@@ -1,0 +1,1775 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>VoIPC — Privacy-First Voice, Video & Chat</title>
+  <meta name="description" content="End-to-end encrypted voice, video, and chat. Self-hosted, open source, no accounts. The privacy-first alternative to Discord and TeamSpeak.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    /* ==============================
+       RESET & BASE
+       ============================== */
+    *, *::before, *::after { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; scroll-padding-top: 72px; }
+    body {
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      line-height: 1.6;
+      overflow-x: hidden;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    :root {
+      --bg-primary: #0f172a;
+      --bg-secondary: #1e293b;
+      --bg-card: rgba(30, 41, 59, 0.6);
+      --bg-dark: #0b1120;
+      --accent-cyan: #38bdf8;
+      --accent-blue: #818cf8;
+      --accent-purple: #c084fc;
+      --accent-green: #4ade80;
+      --accent-red: #f87171;
+      --accent-yellow: #fbbf24;
+      --text-primary: #f1f5f9;
+      --text-secondary: #94a3b8;
+      --text-muted: #64748b;
+      --border-subtle: rgba(56, 189, 248, 0.12);
+      --border-glow: rgba(56, 189, 248, 0.35);
+      --mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
+      --transition: 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      --max-width: 1200px;
+    }
+
+    ::selection { background: rgba(56, 189, 248, 0.3); color: #fff; }
+
+    a { color: var(--accent-cyan); text-decoration: none; transition: color var(--transition); }
+    a:hover { color: #7dd3fc; }
+
+    .container { max-width: var(--max-width); margin: 0 auto; padding: 0 24px; }
+    section { padding: 120px 24px; }
+
+    h2 {
+      font-size: clamp(2rem, 5vw, 3rem);
+      font-weight: 800;
+      text-align: center;
+      margin-bottom: 16px;
+      letter-spacing: -0.02em;
+    }
+    .section-sub {
+      text-align: center;
+      color: var(--text-secondary);
+      font-size: 1.125rem;
+      max-width: 640px;
+      margin: 0 auto 64px;
+    }
+
+    .fade-in {
+      opacity: 0;
+      transform: translateY(24px);
+      transition: opacity 0.7s ease, transform 0.7s ease;
+    }
+    .fade-in.visible { opacity: 1; transform: translateY(0); }
+
+    /* ==============================
+       NAV
+       ============================== */
+    nav {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 1000;
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      background: rgba(15, 23, 42, 0.82);
+      border-bottom: 1px solid var(--border-subtle);
+      transition: background var(--transition);
+    }
+    .nav-inner {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      padding: 0 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 64px;
+    }
+    .nav-logo {
+      font-size: 1.5rem;
+      font-weight: 900;
+      letter-spacing: -0.04em;
+      color: var(--text-primary);
+      display: flex;
+      align-items: center;
+      gap: 2px;
+    }
+    .nav-logo .accent { color: var(--accent-cyan); }
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 32px;
+      list-style: none;
+    }
+    .nav-links a {
+      color: var(--text-secondary);
+      font-size: 0.875rem;
+      font-weight: 500;
+      transition: color var(--transition);
+      position: relative;
+    }
+    .nav-links a::after {
+      content: '';
+      position: absolute;
+      bottom: -4px;
+      left: 0;
+      width: 0;
+      height: 2px;
+      background: var(--accent-cyan);
+      transition: width var(--transition);
+    }
+    .nav-links a:hover, .nav-links a.active { color: var(--text-primary); }
+    .nav-links a.active::after, .nav-links a:hover::after { width: 100%; }
+    .nav-github {
+      color: var(--text-secondary);
+      transition: color var(--transition);
+      display: flex;
+      align-items: center;
+    }
+    .nav-github:hover { color: var(--text-primary); }
+    .menu-toggle {
+      display: none;
+      flex-direction: column;
+      gap: 5px;
+      background: none;
+      border: none;
+      cursor: pointer;
+      padding: 4px;
+    }
+    .menu-toggle span {
+      display: block;
+      width: 24px;
+      height: 2px;
+      background: var(--text-secondary);
+      transition: all var(--transition);
+    }
+    .menu-toggle.open span:nth-child(1) { transform: rotate(45deg) translate(5px, 5px); }
+    .menu-toggle.open span:nth-child(2) { opacity: 0; }
+    .menu-toggle.open span:nth-child(3) { transform: rotate(-45deg) translate(5px, -5px); }
+
+    @media (max-width: 768px) {
+      .menu-toggle { display: flex; }
+      .nav-links {
+        position: fixed;
+        top: 64px;
+        left: 0;
+        right: 0;
+        background: rgba(15, 23, 42, 0.97);
+        backdrop-filter: blur(16px);
+        flex-direction: column;
+        padding: 24px;
+        gap: 20px;
+        transform: translateY(-120%);
+        transition: transform var(--transition);
+        border-bottom: 1px solid var(--border-subtle);
+      }
+      .nav-links.open { transform: translateY(0); }
+    }
+
+    /* ==============================
+       HERO
+       ============================== */
+    #hero {
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+      overflow: hidden;
+      padding-top: 64px;
+      background:
+        radial-gradient(ellipse at 50% 0%, rgba(56, 189, 248, 0.08) 0%, transparent 60%),
+        radial-gradient(circle at 80% 80%, rgba(129, 140, 248, 0.06) 0%, transparent 40%),
+        var(--bg-primary);
+    }
+    .hero-grid {
+      position: absolute;
+      inset: 0;
+      background-image: radial-gradient(circle, rgba(56, 189, 248, 0.08) 1px, transparent 1px);
+      background-size: 48px 48px;
+      mask-image: radial-gradient(ellipse at 50% 50%, black 20%, transparent 70%);
+      -webkit-mask-image: radial-gradient(ellipse at 50% 50%, black 20%, transparent 70%);
+    }
+    .hero-content {
+      position: relative;
+      z-index: 2;
+      text-align: center;
+      max-width: 840px;
+      padding: 0 24px;
+    }
+    .hero-badge {
+      display: inline-block;
+      padding: 6px 16px;
+      border-radius: 999px;
+      background: rgba(56, 189, 248, 0.1);
+      border: 1px solid rgba(56, 189, 248, 0.25);
+      color: var(--accent-cyan);
+      font-size: 0.8125rem;
+      font-weight: 600;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      margin-bottom: 32px;
+    }
+    .hero-title {
+      font-size: clamp(2.5rem, 7vw, 4.5rem);
+      font-weight: 900;
+      line-height: 1.1;
+      letter-spacing: -0.03em;
+      margin-bottom: 24px;
+    }
+    .gradient-text {
+      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue), var(--accent-purple));
+      -webkit-background-clip: text;
+      background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    .hero-sub {
+      font-size: clamp(1rem, 2.5vw, 1.25rem);
+      color: var(--text-secondary);
+      max-width: 600px;
+      margin: 0 auto 40px;
+      line-height: 1.7;
+    }
+    .hero-buttons {
+      display: flex;
+      gap: 16px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 14px 28px;
+      border-radius: 12px;
+      font-size: 1rem;
+      font-weight: 600;
+      border: none;
+      cursor: pointer;
+      transition: all var(--transition);
+      text-decoration: none;
+    }
+    .btn-primary {
+      background: linear-gradient(135deg, var(--accent-cyan), #0ea5e9);
+      color: #0c1222;
+      box-shadow: 0 0 24px rgba(56, 189, 248, 0.25);
+    }
+    .btn-primary:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 0 40px rgba(56, 189, 248, 0.4);
+      color: #0c1222;
+    }
+    .btn-outline {
+      background: transparent;
+      border: 1.5px solid var(--border-glow);
+      color: var(--text-primary);
+    }
+    .btn-outline:hover {
+      background: rgba(56, 189, 248, 0.08);
+      border-color: var(--accent-cyan);
+      transform: translateY(-2px);
+      color: var(--text-primary);
+    }
+
+    /* Shield Animation */
+    .hero-visual {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 0;
+      pointer-events: none;
+    }
+    .shield-container {
+      position: relative;
+      width: 320px;
+      height: 320px;
+      opacity: 0.12;
+    }
+    .shield {
+      position: absolute;
+      inset: 60px;
+      clip-path: polygon(50% 0%, 100% 25%, 100% 65%, 50% 100%, 0% 65%, 0% 25%);
+      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+    }
+    .pulse-ring {
+      position: absolute;
+      inset: 0;
+      border: 2px solid var(--accent-cyan);
+      border-radius: 50%;
+      animation: pulse-ring 3s ease-out infinite;
+    }
+    .pulse-ring:nth-child(2) { animation-delay: 1s; }
+    .pulse-ring:nth-child(3) { animation-delay: 2s; }
+    @keyframes pulse-ring {
+      0% { transform: scale(0.8); opacity: 0.6; }
+      100% { transform: scale(2.2); opacity: 0; }
+    }
+    .wave-bars {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      transform: translate(-50%, -50%);
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      height: 80px;
+    }
+    .wave-bar {
+      width: 6px;
+      background: var(--accent-cyan);
+      border-radius: 3px;
+      animation: wave 1.4s ease-in-out infinite;
+    }
+    .wave-bar:nth-child(1) { animation-delay: 0s; }
+    .wave-bar:nth-child(2) { animation-delay: 0.2s; }
+    .wave-bar:nth-child(3) { animation-delay: 0.4s; }
+    .wave-bar:nth-child(4) { animation-delay: 0.6s; }
+    .wave-bar:nth-child(5) { animation-delay: 0.3s; }
+    @keyframes wave {
+      0%, 100% { height: 16px; }
+      50% { height: 64px; }
+    }
+
+    /* Particles */
+    .particles {
+      position: absolute;
+      inset: 0;
+      overflow: hidden;
+      z-index: 0;
+    }
+    .particle {
+      position: absolute;
+      width: 4px;
+      height: 4px;
+      background: var(--accent-cyan);
+      border-radius: 50%;
+      opacity: 0;
+      animation: float-up linear infinite;
+    }
+    @keyframes float-up {
+      0% { transform: translateY(0) scale(0); opacity: 0; }
+      10% { opacity: 0.6; transform: scale(1); }
+      90% { opacity: 0.3; }
+      100% { transform: translateY(-100vh) scale(0.5); opacity: 0; }
+    }
+
+    /* ==============================
+       WHY SECTION
+       ============================== */
+    #why { background: var(--bg-primary); }
+    .why-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 24px;
+      max-width: var(--max-width);
+      margin: 0 auto;
+    }
+    .why-card {
+      background: var(--bg-card);
+      backdrop-filter: blur(8px);
+      border: 1px solid var(--border-subtle);
+      border-radius: 16px;
+      padding: 36px 28px;
+      transition: all var(--transition);
+    }
+    .why-card:hover {
+      transform: translateY(-4px);
+      border-color: var(--border-glow);
+      box-shadow: 0 8px 40px rgba(56, 189, 248, 0.08);
+    }
+    .why-icon {
+      width: 56px;
+      height: 56px;
+      border-radius: 14px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 20px;
+      font-size: 1.5rem;
+    }
+    .why-icon.zero { background: rgba(248, 113, 113, 0.12); color: var(--accent-red); }
+    .why-icon.signal { background: rgba(56, 189, 248, 0.12); color: var(--accent-cyan); }
+    .why-icon.self { background: rgba(74, 222, 128, 0.12); color: var(--accent-green); }
+    .why-icon.oss { background: rgba(192, 132, 252, 0.12); color: var(--accent-purple); }
+    .why-card h3 {
+      font-size: 1.25rem;
+      font-weight: 700;
+      margin-bottom: 12px;
+    }
+    .why-card p {
+      color: var(--text-secondary);
+      font-size: 0.9375rem;
+      line-height: 1.7;
+    }
+
+    /* ==============================
+       TECH STACK
+       ============================== */
+    #tech {
+      background:
+        radial-gradient(ellipse at 20% 50%, rgba(129, 140, 248, 0.05) 0%, transparent 50%),
+        var(--bg-dark);
+    }
+    .tab-bar {
+      display: flex;
+      justify-content: center;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 48px;
+    }
+    .tab-btn {
+      padding: 10px 24px;
+      border-radius: 999px;
+      border: 1px solid var(--border-subtle);
+      background: transparent;
+      color: var(--text-secondary);
+      font-family: inherit;
+      font-size: 0.9375rem;
+      font-weight: 500;
+      cursor: pointer;
+      transition: all var(--transition);
+    }
+    .tab-btn:hover { border-color: var(--border-glow); color: var(--text-primary); }
+    .tab-btn.active {
+      background: rgba(56, 189, 248, 0.15);
+      border-color: var(--accent-cyan);
+      color: var(--accent-cyan);
+    }
+    .tab-panel {
+      display: none;
+      max-width: 900px;
+      margin: 0 auto;
+      animation: fadeTab 0.4s ease;
+    }
+    .tab-panel.active { display: block; }
+    @keyframes fadeTab { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+    .spec-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    @media (max-width: 640px) { .spec-grid { grid-template-columns: 1fr; } }
+    .spec-item {
+      background: rgba(15, 23, 42, 0.6);
+      border: 1px solid var(--border-subtle);
+      border-radius: 12px;
+      padding: 20px;
+    }
+    .spec-label {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--accent-cyan);
+      margin-bottom: 6px;
+    }
+    .spec-value {
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    .spec-detail {
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+      margin-top: 4px;
+    }
+    .tech-highlight {
+      background: rgba(56, 189, 248, 0.06);
+      border: 1px solid var(--border-subtle);
+      border-radius: 12px;
+      padding: 24px;
+      margin-bottom: 24px;
+    }
+    .tech-highlight h4 {
+      font-size: 1rem;
+      font-weight: 700;
+      margin-bottom: 8px;
+      color: var(--accent-cyan);
+    }
+    .tech-highlight p, .tech-highlight li {
+      color: var(--text-secondary);
+      font-size: 0.9375rem;
+      line-height: 1.7;
+    }
+    .tech-highlight ul {
+      list-style: none;
+      padding: 0;
+    }
+    .tech-highlight ul li {
+      padding: 4px 0;
+      padding-left: 20px;
+      position: relative;
+    }
+    .tech-highlight ul li::before {
+      content: '>';
+      position: absolute;
+      left: 0;
+      color: var(--accent-cyan);
+      font-family: var(--mono);
+      font-weight: 700;
+    }
+
+    /* ==============================
+       SECURITY
+       ============================== */
+    #security {
+      background:
+        radial-gradient(ellipse at 50% 20%, rgba(56, 189, 248, 0.06) 0%, transparent 50%),
+        var(--bg-primary);
+    }
+    .security-tagline {
+      text-align: center;
+      font-size: 1.125rem;
+      color: var(--accent-cyan);
+      font-weight: 500;
+      font-style: italic;
+      margin-bottom: 56px;
+      margin-top: -8px;
+    }
+    .accordion {
+      max-width: 840px;
+      margin: 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .accordion-item {
+      border: 1px solid var(--border-subtle);
+      border-radius: 16px;
+      overflow: hidden;
+      transition: border-color var(--transition), box-shadow var(--transition);
+    }
+    .accordion-item.active {
+      border-color: var(--border-glow);
+      box-shadow: 0 0 32px rgba(56, 189, 248, 0.06);
+    }
+    .accordion-header {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      padding: 20px 24px;
+      cursor: pointer;
+      background: var(--bg-card);
+      user-select: none;
+      transition: background var(--transition);
+    }
+    .accordion-header:hover { background: rgba(30, 41, 59, 0.8); }
+    .layer-num {
+      width: 36px;
+      height: 36px;
+      border-radius: 10px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 0.875rem;
+      font-weight: 800;
+      flex-shrink: 0;
+    }
+    .layer-1 .layer-num { background: rgba(56, 189, 248, 0.15); color: var(--accent-cyan); }
+    .layer-2 .layer-num { background: rgba(129, 140, 248, 0.15); color: var(--accent-blue); }
+    .layer-3 .layer-num { background: rgba(192, 132, 252, 0.15); color: var(--accent-purple); }
+    .layer-4 .layer-num { background: rgba(74, 222, 128, 0.15); color: var(--accent-green); }
+    .layer-5 .layer-num { background: rgba(251, 191, 36, 0.15); color: var(--accent-yellow); }
+    .accordion-title {
+      flex: 1;
+    }
+    .accordion-title h3 {
+      font-size: 1.0625rem;
+      font-weight: 700;
+      margin-bottom: 2px;
+    }
+    .accordion-title span {
+      font-size: 0.8125rem;
+      color: var(--text-muted);
+    }
+    .accordion-chevron {
+      width: 20px;
+      height: 20px;
+      transition: transform var(--transition);
+      color: var(--text-muted);
+      flex-shrink: 0;
+    }
+    .accordion-item.active .accordion-chevron { transform: rotate(180deg); }
+    .accordion-content {
+      max-height: 0;
+      overflow: hidden;
+      transition: max-height 0.5s cubic-bezier(0.4, 0, 0.2, 1);
+    }
+    .accordion-item.active .accordion-content { max-height: 600px; }
+    .accordion-body {
+      padding: 0 24px 24px 76px;
+    }
+    .accordion-body ul {
+      list-style: none;
+      padding: 0;
+    }
+    .accordion-body li {
+      padding: 6px 0;
+      color: var(--text-secondary);
+      font-size: 0.9375rem;
+      position: relative;
+      padding-left: 24px;
+    }
+    .accordion-body li::before {
+      content: '';
+      position: absolute;
+      left: 0;
+      top: 14px;
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--border-glow);
+    }
+    .layer-1 .accordion-body li::before { background: var(--accent-cyan); }
+    .layer-2 .accordion-body li::before { background: var(--accent-blue); }
+    .layer-3 .accordion-body li::before { background: var(--accent-purple); }
+    .layer-4 .accordion-body li::before { background: var(--accent-green); }
+    .layer-5 .accordion-body li::before { background: var(--accent-yellow); }
+
+    /* ==============================
+       TRANSPARENCY
+       ============================== */
+    #transparency {
+      background: var(--bg-dark);
+    }
+    .trans-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+      max-width: var(--max-width);
+      margin: 0 auto;
+    }
+    @media (max-width: 768px) { .trans-grid { grid-template-columns: 1fr; } }
+    .trans-card {
+      border-radius: 16px;
+      padding: 32px;
+      border: 1px solid var(--border-subtle);
+      background: var(--bg-card);
+    }
+    .trans-card h3 {
+      font-size: 1.125rem;
+      font-weight: 700;
+      margin-bottom: 20px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .trans-card.server-stores h3 { color: var(--accent-yellow); }
+    .trans-card.server-blind h3 { color: var(--accent-red); }
+    .trans-card.device-stores h3 { color: var(--accent-cyan); }
+    .trans-card.never-stored h3 { color: var(--text-muted); }
+    .trans-card ul { list-style: none; padding: 0; }
+    .trans-card li {
+      padding: 8px 0;
+      color: var(--text-secondary);
+      font-size: 0.9375rem;
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      line-height: 1.5;
+    }
+    .trans-card li .icon {
+      flex-shrink: 0;
+      margin-top: 3px;
+      font-size: 0.875rem;
+    }
+    .trans-card .note {
+      margin-top: 16px;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 0.8125rem;
+      font-weight: 500;
+    }
+    .trans-card.server-stores .note {
+      background: rgba(251, 191, 36, 0.08);
+      border: 1px solid rgba(251, 191, 36, 0.2);
+      color: var(--accent-yellow);
+    }
+    .trans-card.never-stored .note {
+      background: rgba(100, 116, 139, 0.08);
+      border: 1px solid rgba(100, 116, 139, 0.2);
+      color: var(--text-muted);
+    }
+
+    /* ==============================
+       COMPARISON TABLE
+       ============================== */
+    #compare {
+      background: var(--bg-primary);
+    }
+    .table-wrap {
+      max-width: var(--max-width);
+      margin: 0 auto;
+      overflow-x: auto;
+      border-radius: 16px;
+      border: 1px solid var(--border-subtle);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 640px;
+    }
+    thead th {
+      padding: 18px 20px;
+      text-align: left;
+      font-size: 0.9375rem;
+      font-weight: 700;
+      background: var(--bg-secondary);
+      border-bottom: 1px solid var(--border-subtle);
+    }
+    thead th:first-child { width: 200px; }
+    thead th:nth-child(2) {
+      background: rgba(56, 189, 248, 0.08);
+      color: var(--accent-cyan);
+    }
+    tbody td {
+      padding: 14px 20px;
+      font-size: 0.9375rem;
+      border-bottom: 1px solid rgba(30, 41, 59, 0.5);
+      color: var(--text-secondary);
+    }
+    tbody td:nth-child(2) {
+      background: rgba(56, 189, 248, 0.04);
+    }
+    tbody td:first-child {
+      font-weight: 600;
+      color: var(--text-primary);
+    }
+    tbody tr:last-child td { border-bottom: none; }
+    .check { color: var(--accent-green); font-weight: 700; }
+    .cross { color: var(--accent-red); }
+    .partial { color: var(--accent-yellow); }
+
+    /* ==============================
+       ARCHITECTURE
+       ============================== */
+    #architecture {
+      background: var(--bg-dark);
+    }
+    .arch-diagram {
+      max-width: 900px;
+      margin: 0 auto;
+      display: flex;
+      align-items: center;
+      gap: 0;
+      position: relative;
+    }
+    .arch-node {
+      flex: 0 0 200px;
+      background: var(--bg-card);
+      border: 1px solid var(--border-subtle);
+      border-radius: 16px;
+      padding: 28px 20px;
+      text-align: center;
+      position: relative;
+      z-index: 2;
+    }
+    .arch-node h4 {
+      font-size: 1rem;
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+    .arch-node p {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+    .arch-node.server {
+      flex: 0 0 240px;
+      border-color: var(--accent-cyan);
+      box-shadow: 0 0 32px rgba(56, 189, 248, 0.08);
+    }
+    .arch-node.server .server-blind-badge {
+      display: inline-block;
+      padding: 4px 12px;
+      border-radius: 999px;
+      background: rgba(251, 191, 36, 0.12);
+      border: 1px solid rgba(251, 191, 36, 0.3);
+      color: var(--accent-yellow);
+      font-size: 0.6875rem;
+      font-weight: 600;
+      margin-top: 12px;
+      letter-spacing: 0.02em;
+    }
+    .arch-line {
+      flex: 1;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 8px;
+      padding: 0 8px;
+      z-index: 1;
+    }
+    .arch-line-segment {
+      position: relative;
+      width: 100%;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .arch-line-bar {
+      flex: 1;
+      height: 2px;
+      border-radius: 1px;
+    }
+    .arch-line-bar.tls { background: linear-gradient(90deg, var(--accent-cyan), var(--accent-blue)); }
+    .arch-line-bar.udp { background: linear-gradient(90deg, var(--accent-purple), var(--accent-green)); }
+    .arch-line-label {
+      font-size: 0.6875rem;
+      font-weight: 600;
+      white-space: nowrap;
+      padding: 3px 8px;
+      border-radius: 6px;
+    }
+    .arch-line-label.tls { background: rgba(56, 189, 248, 0.12); color: var(--accent-cyan); }
+    .arch-line-label.udp { background: rgba(192, 132, 252, 0.12); color: var(--accent-purple); }
+    @media (max-width: 768px) {
+      .arch-diagram { flex-direction: column; gap: 0; }
+      .arch-node { flex: none; width: 100%; max-width: 280px; }
+      .arch-line { flex-direction: column; padding: 12px 0; }
+      .arch-line-segment { flex-direction: column; }
+      .arch-line-bar { width: 2px; height: 32px; flex: none; }
+    }
+
+    /* ==============================
+       GETTING STARTED
+       ============================== */
+    #get-started {
+      background: var(--bg-primary);
+    }
+    .start-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 40px;
+      max-width: var(--max-width);
+      margin: 0 auto;
+      align-items: start;
+    }
+    @media (max-width: 768px) { .start-grid { grid-template-columns: 1fr; } }
+    .code-block {
+      margin-bottom: 20px;
+    }
+    .code-header {
+      font-size: 0.8125rem;
+      font-weight: 600;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+    .code-block pre {
+      background: var(--bg-dark);
+      border: 1px solid var(--border-subtle);
+      border-radius: 10px;
+      padding: 16px 20px;
+      overflow-x: auto;
+      font-family: var(--mono);
+      font-size: 0.875rem;
+      line-height: 1.7;
+      color: var(--accent-cyan);
+    }
+    .code-block pre .comment { color: var(--text-muted); }
+    .req-list { list-style: none; padding: 0; }
+    .req-list li {
+      padding: 12px 0;
+      border-bottom: 1px solid rgba(30, 41, 59, 0.4);
+      color: var(--text-secondary);
+      font-size: 0.9375rem;
+      display: flex;
+      align-items: flex-start;
+      gap: 12px;
+    }
+    .req-list li:last-child { border-bottom: none; }
+    .req-label {
+      font-weight: 600;
+      color: var(--text-primary);
+      min-width: 100px;
+    }
+
+    /* ==============================
+       FOOTER
+       ============================== */
+    footer {
+      border-top: 1px solid var(--border-subtle);
+      padding: 48px 24px;
+      text-align: center;
+    }
+    .footer-logo {
+      font-size: 1.25rem;
+      font-weight: 900;
+      letter-spacing: -0.04em;
+      margin-bottom: 8px;
+    }
+    .footer-tagline {
+      color: var(--text-muted);
+      font-size: 0.875rem;
+      margin-bottom: 20px;
+    }
+    .footer-links {
+      display: flex;
+      justify-content: center;
+      gap: 24px;
+      margin-bottom: 24px;
+    }
+    .footer-links a {
+      color: var(--text-secondary);
+      font-size: 0.875rem;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .footer-note {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ========== NAV ========== -->
+  <nav>
+    <div class="nav-inner">
+      <div class="nav-logo">Vo<span class="accent">IPC</span></div>
+      <ul class="nav-links" id="navLinks">
+        <li><a href="#why">Why VoIPC</a></li>
+        <li><a href="#tech">Technology</a></li>
+        <li><a href="#security">Security</a></li>
+        <li><a href="#transparency">Transparency</a></li>
+        <li><a href="#compare">Compare</a></li>
+        <li><a href="#get-started">Get Started</a></li>
+        <li>
+          <a href="https://github.com" class="nav-github" target="_blank" rel="noopener" aria-label="GitHub">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+          </a>
+        </li>
+      </ul>
+      <button class="menu-toggle" id="menuToggle" aria-label="Toggle menu">
+        <span></span><span></span><span></span>
+      </button>
+    </div>
+  </nav>
+
+  <!-- ========== HERO ========== -->
+  <section id="hero">
+    <div class="hero-grid"></div>
+    <div class="particles" id="particles"></div>
+    <div class="hero-visual">
+      <div class="shield-container">
+        <div class="pulse-ring"></div>
+        <div class="pulse-ring"></div>
+        <div class="pulse-ring"></div>
+        <div class="shield"></div>
+        <div class="wave-bars">
+          <div class="wave-bar"></div>
+          <div class="wave-bar"></div>
+          <div class="wave-bar"></div>
+          <div class="wave-bar"></div>
+          <div class="wave-bar"></div>
+        </div>
+      </div>
+    </div>
+    <div class="hero-content">
+      <div class="hero-badge">Open Source &middot; End-to-End Encrypted</div>
+      <h1 class="hero-title">
+        Your conversations are<br>
+        <span class="gradient-text">YOUR conversations.</span>
+      </h1>
+      <p class="hero-sub">
+        Privacy-first voice, video, and chat. Encrypted with Signal Protocol.
+        Self-hosted. No accounts. No telemetry. No compromises.
+      </p>
+      <div class="hero-buttons">
+        <a href="#get-started" class="btn btn-primary">Get Started</a>
+        <a href="https://github.com" class="btn btn-outline" target="_blank" rel="noopener">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+          View on GitHub
+        </a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== WHY ========== -->
+  <section id="why">
+    <div class="container">
+      <h2 class="fade-in">Why VoIPC?</h2>
+      <p class="section-sub fade-in">Built for people who believe privacy isn't a premium feature &mdash; it's a right.</p>
+      <div class="why-grid">
+
+        <div class="why-card fade-in">
+          <div class="why-icon zero">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"/><path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"/><line x1="1" y1="1" x2="23" y2="23"/></svg>
+          </div>
+          <h3>Zero Knowledge</h3>
+          <p>The server is blind by design. It never sees your messages, never stores chat history, never logs conversations. All encryption and decryption happens on <strong>your device</strong>.</p>
+        </div>
+
+        <div class="why-card fade-in">
+          <div class="why-icon signal">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          </div>
+          <h3>Signal Protocol</h3>
+          <p>The same end-to-end encryption trusted by billions. X3DH key exchange, Double Ratchet algorithm, Perfect Forward Secrecy. Your past messages stay safe even if a key is compromised.</p>
+        </div>
+
+        <div class="why-card fade-in">
+          <div class="why-icon self">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="2" width="20" height="8" rx="2" ry="2"/><rect x="2" y="14" width="20" height="8" rx="2" ry="2"/><line x1="6" y1="6" x2="6.01" y2="6"/><line x1="6" y1="18" x2="6.01" y2="18"/></svg>
+          </div>
+          <h3>Self-Hosted</h3>
+          <p>Your server, your rules. A single Rust binary with zero disk persistence. Server restart means a clean slate. No accounts, no sign-up, no email &mdash; just connect and talk.</p>
+        </div>
+
+        <div class="why-card fade-in">
+          <div class="why-icon oss">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg>
+          </div>
+          <h3>Truly Open Source</h3>
+          <p>Every line of code is public under the MIT license. Audit it, fork it, contribute. No hidden telemetry, no phone-home, no data monetization. Ever.</p>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== TECH STACK ========== -->
+  <section id="tech">
+    <div class="container">
+      <h2 class="fade-in">Under the Hood</h2>
+      <p class="section-sub fade-in">Precise engineering at every layer. Here's exactly what powers your calls.</p>
+
+      <div class="tab-bar fade-in">
+        <button class="tab-btn active" data-tab="tab-audio">Audio</button>
+        <button class="tab-btn" data-tab="tab-video">Video</button>
+        <button class="tab-btn" data-tab="tab-network">Networking</button>
+        <button class="tab-btn" data-tab="tab-client">Client</button>
+        <button class="tab-btn" data-tab="tab-server">Server</button>
+      </div>
+
+      <!-- AUDIO -->
+      <div class="tab-panel active" id="tab-audio">
+        <div class="tech-highlight">
+          <h4>Audio Pipeline</h4>
+          <p>Microphone capture &rarr; RNNoise denoiser &rarr; Voice Activity Detection &rarr; Opus encoder &rarr; AES-256-GCM encryption &rarr; UDP transmission</p>
+        </div>
+        <div class="spec-grid">
+          <div class="spec-item">
+            <div class="spec-label">Codec</div>
+            <div class="spec-value">Opus</div>
+            <div class="spec-detail">48 kHz sample rate, mono, 20ms frames (960 samples)</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Bitrate</div>
+            <div class="spec-value">48 kbps</div>
+            <div class="spec-detail">VoIP-optimized mode with DTX (saves bandwidth during silence)</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Noise Suppression</div>
+            <div class="spec-value">RNNoise (ML-based)</div>
+            <div class="spec-detail">Rust port via nnnoiseless. Recurrent neural network trained on real noise</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Voice Detection</div>
+            <div class="spec-value">RMS-based VAD</div>
+            <div class="spec-detail">Configurable threshold (-96dB to 0dB), 300ms hold time to prevent choppy cutoffs</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Packet Loss</div>
+            <div class="spec-value">15% FEC tolerance</div>
+            <div class="spec-detail">Opus in-band Forward Error Correction for lossy network resilience</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Jitter Buffer</div>
+            <div class="spec-value">Adaptive</div>
+            <div class="spec-detail">Sequence-based reordering with configurable buffer depth</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- VIDEO -->
+      <div class="tab-panel" id="tab-video">
+        <div class="tech-highlight">
+          <h4>Screen Share Pipeline</h4>
+          <p>Platform-native screen capture &rarr; H.265/HEVC encoding (GPU priority) &rarr; Fragmentation &rarr; AES-256-GCM encryption &rarr; UDP transmission</p>
+        </div>
+        <div class="spec-grid">
+          <div class="spec-item">
+            <div class="spec-label">Codec</div>
+            <div class="spec-value">H.265 / HEVC</div>
+            <div class="spec-detail">Via FFmpeg 8.0. Ultrafast preset, zero-latency tuning, no B-frames</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Hardware Acceleration</div>
+            <div class="spec-value">NVENC &rarr; QSV &rarr; AMF</div>
+            <div class="spec-detail">NVIDIA, Intel, AMD in priority order. Falls back to libx265 software encoding</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Resolutions</div>
+            <div class="spec-value">480p / 720p / 1080p</div>
+            <div class="spec-detail">1.5 / 3.0 / 5.0 Mbps @ 30 fps. Keyframe every 30 frames</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Max Packet Size</div>
+            <div class="spec-value">1,280 bytes</div>
+            <div class="spec-detail">VPN-safe: fits inside WireGuard (~60B) and OpenVPN (~70B) tunnels</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Fragmentation</div>
+            <div class="spec-value">Up to 255 fragments/frame</div>
+            <div class="spec-detail">Reassembly with gap detection and automatic keyframe requests on loss</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Capture Method</div>
+            <div class="spec-value">Platform-native</div>
+            <div class="spec-detail">Linux: PipeWire + XDG Portal. Windows: DXGI Desktop Duplication</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- NETWORKING -->
+      <div class="tab-panel" id="tab-network">
+        <div class="tech-highlight">
+          <h4>Dual-Channel Architecture</h4>
+          <ul>
+            <li><strong>TCP + TLS</strong> for control messages (auth, channels, chat, encryption setup)</li>
+            <li><strong>UDP</strong> for real-time media (voice, video, screen share audio)</li>
+            <li>Server acts as an <strong>SFU</strong> (Selective Forwarding Unit) &mdash; relays encrypted packets, never decodes them</li>
+          </ul>
+        </div>
+        <div class="spec-grid">
+          <div class="spec-item">
+            <div class="spec-label">Serialization</div>
+            <div class="spec-value">postcard (binary)</div>
+            <div class="spec-detail">no_std compatible, minimal overhead vs JSON/Protobuf</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Voice Header</div>
+            <div class="spec-value">17 bytes (19 encrypted)</div>
+            <div class="spec-detail">type + session_id + udp_token + sequence [+ key_id]</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Video Header</div>
+            <div class="spec-value">23 bytes (25 encrypted)</div>
+            <div class="spec-detail">+ frame_id + fragment_index + fragment_count + timestamp</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">TLS</div>
+            <div class="spec-value">rustls + ring</div>
+            <div class="spec-detail">Pure-Rust TLS 1.2+. TOFU certificate pinning for self-signed certs</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Protocol Version</div>
+            <div class="spec-value">v3</div>
+            <div class="spec-detail">Max TCP message: 64 KiB. End-to-end encryption support built-in</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Reconnection</div>
+            <div class="spec-value">Auto-reconnect</div>
+            <div class="spec-detail">Exponential backoff with jitter. Seamless session recovery</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- CLIENT -->
+      <div class="tab-panel" id="tab-client">
+        <div class="tech-highlight">
+          <h4>Desktop Application</h4>
+          <ul>
+            <li><strong>Tauri 2</strong> &mdash; Rust backend + native webview. ~10x smaller than Electron</li>
+            <li><strong>Svelte 5</strong> frontend with runes ($state, $derived, $effect)</li>
+            <li>15+ reactive components for channels, chat, voice, screen share, settings</li>
+          </ul>
+        </div>
+        <div class="spec-grid">
+          <div class="spec-item">
+            <div class="spec-label">Backend</div>
+            <div class="spec-value">Rust (Tauri 2)</div>
+            <div class="spec-detail">All crypto, audio, networking, and encoding runs natively in Rust</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Frontend</div>
+            <div class="spec-value">Svelte 5 + TypeScript</div>
+            <div class="spec-detail">Runes for reactive state. Vite 6 build system. Zero runtime overhead</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Linux</div>
+            <div class="spec-value">PipeWire + XDG Portal</div>
+            <div class="spec-detail">Native screen capture via ScreenCast portal. Same picker as OBS/Firefox</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Windows</div>
+            <div class="spec-value">DXGI + WASAPI</div>
+            <div class="spec-detail">Direct3D desktop duplication for capture, WASAPI loopback for desktop audio</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Audio Backend</div>
+            <div class="spec-value">cpal (cross-platform)</div>
+            <div class="spec-detail">ALSA on Linux, WASAPI on Windows. Ring buffer for lock-free I/O</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Voice Modes</div>
+            <div class="spec-value">PTT / VAD / Always-On</div>
+            <div class="spec-detail">Push-to-talk, voice activation detection, or continuous transmission</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- SERVER -->
+      <div class="tab-panel" id="tab-server">
+        <div class="tech-highlight">
+          <h4>Zero-Persistence Server</h4>
+          <ul>
+            <li>Single async Rust binary on <strong>Tokio</strong> runtime</li>
+            <li>All state lives in memory. Nothing is ever written to disk</li>
+            <li>Server restart = <strong>clean slate</strong>. No databases, no log files, no traces</li>
+          </ul>
+        </div>
+        <div class="spec-grid">
+          <div class="spec-item">
+            <div class="spec-label">Concurrency</div>
+            <div class="spec-value">DashMap (lock-free)</div>
+            <div class="spec-detail">Concurrent session state without global mutexes</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Default Port</div>
+            <div class="spec-value">9987 (TCP + UDP)</div>
+            <div class="spec-detail">Configurable via TOML config file or CLI arguments</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Capacity</div>
+            <div class="spec-value">64 concurrent users</div>
+            <div class="spec-detail">Configurable. Up to 50 user-created channels with auto-cleanup</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Rate Limiting</div>
+            <div class="spec-value">Token-bucket</div>
+            <div class="spec-detail">Per-user rate limits on chat messages and channel creation</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Secret Handling</div>
+            <div class="spec-value">Zeroizing&lt;T&gt;</div>
+            <div class="spec-detail">Passwords and keys are memory-zeroized on drop. Never leak to swap</div>
+          </div>
+          <div class="spec-item">
+            <div class="spec-label">Channel Cleanup</div>
+            <div class="spec-value">Auto-delete after 300s</div>
+            <div class="spec-detail">Empty user-created channels are automatically removed</div>
+          </div>
+        </div>
+      </div>
+
+    </div>
+  </section>
+
+  <!-- ========== SECURITY ========== -->
+  <section id="security">
+    <div class="container">
+      <h2 class="fade-in">Five Layers of Security</h2>
+      <p class="security-tagline fade-in">"Encryption is not a feature. It's the foundation."</p>
+
+      <div class="accordion">
+
+        <div class="accordion-item layer-1 active fade-in">
+          <div class="accordion-header">
+            <div class="layer-num">1</div>
+            <div class="accordion-title">
+              <h3>Transport Security</h3>
+              <span>TLS on every connection</span>
+            </div>
+            <svg class="accordion-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+          </div>
+          <div class="accordion-content">
+            <div class="accordion-body">
+              <ul>
+                <li><strong>rustls</strong> &mdash; pure-Rust TLS implementation with ring crypto provider</li>
+                <li>TLS 1.2+ encrypts all TCP control traffic (auth, channel ops, chat, key exchange)</li>
+                <li><strong>TOFU</strong> (Trust-On-First-Use) certificate pinning for self-signed server certs</li>
+                <li>No plaintext TCP connections are accepted &mdash; TLS is mandatory</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <div class="accordion-item layer-2 fade-in">
+          <div class="accordion-header">
+            <div class="layer-num">2</div>
+            <div class="accordion-title">
+              <h3>End-to-End Message Encryption</h3>
+              <span>Signal Protocol &mdash; the gold standard</span>
+            </div>
+            <svg class="accordion-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+          </div>
+          <div class="accordion-content">
+            <div class="accordion-body">
+              <ul>
+                <li><strong>X3DH</strong> (Extended Triple Diffie-Hellman) key exchange for session establishment</li>
+                <li><strong>Double Ratchet</strong> algorithm provides forward secrecy per message</li>
+                <li><strong>Curve25519</strong> identity keys (32-byte) with Ed25519 signed pre-keys</li>
+                <li><strong>100 one-time pre-keys</strong> per user + 1 signed pre-key, auto-replenished</li>
+                <li><strong>Sender Keys</strong> for efficient group/channel message encryption</li>
+                <li><strong>Perfect Forward Secrecy</strong> &mdash; compromising a key cannot decrypt past messages</li>
+                <li>Uses the official <strong>libsignal-protocol</strong> crate from Signal Foundation</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <div class="accordion-item layer-3 fade-in">
+          <div class="accordion-header">
+            <div class="layer-num">3</div>
+            <div class="accordion-title">
+              <h3>Media Encryption</h3>
+              <span>AES-256-GCM on every voice &amp; video packet</span>
+            </div>
+            <svg class="accordion-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+          </div>
+          <div class="accordion-content">
+            <div class="accordion-body">
+              <ul>
+                <li><strong>AES-256-GCM</strong> symmetric encryption with per-channel 256-bit keys</li>
+                <li><strong>Deterministic nonce</strong>: session_id(4) || sequence(4) || extra(4) = 12 bytes &mdash; mathematically prevents nonce reuse</li>
+                <li><strong>16-byte authentication tag</strong> detects any packet tampering</li>
+                <li><strong>AAD</strong> (Additional Authenticated Data) binds channel_id + packet_type, preventing cross-channel replay attacks</li>
+                <li>Mandatory <strong>key rotation</strong> after ~4.3 billion packets (~24h at 50 pkt/sec)</li>
+                <li>Media keys distributed to channel members <strong>encrypted via Signal sessions</strong></li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <div class="accordion-item layer-4 fade-in">
+          <div class="accordion-header">
+            <div class="layer-num">4</div>
+            <div class="accordion-title">
+              <h3>Local Storage Encryption</h3>
+              <span>Your device, your vault</span>
+            </div>
+            <svg class="accordion-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+          </div>
+          <div class="accordion-content">
+            <div class="accordion-body">
+              <ul>
+                <li>Chat history encrypted with <strong>PBKDF2-HMAC-SHA256</strong> (600,000 iterations) + <strong>AES-256-GCM</strong></li>
+                <li><strong>32-byte random salt</strong> per file + <strong>12-byte random nonce</strong></li>
+                <li>Custom binary format: <code style="color:var(--accent-cyan);font-family:var(--mono);font-size:0.8125rem;">VOIP</code> magic header + version + salt + nonce + encrypted payload + GCM tag</li>
+                <li>Signal Protocol state encrypted separately with <code style="color:var(--accent-cyan);font-family:var(--mono);font-size:0.8125rem;">VSIG</code> file format</li>
+                <li>Max 500 messages per channel stored locally (auto-rotated)</li>
+                <li><strong>Zeroizing&lt;T&gt;</strong> for all secrets in memory &mdash; overwritten on drop, never leak to swap</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+        <div class="accordion-item layer-5 fade-in">
+          <div class="accordion-header">
+            <div class="layer-num">5</div>
+            <div class="accordion-title">
+              <h3>Zero-Knowledge Server</h3>
+              <span>The server is blind by design</span>
+            </div>
+            <svg class="accordion-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
+          </div>
+          <div class="accordion-content">
+            <div class="accordion-body">
+              <ul>
+                <li>Server <strong>NEVER</strong> sees plaintext messages &mdash; encrypted client-side with Signal Protocol</li>
+                <li>Server <strong>NEVER</strong> stores chat history &mdash; zero persistence, no disk writes</li>
+                <li>Server <strong>NEVER</strong> decodes voice or video &mdash; SFU architecture relays encrypted packets</li>
+                <li>Server <strong>NEVER</strong> logs conversations &mdash; memory-only state, restart = clean slate</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== TRANSPARENCY ========== -->
+  <section id="transparency">
+    <div class="container">
+      <h2 class="fade-in">Complete Transparency</h2>
+      <p class="section-sub fade-in">Exactly what lives where. No fine print.</p>
+
+      <div class="trans-grid">
+
+        <div class="trans-card server-stores fade-in">
+          <h3>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="2" width="20" height="8" rx="2"/><rect x="2" y="14" width="20" height="8" rx="2"/><circle cx="6" cy="6" r="1" fill="currentColor"/><circle cx="6" cy="18" r="1" fill="currentColor"/></svg>
+            Server Stores (Memory Only)
+          </h3>
+          <ul>
+            <li><span class="icon">&#9679;</span> Active usernames and channel memberships</li>
+            <li><span class="icon">&#9679;</span> Channel names, descriptions, and passwords (Zeroized)</li>
+            <li><span class="icon">&#9679;</span> Connection metadata (IPs while connected)</li>
+            <li><span class="icon">&#9679;</span> Media encryption keys (distributed encrypted)</li>
+            <li><span class="icon">&#9679;</span> Pre-key bundles for encryption setup</li>
+          </ul>
+          <div class="note">Nothing is persisted to disk. Server restart = clean slate.</div>
+        </div>
+
+        <div class="trans-card server-blind fade-in">
+          <h3>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="4.93" y1="4.93" x2="19.07" y2="19.07"/></svg>
+            Server Never Sees
+          </h3>
+          <ul>
+            <li><span class="icon">&times;</span> Message contents (Signal Protocol encrypted)</li>
+            <li><span class="icon">&times;</span> Voice and video content (AES-256-GCM encrypted)</li>
+            <li><span class="icon">&times;</span> Chat history (stored only on your device)</li>
+            <li><span class="icon">&times;</span> Your identity keys (only public keys exchanged)</li>
+            <li><span class="icon">&times;</span> Screen share content (encrypted before relay)</li>
+          </ul>
+        </div>
+
+        <div class="trans-card device-stores fade-in">
+          <h3>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="4" y="2" width="16" height="20" rx="2"/><line x1="12" y1="18" x2="12.01" y2="18"/></svg>
+            Your Device Stores
+          </h3>
+          <ul>
+            <li><span class="icon">&#9679;</span> Encrypted chat history (password-protected, AES-256-GCM)</li>
+            <li><span class="icon">&#9679;</span> Encrypted Signal Protocol state (VSIG format)</li>
+            <li><span class="icon">&#9679;</span> Audio/video settings and device preferences</li>
+            <li><span class="icon">&#9679;</span> Max 500 messages per channel (auto-rotated)</li>
+          </ul>
+        </div>
+
+        <div class="trans-card never-stored fade-in">
+          <h3>
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
+            Never Stored. Anywhere.
+          </h3>
+          <ul>
+            <li><span class="icon" style="text-decoration:line-through">&#9679;</span> No analytics or telemetry data</li>
+            <li><span class="icon" style="text-decoration:line-through">&#9679;</span> No user accounts or profiles</li>
+            <li><span class="icon" style="text-decoration:line-through">&#9679;</span> No message logs on the server</li>
+            <li><span class="icon" style="text-decoration:line-through">&#9679;</span> No tracking cookies</li>
+            <li><span class="icon" style="text-decoration:line-through">&#9679;</span> No third-party data sharing</li>
+          </ul>
+          <div class="note">If it's not needed for the call, it doesn't exist.</div>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== COMPARISON ========== -->
+  <section id="compare">
+    <div class="container">
+      <h2 class="fade-in">How VoIPC Compares</h2>
+      <p class="section-sub fade-in">Feature by feature. No marketing spin.</p>
+
+      <div class="table-wrap fade-in">
+        <table>
+          <thead>
+            <tr>
+              <th>Feature</th>
+              <th>VoIPC</th>
+              <th>Discord</th>
+              <th>TeamSpeak</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>E2E Encryption</td>
+              <td class="check">Signal Protocol</td>
+              <td class="cross">No</td>
+              <td class="cross">No</td>
+            </tr>
+            <tr>
+              <td>Voice Encryption</td>
+              <td class="check">AES-256-GCM</td>
+              <td class="cross">No</td>
+              <td class="partial">Limited</td>
+            </tr>
+            <tr>
+              <td>Self-Hosted</td>
+              <td class="check">Yes</td>
+              <td class="cross">No</td>
+              <td class="check">Yes</td>
+            </tr>
+            <tr>
+              <td>Open Source</td>
+              <td class="check">MIT License</td>
+              <td class="cross">No</td>
+              <td class="cross">No</td>
+            </tr>
+            <tr>
+              <td>Account Required</td>
+              <td class="check">No</td>
+              <td class="cross">Yes + email + phone</td>
+              <td class="check">No</td>
+            </tr>
+            <tr>
+              <td>Data Collection</td>
+              <td class="check">None</td>
+              <td class="cross">Extensive</td>
+              <td class="partial">Some</td>
+            </tr>
+            <tr>
+              <td>Server Persistence</td>
+              <td class="check">None (memory only)</td>
+              <td class="cross">Everything, forever</td>
+              <td class="cross">Everything</td>
+            </tr>
+            <tr>
+              <td>Screen Share</td>
+              <td class="check">H.265 HW-accelerated</td>
+              <td class="partial">H.264/VP8</td>
+              <td class="partial">Plugin-based</td>
+            </tr>
+            <tr>
+              <td>Video Codec</td>
+              <td class="check">HEVC (NVENC/QSV/AMF)</td>
+              <td class="partial">H.264/VP8</td>
+              <td class="cross">N/A</td>
+            </tr>
+            <tr>
+              <td>App Size</td>
+              <td class="check">~20 MB (Tauri)</td>
+              <td class="cross">~200 MB (Electron)</td>
+              <td class="partial">~80 MB</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== ARCHITECTURE ========== -->
+  <section id="architecture">
+    <div class="container">
+      <h2 class="fade-in">Architecture</h2>
+      <p class="section-sub fade-in">What happens when you press talk.</p>
+
+      <div class="arch-diagram fade-in">
+        <div class="arch-node">
+          <h4>Client A</h4>
+          <p>Tauri 2 Desktop App<br>Rust + Svelte 5</p>
+        </div>
+
+        <div class="arch-line">
+          <div class="arch-line-segment">
+            <div class="arch-line-bar tls"></div>
+            <div class="arch-line-label tls">TCP + TLS</div>
+            <div class="arch-line-bar tls"></div>
+          </div>
+          <div class="arch-line-segment">
+            <div class="arch-line-bar udp"></div>
+            <div class="arch-line-label udp">UDP + AES-256-GCM</div>
+            <div class="arch-line-bar udp"></div>
+          </div>
+        </div>
+
+        <div class="arch-node server">
+          <h4>Server</h4>
+          <p>Single Rust Binary<br>Async Tokio Runtime<br>SFU Relay</p>
+          <div class="server-blind-badge">Relays only &mdash; never decodes</div>
+        </div>
+
+        <div class="arch-line">
+          <div class="arch-line-segment">
+            <div class="arch-line-bar tls"></div>
+            <div class="arch-line-label tls">TCP + TLS</div>
+            <div class="arch-line-bar tls"></div>
+          </div>
+          <div class="arch-line-segment">
+            <div class="arch-line-bar udp"></div>
+            <div class="arch-line-label udp">UDP + AES-256-GCM</div>
+            <div class="arch-line-bar udp"></div>
+          </div>
+        </div>
+
+        <div class="arch-node">
+          <h4>Client B</h4>
+          <p>Tauri 2 Desktop App<br>Rust + Svelte 5</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== GET STARTED ========== -->
+  <section id="get-started">
+    <div class="container">
+      <h2 class="fade-in">Run Your Own Server</h2>
+      <p class="section-sub fade-in">From zero to encrypted voice chat in under 5 minutes.</p>
+
+      <div class="start-grid">
+
+        <div class="fade-in">
+          <div class="code-block">
+            <div class="code-header">1. Build the server</div>
+            <pre><code><span class="comment"># Clone the repo</span>
+git clone https://github.com/your-org/voipc.git
+cd voipc
+
+<span class="comment"># Build the server binary</span>
+cargo build -p voipc-server --release</code></pre>
+          </div>
+
+          <div class="code-block">
+            <div class="code-header">2. Generate TLS certificates</div>
+            <pre><code>mkdir -p certs
+openssl req -x509 -newkey ec \
+  -pkeyopt ec_paramgen_curve:prime256v1 \
+  -keyout certs/server.key \
+  -out certs/server.crt \
+  -days 365 -nodes \
+  -subj "/CN=voipc"</code></pre>
+          </div>
+
+          <div class="code-block">
+            <div class="code-header">3. Run</div>
+            <pre><code>./target/release/voipc-server</code></pre>
+          </div>
+        </div>
+
+        <div class="fade-in">
+          <h3 style="font-size:1.125rem;font-weight:700;margin-bottom:24px;">Requirements &amp; Configuration</h3>
+          <ul class="req-list">
+            <li>
+              <span class="req-label">Rust</span>
+              Install via <a href="https://rustup.rs" target="_blank" rel="noopener">rustup.rs</a>. Stable toolchain.
+            </li>
+            <li>
+              <span class="req-label">Linux deps</span>
+              libssl-dev, pkg-config, libasound2-dev (for audio)
+            </li>
+            <li>
+              <span class="req-label">Ports</span>
+              TCP &amp; UDP 9987 (default, configurable)
+            </li>
+            <li>
+              <span class="req-label">Config</span>
+              TOML config file: tcp_port, udp_port, max_users, cert_path, key_path
+            </li>
+            <li>
+              <span class="req-label">Settings</span>
+              server_settings.json: empty_channel_timeout, max_channels
+            </li>
+          </ul>
+
+          <div style="margin-top:32px;">
+            <a href="https://github.com" class="btn btn-outline" target="_blank" rel="noopener">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+              Full Build Instructions on GitHub
+            </a>
+          </div>
+        </div>
+
+      </div>
+    </div>
+  </section>
+
+  <!-- ========== FOOTER ========== -->
+  <footer>
+    <div class="footer-logo">Vo<span style="color:var(--accent-cyan)">IPC</span></div>
+    <p class="footer-tagline">Built with Rust, Svelte, and paranoia.</p>
+    <div class="footer-links">
+      <a href="https://github.com" target="_blank" rel="noopener">
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0C5.37 0 0 5.37 0 12c0 5.31 3.435 9.795 8.205 11.385.6.105.825-.255.825-.57 0-.285-.015-1.23-.015-2.235-3.015.555-3.795-.735-4.035-1.41-.135-.345-.72-1.41-1.23-1.695-.42-.225-1.02-.78-.015-.795.945-.015 1.62.87 1.845 1.23 1.08 1.815 2.805 1.305 3.495.99.105-.78.42-1.305.765-1.605-2.67-.3-5.46-1.335-5.46-5.925 0-1.305.465-2.385 1.23-3.225-.12-.3-.54-1.53.12-3.18 0 0 1.005-.315 3.3 1.23.96-.27 1.98-.405 3-.405s2.04.135 3 .405c2.295-1.56 3.3-1.23 3.3-1.23.66 1.65.24 2.88.12 3.18.765.84 1.23 1.905 1.23 3.225 0 4.605-2.805 5.625-5.475 5.925.435.375.81 1.095.81 2.22 0 1.605-.015 2.895-.015 3.3 0 .315.225.69.825.57A12.02 12.02 0 0 0 24 12c0-6.63-5.37-12-12-12z"/></svg>
+        GitHub
+      </a>
+      <a href="#" style="color:var(--text-muted)">MIT License</a>
+    </div>
+    <p class="footer-note">No cookies. No tracking. Not even on this website.</p>
+  </footer>
+
+  <!-- ========== JAVASCRIPT ========== -->
+  <script>
+    // Smooth scroll
+    document.querySelectorAll('a[href^="#"]').forEach(a => {
+      a.addEventListener('click', e => {
+        e.preventDefault();
+        const target = document.querySelector(a.getAttribute('href'));
+        if (target) {
+          target.scrollIntoView({ behavior: 'smooth' });
+          // Close mobile menu
+          document.getElementById('navLinks').classList.remove('open');
+          document.getElementById('menuToggle').classList.remove('open');
+        }
+      });
+    });
+
+    // Active nav highlight
+    const sections = document.querySelectorAll('section[id]');
+    const navLinks = document.querySelectorAll('.nav-links a[href^="#"]');
+    const navObserver = new IntersectionObserver(entries => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          const id = entry.target.id;
+          navLinks.forEach(link => {
+            link.classList.toggle('active', link.getAttribute('href') === '#' + id);
+          });
+        }
+      });
+    }, { threshold: 0.2, rootMargin: '-64px 0px -40% 0px' });
+    sections.forEach(s => navObserver.observe(s));
+
+    // Tab switching
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+        btn.classList.add('active');
+        document.getElementById(btn.dataset.tab).classList.add('active');
+      });
+    });
+
+    // Accordion
+    document.querySelectorAll('.accordion-header').forEach(header => {
+      header.addEventListener('click', () => {
+        const item = header.parentElement;
+        const wasActive = item.classList.contains('active');
+        document.querySelectorAll('.accordion-item').forEach(i => i.classList.remove('active'));
+        if (!wasActive) item.classList.add('active');
+      });
+    });
+
+    // Mobile menu
+    document.getElementById('menuToggle').addEventListener('click', () => {
+      document.getElementById('navLinks').classList.toggle('open');
+      document.getElementById('menuToggle').classList.toggle('open');
+    });
+
+    // Scroll fade-in
+    const fadeObserver = new IntersectionObserver(entries => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('visible');
+          fadeObserver.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.08 });
+    document.querySelectorAll('.fade-in').forEach(el => fadeObserver.observe(el));
+
+    // Generate particles
+    const particleContainer = document.getElementById('particles');
+    for (let i = 0; i < 20; i++) {
+      const p = document.createElement('div');
+      p.className = 'particle';
+      p.style.left = Math.random() * 100 + '%';
+      p.style.animationDuration = (18 + Math.random() * 20) + 's';
+      p.style.animationDelay = (Math.random() * 15) + 's';
+      p.style.width = p.style.height = (2 + Math.random() * 4) + 'px';
+      particleContainer.appendChild(p);
+    }
+  </script>
+
+</body>
+</html>

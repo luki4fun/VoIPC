@@ -1,0 +1,13 @@
+[package]
+name = "voipc-audio"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+voipc-protocol = { workspace = true }
+cpal = { workspace = true }
+audiopus = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+ringbuf = "0.4"
+nnnoiseless = "0.1"

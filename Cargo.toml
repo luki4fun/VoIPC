@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/voipc-protocol",
+    "crates/voipc-audio",
+    "crates/voipc-video",
+    "crates/voipc-crypto",
+    "crates/voipc-server",
+    "client/src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+voipc-protocol = { path = "crates/voipc-protocol" }
+voipc-audio = { path = "crates/voipc-audio" }
+voipc-video = { path = "crates/voipc-video" }
+voipc-crypto = { path = "crates/voipc-crypto" }
+
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.1", features = ["alloc"] }
+
+tokio = { version = "1", features = ["full"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+rustls-pemfile = "2"
+
+cpal = "0.15"
+audiopus = "0.3.0-rc.0"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+anyhow = "1.0"
+thiserror = "2.0"
+bytes = "1"

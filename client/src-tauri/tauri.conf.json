@@ -1,0 +1,43 @@
+{
+  "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/schema.json",
+  "productName": "VoIPC",
+  "version": "0.1.0",
+  "identifier": "com.voipc.app",
+  "build": {
+    "frontendDist": "../dist",
+    "devUrl": "http://localhost:1420",
+    "beforeDevCommand": "npm run dev",
+    "beforeBuildCommand": "npm run build"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "VoIPC",
+        "width": 800,
+        "height": 600,
+        "minWidth": 640,
+        "minHeight": 480,
+        "resizable": true
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; script-src 'self'; connect-src ipc: http://ipc.localhost"
+    }
+  },
+  "bundle": {
+    "linux": {
+      "deb": {
+        "depends": [
+          "libavcodec60",
+          "libavformat60",
+          "libavutil58",
+          "libswscale7",
+          "libturbojpeg",
+          "libpipewire-0.3-0t64",
+          "libgbm1",
+          "libasound2t64"
+        ]
+      }
+    }
+  }
+}

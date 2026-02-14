@@ -1,0 +1,9 @@
+[package]
+name = "voipc-video"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+ffmpeg-next = "8.0"
+anyhow = { workspace = true }
+tracing = { workspace = true }

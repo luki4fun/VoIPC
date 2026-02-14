@@ -1,0 +1,6 @@
+[target.x86_64-pc-windows-msvc]
+# audiopus_sys builds Opus via cmake which uses /MDd (debug CRT) in debug builds,
+# but Rust always links /MD (release CRT). This causes LNK2001 for _CrtDbgReportW.
+# Adding ucrtd.lib provides the missing debug CRT symbol without breaking anything -
+# it's only called by debug assertion macros in third-party C code.
+rustflags = ["-C", "link-arg=ucrtd.lib"]

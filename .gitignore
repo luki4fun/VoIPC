@@ -1,0 +1,25 @@
+/target
+Cargo.lock
+*.swp
+*.swo
+*~
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Tauri client build artifacts
+client/src-tauri/target/
+client/src-tauri/external-dlls/
+client/node_modules/
+client/dist/
+
+# Certificates (keep generate script, ignore actual certs)
+certs/*.key
+certs/*.crt
+certs/*.pem
+
+# OS files
+.DS_Store
+Thumbs.db

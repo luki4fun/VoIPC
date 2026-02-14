@@ -1,0 +1,31 @@
+[package]
+name = "voipc-crypto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+# Signal Protocol — official Rust implementation (requires Rust >= 1.88)
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.67.2" }
+
+# Symmetric encryption for media (voice/video) and state persistence
+ring = "0.17"
+rand = "0.8"
+
+# Key derivation
+hkdf = "0.12"
+hmac = "0.12"
+sha2 = "0.10"
+
+# Serialization for persistent state
+serde = { workspace = true }
+postcard = { workspace = true }
+
+# Async trait support + UUID for sender keys
+async-trait = "0.1"
+uuid = { version = "1", features = ["v5"] }
+
+# Error handling / async
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
