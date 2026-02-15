@@ -217,12 +217,15 @@ openssl req -x509 -newkey ec \
 The server listens on port **9987** (TCP + UDP) by default. Configure via `server.toml`:
 
 ```toml
+host = "0.0.0.0"          # Bind address — set to your public/VPN IP for correct UDP routing
 tcp_port = 9987
 udp_port = 9987
 max_users = 64
 cert_path = "certs/server.crt"
 key_path = "certs/server.key"
 ```
+
+> **VPN / multi-homed setups:** If clients connect via a domain name (e.g. `vpn.example.com`) that resolves to a specific IP, set `host` to that IP. Otherwise the server may send UDP replies from the wrong interface and clients won't receive voice/video. All options can also be passed as CLI flags (`--host`, `--tcp-port`, etc.).
 
 Runtime settings in `server_settings.json`:
 

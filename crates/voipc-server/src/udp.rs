@@ -14,7 +14,6 @@ const MAX_UDP_PACKET_SIZE: usize = 1500;
 /// Run the UDP voice+video packet receive/forward loop.
 pub async fn run_udp_loop(socket: Arc<UdpSocket>, state: Arc<ServerState>) {
     let mut buf = vec![0u8; MAX_UDP_PACKET_SIZE];
-
     loop {
         let (len, src_addr) = match socket.recv_from(&mut buf).await {
             Ok(result) => result,
@@ -79,23 +78,30 @@ async fn handle_voice_packet(
             opus_data: Vec::new(),
             key_id: 0,
         };
-        let _ = socket.send_to(&pong.to_bytes(), src_addr).await;
+        if let Err(e) = socket.send_to(&pong.to_bytes(), src_addr).await {
+            warn!(session_id, %src_addr, "pong send failed: {}", e);
+        }
         return;
     }
 
     // Forward voice packet to all other members in the same channel
     let channel_id = match state.sessions.get(&session_id) {
         Some(session) => session.channel_id,
-        None => return,
+        None => {
+            warn!(session_id, "voice forward: session not found in state");
+            return;
+        }
     };
 
     // Voice is disabled in the General channel (channel 0)
     if channel_id == 0 {
+        debug!(session_id, "voice forward: dropping (General channel)");
         return;
     }
 
     let channels = state.channels.read().await;
     let Some(channel) = channels.get(&channel_id) else {
+        warn!(session_id, channel_id, "voice forward: channel not found");
         return;
     };
 
@@ -113,8 +119,9 @@ async fn handle_voice_packet(
 
         if let Some(member_addr) = member_session.udp_addr {
             if let Err(e) = socket.send_to(data, member_addr).await {
-                trace!(
+                warn!(
                     target_user = member_uid,
+                    %member_addr,
                     "failed to forward voice packet: {}",
                     e
                 );

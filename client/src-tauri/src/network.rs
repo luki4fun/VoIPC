@@ -239,16 +239,20 @@ pub async fn connect_to_server(
     };
 
     let udp_addr = format!("{}:{}", host, udp_port);
-    udp_socket
-        .connect(&udp_addr)
+    let server_addr: std::net::SocketAddr = tokio::net::lookup_host(&udp_addr)
         .await
-        .map_err(|e| format!("Failed to connect UDP to {}: {}", udp_addr, e))?;
+        .map_err(|e| format!("Failed to resolve UDP addr {}: {}", udp_addr, e))?
+        .next()
+        .ok_or_else(|| format!("No addresses found for {}", udp_addr))?;
 
-    info!("UDP socket connected to {}", udp_addr);
+    info!("UDP target resolved to {}", server_addr);
 
     // Send an initial UDP ping so the server learns our UDP address
     let ping_packet = VoicePacket::ping(session_id, udp_token, 0);
-    let _ = udp_socket.send(&ping_packet.to_bytes()).await;
+    match udp_socket.send_to(&ping_packet.to_bytes(), server_addr).await {
+        Ok(n) => info!("UDP ping sent ({} bytes) to {}", n, server_addr),
+        Err(e) => error!("UDP ping send failed: {}", e),
+    }
 
     // Start audio playback stream (output to speakers)
     let settings = state.settings.read().await;
@@ -328,10 +332,10 @@ pub async fn connect_to_server(
         screen_share_active.clone(),
         watching_user_id_shared.clone(),
     ));
-    let udp_send_handle = tokio::spawn(udp_sender_task(udp_socket.clone(), voice_rx));
-    let video_send_handle = tokio::spawn(udp_sender_task(udp_socket.clone(), video_rx));
+    let udp_send_handle = tokio::spawn(udp_sender_task(udp_socket.clone(), voice_rx, server_addr));
+    let video_send_handle = tokio::spawn(udp_sender_task(udp_socket.clone(), video_rx, server_addr));
     let screen_audio_send_handle =
-        tokio::spawn(udp_sender_task(udp_socket.clone(), screen_audio_rx));
+        tokio::spawn(udp_sender_task(udp_socket.clone(), screen_audio_rx, server_addr));
     let video_decode_handle = tokio::task::spawn_blocking({
         let app_handle = app_handle.clone();
         let tcp_tx = tcp_tx.clone();
@@ -1445,13 +1449,16 @@ fn handle_encrypted_channel_message(
 }
 
 /// UDP sender task: sends voice packets from the channel to the server.
-async fn udp_sender_task(socket: Arc<UdpSocket>, mut rx: mpsc::Receiver<Vec<u8>>) {
+async fn udp_sender_task(
+    socket: Arc<UdpSocket>,
+    mut rx: mpsc::Receiver<Vec<u8>>,
+    server_addr: std::net::SocketAddr,
+) {
     while let Some(data) = rx.recv().await {
-        if let Err(e) = socket.send(&data).await {
+        if let Err(e) = socket.send_to(&data, server_addr).await {
             error!("UDP send error: {}", e);
         }
     }
-    info!("UDP sender task ended");
 }
 
 /// UDP receiver task: receives voice and video packets, decrypting if encrypted.
@@ -1532,13 +1539,24 @@ async fn udp_receiver_task(
         }
     }
 
+    let mut recv_count: u64 = 0;
+
     loop {
-        match socket.recv(&mut buf).await {
-            Ok(n) => {
+        match socket.recv_from(&mut buf).await {
+            Ok((n, src_addr)) => {
                 if n == 0 {
                     continue;
                 }
+                recv_count += 1;
                 let packet_type = buf[0];
+
+                // Log first packet to confirm UDP reception is working
+                if recv_count == 1 {
+                    info!(
+                        "UDP recv established: type=0x{:02x} len={} from={}",
+                        packet_type, n, src_addr
+                    );
+                }
 
                 match packet_type {
                     // Voice: OpusVoice (unencrypted) or EncryptedOpusVoice

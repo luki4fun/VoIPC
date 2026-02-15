@@ -3,6 +3,12 @@ use serde::Deserialize;
 /// Server configuration, loaded from a TOML file.
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
+    /// IP address to bind on (default "0.0.0.0").
+    /// Set this to the public/VPN IP that clients connect to so that UDP
+    /// replies are sent from the correct source address.
+    #[serde(default = "default_host")]
+    pub host: String,
+
     /// TCP port for control connections.
     #[serde(default = "default_tcp_port")]
     pub tcp_port: u16,
@@ -22,6 +28,10 @@ pub struct ServerConfig {
     pub key_path: String,
 }
 
+fn default_host() -> String {
+    "0.0.0.0".into()
+}
+
 fn default_tcp_port() -> u16 {
     9987
 }
@@ -37,6 +47,7 @@ fn default_max_users() -> u32 {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            host: default_host(),
             tcp_port: default_tcp_port(),
             udp_port: default_udp_port(),
             max_users: default_max_users(),

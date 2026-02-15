@@ -40,6 +40,10 @@ struct Args {
     #[arg(long)]
     udp_port: Option<u16>,
 
+    /// Bind address (IP), overrides config
+    #[arg(long)]
+    host: Option<String>,
+
     /// Path to server settings file (JSON)
     #[arg(long)]
     settings: Option<String>,
@@ -84,6 +88,9 @@ async fn main() -> Result<()> {
     if let Some(port) = args.udp_port {
         config.udp_port = port;
     }
+    if let Some(host) = args.host {
+        config.host = host;
+    }
 
     // Load server settings (JSON)
     let server_settings = if let Some(settings_path) = &args.settings {
@@ -98,6 +105,7 @@ async fn main() -> Result<()> {
 
     info!("VoIPC Server starting");
     info!(
+        host = %config.host,
         tcp_port = config.tcp_port,
         udp_port = config.udp_port,
         max_users = config.max_users,
@@ -119,11 +127,11 @@ async fn main() -> Result<()> {
     let state = Arc::new(ServerState::new(&config, server_settings));
 
     // Bind TCP listener
-    let tcp_listener = TcpListener::bind(format!("0.0.0.0:{}", config.tcp_port))
+    let tcp_listener = TcpListener::bind(format!("{}:{}", config.host, config.tcp_port))
         .await
-        .with_context(|| format!("failed to bind TCP port {}", config.tcp_port))?;
+        .with_context(|| format!("failed to bind TCP on {}:{}", config.host, config.tcp_port))?;
 
-    info!("TCP listener bound on 0.0.0.0:{}", config.tcp_port);
+    info!("TCP listener bound on {}:{}", config.host, config.tcp_port);
 
     // Bind UDP socket with large buffers to absorb video packet bursts
     let udp_socket = {
@@ -135,11 +143,11 @@ async fn main() -> Result<()> {
         .with_context(|| "failed to create UDP socket")?;
         let _ = sock.set_recv_buffer_size(2 * 1024 * 1024); // 2MB
         let _ = sock.set_send_buffer_size(2 * 1024 * 1024); // 2MB
-        let addr: std::net::SocketAddr = format!("0.0.0.0:{}", config.udp_port)
+        let addr: std::net::SocketAddr = format!("{}:{}", config.host, config.udp_port)
             .parse()
-            .with_context(|| "invalid UDP address")?;
+            .with_context(|| format!("invalid UDP address {}:{}", config.host, config.udp_port))?;
         sock.bind(&addr.into())
-            .with_context(|| format!("failed to bind UDP port {}", config.udp_port))?;
+            .with_context(|| format!("failed to bind UDP on {}:{}", config.host, config.udp_port))?;
         sock.set_nonblocking(true)
             .with_context(|| "failed to set non-blocking")?;
         let std_sock: std::net::UdpSocket = sock.into();
@@ -149,7 +157,7 @@ async fn main() -> Result<()> {
         )
     };
 
-    info!("UDP socket bound on 0.0.0.0:{}", config.udp_port);
+    info!("UDP socket bound on {}:{}", config.host, config.udp_port);
 
     // Spawn UDP voice loop
     let udp_state = state.clone();
