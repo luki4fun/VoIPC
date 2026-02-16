@@ -65,6 +65,8 @@ pub struct UserSession {
     pub chat_rate: RateLimiter,
     /// Rate limiter for channel creation.
     pub create_channel_rate: RateLimiter,
+    /// Rate limiter for pre-key uploads.
+    pub prekey_rate: RateLimiter,
     /// Whether this user is currently screen sharing.
     pub is_screen_sharing: bool,
     /// The user_id of the screenshare this user is currently watching (if any).
@@ -940,6 +942,7 @@ mod tests {
             udp_token: user_id as u64 * 1000,
             chat_rate: RateLimiter::new(5.0, 5.0),
             create_channel_rate: RateLimiter::new(1.0, 0.2),
+            prekey_rate: RateLimiter::new(1.0, 0.2),
             is_screen_sharing: false,
             watching_screenshare: None,
             identity_key: None,

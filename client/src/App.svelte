@@ -15,6 +15,8 @@
   import Toast from "./lib/components/Toast.svelte";
   import ReconnectOverlay from "./lib/components/ReconnectOverlay.svelte";
   import InvitePopup from "./lib/components/InvitePopup.svelte";
+  import PokePopup from "./lib/components/PokePopup.svelte";
+  import Icon from "./lib/components/Icons.svelte";
 
   import {
     connectionState,
@@ -23,11 +25,15 @@
     userId,
     latency,
     acceptSelfSigned,
+    isMuted,
+    isDeafened,
+    isTransmitting,
   } from "./lib/stores/connection.js";
   import { channels, currentChannelId, previewChannelId, previewUsers } from "./lib/stores/channels.js";
   import { users, speakingUsers } from "./lib/stores/users.js";
   import { addNotification } from "./lib/stores/notifications.js";
   import { pendingInvites } from "./lib/stores/invites.js";
+  import { pendingPokes, createPoke } from "./lib/stores/pokes.js";
   import {
     addChannelMessage,
     addDmMessage,
@@ -35,10 +41,35 @@
     incrementChannelUnread,
     clearChannelUnread,
     chatUnlocked,
-    chatFileExists,
   } from "./lib/stores/chat.js";
-  import PasswordPrompt from "./lib/components/PasswordPrompt.svelte";
+  import ChatHistorySetup from "./lib/components/ChatHistorySetup.svelte";
   import type { ChannelInfo, UserInfo } from "./lib/types.js";
+  import {
+    inputDevice,
+    outputDevice,
+    volume,
+    pttKey,
+    pttHoldMode,
+    noiseSuppression,
+    rememberConnection,
+    lastHost,
+    lastPort,
+    lastUsername,
+    lastAcceptSelfSigned,
+    autoConnect,
+    soundSettings,
+  } from "./lib/stores/settings.js";
+  import type { AppConfig } from "./lib/stores/settings.js";
+  import { voiceMode, vadThreshold } from "./lib/stores/voice.js";
+  import {
+    playChannelSwitchSound,
+    playUserJoinedSound,
+    playUserLeftSound,
+    playDisconnectedSound,
+    playDirectMessageSound,
+    playChannelMessageSound,
+    playPokeSound,
+  } from "./lib/sounds.js";
   import {
     addScreenShare,
     removeScreenShare,
@@ -71,6 +102,40 @@
   let showSettings = $state(false);
   let reconnectAttempt = $state(0);
   let reconnectCancelled = $state(false);
+  let reconnectError = $state("");
+
+  // Deferred auto-connect: waits for chat history to be unlocked first
+  let pendingAutoConnect = $state<AppConfig | null>(null);
+
+  async function performAutoConnect(config: AppConfig) {
+    connectionState.set("connecting");
+    try {
+      const address = `${config.last_host}:${config.last_port ?? 9987}`;
+      const id = await invoke<number>("connect", {
+        address,
+        username: config.last_username!,
+        acceptInvalidCerts: config.last_accept_self_signed ?? false,
+      });
+      userId.set(id);
+      serverAddress.set(address);
+      username.set(config.last_username!);
+      acceptSelfSigned.set(config.last_accept_self_signed ?? false);
+      connectionState.set("connected");
+    } catch (e) {
+      console.error("Auto-connect failed:", e);
+      connectionState.set("disconnected");
+      addNotification("Auto-connect failed: " + String(e), "warning");
+    }
+  }
+
+  // Trigger auto-connect only after chat history password has been entered
+  $effect(() => {
+    if (pendingAutoConnect && $chatUnlocked) {
+      const config = pendingAutoConnect;
+      pendingAutoConnect = null;
+      performAutoConnect(config);
+    }
+  });
 
   // Close pop-out window when watching stops
   $effect(() => {
@@ -95,7 +160,11 @@
   async function startReconnect(address: string, name: string, previousChannelId: number) {
     reconnectAttempt = 0;
     reconnectCancelled = false;
+    reconnectError = "";
     connectionState.set("reconnecting");
+
+    const startTime = Date.now();
+    const RECONNECT_TIMEOUT_MS = 30_000;
 
     while (!reconnectCancelled) {
       reconnectAttempt++;
@@ -104,6 +173,14 @@
       // Wait before retrying
       await new Promise((resolve) => setTimeout(resolve, delay));
       if (reconnectCancelled) break;
+
+      // Give up after 30 seconds
+      if (Date.now() - startTime > RECONNECT_TIMEOUT_MS) {
+        addNotification("Reconnection timed out. Please reconnect manually.", "error");
+        reconnectError = "";
+        connectionState.set("disconnected");
+        return;
+      }
 
       // Clean up stale connection state
       try {
@@ -121,6 +198,7 @@
         // Success!
         userId.set(id);
         connectionState.set("connected");
+        reconnectError = "";
         addNotification("Reconnected to server", "info");
 
         // Try to rejoin previous channel
@@ -132,12 +210,23 @@
           }
         }
         return;
-      } catch {
-        // Failed — will retry
+      } catch (e: any) {
+        const errMsg = typeof e === "string" ? e : e?.message ?? "Unknown error";
+        if (errMsg.includes("username already taken")) {
+          reconnectError = "Username still held by server, waiting...";
+        } else if (errMsg.includes("version mismatch")) {
+          addNotification(errMsg, "error");
+          reconnectError = "";
+          connectionState.set("disconnected");
+          return;
+        } else {
+          reconnectError = errMsg;
+        }
       }
     }
 
     // User cancelled
+    reconnectError = "";
     connectionState.set("disconnected");
   }
 
@@ -146,14 +235,37 @@
     connectionState.set("disconnected");
   }
 
-  onMount(() => {
-    // Check if encrypted chat history file exists
-    invoke<boolean>("chat_history_exists").then((exists) => {
-      chatFileExists.set(exists);
-    }).catch((e) => {
-      console.error("Failed to check chat history:", e);
-      chatFileExists.set(false);
-    });
+  onMount(async () => {
+    // Load persisted config and hydrate all stores
+    try {
+      const config = await invoke<AppConfig>("load_config");
+      pttKey.set(config.ptt_key);
+      pttHoldMode.set(config.ptt_hold_mode);
+      volume.set(config.volume);
+      voiceMode.set(config.voice_mode as any);
+      vadThreshold.set(config.vad_threshold_db);
+      noiseSuppression.set(config.noise_suppression);
+      isMuted.set(config.muted);
+      isDeafened.set(config.deafened);
+      soundSettings.set(config.sounds);
+      autoConnect.set(config.auto_connect);
+      if (config.input_device) inputDevice.set(config.input_device);
+      if (config.output_device) outputDevice.set(config.output_device);
+      rememberConnection.set(config.remember_connection);
+      if (config.remember_connection) {
+        lastHost.set(config.last_host ?? "localhost");
+        lastPort.set(config.last_port ?? 9987);
+        lastUsername.set(config.last_username ?? "");
+        lastAcceptSelfSigned.set(config.last_accept_self_signed ?? false);
+      }
+
+      // Schedule auto-connect — will trigger after chat history is unlocked
+      if (config.auto_connect && config.remember_connection && config.last_host && config.last_username) {
+        pendingAutoConnect = config;
+      }
+    } catch (e) {
+      console.error("Failed to load config:", e);
+    }
 
     // Listen for events from the Rust backend
     const unlisteners = [
@@ -186,9 +298,10 @@
         const joinedName = channelNameById(newChannelId);
         if (joinedName) clearChannelUnread(joinedName);
 
-        // Clear screenshare state when changing channels
+        // Clear screenshare state and play channel switch sound
         if (oldChannelId !== newChannelId) {
           resetScreenShareState();
+          playChannelSwitchSound();
         }
 
         // Clear preview when we actually join a channel
@@ -200,6 +313,10 @@
         // Only add to local user list if they joined our channel
         if (event.payload.channel_id === $currentChannelId) {
           users.update((u) => [...u, event.payload]);
+          // Play join sound (not for lobby, not for ourselves)
+          if ($currentChannelId !== 0 && event.payload.user_id !== $userId) {
+            playUserJoinedSound();
+          }
         }
         // Always update channel user count (broadcast to all)
         channels.update((chs) =>
@@ -214,6 +331,10 @@
       listen<{ user_id: number; channel_id: number }>("user-left", (event) => {
         // Only remove from local user list if they left our channel
         if (event.payload.channel_id === $currentChannelId) {
+          // Play leave sound before removing (not for lobby, not for ourselves)
+          if ($currentChannelId !== 0 && event.payload.user_id !== $userId) {
+            playUserLeftSound();
+          }
           users.update((u) =>
             u.filter((user) => user.user_id !== event.payload.user_id)
           );
@@ -272,6 +393,11 @@
 
         // Clear screenshare state
         resetScreenShareState();
+
+        // Play disconnected sound on initial loss (not during reconnect retries)
+        if ($connectionState === "connected") {
+          playDisconnectedSound();
+        }
 
         // If we were connected, start auto-reconnect
         if ($connectionState === "connected") {
@@ -355,6 +481,22 @@
         addNotification("Your invite was declined", "warning");
       }),
 
+      // Poke events
+      listen<{ from_user_id: number; from_username: string; message: string }>(
+        "poke-received",
+        (event) => {
+          pendingPokes.update((p) => [
+            ...p,
+            createPoke(
+              event.payload.from_user_id,
+              event.payload.from_username,
+              event.payload.message,
+            ),
+          ]);
+          playPokeSound();
+        }
+      ),
+
       // Chat events
       listen<{
         channel_id: number;
@@ -371,6 +513,7 @@
           const viewingThisChannel = $activeDmUserId === null && channel_id === $currentChannelId;
           if (!viewingThisChannel) {
             incrementChannelUnread(chName);
+            if (uid !== $userId) playChannelMessageSound();
           }
         }
       }),
@@ -390,6 +533,7 @@
           content,
           timestamp,
         });
+        if (from_user_id !== myId) playDirectMessageSound();
       }),
 
       // Screen share events
@@ -475,6 +619,14 @@
         currentFrame.set(null);
         invoke("stop_screen_capture").catch(() => {});
       }),
+
+      // Global PTT shortcut events from Rust backend
+      listen("ptt-global-pressed", () => {
+        isTransmitting.set(true);
+      }),
+      listen("ptt-global-released", () => {
+        isTransmitting.set(false);
+      }),
     ];
 
     // Periodic ping for latency measurement
@@ -542,8 +694,8 @@
   });
 </script>
 
-{#if $chatFileExists !== null && !$chatUnlocked}
-  <PasswordPrompt fileExists={$chatFileExists} />
+{#if !$chatUnlocked}
+  <ChatHistorySetup />
 {/if}
 
 {#if $connectionState === "disconnected" || $connectionState === "connecting"}
@@ -551,14 +703,15 @@
 {/if}
 
 {#if $connectionState === "reconnecting"}
-  <ReconnectOverlay attempt={reconnectAttempt} oncancel={cancelReconnect} />
+  <ReconnectOverlay attempt={reconnectAttempt} error={reconnectError} oncancel={cancelReconnect} />
 {/if}
 
-<div class="app-layout">
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="app-layout" oncontextmenu={(e) => e.preventDefault()}>
   <div class="titlebar">
     <span class="title">VoIPC</span>
-    <button class="settings-btn" onclick={() => (showSettings = true)}>
-      Settings
+    <button class="settings-btn" onclick={() => (showSettings = true)} title="Settings">
+      <Icon name="settings" size={18} />
     </button>
   </div>
 
@@ -586,6 +739,7 @@
 
 <Toast />
 <InvitePopup />
+<PokePopup />
 
 <style>
   .app-layout {
@@ -611,16 +765,22 @@
   }
 
   .settings-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--icon-btn-size);
+    height: var(--icon-btn-size);
+    padding: 0;
     background: transparent;
     color: var(--text-secondary);
-    font-size: 12px;
-    padding: 4px 10px;
-    border: 1px solid var(--border);
+    border: 1px solid transparent;
+    border-radius: var(--icon-btn-radius);
+    transition: color 0.15s, background-color 0.15s;
   }
 
   .settings-btn:hover {
     color: var(--text-primary);
-    border-color: var(--text-secondary);
+    background: var(--bg-hover);
   }
 
   .main-content {

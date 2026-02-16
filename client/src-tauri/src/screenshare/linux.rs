@@ -8,8 +8,8 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use super::{
-    AudioProcessor, CapturedFrame, FrameProcessor, FrameSlot, PixFmt, SCREEN_AUDIO_BITRATE,
-    SCREEN_AUDIO_FRAME_SIZE,
+    AudioProcessor, CapturedFrame, DisplayInfo, FrameProcessor, FrameSlot, PixFmt, WindowInfo,
+    SCREEN_AUDIO_BITRATE, SCREEN_AUDIO_FRAME_SIZE,
 };
 
 /// An active XDG Desktop Portal ScreenCast session.
@@ -31,15 +31,42 @@ impl Drop for CaptureSession {
     }
 }
 
+/// Enumerate available displays. On Linux/Wayland, the portal handles source
+/// enumeration — returns an empty list. The frontend shows a message instead.
+pub fn enumerate_displays() -> Vec<DisplayInfo> {
+    Vec::new()
+}
+
+/// Enumerate available windows. On Linux/Wayland, the portal handles source
+/// enumeration — returns an empty list. The frontend shows a message instead.
+pub fn enumerate_windows() -> Vec<WindowInfo> {
+    Vec::new()
+}
+
 /// Request a ScreenCast session via the XDG Desktop Portal.
 ///
-/// This shows the native OS screen/window picker (like OBS/Firefox).
+/// `source_type` controls which sources the portal picker shows:
+/// - `"display"` → monitors only
+/// - `"window"` → application windows only
+/// - anything else → both (backwards compat)
+///
+/// `source_id` is ignored on Linux (the portal picker handles selection).
+///
 /// Returns a `CaptureSession` containing the PipeWire FD and node ID.
 /// The session stays alive until the `CaptureSession` is dropped.
-pub async fn request_screencast() -> Result<CaptureSession, String> {
+pub async fn request_screencast(
+    source_type: &str,
+    _source_id: &str,
+) -> Result<CaptureSession, String> {
     use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
     use ashpd::desktop::PersistMode;
     use ashpd::WindowIdentifier;
+
+    let portal_source_type = match source_type {
+        "display" => SourceType::Monitor.into(),
+        "window" => SourceType::Window.into(),
+        _ => SourceType::Monitor | SourceType::Window,
+    };
 
     let (result_tx, result_rx) =
         tokio::sync::oneshot::channel::<Result<(OwnedFd, u32), String>>();
@@ -60,7 +87,7 @@ pub async fn request_screencast() -> Result<CaptureSession, String> {
                 .select_sources(
                     &session,
                     CursorMode::Embedded,
-                    SourceType::Monitor | SourceType::Window,
+                    portal_source_type,
                     false,
                     None,
                     PersistMode::DoNot,

@@ -1,12 +1,13 @@
 use std::fs;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use clap::Parser;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 mod config;
 mod settings;
@@ -177,6 +178,18 @@ async fn main() -> Result<()> {
                 continue;
             }
         };
+
+        // Set TCP keepalive to detect dead connections within ~25 seconds
+        {
+            let sock_ref = socket2::SockRef::from(&tcp_stream);
+            let keepalive = socket2::TcpKeepalive::new()
+                .with_time(Duration::from_secs(10))
+                .with_interval(Duration::from_secs(5))
+                .with_retries(3);
+            if let Err(e) = sock_ref.set_tcp_keepalive(&keepalive) {
+                warn!(peer = %peer_addr, "failed to set TCP keepalive: {}", e);
+            }
+        }
 
         let tls_acceptor = tls_acceptor.clone();
         let state = state.clone();

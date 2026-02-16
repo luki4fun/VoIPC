@@ -1,5 +1,6 @@
 <script lang="ts">
   import { notifications, removeNotification } from "../stores/notifications.js";
+  import Icon from "./Icons.svelte";
 </script>
 
 {#if $notifications.length > 0}
@@ -10,7 +11,7 @@
         <button
           class="toast-close"
           onclick={() => removeNotification(notification.id)}
-        >&#10005;</button>
+        ><Icon name="close" size={14} /></button>
       </div>
     {/each}
   </div>
@@ -73,12 +74,14 @@
   }
 
   .toast-close {
+    display: flex;
+    align-items: center;
+    justify-content: center;
     background: transparent;
     border: none;
     color: var(--text-secondary);
-    font-size: 12px;
     cursor: pointer;
-    padding: 2px 4px;
+    padding: 2px;
     border-radius: 3px;
     flex-shrink: 0;
   }

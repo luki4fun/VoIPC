@@ -36,6 +36,13 @@ export const shareFps = writable<number>(30);
 // Whether the source picker modal is open
 export const showSourcePicker = writable<boolean>(false);
 
+// Whether the picker is in "switch" mode (already sharing, switching source)
+export const pickerSwitchMode = writable<boolean>(false);
+
+// Current capture source tracking
+export const currentSourceType = writable<string>("display");
+export const currentSourceId = writable<string>("0");
+
 // Screen audio toggle state (sharer side)
 export const screenAudioEnabled = writable<boolean>(true);
 
@@ -80,6 +87,9 @@ export function resetScreenShareState() {
   shareResolution.set(720);
   shareFps.set(30);
   showSourcePicker.set(false);
+  pickerSwitchMode.set(false);
+  currentSourceType.set("display");
+  currentSourceId.set("0");
   screenAudioEnabled.set(true);
   screenAudioSending.set(false);
   screenAudioReceiving.set(false);

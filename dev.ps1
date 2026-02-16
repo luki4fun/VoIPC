@@ -1,4 +1,11 @@
 # Debug build + run (cargo tauri dev)
+
+# Sync version from workspace Cargo.toml → tauri.conf.json & package.json
+$version = (Select-String -Path "$PSScriptRoot\Cargo.toml" -Pattern '^version\s*=\s*"(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
+foreach ($file in @("$PSScriptRoot\client\src-tauri\tauri.conf.json", "$PSScriptRoot\client\package.json")) {
+    (Get-Content $file -Raw) -replace '"version":\s*"[^"]*"', "`"version`": `"$version`"" | Set-Content $file -NoNewline
+}
+
 $env:VCPKG_ROOT       = "C:\Program Files\vcpkg"
 $env:CMAKE_GENERATOR  = "Visual Studio 17 2022"
 $env:FFMPEG_DIR       = "$env:VCPKG_ROOT\installed\x64-windows"

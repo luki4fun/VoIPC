@@ -8,14 +8,11 @@
     isTransmitting,
   } from "../stores/connection.js";
   import { currentChannelId } from "../stores/channels.js";
-  import { volume, pttKey } from "../stores/settings.js";
+  import { volume, pttKey, pttHoldMode, noiseSuppression } from "../stores/settings.js";
   import { voiceMode, vadThreshold, audioLevel } from "../stores/voice.js";
   import type { VoiceMode } from "../stores/voice.js";
   import ScreenShareControls from "./ScreenShareControls.svelte";
-  import { writable } from "svelte/store";
-
-  // Noise suppression state (default: enabled)
-  const noiseSuppression = writable(true);
+  import Icon from "./Icons.svelte";
 
   // Voice is disabled in the General lobby (channel 0)
   let voiceDisabled = $derived($currentChannelId === 0);
@@ -93,9 +90,10 @@
     } catch (err) {
       console.error("Failed to set voice mode:", err);
     }
-    // If switching to PTT, stop transmit (user needs to hold key)
-    if (mode === "ptt" && $isTransmitting) {
-      stopTransmit();
+    // Stop transmit when changing modes to reset state cleanly
+    // (handles edge case: key held during mode switch, release event won't fire after unregister)
+    if ($isTransmitting) {
+      await stopTransmit();
     }
   }
 
@@ -140,7 +138,47 @@
     };
   });
 
-  // Global keyboard PTT and shortcuts
+  // Parse the PTT binding string (e.g. "Ctrl+Space", "ControlLeft") into parts
+  function parsePttBinding(): { needCtrl: boolean; needAlt: boolean; needShift: boolean; keyCode: string } {
+    const parts = $pttKey.split("+");
+    let needCtrl = false, needAlt = false, needShift = false;
+    let keyCode = "";
+    for (const part of parts) {
+      if (part === "Ctrl") needCtrl = true;
+      else if (part === "Alt") needAlt = true;
+      else if (part === "Shift") needShift = true;
+      else keyCode = part;
+    }
+    return { needCtrl, needAlt, needShift, keyCode };
+  }
+
+  // Check if the full PTT binding matches (all modifiers + trigger key)
+  function matchesPttBinding(e: KeyboardEvent): boolean {
+    const { needCtrl, needAlt, needShift, keyCode } = parsePttBinding();
+    if (needCtrl && !e.ctrlKey) return false;
+    if (needAlt && !e.altKey) return false;
+    if (needShift && !e.shiftKey) return false;
+    return e.code === keyCode;
+  }
+
+  // Check if a keyup event should stop PTT.
+  // In trigger mode: stop when the trigger key is released.
+  // In hold mode with modifiers: stop when a required modifier is released.
+  // In hold mode without modifiers: stop when the trigger key is released.
+  function shouldStopPtt(e: KeyboardEvent): boolean {
+    const { needCtrl, needAlt, needShift, keyCode } = parsePttBinding();
+    if ($pttHoldMode && (needCtrl || needAlt || needShift)) {
+      // Hold mode with modifiers — stop when any required modifier is released
+      if (needCtrl && e.key === "Control") return true;
+      if (needAlt && e.key === "Alt") return true;
+      if (needShift && e.key === "Shift") return true;
+      return false;
+    }
+    // Trigger mode, or no modifiers — stop when the trigger key is released
+    return e.code === keyCode;
+  }
+
+  // Window-level keyboard PTT and shortcuts (fallback when app is focused)
   let keydownHandler: ((e: KeyboardEvent) => void) | null = null;
   let keyupHandler: ((e: KeyboardEvent) => void) | null = null;
 
@@ -151,7 +189,7 @@
       if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
 
       // PTT key — only in PTT mode
-      if ($voiceMode === "ptt" && e.code === $pttKey && !e.repeat) {
+      if ($voiceMode === "ptt" && matchesPttBinding(e) && !e.repeat) {
         e.preventDefault();
         startTransmit();
       }
@@ -174,7 +212,8 @@
       const target = e.target as HTMLElement;
       if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
 
-      if ($voiceMode === "ptt" && e.code === $pttKey) {
+      // Stop transmit when the released key breaks the PTT binding
+      if ($voiceMode === "ptt" && $isTransmitting && shouldStopPtt(e)) {
         e.preventDefault();
         stopTransmit();
       }
@@ -233,32 +272,35 @@
 
     <div class="divider"></div>
 
-    <button
-      class="control-btn"
-      class:active={$isMuted}
-      onclick={toggleMute}
-      title={$isMuted ? "Unmute (Ctrl+M)" : "Mute (Ctrl+M)"}
-    >
-      {$isMuted ? "Unmute" : "Mute"}
-    </button>
+    <div class="control-group">
+      <button
+        class="icon-btn"
+        class:active-danger={$isMuted}
+        onclick={toggleMute}
+        title={$isMuted ? "Unmute (Ctrl+M)" : "Mute (Ctrl+M)"}
+      >
+        <Icon name={$isMuted ? "mic-off" : "mic-on"} size={18} />
+      </button>
 
-    <button
-      class="control-btn"
-      class:active={$isDeafened}
-      onclick={toggleDeafen}
-      title={$isDeafened ? "Undeafen (Ctrl+D)" : "Deafen (Ctrl+D)"}
-    >
-      {$isDeafened ? "Undeafen" : "Deafen"}
-    </button>
+      <button
+        class="icon-btn"
+        class:active-danger={$isDeafened}
+        onclick={toggleDeafen}
+        title={$isDeafened ? "Undeafen (Ctrl+D)" : "Deafen (Ctrl+D)"}
+      >
+        <Icon name={$isDeafened ? "headphones-off" : "headphones-on"} size={18} />
+      </button>
 
-    <button
-      class="control-btn ns-btn"
-      class:active={!$noiseSuppression}
-      onclick={toggleNoiseSuppression}
-      title={$noiseSuppression ? "Disable noise suppression" : "Enable noise suppression"}
-    >
-      NS
-    </button>
+      <button
+        class="icon-btn"
+        class:active-success={$noiseSuppression}
+        class:ns-off={!$noiseSuppression}
+        onclick={toggleNoiseSuppression}
+        title={$noiseSuppression ? "Disable noise suppression" : "Enable noise suppression"}
+      >
+        <Icon name="noise-suppression" size={18} />
+      </button>
+    </div>
   {/if}
 
   <ScreenShareControls />
@@ -266,7 +308,7 @@
   <div class="divider"></div>
 
   <div class="volume">
-    <span class="vol-label">Vol</span>
+    <Icon name="volume" size={16} class="vol-icon" />
     <input
       type="range"
       min="0"
@@ -300,9 +342,9 @@
     background: var(--bg-tertiary);
     color: var(--text-primary);
     border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 4px 6px;
-    font-size: 11px;
+    border-radius: 6px;
+    padding: 6px 8px;
+    font-size: 12px;
     cursor: pointer;
     outline: none;
   }
@@ -377,31 +419,17 @@
     margin: 0;
   }
 
-  .control-btn {
-    background: var(--bg-tertiary);
-    color: var(--text-secondary);
-    padding: 6px 12px;
-    font-size: 12px;
+  .control-group {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 3px;
+    background: rgba(0, 0, 0, 0.15);
+    border-radius: 10px;
   }
 
-  .control-btn:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
-  }
-
-  .control-btn.active {
-    background: var(--danger);
-    color: white;
-  }
-
-  .ns-btn {
-    background: var(--success);
-    color: white;
-  }
-
-  .ns-btn.active {
-    background: var(--bg-tertiary);
-    color: var(--text-secondary);
+  .ns-off {
+    opacity: 0.5;
   }
 
   .divider {
@@ -415,10 +443,6 @@
     align-items: center;
     gap: 6px;
     margin-left: auto;
-  }
-
-  .vol-label {
-    font-size: 12px;
     color: var(--text-secondary);
   }
 

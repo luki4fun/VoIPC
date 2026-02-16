@@ -1,10 +1,11 @@
 <script lang="ts">
   interface Props {
     attempt: number;
+    error?: string;
     oncancel: () => void;
   }
 
-  let { attempt, oncancel }: Props = $props();
+  let { attempt, error = "", oncancel }: Props = $props();
 </script>
 
 <div class="overlay">
@@ -12,6 +13,9 @@
     <div class="spinner"></div>
     <h2>Connection Lost</h2>
     <p class="message">Reconnecting... attempt #{attempt}</p>
+    {#if error}
+      <p class="error-detail">{error}</p>
+    {/if}
     <button class="cancel-btn" onclick={oncancel}>Cancel</button>
   </div>
 </div>
@@ -64,6 +68,13 @@
     font-size: 14px;
     color: var(--text-secondary);
     margin: 0;
+  }
+
+  .error-detail {
+    font-size: 12px;
+    color: var(--danger);
+    margin: 0;
+    text-align: center;
   }
 
   .cancel-btn {

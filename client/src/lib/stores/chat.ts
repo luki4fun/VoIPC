@@ -30,6 +30,14 @@ export const unreadPerChannel = writable<Map<string, number>>(new Map());
 export const chatUnlocked = writable<boolean>(false);
 export const chatFileExists = writable<boolean | null>(null);
 
+export interface ChatHistoryStatus {
+  path_configured: boolean;
+  current_path: string;
+  file_exists: boolean;
+}
+
+export const chatHistoryStatus = writable<ChatHistoryStatus | null>(null);
+
 function dmKey(a: number, b: number): string {
   return `${Math.min(a, b)}-${Math.max(a, b)}`;
 }

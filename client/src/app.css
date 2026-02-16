@@ -12,6 +12,11 @@
   --warning: #f39c12;
   --border: #2a2a4a;
   --speaking: #4caf50;
+
+  /* Icon button sizing */
+  --icon-btn-size: 36px;
+  --icon-btn-size-sm: 28px;
+  --icon-btn-radius: 8px;
 }
 
 * {
@@ -66,6 +71,38 @@ input {
 
 input:focus {
   border-color: var(--accent);
+}
+
+/* Icon button base — reusable across components */
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: var(--icon-btn-size);
+  height: var(--icon-btn-size);
+  padding: 0;
+  border-radius: var(--icon-btn-radius);
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: none;
+  cursor: pointer;
+  transition: background-color 0.15s, color 0.15s;
+  flex-shrink: 0;
+}
+
+.icon-btn:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+
+.icon-btn.active-danger {
+  background: var(--danger);
+  color: white;
+}
+
+.icon-btn.active-success {
+  background: var(--success);
+  color: white;
 }
 
 ::-webkit-scrollbar {

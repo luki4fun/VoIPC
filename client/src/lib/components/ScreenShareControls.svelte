@@ -5,6 +5,7 @@
     isSharingScreen,
     viewerCount,
     showSourcePicker,
+    pickerSwitchMode,
     screenAudioEnabled,
     screenAudioSending,
     senderFps,
@@ -12,6 +13,7 @@
     shareResolution,
   } from "../stores/screenshare.js";
   import { addNotification } from "../stores/notifications.js";
+  import Icon from "./Icons.svelte";
 
   let inLobby = $derived($currentChannelId === 0);
 
@@ -36,6 +38,12 @@
   );
 
   async function openPicker() {
+    pickerSwitchMode.set(false);
+    showSourcePicker.set(true);
+  }
+
+  function openSwitchPicker() {
+    pickerSwitchMode.set(true);
     showSourcePicker.set(true);
   }
 
@@ -64,25 +72,25 @@
 
   {#if $isSharingScreen}
     <button class="share-btn active" onclick={stopSharing} title="Stop sharing">
-      Stop Share
+      <Icon name="monitor-off" size={16} />
+      <span class="btn-label">Stop</span>
       {#if $viewerCount > 0}
         <span class="viewer-badge">{$viewerCount}</span>
       {/if}
+    </button>
+    <button class="icon-btn-sm" onclick={openSwitchPicker} title="Switch capture source">
+      <Icon name="switch-source" size={16} />
     </button>
     <button
       class="audio-toggle {audioStatus}"
       onclick={toggleAudio}
       title={$screenAudioEnabled ? "Disable screen audio" : "Enable screen audio"}
     >
-      <span class="audio-icon">&#9835;</span>
+      <Icon name="music-note" size={14} />
       {#if audioStatus === "sending"}
-        <span class="status-text">Sending</span>
         <span class="status-dot active"></span>
       {:else if audioStatus === "no-signal"}
-        <span class="status-text">No signal</span>
         <span class="status-dot idle"></span>
-      {:else}
-        <span class="status-text">Off</span>
       {/if}
     </button>
     {#if $senderFps > 0}
@@ -96,7 +104,8 @@
     {/if}
   {:else}
     <button class="share-btn" onclick={openPicker} title="Share your screen">
-      Share Screen
+      <Icon name="monitor" size={16} />
+      <span class="btn-label">Share</span>
     </button>
   {/if}
 {/if}
@@ -134,6 +143,31 @@
     opacity: 0.9;
   }
 
+  .btn-label {
+    font-size: 12px;
+  }
+
+  .icon-btn-sm {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--icon-btn-size-sm);
+    height: var(--icon-btn-size-sm);
+    padding: 0;
+    border-radius: var(--icon-btn-radius);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    border: none;
+    cursor: pointer;
+    transition: background-color 0.15s, color 0.15s;
+    flex-shrink: 0;
+  }
+
+  .icon-btn-sm:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
   .viewer-badge {
     background: rgba(255, 255, 255, 0.25);
     font-size: 10px;
@@ -143,15 +177,21 @@
   }
 
   .audio-toggle {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--icon-btn-size-sm);
+    height: var(--icon-btn-size-sm);
+    padding: 0;
+    border-radius: var(--icon-btn-radius);
     background: var(--bg-tertiary);
     color: var(--text-secondary);
-    padding: 4px 10px;
-    font-size: 12px;
-    display: flex;
-    align-items: center;
-    gap: 5px;
+    border: none;
+    cursor: pointer;
+    transition: background-color 0.15s, color 0.15s;
     flex-shrink: 0;
-    white-space: nowrap;
+    gap: 0;
+    position: relative;
   }
 
   .audio-toggle:hover {
@@ -171,20 +211,13 @@
     color: #faa61a;
   }
 
-  .audio-icon {
-    font-size: 14px;
-  }
-
-  .status-text {
-    font-size: 11px;
-  }
-
   .status-dot {
-    width: 7px;
-    height: 7px;
+    width: 6px;
+    height: 6px;
     border-radius: 50%;
-    display: inline-block;
-    flex-shrink: 0;
+    position: absolute;
+    bottom: 3px;
+    right: 3px;
   }
 
   .status-dot.active {

@@ -7,13 +7,30 @@
     userId,
     acceptSelfSigned,
   } from "../stores/connection.js";
+  import {
+    rememberConnection,
+    lastHost,
+    lastPort,
+    lastUsername,
+    lastAcceptSelfSigned,
+  } from "../stores/settings.js";
 
-  let host = $state("localhost");
-  let port = $state(9987);
-  let name = $state("");
+  let host = $state($lastHost);
+  let port = $state($lastPort);
+  let name = $state($lastUsername);
   let error = $state("");
   let connecting = $state(false);
-  let selfSigned = $state(false);
+  let selfSigned = $state($lastAcceptSelfSigned);
+  let remember = $state($rememberConnection);
+
+  // Sync from stores when they're hydrated (async config load may arrive after first render)
+  $effect(() => {
+    host = $lastHost;
+    port = $lastPort;
+    name = $lastUsername;
+    selfSigned = $lastAcceptSelfSigned;
+    remember = $rememberConnection;
+  });
 
   async function handleConnect() {
     if (!host || !name) {
@@ -42,6 +59,22 @@
       username.set(name);
       acceptSelfSigned.set(selfSigned);
       connectionState.set("connected");
+
+      // Save connection info if remember is checked
+      await invoke("save_connection_info", {
+        host,
+        port,
+        username: name,
+        acceptSelfSigned: selfSigned,
+        remember,
+      });
+      rememberConnection.set(remember);
+      if (remember) {
+        lastHost.set(host);
+        lastPort.set(port);
+        lastUsername.set(name);
+        lastAcceptSelfSigned.set(selfSigned);
+      }
     } catch (e) {
       error = String(e);
       connectionState.set("disconnected");
@@ -105,6 +138,11 @@
         Self-signed mode uses Trust-On-First-Use (TOFU) pinning. The server certificate is trusted on first connect and must match on subsequent connections. Only use this with servers you control.
       </div>
     {/if}
+
+    <label class="checkbox-label">
+      <input type="checkbox" bind:checked={remember} disabled={connecting} />
+      Remember connection details
+    </label>
 
     {#if error}
       <div class="error">{error}</div>

@@ -11,7 +11,7 @@ use tokio_rustls::server::TlsStream;
 use tracing::{error, info, warn};
 
 use voipc_protocol::codec::{
-    decode_client_msg, encode_server_msg, try_decode_frame, PROTOCOL_VERSION,
+    decode_client_msg, encode_server_msg, try_decode_frame, APP_VERSION, PROTOCOL_VERSION,
 };
 use voipc_protocol::messages::{ClientMessage, ServerMessage};
 use voipc_protocol::types::*;
@@ -35,7 +35,7 @@ pub async fn handle_connection(
     // --- Authentication phase (with timeout) ---
     let mut buf = BytesMut::with_capacity(4096);
     let auth_result = tokio::time::timeout(
-        Duration::from_secs(10),
+        Duration::from_secs(5),
         authenticate(&mut tls_stream, &mut buf, &state, &peer_addr),
     )
     .await;
@@ -97,10 +97,17 @@ pub async fn handle_connection(
             }
         }
 
-        // Process all complete messages in the buffer
+        // Process complete messages in the buffer (max 20 per read to prevent burst DoS)
+        let mut msgs_this_read = 0u32;
         loop {
+            if msgs_this_read >= 20 {
+                // Yield to the async runtime before processing more
+                tokio::task::yield_now().await;
+                msgs_this_read = 0;
+            }
             match try_decode_frame(&mut buf) {
                 Ok(Some(payload)) => {
+                    msgs_this_read += 1;
                     match decode_client_msg(&payload) {
                         Ok(msg) => {
                             if let Err(e) =
@@ -146,6 +153,7 @@ async fn authenticate(
                 ClientMessage::Authenticate {
                     username,
                     protocol_version,
+                    app_version,
                     identity_key,
                     prekey_bundle,
                 } => {
@@ -161,8 +169,21 @@ async fn authenticate(
                         anyhow::bail!("protocol version mismatch");
                     }
 
+                    if app_version != APP_VERSION {
+                        let err_msg = ServerMessage::AuthError {
+                            reason: format!(
+                                "version mismatch: client={}, server={}",
+                                app_version, APP_VERSION
+                            ),
+                        };
+                        let data = encode_server_msg(&err_msg)?;
+                        stream.write_all(&data).await?;
+                        anyhow::bail!("app version mismatch");
+                    }
+
                     let username = username.trim().to_string();
-                    if username.is_empty() || username.len() > 32 {
+                    let char_count = username.chars().count();
+                    if char_count == 0 || char_count > 32 {
                         let err_msg = ServerMessage::AuthError {
                             reason: "username must be 1-32 characters".into(),
                         };
@@ -232,6 +253,7 @@ async fn authenticate(
                         udp_token,
                         chat_rate: crate::state::RateLimiter::new(5.0, 5.0),
                         create_channel_rate: crate::state::RateLimiter::new(1.0, 0.2),
+                        prekey_rate: crate::state::RateLimiter::new(1.0, 0.2),
                         is_screen_sharing: false,
                         watching_screenshare: None,
                         identity_key,
@@ -397,30 +419,16 @@ async fn handle_message(
         ClientMessage::DeclineInvite { channel_id } => {
             handle_decline_invite(state, user_id, channel_id).await?;
         }
-        ClientMessage::SendChannelMessage { .. } => {
-            // Plaintext channel messages are no longer accepted.
-            // Clients must use SendEncryptedChannelMessage with Sender Key encryption.
-            let _ = send_msg(
-                tx,
-                &ServerMessage::ChannelError {
-                    reason: "Plaintext messages are not accepted. Use encrypted messages.".into(),
-                },
-            )
-            .await;
-        }
-        ClientMessage::SendDirectMessage { .. } => {
-            // Plaintext direct messages are no longer accepted.
-            // Clients must use SendEncryptedDirectMessage with Signal pairwise encryption.
-            let _ = send_msg(
-                tx,
-                &ServerMessage::ChannelError {
-                    reason: "Plaintext messages are not accepted. Use encrypted messages.".into(),
-                },
-            )
-            .await;
+        ClientMessage::SendPoke {
+            target_user_id,
+            ciphertext,
+            message_type,
+        } => {
+            handle_send_poke(state, user_id, session_id, target_user_id, ciphertext, message_type, tx).await?;
         }
         ClientMessage::StartScreenShare { source: _, resolution } => {
-            handle_start_screen_share(state, user_id, session_id, resolution, tx).await?;
+            let clamped_resolution = resolution.min(4320); // cap at 8K
+            handle_start_screen_share(state, user_id, session_id, clamped_resolution, tx).await?;
         }
         ClientMessage::StopScreenShare => {
             handle_stop_screen_share(state, user_id, session_id, tx).await?;
@@ -443,7 +451,14 @@ async fn handle_message(
             handle_request_prekey_bundle(state, target_user_id, tx).await?;
         }
         ClientMessage::UploadPreKeys { prekeys } => {
-            handle_upload_prekeys(state, session_id, prekeys).await;
+            let allowed = state
+                .sessions
+                .get_mut(&session_id)
+                .map(|mut s| s.prekey_rate.try_consume())
+                .unwrap_or(false);
+            if allowed {
+                handle_upload_prekeys(state, session_id, prekeys).await;
+            }
         }
         ClientMessage::SendEncryptedDirectMessage {
             target_user_id,
@@ -890,6 +905,53 @@ async fn handle_send_invite(
     Ok(())
 }
 
+/// Handle a poke from one user to another.
+/// The server only relays the opaque ciphertext — it cannot read the poke message.
+async fn handle_send_poke(
+    state: &Arc<ServerState>,
+    from_user_id: UserId,
+    from_session_id: SessionId,
+    target_user_id: UserId,
+    ciphertext: Vec<u8>,
+    message_type: u8,
+    tx: &mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    // Look up sender username
+    let from_username = state
+        .sessions
+        .get(&from_session_id)
+        .map(|s| s.username.clone())
+        .unwrap_or_default();
+
+    // Find the target user's session and relay the encrypted poke
+    match state.user_to_session.get(&target_user_id) {
+        Some(target_sid) => {
+            if let Some(session) = state.sessions.get(&*target_sid) {
+                let _ = send_msg(
+                    &session.tcp_tx,
+                    &ServerMessage::PokeReceived {
+                        from_user_id,
+                        from_username,
+                        ciphertext,
+                        message_type,
+                    },
+                )
+                .await;
+            }
+        }
+        None => {
+            let _ = send_msg(
+                tx,
+                &ServerMessage::ChannelError {
+                    reason: "User not found".into(),
+                },
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
 /// Handle a declined channel invite.
 async fn handle_decline_invite(
     state: &Arc<ServerState>,
@@ -1249,13 +1311,20 @@ async fn handle_request_prekey_bundle(
 }
 
 /// Handle uploaded pre-keys — replenish the user's one-time pre-key supply.
+/// Caps total stored pre-keys at 100 per user to prevent memory exhaustion.
 async fn handle_upload_prekeys(
     state: &Arc<ServerState>,
     session_id: SessionId,
     prekeys: Vec<OneTimePreKey>,
 ) {
+    const MAX_PREKEYS: usize = 100;
     if let Some(mut session) = state.sessions.get_mut(&session_id) {
-        session.prekeys.extend(prekeys);
+        let remaining_capacity = MAX_PREKEYS.saturating_sub(session.prekeys.len());
+        if remaining_capacity > 0 {
+            session
+                .prekeys
+                .extend(prekeys.into_iter().take(remaining_capacity));
+        }
     }
 }
 

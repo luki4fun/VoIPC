@@ -147,6 +147,26 @@ npx tauri build    # Release build
 - Node.js (for the Svelte frontend)
 - Tauri CLI: `npm install` in `client/`
 
+## Docker Release Build (AppImage)
+
+Build portable release binaries inside Docker without installing any local dependencies:
+
+```bash
+./release.sh
+```
+
+This builds inside Ubuntu 24.04 and produces:
+- `release/voipc-server` — static binary (musl, zero runtime deps)
+- `release/VoIPC_*.AppImage` — portable client (runs on glibc >= 2.39)
+
+Requires only Docker on the host. No Rust, Node.js, or system libraries needed.
+
+To build the Docker image manually:
+
+```bash
+docker build -f Dockerfile.release -t voipc-release .
+```
+
 ## Server
 
 ```bash

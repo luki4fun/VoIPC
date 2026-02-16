@@ -11,6 +11,10 @@ pub const MAX_MSG_SIZE: u32 = 65_536;
 /// v3: E2E encryption (Signal Protocol + AES-256-GCM media)
 pub const PROTOCOL_VERSION: u32 = 3;
 
+/// Application version, read from Cargo.toml at compile time.
+/// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.
+pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Encode a `ClientMessage` into a length-prefixed byte buffer for TCP transmission.
 pub fn encode_client_msg(msg: &ClientMessage) -> Result<Vec<u8>, ProtocolError> {
     let payload = postcard::to_allocvec(msg)?;
@@ -74,6 +78,7 @@ mod tests {
         let msg = ClientMessage::Authenticate {
             username: "alice".into(),
             protocol_version: PROTOCOL_VERSION,
+            app_version: APP_VERSION.to_string(),
             identity_key: None,
             prekey_bundle: None,
         };
@@ -208,37 +213,38 @@ mod tests {
     }
 
     #[test]
-    fn roundtrip_chat_messages() {
-        let msg = ServerMessage::ChannelChatMessage {
+    fn roundtrip_encrypted_chat_messages() {
+        let msg = ServerMessage::EncryptedChannelChatMessage {
             channel_id: 1,
             user_id: 5,
             username: "alice".into(),
-            content: "hello".into(),
+            ciphertext: vec![0xDE, 0xAD, 0xBE, 0xEF],
             timestamp: 999,
         };
         let encoded = encode_server_msg(&msg).unwrap();
         let decoded = decode_server_msg(&encoded[4..]).unwrap();
         match decoded {
-            ServerMessage::ChannelChatMessage { channel_id, user_id, username, content, timestamp } => {
+            ServerMessage::EncryptedChannelChatMessage { channel_id, user_id, username, ciphertext, timestamp } => {
                 assert_eq!(channel_id, 1);
                 assert_eq!(user_id, 5);
                 assert_eq!(username, "alice");
-                assert_eq!(content, "hello");
+                assert_eq!(ciphertext, vec![0xDE, 0xAD, 0xBE, 0xEF]);
                 assert_eq!(timestamp, 999);
             }
             _ => panic!("wrong variant"),
         }
 
-        let msg = ServerMessage::DirectChatMessage {
+        let msg = ServerMessage::EncryptedDirectChatMessage {
             from_user_id: 1,
             from_username: "bob".into(),
             to_user_id: 2,
-            content: "hi".into(),
+            ciphertext: vec![0xCA, 0xFE],
+            message_type: 2,
             timestamp: 1000,
         };
         let encoded = encode_server_msg(&msg).unwrap();
         let decoded = decode_server_msg(&encoded[4..]).unwrap();
-        assert!(matches!(decoded, ServerMessage::DirectChatMessage { .. }));
+        assert!(matches!(decoded, ServerMessage::EncryptedDirectChatMessage { .. }));
     }
 
     #[test]

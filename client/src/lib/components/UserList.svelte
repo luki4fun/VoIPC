@@ -6,6 +6,8 @@
   import { openDm } from "../stores/chat.js";
   import { watchingUserId, currentFrame } from "../stores/screenshare.js";
   import { addNotification } from "../stores/notifications.js";
+  import Icon from "./Icons.svelte";
+  import type { UserInfo } from "../types.js";
 
   // Are we previewing a different channel?
   let isPreviewing = $derived(
@@ -71,6 +73,42 @@
     }
   }
 
+  // Poke dialog state
+  let pokeTarget = $state<{ userId: number; username: string } | null>(null);
+  let pokeMessage = $state("");
+
+  function openPokeDialog(targetUserId: number, targetUsername: string) {
+    pokeTarget = { userId: targetUserId, username: targetUsername };
+    pokeMessage = "";
+  }
+
+  function cancelPoke() {
+    pokeTarget = null;
+    pokeMessage = "";
+  }
+
+  async function sendPoke() {
+    if (!pokeTarget) return;
+    const { userId: targetUserId } = pokeTarget;
+    const message = pokeMessage;
+    pokeTarget = null;
+    pokeMessage = "";
+    try {
+      await invoke("send_poke", { targetUserId, message });
+    } catch (e) {
+      console.error("Failed to poke user:", e);
+    }
+  }
+
+  function handlePokeKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      sendPoke();
+    } else if (e.key === "Escape") {
+      cancelPoke();
+    }
+  }
+
   async function watchUser(targetUserId: number) {
     try {
       await invoke("watch_screen_share", { sharerUserId: targetUserId });
@@ -110,7 +148,45 @@
   function getUserVolume(uid: number): number {
     return userVolumes[uid] ?? 1.0;
   }
+
+  // Context menu state
+  let contextMenu = $state<{ user: UserInfo; x: number; y: number } | null>(null);
+  let contextMenuEl: HTMLDivElement | undefined = $state(undefined);
+
+  function showContextMenu(user: UserInfo, e: MouseEvent) {
+    e.preventDefault();
+    e.stopPropagation();
+    if (user.user_id === $userId) return;
+    contextMenu = { user, x: e.clientX, y: e.clientY };
+  }
+
+  function closeContextMenu() {
+    contextMenu = null;
+  }
+
+  // Reposition context menu if it overflows viewport
+  $effect(() => {
+    if (contextMenu && contextMenuEl) {
+      const rect = contextMenuEl.getBoundingClientRect();
+      let { x, y } = contextMenu;
+      if (rect.right > window.innerWidth) {
+        x = window.innerWidth - rect.width - 8;
+      }
+      if (rect.bottom > window.innerHeight) {
+        y = window.innerHeight - rect.height - 8;
+      }
+      if (x !== contextMenu.x || y !== contextMenu.y) {
+        contextMenu = { ...contextMenu, x, y };
+      }
+    }
+  });
+
+  function handleContextMenuKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") closeContextMenu();
+  }
 </script>
+
+<svelte:window onkeydown={contextMenu ? handleContextMenuKeydown : undefined} />
 
 <div class="user-list">
   <div class="header">
@@ -122,7 +198,11 @@
   </div>
   <div class="users">
     {#each displayUsers as user (user.user_id)}
-      <div class="user" class:speaking={!isPreviewing && $speakingUsers.has(user.user_id)}>
+      <div
+        class="user"
+        class:speaking={!isPreviewing && $speakingUsers.has(user.user_id)}
+        oncontextmenu={(e) => showContextMenu(user, e)}
+      >
         <div
           class="indicator"
           class:speaking={!isPreviewing && $speakingUsers.has(user.user_id)}
@@ -132,70 +212,35 @@
         <span class="name">
           {user.username}
           {#if user.user_id === displayChannelCreatorId && displayChannelId !== 0}
-            <span class="crown" title="Channel creator">&#9819;</span>
+            <span class="crown" title="Channel creator"><Icon name="crown" size={12} /></span>
           {/if}
           {#if user.user_id === $userId}
             <span class="you">(you)</span>
           {/if}
         </span>
         {#if user.is_muted}
-          <span class="muted-icon" title="Muted">M</span>
+          <span class="status-icon muted" title="Muted">
+            <Icon name="mic-off" size={14} />
+          </span>
         {/if}
         {#if user.is_deafened}
-          <span class="deafened-icon" title="Deafened">D</span>
+          <span class="status-icon deafened" title="Deafened">
+            <Icon name="headphones-off" size={14} />
+          </span>
         {/if}
         {#if user.is_screen_sharing}
-          <span class="share-icon" title="Sharing screen">S</span>
+          <span class="status-icon sharing" title="Sharing screen">
+            <Icon name="monitor" size={14} />
+          </span>
         {/if}
-        <div class="user-actions">
-          {#if !isPreviewing && user.is_screen_sharing && user.user_id !== $userId}
-            <button
-              class="action-btn watch-btn"
-              title="Watch screen share"
-              onclick={() => watchUser(user.user_id)}
-            >&#9654;</button>
-          {/if}
-          {#if canKick && user.user_id !== $userId}
-            <button
-              class="action-btn kick-btn"
-              title="Kick user"
-              onclick={() => kickUser(user.user_id)}
-            >&#10005;</button>
-          {/if}
-          {#if canInvite && user.user_id !== $userId}
-            <button
-              class="action-btn invite-btn"
-              title="Invite to your channel"
-              onclick={() => inviteUser(user.user_id)}
-            >&#8594;</button>
-          {/if}
-          {#if user.user_id !== $userId}
-            <button
-              class="action-btn dm-btn"
-              title="Direct message"
-              onclick={() => openDm(user.user_id, user.username, $userId)}
-            >&#9993;</button>
-          {/if}
-        </div>
-        {#if !isPreviewing && user.user_id !== $userId}
-          <div class="user-volume-popup">
-            <button
-              class="mute-user-btn"
-              class:muted={getUserVolume(user.user_id) === 0}
-              title={getUserVolume(user.user_id) === 0 ? "Unmute user" : "Mute user"}
-              onclick={() => toggleUserMute(user.user_id)}
-            >{getUserVolume(user.user_id) === 0 ? "X" : "V"}</button>
-            <input
-              type="range"
-              class="user-vol-slider"
-              min="0"
-              max="2"
-              step="0.05"
-              value={getUserVolume(user.user_id)}
-              oninput={(e) => handleUserVolumeInput(user.user_id, e)}
-              title="Volume: {Math.round(getUserVolume(user.user_id) * 100)}%"
-            />
-          </div>
+        {#if user.user_id !== $userId}
+          <button
+            class="more-btn"
+            title="Actions"
+            onclick={(e) => { e.stopPropagation(); showContextMenu(user, e); }}
+          >
+            <Icon name="more-vertical" size={16} />
+          </button>
         {/if}
       </div>
     {/each}
@@ -204,6 +249,93 @@
     <div class="preview-hint">Double-click channel to join</div>
   {/if}
 </div>
+
+<!-- Context menu -->
+{#if contextMenu}
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+  <div class="ctx-overlay" onclick={closeContextMenu}>
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+    <div
+      class="ctx-menu"
+      style="left: {contextMenu.x}px; top: {contextMenu.y}px;"
+      onclick={(e) => e.stopPropagation()}
+      bind:this={contextMenuEl}
+    >
+      {#if !isPreviewing && contextMenu.user.is_screen_sharing}
+        <button class="ctx-item" onclick={() => { watchUser(contextMenu!.user.user_id); closeContextMenu(); }}>
+          <Icon name="play" size={16} />
+          <span>Watch Screen</span>
+        </button>
+      {/if}
+      <button class="ctx-item" onclick={() => { openDm(contextMenu!.user.user_id, contextMenu!.user.username, $userId); closeContextMenu(); }}>
+        <Icon name="direct-message" size={16} />
+        <span>Direct Message</span>
+      </button>
+      <button class="ctx-item" onclick={() => { openPokeDialog(contextMenu!.user.user_id, contextMenu!.user.username); closeContextMenu(); }}>
+        <Icon name="poke" size={16} />
+        <span>Poke</span>
+      </button>
+      {#if canInvite}
+        <button class="ctx-item" onclick={() => { inviteUser(contextMenu!.user.user_id); closeContextMenu(); }}>
+          <Icon name="invite" size={16} />
+          <span>Invite to Channel</span>
+        </button>
+      {/if}
+      {#if canKick}
+        <div class="ctx-separator"></div>
+        <button class="ctx-item danger" onclick={() => { kickUser(contextMenu!.user.user_id); closeContextMenu(); }}>
+          <Icon name="kick" size={16} />
+          <span>Kick</span>
+        </button>
+      {/if}
+      {#if !isPreviewing}
+        <div class="ctx-separator"></div>
+        <div class="ctx-volume">
+          <button
+            class="ctx-mute-btn"
+            class:muted={getUserVolume(contextMenu.user.user_id) === 0}
+            title={getUserVolume(contextMenu.user.user_id) === 0 ? "Unmute user" : "Mute user"}
+            onclick={() => toggleUserMute(contextMenu!.user.user_id)}
+          >
+            <Icon name={getUserVolume(contextMenu.user.user_id) === 0 ? "volume-off" : "volume"} size={16} />
+          </button>
+          <input
+            type="range"
+            class="ctx-vol-slider"
+            min="0"
+            max="2"
+            step="0.05"
+            value={getUserVolume(contextMenu.user.user_id)}
+            oninput={(e) => handleUserVolumeInput(contextMenu!.user.user_id, e)}
+            title="Volume: {Math.round(getUserVolume(contextMenu!.user.user_id) * 100)}%"
+          />
+        </div>
+      {/if}
+    </div>
+  </div>
+{/if}
+
+{#if pokeTarget}
+  <div class="poke-overlay" onclick={cancelPoke} onkeydown={() => {}} role="presentation">
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+    <div class="poke-dialog" onclick={(e) => e.stopPropagation()}>
+      <div class="poke-dialog-header">Poke {pokeTarget.username}</div>
+      <input
+        class="poke-input"
+        type="text"
+        placeholder="Message (optional)"
+        bind:value={pokeMessage}
+        onkeydown={handlePokeKeydown}
+        maxlength="200"
+        autofocus
+      />
+      <div class="poke-dialog-actions">
+        <button class="poke-cancel-btn" onclick={cancelPoke}>Cancel</button>
+        <button class="poke-send-btn" onclick={sendPoke}>Poke</button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   .user-list {
@@ -281,8 +413,9 @@
 
   .crown {
     color: #ffc107;
-    font-size: 12px;
     margin-left: 1px;
+    display: inline-flex;
+    vertical-align: middle;
   }
 
   .you {
@@ -290,67 +423,47 @@
     font-size: 11px;
   }
 
-  .muted-icon {
-    font-size: 10px;
+  .status-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+  }
+
+  .status-icon.muted {
     color: var(--danger);
-    font-weight: bold;
-    flex-shrink: 0;
   }
 
-  .deafened-icon {
-    font-size: 10px;
+  .status-icon.deafened {
     color: #ffa726;
-    font-weight: bold;
-    flex-shrink: 0;
   }
 
-  .share-icon {
-    font-size: 9px;
+  .status-icon.sharing {
     color: var(--success);
-    font-weight: bold;
-    background: rgba(76, 175, 80, 0.15);
-    padding: 1px 3px;
-    border-radius: 3px;
-    flex-shrink: 0;
   }
 
-  .user-actions {
+  .more-btn {
     display: none;
     align-items: center;
-    gap: 2px;
-    flex-shrink: 0;
-  }
-
-  .user:hover .user-actions {
-    display: flex;
-  }
-
-  .action-btn {
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
     background: transparent;
     color: var(--text-secondary);
     border: none;
-    font-size: 11px;
+    border-radius: 4px;
     cursor: pointer;
-    padding: 1px 3px;
-    border-radius: 3px;
-    line-height: 1;
     flex-shrink: 0;
   }
 
-  .action-btn:hover {
+  .user:hover .more-btn {
+    display: flex;
+  }
+
+  .more-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
     color: var(--text-primary);
-  }
-
-  .kick-btn:hover {
-    color: var(--danger);
-    background: rgba(244, 67, 54, 0.1);
-  }
-
-  .invite-btn:hover,
-  .watch-btn:hover,
-  .dm-btn:hover {
-    color: var(--accent);
-    background: rgba(74, 158, 255, 0.1);
   }
 
   .preview-hint {
@@ -362,28 +475,87 @@
     font-style: italic;
   }
 
-  /* Volume popup — appears below user row on hover */
-  .user-volume-popup {
-    display: none;
-    position: absolute;
-    top: 100%;
-    left: 0;
-    right: 0;
-    align-items: center;
-    gap: 4px;
-    padding: 4px 8px;
-    background: var(--bg-tertiary);
+  /* Context menu */
+  .ctx-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 200;
+  }
+
+  .ctx-menu {
+    position: fixed;
+    min-width: 180px;
+    background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: 4px;
-    z-index: 10;
-    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+    border-radius: 8px;
+    padding: 4px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    z-index: 201;
   }
 
-  .user:hover .user-volume-popup {
+  .ctx-item {
     display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 8px 12px;
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: 13px;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    text-align: left;
   }
 
-  .user-vol-slider {
+  .ctx-item:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .ctx-item.danger:hover {
+    background: rgba(231, 76, 60, 0.15);
+    color: var(--danger);
+  }
+
+  .ctx-separator {
+    height: 1px;
+    background: var(--border);
+    margin: 4px 0;
+  }
+
+  .ctx-volume {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 12px;
+  }
+
+  .ctx-mute-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    background: transparent;
+    color: var(--text-secondary);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    flex-shrink: 0;
+  }
+
+  .ctx-mute-btn:hover {
+    background: rgba(255, 255, 255, 0.1);
+    color: var(--text-primary);
+  }
+
+  .ctx-mute-btn.muted {
+    color: var(--danger);
+  }
+
+  .ctx-vol-slider {
     flex: 1;
     height: 4px;
     accent-color: var(--accent);
@@ -393,24 +565,82 @@
     min-width: 0;
   }
 
-  .mute-user-btn {
+  /* Poke dialog */
+  .poke-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.5);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+  }
+
+  .poke-dialog {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+    width: 300px;
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+  }
+
+  .poke-dialog-header {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    margin-bottom: 12px;
+  }
+
+  .poke-input {
+    width: 100%;
+    padding: 8px 10px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    font-size: 13px;
+    outline: none;
+    box-sizing: border-box;
+  }
+
+  .poke-input:focus {
+    border-color: var(--accent);
+  }
+
+  .poke-dialog-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+    margin-top: 12px;
+  }
+
+  .poke-cancel-btn {
     background: transparent;
     color: var(--text-secondary);
-    border: none;
-    font-size: 10px;
-    font-weight: bold;
+    border: 1px solid var(--border);
+    padding: 6px 14px;
+    font-size: 12px;
+    border-radius: 4px;
     cursor: pointer;
-    padding: 1px 3px;
-    border-radius: 2px;
-    min-width: 14px;
-    flex-shrink: 0;
   }
 
-  .mute-user-btn:hover {
+  .poke-cancel-btn:hover {
     color: var(--text-primary);
+    border-color: var(--text-secondary);
   }
 
-  .mute-user-btn.muted {
-    color: var(--danger);
+  .poke-send-btn {
+    background: var(--accent);
+    color: white;
+    border: none;
+    padding: 6px 14px;
+    font-size: 12px;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .poke-send-btn:hover {
+    opacity: 0.9;
   }
 </style>

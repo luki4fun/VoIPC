@@ -10,6 +10,9 @@ pub enum ClientMessage {
         username: String,
         /// Protocol version for forward compatibility.
         protocol_version: u32,
+        /// Application version (e.g. "0.1.0"). Must match server version.
+        #[serde(default)]
+        app_version: String,
         /// Client's long-term identity public key (32-byte Curve25519).
         #[serde(default)]
         identity_key: Option<Vec<u8>>,
@@ -78,15 +81,6 @@ pub enum ClientMessage {
         channel_id: ChannelId,
     },
 
-    /// Send a chat message to the sender's current channel.
-    SendChannelMessage { content: String },
-
-    /// Send a direct message to another user.
-    SendDirectMessage {
-        target_user_id: UserId,
-        content: String,
-    },
-
     /// Start sharing screen. Server notifies channel but sharer waits for viewers.
     StartScreenShare {
         /// Capture source identifier (display/window id from enumeration).
@@ -148,6 +142,14 @@ pub enum ClientMessage {
         target_user_id: UserId,
         /// Media key encrypted with the pairwise Signal session.
         encrypted_media_key: Vec<u8>,
+    },
+
+    /// Poke another user (like TeamSpeak). Shows a popup + sound on their end.
+    /// Message is encrypted with the pairwise Signal session.
+    SendPoke {
+        target_user_id: UserId,
+        ciphertext: Vec<u8>,
+        message_type: u8,
     },
 }
 
@@ -243,24 +245,6 @@ pub enum ServerMessage {
         user_id: UserId,
     },
 
-    /// A chat message in a channel.
-    ChannelChatMessage {
-        channel_id: ChannelId,
-        user_id: UserId,
-        username: String,
-        content: String,
-        timestamp: u64,
-    },
-
-    /// A direct message between two users.
-    DirectChatMessage {
-        from_user_id: UserId,
-        from_username: String,
-        to_user_id: UserId,
-        content: String,
-        timestamp: u64,
-    },
-
     /// A user in your channel started screen sharing.
     ScreenShareStarted {
         user_id: UserId,
@@ -345,5 +329,13 @@ pub enum ServerMessage {
         channel_id: ChannelId,
         key_id: u16,
         key_bytes: Vec<u8>,
+    },
+
+    /// Another user poked you. Message is E2E encrypted ciphertext.
+    PokeReceived {
+        from_user_id: UserId,
+        from_username: String,
+        ciphertext: Vec<u8>,
+        message_type: u8,
     },
 }

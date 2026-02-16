@@ -3,6 +3,7 @@
   import { channels, currentChannelId, previewChannelId, previewUsers } from "../stores/channels.js";
   import { userId } from "../stores/connection.js";
   import { dmConversations, activeDmUserId, openDm, closeDm, unreadPerChannel, clearChannelUnread } from "../stores/chat.js";
+  import Icon from "./Icons.svelte";
 
   let showCreateForm = $state(false);
   let newChannelName = $state("");
@@ -15,6 +16,20 @@
   // Password change dialog state (for channel creators)
   let passwordEditChannelId = $state<number | null>(null);
   let passwordEditInput = $state("");
+
+  // Deterministic avatar color from username
+  const AVATAR_COLORS = [
+    "#5865F2", "#57F287", "#FEE75C", "#EB459E",
+    "#ED4245", "#3498db", "#e67e22", "#1abc9c",
+  ];
+
+  function avatarColor(name: string): string {
+    let hash = 0;
+    for (let i = 0; i < name.length; i++) {
+      hash = name.charCodeAt(i) + ((hash << 5) - hash);
+    }
+    return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
+  }
 
   function previewChannel(channelId: number) {
     // Always exit DM mode when clicking a channel
@@ -120,7 +135,9 @@
 <div class="channel-list">
   <div class="header">
     <span>Channels</span>
-    <button class="add-btn" onclick={() => (showCreateForm = !showCreateForm)} title="Create channel">+</button>
+    <button class="add-btn" onclick={() => (showCreateForm = !showCreateForm)} title="Create channel">
+      <Icon name="plus" size={18} />
+    </button>
   </div>
 
   {#if showCreateForm}
@@ -156,11 +173,11 @@
       >
         <span class="channel-icon">
           {#if channel.channel_id === 0}
-            <span title="No voice in lobby">&#9744;</span>
+            <Icon name="lobby" size={16} />
           {:else if channel.has_password}
-            <span title="Password protected">&#128274;</span>
+            <Icon name="lock" size={16} />
           {:else}
-            #
+            <Icon name="hash" size={16} />
           {/if}
         </span>
         <span class="channel-name">{channel.name}</span>
@@ -176,7 +193,7 @@
             role="button"
             tabindex="-1"
             onclick={(e) => openPasswordEdit(channel.channel_id, e)}
-          >&#9881;</span>
+          ><Icon name="channel-settings" size={14} /></span>
         {/if}
       </button>
     {/each}
@@ -184,7 +201,8 @@
 
   {#if $dmConversations.length > 0}
     <div class="dm-section">
-      <div class="header">
+      <div class="header dm-header">
+        <span class="dm-header-icon"><Icon name="direct-message" size={14} /></span>
         <span>Direct Messages</span>
       </div>
       <div class="dm-list">
@@ -194,6 +212,9 @@
             class:active={$activeDmUserId === convo.user_id}
             onclick={() => openDm(convo.user_id, convo.username, $userId)}
           >
+            <span class="dm-avatar" style="background: {avatarColor(convo.username)}">
+              {convo.username.charAt(0).toUpperCase()}
+            </span>
             <span class="dm-name">{convo.username}</span>
             {#if convo.unread > 0}
               <span class="dm-unread">{convo.unread}</span>
@@ -280,17 +301,21 @@
   }
 
   .add-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: var(--icon-btn-size-sm);
+    height: var(--icon-btn-size-sm);
+    padding: 0;
     background: transparent;
     color: var(--text-secondary);
-    font-size: 18px;
-    font-weight: bold;
-    padding: 0 4px;
-    line-height: 1;
     border: none;
+    border-radius: 6px;
     cursor: pointer;
   }
 
   .add-btn:hover {
+    background: var(--bg-hover);
     color: var(--text-primary);
   }
 
@@ -387,15 +412,20 @@
   }
 
   .channel-icon {
+    display: flex;
+    align-items: center;
+    justify-content: center;
     color: var(--text-secondary);
-    font-weight: bold;
-    font-size: 14px;
     width: 18px;
-    text-align: center;
+    flex-shrink: 0;
   }
 
   .channel-name {
     flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
   }
 
   .user-count {
@@ -414,15 +444,14 @@
   }
 
   .settings-icon {
-    font-size: 14px;
+    display: none;
+    align-items: center;
     color: var(--text-secondary);
     cursor: pointer;
-    opacity: 0.35;
-    transition: opacity 0.15s;
   }
 
   .channel:hover .settings-icon {
-    opacity: 0.8;
+    display: flex;
   }
 
   .settings-icon:hover {
@@ -479,6 +508,20 @@
     border-top: 1px solid var(--border);
   }
 
+  .dm-header {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    background: rgba(74, 158, 255, 0.05);
+  }
+
+  .dm-header-icon {
+    display: flex;
+    align-items: center;
+    color: var(--accent);
+    opacity: 0.7;
+  }
+
   .dm-list {
     padding: 4px;
   }
@@ -486,7 +529,7 @@
   .dm-entry {
     display: flex;
     align-items: center;
-    gap: 6px;
+    gap: 8px;
     width: 100%;
     padding: 6px 12px;
     background: transparent;
@@ -506,8 +549,25 @@
     color: var(--text-primary);
   }
 
+  .dm-avatar {
+    width: 28px;
+    height: 28px;
+    border-radius: 50%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 13px;
+    font-weight: 600;
+    color: white;
+    flex-shrink: 0;
+  }
+
   .dm-name {
     flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    min-width: 0;
   }
 
   .dm-unread {

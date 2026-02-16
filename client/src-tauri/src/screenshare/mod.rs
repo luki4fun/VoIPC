@@ -16,12 +16,36 @@ use voipc_video::convert;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "linux")]
-pub use linux::{CaptureSession, request_screencast, spawn_capture_task};
+pub use linux::{
+    CaptureSession, enumerate_displays, enumerate_windows, request_screencast, spawn_capture_task,
+};
 
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
-pub use windows::{CaptureSession, request_screencast, spawn_capture_task};
+pub use windows::{
+    CaptureSession, enumerate_displays, enumerate_windows, request_screencast, spawn_capture_task,
+};
+
+// ── Source enumeration types (cross-platform) ─────────────────────────────
+
+/// Information about an available display/monitor for screen capture.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DisplayInfo {
+    pub id: String,
+    pub name: String,
+    pub width: u32,
+    pub height: u32,
+    pub is_primary: bool,
+}
+
+/// Information about an available window for screen capture.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct WindowInfo {
+    pub id: String,
+    pub title: String,
+    pub app_name: String,
+}
 
 // ── Shared types ─────────────────────────────────────────────────────────
 
@@ -97,7 +121,7 @@ impl FrameSlot {
 // ── Shared frame processing pipeline ─────────────────────────────────────
 
 /// State for the encode → fragment → encrypt → send video pipeline.
-/// Used by both Linux (PipeWire) and Windows (scrap) capture backends.
+/// Used by both Linux (PipeWire) and Windows (WGC) capture backends.
 pub(crate) struct FrameProcessor {
     pub encoder: voipc_video::encoder::Encoder,
     pub i420_buf: Vec<u8>,

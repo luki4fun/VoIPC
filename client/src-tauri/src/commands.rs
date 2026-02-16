@@ -224,6 +224,68 @@ pub async fn send_invite(
     .await
 }
 
+/// Poke another user. They see a popup + sound + window flash.
+/// The poke message is E2E encrypted with the pairwise Signal session.
+#[tauri::command]
+pub async fn send_poke(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    target_user_id: u32,
+    message: String,
+) -> Result<(), String> {
+    // Encrypt the poke message with Signal Protocol pairwise session
+    let (ciphertext, message_type) = tokio::task::block_in_place(|| {
+        let mut signal = state.signal.lock().map_err(|e| e.to_string())?;
+        let stores = signal
+            .stores
+            .as_mut()
+            .ok_or_else(|| "E2E encryption not initialized".to_string())?;
+        tokio::runtime::Handle::current()
+            .block_on(voipc_crypto::session::encrypt_message(
+                stores,
+                target_user_id,
+                message.as_bytes(),
+            ))
+            .map_err(|e| format!("poke encryption failed: {e}"))
+    })?;
+
+    let (tcp_tx, own_user_id, own_username) = {
+        let conn = state.connection.read().await;
+        let connection = conn.as_ref().ok_or("Not connected")?;
+        (connection.tcp_tx.clone(), connection.user_id, connection.username.clone())
+    };
+
+    network::send_tcp_message(
+        &tcp_tx,
+        &ClientMessage::SendPoke {
+            target_user_id,
+            ciphertext,
+            message_type,
+        },
+    )
+    .await?;
+
+    // Emit the poke as a local DM for the sender's chat history
+    if !message.is_empty() {
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
+        let _ = app_handle.emit(
+            "direct-chat-message",
+            serde_json::json!({
+                "from_user_id": own_user_id,
+                "from_username": own_username,
+                "to_user_id": target_user_id,
+                "content": format!("[Poke] {}", message),
+                "timestamp": timestamp,
+            }),
+        );
+    }
+
+    Ok(())
+}
+
 /// Accept a channel invite.
 #[tauri::command]
 pub async fn accept_invite(
@@ -488,9 +550,8 @@ pub async fn send_direct_message(
     }
 }
 
-/// Start transmitting voice (PTT pressed).
-#[tauri::command]
-pub async fn start_transmit(state: State<'_, AppState>) -> Result<(), String> {
+/// Core start-transmit logic, callable from both the Tauri command and the global shortcut handler.
+pub(crate) async fn do_start_transmit(state: &AppState) -> Result<(), String> {
     let mut conn = state.connection.write().await;
     let connection = conn.as_mut().ok_or("Not connected")?;
 
@@ -532,9 +593,8 @@ pub async fn start_transmit(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
-/// Stop transmitting voice (PTT released).
-#[tauri::command]
-pub async fn stop_transmit(state: State<'_, AppState>) -> Result<(), String> {
+/// Core stop-transmit logic, callable from both the Tauri command and the global shortcut handler.
+pub(crate) async fn do_stop_transmit(state: &AppState) -> Result<(), String> {
     let mut conn = state.connection.write().await;
     let connection = conn.as_mut().ok_or("Not connected")?;
 
@@ -558,6 +618,174 @@ pub async fn stop_transmit(state: State<'_, AppState>) -> Result<(), String> {
     Ok(())
 }
 
+/// Start transmitting voice (PTT pressed).
+#[tauri::command]
+pub async fn start_transmit(state: State<'_, AppState>) -> Result<(), String> {
+    do_start_transmit(&state).await
+}
+
+/// Stop transmitting voice (PTT released).
+#[tauri::command]
+pub async fn stop_transmit(state: State<'_, AppState>) -> Result<(), String> {
+    do_stop_transmit(&state).await
+}
+
+/// Check if a JS KeyboardEvent.code string is a recognized key code.
+fn is_valid_key_code(code: &str) -> bool {
+    matches!(
+        code,
+        "Space"
+            | "Tab"
+            | "Escape"
+            | "CapsLock"
+            | "KeyA"
+            | "KeyB"
+            | "KeyC"
+            | "KeyD"
+            | "KeyE"
+            | "KeyF"
+            | "KeyG"
+            | "KeyH"
+            | "KeyI"
+            | "KeyJ"
+            | "KeyK"
+            | "KeyL"
+            | "KeyM"
+            | "KeyN"
+            | "KeyO"
+            | "KeyP"
+            | "KeyQ"
+            | "KeyR"
+            | "KeyS"
+            | "KeyT"
+            | "KeyU"
+            | "KeyV"
+            | "KeyW"
+            | "KeyX"
+            | "KeyY"
+            | "KeyZ"
+            | "Digit0"
+            | "Digit1"
+            | "Digit2"
+            | "Digit3"
+            | "Digit4"
+            | "Digit5"
+            | "Digit6"
+            | "Digit7"
+            | "Digit8"
+            | "Digit9"
+            | "F1"
+            | "F2"
+            | "F3"
+            | "F4"
+            | "F5"
+            | "F6"
+            | "F7"
+            | "F8"
+            | "F9"
+            | "F10"
+            | "F11"
+            | "F12"
+            | "ShiftLeft"
+            | "ShiftRight"
+            | "ControlLeft"
+            | "ControlRight"
+            | "AltLeft"
+            | "AltRight"
+            | "Backquote"
+            | "Minus"
+            | "Equal"
+            | "BracketLeft"
+            | "BracketRight"
+            | "Backslash"
+            | "Semicolon"
+            | "Quote"
+            | "Comma"
+            | "Period"
+            | "Slash"
+    )
+}
+
+/// Parse a PTT binding string like "Ctrl+Space" or "ControlLeft" into a PttBinding.
+pub(crate) fn parse_ptt_binding(binding_str: &str) -> Option<crate::app_state::PttBinding> {
+    let parts: Vec<&str> = binding_str.split('+').collect();
+    let mut ctrl = false;
+    let mut alt = false;
+    let mut shift = false;
+    let mut key_code = "";
+
+    for part in &parts {
+        match *part {
+            "Ctrl" => ctrl = true,
+            "Alt" => alt = true,
+            "Shift" => shift = true,
+            code => key_code = code,
+        }
+    }
+
+    if !is_valid_key_code(key_code) {
+        return None;
+    }
+
+    Some(crate::app_state::PttBinding {
+        ctrl,
+        alt,
+        shift,
+        code: key_code.to_string(),
+    })
+}
+
+/// Change the PTT key binding. Updates both settings and the shared binding for the global key listener.
+#[tauri::command]
+pub async fn set_ptt_key(
+    state: State<'_, AppState>,
+    key_code: String,
+) -> Result<(), String> {
+    // Parse and validate the binding
+    let binding = parse_ptt_binding(&key_code)
+        .ok_or_else(|| format!("Unsupported key binding: {key_code}"))?;
+
+    // Update stored settings
+    {
+        let mut settings = state.settings.write().await;
+        settings.ptt_key = key_code.clone();
+    }
+
+    // Update the shared PttBinding for the global key listener
+    {
+        let mut ptt = state.ptt_binding.write().unwrap();
+        *ptt = binding;
+    }
+
+    // Persist to config
+    {
+        let mut config = state.config.lock().unwrap();
+        config.ptt_key = key_code.clone();
+        let _ = crate::config::save_config(&config);
+    }
+
+    tracing::info!("PTT key changed to: {key_code}");
+    Ok(())
+}
+
+/// Set PTT hold mode. When true, for combo bindings (e.g. Ctrl+Space), holding the modifier
+/// keeps PTT active after releasing the trigger key. When false, releasing the trigger key
+/// immediately stops PTT.
+#[tauri::command]
+pub async fn set_ptt_hold_mode(
+    state: State<'_, AppState>,
+    hold_mode: bool,
+) -> Result<(), String> {
+    state.ptt_hold_mode.store(hold_mode, Ordering::Relaxed);
+    {
+        let mut config = state.config.lock().unwrap();
+        config.ptt_hold_mode = hold_mode;
+        let _ = crate::config::save_config(&config);
+    }
+    tracing::info!("PTT hold mode set to: {hold_mode}");
+    Ok(())
+}
+
 /// Toggle self-mute.
 #[tauri::command]
 pub async fn toggle_mute(state: State<'_, AppState>) -> Result<bool, String> {
@@ -573,6 +801,12 @@ pub async fn toggle_mute(state: State<'_, AppState>) -> Result<bool, String> {
             },
         )
         .await;
+        // Persist
+        {
+            let mut config = state.config.lock().unwrap();
+            config.muted = new_muted;
+            let _ = crate::config::save_config(&config);
+        }
         Ok(new_muted)
     } else {
         Err("Not connected".into())
@@ -594,6 +828,12 @@ pub async fn toggle_deafen(state: State<'_, AppState>) -> Result<bool, String> {
             },
         )
         .await;
+        // Persist
+        {
+            let mut config = state.config.lock().unwrap();
+            config.deafened = new_deafened;
+            let _ = crate::config::save_config(&config);
+        }
         Ok(new_deafened)
     } else {
         Err("Not connected".into())
@@ -645,7 +885,13 @@ pub async fn set_input_device(
     device_name: String,
 ) -> Result<(), String> {
     let mut settings = state.settings.write().await;
-    settings.input_device = Some(device_name);
+    settings.input_device = Some(device_name.clone());
+    drop(settings);
+    {
+        let mut config = state.config.lock().unwrap();
+        config.input_device = Some(device_name);
+        let _ = crate::config::save_config(&config);
+    }
     Ok(())
 }
 
@@ -656,7 +902,13 @@ pub async fn set_output_device(
     device_name: String,
 ) -> Result<(), String> {
     let mut settings = state.settings.write().await;
-    settings.output_device = Some(device_name);
+    settings.output_device = Some(device_name.clone());
+    drop(settings);
+    {
+        let mut config = state.config.lock().unwrap();
+        config.output_device = Some(device_name);
+        let _ = crate::config::save_config(&config);
+    }
     Ok(())
 }
 
@@ -666,8 +918,15 @@ pub async fn set_volume(
     state: State<'_, AppState>,
     volume: f32,
 ) -> Result<(), String> {
+    let clamped = volume.clamp(0.0, 1.0);
     let mut settings = state.settings.write().await;
-    settings.volume = volume.clamp(0.0, 1.0);
+    settings.volume = clamped;
+    drop(settings);
+    {
+        let mut config = state.config.lock().unwrap();
+        config.volume = clamped;
+        let _ = crate::config::save_config(&config);
+    }
     Ok(())
 }
 
@@ -677,18 +936,40 @@ pub async fn set_volume(
 
 /// Start screen sharing — opens the XDG Desktop Portal screen picker, then
 /// sends the TCP announcement. Capture task is NOT started yet; it begins when
+/// Return the current platform name ("linux" or "windows").
+#[tauri::command]
+pub fn get_platform() -> String {
+    std::env::consts::OS.to_string()
+}
+
+/// Enumerate available displays for screen capture.
+#[tauri::command]
+pub fn enumerate_displays() -> Vec<screenshare::DisplayInfo> {
+    screenshare::enumerate_displays()
+}
+
+/// Enumerate available windows for screen capture.
+#[tauri::command]
+pub fn enumerate_windows() -> Vec<screenshare::WindowInfo> {
+    screenshare::enumerate_windows()
+}
+
+/// Start sharing the screen — opens the capture session for the selected source.
+/// The actual capture task starts lazily when
 /// the frontend receives `viewer-count-changed` with count > 0.
 #[tauri::command]
 pub async fn start_screen_share(
     state: State<'_, AppState>,
+    source_type: String,
+    source_id: String,
     resolution: u16,
     _fps: u32,
 ) -> Result<(), String> {
-    // Open the screen capture picker (portal on Linux, display selection on Windows).
+    // Open the screen capture session for the selected source.
     // This must happen BEFORE acquiring the connection lock because it may await
     // user interaction (e.g. portal dialog on Linux).
     // (fps is stored in the frontend and passed to start_screen_capture later)
-    let session = screenshare::request_screencast().await?;
+    let session = screenshare::request_screencast(&source_type, &source_id).await?;
 
     let mut conn = state.connection.write().await;
     let connection = conn.as_mut().ok_or("Not connected")?;
@@ -912,6 +1193,87 @@ pub async fn stop_screen_capture(state: State<'_, AppState>) -> Result<(), Strin
     Ok(())
 }
 
+/// Switch the screen share source without stopping/restarting the share.
+/// Stops the current capture, replaces the session, and restarts capture
+/// if viewers are present. The server is not notified — the stream continues.
+#[tauri::command]
+pub async fn switch_screen_share_source(
+    state: State<'_, AppState>,
+    source_type: String,
+    source_id: String,
+    resolution: u16,
+    fps: u32,
+) -> Result<(), String> {
+    // Acquire the new capture session BEFORE locking (may show portal on Linux).
+    let new_session = screenshare::request_screencast(&source_type, &source_id).await?;
+
+    let mut conn = state.connection.write().await;
+    let connection = conn.as_mut().ok_or("Not connected")?;
+
+    if !connection.is_screen_sharing {
+        return Err("Not currently screen sharing".into());
+    }
+
+    // Stop current capture if running
+    let had_active_capture = connection.screen_capture_task.is_some();
+    connection
+        .screen_share_active
+        .store(false, Ordering::Relaxed);
+    if let Some(task) = connection.screen_capture_task.take() {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
+    }
+
+    // Replace capture session
+    connection.capture_session = Some(new_session);
+
+    // Restart capture if viewers were watching
+    if had_active_capture {
+        let session = connection
+            .capture_session
+            .as_ref()
+            .ok_or("No capture session after switch")?;
+
+        let res = voipc_video::Resolution::from_height(resolution)
+            .ok_or_else(|| format!("Unsupported resolution: {}", resolution))?;
+
+        connection
+            .screen_share_active
+            .store(true, Ordering::Relaxed);
+
+        // Reset sender stats for the new source
+        connection
+            .screen_video_frames_sent
+            .store(0, Ordering::Relaxed);
+        connection
+            .screen_video_bytes_sent
+            .store(0, Ordering::Relaxed);
+
+        let task = screenshare::spawn_capture_task(
+            session,
+            res.width(),
+            res.height(),
+            fps,
+            res.bitrate_kbps(),
+            connection.session_id,
+            connection.udp_token,
+            connection.screen_share_active.clone(),
+            connection.keyframe_requested.clone(),
+            connection.video_tx.clone(),
+            connection.screen_audio_tx.clone(),
+            connection.screen_audio_enabled.clone(),
+            connection.screen_audio_send_count.clone(),
+            connection.current_media_key.clone(),
+            connection.current_channel_id.clone(),
+            connection.screen_video_frames_sent.clone(),
+            connection.screen_video_bytes_sent.clone(),
+        )?;
+
+        connection.screen_capture_task = Some(task);
+    }
+
+    Ok(())
+}
+
 /// Set the keyframe_requested flag — called from frontend on KeyframeRequested event.
 #[tauri::command]
 pub async fn set_keyframe_requested(state: State<'_, AppState>) -> Result<(), String> {
@@ -928,19 +1290,43 @@ pub async fn set_keyframe_requested(state: State<'_, AppState>) -> Result<(), St
 /// Set voice mode: "ptt", "vad", or "always_on".
 #[tauri::command]
 pub async fn set_voice_mode(state: State<'_, AppState>, mode: String) -> Result<(), String> {
+    // Always persist to settings + config (even when disconnected)
+    {
+        let mut settings = state.settings.write().await;
+        settings.voice_mode = mode.clone();
+    }
+    {
+        let mut config = state.config.lock().unwrap();
+        config.voice_mode = mode.clone();
+        let _ = crate::config::save_config(&config);
+    }
+    // Apply to active connection if connected
     let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
-    let vm = crate::app_state::VoiceMode::from_str(&mode);
-    connection.voice_mode.store(vm as u8, Ordering::Relaxed);
+    if let Some(connection) = conn.as_ref() {
+        let vm = crate::app_state::VoiceMode::from_str(&mode);
+        connection.voice_mode.store(vm as u8, Ordering::Relaxed);
+    }
     Ok(())
 }
 
 /// Set the VAD threshold in dB (typically -60 to 0).
 #[tauri::command]
 pub async fn set_vad_threshold(state: State<'_, AppState>, threshold_db: f32) -> Result<(), String> {
+    // Always persist
+    {
+        let mut settings = state.settings.write().await;
+        settings.vad_threshold_db = threshold_db;
+    }
+    {
+        let mut config = state.config.lock().unwrap();
+        config.vad_threshold_db = threshold_db;
+        let _ = crate::config::save_config(&config);
+    }
+    // Apply to active connection if connected
     let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
-    connection.vad_threshold_db.store(threshold_db as i32, Ordering::Relaxed);
+    if let Some(connection) = conn.as_ref() {
+        connection.vad_threshold_db.store(threshold_db as i32, Ordering::Relaxed);
+    }
     Ok(())
 }
 
@@ -959,11 +1345,29 @@ pub async fn get_audio_level(state: State<'_, AppState>) -> Result<f32, String> 
 
 #[tauri::command]
 pub async fn toggle_noise_suppression(state: State<'_, AppState>) -> Result<bool, String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
-    let prev = connection.noise_suppression.load(Ordering::Relaxed);
+    // Read current value from settings (works even when disconnected)
+    let prev = {
+        let settings = state.settings.read().await;
+        settings.noise_suppression
+    };
     let new_val = !prev;
-    connection.noise_suppression.store(new_val, Ordering::Relaxed);
+
+    // Update settings + config
+    {
+        let mut settings = state.settings.write().await;
+        settings.noise_suppression = new_val;
+    }
+    {
+        let mut config = state.config.lock().unwrap();
+        config.noise_suppression = new_val;
+        let _ = crate::config::save_config(&config);
+    }
+
+    // Apply to active connection if connected
+    let conn = state.connection.read().await;
+    if let Some(connection) = conn.as_ref() {
+        connection.noise_suppression.store(new_val, Ordering::Relaxed);
+    }
     Ok(new_val)
 }
 
@@ -1020,30 +1424,191 @@ impl From<&ChatArchive> for ChatArchivePayload {
     }
 }
 
-/// Check whether an encrypted chat history file exists.
-#[tauri::command]
-pub async fn chat_history_exists(
-    state: State<'_, AppState>,
-) -> Result<bool, String> {
-    let exe_dir = std::env::current_exe()
-        .map_err(|e| format!("failed to get executable path: {e}"))?
-        .parent()
-        .ok_or("executable has no parent dir")?
-        .to_path_buf();
-    let file_path = exe_dir.join("chat_history.bin");
+/// Status of the chat history file system.
+#[derive(Serialize)]
+pub struct ChatHistoryStatus {
+    /// Whether a path is configured in settings.json.
+    pub path_configured: bool,
+    /// The currently resolved file path (for display).
+    pub current_path: String,
+    /// Whether a valid VoIPC chat history file exists at the resolved path.
+    pub file_exists: bool,
+}
 
-    // Store the resolved path for later use
+/// Get the current chat history status (path configuration + file existence).
+#[tauri::command]
+pub async fn get_chat_history_status(
+    state: State<'_, AppState>,
+) -> Result<ChatHistoryStatus, String> {
+    let config = state.config.lock().unwrap().clone();
+    let path_configured = config.chat_history_path.is_some();
+    let file_path = crate::config::resolve_chat_history_path(&config);
+
+    // Store the resolved path in ChatState for later use
     {
         let mut chat = state.chat.write().await;
         chat.file_path = file_path.clone();
     }
 
-    if !file_path.exists() {
-        return Ok(false);
+    let file_exists = if file_path.exists() {
+        match std::fs::read(&file_path) {
+            Ok(data) => crypto::has_valid_header(&data),
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+
+    Ok(ChatHistoryStatus {
+        path_configured,
+        current_path: file_path.to_string_lossy().to_string(),
+        file_exists,
+    })
+}
+
+/// Result of setting or checking a chat history path.
+#[derive(Serialize)]
+pub struct SetPathResult {
+    /// The full path to chat_history.bin in the chosen directory.
+    pub full_path: String,
+    /// Whether a valid VoIPC file already exists at this path.
+    pub file_exists: bool,
+}
+
+/// Open a native directory picker for chat history storage location.
+#[tauri::command]
+pub async fn browse_chat_history_directory() -> Option<String> {
+    let result = rfd::AsyncFileDialog::new()
+        .set_title("Select chat history storage directory")
+        .pick_folder()
+        .await;
+    result.map(|f| f.path().to_string_lossy().to_string())
+}
+
+/// Set the chat history storage directory. Validates the directory,
+/// persists to config, and updates ChatState.
+#[tauri::command]
+pub async fn set_chat_history_path(
+    state: State<'_, AppState>,
+    directory: String,
+) -> Result<SetPathResult, String> {
+    let dir_path = std::path::PathBuf::from(&directory);
+
+    // Create directory if it doesn't exist
+    if !dir_path.exists() {
+        std::fs::create_dir_all(&dir_path)
+            .map_err(|e| format!("Cannot create directory: {e}"))?;
+    }
+    if !dir_path.is_dir() {
+        return Err("Selected path is not a directory".into());
     }
 
-    let data = std::fs::read(&file_path).map_err(|e| format!("failed to read file: {e}"))?;
-    Ok(crypto::has_valid_header(&data))
+    // Test write permission
+    let test_file = dir_path.join(".voipc_write_test");
+    std::fs::write(&test_file, b"test")
+        .map_err(|e| format!("Directory is not writable: {e}"))?;
+    let _ = std::fs::remove_file(&test_file);
+
+    let full_path = dir_path.join("chat_history.bin");
+    let full_path_str = full_path.to_string_lossy().to_string();
+
+    // Check if a valid file already exists there
+    let file_exists = if full_path.exists() {
+        match std::fs::read(&full_path) {
+            Ok(data) => {
+                if !crypto::has_valid_header(&data) {
+                    return Err(
+                        "A file named chat_history.bin exists at this location but is not a valid VoIPC chat history file. Please choose a different directory.".into()
+                    );
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+
+    // Persist to config
+    {
+        let mut config = state.config.lock().unwrap();
+        config.chat_history_path = Some(full_path_str.clone());
+        crate::config::save_config(&config)
+            .map_err(|e| format!("Failed to save config: {e}"))?;
+    }
+
+    // Update ChatState
+    {
+        let mut chat = state.chat.write().await;
+        chat.file_path = full_path;
+    }
+
+    Ok(SetPathResult {
+        full_path: full_path_str,
+        file_exists,
+    })
+}
+
+/// Delete the chat history file from disk and reset all in-memory state.
+#[tauri::command]
+pub async fn delete_chat_history(
+    state: State<'_, AppState>,
+) -> Result<String, String> {
+    let mut chat = state.chat.write().await;
+    let path = chat.file_path.clone();
+
+    if path.exists() {
+        std::fs::remove_file(&path)
+            .map_err(|e| format!("Failed to delete file: {e}"))?;
+    }
+
+    // Reset in-memory state
+    chat.archive = ChatArchive::default();
+    chat.sealing_key = None;
+    chat.salt = [0u8; 32];
+    chat.dirty = false;
+
+    // Clear the configured path so user is prompted fresh
+    {
+        let mut config = state.config.lock().unwrap();
+        config.chat_history_path = None;
+        let _ = crate::config::save_config(&config);
+    }
+
+    Ok(path.to_string_lossy().to_string())
+}
+
+/// Check whether a valid VoIPC chat history file exists in a given directory.
+/// Does NOT modify any state.
+#[tauri::command]
+pub async fn check_path_status(directory: String) -> Result<SetPathResult, String> {
+    let dir_path = std::path::PathBuf::from(&directory);
+    if !dir_path.is_dir() {
+        return Err("Not a valid directory".into());
+    }
+    let full_path = dir_path.join("chat_history.bin");
+    let full_path_str = full_path.to_string_lossy().to_string();
+
+    let file_exists = if full_path.exists() {
+        match std::fs::read(&full_path) {
+            Ok(data) => {
+                if !crypto::has_valid_header(&data) {
+                    return Err(
+                        "A file exists at this location but is not a valid VoIPC chat history file".into()
+                    );
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    } else {
+        false
+    };
+
+    Ok(SetPathResult {
+        full_path: full_path_str,
+        file_exists,
+    })
 }
 
 /// Decrypt an existing chat history file with the given password.
@@ -1324,4 +1889,203 @@ pub async fn flush_chat_to_disk(state: &AppState) {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Persistent config commands
+// ---------------------------------------------------------------------------
+
+/// Return the full persisted config to the frontend (called once on init).
+#[tauri::command]
+pub fn load_config(state: State<'_, AppState>) -> crate::config::AppConfig {
+    state.config.lock().unwrap().clone()
+}
+
+/// Save connection details for pre-filling on next launch.
+#[tauri::command]
+pub fn save_connection_info(
+    state: State<'_, AppState>,
+    host: String,
+    port: u16,
+    username: String,
+    accept_self_signed: bool,
+    remember: bool,
+) -> Result<(), String> {
+    let mut config = state.config.lock().unwrap();
+    config.remember_connection = remember;
+    if remember {
+        config.last_host = Some(host);
+        config.last_port = Some(port);
+        config.last_username = Some(username);
+        config.last_accept_self_signed = Some(accept_self_signed);
+    } else {
+        config.last_host = None;
+        config.last_port = None;
+        config.last_username = None;
+        config.last_accept_self_signed = None;
+        config.auto_connect = false;
+    }
+    crate::config::save_config(&config)
+}
+
+/// Reset all settings to defaults and delete the config file.
+#[tauri::command]
+pub async fn reset_config(state: State<'_, AppState>) -> Result<(), String> {
+    let default_config = crate::config::AppConfig::default();
+
+    // Reset in-memory settings
+    {
+        let mut settings = state.settings.write().await;
+        *settings = crate::app_state::UserSettings::default();
+    }
+    {
+        let mut ptt = state.ptt_binding.write().unwrap();
+        *ptt = crate::app_state::PttBinding::default();
+    }
+    state.ptt_hold_mode.store(true, Ordering::Relaxed);
+
+    // Reset config
+    {
+        let mut config = state.config.lock().unwrap();
+        *config = default_config;
+    }
+    crate::config::delete_config();
+    tracing::info!("User config reset to defaults");
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Notification sounds
+// ---------------------------------------------------------------------------
+
+/// Allowed sound file extensions.
+const ALLOWED_SOUND_EXTENSIONS: &[&str] = &["mp3", "wav", "ogg"];
+
+/// Validate a sound file path: must exist, have an allowed extension, and be a regular file.
+fn validate_sound_path(path_str: &str) -> Result<std::path::PathBuf, String> {
+    let path = std::path::PathBuf::from(path_str);
+
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_lowercase())
+        .unwrap_or_default();
+    if !ALLOWED_SOUND_EXTENSIONS.contains(&ext.as_str()) {
+        return Err(format!("Unsupported audio format: .{ext}"));
+    }
+
+    if !path.is_file() {
+        return Err(format!("Sound file not found: {}", path.display()));
+    }
+
+    path.canonicalize()
+        .map_err(|e| format!("Failed to resolve path: {e}"))
+}
+
+/// Play an audio file in a background thread via rodio.
+fn play_audio_file(path: std::path::PathBuf) {
+    std::thread::spawn(move || {
+        let Ok((_stream, handle)) = rodio::OutputStream::try_default() else {
+            tracing::warn!("Failed to open audio output for notification sound");
+            return;
+        };
+        let Ok(file) = std::fs::File::open(&path) else {
+            tracing::warn!("Failed to open sound file: {}", path.display());
+            return;
+        };
+        let Ok(source) = rodio::Decoder::new(std::io::BufReader::new(file)) else {
+            tracing::warn!("Failed to decode sound file: {}", path.display());
+            return;
+        };
+        let Ok(sink) = rodio::Sink::try_new(&handle) else {
+            tracing::warn!("Failed to create audio sink for notification");
+            return;
+        };
+        sink.append(source);
+        sink.sleep_until_end();
+    });
+}
+
+/// Play a notification sound for the given event name.
+/// Reads sound settings from AppConfig. Silently returns Ok if disabled or no file configured.
+#[tauri::command]
+pub fn play_notification_sound(
+    state: State<'_, AppState>,
+    name: String,
+) -> Result<(), String> {
+    let config = state.config.lock().unwrap();
+    let entry = match name.as_str() {
+        "channel_switch" => &config.sounds.channel_switch,
+        "user_joined" => &config.sounds.user_joined,
+        "user_left" => &config.sounds.user_left,
+        "disconnected" => &config.sounds.disconnected,
+        "direct_message" => &config.sounds.direct_message,
+        "channel_message" => &config.sounds.channel_message,
+        "poke" => &config.sounds.poke,
+        _ => return Err(format!("Unknown sound event: {name}")),
+    };
+
+    if !entry.enabled {
+        return Ok(());
+    }
+
+    let path = match &entry.path {
+        Some(p) if !p.is_empty() => match validate_sound_path(p) {
+            Ok(canonical) => canonical,
+            Err(_) => return Ok(()), // File missing/invalid — silently skip
+        },
+        _ => return Ok(()), // No path configured
+    };
+
+    drop(config); // Release the lock before spawning
+    play_audio_file(path);
+    Ok(())
+}
+
+/// Open a native file picker dialog for selecting a sound file.
+/// Returns the selected path, or None if the user cancelled.
+#[tauri::command]
+pub async fn browse_sound_file() -> Option<String> {
+    let result = rfd::AsyncFileDialog::new()
+        .set_title("Select notification sound")
+        .add_filter("Audio files", &["mp3", "wav", "ogg"])
+        .pick_file()
+        .await;
+
+    result.map(|f| f.path().to_string_lossy().to_string())
+}
+
+/// Update the full sound settings from the frontend.
+#[tauri::command]
+pub fn set_sound_settings(
+    state: State<'_, AppState>,
+    settings: crate::config::SoundSettings,
+) -> Result<(), String> {
+    let mut config = state.config.lock().unwrap();
+    config.sounds = settings;
+    crate::config::save_config(&config)
+}
+
+/// Play a sound file for preview purposes (path provided directly, ignoring config).
+#[tauri::command]
+pub fn preview_sound(path: String) -> Result<(), String> {
+    let canonical = validate_sound_path(&path)?;
+    play_audio_file(canonical);
+    Ok(())
+}
+
+/// Update a boolean config field from the frontend (for frontend-only settings).
+#[tauri::command]
+pub fn set_config_bool(
+    state: State<'_, AppState>,
+    key: String,
+    value: bool,
+) -> Result<(), String> {
+    let mut config = state.config.lock().unwrap();
+    match key.as_str() {
+        "auto_connect" => config.auto_connect = value,
+        "remember_connection" => config.remember_connection = value,
+        _ => return Err(format!("Unknown config key: {key}")),
+    }
+    crate::config::save_config(&config)
 }

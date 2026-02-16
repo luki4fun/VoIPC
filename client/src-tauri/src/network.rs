@@ -9,12 +9,12 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 use tracing::{error, info, warn};
 
 use voipc_crypto::media_keys::MediaKey;
 use voipc_protocol::codec::{
-    decode_server_msg, encode_client_msg, try_decode_frame, PROTOCOL_VERSION,
+    decode_server_msg, encode_client_msg, try_decode_frame, APP_VERSION, PROTOCOL_VERSION,
 };
 use voipc_protocol::messages::{ClientMessage, ServerMessage};
 use voipc_protocol::types::*;
@@ -36,6 +36,26 @@ pub async fn connect_to_server(
     username: String,
     accept_invalid_certs: bool,
 ) -> Result<u32, String> {
+    // Tear down any existing connection first (e.g. after webview reload)
+    {
+        let mut conn = state.connection.write().await;
+        if let Some(mut old) = conn.take() {
+            old.transmitting.store(false, std::sync::atomic::Ordering::Relaxed);
+            old.screen_share_active.store(false, std::sync::atomic::Ordering::Relaxed);
+            if let Some(task) = old.capture_task.take() { let _ = task.await; }
+            if let Some(task) = old.screen_capture_task.take() { let _ = task.await; }
+            let _ = send_tcp_message(&old.tcp_tx, &ClientMessage::Disconnect).await;
+            drop(old.tcp_tx);
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            for task in old.tasks { task.abort(); }
+            drop(old.voice_tx);
+            drop(old.video_tx);
+            drop(old.screen_audio_tx);
+            drop(old.playback_stream);
+            info!("cleaned up stale connection before reconnecting");
+        }
+    }
+
     let (host, port) = parse_address(&address)?;
 
     // TCP connect
@@ -61,10 +81,12 @@ pub async fn connect_to_server(
     };
 
     let connector = TlsConnector::from(Arc::new(tls_config));
-    let server_name = rustls::pki_types::ServerName::try_from(host.clone())
-        .unwrap_or_else(|_| {
-            rustls::pki_types::ServerName::try_from("localhost".to_string()).unwrap()
-        });
+    let server_name = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        rustls::pki_types::ServerName::IpAddress(ip.into())
+    } else {
+        rustls::pki_types::ServerName::try_from(host.clone())
+            .map_err(|e| format!("Invalid server name '{}': {}", host, e))?
+    };
 
     let mut tls_stream = connector
         .connect(server_name, tcp_stream)
@@ -163,6 +185,7 @@ pub async fn connect_to_server(
     let auth_msg = ClientMessage::Authenticate {
         username: username.clone(),
         protocol_version: PROTOCOL_VERSION,
+        app_version: APP_VERSION.to_string(),
         identity_key,
         prekey_bundle,
     };
@@ -210,10 +233,18 @@ pub async fn connect_to_server(
 
     info!(user_id, session_id, udp_port, "authenticated with server");
 
-    // Store own user_id in Signal state for sender key operations
+    // Reset Signal tracking state for the new connection.
+    // User IDs are allocated fresh by the server, so old session tracking is stale.
+    // Keep `stores` and `initialized` — identity key persists within app session,
+    // and old sessions in the store will be overwritten on re-establishment.
     {
         let mut signal = state.signal.lock().map_err(|e| e.to_string())?;
         signal.own_user_id = Some(user_id);
+        signal.established_sessions.clear();
+        signal.pending_sessions.clear();
+        signal.sender_key_distributed.clear();
+        signal.sender_key_received.clear();
+        signal.pending_messages.clear();
     }
 
     // Set up UDP socket with large buffers to absorb keyframe bursts
@@ -314,9 +345,19 @@ pub async fn connect_to_server(
     let user_volumes: Arc<std::sync::Mutex<HashMap<u32, f32>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-    // Mute/deafen — shared with capture task and UDP receiver respectively
-    let is_muted = Arc::new(AtomicBool::new(false));
-    let is_deafened = Arc::new(AtomicBool::new(false));
+    // Mute/deafen — initialize from persisted settings
+    let (saved_muted, saved_deafened, saved_voice_mode, saved_vad_db, saved_ns) = {
+        let s = state.settings.read().await;
+        (
+            s.muted,
+            s.deafened,
+            s.voice_mode.clone(),
+            s.vad_threshold_db,
+            s.noise_suppression,
+        )
+    };
+    let is_muted = Arc::new(AtomicBool::new(saved_muted));
+    let is_deafened = Arc::new(AtomicBool::new(saved_deafened));
 
     // Spawn background tasks
     let writer_handle = tokio::spawn(tcp_writer_task(write_half, tcp_rx));
@@ -407,15 +448,30 @@ pub async fn connect_to_server(
         screen_video_resolution,
         current_media_key,
         current_channel_id,
-        voice_mode: Arc::new(AtomicU8::new(0)),
-        vad_threshold_db: Arc::new(AtomicI32::new(-40)),
+        voice_mode: Arc::new(AtomicU8::new(
+            crate::app_state::VoiceMode::from_str(&saved_voice_mode) as u8,
+        )),
+        vad_threshold_db: Arc::new(AtomicI32::new(saved_vad_db as i32)),
         current_audio_level: Arc::new(AtomicI32::new(-9600)),
-        noise_suppression: Arc::new(AtomicBool::new(true)),
+        noise_suppression: Arc::new(AtomicBool::new(saved_ns)),
         user_volumes,
     };
 
     let mut conn = state.connection.write().await;
     *conn = Some(connection);
+
+    // Notify server of persisted mute/deafen state
+    if saved_muted {
+        if let Some(c) = conn.as_ref() {
+            let _ = send_tcp_message(&c.tcp_tx, &ClientMessage::SetMuted { muted: true }).await;
+        }
+    }
+    if saved_deafened {
+        if let Some(c) = conn.as_ref() {
+            let _ =
+                send_tcp_message(&c.tcp_tx, &ClientMessage::SetDeafened { deafened: true }).await;
+        }
+    }
 
     Ok(user_id)
 }
@@ -434,14 +490,27 @@ pub async fn send_tcp_message(
 }
 
 fn parse_address(address: &str) -> Result<(String, u16), String> {
-    let parts: Vec<&str> = address.rsplitn(2, ':').collect();
-    if parts.len() != 2 {
-        return Err("Invalid address format, expected host:port".into());
-    }
-    let port: u16 = parts[0]
+    let (host, port_str) = if address.starts_with('[') {
+        // IPv6: [::1]:9987
+        let bracket_end = address
+            .find("]:")
+            .ok_or("Invalid IPv6 address format, expected [host]:port")?;
+        let host = &address[1..bracket_end];
+        let port_str = &address[bracket_end + 2..];
+        (host.to_string(), port_str)
+    } else {
+        let parts: Vec<&str> = address.rsplitn(2, ':').collect();
+        if parts.len() != 2 {
+            return Err("Invalid address format, expected host:port".into());
+        }
+        (parts[1].to_string(), parts[0])
+    };
+    let port: u16 = port_str
         .parse()
         .map_err(|_| "Invalid port number".to_string())?;
-    let host = parts[1].to_string();
+    if host.is_empty() {
+        return Err("Host cannot be empty".into());
+    }
     Ok((host, port))
 }
 
@@ -550,12 +619,12 @@ async fn handle_server_message(
             if old_ch != channel_id {
                 // Clear media key — server will send a fresh ChannelMediaKey
                 {
-                    let mut mk = media_key.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut mk = media_key.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
                     *mk = None;
                 }
                 // Reset sender key state for the new channel
                 {
-                    let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
+                    let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
                     sig.sender_key_distributed.remove(&channel_id);
                     sig.sender_key_received.remove(&channel_id);
                 }
@@ -574,16 +643,16 @@ async fn handle_server_message(
                 }
             }
 
-            // Auto-request prekey bundles for users we don't have sessions with
-            if channel_id != 0 {
-                request_prekey_bundles_for_users(
-                    &users,
-                    own_user_id,
-                    signal,
-                    tcp_tx,
-                )
-                .await;
-            }
+            // Auto-request prekey bundles for users we don't have sessions with.
+            // This must happen for ALL channels (including Channel 0) because
+            // pairwise sessions are needed for DMs and pokes, not just channel chat.
+            request_prekey_bundles_for_users(
+                &users,
+                own_user_id,
+                signal,
+                tcp_tx,
+            )
+            .await;
 
             let _ = app_handle.emit(
                 "user-list",
@@ -591,8 +660,8 @@ async fn handle_server_message(
             );
         }
         ServerMessage::UserJoined { ref user } => {
-            // Auto-request prekey bundle for new user
-            if user.user_id != own_user_id && user.channel_id != 0 {
+            // Auto-request prekey bundle for new user (all channels, needed for DMs/pokes)
+            if user.user_id != own_user_id {
                 request_prekey_bundles_for_users(
                     &[user.clone()],
                     own_user_id,
@@ -610,7 +679,7 @@ async fn handle_server_message(
         } => {
             // Clean up E2E state for departing user
             {
-                let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
+                let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
                 sig.pending_sessions.remove(&user_id);
                 sig.established_sessions.remove(&user_id);
                 for set in sig.sender_key_distributed.values_mut() {
@@ -713,41 +782,77 @@ async fn handle_server_message(
                 serde_json::json!({"channel_id": channel_id, "user_id": user_id}),
             );
         }
-        ServerMessage::ChannelChatMessage {
-            channel_id,
-            user_id,
-            username,
-            content,
-            timestamp,
-        } => {
-            let _ = app_handle.emit(
-                "channel-chat-message",
-                serde_json::json!({
-                    "channel_id": channel_id,
-                    "user_id": user_id,
-                    "username": username,
-                    "content": content,
-                    "timestamp": timestamp,
-                }),
-            );
-        }
-        ServerMessage::DirectChatMessage {
+        ServerMessage::PokeReceived {
             from_user_id,
             from_username,
-            to_user_id,
-            content,
-            timestamp,
+            ciphertext,
+            message_type,
         } => {
+            // Decrypt the poke message using Signal Protocol
+            let message = {
+                let result = tokio::task::block_in_place(|| {
+                    let mut sig = signal.lock().map_err(|e| format!("signal lock: {e}"))?;
+                    let stores = sig.stores.as_mut()
+                        .ok_or_else(|| "Signal not initialized".to_string())?;
+                    tokio::runtime::Handle::current()
+                        .block_on(voipc_crypto::session::decrypt_message(
+                            stores,
+                            from_user_id,
+                            &ciphertext,
+                            message_type,
+                        ))
+                        .map_err(|e| format!("decrypt poke: {e}"))
+                });
+                match result {
+                    Ok(plaintext) => {
+                        // If PreKeySignalMessage, mark session as established
+                        if message_type == 1 {
+                            let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+                            sig.established_sessions.insert(from_user_id);
+                            sig.pending_sessions.remove(&from_user_id);
+                        }
+                        String::from_utf8_lossy(&plaintext).to_string()
+                    }
+                    Err(e) => {
+                        tracing::warn!(from_user_id, "failed to decrypt poke: {e}");
+                        String::new()
+                    }
+                }
+            };
+
             let _ = app_handle.emit(
-                "direct-chat-message",
+                "poke-received",
                 serde_json::json!({
                     "from_user_id": from_user_id,
                     "from_username": from_username,
-                    "to_user_id": to_user_id,
-                    "content": content,
-                    "timestamp": timestamp,
+                    "message": message,
                 }),
             );
+
+            // Also inject the poke as a DM so it appears in chat history
+            if !message.is_empty() {
+                let timestamp = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let _ = app_handle.emit(
+                    "direct-chat-message",
+                    serde_json::json!({
+                        "from_user_id": from_user_id,
+                        "from_username": from_username,
+                        "to_user_id": own_user_id,
+                        "content": format!("[Poke] {}", message),
+                        "timestamp": timestamp,
+                    }),
+                );
+            }
+
+            // Flash/blink the window to get user attention
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.request_user_attention(
+                    Some(tauri::UserAttentionType::Informational),
+                );
+            }
         }
         // ── Screenshare events ──
         ServerMessage::ScreenShareStarted {
@@ -800,7 +905,7 @@ async fn handle_server_message(
         ServerMessage::PreKeyBundleUnavailable { user_id } => {
             info!(user_id, "prekey bundle unavailable — cannot establish E2E session");
             // Remove from pending so we don't loop
-            let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
+            let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
             sig.pending_sessions.remove(&user_id);
         }
         ServerMessage::IdentityKeyChanged {
@@ -937,7 +1042,7 @@ async fn request_prekey_bundles_for_users(
     let mut to_request = Vec::new();
 
     {
-        let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
+        let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
         if !sig.initialized {
             return;
         }
@@ -1011,7 +1116,7 @@ async fn handle_prekey_bundle(
         Ok(()) => {
             info!(remote_user_id, "E2E session established");
             {
-                let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
+                let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
                 sig.pending_sessions.remove(&remote_user_id);
                 sig.established_sessions.insert(remote_user_id);
             }
@@ -1034,7 +1139,7 @@ async fn handle_prekey_bundle(
         }
         Err(e) => {
             warn!(remote_user_id, "failed to establish E2E session: {}", e);
-            let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
+            let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
             sig.pending_sessions.remove(&remote_user_id);
         }
     }
@@ -1090,7 +1195,7 @@ async fn distribute_sender_key_to_user(
                 warn!(target_user_id, "failed to send sender key: {}", e);
             } else {
                 info!(target_user_id, channel_id, "sender key distributed");
-                let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
+                let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
                 sig.sender_key_distributed
                     .entry(channel_id)
                     .or_default()
@@ -1151,14 +1256,14 @@ async fn handle_sender_key_received(
 
             // If PreKeySignalMessage, session was auto-established on our side
             if message_type == 1 {
-                let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
+                let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
                 sig.established_sessions.insert(from_user_id);
                 sig.pending_sessions.remove(&from_user_id);
             }
 
             // Track the received sender key
             {
-                let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
+                let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
                 sig.sender_key_received
                     .entry(channel_id)
                     .or_default()
@@ -1167,7 +1272,7 @@ async fn handle_sender_key_received(
 
             // Reciprocate: send our sender key if we haven't already
             let need_reciprocate = {
-                let sig = signal.lock().unwrap_or_else(|p| p.into_inner());
+                let sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
                 !sig.sender_key_distributed
                     .get(&channel_id)
                     .map_or(false, |s| s.contains(&from_user_id))
@@ -1202,19 +1307,25 @@ async fn drain_pending_dms(
 ) {
     // Extract pending DMs for this target
     let pending: Vec<String> = {
-        let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
+        let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
         let mut remaining = Vec::new();
         let mut to_send = Vec::new();
+        let mut expired = 0u32;
         for msg in sig.pending_messages.drain(..) {
             match &msg.target {
                 PendingTarget::Direct { target_user_id: tid } if *tid == target_user_id => {
                     // Only send if queued less than 60 seconds ago
                     if msg.queued_at.elapsed().as_secs() < 60 {
                         to_send.push(msg.content);
+                    } else {
+                        expired += 1;
                     }
                 }
                 _ => remaining.push(msg),
             }
+        }
+        if expired > 0 {
+            warn!(target_user_id, expired, "dropped expired pending DMs");
         }
         sig.pending_messages = remaining;
         to_send
@@ -1262,18 +1373,24 @@ async fn drain_pending_channel_messages(
 ) {
     // Extract pending channel messages
     let pending: Vec<String> = {
-        let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
+        let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
         let mut remaining = Vec::new();
         let mut to_send = Vec::new();
+        let mut expired = 0u32;
         for msg in sig.pending_messages.drain(..) {
             match &msg.target {
                 PendingTarget::Channel { channel_id: cid } if *cid == channel_id => {
                     if msg.queued_at.elapsed().as_secs() < 60 {
                         to_send.push(msg.content);
+                    } else {
+                        expired += 1;
                     }
                 }
                 _ => remaining.push(msg),
             }
+        }
+        if expired > 0 {
+            warn!(channel_id, expired, "dropped expired pending channel messages");
         }
         sig.pending_messages = remaining;
         to_send
@@ -1352,7 +1469,7 @@ fn handle_encrypted_direct_message(
 
             // If this was a PreKeySignalMessage, mark session as established
             if message_type == 1 {
-                let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
+                let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
                 sig.established_sessions.insert(from_user_id);
                 sig.pending_sessions.remove(&from_user_id);
             }
@@ -2086,8 +2203,43 @@ pub fn spawn_capture_encode_task(
 /// Maps server hostname to SHA-256 fingerprint of the server's certificate.
 /// On first connect, the cert is trusted and stored. On subsequent connects,
 /// the cert must match the stored fingerprint or the connection is rejected.
+/// Persisted to `tofu_pins.json` in the VoIPC data directory.
 static TOFU_STORE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<u8>>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(tofu_load_from_disk()));
+
+/// Load TOFU pins from disk. Returns empty map on any error.
+fn tofu_load_from_disk() -> HashMap<String, Vec<u8>> {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let path = crate::config::data_dir().join("tofu_pins.json");
+    let Ok(data) = std::fs::read_to_string(&path) else {
+        return HashMap::new();
+    };
+    // Stored as { "host": "base64-encoded-fingerprint", ... }
+    let Ok(map): Result<HashMap<String, String>, _> = serde_json::from_str(&data) else {
+        return HashMap::new();
+    };
+    map.into_iter()
+        .filter_map(|(k, v)| STANDARD.decode(&v).ok().map(|bytes| (k, bytes)))
+        .collect()
+}
+
+/// Save TOFU pins to disk. Errors are logged but non-fatal.
+fn tofu_save_to_disk(store: &HashMap<String, Vec<u8>>) {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let path = crate::config::data_dir().join("tofu_pins.json");
+    let b64_map: HashMap<&str, String> = store
+        .iter()
+        .map(|(k, v)| (k.as_str(), STANDARD.encode(v)))
+        .collect();
+    match serde_json::to_string_pretty(&b64_map) {
+        Ok(json) => {
+            if let Err(e) = std::fs::write(&path, json) {
+                warn!("Failed to save TOFU pins: {}", e);
+            }
+        }
+        Err(e) => warn!("Failed to serialize TOFU pins: {}", e),
+    }
+}
 
 /// Certificate verifier that accepts self-signed certs with TOFU pinning.
 /// First connection to a host: accept and pin the certificate fingerprint.
@@ -2110,7 +2262,7 @@ impl rustls::client::danger::ServerCertVerifier for TofuCertVerifier {
         let fp_bytes = fingerprint.as_ref().to_vec();
         let host_key = format!("{:?}", server_name);
 
-        let mut store = TOFU_STORE.lock().unwrap_or_else(|p| p.into_inner());
+        let mut store = TOFU_STORE.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
 
         if let Some(pinned) = store.get(&host_key) {
             // We've connected to this host before — verify the fingerprint matches
@@ -2129,9 +2281,10 @@ impl rustls::client::danger::ServerCertVerifier for TofuCertVerifier {
             }
             info!("TOFU: certificate fingerprint matches for {}", host_key);
         } else {
-            // First connection — pin the certificate
+            // First connection — pin the certificate and persist to disk
             info!("TOFU: pinning certificate for {} (first connection)", host_key);
             store.insert(host_key, fp_bytes);
+            tofu_save_to_disk(&store);
         }
 
         Ok(rustls::client::danger::ServerCertVerified::assertion())
@@ -2139,20 +2292,30 @@ impl rustls::client::danger::ServerCertVerifier for TofuCertVerifier {
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dss: &rustls::DigitallySignedStruct,
+        message: &[u8],
+        cert: &rustls::pki_types::CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+        )
     }
 
     fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {

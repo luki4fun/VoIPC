@@ -5,11 +5,14 @@
     serverAddress,
     latency,
   } from "../stores/connection.js";
+  import { playDisconnectedSound } from "../sounds.js";
+  import Icon from "./Icons.svelte";
 
   async function disconnect() {
     try {
       await invoke("disconnect");
       connectionState.set("disconnected");
+      playDisconnectedSound();
     } catch (e) {
       console.error("Failed to disconnect:", e);
     }
@@ -34,7 +37,10 @@
 
   {#if $connectionState === "connected"}
     <span class="latency">Ping: {$latency}ms</span>
-    <button class="disconnect-btn" onclick={disconnect}>Disconnect</button>
+    <button class="disconnect-btn" onclick={disconnect}>
+      <Icon name="disconnect" size={14} />
+      Disconnect
+    </button>
   {/if}
 </div>
 
@@ -83,9 +89,12 @@
   }
 
   .disconnect-btn {
+    display: flex;
+    align-items: center;
+    gap: 4px;
     background: transparent;
     color: var(--danger);
-    padding: 2px 8px;
+    padding: 4px 10px;
     font-size: 11px;
     border: 1px solid var(--danger);
   }

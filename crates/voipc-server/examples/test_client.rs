@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
 use voipc_protocol::codec::{
-    decode_server_msg, encode_client_msg, try_decode_frame, PROTOCOL_VERSION,
+    decode_server_msg, encode_client_msg, try_decode_frame, APP_VERSION, PROTOCOL_VERSION,
 };
 use voipc_protocol::messages::{ClientMessage, ServerMessage};
 
@@ -38,6 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let auth = ClientMessage::Authenticate {
         username: "TestUser".into(),
         protocol_version: PROTOCOL_VERSION,
+        app_version: APP_VERSION.to_string(),
         identity_key: None,
         prekey_bundle: None,
     };
@@ -137,30 +138,6 @@ fn print_message(msg: &ServerMessage) {
         }
         ServerMessage::Pong { timestamp } => {
             println!("[OK] Pong received (timestamp={})", timestamp);
-        }
-        ServerMessage::ChannelChatMessage {
-            channel_id,
-            user_id,
-            username,
-            content,
-            ..
-        } => {
-            println!(
-                "[CHAT] #{} <{}({})>: {}",
-                channel_id, username, user_id, content
-            );
-        }
-        ServerMessage::DirectChatMessage {
-            from_user_id,
-            from_username,
-            to_user_id,
-            content,
-            ..
-        } => {
-            println!(
-                "[DM] {}({}) -> {}: {}",
-                from_username, from_user_id, to_user_id, content
-            );
         }
         other => {
             println!("[INFO] Received: {:?}", other);

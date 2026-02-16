@@ -31,6 +31,7 @@ No accounts. No telemetry. No compromises.
 - ML-based noise suppression (RNNoise via nnnoiseless)
 - Voice Activity Detection with configurable threshold
 - Push-to-Talk, VAD, and Always-On modes
+- Global Push-to-Talk keybind (works when window is unfocused)
 - Forward Error Correction (15% packet loss tolerance)
 - Per-user volume control
 
@@ -45,6 +46,8 @@ No accounts. No telemetry. No compromises.
 **Text Chat**
 - Channel and direct messages, both end-to-end encrypted
 - Encrypted local chat history (password-protected, AES-256-GCM)
+- Encrypted poke notifications (like TeamSpeak pokes)
+- Configurable chat history storage location
 - Max 500 messages per channel stored locally
 
 **Channels**
@@ -256,6 +259,12 @@ cd client
 npm install
 npx tauri dev     # Dev build + run
 npx tauri build   # Release build
+```
+
+Or build portable release binaries via Docker (no local dependencies needed):
+
+```bash
+./release.sh    # Outputs release/VoIPC_*.AppImage + release/voipc-server
 ```
 
 See [BUILDING.md](BUILDING.md) for detailed platform-specific instructions and dependency lists.

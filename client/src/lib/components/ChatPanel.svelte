@@ -14,9 +14,40 @@
     clearDmChat,
   } from "../stores/chat.js";
   import type { ChatMessage } from "../types.js";
+  import Icon from "./Icons.svelte";
 
   let messageInput = $state("");
   let messagesContainer = $state<HTMLDivElement | null>(null);
+  let chatInputEl = $state<HTMLInputElement | null>(null);
+
+  // Emoji picker state
+  let showEmojiPicker = $state(false);
+  let emojiCategory = $state(0);
+
+  const EMOJI_CATEGORIES = [
+    { label: "Smileys", emojis: ["😀","😁","😂","🤣","😃","😄","😅","😆","😉","😊","😎","🤩","😏","😒","😞","😔","😟","😕","😣","😖","😫","😩","🥺","😢","😭","😤","😠","😡","🤬","😈","👿","💀","☠️","😱","😨","😰","😥","😓","🤗","🤔","🤭","🤫","🤥","😶","😐","😑","😬","🙄","😯","😧","😮","😲","🥱","😴","🤤","😷","🤒","🤕","🤢","🤮","🥴","😵","🤯","🥳","🥸","😇","🤠","🤡"] },
+    { label: "Gestures", emojis: ["👋","🤚","🖐️","✋","🖖","👌","🤌","🤏","✌️","🤞","🤟","🤘","🤙","👈","👉","👆","👇","☝️","👍","👎","✊","👊","🤛","🤜","👏","🙌","👐","🤲","🤝","🙏","💪","🦾","🖕"] },
+    { label: "Hearts", emojis: ["❤️","🧡","💛","💚","💙","💜","🖤","🤍","🤎","💔","❤️‍🔥","❤️‍🩹","💕","💞","💓","💗","💖","💘","💝","💟","♥️","😍","🥰","😘","😻"] },
+    { label: "Objects", emojis: ["🔥","⭐","🌟","✨","💫","🎉","🎊","🎈","🎁","🏆","🥇","🎯","💡","💎","🔔","🎵","🎶","🎤","🎧","🎮","🕹️","📱","💻","⌨️","🖥️","📷","📸","🔒","🔑","🗝️","🛠️","⚙️","💣","🧨"] },
+    { label: "Nature", emojis: ["🌈","☀️","🌤️","⛅","🌥️","☁️","🌧️","⛈️","🌩️","❄️","🌊","🌸","🌺","🌻","🌹","🌷","🌱","🌿","☘️","🍀","🍁","🍂","🌵","🌴","🐶","🐱","🐭","🐹","🐰","🦊","🐻","🐼","🐸","🐵"] },
+    { label: "Food", emojis: ["🍕","🍔","🍟","🌭","🍿","🧂","🥓","🍳","🥞","🧇","🧀","🍖","🍗","🥩","🌮","🌯","🍜","🍝","🍣","🍱","🍩","🍪","🎂","🍰","🧁","🍫","🍬","🍭","☕","🍵","🧃","🍺","🍻","🥂","🍷","🥃"] },
+  ];
+
+  function insertEmoji(emoji: string) {
+    messageInput += emoji;
+    showEmojiPicker = false;
+    // Re-focus the input
+    tick().then(() => chatInputEl?.focus());
+  }
+
+  function toggleEmojiPicker() {
+    showEmojiPicker = !showEmojiPicker;
+    if (showEmojiPicker) emojiCategory = 0;
+  }
+
+  function handleEmojiKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") showEmojiPicker = false;
+  }
 
   // DM key helper
   function dmKey(a: number, b: number): string {
@@ -133,22 +164,24 @@
   }
 </script>
 
+<svelte:window onclick={() => { if (showEmojiPicker) showEmojiPicker = false; }} onkeydown={showEmojiPicker ? handleEmojiKeydown : undefined} />
+
 <div class="chat-panel">
   <div class="chat-header">
     {#if isDmMode}
-      <button class="back-btn" onclick={backToChannel} title="Back to channel chat">&larr;</button>
+      <button class="back-btn" onclick={backToChannel} title="Back to channel chat"><Icon name="arrow-left" size={16} /></button>
       <span class="chat-title">DM with {$activeDmUsername}</span>
       {#if totalUnreadChannels > 0}
         <span class="unread-badge" title="Unread channel messages">{totalUnreadChannels}</span>
       {/if}
     {:else}
-      <span class="chat-title"># {channelName}</span>
+      <span class="chat-title"><Icon name="hash" size={14} /> {channelName}</span>
       {#if isPreviewing}
         <span class="preview-label">preview</span>
       {/if}
     {/if}
     {#if displayMessages.length > 0 && !isLobby}
-      <button class="clear-chat-btn" onclick={clearCurrentChat} title="Clear chat history">&#128465;</button>
+      <button class="clear-chat-btn" onclick={clearCurrentChat} title="Clear chat history"><Icon name="trash" size={16} /></button>
     {/if}
   </div>
 
@@ -185,9 +218,36 @@
         type="text"
         placeholder={`Message ${$activeDmUsername}...`}
         bind:value={messageInput}
+        bind:this={chatInputEl}
         onkeydown={handleKeydown}
         maxlength="2000"
       />
+      <div class="emoji-wrapper">
+        <button class="emoji-btn" type="button" onclick={(e) => { e.stopPropagation(); toggleEmojiPicker(); }} title="Emoji">
+          <Icon name="smile" size={20} />
+        </button>
+        {#if showEmojiPicker}
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div class="emoji-picker" onkeydown={handleEmojiKeydown} onclick={(e) => e.stopPropagation()}>
+            <div class="emoji-tabs">
+              {#each EMOJI_CATEGORIES as cat, idx}
+                <button
+                  class="emoji-tab"
+                  class:active={emojiCategory === idx}
+                  type="button"
+                  onclick={() => (emojiCategory = idx)}
+                  title={cat.label}
+                >{cat.emojis[0]}</button>
+              {/each}
+            </div>
+            <div class="emoji-grid">
+              {#each EMOJI_CATEGORIES[emojiCategory].emojis as emoji}
+                <button class="emoji-item" type="button" onclick={() => insertEmoji(emoji)}>{emoji}</button>
+              {/each}
+            </div>
+          </div>
+        {/if}
+      </div>
       <button class="send-btn" type="submit" disabled={!messageInput.trim()}>Send</button>
     </form>
   {:else if canSendChannelMessage}
@@ -197,9 +257,36 @@
         type="text"
         placeholder={`Message #${channelName}...`}
         bind:value={messageInput}
+        bind:this={chatInputEl}
         onkeydown={handleKeydown}
         maxlength="2000"
       />
+      <div class="emoji-wrapper">
+        <button class="emoji-btn" type="button" onclick={(e) => { e.stopPropagation(); toggleEmojiPicker(); }} title="Emoji">
+          <Icon name="smile" size={20} />
+        </button>
+        {#if showEmojiPicker}
+          <!-- svelte-ignore a11y_no_static_element_interactions -->
+          <div class="emoji-picker" onkeydown={handleEmojiKeydown} onclick={(e) => e.stopPropagation()}>
+            <div class="emoji-tabs">
+              {#each EMOJI_CATEGORIES as cat, idx}
+                <button
+                  class="emoji-tab"
+                  class:active={emojiCategory === idx}
+                  type="button"
+                  onclick={() => (emojiCategory = idx)}
+                  title={cat.label}
+                >{cat.emojis[0]}</button>
+              {/each}
+            </div>
+            <div class="emoji-grid">
+              {#each EMOJI_CATEGORIES[emojiCategory].emojis as emoji}
+                <button class="emoji-item" type="button" onclick={() => insertEmoji(emoji)}>{emoji}</button>
+              {/each}
+            </div>
+          </div>
+        {/if}
+      </div>
       <button class="send-btn" type="submit" disabled={!messageInput.trim()}>Send</button>
     </form>
   {:else if isPreviewing && !isLobby && !isPasswordProtected}
@@ -230,16 +317,21 @@
 
   .chat-title {
     font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 4px;
   }
 
   .back-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
     background: transparent;
     color: var(--text-secondary);
-    font-size: 16px;
-    padding: 0 4px;
+    padding: 4px;
     border: none;
+    border-radius: 4px;
     cursor: pointer;
-    line-height: 1;
   }
 
   .back-btn:hover {
@@ -247,14 +339,15 @@
   }
 
   .clear-chat-btn {
+    display: flex;
+    align-items: center;
     margin-left: auto;
     background: transparent;
     color: var(--text-secondary);
-    font-size: 14px;
-    padding: 0 4px;
+    padding: 4px;
     border: none;
+    border-radius: 4px;
     cursor: pointer;
-    line-height: 1;
     opacity: 0.35;
     transition: opacity 0.15s;
   }
@@ -378,5 +471,104 @@
     text-align: center;
     border-top: 1px solid var(--border);
     font-style: italic;
+  }
+
+  .emoji-wrapper {
+    position: relative;
+    display: flex;
+    align-items: center;
+  }
+
+  .emoji-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 34px;
+    height: 34px;
+    padding: 0;
+    background: transparent;
+    color: var(--text-secondary);
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+
+  .emoji-btn:hover {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+  }
+
+  .emoji-picker {
+    position: absolute;
+    bottom: calc(100% + 8px);
+    right: 0;
+    width: 320px;
+    max-height: 340px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    display: flex;
+    flex-direction: column;
+    z-index: 150;
+  }
+
+  .emoji-tabs {
+    display: flex;
+    gap: 2px;
+    padding: 6px 6px 4px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .emoji-tab {
+    flex: 1;
+    padding: 4px 0;
+    font-size: 16px;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    opacity: 0.5;
+    transition: opacity 0.1s;
+    line-height: 1;
+  }
+
+  .emoji-tab:hover {
+    opacity: 0.8;
+    background: var(--bg-hover);
+  }
+
+  .emoji-tab.active {
+    opacity: 1;
+    background: var(--bg-tertiary);
+  }
+
+  .emoji-grid {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    gap: 2px;
+    padding: 6px;
+    overflow-y: auto;
+    flex: 1;
+  }
+
+  .emoji-item {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 36px;
+    height: 36px;
+    font-size: 20px;
+    background: transparent;
+    border: none;
+    border-radius: 4px;
+    cursor: pointer;
+    line-height: 1;
+    padding: 0;
+  }
+
+  .emoji-item:hover {
+    background: var(--bg-hover);
+    transform: scale(1.15);
   }
 </style>

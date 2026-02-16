@@ -12,12 +12,42 @@ use voipc_protocol::types::*;
 
 use crate::crypto::ChatArchive;
 
+/// PTT key binding — stores the configured key/combination for push-to-talk.
+/// Uses `std::sync::RwLock` (not tokio) so the global key listener thread can read it synchronously.
+#[derive(Clone)]
+pub struct PttBinding {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+    /// JS `KeyboardEvent.code` of the main key, e.g. "Space", "KeyV", "ControlLeft".
+    pub code: String,
+}
+
+impl Default for PttBinding {
+    fn default() -> Self {
+        Self {
+            ctrl: false,
+            alt: false,
+            shift: false,
+            code: "Space".into(),
+        }
+    }
+}
+
 /// Application state managed by Tauri.
 pub struct AppState {
     pub connection: RwLock<Option<ActiveConnection>>,
     pub settings: RwLock<UserSettings>,
     pub chat: RwLock<ChatState>,
     pub signal: Arc<std::sync::Mutex<SignalState>>,
+    /// PTT binding shared with the global key listener (std RwLock for sync access).
+    pub ptt_binding: Arc<std::sync::RwLock<PttBinding>>,
+    /// When true, for combo bindings (e.g. Ctrl+Space), PTT stays active as long as the
+    /// modifier is held — releasing the trigger key alone doesn't stop PTT.
+    /// When false, releasing the trigger key immediately stops PTT.
+    pub ptt_hold_mode: Arc<AtomicBool>,
+    /// Persistent user configuration (std Mutex — config saves are fast sync ops).
+    pub config: std::sync::Mutex<crate::config::AppConfig>,
 }
 
 impl AppState {
@@ -27,6 +57,9 @@ impl AppState {
             settings: RwLock::new(UserSettings::default()),
             chat: RwLock::new(ChatState::default()),
             signal: Arc::new(std::sync::Mutex::new(SignalState::default())),
+            ptt_binding: Arc::new(std::sync::RwLock::new(PttBinding::default())),
+            ptt_hold_mode: Arc::new(AtomicBool::new(true)),
+            config: std::sync::Mutex::new(crate::config::AppConfig::default()),
         }
     }
 }
@@ -220,13 +253,18 @@ impl VoiceMode {
     }
 }
 
-/// Persisted user settings.
+/// User settings (in-memory, initialized from config on startup).
 #[allow(dead_code)]
 pub struct UserSettings {
     pub input_device: Option<String>,
     pub output_device: Option<String>,
     pub volume: f32,
     pub ptt_key: String,
+    pub voice_mode: String,
+    pub vad_threshold_db: f32,
+    pub noise_suppression: bool,
+    pub muted: bool,
+    pub deafened: bool,
 }
 
 impl Default for UserSettings {
@@ -236,6 +274,11 @@ impl Default for UserSettings {
             output_device: None,
             volume: 1.0,
             ptt_key: "Space".into(),
+            voice_mode: "ptt".into(),
+            vad_threshold_db: -40.0,
+            noise_suppression: true,
+            muted: false,
+            deafened: false,
         }
     }
 }
