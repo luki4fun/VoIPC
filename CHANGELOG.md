@@ -2,7 +2,7 @@
 
 All notable changes to VoIPC are documented here.
 
-## [0.3.0] - Unreleased
+## [0.3.0] - 2026-04-19
 
 ### Added
 - **Android app** (Tauri 2 Mobile) — full mobile client: Oboe audio capture with RNNoise, `VoiceService` foreground service, volume-key PTT, tabbed mobile UI, `MobilePTT.svelte`, speakerphone toggle, and `android-build.sh` producing universal debug/release APKs
