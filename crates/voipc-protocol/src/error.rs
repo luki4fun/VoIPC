@@ -8,6 +8,9 @@ pub enum ProtocolError {
     #[error("unknown UDP packet type: 0x{0:02x}")]
     UnknownPacketType(u8),
 
+    #[error("invalid fragment: index {index} >= count {count}")]
+    InvalidFragmentIndex { index: u8, count: u8 },
+
     #[error("message too large: {0} bytes (max 65536)")]
     MessageTooLarge(usize),
 
@@ -49,5 +52,13 @@ mod tests {
         let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "broken");
         let proto_err: ProtocolError = io_err.into();
         assert!(proto_err.to_string().contains("broken"));
+    }
+
+    #[test]
+    fn invalid_fragment_index_display() {
+        let e = ProtocolError::InvalidFragmentIndex { index: 5, count: 3 };
+        let msg = e.to_string();
+        assert!(msg.contains("5"));
+        assert!(msg.contains("3"));
     }
 }

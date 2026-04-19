@@ -517,6 +517,14 @@ fn run_wgc_capture_loop(
     let frame_interval = Duration::from_secs_f64(1.0 / target_fps as f64);
     let mut buf: Vec<u8> = Vec::new();
 
+    // Cached staging texture — only recreated when frame dimensions/format change
+    let mut cached_staging: Option<ID3D11Texture2D> = None;
+    let mut cached_staging_res: Option<ID3D11Resource> = None;
+    let mut cached_width: u32 = 0;
+    let mut cached_height: u32 = 0;
+    let mut cached_format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT =
+        windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT::default();
+
     while active.load(Ordering::Relaxed) {
         let frame_start = Instant::now();
 
@@ -556,46 +564,59 @@ fn run_wgc_capture_loop(
                 continue;
             }
 
-            // Create staging texture for CPU readback
-            let staging_desc = D3D11_TEXTURE2D_DESC {
-                Width: desc.Width,
-                Height: desc.Height,
-                MipLevels: 1,
-                ArraySize: 1,
-                Format: desc.Format,
-                SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
-                    Count: 1,
-                    Quality: 0,
-                },
-                Usage: D3D11_USAGE_STAGING,
-                BindFlags: 0,
-                CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-                MiscFlags: 0,
-            };
+            // Reuse staging texture if dimensions/format match; recreate otherwise
+            if cached_staging.is_none()
+                || cached_width != desc.Width
+                || cached_height != desc.Height
+                || cached_format != desc.Format
+            {
+                let staging_desc = D3D11_TEXTURE2D_DESC {
+                    Width: desc.Width,
+                    Height: desc.Height,
+                    MipLevels: 1,
+                    ArraySize: 1,
+                    Format: desc.Format,
+                    SampleDesc: windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC {
+                        Count: 1,
+                        Quality: 0,
+                    },
+                    Usage: D3D11_USAGE_STAGING,
+                    BindFlags: 0,
+                    CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+                    MiscFlags: 0,
+                };
 
-            let staging = unsafe {
-                let mut staging_opt: Option<ID3D11Texture2D> = None;
-                if let Err(e) = d3d_device.CreateTexture2D(&staging_desc, None, Some(&mut staging_opt)) {
-                    warn!("WGC: failed to create staging texture: {}", e);
-                    continue;
-                }
-                match staging_opt {
-                    Some(s) => s,
-                    None => {
-                        warn!("WGC: CreateTexture2D returned None");
+                let new_staging = unsafe {
+                    let mut staging_opt: Option<ID3D11Texture2D> = None;
+                    if let Err(e) = d3d_device.CreateTexture2D(&staging_desc, None, Some(&mut staging_opt)) {
+                        warn!("WGC: failed to create staging texture: {}", e);
                         continue;
                     }
-                }
-            };
+                    match staging_opt {
+                        Some(s) => s,
+                        None => {
+                            warn!("WGC: CreateTexture2D returned None");
+                            continue;
+                        }
+                    }
+                };
 
-            // Cast textures to ID3D11Resource for CopyResource/Map/Unmap
-            let staging_res: ID3D11Resource = match staging.cast() {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("WGC: failed to cast staging to ID3D11Resource: {}", e);
-                    continue;
-                }
-            };
+                let new_staging_res: ID3D11Resource = match new_staging.cast() {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("WGC: failed to cast staging to ID3D11Resource: {}", e);
+                        continue;
+                    }
+                };
+
+                cached_staging = Some(new_staging);
+                cached_staging_res = Some(new_staging_res);
+                cached_width = desc.Width;
+                cached_height = desc.Height;
+                cached_format = desc.Format;
+            }
+
+            let staging_res = cached_staging_res.as_ref().unwrap();
             let texture_res: ID3D11Resource = match texture.cast() {
                 Ok(r) => r,
                 Err(e) => {
@@ -606,13 +627,13 @@ fn run_wgc_capture_loop(
 
             // Copy from GPU texture to staging texture
             unsafe {
-                d3d_context.CopyResource(&staging_res, &texture_res);
+                d3d_context.CopyResource(staging_res, &texture_res);
             }
 
             // Map the staging texture for CPU read
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
             if unsafe {
-                d3d_context.Map(&staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
+                d3d_context.Map(staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
             }
             .is_err()
             {
@@ -631,7 +652,7 @@ fn run_wgc_capture_loop(
                 buf.extend_from_slice(src);
             }
 
-            unsafe { d3d_context.Unmap(&staging_res, 0) };
+            unsafe { d3d_context.Unmap(staging_res, 0) };
 
             let captured = CapturedFrame {
                 pixels: std::mem::take(&mut buf),

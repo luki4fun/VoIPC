@@ -15,6 +15,7 @@
     receiverResolution,
     receiverFramesDropped,
   } from "../stores/screenshare.js";
+  import { isMobile } from "../stores/platform.js";
 
   let bitrateLabel = $derived(
     $receiverBitrate >= 1000
@@ -119,7 +120,9 @@
         {/if}
       </span>
     {/if}
-    <button class="popout-btn" onclick={popOut} title="Pop out to separate window">&#8599;</button>
+    {#if !$isMobile}
+      <button class="popout-btn" onclick={popOut} title="Pop out to separate window">&#8599;</button>
+    {/if}
     <button class="stop-btn" onclick={stopWatching}>Stop Watching</button>
   </div>
   <div class="viewer-content">

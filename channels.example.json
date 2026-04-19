@@ -1,0 +1,18 @@
+[
+  {
+    "name": "Music",
+    "description": "Listen to music together",
+    "password": "changeme",
+    "max_users": 10
+  },
+  {
+    "name": "AFK",
+    "description": "Away from keyboard"
+  },
+  {
+    "name": "Private",
+    "description": "Password-protected room",
+    "password": "secret123",
+    "max_users": 5
+  }
+]

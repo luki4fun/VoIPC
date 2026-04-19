@@ -47,12 +47,13 @@ impl Encoder {
     /// `pcm` must contain exactly `OPUS_FRAME_SIZE` (960) samples.
     /// Returns the encoded Opus data.
     pub fn encode(&mut self, pcm: &[f32]) -> Result<Vec<u8>> {
-        assert_eq!(
-            pcm.len(),
-            OPUS_FRAME_SIZE,
-            "PCM frame must be exactly {} samples",
-            OPUS_FRAME_SIZE
-        );
+        if pcm.len() != OPUS_FRAME_SIZE {
+            anyhow::bail!(
+                "PCM frame must be exactly {} samples, got {}",
+                OPUS_FRAME_SIZE,
+                pcm.len()
+            );
+        }
 
         // Opus output buffer — 512 bytes handles higher bitrates (e.g. 64kbps screen audio)
         let mut output = vec![0u8; 512];

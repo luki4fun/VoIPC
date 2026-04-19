@@ -47,8 +47,9 @@ impl JitterBuffer {
         // During buffering phase, accept all packets (out-of-order included)
         if !self.buffering {
             if let Some(next) = self.next_seq {
-                // Discard packets we've already played past
-                if sequence < next && next.wrapping_sub(sequence) < 1000 {
+                // Discard packets we've already played past (wraparound-safe)
+                let distance = next.wrapping_sub(sequence);
+                if distance > 0 && distance < 1000 {
                     return;
                 }
             }

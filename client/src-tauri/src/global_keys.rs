@@ -3,16 +3,34 @@
 //! - **Linux**: Tries `evdev` first (reads `/dev/input/event*` directly — works on X11 + Wayland,
 //!   requires user in `input` group). Falls back to `rdev` (X11 XRecord — no special permissions).
 //! - **Other platforms**: Uses `rdev` which hooks into OS-level keyboard events.
+//! - **Android**: No-op. PTT is handled via on-screen button and volume key interception.
 
+// Android has no global keyboard hooks — PTT uses touch UI + volume keys instead.
+#[cfg(target_os = "android")]
+pub fn spawn_listener(
+    _handle: tauri::AppHandle,
+    _ptt_binding: std::sync::Arc<std::sync::RwLock<crate::app_state::PttBinding>>,
+    _ptt_hold_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    tracing::info!("Global PTT: not available on Android (using touch UI + volume keys)");
+}
+
+#[cfg(not(target_os = "android"))]
 use std::collections::HashSet;
+#[cfg(not(target_os = "android"))]
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(target_os = "android"))]
 use std::sync::Arc;
 
+#[cfg(not(target_os = "android"))]
 use tauri::{Emitter, Manager};
 
+#[cfg(not(target_os = "android"))]
 use crate::app_state::{AppState, PttBinding, VoiceMode};
+#[cfg(not(target_os = "android"))]
 use crate::commands;
 
+#[cfg(not(target_os = "android"))]
 /// Spawn a background thread that monitors global keyboard events and triggers
 /// PTT start/stop. Keys are NOT consumed — they still propagate to all applications.
 pub fn spawn_listener(
@@ -48,6 +66,7 @@ pub fn spawn_listener(
 // rdev-based listener (all platforms — X11 on Linux, native hooks on Windows)
 // ===========================================================================
 
+#[cfg(not(target_os = "android"))]
 fn js_code_to_rdev_key(code: &str) -> Option<rdev::Key> {
     use rdev::Key;
     match code {
@@ -124,6 +143,7 @@ fn js_code_to_rdev_key(code: &str) -> Option<rdev::Key> {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn rdev_binding_matches(held: &HashSet<rdev::Key>, binding: &PttBinding) -> bool {
     use rdev::Key;
     if binding.ctrl
@@ -148,6 +168,7 @@ fn rdev_binding_matches(held: &HashSet<rdev::Key>, binding: &PttBinding) -> bool
     }
 }
 
+#[cfg(not(target_os = "android"))]
 fn rdev_binding_held(held: &HashSet<rdev::Key>, binding: &PttBinding) -> bool {
     use rdev::Key;
     if !binding.ctrl && !binding.alt && !binding.shift {
@@ -168,9 +189,11 @@ fn rdev_binding_held(held: &HashSet<rdev::Key>, binding: &PttBinding) -> bool {
     {
         return false;
     }
-    true
+    // All required modifiers held — also verify the main key is still held
+    rdev_binding_matches(held, binding)
 }
 
+#[cfg(not(target_os = "android"))]
 fn run_rdev_loop(
     handle: tauri::AppHandle,
     ptt_binding: Arc<std::sync::RwLock<PttBinding>>,
@@ -183,7 +206,7 @@ fn run_rdev_loop(
         match event.event_type {
             rdev::EventType::KeyPress(key) => {
                 held_keys.insert(key);
-                let b = ptt_binding.read().unwrap();
+                let b = ptt_binding.read().unwrap_or_else(|p| p.into_inner());
                 let matches = rdev_binding_matches(&held_keys, &b);
                 drop(b);
 
@@ -215,7 +238,7 @@ fn run_rdev_loop(
             }
             rdev::EventType::KeyRelease(key) => {
                 held_keys.remove(&key);
-                let b = ptt_binding.read().unwrap();
+                let b = ptt_binding.read().unwrap_or_else(|p| p.into_inner());
                 let hold = ptt_hold_mode.load(Ordering::Relaxed);
                 let still = if hold {
                     rdev_binding_held(&held_keys, &b)
@@ -383,7 +406,8 @@ fn evdev_binding_held(held: &HashSet<evdev::Key>, binding: &PttBinding) -> bool 
     {
         return false;
     }
-    true
+    // All required modifiers held — also verify the main key is still held
+    evdev_binding_matches(held, binding)
 }
 
 #[cfg(target_os = "linux")]
@@ -423,6 +447,8 @@ fn run_evdev_loop(
 
     let mut held_keys: HashSet<Key> = HashSet::new();
     let mut ptt_active = false;
+    let mut last_enum = std::time::Instant::now();
+    let mut needs_reenumerate = false;
 
     loop {
         // Build poll fds for all devices
@@ -449,7 +475,7 @@ fn run_evdev_loop(
                                 1 => {
                                     // Key press
                                     held_keys.insert(key);
-                                    let b = ptt_binding.read().unwrap();
+                                    let b = ptt_binding.read().unwrap_or_else(|p| p.into_inner());
                                     let matches =
                                         evdev_binding_matches(&held_keys, &b);
                                     drop(b);
@@ -497,7 +523,7 @@ fn run_evdev_loop(
                                 0 => {
                                     // Key release
                                     held_keys.remove(&key);
-                                    let b = ptt_binding.read().unwrap();
+                                    let b = ptt_binding.read().unwrap_or_else(|p| p.into_inner());
                                     let hold =
                                         ptt_hold_mode.load(Ordering::Relaxed);
                                     let still = if hold {
@@ -537,9 +563,103 @@ fn run_evdev_loop(
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                 Err(e) => {
-                    tracing::warn!("evdev error: {e}");
+                    if e.raw_os_error() == Some(libc::ENODEV) {
+                        tracing::info!("Keyboard device removed, will re-enumerate");
+                        needs_reenumerate = true;
+                    } else {
+                        tracing::warn!("evdev error: {e}");
+                    }
                 }
             }
         }
+
+        // Re-enumerate keyboards on device removal or every 30s (handles hotplug)
+        if needs_reenumerate || last_enum.elapsed() > std::time::Duration::from_secs(30) {
+            let new_devs = find_evdev_keyboards();
+            if !new_devs.is_empty() {
+                devices = new_devs;
+                for dev in &devices {
+                    unsafe {
+                        libc::fcntl(dev.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK);
+                    }
+                }
+                tracing::debug!("Re-enumerated {} keyboard devices", devices.len());
+            }
+            needs_reenumerate = false;
+            last_enum = std::time::Instant::now();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    fn binding(code: &str, ctrl: bool, alt: bool, shift: bool) -> PttBinding {
+        PttBinding {
+            code: code.to_string(),
+            ctrl,
+            alt,
+            shift,
+        }
+    }
+
+    // ── rdev_binding_held must require main key, not just modifiers ──
+
+    #[test]
+    fn rdev_held_requires_main_key() {
+        use rdev::Key;
+        // Binding: Ctrl+Space
+        let b = binding("Space", true, false, false);
+
+        // Only Ctrl held (no Space) → must be false (was the ghost-PTT bug)
+        let held: HashSet<Key> = [Key::ControlLeft].into();
+        assert!(!rdev_binding_held(&held, &b));
+
+        // Ctrl + Space both held → true
+        let held: HashSet<Key> = [Key::ControlLeft, Key::Space].into();
+        assert!(rdev_binding_held(&held, &b));
+    }
+
+    #[test]
+    fn rdev_held_no_modifiers_delegates_to_matches() {
+        use rdev::Key;
+        // Binding: just Space (no modifiers)
+        let b = binding("Space", false, false, false);
+
+        let held: HashSet<Key> = [Key::Space].into();
+        assert!(rdev_binding_held(&held, &b));
+
+        let held: HashSet<Key> = [Key::ControlLeft].into();
+        assert!(!rdev_binding_held(&held, &b));
+    }
+
+    #[test]
+    fn rdev_held_missing_modifier_returns_false() {
+        use rdev::Key;
+        // Binding: Ctrl+Alt+Space
+        let b = binding("Space", true, true, false);
+
+        // Only Ctrl + Space (missing Alt) → false
+        let held: HashSet<Key> = [Key::ControlLeft, Key::Space].into();
+        assert!(!rdev_binding_held(&held, &b));
+    }
+
+    // ── evdev_binding_held (Linux only) ──
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn evdev_held_requires_main_key() {
+        use evdev::Key;
+        let b = binding("Space", true, false, false);
+
+        // Only Ctrl held → false
+        let held: HashSet<Key> = [Key::KEY_LEFTCTRL].into();
+        assert!(!evdev_binding_held(&held, &b));
+
+        // Ctrl + Space → true
+        let held: HashSet<Key> = [Key::KEY_LEFTCTRL, Key::KEY_SPACE].into();
+        assert!(evdev_binding_held(&held, &b));
     }
 }

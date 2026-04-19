@@ -10,3 +10,6 @@ export const vadThreshold = writable<number>(-40);
 
 /** Current audio input level in dB. Updated periodically from backend. */
 export const audioLevel = writable<number>(-96);
+
+/** Whether speakerphone is enabled (Android only). Defaults to true. */
+export const speakerMode = writable<boolean>(true);

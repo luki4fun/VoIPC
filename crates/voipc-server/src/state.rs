@@ -1,14 +1,16 @@
 use std::collections::{HashMap, HashSet};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
 use dashmap::DashMap;
+use subtle::ConstantTimeEq;
 use tokio::sync::RwLock;
 use zeroize::Zeroizing;
 
 use voipc_protocol::types::*;
 
+use crate::channels::ChannelEntry;
 use crate::config::ServerConfig;
 use crate::settings::ServerSettings;
 
@@ -61,6 +63,16 @@ pub struct UserSession {
     pub udp_addr: Option<SocketAddr>,
     /// Random token for authenticating UDP voice packets.
     pub udp_token: u64,
+    /// IP address from TCP authentication (for UDP source verification).
+    pub tcp_peer_ip: IpAddr,
+    /// Rate limiter for UDP voice packets (55 pkt/s — 50fps + margin).
+    pub udp_voice_rate: RateLimiter,
+    /// Rate limiter for UDP video packets (120 pkt/s — 60fps × 2 fragments avg).
+    pub udp_video_rate: RateLimiter,
+    /// Global rate limiter for all TCP messages (50 msg/s burst).
+    pub global_rate: RateLimiter,
+    /// Rate limiter for channel password attempts (3 burst, 1/s refill).
+    pub password_attempt_rate: RateLimiter,
     /// Rate limiter for chat messages (channel + DM).
     pub chat_rate: RateLimiter,
     /// Rate limiter for channel creation.
@@ -119,6 +131,8 @@ pub struct Channel {
     pub media_key_bytes: Option<Zeroizing<[u8; 32]>>,
     /// Incrementing key ID for this channel's media key.
     pub media_key_id: u16,
+    /// Whether this channel was loaded from channels.json and cannot be auto-deleted.
+    pub persistent: bool,
 }
 
 /// The shared server state, designed for concurrent access.
@@ -127,6 +141,8 @@ pub struct ServerState {
     pub sessions: DashMap<SessionId, UserSession>,
     /// Reverse lookup: user_id -> session_id.
     pub user_to_session: DashMap<UserId, SessionId>,
+    /// Atomic username reservation: lowercase username -> session_id.
+    pub username_to_session: DashMap<String, SessionId>,
     /// Reverse lookup: UDP address -> session_id (for routing incoming voice).
     pub addr_to_session: DashMap<SocketAddr, SessionId>,
     /// All channels, keyed by channel_id.
@@ -147,7 +163,11 @@ pub struct ServerState {
 
 impl ServerState {
     /// Create a new server state from the given configuration.
-    pub fn new(config: &ServerConfig, settings: ServerSettings) -> Self {
+    pub fn new(
+        config: &ServerConfig,
+        settings: ServerSettings,
+        persistent_channels: Vec<ChannelEntry>,
+    ) -> Self {
         let mut channels = HashMap::new();
         channels.insert(
             0,
@@ -169,12 +189,52 @@ impl ServerState {
                 screen_shares: HashMap::new(),
                 media_key_bytes: None,
                 media_key_id: 0,
+                persistent: false,
             },
         );
+
+        // Insert persistent channels from channels.json with IDs starting at 1
+        let mut next_id: u32 = 1;
+        for entry in &persistent_channels {
+            let channel_id = next_id;
+            next_id += 1;
+
+            let has_password = entry.password_hash.is_some();
+            let password = entry.password_hash.clone().map(Zeroizing::new);
+
+            // Generate a random AES-256 media key for this channel
+            let mut key_bytes = [0u8; 32];
+            rand::Rng::fill(&mut rand::thread_rng(), &mut key_bytes);
+
+            channels.insert(
+                channel_id,
+                Channel {
+                    info: ChannelInfo {
+                        channel_id,
+                        name: entry.name.clone(),
+                        description: entry.description.clone(),
+                        max_users: entry.max_users,
+                        user_count: 0,
+                        has_password,
+                        created_by: None,
+                    },
+                    members: HashSet::new(),
+                    password,
+                    delete_timer: None,
+                    created_by: None,
+                    invited_users: HashSet::new(),
+                    screen_shares: HashMap::new(),
+                    media_key_bytes: Some(Zeroizing::new(key_bytes)),
+                    media_key_id: 0,
+                    persistent: true,
+                },
+            );
+        }
 
         Self {
             sessions: DashMap::new(),
             user_to_session: DashMap::new(),
+            username_to_session: DashMap::new(),
             addr_to_session: DashMap::new(),
             channels: RwLock::new(channels),
             max_users: config.max_users,
@@ -182,7 +242,7 @@ impl ServerState {
             settings,
             next_user_id: AtomicU32::new(1),
             next_session_id: AtomicU32::new(1),
-            next_channel_id: AtomicU32::new(1),
+            next_channel_id: AtomicU32::new(next_id),
         }
     }
 
@@ -206,11 +266,11 @@ impl ServerState {
         self.sessions.len()
     }
 
-    /// Check if a username is already taken.
-    pub fn is_username_taken(&self, username: &str) -> bool {
-        self.sessions
-            .iter()
-            .any(|entry| entry.value().username == username)
+    /// Broadcast a raw serialized message to all connected sessions.
+    pub async fn broadcast_raw_to_all(&self, data: &[u8]) {
+        for entry in self.sessions.iter() {
+            let _ = entry.value().tcp_tx.try_send(data.to_vec());
+        }
     }
 
     /// Get a snapshot of all channel info (for sending to clients).
@@ -263,9 +323,20 @@ impl ServerState {
 
         if !is_invited {
             if let Some(ref channel_pw) = channel.password {
-                match password {
-                    Some(pw) if pw == channel_pw.as_str() => {}
-                    _ => anyhow::bail!("incorrect channel password"),
+                let matches = match password {
+                    Some(pw) if channel.persistent => {
+                        // Persistent channels store a SHA-256 hash — hash the attempt first
+                        let attempt_hash = crate::channels::hash_password(pw);
+                        attempt_hash.as_bytes().ct_eq(channel_pw.as_bytes()).into()
+                    }
+                    Some(pw) => {
+                        // User-created channels store plaintext passwords
+                        pw.as_bytes().ct_eq(channel_pw.as_bytes()).into()
+                    }
+                    None => false,
+                };
+                if !matches {
+                    anyhow::bail!("incorrect channel password");
                 }
             }
         }
@@ -297,11 +368,17 @@ impl ServerState {
         let was_invited = channel.invited_users.remove(&user_id);
 
         if !was_invited {
-            // Check password
             if let Some(ref channel_pw) = channel.password {
-                match password {
-                    Some(pw) if pw == channel_pw.as_str() => {}
-                    _ => anyhow::bail!("incorrect channel password"),
+                let matches = match password {
+                    Some(pw) if channel.persistent => {
+                        let attempt_hash = crate::channels::hash_password(pw);
+                        attempt_hash.as_bytes().ct_eq(channel_pw.as_bytes()).into()
+                    }
+                    Some(pw) => pw.as_bytes().ct_eq(channel_pw.as_bytes()).into(),
+                    None => false,
+                };
+                if !matches {
+                    anyhow::bail!("incorrect channel password");
                 }
             }
         }
@@ -369,6 +446,7 @@ impl ServerState {
         let (_, session) = self.sessions.remove(&session_id)?;
 
         self.user_to_session.remove(&session.user_id);
+        self.username_to_session.remove(&session.username.to_lowercase());
 
         if let Some(addr) = &session.udp_addr {
             self.addr_to_session.remove(addr);
@@ -393,8 +471,11 @@ impl ServerState {
     ) -> anyhow::Result<ChannelInfo> {
         let mut channels = self.channels.write().await;
 
-        // Enforce max channel limit (subtract 1 for the permanent General channel)
-        let user_channels = channels.len().saturating_sub(1);
+        // Count only user-created channels (exclude General and persistent channels)
+        let user_channels = channels
+            .values()
+            .filter(|ch| !ch.persistent && ch.info.channel_id != 0)
+            .count();
         if user_channels >= self.settings.max_channels as usize {
             anyhow::bail!("maximum number of channels reached");
         }
@@ -433,13 +514,14 @@ impl ServerState {
                 screen_shares: HashMap::new(),
                 media_key_bytes: Some(Zeroizing::new(key_bytes)),
                 media_key_id: 0,
+                persistent: false,
             },
         );
 
         Ok(info)
     }
 
-    /// Delete an empty, non-General channel.
+    /// Delete an empty, non-General, non-persistent channel.
     pub async fn delete_channel(&self, channel_id: ChannelId) -> anyhow::Result<()> {
         if channel_id == 0 {
             anyhow::bail!("cannot delete the General channel");
@@ -449,6 +531,10 @@ impl ServerState {
         let channel = channels
             .get(&channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel does not exist"))?;
+
+        if channel.persistent {
+            anyhow::bail!("cannot delete a persistent channel");
+        }
 
         if !channel.members.is_empty() {
             anyhow::bail!("channel is not empty");
@@ -923,7 +1009,7 @@ mod tests {
     use crate::settings::ServerSettings;
 
     fn make_state() -> ServerState {
-        ServerState::new(&ServerConfig::default(), ServerSettings::default())
+        ServerState::new(&ServerConfig::default(), ServerSettings::default(), Vec::new())
     }
 
     fn add_user(state: &ServerState, username: &str) -> (UserId, SessionId) {
@@ -940,6 +1026,11 @@ mod tests {
             tcp_tx: tx,
             udp_addr: None,
             udp_token: user_id as u64 * 1000,
+            tcp_peer_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            udp_voice_rate: RateLimiter::new(55.0, 55.0),
+            udp_video_rate: RateLimiter::new(120.0, 120.0),
+            global_rate: RateLimiter::new(50.0, 50.0),
+            password_attempt_rate: RateLimiter::new(3.0, 1.0),
             chat_rate: RateLimiter::new(5.0, 5.0),
             create_channel_rate: RateLimiter::new(1.0, 0.2),
             prekey_rate: RateLimiter::new(1.0, 0.2),
@@ -955,6 +1046,9 @@ mod tests {
         };
         state.sessions.insert(session_id, session);
         state.user_to_session.insert(user_id, session_id);
+        state
+            .username_to_session
+            .insert(username.to_lowercase(), session_id);
         (user_id, session_id)
     }
 
@@ -1031,10 +1125,10 @@ mod tests {
     #[test]
     fn username_taken() {
         let state = make_state();
-        assert!(!state.is_username_taken("alice"));
+        assert!(!state.username_to_session.contains_key("alice"));
         add_user(&state, "alice");
-        assert!(state.is_username_taken("alice"));
-        assert!(!state.is_username_taken("bob"));
+        assert!(state.username_to_session.contains_key("alice"));
+        assert!(!state.username_to_session.contains_key("bob"));
     }
 
     // ── Channel operations ─────────────────────────────────────────────

@@ -5,9 +5,14 @@ edition.workspace = true
 
 [dependencies]
 voipc-protocol = { workspace = true }
-cpal = { workspace = true }
 audiopus = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 ringbuf = "0.4"
 nnnoiseless = "0.1"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+cpal = { workspace = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+oboe = { version = "0.6", features = ["java-interface"] }

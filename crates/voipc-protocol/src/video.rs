@@ -208,6 +208,14 @@ impl VideoPacket {
         let fragment_count = data[18];
         let timestamp = u32::from_be_bytes([data[19], data[20], data[21], data[22]]);
 
+        // Reject packets where fragment_index >= fragment_count
+        if fragment_count > 0 && fragment_index >= fragment_count {
+            return Err(ProtocolError::InvalidFragmentIndex {
+                index: fragment_index,
+                count: fragment_count,
+            });
+        }
+
         if packet_type.is_encrypted() {
             if data.len() < ENCRYPTED_VIDEO_HEADER_SIZE {
                 return Err(ProtocolError::PacketTooShort {
@@ -260,6 +268,14 @@ pub fn fragment_frame(
     max_payload: usize,
 ) -> Vec<VideoPacket> {
     let chunks: Vec<&[u8]> = encoded_data.chunks(max_payload).collect();
+    if chunks.len() > MAX_FRAGMENTS_PER_FRAME {
+        tracing::warn!(
+            frame_id,
+            total_chunks = chunks.len(),
+            max = MAX_FRAGMENTS_PER_FRAME,
+            "frame exceeds max fragments, truncating"
+        );
+    }
     let fragment_count = chunks.len().min(MAX_FRAGMENTS_PER_FRAME) as u8;
 
     chunks
@@ -323,10 +339,17 @@ impl FrameAssembler {
         let frame_id = packet.frame_id;
         let mut frame_dropped = false;
 
+        // Reject zero-fragment packets — they'd produce empty frames
+        if packet.fragment_count == 0 {
+            return FragmentResult { frame: None, frame_dropped: false };
+        }
+
         // New frame arrived — discard any incomplete previous frame
         if self.current_frame_id != Some(frame_id) {
             if let Some(cur) = self.current_frame_id {
-                if frame_id < cur {
+                // Wraparound-safe: treat frames within 1000 behind current as old
+                let behind = cur.wrapping_sub(frame_id);
+                if behind > 0 && behind < 1000 {
                     // Old/out-of-order frame, ignore
                     return FragmentResult { frame: None, frame_dropped: false };
                 }
@@ -381,7 +404,7 @@ impl FrameAssembler {
                 // Detect frame_id gaps: if we skipped one or more frame_ids entirely
                 // (no fragments arrived at all), those frames were lost in transit.
                 if let Some(prev) = self.last_completed_frame_id {
-                    if frame_id > prev + 1 {
+                    if frame_id.wrapping_sub(prev) > 1 {
                         frame_dropped = true;
                     }
                 }
@@ -514,6 +537,14 @@ impl ScreenShareAudioPacket {
         }
 
         let packet_type = data[0];
+
+        // Reject packets that aren't screen share audio types
+        if packet_type != VideoPacketType::ScreenShareAudio as u8
+            && packet_type != VideoPacketType::EncryptedScreenShareAudio as u8
+        {
+            return Err(ProtocolError::UnknownPacketType(packet_type));
+        }
+
         let session_id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
         let udp_token = u64::from_be_bytes([
             data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12],
@@ -825,5 +856,105 @@ mod tests {
         let decoded = ScreenShareAudioPacket::from_bytes(&bytes).unwrap();
         assert!(decoded.opus_data.is_empty());
         assert_eq!(bytes.len(), SCREEN_AUDIO_HEADER_SIZE);
+    }
+
+    // ── Edge case tests (audit fixes) ──
+
+    #[test]
+    fn video_packet_rejects_invalid_fragment_index() {
+        // fragment_index=5 >= fragment_count=3 → InvalidFragmentIndex
+        let mut pkt = VideoPacket::fragment(false, 1, 1, 0, 0, 3, 0, vec![1, 2]);
+        pkt.fragment_index = 5;
+        pkt.fragment_count = 3;
+        let bytes = pkt.to_bytes();
+        let err = VideoPacket::from_bytes(&bytes).unwrap_err();
+        assert!(matches!(err, ProtocolError::InvalidFragmentIndex { index: 5, count: 3 }));
+    }
+
+    #[test]
+    fn video_packet_allows_zero_fragment_count() {
+        // fragment_count=0 with fragment_index=0 passes from_bytes (assembler rejects it)
+        let mut pkt = VideoPacket::fragment(false, 1, 1, 0, 0, 1, 0, vec![1]);
+        pkt.fragment_count = 0;
+        pkt.fragment_index = 0;
+        let bytes = pkt.to_bytes();
+        assert!(VideoPacket::from_bytes(&bytes).is_ok());
+    }
+
+    #[test]
+    fn assembler_rejects_zero_fragment_count() {
+        let mut assembler = FrameAssembler::new();
+        let mut pkt = VideoPacket::fragment(true, 1, 1, 0, 0, 1, 0, vec![1]);
+        pkt.fragment_count = 0;
+        let r = assembler.add_fragment(&pkt);
+        assert!(r.frame.is_none());
+        assert!(!r.frame_dropped);
+    }
+
+    #[test]
+    fn assembler_frame_id_wraparound_gap_detection() {
+        let mut assembler = FrameAssembler::new();
+
+        // Complete keyframe at frame_id = u32::MAX - 1
+        let pkt = VideoPacket::fragment(true, 1, 1, u32::MAX - 1, 0, 1, 0, vec![10]);
+        let r = assembler.add_fragment(&pkt);
+        assert!(r.frame.is_some());
+
+        // Complete frame at u32::MAX (sequential, no gap)
+        let pkt = VideoPacket::fragment(false, 1, 1, u32::MAX, 0, 1, 100, vec![20]);
+        let r = assembler.add_fragment(&pkt);
+        assert!(r.frame.is_some());
+        assert!(!r.frame_dropped);
+
+        // Complete frame at 0 (wrapped, sequential, no gap)
+        let pkt = VideoPacket::fragment(false, 1, 1, 0, 0, 1, 200, vec![30]);
+        let r = assembler.add_fragment(&pkt);
+        assert!(r.frame.is_some());
+        assert!(!r.frame_dropped);
+
+        // Complete frame at 2 (gap: frame 1 missing)
+        let pkt = VideoPacket::fragment(false, 1, 1, 2, 0, 1, 400, vec![50]);
+        let r = assembler.add_fragment(&pkt);
+        assert!(r.frame.is_some());
+        assert!(r.frame_dropped);
+    }
+
+    #[test]
+    fn assembler_old_frame_wraparound() {
+        let mut assembler = FrameAssembler::new();
+
+        // Complete keyframe at frame_id 5
+        let pkt = VideoPacket::fragment(true, 1, 1, 5, 0, 1, 0, vec![10]);
+        assert!(assembler.add_fragment(&pkt).frame.is_some());
+
+        // Start assembling frame 10
+        let pkt = VideoPacket::fragment(false, 1, 1, 10, 0, 2, 100, vec![20]);
+        assert!(assembler.add_fragment(&pkt).frame.is_none());
+
+        // Frame u32::MAX arrives (behind by 11 in wrapping terms) — should be ignored as old
+        let pkt = VideoPacket::fragment(false, 1, 1, u32::MAX, 0, 1, 50, vec![99]);
+        let r = assembler.add_fragment(&pkt);
+        assert!(r.frame.is_none());
+        assert!(!r.frame_dropped);
+    }
+
+    #[test]
+    fn screen_audio_rejects_wrong_packet_type() {
+        // Build a valid-length packet but with video fragment type (0x10)
+        let mut buf = vec![0u8; SCREEN_AUDIO_HEADER_SIZE + 5];
+        buf[0] = 0x10; // VideoFragment, not ScreenShareAudio
+        let err = ScreenShareAudioPacket::from_bytes(&buf).unwrap_err();
+        assert!(matches!(err, ProtocolError::UnknownPacketType(0x10)));
+    }
+
+    #[test]
+    fn screen_audio_accepts_both_types() {
+        let unenc = ScreenShareAudioPacket::new(1, 1, 0, 0, vec![1, 2, 3]);
+        let bytes = unenc.to_bytes();
+        assert!(ScreenShareAudioPacket::from_bytes(&bytes).is_ok());
+
+        let enc = ScreenShareAudioPacket::new_encrypted(1, 1, 0, 0, 42, vec![1, 2, 3]);
+        let bytes = enc.to_bytes();
+        assert!(ScreenShareAudioPacket::from_bytes(&bytes).is_ok());
     }
 }

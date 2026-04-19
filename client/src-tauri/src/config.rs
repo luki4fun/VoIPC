@@ -1,6 +1,17 @@
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
+
+/// Overridden data directory (set via init_data_dir on Android).
+static DATA_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
+
+/// Set the data directory explicitly. Called from lib.rs setup on Android
+/// with Tauri's app_data_dir(). Must be called before any other config function.
+#[allow(dead_code)]
+pub fn init_data_dir(dir: PathBuf) {
+    let _ = DATA_DIR_OVERRIDE.set(dir);
+}
 
 /// Settings for a single notification sound event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,14 +121,26 @@ impl Default for AppConfig {
     }
 }
 
-/// Returns the VoIPC data directory (~/.config/VoIPC/ on Linux, %APPDATA%/VoIPC on Windows).
+/// Returns the VoIPC data directory.
+/// - Desktop: `~/.config/VoIPC/` (Linux) or `%APPDATA%/VoIPC` (Windows)
+/// - Android: Tauri's `app_data_dir()` (set via `init_data_dir` in setup)
 /// Creates the directory if it doesn't exist.
 pub fn data_dir() -> PathBuf {
-    let dir = dirs::config_dir()
-        .expect("failed to determine config directory")
-        .join("VoIPC");
+    let dir = if let Some(d) = DATA_DIR_OVERRIDE.get() {
+        d.clone()
+    } else {
+        dirs::config_dir()
+            .unwrap_or_else(|| std::env::temp_dir().join("voipc_fallback"))
+            .join("VoIPC")
+    };
     if !dir.exists() {
-        std::fs::create_dir_all(&dir).expect("failed to create VoIPC config directory");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            tracing::error!("failed to create VoIPC config directory {:?}: {e}", dir);
+            // Fall back to temp directory
+            let fallback = std::env::temp_dir().join("VoIPC");
+            let _ = std::fs::create_dir_all(&fallback);
+            return fallback;
+        }
     }
     dir
 }
@@ -180,7 +203,10 @@ pub fn load_config() -> AppConfig {
                 AppConfig::default()
             }
         },
-        Err(_) => AppConfig::default(),
+        Err(e) => {
+            tracing::info!("Could not read config {}: {e} — using defaults", path.display());
+            AppConfig::default()
+        }
     }
 }
 

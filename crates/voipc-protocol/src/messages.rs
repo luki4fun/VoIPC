@@ -193,6 +193,9 @@ pub enum ServerMessage {
     /// A user changed their deafen state.
     UserDeafened { user_id: UserId, deafened: bool },
 
+    /// Server-initiated keepalive ping. Client should reply with ClientMessage::Ping.
+    Ping { timestamp: u64 },
+
     /// Pong response for latency measurement.
     Pong { timestamp: u64 },
 

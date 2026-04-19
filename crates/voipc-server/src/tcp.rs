@@ -1,5 +1,5 @@
 use std::sync::Arc;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use bytes::BytesMut;
@@ -8,7 +8,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_rustls::server::TlsStream;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use voipc_protocol::codec::{
     decode_client_msg, encode_server_msg, try_decode_frame, APP_VERSION, PROTOCOL_VERSION,
@@ -23,12 +23,15 @@ pub async fn handle_connection(
     mut tls_stream: TlsStream<TcpStream>,
     state: Arc<ServerState>,
 ) {
-    let peer_addr = tls_stream
-        .get_ref()
-        .0
-        .peer_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| "unknown".into());
+    let peer_socket_addr = match tls_stream.get_ref().0.peer_addr() {
+        Ok(addr) => addr,
+        Err(e) => {
+            error!("failed to get peer address, dropping connection: {}", e);
+            return;
+        }
+    };
+    let peer_addr = peer_socket_addr.to_string();
+    let tcp_peer_ip = peer_socket_addr.ip();
 
     info!(peer = %peer_addr, "new TCP connection");
 
@@ -36,7 +39,7 @@ pub async fn handle_connection(
     let mut buf = BytesMut::with_capacity(4096);
     let auth_result = tokio::time::timeout(
         Duration::from_secs(5),
-        authenticate(&mut tls_stream, &mut buf, &state, &peer_addr),
+        authenticate(&mut tls_stream, &mut buf, &state, &peer_addr, tcp_peer_ip),
     )
     .await;
     let (user_id, session_id) = match auth_result {
@@ -82,19 +85,53 @@ pub async fn handle_connection(
         error!("failed to auto-join General: {}", e);
     }
 
-    // --- Message loop ---
+    // --- Message loop with keepalive ---
+    let idle_timeout = Duration::from_secs(300); // 5 min idle disconnect
+    let keepalive_interval = Duration::from_secs(60);
+    let mut last_activity = Instant::now();
+    let mut keepalive_timer = tokio::time::interval(keepalive_interval);
+    keepalive_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Skip the immediate first tick
+    keepalive_timer.tick().await;
+
     let mut read_half = read_half;
     loop {
-        match read_half.read_buf(&mut buf).await {
-            Ok(0) => {
-                info!(user_id, "client disconnected (EOF)");
-                break;
+        let got_data = tokio::select! {
+            result = read_half.read_buf(&mut buf) => {
+                match result {
+                    Ok(0) => {
+                        info!(user_id, "client disconnected (EOF)");
+                        break;
+                    }
+                    Ok(_) => {
+                        last_activity = Instant::now();
+                        true
+                    }
+                    Err(e) => {
+                        error!(user_id, "TCP read error: {}", e);
+                        break;
+                    }
+                }
             }
-            Ok(_) => {}
-            Err(e) => {
-                error!(user_id, "TCP read error: {}", e);
-                break;
+            _ = keepalive_timer.tick() => {
+                if last_activity.elapsed() >= idle_timeout {
+                    info!(user_id, "client idle timeout, disconnecting");
+                    break;
+                }
+                // Send keepalive ping to client
+                let timestamp = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let ping = ServerMessage::Ping { timestamp };
+                let _ = send_msg(&tx, &ping).await;
+                debug!(user_id, "sent keepalive ping");
+                false
             }
+        };
+
+        if !got_data {
+            continue; // keepalive tick, no data to decode
         }
 
         // Process complete messages in the buffer (max 20 per read to prevent burst DoS)
@@ -110,6 +147,16 @@ pub async fn handle_connection(
                     msgs_this_read += 1;
                     match decode_client_msg(&payload) {
                         Ok(msg) => {
+                            // Global per-session rate limiter
+                            let allowed = state
+                                .sessions
+                                .get_mut(&session_id)
+                                .map(|mut s| s.global_rate.try_consume())
+                                .unwrap_or(false);
+                            if !allowed {
+                                warn!(user_id, "global rate limit exceeded, dropping message");
+                                continue;
+                            }
                             if let Err(e) =
                                 handle_message(msg, &state, user_id, session_id, &tx).await
                             {
@@ -141,10 +188,14 @@ async fn authenticate(
     buf: &mut BytesMut,
     state: &ServerState,
     peer_addr: &str,
+    tcp_peer_ip: std::net::IpAddr,
 ) -> Result<(UserId, SessionId)> {
     // Read until we get a complete message
     loop {
-        stream.read_buf(buf).await?;
+        let n = stream.read_buf(buf).await?;
+        if n == 0 {
+            anyhow::bail!("client disconnected during authentication");
+        }
 
         if let Some(payload) = try_decode_frame(buf)? {
             let msg = decode_client_msg(&payload)?;
@@ -182,8 +233,7 @@ async fn authenticate(
                     }
 
                     let username = username.trim().to_string();
-                    let char_count = username.chars().count();
-                    if char_count == 0 || char_count > 32 {
+                    if username.is_empty() || username.len() > 32 {
                         let err_msg = ServerMessage::AuthError {
                             reason: "username must be 1-32 characters".into(),
                         };
@@ -201,15 +251,6 @@ async fn authenticate(
                         anyhow::bail!("invalid username characters");
                     }
 
-                    if state.is_username_taken(&username) {
-                        let err_msg = ServerMessage::AuthError {
-                            reason: "username already taken".into(),
-                        };
-                        let data = encode_server_msg(&err_msg)?;
-                        stream.write_all(&data).await?;
-                        anyhow::bail!("username taken");
-                    }
-
                     if state.user_count() >= state.max_users as usize {
                         let err_msg = ServerMessage::AuthError {
                             reason: "server is full".into(),
@@ -221,6 +262,23 @@ async fn authenticate(
 
                     let user_id = state.next_user_id();
                     let session_id = state.next_session_id();
+
+                    // Atomic username reservation — prevents race between two
+                    // simultaneous registrations with the same name
+                    let username_lower = username.to_lowercase();
+                    match state.username_to_session.entry(username_lower) {
+                        dashmap::mapref::entry::Entry::Occupied(_) => {
+                            let err_msg = ServerMessage::AuthError {
+                                reason: "username already taken".into(),
+                            };
+                            let data = encode_server_msg(&err_msg)?;
+                            stream.write_all(&data).await?;
+                            anyhow::bail!("username taken");
+                        }
+                        dashmap::mapref::entry::Entry::Vacant(entry) => {
+                            entry.insert(session_id);
+                        }
+                    }
                     let udp_token: u64 = rand::thread_rng().gen();
 
                     // Extract E2E encryption fields from the pre-key bundle
@@ -251,6 +309,11 @@ async fn authenticate(
                         tcp_tx: placeholder_tx,
                         udp_addr: None,
                         udp_token,
+                        tcp_peer_ip,
+                        udp_voice_rate: crate::state::RateLimiter::new(55.0, 55.0),
+                        udp_video_rate: crate::state::RateLimiter::new(120.0, 120.0),
+                        global_rate: crate::state::RateLimiter::new(50.0, 50.0),
+                        password_attempt_rate: crate::state::RateLimiter::new(3.0, 1.0),
                         chat_rate: crate::state::RateLimiter::new(5.0, 5.0),
                         create_channel_rate: crate::state::RateLimiter::new(1.0, 0.2),
                         prekey_rate: crate::state::RateLimiter::new(1.0, 0.2),
@@ -288,7 +351,7 @@ async fn authenticate(
                     return Ok((user_id, session_id));
                 }
                 _ => {
-                    anyhow::bail!("expected Authenticate message, got {:?}", msg);
+                    anyhow::bail!("expected Authenticate message, got unexpected message type");
                 }
             }
         }
@@ -427,7 +490,7 @@ async fn handle_message(
             handle_send_poke(state, user_id, session_id, target_user_id, ciphertext, message_type, tx).await?;
         }
         ClientMessage::StartScreenShare { source: _, resolution } => {
-            let clamped_resolution = resolution.min(4320); // cap at 8K
+            let clamped_resolution = resolution.clamp(240, 4320);
             handle_start_screen_share(state, user_id, session_id, clamped_resolution, tx).await?;
         }
         ClientMessage::StopScreenShare => {
@@ -528,6 +591,25 @@ async fn handle_join_channel(
     password: Option<&str>,
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
+    // Rate-limit password attempts to prevent brute force
+    if password.is_some() {
+        let allowed = state
+            .sessions
+            .get_mut(&session_id)
+            .map(|mut s| s.password_attempt_rate.try_consume())
+            .unwrap_or(false);
+        if !allowed {
+            let _ = send_msg(
+                tx,
+                &ServerMessage::ChannelError {
+                    reason: "too many password attempts, slow down".into(),
+                },
+            )
+            .await;
+            return Ok(());
+        }
+    }
+
     // Validate the join BEFORE leaving the current channel.
     // This way, if the password is wrong or the channel is full,
     // the user stays where they are instead of being dumped into General.
@@ -914,7 +996,7 @@ async fn handle_send_poke(
     target_user_id: UserId,
     ciphertext: Vec<u8>,
     message_type: u8,
-    tx: &mpsc::Sender<Vec<u8>>,
+    _tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
     // Look up sender username
     let from_username = state
@@ -940,13 +1022,7 @@ async fn handle_send_poke(
             }
         }
         None => {
-            let _ = send_msg(
-                tx,
-                &ServerMessage::ChannelError {
-                    reason: "User not found".into(),
-                },
-            )
-            .await;
+            // Silently drop pokes to offline users — prevents user enumeration
         }
     }
     Ok(())
@@ -1358,24 +1434,14 @@ async fn handle_encrypted_direct_message(
         timestamp,
     };
 
-    // Send to target
+    // Attempt delivery to target (silently fail if offline — prevents user enumeration)
     if let Some(target_sid) = state.user_to_session.get(&target_user_id) {
         if let Some(session) = state.sessions.get(&*target_sid) {
             let _ = send_msg(&session.tcp_tx, &msg).await;
-        } else {
-            let _ = send_msg(tx, &ServerMessage::ChannelError {
-                reason: "User not found".into(),
-            }).await;
-            return Ok(());
         }
-    } else {
-        let _ = send_msg(tx, &ServerMessage::ChannelError {
-            reason: "User not found".into(),
-        }).await;
-        return Ok(());
     }
 
-    // Echo back to sender
+    // Always echo back to sender regardless of delivery success
     let _ = send_msg(tx, &msg).await;
 
     Ok(())
@@ -1425,6 +1491,7 @@ async fn handle_encrypted_channel_message(
 }
 
 /// Handle a sender key distribution — relay to the target user.
+/// Verifies both sender and target are members of the specified channel.
 async fn handle_distribute_sender_key(
     state: &Arc<ServerState>,
     from_user_id: UserId,
@@ -1433,6 +1500,26 @@ async fn handle_distribute_sender_key(
     distribution_message: Vec<u8>,
     message_type: u8,
 ) -> Result<()> {
+    // Verify both users are in the channel before relaying
+    {
+        let channels = state.channels.read().await;
+        if let Some(channel) = channels.get(&channel_id) {
+            if !channel.members.contains(&from_user_id)
+                || !channel.members.contains(&target_user_id)
+            {
+                warn!(
+                    from_user_id,
+                    target_user_id,
+                    channel_id,
+                    "sender key distribution rejected: membership check failed"
+                );
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        }
+    }
+
     if let Some(target_sid) = state.user_to_session.get(&target_user_id) {
         if let Some(session) = state.sessions.get(&*target_sid) {
             let _ = send_msg(
@@ -1450,6 +1537,7 @@ async fn handle_distribute_sender_key(
 }
 
 /// Handle a media key distribution — relay to the target user.
+/// Verifies both sender and target are members of the specified channel.
 async fn handle_distribute_media_key(
     state: &Arc<ServerState>,
     from_user_id: UserId,
@@ -1457,6 +1545,26 @@ async fn handle_distribute_media_key(
     target_user_id: UserId,
     encrypted_media_key: Vec<u8>,
 ) -> Result<()> {
+    // Verify both users are in the channel before relaying
+    {
+        let channels = state.channels.read().await;
+        if let Some(channel) = channels.get(&channel_id) {
+            if !channel.members.contains(&from_user_id)
+                || !channel.members.contains(&target_user_id)
+            {
+                warn!(
+                    from_user_id,
+                    target_user_id,
+                    channel_id,
+                    "media key distribution rejected: membership check failed"
+                );
+                return Ok(());
+            }
+        } else {
+            return Ok(());
+        }
+    }
+
     if let Some(target_sid) = state.user_to_session.get(&target_user_id) {
         if let Some(session) = state.sessions.get(&*target_sid) {
             let _ = send_msg(
@@ -1546,7 +1654,18 @@ async fn cleanup_session(state: &Arc<ServerState>, user_id: UserId, session_id: 
 }
 
 /// Start an auto-delete timer for an empty channel.
+/// Persistent channels (from channels.json) are never auto-deleted.
 async fn start_channel_delete_timer(state: &Arc<ServerState>, channel_id: ChannelId) {
+    // Skip persistent channels — they must never be auto-deleted
+    {
+        let channels = state.channels.read().await;
+        if let Some(ch) = channels.get(&channel_id) {
+            if ch.persistent {
+                return;
+            }
+        }
+    }
+
     let state_for_task = state.clone();
     let timeout_secs = state.settings.empty_channel_timeout_secs;
 

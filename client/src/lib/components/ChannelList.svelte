@@ -180,8 +180,13 @@
             <Icon name="hash" size={16} />
           {/if}
         </span>
-        <span class="channel-name">{channel.name}</span>
-        <span class="user-count">({channel.user_count})</span>
+        <span class="channel-name-col">
+          <span class="channel-name">{channel.name}</span>
+          {#if channel.description}
+            <span class="channel-desc">{channel.description}</span>
+          {/if}
+        </span>
+        <span class="user-count">({channel.user_count}{#if channel.max_users > 0}/{channel.max_users}{/if})</span>
         {#if ($unreadPerChannel.get(channel.name) ?? 0) > 0}
           <span class="channel-unread">{$unreadPerChannel.get(channel.name)}</span>
         {/if}
@@ -420,12 +425,27 @@
     flex-shrink: 0;
   }
 
-  .channel-name {
+  .channel-name-col {
     flex: 1;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    min-width: 0;
+  }
+
+  .channel-name {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    min-width: 0;
+  }
+
+  .channel-desc {
+    font-size: 11px;
+    color: var(--text-secondary);
+    opacity: 0.7;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .user-count {

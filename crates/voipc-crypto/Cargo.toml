@@ -20,6 +20,9 @@ sha2 = "0.10"
 serde = { workspace = true }
 postcard = { workspace = true }
 
+# Secret zeroization
+zeroize = { version = "1", features = ["derive", "serde"] }
+
 # Async trait support + UUID for sender keys
 async-trait = "0.1"
 uuid = { version = "1", features = ["v5"] }

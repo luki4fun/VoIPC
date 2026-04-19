@@ -41,6 +41,7 @@
     incrementChannelUnread,
     clearChannelUnread,
     chatUnlocked,
+    unreadPerChannel,
   } from "./lib/stores/chat.js";
   import ChatHistorySetup from "./lib/components/ChatHistorySetup.svelte";
   import type { ChannelInfo, UserInfo } from "./lib/types.js";
@@ -70,6 +71,9 @@
     playChannelMessageSound,
     playPokeSound,
   } from "./lib/sounds.js";
+  import { isMobile, mobileTab } from "./lib/stores/platform.js";
+  import type { MobileTab } from "./lib/stores/platform.js";
+  import MobilePTT from "./lib/components/MobilePTT.svelte";
   import {
     addScreenShare,
     removeScreenShare,
@@ -155,6 +159,26 @@
       const name = channelNameById($currentChannelId);
       if (name) clearChannelUnread(name);
     }
+  });
+
+  // Android: start/stop foreground voice service when joining/leaving channels
+  $effect(() => {
+    if (!$isMobile) return;
+    const bridge = (window as any).__VoIPC;
+    if (!bridge) return;
+
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    if ($connectionState === 'connected' && $currentChannelId !== 0) {
+      const name = channelNameById($currentChannelId);
+      timer = setTimeout(() => {
+        bridge.startVoiceService(name || 'voice channel');
+      }, 300);
+    } else {
+      bridge.stopVoiceService();
+    }
+
+    return () => { if (timer) clearTimeout(timer); };
   });
 
   async function startReconnect(address: string, name: string, previousChannelId: number) {
@@ -707,7 +731,7 @@
 {/if}
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="app-layout" oncontextmenu={(e) => e.preventDefault()}>
+<div class="app-layout" class:mobile={$isMobile} oncontextmenu={(e) => e.preventDefault()}>
   <div class="titlebar">
     <span class="title">VoIPC</span>
     <button class="settings-btn" onclick={() => (showSettings = true)} title="Settings">
@@ -715,25 +739,87 @@
     </button>
   </div>
 
-  <div class="main-content">
-    <ChannelList />
-    {#if $watchingUserId !== null && !$poppedOut}
-      <ScreenShareViewer />
-    {:else}
-      <ChatPanel />
-    {/if}
-    <UserList />
-  </div>
+  {#if $isMobile}
+    <!-- Mobile: single-column tabbed layout -->
+    <div class="main-content mobile-main">
+      {#if $watchingUserId !== null}
+        <ScreenShareViewer />
+      {:else if $mobileTab === 'channels'}
+        <ChannelList />
+      {:else if $mobileTab === 'chat'}
+        <ChatPanel />
+      {:else}
+        <UserList />
+      {/if}
+    </div>
 
-  <VoiceControls />
-  <StatusBar />
+    <MobilePTT />
+    <VoiceControls />
+    <StatusBar />
+
+    <!-- Bottom tab bar -->
+    <nav class="mobile-tabs">
+      <button
+        class="tab-btn"
+        class:active={$mobileTab === 'channels'}
+        onclick={() => mobileTab.set('channels')}
+      >
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M3 12h4l3-9 4 18 3-9h4"/>
+        </svg>
+        <span>Channels</span>
+      </button>
+      <button
+        class="tab-btn"
+        class:active={$mobileTab === 'chat'}
+        onclick={() => mobileTab.set('chat')}
+      >
+        <div class="tab-icon-wrap">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+          </svg>
+          {#if Array.from($unreadPerChannel.values()).reduce((a, b) => a + b, 0) > 0}
+            <span class="tab-badge"></span>
+          {/if}
+        </div>
+        <span>Chat</span>
+      </button>
+      <button
+        class="tab-btn"
+        class:active={$mobileTab === 'users'}
+        onclick={() => mobileTab.set('users')}
+      >
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
+          <circle cx="9" cy="7" r="4"/>
+          <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
+          <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
+        </svg>
+        <span>Users</span>
+      </button>
+    </nav>
+  {:else}
+    <!-- Desktop: 3-column layout -->
+    <div class="main-content">
+      <ChannelList />
+      {#if $watchingUserId !== null && !$poppedOut}
+        <ScreenShareViewer />
+      {:else}
+        <ChatPanel />
+      {/if}
+      <UserList />
+    </div>
+
+    <VoiceControls />
+    <StatusBar />
+  {/if}
 </div>
 
 {#if showSettings}
   <SettingsPanel onclose={() => (showSettings = false)} />
 {/if}
 
-{#if $showSourcePicker}
+{#if !$isMobile && $showSourcePicker}
   <ScreenShareSourcePicker />
 {/if}
 
@@ -787,5 +873,105 @@
     display: flex;
     flex: 1;
     overflow: hidden;
+  }
+
+  /* ── Mobile layout ── */
+  .app-layout.mobile {
+    height: 100vh;
+    height: 100dvh; /* dynamic viewport height (respects on-screen keyboard) */
+  }
+
+  .app-layout.mobile .titlebar {
+    padding-top: max(8px, env(safe-area-inset-top));
+  }
+
+  .mobile-main {
+    flex-direction: column;
+  }
+
+  /* Mobile: each child fills the full width */
+  .mobile-main > :global(*) {
+    width: 100%;
+    flex: 1;
+    min-height: 0;
+  }
+
+  .mobile-tabs {
+    display: flex;
+    background: var(--bg-primary);
+    border-top: 1px solid var(--border);
+    padding: 4px 0;
+    padding-bottom: max(4px, env(safe-area-inset-bottom));
+    flex-shrink: 0;
+  }
+
+  .tab-btn {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 2px;
+    padding: 6px 0;
+    background: transparent;
+    color: var(--text-secondary);
+    border: none;
+    border-radius: 0;
+    font-size: 10px;
+    transition: color 0.15s;
+  }
+
+  .tab-btn:active {
+    transform: none;
+  }
+
+  .tab-btn.active {
+    color: var(--accent);
+  }
+
+  .tab-btn span {
+    font-size: 10px;
+    line-height: 1;
+  }
+
+  .tab-icon-wrap {
+    position: relative;
+    display: inline-flex;
+  }
+
+  .tab-badge {
+    position: absolute;
+    top: -3px;
+    right: -5px;
+    width: 8px;
+    height: 8px;
+    background: var(--error, #e53935);
+    border-radius: 50%;
+    border: 1.5px solid var(--bg-primary);
+  }
+
+  /* Mobile: override scoped child component widths */
+  .app-layout.mobile :global(.channel-list) {
+    width: 100%;
+    min-width: 0;
+    border-right: none;
+  }
+
+  .app-layout.mobile :global(.user-list) {
+    width: 100%;
+    min-width: 0;
+    border-left: none;
+  }
+
+  .app-layout.mobile :global(.chat-panel) {
+    width: 100%;
+  }
+
+  .app-layout.mobile :global(.voice-controls) {
+    flex-wrap: wrap;
+    padding: 6px 12px;
+  }
+
+  .app-layout.mobile :global(.status-bar) {
+    padding: 4px 12px;
   }
 </style>

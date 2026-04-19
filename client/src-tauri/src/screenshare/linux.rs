@@ -248,7 +248,7 @@ fn run_pipewire_capture(
     let stream = pipewire::stream::Stream::new(&core, "voipc-screenshare", props)
         .map_err(|e| format!("Stream::new: {e}"))?;
 
-    let format_pod = build_video_format_pod(target_width, target_height, target_fps);
+    let format_pod = build_video_format_pod(target_width, target_height, target_fps)?;
 
     let start_time = Instant::now();
 
@@ -365,8 +365,8 @@ fn run_pipewire_capture(
                 return;
             };
 
-            if state.negotiated_width == 0 {
-                return; // Format not negotiated yet
+            if state.negotiated_width == 0 || state.negotiated_height == 0 {
+                return; // Format not fully negotiated yet
             }
 
             // Copy frame data out of PipeWire buffer (returned to PipeWire on callback exit).
@@ -378,8 +378,12 @@ fn run_pipewire_capture(
             // Fall back to width*4 if PipeWire reports 0 (some compositors don't set it).
             let stride = if chunk_stride > 0 {
                 chunk_stride
-            } else {
+            } else if state.negotiated_stride > 0 {
                 state.negotiated_stride as usize
+            } else {
+                tracing::warn!("PipeWire: both chunk and negotiated stride are 0, skipping frame");
+                state.reuse_buf = pixels;
+                return;
             };
 
             let captured = CapturedFrame {
@@ -427,7 +431,7 @@ fn run_pipewire_capture(
         pipewire::stream::Stream::new(&core, "voipc-screenshare-audio", audio_props)
             .map_err(|e| format!("Audio Stream::new: {e}"))?;
 
-    let audio_format_pod = build_audio_format_pod();
+    let audio_format_pod = build_audio_format_pod()?;
 
     let audio_state = RefCell::new(AudioProcessor {
         encoder: None,
@@ -554,7 +558,7 @@ struct PwVideoState {
 
 // ── SPA format pod building/parsing ─────────────────────────────────────
 
-fn build_video_format_pod(width: u32, height: u32, fps: u32) -> Vec<u8> {
+fn build_video_format_pod(width: u32, height: u32, fps: u32) -> Result<Vec<u8>, String> {
     use pipewire::spa;
     use pipewire::spa::pod::serialize::PodSerializer;
 
@@ -610,13 +614,13 @@ fn build_video_format_pod(width: u32, height: u32, fps: u32) -> Vec<u8> {
         ),
     );
 
-    PodSerializer::serialize(
+    Ok(PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
         &spa::pod::Value::Object(obj),
     )
-    .expect("Failed to serialize SPA format pod")
+    .map_err(|e| format!("Failed to serialize SPA format pod: {e:?}"))?
     .0
-    .into_inner()
+    .into_inner())
 }
 
 fn parse_video_format(param: &pipewire::spa::pod::Pod) -> Option<(u32, u32, u32, PixFmt)> {
@@ -658,7 +662,7 @@ fn parse_video_format(param: &pipewire::spa::pod::Pod) -> Option<(u32, u32, u32,
     Some((width, height, stride, format))
 }
 
-fn build_audio_format_pod() -> Vec<u8> {
+fn build_audio_format_pod() -> Result<Vec<u8>, String> {
     use pipewire::spa;
     use pipewire::spa::pod::serialize::PodSerializer;
 
@@ -671,13 +675,13 @@ fn build_audio_format_pod() -> Vec<u8> {
         properties: audio_info.into(),
     };
 
-    PodSerializer::serialize(
+    Ok(PodSerializer::serialize(
         std::io::Cursor::new(Vec::new()),
         &spa::pod::Value::Object(obj),
     )
-    .expect("Failed to serialize SPA audio format pod")
+    .map_err(|e| format!("Failed to serialize SPA audio format pod: {e:?}"))?
     .0
-    .into_inner()
+    .into_inner())
 }
 
 fn parse_audio_format(param: &pipewire::spa::pod::Pod) -> Option<(u32, u32)> {

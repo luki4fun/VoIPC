@@ -11,17 +11,42 @@ use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "voipc_client_lib=info".into()),
-        )
-        .init();
+    // Android: log to logcat via tracing-android; try_init avoids panic on Activity recreation.
+    // Desktop: log to stderr via fmt subscriber.
+    #[cfg(target_os = "android")]
+    {
+        use tracing_subscriber::prelude::*;
+        if let Ok(layer) = tracing_android::layer("VoIPC") {
+            let _ = tracing_subscriber::registry()
+                .with(layer)
+                .try_init();
+        }
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        tracing_subscriber::fmt()
+            .with_env_filter(
+                tracing_subscriber::EnvFilter::try_from_default_env()
+                    .unwrap_or_else(|_| "voipc_client_lib=info".into()),
+            )
+            .init();
+    }
 
     tauri::Builder::default()
         .manage(AppState::new())
         .setup(|app| {
+            // On Android, dirs::config_dir() returns None (no $HOME env var).
+            // Use Tauri's app_data_dir() which resolves to the app's private files dir.
+            #[cfg(target_os = "android")]
+            {
+                let data_dir = app.path().app_data_dir()
+                    .expect("failed to resolve Android app data directory");
+                config::init_data_dir(data_dir);
+            }
+
             // Migrate legacy files from next-to-executable to ~/.config/VoIPC/
+            // (desktop only — no legacy paths on Android)
+            #[cfg(not(target_os = "android"))]
             config::migrate_legacy_paths();
 
             // Load persistent config
@@ -36,7 +61,9 @@ pub fn run() {
                         if crypto::has_valid_header(&data) {
                             cfg.chat_history_path =
                                 Some(default_path.to_string_lossy().to_string());
-                            let _ = config::save_config(&cfg);
+                            if let Err(e) = config::save_config(&cfg) {
+                                tracing::warn!("Failed to save config: {e}");
+                            }
                             tracing::info!(
                                 "Auto-configured chat_history_path to default location"
                             );
@@ -189,5 +216,9 @@ pub fn run() {
             commands::preview_sound,
         ])
         .run(tauri::generate_context!())
-        .expect("error while running VoIPC client");
+        .unwrap_or_else(|e| {
+            tracing::error!("Tauri runtime failed: {e}");
+            #[cfg(not(target_os = "android"))]
+            eprintln!("Tauri runtime failed: {e}");
+        });
 }

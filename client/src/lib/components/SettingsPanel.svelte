@@ -21,6 +21,7 @@
   import { isMuted, isDeafened } from "../stores/connection.js";
   import { clearAllHistory } from "../stores/chat.js";
   import { addNotification } from "../stores/notifications.js";
+  import { isMobile, volumeKeyPtt } from "../stores/platform.js";
   import type { AudioDeviceInfo } from "../types.js";
   import Icon from "./Icons.svelte";
 
@@ -225,8 +226,16 @@
     return parts[parts.length - 1] || path;
   }
 
-  // Load devices on mount
-  loadDevices();
+  function handleVolumeKeyPtt(e: Event) {
+    const checked = (e.target as HTMLInputElement).checked;
+    // Tell the Android native layer to intercept volume key, then update store
+    const bridge = (window as any).__VoIPC;
+    if (bridge) bridge.setVolumeKeyPtt(checked);
+    volumeKeyPtt.set(checked);
+  }
+
+  // Load devices on mount (skip on mobile — only default device available)
+  if (!$isMobile) loadDevices();
 </script>
 
 <div class="overlay" role="dialog" onclick={onclose} onkeydown={() => {}}>
@@ -247,68 +256,81 @@
         class:active={activeTab === "general"}
         onclick={() => (activeTab = "general")}
       >General</button>
-      <button
-        class="tab"
-        class:active={activeTab === "sounds"}
-        onclick={() => (activeTab = "sounds")}
-      >Sounds</button>
+      {#if !$isMobile}
+        <button
+          class="tab"
+          class:active={activeTab === "sounds"}
+          onclick={() => (activeTab = "sounds")}
+        >Sounds</button>
+      {/if}
     </div>
 
     {#if activeTab === "general"}
-      <div class="section">
-        <h4>Audio Input</h4>
-        <select onchange={changeInputDevice}>
-          {#each inputDevices as device}
-            <option value={device.name} selected={device.is_default}>
-              {device.name}
-              {device.is_default ? " (Default)" : ""}
-            </option>
-          {/each}
-        </select>
-      </div>
-
-      <div class="section">
-        <h4>Audio Output</h4>
-        <select onchange={changeOutputDevice}>
-          {#each outputDevices as device}
-            <option value={device.name} selected={device.is_default}>
-              {device.name}
-              {device.is_default ? " (Default)" : ""}
-            </option>
-          {/each}
-        </select>
-      </div>
-
-      <div class="section">
-        <h4>Push to Talk Key</h4>
-        <div class="ptt-config">
-          {#if isCapturingKey}
-            <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_static_element_interactions -->
-            <span
-              class="current-key capturing"
-              tabindex="0"
-              onkeydown={handleCaptureKeyDown}
-              onkeyup={handleCaptureKeyUp}
-              onblur={cancelKeyCapture}
-              use:autofocus
-            >
-              {captureHint}
-            </span>
-          {:else}
-            <span class="current-key">{$pttKey}</span>
-            <button class="change-key-btn" onclick={startKeyCapture}>Change</button>
-          {/if}
+      {#if !$isMobile}
+        <div class="section">
+          <h4>Audio Input</h4>
+          <select onchange={changeInputDevice}>
+            {#each inputDevices as device}
+              <option value={device.name} selected={device.is_default}>
+                {device.name}
+                {device.is_default ? " (Default)" : ""}
+              </option>
+            {/each}
+          </select>
         </div>
-        <label class="toggle-row">
-          <input type="checkbox" checked={$pttHoldMode} onchange={handleHoldModeChange} />
-          <span class="toggle-label">Hold modifier to talk</span>
-          <span class="toggle-hint">
-            {$pttHoldMode
-              ? "Release the modifier key to stop (trigger key only activates)"
-              : "Release the trigger key to stop immediately"}
-          </span>
-        </label>
-      </div>
+
+        <div class="section">
+          <h4>Audio Output</h4>
+          <select onchange={changeOutputDevice}>
+            {#each outputDevices as device}
+              <option value={device.name} selected={device.is_default}>
+                {device.name}
+                {device.is_default ? " (Default)" : ""}
+              </option>
+            {/each}
+          </select>
+        </div>
+
+        <div class="section">
+          <h4>Push to Talk Key</h4>
+          <div class="ptt-config">
+            {#if isCapturingKey}
+              <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_static_element_interactions -->
+              <span
+                class="current-key capturing"
+                tabindex="0"
+                onkeydown={handleCaptureKeyDown}
+                onkeyup={handleCaptureKeyUp}
+                onblur={cancelKeyCapture}
+                use:autofocus
+              >
+                {captureHint}
+              </span>
+            {:else}
+              <span class="current-key">{$pttKey}</span>
+              <button class="change-key-btn" onclick={startKeyCapture}>Change</button>
+            {/if}
+          </div>
+          <label class="toggle-row">
+            <input type="checkbox" checked={$pttHoldMode} onchange={handleHoldModeChange} />
+            <span class="toggle-label">Hold modifier to talk</span>
+            <span class="toggle-hint">
+              {$pttHoldMode
+                ? "Release the modifier key to stop (trigger key only activates)"
+                : "Release the trigger key to stop immediately"}
+            </span>
+          </label>
+        </div>
+      {:else}
+        <div class="section">
+          <h4>Push to Talk</h4>
+          <label class="toggle-row">
+            <input type="checkbox" checked={$volumeKeyPtt} onchange={handleVolumeKeyPtt} />
+            <span class="toggle-label">Use volume button for PTT</span>
+            <span class="toggle-hint">Hold Volume Down to talk (overrides normal volume control)</span>
+          </label>
+        </div>
+      {/if}
 
       <div class="section">
         <h4>Connection</h4>
@@ -383,7 +405,7 @@
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 24px;
-    width: 480px;
+    width: min(480px, 92vw);
     max-height: 80vh;
     overflow-y: auto;
   }

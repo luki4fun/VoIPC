@@ -58,11 +58,12 @@ No accounts. No telemetry. No compromises.
 
 **Platform Support**
 
-| | Linux | Windows | macOS |
-|---|:---:|:---:|:---:|
-| Voice | Yes | Yes | Yes |
-| Screen Capture | PipeWire + XDG Portal | DXGI | Planned |
-| Desktop Audio | PipeWire | WASAPI | Planned |
+| | Linux | Windows | macOS | Android |
+|---|:---:|:---:|:---:|:---:|
+| Voice | Yes | Yes | Yes | Yes (Oboe) |
+| Screen Capture | PipeWire + XDG Portal | DXGI | Planned | — |
+| Desktop Audio | PipeWire | WASAPI | Planned | — |
+| Screen Share Viewing | Yes | Yes | Planned | Planned (decoder WIP) |
 
 ## Security
 
@@ -70,7 +71,7 @@ VoIPC encrypts everything at multiple layers. The server acts as a blind relay �
 
 ### Layer 1: Transport — TLS on every connection
 
-All TCP control traffic is encrypted with TLS 1.2+ via **rustls** (pure-Rust, no OpenSSL). TOFU (Trust-On-First-Use) certificate pinning is supported for self-signed server certs. Plaintext connections are never accepted.
+All TCP control traffic is encrypted with TLS 1.2+ via **rustls** (pure-Rust, no OpenSSL). For self-signed server certs, the client pins the fingerprint on first connect via **TOFU** (`TofuCertVerifier`) and aborts the handshake if it ever changes. Plaintext connections are never accepted.
 
 ### Layer 2: End-to-End Messages — Signal Protocol
 
@@ -239,6 +240,8 @@ Runtime settings in `server_settings.json`:
   "max_channel_name_len": 32
 }
 ```
+
+**Persistent channels** (optional): drop a `channels.json` next to the binary to pre-create long-lived rooms that survive restarts. See [channels.example.json](channels.example.json) — plaintext `password` fields are hashed to SHA-256 on first load and the file is rewritten atomically.
 
 ### Client
 

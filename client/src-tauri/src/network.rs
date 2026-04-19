@@ -9,7 +9,9 @@ use tokio::net::{TcpStream, UdpSocket};
 use tokio::sync::mpsc;
 use tokio_rustls::client::TlsStream;
 use tokio_rustls::TlsConnector;
-use tauri::{Emitter, Manager};
+use tauri::Emitter;
+#[cfg(not(target_os = "android"))]
+use tauri::Manager;
 use tracing::{error, info, warn};
 
 use voipc_crypto::media_keys::MediaKey;
@@ -247,18 +249,37 @@ pub async fn connect_to_server(
         signal.pending_messages.clear();
     }
 
-    // Set up UDP socket with large buffers to absorb keyframe bursts
+    // Resolve UDP server address first to determine address family
+    let udp_addr = format!("{}:{}", host, udp_port);
+    let server_addr: std::net::SocketAddr = tokio::net::lookup_host(&udp_addr)
+        .await
+        .map_err(|e| format!("Failed to resolve UDP addr {}: {}", udp_addr, e))?
+        .next()
+        .ok_or_else(|| format!("No addresses found for {}", udp_addr))?;
+
+    info!("UDP target resolved to {}", server_addr);
+
+    // Set up UDP socket matching server address family, with large buffers
     let udp_socket = {
+        let (domain, bind_addr) = if server_addr.is_ipv4() {
+            (socket2::Domain::IPV4, "0.0.0.0:0")
+        } else {
+            (socket2::Domain::IPV6, "[::]:0")
+        };
         let sock = socket2::Socket::new(
-            socket2::Domain::IPV4,
+            domain,
             socket2::Type::DGRAM,
             Some(socket2::Protocol::UDP),
         )
         .map_err(|e| format!("Failed to create UDP socket: {}", e))?;
         // 2MB buffers — absorbs ~1400 packets of burst without kernel drops
-        let _ = sock.set_recv_buffer_size(2 * 1024 * 1024);
-        let _ = sock.set_send_buffer_size(2 * 1024 * 1024);
-        sock.bind(&"0.0.0.0:0".parse::<std::net::SocketAddr>().unwrap().into())
+        if let Err(e) = sock.set_recv_buffer_size(2 * 1024 * 1024) {
+            warn!("failed to set UDP recv buffer to 2MB: {e}");
+        }
+        if let Err(e) = sock.set_send_buffer_size(2 * 1024 * 1024) {
+            warn!("failed to set UDP send buffer to 2MB: {e}");
+        }
+        sock.bind(&bind_addr.parse::<std::net::SocketAddr>().unwrap().into())
             .map_err(|e| format!("Failed to bind UDP socket: {}", e))?;
         sock.set_nonblocking(true)
             .map_err(|e| format!("Failed to set non-blocking: {}", e))?;
@@ -268,15 +289,6 @@ pub async fn connect_to_server(
                 .map_err(|e| format!("Failed to wrap UDP socket: {}", e))?,
         )
     };
-
-    let udp_addr = format!("{}:{}", host, udp_port);
-    let server_addr: std::net::SocketAddr = tokio::net::lookup_host(&udp_addr)
-        .await
-        .map_err(|e| format!("Failed to resolve UDP addr {}: {}", udp_addr, e))?
-        .next()
-        .ok_or_else(|| format!("No addresses found for {}", udp_addr))?;
-
-    info!("UDP target resolved to {}", server_addr);
 
     // Send an initial UDP ping so the server learns our UDP address
     let ping_packet = VoicePacket::ping(session_id, udp_token, 0);
@@ -707,6 +719,10 @@ async fn handle_server_message(
                 serde_json::json!({"user_id": user_id, "deafened": deafened}),
             );
         }
+        ServerMessage::Ping { timestamp } => {
+            // Reply to server keepalive ping to prevent idle disconnect
+            let _ = send_tcp_message(tcp_tx, &ClientMessage::Ping { timestamp }).await;
+        }
         ServerMessage::Pong { timestamp } => {
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -847,7 +863,8 @@ async fn handle_server_message(
                 );
             }
 
-            // Flash/blink the window to get user attention
+            // Flash/blink the window to get user attention (desktop only)
+            #[cfg(not(target_os = "android"))]
             if let Some(window) = app_handle.get_webview_window("main") {
                 let _ = window.request_user_attention(
                     Some(tauri::UserAttentionType::Informational),
@@ -1657,9 +1674,16 @@ async fn udp_receiver_task(
     }
 
     let mut recv_count: u64 = 0;
+    // Track last voice packet time per user for speaking timeout
+    let mut last_voice_time: HashMap<u32, std::time::Instant> = HashMap::new();
+    let mut speaking_timeout = tokio::time::interval(std::time::Duration::from_millis(300));
+    speaking_timeout.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    const SPEAKING_TIMEOUT_MS: u128 = 500;
 
     loop {
-        match socket.recv_from(&mut buf).await {
+        tokio::select! {
+            result = socket.recv_from(&mut buf) => {
+        match result {
             Ok((n, src_addr)) => {
                 if n == 0 {
                     continue;
@@ -1734,21 +1758,34 @@ async fn udp_receiver_task(
                             .push(sequence, opus_data);
 
                         // Ensure decoder exists (chain to release borrow)
-                        decoders.entry(session_id).or_insert_with(|| {
-                            voipc_audio::decoder::Decoder::new()
-                                .expect("failed to create Opus decoder")
-                        });
+                        if !decoders.contains_key(&session_id) {
+                            match voipc_audio::decoder::Decoder::new() {
+                                Ok(d) => { decoders.insert(session_id, d); }
+                                Err(e) => {
+                                    warn!("Failed to create Opus decoder for session {session_id}: {e}");
+                                    continue;
+                                }
+                            }
+                        }
 
                         // Drain ready frames from this user's jitter buffer
+                        let (Some(jitter), Some(decoder)) = (
+                            jitter_buffers.get_mut(&session_id),
+                            decoders.get_mut(&session_id),
+                        ) else {
+                            warn!("jitter buffer or decoder missing for session {session_id}");
+                            continue;
+                        };
                         drain_jitter_buffer(
                             session_id,
-                            jitter_buffers.get_mut(&session_id).unwrap(),
-                            decoders.get_mut(&session_id).unwrap(),
+                            jitter,
+                            decoder,
                             &playback_producer,
                             &is_deafened,
                             &user_volumes,
                         );
 
+                        last_voice_time.insert(session_id, std::time::Instant::now());
                         let _ = app_handle.emit(
                             "user-speaking",
                             serde_json::json!({"user_id": session_id, "speaking": true}),
@@ -1776,6 +1813,7 @@ async fn udp_receiver_task(
                             jitter.reset();
                         }
                         // Keep decoder alive for state continuity across PTT cycles
+                        last_voice_time.remove(&session_id);
                         let _ = app_handle.emit(
                             "user-speaking",
                             serde_json::json!({"user_id": session_id, "speaking": false}),
@@ -1912,10 +1950,16 @@ async fn udp_receiver_task(
                             current_video_session = Some(packet.session_id);
                         }
 
-                        let decoder = screen_audio_decoder.get_or_insert_with(|| {
-                            voipc_audio::decoder::Decoder::new()
-                                .expect("failed to create screen audio decoder")
-                        });
+                        let decoder = match screen_audio_decoder.as_mut() {
+                            Some(d) => d,
+                            None => match voipc_audio::decoder::Decoder::new() {
+                                Ok(d) => screen_audio_decoder.insert(d),
+                                Err(e) => {
+                                    warn!("Failed to create screen audio decoder: {e}");
+                                    continue;
+                                }
+                            },
+                        };
 
                         match decoder.decode(&opus_data) {
                             Ok(pcm) => {
@@ -1950,6 +1994,23 @@ async fn udp_receiver_task(
                 break;
             }
         }
+            }
+            // Periodically check for users who stopped sending voice (VAD mode timeout)
+            _ = speaking_timeout.tick() => {
+                let now = std::time::Instant::now();
+                let expired: Vec<u32> = last_voice_time.iter()
+                    .filter(|(_, t)| now.duration_since(**t).as_millis() > SPEAKING_TIMEOUT_MS)
+                    .map(|(id, _)| *id)
+                    .collect();
+                for user_id in expired {
+                    last_voice_time.remove(&user_id);
+                    let _ = app_handle.emit(
+                        "user-speaking",
+                        serde_json::json!({"user_id": user_id, "speaking": false}),
+                    );
+                }
+            }
+        }
     }
     info!("UDP receiver task ended");
 }
@@ -1971,7 +2032,13 @@ fn video_decode_render_task(
     needs_keyframe: Arc<AtomicBool>,
 ) {
     let mut decoder: Option<voipc_video::decoder::Decoder> = None;
-    let mut buffers = screenshare::FrameDecodeBuffers::new();
+    let mut buffers = match screenshare::FrameDecodeBuffers::new() {
+        Ok(b) => b,
+        Err(e) => {
+            error!("Failed to init frame decode buffers: {e}");
+            return;
+        }
+    };
     let mut last_keyframe_request = std::time::Instant::now() - std::time::Duration::from_secs(10);
     let mut suppress_render = false;
 
@@ -1981,9 +2048,17 @@ fn video_decode_render_task(
             suppress_render = true;
         }
 
-        let dec = decoder.get_or_insert_with(|| {
-            voipc_video::decoder::Decoder::new().expect("failed to create H.265 decoder")
-        });
+        let dec = match decoder.as_mut() {
+            Some(d) => d,
+            None => match voipc_video::decoder::Decoder::new() {
+                Ok(d) => decoder.insert(d),
+                Err(e) => {
+                    warn!("H.265 decoder creation failed: {e} — skipping frame");
+                    needs_keyframe.store(true, Ordering::Release);
+                    continue;
+                }
+            },
+        };
 
         // ALWAYS decode — maintains codec reference state even when render is suppressed.
         // Skipping decode would cause even more corruption when rendering resumes.
@@ -2260,7 +2335,26 @@ impl rustls::client::danger::ServerCertVerifier for TofuCertVerifier {
         use ring::digest;
         let fingerprint = digest::digest(&digest::SHA256, end_entity.as_ref());
         let fp_bytes = fingerprint.as_ref().to_vec();
-        let host_key = format!("{:?}", server_name);
+        // Canonical host key: lowercase DNS name or standard IP string.
+        // Avoids Debug format which is fragile across rustls versions.
+        let host_key = match server_name {
+            rustls::pki_types::ServerName::DnsName(dns) => dns.as_ref().to_lowercase(),
+            rustls::pki_types::ServerName::IpAddress(ip) => {
+                let std_ip: std::net::IpAddr = match ip {
+                    rustls::pki_types::IpAddr::V4(v4) => {
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::from(*v4.as_ref()))
+                    }
+                    rustls::pki_types::IpAddr::V6(v6) => {
+                        std::net::IpAddr::V6(std::net::Ipv6Addr::from(*v6.as_ref()))
+                    }
+                };
+                std_ip.to_string()
+            }
+            _ => {
+                warn!("TOFU: unknown ServerName variant, using Debug format (fragile across rustls versions)");
+                format!("{:?}", server_name)
+            }
+        };
 
         let mut store = TOFU_STORE.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
 

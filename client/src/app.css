@@ -117,3 +117,8 @@ input:focus {
   background: var(--border);
   border-radius: 3px;
 }
+
+/* ── Mobile overrides (non-scoped) ── */
+.app-layout.mobile {
+  --icon-btn-size: 40px;
+}

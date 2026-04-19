@@ -41,7 +41,7 @@ pub async fn run_udp_loop(socket: Arc<UdpSocket>, state: Arc<ServerState>) {
                 handle_video_packet(data, src_addr, &socket, &state).await;
             }
             _ => {
-                warn!(src = %src_addr, "unknown UDP packet type: 0x{:02x}", packet_type_byte);
+                debug!(src = %src_addr, "unknown UDP packet type: 0x{:02x}", packet_type_byte);
             }
         }
     }
@@ -67,6 +67,17 @@ async fn handle_voice_packet(
         Some(sid) => sid,
         None => return,
     };
+
+    // UDP voice rate limiting
+    let allowed = state
+        .sessions
+        .get_mut(&session_id)
+        .map(|mut s| s.udp_voice_rate.try_consume())
+        .unwrap_or(false);
+    if !allowed {
+        trace!(session_id, "UDP voice rate limit exceeded, dropping packet");
+        return;
+    }
 
     // Handle ping
     if packet.packet_type == VoicePacketType::Ping {
@@ -155,6 +166,17 @@ async fn handle_video_packet(
         None => return,
     };
 
+    // UDP video rate limiting
+    let allowed = state
+        .sessions
+        .get_mut(&resolved_session_id)
+        .map(|mut s| s.udp_video_rate.try_consume())
+        .unwrap_or(false);
+    if !allowed {
+        trace!(session_id, "UDP video rate limit exceeded, dropping packet");
+        return;
+    }
+
     // Get the sharer's user_id and channel_id
     let (sharer_user_id, channel_id) = match state.sessions.get(&resolved_session_id) {
         Some(session) => (session.user_id, session.channel_id),
@@ -179,43 +201,87 @@ async fn handle_video_packet(
 }
 
 /// Resolve a session from the source address (using address learning).
+///
+/// Security: always validates the UDP token (even on cache hit) and verifies the
+/// source IP matches the TCP-authenticated peer IP.  Once a UDP address is bound
+/// to a session, further address changes from the same IP are rejected
+/// (first-packet-wins).
 fn resolve_session(
     src_addr: std::net::SocketAddr,
     packet_session_id: u32,
     packet_udp_token: u64,
     state: &ServerState,
 ) -> Option<u32> {
-    if let Some(sid) = state.addr_to_session.get(&src_addr) {
-        return Some(*sid);
+    // Fast path: cached address — still verify token every time
+    if let Some(cached_sid) = state.addr_to_session.get(&src_addr) {
+        let sid = *cached_sid;
+        let valid = state
+            .sessions
+            .get(&sid)
+            .map(|s| s.udp_token == packet_udp_token)
+            .unwrap_or(false);
+        if valid {
+            return Some(sid);
+        }
+        // Token mismatch on cached entry — evict stale mapping
+        drop(cached_sid);
+        state.addr_to_session.remove(&src_addr);
+        return None;
     }
 
-    // Address learning: verify session_id exists AND udp_token matches
-    let token_valid = state
-        .sessions
-        .get(&packet_session_id)
-        .map(|s| s.udp_token == packet_udp_token)
-        .unwrap_or(false);
-
-    if token_valid {
-        state.addr_to_session.insert(src_addr, packet_session_id);
-
-        if let Some(mut session) = state.sessions.get_mut(&packet_session_id) {
-            session.udp_addr = Some(src_addr);
-        }
-
-        debug!(
-            session_id = packet_session_id,
-            src = %src_addr,
-            "learned UDP address"
-        );
-
-        Some(packet_session_id)
-    } else {
+    // Address learning: validate and bind in a single write-guard to prevent TOCTOU races.
+    // Using get_mut() ensures the token check, IP check, first-packet-wins check, and
+    // udp_addr assignment all happen atomically under the same DashMap shard lock.
+    let mut session = state.sessions.get_mut(&packet_session_id)?;
+    if session.udp_token != packet_udp_token {
         warn!(
             session_id = packet_session_id,
             src = %src_addr,
-            "rejected UDP packet: invalid session or token"
+            "rejected UDP: invalid token"
         );
-        None
+        return None;
     }
+    if session.tcp_peer_ip != src_addr.ip() {
+        warn!(
+            session_id = packet_session_id,
+            src = %src_addr,
+            expected_ip = %session.tcp_peer_ip,
+            "rejected UDP: source IP doesn't match TCP peer"
+        );
+        return None;
+    }
+    // First-packet-wins: don't overwrite an already-bound address
+    if let Some(bound_addr) = session.udp_addr {
+        if bound_addr != src_addr {
+            warn!(
+                session_id = packet_session_id,
+                src = %src_addr,
+                bound = %bound_addr,
+                "rejected UDP: address already bound to different socket"
+            );
+            return None;
+        }
+    }
+    // Guard cache size to prevent memory exhaustion from spoofed addresses
+    let needs_insert = session.udp_addr.is_none();
+    if needs_insert {
+        let cache_cap = (state.max_users as usize).saturating_mul(2).max(64);
+        if state.addr_to_session.len() >= cache_cap {
+            warn!("addr_to_session cache full ({cache_cap}), rejecting new learning");
+            return None;
+        }
+        session.udp_addr = Some(src_addr);
+    }
+    drop(session);
+
+    if needs_insert {
+        state.addr_to_session.insert(src_addr, packet_session_id);
+    }
+
+    debug!(
+        session_id = packet_session_id,
+        src = %src_addr,
+        "learned UDP address"
+    );
+    Some(packet_session_id)
 }

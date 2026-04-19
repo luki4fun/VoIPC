@@ -30,6 +30,14 @@ pub async fn connect(
     username: String,
     accept_invalid_certs: Option<bool>,
 ) -> Result<u32, String> {
+    // Input validation
+    if address.is_empty() || address.len() > 253 {
+        return Err("address must be 1-253 characters".into());
+    }
+    if username.is_empty() || username.len() > 32 {
+        return Err("username must be 1-32 characters".into());
+    }
+
     // Install the ring crypto provider (idempotent — only the first call succeeds)
     let _ = rustls::crypto::ring::default_provider().install_default();
 
@@ -80,6 +88,18 @@ pub async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
         drop(connection.video_tx);
         drop(connection.screen_audio_tx);
         drop(connection.playback_stream);
+
+        // Clear Signal protocol state to prevent stale sessions on reconnect
+        if let Ok(mut sig) = state.signal.lock() {
+            sig.own_user_id = None;
+            sig.initialized = false;
+            sig.stores = None;
+            sig.established_sessions.clear();
+            sig.pending_sessions.clear();
+            sig.sender_key_distributed.clear();
+            sig.sender_key_received.clear();
+            sig.pending_messages.clear();
+        }
 
         tracing::info!("disconnected gracefully");
     }
@@ -143,6 +163,14 @@ pub async fn create_channel(
     name: String,
     password: Option<String>,
 ) -> Result<(), String> {
+    if name.is_empty() || name.len() > 128 {
+        return Err("channel name must be 1-128 characters".into());
+    }
+    if let Some(ref pw) = password {
+        if pw.len() > 128 {
+            return Err("password too long".into());
+        }
+    }
     let conn = state.connection.read().await;
     let connection = conn.as_ref().ok_or("Not connected")?;
     network::send_tcp_message(
@@ -761,7 +789,9 @@ pub async fn set_ptt_key(
     {
         let mut config = state.config.lock().unwrap();
         config.ptt_key = key_code.clone();
-        let _ = crate::config::save_config(&config);
+        if let Err(e) = crate::config::save_config(&config) {
+            tracing::warn!("Failed to save config: {e}");
+        }
     }
 
     tracing::info!("PTT key changed to: {key_code}");
@@ -780,7 +810,9 @@ pub async fn set_ptt_hold_mode(
     {
         let mut config = state.config.lock().unwrap();
         config.ptt_hold_mode = hold_mode;
-        let _ = crate::config::save_config(&config);
+        if let Err(e) = crate::config::save_config(&config) {
+            tracing::warn!("Failed to save config: {e}");
+        }
     }
     tracing::info!("PTT hold mode set to: {hold_mode}");
     Ok(())
@@ -805,7 +837,9 @@ pub async fn toggle_mute(state: State<'_, AppState>) -> Result<bool, String> {
         {
             let mut config = state.config.lock().unwrap();
             config.muted = new_muted;
-            let _ = crate::config::save_config(&config);
+            if let Err(e) = crate::config::save_config(&config) {
+                tracing::warn!("Failed to save config: {e}");
+            }
         }
         Ok(new_muted)
     } else {
@@ -832,7 +866,9 @@ pub async fn toggle_deafen(state: State<'_, AppState>) -> Result<bool, String> {
         {
             let mut config = state.config.lock().unwrap();
             config.deafened = new_deafened;
-            let _ = crate::config::save_config(&config);
+            if let Err(e) = crate::config::save_config(&config) {
+                tracing::warn!("Failed to save config: {e}");
+            }
         }
         Ok(new_deafened)
     } else {
@@ -890,7 +926,9 @@ pub async fn set_input_device(
     {
         let mut config = state.config.lock().unwrap();
         config.input_device = Some(device_name);
-        let _ = crate::config::save_config(&config);
+        if let Err(e) = crate::config::save_config(&config) {
+            tracing::warn!("Failed to save config: {e}");
+        }
     }
     Ok(())
 }
@@ -907,7 +945,9 @@ pub async fn set_output_device(
     {
         let mut config = state.config.lock().unwrap();
         config.output_device = Some(device_name);
-        let _ = crate::config::save_config(&config);
+        if let Err(e) = crate::config::save_config(&config) {
+            tracing::warn!("Failed to save config: {e}");
+        }
     }
     Ok(())
 }
@@ -925,7 +965,9 @@ pub async fn set_volume(
     {
         let mut config = state.config.lock().unwrap();
         config.volume = clamped;
-        let _ = crate::config::save_config(&config);
+        if let Err(e) = crate::config::save_config(&config) {
+            tracing::warn!("Failed to save config: {e}");
+        }
     }
     Ok(())
 }
@@ -965,36 +1007,45 @@ pub async fn start_screen_share(
     resolution: u16,
     _fps: u32,
 ) -> Result<(), String> {
-    // Open the screen capture session for the selected source.
-    // This must happen BEFORE acquiring the connection lock because it may await
-    // user interaction (e.g. portal dialog on Linux).
-    // (fps is stored in the frontend and passed to start_screen_capture later)
-    let session = screenshare::request_screencast(&source_type, &source_id).await?;
-
-    let mut conn = state.connection.write().await;
-    let connection = conn.as_mut().ok_or("Not connected")?;
-
-    if connection.current_channel_id.load(Ordering::Relaxed) == 0 {
-        return Err("Screen sharing is disabled in the General lobby".into());
+    #[cfg(target_os = "android")]
+    {
+        let _ = (state, source_type, source_id, resolution, _fps);
+        return Err("Screen sharing is not available on Android".into());
     }
 
-    if connection.is_screen_sharing {
-        return Err("Already screen sharing".into());
+    #[cfg(not(target_os = "android"))]
+    {
+        // Open the screen capture session for the selected source.
+        // This must happen BEFORE acquiring the connection lock because it may await
+        // user interaction (e.g. portal dialog on Linux).
+        // (fps is stored in the frontend and passed to start_screen_capture later)
+        let session = screenshare::request_screencast(&source_type, &source_id).await?;
+
+        let mut conn = state.connection.write().await;
+        let connection = conn.as_mut().ok_or("Not connected")?;
+
+        if connection.current_channel_id.load(Ordering::Relaxed) == 0 {
+            return Err("Screen sharing is disabled in the General lobby".into());
+        }
+
+        if connection.is_screen_sharing {
+            return Err("Already screen sharing".into());
+        }
+
+        connection.capture_session = Some(session);
+
+        network::send_tcp_message(
+            &connection.tcp_tx,
+            &ClientMessage::StartScreenShare {
+                source: "portal".into(),
+                resolution,
+            },
+        )
+        .await?;
+
+        connection.is_screen_sharing = true;
+        Ok(())
     }
-
-    connection.capture_session = Some(session);
-
-    network::send_tcp_message(
-        &connection.tcp_tx,
-        &ClientMessage::StartScreenShare {
-            source: "portal".into(),
-            resolution,
-        },
-    )
-    .await?;
-
-    connection.is_screen_sharing = true;
-    Ok(())
 }
 
 /// Stop screen sharing — stops capture, closes portal session, sends TCP stop.
@@ -1135,49 +1186,58 @@ pub async fn start_screen_capture(
     resolution: u16,
     fps: u32,
 ) -> Result<(), String> {
-    let mut conn = state.connection.write().await;
-    let connection = conn.as_mut().ok_or("Not connected")?;
-
-    if connection.screen_capture_task.is_some() {
-        return Ok(()); // Already capturing
+    #[cfg(target_os = "android")]
+    {
+        let _ = (state, resolution, fps);
+        return Err("Screen capture is not available on Android".into());
     }
 
-    let session = connection
-        .capture_session
-        .as_ref()
-        .ok_or("No capture session — call start_screen_share first")?;
+    #[cfg(not(target_os = "android"))]
+    {
+        let mut conn = state.connection.write().await;
+        let connection = conn.as_mut().ok_or("Not connected")?;
 
-    let res = voipc_video::Resolution::from_height(resolution)
-        .ok_or_else(|| format!("Unsupported resolution: {}", resolution))?;
+        if connection.screen_capture_task.is_some() {
+            return Ok(()); // Already capturing
+        }
 
-    connection.screen_share_active.store(true, Ordering::Relaxed);
+        let session = connection
+            .capture_session
+            .as_ref()
+            .ok_or("No capture session — call start_screen_share first")?;
 
-    // Reset sender stats for this new capture session
-    connection.screen_video_frames_sent.store(0, Ordering::Relaxed);
-    connection.screen_video_bytes_sent.store(0, Ordering::Relaxed);
+        let res = voipc_video::Resolution::from_height(resolution)
+            .ok_or_else(|| format!("Unsupported resolution: {}", resolution))?;
 
-    let task = screenshare::spawn_capture_task(
-        session,
-        res.width(),
-        res.height(),
-        fps,
-        res.bitrate_kbps(),
-        connection.session_id,
-        connection.udp_token,
-        connection.screen_share_active.clone(),
-        connection.keyframe_requested.clone(),
-        connection.video_tx.clone(),
-        connection.screen_audio_tx.clone(),
-        connection.screen_audio_enabled.clone(),
-        connection.screen_audio_send_count.clone(),
-        connection.current_media_key.clone(),
-        connection.current_channel_id.clone(),
-        connection.screen_video_frames_sent.clone(),
-        connection.screen_video_bytes_sent.clone(),
-    )?;
+        connection.screen_share_active.store(true, Ordering::Relaxed);
 
-    connection.screen_capture_task = Some(task);
-    Ok(())
+        // Reset sender stats for this new capture session
+        connection.screen_video_frames_sent.store(0, Ordering::Relaxed);
+        connection.screen_video_bytes_sent.store(0, Ordering::Relaxed);
+
+        let task = screenshare::spawn_capture_task(
+            session,
+            res.width(),
+            res.height(),
+            fps,
+            res.bitrate_kbps(),
+            connection.session_id,
+            connection.udp_token,
+            connection.screen_share_active.clone(),
+            connection.keyframe_requested.clone(),
+            connection.video_tx.clone(),
+            connection.screen_audio_tx.clone(),
+            connection.screen_audio_enabled.clone(),
+            connection.screen_audio_send_count.clone(),
+            connection.current_media_key.clone(),
+            connection.current_channel_id.clone(),
+            connection.screen_video_frames_sent.clone(),
+            connection.screen_video_bytes_sent.clone(),
+        )?;
+
+        connection.screen_capture_task = Some(task);
+        Ok(())
+    }
 }
 
 /// Stop the screen capture task — called from frontend when viewer_count goes to 0.
@@ -1204,6 +1264,14 @@ pub async fn switch_screen_share_source(
     resolution: u16,
     fps: u32,
 ) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = (state, source_type, source_id, resolution, fps);
+        return Err("Screen sharing is not available on Android".into());
+    }
+
+    #[cfg(not(target_os = "android"))]
+    {
     // Acquire the new capture session BEFORE locking (may show portal on Linux).
     let new_session = screenshare::request_screencast(&source_type, &source_id).await?;
 
@@ -1272,6 +1340,7 @@ pub async fn switch_screen_share_source(
     }
 
     Ok(())
+    } // cfg(not(android))
 }
 
 /// Set the keyframe_requested flag — called from frontend on KeyframeRequested event.
@@ -1298,7 +1367,9 @@ pub async fn set_voice_mode(state: State<'_, AppState>, mode: String) -> Result<
     {
         let mut config = state.config.lock().unwrap();
         config.voice_mode = mode.clone();
-        let _ = crate::config::save_config(&config);
+        if let Err(e) = crate::config::save_config(&config) {
+            tracing::warn!("Failed to save config: {e}");
+        }
     }
     // Apply to active connection if connected
     let conn = state.connection.read().await;
@@ -1320,7 +1391,9 @@ pub async fn set_vad_threshold(state: State<'_, AppState>, threshold_db: f32) ->
     {
         let mut config = state.config.lock().unwrap();
         config.vad_threshold_db = threshold_db;
-        let _ = crate::config::save_config(&config);
+        if let Err(e) = crate::config::save_config(&config) {
+            tracing::warn!("Failed to save config: {e}");
+        }
     }
     // Apply to active connection if connected
     let conn = state.connection.read().await;
@@ -1360,7 +1433,9 @@ pub async fn toggle_noise_suppression(state: State<'_, AppState>) -> Result<bool
     {
         let mut config = state.config.lock().unwrap();
         config.noise_suppression = new_val;
-        let _ = crate::config::save_config(&config);
+        if let Err(e) = crate::config::save_config(&config) {
+            tracing::warn!("Failed to save config: {e}");
+        }
     }
 
     // Apply to active connection if connected
@@ -1478,11 +1553,18 @@ pub struct SetPathResult {
 /// Open a native directory picker for chat history storage location.
 #[tauri::command]
 pub async fn browse_chat_history_directory() -> Option<String> {
-    let result = rfd::AsyncFileDialog::new()
-        .set_title("Select chat history storage directory")
-        .pick_folder()
-        .await;
-    result.map(|f| f.path().to_string_lossy().to_string())
+    #[cfg(not(target_os = "android"))]
+    {
+        let result = rfd::AsyncFileDialog::new()
+            .set_title("Select chat history storage directory")
+            .pick_folder()
+            .await;
+        result.map(|f| f.path().to_string_lossy().to_string())
+    }
+    #[cfg(target_os = "android")]
+    {
+        None // Native file picker not yet implemented on Android
+    }
 }
 
 /// Set the chat history storage directory. Validates the directory,
@@ -1572,7 +1654,9 @@ pub async fn delete_chat_history(
     {
         let mut config = state.config.lock().unwrap();
         config.chat_history_path = None;
-        let _ = crate::config::save_config(&config);
+        if let Err(e) = crate::config::save_config(&config) {
+            tracing::warn!("Failed to save config: {e}");
+        }
     }
 
     Ok(path.to_string_lossy().to_string())
@@ -1984,26 +2068,34 @@ fn validate_sound_path(path_str: &str) -> Result<std::path::PathBuf, String> {
 
 /// Play an audio file in a background thread via rodio.
 fn play_audio_file(path: std::path::PathBuf) {
-    std::thread::spawn(move || {
-        let Ok((_stream, handle)) = rodio::OutputStream::try_default() else {
-            tracing::warn!("Failed to open audio output for notification sound");
-            return;
-        };
-        let Ok(file) = std::fs::File::open(&path) else {
-            tracing::warn!("Failed to open sound file: {}", path.display());
-            return;
-        };
-        let Ok(source) = rodio::Decoder::new(std::io::BufReader::new(file)) else {
-            tracing::warn!("Failed to decode sound file: {}", path.display());
-            return;
-        };
-        let Ok(sink) = rodio::Sink::try_new(&handle) else {
-            tracing::warn!("Failed to create audio sink for notification");
-            return;
-        };
-        sink.append(source);
-        sink.sleep_until_end();
-    });
+    #[cfg(not(target_os = "android"))]
+    {
+        std::thread::spawn(move || {
+            let Ok((_stream, handle)) = rodio::OutputStream::try_default() else {
+                tracing::warn!("Failed to open audio output for notification sound");
+                return;
+            };
+            let Ok(file) = std::fs::File::open(&path) else {
+                tracing::warn!("Failed to open sound file: {}", path.display());
+                return;
+            };
+            let Ok(source) = rodio::Decoder::new(std::io::BufReader::new(file)) else {
+                tracing::warn!("Failed to decode sound file: {}", path.display());
+                return;
+            };
+            let Ok(sink) = rodio::Sink::try_new(&handle) else {
+                tracing::warn!("Failed to create audio sink for notification");
+                return;
+            };
+            sink.append(source);
+            sink.sleep_until_end();
+        });
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = path;
+        tracing::info!("Notification sounds not yet implemented on Android");
+    }
 }
 
 /// Play a notification sound for the given event name.
@@ -2046,13 +2138,19 @@ pub fn play_notification_sound(
 /// Returns the selected path, or None if the user cancelled.
 #[tauri::command]
 pub async fn browse_sound_file() -> Option<String> {
-    let result = rfd::AsyncFileDialog::new()
-        .set_title("Select notification sound")
-        .add_filter("Audio files", &["mp3", "wav", "ogg"])
-        .pick_file()
-        .await;
-
-    result.map(|f| f.path().to_string_lossy().to_string())
+    #[cfg(not(target_os = "android"))]
+    {
+        let result = rfd::AsyncFileDialog::new()
+            .set_title("Select notification sound")
+            .add_filter("Audio files", &["mp3", "wav", "ogg"])
+            .pick_file()
+            .await;
+        result.map(|f| f.path().to_string_lossy().to_string())
+    }
+    #[cfg(target_os = "android")]
+    {
+        None // Native file picker not yet implemented on Android
+    }
 }
 
 /// Update the full sound settings from the frontend.

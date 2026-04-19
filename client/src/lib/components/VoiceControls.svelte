@@ -6,12 +6,15 @@
     isMuted,
     isDeafened,
     isTransmitting,
+    userId,
   } from "../stores/connection.js";
   import { currentChannelId } from "../stores/channels.js";
+  import { speakingUsers } from "../stores/users.js";
   import { volume, pttKey, pttHoldMode, noiseSuppression } from "../stores/settings.js";
-  import { voiceMode, vadThreshold, audioLevel } from "../stores/voice.js";
+  import { voiceMode, vadThreshold, audioLevel, speakerMode } from "../stores/voice.js";
   import type { VoiceMode } from "../stores/voice.js";
   import ScreenShareControls from "./ScreenShareControls.svelte";
+  import { isMobile } from "../stores/platform.js";
   import Icon from "./Icons.svelte";
 
   // Voice is disabled in the General lobby (channel 0)
@@ -68,6 +71,16 @@
       noiseSuppression.set(enabled);
     } catch (e) {
       console.error("Failed to toggle noise suppression:", e);
+    }
+  }
+
+  function toggleSpeaker() {
+    const newVal = !$speakerMode;
+    try {
+      (window as any).__VoIPC?.setSpeakerphone(newVal);
+      speakerMode.set(newVal);
+    } catch (e) {
+      console.error("Failed to toggle speaker:", e);
     }
   }
 
@@ -136,6 +149,24 @@
         levelPollInterval = null;
       }
     };
+  });
+
+  // Update local user's speaking state in VAD mode based on audio level vs threshold.
+  // This makes the local user's indicator in the UserList reflect actual voice activity
+  // (the server doesn't relay our own voice packets back to us).
+  $effect(() => {
+    if ($voiceMode === "vad" && $isTransmitting && $userId > 0) {
+      const speaking = $audioLevel >= $vadThreshold;
+      speakingUsers.update((set) => {
+        const next = new Set(set);
+        if (speaking) {
+          next.add($userId);
+        } else {
+          next.delete($userId);
+        }
+        return next;
+      });
+    }
   });
 
   // Parse the PTT binding string (e.g. "Ctrl+Space", "ControlLeft") into parts
@@ -240,15 +271,17 @@
     </select>
 
     {#if $voiceMode === "ptt"}
-      <button
-        class="ptt-btn"
-        class:active={$isTransmitting}
-        onmousedown={startTransmit}
-        onmouseup={stopTransmit}
-        onmouseleave={stopTransmit}
-      >
-        PTT: {$pttKey}
-      </button>
+      {#if !$isMobile}
+        <button
+          class="ptt-btn"
+          class:active={$isTransmitting}
+          onmousedown={startTransmit}
+          onmouseup={stopTransmit}
+          onmouseleave={stopTransmit}
+        >
+          PTT: {$pttKey}
+        </button>
+      {/if}
     {:else if $voiceMode === "vad"}
       <div class="vad-meter">
         <div class="meter-bar">
@@ -300,10 +333,24 @@
       >
         <Icon name="noise-suppression" size={18} />
       </button>
+
+      {#if $isMobile}
+        <button
+          class="icon-btn"
+          class:active-success={$speakerMode}
+          class:ns-off={!$speakerMode}
+          onclick={toggleSpeaker}
+          title={$speakerMode ? "Switch to earpiece" : "Switch to speaker"}
+        >
+          <Icon name="volume" size={18} />
+        </button>
+      {/if}
     </div>
   {/if}
 
-  <ScreenShareControls />
+  {#if !$isMobile}
+    <ScreenShareControls />
+  {/if}
 
   <div class="divider"></div>
 
@@ -330,6 +377,7 @@
     border-top: 1px solid var(--border);
     overflow: hidden;
     min-width: 0;
+    flex-wrap: wrap;
   }
 
   .voice-disabled {

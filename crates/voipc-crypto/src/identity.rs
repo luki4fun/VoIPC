@@ -6,14 +6,15 @@
 use libsignal_protocol::{IdentityKey, IdentityKeyPair, KeyPair};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 /// A serializable wrapper around libsignal's IdentityKeyPair.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct SerializableIdentityKeyPair {
     /// 32-byte Curve25519 public key.
     pub public_key: Vec<u8>,
-    /// 32-byte Curve25519 private key.
-    pub private_key: Vec<u8>,
+    /// 32-byte Curve25519 private key (zeroized on drop).
+    pub private_key: Zeroizing<Vec<u8>>,
 }
 
 impl SerializableIdentityKeyPair {
@@ -31,7 +32,7 @@ impl SerializableIdentityKeyPair {
     pub fn from_identity_key_pair(pair: &IdentityKeyPair) -> Self {
         Self {
             public_key: pair.public_key().serialize().to_vec(),
-            private_key: pair.private_key().serialize().to_vec(),
+            private_key: Zeroizing::new(pair.private_key().serialize().to_vec()),
         }
     }
 }

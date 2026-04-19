@@ -1,14 +1,24 @@
+#[cfg(not(target_os = "android"))]
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+#[cfg(not(target_os = "android"))]
 use std::sync::Arc;
+#[cfg(not(target_os = "android"))]
 use std::time::{Duration, Instant};
 
+#[cfg(not(target_os = "android"))]
 use base64::Engine;
+#[cfg(not(target_os = "android"))]
 use tauri::Emitter;
+#[cfg(not(target_os = "android"))]
 use tokio::sync::mpsc;
+#[cfg(not(target_os = "android"))]
 use tracing::warn;
 
+#[cfg(not(target_os = "android"))]
 use tracing::info;
+#[cfg(not(target_os = "android"))]
 use voipc_protocol::video::{fragment_frame, ScreenShareAudioPacket};
+#[cfg(not(target_os = "android"))]
 use voipc_video::convert;
 
 // ── Platform-specific capture backends ───────────────────────────────────
@@ -26,6 +36,67 @@ mod windows;
 pub use windows::{
     CaptureSession, enumerate_displays, enumerate_windows, request_screencast, spawn_capture_task,
 };
+
+// ── Android stubs ────────────────────────────────────────────────────────
+
+#[cfg(target_os = "android")]
+pub struct CaptureSession;
+
+#[cfg(target_os = "android")]
+pub fn enumerate_displays() -> Vec<DisplayInfo> {
+    Vec::new()
+}
+
+#[cfg(target_os = "android")]
+pub fn enumerate_windows() -> Vec<WindowInfo> {
+    Vec::new()
+}
+
+#[cfg(target_os = "android")]
+pub struct FrameDecodeBuffers {
+    jpeg_buf: Vec<u8>,
+}
+
+#[cfg(target_os = "android")]
+impl FrameDecodeBuffers {
+    pub fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            jpeg_buf: Vec::with_capacity(512 * 1024),
+        })
+    }
+}
+
+#[cfg(target_os = "android")]
+pub fn render_frame(
+    frame: &voipc_video::decoder::DecodedFrame,
+    app_handle: &tauri::AppHandle,
+    buffers: &mut FrameDecodeBuffers,
+) {
+    use base64::Engine;
+    use tauri::Emitter;
+
+    let w = frame.width as usize;
+    let h = frame.height as usize;
+
+    // I420 (YUV420P) → RGBA using pure-Rust converter from voipc-video
+    let rgba = voipc_video::convert::i420_to_rgba(&frame.i420_data, w, h);
+
+    // Encode RGBA → JPEG using the `image` crate (pure Rust, no native deps)
+    buffers.jpeg_buf.clear();
+    let mut cursor = std::io::Cursor::new(&mut buffers.jpeg_buf);
+    let Some(img) = image::RgbaImage::from_raw(frame.width, frame.height, rgba) else {
+        tracing::warn!("render_frame: invalid RGBA buffer dimensions");
+        return;
+    };
+    if let Err(e) = img.write_to(&mut cursor, image::ImageFormat::Jpeg) {
+        tracing::warn!("JPEG encode error: {}", e);
+        return;
+    }
+
+    let b64 = base64::engine::general_purpose::STANDARD.encode(&buffers.jpeg_buf);
+    let data_url = format!("data:image/jpeg;base64,{}", b64);
+    let _ = app_handle.emit("screenshare-frame", &data_url);
+}
 
 // ── Source enumeration types (cross-platform) ─────────────────────────────
 
@@ -49,6 +120,7 @@ pub struct WindowInfo {
 
 // ── Shared types ─────────────────────────────────────────────────────────
 
+#[cfg(not(target_os = "android"))]
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum PixFmt {
     Bgra,
@@ -58,12 +130,15 @@ pub(crate) enum PixFmt {
     Unknown,
 }
 
+#[cfg(not(target_os = "android"))]
 /// Opus parameters for screen share audio (desktop audio, not voice).
 pub(crate) const SCREEN_AUDIO_FRAME_SIZE: usize = 960; // 20ms at 48kHz
+#[cfg(not(target_os = "android"))]
 pub(crate) const SCREEN_AUDIO_BITRATE: i32 = 64_000; // 64 kbps
 
 // ── Capture → Encode decoupling ─────────────────────────────────────────
 
+#[cfg(not(target_os = "android"))]
 /// Raw captured frame data passed from the capture thread to the encode thread.
 pub(crate) struct CapturedFrame {
     pub pixels: Vec<u8>,
@@ -73,6 +148,7 @@ pub(crate) struct CapturedFrame {
     pub fmt: PixFmt,
 }
 
+#[cfg(not(target_os = "android"))]
 /// Single-slot buffer for passing the latest captured frame to the encode thread.
 /// Older frames are silently overwritten — the encoder always processes the most
 /// recent frame. This prevents the capture thread from ever blocking on encoding.
@@ -82,6 +158,7 @@ pub(crate) struct FrameSlot {
     active: Arc<AtomicBool>,
 }
 
+#[cfg(not(target_os = "android"))]
 impl FrameSlot {
     pub fn new(active: Arc<AtomicBool>) -> Self {
         Self {
@@ -93,7 +170,7 @@ impl FrameSlot {
 
     /// Store a new frame, returning the old one (if any) for buffer reuse.
     pub fn put(&self, frame: CapturedFrame) -> Option<CapturedFrame> {
-        let mut slot = self.frame.lock().unwrap();
+        let mut slot = self.frame.lock().unwrap_or_else(|p| p.into_inner());
         let old = slot.replace(frame);
         self.notify.notify_one();
         old
@@ -101,7 +178,7 @@ impl FrameSlot {
 
     /// Take the current frame, blocking until one is available or active becomes false.
     pub fn take(&self) -> Option<CapturedFrame> {
-        let mut slot = self.frame.lock().unwrap();
+        let mut slot = self.frame.lock().unwrap_or_else(|p| p.into_inner());
         loop {
             if !self.active.load(Ordering::Relaxed) {
                 return None;
@@ -112,7 +189,7 @@ impl FrameSlot {
             let (guard, _) = self
                 .notify
                 .wait_timeout(slot, Duration::from_millis(50))
-                .unwrap();
+                .unwrap_or_else(|p| p.into_inner());
             slot = guard;
         }
     }
@@ -120,6 +197,7 @@ impl FrameSlot {
 
 // ── Shared frame processing pipeline ─────────────────────────────────────
 
+#[cfg(not(target_os = "android"))]
 /// State for the encode → fragment → encrypt → send video pipeline.
 /// Used by both Linux (PipeWire) and Windows (WGC) capture backends.
 pub(crate) struct FrameProcessor {
@@ -144,6 +222,7 @@ pub(crate) struct FrameProcessor {
     pub bytes_sent: Arc<AtomicU64>,
 }
 
+#[cfg(not(target_os = "android"))]
 impl FrameProcessor {
     /// Process a single captured frame: convert → encode → fragment → encrypt → send.
     pub fn process(
@@ -434,6 +513,7 @@ impl FrameProcessor {
 
 // ── Shared audio processing pipeline ─────────────────────────────────────
 
+#[cfg(not(target_os = "android"))]
 /// State for screen share audio: accumulate → Opus encode → encrypt → send.
 pub(crate) struct AudioProcessor {
     pub encoder: Option<voipc_audio::encoder::Encoder>,
@@ -452,6 +532,7 @@ pub(crate) struct AudioProcessor {
     pub channel_id: Arc<AtomicU32>,
 }
 
+#[cfg(not(target_os = "android"))]
 impl AudioProcessor {
     /// Process raw f32 audio bytes: downmix to mono, accumulate, Opus-encode, send.
     pub fn process(&mut self, raw_data: &[u8]) {
@@ -554,6 +635,7 @@ impl AudioProcessor {
 
 // ── Shared helper functions ──────────────────────────────────────────────
 
+#[cfg(not(target_os = "android"))]
 /// Strip row padding from capture buffer (when stride > width * 4).
 pub(crate) fn strip_stride_padding(
     data: &[u8],
@@ -575,22 +657,27 @@ pub(crate) fn strip_stride_padding(
 
 // ── Frame decoding (viewer side — cross-platform) ────────────────────────
 
+// On Android, FrameDecodeBuffers and render_frame will be reimplemented
+// in Phase 3 using a Rust-only JPEG encoder or direct frame passing.
+#[cfg(not(target_os = "android"))]
 /// Reusable state for frame decoding + JPEG encoding.
 pub struct FrameDecodeBuffers {
     pub compressor: turbojpeg::Compressor,
 }
 
+#[cfg(not(target_os = "android"))]
 impl FrameDecodeBuffers {
-    pub fn new() -> Self {
-        let mut compressor =
-            turbojpeg::Compressor::new().expect("Failed to create TurboJPEG compressor");
+    pub fn new() -> anyhow::Result<Self> {
+        let mut compressor = turbojpeg::Compressor::new()
+            .map_err(|e| anyhow::anyhow!("Failed to create TurboJPEG compressor: {e}"))?;
         compressor
             .set_quality(70)
-            .expect("Failed to set JPEG quality");
-        Self { compressor }
+            .map_err(|e| anyhow::anyhow!("Failed to set JPEG quality: {e}"))?;
+        Ok(Self { compressor })
     }
 }
 
+#[cfg(not(target_os = "android"))]
 /// Render a decoded VP8 frame to the frontend as a base64 JPEG.
 pub fn render_frame(
     frame: &voipc_video::decoder::DecodedFrame,
