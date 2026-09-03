@@ -3,7 +3,11 @@ import { writable } from "svelte/store";
 export const inputDevice = writable<string>("");
 export const outputDevice = writable<string>("");
 export const volume = writable<number>(1.0);
+export const inputGain = writable<number>(1.0);
 export const pttKey = writable<string>("Space");
+export const muteKey = writable<string>("");
+export const deafenKey = writable<string>("");
+export const chatHistoryDisabled = writable<boolean>(false);
 export const pttHoldMode = writable<boolean>(true);
 export const noiseSuppression = writable<boolean>(true);
 
@@ -16,6 +20,17 @@ export const lastAcceptSelfSigned = writable<boolean>(false);
 
 // QoL
 export const autoConnect = writable<boolean>(false);
+
+// Saved servers for the connect dialog
+export interface SavedServer {
+  name: string;
+  host: string;
+  port: number;
+  username: string;
+  accept_self_signed: boolean;
+}
+
+export const savedServers = writable<SavedServer[]>([]);
 
 // Sound settings
 export interface SoundEntry {
@@ -51,11 +66,14 @@ export interface AppConfig {
   input_device: string | null;
   output_device: string | null;
   volume: number;
+  input_gain: number;
   noise_suppression: boolean;
   voice_mode: string;
   vad_threshold_db: number;
   ptt_key: string;
   ptt_hold_mode: boolean;
+  mute_key: string | null;
+  deafen_key: string | null;
   muted: boolean;
   deafened: boolean;
   remember_connection: boolean;
@@ -63,7 +81,9 @@ export interface AppConfig {
   last_port: number | null;
   last_username: string | null;
   last_accept_self_signed: boolean | null;
+  saved_servers: SavedServer[];
   sounds: SoundSettings;
   auto_connect: boolean;
   chat_history_path: string | null;
+  chat_history_disabled: boolean;
 }

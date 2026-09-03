@@ -9,6 +9,7 @@ pub mod jitter;
 pub mod mixer;
 #[cfg(not(target_os = "android"))]
 pub mod playback;
+pub mod resample;
 pub mod vad;
 
 // Android audio via Oboe (AAudio/OpenSL ES)
@@ -70,6 +71,8 @@ pub mod capture {
 
     pub fn start_capture(
         _device_name: Option<&str>,
+        _error_flag: Arc<AtomicBool>,
+        _gain: Arc<std::sync::atomic::AtomicU32>, // ponytail: gain not applied on Android yet
     ) -> Result<(CaptureStream, ringbuf::HeapCons<f32>)> {
         let rb = HeapRb::<f32>::new(CAPTURE_BUFFER_SIZE);
         let (producer, consumer) = rb.split();
@@ -193,6 +196,7 @@ pub mod playback {
 
     pub fn start_playback(
         _device_name: Option<&str>,
+        _error_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(PlaybackStream, ringbuf::HeapProd<f32>)> {
         let rb = HeapRb::<f32>::new(PLAYBACK_BUFFER_SIZE);
         let (producer, consumer) = rb.split();

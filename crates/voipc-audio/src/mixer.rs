@@ -6,20 +6,30 @@ use voipc_protocol::voice::OPUS_FRAME_SIZE;
 /// Output is the sum of all inputs, clamped to [-1.0, 1.0].
 pub fn mix_streams(streams: &[&[f32]]) -> Vec<f32> {
     let mut output = vec![0.0f32; OPUS_FRAME_SIZE];
+    mix_into(&mut output, streams.iter().map(|s| (*s, 1.0)));
+    output
+}
 
-    for stream in streams {
-        let len = stream.len().min(OPUS_FRAME_SIZE);
+/// Like [`mix_streams`], but each stream carries its own gain.
+pub fn mix_streams_weighted(streams: &[(&[f32], f32)]) -> Vec<f32> {
+    let mut output = vec![0.0f32; OPUS_FRAME_SIZE];
+    mix_into(&mut output, streams.iter().copied());
+    output
+}
+
+/// Sum gain-weighted streams into `output` (assumed zeroed), clamping to [-1.0, 1.0].
+pub fn mix_into<'a>(output: &mut [f32], streams: impl Iterator<Item = (&'a [f32], f32)>) {
+    for (stream, gain) in streams {
+        let len = stream.len().min(output.len());
         for i in 0..len {
-            output[i] += stream[i];
+            output[i] += stream[i] * gain;
         }
     }
 
     // Clamp to prevent distortion
-    for sample in &mut output {
+    for sample in output.iter_mut() {
         *sample = sample.clamp(-1.0, 1.0);
     }
-
-    output
 }
 
 #[cfg(test)]
@@ -80,5 +90,22 @@ mod tests {
         let a = vec![0.1f32; 100]; // shorter than OPUS_FRAME_SIZE
         let mixed = mix_streams(&[&a]);
         assert_eq!(mixed.len(), OPUS_FRAME_SIZE);
+    }
+
+    #[test]
+    fn weighted_mix_applies_gains() {
+        let a = vec![0.5f32; OPUS_FRAME_SIZE];
+        let b = vec![0.5f32; OPUS_FRAME_SIZE];
+        let mixed = mix_streams_weighted(&[(&a, 0.5), (&b, 2.0)]);
+        assert!((mixed[0] - 1.0).abs() < 1e-6); // 0.25 + 1.0, clamped to 1.0
+        let mixed = mix_streams_weighted(&[(&a, 0.5), (&b, 0.2)]);
+        assert!((mixed[0] - 0.35).abs() < 1e-6);
+    }
+
+    #[test]
+    fn weighted_mix_zero_gain_is_silent() {
+        let a = vec![0.9f32; OPUS_FRAME_SIZE];
+        let mixed = mix_streams_weighted(&[(&a, 0.0)]);
+        assert_eq!(mixed[0], 0.0);
     }
 }

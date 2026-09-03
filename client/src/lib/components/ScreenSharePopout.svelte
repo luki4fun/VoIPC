@@ -92,6 +92,16 @@
     invoke("stop_watching_screen_share").catch(() => {});
     getCurrentWindow().destroy().catch(() => {});
   }
+
+  let contentEl = $state<HTMLDivElement | null>(null);
+
+  function toggleFullscreen() {
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    } else {
+      contentEl?.requestFullscreen().catch(() => {});
+    }
+  }
 </script>
 
 <div class="popout-viewer">
@@ -119,9 +129,16 @@
         {/if}
       </span>
     {/if}
+    <button class="fullscreen-btn" onclick={toggleFullscreen} title="Fullscreen (double-click video)">&#x26F6;</button>
     <button class="stop-btn" onclick={stopWatching}>Stop Watching</button>
   </div>
-  <div class="popout-content">
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    class="popout-content"
+    bind:this={contentEl}
+    ondblclick={toggleFullscreen}
+    role="presentation"
+  >
     {#if displayFrame}
       <img src={displayFrame} alt="Screen share" class="frame" />
     {:else}
@@ -227,8 +244,29 @@
     color: #faa61a;
   }
 
-  .stop-btn {
+  .fullscreen-btn {
     margin-left: auto;
+    background: transparent;
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    padding: 4px 8px;
+    font-size: 14px;
+    line-height: 1;
+    cursor: pointer;
+    border-radius: 4px;
+    flex-shrink: 0;
+  }
+
+  .fullscreen-btn:hover {
+    color: var(--text-primary);
+    border-color: var(--text-secondary);
+  }
+
+  .popout-content:fullscreen {
+    background: #000;
+  }
+
+  .stop-btn {
     background: var(--danger);
     color: white;
     padding: 4px 12px;

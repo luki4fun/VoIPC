@@ -46,6 +46,23 @@ fn format_name(p: Pixel) -> &'static str {
     }
 }
 
+/// Rate-control options shared by every encoder (generic AVCodecContext
+/// AVOptions — libx265 maps maxrate/bufsize to its own vbv params).
+///
+/// - `g`: encoder-internal keyframes are only a 2s safety net; the app forces
+///   an IDR every second via `encode_video_frame(_, true)`. 2×fps (not fps)
+///   avoids beat-frequency double keyframes when the forced IDR resets the
+///   internal GOP counter.
+/// - VBV: bufsize caps the largest compliant frame. The UDP wire format
+///   truncates frames above 255 fragments × 1239 B ≈ 316 KB, so bufsize is
+///   clamped to 2.4 Mbit (300 KB) to keep keyframes under that ceiling.
+fn set_rate_control_opts(opts: &mut Dictionary, bitrate_kbps: u32, fps: u32) {
+    let bits = bitrate_kbps as u64 * 1000;
+    opts.set("g", &(2 * fps).to_string());
+    opts.set("maxrate", &bits.to_string());
+    opts.set("bufsize", &(bits / 2).min(2_400_000).to_string());
+}
+
 /// Hardware encoders to try before falling back to libx265 software encoding.
 /// Order: NVIDIA → Intel Quick Sync → AMD, then software fallback.
 const HW_ENCODERS: &[(&str, &str)] = &[
@@ -142,6 +159,7 @@ impl Encoder {
         encoder.set_max_b_frames(0);
 
         let mut opts = Dictionary::new();
+        set_rate_control_opts(&mut opts, bitrate_kbps, fps);
 
         match name {
             "hevc_nvenc" => {
@@ -150,16 +168,19 @@ impl Encoder {
                 opts.set("rc", "cbr");               // Constant bitrate
                 opts.set("delay", "0");              // No encoding delay
                 opts.set("zerolatency", "1");
+                opts.set("forced-idr", "1");         // pict_type I → real IDR
             }
             "hevc_qsv" => {
                 opts.set("preset", "veryfast");
                 opts.set("async_depth", "1");        // Minimal pipeline depth
                 opts.set("low_power", "1");          // Use LP encode mode if available
+                opts.set("forced_idr", "1");
             }
             "hevc_amf" => {
                 opts.set("usage", "ultralowlatency");
                 opts.set("quality", "speed");
                 opts.set("rc", "cbr");
+                opts.set("forced_idr", "1");
             }
             _ => {}
         }
@@ -195,16 +216,14 @@ impl Encoder {
         encoder.set_max_b_frames(0);
 
         let mut opts = Dictionary::new();
+        set_rate_control_opts(&mut opts, bitrate_kbps, fps);
         opts.set("preset", "ultrafast");
         opts.set("tune", "zerolatency");
+        opts.set("forced-idr", "1");
 
-        let x265_params = [
-            "scenecut=0",
-            "me=dia",
-            "subme=0",
-            "keyint=30",
-            "min-keyint=30",
-        ].join(":");
+        // keyint matches the "g" safety net; the app forces an IDR every 1s.
+        let k = 2 * fps;
+        let x265_params = format!("scenecut=0:me=dia:subme=0:keyint={k}:min-keyint={k}");
         opts.set("x265-params", &x265_params);
 
         let encoder = encoder.open_with(opts)
@@ -367,6 +386,12 @@ impl Encoder {
 
     pub fn height(&self) -> u32 {
         self.height
+    }
+
+    /// The pixel format this encoder was opened with (YUV420P or NV12).
+    /// Frames passed to `encode_video_frame` must match it.
+    pub fn pixel_format(&self) -> Pixel {
+        self.pixel_format
     }
 }
 

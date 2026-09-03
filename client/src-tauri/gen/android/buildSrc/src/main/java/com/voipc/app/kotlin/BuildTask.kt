@@ -39,7 +39,9 @@ open class BuildTask : DefaultTask() {
                 }
                 throw lastException
             } else {
-                throw e;
+                // cargo-tauri isn't installed — fall back to the tauri CLI
+                // from the client's npm devDependencies (npx tauri ...)
+                runTauriCli("npx")
             }
         }
     }

@@ -6,6 +6,18 @@
     populateFromArchive,
     type ChatHistoryStatus,
   } from "../stores/chat.js";
+  import { chatHistoryDisabled } from "../stores/settings.js";
+
+  // Skip the vault entirely: chat stays in-memory (persistence no-ops
+  // without an unlock key) and this gate is not shown again.
+  async function skipVault() {
+    try {
+      await invoke("set_chat_history_disabled", { disabled: true });
+    } catch (e) {
+      console.error("Failed to save skip choice:", e);
+    }
+    chatHistoryDisabled.set(true);
+  }
 
   type Mode =
     | "loading"
@@ -373,6 +385,9 @@
 
       <button class="submit-btn" onclick={handleFirstRunCreate} disabled={loading}>
         {loading ? "Processing..." : "Create"}
+      </button>
+      <button class="text-link skip-link" onclick={skipVault} disabled={loading}>
+        Skip — don't save chat history (kept in memory only, lost on exit)
       </button>
 
     {:else if mode === "unlock"}

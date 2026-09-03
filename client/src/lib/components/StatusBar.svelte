@@ -6,6 +6,7 @@
     latency,
   } from "../stores/connection.js";
   import { playDisconnectedSound } from "../sounds.js";
+  import { addNotification } from "../stores/notifications.js";
   import Icon from "./Icons.svelte";
 
   async function disconnect() {
@@ -15,8 +16,50 @@
       playDisconnectedSound();
     } catch (e) {
       console.error("Failed to disconnect:", e);
+      addNotification(`Failed to disconnect: ${e}`, "error");
     }
   }
+
+  // Voice loss % over a rolling 2s window (from jitter-buffer conceal counts)
+  let lossPercent = $state(0);
+  let lastPlayed = 0;
+  let lastLost = 0;
+  let lossInterval: ReturnType<typeof setInterval> | null = null;
+
+  $effect(() => {
+    if ($connectionState === "connected") {
+      if (!lossInterval) {
+        lastPlayed = 0;
+        lastLost = 0;
+        lossInterval = setInterval(() => {
+          invoke<[number, number]>("get_voice_stats")
+            .then(([played, lost]) => {
+              const dPlayed = played - lastPlayed;
+              const dLost = lost - lastLost;
+              lastPlayed = played;
+              lastLost = lost;
+              const total = dPlayed + dLost;
+              lossPercent = total > 0 ? Math.round((dLost / total) * 100) : 0;
+            })
+            .catch(() => {});
+        }, 2000);
+      }
+    } else if (lossInterval) {
+      clearInterval(lossInterval);
+      lossInterval = null;
+      lossPercent = 0;
+    }
+    return () => {
+      if (lossInterval) {
+        clearInterval(lossInterval);
+        lossInterval = null;
+      }
+    };
+  });
+
+  let quality = $derived(
+    lossPercent >= 5 ? "bad" : lossPercent >= 1 ? "warn" : "good",
+  );
 </script>
 
 <div class="status-bar">
@@ -36,7 +79,9 @@
   </div>
 
   {#if $connectionState === "connected"}
-    <span class="latency">Ping: {$latency}ms</span>
+    <span class="latency quality-{quality}" title="Voice packet loss (2s window)">
+      Ping: {$latency}ms{#if lossPercent > 0}&nbsp;· {lossPercent}% loss{/if}
+    </span>
     <button class="disconnect-btn" onclick={disconnect}>
       <Icon name="disconnect" size={14} />
       Disconnect
@@ -60,6 +105,14 @@
     display: flex;
     align-items: center;
     gap: 6px;
+  }
+
+  .quality-warn {
+    color: var(--warning);
+  }
+
+  .quality-bad {
+    color: var(--danger);
   }
 
   .dot {

@@ -3,7 +3,7 @@ use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tracing::{debug, error, trace, warn};
 
-use voipc_protocol::voice::{VoicePacket, VoicePacketType, VOICE_HEADER_SIZE};
+use voipc_protocol::voice::{VoicePacketType, VOICE_HEADER_SIZE};
 
 use crate::state::ServerState;
 
@@ -48,22 +48,27 @@ pub async fn run_udp_loop(socket: Arc<UdpSocket>, state: Arc<ServerState>) {
 }
 
 /// Handle a voice packet (existing SFU logic — forward to all channel members except sender).
+///
+/// Only the header is parsed — the payload is relayed verbatim, so no
+/// per-packet payload allocation on the hot path.
 async fn handle_voice_packet(
     data: &[u8],
     src_addr: std::net::SocketAddr,
     socket: &UdpSocket,
     state: &ServerState,
 ) {
-    let packet = match VoicePacket::from_bytes(data) {
-        Ok(p) => p,
-        Err(e) => {
-            warn!(src = %src_addr, "invalid voice packet: {}", e);
-            return;
-        }
-    };
+    if data.len() < VOICE_HEADER_SIZE {
+        warn!(src = %src_addr, "voice packet too short");
+        return;
+    }
+    let packet_type = data[0];
+    let packet_session_id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
+    let udp_token = u64::from_be_bytes([
+        data[5], data[6], data[7], data[8], data[9], data[10], data[11], data[12],
+    ]);
 
     // Look up session by UDP address, or learn the address
-    let session_id = match resolve_session(src_addr, packet.session_id, packet.udp_token, state) {
+    let session_id = match resolve_session(src_addr, packet_session_id, udp_token, state) {
         Some(sid) => sid,
         None => return,
     };
@@ -79,17 +84,13 @@ async fn handle_voice_packet(
         return;
     }
 
-    // Handle ping
-    if packet.packet_type == VoicePacketType::Ping {
-        let pong = VoicePacket {
-            packet_type: VoicePacketType::Pong,
-            session_id: packet.session_id,
-            udp_token: packet.udp_token,
-            sequence: packet.sequence,
-            opus_data: Vec::new(),
-            key_id: 0,
-        };
-        if let Err(e) = socket.send_to(&pong.to_bytes(), src_addr).await {
+    // Handle ping — echo back as a Pong, keeping the sequence (the client
+    // uses it as a timestamp for RTT measurement)
+    if packet_type == VoicePacketType::Ping as u8 {
+        let mut pong = [0u8; VOICE_HEADER_SIZE];
+        pong.copy_from_slice(&data[..VOICE_HEADER_SIZE]);
+        pong[0] = VoicePacketType::Pong as u8;
+        if let Err(e) = socket.send_to(&pong, src_addr).await {
             warn!(session_id, %src_addr, "pong send failed: {}", e);
         }
         return;
@@ -110,33 +111,31 @@ async fn handle_voice_packet(
         return;
     }
 
-    let channels = state.channels.read().await;
-    let Some(channel) = channels.get(&channel_id) else {
-        warn!(session_id, channel_id, "voice forward: channel not found");
-        return;
+    // Collect recipient addresses, then release the channels lock BEFORE
+    // sending — the lock is write-preferring, so holding it across awaited
+    // sends would let any join/leave stall voice for the whole server.
+    let member_addrs: Vec<std::net::SocketAddr> = {
+        let channels = state.channels.read().await;
+        let Some(channel) = channels.get(&channel_id) else {
+            warn!(session_id, channel_id, "voice forward: channel not found");
+            return;
+        };
+        channel
+            .members
+            .iter()
+            .filter_map(|member_uid| {
+                let member_sid = state.user_to_session.get(member_uid)?;
+                if *member_sid == session_id {
+                    return None;
+                }
+                state.sessions.get(&*member_sid)?.udp_addr
+            })
+            .collect()
     };
 
-    for &member_uid in &channel.members {
-        let Some(member_sid) = state.user_to_session.get(&member_uid) else {
-            continue;
-        };
-        if *member_sid == session_id {
-            continue;
-        }
-
-        let Some(member_session) = state.sessions.get(&*member_sid) else {
-            continue;
-        };
-
-        if let Some(member_addr) = member_session.udp_addr {
-            if let Err(e) = socket.send_to(data, member_addr).await {
-                warn!(
-                    target_user = member_uid,
-                    %member_addr,
-                    "failed to forward voice packet: {}",
-                    e
-                );
-            }
+    for member_addr in member_addrs {
+        if let Err(e) = socket.send_to(data, member_addr).await {
+            warn!(%member_addr, "failed to forward voice packet: {}", e);
         }
     }
 }
@@ -203,9 +202,9 @@ async fn handle_video_packet(
 /// Resolve a session from the source address (using address learning).
 ///
 /// Security: always validates the UDP token (even on cache hit) and verifies the
-/// source IP matches the TCP-authenticated peer IP.  Once a UDP address is bound
-/// to a session, further address changes from the same IP are rejected
-/// (first-packet-wins).
+/// source IP matches the TCP-authenticated peer IP.  A token- and IP-validated
+/// packet from a new source port rebinds the session's UDP address (NAT
+/// mappings expire and reopen on new ports).
 fn resolve_session(
     src_addr: std::net::SocketAddr,
     packet_session_id: u32,
@@ -250,30 +249,33 @@ fn resolve_session(
         );
         return None;
     }
-    // First-packet-wins: don't overwrite an already-bound address
-    if let Some(bound_addr) = session.udp_addr {
-        if bound_addr != src_addr {
-            warn!(
-                session_id = packet_session_id,
-                src = %src_addr,
-                bound = %bound_addr,
-                "rejected UDP: address already bound to different socket"
-            );
-            return None;
-        }
-    }
-    // Guard cache size to prevent memory exhaustion from spoofed addresses
-    let needs_insert = session.udp_addr.is_none();
-    if needs_insert {
+    // Validated rebind: NAT mappings expire during silent periods and come
+    // back on a new source port. Token + TCP-peer-IP were just validated —
+    // the same trust as the initial bind — so rebind instead of rejecting
+    // (rejecting would kill voice until a full reconnect).
+    let old_addr = session.udp_addr.filter(|&bound| bound != src_addr);
+    let needs_insert = session.udp_addr != Some(src_addr);
+    if needs_insert && old_addr.is_none() {
+        // Guard cache size to prevent memory exhaustion from spoofed addresses
+        // (a rebind frees its old slot, so only genuinely new binds count)
         let cache_cap = (state.max_users as usize).saturating_mul(2).max(64);
         if state.addr_to_session.len() >= cache_cap {
             warn!("addr_to_session cache full ({cache_cap}), rejecting new learning");
             return None;
         }
-        session.udp_addr = Some(src_addr);
     }
+    session.udp_addr = Some(src_addr);
     drop(session);
 
+    if let Some(old) = old_addr {
+        state.addr_to_session.remove(&old);
+        tracing::info!(
+            session_id = packet_session_id,
+            old = %old,
+            new = %src_addr,
+            "UDP address rebound"
+        );
+    }
     if needs_insert {
         state.addr_to_session.insert(src_addr, packet_session_id);
     }

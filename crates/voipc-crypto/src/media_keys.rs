@@ -25,9 +25,23 @@ pub struct MediaKey {
     pub key_bytes: [u8; 32],
     /// Which channel this key belongs to.
     pub channel_id: u32,
+    /// Cached AES key schedule — expanding it per packet costs more than the
+    /// encryption itself at high packet rates. Clones share the cache.
+    #[serde(skip, default)]
+    aead_cache: std::sync::Arc<std::sync::OnceLock<LessSafeKey>>,
 }
 
 impl MediaKey {
+    /// Construct a key from raw bytes (e.g. received from the server).
+    pub fn new(channel_id: u32, key_id: u16, key_bytes: [u8; 32]) -> Self {
+        Self {
+            key_id,
+            key_bytes,
+            channel_id,
+            aead_cache: Default::default(),
+        }
+    }
+
     /// Generate a fresh random media key.
     pub fn generate(channel_id: u32, key_id: u16) -> anyhow::Result<Self> {
         let rng = SystemRandom::new();
@@ -38,14 +52,18 @@ impl MediaKey {
             key_id,
             key_bytes,
             channel_id,
+            aead_cache: Default::default(),
         })
     }
 
-    /// Create an AES-256-GCM key from the raw bytes.
-    fn to_aead_key(&self) -> anyhow::Result<LessSafeKey> {
-        let unbound = UnboundKey::new(&AES_256_GCM, &self.key_bytes)
-            .map_err(|_| anyhow::anyhow!("invalid key"))?;
-        Ok(LessSafeKey::new(unbound))
+    /// The AES-256-GCM key for the raw bytes (key schedule cached).
+    fn to_aead_key(&self) -> anyhow::Result<&LessSafeKey> {
+        // 32 bytes is always a valid AES-256 key length, so init can't fail
+        Ok(self.aead_cache.get_or_init(|| {
+            let unbound = UnboundKey::new(&AES_256_GCM, &self.key_bytes)
+                .expect("AES-256 key is 32 bytes");
+            LessSafeKey::new(unbound)
+        }))
     }
 
     /// Serialize this key for transmission (encrypted by pairwise Signal session).
@@ -70,17 +88,28 @@ impl MediaKey {
             key_id,
             key_bytes,
             channel_id,
+            aead_cache: Default::default(),
         })
     }
 }
 
 /// Construct a unique 12-byte nonce from packet metadata.
-/// Nonce = session_id(4) || sequence_or_frame_id(4) || fragment_info(4)
-fn build_nonce(session_id: u32, sequence: u32, extra: u32) -> Nonce {
+/// Nonce = session_id(4) || sequence_or_frame_id(4) || packet_type(1) || fragment_info(3)
+///
+/// The packet-type byte (taken from the AAD) domain-separates the media
+/// streams: voice, screen audio, and video all encrypt under the same
+/// channel key with independent sequence counters, so without it a user
+/// talking while screen-sharing would reuse (key, nonce) pairs across
+/// streams — catastrophic for AES-GCM.
+fn build_nonce(session_id: u32, sequence: u32, extra: u32, aad_context: &[u8]) -> Nonce {
+    // extra is a fragment index (wire format caps it at 255), so the top
+    // byte is free for the domain tag.
+    debug_assert!(extra <= 0x00FF_FFFF, "extra overflows into the domain byte");
     let mut nonce_bytes = [0u8; 12];
     nonce_bytes[0..4].copy_from_slice(&session_id.to_be_bytes());
     nonce_bytes[4..8].copy_from_slice(&sequence.to_be_bytes());
     nonce_bytes[8..12].copy_from_slice(&extra.to_be_bytes());
+    nonce_bytes[8] = aad_context.get(4).copied().unwrap_or(0);
     Nonce::assume_unique_for_key(nonce_bytes)
 }
 
@@ -113,7 +142,7 @@ pub fn media_encrypt(
     }
 
     let aead_key = key.to_aead_key()?;
-    let nonce = build_nonce(session_id, sequence, extra);
+    let nonce = build_nonce(session_id, sequence, extra, aad_context);
 
     let mut in_out = plaintext.to_vec();
     aead_key
@@ -142,7 +171,7 @@ pub fn media_decrypt(
     }
 
     let aead_key = key.to_aead_key()?;
-    let nonce = build_nonce(session_id, sequence, extra);
+    let nonce = build_nonce(session_id, sequence, extra, aad_context);
 
     let mut in_out = ciphertext.to_vec();
     let plaintext = aead_key
@@ -240,6 +269,27 @@ mod tests {
 
         let result = media_encrypt(&key, 1, MAX_SEQUENCE_BEFORE_ROTATION, 0, &aad, plaintext);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn packet_type_domain_separates_nonces() {
+        // Voice (0x05), screen audio (0x15), and video (0x13/0x14) share the
+        // channel key with independent sequence counters. The packet-type
+        // byte in the AAD must reach the nonce, so identical
+        // (session, sequence) pairs on different streams never produce the
+        // same keystream.
+        let key = MediaKey::generate(1, 0).unwrap();
+        let plaintext = b"same plaintext";
+        let voice_aad = build_aad(1, 0x05);
+        let screen_aad = build_aad(1, 0x15);
+
+        let voice_ct = media_encrypt(&key, 7, 42, 0, &voice_aad, plaintext).unwrap();
+        let screen_ct = media_encrypt(&key, 7, 42, 0, &screen_aad, plaintext).unwrap();
+        // Same nonce would leak: identical plaintext ⇒ identical ciphertext
+        assert_ne!(voice_ct, screen_ct);
+
+        // And a stream's packets can't be replayed into another stream
+        assert!(media_decrypt(&key, 7, 42, 0, &screen_aad, &voice_ct).is_err());
     }
 
     #[test]

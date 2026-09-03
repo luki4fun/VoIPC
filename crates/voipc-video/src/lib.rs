@@ -205,6 +205,17 @@ impl Resolution {
         }
     }
 
+    /// Target bitrate scaled for the actual frame rate: +50% at 60 fps
+    /// (temporal redundancy makes doubling unnecessary).
+    pub fn bitrate_kbps_at(self, fps: u32) -> u32 {
+        let base = self.bitrate_kbps();
+        if fps >= 60 {
+            base * 3 / 2
+        } else {
+            base
+        }
+    }
+
     /// Target frames per second.
     pub fn target_fps(self) -> u32 {
         match self {

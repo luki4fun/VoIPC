@@ -16,6 +16,7 @@
     receiverFramesDropped,
   } from "../stores/screenshare.js";
   import { isMobile } from "../stores/platform.js";
+  import { addNotification } from "../stores/notifications.js";
 
   let bitrateLabel = $derived(
     $receiverBitrate >= 1000
@@ -63,6 +64,17 @@
       currentFrame.set(null);
     } catch (e) {
       console.error("Failed to stop watching:", e);
+      addNotification(`Failed to stop watching: ${e}`, "error");
+    }
+  }
+
+  let contentEl = $state<HTMLDivElement | null>(null);
+
+  function toggleFullscreen() {
+    if (document.fullscreenElement) {
+      document.exitFullscreen().catch(() => {});
+    } else {
+      contentEl?.requestFullscreen().catch(() => {});
     }
   }
 
@@ -120,12 +132,19 @@
         {/if}
       </span>
     {/if}
+    <button class="popout-btn fullscreen-btn" onclick={toggleFullscreen} title="Fullscreen (double-click video)">&#x26F6;</button>
     {#if !$isMobile}
-      <button class="popout-btn" onclick={popOut} title="Pop out to separate window">&#8599;</button>
+      <button class="popout-btn no-auto-margin" onclick={popOut} title="Pop out to separate window">&#8599;</button>
     {/if}
     <button class="stop-btn" onclick={stopWatching}>Stop Watching</button>
   </div>
-  <div class="viewer-content">
+  <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
+  <div
+    class="viewer-content"
+    bind:this={contentEl}
+    ondblclick={toggleFullscreen}
+    role="presentation"
+  >
     {#if displayFrame}
       <img src={displayFrame} alt="Screen share" class="frame" />
     {:else}
@@ -248,6 +267,14 @@
   .popout-btn:hover {
     color: var(--text-primary);
     border-color: var(--text-secondary);
+  }
+
+  .popout-btn.no-auto-margin {
+    margin-left: 0;
+  }
+
+  .viewer-content:fullscreen {
+    background: #000;
   }
 
   .stop-btn {

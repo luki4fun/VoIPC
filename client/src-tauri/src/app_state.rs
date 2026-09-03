@@ -46,8 +46,16 @@ pub struct AppState {
     /// modifier is held — releasing the trigger key alone doesn't stop PTT.
     /// When false, releasing the trigger key immediately stops PTT.
     pub ptt_hold_mode: Arc<AtomicBool>,
+    /// Optional global hotkeys: toggle mute / toggle deafen (None = unbound).
+    pub mute_binding: Arc<std::sync::RwLock<Option<PttBinding>>>,
+    pub deafen_binding: Arc<std::sync::RwLock<Option<PttBinding>>>,
     /// Persistent user configuration (std Mutex — config saves are fast sync ops).
     pub config: std::sync::Mutex<crate::config::AppConfig>,
+    /// Set while the settings-panel mic test runs; cleared to stop it.
+    pub mic_test_active: Arc<AtomicBool>,
+    /// Capture-side mic gain as f32 bits (1.0 = unity), applied in the
+    /// audio callback of both the voice capture and the mic test.
+    pub input_gain: Arc<AtomicU32>,
 }
 
 impl AppState {
@@ -59,7 +67,11 @@ impl AppState {
             signal: Arc::new(std::sync::Mutex::new(SignalState::default())),
             ptt_binding: Arc::new(std::sync::RwLock::new(PttBinding::default())),
             ptt_hold_mode: Arc::new(AtomicBool::new(true)),
+            mute_binding: Arc::new(std::sync::RwLock::new(None)),
+            deafen_binding: Arc::new(std::sync::RwLock::new(None)),
             config: std::sync::Mutex::new(crate::config::AppConfig::default()),
+            mic_test_active: Arc::new(AtomicBool::new(false)),
+            input_gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
         }
     }
 }
@@ -165,11 +177,20 @@ pub struct ActiveConnection {
     pub transmitting: Arc<AtomicBool>,
     /// Handle to the capture+encode task (only active while PTT held).
     pub capture_task: Option<tokio::task::JoinHandle<()>>,
-    /// Playback ring buffer producer — UDP receiver writes decoded PCM here.
-    pub playback_producer: Arc<std::sync::Mutex<ringbuf::HeapProd<f32>>>,
-    /// Playback stream handle — held to keep the cpal output alive.
-    #[allow(dead_code)]
-    pub playback_stream: Option<voipc_audio::playback::PlaybackStream>,
+    /// Voice packet sequence counter — persists across PTT presses so the
+    /// AES-GCM nonce (session_id ‖ sequence) is never reused under the
+    /// channel key and receivers never see a backwards jump.
+    pub voice_sequence: Arc<AtomicU32>,
+    /// Master output volume as f32 bits (applied by the voice mixer task).
+    pub master_volume: Arc<AtomicU32>,
+    /// Voice frames played / concealed (jitter-buffer loss) — for the quality indicator.
+    pub voice_frames_played: Arc<AtomicU32>,
+    pub voice_frames_lost: Arc<AtomicU32>,
+    /// Output device override read by the mixer when rebuilding playback.
+    pub output_device_live: Arc<std::sync::Mutex<Option<String>>>,
+    /// Set to make the mixer (re)build the playback stream — by the cpal
+    /// error callback on device failure, or after an output device change.
+    pub playback_restart: Arc<AtomicBool>,
     /// Token for authenticating UDP voice packets.
     pub udp_token: u64,
     // ── Screen share state ──

@@ -58,6 +58,17 @@ impl Default for SoundSettings {
     }
 }
 
+/// A saved server entry shown in the connect dialog.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SavedServer {
+    pub name: String,
+    pub host: String,
+    pub port: u16,
+    pub username: String,
+    #[serde(default)]
+    pub accept_self_signed: bool,
+}
+
 /// Persistent user configuration, saved as `settings.json` in the VoIPC data directory.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
@@ -66,6 +77,8 @@ pub struct AppConfig {
     pub input_device: Option<String>,
     pub output_device: Option<String>,
     pub volume: f32,
+    /// Capture-side microphone gain (1.0 = unity, clamped 0.0–4.0).
+    pub input_gain: f32,
     pub noise_suppression: bool,
 
     // Voice mode
@@ -75,6 +88,9 @@ pub struct AppConfig {
     // PTT
     pub ptt_key: String,
     pub ptt_hold_mode: bool,
+    /// Optional global hotkeys (binding strings like "Ctrl+M"; None = unbound).
+    pub mute_key: Option<String>,
+    pub deafen_key: Option<String>,
 
     // Mute/Deafen (restored on next connect)
     pub muted: bool,
@@ -86,6 +102,8 @@ pub struct AppConfig {
     pub last_port: Option<u16>,
     pub last_username: Option<String>,
     pub last_accept_self_signed: Option<bool>,
+    /// Saved servers for the connect dialog (keyed by host:port).
+    pub saved_servers: Vec<SavedServer>,
 
     // QoL
     pub sounds: SoundSettings,
@@ -94,6 +112,9 @@ pub struct AppConfig {
     // Storage
     /// Path to the encrypted chat history file. None = not yet configured (first run).
     pub chat_history_path: Option<String>,
+    /// User chose to skip the encrypted chat vault — chat stays in-memory
+    /// only and the first-run setup gate is not shown.
+    pub chat_history_disabled: bool,
 }
 
 impl Default for AppConfig {
@@ -102,11 +123,14 @@ impl Default for AppConfig {
             input_device: None,
             output_device: None,
             volume: 1.0,
+            input_gain: 1.0,
             noise_suppression: true,
             voice_mode: "ptt".into(),
             vad_threshold_db: -40.0,
             ptt_key: "Space".into(),
             ptt_hold_mode: true,
+            mute_key: None,
+            deafen_key: None,
             muted: false,
             deafened: false,
             remember_connection: false,
@@ -114,9 +138,11 @@ impl Default for AppConfig {
             last_port: None,
             last_username: None,
             last_accept_self_signed: None,
+            saved_servers: Vec::new(),
             sounds: SoundSettings::default(),
             auto_connect: false,
             chat_history_path: None,
+            chat_history_disabled: false,
         }
     }
 }

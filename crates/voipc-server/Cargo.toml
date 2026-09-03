@@ -30,3 +30,5 @@ subtle = "2"
 sha2 = "0.10"
 
 [dev-dependencies]
+# For the voice_load example (Opus encoding of the test tone)
+voipc-audio = { workspace = true }

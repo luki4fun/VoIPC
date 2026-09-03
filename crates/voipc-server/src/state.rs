@@ -75,6 +75,8 @@ pub struct UserSession {
     pub password_attempt_rate: RateLimiter,
     /// Rate limiter for chat messages (channel + DM).
     pub chat_rate: RateLimiter,
+    /// Rate limiter for keyframe requests (each one forces an IDR on the sharer).
+    pub keyframe_request_rate: RateLimiter,
     /// Rate limiter for channel creation.
     pub create_channel_rate: RateLimiter,
     /// Rate limiter for pre-key uploads.
@@ -153,10 +155,8 @@ pub struct ServerState {
     pub udp_port: u16,
     /// Runtime settings.
     pub settings: ServerSettings,
-    /// Next user_id counter.
+    /// Next user_id counter (session_id is always equal to user_id).
     next_user_id: AtomicU32,
-    /// Next session_id counter.
-    next_session_id: AtomicU32,
     /// Next channel_id counter (0 is reserved for General).
     next_channel_id: AtomicU32,
 }
@@ -241,19 +241,17 @@ impl ServerState {
             udp_port: config.udp_port,
             settings,
             next_user_id: AtomicU32::new(1),
-            next_session_id: AtomicU32::new(1),
             next_channel_id: AtomicU32::new(next_id),
         }
     }
 
     /// Allocate a new unique user ID.
+    ///
+    /// The session ID is always identical to the user ID (one counter): the
+    /// client keys per-user volume and speaking indicators by the session_id
+    /// carried in voice packets, while the UI only knows user_ids.
     pub fn next_user_id(&self) -> UserId {
         self.next_user_id.fetch_add(1, Ordering::Relaxed)
-    }
-
-    /// Allocate a new unique session ID.
-    pub fn next_session_id(&self) -> SessionId {
-        self.next_session_id.fetch_add(1, Ordering::Relaxed)
     }
 
     /// Allocate a new unique channel ID.
@@ -1014,7 +1012,7 @@ mod tests {
 
     fn add_user(state: &ServerState, username: &str) -> (UserId, SessionId) {
         let user_id = state.next_user_id();
-        let session_id = state.next_session_id();
+        let session_id = user_id;
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let session = UserSession {
             user_id,
@@ -1028,10 +1026,11 @@ mod tests {
             udp_token: user_id as u64 * 1000,
             tcp_peer_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             udp_voice_rate: RateLimiter::new(55.0, 55.0),
-            udp_video_rate: RateLimiter::new(120.0, 120.0),
+            udp_video_rate: RateLimiter::new(400.0, 1200.0),
             global_rate: RateLimiter::new(50.0, 50.0),
             password_attempt_rate: RateLimiter::new(3.0, 1.0),
             chat_rate: RateLimiter::new(5.0, 5.0),
+            keyframe_request_rate: RateLimiter::new(2.0, 1.0),
             create_channel_rate: RateLimiter::new(1.0, 0.2),
             prekey_rate: RateLimiter::new(1.0, 0.2),
             is_screen_sharing: false,
@@ -1116,8 +1115,6 @@ mod tests {
         assert_eq!(state.next_user_id(), 1);
         assert_eq!(state.next_user_id(), 2);
         assert_eq!(state.next_user_id(), 3);
-        assert_eq!(state.next_session_id(), 1);
-        assert_eq!(state.next_session_id(), 2);
         assert_eq!(state.next_channel_id(), 1);
         assert_eq!(state.next_channel_id(), 2);
     }

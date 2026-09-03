@@ -6,6 +6,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+if ! command -v docker &>/dev/null; then
+  echo "release.sh builds inside Docker and requires the docker CLI." >&2
+  echo "Install docker (or use ./build.sh for a native build) and retry." >&2
+  exit 1
+fi
+
 # Sync version
 VERSION=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
 sed -i "s/\"version\": \"[^\"]*\"/\"version\": \"$VERSION\"/" client/src-tauri/tauri.conf.json

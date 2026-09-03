@@ -37,20 +37,23 @@ impl FrameConverter {
     /// Create a new converter.
     ///
     /// `input_format` should be `Pixel::BGRA` (Windows DXGI) or `Pixel::RGBA` (Linux).
-    /// If `dst_width`/`dst_height` differ from `src_width`/`src_height`, the conversion
-    /// also scales in the same pass (replacing the separate `scale_i420_nearest`).
+    /// `output_format` must match the encoder's pixel format (YUV420P or NV12 —
+    /// QSV only accepts NV12). If `dst_width`/`dst_height` differ from
+    /// `src_width`/`src_height`, the conversion also scales in the same pass
+    /// (replacing the separate `scale_i420_nearest`).
     pub fn new(
         input_format: Pixel,
         src_width: u32,
         src_height: u32,
         dst_width: u32,
         dst_height: u32,
+        output_format: Pixel,
     ) -> Result<Self> {
         let scaler = scaling::Context::get(
             input_format,
             src_width,
             src_height,
-            Pixel::YUV420P,
+            output_format,
             dst_width,
             dst_height,
             scaling::Flags::FAST_BILINEAR,
@@ -58,7 +61,7 @@ impl FrameConverter {
         .context("failed to create SwsContext for color conversion")?;
 
         let input_frame = Video::new(input_format, src_width, src_height);
-        let output_frame = Video::new(Pixel::YUV420P, dst_width, dst_height);
+        let output_frame = Video::new(output_format, dst_width, dst_height);
 
         Ok(Self {
             scaler,
@@ -67,6 +70,16 @@ impl FrameConverter {
             src_width,
             src_height,
         })
+    }
+
+    /// Source dimensions this converter was built for.
+    pub fn src_dims(&self) -> (u32, u32) {
+        (self.src_width, self.src_height)
+    }
+
+    /// Input pixel format this converter was built for.
+    pub fn input_format(&self) -> Pixel {
+        self.input_frame.format()
     }
 
     /// Convert pixel data (BGRA or RGBA) to YUV420P.
@@ -554,6 +567,18 @@ mod tests {
         let y_val = src[0];
         for i in 0..16 {
             assert_eq!(dst[i], y_val, "Y[{}] mismatch", i);
+        }
+    }
+
+    #[test]
+    fn frame_converter_outputs_requested_format() {
+        // QSV encoders open with NV12 — the converter must honor it.
+        for fmt in [Pixel::YUV420P, Pixel::NV12] {
+            let mut c = FrameConverter::new(Pixel::BGRA, 64, 64, 64, 64, fmt)
+                .expect("converter init");
+            let bgra = vec![128u8; 64 * 64 * 4];
+            let frame = c.convert(&bgra).expect("convert");
+            assert_eq!(frame.format(), fmt);
         }
     }
 

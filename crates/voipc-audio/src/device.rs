@@ -64,6 +64,49 @@ pub fn get_input_device(name: Option<&str>) -> Result<cpal::Device> {
         .ok_or_else(|| anyhow::anyhow!("no input device available"))
 }
 
+/// Whether the input device can open a stream at `rate` with the given
+/// sample format and channel count (checked against its advertised config
+/// ranges — no throwaway stream is opened).
+pub fn input_supports_rate(
+    device: &cpal::Device,
+    format: cpal::SampleFormat,
+    channels: u16,
+    rate: u32,
+) -> bool {
+    device
+        .supported_input_configs()
+        .map(|mut cfgs| {
+            cfgs.any(|c| {
+                c.channels() == channels
+                    && c.sample_format() == format
+                    && c.min_sample_rate().0 <= rate
+                    && rate <= c.max_sample_rate().0
+            })
+        })
+        .unwrap_or(false)
+}
+
+/// Whether the output device can open a stream at `rate` with the given
+/// sample format and channel count.
+pub fn output_supports_rate(
+    device: &cpal::Device,
+    format: cpal::SampleFormat,
+    channels: u16,
+    rate: u32,
+) -> bool {
+    device
+        .supported_output_configs()
+        .map(|mut cfgs| {
+            cfgs.any(|c| {
+                c.channels() == channels
+                    && c.sample_format() == format
+                    && c.min_sample_rate().0 <= rate
+                    && rate <= c.max_sample_rate().0
+            })
+        })
+        .unwrap_or(false)
+}
+
 /// Find an output device by name, falling back to default.
 pub fn get_output_device(name: Option<&str>) -> Result<cpal::Device> {
     let host = cpal::default_host();

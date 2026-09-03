@@ -53,7 +53,6 @@ pub async fn connect_to_server(
             drop(old.voice_tx);
             drop(old.video_tx);
             drop(old.screen_audio_tx);
-            drop(old.playback_stream);
             info!("cleaned up stale connection before reconnecting");
         }
     }
@@ -297,16 +296,25 @@ pub async fn connect_to_server(
         Err(e) => error!("UDP ping send failed: {}", e),
     }
 
-    // Start audio playback stream (output to speakers)
+    // Start audio playback stream (output to speakers). Failure is not fatal:
+    // the mixer task retries via the restart flag and surfaces an event.
     let settings = state.settings.read().await;
     let output_device = settings.output_device.clone();
+    let saved_volume = settings.volume;
     drop(settings);
 
+    let playback_restart = Arc::new(AtomicBool::new(false));
     let (playback_stream, playback_producer) =
-        voipc_audio::playback::start_playback(output_device.as_deref())
-            .map_err(|e| format!("Failed to start audio playback: {}", e))?;
-
-    let playback_producer = Arc::new(std::sync::Mutex::new(playback_producer));
+        match voipc_audio::playback::start_playback(output_device.as_deref(), playback_restart.clone()) {
+            Ok((s, p)) => (Some(s), Some(p)),
+            Err(e) => {
+                error!("Failed to start audio playback (will retry): {}", e);
+                playback_restart.store(true, Ordering::Relaxed);
+                (None, None)
+            }
+        };
+    let output_device_live = Arc::new(std::sync::Mutex::new(output_device));
+    let master_volume = Arc::new(AtomicU32::new(saved_volume.to_bits()));
 
     // Split TLS stream into reader/writer halves
     let (read_half, write_half) = tokio::io::split(tls_stream);
@@ -353,9 +361,12 @@ pub async fn connect_to_server(
     let screen_share_active = Arc::new(AtomicBool::new(false));
     let watching_user_id_shared = Arc::new(AtomicU32::new(0));
 
-    // Per-user volume control — shared between UDP receiver and commands
+    // Per-user volume control — shared between voice mixer and commands
     let user_volumes: Arc<std::sync::Mutex<HashMap<u32, f32>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
+
+    // Per-user jitter buffers + decoders — UDP receiver pushes, mixer pops
+    let mix_sources: MixSources = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     // Mute/deafen — initialize from persisted settings
     let (saved_muted, saved_deafened, saved_voice_mode, saved_vad_db, saved_ns) = {
@@ -398,23 +409,55 @@ pub async fn connect_to_server(
         move || video_decode_render_task(video_decode_rx, app_handle, tcp_tx, watching_uid, video_res, needs_kf)
     });
 
+    // Voice quality stats (read by the get_voice_stats command)
+    let voice_frames_played = Arc::new(AtomicU32::new(0));
+    let voice_frames_lost = Arc::new(AtomicU32::new(0));
+    // Dead-UDP watchdog state: last Pong arrival, epoch ms
+    let last_pong = Arc::new(AtomicU64::new(0));
+
     let udp_recv_handle = tokio::spawn(udp_receiver_task(
-        udp_socket,
+        udp_socket.clone(),
         app_handle.clone(),
         session_id,
-        playback_producer.clone(),
+        mix_sources.clone(),
         video_decode_tx,
         screen_audio_recv_count.clone(),
         current_media_key.clone(),
         current_channel_id.clone(),
-        user_volumes.clone(),
-        is_deafened.clone(),
         screen_video_frames_received.clone(),
         screen_video_frames_dropped.clone(),
         screen_video_bytes_received.clone(),
         tcp_tx.clone(),
         watching_user_id_shared.clone(),
         needs_keyframe,
+        last_pong.clone(),
+    ));
+
+    // Voice mixer — pops one frame per user per 20ms tick, mixes, and feeds
+    // the playback ring. Owns the playback stream (rebuilds it on error).
+    let mixer_handle = tokio::spawn(voice_mixer_task(
+        mix_sources,
+        playback_stream,
+        playback_producer,
+        playback_restart.clone(),
+        output_device_live.clone(),
+        is_deafened.clone(),
+        user_volumes.clone(),
+        master_volume.clone(),
+        voice_frames_played.clone(),
+        voice_frames_lost.clone(),
+        app_handle.clone(),
+    ));
+
+    // UDP keepalive — keeps the NAT mapping alive through silent channels
+    // and doubles as an RTT probe (server echoes the sequence in its Pong).
+    let keepalive_handle = tokio::spawn(udp_keepalive_task(
+        udp_socket,
+        server_addr,
+        session_id,
+        udp_token,
+        last_pong,
+        app_handle.clone(),
     ));
 
     // Store the active connection
@@ -436,11 +479,17 @@ pub async fn connect_to_server(
             screen_audio_send_handle,
             udp_recv_handle,
             video_decode_handle,
+            mixer_handle,
+            keepalive_handle,
         ],
         transmitting,
         capture_task: None,
-        playback_producer,
-        playback_stream: Some(playback_stream),
+        voice_sequence: Arc::new(AtomicU32::new(0)),
+        master_volume,
+        voice_frames_played,
+        voice_frames_lost,
+        output_device_live,
+        playback_restart,
         udp_token,
         is_screen_sharing: false,
         screen_capture_task: None,
@@ -723,13 +772,11 @@ async fn handle_server_message(
             // Reply to server keepalive ping to prevent idle disconnect
             let _ = send_tcp_message(tcp_tx, &ClientMessage::Ping { timestamp }).await;
         }
-        ServerMessage::Pong { timestamp } => {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_millis() as u64;
-            let rtt = now.saturating_sub(timestamp);
-            let _ = app_handle.emit("latency-update", serde_json::json!({"ms": rtt}));
+        ServerMessage::Pong { timestamp: _ } => {
+            // Displayed latency comes from the UDP keepalive RTT instead:
+            // this Pong also answers our echo of the server's keepalive ping,
+            // where the timestamp is the SERVER's clock — computing a "RTT"
+            // from it yielded clock skew, not latency.
         }
         ServerMessage::ServerShutdown { reason } => {
             let _ = app_handle.emit(
@@ -1017,11 +1064,7 @@ async fn handle_server_message(
                 if key_bytes.len() == 32 {
                     let mut kb = [0u8; 32];
                     kb.copy_from_slice(&key_bytes);
-                    let key = MediaKey {
-                        key_id,
-                        key_bytes: kb,
-                        channel_id,
-                    };
+                    let key = MediaKey::new(channel_id, key_id, kb);
                     let mut guard = media_key.lock().unwrap_or_else(|poisoned| {
                         warn!("media key mutex poisoned — recovering");
                         poisoned.into_inner()
@@ -1503,6 +1546,14 @@ fn handle_encrypted_direct_message(
                     "encrypted": true,
                 }),
             );
+
+            // Flash/blink the window like a poke does (desktop only)
+            #[cfg(not(target_os = "android"))]
+            if let Some(window) = app_handle.get_webview_window("main") {
+                let _ = window.request_user_attention(
+                    Some(tauri::UserAttentionType::Informational),
+                );
+            }
         }
         Err(e) => {
             warn!(from_user_id, "failed to decrypt direct message: {}", e);
@@ -1596,82 +1647,282 @@ async fn udp_sender_task(
 }
 
 /// UDP receiver task: receives voice and video packets, decrypting if encrypted.
+/// One remote audio stream feeding the mixer: voice per session, or a
+/// screen-share audio stream (keyed with [`SCREEN_AUDIO_FLAG`] set).
+struct MixSource {
+    jitter: voipc_audio::jitter::JitterBuffer,
+    decoder: voipc_audio::decoder::Decoder,
+    /// EndOfTransmission seen — the mixer resets the jitter buffer once the
+    /// buffered tail has fully drained (an immediate reset would clip it).
+    eot_received: bool,
+    last_activity: std::time::Instant,
+}
+
+impl MixSource {
+    fn new() -> anyhow::Result<Self> {
+        Ok(Self {
+            jitter: voipc_audio::jitter::JitterBuffer::new(2),
+            decoder: voipc_audio::decoder::Decoder::new()?,
+            eot_received: false,
+            last_activity: std::time::Instant::now(),
+        })
+    }
+}
+
+/// Set on the key of screen-share audio sources (session_ids are small counters).
+const SCREEN_AUDIO_FLAG: u32 = 0x8000_0000;
+/// Sources with no packets for this long are dropped (also covers user leave).
+const SOURCE_IDLE_PRUNE: std::time::Duration = std::time::Duration::from_secs(60);
+
+type MixSources = Arc<std::sync::Mutex<HashMap<u32, MixSource>>>;
+
+/// Milliseconds since the Unix epoch, truncated to u32 — used as the ping
+/// sequence so the server's Pong echo yields a real UDP RTT.
+fn now_millis_u32() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u32
+}
+
+/// Milliseconds since the Unix epoch as u64 (for the UDP-dead watchdog).
+fn now_millis_u64() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+/// No Pong for this long (3 missed 10s keepalives + margin) = UDP path dead.
+const UDP_DEAD_AFTER_MS: u64 = 35_000;
+
+/// Periodic UDP ping: keeps the NAT mapping alive through silent channels
+/// (mappings commonly expire after ~30s) and measures media-path RTT.
+/// Doubles as a dead-UDP watchdog: if Pongs stop while TCP stays up, the
+/// user is silently mute/deaf — emit `udp-dead` / `udp-restored` so the UI
+/// can say so.
+async fn udp_keepalive_task(
+    socket: Arc<UdpSocket>,
+    server_addr: std::net::SocketAddr,
+    session_id: u32,
+    udp_token: u64,
+    last_pong: Arc<AtomicU64>,
+    app_handle: tauri::AppHandle,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Baseline for the watchdog before the first Pong arrives
+    let started = now_millis_u64();
+    let mut udp_dead = false;
+    loop {
+        interval.tick().await;
+        let ping = VoicePacket::ping(session_id, udp_token, now_millis_u32());
+        if let Err(e) = socket.send_to(&ping.to_bytes(), server_addr).await {
+            warn!("UDP keepalive send failed: {}", e);
+        }
+
+        let last = last_pong.load(Ordering::Relaxed).max(started);
+        let stale = now_millis_u64().saturating_sub(last) > UDP_DEAD_AFTER_MS;
+        if stale && !udp_dead {
+            udp_dead = true;
+            warn!("no UDP Pong for {}ms — media path considered dead", UDP_DEAD_AFTER_MS);
+            let _ = app_handle.emit("udp-dead", ());
+        } else if !stale && udp_dead {
+            udp_dead = false;
+            info!("UDP Pongs resumed — media path restored");
+            let _ = app_handle.emit("udp-restored", ());
+        }
+    }
+}
+
+/// Clocked voice mixer: every 20ms, pop one frame per active source, decode
+/// (FEC/PLC on loss), sum with per-user and master gain, and push the mixed
+/// frame to the playback ring. Owns the playback stream and rebuilds it when
+/// `playback_restart` is set (device error or output device change).
+#[allow(clippy::too_many_arguments)]
+#[allow(unused_assignments)] // playback_stream is a hold-to-keep-alive handle
+async fn voice_mixer_task(
+    sources: MixSources,
+    mut playback_stream: Option<voipc_audio::playback::PlaybackStream>,
+    mut producer: Option<ringbuf::HeapProd<f32>>,
+    playback_restart: Arc<AtomicBool>,
+    output_device_live: Arc<std::sync::Mutex<Option<String>>>,
+    is_deafened: Arc<AtomicBool>,
+    user_volumes: Arc<std::sync::Mutex<HashMap<u32, f32>>>,
+    master_volume: Arc<AtomicU32>,
+    voice_frames_played: Arc<AtomicU32>,
+    voice_frames_lost: Arc<AtomicU32>,
+    app_handle: tauri::AppHandle,
+) {
+    use ringbuf::traits::Observer;
+    use voipc_audio::jitter::JitterFrame;
+
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(20));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+    // Resampler for output devices that can't run 48kHz
+    let mut out_rate = playback_stream.as_ref().map_or(48_000, |s| s.sample_rate());
+    let mut resampler = (out_rate != 48_000)
+        .then(|| voipc_audio::resample::LinearResampler::new(48_000, out_rate));
+    let mut last_restart_attempt: Option<std::time::Instant> = None;
+    let mut error_emitted = false;
+    let mut frames: Vec<(u32, Vec<f32>)> = Vec::new();
+    let mut resampled: Vec<f32> = Vec::new();
+
+    loop {
+        interval.tick().await;
+
+        // Rebuild the playback stream if the device died or was switched
+        if playback_restart.swap(false, Ordering::Relaxed) {
+            if last_restart_attempt.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1)) {
+                playback_restart.store(true, Ordering::Relaxed); // retry later
+            } else {
+                last_restart_attempt = Some(std::time::Instant::now());
+                let device_name = output_device_live
+                    .lock()
+                    .map(|d| d.clone())
+                    .unwrap_or_default();
+                // Drop the old stream before opening the device again
+                playback_stream = None;
+                producer = None;
+                match voipc_audio::playback::start_playback(
+                    device_name.as_deref(),
+                    playback_restart.clone(),
+                ) {
+                    Ok((stream, prod)) => {
+                        out_rate = stream.sample_rate();
+                        resampler = (out_rate != 48_000).then(|| {
+                            voipc_audio::resample::LinearResampler::new(48_000, out_rate)
+                        });
+                        playback_stream = Some(stream);
+                        producer = Some(prod);
+                        info!("playback stream (re)started at {}Hz", out_rate);
+                        if error_emitted {
+                            error_emitted = false;
+                            let _ = app_handle.emit("audio-device-restored", ());
+                        }
+                    }
+                    Err(e) => {
+                        warn!("playback restart failed (retrying): {}", e);
+                        if !error_emitted {
+                            error_emitted = true;
+                            let _ = app_handle.emit(
+                                "audio-device-error",
+                                serde_json::json!({"error": e.to_string()}),
+                            );
+                        }
+                        playback_restart.store(true, Ordering::Relaxed);
+                    }
+                }
+            }
+        }
+
+        // Backpressure: if the ring already holds >3 frames, skip this tick
+        // (caps clock drift between our timer and the device clock)
+        let frame_out = (out_rate as usize * 20) / 1000;
+        if let Some(p) = producer.as_ref() {
+            if p.occupied_len() > 3 * frame_out {
+                continue;
+            }
+        }
+
+        // Pull + decode one frame per source
+        frames.clear();
+        {
+            let mut map = match sources.lock() {
+                Ok(m) => m,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            map.retain(|_, s| s.last_activity.elapsed() < SOURCE_IDLE_PRUNE);
+            for (&key, src) in map.iter_mut() {
+                if src.eot_received && src.jitter.is_empty() {
+                    src.jitter.reset();
+                    src.eot_received = false;
+                    continue;
+                }
+                let MixSource { jitter, decoder, .. } = src;
+                let pcm = match jitter.pop() {
+                    None => continue, // buffering or idle
+                    Some(JitterFrame::Ready(data)) => {
+                        voice_frames_played.fetch_add(1, Ordering::Relaxed);
+                        decoder.decode(&data)
+                    }
+                    Some(JitterFrame::Lost) => {
+                        voice_frames_lost.fetch_add(1, Ordering::Relaxed);
+                        match jitter.peek_next() {
+                            // The next packet carries in-band FEC for the lost frame
+                            Some(next) => decoder.decode_fec(next),
+                            None => decoder.decode_lost(),
+                        }
+                    }
+                };
+                match pcm {
+                    Ok(pcm) => frames.push((key, pcm)),
+                    Err(e) => warn!("Opus decode error from source {:#x}: {}", key, e),
+                }
+            }
+        }
+
+        if frames.is_empty() || is_deafened.load(Ordering::Relaxed) {
+            continue; // ring drains to silence; decode above kept Opus state
+        }
+
+        // Mix with per-user gain × master volume
+        let master = f32::from_bits(master_volume.load(Ordering::Relaxed));
+        let mixed = {
+            let volumes = user_volumes
+                .lock()
+                .map(|v| v.clone())
+                .unwrap_or_default();
+            let weighted: Vec<(&[f32], f32)> = frames
+                .iter()
+                .map(|(key, pcm)| {
+                    let vol = volumes
+                        .get(&(key & !SCREEN_AUDIO_FLAG))
+                        .copied()
+                        .unwrap_or(1.0);
+                    (pcm.as_slice(), vol * master)
+                })
+                .collect();
+            voipc_audio::mixer::mix_streams_weighted(&weighted)
+        };
+
+        if let Some(p) = producer.as_mut() {
+            match resampler.as_mut() {
+                Some(r) => {
+                    resampled.clear();
+                    r.process(&mixed, &mut resampled);
+                    let _ = p.push_slice(&resampled);
+                }
+                None => {
+                    let _ = p.push_slice(&mixed);
+                }
+            }
+        }
+    }
+}
+
 async fn udp_receiver_task(
     socket: Arc<UdpSocket>,
     app_handle: tauri::AppHandle,
     _own_session_id: SessionId,
-    playback_producer: Arc<std::sync::Mutex<ringbuf::HeapProd<f32>>>,
+    sources: MixSources,
     video_decode_tx: mpsc::Sender<(Vec<u8>, bool)>,
     screen_audio_recv_count: Arc<AtomicU32>,
     media_key: Arc<std::sync::Mutex<Option<MediaKey>>>,
     channel_id: Arc<AtomicU32>,
-    user_volumes: Arc<std::sync::Mutex<HashMap<u32, f32>>>,
-    is_deafened: Arc<AtomicBool>,
     screen_video_frames_received: Arc<AtomicU32>,
     screen_video_frames_dropped: Arc<AtomicU32>,
     screen_video_bytes_received: Arc<AtomicU64>,
     tcp_tx: mpsc::Sender<Vec<u8>>,
     watching_user_id: Arc<AtomicU32>,
     needs_keyframe: Arc<AtomicBool>,
+    last_pong: Arc<AtomicU64>,
 ) {
-    let mut decoders: HashMap<u32, voipc_audio::decoder::Decoder> = HashMap::new();
-    let mut jitter_buffers: HashMap<u32, voipc_audio::jitter::JitterBuffer> = HashMap::new();
     let mut video_assembler = FrameAssembler::new();
     let mut current_video_session: Option<u32> = None;
-    let mut screen_audio_decoder: Option<voipc_audio::decoder::Decoder> = None;
     let mut buf = vec![0u8; 2048];
     let mut last_keyframe_request = std::time::Instant::now() - std::time::Duration::from_secs(10);
-
-    /// Drain ready frames from a user's jitter buffer, decode them, and push to playback.
-    fn drain_jitter_buffer(
-        session_id: u32,
-        jitter: &mut voipc_audio::jitter::JitterBuffer,
-        decoder: &mut voipc_audio::decoder::Decoder,
-        playback_producer: &Arc<std::sync::Mutex<ringbuf::HeapProd<f32>>>,
-        is_deafened: &Arc<AtomicBool>,
-        user_volumes: &Arc<std::sync::Mutex<HashMap<u32, f32>>>,
-    ) {
-        while let Some(frame) = jitter.pop() {
-            let pcm = match frame {
-                voipc_audio::jitter::JitterFrame::Ready(opus_data) => {
-                    match decoder.decode(&opus_data) {
-                        Ok(pcm) => pcm,
-                        Err(e) => {
-                            warn!("Opus decode error from session {}: {}", session_id, e);
-                            continue;
-                        }
-                    }
-                }
-                voipc_audio::jitter::JitterFrame::Lost => {
-                    match decoder.decode_lost() {
-                        Ok(pcm) => pcm,
-                        Err(e) => {
-                            warn!("Opus PLC error from session {}: {}", session_id, e);
-                            continue;
-                        }
-                    }
-                }
-            };
-
-            if is_deafened.load(Ordering::Relaxed) {
-                continue;
-            }
-
-            let vol = user_volumes.lock()
-                .map(|v| v.get(&session_id).copied().unwrap_or(1.0))
-                .unwrap_or(1.0);
-            if vol > 0.0 {
-                if let Ok(mut producer) = playback_producer.lock() {
-                    if (vol - 1.0).abs() < f32::EPSILON {
-                        producer.push_slice(&pcm);
-                    } else {
-                        let scaled: Vec<f32> = pcm.iter().map(|s| s * vol).collect();
-                        producer.push_slice(&scaled);
-                    }
-                }
-            }
-        }
-    }
 
     let mut recv_count: u64 = 0;
     // Track last voice packet time per user for speaking timeout
@@ -1751,45 +2002,42 @@ async fn udp_receiver_task(
                             buf[header_size..n].to_vec()
                         };
 
-                        // Enqueue into per-user jitter buffer (chain push to release borrow)
-                        jitter_buffers
-                            .entry(session_id)
-                            .or_insert_with(|| voipc_audio::jitter::JitterBuffer::new(2))
-                            .push(sequence, opus_data);
-
-                        // Ensure decoder exists (chain to release borrow)
-                        if !decoders.contains_key(&session_id) {
-                            match voipc_audio::decoder::Decoder::new() {
-                                Ok(d) => { decoders.insert(session_id, d); }
-                                Err(e) => {
-                                    warn!("Failed to create Opus decoder for session {session_id}: {e}");
-                                    continue;
+                        // Enqueue into the per-user jitter buffer; the mixer
+                        // task pops, decodes, and mixes on its 20ms clock
+                        {
+                            let mut map = match sources.lock() {
+                                Ok(m) => m,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            let src = match map.entry(session_id) {
+                                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                                std::collections::hash_map::Entry::Vacant(v) => {
+                                    match MixSource::new() {
+                                        Ok(s) => v.insert(s),
+                                        Err(e) => {
+                                            warn!("Failed to create Opus decoder for session {session_id}: {e}");
+                                            continue;
+                                        }
+                                    }
                                 }
-                            }
+                            };
+                            src.jitter.push(sequence, opus_data);
+                            src.eot_received = false;
+                            src.last_activity = std::time::Instant::now();
                         }
 
-                        // Drain ready frames from this user's jitter buffer
-                        let (Some(jitter), Some(decoder)) = (
-                            jitter_buffers.get_mut(&session_id),
-                            decoders.get_mut(&session_id),
-                        ) else {
-                            warn!("jitter buffer or decoder missing for session {session_id}");
-                            continue;
-                        };
-                        drain_jitter_buffer(
-                            session_id,
-                            jitter,
-                            decoder,
-                            &playback_producer,
-                            &is_deafened,
-                            &user_volumes,
-                        );
-
-                        last_voice_time.insert(session_id, std::time::Instant::now());
-                        let _ = app_handle.emit(
-                            "user-speaking",
-                            serde_json::json!({"user_id": session_id, "speaking": true}),
-                        );
+                        // Edge-triggered speaking indicator: emit only on the
+                        // first packet of a burst (the 300ms sweep and the EOT
+                        // branch emit speaking:false and clear the entry)
+                        if last_voice_time
+                            .insert(session_id, std::time::Instant::now())
+                            .is_none()
+                        {
+                            let _ = app_handle.emit(
+                                "user-speaking",
+                                serde_json::json!({"user_id": session_id, "speaking": true}),
+                            );
+                        }
                     }
                     // Voice: EndOfTransmission
                     0x02 => {
@@ -1798,31 +2046,42 @@ async fn udp_receiver_task(
                         }
                         let session_id =
                             u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
-                        // Drain remaining frames before resetting
-                        if let Some(jitter) = jitter_buffers.get_mut(&session_id) {
-                            if let Some(decoder) = decoders.get_mut(&session_id) {
-                                drain_jitter_buffer(
-                                    session_id,
-                                    jitter,
-                                    decoder,
-                                    &playback_producer,
-                                    &is_deafened,
-                                    &user_volumes,
-                                );
+                        // Mark EOT — the mixer resets the jitter buffer after
+                        // draining the buffered tail (an immediate reset here
+                        // would clip the end of the last word).
+                        // The decoder stays alive for continuity across bursts.
+                        if let Ok(mut map) = sources.lock() {
+                            if let Some(src) = map.get_mut(&session_id) {
+                                src.eot_received = true;
                             }
-                            jitter.reset();
                         }
-                        // Keep decoder alive for state continuity across PTT cycles
                         last_voice_time.remove(&session_id);
                         let _ = app_handle.emit(
                             "user-speaking",
                             serde_json::json!({"user_id": session_id, "speaking": false}),
                         );
                     }
-                    // Voice: Pong
+                    // Voice: Ping from server — reply with a Pong
                     0x03 => {
                         buf[0] = 0x04;
-                        let _ = socket.send(&buf[..n]).await;
+                        let _ = socket.send_to(&buf[..n], src_addr).await;
+                    }
+                    // Voice: Pong — echo of our keepalive ping; the sequence
+                    // field carries our send time, so this is real UDP RTT
+                    0x04 => {
+                        if n >= voipc_protocol::voice::VOICE_HEADER_SIZE {
+                            last_pong.store(now_millis_u64(), Ordering::Relaxed);
+                            let sent =
+                                u32::from_be_bytes([buf[13], buf[14], buf[15], buf[16]]);
+                            let rtt = now_millis_u32().wrapping_sub(sent);
+                            // Guard against clock weirdness producing huge values
+                            if rtt < 60_000 {
+                                let _ = app_handle.emit(
+                                    "latency-update",
+                                    serde_json::json!({"ms": rtt}),
+                                );
+                            }
+                        }
                     }
                     // Video: VideoFragment / VideoKeyframeFragment (unencrypted + encrypted)
                     0x10 | 0x11 | 0x13 | 0x14 => {
@@ -1866,10 +2125,10 @@ async fn udp_receiver_task(
                             }
                         }
 
-                        // Detect sharer change — reset assembler and audio decoder
+                        // Detect sharer change — reset assembler (the old
+                        // sharer's audio source just goes idle and is pruned)
                         if current_video_session != Some(packet.session_id) {
                             video_assembler.reset();
-                            screen_audio_decoder = None;
                             current_video_session = Some(packet.session_id);
                         }
 
@@ -1944,47 +2203,35 @@ async fn udp_receiver_task(
                             packet.opus_data.clone()
                         };
 
-                        // Reset decoder if sharer changed
                         if current_video_session != Some(packet.session_id) {
-                            screen_audio_decoder = None;
                             current_video_session = Some(packet.session_id);
                         }
 
-                        let decoder = match screen_audio_decoder.as_mut() {
-                            Some(d) => d,
-                            None => match voipc_audio::decoder::Decoder::new() {
-                                Ok(d) => screen_audio_decoder.insert(d),
-                                Err(e) => {
-                                    warn!("Failed to create screen audio decoder: {e}");
-                                    continue;
-                                }
-                            },
-                        };
-
-                        match decoder.decode(&opus_data) {
-                            Ok(pcm) => {
-                                if !is_deafened.load(Ordering::Relaxed) {
-                                    let sharer_id = packet.session_id;
-                                    let vol = user_volumes.lock()
-                                        .map(|v| v.get(&sharer_id).copied().unwrap_or(1.0))
-                                        .unwrap_or(1.0);
-                                    if vol > 0.0 {
-                                        if let Ok(mut producer) = playback_producer.lock() {
-                                            if (vol - 1.0).abs() < f32::EPSILON {
-                                                producer.push_slice(&pcm);
-                                            } else {
-                                                let scaled: Vec<f32> = pcm.iter().map(|s| s * vol).collect();
-                                                producer.push_slice(&scaled);
-                                            }
+                        // Feed the mixer like a voice stream (flagged key) —
+                        // screen audio gains jitter/reorder protection and is
+                        // mixed correctly with simultaneous voice.
+                        {
+                            let mut map = match sources.lock() {
+                                Ok(m) => m,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            let key = packet.session_id | SCREEN_AUDIO_FLAG;
+                            let src = match map.entry(key) {
+                                std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
+                                std::collections::hash_map::Entry::Vacant(v) => {
+                                    match MixSource::new() {
+                                        Ok(s) => v.insert(s),
+                                        Err(e) => {
+                                            warn!("Failed to create screen audio decoder: {e}");
+                                            continue;
                                         }
                                     }
                                 }
-                                screen_audio_recv_count.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(e) => {
-                                warn!("Screen audio decode error: {}", e);
-                            }
+                            };
+                            src.jitter.push(packet.sequence, opus_data);
+                            src.last_activity = std::time::Instant::now();
                         }
+                        screen_audio_recv_count.fetch_add(1, Ordering::Relaxed);
                     }
                     _ => {}
                 }
@@ -2125,6 +2372,7 @@ fn video_decode_render_task(
 /// Capture+encode task: reads from mic, encodes to Opus, encrypts with
 /// AES-256-GCM if a media key is available, then sends via UDP.
 /// Runs on a blocking thread since it polls the ring buffer.
+#[allow(unused_assignments)] // capture_stream is a hold-to-keep-alive handle
 pub fn spawn_capture_encode_task(
     device_name: Option<String>,
     session_id: u32,
@@ -2138,17 +2386,29 @@ pub fn spawn_capture_encode_task(
     current_audio_level: Arc<AtomicI32>,
     noise_suppression: Arc<AtomicBool>,
     is_muted: Arc<AtomicBool>,
+    voice_sequence: Arc<AtomicU32>,
+    input_gain: Arc<AtomicU32>,
+    app_handle: tauri::AppHandle,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
-        let (_capture_stream, mut consumer) =
-            match voipc_audio::capture::start_capture(device_name.as_deref()) {
+        let capture_error = Arc::new(AtomicBool::new(false));
+        let (mut _capture_stream, mut consumer) =
+            match voipc_audio::capture::start_capture(
+                device_name.as_deref(),
+                capture_error.clone(),
+                input_gain.clone(),
+            ) {
                 Ok(result) => result,
                 Err(e) => {
                     error!("Failed to start audio capture: {}", e);
+                    transmitting.store(false, Ordering::Relaxed);
+                    let _ = app_handle.emit(
+                        "audio-device-error",
+                        serde_json::json!({"error": e.to_string()}),
+                    );
                     return;
                 }
             };
-
         let mut encoder = match voipc_audio::encoder::Encoder::new() {
             Ok(e) => e,
             Err(e) => {
@@ -2160,7 +2420,8 @@ pub fn spawn_capture_encode_task(
         let frame_size = encoder.frame_size(); // 960 samples
         let mut pcm_buf = vec![0.0f32; frame_size];
         let mut accumulated: usize = 0;
-        let mut sequence: u32 = 0;
+        let mut stream_dead = false;
+        let mut last_rebuild = std::time::Instant::now();
 
         // Voice activity detector for VAD mode
         let mut vad = voipc_audio::vad::VoiceActivityDetector::new(
@@ -2175,6 +2436,40 @@ pub fn spawn_capture_encode_task(
         info!("capture+encode task started");
 
         while transmitting.load(Ordering::Relaxed) {
+            // Rebuild the capture stream if the device died (unplug etc.)
+            if capture_error.swap(false, Ordering::Relaxed) && !stream_dead {
+                stream_dead = true;
+                warn!("capture device error — attempting recovery");
+                let _ = app_handle.emit(
+                    "audio-device-error",
+                    serde_json::json!({"error": "capture device error"}),
+                );
+            }
+            if stream_dead {
+                if last_rebuild.elapsed() >= std::time::Duration::from_secs(1) {
+                    last_rebuild = std::time::Instant::now();
+                    match voipc_audio::capture::start_capture(
+                        device_name.as_deref(),
+                        capture_error.clone(),
+                        input_gain.clone(),
+                    ) {
+                        Ok((stream, cons)) => {
+                            _capture_stream = stream;
+                            consumer = cons;
+                            stream_dead = false;
+                            accumulated = 0;
+                            info!("capture stream restored");
+                            let _ = app_handle.emit("audio-device-restored", ());
+                        }
+                        Err(e) => warn!("capture restart failed (retrying): {}", e),
+                    }
+                }
+                if stream_dead {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    continue;
+                }
+            }
+
             // Read into the remaining portion of pcm_buf
             let read = ringbuf::traits::Consumer::pop_slice(
                 &mut consumer,
@@ -2216,7 +2511,12 @@ pub fn spawn_capture_encode_task(
                 continue;
             }
 
-            // We have a full frame — encode and send
+            // We have a full frame — encode and send.
+            // The sequence counter lives on the connection so it never
+            // restarts within a session: a restart would reuse AES-GCM
+            // nonces under the channel key and desync receivers' jitter
+            // buffers when the EndOfTransmission packet is lost.
+            let sequence = voice_sequence.fetch_add(1, Ordering::Relaxed);
             match encoder.encode(&pcm_buf) {
                 Ok(opus_data) => {
                     let packet = {
@@ -2241,10 +2541,9 @@ pub fn spawn_capture_encode_task(
                                 ),
                                 Err(e) => {
                                     warn!("Voice encryption failed (seq {}): {}", sequence, e);
-                                    // Do NOT fall back to plaintext — skip this frame.
-                                    // Use saturating_add to prevent wraparound to 0
-                                    // which would cause nonce reuse under the same key.
-                                    sequence = sequence.saturating_add(1);
+                                    // Do NOT fall back to plaintext — skip this
+                                    // frame (the sequence was already consumed,
+                                    // receivers treat the gap as loss).
                                     accumulated = 0;
                                     continue;
                                 }
@@ -2256,7 +2555,6 @@ pub fn spawn_capture_encode_task(
                             VoicePacket::voice(session_id, udp_token, sequence, opus_data)
                         }
                     };
-                    sequence = sequence.saturating_add(1);
 
                     if voice_tx.blocking_send(packet.to_bytes()).is_err() {
                         break;

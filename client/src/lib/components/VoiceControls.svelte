@@ -1,5 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
   import { onMount, onDestroy } from "svelte";
   import {
     connectionState,
@@ -10,7 +11,7 @@
   } from "../stores/connection.js";
   import { currentChannelId } from "../stores/channels.js";
   import { speakingUsers } from "../stores/users.js";
-  import { volume, pttKey, pttHoldMode, noiseSuppression } from "../stores/settings.js";
+  import { volume, inputGain, pttKey, pttHoldMode, noiseSuppression } from "../stores/settings.js";
   import { voiceMode, vadThreshold, audioLevel, speakerMode } from "../stores/voice.js";
   import type { VoiceMode } from "../stores/voice.js";
   import ScreenShareControls from "./ScreenShareControls.svelte";
@@ -81,6 +82,18 @@
       speakerMode.set(newVal);
     } catch (e) {
       console.error("Failed to toggle speaker:", e);
+    }
+  }
+
+  let toggleUnlisten: Array<() => void> = [];
+
+  async function handleGainChange(e: Event) {
+    const gain = parseFloat((e.target as HTMLInputElement).value);
+    inputGain.set(gain);
+    try {
+      await invoke("set_input_gain", { gain });
+    } catch (err) {
+      console.error("Failed to set input gain:", err);
     }
   }
 
@@ -252,11 +265,21 @@
 
     window.addEventListener("keydown", keydownHandler);
     window.addEventListener("keyup", keyupHandler);
+
+    // Tray menu and global hotkeys request toggles via these events —
+    // routed through the same functions so UI + server stay in sync
+    listen("toggle-mute-request", () => toggleMute()).then((fn) =>
+      toggleUnlisten.push(fn),
+    );
+    listen("toggle-deafen-request", () => toggleDeafen()).then((fn) =>
+      toggleUnlisten.push(fn),
+    );
   });
 
   onDestroy(() => {
     if (keydownHandler) window.removeEventListener("keydown", keydownHandler);
     if (keyupHandler) window.removeEventListener("keyup", keyupHandler);
+    toggleUnlisten.forEach((fn) => fn());
   });
 </script>
 
@@ -354,7 +377,19 @@
 
   <div class="divider"></div>
 
-  <div class="volume">
+  <div class="volume" title="Mic gain: {Math.round($inputGain * 100)}%">
+    <Icon name="mic-on" size={16} class="vol-icon" />
+    <input
+      type="range"
+      min="0"
+      max="4"
+      step="0.1"
+      value={$inputGain}
+      oninput={handleGainChange}
+    />
+  </div>
+
+  <div class="volume" title="Output volume: {Math.round($volume * 100)}%">
     <Icon name="volume" size={16} class="vol-icon" />
     <input
       type="range"
@@ -387,11 +422,11 @@
   }
 
   .mode-select {
-    background: var(--bg-tertiary);
+    background-color: var(--bg-tertiary);
     color: var(--text-primary);
     border: 1px solid var(--border);
     border-radius: 6px;
-    padding: 6px 8px;
+    padding: 6px 28px 6px 8px;
     font-size: 12px;
     cursor: pointer;
     outline: none;

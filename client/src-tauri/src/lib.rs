@@ -9,8 +9,21 @@ mod screenshare;
 use app_state::AppState;
 use tauri::Manager;
 
+/// Whether the system tray was created. When it wasn't (e.g. libappindicator
+/// missing on Linux), close-to-tray is disabled so closing the window quits.
+#[cfg(not(target_os = "android"))]
+static TRAY_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // WebKitGTK's DMA-BUF renderer crashes the Wayland connection on NVIDIA
+    // ("Gdk Error 71 (Protocol error) dispatching to Wayland display").
+    // Disable it unless the user explicitly set the variable themselves.
+    #[cfg(all(target_os = "linux", not(target_os = "android")))]
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+
     // Android: log to logcat via tracing-android; try_init avoids panic on Activity recreation.
     // Desktop: log to stderr via fmt subscriber.
     #[cfg(target_os = "android")]
@@ -33,6 +46,7 @@ pub fn run() {
     }
 
     tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
         .manage(AppState::new())
         .setup(|app| {
             // On Android, dirs::config_dir() returns None (no $HOME env var).
@@ -97,6 +111,19 @@ pub fn run() {
                     s.muted = cfg.muted;
                     s.deafened = cfg.deafened;
                 }
+                state.input_gain.store(
+                    cfg.input_gain.clamp(0.0, 4.0).to_bits(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                // Hydrate the optional global mute/deafen hotkeys
+                *state.mute_binding.write().unwrap() = cfg
+                    .mute_key
+                    .as_deref()
+                    .and_then(commands::parse_ptt_binding);
+                *state.deafen_binding.write().unwrap() = cfg
+                    .deafen_key
+                    .as_deref()
+                    .and_then(commands::parse_ptt_binding);
 
                 // Apply PTT binding
                 if let Some(binding) = commands::parse_ptt_binding(&cfg.ptt_key) {
@@ -131,9 +158,107 @@ pub fn run() {
                 app.handle().clone(),
                 app.state::<AppState>().ptt_binding.clone(),
                 app.state::<AppState>().ptt_hold_mode.clone(),
+                app.state::<AppState>().mute_binding.clone(),
+                app.state::<AppState>().deafen_binding.clone(),
             );
 
+            // System tray: closing the window hides to tray (call keeps
+            // running); Quit in the tray menu actually exits.
+            #[cfg(not(target_os = "android"))]
+            {
+                use tauri::menu::{Menu, MenuItem};
+                use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+                use tauri::Emitter as _;
+
+                fn toggle_main_window(app: &tauri::AppHandle) {
+                    if let Some(window) = app.get_webview_window("main") {
+                        if window.is_visible().unwrap_or(false) {
+                            let _ = window.hide();
+                        } else {
+                            let _ = window.show();
+                            let _ = window.set_focus();
+                        }
+                    }
+                }
+
+                let build_tray = || -> tauri::Result<()> {
+                    let show = MenuItem::with_id(app, "show", "Show / Hide", true, None::<&str>)?;
+                    let mute = MenuItem::with_id(app, "mute", "Toggle Mute", true, None::<&str>)?;
+                    let deafen =
+                        MenuItem::with_id(app, "deafen", "Toggle Deafen", true, None::<&str>)?;
+                    let quit = MenuItem::with_id(app, "quit", "Quit VoIPC", true, None::<&str>)?;
+                    let menu = Menu::with_items(app, &[&show, &mute, &deafen, &quit])?;
+
+                    let mut tray = TrayIconBuilder::with_id("voipc-tray")
+                        .menu(&menu)
+                        .show_menu_on_left_click(false)
+                        .tooltip("VoIPC")
+                        .on_menu_event(|app, event| match event.id.as_ref() {
+                            "show" => toggle_main_window(app),
+                            // VoiceControls listens for these and runs its normal
+                            // mute/deafen toggle path, keeping UI + server in sync
+                            "mute" => {
+                                let _ = app.emit("tray-toggle-mute", ());
+                            }
+                            "deafen" => {
+                                let _ = app.emit("tray-toggle-deafen", ());
+                            }
+                            "quit" => app.exit(0),
+                            _ => {}
+                        })
+                        .on_tray_icon_event(|tray, event| {
+                            if let TrayIconEvent::Click {
+                                button: MouseButton::Left,
+                                button_state: MouseButtonState::Up,
+                                ..
+                            } = event
+                            {
+                                toggle_main_window(tray.app_handle());
+                            }
+                        });
+                    if let Some(icon) = app.default_window_icon() {
+                        tray = tray.icon(icon.clone());
+                    }
+                    tray.build(app)?;
+                    Ok(())
+                };
+
+                // libappindicator-sys panics (not errs) when no appindicator
+                // library is installed — catch it and run without a tray
+                // instead of crashing on startup. Panic hook silenced around
+                // the call so the missing-library case logs one warning, not
+                // a full panic dump.
+                let prev_hook = std::panic::take_hook();
+                std::panic::set_hook(Box::new(|_| {}));
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(build_tray));
+                std::panic::set_hook(prev_hook);
+                match result {
+                    Ok(Ok(())) => TRAY_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed),
+                    Ok(Err(e)) => {
+                        tracing::warn!("System tray unavailable ({e}) — running without tray; closing the window will quit")
+                    }
+                    Err(_) => tracing::warn!(
+                        "System tray unavailable (libayatana-appindicator3/libappindicator3 not installed) — running without tray; closing the window will quit"
+                    ),
+                }
+            }
+
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // Close-to-tray: intercept only the main window's close, and only
+            // when a tray actually exists to bring the window back
+            #[cfg(not(target_os = "android"))]
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == "main"
+                    && TRAY_ACTIVE.load(std::sync::atomic::Ordering::Relaxed)
+                {
+                    api.prevent_close();
+                    let _ = window.hide();
+                }
+            }
+            #[cfg(target_os = "android")]
+            let _ = (window, event);
         })
         .invoke_handler(tauri::generate_handler![
             commands::connect,
@@ -159,6 +284,11 @@ pub fn run() {
             commands::set_input_device,
             commands::set_output_device,
             commands::set_volume,
+            commands::set_input_gain,
+            commands::get_voice_stats,
+            commands::set_mute_key,
+            commands::set_deafen_key,
+            commands::set_chat_history_disabled,
             // Chat history (encrypted file)
             commands::get_chat_history_status,
             commands::unlock_chat_history,
@@ -207,6 +337,10 @@ pub fn run() {
             // Persistent config
             commands::load_config,
             commands::save_connection_info,
+            commands::save_server,
+            commands::remove_server,
+            commands::start_mic_test,
+            commands::stop_mic_test,
             commands::reset_config,
             commands::set_config_bool,
             // Notification sounds

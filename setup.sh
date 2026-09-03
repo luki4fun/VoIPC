@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# VoIPC Linux (Ubuntu/Debian) development environment setup
+# VoIPC Linux development environment setup (Ubuntu/Debian via apt, Arch via pacman)
 # Installs system packages, Rust, Node.js, and runs npm install.
 set -euo pipefail
 
@@ -17,6 +17,7 @@ echo -e "\n${CYAN}=== VoIPC Linux Setup ===${NC}"
 
 # ── System packages ───────────────────────────────────────────────────────
 info "Installing system dependencies (may prompt for sudo password)..."
+if command -v apt-get &>/dev/null; then
 sudo apt-get update -qq
 sudo apt-get install -y \
   libavcodec-dev \
@@ -37,8 +38,31 @@ sudo apt-get install -y \
   libwebkit2gtk-4.1-dev \
   libjavascriptcoregtk-4.1-dev \
   libsoup-3.0-dev \
+  libayatana-appindicator3-dev \
   curl \
   build-essential
+elif command -v pacman &>/dev/null; then
+sudo pacman -S --needed --noconfirm \
+  ffmpeg \
+  x265 \
+  clang \
+  libjpeg-turbo \
+  nasm \
+  libpipewire \
+  mesa \
+  alsa-lib \
+  openssl \
+  gtk3 \
+  webkit2gtk-4.1 \
+  libsoup3 \
+  libayatana-appindicator \
+  curl \
+  base-devel
+else
+  err "No supported package manager found (apt-get or pacman)."
+  err "Install the dependencies listed in BUILDING.md manually, then re-run."
+  exit 1
+fi
 ok "System packages installed"
 
 # ── Rust ──────────────────────────────────────────────────────────────────

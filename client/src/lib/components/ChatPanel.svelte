@@ -3,6 +3,7 @@
   import { tick } from "svelte";
   import { channels, currentChannelId, previewChannelId } from "../stores/channels.js";
   import { userId } from "../stores/connection.js";
+  import { addNotification } from "../stores/notifications.js";
   import {
     channelMessages,
     dmMessages,
@@ -19,6 +20,45 @@
   let messageInput = $state("");
   let messagesContainer = $state<HTMLDivElement | null>(null);
   let chatInputEl = $state<HTMLInputElement | null>(null);
+
+  // ── Link handling: URLs become buttons that open a copy popup (never a
+  // browser). Rendering stays plain text nodes — no HTML injection surface.
+  const URL_RE = /(https?:\/\/[^\s]+)/g;
+
+  function splitSegments(text: string): Array<{ text: string; url: boolean }> {
+    return text
+      .split(URL_RE)
+      .filter((p) => p !== "")
+      .map((p) => ({ text: p, url: /^https?:\/\//.test(p) }));
+  }
+
+  let linkPopupUrl = $state<string | null>(null);
+  let linkInputEl = $state<HTMLInputElement | null>(null);
+
+  $effect(() => {
+    if (linkPopupUrl !== null && linkInputEl) {
+      linkInputEl.focus();
+      linkInputEl.select();
+    }
+  });
+
+  async function copyLink() {
+    if (linkPopupUrl === null) return;
+    let copied = false;
+    try {
+      await navigator.clipboard.writeText(linkPopupUrl);
+      copied = true;
+    } catch {
+      linkInputEl?.focus();
+      linkInputEl?.select();
+      copied = document.execCommand("copy");
+    }
+    if (copied) {
+      addNotification("Link copied", "info", 2500);
+      linkPopupUrl = null;
+    }
+    // Not copied: leave the popup open with the URL selected for manual Ctrl+C
+  }
 
   // Emoji picker state
   let showEmojiPicker = $state(false);
@@ -141,6 +181,7 @@
       }
     } catch (e) {
       console.error("Failed to send message:", e);
+      addNotification(`Failed to send message: ${e}`, "error");
     }
   }
 
@@ -206,7 +247,13 @@
             <span class="msg-time">{formatTime(msg.timestamp)}</span>
           </div>
         {/if}
-        <div class="msg-content">{msg.content}</div>
+        <div class="msg-content">
+          {#each splitSegments(msg.content) as seg}
+            {#if seg.url}
+              <button class="msg-link" onclick={() => (linkPopupUrl = seg.text)} title="Copy link">{seg.text}</button>
+            {:else}{seg.text}{/if}
+          {/each}
+        </div>
       {/each}
     {/if}
   </div>
@@ -293,6 +340,26 @@
     <div class="preview-footer">Double-click channel to join and chat</div>
   {/if}
 </div>
+
+{#if linkPopupUrl !== null}
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+  <div class="link-overlay" onclick={() => (linkPopupUrl = null)}>
+    <div class="link-dialog" onclick={(e) => e.stopPropagation()}>
+      <span class="link-title">Copy link</span>
+      <input
+        class="link-input"
+        readonly
+        bind:this={linkInputEl}
+        value={linkPopupUrl}
+        onfocus={(e) => e.currentTarget.select()}
+      />
+      <div class="link-actions">
+        <button class="link-copy-btn" onclick={copyLink}>Copy</button>
+        <button class="link-close-btn" onclick={() => (linkPopupUrl = null)}>Close</button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   .chat-panel {
@@ -412,6 +479,83 @@
     padding-left: 0;
     line-height: 1.4;
     word-break: break-word;
+  }
+
+  .msg-link {
+    background: none;
+    border: none;
+    padding: 0;
+    font-size: 13px;
+    line-height: 1.4;
+    color: var(--accent);
+    text-decoration: underline;
+    cursor: pointer;
+    word-break: break-all;
+  }
+
+  .msg-link:hover {
+    color: var(--accent-hover);
+  }
+
+  .link-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 150;
+  }
+
+  .link-dialog {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 20px;
+    width: 420px;
+    max-width: 90vw;
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  }
+
+  .link-title {
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .link-input {
+    width: 100%;
+    font-size: 13px;
+    padding: 8px;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    color: var(--text-primary);
+  }
+
+  .link-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+  }
+
+  .link-copy-btn {
+    background: var(--accent);
+    color: white;
+    padding: 6px 16px;
+    font-size: 13px;
+    border-radius: 4px;
+  }
+
+  .link-close-btn {
+    background: transparent;
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    padding: 6px 16px;
+    font-size: 13px;
+    border-radius: 4px;
   }
 
   .input-bar {

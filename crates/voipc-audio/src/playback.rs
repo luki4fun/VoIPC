@@ -1,3 +1,6 @@
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, StreamTrait};
 use cpal::{SampleFormat, StreamConfig};
@@ -7,8 +10,8 @@ use tracing::{error, info, warn};
 
 use crate::device;
 
-/// The sample rate Opus produces. We force the playback device to this rate
-/// so decoded samples play back at the correct speed.
+/// The sample rate Opus produces. We prefer this on the playback device;
+/// if unsupported, the mixer resamples to the device rate before pushing.
 const TARGET_SAMPLE_RATE: u32 = 48_000;
 
 /// Handle to an active audio playback stream.
@@ -18,133 +21,119 @@ pub struct PlaybackStream {
     sample_rate: u32,
 }
 
-/// Size of the playback ring buffer in samples (~200ms at 48kHz).
-const PLAYBACK_BUFFER_SIZE: usize = 48_000 / 5;
+/// Fill an interleaved output buffer from the mono ring buffer, duplicating
+/// each sample to all channels and fading out on underrun to avoid clicks.
+fn fill_output(
+    consumer: &mut ringbuf::HeapCons<f32>,
+    data: &mut [f32],
+    channels: usize,
+    scratch: &mut Vec<f32>,
+) {
+    let frames = data.len() / channels;
+    scratch.clear();
+    scratch.resize(frames, 0.0);
+    let read = consumer.pop_slice(scratch);
+    if read < frames && read > 0 {
+        let fade_len = read.min(32);
+        let fade_start = read - fade_len;
+        for i in 0..fade_len {
+            scratch[fade_start + i] *= 1.0 - (i as f32 / fade_len as f32);
+        }
+    }
+    if channels == 1 {
+        data.copy_from_slice(scratch);
+    } else {
+        for (frame, &sample) in data.chunks_mut(channels).zip(scratch.iter()) {
+            for ch in frame.iter_mut() {
+                *ch = sample;
+            }
+        }
+    }
+}
 
 /// Start playing audio through the given device (or default).
 ///
-/// Returns the playback stream handle and a ring buffer producer
-/// that the mixer writes decoded PCM samples into.
+/// Returns the playback stream handle and a ring buffer producer that the
+/// mixer writes PCM samples into **at the stream's sample rate** (query it
+/// via [`PlaybackStream::sample_rate`]; 48kHz unless the device can't).
+/// `error_flag` is set when the stream reports an error (e.g. the device
+/// disappeared) so the owner can rebuild it.
 pub fn start_playback(
     device_name: Option<&str>,
+    error_flag: Arc<AtomicBool>,
 ) -> Result<(PlaybackStream, ringbuf::HeapProd<f32>)> {
     let device = device::get_output_device(device_name)?;
     let config = device.default_output_config()?;
     let channels = config.channels() as usize;
+    let sample_format = config.sample_format();
 
-    // Try 48kHz first (matches Opus), fall back to device default
-    let (stream_config, actual_rate) = {
-        let fallback_rate = config.sample_rate().0;
-        if fallback_rate == TARGET_SAMPLE_RATE {
-            let cfg = StreamConfig {
-                channels: config.channels(),
-                sample_rate: cpal::SampleRate(TARGET_SAMPLE_RATE),
-                buffer_size: cpal::BufferSize::Default,
-            };
-            (cfg, TARGET_SAMPLE_RATE)
-        } else {
-            let test = StreamConfig {
-                channels: config.channels(),
-                sample_rate: cpal::SampleRate(TARGET_SAMPLE_RATE),
-                buffer_size: cpal::BufferSize::Default,
-            };
-            match device.build_output_stream(
-                &test,
-                |_: &mut [f32], _: &cpal::OutputCallbackInfo| {},
-                |_| {},
-                None,
-            ) {
-                Ok(_dropped) => {
-                    info!(
-                        "device default is {}Hz, overriding to {}Hz",
-                        fallback_rate, TARGET_SAMPLE_RATE
-                    );
-                    let cfg = StreamConfig {
-                        channels: config.channels(),
-                        sample_rate: cpal::SampleRate(TARGET_SAMPLE_RATE),
-                        buffer_size: cpal::BufferSize::Default,
-                    };
-                    (cfg, TARGET_SAMPLE_RATE)
-                }
-                Err(_) => {
-                    warn!(
-                        "device does not support {}Hz, using default {}Hz — audio quality may be degraded",
-                        TARGET_SAMPLE_RATE, fallback_rate
-                    );
-                    let cfg = StreamConfig {
-                        channels: config.channels(),
-                        sample_rate: config.sample_rate(),
-                        buffer_size: cpal::BufferSize::Default,
-                    };
-                    (cfg, fallback_rate)
-                }
-            }
-        }
+    let default_rate = config.sample_rate().0;
+    let actual_rate = if default_rate == TARGET_SAMPLE_RATE
+        || device::output_supports_rate(&device, sample_format, config.channels(), TARGET_SAMPLE_RATE)
+    {
+        TARGET_SAMPLE_RATE
+    } else {
+        warn!(
+            "output device does not support {}Hz, using {}Hz with resampling",
+            TARGET_SAMPLE_RATE, default_rate
+        );
+        default_rate
+    };
+    let stream_config = StreamConfig {
+        channels: config.channels(),
+        sample_rate: cpal::SampleRate(actual_rate),
+        buffer_size: cpal::BufferSize::Default,
     };
 
     info!(
         device = device.name().unwrap_or_default(),
         sample_rate = actual_rate,
         channels,
+        format = ?sample_format,
         "starting audio playback"
     );
 
-    let rb = HeapRb::<f32>::new(PLAYBACK_BUFFER_SIZE);
+    // ~200ms of mono samples at the stream rate
+    let rb = HeapRb::<f32>::new((actual_rate / 5) as usize);
     let (producer, mut consumer) = rb.split();
 
-    let stream = match config.sample_format() {
-        SampleFormat::F32 => device.build_output_stream(
-            &stream_config,
-            move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
-                if channels == 1 {
-                    let read = consumer.pop_slice(data);
-                    // Fade out last samples to avoid click on underrun
-                    if read < data.len() && read > 0 {
-                        let fade_len = read.min(32);
-                        let fade_start = read - fade_len;
-                        for i in 0..fade_len {
-                            data[fade_start + i] *= 1.0 - (i as f32 / fade_len as f32);
-                        }
-                    }
-                    for sample in &mut data[read..] {
-                        *sample = 0.0;
-                    }
-                } else {
-                    // Duplicate mono to all channels, with fade-out on underrun
-                    let mono_frames = data.len() / channels;
-                    let mut last_sample = 0.0f32;
-                    let mut underrun_at = mono_frames; // index where underrun starts
+    let error_cb = {
+        let flag = error_flag.clone();
+        move |err| {
+            error!("audio playback error: {}", err);
+            flag.store(true, Ordering::Relaxed);
+        }
+    };
 
-                    for (i, frame) in data.chunks_mut(channels).enumerate() {
-                        let sample = match consumer.pop_iter().next() {
-                            Some(s) => {
-                                last_sample = s;
-                                s
-                            }
-                            None => {
-                                if underrun_at == mono_frames {
-                                    underrun_at = i;
-                                }
-                                // Fade out over 32 samples from the underrun point
-                                let fade_i = i - underrun_at;
-                                if fade_i < 32 {
-                                    last_sample * (1.0 - fade_i as f32 / 32.0)
-                                } else {
-                                    0.0
-                                }
-                            }
-                        };
-                        for ch in frame.iter_mut() {
-                            *ch = sample;
-                        }
+    let stream = match sample_format {
+        SampleFormat::F32 => {
+            let mut scratch: Vec<f32> = Vec::new();
+            device.build_output_stream(
+                &stream_config,
+                move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
+                    fill_output(&mut consumer, data, channels, &mut scratch);
+                },
+                error_cb,
+                None,
+            )?
+        }
+        SampleFormat::I16 => {
+            let mut scratch: Vec<f32> = Vec::new();
+            let mut frames_f32: Vec<f32> = Vec::new();
+            device.build_output_stream(
+                &stream_config,
+                move |data: &mut [i16], _: &cpal::OutputCallbackInfo| {
+                    frames_f32.clear();
+                    frames_f32.resize(data.len(), 0.0);
+                    fill_output(&mut consumer, &mut frames_f32, channels, &mut scratch);
+                    for (out, &s) in data.iter_mut().zip(frames_f32.iter()) {
+                        *out = (s.clamp(-1.0, 1.0) * i16::MAX as f32) as i16;
                     }
-                }
-            },
-            move |err| {
-                error!("audio playback error: {}", err);
-            },
-            None,
-        )?,
+                },
+                error_cb,
+                None,
+            )?
+        }
         format => anyhow::bail!("unsupported output sample format: {:?}", format),
     };
 

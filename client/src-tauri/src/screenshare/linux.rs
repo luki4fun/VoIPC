@@ -228,12 +228,12 @@ fn run_pipewire_capture(
 ) -> Result<(), String> {
     pipewire::init();
 
-    let mainloop =
-        pipewire::main_loop::MainLoop::new(None).map_err(|e| format!("MainLoop::new: {e}"))?;
-    let context = pipewire::context::Context::new(&mainloop)
-        .map_err(|e| format!("Context::new: {e}"))?;
+    let mainloop = pipewire::main_loop::MainLoopRc::new(None)
+        .map_err(|e| format!("MainLoopRc::new: {e}"))?;
+    let context = pipewire::context::ContextRc::new(&mainloop, None)
+        .map_err(|e| format!("ContextRc::new: {e}"))?;
     let core = context
-        .connect_fd(pw_fd, None)
+        .connect_fd_rc(pw_fd, None)
         .map_err(|e| format!("connect_fd: {e}"))?;
 
     let props = {
@@ -245,8 +245,8 @@ fn run_pipewire_capture(
         }
     };
 
-    let stream = pipewire::stream::Stream::new(&core, "voipc-screenshare", props)
-        .map_err(|e| format!("Stream::new: {e}"))?;
+    let stream = pipewire::stream::StreamRc::new(core.clone(), "voipc-screenshare", props)
+        .map_err(|e| format!("StreamRc::new: {e}"))?;
 
     let format_pod = build_video_format_pod(target_width, target_height, target_fps)?;
 
@@ -295,6 +295,7 @@ fn run_pipewire_capture(
                     frame.stride,
                     frame.fmt,
                 );
+                encode_slot.recycle(frame.pixels);
             }
             info!("PipeWire encode thread stopped");
         })
@@ -308,6 +309,7 @@ fn run_pipewire_capture(
     // ── PipeWire video stream ────────────────────────────────────────────
     // The process callback is now lightweight (memcpy only); encoding
     // happens on the separate encode thread via the FrameSlot.
+    let frame_interval = std::time::Duration::from_secs_f64(1.0 / target_fps.max(1) as f64);
     let capture_state = RefCell::new(PwVideoState {
         slot: slot.clone(),
         reuse_buf: Vec::new(),
@@ -315,6 +317,8 @@ fn run_pipewire_capture(
         negotiated_height: 0,
         negotiated_stride: 0,
         negotiated_format: PixFmt::Unknown,
+        frame_interval,
+        next_frame: Instant::now(),
     });
 
     let _listener = stream
@@ -369,7 +373,24 @@ fn run_pipewire_capture(
                 return; // Format not fully negotiated yet
             }
 
+            // Skip frames above target fps before paying for the memcpy
+            // (buffer is already dequeued; PipeWire recycles it on return).
+            // The deadline advances by one interval rather than resetting to
+            // now, so the average holds at target fps instead of quantizing to
+            // a subharmonic of the compositor's refresh rate (144 Hz → 60 fps
+            // would otherwise give 48). Clamped to now after a stall.
+            let now = Instant::now();
+            if now < state.next_frame {
+                return;
+            }
+            state.next_frame = (state.next_frame + state.frame_interval).max(now);
+
             // Copy frame data out of PipeWire buffer (returned to PipeWire on callback exit).
+            if state.reuse_buf.capacity() == 0 {
+                if let Some(b) = state.slot.take_spare() {
+                    state.reuse_buf = b;
+                }
+            }
             let mut pixels = std::mem::take(&mut state.reuse_buf);
             pixels.clear();
             pixels.extend_from_slice(&raw_data[offset..offset + size]);
@@ -428,8 +449,8 @@ fn run_pipewire_capture(
     };
 
     let audio_stream =
-        pipewire::stream::Stream::new(&core, "voipc-screenshare-audio", audio_props)
-            .map_err(|e| format!("Audio Stream::new: {e}"))?;
+        pipewire::stream::StreamRc::new(core.clone(), "voipc-screenshare-audio", audio_props)
+            .map_err(|e| format!("Audio StreamRc::new: {e}"))?;
 
     let audio_format_pod = build_audio_format_pod()?;
 
@@ -448,6 +469,8 @@ fn run_pipewire_capture(
         channels: 0,
         media_key: media_key.clone(),
         channel_id: channel_id.clone(),
+        resampler: None,
+        mono_buf: Vec::new(),
     });
 
     let _audio_listener = audio_stream
@@ -533,7 +556,9 @@ fn run_pipewire_capture(
 
     let loop_ = mainloop.loop_();
     while active.load(Ordering::Relaxed) {
-        loop_.iterate(std::time::Duration::from_millis(5));
+        loop_.iterate(pipewire::loop_::Timeout::Finite(
+            std::time::Duration::from_millis(5),
+        ));
     }
 
     // Wait for encode thread to finish (it will exit when active becomes false)
@@ -554,6 +579,10 @@ struct PwVideoState {
     negotiated_height: u32,
     negotiated_stride: u32,
     negotiated_format: PixFmt,
+    /// Pace to the target fps: compositors treat the framerate hint as a hint
+    /// and may deliver at native refresh (e.g. 144 Hz).
+    frame_interval: std::time::Duration,
+    next_frame: Instant,
 }
 
 // ── SPA format pod building/parsing ─────────────────────────────────────

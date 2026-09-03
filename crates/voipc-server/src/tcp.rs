@@ -223,8 +223,9 @@ async fn authenticate(
                     if app_version != APP_VERSION {
                         let err_msg = ServerMessage::AuthError {
                             reason: format!(
-                                "version mismatch: client={}, server={}",
-                                app_version, APP_VERSION
+                                "version mismatch: the server runs VoIPC {}, you run {} — \
+                                 please install the matching version",
+                                APP_VERSION, app_version
                             ),
                         };
                         let data = encode_server_msg(&err_msg)?;
@@ -261,7 +262,10 @@ async fn authenticate(
                     }
 
                     let user_id = state.next_user_id();
-                    let session_id = state.next_session_id();
+                    // Deliberately the same value: the client keys per-user
+                    // volume and speaking state by the session_id in voice
+                    // packets, but its UI only knows user_ids.
+                    let session_id = user_id;
 
                     // Atomic username reservation — prevents race between two
                     // simultaneous registrations with the same name
@@ -311,10 +315,14 @@ async fn authenticate(
                         udp_token,
                         tcp_peer_ip,
                         udp_voice_rate: crate::state::RateLimiter::new(55.0, 55.0),
-                        udp_video_rate: crate::state::RateLimiter::new(120.0, 120.0),
+                        // 1200 pkt/s ≈ 12 Mbps at 1280B packets: covers 1080p60
+                        // video (~7.5 Mbps) + screen audio with headroom; burst
+                        // 400 absorbs a full keyframe (up to 255 fragments).
+                        udp_video_rate: crate::state::RateLimiter::new(400.0, 1200.0),
                         global_rate: crate::state::RateLimiter::new(50.0, 50.0),
                         password_attempt_rate: crate::state::RateLimiter::new(3.0, 1.0),
                         chat_rate: crate::state::RateLimiter::new(5.0, 5.0),
+                        keyframe_request_rate: crate::state::RateLimiter::new(2.0, 1.0),
                         create_channel_rate: crate::state::RateLimiter::new(1.0, 0.2),
                         prekey_rate: crate::state::RateLimiter::new(1.0, 0.2),
                         is_screen_sharing: false,
@@ -503,7 +511,16 @@ async fn handle_message(
             handle_stop_watching(state, user_id, session_id, tx).await?;
         }
         ClientMessage::RequestKeyframe { sharer_user_id } => {
-            handle_request_keyframe(state, sharer_user_id).await?;
+            // Forcing IDRs is expensive for the sharer — cap per requester.
+            // Dropped silently: the client re-requests within a second anyway.
+            let allowed = state
+                .sessions
+                .get_mut(&session_id)
+                .map(|mut s| s.keyframe_request_rate.try_consume())
+                .unwrap_or(false);
+            if allowed {
+                handle_request_keyframe(state, sharer_user_id).await?;
+            }
         }
         ClientMessage::Authenticate { .. } => {
             warn!(user_id, "received duplicate Authenticate message, ignoring");

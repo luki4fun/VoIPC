@@ -260,8 +260,7 @@ pub async fn request_screencast(
 
 /// Spawn the screen capture + H.265 encode + fragment task.
 ///
-/// Dispatches to DXGI (display capture) or WGC (window capture) based on
-/// the `CaptureSource` in the session.
+/// Uses Windows.Graphics.Capture (WGC) for both display and window capture.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_capture_task(
     session: &CaptureSession,
@@ -438,6 +437,7 @@ fn run_capture_and_encode(
 
     while let Some(frame) = slot.take() {
         processor.process(&frame.pixels, frame.width, frame.height, frame.stride, frame.fmt);
+        slot.recycle(frame.pixels);
     }
 
     // ── Cleanup ──────────────────────────────────────────────────────────
@@ -525,8 +525,16 @@ fn run_wgc_capture_loop(
     let mut cached_format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT =
         windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT::default();
 
+    // Pace at the loop top so error-path `continue`s can't busy-loop.
+    let mut next_frame = Instant::now();
     while active.load(Ordering::Relaxed) {
-        let frame_start = Instant::now();
+        let now = Instant::now();
+        if now < next_frame {
+            std::thread::sleep(next_frame - now);
+        }
+        // Advance by one interval instead of resetting to now, so the loop
+        // body's own duration doesn't accumulate as drift below target fps.
+        next_frame = (next_frame + frame_interval).max(Instant::now());
 
         if let Ok(frame) = pool.TryGetNextFrame() {
             // Get the D3D11 texture from the captured frame
@@ -645,6 +653,11 @@ fn run_wgc_capture_loop(
             let total_bytes = stride * height;
 
             // Copy pixel data to owned buffer
+            if buf.capacity() == 0 {
+                if let Some(b) = slot.take_spare() {
+                    buf = b;
+                }
+            }
             buf.clear();
             buf.reserve(total_bytes);
             unsafe {
@@ -665,12 +678,6 @@ fn run_wgc_capture_loop(
             if let Some(old) = slot.put(captured) {
                 buf = old.pixels;
             }
-        }
-
-        // Rate-limit to target FPS
-        let elapsed = frame_start.elapsed();
-        if elapsed < frame_interval {
-            std::thread::sleep(frame_interval - elapsed);
         }
     }
 
@@ -813,9 +820,8 @@ fn setup_loopback_audio_inner(
     );
 
     if sample_rate != 48_000 {
-        warn!(
-            "WASAPI loopback sample rate is {}Hz (expected 48000Hz), \
-             audio may not work correctly",
+        info!(
+            "WASAPI loopback sample rate is {}Hz — resampling to 48000Hz",
             sample_rate
         );
     }
@@ -840,6 +846,8 @@ fn setup_loopback_audio_inner(
         channels,
         media_key,
         channel_id,
+        resampler: None,
+        mono_buf: Vec::new(),
     }));
 
     let stream_config = cpal::StreamConfig {

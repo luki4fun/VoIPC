@@ -2,6 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { channels, currentChannelId, previewChannelId, previewUsers } from "../stores/channels.js";
   import { userId } from "../stores/connection.js";
+  import { addNotification } from "../stores/notifications.js";
   import { dmConversations, activeDmUserId, openDm, closeDm, unreadPerChannel, clearChannelUnread } from "../stores/chat.js";
   import Icon from "./Icons.svelte";
 
@@ -61,6 +62,7 @@
       await invoke("join_channel", { channelId, password: null });
     } catch (e) {
       console.error("Failed to join channel:", e);
+      addNotification(`Failed to join channel: ${e}`, "error");
     }
   }
 
@@ -75,6 +77,7 @@
       passwordPromptInput = "";
     } catch (e) {
       console.error("Failed to join channel:", e);
+      addNotification(`Failed to join channel: ${e}`, "error");
     }
   }
 
@@ -96,6 +99,7 @@
       showCreateForm = false;
     } catch (e) {
       console.error("Failed to create channel:", e);
+      addNotification(`Failed to create channel: ${e}`, "error");
     }
   }
 
@@ -123,6 +127,7 @@
       passwordEditInput = "";
     } catch (e) {
       console.error("Failed to change password:", e);
+      addNotification(`Failed to change password: ${e}`, "error");
     }
   }
 

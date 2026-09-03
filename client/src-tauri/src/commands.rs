@@ -83,11 +83,11 @@ pub async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
             task.abort();
         }
 
-        // Drop playback stream and voice/video/screen-audio channels
+        // Drop voice/video/screen-audio channels (the aborted mixer task
+        // owned and released the playback stream)
         drop(connection.voice_tx);
         drop(connection.video_tx);
         drop(connection.screen_audio_tx);
-        drop(connection.playback_stream);
 
         // Clear Signal protocol state to prevent stale sessions on reconnect
         if let Ok(mut sig) = state.signal.lock() {
@@ -579,7 +579,10 @@ pub async fn send_direct_message(
 }
 
 /// Core start-transmit logic, callable from both the Tauri command and the global shortcut handler.
-pub(crate) async fn do_start_transmit(state: &AppState) -> Result<(), String> {
+pub(crate) async fn do_start_transmit(
+    state: &AppState,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
     let mut conn = state.connection.write().await;
     let connection = conn.as_mut().ok_or("Not connected")?;
 
@@ -614,6 +617,9 @@ pub(crate) async fn do_start_transmit(state: &AppState) -> Result<(), String> {
         connection.current_audio_level.clone(),
         connection.noise_suppression.clone(),
         connection.is_muted.clone(),
+        connection.voice_sequence.clone(),
+        state.input_gain.clone(),
+        app_handle,
     );
     connection.capture_task = Some(task);
 
@@ -648,8 +654,11 @@ pub(crate) async fn do_stop_transmit(state: &AppState) -> Result<(), String> {
 
 /// Start transmitting voice (PTT pressed).
 #[tauri::command]
-pub async fn start_transmit(state: State<'_, AppState>) -> Result<(), String> {
-    do_start_transmit(&state).await
+pub async fn start_transmit(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    do_start_transmit(&state, app).await
 }
 
 /// Stop transmitting voice (PTT released).
@@ -798,6 +807,58 @@ pub async fn set_ptt_key(
     Ok(())
 }
 
+/// Shared logic for the optional global toggle hotkeys (empty string = unbind).
+fn set_toggle_key(
+    binding_slot: &std::sync::RwLock<Option<crate::app_state::PttBinding>>,
+    key_code: &str,
+) -> Result<Option<String>, String> {
+    if key_code.is_empty() {
+        *binding_slot.write().unwrap() = None;
+        return Ok(None);
+    }
+    let binding = parse_ptt_binding(key_code)
+        .ok_or_else(|| format!("Unsupported key binding: {key_code}"))?;
+    *binding_slot.write().unwrap() = Some(binding);
+    Ok(Some(key_code.to_string()))
+}
+
+/// Set (or clear, with an empty string) the global mute-toggle hotkey.
+#[tauri::command]
+pub fn set_mute_key(state: State<'_, AppState>, key_code: String) -> Result<(), String> {
+    let stored = set_toggle_key(&state.mute_binding, &key_code)?;
+    let mut config = state.config.lock().unwrap();
+    config.mute_key = stored;
+    if let Err(e) = crate::config::save_config(&config) {
+        tracing::warn!("Failed to save config: {e}");
+    }
+    Ok(())
+}
+
+/// Enable/disable the encrypted chat vault. Disabled = chat is in-memory
+/// only (persistence already no-ops without an unlock key) and the first-run
+/// setup gate is skipped.
+#[tauri::command]
+pub fn set_chat_history_disabled(
+    state: State<'_, AppState>,
+    disabled: bool,
+) -> Result<(), String> {
+    let mut config = state.config.lock().unwrap();
+    config.chat_history_disabled = disabled;
+    crate::config::save_config(&config)
+}
+
+/// Set (or clear, with an empty string) the global deafen-toggle hotkey.
+#[tauri::command]
+pub fn set_deafen_key(state: State<'_, AppState>, key_code: String) -> Result<(), String> {
+    let stored = set_toggle_key(&state.deafen_binding, &key_code)?;
+    let mut config = state.config.lock().unwrap();
+    config.deafen_key = stored;
+    if let Err(e) = crate::config::save_config(&config) {
+        tracing::warn!("Failed to save config: {e}");
+    }
+    Ok(())
+}
+
 /// Set PTT hold mode. When true, for combo bindings (e.g. Ctrl+Space), holding the modifier
 /// keeps PTT active after releasing the trigger key. When false, releasing the trigger key
 /// immediately stops PTT.
@@ -933,7 +994,8 @@ pub async fn set_input_device(
     Ok(())
 }
 
-/// Set the active output device.
+/// Set the active output device. Applies live: the mixer task rebuilds the
+/// playback stream on its next tick.
 #[tauri::command]
 pub async fn set_output_device(
     state: State<'_, AppState>,
@@ -944,10 +1006,17 @@ pub async fn set_output_device(
     drop(settings);
     {
         let mut config = state.config.lock().unwrap();
-        config.output_device = Some(device_name);
+        config.output_device = Some(device_name.clone());
         if let Err(e) = crate::config::save_config(&config) {
             tracing::warn!("Failed to save config: {e}");
         }
+    }
+    let conn = state.connection.read().await;
+    if let Some(connection) = conn.as_ref() {
+        if let Ok(mut live) = connection.output_device_live.lock() {
+            *live = Some(device_name);
+        }
+        connection.playback_restart.store(true, Ordering::Relaxed);
     }
     Ok(())
 }
@@ -968,6 +1037,37 @@ pub async fn set_volume(
         if let Err(e) = crate::config::save_config(&config) {
             tracing::warn!("Failed to save config: {e}");
         }
+    }
+    // Apply live — the mixer reads this every tick
+    let conn = state.connection.read().await;
+    if let Some(connection) = conn.as_ref() {
+        connection.master_volume.store(clamped.to_bits(), Ordering::Relaxed);
+    }
+    Ok(())
+}
+
+/// Voice receive stats: (frames_played, frames_lost) since connect.
+/// The UI polls this and computes a windowed loss percentage.
+#[tauri::command]
+pub async fn get_voice_stats(state: State<'_, AppState>) -> Result<(u32, u32), String> {
+    let conn = state.connection.read().await;
+    let connection = conn.as_ref().ok_or("Not connected")?;
+    Ok((
+        connection.voice_frames_played.load(Ordering::Relaxed),
+        connection.voice_frames_lost.load(Ordering::Relaxed),
+    ))
+}
+
+/// Set the capture-side mic gain (1.0 = unity). Applies live — the audio
+/// callback reads it per buffer.
+#[tauri::command]
+pub fn set_input_gain(state: State<'_, AppState>, gain: f32) -> Result<(), String> {
+    let clamped = gain.clamp(0.0, 4.0);
+    state.input_gain.store(clamped.to_bits(), Ordering::Relaxed);
+    let mut config = state.config.lock().unwrap();
+    config.input_gain = clamped;
+    if let Err(e) = crate::config::save_config(&config) {
+        tracing::warn!("Failed to save config: {e}");
     }
     Ok(())
 }
@@ -1208,6 +1308,8 @@ pub async fn start_screen_capture(
 
         let res = voipc_video::Resolution::from_height(resolution)
             .ok_or_else(|| format!("Unsupported resolution: {}", resolution))?;
+        // Guard against fps=0 (division by zero in pacing/keyframe interval).
+        let fps = fps.clamp(1, 60);
 
         connection.screen_share_active.store(true, Ordering::Relaxed);
 
@@ -1220,7 +1322,7 @@ pub async fn start_screen_capture(
             res.width(),
             res.height(),
             fps,
-            res.bitrate_kbps(),
+            res.bitrate_kbps_at(fps),
             connection.session_id,
             connection.udp_token,
             connection.screen_share_active.clone(),
@@ -1303,6 +1405,8 @@ pub async fn switch_screen_share_source(
 
         let res = voipc_video::Resolution::from_height(resolution)
             .ok_or_else(|| format!("Unsupported resolution: {}", resolution))?;
+        // Guard against fps=0 (division by zero in pacing/keyframe interval).
+        let fps = fps.clamp(1, 60);
 
         connection
             .screen_share_active
@@ -1321,7 +1425,7 @@ pub async fn switch_screen_share_source(
             res.width(),
             res.height(),
             fps,
-            res.bitrate_kbps(),
+            res.bitrate_kbps_at(fps),
             connection.session_id,
             connection.udp_token,
             connection.screen_share_active.clone(),
@@ -1410,6 +1514,73 @@ pub async fn get_audio_level(state: State<'_, AppState>) -> Result<f32, String> 
     let connection = conn.as_ref().ok_or("Not connected")?;
     let raw = connection.current_audio_level.load(Ordering::Relaxed);
     Ok(raw as f32 / 100.0)
+}
+
+/// Start the settings-panel mic test: captures from the current input device
+/// and emits `mic-test-level` events ({"db": dBFS}, ~20 Hz) until stopped.
+/// Refused while transmitting — the capture device is in use.
+#[tauri::command]
+pub async fn start_mic_test(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = (state, app);
+        return Err("Mic test not available on Android".into());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        {
+            let conn = state.connection.read().await;
+            if let Some(c) = conn.as_ref() {
+                if c.transmitting.load(Ordering::Relaxed) {
+                    return Err("Cannot test microphone while transmitting".into());
+                }
+            }
+        }
+        if state.mic_test_active.swap(true, Ordering::Relaxed) {
+            return Ok(()); // already running
+        }
+        let active = state.mic_test_active.clone();
+        let gain = state.input_gain.clone();
+        let device = state.settings.read().await.input_device.clone();
+        tokio::task::spawn_blocking(move || {
+            use tauri::Emitter as _;
+            let error_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (_stream, mut consumer) =
+                match voipc_audio::capture::start_capture(device.as_deref(), error_flag, gain) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        active.store(false, Ordering::Relaxed);
+                        let _ = app.emit(
+                            "mic-test-error",
+                            serde_json::json!({"error": e.to_string()}),
+                        );
+                        return;
+                    }
+                };
+            let mut buf = vec![0.0f32; 2400]; // 50ms at 48kHz
+            while active.load(Ordering::Relaxed) {
+                let read = ringbuf::traits::Consumer::pop_slice(&mut consumer, &mut buf);
+                if read > 0 {
+                    let rms = (buf[..read].iter().map(|s| s * s).sum::<f32>()
+                        / read as f32)
+                        .sqrt();
+                    let db = if rms > 0.0 { 20.0 * rms.log10() } else { -100.0 };
+                    let _ = app.emit("mic-test-level", serde_json::json!({"db": db}));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+        });
+        Ok(())
+    }
+}
+
+/// Stop the mic test (no-op if not running).
+#[tauri::command]
+pub fn stop_mic_test(state: State<'_, AppState>) {
+    state.mic_test_active.store(false, Ordering::Relaxed);
 }
 
 // ---------------------------------------------------------------------------
@@ -2012,6 +2183,52 @@ pub fn save_connection_info(
     crate::config::save_config(&config)
 }
 
+/// Add or update a saved server (keyed by host:port). Returns the new list.
+#[tauri::command]
+pub fn save_server(
+    state: State<'_, AppState>,
+    name: String,
+    host: String,
+    port: u16,
+    username: String,
+    accept_self_signed: bool,
+) -> Result<Vec<crate::config::SavedServer>, String> {
+    let mut config = state.config.lock().unwrap();
+    let entry = crate::config::SavedServer {
+        name,
+        host,
+        port,
+        username,
+        accept_self_signed,
+    };
+    if let Some(existing) = config
+        .saved_servers
+        .iter_mut()
+        .find(|s| s.host == entry.host && s.port == entry.port)
+    {
+        *existing = entry;
+    } else {
+        config.saved_servers.push(entry);
+    }
+    crate::config::save_config(&config)?;
+    Ok(config.saved_servers.clone())
+}
+
+/// Remove a saved server by host:port. Returns the new list.
+#[tauri::command]
+pub fn remove_server(
+    state: State<'_, AppState>,
+    host: String,
+    port: u16,
+) -> Result<Vec<crate::config::SavedServer>, String> {
+    let mut config = state.config.lock().unwrap();
+    config
+        .saved_servers
+        .retain(|s| !(s.host == host && s.port == port));
+    crate::config::save_config(&config)?;
+    Ok(config.saved_servers.clone())
+}
+
 /// Reset all settings to defaults and delete the config file.
 #[tauri::command]
 pub async fn reset_config(state: State<'_, AppState>) -> Result<(), String> {
@@ -2027,6 +2244,9 @@ pub async fn reset_config(state: State<'_, AppState>) -> Result<(), String> {
         *ptt = crate::app_state::PttBinding::default();
     }
     state.ptt_hold_mode.store(true, Ordering::Relaxed);
+    state.input_gain.store(1.0f32.to_bits(), Ordering::Relaxed);
+    *state.mute_binding.write().unwrap() = None;
+    *state.deafen_binding.write().unwrap() = None;
 
     // Reset config
     {

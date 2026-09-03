@@ -34,6 +34,25 @@ body {
   height: 100vh;
 }
 
+/* WebKitGTK paints native (white) selects unless appearance is disabled —
+   force themed rendering + our own chevron for every dropdown */
+select {
+  appearance: none;
+  -webkit-appearance: none;
+  background-color: var(--bg-tertiary);
+  color: var(--text-primary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23a0a0a0' stroke-width='1.5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 10px center;
+}
+
+select option {
+  background-color: var(--bg-secondary);
+  color: var(--text-primary);
+}
+
 /* Apply user-select: none to UI chrome, not globally */
 .titlebar, .voice-controls, .status-bar,
 button, .channel-list .header, .user-list .header {

@@ -78,8 +78,10 @@ $dllStaging = "$PSScriptRoot\client\src-tauri\external-dlls"
 if (Test-Path $dllStaging) { Remove-Item $dllStaging -Recurse -Force }
 New-Item -ItemType Directory -Path $dllStaging | Out-Null
 
-# Copy FFmpeg, x265, and transitive dependency DLLs from vcpkg
-$dllPatterns = @("av*.dll", "sw*.dll", "x265*.dll", "libx265*.dll", "postproc*.dll", "turbojpeg.dll")
+# Copy FFmpeg, x265, and transitive dependency DLLs from vcpkg.
+# vpl/libvpl: Intel oneVPL dispatcher pulled in by ffmpeg[qsv] (NVENC/AMF need
+# no DLLs — they load from the GPU driver at runtime).
+$dllPatterns = @("av*.dll", "sw*.dll", "x265*.dll", "libx265*.dll", "postproc*.dll", "turbojpeg.dll", "vpl*.dll", "libvpl*.dll")
 foreach ($pattern in $dllPatterns) {
     Get-ChildItem "$vcpkgBin\$pattern" -ErrorAction SilentlyContinue |
         Copy-Item -Destination $dllStaging

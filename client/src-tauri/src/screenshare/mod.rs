@@ -156,6 +156,10 @@ pub(crate) struct FrameSlot {
     frame: std::sync::Mutex<Option<CapturedFrame>>,
     notify: std::sync::Condvar,
     active: Arc<AtomicBool>,
+    /// Consumed pixel buffers returned by the encode thread for reuse.
+    /// Without this, `put` only hands back a buffer when it displaces an
+    /// unconsumed frame — i.e. the keeping-up case allocates every frame.
+    spare: std::sync::Mutex<Vec<Vec<u8>>>,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -165,7 +169,22 @@ impl FrameSlot {
             frame: std::sync::Mutex::new(None),
             notify: std::sync::Condvar::new(),
             active,
+            spare: std::sync::Mutex::new(Vec::new()),
         }
+    }
+
+    /// Return a consumed frame's buffer to the capture thread (capped at 2).
+    pub fn recycle(&self, mut buf: Vec<u8>) {
+        buf.clear();
+        let mut spares = self.spare.lock().unwrap_or_else(|p| p.into_inner());
+        if spares.len() < 2 {
+            spares.push(buf);
+        }
+    }
+
+    /// Grab a recycled buffer, if one is available.
+    pub fn take_spare(&self) -> Option<Vec<u8>> {
+        self.spare.lock().unwrap_or_else(|p| p.into_inner()).pop()
     }
 
     /// Store a new frame, returning the old one (if any) for buffer reuse.
@@ -197,6 +216,16 @@ impl FrameSlot {
 
 // ── Shared frame processing pipeline ─────────────────────────────────────
 
+/// Video frame_id and screen-audio sequence feed the AES-GCM nonce
+/// (session_id ‖ counter ‖ type/fragment) under the channel media key, which
+/// outlives individual shares — so the counters must never restart while the
+/// process runs, or share #2 would reuse share #1's nonces. Process-wide
+/// monotonic, same reasoning as `voice_sequence` on the connection.
+#[cfg(not(target_os = "android"))]
+static SHARE_FRAME_ID: AtomicU32 = AtomicU32::new(0);
+#[cfg(not(target_os = "android"))]
+static SHARE_AUDIO_SEQ: AtomicU32 = AtomicU32::new(0);
+
 #[cfg(not(target_os = "android"))]
 /// State for the encode → fragment → encrypt → send video pipeline.
 /// Used by both Linux (PipeWire) and Windows (WGC) capture backends.
@@ -206,6 +235,8 @@ pub(crate) struct FrameProcessor {
     pub full_res_i420_buf: Vec<u8>,
     /// SIMD-accelerated BGRA/RGBA → YUV420P converter (lazy-initialized on first frame).
     pub converter: Option<convert::FrameConverter>,
+    /// Current frame's id — assigned from [`SHARE_FRAME_ID`] per frame, never
+    /// incremented locally (nonce uniqueness across share sessions).
     pub frame_id: u32,
     pub keyframe_interval: u32,
     pub start_time: Instant,
@@ -242,21 +273,38 @@ impl FrameProcessor {
             PixFmt::Unknown => return,
         };
 
+        // Rebuild the converter if the source changed size or pixel format
+        // (portal renegotiation, window resize) — a stale SwsContext would read
+        // with the old stride, or swap red and blue.
+        if self.converter.as_ref().is_some_and(|c| {
+            c.src_dims() != (src_w as u32, src_h as u32) || c.input_format() != ffmpeg_fmt
+        }) {
+            info!(
+                "source format changed to {}x{} {:?} — rebuilding converter",
+                src_w, src_h, fmt
+            );
+            self.converter = None;
+        }
+
         // Lazy-init the SIMD converter on first frame (or if source dimensions change)
         let converter = match &mut self.converter {
             Some(c) => c,
             None => {
+                // Output format must match what the encoder was opened with
+                // (NV12 for QSV, YUV420P otherwise).
+                let enc_pf = self.encoder.pixel_format();
                 match convert::FrameConverter::new(
                     ffmpeg_fmt,
                     src_w as u32,
                     src_h as u32,
                     tw,
                     th,
+                    enc_pf,
                 ) {
                     Ok(c) => {
                         info!(
-                            "FrameConverter: initialized SwsContext ({}x{} {:?} → {}x{} YUV420P)",
-                            src_w, src_h, fmt, tw, th
+                            "FrameConverter: initialized SwsContext ({}x{} {:?} → {}x{} {:?})",
+                            src_w, src_h, fmt, tw, th, enc_pf
                         );
                         self.converter = Some(c);
                         self.converter.as_mut().unwrap()
@@ -282,6 +330,7 @@ impl FrameProcessor {
             }
         };
 
+        self.frame_id = SHARE_FRAME_ID.fetch_add(1, Ordering::Relaxed);
         let force_keyframe = self.keyframe_requested.swap(false, Ordering::Relaxed)
             || (self.frame_id % self.keyframe_interval == 0);
 
@@ -290,7 +339,6 @@ impl FrameProcessor {
             Ok(frames) => frames,
             Err(e) => {
                 warn!("H.265 encode error: {}", e);
-                self.frame_id = self.frame_id.saturating_add(1);
                 return;
             }
         };
@@ -357,6 +405,7 @@ impl FrameProcessor {
             }
         }
 
+        self.frame_id = SHARE_FRAME_ID.fetch_add(1, Ordering::Relaxed);
         let force_keyframe = self.keyframe_requested.swap(false, Ordering::Relaxed)
             || (self.frame_id % self.keyframe_interval == 0);
 
@@ -369,7 +418,6 @@ impl FrameProcessor {
                 Ok(frames) => frames,
                 Err(e) => {
                     warn!("H.265 encode error (scalar fallback): {}", e);
-                    self.frame_id = self.frame_id.saturating_add(1);
                     return;
                 }
             };
@@ -387,12 +435,19 @@ impl FrameProcessor {
         let mut total_bytes: u64 = 0;
         let mut send_failed = false;
 
-        for ef in encoded_frames {
-            let key_guard = self.media_key.lock().unwrap_or_else(|poisoned| {
+        // Clone the key (small: id + 32B) instead of holding the mutex across
+        // fragmenting/encrypting/sending — voice paths share this mutex.
+        let key_opt = self
+            .media_key
+            .lock()
+            .unwrap_or_else(|poisoned| {
                 warn!("media key mutex poisoned — recovering");
                 poisoned.into_inner()
-            });
-            let key_opt = key_guard.as_ref();
+            })
+            .clone();
+        let key_opt = key_opt.as_ref();
+
+        for ef in encoded_frames {
 
             // Use smaller fragment size when encrypting to account for
             // GCM tag (16B) + key_id header (2B) — keeps total packet
@@ -425,7 +480,6 @@ impl FrameProcessor {
                         self.video_tx.capacity(), fragment_count, self.frame_id
                     );
                     self.keyframe_requested.store(true, Ordering::Relaxed);
-                    send_failed = true;
                     break;
                 }
             } else {
@@ -472,12 +526,31 @@ impl FrameProcessor {
                 let byte_len = bytes.len() as u64;
 
                 if must_block {
-                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                        if handle.block_on(self.video_tx.send(bytes)).is_err() {
-                            self.active.store(false, Ordering::Relaxed);
-                            return;
+                    // Wait for room rather than corrupt the frame, but stay
+                    // interruptible: teardown signals only through `active`,
+                    // and the stop/switch paths drop the task handle after a
+                    // short timeout, so a parked send would strand this
+                    // pipeline (and its encoder and capture session) alongside
+                    // the next one.
+                    let mut pending = bytes;
+                    loop {
+                        match self.video_tx.try_send(pending) {
+                            Ok(()) => {
+                                total_bytes += byte_len;
+                                break;
+                            }
+                            Err(mpsc::error::TrySendError::Full(returned)) => {
+                                if !self.active.load(Ordering::Relaxed) {
+                                    return;
+                                }
+                                pending = returned;
+                                std::thread::sleep(Duration::from_millis(2));
+                            }
+                            Err(mpsc::error::TrySendError::Closed(_)) => {
+                                self.active.store(false, Ordering::Relaxed);
+                                return;
+                            }
                         }
-                        total_bytes += byte_len;
                     }
                 } else {
                     match self.video_tx.try_send(bytes) {
@@ -507,7 +580,6 @@ impl FrameProcessor {
 
         self.frames_sent.fetch_add(1, Ordering::Relaxed);
         self.bytes_sent.fetch_add(total_bytes, Ordering::Relaxed);
-        self.frame_id = self.frame_id.saturating_add(1);
     }
 }
 
@@ -530,6 +602,12 @@ pub(crate) struct AudioProcessor {
     pub channels: u32,
     pub media_key: Arc<std::sync::Mutex<Option<voipc_crypto::MediaKey>>>,
     pub channel_id: Arc<AtomicU32>,
+    /// Device-rate → 48kHz resampler, lazily built when `sample_rate` isn't
+    /// 48kHz (WASAPI loopback runs at the output device's rate). Keyed by the
+    /// rate it was built for so a renegotiation rebuilds it.
+    pub resampler: Option<(u32, voipc_audio::resample::LinearResampler)>,
+    /// Scratch for the downmixed mono chunk before resampling.
+    pub mono_buf: Vec<f32>,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -556,16 +634,40 @@ impl AudioProcessor {
             unsafe { std::slice::from_raw_parts(raw_data.as_ptr() as *const f32, sample_count) };
 
         let frame_count = sample_count / channels;
-        for i in 0..frame_count {
-            let mut sum = 0.0f32;
-            for ch in 0..channels {
-                sum += samples[i * channels + ch];
+        let rate = self.sample_rate;
+        if rate != 0 && rate != 48_000 {
+            // Device delivers at its own rate (WASAPI loopback especially);
+            // Opus frames must be 48kHz — downmix, then resample into the
+            // accumulator. Without this the audio plays pitch-shifted.
+            self.mono_buf.clear();
+            for i in 0..frame_count {
+                let mut sum = 0.0f32;
+                for ch in 0..channels {
+                    sum += samples[i * channels + ch];
+                }
+                self.mono_buf.push(sum / channels as f32);
             }
-            self.accumulator.push(sum / channels as f32);
+            if self.resampler.as_ref().is_none_or(|(r, _)| *r != rate) {
+                self.resampler =
+                    Some((rate, voipc_audio::resample::LinearResampler::new(rate, 48_000)));
+            }
+            let (_, resampler) = self.resampler.as_mut().expect("just set");
+            resampler.process(&self.mono_buf, &mut self.accumulator);
+        } else {
+            for i in 0..frame_count {
+                let mut sum = 0.0f32;
+                for ch in 0..channels {
+                    sum += samples[i * channels + ch];
+                }
+                self.accumulator.push(sum / channels as f32);
+            }
         }
 
         while self.accumulator.len() >= SCREEN_AUDIO_FRAME_SIZE {
             let frame: Vec<f32> = self.accumulator.drain(..SCREEN_AUDIO_FRAME_SIZE).collect();
+            // Assigned per frame, never incremented locally (nonce uniqueness
+            // across share sessions — see SHARE_AUDIO_SEQ).
+            self.sequence = SHARE_AUDIO_SEQ.fetch_add(1, Ordering::Relaxed);
 
             let opus_data = match encoder.encode(&frame) {
                 Ok(data) => data,
@@ -577,13 +679,17 @@ impl AudioProcessor {
 
             let timestamp = self.start_time.elapsed().as_millis() as u32;
 
-            let key_guard = self.media_key.lock().unwrap_or_else(|poisoned| {
-                warn!("media key mutex poisoned — recovering");
-                poisoned.into_inner()
-            });
-            let key_opt = key_guard.as_ref();
+            // Clone instead of holding the shared mutex across encrypt+send.
+            let key_opt = self
+                .media_key
+                .lock()
+                .unwrap_or_else(|poisoned| {
+                    warn!("media key mutex poisoned — recovering");
+                    poisoned.into_inner()
+                })
+                .clone();
 
-            let packet = if let Some(key) = key_opt {
+            let packet = if let Some(key) = key_opt.as_ref() {
                 let ch_id = self.channel_id.load(Ordering::Relaxed);
                 let aad = voipc_crypto::media_keys::build_aad(ch_id, 0x15);
                 match voipc_crypto::media_encrypt(
@@ -604,7 +710,6 @@ impl AudioProcessor {
                     ),
                     Err(e) => {
                         warn!("Screen audio encryption failed: {}", e);
-                        self.sequence = self.sequence.saturating_add(1);
                         continue;
                     }
                 }
@@ -617,7 +722,6 @@ impl AudioProcessor {
                     opus_data,
                 )
             };
-            self.sequence = self.sequence.saturating_add(1);
 
             match self.audio_tx.try_send(packet.to_bytes()) {
                 Ok(()) => {
@@ -657,8 +761,7 @@ pub(crate) fn strip_stride_padding(
 
 // ── Frame decoding (viewer side — cross-platform) ────────────────────────
 
-// On Android, FrameDecodeBuffers and render_frame will be reimplemented
-// in Phase 3 using a Rust-only JPEG encoder or direct frame passing.
+// Android uses the pure-Rust image-crate path further up (no turbojpeg on NDK).
 #[cfg(not(target_os = "android"))]
 /// Reusable state for frame decoding + JPEG encoding.
 pub struct FrameDecodeBuffers {

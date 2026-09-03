@@ -11,6 +11,8 @@ pub fn spawn_listener(
     _handle: tauri::AppHandle,
     _ptt_binding: std::sync::Arc<std::sync::RwLock<crate::app_state::PttBinding>>,
     _ptt_hold_mode: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    _mute_binding: std::sync::Arc<std::sync::RwLock<Option<crate::app_state::PttBinding>>>,
+    _deafen_binding: std::sync::Arc<std::sync::RwLock<Option<crate::app_state::PttBinding>>>,
 ) {
     tracing::info!("Global PTT: not available on Android (using touch UI + volume keys)");
 }
@@ -37,6 +39,8 @@ pub fn spawn_listener(
     handle: tauri::AppHandle,
     ptt_binding: Arc<std::sync::RwLock<PttBinding>>,
     ptt_hold_mode: Arc<AtomicBool>,
+    mute_binding: Arc<std::sync::RwLock<Option<PttBinding>>>,
+    deafen_binding: Arc<std::sync::RwLock<Option<PttBinding>>>,
 ) {
     std::thread::spawn(move || {
         // On Linux, try evdev first (best — works on Wayland + X11).
@@ -49,7 +53,14 @@ pub fn spawn_listener(
                     "Global PTT: monitoring {} keyboard(s) via evdev",
                     keyboards.len()
                 );
-                run_evdev_loop(keyboards, &handle, &ptt_binding, &ptt_hold_mode);
+                run_evdev_loop(
+                    keyboards,
+                    &handle,
+                    &ptt_binding,
+                    &ptt_hold_mode,
+                    &mute_binding,
+                    &deafen_binding,
+                );
                 return;
             }
             tracing::info!(
@@ -58,8 +69,26 @@ pub fn spawn_listener(
             );
         }
 
-        run_rdev_loop(handle, ptt_binding, ptt_hold_mode);
+        run_rdev_loop(handle, ptt_binding, ptt_hold_mode, mute_binding, deafen_binding);
     });
+}
+
+/// Edge-triggered toggle hotkey: emit `event` once when the binding becomes
+/// fully held; re-arm when any of its keys is released. The frontend listens
+/// and runs its normal mute/deafen toggle path (same events as the tray menu).
+#[cfg(not(target_os = "android"))]
+fn check_toggle_hotkey(
+    handle: &tauri::AppHandle,
+    matches: bool,
+    active: &mut bool,
+    event: &'static str,
+) {
+    if matches && !*active {
+        *active = true;
+        let _ = handle.emit(event, ());
+    } else if !matches {
+        *active = false;
+    }
 }
 
 // ===========================================================================
@@ -198,14 +227,34 @@ fn run_rdev_loop(
     handle: tauri::AppHandle,
     ptt_binding: Arc<std::sync::RwLock<PttBinding>>,
     ptt_hold_mode: Arc<AtomicBool>,
+    mute_binding: Arc<std::sync::RwLock<Option<PttBinding>>>,
+    deafen_binding: Arc<std::sync::RwLock<Option<PttBinding>>>,
 ) {
     let mut held_keys = HashSet::new();
     let mut ptt_active = false;
+    let mut mute_active = false;
+    let mut deafen_active = false;
 
     let callback = move |event: rdev::Event| {
+        // Mute/deafen toggle hotkeys — checked on every key transition
+        let update_toggles = |held: &HashSet<rdev::Key>,
+                              mute_active: &mut bool,
+                              deafen_active: &mut bool,
+                              handle: &tauri::AppHandle| {
+            let m = mute_binding.read().unwrap_or_else(|p| p.into_inner());
+            let m_match = m.as_ref().is_some_and(|b| rdev_binding_matches(held, b));
+            drop(m);
+            check_toggle_hotkey(handle, m_match, mute_active, "toggle-mute-request");
+            let d = deafen_binding.read().unwrap_or_else(|p| p.into_inner());
+            let d_match = d.as_ref().is_some_and(|b| rdev_binding_matches(held, b));
+            drop(d);
+            check_toggle_hotkey(handle, d_match, deafen_active, "toggle-deafen-request");
+        };
+
         match event.event_type {
             rdev::EventType::KeyPress(key) => {
                 held_keys.insert(key);
+                update_toggles(&held_keys, &mut mute_active, &mut deafen_active, &handle);
                 let b = ptt_binding.read().unwrap_or_else(|p| p.into_inner());
                 let matches = rdev_binding_matches(&held_keys, &b);
                 drop(b);
@@ -228,7 +277,7 @@ fn run_rdev_loop(
                                 return;
                             }
                         }
-                        if let Err(e) = commands::do_start_transmit(&state).await {
+                        if let Err(e) = commands::do_start_transmit(&state, h.clone()).await {
                             tracing::warn!("Global PTT start failed: {e}");
                         } else {
                             let _ = h.emit("ptt-global-pressed", ());
@@ -238,6 +287,7 @@ fn run_rdev_loop(
             }
             rdev::EventType::KeyRelease(key) => {
                 held_keys.remove(&key);
+                update_toggles(&held_keys, &mut mute_active, &mut deafen_active, &handle);
                 let b = ptt_binding.read().unwrap_or_else(|p| p.into_inner());
                 let hold = ptt_hold_mode.load(Ordering::Relaxed);
                 let still = if hold {
@@ -434,9 +484,26 @@ fn run_evdev_loop(
     handle: &tauri::AppHandle,
     ptt_binding: &Arc<std::sync::RwLock<PttBinding>>,
     ptt_hold_mode: &Arc<AtomicBool>,
+    mute_binding: &Arc<std::sync::RwLock<Option<PttBinding>>>,
+    deafen_binding: &Arc<std::sync::RwLock<Option<PttBinding>>>,
 ) {
     use evdev::{InputEventKind, Key};
     use std::os::unix::io::AsRawFd;
+
+    let mut mute_active = false;
+    let mut deafen_active = false;
+    let update_toggles = |held: &HashSet<Key>,
+                          mute_active: &mut bool,
+                          deafen_active: &mut bool| {
+        let m = mute_binding.read().unwrap_or_else(|p| p.into_inner());
+        let m_match = m.as_ref().is_some_and(|b| evdev_binding_matches(held, b));
+        drop(m);
+        check_toggle_hotkey(handle, m_match, mute_active, "toggle-mute-request");
+        let d = deafen_binding.read().unwrap_or_else(|p| p.into_inner());
+        let d_match = d.as_ref().is_some_and(|b| evdev_binding_matches(held, b));
+        drop(d);
+        check_toggle_hotkey(handle, d_match, deafen_active, "toggle-deafen-request");
+    };
 
     // Set all devices to non-blocking mode via fcntl
     for dev in &devices {
@@ -475,6 +542,7 @@ fn run_evdev_loop(
                                 1 => {
                                     // Key press
                                     held_keys.insert(key);
+                                    update_toggles(&held_keys, &mut mute_active, &mut deafen_active);
                                     let b = ptt_binding.read().unwrap_or_else(|p| p.into_inner());
                                     let matches =
                                         evdev_binding_matches(&held_keys, &b);
@@ -505,6 +573,7 @@ fn run_evdev_loop(
                                             if let Err(e) =
                                                 commands::do_start_transmit(
                                                     &state,
+                                                    h.clone(),
                                                 )
                                                 .await
                                             {
@@ -523,6 +592,7 @@ fn run_evdev_loop(
                                 0 => {
                                     // Key release
                                     held_keys.remove(&key);
+                                    update_toggles(&held_keys, &mut mute_active, &mut deafen_active);
                                     let b = ptt_binding.read().unwrap_or_else(|p| p.into_inner());
                                     let hold =
                                         ptt_hold_mode.load(Ordering::Relaxed);

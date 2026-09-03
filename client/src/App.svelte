@@ -31,7 +31,7 @@
   } from "./lib/stores/connection.js";
   import { channels, currentChannelId, previewChannelId, previewUsers } from "./lib/stores/channels.js";
   import { users, speakingUsers } from "./lib/stores/users.js";
-  import { addNotification } from "./lib/stores/notifications.js";
+  import { addNotification, removeNotification } from "./lib/stores/notifications.js";
   import { pendingInvites } from "./lib/stores/invites.js";
   import { pendingPokes, createPoke } from "./lib/stores/pokes.js";
   import {
@@ -58,7 +58,12 @@
     lastUsername,
     lastAcceptSelfSigned,
     autoConnect,
+    savedServers,
     soundSettings,
+    inputGain,
+    muteKey,
+    deafenKey,
+    chatHistoryDisabled,
   } from "./lib/stores/settings.js";
   import type { AppConfig } from "./lib/stores/settings.js";
   import { voiceMode, vadThreshold } from "./lib/stores/voice.js";
@@ -110,6 +115,24 @@
 
   // Deferred auto-connect: waits for chat history to be unlocked first
   let pendingAutoConnect = $state<AppConfig | null>(null);
+  let udpDeadToastId: number | null = null;
+  // Chat pane below the screen-share viewer (desktop)
+  let viewerChatOpen = $state(true);
+
+  // OS notification when the window is not focused (DMs and pokes)
+  async function notifyUnfocused(title: string, body: string) {
+    if (document.hasFocus()) return;
+    try {
+      const notif = await import("@tauri-apps/plugin-notification");
+      let granted = await notif.isPermissionGranted();
+      if (!granted) {
+        granted = (await notif.requestPermission()) === "granted";
+      }
+      if (granted) notif.sendNotification({ title, body });
+    } catch (e) {
+      console.error("Desktop notification failed:", e);
+    }
+  }
 
   async function performAutoConnect(config: AppConfig) {
     connectionState.set("connecting");
@@ -181,14 +204,21 @@
     return () => { if (timer) clearTimeout(timer); };
   });
 
-  async function startReconnect(address: string, name: string, previousChannelId: number) {
+  async function startReconnect(
+    address: string,
+    name: string,
+    previousChannelId: number,
+    initialError = "",
+  ) {
     reconnectAttempt = 0;
     reconnectCancelled = false;
-    reconnectError = "";
+    reconnectError = initialError;
     connectionState.set("reconnecting");
 
     const startTime = Date.now();
-    const RECONNECT_TIMEOUT_MS = 30_000;
+    // Generous budget: a Wi-Fi roam, VPN flap, or laptop lid-close should
+    // not end the session. The overlay has a Cancel button for giving up.
+    const RECONNECT_TIMEOUT_MS = 300_000;
 
     while (!reconnectCancelled) {
       reconnectAttempt++;
@@ -198,7 +228,7 @@
       await new Promise((resolve) => setTimeout(resolve, delay));
       if (reconnectCancelled) break;
 
-      // Give up after 30 seconds
+      // Give up after the reconnect budget
       if (Date.now() - startTime > RECONNECT_TIMEOUT_MS) {
         addNotification("Reconnection timed out. Please reconnect manually.", "error");
         reconnectError = "";
@@ -273,6 +303,11 @@
       isDeafened.set(config.deafened);
       soundSettings.set(config.sounds);
       autoConnect.set(config.auto_connect);
+      savedServers.set(config.saved_servers ?? []);
+      inputGain.set(config.input_gain ?? 1.0);
+      muteKey.set(config.mute_key ?? "");
+      deafenKey.set(config.deafen_key ?? "");
+      chatHistoryDisabled.set(config.chat_history_disabled ?? false);
       if (config.input_device) inputDevice.set(config.input_device);
       if (config.output_device) outputDevice.set(config.output_device);
       rememberConnection.set(config.remember_connection);
@@ -413,7 +448,9 @@
       }),
 
       listen<{ reason: string }>("connection-lost", (event) => {
-        console.error("Connection lost:", event.payload.reason);
+        const reason = event.payload.reason;
+        console.error("Connection lost:", reason);
+        addNotification(`Connection lost: ${reason}`, "error");
 
         // Clear screenshare state
         resetScreenShareState();
@@ -428,10 +465,51 @@
           const addr = $serverAddress;
           const name = $username;
           const prevChannel = $currentChannelId;
-          startReconnect(addr, name, prevChannel);
+          startReconnect(addr, name, prevChannel, reason);
         } else {
           connectionState.set("disconnected");
         }
+      }),
+
+      listen<{ error: string }>("audio-device-error", (event) => {
+        addNotification(
+          `Audio device error: ${event.payload.error} — retrying…`,
+          "error",
+        );
+      }),
+
+      listen("audio-device-restored", () => {
+        addNotification("Audio device restored", "info");
+      }),
+
+      listen("udp-dead", () => {
+        if (udpDeadToastId === null) {
+          udpDeadToastId = addNotification(
+            "Voice connection lost (UDP blocked — check firewall/NAT). Still trying…",
+            "error",
+            0,
+          );
+        }
+      }),
+
+      listen("udp-restored", () => {
+        if (udpDeadToastId !== null) {
+          removeNotification(udpDeadToastId);
+          udpDeadToastId = null;
+        }
+        addNotification("Voice connection restored", "info");
+      }),
+
+      listen<{ user_id: number }>("identity-key-changed", (event) => {
+        const uid = event.payload.user_id;
+        const name =
+          $users.find((u) => u.user_id === uid)?.username ?? `User ${uid}`;
+        addNotification(
+          `Security warning: ${name}'s encryption identity changed. ` +
+            `Verify with them out-of-band before trusting messages.`,
+          "error",
+          0,
+        );
       }),
 
       listen<ChannelInfo>("channel-created", (event) => {
@@ -518,6 +596,10 @@
             ),
           ]);
           playPokeSound();
+          notifyUnfocused(
+            `Poke from ${event.payload.from_username}`,
+            event.payload.message || "",
+          );
         }
       ),
 
@@ -557,7 +639,10 @@
           content,
           timestamp,
         });
-        if (from_user_id !== myId) playDirectMessageSound();
+        if (from_user_id !== myId) {
+          playDirectMessageSound();
+          notifyUnfocused(from_username, content.slice(0, 140));
+        }
       }),
 
       // Screen share events
@@ -616,7 +701,10 @@
           invoke("start_screen_capture", {
             resolution: $shareResolution,
             fps: $shareFps,
-          }).catch((e: any) => console.error("Failed to start capture:", e));
+          }).catch((e: any) => {
+            console.error("Failed to start capture:", e);
+            addNotification(`Failed to start screen capture: ${e}`, "error");
+          });
         } else if (count === 0 && prevCount > 0) {
           invoke("stop_screen_capture").catch((e: any) =>
             console.error("Failed to stop capture:", e)
@@ -718,7 +806,7 @@
   });
 </script>
 
-{#if !$chatUnlocked}
+{#if !$chatUnlocked && !$chatHistoryDisabled}
   <ChatHistorySetup />
 {/if}
 
@@ -803,7 +891,18 @@
     <div class="main-content">
       <ChannelList />
       {#if $watchingUserId !== null && !$poppedOut}
-        <ScreenShareViewer />
+        <div class="viewer-with-chat">
+          <ScreenShareViewer />
+          <button
+            class="chat-collapse"
+            onclick={() => (viewerChatOpen = !viewerChatOpen)}
+          >{viewerChatOpen ? "Hide chat ▾" : "Show chat ▴"}</button>
+          {#if viewerChatOpen}
+            <div class="viewer-chat-pane">
+              <ChatPanel />
+            </div>
+          {/if}
+        </div>
       {:else}
         <ChatPanel />
       {/if}
@@ -873,6 +972,46 @@
     display: flex;
     flex: 1;
     overflow: hidden;
+  }
+
+  /* Screen-share viewer with the chat pane stacked below it */
+  .viewer-with-chat {
+    display: flex;
+    flex-direction: column;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  .viewer-with-chat > :global(.viewer) {
+    flex: 1;
+    min-height: 0;
+  }
+
+  .chat-collapse {
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    border: none;
+    border-top: 1px solid var(--border);
+    padding: 3px 0;
+    font-size: 11px;
+    cursor: pointer;
+  }
+
+  .chat-collapse:hover {
+    color: var(--text-primary);
+  }
+
+  .viewer-chat-pane {
+    height: 280px;
+    flex-shrink: 0;
+    display: flex;
+    min-height: 0;
+  }
+
+  .viewer-chat-pane > :global(*) {
+    flex: 1;
+    min-width: 0;
   }
 
   /* ── Mobile layout ── */

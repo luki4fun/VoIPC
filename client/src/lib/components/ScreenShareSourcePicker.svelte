@@ -479,11 +479,11 @@
   }
 
   .setting-row select {
-    background: var(--bg-primary);
+    background-color: var(--bg-primary);
     color: var(--text-primary);
     border: 1px solid var(--border);
     border-radius: 4px;
-    padding: 4px 8px;
+    padding: 4px 28px 4px 8px;
     font-size: 13px;
     flex: 1;
   }

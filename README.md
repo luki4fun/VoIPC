@@ -24,6 +24,18 @@
 
 No accounts. No telemetry. No compromises.
 
+<p align="center">
+  <img src="website/screenshots/main-window.png" alt="VoIPC main window — channels, chat, and user list with speaking indicators" width="800">
+</p>
+
+<table>
+  <tr>
+    <td><img src="website/screenshots/screenshare.png" alt="Screen share viewer with stream stats and chat"></td>
+    <td><img src="website/screenshots/settings-audio.png" alt="Audio settings with mic test and global hotkeys"></td>
+    <td><img src="website/screenshots/connect.png" alt="Connect dialog with saved servers"></td>
+  </tr>
+</table>
+
 ## Features
 
 **Voice Chat**
@@ -31,16 +43,18 @@ No accounts. No telemetry. No compromises.
 - ML-based noise suppression (RNNoise via nnnoiseless)
 - Voice Activity Detection with configurable threshold
 - Push-to-Talk, VAD, and Always-On modes
-- Global Push-to-Talk keybind (works when window is unfocused)
-- Forward Error Correction (15% packet loss tolerance)
-- Per-user volume control
+- Global Push-to-Talk and mute/deafen hotkeys (work when window is unfocused)
+- Opus in-band FEC — a lost packet is rebuilt from the one that follows it
+- Adaptive jitter buffer (40 → 160 ms, grows only under packet loss)
+- Per-user volume control, 0–400% mic input gain, mic test in settings
+- Audio device hot-recovery when a device dies mid-call
 
 **Screen Sharing**
 - H.265/HEVC encoding via FFmpeg
-- Hardware acceleration: NVIDIA NVENC, Intel QSV, AMD AMF (libx265 software fallback)
-- 480p / 720p / 1080p @ 30 fps
-- Desktop audio capture
-- Pop-out viewer window
+- Hardware acceleration: NVIDIA NVENC, Intel QSV, AMD AMF (libx265 software fallback) — shipped in Windows builds since 0.4.0
+- 480p / 720p / 1080p @ 30 or 60 fps (60 fps gets +50% bitrate)
+- Desktop audio capture (64 kbps Opus)
+- Pop-out viewer window and fullscreen viewing; chat stays visible while watching
 - VPN-safe packet sizes (1280 bytes — fits inside WireGuard and OpenVPN tunnels)
 
 **Text Chat**
@@ -55,15 +69,26 @@ No accounts. No telemetry. No compromises.
 - Per-channel media encryption keys
 - Auto-cleanup of empty channels
 - Configurable user limits
+- Persistent rooms via `channels.json` on the server
+
+**Quality of Life**
+- Saved servers in the connect dialog, optional auto-connect
+- System tray (close-to-tray keeps the call running) and desktop notifications
+- Voice quality indicator: live ping + packet-loss % in the status bar
+- NAT rebind + UDP keepalive — voice survives router mapping timeouts
+- Auto-reconnect keeps trying for 5 minutes (Wi-Fi roams, laptop sleep)
+- Dead-UDP detection warns when a firewall blocks voice while TCP still works
 
 **Platform Support**
 
-| | Linux | Windows | macOS | Android |
+| | Linux | Windows | Android | macOS |
 |---|:---:|:---:|:---:|:---:|
-| Voice | Yes | Yes | Yes | Yes (Oboe) |
-| Screen Capture | PipeWire + XDG Portal | DXGI | Planned | — |
-| Desktop Audio | PipeWire | WASAPI | Planned | — |
-| Screen Share Viewing | Yes | Yes | Planned | Planned (decoder WIP) |
+| Voice | Yes | Yes | Yes (Oboe) | Untested¹ |
+| Screen Capture | PipeWire + XDG Portal | Windows.Graphics.Capture | — | — |
+| Desktop Audio | PipeWire | WASAPI | — | — |
+| Screen Share Viewing | Yes | Yes | Yes (AMediaCodec) | — |
+
+¹ There is no macOS-specific code yet; nothing is built or tested for it.
 
 ## Security
 
@@ -75,7 +100,7 @@ All TCP control traffic is encrypted with TLS 1.2+ via **rustls** (pure-Rust, no
 
 ### Layer 2: End-to-End Messages — Signal Protocol
 
-Chat messages (channel and DM) use the **Signal Protocol** from the official [libsignal](https://github.com/nicklabs/libsignal) crate by Signal Foundation:
+Chat messages (channel and DM) use the **Signal Protocol** from the official [libsignal](https://github.com/signalapp/libsignal) crate by Signal Foundation:
 
 - **X3DH** (Extended Triple Diffie-Hellman) for session establishment
 - **Double Ratchet** algorithm — new key for every message
@@ -89,7 +114,7 @@ Chat messages (channel and DM) use the **Signal Protocol** from the official [li
 All voice, video, and screen share audio is encrypted with **AES-256-GCM** (via the `ring` crate):
 
 - Per-channel 256-bit symmetric key, randomly generated
-- Deterministic nonce: `session_id(4) || sequence(4) || extra(4)` — prevents reuse by construction
+- Deterministic nonce: `session_id(4) || sequence(4) || extra(4)` — prevents reuse by construction; domain-separated per stream type (voice / screen audio / video)
 - 16-byte authentication tag on every packet — detects tampering
 - AAD (Additional Authenticated Data) binds channel_id + packet_type — blocks cross-channel replay
 - Mandatory key rotation after ~4.3 billion packets
@@ -115,14 +140,14 @@ Client-side data at rest:
 
 | | VoIPC | Discord | TeamSpeak |
 |---|---|---|---|
-| E2E Encryption | Signal Protocol | No | No |
-| Voice Encryption | AES-256-GCM | No | Limited |
+| E2E Text Chat | Signal Protocol | No | No |
+| E2E Voice & Video | AES-256-GCM | Partial (DAVE — voice/DM calls) | No |
 | Self-Hosted | Yes | No | Yes |
 | Open Source | MIT | No | No |
 | Account Required | No | Yes | No |
 | Data Collection | None | Extensive | Some |
 | Server Persistence | None | Everything | Everything |
-| Screen Share Codec | H.265 HW-accel | H.264/VP8 | Plugin |
+| Screen Share Codec | H.265 HW-accel | H.264/VP8 | Limited |
 
 ## Technology
 
@@ -155,8 +180,8 @@ Client-side data at rest:
 | **Server Runtime** | Tokio | Async, single-binary, DashMap lock-free concurrency |
 | **Client Backend** | Tauri 2 (Rust) | Native IPC, audio/video/crypto all in Rust |
 | **Client Frontend** | Svelte 5 + TypeScript | Runes ($state, $derived, $effect), Vite 6 |
-| **Audio I/O** | cpal | ALSA (Linux), WASAPI (Windows), CoreAudio (macOS) |
-| **Screen Capture** | Platform-native | PipeWire ScreenCast (Linux), DXGI (Windows) |
+| **Audio I/O** | cpal / Oboe | ALSA (Linux), WASAPI (Windows), Oboe (Android) |
+| **Screen Capture** | Platform-native | PipeWire ScreenCast (Linux), Windows.Graphics.Capture (Windows) |
 
 ### Protocol Details
 
@@ -189,7 +214,7 @@ VoIPC/
 │   │   └── commands.rs     # Tauri IPC command handlers
 │   └── src/
 │       ├── lib/
-│       │   ├── components/ # 15 Svelte 5 components
+│       │   ├── components/ # Svelte 5 components
 │       │   └── stores/     # Reactive state (channels, chat, voice, etc.)
 │       └── App.svelte      # Root component
 ├── website/                # Project website (single HTML file)

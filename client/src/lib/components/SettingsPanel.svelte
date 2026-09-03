@@ -1,10 +1,16 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { listen } from "@tauri-apps/api/event";
+  import { onDestroy } from "svelte";
   import {
     inputDevice,
     outputDevice,
     volume,
+    inputGain,
     pttKey,
+    muteKey,
+    deafenKey,
+    chatHistoryDisabled,
     pttHoldMode,
     noiseSuppression,
     rememberConnection,
@@ -38,6 +44,7 @@
       outputDevices = await invoke("get_output_devices");
     } catch (e) {
       console.error("Failed to load devices:", e);
+      addNotification(`Failed to load audio devices: ${e}`, "error");
     }
   }
 
@@ -46,8 +53,14 @@
     inputDevice.set(target.value);
     try {
       await invoke("set_input_device", { deviceName: target.value });
+      // Re-open the test stream on the newly selected device
+      if (micTestRunning) {
+        stopMicTest();
+        await startMicTest();
+      }
     } catch (err) {
       console.error("Failed to set input device:", err);
+      addNotification(`Failed to set input device: ${err}`, "error");
     }
   }
 
@@ -58,6 +71,7 @@
       await invoke("set_output_device", { deviceName: target.value });
     } catch (err) {
       console.error("Failed to set output device:", err);
+      addNotification(`Failed to set output device: ${err}`, "error");
     }
   }
 
@@ -65,8 +79,11 @@
   let isCapturingKey = $state(false);
   let captureHint = $state("Press any key or combo...");
   let nonModifierPressed = false;
+  // Which binding the capture UI is editing: PTT, global mute, or global deafen
+  let captureTarget = $state<"ptt" | "mute" | "deafen">("ptt");
 
-  function startKeyCapture() {
+  function startKeyCapture(target: "ptt" | "mute" | "deafen" = "ptt") {
+    captureTarget = target;
     isCapturingKey = true;
     nonModifierPressed = false;
     captureHint = "Press any key or combo...";
@@ -82,11 +99,27 @@
   }
 
   function finishCapture(binding: string) {
-    pttKey.set(binding);
     isCapturingKey = false;
-    invoke("set_ptt_key", { keyCode: binding }).catch((err: any) => {
-      console.error("Failed to set PTT key:", err);
+    const targets = {
+      ptt: { store: pttKey, cmd: "set_ptt_key", label: "PTT key" },
+      mute: { store: muteKey, cmd: "set_mute_key", label: "mute hotkey" },
+      deafen: { store: deafenKey, cmd: "set_deafen_key", label: "deafen hotkey" },
+    } as const;
+    const t = targets[captureTarget];
+    t.store.set(binding);
+    invoke(t.cmd, { keyCode: binding }).catch((err: any) => {
+      console.error(`Failed to set ${t.label}:`, err);
+      addNotification(`Failed to set ${t.label}: ${err}`, "error");
     });
+  }
+
+  function clearToggleKey(target: "mute" | "deafen") {
+    const t =
+      target === "mute"
+        ? { store: muteKey, cmd: "set_mute_key" }
+        : { store: deafenKey, cmd: "set_deafen_key" };
+    t.store.set("");
+    invoke(t.cmd, { keyCode: "" }).catch(() => {});
   }
 
   function handleCaptureKeyDown(e: KeyboardEvent) {
@@ -149,6 +182,10 @@
       pttKey.set("Space");
       pttHoldMode.set(true);
       volume.set(1.0);
+      inputGain.set(1.0);
+      muteKey.set("");
+      deafenKey.set("");
+      chatHistoryDisabled.set(false);
       inputDevice.set("");
       outputDevice.set("");
       voiceMode.set("ptt");
@@ -166,6 +203,7 @@
       addNotification("Settings reset to defaults", "info");
     } catch (e) {
       console.error("Failed to reset config:", e);
+      addNotification(`Failed to reset settings: ${e}`, "error");
     }
   }
 
@@ -187,6 +225,7 @@
       await invoke("set_sound_settings", { settings });
     } catch (e) {
       console.error("Failed to save sound settings:", e);
+      addNotification(`Failed to save sound settings: ${e}`, "error");
     }
   }
 
@@ -218,6 +257,7 @@
       await invoke("preview_sound", { path });
     } catch (e) {
       console.error("Failed to preview sound:", e);
+      addNotification(`Failed to play sound: ${e}`, "error");
     }
   }
 
@@ -233,6 +273,53 @@
     if (bridge) bridge.setVolumeKeyPtt(checked);
     volumeKeyPtt.set(checked);
   }
+
+  // --- Mic test (settings-panel level meter, independent of VAD/calls) ---
+
+  let micTestRunning = $state(false);
+  let micLevelDb = $state(-100);
+  let micLevelPercent = $derived(
+    Math.max(0, Math.min(100, ((micLevelDb + 60) / 60) * 100)),
+  );
+  let micUnlisten: Array<() => void> = [];
+
+  async function startMicTest() {
+    try {
+      micUnlisten.push(
+        await listen<{ db: number }>("mic-test-level", (e) => {
+          micLevelDb = e.payload.db;
+        }),
+      );
+      micUnlisten.push(
+        await listen<{ error: string }>("mic-test-error", (e) => {
+          addNotification(`Mic test failed: ${e.payload.error}`, "error");
+          stopMicTest();
+        }),
+      );
+      await invoke("start_mic_test");
+      micTestRunning = true;
+    } catch (e) {
+      addNotification(`Mic test failed: ${e}`, "error");
+      stopMicTest();
+    }
+  }
+
+  function stopMicTest() {
+    micUnlisten.forEach((fn) => fn());
+    micUnlisten = [];
+    micTestRunning = false;
+    micLevelDb = -100;
+    invoke("stop_mic_test").catch(() => {});
+  }
+
+  function toggleMicTest() {
+    if (micTestRunning) stopMicTest();
+    else startMicTest();
+  }
+
+  onDestroy(() => {
+    if (micTestRunning) stopMicTest();
+  });
 
   // Load devices on mount (skip on mobile — only default device available)
   if (!$isMobile) loadDevices();
@@ -277,6 +364,16 @@
               </option>
             {/each}
           </select>
+          <div class="mic-test">
+            <button class="mic-test-btn" onclick={toggleMicTest}>
+              {micTestRunning ? "Stop test" : "Test microphone"}
+            </button>
+            {#if micTestRunning}
+              <div class="level-track">
+                <div class="level-fill" style="width: {micLevelPercent}%"></div>
+              </div>
+            {/if}
+          </div>
         </div>
 
         <div class="section">
@@ -294,7 +391,7 @@
         <div class="section">
           <h4>Push to Talk Key</h4>
           <div class="ptt-config">
-            {#if isCapturingKey}
+            {#if isCapturingKey && captureTarget === "ptt"}
               <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_static_element_interactions -->
               <span
                 class="current-key capturing"
@@ -308,7 +405,7 @@
               </span>
             {:else}
               <span class="current-key">{$pttKey}</span>
-              <button class="change-key-btn" onclick={startKeyCapture}>Change</button>
+              <button class="change-key-btn" onclick={() => startKeyCapture("ptt")}>Change</button>
             {/if}
           </div>
           <label class="toggle-row">
@@ -320,6 +417,51 @@
                 : "Release the trigger key to stop immediately"}
             </span>
           </label>
+        </div>
+
+        <div class="section">
+          <h4>Global Hotkeys</h4>
+          <div class="ptt-config">
+            <span class="hotkey-label">Toggle mute</span>
+            {#if isCapturingKey && captureTarget === "mute"}
+              <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_static_element_interactions -->
+              <span
+                class="current-key capturing"
+                tabindex="0"
+                onkeydown={handleCaptureKeyDown}
+                onkeyup={handleCaptureKeyUp}
+                onblur={cancelKeyCapture}
+                use:autofocus
+              >{captureHint}</span>
+            {:else}
+              <span class="current-key">{$muteKey || "Not set"}</span>
+              <button class="change-key-btn" onclick={() => startKeyCapture("mute")}>Change</button>
+              {#if $muteKey}
+                <button class="change-key-btn" onclick={() => clearToggleKey("mute")}>Clear</button>
+              {/if}
+            {/if}
+          </div>
+          <div class="ptt-config">
+            <span class="hotkey-label">Toggle deafen</span>
+            {#if isCapturingKey && captureTarget === "deafen"}
+              <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_static_element_interactions -->
+              <span
+                class="current-key capturing"
+                tabindex="0"
+                onkeydown={handleCaptureKeyDown}
+                onkeyup={handleCaptureKeyUp}
+                onblur={cancelKeyCapture}
+                use:autofocus
+              >{captureHint}</span>
+            {:else}
+              <span class="current-key">{$deafenKey || "Not set"}</span>
+              <button class="change-key-btn" onclick={() => startKeyCapture("deafen")}>Change</button>
+              {#if $deafenKey}
+                <button class="change-key-btn" onclick={() => clearToggleKey("deafen")}>Clear</button>
+              {/if}
+            {/if}
+          </div>
+          <span class="toggle-hint">Work system-wide, even while the window is unfocused or in the tray</span>
         </div>
       {:else}
         <div class="section">
@@ -345,6 +487,25 @@
 
       <div class="section">
         <h4>Data</h4>
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={!$chatHistoryDisabled}
+            onchange={(e) => {
+              const enabled = (e.target as HTMLInputElement).checked;
+              chatHistoryDisabled.set(!enabled);
+              invoke("set_chat_history_disabled", { disabled: !enabled }).catch((err: any) => {
+                addNotification(`Failed to save setting: ${err}`, "error");
+              });
+            }}
+          />
+          <span class="toggle-label">Save chat history (encrypted)</span>
+          <span class="toggle-hint">
+            {$chatHistoryDisabled
+              ? "Off — chat is kept in memory only and lost on exit"
+              : "Messages are stored in the encrypted vault"}
+          </span>
+        </label>
         <div class="btn-row">
           <button class="danger-btn" onclick={async () => { await clearAllHistory(); addNotification("Chat history cleared", "info"); }}>
             Clear Chat History
@@ -468,6 +629,44 @@
     margin-bottom: 20px;
   }
 
+  .mic-test {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    margin-top: 8px;
+  }
+
+  .mic-test-btn {
+    background: transparent;
+    color: var(--text-secondary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 4px 10px;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+
+  .mic-test-btn:hover {
+    color: var(--text-primary);
+    border-color: var(--text-secondary);
+  }
+
+  .level-track {
+    flex: 1;
+    height: 8px;
+    background: var(--bg-tertiary);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  .level-fill {
+    height: 100%;
+    background: #43b581;
+    border-radius: 4px;
+    transition: width 60ms linear;
+  }
+
   h4 {
     font-size: 12px;
     text-transform: uppercase;
@@ -478,8 +677,8 @@
 
   select {
     width: 100%;
-    padding: 8px 12px;
-    background: var(--bg-primary);
+    padding: 8px 28px 8px 12px;
+    background-color: var(--bg-primary);
     color: var(--text-primary);
     border: 1px solid var(--border);
     border-radius: 4px;
@@ -521,6 +720,16 @@
     display: flex;
     align-items: center;
     gap: 8px;
+  }
+
+  .ptt-config + .ptt-config {
+    margin-top: 8px;
+  }
+
+  .hotkey-label {
+    font-size: 12px;
+    color: var(--text-secondary);
+    min-width: 90px;
   }
 
   .current-key {

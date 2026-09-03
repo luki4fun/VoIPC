@@ -5,7 +5,7 @@
 Setup scripts install all required tools and dependencies automatically:
 
 ```bash
-# Linux (Ubuntu/Debian)
+# Linux (Ubuntu/Debian via apt, Arch via pacman)
 ./setup.sh
 
 # Windows (PowerShell, run as Administrator)
@@ -16,9 +16,9 @@ Then use the build scripts below.
 
 ---
 
-## Linux (Ubuntu/Debian)
+## Linux
 
-### System Dependencies
+### System Dependencies (Ubuntu/Debian)
 
 ```bash
 sudo apt-get install -y \
@@ -39,7 +39,8 @@ sudo apt-get install -y \
   libgtk-3-dev \
   libwebkit2gtk-4.1-dev \
   libjavascriptcoregtk-4.1-dev \
-  libsoup-3.0-dev
+  libsoup-3.0-dev \
+  libayatana-appindicator3-dev
 ```
 
 | Package | Required by |
@@ -62,6 +63,16 @@ sudo apt-get install -y \
 | `libwebkit2gtk-4.1-dev` | Tauri webview |
 | `libjavascriptcoregtk-4.1-dev` | Tauri webview JS engine |
 | `libsoup-3.0-dev` | Tauri HTTP client |
+| `libayatana-appindicator3-dev` | System tray icon (the app currently fails to start without the runtime lib) |
+
+### System Dependencies (Arch / Manjaro / CachyOS)
+
+```bash
+sudo pacman -S --needed \
+  ffmpeg x265 clang libjpeg-turbo nasm libpipewire mesa alsa-lib \
+  openssl gtk3 webkit2gtk-4.1 libsoup3 libayatana-appindicator \
+  curl base-devel
+```
 
 ### Runtime Dependencies (for running the .deb on another machine)
 
@@ -82,7 +93,8 @@ sudo apt-get install -y \
   libgtk-3-0 \
   libwebkit2gtk-4.1-0 \
   libjavascriptcoregtk-4.1-0 \
-  libsoup-3.0-0
+  libsoup-3.0-0 \
+  libayatana-appindicator3-1
 ```
 
 > **Note:** Package names with version suffixes (e.g. `libavcodec60`) vary between Ubuntu/Debian
@@ -94,18 +106,21 @@ sudo apt-get install -y \
 Use the provided scripts which set the required environment variables automatically:
 
 ```bash
-./dev.sh          # Debug build + run (cargo tauri dev)
-./build.sh        # Release build (cargo tauri build)
+./dev.sh          # Debug build + run (tauri dev)
+./build.sh        # Release build (tauri build)
 ```
+
+The scripts use the tauri CLI from the client's npm devDependencies (`npx tauri`) —
+no global `cargo install tauri-cli` is required — and run `npm install` on first use.
 
 ### Environment Variables (if building manually)
 
 ```bash
 export PATH="$HOME/.cargo/bin:$PATH"
-export BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include"
+export BINDGEN_EXTRA_CLANG_ARGS="-I$(gcc -print-file-name=include)"
 ```
 
-The `BINDGEN_EXTRA_CLANG_ARGS` is needed because bindgen's bundled clang can't find GCC system headers (`stdbool.h`, etc.) without the explicit include path. Adjust the GCC version number if yours differs.
+`BINDGEN_EXTRA_CLANG_ARGS` is needed because bindgen's bundled clang can't find GCC system headers (`stdbool.h`, etc.) without the explicit include path. `gcc -print-file-name=include` resolves the right directory on any distro; the build scripts set this automatically.
 
 ## Windows
 
@@ -117,13 +132,15 @@ The `BINDGEN_EXTRA_CLANG_ARGS` is needed because bindgen's bundled clang can't f
 4. **CMake** — required by `libsignal-protocol` build ([cmake.org](https://cmake.org/download/))
 5. **NASM** — required for SIMD optimizations in libjpeg-turbo and x265 ([nasm.us](https://www.nasm.us/))
 6. **LLVM** — required by bindgen to generate FFmpeg Rust bindings (`winget install LLVM.LLVM`)
-7. **FFmpeg** — installed via vcpkg (run `.\setup.ps1` to install automatically)
+7. **FFmpeg** — installed via vcpkg (run `.\setup.ps1` to install automatically). Installed as `ffmpeg[x265,nvcodec,amf,qsv]` so the hardware H.265 encoders (NVIDIA NVENC, AMD AMF, Intel QuickSync) are compiled in. NVENC and AMF load from the GPU driver at runtime (no extra installs for users); QSV ships the Intel oneVPL dispatcher DLL with the app.
 
 Make sure `cmake`, `nasm`, and LLVM are on your `PATH`. Or just run `.\setup.ps1` which handles all of the above.
 
+If you set up FFmpeg with an older version of `setup.ps1` (without the HW encoder features), re-run `.\setup.ps1` — it detects the missing features and reinstalls FFmpeg.
+
 ### Screen sharing
 
-Screen capture on Windows uses DXGI Desktop Duplication (primary display). Desktop audio is captured via WASAPI loopback.
+Screen capture on Windows uses Windows.Graphics.Capture (displays and windows). Desktop audio is captured via WASAPI loopback.
 
 ### Build Scripts
 
@@ -146,6 +163,27 @@ npx tauri build    # Release build
 - Rust via [rustup](https://rustup.rs/)
 - Node.js (for the Svelte frontend)
 - Tauri CLI: `npm install` in `client/`
+
+## Android
+
+```bash
+./android-setup.sh    # one-time: installs SDK + NDK + JDK 21 + Rust targets to ~/android-sdk
+./android-build.sh [debug|release] [--target aarch64|armv7|x86_64|all]
+```
+
+`android-setup.sh` bootstraps a fresh machine with no Android tooling: it
+downloads the commandline-tools, accepts licenses, installs platform-tools,
+the platform matching `compileSdk`, build-tools, the NDK, a bundled Temurin
+JDK 21 (the Android Gradle plugin needs 17–21 — a too-new system Java won't
+work), and the Rust cross-compile targets. Everything lands in `~/android-sdk`
+(override with `ANDROID_HOME`); it is re-runnable and skips what's already
+installed.
+
+`android-build.sh` honors `ANDROID_HOME`, `ANDROID_NDK_HOME`, and `JAVA_HOME`
+if set, otherwise auto-detects them (including the setup script's bundled JDK;
+newest installed NDK wins) and tells you exactly what's missing. Release
+builds need a `keystore.properties` at the repo root (copy
+`keystore.properties.example`).
 
 ## Docker Release Build (AppImage)
 
