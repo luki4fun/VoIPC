@@ -237,7 +237,7 @@
 <section id="top">
   <div class="container hero-grid">
     <div>
-      <p class="hero-meta"><a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">v0.4.0</a> · MIT · Linux / Windows / Android</p>
+      <p class="hero-meta"><a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">v0.4.0</a> · MIT · Linux / Windows / Android / Browser</p>
       <h1>Voice, screen sharing, and chat — on a server you run.</h1>
       <p class="hero-sub">VoIPC is an open-source alternative to Discord and TeamSpeak. Messages are encrypted with the Signal Protocol, voice and video with AES-256-GCM, and the relay server keeps nothing: no accounts, no database, no logs.</p>
       <div class="hero-buttons">
@@ -305,9 +305,10 @@
         <li>Audio device hot-recovery when a headset dies mid-call</li>
         <li>NAT rebind and UDP keepalive — voice survives router timeouts</li>
         <li>Auto-reconnect keeps trying for 5 minutes across Wi-Fi roams</li>
-        <li>Warning when a contact's encryption identity key changes</li>
         <li>Dead-UDP detection tells you when a firewall eats your voice</li>
         <li>Android client: voice and screen-share viewing on the go</li>
+        <li>Invite links that open the browser client straight into a channel</li>
+        <li>Admin sessions via a server token: kick and IP-ban, no accounts needed</li>
         <li>IPv6 dual-stack, TOFU certificate pinning for self-signed certs</li>
       </ul>
     </div>
@@ -524,6 +525,7 @@
           <tr><td>Account required</td><td class="ok">No</td><td class="no">Yes</td><td class="ok">No</td></tr>
           <tr><td>Server persistence</td><td class="ok">None — memory only</td><td class="no">Cloud, retained</td><td class="mid">Logs &amp; database</td></tr>
           <tr><td>Screen share</td><td class="ok">H.265, GPU-encoded, 1080p60</td><td class="mid">H.264/VP8, higher tiers paid</td><td class="mid">Limited</td></tr>
+          <tr><td>Runs in a browser</td><td class="ok">Yes — E2E encrypted, self-hosted</td><td class="ok">Yes</td><td class="no">No</td></tr>
           <tr><td>Cost</td><td class="ok">Free — your hardware</td><td class="mid">Free + paid tiers</td><td class="mid">Free tier, licensed beyond</td></tr>
         </tbody>
       </table>
@@ -538,17 +540,18 @@
     <div class="table-wrap">
       <table>
         <thead>
-          <tr><th></th><th>Linux</th><th>Windows</th><th>Android</th><th>macOS</th></tr>
+          <tr><th></th><th>Linux</th><th>Windows</th><th>Android</th><th>Browser</th><th>macOS</th></tr>
         </thead>
         <tbody>
-          <tr><td>Voice</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="muted">—</td></tr>
-          <tr><td>Screen share (send)</td><td class="ok">PipeWire</td><td class="ok">WGC</td><td class="muted">—</td><td class="muted">—</td></tr>
-          <tr><td>Screen share (watch)</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="muted">—</td></tr>
-          <tr><td>Desktop audio</td><td class="ok">PipeWire</td><td class="ok">WASAPI</td><td class="muted">—</td><td class="muted">—</td></tr>
+          <tr><td>Voice</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="muted">—</td></tr>
+          <tr><td>Text chat (E2E)</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="muted">—</td></tr>
+          <tr><td>Screen share (send)</td><td class="ok">PipeWire</td><td class="ok">WGC</td><td class="muted">—</td><td class="muted">—</td><td class="muted">—</td></tr>
+          <tr><td>Screen share (watch)</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Where H.265 decodes</td><td class="muted">—</td></tr>
+          <tr><td>Desktop audio</td><td class="ok">PipeWire</td><td class="ok">WASAPI</td><td class="muted">—</td><td class="muted">—</td><td class="muted">—</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="audit-note">macOS is not supported yet — there is no macOS-specific code in the tree, so it isn't listed as working.</p>
+    <p class="audit-note">The browser client needs Chrome 97, Edge 98, Firefox 130 or Safari 26.4 (WebTransport and WebCodecs). Watching a screen share additionally needs an H.265 decoder, which browsers only expose on Windows, macOS and Android — voice and chat work everywhere. macOS is not supported yet — there is no macOS-specific code in the tree, so it isn't listed as working.</p>
   </div>
 </section>
 
@@ -560,6 +563,7 @@
       <div>
         <h3>Client</h3>
         <p>Prebuilt packages on the <a href="https://github.com/luki4fun/voipc/releases">GitHub releases page</a>, or build from source — <code>setup.sh</code> / <code>setup.ps1</code> installs the dependencies, <code>build.sh</code> / <code>build.ps1</code> builds. See <a href="https://github.com/luki4fun/voipc/blob/main/BUILDING.md">BUILDING.md</a> for the per-platform details.</p>
+        <p>Or install nothing: the server hosts a browser client at <code>https://your-server:9987</code>, with the same Signal and AES-256-GCM encryption compiled to WebAssembly.</p>
         <a class="btn btn-primary" href="https://github.com/luki4fun/voipc/releases">Releases</a>
       </div>
       <div>
@@ -568,16 +572,17 @@
 git clone https://github.com/luki4fun/voipc
 cd voipc &amp;&amp; cargo build -p voipc-server --release
 
-<span class="c"># self-signed cert</span>
+<span class="c"># self-signed cert (browsers check the subjectAltName: use your host name / IP)</span>
 mkdir -p certs
 openssl req -x509 -newkey ec \
   -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout certs/server.key -out certs/server.crt \
-  -days 365 -nodes -subj "/CN=voipc"
+  -days 365 -nodes -subj "/CN=voipc" \
+  -addext "subjectAltName=DNS:your-server.example,IP:203.0.113.5"
 
-<span class="c"># run (port 9987 TCP + UDP)</span>
+<span class="c"># run (9987 TCP + UDP, 9988 UDP for browsers)</span>
 ./target/release/voipc-server</pre>
-        <p>Configure via <code>server.toml</code> or CLI flags; drop a <code>channels.json</code> next to the binary for persistent rooms. A Docker release build (<code>./release.sh</code>) produces a static musl binary and an AppImage.</p>
+        <p>Configure via <code>server.toml</code> or CLI flags; drop a <code>channels.json</code> next to the binary for persistent rooms; set <code>admin_token</code> (or take the one printed in the log) to moderate. The same binary serves the browser client over HTTP/2 and WebTransport (<code>web_port</code>, default 9988; <code>0</code> turns it off). A Docker release build (<code>./release.sh</code>) produces a static musl binary, an AppImage, and the web bundle.</p>
       </div>
     </div>
   </div>

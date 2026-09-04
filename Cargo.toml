@@ -8,6 +8,9 @@ members = [
     "crates/voipc-server",
     "client/src-tauri",
 ]
+# The wasm crate is its own workspace: it patches pqcrypto-kyber with a stub
+# and enables wasm-only features that must never leak into the native build.
+exclude = ["crates/voipc-web"]
 
 [workspace.package]
 version = "0.4.0"

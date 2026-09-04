@@ -27,7 +27,8 @@
   import { isMuted, isDeafened } from "../stores/connection.js";
   import { clearAllHistory } from "../stores/chat.js";
   import { addNotification } from "../stores/notifications.js";
-  import { isMobile, volumeKeyPtt } from "../stores/platform.js";
+  import { isMobile, isWeb, volumeKeyPtt } from "../stores/platform.js";
+  import { shareChannelHistory } from "../stores/settings.js";
   import type { AudioDeviceInfo } from "../types.js";
   import Icon from "./Icons.svelte";
 
@@ -419,6 +420,7 @@
           </label>
         </div>
 
+        {#if !isWeb}
         <div class="section">
           <h4>Global Hotkeys</h4>
           <div class="ptt-config">
@@ -463,6 +465,7 @@
           </div>
           <span class="toggle-hint">Work system-wide, even while the window is unfocused or in the tray</span>
         </div>
+        {/if}
       {:else}
         <div class="section">
           <h4>Push to Talk</h4>
@@ -487,6 +490,7 @@
 
       <div class="section">
         <h4>Data</h4>
+        {#if !isWeb}
         <label class="toggle-row">
           <input
             type="checkbox"
@@ -504,6 +508,24 @@
             {$chatHistoryDisabled
               ? "Off — chat is kept in memory only and lost on exit"
               : "Messages are stored in the encrypted vault"}
+          </span>
+        </label>
+        {/if}
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={$shareChannelHistory}
+            onchange={(e) => {
+              const enabled = (e.target as HTMLInputElement).checked;
+              shareChannelHistory.set(enabled);
+              invoke("set_config_bool", { key: "share_channel_history", value: enabled }).catch((err: any) => {
+                addNotification(`Failed to save setting: ${err}`, "error");
+              });
+            }}
+          />
+          <span class="toggle-label">Share recent channel chat with newcomers</span>
+          <span class="toggle-hint">
+            When someone joins your channel, your client may hand them the last 50 channel messages it has — end-to-end encrypted to that person only, never through the server in the clear
           </span>
         </label>
         <div class="btn-row">
@@ -533,16 +555,25 @@
               </label>
             </div>
             <span class="sound-desc">{event.description}</span>
-            <div class="sound-file-row">
-              <span class="sound-path" title={entry.path ?? ""}>
-                {entry.path ? fileNameFromPath(entry.path) : "No file selected"}
-              </span>
-              <button class="sound-btn" onclick={() => browseSoundFile(event.key)} title="Browse">Browse</button>
-              {#if entry.path}
-                <button class="sound-btn" onclick={() => previewSoundFile(entry.path!)} title="Play">Play</button>
-                <button class="sound-btn clear" onclick={() => clearSoundFile(event.key)} title="Clear"><Icon name="close" size={14} /></button>
-              {/if}
-            </div>
+            {#if isWeb}
+              <!-- The browser has no files: a built-in tone per event; the
+                   web backend previews by event name -->
+              <div class="sound-file-row">
+                <span class="sound-path">Built-in tone</span>
+                <button class="sound-btn" onclick={() => previewSoundFile(event.key)} title="Play">Play</button>
+              </div>
+            {:else}
+              <div class="sound-file-row">
+                <span class="sound-path" title={entry.path ?? ""}>
+                  {entry.path ? fileNameFromPath(entry.path) : "No file selected"}
+                </span>
+                <button class="sound-btn" onclick={() => browseSoundFile(event.key)} title="Browse">Browse</button>
+                {#if entry.path}
+                  <button class="sound-btn" onclick={() => previewSoundFile(entry.path!)} title="Play">Play</button>
+                  <button class="sound-btn clear" onclick={() => clearSoundFile(event.key)} title="Clear"><Icon name="close" size={14} /></button>
+                {/if}
+              </div>
+            {/if}
           </div>
         {/each}
       </div>

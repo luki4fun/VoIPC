@@ -198,10 +198,10 @@ pub fn run() {
                             // VoiceControls listens for these and runs its normal
                             // mute/deafen toggle path, keeping UI + server in sync
                             "mute" => {
-                                let _ = app.emit("tray-toggle-mute", ());
+                                let _ = app.emit("toggle-mute-request", ());
                             }
                             "deafen" => {
-                                let _ = app.emit("tray-toggle-deafen", ());
+                                let _ = app.emit("toggle-deafen-request", ());
                             }
                             "quit" => app.exit(0),
                             _ => {}
@@ -331,9 +331,15 @@ pub fn run() {
             commands::request_prekey_bundle,
             commands::send_encrypted_direct_message,
             commands::send_encrypted_channel_message,
-            commands::distribute_sender_key,
-            commands::distribute_media_key,
             commands::upload_prekeys,
+            commands::forget_server_pin,
+            commands::send_channel_history,
+            // Moderation
+            commands::admin_login,
+            commands::admin_kick,
+            commands::admin_ban,
+            commands::admin_unban,
+            commands::admin_list_bans,
             // Persistent config
             commands::load_config,
             commands::save_connection_info,

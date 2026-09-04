@@ -63,7 +63,7 @@ sudo apt-get install -y \
 | `libwebkit2gtk-4.1-dev` | Tauri webview |
 | `libjavascriptcoregtk-4.1-dev` | Tauri webview JS engine |
 | `libsoup-3.0-dev` | Tauri HTTP client |
-| `libayatana-appindicator3-dev` | System tray icon (the app currently fails to start without the runtime lib) |
+| `libayatana-appindicator3-dev` | System tray icon (optional at runtime: without the library there is no tray and closing the window quits) |
 
 ### System Dependencies (Arch / Manjaro / CachyOS)
 
@@ -185,6 +185,42 @@ newest installed NDK wins) and tells you exactly what's missing. Release
 builds need a `keystore.properties` at the repo root (copy
 `keystore.properties.example`).
 
+## Web client (browser)
+
+```bash
+./build-web.sh      # wasm crate + Vite bundle + server binary that embeds it
+./test-web.sh       # headless two-browser end-to-end check
+```
+
+`build-web.sh` installs the `wasm32-unknown-unknown` Rust target if missing, builds
+`crates/voipc-web` with `wasm-pack` (a client devDependency, no global install), bundles the
+Svelte app in web mode to `client/dist-web`, and then builds the server, which embeds that
+directory with `rust-embed`. Outputs:
+
+- `target/release/voipc-server` — serves the web client at `https://<host>:<tcp_port>/`
+- `release/VoIPC-web-<version>.tar.gz` — the static bundle, if you want to host it elsewhere
+
+The wasm crate is a separate Cargo workspace (`crates/voipc-web`), because it replaces
+`pqcrypto-kyber` with a stub (its C code cannot build for wasm and VoIPC never negotiates
+Kyber) and enables wasm-only features of `getrandom` and `ring`. Nothing of that leaks into
+the native build.
+
+Manual steps, if you prefer:
+
+```bash
+cd client
+npm install
+npm run build:wasm   # wasm-pack → client/src/lib/wasm
+npm run build:web    # wasm + vite build --mode web → client/dist-web
+npm run dev:web      # dev server on http://localhost:1420 (point it at a running server)
+cd .. && cargo build -p voipc-server --release
+```
+
+`test-web.sh` starts a server on test ports with a throwaway certificate, runs two headless
+Chromium instances with a fake microphone through the in-page self-test, and checks that they
+see each other, exchange the media key over Signal, hear each other's voice, and read each
+other's channel messages and DMs. Set `CHROME=/path/to/chrome` if Chromium is not on `PATH`.
+
 ## Docker Release Build (AppImage)
 
 Build portable release binaries inside Docker without installing any local dependencies:
@@ -194,8 +230,9 @@ Build portable release binaries inside Docker without installing any local depen
 ```
 
 This builds inside Ubuntu 24.04 and produces:
-- `release/voipc-server` — static binary (musl, zero runtime deps)
+- `release/voipc-server` — static binary (musl, zero runtime deps), serving the embedded web client
 - `release/VoIPC_*.AppImage` — portable client (runs on glibc >= 2.39)
+- `release/VoIPC-web-*.tar.gz` — the web client bundle (already inside the server binary)
 
 Requires only Docker on the host. No Rust, Node.js, or system libraries needed.
 

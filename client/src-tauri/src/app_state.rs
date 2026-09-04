@@ -37,6 +37,9 @@ impl Default for PttBinding {
 /// Application state managed by Tauri.
 pub struct AppState {
     pub connection: RwLock<Option<ActiveConnection>>,
+    /// Held for the whole of `connect_to_server` so concurrent connects
+    /// (reconnect loop vs. manual) run one after the other.
+    pub connect_lock: tokio::sync::Mutex<()>,
     pub settings: RwLock<UserSettings>,
     pub chat: RwLock<ChatState>,
     pub signal: Arc<std::sync::Mutex<SignalState>>,
@@ -62,6 +65,7 @@ impl AppState {
     pub fn new() -> Self {
         Self {
             connection: RwLock::new(None),
+            connect_lock: tokio::sync::Mutex::new(()),
             settings: RwLock::new(UserSettings::default()),
             chat: RwLock::new(ChatState::default()),
             signal: Arc::new(std::sync::Mutex::new(SignalState::default())),
@@ -112,6 +116,9 @@ pub struct SignalState {
     pub sender_key_received: HashMap<u32, HashSet<u32>>,
     /// Messages queued while waiting for encryption to be established.
     pub pending_messages: Vec<PendingMessage>,
+    /// Channel we entered with members already in it: ask the first member
+    /// whose sender key arrives for recent chat (once per entry, 0 = none).
+    pub history_wanted_channel: u32,
 }
 
 impl Default for SignalState {
@@ -125,6 +132,7 @@ impl Default for SignalState {
             sender_key_distributed: HashMap::new(),
             sender_key_received: HashMap::new(),
             pending_messages: Vec::new(),
+            history_wanted_channel: 0,
         }
     }
 }

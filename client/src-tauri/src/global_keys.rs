@@ -516,6 +516,8 @@ fn run_evdev_loop(
     let mut ptt_active = false;
     let mut last_enum = std::time::Instant::now();
     let mut needs_reenumerate = false;
+    // fds that returned ENODEV this iteration (device unplugged)
+    let mut dead_fds: Vec<std::os::fd::RawFd> = Vec::new();
 
     loop {
         // Build poll fds for all devices
@@ -534,6 +536,7 @@ fn run_evdev_loop(
         }
 
         for dev in devices.iter_mut() {
+            let fd = dev.as_raw_fd();
             match dev.fetch_events() {
                 Ok(events) => {
                     for event in events {
@@ -635,11 +638,33 @@ fn run_evdev_loop(
                 Err(e) => {
                     if e.raw_os_error() == Some(libc::ENODEV) {
                         tracing::info!("Keyboard device removed, will re-enumerate");
+                        dead_fds.push(fd);
                         needs_reenumerate = true;
                     } else {
                         tracing::warn!("evdev error: {e}");
                     }
                 }
+            }
+        }
+
+        // Drop unplugged devices now. Keeping a dead fd makes poll() return
+        // immediately (POLLHUP) forever: 100% CPU and a log line per spin
+        // until a replacement keyboard shows up.
+        if !dead_fds.is_empty() {
+            devices.retain(|d| !dead_fds.contains(&d.as_raw_fd()));
+            dead_fds.clear();
+            if devices.is_empty() && ptt_active {
+                // The key can never be released now — don't leave the mic open
+                ptt_active = false;
+                let h = handle.clone();
+                tauri::async_runtime::spawn(async move {
+                    let state = h.state::<AppState>();
+                    if let Err(e) = commands::do_stop_transmit(&state).await {
+                        tracing::warn!("Global PTT stop after device loss failed: {e}");
+                    } else {
+                        let _ = h.emit("ptt-global-released", ());
+                    }
+                });
             }
         }
 

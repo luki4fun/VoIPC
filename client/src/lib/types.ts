@@ -5,6 +5,15 @@ export interface UserInfo {
   is_muted: boolean;
   is_deafened: boolean;
   is_screen_sharing: boolean;
+  /** Logged in with the server's admin token. */
+  is_admin: boolean;
+}
+
+/** An active IP ban (admin view). */
+export interface BanInfo {
+  ip: string;
+  /** Seconds until expiry; null = until the server restarts. */
+  expires_in_secs: number | null;
 }
 
 export interface ChannelInfo {
@@ -33,4 +42,10 @@ export interface ChatMessage {
   username: string;
   content: string;
   timestamp: number;
+  /**
+   * Absent/"text" = a normal message. "history-marker" = the divider inserted
+   * where a member's shared history ends. Anything else (a future attachment
+   * type) renders as a placeholder and is never re-shared.
+   */
+  kind?: string;
 }

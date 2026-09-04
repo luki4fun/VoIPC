@@ -20,6 +20,8 @@ export const lastAcceptSelfSigned = writable<boolean>(false);
 
 // QoL
 export const autoConnect = writable<boolean>(false);
+/** Answer newcomers' requests for recent channel chat (E2E, pairwise). */
+export const shareChannelHistory = writable<boolean>(true);
 
 // Saved servers for the connect dialog
 export interface SavedServer {
@@ -84,6 +86,7 @@ export interface AppConfig {
   saved_servers: SavedServer[];
   sounds: SoundSettings;
   auto_connect: boolean;
+  share_channel_history: boolean;
   chat_history_path: string | null;
   chat_history_disabled: boolean;
 }

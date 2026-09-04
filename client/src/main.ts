@@ -3,7 +3,10 @@ import "./app.css";
 
 const params = new URLSearchParams(window.location.search);
 
-if (params.get("popout") === "screenshare") {
+if (__WEB__ && params.has("selftest")) {
+  // Headless end-to-end test of the web client (see test-web.sh); web build only
+  import("./web/selftest").then((m) => m.run(params));
+} else if (params.get("popout") === "screenshare") {
   import("./lib/components/ScreenSharePopout.svelte").then(({ default: Comp }) => {
     mount(Comp, {
       target: document.getElementById("app")!,

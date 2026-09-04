@@ -1,0 +1,2 @@
+# Standalone workspace: cargo/wasm-pack build here, not in the root target dir.
+/target

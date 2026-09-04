@@ -16,6 +16,26 @@
     savedServers,
     type SavedServer,
   } from "../stores/settings.js";
+  import { isWeb } from "../stores/platform.js";
+  import { pendingInvite } from "../stores/connection.js";
+  import { parseInviteLink } from "../invite.js";
+
+  // Invite link pasted here: takes host/port from it and joins the channel
+  // right after connecting (App.svelte watches pendingInvite)
+  let inviteLink = $state("");
+
+  function applyInviteLink() {
+    const parsed = parseInviteLink(inviteLink);
+    if (!parsed) {
+      if (inviteLink.trim()) error = "Not a VoIPC invite link (expected https://host:port/#channel=…)";
+      return;
+    }
+    host = parsed.host;
+    port = parsed.port;
+    pendingInvite.set(parsed.invite);
+    inviteLink = "";
+    error = "";
+  }
 
   let host = $state($lastHost);
   let port = $state($lastPort);
@@ -113,6 +133,18 @@
     }
   }
 
+  // Offered when the TOFU pin rejected the server's certificate
+  let pinRejected = $derived(error.includes("fingerprint changed"));
+
+  async function forgetPin() {
+    try {
+      await invoke("forget_server_pin", { host, port });
+      error = "";
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
   async function removeSaved(s: SavedServer, e: Event) {
     e.stopPropagation();
     try {
@@ -177,6 +209,29 @@
       </div>
     </div>
 
+    {#if $pendingInvite}
+      <div class="invite-banner">
+        <span>
+          Invited to <strong>#{$pendingInvite.channel}</strong>{#if $pendingInvite.password} (password included){/if}
+          — you join it right after connecting.
+        </span>
+        <button type="button" class="invite-dismiss" onclick={() => pendingInvite.set(null)} title="Discard invite">&#x2715;</button>
+      </div>
+    {:else}
+      <div class="field">
+        <label for="invite">Invite link (optional)</label>
+        <input
+          id="invite"
+          type="text"
+          bind:value={inviteLink}
+          placeholder="https://server:9987/#channel=…"
+          disabled={connecting}
+          onchange={applyInviteLink}
+          onpaste={() => setTimeout(applyInviteLink, 0)}
+        />
+      </div>
+    {/if}
+
     <div class="field">
       <label for="username">Username</label>
       <input
@@ -190,14 +245,20 @@
       />
     </div>
 
-    <label class="checkbox-label">
-      <input type="checkbox" bind:checked={selfSigned} disabled={connecting} />
-      Accept self-signed certificates
-    </label>
+    {#if !isWeb}
+      <label class="checkbox-label">
+        <input type="checkbox" bind:checked={selfSigned} disabled={connecting} />
+        Accept self-signed certificates
+      </label>
 
-    {#if selfSigned}
-      <div class="security-warning">
-        Self-signed mode uses Trust-On-First-Use (TOFU) pinning. The server certificate is trusted on first connect and must match on subsequent connections. Only use this with servers you control.
+      {#if selfSigned}
+        <div class="security-warning">
+          Self-signed mode uses Trust-On-First-Use (TOFU) pinning. The server certificate is trusted on first connect and must match on subsequent connections. Only use this with servers you control.
+        </div>
+      {/if}
+    {:else}
+      <div class="web-hint">
+        The server's TLS certificate must be trusted by your browser; open https://{host}:{port} once and accept it.
       </div>
     {/if}
 
@@ -208,6 +269,16 @@
 
     {#if error}
       <div class="error">{error}</div>
+      {#if pinRejected && !isWeb}
+        <button
+          type="button"
+          class="save-server-btn"
+          onclick={forgetPin}
+          disabled={connecting}
+        >
+          Forget pinned certificate for {host}:{port}
+        </button>
+      {/if}
     {/if}
 
     <div class="btn-row">
@@ -305,6 +376,32 @@
     font-size: 12px;
     color: var(--warning);
     line-height: 1.4;
+  }
+
+  .web-hint {
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.4;
+  }
+
+  .invite-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    font-size: 12px;
+    line-height: 1.4;
+    color: var(--text-primary);
+    background: var(--bg-hover);
+    border-radius: 6px;
+    padding: 8px 10px;
+  }
+
+  .invite-dismiss {
+    margin-left: auto;
+    background: transparent;
+    color: var(--text-secondary);
+    padding: 0 4px;
+    font-size: 12px;
   }
 
   .error {

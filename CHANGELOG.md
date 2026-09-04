@@ -2,7 +2,45 @@
 
 All notable changes to VoIPC are documented here.
 
-## [0.4.0] - 2026-09-02
+## [0.4.0] - 2026-09-04
+
+Protocol version 4 — client and server must be updated together (client-generated media keys, nonce domain separation).
+
+### Added — web client
+- **VoIPC runs in the browser.** Point a browser at `https://your-server:9987` and you get the same app: channels, voice, E2E chat, DMs, pokes, and screen-share viewing. No install, no extension. The server binary embeds the web client, so hosting it is not a separate deployment
+- **Same crypto as the native clients** — the Signal Protocol (libsignal) and AES-256-GCM media encryption are compiled to WebAssembly and run in the page. The server relays the same encrypted bytes it relays for desktop clients and can read no more than before
+- **HTTP/2 and WebTransport, no HTTP/1** — the page is served over HTTP/2 on the existing TLS port; control messages travel on one WebTransport (QUIC) stream and media as QUIC datagrams, with each video frame on its own stream. The TLS listener now offers only `h2` to browsers, so HTTP/1 requests are refused during the handshake. The WebTransport endpoint listens on UDP `web_port` (default 9988; `0` disables the web client) with a short-lived certificate the server generates and rotates itself and publishes by hash to the page — operators configure nothing beyond opening the port
+- **Browser media pipeline** — Opus encode/decode and H.265 decode via WebCodecs, capture and mixing in AudioWorklets with the same 20 ms clock and jitter buffer as the native mixer. Where a browser cannot decode H.265 (Linux browsers today) watching a share says so instead of showing a black frame; voice and chat work everywhere
+- **Not in the web client:** sharing your own screen, the pop-out viewer, global hotkeys, the tray, and the encrypted chat vault (browser chat is in-memory only). Everything else is the desktop feature set. Needs Chrome 97+, Edge 98+, Firefox 130+ or Safari 26.4+ (WebTransport and WebCodecs)
+- Notification sounds in the browser: built-in tones per event (Settings → Sounds), no files needed; phones other than Android (iPhone, iPad) get the mobile layout
+- `build-web.sh` builds it (wasm + Vite + server), `test-web.sh` runs a headless two-browser end-to-end check of voice, chat, DMs, invite links, history hand-off and an admin kick, and `./release.sh` now also emits `release/VoIPC-web-<version>.tar.gz`
+
+### Added — moderation without accounts
+- **Admin sessions.** Any connected user can log in with the server's admin token (status bar → shield). Set `admin_token` in `server.toml`, pass `--admin-token`, or export `VOIPC_ADMIN_TOKEN`; without one the server prints a fresh random token in its log at every start (like a TeamSpeak privilege key). Admins are visible to everyone (shield badge), can kick users from any channel or from the server, and ban an IP for 1 h, 24 h or until restart. Bans live in server memory only, apply to TCP and WebTransport connections alike, and can be lifted from the admin panel. Three wrong tokens disconnect the session
+- Kicks and bans carry a reason; the client shows it and does not auto-reconnect afterwards
+
+### Added — onboarding
+- **Invite links**: `https://your-server:9987/#channel=<name>[&password=…]`. Opened in a browser it lands in the web client with the channel pre-selected and joins it right after connecting; the desktop connect dialog accepts the same link. The fragment never leaves the browser (not sent to the server, not in its logs). *Copy invite link* sits in the channel-list header; the password rides along when your session knows it, otherwise the joiner is asked
+- **Channel history for newcomers**: on joining a channel, one member hands you the last 50 channel messages over your pairwise Signal session (end-to-end; the server relays ciphertext between members only). They appear above a "shared by …" divider and are deduplicated against what you already have. Opt out under Settings → Data. Direct messages are never shared
+
+### Added — UI
+- **Saved servers** — the connect dialog keeps a list of saved servers (★ Save); click an entry to connect
+- **Fullscreen screen-share viewing** — button or double-click, in both the in-app viewer and the pop-out window
+- **Microphone test** — level meter in Settings → Audio Input, works without joining a call
+- Errors are now surfaced as toasts (connection-loss reason, kick/shutdown message, device/channel/chat failures) instead of silently landing in the console
+- Auto-reconnect keeps trying for 5 minutes (was 30 seconds) — survives Wi-Fi roams and laptop sleep; Cancel still available
+
+### Added — quality of life
+- **System tray** — closing the window now hides to the tray and the call keeps running; tray menu offers Show/Hide, Toggle Mute, Toggle Deafen, and Quit (Quit actually exits)
+- **Desktop notifications** — DMs and pokes show an OS notification while the window is unfocused (first launch asks for permission); DMs also flash the taskbar like pokes
+- **Global mute/deafen hotkeys** — optional system-wide hotkeys (Settings → Global Hotkeys) that work while unfocused or in the tray, using the same evdev/rdev machinery as PTT
+- **Mic input gain** — capture-side gain slider (0–400%) next to the output volume; applies live, also visible in the settings mic test
+- **Voice quality indicator** — the status bar shows packet-loss percentage next to the ping (colored: <1% normal, 1–5% orange, ≥5% red), fed by the jitter buffer's conceal counts
+- **Dead-UDP detection** — if keepalive Pongs stop for 35 s while TCP stays up, a sticky warning explains that voice/UDP is blocked (firewall/NAT) instead of silent mute/deafness; clears itself on recovery
+- **Chat next to screen share** — watching a share no longer replaces the chat: it appears in a collapsible pane under the video (desktop)
+- **Copyable links in chat** — URLs in messages are highlighted; clicking opens a copy dialog with the URL preselected (links never open a browser directly)
+- **Skippable chat vault** — the first-run encrypted-history setup can be skipped ("don't save chat history"); chat then stays in memory only. Re-enable under Settings → Data
+- Version-mismatch errors now say which version the server runs and that the client needs updating
 
 ### Changed — screen share encoding performance
 - **Windows builds now include hardware H.265 encoders** — vcpkg FFmpeg is installed as `ffmpeg[x265,nvcodec,amf,qsv]`, enabling NVIDIA NVENC, AMD AMF, and Intel QuickSync (previously every Windows user encoded on the CPU with libx265). NVENC/AMF load from the GPU driver at runtime; QSV ships the Intel oneVPL dispatcher DLL. Re-run `.\setup.ps1` to pick up the new features
@@ -29,32 +67,35 @@ All notable changes to VoIPC are documented here.
 - Voice nonce sequence persists across PTT presses (an AES-GCM nonce could previously repeat after a restart of the counter)
 - Server relays voice packets without re-parsing the payload and no longer holds the channel lock across sends (a join/leave can no longer stall voice for everyone)
 - Speaking indicators are edge-triggered (one event per talk burst instead of one per packet)
+- Connect has a 10 s deadline per phase (TCP, TLS, auth) — a black-holed host no longer pins the reconnect loop and its Cancel button for minutes
+- The TCP reader times out after 150 s without data (two missed server pings), so a silently dead path (Wi-Fi roam, laptop sleep, NAT expiry) triggers auto-reconnect instead of a frozen session
+- The UDP receiver survives `recv` errors (Windows reported `WSAECONNRESET` after any ICMP unreachable and voice died for the rest of the session)
+- Concurrent connects (reconnect loop vs. manual connect) are serialized; the loser's tasks no longer leak
+- A second `connection-lost` during a reconnect (server shutdown is followed by the socket closing) no longer hides the reconnect overlay while the retry loop keeps running; cancelling a reconnect discards an attempt that was already in flight
+- Signal state is reset on every connect. Identities are ephemeral by design; keeping the store across a server restart made libsignal reject peers whose reassigned user id had belonged to someone else
+- TOFU pins are keyed by `host:port` (two self-signed servers on one machine no longer read as a MITM of each other) and can be forgotten from the connect dialog after a legitimate certificate change
+- Server per-IP connection cap raised from 5 to 10: a browser holds two slots (the HTTP/2 page connection and the WebTransport session), so the old cap allowed only two web users behind one NAT
 
 ### Security
+- **Media keys never touch the server.** Until now the server generated every channel's AES-256-GCM key and sent it to each joiner over TLS, so a server operator could decrypt all voice, video and screen-share audio despite the "blind relay" claim. The first member of a channel now generates the key on the client; existing members hand it to each joiner over their pairwise Signal session (`DistributeMediaKey`, which the server relays without being able to read). The server-issued `ChannelMediaKey` message is gone. Re-keying when a member leaves is not implemented yet (the server stops relaying to them; on-path capture of later packets would still decrypt) — planned as a follow-up
 - **Fixed AES-GCM nonce reuse across media streams** — voice, screen-share audio, and video encrypt under the same channel key but kept independent sequence counters, so talking while screen-sharing produced identical key+nonce pairs on different plaintexts. The packet-type byte now domain-separates the nonce, and screen-share frame/audio counters persist across shares instead of restarting at 0. Old and new clients cannot decrypt each other's media — update all clients together
-- Server caps keyframe requests at ~1/s per viewer (previously a viewer could force ~50 IDRs/s onto a sharer via the generic message budget)
-
-### Added — UI
-- **Saved servers** — the connect dialog keeps a list of saved servers (★ Save); click an entry to connect
-- **Fullscreen screen-share viewing** — button or double-click, in both the in-app viewer and the pop-out window
-- **Microphone test** — level meter in Settings → Audio Input, works without joining a call
-- Errors are now surfaced as toasts (connection-loss reason, kick/shutdown message, device/channel/chat failures) instead of silently landing in the console
-- Auto-reconnect keeps trying for 5 minutes (was 30 seconds) — survives Wi-Fi roams and laptop sleep; Cancel still available
-
-### Added — quality of life
-- **System tray** — closing the window now hides to the tray and the call keeps running; tray menu offers Show/Hide, Toggle Mute, Toggle Deafen, and Quit (Quit actually exits)
-- **Desktop notifications** — DMs and pokes show an OS notification while the window is unfocused (first launch asks for permission); DMs also flash the taskbar like pokes
-- **Global mute/deafen hotkeys** — optional system-wide hotkeys (Settings → Global Hotkeys) that work while unfocused or in the tray, using the same evdev/rdev machinery as PTT
-- **Mic input gain** — capture-side gain slider (0–400%) next to the output volume; applies live, also visible in the settings mic test
-- **Voice quality indicator** — the status bar shows packet-loss percentage next to the ping (colored: <1% normal, 1–5% orange, ≥5% red), fed by the jitter buffer's conceal counts
-- **Dead-UDP detection** — if keepalive Pongs stop for 35 s while TCP stays up, a sticky warning explains that voice/UDP is blocked (firewall/NAT) instead of silent mute/deafness; clears itself on recovery
-- **Chat next to screen share** — watching a share no longer replaces the chat: it appears in a collapsible pane under the video (desktop)
-- **Copyable links in chat** — URLs in messages are highlighted; clicking opens a copy dialog with the URL preselected (links never open a browser directly)
-- **Skippable chat vault** — the first-run encrypted-history setup can be skipped ("don't save chat history"); chat then stays in memory only. Re-enable under Settings → Data
-- **E2E identity warning** — if a contact's encryption identity key changes (potential impersonation), a sticky warning names the user and stays until dismissed
-- Version-mismatch errors now say which version the server runs and that the client needs updating
+- **No plaintext media, ever.** Voice, video and screen audio were sent unencrypted whenever no media key was installed (e.g. the moment after a channel switch in voice-activation mode), and receivers accepted plaintext packet types even with a key present. Senders now drop frames until a key is installed (the UI shows a warning if that takes more than 2 s) and both the server relay and the client receiver drop the plaintext types
+- **UDP source check on the client.** The receiver accepted datagrams from any address; anyone who learned the client's endpoint could inject packets or spoof keepalive replies. Only packets from the server's UDP address are processed
+- **Relay no longer leaks `udp_token`.** Every forwarded voice/video packet carried the sender's secret UDP token in its header. Combined with the new NAT rebind, a channel member behind the same public IP (CGNAT, office NAT, shared VPN exit) could rebind — hijack or black-hole — another member's voice. The server zeroes the token before forwarding
+- **Server hardening:** TLS handshake timeout (idle TCP sockets could hold all 256 connection slots forever); a malformed frame length now disconnects instead of growing the read buffer without bound; control-message sends are non-blocking so one client that stops reading can no longer stall broadcasts (and, through DashMap shard locks, the whole server); a failed `Authenticated` write no longer leaks the reserved username/session; pre-key bundle requests are rate-limited (one user could drain anyone's one-time pre-keys in seconds); pokes share the chat rate limit; keyframe requests are capped at ~1/s per viewer and only honoured from actual viewers of that share (previously a viewer could force ~50 IDRs/s onto a sharer); a kicked user's screen-share state is torn down like on leave (a kicked viewer kept receiving video)
+- **Client:** a client-forged UDP Pong is no longer relayed as voice (it spoofed RTT/keepalive on every receiver); peer text is escaped before it reaches OS notification bodies (freedesktop daemons render markup)
 
 ### Fixed
+- A rejected channel join (wrong password, channel full) no longer drops the current channel's media key and channel state — the switch is applied only once the server confirms it. Previously voice went silent until the next successful channel change
+- Tray *Toggle Mute* / *Toggle Deafen* did nothing (event names didn't match the listeners)
+- Voice-activation / always-on mode did not restart the microphone after a reconnect
+- Releasing the PTT key while focus was in the chat box left the microphone open
+- Switching between sharers could freeze the video until the next keyframe (screen-audio packets updated the sharer tracker without resetting the frame assembler)
+- The sticky "UDP blocked" warning survived a successful reconnect
+- Global PTT (evdev): unplugging the last keyboard made the listener spin at 100 % CPU and flood the log; PTT is released if it was held at that moment
+- Server: the auto-delete timer aborted its own task, sometimes cancelling the `ChannelDeleted` broadcast; unanswered invites of users who disconnected stayed in the invite list forever
+- Auto-connect never fired for users who skipped the encrypted chat vault (it waited for an unlock that could not happen)
+- Removed dead code: `ts3_bridge.rs` (uncompilable), Signal state persistence (`persistence.rs`, never called), two unused Tauri commands
 - Dropdown menus rendered with a native white background and gray text on Linux — WebKitGTK ignores themed `<select>` styling unless `appearance: none` is set; all selects now render dark with a custom chevron
 - The client crashed on startup when no appindicator library was installed (libappindicator-sys panics on load) — the tray is now optional: without it the app logs a warning and closing the window quits instead of hiding to tray
 - The client crashed on NVIDIA + Wayland ("Gdk Error 71 dispatching to Wayland display") — WebKitGTK's DMA-BUF renderer is now disabled by default (`WEBKIT_DISABLE_DMABUF_RENDERER=1`, overridable via the environment)

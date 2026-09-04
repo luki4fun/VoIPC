@@ -3,8 +3,6 @@
 //! Uses X3DH key agreement to establish sessions, then the Double Ratchet
 //! algorithm for ongoing message encryption with forward secrecy.
 
-use std::time::SystemTime;
-
 use libsignal_protocol::{
     message_decrypt, message_decrypt_prekey, message_encrypt, process_prekey_bundle,
     CiphertextMessageType, IdentityKey, PreKeyBundle, PreKeyId, ProtocolAddress, PublicKey,
@@ -57,7 +55,7 @@ pub async fn establish_session(
         &mut stores.session,
         &mut stores.identity,
         &bundle,
-        SystemTime::now(),
+        crate::time::now(),
         &mut OsRng,
     )
     .await?;
@@ -79,7 +77,7 @@ pub async fn encrypt_message(
         &address,
         &mut stores.session,
         &mut stores.identity,
-        SystemTime::now(),
+        crate::time::now(),
     )
     .await?;
 

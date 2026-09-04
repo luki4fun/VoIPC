@@ -23,7 +23,7 @@ pub async fn run_udp_loop(socket: Arc<UdpSocket>, state: Arc<ServerState>) {
             }
         };
 
-        let data = &buf[..len];
+        let data = &mut buf[..len];
 
         if data.is_empty() {
             continue;
@@ -31,20 +31,33 @@ pub async fn run_udp_loop(socket: Arc<UdpSocket>, state: Arc<ServerState>) {
 
         let packet_type_byte = data[0];
 
+        // Only encrypted media is relayed. Plaintext voice/video types exist
+        // in the wire format but no keyed client ever sends them — accepting
+        // them here would let anyone on-path inject audio into a channel.
         match packet_type_byte {
-            // Voice packets: 0x01-0x05 (includes encrypted voice 0x05)
-            0x01..=0x05 => {
+            // Voice control + encrypted voice (EOT 0x02, Ping 0x03, encrypted 0x05).
+            // Pong (0x04) is server→client only; a relayed one would spoof RTT
+            // and keepalive state on every receiver.
+            0x02 | 0x03 | 0x05 => {
                 handle_voice_packet(data, src_addr, &socket, &state).await;
             }
-            // Video / screen-share audio packets: 0x10-0x15 (includes encrypted 0x13-0x15)
-            0x10..=0x15 => {
+            // Encrypted video fragments (0x13, 0x14) + encrypted screen audio (0x15)
+            0x13..=0x15 => {
                 handle_video_packet(data, src_addr, &socket, &state).await;
             }
             _ => {
-                debug!(src = %src_addr, "unknown UDP packet type: 0x{:02x}", packet_type_byte);
+                debug!(src = %src_addr, "dropping UDP packet type: 0x{:02x}", packet_type_byte);
             }
         }
     }
+}
+
+/// Zero the sender's udp_token (bytes 5..13 of every media header) before a
+/// packet is forwarded. The token authenticates NAT rebinds in
+/// `resolve_session`; relaying it verbatim handed it to every peer, and a
+/// peer behind the same public IP could then hijack the sender's binding.
+fn scrub_token(data: &mut [u8]) {
+    data[5..13].fill(0);
 }
 
 /// Handle a voice packet (existing SFU logic — forward to all channel members except sender).
@@ -52,13 +65,13 @@ pub async fn run_udp_loop(socket: Arc<UdpSocket>, state: Arc<ServerState>) {
 /// Only the header is parsed — the payload is relayed verbatim, so no
 /// per-packet payload allocation on the hot path.
 async fn handle_voice_packet(
-    data: &[u8],
+    data: &mut [u8],
     src_addr: std::net::SocketAddr,
     socket: &UdpSocket,
     state: &ServerState,
 ) {
     if data.len() < VOICE_HEADER_SIZE {
-        warn!(src = %src_addr, "voice packet too short");
+        debug!(src = %src_addr, "voice packet too short");
         return;
     }
     let packet_type = data[0];
@@ -111,6 +124,8 @@ async fn handle_voice_packet(
         return;
     }
 
+    scrub_token(data);
+
     // Collect recipient addresses, then release the channels lock BEFORE
     // sending — the lock is write-preferring, so holding it across awaited
     // sends would let any join/leave stall voice for the whole server.
@@ -142,7 +157,7 @@ async fn handle_voice_packet(
 
 /// Handle a video packet — forward ONLY to viewers of this sharer (not all channel members).
 async fn handle_video_packet(
-    data: &[u8],
+    data: &mut [u8],
     src_addr: std::net::SocketAddr,
     socket: &UdpSocket,
     state: &ServerState,
@@ -150,7 +165,7 @@ async fn handle_video_packet(
     // Video packets have the same session_id/udp_token layout as voice packets
     // at bytes 1-4 (session_id) and 5-12 (udp_token), so we can reuse the header parsing
     if data.len() < VOICE_HEADER_SIZE {
-        warn!(src = %src_addr, "video packet too short");
+        debug!(src = %src_addr, "video packet too short");
         return;
     }
 
@@ -185,6 +200,8 @@ async fn handle_video_packet(
     if channel_id == 0 {
         return;
     }
+
+    scrub_token(data);
 
     // Get viewer addresses for this sharer (only viewers, not all channel members)
     let viewer_addrs = state
@@ -233,7 +250,9 @@ fn resolve_session(
     // udp_addr assignment all happen atomically under the same DashMap shard lock.
     let mut session = state.sessions.get_mut(&packet_session_id)?;
     if session.udp_token != packet_udp_token {
-        warn!(
+        // debug, not warn: reachable by anyone on the internet before any
+        // rate limit, and this task also relays everyone's voice
+        debug!(
             session_id = packet_session_id,
             src = %src_addr,
             "rejected UDP: invalid token"
@@ -286,4 +305,18 @@ fn resolve_session(
         "learned UDP address"
     );
     Some(packet_session_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scrub_token_zeroes_only_the_token_bytes() {
+        let mut pkt: Vec<u8> = (1u8..=20).collect();
+        scrub_token(&mut pkt);
+        assert_eq!(&pkt[..5], &[1, 2, 3, 4, 5]);
+        assert_eq!(&pkt[5..13], &[0u8; 8]);
+        assert_eq!(&pkt[13..], &[14, 15, 16, 17, 18, 19, 20]);
+    }
 }

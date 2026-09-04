@@ -15,7 +15,7 @@
     receiverResolution,
     receiverFramesDropped,
   } from "../stores/screenshare.js";
-  import { isMobile } from "../stores/platform.js";
+  import { isMobile, isWeb } from "../stores/platform.js";
   import { addNotification } from "../stores/notifications.js";
 
   let bitrateLabel = $derived(
@@ -55,6 +55,16 @@
   onDestroy(() => {
     rafScheduled = false;
     pendingFrame = null;
+  });
+
+  // Web: the backend decodes straight into this canvas (registered through
+  // the window bridge so this component never imports web-only code)
+  let canvasEl = $state<HTMLCanvasElement | null>(null);
+  $effect(() => {
+    if (!isWeb) return;
+    const bridge = (window as any).__voipc_web;
+    bridge?.setVideoCanvas(canvasEl);
+    return () => bridge?.setVideoCanvas(null);
   });
 
   async function stopWatching() {
@@ -133,7 +143,7 @@
       </span>
     {/if}
     <button class="popout-btn fullscreen-btn" onclick={toggleFullscreen} title="Fullscreen (double-click video)">&#x26F6;</button>
-    {#if !$isMobile}
+    {#if !$isMobile && !isWeb}
       <button class="popout-btn no-auto-margin" onclick={popOut} title="Pop out to separate window">&#8599;</button>
     {/if}
     <button class="stop-btn" onclick={stopWatching}>Stop Watching</button>
@@ -145,7 +155,12 @@
     ondblclick={toggleFullscreen}
     role="presentation"
   >
-    {#if displayFrame}
+    {#if isWeb}
+      <canvas class="frame" class:hidden={!displayFrame} bind:this={canvasEl}></canvas>
+      {#if !displayFrame}
+        <div class="waiting">Waiting for video stream...</div>
+      {/if}
+    {:else if displayFrame}
       <img src={displayFrame} alt="Screen share" class="frame" />
     {:else}
       <div class="waiting">Waiting for video stream...</div>
@@ -302,6 +317,10 @@
     max-width: 100%;
     max-height: 100%;
     object-fit: contain;
+  }
+
+  .frame.hidden {
+    display: none;
   }
 
   .waiting {

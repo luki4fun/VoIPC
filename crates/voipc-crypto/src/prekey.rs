@@ -61,11 +61,7 @@ pub async fn generate_prekeys(
     // Generate signed pre-key
     let signed_prekey_id = SignedPreKeyId::from(1u32);
     let signed_key_pair = KeyPair::generate(&mut OsRng);
-    let timestamp_millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64;
-    let timestamp = Timestamp::from_epoch_millis(timestamp_millis);
+    let timestamp = Timestamp::from_epoch_millis(crate::time::now_millis());
 
     let signature = identity_key_pair
         .private_key()

@@ -140,8 +140,10 @@ pub enum ClientMessage {
     DistributeMediaKey {
         channel_id: ChannelId,
         target_user_id: UserId,
-        /// Media key encrypted with the pairwise Signal session.
+        /// `MediaKey::to_bytes()` encrypted with the pairwise Signal session.
         encrypted_media_key: Vec<u8>,
+        /// 1 = PreKeySignalMessage, 2 = SignalMessage.
+        message_type: u8,
     },
 
     /// Poke another user (like TeamSpeak). Shows a popup + sound on their end.
@@ -149,6 +151,46 @@ pub enum ClientMessage {
     SendPoke {
         target_user_id: UserId,
         ciphertext: Vec<u8>,
+        message_type: u8,
+    },
+
+    // ── Moderation (admin token session) ─────────────────────────────
+
+    /// Turn this session into a server admin with the server's admin token.
+    AdminLogin { token: String },
+
+    /// Disconnect a user from the server (admin only).
+    AdminKick { user_id: UserId, reason: String },
+
+    /// Disconnect a user and ban their IP (admin only).
+    /// `duration_secs` 0 = until the server restarts.
+    AdminBan {
+        user_id: UserId,
+        reason: String,
+        duration_secs: u32,
+    },
+
+    /// Lift an IP ban (admin only).
+    AdminUnban { ip: String },
+
+    /// Request the list of active bans (admin only).
+    AdminListBans,
+
+    // ── Channel history hand-off (E2E) ───────────────────────────────
+
+    /// Ask a channel member to share recent channel chat with us.
+    RequestChannelHistory {
+        channel_id: ChannelId,
+        target_user_id: UserId,
+    },
+
+    /// Recent channel chat for a newcomer, encrypted with the pairwise
+    /// Signal session (JSON `{ v, messages: [...] }` inside).
+    SendChannelHistory {
+        channel_id: ChannelId,
+        target_user_id: UserId,
+        ciphertext: Vec<u8>,
+        /// 1 = PreKeySignalMessage, 2 = SignalMessage.
         message_type: u8,
     },
 }
@@ -320,18 +362,13 @@ pub enum ServerMessage {
     },
 
     /// A media encryption key was received (peer-to-peer, encrypted via Signal).
+    /// The server relays it blind; it never holds media keys.
     MediaKeyReceived {
         channel_id: ChannelId,
         from_user_id: UserId,
         encrypted_media_key: Vec<u8>,
-    },
-
-    /// Server-issued media encryption key for a channel (sent over TLS).
-    /// Used when Signal sessions are not established for peer-to-peer key exchange.
-    ChannelMediaKey {
-        channel_id: ChannelId,
-        key_id: u16,
-        key_bytes: Vec<u8>,
+        /// 1 = PreKeySignalMessage, 2 = SignalMessage.
+        message_type: u8,
     },
 
     /// Another user poked you. Message is E2E encrypted ciphertext.
@@ -339,6 +376,40 @@ pub enum ServerMessage {
         from_user_id: UserId,
         from_username: String,
         ciphertext: Vec<u8>,
+        message_type: u8,
+    },
+
+    // ── Moderation ───────────────────────────────────────────────────
+
+    /// A user's admin status changed (broadcast to everyone; the admin's own
+    /// client sees its login confirmed this way).
+    AdminStatus { user_id: UserId, is_admin: bool },
+
+    /// An admin command was refused.
+    AdminError { reason: String },
+
+    /// Active IP bans (admin only; reply to AdminListBans and after changes).
+    AdminBans { bans: Vec<BanInfo> },
+
+    /// The server is closing this connection (kick or ban). Clients must not
+    /// auto-reconnect.
+    Disconnected { reason: String },
+
+    // ── Channel history hand-off ─────────────────────────────────────
+
+    /// A newcomer asks you for recent chat of the channel you share.
+    ChannelHistoryRequested {
+        channel_id: ChannelId,
+        from_user_id: UserId,
+    },
+
+    /// Recent channel chat from a member (pairwise-encrypted).
+    ChannelHistoryReceived {
+        channel_id: ChannelId,
+        from_user_id: UserId,
+        from_username: String,
+        ciphertext: Vec<u8>,
+        /// 1 = PreKeySignalMessage, 2 = SignalMessage.
         message_type: u8,
     },
 }

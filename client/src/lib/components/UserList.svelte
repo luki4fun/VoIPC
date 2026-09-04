@@ -2,7 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { channels, currentChannelId, previewChannelId, previewUsers } from "../stores/channels.js";
   import { users, speakingUsers } from "../stores/users.js";
-  import { userId } from "../stores/connection.js";
+  import { userId, isAdmin } from "../stores/connection.js";
   import { openDm } from "../stores/chat.js";
   import { watchingUserId, currentFrame } from "../stores/screenshare.js";
   import { addNotification } from "../stores/notifications.js";
@@ -41,9 +41,10 @@
     currentChannelCreatorId === $userId && $currentChannelId !== 0
   );
 
-  // Kick is only available when viewing own channel (not previewing)
+  // Channel kick: the creator in their own channel, an admin in any channel
   let canKick = $derived(
-    !isPreviewing && displayChannelCreatorId === $userId && $currentChannelId !== 0
+    displayChannelId !== 0 &&
+      ((!isPreviewing && displayChannelCreatorId === $userId) || $isAdmin)
   );
 
   // Invite is available when previewing another channel and you're creator of your current channel
@@ -54,7 +55,7 @@
   async function kickUser(targetUserId: number) {
     try {
       await invoke("kick_user", {
-        channelId: $currentChannelId,
+        channelId: displayChannelId,
         userId: targetUserId,
       });
     } catch (e) {
@@ -106,6 +107,42 @@
       sendPoke();
     } else if (e.key === "Escape") {
       cancelPoke();
+    }
+  }
+
+  // Admin actions (server kick / IP ban) ask for a reason first
+  type AdminAction = { kind: "kick" | "ban"; userId: number; username: string; durationSecs: number; label: string };
+  let adminAction = $state<AdminAction | null>(null);
+  let adminReason = $state("");
+
+  function openAdminAction(user: UserInfo, kind: "kick" | "ban", durationSecs: number, label: string) {
+    adminAction = { kind, userId: user.user_id, username: user.username, durationSecs, label };
+    adminReason = "";
+  }
+
+  async function confirmAdminAction() {
+    if (!adminAction) return;
+    const a = adminAction;
+    const reason = adminReason;
+    adminAction = null;
+    adminReason = "";
+    try {
+      if (a.kind === "kick") {
+        await invoke("admin_kick", { userId: a.userId, reason });
+      } else {
+        await invoke("admin_ban", { userId: a.userId, reason, durationSecs: a.durationSecs });
+      }
+    } catch (e) {
+      addNotification(`Admin action failed: ${e}`, "error");
+    }
+  }
+
+  function handleAdminKeydown(e: KeyboardEvent) {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      confirmAdminAction();
+    } else if (e.key === "Escape") {
+      adminAction = null;
     }
   }
 
@@ -214,6 +251,9 @@
           {#if user.user_id === displayChannelCreatorId && displayChannelId !== 0}
             <span class="crown" title="Channel creator"><Icon name="crown" size={12} /></span>
           {/if}
+          {#if user.is_admin}
+            <span class="shield" title="Server admin"><Icon name="shield" size={12} /></span>
+          {/if}
           {#if user.user_id === $userId}
             <span class="you">(you)</span>
           {/if}
@@ -285,7 +325,26 @@
         <div class="ctx-separator"></div>
         <button class="ctx-item danger" onclick={() => { kickUser(contextMenu!.user.user_id); closeContextMenu(); }}>
           <Icon name="kick" size={16} />
-          <span>Kick</span>
+          <span>Kick from channel</span>
+        </button>
+      {/if}
+      {#if $isAdmin}
+        <div class="ctx-separator"></div>
+        <button class="ctx-item danger" onclick={() => { openAdminAction(contextMenu!.user, "kick", 0, "Kick from server"); closeContextMenu(); }}>
+          <Icon name="shield" size={16} />
+          <span>Kick from server</span>
+        </button>
+        <button class="ctx-item danger" onclick={() => { openAdminAction(contextMenu!.user, "ban", 3600, "Ban for 1 hour"); closeContextMenu(); }}>
+          <Icon name="ban" size={16} />
+          <span>Ban 1 hour</span>
+        </button>
+        <button class="ctx-item danger" onclick={() => { openAdminAction(contextMenu!.user, "ban", 86400, "Ban for 24 hours"); closeContextMenu(); }}>
+          <Icon name="ban" size={16} />
+          <span>Ban 24 hours</span>
+        </button>
+        <button class="ctx-item danger" onclick={() => { openAdminAction(contextMenu!.user, "ban", 0, "Ban until server restart"); closeContextMenu(); }}>
+          <Icon name="ban" size={16} />
+          <span>Ban until restart</span>
         </button>
       {/if}
       {#if !isPreviewing}
@@ -337,6 +396,34 @@
   </div>
 {/if}
 
+{#if adminAction}
+  <div class="poke-overlay" onclick={() => (adminAction = null)} onkeydown={() => {}} role="presentation">
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+    <div class="poke-dialog" onclick={(e) => e.stopPropagation()}>
+      <div class="poke-dialog-header">{adminAction.label}: {adminAction.username}</div>
+      {#if adminAction.kind === "ban"}
+        <div class="admin-hint">
+          Bans the user's IP address, so everyone behind the same address is affected.
+          Bans live in server memory until they expire or the server restarts.
+        </div>
+      {/if}
+      <input
+        class="poke-input"
+        type="text"
+        placeholder="Reason (shown to the user)"
+        bind:value={adminReason}
+        onkeydown={handleAdminKeydown}
+        maxlength="200"
+        autofocus
+      />
+      <div class="poke-dialog-actions">
+        <button class="poke-cancel-btn" onclick={() => (adminAction = null)}>Cancel</button>
+        <button class="poke-send-btn danger" onclick={confirmAdminAction}>{adminAction.kind === "kick" ? "Kick" : "Ban"}</button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
   .user-list {
     display: flex;
@@ -379,6 +466,24 @@
 
   .user.speaking {
     background: rgba(76, 175, 80, 0.1);
+  }
+
+  .shield {
+    display: inline-flex;
+    color: var(--accent);
+    margin-left: 4px;
+    vertical-align: middle;
+  }
+
+  .admin-hint {
+    font-size: 12px;
+    color: var(--text-secondary);
+    line-height: 1.4;
+    margin-bottom: 8px;
+  }
+
+  .poke-send-btn.danger {
+    background: var(--danger);
   }
 
   .indicator {

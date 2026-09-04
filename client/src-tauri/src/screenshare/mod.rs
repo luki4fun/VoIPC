@@ -519,7 +519,9 @@ impl FrameProcessor {
                         }
                     }
                 } else {
-                    pkt
+                    // Never send plaintext: no key means we are still waiting
+                    // for the channel's media key (the viewer sees a gap).
+                    continue;
                 };
 
                 let bytes = final_pkt.to_bytes();
@@ -714,13 +716,8 @@ impl AudioProcessor {
                     }
                 }
             } else {
-                ScreenShareAudioPacket::new(
-                    self.session_id,
-                    self.udp_token,
-                    self.sequence,
-                    timestamp,
-                    opus_data,
-                )
+                // Never send plaintext (see the video path above)
+                continue;
             };
 
             match self.audio_tx.try_send(packet.to_bytes()) {

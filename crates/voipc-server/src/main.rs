@@ -10,7 +10,7 @@ use dashmap::DashMap;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio_rustls::TlsAcceptor;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod channels;
 mod config;
@@ -18,6 +18,7 @@ mod settings;
 mod state;
 mod tcp;
 mod udp;
+mod web;
 
 use config::ServerConfig;
 use state::ServerState;
@@ -46,6 +47,10 @@ struct Args {
     #[arg(long)]
     udp_port: Option<u16>,
 
+    /// WebTransport UDP port for the web client (0 disables it), overrides config
+    #[arg(long)]
+    web_port: Option<u16>,
+
     /// Bind address (IP), overrides config
     #[arg(long)]
     host: Option<String>,
@@ -57,6 +62,58 @@ struct Args {
     /// Path to persistent channels file (JSON)
     #[arg(long)]
     channels: Option<String>,
+
+    /// Admin token (overrides config and VOIPC_ADMIN_TOKEN); unset = generated per start
+    #[arg(long)]
+    admin_token: Option<String>,
+}
+
+/// Connection caps shared by the TCP and WebTransport accept loops.
+pub struct ConnLimits {
+    total: AtomicU32,
+    per_ip: DashMap<IpAddr, u32>,
+}
+
+impl ConnLimits {
+    /// A browser holds two slots (the HTTP/2 page connection and the
+    /// WebTransport session), a native client one.
+    const MAX_PER_IP: u32 = 10;
+    const MAX_TOTAL: u32 = 256;
+
+    pub fn new() -> Self {
+        Self {
+            total: AtomicU32::new(0),
+            per_ip: DashMap::new(),
+        }
+    }
+
+    /// Take a slot for `ip`. On `Err` nothing was taken; the value is the
+    /// reason for the log line.
+    pub fn acquire(&self, ip: IpAddr) -> Result<(), &'static str> {
+        if self.total.load(Ordering::Relaxed) >= Self::MAX_TOTAL {
+            return Err("global limit reached");
+        }
+        {
+            let mut count = self.per_ip.entry(ip).or_insert(0);
+            if *count >= Self::MAX_PER_IP {
+                return Err("per-IP limit reached");
+            }
+            *count += 1;
+        }
+        self.total.fetch_add(1, Ordering::Relaxed);
+        Ok(())
+    }
+
+    pub fn release(&self, ip: IpAddr) {
+        self.total.fetch_sub(1, Ordering::Relaxed);
+        if let Some(mut count) = self.per_ip.get_mut(&ip) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                drop(count);
+                self.per_ip.remove(&ip);
+            }
+        }
+    }
 }
 
 #[tokio::main]
@@ -98,8 +155,18 @@ async fn main() -> Result<()> {
     if let Some(port) = args.udp_port {
         config.udp_port = port;
     }
+    if let Some(port) = args.web_port {
+        config.web_port = port;
+    }
     if let Some(host) = args.host {
         config.host = host;
+    }
+    if let Some(token) = args
+        .admin_token
+        .or_else(|| std::env::var("VOIPC_ADMIN_TOKEN").ok())
+        .filter(|t| !t.is_empty())
+    {
+        config.admin_token = Some(token);
     }
 
     // Load server settings (JSON)
@@ -129,6 +196,7 @@ async fn main() -> Result<()> {
         host = %config.host,
         tcp_port = config.tcp_port,
         udp_port = config.udp_port,
+        web_port = config.web_port,
         max_users = config.max_users,
         empty_channel_timeout = server_settings.empty_channel_timeout_secs,
         persistent_channels = persistent_channels.len(),
@@ -138,15 +206,35 @@ async fn main() -> Result<()> {
     let certs = load_certs(&config.cert_path)?;
     let key = load_key(&config.key_path)?;
 
-    let tls_config = rustls::ServerConfig::builder()
+    let mut tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .context("invalid TLS configuration")?;
+    // Browsers get the web client over HTTP/2 only; the native client sends
+    // no ALPN and takes the control-protocol path. Anything offering just
+    // http/1.1 fails the handshake.
+    tls_config.alpn_protocols = vec![b"h2".to_vec()];
 
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
+    // Admin token: configured, or generated for this run and shown once
+    // (like a TeamSpeak privilege key). Nothing is persisted.
+    let admin_token = match config.admin_token.clone().filter(|t| !t.is_empty()) {
+        Some(token) => token,
+        None => {
+            let token = hex::encode(rand::random::<[u8; 32]>());
+            info!("no admin_token configured — admin token for this run: {token}");
+            token
+        }
+    };
+
     // Create shared state
-    let state = Arc::new(ServerState::new(&config, server_settings, persistent_channels));
+    let state = Arc::new(ServerState::new(
+        &config,
+        server_settings,
+        persistent_channels,
+        admin_token,
+    ));
 
     // Bind TCP listener
     let tcp_listener = TcpListener::bind(format!("{}:{}", config.host, config.tcp_port))
@@ -201,14 +289,28 @@ async fn main() -> Result<()> {
         udp::run_udp_loop(udp_sock, udp_state).await;
     });
 
+    let limits = Arc::new(ConnLimits::new());
+
+    // Web client: WebTransport endpoint + the page's /wt.json data
+    let wt_info = if config.web_port != 0 {
+        let web = web::WebTransport::bind(&config)?;
+        let wt_info = web.info();
+        let media_addr = udp_socket
+            .local_addr()
+            .context("failed to read UDP socket address")?;
+        tokio::spawn(web.run(state.clone(), media_addr, limits.clone()));
+        info!(
+            "web client at https://{}:{}/ (WebTransport on UDP {})",
+            config.host, config.tcp_port, config.web_port
+        );
+        Some(wt_info)
+    } else {
+        info!("web client disabled (web_port = 0)");
+        None
+    };
+
     // TCP accept loop with connection limits
     info!("server ready, accepting connections");
-
-    const MAX_CONNECTIONS_PER_IP: u32 = 5;
-    const MAX_TOTAL_CONNECTIONS: u32 = 256;
-
-    let active_connections = Arc::new(AtomicU32::new(0));
-    let per_ip_connections: Arc<DashMap<IpAddr, u32>> = Arc::new(DashMap::new());
 
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -232,25 +334,17 @@ async fn main() -> Result<()> {
 
         let peer_ip = peer_addr.ip();
 
-        // Global connection limit
-        if active_connections.load(Ordering::Relaxed) >= MAX_TOTAL_CONNECTIONS {
-            warn!(peer = %peer_addr, "rejecting connection: global limit reached");
+        if state.is_banned(peer_ip) {
+            debug!(peer = %peer_addr, "rejecting connection: banned");
             drop(tcp_stream);
             continue;
         }
 
-        // Per-IP connection limit
-        {
-            let mut count = per_ip_connections.entry(peer_ip).or_insert(0);
-            if *count >= MAX_CONNECTIONS_PER_IP {
-                warn!(peer = %peer_addr, "rejecting connection: per-IP limit reached");
-                drop(tcp_stream);
-                continue;
-            }
-            *count += 1;
+        if let Err(reason) = limits.acquire(peer_ip) {
+            warn!(peer = %peer_addr, "rejecting connection: {reason}");
+            drop(tcp_stream);
+            continue;
         }
-
-        active_connections.fetch_add(1, Ordering::Relaxed);
 
         // Set TCP keepalive to detect dead connections within ~25 seconds
         {
@@ -266,28 +360,45 @@ async fn main() -> Result<()> {
 
         let tls_acceptor = tls_acceptor.clone();
         let state = state.clone();
-        let conn_count = active_connections.clone();
-        let ip_conns = per_ip_connections.clone();
+        let limits = limits.clone();
+        let wt_info = wt_info.clone();
 
         tokio::spawn(async move {
-            match tls_acceptor.accept(tcp_stream).await {
-                Ok(tls_stream) => {
-                    tcp::handle_connection(tls_stream, state).await;
+            // The 5 s auth timeout only starts after TLS completes; without a
+            // deadline here an idle TCP socket (no ClientHello) holds one of
+            // the 256 slots forever.
+            match tokio::time::timeout(Duration::from_secs(10), tls_acceptor.accept(tcp_stream))
+                .await
+            {
+                Ok(Ok(tls_stream)) => {
+                    if tls_stream.get_ref().1.alpn_protocol() == Some(&b"h2"[..]) {
+                        web::serve_h2(tls_stream, wt_info, peer_addr).await;
+                    } else {
+                        tcp::handle_connection(
+                            tls_stream,
+                            peer_addr.to_string(),
+                            peer_addr.ip(),
+                            peer_addr.ip(),
+                            state,
+                        )
+                        .await;
+                    }
                 }
-                Err(e) => {
-                    error!(peer = %peer_addr, "TLS handshake failed: {}", e);
+                Ok(Err(e)) => {
+                    // Browsers open speculative connections and drop them
+                    // without a ClientHello; that is normal traffic, not an error.
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        debug!(peer = %peer_addr, "TLS handshake aborted by peer");
+                    } else {
+                        error!(peer = %peer_addr, "TLS handshake failed: {}", e);
+                    }
+                }
+                Err(_) => {
+                    warn!(peer = %peer_addr, "TLS handshake timed out");
                 }
             }
 
-            // Decrement connection counters on task completion
-            conn_count.fetch_sub(1, Ordering::Relaxed);
-            if let Some(mut count) = ip_conns.get_mut(&peer_ip) {
-                *count = count.saturating_sub(1);
-                if *count == 0 {
-                    drop(count);
-                    ip_conns.remove(&peer_ip);
-                }
-            }
+            limits.release(peer_ip);
         });
     }
 

@@ -27,8 +27,11 @@ zeroize = { version = "1", features = ["derive", "serde"] }
 async-trait = "0.1"
 uuid = { version = "1", features = ["v5"] }
 
-# Error handling / async
+# Error handling / logging
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-tokio = { workspace = true }
 tracing = { workspace = true }
+
+# wasm32 has no SystemTime::now(); read the JS clock instead (see time::now)
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+js-sys = "0.3"

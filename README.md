@@ -12,7 +12,7 @@
   <a href="#data-transparency">Data Transparency</a>
   <br><br>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="MIT License"></a>
-  <img src="https://img.shields.io/badge/rust-1.75%2B-orange.svg" alt="Rust">
+  <img src="https://img.shields.io/badge/rust-1.88%2B-orange.svg" alt="Rust">
   <img src="https://img.shields.io/badge/svelte-5-ff3e00.svg" alt="Svelte 5">
   <img src="https://img.shields.io/badge/tauri-2-24c8db.svg" alt="Tauri 2">
   <img src="https://img.shields.io/badge/encryption-Signal%20Protocol-green.svg" alt="Signal Protocol">
@@ -70,6 +70,8 @@ No accounts. No telemetry. No compromises.
 - Auto-cleanup of empty channels
 - Configurable user limits
 - Persistent rooms via `channels.json` on the server
+- Invite links (`https://server:9987/#channel=name`): open the web client, or paste into the desktop connect dialog, and land in the channel — the password can ride in the fragment, which never reaches the server
+- Newcomers get the last 50 channel messages from a member, end-to-end encrypted to them (opt-out in Settings → Data)
 
 **Quality of Life**
 - Saved servers in the connect dialog, optional auto-connect
@@ -78,17 +80,30 @@ No accounts. No telemetry. No compromises.
 - NAT rebind + UDP keepalive — voice survives router mapping timeouts
 - Auto-reconnect keeps trying for 5 minutes (Wi-Fi roams, laptop sleep)
 - Dead-UDP detection warns when a firewall blocks voice while TCP still works
+- Server admin session: log in with the server's admin token (status bar shield) to kick users from any channel or from the server and to IP-ban them for 1 h, 24 h or until restart; bans are memory-only and listed with an Unban button
 
 **Platform Support**
 
-| | Linux | Windows | Android | macOS |
-|---|:---:|:---:|:---:|:---:|
-| Voice | Yes | Yes | Yes (Oboe) | Untested¹ |
-| Screen Capture | PipeWire + XDG Portal | Windows.Graphics.Capture | — | — |
-| Desktop Audio | PipeWire | WASAPI | — | — |
-| Screen Share Viewing | Yes | Yes | Yes (AMediaCodec) | — |
+| | Linux | Windows | Android | Browser | macOS |
+|---|:---:|:---:|:---:|:---:|:---:|
+| Voice | Yes | Yes | Yes (Oboe) | Yes (WebCodecs) | Untested¹ |
+| Text chat (E2E) | Yes | Yes | Yes | Yes (Signal in wasm) | — |
+| Screen Capture | PipeWire + XDG Portal | Windows.Graphics.Capture | — | — | — |
+| Desktop Audio | PipeWire | WASAPI | — | — | — |
+| Screen Share Viewing | Yes | Yes | Yes (AMediaCodec) | Where H.265 decodes² | — |
 
 ¹ There is no macOS-specific code yet; nothing is built or tested for it.
+² Browsers decode H.265 only where the platform provides it: Chrome/Edge on Windows and macOS,
+Safari 17+, Chrome on Android. Firefox on Windows/macOS since 136. On Linux browsers there is
+no H.265 decoder, so the web client says so instead of showing a black frame — voice and chat
+work everywhere.
+
+**Web client (browser)**
+
+The server hosts the web client itself: open `https://your-server:9987` and you get the same
+UI as the desktop app, with the Signal Protocol and AES-256-GCM media crypto compiled to
+WebAssembly. Needs Chrome 97+, Edge 98+, Firefox 130+, or Safari 26.4+ (WebTransport + WebCodecs). Screen
+*sharing* from a browser is not implemented; everything else is the same app.
 
 ## Security
 
@@ -96,7 +111,7 @@ VoIPC encrypts everything at multiple layers. The server acts as a blind relay �
 
 ### Layer 1: Transport — TLS on every connection
 
-All TCP control traffic is encrypted with TLS 1.2+ via **rustls** (pure-Rust, no OpenSSL). For self-signed server certs, the client pins the fingerprint on first connect via **TOFU** (`TofuCertVerifier`) and aborts the handshake if it ever changes. Plaintext connections are never accepted.
+All TCP control traffic is encrypted with TLS 1.2+ via **rustls** (pure-Rust, no OpenSSL). For self-signed server certs, the client pins the certificate fingerprint per `host:port` on first connect via **TOFU** (`TofuCertVerifier`) and aborts the handshake if it ever changes. If a server legitimately replaced its certificate, the connect dialog offers *Forget pinned certificate*; the next connect pins the new one. Plaintext connections are never accepted.
 
 ### Layer 2: End-to-End Messages — Signal Protocol
 
@@ -108,6 +123,7 @@ Chat messages (channel and DM) use the **Signal Protocol** from the official [li
 - **100 one-time pre-keys** per user, auto-replenished
 - **Sender Keys** for efficient group/channel message encryption
 - **Perfect Forward Secrecy** — a compromised key cannot decrypt past messages
+- **Ephemeral identities by design** — a fresh identity key pair is generated for every connection and never written to disk. There are no accounts and nothing to fingerprint or link across sessions. The trade-off is explicit: pre-key bundles come from the server, so protection against an *actively malicious* server substituting keys during session setup is not a goal; protection against a passive or compromised-at-rest server is.
 
 ### Layer 3: Media — AES-256-GCM on every packet
 
@@ -118,7 +134,8 @@ All voice, video, and screen share audio is encrypted with **AES-256-GCM** (via 
 - 16-byte authentication tag on every packet — detects tampering
 - AAD (Additional Authenticated Data) binds channel_id + packet_type — blocks cross-channel replay
 - Mandatory key rotation after ~4.3 billion packets
-- Media keys distributed to channel members encrypted via pairwise Signal sessions
+- Media keys are generated by the first member of a channel and handed to each joiner over the pairwise Signal session; the server relays the encrypted blob and never holds a media key
+- Plaintext media packet types are never sent and are dropped by both server and clients
 
 ### Layer 4: Local Storage — AES-256-GCM + PBKDF2
 
@@ -126,7 +143,7 @@ Client-side data at rest:
 
 - Chat history encrypted with **PBKDF2-HMAC-SHA256** (600,000 iterations) + **AES-256-GCM**
 - 32-byte random salt + 12-byte random nonce per file
-- Signal Protocol state encrypted separately (VSIG file format)
+- Signal Protocol state is never stored (see *Ephemeral identities* above)
 - All secrets wrapped in `Zeroizing<T>` — memory-zeroized on drop
 
 ### Layer 5: Zero-Knowledge Server
@@ -158,14 +175,22 @@ Client-side data at rest:
 │   Client A   │◄──────────────────────────►│    Server    │◄──────────────────────────►│   Client B   │
 │  Tauri 2 App │   AES-256-GCM (UDP)        │  Rust Binary │   AES-256-GCM (UDP)        │  Tauri 2 App │
 │  Rust+Svelte │◄──────────────────────────►│  Tokio SFU   │◄──────────────────────────►│  Rust+Svelte │
-└──────────────┘                             └──────────────┘                             └──────────────┘
-                                              Relays only —
-                                              never decodes
+└──────────────┘                             └──────┬───────┘                            └──────────────┘
+                                              Relays only —  │  HTTP/2 (page) + WebTransport
+                                              never decodes  │  same messages, same crypto
+                                                      ┌──────┴───────┐
+                                                      │  Web Client  │
+                                                      │ Svelte+wasm  │
+                                                      └──────────────┘
 ```
 
 - **TCP + TLS** for control messages (auth, channels, chat, encryption key exchange)
 - **UDP** for real-time media (voice, video, screen share audio)
 - **SFU** (Selective Forwarding Unit) — server relays encrypted packets without decoding
+- **HTTP/2 + WebTransport** for browsers: the same page origin serves the web client and a
+  QUIC endpoint carries the identical control messages (one bidirectional stream) and media
+  packets (datagrams; video frames as one stream per frame). Browsers get no plaintext the
+  native clients don't — all encryption happens in the page, in WebAssembly
 
 ### Stack
 
@@ -180,6 +205,7 @@ Client-side data at rest:
 | **Server Runtime** | Tokio | Async, single-binary, DashMap lock-free concurrency |
 | **Client Backend** | Tauri 2 (Rust) | Native IPC, audio/video/crypto all in Rust |
 | **Client Frontend** | Svelte 5 + TypeScript | Runes ($state, $derived, $effect), Vite 6 |
+| **Web Client** | WebAssembly + WebCodecs | Same Svelte UI; Signal + media crypto in wasm, Opus/H.265 via WebCodecs, WebTransport for control and media |
 | **Audio I/O** | cpal / Oboe | ALSA (Linux), WASAPI (Windows), Oboe (Android) |
 | **Screen Capture** | Platform-native | PipeWire ScreenCast (Linux), Windows.Graphics.Capture (Windows) |
 
@@ -192,8 +218,9 @@ Client-side data at rest:
 | Max voice packet | 512 bytes |
 | Max video packet | 1,280 bytes (VPN-safe) |
 | Max TCP message | 64 KiB |
-| Protocol version | v3 |
+| Protocol version | v4 |
 | Default port | 9987 (TCP + UDP) |
+| Web client port | 9988 (UDP, WebTransport) |
 
 ### Project Structure
 
@@ -204,7 +231,8 @@ VoIPC/
 │   ├── voipc-server/       # Server binary (TCP + UDP + TLS)
 │   ├── voipc-audio/        # Capture, playback, Opus, RNNoise, VAD, jitter buffer
 │   ├── voipc-video/        # H.265 encoding/decoding, fragment assembly
-│   └── voipc-crypto/       # Signal Protocol, AES-256-GCM, key management, persistence
+│   ├── voipc-crypto/       # Signal Protocol, AES-256-GCM, key management
+│   └── voipc-web/          # wasm build of protocol + crypto for the browser client
 ├── client/
 │   ├── src-tauri/src/      # Tauri Rust backend (network, crypto, state, commands)
 │   │   ├── screenshare/    # Platform-specific capture (linux.rs, windows.rs)
@@ -216,10 +244,14 @@ VoIPC/
 │       ├── lib/
 │       │   ├── components/ # Svelte 5 components
 │       │   └── stores/     # Reactive state (channels, chat, voice, etc.)
+│       ├── web/            # Browser backend: WebTransport, Signal orchestration,
+│       │                   #   WebCodecs audio/video, Tauri API shims
 │       └── App.svelte      # Root component
 ├── website/                # Project website (single HTML file)
 ├── setup.sh / setup.ps1    # One-command dependency installer
 ├── build.sh / build.ps1    # Release build scripts
+├── build-web.sh            # Web client (wasm + Vite) + server that embeds it
+├── test-web.sh             # Headless two-browser end-to-end test of the web client
 ├── dev.sh / dev.ps1        # Dev build + run
 └── Cargo.toml              # Workspace root
 ```
@@ -232,12 +264,14 @@ VoIPC/
 # Build
 cargo build -p voipc-server --release
 
-# Generate self-signed TLS certificate
+# Generate self-signed TLS certificate (browsers check the subjectAltName —
+# put the host name / IP your users will type)
 mkdir -p certs
 openssl req -x509 -newkey ec \
   -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout certs/server.key -out certs/server.crt \
-  -days 365 -nodes -subj "/CN=voipc"
+  -days 365 -nodes -subj "/CN=voipc" \
+  -addext "subjectAltName=DNS:your-server.example,IP:203.0.113.5"
 
 # Run
 ./target/release/voipc-server
@@ -249,9 +283,11 @@ The server listens on port **9987** (TCP + UDP) by default. Configure via `serve
 host = "0.0.0.0"          # Bind address — set to your public/VPN IP for correct UDP routing
 tcp_port = 9987
 udp_port = 9987
+web_port = 9988           # WebTransport (UDP) for the browser client; 0 disables the web client
 max_users = 64
 cert_path = "certs/server.crt"
 key_path = "certs/server.key"
+admin_token = "change-me"  # optional; unset = a random token is printed in the log at every start
 ```
 
 > **VPN / multi-homed setups:** If clients connect via a domain name (e.g. `vpn.example.com`) that resolves to a specific IP, set `host` to that IP. Otherwise the server may send UDP replies from the wrong interface and clients won't receive voice/video. All options can also be passed as CLI flags (`--host`, `--tcp-port`, etc.).
@@ -267,6 +303,8 @@ Runtime settings in `server_settings.json`:
 ```
 
 **Persistent channels** (optional): drop a `channels.json` next to the binary to pre-create long-lived rooms that survive restarts. See [channels.example.json](channels.example.json) — plaintext `password` fields are hashed to SHA-256 on first load and the file is rewritten atomically.
+
+**Server administration:** there are no accounts; any connected user becomes admin for their session by entering the admin token (status bar → shield icon). Set `admin_token` in `server.toml`, pass `--admin-token`, or export `VOIPC_ADMIN_TOKEN`; without one the server prints a fresh random token in its log at every start. Admins can kick users from channels or from the server and ban an IP for 1 h, 24 h or until restart — everyone behind that IP is affected, and bans live in memory only. Other users see a shield next to an admin's name. Three wrong tokens disconnect the session.
 
 ### Client
 
@@ -292,10 +330,36 @@ npx tauri build   # Release build
 Or build portable release binaries via Docker (no local dependencies needed):
 
 ```bash
-./release.sh    # Outputs release/VoIPC_*.AppImage + release/voipc-server
+./release.sh    # Outputs release/VoIPC_*.AppImage + release/voipc-server + release/VoIPC-web-*.tar.gz
 ```
 
 See [BUILDING.md](BUILDING.md) for detailed platform-specific instructions and dependency lists.
+
+### Web client
+
+Nothing to install: point a browser at the server.
+
+```
+https://your-server:9987
+```
+
+The server binary serves the web client over HTTP/2 and carries voice, video and control
+messages over WebTransport on UDP **9988** — open that port too. With a self-signed
+certificate the browser shows a warning on the first visit; accept it once and the app works
+(generate the certificate with a `subjectAltName`, see the openssl line above, or use a real
+certificate from a CA). The WebTransport endpoint uses its own short-lived certificate that
+the server generates, rotates, and publishes by hash to the page — there is nothing to
+configure.
+
+Requires Chrome 97+, Edge 98+, Firefox 130+, or Safari 26.4+. Voice and chat work in all of them;
+watching a screen share needs a browser that can decode H.265 (see the platform table).
+
+To build it yourself:
+
+```bash
+./build-web.sh    # wasm + Vite bundle, then a server binary that embeds it
+./test-web.sh     # headless two-browser end-to-end check (voice, chat, DMs)
+```
 
 ## Data Transparency
 
@@ -319,7 +383,6 @@ See [BUILDING.md](BUILDING.md) for detailed platform-specific instructions and d
 ### What your device stores
 
 - Encrypted chat history (`VOIP` binary format, password-protected)
-- Encrypted Signal Protocol state (`VSIG` binary format)
 - Audio/video settings and device preferences
 - Max 500 messages per channel, auto-rotated
 

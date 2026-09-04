@@ -1,0 +1,54 @@
+[package]
+name = "voipc-web"
+version = "0.4.0"
+edition = "2021"
+license = "MIT"
+description = "VoIPC protocol codec, Signal Protocol and media crypto compiled to wasm for the browser client"
+publish = false
+
+# Standalone workspace: the pqcrypto-kyber patch and the wasm-only features
+# below must never leak into the native build (the root workspace excludes
+# this path). voipc-protocol/voipc-crypto still inherit their version from the
+# root workspace, so APP_VERSION stays the single source of truth.
+[workspace]
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+voipc-protocol = { path = "../voipc-protocol" }
+voipc-crypto = { path = "../voipc-crypto" }
+# Same source as voipc-crypto (Cargo unifies it); needed to read the pre-key
+# records back out of the stores when building the Authenticate bundle.
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.67.2" }
+
+serde = { version = "1.0", features = ["derive"] }
+postcard = { version = "1.1", features = ["alloc"] }
+anyhow = "1.0"
+rand = "0.8"
+# libsignal futures over the in-memory stores complete on the first poll
+futures-util = { version = "0.3", default-features = false }
+
+wasm-bindgen = "0.2"
+serde-wasm-bindgen = "0.6"
+js-sys = "0.3"
+console_error_panic_hook = "0.1"
+
+# Browser entropy for every getrandom in the tree (rand 0.8 -> 0.2,
+# pqcrypto-internals -> 0.3; the 0.3 backend is selected in .cargo/config.toml)
+# and for ring's AES-GCM.
+getrandom02 = { package = "getrandom", version = "0.2", features = ["js"] }
+getrandom03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+ring = { version = "0.17", features = ["wasm32_unknown_unknown_js"] }
+
+# pqcrypto-kyber wraps PQClean C code that does not build for wasm32. VoIPC
+# never negotiates Kyber, so libsignal gets a stub whose functions are
+# unreachable (see kyber-stub/src/lib.rs).
+[patch.crates-io]
+pqcrypto-kyber = { path = "kyber-stub" }
+
+[package.metadata.wasm-pack.profile.release]
+wasm-opt = false
+
+[profile.release]
+opt-level = "s"

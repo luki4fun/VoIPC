@@ -1,13 +1,12 @@
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use bytes::BytesMut;
 use rand::Rng;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpStream;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tokio_rustls::server::TlsStream;
 use tracing::{debug, error, info, warn};
 
 use voipc_protocol::codec::{
@@ -18,28 +17,31 @@ use voipc_protocol::types::*;
 
 use crate::state::ServerState;
 
-/// Handle a single TCP client connection (already TLS-wrapped).
-pub async fn handle_connection(
-    mut tls_stream: TlsStream<TcpStream>,
+/// Handle a single control connection carrying the native wire format.
+///
+/// `stream` is either a TLS-wrapped TCP stream (native clients) or one end
+/// of an in-process duplex fed by the WebTransport bridge. `peer_label` is
+/// only used for logging; `peer_ip` is the client's real address (bans);
+/// `udp_peer_ip` is the source IP the session's media packets must come
+/// from (see `udp::resolve_session`).
+pub async fn handle_connection<S>(
+    mut stream: S,
+    peer_label: String,
+    peer_ip: IpAddr,
+    udp_peer_ip: IpAddr,
     state: Arc<ServerState>,
-) {
-    let peer_socket_addr = match tls_stream.get_ref().0.peer_addr() {
-        Ok(addr) => addr,
-        Err(e) => {
-            error!("failed to get peer address, dropping connection: {}", e);
-            return;
-        }
-    };
-    let peer_addr = peer_socket_addr.to_string();
-    let tcp_peer_ip = peer_socket_addr.ip();
+) where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let peer_addr = peer_label;
 
-    info!(peer = %peer_addr, "new TCP connection");
+    info!(peer = %peer_addr, "new connection");
 
     // --- Authentication phase (with timeout) ---
     let mut buf = BytesMut::with_capacity(4096);
     let auth_result = tokio::time::timeout(
         Duration::from_secs(5),
-        authenticate(&mut tls_stream, &mut buf, &state, &peer_addr, tcp_peer_ip),
+        authenticate(&mut stream, &mut buf, &state, &peer_addr, peer_ip, udp_peer_ip),
     )
     .await;
     let (user_id, session_id) = match auth_result {
@@ -57,12 +59,12 @@ pub async fn handle_connection(
     info!(peer = %peer_addr, user_id, session_id, "user authenticated");
 
     // --- Split into reader/writer ---
-    let (read_half, mut write_half) = tokio::io::split(tls_stream);
+    let (read_half, mut write_half) = tokio::io::split(stream);
 
     // Writer task: receives serialized messages from a channel and writes to TCP
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(64);
+    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
 
-    let writer_handle = tokio::spawn(async move {
+    let mut writer_handle = tokio::spawn(async move {
         while let Some(data) = rx.recv().await {
             if let Err(e) = write_half.write_all(&data).await {
                 error!("TCP write error: {}", e);
@@ -71,10 +73,32 @@ pub async fn handle_connection(
         }
     });
 
-    // Store the sender in the session
-    if let Some(mut session) = state.sessions.get_mut(&session_id) {
-        session.tcp_tx = tx.clone();
-    }
+    // Store the sender in the session; keep the admin close handle
+    let (udp_token, close) = match state.sessions.get_mut(&session_id) {
+        Some(mut session) => {
+            session.tcp_tx = tx.clone();
+            (session.udp_token, session.close.clone())
+        }
+        None => {
+            // Session vanished between authenticate() and here — nothing to serve
+            writer_handle.abort();
+            return;
+        }
+    };
+
+    // Sent from here (not inside authenticate) so that a failed write
+    // still flows through cleanup_session below instead of leaking the
+    // registered session and username.
+    let _ = send_msg(
+        &tx,
+        &ServerMessage::Authenticated {
+            user_id,
+            session_id,
+            udp_port: state.udp_port,
+            udp_token,
+        },
+    )
+    .await;
 
     // Send channel list
     let channel_list = state.channel_list().await;
@@ -95,7 +119,7 @@ pub async fn handle_connection(
     keepalive_timer.tick().await;
 
     let mut read_half = read_half;
-    loop {
+    'conn: loop {
         let got_data = tokio::select! {
             result = read_half.read_buf(&mut buf) => {
                 match result {
@@ -127,6 +151,10 @@ pub async fn handle_connection(
                 let _ = send_msg(&tx, &ping).await;
                 debug!(user_id, "sent keepalive ping");
                 false
+            }
+            _ = close.notified() => {
+                info!(user_id, "connection closed by admin");
+                break;
             }
         };
 
@@ -170,8 +198,10 @@ pub async fn handle_connection(
                 }
                 Ok(None) => break, // need more data
                 Err(e) => {
-                    error!(user_id, "frame decode error: {}", e);
-                    break;
+                    // The bad length prefix is never consumed: keep reading
+                    // and the buffer grows without bound. Drop the client.
+                    error!(user_id, "frame decode error, disconnecting: {}", e);
+                    break 'conn;
                 }
             }
         }
@@ -179,17 +209,30 @@ pub async fn handle_connection(
 
     // --- Cleanup ---
     cleanup_session(&state, user_id, session_id).await;
-    writer_handle.abort();
+    // Let the writer flush what is queued (a Disconnected reason, for one):
+    // cleanup_session dropped the session's tcp_tx clone, ours goes here, so
+    // the writer sees the channel close once the queue is empty.
+    drop(tx);
+    if tokio::time::timeout(Duration::from_secs(2), &mut writer_handle)
+        .await
+        .is_err()
+    {
+        writer_handle.abort();
+    }
 }
 
 /// Perform the authentication handshake.
-async fn authenticate(
-    stream: &mut TlsStream<TcpStream>,
+async fn authenticate<S>(
+    stream: &mut S,
     buf: &mut BytesMut,
     state: &ServerState,
     peer_addr: &str,
-    tcp_peer_ip: std::net::IpAddr,
-) -> Result<(UserId, SessionId)> {
+    peer_ip: IpAddr,
+    tcp_peer_ip: IpAddr,
+) -> Result<(UserId, SessionId)>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     // Read until we get a complete message
     loop {
         let n = stream.read_buf(buf).await?;
@@ -314,6 +357,11 @@ async fn authenticate(
                         udp_addr: None,
                         udp_token,
                         tcp_peer_ip,
+                        peer_ip,
+                        is_admin: false,
+                        admin_login_failures: 0,
+                        close: Default::default(),
+                        history_request_rate: crate::state::RateLimiter::new(3.0, 0.5),
                         udp_voice_rate: crate::state::RateLimiter::new(55.0, 55.0),
                         // 1200 pkt/s ≈ 12 Mbps at 1280B packets: covers 1080p60
                         // video (~7.5 Mbps) + screen audio with headroom; burst
@@ -325,6 +373,8 @@ async fn authenticate(
                         keyframe_request_rate: crate::state::RateLimiter::new(2.0, 1.0),
                         create_channel_rate: crate::state::RateLimiter::new(1.0, 0.2),
                         prekey_rate: crate::state::RateLimiter::new(1.0, 0.2),
+                        // Burst covers joining a full channel; refill limits draining
+                        prekey_bundle_rate: crate::state::RateLimiter::new(60.0, 1.0),
                         is_screen_sharing: false,
                         watching_screenshare: None,
                         identity_key,
@@ -339,15 +389,8 @@ async fn authenticate(
                     state.sessions.insert(session_id, session);
                     state.user_to_session.insert(user_id, session_id);
 
-                    let auth_msg = ServerMessage::Authenticated {
-                        user_id,
-                        session_id,
-                        udp_port: state.udp_port,
-                        udp_token,
-                    };
-                    let data = encode_server_msg(&auth_msg)?;
-                    stream.write_all(&data).await?;
-
+                    // No network I/O after this point: every failure past the
+                    // inserts must run cleanup_session (handle_connection does).
                     info!(
                         peer = %peer_addr,
                         username = %username,
@@ -441,7 +484,8 @@ async fn handle_message(
             channel_id,
             password,
         } => {
-            handle_set_channel_password(state, user_id, channel_id, password, tx).await?;
+            handle_set_channel_password(state, user_id, session_id, channel_id, password, tx)
+                .await?;
         }
         ClientMessage::KickUser {
             channel_id,
@@ -495,7 +539,19 @@ async fn handle_message(
             ciphertext,
             message_type,
         } => {
-            handle_send_poke(state, user_id, session_id, target_user_id, ciphertext, message_type, tx).await?;
+            // Pokes play a sound and raise an OS notification — same budget as chat
+            let allowed = state
+                .sessions
+                .get_mut(&session_id)
+                .map(|mut s| s.chat_rate.try_consume())
+                .unwrap_or(false);
+            if !allowed {
+                let _ = send_msg(tx, &ServerMessage::ChannelError {
+                    reason: "sending too fast, slow down".into(),
+                }).await;
+            } else {
+                handle_send_poke(state, user_id, session_id, target_user_id, ciphertext, message_type, tx).await?;
+            }
         }
         ClientMessage::StartScreenShare { source: _, resolution } => {
             let clamped_resolution = resolution.clamp(240, 4320);
@@ -511,12 +567,16 @@ async fn handle_message(
             handle_stop_watching(state, user_id, session_id, tx).await?;
         }
         ClientMessage::RequestKeyframe { sharer_user_id } => {
-            // Forcing IDRs is expensive for the sharer — cap per requester.
-            // Dropped silently: the client re-requests within a second anyway.
+            // Forcing IDRs is expensive for the sharer — only viewers of that
+            // share may ask, capped per viewer. Dropped silently: the client
+            // re-requests within a second anyway.
             let allowed = state
                 .sessions
                 .get_mut(&session_id)
-                .map(|mut s| s.keyframe_request_rate.try_consume())
+                .map(|mut s| {
+                    s.watching_screenshare == Some(sharer_user_id)
+                        && s.keyframe_request_rate.try_consume()
+                })
                 .unwrap_or(false);
             if allowed {
                 handle_request_keyframe(state, sharer_user_id).await?;
@@ -528,7 +588,25 @@ async fn handle_message(
 
         // ── E2E Encryption handlers ──────────────────────────────────────
         ClientMessage::RequestPreKeyBundle { target_user_id } => {
-            handle_request_prekey_bundle(state, target_user_id, tx).await?;
+            // Each bundle consumes one of the target's one-time pre-keys
+            // (100 stored, replenished at 0.2 uploads/s) — unthrottled, one
+            // user could drain anyone's supply in seconds.
+            let allowed = state
+                .sessions
+                .get_mut(&session_id)
+                .map(|mut s| s.prekey_bundle_rate.try_consume())
+                .unwrap_or(false);
+            if allowed {
+                handle_request_prekey_bundle(state, target_user_id, tx).await?;
+            } else {
+                let _ = send_msg(
+                    tx,
+                    &ServerMessage::PreKeyBundleUnavailable {
+                        user_id: target_user_id,
+                    },
+                )
+                .await;
+            }
         }
         ClientMessage::UploadPreKeys { prekeys } => {
             let allowed = state
@@ -590,10 +668,73 @@ async fn handle_message(
             channel_id,
             target_user_id,
             encrypted_media_key,
+            message_type,
         } => {
             handle_distribute_media_key(
-                state, user_id, channel_id, target_user_id, encrypted_media_key,
+                state, user_id, channel_id, target_user_id, encrypted_media_key, message_type,
             ).await?;
+        }
+
+        // ── Moderation ─────────────────────────────────────────────────
+        ClientMessage::AdminLogin { token } => {
+            handle_admin_login(state, user_id, session_id, &token, tx).await;
+        }
+        ClientMessage::AdminKick { user_id: target_id, reason } => {
+            if state.is_admin(session_id) {
+                handle_admin_kick(state, user_id, target_id, reason, false, 0, tx).await;
+            } else {
+                admin_error(tx, "not an admin").await;
+            }
+        }
+        ClientMessage::AdminBan { user_id: target_id, reason, duration_secs } => {
+            if state.is_admin(session_id) {
+                handle_admin_kick(state, user_id, target_id, reason, true, duration_secs, tx).await;
+            } else {
+                admin_error(tx, "not an admin").await;
+            }
+        }
+        ClientMessage::AdminUnban { ip } => {
+            if !state.is_admin(session_id) {
+                admin_error(tx, "not an admin").await;
+            } else if let Ok(ip) = ip.parse::<IpAddr>() {
+                state.unban(ip);
+                info!(user_id, %ip, "admin unban");
+                let _ = send_msg(tx, &ServerMessage::AdminBans { bans: state.list_bans() }).await;
+            } else {
+                admin_error(tx, "invalid IP address").await;
+            }
+        }
+        ClientMessage::AdminListBans => {
+            if state.is_admin(session_id) {
+                let _ = send_msg(tx, &ServerMessage::AdminBans { bans: state.list_bans() }).await;
+            } else {
+                admin_error(tx, "not an admin").await;
+            }
+        }
+
+        // ── Channel history hand-off ───────────────────────────────────
+        ClientMessage::RequestChannelHistory { channel_id, target_user_id } => {
+            let allowed = state
+                .sessions
+                .get_mut(&session_id)
+                .map(|mut s| s.history_request_rate.try_consume())
+                .unwrap_or(false);
+            if allowed {
+                handle_request_channel_history(state, user_id, channel_id, target_user_id).await;
+            }
+        }
+        ClientMessage::SendChannelHistory { channel_id, target_user_id, ciphertext, message_type } => {
+            let allowed = state
+                .sessions
+                .get_mut(&session_id)
+                .map(|mut s| s.chat_rate.try_consume())
+                .unwrap_or(false);
+            if allowed {
+                handle_send_channel_history(
+                    state, user_id, session_id, channel_id, target_user_id, ciphertext, message_type,
+                )
+                .await;
+            }
         }
     }
     Ok(())
@@ -650,47 +791,7 @@ async fn handle_join_channel(
 
     // Clean up screenshare state from the old channel before leaving
     if old_channel_id != channel_id && old_channel_id != 0 {
-        let cleanup = state
-            .cleanup_screen_shares_for_user(user_id, session_id, old_channel_id)
-            .await;
-
-        // Notify viewers that the share stopped
-        for viewer_sid in &cleanup.viewers_to_notify_stopped {
-            if let Some(session) = state.sessions.get(viewer_sid) {
-                let _ = send_msg(
-                    &session.tcp_tx,
-                    &ServerMessage::StoppedWatchingScreenShare {
-                        reason: "sharer_left".into(),
-                    },
-                )
-                .await;
-            }
-        }
-
-        // Broadcast ScreenShareStopped to old channel
-        if let Some(sharer_uid) = cleanup.stopped_sharer_user_id {
-            let msg = ServerMessage::ScreenShareStopped {
-                user_id: sharer_uid,
-            };
-            for &sid in &cleanup.channel_member_sessions {
-                if let Some(session) = state.sessions.get(&sid) {
-                    let _ = send_msg(&session.tcp_tx, &msg).await;
-                }
-            }
-        }
-
-        // Notify sharer of viewer count change (if we were watching someone)
-        if let Some((sharer_sid, new_count)) = cleanup.sharer_viewer_count_changed {
-            if let Some(session) = state.sessions.get(&sharer_sid) {
-                let _ = send_msg(
-                    &session.tcp_tx,
-                    &ServerMessage::ViewerCountChanged {
-                        viewer_count: new_count,
-                    },
-                )
-                .await;
-            }
-        }
+        cleanup_and_notify_screen_shares(state, user_id, session_id, old_channel_id).await;
     }
 
     // Now leave the current channel
@@ -739,18 +840,8 @@ async fn handle_join_channel(
     )
     .await;
 
-    // Send the channel's media encryption key (for voice/video AES-256-GCM)
-    if let Some((key_id, key_bytes)) = state.get_channel_media_key(channel_id).await {
-        let _ = send_msg(
-            tx,
-            &ServerMessage::ChannelMediaKey {
-                channel_id,
-                key_id,
-                key_bytes: key_bytes.to_vec(),
-            },
-        )
-        .await;
-    }
+    // Media keys are generated by clients and exchanged over pairwise Signal
+    // sessions (DistributeMediaKey) — the server never sees them.
 
     // Build user info for the join notification
     let user_info = UserInfo {
@@ -772,6 +863,7 @@ async fn handle_join_channel(
             .map(|s| s.is_deafened)
             .unwrap_or(false),
         is_screen_sharing: false,
+        is_admin: state.is_admin(session_id),
     };
 
     let join_msg = ServerMessage::UserJoined { user: user_info };
@@ -855,11 +947,16 @@ async fn handle_create_channel(
 async fn handle_set_channel_password(
     state: &Arc<ServerState>,
     user_id: UserId,
+    session_id: SessionId,
     channel_id: ChannelId,
     password: Option<String>,
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
-    match state.set_channel_password(channel_id, user_id, password).await {
+    let is_admin = state.is_admin(session_id);
+    match state
+        .set_channel_password(channel_id, user_id, password, is_admin)
+        .await
+    {
         Ok(updated_info) => {
             let msg = ServerMessage::ChannelUpdated {
                 channel: updated_info,
@@ -883,20 +980,34 @@ async fn handle_set_channel_password(
 async fn handle_kick_user(
     state: &Arc<ServerState>,
     requester_id: UserId,
-    _requester_session_id: SessionId,
+    requester_session_id: SessionId,
     channel_id: ChannelId,
     target_id: UserId,
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
-    match state.kick_user(channel_id, requester_id, target_id).await {
+    let by_admin = state.is_admin(requester_session_id);
+    match state
+        .kick_user(channel_id, requester_id, target_id, by_admin)
+        .await
+    {
         Ok((target_session_id, remaining_count)) => {
+            // Same teardown as leave/disconnect: otherwise a kicked viewer
+            // keeps receiving the share's video and a kicked sharer leaves
+            // its viewers stuck.
+            cleanup_and_notify_screen_shares(state, target_id, target_session_id, channel_id)
+                .await;
+
             // Notify the kicked user
             if let Some(session) = state.sessions.get(&target_session_id) {
                 let _ = send_msg(
                     &session.tcp_tx,
                     &ServerMessage::Kicked {
                         channel_id,
-                        reason: "You were kicked by the channel creator".into(),
+                        reason: if by_admin {
+                            "You were kicked from the channel by an admin".into()
+                        } else {
+                            "You were kicked by the channel creator".into()
+                        },
                     },
                 )
                 .await;
@@ -944,6 +1055,7 @@ async fn handle_kick_user(
                     .map(|s| s.is_deafened)
                     .unwrap_or(false),
                 is_screen_sharing: false,
+                is_admin: state.is_admin(target_session_id),
             };
             let join_msg = ServerMessage::UserJoined { user: user_info };
             broadcast_to_all(state, &join_msg, Some(target_id)).await;
@@ -1078,6 +1190,218 @@ async fn handle_decline_invite(
     }
 
     Ok(())
+}
+
+// ── Moderation handlers ────────────────────────────────────────────────
+
+async fn admin_error(tx: &mpsc::Sender<Vec<u8>>, reason: &str) {
+    let _ = send_msg(
+        tx,
+        &ServerMessage::AdminError {
+            reason: reason.into(),
+        },
+    )
+    .await;
+}
+
+/// Constant-time token check; the third failure closes the connection.
+async fn handle_admin_login(
+    state: &Arc<ServerState>,
+    user_id: UserId,
+    session_id: SessionId,
+    token: &str,
+    tx: &mpsc::Sender<Vec<u8>>,
+) {
+    use subtle::ConstantTimeEq;
+    let ok: bool = token
+        .as_bytes()
+        .ct_eq(state.admin_token.as_bytes())
+        .into();
+    if ok {
+        if let Some(mut session) = state.sessions.get_mut(&session_id) {
+            session.is_admin = true;
+            session.admin_login_failures = 0;
+        }
+        info!(user_id, "admin login");
+        broadcast_to_all(
+            state,
+            &ServerMessage::AdminStatus {
+                user_id,
+                is_admin: true,
+            },
+            None,
+        )
+        .await;
+        return;
+    }
+    let failures = state
+        .sessions
+        .get_mut(&session_id)
+        .map(|mut s| {
+            s.admin_login_failures = s.admin_login_failures.saturating_add(1);
+            s.admin_login_failures
+        })
+        .unwrap_or(0);
+    warn!(user_id, failures, "admin login failed");
+    admin_error(tx, "wrong admin token").await;
+    if failures >= 3 {
+        force_disconnect(state, session_id, "too many failed admin logins").await;
+    }
+}
+
+/// Send `Disconnected` to a session and wake its connection loop, which
+/// exits and runs the normal cleanup.
+async fn force_disconnect(state: &Arc<ServerState>, session_id: SessionId, reason: &str) {
+    let close = {
+        let Some(session) = state.sessions.get(&session_id) else {
+            return;
+        };
+        let _ = send_msg(
+            &session.tcp_tx,
+            &ServerMessage::Disconnected {
+                reason: reason.to_string(),
+            },
+        )
+        .await;
+        session.close.clone()
+    };
+    close.notify_one();
+}
+
+/// Admin kick, optionally with an IP ban. A ban closes every session from
+/// that IP, not just the target's.
+async fn handle_admin_kick(
+    state: &Arc<ServerState>,
+    admin_user_id: UserId,
+    target_id: UserId,
+    reason: String,
+    ban: bool,
+    duration_secs: u32,
+    tx: &mpsc::Sender<Vec<u8>>,
+) {
+    if target_id == admin_user_id {
+        admin_error(tx, "you cannot kick yourself").await;
+        return;
+    }
+    let Some(target_sid) = state.user_to_session.get(&target_id).map(|s| *s) else {
+        admin_error(tx, "user not found").await;
+        return;
+    };
+    let reason: String = reason.trim().chars().take(200).collect();
+    let reason = if reason.is_empty() {
+        "no reason given".to_string()
+    } else {
+        reason
+    };
+
+    if !ban {
+        info!(admin = admin_user_id, target = target_id, "admin kick");
+        force_disconnect(
+            state,
+            target_sid,
+            &format!("You were kicked from this server: {reason}"),
+        )
+        .await;
+        return;
+    }
+
+    let Some(ip) = state.sessions.get(&target_sid).map(|s| s.peer_ip) else {
+        admin_error(tx, "user not found").await;
+        return;
+    };
+    let duration = (duration_secs > 0).then(|| Duration::from_secs(u64::from(duration_secs)));
+    state.ban(ip, duration);
+    info!(admin = admin_user_id, target = target_id, %ip, duration_secs, "admin ban");
+    let text = format!("You were banned from this server: {reason}");
+    let sids: Vec<SessionId> = state
+        .sessions
+        .iter()
+        .filter(|e| e.value().peer_ip == ip)
+        .map(|e| *e.key())
+        .collect();
+    for sid in sids {
+        force_disconnect(state, sid, &text).await;
+    }
+    let _ = send_msg(
+        tx,
+        &ServerMessage::AdminBans {
+            bans: state.list_bans(),
+        },
+    )
+    .await;
+}
+
+// ── Channel history hand-off (relay only, payload opaque) ──────────────
+
+async fn both_in_channel(
+    state: &Arc<ServerState>,
+    channel_id: ChannelId,
+    a: UserId,
+    b: UserId,
+) -> bool {
+    let channels = state.channels.read().await;
+    channels
+        .get(&channel_id)
+        .map_or(false, |ch| ch.members.contains(&a) && ch.members.contains(&b))
+}
+
+async fn handle_request_channel_history(
+    state: &Arc<ServerState>,
+    from_user_id: UserId,
+    channel_id: ChannelId,
+    target_user_id: UserId,
+) {
+    if from_user_id == target_user_id
+        || !both_in_channel(state, channel_id, from_user_id, target_user_id).await
+    {
+        return;
+    }
+    if let Some(target_sid) = state.user_to_session.get(&target_user_id) {
+        if let Some(session) = state.sessions.get(&*target_sid) {
+            let _ = send_msg(
+                &session.tcp_tx,
+                &ServerMessage::ChannelHistoryRequested {
+                    channel_id,
+                    from_user_id,
+                },
+            )
+            .await;
+        }
+    }
+}
+
+async fn handle_send_channel_history(
+    state: &Arc<ServerState>,
+    from_user_id: UserId,
+    from_session_id: SessionId,
+    channel_id: ChannelId,
+    target_user_id: UserId,
+    ciphertext: Vec<u8>,
+    message_type: u8,
+) {
+    if !both_in_channel(state, channel_id, from_user_id, target_user_id).await {
+        return;
+    }
+    let from_username = state
+        .sessions
+        .get(&from_session_id)
+        .map(|s| s.username.clone())
+        .unwrap_or_default();
+    if let Some(target_sid) = state.user_to_session.get(&target_user_id) {
+        if let Some(session) = state.sessions.get(&*target_sid) {
+            let _ = send_msg(
+                &session.tcp_tx,
+                &ServerMessage::ChannelHistoryReceived {
+                    channel_id,
+                    from_user_id,
+                    from_username,
+                    ciphertext,
+                    message_type,
+                },
+            )
+            .await;
+        }
+    }
 }
 
 // ── Screen share handlers ──────────────────────────────────────────────
@@ -1524,7 +1848,10 @@ async fn handle_distribute_sender_key(
             if !channel.members.contains(&from_user_id)
                 || !channel.members.contains(&target_user_id)
             {
-                warn!(
+                // debug, not warn: clients hand their sender key to every
+                // peer they establish a session with, wherever that peer
+                // is; this check is the filter, not an anomaly.
+                debug!(
                     from_user_id,
                     target_user_id,
                     channel_id,
@@ -1561,6 +1888,7 @@ async fn handle_distribute_media_key(
     channel_id: ChannelId,
     target_user_id: UserId,
     encrypted_media_key: Vec<u8>,
+    message_type: u8,
 ) -> Result<()> {
     // Verify both users are in the channel before relaying
     {
@@ -1569,7 +1897,8 @@ async fn handle_distribute_media_key(
             if !channel.members.contains(&from_user_id)
                 || !channel.members.contains(&target_user_id)
             {
-                warn!(
+                // debug for the same reason as the sender key above
+                debug!(
                     from_user_id,
                     target_user_id,
                     channel_id,
@@ -1590,6 +1919,7 @@ async fn handle_distribute_media_key(
                     channel_id,
                     from_user_id,
                     encrypted_media_key,
+                    message_type,
                 },
             ).await;
         }
@@ -1607,47 +1937,7 @@ async fn cleanup_session(state: &Arc<ServerState>, user_id: UserId, session_id: 
         .unwrap_or(0);
 
     if channel_id != 0 {
-        let cleanup = state
-            .cleanup_screen_shares_for_user(user_id, session_id, channel_id)
-            .await;
-
-        // Notify viewers that the share stopped
-        for viewer_sid in &cleanup.viewers_to_notify_stopped {
-            if let Some(session) = state.sessions.get(viewer_sid) {
-                let _ = send_msg(
-                    &session.tcp_tx,
-                    &ServerMessage::StoppedWatchingScreenShare {
-                        reason: "sharer_left".into(),
-                    },
-                )
-                .await;
-            }
-        }
-
-        // Broadcast ScreenShareStopped to channel
-        if let Some(sharer_uid) = cleanup.stopped_sharer_user_id {
-            let msg = ServerMessage::ScreenShareStopped {
-                user_id: sharer_uid,
-            };
-            for &sid in &cleanup.channel_member_sessions {
-                if let Some(session) = state.sessions.get(&sid) {
-                    let _ = send_msg(&session.tcp_tx, &msg).await;
-                }
-            }
-        }
-
-        // Notify sharer of viewer count change
-        if let Some((sharer_sid, new_count)) = cleanup.sharer_viewer_count_changed {
-            if let Some(session) = state.sessions.get(&sharer_sid) {
-                let _ = send_msg(
-                    &session.tcp_tx,
-                    &ServerMessage::ViewerCountChanged {
-                        viewer_count: new_count,
-                    },
-                )
-                .await;
-            }
-        }
+        cleanup_and_notify_screen_shares(state, user_id, session_id, channel_id).await;
     }
 
     // Leave channel and notify ALL users
@@ -1668,6 +1958,59 @@ async fn cleanup_session(state: &Arc<ServerState>, user_id: UserId, session_id: 
 
     state.remove_session(session_id).await;
     info!(user_id, session_id, "session cleaned up");
+}
+
+/// Tear down a user's screen-share state in `channel_id` (their own share
+/// and/or the share they were watching) and notify everyone affected.
+/// Used by every path that removes a user from a channel: leave, kick,
+/// disconnect.
+async fn cleanup_and_notify_screen_shares(
+    state: &Arc<ServerState>,
+    user_id: UserId,
+    session_id: SessionId,
+    channel_id: ChannelId,
+) {
+    let cleanup = state
+        .cleanup_screen_shares_for_user(user_id, session_id, channel_id)
+        .await;
+
+    // Notify viewers that the share stopped
+    for viewer_sid in &cleanup.viewers_to_notify_stopped {
+        if let Some(session) = state.sessions.get(viewer_sid) {
+            let _ = send_msg(
+                &session.tcp_tx,
+                &ServerMessage::StoppedWatchingScreenShare {
+                    reason: "sharer_left".into(),
+                },
+            )
+            .await;
+        }
+    }
+
+    // Broadcast ScreenShareStopped to the channel
+    if let Some(sharer_uid) = cleanup.stopped_sharer_user_id {
+        let msg = ServerMessage::ScreenShareStopped {
+            user_id: sharer_uid,
+        };
+        for &sid in &cleanup.channel_member_sessions {
+            if let Some(session) = state.sessions.get(&sid) {
+                let _ = send_msg(&session.tcp_tx, &msg).await;
+            }
+        }
+    }
+
+    // Notify sharer of viewer count change (if the user was watching someone)
+    if let Some((sharer_sid, new_count)) = cleanup.sharer_viewer_count_changed {
+        if let Some(session) = state.sessions.get(&sharer_sid) {
+            let _ = send_msg(
+                &session.tcp_tx,
+                &ServerMessage::ViewerCountChanged {
+                    viewer_count: new_count,
+                },
+            )
+            .await;
+        }
+    }
 }
 
 /// Start an auto-delete timer for an empty channel.
@@ -1742,8 +2085,288 @@ async fn broadcast_to_channel(
 }
 
 /// Send a server message to a client via their TCP sender.
+///
+/// Never awaits: callers hold DashMap shard guards (broadcasts iterate
+/// `sessions`), so a client that stops reading its socket must not be able
+/// to park the whole server behind its full queue. A client that cannot
+/// drain 256 control messages is dead anyway.
 async fn send_msg(tx: &mpsc::Sender<Vec<u8>>, msg: &ServerMessage) -> Result<()> {
     let data = encode_server_msg(msg)?;
-    tx.send(data).await.map_err(|_| anyhow::anyhow!("TCP send channel closed"))?;
+    tx.try_send(data).map_err(|e| match e {
+        mpsc::error::TrySendError::Full(_) => {
+            anyhow::anyhow!("TCP send queue full (client not reading)")
+        }
+        mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("TCP send channel closed"),
+    })?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::Ipv4Addr;
+
+    use voipc_protocol::codec::{decode_server_msg, encode_client_msg};
+
+    use crate::config::ServerConfig;
+    use crate::settings::ServerSettings;
+
+    /// Drives `handle_connection` over an in-memory duplex without TLS —
+    /// exactly how the WebTransport bridge feeds it.
+    #[tokio::test]
+    async fn authenticates_over_duplex() {
+        let config = ServerConfig::default();
+        let state = Arc::new(ServerState::new(
+            &config,
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        ));
+        let (mut client, server) = tokio::io::duplex(65536);
+        let mut handler = tokio::spawn(handle_connection(
+            server,
+            "test".into(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            state.clone(),
+        ));
+
+        let auth = ClientMessage::Authenticate {
+            username: "web".into(),
+            protocol_version: PROTOCOL_VERSION,
+            app_version: APP_VERSION.to_string(),
+            identity_key: None,
+            prekey_bundle: None,
+        };
+        client
+            .write_all(&encode_client_msg(&auth).unwrap())
+            .await
+            .unwrap();
+
+        let mut buf = BytesMut::new();
+        let mut replies = Vec::new();
+        let read_replies = async {
+            while replies.len() < 3 {
+                let n = client.read_buf(&mut buf).await.unwrap();
+                assert!(n > 0, "server closed the connection");
+                while let Some(payload) = try_decode_frame(&mut buf).unwrap() {
+                    replies.push(decode_server_msg(&payload).unwrap());
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), read_replies)
+            .await
+            .expect("replies within 5 s");
+
+        assert!(matches!(
+            replies[0],
+            ServerMessage::Authenticated { udp_port, .. } if udp_port == config.udp_port
+        ));
+        assert!(matches!(replies[1], ServerMessage::ChannelList { .. }));
+        assert!(matches!(
+            replies[2],
+            ServerMessage::UserList { channel_id: 0, .. }
+        ));
+        assert_eq!(state.sessions.len(), 1);
+
+        // Dropping our end is what the bridge does on teardown: the handler
+        // must see EOF and clean the session up.
+        drop(client);
+        tokio::time::timeout(Duration::from_secs(5), &mut handler)
+            .await
+            .expect("handler exits after EOF")
+            .unwrap();
+        assert!(state.sessions.is_empty());
+    }
+
+    // ── Moderation ─────────────────────────────────────────────────────
+
+    struct Client {
+        stream: tokio::io::DuplexStream,
+        handler: tokio::task::JoinHandle<()>,
+        buf: BytesMut,
+    }
+
+    impl Client {
+        async fn send(&mut self, msg: &ClientMessage) {
+            self.stream
+                .write_all(&encode_client_msg(msg).unwrap())
+                .await
+                .unwrap();
+        }
+
+        /// Next server message, or None once the server closed the stream.
+        async fn next(&mut self) -> Option<ServerMessage> {
+            loop {
+                if let Some(payload) = try_decode_frame(&mut self.buf).unwrap() {
+                    return Some(decode_server_msg(&payload).unwrap());
+                }
+                let n = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    self.stream.read_buf(&mut self.buf),
+                )
+                .await
+                .expect("a server message within 5 s")
+                .unwrap();
+                if n == 0 {
+                    return None;
+                }
+            }
+        }
+
+        /// Skips messages (broadcasts about other users) until `pred` matches.
+        async fn expect(
+            &mut self,
+            what: &str,
+            pred: impl Fn(&ServerMessage) -> bool,
+        ) -> ServerMessage {
+            loop {
+                match self.next().await {
+                    Some(msg) if pred(&msg) => return msg,
+                    Some(_) => continue,
+                    None => panic!("connection closed while waiting for {what}"),
+                }
+            }
+        }
+
+        async fn assert_closed(mut self) {
+            assert!(self.next().await.is_none(), "server should close the stream");
+            tokio::time::timeout(Duration::from_secs(5), &mut self.handler)
+                .await
+                .expect("handler exits")
+                .unwrap();
+        }
+    }
+
+    fn admin_state() -> Arc<ServerState> {
+        Arc::new(ServerState::new(
+            &ServerConfig::default(),
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        ))
+    }
+
+    /// Authenticates `username` from `ip` over a duplex.
+    async fn connect(state: &Arc<ServerState>, username: &str, ip: IpAddr) -> Client {
+        let (stream, server) = tokio::io::duplex(65536);
+        let handler = tokio::spawn(handle_connection(
+            server,
+            username.into(),
+            ip,
+            ip,
+            state.clone(),
+        ));
+        let mut client = Client {
+            stream,
+            handler,
+            buf: BytesMut::new(),
+        };
+        client
+            .send(&ClientMessage::Authenticate {
+                username: username.into(),
+                protocol_version: PROTOCOL_VERSION,
+                app_version: APP_VERSION.to_string(),
+                identity_key: None,
+                prekey_bundle: None,
+            })
+            .await;
+        client
+            .expect("Authenticated", |m| matches!(m, ServerMessage::Authenticated { .. }))
+            .await;
+        client
+    }
+
+    #[tokio::test]
+    async fn admin_login_ban_and_unban() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let far = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5));
+        let mut alice = connect(&state, "alice", lo).await; // user 1
+        let mut bob = connect(&state, "bob", far).await; // user 2
+
+        // Not an admin: refused
+        bob.send(&ClientMessage::AdminKick { user_id: 1, reason: String::new() })
+            .await;
+        bob.expect("AdminError", |m| matches!(m, ServerMessage::AdminError { .. }))
+            .await;
+
+        // Wrong token, then the right one; everyone learns about the login
+        alice
+            .send(&ClientMessage::AdminLogin { token: "nope".into() })
+            .await;
+        alice
+            .expect("AdminError", |m| matches!(m, ServerMessage::AdminError { .. }))
+            .await;
+        alice
+            .send(&ClientMessage::AdminLogin { token: "test-admin-token".into() })
+            .await;
+        let is_login = |m: &ServerMessage| {
+            matches!(m, ServerMessage::AdminStatus { user_id: 1, is_admin: true })
+        };
+        alice.expect("AdminStatus", is_login).await;
+        bob.expect("AdminStatus broadcast", is_login).await;
+        assert!(state.is_admin(1));
+
+        // Ban bob: he gets the reason, his stream closes, his IP is blocked,
+        // alice gets the updated ban list
+        alice
+            .send(&ClientMessage::AdminBan {
+                user_id: 2,
+                reason: "spam".into(),
+                duration_secs: 60,
+            })
+            .await;
+        let gone = bob
+            .expect("Disconnected", |m| matches!(m, ServerMessage::Disconnected { .. }))
+            .await;
+        assert!(matches!(gone, ServerMessage::Disconnected { reason } if reason.contains("spam")));
+        bob.assert_closed().await;
+        assert!(state.is_banned(far));
+        assert!(!state.is_banned(lo));
+        assert_eq!(state.sessions.len(), 1);
+        let bans = alice
+            .expect("AdminBans", |m| matches!(m, ServerMessage::AdminBans { .. }))
+            .await;
+        assert!(matches!(&bans, ServerMessage::AdminBans { bans } if bans.len() == 1 && bans[0].ip == "10.0.0.5"));
+
+        // Unban
+        alice
+            .send(&ClientMessage::AdminUnban { ip: "10.0.0.5".into() })
+            .await;
+        let bans = alice
+            .expect("AdminBans", |m| matches!(m, ServerMessage::AdminBans { .. }))
+            .await;
+        assert!(matches!(&bans, ServerMessage::AdminBans { bans } if bans.is_empty()));
+        assert!(!state.is_banned(far));
+    }
+
+    #[tokio::test]
+    async fn three_failed_admin_logins_disconnect() {
+        let state = admin_state();
+        let mut dave = connect(&state, "dave", IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+        for _ in 0..3 {
+            dave.send(&ClientMessage::AdminLogin { token: "wrong".into() })
+                .await;
+            dave.expect("AdminError", |m| matches!(m, ServerMessage::AdminError { .. }))
+                .await;
+        }
+        dave.expect("Disconnected", |m| matches!(m, ServerMessage::Disconnected { .. }))
+            .await;
+        dave.assert_closed().await;
+        assert!(state.sessions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn bans_expire() {
+        let state = admin_state();
+        let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9));
+        state.ban(ip, Some(Duration::from_millis(50)));
+        assert!(state.is_banned(ip));
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(!state.is_banned(ip));
+        assert!(state.list_bans().is_empty());
+        state.ban(ip, None);
+        assert_eq!(state.list_bans()[0].expires_in_secs, None);
+    }
 }

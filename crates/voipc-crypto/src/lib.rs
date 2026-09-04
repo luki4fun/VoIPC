@@ -6,15 +6,17 @@
 //! - Pairwise session establishment (X3DH + Double Ratchet)
 //! - Group encryption via Sender Keys
 //! - Symmetric AES-256-GCM encryption for voice/video media
-//! - Encrypted persistence of Signal Protocol state
+//!
+//! Signal state is deliberately not persisted: identities are ephemeral per
+//! launch (no accounts, nothing to fingerprint or link across sessions).
 
 pub mod group;
 pub mod identity;
 pub mod media_keys;
-pub mod persistence;
 pub mod prekey;
 pub mod session;
 pub mod stores;
+pub mod time;
 
 // Re-export key types for convenience
 pub use identity::{generate_identity_key_pair, SerializableIdentityKeyPair};

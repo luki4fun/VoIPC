@@ -108,6 +108,8 @@ pub struct AppConfig {
     // QoL
     pub sounds: SoundSettings,
     pub auto_connect: bool,
+    /// Answer newcomers' requests for recent channel chat (E2E, pairwise).
+    pub share_channel_history: bool,
 
     // Storage
     /// Path to the encrypted chat history file. None = not yet configured (first run).
@@ -141,6 +143,7 @@ impl Default for AppConfig {
             saved_servers: Vec::new(),
             sounds: SoundSettings::default(),
             auto_connect: false,
+            share_channel_history: true,
             chat_history_path: None,
             chat_history_disabled: false,
         }

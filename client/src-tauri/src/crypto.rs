@@ -19,6 +19,10 @@ pub struct ChatMessage {
     pub username: String,
     pub content: String,
     pub timestamp: u64,
+    /// None/"text" = a message; "history-marker" = the divider after shared
+    /// history; other values are placeholders (future attachment types).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone, Debug)]

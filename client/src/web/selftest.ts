@@ -1,0 +1,214 @@
+// Headless end-to-end self-test for the web client, driven by test-web.sh.
+// Loaded instead of the UI when the page URL carries ?selftest=1. It exercises
+// the same invoke()/listen() surface the Svelte components use and reports
+// through console.log lines prefixed with "SELFTEST", which the driver parses.
+//
+// Query parameters:
+//   name=<username>      required
+//   channel=<name>       channel to create or join (default "e2e"); an invite
+//                        fragment (#channel=<name>) takes precedence
+//   role=talker|listener talker transmits a PTT burst, listener reports stats
+//   dm=<username>        send a direct message to this user once seen
+//   duration=<ms>        main phase before the wrap-up (default 15000)
+//   admin=<token>        wrap-up: log in as admin and kick the user in `kick`
+//   kick=<username>      the user the admin kicks
+//   expect_kick=1        wrap-up: wait (up to 10 s) to be kicked
+
+import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
+import { parseInviteFragment } from "../lib/invite";
+
+interface ChannelInfo { channel_id: number; name: string }
+interface UserInfo { user_id: number; username: string; channel_id: number }
+
+function log(line: string, data?: unknown) {
+  console.log(`SELFTEST ${line}${data === undefined ? "" : " " + JSON.stringify(data, (_k, v) => (typeof v === "bigint" ? Number(v) : v))}`);
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+export async function run(params: URLSearchParams): Promise<void> {
+  const name = params.get("name") ?? `web${Math.floor(Math.random() * 1000)}`;
+  const invite = parseInviteFragment(window.location.hash);
+  const channelName = invite?.channel ?? params.get("channel") ?? "e2e";
+  const role = params.get("role") ?? "listener";
+  const dmTarget = params.get("dm");
+  const duration = Number(params.get("duration") ?? 15000);
+  const adminToken = params.get("admin");
+  const kickTarget = params.get("kick");
+  const expectKick = params.has("expect_kick");
+
+  window.addEventListener("error", (e) => log("error", { message: e.message }));
+  window.addEventListener("unhandledrejection", (e) => log("error", { message: String(e.reason) }));
+
+  let channels: ChannelInfo[] = [];
+  const users = new Map<number, UserInfo>();
+  let myUserId = 0;
+  let joinedChannelId = 0;
+  let dmSent = false;
+  let chatSent = false;
+  let earlySent = false;
+  let isAdmin = false;
+  let kicked = false;
+  // What App.svelte would hand to a newcomer: the channel messages we have seen
+  const channelHistory: { user_id: number; username: string; content: string; timestamp: number }[] = [];
+
+  const watched = [
+    "channel-list", "user-list", "user-joined", "user-left", "media-key-installed",
+    "media-key-missing", "user-speaking", "channel-chat-message", "direct-chat-message",
+    "latency-update", "connection-lost", "channel-error", "udp-dead", "audio-device-error",
+    "identity-key-changed", "poke-received", "admin-status", "admin-error",
+    "server-disconnected", "channel-history-requested", "channel-history-received",
+  ];
+  for (const ev of watched) {
+    await listen(ev, (e: { payload: unknown }) => {
+      if (ev !== "latency-update") log(`event ${ev}`, e.payload);
+      if (ev === "channel-list") channels = e.payload as ChannelInfo[];
+      if (ev === "user-list") {
+        const p = e.payload as { channel_id: number; users: UserInfo[] };
+        for (const u of p.users) users.set(u.user_id, u);
+      }
+      if (ev === "user-joined") {
+        const u = e.payload as UserInfo;
+        users.set(u.user_id, u);
+      }
+      if (ev === "admin-status") {
+        const p = e.payload as { user_id: number; is_admin: boolean };
+        if (p.user_id === myUserId) isAdmin = p.is_admin;
+      }
+      if (ev === "server-disconnected") kicked = true;
+      if (ev === "channel-chat-message") {
+        const m = e.payload as { user_id: number; username: string; content: string; timestamp: number };
+        channelHistory.push({ user_id: m.user_id, username: m.username, content: m.content, timestamp: m.timestamp });
+      }
+      if (ev === "channel-history-requested") {
+        // The UI's job in the real app: answer with the recent channel chat
+        const p = e.payload as { channel_id: number; from_user_id: number };
+        invoke("send_channel_history", {
+          channelId: p.channel_id,
+          targetUserId: p.from_user_id,
+          messages: channelHistory.slice(-50),
+        }).catch((err) => log("error", { message: `history: ${String(err)}` }));
+      }
+    });
+  }
+
+  try {
+    const userId = await invoke<number>("connect", {
+      address: window.location.host,
+      username: name,
+      acceptInvalidCerts: false,
+    });
+    myUserId = userId;
+    log("connected", { user_id: userId, name });
+  } catch (e) {
+    log("connect-failed", { error: String(e) });
+    log("done");
+    return;
+  }
+
+  // Wait for the channel list, then create or join the test channel
+  for (let i = 0; i < 50 && channels.length === 0; i++) await sleep(100);
+  const existing = channels.find((c) => c.name === channelName);
+  try {
+    if (existing) {
+      await invoke("join_channel", { channelId: existing.channel_id, password: invite?.password ?? null });
+      joinedChannelId = existing.channel_id;
+    } else {
+      await invoke("create_channel", { name: channelName, password: null });
+    }
+    log("channel-requested", { channel: channelName, existing: !!existing, source: invite ? "invite" : "param" });
+  } catch (e) {
+    log("error", { message: `channel: ${String(e)}` });
+  }
+
+  const started = Date.now();
+  let talked = false;
+  while (Date.now() - started < duration) {
+    await sleep(500);
+    const me = users.get(myUserId);
+    if (me && me.channel_id !== 0) joinedChannelId = me.channel_id;
+    const peers = [...users.values()].filter((u) => u.user_id !== myUserId && u.channel_id === joinedChannelId && joinedChannelId !== 0);
+
+    // A message typed while alone: queued until a peer arrives, and part of
+    // the channel history handed to that peer
+    if (role === "talker" && !earlySent && joinedChannelId !== 0) {
+      earlySent = true;
+      try {
+        await invoke("send_channel_message", { content: `early from ${name}` });
+        log("early-chat-sent");
+      } catch (e) {
+        log("error", { message: `early chat: ${String(e)}` });
+      }
+    }
+    // Give the Signal handshake + sender-key exchange a moment, then chat once
+    if (!chatSent && peers.length > 0 && Date.now() - started > 4000) {
+      chatSent = true;
+      try {
+        await invoke("send_channel_message", { content: `hello from ${name}` });
+        log("chat-sent");
+      } catch (e) {
+        log("error", { message: `chat: ${String(e)}` });
+      }
+    }
+    if (!dmSent && dmTarget) {
+      const target = [...users.values()].find((u) => u.username === dmTarget);
+      if (target && Date.now() - started > 4000) {
+        dmSent = true;
+        try {
+          await invoke("send_direct_message", { targetUserId: target.user_id, content: `dm from ${name}` });
+          log("dm-sent", { to: target.user_id });
+        } catch (e) {
+          log("error", { message: `dm: ${String(e)}` });
+        }
+      }
+    }
+    if (role === "talker" && !talked && peers.length > 0 && Date.now() - started > 5000) {
+      talked = true;
+      try {
+        await invoke("start_transmit");
+        log("transmit-started");
+        await sleep(4000);
+        await invoke("stop_transmit");
+        log("transmit-stopped");
+      } catch (e) {
+        log("error", { message: `transmit: ${String(e)}` });
+      }
+    }
+  }
+
+  try {
+    const [played, lost] = await invoke<[number, number]>("get_voice_stats");
+    log("voice-stats", { played, lost });
+  } catch (e) {
+    log("error", { message: `voice-stats: ${String(e)}` });
+  }
+
+  // Wrap-up: moderation
+  if (adminToken && kickTarget) {
+    await sleep(2500); // let the other side finish its own wrap-up first
+    try {
+      await invoke("admin_login", { token: adminToken });
+      for (let i = 0; i < 50 && !isAdmin; i++) await sleep(100);
+      log("admin-login", { ok: isAdmin });
+      const target = [...users.values()].find((u) => u.username === kickTarget);
+      if (isAdmin && target) {
+        await invoke("admin_kick", { userId: target.user_id, reason: "e2e kick" });
+        log("admin-kicked", { user_id: target.user_id });
+        await sleep(1000);
+      }
+    } catch (e) {
+      log("error", { message: `admin: ${String(e)}` });
+    }
+  } else if (expectKick) {
+    for (let i = 0; i < 100 && !kicked; i++) await sleep(100);
+    log("kick-observed", { kicked });
+  }
+
+  try {
+    await invoke("disconnect");
+  } catch {
+    // ignore
+  }
+  log("done");
+}

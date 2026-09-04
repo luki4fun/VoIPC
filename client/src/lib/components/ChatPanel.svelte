@@ -157,8 +157,9 @@
     if (index === 0) return true;
     const prev = displayMessages[index - 1];
     const curr = displayMessages[index];
-    // Show header if different user or more than 5 minutes apart
+    // Show header if different user, after a history divider, or more than 5 minutes apart
     return (
+      prev.kind === "history-marker" ||
       prev.user_id !== curr.user_id ||
       curr.timestamp - prev.timestamp > 5 * 60 * 1000
     );
@@ -241,19 +242,27 @@
       </div>
     {:else}
       {#each displayMessages as msg, i (msg.timestamp + "-" + msg.user_id + "-" + i)}
-        {#if shouldShowHeader(i)}
-          <div class="msg-header">
-            <span class="msg-username" class:self={msg.user_id === $userId}>{msg.username}</span>
-            <span class="msg-time">{formatTime(msg.timestamp)}</span>
+        {#if msg.kind === "history-marker"}
+          <div class="history-marker"><span>{msg.content}</span></div>
+        {:else}
+          {#if shouldShowHeader(i)}
+            <div class="msg-header">
+              <span class="msg-username" class:self={msg.user_id === $userId}>{msg.username}</span>
+              <span class="msg-time">{formatTime(msg.timestamp)}</span>
+            </div>
+          {/if}
+          <div class="msg-content">
+            {#if msg.kind && msg.kind !== "text"}
+              <span class="attachment-placeholder">[attachment — not shared]</span>
+            {:else}
+              {#each splitSegments(msg.content) as seg}
+                {#if seg.url}
+                  <button class="msg-link" onclick={() => (linkPopupUrl = seg.text)} title="Copy link">{seg.text}</button>
+                {:else}{seg.text}{/if}
+              {/each}
+            {/if}
           </div>
         {/if}
-        <div class="msg-content">
-          {#each splitSegments(msg.content) as seg}
-            {#if seg.url}
-              <button class="msg-link" onclick={() => (linkPopupUrl = seg.text)} title="Copy link">{seg.text}</button>
-            {:else}{seg.text}{/if}
-          {/each}
-        </div>
       {/each}
     {/if}
   </div>
@@ -368,6 +377,29 @@
     height: 100%;
     flex: 1;
     min-width: 0;
+  }
+
+  .history-marker {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin: 10px 0;
+    font-size: 11px;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .history-marker::before,
+  .history-marker::after {
+    content: "";
+    flex: 1;
+    border-top: 1px solid var(--border);
+  }
+
+  .attachment-placeholder {
+    color: var(--text-secondary);
+    font-style: italic;
   }
 
   .chat-header {

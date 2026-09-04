@@ -123,23 +123,10 @@ pub async fn join_channel(
         },
     )
     .await?;
-    // Track locally so start_transmit can check (server confirms via user-list event).
-    // NOTE: The TCP reader task also updates current_channel_id when it receives
-    // UserList from the server, which handles server-initiated moves (create, kick, etc.)
-    connection.current_channel_id.store(channel_id, std::sync::atomic::Ordering::Relaxed);
-
-    // Clear the current media key — server will send a fresh ChannelMediaKey
-    // for the new channel via the TCP control channel.
-    if let Ok(mut mk) = connection.current_media_key.lock() {
-        *mk = None;
-    }
-
-    // Reset sender key state for the new channel (fresh distribution needed)
-    {
-        let mut sig = state.signal.lock().unwrap_or_else(|p| p.into_inner());
-        sig.sender_key_distributed.remove(&channel_id);
-        sig.sender_key_received.remove(&channel_id);
-    }
+    // Channel id, media key and sender-key state switch only when the server
+    // confirms the move (UserList, handled in network.rs): a rejected join
+    // (wrong password, channel full) must leave the current channel's voice
+    // working.
 
     // Clean up screen share state when switching channels
     if connection.is_screen_sharing {
@@ -2014,6 +2001,99 @@ pub async fn send_encrypted_direct_message(
     .await
 }
 
+/// Hand recent channel chat to a newcomer: JSON `{ v, messages }` encrypted
+/// with the pairwise Signal session (the frontend picked and trimmed the
+/// messages; the server relays the ciphertext blind).
+#[tauri::command]
+pub async fn send_channel_history(
+    state: State<'_, AppState>,
+    channel_id: u32,
+    target_user_id: u32,
+    messages: serde_json::Value,
+) -> Result<(), String> {
+    let payload = serde_json::to_vec(&serde_json::json!({ "v": 1, "messages": messages }))
+        .map_err(|e| e.to_string())?;
+    if payload.len() > 60 * 1024 {
+        return Err("history payload too large".into());
+    }
+    let (ciphertext, message_type) = tokio::task::block_in_place(|| {
+        let mut signal = state.signal.lock().map_err(|e| e.to_string())?;
+        let stores = signal.stores.as_mut().ok_or("E2E encryption not initialized".to_string())?;
+        tokio::runtime::Handle::current()
+            .block_on(voipc_crypto::session::encrypt_message(stores, target_user_id, &payload))
+            .map_err(|e| format!("encryption failed: {e}"))
+    })?;
+
+    let conn = state.connection.read().await;
+    let connection = conn.as_ref().ok_or("Not connected")?;
+    network::send_tcp_message(
+        &connection.tcp_tx,
+        &ClientMessage::SendChannelHistory {
+            channel_id,
+            target_user_id,
+            ciphertext,
+            message_type,
+        },
+    )
+    .await
+}
+
+// ── Moderation (admin token session) ──────────────────────────────────
+
+async fn send_admin_message(state: &AppState, msg: ClientMessage) -> Result<(), String> {
+    let conn = state.connection.read().await;
+    let connection = conn.as_ref().ok_or("Not connected")?;
+    network::send_tcp_message(&connection.tcp_tx, &msg).await
+}
+
+/// Log this session in as server admin. The reply arrives as the
+/// `admin-status` event (or `admin-error`).
+#[tauri::command]
+pub async fn admin_login(state: State<'_, AppState>, token: String) -> Result<(), String> {
+    send_admin_message(&state, ClientMessage::AdminLogin { token }).await
+}
+
+/// Disconnect a user from the server (admin only).
+#[tauri::command]
+pub async fn admin_kick(
+    state: State<'_, AppState>,
+    user_id: u32,
+    reason: String,
+) -> Result<(), String> {
+    send_admin_message(&state, ClientMessage::AdminKick { user_id, reason }).await
+}
+
+/// Disconnect a user and ban their IP (admin only). `duration_secs` 0 = until restart.
+#[tauri::command]
+pub async fn admin_ban(
+    state: State<'_, AppState>,
+    user_id: u32,
+    reason: String,
+    duration_secs: u32,
+) -> Result<(), String> {
+    send_admin_message(
+        &state,
+        ClientMessage::AdminBan {
+            user_id,
+            reason,
+            duration_secs,
+        },
+    )
+    .await
+}
+
+/// Lift an IP ban (admin only). The updated list arrives as `admin-bans`.
+#[tauri::command]
+pub async fn admin_unban(state: State<'_, AppState>, ip: String) -> Result<(), String> {
+    send_admin_message(&state, ClientMessage::AdminUnban { ip }).await
+}
+
+/// Request the ban list (admin only); delivered as the `admin-bans` event.
+#[tauri::command]
+pub async fn admin_list_bans(state: State<'_, AppState>) -> Result<(), String> {
+    send_admin_message(&state, ClientMessage::AdminListBans).await
+}
+
 /// Send an encrypted channel message using Sender Keys.
 /// Encrypts the plaintext using the channel's sender key, then sends ciphertext.
 #[tauri::command]
@@ -2065,48 +2145,11 @@ pub async fn send_encrypted_channel_message(
     .await
 }
 
-/// Distribute a sender key to a channel member (for group encryption).
+/// Forget the TOFU-pinned certificate of a server (after a legitimate
+/// certificate rotation). Returns whether a pin existed.
 #[tauri::command]
-pub async fn distribute_sender_key(
-    state: State<'_, AppState>,
-    channel_id: u32,
-    target_user_id: u32,
-    distribution_message: Vec<u8>,
-    message_type: Option<u8>,
-) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
-    network::send_tcp_message(
-        &connection.tcp_tx,
-        &ClientMessage::DistributeSenderKey {
-            channel_id,
-            target_user_id,
-            distribution_message,
-            message_type: message_type.unwrap_or(0),
-        },
-    )
-    .await
-}
-
-/// Distribute a media encryption key to a channel member.
-#[tauri::command]
-pub async fn distribute_media_key(
-    state: State<'_, AppState>,
-    channel_id: u32,
-    target_user_id: u32,
-    encrypted_media_key: Vec<u8>,
-) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
-    network::send_tcp_message(
-        &connection.tcp_tx,
-        &ClientMessage::DistributeMediaKey {
-            channel_id,
-            target_user_id,
-            encrypted_media_key,
-        },
-    )
-    .await
+pub fn forget_server_pin(host: String, port: u16) -> bool {
+    network::tofu_forget(&host, port)
 }
 
 /// Upload replenished one-time pre-keys to the server.
@@ -2403,6 +2446,7 @@ pub fn set_config_bool(
     match key.as_str() {
         "auto_connect" => config.auto_connect = value,
         "remember_connection" => config.remember_connection = value,
+        "share_channel_history" => config.share_channel_history = value,
         _ => return Err(format!("Unknown config key: {key}")),
     }
     crate::config::save_config(&config)

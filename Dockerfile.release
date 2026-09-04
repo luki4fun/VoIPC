@@ -38,9 +38,9 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     file \
     && rm -rf /var/lib/apt/lists/*
 
-# Rust + Tauri CLI
+# Rust + Tauri CLI (+ wasm target for the web client)
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && rustup target add x86_64-unknown-linux-musl \
+    && rustup target add x86_64-unknown-linux-musl wasm32-unknown-unknown \
     && cargo install tauri-cli
 
 # Node.js (LTS)
@@ -54,7 +54,10 @@ COPY . .
 # Frontend dependencies
 RUN cd client && npm ci
 
-# Build server (fully static via musl — zero runtime deps)
+# Build the web client (wasm + Vite) BEFORE the server: the server embeds client/dist-web
+RUN cd client && npm run build:web
+
+# Build server (fully static via musl — zero runtime deps; serves the embedded web client)
 RUN cargo build -p voipc-server --release --target x86_64-unknown-linux-musl
 
 # Build client AppImage (bundle-libs.sh runs automatically via beforeBundleCommand)
@@ -68,6 +71,7 @@ RUN cargo tauri build --bundles appimage
 RUN mkdir -p /release \
     && cp target/x86_64-unknown-linux-musl/release/voipc-server /release/ \
     && cp target/release/bundle/appimage/*.AppImage /release/ \
+    && tar -czf /release/VoIPC-web.tar.gz -C client dist-web \
     && ls -lh /release/
 
 # Minimal output stage

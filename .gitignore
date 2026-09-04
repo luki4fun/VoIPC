@@ -1,4 +1,5 @@
 /target
+/release
 Cargo.lock
 *.swp
 *.swo
@@ -14,6 +15,10 @@ client/src-tauri/target/
 client/src-tauri/external-dlls/
 client/node_modules/
 client/dist/
+
+# Web client build artifacts (npm run build:web)
+client/dist-web/
+client/src/lib/wasm/
 
 # Certificates (keep generate script, ignore actual certs)
 certs/*.key

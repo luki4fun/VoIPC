@@ -1,0 +1,15 @@
+[package]
+# Substituted for the real crate through [patch.crates-io] in ../Cargo.toml.
+name = "pqcrypto-kyber"
+version = "0.7.9"
+edition = "2021"
+license = "MIT"
+description = "Stub replacing pqcrypto-kyber in the VoIPC wasm build (Kyber is never negotiated)"
+publish = false
+
+[dependencies]
+pqcrypto-traits = "0.3"
+
+[features]
+# libsignal enables this on the real crate.
+std = []

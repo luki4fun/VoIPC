@@ -115,6 +115,65 @@ export function addChannelMessage(channelName: string, msg: ChatMessage) {
   scheduleSave();
 }
 
+const HISTORY_MAX_MESSAGES = 50;
+const HISTORY_MAX_CONTENT = 2000;
+
+/**
+ * Merge channel history shared by a member: only well-formed text messages,
+ * deduplicated against what we have, chronological, capped, and closed by
+ * one "history-marker" divider so the reader sees where the hand-off ends.
+ */
+export function mergeChannelHistory(channelName: string, incoming: unknown[], sharedBy: string) {
+  const valid: ChatMessage[] = [];
+  for (const raw of incoming.slice(-HISTORY_MAX_MESSAGES)) {
+    const m = raw as Partial<ChatMessage> | null;
+    if (
+      !m || typeof m.user_id !== "number" || typeof m.username !== "string" ||
+      typeof m.content !== "string" || typeof m.timestamp !== "number"
+    ) continue;
+    valid.push({
+      user_id: m.user_id,
+      username: m.username.slice(0, 32),
+      content: m.content.slice(0, HISTORY_MAX_CONTENT),
+      timestamp: m.timestamp,
+      kind: m.kind === undefined || m.kind === "text" ? undefined : String(m.kind).slice(0, 32),
+    });
+  }
+  if (valid.length === 0) return;
+
+  channelMessages.update((map) => {
+    const existing = (map.get(channelName) ?? []).filter((m) => m.kind !== "history-marker");
+    // A message we already hold: same author and text within two minutes.
+    // The window absorbs sender-local vs. server timestamps (a message typed
+    // while alone is queued, then delivered live to the newcomer as well).
+    const have = [...existing];
+    const isDuplicate = (m: ChatMessage) =>
+      have.some((h) => h.user_id === m.user_id && h.content === m.content && Math.abs(h.timestamp - m.timestamp) < 120_000);
+    const fresh: ChatMessage[] = [];
+    for (const m of valid) {
+      if (isDuplicate(m)) continue;
+      fresh.push(m);
+      have.push(m);
+    }
+    if (fresh.length === 0) return map;
+    const marker: ChatMessage = {
+      user_id: 0,
+      username: "",
+      content: `Earlier messages shared by ${sharedBy}`,
+      timestamp: fresh[fresh.length - 1].timestamp,
+      kind: "history-marker",
+    };
+    // Stable sort: the marker sits right after the last shared message
+    const msgs = [...existing, ...fresh, marker].sort((a, b) => a.timestamp - b.timestamp);
+    if (msgs.length > MAX_MESSAGES) {
+      msgs.splice(0, msgs.length - MAX_MESSAGES);
+    }
+    map.set(channelName, msgs);
+    return new Map(map);
+  });
+  scheduleSave();
+}
+
 export function addDmMessage(
   myId: number,
   fromId: number,

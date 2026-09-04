@@ -48,6 +48,12 @@
     }
   });
 
+  // A new connection starts with no capture task; the store must follow,
+  // or the auto-start above never re-arms after a reconnect
+  $effect(() => {
+    if ($connectionState !== "connected") isTransmitting.set(false);
+  });
+
   async function toggleMute() {
     try {
       const muted: boolean = await invoke("toggle_mute");
@@ -252,9 +258,9 @@
     };
 
     keyupHandler = (e: KeyboardEvent) => {
-      // Don't trigger when typing in input/textarea
-      const target = e.target as HTMLElement;
-      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
+      // No input/textarea guard here (unlike keydown): releasing the PTT
+      // key must always stop the mic, even if focus moved into the chat
+      // box while it was held. The path is gated on $isTransmitting.
 
       // Stop transmit when the released key breaks the PTT binding
       if ($voiceMode === "ptt" && $isTransmitting && shouldStopPtt(e)) {

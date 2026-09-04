@@ -29,6 +29,12 @@ use voipc_protocol::voice::VoicePacket;
 use crate::app_state::{ActiveConnection, AppState, PendingTarget, SignalState};
 use crate::screenshare;
 
+/// Bound for each connect phase (TCP, TLS, auth response).
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// The server pings every 60 s; two missed pings plus margin means the path
+/// is dead even though the socket never reported it (roam, sleep, NAT expiry).
+const TCP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
+
 /// Connect to the server, authenticate, spawn background tasks, and store the connection.
 /// Returns the assigned user_id on success.
 pub async fn connect_to_server(
@@ -38,6 +44,11 @@ pub async fn connect_to_server(
     username: String,
     accept_invalid_certs: bool,
 ) -> Result<u32, String> {
+    // Serialize connects: the reconnect loop and a manual connect can race,
+    // and the write lock below is released before the network phase — the
+    // loser's tasks would otherwise be overwritten without teardown and leak.
+    let _connect_guard = state.connect_lock.lock().await;
+
     // Tear down any existing connection first (e.g. after webview reload)
     {
         let mut conn = state.connection.write().await;
@@ -57,11 +68,24 @@ pub async fn connect_to_server(
         }
     }
 
+    // Fresh Signal identity per connection (ephemeral by design — no accounts,
+    // nothing to fingerprint). Also required for correctness: the server
+    // reassigns user ids on restart, and libsignal pins identities to
+    // "user_N", so a kept store would reject the new holder of an old id.
+    {
+        let mut signal = state.signal.lock().map_err(|e| e.to_string())?;
+        signal.stores = None;
+        signal.initialized = false;
+    }
+
     let (host, port) = parse_address(&address)?;
 
-    // TCP connect
-    let tcp_stream = TcpStream::connect((&*host, port))
+    // TCP connect. Every phase below is bounded: without a deadline a
+    // black-holed host keeps the reconnect loop (and its Cancel button)
+    // stuck in SYN retries for minutes.
+    let tcp_stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((&*host, port)))
         .await
+        .map_err(|_| format!("Timed out connecting to {}", address))?
         .map_err(|e| format!("Could not connect to {}: {}", address, e))?;
 
     info!("TCP connected to {}", address);
@@ -71,7 +95,9 @@ pub async fn connect_to_server(
         warn!("Using TOFU certificate pinning (self-signed mode)");
         rustls::ClientConfig::builder()
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(TofuCertVerifier))
+            .with_custom_certificate_verifier(Arc::new(TofuCertVerifier {
+                key: tofu_key(&host, port),
+            }))
             .with_no_client_auth()
     } else {
         let mut root_store = rustls::RootCertStore::empty();
@@ -89,9 +115,9 @@ pub async fn connect_to_server(
             .map_err(|e| format!("Invalid server name '{}': {}", host, e))?
     };
 
-    let mut tls_stream = connector
-        .connect(server_name, tcp_stream)
+    let mut tls_stream = tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(server_name, tcp_stream))
         .await
+        .map_err(|_| format!("Timed out in TLS handshake with {}", address))?
         .map_err(|e| format!("TLS handshake failed: {}", e))?;
 
     info!("TLS handshake complete");
@@ -200,9 +226,9 @@ pub async fn connect_to_server(
     // Read until we get the Authenticated or AuthError response
     let mut buf = BytesMut::with_capacity(4096);
     let (user_id, session_id, udp_port, udp_token) = loop {
-        let n = tls_stream
-            .read_buf(&mut buf)
+        let n = tokio::time::timeout(CONNECT_TIMEOUT, tls_stream.read_buf(&mut buf))
             .await
+            .map_err(|_| "Timed out waiting for the authentication response".to_string())?
             .map_err(|e| format!("Failed to read auth response: {}", e))?;
 
         if n == 0 {
@@ -417,6 +443,7 @@ pub async fn connect_to_server(
 
     let udp_recv_handle = tokio::spawn(udp_receiver_task(
         udp_socket.clone(),
+        server_addr,
         app_handle.clone(),
         session_id,
         mix_sources.clone(),
@@ -603,9 +630,9 @@ async fn tcp_reader_task(
     screen_share_active: Arc<AtomicBool>,
     watching_user_id_shared: Arc<AtomicU32>,
 ) {
-    loop {
-        match read_half.read_buf(&mut buf).await {
-            Ok(0) => {
+    'read: loop {
+        match tokio::time::timeout(TCP_IDLE_TIMEOUT, read_half.read_buf(&mut buf)).await {
+            Ok(Ok(0)) => {
                 info!("server closed TCP connection");
                 let _ = app_handle.emit(
                     "connection-lost",
@@ -613,12 +640,20 @@ async fn tcp_reader_task(
                 );
                 break;
             }
-            Ok(_) => {}
-            Err(e) => {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => {
                 error!("TCP read error: {}", e);
                 let _ = app_handle.emit(
                     "connection-lost",
                     serde_json::json!({"reason": format!("Read error: {}", e)}),
+                );
+                break;
+            }
+            Err(_) => {
+                error!("no data from server for {:?}", TCP_IDLE_TIMEOUT);
+                let _ = app_handle.emit(
+                    "connection-lost",
+                    serde_json::json!({"reason": "Connection timed out (no data from server)"}),
                 );
                 break;
             }
@@ -645,8 +680,14 @@ async fn tcp_reader_task(
                 },
                 Ok(None) => break,
                 Err(e) => {
+                    // The bad length prefix is never consumed; reading on
+                    // would only grow `buf` forever. Treat as a dead link.
                     error!("frame decode error: {}", e);
-                    break;
+                    let _ = app_handle.emit(
+                        "connection-lost",
+                        serde_json::json!({"reason": format!("Protocol error: {}", e)}),
+                    );
+                    break 'read;
                 }
             }
         }
@@ -678,7 +719,9 @@ async fn handle_server_message(
             // (create_channel auto-join, kicks, invites, etc.)
             let old_ch = channel_id_store.swap(channel_id, Ordering::Relaxed);
             if old_ch != channel_id {
-                // Clear media key — server will send a fresh ChannelMediaKey
+                // Clear media key — the new channel's key comes from an
+                // existing member over Signal, or we generate one if alone
+                // (see below, after the user list is known)
                 {
                     let mut mk = media_key.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
                     *mk = None;
@@ -688,6 +731,8 @@ async fn handle_server_message(
                     let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
                     sig.sender_key_distributed.remove(&channel_id);
                     sig.sender_key_received.remove(&channel_id);
+                    // Members already here → ask the first one we key up with for recent chat
+                    sig.history_wanted_channel = if users.len() > 1 { channel_id } else { 0 };
                 }
                 info!(old_ch, channel_id, "channel changed via UserList");
 
@@ -714,6 +759,27 @@ async fn handle_server_message(
                 tcp_tx,
             )
             .await;
+
+            // Media keys never touch the server: the first member of a
+            // channel generates one; everyone else receives it from an
+            // existing member over a pairwise Signal session
+            // (distribute_sender_key_to_user → distribute_media_key_to_user).
+            let alone = users.len() == 1 && users[0].user_id == own_user_id;
+            if channel_id != 0 && alone {
+                let have_key = media_key
+                    .lock()
+                    .map(|g| g.as_ref().is_some_and(|k| k.channel_id == channel_id))
+                    .unwrap_or(false);
+                if !have_key {
+                    match MediaKey::generate(channel_id, 0) {
+                        Ok(key) => {
+                            install_media_key(media_key, key, app_handle);
+                            info!(channel_id, "generated media key (first member)");
+                        }
+                        Err(e) => error!(channel_id, "media key generation failed: {}", e),
+                    }
+                }
+            }
 
             let _ = app_handle.emit(
                 "user-list",
@@ -964,7 +1030,16 @@ async fn handle_server_message(
         }
         // ── E2E Encryption: PreKeyBundle → establish session + distribute sender keys ──
         ServerMessage::PreKeyBundle { user_id, bundle } => {
-            handle_prekey_bundle(user_id, &bundle, own_user_id, signal, tcp_tx, channel_id_store).await;
+            handle_prekey_bundle(
+                user_id,
+                &bundle,
+                own_user_id,
+                signal,
+                media_key,
+                tcp_tx,
+                channel_id_store,
+            )
+            .await;
         }
         ServerMessage::PreKeyBundleUnavailable { user_id } => {
             info!(user_id, "prekey bundle unavailable — cannot establish E2E session");
@@ -1034,6 +1109,7 @@ async fn handle_server_message(
                 message_type,
                 own_user_id,
                 signal,
+                media_key,
                 tcp_tx,
             )
             .await;
@@ -1042,52 +1118,129 @@ async fn handle_server_message(
             channel_id,
             from_user_id,
             encrypted_media_key,
+            message_type,
         } => {
+            handle_media_key_received(
+                channel_id,
+                from_user_id,
+                &encrypted_media_key,
+                message_type,
+                signal,
+                media_key,
+                channel_id_store,
+                app_handle,
+            )
+            .await;
+        }
+        // ── Moderation ──
+        ServerMessage::AdminStatus { user_id, is_admin } => {
             let _ = app_handle.emit(
-                "media-key-received",
-                serde_json::json!({
-                    "channel_id": channel_id,
-                    "from_user_id": from_user_id,
-                    "encrypted_media_key": encrypted_media_key,
-                }),
+                "admin-status",
+                serde_json::json!({"user_id": user_id, "is_admin": is_admin}),
             );
         }
-        ServerMessage::ChannelMediaKey {
+        ServerMessage::AdminError { reason } => {
+            let _ = app_handle.emit("admin-error", serde_json::json!({"reason": reason}));
+        }
+        ServerMessage::AdminBans { bans } => {
+            let _ = app_handle.emit("admin-bans", serde_json::json!({"bans": bans}));
+        }
+        ServerMessage::Disconnected { reason } => {
+            // The server closes the socket next; the UI must not auto-reconnect
+            info!("disconnected by server: {}", reason);
+            let _ = app_handle.emit(
+                "server-disconnected",
+                serde_json::json!({"reason": reason}),
+            );
+        }
+        // ── Channel history hand-off ──
+        ServerMessage::ChannelHistoryRequested {
             channel_id,
-            key_id,
-            key_bytes,
+            from_user_id,
         } => {
-            // Server-issued media key — store it for voice/video encryption.
-            // Only apply if this is for our current channel.
-            let current_ch = channel_id_store.load(Ordering::Relaxed);
-            if channel_id == current_ch {
-                if key_bytes.len() == 32 {
-                    let mut kb = [0u8; 32];
-                    kb.copy_from_slice(&key_bytes);
-                    let key = MediaKey::new(channel_id, key_id, kb);
-                    let mut guard = media_key.lock().unwrap_or_else(|poisoned| {
-                        warn!("media key mutex poisoned — recovering");
-                        poisoned.into_inner()
-                    });
-                    *guard = Some(key);
-                    info!(channel_id, key_id, "media key installed for channel");
-                } else {
-                    warn!(
-                        "received invalid media key length {} for channel {}",
-                        key_bytes.len(),
-                        channel_id
-                    );
-                }
-            } else {
-                info!(
-                    channel_id,
-                    current_ch,
-                    "ignoring media key for non-current channel"
-                );
-            }
+            let _ = app_handle.emit(
+                "channel-history-requested",
+                serde_json::json!({"channel_id": channel_id, "from_user_id": from_user_id}),
+            );
+        }
+        ServerMessage::ChannelHistoryReceived {
+            channel_id,
+            from_user_id,
+            from_username,
+            ciphertext,
+            message_type,
+        } => {
+            handle_channel_history_received(
+                channel_id,
+                from_user_id,
+                &from_username,
+                &ciphertext,
+                message_type,
+                signal,
+                app_handle,
+            );
         }
         ServerMessage::Authenticated { .. } | ServerMessage::AuthError { .. } => {}
     }
+}
+
+/// Decrypt a member's channel-history blob (JSON `{ v, messages }`) and hand
+/// the messages to the UI, which validates and merges them.
+fn handle_channel_history_received(
+    channel_id: u32,
+    from_user_id: u32,
+    from_username: &str,
+    ciphertext: &[u8],
+    message_type: u8,
+    signal: &Arc<std::sync::Mutex<SignalState>>,
+    app_handle: &tauri::AppHandle,
+) {
+    let result = tokio::task::block_in_place(|| {
+        let mut sig = signal.lock().map_err(|e| format!("signal lock: {e}"))?;
+        let stores = sig
+            .stores
+            .as_mut()
+            .ok_or_else(|| "Signal not initialized".to_string())?;
+        tokio::runtime::Handle::current()
+            .block_on(voipc_crypto::session::decrypt_message(
+                stores,
+                from_user_id,
+                ciphertext,
+                message_type,
+            ))
+            .map_err(|e| format!("decrypt history: {e}"))
+    });
+    let plaintext = match result {
+        Ok(p) => p,
+        Err(e) => {
+            warn!(from_user_id, channel_id, "channel history rejected: {}", e);
+            return;
+        }
+    };
+    if message_type == 1 {
+        let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+        sig.established_sessions.insert(from_user_id);
+        sig.pending_sessions.remove(&from_user_id);
+    }
+    let messages = match serde_json::from_slice::<serde_json::Value>(&plaintext) {
+        Ok(serde_json::Value::Object(mut map)) => match map.remove("messages") {
+            Some(serde_json::Value::Array(list)) => list,
+            _ => return,
+        },
+        _ => {
+            warn!(from_user_id, channel_id, "channel history: malformed payload");
+            return;
+        }
+    };
+    let _ = app_handle.emit(
+        "channel-history-received",
+        serde_json::json!({
+            "channel_id": channel_id,
+            "from_user_id": from_user_id,
+            "from_username": from_username,
+            "messages": messages,
+        }),
+    );
 }
 
 // ── E2E Helper functions ─────────────────────────────────────────────────
@@ -1139,6 +1292,7 @@ async fn handle_prekey_bundle(
     bundle: &PreKeyBundleData,
     own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
+    media_key: &Arc<std::sync::Mutex<Option<MediaKey>>>,
     tcp_tx: &mpsc::Sender<Vec<u8>>,
     channel_id_store: &Arc<AtomicU32>,
 ) {
@@ -1184,7 +1338,7 @@ async fn handle_prekey_bundle(
             // Drain any pending direct messages for this user
             drain_pending_dms(remote_user_id, own_user_id, signal, tcp_tx).await;
 
-            // Distribute our sender key for the current channel
+            // Distribute our sender key (and the channel media key) for the current channel
             let current_channel = channel_id_store.load(Ordering::Relaxed);
             if current_channel != 0 {
                 distribute_sender_key_to_user(
@@ -1192,6 +1346,7 @@ async fn handle_prekey_bundle(
                     remote_user_id,
                     own_user_id,
                     signal,
+                    media_key,
                     tcp_tx,
                 )
                 .await;
@@ -1206,12 +1361,14 @@ async fn handle_prekey_bundle(
 }
 
 /// Create our sender key distribution message for a channel, encrypt it pairwise,
-/// and send it to a specific user.
+/// and send it to a specific user. On success also hands them the channel's
+/// media key (if we hold one) over the same pairwise session.
 async fn distribute_sender_key_to_user(
     channel_id: u32,
     target_user_id: u32,
     own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
+    media_key: &Arc<std::sync::Mutex<Option<MediaKey>>>,
     tcp_tx: &mpsc::Sender<Vec<u8>>,
 ) {
     let result = tokio::task::block_in_place(|| {
@@ -1255,6 +1412,8 @@ async fn distribute_sender_key_to_user(
                 warn!(target_user_id, "failed to send sender key: {}", e);
             } else {
                 info!(target_user_id, channel_id, "sender key distributed");
+                distribute_media_key_to_user(channel_id, target_user_id, signal, media_key, tcp_tx)
+                    .await;
                 let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
                 sig.sender_key_distributed
                     .entry(channel_id)
@@ -1268,6 +1427,139 @@ async fn distribute_sender_key_to_user(
     }
 }
 
+/// Store a media key for voice/video and tell the UI (clears any
+/// "waiting for media key" warning).
+fn install_media_key(
+    media_key: &Arc<std::sync::Mutex<Option<MediaKey>>>,
+    key: MediaKey,
+    app_handle: &tauri::AppHandle,
+) {
+    let (channel_id, key_id) = (key.channel_id, key.key_id);
+    let mut guard = media_key.lock().unwrap_or_else(|p| {
+        warn!("media key mutex poisoned — recovering");
+        p.into_inner()
+    });
+    *guard = Some(key);
+    drop(guard);
+    let _ = app_handle.emit(
+        "media-key-installed",
+        serde_json::json!({"channel_id": channel_id, "key_id": key_id}),
+    );
+}
+
+/// Encrypt our current media key for `channel_id` with the pairwise session
+/// to `target_user_id` and send it. Silently does nothing if we hold no key
+/// for that channel (then we are waiting for one ourselves).
+async fn distribute_media_key_to_user(
+    channel_id: u32,
+    target_user_id: u32,
+    signal: &Arc<std::sync::Mutex<SignalState>>,
+    media_key: &Arc<std::sync::Mutex<Option<MediaKey>>>,
+    tcp_tx: &mpsc::Sender<Vec<u8>>,
+) {
+    let key_bytes = {
+        let guard = media_key.lock().unwrap_or_else(|p| {
+            warn!("media key mutex poisoned — recovering");
+            p.into_inner()
+        });
+        match guard.as_ref() {
+            Some(k) if k.channel_id == channel_id => k.to_bytes(),
+            _ => return,
+        }
+    };
+
+    let result = tokio::task::block_in_place(|| {
+        let mut sig = signal.lock().map_err(|e| format!("signal lock: {e}"))?;
+        let stores = sig
+            .stores
+            .as_mut()
+            .ok_or_else(|| "Signal not initialized".to_string())?;
+        tokio::runtime::Handle::current()
+            .block_on(voipc_crypto::session::encrypt_message(
+                stores,
+                target_user_id,
+                &key_bytes,
+            ))
+            .map_err(|e| format!("encrypt media key: {e}"))
+    });
+
+    match result {
+        Ok((encrypted_media_key, message_type)) => {
+            let msg = ClientMessage::DistributeMediaKey {
+                channel_id,
+                target_user_id,
+                encrypted_media_key,
+                message_type,
+            };
+            match send_tcp_message(tcp_tx, &msg).await {
+                Ok(()) => info!(target_user_id, channel_id, "media key distributed"),
+                Err(e) => warn!(target_user_id, "failed to send media key: {}", e),
+            }
+        }
+        Err(e) => warn!(target_user_id, channel_id, "failed to distribute media key: {}", e),
+    }
+}
+
+/// Decrypt a media key sent by a channel member and install it if it is for
+/// our current channel and not older than what we already hold.
+async fn handle_media_key_received(
+    channel_id: u32,
+    from_user_id: u32,
+    ciphertext: &[u8],
+    message_type: u8,
+    signal: &Arc<std::sync::Mutex<SignalState>>,
+    media_key: &Arc<std::sync::Mutex<Option<MediaKey>>>,
+    channel_id_store: &Arc<AtomicU32>,
+    app_handle: &tauri::AppHandle,
+) {
+    let result = tokio::task::block_in_place(|| {
+        let mut sig = signal.lock().map_err(|e| format!("signal lock: {e}"))?;
+        let stores = sig
+            .stores
+            .as_mut()
+            .ok_or_else(|| "Signal not initialized".to_string())?;
+        let plaintext = tokio::runtime::Handle::current()
+            .block_on(voipc_crypto::session::decrypt_message(
+                stores,
+                from_user_id,
+                ciphertext,
+                message_type,
+            ))
+            .map_err(|e| format!("decrypt media key: {e}"))?;
+        MediaKey::from_bytes(&plaintext).map_err(|e| format!("parse media key: {e}"))
+    });
+
+    let key = match result {
+        Ok(k) => k,
+        Err(e) => {
+            warn!(from_user_id, channel_id, "media key rejected: {}", e);
+            return;
+        }
+    };
+
+    // A PreKeySignalMessage establishes the session on our side as well
+    if message_type == 1 {
+        let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+        sig.established_sessions.insert(from_user_id);
+        sig.pending_sessions.remove(&from_user_id);
+    }
+
+    let current = channel_id_store.load(Ordering::Relaxed);
+    if key.channel_id != channel_id || channel_id != current {
+        info!(from_user_id, channel_id, current, "ignoring media key for another channel");
+        return;
+    }
+    let newer = media_key
+        .lock()
+        .map(|g| g.as_ref().map_or(true, |k| k.channel_id != channel_id || key.key_id >= k.key_id))
+        .unwrap_or(true);
+    if newer {
+        let key_id = key.key_id;
+        install_media_key(media_key, key, app_handle);
+        info!(from_user_id, channel_id, key_id, "media key installed");
+    }
+}
+
 /// Handle a received sender key: decrypt pairwise, process distribution message,
 /// and reciprocate by sending our own sender key if needed.
 async fn handle_sender_key_received(
@@ -1277,6 +1569,7 @@ async fn handle_sender_key_received(
     message_type: u8,
     own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
+    media_key: &Arc<std::sync::Mutex<Option<MediaKey>>>,
     tcp_tx: &mpsc::Sender<Vec<u8>>,
 ) {
     let result = tokio::task::block_in_place(|| {
@@ -1344,6 +1637,7 @@ async fn handle_sender_key_received(
                     from_user_id,
                     own_user_id,
                     signal,
+                    media_key,
                     tcp_tx,
                 )
                 .await;
@@ -1351,6 +1645,29 @@ async fn handle_sender_key_received(
 
             // Drain any pending channel messages now that we have sender keys
             drain_pending_channel_messages(channel_id, own_user_id, signal, tcp_tx).await;
+
+            // Newcomer: the first member whose sender key arrives holds a
+            // pairwise session with us (they just used it), so ask them for
+            // recent chat. Once per channel entry.
+            let ask = {
+                let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+                if channel_id != 0 && sig.history_wanted_channel == channel_id {
+                    sig.history_wanted_channel = 0;
+                    true
+                } else {
+                    false
+                }
+            };
+            if ask {
+                let _ = send_tcp_message(
+                    tcp_tx,
+                    &ClientMessage::RequestChannelHistory {
+                        channel_id,
+                        target_user_id: from_user_id,
+                    },
+                )
+                .await;
+            }
         }
         Err(e) => {
             warn!(from_user_id, channel_id, "failed to process sender key: {}", e);
@@ -1904,6 +2221,7 @@ async fn voice_mixer_task(
 
 async fn udp_receiver_task(
     socket: Arc<UdpSocket>,
+    server_addr: std::net::SocketAddr,
     app_handle: tauri::AppHandle,
     _own_session_id: SessionId,
     sources: MixSources,
@@ -1925,6 +2243,8 @@ async fn udp_receiver_task(
     let mut last_keyframe_request = std::time::Instant::now() - std::time::Duration::from_secs(10);
 
     let mut recv_count: u64 = 0;
+    let mut recv_errors: u32 = 0;
+    let mut foreign_src_logged = false;
     // Track last voice packet time per user for speaking timeout
     let mut last_voice_time: HashMap<u32, std::time::Instant> = HashMap::new();
     let mut speaking_timeout = tokio::time::interval(std::time::Duration::from_millis(300));
@@ -1936,6 +2256,17 @@ async fn udp_receiver_task(
             result = socket.recv_from(&mut buf) => {
         match result {
             Ok((n, src_addr)) => {
+                recv_errors = 0;
+                // The socket is unconnected: anyone who learns our endpoint
+                // (LAN, full-cone NAT) could otherwise inject packets or
+                // spoof Pongs. Only the server is a valid source.
+                if src_addr != server_addr {
+                    if !foreign_src_logged {
+                        foreign_src_logged = true;
+                        warn!("ignoring UDP from {} (server is {})", src_addr, server_addr);
+                    }
+                    continue;
+                }
                 if n == 0 {
                     continue;
                 }
@@ -1951,13 +2282,11 @@ async fn udp_receiver_task(
                 }
 
                 match packet_type {
-                    // Voice: OpusVoice (unencrypted) or EncryptedOpusVoice
-                    0x01 | 0x05 => {
-                        let header_size = if packet_type == 0x05 {
-                            voipc_protocol::voice::ENCRYPTED_VOICE_HEADER_SIZE
-                        } else {
-                            voipc_protocol::voice::VOICE_HEADER_SIZE
-                        };
+                    // Encrypted voice only. Plaintext types (0x01, 0x10-0x12)
+                    // are never produced by a keyed client and are dropped on
+                    // receive so nothing unauthenticated can reach the mixer.
+                    0x05 => {
+                        let header_size = voipc_protocol::voice::ENCRYPTED_VOICE_HEADER_SIZE;
                         if n < header_size {
                             continue;
                         }
@@ -1999,7 +2328,7 @@ async fn udp_receiver_task(
                                 continue;
                             }
                         } else {
-                            buf[header_size..n].to_vec()
+                            continue;
                         };
 
                         // Enqueue into the per-user jitter buffer; the mixer
@@ -2084,7 +2413,7 @@ async fn udp_receiver_task(
                         }
                     }
                     // Video: VideoFragment / VideoKeyframeFragment (unencrypted + encrypted)
-                    0x10 | 0x11 | 0x13 | 0x14 => {
+                    0x13 | 0x14 => {
                         if n < VIDEO_HEADER_SIZE {
                             continue;
                         }
@@ -2161,8 +2490,8 @@ async fn udp_receiver_task(
                             }
                         }
                     }
-                    // Screen share audio (unencrypted + encrypted)
-                    0x12 | 0x15 => {
+                    // Screen share audio (encrypted only)
+                    0x15 => {
                         if n < SCREEN_AUDIO_HEADER_SIZE {
                             continue;
                         }
@@ -2200,12 +2529,8 @@ async fn udp_receiver_task(
                                 continue;
                             }
                         } else {
-                            packet.opus_data.clone()
+                            continue;
                         };
-
-                        if current_video_session != Some(packet.session_id) {
-                            current_video_session = Some(packet.session_id);
-                        }
 
                         // Feed the mixer like a voice stream (flagged key) —
                         // screen audio gains jitter/reorder protection and is
@@ -2237,8 +2562,14 @@ async fn udp_receiver_task(
                 }
             }
             Err(e) => {
-                error!("UDP recv error: {}", e);
-                break;
+                // Not fatal: on Windows an ICMP unreachable for any earlier
+                // send surfaces here as WSAECONNRESET; leaving would kill
+                // voice for the rest of the session while TCP stays up.
+                recv_errors += 1;
+                error!("UDP recv error ({}): {}", recv_errors, e);
+                if recv_errors >= 10 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                }
             }
         }
             }
@@ -2259,7 +2590,6 @@ async fn udp_receiver_task(
             }
         }
     }
-    info!("UDP receiver task ended");
 }
 
 /// Video decode + render task: runs on a blocking thread to avoid stalling
@@ -2422,6 +2752,9 @@ pub fn spawn_capture_encode_task(
         let mut accumulated: usize = 0;
         let mut stream_dead = false;
         let mut last_rebuild = std::time::Instant::now();
+        // "Waiting for media key" UI warning, emitted once per gap
+        let mut key_missing_since: Option<std::time::Instant> = None;
+        let mut key_missing_emitted = false;
 
         // Voice activity detector for VAD mode
         let mut vad = voipc_audio::vad::VoiceActivityDetector::new(
@@ -2527,6 +2860,8 @@ pub fn spawn_capture_encode_task(
                         let key_opt = key_guard.as_ref();
 
                         if let Some(key) = key_opt {
+                            key_missing_since = None;
+                            key_missing_emitted = false;
                             let ch_id = channel_id.load(Ordering::Relaxed);
                             let aad = voipc_crypto::build_aad(ch_id, 0x05);
                             match voipc_crypto::media_encrypt(
@@ -2549,10 +2884,21 @@ pub fn spawn_capture_encode_task(
                                 }
                             }
                         } else {
-                            // No media key available — send unencrypted with warning
-                            // (this path should only happen during key exchange bootstrap)
-                            warn!("No media key — sending unencrypted voice");
-                            VoicePacket::voice(session_id, udp_token, sequence, opus_data)
+                            // Never fall back to plaintext. We are waiting for
+                            // the channel's media key (channel switch, or the
+                            // member holding it is still establishing our
+                            // Signal session); warn the UI once if it drags on.
+                            let since = *key_missing_since
+                                .get_or_insert_with(std::time::Instant::now);
+                            if !key_missing_emitted
+                                && since.elapsed() > std::time::Duration::from_secs(2)
+                            {
+                                key_missing_emitted = true;
+                                warn!("no media key for 2s — voice frames are being dropped");
+                                let _ = app_handle.emit("media-key-missing", ());
+                            }
+                            accumulated = 0;
+                            continue;
                         }
                     };
 
@@ -2614,18 +2960,37 @@ fn tofu_save_to_disk(store: &HashMap<String, Vec<u8>>) {
     }
 }
 
+/// Pin store key: `host:port`, lowercase. Per port, so two self-signed
+/// servers on one box do not read as a MITM of each other.
+fn tofu_key(host: &str, port: u16) -> String {
+    format!("{}:{}", host.to_lowercase(), port)
+}
+
+/// Forget the pinned certificate for a server (after a legitimate cert
+/// rotation). The next connect pins the new certificate.
+pub fn tofu_forget(host: &str, port: u16) -> bool {
+    let mut store = TOFU_STORE.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+    let removed = store.remove(&tofu_key(host, port)).is_some();
+    if removed {
+        tofu_save_to_disk(&store);
+    }
+    removed
+}
+
 /// Certificate verifier that accepts self-signed certs with TOFU pinning.
-/// First connection to a host: accept and pin the certificate fingerprint.
+/// First connection to a host:port: accept and pin the certificate fingerprint.
 /// Subsequent connections: reject if the certificate fingerprint changes.
 #[derive(Debug)]
-struct TofuCertVerifier;
+struct TofuCertVerifier {
+    key: String,
+}
 
 impl rustls::client::danger::ServerCertVerifier for TofuCertVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &rustls::pki_types::CertificateDer<'_>,
         _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        server_name: &rustls::pki_types::ServerName<'_>,
+        _server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
@@ -2633,30 +2998,11 @@ impl rustls::client::danger::ServerCertVerifier for TofuCertVerifier {
         use ring::digest;
         let fingerprint = digest::digest(&digest::SHA256, end_entity.as_ref());
         let fp_bytes = fingerprint.as_ref().to_vec();
-        // Canonical host key: lowercase DNS name or standard IP string.
-        // Avoids Debug format which is fragile across rustls versions.
-        let host_key = match server_name {
-            rustls::pki_types::ServerName::DnsName(dns) => dns.as_ref().to_lowercase(),
-            rustls::pki_types::ServerName::IpAddress(ip) => {
-                let std_ip: std::net::IpAddr = match ip {
-                    rustls::pki_types::IpAddr::V4(v4) => {
-                        std::net::IpAddr::V4(std::net::Ipv4Addr::from(*v4.as_ref()))
-                    }
-                    rustls::pki_types::IpAddr::V6(v6) => {
-                        std::net::IpAddr::V6(std::net::Ipv6Addr::from(*v6.as_ref()))
-                    }
-                };
-                std_ip.to_string()
-            }
-            _ => {
-                warn!("TOFU: unknown ServerName variant, using Debug format (fragile across rustls versions)");
-                format!("{:?}", server_name)
-            }
-        };
+        let host_key = &self.key;
 
         let mut store = TOFU_STORE.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
 
-        if let Some(pinned) = store.get(&host_key) {
+        if let Some(pinned) = store.get(host_key) {
             // We've connected to this host before — verify the fingerprint matches
             if *pinned != fp_bytes {
                 warn!(
@@ -2666,8 +3012,8 @@ impl rustls::client::danger::ServerCertVerifier for TofuCertVerifier {
                 return Err(rustls::Error::General(format!(
                     "Server certificate fingerprint changed for {}. \
                      This could indicate a man-in-the-middle attack. \
-                     If the server certificate was intentionally changed, \
-                     restart the application to accept the new certificate.",
+                     Only if you know the server's certificate was replaced, \
+                     use \"Forget pinned certificate\" and connect again.",
                     host_key
                 )));
             }
@@ -2675,7 +3021,7 @@ impl rustls::client::danger::ServerCertVerifier for TofuCertVerifier {
         } else {
             // First connection — pin the certificate and persist to disk
             info!("TOFU: pinning certificate for {} (first connection)", host_key);
-            store.insert(host_key, fp_bytes);
+            store.insert(host_key.clone(), fp_bytes);
             tofu_save_to_disk(&store);
         }
 

@@ -65,6 +65,18 @@ pub struct UserSession {
     pub udp_token: u64,
     /// IP address from TCP authentication (for UDP source verification).
     pub tcp_peer_ip: IpAddr,
+    /// The client's real IP (bans). Same as `tcp_peer_ip` for native clients;
+    /// web sessions carry the loopback bridge in `tcp_peer_ip`.
+    pub peer_ip: IpAddr,
+    /// Logged in with the admin token.
+    pub is_admin: bool,
+    /// Failed AdminLogin attempts; the third closes the connection.
+    pub admin_login_failures: u8,
+    /// Woken by an admin kick/ban: the connection loop exits and cleans up.
+    pub close: std::sync::Arc<tokio::sync::Notify>,
+    /// Rate limiter for channel history requests (each one makes a peer
+    /// encrypt and send up to ~48 KiB).
+    pub history_request_rate: RateLimiter,
     /// Rate limiter for UDP voice packets (55 pkt/s — 50fps + margin).
     pub udp_voice_rate: RateLimiter,
     /// Rate limiter for UDP video packets (120 pkt/s — 60fps × 2 fragments avg).
@@ -81,6 +93,8 @@ pub struct UserSession {
     pub create_channel_rate: RateLimiter,
     /// Rate limiter for pre-key uploads.
     pub prekey_rate: RateLimiter,
+    /// Rate limiter for pre-key bundle requests (each consumes a target's one-time key).
+    pub prekey_bundle_rate: RateLimiter,
     /// Whether this user is currently screen sharing.
     pub is_screen_sharing: bool,
     /// The user_id of the screenshare this user is currently watching (if any).
@@ -128,11 +142,6 @@ pub struct Channel {
     pub invited_users: HashSet<UserId>,
     /// Active screen shares: sharer_user_id -> ScreenShareSession.
     pub screen_shares: HashMap<UserId, ScreenShareSession>,
-    /// AES-256-GCM media encryption key for voice/video in this channel.
-    /// None for General (channel 0) where voice is disabled. Zeroized on drop.
-    pub media_key_bytes: Option<Zeroizing<[u8; 32]>>,
-    /// Incrementing key ID for this channel's media key.
-    pub media_key_id: u16,
     /// Whether this channel was loaded from channels.json and cannot be auto-deleted.
     pub persistent: bool,
 }
@@ -155,6 +164,10 @@ pub struct ServerState {
     pub udp_port: u16,
     /// Runtime settings.
     pub settings: ServerSettings,
+    /// Admin token (from config, or generated at startup).
+    pub admin_token: String,
+    /// Banned IPs with their expiry (None = until restart). Memory only.
+    pub bans: DashMap<IpAddr, Option<Instant>>,
     /// Next user_id counter (session_id is always equal to user_id).
     next_user_id: AtomicU32,
     /// Next channel_id counter (0 is reserved for General).
@@ -167,6 +180,7 @@ impl ServerState {
         config: &ServerConfig,
         settings: ServerSettings,
         persistent_channels: Vec<ChannelEntry>,
+        admin_token: String,
     ) -> Self {
         let mut channels = HashMap::new();
         channels.insert(
@@ -187,8 +201,6 @@ impl ServerState {
                 created_by: None,
                 invited_users: HashSet::new(),
                 screen_shares: HashMap::new(),
-                media_key_bytes: None,
-                media_key_id: 0,
                 persistent: false,
             },
         );
@@ -201,10 +213,6 @@ impl ServerState {
 
             let has_password = entry.password_hash.is_some();
             let password = entry.password_hash.clone().map(Zeroizing::new);
-
-            // Generate a random AES-256 media key for this channel
-            let mut key_bytes = [0u8; 32];
-            rand::Rng::fill(&mut rand::thread_rng(), &mut key_bytes);
 
             channels.insert(
                 channel_id,
@@ -224,8 +232,6 @@ impl ServerState {
                     created_by: None,
                     invited_users: HashSet::new(),
                     screen_shares: HashMap::new(),
-                    media_key_bytes: Some(Zeroizing::new(key_bytes)),
-                    media_key_id: 0,
                     persistent: true,
                 },
             );
@@ -240,6 +246,8 @@ impl ServerState {
             max_users: config.max_users,
             udp_port: config.udp_port,
             settings,
+            admin_token,
+            bans: DashMap::new(),
             next_user_id: AtomicU32::new(1),
             next_channel_id: AtomicU32::new(next_id),
         }
@@ -262,6 +270,57 @@ impl ServerState {
     /// Get the total number of connected users.
     pub fn user_count(&self) -> usize {
         self.sessions.len()
+    }
+
+    // ── Moderation ─────────────────────────────────────────────────────
+
+    /// Whether the session is logged in as admin.
+    pub fn is_admin(&self, session_id: SessionId) -> bool {
+        self.sessions
+            .get(&session_id)
+            .map(|s| s.is_admin)
+            .unwrap_or(false)
+    }
+
+    /// Whether `ip` is banned. An expired entry is dropped on the way.
+    pub fn is_banned(&self, ip: IpAddr) -> bool {
+        match self.bans.get(&ip).map(|e| *e) {
+            None => false,
+            Some(None) => true,
+            Some(Some(until)) if Instant::now() < until => true,
+            Some(Some(_)) => {
+                self.bans.remove(&ip);
+                false
+            }
+        }
+    }
+
+    /// Ban `ip` for `duration` (None = until the server restarts).
+    pub fn ban(&self, ip: IpAddr, duration: Option<std::time::Duration>) {
+        self.bans.insert(ip, duration.map(|d| Instant::now() + d));
+    }
+
+    /// Lift a ban. Returns whether one existed.
+    pub fn unban(&self, ip: IpAddr) -> bool {
+        self.bans.remove(&ip).is_some()
+    }
+
+    /// Active bans, sorted by IP; expired ones are purged.
+    pub fn list_bans(&self) -> Vec<BanInfo> {
+        let now = Instant::now();
+        self.bans.retain(|_, until| until.map_or(true, |u| u > now));
+        let mut bans: Vec<BanInfo> = self
+            .bans
+            .iter()
+            .map(|e| BanInfo {
+                ip: e.key().to_string(),
+                expires_in_secs: e
+                    .value()
+                    .map(|u| u.saturating_duration_since(now).as_secs()),
+            })
+            .collect();
+        bans.sort_by(|a, b| a.ip.cmp(&b.ip));
+        bans
     }
 
     /// Broadcast a raw serialized message to all connected sessions.
@@ -299,6 +358,7 @@ impl ServerState {
                     is_muted: session.is_muted,
                     is_deafened: session.is_deafened,
                     is_screen_sharing: session.is_screen_sharing,
+                    is_admin: session.is_admin,
                 })
             })
             .collect()
@@ -456,6 +516,11 @@ impl ServerState {
             channel.members.remove(&session.user_id);
             channel.info.user_count = channel.members.len() as u32;
         }
+        // Unanswered invites would otherwise pin the user_id in every
+        // channel's invite set forever (ids are never reused) and fill the cap.
+        for channel in channels.values_mut() {
+            channel.invited_users.remove(&session.user_id);
+        }
 
         Some(session)
     }
@@ -496,10 +561,6 @@ impl ServerState {
             created_by: Some(created_by),
         };
 
-        // Generate a random AES-256 media key for this channel
-        let mut key_bytes = [0u8; 32];
-        rand::Rng::fill(&mut rand::thread_rng(), &mut key_bytes);
-
         channels.insert(
             channel_id,
             Channel {
@@ -510,8 +571,6 @@ impl ServerState {
                 created_by: Some(created_by),
                 invited_users: HashSet::new(),
                 screen_shares: HashMap::new(),
-                media_key_bytes: Some(Zeroizing::new(key_bytes)),
-                media_key_id: 0,
                 persistent: false,
             },
         );
@@ -538,21 +597,21 @@ impl ServerState {
             anyhow::bail!("channel is not empty");
         }
 
-        if let Some(ch) = channels.remove(&channel_id) {
-            if let Some(timer) = ch.delete_timer {
-                timer.abort();
-            }
-        }
+        // Plain drop, no abort: the caller IS the timer task whose handle is
+        // stored here — aborting it would cancel the ChannelDeleted broadcast
+        // that follows at its next yield point.
+        let _ = channels.remove(&channel_id);
 
         Ok(())
     }
 
-    /// Change a channel's password (creator only). Returns the updated ChannelInfo.
+    /// Change a channel's password (creator or admin). Returns the updated ChannelInfo.
     pub async fn set_channel_password(
         &self,
         channel_id: ChannelId,
         user_id: UserId,
         password: Option<String>,
+        is_admin: bool,
     ) -> anyhow::Result<ChannelInfo> {
         if channel_id == 0 {
             anyhow::bail!("cannot modify the General channel");
@@ -563,7 +622,7 @@ impl ServerState {
             .get_mut(&channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel does not exist"))?;
 
-        if channel.created_by != Some(user_id) {
+        if !is_admin && channel.created_by != Some(user_id) {
             anyhow::bail!("only the channel creator can change the password");
         }
 
@@ -573,13 +632,14 @@ impl ServerState {
         Ok(channel.info.clone())
     }
 
-    /// Remove a user from a channel (creator kicks them).
+    /// Remove a user from a channel (creator or admin kicks them).
     /// Returns the kicked user's session_id and the channel's remaining member count.
     pub async fn kick_user(
         &self,
         channel_id: ChannelId,
         requester_id: UserId,
         target_id: UserId,
+        requester_is_admin: bool,
     ) -> anyhow::Result<(SessionId, usize)> {
         if channel_id == 0 {
             anyhow::bail!("cannot kick users from the General channel");
@@ -594,7 +654,7 @@ impl ServerState {
             .get_mut(&channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel does not exist"))?;
 
-        if channel.created_by != Some(requester_id) {
+        if !requester_is_admin && channel.created_by != Some(requester_id) {
             anyhow::bail!("only the channel creator can kick users");
         }
 
@@ -691,15 +751,6 @@ impl ServerState {
             }
             None => false,
         }
-    }
-
-    /// Get the current media key for a channel (if any).
-    /// Returns (key_id, key_bytes) for non-General channels.
-    pub async fn get_channel_media_key(&self, channel_id: ChannelId) -> Option<(u16, [u8; 32])> {
-        let channels = self.channels.read().await;
-        let channel = channels.get(&channel_id)?;
-        let key_bytes = channel.media_key_bytes.as_ref()?;
-        Some((channel.media_key_id, **key_bytes))
     }
 
     // ── Screen share methods ───────────────────────────────────────────
@@ -1007,7 +1058,12 @@ mod tests {
     use crate::settings::ServerSettings;
 
     fn make_state() -> ServerState {
-        ServerState::new(&ServerConfig::default(), ServerSettings::default(), Vec::new())
+        ServerState::new(
+            &ServerConfig::default(),
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        )
     }
 
     fn add_user(state: &ServerState, username: &str) -> (UserId, SessionId) {
@@ -1025,6 +1081,11 @@ mod tests {
             udp_addr: None,
             udp_token: user_id as u64 * 1000,
             tcp_peer_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            peer_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            is_admin: false,
+            admin_login_failures: 0,
+            close: Default::default(),
+            history_request_rate: RateLimiter::new(3.0, 0.5),
             udp_voice_rate: RateLimiter::new(55.0, 55.0),
             udp_video_rate: RateLimiter::new(400.0, 1200.0),
             global_rate: RateLimiter::new(50.0, 50.0),
@@ -1033,6 +1094,7 @@ mod tests {
             keyframe_request_rate: RateLimiter::new(2.0, 1.0),
             create_channel_rate: RateLimiter::new(1.0, 0.2),
             prekey_rate: RateLimiter::new(1.0, 0.2),
+            prekey_bundle_rate: RateLimiter::new(60.0, 1.0),
             is_screen_sharing: false,
             watching_screenshare: None,
             identity_key: None,
@@ -1269,7 +1331,7 @@ mod tests {
         let state = make_state();
         let (uid, _) = add_user(&state, "alice");
         let ch = state.create_channel("Room".into(), None, uid).await.unwrap();
-        let updated = state.set_channel_password(ch.channel_id, uid, Some("pw".into())).await.unwrap();
+        let updated = state.set_channel_password(ch.channel_id, uid, Some("pw".into()), false).await.unwrap();
         assert!(updated.has_password);
     }
 
@@ -1279,7 +1341,7 @@ mod tests {
         let (uid, _) = add_user(&state, "alice");
         let ch = state.create_channel("Room".into(), None, uid).await.unwrap();
         let (uid2, _) = add_user(&state, "bob");
-        let err = state.set_channel_password(ch.channel_id, uid2, Some("hack".into())).await;
+        let err = state.set_channel_password(ch.channel_id, uid2, Some("hack".into()), false).await;
         assert!(err.unwrap_err().to_string().contains("creator"));
     }
 
@@ -1287,7 +1349,7 @@ mod tests {
     async fn set_password_general_fails() {
         let state = make_state();
         let (uid, _) = add_user(&state, "alice");
-        let err = state.set_channel_password(0, uid, Some("pw".into())).await;
+        let err = state.set_channel_password(0, uid, Some("pw".into()), false).await;
         assert!(err.unwrap_err().to_string().contains("General"));
     }
 
@@ -1299,7 +1361,7 @@ mod tests {
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
         let (uid2, sid2) = add_user(&state, "bob");
         state.join_channel(uid2, sid2, ch.channel_id, None).await.unwrap();
-        let (kicked_sid, remaining) = state.kick_user(ch.channel_id, uid, uid2).await.unwrap();
+        let (kicked_sid, remaining) = state.kick_user(ch.channel_id, uid, uid2, false).await.unwrap();
         assert_eq!(kicked_sid, sid2);
         assert_eq!(remaining, 1);
     }
@@ -1310,7 +1372,7 @@ mod tests {
         let (uid, sid) = add_user(&state, "alice");
         let ch = state.create_channel("Room".into(), None, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
-        let err = state.kick_user(ch.channel_id, uid, uid).await;
+        let err = state.kick_user(ch.channel_id, uid, uid, false).await;
         assert!(err.unwrap_err().to_string().contains("yourself"));
     }
 
@@ -1322,7 +1384,7 @@ mod tests {
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
         let (uid2, sid2) = add_user(&state, "bob");
         state.join_channel(uid2, sid2, ch.channel_id, None).await.unwrap();
-        let err = state.kick_user(ch.channel_id, uid2, uid).await;
+        let err = state.kick_user(ch.channel_id, uid2, uid, false).await;
         assert!(err.unwrap_err().to_string().contains("creator"));
     }
 

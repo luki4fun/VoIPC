@@ -2,8 +2,11 @@ import { writable } from 'svelte/store';
 import { invoke } from '@tauri-apps/api/core';
 import { addNotification } from './notifications';
 
-/** true when running on Android (Tauri mobile). This is a Tauri app, not a web app,
- *  so the only mobile platform is Android. */
+/** true in the browser build (web client), false in the Tauri app (desktop/Android). */
+export const isWeb: boolean = __WEB__;
+
+/** true when running on Android (Tauri mobile) or, on the web client, in a
+ *  mobile browser — both get the phone layout. */
 export const isMobile = writable(false);
 
 /** Whether volume key PTT is enabled */
@@ -19,11 +22,18 @@ export const mobileTab = writable<MobileTab>('chat');
 if (typeof window !== 'undefined') {
   const isAndroid = /android/i.test(navigator.userAgent)
     || typeof (window as any).__VoIPC !== 'undefined';
-  isMobile.set(isAndroid);
+  // Web: any phone gets the phone layout (iPhone Safari has no "Android" in
+  // its UA; iPadOS masquerades as a Mac, hence the coarse-pointer fallback)
+  const isPhoneBrowser = isWeb && (
+    /iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
+    || (window.matchMedia?.('(pointer: coarse)').matches && window.innerWidth < 900)
+  );
+  isMobile.set(isAndroid || isPhoneBrowser);
 
   // Register global JS bridge functions for Android native → WebView communication.
-  // These are called from MainActivity.kt via evaluateJavascript().
-  if (isAndroid) {
+  // These are called from MainActivity.kt via evaluateJavascript(). The web
+  // client has no native side, so an Android browser gets none of them.
+  if (isAndroid && !isWeb) {
     // Volume key PTT press/release
     (window as any).__voipc_ptt_press = () => {
       invoke('start_transmit').catch(() => {});

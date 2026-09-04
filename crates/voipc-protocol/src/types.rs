@@ -24,6 +24,17 @@ pub struct UserInfo {
     pub is_deafened: bool,
     #[serde(default)]
     pub is_screen_sharing: bool,
+    /// Logged in with the server's admin token.
+    #[serde(default)]
+    pub is_admin: bool,
+}
+
+/// An active IP ban, as shown to admins.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BanInfo {
+    pub ip: String,
+    /// Seconds until the ban expires; None = until the server restarts.
+    pub expires_in_secs: Option<u64>,
 }
 
 /// Information about a screen capture source (display or window).
@@ -91,6 +102,7 @@ mod tests {
             is_muted: true,
             is_deafened: true,
             is_screen_sharing: false,
+            is_admin: true,
         };
         let bytes = postcard::to_allocvec(&info).unwrap();
         let decoded: UserInfo = postcard::from_bytes(&bytes).unwrap();
@@ -132,6 +144,7 @@ mod tests {
             is_muted: false,
             is_deafened: false,
             is_screen_sharing: false,
+            is_admin: false,
         };
         let bytes = postcard::to_allocvec(&info).unwrap();
         let decoded: UserInfo = postcard::from_bytes(&bytes).unwrap();

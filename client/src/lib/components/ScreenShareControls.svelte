@@ -13,6 +13,7 @@
     shareResolution,
   } from "../stores/screenshare.js";
   import { addNotification } from "../stores/notifications.js";
+  import { isWeb } from "../stores/platform.js";
   import Icon from "./Icons.svelte";
 
   let inLobby = $derived($currentChannelId === 0);
@@ -67,7 +68,7 @@
   }
 </script>
 
-{#if !inLobby}
+{#if !inLobby && !isWeb}
   <div class="divider"></div>
 
   {#if $isSharingScreen}

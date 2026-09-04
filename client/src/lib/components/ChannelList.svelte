@@ -1,10 +1,36 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { channels, currentChannelId, previewChannelId, previewUsers } from "../stores/channels.js";
-  import { userId } from "../stores/connection.js";
+  import { userId, serverAddress, channelPasswords } from "../stores/connection.js";
   import { addNotification } from "../stores/notifications.js";
   import { dmConversations, activeDmUserId, openDm, closeDm, unreadPerChannel, clearChannelUnread } from "../stores/chat.js";
+  import { buildInviteLink, splitAddress } from "../invite.js";
   import Icon from "./Icons.svelte";
+
+  let currentChannelName = $derived(
+    $channels.find((c) => c.channel_id === $currentChannelId)?.name ?? ""
+  );
+
+  // Invite link for the current channel; the password rides along only when
+  // this session knows it (created the channel or joined with it)
+  let inviteLinkPopup = $state<string | null>(null);
+
+  async function copyInviteLink() {
+    const ch = $channels.find((c) => c.channel_id === $currentChannelId);
+    if (!ch || ch.channel_id === 0) return;
+    const { host, port } = splitAddress($serverAddress);
+    const password = ch.has_password ? ($channelPasswords.get(ch.name) ?? null) : null;
+    const link = buildInviteLink(host, port, ch.name, password);
+    if (ch.has_password && !password) {
+      addNotification("This session does not know the channel password — the link will ask the joiner for it", "warning");
+    }
+    try {
+      await navigator.clipboard.writeText(link);
+      addNotification("Invite link copied", "info", 2500);
+    } catch {
+      inviteLinkPopup = link; // clipboard blocked: show it for manual copy
+    }
+  }
 
   let showCreateForm = $state(false);
   let newChannelName = $state("");
@@ -73,6 +99,11 @@
         channelId: passwordPromptChannelId,
         password: passwordPromptInput || null,
       });
+      const chName = $channels.find((c) => c.channel_id === passwordPromptChannelId)?.name;
+      if (chName && passwordPromptInput) {
+        const pw = passwordPromptInput;
+        channelPasswords.update((m) => new Map(m).set(chName, pw));
+      }
       passwordPromptChannelId = null;
       passwordPromptInput = "";
     } catch (e) {
@@ -94,6 +125,10 @@
         name,
         password: newChannelPassword || null,
       });
+      if (newChannelPassword) {
+        const pw = newChannelPassword;
+        channelPasswords.update((m) => new Map(m).set(name, pw));
+      }
       newChannelName = "";
       newChannelPassword = "";
       showCreateForm = false;
@@ -140,9 +175,16 @@
 <div class="channel-list">
   <div class="header">
     <span>Channels</span>
-    <button class="add-btn" onclick={() => (showCreateForm = !showCreateForm)} title="Create channel">
-      <Icon name="plus" size={18} />
-    </button>
+    <span class="header-actions">
+      {#if $currentChannelId !== 0}
+        <button class="add-btn" onclick={copyInviteLink} title="Copy invite link for #{currentChannelName}">
+          <Icon name="link" size={16} />
+        </button>
+      {/if}
+      <button class="add-btn" onclick={() => (showCreateForm = !showCreateForm)} title="Create channel">
+        <Icon name="plus" size={18} />
+      </button>
+    </span>
   </div>
 
   {#if showCreateForm}
@@ -258,6 +300,20 @@
         <button class="cancel-btn" type="button" onclick={cancelPasswordPrompt}>Cancel</button>
       </div>
     </form>
+  </div>
+{/if}
+
+{#if inviteLinkPopup !== null}
+  <!-- svelte-ignore a11y_click_events_have_key_events -->
+  <div class="overlay" onclick={() => (inviteLinkPopup = null)} role="presentation">
+    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+    <div class="password-dialog" onclick={(e) => e.stopPropagation()}>
+      <div class="dialog-title">Invite link</div>
+      <input class="dialog-input" readonly value={inviteLinkPopup} onfocus={(e) => e.currentTarget.select()} />
+      <div class="dialog-actions">
+        <button class="cancel-btn" type="button" onclick={() => (inviteLinkPopup = null)}>Close</button>
+      </div>
+    </div>
   </div>
 {/if}
 
@@ -531,6 +587,11 @@
 
   .dm-section {
     border-top: 1px solid var(--border);
+  }
+
+  .header-actions {
+    display: flex;
+    gap: 4px;
   }
 
   .dm-header {

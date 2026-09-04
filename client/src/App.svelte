@@ -28,6 +28,9 @@
     isMuted,
     isDeafened,
     isTransmitting,
+    isAdmin,
+    pendingInvite,
+    channelPasswords,
   } from "./lib/stores/connection.js";
   import { channels, currentChannelId, previewChannelId, previewUsers } from "./lib/stores/channels.js";
   import { users, speakingUsers } from "./lib/stores/users.js";
@@ -42,9 +45,12 @@
     clearChannelUnread,
     chatUnlocked,
     unreadPerChannel,
+    channelMessages,
+    mergeChannelHistory,
   } from "./lib/stores/chat.js";
   import ChatHistorySetup from "./lib/components/ChatHistorySetup.svelte";
-  import type { ChannelInfo, UserInfo } from "./lib/types.js";
+  import type { ChannelInfo, ChatMessage, UserInfo } from "./lib/types.js";
+  import { parseInviteFragment } from "./lib/invite.js";
   import {
     inputDevice,
     outputDevice,
@@ -64,6 +70,7 @@
     muteKey,
     deafenKey,
     chatHistoryDisabled,
+    shareChannelHistory,
   } from "./lib/stores/settings.js";
   import type { AppConfig } from "./lib/stores/settings.js";
   import { voiceMode, vadThreshold } from "./lib/stores/voice.js";
@@ -76,7 +83,7 @@
     playChannelMessageSound,
     playPokeSound,
   } from "./lib/sounds.js";
-  import { isMobile, mobileTab } from "./lib/stores/platform.js";
+  import { isMobile, isWeb, mobileTab } from "./lib/stores/platform.js";
   import type { MobileTab } from "./lib/stores/platform.js";
   import MobilePTT from "./lib/components/MobilePTT.svelte";
   import {
@@ -116,8 +123,33 @@
   // Deferred auto-connect: waits for chat history to be unlocked first
   let pendingAutoConnect = $state<AppConfig | null>(null);
   let udpDeadToastId: number | null = null;
+  let mediaKeyToastId: number | null = null;
   // Chat pane below the screen-share viewer (desktop)
   let viewerChatOpen = $state(true);
+
+  // Invite link: join the named channel once connected and the channel list
+  // is known (set from the URL fragment in onMount or by the connect dialog)
+  $effect(() => {
+    const inv = $pendingInvite;
+    if (!inv || $connectionState !== "connected" || $channels.length === 0) return;
+    const ch = $channels.find((c) => c.name === inv.channel);
+    pendingInvite.set(null);
+    if (!ch) {
+      addNotification(`The invite's channel "${inv.channel}" does not exist on this server`, "warning");
+      return;
+    }
+    if (inv.password) {
+      channelPasswords.update((m) => new Map(m).set(ch.name, inv.password!));
+    }
+    invoke("join_channel", { channelId: ch.channel_id, password: inv.password }).catch((e: unknown) => {
+      addNotification(`Could not join #${ch.name}: ${e}`, "error");
+    });
+  });
+
+  // Admin status lives and dies with the connection
+  $effect(() => {
+    if ($connectionState !== "connected") isAdmin.set(false);
+  });
 
   // OS notification when the window is not focused (DMs and pokes)
   async function notifyUnfocused(title: string, body: string) {
@@ -128,7 +160,11 @@
       if (!granted) {
         granted = (await notif.requestPermission()) === "granted";
       }
-      if (granted) notif.sendNotification({ title, body });
+      // Freedesktop daemons render the body as markup; peers must not be
+      // able to inject links or styling into a system notification
+      const esc = (s: string) =>
+        s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      if (granted) notif.sendNotification({ title: esc(title), body: esc(body) });
     } catch (e) {
       console.error("Desktop notification failed:", e);
     }
@@ -156,8 +192,9 @@
   }
 
   // Trigger auto-connect only after chat history password has been entered
+  // (or the vault was skipped — then there is nothing to unlock)
   $effect(() => {
-    if (pendingAutoConnect && $chatUnlocked) {
+    if (pendingAutoConnect && ($chatUnlocked || $chatHistoryDisabled)) {
       const config = pendingAutoConnect;
       pendingAutoConnect = null;
       performAutoConnect(config);
@@ -249,6 +286,12 @@
           username: name,
           acceptInvalidCerts: $acceptSelfSigned,
         });
+        if (reconnectCancelled) {
+          // Cancelled while this attempt was in flight (possibly after a
+          // manual connect elsewhere) — don't adopt its result
+          invoke("disconnect").catch(() => {});
+          return;
+        }
         // Success!
         userId.set(id);
         connectionState.set("connected");
@@ -290,6 +333,14 @@
   }
 
   onMount(async () => {
+    // Invite link in the URL fragment (web client): keep it, then drop it from
+    // the address bar so it is neither kept in history nor re-applied on reload
+    if (window.location.hash.length > 1) {
+      const inv = parseInviteFragment(window.location.hash);
+      if (inv) pendingInvite.set(inv);
+      history.replaceState(null, "", window.location.pathname + window.location.search);
+    }
+
     // Load persisted config and hydrate all stores
     try {
       const config = await invoke<AppConfig>("load_config");
@@ -308,6 +359,7 @@
       muteKey.set(config.mute_key ?? "");
       deafenKey.set(config.deafen_key ?? "");
       chatHistoryDisabled.set(config.chat_history_disabled ?? false);
+      shareChannelHistory.set(config.share_channel_history ?? true);
       if (config.input_device) inputDevice.set(config.input_device);
       if (config.output_device) outputDevice.set(config.output_device);
       rememberConnection.set(config.remember_connection);
@@ -455,6 +507,17 @@
         // Clear screenshare state
         resetScreenShareState();
 
+        // Session-scoped warnings die with the session (the new keepalive
+        // task starts healthy and never emits udp-restored)
+        if (udpDeadToastId !== null) {
+          removeNotification(udpDeadToastId);
+          udpDeadToastId = null;
+        }
+        if (mediaKeyToastId !== null) {
+          removeNotification(mediaKeyToastId);
+          mediaKeyToastId = null;
+        }
+
         // Play disconnected sound on initial loss (not during reconnect retries)
         if ($connectionState === "connected") {
           playDisconnectedSound();
@@ -466,7 +529,10 @@
           const name = $username;
           const prevChannel = $currentChannelId;
           startReconnect(addr, name, prevChannel, reason);
-        } else {
+        } else if ($connectionState !== "reconnecting") {
+          // A second connection-lost during a reconnect (ServerShutdown is
+          // followed by the socket closing) must not hide the overlay while
+          // the retry loop is still running
           connectionState.set("disconnected");
         }
       }),
@@ -500,6 +566,23 @@
         addNotification("Voice connection restored", "info");
       }),
 
+      listen("media-key-missing", () => {
+        if (mediaKeyToastId === null) {
+          mediaKeyToastId = addNotification(
+            "Waiting for the channel's encryption key — voice and screen share are held back until a member sends it",
+            "error",
+            0,
+          );
+        }
+      }),
+
+      listen("media-key-installed", () => {
+        if (mediaKeyToastId !== null) {
+          removeNotification(mediaKeyToastId);
+          mediaKeyToastId = null;
+        }
+      }),
+
       listen<{ user_id: number }>("identity-key-changed", (event) => {
         const uid = event.payload.user_id;
         const name =
@@ -511,6 +594,58 @@
           0,
         );
       }),
+
+      // ── Moderation ──
+      listen<{ user_id: number; is_admin: boolean }>("admin-status", (event) => {
+        const { user_id: uid, is_admin } = event.payload;
+        if (uid === $userId) {
+          isAdmin.set(is_admin);
+          if (is_admin) addNotification("You are now a server admin", "info");
+        }
+        const mark = (list: UserInfo[]) =>
+          list.map((u) => (u.user_id === uid ? { ...u, is_admin } : u));
+        users.update(mark);
+        previewUsers.update(mark);
+      }),
+
+      listen<{ reason: string }>("admin-error", (event) => {
+        addNotification(`Admin: ${event.payload.reason}`, "error");
+      }),
+
+      listen<{ reason: string }>("server-disconnected", (event) => {
+        // Set synchronously, before the socket closes: the connection-lost
+        // that follows must not start the 5-minute reconnect loop
+        connectionState.set("disconnected");
+        isAdmin.set(false);
+        addNotification(event.payload.reason, "error", 0);
+        invoke("disconnect").catch(() => {});
+      }),
+
+      // ── Channel history hand-off (E2E, member → newcomer) ──
+      listen<{ channel_id: number; from_user_id: number }>("channel-history-requested", (event) => {
+        if (!$shareChannelHistory) return;
+        const chName = channelNameById(event.payload.channel_id);
+        if (!chName) return;
+        const text = ($channelMessages.get(chName) ?? []).filter((m) => !m.kind || m.kind === "text");
+        let msgs: ChatMessage[] = text.slice(-50);
+        // Stay well under the 64 KiB control-message cap (Signal envelope + framing)
+        const bytes = (list: ChatMessage[]) => new TextEncoder().encode(JSON.stringify(list)).length;
+        while (msgs.length > 0 && bytes(msgs) > 48 * 1024) msgs = msgs.slice(1);
+        if (msgs.length === 0) return;
+        invoke("send_channel_history", {
+          channelId: event.payload.channel_id,
+          targetUserId: event.payload.from_user_id,
+          messages: msgs,
+        }).catch((e: unknown) => console.warn("channel history hand-off failed:", e));
+      }),
+
+      listen<{ channel_id: number; from_user_id: number; from_username: string; messages: unknown[] }>(
+        "channel-history-received",
+        (event) => {
+          const chName = channelNameById(event.payload.channel_id);
+          if (chName) mergeChannelHistory(chName, event.payload.messages, event.payload.from_username);
+        },
+      ),
 
       listen<ChannelInfo>("channel-created", (event) => {
         channels.update((chs) => [...chs, event.payload]);
@@ -918,7 +1053,7 @@
   <SettingsPanel onclose={() => (showSettings = false)} />
 {/if}
 
-{#if !$isMobile && $showSourcePicker}
+{#if !$isMobile && !isWeb && $showSourcePicker}
   <ScreenShareSourcePicker />
 {/if}
 
