@@ -122,7 +122,6 @@
 
   // Deferred auto-connect: waits for chat history to be unlocked first
   let pendingAutoConnect = $state<AppConfig | null>(null);
-  let udpDeadToastId: number | null = null;
   let mediaKeyToastId: number | null = null;
   // Chat pane below the screen-share viewer (desktop)
   let viewerChatOpen = $state(true);
@@ -507,12 +506,7 @@
         // Clear screenshare state
         resetScreenShareState();
 
-        // Session-scoped warnings die with the session (the new keepalive
-        // task starts healthy and never emits udp-restored)
-        if (udpDeadToastId !== null) {
-          removeNotification(udpDeadToastId);
-          udpDeadToastId = null;
-        }
+        // Session-scoped warnings die with the session
         if (mediaKeyToastId !== null) {
           removeNotification(mediaKeyToastId);
           mediaKeyToastId = null;
@@ -546,24 +540,6 @@
 
       listen("audio-device-restored", () => {
         addNotification("Audio device restored", "info");
-      }),
-
-      listen("udp-dead", () => {
-        if (udpDeadToastId === null) {
-          udpDeadToastId = addNotification(
-            "Voice connection lost (UDP blocked — check firewall/NAT). Still trying…",
-            "error",
-            0,
-          );
-        }
-      }),
-
-      listen("udp-restored", () => {
-        if (udpDeadToastId !== null) {
-          removeNotification(udpDeadToastId);
-          udpDeadToastId = null;
-        }
-        addNotification("Voice connection restored", "info");
       }),
 
       listen("media-key-missing", () => {

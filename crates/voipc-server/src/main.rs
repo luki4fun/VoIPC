@@ -8,16 +8,16 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use dashmap::DashMap;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
-use tokio::net::{TcpListener, UdpSocket};
+use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
 mod channels;
 mod config;
+mod media;
 mod settings;
 mod state;
 mod tcp;
-mod udp;
 mod web;
 
 use config::ServerConfig;
@@ -39,17 +39,13 @@ struct Args {
     #[arg(long)]
     key: Option<String>,
 
-    /// TCP port, overrides config
+    /// TCP port (browser page), overrides config
     #[arg(long)]
     tcp_port: Option<u16>,
 
-    /// UDP port, overrides config
+    /// UDP port (QUIC endpoint for all clients), overrides config
     #[arg(long)]
     udp_port: Option<u16>,
-
-    /// WebTransport UDP port for the web client (0 disables it), overrides config
-    #[arg(long)]
-    web_port: Option<u16>,
 
     /// Bind address (IP), overrides config
     #[arg(long)]
@@ -68,7 +64,7 @@ struct Args {
     admin_token: Option<String>,
 }
 
-/// Connection caps shared by the TCP and WebTransport accept loops.
+/// Connection caps shared by the TCP (page) and QUIC accept loops.
 pub struct ConnLimits {
     total: AtomicU32,
     per_ip: DashMap<IpAddr, u32>,
@@ -76,7 +72,7 @@ pub struct ConnLimits {
 
 impl ConnLimits {
     /// A browser holds two slots (the HTTP/2 page connection and the
-    /// WebTransport session), a native client one.
+    /// QUIC session), a native client one (QUIC only).
     const MAX_PER_IP: u32 = 10;
     const MAX_TOTAL: u32 = 256;
 
@@ -155,9 +151,6 @@ async fn main() -> Result<()> {
     if let Some(port) = args.udp_port {
         config.udp_port = port;
     }
-    if let Some(port) = args.web_port {
-        config.web_port = port;
-    }
     if let Some(host) = args.host {
         config.host = host;
     }
@@ -196,23 +189,24 @@ async fn main() -> Result<()> {
         host = %config.host,
         tcp_port = config.tcp_port,
         udp_port = config.udp_port,
-        web_port = config.web_port,
         max_users = config.max_users,
         empty_channel_timeout = server_settings.empty_channel_timeout_secs,
         persistent_channels = persistent_channels.len(),
     );
 
-    // Load TLS certificate and key
+    // Load TLS certificate and key: the QUIC endpoint serves them to native
+    // clients (by SNI), the TCP listener to browsers loading the page.
     let certs = load_certs(&config.cert_path)?;
     let key = load_key(&config.key_path)?;
 
-    let mut tls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(certs, key)
-        .context("invalid TLS configuration")?;
-    // Browsers get the web client over HTTP/2 only; the native client sends
-    // no ALPN and takes the control-protocol path. Anything offering just
-    // http/1.1 fails the handshake.
+    let mut tls_config =
+        rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
+            .with_no_client_auth()
+            .with_single_cert(certs.clone(), key.clone_key())
+            .context("invalid TLS configuration")?;
+    // Browsers get the web client over HTTP/2 only; anything offering just
+    // http/1.1 fails the handshake. Pre-0.5 native clients send no ALPN and
+    // are told to update (tcp::reject_legacy).
     tls_config.alpn_protocols = vec![b"h2".to_vec()];
 
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
@@ -243,71 +237,16 @@ async fn main() -> Result<()> {
 
     info!("TCP listener bound on {}:{}", config.host, config.tcp_port);
 
-    // Bind UDP socket with large buffers to absorb video packet bursts
-    let udp_socket = {
-        let addr: std::net::SocketAddr = format!("{}:{}", config.host, config.udp_port)
-            .parse()
-            .with_context(|| format!("invalid UDP address {}:{}", config.host, config.udp_port))?;
-        let domain = if addr.is_ipv4() {
-            socket2::Domain::IPV4
-        } else {
-            socket2::Domain::IPV6
-        };
-        let sock = socket2::Socket::new(
-            domain,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )
-        .with_context(|| "failed to create UDP socket")?;
-        // Allow dual-stack (IPv4+IPv6) when binding to IPv6
-        if addr.is_ipv6() {
-            let _ = sock.set_only_v6(false);
-        }
-        if let Err(e) = sock.set_recv_buffer_size(2 * 1024 * 1024) {
-            warn!("failed to set UDP recv buffer to 2MB: {e}");
-        }
-        if let Err(e) = sock.set_send_buffer_size(2 * 1024 * 1024) {
-            warn!("failed to set UDP send buffer to 2MB: {e}");
-        }
-        sock.bind(&addr.into())
-            .with_context(|| format!("failed to bind UDP on {}:{}", config.host, config.udp_port))?;
-        sock.set_nonblocking(true)
-            .with_context(|| "failed to set non-blocking")?;
-        let std_sock: std::net::UdpSocket = sock.into();
-        Arc::new(
-            UdpSocket::from_std(std_sock)
-                .with_context(|| "failed to wrap UDP socket in tokio")?,
-        )
-    };
-
-    info!("UDP socket bound on {}:{}", config.host, config.udp_port);
-
-    // Spawn UDP voice loop
-    let udp_state = state.clone();
-    let udp_sock = udp_socket.clone();
-    tokio::spawn(async move {
-        udp::run_udp_loop(udp_sock, udp_state).await;
-    });
-
     let limits = Arc::new(ConnLimits::new());
 
-    // Web client: WebTransport endpoint + the page's /wt.json data
-    let wt_info = if config.web_port != 0 {
-        let web = web::WebTransport::bind(&config)?;
-        let wt_info = web.info();
-        let media_addr = udp_socket
-            .local_addr()
-            .context("failed to read UDP socket address")?;
-        tokio::spawn(web.run(state.clone(), media_addr, limits.clone()));
-        info!(
-            "web client at https://{}:{}/ (WebTransport on UDP {})",
-            config.host, config.tcp_port, config.web_port
-        );
-        Some(wt_info)
-    } else {
-        info!("web client disabled (web_port = 0)");
-        None
-    };
+    // The QUIC endpoint every client connects to, plus the page's /wt.json data
+    let web = web::WebTransport::bind(&config, certs, key)?;
+    let wt_info = web.info();
+    tokio::spawn(web.run(state.clone(), limits.clone()));
+    info!(
+        "QUIC endpoint bound on UDP {}:{} (web client at https://{}:{}/)",
+        config.host, config.udp_port, config.host, config.tcp_port
+    );
 
     // TCP accept loop with connection limits
     info!("server ready, accepting connections");
@@ -359,7 +298,6 @@ async fn main() -> Result<()> {
         }
 
         let tls_acceptor = tls_acceptor.clone();
-        let state = state.clone();
         let limits = limits.clone();
         let wt_info = wt_info.clone();
 
@@ -374,14 +312,8 @@ async fn main() -> Result<()> {
                     if tls_stream.get_ref().1.alpn_protocol() == Some(&b"h2"[..]) {
                         web::serve_h2(tls_stream, wt_info, peer_addr).await;
                     } else {
-                        tcp::handle_connection(
-                            tls_stream,
-                            peer_addr.to_string(),
-                            peer_addr.ip(),
-                            peer_addr.ip(),
-                            state,
-                        )
-                        .await;
+                        debug!(peer = %peer_addr, "legacy (pre-0.5) client, telling it to update");
+                        tcp::reject_legacy(tls_stream).await;
                     }
                 }
                 Ok(Err(e)) => {

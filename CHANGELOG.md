@@ -2,6 +2,37 @@
 
 All notable changes to VoIPC are documented here.
 
+## [0.5.0] - 2026-09-05
+
+Protocol version 5 — client and server must be updated together (one QUIC connection per client, media headers without the UDP token, loss reports). A 0.4 desktop client that connects to a 0.5 server is told to update and stops reconnecting.
+
+### Changed — native clients over QUIC
+- **Desktop and Android clients now connect over QUIC (WebTransport), the endpoint the browser client already used.** The TCP control connection and the raw UDP media socket are gone: control messages travel on one bidirectional stream, voice and screen-share audio as QUIC datagrams, and every video frame on its own unidirectional stream — in both directions, so the server relays the same thing for every client. TLS 1.3 only
+- **One UDP port for everyone.** The QUIC endpoint listens on `udp_port` (default 9987, same number as the page's TCP port); `web_port` and UDP 9988 are gone (an old `server.toml` with `web_port` still loads, the key is ignored). Native clients ask for the operator certificate by TLS server name and pin it on first use exactly as before — existing pins keep working; browsers keep getting the short-lived hash-pinned certificate on the same endpoint
+- **NAT rebind, keepalive and dead-UDP detection replaced by QUIC.** Connection migration survives NAT mapping changes and address changes (Wi-Fi roams), keepalives are QUIC's, and a blocked UDP port now fails the connect with a clear error instead of leaving a session that is silently mute and deaf. The `udp_token` / address-learning machinery, the loopback bridge for browser sessions and the dead-UDP toast are removed; the status-bar latency comes from QUIC's own RTT estimate
+- **Media headers shrink by 8 bytes** (voice 17 → 9, video 23 → 15, screen audio 21 → 13 plus 2 for the key id when encrypted): the UDP token they carried no longer exists. The server checks that a packet's session id is the sending connection's own instead
+- Disconnecting closes the QUIC connection explicitly so the server frees the username immediately
+- The `voice_load` example drives QUIC clients and sends encrypted voice (it used to send plaintext, which the server drops); the TCP `test_client` example is gone
+
+### Added — screen-share congestion control
+- **Viewers report frame loss to the sharer every 2 s** (native and browser viewers alike) and the sharer steps its encoder down a ladder — 60%, 40% and 25% of the configured bitrate, with the frame rate halved on the two lowest rungs — instead of answering loss with ever more keyframes. A sharer whose own uplink queue backs up counts that as loss too. After 30 s without loss it climbs one rung back. Level changes are logged
+- **Only a majority of the viewers steps a share down.** Reports are counted over a 2 s window against the current viewer count, so one viewer on a bad link (or one lying about it) no longer costs everybody else quality
+- **The sharer also watches its own QUIC path**, which viewer reports cannot see: once a second it compares lost packets against packets sent and the round-trip time against the session's minimum, and treats ≥1% loss or a doubled RTT as congestion. The send queue is half as deep as before (about a second of video), so backpressure is reported sooner instead of hiding a growing backlog
+- Keyframe requests are now capped per share rather than per viewer: one relayed request per second however many viewers ask, which ends the keyframe storms a crowded share used to trigger
+
+### Changed — screen-share bandwidth and latency
+- **A periodic keyframe every 4 s instead of every second**, roughly a quarter less video bandwidth at 1080p30. Video travels on reliable QUIC streams, where loss no longer breaks the decoder chain, so the periodic keyframe is only a safety net — and every viewer joining a share now gets one on the spot (still at most one per second per share), rather than only the first
+- **Video fragments are relayed and decoded as they arrive.** The server and both clients used to read a whole frame's stream before parsing it, so every hop added the frame's full transmission time — 35 ms for a delta frame and up to 300 ms for a keyframe on a 5 Mbps link
+
+### Security
+- **A QUIC connection slot is only spent once the client's address is validated.** The slot used to be taken on the first packet and held for the whole 10 s handshake window, so spoofed source addresses could pin all 256 of them and lock everyone out. Unvalidated sources now get a Retry first, which costs one extra round trip on a first connect
+
+### Fixed
+- **A kicked or banned client is told why again.** Ending a session waited for whichever of its legs finished first, and on a kick that is always the media relay, so the control leg was cut off while it was still delivering the reason. The client showed a plain "connection lost" instead of the kick message, most of the time in Firefox and occasionally in Chromium
+- Screen-share and voice relay no longer take a detour through a loopback UDP socket for browser sessions
+- The web client says so when the browser has no WebCodecs audio decoder, instead of staying silent as if nobody were talking; the H.265 probe also accepts the `hvc1` spelling of the codec, which some browsers advertise instead of `hev1`
+- Firefox is now covered by the browser end-to-end test (`BROWSER=firefox ./test-web.sh`): voice, chat, direct messages, invites, history and admin kick all pass on Firefox 155
+
 ## [0.4.0] - 2026-09-04
 
 Protocol version 4 — client and server must be updated together (client-generated media keys, nonce domain separation).

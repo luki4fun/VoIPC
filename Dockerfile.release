@@ -2,7 +2,7 @@
 # Produces: fully static server binary (musl) + portable client AppImage.
 #
 # Usage:
-#   ./release.sh            — builds everything, outputs to release/
+#   npm run release         — builds everything, outputs to release/
 #   docker build -f Dockerfile.release -t voipc-release .   — manual build
 #
 # Uses Ubuntu 24.04 (glibc 2.39).
@@ -38,10 +38,10 @@ RUN apt-get update -qq && apt-get install -y --no-install-recommends \
     file \
     && rm -rf /var/lib/apt/lists/*
 
-# Rust + Tauri CLI (+ wasm target for the web client)
+# Rust (+ wasm target for the web client). The Tauri CLI comes from the
+# client's npm devDependencies, like everywhere else — no global install.
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-    && rustup target add x86_64-unknown-linux-musl wasm32-unknown-unknown \
-    && cargo install tauri-cli
+    && rustup target add x86_64-unknown-linux-musl wasm32-unknown-unknown
 
 # Node.js (LTS)
 RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
@@ -60,12 +60,14 @@ RUN cd client && npm run build:web
 # Build server (fully static via musl — zero runtime deps; serves the embedded web client)
 RUN cargo build -p voipc-server --release --target x86_64-unknown-linux-musl
 
-# Build client AppImage (bundle-libs.sh runs automatically via beforeBundleCommand)
-ENV BINDGEN_EXTRA_CLANG_ARGS="-I/usr/lib/gcc/x86_64-linux-gnu/13/include"
-ENV TAURI_CONFIG='{"build":{"beforeBundleCommand":"bash /build/bundle-libs.sh"},"bundle":{"linux":{"appimage":{"files":{"/usr/lib":"appimage-libs/"}}}}}'
+# Build client AppImage. The build task probes gcc for its include directory,
+# stages the shared libraries via the bundle-libs task, and passes the AppImage
+# file mapping through --config. That mapping used to be set through
+# TAURI_CONFIG, which the Tauri v2 CLI ignores — so the staged libraries were
+# silently dropped from the AppImage.
 # Tauri's appimagetool/linuxdeploy can't use FUSE inside Docker
 ENV APPIMAGE_EXTRACT_AND_RUN=1
-RUN cargo tauri build --bundles appimage
+RUN node tools/voipc.mjs build --bundles appimage
 
 # Collect outputs into /release
 RUN mkdir -p /release \

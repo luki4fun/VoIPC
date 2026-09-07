@@ -49,16 +49,16 @@ fn format_name(p: Pixel) -> &'static str {
 /// Rate-control options shared by every encoder (generic AVCodecContext
 /// AVOptions — libx265 maps maxrate/bufsize to its own vbv params).
 ///
-/// - `g`: encoder-internal keyframes are only a 2s safety net; the app forces
-///   an IDR every second via `encode_video_frame(_, true)`. 2×fps (not fps)
-///   avoids beat-frequency double keyframes when the forced IDR resets the
-///   internal GOP counter.
+/// - `g`: encoder-internal keyframes are only a safety net; the app forces an
+///   IDR every `KEYFRAME_INTERVAL_SECS` via `encode_video_frame(_, true)`. Twice
+///   that interval (not 1×) avoids beat-frequency double keyframes when the
+///   forced IDR resets the internal GOP counter.
 /// - VBV: bufsize caps the largest compliant frame. The UDP wire format
 ///   truncates frames above 255 fragments × 1239 B ≈ 316 KB, so bufsize is
 ///   clamped to 2.4 Mbit (300 KB) to keep keyframes under that ceiling.
 fn set_rate_control_opts(opts: &mut Dictionary, bitrate_kbps: u32, fps: u32) {
     let bits = bitrate_kbps as u64 * 1000;
-    opts.set("g", &(2 * fps).to_string());
+    opts.set("g", &(2 * crate::KEYFRAME_INTERVAL_SECS * fps).to_string());
     opts.set("maxrate", &bits.to_string());
     opts.set("bufsize", &(bits / 2).min(2_400_000).to_string());
 }
@@ -221,8 +221,9 @@ impl Encoder {
         opts.set("tune", "zerolatency");
         opts.set("forced-idr", "1");
 
-        // keyint matches the "g" safety net; the app forces an IDR every 1s.
-        let k = 2 * fps;
+        // keyint matches the "g" safety net; the app forces its own IDR every
+        // KEYFRAME_INTERVAL_SECS.
+        let k = 2 * crate::KEYFRAME_INTERVAL_SECS * fps;
         let x265_params = format!("scenecut=0:me=dia:subme=0:keyint={k}:min-keyint={k}");
         opts.set("x265-params", &x265_params);
 

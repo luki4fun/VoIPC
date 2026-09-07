@@ -215,21 +215,20 @@ impl MediaKey {
 pub fn build_voice_packet(
     key: &MediaKey,
     session_id: u32,
-    udp_token: u64,
     sequence: u32,
     opus: &[u8],
 ) -> Result<Vec<u8>, JsError> {
-    media::build_voice_packet(&key.inner, session_id, udp_token, sequence, opus).map_err(js_err)
+    media::build_voice_packet(&key.inner, session_id, sequence, opus).map_err(js_err)
 }
 
 #[wasm_bindgen(js_name = buildEotPacket)]
-pub fn build_eot_packet(session_id: u32, udp_token: u64, sequence: u32) -> Vec<u8> {
-    media::build_eot_packet(session_id, udp_token, sequence)
+pub fn build_eot_packet(session_id: u32, sequence: u32) -> Vec<u8> {
+    media::build_eot_packet(session_id, sequence)
 }
 
 #[wasm_bindgen(js_name = buildPingPacket)]
-pub fn build_ping_packet(session_id: u32, udp_token: u64, sequence: u32) -> Vec<u8> {
-    media::build_ping_packet(session_id, udp_token, sequence)
+pub fn build_ping_packet(session_id: u32, sequence: u32) -> Vec<u8> {
+    media::build_ping_packet(session_id, sequence)
 }
 
 /// `{ packet_type, session_id, sequence }` of an EOT (0x02), Ping (0x03) or

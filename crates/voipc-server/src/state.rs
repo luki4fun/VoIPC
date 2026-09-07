@@ -1,11 +1,12 @@
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Instant;
 
+use bytes::Bytes;
 use dashmap::DashMap;
 use subtle::ConstantTimeEq;
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use zeroize::Zeroizing;
 
 use voipc_protocol::types::*;
@@ -57,16 +58,12 @@ pub struct UserSession {
     pub channel_id: ChannelId,
     pub is_muted: bool,
     pub is_deafened: bool,
-    /// Sender for pushing TCP control messages to this user's writer task.
-    pub tcp_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
-    /// The user's UDP source address (learned from their first UDP packet).
-    pub udp_addr: Option<SocketAddr>,
-    /// Random token for authenticating UDP voice packets.
-    pub udp_token: u64,
-    /// IP address from TCP authentication (for UDP source verification).
-    pub tcp_peer_ip: IpAddr,
-    /// The client's real IP (bans). Same as `tcp_peer_ip` for native clients;
-    /// web sessions carry the loopback bridge in `tcp_peer_ip`.
+    /// Sender for pushing control messages to this user's writer task.
+    pub tcp_tx: mpsc::Sender<Vec<u8>>,
+    /// Media packets (voice, video, screen audio) queued for this user's
+    /// QUIC session. A full queue drops the packet, like UDP would.
+    pub media_tx: mpsc::Sender<Bytes>,
+    /// The client's IP (bans).
     pub peer_ip: IpAddr,
     /// Logged in with the admin token.
     pub is_admin: bool,
@@ -87,8 +84,12 @@ pub struct UserSession {
     pub password_attempt_rate: RateLimiter,
     /// Rate limiter for chat messages (channel + DM).
     pub chat_rate: RateLimiter,
-    /// Rate limiter for keyframe requests (each one forces an IDR on the sharer).
-    pub keyframe_request_rate: RateLimiter,
+    /// Rate limiter for keyframe requests relayed *to* this user as a sharer
+    /// (each one forces an IDR); per share, so many viewers losing the same
+    /// frames cannot storm the sharer.
+    pub keyframe_relay_rate: RateLimiter,
+    /// Rate limiter for this user's frame-loss reports as a viewer.
+    pub loss_report_rate: RateLimiter,
     /// Rate limiter for channel creation.
     pub create_channel_rate: RateLimiter,
     /// Rate limiter for pre-key uploads.
@@ -154,14 +155,10 @@ pub struct ServerState {
     pub user_to_session: DashMap<UserId, SessionId>,
     /// Atomic username reservation: lowercase username -> session_id.
     pub username_to_session: DashMap<String, SessionId>,
-    /// Reverse lookup: UDP address -> session_id (for routing incoming voice).
-    pub addr_to_session: DashMap<SocketAddr, SessionId>,
     /// All channels, keyed by channel_id.
     pub channels: RwLock<HashMap<ChannelId, Channel>>,
     /// Maximum concurrent users.
     pub max_users: u32,
-    /// UDP port (sent to clients during authentication).
-    pub udp_port: u16,
     /// Runtime settings.
     pub settings: ServerSettings,
     /// Admin token (from config, or generated at startup).
@@ -241,10 +238,8 @@ impl ServerState {
             sessions: DashMap::new(),
             user_to_session: DashMap::new(),
             username_to_session: DashMap::new(),
-            addr_to_session: DashMap::new(),
             channels: RwLock::new(channels),
             max_users: config.max_users,
-            udp_port: config.udp_port,
             settings,
             admin_token,
             bans: DashMap::new(),
@@ -505,10 +500,6 @@ impl ServerState {
 
         self.user_to_session.remove(&session.user_id);
         self.username_to_session.remove(&session.username.to_lowercase());
-
-        if let Some(addr) = &session.udp_addr {
-            self.addr_to_session.remove(addr);
-        }
 
         // Remove from channel
         let mut channels = self.channels.write().await;
@@ -946,13 +937,13 @@ impl ServerState {
         Ok((sharer_user_id, share.sharer_session_id, old_count, new_count))
     }
 
-    /// Get the UDP addresses of all viewers of a given sharer.
-    /// Called from UDP routing to forward video packets only to viewers.
-    pub async fn get_screen_share_viewer_addrs(
+    /// Get the media queues of all viewers of a given sharer.
+    /// Called from media routing to forward video packets only to viewers.
+    pub async fn get_screen_share_viewer_txs(
         &self,
         sharer_user_id: UserId,
         channel_id: ChannelId,
-    ) -> Vec<SocketAddr> {
+    ) -> Vec<mpsc::Sender<Bytes>> {
         let channels = self.channels.read().await;
         let Some(channel) = channels.get(&channel_id) else {
             return Vec::new();
@@ -967,7 +958,7 @@ impl ServerState {
             .filter_map(|&vid| {
                 let sid = *self.user_to_session.get(&vid)?;
                 let session = self.sessions.get(&sid)?;
-                session.udp_addr
+                Some(session.media_tx.clone())
             })
             .collect()
     }
@@ -1052,12 +1043,12 @@ pub struct ScreenShareCleanup {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
     use crate::config::ServerConfig;
     use crate::settings::ServerSettings;
 
-    fn make_state() -> ServerState {
+    pub(crate) fn make_state() -> ServerState {
         ServerState::new(
             &ServerConfig::default(),
             ServerSettings::default(),
@@ -1066,10 +1057,22 @@ mod tests {
         )
     }
 
-    fn add_user(state: &ServerState, username: &str) -> (UserId, SessionId) {
+    /// Registers a user with dummy control/media queues.
+    pub(crate) fn add_user(state: &ServerState, username: &str) -> (UserId, SessionId) {
+        let (user_id, session_id, _media) = add_user_with_media(state, username);
+        (user_id, session_id)
+    }
+
+    /// Registers a user and hands back the media queue so a test can watch
+    /// what the relay fans out to them.
+    pub(crate) fn add_user_with_media(
+        state: &ServerState,
+        username: &str,
+    ) -> (UserId, SessionId, mpsc::Receiver<Bytes>) {
         let user_id = state.next_user_id();
         let session_id = user_id;
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (tx, _rx) = mpsc::channel(1);
+        let (media_tx, media_rx) = mpsc::channel(16);
         let session = UserSession {
             user_id,
             session_id,
@@ -1078,9 +1081,7 @@ mod tests {
             is_muted: false,
             is_deafened: false,
             tcp_tx: tx,
-            udp_addr: None,
-            udp_token: user_id as u64 * 1000,
-            tcp_peer_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+            media_tx,
             peer_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             is_admin: false,
             admin_login_failures: 0,
@@ -1091,7 +1092,8 @@ mod tests {
             global_rate: RateLimiter::new(50.0, 50.0),
             password_attempt_rate: RateLimiter::new(3.0, 1.0),
             chat_rate: RateLimiter::new(5.0, 5.0),
-            keyframe_request_rate: RateLimiter::new(2.0, 1.0),
+            keyframe_relay_rate: RateLimiter::new(2.0, 1.0),
+            loss_report_rate: RateLimiter::new(2.0, 1.0),
             create_channel_rate: RateLimiter::new(1.0, 0.2),
             prekey_rate: RateLimiter::new(1.0, 0.2),
             prekey_bundle_rate: RateLimiter::new(60.0, 1.0),
@@ -1110,8 +1112,53 @@ mod tests {
         state
             .username_to_session
             .insert(username.to_lowercase(), session_id);
-        (user_id, session_id)
+        (user_id, session_id, media_rx)
     }
+
+    /// Puts `users` into `channel_id`, creating the channel if needed
+    /// (bypasses join validation: no passwords, no notifications).
+    pub(crate) async fn put_in_channel(
+        state: &ServerState,
+        channel_id: ChannelId,
+        users: &[(UserId, SessionId)],
+    ) {
+        let mut channels = state.channels.write().await;
+        let channel = channels.entry(channel_id).or_insert_with(|| Channel {
+            info: ChannelInfo {
+                channel_id,
+                name: format!("test-{channel_id}"),
+                description: String::new(),
+                max_users: 0,
+                user_count: 0,
+                has_password: false,
+                created_by: None,
+            },
+            members: HashSet::new(),
+            password: None,
+            delete_timer: None,
+            created_by: None,
+            invited_users: HashSet::new(),
+            screen_shares: HashMap::new(),
+            persistent: false,
+        });
+        for &(user_id, session_id) in users {
+            channel.members.insert(user_id);
+            if let Some(mut session) = state.sessions.get_mut(&session_id) {
+                session.channel_id = channel_id;
+            }
+        }
+        channel.info.user_count = channel.members.len() as u32;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
+    #[allow(unused_imports)]
+    use crate::config::ServerConfig;
+    #[allow(unused_imports)]
+    use crate::settings::ServerSettings;
 
     // ── RateLimiter ────────────────────────────────────────────────────
 

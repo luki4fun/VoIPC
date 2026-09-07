@@ -13,6 +13,7 @@ Cargo.lock
 # Tauri client build artifacts
 client/src-tauri/target/
 client/src-tauri/external-dlls/
+client/src-tauri/appimage-libs/
 client/node_modules/
 client/dist/
 
@@ -24,6 +25,13 @@ client/src/lib/wasm/
 certs/*.key
 certs/*.crt
 certs/*.pem
+
+# Android release signing — passwords and the signing key itself.
+# Losing the key means no future update can install over an existing app;
+# leaking it means anyone can publish an update. Keep the .example only.
+keystore.properties
+*.jks
+*.keystore
 
 # OS files
 .DS_Store

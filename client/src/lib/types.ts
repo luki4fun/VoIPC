@@ -29,7 +29,6 @@ export interface ChannelInfo {
 export interface ConnectionInfo {
   user_id: number;
   session_id: number;
-  udp_port: number;
 }
 
 export interface AudioDeviceInfo {

@@ -159,6 +159,8 @@ export class AudioEngine implements AudioApi {
   private levelDb = -96;
   private keyMissingSince: number | null = null;
   private keyMissingEmitted = false;
+  /** A browser without an Opus decoder is reported once, not per packet. */
+  private noDecoderEmitted = false;
 
   // Mic test
   private micTestActive = false;
@@ -192,6 +194,7 @@ export class AudioEngine implements AudioApi {
     this.screenAudioRecv = 0;
     this.keyMissingSince = null;
     this.keyMissingEmitted = false;
+    this.noDecoderEmitted = false;
     this.userVolumes.clear();
     this.mixer?.port.postMessage({ type: "reset" });
     if (!this.sweepTimer) {
@@ -269,7 +272,16 @@ export class AudioEngine implements AudioApi {
   }
 
   private feedSource(key: number, sequence: number, opus: Uint8Array): void {
-    if (typeof AudioDecoder === "undefined") return;
+    if (typeof AudioDecoder === "undefined") {
+      // Silence would look like everyone else being quiet: say why, once.
+      if (!this.noDecoderEmitted) {
+        this.noDecoderEmitted = true;
+        emit("audio-device-error", {
+          error: "This browser has no WebCodecs audio decoder (needs Chrome/Edge 94+, Firefox 130+ or Safari 17+)",
+        });
+      }
+      return;
+    }
     let src = this.sources.get(key);
     if (!src) {
       src = this.createSource(key);
@@ -475,7 +487,7 @@ export class AudioEngine implements AudioApi {
     this.transmitting = false;
     this.stopCapture();
     // Tell the others we stopped talking (clears their speaking indicator)
-    c.sendDatagram(wasm().buildEotPacket(c.sessionId, c.udpToken, c.nextVoiceSequence()));
+    c.sendDatagram(wasm().buildEotPacket(c.sessionId, c.nextVoiceSequence()));
   }
 
   private stopCapture(): void {
@@ -607,7 +619,7 @@ export class AudioEngine implements AudioApi {
     const opus = new Uint8Array(chunk.byteLength);
     chunk.copyTo(opus);
     try {
-      c.sendDatagram(wasm().buildVoicePacket(key, c.sessionId, c.udpToken, sequence, opus));
+      c.sendDatagram(wasm().buildVoicePacket(key, c.sessionId, sequence, opus));
     } catch (e) {
       // Skip the frame (the sequence is consumed; receivers see a gap)
       console.warn(`voice encryption failed (seq ${sequence}):`, e);

@@ -226,6 +226,80 @@ static SHARE_FRAME_ID: AtomicU32 = AtomicU32::new(0);
 #[cfg(not(target_os = "android"))]
 static SHARE_AUDIO_SEQ: AtomicU32 = AtomicU32::new(0);
 
+/// Milliseconds since the Unix epoch — the clock shared by loss signals
+/// (`ActiveConnection::share_loss_ms`) and the encoder's ladder.
+pub fn epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+// ── Congestion control ───────────────────────────────────────────────────
+//
+// Viewers report frame loss every 2 s (VideoLossReport, relayed by the
+// server) and the sender's own video queue reports backpressure; both land
+// in `loss_ms`. The encoder then steps down a ladder of (bitrate scale, fps
+// divisor) instead of re-sending ever more keyframes into a link that is
+// already too small, and climbs back once the loss stays away.
+
+/// Bitrate scale and fps divisor per level; level 0 is the configured quality.
+#[cfg(not(target_os = "android"))]
+const LEVELS: [(f32, u32); 4] = [(1.0, 1), (0.6, 1), (0.4, 2), (0.25, 2)];
+/// A loss signal younger than this counts as current.
+#[cfg(not(target_os = "android"))]
+const LOSS_RECENT_MS: u64 = 2_000;
+/// Minimum time between two step-downs, so one burst of reports is one step.
+#[cfg(not(target_os = "android"))]
+const STEP_DOWN_HOLD_MS: u64 = 3_000;
+/// Loss-free time (and time since the last change) before stepping back up.
+#[cfg(not(target_os = "android"))]
+const STEP_UP_AFTER_MS: u64 = 30_000;
+
+/// Next ladder level given the age of the last loss signal and the time
+/// since the last level change (both in ms).
+#[cfg(not(target_os = "android"))]
+fn next_level(level: u8, loss_age_ms: u64, since_change_ms: u64) -> u8 {
+    let max = (LEVELS.len() - 1) as u8;
+    if loss_age_ms < LOSS_RECENT_MS {
+        if since_change_ms >= STEP_DOWN_HOLD_MS && level < max {
+            level + 1
+        } else {
+            level
+        }
+    } else if loss_age_ms >= STEP_UP_AFTER_MS && since_change_ms >= STEP_UP_AFTER_MS && level > 0 {
+        level - 1
+    } else {
+        level
+    }
+}
+
+#[cfg(all(test, not(target_os = "android")))]
+mod ladder_tests {
+    use super::*;
+
+    #[test]
+    fn steps_down_on_recent_loss_with_hold_and_up_after_quiet() {
+        // Fresh loss, long since the last change: one step down
+        assert_eq!(next_level(0, 100, 10_000), 1);
+        // A burst of reports within the hold time is one step, not many
+        assert_eq!(next_level(1, 100, 500), 1);
+        // Never past the last rung
+        assert_eq!(next_level(3, 100, 10_000), 3);
+        // Loss just stopped: hold the level
+        assert_eq!(next_level(2, 5_000, 5_000), 2);
+        // Quiet long enough (and not right after a change): climb one rung
+        assert_eq!(next_level(2, 31_000, 31_000), 1);
+        assert_eq!(next_level(2, 31_000, 1_000), 2);
+        // Level 0 with no loss ever (loss_ms = 0 → huge age) stays put
+        assert_eq!(next_level(0, u64::MAX, 60_000), 0);
+        // Every rung keeps at least 1 fps and a positive bitrate
+        for (scale, divisor) in LEVELS {
+            assert!(scale > 0.0 && divisor >= 1);
+        }
+    }
+}
+
 #[cfg(not(target_os = "android"))]
 /// State for the encode → fragment → encrypt → send video pipeline.
 /// Used by both Linux (PipeWire) and Windows (WGC) capture backends.
@@ -244,9 +318,19 @@ pub(crate) struct FrameProcessor {
     pub target_height: u32,
     pub active: Arc<AtomicBool>,
     pub keyframe_requested: Arc<AtomicBool>,
+    /// Epoch ms of the last loss signal (viewer report or local
+    /// backpressure), 0 = none. See `next_level`.
+    pub loss_ms: Arc<AtomicU64>,
+    /// Configured quality; the ladder scales it.
+    pub base_bitrate_kbps: u32,
+    pub base_fps: u32,
+    /// Ladder level currently applied to the encoder.
+    pub level: u8,
+    pub level_changed: Instant,
+    /// Captured frames seen — fps reduction skips every Nth.
+    pub frame_counter: u32,
     pub video_tx: mpsc::Sender<Vec<u8>>,
     pub session_id: u32,
-    pub udp_token: u64,
     pub media_key: Arc<std::sync::Mutex<Option<voipc_crypto::MediaKey>>>,
     pub channel_id: Arc<AtomicU32>,
     pub frames_sent: Arc<AtomicU32>,
@@ -255,6 +339,44 @@ pub(crate) struct FrameProcessor {
 
 #[cfg(not(target_os = "android"))]
 impl FrameProcessor {
+    /// Step the quality ladder if the loss picture changed: rebuilds the
+    /// encoder at the new bitrate/fps (a fresh encoder starts with an IDR,
+    /// which the viewers need anyway). Keeps the old encoder if the rebuild
+    /// fails.
+    fn adapt(&mut self) {
+        let loss_age = epoch_ms().saturating_sub(self.loss_ms.load(Ordering::Relaxed));
+        let since_change = self.level_changed.elapsed().as_millis() as u64;
+        let next = next_level(self.level, loss_age, since_change);
+        if next == self.level {
+            return;
+        }
+        let (scale, divisor) = LEVELS[next as usize];
+        let kbps = ((self.base_bitrate_kbps as f32) * scale) as u32;
+        let fps = (self.base_fps / divisor).max(1);
+        match voipc_video::encoder::Encoder::new(self.target_width, self.target_height, kbps, fps) {
+            Ok(encoder) => {
+                // The converter's output format follows the encoder (NV12 for QSV)
+                if encoder.pixel_format() != self.encoder.pixel_format() {
+                    self.converter = None;
+                }
+                self.encoder = encoder;
+                self.keyframe_interval = voipc_video::KEYFRAME_INTERVAL_SECS * fps;
+                self.keyframe_requested.store(true, Ordering::Relaxed);
+                info!(
+                    from = self.level,
+                    to = next,
+                    kbps,
+                    fps,
+                    "screen share quality level changed"
+                );
+                self.level = next;
+            }
+            Err(e) => warn!("could not rebuild the encoder for level {next}: {e}"),
+        }
+        // Also after a failure, so the rebuild is not retried every frame
+        self.level_changed = Instant::now();
+    }
+
     /// Process a single captured frame: convert → encode → fragment → encrypt → send.
     pub fn process(
         &mut self,
@@ -264,6 +386,15 @@ impl FrameProcessor {
         stride: usize,
         fmt: PixFmt,
     ) {
+        // Congestion control first, and before a frame id is consumed:
+        // frames skipped for the fps divisor must not leave gaps that the
+        // viewers' assemblers would read as loss.
+        self.adapt();
+        self.frame_counter = self.frame_counter.wrapping_add(1);
+        if self.frame_counter % LEVELS[self.level as usize].1 != 0 {
+            return;
+        }
+
         let tw = self.target_width;
         let th = self.target_height;
 
@@ -461,7 +592,6 @@ impl FrameProcessor {
                 &ef.data,
                 ef.is_keyframe,
                 self.session_id,
-                self.udp_token,
                 self.frame_id,
                 timestamp,
                 max_payload,
@@ -480,6 +610,8 @@ impl FrameProcessor {
                         self.video_tx.capacity(), fragment_count, self.frame_id
                     );
                     self.keyframe_requested.store(true, Ordering::Relaxed);
+                    // Our own uplink is the bottleneck: counts as loss for the ladder
+                    self.loss_ms.store(epoch_ms(), Ordering::Relaxed);
                     break;
                 }
             } else {
@@ -504,7 +636,6 @@ impl FrameProcessor {
                             VideoPacket::encrypted_fragment(
                                 ef.is_keyframe,
                                 self.session_id,
-                                self.udp_token,
                                 self.frame_id,
                                 pkt.fragment_index,
                                 pkt.fragment_count,
@@ -565,6 +696,8 @@ impl FrameProcessor {
                                 self.frame_id
                             );
                             self.keyframe_requested.store(true, Ordering::Relaxed);
+                    // Our own uplink is the bottleneck: counts as loss for the ladder
+                    self.loss_ms.store(epoch_ms(), Ordering::Relaxed);
                             send_failed = true;
                             break;
                         }
@@ -594,7 +727,6 @@ pub(crate) struct AudioProcessor {
     pub accumulator: Vec<f32>,
     pub sequence: u32,
     pub session_id: u32,
-    pub udp_token: u64,
     pub start_time: Instant,
     pub audio_tx: mpsc::Sender<Vec<u8>>,
     pub active: Arc<AtomicBool>,
@@ -704,7 +836,6 @@ impl AudioProcessor {
                 ) {
                     Ok(encrypted) => ScreenShareAudioPacket::new_encrypted(
                         self.session_id,
-                        self.udp_token,
                         self.sequence,
                         timestamp,
                         key.key_id,

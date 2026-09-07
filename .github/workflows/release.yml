@@ -1,0 +1,365 @@
+name: Release
+
+# Builds every artifact for a release and opens it as a draft for review.
+#
+# Push a tag to build a release:   git tag v0.5.0 && git push origin v0.5.0
+# Or run it manually from the Actions tab to rehearse the whole thing first.
+on:
+  workflow_dispatch:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Fail before spending an hour of runner time if the tag and the tree
+  # disagree, and pull the release notes out of the changelog.
+  meta:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve and verify the version
+        id: v
+        run: |
+          version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Cargo.toml version: $version"
+
+          # The server compares client and server version strings for exact
+          # equality, so a release whose tag and tree disagree ships clients
+          # that every server rejects.
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="${GITHUB_REF_NAME#v}"
+            if [ "$tag" != "$version" ]; then
+              echo "::error::tag v$tag does not match Cargo.toml version $version"
+              exit 1
+            fi
+          fi
+
+      - name: Check every copy of the version agrees
+        run: node tools/voipc.mjs version --check
+
+      - name: Extract the changelog section
+        run: |
+          version="${{ steps.v.outputs.version }}"
+          # The changelog is hand-written prose and is the release-notes source;
+          # do not generate notes from commit subjects.
+          awk -v v="$version" '
+            $0 ~ "^## \\[" v "\\]" { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+          ' CHANGELOG.md > notes.md
+          if [ ! -s notes.md ]; then
+            echo "::error::no '## [$version]' section found in CHANGELOG.md"
+            exit 1
+          fi
+          cat notes.md
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: notes.md
+
+  linux:
+    needs: meta
+    runs-on: ubuntu-24.04   # glibc 2.39, matching Dockerfile.release
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl ca-certificates pkg-config nasm cmake protobuf-compiler \
+            libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev \
+            libavutil-dev libswscale-dev libx265-dev \
+            libpipewire-0.3-dev libgbm-dev libasound2-dev libturbojpeg0-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev \
+            libssl-dev libclang-dev musl-tools file
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl, wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+
+      - run: npm ci
+        working-directory: client
+
+      # The server embeds client/dist-web at compile time, so the web bundle
+      # has to exist before the server is built.
+      - name: Build the web client
+        run: npm run build:web
+        working-directory: client
+
+      - name: Build the server (static musl)
+        run: cargo build -p voipc-server --release --target x86_64-unknown-linux-musl
+
+      - name: Build the desktop client (AppImage + deb)
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1   # appimagetool cannot use FUSE on a runner
+        run: node tools/voipc.mjs build
+
+      - name: Collect artifacts
+        run: |
+          v="${{ needs.meta.outputs.version }}"
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/voipc-server dist/voipc-server-linux-x86_64
+          cp target/release/bundle/appimage/*.AppImage dist/
+          cp target/release/bundle/deb/*.deb dist/
+          tar -czf "dist/VoIPC-web-$v.tar.gz" -C client dist-web
+          ls -lh dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          if-no-files-found: error
+          path: dist/*
+
+  windows:
+    needs: meta
+    # Pinned rather than windows-latest: the image is moving to VS 2026 and the
+    # build detects the toolset, but pinning keeps releases reproducible.
+    runs-on: windows-2025
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+
+      # The image ships Visual Studio, LLVM, CMake and vcpkg, but not NASM
+      # (libjpeg-turbo SIMD) or protoc (libsignal's build script).
+      - name: Install NASM and protoc
+        run: |
+          choco install -y nasm protoc --no-progress
+          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      # VCPKG_INSTALLATION_ROOT is set on the runner machine, not in the
+      # workflow `env` context, so it has to be carried through step outputs
+      # rather than referenced as ${{ env.VCPKG_INSTALLATION_ROOT }}.
+      - name: Resolve the vcpkg location and revision
+        id: vcpkg
+        run: |
+          $root = $env:VCPKG_INSTALLATION_ROOT
+          if (-not $root) { $root = "C:\vcpkg" }
+          $rev = git -C "$root" rev-parse HEAD
+          "root=$root" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "rev=$rev"   | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      # Building the ffmpeg port from source takes 1-4 h on a 2-core runner, so
+      # this cache is not optional. A hit turns it into seconds.
+      - name: Cache the vcpkg FFmpeg build
+        id: vcpkg-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ steps.vcpkg.outputs.root }}/installed
+            ${{ steps.vcpkg.outputs.root }}/packages
+          key: vcpkg-ffmpeg-x265-nvcodec-amf-qsv-${{ steps.vcpkg.outputs.rev }}
+
+      - name: Install FFmpeg via vcpkg
+        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
+        run: |
+          & "${{ steps.vcpkg.outputs.root }}\vcpkg.exe" install `
+            "ffmpeg[x265,nvcodec,amf,qsv]:x64-windows" --recurse
+
+      - name: Build the client (NSIS + MSI)
+        env:
+          VCPKG_ROOT: ${{ steps.vcpkg.outputs.root }}
+        run: node tools/voipc.mjs build --bundles nsis,msi
+
+      # .cargo/config.toml links ucrtd.lib, which exports the whole CRT mapped
+      # to the debug ucrtbased.dll. That DLL ships with Visual Studio and exists
+      # on no end-user machine — and a runner has VS installed, so only an
+      # explicit check catches it.
+      - name: Check the exe does not depend on the debug CRT
+        run: |
+          $dumpbin = Get-ChildItem -Recurse -Filter dumpbin.exe `
+            "${env:ProgramFiles}\Microsoft Visual Studio\2022" -ErrorAction SilentlyContinue |
+            Select-Object -First 1
+          if (-not $dumpbin) {
+            $dumpbin = Get-ChildItem -Recurse -Filter dumpbin.exe `
+              "${env:ProgramFiles}\Microsoft Visual Studio" | Select-Object -First 1
+          }
+          $deps = & $dumpbin.FullName /dependents target\release\voipc-client.exe
+          if ($deps -match 'ucrtbased\.dll') {
+            throw "voipc-client.exe imports ucrtbased.dll (debug CRT) - it will not start on a machine without Visual Studio"
+          }
+          Write-Host "[ok] No debug CRT dependency"
+
+      - name: Smoke test the installer on real Windows
+        run: |
+          $setup = Get-ChildItem target\release\bundle\nsis\*-setup.exe | Select-Object -First 1
+          Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait
+          $exe = Get-ChildItem "$env:LOCALAPPDATA\Programs\VoIPC\VoIPC.exe",`
+                               "$env:ProgramFiles\VoIPC\VoIPC.exe" -ErrorAction SilentlyContinue |
+                 Select-Object -First 1
+          if (-not $exe) { throw "Installed VoIPC.exe not found after silent install" }
+          $p = Start-Process -FilePath $exe.FullName -PassThru
+          Start-Sleep -Seconds 20
+          if ($p.HasExited) { throw "VoIPC exited early with code $($p.ExitCode)" }
+          Stop-Process -Id $p.Id -Force
+          Write-Host "[ok] App launched and stayed alive"
+
+      - name: Collect artifacts
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target\release\bundle\nsis\*.exe dist\
+          Copy-Item target\release\bundle\msi\*.msi dist\
+          Get-ChildItem dist\
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          if-no-files-found: error
+          path: dist/*
+
+  android:
+    needs: meta
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check the signing secrets are configured
+        id: signing
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE" ]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+            echo "::warning::ANDROID_KEYSTORE_BASE64 is not set — skipping the Android build."
+          fi
+
+      - uses: actions/setup-java@v4
+        if: steps.signing.outputs.ready == 'true'
+        with:
+          distribution: temurin
+          java-version: 21
+
+      - uses: actions/setup-node@v4
+        if: steps.signing.outputs.ready == 'true'
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.signing.outputs.ready == 'true'
+        with:
+          targets: aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.signing.outputs.ready == 'true'
+        with:
+          workspaces: '. -> target'
+
+      # ANDROID_HOME is set on the runner machine, not in the workflow `env`
+      # context, so the NDK path is exported through GITHUB_ENV for later steps.
+      - name: Install the Android NDK
+        if: steps.signing.outputs.ready == 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends cmake protobuf-compiler
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;28.0.13004108"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
+
+      # build.gradle.kts reads keystore.properties from the repo root and
+      # resolves storeFile relative to that file, so both land side by side.
+      - name: Reconstruct the signing keystore
+        if: steps.signing.outputs.ready == 'true'
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          echo "$KEYSTORE" | base64 -d > voipc-release.jks
+          # A .properties file is read by java.util.Properties, which treats a
+          # backslash as an escape — an unescaped one in a password silently
+          # produces a different string and Gradle reports "keystore password
+          # was incorrect".
+          esc() { printf '%s' "$1" | sed 's/\\/\\\\/g'; }
+          {
+            echo "storeFile=voipc-release.jks"
+            echo "storePassword=$(esc "$STORE_PASSWORD")"
+            echo "keyAlias=$(esc "$KEY_ALIAS")"
+            echo "keyPassword=$(esc "$KEY_PASSWORD")"
+          } > keystore.properties
+
+      - name: Build the signed APK
+        if: steps.signing.outputs.ready == 'true'
+        run: node tools/voipc.mjs android release --target aarch64
+
+      - name: Remove the signing material
+        if: always() && steps.signing.outputs.ready == 'true'
+        run: rm -f voipc-release.jks keystore.properties
+
+      - name: Collect artifacts
+        if: steps.signing.outputs.ready == 'true'
+        run: |
+          v="${{ needs.meta.outputs.version }}"
+          mkdir -p dist
+          cp release/VoIPC-android-release.apk "dist/VoIPC-android-$v.apk"
+
+      - uses: actions/upload-artifact@v4
+        if: steps.signing.outputs.ready == 'true'
+        with:
+          name: android
+          if-no-files-found: error
+          path: dist/*
+
+  publish:
+    needs: [meta, linux, windows, android]
+    # Publish whatever built, as long as nothing outright failed.
+    if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten the artifacts
+        run: |
+          mkdir -p dist
+          find artifacts -type f ! -name notes.md -exec cp {} dist/ \;
+          ls -lh dist/
+
+      - name: Create the draft release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v2
+        with:
+          draft: true
+          name: v${{ needs.meta.outputs.version }}
+          body_path: artifacts/release-notes/notes.md
+          files: dist/*

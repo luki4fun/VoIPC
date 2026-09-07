@@ -29,6 +29,8 @@ sudo apt-get install -y \
   libx265-dev \
   libclang-dev \
   libturbojpeg0-dev \
+  cmake \
+  protobuf-compiler \
   nasm \
   libpipewire-0.3-dev \
   libgbm-dev \
@@ -47,6 +49,8 @@ sudo pacman -S --needed --noconfirm \
   x265 \
   clang \
   libjpeg-turbo \
+  cmake \
+  protobuf \
   nasm \
   libpipewire \
   mesa \
@@ -96,5 +100,6 @@ npm install
 ok "npm dependencies installed"
 
 echo -e "\n${CYAN}=== Setup complete ===${NC}"
-echo "Run:  ./dev.sh   (debug)  or  ./build.sh  (release)"
+echo "Run:  npm run dev   (debug)  or  npm run build  (release)"
+echo "      npm run --silent   lists every build task"
 echo ""

@@ -9,6 +9,8 @@
 const MAX_MSG_SIZE = 65_536;
 /** Largest per-frame video stream we buffer (a 1080p keyframe is well under 1 MiB). */
 const MAX_FRAME_STREAM_BYTES = 8 * 1024 * 1024;
+/** Same bound as voipc_protocol::video::MAX_STREAM_RECORD_SIZE. */
+const MAX_STREAM_RECORD_SIZE = 1500;
 /** Bound for each connect phase, like network.rs CONNECT_TIMEOUT. */
 const CONNECT_TIMEOUT_MS = 10_000;
 /** The server pings every 60 s on the control channel; two missed pings plus margin. */
@@ -238,33 +240,37 @@ async function readVideoStreams(streams: ReadableStream, handlers: TransportHand
   }
 }
 
+/** Packets are handed on as they arrive: waiting for the frame's FIN would add
+ *  its whole transmission time to the latency (voipc_protocol::video::RecordReader). */
 async function readVideoFrame(stream: ReadableStream<Uint8Array>, handlers: TransportHandlers): Promise<void> {
   const reader = stream.getReader();
-  const chunks: Uint8Array[] = [];
+  let pending: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
   let total = 0;
   try {
     for (;;) {
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done) return;
       total += value.length;
       if (total > MAX_FRAME_STREAM_BYTES) {
         await reader.cancel();
         return;
       }
-      chunks.push(value);
+      const data = pending.length === 0 ? value : concat(pending, value);
+      let off = 0;
+      while (off + 2 <= data.length) {
+        const len = (data[off] << 8) | data[off + 1];
+        if (len === 0 || len > MAX_STREAM_RECORD_SIZE) {
+          await reader.cancel(); // record boundaries are lost, the frame is junk
+          return;
+        }
+        if (off + 2 + len > data.length) break; // the rest is still in flight
+        handlers.onVideoPacket(data.subarray(off + 2, off + 2 + len));
+        off += 2 + len;
+      }
+      pending = off === 0 ? data : data.slice(off);
     }
   } catch {
     // Stream reset by the server: the frame is lost, the assembler requests a keyframe.
-    return;
-  }
-  const data = chunks.length === 1 ? chunks[0] : concatAll(chunks, total);
-  let off = 0;
-  while (off + 2 <= data.length) {
-    const len = (data[off] << 8) | data[off + 1];
-    off += 2;
-    if (len === 0 || off + len > data.length) break; // truncated record
-    handlers.onVideoPacket(data.subarray(off, off + len));
-    off += len;
   }
 }
 
@@ -292,16 +298,6 @@ function concat(a: Uint8Array, b: Uint8Array): Uint8Array {
   const out = new Uint8Array(a.length + b.length);
   out.set(a, 0);
   out.set(b, a.length);
-  return out;
-}
-
-function concatAll(chunks: Uint8Array[], total: number): Uint8Array {
-  const out = new Uint8Array(total);
-  let off = 0;
-  for (const c of chunks) {
-    out.set(c, off);
-    off += c.length;
-  }
   return out;
 }
 

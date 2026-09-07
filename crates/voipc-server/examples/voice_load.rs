@@ -1,25 +1,35 @@
-// Headless voice load generator: N clients authenticate, join one channel,
-// and each streams a real Opus-encoded tone at 50 packets/sec over UDP while
-// counting the packets fanned back out to them.
+// Headless voice load generator: N clients connect over QUIC, join one
+// channel, and each streams a real Opus-encoded tone at 50 packets/sec as
+// media datagrams while counting the packets fanned back out to them.
 //
 // Run against a local server:
 //   cargo run -p voipc-server --release --example voice_load -- 30 127.0.0.1:9987
 //
 // Expected at N=30: aggregate send ~1500 pkt/s, aggregate recv ~43500 pkt/s
-// (each of the 30 clients receives the other 29 streams). A real client in
-// the same channel should hear a loud-but-clamped mix of all tones.
+// (each of the 30 clients receives the other 29 streams). The tone is
+// encrypted under a random media key the server never sees (it relays
+// encrypted voice verbatim), so a real client in the channel receives
+// packets it cannot decode — this measures relay throughput only.
 
+use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt};
+use wtransport::config::{DnsLookupFuture, DnsResolver};
+use wtransport::{ClientConfig, Endpoint};
 
 use voipc_protocol::codec::{
     decode_server_msg, encode_client_msg, try_decode_frame, APP_VERSION, PROTOCOL_VERSION,
 };
 use voipc_protocol::messages::{ClientMessage, ServerMessage};
 use voipc_protocol::voice::{VoicePacket, OPUS_FRAME_SIZE, OPUS_SAMPLE_RATE};
+
+/// Server name that makes the server present its operator certificate
+/// (`crates/voipc-server/src/web.rs::NATIVE_SNI`).
+const NATIVE_SNI: &str = "voipc-native";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -78,12 +88,10 @@ async fn run_client(
     channel_tx: tokio::sync::watch::Sender<u32>,
     mut channel_rx: tokio::sync::watch::Receiver<u32>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // ── TCP + TLS + auth ──
+    // ── QUIC + auth ──
     // The server caps connections per IP (DoS guard), so spread the load
-    // clients across 127.0.0.0/8 source addresses (4 clients per IP). The
-    // UDP socket must bind the same IP — the server validates that the UDP
-    // source IP matches the TCP peer IP.
-    let server_addr: std::net::SocketAddr = tokio::net::lookup_host(server)
+    // clients across 127.0.0.0/8 source addresses (4 clients per IP).
+    let server_addr: SocketAddr = tokio::net::lookup_host(server)
         .await?
         .next()
         .ok_or("cannot resolve server")?;
@@ -93,16 +101,22 @@ async fn run_client(
         (index / 4 / 250) as u8,
         2 + (index / 4 % 250) as u8,
     ));
-    let tcp_socket = tokio::net::TcpSocket::new_v4()?;
-    tcp_socket.bind(std::net::SocketAddr::new(local_ip, 0))?;
-    let tcp = tcp_socket.connect(server_addr).await?;
-    let config = rustls::ClientConfig::builder()
+    let mut tls = rustls::ClientConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(NoCertVerifier))
         .with_no_client_auth();
-    let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
-    let server_name = rustls::pki_types::ServerName::try_from("localhost".to_string())?;
-    let mut tls = connector.connect(server_name, tcp).await?;
+    tls.alpn_protocols = vec![b"h3".to_vec()];
+    let config = ClientConfig::builder()
+        .with_bind_address(SocketAddr::new(local_ip, 0))
+        .with_custom_tls(tls)
+        .keep_alive_interval(Some(Duration::from_secs(10)))
+        .dns_resolver(Fixed(server_addr))
+        .build();
+    let endpoint = Endpoint::client(config)?;
+    let connection = endpoint
+        .connect(format!("https://{NATIVE_SNI}:{}/voipc", server_addr.port()))
+        .await?;
+    let (mut send, mut recv) = connection.open_bi().await?.await?;
 
     let auth = ClientMessage::Authenticate {
         username: format!("load{index}"),
@@ -111,16 +125,12 @@ async fn run_client(
         identity_key: None,
         prekey_bundle: None,
     };
-    tls.write_all(&encode_client_msg(&auth)?).await?;
+    send.write_all(&encode_client_msg(&auth)?).await?;
 
     let mut buf = bytes::BytesMut::with_capacity(8192);
-    let (session_id, udp_token) = loop {
-        match next_message(&mut tls, &mut buf).await? {
-            ServerMessage::Authenticated {
-                session_id,
-                udp_token,
-                ..
-            } => break (session_id, udp_token),
+    let session_id = loop {
+        match next_message(&mut recv, &mut buf).await? {
+            ServerMessage::Authenticated { session_id, .. } => break session_id,
             ServerMessage::AuthError { reason } => return Err(reason.into()),
             _ => {}
         }
@@ -128,14 +138,14 @@ async fn run_client(
 
     // ── Channel setup: client 0 creates (or reuses) the load channel ──
     let channel_id = if index == 0 {
-        tls.write_all(&encode_client_msg(&ClientMessage::CreateChannel {
+        send.write_all(&encode_client_msg(&ClientMessage::CreateChannel {
             name: "LoadTest".into(),
             password: None,
         })?)
         .await?;
         let mut existing: Option<u32> = None;
         let id = loop {
-            match next_message(&mut tls, &mut buf).await? {
+            match next_message(&mut recv, &mut buf).await? {
                 ServerMessage::ChannelCreated { channel } if channel.name == "LoadTest" => {
                     break channel.channel_id
                 }
@@ -158,20 +168,20 @@ async fn run_client(
         channel_rx.wait_for(|&id| id != 0).await?;
         *channel_rx.borrow()
     };
-    tls.write_all(&encode_client_msg(&ClientMessage::JoinChannel {
+    send.write_all(&encode_client_msg(&ClientMessage::JoinChannel {
         channel_id,
         password: None,
     })?)
     .await?;
 
-    // Keep the TCP session alive: answer server keepalive pings
+    // Keep the control session alive: answer server keepalive pings
     tokio::spawn(async move {
         loop {
-            match next_message(&mut tls, &mut buf).await {
+            match next_message(&mut recv, &mut buf).await {
                 Ok(ServerMessage::Ping { timestamp }) => {
                     let msg = ClientMessage::Ping { timestamp };
                     if let Ok(data) = encode_client_msg(&msg) {
-                        if tls.write_all(&data).await.is_err() {
+                        if send.write_all(&data).await.is_err() {
                             return;
                         }
                     }
@@ -182,81 +192,67 @@ async fn run_client(
         }
     });
 
-    // ── UDP voice ──
-    let bind_udp = || async {
-        let udp = tokio::net::UdpSocket::bind(std::net::SocketAddr::new(local_ip, 0)).await?;
-        udp.connect(server_addr).await?;
-        udp.send(&VoicePacket::ping(session_id, udp_token, 0).to_bytes())
-            .await?;
-        Ok::<_, std::io::Error>(Arc::new(udp))
-    };
-    let spawn_recv = |udp: Arc<tokio::net::UdpSocket>, received: Arc<AtomicU64>| {
+    // Count everything fanned out to us
+    {
+        let connection = connection.clone();
+        let received = received.clone();
         tokio::spawn(async move {
-            let mut buf = [0u8; 2048];
-            while let Ok(_n) = udp.recv(&mut buf).await {
+            while connection.receive_datagram().await.is_ok() {
                 received.fetch_add(1, Ordering::Relaxed);
             }
-        })
-    };
+        });
+    }
 
-    // Set VOICE_LOAD_REBIND_SECS to make each client move to a fresh UDP
-    // source port periodically — simulates NAT mapping expiry to exercise
-    // the server's validated-rebind path.
-    let rebind_every: Option<Duration> = std::env::var("VOICE_LOAD_REBIND_SECS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .map(Duration::from_secs);
-
-    {
-        let mut udp = bind_udp().await?;
-        let mut recv_task = spawn_recv(udp.clone(), received.clone());
-        let mut last_rebind = tokio::time::Instant::now();
-
-        // Sender: 440Hz + per-client offset tone, Opus-encoded, 50 pkt/s
-        let mut encoder = voipc_audio::encoder::Encoder::new()?;
-        let mut pcm = [0.0f32; OPUS_FRAME_SIZE];
-        let freq = 220.0 + 20.0 * index as f32;
-        let mut phase = 0.0f32;
-        let step = 2.0 * std::f32::consts::PI * freq / OPUS_SAMPLE_RATE as f32;
-        let mut sequence: u32 = 0;
-        let mut interval = tokio::time::interval(Duration::from_millis(20));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        loop {
-            interval.tick().await;
-            if let Some(period) = rebind_every {
-                if last_rebind.elapsed() >= period {
-                    last_rebind = tokio::time::Instant::now();
-                    recv_task.abort();
-                    udp = bind_udp().await?;
-                    recv_task = spawn_recv(udp.clone(), received.clone());
-                    println!("client {index}: rebound UDP to {}", udp.local_addr()?);
-                }
-            }
-            for s in pcm.iter_mut() {
-                *s = 0.2 * phase.sin();
-                phase += step;
-            }
-            phase %= 2.0 * std::f32::consts::PI;
-            let opus = encoder.encode(&pcm)?;
-            let packet = VoicePacket::voice(session_id, udp_token, sequence, opus);
-            sequence = sequence.wrapping_add(1);
-            udp.send(&packet.to_bytes()).await?;
-            sent.fetch_add(1, Ordering::Relaxed);
+    // ── Voice: 440Hz + per-client offset tone, Opus-encoded, encrypted, 50 pkt/s ──
+    let key = voipc_crypto::MediaKey::generate(channel_id, 1)?;
+    let aad = voipc_crypto::build_aad(channel_id, 0x05);
+    let mut encoder = voipc_audio::encoder::Encoder::new()?;
+    let mut pcm = [0.0f32; OPUS_FRAME_SIZE];
+    let freq = 220.0 + 20.0 * index as f32;
+    let mut phase = 0.0f32;
+    let step = 2.0 * std::f32::consts::PI * freq / OPUS_SAMPLE_RATE as f32;
+    let mut sequence: u32 = 0;
+    let mut interval = tokio::time::interval(Duration::from_millis(20));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        for s in pcm.iter_mut() {
+            *s = 0.2 * phase.sin();
+            phase += step;
         }
+        phase %= 2.0 * std::f32::consts::PI;
+        let opus = encoder.encode(&pcm)?;
+        let encrypted = voipc_crypto::media_encrypt(&key, session_id, sequence, 0, &aad, &opus)?;
+        let packet = VoicePacket::encrypted_voice(session_id, sequence, key.key_id, encrypted);
+        sequence = sequence.wrapping_add(1);
+        connection.send_datagram(packet.to_bytes())?;
+        sent.fetch_add(1, Ordering::Relaxed);
     }
 }
 
-async fn next_message(
-    tls: &mut tokio_rustls::client::TlsStream<tokio::net::TcpStream>,
+async fn next_message<R: AsyncRead + Unpin>(
+    recv: &mut R,
     buf: &mut bytes::BytesMut,
 ) -> Result<ServerMessage, Box<dyn std::error::Error + Send + Sync>> {
     loop {
         if let Some(payload) = try_decode_frame(buf)? {
             return Ok(decode_server_msg(&payload)?);
         }
-        if tls.read_buf(buf).await? == 0 {
+        if recv.read_buf(buf).await? == 0 {
             return Err("server closed connection".into());
         }
+    }
+}
+
+/// Resolves any host name to the server address, so the URL can carry
+/// `NATIVE_SNI` as the server name while dialing an IP.
+#[derive(Debug)]
+struct Fixed(SocketAddr);
+
+impl DnsResolver for Fixed {
+    fn resolve(&self, _host: &str) -> Pin<Box<dyn DnsLookupFuture>> {
+        let addr = self.0;
+        Box::pin(async move { Ok(Some(addr)) })
     }
 }
 

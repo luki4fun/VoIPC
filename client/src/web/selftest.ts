@@ -56,7 +56,7 @@ export async function run(params: URLSearchParams): Promise<void> {
   const watched = [
     "channel-list", "user-list", "user-joined", "user-left", "media-key-installed",
     "media-key-missing", "user-speaking", "channel-chat-message", "direct-chat-message",
-    "latency-update", "connection-lost", "channel-error", "udp-dead", "audio-device-error",
+    "latency-update", "connection-lost", "channel-error", "audio-device-error",
     "identity-key-changed", "poke-received", "admin-status", "admin-error",
     "server-disconnected", "channel-history-requested", "channel-history-received",
   ];

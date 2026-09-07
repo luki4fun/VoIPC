@@ -6,11 +6,12 @@ foreach ($file in @("$PSScriptRoot\client\src-tauri\tauri.conf.json", "$PSScript
     (Get-Content $file -Raw) -replace '"version":\s*"[^"]*"', "`"version`": `"$version`"" | Set-Content $file -NoNewline
 }
 
-$env:VCPKG_ROOT       = "C:\Program Files\vcpkg"
+# Honour a pre-set VCPKG_ROOT/LIBCLANG_PATH (CI images ship vcpkg at C:\vcpkg)
+if (-not $env:VCPKG_ROOT)    { $env:VCPKG_ROOT    = "C:\Program Files\vcpkg" }
+if (-not $env:LIBCLANG_PATH) { $env:LIBCLANG_PATH = "C:\Program Files\LLVM\bin" }
 $env:CMAKE_GENERATOR  = "Visual Studio 17 2022"
 $env:FFMPEG_DIR       = "$env:VCPKG_ROOT\installed\x64-windows"
 $env:PKG_CONFIG_PATH  = "$env:VCPKG_ROOT\installed\x64-windows\lib\pkgconfig"
-$env:LIBCLANG_PATH    = "C:\Program Files\LLVM\bin"
 
 # ── Detect MSVC and Windows SDK paths via vswhere ────────────────────────
 $vsWhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
@@ -89,9 +90,17 @@ foreach ($pattern in $dllPatterns) {
 $stagedCount = (Get-ChildItem "$dllStaging\*.dll" -ErrorAction SilentlyContinue).Count
 Write-Host "[ok] Staged $stagedCount DLLs for bundling" -ForegroundColor Green
 
-# Tell Tauri to bundle the staged DLLs (Windows-only override; Linux doesn't need this)
-$env:TAURI_CONFIG = '{"bundle":{"resources":{"external-dlls/*":"./"}}}'
+# Tell Tauri to bundle the staged DLLs, and disable the Linux-only AppImage hook
+# (beforeBundleCommand stages Linux shared libraries and needs ldd + an ELF binary).
+# An empty hook string is treated as "no hook" by the Tauri CLI.
+#
+# This must go through --config: the TAURI_CONFIG environment variable that
+# Tauri v1 honoured is silently ignored by the v2 CLI, so setting it there left
+# the FFmpeg DLLs out of the installer without any warning.
+# bundle.active is unset in tauri.conf.json, which means off — without this a
+# release build produces the bare .exe and silently skips the installer.
+$tauriConfig = '{"build":{"beforeBundleCommand":""},"bundle":{"active":true,"resources":{"external-dlls/*":"./"}}}'
 
 Set-Location -Path "$PSScriptRoot\client"
 if (-not (Test-Path "node_modules")) { npm install }
-npx tauri build @args
+npx tauri build --config $tauriConfig @args

@@ -89,6 +89,10 @@ pub async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
         drop(connection.video_tx);
         drop(connection.screen_audio_tx);
 
+        // Tell the server right away (otherwise it holds the username until
+        // its idle timeout and a quick reconnect gets "already taken")
+        connection.quic.close().await;
+
         // Clear Signal protocol state to prevent stale sessions on reconnect
         if let Ok(mut sig) = state.signal.lock() {
             sig.own_user_id = None;
@@ -594,7 +598,6 @@ pub(crate) async fn do_start_transmit(
     let task = network::spawn_capture_encode_task(
         input_device,
         connection.session_id,
-        connection.udp_token,
         connection.transmitting.clone(),
         connection.voice_tx.clone(),
         connection.current_media_key.clone(),
@@ -632,7 +635,7 @@ pub(crate) async fn do_stop_transmit(state: &AppState) -> Result<(), String> {
     }
 
     // Send EndOfTransmission so other clients know we stopped talking
-    let eot = VoicePacket::end_of_transmission(connection.session_id, connection.udp_token, 0);
+    let eot = VoicePacket::end_of_transmission(connection.session_id, 0);
     let _ = connection.voice_tx.send(eot.to_bytes()).await;
 
     tracing::info!("PTT released — capture stopped");
@@ -1266,6 +1269,17 @@ pub async fn get_screen_share_stats(
     ))
 }
 
+/// Drop the previous share's viewer loss reports so they cannot vote the new
+/// one down; the viewer count arrives again from the server as viewers join.
+#[cfg(not(target_os = "android"))]
+fn clear_loss_tally(connection: &crate::app_state::ActiveConnection) {
+    let mut tally = connection
+        .share_loss_tally
+        .lock()
+        .unwrap_or_else(|p| p.into_inner());
+    *tally = crate::app_state::LossTally::default();
+}
+
 /// Start the screen capture task — called from frontend when viewer_count goes from 0 to N.
 #[tauri::command]
 pub async fn start_screen_capture(
@@ -1303,6 +1317,9 @@ pub async fn start_screen_capture(
         // Reset sender stats for this new capture session
         connection.screen_video_frames_sent.store(0, Ordering::Relaxed);
         connection.screen_video_bytes_sent.store(0, Ordering::Relaxed);
+        // A loss report from a previous share must not bump the new one
+        connection.share_loss_ms.store(0, Ordering::Relaxed);
+        clear_loss_tally(connection);
 
         let task = screenshare::spawn_capture_task(
             session,
@@ -1311,9 +1328,9 @@ pub async fn start_screen_capture(
             fps,
             res.bitrate_kbps_at(fps),
             connection.session_id,
-            connection.udp_token,
             connection.screen_share_active.clone(),
             connection.keyframe_requested.clone(),
+            connection.share_loss_ms.clone(),
             connection.video_tx.clone(),
             connection.screen_audio_tx.clone(),
             connection.screen_audio_enabled.clone(),
@@ -1406,6 +1423,8 @@ pub async fn switch_screen_share_source(
         connection
             .screen_video_bytes_sent
             .store(0, Ordering::Relaxed);
+        connection.share_loss_ms.store(0, Ordering::Relaxed);
+        clear_loss_tally(connection);
 
         let task = screenshare::spawn_capture_task(
             session,
@@ -1414,9 +1433,9 @@ pub async fn switch_screen_share_source(
             fps,
             res.bitrate_kbps_at(fps),
             connection.session_id,
-            connection.udp_token,
             connection.screen_share_active.clone(),
             connection.keyframe_requested.clone(),
+            connection.share_loss_ms.clone(),
             connection.video_tx.clone(),
             connection.screen_audio_tx.clone(),
             connection.screen_audio_enabled.clone(),
@@ -2149,7 +2168,7 @@ pub async fn send_encrypted_channel_message(
 /// certificate rotation). Returns whether a pin existed.
 #[tauri::command]
 pub fn forget_server_pin(host: String, port: u16) -> bool {
-    network::tofu_forget(&host, port)
+    crate::transport::tofu_forget(&host, port)
 }
 
 /// Upload replenished one-time pre-keys to the server.

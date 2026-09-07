@@ -4,15 +4,14 @@ use std::sync::Arc;
 
 use bytes::BytesMut;
 use ringbuf::traits::Producer;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tokio_rustls::client::TlsStream;
-use tokio_rustls::TlsConnector;
 use tauri::Emitter;
 #[cfg(not(target_os = "android"))]
 use tauri::Manager;
 use tracing::{error, info, warn};
+use wtransport::error::SendDatagramError;
+use wtransport::{Connection, SendStream};
 
 use voipc_crypto::media_keys::MediaKey;
 use voipc_protocol::codec::{
@@ -21,19 +20,14 @@ use voipc_protocol::codec::{
 use voipc_protocol::messages::{ClientMessage, ServerMessage};
 use voipc_protocol::types::*;
 use voipc_protocol::video::{
-    FrameAssembler, ScreenShareAudioPacket, VideoPacket, SCREEN_AUDIO_HEADER_SIZE,
-    VIDEO_HEADER_SIZE,
+    FrameAssembler, FrameGrouper, RecordReader, ScreenShareAudioPacket, VideoPacket,
+    SCREEN_AUDIO_HEADER_SIZE, VIDEO_HEADER_SIZE,
 };
 use voipc_protocol::voice::VoicePacket;
 
-use crate::app_state::{ActiveConnection, AppState, PendingTarget, SignalState};
+use crate::app_state::{ActiveConnection, AppState, LossTally, PendingTarget, SignalState};
 use crate::screenshare;
-
-/// Bound for each connect phase (TCP, TLS, auth response).
-const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// The server pings every 60 s; two missed pings plus margin means the path
-/// is dead even though the socket never reported it (roam, sleep, NAT expiry).
-const TCP_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(150);
+use crate::transport::CONNECT_TIMEOUT;
 
 /// Connect to the server, authenticate, spawn background tasks, and store the connection.
 /// Returns the assigned user_id on success.
@@ -64,6 +58,7 @@ pub async fn connect_to_server(
             drop(old.voice_tx);
             drop(old.video_tx);
             drop(old.screen_audio_tx);
+            old.quic.close().await;
             info!("cleaned up stale connection before reconnecting");
         }
     }
@@ -80,47 +75,12 @@ pub async fn connect_to_server(
 
     let (host, port) = parse_address(&address)?;
 
-    // TCP connect. Every phase below is bounded: without a deadline a
-    // black-holed host keeps the reconnect loop (and its Cancel button)
-    // stuck in SYN retries for minutes.
-    let tcp_stream = tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect((&*host, port)))
-        .await
-        .map_err(|_| format!("Timed out connecting to {}", address))?
-        .map_err(|e| format!("Could not connect to {}: {}", address, e))?;
-
-    info!("TCP connected to {}", address);
-
-    // TLS handshake
-    let tls_config = if accept_invalid_certs {
-        warn!("Using TOFU certificate pinning (self-signed mode)");
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(TofuCertVerifier {
-                key: tofu_key(&host, port),
-            }))
-            .with_no_client_auth()
-    } else {
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth()
-    };
-
-    let connector = TlsConnector::from(Arc::new(tls_config));
-    let server_name = if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        rustls::pki_types::ServerName::IpAddress(ip.into())
-    } else {
-        rustls::pki_types::ServerName::try_from(host.clone())
-            .map_err(|e| format!("Invalid server name '{}': {}", host, e))?
-    };
-
-    let mut tls_stream = tokio::time::timeout(CONNECT_TIMEOUT, connector.connect(server_name, tcp_stream))
-        .await
-        .map_err(|_| format!("Timed out in TLS handshake with {}", address))?
-        .map_err(|e| format!("TLS handshake failed: {}", e))?;
-
-    info!("TLS handshake complete");
+    // QUIC connect + control stream (every phase bounded, see transport.rs)
+    let crate::transport::Link {
+        quic,
+        mut control_send,
+        mut control_recv,
+    } = crate::transport::connect(&host, port, accept_invalid_certs).await?;
 
     // Initialize Signal Protocol state if not already done
     {
@@ -218,15 +178,15 @@ pub async fn connect_to_server(
     };
     let data =
         encode_client_msg(&auth_msg).map_err(|e| format!("Failed to encode auth: {}", e))?;
-    tls_stream
+    control_send
         .write_all(&data)
         .await
         .map_err(|e| format!("Failed to send auth: {}", e))?;
 
     // Read until we get the Authenticated or AuthError response
     let mut buf = BytesMut::with_capacity(4096);
-    let (user_id, session_id, udp_port, udp_token) = loop {
-        let n = tokio::time::timeout(CONNECT_TIMEOUT, tls_stream.read_buf(&mut buf))
+    let (user_id, session_id) = loop {
+        let n = tokio::time::timeout(CONNECT_TIMEOUT, control_recv.read_buf(&mut buf))
             .await
             .map_err(|_| "Timed out waiting for the authentication response".to_string())?
             .map_err(|e| format!("Failed to read auth response: {}", e))?;
@@ -245,9 +205,7 @@ pub async fn connect_to_server(
                 ServerMessage::Authenticated {
                     user_id,
                     session_id,
-                    udp_port,
-                    udp_token,
-                } => break (user_id, session_id, udp_port, udp_token),
+                } => break (user_id, session_id),
                 ServerMessage::AuthError { reason } => {
                     return Err(format!("Authentication failed: {}", reason));
                 }
@@ -258,7 +216,7 @@ pub async fn connect_to_server(
         }
     };
 
-    info!(user_id, session_id, udp_port, "authenticated with server");
+    info!(user_id, session_id, "authenticated with server");
 
     // Reset Signal tracking state for the new connection.
     // User IDs are allocated fresh by the server, so old session tracking is stale.
@@ -272,54 +230,6 @@ pub async fn connect_to_server(
         signal.sender_key_distributed.clear();
         signal.sender_key_received.clear();
         signal.pending_messages.clear();
-    }
-
-    // Resolve UDP server address first to determine address family
-    let udp_addr = format!("{}:{}", host, udp_port);
-    let server_addr: std::net::SocketAddr = tokio::net::lookup_host(&udp_addr)
-        .await
-        .map_err(|e| format!("Failed to resolve UDP addr {}: {}", udp_addr, e))?
-        .next()
-        .ok_or_else(|| format!("No addresses found for {}", udp_addr))?;
-
-    info!("UDP target resolved to {}", server_addr);
-
-    // Set up UDP socket matching server address family, with large buffers
-    let udp_socket = {
-        let (domain, bind_addr) = if server_addr.is_ipv4() {
-            (socket2::Domain::IPV4, "0.0.0.0:0")
-        } else {
-            (socket2::Domain::IPV6, "[::]:0")
-        };
-        let sock = socket2::Socket::new(
-            domain,
-            socket2::Type::DGRAM,
-            Some(socket2::Protocol::UDP),
-        )
-        .map_err(|e| format!("Failed to create UDP socket: {}", e))?;
-        // 2MB buffers — absorbs ~1400 packets of burst without kernel drops
-        if let Err(e) = sock.set_recv_buffer_size(2 * 1024 * 1024) {
-            warn!("failed to set UDP recv buffer to 2MB: {e}");
-        }
-        if let Err(e) = sock.set_send_buffer_size(2 * 1024 * 1024) {
-            warn!("failed to set UDP send buffer to 2MB: {e}");
-        }
-        sock.bind(&bind_addr.parse::<std::net::SocketAddr>().unwrap().into())
-            .map_err(|e| format!("Failed to bind UDP socket: {}", e))?;
-        sock.set_nonblocking(true)
-            .map_err(|e| format!("Failed to set non-blocking: {}", e))?;
-        let std_sock: std::net::UdpSocket = sock.into();
-        Arc::new(
-            UdpSocket::from_std(std_sock)
-                .map_err(|e| format!("Failed to wrap UDP socket: {}", e))?,
-        )
-    };
-
-    // Send an initial UDP ping so the server learns our UDP address
-    let ping_packet = VoicePacket::ping(session_id, udp_token, 0);
-    match udp_socket.send_to(&ping_packet.to_bytes(), server_addr).await {
-        Ok(n) => info!("UDP ping sent ({} bytes) to {}", n, server_addr),
-        Err(e) => error!("UDP ping send failed: {}", e),
     }
 
     // Start audio playback stream (output to speakers). Failure is not fatal:
@@ -342,18 +252,16 @@ pub async fn connect_to_server(
     let output_device_live = Arc::new(std::sync::Mutex::new(output_device));
     let master_volume = Arc::new(AtomicU32::new(saved_volume.to_bits()));
 
-    // Split TLS stream into reader/writer halves
-    let (read_half, write_half) = tokio::io::split(tls_stream);
-
-    // TCP writer channel
+    // Control writer channel
     let (tcp_tx, tcp_rx) = mpsc::channel::<Vec<u8>>(64);
-    // UDP voice channel
+    // Voice datagram channel
     let (voice_tx, voice_rx) = mpsc::channel::<Vec<u8>>(256);
-    // UDP video channel (separate from voice to avoid blocking).
-    // 1024 slots ≈ ~68 frames at 15 fragments/frame — gives ~2s of headroom
-    // before the non-blocking try_send in FrameProcessor starts dropping frames.
-    let (video_tx, video_rx) = mpsc::channel::<Vec<u8>>(1024);
-    // UDP screen share audio channel
+    // Video channel (separate from voice to avoid blocking).
+    // 512 slots ≈ ~34 frames at 15 fragments/frame — ~1s of headroom before the
+    // non-blocking try_send in FrameProcessor reports backpressure, and still
+    // room for a full 255-fragment keyframe. Deeper only delays that signal.
+    let (video_tx, video_rx) = mpsc::channel::<Vec<u8>>(512);
+    // Screen share audio datagram channel
     let (screen_audio_tx, screen_audio_rx) = mpsc::channel::<Vec<u8>>(128);
 
     // Shared state for media encryption, screen audio, and transmit control
@@ -383,7 +291,13 @@ pub async fn connect_to_server(
     // delta frames that the H.265 decoder produces after reference chain breakage.
     let needs_keyframe = Arc::new(AtomicBool::new(false));
 
-    // Shared screen share state — created early so TCP reader can reset on channel change
+    // Last frame-loss signal for our own share (viewer reports, our own path
+    // stats); read by the encode thread to step quality down. The tally decides
+    // which viewer reports count as loss.
+    let share_loss_ms = Arc::new(AtomicU64::new(0));
+    let share_loss_tally = Arc::new(std::sync::Mutex::new(LossTally::default()));
+
+    // Shared screen share state — created early so the control reader can reset on channel change
     let screen_share_active = Arc::new(AtomicBool::new(false));
     let watching_user_id_shared = Arc::new(AtomicU32::new(0));
 
@@ -409,9 +323,10 @@ pub async fn connect_to_server(
     let is_deafened = Arc::new(AtomicBool::new(saved_deafened));
 
     // Spawn background tasks
-    let writer_handle = tokio::spawn(tcp_writer_task(write_half, tcp_rx));
-    let reader_handle = tokio::spawn(tcp_reader_task(
-        read_half,
+    let connection = quic.connection.clone();
+    let writer_handle = tokio::spawn(control_writer_task(control_send, tcp_rx));
+    let reader_handle = tokio::spawn(control_reader_task(
+        control_recv,
         buf,
         app_handle.clone(),
         current_media_key.clone(),
@@ -421,11 +336,13 @@ pub async fn connect_to_server(
         user_id,
         screen_share_active.clone(),
         watching_user_id_shared.clone(),
+        share_loss_ms.clone(),
+        share_loss_tally.clone(),
     ));
-    let udp_send_handle = tokio::spawn(udp_sender_task(udp_socket.clone(), voice_rx, server_addr));
-    let video_send_handle = tokio::spawn(udp_sender_task(udp_socket.clone(), video_rx, server_addr));
+    let udp_send_handle = tokio::spawn(datagram_sender_task(connection.clone(), voice_rx));
+    let video_send_handle = tokio::spawn(video_stream_sender_task(connection.clone(), video_rx));
     let screen_audio_send_handle =
-        tokio::spawn(udp_sender_task(udp_socket.clone(), screen_audio_rx, server_addr));
+        tokio::spawn(datagram_sender_task(connection.clone(), screen_audio_rx));
     let video_decode_handle = tokio::task::spawn_blocking({
         let app_handle = app_handle.clone();
         let tcp_tx = tcp_tx.clone();
@@ -438,17 +355,18 @@ pub async fn connect_to_server(
     // Voice quality stats (read by the get_voice_stats command)
     let voice_frames_played = Arc::new(AtomicU32::new(0));
     let voice_frames_lost = Arc::new(AtomicU32::new(0));
-    // Dead-UDP watchdog state: last Pong arrival, epoch ms
-    let last_pong = Arc::new(AtomicU64::new(0));
 
-    let udp_recv_handle = tokio::spawn(udp_receiver_task(
-        udp_socket.clone(),
-        server_addr,
+    let udp_recv_handle = tokio::spawn(datagram_receiver_task(
+        connection.clone(),
         app_handle.clone(),
-        session_id,
         mix_sources.clone(),
-        video_decode_tx,
         screen_audio_recv_count.clone(),
+        current_media_key.clone(),
+        current_channel_id.clone(),
+    ));
+    let video_recv_handle = tokio::spawn(video_stream_receiver_task(
+        connection.clone(),
+        video_decode_tx,
         current_media_key.clone(),
         current_channel_id.clone(),
         screen_video_frames_received.clone(),
@@ -457,7 +375,6 @@ pub async fn connect_to_server(
         tcp_tx.clone(),
         watching_user_id_shared.clone(),
         needs_keyframe,
-        last_pong.clone(),
     ));
 
     // Voice mixer — pops one frame per user per 20ms tick, mixes, and feeds
@@ -476,15 +393,13 @@ pub async fn connect_to_server(
         app_handle.clone(),
     ));
 
-    // UDP keepalive — keeps the NAT mapping alive through silent channels
-    // and doubles as an RTT probe (server echoes the sequence in its Pong).
-    let keepalive_handle = tokio::spawn(udp_keepalive_task(
-        udp_socket,
-        server_addr,
-        session_id,
-        udp_token,
-        last_pong,
-        app_handle.clone(),
+    // Latency display from QUIC's RTT estimate (NAT keepalives are QUIC's job)
+    let latency_handle = tokio::spawn(latency_task(connection.clone(), app_handle.clone()));
+    // Our own uplink's congestion, which viewer reports cannot see
+    let congestion_handle = tokio::spawn(congestion_task(
+        connection,
+        screen_share_active.clone(),
+        share_loss_ms.clone(),
     ));
 
     // Store the active connection
@@ -498,6 +413,7 @@ pub async fn connect_to_server(
         voice_tx,
         video_tx,
         screen_audio_tx,
+        quic,
         tasks: vec![
             writer_handle,
             reader_handle,
@@ -505,9 +421,11 @@ pub async fn connect_to_server(
             video_send_handle,
             screen_audio_send_handle,
             udp_recv_handle,
+            video_recv_handle,
             video_decode_handle,
             mixer_handle,
-            keepalive_handle,
+            latency_handle,
+            congestion_handle,
         ],
         transmitting,
         capture_task: None,
@@ -517,11 +435,12 @@ pub async fn connect_to_server(
         voice_frames_lost,
         output_device_live,
         playback_restart,
-        udp_token,
         is_screen_sharing: false,
         screen_capture_task: None,
         screen_share_active,
         keyframe_requested: Arc::new(AtomicBool::new(false)),
+        share_loss_ms,
+        share_loss_tally,
         watching_user_id: None,
         watching_user_id_shared,
         capture_session: None,
@@ -564,7 +483,7 @@ pub async fn connect_to_server(
     Ok(user_id)
 }
 
-/// Send a client message over the TCP control channel.
+/// Send a client message over the control stream.
 pub async fn send_tcp_message(
     tcp_tx: &mpsc::Sender<Vec<u8>>,
     msg: &ClientMessage,
@@ -602,24 +521,27 @@ fn parse_address(address: &str) -> Result<(String, u16), String> {
     Ok((host, port))
 }
 
-/// TCP writer task: sends encoded messages from the channel to the TCP stream.
-async fn tcp_writer_task(
-    mut write_half: tokio::io::WriteHalf<TlsStream<TcpStream>>,
+/// Control writer task: sends encoded messages from the channel to the control stream.
+async fn control_writer_task<W: AsyncWrite + Unpin>(
+    mut write_half: W,
     mut rx: mpsc::Receiver<Vec<u8>>,
 ) {
     while let Some(data) = rx.recv().await {
         if let Err(e) = write_half.write_all(&data).await {
-            error!("TCP write error: {}", e);
+            error!("control write error: {}", e);
             break;
         }
     }
-    info!("TCP writer task ended");
+    info!("control writer task ended");
 }
 
-/// TCP reader task: reads server messages, handles E2E encryption orchestration,
-/// and emits Tauri events to the frontend.
-async fn tcp_reader_task(
-    mut read_half: tokio::io::ReadHalf<TlsStream<TcpStream>>,
+/// Control reader task: reads server messages, handles E2E encryption
+/// orchestration, and emits Tauri events to the frontend. A dead link shows
+/// up here as a read error: QUIC's idle timeout (30 s without acks) closes
+/// the connection even when the OS never reports anything (roam, sleep).
+#[allow(clippy::too_many_arguments)]
+async fn control_reader_task<R: AsyncRead + Unpin>(
+    mut read_half: R,
     mut buf: BytesMut,
     app_handle: tauri::AppHandle,
     media_key: Arc<std::sync::Mutex<Option<MediaKey>>>,
@@ -629,31 +551,25 @@ async fn tcp_reader_task(
     own_user_id: u32,
     screen_share_active: Arc<AtomicBool>,
     watching_user_id_shared: Arc<AtomicU32>,
+    share_loss_ms: Arc<AtomicU64>,
+    share_loss_tally: Arc<std::sync::Mutex<LossTally>>,
 ) {
     'read: loop {
-        match tokio::time::timeout(TCP_IDLE_TIMEOUT, read_half.read_buf(&mut buf)).await {
-            Ok(Ok(0)) => {
-                info!("server closed TCP connection");
+        match read_half.read_buf(&mut buf).await {
+            Ok(0) => {
+                info!("server closed the control stream");
                 let _ = app_handle.emit(
                     "connection-lost",
                     serde_json::json!({"reason": "Server closed connection"}),
                 );
                 break;
             }
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => {
-                error!("TCP read error: {}", e);
+            Ok(_) => {}
+            Err(e) => {
+                error!("control read error: {}", e);
                 let _ = app_handle.emit(
                     "connection-lost",
-                    serde_json::json!({"reason": format!("Read error: {}", e)}),
-                );
-                break;
-            }
-            Err(_) => {
-                error!("no data from server for {:?}", TCP_IDLE_TIMEOUT);
-                let _ = app_handle.emit(
-                    "connection-lost",
-                    serde_json::json!({"reason": "Connection timed out (no data from server)"}),
+                    serde_json::json!({"reason": format!("Connection lost: {}", e)}),
                 );
                 break;
             }
@@ -673,6 +589,8 @@ async fn tcp_reader_task(
                             own_user_id,
                             &screen_share_active,
                             &watching_user_id_shared,
+                            &share_loss_ms,
+                            &share_loss_tally,
                         )
                         .await;
                     }
@@ -692,12 +610,13 @@ async fn tcp_reader_task(
             }
         }
     }
-    info!("TCP reader task ended");
+    info!("control reader task ended");
 }
 
 /// Dispatch a server message to the appropriate Tauri event.
 /// Also handles E2E encryption orchestration (session establishment, sender key
 /// distribution, and automatic decryption of encrypted messages).
+#[allow(clippy::too_many_arguments)]
 async fn handle_server_message(
     msg: ServerMessage,
     app_handle: &tauri::AppHandle,
@@ -708,8 +627,38 @@ async fn handle_server_message(
     own_user_id: u32,
     screen_share_active: &Arc<AtomicBool>,
     watching_user_id_shared: &Arc<AtomicU32>,
+    share_loss_ms: &Arc<AtomicU64>,
+    share_loss_tally: &Arc<std::sync::Mutex<LossTally>>,
 ) {
     match msg {
+        ServerMessage::VideoLossReported {
+            viewer_user_id,
+            frames_dropped,
+            frames_received,
+        } => {
+            // A viewer lost frames. Only a majority of the current viewers
+            // steps the encoder down (screenshare::FrameProcessor::adapt) — one
+            // viewer on a bad link is that viewer's problem, not the share's.
+            if frames_dropped > 0 {
+                let now = screenshare::epoch_ms();
+                let mut tally = share_loss_tally
+                    .lock()
+                    .unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+                tally.reports.insert(viewer_user_id, now);
+                tally
+                    .reports
+                    .retain(|_, at| now.saturating_sub(*at) < LOSS_REPORT_TTL_MS);
+                let (reporters, viewers) = (tally.reports.len(), tally.viewer_count);
+                drop(tally);
+                if majority_reached(reporters, viewers) {
+                    share_loss_ms.store(now, Ordering::Relaxed);
+                }
+                info!(
+                    viewer_user_id,
+                    frames_dropped, frames_received, reporters, viewers, "viewer reported frame loss"
+                );
+            }
+        }
         ServerMessage::ChannelList { channels } => {
             let _ = app_handle.emit("channel-list", &channels);
         }
@@ -839,10 +788,10 @@ async fn handle_server_message(
             let _ = send_tcp_message(tcp_tx, &ClientMessage::Ping { timestamp }).await;
         }
         ServerMessage::Pong { timestamp: _ } => {
-            // Displayed latency comes from the UDP keepalive RTT instead:
-            // this Pong also answers our echo of the server's keepalive ping,
-            // where the timestamp is the SERVER's clock — computing a "RTT"
-            // from it yielded clock skew, not latency.
+            // Displayed latency comes from QUIC's RTT estimate (latency_task)
+            // instead: this Pong also answers our echo of the server's
+            // keepalive ping, where the timestamp is the SERVER's clock —
+            // computing a "RTT" from it yielded clock skew, not latency.
         }
         ServerMessage::ServerShutdown { reason } => {
             let _ = app_handle.emit(
@@ -1014,6 +963,10 @@ async fn handle_server_message(
             );
         }
         ServerMessage::ViewerCountChanged { viewer_count } => {
+            share_loss_tally
+                .lock()
+                .unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() })
+                .viewer_count = viewer_count;
             let _ = app_handle.emit(
                 "viewer-count-changed",
                 serde_json::json!({"viewer_count": viewer_count}),
@@ -1950,20 +1903,6 @@ fn handle_encrypted_channel_message(
     }
 }
 
-/// UDP sender task: sends voice packets from the channel to the server.
-async fn udp_sender_task(
-    socket: Arc<UdpSocket>,
-    mut rx: mpsc::Receiver<Vec<u8>>,
-    server_addr: std::net::SocketAddr,
-) {
-    while let Some(data) = rx.recv().await {
-        if let Err(e) = socket.send_to(&data, server_addr).await {
-            error!("UDP send error: {}", e);
-        }
-    }
-}
-
-/// UDP receiver task: receives voice and video packets, decrypting if encrypted.
 /// One remote audio stream feeding the mixer: voice per session, or a
 /// screen-share audio stream (keyed with [`SCREEN_AUDIO_FLAG`] set).
 struct MixSource {
@@ -1992,65 +1931,6 @@ const SCREEN_AUDIO_FLAG: u32 = 0x8000_0000;
 const SOURCE_IDLE_PRUNE: std::time::Duration = std::time::Duration::from_secs(60);
 
 type MixSources = Arc<std::sync::Mutex<HashMap<u32, MixSource>>>;
-
-/// Milliseconds since the Unix epoch, truncated to u32 — used as the ping
-/// sequence so the server's Pong echo yields a real UDP RTT.
-fn now_millis_u32() -> u32 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u32
-}
-
-/// Milliseconds since the Unix epoch as u64 (for the UDP-dead watchdog).
-fn now_millis_u64() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
-}
-
-/// No Pong for this long (3 missed 10s keepalives + margin) = UDP path dead.
-const UDP_DEAD_AFTER_MS: u64 = 35_000;
-
-/// Periodic UDP ping: keeps the NAT mapping alive through silent channels
-/// (mappings commonly expire after ~30s) and measures media-path RTT.
-/// Doubles as a dead-UDP watchdog: if Pongs stop while TCP stays up, the
-/// user is silently mute/deaf — emit `udp-dead` / `udp-restored` so the UI
-/// can say so.
-async fn udp_keepalive_task(
-    socket: Arc<UdpSocket>,
-    server_addr: std::net::SocketAddr,
-    session_id: u32,
-    udp_token: u64,
-    last_pong: Arc<AtomicU64>,
-    app_handle: tauri::AppHandle,
-) {
-    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    // Baseline for the watchdog before the first Pong arrives
-    let started = now_millis_u64();
-    let mut udp_dead = false;
-    loop {
-        interval.tick().await;
-        let ping = VoicePacket::ping(session_id, udp_token, now_millis_u32());
-        if let Err(e) = socket.send_to(&ping.to_bytes(), server_addr).await {
-            warn!("UDP keepalive send failed: {}", e);
-        }
-
-        let last = last_pong.load(Ordering::Relaxed).max(started);
-        let stale = now_millis_u64().saturating_sub(last) > UDP_DEAD_AFTER_MS;
-        if stale && !udp_dead {
-            udp_dead = true;
-            warn!("no UDP Pong for {}ms — media path considered dead", UDP_DEAD_AFTER_MS);
-            let _ = app_handle.emit("udp-dead", ());
-        } else if !stale && udp_dead {
-            udp_dead = false;
-            info!("UDP Pongs resumed — media path restored");
-            let _ = app_handle.emit("udp-restored", ());
-        }
-    }
-}
 
 /// Clocked voice mixer: every 20ms, pop one frame per active source, decode
 /// (FEC/PLC on loss), sum with per-user and master gain, and push the mixed
@@ -2219,32 +2099,194 @@ async fn voice_mixer_task(
     }
 }
 
-async fn udp_receiver_task(
-    socket: Arc<UdpSocket>,
-    server_addr: std::net::SocketAddr,
+/// Voice / screen-audio packets → QUIC datagrams (unreliable and unordered,
+/// like the UDP they replace).
+async fn datagram_sender_task(connection: Connection, mut rx: mpsc::Receiver<Vec<u8>>) {
+    let mut warned_oversize = false;
+    while let Some(data) = rx.recv().await {
+        match connection.send_datagram(data) {
+            Ok(()) => {}
+            Err(SendDatagramError::TooLarge) => {
+                if !warned_oversize {
+                    warned_oversize = true;
+                    warn!(
+                        "media packet exceeds the datagram limit ({:?}) — dropped",
+                        connection.max_datagram_size()
+                    );
+                }
+            }
+            Err(SendDatagramError::UnsupportedByPeer) => {
+                error!("server does not accept datagrams — media disabled");
+                return;
+            }
+            Err(SendDatagramError::NotConnected) => return,
+        }
+    }
+}
+
+/// Video fragments → one unidirectional stream per frame, each fragment
+/// prefixed with its u16-BE length (fragments exceed the datagram MTU).
+/// Mirror of the server's stream writer.
+async fn video_stream_sender_task(connection: Connection, mut rx: mpsc::Receiver<Vec<u8>>) {
+    let mut grouper = FrameGrouper::default();
+    let mut stream: Option<SendStream> = None;
+    while let Some(packet) = rx.recv().await {
+        let Some(place) = grouper.place(&packet) else {
+            continue;
+        };
+        if place.new_frame {
+            finish_frame(stream.take()).await;
+            stream = match connection.open_uni().await {
+                Ok(opening) => match opening.await {
+                    Ok(stream) => Some(stream),
+                    Err(e) => {
+                        warn!("video stream refused: {}", e);
+                        None
+                    }
+                },
+                Err(e) => {
+                    info!("video stream open ended: {}", e);
+                    return;
+                }
+            };
+        }
+        // No stream: the frame's opening failed or an earlier write did;
+        // drop the rest of this frame, viewers request a keyframe.
+        let Some(current) = stream.as_mut() else {
+            continue;
+        };
+        let len = (packet.len() as u16).to_be_bytes();
+        if current.write_all(&len).await.is_err() || current.write_all(&packet).await.is_err() {
+            stream = None;
+            continue;
+        }
+        if place.last {
+            finish_frame(stream.take()).await;
+        }
+    }
+}
+
+/// FIN a frame stream without waiting for the peer's ack (`shutdown` is
+/// quinn's synchronous finish; wtransport's `finish` would cost one RTT per frame).
+async fn finish_frame(stream: Option<SendStream>) {
+    if let Some(mut stream) = stream {
+        let _ = stream.shutdown().await;
+    }
+}
+
+/// A viewer's loss report counts for this long; older ones are pruned before
+/// the majority is counted (viewers report every 2 s).
+const LOSS_REPORT_TTL_MS: u64 = 2_000;
+
+/// Whether enough of the current viewers report loss to step the share down.
+/// With no viewer count yet (nothing received), a single report is enough.
+fn majority_reached(reporters: usize, viewers: u32) -> bool {
+    reporters as u32 >= ((viewers + 1) / 2).max(1)
+}
+
+/// One second of this connection's QUIC path statistics.
+#[derive(Clone, Copy, Default)]
+struct PathSample {
+    rtt: std::time::Duration,
+    lost_packets: u64,
+    sent_packets: u64,
+}
+
+/// Whether our own uplink looks congested between two samples: real packet loss,
+/// or an RTT well above the session's minimum (a queue building somewhere on the
+/// path). cwnd is deliberately not used — quinn's is app-limited most of the
+/// time, so it stays small and would read as congestion whenever we send little.
+/// ponytail: a fixed 1% loss floor rather than a loss estimator; if shares still
+/// step down on healthy links, switch to ECN (`PathStats::congestion_events`).
+fn congested(prev: &PathSample, cur: &PathSample, min_rtt: std::time::Duration) -> bool {
+    let lost = cur.lost_packets.saturating_sub(prev.lost_packets);
+    let sent = cur.sent_packets.saturating_sub(prev.sent_packets);
+    if lost > 0 && lost * 100 >= sent {
+        return true;
+    }
+    cur.rtt > (min_rtt * 2).max(min_rtt + std::time::Duration::from_millis(100))
+}
+
+/// Watches our own path stats while sharing: congestion on the way *to* the
+/// server never reaches the viewers' loss reports, it only shows up once the
+/// send queue is already a second deep. A hit here feeds the same `share_loss_ms`
+/// the encoder's ladder reads.
+async fn congestion_task(
+    connection: Connection,
+    screen_share_active: Arc<AtomicBool>,
+    share_loss_ms: Arc<AtomicU64>,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(1));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut prev = PathSample::default();
+    let mut min_rtt = std::time::Duration::MAX;
+    let mut reported = false;
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let path = connection.quic_connection().stats().path;
+                let cur = PathSample {
+                    rtt: path.rtt,
+                    lost_packets: path.lost_packets,
+                    sent_packets: path.sent_packets,
+                };
+                min_rtt = min_rtt.min(cur.rtt);
+                if !screen_share_active.load(Ordering::Relaxed) {
+                    prev = cur;
+                    reported = false;
+                    continue;
+                }
+                if congested(&prev, &cur, min_rtt) {
+                    share_loss_ms.store(screenshare::epoch_ms(), Ordering::Relaxed);
+                    if !reported {
+                        reported = true;
+                        info!(
+                            rtt_ms = cur.rtt.as_millis() as u64,
+                            min_rtt_ms = min_rtt.as_millis() as u64,
+                            lost = cur.lost_packets.saturating_sub(prev.lost_packets),
+                            sent = cur.sent_packets.saturating_sub(prev.sent_packets),
+                            "own uplink congested — stepping the share down"
+                        );
+                    }
+                } else if reported {
+                    reported = false;
+                    info!("own uplink recovered");
+                }
+                prev = cur;
+            }
+            _ = connection.closed() => return,
+        }
+    }
+}
+
+/// Latency for the status bar from QUIC's own RTT estimate, every 10 s.
+async fn latency_task(connection: Connection, app_handle: tauri::AppHandle) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let ms = connection.rtt().as_millis() as u64;
+                let _ = app_handle.emit("latency-update", serde_json::json!({"ms": ms}));
+            }
+            _ = connection.closed() => return,
+        }
+    }
+}
+
+/// Server → client datagrams: voice (0x05), end-of-transmission (0x02) and
+/// screen-share audio (0x15), decrypted and fed to the mixer's per-source
+/// jitter buffers; also drives the speaking indicator. Video arrives on
+/// streams (`video_stream_receiver_task`).
+async fn datagram_receiver_task(
+    connection: Connection,
     app_handle: tauri::AppHandle,
-    _own_session_id: SessionId,
     sources: MixSources,
-    video_decode_tx: mpsc::Sender<(Vec<u8>, bool)>,
     screen_audio_recv_count: Arc<AtomicU32>,
     media_key: Arc<std::sync::Mutex<Option<MediaKey>>>,
     channel_id: Arc<AtomicU32>,
-    screen_video_frames_received: Arc<AtomicU32>,
-    screen_video_frames_dropped: Arc<AtomicU32>,
-    screen_video_bytes_received: Arc<AtomicU64>,
-    tcp_tx: mpsc::Sender<Vec<u8>>,
-    watching_user_id: Arc<AtomicU32>,
-    needs_keyframe: Arc<AtomicBool>,
-    last_pong: Arc<AtomicU64>,
 ) {
-    let mut video_assembler = FrameAssembler::new();
-    let mut current_video_session: Option<u32> = None;
-    let mut buf = vec![0u8; 2048];
-    let mut last_keyframe_request = std::time::Instant::now() - std::time::Duration::from_secs(10);
-
     let mut recv_count: u64 = 0;
-    let mut recv_errors: u32 = 0;
-    let mut foreign_src_logged = false;
     // Track last voice packet time per user for speaking timeout
     let mut last_voice_time: HashMap<u32, std::time::Instant> = HashMap::new();
     let mut speaking_timeout = tokio::time::interval(std::time::Duration::from_millis(300));
@@ -2253,32 +2295,24 @@ async fn udp_receiver_task(
 
     loop {
         tokio::select! {
-            result = socket.recv_from(&mut buf) => {
-        match result {
-            Ok((n, src_addr)) => {
-                recv_errors = 0;
-                // The socket is unconnected: anyone who learns our endpoint
-                // (LAN, full-cone NAT) could otherwise inject packets or
-                // spoof Pongs. Only the server is a valid source.
-                if src_addr != server_addr {
-                    if !foreign_src_logged {
-                        foreign_src_logged = true;
-                        warn!("ignoring UDP from {} (server is {})", src_addr, server_addr);
+            result = connection.receive_datagram() => {
+                let datagram = match result {
+                    Ok(datagram) => datagram,
+                    Err(e) => {
+                        info!("datagram receive ended: {}", e);
+                        break;
                     }
-                    continue;
-                }
+                };
+                let buf: &[u8] = &datagram;
+                let n = buf.len();
                 if n == 0 {
                     continue;
                 }
                 recv_count += 1;
                 let packet_type = buf[0];
 
-                // Log first packet to confirm UDP reception is working
                 if recv_count == 1 {
-                    info!(
-                        "UDP recv established: type=0x{:02x} len={} from={}",
-                        packet_type, n, src_addr
-                    );
+                    info!("media path established: first datagram type=0x{:02x} len={}", packet_type, n);
                 }
 
                 match packet_type {
@@ -2293,10 +2327,9 @@ async fn udp_receiver_task(
                         let session_id =
                             u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
                         let sequence =
-                            u32::from_be_bytes([buf[13], buf[14], buf[15], buf[16]]);
+                            u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]);
 
-                        // Decrypt if encrypted, otherwise use raw data
-                        let opus_data: Vec<u8> = if packet_type == 0x05 {
+                        let opus_data: Vec<u8> = {
                             let raw_encrypted = &buf[header_size..n];
                             let key_guard = media_key.lock().unwrap_or_else(|poisoned| {
                                 warn!("media key mutex poisoned — recovering");
@@ -2327,8 +2360,6 @@ async fn udp_receiver_task(
                                 warn!("Received encrypted voice but no media key available");
                                 continue;
                             }
-                        } else {
-                            continue;
                         };
 
                         // Enqueue into the per-user jitter buffer; the mixer
@@ -2390,112 +2421,12 @@ async fn udp_receiver_task(
                             serde_json::json!({"user_id": session_id, "speaking": false}),
                         );
                     }
-                    // Voice: Ping from server — reply with a Pong
-                    0x03 => {
-                        buf[0] = 0x04;
-                        let _ = socket.send_to(&buf[..n], src_addr).await;
-                    }
-                    // Voice: Pong — echo of our keepalive ping; the sequence
-                    // field carries our send time, so this is real UDP RTT
-                    0x04 => {
-                        if n >= voipc_protocol::voice::VOICE_HEADER_SIZE {
-                            last_pong.store(now_millis_u64(), Ordering::Relaxed);
-                            let sent =
-                                u32::from_be_bytes([buf[13], buf[14], buf[15], buf[16]]);
-                            let rtt = now_millis_u32().wrapping_sub(sent);
-                            // Guard against clock weirdness producing huge values
-                            if rtt < 60_000 {
-                                let _ = app_handle.emit(
-                                    "latency-update",
-                                    serde_json::json!({"ms": rtt}),
-                                );
-                            }
-                        }
-                    }
-                    // Video: VideoFragment / VideoKeyframeFragment (unencrypted + encrypted)
-                    0x13 | 0x14 => {
-                        if n < VIDEO_HEADER_SIZE {
-                            continue;
-                        }
-                        let mut packet = match VideoPacket::from_bytes(&buf[..n]) {
-                            Ok(p) => p,
-                            Err(_) => continue,
-                        };
-
-                        screen_video_bytes_received.fetch_add(n as u64, Ordering::Relaxed);
-
-                        // Decrypt encrypted video fragments
-                        if packet.packet_type.is_encrypted() {
-                            let key_guard = media_key.lock().unwrap_or_else(|poisoned| {
-                                warn!("media key mutex poisoned — recovering");
-                                poisoned.into_inner()
-                            });
-                            let key_opt = key_guard.as_ref();
-                            if let Some(key) = key_opt {
-                                let ch_id = channel_id.load(Ordering::Relaxed);
-                                let aad = voipc_crypto::build_aad(ch_id, packet_type);
-                                match voipc_crypto::media_decrypt(
-                                    key,
-                                    packet.session_id,
-                                    packet.frame_id,
-                                    packet.fragment_index as u32,
-                                    &aad,
-                                    &packet.payload,
-                                ) {
-                                    Ok(decrypted) => packet.payload = decrypted,
-                                    Err(e) => {
-                                        warn!("Video decryption failed: {}", e);
-                                        continue;
-                                    }
-                                }
-                            } else {
-                                warn!("Received encrypted video but no media key");
-                                continue;
-                            }
-                        }
-
-                        // Detect sharer change — reset assembler (the old
-                        // sharer's audio source just goes idle and is pruned)
-                        if current_video_session != Some(packet.session_id) {
-                            video_assembler.reset();
-                            current_video_session = Some(packet.session_id);
-                        }
-
-                        let result = video_assembler.add_fragment(&packet);
-
-                        // Incomplete frame was dropped — signal render suppression
-                        // and request keyframe to recover
-                        if result.frame_dropped {
-                            screen_video_frames_dropped.fetch_add(1, Ordering::Relaxed);
-                            needs_keyframe.store(true, Ordering::Release);
-                            if last_keyframe_request.elapsed() >= std::time::Duration::from_secs(1) {
-                                let sharer_id = watching_user_id.load(Ordering::Relaxed);
-                                if sharer_id != 0 {
-                                    let msg = ClientMessage::RequestKeyframe { sharer_user_id: sharer_id };
-                                    if let Ok(data) = encode_client_msg(&msg) {
-                                        let _ = tcp_tx.try_send(data);
-                                        info!("auto-requested keyframe (frame loss detected)");
-                                    }
-                                    last_keyframe_request = std::time::Instant::now();
-                                }
-                            }
-                        }
-
-                        if let Some((frame_data, is_keyframe)) = result.frame {
-                            screen_video_frames_received.fetch_add(1, Ordering::Relaxed);
-                            // Send to decode task — drop if full to avoid stalling voice
-                            if video_decode_tx.try_send((frame_data, is_keyframe)).is_err() {
-                                screen_video_frames_dropped.fetch_add(1, Ordering::Relaxed);
-                                warn!("video decode channel full — dropping assembled frame");
-                            }
-                        }
-                    }
                     // Screen share audio (encrypted only)
                     0x15 => {
                         if n < SCREEN_AUDIO_HEADER_SIZE {
                             continue;
                         }
-                        let packet = match ScreenShareAudioPacket::from_bytes(&buf[..n]) {
+                        let packet = match ScreenShareAudioPacket::from_bytes(buf) {
                             Ok(p) => p,
                             Err(_) => continue,
                         };
@@ -2561,18 +2492,6 @@ async fn udp_receiver_task(
                     _ => {}
                 }
             }
-            Err(e) => {
-                // Not fatal: on Windows an ICMP unreachable for any earlier
-                // send surfaces here as WSAECONNRESET; leaving would kill
-                // voice for the rest of the session while TCP stays up.
-                recv_errors += 1;
-                error!("UDP recv error ({}): {}", recv_errors, e);
-                if recv_errors >= 10 {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                }
-            }
-        }
-            }
             // Periodically check for users who stopped sending voice (VAD mode timeout)
             _ = speaking_timeout.tick() => {
                 let now = std::time::Instant::now();
@@ -2592,8 +2511,228 @@ async fn udp_receiver_task(
     }
 }
 
+/// Largest per-frame video stream we accept (a 1080p keyframe is well under 1 MiB).
+const MAX_FRAME_STREAM_BYTES: u64 = 8 * 1024 * 1024;
+/// Viewer loss reports to the sharer cover this window.
+const LOSS_REPORT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Server → client video: each unidirectional stream is one frame as
+/// `[u16 BE len][packet]` records, fed to the assembler as they arrive (waiting
+/// for the frame's FIN would add its whole transmission time to the latency).
+/// Decrypts, reassembles, hands complete frames to the decode task, requests a
+/// keyframe on loss and reports the loss to the sharer every 2 s so it can
+/// lower its bitrate/fps.
+#[allow(clippy::too_many_arguments)]
+async fn video_stream_receiver_task(
+    connection: Connection,
+    video_decode_tx: mpsc::Sender<(Vec<u8>, bool)>,
+    media_key: Arc<std::sync::Mutex<Option<MediaKey>>>,
+    channel_id: Arc<AtomicU32>,
+    screen_video_frames_received: Arc<AtomicU32>,
+    screen_video_frames_dropped: Arc<AtomicU32>,
+    screen_video_bytes_received: Arc<AtomicU64>,
+    tcp_tx: mpsc::Sender<Vec<u8>>,
+    watching_user_id: Arc<AtomicU32>,
+    needs_keyframe: Arc<AtomicBool>,
+) {
+    let mut video_assembler = FrameAssembler::new();
+    let mut current_video_session: Option<u32> = None;
+    let mut last_keyframe_request = std::time::Instant::now() - std::time::Duration::from_secs(10);
+    let mut window_started = std::time::Instant::now();
+    let mut window_dropped: u32 = 0;
+    let mut window_received: u32 = 0;
+    let mut chunk = vec![0u8; 16 * 1024];
+
+    loop {
+        let mut stream = match connection.accept_uni().await {
+            Ok(stream) => stream,
+            Err(e) => {
+                info!("video stream accept ended: {}", e);
+                return;
+            }
+        };
+        // Frames are read one after another so fragments reach the assembler in order.
+        let mut reader = RecordReader::default();
+        let mut total: u64 = 0;
+
+        loop {
+            // Err = reset by the server: the frame is lost, the assembler sees the gap
+            let read = match stream.read(&mut chunk).await {
+                Ok(Some(n)) => n,
+                Ok(None) | Err(_) => break,
+            };
+            total += read as u64;
+            if total > MAX_FRAME_STREAM_BYTES {
+                break;
+            }
+
+            for packet_bytes in reader.push(&chunk[..read]) {
+                let n = packet_bytes.len();
+                if n < VIDEO_HEADER_SIZE {
+                    continue;
+                }
+                let packet_type = packet_bytes[0];
+                if packet_type != 0x13 && packet_type != 0x14 {
+                    continue;
+                }
+                let mut packet = match VideoPacket::from_bytes(&packet_bytes) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+
+                screen_video_bytes_received.fetch_add(n as u64, Ordering::Relaxed);
+
+                // Decrypt (plaintext video is never relayed)
+                {
+                    let key_guard = media_key.lock().unwrap_or_else(|poisoned| {
+                        warn!("media key mutex poisoned — recovering");
+                        poisoned.into_inner()
+                    });
+                    let key_opt = key_guard.as_ref();
+                    if let Some(key) = key_opt {
+                        let ch_id = channel_id.load(Ordering::Relaxed);
+                        let aad = voipc_crypto::build_aad(ch_id, packet_type);
+                        match voipc_crypto::media_decrypt(
+                            key,
+                            packet.session_id,
+                            packet.frame_id,
+                            packet.fragment_index as u32,
+                            &aad,
+                            &packet.payload,
+                        ) {
+                            Ok(decrypted) => packet.payload = decrypted,
+                            Err(e) => {
+                                warn!("Video decryption failed: {}", e);
+                                continue;
+                            }
+                        }
+                    } else {
+                        warn!("Received encrypted video but no media key");
+                        continue;
+                    }
+                }
+
+                // Detect sharer change — reset assembler (the old
+                // sharer's audio source just goes idle and is pruned)
+                if current_video_session != Some(packet.session_id) {
+                    video_assembler.reset();
+                    current_video_session = Some(packet.session_id);
+                }
+
+                let result = video_assembler.add_fragment(&packet);
+
+                // Incomplete frame was dropped — signal render suppression
+                // and request keyframe to recover
+                if result.frame_dropped {
+                    screen_video_frames_dropped.fetch_add(1, Ordering::Relaxed);
+                    window_dropped += 1;
+                    needs_keyframe.store(true, Ordering::Release);
+                    if last_keyframe_request.elapsed() >= std::time::Duration::from_secs(1) {
+                        let sharer_id = watching_user_id.load(Ordering::Relaxed);
+                        if sharer_id != 0 {
+                            let msg = ClientMessage::RequestKeyframe { sharer_user_id: sharer_id };
+                            if let Ok(data) = encode_client_msg(&msg) {
+                                let _ = tcp_tx.try_send(data);
+                                info!("auto-requested keyframe (frame loss detected)");
+                            }
+                            last_keyframe_request = std::time::Instant::now();
+                        }
+                    }
+                }
+
+                if let Some((frame_data, is_keyframe)) = result.frame {
+                    screen_video_frames_received.fetch_add(1, Ordering::Relaxed);
+                    window_received += 1;
+                    // Send to decode task — drop if full to avoid stalling voice
+                    if video_decode_tx.try_send((frame_data, is_keyframe)).is_err() {
+                        screen_video_frames_dropped.fetch_add(1, Ordering::Relaxed);
+                        window_dropped += 1;
+                        warn!("video decode channel full — dropping assembled frame");
+                    }
+                }
+            }
+            if reader.is_broken() {
+                break;
+            }
+        }
+
+        // Loss report: tell the sharer what this window lost so it can adapt
+        if window_started.elapsed() >= LOSS_REPORT_WINDOW {
+            let sharer_id = watching_user_id.load(Ordering::Relaxed);
+            if window_dropped > 0 && sharer_id != 0 {
+                let msg = ClientMessage::VideoLossReport {
+                    sharer_user_id: sharer_id,
+                    frames_dropped: window_dropped,
+                    frames_received: window_received,
+                };
+                if let Ok(data) = encode_client_msg(&msg) {
+                    let _ = tcp_tx.try_send(data);
+                }
+                info!(
+                    dropped = window_dropped,
+                    received = window_received,
+                    "reported frame loss to the sharer"
+                );
+            }
+            window_started = std::time::Instant::now();
+            window_dropped = 0;
+            window_received = 0;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    fn sample(rtt_ms: u64, lost: u64, sent: u64) -> PathSample {
+        PathSample {
+            rtt: Duration::from_millis(rtt_ms),
+            lost_packets: lost,
+            sent_packets: sent,
+        }
+    }
+
+    #[test]
+    fn congestion_needs_real_loss_or_a_growing_queue() {
+        let min_rtt = Duration::from_millis(20);
+        let prev = sample(20, 0, 1_000);
+
+        // A quiet second: no loss, RTT at the session minimum
+        assert!(!congested(&prev, &sample(20, 0, 1_500), min_rtt));
+        // One lost packet in 500 is normal wireless noise, not congestion
+        assert!(!congested(&prev, &sample(20, 1, 1_500), min_rtt));
+        // 1% of the window lost
+        assert!(congested(&prev, &sample(20, 5, 1_500), min_rtt));
+        // RTT doubled (the 2× branch, which decides while min_rtt is large)
+        assert!(congested(&prev, &sample(200, 0, 1_500), min_rtt));
+        // Doubling a tiny min_rtt is not enough on its own: +100 ms is the floor
+        assert!(!congested(&prev, &sample(50, 0, 1_500), min_rtt));
+        assert!(congested(&prev, &sample(150, 0, 1_500), min_rtt));
+        // On a link whose minimum is already high, doubling is the wider bound,
+        // so +100 ms of jitter is not yet congestion
+        let far = Duration::from_millis(300);
+        assert!(!congested(&prev, &sample(450, 0, 1_500), far));
+        assert!(congested(&prev, &sample(700, 0, 1_500), far));
+    }
+
+    #[test]
+    fn majority_of_viewers_steps_the_share_down() {
+        assert!(majority_reached(1, 1)); // the only viewer
+        assert!(majority_reached(1, 2)); // half of two is a majority here
+        assert!(!majority_reached(1, 3)); // one of three is not
+        assert!(majority_reached(2, 3));
+        assert!(!majority_reached(2, 5));
+        assert!(majority_reached(3, 5));
+        // No viewer count seen yet: trust the report we did get
+        assert!(majority_reached(1, 0));
+        assert!(!majority_reached(0, 0));
+    }
+}
+
 /// Video decode + render task: runs on a blocking thread to avoid stalling
-/// the UDP receiver. Decodes ALL H.265 frames to maintain codec state, but only
+/// the media receivers. Decodes ALL H.265 frames to maintain codec state, but only
 /// JPEG-encodes and emits the most recent frame (frame skipping).
 ///
 /// **Render suppression:** When UDP packet loss breaks the H.265 reference chain,
@@ -2700,13 +2839,13 @@ fn video_decode_render_task(
 }
 
 /// Capture+encode task: reads from mic, encodes to Opus, encrypts with
-/// AES-256-GCM if a media key is available, then sends via UDP.
+/// AES-256-GCM if a media key is available, then sends as datagrams.
 /// Runs on a blocking thread since it polls the ring buffer.
 #[allow(unused_assignments)] // capture_stream is a hold-to-keep-alive handle
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_capture_encode_task(
     device_name: Option<String>,
     session_id: u32,
-    udp_token: u64,
     transmitting: Arc<AtomicBool>,
     voice_tx: mpsc::Sender<Vec<u8>>,
     media_key: Arc<std::sync::Mutex<Option<MediaKey>>>,
@@ -2869,7 +3008,6 @@ pub fn spawn_capture_encode_task(
                             ) {
                                 Ok(encrypted) => VoicePacket::encrypted_voice(
                                     session_id,
-                                    udp_token,
                                     sequence,
                                     key.key_id,
                                     encrypted,
@@ -2918,155 +3056,3 @@ pub fn spawn_capture_encode_task(
     })
 }
 
-/// TOFU (Trust On First Use) certificate pinning store.
-/// Maps server hostname to SHA-256 fingerprint of the server's certificate.
-/// On first connect, the cert is trusted and stored. On subsequent connects,
-/// the cert must match the stored fingerprint or the connection is rejected.
-/// Persisted to `tofu_pins.json` in the VoIPC data directory.
-static TOFU_STORE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<u8>>>> =
-    std::sync::LazyLock::new(|| std::sync::Mutex::new(tofu_load_from_disk()));
-
-/// Load TOFU pins from disk. Returns empty map on any error.
-fn tofu_load_from_disk() -> HashMap<String, Vec<u8>> {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let path = crate::config::data_dir().join("tofu_pins.json");
-    let Ok(data) = std::fs::read_to_string(&path) else {
-        return HashMap::new();
-    };
-    // Stored as { "host": "base64-encoded-fingerprint", ... }
-    let Ok(map): Result<HashMap<String, String>, _> = serde_json::from_str(&data) else {
-        return HashMap::new();
-    };
-    map.into_iter()
-        .filter_map(|(k, v)| STANDARD.decode(&v).ok().map(|bytes| (k, bytes)))
-        .collect()
-}
-
-/// Save TOFU pins to disk. Errors are logged but non-fatal.
-fn tofu_save_to_disk(store: &HashMap<String, Vec<u8>>) {
-    use base64::{engine::general_purpose::STANDARD, Engine};
-    let path = crate::config::data_dir().join("tofu_pins.json");
-    let b64_map: HashMap<&str, String> = store
-        .iter()
-        .map(|(k, v)| (k.as_str(), STANDARD.encode(v)))
-        .collect();
-    match serde_json::to_string_pretty(&b64_map) {
-        Ok(json) => {
-            if let Err(e) = std::fs::write(&path, json) {
-                warn!("Failed to save TOFU pins: {}", e);
-            }
-        }
-        Err(e) => warn!("Failed to serialize TOFU pins: {}", e),
-    }
-}
-
-/// Pin store key: `host:port`, lowercase. Per port, so two self-signed
-/// servers on one box do not read as a MITM of each other.
-fn tofu_key(host: &str, port: u16) -> String {
-    format!("{}:{}", host.to_lowercase(), port)
-}
-
-/// Forget the pinned certificate for a server (after a legitimate cert
-/// rotation). The next connect pins the new certificate.
-pub fn tofu_forget(host: &str, port: u16) -> bool {
-    let mut store = TOFU_STORE.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
-    let removed = store.remove(&tofu_key(host, port)).is_some();
-    if removed {
-        tofu_save_to_disk(&store);
-    }
-    removed
-}
-
-/// Certificate verifier that accepts self-signed certs with TOFU pinning.
-/// First connection to a host:port: accept and pin the certificate fingerprint.
-/// Subsequent connections: reject if the certificate fingerprint changes.
-#[derive(Debug)]
-struct TofuCertVerifier {
-    key: String,
-}
-
-impl rustls::client::danger::ServerCertVerifier for TofuCertVerifier {
-    fn verify_server_cert(
-        &self,
-        end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        // Compute SHA-256 fingerprint of the server's certificate
-        use ring::digest;
-        let fingerprint = digest::digest(&digest::SHA256, end_entity.as_ref());
-        let fp_bytes = fingerprint.as_ref().to_vec();
-        let host_key = &self.key;
-
-        let mut store = TOFU_STORE.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
-
-        if let Some(pinned) = store.get(host_key) {
-            // We've connected to this host before — verify the fingerprint matches
-            if *pinned != fp_bytes {
-                warn!(
-                    "TOFU: certificate fingerprint changed for {}! Possible MITM attack.",
-                    host_key
-                );
-                return Err(rustls::Error::General(format!(
-                    "Server certificate fingerprint changed for {}. \
-                     This could indicate a man-in-the-middle attack. \
-                     Only if you know the server's certificate was replaced, \
-                     use \"Forget pinned certificate\" and connect again.",
-                    host_key
-                )));
-            }
-            info!("TOFU: certificate fingerprint matches for {}", host_key);
-        } else {
-            // First connection — pin the certificate and persist to disk
-            info!("TOFU: pinning certificate for {} (first connection)", host_key);
-            store.insert(host_key.clone(), fp_bytes);
-            tofu_save_to_disk(&store);
-        }
-
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls12_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &rustls::pki_types::CertificateDer<'_>,
-        dss: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        rustls::crypto::verify_tls13_signature(
-            message,
-            cert,
-            dss,
-            &rustls::crypto::ring::default_provider().signature_verification_algorithms,
-        )
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        vec![
-            rustls::SignatureScheme::RSA_PKCS1_SHA256,
-            rustls::SignatureScheme::RSA_PKCS1_SHA384,
-            rustls::SignatureScheme::RSA_PKCS1_SHA512,
-            rustls::SignatureScheme::RSA_PSS_SHA256,
-            rustls::SignatureScheme::RSA_PSS_SHA384,
-            rustls::SignatureScheme::RSA_PSS_SHA512,
-            rustls::SignatureScheme::ECDSA_NISTP256_SHA256,
-            rustls::SignatureScheme::ECDSA_NISTP384_SHA384,
-            rustls::SignatureScheme::ED25519,
-        ]
-    }
-}

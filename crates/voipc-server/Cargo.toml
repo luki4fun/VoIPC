@@ -30,7 +30,8 @@ subtle = "2"
 sha2 = "0.10"
 
 # Web client: HTTP/2-only static page (no http1 feature, on purpose) and the
-# WebTransport bridge. wtransport stays on ring so the musl build is static.
+# QUIC/WebTransport endpoint all clients use. wtransport stays on ring so the
+# musl build is static.
 hyper = { version = "1", features = ["http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
@@ -39,5 +40,6 @@ rust-embed = { version = "8", features = ["debug-embed", "mime-guess"] }
 hex = "0.4"
 
 [dev-dependencies]
-# For the voice_load example (Opus encoding of the test tone)
+# For the voice_load example (Opus encoding + media encryption of the test tone)
 voipc-audio = { workspace = true }
+voipc-crypto = { workspace = true }

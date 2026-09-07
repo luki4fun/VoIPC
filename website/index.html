@@ -237,7 +237,7 @@
 <section id="top">
   <div class="container hero-grid">
     <div>
-      <p class="hero-meta"><a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">v0.4.0</a> · MIT · Linux / Windows / Android / Browser</p>
+      <p class="hero-meta"><a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">v0.5.0</a> · MIT · Linux / Windows / Android / Browser</p>
       <h1>Voice, screen sharing, and chat — on a server you run.</h1>
       <p class="hero-sub">VoIPC is an open-source alternative to Discord and TeamSpeak. Messages are encrypted with the Signal Protocol, voice and video with AES-256-GCM, and the relay server keeps nothing: no accounts, no database, no logs.</p>
       <div class="hero-buttons">
@@ -303,9 +303,9 @@
       <ul>
         <li>Voice quality indicator: live ping and packet-loss in the status bar</li>
         <li>Audio device hot-recovery when a headset dies mid-call</li>
-        <li>NAT rebind and UDP keepalive — voice survives router timeouts</li>
-        <li>Auto-reconnect keeps trying for 5 minutes across Wi-Fi roams</li>
-        <li>Dead-UDP detection tells you when a firewall eats your voice</li>
+        <li>One QUIC connection per client — migration survives NAT rebinds and Wi-Fi roams</li>
+        <li>Auto-reconnect keeps trying for 5 minutes after sleep or a server restart</li>
+        <li>Screen share adapts bitrate and fps to what the link can carry</li>
         <li>Android client: voice and screen-share viewing on the go</li>
         <li>Invite links that open the browser client straight into a channel</li>
         <li>Admin sessions via a server token: kick and IP-ban, no accounts needed</li>
@@ -337,7 +337,7 @@
           <dt>Codec</dt><dd>H.265/HEVC via FFmpeg</dd>
           <dt>Encoders</dt><dd>NVENC → QuickSync → AMF → libx265</dd>
           <dt>Modes</dt><dd>480p/720p/1080p · 30/60 fps · 1.5–7.5 Mbps</dd>
-          <dt>Keyframes</dt><dd>2 s GOP, VBV-capped under the UDP ceiling</dd>
+          <dt>Keyframes</dt><dd>2 s GOP, VBV-capped; bitrate steps down on viewer loss</dd>
           <dt>Capture</dt><dd>PipeWire + XDG portal · Windows.Graphics.Capture</dd>
           <dt>Decode</dt><dd>FFmpeg desktop · AMediaCodec on Android</dd>
         </dl>
@@ -345,12 +345,12 @@
       <div class="spec-card">
         <h3>Protocol</h3>
         <dl>
-          <dt>Version</dt><dd>v3, postcard binary serialization</dd>
-          <dt>Control</dt><dd>TCP + TLS 1.2+ (rustls), max 64 KiB/msg</dd>
-          <dt>Media</dt><dd>UDP: voice ≤ 512 B, video ≤ 1280 B</dd>
-          <dt>Headers</dt><dd>17 B voice · 23 B video</dd>
-          <dt>Port</dt><dd>9987 TCP + UDP (configurable)</dd>
-          <dt>Network</dt><dd>IPv6 dual-stack, NAT rebind, keepalive</dd>
+          <dt>Version</dt><dd>v5, postcard binary serialization</dd>
+          <dt>Control</dt><dd>QUIC stream, TLS 1.3 (rustls), max 64 KiB/msg</dd>
+          <dt>Media</dt><dd>QUIC datagrams (voice ≤ 512 B), one stream per video frame</dd>
+          <dt>Headers</dt><dd>9 B voice · 15 B video</dd>
+          <dt>Port</dt><dd>9987 UDP (QUIC) + TCP (browser page)</dd>
+          <dt>Network</dt><dd>IPv6 dual-stack, QUIC connection migration</dd>
         </dl>
       </div>
       <div class="spec-card">
@@ -378,7 +378,7 @@
       <div>
         <h3>Transport — TLS everywhere</h3>
         <ul>
-          <li>All TCP control traffic runs TLS 1.2+ via rustls; plaintext connections are refused</li>
+          <li>Everything rides one QUIC connection with TLS 1.3 via rustls; there is no plaintext transport</li>
           <li>Self-signed certs are pinned on first connect (TOFU) — a changed fingerprint aborts the handshake</li>
         </ul>
       </div>
@@ -482,23 +482,23 @@
 <section id="architecture">
   <div class="container">
     <h2>Architecture</h2>
-    <p class="section-sub">Two channels per client: TCP for control, UDP for media. The server is a selective forwarding unit — it routes packets, it doesn't read them.</p>
+    <p class="section-sub">One QUIC connection per client: a control stream, media datagrams, and a stream per video frame. The server is a selective forwarding unit — it routes packets, it doesn't read them.</p>
     <div class="arch">
       <div class="arch-node">
         <h3>Client A</h3>
         <p>Tauri 2 · Rust + Svelte 5</p>
       </div>
       <div class="arch-link">
-        <div class="arch-wire"><span>TCP · TLS 1.2+</span></div>
-        <div class="arch-wire udp"><span>UDP · AES-256-GCM</span></div>
+        <div class="arch-wire"><span>QUIC · TLS 1.3</span></div>
+        <div class="arch-wire udp"><span>datagrams · AES-256-GCM</span></div>
       </div>
       <div class="arch-node server">
         <h3>Server</h3>
         <p>Tokio SFU · single binary<br>relays ciphertext, decodes nothing</p>
       </div>
       <div class="arch-link">
-        <div class="arch-wire"><span>TCP · TLS 1.2+</span></div>
-        <div class="arch-wire udp"><span>UDP · AES-256-GCM</span></div>
+        <div class="arch-wire"><span>QUIC · TLS 1.3</span></div>
+        <div class="arch-wire udp"><span>datagrams · AES-256-GCM</span></div>
       </div>
       <div class="arch-node">
         <h3>Client B</h3>
@@ -551,7 +551,7 @@
         </tbody>
       </table>
     </div>
-    <p class="audit-note">The browser client needs Chrome 97, Edge 98, Firefox 130 or Safari 26.4 (WebTransport and WebCodecs). Watching a screen share additionally needs an H.265 decoder, which browsers only expose on Windows, macOS and Android — voice and chat work everywhere. macOS is not supported yet — there is no macOS-specific code in the tree, so it isn't listed as working.</p>
+    <p class="audit-note">The browser client needs Chrome 97, Edge 98, Firefox 130 or Safari 26.4 (WebTransport and WebCodecs); voice and chat are tested end to end on both Chromium and Firefox. Watching a screen share additionally needs an H.265 decoder, which browsers only expose on Windows, macOS and Android — and which Firefox does not offer WebCodecs on Linux. macOS is not supported yet — there is no macOS-specific code in the tree, so it isn't listed as working.</p>
   </div>
 </section>
 
@@ -562,7 +562,7 @@
     <div class="dl-grid">
       <div>
         <h3>Client</h3>
-        <p>Prebuilt packages on the <a href="https://github.com/luki4fun/voipc/releases">GitHub releases page</a>, or build from source — <code>setup.sh</code> / <code>setup.ps1</code> installs the dependencies, <code>build.sh</code> / <code>build.ps1</code> builds. See <a href="https://github.com/luki4fun/voipc/blob/main/BUILDING.md">BUILDING.md</a> for the per-platform details.</p>
+        <p>Prebuilt packages on the <a href="https://github.com/luki4fun/voipc/releases">GitHub releases page</a>, or build from source — <code>setup.sh</code> / <code>setup.ps1</code> installs the dependencies, <code>npm run build</code> builds. See <a href="https://github.com/luki4fun/voipc/blob/main/BUILDING.md">BUILDING.md</a> for the per-platform details.</p>
         <p>Or install nothing: the server hosts a browser client at <code>https://your-server:9987</code>, with the same Signal and AES-256-GCM encryption compiled to WebAssembly.</p>
         <a class="btn btn-primary" href="https://github.com/luki4fun/voipc/releases">Releases</a>
       </div>
@@ -580,9 +580,9 @@ openssl req -x509 -newkey ec \
   -days 365 -nodes -subj "/CN=voipc" \
   -addext "subjectAltName=DNS:your-server.example,IP:203.0.113.5"
 
-<span class="c"># run (9987 TCP + UDP, 9988 UDP for browsers)</span>
+<span class="c"># run (UDP 9987 for QUIC — every client — and TCP 9987 for the browser page)</span>
 ./target/release/voipc-server</pre>
-        <p>Configure via <code>server.toml</code> or CLI flags; drop a <code>channels.json</code> next to the binary for persistent rooms; set <code>admin_token</code> (or take the one printed in the log) to moderate. The same binary serves the browser client over HTTP/2 and WebTransport (<code>web_port</code>, default 9988; <code>0</code> turns it off). A Docker release build (<code>./release.sh</code>) produces a static musl binary, an AppImage, and the web bundle.</p>
+        <p>Configure via <code>server.toml</code> or CLI flags; drop a <code>channels.json</code> next to the binary for persistent rooms; set <code>admin_token</code> (or take the one printed in the log) to moderate. The same binary serves the browser client over HTTP/2 on the TCP port, and browsers then join the same QUIC endpoint the desktop app uses. A Docker release build (<code>npm run release</code>) produces a static musl binary, an AppImage, and the web bundle.</p>
       </div>
     </div>
   </div>

@@ -7,7 +7,6 @@ import type { MediaKey } from "./wasm";
 /** What the media modules may use from the live session. */
 export interface SessionContext {
   readonly sessionId: number;
-  readonly udpToken: bigint;
   /** Current channel id (0 = General, where no media is allowed). */
   readonly channelId: number;
   /** Installed media key for the current channel, or null while waiting. */

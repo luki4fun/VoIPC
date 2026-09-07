@@ -94,9 +94,9 @@ export interface WasmApi {
   mediaKeyFromBytes(bytes: Uint8Array): MediaKey;
   newVideoAssembler(): VideoAssembler;
   /** Encrypted voice packet (0x05); AAD channel id comes from the key. */
-  buildVoicePacket(key: MediaKey, sessionId: number, udpToken: bigint, sequence: number, opus: Uint8Array): Uint8Array;
-  buildEotPacket(sessionId: number, udpToken: bigint, sequence: number): Uint8Array;
-  buildPingPacket(sessionId: number, udpToken: bigint, sequence: number): Uint8Array;
+  buildVoicePacket(key: MediaKey, sessionId: number, sequence: number, opus: Uint8Array): Uint8Array;
+  buildEotPacket(sessionId: number, sequence: number): Uint8Array;
+  buildPingPacket(sessionId: number, sequence: number): Uint8Array;
   /** Header of an EOT/Ping/Pong packet (0x02/0x03/0x04); throws on voice packets. */
   parseVoiceHeader(bytes: Uint8Array): VoicePacketHeader;
   /** Decrypts an encrypted voice packet (0x05); throws on any other type or on failed authentication. */
@@ -123,9 +123,9 @@ export async function loadWasm(): Promise<WasmApi> {
     generateMediaKey: (c, k) => mod.MediaKey.generate(c, k),
     mediaKeyFromBytes: (b) => mod.MediaKey.fromBytes(b),
     newVideoAssembler: () => new mod.VideoAssembler(),
-    buildVoicePacket: (key, s, t, q, o) => mod.buildVoicePacket(key, s, t, q, o),
-    buildEotPacket: (s, t, q) => mod.buildEotPacket(s, t, q),
-    buildPingPacket: (s, t, q) => mod.buildPingPacket(s, t, q),
+    buildVoicePacket: (key, s, q, o) => mod.buildVoicePacket(key, s, q, o),
+    buildEotPacket: (s, q) => mod.buildEotPacket(s, q),
+    buildPingPacket: (s, q) => mod.buildPingPacket(s, q),
     parseVoiceHeader: (b) => mod.parseVoiceHeader(b),
     decryptVoicePacket: (key, b) => mod.decryptVoicePacket(key, b),
     parseScreenAudioPacket: (key, b) => mod.parseScreenAudioPacket(key, b),

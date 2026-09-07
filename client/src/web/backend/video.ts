@@ -9,11 +9,19 @@ import { wasm } from "./wasm";
 import type { VideoAssembler } from "./wasm";
 import type { SessionContext, VideoApi } from "./types";
 
-/** HEVC Main, level 5.1 then 4.0 — the stream is Annex B with in-band VPS/SPS/PPS. */
-const HEVC_CODECS = ["hev1.1.6.L153.B0", "hev1.1.6.L120.B0"];
+/** HEVC Main, level 5.1 then 4.0 — the stream is Annex B with in-band VPS/SPS/PPS.
+ *  Both prefixes are tried: some browsers only advertise the hvc1 spelling. */
+const HEVC_CODECS = [
+  "hev1.1.6.L153.B0",
+  "hvc1.1.6.L153.B0",
+  "hev1.1.6.L120.B0",
+  "hvc1.1.6.L120.B0",
+];
 const UNSUPPORTED_REASON =
   "This browser cannot decode H.265 video — use Chrome/Edge on Windows/macOS, Safari 17+, or the desktop app";
 const KEYFRAME_REQUEST_INTERVAL_MS = 1_000;
+/** Loss-report window: dropped/received frame counts sent to the sharer via the server. */
+const LOSS_REPORT_INTERVAL_MS = 2_000;
 
 export class VideoViewer implements VideoApi {
   private ctx: SessionContext | null = null;
@@ -41,6 +49,10 @@ export class VideoViewer implements VideoApi {
   private framesDropped = 0;
   private bytesReceived = 0;
   private resolution = 0;
+  /** Current loss-report window (transport loss only, not decrypt failures). */
+  private windowDropped = 0;
+  private windowReceived = 0;
+  private lossReportTimer: ReturnType<typeof setInterval> | null = null;
 
   attach(ctx: SessionContext): void {
     this.ctx = ctx;
@@ -74,11 +86,20 @@ export class VideoViewer implements VideoApi {
     this.codec = codec;
     this.assembler = wasm().newVideoAssembler();
     this.openDecoder();
+    this.windowDropped = 0;
+    this.windowReceived = 0;
+    this.lossReportTimer = setInterval(() => this.sendLossReport(), LOSS_REPORT_INTERVAL_MS);
   }
 
   stopWatching(): void {
     this.watching = false;
     this.sharerUserId = 0;
+    if (this.lossReportTimer !== null) {
+      clearInterval(this.lossReportTimer);
+      this.lossReportTimer = null;
+    }
+    this.windowDropped = 0;
+    this.windowReceived = 0;
     this.closeDecoder();
     this.assembler?.free();
     this.assembler = null;
@@ -105,11 +126,13 @@ export class VideoViewer implements VideoApi {
     if (r.frame_dropped) {
       // Incomplete frame: hold rendering and ask the sharer for a keyframe
       this.framesDropped++;
+      this.windowDropped++;
       this.suppress();
       this.requestKeyframe();
     }
     if (!r.frame) return;
     this.framesReceived++;
+    this.windowReceived++;
     if (this.needKeyframe && !r.is_keyframe) {
       this.requestKeyframe();
       return;
@@ -252,6 +275,19 @@ export class VideoViewer implements VideoApi {
     if (now - this.lastKeyframeRequest < KEYFRAME_REQUEST_INTERVAL_MS) return;
     this.lastKeyframeRequest = now;
     c.sendControl({ RequestKeyframe: { sharer_user_id: this.sharerUserId } });
+  }
+
+  /** Every LOSS_REPORT_INTERVAL_MS: tell the sharer about lost frames (only when there were any). */
+  private sendLossReport(): void {
+    const dropped = this.windowDropped;
+    const received = this.windowReceived;
+    this.windowDropped = 0;
+    this.windowReceived = 0;
+    const c = this.ctx;
+    if (!c || !this.watching || this.sharerUserId === 0 || dropped === 0) return;
+    c.sendControl({
+      VideoLossReport: { sharer_user_id: this.sharerUserId, frames_dropped: dropped, frames_received: received },
+    });
   }
 }
 

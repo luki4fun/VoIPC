@@ -3,10 +3,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
-use bytes::BytesMut;
-use rand::Rng;
+use bytes::{Bytes, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use voipc_protocol::codec::{
@@ -17,18 +16,42 @@ use voipc_protocol::types::*;
 
 use crate::state::ServerState;
 
+/// A TLS connection on the page port that offered no ALPN is a pre-0.5
+/// native client speaking the old TCP control protocol. Answer with the one
+/// message it understands so it shows a clear error and stops reconnecting
+/// (its reconnect loop gives up on "version mismatch").
+pub async fn reject_legacy<S>(mut stream: S)
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    // Let it send its Authenticate first, so the reply is not lost to a
+    // reset on its own write.
+    let mut scratch = [0u8; 4096];
+    let _ = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut scratch)).await;
+    let msg = ServerMessage::AuthError {
+        reason: "version mismatch: this server runs VoIPC 0.5+, which connects over QUIC (UDP) — \
+                 please update your client"
+            .into(),
+    };
+    if let Ok(data) = encode_server_msg(&msg) {
+        let _ = stream.write_all(&data).await;
+        let _ = stream.shutdown().await;
+    }
+}
+
 /// Handle a single control connection carrying the native wire format.
 ///
-/// `stream` is either a TLS-wrapped TCP stream (native clients) or one end
-/// of an in-process duplex fed by the WebTransport bridge. `peer_label` is
-/// only used for logging; `peer_ip` is the client's real address (bans);
-/// `udp_peer_ip` is the source IP the session's media packets must come
-/// from (see `udp::resolve_session`).
+/// `stream` is one end of an in-process duplex fed by the QUIC session
+/// bridge (`web::run_session`). `peer_label` is only used for logging;
+/// `peer_ip` is the client's address (bans); `media_tx` is where the relay
+/// queues media for this client; `sid_tx` tells the bridge the session id
+/// once authentication succeeded (dropped unresolved on failure).
 pub async fn handle_connection<S>(
     mut stream: S,
     peer_label: String,
     peer_ip: IpAddr,
-    udp_peer_ip: IpAddr,
+    media_tx: mpsc::Sender<Bytes>,
+    sid_tx: oneshot::Sender<SessionId>,
     state: Arc<ServerState>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -41,7 +64,7 @@ pub async fn handle_connection<S>(
     let mut buf = BytesMut::with_capacity(4096);
     let auth_result = tokio::time::timeout(
         Duration::from_secs(5),
-        authenticate(&mut stream, &mut buf, &state, &peer_addr, peer_ip, udp_peer_ip),
+        authenticate(&mut stream, &mut buf, &state, &peer_addr, peer_ip, media_tx, sid_tx),
     )
     .await;
     let (user_id, session_id) = match auth_result {
@@ -74,10 +97,10 @@ pub async fn handle_connection<S>(
     });
 
     // Store the sender in the session; keep the admin close handle
-    let (udp_token, close) = match state.sessions.get_mut(&session_id) {
+    let close = match state.sessions.get_mut(&session_id) {
         Some(mut session) => {
             session.tcp_tx = tx.clone();
-            (session.udp_token, session.close.clone())
+            session.close.clone()
         }
         None => {
             // Session vanished between authenticate() and here — nothing to serve
@@ -94,8 +117,6 @@ pub async fn handle_connection<S>(
         &ServerMessage::Authenticated {
             user_id,
             session_id,
-            udp_port: state.udp_port,
-            udp_token,
         },
     )
     .await;
@@ -228,7 +249,8 @@ async fn authenticate<S>(
     state: &ServerState,
     peer_addr: &str,
     peer_ip: IpAddr,
-    tcp_peer_ip: IpAddr,
+    media_tx: mpsc::Sender<Bytes>,
+    sid_tx: oneshot::Sender<SessionId>,
 ) -> Result<(UserId, SessionId)>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -326,7 +348,6 @@ where
                             entry.insert(session_id);
                         }
                     }
-                    let udp_token: u64 = rand::thread_rng().gen();
 
                     // Extract E2E encryption fields from the pre-key bundle
                     let (prekeys, signed_prekey_id, signed_prekey, signed_prekey_signature, registration_id, device_id) =
@@ -354,9 +375,7 @@ where
                         is_muted: false,
                         is_deafened: false,
                         tcp_tx: placeholder_tx,
-                        udp_addr: None,
-                        udp_token,
-                        tcp_peer_ip,
+                        media_tx,
                         peer_ip,
                         is_admin: false,
                         admin_login_failures: 0,
@@ -370,7 +389,8 @@ where
                         global_rate: crate::state::RateLimiter::new(50.0, 50.0),
                         password_attempt_rate: crate::state::RateLimiter::new(3.0, 1.0),
                         chat_rate: crate::state::RateLimiter::new(5.0, 5.0),
-                        keyframe_request_rate: crate::state::RateLimiter::new(2.0, 1.0),
+                        keyframe_relay_rate: crate::state::RateLimiter::new(2.0, 1.0),
+                        loss_report_rate: crate::state::RateLimiter::new(2.0, 1.0),
                         create_channel_rate: crate::state::RateLimiter::new(1.0, 0.2),
                         prekey_rate: crate::state::RateLimiter::new(1.0, 0.2),
                         // Burst covers joining a full channel; refill limits draining
@@ -388,6 +408,8 @@ where
 
                     state.sessions.insert(session_id, session);
                     state.user_to_session.insert(user_id, session_id);
+                    // The bridge can start routing this session's media now
+                    let _ = sid_tx.send(session_id);
 
                     // No network I/O after this point: every failure past the
                     // inserts must run cleanup_session (handle_connection does).
@@ -568,18 +590,50 @@ async fn handle_message(
         }
         ClientMessage::RequestKeyframe { sharer_user_id } => {
             // Forcing IDRs is expensive for the sharer — only viewers of that
-            // share may ask, capped per viewer. Dropped silently: the client
-            // re-requests within a second anyway.
+            // share may ask, and the relay is capped per share (not per
+            // viewer, see handle_request_keyframe). Dropped silently: the
+            // client re-requests within a second anyway.
+            let watching = state
+                .sessions
+                .get(&session_id)
+                .map(|s| s.watching_screenshare == Some(sharer_user_id))
+                .unwrap_or(false);
+            if watching {
+                handle_request_keyframe(state, sharer_user_id).await?;
+            }
+        }
+        ClientMessage::VideoLossReport {
+            sharer_user_id,
+            frames_dropped,
+            frames_received,
+        } => {
+            // Relayed to the sharer, which lowers its bitrate/fps. Only
+            // viewers of that share may report, at most ~1/s each.
             let allowed = state
                 .sessions
                 .get_mut(&session_id)
                 .map(|mut s| {
                     s.watching_screenshare == Some(sharer_user_id)
-                        && s.keyframe_request_rate.try_consume()
+                        && s.loss_report_rate.try_consume()
                 })
                 .unwrap_or(false);
             if allowed {
-                handle_request_keyframe(state, sharer_user_id).await?;
+                let sharer_tx = state
+                    .user_to_session
+                    .get(&sharer_user_id)
+                    .map(|sid| *sid)
+                    .and_then(|sid| state.sessions.get(&sid).map(|s| s.tcp_tx.clone()));
+                if let Some(sharer_tx) = sharer_tx {
+                    let _ = send_msg(
+                        &sharer_tx,
+                        &ServerMessage::VideoLossReported {
+                            viewer_user_id: user_id,
+                            frames_dropped,
+                            frames_received,
+                        },
+                    )
+                    .await;
+                }
             }
         }
         ClientMessage::Authenticate { .. } => {
@@ -1530,7 +1584,7 @@ async fn handle_watch_screen_share(
         .watch_screen_share(viewer_user_id, viewer_session_id, sharer_user_id, channel_id)
         .await
     {
-        Ok((sharer_sid, old_count, new_count, prev_unwatch)) => {
+        Ok((sharer_sid, _old_count, new_count, prev_unwatch)) => {
             // Confirm to viewer
             let _ = send_msg(
                 tx,
@@ -1538,21 +1592,24 @@ async fn handle_watch_screen_share(
             )
             .await;
 
-            // Notify sharer of new viewer count
-            if let Some(session) = state.sessions.get(&sharer_sid) {
+            // Notify the sharer of the new viewer count and get the newcomer a
+            // keyframe: it would otherwise wait up to 4 s for the periodic one.
+            // Capped per share like viewer requests (a burst of joiners is one
+            // IDR per second, not one each). The guard is dropped before awaiting.
+            let sharer = state.sessions.get_mut(&sharer_sid).map(|mut session| {
+                let want_keyframe = new_count > 0 && session.keyframe_relay_rate.try_consume();
+                (session.tcp_tx.clone(), want_keyframe)
+            });
+            if let Some((sharer_tx, want_keyframe)) = sharer {
                 let _ = send_msg(
-                    &session.tcp_tx,
+                    &sharer_tx,
                     &ServerMessage::ViewerCountChanged {
                         viewer_count: new_count,
                     },
                 )
                 .await;
-
-                // If this is the first viewer, also request a keyframe
-                if old_count == 0 && new_count > 0 {
-                    let _ =
-                        send_msg(&session.tcp_tx, &ServerMessage::KeyframeRequested)
-                            .await;
+                if want_keyframe {
+                    let _ = send_msg(&sharer_tx, &ServerMessage::KeyframeRequested).await;
                 }
             }
 
@@ -1635,16 +1692,25 @@ async fn handle_stop_watching(
     Ok(())
 }
 
-/// Handle a keyframe request — relay to the sharer.
+/// Handle a keyframe request — relay to the sharer, at most ~1/s per share
+/// however many viewers ask (each relayed request forces an IDR).
 async fn handle_request_keyframe(
     state: &Arc<ServerState>,
     sharer_user_id: UserId,
 ) -> Result<()> {
-    if let Some(sharer_sid) = state.user_to_session.get(&sharer_user_id) {
-        if let Some(session) = state.sessions.get(&*sharer_sid) {
-            let _ = send_msg(&session.tcp_tx, &ServerMessage::KeyframeRequested).await;
+    let Some(sharer_sid) = state.user_to_session.get(&sharer_user_id).map(|s| *s) else {
+        return Ok(());
+    };
+    let sharer_tx = match state.sessions.get_mut(&sharer_sid) {
+        Some(mut session) => {
+            if !session.keyframe_relay_rate.try_consume() {
+                return Ok(());
+            }
+            session.tcp_tx.clone()
         }
-    }
+        None => return Ok(()),
+    };
+    let _ = send_msg(&sharer_tx, &ServerMessage::KeyframeRequested).await;
     Ok(())
 }
 
@@ -2111,8 +2177,8 @@ mod tests {
     use crate::config::ServerConfig;
     use crate::settings::ServerSettings;
 
-    /// Drives `handle_connection` over an in-memory duplex without TLS —
-    /// exactly how the WebTransport bridge feeds it.
+    /// Drives `handle_connection` over an in-memory duplex without QUIC —
+    /// exactly how the session bridge feeds it.
     #[tokio::test]
     async fn authenticates_over_duplex() {
         let config = ServerConfig::default();
@@ -2123,11 +2189,14 @@ mod tests {
             "test-admin-token".into(),
         ));
         let (mut client, server) = tokio::io::duplex(65536);
+        let (media_tx, _media_rx) = mpsc::channel(8);
+        let (sid_tx, sid_rx) = oneshot::channel();
         let mut handler = tokio::spawn(handle_connection(
             server,
             "test".into(),
             IpAddr::V4(Ipv4Addr::LOCALHOST),
-            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            media_tx,
+            sid_tx,
             state.clone(),
         ));
 
@@ -2158,16 +2227,17 @@ mod tests {
             .await
             .expect("replies within 5 s");
 
-        assert!(matches!(
-            replies[0],
-            ServerMessage::Authenticated { udp_port, .. } if udp_port == config.udp_port
-        ));
+        let ServerMessage::Authenticated { session_id, .. } = replies[0] else {
+            panic!("expected Authenticated, got {:?}", replies[0]);
+        };
         assert!(matches!(replies[1], ServerMessage::ChannelList { .. }));
         assert!(matches!(
             replies[2],
             ServerMessage::UserList { channel_id: 0, .. }
         ));
         assert_eq!(state.sessions.len(), 1);
+        // The bridge learns the session id as soon as the session exists
+        assert_eq!(sid_rx.await.unwrap(), session_id);
 
         // Dropping our end is what the bridge does on teardown: the handler
         // must see EOF and clean the session up.
@@ -2250,11 +2320,14 @@ mod tests {
     /// Authenticates `username` from `ip` over a duplex.
     async fn connect(state: &Arc<ServerState>, username: &str, ip: IpAddr) -> Client {
         let (stream, server) = tokio::io::duplex(65536);
+        let (media_tx, _media_rx) = mpsc::channel(8);
+        let (sid_tx, _sid_rx) = oneshot::channel();
         let handler = tokio::spawn(handle_connection(
             server,
             username.into(),
             ip,
-            ip,
+            media_tx,
+            sid_tx,
             state.clone(),
         ));
         let mut client = Client {

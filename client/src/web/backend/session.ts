@@ -1,5 +1,5 @@
 // The connection: a port of client/src-tauri/src/network.rs (connect,
-// server message dispatch, Signal Protocol orchestration, UDP keepalive)
+// server message dispatch, Signal Protocol orchestration, RTT keepalive)
 // and of the chat/poke commands that need the Signal state, minus native
 // I/O. Media packets are handed to audio.ts / video.ts, which see this
 // session through the SessionContext interface.
@@ -13,14 +13,12 @@ import { video } from "./video";
 
 /** Bound for the authentication response (network.rs CONNECT_TIMEOUT). */
 const AUTH_TIMEOUT_MS = 10_000;
-/** UDP keepalive period: keeps the media path alive and measures RTT. */
+/** Datagram keepalive period: measures RTT (a dead QUIC path closes the transport). */
 const KEEPALIVE_MS = 10_000;
-/** No Pong for this long (3 missed keepalives + margin) = media path dead. */
-const UDP_DEAD_AFTER_MS = 35_000;
 /** Queued chat messages older than this are dropped instead of sent. */
 const PENDING_MESSAGE_TTL_MS = 60_000;
 /** voipc_protocol::voice::VOICE_HEADER_SIZE */
-const VOICE_HEADER_SIZE = 17;
+const VOICE_HEADER_SIZE = 9;
 
 type PendingTarget = { kind: "channel"; channelId: number } | { kind: "direct"; targetUserId: number };
 
@@ -132,7 +130,6 @@ function parseAddress(address: string): { host: string; port: number } {
 
 export class Session implements SessionContext {
   sessionId = 0;
-  udpToken = 0n;
   /** Current channel (0 = General). Set locally on join_channel, confirmed by UserList. */
   channelId = 0;
   mediaKey: MediaKey | null = null;
@@ -157,8 +154,6 @@ export class Session implements SessionContext {
   private voiceSequence = 0;
   private auth: { resolve(): void; reject(e: Error): void } | null = null;
   private keepalive: ReturnType<typeof setInterval> | undefined;
-  private lastPong = 0;
-  private udpDead = false;
   private attached = false;
   private ended = false;
 
@@ -221,31 +216,21 @@ export class Session implements SessionContext {
     video.attach(this);
     this.attached = true;
 
-    // The server learns our media address from the first datagram.
-    this.sendDatagram(wasm().buildPingPacket(this.sessionId, this.udpToken, nowU32()));
+    // First ping: gives the UI an RTT reading right away.
+    this.sendPing();
 
     // Notify the server of persisted mute/deafen state
     if (audio.muted) this.sendControl({ SetMuted: { muted: true } });
     if (audio.deafened) this.sendControl({ SetDeafened: { deafened: true } });
 
-    // Baseline for the dead-UDP watchdog before the first Pong arrives
-    const started = Date.now();
-    this.keepalive = setInterval(() => this.keepaliveTick(started), KEEPALIVE_MS);
+    // RTT probe only: media and control share one QUIC connection, so a dead
+    // path surfaces as connection-lost instead of a separate watchdog.
+    this.keepalive = setInterval(() => this.sendPing(), KEEPALIVE_MS);
   }
 
-  /** network.rs udp_keepalive_task: NAT keepalive + RTT probe + dead-UDP watchdog. */
-  private keepaliveTick(started: number): void {
-    this.sendDatagram(wasm().buildPingPacket(this.sessionId, this.udpToken, nowU32()));
-    const last = Math.max(this.lastPong, started);
-    const stale = Date.now() - last > UDP_DEAD_AFTER_MS;
-    if (stale && !this.udpDead) {
-      this.udpDead = true;
-      console.warn(`no UDP Pong for ${UDP_DEAD_AFTER_MS}ms — media path considered dead`);
-      emit("udp-dead");
-    } else if (!stale && this.udpDead) {
-      this.udpDead = false;
-      emit("udp-restored");
-    }
+  /** Ping datagram whose sequence carries the send time (echoed in the Pong). */
+  private sendPing(): void {
+    this.sendDatagram(wasm().buildPingPacket(this.sessionId, nowU32()));
   }
 
   /** Tear down: stop media, optionally send Disconnect, close, drop Signal state. */
@@ -340,7 +325,6 @@ export class Session implements SessionContext {
     } catch {
       return;
     }
-    this.lastPong = Date.now();
     const rtt = (nowU32() - sent) >>> 0;
     // Guard against clock weirdness producing huge values
     if (rtt < 60_000) emit("latency-update", { ms: rtt });
@@ -362,7 +346,6 @@ export class Session implements SessionContext {
       case "Authenticated":
         this.userId = b.user_id;
         this.sessionId = b.session_id;
-        this.udpToken = BigInt(b.udp_token);
         this.auth?.resolve();
         break;
       case "AuthError":
@@ -459,6 +442,9 @@ export class Session implements SessionContext {
         break;
       case "KeyframeRequested":
         emit("keyframe-requested");
+        break;
+      case "VideoLossReported":
+        // Viewer loss feedback for a sharer; browsers cannot share
         break;
       case "ScreenShareError":
         emit("screenshare-error", { reason: b.reason });

@@ -1,0 +1,20 @@
+{
+  "name": "voipc-tools",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Build task runner for VoIPC. The app itself lives in client/.",
+  "type": "module",
+  "scripts": {
+    "dev": "node tools/voipc.mjs dev",
+    "build": "node tools/voipc.mjs build",
+    "setup:windows": "node tools/voipc.mjs setup:windows",
+    "build:windows": "node tools/voipc.mjs build:windows",
+    "web": "node tools/voipc.mjs web",
+    "setup:android": "node tools/voipc.mjs setup:android",
+    "android": "node tools/voipc.mjs android",
+    "release": "node tools/voipc.mjs release",
+    "test:web": "node tools/voipc.mjs test:web",
+    "version:sync": "node tools/voipc.mjs version",
+    "version:check": "node tools/voipc.mjs version --check"
+  }
+}

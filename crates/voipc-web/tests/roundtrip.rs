@@ -51,7 +51,7 @@ fn signal_pairwise_and_group_round_trip() {
 fn voice_packet_round_trip() {
     let key = MediaKey::generate(7, 3).unwrap();
     let opus = [0x11u8, 0x22, 0x33, 0x44, 0x55];
-    let packet = media::build_voice_packet(&key, 42, 0xDEAD_BEEF_CAFE_F00D, 10, &opus).unwrap();
+    let packet = media::build_voice_packet(&key, 42, 10, &opus).unwrap();
     assert_eq!(packet[0], 0x05);
 
     let info = media::parse_voice_packet(Some(&key), &packet).unwrap();
@@ -66,10 +66,10 @@ fn voice_packet_round_trip() {
     assert!(media::parse_voice_packet(Some(&other), &packet).is_err());
 
     // EOT and ping are header only and need no key.
-    let eot = media::parse_voice_packet(None, &media::build_eot_packet(42, 1, 11)).unwrap();
+    let eot = media::parse_voice_packet(None, &media::build_eot_packet(42, 11)).unwrap();
     assert_eq!((eot.packet_type, eot.session_id, eot.sequence), (0x02, 42, 11));
     assert!(eot.opus.is_none());
-    let ping = media::parse_voice_packet(None, &media::build_ping_packet(42, 1, 12)).unwrap();
+    let ping = media::parse_voice_packet(None, &media::build_ping_packet(42, 12)).unwrap();
     assert_eq!((ping.packet_type, ping.sequence), (0x03, 12));
 }
 
@@ -80,14 +80,14 @@ fn screen_audio_round_trip() {
     let aad = build_aad(7, 0x15);
     let encrypted = media_encrypt(&key, 8, 100, 0, &aad, &opus).unwrap();
     let packet =
-        ScreenShareAudioPacket::new_encrypted(8, 1, 100, 2500, key.key_id, encrypted).to_bytes();
+        ScreenShareAudioPacket::new_encrypted(8, 100, 2500, key.key_id, encrypted).to_bytes();
 
     let info = media::parse_screen_audio_packet(&key, &packet).unwrap();
     assert_eq!((info.session_id, info.sequence, info.timestamp), (8, 100, 2500));
     assert_eq!(info.opus, opus);
 
     // Plaintext screen audio is refused.
-    let plain = ScreenShareAudioPacket::new(8, 1, 101, 2520, opus.to_vec()).to_bytes();
+    let plain = ScreenShareAudioPacket::new(8, 101, 2520, opus.to_vec()).to_bytes();
     assert!(media::parse_screen_audio_packet(&key, &plain).is_err());
 }
 
@@ -95,14 +95,13 @@ fn screen_audio_round_trip() {
 fn video_fragments_reassemble() {
     let key = MediaKey::generate(7, 0).unwrap();
     let frame: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
-    let (session_id, udp_token, frame_id, timestamp) = (9, 1, 0, 1234);
+    let (session_id, frame_id, timestamp) = (9, 0, 1234);
 
     // Encrypted exactly like the native sharer (client/src-tauri/src/screenshare/mod.rs).
     let packets: Vec<Vec<u8>> = fragment_frame(
         &frame,
         true,
         session_id,
-        udp_token,
         frame_id,
         timestamp,
         MAX_ENCRYPTED_VIDEO_PAYLOAD_SIZE,
@@ -122,7 +121,6 @@ fn video_fragments_reassemble() {
         VideoPacket::encrypted_fragment(
             true,
             session_id,
-            udp_token,
             frame_id,
             pkt.fragment_index,
             pkt.fragment_count,
@@ -165,23 +163,24 @@ fn voice_interoperates_with_the_native_client() {
     let channel_id = 7;
     let key = MediaKey::generate(channel_id, 0).unwrap();
     let opus: Vec<u8> = (0..80u8).collect();
-    let (session_id, udp_token, sequence) = (3, 0x0102_0304_0506_0708, 99);
+    let (session_id, sequence) = (3, 99);
 
     // Browser sends → native client receives.
-    let packet = media::build_voice_packet(&key, session_id, udp_token, sequence, &opus).unwrap();
+    let packet = media::build_voice_packet(&key, session_id, sequence, &opus).unwrap();
     let header = voipc_protocol::voice::ENCRYPTED_VOICE_HEADER_SIZE;
+    assert_eq!(header, 11);
     assert_eq!(packet[0], 0x05);
     assert_eq!(
         u32::from_be_bytes(packet[1..5].try_into().unwrap()),
         session_id
     );
     assert_eq!(
-        u64::from_be_bytes(packet[5..13].try_into().unwrap()),
-        udp_token
+        u32::from_be_bytes(packet[5..9].try_into().unwrap()),
+        sequence
     );
     assert_eq!(
-        u32::from_be_bytes(packet[13..17].try_into().unwrap()),
-        sequence
+        u16::from_be_bytes(packet[9..11].try_into().unwrap()),
+        key.key_id
     );
     let decrypted = voipc_crypto::media_decrypt(
         &key,
@@ -204,14 +203,9 @@ fn voice_interoperates_with_the_native_client() {
         &opus,
     )
     .unwrap();
-    let native = voipc_protocol::voice::VoicePacket::encrypted_voice(
-        session_id,
-        udp_token,
-        sequence,
-        key.key_id,
-        encrypted,
-    )
-    .to_bytes();
+    let native =
+        voipc_protocol::voice::VoicePacket::encrypted_voice(session_id, sequence, key.key_id, encrypted)
+            .to_bytes();
     let info = media::parse_voice_packet(Some(&key), &native).unwrap();
     assert_eq!(info.opus.as_deref(), Some(&opus[..]));
     assert_eq!(info.sequence, sequence);

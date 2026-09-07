@@ -168,6 +168,12 @@ pub mod convert {
     }
 }
 
+/// Seconds between the periodic IDRs the app forces (`frame_id % (this × fps)`).
+/// Video travels on reliable QUIC streams, so loss no longer breaks the decoder
+/// chain; the periodic keyframe is only a safety net (a new viewer asks for one
+/// explicitly) and costs 10–20× a delta frame.
+pub const KEYFRAME_INTERVAL_SECS: u32 = 4;
+
 /// Screen share resolution presets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Resolution {

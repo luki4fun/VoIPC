@@ -1,14 +1,14 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-cli/schema.json",
   "productName": "VoIPC",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "identifier": "com.voipc.app",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
     "beforeDevCommand": "npm run dev",
     "beforeBuildCommand": "npm run build",
-    "beforeBundleCommand": "bash ../bundle-libs.sh"
+    "beforeBundleCommand": "node ../tools/voipc.mjs bundle-libs"
   },
   "app": {
     "windows": [

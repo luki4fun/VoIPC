@@ -18,8 +18,11 @@ voipc-crypto = { path = "../../crates/voipc-crypto" }
 tauri = { version = "2", features = [] }
 tauri-plugin-notification = "2"
 tokio = { version = "1", features = ["full"] }
-tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
+# QUIC/WebTransport link to the server (quinn underneath); ring so the
+# Windows and Android builds need no extra toolchain. "quinn" only unlocks
+# Connection::quic_connection() (path stats for congestion detection).
+wtransport = { version = "0.7", default-features = false, features = ["ring", "quinn"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std"] }
 webpki-roots = "0.26"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -33,7 +36,6 @@ ring = "0.17"
 base64 = "0.22"
 rand = "0.8"
 libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.67.2" }
-socket2 = "0.6.2"
 dirs = "6"
 
 # Desktop-only dependencies (not available on Android)

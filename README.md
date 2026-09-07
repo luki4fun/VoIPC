@@ -77,9 +77,10 @@ No accounts. No telemetry. No compromises.
 - Saved servers in the connect dialog, optional auto-connect
 - System tray (close-to-tray keeps the call running) and desktop notifications
 - Voice quality indicator: live ping + packet-loss % in the status bar
-- NAT rebind + UDP keepalive — voice survives router mapping timeouts
-- Auto-reconnect keeps trying for 5 minutes (Wi-Fi roams, laptop sleep)
-- Dead-UDP detection warns when a firewall blocks voice while TCP still works
+- One QUIC connection per client — connection migration survives NAT rebinds, Wi-Fi roams and address changes
+- Auto-reconnect keeps trying for 5 minutes (laptop sleep, server restart)
+- A blocked UDP port fails the connect with a clear error instead of a silent mute
+- Screen share adapts bitrate and frame rate to what the link carries (viewers report loss, the sharer steps down)
 - Server admin session: log in with the server's admin token (status bar shield) to kick users from any channel or from the server and to IP-ban them for 1 h, 24 h or until restart; bans are memory-only and listed with an Unban button
 
 **Platform Support**
@@ -94,16 +95,18 @@ No accounts. No telemetry. No compromises.
 
 ¹ There is no macOS-specific code yet; nothing is built or tested for it.
 ² Browsers decode H.265 only where the platform provides it: Chrome/Edge on Windows and macOS,
-Safari 17+, Chrome on Android. Firefox on Windows/macOS since 136. On Linux browsers there is
-no H.265 decoder, so the web client says so instead of showing a black frame — voice and chat
-work everywhere.
+Safari 17+, Chrome on Android. Firefox has decoded H.265 since 134 on Windows and 136 on macOS,
+but exposes no H.265 decoder to WebCodecs on Linux (checked with Firefox 155), and on Linux no
+browser does. The web client probes for a decoder and says so instead of showing a black frame —
+voice and chat work everywhere, Firefox included.
 
 **Web client (browser)**
 
 The server hosts the web client itself: open `https://your-server:9987` and you get the same
 UI as the desktop app, with the Signal Protocol and AES-256-GCM media crypto compiled to
-WebAssembly. Needs Chrome 97+, Edge 98+, Firefox 130+, or Safari 26.4+ (WebTransport + WebCodecs). Screen
-*sharing* from a browser is not implemented; everything else is the same app.
+WebAssembly. Needs Chrome 97+, Edge 98+, Firefox 130+, or Safari 26.4+ (WebTransport + WebCodecs);
+Chromium and Firefox are both covered by the end-to-end test. Screen *sharing* from a browser is
+not implemented; everything else is the same app.
 
 ## Security
 
@@ -171,26 +174,27 @@ Client-side data at rest:
 ### Architecture
 
 ```
-┌──────────────┐         TLS (TCP)          ┌──────────────┐         TLS (TCP)          ┌──────────────┐
+┌──────────────┐      QUIC · TLS 1.3        ┌──────────────┐      QUIC · TLS 1.3        ┌──────────────┐
 │   Client A   │◄──────────────────────────►│    Server    │◄──────────────────────────►│   Client B   │
-│  Tauri 2 App │   AES-256-GCM (UDP)        │  Rust Binary │   AES-256-GCM (UDP)        │  Tauri 2 App │
-│  Rust+Svelte │◄──────────────────────────►│  Tokio SFU   │◄──────────────────────────►│  Rust+Svelte │
+│  Tauri 2 App │  control stream + media    │  Rust Binary │  control stream + media    │  Tauri 2 App │
+│  Rust+Svelte │  datagrams, AES-256-GCM    │  Tokio SFU   │  datagrams, AES-256-GCM    │  Rust+Svelte │
 └──────────────┘                             └──────┬───────┘                            └──────────────┘
-                                              Relays only —  │  HTTP/2 (page) + WebTransport
-                                              never decodes  │  same messages, same crypto
+                                              Relays only —  │  HTTPS page (HTTP/2) +
+                                              never decodes  │  the same QUIC endpoint
                                                       ┌──────┴───────┐
                                                       │  Web Client  │
                                                       │ Svelte+wasm  │
                                                       └──────────────┘
 ```
 
-- **TCP + TLS** for control messages (auth, channels, chat, encryption key exchange)
-- **UDP** for real-time media (voice, video, screen share audio)
+- **One QUIC (WebTransport) connection** per client, TLS 1.3 only: control messages (auth,
+  channels, chat, encryption key exchange) on a bidirectional stream, voice and screen-share
+  audio as datagrams, each video frame on its own unidirectional stream. NAT rebinds and
+  address changes are handled by QUIC connection migration
 - **SFU** (Selective Forwarding Unit) — server relays encrypted packets without decoding
-- **HTTP/2 + WebTransport** for browsers: the same page origin serves the web client and a
-  QUIC endpoint carries the identical control messages (one bidirectional stream) and media
-  packets (datagrams; video frames as one stream per frame). Browsers get no plaintext the
-  native clients don't — all encryption happens in the page, in WebAssembly
+- **HTTP/2 page** for browsers: the same origin serves the web client, which then opens the
+  same QUIC endpoint the desktop app uses. Browsers get no plaintext the native clients
+  don't — all encryption happens in the page, in WebAssembly
 
 ### Stack
 
@@ -213,14 +217,13 @@ Client-side data at rest:
 
 | Metric | Value |
 |---|---|
-| Voice packet header | 17 bytes (19 encrypted) |
-| Video packet header | 23 bytes (25 encrypted) |
+| Voice packet header | 9 bytes (11 encrypted) |
+| Video packet header | 15 bytes (17 encrypted) |
 | Max voice packet | 512 bytes |
-| Max video packet | 1,280 bytes (VPN-safe) |
-| Max TCP message | 64 KiB |
-| Protocol version | v4 |
-| Default port | 9987 (TCP + UDP) |
-| Web client port | 9988 (UDP, WebTransport) |
+| Max video packet | 1,280 bytes |
+| Max control message | 64 KiB |
+| Protocol version | v5 |
+| Default port | 9987 — UDP for QUIC (all clients), TCP for the browser page |
 
 ### Project Structure
 
@@ -228,7 +231,7 @@ Client-side data at rest:
 VoIPC/
 ├── crates/
 │   ├── voipc-protocol/     # Message types, packet formats, codec
-│   ├── voipc-server/       # Server binary (TCP + UDP + TLS)
+│   ├── voipc-server/       # Server binary (QUIC/WebTransport endpoint + HTTPS page)
 │   ├── voipc-audio/        # Capture, playback, Opus, RNNoise, VAD, jitter buffer
 │   ├── voipc-video/        # H.265 encoding/decoding, fragment assembly
 │   ├── voipc-crypto/       # Signal Protocol, AES-256-GCM, key management
@@ -236,7 +239,8 @@ VoIPC/
 ├── client/
 │   ├── src-tauri/src/      # Tauri Rust backend (network, crypto, state, commands)
 │   │   ├── screenshare/    # Platform-specific capture (linux.rs, windows.rs)
-│   │   ├── network.rs      # TCP/UDP connection handling, Signal session setup
+│   │   ├── transport.rs    # QUIC connection, certificate pinning (TOFU)
+│   │   ├── network.rs      # Control/media tasks, Signal session setup
 │   │   ├── crypto.rs       # Chat history encryption (PBKDF2 + AES-256-GCM)
 │   │   ├── app_state.rs    # Central app state (connections, audio, crypto)
 │   │   └── commands.rs     # Tauri IPC command handlers
@@ -248,11 +252,9 @@ VoIPC/
 │       │                   #   WebCodecs audio/video, Tauri API shims
 │       └── App.svelte      # Root component
 ├── website/                # Project website (single HTML file)
-├── setup.sh / setup.ps1    # One-command dependency installer
-├── build.sh / build.ps1    # Release build scripts
-├── build-web.sh            # Web client (wasm + Vite) + server that embeds it
+├── tools/                  # Build task runner — npm run <task>, one per build
+├── setup.sh / setup.ps1    # One-command dependency installer (Rust, Node, system libs)
 ├── test-web.sh             # Headless two-browser end-to-end test of the web client
-├── dev.sh / dev.ps1        # Dev build + run
 └── Cargo.toml              # Workspace root
 ```
 
@@ -277,20 +279,20 @@ openssl req -x509 -newkey ec \
 ./target/release/voipc-server
 ```
 
-The server listens on port **9987** (TCP + UDP) by default. Configure via `server.toml`:
+The server listens on port **9987** by default: UDP for the QUIC endpoint every client
+connects to, TCP for the browser page. Configure via `server.toml`:
 
 ```toml
-host = "0.0.0.0"          # Bind address — set to your public/VPN IP for correct UDP routing
-tcp_port = 9987
-udp_port = 9987
-web_port = 9988           # WebTransport (UDP) for the browser client; 0 disables the web client
+host = "0.0.0.0"          # Bind address — set to your public/VPN IP for correct QUIC routing
+tcp_port = 9987           # HTTPS page for the browser client
+udp_port = 9987           # QUIC endpoint (all clients) — keep equal to tcp_port so one host:port reaches both
 max_users = 64
 cert_path = "certs/server.crt"
 key_path = "certs/server.key"
 admin_token = "change-me"  # optional; unset = a random token is printed in the log at every start
 ```
 
-> **VPN / multi-homed setups:** If clients connect via a domain name (e.g. `vpn.example.com`) that resolves to a specific IP, set `host` to that IP. Otherwise the server may send UDP replies from the wrong interface and clients won't receive voice/video. All options can also be passed as CLI flags (`--host`, `--tcp-port`, etc.).
+> **VPN / multi-homed setups:** If clients connect via a domain name (e.g. `vpn.example.com`) that resolves to a specific IP, set `host` to that IP. Otherwise the server may send QUIC packets from the wrong interface and the handshake never completes. All options can also be passed as CLI flags (`--host`, `--tcp-port`, `--udp-port`, etc.).
 
 Runtime settings in `server_settings.json`:
 
@@ -310,13 +312,16 @@ Runtime settings in `server_settings.json`:
 
 ```bash
 # Linux
-./setup.sh    # Install system dependencies
-./build.sh    # Release build
+./setup.sh       # Install system dependencies, Rust and Node
+npm run build    # Release build
 
 # Windows (PowerShell as Administrator)
 .\setup.ps1
-.\build.ps1
+npm run build
 ```
+
+Every build task runs through `npm run <task>` on both platforms;
+`node tools/voipc.mjs --help` lists them.
 
 Or manually:
 
@@ -330,7 +335,7 @@ npx tauri build   # Release build
 Or build portable release binaries via Docker (no local dependencies needed):
 
 ```bash
-./release.sh    # Outputs release/VoIPC_*.AppImage + release/voipc-server + release/VoIPC-web-*.tar.gz
+npm run release    # Outputs release/VoIPC_*.AppImage + release/voipc-server + release/VoIPC-web-*.tar.gz
 ```
 
 See [BUILDING.md](BUILDING.md) for detailed platform-specific instructions and dependency lists.
@@ -344,21 +349,24 @@ https://your-server:9987
 ```
 
 The server binary serves the web client over HTTP/2 and carries voice, video and control
-messages over WebTransport on UDP **9988** — open that port too. With a self-signed
-certificate the browser shows a warning on the first visit; accept it once and the app works
-(generate the certificate with a `subjectAltName`, see the openssl line above, or use a real
-certificate from a CA). The WebTransport endpoint uses its own short-lived certificate that
-the server generates, rotates, and publishes by hash to the page — there is nothing to
-configure.
+messages over WebTransport on the same UDP port the desktop app uses (**9987**) — no extra
+port to open. With a self-signed certificate the browser shows a warning on the first visit;
+accept it once and the app works (generate the certificate with a `subjectAltName`, see the
+openssl line above, or use a real certificate from a CA). Browsers pin the QUIC endpoint by
+certificate hash, so for them the server presents a short-lived certificate it generates,
+rotates, and publishes by hash to the page — there is nothing to configure. Desktop clients
+get the operator certificate on the same endpoint and pin it on first use as before.
 
 Requires Chrome 97+, Edge 98+, Firefox 130+, or Safari 26.4+. Voice and chat work in all of them;
-watching a screen share needs a browser that can decode H.265 (see the platform table).
+watching a screen share needs a browser that can decode H.265 (see the platform table). In
+Firefox the output-device picker does nothing — routing audio to a chosen device is a Chromium
+extension the other engines have not implemented.
 
 To build it yourself:
 
 ```bash
-./build-web.sh    # wasm + Vite bundle, then a server binary that embeds it
-./test-web.sh     # headless two-browser end-to-end check (voice, chat, DMs)
+npm run web        # wasm + Vite bundle, then a server binary that embeds it
+npm run test:web   # headless two-browser end-to-end check (voice, chat, DMs)
 ```
 
 ## Data Transparency

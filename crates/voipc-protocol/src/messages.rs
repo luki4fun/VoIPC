@@ -2,10 +2,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::types::*;
 
-/// Messages sent from client to server over the TCP control channel.
+/// Messages sent from client to server over the control stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
-    /// Initial authentication. Sent immediately after TLS handshake.
+    /// Initial authentication. First message on the control stream.
     Authenticate {
         username: String,
         /// Protocol version for forward compatibility.
@@ -193,19 +193,26 @@ pub enum ClientMessage {
         /// 1 = PreKeySignalMessage, 2 = SignalMessage.
         message_type: u8,
     },
+
+    // ── Screen share congestion control ──────────────────────────────
+
+    /// A viewer saw frame loss in the last reporting window (~2 s). Relayed
+    /// to the sharer, which lowers bitrate/fps instead of storming keyframes.
+    VideoLossReport {
+        sharer_user_id: UserId,
+        frames_dropped: u32,
+        frames_received: u32,
+    },
 }
 
-/// Messages sent from server to client over the TCP control channel.
+/// Messages sent from server to client over the control stream.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerMessage {
-    /// Authentication succeeded.
+    /// Authentication succeeded. Media travels on the same QUIC connection
+    /// (datagrams + per-frame streams), so there is nothing else to set up.
     Authenticated {
         user_id: UserId,
         session_id: SessionId,
-        /// Server UDP port for voice traffic.
-        udp_port: u16,
-        /// Token the client must include in every UDP voice packet.
-        udp_token: u64,
     },
 
     /// Authentication failed.
@@ -411,5 +418,14 @@ pub enum ServerMessage {
         ciphertext: Vec<u8>,
         /// 1 = PreKeySignalMessage, 2 = SignalMessage.
         message_type: u8,
+    },
+
+    // ── Screen share congestion control ──────────────────────────────
+
+    /// One of your viewers reported frame loss (sharer only).
+    VideoLossReported {
+        viewer_user_id: UserId,
+        frames_dropped: u32,
+        frames_received: u32,
     },
 }

@@ -171,14 +171,16 @@ pub struct ActiveConnection {
     pub session_id: SessionId,
     pub is_muted: Arc<AtomicBool>,
     pub is_deafened: Arc<AtomicBool>,
-    /// Sender for TCP control messages.
+    /// Sender for control messages (framed, onto the control stream).
     pub tcp_tx: mpsc::Sender<Vec<u8>>,
-    /// Sender for UDP voice packets.
+    /// Sender for voice packets (QUIC datagrams).
     pub voice_tx: mpsc::Sender<Vec<u8>>,
-    /// Sender for UDP video packets (screen share).
+    /// Sender for video fragments (one QUIC stream per frame).
     pub video_tx: mpsc::Sender<Vec<u8>>,
-    /// Sender for UDP screen share audio packets.
+    /// Sender for screen share audio packets (QUIC datagrams).
     pub screen_audio_tx: mpsc::Sender<Vec<u8>>,
+    /// QUIC endpoint + connection; closed explicitly on disconnect.
+    pub quic: crate::transport::Quic,
     /// Join handles for cleanup on disconnect.
     pub tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Flag to signal the capture+encode loop to stop.
@@ -199,8 +201,6 @@ pub struct ActiveConnection {
     /// Set to make the mixer (re)build the playback stream — by the cpal
     /// error callback on device failure, or after an output device change.
     pub playback_restart: Arc<AtomicBool>,
-    /// Token for authenticating UDP voice packets.
-    pub udp_token: u64,
     // ── Screen share state ──
     /// Whether this client is currently screen sharing.
     pub is_screen_sharing: bool,
@@ -210,6 +210,13 @@ pub struct ActiveConnection {
     pub screen_share_active: Arc<AtomicBool>,
     /// Flag set when a viewer requests a keyframe.
     pub keyframe_requested: Arc<AtomicBool>,
+    /// Epoch ms of the last frame-loss signal for our screen share (a
+    /// viewer's report, our own path stats or local send backpressure); the
+    /// encoder steps its bitrate/fps down while these keep coming. 0 = none.
+    pub share_loss_ms: Arc<AtomicU64>,
+    /// Recent viewer loss reports; only a majority of viewers steps the share
+    /// down, so one flaky (or hostile) viewer cannot degrade it for everyone.
+    pub share_loss_tally: Arc<std::sync::Mutex<LossTally>>,
     /// The user_id of the screenshare we're currently watching (if any).
     pub watching_user_id: Option<UserId>,
     /// Shared atomic version of watching_user_id for cross-task access (0 = not watching).
@@ -253,6 +260,15 @@ pub struct ActiveConnection {
     // ── Per-user volume ──
     /// Per-user volume multiplier (0.0 = muted, 1.0 = default, 2.0 = max).
     pub user_volumes: Arc<std::sync::Mutex<HashMap<u32, f32>>>,
+}
+
+/// Who reported frame loss on our screen share, and how many viewers there are
+/// to compare that against. See `network::majority_reached`.
+#[derive(Default)]
+pub struct LossTally {
+    pub viewer_count: u32,
+    /// Viewer user id → epoch ms of its last report of dropped frames.
+    pub reports: HashMap<UserId, u64>,
 }
 
 /// Voice activation mode.

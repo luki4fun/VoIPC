@@ -5,6 +5,7 @@ mod crypto;
 mod global_keys;
 mod network;
 mod screenshare;
+mod transport;
 
 use app_state::AppState;
 use tauri::Manager;

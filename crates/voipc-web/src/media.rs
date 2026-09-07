@@ -19,24 +19,20 @@ const ENCRYPTED_SCREEN_AUDIO: u8 = VideoPacketType::EncryptedScreenShareAudio as
 pub fn build_voice_packet(
     key: &MediaKey,
     session_id: u32,
-    udp_token: u64,
     sequence: u32,
     opus: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
     let aad = build_aad(key.channel_id, ENCRYPTED_VOICE);
     let encrypted = media_encrypt(key, session_id, sequence, 0, &aad, opus)?;
-    Ok(
-        VoicePacket::encrypted_voice(session_id, udp_token, sequence, key.key_id, encrypted)
-            .to_bytes(),
-    )
+    Ok(VoicePacket::encrypted_voice(session_id, sequence, key.key_id, encrypted).to_bytes())
 }
 
-pub fn build_eot_packet(session_id: u32, udp_token: u64, sequence: u32) -> Vec<u8> {
-    VoicePacket::end_of_transmission(session_id, udp_token, sequence).to_bytes()
+pub fn build_eot_packet(session_id: u32, sequence: u32) -> Vec<u8> {
+    VoicePacket::end_of_transmission(session_id, sequence).to_bytes()
 }
 
-pub fn build_ping_packet(session_id: u32, udp_token: u64, sequence: u32) -> Vec<u8> {
-    VoicePacket::ping(session_id, udp_token, sequence).to_bytes()
+pub fn build_ping_packet(session_id: u32, sequence: u32) -> Vec<u8> {
+    VoicePacket::ping(session_id, sequence).to_bytes()
 }
 
 pub struct VoiceInfo {
