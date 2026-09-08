@@ -12,6 +12,20 @@
 import { emit } from "./events";
 import { wasm } from "./wasm";
 import type { AudioApi, SessionContext } from "./types";
+import {
+  DEFAULT_RANGE,
+  FLAT,
+  MAX_MUFFLE,
+  defaultListener,
+  defaultSource,
+  gains as spatialGains,
+  testSource,
+  testVoiceFrame,
+  type Gains,
+  type Listener,
+  type ProximityMode,
+  type Source as SpatialSource,
+} from "../../lib/spatial";
 
 const SAMPLE_RATE = 48_000;
 const FRAME_US = 20_000;
@@ -27,8 +41,34 @@ const KEY_MISSING_WARN_MS = 2_000;
 const VAD_HOLD_FRAMES = 15;
 const CAPTURE_RESTART_MS = 1_000;
 const MIC_TEST_EMIT_MS = 45;
+/**
+ * Mixer key of the settings panel's spatial test: above any session id and
+ * clear of SCREEN_AUDIO_FLAG, so it collides with no real source.
+ */
+const SPATIAL_TEST_KEY = 0x7fff_fffe;
+/** Frames kept queued ahead of the worklet (its jitter buffer wants 2 to start). */
+const SPATIAL_TEST_LEAD = 3;
+const SPATIAL_TEST_TICK_MS = 20;
+
+/** How often we look at our position while syncing it (network.rs beacon). */
+const POSITION_TICK_MS = 100;
+/** Re-announce even an unmoved position this often, so late joiners converge. */
+const POSITION_KEEPALIVE_MS = 1_000;
 
 type VoiceMode = "ptt" | "vad" | "always_on";
+
+/** The settings panel's spatial test while it runs (app_state.rs SpatialTest). */
+interface SpatialTest {
+  mode: ProximityMode;
+  /** Wall clock the orbit started: what the gains and the panel's label use. */
+  startedMs: number;
+  /** Audio clock at the same moment: what frame scheduling uses. */
+  startedAt: number;
+  sample: number;
+  sequence: number;
+  posted: number;
+  timer: ReturnType<typeof setInterval>;
+}
 type AudioDeviceInfo = { name: string; is_default: boolean };
 
 interface CaptureFrame {
@@ -43,6 +83,12 @@ interface Source {
   /** Sequence numbers of chunks submitted to the decoder, in order. */
   pending: number[];
   lastActivity: number;
+}
+
+/** A finite number in [lo, hi], or `fallback` (commands.rs does the same). */
+function finite(v: number | undefined, fallback: number, lo: number, hi: number): number {
+  const n = v == null || !Number.isFinite(v) ? fallback : v;
+  return Math.min(Math.max(n, lo), hi);
 }
 
 function describeError(e: unknown): string {
@@ -215,6 +261,21 @@ export class AudioEngine implements AudioApi {
   private speaking = new Map<number, number>();
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
 
+  // Proximity chat. Mirrors SpatialState in client/src-tauri/src/app_state.rs:
+  // positions are local, only "sync my position" puts ours on the wire.
+  private proximity: ProximityMode = "off";
+  private spatialEnabled = true;
+  private screenAudioSpatial = true;
+  private positionSync = false;
+  private listener: Listener = defaultListener();
+  private positions = new Map<number, SpatialSource>();
+  private positionSequence = 0;
+  private beaconTimer: ReturnType<typeof setInterval> | null = null;
+  /** Our position moved since the last beacon. */
+  private positionDirty = false;
+  private positionSentAt = 0;
+  private spatialTest: SpatialTest | null = null;
+
   get muted(): boolean {
     return this._muted;
   }
@@ -235,9 +296,15 @@ export class AudioEngine implements AudioApi {
     this.keyMissingEmitted = false;
     this.noDecoderEmitted = false;
     this.userVolumes.clear();
+    this.clearPositions();
+    this.positionSync = false;
+    this.proximity = "off";
     this.mixer?.port.postMessage({ type: "reset" });
     if (!this.sweepTimer) {
       this.sweepTimer = setInterval(() => this.sweep(), SPEAKING_SWEEP_MS);
+    }
+    if (!this.beaconTimer) {
+      this.beaconTimer = setInterval(() => this.sendPositionBeacon(), POSITION_TICK_MS);
     }
     this.ensureGraph().catch((e) => {
       emit("audio-device-error", { error: describeError(e) });
@@ -252,15 +319,46 @@ export class AudioEngine implements AudioApi {
     this.dropSources();
     this.mixer?.port.postMessage({ type: "clear" });
     this.speaking.clear();
+    this.clearPositions();
+    this.positionSync = false;
+    this.proximity = "off";
     if (this.sweepTimer) {
       clearInterval(this.sweepTimer);
       this.sweepTimer = null;
     }
+    if (this.beaconTimer) {
+      clearInterval(this.beaconTimer);
+      this.beaconTimer = null;
+    }
   }
 
-  onChannelChanged(): void {
+  /**
+   * A channel switch. `proximity` is the new channel's mode; leaving a
+   * proximity channel drops every placement, so a stale layout can never
+   * leak into the next channel.
+   */
+  onChannelChanged(proximity: ProximityMode = "off"): void {
     this.dropSources();
     this.mixer?.port.postMessage({ type: "clear" });
+    this.positionSync = false;
+    this.clearPositions();
+    this.setProximityMode(proximity);
+  }
+
+  /**
+   * The current channel's proximity mode changed (an admin or the creator
+   * switched it). Turning it off drops every placement.
+   */
+  setProximityMode(proximity: ProximityMode): void {
+    if (proximity === this.proximity) return;
+    this.proximity = proximity;
+    if (proximity === "off") {
+      this.positionSync = false;
+      this.clearPositions();
+    }
+    this.pushSpatialGains();
+    // Same payload shape as network.rs, channel included
+    emit("proximity-mode", { channel_id: this.ctx?.channelId ?? 0, mode: proximity });
   }
 
   // ── Incoming media ───────────────────────────────────────────────────
@@ -421,7 +519,9 @@ export class AudioEngine implements AudioApi {
         const mixer = new AudioWorkletNode(ac, "voipc-mixer", {
           numberOfInputs: 0,
           numberOfOutputs: 1,
-          outputChannelCount: [1],
+          // Stereo: proximity chat places voices left/right. A non-spatial
+          // channel writes the same samples to both, as before.
+          outputChannelCount: [2],
         });
         mixer.port.onmessage = (e: MessageEvent<{ type: string; played: number; lost: number }>) => {
           if (e.data?.type === "stats") {
@@ -435,6 +535,7 @@ export class AudioEngine implements AudioApi {
           mixer.port.postMessage({ type: "user-volume", userId, gain });
         }
         this.mixer = mixer;
+        this.pushSpatialGains(mixer);
         this.masterGain = master;
         await this.applyOutputDevice();
       })().catch((e) => {
@@ -714,6 +815,222 @@ export class AudioEngine implements AudioApi {
     return this.userVolumes.get(userId) ?? 1;
   }
 
+  // ── Proximity chat ───────────────────────────────────────────────────
+
+  /** Place another user, or remove their placement when `pos` is null. */
+  setUserPosition(
+    userId: number,
+    pos: [number, number, number] | null,
+    opts?: { range?: number; volume?: number; muffle?: number; direct?: boolean },
+  ): void {
+    if (!pos) {
+      this.positions.delete(userId);
+    } else {
+      // A NaN would make every gain NaN and, through the worklet's filter
+      // state, silence that source for good (commands.rs rejects it too)
+      if (!pos.every(Number.isFinite)) return;
+      this.positions.set(userId, {
+        pos,
+        range: finite(opts?.range, DEFAULT_RANGE, 0.01, Number.MAX_VALUE),
+        volume: finite(opts?.volume, 1, 0, 2),
+        muffle: Math.min(Math.max(opts?.muffle ?? 0, 0), MAX_MUFFLE),
+        direct: opts?.direct ?? false,
+      });
+    }
+    this.pushSpatialGains();
+  }
+
+  /** Move ourselves, and share the position when syncing is on. */
+  setOwnPosition(pos: [number, number, number], fwd?: [number, number]): void {
+    if (!pos.every(Number.isFinite)) return;
+    const f = fwd ?? [0, 1];
+    const len = Math.hypot(f[0], f[1]);
+    this.listener = {
+      pos,
+      fwd: Number.isFinite(len) && len > 1e-6 ? [f[0] / len, f[1] / len] : [0, 1],
+    };
+    this.pushSpatialGains();
+    // The beacon tick sends it within 100 ms. Sending here would put one
+    // datagram on the wire per pointer event, ten times what the server relays.
+    this.positionDirty = true;
+  }
+
+  /** Start or stop sharing our own position with the channel. */
+  setPositionSync(enabled: boolean): void {
+    this.positionSync = enabled;
+    if (enabled) {
+      // Everyone else's placement was our local guess until now
+      this.positions.clear();
+      this.pushSpatialGains();
+      this.positionDirty = true;
+    }
+  }
+
+  /**
+   * Forget every placement (room reset, or a game disconnecting). Goes
+   * through the normal push, which sends an empty list — a `spatial-clear`
+   * would also drop the settings panel's test for a frame.
+   */
+  clearPositions(): void {
+    this.positions.clear();
+    this.listener = defaultListener();
+    this.pushSpatialGains();
+  }
+
+  setSpatialSetting(key: string, value: boolean): void {
+    if (key === "spatial_audio") this.spatialEnabled = value;
+    else if (key === "screen_audio_spatial") this.screenAudioSpatial = value;
+    this.pushSpatialGains();
+  }
+
+  /** A peer shared their position (encrypted position beacon, type 0x06). */
+  onPositionPacket(bytes: Uint8Array): void {
+    const c = this.ctx;
+    if (!c || !c.mediaKey) return;
+    // While we are not syncing, our own layout of the room is authoritative
+    if (!this.positionSync) return;
+    let info;
+    try {
+      info = wasm().decryptPositionPacket(c.mediaKey, bytes);
+    } catch {
+      return;
+    }
+    const existing = this.positions.get(info.session_id);
+    const pos: [number, number, number] = [info.x, info.y, info.z];
+    this.positions.set(info.session_id, existing ? { ...existing, pos } : defaultSource(pos));
+    this.pushSpatialGains();
+    emit("user-position", { user_id: info.session_id, x: info.x, y: info.y, z: info.z });
+  }
+
+  /** Drop a user's placement (they left the channel). */
+  onUserLeft(userId: number): void {
+    if (this.positions.delete(userId)) this.pushSpatialGains();
+  }
+
+  private sendPositionBeacon(): void {
+    // Unreliable datagrams, and members who join later missed every earlier
+    // one — the keepalive is what makes the room converge.
+    if (!this.positionSync || this.proximity === "off") return;
+    const now = performance.now();
+    if (!this.positionDirty && now - this.positionSentAt < POSITION_KEEPALIVE_MS) return;
+    this.positionDirty = false;
+    this.positionSentAt = now;
+    this.sendPosition(this.listener.pos);
+  }
+
+  private sendPosition(pos: [number, number, number]): void {
+    const c = this.ctx;
+    if (!c || !c.mediaKey) return;
+    try {
+      const packet = wasm().buildPositionPacket(
+        c.mediaKey,
+        c.sessionId,
+        this.positionSequence++,
+        pos[0],
+        pos[1],
+        pos[2],
+      );
+      c.sendDatagram(packet);
+    } catch (e) {
+      console.error("failed to send position:", e);
+    }
+  }
+
+  /**
+   * Recompute every source's stereo gains and hand them to the worklet. An
+   * empty list clears the worklet's map, so this is also how placements are
+   * dropped — the settings panel's test keeps its own gains through that.
+   */
+  private pushSpatialGains(mixer: AudioWorkletNode | null = this.mixer): void {
+    if (!mixer) return;
+    const entries: [number, number, number, number][] = [];
+    const push = (key: number, g: Gains) => entries.push([key, g.l, g.r, g.lpA]);
+    if (this.proximity !== "off" && this.spatialEnabled) {
+      for (const [userId, src] of this.positions) {
+        const g = spatialGains(this.proximity, this.listener, src);
+        push(userId, g);
+        // A share's audio follows its sharer, unless the viewer turned that off
+        push((userId | SCREEN_AUDIO_FLAG) >>> 0, this.screenAudioSpatial ? g : FLAT);
+      }
+    }
+    // The test has its own mode and runs in any channel, the lobby included
+    const test = this.spatialTest;
+    if (test) {
+      const t = (performance.now() - test.startedMs) / 1000;
+      push(
+        SPATIAL_TEST_KEY,
+        this.spatialEnabled
+          ? spatialGains(test.mode, defaultListener(), testSource(test.mode, t))
+          : FLAT,
+      );
+    }
+    mixer.port.postMessage({ type: "spatial", gains: entries });
+  }
+
+  // ── The settings panel's spatial test ────────────────────────────────
+
+  /**
+   * A synthetic voice orbits the listener through the real worklet, so what
+   * the user hears is what proximity chat does. No session needed: the audio
+   * graph stands on its own, like the mic test.
+   */
+  async startSpatialTest(mode: ProximityMode): Promise<void> {
+    if (mode === "off") throw new Error("Pick 2d or 3d");
+    const ac = await this.ensureGraph();
+    const previous = this.spatialTest;
+    if (previous) clearInterval(previous.timer);
+    // Switching modes keeps the generator phase and the sequence: no click
+    this.spatialTest = {
+      mode,
+      startedMs: performance.now(),
+      startedAt: ac.currentTime,
+      sample: previous?.sample ?? 0,
+      sequence: previous?.sequence ?? 0,
+      posted: 0,
+      timer: setInterval(() => this.spatialTestTick(), SPATIAL_TEST_TICK_MS),
+    };
+    this.spatialTestTick();
+  }
+
+  private spatialTestTick(): void {
+    const test = this.spatialTest;
+    const ac = this.audioContext;
+    if (!test || !this.mixer || !ac) return;
+    // Scheduled against the audio clock, not the timer: a throttled or late
+    // timer posts the backlog at once instead of drifting, and a suspended
+    // context (autoplay policy) does not pile frames up at all.
+    const due = Math.floor((ac.currentTime - test.startedAt) * 50) + SPATIAL_TEST_LEAD;
+    while (test.posted < due) {
+      const pcm = testVoiceFrame(test.sample);
+      test.sample += pcm.length;
+      test.posted++;
+      this.mixer.port.postMessage(
+        { type: "frame", source: SPATIAL_TEST_KEY, sequence: test.sequence++, pcm },
+        [pcm.buffer],
+      );
+    }
+    this.pushSpatialGains(); // the orbit moved
+  }
+
+  stopSpatialTest(): void {
+    const test = this.spatialTest;
+    if (!test) return;
+    clearInterval(test.timer);
+    this.spatialTest = null;
+    if (this.mixer) {
+      // One frame faded to silence: cutting mid-syllable would click
+      const pcm = testVoiceFrame(test.sample);
+      for (let i = 0; i < pcm.length; i++) pcm[i] *= 1 - i / pcm.length;
+      this.mixer.port.postMessage(
+        { type: "frame", source: SPATIAL_TEST_KEY, sequence: test.sequence, pcm },
+        [pcm.buffer],
+      );
+      this.mixer.port.postMessage({ type: "eot", source: SPATIAL_TEST_KEY });
+    }
+    // No gain push: the worklet keeps the last gains for the buffered tail,
+    // and the next push (any placement change) drops the key.
+  }
+
   async setVoiceMode(mode: string): Promise<void> {
     this.voiceMode = mode === "vad" || mode === "always_on" ? mode : "ptt";
   }
@@ -736,6 +1053,8 @@ export class AudioEngine implements AudioApi {
     vad_threshold_db: number;
     input_device: string | null;
     output_device: string | null;
+    spatial_audio?: boolean;
+    screen_audio_spatial?: boolean;
   }): void {
     this._muted = s.muted;
     this._deafened = s.deafened;
@@ -747,6 +1066,10 @@ export class AudioEngine implements AudioApi {
     this.setVadThreshold(s.vad_threshold_db);
     this.inputDevice = s.input_device;
     this.outputDevice = s.output_device;
+    // The persisted spatial preferences, like network.rs seeds SpatialState
+    this.spatialEnabled = s.spatial_audio ?? true;
+    this.screenAudioSpatial = s.screen_audio_spatial ?? true;
+    this.pushSpatialGains();
     if (this.mixer) void this.applyOutputDevice();
   }
 

@@ -111,6 +111,21 @@ pub struct AppConfig {
     /// on Linux and no Firefox anywhere can decode it).
     pub screen_share_codec: String,
 
+    // Proximity chat
+    /// Render voices positionally in proximity channels. Off gives everyone
+    /// the plain centred mix (mono headsets, hearing in one ear, preference).
+    pub spatial_audio: bool,
+    /// Whether a screen share's audio is placed at its sharer's position or
+    /// stays centred. Each viewer decides for themselves.
+    pub screen_audio_spatial: bool,
+    /// Accept connections from a game on the local SDK port.
+    pub sdk_enabled: bool,
+    /// Port the game SDK listens on (loopback only).
+    pub sdk_port: u16,
+    /// Extra browser origins allowed to connect to the SDK, on top of the
+    /// built-in game-runtime patterns. `"null"` covers a `file://` page.
+    pub sdk_allowed_origins: Vec<String>,
+
     // QoL
     pub sounds: SoundSettings,
     pub auto_connect: bool,
@@ -148,6 +163,11 @@ impl Default for AppConfig {
             last_accept_self_signed: None,
             saved_servers: Vec::new(),
             screen_share_codec: "h264".into(),
+            spatial_audio: true,
+            screen_audio_spatial: true,
+            sdk_enabled: false,
+            sdk_port: 39987,
+            sdk_allowed_origins: Vec::new(),
             sounds: SoundSettings::default(),
             auto_connect: false,
             share_channel_history: true,

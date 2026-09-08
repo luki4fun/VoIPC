@@ -13,7 +13,7 @@ export const isMobile = writable(false);
 export const volumeKeyPtt = writable(false);
 
 /** The currently active mobile tab */
-export type MobileTab = 'channels' | 'chat' | 'users';
+export type MobileTab = 'channels' | 'chat' | 'room' | 'users';
 export const mobileTab = writable<MobileTab>('chat');
 
 // Detect platform on init.

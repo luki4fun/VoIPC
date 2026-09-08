@@ -31,6 +31,10 @@ pub enum ClientMessage {
     CreateChannel {
         name: String,
         password: Option<String>,
+        /// Positional audio mode. A server with proximity chat disabled
+        /// refuses anything but Off with a ChannelError.
+        #[serde(default)]
+        proximity: ProximityMode,
     },
 
     /// Client is disconnecting gracefully.
@@ -52,6 +56,14 @@ pub enum ClientMessage {
     SetChannelPassword {
         channel_id: ChannelId,
         password: Option<String>,
+    },
+
+    /// Change the positional audio mode of a channel (creator or admin;
+    /// persistent channels admin only). Answered with ChannelUpdated or
+    /// ChannelError.
+    SetChannelProximity {
+        channel_id: ChannelId,
+        proximity: ProximityMode,
     },
 
     /// Kick a user from a channel (creator only).

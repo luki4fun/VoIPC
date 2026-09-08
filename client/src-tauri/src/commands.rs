@@ -4,7 +4,9 @@ use std::sync::atomic::Ordering;
 use serde::Serialize;
 use tauri::{Emitter, State};
 
+use voipc_audio::spatial::{Listener, Source};
 use voipc_protocol::messages::ClientMessage;
+use voipc_protocol::types::ProximityMode;
 use voipc_protocol::voice::VoicePacket;
 
 use crate::app_state::{AppState, PendingMessage, PendingTarget};
@@ -153,6 +155,7 @@ pub async fn create_channel(
     state: State<'_, AppState>,
     name: String,
     password: Option<String>,
+    proximity: Option<String>,
 ) -> Result<(), String> {
     if name.is_empty() || name.len() > 128 {
         return Err("channel name must be 1-128 characters".into());
@@ -162,11 +165,47 @@ pub async fn create_channel(
             return Err("password too long".into());
         }
     }
+    let proximity = parse_proximity(proximity.as_deref())?;
     let conn = state.connection.read().await;
     let connection = conn.as_ref().ok_or("Not connected")?;
     network::send_tcp_message(
         &connection.tcp_tx,
-        &ClientMessage::CreateChannel { name, password },
+        &ClientMessage::CreateChannel {
+            name,
+            password,
+            proximity,
+        },
+    )
+    .await
+}
+
+/// Parse the UI's proximity string. None keeps the channel non-positional.
+fn parse_proximity(mode: Option<&str>) -> Result<ProximityMode, String> {
+    match mode {
+        None | Some("off") => Ok(ProximityMode::Off),
+        Some("2d") => Ok(ProximityMode::TwoD),
+        Some("3d") => Ok(ProximityMode::ThreeD),
+        Some(other) => Err(format!("unknown proximity mode: {other}")),
+    }
+}
+
+/// Change a channel's proximity mode (creator, or an admin for a channel from
+/// channels.json).
+#[tauri::command]
+pub async fn set_channel_proximity(
+    state: State<'_, AppState>,
+    channel_id: u32,
+    proximity: String,
+) -> Result<(), String> {
+    let proximity = parse_proximity(Some(&proximity))?;
+    let conn = state.connection.read().await;
+    let connection = conn.as_ref().ok_or("Not connected")?;
+    network::send_tcp_message(
+        &connection.tcp_tx,
+        &ClientMessage::SetChannelProximity {
+            channel_id,
+            proximity,
+        },
     )
     .await
 }
@@ -1679,6 +1718,242 @@ pub async fn get_user_volume(
     let connection = conn.as_ref().ok_or("Not connected")?;
     let volumes = connection.user_volumes.lock().map_err(|e| e.to_string())?;
     Ok(volumes.get(&user_id).copied().unwrap_or(1.0))
+}
+
+// ---------------------------------------------------------------------------
+// Proximity chat: positions
+//
+// Positions are local state. The room view writes them from drags, the game
+// SDK writes them from the game, and only "sync my position" puts our own on
+// the wire, as an encrypted position beacon sent by network.rs's beacon task
+// (at most ten a second, plus a keepalive once a second).
+// ---------------------------------------------------------------------------
+
+/// Place another user, or remove their placement when `pos` is None.
+#[tauri::command]
+pub async fn set_user_position(
+    state: State<'_, AppState>,
+    user_id: u32,
+    pos: Option<[f32; 3]>,
+    range: Option<f32>,
+    volume: Option<f32>,
+    muffle: Option<u8>,
+    direct: Option<bool>,
+) -> Result<(), String> {
+    let conn = state.connection.read().await;
+    let connection = conn.as_ref().ok_or("Not connected")?;
+    let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+    match pos {
+        None => {
+            spatial.sources.remove(&user_id);
+        }
+        Some(pos) => {
+            if !pos.iter().all(|c| c.is_finite()) {
+                return Err("position must be finite".into());
+            }
+            spatial.sources.insert(
+                user_id,
+                Source {
+                    pos,
+                    range: range.unwrap_or(voipc_audio::spatial::DEFAULT_RANGE).max(0.01),
+                    volume: volume.unwrap_or(1.0).clamp(0.0, 2.0),
+                    muffle: muffle.unwrap_or(0).min(voipc_audio::spatial::MAX_MUFFLE),
+                    direct: direct.unwrap_or(false),
+                },
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Move ourselves. `fwd` is the facing direction in the x/y plane; the room
+/// view leaves it at (0, 1) so panning is screen-relative there.
+#[tauri::command]
+pub async fn set_own_position(
+    state: State<'_, AppState>,
+    pos: [f32; 3],
+    fwd: Option<[f32; 2]>,
+) -> Result<(), String> {
+    if !pos.iter().all(|c| c.is_finite()) {
+        return Err("position must be finite".into());
+    }
+    let fwd = fwd.unwrap_or([0.0, 1.0]);
+    let len = (fwd[0] * fwd[0] + fwd[1] * fwd[1]).sqrt();
+    let fwd = if len.is_finite() && len > 1e-6 {
+        [fwd[0] / len, fwd[1] / len]
+    } else {
+        [0.0, 1.0]
+    };
+
+    let conn = state.connection.read().await;
+    let connection = conn.as_ref().ok_or("Not connected")?;
+    let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+    spatial.listener = Listener { pos, fwd };
+    // The beacon task picks this up within 100 ms. Sending here instead would
+    // put one datagram on the wire per pointer event, ten times the budget the
+    // server relays — and the drops would land on the last, resting position.
+    spatial.dirty = true;
+    Ok(())
+}
+
+/// Start or stop sharing our own position with the channel.
+#[tauri::command]
+pub async fn set_position_sync(
+    state: State<'_, AppState>,
+    enabled: bool,
+) -> Result<(), String> {
+    let conn = state.connection.read().await;
+    let connection = conn.as_ref().ok_or("Not connected")?;
+    let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+    spatial.sync = enabled;
+    if enabled {
+        // Everyone else's placement was our local guess until now; the
+        // peers who sync will replace it, the others sound flat.
+        spatial.sources.clear();
+        spatial.dirty = true; // announce where we stand on the next tick
+    }
+    Ok(())
+}
+
+/// Toggle a spatial-audio preference. Persists it, and applies it to the
+/// running mixer if we are connected.
+///
+/// Separate from `set_config_bool` because these two also have to reach the
+/// live `SpatialState`, which needs the async connection lock.
+#[tauri::command]
+pub async fn set_spatial_setting(
+    state: State<'_, AppState>,
+    key: String,
+    value: bool,
+) -> Result<(), String> {
+    match key.as_str() {
+        "spatial_audio" | "screen_audio_spatial" => {}
+        other => return Err(format!("Unknown spatial setting: {other}")),
+    }
+
+    {
+        let mut settings = state.settings.write().await;
+        match key.as_str() {
+            "spatial_audio" => settings.spatial_audio = value,
+            _ => settings.screen_audio_spatial = value,
+        }
+    }
+    if let Some(connection) = state.connection.read().await.as_ref() {
+        let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+        match key.as_str() {
+            "spatial_audio" => spatial.enabled = value,
+            _ => spatial.screen_audio_spatial = value,
+        }
+    }
+
+    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    match key.as_str() {
+        "spatial_audio" => config.spatial_audio = value,
+        _ => config.screen_audio_spatial = value,
+    }
+    crate::config::save_config(&config)
+}
+
+/// Whether the game SDK is available here, on, and which port it uses.
+#[tauri::command]
+pub async fn get_sdk_status(state: State<'_, AppState>) -> Result<serde_json::Value, String> {
+    // The live game too: Settings opened after the game connected missed the
+    // `sdk-status` event and would otherwise claim nothing is connected.
+    let game = state
+        .sdk_game
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
+    let config = state.config.lock().map_err(|e| e.to_string())?;
+    Ok(serde_json::json!({
+        "available": cfg!(not(target_os = "android")),
+        "enabled": config.sdk_enabled,
+        "port": config.sdk_port,
+        "origins": config.sdk_allowed_origins,
+        "connected": game.is_some(),
+        "game": game.unwrap_or_default(),
+    }))
+}
+
+/// Turn the game SDK on or off and set its port and extra allowed origins.
+/// The listener picks the change up within a second.
+#[tauri::command]
+pub async fn set_sdk_config(
+    state: State<'_, AppState>,
+    enabled: Option<bool>,
+    port: Option<u16>,
+    origins: Option<Vec<String>>,
+) -> Result<(), String> {
+    if let Some(port) = port {
+        if port < 1024 {
+            return Err("port must be 1024 or above".into());
+        }
+    }
+    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    if let Some(enabled) = enabled {
+        config.sdk_enabled = enabled;
+    }
+    if let Some(port) = port {
+        config.sdk_port = port;
+    }
+    if let Some(origins) = origins {
+        config.sdk_allowed_origins = origins
+            .into_iter()
+            .map(|o| o.trim().to_string())
+            .filter(|o| !o.is_empty())
+            .collect();
+    }
+    crate::config::save_config(&config)
+}
+
+/// Forget every placement (room reset, or a game disconnecting).
+#[tauri::command]
+pub async fn clear_positions(state: State<'_, AppState>) -> Result<(), String> {
+    let conn = state.connection.read().await;
+    let connection = conn.as_ref().ok_or("Not connected")?;
+    let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+    spatial.clear_positions();
+    Ok(())
+}
+
+/// Start (or re-aim) the spatial test: a synthetic voice orbits the listener
+/// through the live voice mixer, so what the user hears is exactly what
+/// proximity chat will do. Needs a connection: the mixer and the playback
+/// stream only exist while one is up.
+#[tauri::command]
+pub async fn start_spatial_test(state: State<'_, AppState>, mode: String) -> Result<(), String> {
+    let mode = parse_proximity(Some(&mode))?;
+    if mode == ProximityMode::Off {
+        return Err("Pick 2d or 3d".into());
+    }
+    let conn = state.connection.read().await;
+    let connection = conn
+        .as_ref()
+        .ok_or("Connect to a server first — the test plays through the live voice mixer")?;
+    let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+    // Switching modes mid-run keeps the generator phase and the gain ramp
+    let previous = spatial.test.take();
+    spatial.test = Some(crate::app_state::SpatialTest {
+        mode,
+        started: std::time::Instant::now(),
+        sample: previous.as_ref().map_or(0, |t| t.sample),
+        stopping: false,
+        mix: previous.map_or_else(Default::default, |t| t.mix),
+    });
+    Ok(())
+}
+
+/// Stop the spatial test. The mixer fades it out over one frame; a no-op when
+/// none runs or we are not connected.
+#[tauri::command]
+pub async fn stop_spatial_test(state: State<'_, AppState>) -> Result<(), String> {
+    if let Some(connection) = state.connection.read().await.as_ref() {
+        let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(test) = spatial.test.as_mut() {
+            test.stopping = true;
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

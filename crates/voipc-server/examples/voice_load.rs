@@ -141,6 +141,7 @@ async fn run_client(
         send.write_all(&encode_client_msg(&ClientMessage::CreateChannel {
             name: "LoadTest".into(),
             password: None,
+            proximity: Default::default(),
         })?)
         .await?;
         let mut existing: Option<u32> = None;

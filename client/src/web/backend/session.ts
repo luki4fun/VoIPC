@@ -8,6 +8,8 @@ import { emit } from "./events";
 import { loadWasm, wasm, type MediaKey, type PreKeyBundleData, type SignalClient } from "./wasm";
 import { connect as openTransport, type Transport } from "./transport";
 import type { SessionContext } from "./types";
+import type { ChannelInfo } from "../../lib/types";
+import type { ProximityMode } from "../../lib/spatial";
 import { audio } from "./audio";
 import { video } from "./video";
 import { share } from "./share";
@@ -138,6 +140,8 @@ export class Session implements SessionContext {
   transport: Transport | null = null;
   /** The sharer we are watching (0 = none). */
   watchingUserId = 0;
+  /** The channel list as last received — the source of each channel's proximity mode. */
+  private channels: ChannelInfo[] = [];
 
   // Signal tracking state (app_state.rs SignalState). Keys are user ids.
   private readonly establishedSessions = new Set<number>();
@@ -165,6 +169,19 @@ export class Session implements SessionContext {
 
   get isEnded(): boolean {
     return this.ended;
+  }
+
+  /** A channel's proximity mode, "off" for one we have never seen. */
+  proximityOf(channelId: number): ProximityMode {
+    return this.channels.find((c) => c.channel_id === channelId)?.proximity ?? "off";
+  }
+
+  /** Never mutates in place: the array must not be shared with anything emitted. */
+  private upsertChannel(channel: ChannelInfo): void {
+    const known = this.channels.some((c) => c.channel_id === channel.channel_id);
+    this.channels = known
+      ? this.channels.map((c) => (c.channel_id === channel.channel_id ? channel : c))
+      : [...this.channels, channel];
   }
 
   // ── SessionContext ──
@@ -323,6 +340,9 @@ export class Session implements SessionContext {
       case 0x15:
         if (this.attached) audio.onScreenAudioPacket(bytes);
         break;
+      case 0x06:
+        if (this.attached) audio.onPositionPacket(bytes);
+        break;
       case 0x04:
         this.onPong(bytes);
         break;
@@ -374,6 +394,8 @@ export class Session implements SessionContext {
         this.auth?.reject(new Error(`Authentication failed: ${b.reason}`));
         break;
       case "ChannelList":
+        // Our own copy: the emitted array ends up in the UI's store
+        this.channels = [...b.channels];
         emit("channel-list", b.channels);
         break;
       case "UserList":
@@ -390,6 +412,7 @@ export class Session implements SessionContext {
         this.establishedSessions.delete(uid);
         for (const set of this.senderKeyDistributed.values()) set.delete(uid);
         for (const set of this.senderKeyReceived.values()) set.delete(uid);
+        audio.onUserLeft(uid);
         emit("user-left", { user_id: uid, channel_id: b.channel_id });
         break;
       }
@@ -412,15 +435,20 @@ export class Session implements SessionContext {
       case "MovedToChannel":
         break;
       case "ChannelCreated":
+        this.upsertChannel(b.channel);
         emit("channel-created", b.channel);
         break;
       case "ChannelDeleted":
+        this.channels = this.channels.filter((c) => c.channel_id !== b.channel_id);
         emit("channel-deleted", { channel_id: b.channel_id });
         break;
       case "ChannelError":
         emit("channel-error", { reason: b.reason });
         break;
       case "ChannelUpdated":
+        this.upsertChannel(b.channel);
+        // The mode of the channel we are in may have just changed
+        audio.setProximityMode(this.proximityOf(this.channelId));
         emit("channel-updated", b.channel);
         break;
       case "Kicked":
@@ -571,7 +599,7 @@ export class Session implements SessionContext {
       }
       // Our own share belonged to the old channel's members and its media key
       if (share.sharing) share.stop();
-      audio.onChannelChanged();
+      audio.onChannelChanged(this.proximityOf(channelId));
     }
 
     // Pairwise sessions are needed in every channel (DMs, pokes), not just for channel chat

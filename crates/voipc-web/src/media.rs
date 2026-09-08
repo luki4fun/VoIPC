@@ -10,11 +10,12 @@ use voipc_protocol::video::{
     fragment_frame, FrameAssembler, ScreenShareAudioPacket, VideoPacket, VideoPacketType,
     MAX_ENCRYPTED_VIDEO_PAYLOAD_SIZE, MAX_FRAGMENTS_PER_FRAME,
 };
-use voipc_protocol::voice::{VoicePacket, VoicePacketType};
+use voipc_protocol::voice::{PositionPayload, VoicePacket, VoicePacketType};
 
 /// Packet type bytes that tag the AAD (and through it the nonce) per stream.
 const ENCRYPTED_VOICE: u8 = VoicePacketType::EncryptedOpusVoice as u8;
 const ENCRYPTED_SCREEN_AUDIO: u8 = VideoPacketType::EncryptedScreenShareAudio as u8;
+const POSITION: u8 = VoicePacketType::Position as u8;
 
 /// Encrypted voice packet (0x05) for one Opus frame.
 pub fn build_voice_packet(
@@ -65,12 +66,61 @@ pub fn parse_voice_packet(key: Option<&MediaKey>, bytes: &[u8]) -> anyhow::Resul
             None
         }
         VoicePacketType::OpusVoice => bail!("plaintext voice packet rejected"),
+        VoicePacketType::Position => bail!("position packet is not voice"),
     };
     Ok(VoiceInfo {
         packet_type: packet.packet_type as u8,
         session_id: packet.session_id,
         sequence: packet.sequence,
         opus,
+    })
+}
+
+/// Encrypted position beacon (0x06). Same shape as the native client's
+/// `network::send_position`: the channel key, its own sequence counter and a
+/// packet-type byte in the AAD that keeps positions in their own nonce domain.
+pub fn build_position_packet(
+    key: &MediaKey,
+    session_id: u32,
+    sequence: u32,
+    x: f32,
+    y: f32,
+    z: f32,
+) -> anyhow::Result<Vec<u8>> {
+    let aad = build_aad(key.channel_id, POSITION);
+    let payload = PositionPayload { x, y, z };
+    let encrypted = media_encrypt(key, session_id, sequence, 0, &aad, &payload.to_bytes())?;
+    Ok(VoicePacket::position(session_id, sequence, key.key_id, encrypted).to_bytes())
+}
+
+pub struct PositionInfo {
+    pub session_id: u32,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+/// Decrypts a position beacon (0x06); any other packet type is an error.
+pub fn parse_position_packet(key: &MediaKey, bytes: &[u8]) -> anyhow::Result<PositionInfo> {
+    let packet = VoicePacket::from_bytes(bytes)?;
+    if packet.packet_type != VoicePacketType::Position {
+        bail!("not a position packet");
+    }
+    let aad = build_aad(key.channel_id, POSITION);
+    let plaintext = media_decrypt(
+        key,
+        packet.session_id,
+        packet.sequence,
+        0,
+        &aad,
+        &packet.opus_data,
+    )?;
+    let payload = PositionPayload::from_bytes(&plaintext)?;
+    Ok(PositionInfo {
+        session_id: packet.session_id,
+        x: payload.x,
+        y: payload.y,
+        z: payload.z,
     })
 }
 

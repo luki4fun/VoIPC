@@ -23,7 +23,7 @@ use voipc_protocol::video::{
     FrameAssembler, FrameGrouper, RecordReader, ScreenShareAudioPacket, VideoPacket,
     SCREEN_AUDIO_HEADER_SIZE, VIDEO_HEADER_SIZE,
 };
-use voipc_protocol::voice::VoicePacket;
+use voipc_protocol::voice::{PositionPayload, VoicePacket, VoicePacketType};
 
 use crate::app_state::{ActiveConnection, AppState, LossTally, PendingTarget, SignalState};
 use crate::screenshare;
@@ -310,6 +310,20 @@ pub async fn connect_to_server(
     let user_volumes: Arc<std::sync::Mutex<HashMap<u32, f32>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
 
+    // Proximity chat: positions and the current channel's mode. Seeded from
+    // the persisted client settings; the channel's mode arrives with the
+    // channel list.
+    let spatial = {
+        let s = state.settings.read().await;
+        Arc::new(std::sync::Mutex::new(crate::app_state::SpatialState {
+            enabled: s.spatial_audio,
+            screen_audio_spatial: s.screen_audio_spatial,
+            ..Default::default()
+        }))
+    };
+    let channels_snapshot: Arc<std::sync::Mutex<Vec<voipc_protocol::types::ChannelInfo>>> =
+        Arc::new(std::sync::Mutex::new(Vec::new()));
+
     // Per-user jitter buffers + decoders — UDP receiver pushes, mixer pops
     let mix_sources: MixSources = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
@@ -344,6 +358,8 @@ pub async fn connect_to_server(
         watching_codec.clone(),
         share_loss_ms.clone(),
         share_loss_tally.clone(),
+        spatial.clone(),
+        channels_snapshot.clone(),
     ));
     let udp_send_handle = tokio::spawn(datagram_sender_task(connection.clone(), voice_rx));
     let video_send_handle = tokio::spawn(video_stream_sender_task(connection.clone(), video_rx));
@@ -380,6 +396,7 @@ pub async fn connect_to_server(
         screen_audio_recv_count.clone(),
         current_media_key.clone(),
         current_channel_id.clone(),
+        spatial.clone(),
     ));
     let video_recv_handle = tokio::spawn(video_stream_receiver_task(
         connection.clone(),
@@ -404,6 +421,7 @@ pub async fn connect_to_server(
         output_device_live.clone(),
         is_deafened.clone(),
         user_volumes.clone(),
+        spatial.clone(),
         master_volume.clone(),
         voice_frames_played.clone(),
         voice_frames_lost.clone(),
@@ -412,6 +430,17 @@ pub async fn connect_to_server(
 
     // Latency display from QUIC's RTT estimate (NAT keepalives are QUIC's job)
     let latency_handle = tokio::spawn(latency_task(connection.clone(), app_handle.clone()));
+    // Re-announce our position once a second while syncing it
+    let position_sequence = Arc::new(AtomicU32::new(0));
+    let beacon_handle = tokio::spawn(position_beacon_task(
+        connection.clone(),
+        spatial.clone(),
+        voice_tx.clone(),
+        current_media_key.clone(),
+        session_id,
+        current_channel_id.clone(),
+        position_sequence.clone(),
+    ));
     // Our own uplink's congestion, which viewer reports cannot see
     let congestion_handle = tokio::spawn(congestion_task(
         connection,
@@ -423,6 +452,7 @@ pub async fn connect_to_server(
     let connection = ActiveConnection {
         user_id,
         username,
+        server_address: address.clone(),
         session_id,
         is_muted,
         is_deafened,
@@ -442,6 +472,7 @@ pub async fn connect_to_server(
             video_decode_handle,
             mixer_handle,
             latency_handle,
+            beacon_handle,
             congestion_handle,
         ],
         transmitting,
@@ -480,6 +511,9 @@ pub async fn connect_to_server(
         current_audio_level: Arc::new(AtomicI32::new(-9600)),
         noise_suppression: Arc::new(AtomicBool::new(saved_ns)),
         user_volumes,
+        spatial,
+        channels: channels_snapshot,
+        position_sequence,
     };
 
     let mut conn = state.connection.write().await;
@@ -572,6 +606,8 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     watching_codec: Arc<AtomicU8>,
     share_loss_ms: Arc<AtomicU64>,
     share_loss_tally: Arc<std::sync::Mutex<LossTally>>,
+    spatial: Arc<std::sync::Mutex<crate::app_state::SpatialState>>,
+    channels_snapshot: Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
 ) {
     'read: loop {
         match read_half.read_buf(&mut buf).await {
@@ -611,6 +647,8 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
                             &watching_codec,
                             &share_loss_ms,
                             &share_loss_tally,
+                            &spatial,
+                            &channels_snapshot,
                         )
                         .await;
                     }
@@ -637,6 +675,87 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
 /// Also handles E2E encryption orchestration (session establishment, sender key
 /// distribution, and automatic decryption of encrypted messages).
 #[allow(clippy::too_many_arguments)]
+/// Replace the cached channel list.
+fn set_channels(cache: &Arc<std::sync::Mutex<Vec<ChannelInfo>>>, channels: Vec<ChannelInfo>) {
+    if let Ok(mut list) = cache.lock() {
+        *list = channels;
+    }
+}
+
+/// Insert or replace one channel in the cache.
+fn upsert_channel(cache: &Arc<std::sync::Mutex<Vec<ChannelInfo>>>, channel: ChannelInfo) {
+    if let Ok(mut list) = cache.lock() {
+        match list.iter_mut().find(|c| c.channel_id == channel.channel_id) {
+            Some(existing) => *existing = channel,
+            None => list.push(channel),
+        }
+    }
+}
+
+/// A channel switch: drop the old room and take on the new channel's mode.
+/// Mirrors `AudioEngine.onChannelChanged` in the browser backend — a layout
+/// (and our own sharing) belongs to the channel it was made in, even when the
+/// next channel happens to have the same mode.
+fn on_channel_changed(
+    spatial: &Arc<std::sync::Mutex<crate::app_state::SpatialState>>,
+    cache: &Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
+    channel_id: u32,
+    app_handle: &tauri::AppHandle,
+) {
+    {
+        let mut sp = match spatial.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        sp.sync = false;
+        sp.clear_positions();
+    }
+    apply_channel_proximity(spatial, cache, channel_id, app_handle);
+}
+
+/// Point the mixer at the proximity mode of the channel we are in. Leaving a
+/// proximity channel drops every placement, so a stale layout can never leak
+/// into the next channel.
+fn apply_channel_proximity(
+    spatial: &Arc<std::sync::Mutex<crate::app_state::SpatialState>>,
+    cache: &Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
+    channel_id: u32,
+    app_handle: &tauri::AppHandle,
+) {
+    let mode = cache
+        .lock()
+        .ok()
+        .and_then(|list| {
+            list.iter()
+                .find(|c| c.channel_id == channel_id)
+                .map(|c| c.proximity)
+        })
+        .unwrap_or(ProximityMode::Off);
+
+    let changed = {
+        let mut sp = match spatial.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if sp.mode == mode {
+            return;
+        }
+        sp.mode = mode;
+        if mode == ProximityMode::Off {
+            sp.sync = false;
+            sp.clear_positions();
+        }
+        true
+    };
+    if changed {
+        let _ = app_handle.emit(
+            "proximity-mode",
+            serde_json::json!({"channel_id": channel_id, "mode": mode}),
+        );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle_server_message(
     msg: ServerMessage,
     app_handle: &tauri::AppHandle,
@@ -650,6 +769,8 @@ async fn handle_server_message(
     watching_codec: &Arc<AtomicU8>,
     share_loss_ms: &Arc<AtomicU64>,
     share_loss_tally: &Arc<std::sync::Mutex<LossTally>>,
+    spatial: &Arc<std::sync::Mutex<crate::app_state::SpatialState>>,
+    channels_snapshot: &Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
 ) {
     match msg {
         ServerMessage::VideoLossReported {
@@ -681,6 +802,13 @@ async fn handle_server_message(
             }
         }
         ServerMessage::ChannelList { channels } => {
+            set_channels(channels_snapshot, channels.clone());
+            apply_channel_proximity(
+                spatial,
+                channels_snapshot,
+                channel_id_store.load(Ordering::Relaxed),
+                app_handle,
+            );
             let _ = app_handle.emit("channel-list", &channels);
         }
         ServerMessage::UserList { channel_id, users } => {
@@ -717,6 +845,13 @@ async fn handle_server_message(
                     let _ = send_tcp_message(tcp_tx, &ClientMessage::StopWatchingScreenShare).await;
                     let _ = app_handle.emit("screen-share-force-stopped", ());
                 }
+
+                // The room belongs to the channel we just left; the new
+                // channel's mode is what the mixer renders from here on.
+                // This is the only place a join reaches the spatial state:
+                // the server sends ChannelList once at login and
+                // ChannelUpdated only on a settings change.
+                on_channel_changed(spatial, channels_snapshot, channel_id, app_handle);
             }
 
             // Auto-request prekey bundles for users we don't have sessions with.
@@ -786,6 +921,10 @@ async fn handle_server_message(
                     set.remove(&user_id);
                 }
             }
+            // Forget where they stood — the id is reused for the next joiner
+            if let Ok(mut sp) = spatial.lock() {
+                sp.sources.remove(&user_id);
+            }
 
             let _ = app_handle.emit(
                 "user-left",
@@ -824,9 +963,13 @@ async fn handle_server_message(
             info!("moved to channel {}", channel_id);
         }
         ServerMessage::ChannelCreated { channel } => {
+            upsert_channel(channels_snapshot, channel.clone());
             let _ = app_handle.emit("channel-created", &channel);
         }
         ServerMessage::ChannelDeleted { channel_id } => {
+            if let Ok(mut list) = channels_snapshot.lock() {
+                list.retain(|c| c.channel_id != channel_id);
+            }
             let _ = app_handle.emit(
                 "channel-deleted",
                 serde_json::json!({"channel_id": channel_id}),
@@ -839,6 +982,13 @@ async fn handle_server_message(
             );
         }
         ServerMessage::ChannelUpdated { channel } => {
+            upsert_channel(channels_snapshot, channel.clone());
+            apply_channel_proximity(
+                spatial,
+                channels_snapshot,
+                channel_id_store.load(Ordering::Relaxed),
+                app_handle,
+            );
             let _ = app_handle.emit("channel-updated", &channel);
         }
         ServerMessage::Kicked { channel_id, reason } => {
@@ -1936,6 +2086,9 @@ struct MixSource {
     /// buffered tail has fully drained (an immediate reset would clip it).
     eot_received: bool,
     last_activity: std::time::Instant,
+    /// Where this source's gains and muffle filter were left last frame, so
+    /// the next one ramps on from there instead of stepping (which clicks).
+    mix: voipc_audio::mixer::SourceMixState,
 }
 
 impl MixSource {
@@ -1945,6 +2098,7 @@ impl MixSource {
             decoder: voipc_audio::decoder::Decoder::new()?,
             eot_received: false,
             last_activity: std::time::Instant::now(),
+            mix: voipc_audio::mixer::SourceMixState::default(),
         })
     }
 }
@@ -1970,6 +2124,7 @@ async fn voice_mixer_task(
     output_device_live: Arc<std::sync::Mutex<Option<String>>>,
     is_deafened: Arc<AtomicBool>,
     user_volumes: Arc<std::sync::Mutex<HashMap<u32, f32>>>,
+    spatial: Arc<std::sync::Mutex<crate::app_state::SpatialState>>,
     master_volume: Arc<AtomicU32>,
     voice_frames_played: Arc<AtomicU32>,
     voice_frames_lost: Arc<AtomicU32>,
@@ -1981,13 +2136,25 @@ async fn voice_mixer_task(
     let mut interval = tokio::time::interval(std::time::Duration::from_millis(20));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    // Resampler for output devices that can't run 48kHz
+    // Resamplers for output devices that can't run 48kHz — one per channel,
+    // each carrying its own interpolation state
     let mut out_rate = playback_stream.as_ref().map_or(48_000, |s| s.sample_rate());
-    let mut resampler = (out_rate != 48_000)
-        .then(|| voipc_audio::resample::LinearResampler::new(48_000, out_rate));
+    let mut resampler = (out_rate != 48_000).then(|| {
+        (
+            voipc_audio::resample::LinearResampler::new(48_000, out_rate),
+            voipc_audio::resample::LinearResampler::new(48_000, out_rate),
+        )
+    });
     let mut last_restart_attempt: Option<std::time::Instant> = None;
     let mut error_emitted = false;
-    let mut frames: Vec<(u32, Vec<f32>)> = Vec::new();
+    // Interleaved stereo mix for one 20 ms frame
+    let mut stereo: Vec<f32> = Vec::new();
+    // One frame of the settings panel's spatial test, when it runs
+    let mut test_frame: Vec<f32> = Vec::new();
+    let mut chan_l: Vec<f32> = Vec::new();
+    let mut chan_r: Vec<f32> = Vec::new();
+    let mut out_l: Vec<f32> = Vec::new();
+    let mut out_r: Vec<f32> = Vec::new();
     let mut resampled: Vec<f32> = Vec::new();
 
     loop {
@@ -2013,7 +2180,10 @@ async fn voice_mixer_task(
                     Ok((stream, prod)) => {
                         out_rate = stream.sample_rate();
                         resampler = (out_rate != 48_000).then(|| {
-                            voipc_audio::resample::LinearResampler::new(48_000, out_rate)
+                            (
+                                voipc_audio::resample::LinearResampler::new(48_000, out_rate),
+                                voipc_audio::resample::LinearResampler::new(48_000, out_rate),
+                            )
                         });
                         playback_stream = Some(stream);
                         producer = Some(prod);
@@ -2040,15 +2210,33 @@ async fn voice_mixer_task(
 
         // Backpressure: if the ring already holds >3 frames, skip this tick
         // (caps clock drift between our timer and the device clock)
-        let frame_out = (out_rate as usize * 20) / 1000;
+        // ×2: the ring carries interleaved stereo
+        let frame_out = (out_rate as usize * 20) / 1000 * 2;
         if let Some(p) = producer.as_ref() {
             if p.occupied_len() > 3 * frame_out {
                 continue;
             }
         }
 
-        // Pull + decode one frame per source
-        frames.clear();
+        // Pull, decode and mix one frame per source. Mixing runs under the
+        // same lock as the decode so each source's gain ramp state stays with
+        // it — a per-frame gain step would click.
+        let master = f32::from_bits(master_volume.load(Ordering::Relaxed));
+        let deafened = is_deafened.load(Ordering::Relaxed);
+        let volumes = user_volumes
+            .lock()
+            .map(|v| v.clone())
+            .unwrap_or_default();
+        // ponytail: the spatial state is locked for the whole 20 ms mix; the
+        // writers (room drags, SDK updates) hold it for microseconds
+        let mut sp = match spatial.lock() {
+            Ok(s) => s,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        stereo.clear();
+        stereo.resize(voipc_protocol::voice::OPUS_FRAME_SIZE * 2, 0.0);
+        let mut mixed_any = false;
         {
             let mut map = match sources.lock() {
                 Ok(m) => m,
@@ -2077,48 +2265,215 @@ async fn voice_mixer_task(
                         }
                     }
                 };
-                match pcm {
-                    Ok(pcm) => frames.push((key, pcm)),
-                    Err(e) => warn!("Opus decode error from source {:#x}: {}", key, e),
+                let pcm = match pcm {
+                    Ok(pcm) => pcm,
+                    Err(e) => {
+                        warn!("Opus decode error from source {:#x}: {}", key, e);
+                        continue;
+                    }
+                };
+                if deafened {
+                    continue; // decoded to keep the Opus state, then dropped
                 }
+
+                let is_screen_audio = key & SCREEN_AUDIO_FLAG != 0;
+                let user_id = key & !SCREEN_AUDIO_FLAG;
+                let vol = volumes.get(&user_id).copied().unwrap_or(1.0) * master;
+                let g = sp.gains_for(user_id, is_screen_audio);
+                voipc_audio::mixer::mix_source_stereo(
+                    &mut stereo,
+                    &pcm,
+                    &mut src.mix,
+                    (g.l * vol, g.r * vol),
+                    g.lp_a,
+                );
+                mixed_any = true;
             }
         }
 
-        if frames.is_empty() || is_deafened.load(Ordering::Relaxed) {
+        // The settings panel's spatial test: a synthetic voice on the test
+        // orbit, rendered by the same gains() and the same ramped mix as a
+        // real speaker. Always relative to the default listener — the test is
+        // about the headphones, not about where the user stands in the room —
+        // and it honours the spatial-audio toggle, so flipping that while it
+        // runs is the A/B comparison.
+        let spatial_enabled = sp.enabled;
+        let mut test_finished = false;
+        if let Some(test) = sp.test.as_mut() {
+            if deafened {
+                // Phase frozen: undeafening resumes without a click
+                test_finished = test.stopping;
+            } else {
+                test_frame.resize(voipc_protocol::voice::OPUS_FRAME_SIZE, 0.0);
+                voipc_audio::spatial::test_voice_frame(test.sample, &mut test_frame);
+                test.sample += test_frame.len() as u64;
+                let (target, lp_a) = test.frame_target(
+                    spatial_enabled,
+                    master,
+                    test.started.elapsed().as_secs_f32(),
+                );
+                voipc_audio::mixer::mix_source_stereo(
+                    &mut stereo,
+                    &test_frame,
+                    &mut test.mix,
+                    target,
+                    lp_a,
+                );
+                mixed_any = true;
+                test_finished = test.stopping;
+            }
+        }
+        if test_finished {
+            sp.test = None;
+        }
+        drop(sp);
+
+        if !mixed_any {
             continue; // ring drains to silence; decode above kept Opus state
         }
-
-        // Mix with per-user gain × master volume
-        let master = f32::from_bits(master_volume.load(Ordering::Relaxed));
-        let mixed = {
-            let volumes = user_volumes
-                .lock()
-                .map(|v| v.clone())
-                .unwrap_or_default();
-            let weighted: Vec<(&[f32], f32)> = frames
-                .iter()
-                .map(|(key, pcm)| {
-                    let vol = volumes
-                        .get(&(key & !SCREEN_AUDIO_FLAG))
-                        .copied()
-                        .unwrap_or(1.0);
-                    (pcm.as_slice(), vol * master)
-                })
-                .collect();
-            voipc_audio::mixer::mix_streams_weighted(&weighted)
-        };
+        voipc_audio::mixer::clamp(&mut stereo);
 
         if let Some(p) = producer.as_mut() {
             match resampler.as_mut() {
-                Some(r) => {
+                Some((rl, rr)) => {
+                    // Resample each channel on its own state, then re-interleave
+                    chan_l.clear();
+                    chan_r.clear();
+                    for pair in stereo.chunks_exact(2) {
+                        chan_l.push(pair[0]);
+                        chan_r.push(pair[1]);
+                    }
+                    out_l.clear();
+                    out_r.clear();
+                    rl.process(&chan_l, &mut out_l);
+                    rr.process(&chan_r, &mut out_r);
                     resampled.clear();
-                    r.process(&mixed, &mut resampled);
+                    for (l, r) in out_l.iter().zip(out_r.iter()) {
+                        resampled.push(*l);
+                        resampled.push(*r);
+                    }
                     let _ = p.push_slice(&resampled);
                 }
                 None => {
-                    let _ = p.push_slice(&mixed);
+                    let _ = p.push_slice(&stereo);
                 }
             }
+        }
+    }
+}
+
+/// Encrypt and send one position beacon for this client.
+///
+/// Positions ride the media path like voice: AES-256-GCM under the channel
+/// key, so the relay carries 39 opaque bytes and learns nothing but that a
+/// member is sharing a position. They have their own sequence counter because
+/// the AAD's packet-type byte puts them in their own nonce domain, and because
+/// gaps in the voice counter would look like packet loss to receivers.
+///
+/// Best effort: a full queue or a missing key drops the beacon, and the next
+/// one (or the 1 s keepalive) carries the position instead.
+fn send_position_parts(
+    voice_tx: &mpsc::Sender<Vec<u8>>,
+    media_key: &Arc<std::sync::Mutex<Option<MediaKey>>>,
+    session_id: u32,
+    channel_id: &AtomicU32,
+    position_sequence: &AtomicU32,
+    pos: [f32; 3],
+) {
+    let key = {
+        let guard = match media_key.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match guard.as_ref() {
+            Some(k) => k.clone(),
+            None => return, // no channel key yet
+        }
+    };
+
+    let sequence = position_sequence.fetch_add(1, Ordering::Relaxed);
+    let aad = voipc_crypto::build_aad(
+        channel_id.load(Ordering::Relaxed),
+        VoicePacketType::Position as u8,
+    );
+    let payload = PositionPayload {
+        x: pos[0],
+        y: pos[1],
+        z: pos[2],
+    };
+    let encrypted = match voipc_crypto::media_encrypt(
+        &key,
+        session_id,
+        sequence,
+        0,
+        &aad,
+        &payload.to_bytes(),
+    ) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            warn!("position encryption failed: {e}");
+            return;
+        }
+    };
+    let packet = VoicePacket::position(session_id, sequence, key.key_id, encrypted);
+    let _ = voice_tx.try_send(packet.to_bytes());
+}
+
+/// How often the beacon task looks at our position: a move is announced on the
+/// next tick, so a drag can never exceed ten beacons a second.
+const POSITION_TICK: std::time::Duration = std::time::Duration::from_millis(100);
+/// Re-announce even a position that has not moved this often, so a member who
+/// joins later converges.
+const POSITION_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Sends our position while we are syncing it: within 100 ms of a move, and
+/// once a second regardless.
+///
+/// Beacons are unreliable datagrams and a member who joins later has missed
+/// every earlier one, so the keepalive is what makes the room converge.
+async fn position_beacon_task(
+    connection: Connection,
+    spatial: Arc<std::sync::Mutex<crate::app_state::SpatialState>>,
+    voice_tx: mpsc::Sender<Vec<u8>>,
+    media_key: Arc<std::sync::Mutex<Option<MediaKey>>>,
+    session_id: u32,
+    channel_id: Arc<AtomicU32>,
+    position_sequence: Arc<AtomicU32>,
+) {
+    let mut interval = tokio::time::interval(POSITION_TICK);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut last_sent = tokio::time::Instant::now() - POSITION_KEEPALIVE;
+    loop {
+        tokio::select! {
+            _ = interval.tick() => {
+                let pos = {
+                    let mut sp = match spatial.lock() {
+                        Ok(s) => s,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if !sp.sync || sp.mode == ProximityMode::Off {
+                        continue;
+                    }
+                    // A move goes out on the next tick (≤10/s, the rate the
+                    // server relays); otherwise the keepalive carries it.
+                    let due = sp.dirty || last_sent.elapsed() >= POSITION_KEEPALIVE;
+                    if !due {
+                        continue;
+                    }
+                    sp.dirty = false;
+                    sp.listener.pos
+                };
+                last_sent = tokio::time::Instant::now();
+                send_position_parts(
+                    &voice_tx,
+                    &media_key,
+                    session_id,
+                    &channel_id,
+                    &position_sequence,
+                    pos,
+                );
+            }
+            _ = connection.closed() => return,
         }
     }
 }
@@ -2309,6 +2664,7 @@ async fn datagram_receiver_task(
     screen_audio_recv_count: Arc<AtomicU32>,
     media_key: Arc<std::sync::Mutex<Option<MediaKey>>>,
     channel_id: Arc<AtomicU32>,
+    spatial: Arc<std::sync::Mutex<crate::app_state::SpatialState>>,
 ) {
     let mut recv_count: u64 = 0;
     // Track last voice packet time per user for speaking timeout
@@ -2420,6 +2776,75 @@ async fn datagram_receiver_task(
                             let _ = app_handle.emit(
                                 "user-speaking",
                                 serde_json::json!({"user_id": session_id, "speaking": true}),
+                            );
+                        }
+                    }
+                    // Position beacon from a member who syncs their position
+                    0x06 => {
+                        let header_size = voipc_protocol::voice::ENCRYPTED_VOICE_HEADER_SIZE;
+                        if n != voipc_protocol::voice::POSITION_PACKET_SIZE {
+                            continue;
+                        }
+                        let session_id = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
+                        let sequence = u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]);
+
+                        let plaintext = {
+                            let key_guard = media_key.lock().unwrap_or_else(|poisoned| {
+                                warn!("media key mutex poisoned — recovering");
+                                poisoned.into_inner()
+                            });
+                            let Some(key) = key_guard.as_ref() else { continue };
+                            let ch_id = channel_id.load(Ordering::Relaxed);
+                            let aad = voipc_crypto::build_aad(
+                                ch_id,
+                                VoicePacketType::Position as u8,
+                            );
+                            match voipc_crypto::media_decrypt(
+                                key,
+                                session_id,
+                                sequence,
+                                0,
+                                &aad,
+                                &buf[header_size..n],
+                            ) {
+                                Ok(decrypted) => decrypted,
+                                Err(e) => {
+                                    warn!("position decryption failed from session {session_id}: {e}");
+                                    continue;
+                                }
+                            }
+                        };
+                        let Ok(payload) = PositionPayload::from_bytes(&plaintext) else {
+                            continue;
+                        };
+
+                        // While we are not syncing, our own layout of the room
+                        // is authoritative and peers' positions are ignored.
+                        let accepted = {
+                            let mut sp = match spatial.lock() {
+                                Ok(s) => s,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            if sp.sync && !sp.sdk_active {
+                                let src = sp
+                                    .sources
+                                    .entry(session_id)
+                                    .or_insert_with(voipc_audio::spatial::Source::default);
+                                src.pos = [payload.x, payload.y, payload.z];
+                                true
+                            } else {
+                                false
+                            }
+                        };
+                        if accepted {
+                            let _ = app_handle.emit(
+                                "user-position",
+                                serde_json::json!({
+                                    "user_id": session_id,
+                                    "x": payload.x,
+                                    "y": payload.y,
+                                    "z": payload.z,
+                                }),
                             );
                         }
                     }

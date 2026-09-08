@@ -21,8 +21,12 @@ pub struct PlaybackStream {
     sample_rate: u32,
 }
 
-/// Fill an interleaved output buffer from the mono ring buffer, duplicating
-/// each sample to all channels and fading out on underrun to avoid clicks.
+/// Fill the device's interleaved output buffer from the ring buffer, which
+/// carries interleaved **stereo** since proximity chat needs a stereo image.
+///
+/// A mono device gets the downmix, a stereo device the pair as-is, and a
+/// surround device gets L and R on the front pair with the downmix behind, so
+/// nobody loses a channel. On underrun the tail fades out to avoid a click.
 fn fill_output(
     consumer: &mut ringbuf::HeapCons<f32>,
     data: &mut [f32],
@@ -31,21 +35,29 @@ fn fill_output(
 ) {
     let frames = data.len() / channels;
     scratch.clear();
-    scratch.resize(frames, 0.0);
-    let read = consumer.pop_slice(scratch);
-    if read < frames && read > 0 {
-        let fade_len = read.min(32);
-        let fade_start = read - fade_len;
+    scratch.resize(frames * 2, 0.0);
+    let read_frames = consumer.pop_slice(scratch) / 2;
+    if read_frames < frames && read_frames > 0 {
+        let fade_len = read_frames.min(32);
+        let fade_start = read_frames - fade_len;
         for i in 0..fade_len {
-            scratch[fade_start + i] *= 1.0 - (i as f32 / fade_len as f32);
+            let factor = 1.0 - (i as f32 / fade_len as f32);
+            scratch[2 * (fade_start + i)] *= factor;
+            scratch[2 * (fade_start + i) + 1] *= factor;
         }
     }
-    if channels == 1 {
-        data.copy_from_slice(scratch);
-    } else {
-        for (frame, &sample) in data.chunks_mut(channels).zip(scratch.iter()) {
-            for ch in frame.iter_mut() {
-                *ch = sample;
+    for (frame, pair) in data.chunks_mut(channels).zip(scratch.chunks_exact(2)) {
+        let (l, r) = (pair[0], pair[1]);
+        match channels {
+            1 => frame[0] = 0.5 * (l + r),
+            _ => {
+                frame[0] = l;
+                frame[1] = r;
+                // ponytail: extra channels get the downmix; proper surround
+                // placement if anyone ever asks for it
+                for ch in frame[2..].iter_mut() {
+                    *ch = 0.5 * (l + r);
+                }
             }
         }
     }
@@ -54,8 +66,9 @@ fn fill_output(
 /// Start playing audio through the given device (or default).
 ///
 /// Returns the playback stream handle and a ring buffer producer that the
-/// mixer writes PCM samples into **at the stream's sample rate** (query it
-/// via [`PlaybackStream::sample_rate`]; 48kHz unless the device can't).
+/// mixer writes **interleaved stereo** PCM into, at the stream's sample rate
+/// (query it via [`PlaybackStream::sample_rate`]; 48kHz unless the device
+/// can't).
 /// `error_flag` is set when the stream reports an error (e.g. the device
 /// disappeared) so the owner can rebuild it.
 pub fn start_playback(
@@ -93,8 +106,8 @@ pub fn start_playback(
         "starting audio playback"
     );
 
-    // ~200ms of mono samples at the stream rate
-    let rb = HeapRb::<f32>::new((actual_rate / 5) as usize);
+    // ~200ms of interleaved stereo samples at the stream rate
+    let rb = HeapRb::<f32>::new((actual_rate / 5) as usize * 2);
     let (producer, mut consumer) = rb.split();
 
     let error_cb = {
@@ -151,5 +164,67 @@ unsafe impl Sync for PlaybackStream {}
 impl PlaybackStream {
     pub fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ringbuf::traits::Producer;
+
+    /// Feeds `pairs` into a ring buffer and renders one callback of `frames`
+    /// frames for a device with `channels` channels.
+    fn render(pairs: &[(f32, f32)], frames: usize, channels: usize) -> Vec<f32> {
+        let rb = HeapRb::<f32>::new(4096);
+        let (mut producer, mut consumer) = rb.split();
+        for &(l, r) in pairs {
+            producer.try_push(l).unwrap();
+            producer.try_push(r).unwrap();
+        }
+        let mut data = vec![0.0f32; frames * channels];
+        let mut scratch = Vec::new();
+        fill_output(&mut consumer, &mut data, channels, &mut scratch);
+        data
+    }
+
+    #[test]
+    fn stereo_device_gets_the_pair_unchanged() {
+        let out = render(&[(0.25, 0.75), (-0.5, 0.5)], 2, 2);
+        assert_eq!(out, vec![0.25, 0.75, -0.5, 0.5]);
+    }
+
+    #[test]
+    fn mono_device_gets_the_downmix() {
+        let out = render(&[(0.25, 0.75), (1.0, -1.0)], 2, 1);
+        assert_eq!(out, vec![0.5, 0.0]);
+    }
+
+    #[test]
+    fn surround_device_keeps_the_front_pair() {
+        let out = render(&[(0.2, 0.8)], 1, 6);
+        assert_eq!(out[0], 0.2);
+        assert_eq!(out[1], 0.8);
+        for &s in &out[2..] {
+            assert!((s - 0.5).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn underrun_fades_the_tail_and_leaves_silence() {
+        // 40 frames available, 100 asked for: the last 32 fade out
+        let pairs: Vec<(f32, f32)> = (0..40).map(|_| (1.0, 1.0)).collect();
+        let out = render(&pairs, 100, 2);
+        assert_eq!(out[0], 1.0, "the head is untouched");
+        assert!(out[2 * 39] < 0.05, "the tail should have faded");
+        assert!(out[2 * 39] >= 0.0);
+        for &s in &out[80..] {
+            assert_eq!(s, 0.0, "past the data it must be silent");
+        }
+    }
+
+    #[test]
+    fn a_dry_ring_is_silence_not_noise() {
+        let out = render(&[], 8, 2);
+        assert!(out.iter().all(|&s| s == 0.0));
     }
 }

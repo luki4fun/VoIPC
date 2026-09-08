@@ -17,6 +17,8 @@
   } from "../stores/screenshare.js";
   import { isMobile, isWeb } from "../stores/platform.js";
   import { addNotification } from "../stores/notifications.js";
+  import { currentProximity } from "../stores/room.js";
+  import { screenAudioSpatial, spatialAudio } from "../stores/settings.js";
 
   let bitrateLabel = $derived(
     $receiverBitrate >= 1000
@@ -66,6 +68,17 @@
     bridge?.setVideoCanvas(canvasEl);
     return () => bridge?.setVideoCanvas(null);
   });
+
+  /** Does this share's audio come from where the sharer stands, or centred? */
+  async function toggleScreenAudioSpatial() {
+    const value = !$screenAudioSpatial;
+    screenAudioSpatial.set(value);
+    try {
+      await invoke("set_spatial_setting", { key: "screen_audio_spatial", value });
+    } catch (e) {
+      addNotification(`Failed to save setting: ${e}`, "error");
+    }
+  }
 
   async function stopWatching() {
     try {
@@ -141,6 +154,15 @@
           <span class="stat dropped">{$receiverFramesDropped} dropped</span>
         {/if}
       </span>
+    {/if}
+    {#if $currentProximity !== "off" && $spatialAudio}
+      <button
+        class="popout-btn no-auto-margin"
+        onclick={toggleScreenAudioSpatial}
+        title={$screenAudioSpatial
+          ? "This share's audio comes from where the sharer stands — click to centre it"
+          : "This share's audio is centred — click to place it where the sharer stands"}
+      >{$screenAudioSpatial ? "Placed audio" : "Centred audio"}</button>
     {/if}
     <button class="popout-btn fullscreen-btn" onclick={toggleFullscreen} title="Fullscreen (double-click video)">&#x26F6;</button>
     {#if !$isMobile && !isWeb}

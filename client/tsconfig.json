@@ -21,5 +21,7 @@
     "noUnusedParameters": true,
     "noFallthroughCasesInSwitch": true
   },
-  "include": ["src/**/*.ts", "src/**/*.svelte"]
+  "include": ["src/**/*.ts", "src/**/*.svelte"],
+  // Run by `npm test` under Node's own runner, which brings its own types
+  "exclude": ["src/**/*.test.ts"]
 }

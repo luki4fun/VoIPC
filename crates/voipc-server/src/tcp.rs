@@ -382,6 +382,10 @@ where
                         close: Default::default(),
                         history_request_rate: crate::state::RateLimiter::new(3.0, 0.5),
                         udp_voice_rate: crate::state::RateLimiter::new(55.0, 55.0),
+                        // Position beacons: senders coalesce to 10 Hz, so 12/s
+                        // with a matching burst is plenty and keeps them off
+                        // the voice budget.
+                        position_rate: crate::state::RateLimiter::new(12.0, 12.0),
                         // 1200 pkt/s ≈ 12 Mbps at 1280B packets: covers 1080p60
                         // video (~7.5 Mbps) + screen audio with headroom; burst
                         // 400 absorbs a full keyframe (up to 255 fragments).
@@ -447,7 +451,11 @@ async fn handle_message(
             handle_join_channel(state, user_id, session_id, channel_id, password.as_deref(), tx)
                 .await?;
         }
-        ClientMessage::CreateChannel { name, password } => {
+        ClientMessage::CreateChannel {
+            name,
+            password,
+            proximity,
+        } => {
             let allowed = state
                 .sessions
                 .get_mut(&session_id)
@@ -458,7 +466,8 @@ async fn handle_message(
                     reason: "rate limit exceeded, try again later".into(),
                 }).await;
             } else {
-                handle_create_channel(state, user_id, session_id, name, password, tx).await?;
+                handle_create_channel(state, user_id, session_id, name, password, proximity, tx)
+                    .await?;
             }
         }
         ClientMessage::Disconnect => {
@@ -507,6 +516,13 @@ async fn handle_message(
             password,
         } => {
             handle_set_channel_password(state, user_id, session_id, channel_id, password, tx)
+                .await?;
+        }
+        ClientMessage::SetChannelProximity {
+            channel_id,
+            proximity,
+        } => {
+            handle_set_channel_proximity(state, user_id, session_id, channel_id, proximity, tx)
                 .await?;
         }
         ClientMessage::KickUser {
@@ -934,6 +950,7 @@ async fn handle_create_channel(
     session_id: SessionId,
     name: String,
     password: Option<String>,
+    proximity: ProximityMode,
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
     // Validate and sanitize name
@@ -966,7 +983,7 @@ async fn handle_create_channel(
     // Store password for the join call (create_channel takes ownership)
     let join_password = password.clone();
 
-    match state.create_channel(name, password, user_id).await {
+    match state.create_channel(name, password, proximity, user_id).await {
         Ok(info) => {
             let channel_id = info.channel_id;
             // Broadcast ChannelCreated to all users
@@ -1010,6 +1027,39 @@ async fn handle_set_channel_password(
     let is_admin = state.is_admin(session_id);
     match state
         .set_channel_password(channel_id, user_id, password, is_admin)
+        .await
+    {
+        Ok(updated_info) => {
+            let msg = ServerMessage::ChannelUpdated {
+                channel: updated_info,
+            };
+            broadcast_to_all(state, &msg, None).await;
+        }
+        Err(e) => {
+            let _ = send_msg(
+                tx,
+                &ServerMessage::ChannelError {
+                    reason: e.to_string(),
+                },
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+/// Handle a proximity-mode change from the channel creator or an admin.
+async fn handle_set_channel_proximity(
+    state: &Arc<ServerState>,
+    user_id: UserId,
+    session_id: SessionId,
+    channel_id: ChannelId,
+    proximity: ProximityMode,
+    tx: &mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    let is_admin = state.is_admin(session_id);
+    match state
+        .set_channel_proximity(channel_id, user_id, proximity, is_admin)
         .await
     {
         Ok(updated_info) => {
@@ -2444,7 +2494,7 @@ mod tests {
 
         // Sharing needs a real channel; General never carries media.
         alice
-            .send(&ClientMessage::CreateChannel { name: "room".into(), password: None })
+            .send(&ClientMessage::CreateChannel { name: "room".into(), password: None, proximity: ProximityMode::Off })
             .await;
         let created = alice
             .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))

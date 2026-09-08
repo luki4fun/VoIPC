@@ -15,6 +15,12 @@ pub struct ServerSettings {
     /// Maximum channel name length.
     #[serde(default = "default_max_channel_name_len")]
     pub max_channel_name_len: usize,
+
+    /// Whether channels may use proximity (positional) audio at all. When
+    /// false, every channel is served as `off`, requests to enable it are
+    /// refused, and position beacons are not relayed.
+    #[serde(default = "default_proximity_enabled")]
+    pub proximity_enabled: bool,
 }
 
 fn default_empty_channel_timeout() -> u64 {
@@ -26,6 +32,9 @@ fn default_max_channels() -> u32 {
 fn default_max_channel_name_len() -> usize {
     32
 }
+fn default_proximity_enabled() -> bool {
+    true
+}
 
 impl Default for ServerSettings {
     fn default() -> Self {
@@ -33,6 +42,7 @@ impl Default for ServerSettings {
             empty_channel_timeout_secs: default_empty_channel_timeout(),
             max_channels: default_max_channels(),
             max_channel_name_len: default_max_channel_name_len(),
+            proximity_enabled: default_proximity_enabled(),
         }
     }
 }
@@ -54,6 +64,17 @@ mod tests {
         assert_eq!(settings.empty_channel_timeout_secs, 300);
         assert_eq!(settings.max_channels, 50);
         assert_eq!(settings.max_channel_name_len, 32);
+        assert!(settings.proximity_enabled);
+    }
+
+    #[test]
+    fn proximity_can_be_disabled() {
+        let settings: ServerSettings =
+            serde_json::from_str(r#"{"proximity_enabled": false}"#).unwrap();
+        assert!(!settings.proximity_enabled);
+        // A pre-0.6 settings file keeps proximity available
+        let old: ServerSettings = serde_json::from_str(r#"{"max_channels": 10}"#).unwrap();
+        assert!(old.proximity_enabled);
     }
 
     #[test]

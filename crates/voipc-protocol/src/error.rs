@@ -11,6 +11,12 @@ pub enum ProtocolError {
     #[error("invalid fragment: index {index} >= count {count}")]
     InvalidFragmentIndex { index: u8, count: u8 },
 
+    /// A position beacon carried NaN or infinity. Those would turn every
+    /// spatial gain computed from them into NaN and silence the whole mix,
+    /// so they are rejected at the parser.
+    #[error("invalid position: coordinates must be finite")]
+    InvalidPosition,
+
     #[error("message too large: {0} bytes (max 65536)")]
     MessageTooLarge(usize),
 

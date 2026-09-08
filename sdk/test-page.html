@@ -1,0 +1,139 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>VoIPC Game SDK — test page</title>
+<!--
+  Stands in for a game while you build against the VoIPC Game SDK
+  (docs/SDK.md). Open it in a browser, add "null" to Settings → Game
+  Integration → allowed origins (a file:// page has no real origin), connect,
+  and drag the sliders: the other user's voice should move.
+-->
+<style>
+  body { font: 14px system-ui, sans-serif; margin: 24px; max-width: 640px; }
+  h1 { font-size: 18px; }
+  fieldset { border: 1px solid #ccc; border-radius: 6px; margin: 12px 0; }
+  label { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  label span:first-child { width: 90px; }
+  input[type="range"] { flex: 1; }
+  output { width: 60px; text-align: right; font-variant-numeric: tabular-nums; }
+  #log { background: #111; color: #ddd; padding: 8px; height: 160px; overflow: auto;
+         font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; }
+  .row { display: flex; gap: 8px; align-items: center; }
+</style>
+
+<h1>VoIPC Game SDK — test page</h1>
+
+<div class="row">
+  <label style="flex: 1"><span>Address</span>
+    <input id="url" value="ws://127.0.0.1:39987/" style="flex: 1" />
+  </label>
+  <button id="connect">Connect</button>
+  <button id="disconnect" disabled>Disconnect</button>
+</div>
+
+<div class="row">
+  <label style="flex: 1"><span>VoIPC server</span>
+    <input id="server" value="127.0.0.1:9987" style="flex: 1"
+           title="The server VoIPC is connected to. A mismatch is answered with wrong_server." />
+  </label>
+</div>
+
+<fieldset>
+  <legend>You (the listener)</legend>
+  <label><span>x</span><input type="range" id="sx" min="-20" max="20" step="0.1" value="0" /><output id="sxv">0</output></label>
+  <label><span>y</span><input type="range" id="sy" min="-20" max="20" step="0.1" value="0" /><output id="syv">0</output></label>
+  <label><span>facing</span><input type="range" id="syaw" min="0" max="359" step="1" value="0" /><output id="syawv">0°</output></label>
+</fieldset>
+
+<fieldset>
+  <legend>Another player</legend>
+  <label><span>user id</span><input type="number" id="pid" value="2" min="1" style="width: 80px" /></label>
+  <label><span>x</span><input type="range" id="px" min="-20" max="20" step="0.1" value="3" /><output id="pxv">3</output></label>
+  <label><span>y</span><input type="range" id="py" min="-20" max="20" step="0.1" value="0" /><output id="pyv">0</output></label>
+  <label><span>range</span><input type="range" id="pr" min="1" max="40" step="0.5" value="8" /><output id="prv">8</output></label>
+  <label><span>volume</span><input type="range" id="pv" min="0" max="2" step="0.05" value="1" /><output id="pvv">1</output></label>
+  <label><span>muffle</span><input type="range" id="pm" min="0" max="10" step="1" value="0" /><output id="pmv">0</output></label>
+  <label><span>mode</span>
+    <select id="pmode">
+      <option value="spatial">spatial</option>
+      <option value="direct">direct (radio/phone/megaphone)</option>
+    </select>
+  </label>
+</fieldset>
+
+<div id="log"></div>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const logEl = $("log");
+  let socket = null;
+  let timer = null;
+
+  function log(line) {
+    logEl.textContent += line + "\n";
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function connect() {
+    socket = new WebSocket($("url").value);
+    socket.onopen = () => {
+      log("connected");
+      $("connect").disabled = true;
+      $("disconnect").disabled = false;
+      socket.send(JSON.stringify({
+        type: "hello",
+        sdk: 1,
+        game: "test-page",
+        resource: "sdk/test-page.html",
+        // Required: a mod naming another server is refused with wrong_server
+        server: $("server").value,
+      }));
+      // 10 Hz, the rate a real mod should use
+      timer = setInterval(sendUpdate, 100);
+    };
+    socket.onmessage = (e) => log("< " + e.data);
+    socket.onerror = () => log("socket error — is the integration enabled, and is 'null' an allowed origin?");
+    socket.onclose = (e) => {
+      log(`closed (${e.code})`);
+      clearInterval(timer);
+      timer = null;
+      socket = null;
+      $("connect").disabled = false;
+      $("disconnect").disabled = true;
+    };
+  }
+
+  function sendUpdate() {
+    if (!socket || socket.readyState !== WebSocket.OPEN) return;
+    const mode = $("pmode").value;
+    socket.send(JSON.stringify({
+      type: "update",
+      self: {
+        pos: [Number($("sx").value), Number($("sy").value), 0],
+        yaw: Number($("syaw").value),
+      },
+      players: [{
+        id: Number($("pid").value),
+        pos: [Number($("px").value), Number($("py").value), 0],
+        range: Number($("pr").value),
+        volume: Number($("pv").value),
+        muffle: Number($("pm").value),
+        mode,
+      }],
+    }));
+  }
+
+  // Live read-outs
+  for (const [input, out, suffix] of [
+    ["sx", "sxv", ""], ["sy", "syv", ""], ["syaw", "syawv", "°"],
+    ["px", "pxv", ""], ["py", "pyv", ""], ["pr", "prv", ""],
+    ["pv", "pvv", ""], ["pm", "pmv", ""],
+  ]) {
+    const el = $(input);
+    const show = () => ($(out).value = el.value + suffix);
+    el.addEventListener("input", show);
+    show();
+  }
+
+  $("connect").addEventListener("click", connect);
+  $("disconnect").addEventListener("click", () => socket && socket.close());
+</script>

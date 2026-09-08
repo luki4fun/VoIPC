@@ -50,6 +50,15 @@ jobs:
 
       - run: cargo test --workspace
 
+      # The browser half of the spatial maths and the room presets, under
+      # Node's own test runner (no dependencies to install). Needs Node 22 for
+      # --experimental-strip-types; the runner's default may be older.
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+      - name: Client unit tests
+        run: npm --prefix client test
+
       # Separate workspace (wasm-only dependencies), so it needs its own run.
       - name: Test the wasm crate on the host
         run: cargo test

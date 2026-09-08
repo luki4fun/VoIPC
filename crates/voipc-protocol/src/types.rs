@@ -100,6 +100,23 @@ pub struct OneTimePreKey {
     pub public_key: Vec<u8>,
 }
 
+/// Positional ("proximity") audio mode of a channel. Rendering happens on
+/// each client; the server only stores the mode and relays the encrypted
+/// position beacons of members who sync their position.
+///
+/// Coordinates are metres: x/y is the ground plane, z is up. `TwoD` ignores
+/// z for distance; `ThreeD` uses all three axes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ProximityMode {
+    #[default]
+    #[serde(rename = "off")]
+    Off,
+    #[serde(rename = "2d")]
+    TwoD,
+    #[serde(rename = "3d")]
+    ThreeD,
+}
+
 /// Information about a channel/room.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelInfo {
@@ -114,6 +131,9 @@ pub struct ChannelInfo {
     pub has_password: bool,
     /// User who created this channel (None for the permanent General channel).
     pub created_by: Option<UserId>,
+    /// Positional audio mode (protocol v6).
+    #[serde(default)]
+    pub proximity: ProximityMode,
 }
 
 #[cfg(test)]
@@ -151,6 +171,7 @@ mod tests {
             user_count: 3,
             has_password: true,
             created_by: Some(1),
+            proximity: ProximityMode::TwoD,
         };
         let bytes = postcard::to_allocvec(&info).unwrap();
         let decoded: ChannelInfo = postcard::from_bytes(&bytes).unwrap();
@@ -159,6 +180,17 @@ mod tests {
         assert_eq!(decoded.max_users, 10);
         assert!(decoded.has_password);
         assert_eq!(decoded.created_by, Some(1));
+        assert_eq!(decoded.proximity, ProximityMode::TwoD);
+    }
+
+    #[test]
+    fn proximity_mode_json_names() {
+        assert_eq!(serde_json::to_string(&ProximityMode::Off).unwrap(), "\"off\"");
+        assert_eq!(serde_json::to_string(&ProximityMode::TwoD).unwrap(), "\"2d\"");
+        assert_eq!(serde_json::to_string(&ProximityMode::ThreeD).unwrap(), "\"3d\"");
+        let m: ProximityMode = serde_json::from_str("\"3d\"").unwrap();
+        assert_eq!(m, ProximityMode::ThreeD);
+        assert!(serde_json::from_str::<ProximityMode>("\"4d\"").is_err());
     }
 
     #[test]

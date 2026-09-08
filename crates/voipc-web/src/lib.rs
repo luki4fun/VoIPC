@@ -250,6 +250,31 @@ pub fn decrypt_voice_packet(key: &MediaKey, data: &[u8]) -> Result<JsValue, JsEr
     Ok(voice_info_object(&info))
 }
 
+/// Encrypted position beacon (0x06) for the room's "sync my position".
+#[wasm_bindgen(js_name = buildPositionPacket)]
+pub fn build_position_packet(
+    key: &MediaKey,
+    session_id: u32,
+    sequence: u32,
+    x: f32,
+    y: f32,
+    z: f32,
+) -> Result<Vec<u8>, JsError> {
+    media::build_position_packet(&key.inner, session_id, sequence, x, y, z).map_err(js_err)
+}
+
+/// `{ session_id, x, y, z }` from a position beacon decrypted with `key`.
+#[wasm_bindgen(js_name = decryptPositionPacket)]
+pub fn decrypt_position_packet(key: &MediaKey, data: &[u8]) -> Result<JsValue, JsError> {
+    let info = media::parse_position_packet(&key.inner, data).map_err(js_err)?;
+    Ok(js_object(&[
+        ("session_id", JsValue::from(info.session_id)),
+        ("x", JsValue::from(info.x)),
+        ("y", JsValue::from(info.y)),
+        ("z", JsValue::from(info.z)),
+    ]))
+}
+
 fn voice_info_object(info: &media::VoiceInfo) -> JsValue {
     let mut fields = vec![
         ("packet_type", JsValue::from(info.packet_type)),

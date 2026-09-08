@@ -74,6 +74,25 @@ fn voice_packet_round_trip() {
 }
 
 #[test]
+fn position_packet_round_trip() {
+    let key = MediaKey::generate(7, 3).unwrap();
+    let packet = media::build_position_packet(&key, 42, 5, 1.5, -2.25, 0.75).unwrap();
+    assert_eq!(packet[0], 0x06);
+    assert_eq!(packet.len(), voipc_protocol::voice::POSITION_PACKET_SIZE);
+
+    let info = media::parse_position_packet(&key, &packet).unwrap();
+    assert_eq!(info.session_id, 42);
+    assert_eq!((info.x, info.y, info.z), (1.5, -2.25, 0.75));
+
+    // Wrong key fails authentication, and a voice packet is not a position
+    let other = MediaKey::generate(7, 4).unwrap();
+    assert!(media::parse_position_packet(&other, &packet).is_err());
+    let voice = media::build_voice_packet(&key, 42, 10, &[1, 2, 3]).unwrap();
+    assert!(media::parse_position_packet(&key, &voice).is_err());
+    assert!(media::parse_voice_packet(Some(&key), &packet).is_err());
+}
+
+#[test]
 fn screen_audio_round_trip() {
     let key = MediaKey::generate(7, 0).unwrap();
     let opus = [9u8; 40];

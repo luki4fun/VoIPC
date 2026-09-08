@@ -14,6 +14,9 @@ pub enum VoicePacketType {
     Pong = 0x04,
     /// AES-256-GCM encrypted Opus voice data.
     EncryptedOpusVoice = 0x05,
+    /// AES-256-GCM encrypted listener position ([`PositionPayload`]), sent by
+    /// members of a proximity channel who share their position.
+    Position = 0x06,
 }
 
 impl VoicePacketType {
@@ -24,6 +27,7 @@ impl VoicePacketType {
             0x03 => Ok(Self::Ping),
             0x04 => Ok(Self::Pong),
             0x05 => Ok(Self::EncryptedOpusVoice),
+            0x06 => Ok(Self::Position),
             other => Err(ProtocolError::UnknownPacketType(other)),
         }
     }
@@ -33,7 +37,14 @@ impl VoicePacketType {
 pub const VOICE_HEADER_SIZE: usize = 9;
 
 /// Header size for encrypted voice: standard header + 2 (key_id) = 11 bytes.
+/// Position packets (0x06) use the same header.
 pub const ENCRYPTED_VOICE_HEADER_SIZE: usize = 11;
+
+/// Plaintext size of a position beacon: x, y, z as f32 = 12 bytes.
+pub const POSITION_PAYLOAD_SIZE: usize = 12;
+
+/// Wire size of an encrypted position packet: header + payload + GCM tag.
+pub const POSITION_PACKET_SIZE: usize = ENCRYPTED_VOICE_HEADER_SIZE + POSITION_PAYLOAD_SIZE + 16;
 
 /// Maximum voice packet size (well under the QUIC datagram limit).
 /// Encrypted packets add 18 bytes overhead (2 key_id + 16 GCM tag).
@@ -94,6 +105,17 @@ impl VoicePacket {
         }
     }
 
+    /// Create an encrypted position beacon.
+    pub fn position(session_id: u32, sequence: u32, key_id: u16, encrypted_data: Vec<u8>) -> Self {
+        Self {
+            packet_type: VoicePacketType::Position,
+            session_id,
+            sequence,
+            opus_data: encrypted_data,
+            key_id,
+        }
+    }
+
     /// Create an end-of-transmission packet (PTT released).
     pub fn end_of_transmission(session_id: u32, sequence: u32) -> Self {
         Self {
@@ -118,7 +140,10 @@ impl VoicePacket {
 
     /// Serialize to bytes for transmission.
     pub fn to_bytes(&self) -> Vec<u8> {
-        if self.packet_type == VoicePacketType::EncryptedOpusVoice {
+        if matches!(
+            self.packet_type,
+            VoicePacketType::EncryptedOpusVoice | VoicePacketType::Position
+        ) {
             // Encrypted format: header + key_id(2) + encrypted data
             let mut buf =
                 Vec::with_capacity(ENCRYPTED_VOICE_HEADER_SIZE + self.opus_data.len());
@@ -152,7 +177,10 @@ impl VoicePacket {
         let session_id = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
         let sequence = u32::from_be_bytes([data[5], data[6], data[7], data[8]]);
 
-        if packet_type == VoicePacketType::EncryptedOpusVoice {
+        if matches!(
+            packet_type,
+            VoicePacketType::EncryptedOpusVoice | VoicePacketType::Position
+        ) {
             if data.len() < ENCRYPTED_VOICE_HEADER_SIZE {
                 return Err(ProtocolError::PacketTooShort {
                     expected: ENCRYPTED_VOICE_HEADER_SIZE,
@@ -178,6 +206,40 @@ impl VoicePacket {
                 key_id: 0,
             })
         }
+    }
+}
+
+/// Plaintext of a [`VoicePacketType::Position`] packet: the sender's position
+/// in metres (x/y ground plane, z up), little-endian f32.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PositionPayload {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+impl PositionPayload {
+    pub fn to_bytes(&self) -> [u8; POSITION_PAYLOAD_SIZE] {
+        let mut buf = [0u8; POSITION_PAYLOAD_SIZE];
+        buf[0..4].copy_from_slice(&self.x.to_le_bytes());
+        buf[4..8].copy_from_slice(&self.y.to_le_bytes());
+        buf[8..12].copy_from_slice(&self.z.to_le_bytes());
+        buf
+    }
+
+    pub fn from_bytes(data: &[u8]) -> Result<Self, ProtocolError> {
+        if data.len() < POSITION_PAYLOAD_SIZE {
+            return Err(ProtocolError::PacketTooShort {
+                expected: POSITION_PAYLOAD_SIZE,
+                got: data.len(),
+            });
+        }
+        let f = |i: usize| f32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
+        let (x, y, z) = (f(0), f(4), f(8));
+        if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+            return Err(ProtocolError::InvalidPosition);
+        }
+        Ok(Self { x, y, z })
     }
 }
 
@@ -271,13 +333,43 @@ mod tests {
         assert_eq!(VoicePacketType::from_byte(0x03).unwrap(), VoicePacketType::Ping);
         assert_eq!(VoicePacketType::from_byte(0x04).unwrap(), VoicePacketType::Pong);
         assert_eq!(VoicePacketType::from_byte(0x05).unwrap(), VoicePacketType::EncryptedOpusVoice);
+        assert_eq!(VoicePacketType::from_byte(0x06).unwrap(), VoicePacketType::Position);
     }
 
     #[test]
     fn voice_packet_type_invalid() {
         assert!(VoicePacketType::from_byte(0x00).is_err());
-        assert!(VoicePacketType::from_byte(0x06).is_err());
+        assert!(VoicePacketType::from_byte(0x07).is_err());
         assert!(VoicePacketType::from_byte(0xFF).is_err());
+    }
+
+    #[test]
+    fn roundtrip_position_packet() {
+        // 12-byte payload + 16-byte GCM tag, as the sender produces
+        let payload = PositionPayload { x: 1.5, y: -2.25, z: 0.75 };
+        let ciphertext = [payload.to_bytes().to_vec(), vec![0u8; 16]].concat();
+        let bytes = VoicePacket::position(42, 9, 3, ciphertext).to_bytes();
+        assert_eq!(bytes.len(), POSITION_PACKET_SIZE);
+
+        let decoded = VoicePacket::from_bytes(&bytes).unwrap();
+        assert_eq!(decoded.packet_type, VoicePacketType::Position);
+        assert_eq!(decoded.session_id, 42);
+        assert_eq!(decoded.sequence, 9);
+        assert_eq!(decoded.key_id, 3);
+        assert_eq!(
+            PositionPayload::from_bytes(&decoded.opus_data).unwrap(),
+            payload
+        );
+    }
+
+    #[test]
+    fn position_payload_rejects_short_and_non_finite() {
+        assert!(PositionPayload::from_bytes(&[0u8; 11]).is_err());
+        let mut buf = PositionPayload { x: 0.0, y: 0.0, z: 0.0 }.to_bytes();
+        buf[0..4].copy_from_slice(&f32::NAN.to_le_bytes());
+        assert!(PositionPayload::from_bytes(&buf).is_err());
+        buf[0..4].copy_from_slice(&f32::INFINITY.to_le_bytes());
+        assert!(PositionPayload::from_bytes(&buf).is_err());
     }
 
     #[test]

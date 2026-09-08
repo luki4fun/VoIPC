@@ -75,6 +75,22 @@ No accounts. No telemetry. No compromises.
 - Invite links (`https://server:9987/#channel=name`): open the web client, or paste into the desktop connect dialog, and land in the channel — the password can ride in the fragment, which never reaches the server
 - Newcomers get the last 50 channel messages from a member, end-to-end encrypted to them (opt-out in Settings → Data)
 
+**Proximity Chat**
+- A channel can be **2D** (a floor plan) or **3D** (height counts too), set when it is created and
+  changeable afterwards by its creator or an admin; operators can switch the whole feature off
+- Voices are placed left/right and get quieter with distance, using the constant-power pan law and
+  the inverse distance model every other implementation converged on. Desktop and browser render it;
+  Android gets the distance but not the panning yet
+- **Check your own setup**: Settings → Spatial Audio → *Test 2D* / *Test 3D* circles a synthetic
+  voice around you through the real mixer, with a live readout of where it is
+- A **virtual room** shows everyone on a top-down plan. Arrange people yourself — that layout stays
+  on your machine — or turn on *Sync my position*, after which you move only yourself and your
+  position is broadcast to the channel, encrypted like voice. Presets: round table, class room, line
+- **Game SDK**: a game mod can drive the positions instead, over a local WebSocket. It is the open
+  alternative to the TeamSpeak plugins RP servers use (SaltyChat, YACA, TokoVOIP) — no plugin, no
+  license server, players addressed by their VoIPC user id. Ranges, per-player volume, distance
+  culling and 0–10 muffling are supported; radio and phone effects come later. See [docs/SDK.md](docs/SDK.md)
+
 **Quality of Life**
 - Saved servers in the connect dialog, optional auto-connect
 - System tray (close-to-tray keeps the call running) and desktop notifications
@@ -306,11 +322,14 @@ Runtime settings in `server_settings.json`:
 {
   "empty_channel_timeout_secs": 300,
   "max_channels": 50,
-  "max_channel_name_len": 32
+  "max_channel_name_len": 32,
+  "proximity_enabled": true
 }
 ```
 
-**Persistent channels** (optional): drop a `channels.json` next to the binary to pre-create long-lived rooms that survive restarts. See [channels.example.json](channels.example.json) — plaintext `password` fields are hashed to SHA-256 on first load and the file is rewritten atomically.
+`proximity_enabled: false` switches proximity chat off for the whole server: every channel is served as non-positional, requests to enable it are refused, and position beacons are not relayed.
+
+**Persistent channels** (optional): drop a `channels.json` next to the binary to pre-create long-lived rooms that survive restarts. See [channels.example.json](channels.example.json) — plaintext `password` fields are hashed to SHA-256 on first load and the file is rewritten atomically. A channel may set `"proximity": "2d"` or `"3d"` to make it a proximity room.
 
 **Server administration:** there are no accounts; any connected user becomes admin for their session by entering the admin token (status bar → shield icon). Set `admin_token` in `server.toml`, pass `--admin-token`, or export `VOIPC_ADMIN_TOKEN`; without one the server prints a fresh random token in its log at every start. Admins can kick users from channels or from the server and ban an IP for 1 h, 24 h or until restart — everyone behind that IP is affected, and bans live in memory only. Other users see a shield next to an admin's name. Three wrong tokens disconnect the session.
 
@@ -374,7 +393,9 @@ To build it yourself:
 
 ```bash
 npm run web        # wasm + Vite bundle, then a server binary that embeds it
-npm run test:web   # headless two-browser end-to-end check (voice, chat, DMs, screen share)
+npm run test:web   # headless two-browser end-to-end check (voice, chat, DMs, screen share,
+                   # proximity, and a run through the real UI in the Chromium lanes)
+npm --prefix client test   # browser-side unit tests (spatial maths, room presets)
 ```
 
 ## Data Transparency
@@ -395,6 +416,9 @@ npm run test:web   # headless two-browser end-to-end check (voice, chat, DMs, sc
 - Voice/video content — encrypted with AES-256-GCM before transmission
 - Chat history — stored only on your device, encrypted
 - Your private keys — only public keys are exchanged
+- Where you stand in a proximity room — positions are encrypted with the channel key like voice; the
+  relay sees only that a member is sharing one. Positions a game feeds in never leave your machine
+  at all
 
 ### What your device stores
 

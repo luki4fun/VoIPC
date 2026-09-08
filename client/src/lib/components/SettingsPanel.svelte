@@ -25,11 +25,12 @@
   } from "../stores/settings.js";
   import type { SoundSettings, SoundEntry } from "../stores/settings.js";
   import { voiceMode, vadThreshold } from "../stores/voice.js";
-  import { isMuted, isDeafened } from "../stores/connection.js";
+  import { connectionState, isMuted, isDeafened } from "../stores/connection.js";
+  import { testLabel, testSource } from "../spatial.js";
   import { clearAllHistory } from "../stores/chat.js";
   import { addNotification } from "../stores/notifications.js";
   import { isMobile, isWeb, volumeKeyPtt } from "../stores/platform.js";
-  import { shareChannelHistory } from "../stores/settings.js";
+  import { shareChannelHistory, spatialAudio, screenAudioSpatial } from "../stores/settings.js";
   import type { AudioDeviceInfo } from "../types.js";
   import Icon from "./Icons.svelte";
 
@@ -39,6 +40,60 @@
 
   let inputDevices = $state<AudioDeviceInfo[]>([]);
   let outputDevices = $state<AudioDeviceInfo[]>([]);
+
+  // Game SDK (desktop only): the local port a game mod connects to
+  let sdkEnabled = $state(false);
+  let sdkPort = $state(39987);
+  let sdkOrigins = $state("");
+  let sdkConnected = $state(false);
+  let sdkGame = $state("");
+  /** False where the SDK is compiled out (Android), so the section stays hidden. */
+  let sdkAvailable = $state(false);
+
+  async function loadSdkStatus() {
+    if (isWeb) return;
+    try {
+      const status = await invoke<{
+        available: boolean;
+        enabled: boolean;
+        port: number;
+        origins: string[];
+        connected: boolean;
+        game: string;
+      }>("get_sdk_status");
+      sdkAvailable = status.available;
+      sdkEnabled = status.enabled;
+      sdkPort = status.port;
+      sdkOrigins = status.origins.join("\n");
+      // A game that connected before this panel opened sent its event to nobody
+      sdkConnected = status.connected;
+      sdkGame = status.game;
+    } catch (e) {
+      console.error("Failed to read the game SDK status:", e);
+    }
+  }
+
+  async function setSdk(change: { enabled?: boolean; port?: number; origins?: string }) {
+    if (change.enabled !== undefined) sdkEnabled = change.enabled;
+    if (change.port !== undefined) sdkPort = change.port;
+    if (change.origins !== undefined) sdkOrigins = change.origins;
+    try {
+      await invoke("set_sdk_config", {
+        enabled: change.enabled ?? null,
+        port: change.port ?? null,
+        origins:
+          change.origins === undefined
+            ? null
+            : change.origins
+                .split("\n")
+                .map((o) => o.trim())
+                .filter((o) => o.length > 0),
+      });
+    } catch (e) {
+      addNotification(`Failed to save the game integration settings: ${e}`, "error");
+      loadSdkStatus();
+    }
+  }
 
   async function loadDevices() {
     try {
@@ -57,6 +112,17 @@
       await invoke("set_screen_share_codec", { codec });
     } catch (err) {
       addNotification(`Failed to set the screen share codec: ${err}`, "error");
+    }
+  }
+
+  /** Both spatial preferences take effect immediately and are persisted. */
+  async function setSpatial(key: "spatial_audio" | "screen_audio_spatial", value: boolean) {
+    if (key === "spatial_audio") spatialAudio.set(value);
+    else screenAudioSpatial.set(value);
+    try {
+      await invoke("set_spatial_setting", { key, value });
+    } catch (err) {
+      addNotification(`Failed to save setting: ${err}`, "error");
     }
   }
 
@@ -329,12 +395,63 @@
     else startMicTest();
   }
 
+  // --- Spatial test: a synthetic voice orbits you through the real mixer ---
+
+  let spatialTest = $state<{ mode: "2d" | "3d"; started: number } | null>(null);
+  let spatialTestWhere = $state("");
+  let spatialTestPos = $state<[number, number, number]>([0, 3, 0]);
+  let spatialTestTimer: ReturnType<typeof setInterval> | null = null;
+  // On the desktop the test is mixed into the connection's voice mixer; the
+  // browser's audio graph stands on its own.
+  let canSpatialTest = $derived(isWeb || $connectionState === "connected");
+
+  function tickSpatialTest() {
+    if (!spatialTest) return;
+    const t = (performance.now() - spatialTest.started) / 1000;
+    spatialTestWhere = testLabel(spatialTest.mode, t);
+    spatialTestPos = testSource(spatialTest.mode, t).pos;
+  }
+
+  async function startSpatialTest(mode: "2d" | "3d") {
+    try {
+      await invoke("start_spatial_test", { mode });
+      spatialTest = { mode, started: performance.now() };
+      if (!spatialTestTimer) spatialTestTimer = setInterval(tickSpatialTest, 100);
+      tickSpatialTest();
+    } catch (e) {
+      addNotification(`Spatial test failed: ${e}`, "error");
+    }
+  }
+
+  function stopSpatialTest() {
+    if (spatialTestTimer) clearInterval(spatialTestTimer);
+    spatialTestTimer = null;
+    spatialTest = null;
+    invoke("stop_spatial_test").catch(() => {});
+  }
+
+  // Losing the connection takes the desktop mixer with it
+  $effect(() => {
+    if (!canSpatialTest && spatialTest) stopSpatialTest();
+  });
+
   onDestroy(() => {
     if (micTestRunning) stopMicTest();
+    if (spatialTest) stopSpatialTest();
   });
 
   // Load devices on mount (skip on mobile — only default device available)
   if (!$isMobile) loadDevices();
+  loadSdkStatus();
+
+  // A game connecting or leaving shows up live in the panel
+  const sdkUnlisten = listen<{ connected: boolean; game: string }>("sdk-status", (event) => {
+    sdkConnected = event.payload.connected;
+    sdkGame = event.payload.game;
+  });
+  onDestroy(() => {
+    sdkUnlisten.then((off) => off()).catch(() => {});
+  });
 </script>
 
 <div class="overlay" role="dialog" onclick={onclose} onkeydown={() => {}}>
@@ -498,6 +615,124 @@
         <span class="toggle-hint">
           Browsers decode H.265 only on Windows and macOS, and Firefox nowhere. Applies to your next share.
         </span>
+      </div>
+      {/if}
+
+      <div class="section">
+        <h4>Spatial Audio</h4>
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={$spatialAudio}
+            onchange={(e) => setSpatial("spatial_audio", (e.target as HTMLInputElement).checked)}
+          />
+          <span class="toggle-label">Hear people where they stand</span>
+          <span class="toggle-hint">
+            In a proximity channel, voices are placed left/right and get quieter with distance.
+            Turn this off for one plain, centred mix — useful on a mono headset or with hearing in one ear.
+          </span>
+        </label>
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={$screenAudioSpatial}
+            onchange={(e) => setSpatial("screen_audio_spatial", (e.target as HTMLInputElement).checked)}
+            disabled={!$spatialAudio}
+          />
+          <span class="toggle-label">Screen-share audio follows the sharer</span>
+          <span class="toggle-hint">
+            Off keeps a shared screen's sound centred while voices stay placed — better for music and video
+          </span>
+        </label>
+
+        <div class="mic-test">
+          {#if spatialTest}
+            <button class="mic-test-btn" onclick={stopSpatialTest}>Stop test</button>
+            <button
+              class="mic-test-btn"
+              onclick={() => startSpatialTest(spatialTest!.mode === "2d" ? "3d" : "2d")}
+            >Switch to {spatialTest.mode === "2d" ? "3D" : "2D"}</button>
+          {:else}
+            <button
+              class="mic-test-btn"
+              disabled={!canSpatialTest || $isDeafened}
+              onclick={() => startSpatialTest("2d")}
+            >Test 2D</button>
+            <button
+              class="mic-test-btn"
+              disabled={!canSpatialTest || $isDeafened}
+              onclick={() => startSpatialTest("3d")}
+            >Test 3D</button>
+          {/if}
+        </div>
+        {#if spatialTest}
+          <div class="spatial-test-readout">
+            <svg viewBox="-4.5 -4.5 9 9" width="64" height="64" aria-hidden="true">
+              <circle r="3" fill="none" stroke="currentColor" stroke-opacity="0.25" stroke-width="0.08" />
+              <path d="M0,-0.7 L0.45,0.45 L-0.45,0.45 Z" fill="currentColor" opacity="0.6" />
+              <circle
+                cx={spatialTestPos[0]}
+                cy={-spatialTestPos[1]}
+                r={0.45 + spatialTestPos[2] / 20}
+                fill="currentColor"
+              />
+            </svg>
+            <span>The voice is <strong>{spatialTestWhere}</strong></span>
+          </div>
+        {/if}
+        <span class="toggle-hint">
+          {#if !canSpatialTest}
+            Connect to a server first — the test plays through the live voice mixer.
+          {:else if $isDeafened}
+            You are deafened; undeafen to hear the test.
+          {:else}
+            A synthetic voice circles you 3 m away every 8 seconds: front, right, behind, left.
+            In 3D it also climbs 4 m above you and sinks 4 m below, getting quieter with height.
+            Turn "Hear people where they stand" off while it runs to compare with the plain mix.
+            {#if $isMobile && !isWeb} This device plays a mono downmix: you hear the distance, not left/right.{/if}
+          {/if}
+        </span>
+      </div>
+
+      {#if !isWeb && sdkAvailable}
+      <div class="section">
+        <h4>Game Integration</h4>
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={sdkEnabled}
+            onchange={(e) => setSdk({ enabled: (e.target as HTMLInputElement).checked })}
+          />
+          <span class="toggle-label">Let a game place people for me</span>
+          <span class="toggle-hint">
+            Opens a local port only this machine can reach, so a game mod can tell VoIPC where
+            every player stands. {sdkConnected ? `Connected: ${sdkGame}.` : "No game connected."}
+            See docs/SDK.md.
+          </span>
+        </label>
+        {#if sdkEnabled}
+          <div class="ptt-config">
+            <span class="hotkey-label">Port</span>
+            <input
+              class="sdk-input"
+              type="number"
+              min="1024"
+              max="65535"
+              value={sdkPort}
+              onchange={(e) => setSdk({ port: Number((e.target as HTMLInputElement).value) })}
+            />
+          </div>
+          <span class="toggle-hint">
+            Extra allowed origins, one per line. Game runtimes are allowed already;
+            add <code>null</code> only to test from a local file.
+          </span>
+          <textarea
+            class="sdk-input"
+            rows="2"
+            value={sdkOrigins}
+            onchange={(e) => setSdk({ origins: (e.target as HTMLTextAreaElement).value })}
+          ></textarea>
+        {/if}
       </div>
       {/if}
 
@@ -785,6 +1020,27 @@
     font-size: 12px;
     color: var(--text-secondary);
     min-width: 90px;
+  }
+
+  .spatial-test-readout {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .sdk-input {
+    font-size: 13px;
+    padding: 6px 8px;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    outline: none;
+    width: 100%;
+    font-family: inherit;
+    resize: vertical;
   }
 
   .current-key {

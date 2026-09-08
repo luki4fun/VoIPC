@@ -154,8 +154,11 @@ class MixerProcessor extends AudioWorkletProcessor {
     this.sources = new Map();
     /** user id -> gain (absent = 1.0) */
     this.userVolumes = new Map();
+    /** source key -> [gainL, gainR, lowpass coefficient] from the spatial mixer */
+    this.spatial = new Map();
     this.deafened = false;
-    this.mix = new Float32Array(FRAME);
+    this.mixL = new Float32Array(FRAME);
+    this.mixR = new Float32Array(FRAME);
     this.mixPos = FRAME; // nothing buffered yet
     this.framesPlayed = 0;
     this.framesLost = 0;
@@ -169,7 +172,18 @@ class MixerProcessor extends AudioWorkletProcessor {
       case "frame": {
         let src = this.sources.get(m.source);
         if (!src) {
-          src = { jitter: new JitterBuffer(2), eotReceived: false, lastActivity: 0 };
+          src = {
+            jitter: new JitterBuffer(2),
+            eotReceived: false,
+            lastActivity: 0,
+            // Where this source's gains and muffle filter were left last frame
+            gainL: 1,
+            gainR: 1,
+            lowpass: 0,
+            // First frame jumps to its target instead of ramping down from
+            // unity, or a muted or distant speaker bursts at full volume
+            primed: false,
+          };
           this.sources.set(m.source, src);
         }
         src.jitter.push(m.sequence, m.pcm);
@@ -187,15 +201,26 @@ class MixerProcessor extends AudioWorkletProcessor {
         if (m.gain === 1) this.userVolumes.delete(m.userId);
         else this.userVolumes.set(m.userId, m.gain);
         break;
+      // Bulk spatial update: [[sourceKey, gainL, gainR, lowpassCoefficient], …]
+      // for every placed source. Keys absent from the list render flat.
+      case "spatial":
+        this.spatial.clear();
+        for (const [key, l, r, lpA] of m.gains) this.spatial.set(key, [l, r, lpA]);
+        break;
+      case "spatial-clear":
+        this.spatial.clear();
+        break;
       case "deafen":
         this.deafened = !!m.value;
         break;
       case "clear":
         this.sources.clear();
+        this.spatial.clear();
         break;
       case "reset":
         this.sources.clear();
         this.userVolumes.clear();
+        this.spatial.clear();
         this.framesPlayed = 0;
         this.framesLost = 0;
         this.lastReported = [0, 0];
@@ -203,9 +228,10 @@ class MixerProcessor extends AudioWorkletProcessor {
     }
   }
 
-  /** Pull one 20 ms frame from every source and mix into this.mix. */
+  /** Pull one 20 ms frame from every source and mix into this.mixL/mixR. */
   pullFrame() {
-    this.mix.fill(0);
+    this.mixL.fill(0);
+    this.mixR.fill(0);
     let mixed = false;
     for (const [key, src] of this.sources) {
       if (currentTime - src.lastActivity >= SOURCE_IDLE_PRUNE) {
@@ -227,14 +253,42 @@ class MixerProcessor extends AudioWorkletProcessor {
       if (this.deafened) continue; // popped so the buffer keeps flowing
       // Screen-audio sources (high bit set) follow their sharer's volume
       const gain = this.userVolumes.get(key & 0x7fffffff) ?? 1;
+      // Spatial placement, if any: [gainL, gainR, lowpass coefficient].
+      // Gains ramp across the frame — a step would click.
+      const placement = this.spatial.get(key);
+      const targetL = gain * (placement ? placement[0] : 1);
+      const targetR = gain * (placement ? placement[1] : 1);
+      const lpA = placement ? placement[2] : 1;
       const n = Math.min(r.length, FRAME);
-      for (let i = 0; i < n; i++) this.mix[i] += r[i] * gain;
+      if (!src.primed) {
+        src.gainL = targetL;
+        src.gainR = targetR;
+        src.primed = true;
+      }
+      const stepL = (targetL - src.gainL) / n;
+      const stepR = (targetR - src.gainR) / n;
+      let gl = src.gainL;
+      let gr = src.gainR;
+      let lp = src.lowpass;
+      for (let i = 0; i < n; i++) {
+        lp += lpA * (r[i] - lp);
+        const s = lpA >= 1 ? r[i] : lp;
+        this.mixL[i] += s * gl;
+        this.mixR[i] += s * gr;
+        gl += stepL;
+        gr += stepR;
+      }
+      src.gainL = targetL;
+      src.gainR = targetR;
+      src.lowpass = lp;
       mixed = true;
     }
     if (mixed) {
       for (let i = 0; i < FRAME; i++) {
-        const s = this.mix[i];
-        this.mix[i] = s > 1 ? 1 : s < -1 ? -1 : s;
+        const l = this.mixL[i];
+        const r = this.mixR[i];
+        this.mixL[i] = l > 1 ? 1 : l < -1 ? -1 : l;
+        this.mixR[i] = r > 1 ? 1 : r < -1 ? -1 : r;
       }
     }
     if (++this.pullsSinceReport >= STATS_INTERVAL_FRAMES) {
@@ -249,19 +303,31 @@ class MixerProcessor extends AudioWorkletProcessor {
   process(_inputs, outputs) {
     const out = outputs[0];
     if (!out || out.length === 0) return true;
-    const ch0 = out[0];
+    const left = out[0];
+    const right = out.length > 1 ? out[1] : null;
     let o = 0;
-    while (o < ch0.length) {
+    while (o < left.length) {
       if (this.mixPos >= FRAME) {
         this.pullFrame();
         this.mixPos = 0;
       }
-      const take = Math.min(FRAME - this.mixPos, ch0.length - o);
-      ch0.set(this.mix.subarray(this.mixPos, this.mixPos + take), o);
+      const take = Math.min(FRAME - this.mixPos, left.length - o);
+      if (right) {
+        left.set(this.mixL.subarray(this.mixPos, this.mixPos + take), o);
+        right.set(this.mixR.subarray(this.mixPos, this.mixPos + take), o);
+      } else {
+        // Mono destination: the downmix, so a placed voice is still audible
+        for (let i = 0; i < take; i++) {
+          left[o + i] = 0.5 * (this.mixL[this.mixPos + i] + this.mixR[this.mixPos + i]);
+        }
+      }
       this.mixPos += take;
       o += take;
     }
-    for (let c = 1; c < out.length; c++) out[c].set(ch0);
+    // Any further channels (surround) get the downmix
+    for (let c = 2; c < out.length; c++) {
+      for (let i = 0; i < left.length; i++) out[c][i] = 0.5 * (left[i] + right[i]);
+    }
     return true;
   }
 }

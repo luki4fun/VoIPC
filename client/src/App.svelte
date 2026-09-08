@@ -10,6 +10,7 @@
   import VoiceControls from "./lib/components/VoiceControls.svelte";
   import ScreenShareSourcePicker from "./lib/components/ScreenShareSourcePicker.svelte";
   import ScreenShareViewer from "./lib/components/ScreenShareViewer.svelte";
+  import RoomView from "./lib/components/RoomView.svelte";
   import StatusBar from "./lib/components/StatusBar.svelte";
   import SettingsPanel from "./lib/components/SettingsPanel.svelte";
   import Toast from "./lib/components/Toast.svelte";
@@ -72,6 +73,8 @@
     chatHistoryDisabled,
     shareChannelHistory,
     screenShareCodec,
+    spatialAudio,
+    screenAudioSpatial,
     defaultServer,
   } from "./lib/stores/settings.js";
   import type { AppConfig } from "./lib/stores/settings.js";
@@ -87,6 +90,17 @@
   } from "./lib/sounds.js";
   import { isMobile, isWeb, mobileTab } from "./lib/stores/platform.js";
   import type { MobileTab } from "./lib/stores/platform.js";
+  import {
+    clearRoom,
+    currentProximity,
+    drivenBy,
+    positions,
+    resetRoom,
+    roomOpen,
+    selectedUserId,
+    syncing,
+  } from "./lib/stores/room.js";
+  import { upsertById } from "./lib/stores/upsert.js";
   import MobilePTT from "./lib/components/MobilePTT.svelte";
   import {
     addScreenShare,
@@ -147,9 +161,12 @@
     });
   });
 
-  // Admin status lives and dies with the connection
+  // Admin status and the room live and die with the connection
   $effect(() => {
-    if ($connectionState !== "connected") isAdmin.set(false);
+    if ($connectionState !== "connected") {
+      isAdmin.set(false);
+      resetRoom();
+    }
   });
 
   // OS notification when the window is not focused (DMs and pokes)
@@ -211,6 +228,16 @@
         setPopoutWindow(null);
         poppedOut.set(false);
       }
+    }
+  });
+
+  // Proximity switched off under us (an admin or the creator changed it):
+  // close the room and forget the layout.
+  $effect(() => {
+    if ($currentProximity === "off") {
+      roomOpen.set(false);
+      if ($mobileTab === "room") mobileTab.set("chat");
+      if ($positions.size > 0 || $syncing) clearRoom();
     }
   });
 
@@ -362,6 +389,8 @@
       chatHistoryDisabled.set(config.chat_history_disabled ?? false);
       shareChannelHistory.set(config.share_channel_history ?? true);
       screenShareCodec.set(config.screen_share_codec ?? "h264");
+      spatialAudio.set(config.spatial_audio ?? true);
+      screenAudioSpatial.set(config.screen_audio_spatial ?? true);
       if (config.input_device) inputDevice.set(config.input_device);
       if (config.output_device) outputDevice.set(config.output_device);
       rememberConnection.set(config.remember_connection);
@@ -415,6 +444,8 @@
 
         // Clear screenshare state and play channel switch sound
         if (oldChannelId !== newChannelId) {
+          // A room layout belongs to the channel it was made in
+          clearRoom();
           resetScreenShareState();
           playChannelSwitchSound();
         }
@@ -425,22 +456,32 @@
       }),
 
       listen<UserInfo>("user-joined", (event) => {
-        // Only add to local user list if they joined our channel
+        // The user list snapshot and this broadcast are built separately on
+        // the server, so a user we already have can arrive again (two joins
+        // at once). Replacing is idempotent; appending twice would throw
+        // each_key_duplicate and wedge the UI.
+        let isNew = true;
         if (event.payload.channel_id === $currentChannelId) {
-          users.update((u) => [...u, event.payload]);
+          users.update((u) => {
+            const next = upsertById(u, event.payload, (x) => x.user_id);
+            isNew = next.added;
+            return next.list;
+          });
           // Play join sound (not for lobby, not for ourselves)
-          if ($currentChannelId !== 0 && event.payload.user_id !== $userId) {
+          if (isNew && $currentChannelId !== 0 && event.payload.user_id !== $userId) {
             playUserJoinedSound();
           }
         }
         // Always update channel user count (broadcast to all)
-        channels.update((chs) =>
-          chs.map((ch) =>
-            ch.channel_id === event.payload.channel_id
-              ? { ...ch, user_count: ch.user_count + 1 }
-              : ch
-          )
-        );
+        if (isNew) {
+          channels.update((chs) =>
+            chs.map((ch) =>
+              ch.channel_id === event.payload.channel_id
+                ? { ...ch, user_count: ch.user_count + 1 }
+                : ch
+            )
+          );
+        }
       }),
 
       listen<{ user_id: number; channel_id: number }>("user-left", (event) => {
@@ -453,6 +494,15 @@
           users.update((u) =>
             u.filter((user) => user.user_id !== event.payload.user_id)
           );
+          // Forget where they stood: the id belongs to the next joiner
+          positions.update((m) => {
+            if (!m.has(event.payload.user_id)) return m;
+            const next = new Map(m);
+            next.delete(event.payload.user_id);
+            return next;
+          });
+          // A selection pointing at nobody would move a ghost on the next click
+          selectedUserId.update((id) => (id === event.payload.user_id ? null : id));
         }
         // Always update channel count
         channels.update((chs) =>
@@ -482,6 +532,27 @@
               : user
           )
         );
+      }),
+
+      // A member of a proximity channel shared where they stand
+      listen<{ user_id: number; x: number; y: number; z: number }>(
+        "user-position",
+        (event) => {
+          const { user_id, x, y, z } = event.payload;
+          positions.update((m) => new Map(m).set(user_id, { x, y, z }));
+        }
+      ),
+
+      // A game took over the positions (or gave them back): the room shows
+      // them but stops accepting drags, and our own sharing is off — the
+      // backend already cleared it when the game said hello.
+      listen<{ connected: boolean; game: string }>("sdk-status", (event) => {
+        drivenBy.set(event.payload.connected ? event.payload.game || "a game" : null);
+        if (event.payload.connected) {
+          syncing.set(false);
+          positions.set(new Map());
+          selectedUserId.set(null);
+        }
       }),
 
       listen<{ user_id: number; speaking: boolean }>(
@@ -629,7 +700,10 @@
       ),
 
       listen<ChannelInfo>("channel-created", (event) => {
-        channels.update((chs) => [...chs, event.payload]);
+        // Idempotent: the channel list snapshot may already contain it
+        channels.update(
+          (chs) => upsertById(chs, event.payload, (c) => c.channel_id).list
+        );
       }),
 
       listen<{ channel_id: number }>("channel-deleted", (event) => {
@@ -953,6 +1027,8 @@
         <ChannelList />
       {:else if $mobileTab === 'chat'}
         <ChatPanel />
+      {:else if $mobileTab === 'room'}
+        <RoomView />
       {:else}
         <UserList />
       {/if}
@@ -989,6 +1065,16 @@
         </div>
         <span>Chat</span>
       </button>
+      {#if $currentProximity !== 'off'}
+        <button
+          class="tab-btn"
+          class:active={$mobileTab === 'room'}
+          onclick={() => mobileTab.set('room')}
+        >
+          <Icon name="room" size={20} />
+          <span>Room</span>
+        </button>
+      {/if}
       <button
         class="tab-btn"
         class:active={$mobileTab === 'users'}
@@ -1020,6 +1106,8 @@
             </div>
           {/if}
         </div>
+      {:else if $roomOpen && $currentProximity !== 'off'}
+        <RoomView />
       {:else}
         <ChatPanel />
       {/if}

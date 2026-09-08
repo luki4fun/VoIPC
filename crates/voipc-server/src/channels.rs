@@ -5,6 +5,7 @@ use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::info;
+use voipc_protocol::types::ProximityMode;
 
 const SHA256_PREFIX: &str = "sha256:";
 
@@ -27,6 +28,10 @@ pub struct ChannelEntry {
     /// Maximum users (0 = unlimited).
     #[serde(default)]
     pub max_users: u32,
+
+    /// Positional audio mode: "off" (default), "2d" or "3d".
+    #[serde(default)]
+    pub proximity: ProximityMode,
 }
 
 /// Hash a plaintext password to `"sha256:<64 hex chars>"`.
@@ -155,6 +160,7 @@ mod tests {
             password: None,
             password_hash: None,
             max_users: 0,
+            proximity: ProximityMode::Off,
         }];
         assert!(validate_entries(&entries).is_err());
     }
@@ -167,6 +173,7 @@ mod tests {
             password: None,
             password_hash: None,
             max_users: 0,
+            proximity: ProximityMode::Off,
         }];
         assert!(validate_entries(&entries).is_err());
     }
@@ -180,6 +187,7 @@ mod tests {
                 password: None,
                 password_hash: None,
                 max_users: 0,
+                proximity: ProximityMode::Off,
             },
             ChannelEntry {
                 name: "music".into(),
@@ -187,6 +195,7 @@ mod tests {
                 password: None,
                 password_hash: None,
                 max_users: 0,
+                proximity: ProximityMode::Off,
             },
         ];
         assert!(validate_entries(&entries).is_err());
@@ -200,6 +209,7 @@ mod tests {
             password: Some("plain".into()),
             password_hash: Some("sha256:abc".into()),
             max_users: 0,
+            proximity: ProximityMode::Off,
         }];
         assert!(validate_entries(&entries).is_err());
     }
@@ -213,6 +223,7 @@ mod tests {
                 password: None,
                 password_hash: None,
                 max_users: 10,
+                proximity: ProximityMode::TwoD,
             },
             ChannelEntry {
                 name: "AFK".into(),
@@ -220,6 +231,7 @@ mod tests {
                 password: None,
                 password_hash: Some(hash_password("test")),
                 max_users: 0,
+                proximity: ProximityMode::Off,
             },
         ];
         assert!(validate_entries(&entries).is_ok());
@@ -233,6 +245,7 @@ mod tests {
             password: Some("secret".into()),
             password_hash: None,
             max_users: 0,
+            proximity: ProximityMode::Off,
         }];
         let changed = hash_plaintext_passwords(&mut entries);
         assert!(changed);
@@ -253,6 +266,7 @@ mod tests {
             password: None,
             password_hash: Some(hash.clone()),
             max_users: 0,
+            proximity: ProximityMode::Off,
         }];
         let changed = hash_plaintext_passwords(&mut entries);
         assert!(!changed);
@@ -267,6 +281,7 @@ mod tests {
             password: None,
             password_hash: Some("md5:abcdef".into()),
             max_users: 0,
+            proximity: ProximityMode::Off,
         }];
         assert!(validate_entries(&entries).is_err());
     }
@@ -274,5 +289,35 @@ mod tests {
     #[test]
     fn validate_empty_array_succeeds() {
         assert!(validate_entries(&[]).is_ok());
+    }
+
+    #[test]
+    fn proximity_parses_and_defaults_to_off() {
+        let entries: Vec<ChannelEntry> = serde_json::from_str(
+            r#"[{"name":"Ingame","proximity":"3d"},{"name":"AFK"}]"#,
+        )
+        .unwrap();
+        assert_eq!(entries[0].proximity, ProximityMode::ThreeD);
+        assert_eq!(entries[1].proximity, ProximityMode::Off);
+        // An unknown mode is a load error, not a silent Off
+        assert!(serde_json::from_str::<Vec<ChannelEntry>>(r#"[{"name":"X","proximity":"4d"}]"#).is_err());
+    }
+
+    #[test]
+    fn proximity_survives_the_password_rewrite() {
+        // hash_plaintext_passwords + atomic_rewrite serialize through ChannelEntry,
+        // so a mode set in the file must still be there afterwards.
+        let mut entries = vec![ChannelEntry {
+            name: "Ingame".into(),
+            description: String::new(),
+            password: Some("secret".into()),
+            password_hash: None,
+            max_users: 0,
+            proximity: ProximityMode::TwoD,
+        }];
+        assert!(hash_plaintext_passwords(&mut entries));
+        let json = serde_json::to_string(&entries).unwrap();
+        let back: Vec<ChannelEntry> = serde_json::from_str(&json).unwrap();
+        assert_eq!(back[0].proximity, ProximityMode::TwoD);
     }
 }

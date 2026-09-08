@@ -5,6 +5,8 @@ mod crypto;
 mod global_keys;
 mod network;
 mod screenshare;
+#[cfg(not(target_os = "android"))]
+mod sdk;
 mod transport;
 
 use app_state::AppState;
@@ -111,6 +113,8 @@ pub fn run() {
                     s.noise_suppression = cfg.noise_suppression;
                     s.muted = cfg.muted;
                     s.deafened = cfg.deafened;
+                    s.spatial_audio = cfg.spatial_audio;
+                    s.screen_audio_spatial = cfg.screen_audio_spatial;
                 }
                 state.input_gain.store(
                     cfg.input_gain.clamp(0.0, 4.0).to_bits(),
@@ -162,6 +166,10 @@ pub fn run() {
                 app.state::<AppState>().mute_binding.clone(),
                 app.state::<AppState>().deafen_binding.clone(),
             );
+
+            // Game SDK: idle until the user enables it in Settings
+            #[cfg(not(target_os = "android"))]
+            sdk::spawn(app.handle().clone());
 
             // System tray: closing the window hides to tray (call keeps
             // running); Quit in the tray menu actually exits.
@@ -329,6 +337,16 @@ pub fn run() {
             // Per-user volume
             commands::set_user_volume,
             commands::get_user_volume,
+            commands::set_channel_proximity,
+            commands::set_user_position,
+            commands::set_own_position,
+            commands::set_position_sync,
+            commands::clear_positions,
+            commands::set_spatial_setting,
+            commands::start_spatial_test,
+            commands::stop_spatial_test,
+            commands::get_sdk_status,
+            commands::set_sdk_config,
             // E2E Encryption
             commands::request_prekey_bundle,
             commands::send_encrypted_direct_message,

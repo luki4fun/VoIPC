@@ -1,3 +1,7 @@
+import type { ProximityMode } from "./spatial";
+
+export type { ProximityMode };
+
 export interface UserInfo {
   user_id: number;
   username: string;
@@ -24,6 +28,8 @@ export interface ChannelInfo {
   user_count: number;
   has_password: boolean;
   created_by: number | null;
+  /** Positional audio mode of this channel. */
+  proximity: ProximityMode;
 }
 
 export interface ConnectionInfo {

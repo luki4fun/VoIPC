@@ -8,8 +8,8 @@ use bytes::Bytes;
 use tokio::sync::mpsc;
 use tracing::{debug, trace, warn};
 
-use voipc_protocol::types::SessionId;
-use voipc_protocol::voice::{VoicePacketType, VOICE_HEADER_SIZE};
+use voipc_protocol::types::{ProximityMode, SessionId};
+use voipc_protocol::voice::{VoicePacketType, POSITION_PACKET_SIZE, VOICE_HEADER_SIZE};
 
 use crate::state::ServerState;
 
@@ -36,10 +36,11 @@ pub async fn handle_packet(session_id: SessionId, data: Bytes, state: &ServerSta
     // in the wire format but no keyed client ever sends them — accepting
     // them here would let anyone inject audio into a channel.
     match data[0] {
-        // Voice control + encrypted voice (EOT 0x02, Ping 0x03, encrypted 0x05).
+        // Voice control + encrypted voice (EOT 0x02, Ping 0x03, encrypted 0x05)
+        // and encrypted position beacons (0x06, proximity channels only).
         // Pong (0x04) is server→client only; a relayed one would spoof RTT
         // on every receiver.
-        0x02 | 0x03 | 0x05 => handle_voice_packet(session_id, data, state).await,
+        0x02 | 0x03 | 0x05 | 0x06 => handle_voice_packet(session_id, data, state).await,
         // Encrypted video fragments (0x13, 0x14) + encrypted screen audio (0x15)
         0x13..=0x15 => handle_video_packet(session_id, data, state).await,
         other => debug!(session_id, "dropping media packet type: 0x{other:02x}"),
@@ -47,11 +48,27 @@ pub async fn handle_packet(session_id: SessionId, data: Bytes, state: &ServerSta
 }
 
 /// Voice: forward to all channel members except the sender; answer pings.
+/// Position beacons (0x06) travel the same path but on their own budget and
+/// only inside proximity channels.
 async fn handle_voice_packet(session_id: SessionId, data: Bytes, state: &ServerState) {
+    let is_position = data[0] == VoicePacketType::Position as u8;
+
+    // Positions are a fixed size; anything else claiming to be one is junk.
+    if is_position && data.len() != POSITION_PACKET_SIZE {
+        debug!(session_id, len = data.len(), "dropping malformed position packet");
+        return;
+    }
+
     let allowed = state
         .sessions
         .get_mut(&session_id)
-        .map(|mut s| s.udp_voice_rate.try_consume())
+        .map(|mut s| {
+            if is_position {
+                s.position_rate.try_consume()
+            } else {
+                s.udp_voice_rate.try_consume()
+            }
+        })
         .unwrap_or(false);
     if !allowed {
         trace!(session_id, "voice rate limit exceeded, dropping packet");
@@ -92,6 +109,11 @@ async fn handle_voice_packet(session_id: SessionId, data: Bytes, state: &ServerS
             warn!(session_id, channel_id, "voice forward: channel not found");
             return;
         };
+        // Positions only exist in proximity channels. The kill switch already
+        // forced every channel's mode to Off, so this covers it too.
+        if is_position && channel.info.proximity == ProximityMode::Off {
+            return;
+        }
         channel
             .members
             .iter()
@@ -146,7 +168,7 @@ mod tests {
     use crate::state::test_support::*;
     use voipc_protocol::types::VideoCodec;
     use voipc_protocol::video::VideoPacket;
-    use voipc_protocol::voice::VoicePacket;
+    use voipc_protocol::voice::{VoicePacket, ENCRYPTED_VOICE_HEADER_SIZE};
 
     fn encrypted_voice(session_id: u32) -> Bytes {
         Bytes::from(VoicePacket::encrypted_voice(session_id, 1, 1, vec![9; 40]).to_bytes())
@@ -213,6 +235,66 @@ mod tests {
         handle_packet(alice_sid, Bytes::from(vec![0x05; MAX_PACKET_SIZE + 1]), &state).await;
 
         assert!(bob_media.try_recv().is_err());
+    }
+
+    fn position_packet(session_id: u32) -> Bytes {
+        let payload = vec![0u8; POSITION_PACKET_SIZE - ENCRYPTED_VOICE_HEADER_SIZE];
+        Bytes::from(VoicePacket::position(session_id, 1, 1, payload).to_bytes())
+    }
+
+    async fn set_proximity(state: &ServerState, channel_id: u32, mode: ProximityMode) {
+        state.channels.write().await.get_mut(&channel_id).unwrap().info.proximity = mode;
+    }
+
+    #[tokio::test]
+    async fn position_is_relayed_only_in_proximity_channels() {
+        let state = make_state();
+        let (alice_uid, alice_sid, _) = add_user_with_media(&state, "alice");
+        let (bob_uid, bob_sid, mut bob_media) = add_user_with_media(&state, "bob");
+        put_in_channel(&state, 5, &[(alice_uid, alice_sid), (bob_uid, bob_sid)]).await;
+
+        // Off (the default): dropped
+        handle_packet(alice_sid, position_packet(alice_sid), &state).await;
+        assert!(bob_media.try_recv().is_err());
+
+        // 2d: relayed verbatim
+        set_proximity(&state, 5, ProximityMode::TwoD).await;
+        let packet = position_packet(alice_sid);
+        handle_packet(alice_sid, packet.clone(), &state).await;
+        assert_eq!(bob_media.try_recv().unwrap(), packet);
+    }
+
+    #[tokio::test]
+    async fn malformed_position_is_dropped() {
+        let state = make_state();
+        let (alice_uid, alice_sid, _) = add_user_with_media(&state, "alice");
+        let (bob_uid, bob_sid, mut bob_media) = add_user_with_media(&state, "bob");
+        put_in_channel(&state, 5, &[(alice_uid, alice_sid), (bob_uid, bob_sid)]).await;
+        set_proximity(&state, 5, ProximityMode::ThreeD).await;
+
+        let oversized = Bytes::from(VoicePacket::position(alice_sid, 1, 1, vec![0u8; 99]).to_bytes());
+        handle_packet(alice_sid, oversized, &state).await;
+        assert!(bob_media.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn position_has_its_own_rate_budget() {
+        let state = make_state();
+        let (alice_uid, alice_sid, _) = add_user_with_media(&state, "alice");
+        let (bob_uid, bob_sid, mut bob_media) = add_user_with_media(&state, "bob");
+        put_in_channel(&state, 5, &[(alice_uid, alice_sid), (bob_uid, bob_sid)]).await;
+        set_proximity(&state, 5, ProximityMode::TwoD).await;
+
+        // Burst past the position limiter (12)
+        for _ in 0..30 {
+            handle_packet(alice_sid, position_packet(alice_sid), &state).await;
+        }
+        let relayed = std::iter::from_fn(|| bob_media.try_recv().ok()).count();
+        assert!(relayed <= 13, "position limiter let {relayed} through");
+
+        // Voice still has its own budget
+        handle_packet(alice_sid, encrypted_voice(alice_sid), &state).await;
+        assert!(bob_media.try_recv().is_ok());
     }
 
     #[tokio::test]

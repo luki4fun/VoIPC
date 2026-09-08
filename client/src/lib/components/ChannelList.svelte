@@ -5,7 +5,10 @@
   import { addNotification } from "../stores/notifications.js";
   import { dmConversations, activeDmUserId, openDm, closeDm, unreadPerChannel, clearChannelUnread } from "../stores/chat.js";
   import { buildInviteLink, splitAddress } from "../invite.js";
+  import { avatarColor } from "../avatar.js";
+  import { isAdmin } from "../stores/connection.js";
   import Icon from "./Icons.svelte";
+  import type { ProximityMode } from "../spatial.js";
 
   let currentChannelName = $derived(
     $channels.find((c) => c.channel_id === $currentChannelId)?.name ?? ""
@@ -35,6 +38,7 @@
   let showCreateForm = $state(false);
   let newChannelName = $state("");
   let newChannelPassword = $state("");
+  let newChannelProximity = $state<ProximityMode>("off");
 
   // Password prompt state (for joining)
   let passwordPromptChannelId = $state<number | null>(null);
@@ -44,19 +48,6 @@
   let passwordEditChannelId = $state<number | null>(null);
   let passwordEditInput = $state("");
 
-  // Deterministic avatar color from username
-  const AVATAR_COLORS = [
-    "#5865F2", "#57F287", "#FEE75C", "#EB459E",
-    "#ED4245", "#3498db", "#e67e22", "#1abc9c",
-  ];
-
-  function avatarColor(name: string): string {
-    let hash = 0;
-    for (let i = 0; i < name.length; i++) {
-      hash = name.charCodeAt(i) + ((hash << 5) - hash);
-    }
-    return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
-  }
 
   function previewChannel(channelId: number) {
     // Always exit DM mode when clicking a channel
@@ -124,6 +115,7 @@
       await invoke("create_channel", {
         name,
         password: newChannelPassword || null,
+        proximity: newChannelProximity,
       });
       if (newChannelPassword) {
         const pw = newChannelPassword;
@@ -131,6 +123,7 @@
       }
       newChannelName = "";
       newChannelPassword = "";
+      newChannelProximity = "off";
       showCreateForm = false;
     } catch (e) {
       console.error("Failed to create channel:", e);
@@ -141,34 +134,73 @@
   function cancelCreate() {
     newChannelName = "";
     newChannelPassword = "";
+    newChannelProximity = "off";
     showCreateForm = false;
   }
 
+  // Channel settings: password and proximity mode. The server lets the
+  // creator (or any admin) change these; channels from channels.json have no
+  // creator, so those are admin-only.
+  let settingsProximity = $state<ProximityMode>("off");
+
+  function canEditChannel(channel: { channel_id: number; created_by: number | null }): boolean {
+    return channel.channel_id !== 0 && (channel.created_by === $userId || $isAdmin);
+  }
+
+  /** Does the edited channel have a password right now? */
+  let passwordEditHasPassword = $state(false);
+  /** Explicit "remove the password" choice; an empty field alone means "leave it". */
+  let passwordEditRemove = $state(false);
+
   function openPasswordEdit(channelId: number, e: Event) {
     e.stopPropagation();
+    const channel = $channels.find((c) => c.channel_id === channelId);
     passwordEditChannelId = channelId;
-    // Leave input empty — user sets a new password (or submits empty to remove)
+    // Leave input empty — an empty field keeps the current password
     passwordEditInput = "";
+    passwordEditRemove = false;
+    passwordEditHasPassword = channel?.has_password ?? false;
+    settingsProximity = channel?.proximity ?? "off";
   }
 
   async function submitPasswordEdit() {
     if (passwordEditChannelId === null) return;
+    const channelId = passwordEditChannelId;
+    const before = $channels.find((c) => c.channel_id === channelId)?.proximity ?? "off";
     try {
-      await invoke("set_channel_password", {
-        channelId: passwordEditChannelId,
-        password: passwordEditInput || null,
-      });
+      // Only touch the password when the user actually asked to: saving this
+      // dialog to change the proximity mode must not drop it
+      if (passwordEditRemove || passwordEditInput) {
+        await invoke("set_channel_password", {
+          channelId,
+          password: passwordEditRemove ? null : passwordEditInput,
+        });
+        const chName = $channels.find((c) => c.channel_id === channelId)?.name;
+        if (chName) {
+          channelPasswords.update((m) => {
+            const next = new Map(m);
+            if (passwordEditRemove) next.delete(chName);
+            else next.set(chName, passwordEditInput);
+            return next;
+          });
+        }
+      }
+      if (settingsProximity !== before) {
+        await invoke("set_channel_proximity", { channelId, proximity: settingsProximity });
+      }
       passwordEditChannelId = null;
       passwordEditInput = "";
+      passwordEditRemove = false;
     } catch (e) {
-      console.error("Failed to change password:", e);
-      addNotification(`Failed to change password: ${e}`, "error");
+      console.error("Failed to change channel settings:", e);
+      addNotification(`Failed to change channel settings: ${e}`, "error");
     }
   }
 
   function cancelPasswordEdit() {
     passwordEditChannelId = null;
     passwordEditInput = "";
+    passwordEditRemove = false;
   }
 </script>
 
@@ -202,6 +234,14 @@
         placeholder="Password (optional)"
         bind:value={newChannelPassword}
       />
+      <label class="create-label">
+        Proximity chat
+        <select class="create-input" bind:value={newChannelProximity}>
+          <option value="off">Off — everyone equally loud</option>
+          <option value="2d">2D — on a floor plan</option>
+          <option value="3d">3D — height counts too</option>
+        </select>
+      </label>
       <div class="create-actions">
         <button class="create-btn" type="submit">Create</button>
         <button class="cancel-btn" type="button" onclick={cancelCreate}>Cancel</button>
@@ -233,11 +273,16 @@
             <span class="channel-desc">{channel.description}</span>
           {/if}
         </span>
+        {#if channel.proximity !== "off"}
+          <span class="proximity-tag" title="Proximity chat: you hear people where they stand">
+            {channel.proximity.toUpperCase()}
+          </span>
+        {/if}
         <span class="user-count">({channel.user_count}{#if channel.max_users > 0}/{channel.max_users}{/if})</span>
         {#if ($unreadPerChannel.get(channel.name) ?? 0) > 0}
           <span class="channel-unread">{$unreadPerChannel.get(channel.name)}</span>
         {/if}
-        {#if channel.created_by === $userId && channel.channel_id !== 0}
+        {#if canEditChannel(channel)}
           <!-- svelte-ignore a11y_click_events_have_key_events -->
           <span
             class="settings-icon"
@@ -327,13 +372,28 @@
       onkeydown={(e) => { if (e.key === 'Escape') cancelPasswordEdit(); }}
       onsubmit={(e) => { e.preventDefault(); submitPasswordEdit(); }}
     >
-      <div class="dialog-title">Change Channel Password</div>
+      <div class="dialog-title">Channel Settings</div>
       <input
         class="dialog-input"
         type="password"
-        placeholder="New password (empty to remove)"
+        placeholder={passwordEditHasPassword ? "New password (empty: keep current)" : "Set a password (optional)"}
         bind:value={passwordEditInput}
+        disabled={passwordEditRemove}
       />
+      {#if passwordEditHasPassword}
+        <label class="dialog-check">
+          <input type="checkbox" bind:checked={passwordEditRemove} />
+          Remove the password
+        </label>
+      {/if}
+      <label class="dialog-label">
+        Proximity chat
+        <select class="dialog-input" bind:value={settingsProximity}>
+          <option value="off">Off — everyone equally loud</option>
+          <option value="2d">2D — on a floor plan</option>
+          <option value="3d">3D — height counts too</option>
+        </select>
+      </label>
       <div class="dialog-actions">
         <button class="create-btn" type="submit">Save</button>
         <button class="cancel-btn" type="button" onclick={cancelPasswordEdit}>Cancel</button>
@@ -510,6 +570,34 @@
   }
 
   .user-count {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .proximity-tag {
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    padding: 1px 4px;
+    border-radius: 3px;
+    border: 1px solid var(--border);
+    color: var(--text-secondary);
+    flex-shrink: 0;
+  }
+
+  .create-label,
+  .dialog-label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .dialog-check {
+    display: flex;
+    align-items: center;
+    gap: 6px;
     font-size: 12px;
     color: var(--text-secondary);
   }

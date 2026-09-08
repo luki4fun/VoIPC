@@ -9,3 +9,8 @@ postcard = { workspace = true }
 thiserror = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+# ProximityMode's serde names are the JSON contract for channels.json and the
+# JS bridge; only the tests need a JSON codec.
+serde_json = "1.0"

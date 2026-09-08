@@ -3,6 +3,7 @@
 // own the media pipelines and only see the session through `SessionContext`.
 
 import type { MediaKey } from "./wasm";
+import type { ProximityMode } from "../../lib/spatial";
 
 /** Codec of a screen share, as the protocol names it (voipc-protocol types.rs). */
 export type VideoCodec = "H264" | "H265" | "Vp8" | "Vp9";
@@ -44,14 +45,23 @@ export interface AudioApi {
   attach(ctx: SessionContext): void;
   /** Session ended: stop capture, drop all playback sources, emit nothing. */
   detach(): void;
-  /** Channel changed (UserList with a new channel id): drop playback sources. */
-  onChannelChanged(): void;
+  /**
+   * Channel changed (UserList with a new channel id): drop playback sources
+   * and take on the new channel's proximity mode.
+   */
+  onChannelChanged(proximity?: ProximityMode): void;
+  /** The current channel's proximity mode changed under us. */
+  setProximityMode(proximity: ProximityMode): void;
   /** Raw 0x05 packet from the server (decrypt with ctx.mediaKey inside). */
   onVoicePacket(bytes: Uint8Array): void;
   /** Raw 0x02 EndOfTransmission packet. */
   onEotPacket(bytes: Uint8Array): void;
   /** Raw 0x15 encrypted screen-share audio packet. */
   onScreenAudioPacket(bytes: Uint8Array): void;
+  /** Raw 0x06 encrypted position beacon from a member sharing their position. */
+  onPositionPacket(bytes: Uint8Array): void;
+  /** A user left the channel: forget where they stood. */
+  onUserLeft(userId: number): void;
 
   // invoke() commands (same semantics as client/src-tauri/src/commands.rs)
   startTransmit(): Promise<void>;
@@ -63,6 +73,18 @@ export interface AudioApi {
   setVolume(volume: number): void;
   setUserVolume(userId: number, volume: number): void;
   getUserVolume(userId: number): number;
+  setUserPosition(
+    userId: number,
+    pos: [number, number, number] | null,
+    opts?: { range?: number; volume?: number; muffle?: number; direct?: boolean },
+  ): void;
+  setOwnPosition(pos: [number, number, number], fwd?: [number, number]): void;
+  setPositionSync(enabled: boolean): void;
+  clearPositions(): void;
+  setSpatialSetting(key: string, value: boolean): void;
+  /** Settings-panel spatial test (start_spatial_test / stop_spatial_test). */
+  startSpatialTest(mode: ProximityMode): Promise<void>;
+  stopSpatialTest(): void;
   setVoiceMode(mode: string): Promise<void>;
   setVadThreshold(thresholdDb: number): void;
   getAudioLevel(): number;
@@ -90,6 +112,8 @@ export interface AudioApi {
     vad_threshold_db: number;
     input_device: string | null;
     output_device: string | null;
+    spatial_audio?: boolean;
+    screen_audio_spatial?: boolean;
   }): void;
   readonly muted: boolean;
   readonly deafened: boolean;

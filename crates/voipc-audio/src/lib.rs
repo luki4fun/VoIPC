@@ -10,6 +10,7 @@ pub mod mixer;
 #[cfg(not(target_os = "android"))]
 pub mod playback;
 pub mod resample;
+pub mod spatial;
 pub mod vad;
 
 // Android audio via Oboe (AAudio/OpenSL ES)
@@ -141,23 +142,37 @@ pub mod playback {
     use ringbuf::HeapRb;
 
     const TARGET_SAMPLE_RATE: u32 = 48_000;
-    const PLAYBACK_BUFFER_SIZE: usize = 48_000 / 5; // ~200ms
+    // ~200ms of interleaved stereo samples
+    const PLAYBACK_BUFFER_SIZE: usize = 48_000 / 5 * 2;
 
     struct OboePlayback {
         consumer: ringbuf::HeapCons<f32>,
-        last_samples: [f32; 32],
+        /// Interleaved stereo pulled from the ring before the downmix.
+        scratch: Vec<f32>,
     }
 
     impl AudioOutputCallback for OboePlayback {
         type FrameType = (f32, Mono);
 
+        // ponytail: the mixer produces stereo, Android plays the mono downmix
+        // — distance attenuation works, panning does not. Real stereo needs
+        // set_stereo() + FrameType (f32, Stereo) here and a look at the
+        // MODE_IN_COMMUNICATION routing in MainActivity.kt, which mono-ifies
+        // the stream on many devices.
         fn on_audio_ready(
             &mut self,
             _stream: &mut dyn AudioOutputStreamSafe,
             audio_data: &mut [f32],
         ) -> DataCallbackResult {
-            let read = self.consumer.pop_slice(audio_data);
-            if read < audio_data.len() {
+            let frames = audio_data.len();
+            self.scratch.clear();
+            self.scratch.resize(frames * 2, 0.0);
+            let read = self.consumer.pop_slice(&mut self.scratch) / 2;
+
+            for i in 0..read {
+                audio_data[i] = 0.5 * (self.scratch[2 * i] + self.scratch[2 * i + 1]);
+            }
+            if read < frames {
                 // Underrun: fade out last samples to avoid clicks, then silence
                 let fade_len = read.min(32);
                 for i in 0..fade_len {
@@ -168,10 +183,6 @@ pub mod playback {
                     *sample = 0.0;
                 }
             }
-            // Store last samples for potential fade-out
-            let start = if read >= 32 { read - 32 } else { 0 };
-            let count = read.min(32);
-            self.last_samples[..count].copy_from_slice(&audio_data[start..start + count]);
             DataCallbackResult::Continue
         }
 
@@ -203,7 +214,7 @@ pub mod playback {
 
         let callback = OboePlayback {
             consumer,
-            last_samples: [0.0; 32],
+            scratch: Vec::new(),
         };
 
         let mut stream = AudioStreamBuilder::default()

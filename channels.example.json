@@ -10,6 +10,11 @@
     "description": "Away from keyboard"
   },
   {
+    "name": "Round Table",
+    "description": "Proximity chat: you hear people where they stand",
+    "proximity": "2d"
+  },
+  {
     "name": "Private",
     "description": "Password-protected room",
     "password": "secret123",

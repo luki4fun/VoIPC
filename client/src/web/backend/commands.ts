@@ -12,6 +12,7 @@ import { getConfig, resetConfig, updateConfig } from "./config";
 import * as session from "./session";
 import { playCue } from "./sounds";
 import type { SavedServer, SoundSettings } from "../../lib/stores/settings";
+import type { ProximityMode } from "../../lib/spatial";
 
 type Args = Record<string, unknown>;
 type Handler = (args: Args) => unknown;
@@ -47,6 +48,21 @@ function bool(v: unknown, name: string): boolean {
 
 function clamp(v: number, lo: number, hi: number): number {
   return Math.min(hi, Math.max(lo, v));
+}
+
+/** Proximity mode as the protocol spells it; absent or "off" means non-positional. */
+function proximityMode(v: unknown): ProximityMode {
+  if (v == null) return "off";
+  const s = str(v, "proximity");
+  return s === "off" || s === "2d" || s === "3d" ? s : fail(`unknown proximity mode: ${s}`);
+}
+
+/** A position in metres: [x, y, z], or null to remove a placement. */
+function position(v: unknown, name: string): [number, number, number] | null {
+  if (v == null) return null;
+  if (!Array.isArray(v) || v.length !== 3) fail(`invalid ${name}`);
+  const [x, y, z] = v.map((c) => num(c, name));
+  return [x, y, z];
 }
 
 const byteLength = (s: string) => new TextEncoder().encode(s).length;
@@ -102,16 +118,25 @@ const handlers: Record<string, Handler> = {
     s.clearWatching();
     s.sendControl({ JoinChannel: { channel_id: channel, password: optStr(password, "password") } });
   },
-  create_channel: ({ name, password }) => {
+  create_channel: ({ name, password, proximity }) => {
     const channelName = str(name, "name");
     if (channelName.length === 0 || byteLength(channelName) > 128) fail("channel name must be 1-128 characters");
     const pw = optStr(password, "password");
     if (pw !== null && byteLength(pw) > 128) fail("password too long");
-    need().sendControl({ CreateChannel: { name: channelName, password: pw } });
+    need().sendControl({
+      CreateChannel: { name: channelName, password: pw, proximity: proximityMode(proximity) },
+    });
   },
   set_channel_password: ({ channelId, password }) =>
     need().sendControl({
       SetChannelPassword: { channel_id: u32(channelId, "channelId"), password: optStr(password, "password") },
+    }),
+  set_channel_proximity: ({ channelId, proximity }) =>
+    need().sendControl({
+      SetChannelProximity: {
+        channel_id: u32(channelId, "channelId"),
+        proximity: proximityMode(proximity),
+      },
     }),
   kick_user: ({ channelId, userId }) =>
     need().sendControl({ KickUser: { channel_id: u32(channelId, "channelId"), user_id: u32(userId, "userId") } }),
@@ -206,6 +231,48 @@ const handlers: Record<string, Handler> = {
     need();
     audio.setUserVolume(u32(userId, "userId"), clamp(num(volume, "volume"), 0, 2));
   },
+  set_user_position: ({ userId, pos, range, volume, muffle, direct }) => {
+    need();
+    audio.setUserPosition(u32(userId, "userId"), position(pos, "pos"), {
+      range: range == null ? undefined : num(range, "range"),
+      volume: volume == null ? undefined : num(volume, "volume"),
+      muffle: muffle == null ? undefined : u32(muffle, "muffle"),
+      direct: direct == null ? undefined : bool(direct, "direct"),
+    });
+  },
+  set_own_position: ({ pos, fwd }) => {
+    need();
+    const p = position(pos, "pos") ?? fail("invalid pos");
+    let facing: [number, number] | undefined;
+    if (fwd != null) {
+      if (!Array.isArray(fwd) || fwd.length !== 2) fail("invalid fwd");
+      facing = [num(fwd[0], "fwd"), num(fwd[1], "fwd")];
+    }
+    audio.setOwnPosition(p, facing);
+  },
+  set_position_sync: ({ enabled }) => {
+    need();
+    audio.setPositionSync(bool(enabled, "enabled"));
+  },
+  clear_positions: () => {
+    need();
+    audio.clearPositions();
+  },
+  // A browser page cannot host a socket, so the game SDK is desktop-only
+  get_sdk_status: () => ({ available: false, enabled: false, port: 0, origins: [] }),
+  set_sdk_config: () => fail("The game SDK needs the desktop app"),
+  set_spatial_setting: ({ key, value }) => {
+    const enabled = bool(value, "value");
+    const name = str(key, "key");
+    if (name !== "spatial_audio" && name !== "screen_audio_spatial") {
+      fail(`Unknown spatial setting: ${name}`);
+    }
+    updateConfig((c) => {
+      if (name === "spatial_audio") c.spatial_audio = enabled;
+      else c.screen_audio_spatial = enabled;
+    });
+    audio.setSpatialSetting(name, enabled);
+  },
   get_user_volume: ({ userId }) => {
     need();
     return audio.getUserVolume(u32(userId, "userId"));
@@ -246,6 +313,13 @@ const handlers: Record<string, Handler> = {
   },
   start_mic_test: () => audio.startMicTest(),
   stop_mic_test: () => audio.stopMicTest(),
+  // No session needed: the audio graph stands on its own, like the mic test
+  start_spatial_test: ({ mode }) => {
+    const m = proximityMode(mode);
+    if (m === "off") fail("Pick 2d or 3d");
+    return audio.startSpatialTest(m);
+  },
+  stop_spatial_test: () => audio.stopSpatialTest(),
   get_voice_stats: () => {
     need();
     return audio.getVoiceStats();

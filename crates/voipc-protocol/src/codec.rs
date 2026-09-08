@@ -13,7 +13,9 @@ pub const MAX_MSG_SIZE: u32 = 65_536;
 ///     (server-issued ChannelMediaKey removed; DistributeMediaKey carries message_type)
 /// v5: everything over one QUIC connection — udp_token removed from media
 ///     headers and from Authenticated; VideoLossReport/VideoLossReported added
-pub const PROTOCOL_VERSION: u32 = 5;
+/// v6: proximity chat — ChannelInfo.proximity, CreateChannel.proximity,
+///     SetChannelProximity, encrypted Position media packet (0x06)
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.
@@ -195,13 +197,19 @@ mod tests {
         let msg = ClientMessage::CreateChannel {
             name: "TestRoom".into(),
             password: None,
+            proximity: crate::types::ProximityMode::ThreeD,
         };
         let encoded = encode_client_msg(&msg).unwrap();
         let decoded = decode_client_msg(&encoded[4..]).unwrap();
         match decoded {
-            ClientMessage::CreateChannel { name, password } => {
+            ClientMessage::CreateChannel {
+                name,
+                password,
+                proximity,
+            } => {
                 assert_eq!(name, "TestRoom");
                 assert!(password.is_none());
+                assert_eq!(proximity, crate::types::ProximityMode::ThreeD);
             }
             _ => panic!("wrong variant"),
         }

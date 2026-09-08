@@ -10,9 +10,15 @@ const handlers = new Map<string, Set<Handler>>();
 export function emit(name: string, payload: unknown = null): void {
   const set = handlers.get(name);
   if (!set) return;
+  // Value semantics, like Tauri's IPC: a handler gets its own copy, so no
+  // backend cache and no Svelte store can ever alias the same object. (The
+  // session once cached the ChannelList array it also emitted; the store kept
+  // that array, a later in-place push duplicated a channel and the keyed
+  // {#each} threw each_key_duplicate.) Payloads are plain JSON-like values.
+  const value = payload !== null && typeof payload === "object" ? structuredClone(payload) : payload;
   for (const h of Array.from(set)) {
     try {
-      h(payload);
+      h(value);
     } catch (e) {
       console.error(`event handler for "${name}" failed:`, e);
     }

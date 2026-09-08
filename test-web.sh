@@ -111,7 +111,7 @@ EOF
 # alice creates the channel, becomes admin at the end and kicks bob; bob joins
 # through an invite-link fragment (#channel=…) and expects the kick
 # alice also shares her (synthetic) screen; bob watches it
-run_browser alice talker "&channel=e2e&dm=bob&admin=e2e-admin&kick=bob&share=1" \
+run_browser alice talker "&channel=e2e&dm=bob&admin=e2e-admin&kick=bob&share=1&proximity=2d&pos=3,0,0&spatialtest=3d" \
   "$WORK/alice.log" "$BROWSER_ALICE"
 # Not a fixed stagger: the run asserts that a message alice sent *before* bob
 # arrived reaches him as channel history, so the harness has to make "before"
@@ -128,7 +128,7 @@ for _ in $(seq 1 300); do
 done
 grep -q 'SELFTEST early-chat-sent' "$WORK/alice.log" ||
   echo "warning: alice never reported her first message — bob starts anyway, expect a history failure"
-run_browser bob listener "&dm=alice&expect_kick=1&watch=1#channel=e2e" \
+run_browser bob listener "&dm=alice&expect_kick=1&watch=1&pos=-3,0,0#channel=e2e" \
   "$WORK/bob.log" "$BROWSER_BOB"
 
 deadline=$(( $(date +%s) + DURATION / 1000 + 30 ))
@@ -157,6 +157,16 @@ check "bob got a media key"             "$WORK/bob.txt"   'media-key-installed'
 check "bob saw alice speaking"          "$WORK/bob.txt"   'user-speaking.*speaking.*true'
 check "bob saw alice stop speaking"     "$WORK/bob.txt"   'user-speaking.*speaking.*false'
 check "bob played voice frames"         "$WORK/bob.txt"   'voice-stats.*played.*:[1-9]'
+check "alice's channel is 2d"           "$WORK/alice.txt" 'event channel-created.*"name":"e2e".*"proximity":"2d"'
+check "bob sees the channel as 2d"      "$WORK/bob.txt"   'event channel-list.*"name":"e2e".*"proximity":"2d"'
+check "alice's spatial maths matches"   "$WORK/alice.txt" 'SELFTEST spatial ok'
+check "bob's spatial maths matches"     "$WORK/bob.txt"   'SELFTEST spatial ok'
+check "bob placed alice from her beacon" "$WORK/bob.txt"  'event user-position.*"x":3'
+check "alice placed bob from his beacon" "$WORK/alice.txt" 'event user-position.*"x":-3'
+# Nobody transmits to alice (bob only listens), so her played frames are the
+# spatial test's synthetic voice going through the real mixer
+check "alice ran the spatial test"      "$WORK/alice.txt" 'spatial-test-started.*"mode":"3d"'
+check "alice's mixer played the test"   "$WORK/alice.txt" 'voice-stats.*played.*:[1-9]'
 check "bob read alice's channel message" "$WORK/bob.txt"  'channel-chat-message.*hello from alice'
 check "alice read bob's channel message" "$WORK/alice.txt" 'channel-chat-message.*hello from bob'
 check "bob read alice's DM"             "$WORK/bob.txt"   'direct-chat-message.*dm from alice'
@@ -181,6 +191,34 @@ fi
 if grep -q 'SELFTEST error' "$WORK/alice.txt" "$WORK/bob.txt" || grep -q 'connection-lost' "$WORK/alice.txt"; then
   echo "FAIL errors/connection loss reported:" | tee -a "$WORK/fails.txt"
   grep -h 'connection-lost\|SELFTEST error' "$WORK/alice.txt" "$WORK/bob.txt" | tee -a "$WORK/fails.txt"; fail=1
+fi
+
+# The self-test above never renders a component: it drives the backend through
+# the same invoke()/listen() surface the UI uses. test-ui.mjs clicks the real
+# Svelte UI over the DevTools protocol, which is where a duplicate key in a
+# keyed {#each} throws and wedges the window. Chromium only — Firefox has no CDP.
+if [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
+  echo "--- UI regression (test-ui.mjs)"
+  UI_CDP="${UI_CDP:-9229}"
+  "$CHROME" --headless=new --no-sandbox --disable-gpu --ignore-certificate-errors \
+    --use-fake-ui-for-media-stream --use-fake-device-for-media-stream \
+    --autoplay-policy=no-user-gesture-required --remote-debugging-port="$UI_CDP" \
+    --user-data-dir="$WORK/profile-ui" about:blank > "$WORK/ui-browser.log" 2>&1 &
+  ui_browser=$!
+  for _ in $(seq 1 50); do
+    curl -s "http://127.0.0.1:$UI_CDP/json/version" > /dev/null 2>&1 && break
+    sleep 0.2
+  done
+  if node "$SCRIPT_DIR/test-ui.mjs" "$TCP_PORT" "$UI_CDP" | tee "$WORK/ui.txt"; then
+    echo "PASS the UI survives creating and configuring a proximity channel"
+  else
+    echo "FAIL the UI regression test" | tee -a "$WORK/fails.txt"
+    grep '^FAIL' "$WORK/ui.txt" >> "$WORK/fails.txt" || true
+    fail=1
+  fi
+  kill "$ui_browser" 2>/dev/null || true
+else
+  echo "--- UI regression skipped (needs Chromium for the DevTools protocol)"
 fi
 
 echo "--- server log tail"; tail -20 "$WORK/server.log"

@@ -16,10 +16,16 @@
 //   share=1              share a screen (a synthetic canvas stands in for the
 //                        display, so headless browsers need no real capture)
 //   watch=1              watch the first peer that starts sharing
+//   proximity=off|2d|3d  proximity mode for a channel this run creates
+//   pos=<x,y,z>          stand here (metres) and share the position with the
+//                        channel, so peers receive a position beacon
+//   spatialtest=2d|3d    run the settings panel's spatial test (a synthetic
+//                        voice orbiting the listener) through the real mixer
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { parseInviteFragment } from "../lib/invite";
+import { checkGoldenValues, testLabel, type ProximityMode } from "../lib/spatial";
 
 interface ChannelInfo { channel_id: number; name: string }
 interface UserInfo { user_id: number; username: string; channel_id: number; is_screen_sharing?: boolean }
@@ -76,6 +82,15 @@ export async function run(params: URLSearchParams): Promise<void> {
   const expectKick = params.has("expect_kick");
   const doShare = params.has("share");
   const doWatch = params.has("watch");
+  const proximity = (params.get("proximity") ?? "off") as ProximityMode;
+  const ownPosition = params.get("pos");
+  const spatialTest = params.get("spatialtest") as "2d" | "3d" | null;
+
+  // The spatial formula is written twice (Rust for the native mixer, TypeScript
+  // for the worklet). This proves the browser copy still matches the table both
+  // sides assert, so the two cannot drift apart unnoticed.
+  const spatialMismatch = checkGoldenValues();
+  log(spatialMismatch === null ? "spatial ok" : "spatial mismatch", spatialMismatch ?? undefined);
 
   window.addEventListener("error", (e) => log("error", { message: e.message }));
   window.addEventListener("unhandledrejection", (e) => log("error", { message: String(e.reason) }));
@@ -105,6 +120,7 @@ export async function run(params: URLSearchParams): Promise<void> {
     "screenshare-started", "screenshare-stopped", "watching-screenshare",
     "stopped-watching-screenshare", "screenshare-error", "screenshare-frame",
     "viewer-count-changed", "keyframe-requested",
+    "user-position", "proximity-mode", "channel-created", "channel-updated",
   ];
   for (const ev of watched) {
     await listen(ev, (e: { payload: unknown }) => {
@@ -164,6 +180,16 @@ export async function run(params: URLSearchParams): Promise<void> {
     });
     myUserId = userId;
     log("connected", { user_id: userId, name });
+    // The spatial test plays a synthetic voice through the real mixer, so the
+    // played-frame count below proves the whole path renders it
+    if (spatialTest) {
+      try {
+        await invoke("start_spatial_test", { mode: spatialTest });
+        log("spatial-test-started", { mode: spatialTest, where: testLabel(spatialTest, 0) });
+      } catch (e) {
+        log("error", { message: `spatial test: ${String(e)}` });
+      }
+    }
   } catch (e) {
     log("connect-failed", { error: String(e) });
     log("done");
@@ -178,7 +204,7 @@ export async function run(params: URLSearchParams): Promise<void> {
       await invoke("join_channel", { channelId: existing.channel_id, password: invite?.password ?? null });
       joinedChannelId = existing.channel_id;
     } else {
-      await invoke("create_channel", { name: channelName, password: null });
+      await invoke("create_channel", { name: channelName, password: null, proximity });
     }
     log("channel-requested", { channel: channelName, existing: !!existing, source: invite ? "invite" : "param" });
   } catch (e) {
@@ -217,10 +243,25 @@ export async function run(params: URLSearchParams): Promise<void> {
 
   const started = Date.now();
   let talked = false;
+  let positionShared = false;
   while (Date.now() - started < duration) {
     await sleep(500);
     const me = users.get(myUserId);
     if (me && me.channel_id !== 0) joinedChannelId = me.channel_id;
+
+    // Proximity chat: stand somewhere and share it, so the peer's client
+    // receives a position beacon and places us
+    if (ownPosition && !positionShared && joinedChannelId !== 0) {
+      positionShared = true;
+      const [x, y, z] = ownPosition.split(",").map(Number);
+      try {
+        await invoke("set_own_position", { pos: [x, y, z] });
+        await invoke("set_position_sync", { enabled: true });
+        log("position-shared", { x, y, z });
+      } catch (e) {
+        log("error", { message: `position: ${String(e)}` });
+      }
+    }
     const peers = [...users.values()].filter((u) => u.user_id !== myUserId && u.channel_id === joinedChannelId && joinedChannelId !== 0);
 
     // A message typed while alone: queued until a peer arrives, and part of
@@ -302,6 +343,11 @@ export async function run(params: URLSearchParams): Promise<void> {
         log("error", { message: `transmit: ${String(e)}` });
       }
     }
+  }
+
+  if (spatialTest) {
+    log("spatial-test", { where: testLabel(spatialTest, (Date.now() - started) / 1000) });
+    await invoke("stop_spatial_test").catch(() => {});
   }
 
   try {

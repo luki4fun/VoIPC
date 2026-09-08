@@ -6,6 +6,7 @@ use std::sync::Arc;
 use ring::aead::LessSafeKey;
 use tokio::sync::{mpsc, RwLock};
 
+use voipc_audio::spatial::{Gains, Listener, Source};
 use voipc_crypto::media_keys::MediaKey;
 use voipc_crypto::stores::SignalStores;
 use voipc_protocol::types::*;
@@ -59,6 +60,10 @@ pub struct AppState {
     /// Capture-side mic gain as f32 bits (1.0 = unity), applied in the
     /// audio callback of both the voice capture and the mic test.
     pub input_gain: Arc<AtomicU32>,
+    /// The game currently driving positions over the SDK socket, by name.
+    /// `get_sdk_status` reads it, so Settings opened after the game connected
+    /// still shows it (the `sdk-status` event alone would have been missed).
+    pub sdk_game: Arc<std::sync::Mutex<Option<String>>>,
 }
 
 impl AppState {
@@ -76,6 +81,7 @@ impl AppState {
             config: std::sync::Mutex::new(crate::config::AppConfig::default()),
             mic_test_active: Arc::new(AtomicBool::new(false)),
             input_gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            sdk_game: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 }
@@ -168,6 +174,10 @@ impl Default for ChatState {
 pub struct ActiveConnection {
     pub user_id: UserId,
     pub username: String,
+    /// The `host:port` we connected to, as the user typed it. The game SDK
+    /// checks a mod's expectation against it before letting the game drive
+    /// the mix.
+    pub server_address: String,
     pub session_id: SessionId,
     pub is_muted: Arc<AtomicBool>,
     pub is_deafened: Arc<AtomicBool>,
@@ -264,6 +274,134 @@ pub struct ActiveConnection {
     // ── Per-user volume ──
     /// Per-user volume multiplier (0.0 = muted, 1.0 = default, 2.0 = max).
     pub user_volumes: Arc<std::sync::Mutex<HashMap<u32, f32>>>,
+    // ── Proximity chat ──
+    /// Where everyone stands, and how the mixer should render them.
+    pub spatial: Arc<std::sync::Mutex<SpatialState>>,
+    /// The channel list as last received, so the backend can resolve a
+    /// channel's proximity mode (and, for the game SDK, a channel by name)
+    /// without asking the UI.
+    pub channels: Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
+    /// Sequence counter for position beacons. Their own nonce domain, so it
+    /// must never share the voice counter.
+    pub position_sequence: Arc<AtomicU32>,
+}
+
+/// Everything the mixer needs to render voices positionally.
+///
+/// Positions are local state: the room UI and the game SDK both write here,
+/// and only the room's "sync my position" puts anything on the wire.
+pub struct SpatialState {
+    /// The current channel's mode. Off disables everything below.
+    pub mode: ProximityMode,
+    /// User setting: spatial audio may be switched off per client.
+    pub enabled: bool,
+    /// User setting: does a screen share's audio follow its sharer's position
+    /// or stay centred?
+    pub screen_audio_spatial: bool,
+    /// A game is driving positions. Members it does not list are silent
+    /// (distance culling), and the room view stops accepting drags.
+    pub sdk_active: bool,
+    /// Broadcasting our own position, and accepting the other members'.
+    pub sync: bool,
+    /// Our position moved since the last beacon. The beacon task sends at most
+    /// ten times a second, so a drag cannot outrun the server's budget.
+    pub dirty: bool,
+    /// Our own pose.
+    pub listener: Listener,
+    /// Where each other user is, keyed by user_id (== session_id, the id the
+    /// media packets carry), like `user_volumes`.
+    pub sources: HashMap<u32, Source>,
+    /// The settings panel's spatial test, while it runs.
+    pub test: Option<SpatialTest>,
+}
+
+/// A synthetic voice orbiting the listener, mixed by `voice_mixer_task` like
+/// any other source, so what the user hears is what proximity chat does.
+///
+/// It carries its own mode (the button they pressed), runs in any channel, and
+/// is always rendered relative to the default listener — the test is about the
+/// headphones, not about where they dragged themselves in the room.
+impl SpatialTest {
+    /// What the mixer applies to this frame: the stereo gains it ramps to, and
+    /// the low-pass coefficient. Always relative to the default listener, and
+    /// flat when the user has spatial audio switched off, so toggling it while
+    /// the test runs is the A/B comparison.
+    pub fn frame_target(
+        &self,
+        spatial_enabled: bool,
+        master: f32,
+        elapsed_secs: f32,
+    ) -> ((f32, f32), f32) {
+        let source = voipc_audio::spatial::test_source(self.mode, elapsed_secs);
+        let g = if spatial_enabled {
+            voipc_audio::spatial::gains(self.mode, &Listener::default(), Some(&source))
+        } else {
+            voipc_audio::spatial::FLAT
+        };
+        // Stopping: one frame ramped to silence, then the test is dropped
+        let target = if self.stopping {
+            (0.0, 0.0)
+        } else {
+            (g.l * master, g.r * master)
+        };
+        (target, g.lp_a)
+    }
+}
+
+pub struct SpatialTest {
+    pub mode: ProximityMode,
+    pub started: std::time::Instant,
+    /// Samples rendered so far: the generator's phase. Survives a mode switch,
+    /// so switching 2D↔3D does not click.
+    pub sample: u64,
+    /// Stopping: the mixer ramps this source to silence over one frame, then
+    /// drops it. A hard cut would click.
+    pub stopping: bool,
+    pub mix: voipc_audio::mixer::SourceMixState,
+}
+
+impl Default for SpatialState {
+    fn default() -> Self {
+        Self {
+            mode: ProximityMode::Off,
+            enabled: true,
+            screen_audio_spatial: true,
+            sdk_active: false,
+            sync: false,
+            dirty: false,
+            listener: Listener::default(),
+            sources: HashMap::new(),
+            test: None,
+        }
+    }
+}
+
+impl SpatialState {
+    /// Whether any spatial rendering happens at all right now.
+    pub fn active(&self) -> bool {
+        self.mode != ProximityMode::Off && self.enabled
+    }
+
+    /// Gains for one mixer source key (voice or screen audio).
+    pub fn gains_for(&self, key: u32, screen_audio: bool) -> Gains {
+        if !self.active() || (screen_audio && !self.screen_audio_spatial) {
+            return voipc_audio::spatial::FLAT;
+        }
+        match self.sources.get(&key) {
+            Some(src) => voipc_audio::spatial::gains(self.mode, &self.listener, Some(src)),
+            // A game lists everyone who should be audible; anyone else is out
+            // of range. Without a game, an unplaced user just sounds flat.
+            None if self.sdk_active => Gains { l: 0.0, r: 0.0, lp_a: 1.0 },
+            None => voipc_audio::spatial::FLAT,
+        }
+    }
+
+    /// Forget every placement (channel change, room reset, game disconnect).
+    /// The settings panel's test is not a placement and keeps running.
+    pub fn clear_positions(&mut self) {
+        self.sources.clear();
+        self.listener = Listener::default();
+    }
 }
 
 /// Who reported frame loss on our screen share, and how many viewers there are
@@ -324,6 +462,10 @@ pub struct UserSettings {
     pub noise_suppression: bool,
     pub muted: bool,
     pub deafened: bool,
+    /// Render proximity channels positionally (see `AppConfig::spatial_audio`).
+    pub spatial_audio: bool,
+    /// Place a screen share's audio at its sharer's position.
+    pub screen_audio_spatial: bool,
 }
 
 impl Default for UserSettings {
@@ -338,6 +480,101 @@ impl Default for UserSettings {
             noise_suppression: true,
             muted: false,
             deafened: false,
+            spatial_audio: true,
+            screen_audio_spatial: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use voipc_audio::spatial::{FLAT, MAX_MUFFLE, Source};
+
+    fn test_state(mode: ProximityMode, stopping: bool) -> SpatialTest {
+        SpatialTest {
+            mode,
+            started: std::time::Instant::now(),
+            sample: 0,
+            stopping,
+            mix: Default::default(),
+        }
+    }
+
+    #[test]
+    fn the_spatial_test_pans_and_follows_the_master_volume() {
+        let test = test_state(ProximityMode::TwoD, false);
+        // A quarter into the orbit the voice is on the right
+        let ((l, r), lp_a) = test.frame_target(true, 1.0, 2.0);
+        assert!(r > l * 5.0, "l = {l}, r = {r}");
+        assert_eq!(lp_a, 1.0, "the test is never muffled");
+        // Master volume scales it like any other source
+        let ((half_l, half_r), _) = test.frame_target(true, 0.5, 2.0);
+        assert!((half_l - l * 0.5).abs() < 1e-6 && (half_r - r * 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn switching_spatial_audio_off_centres_the_test() {
+        let test = test_state(ProximityMode::ThreeD, false);
+        let ((l, r), _) = test.frame_target(false, 1.0, 2.0);
+        assert_eq!((l, r), (FLAT.l, FLAT.r));
+    }
+
+    #[test]
+    fn stopping_ramps_the_test_to_silence() {
+        let test = test_state(ProximityMode::TwoD, true);
+        assert_eq!(test.frame_target(true, 1.0, 2.0).0, (0.0, 0.0));
+    }
+
+    #[test]
+    fn an_unplaced_user_is_flat_unless_a_game_is_culling() {
+        let mut state = SpatialState {
+            mode: ProximityMode::TwoD,
+            ..Default::default()
+        };
+        assert_eq!(state.gains_for(7, false), FLAT);
+        // A game lists everyone audible, so anyone missing is out of range
+        state.sdk_active = true;
+        assert_eq!(state.gains_for(7, false).l, 0.0);
+    }
+
+    #[test]
+    fn screen_audio_follows_the_sharer_only_when_the_viewer_wants_it() {
+        let mut state = SpatialState {
+            mode: ProximityMode::TwoD,
+            ..Default::default()
+        };
+        state.sources.insert(
+            7,
+            Source {
+                pos: [5.0, 0.0, 0.0],
+                ..Source::default()
+            },
+        );
+        let voice = state.gains_for(7, false);
+        assert!(voice.r > voice.l * 5.0);
+        assert_eq!(state.gains_for(7, true), voice, "the share follows its sharer");
+        state.screen_audio_spatial = false;
+        assert_eq!(state.gains_for(7, true), FLAT, "…until the viewer centres it");
+        assert_eq!(state.gains_for(7, false), voice, "which leaves the voice alone");
+    }
+
+    #[test]
+    fn clearing_placements_leaves_the_test_running() {
+        let mut state = SpatialState {
+            mode: ProximityMode::TwoD,
+            test: Some(test_state(ProximityMode::TwoD, false)),
+            ..Default::default()
+        };
+        state.sources.insert(
+            7,
+            Source {
+                muffle: MAX_MUFFLE,
+                ..Source::default()
+            },
+        );
+        state.clear_positions();
+        assert!(state.sources.is_empty());
+        assert!(state.test.is_some(), "the settings-panel test is not a placement");
     }
 }

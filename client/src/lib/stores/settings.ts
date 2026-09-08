@@ -69,6 +69,12 @@ export const shareChannelHistory = writable<boolean>(true);
 /** Codec for our own screen share: "h264" (every viewer) or "h265" (desktop viewers). */
 export const screenShareCodec = writable<string>("h264");
 
+// Proximity chat (receive side; both are per-client preferences)
+/** Render voices positionally in proximity channels. */
+export const spatialAudio = writable<boolean>(true);
+/** Place a screen share's audio at its sharer's position. */
+export const screenAudioSpatial = writable<boolean>(true);
+
 // Saved servers for the connect dialog
 export interface SavedServer {
   name: string;
@@ -132,6 +138,10 @@ export interface AppConfig {
   saved_servers: SavedServer[];
   /** Codec for our own screen share: "h264" (default) or "h265". */
   screen_share_codec: string;
+  /** Render voices positionally in proximity channels. */
+  spatial_audio: boolean;
+  /** Place a screen share's audio at its sharer's position. */
+  screen_audio_spatial: boolean;
   sounds: SoundSettings;
   auto_connect: boolean;
   share_channel_history: boolean;

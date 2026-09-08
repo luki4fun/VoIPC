@@ -237,7 +237,7 @@
 <section id="top">
   <div class="container hero-grid">
     <div>
-      <p class="hero-meta"><a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">v0.5.2</a> · MIT · Linux / Windows / Android / Browser</p>
+      <p class="hero-meta"><a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">v0.6.0</a> · MIT · Linux / Windows / Android / Browser</p>
       <h1>Voice, screen sharing, and chat — on a server you run.</h1>
       <p class="hero-sub">VoIPC is an open-source alternative to Discord and TeamSpeak. Messages are encrypted with the Signal Protocol, voice and video with AES-256-GCM, and the relay server keeps nothing: no accounts, no database, no logs.</p>
       <div class="hero-buttons">
@@ -297,6 +297,21 @@
         </ul>
       </div>
       <img class="screenshot" src="screenshots/connect.png" width="1280" height="800" alt="VoIPC connect dialog with saved servers" loading="lazy">
+    </div>
+
+    <div class="feature-row">
+      <div>
+        <h3>Proximity chat</h3>
+        <p>A channel can place voices in space: 2D on a floor plan, or 3D with height. Distance makes a voice quieter, direction moves it left or right, and a wall muffles it — the same maths Mumble and TeamSpeak use, done on your own machine.</p>
+        <ul>
+          <li>Virtual room: arrange everyone yourself, or share your own position with the channel</li>
+          <li>Presets for a round table, a class room with a presenter, or a line</li>
+          <li>Positions are encrypted with the channel key like voice — the server relays them blind</li>
+          <li>Off, 2D or 3D per channel; operators can switch the feature off server-wide</li>
+          <li><strong>Game SDK</strong>: a game mod can drive the positions over a local socket — the open
+            alternative to the TeamSpeak plugins RP servers install today, with no plugin and no license server</li>
+        </ul>
+      </div>
     </div>
 
     <div class="also">

@@ -16,6 +16,7 @@
   import type { VoiceMode } from "../stores/voice.js";
   import ScreenShareControls from "./ScreenShareControls.svelte";
   import { isMobile } from "../stores/platform.js";
+  import { currentProximity, roomOpen } from "../stores/room.js";
   import Icon from "./Icons.svelte";
 
   // Voice is disabled in the General lobby (channel 0)
@@ -372,6 +373,17 @@
           title={$speakerMode ? "Switch to earpiece" : "Switch to speaker"}
         >
           <Icon name="volume" size={18} />
+        </button>
+      {/if}
+
+      {#if !$isMobile && $currentProximity !== "off"}
+        <button
+          class="icon-btn"
+          class:active-success={$roomOpen}
+          onclick={() => roomOpen.update((v) => !v)}
+          title={$roomOpen ? "Back to chat" : "Show the virtual room"}
+        >
+          <Icon name="room" size={18} />
         </button>
       {/if}
     </div>

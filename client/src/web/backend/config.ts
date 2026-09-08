@@ -30,6 +30,8 @@ export function defaultConfig(): AppConfig {
     last_accept_self_signed: null,
     saved_servers: [],
     screen_share_codec: "h264",
+    spatial_audio: true,
+    screen_audio_spatial: true,
     sounds: defaultSoundSettings(),
     auto_connect: false,
     share_channel_history: true,

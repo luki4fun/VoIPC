@@ -74,6 +74,14 @@ export interface DecryptedVoice extends VoicePacketHeader {
   opus: Uint8Array;
 }
 
+/** A peer's position in metres (x/y ground plane, z up). */
+export interface DecryptedPosition {
+  session_id: number;
+  x: number;
+  y: number;
+  z: number;
+}
+
 export interface ScreenAudioInfo {
   session_id: number;
   sequence: number;
@@ -101,6 +109,17 @@ export interface WasmApi {
   parseVoiceHeader(bytes: Uint8Array): VoicePacketHeader;
   /** Decrypts an encrypted voice packet (0x05); throws on any other type or on failed authentication. */
   decryptVoicePacket(key: MediaKey, bytes: Uint8Array): DecryptedVoice;
+  /** Encrypted position beacon (0x06) carrying our own position, in metres. */
+  buildPositionPacket(
+    key: MediaKey,
+    sessionId: number,
+    sequence: number,
+    x: number,
+    y: number,
+    z: number,
+  ): Uint8Array;
+  /** Decrypts a position beacon (0x06); throws on any other type or on failed authentication. */
+  decryptPositionPacket(key: MediaKey, bytes: Uint8Array): DecryptedPosition;
   /** Encrypted screen-share audio packet (0x15). Throws on failure. */
   parseScreenAudioPacket(key: MediaKey, bytes: Uint8Array): ScreenAudioInfo;
   /** Encrypted screen-share audio packet (0x15) for one Opus frame we captured. */
@@ -150,6 +169,8 @@ export async function loadWasm(): Promise<WasmApi> {
     buildPingPacket: (s, q) => mod.buildPingPacket(s, q),
     parseVoiceHeader: (b) => mod.parseVoiceHeader(b),
     decryptVoicePacket: (key, b) => mod.decryptVoicePacket(key, b),
+    buildPositionPacket: (key, s, q, x, y, z) => mod.buildPositionPacket(key, s, q, x, y, z),
+    decryptPositionPacket: (key, b) => mod.decryptPositionPacket(key, b),
     parseScreenAudioPacket: (key, b) => mod.parseScreenAudioPacket(key, b),
     buildScreenAudioPacket: (key, s, q, t, o) => mod.buildScreenAudioPacket(key, s, q, t, o),
     buildVideoFrameStream: (key, s, f, t, k, d) => mod.buildVideoFrameStream(key, s, f, t, k, d),

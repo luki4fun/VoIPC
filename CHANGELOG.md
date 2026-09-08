@@ -2,6 +2,46 @@
 
 All notable changes to VoIPC are documented here.
 
+## [0.6.0] - unreleased
+
+Protocol version 6 — client and server must be updated together (a channel now carries a proximity mode, and positions travel as a new encrypted media packet). A 0.5.x client connecting to a 0.6 server is told to update and stops reconnecting.
+
+### Added — proximity chat
+
+- **A channel can place voices in space.** Its mode is `off`, `2d` (a floor plan) or `3d` (height counts too), chosen when the channel is created and changeable afterwards by its creator — or by an admin, which is also the only way to change a channel from `channels.json`, exactly as with their password. Set `"proximity": "2d"` on an entry in `channels.json` to have a room start that way
+- **Voices are panned and attenuated on the receiving client**: the constant-power pan law browsers use for `StereoPannerNode`, the inverse distance model FMOD and TeamSpeak 3 use, Mumble's near-field bloom so someone standing on you does not spin around your head, and a fade over the last stretch of the range so a voice crossing it does not click. Gains ramp across each 20 ms frame; a source nobody placed sounds exactly as it did before, at unity on both channels
+- The formula lives once per host — `crates/voipc-audio/src/spatial.rs` and `client/src/lib/spatial.ts` — and both assert the same golden table, so the desktop and the browser cannot drift apart. The browser check runs in the end-to-end test
+- **The playback path is stereo end to end.** A mono output device gets the downmix, a surround device the front pair. **Android plays the downmix for now**: distance works there, panning does not
+- **A virtual room** shows the channel on a top-down plan (plain SVG, no new dependency). Arrange everyone yourself and the layout stays on your machine; turn on *Sync my position* and you move only yourself while your position is broadcast to the channel. Presets: round table, class room with a presenter at the front, line, free placement. In a `3d` channel each avatar gets a height slider
+- **Positions are as private as voice.** A shared position is one 39-byte AES-256-GCM packet under the channel key, relayed like a voice datagram: the server sees that a member is sharing a position and nothing else. It is re-sent once a second so a late joiner converges, at most ten times a second while moving, and the server drops it entirely in a non-proximity channel
+- **Per-viewer choice for screen-share audio**: it can come from where the sharer stands or stay centred, toggled in the viewer's toolbar or in Settings. Spatial audio as a whole can be switched off per client, which matters on a mono headset or with hearing in one ear
+- **A server-wide switch**: `proximity_enabled: false` in `server_settings.json` serves every channel as non-positional, refuses requests to enable it, and stops relaying positions
+- **Try it without a second person**: Settings → Spatial Audio → *Test 2D* / *Test 3D* sends a synthetic voice circling you through the real mixer, with a live readout of where it is. Turning "Hear people where they stand" off while it runs is the A/B comparison. On desktop it needs a connection (it plays through the call's mixer); Android hears the distance but not left/right
+
+### Added — a game SDK, as the open alternative to the TeamSpeak plugins
+
+- **A game mod can drive the positions.** VoIPC opens a loopback WebSocket that a page inside the game runtime connects to, the way SaltyChat, YACA and TokoVOIP work — but with no plugin to install, no license server, and players addressed by their VoIPC user id instead of by matching nicknames
+- One bulk update a few times a second carries the listener's pose and every audible player with their range, volume override, 0–10 muffling and mode. A player left out of the list is silent, which is how distance culling works in the plugins scripts already target. Radio, phone and megaphone audio is accepted as `mode: "direct"` and renders flat; the effect chains come later, and the handshake's `capabilities` list says what a build actually renders
+- **Off by default**, loopback only, and origins are checked: the game runtimes are allowed by prefix, `localhost` and `127.0.0.1` only as the exact host, and everything else is refused — a page served from `localhost.example.com` is an ordinary internet page that can reach a local port like any other. `hello.server` is required, so a mod cannot skip the wrong-server check by leaving it out, and the newest connection that completed a handshake owns the mix: a refused or stale socket can no longer clear a running game's positions on its way out
+- After a VoIPC reconnect the mod's player ids belong to the previous session; VoIPC answers such an update with an error telling it to say hello again, instead of silently culling every speaker out of the mix
+- `docs/SDK.md` documents the protocol and the FiveM/alt:V/RAGE identity flow; `sdk/test-page.html` is a one-file harness with sliders, so the SDK can be tried without a game. A ready-made FiveM example resource follows in 0.6.1
+
+### Fixed — hardening of the above, before it ships
+
+- **The web client no longer wedges when a channel is created.** The session cached the channel-list array it also handed to the UI, so a later in-place update duplicated a channel; Svelte's keyed list threw inside its flush and every later update threw again, leaving the window dead. The event bus now hands out copies, and both list updates replace instead of appending blindly, which also covers the server's snapshot and broadcast racing on two simultaneous joins
+- **Proximity chat now works on the desktop client at all**: the mixer only learned a channel's mode from the channel list and from later edits, never from joining one, so voices stayed flat and no position was ever shared. Joining also drops the previous room's placements, as the browser already did
+- **Changing a channel's proximity no longer deletes its password.** Saving the settings dialog always rewrote the password with the empty field; it is now left alone unless you type one or tick *Remove the password*
+- A dragged avatar sends at most ten positions a second on both clients, instead of one per pointer event — most of which the server dropped, the resting position among them
+- A newly created mixer source no longer bursts at full volume for its first 20 ms: gains start at their target instead of ramping down from unity, so a locally muted or distant speaker stays quiet
+- The browser client applies the saved spatial-audio settings on load, ignores non-finite positions (one NaN silenced a source for good), and the room view no longer keeps sharing your position after *Reset*, leaves a stale selection behind when someone leaves, or shows *Sync my position* as on when the toggle failed
+- The room view now locks while a game drives the positions, which the game SDK had announced since the beginning with nobody listening
+
+### Testing
+
+- The spatial maths is asserted along a full 2D and 3D trajectory in both languages, not just at a few fixed points, and the browser copy is checked in the end-to-end run
+- `npm test` in `client/` runs the browser-side unit tests on Node's own runner (no new dependency)
+- `test-ui.mjs` drives the real Svelte UI in a headless browser — creating a proximity channel, arranging the room, joining with a second client, changing the mode — and fails on any uncaught error. The end-to-end script runs it in its Chromium lanes; it reproduces the wedging bug above on the unfixed code
+
 ## [0.5.2] - 2026-09-08
 
 Protocol version 5 — client and server must be updated together (one QUIC connection per client, media headers without the UDP token, loss reports, the share's codec). A 0.4 client that connects to a 0.5.2 server is told to update and stops reconnecting, and so is a build from the unreleased 0.5.0/0.5.1 trees: they speak protocol 5 but without the codec field, which the server checks by exact version match.
