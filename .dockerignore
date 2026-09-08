@@ -1,0 +1,39 @@
+# Build context for Dockerfile.release, which does `COPY . .`.
+#
+# Two reasons to keep this tight: the build artifacts are tens of gigabytes and
+# would be uploaded on every build, and the Android signing key must never end
+# up in an image layer — the final stage is FROM scratch, but the builder stage
+# would still carry it in the local image cache.
+
+# Build outputs (the image builds its own)
+target/
+release/
+client/src-tauri/target/
+client/src-tauri/external-dlls/
+client/src-tauri/appimage-libs/
+client/dist/
+client/dist-web/
+client/src/lib/wasm/
+client/node_modules/
+node_modules/
+
+# Gradle's Android output tree (1.8 GB after one APK build; gitignored, and the
+# Docker image builds Linux artifacts only)
+client/src-tauri/gen/android/app/build/
+client/src-tauri/gen/android/.gradle/
+client/src-tauri/gen/android/app/src/main/jniLibs/
+
+# Signing material and certificates
+*.jks
+*.keystore
+keystore.properties
+certs/
+
+# History and local tooling
+.git/
+.github/
+.idea/
+.vscode/
+
+# Screenshots and the website are not part of any built artifact
+website/

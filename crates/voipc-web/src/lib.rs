@@ -312,7 +312,7 @@ pub fn parse_screen_audio_packet(key: &MediaKey, data: &[u8]) -> Result<JsValue,
     ]))
 }
 
-/// Reassembles encrypted video fragments (0x13/0x14) into H.265 frames.
+/// Reassembles encrypted video fragments (0x13/0x14) into whole frames.
 #[wasm_bindgen]
 pub struct VideoAssembler {
     core: media::VideoAssemblerCore,

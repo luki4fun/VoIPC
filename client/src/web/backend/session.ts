@@ -446,6 +446,8 @@ export class Session implements SessionContext {
         this.onPokeReceived(b.from_user_id, b.from_username, toBytes(b.ciphertext), b.message_type);
         break;
       case "ScreenShareStarted":
+        // Our own share was accepted; anyone else's is news for the UI
+        if (b.user_id === this.userId) share.onStarted();
         emit("screenshare-started", { user_id: b.user_id, username: b.username, resolution: b.resolution });
         break;
       case "ScreenShareStopped":
@@ -465,7 +467,8 @@ export class Session implements SessionContext {
         emit("viewer-count-changed", { viewer_count: b.viewer_count });
         break;
       case "KeyframeRequested":
-        // A viewer needs an IDR now; the UI relays this too (App.svelte)
+        // A viewer needs an IDR now. The event exists for parity with the
+        // native client, whose UI relays it back through set_keyframe_requested.
         share.requestKeyframe();
         emit("keyframe-requested");
         break;
@@ -474,6 +477,9 @@ export class Session implements SessionContext {
         share.onLossReport(b.frames_dropped);
         break;
       case "ScreenShareError":
+        // A refused StartScreenShare (already sharing, General lobby) must also
+        // tear down the capture the browser already granted us.
+        share.onServerError();
         emit("screenshare-error", { reason: b.reason });
         break;
       case "PreKeyBundle":

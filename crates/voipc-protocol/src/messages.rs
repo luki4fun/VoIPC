@@ -87,8 +87,9 @@ pub enum ClientMessage {
         source: String,
         /// Desired resolution height: 480, 720, or 1080.
         resolution: u16,
-        /// Codec every frame of this share is encoded with.
-        #[serde(default)]
+        /// Codec every frame of this share is encoded with. postcard is
+        /// positional, so this is not an optional field on the wire — client
+        /// and server of the same protocol version always agree on it.
         codec: VideoCodec,
     },
 
@@ -315,7 +316,6 @@ pub enum ServerMessage {
     /// arrive (`ScreenShareStarted` went out before they clicked watch).
     WatchingScreenShare {
         sharer_user_id: UserId,
-        #[serde(default)]
         codec: VideoCodec,
     },
 

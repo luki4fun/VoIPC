@@ -1,0 +1,108 @@
+name: Tests
+
+# Runs on every push and pull request, and as the gate the release workflow
+# calls before it builds anything.
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_call:
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      # The same list the Linux release job installs; voipc-video links FFmpeg
+      # and voipc-client links the desktop stack even for `cargo test`.
+      - name: System dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl ca-certificates pkg-config nasm cmake protobuf-compiler \
+            libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev \
+            libavutil-dev libswscale-dev libx264-dev libx265-dev \
+            libpipewire-0.3-dev libgbm-dev libasound2-dev libturbojpeg0-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev \
+            libssl-dev libclang-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            crates/voipc-web -> target
+
+      - name: Version fields agree with Cargo.toml
+        run: node tools/voipc.mjs version --check
+
+      - run: cargo test --workspace
+
+      # Separate workspace (wasm-only dependencies), so it needs its own run.
+      - name: Test the wasm crate on the host
+        run: cargo test
+        working-directory: crates/voipc-web
+
+  browser:
+    name: Browser end-to-end
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl ca-certificates pkg-config nasm cmake protobuf-compiler \
+            libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev \
+            libavutil-dev libswscale-dev libx264-dev libx265-dev \
+            libpipewire-0.3-dev libgbm-dev libasound2-dev libturbojpeg0-dev \
+            libssl-dev libclang-dev \
+            libnss3-tools   # certutil: the Firefox lane trusts the test CA with it
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: '. -> target'
+
+      - run: npm ci
+        working-directory: client
+
+      # wasm + web bundle + the server that embeds it
+      - run: npm run web
+
+      # The runner image ships Google Chrome and Firefox; test-web.sh falls back
+      # to google-chrome when there is no `chromium` binary.
+
+      # Both engines, and both mixed pairings: a Chromium sharer feeds a Firefox
+      # viewer H.264, a Firefox sharer feeds a Chromium viewer VP9.
+      - name: Chromium ↔ Chromium
+        run: ./test-web.sh
+        env: { BROWSER: chromium }
+      - name: Firefox ↔ Firefox
+        run: ./test-web.sh
+        env: { BROWSER: firefox }
+      - name: Chromium shares, Firefox watches
+        run: ./test-web.sh
+        env: { BROWSER_ALICE: chromium, BROWSER_BOB: firefox }
+      - name: Firefox shares, Chromium watches
+        run: ./test-web.sh
+        env: { BROWSER_ALICE: firefox, BROWSER_BOB: chromium }

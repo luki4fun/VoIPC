@@ -2,9 +2,9 @@
 
 All notable changes to VoIPC are documented here.
 
-## [0.5.0] - 2026-09-05
+## [0.5.2] - 2026-09-08
 
-Protocol version 5 — client and server must be updated together (one QUIC connection per client, media headers without the UDP token, loss reports, the share's codec). A 0.4 desktop client that connects to a 0.5 server is told to update and stops reconnecting.
+Protocol version 5 — client and server must be updated together (one QUIC connection per client, media headers without the UDP token, loss reports, the share's codec). A 0.4 client that connects to a 0.5.2 server is told to update and stops reconnecting, and so is a build from the unreleased 0.5.0/0.5.1 trees: they speak protocol 5 but without the codec field, which the server checks by exact version match.
 
 ### Added — screen sharing in every browser
 
@@ -12,7 +12,7 @@ Protocol version 5 — client and server must be updated together (one QUIC conn
 - **Browsers can share their screen.** `getDisplayMedia` → WebCodecs → the same encrypted fragments the desktop client sends, one QUIC stream per frame. VoIPC picks the codec by actually encoding a frame with it: Chromium shares H.264, Firefox falls back to VP9 because its WebCodecs H.264 encoder reports support and then refuses to encode ([Bugzilla 1918769](https://bugzilla.mozilla.org/show_bug.cgi?id=1918769)). Desktop audio comes along where the browser offers a track (Chromium for tabs and system audio; Firefox on Linux offers none). The frame clock runs in a Worker, so a share keeps its frame rate while the tab sits in the background — where a sharer's tab lives, and where page timers are throttled to about one tick per second
 - The browser share honours the same viewer-count gating, keyframe requests and quality ladder as the desktop sharer, and drops a frame rather than sending one too big for the 255-fragment wire format (WebCodecs has no VBV)
 - Encoders and decoders are wired for H.264, H.265, VP8 and VP9 across all three clients — FFmpeg on the desktop, MediaCodec on Android, WebCodecs in browsers
-- **The end-to-end browser test now shares and watches a screen** on both engines and in both mixed pairings (Chromium sharer → Firefox viewer and back). `BROWSER_ALICE` / `BROWSER_BOB` pick the engine per side. An animated canvas stands in for the display, so headless runs need no real capture
+- **The end-to-end browser test now shares and watches a screen.** `BROWSER_ALICE` / `BROWSER_BOB` pick the engine per side, so one run covers Chromium sharing to Firefox and the next covers the reverse; all four pairings pass. An animated canvas stands in for the display, so headless runs need no real capture
 - Windows builds now install FFmpeg with `x264` alongside `x265` (`.\setup.ps1`, and the cached vcpkg build in CI); Linux gets libx264 with the distribution's libavcodec
 
 ### Added — a default server for demo builds
@@ -39,6 +39,12 @@ Protocol version 5 — client and server must be updated together (one QUIC conn
 
 ### Security
 - **A QUIC connection slot is only spent once the client's address is validated.** The slot used to be taken on the first packet and held for the whole 10 s handshake window, so spoofed source addresses could pin all 256 of them and lock everyone out. Unvalidated sources now get a Retry first, which costs one extra round trip on a first connect
+
+### Fixed — Android
+- **The Android app started and immediately died.** The native library needs the NDK's C++ runtime (the audio layer is C++) but never declared it, and Android's loader resolves only what a library declares — so `dlopen` failed with `cannot locate symbol "__cxa_pure_virtual"` before the first screen was drawn. Shipping `libc++_shared.so` inside the APK was not enough. The build now links it, and the Android build task refuses to package a library that does not
+- **Watching a screen share showed "Waiting for video stream..." forever.** Frames were being received and decoded the whole time; the viewer converted them to RGBA and the JPEG encoder rejects an alpha channel ("does not support the color type `Rgba8`"), so every frame was dropped on the way to the screen. It converts to RGB now
+- **A share that was not a multiple of 16 wide decoded sheared or stretched.** The decoder is configured before the first frame with a 1920x1080 guess, and on a device that does not report a stride, that guess survived as the row stride of a 720p picture. The stride now follows the real size, and the codec's crop rectangle is applied, so a 854-wide share is shown as 854 and not as the padded 864
+- The connect dialog on Android and Windows offered `tauri.localhost` as the server, the app's own internal webview origin. It offers `localhost` again; only the browser client fills in the page's origin
 
 ### Fixed
 - **A kicked or banned client is told why again.** Ending a session waited for whichever of its legs finished first, and on a kick that is always the media relay, so the control leg was cut off while it was still delivering the reason. The client showed a plain "connection lost" instead of the kick message, most of the time in Firefox and occasionally in Chromium

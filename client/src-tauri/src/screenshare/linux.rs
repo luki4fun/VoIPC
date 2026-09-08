@@ -153,7 +153,7 @@ pub async fn request_screencast(
     }
 }
 
-/// Spawn the PipeWire screen capture + VP8 encode + fragment task.
+/// Spawn the PipeWire screen capture + encode + fragment task.
 pub fn spawn_capture_task(
     session: &CaptureSession,
     target_width: u32,

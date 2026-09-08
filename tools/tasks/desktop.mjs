@@ -34,7 +34,11 @@ function windowsMsvcEnv() {
   env.VCPKG_ROOT = vcpkgRoot;
   env.FFMPEG_DIR = vcpkgInstalled;
   env.PKG_CONFIG_PATH = join(vcpkgInstalled, 'lib', 'pkgconfig');
-  env.LIBCLANG_PATH = process.env.LIBCLANG_PATH || join(pf, 'LLVM', 'bin');
+  // Only point bindgen at a libclang that is actually there. Setting this to a
+  // path that does not exist is worse than leaving it unset, because bindgen
+  // can otherwise find libclang through PATH.
+  const llvmBin = process.env.LIBCLANG_PATH || join(pf, 'LLVM', 'bin');
+  if (existsSync(llvmBin)) env.LIBCLANG_PATH = llvmBin;
 
   const vswhere = join(pf86, 'Microsoft Visual Studio', 'Installer', 'vswhere.exe');
   let vsPath = null;
@@ -66,10 +70,13 @@ function windowsMsvcEnv() {
 
   if (vsPath && msvcVer) {
     const msvcRoot = join(vsPath, 'VC', 'Tools', 'MSVC', msvcVer);
-    // Force MSVC so the cmake-based crates don't pick up a clang from PATH.
+    // Force MSVC so the cmake-based crates don't pick up a clang from PATH —
+    // but only if it is really there, since a bogus CC breaks every cc-rs crate.
     const cl = join(msvcRoot, 'bin', 'Hostx64', 'x64', 'cl.exe');
-    env.CC = cl;
-    env.CXX = cl;
+    if (existsSync(cl)) {
+      env.CC = cl;
+      env.CXX = cl;
+    }
     includes.push(join(msvcRoot, 'include'));
     libs.push(join(msvcRoot, 'lib', 'x64'));
   }
@@ -138,7 +145,12 @@ export default function desktop(task, args) {
   const version = syncVersion();
   head(`${isDev ? 'Running' : 'Building'} VoIPC ${version} for ${process.platform}`);
 
-  const env = {};
+  // CMake 4 removed compatibility with project files declaring < 3.5, which
+  // libopus does — treat them as 3.5 instead of hard-erroring. Every task that
+  // can reach a CMake-based crate needs this: the cross build and the Android
+  // build set it too. It only bites where the vendored Opus is actually built,
+  // so a Linux host that resolves libopus through pkg-config never sees it.
+  const env = { CMAKE_POLICY_VERSION_MINIMUM: '3.5' };
   let config;
   // tauri.conf.json leaves bundle.active unset, which means "off" — so without
   // this a release build produces the bare binary and silently skips both the

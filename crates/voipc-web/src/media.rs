@@ -183,7 +183,7 @@ pub fn parse_screen_audio_packet(key: &MediaKey, bytes: &[u8]) -> anyhow::Result
 }
 
 pub struct VideoPush {
-    /// The reassembled H.265 frame when this fragment completed one.
+    /// The reassembled frame when this fragment completed one.
     pub frame: Option<Vec<u8>>,
     /// The completed frame's flag, or the fragment's while still assembling.
     pub is_keyframe: bool,
@@ -194,7 +194,7 @@ pub struct VideoPush {
     pub frame_dropped: bool,
 }
 
-/// Reassembles encrypted video fragments (0x13/0x14) into H.265 frames.
+/// Reassembles encrypted video fragments (0x13/0x14) into whole frames.
 pub struct VideoAssemblerCore {
     assembler: FrameAssembler,
     /// Sharer session the fragments belong to; a change resets the assembler.

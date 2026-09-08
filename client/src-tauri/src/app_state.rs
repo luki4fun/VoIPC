@@ -303,7 +303,8 @@ impl VoiceMode {
 }
 
 /// Config string → codec for our own screen share. Anything unknown is H.264,
-/// the codec every viewer can decode.
+/// the codec every viewer can decode. Sharing is desktop-only.
+#[cfg(not(target_os = "android"))]
 pub fn share_codec_from_str(s: &str) -> VideoCodec {
     match s {
         "h265" => VideoCodec::H265,

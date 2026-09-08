@@ -886,7 +886,8 @@
           .then(([framesSent, bytesSent, framesRecv, framesDropped, bytesRecv, resPacked]) => {
             const dt = 0.5; // 500ms poll interval
 
-            const sentDelta = framesSent - lastFramesSent;
+            // A restarted share resets the counters: never report a negative rate
+            const sentDelta = Math.max(0, framesSent - lastFramesSent);
             senderFps.set(Math.round(sentDelta / dt));
             lastFramesSent = framesSent;
 

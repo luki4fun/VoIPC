@@ -224,9 +224,6 @@ npm run build          # Release build (NSIS installer)
 npm run build -- --bundles nsis,msi   # both installer formats
 ```
 
-`build.ps1` is still present as a fallback while the shared build task proves
-itself on CI; it does the same thing.
-
 ### Building manually
 
 ```powershell
@@ -361,6 +358,11 @@ root, builds, and deletes both afterwards.
 - Rust via [rustup](https://rustup.rs/)
 - Node.js (for the Svelte frontend)
 - Tauri CLI: `npm install` in `client/`
+
+`Cargo.lock` (both the workspace's and `crates/voipc-web`'s) and
+`client/package-lock.json` are committed: a tag has to build the same
+dependency versions a year from now. `npm run version:sync` keeps the npm
+lockfile's own version field in step with `Cargo.toml`.
 
 ## Android
 

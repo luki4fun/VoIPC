@@ -19,6 +19,11 @@ export const noiseSuppression = writable<boolean>(true);
  * normal release ships with localhost. In the browser the page's own origin
  * wins when no default was baked in: the server that served the page is the
  * one to connect to.
+ *
+ * Only the browser build may read the origin. The app's webview serves the UI
+ * from an origin of its own (`http://tauri.localhost` on Android and Windows),
+ * which is not a server anyone can connect to — hence the `__WEB__` check
+ * rather than sniffing the protocol.
  */
 export function defaultServer(): { host: string; port: number } {
   const baked = import.meta.env?.VITE_DEFAULT_SERVER?.trim();
@@ -27,8 +32,9 @@ export function defaultServer(): { host: string; port: number } {
     if (parsed) return parsed;
     console.warn(`ignoring malformed VITE_DEFAULT_SERVER: ${baked}`);
   }
-  const loc = typeof location !== "undefined" && location.protocol.startsWith("http") ? location : null;
-  if (loc?.hostname) return { host: loc.hostname, port: Number(loc.port) || 9987 };
+  if (__WEB__ && typeof location !== "undefined" && location.hostname) {
+    return { host: location.hostname, port: Number(location.port) || 9987 };
+  }
   return { host: "localhost", port: 9987 };
 }
 

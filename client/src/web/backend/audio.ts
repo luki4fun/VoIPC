@@ -208,6 +208,8 @@ export class AudioEngine implements AudioApi {
   private screenEncoder: AudioEncoder | null = null;
   /** Set while the audio graph is coming up for a share (start is async). */
   private screenAudioStarting = false;
+  /** An encoder that failed is not rebuilt every 20 ms; reported once instead. */
+  private screenEncoderFailed = false;
   private screenEncodeTimestampUs = 0;
   /** session_id -> last voice packet time (edge-triggered speaking indicator). */
   private speaking = new Map<number, number>();
@@ -857,6 +859,7 @@ export class AudioEngine implements AudioApi {
         // Sharing may have stopped while the graph was coming up
         if (!this.screenAudioStarting || stream.getAudioTracks().length === 0) return;
         this.screenEncodeTimestampUs = 0;
+        this.screenEncoderFailed = false;
         this.screenCapture = Capture.fromStream(ac, stream, (f) => this.onScreenAudioFrame(f));
         this.screenCapture.onended = () => this.stopScreenAudio();
       })
@@ -906,24 +909,38 @@ export class AudioEngine implements AudioApi {
 
   private ensureScreenEncoder(): AudioEncoder | null {
     if (this.screenEncoder && this.screenEncoder.state === "configured") return this.screenEncoder;
-    if (typeof AudioEncoder === "undefined") return null;
+    if (this.screenEncoderFailed || typeof AudioEncoder === "undefined") return null;
     const enc = new AudioEncoder({
       output: (chunk) => this.onScreenAudioChunk(chunk),
-      error: (e) => {
-        console.warn("screen audio encode error:", e.message);
-        if (this.screenEncoder === enc) this.screenEncoder = null;
-      },
+      error: (e) => this.onScreenEncoderError(e.message),
     });
-    // 64 kbps mono, the native sharer's SCREEN_AUDIO_BITRATE (screenshare/mod.rs)
-    enc.configure({
-      codec: "opus",
-      sampleRate: SAMPLE_RATE,
-      numberOfChannels: 1,
-      bitrate: 64_000,
-      opus: { application: "audio", frameDuration: FRAME_US } as OpusEncoderConfig,
-    });
+    try {
+      // 64 kbps mono, the native sharer's SCREEN_AUDIO_BITRATE (screenshare/mod.rs)
+      enc.configure({
+        codec: "opus",
+        sampleRate: SAMPLE_RATE,
+        numberOfChannels: 1,
+        bitrate: 64_000,
+        opus: { application: "audio", frameDuration: FRAME_US } as OpusEncoderConfig,
+      });
+    } catch (e) {
+      this.onScreenEncoderError(e instanceof Error ? e.message : String(e));
+      return null;
+    }
     this.screenEncoder = enc;
     return enc;
+  }
+
+  /**
+   * A browser without an Opus encoder would otherwise rebuild one (and warn)
+   * for every 20 ms frame of the whole share. Report once and send video only.
+   */
+  private onScreenEncoderError(message: string): void {
+    this.screenEncoder = null;
+    if (this.screenEncoderFailed) return;
+    this.screenEncoderFailed = true;
+    console.warn("screen audio encoder failed, sharing video only:", message);
+    emit("screenshare-error", { reason: `Screen audio is not being sent: ${message}` });
   }
 
   private onScreenAudioChunk(chunk: EncodedAudioChunk): void {

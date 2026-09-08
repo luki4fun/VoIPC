@@ -22,7 +22,9 @@
   // without them (or a mobile one) keeps the button hidden.
   const canShare =
     !isWeb ||
-    (typeof VideoEncoder !== "undefined" && !!navigator.mediaDevices?.getDisplayMedia);
+    (typeof VideoEncoder !== "undefined" &&
+      typeof VideoFrame !== "undefined" &&
+      !!navigator.mediaDevices?.getDisplayMedia);
 
   let resLabel = $derived(
     $shareResolution === 1080 ? "1080p" :

@@ -7,9 +7,12 @@
 // after five minutes hidden). Worker timers are not throttled that way, so the
 // share keeps its frame rate while the tab sits in the background.
 //
+// Only the Firefox path uses this: Chromium reads the capture track directly
+// through MediaStreamTrackProcessor, which is not throttled either.
+//
 // Protocol: postMessage({ type: "start", intervalMs }) begins ticking,
-// { type: "stop" } ends it. Each tick posts the worker's own timestamp, which
-// the main thread uses to skip a tick it could not keep up with.
+// { type: "stop" } ends it. Each tick is an empty message — the main thread
+// paces itself against its own clock.
 
 let timer = null;
 
@@ -19,7 +22,7 @@ self.onmessage = (e) => {
   if (msg.type === "start") {
     if (timer !== null) clearInterval(timer);
     const interval = Math.max(1, Math.round(msg.intervalMs));
-    timer = setInterval(() => self.postMessage({ at: performance.now() }), interval);
+    timer = setInterval(() => self.postMessage(0), interval);
   } else if (msg.type === "stop") {
     if (timer !== null) clearInterval(timer);
     timer = null;

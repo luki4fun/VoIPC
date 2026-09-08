@@ -5,7 +5,7 @@ pub mod decoder;
 #[cfg(not(target_os = "android"))]
 pub mod convert;
 
-// Android H.265 decoder via NDK AMediaCodec
+// Android video decoder via NDK AMediaCodec
 #[cfg(target_os = "android")]
 mod android_decoder;
 #[cfg(target_os = "android")]
@@ -113,6 +113,30 @@ pub mod convert {
         let mut rgba = vec![0u8; width * height * 4];
         i420_to_rgba_into(i420, width, height, &mut rgba);
         rgba
+    }
+
+    /// I420 to packed RGB. JPEG has no alpha channel — the `image` crate's
+    /// encoder refuses an RGBA buffer outright — so the viewer converts to this.
+    pub fn i420_to_rgb(i420: &[u8], width: usize, height: usize) -> Vec<u8> {
+        let mut rgb = vec![0u8; width * height * 3];
+        let y_plane = &i420[..width * height];
+        let uv_width = (width + 1) / 2;
+        let u_offset = width * height;
+        let v_offset = u_offset + uv_width * ((height + 1) / 2);
+        for row in 0..height {
+            let row_off = row * width;
+            let uv_row = (row / 2) * uv_width;
+            for col in 0..width {
+                let c = y_plane[row_off + col] as i32 - 16;
+                let d = i420[u_offset + uv_row + (col / 2)] as i32 - 128;
+                let e = i420[v_offset + uv_row + (col / 2)] as i32 - 128;
+                let out = (row_off + col) * 3;
+                rgb[out] = clamp_u8((298 * c + 409 * e + 128) >> 8);
+                rgb[out + 1] = clamp_u8((298 * c - 100 * d - 208 * e + 128) >> 8);
+                rgb[out + 2] = clamp_u8((298 * c + 516 * d + 128) >> 8);
+            }
+        }
+        rgb
     }
 
     pub fn i420_to_rgba_into(i420: &[u8], width: usize, height: usize, rgba: &mut [u8]) {

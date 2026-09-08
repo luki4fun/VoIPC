@@ -75,8 +75,12 @@ jobs:
           name: release-notes
           path: notes.md
 
+  # Nothing is built until the suite that covers it passes.
+  test:
+    uses: ./.github/workflows/test.yml
+
   linux:
-    needs: meta
+    needs: [meta, test]
     runs-on: ubuntu-24.04   # glibc 2.39, matching Dockerfile.release
     steps:
       - uses: actions/checkout@v5
@@ -144,7 +148,7 @@ jobs:
           path: dist/*
 
   windows:
-    needs: meta
+    needs: [meta, test]
     # Pinned rather than windows-latest: the image is moving to VS 2026 and the
     # build detects the toolset, but pinning keeps releases reproducible.
     runs-on: windows-2025
@@ -255,7 +259,7 @@ jobs:
           path: dist/*
 
   android:
-    needs: meta
+    needs: [meta, test]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5

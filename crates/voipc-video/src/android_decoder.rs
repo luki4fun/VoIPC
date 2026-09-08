@@ -222,13 +222,20 @@ impl Decoder {
         };
         let needs_csd = matches!(self.video_codec, VideoCodec::H264 | VideoCodec::H265);
 
-        // Find CSD (everything up to the first non-parameter-set NAL unit)
+        // Find CSD (everything up to the first non-parameter-set NAL unit).
+        // H.264 wants SPS in csd-0 and PPS in csd-1; HEVC takes VPS+SPS+PPS
+        // concatenated in csd-0 (Android's documented layout for each).
         let csd = if needs_csd { extract_csd(self.video_codec, data) } else { &[][..] };
         if needs_csd && csd.is_empty() {
             return Err(anyhow!(
                 "AMediaCodec: first frame has no parameter sets — waiting for keyframe"
             ));
         }
+        let (csd0, csd1) = if self.video_codec == VideoCodec::H264 {
+            split_h264_csd(csd)
+        } else {
+            (csd, &[][..])
+        };
 
         // Parse width/height from the SPS if possible, otherwise use defaults
         let (w, h) = parse_sps_dimensions(self.video_codec, data).unwrap_or((1920, 1080));
@@ -250,13 +257,21 @@ impl Decoder {
                 b"height\0".as_ptr() as *const _,
                 h as i32,
             );
-            // Set CSD-0 (parameter sets concatenated with start codes)
-            if !csd.is_empty() {
+            // Parameter sets, with start codes
+            if !csd0.is_empty() {
                 ffi::AMediaFormat_setBuffer(
                     format,
                     b"csd-0\0".as_ptr() as *const _,
-                    csd.as_ptr(),
-                    csd.len(),
+                    csd0.as_ptr(),
+                    csd0.len(),
+                );
+            }
+            if !csd1.is_empty() {
+                ffi::AMediaFormat_setBuffer(
+                    format,
+                    b"csd-1\0".as_ptr() as *const _,
+                    csd1.as_ptr(),
+                    csd1.len(),
                 );
             }
 
@@ -413,6 +428,36 @@ impl Decoder {
             ) {
                 self.height = val as u32;
             }
+            // The configure hint was a guess (1920x1080 for anything but HEVC),
+            // so its stride must not survive into the real size. Devices that
+            // report stride/slice-height below overwrite these again.
+            self.stride = self.width;
+            self.slice_height = self.height;
+
+            // Codecs encode in whole macroblocks, so a 854-wide share is coded
+            // as 864 and carries a crop rectangle for the visible part. Without
+            // this the viewer shows the padding and a slightly stretched image.
+            let mut left = 0i32;
+            let mut right = 0i32;
+            let mut top = 0i32;
+            let mut bottom = 0i32;
+            if ffi::AMediaFormat_getInt32(format, b"crop-left\0".as_ptr() as *const _, &mut left)
+                && ffi::AMediaFormat_getInt32(format, b"crop-right\0".as_ptr() as *const _, &mut right)
+                && ffi::AMediaFormat_getInt32(format, b"crop-top\0".as_ptr() as *const _, &mut top)
+                && ffi::AMediaFormat_getInt32(format, b"crop-bottom\0".as_ptr() as *const _, &mut bottom)
+            {
+                // The rectangle is inclusive on both edges.
+                let cropped_w = right - left + 1;
+                let cropped_h = bottom - top + 1;
+                if cropped_w > 0
+                    && cropped_h > 0
+                    && cropped_w as u32 <= self.width
+                    && cropped_h as u32 <= self.height
+                {
+                    self.width = cropped_w as u32;
+                    self.height = cropped_h as u32;
+                }
+            }
             if ffi::AMediaFormat_getInt32(
                 format,
                 b"stride\0".as_ptr() as *const _,
@@ -550,7 +595,7 @@ impl Drop for Decoder {
 }
 
 // ---------------------------------------------------------------------------
-// H.265 Annex B helpers
+// Annex B helpers (H.264 and H.265)
 // ---------------------------------------------------------------------------
 
 /// Find start code positions in Annex B byte stream.
@@ -645,16 +690,29 @@ fn extract_csd(video_codec: VideoCodec, data: &[u8]) -> &[u8] {
     }
 }
 
+/// Split an H.264 CSD range into (SPS…, PPS…) as MediaCodec expects it for
+/// `video/avc`: csd-0 carries the SPS, csd-1 the PPS. The split is the first
+/// PPS start code inside the range; without one the whole range stays in csd-0.
+fn split_h264_csd(csd: &[u8]) -> (&[u8], &[u8]) {
+    for &pos in find_start_codes(csd).iter() {
+        if nal_type(VideoCodec::H264, csd, pos) == Some(8) {
+            return (&csd[..pos], &csd[pos..]);
+        }
+    }
+    (csd, &[])
+}
+
 /// Minimal HEVC SPS parser to extract pic_width and pic_height.
 ///
 /// Parses just enough of the SPS NAL to reach pic_width_in_luma_samples
 /// and pic_height_in_luma_samples (both exp-Golomb coded).
 ///
 /// HEVC only: for every other codec the configure hint is the 1920x1080
-/// fallback, which MediaCodec corrects through INFO_OUTPUT_FORMAT_CHANGED
-/// before it hands out the first decoded buffer.
-/// ponytail: add an H.264 SPS parser only if a device is ever seen to skip
-/// that callback.
+/// fallback, and the real size arrives with INFO_OUTPUT_FORMAT_CHANGED, which
+/// MediaCodec raises before the first decoded buffer (`update_output_format`
+/// then resets stride and slice height along with it).
+/// ponytail: add an H.264 SPS parser only if a device is ever seen to hand out
+/// a buffer before that callback.
 fn parse_sps_dimensions(video_codec: VideoCodec, data: &[u8]) -> Option<(u32, u32)> {
     if video_codec != VideoCodec::H265 {
         return None;
@@ -663,7 +721,10 @@ fn parse_sps_dimensions(video_codec: VideoCodec, data: &[u8]) -> Option<(u32, u3
 
     // Find the SPS NAL unit
     for (i, &pos) in positions.iter().enumerate() {
-        if nal_type(video_codec, data, pos)? == sps_nal_type(video_codec) {
+        let Some(t) = nal_type(video_codec, data, pos) else {
+            continue;
+        };
+        if t == sps_nal_type(video_codec) {
             // SPS NAL type
             let hdr_offset = if data[pos + 2] == 1 {
                 pos + 3

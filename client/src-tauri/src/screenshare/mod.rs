@@ -78,14 +78,17 @@ pub fn render_frame(
     let w = frame.width as usize;
     let h = frame.height as usize;
 
-    // I420 (YUV420P) → RGBA using pure-Rust converter from voipc-video
-    let rgba = voipc_video::convert::i420_to_rgba(&frame.i420_data, w, h);
+    // I420 (YUV420P) → RGB using the pure-Rust converter from voipc-video.
+    // RGB, not RGBA: the `image` crate's JPEG encoder rejects an alpha channel
+    // ("does not support the color type Rgba8"), which silently dropped every
+    // frame and left the viewer on "Waiting for video stream...".
+    let rgb = voipc_video::convert::i420_to_rgb(&frame.i420_data, w, h);
 
-    // Encode RGBA → JPEG using the `image` crate (pure Rust, no native deps)
+    // Encode RGB → JPEG using the `image` crate (pure Rust, no native deps)
     buffers.jpeg_buf.clear();
     let mut cursor = std::io::Cursor::new(&mut buffers.jpeg_buf);
-    let Some(img) = image::RgbaImage::from_raw(frame.width, frame.height, rgba) else {
-        tracing::warn!("render_frame: invalid RGBA buffer dimensions");
+    let Some(img) = image::RgbImage::from_raw(frame.width, frame.height, rgb) else {
+        tracing::warn!("render_frame: invalid RGB buffer dimensions");
         return;
     };
     if let Err(e) = img.write_to(&mut cursor, image::ImageFormat::Jpeg) {
@@ -607,7 +610,7 @@ impl FrameProcessor {
 
             // Pre-check: ensure channel has room for ALL fragments before
             // sending any. This guarantees all-or-nothing delivery — no
-            // partial frames that would corrupt the viewer's H.265 decoder.
+            // partial frames that would corrupt the viewer's decoder.
             let fragment_count = packets.len();
             let must_block = if self.video_tx.capacity() < fragment_count {
                 if ef.is_keyframe {
@@ -917,7 +920,7 @@ impl FrameDecodeBuffers {
 }
 
 #[cfg(not(target_os = "android"))]
-/// Render a decoded VP8 frame to the frontend as a base64 JPEG.
+/// Render a decoded frame to the frontend as a base64 JPEG.
 pub fn render_frame(
     frame: &voipc_video::decoder::DecodedFrame,
     app_handle: &tauri::AppHandle,

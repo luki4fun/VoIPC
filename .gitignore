@@ -1,6 +1,5 @@
 /target
 /release
-Cargo.lock
 *.swp
 *.swo
 *~

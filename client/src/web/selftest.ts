@@ -178,6 +178,26 @@ export async function run(params: URLSearchParams): Promise<void> {
     log("error", { message: `channel: ${String(e)}` });
   }
 
+  // The message alice types while alone, sent before the loop rather than on
+  // its first tick: a peer that joins in between asks for the channel history
+  // straight away, and she can only hand over what she already has.
+  if (role === "talker") {
+    for (let i = 0; i < 40 && joinedChannelId === 0; i++) {
+      await sleep(50);
+      const me = users.get(myUserId);
+      if (me && me.channel_id !== 0) joinedChannelId = me.channel_id;
+    }
+    if (joinedChannelId !== 0) {
+      earlySent = true;
+      try {
+        await invoke("send_channel_message", { content: `early from ${name}` });
+        log("early-chat-sent");
+      } catch (e) {
+        log("error", { message: `early chat: ${String(e)}` });
+      }
+    }
+  }
+
   const started = Date.now();
   let talked = false;
   while (Date.now() - started < duration) {

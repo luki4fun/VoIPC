@@ -272,12 +272,10 @@ const handlers: Record<string, Handler> = {
     need();
     return share.start(u32(resolution, "resolution"), u32(fps, "fps"));
   },
-  switch_screen_share_source: ({ resolution, fps }) => {
-    // getDisplayMedia cannot switch source without asking again: stop and re-ask
-    need();
-    share.stop();
-    return share.start(u32(resolution, "resolution"), u32(fps, "fps"));
-  },
+  // getDisplayMedia has no switch: the button is hidden on web, and stopping
+  // first would leave the share down if the user then cancelled the picker.
+  switch_screen_share_source: () =>
+    fail("Switching the source is not available in the browser — stop sharing and share again"),
   stop_screen_share: () => share.stop(),
   // The browser's picker enumerates sources itself
   enumerate_displays: () => [],

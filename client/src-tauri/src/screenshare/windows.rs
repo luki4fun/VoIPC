@@ -258,7 +258,7 @@ pub async fn request_screencast(
     }
 }
 
-/// Spawn the screen capture + H.265 encode + fragment task.
+/// Spawn the screen capture + encode + fragment task.
 ///
 /// Uses Windows.Graphics.Capture (WGC) for both display and window capture.
 #[allow(clippy::too_many_arguments)]

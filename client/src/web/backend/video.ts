@@ -117,6 +117,11 @@ export class VideoViewer implements VideoApi {
     }
     this.windowDropped = 0;
     this.windowReceived = 0;
+    // A fresh watch must be able to ask for its keyframe right away, even if
+    // the previous one asked less than KEYFRAME_REQUEST_INTERVAL_MS ago.
+    // The resolution stays: it is the last thing we decoded, and the native
+    // client keeps reporting it too until the next share replaces it.
+    this.lastKeyframeRequest = -Infinity;
     this.closeDecoder();
     this.assembler?.free();
     this.assembler = null;

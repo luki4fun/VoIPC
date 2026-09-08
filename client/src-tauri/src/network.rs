@@ -2783,6 +2783,10 @@ fn video_decode_render_task(
     };
     let mut last_keyframe_request = std::time::Instant::now() - std::time::Duration::from_secs(10);
     let mut suppress_render = false;
+    // The share the current decoder belongs to (sharer, codec); a change in
+    // either invalidates its reference frames.
+    let mut decoder_for: Option<(u32, voipc_protocol::types::VideoCodec)> = None;
+    let mut reported_missing_decoder: Option<voipc_protocol::types::VideoCodec> = None;
 
     while let Some((frame_data, is_keyframe)) = decode_rx.blocking_recv() {
         // Check shared flag from UDP receiver (frame loss detected)
@@ -2790,12 +2794,14 @@ fn video_decode_render_task(
             suppress_render = true;
         }
 
-        // Switching to a share in another codec (or the first share of this
-        // session) needs a new decoder; the old one cannot read the new stream.
+        // A different codec cannot be read by this decoder at all, and a
+        // different sharer's deltas would decode against the previous share's
+        // reference frames. Either way: start over and wait for a keyframe.
         let want_codec =
             voipc_protocol::types::VideoCodec::from_u8(watching_codec.load(Ordering::Relaxed));
-        if decoder.as_ref().is_some_and(|d| d.codec() != want_codec) {
-            info!("screen share codec changed to {want_codec:?} — rebuilding the decoder");
+        let want_sharer = watching_user_id.load(Ordering::Relaxed);
+        if decoder_for.is_some_and(|had| had != (want_sharer, want_codec)) {
+            info!("screen share changed (sharer {want_sharer}, {want_codec:?}) — rebuilding the decoder");
             decoder = None;
             suppress_render = true;
         }
@@ -2803,10 +2809,26 @@ fn video_decode_render_task(
         let dec = match decoder.as_mut() {
             Some(d) => d,
             None => match voipc_video::decoder::Decoder::new(want_codec) {
-                Ok(d) => decoder.insert(d),
+                Ok(d) => {
+                    decoder_for = Some((want_sharer, want_codec));
+                    reported_missing_decoder = None;
+                    decoder.insert(d)
+                }
                 Err(e) => {
                     warn!("{want_codec:?} decoder creation failed: {e} — skipping frame");
                     needs_keyframe.store(true, Ordering::Release);
+                    // Tell the user once per codec instead of logging per frame
+                    if reported_missing_decoder != Some(want_codec) {
+                        reported_missing_decoder = Some(want_codec);
+                        let _ = app_handle.emit(
+                            "screenshare-error",
+                            serde_json::json!({
+                                "reason": format!(
+                                    "This device cannot decode the {want_codec:?} video this share uses"
+                                )
+                            }),
+                        );
+                    }
                     continue;
                 }
             },
@@ -2836,17 +2858,21 @@ fn video_decode_render_task(
             }
         };
 
-        // Track whether any keyframe was decoded in this batch
+        // Track whether any keyframe *decoded* in this batch. A keyframe that
+        // failed to decode (a leftover frame of the previous share hitting the
+        // new decoder) must not resume rendering.
         let mut keyframe_seen = is_keyframe;
 
         // Drain any queued frames — decode all to maintain codec state,
         // but only keep the latest decoded result for rendering
         while let Ok((next_frame, next_is_keyframe)) = decode_rx.try_recv() {
-            if next_is_keyframe {
-                keyframe_seen = true;
-            }
             match dec.decode(&next_frame) {
-                Ok(d) => latest_decoded = d,
+                Ok(d) => {
+                    latest_decoded = d;
+                    if next_is_keyframe {
+                        keyframe_seen = true;
+                    }
+                }
                 Err(e) => {
                     warn!("{want_codec:?} decode error (drain): {}", e);
                     suppress_render = true;

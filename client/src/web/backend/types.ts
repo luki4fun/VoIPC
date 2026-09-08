@@ -32,8 +32,8 @@ export interface SessionContext {
   /**
    * Tell the server we stopped watching a share and clear the session's viewer
    * state. The video module calls this when it gives up on a stream (e.g. the
-   * browser has no H.265 decoder), so the session does not keep thinking it is
-   * still a viewer.
+   * browser cannot decode the share's codec), so the session does not keep
+   * thinking it is still a viewer.
    */
   stopWatching(): void;
 }
@@ -127,6 +127,10 @@ export interface ShareApi {
   start(resolution: number, fps: number): Promise<void>;
   /** stop_screen_share, the browser's own "Stop sharing", or a channel change. */
   stop(): void;
+  /** ScreenShareStarted for our own user: the server accepted the share. */
+  onStarted(): void;
+  /** ScreenShareError: a refused share must release the capture we already hold. */
+  onServerError(): void;
   /** start_screen_capture / stop_screen_capture: viewers arrived or all left. */
   startEncoding(resolution: number, fps: number): void;
   stopEncoding(): void;

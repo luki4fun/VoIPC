@@ -237,7 +237,10 @@ impl Encoder {
     }
 
     /// Open the libx264/libx265 software encoder with ultrafast + zerolatency settings.
-    fn open_software(
+    ///
+    /// `pub(crate)` for the tests: `new` prefers the hardware encoders, so on a
+    /// machine with a GPU nothing would ever exercise this path.
+    pub(crate) fn open_software(
         name: &str,
         video_codec: VideoCodec,
         width: u32,
@@ -547,6 +550,40 @@ mod tests {
         }
     }
 
+    /// The software encoders are the fallback every machine without a usable
+    /// GPU encoder lands on, and `Encoder::new` hides them behind the hardware
+    /// list — so open them directly and check the same properties.
+    #[test]
+    fn software_encoders_work() {
+        init_ffmpeg();
+        for (name, codec) in [("libx264", VideoCodec::H264), ("libx265", VideoCodec::H265)] {
+            let mut enc = Encoder::open_software(name, codec, 64, 64, 500, 30)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(enc.codec(), codec);
+            let i420 = vec![128u8; 64 * 64 + 2 * 32 * 32];
+            let frames = enc.encode(&i420, 0, true).unwrap();
+            assert!(!frames.is_empty(), "{name}: no frame came out");
+            assert!(frames[0].is_keyframe);
+            assert!(sps_present(codec, &frames[0].data), "{name}: keyframe has no SPS");
+
+            let mut dec = Decoder::new(codec).unwrap();
+            assert!(!dec.decode(&frames[0].data).unwrap().is_empty());
+        }
+    }
+
+    /// nal type 7 (H.264 SPS) / 33 (HEVC SPS) somewhere in an Annex B frame.
+    fn sps_present(codec: VideoCodec, data: &[u8]) -> bool {
+        data.windows(4).any(|w| {
+            w[0] == 0
+                && w[1] == 0
+                && w[2] == 1
+                && match codec {
+                    VideoCodec::H264 => w[3] & 0x1f == 7,
+                    _ => (w[3] >> 1) & 0x3f == 33,
+                }
+        })
+    }
+
     /// A keyframe must carry its parameter sets: browsers and the native
     /// decoder alike start from a bare Annex B keyframe with nothing out of band.
     #[test]
@@ -564,17 +601,8 @@ mod tests {
                 }
             }
             assert!(key_frames.len() >= 2, "{codec:?}: expected a second forced IDR");
-            // nal type 7 (H.264 SPS) / 33 (HEVC SPS) ahead of the slice data
-            let sps = |data: &[u8]| {
-                data.windows(4).any(|w| {
-                    w[0] == 0 && w[1] == 0 && w[2] == 1 && match codec {
-                        VideoCodec::H264 => w[3] & 0x1f == 7,
-                        _ => (w[3] >> 1) & 0x3f == 33,
-                    }
-                })
-            };
             for (i, kf) in key_frames.iter().enumerate() {
-                assert!(sps(kf), "{codec:?}: keyframe {i} has no SPS");
+                assert!(sps_present(codec, kf), "{codec:?}: keyframe {i} has no SPS");
             }
         }
     }

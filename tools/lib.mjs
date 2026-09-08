@@ -126,6 +126,23 @@ const VERSION_SITES = [
     make: (v) => `"version": "${v}"`,
   },
   {
+    // npm rewrites the lockfile from package.json on every `npm install`, so a
+    // stale version here turns into churn on a tracked file during a CI build.
+    // Both copies: the root object and the "" entry of `packages`.
+    file: join(CLIENT, 'package-lock.json'),
+    re: /"version":\s*"[^"]*"/g,
+    make: (v) => `"version": "${v}"`,
+    /** Only the first two "version" keys belong to this package. */
+    limit: 2,
+  },
+  {
+    // Separate Cargo workspace, so the root [workspace.package] version does
+    // not reach it; it ends up in the generated wasm package.json.
+    file: join(ROOT, 'crates', 'voipc-web', 'Cargo.toml'),
+    re: /^version = "[^"]*"/m,
+    make: (v) => `version = "${v}"`,
+  },
+  {
     // The download blurb on the website; nothing else syncs it.
     file: join(ROOT, 'website', 'index.html'),
     re: /(<a href="[^"]*CHANGELOG\.md">)v\d+\.\d+\.\d+(<\/a>)/,
@@ -153,7 +170,13 @@ export function syncVersion({ check = false, quiet = false } = {}) {
       if (site.optional) continue;
       fail(`no version field found in ${site.file}`);
     }
-    const after = before.replace(site.re, site.make(version));
+    // `make` may use $1/$2 backreferences, which only expand when replace()
+    // gets a string — so the counting form is used only where a limit asks
+    // for it (the lockfile repeats "version" for every dependency).
+    let replaced = 0;
+    const after = site.limit
+      ? before.replace(site.re, (m) => (++replaced > site.limit ? m : site.make(version)))
+      : before.replace(site.re, site.make(version));
     if (after === before) continue;
 
     const rel = site.file.slice(ROOT.length + 1);
@@ -167,7 +190,7 @@ export function syncVersion({ check = false, quiet = false } = {}) {
 
   if (check && stale.length) {
     err(`these files disagree with Cargo.toml (${version}): ${stale.join(', ')}`);
-    fail('run `npm run version` and commit the result');
+    fail('run `npm run version:sync` and commit the result');
   }
   return version;
 }

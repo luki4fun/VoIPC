@@ -363,16 +363,18 @@ certificate hash, so for them the server presents a short-lived certificate it g
 rotates, and publishes by hash to the page — there is nothing to configure. Desktop clients
 get the operator certificate on the same endpoint and pin it on first use as before.
 
-Requires Chrome 97+, Edge 98+, Firefox 130+, or Safari 26.4+. Voice, chat, watching a share and
-sharing your own screen work in all of them (H.265 shares are the exception — see the platform
-table). In Firefox the output-device picker does nothing — routing audio to a chosen device is a
+Requires Chrome 97+, Edge 98+, Firefox 130+, or Safari 26.4+ for voice, chat and watching a
+share (H.265 shares are the exception — see the platform table). Sharing your own screen
+additionally needs `VideoEncoder` and `getDisplayMedia`, which rules out most mobile browsers;
+it is tested on Chromium 152 and Firefox 155, and the Share button hides itself where the
+browser cannot do it. In Firefox the output-device picker does nothing — routing audio to a chosen device is a
 Chromium extension the other engines have not implemented.
 
 To build it yourself:
 
 ```bash
 npm run web        # wasm + Vite bundle, then a server binary that embeds it
-npm run test:web   # headless two-browser end-to-end check (voice, chat, DMs)
+npm run test:web   # headless two-browser end-to-end check (voice, chat, DMs, screen share)
 ```
 
 ## Data Transparency

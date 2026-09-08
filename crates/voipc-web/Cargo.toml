@@ -1,6 +1,6 @@
 [package]
 name = "voipc-web"
-version = "0.5.0"
+version = "0.5.2"
 edition = "2021"
 license = "MIT"
 description = "VoIPC protocol codec, Signal Protocol and media crypto compiled to wasm for the browser client"

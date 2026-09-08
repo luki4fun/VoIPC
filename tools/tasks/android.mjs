@@ -178,11 +178,13 @@ function build(args) {
   }
 
   // oboe-sys (C++) pulls in __cxa_pure_virtual and friends, which need the C++
-  // runtime present at load time.
+  // runtime present at load time. src-tauri/build.rs links against it so the
+  // loader knows to open it; this puts the file in the APK.
   const jniLibs = join(CLIENT, 'src-tauri', 'gen', 'android', 'app', 'src', 'main', 'jniLibs', 'arm64-v8a');
   mkdirSync(jniLibs, { recursive: true });
   const libcxx = join(toolchain, 'sysroot', 'usr', 'lib', 'aarch64-linux-android', 'libc++_shared.so');
-  if (existsSync(libcxx)) copyFileSync(libcxx, join(jniLibs, 'libc++_shared.so'));
+  if (!existsSync(libcxx)) fail(`the NDK has no libc++_shared.so at ${libcxx}`);
+  copyFileSync(libcxx, join(jniLibs, 'libc++_shared.so'));
 
   if (buildType === 'release' && !existsSync(join(ROOT, 'keystore.properties'))) {
     fail('keystore.properties not found at the repo root.\n'
@@ -195,6 +197,8 @@ function build(args) {
   if (buildType === 'debug') cmd.push('--debug');
   run('npx', cmd, { cwd: CLIENT, env });
 
+  verifyNativeLib(toolchain, target);
+
   const outBase = join(CLIENT, 'src-tauri', 'gen', 'android', 'app', 'build', 'outputs', 'apk', 'universal');
   const outDir = join(outBase, buildType);
   const apk = existsSync(outDir) ? readdirSync(outDir).find((f) => f.endsWith('.apk')) : null;
@@ -206,6 +210,27 @@ function build(args) {
 
   head('Build complete');
   ok(dest);
+}
+
+/**
+ * The app dies at startup ("cannot locate symbol __cxa_pure_virtual") if the
+ * Rust library does not name libc++_shared.so in DT_NEEDED — shipping the file
+ * in the APK is not enough, because Android's loader only opens what a library
+ * declares. That failure only shows up on a device, so check it at build time.
+ */
+function verifyNativeLib(toolchain, target) {
+  const so = join(ROOT, 'target', target, 'release', 'libvoipc_client_lib.so');
+  if (!existsSync(so)) return; // debug build, or a layout we do not know
+  const readelf = join(toolchain, 'bin', 'llvm-readelf');
+  if (!existsSync(readelf)) return;
+  const dynamic = capture(readelf, ['-d', so]);
+  if (!dynamic) return; // readelf could not read it; not a reason to fail the build
+  if (!dynamic.includes('libc++_shared.so')) {
+    fail('the native library does not link libc++_shared.so — the app would crash\n'
+      + '     on launch with "cannot locate symbol __cxa_pure_virtual".\n'
+      + '     client/src-tauri/build.rs adds this link for Android targets.');
+  }
+  ok('native library links the C++ runtime');
 }
 
 export default function android(task, args) {
