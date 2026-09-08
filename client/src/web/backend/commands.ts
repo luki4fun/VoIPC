@@ -7,6 +7,7 @@
 
 import { audio } from "./audio";
 import { video } from "./video";
+import { share } from "./share";
 import { getConfig, resetConfig, updateConfig } from "./config";
 import * as session from "./session";
 import { playCue } from "./sounds";
@@ -79,7 +80,6 @@ function setToggleKey(field: "mute_key" | "deafen_key", keyCode: unknown): void 
   });
 }
 
-const WEB_NO_SCREEN_SHARE = "Screen sharing is not available in the web client";
 const WEB_NO_CHAT_HISTORY = "Chat history is not available in the web client";
 
 const handlers: Record<string, Handler> = {
@@ -255,24 +255,40 @@ const handlers: Record<string, Handler> = {
     return audio.getScreenAudioStatus();
   },
 
-  // ── screen share (viewing only) ──
+  // ── screen share ──
   watch_screen_share: ({ sharerUserId }) => need().watchScreenShare(u32(sharerUserId, "sharerUserId")),
   stop_watching_screen_share: () => need().stopWatchingScreenShare(),
   request_keyframe: ({ sharerUserId }) =>
     need().sendControl({ RequestKeyframe: { sharer_user_id: u32(sharerUserId, "sharerUserId") } }),
   get_screen_share_stats: () => {
     need();
-    return video.getStats();
+    // [frames_sent, bytes_sent] from our own share, the rest from the viewer
+    const [, , recv, dropped, bytesRecv, resolution] = video.getStats();
+    const [sent, bytesSent] = share.getStats();
+    return [sent, bytesSent, recv, dropped, bytesRecv, resolution];
   },
-  start_screen_share: () => fail(WEB_NO_SCREEN_SHARE),
-  switch_screen_share_source: () => fail(WEB_NO_SCREEN_SHARE),
-  stop_screen_share: () => fail(WEB_NO_SCREEN_SHARE),
+  // The browser opens its own source picker, so sourceType/sourceId are unused
+  start_screen_share: ({ resolution, fps }) => {
+    need();
+    return share.start(u32(resolution, "resolution"), u32(fps, "fps"));
+  },
+  switch_screen_share_source: ({ resolution, fps }) => {
+    // getDisplayMedia cannot switch source without asking again: stop and re-ask
+    need();
+    share.stop();
+    return share.start(u32(resolution, "resolution"), u32(fps, "fps"));
+  },
+  stop_screen_share: () => share.stop(),
+  // The browser's picker enumerates sources itself
   enumerate_displays: () => [],
   enumerate_windows: () => [],
-  start_screen_capture: () => {},
-  stop_screen_capture: () => {},
-  set_keyframe_requested: () => {},
-  toggle_screen_audio: () => false,
+  start_screen_capture: ({ resolution, fps }) =>
+    share.startEncoding(u32(resolution, "resolution"), u32(fps, "fps")),
+  stop_screen_capture: () => share.stopEncoding(),
+  set_keyframe_requested: () => share.requestKeyframe(),
+  toggle_screen_audio: () => share.toggleAudio(),
+  // Browsers pick their own codec (H.264 where they can encode it, else VP9)
+  set_screen_share_codec: () => {},
 
   // ── chat history (no vault in the browser: chat stays in memory) ──
   save_chat_messages: () => {},

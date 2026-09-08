@@ -67,6 +67,8 @@ class Capture {
     private readonly source: MediaStreamAudioSourceNode,
     private readonly gainNode: GainNode,
     private readonly node: AudioWorkletNode,
+    /** Whether closing may stop the stream's tracks (false: it is borrowed). */
+    private readonly ownsStream = true,
   ) {}
 
   static async open(
@@ -104,6 +106,33 @@ class Capture {
     return cap;
   }
 
+  /**
+   * Same 20 ms frames, but from a stream we already have: the desktop audio
+   * getDisplayMedia handed us while sharing. The stream belongs to the caller,
+   * so `close()` leaves its tracks running.
+   */
+  static fromStream(
+    ac: AudioContext,
+    stream: MediaStream,
+    onFrame: (f: CaptureFrame) => void,
+  ): Capture {
+    const source = ac.createMediaStreamSource(stream);
+    const gainNode = ac.createGain();
+    const node = new AudioWorkletNode(ac, "voipc-capture", {
+      numberOfInputs: 1,
+      numberOfOutputs: 1,
+      channelCount: 1,
+      channelCountMode: "explicit",
+    });
+    source.connect(gainNode);
+    gainNode.connect(node);
+    node.connect(ac.destination);
+    node.port.onmessage = (e: MessageEvent<CaptureFrame>) => onFrame(e.data);
+    const cap = new Capture(stream, source, gainNode, node, false);
+    for (const t of stream.getAudioTracks()) t.onended = () => cap.onended?.();
+    return cap;
+  }
+
   setGain(gain: number): void {
     this.gainNode.gain.value = gain;
   }
@@ -122,7 +151,7 @@ class Capture {
     this.node.disconnect();
     for (const t of this.stream.getTracks()) {
       t.onended = null;
-      t.stop();
+      if (this.ownsStream) t.stop();
     }
   }
 }
@@ -173,6 +202,13 @@ export class AudioEngine implements AudioApi {
   private framesPlayed = 0;
   private framesLost = 0;
   private screenAudioRecv = 0;
+  private screenAudioSent = 0;
+  /** Desktop-audio capture while sharing our screen (share.ts drives it). */
+  private screenCapture: Capture | null = null;
+  private screenEncoder: AudioEncoder | null = null;
+  /** Set while the audio graph is coming up for a share (start is async). */
+  private screenAudioStarting = false;
+  private screenEncodeTimestampUs = 0;
   /** session_id -> last voice packet time (edge-triggered speaking indicator). */
   private speaking = new Map<number, number>();
   private sweepTimer: ReturnType<typeof setInterval> | null = null;
@@ -192,6 +228,7 @@ export class AudioEngine implements AudioApi {
     this.framesPlayed = 0;
     this.framesLost = 0;
     this.screenAudioRecv = 0;
+    this.screenAudioSent = 0;
     this.keyMissingSince = null;
     this.keyMissingEmitted = false;
     this.noDecoderEmitted = false;
@@ -209,6 +246,7 @@ export class AudioEngine implements AudioApi {
     this.ctx = null;
     this.transmitting = false;
     this.stopCapture();
+    this.stopScreenAudio();
     this.dropSources();
     this.mixer?.port.postMessage({ type: "clear" });
     this.speaking.clear();
@@ -800,6 +838,119 @@ export class AudioEngine implements AudioApi {
     this.micTest = null;
   }
 
+  // ── Screen-share audio (send side) ───────────────────────────────────
+
+  /**
+   * Send the desktop audio of a share we are hosting. `stream` is the
+   * getDisplayMedia stream; its audio track (when the browser gave one) is
+   * encoded like voice but sent as screen audio (0x15). Chromium offers a
+   * track for tab and system audio, Firefox on Linux offers none.
+   */
+  startScreenAudio(stream: MediaStream): void {
+    // The flag is set before the first await so two quick calls (share start
+    // and an audio toggle) cannot build two captures on the same stream.
+    if (this.screenCapture || this.screenAudioStarting) return;
+    if (stream.getAudioTracks().length === 0) return;
+    this.screenAudioStarting = true;
+    void this.ensureGraph()
+      .then((ac) => {
+        // Sharing may have stopped while the graph was coming up
+        if (!this.screenAudioStarting || stream.getAudioTracks().length === 0) return;
+        this.screenEncodeTimestampUs = 0;
+        this.screenCapture = Capture.fromStream(ac, stream, (f) => this.onScreenAudioFrame(f));
+        this.screenCapture.onended = () => this.stopScreenAudio();
+      })
+      .catch((e) => console.warn("screen audio capture failed:", e))
+      .finally(() => {
+        this.screenAudioStarting = false;
+      });
+  }
+
+  stopScreenAudio(): void {
+    this.screenAudioStarting = false;
+    this.screenCapture?.close();
+    this.screenCapture = null;
+    const enc = this.screenEncoder;
+    this.screenEncoder = null;
+    if (enc && enc.state !== "closed") {
+      try {
+        enc.close();
+      } catch {
+        // already closed
+      }
+    }
+  }
+
+  private onScreenAudioFrame({ pcm }: CaptureFrame): void {
+    const ctx = this.ctx;
+    if (!ctx || !this.screenCapture) return;
+    const enc = this.ensureScreenEncoder();
+    if (!enc) return;
+    const data = new AudioData({
+      format: "f32",
+      sampleRate: SAMPLE_RATE,
+      numberOfFrames: pcm.length,
+      numberOfChannels: 1,
+      timestamp: this.screenEncodeTimestampUs,
+      data: pcm,
+    });
+    this.screenEncodeTimestampUs += FRAME_US;
+    try {
+      enc.encode(data);
+    } catch (e) {
+      console.warn("screen audio encode failed:", e);
+    } finally {
+      data.close();
+    }
+  }
+
+  private ensureScreenEncoder(): AudioEncoder | null {
+    if (this.screenEncoder && this.screenEncoder.state === "configured") return this.screenEncoder;
+    if (typeof AudioEncoder === "undefined") return null;
+    const enc = new AudioEncoder({
+      output: (chunk) => this.onScreenAudioChunk(chunk),
+      error: (e) => {
+        console.warn("screen audio encode error:", e.message);
+        if (this.screenEncoder === enc) this.screenEncoder = null;
+      },
+    });
+    // 64 kbps mono, the native sharer's SCREEN_AUDIO_BITRATE (screenshare/mod.rs)
+    enc.configure({
+      codec: "opus",
+      sampleRate: SAMPLE_RATE,
+      numberOfChannels: 1,
+      bitrate: 64_000,
+      opus: { application: "audio", frameDuration: FRAME_US } as OpusEncoderConfig,
+    });
+    this.screenEncoder = enc;
+    return enc;
+  }
+
+  private onScreenAudioChunk(chunk: EncodedAudioChunk): void {
+    const ctx = this.ctx;
+    if (!ctx || !this.screenCapture) return;
+    const key = ctx.mediaKey;
+    if (!key) return; // no key: drop the frame, never send plaintext
+    // The sequence never restarts within a connection (AES-GCM nonce)
+    const sequence = ctx.nextScreenAudioSequence();
+    const opus = new Uint8Array(chunk.byteLength);
+    chunk.copyTo(opus);
+    try {
+      ctx.sendDatagram(
+        wasm().buildScreenAudioPacket(
+          key,
+          ctx.sessionId,
+          sequence,
+          Math.round(chunk.timestamp / 1000),
+          opus,
+        ),
+      );
+      this.screenAudioSent++;
+    } catch (e) {
+      console.warn(`screen audio encryption failed (seq ${sequence}):`, e);
+    }
+  }
+
   // ── Stats ────────────────────────────────────────────────────────────
 
   getVoiceStats(): [number, number] {
@@ -807,8 +958,7 @@ export class AudioEngine implements AudioApi {
   }
 
   getScreenAudioStatus(): [number, number] {
-    // The browser never sends screen audio
-    return [0, this.screenAudioRecv];
+    return [this.screenAudioSent, this.screenAudioRecv];
   }
 }
 

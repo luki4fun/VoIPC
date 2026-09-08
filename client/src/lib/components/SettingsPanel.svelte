@@ -19,6 +19,7 @@
     lastUsername,
     lastAcceptSelfSigned,
     autoConnect,
+    screenShareCodec,
     soundSettings,
     defaultSoundSettings,
   } from "../stores/settings.js";
@@ -46,6 +47,16 @@
     } catch (e) {
       console.error("Failed to load devices:", e);
       addNotification(`Failed to load audio devices: ${e}`, "error");
+    }
+  }
+
+  async function changeScreenShareCodec(e: Event) {
+    const codec = (e.target as HTMLSelectElement).value;
+    screenShareCodec.set(codec);
+    try {
+      await invoke("set_screen_share_codec", { codec });
+    } catch (err) {
+      addNotification(`Failed to set the screen share codec: ${err}`, "error");
     }
   }
 
@@ -475,6 +486,19 @@
             <span class="toggle-hint">Hold Volume Down to talk (overrides normal volume control)</span>
           </label>
         </div>
+      {/if}
+
+      {#if !isWeb}
+      <div class="section">
+        <h4>Screen Share</h4>
+        <select value={$screenShareCodec} onchange={changeScreenShareCodec}>
+          <option value="h264">H.264 — every viewer can watch</option>
+          <option value="h265">H.265 — less bandwidth, desktop viewers only</option>
+        </select>
+        <span class="toggle-hint">
+          Browsers decode H.265 only on Windows and macOS, and Firefox nowhere. Applies to your next share.
+        </span>
+      </div>
       {/if}
 
       <div class="section">

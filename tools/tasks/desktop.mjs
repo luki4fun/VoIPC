@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, copyFileSync 
 import { join } from 'node:path';
 import {
   CLIENT, ROOT, IS_WINDOWS, capture, fail, head, info, npmInstall, ok, run, syncVersion,
+  writeTempConfig,
 } from '../lib.mjs';
 
 /** Newest entry of a directory, by name. */
@@ -118,9 +119,9 @@ function stageWindowsDlls(env) {
 
   if (!existsSync(vcpkgBin)) fail(`vcpkg binaries not found at ${vcpkgBin} — run .\\setup.ps1`);
 
-  // FFmpeg, x265 and the Intel oneVPL dispatcher that ffmpeg[qsv] pulls in.
-  // NVENC and AMF need no DLLs; they load from the GPU driver at runtime.
-  const patterns = [/^av.*\.dll$/i, /^sw.*\.dll$/i, /^(lib)?x265.*\.dll$/i,
+  // FFmpeg, x264/x265 and the Intel oneVPL dispatcher that ffmpeg[qsv] pulls
+  // in. NVENC and AMF need no DLLs; they load from the GPU driver at runtime.
+  const patterns = [/^av.*\.dll$/i, /^sw.*\.dll$/i, /^(lib)?x26[45].*\.dll$/i,
     /^postproc.*\.dll$/i, /^(lib)?vpl.*\.dll$/i];
   let staged = 0;
   for (const name of readdirSync(vcpkgBin)) {
@@ -198,8 +199,13 @@ export default function desktop(task, args) {
   npmInstall();
 
   const cmd = ['tauri', isDev ? 'dev' : 'build'];
-  if (config) cmd.push('--config', JSON.stringify(config));
-  run('npx', [...cmd, ...args], { cwd: CLIENT, env });
+  const cfg = config ? writeTempConfig(config) : null;
+  if (cfg) cmd.push('--config', cfg.file);
+  try {
+    run('npx', [...cmd, ...args], { cwd: CLIENT, env });
+  } finally {
+    cfg?.cleanup();
+  }
 
   if (isDev) return;
 

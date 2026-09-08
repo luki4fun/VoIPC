@@ -50,8 +50,10 @@ No accounts. No telemetry. No compromises.
 - Audio device hot-recovery when a device dies mid-call
 
 **Screen Sharing**
-- H.265/HEVC encoding via FFmpeg
-- Hardware acceleration: NVIDIA NVENC, Intel QSV, AMD AMF (libx265 software fallback) — shipped in Windows builds since 0.4.0
+- H.264 encoding via FFmpeg by default — every viewer can watch, browsers included.
+  H.265/HEVC is one setting away when everyone watching is on a desktop client
+- Hardware acceleration: NVIDIA NVENC, Intel QSV, AMD AMF (libx264/libx265 software fallback) — shipped in Windows builds since 0.4.0
+- **Share from a browser too**: Chromium encodes H.264, Firefox VP9 (it cannot encode H.264), and every viewer decodes both
 - 480p / 720p / 1080p @ 30 or 60 fps (60 fps gets +50% bitrate)
 - Desktop audio capture (64 kbps Opus)
 - Pop-out viewer window and fullscreen viewing; chat stays visible while watching
@@ -89,24 +91,28 @@ No accounts. No telemetry. No compromises.
 |---|:---:|:---:|:---:|:---:|:---:|
 | Voice | Yes | Yes | Yes (Oboe) | Yes (WebCodecs) | Untested¹ |
 | Text chat (E2E) | Yes | Yes | Yes | Yes (Signal in wasm) | — |
-| Screen Capture | PipeWire + XDG Portal | Windows.Graphics.Capture | — | — | — |
-| Desktop Audio | PipeWire | WASAPI | — | — | — |
-| Screen Share Viewing | Yes | Yes | Yes (AMediaCodec) | Where H.265 decodes² | — |
+| Screen Capture | PipeWire + XDG Portal | Windows.Graphics.Capture | — | getDisplayMedia | — |
+| Desktop Audio | PipeWire | WASAPI | — | Where the browser offers a track² | — |
+| Screen Share Viewing | Yes | Yes | Yes (AMediaCodec) | Yes³ | — |
 
 ¹ There is no macOS-specific code yet; nothing is built or tested for it.
-² Browsers decode H.265 only where the platform provides it: Chrome/Edge on Windows and macOS,
-Safari 17+, Chrome on Android. Firefox has decoded H.265 since 134 on Windows and 136 on macOS,
-but exposes no H.265 decoder to WebCodecs on Linux (checked with Firefox 155), and on Linux no
-browser does. The web client probes for a decoder and says so instead of showing a black frame —
-voice and chat work everywhere, Firefox included.
+² Chromium offers tab and system audio in its share picker; Firefox on Linux offers none, and
+the audio indicator shows "no signal".
+³ Every client decodes H.264, VP8 and VP9, so any browser can watch any share encoded in them —
+which is why H.264 is the default. H.265 is the exception: browsers decode it only where the
+platform provides it (Chrome/Edge on Windows and macOS, Safari 17+, Chrome on Android; Firefox
+nowhere, and no browser on Linux). A viewer that cannot decode a share's codec is told so instead
+of showing a black frame.
 
 **Web client (browser)**
 
 The server hosts the web client itself: open `https://your-server:9987` and you get the same
 UI as the desktop app, with the Signal Protocol and AES-256-GCM media crypto compiled to
 WebAssembly. Needs Chrome 97+, Edge 98+, Firefox 130+, or Safari 26.4+ (WebTransport + WebCodecs);
-Chromium and Firefox are both covered by the end-to-end test. Screen *sharing* from a browser is
-not implemented; everything else is the same app.
+Chromium and Firefox are both covered by the end-to-end test, including sharing a screen and
+watching one. Sharing from a browser uses the browser's own picker; VoIPC picks the codec by
+trying to encode with it, so Chromium shares H.264 and Firefox VP9 (its WebCodecs H.264 encoder
+is broken, [Bugzilla 1918769](https://bugzilla.mozilla.org/show_bug.cgi?id=1918769)).
 
 ## Security
 
@@ -167,7 +173,7 @@ Client-side data at rest:
 | Account Required | No | Yes | No |
 | Data Collection | None | Extensive | Some |
 | Server Persistence | None | Everything | Everything |
-| Screen Share Codec | H.265 HW-accel | H.264/VP8 | Limited |
+| Screen Share Codec | H.264 or H.265, HW-accel | H.264/VP8 | Limited |
 
 ## Technology
 
@@ -202,14 +208,14 @@ Client-side data at rest:
 |---|---|---|
 | **Audio** | Opus via audiopus | 48 kHz, mono, 20ms frames, 48 kbps, FEC, DTX |
 | **Noise Suppression** | nnnoiseless (RNNoise) | ML-based, 480-sample frames at 48 kHz |
-| **Video Codec** | H.265/HEVC via FFmpeg 8 | NVENC → QSV → AMF → libx265 fallback |
+| **Video Codec** | H.264 (default) or H.265 via FFmpeg 8 | NVENC → QSV → AMF → libx264/libx265 fallback; browsers also send VP9/VP8 |
 | **Encryption** | libsignal-protocol + ring | Signal Protocol for messages, AES-256-GCM for media |
 | **TLS** | rustls 0.23 + ring | Pure-Rust TLS 1.2+, TOFU cert pinning |
 | **Serialization** | postcard | Binary, no_std compatible, minimal overhead |
 | **Server Runtime** | Tokio | Async, single-binary, DashMap lock-free concurrency |
 | **Client Backend** | Tauri 2 (Rust) | Native IPC, audio/video/crypto all in Rust |
 | **Client Frontend** | Svelte 5 + TypeScript | Runes ($state, $derived, $effect), Vite 6 |
-| **Web Client** | WebAssembly + WebCodecs | Same Svelte UI; Signal + media crypto in wasm, Opus/H.265 via WebCodecs, WebTransport for control and media |
+| **Web Client** | WebAssembly + WebCodecs | Same Svelte UI; Signal + media crypto in wasm, Opus and video via WebCodecs, WebTransport for control and media |
 | **Audio I/O** | cpal / Oboe | ALSA (Linux), WASAPI (Windows), Oboe (Android) |
 | **Screen Capture** | Platform-native | PipeWire ScreenCast (Linux), Windows.Graphics.Capture (Windows) |
 
@@ -233,7 +239,7 @@ VoIPC/
 │   ├── voipc-protocol/     # Message types, packet formats, codec
 │   ├── voipc-server/       # Server binary (QUIC/WebTransport endpoint + HTTPS page)
 │   ├── voipc-audio/        # Capture, playback, Opus, RNNoise, VAD, jitter buffer
-│   ├── voipc-video/        # H.265 encoding/decoding, fragment assembly
+│   ├── voipc-video/        # H.264/H.265 encoding, H.264/H.265/VP8/VP9 decoding, fragment assembly
 │   ├── voipc-crypto/       # Signal Protocol, AES-256-GCM, key management
 │   └── voipc-web/          # wasm build of protocol + crypto for the browser client
 ├── client/
@@ -357,10 +363,10 @@ certificate hash, so for them the server presents a short-lived certificate it g
 rotates, and publishes by hash to the page — there is nothing to configure. Desktop clients
 get the operator certificate on the same endpoint and pin it on first use as before.
 
-Requires Chrome 97+, Edge 98+, Firefox 130+, or Safari 26.4+. Voice and chat work in all of them;
-watching a screen share needs a browser that can decode H.265 (see the platform table). In
-Firefox the output-device picker does nothing — routing audio to a chosen device is a Chromium
-extension the other engines have not implemented.
+Requires Chrome 97+, Edge 98+, Firefox 130+, or Safari 26.4+. Voice, chat, watching a share and
+sharing your own screen work in all of them (H.265 shares are the exception — see the platform
+table). In Firefox the output-device picker does nothing — routing audio to a chosen device is a
+Chromium extension the other engines have not implemented.
 
 To build it yourself:
 

@@ -305,6 +305,8 @@ mod ladder_tests {
 /// Used by both Linux (PipeWire) and Windows (WGC) capture backends.
 pub(crate) struct FrameProcessor {
     pub encoder: voipc_video::encoder::Encoder,
+    /// Codec of this share; the ladder rebuilds the encoder with it.
+    pub codec: voipc_protocol::types::VideoCodec,
     pub i420_buf: Vec<u8>,
     pub full_res_i420_buf: Vec<u8>,
     /// SIMD-accelerated BGRA/RGBA → YUV420P converter (lazy-initialized on first frame).
@@ -353,7 +355,13 @@ impl FrameProcessor {
         let (scale, divisor) = LEVELS[next as usize];
         let kbps = ((self.base_bitrate_kbps as f32) * scale) as u32;
         let fps = (self.base_fps / divisor).max(1);
-        match voipc_video::encoder::Encoder::new(self.target_width, self.target_height, kbps, fps) {
+        match voipc_video::encoder::Encoder::new(
+            self.codec,
+            self.target_width,
+            self.target_height,
+            kbps,
+            fps,
+        ) {
             Ok(encoder) => {
                 // The converter's output format follows the encoder (NV12 for QSV)
                 if encoder.pixel_format() != self.encoder.pixel_format() {
@@ -469,7 +477,7 @@ impl FrameProcessor {
         let encoded_frames = match self.encoder.encode_video_frame(yuv_frame, force_keyframe) {
             Ok(frames) => frames,
             Err(e) => {
-                warn!("H.265 encode error: {}", e);
+                warn!("{:?} encode error: {}", self.codec, e);
                 return;
             }
         };
@@ -548,7 +556,7 @@ impl FrameProcessor {
             {
                 Ok(frames) => frames,
                 Err(e) => {
-                    warn!("H.265 encode error (scalar fallback): {}", e);
+                    warn!("{:?} encode error (scalar fallback): {}", self.codec, e);
                     return;
                 }
             };

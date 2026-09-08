@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 tracing = { workspace = true }
+# For VideoCodec — the codec a share is encoded with travels in the protocol.
+voipc-protocol = { path = "../voipc-protocol" }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 ffmpeg-next = "8.0"

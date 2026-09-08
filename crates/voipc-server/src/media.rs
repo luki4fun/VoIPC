@@ -144,6 +144,7 @@ async fn handle_video_packet(session_id: SessionId, data: Bytes, state: &ServerS
 mod tests {
     use super::*;
     use crate::state::test_support::*;
+    use voipc_protocol::types::VideoCodec;
     use voipc_protocol::video::VideoPacket;
     use voipc_protocol::voice::VoicePacket;
 
@@ -227,7 +228,7 @@ mod tests {
         )
         .await;
         state
-            .start_screen_share(alice_uid, alice_sid, 5, 720)
+            .start_screen_share(alice_uid, alice_sid, 5, 720, VideoCodec::H264)
             .await
             .unwrap();
         state

@@ -262,6 +262,43 @@ fn voice_info_object(info: &media::VoiceInfo) -> JsValue {
     js_object(&fields)
 }
 
+/// Encrypted screen-share audio packet (0x15) for one Opus frame of the
+/// desktop audio a browser sharer captured.
+#[wasm_bindgen(js_name = buildScreenAudioPacket)]
+pub fn build_screen_audio_packet(
+    key: &MediaKey,
+    session_id: u32,
+    sequence: u32,
+    timestamp: u32,
+    opus: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    media::build_screen_audio_packet(&key.inner, session_id, sequence, timestamp, opus)
+        .map_err(js_err)
+}
+
+/// One encoded video frame as the body of its per-frame stream: encrypted
+/// fragments, each behind a `u16` big-endian length. Write it to one
+/// unidirectional WebTransport stream and close it.
+#[wasm_bindgen(js_name = buildVideoFrameStream)]
+pub fn build_video_frame_stream(
+    key: &MediaKey,
+    session_id: u32,
+    frame_id: u32,
+    timestamp: u32,
+    is_keyframe: bool,
+    frame: &[u8],
+) -> Result<Vec<u8>, JsError> {
+    media::build_video_frame_stream(
+        &key.inner,
+        session_id,
+        frame_id,
+        timestamp,
+        is_keyframe,
+        frame,
+    )
+    .map_err(js_err)
+}
+
 /// `{ session_id, sequence, timestamp, opus }` from an encrypted screen-share
 /// audio packet (0x15).
 #[wasm_bindgen(js_name = parseScreenAudioPacket)]

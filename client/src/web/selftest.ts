@@ -13,13 +13,43 @@
 //   admin=<token>        wrap-up: log in as admin and kick the user in `kick`
 //   kick=<username>      the user the admin kicks
 //   expect_kick=1        wrap-up: wait (up to 10 s) to be kicked
+//   share=1              share a screen (a synthetic canvas stands in for the
+//                        display, so headless browsers need no real capture)
+//   watch=1              watch the first peer that starts sharing
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { parseInviteFragment } from "../lib/invite";
 
 interface ChannelInfo { channel_id: number; name: string }
-interface UserInfo { user_id: number; username: string; channel_id: number }
+interface UserInfo { user_id: number; username: string; channel_id: number; is_screen_sharing?: boolean }
+
+/**
+ * Stand-in for a display: an animated canvas as a MediaStream. Headless
+ * browsers have no screen to capture and no picker to click, so the sharer role
+ * replaces getDisplayMedia with this. Product code is untouched — the override
+ * lives on the navigator.mediaDevices instance and shadows the prototype method.
+ */
+function fakeDisplayCapture(fps: number): void {
+  const canvas = document.createElement("canvas");
+  canvas.width = 854;
+  canvas.height = 480;
+  const ctx = canvas.getContext("2d")!;
+  let frame = 0;
+  setInterval(() => {
+    frame++;
+    // Moving content: a static image would encode to almost nothing and hide
+    // a broken pipeline behind a plausible byte count.
+    ctx.fillStyle = `hsl(${(frame * 7) % 360}, 70%, 45%)`;
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#fff";
+    ctx.fillRect((frame * 13) % canvas.width, 120, 160, 160);
+    ctx.font = "48px sans-serif";
+    ctx.fillText(`frame ${frame}`, 40, 400);
+  }, Math.round(1000 / fps));
+  const stream = canvas.captureStream(fps);
+  navigator.mediaDevices.getDisplayMedia = async () => stream;
+}
 
 function log(line: string, data?: unknown) {
   console.log(`SELFTEST ${line}${data === undefined ? "" : " " + JSON.stringify(data, (_k, v) => (typeof v === "bigint" ? Number(v) : v))}`);
@@ -37,6 +67,8 @@ export async function run(params: URLSearchParams): Promise<void> {
   const adminToken = params.get("admin");
   const kickTarget = params.get("kick");
   const expectKick = params.has("expect_kick");
+  const doShare = params.has("share");
+  const doWatch = params.has("watch");
 
   window.addEventListener("error", (e) => log("error", { message: e.message }));
   window.addEventListener("unhandledrejection", (e) => log("error", { message: String(e.reason) }));
@@ -50,6 +82,10 @@ export async function run(params: URLSearchParams): Promise<void> {
   let earlySent = false;
   let isAdmin = false;
   let kicked = false;
+  let sharing = false;
+  let watching = false;
+  let sharerUserId = 0;
+  let framesDrawn = 0;
   // What App.svelte would hand to a newcomer: the channel messages we have seen
   const channelHistory: { user_id: number; username: string; content: string; timestamp: number }[] = [];
 
@@ -59,6 +95,9 @@ export async function run(params: URLSearchParams): Promise<void> {
     "latency-update", "connection-lost", "channel-error", "audio-device-error",
     "identity-key-changed", "poke-received", "admin-status", "admin-error",
     "server-disconnected", "channel-history-requested", "channel-history-received",
+    "screenshare-started", "screenshare-stopped", "watching-screenshare",
+    "stopped-watching-screenshare", "screenshare-error", "screenshare-frame",
+    "viewer-count-changed", "keyframe-requested",
   ];
   for (const ev of watched) {
     await listen(ev, (e: { payload: unknown }) => {
@@ -77,6 +116,23 @@ export async function run(params: URLSearchParams): Promise<void> {
         if (p.user_id === myUserId) isAdmin = p.is_admin;
       }
       if (ev === "server-disconnected") kicked = true;
+      if (ev === "screenshare-started") {
+        const p = e.payload as { user_id: number };
+        if (p.user_id !== myUserId) sharerUserId = p.user_id;
+      }
+      if (ev === "screenshare-frame") framesDrawn++;
+      // What App.svelte does for a sharer: encode only while someone watches,
+      // and force a keyframe when a viewer asks for one.
+      if (ev === "viewer-count-changed") {
+        const p = e.payload as { viewer_count: number };
+        const cmd = p.viewer_count > 0 ? "start_screen_capture" : "stop_screen_capture";
+        invoke(cmd, { resolution: 480, fps: 15 }).catch((err) =>
+          log("error", { message: `${cmd}: ${String(err)}` }),
+        );
+      }
+      if (ev === "keyframe-requested") {
+        invoke("set_keyframe_requested").catch(() => {});
+      }
       if (ev === "channel-chat-message") {
         const m = e.payload as { user_id: number; username: string; content: string; timestamp: number };
         channelHistory.push({ user_id: m.user_id, username: m.username, content: m.content, timestamp: m.timestamp });
@@ -163,6 +219,40 @@ export async function run(params: URLSearchParams): Promise<void> {
         }
       }
     }
+    if (doShare && !sharing && peers.length > 0 && Date.now() - started > 3000) {
+      sharing = true;
+      try {
+        fakeDisplayCapture(15);
+        await invoke("start_screen_share", {
+          sourceType: "display",
+          sourceId: "0",
+          resolution: 480,
+          fps: 15,
+        });
+        log("share-started");
+      } catch (e) {
+        log("error", { message: `share: ${String(e)}` });
+      }
+    }
+    // A peer's share shows up as ScreenShareStarted, or (for a late joiner) as
+    // is_screen_sharing in the user list.
+    if (doWatch && !watching && Date.now() - started > 4000) {
+      const target =
+        sharerUserId || peers.find((u) => u.is_screen_sharing)?.user_id || 0;
+      if (target !== 0) {
+        watching = true;
+        try {
+          // The viewer component's job: hand the canvas to the web backend
+          const canvas = document.createElement("canvas");
+          document.body.appendChild(canvas);
+          (window as any).__voipc_web?.setVideoCanvas(canvas);
+          await invoke("watch_screen_share", { sharerUserId: target });
+          log("watch-requested", { sharer: target });
+        } catch (e) {
+          log("error", { message: `watch: ${String(e)}` });
+        }
+      }
+    }
     if (role === "talker" && !talked && peers.length > 0 && Date.now() - started > 5000) {
       talked = true;
       try {
@@ -182,6 +272,26 @@ export async function run(params: URLSearchParams): Promise<void> {
     log("voice-stats", { played, lost });
   } catch (e) {
     log("error", { message: `voice-stats: ${String(e)}` });
+  }
+
+  if (doShare || doWatch) {
+    try {
+      const [sent, bytesSent, recv, dropped, bytesRecv, resolution] =
+        await invoke<[number, number, number, number, number, number]>("get_screen_share_stats");
+      log("screenshare-stats", {
+        frames_sent: sent,
+        bytes_sent: bytesSent,
+        frames_recv: recv,
+        frames_dropped: dropped,
+        bytes_recv: bytesRecv,
+        width: resolution >>> 16,
+        height: resolution & 0xffff,
+        frames_drawn: framesDrawn,
+      });
+    } catch (e) {
+      log("error", { message: `screenshare-stats: ${String(e)}` });
+    }
+    if (doShare) await invoke("stop_screen_share").catch(() => {});
   }
 
   // Wrap-up: moderation

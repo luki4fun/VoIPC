@@ -204,6 +204,10 @@ pub struct ActiveConnection {
     // ── Screen share state ──
     /// Whether this client is currently screen sharing.
     pub is_screen_sharing: bool,
+    /// Codec of our own share, taken from the config when it starts. Fixed for
+    /// the share's life, so a source switch re-uses it and the viewers who were
+    /// told this codec on watch stay correct.
+    pub screen_share_codec: VideoCodec,
     /// Handle to the screen capture task (when sharing).
     pub screen_capture_task: Option<tokio::task::JoinHandle<()>>,
     /// Flag to signal the capture task to stop.
@@ -295,6 +299,15 @@ impl VoiceMode {
             "always_on" => Self::AlwaysOn,
             _ => Self::Ptt,
         }
+    }
+}
+
+/// Config string → codec for our own screen share. Anything unknown is H.264,
+/// the codec every viewer can decode.
+pub fn share_codec_from_str(s: &str) -> VideoCodec {
+    match s {
+        "h265" => VideoCodec::H265,
+        _ => VideoCodec::H264,
     }
 }
 

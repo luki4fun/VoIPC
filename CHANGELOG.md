@@ -4,7 +4,20 @@ All notable changes to VoIPC are documented here.
 
 ## [0.5.0] - 2026-09-05
 
-Protocol version 5 — client and server must be updated together (one QUIC connection per client, media headers without the UDP token, loss reports). A 0.4 desktop client that connects to a 0.5 server is told to update and stops reconnecting.
+Protocol version 5 — client and server must be updated together (one QUIC connection per client, media headers without the UDP token, loss reports, the share's codec). A 0.4 desktop client that connects to a 0.5 server is told to update and stops reconnecting.
+
+### Added — screen sharing in every browser
+
+- **Any browser can watch a screen share.** A share now states its codec (`StartScreenShare`), the server hands it to each viewer when they start watching, and the viewer builds its decoder from that. Desktop sharers encode **H.264 by default**, which every client decodes — Firefox included, and Chromium on Linux, neither of which has ever had an HEVC decoder in WebCodecs. H.265 stays available under Settings → Screen Share for rooms where everyone watches from a desktop client; a viewer that cannot decode a share's codec is told which codec it is and that the sharer can switch, instead of being left with a black frame
+- **Browsers can share their screen.** `getDisplayMedia` → WebCodecs → the same encrypted fragments the desktop client sends, one QUIC stream per frame. VoIPC picks the codec by actually encoding a frame with it: Chromium shares H.264, Firefox falls back to VP9 because its WebCodecs H.264 encoder reports support and then refuses to encode ([Bugzilla 1918769](https://bugzilla.mozilla.org/show_bug.cgi?id=1918769)). Desktop audio comes along where the browser offers a track (Chromium for tabs and system audio; Firefox on Linux offers none). The frame clock runs in a Worker, so a share keeps its frame rate while the tab sits in the background — where a sharer's tab lives, and where page timers are throttled to about one tick per second
+- The browser share honours the same viewer-count gating, keyframe requests and quality ladder as the desktop sharer, and drops a frame rather than sending one too big for the 255-fragment wire format (WebCodecs has no VBV)
+- Encoders and decoders are wired for H.264, H.265, VP8 and VP9 across all three clients — FFmpeg on the desktop, MediaCodec on Android, WebCodecs in browsers
+- **The end-to-end browser test now shares and watches a screen** on both engines and in both mixed pairings (Chromium sharer → Firefox viewer and back). `BROWSER_ALICE` / `BROWSER_BOB` pick the engine per side. An animated canvas stands in for the display, so headless runs need no real capture
+- Windows builds now install FFmpeg with `x264` alongside `x265` (`.\setup.ps1`, and the cached vcpkg build in CI); Linux gets libx264 with the distribution's libavcodec
+
+### Added — a default server for demo builds
+
+- `VITE_DEFAULT_SERVER=host[:port]` at build time pre-fills the connect dialog, so a build handed to someone points at your relay from the start. Unset — as in every tagged release — the dialog starts at `localhost:9987` in the desktop app and at the page's own origin in the browser. Works for the desktop, web, Android and Docker builds; the release workflow takes it as an optional `default_server` input when run by hand (see BUILDING.md)
 
 ### Changed — native clients over QUIC
 - **Desktop and Android clients now connect over QUIC (WebTransport), the endpoint the browser client already used.** The TCP control connection and the raw UDP media socket are gone: control messages travel on one bidirectional stream, voice and screen-share audio as QUIC datagrams, and every video frame on its own unidirectional stream — in both directions, so the server relays the same thing for every client. TLS 1.3 only

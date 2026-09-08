@@ -125,6 +125,8 @@ pub struct ScreenShareSession {
     pub viewers: HashSet<UserId>,
     /// Resolution being shared.
     pub resolution: u16,
+    /// Codec the sharer encodes with; handed to every viewer on watch.
+    pub codec: VideoCodec,
 }
 
 /// A channel/room on the server.
@@ -753,6 +755,7 @@ impl ServerState {
         session_id: SessionId,
         channel_id: ChannelId,
         resolution: u16,
+        codec: VideoCodec,
     ) -> anyhow::Result<Vec<SessionId>> {
         if channel_id == 0 {
             anyhow::bail!("cannot screen share in the General channel");
@@ -780,6 +783,7 @@ impl ServerState {
                 sharer_session_id: session_id,
                 viewers: HashSet::new(),
                 resolution,
+                codec,
             },
         );
 
@@ -841,14 +845,15 @@ impl ServerState {
     }
 
     /// Start watching a screen share. Enforces one-at-a-time.
-    /// Returns (sharer_session_id, old_viewer_count, new_viewer_count, Option<previous_sharer_session_for_unwatch>).
+    /// Returns (sharer_session_id, old_viewer_count, new_viewer_count,
+    /// Option<previous_sharer_session_for_unwatch>, share_codec).
     pub async fn watch_screen_share(
         &self,
         viewer_user_id: UserId,
         viewer_session_id: SessionId,
         sharer_user_id: UserId,
         channel_id: ChannelId,
-    ) -> anyhow::Result<(SessionId, u32, u32, Option<(UserId, SessionId, u32)>)> {
+    ) -> anyhow::Result<(SessionId, u32, u32, Option<(UserId, SessionId, u32)>, VideoCodec)> {
         // Check if viewer is already watching someone else — auto-unwatch
         let prev_unwatch = {
             let session = self
@@ -894,7 +899,13 @@ impl ServerState {
         share.viewers.insert(viewer_user_id);
         let new_count = share.viewers.len() as u32;
 
-        Ok((share.sharer_session_id, old_count, new_count, prev_info))
+        Ok((
+            share.sharer_session_id,
+            old_count,
+            new_count,
+            prev_info,
+            share.codec,
+        ))
     }
 
     /// Stop watching a screen share.
@@ -1470,7 +1481,7 @@ mod tests {
         let (uid, sid) = add_user(&state, "alice");
         let ch = state.create_channel("Room".into(), None, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
-        let others = state.start_screen_share(uid, sid, ch.channel_id, 720).await.unwrap();
+        let others = state.start_screen_share(uid, sid, ch.channel_id, 720, VideoCodec::H264).await.unwrap();
         assert!(others.is_empty());
         assert!(state.sessions.get(&sid).unwrap().is_screen_sharing);
         let channels = state.channels.read().await;
@@ -1481,7 +1492,7 @@ mod tests {
     async fn start_screen_share_general_fails() {
         let state = make_state();
         let (uid, sid) = add_user(&state, "alice");
-        let err = state.start_screen_share(uid, sid, 0, 720).await;
+        let err = state.start_screen_share(uid, sid, 0, 720, VideoCodec::H264).await;
         assert!(err.unwrap_err().to_string().contains("General"));
     }
 
@@ -1491,7 +1502,7 @@ mod tests {
         let (uid, sid) = add_user(&state, "alice");
         let ch = state.create_channel("Room".into(), None, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
-        state.start_screen_share(uid, sid, ch.channel_id, 720).await.unwrap();
+        state.start_screen_share(uid, sid, ch.channel_id, 720, VideoCodec::H264).await.unwrap();
         state.stop_screen_share(uid, sid, ch.channel_id).await.unwrap();
         assert!(!state.sessions.get(&sid).unwrap().is_screen_sharing);
         let channels = state.channels.read().await;
@@ -1504,15 +1515,17 @@ mod tests {
         let (uid, sid) = add_user(&state, "alice");
         let ch = state.create_channel("Room".into(), None, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
-        state.start_screen_share(uid, sid, ch.channel_id, 720).await.unwrap();
+        state.start_screen_share(uid, sid, ch.channel_id, 720, VideoCodec::H265).await.unwrap();
         let (uid2, sid2) = add_user(&state, "bob");
         state.join_channel(uid2, sid2, ch.channel_id, None).await.unwrap();
-        let (sharer_sid, old, new, prev) =
+        let (sharer_sid, old, new, prev, codec) =
             state.watch_screen_share(uid2, sid2, uid, ch.channel_id).await.unwrap();
         assert_eq!(sharer_sid, sid);
         assert_eq!(old, 0);
         assert_eq!(new, 1);
         assert!(prev.is_none());
+        // The viewer is told what the sharer encodes with
+        assert_eq!(codec, VideoCodec::H265);
     }
 
     #[tokio::test]
@@ -1521,7 +1534,7 @@ mod tests {
         let (uid, sid) = add_user(&state, "alice");
         let ch = state.create_channel("Room".into(), None, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
-        state.start_screen_share(uid, sid, ch.channel_id, 720).await.unwrap();
+        state.start_screen_share(uid, sid, ch.channel_id, 720, VideoCodec::H264).await.unwrap();
         let (uid2, sid2) = add_user(&state, "bob");
         state.join_channel(uid2, sid2, ch.channel_id, None).await.unwrap();
         state.watch_screen_share(uid2, sid2, uid, ch.channel_id).await.unwrap();

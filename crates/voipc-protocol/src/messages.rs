@@ -87,6 +87,9 @@ pub enum ClientMessage {
         source: String,
         /// Desired resolution height: 480, 720, or 1080.
         resolution: u16,
+        /// Codec every frame of this share is encoded with.
+        #[serde(default)]
+        codec: VideoCodec,
     },
 
     /// Stop sharing screen.
@@ -307,8 +310,14 @@ pub enum ServerMessage {
     /// A user in your channel stopped screen sharing.
     ScreenShareStopped { user_id: UserId },
 
-    /// Confirmation that you are now watching a user's screen share.
-    WatchingScreenShare { sharer_user_id: UserId },
+    /// Confirmation that you are now watching a user's screen share. Carries the
+    /// share's codec: this is the only message a late joiner gets before frames
+    /// arrive (`ScreenShareStarted` went out before they clicked watch).
+    WatchingScreenShare {
+        sharer_user_id: UserId,
+        #[serde(default)]
+        codec: VideoCodec,
+    },
 
     /// You stopped watching a screen share.
     StoppedWatchingScreenShare { reason: String },

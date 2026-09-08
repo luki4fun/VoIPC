@@ -44,6 +44,11 @@
     loading = true;
     try {
       platform = await invoke<string>("get_platform");
+      // The browser runs its own picker after Start: nothing to enumerate here
+      if (platform === "web") {
+        loading = false;
+        return;
+      }
       const [d, w] = await Promise.all([
         invoke<DisplayInfo[]>("enumerate_displays"),
         invoke<WindowInfo[]>("enumerate_windows"),
@@ -89,8 +94,8 @@
 
   async function startOrSwitch() {
     const sourceType = activeTab === "displays" ? "display" : "window";
-    // On Linux, source_id is ignored (portal handles selection)
-    const sourceId = platform === "linux" ? "0" : (selectedId ?? "0");
+    // Linux and the browser ignore source_id — their own picker decides
+    const sourceId = usesOwnPicker ? "0" : (selectedId ?? "0");
 
     // On Windows, require a selection
     if (platform === "windows" && !selectedId) {
@@ -129,10 +134,12 @@
     }
   }
 
+  // Linux (portal) and the browser both show their own picker after Start
   let isLinux = $derived(platform === "linux");
+  let usesOwnPicker = $derived(platform === "linux" || platform === "web");
   let buttonLabel = $derived(
     starting
-      ? isLinux
+      ? usesOwnPicker
         ? "Opening picker..."
         : "Starting..."
       : $pickerSwitchMode
@@ -172,17 +179,25 @@
     <div class="source-list">
       {#if loading}
         <div class="placeholder">Loading sources...</div>
-      {:else if isLinux}
-        <!-- Linux: portal handles enumeration -->
+      {:else if usesOwnPicker}
+        <!-- Linux portal and the browser enumerate sources themselves -->
         <div class="portal-hint">
           {#if activeTab === "displays"}
             <div class="portal-icon">&#9638;</div>
             <p>Display capture</p>
-            <p class="portal-sub">Your system's display picker will appear after clicking Start.</p>
+            <p class="portal-sub">
+              {platform === "web"
+                ? "Your browser's share picker will appear after clicking Start."
+                : "Your system's display picker will appear after clicking Start."}
+            </p>
           {:else}
             <div class="portal-icon">&#9645;</div>
             <p>Window capture</p>
-            <p class="portal-sub">Your system's window picker will appear after clicking Start.</p>
+            <p class="portal-sub">
+              {platform === "web"
+                ? "Your browser's share picker will appear after clicking Start."
+                : "Your system's window picker will appear after clicking Start."}
+            </p>
           {/if}
         </div>
       {:else if activeTab === "displays"}

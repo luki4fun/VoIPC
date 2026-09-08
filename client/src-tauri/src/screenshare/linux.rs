@@ -160,6 +160,7 @@ pub fn spawn_capture_task(
     target_height: u32,
     target_fps: u32,
     bitrate: u32,
+    codec: voipc_protocol::types::VideoCodec,
     session_id: u32,
     active: Arc<AtomicBool>,
     keyframe_requested: Arc<AtomicBool>,
@@ -187,6 +188,7 @@ pub fn spawn_capture_task(
             target_height,
             target_fps,
             bitrate,
+            codec,
             session_id,
             active,
             keyframe_requested,
@@ -213,6 +215,7 @@ fn run_pipewire_capture(
     target_height: u32,
     target_fps: u32,
     bitrate: u32,
+    codec: voipc_protocol::types::VideoCodec,
     session_id: u32,
     active: Arc<AtomicBool>,
     keyframe_requested: Arc<AtomicBool>,
@@ -254,11 +257,12 @@ fn run_pipewire_capture(
 
     // ── Create encoder + processor upfront (like Windows) ────────────────
     let encoder =
-        voipc_video::encoder::Encoder::new(target_width, target_height, bitrate, target_fps)
-            .map_err(|e| format!("Failed to create H.265 encoder: {e}"))?;
+        voipc_video::encoder::Encoder::new(codec, target_width, target_height, bitrate, target_fps)
+            .map_err(|e| format!("Failed to create the {codec:?} encoder: {e}"))?;
 
     let processor = FrameProcessor {
         encoder,
+        codec,
         i420_buf: Vec::new(),
         full_res_i420_buf: Vec::new(),
         converter: None,

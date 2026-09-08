@@ -6,6 +6,13 @@ name: Release
 # Or run it manually from the Actions tab to rehearse the whole thing first.
 on:
   workflow_dispatch:
+    inputs:
+      default_server:
+        description: >-
+          Bake this server into the connect dialog (host or host:port) — for a
+          demo build. Leave empty for a normal release.
+        required: false
+        default: ''
   push:
     tags: ['v*']
 
@@ -24,7 +31,7 @@ jobs:
     outputs:
       version: ${{ steps.v.outputs.version }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Resolve and verify the version
         id: v
@@ -63,7 +70,7 @@ jobs:
           fi
           cat notes.md
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: release-notes
           path: notes.md
@@ -72,7 +79,7 @@ jobs:
     needs: meta
     runs-on: ubuntu-24.04   # glibc 2.39, matching Dockerfile.release
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: System dependencies
         run: |
@@ -86,7 +93,7 @@ jobs:
             libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev \
             libssl-dev libclang-dev musl-tools file
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -106,6 +113,8 @@ jobs:
       # The server embeds client/dist-web at compile time, so the web bundle
       # has to exist before the server is built.
       - name: Build the web client
+        env:
+          VITE_DEFAULT_SERVER: ${{ inputs.default_server }}
         run: npm run build:web
         working-directory: client
 
@@ -115,6 +124,7 @@ jobs:
       - name: Build the desktop client (AppImage + deb)
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1   # appimagetool cannot use FUSE on a runner
+          VITE_DEFAULT_SERVER: ${{ inputs.default_server }}
         run: node tools/voipc.mjs build
 
       - name: Collect artifacts
@@ -127,7 +137,7 @@ jobs:
           tar -czf "dist/VoIPC-web-$v.tar.gz" -C client dist-web
           ls -lh dist/
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           if-no-files-found: error
@@ -140,9 +150,9 @@ jobs:
     runs-on: windows-2025
     timeout-minutes: 360
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
@@ -179,22 +189,23 @@ jobs:
       # this cache is not optional. A hit turns it into seconds.
       - name: Cache the vcpkg FFmpeg build
         id: vcpkg-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ${{ steps.vcpkg.outputs.root }}/installed
             ${{ steps.vcpkg.outputs.root }}/packages
-          key: vcpkg-ffmpeg-x265-nvcodec-amf-qsv-${{ steps.vcpkg.outputs.rev }}
+          key: vcpkg-ffmpeg-x264-x265-nvcodec-amf-qsv-${{ steps.vcpkg.outputs.rev }}
 
       - name: Install FFmpeg via vcpkg
         if: steps.vcpkg-cache.outputs.cache-hit != 'true'
         run: |
           & "${{ steps.vcpkg.outputs.root }}\vcpkg.exe" install `
-            "ffmpeg[x265,nvcodec,amf,qsv]:x64-windows" --recurse
+            "ffmpeg[x264,x265,nvcodec,amf,qsv]:x64-windows" --recurse
 
       - name: Build the client (NSIS + MSI)
         env:
           VCPKG_ROOT: ${{ steps.vcpkg.outputs.root }}
+          VITE_DEFAULT_SERVER: ${{ inputs.default_server }}
         run: node tools/voipc.mjs build --bundles nsis,msi
 
       # .cargo/config.toml links ucrtd.lib, which exports the whole CRT mapped
@@ -237,7 +248,7 @@ jobs:
           Copy-Item target\release\bundle\msi\*.msi dist\
           Get-ChildItem dist\
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: windows
           if-no-files-found: error
@@ -247,7 +258,7 @@ jobs:
     needs: meta
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Check the signing secrets are configured
         id: signing
@@ -261,13 +272,13 @@ jobs:
             echo "::warning::ANDROID_KEYSTORE_BASE64 is not set — skipping the Android build."
           fi
 
-      - uses: actions/setup-java@v4
+      - uses: actions/setup-java@v5
         if: steps.signing.outputs.ready == 'true'
         with:
           distribution: temurin
           java-version: 21
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         if: steps.signing.outputs.ready == 'true'
         with:
           node-version: 22
@@ -319,6 +330,8 @@ jobs:
 
       - name: Build the signed APK
         if: steps.signing.outputs.ready == 'true'
+        env:
+          VITE_DEFAULT_SERVER: ${{ inputs.default_server }}
         run: node tools/voipc.mjs android release --target aarch64
 
       - name: Remove the signing material
@@ -332,7 +345,7 @@ jobs:
           mkdir -p dist
           cp release/VoIPC-android-release.apk "dist/VoIPC-android-$v.apk"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         if: steps.signing.outputs.ready == 'true'
         with:
           name: android
@@ -345,7 +358,7 @@ jobs:
     if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: artifacts
 
@@ -357,7 +370,7 @@ jobs:
 
       - name: Create the draft release
         if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           draft: true
           name: v${{ needs.meta.outputs.version }}

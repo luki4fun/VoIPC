@@ -3,7 +3,8 @@
 // Everything here used to be copy-pasted across the root shell and PowerShell
 // scripts — the version sync alone existed in seven places in two languages.
 import { spawnSync } from 'node:child_process';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -169,6 +170,22 @@ export function syncVersion({ check = false, quiet = false } = {}) {
     fail('run `npm run version` and commit the result');
   }
   return version;
+}
+
+/**
+ * Write a Tauri config override to a temp file and hand back its path.
+ *
+ * `tauri build --config` takes either JSON or a path. Passing JSON inline
+ * breaks on Windows: npm and npx are batch files, so they have to be spawned
+ * through cmd.exe, which strips the double quotes and leaves Tauri with
+ * `{build:{beforeBundleCommand:}}` — "key must be a string". A file has no
+ * quoting to lose.
+ */
+export function writeTempConfig(config) {
+  const dir = mkdtempSync(join(tmpdir(), 'voipc-tauri-config-'));
+  const file = join(dir, 'config.json');
+  writeFileSync(file, JSON.stringify(config));
+  return { file, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 /** Install the client's npm dependencies if they are missing. */

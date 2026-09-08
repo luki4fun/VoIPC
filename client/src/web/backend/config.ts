@@ -2,13 +2,13 @@
 // client/src-tauri/src/config.rs (same field names and defaults), kept in
 // localStorage instead of settings.json.
 
-import { defaultSoundSettings, type AppConfig } from "../../lib/stores/settings";
+import { defaultServer, defaultSoundSettings, type AppConfig } from "../../lib/stores/settings";
 
 const STORAGE_KEY = "voipc.settings";
 
 export function defaultConfig(): AppConfig {
-  // The connect dialog is pre-filled with the origin the page came from.
-  const loc = typeof location !== "undefined" ? location : null;
+  // Baked-in default if the build set one, else the origin that served the page.
+  const server = defaultServer();
   return {
     input_device: null,
     output_device: null,
@@ -24,11 +24,12 @@ export function defaultConfig(): AppConfig {
     muted: false,
     deafened: false,
     remember_connection: false,
-    last_host: loc?.hostname || null,
-    last_port: loc ? Number(loc.port) || 9987 : null,
+    last_host: server.host,
+    last_port: server.port,
     last_username: null,
     last_accept_self_signed: null,
     saved_servers: [],
+    screen_share_codec: "h264",
     sounds: defaultSoundSettings(),
     auto_connect: false,
     share_channel_history: true,

@@ -18,6 +18,12 @@
 
   let inLobby = $derived($currentChannelId === 0);
 
+  // The browser client shares through WebCodecs + getDisplayMedia; a browser
+  // without them (or a mobile one) keeps the button hidden.
+  const canShare =
+    !isWeb ||
+    (typeof VideoEncoder !== "undefined" && !!navigator.mediaDevices?.getDisplayMedia);
+
   let resLabel = $derived(
     $shareResolution === 1080 ? "1080p" :
     $shareResolution === 720 ? "720p" :
@@ -68,7 +74,7 @@
   }
 </script>
 
-{#if !inLobby && !isWeb}
+{#if !inLobby && canShare}
   <div class="divider"></div>
 
   {#if $isSharingScreen}
@@ -79,9 +85,11 @@
         <span class="viewer-badge">{$viewerCount}</span>
       {/if}
     </button>
-    <button class="icon-btn-sm" onclick={openSwitchPicker} title="Switch capture source">
-      <Icon name="switch-source" size={16} />
-    </button>
+    {#if !isWeb}
+      <button class="icon-btn-sm" onclick={openSwitchPicker} title="Switch capture source">
+        <Icon name="switch-source" size={16} />
+      </button>
+    {/if}
     <button
       class="audio-toggle {audioStatus}"
       onclick={toggleAudio}

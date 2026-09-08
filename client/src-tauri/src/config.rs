@@ -105,6 +105,12 @@ pub struct AppConfig {
     /// Saved servers for the connect dialog (keyed by host:port).
     pub saved_servers: Vec<SavedServer>,
 
+    // Screen share
+    /// Codec our own screen share is encoded with: "h264" (default — every
+    /// viewer decodes it, browsers included) or "h265" (smaller, but no browser
+    /// on Linux and no Firefox anywhere can decode it).
+    pub screen_share_codec: String,
+
     // QoL
     pub sounds: SoundSettings,
     pub auto_connect: bool,
@@ -141,6 +147,7 @@ impl Default for AppConfig {
             last_username: None,
             last_accept_self_signed: None,
             saved_servers: Vec::new(),
+            screen_share_codec: "h264".into(),
             sounds: SoundSettings::default(),
             auto_connect: false,
             share_channel_history: true,

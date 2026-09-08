@@ -280,7 +280,7 @@ pub async fn connect_to_server(
     let screen_video_bytes_received = Arc::new(AtomicU64::new(0));
     let screen_video_resolution = Arc::new(AtomicU32::new(0));
 
-    // Video decode channel — assembled H.265 frames sent to a blocking decode task
+    // Video decode channel — assembled video frames sent to a blocking decode task
     // to avoid stalling the UDP receiver (which also handles voice).
     // Tuple: (frame_data, is_keyframe) — the decode task needs is_keyframe to know
     // when it's safe to resume rendering after corruption suppression.
@@ -288,7 +288,7 @@ pub async fn connect_to_server(
 
     // Render suppression flag — set by UDP receiver on frame loss, cleared by decode
     // task when a keyframe is successfully decoded. Prevents displaying gray/corrupted
-    // delta frames that the H.265 decoder produces after reference chain breakage.
+    // delta frames that the decoder produces after reference chain breakage.
     let needs_keyframe = Arc::new(AtomicBool::new(false));
 
     // Last frame-loss signal for our own share (viewer reports, our own path
@@ -300,6 +300,11 @@ pub async fn connect_to_server(
     // Shared screen share state — created early so the control reader can reset on channel change
     let screen_share_active = Arc::new(AtomicBool::new(false));
     let watching_user_id_shared = Arc::new(AtomicU32::new(0));
+    // Codec of the share we are watching (VideoCodec as u8), set from
+    // WatchingScreenShare before its first frame arrives.
+    let watching_codec = Arc::new(AtomicU8::new(
+        voipc_protocol::types::VideoCodec::H264 as u8,
+    ));
 
     // Per-user volume control — shared between voice mixer and commands
     let user_volumes: Arc<std::sync::Mutex<HashMap<u32, f32>>> =
@@ -336,6 +341,7 @@ pub async fn connect_to_server(
         user_id,
         screen_share_active.clone(),
         watching_user_id_shared.clone(),
+        watching_codec.clone(),
         share_loss_ms.clone(),
         share_loss_tally.clone(),
     ));
@@ -347,9 +353,20 @@ pub async fn connect_to_server(
         let app_handle = app_handle.clone();
         let tcp_tx = tcp_tx.clone();
         let watching_uid = watching_user_id_shared.clone();
+        let watch_codec = watching_codec.clone();
         let video_res = screen_video_resolution.clone();
         let needs_kf = needs_keyframe.clone();
-        move || video_decode_render_task(video_decode_rx, app_handle, tcp_tx, watching_uid, video_res, needs_kf)
+        move || {
+            video_decode_render_task(
+                video_decode_rx,
+                app_handle,
+                tcp_tx,
+                watching_uid,
+                watch_codec,
+                video_res,
+                needs_kf,
+            )
+        }
     });
 
     // Voice quality stats (read by the get_voice_stats command)
@@ -436,6 +453,7 @@ pub async fn connect_to_server(
         output_device_live,
         playback_restart,
         is_screen_sharing: false,
+        screen_share_codec: voipc_protocol::types::VideoCodec::H264,
         screen_capture_task: None,
         screen_share_active,
         keyframe_requested: Arc::new(AtomicBool::new(false)),
@@ -551,6 +569,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     own_user_id: u32,
     screen_share_active: Arc<AtomicBool>,
     watching_user_id_shared: Arc<AtomicU32>,
+    watching_codec: Arc<AtomicU8>,
     share_loss_ms: Arc<AtomicU64>,
     share_loss_tally: Arc<std::sync::Mutex<LossTally>>,
 ) {
@@ -589,6 +608,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
                             own_user_id,
                             &screen_share_active,
                             &watching_user_id_shared,
+                            &watching_codec,
                             &share_loss_ms,
                             &share_loss_tally,
                         )
@@ -627,6 +647,7 @@ async fn handle_server_message(
     own_user_id: u32,
     screen_share_active: &Arc<AtomicBool>,
     watching_user_id_shared: &Arc<AtomicU32>,
+    watching_codec: &Arc<AtomicU8>,
     share_loss_ms: &Arc<AtomicU64>,
     share_loss_tally: &Arc<std::sync::Mutex<LossTally>>,
 ) {
@@ -950,10 +971,13 @@ async fn handle_server_message(
                 serde_json::json!({"user_id": user_id}),
             );
         }
-        ServerMessage::WatchingScreenShare { sharer_user_id } => {
+        ServerMessage::WatchingScreenShare { sharer_user_id, codec } => {
+            // Before the first fragment arrives: the decode task builds its
+            // decoder from this and rebuilds it when the value changes.
+            watching_codec.store(codec as u8, Ordering::Relaxed);
             let _ = app_handle.emit(
                 "watching-screenshare",
-                serde_json::json!({"sharer_user_id": sharer_user_id}),
+                serde_json::json!({"sharer_user_id": sharer_user_id, "codec": format!("{codec:?}")}),
             );
         }
         ServerMessage::StoppedWatchingScreenShare { reason } => {
@@ -2732,18 +2756,20 @@ mod tests {
 }
 
 /// Video decode + render task: runs on a blocking thread to avoid stalling
-/// the media receivers. Decodes ALL H.265 frames to maintain codec state, but only
+/// the media receivers. Decodes ALL frames to maintain codec state, but only
 /// JPEG-encodes and emits the most recent frame (frame skipping).
 ///
-/// **Render suppression:** When UDP packet loss breaks the H.265 reference chain,
+/// **Render suppression:** When packet loss breaks the decoder's reference chain,
 /// all subsequent delta frames decode to gray/corrupted pixels. Instead of displaying
 /// these, we suppress rendering until a keyframe arrives and resets the decoder state.
 /// The viewer sees the last good frame (frozen) instead of gray corruption.
+#[allow(clippy::too_many_arguments)]
 fn video_decode_render_task(
     mut decode_rx: mpsc::Receiver<(Vec<u8>, bool)>,
     app_handle: tauri::AppHandle,
     tcp_tx: mpsc::Sender<Vec<u8>>,
     watching_user_id: Arc<AtomicU32>,
+    watching_codec: Arc<AtomicU8>,
     screen_video_resolution: Arc<AtomicU32>,
     needs_keyframe: Arc<AtomicBool>,
 ) {
@@ -2764,12 +2790,22 @@ fn video_decode_render_task(
             suppress_render = true;
         }
 
+        // Switching to a share in another codec (or the first share of this
+        // session) needs a new decoder; the old one cannot read the new stream.
+        let want_codec =
+            voipc_protocol::types::VideoCodec::from_u8(watching_codec.load(Ordering::Relaxed));
+        if decoder.as_ref().is_some_and(|d| d.codec() != want_codec) {
+            info!("screen share codec changed to {want_codec:?} — rebuilding the decoder");
+            decoder = None;
+            suppress_render = true;
+        }
+
         let dec = match decoder.as_mut() {
             Some(d) => d,
-            None => match voipc_video::decoder::Decoder::new() {
+            None => match voipc_video::decoder::Decoder::new(want_codec) {
                 Ok(d) => decoder.insert(d),
                 Err(e) => {
-                    warn!("H.265 decoder creation failed: {e} — skipping frame");
+                    warn!("{want_codec:?} decoder creation failed: {e} — skipping frame");
                     needs_keyframe.store(true, Ordering::Release);
                     continue;
                 }
@@ -2781,7 +2817,7 @@ fn video_decode_render_task(
         let mut latest_decoded = match dec.decode(&frame_data) {
             Ok(d) => d,
             Err(e) => {
-                warn!("H.265 decode error: {}", e);
+                warn!("{want_codec:?} decode error: {}", e);
                 suppress_render = true;
                 needs_keyframe.store(true, Ordering::Release);
                 // Auto-request keyframe on decode failure (max once per second)
@@ -2812,7 +2848,7 @@ fn video_decode_render_task(
             match dec.decode(&next_frame) {
                 Ok(d) => latest_decoded = d,
                 Err(e) => {
-                    warn!("H.265 decode error (drain): {}", e);
+                    warn!("{want_codec:?} decode error (drain): {}", e);
                     suppress_render = true;
                     needs_keyframe.store(true, Ordering::Release);
                 }

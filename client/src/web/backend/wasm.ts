@@ -39,7 +39,7 @@ export interface MediaKey {
 export interface VideoAssembler {
   /**
    * Feed one encrypted video fragment packet (0x13/0x14). Returns the
-   * reassembled H.265 frame when complete. Throws on decrypt failure.
+   * reassembled frame when complete. Throws on decrypt failure.
    */
   push(key: MediaKey, bytes: Uint8Array): {
     frame?: Uint8Array;
@@ -103,6 +103,28 @@ export interface WasmApi {
   decryptVoicePacket(key: MediaKey, bytes: Uint8Array): DecryptedVoice;
   /** Encrypted screen-share audio packet (0x15). Throws on failure. */
   parseScreenAudioPacket(key: MediaKey, bytes: Uint8Array): ScreenAudioInfo;
+  /** Encrypted screen-share audio packet (0x15) for one Opus frame we captured. */
+  buildScreenAudioPacket(
+    key: MediaKey,
+    sessionId: number,
+    sequence: number,
+    timestamp: number,
+    opus: Uint8Array,
+  ): Uint8Array;
+  /**
+   * One encoded video frame as the body of its per-frame stream: encrypted
+   * fragments, each behind a u16 big-endian length. Throws when the frame needs
+   * more than 255 fragments (~316 KB) — the caller must lower the bitrate
+   * instead of sending a frame the viewers cannot reassemble.
+   */
+  buildVideoFrameStream(
+    key: MediaKey,
+    sessionId: number,
+    frameId: number,
+    timestamp: number,
+    isKeyframe: boolean,
+    frame: Uint8Array,
+  ): Uint8Array;
 }
 
 let api: WasmApi | null = null;
@@ -129,6 +151,8 @@ export async function loadWasm(): Promise<WasmApi> {
     parseVoiceHeader: (b) => mod.parseVoiceHeader(b),
     decryptVoicePacket: (key, b) => mod.decryptVoicePacket(key, b),
     parseScreenAudioPacket: (key, b) => mod.parseScreenAudioPacket(key, b),
+    buildScreenAudioPacket: (key, s, q, t, o) => mod.buildScreenAudioPacket(key, s, q, t, o),
+    buildVideoFrameStream: (key, s, f, t, k, d) => mod.buildVideoFrameStream(key, s, f, t, k, d),
   };
   return api;
 }

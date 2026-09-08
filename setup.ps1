@@ -97,8 +97,11 @@ if (Test-Path "$vcpkgRoot\vcpkg.exe") {
 $ffmpegHeader = "$vcpkgRoot\installed\x64-windows\include\libavcodec\avcodec.h"
 $ffmpegLib = "$vcpkgRoot\installed\x64-windows\lib\avcodec.lib"
 $x265Lib = "$vcpkgRoot\installed\x64-windows\lib\x265.lib"
+$x264Lib = "$vcpkgRoot\installed\x64-windows\lib\libx264.lib"
 $nvHeaders = "$vcpkgRoot\installed\x64-windows\include\ffnvcodec"
-$ffmpegFeatures = "ffmpeg[x265,nvcodec,amf,qsv]:x64-windows"
+# x264 is the default screen-share codec (every viewer decodes H.264),
+# x265 the opt-in one; the three HW encoders cover both.
+$ffmpegFeatures = "ffmpeg[x264,x265,nvcodec,amf,qsv]:x64-windows"
 # Ask vcpkg which features the installed ffmpeg was actually built with. File
 # markers alone would lie: x265.lib and the ffnvcodec headers belong to separate
 # ports and survive a plain `vcpkg install ffmpeg` in a shared vcpkg tree.
@@ -111,19 +114,19 @@ function Test-FFmpegFeature($feature) {
     return $ffmpegListing -match "ffmpeg\[[^\]]*$feature[^\]]*\]:x64-windows(\s|`$)"
 }
 if ($ffmpegListing) {
-    $hasX265 = Test-FFmpegFeature 'x265'
+    $hasX265 = (Test-FFmpegFeature 'x265') -and (Test-FFmpegFeature 'x264')
     # All three HW encoders are separately selectable, so nvcodec alone is not
     # evidence that amf and qsv are present.
     $hasHwEncoders = (Test-FFmpegFeature 'nvcodec') -and (Test-FFmpegFeature 'amf') -and (Test-FFmpegFeature 'qsv')
 } else {
-    $hasX265 = Test-Path $x265Lib
+    $hasX265 = (Test-Path $x265Lib) -and (Test-Path $x264Lib)
     $hasHwEncoders = Test-Path $nvHeaders
 }
 if ((Test-Path $ffmpegHeader) -and (Test-Path $ffmpegLib) -and $hasX265 -and $hasHwEncoders) {
-    Write-Host "[ok] FFmpeg + x265 + HW encoders already installed via vcpkg" -ForegroundColor Green
+    Write-Host "[ok] FFmpeg + x264/x265 + HW encoders already installed via vcpkg" -ForegroundColor Green
 } else {
     if ((Test-Path $ffmpegLib) -and -not $hasX265) {
-        Write-Host "[!!] FFmpeg installed but WITHOUT x265 - reinstalling..." -ForegroundColor Yellow
+        Write-Host "[!!] FFmpeg installed but WITHOUT x264/x265 - reinstalling..." -ForegroundColor Yellow
         & "$vcpkgRoot\vcpkg.exe" remove ffmpeg:x64-windows
     } elseif ((Test-Path $ffmpegLib) -and -not $hasHwEncoders) {
         Write-Host "[!!] FFmpeg installed but WITHOUT HW encoders (NVENC/AMF/QSV) - reinstalling..." -ForegroundColor Yellow
@@ -132,13 +135,13 @@ if ((Test-Path $ffmpegHeader) -and (Test-Path $ffmpegLib) -and $hasX265 -and $ha
         Write-Host "[!!] FFmpeg libs found but headers missing - reinstalling..." -ForegroundColor Yellow
         & "$vcpkgRoot\vcpkg.exe" remove ffmpeg:x64-windows
     }
-    Write-Host "[..] Installing FFmpeg with x265 + HW encoders via vcpkg (this may take 15-30 minutes)..." -ForegroundColor Yellow
+    Write-Host "[..] Installing FFmpeg with x264/x265 + HW encoders via vcpkg (this may take 15-30 minutes)..." -ForegroundColor Yellow
     & "$vcpkgRoot\vcpkg.exe" install $ffmpegFeatures --recurse
     # Re-read the listing so the post-install check asserts the same feature set
     # the staleness check gates on.
     $ffmpegListing = (& "$vcpkgRoot\vcpkg.exe" list ffmpeg 2>$null | Out-String)
     $missingFeatures = if ($ffmpegListing) {
-        @('x265', 'nvcodec', 'amf', 'qsv') | Where-Object { -not (Test-FFmpegFeature $_) }
+        @('x264', 'x265', 'nvcodec', 'amf', 'qsv') | Where-Object { -not (Test-FFmpegFeature $_) }
     } else { @() }
     if (-not (Test-Path $ffmpegHeader)) {
         Write-Host "[!!] FFmpeg headers still missing after install!" -ForegroundColor Red
@@ -149,10 +152,10 @@ if ((Test-Path $ffmpegHeader) -and (Test-Path $ffmpegLib) -and $hasX265 -and $ha
         Write-Host "     Screen share will fall back to CPU encoding for the affected GPUs." -ForegroundColor Yellow
         Write-Host "     Try: vcpkg remove ffmpeg:x64-windows; vcpkg install `"$ffmpegFeatures`"" -ForegroundColor Yellow
     } elseif (-not (Test-Path $x265Lib)) {
-        Write-Host "[!!] x265 still missing after install!" -ForegroundColor Red
+        Write-Host "[!!] x264/x265 still missing after install!" -ForegroundColor Red
         Write-Host "     Try: vcpkg remove ffmpeg:x64-windows; vcpkg install `"$ffmpegFeatures`"" -ForegroundColor Yellow
     } else {
-        Write-Host "[ok] FFmpeg + x265 + HW encoders installed" -ForegroundColor Green
+        Write-Host "[ok] FFmpeg + x264/x265 + HW encoders installed" -ForegroundColor Green
     }
 }
 

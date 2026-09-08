@@ -48,6 +48,13 @@ RUN curl -fsSL https://deb.nodesource.com/setup_lts.x | bash - \
     && apt-get install -y nodejs \
     && rm -rf /var/lib/apt/lists/*
 
+# Optional demo build: bake a default server into the connect dialog
+#   npm run release -- --build-arg VITE_DEFAULT_SERVER=demo.example.org:9987
+# Unset for the normal release, where the dialog falls back to the page origin
+# (web) or localhost (desktop).
+ARG VITE_DEFAULT_SERVER=""
+ENV VITE_DEFAULT_SERVER=$VITE_DEFAULT_SERVER
+
 WORKDIR /build
 COPY . .
 

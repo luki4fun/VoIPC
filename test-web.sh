@@ -4,7 +4,9 @@
 # in-page self-test (?selftest=1), and checks that they see each other, exchange
 # the media key, hear voice, and read each other's E2E chat.
 #
-# BROWSER=chromium (default) or BROWSER=firefox picks the engine.
+# BROWSER=chromium (default) or BROWSER=firefox picks the engine. BROWSER_ALICE
+# and BROWSER_BOB override it per side, which is how the mixed lane runs a
+# Chromium sharer (H.264) against a Firefox viewer and the other way round.
 #
 # Prerequisites: npm run web (or npm run build:web + cargo build -p voipc-server --release),
 # openssl, curl with HTTP/2, and either chromium (CHROME=/path/to/chrome) or,
@@ -16,18 +18,23 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 BROWSER="${BROWSER:-chromium}"
-case "$BROWSER" in
-  chromium)
-    CHROME="${CHROME:-$(command -v chromium || command -v chromium-browser || command -v google-chrome || true)}"
-    [ -n "$CHROME" ] || { echo "no chromium found (set CHROME=...)" >&2; exit 1; }
-    ;;
-  firefox)
-    FIREFOX="${FIREFOX:-$(command -v firefox || true)}"
-    [ -n "$FIREFOX" ] || { echo "no firefox found (set FIREFOX=...)" >&2; exit 1; }
-    command -v certutil >/dev/null || { echo "certutil missing (Arch: nss, Debian: libnss3-tools)" >&2; exit 1; }
-    ;;
-  *) echo "unknown BROWSER=$BROWSER (chromium or firefox)" >&2; exit 1 ;;
-esac
+BROWSER_ALICE="${BROWSER_ALICE:-$BROWSER}"
+BROWSER_BOB="${BROWSER_BOB:-$BROWSER}"
+for b in "$BROWSER_ALICE" "$BROWSER_BOB"; do
+  case "$b" in
+    chromium)
+      CHROME="${CHROME:-$(command -v chromium || command -v chromium-browser || command -v google-chrome || true)}"
+      [ -n "$CHROME" ] || { echo "no chromium found (set CHROME=...)" >&2; exit 1; }
+      ;;
+    firefox)
+      FIREFOX="${FIREFOX:-$(command -v firefox || true)}"
+      [ -n "$FIREFOX" ] || { echo "no firefox found (set FIREFOX=...)" >&2; exit 1; }
+      command -v certutil >/dev/null || { echo "certutil missing (Arch: nss, Debian: libnss3-tools)" >&2; exit 1; }
+      ;;
+    *) echo "unknown browser '$b' (chromium or firefox)" >&2; exit 1 ;;
+  esac
+done
+echo "browsers: alice=$BROWSER_ALICE bob=$BROWSER_BOB"
 SERVER="${SERVER:-target/release/voipc-server}"
 [ -x "$SERVER" ] || { echo "$SERVER missing — run npm run web first" >&2; exit 1; }
 
@@ -66,9 +73,10 @@ done
 grep -q '"hash"' "$WORK/wt.json" || { echo "server did not come up:"; cat "$WORK/server.log"; exit 1; }
 echo "server up: $(cat "$WORK/wt.json")"
 
-run_browser() { # name role extra-params logfile
+run_browser() { # name role extra-params logfile browser
   local url="https://127.0.0.1:$TCP_PORT/?selftest=1&name=$1&role=$2&duration=$DURATION$3"
-  if [ "$BROWSER" = firefox ]; then
+  local engine="${5:-$BROWSER}"
+  if [ "$engine" = firefox ]; then
     # Firefox has no --ignore-certificate-errors: the test CA goes into the
     # profile's own NSS database. console.log goes to stdout here (Chromium
     # logs it to stderr), so both streams land in the log file.
@@ -94,9 +102,12 @@ EOF
 
 # alice creates the channel, becomes admin at the end and kicks bob; bob joins
 # through an invite-link fragment (#channel=…) and expects the kick
-run_browser alice talker "&channel=e2e&dm=bob&admin=e2e-admin&kick=bob" "$WORK/alice.log"
+# alice also shares her (synthetic) screen; bob watches it
+run_browser alice talker "&channel=e2e&dm=bob&admin=e2e-admin&kick=bob&share=1" \
+  "$WORK/alice.log" "$BROWSER_ALICE"
 sleep 1
-run_browser bob listener "&dm=alice&expect_kick=1#channel=e2e" "$WORK/bob.log"
+run_browser bob listener "&dm=alice&expect_kick=1&watch=1#channel=e2e" \
+  "$WORK/bob.log" "$BROWSER_BOB"
 
 deadline=$(( $(date +%s) + DURATION / 1000 + 30 ))
 until grep -q "SELFTEST done" "$WORK/alice.log" && grep -q "SELFTEST done" "$WORK/bob.log"; do
@@ -131,6 +142,14 @@ check "bob joined via the invite link"  "$WORK/bob.txt"   'channel-requested.*"s
 check "bob received channel history"    "$WORK/bob.txt"   'channel-history-received.*early from alice'
 check "alice became admin"              "$WORK/alice.txt" 'admin-status.*"is_admin":true'
 check "bob was kicked by the admin"     "$WORK/bob.txt"   'server-disconnected.*kicked from this server'
+check "alice shared her screen"         "$WORK/alice.txt" 'share-started'
+check "alice sent video frames"         "$WORK/alice.txt" 'screenshare-stats.*"frames_sent":[1-9]'
+check "bob watched the share"           "$WORK/bob.txt"   'watching-screenshare'
+check "bob decoded video frames"        "$WORK/bob.txt"   'screenshare-stats.*"frames_recv":[1-9]'
+check "bob drew a frame on the canvas"  "$WORK/bob.txt"   'screenshare-stats.*"frames_drawn":[1-9]'
+if grep -q 'screenshare-error' "$WORK/alice.txt" "$WORK/bob.txt"; then
+  echo "FAIL screen share error reported:"; grep -h 'screenshare-error' "$WORK/alice.txt" "$WORK/bob.txt"; fail=1
+fi
 # bob's connection loss is the kick; alice must stay connected until she leaves
 if grep -q 'SELFTEST error' "$WORK/alice.txt" "$WORK/bob.txt" || grep -q 'connection-lost' "$WORK/alice.txt"; then
   echo "FAIL errors/connection loss reported:"; grep -h 'connection-lost\|SELFTEST error' "$WORK/alice.txt" "$WORK/bob.txt"; fail=1

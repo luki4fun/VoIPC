@@ -271,9 +271,10 @@
     <div class="feature-row">
       <div>
         <h3>Screen sharing</h3>
-        <p>H.265 encoded on your GPU — NVENC, QuickSync, or AMF, with software fallback. Windows builds ship the hardware encoders since 0.4.0.</p>
+        <p>H.264 encoded on your GPU — NVENC, QuickSync, or AMF, with software fallback. Every viewer can watch it, browsers included; H.265 is one setting away when everyone is on a desktop client. Windows builds ship the hardware encoders since 0.4.0.</p>
         <ul>
           <li>480p / 720p / 1080p at 30 or 60 fps, 1.5–7.5 Mbps</li>
+          <li>Share from a browser too — Chromium encodes H.264, Firefox VP9</li>
           <li>Desktop audio comes along, as 64 kbps Opus</li>
           <li>Watch fullscreen or in a pop-out window; chat stays visible</li>
           <li>1280-byte packets — fits inside WireGuard and OpenVPN tunnels</li>
@@ -334,12 +335,12 @@
       <div class="spec-card">
         <h3>Video</h3>
         <dl>
-          <dt>Codec</dt><dd>H.265/HEVC via FFmpeg</dd>
-          <dt>Encoders</dt><dd>NVENC → QuickSync → AMF → libx265</dd>
+          <dt>Codec</dt><dd>H.264 by default, H.265 optional (FFmpeg); browsers also send VP9/VP8</dd>
+          <dt>Encoders</dt><dd>NVENC → QuickSync → AMF → libx264/libx265; WebCodecs in the browser</dd>
           <dt>Modes</dt><dd>480p/720p/1080p · 30/60 fps · 1.5–7.5 Mbps</dd>
           <dt>Keyframes</dt><dd>2 s GOP, VBV-capped; bitrate steps down on viewer loss</dd>
           <dt>Capture</dt><dd>PipeWire + XDG portal · Windows.Graphics.Capture</dd>
-          <dt>Decode</dt><dd>FFmpeg desktop · AMediaCodec on Android</dd>
+          <dt>Decode</dt><dd>FFmpeg desktop · AMediaCodec on Android · WebCodecs in the browser</dd>
         </dl>
       </div>
       <div class="spec-card">
@@ -524,7 +525,7 @@
           <tr><td>Open source</td><td class="ok">Yes — MIT</td><td class="no">No</td><td class="no">No</td></tr>
           <tr><td>Account required</td><td class="ok">No</td><td class="no">Yes</td><td class="ok">No</td></tr>
           <tr><td>Server persistence</td><td class="ok">None — memory only</td><td class="no">Cloud, retained</td><td class="mid">Logs &amp; database</td></tr>
-          <tr><td>Screen share</td><td class="ok">H.265, GPU-encoded, 1080p60</td><td class="mid">H.264/VP8, higher tiers paid</td><td class="mid">Limited</td></tr>
+          <tr><td>Screen share</td><td class="ok">H.264 or H.265, GPU-encoded, 1080p60</td><td class="mid">H.264/VP8, higher tiers paid</td><td class="mid">Limited</td></tr>
           <tr><td>Runs in a browser</td><td class="ok">Yes — E2E encrypted, self-hosted</td><td class="ok">Yes</td><td class="no">No</td></tr>
           <tr><td>Cost</td><td class="ok">Free — your hardware</td><td class="mid">Free + paid tiers</td><td class="mid">Free tier, licensed beyond</td></tr>
         </tbody>
@@ -545,13 +546,13 @@
         <tbody>
           <tr><td>Voice</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="muted">—</td></tr>
           <tr><td>Text chat (E2E)</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="muted">—</td></tr>
-          <tr><td>Screen share (send)</td><td class="ok">PipeWire</td><td class="ok">WGC</td><td class="muted">—</td><td class="muted">—</td><td class="muted">—</td></tr>
-          <tr><td>Screen share (watch)</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Where H.265 decodes</td><td class="muted">—</td></tr>
-          <tr><td>Desktop audio</td><td class="ok">PipeWire</td><td class="ok">WASAPI</td><td class="muted">—</td><td class="muted">—</td><td class="muted">—</td></tr>
+          <tr><td>Screen share (send)</td><td class="ok">PipeWire</td><td class="ok">WGC</td><td class="muted">—</td><td class="ok">getDisplayMedia</td><td class="muted">—</td></tr>
+          <tr><td>Screen share (watch)</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="muted">—</td></tr>
+          <tr><td>Desktop audio</td><td class="ok">PipeWire</td><td class="ok">WASAPI</td><td class="muted">—</td><td class="mid">Where the browser offers a track</td><td class="muted">—</td></tr>
         </tbody>
       </table>
     </div>
-    <p class="audit-note">The browser client needs Chrome 97, Edge 98, Firefox 130 or Safari 26.4 (WebTransport and WebCodecs); voice and chat are tested end to end on both Chromium and Firefox. Watching a screen share additionally needs an H.265 decoder, which browsers only expose on Windows, macOS and Android — and which Firefox does not offer WebCodecs on Linux. macOS is not supported yet — there is no macOS-specific code in the tree, so it isn't listed as working.</p>
+    <p class="audit-note">The browser client needs Chrome 97, Edge 98, Firefox 130 or Safari 26.4 (WebTransport and WebCodecs); voice, chat, sharing a screen and watching one are tested end to end on both Chromium and Firefox. Every client decodes H.264, VP8 and VP9, so any browser can watch a share in them — H.265 is the exception, since browsers expose an HEVC decoder only on Windows, macOS and Android, and Firefox nowhere. Desktop audio from a browser share depends on the browser offering an audio track: Chromium does for tabs and system audio, Firefox on Linux does not. macOS is not supported yet — there is no macOS-specific code in the tree, so it isn't listed as working.</p>
   </div>
 </section>
 

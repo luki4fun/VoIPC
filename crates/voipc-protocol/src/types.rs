@@ -37,6 +37,33 @@ pub struct BanInfo {
     pub expires_in_secs: Option<u64>,
 }
 
+/// Video codec of a screen share, chosen by the sharer and fixed for the life
+/// of the share. H.264 is the default because every viewer decodes it (browsers
+/// included); H.265 is smaller but browsers expose no HEVC decoder on Linux and
+/// Firefox none at all. VP8/VP9 exist because a Firefox sharer cannot encode
+/// H.264 (Bugzilla 1918769) — no client encodes them natively.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[repr(u8)]
+pub enum VideoCodec {
+    #[default]
+    H264 = 0,
+    H265 = 1,
+    Vp8 = 2,
+    Vp9 = 3,
+}
+
+impl VideoCodec {
+    /// For passing the codec through an `AtomicU8`; unknown values read as H264.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::H265,
+            2 => Self::Vp8,
+            3 => Self::Vp9,
+            _ => Self::H264,
+        }
+    }
+}
+
 /// Information about a screen capture source (display or window).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CaptureSourceInfo {

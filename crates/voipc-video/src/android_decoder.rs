@@ -1,11 +1,12 @@
-//! H.265/HEVC decoder for Android using the NDK AMediaCodec API.
+//! Screen-share video decoder for Android using the NDK AMediaCodec API.
 //!
 //! Uses raw FFI bindings to `libmediandk.so` (available since API 21).
-//! The decoder is lazily configured on the first keyframe containing
-//! VPS/SPS/PPS codec-specific data (CSD).
+//! The decoder is lazily configured on the first keyframe: H.264/H.265 need
+//! their parameter sets as codec-specific data (CSD), VP8/VP9 need nothing.
 
 use anyhow::{anyhow, Result};
 use std::ptr;
+use voipc_protocol::types::VideoCodec;
 
 // ---------------------------------------------------------------------------
 // FFI bindings for NDK AMediaCodec / AMediaFormat
@@ -137,9 +138,10 @@ pub struct DecodedFrame {
     pub i420_data: Vec<u8>,
 }
 
-/// H.265/HEVC decoder backed by Android's hardware MediaCodec.
+/// Screen-share decoder backed by Android's hardware MediaCodec.
 pub struct Decoder {
     codec: *mut ffi::AMediaCodec,
+    video_codec: VideoCodec,
     configured: bool,
     width: u32,
     height: u32,
@@ -153,20 +155,28 @@ pub struct Decoder {
 unsafe impl Send for Decoder {}
 
 impl Decoder {
-    /// Create a new H.265/HEVC decoder.
+    /// Create a decoder for `video_codec`.
     ///
     /// The codec is allocated but not configured until the first keyframe
-    /// with VPS/SPS/PPS is received.
-    pub fn new() -> Result<Self> {
-        let mime = b"video/hevc\0";
+    /// (H.264/H.265 also need its parameter sets as CSD).
+    pub fn new(video_codec: VideoCodec) -> Result<Self> {
+        let mime: &[u8] = match video_codec {
+            VideoCodec::H264 => b"video/avc\0",
+            VideoCodec::H265 => b"video/hevc\0",
+            VideoCodec::Vp8 => b"video/x-vnd.on2.vp8\0",
+            VideoCodec::Vp9 => b"video/x-vnd.on2.vp9\0",
+        };
         let codec =
             unsafe { ffi::AMediaCodec_createDecoderByType(mime.as_ptr() as *const _) };
         if codec.is_null() {
-            return Err(anyhow!("AMediaCodec: no HEVC decoder available on this device"));
+            return Err(anyhow!(
+                "AMediaCodec: no {video_codec:?} decoder available on this device"
+            ));
         }
-        tracing::info!("AMediaCodec: HEVC decoder created");
+        tracing::info!("AMediaCodec: {video_codec:?} decoder created");
         Ok(Self {
             codec,
+            video_codec,
             configured: false,
             width: 0,
             height: 0,
@@ -177,10 +187,11 @@ impl Decoder {
         })
     }
 
-    /// Decode a H.265/HEVC encoded frame (Annex B format with start codes).
+    /// Decode one encoded frame (Annex B with start codes for H.264/H.265,
+    /// raw frames for VP8/VP9).
     ///
-    /// On the first call, the data must be a keyframe containing VPS/SPS/PPS
-    /// so that the codec can be configured.
+    /// On the first call, H.264/H.265 data must be a keyframe carrying its
+    /// parameter sets so that the codec can be configured.
     pub fn decode(&mut self, data: &[u8]) -> Result<Vec<DecodedFrame>> {
         if !self.configured {
             self.configure_from_keyframe(data)?;
@@ -190,18 +201,28 @@ impl Decoder {
         self.drain_output()
     }
 
-    /// Extract VPS/SPS/PPS from the first keyframe and configure the codec.
+    /// Configure the codec from the first keyframe: parameter sets as CSD-0 for
+    /// H.264/H.265, nothing for VP8/VP9 (MediaCodec reads their keyframe header;
+    /// the real size arrives through INFO_OUTPUT_FORMAT_CHANGED).
     fn configure_from_keyframe(&mut self, data: &[u8]) -> Result<()> {
-        // Find CSD (everything up to the first non-VPS/SPS/PPS NAL unit)
-        let csd = extract_csd(data);
-        if csd.is_empty() {
+        let mime: &[u8] = match self.video_codec {
+            VideoCodec::H264 => b"video/avc\0",
+            VideoCodec::H265 => b"video/hevc\0",
+            VideoCodec::Vp8 => b"video/x-vnd.on2.vp8\0",
+            VideoCodec::Vp9 => b"video/x-vnd.on2.vp9\0",
+        };
+        let needs_csd = matches!(self.video_codec, VideoCodec::H264 | VideoCodec::H265);
+
+        // Find CSD (everything up to the first non-parameter-set NAL unit)
+        let csd = if needs_csd { extract_csd(self.video_codec, data) } else { &[][..] };
+        if needs_csd && csd.is_empty() {
             return Err(anyhow!(
-                "AMediaCodec: first frame has no VPS/SPS/PPS — waiting for keyframe"
+                "AMediaCodec: first frame has no parameter sets — waiting for keyframe"
             ));
         }
 
-        // Parse width/height from SPS if possible, otherwise use defaults
-        let (w, h) = parse_sps_dimensions(data).unwrap_or((1920, 1080));
+        // Parse width/height from the SPS if possible, otherwise use defaults
+        let (w, h) = parse_sps_dimensions(self.video_codec, data).unwrap_or((1920, 1080));
 
         let format = unsafe { ffi::AMediaFormat_new() };
         if format.is_null() {
@@ -212,7 +233,7 @@ impl Decoder {
             ffi::AMediaFormat_setString(
                 format,
                 b"mime\0".as_ptr() as *const _,
-                b"video/hevc\0".as_ptr() as *const _,
+                mime.as_ptr() as *const _,
             );
             ffi::AMediaFormat_setInt32(format, b"width\0".as_ptr() as *const _, w as i32);
             ffi::AMediaFormat_setInt32(
@@ -220,13 +241,15 @@ impl Decoder {
                 b"height\0".as_ptr() as *const _,
                 h as i32,
             );
-            // Set CSD-0 (VPS+SPS+PPS concatenated with start codes)
-            ffi::AMediaFormat_setBuffer(
-                format,
-                b"csd-0\0".as_ptr() as *const _,
-                csd.as_ptr(),
-                csd.len(),
-            );
+            // Set CSD-0 (parameter sets concatenated with start codes)
+            if !csd.is_empty() {
+                ffi::AMediaFormat_setBuffer(
+                    format,
+                    b"csd-0\0".as_ptr() as *const _,
+                    csd.as_ptr(),
+                    csd.len(),
+                );
+            }
 
             let status = ffi::AMediaCodec_configure(
                 self.codec,
@@ -543,7 +566,7 @@ fn find_start_codes(data: &[u8]) -> Vec<usize> {
 }
 
 /// Get the HEVC NAL unit type from the first byte after the start code.
-fn hevc_nal_type(data: &[u8], start_code_pos: usize) -> Option<u8> {
+fn nal_type(video_codec: VideoCodec, data: &[u8], start_code_pos: usize) -> Option<u8> {
     let hdr_offset = if start_code_pos + 2 < data.len() && data[start_code_pos + 2] == 1 {
         start_code_pos + 3
     } else if start_code_pos + 3 < data.len() && data[start_code_pos + 3] == 1 {
@@ -552,17 +575,37 @@ fn hevc_nal_type(data: &[u8], start_code_pos: usize) -> Option<u8> {
         return None;
     };
     if hdr_offset < data.len() {
-        Some((data[hdr_offset] >> 1) & 0x3F)
+        // H.264: 1-byte header, 5-bit type. HEVC: 2-byte header, 6-bit type.
+        Some(match video_codec {
+            VideoCodec::H264 => data[hdr_offset] & 0x1F,
+            _ => (data[hdr_offset] >> 1) & 0x3F,
+        })
     } else {
         None
     }
 }
 
-/// Extract VPS+SPS+PPS from an Annex B keyframe as the CSD-0 buffer.
+/// Parameter-set NAL types: H.264 SPS=7/PPS=8, HEVC VPS=32/SPS=33/PPS=34.
+fn is_parameter_set(video_codec: VideoCodec, nal_type: u8) -> bool {
+    match video_codec {
+        VideoCodec::H264 => nal_type == 7 || nal_type == 8,
+        _ => (32..=34).contains(&nal_type),
+    }
+}
+
+/// The SPS NAL type for this codec.
+fn sps_nal_type(video_codec: VideoCodec) -> u8 {
+    match video_codec {
+        VideoCodec::H264 => 7,
+        _ => 33,
+    }
+}
+
+/// Extract the parameter sets from an Annex B keyframe as the CSD-0 buffer.
 ///
-/// Returns the byte range from the first VPS/SPS/PPS NAL through the end
-/// of the last parameter set NAL (before the first slice NAL).
-fn extract_csd(data: &[u8]) -> &[u8] {
+/// Returns the byte range from the first parameter-set NAL through the end
+/// of the last one (before the first slice NAL).
+fn extract_csd(video_codec: VideoCodec, data: &[u8]) -> &[u8] {
     let positions = find_start_codes(data);
     if positions.is_empty() {
         return &[];
@@ -572,9 +615,8 @@ fn extract_csd(data: &[u8]) -> &[u8] {
     let mut csd_end: usize = 0;
 
     for (i, &pos) in positions.iter().enumerate() {
-        if let Some(nal_type) = hevc_nal_type(data, pos) {
-            // VPS=32, SPS=33, PPS=34
-            if (32..=34).contains(&nal_type) {
+        if let Some(nal_type) = nal_type(video_codec, data, pos) {
+            if is_parameter_set(video_codec, nal_type) {
                 if csd_start.is_none() {
                     csd_start = Some(pos);
                 }
@@ -598,12 +640,21 @@ fn extract_csd(data: &[u8]) -> &[u8] {
 ///
 /// Parses just enough of the SPS NAL to reach pic_width_in_luma_samples
 /// and pic_height_in_luma_samples (both exp-Golomb coded).
-fn parse_sps_dimensions(data: &[u8]) -> Option<(u32, u32)> {
+///
+/// HEVC only: for every other codec the configure hint is the 1920x1080
+/// fallback, which MediaCodec corrects through INFO_OUTPUT_FORMAT_CHANGED
+/// before it hands out the first decoded buffer.
+/// ponytail: add an H.264 SPS parser only if a device is ever seen to skip
+/// that callback.
+fn parse_sps_dimensions(video_codec: VideoCodec, data: &[u8]) -> Option<(u32, u32)> {
+    if video_codec != VideoCodec::H265 {
+        return None;
+    }
     let positions = find_start_codes(data);
 
     // Find the SPS NAL unit
     for (i, &pos) in positions.iter().enumerate() {
-        if hevc_nal_type(data, pos)? == 33 {
+        if nal_type(video_codec, data, pos)? == sps_nal_type(video_codec) {
             // SPS NAL type
             let hdr_offset = if data[pos + 2] == 1 {
                 pos + 3

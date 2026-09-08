@@ -15,6 +15,12 @@ const MAX_STREAM_RECORD_SIZE = 1500;
 const CONNECT_TIMEOUT_MS = 10_000;
 /** The server pings every 60 s on the control channel; two missed pings plus margin. */
 const IDLE_TIMEOUT_MS = 150_000;
+/**
+ * Video frames allowed to be in flight at once while sharing. About a second
+ * at 30 fps, matching the native sender's queue depth (network.rs): past it the
+ * uplink is the bottleneck and dropping a frame beats growing a backlog.
+ */
+const MAX_FRAMES_IN_FLIGHT = 30;
 
 export interface TransportHandlers {
   /** One complete control frame payload (postcard ServerMessage, no length prefix). */
@@ -31,6 +37,16 @@ export interface Transport {
   /** Frame and queue one control payload (postcard ClientMessage). */
   sendControl(payload: Uint8Array): void;
   sendDatagram(bytes: Uint8Array): void;
+  /**
+   * Write one encoded video frame on a unidirectional stream of its own, the
+   * shape the server relays (see `pump_video_in` in voipc-server/src/web.rs).
+   * `body` is the wasm-built `[u16 len][packet]…` record sequence.
+   *
+   * Returns false when the frame was dropped because too many earlier frames
+   * are still in flight — our uplink is the bottleneck, and the caller should
+   * count that as loss and ask its encoder for a keyframe.
+   */
+  sendVideoFrame(body: Uint8Array): boolean;
   /** Flush queued control frames and close the session. onClosed is not called. */
   close(): Promise<void>;
 }
@@ -77,6 +93,8 @@ export async function connect(host: string, port: number, handlers: TransportHan
 
   let closed = false;
   let watchdog: ReturnType<typeof setTimeout> | undefined;
+  /** Frames whose stream has not finished writing (send-side backpressure). */
+  let framesInFlight = 0;
 
   const finish = (reason: string) => {
     if (closed) return;
@@ -116,6 +134,27 @@ export async function connect(host: string, port: number, handlers: TransportHan
       datagramWriter.write(bytes).catch(() => {
         // Dropped: datagrams are unreliable by design.
       });
+    },
+    sendVideoFrame(body) {
+      if (closed) return false;
+      // A frame goes out whole or not at all: a half-written frame would
+      // stall every viewer's assembler until the next keyframe.
+      if (framesInFlight >= MAX_FRAMES_IN_FLIGHT) return false;
+      framesInFlight++;
+      void (async () => {
+        try {
+          const stream: WritableStream<Uint8Array> = await wt.createUnidirectionalStream();
+          const writer = stream.getWriter();
+          await writer.write(body);
+          await writer.close();
+        } catch {
+          // Stream refused or reset: the frame is lost, the viewers ask for a
+          // keyframe. The session's own error handling reports a dead link.
+        } finally {
+          framesInFlight--;
+        }
+      })();
+      return true;
     },
     async close() {
       if (closed) return;

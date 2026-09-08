@@ -7,7 +7,8 @@
 use anyhow::{bail, Context};
 use voipc_crypto::{build_aad, media_decrypt, media_encrypt, MediaKey};
 use voipc_protocol::video::{
-    FrameAssembler, ScreenShareAudioPacket, VideoPacket, VideoPacketType,
+    fragment_frame, FrameAssembler, ScreenShareAudioPacket, VideoPacket, VideoPacketType,
+    MAX_ENCRYPTED_VIDEO_PAYLOAD_SIZE, MAX_FRAGMENTS_PER_FRAME,
 };
 use voipc_protocol::voice::{VoicePacket, VoicePacketType};
 
@@ -71,6 +72,83 @@ pub fn parse_voice_packet(key: Option<&MediaKey>, bytes: &[u8]) -> anyhow::Resul
         sequence: packet.sequence,
         opus,
     })
+}
+
+/// Encrypted screen-share audio packet (0x15) for one Opus frame — the send
+/// side of [`parse_screen_audio_packet`], mirroring the native sharer's
+/// `AudioProcessor` (client/src-tauri/src/screenshare/mod.rs).
+pub fn build_screen_audio_packet(
+    key: &MediaKey,
+    session_id: u32,
+    sequence: u32,
+    timestamp: u32,
+    opus: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let aad = build_aad(key.channel_id, ENCRYPTED_SCREEN_AUDIO);
+    let encrypted = media_encrypt(key, session_id, sequence, 0, &aad, opus)?;
+    Ok(
+        ScreenShareAudioPacket::new_encrypted(session_id, sequence, timestamp, key.key_id, encrypted)
+            .to_bytes(),
+    )
+}
+
+/// One encoded video frame as the body of a per-frame stream: fragmented,
+/// each fragment encrypted, each prefixed with its `u16` big-endian length —
+/// what the server's `RecordReader` expects and what the native sharer writes
+/// (client/src-tauri/src/screenshare/mod.rs `send_encoded_frames`).
+///
+/// Fails for a frame that needs more than 255 fragments (~316 KB) instead of
+/// truncating it: a truncated frame would leave every viewer's decoder stuck.
+pub fn build_video_frame_stream(
+    key: &MediaKey,
+    session_id: u32,
+    frame_id: u32,
+    timestamp: u32,
+    is_keyframe: bool,
+    frame: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let needed = frame.len().div_ceil(MAX_ENCRYPTED_VIDEO_PAYLOAD_SIZE);
+    if needed > MAX_FRAGMENTS_PER_FRAME {
+        bail!(
+            "frame of {} bytes needs {needed} fragments, more than the {MAX_FRAGMENTS_PER_FRAME} the wire format allows",
+            frame.len()
+        );
+    }
+
+    let packet_type = if is_keyframe { 0x14u8 } else { 0x13u8 };
+    let aad = build_aad(key.channel_id, packet_type);
+    let mut out = Vec::with_capacity(frame.len() + needed * 64);
+    for pkt in fragment_frame(
+        frame,
+        is_keyframe,
+        session_id,
+        frame_id,
+        timestamp,
+        MAX_ENCRYPTED_VIDEO_PAYLOAD_SIZE,
+    ) {
+        let encrypted = media_encrypt(
+            key,
+            session_id,
+            frame_id,
+            pkt.fragment_index as u32,
+            &aad,
+            &pkt.payload,
+        )?;
+        let bytes = VideoPacket::encrypted_fragment(
+            is_keyframe,
+            session_id,
+            frame_id,
+            pkt.fragment_index,
+            pkt.fragment_count,
+            timestamp,
+            key.key_id,
+            encrypted,
+        )
+        .to_bytes();
+        out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+        out.extend_from_slice(&bytes);
+    }
+    Ok(out)
 }
 
 pub struct ScreenAudioInfo {

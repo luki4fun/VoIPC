@@ -268,6 +268,7 @@ pub fn spawn_capture_task(
     target_height: u32,
     target_fps: u32,
     bitrate: u32,
+    codec: voipc_protocol::types::VideoCodec,
     session_id: u32,
     active: Arc<AtomicBool>,
     keyframe_requested: Arc<AtomicBool>,
@@ -295,6 +296,7 @@ pub fn spawn_capture_task(
             target_height,
             target_fps,
             bitrate,
+            codec,
             session_id,
             active,
             keyframe_requested,
@@ -356,6 +358,7 @@ fn run_capture_and_encode(
     target_height: u32,
     target_fps: u32,
     bitrate: u32,
+    codec: voipc_protocol::types::VideoCodec,
     session_id: u32,
     active: Arc<AtomicBool>,
     keyframe_requested: Arc<AtomicBool>,
@@ -369,8 +372,8 @@ fn run_capture_and_encode(
     frames_sent: Arc<AtomicU32>,
     bytes_sent: Arc<AtomicU64>,
 ) -> Result<(), String> {
-    let encoder = voipc_video::encoder::Encoder::new(target_width, target_height, bitrate, target_fps)
-        .map_err(|e| format!("Failed to create H.265 encoder: {e}"))?;
+    let encoder = voipc_video::encoder::Encoder::new(codec, target_width, target_height, bitrate, target_fps)
+        .map_err(|e| format!("Failed to create the {codec:?} encoder: {e}"))?;
 
     let source_desc = match &source {
         CaptureSource::Display { hmonitor } => format!("WGC monitor 0x{:x}", hmonitor),
@@ -415,6 +418,7 @@ fn run_capture_and_encode(
     // ── Run encode loop on this thread ───────────────────────────────────
     let mut processor = FrameProcessor {
         encoder,
+        codec,
         i420_buf: Vec::new(),
         full_res_i420_buf: Vec::new(),
         converter: None,

@@ -4,8 +4,8 @@
 
 use voipc_crypto::{build_aad, media_encrypt, MediaKey};
 use voipc_protocol::video::{
-    fragment_frame, ScreenShareAudioPacket, VideoPacket, MAX_ENCRYPTED_VIDEO_PAYLOAD_SIZE,
-    MAX_VIDEO_PACKET_SIZE,
+    fragment_frame, stream_records, ScreenShareAudioPacket, VideoPacket,
+    MAX_ENCRYPTED_VIDEO_PAYLOAD_SIZE, MAX_VIDEO_PACKET_SIZE,
 };
 use voipc_web::media::{self, VideoAssemblerCore};
 use voipc_web::signal::SignalCore;
@@ -151,6 +151,71 @@ fn video_fragments_reassemble() {
     // A wrong key fails authentication instead of feeding garbage to the decoder.
     let other = MediaKey::generate(7, 1).unwrap();
     assert!(assembler.push(&other, &packets[0]).is_err());
+}
+
+/// A browser sharer's frame stream must come apart exactly like the native
+/// sharer's: `stream_records` splits it, the assembler puts the frame back.
+#[test]
+fn video_frame_stream_round_trip() {
+    let key = MediaKey::generate(7, 2).unwrap();
+    let frame: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+    let (session_id, frame_id, timestamp) = (9, 4, 777);
+
+    let stream =
+        media::build_video_frame_stream(&key, session_id, frame_id, timestamp, true, &frame)
+            .unwrap();
+    let records = stream_records(&stream);
+    assert_eq!(records.len(), 5);
+    assert!(records.iter().all(|r| r.len() <= MAX_VIDEO_PACKET_SIZE));
+    // Keyframe fragments, and the native fragmenter agrees on the count
+    assert!(records.iter().all(|r| r[0] == 0x14));
+
+    let mut assembler = VideoAssemblerCore::new();
+    let (last, rest) = records.split_last().unwrap();
+    for record in rest {
+        assert!(assembler.push(&key, record).unwrap().frame.is_none());
+    }
+    let r = assembler.push(&key, last).unwrap();
+    assert_eq!(r.frame.as_deref(), Some(&frame[..]));
+    assert!(r.is_keyframe);
+    assert_eq!(r.timestamp, timestamp);
+
+    // A delta frame is tagged 0x13 and reassembles on the same assembler
+    let delta = vec![0xABu8; 900];
+    let stream =
+        media::build_video_frame_stream(&key, session_id, frame_id + 1, timestamp + 33, false, &delta)
+            .unwrap();
+    let records = stream_records(&stream);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0][0], 0x13);
+    let r = assembler.push(&key, records[0]).unwrap();
+    assert_eq!(r.frame.as_deref(), Some(&delta[..]));
+    assert!(!r.is_keyframe);
+
+    // Too big for the 255-fragment wire format: refused, never truncated
+    let huge = vec![0u8; MAX_ENCRYPTED_VIDEO_PAYLOAD_SIZE * 256];
+    assert!(
+        media::build_video_frame_stream(&key, session_id, 2, 0, true, &huge).is_err(),
+        "an oversized frame must be refused, not silently cut short"
+    );
+}
+
+/// The browser sharer's screen audio must parse with the receive path both
+/// clients use.
+#[test]
+fn screen_audio_packet_round_trip() {
+    let key = MediaKey::generate(7, 5).unwrap();
+    let opus = [3u8; 60];
+    let packet = media::build_screen_audio_packet(&key, 8, 101, 2540, &opus).unwrap();
+    assert_eq!(packet[0], 0x15);
+
+    let info = media::parse_screen_audio_packet(&key, &packet).unwrap();
+    assert_eq!((info.session_id, info.sequence, info.timestamp), (8, 101, 2540));
+    assert_eq!(info.opus, opus);
+
+    // Another key fails authentication instead of playing noise
+    let other = MediaKey::generate(7, 6).unwrap();
+    assert!(media::parse_screen_audio_packet(&other, &packet).is_err());
 }
 
 /// The browser's voice packets must decrypt with the native receive path, and

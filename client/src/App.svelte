@@ -71,6 +71,8 @@
     deafenKey,
     chatHistoryDisabled,
     shareChannelHistory,
+    screenShareCodec,
+    defaultServer,
   } from "./lib/stores/settings.js";
   import type { AppConfig } from "./lib/stores/settings.js";
   import { voiceMode, vadThreshold } from "./lib/stores/voice.js";
@@ -359,12 +361,15 @@
       deafenKey.set(config.deafen_key ?? "");
       chatHistoryDisabled.set(config.chat_history_disabled ?? false);
       shareChannelHistory.set(config.share_channel_history ?? true);
+      screenShareCodec.set(config.screen_share_codec ?? "h264");
       if (config.input_device) inputDevice.set(config.input_device);
       if (config.output_device) outputDevice.set(config.output_device);
       rememberConnection.set(config.remember_connection);
       if (config.remember_connection) {
-        lastHost.set(config.last_host ?? "localhost");
-        lastPort.set(config.last_port ?? 9987);
+        // A build-time default (VITE_DEFAULT_SERVER) fills in for a config
+        // written before there was one.
+        lastHost.set(config.last_host ?? defaultServer().host);
+        lastPort.set(config.last_port ?? defaultServer().port);
         lastUsername.set(config.last_username ?? "");
         lastAcceptSelfSigned.set(config.last_accept_self_signed ?? false);
       }
@@ -1029,7 +1034,7 @@
   <SettingsPanel onclose={() => (showSettings = false)} />
 {/if}
 
-{#if !$isMobile && !isWeb && $showSourcePicker}
+{#if !$isMobile && $showSourcePicker}
   <ScreenShareSourcePicker />
 {/if}
 

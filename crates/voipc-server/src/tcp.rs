@@ -575,9 +575,10 @@ async fn handle_message(
                 handle_send_poke(state, user_id, session_id, target_user_id, ciphertext, message_type, tx).await?;
             }
         }
-        ClientMessage::StartScreenShare { source: _, resolution } => {
+        ClientMessage::StartScreenShare { source: _, resolution, codec } => {
             let clamped_resolution = resolution.clamp(240, 4320);
-            handle_start_screen_share(state, user_id, session_id, clamped_resolution, tx).await?;
+            handle_start_screen_share(state, user_id, session_id, clamped_resolution, codec, tx)
+                .await?;
         }
         ClientMessage::StopScreenShare => {
             handle_stop_screen_share(state, user_id, session_id, tx).await?;
@@ -1466,6 +1467,7 @@ async fn handle_start_screen_share(
     user_id: UserId,
     session_id: SessionId,
     resolution: u16,
+    codec: VideoCodec,
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
     let channel_id = state
@@ -1475,7 +1477,7 @@ async fn handle_start_screen_share(
         .unwrap_or(0);
 
     match state
-        .start_screen_share(user_id, session_id, channel_id, resolution)
+        .start_screen_share(user_id, session_id, channel_id, resolution, codec)
         .await
     {
         Ok(member_sessions) => {
@@ -1584,11 +1586,11 @@ async fn handle_watch_screen_share(
         .watch_screen_share(viewer_user_id, viewer_session_id, sharer_user_id, channel_id)
         .await
     {
-        Ok((sharer_sid, _old_count, new_count, prev_unwatch)) => {
-            // Confirm to viewer
+        Ok((sharer_sid, _old_count, new_count, prev_unwatch, codec)) => {
+            // Confirm to viewer, with the codec its decoder needs
             let _ = send_msg(
                 tx,
-                &ServerMessage::WatchingScreenShare { sharer_user_id },
+                &ServerMessage::WatchingScreenShare { sharer_user_id, codec },
             )
             .await;
 
@@ -2428,6 +2430,59 @@ mod tests {
             .await;
         dave.assert_closed().await;
         assert!(state.sessions.is_empty());
+    }
+
+    /// A viewer must be told which codec the share it just joined uses: it is
+    /// the only thing that reaches a late joiner before the first frame, and
+    /// building the wrong decoder means a black window.
+    #[tokio::test]
+    async fn watchers_learn_the_share_codec() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut alice = connect(&state, "alice", lo).await; // user 1
+        let mut bob = connect(&state, "bob", lo).await; // user 2
+
+        // Sharing needs a real channel; General never carries media.
+        alice
+            .send(&ClientMessage::CreateChannel { name: "room".into(), password: None })
+            .await;
+        let created = alice
+            .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))
+            .await;
+        let ServerMessage::ChannelCreated { channel } = created else { unreachable!() };
+        let channel_id = channel.channel_id;
+        bob.send(&ClientMessage::JoinChannel { channel_id, password: None })
+            .await;
+        bob.expect("UserList", |m| matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id))
+            .await;
+
+        // Alice shares in a codec that is not the default
+        alice
+            .send(&ClientMessage::StartScreenShare {
+                source: "portal".into(),
+                resolution: 720,
+                codec: VideoCodec::Vp9,
+            })
+            .await;
+        bob.expect("ScreenShareStarted", |m| {
+            matches!(m, ServerMessage::ScreenShareStarted { user_id: 1, .. })
+        })
+        .await;
+
+        bob.send(&ClientMessage::WatchScreenShare { sharer_user_id: 1 })
+            .await;
+        let watching = bob
+            .expect("WatchingScreenShare", |m| {
+                matches!(m, ServerMessage::WatchingScreenShare { .. })
+            })
+            .await;
+        assert!(
+            matches!(
+                watching,
+                ServerMessage::WatchingScreenShare { sharer_user_id: 1, codec: VideoCodec::Vp9 }
+            ),
+            "the viewer was told the wrong codec: {watching:?}"
+        );
     }
 
     #[tokio::test]

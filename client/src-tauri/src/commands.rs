@@ -1124,11 +1124,19 @@ pub async fn start_screen_share(
 
         connection.capture_session = Some(session);
 
+        // Fixed for the life of this share: viewers are told this codec when
+        // they start watching, and a source switch keeps encoding in it.
+        let codec = crate::app_state::share_codec_from_str(
+            &state.config.lock().unwrap().screen_share_codec,
+        );
+        connection.screen_share_codec = codec;
+
         network::send_tcp_message(
             &connection.tcp_tx,
             &ClientMessage::StartScreenShare {
                 source: "portal".into(),
                 resolution,
+                codec,
             },
         )
         .await?;
@@ -1327,6 +1335,7 @@ pub async fn start_screen_capture(
             res.height(),
             fps,
             res.bitrate_kbps_at(fps),
+            connection.screen_share_codec,
             connection.session_id,
             connection.screen_share_active.clone(),
             connection.keyframe_requested.clone(),
@@ -1432,6 +1441,7 @@ pub async fn switch_screen_share_source(
             res.height(),
             fps,
             res.bitrate_kbps_at(fps),
+            connection.screen_share_codec,
             connection.session_id,
             connection.screen_share_active.clone(),
             connection.keyframe_requested.clone(),
@@ -1451,6 +1461,21 @@ pub async fn switch_screen_share_source(
 
     Ok(())
     } // cfg(not(android))
+}
+
+/// Set the codec used for our own screen shares: "h264" or "h265".
+/// Applies to the next share — the codec of a running one is fixed.
+#[tauri::command]
+pub async fn set_screen_share_codec(state: State<'_, AppState>, codec: String) -> Result<(), String> {
+    if codec != "h264" && codec != "h265" {
+        return Err(format!("unknown screen share codec: {codec}"));
+    }
+    let mut config = state.config.lock().unwrap();
+    config.screen_share_codec = codec;
+    if let Err(e) = crate::config::save_config(&config) {
+        tracing::warn!("Failed to save config: {e}");
+    }
+    Ok(())
 }
 
 /// Set the keyframe_requested flag — called from frontend on KeyframeRequested event.

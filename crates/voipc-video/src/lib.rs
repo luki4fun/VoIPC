@@ -16,6 +16,7 @@ pub mod decoder {
 #[cfg(target_os = "android")]
 pub mod encoder {
     use anyhow::Result;
+    use voipc_protocol::types::VideoCodec;
 
     pub struct Encoder;
 
@@ -30,16 +31,23 @@ pub mod encoder {
     unsafe impl Send for Encoder {}
 
     impl Encoder {
-        pub fn new(_width: u32, _height: u32, _bitrate_kbps: u32, _fps: u32) -> Result<Self> {
-            anyhow::bail!("H.265 encoder not available on Android")
+        pub fn new(
+            _codec: VideoCodec,
+            _width: u32,
+            _height: u32,
+            _bitrate_kbps: u32,
+            _fps: u32,
+        ) -> Result<Self> {
+            anyhow::bail!("screen share encoding is not available on Android")
         }
 
         pub fn encode(&mut self, _i420_data: &[u8], _pts: i64, _force_keyframe: bool) -> Result<Vec<EncodedFrame>> {
-            anyhow::bail!("H.265 encoder not available on Android")
+            anyhow::bail!("screen share encoding is not available on Android")
         }
 
         pub fn width(&self) -> u32 { 0 }
         pub fn height(&self) -> u32 { 0 }
+        pub fn codec(&self) -> VideoCodec { VideoCodec::H264 }
     }
 }
 

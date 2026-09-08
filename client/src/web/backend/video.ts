@@ -1,24 +1,37 @@
-// Screen-share viewer: encrypted H.265 fragments -> wasm VideoAssembler ->
-// WebCodecs VideoDecoder -> <canvas>. Port of the receive side of
+// Screen-share viewer: encrypted fragments -> wasm VideoAssembler -> WebCodecs
+// VideoDecoder -> <canvas>. Port of the receive side of
 // client/src-tauri/src/network.rs (the video arm of udp_receiver_task and
-// video_decode_render_task). Sending a screen share from the browser is out
-// of scope, so the sender stats stay 0.
+// video_decode_render_task). Sharing our own screen lives in share.ts, which
+// fills in the sender half of getStats().
 
 import { emit } from "./events";
 import { wasm } from "./wasm";
 import type { VideoAssembler } from "./wasm";
-import type { SessionContext, VideoApi } from "./types";
+import type { SessionContext, VideoApi, VideoCodec } from "./types";
 
-/** HEVC Main, level 5.1 then 4.0 — the stream is Annex B with in-band VPS/SPS/PPS.
- *  Both prefixes are tried: some browsers only advertise the hvc1 spelling. */
-const HEVC_CODECS = [
-  "hev1.1.6.L153.B0",
-  "hvc1.1.6.L153.B0",
-  "hev1.1.6.L120.B0",
-  "hvc1.1.6.L120.B0",
-];
-const UNSUPPORTED_REASON =
-  "This browser cannot decode H.265 video — use Chrome/Edge on Windows/macOS, Safari 17+, or the desktop app";
+/**
+ * WebCodecs codec strings to try per share codec, best first. Every stream is
+ * Annex B (H.264/H.265) or raw frames (VP8/VP9) with the parameter sets in
+ * band, so no `description` is needed.
+ *
+ * H.264: High/Main/Baseline at level 5.1, then 4.2 for decoders that refuse the
+ * higher level. H.265: both the hev1 and hvc1 spellings, since some browsers
+ * advertise only one.
+ */
+const CODEC_CANDIDATES: Record<VideoCodec, string[]> = {
+  H264: ["avc1.640033", "avc1.4d0033", "avc1.420033", "avc1.64002a", "avc1.4d002a"],
+  H265: ["hev1.1.6.L153.B0", "hvc1.1.6.L153.B0", "hev1.1.6.L120.B0", "hvc1.1.6.L120.B0"],
+  Vp8: ["vp8"],
+  Vp9: ["vp09.00.51.08", "vp09.00.10.08"],
+};
+
+/** What to tell the user when their browser has no decoder for this share. */
+function unsupportedReason(codec: VideoCodec): string {
+  if (codec === "H265") {
+    return "This browser cannot decode H.265 video — ask the sharer to switch to H.264 in Settings, or use the desktop app";
+  }
+  return `This browser cannot decode the ${codec} video this share uses — try another browser or the desktop app`;
+}
 const KEYFRAME_REQUEST_INTERVAL_MS = 1_000;
 /** Loss-report window: dropped/received frame counts sent to the sharer via the server. */
 const LOSS_REPORT_INTERVAL_MS = 2_000;
@@ -27,7 +40,10 @@ export class VideoViewer implements VideoApi {
   private ctx: SessionContext | null = null;
   private canvas: HTMLCanvasElement | null = null;
   private decoder: VideoDecoder | null = null;
+  /** WebCodecs codec string the decoder was configured with. */
   private codec = "";
+  /** Codec of the share we are watching, from WatchingScreenShare. */
+  private shareCodec: VideoCodec = "H264";
   private assembler: VideoAssembler | null = null;
   private sharerUserId = 0;
   private watching = false;
@@ -63,9 +79,10 @@ export class VideoViewer implements VideoApi {
     this.ctx = null;
   }
 
-  async startWatching(sharerUserId: number): Promise<void> {
+  async startWatching(sharerUserId: number, codec: VideoCodec): Promise<void> {
     this.stopWatching();
     this.sharerUserId = sharerUserId;
+    this.shareCodec = codec;
     this.watching = true;
     this.framesReceived = 0;
     this.framesDropped = 0;
@@ -73,17 +90,17 @@ export class VideoViewer implements VideoApi {
     this.resolution = 0;
     this.firstFrameShown = false;
 
-    const codec = await this.probeCodec();
+    const decoderCodec = await this.probeCodec(codec);
     if (!this.watching || this.sharerUserId !== sharerUserId) return; // stopped meanwhile
-    if (!codec) {
+    if (!decoderCodec) {
       this.watching = false;
       this.sharerUserId = 0;
-      emit("screenshare-error", { reason: UNSUPPORTED_REASON });
+      emit("screenshare-error", { reason: unsupportedReason(codec) });
       this.ctx?.stopWatching();
       emit("stopped-watching-screenshare", { reason: "unsupported" });
       return;
     }
-    this.codec = codec;
+    this.codec = decoderCodec;
     this.assembler = wasm().newVideoAssembler();
     this.openDecoder();
     this.windowDropped = 0;
@@ -160,9 +177,9 @@ export class VideoViewer implements VideoApi {
     if (canvas && this.pendingFrame) this.scheduleDraw();
   }
 
-  private async probeCodec(): Promise<string | null> {
+  private async probeCodec(shareCodec: VideoCodec): Promise<string | null> {
     if (typeof VideoDecoder === "undefined") return null;
-    for (const codec of HEVC_CODECS) {
+    for (const codec of CODEC_CANDIDATES[shareCodec] ?? []) {
       try {
         const r = await VideoDecoder.isConfigSupported({ codec, optimizeForLatency: true });
         if (r.supported) return codec;
@@ -204,7 +221,7 @@ export class VideoViewer implements VideoApi {
 
   private onDecodeError(e: Error): void {
     if (!this.watching) return;
-    console.warn("H.265 decode error:", e.message);
+    console.warn(`${this.shareCodec} decode error:`, e.message);
     this.suppress();
     this.requestKeyframe();
     // A WebCodecs decoder is closed after an error; build a fresh one that
@@ -212,7 +229,7 @@ export class VideoViewer implements VideoApi {
     try {
       this.openDecoder();
     } catch (err) {
-      console.warn("H.265 decoder creation failed:", err);
+      console.warn(`${this.shareCodec} decoder creation failed:`, err);
     }
   }
 

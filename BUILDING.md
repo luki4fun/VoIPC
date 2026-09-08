@@ -35,6 +35,24 @@ straight through to the underlying tool.
 Everything at once, in the same versions a release ships: push a `v*` tag and
 let `.github/workflows/release.yml` build all four platforms.
 
+### Demo builds (a default server in the connect dialog)
+
+`VITE_DEFAULT_SERVER=host[:port]` bakes a server into the connect dialog, so a
+build handed to someone starts pointing at your relay. The port defaults to
+9987; an IPv6 literal goes in brackets (`[2001:db8::1]:9987`).
+
+```bash
+VITE_DEFAULT_SERVER=demo.example.org npm run build            # desktop
+VITE_DEFAULT_SERVER=demo.example.org npm run web              # web bundle + server
+VITE_DEFAULT_SERVER=demo.example.org npm run android -- release
+npm run release -- --build-arg VITE_DEFAULT_SERVER=demo.example.org   # Docker
+```
+
+Leave it unset for a normal release: the dialog then starts at `localhost:9987`
+in the desktop app and at the page's own origin in the browser. The release
+workflow takes the same value as the optional `default_server` input when you
+run it by hand from the Actions tab; tag builds never set it.
+
 ### Debug builds
 
 | Command | Notes |
@@ -98,7 +116,7 @@ sudo apt-get install -y \
 | `libavdevice-dev` | FFmpeg device library |
 | `libavutil-dev` | FFmpeg utility functions |
 | `libswscale-dev` | FFmpeg pixel format conversion |
-| `libx265-dev` | x265 HEVC encoder library |
+| `libx265-dev` | x265 HEVC encoder library (H.264 comes with libavcodec's libx264) |
 | `libclang-dev` | libclang for bindgen (generates FFmpeg Rust bindings) |
 | `libturbojpeg0-dev` | Fast JPEG encoding (screen share frame delivery) |
 | `nasm` | SIMD assembly for libjpeg-turbo and x265 |
@@ -183,7 +201,7 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I$(gcc -print-file-name=include)"
 5. **NASM** — required for SIMD optimizations in libjpeg-turbo and x265 ([nasm.us](https://www.nasm.us/))
 6. **LLVM** — required by bindgen to generate FFmpeg Rust bindings (`winget install LLVM.LLVM`)
 7. **protoc** — required by the `libsignal-protocol` build (`winget install Google.Protobuf`)
-8. **FFmpeg** — installed via vcpkg (run `.\setup.ps1` to install automatically). Installed as `ffmpeg[x265,nvcodec,amf,qsv]` so the hardware H.265 encoders (NVIDIA NVENC, AMD AMF, Intel QuickSync) are compiled in. NVENC and AMF load from the GPU driver at runtime (no extra installs for users); QSV ships the Intel oneVPL dispatcher DLL with the app.
+8. **FFmpeg** — installed via vcpkg (run `.\setup.ps1` to install automatically). Installed as `ffmpeg[x264,x265,nvcodec,amf,qsv]` so both software encoders and the hardware ones (NVIDIA NVENC, AMD AMF, Intel QuickSync) are compiled in for H.264 and H.265. NVENC and AMF load from the GPU driver at runtime (no extra installs for users); QSV ships the Intel oneVPL dispatcher DLL with the app.
 
 Make sure `cmake`, `nasm`, `protoc`, and LLVM are on your `PATH`. Or just run `.\setup.ps1` which handles all of the above.
 
@@ -266,7 +284,8 @@ that cache is **not redistributable**, so never commit or ship it.
 The FFmpeg build must be a **`-shared`** one (those ship `include/` and the MSVC
 `lib/*.lib` import libraries) and must match the FFmpeg major that `ffmpeg-next`
 targets — currently FFmpeg 8.x / libavcodec 62. The GPL variant is required for
-`libx265`; like the vcpkg build it also has NVENC, AMF and QSV compiled in.
+`libx264` and `libx265`; like the vcpkg build it also has NVENC, AMF and QSV
+compiled in.
 
 ### Differences from a native Windows build
 
@@ -427,9 +446,21 @@ cd .. && cargo build -p voipc-server --release
 ```
 
 The web end-to-end test starts a server on test ports with a throwaway certificate, runs two headless
-Chromium instances with a fake microphone through the in-page self-test, and checks that they
-see each other, exchange the media key over Signal, hear each other's voice, and read each
-other's channel messages and DMs. Set `CHROME=/path/to/chrome` if Chromium is not on `PATH`.
+browsers with a fake microphone through the in-page self-test, and checks that they see each
+other, exchange the media key over Signal, hear each other's voice, read each other's channel
+messages and DMs, and that one watches the other's screen share (an animated canvas stands in
+for the display, so no real capture is needed). Set `CHROME=/path/to/chrome` if Chromium is not
+on `PATH`.
+
+```bash
+npm run test:web                                  # Chromium on both sides
+BROWSER=firefox ./test-web.sh                     # Firefox on both sides
+BROWSER_ALICE=chromium BROWSER_BOB=firefox ./test-web.sh   # Chromium shares H.264, Firefox watches
+BROWSER_ALICE=firefox BROWSER_BOB=chromium ./test-web.sh   # Firefox shares VP9, Chromium watches
+```
+
+The Firefox lane needs `certutil` (Arch: `nss`, Debian/Ubuntu: `libnss3-tools`) to trust the
+test certificate.
 
 ## Docker Release Build (AppImage)
 

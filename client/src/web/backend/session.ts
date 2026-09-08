@@ -10,6 +10,7 @@ import { connect as openTransport, type Transport } from "./transport";
 import type { SessionContext } from "./types";
 import { audio } from "./audio";
 import { video } from "./video";
+import { share } from "./share";
 
 /** Bound for the authentication response (network.rs CONNECT_TIMEOUT). */
 const AUTH_TIMEOUT_MS = 10_000;
@@ -152,6 +153,9 @@ export class Session implements SessionContext {
 
   /** Voice sequence: never restarts within a connection (AES-GCM nonce = session_id ‖ sequence). */
   private voiceSequence = 0;
+  /** Same rule for our own share's frames and screen audio (SHARE_FRAME_ID / SHARE_AUDIO_SEQ). */
+  private videoFrameId = 0;
+  private screenAudioSequence = 0;
   private auth: { resolve(): void; reject(e: Error): void } | null = null;
   private keepalive: ReturnType<typeof setInterval> | undefined;
   private attached = false;
@@ -171,8 +175,24 @@ export class Session implements SessionContext {
     return seq;
   }
 
+  nextVideoFrameId(): number {
+    const id = this.videoFrameId;
+    this.videoFrameId = (id + 1) >>> 0;
+    return id;
+  }
+
+  nextScreenAudioSequence(): number {
+    const seq = this.screenAudioSequence;
+    this.screenAudioSequence = (seq + 1) >>> 0;
+    return seq;
+  }
+
   sendDatagram(bytes: Uint8Array): void {
     this.transport?.sendDatagram(bytes);
+  }
+
+  sendVideoFrame(body: Uint8Array): boolean {
+    return this.transport?.sendVideoFrame(body) ?? false;
   }
 
   sendControl(msg: unknown): void {
@@ -214,6 +234,7 @@ export class Session implements SessionContext {
   start(): void {
     audio.attach(this);
     video.attach(this);
+    share.attach(this);
     this.attached = true;
 
     // First ping: gives the UI an RTT reading right away.
@@ -243,6 +264,7 @@ export class Session implements SessionContext {
       this.attached = false;
       audio.detach();
       video.detach();
+      share.detach();
     }
     if (sendDisconnect) this.sendControl("Disconnect");
     if (this.transport) await this.transport.close();
@@ -430,8 +452,10 @@ export class Session implements SessionContext {
         emit("screenshare-stopped", { user_id: b.user_id });
         break;
       case "WatchingScreenShare":
-        emit("watching-screenshare", { sharer_user_id: b.sharer_user_id });
-        video.startWatching(b.sharer_user_id).catch((e) => console.error("failed to start watching:", e));
+        emit("watching-screenshare", { sharer_user_id: b.sharer_user_id, codec: b.codec });
+        video
+          .startWatching(b.sharer_user_id, b.codec)
+          .catch((e) => console.error("failed to start watching:", e));
         break;
       case "StoppedWatchingScreenShare":
         emit("stopped-watching-screenshare", { reason: b.reason });
@@ -441,10 +465,13 @@ export class Session implements SessionContext {
         emit("viewer-count-changed", { viewer_count: b.viewer_count });
         break;
       case "KeyframeRequested":
+        // A viewer needs an IDR now; the UI relays this too (App.svelte)
+        share.requestKeyframe();
         emit("keyframe-requested");
         break;
       case "VideoLossReported":
-        // Viewer loss feedback for a sharer; browsers cannot share
+        // A viewer of our share lost frames: step the encoder down
+        share.onLossReport(b.frames_dropped);
         break;
       case "ScreenShareError":
         emit("screenshare-error", { reason: b.reason });
@@ -536,6 +563,8 @@ export class Session implements SessionContext {
         emit("screen-share-force-stopped");
         video.stopWatching();
       }
+      // Our own share belonged to the old channel's members and its media key
+      if (share.sharing) share.stop();
       audio.onChannelChanged();
     }
 

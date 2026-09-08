@@ -220,13 +220,15 @@ mod tests {
         let msg = ClientMessage::StartScreenShare {
             source: "screen:0".into(),
             resolution: 1080,
+            codec: crate::types::VideoCodec::Vp9,
         };
         let encoded = encode_client_msg(&msg).unwrap();
         let decoded = decode_client_msg(&encoded[4..]).unwrap();
         match decoded {
-            ClientMessage::StartScreenShare { source, resolution } => {
+            ClientMessage::StartScreenShare { source, resolution, codec } => {
                 assert_eq!(source, "screen:0");
                 assert_eq!(resolution, 1080);
+                assert_eq!(codec, crate::types::VideoCodec::Vp9);
             }
             _ => panic!("wrong variant"),
         }
@@ -235,6 +237,21 @@ mod tests {
         let encoded = encode_client_msg(&msg).unwrap();
         let decoded = decode_client_msg(&encoded[4..]).unwrap();
         assert!(matches!(decoded, ClientMessage::WatchScreenShare { sharer_user_id: 7 }));
+
+        // The viewer learns the codec here, not from ScreenShareStarted
+        let msg = ServerMessage::WatchingScreenShare {
+            sharer_user_id: 7,
+            codec: crate::types::VideoCodec::H265,
+        };
+        let encoded = encode_server_msg(&msg).unwrap();
+        let decoded = decode_server_msg(&encoded[4..]).unwrap();
+        match decoded {
+            ServerMessage::WatchingScreenShare { sharer_user_id, codec } => {
+                assert_eq!(sharer_user_id, 7);
+                assert_eq!(codec, crate::types::VideoCodec::H265);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

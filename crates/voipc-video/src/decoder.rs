@@ -4,6 +4,7 @@ use ffmpeg::codec::{self, decoder};
 use ffmpeg::format::Pixel;
 use ffmpeg::util::frame::video::Video;
 use std::sync::Once;
+use voipc_protocol::types::VideoCodec;
 
 static FFMPEG_INIT: Once = Once::new();
 
@@ -14,9 +15,10 @@ fn init_ffmpeg() {
     });
 }
 
-/// A H.265/HEVC decoder for screen share frames.
+/// A decoder for screen share frames, in whatever codec the sharer announced.
 pub struct Decoder {
     decoder: decoder::Video,
+    video_codec: VideoCodec,
 }
 
 // SAFETY: The FFmpeg decoder context is not Send by default due to raw pointers,
@@ -33,34 +35,49 @@ pub struct DecodedFrame {
 }
 
 impl Decoder {
-    /// Create a new H.265/HEVC decoder.
-    pub fn new() -> Result<Self> {
+    /// Create a decoder for `video_codec`. All four are built into FFmpeg
+    /// (H.264/HEVC/VP8/VP9 decoders need no external library), so a viewer can
+    /// watch a browser sharer's VP9 as easily as a desktop sharer's H.264.
+    pub fn new(video_codec: VideoCodec) -> Result<Self> {
         init_ffmpeg();
 
-        // Find H.265/HEVC software decoder
-        let codec = decoder::find(codec::Id::HEVC)
-            .ok_or_else(|| anyhow!("H.265 decoder: HEVC codec not found"))?;
+        let id = match video_codec {
+            VideoCodec::H264 => codec::Id::H264,
+            VideoCodec::H265 => codec::Id::HEVC,
+            VideoCodec::Vp8 => codec::Id::VP8,
+            VideoCodec::Vp9 => codec::Id::VP9,
+        };
+        let codec = decoder::find(id)
+            .ok_or_else(|| anyhow!("{video_codec:?} decoder: codec not found in this FFmpeg"))?;
 
         // Create decoder context with codec-specific defaults
         let decoder = codec::context::Context::new_with_codec(codec)
             .decoder()
             .open_as(codec)
-            .context("H.265 decoder: failed to open decoder")?
+            .with_context(|| format!("{video_codec:?} decoder: failed to open decoder"))?
             .video();
 
-        Ok(Self { decoder: decoder? })
+        Ok(Self {
+            decoder: decoder?,
+            video_codec,
+        })
     }
 
-    /// Decode a H.265/HEVC encoded frame.
+    /// The codec this decoder was opened for.
+    pub fn codec(&self) -> VideoCodec {
+        self.video_codec
+    }
+
+    /// Decode one encoded frame.
     ///
-    /// Returns a list of decoded frames (usually one, but H.265 can buffer).
+    /// Returns a list of decoded frames (usually one, but the decoder can buffer).
     pub fn decode(&mut self, data: &[u8]) -> Result<Vec<DecodedFrame>> {
         // Create packet from raw data
         let packet = ffmpeg::Packet::copy(data);
 
         // Send packet to decoder
         self.decoder.send_packet(&packet)
-            .context("H.265 decoder: failed to send packet")?;
+            .with_context(|| format!("{:?} decoder: failed to send packet", self.video_codec))?;
 
         // Collect decoded frames
         let mut frames = Vec::new();
@@ -144,14 +161,14 @@ impl Decoder {
             width,
             height,
             ffmpeg::software::scaling::flag::Flags::BILINEAR,
-        ).context("H.265 decoder: failed to create scaler context")?;
+        ).context("decoder: failed to create scaler context")?;
 
         // Create output frame
         let mut i420_frame = Video::empty();
 
         // Scale/convert
         scaler.run(frame, &mut i420_frame)
-            .context("H.265 decoder: failed to convert to I420")?;
+            .context("decoder: failed to convert to I420")?;
 
         // Extract data
         Ok(self.extract_i420_from_frame(&i420_frame))

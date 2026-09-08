@@ -12,6 +12,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
   CLIENT, ROOT, capture, err, fail, head, info, npmInstall, ok, run, syncVersion, which,
+  writeTempConfig,
 } from '../lib.mjs';
 
 const TARGET = 'x86_64-pc-windows-msvc';
@@ -136,11 +137,12 @@ function reportEncoders() {
   const dir = ffmpegDir();
   const ffmpegExe = join(dir, 'bin', 'ffmpeg.exe');
   if (!which('wine') || !existsSync(ffmpegExe)) return;
-  info('checking HEVC encoders in the Windows FFmpeg (via wine)...');
+  info('checking video encoders in the Windows FFmpeg (via wine)...');
   const out = capture('wine', [ffmpegExe, '-hide_banner', '-encoders'],
     { env: { WINEDEBUG: '-all' } });
-  const found = [...new Set(out.match(/hevc_(nvenc|amf|qsv)|libx265/g) ?? [])];
-  if (found.length) ok(`HEVC encoders available: ${found.sort().join(' ')}`);
+  const found = [...new Set(
+    out.match(/h264_(nvenc|amf|qsv)|hevc_(nvenc|amf|qsv)|libx264|libx265/g) ?? [])];
+  if (found.length) ok(`video encoders available: ${found.sort().join(' ')}`);
 }
 
 function setup() {
@@ -212,7 +214,7 @@ function ensureUcrtdStub(env) {
   run('llvm-ar', ['rcs', stub]);
 }
 
-/** Ship the FFmpeg DLLs next to the exe. x265 and libvpl are linked inside
+/** Ship the FFmpeg DLLs next to the exe. x264, x265 and libvpl are linked inside
  *  them in these builds, and turbojpeg and Opus are static, so nothing else is
  *  needed. NVENC and AMF load from the GPU driver at runtime. */
 function stageDlls() {
@@ -222,7 +224,7 @@ function stageDlls() {
   mkdirSync(staging, { recursive: true });
 
   const patterns = [/^av.*\.dll$/i, /^sw.*\.dll$/i, /^postproc.*\.dll$/i,
-    /^(lib)?x265.*\.dll$/i, /^(lib)?vpl.*\.dll$/i];
+    /^(lib)?x26[45].*\.dll$/i, /^(lib)?vpl.*\.dll$/i];
   let staged = 0;
   for (const name of readdirSync(binDir)) {
     if (patterns.some((re) => re.test(name))) {
@@ -328,13 +330,18 @@ function build(args) {
   if (!noBundle) Object.assign(config.bundle, { active: true, targets: ['nsis'] });
 
   npmInstall();
+  const cfg = writeTempConfig(config);
   const cmd = ['tauri', 'build', '--runner', 'cargo-xwin', '--target', TARGET,
-    '--config', JSON.stringify(config)];
+    '--config', cfg.file];
   if (noBundle) {
     info('VOIPC_NO_BUNDLE set — building the .exe only, no installer');
     cmd.push('--no-bundle');
   }
-  run('npx', [...cmd, ...args], { cwd: CLIENT, env });
+  try {
+    run('npx', [...cmd, ...args], { cwd: CLIENT, env });
+  } finally {
+    cfg.cleanup();
+  }
 
   head('Build complete');
   const exe = join(ROOT, 'target', TARGET, 'release', 'voipc-client.exe');

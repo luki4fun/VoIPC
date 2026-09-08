@@ -6,6 +6,7 @@ use ffmpeg::util::frame::video::Video;
 use ffmpeg::{Dictionary, Rational};
 use std::sync::Once;
 use tracing::info;
+use voipc_protocol::types::VideoCodec;
 
 static FFMPEG_INIT: Once = Once::new();
 
@@ -16,9 +17,10 @@ fn init_ffmpeg() {
     });
 }
 
-/// A H.265/HEVC encoder for screen share frames.
+/// An H.264 or H.265 encoder for screen share frames.
 pub struct Encoder {
     encoder: encoder::Video,
+    codec: VideoCodec,
     width: u32,
     height: u32,
     frame_index: i64,
@@ -63,55 +65,78 @@ fn set_rate_control_opts(opts: &mut Dictionary, bitrate_kbps: u32, fps: u32) {
     opts.set("bufsize", &(bits / 2).min(2_400_000).to_string());
 }
 
-/// Hardware encoders to try before falling back to libx265 software encoding.
+/// Hardware encoders to try before falling back to software encoding.
 /// Order: NVIDIA → Intel Quick Sync → AMD, then software fallback.
-const HW_ENCODERS: &[(&str, &str)] = &[
+const HW_ENCODERS_H264: &[(&str, &str)] = &[
+    ("h264_nvenc", "NVIDIA NVENC"),
+    ("h264_qsv", "Intel Quick Sync"),
+    ("h264_amf", "AMD AMF"),
+];
+const HW_ENCODERS_H265: &[(&str, &str)] = &[
     ("hevc_nvenc", "NVIDIA NVENC"),
     ("hevc_qsv", "Intel Quick Sync"),
     ("hevc_amf", "AMD AMF"),
 ];
 
 impl Encoder {
-    /// Create a new H.265/HEVC encoder.
+    /// Create an encoder for `codec` (H.264 or H.265).
     ///
     /// Tries hardware encoders first (NVENC, QSV, AMF) for much faster encoding,
-    /// falling back to libx265 software encoding if none are available.
+    /// falling back to the libx264/libx265 software encoder if none are available.
+    /// VP8 and VP9 are decode-only natively — only browser sharers produce them.
     ///
     /// `width` and `height` must be divisible by 2.
     /// `bitrate_kbps` is the target bitrate in kilobits per second.
     /// `fps` is the target frame rate.
-    pub fn new(width: u32, height: u32, bitrate_kbps: u32, fps: u32) -> Result<Self> {
+    pub fn new(
+        video_codec: VideoCodec,
+        width: u32,
+        height: u32,
+        bitrate_kbps: u32,
+        fps: u32,
+    ) -> Result<Self> {
+        let (hw_list, sw_name) = match video_codec {
+            VideoCodec::H264 => (HW_ENCODERS_H264, "libx264"),
+            VideoCodec::H265 => (HW_ENCODERS_H265, "libx265"),
+            VideoCodec::Vp8 | VideoCodec::Vp9 => {
+                bail!("{video_codec:?} is decode-only here — no native encoder")
+            }
+        };
+
         if width % 2 != 0 || height % 2 != 0 {
-            bail!("H.265 encoder: width and height must be divisible by 2");
+            bail!("{video_codec:?} encoder: width and height must be divisible by 2");
         }
 
         init_ffmpeg();
 
         // Try hardware encoders first — they're 10-50x faster than software.
-        for &(name, label) in HW_ENCODERS {
+        for &(name, label) in hw_list {
             if let Some(codec) = encoder::find_by_name(name) {
-                match Self::try_open_hw(codec, name, width, height, bitrate_kbps, fps) {
+                match Self::try_open_hw(codec, name, video_codec, width, height, bitrate_kbps, fps)
+                {
                     Ok(enc) => {
-                        info!("H.265 encoder: using {} hardware encoder ({})", label, name);
+                        info!("{video_codec:?} encoder: using {label} hardware encoder ({name})");
                         return Ok(enc);
                     }
                     Err(e) => {
-                        info!("H.265 encoder: {} not usable: {}", name, e);
+                        info!("{video_codec:?} encoder: {name} not usable: {e}");
                     }
                 }
             }
         }
 
-        // Fall back to libx265 software encoder.
-        let enc = Self::open_x265(width, height, bitrate_kbps, fps)?;
-        info!("H.265 encoder: using libx265 software encoder");
+        // Fall back to the software encoder.
+        let enc = Self::open_software(sw_name, video_codec, width, height, bitrate_kbps, fps)?;
+        info!("{video_codec:?} encoder: using {sw_name} software encoder");
         Ok(enc)
     }
 
-    /// Try to open a hardware HEVC encoder with low-latency settings.
+    /// Try to open a hardware encoder with low-latency settings.
+    #[allow(clippy::too_many_arguments)]
     fn try_open_hw(
         codec: ffmpeg::Codec,
         name: &str,
+        video_codec: VideoCodec,
         width: u32,
         height: u32,
         bitrate_kbps: u32,
@@ -119,7 +144,7 @@ impl Encoder {
     ) -> Result<Self> {
         // QSV doesn't support YUV420P — it needs NV12 (semi-planar UV).
         // We'll convert I420→NV12 in encode() when this format is used.
-        let formats_to_try = if name == "hevc_qsv" {
+        let formats_to_try = if name.ends_with("_qsv") {
             &[Pixel::NV12][..]
         } else {
             &[Pixel::YUV420P, Pixel::NV12]
@@ -127,7 +152,16 @@ impl Encoder {
 
         let mut last_err = None;
         for &pixel_format in formats_to_try {
-            match Self::try_open_hw_with_format(codec, name, width, height, bitrate_kbps, fps, pixel_format) {
+            match Self::try_open_hw_with_format(
+                codec,
+                name,
+                video_codec,
+                width,
+                height,
+                bitrate_kbps,
+                fps,
+                pixel_format,
+            ) {
                 Ok(enc) => return Ok(enc),
                 Err(e) => last_err = Some(e),
             }
@@ -136,9 +170,11 @@ impl Encoder {
         Err(last_err.unwrap_or_else(|| anyhow!("{}: no compatible pixel format", name)))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn try_open_hw_with_format(
         codec: ffmpeg::Codec,
         name: &str,
+        video_codec: VideoCodec,
         width: u32,
         height: u32,
         bitrate_kbps: u32,
@@ -161,8 +197,10 @@ impl Encoder {
         let mut opts = Dictionary::new();
         set_rate_control_opts(&mut opts, bitrate_kbps, fps);
 
-        match name {
-            "hevc_nvenc" => {
+        // Option names are the same for the h264_* and hevc_* variants of each
+        // vendor's encoder, so match on the vendor suffix.
+        match name.rsplit('_').next().unwrap_or("") {
+            "nvenc" => {
                 opts.set("preset", "p1");           // Fastest NVENC preset
                 opts.set("tune", "ull");             // Ultra low latency
                 opts.set("rc", "cbr");               // Constant bitrate
@@ -170,13 +208,13 @@ impl Encoder {
                 opts.set("zerolatency", "1");
                 opts.set("forced-idr", "1");         // pict_type I → real IDR
             }
-            "hevc_qsv" => {
+            "qsv" => {
                 opts.set("preset", "veryfast");
                 opts.set("async_depth", "1");        // Minimal pipeline depth
                 opts.set("low_power", "1");          // Use LP encode mode if available
                 opts.set("forced_idr", "1");
             }
-            "hevc_amf" => {
+            "amf" => {
                 opts.set("usage", "ultralowlatency");
                 opts.set("quality", "speed");
                 opts.set("rc", "cbr");
@@ -190,6 +228,7 @@ impl Encoder {
 
         Ok(Self {
             encoder,
+            codec: video_codec,
             width,
             height,
             frame_index: 0,
@@ -197,10 +236,18 @@ impl Encoder {
         })
     }
 
-    /// Open the libx265 software encoder with ultrafast + zerolatency settings.
-    fn open_x265(width: u32, height: u32, bitrate_kbps: u32, fps: u32) -> Result<Self> {
-        let codec = encoder::find_by_name("libx265")
-            .ok_or_else(|| anyhow!("libx265 codec not found (is FFmpeg built with x265?)"))?;
+    /// Open the libx264/libx265 software encoder with ultrafast + zerolatency settings.
+    fn open_software(
+        name: &str,
+        video_codec: VideoCodec,
+        width: u32,
+        height: u32,
+        bitrate_kbps: u32,
+        fps: u32,
+    ) -> Result<Self> {
+        let codec = encoder::find_by_name(name).ok_or_else(|| {
+            anyhow!("{name} codec not found (is FFmpeg built with it?)")
+        })?;
 
         let mut encoder = codec::context::Context::new_with_codec(codec)
             .encoder()
@@ -222,16 +269,25 @@ impl Encoder {
         opts.set("forced-idr", "1");
 
         // keyint matches the "g" safety net; the app forces its own IDR every
-        // KEYFRAME_INTERVAL_SECS.
+        // KEYFRAME_INTERVAL_SECS. repeat-headers puts SPS/PPS (and VPS) in front
+        // of every IDR: viewers decode a bare Annex B stream with no out-of-band
+        // parameter sets, and a late joiner must be able to start on any IDR.
         let k = 2 * crate::KEYFRAME_INTERVAL_SECS * fps;
-        let x265_params = format!("scenecut=0:me=dia:subme=0:keyint={k}:min-keyint={k}");
-        opts.set("x265-params", &x265_params);
+        let params = format!(
+            "scenecut=0:me=dia:subme=0:keyint={k}:min-keyint={k}:repeat-headers=1:annexb=1"
+        );
+        match video_codec {
+            VideoCodec::H264 => opts.set("x264-params", &params),
+            _ => opts.set("x265-params", &params),
+        }
 
-        let encoder = encoder.open_with(opts)
-            .context("libx265: failed to open encoder")?;
+        let encoder = encoder
+            .open_with(opts)
+            .with_context(|| format!("{name}: failed to open encoder"))?;
 
         Ok(Self {
             encoder,
+            codec: video_codec,
             width,
             height,
             frame_index: 0,
@@ -251,7 +307,8 @@ impl Encoder {
         let expected_size = (self.width as usize) * (self.height as usize) * 3 / 2;
         if i420_data.len() < expected_size {
             bail!(
-                "H.265 encoder: I420 data too short (got {}, expected {})",
+                "{:?} encoder: I420 data too short (got {}, expected {})",
+                self.codec,
                 i420_data.len(),
                 expected_size
             );
@@ -316,8 +373,9 @@ impl Encoder {
             }
         }
 
-        self.encoder.send_frame(&frame)
-            .context("H.265 encoder: failed to send frame")?;
+        self.encoder
+            .send_frame(&frame)
+            .with_context(|| format!("{:?} encoder: failed to send frame", self.codec))?;
 
         let mut frames = Vec::new();
         let mut packet = ffmpeg::Packet::empty();
@@ -361,7 +419,7 @@ impl Encoder {
 
         self.encoder
             .send_frame(frame)
-            .context("H.265 encoder: failed to send frame")?;
+            .with_context(|| format!("{:?} encoder: failed to send frame", self.codec))?;
 
         let mut frames = Vec::new();
         let mut packet = ffmpeg::Packet::empty();
@@ -389,6 +447,11 @@ impl Encoder {
         self.height
     }
 
+    /// The codec this encoder produces.
+    pub fn codec(&self) -> VideoCodec {
+        self.codec
+    }
+
     /// The pixel format this encoder was opened with (YUV420P or NV12).
     /// Frames passed to `encode_video_frame` must match it.
     pub fn pixel_format(&self) -> Pixel {
@@ -412,60 +475,107 @@ mod tests {
     use super::*;
     use crate::decoder::Decoder;
 
+    /// Both codecs a native client can encode.
+    const NATIVE: [VideoCodec; 2] = [VideoCodec::H264, VideoCodec::H265];
+
     #[test]
     fn encoder_new_valid() {
-        let enc = Encoder::new(640, 480, 1000, 30);
-        assert!(enc.is_ok());
-        let enc = enc.unwrap();
-        assert_eq!(enc.width(), 640);
-        assert_eq!(enc.height(), 480);
+        for codec in NATIVE {
+            let enc = Encoder::new(codec, 640, 480, 1000, 30).unwrap();
+            assert_eq!(enc.width(), 640);
+            assert_eq!(enc.height(), 480);
+            assert_eq!(enc.codec(), codec);
+        }
     }
 
     #[test]
     fn encoder_odd_dimensions_fails() {
-        let enc = Encoder::new(641, 480, 1000, 30);
-        assert!(enc.is_err());
+        assert!(Encoder::new(VideoCodec::H264, 641, 480, 1000, 30).is_err());
+    }
+
+    #[test]
+    fn encoder_rejects_browser_only_codecs() {
+        assert!(Encoder::new(VideoCodec::Vp8, 64, 64, 500, 30).is_err());
+        assert!(Encoder::new(VideoCodec::Vp9, 64, 64, 500, 30).is_err());
     }
 
     #[test]
     fn encoder_encode_gray_frame() {
-        let mut enc = Encoder::new(64, 64, 500, 30).unwrap();
-        // Gray I420 frame: Y=128, U=128, V=128
-        let y_size = 64 * 64;
-        let uv_size = 32 * 32;
-        let i420 = vec![128u8; y_size + 2 * uv_size];
-        let frames = enc.encode(&i420, 0, true).unwrap();
-        assert!(!frames.is_empty());
-        assert!(!frames[0].data.is_empty());
-        assert!(frames[0].is_keyframe);
+        for codec in NATIVE {
+            let mut enc = Encoder::new(codec, 64, 64, 500, 30).unwrap();
+            // Gray I420 frame: Y=128, U=128, V=128
+            let y_size = 64 * 64;
+            let uv_size = 32 * 32;
+            let i420 = vec![128u8; y_size + 2 * uv_size];
+            let frames = enc.encode(&i420, 0, true).unwrap();
+            assert!(!frames.is_empty());
+            assert!(!frames[0].data.is_empty());
+            assert!(frames[0].is_keyframe);
+        }
     }
 
     #[test]
     fn decoder_new() {
-        let dec = Decoder::new();
-        assert!(dec.is_ok());
+        // Every codec a viewer can be asked to decode
+        for codec in [VideoCodec::H264, VideoCodec::H265, VideoCodec::Vp8, VideoCodec::Vp9] {
+            assert!(Decoder::new(codec).is_ok(), "no decoder for {codec:?}");
+        }
     }
 
     #[test]
     fn encode_decode_roundtrip() {
-        let mut enc = Encoder::new(64, 64, 500, 30).unwrap();
-        let y_size = 64 * 64;
-        let uv_size = 32 * 32;
-        let i420 = vec![128u8; y_size + 2 * uv_size];
-        let encoded = enc.encode(&i420, 0, true).unwrap();
-        assert!(!encoded.is_empty());
+        for codec in NATIVE {
+            let mut enc = Encoder::new(codec, 64, 64, 500, 30).unwrap();
+            let y_size = 64 * 64;
+            let uv_size = 32 * 32;
+            let i420 = vec![128u8; y_size + 2 * uv_size];
+            let encoded = enc.encode(&i420, 0, true).unwrap();
+            assert!(!encoded.is_empty());
 
-        let mut dec = Decoder::new().unwrap();
-        let decoded = dec.decode(&encoded[0].data).unwrap();
-        assert!(!decoded.is_empty());
-        assert_eq!(decoded[0].width, 64);
-        assert_eq!(decoded[0].height, 64);
+            let mut dec = Decoder::new(codec).unwrap();
+            let decoded = dec.decode(&encoded[0].data).unwrap();
+            assert!(!decoded.is_empty(), "{codec:?}: no frame decoded");
+            assert_eq!(decoded[0].width, 64);
+            assert_eq!(decoded[0].height, 64);
 
-        // Verify pixel data is not all zeros (black screen regression)
-        let y_plane = &decoded[0].i420_data[..y_size];
-        let avg_y: f64 = y_plane.iter().map(|&b| b as f64).sum::<f64>() / y_size as f64;
-        // Input Y=128, lossy compression should keep it in range ~110-145
-        assert!(avg_y > 100.0 && avg_y < 160.0,
-            "decoded Y average {avg_y} is way off from input 128 — data likely corrupt");
+            // Verify pixel data is not all zeros (black screen regression)
+            let y_plane = &decoded[0].i420_data[..y_size];
+            let avg_y: f64 = y_plane.iter().map(|&b| b as f64).sum::<f64>() / y_size as f64;
+            // Input Y=128, lossy compression should keep it in range ~110-145
+            assert!(avg_y > 100.0 && avg_y < 160.0,
+                "{codec:?}: decoded Y average {avg_y} is way off from input 128 — data likely corrupt");
+        }
+    }
+
+    /// A keyframe must carry its parameter sets: browsers and the native
+    /// decoder alike start from a bare Annex B keyframe with nothing out of band.
+    #[test]
+    fn keyframes_carry_parameter_sets() {
+        for codec in NATIVE {
+            let mut enc = Encoder::new(codec, 64, 64, 500, 30).unwrap();
+            let i420 = vec![128u8; 64 * 64 + 2 * 32 * 32];
+            // Encode a few frames, then force a second IDR
+            let mut key_frames = Vec::new();
+            for pts in 0..5 {
+                for f in enc.encode(&i420, pts, pts == 0 || pts == 4).unwrap() {
+                    if f.is_keyframe {
+                        key_frames.push(f.data);
+                    }
+                }
+            }
+            assert!(key_frames.len() >= 2, "{codec:?}: expected a second forced IDR");
+            // nal type 7 (H.264 SPS) / 33 (HEVC SPS) ahead of the slice data
+            let sps = |data: &[u8]| {
+                data.windows(4).any(|w| {
+                    w[0] == 0 && w[1] == 0 && w[2] == 1 && match codec {
+                        VideoCodec::H264 => w[3] & 0x1f == 7,
+                        _ => (w[3] >> 1) & 0x3f == 33,
+                    }
+                })
+            };
+            for (i, kf) in key_frames.iter().enumerate() {
+                assert!(sps(kf), "{codec:?}: keyframe {i} has no SPS");
+            }
+        }
     }
 }
