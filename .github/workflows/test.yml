@@ -77,7 +77,23 @@ jobs:
             libavutil-dev libswscale-dev libx264-dev libx265-dev \
             libpipewire-0.3-dev libgbm-dev libasound2-dev libturbojpeg0-dev \
             libssl-dev libclang-dev \
-            libnss3-tools   # certutil: the Firefox lane trusts the test CA with it
+            libnss3-tools \
+            pulseaudio pulseaudio-utils
+
+      # certutil (libnss3-tools) is how the Firefox lane trusts the test CA.
+      #
+      # The sink is the other thing Firefox needs and Chrome does not. A runner
+      # has no sound card, and Firefox has no fake audio output to fall back on:
+      # its AudioContext never starts, so it neither captures voice (nothing is
+      # sent, and the peer never even sees "speaking") nor renders any (nothing
+      # to count). Every Firefox lane fails both voice checks while chat and
+      # video pass — reproduced locally by hiding PulseAudio and ALSA, and fixed
+      # by exactly this: a daemon whose only sink is a null one.
+      - name: Audio sink for Firefox
+        run: |
+          pulseaudio --start --exit-idle-time=-1 || pulseaudio --daemonize --exit-idle-time=-1
+          pactl load-module module-null-sink sink_name=voipc-test
+          pactl info   # fails the step here, not six checks later, if none of that worked
 
       - uses: actions/setup-node@v5
         with:

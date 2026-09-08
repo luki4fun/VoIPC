@@ -30,6 +30,14 @@ for b in "$BROWSER_ALICE" "$BROWSER_BOB"; do
       FIREFOX="${FIREFOX:-$(command -v firefox || true)}"
       [ -n "$FIREFOX" ] || { echo "no firefox found (set FIREFOX=...)" >&2; exit 1; }
       command -v certutil >/dev/null || { echo "certutil missing (Arch: nss, Debian: libnss3-tools)" >&2; exit 1; }
+      # Chrome falls back to a fake audio device; Firefox does not. With no
+      # sound server its AudioContext never starts, so it captures nothing and
+      # plays nothing, and the two voice checks fail with played:0 on both
+      # sides for reasons the log never names. A null sink is enough.
+      if command -v pactl >/dev/null 2>&1 && ! pactl info >/dev/null 2>&1; then
+        echo "warning: no PulseAudio server — expect the Firefox voice checks to fail" >&2
+        echo "         (start one with: pulseaudio --start --exit-idle-time=-1)" >&2
+      fi
       ;;
     *) echo "unknown browser '$b' (chromium or firefox)" >&2; exit 1 ;;
   esac
