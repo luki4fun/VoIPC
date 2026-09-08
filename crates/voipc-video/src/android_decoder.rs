@@ -187,6 +187,15 @@ impl Decoder {
         })
     }
 
+    /// The codec this decoder was opened for.
+    ///
+    /// Mirrors the desktop decoder's accessor, which the shared client code
+    /// uses to notice a codec change and rebuild the decoder. It cannot be
+    /// named after the `codec` field here — that one is the MediaCodec handle.
+    pub fn codec(&self) -> VideoCodec {
+        self.video_codec
+    }
+
     /// Decode one encoded frame (Annex B with start codes for H.264/H.265,
     /// raw frames for VP8/VP9).
     ///
