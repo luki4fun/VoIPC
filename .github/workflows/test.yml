@@ -10,7 +10,10 @@ on:
   workflow_call:
 
 concurrency:
-  group: test-${{ github.ref }}
+  # `github.workflow` is the *caller's* name, so the copy the release workflow
+  # calls sits in its own group. Without that, pushing again while a release is
+  # building cancels the release's own test gate and with it the release.
+  group: test-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -55,6 +58,13 @@ jobs:
   browser:
     name: Browser end-to-end
     runs-on: ubuntu-24.04
+    # The image has both, and test-web.sh would pick `chromium` first — but that
+    # one is an unbranded snapshot build (no proprietary codecs), so the browser
+    # sharer quietly falls back to VP9 and no lane exercises the H.264 path that
+    # every viewer, Android included, depends on. Google Chrome is also what the
+    # people running this client actually have.
+    env:
+      CHROME: /usr/bin/google-chrome
     steps:
       - uses: actions/checkout@v5
 
@@ -89,20 +99,23 @@ jobs:
       # wasm + web bundle + the server that embeds it
       - run: npm run web
 
-      # The runner image ships Google Chrome and Firefox; test-web.sh falls back
-      # to google-chrome when there is no `chromium` binary.
-
       # Both engines, and both mixed pairings: a Chromium sharer feeds a Firefox
       # viewer H.264, a Firefox sharer feeds a Chromium viewer VP9.
+      # `!cancelled()` so one red lane does not hide the other three: knowing
+      # whether a failure is engine-specific is most of the diagnosis, and the
+      # job still fails if any lane did.
       - name: Chromium ↔ Chromium
         run: ./test-web.sh
         env: { BROWSER: chromium }
       - name: Firefox ↔ Firefox
+        if: ${{ !cancelled() }}
         run: ./test-web.sh
         env: { BROWSER: firefox }
       - name: Chromium shares, Firefox watches
+        if: ${{ !cancelled() }}
         run: ./test-web.sh
         env: { BROWSER_ALICE: chromium, BROWSER_BOB: firefox }
       - name: Firefox shares, Chromium watches
+        if: ${{ !cancelled() }}
         run: ./test-web.sh
         env: { BROWSER_ALICE: firefox, BROWSER_BOB: chromium }

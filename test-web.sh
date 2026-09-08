@@ -105,7 +105,21 @@ EOF
 # alice also shares her (synthetic) screen; bob watches it
 run_browser alice talker "&channel=e2e&dm=bob&admin=e2e-admin&kick=bob&share=1" \
   "$WORK/alice.log" "$BROWSER_ALICE"
-sleep 1
+# Not a fixed stagger: the run asserts that a message alice sent *before* bob
+# arrived reaches him as channel history, so the harness has to make "before"
+# true. `sleep 1` did not. On a cold CI runner alice's browser is the first
+# Chromium to start and pays for it, while bob's, launched a second later, finds
+# the binary in the page cache and can reach create_channel first — then bob owns
+# the channel, alice is the late joiner who gets the empty history, and the only
+# check that fails is the one that names neither cause ("bob joined via the
+# invite link" passes on a channel he created himself).
+# alice logs early-chat-sent once her message is in her own history.
+for _ in $(seq 1 300); do
+  if grep -q 'SELFTEST early-chat-sent' "$WORK/alice.log"; then break; fi
+  sleep 0.1
+done
+grep -q 'SELFTEST early-chat-sent' "$WORK/alice.log" ||
+  echo "warning: alice never reported her first message — bob starts anyway, expect a history failure"
 run_browser bob listener "&dm=alice&expect_kick=1&watch=1#channel=e2e" \
   "$WORK/bob.log" "$BROWSER_BOB"
 
@@ -124,8 +138,9 @@ echo "--- alice"; cat "$WORK/alice.txt"
 echo "--- bob";   cat "$WORK/bob.txt"
 
 fail=0
+: > "$WORK/fails.txt"
 check() { # description file pattern
-  if grep -q "$3" "$2"; then echo "PASS $1"; else echo "FAIL $1"; fail=1; fi
+  if grep -q "$3" "$2"; then echo "PASS $1"; else echo "FAIL $1" | tee -a "$WORK/fails.txt"; fail=1; fi
 }
 check "alice connected"                 "$WORK/alice.txt" 'SELFTEST connected'
 check "bob connected"                   "$WORK/bob.txt"   'SELFTEST connected'
@@ -138,7 +153,10 @@ check "bob read alice's channel message" "$WORK/bob.txt"  'channel-chat-message.
 check "alice read bob's channel message" "$WORK/alice.txt" 'channel-chat-message.*hello from bob'
 check "bob read alice's DM"             "$WORK/bob.txt"   'direct-chat-message.*dm from alice'
 check "alice read bob's DM"             "$WORK/alice.txt" 'direct-chat-message.*dm from bob'
-check "bob joined via the invite link"  "$WORK/bob.txt"   'channel-requested.*"source":"invite"'
+# "existing":true is the half that matters: a bob who *created* the channel
+# because he beat alice to it also logs source":"invite", and then quietly fails
+# the history check three lines down instead of this one.
+check "bob joined via the invite link"  "$WORK/bob.txt"   'channel-requested.*"existing":true.*"source":"invite"'
 check "bob received channel history"    "$WORK/bob.txt"   'channel-history-received.*early from alice'
 check "alice became admin"              "$WORK/alice.txt" 'admin-status.*"is_admin":true'
 check "bob was kicked by the admin"     "$WORK/bob.txt"   'server-disconnected.*kicked from this server'
@@ -148,12 +166,28 @@ check "bob watched the share"           "$WORK/bob.txt"   'watching-screenshare'
 check "bob decoded video frames"        "$WORK/bob.txt"   'screenshare-stats.*"frames_recv":[1-9]'
 check "bob drew a frame on the canvas"  "$WORK/bob.txt"   'screenshare-stats.*"frames_drawn":[1-9]'
 if grep -q 'screenshare-error' "$WORK/alice.txt" "$WORK/bob.txt"; then
-  echo "FAIL screen share error reported:"; grep -h 'screenshare-error' "$WORK/alice.txt" "$WORK/bob.txt"; fail=1
+  echo "FAIL screen share error reported:" | tee -a "$WORK/fails.txt"
+  grep -h 'screenshare-error' "$WORK/alice.txt" "$WORK/bob.txt" | tee -a "$WORK/fails.txt"; fail=1
 fi
 # bob's connection loss is the kick; alice must stay connected until she leaves
 if grep -q 'SELFTEST error' "$WORK/alice.txt" "$WORK/bob.txt" || grep -q 'connection-lost' "$WORK/alice.txt"; then
-  echo "FAIL errors/connection loss reported:"; grep -h 'connection-lost\|SELFTEST error' "$WORK/alice.txt" "$WORK/bob.txt"; fail=1
+  echo "FAIL errors/connection loss reported:" | tee -a "$WORK/fails.txt"
+  grep -h 'connection-lost\|SELFTEST error' "$WORK/alice.txt" "$WORK/bob.txt" | tee -a "$WORK/fails.txt"; fail=1
 fi
 
 echo "--- server log tail"; tail -20 "$WORK/server.log"
+
+# Everything above is in the job log, and reading that log needs admin rights on
+# the repository — a run's *annotations* need none. Repeat the failure into one
+# so it can be read back from
+# /repos/:owner/:repo/check-runs/:id/annotations without a token.
+if [ "$fail" -ne 0 ] && [ -n "${GITHUB_ACTIONS:-}" ]; then
+  {
+    cat "$WORK/fails.txt"
+    echo "--- alice"; tail -20 "$WORK/alice.txt"
+    echo "--- bob";   tail -20 "$WORK/bob.txt"
+  } | head -c 3000 > "$WORK/detail.txt"
+  printf '::error title=test-web %s -> %s::%s\n' "$BROWSER_ALICE" "$BROWSER_BOB" \
+    "$(awk '{ gsub(/%/, "%25"); gsub(/\r/, "%0D"); printf "%s%%0A", $0 }' "$WORK/detail.txt")"
+fi
 exit $fail

@@ -51,8 +51,15 @@ function fakeDisplayCapture(fps: number): void {
   navigator.mediaDevices.getDisplayMedia = async () => stream;
 }
 
+// Wall clock, not a page-relative one: the two sides run in separate browsers
+// and the only interesting question about a failed run is the order of events
+// *between* them ("did alice send before bob asked?"). The suffix goes last so
+// the checks in test-web.sh, which match on the message and its payload, are
+// unaffected — as is Firefox's `", source: …"` tail, stripped by the same sed.
 function log(line: string, data?: unknown) {
-  console.log(`SELFTEST ${line}${data === undefined ? "" : " " + JSON.stringify(data, (_k, v) => (typeof v === "bigint" ? Number(v) : v))}`);
+  console.log(
+    `SELFTEST ${line}${data === undefined ? "" : " " + JSON.stringify(data, (_k, v) => (typeof v === "bigint" ? Number(v) : v))} @${Date.now()}`,
+  );
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -182,16 +189,26 @@ export async function run(params: URLSearchParams): Promise<void> {
   // its first tick: a peer that joins in between asks for the channel history
   // straight away, and she can only hand over what she already has.
   if (role === "talker") {
-    for (let i = 0; i < 40 && joinedChannelId === 0; i++) {
+    // No fixed budget: test-web.sh holds the second browser until the line
+    // below appears, so taking longer here costs time but never correctness.
+    for (let i = 0; i < 200 && joinedChannelId === 0; i++) {
       await sleep(50);
       const me = users.get(myUserId);
       if (me && me.channel_id !== 0) joinedChannelId = me.channel_id;
     }
-    if (joinedChannelId !== 0) {
+    if (joinedChannelId === 0) {
+      log("error", { message: "no channel after 10s, skipping the early message" });
+    } else {
       earlySent = true;
+      const early = `early from ${name}`;
+      const inHistory = () => channelHistory.some((m) => m.content === early);
       try {
-        await invoke("send_channel_message", { content: `early from ${name}` });
-        log("early-chat-sent");
+        await invoke("send_channel_message", { content: early });
+        // "Sent" is not the state the next peer depends on: the message reaches
+        // channelHistory — the list handed to a newcomer — only when the server
+        // echoes it back. Log the line the harness waits for once it is there.
+        for (let i = 0; i < 100 && !inHistory(); i++) await sleep(50);
+        log("early-chat-sent", { in_history: inHistory() });
       } catch (e) {
         log("error", { message: `early chat: ${String(e)}` });
       }
@@ -314,9 +331,21 @@ export async function run(params: URLSearchParams): Promise<void> {
     if (doShare) await invoke("stop_screen_share").catch(() => {});
   }
 
+  // "My measurements are in." The two browsers do not start together — the
+  // harness holds the second one until the first has its message in the channel
+  // history — so the admin cannot assume the other side is as far along as she
+  // is. Without this the kick lands mid-run and the kicked side never reports
+  // its voice and video stats.
+  await invoke("send_channel_message", { content: `wrap-up from ${name}` }).catch(() => {});
+  log("wrap-up-sent");
+
   // Wrap-up: moderation
   if (adminToken && kickTarget) {
-    await sleep(2500); // let the other side finish its own wrap-up first
+    const peerWrapped = () =>
+      channelHistory.some((m) => m.username === kickTarget && m.content === `wrap-up from ${kickTarget}`);
+    for (let i = 0; i < 400 && !peerWrapped(); i++) await sleep(50);
+    log("peer-wrap-up", { seen: peerWrapped() });
+    await sleep(500);
     try {
       await invoke("admin_login", { token: adminToken });
       for (let i = 0; i < 50 && !isAdmin; i++) await sleep(100);
