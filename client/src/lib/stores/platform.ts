@@ -1,6 +1,7 @@
 import { writable } from 'svelte/store';
 import { invoke } from '@tauri-apps/api/core';
 import { addNotification } from './notifications';
+import { setSelfDeafened, setSelfMuted } from './connection';
 
 /** true in the browser build (web client), false in the Tauri app (desktop/Android). */
 export const isWeb: boolean = __WEB__;
@@ -47,14 +48,16 @@ if (typeof window !== 'undefined') {
       invoke('disconnect').catch(() => {});
     };
 
-    // Notification action: toggle mute
+    // Notification actions: toggle mute / deafen. The result has to be fed back
+    // into the stores — the button and our own row in the member list both read
+    // them, and nothing else in the app learns about a toggle made from the
+    // notification shade.
     (window as any).__voipc_toggle_mute = () => {
-      invoke('toggle_mute').catch(() => {});
+      invoke<boolean>('toggle_mute').then(setSelfMuted).catch(() => {});
     };
 
-    // Notification action: toggle deafen
     (window as any).__voipc_toggle_deafen = () => {
-      invoke('toggle_deafen').catch(() => {});
+      invoke<boolean>('toggle_deafen').then(setSelfDeafened).catch(() => {});
     };
 
     // Permission denial feedback from MainActivity

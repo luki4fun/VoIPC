@@ -32,6 +32,47 @@ pub struct ChannelEntry {
     /// Positional audio mode: "off" (default), "2d" or "3d".
     #[serde(default)]
     pub proximity: ProximityMode,
+
+    /// Keep the channel out of the sidebar for non-admins. It can still be
+    /// joined by id, so invite links and the game SDK keep working.
+    #[serde(default)]
+    pub hidden: bool,
+
+    /// Members see each other under a random pseudonym; admins see the real
+    /// names. Chat history is not handed over in such a channel.
+    #[serde(default)]
+    pub anonymous: bool,
+
+    /// Whether screen sharing is allowed here (default: yes).
+    #[serde(default = "default_true")]
+    pub screen_share: bool,
+
+    /// Hide the member list from non-admins; they still see whoever speaks.
+    #[serde(default)]
+    pub hide_members: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for ChannelEntry {
+    /// A plain public channel. Tests build on this so a new option does not
+    /// have to be added to a dozen literals.
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            description: String::new(),
+            password: None,
+            password_hash: None,
+            max_users: 0,
+            proximity: ProximityMode::Off,
+            hidden: false,
+            anonymous: false,
+            screen_share: true,
+            hide_members: false,
+        }
+    }
 }
 
 /// Hash a plaintext password to `"sha256:<64 hex chars>"`.
@@ -161,6 +202,7 @@ mod tests {
             password_hash: None,
             max_users: 0,
             proximity: ProximityMode::Off,
+            ..Default::default()
         }];
         assert!(validate_entries(&entries).is_err());
     }
@@ -174,6 +216,7 @@ mod tests {
             password_hash: None,
             max_users: 0,
             proximity: ProximityMode::Off,
+            ..Default::default()
         }];
         assert!(validate_entries(&entries).is_err());
     }
@@ -188,6 +231,7 @@ mod tests {
                 password_hash: None,
                 max_users: 0,
                 proximity: ProximityMode::Off,
+                ..Default::default()
             },
             ChannelEntry {
                 name: "music".into(),
@@ -196,6 +240,7 @@ mod tests {
                 password_hash: None,
                 max_users: 0,
                 proximity: ProximityMode::Off,
+                ..Default::default()
             },
         ];
         assert!(validate_entries(&entries).is_err());
@@ -210,6 +255,7 @@ mod tests {
             password_hash: Some("sha256:abc".into()),
             max_users: 0,
             proximity: ProximityMode::Off,
+            ..Default::default()
         }];
         assert!(validate_entries(&entries).is_err());
     }
@@ -224,6 +270,7 @@ mod tests {
                 password_hash: None,
                 max_users: 10,
                 proximity: ProximityMode::TwoD,
+                ..Default::default()
             },
             ChannelEntry {
                 name: "AFK".into(),
@@ -232,6 +279,7 @@ mod tests {
                 password_hash: Some(hash_password("test")),
                 max_users: 0,
                 proximity: ProximityMode::Off,
+                ..Default::default()
             },
         ];
         assert!(validate_entries(&entries).is_ok());
@@ -246,6 +294,7 @@ mod tests {
             password_hash: None,
             max_users: 0,
             proximity: ProximityMode::Off,
+            ..Default::default()
         }];
         let changed = hash_plaintext_passwords(&mut entries);
         assert!(changed);
@@ -267,6 +316,7 @@ mod tests {
             password_hash: Some(hash.clone()),
             max_users: 0,
             proximity: ProximityMode::Off,
+            ..Default::default()
         }];
         let changed = hash_plaintext_passwords(&mut entries);
         assert!(!changed);
@@ -282,6 +332,7 @@ mod tests {
             password_hash: Some("md5:abcdef".into()),
             max_users: 0,
             proximity: ProximityMode::Off,
+            ..Default::default()
         }];
         assert!(validate_entries(&entries).is_err());
     }
@@ -304,9 +355,25 @@ mod tests {
     }
 
     #[test]
-    fn proximity_survives_the_password_rewrite() {
+    fn channel_options_load_and_default() {
+        let entries: Vec<ChannelEntry> = serde_json::from_str(
+            r#"[{"name":"Ingame","proximity":"3d","hidden":true,"anonymous":true,
+                 "screen_share":false,"hide_members":true},
+                {"name":"Music"}]"#,
+        )
+        .unwrap();
+        assert!(entries[0].hidden && entries[0].anonymous && entries[0].hide_members);
+        assert!(!entries[0].screen_share);
+        // A file written before these options existed must give a plain room
+        // that still allows sharing
+        assert!(!entries[1].hidden && !entries[1].anonymous && !entries[1].hide_members);
+        assert!(entries[1].screen_share);
+    }
+
+    #[test]
+    fn options_survive_the_password_rewrite() {
         // hash_plaintext_passwords + atomic_rewrite serialize through ChannelEntry,
-        // so a mode set in the file must still be there afterwards.
+        // so everything set in the file must still be there afterwards.
         let mut entries = vec![ChannelEntry {
             name: "Ingame".into(),
             description: String::new(),
@@ -314,10 +381,16 @@ mod tests {
             password_hash: None,
             max_users: 0,
             proximity: ProximityMode::TwoD,
+            hidden: true,
+            anonymous: true,
+            screen_share: false,
+            hide_members: true,
         }];
         assert!(hash_plaintext_passwords(&mut entries));
         let json = serde_json::to_string(&entries).unwrap();
         let back: Vec<ChannelEntry> = serde_json::from_str(&json).unwrap();
         assert_eq!(back[0].proximity, ProximityMode::TwoD);
+        assert!(back[0].hidden && back[0].anonymous && back[0].hide_members);
+        assert!(!back[0].screen_share, "sharing must stay switched off");
     }
 }

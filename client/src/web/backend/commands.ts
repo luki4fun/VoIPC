@@ -118,13 +118,18 @@ const handlers: Record<string, Handler> = {
     s.clearWatching();
     s.sendControl({ JoinChannel: { channel_id: channel, password: optStr(password, "password") } });
   },
-  create_channel: ({ name, password, proximity }) => {
+  create_channel: ({ name, password, proximity, anonymous }) => {
     const channelName = str(name, "name");
     if (channelName.length === 0 || byteLength(channelName) > 128) fail("channel name must be 1-128 characters");
     const pw = optStr(password, "password");
     if (pw !== null && byteLength(pw) > 128) fail("password too long");
     need().sendControl({
-      CreateChannel: { name: channelName, password: pw, proximity: proximityMode(proximity) },
+      CreateChannel: {
+        name: channelName,
+        password: pw,
+        proximity: proximityMode(proximity),
+        anonymous: anonymous == null ? false : bool(anonymous, "anonymous"),
+      },
     });
   },
   set_channel_password: ({ channelId, password }) =>
@@ -138,6 +143,19 @@ const handlers: Record<string, Handler> = {
         proximity: proximityMode(proximity),
       },
     }),
+  // null leaves an option as it is, so the dialog only sends what changed
+  set_channel_options: ({ channelId, hidden, anonymous, screenShare, hideMembers }) => {
+    const flag = (v: unknown, name: string) => (v == null ? null : bool(v, name));
+    need().sendControl({
+      SetChannelOptions: {
+        channel_id: u32(channelId, "channelId"),
+        hidden: flag(hidden, "hidden"),
+        anonymous: flag(anonymous, "anonymous"),
+        screen_share: flag(screenShare, "screenShare"),
+        hide_members: flag(hideMembers, "hideMembers"),
+      },
+    });
+  },
   kick_user: ({ channelId, userId }) =>
     need().sendControl({ KickUser: { channel_id: u32(channelId, "channelId"), user_id: u32(userId, "userId") } }),
   request_channel_users: ({ channelId }) =>

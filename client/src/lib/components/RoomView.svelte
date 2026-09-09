@@ -8,7 +8,7 @@
 
   import { invoke } from "@tauri-apps/api/core";
   import { users, speakingUsers } from "../stores/users.js";
-  import { userId } from "../stores/connection.js";
+  import { isAdmin, userId } from "../stores/connection.js";
   import { channels, currentChannelId } from "../stores/channels.js";
   import { addNotification } from "../stores/notifications.js";
   import { avatarColor } from "../avatar.js";
@@ -39,13 +39,21 @@
   const is3d = $derived($currentProximity === "3d");
   const locked = $derived($drivenBy !== null);
 
-  /** Everyone in the channel, own user first so it draws on top. */
+  /**
+   * Everyone the room may show. A channel that hides its members hides them
+   * here too — otherwise the plan would name everyone the list does not.
+   */
+  const roomUsers = $derived(
+    $channels.find((c) => c.channel_id === $currentChannelId)?.hide_members && !$isAdmin
+      ? $users.filter((u) => u.user_id === $userId)
+      : $users,
+  );
   const placed = $derived(
-    $users
+    roomUsers
       .map((u) => ({ user: u, at: $positions.get(u.user_id) ?? null }))
       .filter((e) => e.at !== null) as { user: (typeof $users)[number]; at: Point }[],
   );
-  const unplaced = $derived($users.filter((u) => !$positions.has(u.user_id)));
+  const unplaced = $derived(roomUsers.filter((u) => !$positions.has(u.user_id)));
 
   function canDrag(id: number): boolean {
     if (locked) return false;

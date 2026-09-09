@@ -9,6 +9,7 @@
   import { isAdmin } from "../stores/connection.js";
   import Icon from "./Icons.svelte";
   import type { ProximityMode } from "../spatial.js";
+  import type { ChannelInfo } from "../types.js";
 
   let currentChannelName = $derived(
     $channels.find((c) => c.channel_id === $currentChannelId)?.name ?? ""
@@ -39,6 +40,14 @@
   let newChannelName = $state("");
   let newChannelPassword = $state("");
   let newChannelProximity = $state<ProximityMode>("off");
+  let newChannelAnonymous = $state(false);
+
+  // A hidden channel is not listed, unless you are an admin or standing in it
+  let visibleChannels = $derived(
+    $channels.filter(
+      (c) => !c.hidden || $isAdmin || c.channel_id === $currentChannelId,
+    ),
+  );
 
   // Password prompt state (for joining)
   let passwordPromptChannelId = $state<number | null>(null);
@@ -116,6 +125,7 @@
         name,
         password: newChannelPassword || null,
         proximity: newChannelProximity,
+        anonymous: newChannelAnonymous,
       });
       if (newChannelPassword) {
         const pw = newChannelPassword;
@@ -124,6 +134,7 @@
       newChannelName = "";
       newChannelPassword = "";
       newChannelProximity = "off";
+      newChannelAnonymous = false;
       showCreateForm = false;
     } catch (e) {
       console.error("Failed to create channel:", e);
@@ -135,6 +146,7 @@
     newChannelName = "";
     newChannelPassword = "";
     newChannelProximity = "off";
+    newChannelAnonymous = false;
     showCreateForm = false;
   }
 
@@ -151,6 +163,12 @@
   let passwordEditHasPassword = $state(false);
   /** Explicit "remove the password" choice; an empty field alone means "leave it". */
   let passwordEditRemove = $state(false);
+  // The other options, seeded from the channel so only real changes are sent
+  let settingsHidden = $state(false);
+  let settingsAnonymous = $state(false);
+  let settingsScreenShare = $state(true);
+  let settingsHideMembers = $state(false);
+  let settingsBefore: ChannelInfo | null = null;
 
   function openPasswordEdit(channelId: number, e: Event) {
     e.stopPropagation();
@@ -161,6 +179,11 @@
     passwordEditRemove = false;
     passwordEditHasPassword = channel?.has_password ?? false;
     settingsProximity = channel?.proximity ?? "off";
+    settingsHidden = channel?.hidden ?? false;
+    settingsAnonymous = channel?.anonymous ?? false;
+    settingsScreenShare = channel?.screen_share ?? true;
+    settingsHideMembers = channel?.hide_members ?? false;
+    settingsBefore = channel ?? null;
   }
 
   async function submitPasswordEdit() {
@@ -187,6 +210,24 @@
       }
       if (settingsProximity !== before) {
         await invoke("set_channel_proximity", { channelId, proximity: settingsProximity });
+      }
+      // Only what actually changed; null leaves an option alone
+      const was = settingsBefore;
+      const changed = <T>(now: T, then: T | undefined) => (now === then ? null : now);
+      if (
+        was &&
+        (settingsHidden !== was.hidden ||
+          settingsAnonymous !== was.anonymous ||
+          settingsScreenShare !== was.screen_share ||
+          settingsHideMembers !== was.hide_members)
+      ) {
+        await invoke("set_channel_options", {
+          channelId,
+          hidden: changed(settingsHidden, was.hidden),
+          anonymous: changed(settingsAnonymous, was.anonymous),
+          screenShare: changed(settingsScreenShare, was.screen_share),
+          hideMembers: changed(settingsHideMembers, was.hide_members),
+        });
       }
       passwordEditChannelId = null;
       passwordEditInput = "";
@@ -242,6 +283,10 @@
           <option value="3d">3D — height counts too</option>
         </select>
       </label>
+      <label class="dialog-check">
+        <input type="checkbox" bind:checked={newChannelAnonymous} />
+        Anonymous (everyone gets a random name)
+      </label>
       <div class="create-actions">
         <button class="create-btn" type="submit">Create</button>
         <button class="cancel-btn" type="button" onclick={cancelCreate}>Cancel</button>
@@ -250,7 +295,7 @@
   {/if}
 
   <div class="channels">
-    {#each $channels as channel (channel.channel_id)}
+    {#each visibleChannels as channel (channel.channel_id)}
       <button
         class="channel"
         class:active={channel.channel_id === $currentChannelId}
@@ -278,7 +323,15 @@
             {channel.proximity.toUpperCase()}
           </span>
         {/if}
-        <span class="user-count">({channel.user_count}{#if channel.max_users > 0}/{channel.max_users}{/if})</span>
+        {#if channel.anonymous}
+          <span class="proximity-tag" title="Anonymous: members see each other under random names">?</span>
+        {/if}
+        {#if channel.hidden}
+          <span class="proximity-tag" title="Hidden: only admins see this channel in the list">H</span>
+        {/if}
+        {#if !(channel.hide_members && !$isAdmin)}
+          <span class="user-count">({channel.user_count}{#if channel.max_users > 0}/{channel.max_users}{/if})</span>
+        {/if}
         {#if ($unreadPerChannel.get(channel.name) ?? 0) > 0}
           <span class="channel-unread">{$unreadPerChannel.get(channel.name)}</span>
         {/if}
@@ -393,6 +446,22 @@
           <option value="2d">2D — on a floor plan</option>
           <option value="3d">3D — height counts too</option>
         </select>
+      </label>
+      <label class="dialog-check">
+        <input type="checkbox" bind:checked={settingsHidden} />
+        Hidden — not listed for anyone but admins
+      </label>
+      <label class="dialog-check">
+        <input type="checkbox" bind:checked={settingsAnonymous} />
+        Anonymous — random names instead of real ones
+      </label>
+      <label class="dialog-check">
+        <input type="checkbox" bind:checked={settingsHideMembers} />
+        Hide members — non-admins see only who is speaking
+      </label>
+      <label class="dialog-check">
+        <input type="checkbox" bind:checked={settingsScreenShare} />
+        Allow screen sharing
       </label>
       <div class="dialog-actions">
         <button class="create-btn" type="submit">Save</button>
@@ -519,6 +588,11 @@
     text-align: left;
     font-size: 14px;
     border-radius: 4px;
+    /* Joining is a double click. Without this the page is zoomable, so a
+       double tap on a touchscreen is double-tap-to-zoom and the browser never
+       delivers dblclick — which made it impossible to join a channel on
+       Android at all. */
+    touch-action: manipulation;
   }
 
   .channel:hover {

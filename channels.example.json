@@ -15,6 +15,15 @@
     "proximity": "2d"
   },
   {
+    "name": "Ingame",
+    "description": "Driven by the game SDK — see docs/SDK.md",
+    "proximity": "3d",
+    "hidden": true,
+    "anonymous": true,
+    "screen_share": false,
+    "hide_members": true
+  },
+  {
     "name": "Private",
     "description": "Password-protected room",
     "password": "secret123",

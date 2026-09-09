@@ -6,7 +6,7 @@ use std::sync::Arc;
 use ring::aead::LessSafeKey;
 use tokio::sync::{mpsc, RwLock};
 
-use voipc_audio::spatial::{Gains, Listener, Source};
+use voipc_audio::spatial::{Effect, Gains, Listener, Source};
 use voipc_crypto::media_keys::MediaKey;
 use voipc_crypto::stores::SignalStores;
 use voipc_protocol::types::*;
@@ -64,6 +64,24 @@ pub struct AppState {
     /// `get_sdk_status` reads it, so Settings opened after the game connected
     /// still shows it (the `sdk-status` event alone would have been missed).
     pub sdk_game: Arc<std::sync::Mutex<Option<String>>>,
+    /// Fan-out to every open SDK socket. It lives here rather than on the
+    /// connection because the listener outlives connections: a socket
+    /// subscribes once and keeps receiving across a reconnect.
+    pub sdk_events: tokio::sync::broadcast::Sender<SdkEvent>,
+    /// Why the SDK listener could not bind, for Settings; None while it listens.
+    pub sdk_listen_error: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// What the game SDK pushes to a connected mod, fanned out from wherever it
+/// happens: the datagram receiver, the capture task, the mute toggles.
+#[derive(Debug, Clone)]
+pub enum SdkEvent {
+    Talk { user_id: UserId, speaking: bool },
+    Muted { user_id: UserId, muted: bool },
+    Deafened { user_id: UserId, deafened: bool },
+    /// The server refused something (a channel join, most importantly), so a
+    /// mod waiting for its `hello` to complete learns why.
+    ChannelError(String),
 }
 
 impl AppState {
@@ -82,7 +100,15 @@ impl AppState {
             mic_test_active: Arc::new(AtomicBool::new(false)),
             input_gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
             sdk_game: Arc::new(std::sync::Mutex::new(None)),
+            // Enough for a burst of talk edges; a lagging socket skips ahead
+            sdk_events: tokio::sync::broadcast::channel(64).0,
+            sdk_listen_error: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    /// Publish to the SDK sockets. Nobody listening is the normal case.
+    pub fn sdk_event(&self, event: SdkEvent) {
+        let _ = self.sdk_events.send(event);
     }
 }
 
@@ -286,6 +312,96 @@ pub struct ActiveConnection {
     pub position_sequence: Arc<AtomicU32>,
 }
 
+/// Longest glide between two SDK updates: later than this is a stall, not
+/// motion, so the source waits where it is instead of crawling.
+pub const MAX_GLIDE: std::time::Duration = std::time::Duration::from_millis(250);
+pub const MIN_GLIDE: std::time::Duration = std::time::Duration::from_millis(20);
+/// Further than this in one update is a teleport (respawn, warp), not a walk.
+/// A car at 50 m/s covers 12.5 m per 4 Hz tick, so the bar is deliberately high.
+pub const TELEPORT_M: f32 = 50.0;
+
+/// A placement on its way from where the game last had it to where it is now.
+///
+/// Updates arrive 4–10 times a second; rendered as they come, the pan and the
+/// volume step at that rate. The mixer reads the interpolated pose instead, so
+/// a 4 Hz mod sounds continuous. Room drags and position beacons do not use
+/// this — they snap, as they always did.
+#[derive(Debug, Clone, Copy)]
+pub struct Motion {
+    pub from: [f32; 3],
+    pub to: [f32; 3],
+    /// Facing at both ends; only the listener turns.
+    pub fwd: Option<([f32; 2], [f32; 2])>,
+    pub at: std::time::Instant,
+    pub over: std::time::Duration,
+}
+
+impl Motion {
+    pub fn snap(pos: [f32; 3], now: std::time::Instant) -> Self {
+        Self {
+            from: pos,
+            to: pos,
+            fwd: None,
+            at: now,
+            over: std::time::Duration::ZERO,
+        }
+    }
+
+    /// Glide on from wherever `prev` is right now: an update that arrives
+    /// mid-flight must not jump back to the previous start.
+    pub fn glide(
+        prev: &Motion,
+        to: [f32; 3],
+        over: std::time::Duration,
+        now: std::time::Instant,
+    ) -> Self {
+        let from = prev.pos_at(now);
+        let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
+        if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() > TELEPORT_M {
+            return Self::snap(to, now);
+        }
+        Self {
+            from,
+            to,
+            fwd: None,
+            at: now,
+            over,
+        }
+    }
+
+    fn t(&self, now: std::time::Instant) -> f32 {
+        if self.over.is_zero() {
+            return 1.0;
+        }
+        (now.saturating_duration_since(self.at).as_secs_f32() / self.over.as_secs_f32()).min(1.0)
+    }
+
+    pub fn pos_at(&self, now: std::time::Instant) -> [f32; 3] {
+        let t = self.t(now);
+        [
+            self.from[0] + (self.to[0] - self.from[0]) * t,
+            self.from[1] + (self.to[1] - self.from[1]) * t,
+            self.from[2] + (self.to[2] - self.from[2]) * t,
+        ]
+    }
+
+    /// Lerp and renormalise. An exact U-turn passes through zero length, which
+    /// has no direction, so it faces the new way instead.
+    pub fn fwd_at(&self, now: std::time::Instant) -> [f32; 2] {
+        let Some((a, b)) = self.fwd else {
+            return [0.0, 1.0];
+        };
+        let t = self.t(now);
+        let v = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+        let len = (v[0] * v[0] + v[1] * v[1]).sqrt();
+        if len > 1e-3 {
+            [v[0] / len, v[1] / len]
+        } else {
+            b
+        }
+    }
+}
+
 /// Everything the mixer needs to render voices positionally.
 ///
 /// Positions are local state: the room UI and the game SDK both write here,
@@ -301,6 +417,10 @@ pub struct SpatialState {
     /// A game is driving positions. Members it does not list are silent
     /// (distance culling), and the room view stops accepting drags.
     pub sdk_active: bool,
+    /// The channel the game said hello for. Leaving it must disarm the SDK:
+    /// its player ids belong to that room, and culling by them everywhere else
+    /// would silence the whole channel we moved to.
+    pub sdk_channel: Option<ChannelId>,
     /// Broadcasting our own position, and accepting the other members'.
     pub sync: bool,
     /// Our position moved since the last beacon. The beacon task sends at most
@@ -313,6 +433,12 @@ pub struct SpatialState {
     pub sources: HashMap<u32, Source>,
     /// The settings panel's spatial test, while it runs.
     pub test: Option<SpatialTest>,
+    /// Glides for the SDK's placements, keyed like `sources`. A source without
+    /// one renders where `sources` says it is.
+    pub motion: HashMap<u32, Motion>,
+    pub listener_motion: Option<Motion>,
+    /// When the last SDK update arrived, for the observed update rate.
+    pub last_update: Option<std::time::Instant>,
 }
 
 /// A synthetic voice orbiting the listener, mixed by `voice_mixer_task` like
@@ -367,11 +493,15 @@ impl Default for SpatialState {
             enabled: true,
             screen_audio_spatial: true,
             sdk_active: false,
+            sdk_channel: None,
             sync: false,
             dirty: false,
             listener: Listener::default(),
             sources: HashMap::new(),
             test: None,
+            motion: HashMap::new(),
+            listener_motion: None,
+            last_update: None,
         }
     }
 }
@@ -382,13 +512,34 @@ impl SpatialState {
         self.mode != ProximityMode::Off && self.enabled
     }
 
-    /// Gains for one mixer source key (voice or screen audio).
-    pub fn gains_for(&self, key: u32, screen_audio: bool) -> Gains {
+    /// Gains for one mixer source key (voice or screen audio), as of `now`.
+    ///
+    /// The single place a glide is read: the SDK's targets stay in `sources`
+    /// and `listener`, so every other writer (room drags, position beacons)
+    /// keeps snapping the way it always did.
+    pub fn gains_for(&self, key: u32, screen_audio: bool, now: std::time::Instant) -> Gains {
         if !self.active() || (screen_audio && !self.screen_audio_spatial) {
             return voipc_audio::spatial::FLAT;
         }
         match self.sources.get(&key) {
-            Some(src) => voipc_audio::spatial::gains(self.mode, &self.listener, Some(src)),
+            Some(src) => {
+                let listener = match &self.listener_motion {
+                    Some(m) => Listener {
+                        pos: m.pos_at(now),
+                        fwd: m.fwd_at(now),
+                    },
+                    None => self.listener,
+                };
+                let placed = match self.motion.get(&key) {
+                    // A direct source has no position to interpolate
+                    Some(m) if !src.direct => Source {
+                        pos: m.pos_at(now),
+                        ..*src
+                    },
+                    _ => *src,
+                };
+                voipc_audio::spatial::gains(self.mode, &listener, Some(&placed))
+            }
             // A game lists everyone who should be audible; anyone else is out
             // of range. Without a game, an unplaced user just sounds flat.
             None if self.sdk_active => Gains { l: 0.0, r: 0.0, lp_a: 1.0 },
@@ -396,11 +547,21 @@ impl SpatialState {
         }
     }
 
+    /// The effect chain a source is rendered through. Not gated on `active()`:
+    /// a radio is a radio whether or not the channel is positional.
+    pub fn effect_for(&self, key: u32) -> Effect {
+        self.sources.get(&key).map_or(Effect::None, |s| s.fx)
+    }
+
     /// Forget every placement (channel change, room reset, game disconnect).
     /// The settings panel's test is not a placement and keeps running.
     pub fn clear_positions(&mut self) {
         self.sources.clear();
+        self.sdk_channel = None;
         self.listener = Listener::default();
+        self.motion.clear();
+        self.listener_motion = None;
+        self.last_update = None;
     }
 }
 
@@ -489,6 +650,7 @@ impl Default for UserSettings {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::{Duration, Instant};
     use voipc_audio::spatial::{FLAT, MAX_MUFFLE, Source};
 
     fn test_state(mode: ProximityMode, stopping: bool) -> SpatialTest {
@@ -532,10 +694,10 @@ mod tests {
             mode: ProximityMode::TwoD,
             ..Default::default()
         };
-        assert_eq!(state.gains_for(7, false), FLAT);
+        assert_eq!(state.gains_for(7, false, Instant::now()), FLAT);
         // A game lists everyone audible, so anyone missing is out of range
         state.sdk_active = true;
-        assert_eq!(state.gains_for(7, false).l, 0.0);
+        assert_eq!(state.gains_for(7, false, Instant::now()).l, 0.0);
     }
 
     #[test]
@@ -551,12 +713,160 @@ mod tests {
                 ..Source::default()
             },
         );
-        let voice = state.gains_for(7, false);
+        let voice = state.gains_for(7, false, Instant::now());
         assert!(voice.r > voice.l * 5.0);
-        assert_eq!(state.gains_for(7, true), voice, "the share follows its sharer");
+        assert_eq!(state.gains_for(7, true, Instant::now()), voice, "the share follows its sharer");
         state.screen_audio_spatial = false;
-        assert_eq!(state.gains_for(7, true), FLAT, "…until the viewer centres it");
-        assert_eq!(state.gains_for(7, false), voice, "which leaves the voice alone");
+        assert_eq!(state.gains_for(7, true, Instant::now()), FLAT, "…until the viewer centres it");
+        assert_eq!(state.gains_for(7, false, Instant::now()), voice, "which leaves the voice alone");
+    }
+
+    // ── Glides between SDK updates ──────────────────────────────────────
+
+    #[test]
+    fn a_glide_is_linear_and_stops_at_the_target() {
+        let t0 = Instant::now();
+        let m = Motion {
+            from: [0.0; 3],
+            to: [10.0, 0.0, 0.0],
+            fwd: None,
+            at: t0,
+            over: Duration::from_millis(100),
+        };
+        assert_eq!(m.pos_at(t0)[0], 0.0);
+        assert!((m.pos_at(t0 + Duration::from_millis(50))[0] - 5.0).abs() < 1e-3);
+        assert_eq!(m.pos_at(t0 + Duration::from_millis(100))[0], 10.0);
+        // A late update does not overshoot: the source waits at the target
+        assert_eq!(m.pos_at(t0 + Duration::from_secs(1))[0], 10.0);
+    }
+
+    #[test]
+    fn a_new_update_glides_on_from_mid_flight() {
+        let t0 = Instant::now();
+        let first = Motion {
+            from: [0.0; 3],
+            to: [10.0, 0.0, 0.0],
+            fwd: None,
+            at: t0,
+            over: Duration::from_millis(100),
+        };
+        let halfway = t0 + Duration::from_millis(50);
+        let second = Motion::glide(&first, [0.0; 3], Duration::from_millis(100), halfway);
+        assert!((second.from[0] - 5.0).abs() < 1e-3, "jumped back to {}", second.from[0]);
+    }
+
+    #[test]
+    fn a_teleport_snaps_instead_of_gliding() {
+        let t0 = Instant::now();
+        let here = Motion::snap([0.0; 3], t0);
+        // A respawn across the map: sliding through it would sweep the pan
+        let jump = Motion::glide(&here, [0.0, TELEPORT_M + 10.0, 0.0], MAX_GLIDE, t0);
+        assert_eq!(jump.from, jump.to);
+        assert!(jump.over.is_zero());
+        // A normal step still glides
+        let step = Motion::glide(&here, [0.0, 2.0, 0.0], MAX_GLIDE, t0);
+        assert_ne!(step.from, step.to);
+    }
+
+    #[test]
+    fn facing_interpolates_and_survives_a_u_turn() {
+        let t0 = Instant::now();
+        // A snap has no duration, so it is already at its target
+        let snapped = Motion {
+            fwd: Some(([0.0, 1.0], [1.0, 0.0])),
+            ..Motion::snap([0.0; 3], t0)
+        };
+        assert_eq!(snapped.fwd_at(t0), [1.0, 0.0]);
+        // Without a facing at all, straight ahead
+        assert_eq!(Motion::snap([0.0; 3], t0).fwd_at(t0), [0.0, 1.0]);
+
+        let quarter = Motion {
+            at: t0,
+            over: Duration::from_millis(100),
+            fwd: Some(([0.0, 1.0], [1.0, 0.0])),
+            ..Motion::snap([0.0; 3], t0)
+        };
+        let mid = quarter.fwd_at(t0 + Duration::from_millis(50));
+        assert!((mid[0].hypot(mid[1]) - 1.0).abs() < 1e-3, "not a unit vector: {mid:?}");
+        assert!((mid[0] - mid[1]).abs() < 1e-3, "not 45 degrees: {mid:?}");
+
+        // An exact about-turn passes through zero length, which has no
+        // direction: face the new way rather than something arbitrary
+        let about = Motion {
+            at: t0,
+            over: Duration::from_millis(100),
+            fwd: Some(([0.0, 1.0], [0.0, -1.0])),
+            ..Motion::snap([0.0; 3], t0)
+        };
+        assert_eq!(about.fwd_at(t0 + Duration::from_millis(50)), [0.0, -1.0]);
+    }
+
+    #[test]
+    fn the_mixer_reads_the_glide_and_direct_sources_ignore_it() {
+        let t0 = Instant::now();
+        let over = Duration::from_millis(100);
+        let mut state = SpatialState {
+            mode: ProximityMode::TwoD,
+            ..Default::default()
+        };
+        state.sources.insert(
+            7,
+            Source {
+                pos: [5.0, 0.0, 0.0],
+                ..Source::default()
+            },
+        );
+        state.motion.insert(
+            7,
+            Motion {
+                from: [-5.0, 0.0, 0.0],
+                to: [5.0, 0.0, 0.0],
+                fwd: None,
+                at: t0,
+                over,
+            },
+        );
+
+        // At the start of the glide the voice is still on the left
+        let start = state.gains_for(7, false, t0);
+        assert!(start.l > start.r * 5.0, "{start:?}");
+        // At the end it has arrived on the right
+        let end = state.gains_for(7, false, t0 + over);
+        assert!(end.r > end.l * 5.0, "{end:?}");
+
+        // A radio has no position to glide along
+        state.sources.get_mut(&7).unwrap().direct = true;
+        let direct = state.gains_for(7, false, t0);
+        assert!((direct.l - direct.r).abs() < 1e-6, "{direct:?}");
+    }
+
+    #[test]
+    fn clearing_placements_drops_the_glides() {
+        let mut state = SpatialState::default();
+        state.motion.insert(7, Motion::snap([1.0, 2.0, 3.0], Instant::now()));
+        state.listener_motion = Some(Motion::snap([0.0; 3], Instant::now()));
+        state.last_update = Some(Instant::now());
+        state.clear_positions();
+        assert!(state.motion.is_empty());
+        assert!(state.listener_motion.is_none());
+        assert!(state.last_update.is_none());
+    }
+
+    #[test]
+    fn the_effect_follows_the_source() {
+        let mut state = SpatialState::default();
+        assert_eq!(state.effect_for(7), Effect::None);
+        state.sources.insert(
+            7,
+            Source {
+                fx: Effect::Radio,
+                direct: true,
+                ..Source::default()
+            },
+        );
+        // Not gated on the channel being positional: a radio is a radio
+        assert_eq!(state.effect_for(7), Effect::Radio);
+        assert_eq!(state.effect_for(9), Effect::None);
     }
 
     #[test]

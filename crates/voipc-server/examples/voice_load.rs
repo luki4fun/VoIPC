@@ -142,6 +142,7 @@ async fn run_client(
             name: "LoadTest".into(),
             password: None,
             proximity: Default::default(),
+            anonymous: false,
         })?)
         .await?;
         let mut existing: Option<u32> = None;

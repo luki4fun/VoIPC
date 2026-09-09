@@ -89,7 +89,9 @@ No accounts. No telemetry. No compromises.
 - **Game SDK**: a game mod can drive the positions instead, over a local WebSocket. It is the open
   alternative to the TeamSpeak plugins RP servers use (SaltyChat, YACA, TokoVOIP) — no plugin, no
   license server, players addressed by their VoIPC user id. Ranges, per-player volume, distance
-  culling and 0–10 muffling are supported; radio and phone effects come later. See [docs/SDK.md](docs/SDK.md)
+  culling, 0–10 muffling and radio/phone effect chains, with speaking and mute state pushed back to
+  the game. A ready-made FiveM resource is in [sdk/fivem-voipc/](sdk/fivem-voipc/); the protocol is
+  in [docs/SDK.md](docs/SDK.md)
 
 **Quality of Life**
 - Saved servers in the connect dialog, optional auto-connect
@@ -244,7 +246,7 @@ Client-side data at rest:
 | Max voice packet | 512 bytes |
 | Max video packet | 1,280 bytes |
 | Max control message | 64 KiB |
-| Protocol version | v5 |
+| Protocol version | v7 |
 | Default port | 9987 — UDP for QUIC (all clients), TCP for the browser page |
 
 ### Project Structure
@@ -329,7 +331,17 @@ Runtime settings in `server_settings.json`:
 
 `proximity_enabled: false` switches proximity chat off for the whole server: every channel is served as non-positional, requests to enable it are refused, and position beacons are not relayed.
 
-**Persistent channels** (optional): drop a `channels.json` next to the binary to pre-create long-lived rooms that survive restarts. See [channels.example.json](channels.example.json) — plaintext `password` fields are hashed to SHA-256 on first load and the file is rewritten atomically. A channel may set `"proximity": "2d"` or `"3d"` to make it a proximity room.
+**Persistent channels** (optional): drop a `channels.json` next to the binary to pre-create long-lived rooms that survive restarts. See [channels.example.json](channels.example.json) — plaintext `password` fields are hashed to SHA-256 on first load and the file is rewritten atomically. Per channel:
+
+| Option | Default | Effect |
+|---|---|---|
+| `proximity` | `"off"` | `"2d"` or `"3d"` makes it a proximity room |
+| `hidden` | `false` | Not listed in the sidebar for non-admins. It can still be joined by an invite link or by the game SDK, so it is out of the way, not locked |
+| `anonymous` | `false` | Members see each other as `Guest-1234`, a fresh name per visit. The server substitutes it everywhere, so no client ever learns the real one; admins see the real names, and no chat history is handed over in such a channel |
+| `screen_share` | `true` | `false` refuses screen sharing there |
+| `hide_members` | `false` | Non-admins see no member list, only whoever is speaking (and can still adjust their volume) |
+
+The creator of a channel, or any admin, can change these at runtime through the channel's gear icon. Channels from `channels.json` have no creator, so those are admin-only.
 
 **Server administration:** there are no accounts; any connected user becomes admin for their session by entering the admin token (status bar → shield icon). Set `admin_token` in `server.toml`, pass `--admin-token`, or export `VOIPC_ADMIN_TOKEN`; without one the server prints a fresh random token in its log at every start. Admins can kick users from channels or from the server and ban an IP for 1 h, 24 h or until restart — everyone behind that IP is affected, and bans live in memory only. Other users see a shield next to an admin's name. Three wrong tokens disconnect the session.
 
@@ -362,6 +374,9 @@ Or build portable release binaries via Docker (no local dependencies needed):
 ```bash
 npm run release    # Outputs release/VoIPC_*.AppImage + release/voipc-server + release/VoIPC-web-*.tar.gz
 ```
+
+Without Docker it falls back to a host build — the server and the web bundle, no AppImage —
+and tells you what it skipped and why.
 
 See [BUILDING.md](BUILDING.md) for detailed platform-specific instructions and dependency lists.
 

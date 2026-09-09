@@ -2,9 +2,22 @@
 
 All notable changes to VoIPC are documented here.
 
-## [0.6.0] - unreleased
+## [0.7.0] - unreleased
 
-Protocol version 6 — client and server must be updated together (a channel now carries a proximity mode, and positions travel as a new encrypted media packet). A 0.5.x client connecting to a 0.6 server is told to update and stops reconnecting.
+Protocol version 7 — client and server must be updated together (a channel now carries a proximity mode and four options, and positions travel as a new encrypted media packet). A 0.5.x client connecting to a 0.7 server is told to update and stops reconnecting.
+
+### Added — channel options
+
+Four options per channel, in `channels.json` or through the channel's gear icon (its creator, or an admin; channels from `channels.json` have no creator, so those are admin-only). They are what an ingame roleplay channel needs, and they compose: see the `Ingame` entry in [channels.example.json](channels.example.json).
+
+- **`hidden`** — the channel is not listed for anyone but admins. It can still be joined through an invite link or by the game SDK, so it is out of the way rather than locked
+- **`anonymous`** — members see each other as `Guest-1234`, a fresh name each time they enter. **The substitution happens on the server**, in every message that carries a name: the member list, joins, chat, direct messages, pokes, invites and screen-share notices. No other client is ever told the real name, and you see your own pseudonym too, so you know what the others see. Admins see the real names, which is what makes moderating such a channel possible. Chat history is not handed over in an anonymous channel: the names in an archive sit inside the ciphertext, where the server cannot substitute them
+- **`screen_share`** — `false` refuses sharing in that channel, and the button disappears there
+- **`hide_members`** — non-admins get no member list and no head count, only whoever is speaking (for about ten seconds), so a voice can still be turned down without the room being a roster. Members still receive the list internally, because the encryption keys are exchanged per member
+
+### Fixed
+
+- A refused screen share no longer leaves the sharer permanently marked as sharing. The flag was set before the channel was even looked up, so any later refusal locked that session out of sharing until reconnect
 
 ### Added — proximity chat
 
@@ -21,10 +34,16 @@ Protocol version 6 — client and server must be updated together (a channel now
 ### Added — a game SDK, as the open alternative to the TeamSpeak plugins
 
 - **A game mod can drive the positions.** VoIPC opens a loopback WebSocket that a page inside the game runtime connects to, the way SaltyChat, YACA and TokoVOIP work — but with no plugin to install, no license server, and players addressed by their VoIPC user id instead of by matching nicknames
-- One bulk update a few times a second carries the listener's pose and every audible player with their range, volume override, 0–10 muffling and mode. A player left out of the list is silent, which is how distance culling works in the plugins scripts already target. Radio, phone and megaphone audio is accepted as `mode: "direct"` and renders flat; the effect chains come later, and the handshake's `capabilities` list says what a build actually renders
+- One bulk update a few times a second carries the listener's pose and every audible player with their range, volume override, 0–10 muffling and mode. A player left out of the list is silent, which is how distance culling works in the plugins scripts already target. Radio, phone and megaphone audio is `mode: "radio"`, `"phone"` or `"direct"`, and the handshake's `capabilities` list says what a build actually renders
+- **Radio and phone are real effects now**, not flat audio: `mode: "phone"` band-limits a voice to roughly 300–3400 Hz, and `mode: "radio"` adds drive, a faint hiss and a short squelch burst when a transmission starts and ends. Deterministic and click-free; the browser client has no SDK and renders both flat, which is what `capabilities` is for
+- **Positions glide between updates.** A mod sending 4–10 times a second used to step the pan and the volume at exactly that rate; each player (and the listener's own pose and facing) now moves smoothly over the gap between updates. A jump of more than 50 m snaps instead, so a respawn does not sweep across the room
+- **VoIPC pushes back**: `talk` for another player starting or stopping, `self` for the local player's speaking, mute and deafen, `user` for someone else's mute. Enough for a talking icon over a player's head. "Speaking" means voice actually going out, so push-to-talk and mute are reflected
+- **`hello` now waits for the join.** It used to answer `ingame` before the channel was joined, so a wrong password looked like success and left distance culling armed with nobody driving it. A refusal is relayed verbatim: `could not join Ingame: incorrect channel password`
 - **Off by default**, loopback only, and origins are checked: the game runtimes are allowed by prefix, `localhost` and `127.0.0.1` only as the exact host, and everything else is refused — a page served from `localhost.example.com` is an ordinary internet page that can reach a local port like any other. `hello.server` is required, so a mod cannot skip the wrong-server check by leaving it out, and the newest connection that completed a handshake owns the mix: a refused or stale socket can no longer clear a running game's positions on its way out
 - After a VoIPC reconnect the mod's player ids belong to the previous session; VoIPC answers such an update with an error telling it to say hello again, instead of silently culling every speaker out of the mix
-- `docs/SDK.md` documents the protocol and the FiveM/alt:V/RAGE identity flow; `sdk/test-page.html` is a one-file harness with sliders, so the SDK can be tried without a game. A ready-made FiveM example resource follows in 0.6.1
+- **Hardened the socket**: a handshake must finish in 5 seconds, a silent socket is closed after 30, at most four are served at once, `Upgrade` and `Sec-WebSocket-Version: 13` are checked, client frames must be masked as the standard requires, and a first frame pipelined behind the upgrade request is no longer thrown away. A port that cannot be bound is reported in Settings instead of leaving the toggle on and nothing listening
+- **A ready-made FiveM resource** in `sdk/fivem-voipc/`: state-bag identity, head-bone positions at 10 Hz, distance culling, muffling from vehicles, interiors and line of sight, and a voice-range key. Radio, phone and the talking overlay are left as documented stubs. `sdk/test-page.html` grew the channel field, the radio and phone modes, the build's capability list and a live "who is talking" line
+- `docs/SDK.md` documents the protocol and the FiveM/alt:V/RAGE identity flow
 
 ### Fixed — hardening of the above, before it ships
 
@@ -35,6 +54,22 @@ Protocol version 6 — client and server must be updated together (a channel now
 - A newly created mixer source no longer bursts at full volume for its first 20 ms: gains start at their target instead of ramping down from unity, so a locally muted or distant speaker stays quiet
 - The browser client applies the saved spatial-audio settings on load, ignores non-finite positions (one NaN silenced a source for good), and the room view no longer keeps sharing your position after *Reset*, leaves a stale selection behind when someone leaves, or shows *Sync my position* as on when the toggle failed
 - The room view now locks while a game drives the positions, which the game SDK had announced since the beginning with nobody listening
+
+### Fixed — Android
+
+- **A channel can be joined on a phone at all.** Joining is a double click, and the page is zoomable, so Android read a double tap as double-tap-to-zoom and never delivered the event — you could highlight a channel and nothing else. The channel row now opts out of that gesture
+- **The Android build compiles again.** `tauri::Manager` was imported only on desktop, and the new game-SDK event publishers use it everywhere; nothing had compiled the Android target since that landed, because no CI job does. Verified end to end this time: built, installed on a phone, connected to a 0.7.0 server, joined a channel
+
+### Fixed — older bugs, while we were in here
+
+- **Muting or deafening yourself shows on your own row at once.** The marker in the member list only appeared after a channel switch, because the server deliberately does not send `UserMuted` back to the session that caused it and no client filled the gap; the toolbar button looked right the whole time, which is what made it confusing. Toggling from the Android notification now updates the button as well, which it never did
+- **Firefox can share a screen or a window again.** The browser client asked for the shared screen's audio unconditionally, and Firefox — which has never implemented that capture (Mozilla bug 1541425) — answers by offering browser tabs and nothing else. It is no longer asked for there, and the share dialog says why and points at a Chromium browser for anyone who needs the sound
+
+### Changed — build tooling
+
+- `npm run release` no longer stops dead when Docker is missing. It falls back to a host build of the web bundle and the server, names the AppImage as the artifact it had to skip and says why it is worth having (the image exists to pin glibc 2.39 so one build runs everywhere), and warns that the host server is not the static musl one. `VOIPC_NO_DOCKER=1` takes that path on purpose
+- The artifact summary lists what the run actually built. It used to print the whole `release/` directory, so last month's tarball was reported as fresh output
+- `npm run version:check` now also covers the FiveM resource manifest and the two copies of the SDK's `state` example, which had been drifting by hand
 
 ### Testing
 

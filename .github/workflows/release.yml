@@ -2,7 +2,7 @@ name: Release
 
 # Builds every artifact for a release and opens it as a draft for review.
 #
-# Push a tag to build a release:   git tag v0.5.0 && git push origin v0.5.0
+# Push a tag to build a release:   git tag v0.7.0 && git push origin v0.7.0
 # Or run it manually from the Actions tab to rehearse the whole thing first.
 on:
   workflow_dispatch:

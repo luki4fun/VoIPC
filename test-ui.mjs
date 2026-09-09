@@ -96,6 +96,11 @@ const click = (selector) =>
 const channelNames = `[...document.querySelectorAll(".channel .channel-name")].map((e) => e.textContent)`;
 /** Users as the member list renders them (UserList.svelte `.users > .user > .name`). */
 const userNames = `[...document.querySelectorAll(".users .user .name")].map((e) => e.textContent.trim())`;
+/** Whether a member list row carries the muted marker. `name` of null means our own row. */
+const rowMuted = (name) => `(() => { const rows = [...document.querySelectorAll(".users .user")];
+  const row = ${name === null ? `rows.find((e) => e.querySelector(".you"))`
+    : `rows.find((e) => e.textContent.includes(${JSON.stringify(name)}))`};
+  return row ? !!row.querySelector(".status-icon.muted") : null; })()`;
 /** The proximity tag of our own channel — other channels on the server have their own. */
 const ownProximityTag = `(() => { const row = [...document.querySelectorAll(".channel")]
   .find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(CHANNEL)});
@@ -161,6 +166,18 @@ const aliceUsers = await alice.evaluate(userNames);
 check("both members are listed once", new Set(aliceUsers).size === aliceUsers.length, aliceUsers.join(","));
 check("the joiner is in the member list", aliceUsers.some((u) => u.includes("ui-bob")), aliceUsers.join(","));
 
+// 3b. Muting yourself has to show on your own row straight away. The server
+//     never sends UserMuted back to the session that caused it, so only the
+//     local update can put the marker there — it used to appear on the next
+//     UserList, i.e. not before the next channel switch.
+await alice.evaluate(click('button[title^="Mute"]'));
+await sleep(800);
+check("muting yourself marks your own row", (await alice.evaluate(rowMuted(null))) === true);
+check("the other client sees the mute too", (await bob.evaluate(rowMuted("ui-alice"))) === true);
+await alice.evaluate(click('button[title^="Unmute"]'));
+await sleep(800);
+check("unmuting clears your own row again", (await alice.evaluate(rowMuted(null))) === false);
+
 // 4. Channel settings: change the proximity mode (and leave the password alone)
 await alice.evaluate(`(() => { const el = document.querySelector(".channel.active .settings-icon"); if (!el) return false; el.click(); return true; })()`);
 await sleep(400);
@@ -182,7 +199,71 @@ await alice.evaluate(click(".password-dialog .create-btn"));
 await sleep(1200);
 check("the room closes when proximity is switched off", await alice.evaluate(`!document.querySelector(".room")`));
 
-// 6. Nothing threw anywhere. One uncaught exception in a keyed {#each} wedges
+// 6. The channel options: an anonymous, hidden, share-less room where the
+//    members are not listed. Everything is checked from the other client's
+//    page, which is where a leak would show.
+const SECRET = `secret-${process.pid % 10000}`;
+await alice.evaluate(click('button[title="Create channel"]'));
+await waitFor(alice, `document.querySelector(".create-form")`);
+await alice.evaluate(setInput(".create-form input[type=text]", SECRET));
+await alice.evaluate(click(".create-form .dialog-check input"));
+await alice.evaluate(click(".create-form .create-btn"));
+await sleep(2500);
+
+const secretUsers = await alice.evaluate(userNames);
+check(
+  "an anonymous channel renames its members",
+  secretUsers.length > 0 && secretUsers.every((u) => /^Guest-\d{4}/.test(u)),
+  secretUsers.join(","),
+);
+check(
+  "the creator does not see their own real name either",
+  !secretUsers.some((u) => u.includes("ui-alice")),
+  secretUsers.join(","),
+);
+
+// The observer joins and must never learn the real name
+await bob.evaluate(
+  `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.textContent.includes(${JSON.stringify(SECRET)}));
+     if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
+);
+await sleep(2500);
+const bobSees = await bob.evaluate(userNames);
+check("the observer sees pseudonyms", bobSees.every((u) => /^Guest-\d{4}/.test(u)), bobSees.join(","));
+check("the observer never receives a real name", !bobSees.some((u) => u.includes("ui-")), bobSees.join(","));
+// The store holds what the wire delivered, so this catches a leak the DOM hides
+const wireNames = await bob.evaluate(
+  `JSON.stringify([...document.querySelectorAll(".users .user .name")].map((e) => e.textContent))`,
+);
+check("no real name reached the observer's client", !wireNames.includes("ui-alice"), wireNames);
+
+// Hidden + no sharing + hidden members, set through the settings dialog
+await alice.evaluate(`(() => { const el = document.querySelector(".channel.active .settings-icon"); if (!el) return false; el.click(); return true; })()`);
+await sleep(400);
+// Order in the dialog: hidden, anonymous, hide members, allow screen sharing
+await alice.evaluate(`(() => { const b = [...document.querySelectorAll(".password-dialog .dialog-check input")];
+  b[0].click(); b[2].click(); b[3].click(); return b.length; })()`);
+await alice.evaluate(click(".password-dialog .create-btn"));
+await sleep(1500);
+
+check(
+  "the share button is gone where sharing is off",
+  !(await alice.evaluate(`!!document.querySelector('button[title="Share your screen"]')`)),
+);
+const hiddenList = await alice.evaluate(userNames);
+check("hidden members leave only yourself listed", hiddenList.length === 1, hiddenList.join(","));
+check(
+  "the reason is spelled out",
+  await alice.evaluate(`!!document.querySelector(".hidden-note")`),
+);
+const bobChannelsAfter = await bob.evaluate(channelNames);
+check(
+  "a hidden channel stays listed for the member standing in it",
+  bobChannelsAfter.includes(SECRET),
+  bobChannelsAfter.join(","),
+);
+
+// 7. Nothing threw anywhere. One uncaught exception in a keyed {#each} wedges
 //    the UI for the rest of the session, so this is the real assertion.
 for (const [name, tab] of [["creator", alice], ["observer", bob]]) {
   const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));

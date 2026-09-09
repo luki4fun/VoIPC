@@ -1,7 +1,8 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
+  import { onDestroy } from "svelte";
   import { channels, currentChannelId, previewChannelId, previewUsers } from "../stores/channels.js";
-  import { users, speakingUsers } from "../stores/users.js";
+  import { users, speakingUsers, visibleMembers } from "../stores/users.js";
   import { userId, isAdmin } from "../stores/connection.js";
   import { openDm } from "../stores/chat.js";
   import { watchingUserId, currentFrame } from "../stores/screenshare.js";
@@ -19,8 +20,47 @@
     isPreviewing ? $previewChannelId! : $currentChannelId
   );
 
+  // A channel may hide its members from non-admins. Whoever speaks appears
+  // for a while, so their volume can still be adjusted; after that they fade
+  // out of the list again.
+  const SPEAKER_LINGER_MS = 10_000;
+  let recentSpeakers = $state(new Set<number>());
+  let speakerTimers = new Map<number, ReturnType<typeof setTimeout>>();
+
+  let hideMembers = $derived(
+    !$isAdmin &&
+      ($channels.find((c) => c.channel_id === displayChannelId)?.hide_members ?? false)
+  );
+
+  $effect(() => {
+    if (!hideMembers) return;
+    for (const id of $speakingUsers) {
+      clearTimeout(speakerTimers.get(id));
+      if (!recentSpeakers.has(id)) recentSpeakers = new Set(recentSpeakers).add(id);
+      speakerTimers.set(
+        id,
+        setTimeout(() => {
+          const next = new Set(recentSpeakers);
+          next.delete(id);
+          recentSpeakers = next;
+          speakerTimers.delete(id);
+        }, SPEAKER_LINGER_MS),
+      );
+    }
+  });
+
+  onDestroy(() => {
+    for (const t of speakerTimers.values()) clearTimeout(t);
+    speakerTimers.clear();
+  });
+
   let displayUsers = $derived(
-    isPreviewing ? $previewUsers : $users
+    visibleMembers(
+      isPreviewing ? $previewUsers : $users,
+      $userId,
+      recentSpeakers,
+      hideMembers && !isPreviewing,
+    )
   );
 
   let channelName = $derived(
@@ -233,6 +273,9 @@
       Users in #{channelName}
     {/if}
   </div>
+  {#if hideMembers && !isPreviewing}
+    <div class="hidden-note">Members are hidden here — people appear while they speak</div>
+  {/if}
   <div class="users">
     {#each displayUsers as user (user.user_id)}
       <div
@@ -440,6 +483,14 @@
     font-size: 11px;
     text-transform: uppercase;
     letter-spacing: 1px;
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border);
+  }
+
+  .hidden-note {
+    padding: 8px 16px;
+    font-size: 11px;
+    line-height: 1.4;
     color: var(--text-secondary);
     border-bottom: 1px solid var(--border);
   }

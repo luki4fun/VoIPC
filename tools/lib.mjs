@@ -149,6 +149,28 @@ const VERSION_SITES = [
     make: (v) => `$1v${v}$2`,
     optional: true,
   },
+  {
+    // The FiveM example resource. A stale version here is cosmetic — FiveM
+    // only prints it — but it was hand-maintained and had already drifted.
+    file: join(ROOT, 'sdk', 'fivem-voipc', 'fxmanifest.lua'),
+    re: /^version '[^']*'/m,
+    make: (v) => `version '${v}'`,
+    optional: true,
+  },
+  {
+    // The `state` payload in the SDK documentation, written out twice: once in
+    // docs/SDK.md and once in the module doc comment it was copied from.
+    file: join(ROOT, 'docs', 'SDK.md'),
+    re: /"version":"[^"]*","sdk":1/,
+    make: (v) => `"version":"${v}","sdk":1`,
+    optional: true,
+  },
+  {
+    file: join(CLIENT, 'src-tauri', 'src', 'sdk.rs'),
+    re: /"version":"[^"]*","sdk":1/,
+    make: (v) => `"version":"${v}","sdk":1`,
+    optional: true,
+  },
 ];
 
 /**

@@ -4,7 +4,12 @@ import { mkdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { CLIENT, ROOT, ensureRustTarget, head, npmInstall, ok, run, syncVersion } from '../lib.mjs';
 
-export default function web(_task, args) {
+/**
+ * @param {{ summary?: boolean }} opts  The release fallback prints its own
+ *   artifact list and does not want this one repeated. Returns the version it
+ *   built, which is what names the tarball.
+ */
+export default function web(_task, args, { summary = true } = {}) {
   const debug = args.includes('--debug');
   const rest = args.filter((a) => a !== '--debug');
   const version = syncVersion();
@@ -23,8 +28,11 @@ export default function web(_task, args) {
   const tarball = join('release', `VoIPC-web-${version}.tar.gz`);
   run('tar', ['-czf', tarball, '-C', 'client', 'dist-web']);
 
-  const profile = debug ? 'debug' : 'release';
-  head('Web client artifacts');
-  ok(`static bundle: ${tarball}`);
-  ok(`server binary: target/${profile}/voipc-server (serves https://<host>:9987/)`);
+  if (summary) {
+    const profile = debug ? 'debug' : 'release';
+    head('Web client artifacts');
+    ok(`static bundle: ${tarball}`);
+    ok(`server binary: target/${profile}/voipc-server (serves https://<host>:9987/)`);
+  }
+  return version;
 }

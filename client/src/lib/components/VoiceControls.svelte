@@ -7,6 +7,8 @@
     isMuted,
     isDeafened,
     isTransmitting,
+    setSelfDeafened,
+    setSelfMuted,
     userId,
   } from "../stores/connection.js";
   import { currentChannelId } from "../stores/channels.js";
@@ -58,7 +60,7 @@
   async function toggleMute() {
     try {
       const muted: boolean = await invoke("toggle_mute");
-      isMuted.set(muted);
+      setSelfMuted(muted);
     } catch (e) {
       console.error("Failed to toggle mute:", e);
     }
@@ -67,7 +69,7 @@
   async function toggleDeafen() {
     try {
       const deafened: boolean = await invoke("toggle_deafen");
-      isDeafened.set(deafened);
+      setSelfDeafened(deafened);
     } catch (e) {
       console.error("Failed to toggle deafen:", e);
     }

@@ -62,6 +62,23 @@ impl Default for Listener {
     }
 }
 
+/// The effect chain a source is rendered through.
+///
+/// Only the desktop mixer applies it — the browser has no game SDK, and its
+/// worklet renders these flat. [`gains`] ignores it on purpose: that function
+/// is mirrored in TypeScript against a shared golden table, and an effect
+/// nobody else can render must not move those numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Effect {
+    #[default]
+    None,
+    /// Band-limited to roughly the telephone band, 300–3400 Hz.
+    Phone,
+    /// The same band-limit plus drive, a faint hiss and a squelch burst at the
+    /// start and end of every transmission.
+    Radio,
+}
+
 /// Where one other user is, and how they should be rendered.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Source {
@@ -75,6 +92,9 @@ pub struct Source {
     /// Render flat instead of positionally — radio, phone, megaphone,
     /// spectators. Distance and direction are ignored, `volume` still applies.
     pub direct: bool,
+    /// Effect chain applied by the desktop mixer; `Radio` and `Phone` imply
+    /// `direct` (they are not coming from a place in the world).
+    pub fx: Effect,
 }
 
 impl Default for Source {
@@ -85,6 +105,7 @@ impl Default for Source {
             volume: 1.0,
             muffle: 0,
             direct: false,
+            fx: Effect::None,
         }
     }
 }

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { addNotification } from "../stores/notifications.js";
+  import { canShareDisplayAudio } from "../display-capture.js";
   import {
     showSourcePicker,
     pickerSwitchMode,
@@ -136,6 +137,10 @@
 
   // Linux (portal) and the browser both show their own picker after Start
   let isLinux = $derived(platform === "linux");
+  // Said out loud rather than downgraded silently: on Firefox the share goes
+  // out without the screen's sound, which is the price of being offered
+  // anything but a browser tab.
+  let noShareAudio = $derived(platform === "web" && !canShareDisplayAudio());
   let usesOwnPicker = $derived(platform === "linux" || platform === "web");
   let buttonLabel = $derived(
     starting
@@ -197,6 +202,14 @@
               {platform === "web"
                 ? "Your browser's share picker will appear after clicking Start."
                 : "Your system's window picker will appear after clicking Start."}
+            </p>
+          {/if}
+          {#if noShareAudio}
+            <p class="portal-note">
+              Firefox cannot share a screen's sound, and while it is asked for it offers
+              browser tabs and nothing else. VoIPC asks without it, so you can pick a display
+              or a window — share from Chrome, Edge or another Chromium browser if you need
+              the sound as well.
             </p>
           {/if}
         </div>
@@ -405,6 +418,15 @@
     color: var(--text-secondary) !important;
     font-weight: 400 !important;
     font-size: 12px !important;
+  }
+
+  .portal-note {
+    margin-top: 8px !important;
+    max-width: 340px;
+    color: var(--text-secondary) !important;
+    font-weight: 400 !important;
+    font-size: 11px !important;
+    line-height: 1.5;
   }
 
   .source-card {

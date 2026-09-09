@@ -156,6 +156,7 @@ pub async fn create_channel(
     name: String,
     password: Option<String>,
     proximity: Option<String>,
+    anonymous: Option<bool>,
 ) -> Result<(), String> {
     if name.is_empty() || name.len() > 128 {
         return Err("channel name must be 1-128 characters".into());
@@ -174,6 +175,33 @@ pub async fn create_channel(
             name,
             password,
             proximity,
+            anonymous: anonymous.unwrap_or(false),
+        },
+    )
+    .await
+}
+
+/// Change a channel's other options (creator, or an admin for a channel from
+/// channels.json). `None` leaves an option as it is.
+#[tauri::command]
+pub async fn set_channel_options(
+    state: State<'_, AppState>,
+    channel_id: u32,
+    hidden: Option<bool>,
+    anonymous: Option<bool>,
+    screen_share: Option<bool>,
+    hide_members: Option<bool>,
+) -> Result<(), String> {
+    let conn = state.connection.read().await;
+    let connection = conn.as_ref().ok_or("Not connected")?;
+    network::send_tcp_message(
+        &connection.tcp_tx,
+        &ClientMessage::SetChannelOptions {
+            channel_id,
+            hidden,
+            anonymous,
+            screen_share,
+            hide_members,
         },
     )
     .await
@@ -916,6 +944,12 @@ pub async fn toggle_mute(state: State<'_, AppState>) -> Result<bool, String> {
         let was_muted = conn.is_muted.load(Ordering::Relaxed);
         let new_muted = !was_muted;
         conn.is_muted.store(new_muted, Ordering::Relaxed);
+        // A game showing a muted marker learns about it here; the server's
+        // own broadcast never comes back to us
+        state.sdk_event(crate::app_state::SdkEvent::Muted {
+            user_id: conn.user_id,
+            muted: new_muted,
+        });
         let _ = network::send_tcp_message(
             &conn.tcp_tx,
             &ClientMessage::SetMuted {
@@ -945,6 +979,10 @@ pub async fn toggle_deafen(state: State<'_, AppState>) -> Result<bool, String> {
         let was_deafened = conn.is_deafened.load(Ordering::Relaxed);
         let new_deafened = !was_deafened;
         conn.is_deafened.store(new_deafened, Ordering::Relaxed);
+        state.sdk_event(crate::app_state::SdkEvent::Deafened {
+            user_id: conn.user_id,
+            deafened: new_deafened,
+        });
         let _ = network::send_tcp_message(
             &conn.tcp_tx,
             &ClientMessage::SetDeafened {
@@ -1759,6 +1797,8 @@ pub async fn set_user_position(
                     volume: volume.unwrap_or(1.0).clamp(0.0, 2.0),
                     muffle: muffle.unwrap_or(0).min(voipc_audio::spatial::MAX_MUFFLE),
                     direct: direct.unwrap_or(false),
+                    // The room view places people, never radios
+                    fx: voipc_audio::spatial::Effect::None,
                 },
             );
         }
@@ -1864,6 +1904,13 @@ pub async fn get_sdk_status(state: State<'_, AppState>) -> Result<serde_json::Va
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone();
+    // Why the port could not be taken, if that is the case: otherwise the
+    // panel shows the integration as on and simply never connects.
+    let error = state
+        .sdk_listen_error
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone();
     let config = state.config.lock().map_err(|e| e.to_string())?;
     Ok(serde_json::json!({
         "available": cfg!(not(target_os = "android")),
@@ -1872,6 +1919,8 @@ pub async fn get_sdk_status(state: State<'_, AppState>) -> Result<serde_json::Va
         "origins": config.sdk_allowed_origins,
         "connected": game.is_some(),
         "game": game.unwrap_or_default(),
+        "listening": config.sdk_enabled && error.is_none(),
+        "error": error,
     }))
 }
 

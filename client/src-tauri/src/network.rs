@@ -7,7 +7,9 @@ use ringbuf::traits::Producer;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tauri::Emitter;
-#[cfg(not(target_os = "android"))]
+// Not desktop-only any more: the SDK event publishers reach for AppState
+// through the handle, and those run on every platform even though the SDK
+// listener itself does not exist on Android.
 use tauri::Manager;
 use tracing::{error, info, warn};
 use wtransport::error::SendDatagramError;
@@ -25,7 +27,7 @@ use voipc_protocol::video::{
 };
 use voipc_protocol::voice::{PositionPayload, VoicePacket, VoicePacketType};
 
-use crate::app_state::{ActiveConnection, AppState, LossTally, PendingTarget, SignalState};
+use crate::app_state::{ActiveConnection, AppState, LossTally, PendingTarget, SdkEvent, SignalState};
 use crate::screenshare;
 use crate::transport::CONNECT_TIMEOUT;
 
@@ -708,6 +710,10 @@ fn on_channel_changed(
             Err(poisoned) => poisoned.into_inner(),
         };
         sp.sync = false;
+        // A game drives one channel: somewhere else its ids match nobody, and
+        // leaving culling armed would silence everyone here. The mod's next
+        // update is refused and tells it to say hello again.
+        sp.sdk_active = false;
         sp.clear_positions();
     }
     apply_channel_proximity(spatial, cache, channel_id, app_handle);
@@ -936,12 +942,18 @@ async fn handle_server_message(
                 "user-muted",
                 serde_json::json!({"user_id": user_id, "muted": muted}),
             );
+            app_handle
+                .state::<AppState>()
+                .sdk_event(SdkEvent::Muted { user_id, muted });
         }
         ServerMessage::UserDeafened { user_id, deafened } => {
             let _ = app_handle.emit(
                 "user-deafened",
                 serde_json::json!({"user_id": user_id, "deafened": deafened}),
             );
+            app_handle
+                .state::<AppState>()
+                .sdk_event(SdkEvent::Deafened { user_id, deafened });
         }
         ServerMessage::Ping { timestamp } => {
             // Reply to server keepalive ping to prevent idle disconnect
@@ -978,8 +990,12 @@ async fn handle_server_message(
         ServerMessage::ChannelError { reason } => {
             let _ = app_handle.emit(
                 "channel-error",
-                serde_json::json!({"reason": reason}),
+                serde_json::json!({"reason": reason.clone()}),
             );
+            // A mod waiting for its `hello` join learns why it failed
+            app_handle
+                .state::<AppState>()
+                .sdk_event(SdkEvent::ChannelError(reason));
         }
         ServerMessage::ChannelUpdated { channel } => {
             upsert_channel(channels_snapshot, channel.clone());
@@ -2237,6 +2253,8 @@ async fn voice_mixer_task(
         stereo.clear();
         stereo.resize(voipc_protocol::voice::OPUS_FRAME_SIZE * 2, 0.0);
         let mut mixed_any = false;
+        // One clock for the whole frame: every glide is read against it
+        let now = std::time::Instant::now();
         {
             let mut map = match sources.lock() {
                 Ok(m) => m,
@@ -2244,14 +2262,34 @@ async fn voice_mixer_task(
             };
             map.retain(|_, s| s.last_activity.elapsed() < SOURCE_IDLE_PRUNE);
             for (&key, src) in map.iter_mut() {
-                if src.eot_received && src.jitter.is_empty() {
+                let is_screen_audio = key & SCREEN_AUDIO_FLAG != 0;
+                let user_id = key & !SCREEN_AUDIO_FLAG;
+                // A radio or phone from the game SDK; a screen share is never one
+                let fx = if is_screen_audio {
+                    voipc_audio::spatial::Effect::None
+                } else {
+                    sp.effect_for(user_id)
+                };
+
+                // End of transmission: the buffered tail has drained
+                let drained = src.eot_received && src.jitter.is_empty();
+                if drained {
                     src.jitter.reset();
                     src.eot_received = false;
-                    continue;
                 }
                 let MixSource { jitter, decoder, .. } = src;
-                let pcm = match jitter.pop() {
-                    None => continue, // buffering or idle
+                let popped = if drained { None } else { jitter.pop() };
+                let pcm = match popped {
+                    // Nothing to play: a radio closes its squelch, at once on
+                    // an end-of-transmission and after a pause otherwise
+                    None => {
+                        let mut nothing: [f32; 0] = [];
+                        let out: &mut [f32] = if deafened { &mut nothing } else { &mut stereo };
+                        if voipc_audio::mixer::mix_source_stop(out, &mut src.mix, fx, drained) {
+                            mixed_any = true;
+                        }
+                        continue;
+                    }
                     Some(JitterFrame::Ready(data)) => {
                         voice_frames_played.fetch_add(1, Ordering::Relaxed);
                         decoder.decode(&data)
@@ -2276,16 +2314,15 @@ async fn voice_mixer_task(
                     continue; // decoded to keep the Opus state, then dropped
                 }
 
-                let is_screen_audio = key & SCREEN_AUDIO_FLAG != 0;
-                let user_id = key & !SCREEN_AUDIO_FLAG;
                 let vol = volumes.get(&user_id).copied().unwrap_or(1.0) * master;
-                let g = sp.gains_for(user_id, is_screen_audio);
-                voipc_audio::mixer::mix_source_stereo(
+                let g = sp.gains_for(user_id, is_screen_audio, now);
+                voipc_audio::mixer::mix_source_fx(
                     &mut stereo,
                     &pcm,
                     &mut src.mix,
                     (g.l * vol, g.r * vol),
                     g.lp_a,
+                    fx,
                 );
                 mixed_any = true;
             }
@@ -2777,6 +2814,10 @@ async fn datagram_receiver_task(
                                 "user-speaking",
                                 serde_json::json!({"user_id": session_id, "speaking": true}),
                             );
+                            app_handle.state::<AppState>().sdk_event(SdkEvent::Talk {
+                                user_id: session_id,
+                                speaking: true,
+                            });
                         }
                     }
                     // Position beacon from a member who syncs their position
@@ -2869,6 +2910,10 @@ async fn datagram_receiver_task(
                             "user-speaking",
                             serde_json::json!({"user_id": session_id, "speaking": false}),
                         );
+                        app_handle.state::<AppState>().sdk_event(SdkEvent::Talk {
+                            user_id: session_id,
+                            speaking: false,
+                        });
                     }
                     // Screen share audio (encrypted only)
                     0x15 => {
@@ -2954,6 +2999,9 @@ async fn datagram_receiver_task(
                         "user-speaking",
                         serde_json::json!({"user_id": user_id, "speaking": false}),
                     );
+                    app_handle
+                        .state::<AppState>()
+                        .sdk_event(SdkEvent::Talk { user_id, speaking: false });
                 }
             }
         }
@@ -3347,6 +3395,8 @@ pub fn spawn_capture_encode_task(
     app_handle: tauri::AppHandle,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
+        // Whether voice was going out on the previous frame (talk edges)
+        let mut was_on_air = false;
         let capture_error = Arc::new(AtomicBool::new(false));
         let (mut _capture_stream, mut consumer) =
             match voipc_audio::capture::start_capture(
@@ -3465,7 +3515,19 @@ pub fn spawn_capture_encode_task(
                 crate::app_state::VoiceMode::AlwaysOn => true,
             };
 
-            if !should_send || is_muted.load(Ordering::Relaxed) {
+            // Voice actually on the wire, which is what a mod means by
+            // "speaking": `transmitting` is always true in VAD and always-on
+            // mode, so only this gate knows. Published on the edges.
+            let on_air = should_send && !is_muted.load(Ordering::Relaxed);
+            if on_air != was_on_air {
+                was_on_air = on_air;
+                app_handle.state::<AppState>().sdk_event(SdkEvent::Talk {
+                    user_id: session_id,
+                    speaking: on_air,
+                });
+            }
+
+            if !on_air {
                 accumulated = 0;
                 continue;
             }
@@ -3539,6 +3601,14 @@ pub fn spawn_capture_encode_task(
             accumulated = 0;
         }
 
+        // PTT released (or the stream died) mid-word: a mod must not be left
+        // drawing a talking icon forever.
+        if was_on_air {
+            app_handle.state::<AppState>().sdk_event(SdkEvent::Talk {
+                user_id: session_id,
+                speaking: false,
+            });
+        }
         info!("capture+encode task stopped");
     })
 }

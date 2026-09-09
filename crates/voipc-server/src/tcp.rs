@@ -455,6 +455,7 @@ async fn handle_message(
             name,
             password,
             proximity,
+            anonymous,
         } => {
             let allowed = state
                 .sessions
@@ -466,8 +467,10 @@ async fn handle_message(
                     reason: "rate limit exceeded, try again later".into(),
                 }).await;
             } else {
-                handle_create_channel(state, user_id, session_id, name, password, proximity, tx)
-                    .await?;
+                handle_create_channel(
+                    state, user_id, session_id, name, password, proximity, anonymous, tx,
+                )
+                .await?;
             }
         }
         ClientMessage::Disconnect => {
@@ -525,6 +528,26 @@ async fn handle_message(
             handle_set_channel_proximity(state, user_id, session_id, channel_id, proximity, tx)
                 .await?;
         }
+        ClientMessage::SetChannelOptions {
+            channel_id,
+            hidden,
+            anonymous,
+            screen_share,
+            hide_members,
+        } => {
+            handle_set_channel_options(
+                state,
+                user_id,
+                session_id,
+                channel_id,
+                hidden,
+                anonymous,
+                screen_share,
+                hide_members,
+                tx,
+            )
+            .await?;
+        }
         ClientMessage::KickUser {
             channel_id,
             user_id: target_id,
@@ -532,9 +555,10 @@ async fn handle_message(
             handle_kick_user(state, user_id, session_id, channel_id, target_id, tx).await?;
         }
         ClientMessage::RequestChannelUsers { channel_id } => {
-            let allowed = state.is_channel_public_or_member(channel_id, user_id).await;
+            let allowed = state.is_channel_public_or_member(channel_id, user_id).await
+                || state.is_admin(session_id);
             let users = if allowed {
-                state.users_in_channel(channel_id).await
+                state.users_in_channel_for(channel_id, session_id).await
             } else {
                 vec![]
             };
@@ -888,7 +912,7 @@ async fn handle_join_channel(
         // Shouldn't happen, but handle gracefully
         warn!(user_id, "join failed after validation: {}", e);
         let _ = state.join_channel(user_id, session_id, 0, None).await;
-        let users = state.users_in_channel(0).await;
+        let users = state.users_in_channel_for(0, session_id).await;
         let _ = send_msg(
             tx,
             &ServerMessage::UserList {
@@ -901,7 +925,7 @@ async fn handle_join_channel(
     }
 
     // Send user list for the new channel to the joining user
-    let users = state.users_in_channel(channel_id).await;
+    let users = state.users_in_channel_for(channel_id, session_id).await;
     let _ = send_msg(
         tx,
         &ServerMessage::UserList {
@@ -937,10 +961,38 @@ async fn handle_join_channel(
         is_admin: state.is_admin(session_id),
     };
 
-    let join_msg = ServerMessage::UserJoined { user: user_info };
-    broadcast_to_all(state, &join_msg, Some(user_id)).await;
+    broadcast_user_joined(state, user_info).await;
 
     Ok(())
+}
+
+/// Announce a join to everyone but the joiner, each recipient getting the
+/// name they may see. `user.username` carries the real name.
+///
+/// This goes to every session, not just the channel's, because it doubles as
+/// the user-count update — so a recipient who is not in the channel gets no
+/// name at all. Otherwise moving between an anonymous channel and an ordinary
+/// one would hand outsiders both names for the same id, and the members left
+/// behind would learn who the pseudonym had been.
+async fn broadcast_user_joined(state: &Arc<ServerState>, user: UserInfo) {
+    let (real, alias) = state.names_of(user.user_id).await;
+    for entry in state.sessions.iter() {
+        let session = entry.value();
+        if session.user_id == user.user_id {
+            continue;
+        }
+        let username = if session.channel_id == user.channel_id || session.is_admin {
+            crate::state::pick_name(&real, &alias, session.is_admin)
+        } else {
+            // The client only renders this for its own channel anyway
+            String::new()
+        };
+        let info = UserInfo {
+            username,
+            ..user.clone()
+        };
+        let _ = send_msg(&session.tcp_tx, &ServerMessage::UserJoined { user: info }).await;
+    }
 }
 
 /// Handle a create channel request.
@@ -951,6 +1003,7 @@ async fn handle_create_channel(
     name: String,
     password: Option<String>,
     proximity: ProximityMode,
+    anonymous: bool,
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
     // Validate and sanitize name
@@ -983,7 +1036,10 @@ async fn handle_create_channel(
     // Store password for the join call (create_channel takes ownership)
     let join_password = password.clone();
 
-    match state.create_channel(name, password, proximity, user_id).await {
+    match state
+        .create_channel(name, password, proximity, anonymous, user_id)
+        .await
+    {
         Ok(info) => {
             let channel_id = info.channel_id;
             // Broadcast ChannelCreated to all users
@@ -1081,6 +1137,116 @@ async fn handle_set_channel_proximity(
     Ok(())
 }
 
+/// Handle a change to the other channel options (creator or admin).
+#[allow(clippy::too_many_arguments)]
+async fn handle_set_channel_options(
+    state: &Arc<ServerState>,
+    user_id: UserId,
+    session_id: SessionId,
+    channel_id: ChannelId,
+    hidden: Option<bool>,
+    anonymous: Option<bool>,
+    screen_share: Option<bool>,
+    hide_members: Option<bool>,
+    tx: &mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    let is_admin = state.is_admin(session_id);
+    match state
+        .set_channel_options(
+            channel_id,
+            user_id,
+            hidden,
+            anonymous,
+            screen_share,
+            hide_members,
+            is_admin,
+        )
+        .await
+    {
+        Ok(updated_info) => {
+            let now_anonymous = updated_info.anonymous;
+            let sharing_off = !updated_info.screen_share;
+            let msg = ServerMessage::ChannelUpdated {
+                channel: updated_info,
+            };
+            broadcast_to_all(state, &msg, None).await;
+
+            // Switching sharing off stops the shares already running: leaving
+            // them relaying would make the option a lie, and the sharer's UI
+            // has no reason to keep a Stop button for a channel that forbids it.
+            if sharing_off {
+                let sharers: Vec<(UserId, SessionId)> = {
+                    let channels = state.channels.read().await;
+                    channels
+                        .get(&channel_id)
+                        .map(|ch| {
+                            ch.screen_shares
+                                .values()
+                                .map(|s| (s.sharer_user_id, s.sharer_session_id))
+                                .collect()
+                        })
+                        .unwrap_or_default()
+                };
+                for (sharer_uid, sharer_sid) in sharers {
+                    cleanup_and_notify_screen_shares(state, sharer_uid, sharer_sid, channel_id)
+                        .await;
+                    // Tell the sharer's own client to stop capturing
+                    if let Some(session) = state.sessions.get(&sharer_sid) {
+                        let _ = send_msg(
+                            &session.tcp_tx,
+                            &ServerMessage::ScreenShareError {
+                                reason: "screen sharing was switched off in this channel".into(),
+                            },
+                        )
+                        .await;
+                    }
+                }
+            }
+
+            // Anonymity changed the names the members go by, and their client
+            // stores hold the old ones: hand each member a fresh list.
+            if anonymous.is_some_and(|v| v == now_anonymous) {
+                resend_user_list(state, channel_id).await;
+            }
+        }
+        Err(e) => {
+            let _ = send_msg(
+                tx,
+                &ServerMessage::ChannelError {
+                    reason: e.to_string(),
+                },
+            )
+            .await;
+        }
+    }
+    Ok(())
+}
+
+/// Send every member of a channel the member list as they may now see it.
+async fn resend_user_list(state: &Arc<ServerState>, channel_id: ChannelId) {
+    let members: Vec<SessionId> = {
+        let channels = state.channels.read().await;
+        let Some(channel) = channels.get(&channel_id) else {
+            return;
+        };
+        channel
+            .members
+            .iter()
+            .filter_map(|uid| state.user_to_session.get(uid).map(|s| *s))
+            .collect()
+    };
+    for sid in members {
+        let users = state.users_in_channel_for(channel_id, sid).await;
+        if let Some(session) = state.sessions.get(&sid) {
+            let _ = send_msg(
+                &session.tcp_tx,
+                &ServerMessage::UserList { channel_id, users },
+            )
+            .await;
+        }
+    }
+}
+
 /// Handle a kick request from the channel creator.
 async fn handle_kick_user(
     state: &Arc<ServerState>,
@@ -1127,7 +1293,7 @@ async fn handle_kick_user(
 
             // Move the kicked user to General (channel 0)
             let _ = state.join_channel(target_id, target_session_id, 0, None).await;
-            let general_users = state.users_in_channel(0).await;
+            let general_users = state.users_in_channel_for(0, target_session_id).await;
 
             if let Some(session) = state.sessions.get(&target_session_id) {
                 let _ = send_msg(
@@ -1162,8 +1328,7 @@ async fn handle_kick_user(
                 is_screen_sharing: false,
                 is_admin: state.is_admin(target_session_id),
             };
-            let join_msg = ServerMessage::UserJoined { user: user_info };
-            broadcast_to_all(state, &join_msg, Some(target_id)).await;
+            broadcast_user_joined(state, user_info).await;
 
             // Start auto-delete timer if the channel is now empty
             if remaining_count == 0 {
@@ -1192,7 +1357,14 @@ async fn handle_send_invite(
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
     match state.add_invite(channel_id, requester_id, target_user_id).await {
-        Ok((channel_name, invited_by)) => {
+        Ok((channel_name, mut invited_by)) => {
+            // Bound to a `let` first: in an `if let` the DashMap guard lives
+            // to the end of the block, and `display_name` takes the channels
+            // lock (and this shard again) while it is held.
+            let target_sid = state.user_to_session.get(&target_user_id).map(|s| *s);
+            if let Some(sid) = target_sid {
+                invited_by = state.display_name(requester_id, sid).await;
+            }
             // Send InviteReceived to the target user
             if let Some(target_sid) = state.user_to_session.get(&target_user_id) {
                 if let Some(session) = state.sessions.get(&*target_sid) {
@@ -1232,12 +1404,14 @@ async fn handle_send_poke(
     message_type: u8,
     _tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
-    // Look up sender username
-    let from_username = state
-        .sessions
-        .get(&from_session_id)
-        .map(|s| s.username.clone())
-        .unwrap_or_default();
+    // The name the target may see: a poke from an anonymous channel must not
+    // carry the real one
+    let target_session = state.user_to_session.get(&target_user_id).map(|s| *s);
+    let from_username = match target_session {
+        Some(sid) => state.display_name(from_user_id, sid).await,
+        None => String::new(),
+    };
+    let _ = from_session_id;
 
     // Find the target user's session and relay the encrypted poke
     match state.user_to_session.get(&target_user_id) {
@@ -1461,6 +1635,11 @@ async fn handle_request_channel_history(
     {
         return;
     }
+    // No hand-off in an anonymous channel: the names in an archive are inside
+    // the ciphertext, where the server cannot substitute them
+    if state.is_anonymous_channel(channel_id).await {
+        return;
+    }
     if let Some(target_sid) = state.user_to_session.get(&target_user_id) {
         if let Some(session) = state.sessions.get(&*target_sid) {
             let _ = send_msg(
@@ -1485,6 +1664,12 @@ async fn handle_send_channel_history(
     message_type: u8,
 ) {
     if !both_in_channel(state, channel_id, from_user_id, target_user_id).await {
+        return;
+    }
+    // An archive carries the names its owner stored, inside the ciphertext
+    // where the server cannot substitute them — so an anonymous channel gets
+    // no history hand-off at all.
+    if state.is_anonymous_channel(channel_id).await {
         return;
     }
     let from_username = state
@@ -1531,26 +1716,30 @@ async fn handle_start_screen_share(
         .await
     {
         Ok(member_sessions) => {
-            let username = state
-                .sessions
-                .get(&session_id)
-                .map(|s| s.username.clone())
-                .unwrap_or_default();
+            let (real, alias) = state.names_of(user_id).await;
 
-            let msg = ServerMessage::ScreenShareStarted {
-                user_id,
-                username,
-                resolution,
-            };
-
-            // Broadcast to all channel members (including sender for confirmation)
+            // Broadcast to all channel members (including sender for confirmation),
+            // each under the name they may see
             for sid in &member_sessions {
                 if let Some(session) = state.sessions.get(sid) {
+                    let msg = ServerMessage::ScreenShareStarted {
+                        user_id,
+                        username: crate::state::pick_name(&real, &alias, session.is_admin),
+                        resolution,
+                    };
                     let _ = send_msg(&session.tcp_tx, &msg).await;
                 }
             }
-            // Also send to the sharer themselves
-            let _ = send_msg(tx, &msg).await;
+            // Also send to the sharer themselves, under their own name here
+            let _ = send_msg(
+                tx,
+                &ServerMessage::ScreenShareStarted {
+                    user_id,
+                    username: crate::state::pick_name(&real, &alias, state.is_admin(session_id)),
+                    resolution,
+                },
+            )
+            .await;
         }
         Err(e) => {
             let _ = send_msg(
@@ -1873,22 +2062,17 @@ async fn handle_encrypted_direct_message(
     message_type: u8,
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
-    let from_username = state
-        .sessions
-        .get(&from_session_id)
-        .map(|s| s.username.clone())
-        .unwrap_or_default();
+    let (real, alias) = state.names_of(from_user_id).await;
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64;
-
-    let msg = ServerMessage::EncryptedDirectChatMessage {
+    let message = |username: String| ServerMessage::EncryptedDirectChatMessage {
         from_user_id,
-        from_username,
+        from_username: username,
         to_user_id: target_user_id,
-        ciphertext,
+        ciphertext: ciphertext.clone(),
         message_type,
         timestamp,
     };
@@ -1896,12 +2080,15 @@ async fn handle_encrypted_direct_message(
     // Attempt delivery to target (silently fail if offline — prevents user enumeration)
     if let Some(target_sid) = state.user_to_session.get(&target_user_id) {
         if let Some(session) = state.sessions.get(&*target_sid) {
-            let _ = send_msg(&session.tcp_tx, &msg).await;
+            let name = crate::state::pick_name(&real, &alias, session.is_admin);
+            let _ = send_msg(&session.tcp_tx, &message(name)).await;
         }
     }
 
-    // Always echo back to sender regardless of delivery success
-    let _ = send_msg(tx, &msg).await;
+    // Always echo back to sender regardless of delivery success, under the
+    // name the sender themselves goes by
+    let own = crate::state::pick_name(&real, &alias, state.is_admin(from_session_id));
+    let _ = send_msg(tx, &message(own)).await;
 
     Ok(())
 }
@@ -1934,17 +2121,35 @@ async fn handle_encrypted_channel_message(
         .unwrap_or_default()
         .as_millis() as u64;
 
-    let msg = ServerMessage::EncryptedChannelChatMessage {
-        channel_id,
-        user_id,
-        username,
-        ciphertext,
-        timestamp,
-    };
-
     // Encrypted channel messages go to channel members except the sender
-    // (sender can't decrypt their own sender key ciphertext)
-    broadcast_to_channel(state, channel_id, &msg, Some(user_id)).await;
+    // (sender can't decrypt their own sender key ciphertext), each under the
+    // name they may see
+    let (real, alias) = state.names_of(user_id).await;
+    let _ = username;
+    let members: Vec<SessionId> = {
+        let channels = state.channels.read().await;
+        match channels.get(&channel_id) {
+            Some(channel) => channel
+                .members
+                .iter()
+                .filter(|&&uid| uid != user_id)
+                .filter_map(|uid| state.user_to_session.get(uid).map(|s| *s))
+                .collect(),
+            None => Vec::new(),
+        }
+    };
+    for sid in members {
+        if let Some(session) = state.sessions.get(&sid) {
+            let msg = ServerMessage::EncryptedChannelChatMessage {
+                channel_id,
+                user_id,
+                username: crate::state::pick_name(&real, &alias, session.is_admin),
+                ciphertext: ciphertext.clone(),
+                timestamp,
+            };
+            let _ = send_msg(&session.tcp_tx, &msg).await;
+        }
+    }
 
     Ok(())
 }
@@ -2494,7 +2699,7 @@ mod tests {
 
         // Sharing needs a real channel; General never carries media.
         alice
-            .send(&ClientMessage::CreateChannel { name: "room".into(), password: None, proximity: ProximityMode::Off })
+            .send(&ClientMessage::CreateChannel { name: "room".into(), password: None, proximity: ProximityMode::Off, anonymous: false })
             .await;
         let created = alice
             .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))

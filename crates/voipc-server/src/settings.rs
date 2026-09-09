@@ -72,7 +72,7 @@ mod tests {
         let settings: ServerSettings =
             serde_json::from_str(r#"{"proximity_enabled": false}"#).unwrap();
         assert!(!settings.proximity_enabled);
-        // A pre-0.6 settings file keeps proximity available
+        // A pre-0.7 settings file keeps proximity available
         let old: ServerSettings = serde_json::from_str(r#"{"max_channels": 10}"#).unwrap();
         assert!(old.proximity_enabled);
     }

@@ -35,6 +35,14 @@ export interface Listener {
   fwd: [number, number];
 }
 
+/**
+ * Effect chain a source is rendered through. Desktop only: the browser has no
+ * game SDK, and its worklet renders radio and phone flat. Here for type parity
+ * with spatial.rs — `gains()` ignores it on both sides, so the golden table is
+ * unaffected.
+ */
+export type Effect = "none" | "phone" | "radio";
+
 export interface Source {
   pos: [number, number, number];
   /** Distance (m) at which this source falls silent. */
@@ -45,6 +53,8 @@ export interface Source {
   muffle: number;
   /** Render flat: radio, phone, megaphone, spectators. */
   direct: boolean;
+  /** Desktop-only effect chain; the browser renders these flat. */
+  fx?: Effect;
 }
 
 export interface Gains {

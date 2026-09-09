@@ -49,6 +49,8 @@
   let sdkGame = $state("");
   /** False where the SDK is compiled out (Android), so the section stays hidden. */
   let sdkAvailable = $state(false);
+  /** Why the port could not be taken; empty while the listener is fine. */
+  let sdkError = $state("");
 
   async function loadSdkStatus() {
     if (isWeb) return;
@@ -60,6 +62,7 @@
         origins: string[];
         connected: boolean;
         game: string;
+        error: string | null;
       }>("get_sdk_status");
       sdkAvailable = status.available;
       sdkEnabled = status.enabled;
@@ -68,6 +71,7 @@
       // A game that connected before this panel opened sent its event to nobody
       sdkConnected = status.connected;
       sdkGame = status.game;
+      sdkError = status.error ?? "";
     } catch (e) {
       console.error("Failed to read the game SDK status:", e);
     }
@@ -445,9 +449,18 @@
   loadSdkStatus();
 
   // A game connecting or leaving shows up live in the panel
-  const sdkUnlisten = listen<{ connected: boolean; game: string }>("sdk-status", (event) => {
-    sdkConnected = event.payload.connected;
-    sdkGame = event.payload.game;
+  // Two kinds of update share this event: a game connecting or leaving, and
+  // the listener failing (or managing) to bind. Merge by what is present.
+  const sdkUnlisten = listen<{
+    connected?: boolean;
+    game?: string;
+    error?: string | null;
+  }>("sdk-status", (event) => {
+    if (event.payload.connected !== undefined) {
+      sdkConnected = event.payload.connected;
+      sdkGame = event.payload.game ?? "";
+    }
+    if ("error" in event.payload) sdkError = event.payload.error ?? "";
   });
   onDestroy(() => {
     sdkUnlisten.then((off) => off()).catch(() => {});
@@ -710,6 +723,9 @@
             See docs/SDK.md.
           </span>
         </label>
+        {#if sdkEnabled && sdkError}
+          <span class="toggle-hint sdk-error">{sdkError}</span>
+        {/if}
         {#if sdkEnabled}
           <div class="ptt-config">
             <span class="hotkey-label">Port</span>
@@ -1028,6 +1044,10 @@
     gap: 10px;
     font-size: 12px;
     color: var(--text-secondary);
+  }
+
+  .sdk-error {
+    color: var(--danger, #ed4245);
   }
 
   .sdk-input {

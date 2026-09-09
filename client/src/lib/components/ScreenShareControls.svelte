@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { currentChannelId } from "../stores/channels.js";
+  import { channels, currentChannelId } from "../stores/channels.js";
   import {
     isSharingScreen,
     viewerCount,
@@ -17,6 +17,10 @@
   import Icon from "./Icons.svelte";
 
   let inLobby = $derived($currentChannelId === 0);
+  // A channel can switch sharing off (the server refuses it there too)
+  let shareOff = $derived(
+    $channels.find((c) => c.channel_id === $currentChannelId)?.screen_share === false,
+  );
 
   // The browser client shares through WebCodecs + getDisplayMedia; a browser
   // without them (or a mobile one) keeps the button hidden.
@@ -76,7 +80,9 @@
   }
 </script>
 
-{#if !inLobby && canShare}
+<!-- Switching sharing off mid-share must not strand the sharer: keep the
+     controls (i.e. Stop) while they are still sending. -->
+{#if !inLobby && canShare && (!shareOff || $isSharingScreen)}
   <div class="divider"></div>
 
   {#if $isSharingScreen}

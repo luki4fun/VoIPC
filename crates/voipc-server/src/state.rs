@@ -151,6 +151,30 @@ pub struct Channel {
     pub screen_shares: HashMap<UserId, ScreenShareSession>,
     /// Whether this channel was loaded from channels.json and cannot be auto-deleted.
     pub persistent: bool,
+    /// The name each member is known by here while the channel is anonymous.
+    /// Assigned on join, dropped on leave; admins are told the real names.
+    pub pseudonyms: HashMap<UserId, String>,
+}
+
+/// The name one recipient may see: the pseudonym unless they are an admin.
+pub fn pick_name(real: &str, alias: &Option<String>, viewer_is_admin: bool) -> String {
+    match alias {
+        Some(alias) if !viewer_is_admin => alias.clone(),
+        _ => real.to_string(),
+    }
+}
+
+/// A pseudonym for an anonymous channel, unique among the ones in use.
+fn mint_pseudonym(taken: &HashMap<UserId, String>) -> String {
+    for _ in 0..64 {
+        let name = format!("Guest-{:04}", rand::random::<u16>() % 10_000);
+        if !taken.values().any(|n| n == &name) {
+            return name;
+        }
+    }
+    // 64 collisions in a row means the channel is impossibly full; fall back
+    // to something unique rather than looping.
+    format!("Guest-{}", rand::random::<u32>())
 }
 
 /// The shared server state, designed for concurrent access.
@@ -198,6 +222,10 @@ impl ServerState {
                     has_password: false,
                     created_by: None,
                     proximity: ProximityMode::Off,
+                    hidden: false,
+                    anonymous: false,
+                    screen_share: true,
+                    hide_members: false,
                 },
                 members: HashSet::new(),
                 password: None,
@@ -206,6 +234,7 @@ impl ServerState {
                 invited_users: HashSet::new(),
                 screen_shares: HashMap::new(),
                 persistent: false,
+                pseudonyms: HashMap::new(),
             },
         );
 
@@ -244,6 +273,10 @@ impl ServerState {
                         has_password,
                         created_by: None,
                         proximity,
+                        hidden: entry.hidden,
+                        anonymous: entry.anonymous,
+                        screen_share: entry.screen_share,
+                        hide_members: entry.hide_members,
                     },
                     members: HashSet::new(),
                     password,
@@ -252,6 +285,7 @@ impl ServerState {
                     invited_users: HashSet::new(),
                     screen_shares: HashMap::new(),
                     persistent: true,
+                    pseudonyms: HashMap::new(),
                 },
             );
         }
@@ -355,12 +389,18 @@ impl ServerState {
         list
     }
 
-    /// Get users in a specific channel.
-    pub async fn users_in_channel(&self, channel_id: ChannelId) -> Vec<UserInfo> {
+    /// Get users in a specific channel, as `viewer` may see them: in an
+    /// anonymous channel a non-admin viewer gets the members' pseudonyms.
+    pub async fn users_in_channel_for(
+        &self,
+        channel_id: ChannelId,
+        viewer_session: SessionId,
+    ) -> Vec<UserInfo> {
         let channels = self.channels.read().await;
         let Some(channel) = channels.get(&channel_id) else {
             return Vec::new();
         };
+        let anonymous = channel.info.anonymous && !self.is_admin(viewer_session);
 
         channel
             .members
@@ -368,9 +408,13 @@ impl ServerState {
             .filter_map(|&uid| {
                 let sid = self.user_to_session.get(&uid)?;
                 let session = self.sessions.get(&*sid)?;
+                let username = match anonymous.then(|| channel.pseudonyms.get(&uid)).flatten() {
+                    Some(alias) => alias.clone(),
+                    None => session.username.clone(),
+                };
                 Some(UserInfo {
                     user_id: session.user_id,
-                    username: session.username.clone(),
+                    username,
                     channel_id: session.channel_id,
                     is_muted: session.is_muted,
                     is_deafened: session.is_deafened,
@@ -379,6 +423,14 @@ impl ServerState {
                 })
             })
             .collect()
+    }
+
+    /// Whether a channel shows its members under pseudonyms.
+    pub async fn is_anonymous_channel(&self, channel_id: ChannelId) -> bool {
+        let channels = self.channels.read().await;
+        channels
+            .get(&channel_id)
+            .is_some_and(|ch| ch.info.anonymous)
     }
 
     /// Check if a join would succeed (password, capacity) without modifying state.
@@ -477,6 +529,13 @@ impl ServerState {
         channel.members.insert(user_id);
         channel.info.user_count = channel.members.len() as u32;
 
+        // In an anonymous channel this is the only name the other members
+        // ever learn; it lasts as long as this visit.
+        if channel.info.anonymous {
+            let name = mint_pseudonym(&channel.pseudonyms);
+            channel.pseudonyms.insert(user_id, name);
+        }
+
         // Update the session's channel_id
         if let Some(mut session) = self.sessions.get_mut(&session_id) {
             session.channel_id = channel_id;
@@ -505,6 +564,8 @@ impl ServerState {
             return None;
         }
         channel.info.user_count = channel.members.len() as u32;
+        // Coming back means a new pseudonym, which is the point
+        channel.pseudonyms.remove(&user_id);
 
         let remaining: Vec<SessionId> = channel
             .members
@@ -544,6 +605,7 @@ impl ServerState {
         name: String,
         password: Option<String>,
         proximity: ProximityMode,
+        anonymous: bool,
         created_by: UserId,
     ) -> anyhow::Result<ChannelInfo> {
         if proximity != ProximityMode::Off && !self.settings.proximity_enabled {
@@ -578,6 +640,12 @@ impl ServerState {
             has_password,
             created_by: Some(created_by),
             proximity,
+            // A user-created channel is an ordinary room; the rest are set
+            // afterwards through SetChannelOptions.
+            hidden: false,
+            anonymous,
+            screen_share: true,
+            hide_members: false,
         };
 
         channels.insert(
@@ -591,6 +659,7 @@ impl ServerState {
                 invited_users: HashSet::new(),
                 screen_shares: HashMap::new(),
                 persistent: false,
+                pseudonyms: HashMap::new(),
             },
         );
 
@@ -682,6 +751,91 @@ impl ServerState {
         Ok(channel.info.clone())
     }
 
+    /// Change the other channel options (creator or admin — persistent
+    /// channels have no creator, so those are admin-only, exactly as their
+    /// password is). `None` leaves an option alone. Returns the updated info.
+    pub async fn set_channel_options(
+        &self,
+        channel_id: ChannelId,
+        user_id: UserId,
+        hidden: Option<bool>,
+        anonymous: Option<bool>,
+        screen_share: Option<bool>,
+        hide_members: Option<bool>,
+        is_admin: bool,
+    ) -> anyhow::Result<ChannelInfo> {
+        if channel_id == 0 {
+            anyhow::bail!("cannot modify the General channel");
+        }
+
+        let mut channels = self.channels.write().await;
+        let channel = channels
+            .get_mut(&channel_id)
+            .ok_or_else(|| anyhow::anyhow!("channel does not exist"))?;
+
+        if !is_admin && channel.created_by != Some(user_id) {
+            anyhow::bail!("only the channel creator can change the channel options");
+        }
+
+        if let Some(v) = hidden {
+            channel.info.hidden = v;
+        }
+        if let Some(v) = screen_share {
+            channel.info.screen_share = v;
+        }
+        if let Some(v) = hide_members {
+            channel.info.hide_members = v;
+        }
+        if let Some(v) = anonymous {
+            if v != channel.info.anonymous {
+                channel.info.anonymous = v;
+                // Everyone here needs the names the channel now goes by: fresh
+                // pseudonyms when switching on, the real names when switching off.
+                channel.pseudonyms.clear();
+                if v {
+                    let members: Vec<UserId> = channel.members.iter().copied().collect();
+                    for uid in members {
+                        let name = mint_pseudonym(&channel.pseudonyms);
+                        channel.pseudonyms.insert(uid, name);
+                    }
+                }
+            }
+        }
+
+        Ok(channel.info.clone())
+    }
+
+    /// The real name of `subject`, and the pseudonym they currently go by if
+    /// they are in an anonymous channel.
+    ///
+    /// Broadcast loops resolve this once and then pick per recipient with
+    /// [`pick_name`] — the alternative, calling [`Self::display_name`] inside
+    /// the loop, would take the channels lock while holding a session shard.
+    pub async fn names_of(&self, subject: UserId) -> (String, Option<String>) {
+        let real = self
+            .user_to_session
+            .get(&subject)
+            .and_then(|sid| self.sessions.get(&*sid).map(|s| s.username.clone()))
+            .unwrap_or_default();
+        let channels = self.channels.read().await;
+        let alias = channels.values().find_map(|ch| {
+            (ch.info.anonymous && ch.members.contains(&subject))
+                .then(|| ch.pseudonyms.get(&subject).cloned())
+                .flatten()
+        });
+        (real, alias)
+    }
+
+    /// The name `subject` goes by as far as `viewer` is concerned.
+    ///
+    /// In an anonymous channel every member — including the subject, so they
+    /// know what the others see — is shown a pseudonym. Admins are shown the
+    /// real name, which is what makes moderating such a channel possible.
+    pub async fn display_name(&self, subject: UserId, viewer_session: SessionId) -> String {
+        let (real, alias) = self.names_of(subject).await;
+        pick_name(&real, &alias, self.is_admin(viewer_session))
+    }
+
     /// Remove a user from a channel (creator or admin kicks them).
     /// Returns the kicked user's session_id and the channel's remaining member count.
     pub async fn kick_user(
@@ -712,6 +866,7 @@ impl ServerState {
             anyhow::bail!("user is not in this channel");
         }
         channel.info.user_count = channel.members.len() as u32;
+        channel.pseudonyms.remove(&target_id);
 
         let target_session_id = self
             .user_to_session
@@ -797,6 +952,11 @@ impl ServerState {
         let channels = self.channels.read().await;
         match channels.get(&channel_id) {
             Some(channel) => {
+                // A channel that hides its members shows them to nobody who is
+                // not in it, password or not
+                if channel.info.hide_members && !channel.members.contains(&user_id) {
+                    return false;
+                }
                 channel.password.is_none() || channel.members.contains(&user_id)
             }
             None => false,
@@ -818,6 +978,17 @@ impl ServerState {
             anyhow::bail!("cannot screen share in the General channel");
         }
 
+        // Every refusal happens before the session is marked as sharing: a
+        // bail after that flag is set leaves the user unable to ever share
+        // again (it is only cleared on stop).
+        let mut channels = self.channels.write().await;
+        let channel = channels
+            .get_mut(&channel_id)
+            .ok_or_else(|| anyhow::anyhow!("channel not found"))?;
+        if !channel.info.screen_share {
+            anyhow::bail!("screen sharing is off in this channel");
+        }
+
         // Mark user as sharing
         if let Some(mut session) = self.sessions.get_mut(&session_id) {
             if session.is_screen_sharing {
@@ -827,11 +998,6 @@ impl ServerState {
         } else {
             anyhow::bail!("session not found");
         }
-
-        let mut channels = self.channels.write().await;
-        let channel = channels
-            .get_mut(&channel_id)
-            .ok_or_else(|| anyhow::anyhow!("channel not found"))?;
 
         channel.screen_shares.insert(
             user_id,
@@ -1206,6 +1372,10 @@ pub(crate) mod test_support {
                 has_password: false,
                 created_by: None,
                 proximity: ProximityMode::Off,
+                hidden: false,
+                anonymous: false,
+                screen_share: true,
+                hide_members: false,
             },
             members: HashSet::new(),
             password: None,
@@ -1214,6 +1384,7 @@ pub(crate) mod test_support {
             invited_users: HashSet::new(),
             screen_shares: HashMap::new(),
             persistent: false,
+            pseudonyms: HashMap::new(),
         });
         for &(user_id, session_id) in users {
             channel.members.insert(user_id);
@@ -1317,7 +1488,7 @@ mod tests {
     async fn validate_join_open_channel() {
         let state = make_state();
         let (uid, _) = add_user(&state, "alice");
-        let ch = state.create_channel("Open".into(), None, ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Open".into(), None, ProximityMode::Off, false, uid).await.unwrap();
         assert!(state.validate_join(ch.channel_id, None, uid).await.is_ok());
     }
 
@@ -1325,7 +1496,7 @@ mod tests {
     async fn validate_join_wrong_password() {
         let state = make_state();
         let (uid, _) = add_user(&state, "alice");
-        let ch = state.create_channel("Priv".into(), Some("secret".into()), ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Priv".into(), Some("secret".into()), ProximityMode::Off, false, uid).await.unwrap();
         let (uid2, _) = add_user(&state, "bob");
         let err = state.validate_join(ch.channel_id, Some("wrong"), uid2).await;
         assert!(err.unwrap_err().to_string().contains("incorrect"));
@@ -1335,7 +1506,7 @@ mod tests {
     async fn validate_join_correct_password() {
         let state = make_state();
         let (uid, _) = add_user(&state, "alice");
-        let ch = state.create_channel("Priv".into(), Some("secret".into()), ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Priv".into(), Some("secret".into()), ProximityMode::Off, false, uid).await.unwrap();
         let (uid2, _) = add_user(&state, "bob");
         assert!(state.validate_join(ch.channel_id, Some("secret"), uid2).await.is_ok());
     }
@@ -1344,7 +1515,7 @@ mod tests {
     async fn validate_join_full_channel() {
         let state = make_state();
         let (uid, sid) = add_user(&state, "alice");
-        let ch = state.create_channel("Small".into(), None, ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Small".into(), None, ProximityMode::Off, false, uid).await.unwrap();
         {
             let mut channels = state.channels.write().await;
             channels.get_mut(&ch.channel_id).unwrap().info.max_users = 1;
@@ -1359,7 +1530,7 @@ mod tests {
     async fn validate_join_invited_bypasses_password() {
         let state = make_state();
         let (uid, _) = add_user(&state, "alice");
-        let ch = state.create_channel("Inv".into(), Some("secret".into()), ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Inv".into(), Some("secret".into()), ProximityMode::Off, false, uid).await.unwrap();
         let (uid2, _) = add_user(&state, "bob");
         {
             let mut channels = state.channels.write().await;
@@ -1372,7 +1543,7 @@ mod tests {
     async fn join_channel_adds_member() {
         let state = make_state();
         let (uid, sid) = add_user(&state, "alice");
-        let ch = state.create_channel("Test".into(), None, ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Test".into(), None, ProximityMode::Off, false, uid).await.unwrap();
         let others = state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
         assert!(others.is_empty());
         let channels = state.channels.read().await;
@@ -1385,7 +1556,7 @@ mod tests {
     async fn join_channel_clears_invite() {
         let state = make_state();
         let (uid, _) = add_user(&state, "alice");
-        let ch = state.create_channel("Test".into(), Some("pw".into()), ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Test".into(), Some("pw".into()), ProximityMode::Off, false, uid).await.unwrap();
         let (uid2, sid2) = add_user(&state, "bob");
         {
             let mut channels = state.channels.write().await;
@@ -1400,7 +1571,7 @@ mod tests {
     async fn leave_channel_removes_member() {
         let state = make_state();
         let (uid, sid) = add_user(&state, "alice");
-        let ch = state.create_channel("Test".into(), None, ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Test".into(), None, ProximityMode::Off, false, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
         let (left_ch, remaining, count) = state.leave_current_channel(uid, sid).await.unwrap();
         assert_eq!(left_ch, ch.channel_id);
@@ -1412,7 +1583,7 @@ mod tests {
     async fn create_channel_succeeds() {
         let state = make_state();
         let (uid, _) = add_user(&state, "alice");
-        let ch = state.create_channel("MyRoom".into(), Some("pw".into()), ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("MyRoom".into(), Some("pw".into()), ProximityMode::Off, false, uid).await.unwrap();
         assert_eq!(ch.name, "MyRoom");
         assert!(ch.has_password);
         assert_eq!(ch.created_by, Some(uid));
@@ -1424,7 +1595,7 @@ mod tests {
         let state = make_state();
         let (uid, _) = add_user(&state, "alice");
         let ch = state
-            .create_channel("Room".into(), None, ProximityMode::ThreeD, uid)
+            .create_channel("Room".into(), None, ProximityMode::ThreeD, false, uid)
             .await
             .unwrap();
         assert_eq!(ch.proximity, ProximityMode::ThreeD);
@@ -1440,14 +1611,14 @@ mod tests {
         let (uid, _) = add_user(&state, "alice");
 
         let err = state
-            .create_channel("Room".into(), None, ProximityMode::TwoD, uid)
+            .create_channel("Room".into(), None, ProximityMode::TwoD, false, uid)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("disabled"));
 
         // An off channel is still fine, but it cannot be switched on later
         let ch = state
-            .create_channel("Room".into(), None, ProximityMode::Off, uid)
+            .create_channel("Room".into(), None, ProximityMode::Off, false, uid)
             .await
             .unwrap();
         let err = state
@@ -1466,6 +1637,7 @@ mod tests {
             password_hash: None,
             max_users: 0,
             proximity: ProximityMode::TwoD,
+            ..Default::default()
         };
         let on = ServerState::new(
             &ServerConfig::default(),
@@ -1490,7 +1662,7 @@ mod tests {
         let (uid, _) = add_user(&state, "alice");
         let (other, _) = add_user(&state, "bob");
         let ch = state
-            .create_channel("Room".into(), None, ProximityMode::Off, uid)
+            .create_channel("Room".into(), None, ProximityMode::Off, false, uid)
             .await
             .unwrap();
 
@@ -1518,6 +1690,272 @@ mod tests {
             .is_err());
     }
 
+    // ── Channel options: hidden / anonymous / screen share / hide members ──
+
+    /// Marks a session as logged in with the admin token.
+    fn make_admin(state: &ServerState, session_id: SessionId) {
+        state.sessions.get_mut(&session_id).unwrap().is_admin = true;
+    }
+
+    #[tokio::test]
+    async fn an_anonymous_channel_hands_out_pseudonyms() {
+        let state = make_state();
+        let (alice, alice_sid) = add_user(&state, "alice");
+        let (bob, bob_sid) = add_user(&state, "bob");
+        let ch = state
+            .create_channel("Ingame".into(), None, ProximityMode::Off, true, alice)
+            .await
+            .unwrap();
+        state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
+        state.join_channel(bob, bob_sid, ch.channel_id, None).await.unwrap();
+
+        let seen = state.users_in_channel_for(ch.channel_id, bob_sid).await;
+        assert_eq!(seen.len(), 2);
+        for user in &seen {
+            assert!(user.username.starts_with("Guest-"), "{}", user.username);
+        }
+        // Unique, so two members are never the same person
+        assert_ne!(seen[0].username, seen[1].username);
+        // Stable while they stay: the list must not reshuffle on every send
+        let again = state.users_in_channel_for(ch.channel_id, bob_sid).await;
+        assert_eq!(seen[0].username, again[0].username);
+        // Even about themselves, so they know what the others see
+        let own = state.display_name(bob, bob_sid).await;
+        assert!(own.starts_with("Guest-"), "{own}");
+    }
+
+    #[tokio::test]
+    async fn an_admin_sees_the_real_names() {
+        let state = make_state();
+        let (alice, alice_sid) = add_user(&state, "alice");
+        let (mod_id, mod_sid) = add_user(&state, "moderator");
+        make_admin(&state, mod_sid);
+        let ch = state
+            .create_channel("Ingame".into(), None, ProximityMode::Off, true, alice)
+            .await
+            .unwrap();
+        state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
+        state.join_channel(mod_id, mod_sid, ch.channel_id, None).await.unwrap();
+
+        let seen = state.users_in_channel_for(ch.channel_id, mod_sid).await;
+        let names: Vec<&str> = seen.iter().map(|u| u.username.as_str()).collect();
+        assert!(names.contains(&"alice"), "{names:?}");
+        assert_eq!(state.display_name(alice, mod_sid).await, "alice");
+    }
+
+    #[tokio::test]
+    async fn a_pseudonym_lasts_only_for_the_visit() {
+        let state = make_state();
+        let (alice, alice_sid) = add_user(&state, "alice");
+        let ch = state
+            .create_channel("Ingame".into(), None, ProximityMode::Off, true, alice)
+            .await
+            .unwrap();
+        state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
+        let first = state.display_name(alice, alice_sid).await;
+
+        state.leave_current_channel(alice, alice_sid).await;
+        {
+            let channels = state.channels.read().await;
+            assert!(channels[&ch.channel_id].pseudonyms.is_empty(), "left behind");
+        }
+        // Outside an anonymous channel the real name is used again
+        assert_eq!(state.display_name(alice, alice_sid).await, "alice");
+
+        state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
+        let second = state.display_name(alice, alice_sid).await;
+        assert!(second.starts_with("Guest-"));
+        let _ = first; // a repeat is possible, just unlikely; identity is not the claim
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_channel_uses_real_names() {
+        let state = make_state();
+        let (alice, alice_sid) = add_user(&state, "alice");
+        let ch = state
+            .create_channel("Room".into(), None, ProximityMode::Off, false, alice)
+            .await
+            .unwrap();
+        state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
+        assert_eq!(state.display_name(alice, alice_sid).await, "alice");
+        assert_eq!(
+            state.users_in_channel_for(ch.channel_id, alice_sid).await[0].username,
+            "alice"
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_anonymity_on_and_off_swaps_the_names() {
+        let state = make_state();
+        let (alice, alice_sid) = add_user(&state, "alice");
+        let ch = state
+            .create_channel("Room".into(), None, ProximityMode::Off, false, alice)
+            .await
+            .unwrap();
+        state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
+
+        let on = state
+            .set_channel_options(ch.channel_id, alice, None, Some(true), None, None, false)
+            .await
+            .unwrap();
+        assert!(on.anonymous);
+        assert!(state.display_name(alice, alice_sid).await.starts_with("Guest-"));
+
+        let off = state
+            .set_channel_options(ch.channel_id, alice, None, Some(false), None, None, false)
+            .await
+            .unwrap();
+        assert!(!off.anonymous);
+        assert_eq!(state.display_name(alice, alice_sid).await, "alice");
+    }
+
+    #[tokio::test]
+    async fn set_channel_options_permissions() {
+        let state = make_state();
+        let (alice, _) = add_user(&state, "alice");
+        let (bob, _) = add_user(&state, "bob");
+        let ch = state
+            .create_channel("Room".into(), None, ProximityMode::Off, false, alice)
+            .await
+            .unwrap();
+
+        // The creator may, a stranger may not, an admin may
+        let updated = state
+            .set_channel_options(ch.channel_id, alice, Some(true), None, Some(false), Some(true), false)
+            .await
+            .unwrap();
+        assert!(updated.hidden && updated.hide_members && !updated.screen_share);
+        assert!(state
+            .set_channel_options(ch.channel_id, bob, Some(false), None, None, None, false)
+            .await
+            .is_err());
+        assert!(state
+            .set_channel_options(ch.channel_id, bob, Some(false), None, None, None, true)
+            .await
+            .is_ok());
+        // Never the General channel
+        assert!(state
+            .set_channel_options(0, alice, Some(true), None, None, None, true)
+            .await
+            .is_err());
+
+        // None leaves an option alone
+        let before = state
+            .set_channel_options(ch.channel_id, alice, None, None, None, None, false)
+            .await
+            .unwrap();
+        assert!(!before.hidden, "hidden was set to false above");
+        assert!(before.hide_members, "hide_members must be untouched");
+    }
+
+    #[tokio::test]
+    async fn screen_sharing_can_be_switched_off_per_channel() {
+        let state = make_state();
+        let (alice, alice_sid) = add_user(&state, "alice");
+        let ch = state
+            .create_channel("Ingame".into(), None, ProximityMode::Off, false, alice)
+            .await
+            .unwrap();
+        state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
+        state
+            .set_channel_options(ch.channel_id, alice, None, None, Some(false), None, false)
+            .await
+            .unwrap();
+
+        let err = state
+            .start_screen_share(alice, alice_sid, ch.channel_id, 720, VideoCodec::H264)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("off in this channel"), "{err}");
+        // The refusal must not leave the session marked as sharing: that flag
+        // is only cleared on stop, so they could never share again
+        assert!(!state.sessions.get(&alice_sid).unwrap().is_screen_sharing);
+
+        // Switched back on, sharing works
+        state
+            .set_channel_options(ch.channel_id, alice, None, None, Some(true), None, false)
+            .await
+            .unwrap();
+        assert!(state
+            .start_screen_share(alice, alice_sid, ch.channel_id, 720, VideoCodec::H264)
+            .await
+            .is_ok());
+    }
+
+    #[tokio::test]
+    async fn switching_sharing_off_leaves_a_running_share_to_be_stopped() {
+        // The option flip does not itself end the share; tcp.rs stops the
+        // sharers it finds here, so the list must still be readable.
+        let state = make_state();
+        let (alice, alice_sid) = add_user(&state, "alice");
+        let ch = state
+            .create_channel("Room".into(), None, ProximityMode::Off, false, alice)
+            .await
+            .unwrap();
+        state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
+        state
+            .start_screen_share(alice, alice_sid, ch.channel_id, 720, VideoCodec::H264)
+            .await
+            .unwrap();
+
+        state
+            .set_channel_options(ch.channel_id, alice, None, None, Some(false), None, false)
+            .await
+            .unwrap();
+        let sharers: Vec<UserId> = {
+            let channels = state.channels.read().await;
+            channels[&ch.channel_id]
+                .screen_shares
+                .values()
+                .map(|s| s.sharer_user_id)
+                .collect()
+        };
+        assert_eq!(sharers, vec![alice], "the running share must still be findable");
+    }
+
+    #[tokio::test]
+    async fn a_hide_members_channel_shows_nobody_to_outsiders() {
+        let state = make_state();
+        let (alice, alice_sid) = add_user(&state, "alice");
+        let (bob, _) = add_user(&state, "bob");
+        let ch = state
+            .create_channel("Ingame".into(), None, ProximityMode::Off, false, alice)
+            .await
+            .unwrap();
+        state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
+        state
+            .set_channel_options(ch.channel_id, alice, None, None, None, Some(true), false)
+            .await
+            .unwrap();
+
+        // The preview a non-member asks for is refused, password or not
+        assert!(!state.is_channel_public_or_member(ch.channel_id, bob).await);
+        // A member still sees the channel, since the keys are per member
+        assert!(state.is_channel_public_or_member(ch.channel_id, alice).await);
+    }
+
+    #[tokio::test]
+    async fn persistent_channels_carry_their_options() {
+        let state = ServerState::new(
+            &ServerConfig::default(),
+            ServerSettings::default(),
+            vec![ChannelEntry {
+                name: "Ingame".into(),
+                proximity: ProximityMode::ThreeD,
+                hidden: true,
+                anonymous: true,
+                screen_share: false,
+                hide_members: true,
+                ..Default::default()
+            }],
+            "t".into(),
+        );
+        let info = &state.channels.read().await[&1].info;
+        assert!(info.hidden && info.anonymous && info.hide_members);
+        assert!(!info.screen_share);
+        assert_eq!(info.proximity, ProximityMode::ThreeD);
+    }
+
     #[tokio::test]
     async fn persistent_channel_proximity_is_admin_only() {
         let state = ServerState::new(
@@ -1530,6 +1968,7 @@ mod tests {
                 password_hash: None,
                 max_users: 0,
                 proximity: ProximityMode::Off,
+                ..Default::default()
             }],
             "t".into(),
         );
@@ -1549,8 +1988,8 @@ mod tests {
     async fn create_channel_duplicate_name_fails() {
         let state = make_state();
         let (uid, _) = add_user(&state, "alice");
-        state.create_channel("Dup".into(), None, ProximityMode::Off, uid).await.unwrap();
-        let err = state.create_channel("Dup".into(), None, ProximityMode::Off, uid).await;
+        state.create_channel("Dup".into(), None, ProximityMode::Off, false, uid).await.unwrap();
+        let err = state.create_channel("Dup".into(), None, ProximityMode::Off, false, uid).await;
         assert!(err.unwrap_err().to_string().contains("already exists"));
     }
 
@@ -1565,7 +2004,7 @@ mod tests {
     async fn delete_channel_empty_succeeds() {
         let state = make_state();
         let (uid, _) = add_user(&state, "alice");
-        let ch = state.create_channel("ToDelete".into(), None, ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("ToDelete".into(), None, ProximityMode::Off, false, uid).await.unwrap();
         assert!(state.delete_channel(ch.channel_id).await.is_ok());
         let channels = state.channels.read().await;
         assert!(!channels.contains_key(&ch.channel_id));
@@ -1577,7 +2016,7 @@ mod tests {
     async fn set_password_by_creator() {
         let state = make_state();
         let (uid, _) = add_user(&state, "alice");
-        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, false, uid).await.unwrap();
         let updated = state.set_channel_password(ch.channel_id, uid, Some("pw".into()), false).await.unwrap();
         assert!(updated.has_password);
     }
@@ -1586,7 +2025,7 @@ mod tests {
     async fn set_password_non_creator_fails() {
         let state = make_state();
         let (uid, _) = add_user(&state, "alice");
-        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, false, uid).await.unwrap();
         let (uid2, _) = add_user(&state, "bob");
         let err = state.set_channel_password(ch.channel_id, uid2, Some("hack".into()), false).await;
         assert!(err.unwrap_err().to_string().contains("creator"));
@@ -1604,7 +2043,7 @@ mod tests {
     async fn kick_user_by_creator() {
         let state = make_state();
         let (uid, sid) = add_user(&state, "alice");
-        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, false, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
         let (uid2, sid2) = add_user(&state, "bob");
         state.join_channel(uid2, sid2, ch.channel_id, None).await.unwrap();
@@ -1617,7 +2056,7 @@ mod tests {
     async fn kick_self_fails() {
         let state = make_state();
         let (uid, sid) = add_user(&state, "alice");
-        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, false, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
         let err = state.kick_user(ch.channel_id, uid, uid, false).await;
         assert!(err.unwrap_err().to_string().contains("yourself"));
@@ -1627,7 +2066,7 @@ mod tests {
     async fn kick_non_creator_fails() {
         let state = make_state();
         let (uid, sid) = add_user(&state, "alice");
-        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, false, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
         let (uid2, sid2) = add_user(&state, "bob");
         state.join_channel(uid2, sid2, ch.channel_id, None).await.unwrap();
@@ -1639,7 +2078,7 @@ mod tests {
     async fn add_invite_succeeds() {
         let state = make_state();
         let (uid, _) = add_user(&state, "alice");
-        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, false, uid).await.unwrap();
         let (uid2, _) = add_user(&state, "bob");
         let (ch_name, inviter) = state.add_invite(ch.channel_id, uid, uid2).await.unwrap();
         assert_eq!(ch_name, "Room");
@@ -1652,7 +2091,7 @@ mod tests {
     async fn add_invite_limit() {
         let state = make_state();
         let (uid, _) = add_user(&state, "alice");
-        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, false, uid).await.unwrap();
         for i in 0..50 {
             let (target, _) = add_user(&state, &format!("user{i}"));
             state.add_invite(ch.channel_id, uid, target).await.unwrap();
@@ -1668,7 +2107,7 @@ mod tests {
     async fn start_screen_share() {
         let state = make_state();
         let (uid, sid) = add_user(&state, "alice");
-        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, false, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
         let others = state.start_screen_share(uid, sid, ch.channel_id, 720, VideoCodec::H264).await.unwrap();
         assert!(others.is_empty());
@@ -1689,7 +2128,7 @@ mod tests {
     async fn stop_screen_share_clears_state() {
         let state = make_state();
         let (uid, sid) = add_user(&state, "alice");
-        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, false, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
         state.start_screen_share(uid, sid, ch.channel_id, 720, VideoCodec::H264).await.unwrap();
         state.stop_screen_share(uid, sid, ch.channel_id).await.unwrap();
@@ -1702,7 +2141,7 @@ mod tests {
     async fn watch_screen_share_adds_viewer() {
         let state = make_state();
         let (uid, sid) = add_user(&state, "alice");
-        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, false, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
         state.start_screen_share(uid, sid, ch.channel_id, 720, VideoCodec::H265).await.unwrap();
         let (uid2, sid2) = add_user(&state, "bob");
@@ -1721,7 +2160,7 @@ mod tests {
     async fn cleanup_screen_shares_for_user() {
         let state = make_state();
         let (uid, sid) = add_user(&state, "alice");
-        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, uid).await.unwrap();
+        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, false, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
         state.start_screen_share(uid, sid, ch.channel_id, 720, VideoCodec::H264).await.unwrap();
         let (uid2, sid2) = add_user(&state, "bob");

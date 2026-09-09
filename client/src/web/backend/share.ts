@@ -17,6 +17,7 @@
 
 import { emit } from "./events";
 import { wasm } from "./wasm";
+import { displayConstraints } from "../../lib/display-capture";
 import type { SessionContext, ShareApi, VideoCodec } from "./types";
 import { audio } from "./audio";
 
@@ -156,14 +157,10 @@ export class ShareSender implements ShareApi {
     try {
       // The browser's own picker. Must be the first await after the user's
       // click: getDisplayMedia needs the transient activation that click gave.
-      stream = await navigator.mediaDevices.getDisplayMedia({
-        video: {
-          width: { ideal: this.width },
-          height: { ideal: this.height },
-          frameRate: { ideal: this.fps },
-        },
-        audio: true,
-      });
+      // Audio is not asked for on Firefox — see display-capture.ts.
+      stream = await navigator.mediaDevices.getDisplayMedia(
+        displayConstraints({ width: this.width, height: this.height, fps: this.fps }),
+      );
     } catch (e) {
       this.starting = false;
       throw e;
@@ -219,7 +216,8 @@ export class ShareSender implements ShareApi {
     console.info(`screen share started: ${this.shareHeight}p@${this.fps} ${this.codec}`);
 
     // Desktop audio, when the browser gave us a track (Chromium for tab and
-    // system audio; Firefox on Linux offers none — the UI shows "no signal").
+    // system audio; Firefox is not even asked — see display-capture.ts — and
+    // the UI shows "no signal").
     const audioTrack = stream.getAudioTracks()[0];
     if (audioTrack && this.audioEnabled) audio.startScreenAudio(stream);
   }

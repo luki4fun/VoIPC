@@ -30,6 +30,14 @@ export interface ChannelInfo {
   created_by: number | null;
   /** Positional audio mode of this channel. */
   proximity: ProximityMode;
+  /** Kept out of the sidebar for non-admins; joining by id still works. */
+  hidden: boolean;
+  /** Members see each other under random pseudonyms (admins see real names). */
+  anonymous: boolean;
+  /** Whether screen sharing is allowed here. */
+  screen_share: boolean;
+  /** Non-admins see only whoever is speaking, not the member list. */
+  hide_members: boolean;
 }
 
 export interface ConnectionInfo {

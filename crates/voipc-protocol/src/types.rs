@@ -134,6 +134,26 @@ pub struct ChannelInfo {
     /// Positional audio mode (protocol v6).
     #[serde(default)]
     pub proximity: ProximityMode,
+    /// Not listed in the sidebar for non-admins (protocol v7). Joining by id
+    /// still works, so invite links and the game SDK's join-by-name keep
+    /// working — this hides the room, it does not lock it.
+    #[serde(default)]
+    pub hidden: bool,
+    /// Members are shown to each other under a random pseudonym. The server
+    /// substitutes it in every message; admins see the real names.
+    #[serde(default)]
+    pub anonymous: bool,
+    /// Whether screen sharing is allowed here. Default true, so a channel
+    /// from an older config keeps working.
+    #[serde(default = "default_true")]
+    pub screen_share: bool,
+    /// Non-admins do not see the member list, only whoever is speaking.
+    #[serde(default)]
+    pub hide_members: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -172,6 +192,10 @@ mod tests {
             has_password: true,
             created_by: Some(1),
             proximity: ProximityMode::TwoD,
+            hidden: true,
+            anonymous: true,
+            screen_share: false,
+            hide_members: true,
         };
         let bytes = postcard::to_allocvec(&info).unwrap();
         let decoded: ChannelInfo = postcard::from_bytes(&bytes).unwrap();
@@ -181,6 +205,23 @@ mod tests {
         assert!(decoded.has_password);
         assert_eq!(decoded.created_by, Some(1));
         assert_eq!(decoded.proximity, ProximityMode::TwoD);
+        assert!(decoded.hidden && decoded.anonymous && decoded.hide_members);
+        assert!(!decoded.screen_share);
+    }
+
+    #[test]
+    fn channel_options_default_to_an_ordinary_room() {
+        // A channels.json entry that names none of them, and an older config
+        // reaching a newer server, must both give a plain public channel that
+        // still allows screen sharing.
+        let info: ChannelInfo = serde_json::from_str(
+            r#"{"channel_id":1,"name":"X","description":"","max_users":0,
+                "user_count":0,"has_password":false,"created_by":null}"#,
+        )
+        .unwrap();
+        assert!(!info.hidden && !info.anonymous && !info.hide_members);
+        assert!(info.screen_share, "sharing must stay on unless switched off");
+        assert_eq!(info.proximity, ProximityMode::Off);
     }
 
     #[test]

@@ -16,7 +16,7 @@ const TASKS = {
   web: ['./tasks/web.mjs', 'Build the web client (wasm + Vite) and the server that embeds it'],
   'setup:android': ['./tasks/android.mjs', 'One-time Android SDK/NDK/JDK setup'],
   android: ['./tasks/android.mjs', 'Build the Android APK'],
-  release: ['./tasks/release.mjs', 'Build the portable Linux release artifacts in Docker'],
+  release: ['./tasks/release.mjs', 'Portable Linux release artifacts in Docker (host build without it)'],
   'test:web': ['./tasks/test-web.mjs', 'Headless two-browser end-to-end test of the web client'],
   'bundle-libs': ['./tasks/bundle-libs.mjs', 'Stage shared libraries for AppImage bundling'],
   version: ['./tasks/version.mjs', 'Sync the workspace version into every file that repeats it'],

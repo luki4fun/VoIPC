@@ -35,6 +35,9 @@ pub enum ClientMessage {
         /// refuses anything but Off with a ChannelError.
         #[serde(default)]
         proximity: ProximityMode,
+        /// Members see each other under random pseudonyms (protocol v7).
+        #[serde(default)]
+        anonymous: bool,
     },
 
     /// Client is disconnecting gracefully.
@@ -64,6 +67,21 @@ pub enum ClientMessage {
     SetChannelProximity {
         channel_id: ChannelId,
         proximity: ProximityMode,
+    },
+
+    /// Change the other channel options (creator or admin; persistent
+    /// channels admin only). `None` leaves an option as it is. Answered with
+    /// ChannelUpdated or ChannelError.
+    SetChannelOptions {
+        channel_id: ChannelId,
+        #[serde(default)]
+        hidden: Option<bool>,
+        #[serde(default)]
+        anonymous: Option<bool>,
+        #[serde(default)]
+        screen_share: Option<bool>,
+        #[serde(default)]
+        hide_members: Option<bool>,
     },
 
     /// Kick a user from a channel (creator only).

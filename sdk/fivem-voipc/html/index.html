@@ -1,0 +1,84 @@
+<!doctype html>
+<meta charset="utf-8" />
+<title>voipc bridge</title>
+<!--
+  Invisible NUI page: Lua has no socket API, so this is what actually talks to
+  the VoIPC client. It forwards SendNUIMessage in, and VoIPC's replies back out
+  through NUI callbacks. Its origin is https://cfx-nui-<resource>, which VoIPC
+  allows without configuration.
+-->
+<script>
+  let socket = null;
+  let hello = null;
+  let url = null;
+  let reconnect = null;
+
+  const post = (path, body) =>
+    fetch(`https://${GetParentResourceName()}/${path}`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json; charset=UTF-8" },
+      body: JSON.stringify(body),
+    }).catch(() => {});
+
+  function open() {
+    clearTimeout(reconnect);
+    reconnect = null;
+    try {
+      socket = new WebSocket(url);
+    } catch (e) {
+      post("error", { reason: `could not open ${url}: ${e}` });
+      return;
+    }
+    socket.onopen = () => socket.send(JSON.stringify(hello));
+    socket.onmessage = (e) => {
+      let msg;
+      try {
+        msg = JSON.parse(e.data);
+      } catch {
+        return;
+      }
+      if (msg.type === "state") post("state", msg);
+      else if (msg.type === "talk" || msg.type === "self" || msg.type === "user") post("talk", msg);
+      else if (msg.type === "error") {
+        post("error", msg);
+        // Every "say hello again" case says so: a VoIPC reconnect, leaving the
+        // channel, or another socket having taken ownership while we were open
+        if (typeof msg.reason === "string" && msg.reason.includes("hello")) {
+          socket.send(JSON.stringify(hello));
+        }
+      }
+    };
+    socket.onclose = () => {
+      socket = null;
+      // The player may not have enabled the integration yet, or VoIPC may be
+      // closed: keep trying quietly for as long as the resource runs.
+      if (hello) reconnect = setTimeout(open, 2000);
+    };
+    socket.onerror = () => {};
+  }
+
+  window.addEventListener("message", (event) => {
+    const data = event.data || {};
+    if (data.type === "connect") {
+      hello = data.hello;
+      url = data.url;
+      open();
+    } else if (data.type === "update") {
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify(data.update));
+      }
+    } else if (data.type === "bye") {
+      hello = null;
+      clearTimeout(reconnect);
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "bye" }));
+        socket.close();
+      }
+    }
+  });
+
+  // The page loads asynchronously after the resource starts, so a `connect`
+  // sent before this listener existed would be dropped without a trace. Tell
+  // Lua we are here instead of relying on the timing.
+  post("ready", {});
+</script>

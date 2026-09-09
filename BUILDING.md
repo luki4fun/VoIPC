@@ -31,6 +31,7 @@ straight through to the underlying tool.
 | `npm run web` | wasm + Vite bundle, then the server that embeds it | `target/release/voipc-server`, `release/VoIPC-web-<v>.tar.gz` |
 | `npm run android -- release` | signed APK (needs `keystore.properties`) | `release/VoIPC-android-release.apk` |
 | `npm run release` | all Linux artifacts in Docker, portable | `release/` — AppImage, musl server, web bundle |
+| `VOIPC_NO_DOCKER=1 npm run release` | the same, minus what needs Docker | `release/voipc-server` (host glibc), `release/VoIPC-web-<v>.tar.gz` |
 
 Everything at once, in the same versions a release ships: push a `v*` tag and
 let `.github/workflows/release.yml` build all four platforms.
@@ -319,7 +320,7 @@ release for review. Push a tag to run it, or dispatch it manually from the
 Actions tab to rehearse without tagging:
 
 ```bash
-git tag v0.5.0 && git push origin v0.5.0
+git tag v0.7.0 && git push origin v0.7.0
 ```
 
 It refuses to build if the tag and `[workspace.package] version` disagree, or if
@@ -478,6 +479,13 @@ This builds inside Ubuntu 24.04 and produces:
 - `release/VoIPC-web-*.tar.gz` — the web client bundle (already inside the server binary)
 
 Requires only Docker on the host. No Rust, Node.js, or system libraries needed.
+
+**Without Docker** the task no longer stops: it falls back to a host build of the web bundle
+and the server, and says which artifact it had to skip. `VOIPC_NO_DOCKER=1 npm run release`
+takes that path deliberately. Two things are lost, and both matter for a real release — the
+AppImage (Docker is what pins glibc 2.39, so one build runs on every distro) and the static
+musl server (the host build links against whatever glibc this machine has). Use it to get a
+server and a web bundle out quickly, not to cut a release.
 
 To build the Docker image manually:
 

@@ -338,6 +338,7 @@ pub fn run() {
             commands::set_user_volume,
             commands::get_user_volume,
             commands::set_channel_proximity,
+            commands::set_channel_options,
             commands::set_user_position,
             commands::set_own_position,
             commands::set_position_sync,

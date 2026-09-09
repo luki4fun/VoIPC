@@ -131,6 +131,15 @@
     return $channels.find((c) => c.channel_id === channelId)?.name ?? "";
   }
 
+  /**
+   * The name the current channel knows us by. Our own messages are echoed
+   * locally under the name we connected with, which in an anonymous channel
+   * is not the one anyone else sees; the member list carries the right one.
+   */
+  function ownDisplayName(fallback: string): string {
+    return $users.find((u) => u.user_id === $userId)?.username ?? fallback;
+  }
+
   let showSettings = $state(false);
   let reconnectAttempt = $state(0);
   let reconnectCancelled = $state(false);
@@ -801,9 +810,13 @@
         content: string;
         timestamp: number;
       }>("channel-chat-message", (event) => {
-        const { channel_id, user_id: uid, username: uname, content, timestamp } = event.payload;
+        const { channel_id, user_id: uid, username, content, timestamp } = event.payload;
         const chName = channelNameById(channel_id);
         if (chName) {
+          // Our own messages are echoed locally under the name we connected
+          // with; in an anonymous channel that is not the name anyone else
+          // sees, so use the one the channel knows us by.
+          const uname = uid === $userId ? ownDisplayName(username) : username;
           addChannelMessage(chName, { user_id: uid, username: uname, content, timestamp });
           // Track unread if not currently viewing this channel's chat
           const viewingThisChannel = $activeDmUserId === null && channel_id === $currentChannelId;
@@ -821,8 +834,12 @@
         content: string;
         timestamp: number;
       }>("direct-chat-message", (event) => {
-        const { from_user_id, from_username, to_user_id, content, timestamp } = event.payload;
+        const { from_user_id, to_user_id, content, timestamp } = event.payload;
         const myId = $userId;
+        const from_username =
+          from_user_id === myId
+            ? ownDisplayName(event.payload.from_username)
+            : event.payload.from_username;
         addDmMessage(myId, from_user_id, from_username, to_user_id, {
           user_id: from_user_id,
           username: from_username,
@@ -908,6 +925,12 @@
 
       listen<{ reason: string }>("screenshare-error", (event) => {
         addNotification("Screen share error: " + event.payload.reason, "error");
+        // The server refused or ended our share (a channel can switch sharing
+        // off under us): stop capturing rather than sending into the void.
+        if ($isSharingScreen) {
+          isSharingScreen.set(false);
+          invoke("stop_screen_capture").catch(() => {});
+        }
       }),
 
       listen<string>("screenshare-frame", (event) => {

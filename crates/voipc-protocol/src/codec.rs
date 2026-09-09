@@ -15,7 +15,9 @@ pub const MAX_MSG_SIZE: u32 = 65_536;
 ///     headers and from Authenticated; VideoLossReport/VideoLossReported added
 /// v6: proximity chat — ChannelInfo.proximity, CreateChannel.proximity,
 ///     SetChannelProximity, encrypted Position media packet (0x06)
-pub const PROTOCOL_VERSION: u32 = 6;
+/// v7: channel options — ChannelInfo.hidden/anonymous/screen_share/hide_members,
+///     CreateChannel.anonymous, SetChannelOptions
+pub const PROTOCOL_VERSION: u32 = 7;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.
@@ -198,6 +200,7 @@ mod tests {
             name: "TestRoom".into(),
             password: None,
             proximity: crate::types::ProximityMode::ThreeD,
+            anonymous: true,
         };
         let encoded = encode_client_msg(&msg).unwrap();
         let decoded = decode_client_msg(&encoded[4..]).unwrap();
@@ -206,10 +209,42 @@ mod tests {
                 name,
                 password,
                 proximity,
+                anonymous,
             } => {
                 assert_eq!(name, "TestRoom");
                 assert!(password.is_none());
                 assert_eq!(proximity, crate::types::ProximityMode::ThreeD);
+                assert!(anonymous);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn roundtrip_set_channel_options() {
+        // None leaves an option alone; the server must be able to tell that
+        // apart from "set it to false".
+        let msg = ClientMessage::SetChannelOptions {
+            channel_id: 3,
+            hidden: Some(true),
+            anonymous: None,
+            screen_share: Some(false),
+            hide_members: None,
+        };
+        let encoded = encode_client_msg(&msg).unwrap();
+        match decode_client_msg(&encoded[4..]).unwrap() {
+            ClientMessage::SetChannelOptions {
+                channel_id,
+                hidden,
+                anonymous,
+                screen_share,
+                hide_members,
+            } => {
+                assert_eq!(channel_id, 3);
+                assert_eq!(hidden, Some(true));
+                assert_eq!(anonymous, None);
+                assert_eq!(screen_share, Some(false));
+                assert_eq!(hide_members, None);
             }
             _ => panic!("wrong variant"),
         }
