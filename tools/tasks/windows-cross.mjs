@@ -296,11 +296,13 @@ function build(args) {
     CMAKE_POLICY_VERSION_MINIMUM: '3.5',
     XWIN_ARCH: 'x86_64',
     XWIN_CACHE_DIR: xwinCacheDir(),
-    // Wrap cargo-xwin's generated CMake toolchain to work around Opus'
-    // clang-cl incompatibility (see xwin-msvc-toolchain.cmake). cargo-xwin
-    // overwrites the underscored spelling of this variable, but the cmake crate
-    // looks up the dashed one first, so this wins.
-    [`CMAKE_TOOLCHAIN_FILE_${TARGET}`]: join(ROOT, 'xwin-msvc-toolchain.cmake'),
+    // The CMake toolchain wrapper that works around Opus' clang-cl
+    // incompatibility is NOT exported here. Its variable name contains dashes,
+    // which is not a valid shell identifier, and `dash` drops such variables
+    // from the environment it hands on while `bash` keeps them — so exporting
+    // it only worked when every shell in the chain happened to be bash. It
+    // lives in .cargo/config.toml [env] instead, which cargo puts straight into
+    // the build script's environment. See xwin-msvc-toolchain.cmake.
   };
 
   // A prebuilt libjpeg-turbo escape hatch for when the vendored CMake+NASM

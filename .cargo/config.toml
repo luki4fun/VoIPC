@@ -4,3 +4,20 @@
 # Adding ucrtd.lib provides the missing debug CRT symbol without breaking anything -
 # it's only called by debug assertion macros in third-party C code.
 rustflags = ["-C", "link-arg=ucrtd.lib"]
+
+[env]
+# Point the `cmake` crate at xwin-msvc-toolchain.cmake, which chains to the
+# toolchain cargo-xwin generates and then turns off Opus' SSE4.1/AVX dispatch
+# paths (see that file for why). Only the Windows-MSVC target reads this name,
+# so a Linux or Android build never sees it, and outside a cargo-xwin build the
+# file does nothing.
+#
+# This lives here rather than in the environment the build task exports because
+# the name is not a valid shell identifier: `dash` drops such variables from the
+# environment it passes on, `bash` keeps them. Every shell between the task and
+# the build script therefore had to be bash for the override to survive, which
+# is why it worked on Arch (/bin/sh is bash) and vanished on an Ubuntu runner
+# (/bin/sh is dash) — Opus then compiled its SSE4.1 sources under clang-cl and
+# the release build failed. Cargo puts this straight into the build script's
+# environment, with no shell in between.
+"CMAKE_TOOLCHAIN_FILE_x86_64-pc-windows-msvc" = { value = "xwin-msvc-toolchain.cmake", relative = true }
