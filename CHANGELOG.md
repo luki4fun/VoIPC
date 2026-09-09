@@ -2,7 +2,7 @@
 
 All notable changes to VoIPC are documented here.
 
-## [0.7.0] - unreleased
+## [0.7.0] - 2026-09-09
 
 Protocol version 7 — client and server must be updated together (a channel now carries a proximity mode and four options, and positions travel as a new encrypted media packet). A 0.5.x client connecting to a 0.7 server is told to update and stops reconnecting.
 
