@@ -3,7 +3,7 @@
 // Everything here used to be copy-pasted across the root shell and PowerShell
 // scripts — the version sync alone existed in seven places in two languages.
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -231,6 +231,54 @@ export function writeTempConfig(config) {
   const file = join(dir, 'config.json');
   writeFileSync(file, JSON.stringify(config));
   return { file, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
+// ffmpeg-next 8.1 (see Cargo.lock) targets FFmpeg 8.x / libavcodec 62. Do not
+// point a build at a 9.x tree without bumping the crate first: the generated
+// bindings do not compile, and the error arrives as a screenful of C ten
+// minutes into a build, naming nothing that leads back to here. This is not
+// hypothetical — vcpkg tracks FFmpeg head and moved its port to 9.0 in August
+// 2026, which is what silently broke both the Windows CI job and `setup.ps1`.
+export const EXPECTED_AVCODEC_MAJOR = '62';
+
+/** LIBAVCODEC_VERSION_MAJOR from an FFmpeg tree's headers, or null. */
+export function avcodecMajor(dir) {
+  for (const f of ['version_major.h', 'version.h']) {
+    const p = join(dir, 'include', 'libavcodec', f);
+    if (!existsSync(p)) continue;
+    const m = readFileSync(p, 'utf8').match(/define\s+LIBAVCODEC_VERSION_MAJOR\s+(\d+)/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
+/**
+ * Abort unless an FFmpeg tree is the major ffmpeg-next expects. `hint` says how
+ * to get the right one, since that differs per platform and build path.
+ */
+export function checkFfmpegAbi(dir, hint) {
+  const headerMajor = avcodecMajor(dir);
+  if (!headerMajor) return; // no headers to judge; the build's own probe will complain
+
+  // The DLLs carry the major in their name, so a tree assembled from two
+  // downloads is caught here rather than at load time on a user's machine.
+  const binDir = join(dir, 'bin');
+  const dll = existsSync(binDir)
+    ? readdirSync(binDir).find((f) => /^avcodec-\d+\.dll$/i.test(f))
+    : null;
+  const dllMajor = dll ? dll.match(/(\d+)/)[1] : null;
+  if (dllMajor && dllMajor !== headerMajor) {
+    fail(`FFmpeg headers (${headerMajor}) and DLLs (${dllMajor}) disagree in ${dir} —`,
+      'mixed downloads? Delete that directory and install FFmpeg again.');
+  }
+
+  if (headerMajor !== EXPECTED_AVCODEC_MAJOR) {
+    fail(`FFmpeg in ${dir} is libavcodec ${headerMajor};`,
+      `ffmpeg-next 8.1 needs ${EXPECTED_AVCODEC_MAJOR} (FFmpeg 8.x).\n`
+      + `     The Rust bindings will not compile against it.\n`
+      + (hint ? `     ${hint}` : ''));
+  }
+  ok(`FFmpeg 8.x (libavcodec ${headerMajor}) — matches ffmpeg-next 8.1`);
 }
 
 /** Install the client's npm dependencies if they are missing. */

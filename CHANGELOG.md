@@ -71,6 +71,14 @@ Four options per channel, in `channels.json` or through the channel's gear icon 
 - The artifact summary lists what the run actually built. It used to print the whole `release/` directory, so last month's tarball was reported as fresh output
 - `npm run version:check` now also covers the FiveM resource manifest and the two copies of the SDK's `state` example, which had been drifting by hand
 
+### Fixed — CI, which had never finished a release
+
+- **The Windows release job is the build that actually works.** It built natively on a Windows runner against FFmpeg from vcpkg — a path that shared no code with `npm run build:windows` and had never once succeeded. vcpkg follows FFmpeg head and is on 9.0.1; `ffmpeg-sys-next` 8.1 stops at libavcodec 62, so every attempt compiled for eight minutes and then died in the bindings, after a forty-minute FFmpeg build that a failing job never got to keep. Windows is now cross-built on Linux by the same task run at home, with FFmpeg pinned to 8.1 and its ABI major checked before anything compiles against it, and a small Windows job installs the resulting installer and checks the app starts. Only NSIS is built; the MSI bundle had never been produced anywhere
+- **The Rust test job installs the client's dependencies.** `npm --prefix client test` was added as "no dependencies to install", which stopped being true when the store tests landed: they reach `svelte/store` through `room.ts` and `users.ts`, so on a runner's fresh checkout the step died instantly on `ERR_MODULE_NOT_FOUND`
+- **`clang-cl` is no longer assumed.** Arch ships that name, Debian and Ubuntu ship only `clang` — and clang picks its cl driver mode from `argv[0]`, so the cross build links one itself instead of failing its tool check on a distribution it should support
+- **Caches survive a failed job.** `actions/cache` only saves on success, which is why every red Windows run threw away the expensive part and started over; the caches that guard a long download or build now restore and save separately
+- **A red build says what went wrong.** Reading Actions logs through the API needs admin rights on the repository even when it is public, so a failure was a black box to anyone without push access. Every build and test step now runs through `tools/ci-run.sh`, which repeats the tail of a failure as an annotation — those need no credentials at all. `test-web.sh` has done this for its browser lanes since 0.5.2
+
 ### Testing
 
 - The spatial maths is asserted along a full 2D and 3D trajectory in both languages, not just at a few fixed points, and the browser copy is checked in the end-to-end run

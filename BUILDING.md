@@ -206,10 +206,19 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I$(gcc -print-file-name=include)"
 
 Make sure `cmake`, `nasm`, `protoc`, and LLVM are on your `PATH`. Or just run `.\setup.ps1` which handles all of the above.
 
-The build defaults `VCPKG_ROOT` to `C:\Program Files\vcpkg` but honours a pre-set
-value, which is how the CI workflow points it at the runner's own vcpkg. The CMake
-generator is detected through vswhere rather than hardcoded, so a machine on a
-newer Visual Studio than 2022 still builds.
+The build defaults `VCPKG_ROOT` to `C:\Program Files\vcpkg`, but honours a pre-set
+value. The CMake generator is detected through vswhere rather than hardcoded, so a
+machine on a newer Visual Studio than 2022 still builds.
+
+**Mind the FFmpeg version.** `ffmpeg-next` 8.1 needs FFmpeg 8.x (libavcodec 62),
+and vcpkg tracks FFmpeg head — its port moved to 9.0 in August 2026, and the Rust
+bindings do not compile against that. The build now checks the major before
+compiling anything and stops with a message instead of a screenful of C errors ten
+minutes in. If your vcpkg is ahead, either pin the port or skip vcpkg for FFmpeg
+and point `FFMPEG_DIR` at an `n8.x-win64-gpl-shared` build from
+[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) — that is the
+same tree the Linux cross build and CI use, and `FFMPEG_DIR` wins over vcpkg for
+headers, import libraries and the DLLs bundled with the app.
 
 If you set up FFmpeg with an older version of `setup.ps1` (without the HW encoder features), re-run `.\setup.ps1` — it detects the missing features and reinstalls FFmpeg.
 
@@ -287,8 +296,8 @@ compiled in.
 
 ### Differences from a native Windows build
 
-- **NSIS installers only.** MSI needs WiX, which only runs on Windows. Use the
-  GitHub Actions workflow below for MSI.
+- **NSIS installers only.** MSI needs WiX, which only runs on Windows. Releases
+  ship the NSIS installer; no MSI is built anywhere.
 - **Opus loses its SSE4.1/AVX paths.** Opus only applies the per-file `-msse4.1`
   those sources need `if(NOT MSVC)`, and clang-cl sets `MSVC` while still
   requiring the flag. `xwin-msvc-toolchain.cmake` disables those dispatch paths
@@ -331,13 +340,29 @@ Release notes come from the matching `## [x.y.z]` section of `CHANGELOG.md`.
 | Job | Runner | Produces |
 |---|---|---|
 | `linux` | ubuntu-24.04 | AppImage, `.deb`, static musl server, web bundle |
-| `windows` | windows-2025 | NSIS `.exe` and `.msi`, plus a real-Windows smoke test |
+| `windows` | ubuntu-24.04 | NSIS `.exe`, cross-built with cargo-xwin |
+| `windows-smoke` | windows-2025 | installs that `.exe` and checks the app starts |
 | `android` | ubuntu-24.04 | signed APK |
 
-The repository is public, so all of this runs on free standard runners. The
-Windows job caches the vcpkg FFmpeg build, which otherwise takes 1-4 hours on a
-2-core runner; MSI installers can only be produced there, since WiX is
-Windows-only.
+The repository is public, so all of this runs on free standard runners.
+
+Windows is cross-built rather than built on a Windows runner, and it is the same
+`build:windows` task described above — so a red CI build reproduces at home in
+minutes. The native path was tried first and never produced a release: it took
+FFmpeg from the runner's vcpkg, which follows FFmpeg head, so it spent forty
+minutes building FFmpeg 9 and eight more compiling before dying in bindings that
+only support 8.x. No MSI is built; WiX is Windows-only, and nothing here has ever
+produced one.
+
+Every build and test step runs through `tools/ci-run.sh`, which repeats the tail of
+a failure as a workflow annotation. Reading Actions logs through the API needs
+admin rights on the repository even when it is public, and artifact downloads need
+a token, but annotations need neither:
+
+```sh
+curl -s https://api.github.com/repos/luki4fun/VoIPC/actions/runs/<run-id>/jobs
+curl -s https://api.github.com/repos/luki4fun/VoIPC/check-runs/<job-id>/annotations
+```
 
 ### Android signing secrets
 

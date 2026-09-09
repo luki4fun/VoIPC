@@ -48,20 +48,32 @@ jobs:
       - name: Version fields agree with Cargo.toml
         run: node tools/voipc.mjs version --check
 
-      - run: cargo test --workspace
+      # Through tools/ci-run.sh so a failure repeats its tail as an annotation:
+      # Actions logs need admin rights to read through the API, annotations do
+      # not, so this is the only part of a red run anyone can actually see.
+      - run: bash tools/ci-run.sh "cargo test" cargo test --workspace
 
       # The browser half of the spatial maths and the room presets, under
-      # Node's own test runner (no dependencies to install). Needs Node 22 for
-      # --experimental-strip-types; the runner's default may be older.
+      # Node's own test runner. Needs Node 22 for --experimental-strip-types;
+      # the runner's default may be older.
+      #
+      # The client's dependencies are not optional here, even though the runner
+      # is Node's own: room.test.ts and users.test.ts reach `svelte/store`
+      # through room.ts and users.ts, and a fresh checkout has no node_modules
+      # anywhere, so without this the step dies instantly on ERR_MODULE_NOT_FOUND.
       - uses: actions/setup-node@v5
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+        working-directory: client
       - name: Client unit tests
-        run: npm --prefix client test
+        run: bash tools/ci-run.sh "client unit tests" npm --prefix client test
 
       # Separate workspace (wasm-only dependencies), so it needs its own run.
       - name: Test the wasm crate on the host
-        run: cargo test
+        run: bash ../../tools/ci-run.sh "wasm crate test" cargo test
         working-directory: crates/voipc-web
 
   browser:

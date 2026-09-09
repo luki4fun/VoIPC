@@ -6,33 +6,35 @@
 //
 // `setup:windows` installs the toolchain, `build:windows` builds the installer.
 import {
-  copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync,
+  copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, renameSync, rmSync, symlinkSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  CLIENT, ROOT, capture, err, fail, head, info, npmInstall, ok, run, syncVersion, which,
-  writeTempConfig,
+  CLIENT, ROOT, capture, checkFfmpegAbi, err, fail, head, info, npmInstall, ok, run, syncVersion,
+  which, writeTempConfig,
 } from '../lib.mjs';
 
 const TARGET = 'x86_64-pc-windows-msvc';
 
-// ffmpeg-next 8.1 (see Cargo.lock) targets FFmpeg 8.x / libavcodec 62. Do not
-// move this to an n9.x build without bumping the crate first — the generated
-// bindings will not compile.
-const EXPECTED_AVCODEC_MAJOR = '62';
+// An n8.x "-shared" asset: those ship include/ and lib/*.lib, and the major has
+// to be the one ffmpeg-next expects — checkFfmpegAbi() in lib.mjs enforces it.
 const DEFAULT_ASSET = 'ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip';
+const FFMPEG_HINT = 'Set VOIPC_FFMPEG_ASSET to an n8.x "-shared" build and re-run setup:windows.';
 
 const home = () => process.env.HOME ?? process.env.USERPROFILE ?? '';
 const ffmpegDir = () =>
   process.env.VOIPC_FFMPEG_WIN64 || join(home(), '.local', 'share', 'voipc', 'ffmpeg-win64');
 const xwinCacheDir = () => process.env.XWIN_CACHE_DIR || join(home(), '.cache', 'cargo-xwin');
+const shimDir = () => join(home(), '.cache', 'voipc', 'bin');
 
 const BUILD_TOOLS = ['cargo-xwin', 'clang-cl', 'lld-link', 'llvm-rc', 'llvm-ar',
   'ninja', 'cmake', 'nasm', 'protoc'];
 const SETUP_TOOLS = ['clang', 'clang-cl', 'lld-link', 'llvm-rc', 'llvm-lib', 'llvm-ar',
   'ninja', 'cmake', 'nasm', 'protoc', 'unzip', 'curl'];
 
+// Debian and Ubuntu have no clang-cl binary of their own; ensureClangCl() links
+// one from clang, so the package list is the same set of projects either way.
 const INSTALL_HINTS = [
   'Arch:   sudo pacman -S --needed clang lld llvm ninja cmake nasm protobuf unzip curl',
   'Debian: sudo apt install clang lld llvm ninja-build cmake nasm protobuf-compiler unzip curl',
@@ -42,31 +44,6 @@ function haveFfmpeg(dir) {
   return existsSync(join(dir, 'include', 'libavcodec', 'avcodec.h'))
     && existsSync(join(dir, 'lib', 'avcodec.lib'))
     && readdirSync(join(dir, 'bin')).some((f) => /^avcodec-\d+\.dll$/i.test(f));
-}
-
-/** Header and DLL majors must agree with each other and with ffmpeg-next. */
-function checkFfmpegAbi(dir) {
-  let headerMajor = null;
-  for (const f of ['version_major.h', 'version.h']) {
-    const p = join(dir, 'include', 'libavcodec', f);
-    if (!existsSync(p)) continue;
-    const m = readFileSync(p, 'utf8').match(/define\s+LIBAVCODEC_VERSION_MAJOR\s+(\d+)/);
-    if (m) { headerMajor = m[1]; break; }
-  }
-  const dll = readdirSync(join(dir, 'bin')).find((f) => /^avcodec-\d+\.dll$/i.test(f));
-  const dllMajor = dll ? dll.match(/(\d+)/)[1] : null;
-
-  if (headerMajor && dllMajor && headerMajor !== dllMajor) {
-    fail(`FFmpeg headers (${headerMajor}) and DLLs (${dllMajor}) disagree — mixed downloads?\n`
-      + `     Delete ${dir} and re-run setup.`);
-  }
-  if (headerMajor === EXPECTED_AVCODEC_MAJOR) {
-    ok(`FFmpeg 8.x (libavcodec ${headerMajor}) — matches ffmpeg-next 8.1`);
-  } else {
-    err(`libavcodec major is ${headerMajor}; ffmpeg-next 8.1 expects ${EXPECTED_AVCODEC_MAJOR}.`);
-    err('The Rust bindings will most likely fail to compile.');
-    info('Set VOIPC_FFMPEG_ASSET to an n8.x "-shared" build and re-run setup.');
-  }
 }
 
 function installNsis() {
@@ -95,7 +72,7 @@ function downloadFfmpeg() {
   const dir = ffmpegDir();
   if (haveFfmpeg(dir)) {
     ok(`Windows FFmpeg already present at ${dir}`);
-    checkFfmpegAbi(dir);
+    checkFfmpegAbi(dir, FFMPEG_HINT);
     return;
   }
   const asset = process.env.VOIPC_FFMPEG_ASSET || DEFAULT_ASSET;
@@ -130,7 +107,7 @@ function downloadFfmpeg() {
       + '     Use an asset whose name contains "shared" — those ship include/ and lib/*.lib.');
   }
   ok(`Windows FFmpeg installed to ${dir}`);
-  checkFfmpegAbi(dir);
+  checkFfmpegAbi(dir, FFMPEG_HINT);
 }
 
 function reportEncoders() {
@@ -147,6 +124,7 @@ function reportEncoders() {
 
 function setup() {
   head('VoIPC Windows cross-build setup');
+  ensureClangCl();
   requireOrHint(SETUP_TOOLS);
   if (which('wine')) ok("wine found (optional: 'cargo xwin test' and exe smoke tests)");
   else info('wine not found — optional, only needed to run the built exe or tests locally');
@@ -174,6 +152,29 @@ function setup() {
 
   head('Setup complete');
   console.log('Build the Windows client with:  npm run build:windows');
+}
+
+/**
+ * Arch ships /usr/bin/clang-cl; Debian and Ubuntu ship clang under that name
+ * only — their clang package has clang, clang++ and asan and nothing else. But
+ * clang picks its cl.exe driver mode from argv[0], so the Arch binary and a
+ * symlink are the same thing, and cargo-xwin only ever invokes it by name.
+ *
+ * A symlink in a cache directory rather than /usr/local/bin: no root needed,
+ * and nothing outside this build sees it. Prepending to PATH is enough for the
+ * child processes, since run() and which() both inherit process.env.
+ */
+function ensureClangCl() {
+  if (which('clang-cl')) return;
+  const clang = which('clang');
+  if (!clang) return; // no clang at all — requireOrHint reports the real problem
+  const dir = shimDir();
+  mkdirSync(dir, { recursive: true });
+  const shim = join(dir, 'clang-cl');
+  rmSync(shim, { force: true });
+  symlinkSync(clang, shim);
+  process.env.PATH = `${dir}:${process.env.PATH ?? ''}`;
+  info(`clang-cl is not installed — linking ${shim} -> ${clang}`);
 }
 
 function requireOrHint(tools) {
@@ -260,6 +261,7 @@ function auditImports(exe, staging) {
 
 function build(args) {
   const noBundle = process.env.VOIPC_NO_BUNDLE;
+  ensureClangCl();
   requireOrHint(noBundle ? BUILD_TOOLS : [...BUILD_TOOLS, 'makensis']);
   if (!existsSync(join(ffmpegDir(), 'lib', 'avcodec.lib'))) {
     fail(`Windows FFmpeg not found at ${ffmpegDir()} — run npm run setup:windows first`);

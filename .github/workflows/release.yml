@@ -114,22 +114,29 @@ jobs:
       - run: npm ci
         working-directory: client
 
+      # Every build runs through tools/ci-run.sh: reading Actions logs through
+      # the API needs admin rights on the repository, annotations need none, so
+      # a failure repeats its own tail into one. Without that a red build job is
+      # a black box to anyone without push access.
+      #
       # The server embeds client/dist-web at compile time, so the web bundle
       # has to exist before the server is built.
       - name: Build the web client
         env:
           VITE_DEFAULT_SERVER: ${{ inputs.default_server }}
-        run: npm run build:web
+        run: bash ../tools/ci-run.sh "linux web client" npm run build:web
         working-directory: client
 
       - name: Build the server (static musl)
-        run: cargo build -p voipc-server --release --target x86_64-unknown-linux-musl
+        run: >-
+          bash tools/ci-run.sh "linux server"
+          cargo build -p voipc-server --release --target x86_64-unknown-linux-musl
 
       - name: Build the desktop client (AppImage + deb)
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1   # appimagetool cannot use FUSE on a runner
           VITE_DEFAULT_SERVER: ${{ inputs.default_server }}
-        run: node tools/voipc.mjs build
+        run: bash tools/ci-run.sh "linux desktop client" node tools/voipc.mjs build
 
       - name: Collect artifacts
         run: |
@@ -147,14 +154,34 @@ jobs:
           if-no-files-found: error
           path: dist/*
 
+  # Windows is cross-built from Linux, by the same task the maintainer runs at
+  # home (`npm run build:windows`), so a red CI build can be reproduced in
+  # minutes instead of guessed at.
+  #
+  # This used to build natively on windows-2025 against FFmpeg from vcpkg. That
+  # path shared no code with the one anyone actually runs and never once
+  # succeeded: vcpkg follows FFmpeg head — the runner image's vcpkg is on 9.0.1
+  # — while ffmpeg-sys-next 8.1 stops at libavcodec 62, so every attempt
+  # compiled for eight minutes and then died in the bindings, after a 40-minute
+  # FFmpeg build that a failing job never got to cache. The cross build pins
+  # FFmpeg 8.1 and verifies its ABI major before compiling anything.
   windows:
     needs: [meta, test]
-    # Pinned rather than windows-latest: the image is moving to VS 2026 and the
-    # build detects the toolset, but pinning keeps releases reproducible.
-    runs-on: windows-2025
-    timeout-minutes: 360
+    runs-on: ubuntu-24.04
+    env:
+      # Pinned so releases are reproducible and the cache key means something.
+      CARGO_XWIN_VERSION: '0.23.1'
     steps:
       - uses: actions/checkout@v5
+
+      # Ubuntu ships no clang-cl — only Arch does — so ensureClangCl() in the
+      # task links one from clang, which picks its cl driver mode from argv[0].
+      - name: Cross toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm ninja-build cmake nasm protobuf-compiler \
+            nsis unzip curl
 
       - uses: actions/setup-node@v5
         with:
@@ -170,70 +197,86 @@ jobs:
         with:
           workspaces: '. -> target'
 
-      # The image ships Visual Studio, LLVM, CMake and vcpkg, but not NASM
-      # (libjpeg-turbo SIMD) or protoc (libsignal's build script).
-      - name: Install NASM and protoc
-        run: |
-          choco install -y nasm protoc --no-progress
-          "C:\Program Files\NASM" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
-
-      # VCPKG_INSTALLATION_ROOT is set on the runner machine, not in the
-      # workflow `env` context, so it has to be carried through step outputs
-      # rather than referenced as ${{ env.VCPKG_INSTALLATION_ROOT }}.
-      - name: Resolve the vcpkg location and revision
-        id: vcpkg
-        run: |
-          $root = $env:VCPKG_INSTALLATION_ROOT
-          if (-not $root) { $root = "C:\vcpkg" }
-          $rev = git -C "$root" rev-parse HEAD
-          "root=$root" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "rev=$rev"   | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-
-      # Building the ffmpeg port from source takes 1-4 h on a 2-core runner, so
-      # this cache is not optional. A hit turns it into seconds.
-      - name: Cache the vcpkg FFmpeg build
-        id: vcpkg-cache
-        uses: actions/cache@v5
+      # restore/save rather than actions/cache, whose post step is
+      # `post-if: success()` and therefore saves nothing when the job fails —
+      # which is how the old vcpkg job managed to rebuild FFmpeg from source on
+      # every single retry.
+      - name: Restore cargo-xwin
+        id: xwin
+        uses: actions/cache/restore@v5
         with:
-          path: |
-            ${{ steps.vcpkg.outputs.root }}/installed
-            ${{ steps.vcpkg.outputs.root }}/packages
-          key: vcpkg-ffmpeg-x264-x265-nvcodec-amf-qsv-${{ steps.vcpkg.outputs.rev }}
+          path: ~/.cargo/bin/cargo-xwin
+          key: cargo-xwin-${{ env.CARGO_XWIN_VERSION }}
 
-      - name: Install FFmpeg via vcpkg
-        if: steps.vcpkg-cache.outputs.cache-hit != 'true'
-        run: |
-          & "${{ steps.vcpkg.outputs.root }}\vcpkg.exe" install `
-            "ffmpeg[x264,x265,nvcodec,amf,qsv]:x64-windows" --recurse
+      - name: Install cargo-xwin
+        if: steps.xwin.outputs.cache-hit != 'true'
+        run: cargo install --locked cargo-xwin@${{ env.CARGO_XWIN_VERSION }}
 
-      - name: Build the client (NSIS + MSI)
+      - name: Save cargo-xwin
+        if: always() && steps.xwin.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.cargo/bin/cargo-xwin
+          key: cargo-xwin-${{ env.CARGO_XWIN_VERSION }}
+
+      # The prebuilt Windows FFmpeg the task downloads. The key is the asset
+      # name, which is the version pin; setup:windows then checks that
+      # libavcodec really is major 62 before anything is compiled against it.
+      - name: Restore the pinned Windows FFmpeg
+        id: ffmpeg
+        uses: actions/cache/restore@v5
+        with:
+          path: ~/.local/share/voipc/ffmpeg-win64
+          key: voipc-ffmpeg-win64-n8.1-gpl-shared
+
+      - name: Windows toolchain and FFmpeg
+        run: bash tools/ci-run.sh "windows setup" node tools/voipc.mjs setup:windows
+
+      - name: Save the pinned Windows FFmpeg
+        if: always() && steps.ffmpeg.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@v5
+        with:
+          path: ~/.local/share/voipc/ffmpeg-win64
+          key: voipc-ffmpeg-win64-n8.1-gpl-shared
+
+      # auditImports() fails the build if the exe imports ucrtbased.dll, or any
+      # DLL that is neither part of Windows nor bundled beside it — what the old
+      # dumpbin step checked, and more.
+      - name: Build the client (NSIS)
         env:
-          VCPKG_ROOT: ${{ steps.vcpkg.outputs.root }}
           VITE_DEFAULT_SERVER: ${{ inputs.default_server }}
-        run: node tools/voipc.mjs build --bundles nsis,msi
+        run: bash tools/ci-run.sh "windows build" node tools/voipc.mjs build:windows
 
-      # .cargo/config.toml links ucrtd.lib, which exports the whole CRT mapped
-      # to the debug ucrtbased.dll. That DLL ships with Visual Studio and exists
-      # on no end-user machine — and a runner has VS installed, so only an
-      # explicit check catches it.
-      - name: Check the exe does not depend on the debug CRT
+      - name: Collect artifacts
         run: |
-          $dumpbin = Get-ChildItem -Recurse -Filter dumpbin.exe `
-            "${env:ProgramFiles}\Microsoft Visual Studio\2022" -ErrorAction SilentlyContinue |
-            Select-Object -First 1
-          if (-not $dumpbin) {
-            $dumpbin = Get-ChildItem -Recurse -Filter dumpbin.exe `
-              "${env:ProgramFiles}\Microsoft Visual Studio" | Select-Object -First 1
-          }
-          $deps = & $dumpbin.FullName /dependents target\release\voipc-client.exe
-          if ($deps -match 'ucrtbased\.dll') {
-            throw "voipc-client.exe imports ucrtbased.dll (debug CRT) - it will not start on a machine without Visual Studio"
-          }
-          Write-Host "[ok] No debug CRT dependency"
+          mkdir -p dist
+          cp target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe dist/
+          ls -lh dist/
 
-      - name: Smoke test the installer on real Windows
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows
+          if-no-files-found: error
+          path: dist/*
+
+  # The one thing a Windows runner is still needed for: proving the installer
+  # the cross build produced really installs and starts on real Windows.
+  windows-smoke:
+    needs: windows
+    runs-on: windows-2025
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: windows
+          path: dist
+
+      - name: Install the app and check it stays up
         run: |
-          $setup = Get-ChildItem target\release\bundle\nsis\*-setup.exe | Select-Object -First 1
+          $setup = Get-ChildItem dist\*-setup.exe -ErrorAction SilentlyContinue |
+                   Select-Object -First 1
+          if (-not $setup) { throw "no NSIS installer in the windows artifact" }
           Start-Process -FilePath $setup.FullName -ArgumentList '/S' -Wait
           $exe = Get-ChildItem "$env:LOCALAPPDATA\Programs\VoIPC\VoIPC.exe",`
                                "$env:ProgramFiles\VoIPC\VoIPC.exe" -ErrorAction SilentlyContinue |
@@ -244,19 +287,6 @@ jobs:
           if ($p.HasExited) { throw "VoIPC exited early with code $($p.ExitCode)" }
           Stop-Process -Id $p.Id -Force
           Write-Host "[ok] App launched and stayed alive"
-
-      - name: Collect artifacts
-        run: |
-          New-Item -ItemType Directory -Force dist | Out-Null
-          Copy-Item target\release\bundle\nsis\*.exe dist\
-          Copy-Item target\release\bundle\msi\*.msi dist\
-          Get-ChildItem dist\
-
-      - uses: actions/upload-artifact@v7
-        with:
-          name: windows
-          if-no-files-found: error
-          path: dist/*
 
   android:
     needs: [meta, test]
@@ -336,7 +366,9 @@ jobs:
         if: steps.signing.outputs.ready == 'true'
         env:
           VITE_DEFAULT_SERVER: ${{ inputs.default_server }}
-        run: node tools/voipc.mjs android release --target aarch64
+        run: >-
+          bash tools/ci-run.sh "android build"
+          node tools/voipc.mjs android release --target aarch64
 
       - name: Remove the signing material
         if: always() && steps.signing.outputs.ready == 'true'
@@ -357,7 +389,7 @@ jobs:
           path: dist/*
 
   publish:
-    needs: [meta, linux, windows, android]
+    needs: [meta, linux, windows, windows-smoke, android]
     # Publish whatever built, as long as nothing outright failed.
     if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-24.04
