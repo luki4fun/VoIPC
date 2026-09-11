@@ -244,6 +244,7 @@ export async function run(params: URLSearchParams): Promise<void> {
   const started = Date.now();
   let talked = false;
   let positionShared = false;
+  let effectsSet = false;
   while (Date.now() - started < duration) {
     await sleep(500);
     const me = users.get(myUserId);
@@ -263,6 +264,28 @@ export async function run(params: URLSearchParams): Promise<void> {
       }
     }
     const peers = [...users.values()].filter((u) => u.user_id !== myUserId && u.channel_id === joinedChannelId && joinedChannelId !== 0);
+
+    // Drive both kinds of lane — one coming in, and our own going out — with
+    // all four controls on, so the voice checks below cover the whole chain:
+    // an exception anywhere in the worklet's mix stops the stats message this
+    // run asserts on. Deliberately not its own check line — one that cannot
+    // fail is worse than none.
+    if (!effectsSet && peers.length > 0) {
+      effectsSet = true;
+      try {
+        await invoke("set_user_fx", {
+          userId: peers[0].user_id,
+          effect: "radio",
+          muffle: 4,
+          reverb: 6,
+          water: 3,
+        });
+        await invoke("set_mic_fx", { effect: "phone", muffle: 2, reverb: 5, water: 4 });
+        log("effects-set", { peer: peers[0].user_id });
+      } catch (e) {
+        log("error", { message: `effects: ${String(e)}` });
+      }
+    }
 
     // A message typed while alone: queued until a peer arrives, and part of
     // the channel history handed to that peer

@@ -38,6 +38,13 @@ export interface ChannelInfo {
   screen_share: boolean;
   /** Non-admins see only whoever is speaking, not the member list. */
   hide_members: boolean;
+  /**
+   * The server forwards each voice only to whoever should hear it, instead of
+   * to every member. Off everywhere by default, and the only state in which
+   * the server is told anything about who hears whom — so a channel says it,
+   * and the people in it are told when they arrive.
+   */
+  routed: boolean;
 }
 
 export interface ConnectionInfo {

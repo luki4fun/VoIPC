@@ -27,6 +27,7 @@ use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
+use http_body_util::BodyExt as _;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rust_embed::Embed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -35,6 +36,7 @@ use rustls::sign::CertifiedKey;
 use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
+use voipc_protocol::types::UserId;
 use tokio::task::JoinSet;
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, info, warn};
@@ -83,10 +85,16 @@ pub struct WtInfo {
 // ── HTTP/2 static page ──────────────────────────────────────────────────
 
 /// Serve the web client over HTTP/2 on a TLS stream that negotiated `h2`.
-pub async fn serve_h2(tls: TlsStream<TcpStream>, wt: Arc<WtInfo>, peer: SocketAddr) {
+pub async fn serve_h2(
+    tls: TlsStream<TcpStream>,
+    wt: Arc<WtInfo>,
+    state: Arc<ServerState>,
+    peer: SocketAddr,
+) {
     let service = service_fn(move |req: Request<Incoming>| {
         let wt = wt.clone();
-        async move { Ok::<_, Infallible>(handle_request(&req, &wt)) }
+        let state = state.clone();
+        async move { Ok::<_, Infallible>(handle_request(req, &wt, &state).await) }
     });
     if let Err(e) = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
         .serve_connection(TokioIo::new(tls), service)
@@ -96,10 +104,16 @@ pub async fn serve_h2(tls: TlsStream<TcpStream>, wt: Arc<WtInfo>, peer: SocketAd
     }
 }
 
-fn handle_request(req: &Request<Incoming>, wt: &WtInfo) -> Response<Full<Bytes>> {
+async fn handle_request(
+    req: Request<Incoming>,
+    wt: &WtInfo,
+    state: &ServerState,
+) -> Response<Full<Bytes>> {
     let head_only = req.method() == Method::HEAD;
     let mut resp = if req.method() == Method::GET || head_only {
         route(req.uri().path(), wt)
+    } else if req.method() == Method::POST && req.uri().path() == GAME_ROUTES_PATH {
+        game_routes(req, state).await
     } else {
         let mut resp = plain(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
         resp.headers_mut()
@@ -113,6 +127,166 @@ fn handle_request(req: &Request<Incoming>, wt: &WtInfo) -> Response<Full<Bytes>>
         *resp.body_mut() = Full::new(Bytes::new());
     }
     resp
+}
+
+// ── The game server's routing API ───────────────────────────────────────
+//
+// A game server telling the relay who may hear whom, for a channel whose
+// `routed` flag is on. Everything about the shape of this is chosen so the
+// relay learns as little as it can while still being able to enforce:
+//
+// - **Buses are opaque.** The game server hashes and salts its own names
+//   (per run — that is what `boot` is for) before sending them. We hash them
+//   again to a `u64`, resolve them to "who hears whom" here, and forget them.
+//   There is no map from a bus id to anything, and an id means nothing between
+//   one run and the next.
+// - **No coordinates.** `deny_unknown_fields` means a well-meaning mod cannot
+//   even send one by accident — the POST is refused rather than silently
+//   carrying a position into a log.
+// - **No reading back.** There is deliberately no `GET /sessions`: it would
+//   walk straight past the pseudonyms an anonymous channel hands out and the
+//   member list `hide_members` hides. A game token is not an admin token.
+
+const GAME_ROUTES_PATH: &str = "/game/v1/routes";
+/// Largest routing POST accepted. A full server's worth of ids and buses is a
+/// few tens of kilobytes; this is generous and still bounded.
+const MAX_ROUTES_BODY: usize = 512 * 1024;
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutesBody {
+    /// The channel by name, as the mod names it in `hello`.
+    channel: String,
+    /// Rises with every POST of one run, so a late one cannot overwrite a
+    /// newer one.
+    epoch: u64,
+    /// This run of the game server. A new one resets `epoch`, so a server
+    /// whose epoch is a tick counter can restart without being refused
+    /// for ever — and then the channel would quietly fall back to full
+    /// fan-out with nothing to notice.
+    #[serde(default)]
+    boot: String,
+    /// How long this answer is good for, capped at `routing::MAX_TTL`.
+    #[serde(default = "default_ttl_ms")]
+    ttl_ms: u64,
+    players: Vec<RoutesPlayer>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RoutesPlayer {
+    /// VoIPC user id.
+    user: UserId,
+    /// Buses this player talks on.
+    #[serde(default, rename = "pub")]
+    publishes: Vec<String>,
+    /// Buses this player listens to.
+    #[serde(default, rename = "sub")]
+    subscribes: Vec<String>,
+}
+
+fn default_ttl_ms() -> u64 {
+    3_000
+}
+
+async fn game_routes(req: Request<Incoming>, state: &ServerState) -> Response<Full<Bytes>> {
+    let Some(expected) = state.settings.game_token.as_deref() else {
+        return plain(StatusCode::NOT_FOUND, "not found");
+    };
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
+        .unwrap_or("");
+    // Constant time, exactly as the admin token is compared: a timing oracle
+    // on this one would hand somebody the ability to silence a channel.
+    let ok: bool = {
+        use subtle::ConstantTimeEq;
+        presented.as_bytes().ct_eq(expected.as_bytes()).into()
+    };
+    if !ok {
+        return plain(StatusCode::UNAUTHORIZED, "bad token");
+    }
+
+    let body = match http_body_util::Limited::new(req.into_body(), MAX_ROUTES_BODY)
+        .collect()
+        .await
+    {
+        Ok(b) => b.to_bytes(),
+        Err(_) => return plain(StatusCode::PAYLOAD_TOO_LARGE, "body too large"),
+    };
+    let parsed: RoutesBody = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(e) => {
+            return owned(StatusCode::BAD_REQUEST, Bytes::from(format!("bad body: {e}")))
+        }
+    };
+
+    let channel_id = {
+        let channels = state.channels.read().await;
+        match channels
+            .iter()
+            .find(|(_, ch)| ch.info.name == parsed.channel && ch.info.routed)
+        {
+            Some((id, _)) => *id,
+            None => {
+                return plain(
+                    StatusCode::NOT_FOUND,
+                    "no routed channel by that name — is `routed` on in channels.json?",
+                )
+            }
+        }
+    };
+
+    let forwarded = parsed.players.len();
+    let routes = resolve(parsed);
+    match state
+        .routing
+        .set_routes(channel_id, routes, tokio::time::Instant::now())
+    {
+        Ok(()) => owned(StatusCode::OK, Bytes::from(format!("{forwarded} players"))),
+        // Logged rather than silent: a game server stuck behind its own epoch
+        // would otherwise stop enforcing with nothing to see.
+        Err(crate::routing::RoutesError::Stale) => {
+            warn!(channel_id, "game routes refused: epoch is not newer than the one held");
+            plain(StatusCode::CONFLICT, "epoch is not newer than the one held")
+        }
+    }
+}
+
+/// Turn buses into "who may hear whom", and forget the buses.
+///
+/// The intersection is the whole model: geometry, radio channels, phone calls
+/// and job gating all collapse to "do these two share a bus", which is why the
+/// relay can enforce them without being told what any of them are.
+fn resolve(body: RoutesBody) -> crate::routing::Routes {
+    use std::collections::{HashMap, HashSet};
+    let bus = |name: &str| -> u64 {
+        let digest = <sha2::Sha256 as sha2::Digest>::digest(name.as_bytes());
+        u64::from_be_bytes(digest[..8].try_into().expect("sha256 is 32 bytes"))
+    };
+    let speakers: Vec<(UserId, HashSet<u64>)> = body
+        .players
+        .iter()
+        .map(|p| (p.user, p.publishes.iter().map(|b| bus(b)).collect()))
+        .collect();
+    let mut hear: HashMap<UserId, HashSet<UserId>> = HashMap::with_capacity(body.players.len());
+    for listener in &body.players {
+        let subs: HashSet<u64> = listener.subscribes.iter().map(|b| bus(b)).collect();
+        let audible = speakers
+            .iter()
+            .filter(|(uid, pubs)| *uid != listener.user && !subs.is_disjoint(pubs))
+            .map(|(uid, _)| *uid)
+            .collect();
+        hear.insert(listener.user, audible);
+    }
+    crate::routing::Routes {
+        epoch: body.epoch,
+        boot: body.boot,
+        ttl: std::time::Duration::from_millis(body.ttl_ms),
+        hear,
+    }
 }
 
 fn route(path: &str, wt: &WtInfo) -> Response<Full<Bytes>> {
@@ -163,7 +337,12 @@ fn route(path: &str, wt: &WtInfo) -> Response<Full<Bytes>> {
 }
 
 fn plain(status: StatusCode, text: &'static str) -> Response<Full<Bytes>> {
-    let mut resp = Response::new(Full::new(Bytes::from_static(text.as_bytes())));
+    owned(status, Bytes::from_static(text.as_bytes()))
+}
+
+/// The same, for a message built at runtime (a parse error, a count).
+fn owned(status: StatusCode, body: Bytes) -> Response<Full<Bytes>> {
+    let mut resp = Response::new(Full::new(body));
     *resp.status_mut() = status;
     resp.headers_mut().insert(
         header::CONTENT_TYPE,

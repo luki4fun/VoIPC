@@ -7,6 +7,9 @@
   import { openDm } from "../stores/chat.js";
   import { watchingUserId, currentFrame } from "../stores/screenshare.js";
   import { addNotification } from "../stores/notifications.js";
+  import { audibleIds, centreView } from "../stores/room.js";
+  import { isMobile, mobileTab } from "../stores/platform.js";
+  import { selectedStrip, setUserVolume, toggleUserMute, userVolumes, volumeOf } from "../stores/mixer.js";
   import Icon from "./Icons.svelte";
   import type { UserInfo } from "../types.js";
 
@@ -14,6 +17,15 @@
   let isPreviewing = $derived(
     $previewChannelId !== null && $previewChannelId !== $currentChannelId
   );
+
+  /**
+   * Is this member one the game is currently leaving out of the mix? `null`
+   * means no game is culling. Never applies to the preview of another channel,
+   * which the game is not driving. See `audibleIds` for why this is shown.
+   */
+  function isCulled(id: number, audible: Set<number> | null): boolean {
+    return !isPreviewing && audible !== null && id !== $userId && !audible.has(id);
+  }
 
   // Which channel's info to show
   let displayChannelId = $derived(
@@ -196,34 +208,15 @@
     }
   }
 
-  // Per-user volume state: user_id → volume (0.0 - 2.0, default 1.0)
-  let userVolumes: Record<number, number> = $state({});
-
-  async function setUserVolume(targetUserId: number, vol: number) {
-    userVolumes[targetUserId] = vol;
-    try {
-      await invoke("set_user_volume", { userId: targetUserId, volume: vol });
-    } catch (e) {
-      console.error("Failed to set user volume:", e);
-    }
+  // Per-user volume lives in one store, shared with the mixer: this used to be
+  // a component-local record, so the same person had two different volumes
+  // depending on which control you were looking at.
+  function getUserVolume(uid: number): number {
+    return $userVolumes.get(uid) ?? 1.0;
   }
 
   function handleUserVolumeInput(targetUserId: number, e: Event) {
-    const vol = parseFloat((e.target as HTMLInputElement).value);
-    setUserVolume(targetUserId, vol);
-  }
-
-  function toggleUserMute(targetUserId: number) {
-    const current = userVolumes[targetUserId] ?? 1.0;
-    if (current > 0) {
-      setUserVolume(targetUserId, 0);
-    } else {
-      setUserVolume(targetUserId, 1.0);
-    }
-  }
-
-  function getUserVolume(uid: number): number {
-    return userVolumes[uid] ?? 1.0;
+    setUserVolume(targetUserId, parseFloat((e.target as HTMLInputElement).value));
   }
 
   // Context menu state
@@ -281,6 +274,10 @@
       <div
         class="user"
         class:speaking={!isPreviewing && $speakingUsers.has(user.user_id)}
+        class:culled={isCulled(user.user_id, $audibleIds)}
+        title={isCulled(user.user_id, $audibleIds)
+          ? "Out of earshot in the game — close it to hear everyone again"
+          : undefined}
         oncontextmenu={(e) => showContextMenu(user, e)}
       >
         <div
@@ -358,6 +355,20 @@
         <Icon name="poke" size={16} />
         <span>Poke</span>
       </button>
+      {#if !isPreviewing}
+        <button
+          class="ctx-item"
+          onclick={() => {
+            selectedStrip.set(contextMenu!.user.user_id);
+            if ($isMobile) mobileTab.set("mixer");
+            else centreView.set("mixer");
+            closeContextMenu();
+          }}
+        >
+          <Icon name="music-note" size={16} />
+          <span>Mixer…</span>
+        </button>
+      {/if}
       {#if canInvite}
         <button class="ctx-item" onclick={() => { inviteUser(contextMenu!.user.user_id); closeContextMenu(); }}>
           <Icon name="invite" size={16} />
@@ -513,6 +524,13 @@
 
   .user:hover {
     background: var(--bg-hover);
+  }
+
+  /* A game says who is in earshot by leaving everyone else out. That is how
+     distance culling works, and also how a game could silence one person — so
+     it is shown rather than left to be discovered. */
+  .user.culled {
+    opacity: 0.45;
   }
 
   .user.speaking {

@@ -168,6 +168,7 @@
   let settingsAnonymous = $state(false);
   let settingsScreenShare = $state(true);
   let settingsHideMembers = $state(false);
+  let settingsRouted = $state(false);
   let settingsBefore: ChannelInfo | null = null;
 
   function openPasswordEdit(channelId: number, e: Event) {
@@ -183,6 +184,7 @@
     settingsAnonymous = channel?.anonymous ?? false;
     settingsScreenShare = channel?.screen_share ?? true;
     settingsHideMembers = channel?.hide_members ?? false;
+    settingsRouted = channel?.routed ?? false;
     settingsBefore = channel ?? null;
   }
 
@@ -219,7 +221,8 @@
         (settingsHidden !== was.hidden ||
           settingsAnonymous !== was.anonymous ||
           settingsScreenShare !== was.screen_share ||
-          settingsHideMembers !== was.hide_members)
+          settingsHideMembers !== was.hide_members ||
+          settingsRouted !== was.routed)
       ) {
         await invoke("set_channel_options", {
           channelId,
@@ -227,6 +230,7 @@
           anonymous: changed(settingsAnonymous, was.anonymous),
           screenShare: changed(settingsScreenShare, was.screen_share),
           hideMembers: changed(settingsHideMembers, was.hide_members),
+          routed: changed(settingsRouted, was.routed),
         });
       }
       passwordEditChannelId = null;
@@ -328,6 +332,13 @@
         {/if}
         {#if channel.hidden}
           <span class="proximity-tag" title="Hidden: only admins see this channel in the list">H</span>
+        {/if}
+        {#if channel.routed}
+          <span
+            class="proximity-tag"
+            title="Routed: the server is told which members you want to hear, and forwards only their voice"
+            >R</span
+          >
         {/if}
         {#if !(channel.hide_members && !$isAdmin)}
           <span class="user-count">({channel.user_count}{#if channel.max_users > 0}/{channel.max_users}{/if})</span>
@@ -463,6 +474,17 @@
         <input type="checkbox" bind:checked={settingsScreenShare} />
         Allow screen sharing
       </label>
+      <label class="dialog-check">
+        <input type="checkbox" bind:checked={settingsRouted} />
+        Routed — the server forwards each voice only to whoever should hear it
+      </label>
+      <p class="dialog-note">
+        For a channel a game drives, where everyone in it can be a whole map. It is the one
+        setting that tells the server anything about who hears whom: members here tell it which
+        of the others they want to hear, and a connected game server may narrow that further.
+        The server still never receives positions, names it does not already have, or audio it
+        can read. Off everywhere else, where fanning out to the whole channel costs nothing.
+      </p>
       <div class="dialog-actions">
         <button class="create-btn" type="submit">Save</button>
         <button class="cancel-btn" type="button" onclick={cancelPasswordEdit}>Cancel</button>
@@ -674,6 +696,16 @@
     gap: 6px;
     font-size: 12px;
     color: var(--text-secondary);
+  }
+
+  /* What an option actually shares, spelled out where it is switched on.
+     A setting that changes what the server learns has to say so. */
+  .dialog-note {
+    margin: -2px 0 0 22px;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--text-secondary);
+    opacity: 0.85;
   }
 
   .channel-unread {

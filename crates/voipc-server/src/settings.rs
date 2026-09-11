@@ -21,6 +21,17 @@ pub struct ServerSettings {
     /// refused, and position beacons are not relayed.
     #[serde(default = "default_proximity_enabled")]
     pub proximity_enabled: bool,
+
+    /// Bearer token a **game server** presents to `POST /game/v1/routes`,
+    /// which tells the relay who may hear whom in a channel whose `routed`
+    /// flag is on. Unset (the default) means the endpoint answers 404 and
+    /// this server has no idea games exist.
+    ///
+    /// Not the admin token, and deliberately much weaker: it can narrow who
+    /// hears whom inside one routed channel, and nothing else. No session
+    /// list, no names, no kick, no bans.
+    #[serde(default)]
+    pub game_token: Option<String>,
 }
 
 fn default_empty_channel_timeout() -> u64 {
@@ -43,6 +54,7 @@ impl Default for ServerSettings {
             max_channels: default_max_channels(),
             max_channel_name_len: default_max_channel_name_len(),
             proximity_enabled: default_proximity_enabled(),
+            game_token: None,
         }
     }
 }

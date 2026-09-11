@@ -50,6 +50,13 @@ pub struct ChannelEntry {
     /// Hide the member list from non-admins; they still see whoever speaks.
     #[serde(default)]
     pub hide_members: bool,
+
+    /// Forward voice only to the people who should hear it, instead of to
+    /// every member. For a channel a game drives, where "every member" can be
+    /// a whole map; it is also the only setting that tells this server
+    /// anything about who hears whom, so it is off unless asked for.
+    #[serde(default)]
+    pub routed: bool,
 }
 
 fn default_true() -> bool {
@@ -71,6 +78,7 @@ impl Default for ChannelEntry {
             anonymous: false,
             screen_share: true,
             hide_members: false,
+            routed: false,
         }
     }
 }
@@ -385,12 +393,13 @@ mod tests {
             anonymous: true,
             screen_share: false,
             hide_members: true,
+            routed: true,
         }];
         assert!(hash_plaintext_passwords(&mut entries));
         let json = serde_json::to_string(&entries).unwrap();
         let back: Vec<ChannelEntry> = serde_json::from_str(&json).unwrap();
         assert_eq!(back[0].proximity, ProximityMode::TwoD);
-        assert!(back[0].hidden && back[0].anonymous && back[0].hide_members);
+        assert!(back[0].hidden && back[0].anonymous && back[0].hide_members && back[0].routed);
         assert!(!back[0].screen_share, "sharing must stay switched off");
     }
 }

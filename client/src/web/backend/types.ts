@@ -73,6 +73,17 @@ export interface AudioApi {
   setVolume(volume: number): void;
   setUserVolume(userId: number, volume: number): void;
   getUserVolume(userId: number): number;
+  /**
+   * One incoming lane: an effect plus muffle, reverb and water, each 0-10.
+   * Exactly the four controls our own microphone has.
+   */
+  setUserFx(userId: number, effect: string, muffle: number, reverb: number, water: number): void;
+  getUserFx(userId: number): [string, number, number, number];
+  /** Every source's level, keyed by user id, for the mixer's meters. */
+  getSourceLevels(): Record<number, number>;
+  /** Our own microphone's lane — the same four controls, and everyone hears it. */
+  setMicFx(effect: string, muffle: number, reverb: number, water: number): void;
+  getMicFx(): [string, number, number, number];
   setUserPosition(
     userId: number,
     pos: [number, number, number] | null,
@@ -92,8 +103,16 @@ export interface AudioApi {
   getOutputDevices(): Promise<{ name: string; is_default: boolean }[]>;
   setInputDevice(name: string): Promise<void>;
   setOutputDevice(name: string): Promise<void>;
-  startMicTest(): Promise<void>;
+  /** `monitor` plays the microphone back through the sender effect. */
+  startMicTest(monitor?: boolean): Promise<void>;
   stopMicTest(): void;
+  /** The synthetic voice, hard left then hard right, until stopped. */
+  startOutputTest(): Promise<void>;
+  stopOutputTest(): void;
+  /** Whether this browser can send audio to a device the user picks. */
+  canPickOutput(): boolean;
+  /** Ask for the microphone, and throw the refusal rather than swallow it. */
+  requestMicrophone(): Promise<void>;
   /** [frames_played, frames_lost] cumulative, for get_voice_stats. */
   getVoiceStats(): [number, number];
   /** [send_count, recv_count] cumulative screen-audio packets, for get_screen_audio_status. */

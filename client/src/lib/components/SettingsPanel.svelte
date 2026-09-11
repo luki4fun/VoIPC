@@ -30,9 +30,16 @@
   import { clearAllHistory } from "../stores/chat.js";
   import { addNotification } from "../stores/notifications.js";
   import { isMobile, isWeb, volumeKeyPtt } from "../stores/platform.js";
-  import { shareChannelHistory, spatialAudio, screenAudioSpatial } from "../stores/settings.js";
+  import {
+    micMonitor,
+    shareChannelHistory,
+    spatialAudio,
+    screenAudioSpatial,
+    audioSetupRequested,
+  } from "../stores/settings.js";
   import type { AudioDeviceInfo } from "../types.js";
   import Icon from "./Icons.svelte";
+  import { KeyCapture, shadows } from "../keybind.js";
 
   let { onclose }: { onclose: () => void } = $props();
 
@@ -45,6 +52,10 @@
   let sdkEnabled = $state(false);
   let sdkPort = $state(39987);
   let sdkOrigins = $state("");
+  /** The two things a game may do *to* the player rather than for them. */
+  let sdkBeacon = $state(false);
+  let sdkTransmit = $state(false);
+  let sdkMumble = $state(false);
   let sdkConnected = $state(false);
   let sdkGame = $state("");
   /** False where the SDK is compiled out (Android), so the section stays hidden. */
@@ -60,6 +71,9 @@
         enabled: boolean;
         port: number;
         origins: string[];
+        beaconAllowed: boolean;
+        transmitAllowed: boolean;
+        mumblelink: boolean;
         connected: boolean;
         game: string;
         error: string | null;
@@ -68,6 +82,9 @@
       sdkEnabled = status.enabled;
       sdkPort = status.port;
       sdkOrigins = status.origins.join("\n");
+      sdkBeacon = status.beaconAllowed ?? false;
+      sdkTransmit = status.transmitAllowed ?? false;
+      sdkMumble = status.mumblelink ?? false;
       // A game that connected before this panel opened sent its event to nobody
       sdkConnected = status.connected;
       sdkGame = status.game;
@@ -77,14 +94,27 @@
     }
   }
 
-  async function setSdk(change: { enabled?: boolean; port?: number; origins?: string }) {
+  async function setSdk(change: {
+    enabled?: boolean;
+    port?: number;
+    origins?: string;
+    beaconAllowed?: boolean;
+    transmitAllowed?: boolean;
+    mumblelink?: boolean;
+  }) {
     if (change.enabled !== undefined) sdkEnabled = change.enabled;
     if (change.port !== undefined) sdkPort = change.port;
     if (change.origins !== undefined) sdkOrigins = change.origins;
+    if (change.beaconAllowed !== undefined) sdkBeacon = change.beaconAllowed;
+    if (change.transmitAllowed !== undefined) sdkTransmit = change.transmitAllowed;
+    if (change.mumblelink !== undefined) sdkMumble = change.mumblelink;
     try {
       await invoke("set_sdk_config", {
         enabled: change.enabled ?? null,
         port: change.port ?? null,
+        beaconAllowed: change.beaconAllowed ?? null,
+        transmitAllowed: change.transmitAllowed ?? null,
+        mumblelink: change.mumblelink ?? null,
         origins:
           change.origins === undefined
             ? null
@@ -159,29 +189,22 @@
 
   // PTT key capture
   let isCapturingKey = $state(false);
-  let captureHint = $state("Press any key or combo...");
-  let nonModifierPressed = false;
+  let captureHint = $state(KeyCapture.PROMPT);
+  /** The rules live in lib/keybind.ts, shared with the first-run audio setup. */
+  let capture: KeyCapture | null = null;
   // Which binding the capture UI is editing: PTT, global mute, or global deafen
   let captureTarget = $state<"ptt" | "mute" | "deafen">("ptt");
 
   function startKeyCapture(target: "ptt" | "mute" | "deafen" = "ptt") {
     captureTarget = target;
     isCapturingKey = true;
-    nonModifierPressed = false;
-    captureHint = "Press any key or combo...";
-  }
-
-  function formatBinding(e: KeyboardEvent): string {
-    const parts: string[] = [];
-    if (e.ctrlKey) parts.push("Ctrl");
-    if (e.altKey) parts.push("Alt");
-    if (e.shiftKey) parts.push("Shift");
-    parts.push(e.code);
-    return parts.join("+");
+    capture = new KeyCapture();
+    captureHint = KeyCapture.PROMPT;
   }
 
   function finishCapture(binding: string) {
     isCapturingKey = false;
+    capture = null;
     const targets = {
       ptt: { store: pttKey, cmd: "set_ptt_key", label: "PTT key" },
       mute: { store: muteKey, cmd: "set_mute_key", label: "mute hotkey" },
@@ -207,39 +230,38 @@
   function handleCaptureKeyDown(e: KeyboardEvent) {
     e.preventDefault();
     e.stopPropagation();
-
-    const isModifier = ["Control", "Shift", "Alt", "Meta"].includes(e.key);
-
-    if (isModifier) {
-      const parts: string[] = [];
-      if (e.ctrlKey || e.key === "Control") parts.push("Ctrl");
-      if (e.altKey || e.key === "Alt") parts.push("Alt");
-      if (e.shiftKey || e.key === "Shift") parts.push("Shift");
-      captureHint = parts.join("+") + "+...";
-      return;
-    }
-
-    nonModifierPressed = true;
-    finishCapture(formatBinding(e));
+    if (!capture) return;
+    const step = capture.keydown(e);
+    if (step.kind === "hint") captureHint = step.hint;
+    else finishCapture(step.binding);
   }
 
   function handleCaptureKeyUp(e: KeyboardEvent) {
     e.preventDefault();
     e.stopPropagation();
     if (!isCapturingKey) return;
-
-    const isModifier = ["Control", "Shift", "Alt", "Meta"].includes(e.key);
-    if (isModifier && !nonModifierPressed) {
-      finishCapture(e.code);
-    }
+    const done = capture?.keyup(e);
+    if (done) finishCapture(done.binding);
   }
 
   function cancelKeyCapture() {
     isCapturingKey = false;
+    capture = null;
   }
 
   function autofocus(node: HTMLElement) {
     node.focus();
+  }
+
+  /** What a picker shows when nothing is saved: the system's own default. */
+  function defaultDeviceName(list: AudioDeviceInfo[]): string {
+    return list.find((d) => d.is_default)?.name ?? list[0]?.name ?? "";
+  }
+
+  /** Ask the four first-run questions again, from Settings. */
+  function runAudioSetup() {
+    audioSetupRequested.set(true);
+    onclose();
   }
 
   function handleHoldModeChange(e: Event) {
@@ -378,7 +400,7 @@
           stopMicTest();
         }),
       );
-      await invoke("start_mic_test");
+      await invoke("start_mic_test", { monitor: $micMonitor });
       micTestRunning = true;
     } catch (e) {
       addNotification(`Mic test failed: ${e}`, "error");
@@ -498,9 +520,12 @@
       {#if !$isMobile}
         <div class="section">
           <h4>Audio Input</h4>
-          <select onchange={changeInputDevice}>
+          <!-- Bound to what is saved, not to `is_default`: a device somebody
+               chose on purpose was shown as unselected, so the panel claimed
+               they were on the system default when they were not. -->
+          <select value={$inputDevice || defaultDeviceName(inputDevices)} onchange={changeInputDevice}>
             {#each inputDevices as device}
-              <option value={device.name} selected={device.is_default}>
+              <option value={device.name}>
                 {device.name}
                 {device.is_default ? " (Default)" : ""}
               </option>
@@ -516,18 +541,37 @@
               </div>
             {/if}
           </div>
+          <label class="toggle-row">
+            <input
+              type="checkbox"
+              checked={$micMonitor}
+              disabled={micTestRunning}
+              onchange={(e) => micMonitor.set((e.target as HTMLInputElement).checked)}
+            />
+            <span class="toggle-label">Hear myself during the test (headphones only)</span>
+            <span class="toggle-hint">
+              Plays your microphone back to you through your own voice effect, so you can
+              hear what the channel hears before anyone else does. On speakers it feeds
+              back. Not saved: it is a deliberate act each session.
+            </span>
+          </label>
         </div>
 
         <div class="section">
           <h4>Audio Output</h4>
-          <select onchange={changeOutputDevice}>
+          <select value={$outputDevice || defaultDeviceName(outputDevices)} onchange={changeOutputDevice}>
             {#each outputDevices as device}
-              <option value={device.name} selected={device.is_default}>
+              <option value={device.name}>
                 {device.name}
                 {device.is_default ? " (Default)" : ""}
               </option>
             {/each}
           </select>
+          <button class="mic-test-btn" onclick={runAudioSetup}>Run audio setup again</button>
+          <span class="toggle-hint">
+            Walks through the microphone, the speakers and how your microphone opens — the
+            same four questions VoIPC asks the first time.
+          </span>
         </div>
 
         <div class="section">
@@ -550,6 +594,12 @@
               <button class="change-key-btn" onclick={() => startKeyCapture("ptt")}>Change</button>
             {/if}
           </div>
+          {#if shadows($pttKey)}
+            <span class="toggle-hint">
+              {$pttKey} also toggles {shadows($pttKey) === "mute" ? "mute" : "deafen"}. Push to talk
+              wins, so that shortcut stops working while this is your key.
+            </span>
+          {/if}
           <label class="toggle-row">
             <input type="checkbox" checked={$pttHoldMode} onchange={handleHoldModeChange} />
             <span class="toggle-label">Hold modifier to talk</span>
@@ -738,6 +788,47 @@
               onchange={(e) => setSdk({ port: Number((e.target as HTMLInputElement).value) })}
             />
           </div>
+          <label class="toggle-row">
+            <input
+              type="checkbox"
+              checked={sdkBeacon}
+              onchange={(e) => setSdk({ beaconAllowed: (e.target as HTMLInputElement).checked })}
+            />
+            <span class="toggle-label">Let a game broadcast my position to the channel</span>
+            <span class="toggle-hint">
+              For games whose mods can only see where you are, not where everyone else is. Your
+              position is encrypted with the channel key like your voice — the server cannot read
+              it, but everyone in the channel can. Off by default; without it, positions a game
+              feeds in never leave this machine.
+            </span>
+          </label>
+          <label class="toggle-row">
+            <input
+              type="checkbox"
+              checked={sdkMumble}
+              onchange={(e) => setSdk({ mumblelink: (e.target as HTMLInputElement).checked })}
+            />
+            <span class="toggle-label">Follow MumbleLink</span>
+            <span class="toggle-hint">
+              Some games — Guild Wars 2 among them — write your own position into shared memory
+              instead of letting a mod talk to VoIPC. This reads that, and nothing else in it:
+              not your account name, not which server you are on. It places people for you
+              locally; they see you only if you also allow the setting above.
+            </span>
+          </label>
+          <label class="toggle-row">
+            <input
+              type="checkbox"
+              checked={sdkTransmit}
+              onchange={(e) => setSdk({ transmitAllowed: (e.target as HTMLInputElement).checked })}
+            />
+            <span class="toggle-label">Let a game press my push-to-talk</span>
+            <span class="toggle-hint">
+              So the in-game radio key is the only key you hold. It can never talk over your mute,
+              it shows in the voice bar like any other transmission, and it lets go as soon as the
+              game stops driving. Off by default.
+            </span>
+          </label>
           <span class="toggle-hint">
             Extra allowed origins, one per line. Game runtimes are allowed already;
             add <code>null</code> only to test from a local file.

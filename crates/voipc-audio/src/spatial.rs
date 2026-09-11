@@ -41,8 +41,10 @@ const MUFFLE_FC_MAX: f32 = 22_000.0;
 const MUFFLE_CUT_DB: f32 = 15.0;
 /// Highest muffle level the SDK may send (0 = clear, 10 = through a wall).
 pub const MAX_MUFFLE: u8 = 10;
-
-const SAMPLE_RATE: f32 = 48_000.0;
+/// Highest room reverberation the SDK or the UI may ask for (0 = dry).
+pub const MAX_REVERB: u8 = 10;
+/// Highest "how submerged the listener is" (0 = above water).
+pub const MAX_UNDERWATER: u8 = 10;
 
 /// Where the listener is and which way they face.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -62,21 +64,140 @@ impl Default for Listener {
     }
 }
 
-/// The effect chain a source is rendered through.
+/// Which effect chain a voice is rendered through.
 ///
-/// Only the desktop mixer applies it — the browser has no game SDK, and its
-/// worklet renders these flat. [`gains`] ignores it on purpose: that function
-/// is mirrored in TypeScript against a shared golden table, and an effect
-/// nobody else can render must not move those numbers.
+/// Both clients render every chain — the browser's worklet holds the same DSP,
+/// and the two suites pin the same levels. [`gains`] ignores the chain on
+/// purpose: that function is mirrored in TypeScript against a shared golden
+/// table, and an effect must not move those numbers.
+///
+/// The discriminants are explicit and **0, 1 and 2 must never move**: the
+/// chosen effect is stored as a byte in the client's config and in an atomic,
+/// so renumbering silently hands somebody a different effect than the one they
+/// picked. New chains are appended.
+///
+/// The parameters of each live in `mixer::PRESETS`, indexed by `fx as usize - 1`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[repr(u8)]
 pub enum Effect {
     #[default]
-    None,
-    /// Band-limited to roughly the telephone band, 300–3400 Hz.
-    Phone,
+    None = 0,
+    /// Band-limited to roughly the telephone band, 300–3400 Hz. Kept as the
+    /// original chain, and noticeably quieter than the rest; `Landline` is the
+    /// loudness-matched one to reach for.
+    Phone = 1,
     /// The same band-limit plus drive, a faint hiss and a squelch burst at the
     /// start and end of every transmission.
-    Radio,
+    Radio = 2,
+    Cb = 3,
+    Walkie = 4,
+    Aviation = 5,
+    Police = 6,
+    Landline = 7,
+    Mobile = 8,
+    BadVoip = 9,
+    Intercom = 10,
+    Megaphone = 11,
+    Gramophone = 12,
+    Robot = 13,
+}
+
+/// Every chain, in discriminant order. `EFFECTS[i]` is `from_u8(i as u8 + 1)`.
+pub const EFFECTS: [Effect; 13] = [
+    Effect::Phone,
+    Effect::Radio,
+    Effect::Cb,
+    Effect::Walkie,
+    Effect::Aviation,
+    Effect::Police,
+    Effect::Landline,
+    Effect::Mobile,
+    Effect::BadVoip,
+    Effect::Intercom,
+    Effect::Megaphone,
+    Effect::Gramophone,
+    Effect::Robot,
+];
+
+impl Effect {
+    /// From the byte an atomic or a config carries. Anything unknown is no
+    /// effect, the same rule the SDK applies to an unrecognised `mode` — which
+    /// is what lets a newer mod name a chain this build has never heard of.
+    pub fn from_u8(v: u8) -> Self {
+        if v == 0 || v as usize > EFFECTS.len() {
+            Effect::None
+        } else {
+            EFFECTS[v as usize - 1]
+        }
+    }
+
+    /// The id this chain is known by on the wire, in the config and in the UI.
+    pub fn id(self) -> &'static str {
+        match self {
+            Effect::None => "none",
+            other => crate::mixer::preset(other).map_or("none", |p| p.id),
+        }
+    }
+}
+
+/// The effect one of the SDK's mode names asks for. `"direct"` and anything
+/// unknown are no effect; `direct` is a placement question, not a chain.
+pub fn effect_from_str(s: &str) -> Effect {
+    EFFECTS
+        .into_iter()
+        .find(|e| crate::mixer::preset(*e).is_some_and(|p| p.id == s))
+        .unwrap_or(Effect::None)
+}
+
+/// Put a finished pair of gains in one ear: −1 hard left, +1 hard right.
+///
+/// Deliberately **outside** [`gains`], and applied after it. That function is
+/// pinned by a golden table mirrored in TypeScript, and `volume · √2 · cos(π/4)`
+/// is `0.99999994` in f32 — routing an unpanned source through the pan law
+/// would move every number in the table. `pan == 0.0` returns the gains
+/// untouched, so only a source somebody actually panned pays anything.
+///
+/// No [`WIDTH`] clamp here, unlike the world pan. `WIDTH` exists because a
+/// world direction is an estimate and a hard pan of an estimate is fatiguing;
+/// "the phone is at my left ear" is not an estimate. A mod that wants the
+/// gentler feel asks for `pan: 0.85` itself. With spatial audio off, [`gains`]
+/// returns [`FLAT`] and this goes with it, so one-eared listeners keep hearing
+/// everything.
+pub fn pan_gains(g: Gains, pan: f32) -> Gains {
+    if pan == 0.0 || !pan.is_finite() {
+        return g;
+    }
+    // The same constant-power law the world pan uses, at spatial.rs:263-268
+    let angle = (pan.clamp(-1.0, 1.0) + 1.0) * 0.5 * core::f32::consts::FRAC_PI_2;
+    Gains {
+        l: g.l * angle.cos() * core::f32::consts::SQRT_2,
+        r: g.r * angle.sin() * core::f32::consts::SQRT_2,
+        lp_a: g.lp_a,
+    }
+}
+
+/// The level half of a muffle, as a linear gain: a wall makes a voice quieter
+/// as well as duller, and the two halves have to be able to travel separately.
+///
+/// [`gains`] applies both; a channel where `gains` is not placing anybody still
+/// owes the cut to whatever the game said, and calls this with [`muffle_lp_a`].
+pub fn muffle_cut(muffle: u8) -> f32 {
+    let m = muffle.min(MAX_MUFFLE) as f32 / MAX_MUFFLE as f32;
+    10f32.powf(-MUFFLE_CUT_DB * m / 20.0)
+}
+
+/// One-pole coefficient for a muffle level; 1.0 is bypass.
+///
+/// The level cut is [`muffle_cut`] — this is the filter half, which the
+/// listener's own per-user muffle needs in channels where `gains` returns
+/// [`FLAT`].
+pub fn muffle_lp_a(muffle: u8) -> f32 {
+    let m = muffle.min(MAX_MUFFLE) as f32 / MAX_MUFFLE as f32;
+    if m == 0.0 {
+        1.0
+    } else {
+        crate::mixer::one_pole_a(MUFFLE_FC_MAX.powf(1.0 - m) * MUFFLE_FC_MIN.powf(m))
+    }
 }
 
 /// Where one other user is, and how they should be rendered.
@@ -95,6 +216,16 @@ pub struct Source {
     /// Effect chain applied by the desktop mixer; `Radio` and `Phone` imply
     /// `direct` (they are not coming from a place in the world).
     pub fx: Effect,
+    /// Put this render in one ear: −1 hard left, 0 centred, +1 hard right.
+    /// Applied by [`pan_gains`] *after* [`gains`], which is why it is not a
+    /// parameter of that function. A phone held to the left ear is the case
+    /// this exists for; the world's own direction is `pos`.
+    pub pan: f32,
+    /// Hold this render back by whole 20 ms frames, so one voice can arrive
+    /// twice — over the air and through the room — the way a real radio does.
+    /// ponytail: whole frames only; a sample-accurate delay needs a per-source
+    /// ring, and nobody can hear 20 ms of quantisation on a radio double.
+    pub delay_frames: u8,
 }
 
 impl Default for Source {
@@ -106,6 +237,8 @@ impl Default for Source {
             muffle: 0,
             direct: false,
             fx: Effect::None,
+            pan: 0.0,
+            delay_frames: 0,
         }
     }
 }
@@ -127,7 +260,8 @@ pub const FLAT: Gains = Gains {
     lp_a: 1.0,
 };
 
-const SILENT: Gains = Gains {
+/// Out of earshot: the game culled them, or they are past the range.
+pub const SILENT: Gains = Gains {
     l: 0.0,
     r: 0.0,
     lp_a: 1.0,
@@ -178,14 +312,8 @@ pub fn gains(mode: ProximityMode, lis: &Listener, src: Option<&Source>) -> Gains
     let pan = (lat * WIDTH * (1.0 - bloom)).clamp(-1.0, 1.0);
     let angle = (pan + 1.0) * 0.5 * core::f32::consts::FRAC_PI_2;
 
-    let m = s.muffle.min(MAX_MUFFLE) as f32 / MAX_MUFFLE as f32;
-    let volume = g * s.volume * 10f32.powf(-MUFFLE_CUT_DB * m / 20.0) * core::f32::consts::SQRT_2;
-    let lp_a = if m == 0.0 {
-        1.0
-    } else {
-        let fc = MUFFLE_FC_MAX.powf(1.0 - m) * MUFFLE_FC_MIN.powf(m);
-        1.0 - (-2.0 * core::f32::consts::PI * fc / SAMPLE_RATE).exp()
-    };
+    let volume = g * s.volume * muffle_cut(s.muffle) * core::f32::consts::SQRT_2;
+    let lp_a = muffle_lp_a(s.muffle);
 
     Gains {
         l: volume * angle.cos(),
@@ -389,6 +517,38 @@ mod tests {
     }
 
     #[test]
+    fn an_ear_pan_is_applied_after_the_golden_table_and_keeps_its_power() {
+        let g = Gains { l: 0.8, r: 0.8, lp_a: 0.5 };
+        // Untouched at centre, and bit-exact: this is the case that must not
+        // move the golden table, and `0.8 * SQRT_2 * cos(PI/4)` does not come
+        // back as `0.8` in f32.
+        assert_eq!(pan_gains(g, 0.0), g);
+        assert_eq!(pan_gains(g, f32::NAN), g);
+
+        let power = |g: Gains| (g.l * g.l + g.r * g.r).sqrt();
+        for pan in [-1.0, -0.85, -0.3, 0.3, 0.85, 1.0] {
+            let p = pan_gains(g, pan);
+            assert!(
+                (power(p) - power(g)).abs() < 1e-5,
+                "pan {pan} changed the loudness: {p:?}"
+            );
+            assert_eq!(p.lp_a, g.lp_a, "pan is not a filter");
+        }
+
+        // Hard left really is hard left: nothing in the other ear, and no
+        // WIDTH clamp softening it — "which ear is my phone in" has to be
+        // answerable.
+        let left = pan_gains(g, -1.0);
+        assert!(left.r.abs() < 1e-6 && (left.l - 0.8 * core::f32::consts::SQRT_2).abs() < 1e-5);
+        let right = pan_gains(g, 1.0);
+        assert!(right.l.abs() < 1e-6);
+        // Mirrored, and out of range is clamped rather than refused
+        assert_eq!(pan_gains(g, 9.0), right);
+        assert_eq!(pan_gains(g, -9.0), left);
+        assert!((left.l - right.r).abs() < 1e-6);
+    }
+
+    #[test]
     fn muffle_cuts_volume_and_lowers_the_cutoff() {
         let lis = Listener::default();
         let clear = gains(ProximityMode::TwoD, &lis, Some(&at(0.0, 0.0)));
@@ -411,6 +571,31 @@ mod tests {
             Some(&Source { muffle: 200, ..at(0.0, 0.0) }),
         );
         assert_eq!(over, walled);
+    }
+
+    #[test]
+    fn effect_names_are_a_closed_set() {
+        assert_eq!(effect_from_str("radio"), Effect::Radio);
+        assert_eq!(effect_from_str("phone"), Effect::Phone);
+        assert_eq!(effect_from_str("megaphone"), Effect::Megaphone);
+        // "direct" is a placement, not a chain, and an unknown name is still
+        // rendered plainly rather than refused — that is what lets a mod written
+        // against a later build keep working against this one.
+        for name in ["none", "", "direct", "spatial", "Radio", "telepathy"] {
+            assert_eq!(effect_from_str(name), Effect::None, "{name} was not refused");
+        }
+        // 0, 1 and 2 are pinned: they are stored in configs and in an atomic
+        assert_eq!(Effect::from_u8(1), Effect::Phone);
+        assert_eq!(Effect::from_u8(2), Effect::Radio);
+        for v in [0u8, 14, 200, 255] {
+            assert_eq!(Effect::from_u8(v), Effect::None, "byte {v}");
+        }
+        // Every chain round-trips through its byte and its id
+        for (i, fx) in EFFECTS.into_iter().enumerate() {
+            assert_eq!(Effect::from_u8(i as u8 + 1), fx);
+            assert_eq!(effect_from_str(fx.id()), fx, "{} did not round-trip", fx.id());
+        }
+        assert_eq!(Effect::None.id(), "none");
     }
 
     #[test]

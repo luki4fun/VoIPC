@@ -31,6 +31,14 @@ export function setSelfDeafened(deafened: boolean): void {
   users.update((all) => patchUser(all, get(userId), { is_deafened: deafened }));
 }
 export const isTransmitting = writable<boolean>(false);
+
+/**
+ * A game is holding push-to-talk down for us, because the player pressed their
+ * in-game radio key. Off unless they allowed it in Settings, and shown in the
+ * voice bar: a microphone somebody else opened has to look different from one
+ * you opened yourself.
+ */
+export const transmitHeldByGame = writable<boolean>(false);
 export const acceptSelfSigned = writable<boolean>(false);
 
 /** This session is logged in with the server's admin token. */

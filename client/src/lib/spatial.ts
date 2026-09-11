@@ -24,8 +24,14 @@ export const BLOOM = 0.5;
 const MUFFLE_FC_MIN = 350;
 const MUFFLE_FC_MAX = 22_000;
 const MUFFLE_CUT_DB = 15;
+/**
+ * The scale every scalable effect runs on: 0 is off, 10 is as far as it goes.
+ * Muffle, reverb and water all use it, because they are the same kind of
+ * control — a lane's effect is the dropdown, these three are the sliders.
+ */
+export const MAX_LEVEL = 10;
 /** Highest muffle level the SDK may send (0 = clear, 10 = through a wall). */
-export const MAX_MUFFLE = 10;
+export const MAX_MUFFLE = MAX_LEVEL;
 
 const SAMPLE_RATE = 48_000;
 
@@ -36,10 +42,14 @@ export interface Listener {
 }
 
 /**
- * Effect chain a source is rendered through. Desktop only: the browser has no
- * game SDK, and its worklet renders radio and phone flat. Here for type parity
- * with spatial.rs — `gains()` ignores it on both sides, so the golden table is
- * unaffected.
+ * Effect chain a source is rendered through. The browser renders every chain
+ * the desktop does (they share one copy of the DSP in the mixer worklet); what
+ * it has no socket for is the game SDK, so here a chain only ever comes from
+ * the user's own mixer. Here for type parity with spatial.rs — `gains()`
+ * ignores it on both sides, so the golden table is unaffected.
+ *
+ * The three names are the ones this file's callers use; the full list of
+ * thirteen lives in `PRESETS` in the worklet, which is its single source.
  */
 export type Effect = "none" | "phone" | "radio";
 
@@ -53,7 +63,7 @@ export interface Source {
   muffle: number;
   /** Render flat: radio, phone, megaphone, spectators. */
   direct: boolean;
-  /** Desktop-only effect chain; the browser renders these flat. */
+  /** Effect chain; rendered by both clients, and ignored by `gains`. */
   fx?: Effect;
 }
 
@@ -103,19 +113,43 @@ export function gains(mode: ProximityMode, lis: Listener, src: Source | null): G
   const pan = clamp(lat * WIDTH * (1 - bloom), -1, 1);
   const angle = ((pan + 1) * 0.5 * Math.PI) / 2;
 
-  const m = Math.min(src.muffle, MAX_MUFFLE) / MAX_MUFFLE;
-  const volume = g * src.volume * Math.pow(10, (-MUFFLE_CUT_DB * m) / 20) * Math.SQRT2;
-  const lpA =
-    m === 0
-      ? 1
-      : 1 - Math.exp((-2 * Math.PI * Math.pow(MUFFLE_FC_MAX, 1 - m) * Math.pow(MUFFLE_FC_MIN, m)) / SAMPLE_RATE);
+  const volume = g * src.volume * muffleCut(src.muffle) * Math.SQRT2;
 
-  return { l: volume * Math.cos(angle), r: volume * Math.sin(angle), lpA };
+  return { l: volume * Math.cos(angle), r: volume * Math.sin(angle), lpA: muffleLpA(src.muffle) };
+}
+
+/**
+ * The level half of a muffle, as a linear gain: a wall makes a voice quieter as
+ * well as duller. Mirrors spatial.rs `muffle_cut`. `gains` applies both halves;
+ * a channel that places nobody still owes the cut to whatever a game said.
+ */
+export function muffleCut(muffle: number): number {
+  const m = Math.min(Math.max(muffle, 0), MAX_MUFFLE) / MAX_MUFFLE;
+  return Math.pow(10, (-MUFFLE_CUT_DB * m) / 20);
+}
+
+/**
+ * One-pole coefficient for a muffle level; 1 is bypass. Mirrors spatial.rs
+ * `muffle_lp_a`. The volume cut stays in `gains` — this is the filter half,
+ * which the listener's own per-user muffle needs in channels where `gains`
+ * returns FLAT.
+ */
+export function muffleLpA(muffle: number): number {
+  const m = Math.min(Math.max(muffle, 0), MAX_MUFFLE) / MAX_MUFFLE;
+  if (m === 0) return 1;
+  const fc = Math.pow(MUFFLE_FC_MAX, 1 - m) * Math.pow(MUFFLE_FC_MIN, m);
+  return 1 - Math.exp((-2 * Math.PI * fc) / SAMPLE_RATE);
 }
 
 function clamp(v: number, lo: number, hi: number): number {
   return v < lo ? lo : v > hi ? hi : v;
 }
+
+// Deliberately *not* mirrored here: spatial.rs `pan_gains`, which puts one
+// render in one ear. Only a game asks for that, and only over the SDK socket,
+// which a browser page cannot host — so a port would be dead code, and the
+// golden table could not check it. If the browser ever receives placements
+// from the server (a routed channel is the obvious way), port it then.
 
 // ── The settings panel's spatial test (mirrors spatial.rs) ───────────────
 //

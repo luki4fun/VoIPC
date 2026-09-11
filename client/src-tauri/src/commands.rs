@@ -4,7 +4,7 @@ use std::sync::atomic::Ordering;
 use serde::Serialize;
 use tauri::{Emitter, State};
 
-use voipc_audio::spatial::{Listener, Source};
+use voipc_audio::spatial::Listener;
 use voipc_protocol::messages::ClientMessage;
 use voipc_protocol::types::ProximityMode;
 use voipc_protocol::voice::VoicePacket;
@@ -191,6 +191,7 @@ pub async fn set_channel_options(
     anonymous: Option<bool>,
     screen_share: Option<bool>,
     hide_members: Option<bool>,
+    routed: Option<bool>,
 ) -> Result<(), String> {
     let conn = state.connection.read().await;
     let connection = conn.as_ref().ok_or("Not connected")?;
@@ -202,6 +203,7 @@ pub async fn set_channel_options(
             anonymous,
             screen_share,
             hide_members,
+            routed,
         },
     )
     .await
@@ -636,11 +638,59 @@ pub async fn send_direct_message(
     }
 }
 
-/// Core start-transmit logic, callable from both the Tauri command and the global shortcut handler.
+/// The user pressed push-to-talk (or switched to voice activation, which holds
+/// it down for them). Callable from the Tauri command and the global shortcut.
 pub(crate) async fn do_start_transmit(
     state: &AppState,
     app_handle: tauri::AppHandle,
 ) -> Result<(), String> {
+    state.ptt_user.store(true, Ordering::Relaxed);
+    start_capture(state, app_handle).await
+}
+
+/// The user let go. The microphone only actually closes if a game is not also
+/// holding it — and a game's release never closes it while the user is holding
+/// it either. Two holders, one microphone, and neither can cut the other off.
+pub(crate) async fn do_stop_transmit(state: &AppState) -> Result<(), String> {
+    state.ptt_user.store(false, Ordering::Relaxed);
+    if state.ptt_sdk.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    stop_capture(state).await
+}
+
+/// A game pressing (or releasing) push-to-talk for the user, because they
+/// pressed their in-game radio key.
+///
+/// Off by default and refused unless the user has turned it on — see
+/// `sdk_transmit_allowed`. Everything else about it is deliberately the same
+/// path the key takes, so mute still wins, the indicator still lights, and
+/// there is no second way to open a microphone in this codebase.
+pub(crate) async fn sdk_set_transmit(
+    state: &AppState,
+    app_handle: tauri::AppHandle,
+    on: bool,
+) -> Result<(), String> {
+    state.ptt_sdk.store(on, Ordering::Relaxed);
+    let _ = app_handle.emit(
+        if on {
+            "ptt-global-pressed"
+        } else {
+            "ptt-global-released"
+        },
+        (),
+    );
+    let _ = app_handle.emit("sdk-transmit", serde_json::json!({ "held": on }));
+    if on {
+        start_capture(state, app_handle).await
+    } else if state.ptt_user.load(Ordering::Relaxed) {
+        Ok(()) // the user is still holding their own key
+    } else {
+        stop_capture(state).await
+    }
+}
+
+async fn start_capture(state: &AppState, app_handle: tauri::AppHandle) -> Result<(), String> {
     let mut conn = state.connection.write().await;
     let connection = conn.as_mut().ok_or("Not connected")?;
 
@@ -675,6 +725,7 @@ pub(crate) async fn do_start_transmit(
         connection.noise_suppression.clone(),
         connection.is_muted.clone(),
         connection.voice_sequence.clone(),
+        state.sender_lane.clone(),
         state.input_gain.clone(),
         app_handle,
     );
@@ -684,8 +735,7 @@ pub(crate) async fn do_start_transmit(
     Ok(())
 }
 
-/// Core stop-transmit logic, callable from both the Tauri command and the global shortcut handler.
-pub(crate) async fn do_stop_transmit(state: &AppState) -> Result<(), String> {
+async fn stop_capture(state: &AppState) -> Result<(), String> {
     let mut conn = state.connection.write().await;
     let connection = conn.as_mut().ok_or("Not connected")?;
 
@@ -1631,10 +1681,11 @@ pub async fn get_audio_level(state: State<'_, AppState>) -> Result<f32, String> 
 pub async fn start_mic_test(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
+    monitor: Option<bool>,
 ) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
-        let _ = (state, app);
+        let _ = (state, app, monitor);
         return Err("Mic test not available on Android".into());
     }
     #[cfg(not(target_os = "android"))]
@@ -1652,8 +1703,12 @@ pub async fn start_mic_test(
         }
         let active = state.mic_test_active.clone();
         let gain = state.input_gain.clone();
+        let sender_lane = state.sender_lane.clone();
         let device = state.settings.read().await.input_device.clone();
+        let output_device = state.settings.read().await.output_device.clone();
+        let monitor = monitor.unwrap_or(false);
         tokio::task::spawn_blocking(move || {
+            use ringbuf::traits::Producer as _;
             use tauri::Emitter as _;
             let error_flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let (_stream, mut consumer) =
@@ -1668,6 +1723,38 @@ pub async fn start_mic_test(
                         return;
                     }
                 };
+
+            // Self-monitoring: the only way to hear your own voice effect
+            // before anyone else does. Its own playback stream, because the
+            // test runs while disconnected and there is no mixer then.
+            // ponytail: 48 kHz only — a resampler for an audition is not worth
+            // lifting out of the mixer.
+            let mut monitoring = None;
+            if monitor {
+                let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                match voipc_audio::playback::start_playback(output_device.as_deref(), flag) {
+                    Ok((stream, producer)) if stream.sample_rate() == 48_000 => {
+                        monitoring = Some((stream, producer));
+                    }
+                    Ok(_) => {
+                        let _ = app.emit(
+                            "mic-test-error",
+                            serde_json::json!({
+                                "error": "Self-monitoring needs a 48 kHz output device"
+                            }),
+                        );
+                    }
+                    Err(e) => {
+                        let _ = app.emit(
+                            "mic-test-error",
+                            serde_json::json!({"error": format!("Self-monitoring failed: {e}")}),
+                        );
+                    }
+                }
+            }
+            let mut fx_state = voipc_audio::mixer::SourceMixState::default();
+            let mut scratch: Vec<f32> = Vec::new();
+
             let mut buf = vec![0.0f32; 2400]; // 50ms at 48kHz
             while active.load(Ordering::Relaxed) {
                 let read = ringbuf::traits::Consumer::pop_slice(&mut consumer, &mut buf);
@@ -1677,6 +1764,26 @@ pub async fn start_mic_test(
                         .sqrt();
                     let db = if rms > 0.0 { 20.0 * rms.log10() } else { -100.0 };
                     let _ = app.emit("mic-test-level", serde_json::json!({"db": db}));
+
+                    if let Some((_, producer)) = monitoring.as_mut() {
+                        // The same chain the capture task runs, so what you
+                        // hear here is what the channel will hear
+                        let packed = sender_lane.load(Ordering::Relaxed);
+                        let fx =
+                            voipc_audio::spatial::Effect::from_u8((packed & 0xff) as u8);
+                        scratch.clear();
+                        scratch.resize(read * 2, 0.0);
+                        voipc_audio::mixer::mix_source_fx(
+                            &mut scratch,
+                            &buf[..read],
+                            &mut fx_state,
+                            (1.0, 1.0),
+                            1.0,
+                            fx,
+                        );
+                        voipc_audio::mixer::clamp(&mut scratch);
+                        producer.push_slice(&scratch);
+                    }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -1689,6 +1796,124 @@ pub async fn start_mic_test(
 #[tauri::command]
 pub fn stop_mic_test(state: State<'_, AppState>) {
     state.mic_test_active.store(false, Ordering::Relaxed);
+}
+
+/// How long the output test spends in each ear before swapping.
+const OUTPUT_TEST_SIDE: std::time::Duration = std::time::Duration::from_millis(1_200);
+
+/// Play the synthetic voice hard left, then hard right, until stopped.
+///
+/// The one question the spatial test cannot answer: *is my left ear my left
+/// ear?* That one orbits for eight seconds through the live mixer and needs a
+/// connection (`start_spatial_test`); this one answers "are both sides working,
+/// and are they the right way round" in two seconds, before the user has
+/// joined anything. It emits `output-test-side {"side":"left"|"right"}` on
+/// every swap, so the screen can name the side that should be sounding — the
+/// answer is worthless if the user has to guess which one they are hearing.
+#[tauri::command]
+pub async fn start_output_test(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = (state, app);
+        return Err("Output test not available on Android".into());
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        if state.output_test_active.swap(true, Ordering::Relaxed) {
+            return Ok(()); // already running
+        }
+        let active = state.output_test_active.clone();
+        let device = state.settings.read().await.output_device.clone();
+        tokio::task::spawn_blocking(move || {
+            use ringbuf::traits::Producer as _;
+            use tauri::Emitter as _;
+            let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            // ponytail: 48 kHz only, exactly like the mic test's monitor path —
+            // a resampler for a two-second audition is not worth lifting out
+            // of the mixer.
+            let (stream, mut producer) =
+                match voipc_audio::playback::start_playback(device.as_deref(), flag) {
+                    Ok((s, p)) if s.sample_rate() == 48_000 => (s, p),
+                    Ok(_) => {
+                        active.store(false, Ordering::Relaxed);
+                        let _ = app.emit(
+                            "output-test-error",
+                            serde_json::json!({"error": "The output test needs a 48 kHz device"}),
+                        );
+                        return;
+                    }
+                    Err(e) => {
+                        active.store(false, Ordering::Relaxed);
+                        let _ = app.emit(
+                            "output-test-error",
+                            serde_json::json!({"error": e.to_string()}),
+                        );
+                        return;
+                    }
+                };
+            let _stream = stream;
+
+            let frame = voipc_protocol::voice::OPUS_FRAME_SIZE;
+            let mut mono = vec![0.0f32; frame];
+            let mut stereo = vec![0.0f32; frame * 2];
+            let mut sample: u64 = 0;
+            let mut left = true;
+            let mut side_started = std::time::Instant::now();
+            let _ = app.emit("output-test-side", serde_json::json!({"side": "left"}));
+            while active.load(Ordering::Relaxed) {
+                if side_started.elapsed() >= OUTPUT_TEST_SIDE {
+                    left = !left;
+                    side_started = std::time::Instant::now();
+                    let _ = app.emit(
+                        "output-test-side",
+                        serde_json::json!({"side": if left { "left" } else { "right" }}),
+                    );
+                }
+                voipc_audio::spatial::test_voice_frame(sample, &mut mono);
+                sample += frame as u64;
+                for (i, &s) in mono.iter().enumerate() {
+                    stereo[2 * i] = if left { s } else { 0.0 };
+                    stereo[2 * i + 1] = if left { 0.0 } else { s };
+                }
+                // Push what fits and sleep a frame: the ring is the clock, so
+                // a full one simply means we are ahead of the device.
+                producer.push_slice(&stereo);
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        });
+        Ok(())
+    }
+}
+
+/// Stop the output test (no-op if not running).
+#[tauri::command]
+pub fn stop_output_test(state: State<'_, AppState>) {
+    state.output_test_active.store(false, Ordering::Relaxed);
+}
+
+/// Ask for the microphone. A no-op on desktop, where the OS does not gate it
+/// per application; the browser needs it and needs the refusal to be visible.
+#[tauri::command]
+pub async fn request_microphone() -> Result<(), String> {
+    Ok(())
+}
+
+/// Record that the user has been through the first-run audio setup.
+///
+/// Its own command rather than an arm of `set_config_bool`, which only takes
+/// bools: this is a version, so a later release that adds a step can ask again
+/// without asking everybody who already answered.
+#[tauri::command]
+pub async fn set_audio_setup_version(
+    state: State<'_, AppState>,
+    version: u32,
+) -> Result<(), String> {
+    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    config.audio_setup_version = version;
+    crate::config::save_config(&config)
 }
 
 // ---------------------------------------------------------------------------
@@ -1759,6 +1984,127 @@ pub async fn get_user_volume(
 }
 
 // ---------------------------------------------------------------------------
+// Audio effects the listener chose
+//
+// Per-user effects and the listener's own room are local, like the per-user
+// volumes: nothing about them reaches the wire, and nobody else can tell.
+// While a game drives the mix they are stored but not rendered — the game owns
+// the receiver side, because one player may be heard directly by one listener
+// and over a phone by another at the same moment.
+// ---------------------------------------------------------------------------
+
+/// How we hear one other user: the same four controls our own microphone has.
+/// Per connection and never persisted, because a user id is a session id.
+#[tauri::command]
+pub async fn set_user_fx(
+    state: State<'_, AppState>,
+    user_id: u32,
+    effect: String,
+    muffle: u8,
+    reverb: u8,
+    water: u8,
+) -> Result<(), String> {
+    let lane = parse_lane(&effect, muffle, reverb, water)?;
+    let conn = state.connection.read().await;
+    let connection = conn.as_ref().ok_or("Not connected")?;
+    let mut map = connection.user_fx.lock().map_err(|e| e.to_string())?;
+    if lane.is_plain() {
+        map.remove(&user_id);
+    } else {
+        map.insert(user_id, lane);
+    }
+    Ok(())
+}
+
+/// One lane's controls, validated and clamped. Any preset id, plus "none".
+/// The table is the single source of truth, so adding a chain does not mean
+/// remembering to widen a validator.
+fn parse_lane(
+    effect: &str,
+    muffle: u8,
+    reverb: u8,
+    water: u8,
+) -> Result<crate::app_state::LaneFx, String> {
+    let fx = voipc_audio::spatial::effect_from_str(effect);
+    if fx == voipc_audio::spatial::Effect::None && effect != "none" {
+        return Err(format!("Unknown effect: {effect}"));
+    }
+    Ok(crate::app_state::LaneFx {
+        effect: fx,
+        muffle: muffle.min(voipc_audio::spatial::MAX_MUFFLE),
+        reverb: reverb.min(voipc_audio::spatial::MAX_REVERB),
+        water: water.min(voipc_audio::spatial::MAX_UNDERWATER),
+    })
+}
+
+/// Pack a lane into one word, so the capture thread can read it without a lock.
+fn pack_lane(lane: crate::app_state::LaneFx) -> u32 {
+    lane.effect as u32
+        | (lane.muffle as u32) << 8
+        | (lane.reverb as u32) << 16
+        | (lane.water as u32) << 24
+}
+
+/// Our own microphone's lane. Everybody hears all of it: it is rendered into
+/// the voice before Opus, so no listener can turn it off. Persisted, and
+/// settable while disconnected.
+#[tauri::command]
+pub async fn set_mic_fx(
+    state: State<'_, AppState>,
+    effect: String,
+    muffle: u8,
+    reverb: u8,
+    water: u8,
+) -> Result<(), String> {
+    let lane = parse_lane(&effect, muffle, reverb, water)?;
+    state
+        .sender_lane
+        .store(pack_lane(lane), std::sync::atomic::Ordering::Relaxed);
+    {
+        let mut settings = state.settings.write().await;
+        settings.mic_effect = effect.clone();
+        settings.mic_muffle = lane.muffle;
+        settings.mic_reverb = lane.reverb;
+        settings.mic_water = lane.water;
+    }
+    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    config.mic_effect = effect;
+    config.mic_muffle = lane.muffle;
+    config.mic_reverb = lane.reverb;
+    config.mic_water = lane.water;
+    crate::config::save_config(&config)
+}
+
+/// What we set for that user, so a freshly opened strip shows the truth rather
+/// than a mirror that a reconnect has quietly invalidated.
+#[tauri::command]
+pub async fn get_user_fx(
+    state: State<'_, AppState>,
+    user_id: u32,
+) -> Result<(String, u8, u8, u8), String> {
+    let conn = state.connection.read().await;
+    let connection = conn.as_ref().ok_or("Not connected")?;
+    let map = connection.user_fx.lock().map_err(|e| e.to_string())?;
+    Ok(match map.get(&user_id) {
+        Some(l) => (l.effect.id().to_string(), l.muffle, l.reverb, l.water),
+        None => ("none".into(), 0, 0, 0),
+    })
+}
+
+/// Every source's current level, keyed by user id, for the mixer's meters.
+///
+/// One call rather than one per strip, so the poll cost does not grow with the
+/// room. Levels are pre-fader on purpose — a post-fader meter reads zero for
+/// exactly the muted person you opened the mixer to find.
+#[tauri::command]
+pub async fn get_source_levels(state: State<'_, AppState>) -> Result<HashMap<u32, f32>, String> {
+    let conn = state.connection.read().await;
+    let connection = conn.as_ref().ok_or("Not connected")?;
+    let levels = connection.source_levels.lock().map_err(|e| e.to_string())?;
+    Ok(levels.clone())
+}
+
+// ---------------------------------------------------------------------------
 // Proximity chat: positions
 //
 // Positions are local state. The room view writes them from drags, the game
@@ -1789,17 +2135,14 @@ pub async fn set_user_position(
             if !pos.iter().all(|c| c.is_finite()) {
                 return Err("position must be finite".into());
             }
+            // Field by field: the room view sends a position and nothing
+            // else, and it must not reset a range or a direct flag somebody
+            // the game SDK set. The lane's own effect lives in `user_fx`,
+            // where a game's next update cannot wipe it — see `set_user_fx`.
+            let prev = spatial.sources.get(&user_id).copied();
             spatial.sources.insert(
                 user_id,
-                Source {
-                    pos,
-                    range: range.unwrap_or(voipc_audio::spatial::DEFAULT_RANGE).max(0.01),
-                    volume: volume.unwrap_or(1.0).clamp(0.0, 2.0),
-                    muffle: muffle.unwrap_or(0).min(voipc_audio::spatial::MAX_MUFFLE),
-                    direct: direct.unwrap_or(false),
-                    // The room view places people, never radios
-                    fx: voipc_audio::spatial::Effect::None,
-                },
+                crate::app_state::merge_source(prev, pos, range, volume, muffle, direct),
             );
         }
     }
@@ -1845,7 +2188,17 @@ pub async fn set_position_sync(
     let conn = state.connection.read().await;
     let connection = conn.as_ref().ok_or("Not connected")?;
     let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+    // The room view disables its checkbox while a game drives, but the command
+    // is the boundary, not the checkbox: turning sync on here would clear the
+    // game's placements (silencing everyone until its next update) and start
+    // broadcasting a position the *game* chose, which the user never offered.
+    if spatial.sdk_active {
+        return Err("A game is placing people right now — close it first".into());
+    }
     spatial.sync = enabled;
+    // Remembered as well as applied: a game that later turns beaconing on has
+    // to hand *this* back when it goes, not whatever it found.
+    spatial.user_sync = enabled;
     if enabled {
         // Everyone else's placement was our local guess until now; the
         // peers who sync will replace it, the others sound flat.
@@ -1879,10 +2232,18 @@ pub async fn set_spatial_setting(
         }
     }
     if let Some(connection) = state.connection.read().await.as_ref() {
-        let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
-        match key.as_str() {
-            "spatial_audio" => spatial.enabled = value,
-            _ => spatial.screen_audio_spatial = value,
+        let mode = {
+            let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+            match key.as_str() {
+                "spatial_audio" => spatial.enabled = value,
+                _ => spatial.screen_audio_spatial = value,
+            }
+            spatial.proximity_for_sdk()
+        };
+        // Turning placement off leaves a game reading "3d" and wondering why
+        // its coordinates do nothing, so tell it what the user just did.
+        if key == "spatial_audio" {
+            state.sdk_event(crate::app_state::SdkEvent::Proximity { mode });
         }
     }
 
@@ -1917,6 +2278,9 @@ pub async fn get_sdk_status(state: State<'_, AppState>) -> Result<serde_json::Va
         "enabled": config.sdk_enabled,
         "port": config.sdk_port,
         "origins": config.sdk_allowed_origins,
+        "mumblelink": config.mumblelink_enabled,
+        "beaconAllowed": config.sdk_beacon_allowed,
+        "transmitAllowed": config.sdk_transmit_allowed,
         "connected": game.is_some(),
         "game": game.unwrap_or_default(),
         "listening": config.sdk_enabled && error.is_none(),
@@ -1932,6 +2296,9 @@ pub async fn set_sdk_config(
     enabled: Option<bool>,
     port: Option<u16>,
     origins: Option<Vec<String>>,
+    beacon_allowed: Option<bool>,
+    transmit_allowed: Option<bool>,
+    mumblelink: Option<bool>,
 ) -> Result<(), String> {
     if let Some(port) = port {
         if port < 1024 {
@@ -1951,6 +2318,18 @@ pub async fn set_sdk_config(
             .map(|o| o.trim().to_string())
             .filter(|o| !o.is_empty())
             .collect();
+    }
+    // The two things a game may do *to* the user rather than for them. Both
+    // off by default, and both read fresh on every request, so switching one
+    // off takes effect on the next frame rather than the next connection.
+    if let Some(v) = beacon_allowed {
+        config.sdk_beacon_allowed = v;
+    }
+    if let Some(v) = transmit_allowed {
+        config.sdk_transmit_allowed = v;
+    }
+    if let Some(v) = mumblelink {
+        config.mumblelink_enabled = v;
     }
     crate::config::save_config(&config)
 }

@@ -13,6 +13,7 @@ import * as session from "./session";
 import { playCue } from "./sounds";
 import type { SavedServer, SoundSettings } from "../../lib/stores/settings";
 import type { ProximityMode } from "../../lib/spatial";
+import { FX_NONE, effectFromId } from "./worklets/mixer-worklet.js";
 
 type Args = Record<string, unknown>;
 type Handler = (args: Args) => unknown;
@@ -98,6 +99,18 @@ function setToggleKey(field: "mute_key" | "deafen_key", keyCode: unknown): void 
 
 const WEB_NO_CHAT_HISTORY = "Chat history is not available in the web client";
 
+/**
+ * A lane's effect id: any preset, plus "none". The preset table is the single
+ * source of truth on both sides, so adding a chain does not mean remembering
+ * to widen a validator. For a web build this handler *is* the trust boundary,
+ * not a mirror of the Rust one.
+ */
+function laneEffect(effect: unknown): string {
+  const name = str(effect, "effect");
+  if (name !== "none" && effectFromId(name) === FX_NONE) fail(`Unknown effect: ${name}`);
+  return name;
+}
+
 const handlers: Record<string, Handler> = {
   // ── connection ──
   connect: ({ address, username }) => {
@@ -144,7 +157,7 @@ const handlers: Record<string, Handler> = {
       },
     }),
   // null leaves an option as it is, so the dialog only sends what changed
-  set_channel_options: ({ channelId, hidden, anonymous, screenShare, hideMembers }) => {
+  set_channel_options: ({ channelId, hidden, anonymous, screenShare, hideMembers, routed }) => {
     const flag = (v: unknown, name: string) => (v == null ? null : bool(v, name));
     need().sendControl({
       SetChannelOptions: {
@@ -153,6 +166,7 @@ const handlers: Record<string, Handler> = {
         anonymous: flag(anonymous, "anonymous"),
         screen_share: flag(screenShare, "screenShare"),
         hide_members: flag(hideMembers, "hideMembers"),
+        routed: flag(routed, "routed"),
       },
     });
   },
@@ -277,7 +291,15 @@ const handlers: Record<string, Handler> = {
     audio.clearPositions();
   },
   // A browser page cannot host a socket, so the game SDK is desktop-only
-  get_sdk_status: () => ({ available: false, enabled: false, port: 0, origins: [] }),
+  get_sdk_status: () => ({
+    available: false,
+    enabled: false,
+    port: 0,
+    origins: [],
+    beaconAllowed: false,
+    transmitAllowed: false,
+    mumblelink: false,
+  }),
   set_sdk_config: () => fail("The game SDK needs the desktop app"),
   set_spatial_setting: ({ key, value }) => {
     const enabled = bool(value, "value");
@@ -295,6 +317,42 @@ const handlers: Record<string, Handler> = {
     need();
     return audio.getUserVolume(u32(userId, "userId"));
   },
+  // Audio effects. Validated here as well as in the Rust command: for a web
+  // build this handler *is* the trust boundary, not a mirror of one.
+  set_user_fx: ({ userId, effect, muffle, reverb, water }) => {
+    need();
+    audio.setUserFx(
+      u32(userId, "userId"),
+      laneEffect(effect),
+      clamp(num(muffle, "muffle"), 0, 10),
+      clamp(num(reverb, "reverb"), 0, 10),
+      clamp(num(water, "water"), 0, 10),
+    );
+  },
+  get_source_levels: () => {
+    need();
+    return audio.getSourceLevels();
+  },
+  get_user_fx: ({ userId }) => {
+    need();
+    return audio.getUserFx(u32(userId, "userId"));
+  },
+  // Our own microphone's lane: the same four controls, the same validation.
+  // No need(): a preference, settable while disconnected, like the others.
+  set_mic_fx: ({ effect, muffle, reverb, water }) => {
+    const name = laneEffect(effect);
+    const mu = clamp(num(muffle, "muffle"), 0, 10);
+    const rv = clamp(num(reverb, "reverb"), 0, 10);
+    const wt = clamp(num(water, "water"), 0, 10);
+    updateConfig((c) => {
+      c.mic_effect = name;
+      c.mic_muffle = mu;
+      c.mic_reverb = rv;
+      c.mic_water = wt;
+    });
+    audio.setMicFx(name, mu, rv, wt);
+  },
+  get_mic_fx: () => audio.getMicFx(),
   set_voice_mode: async ({ mode }) => {
     const value = str(mode, "mode");
     updateConfig((c) => {
@@ -329,8 +387,20 @@ const handlers: Record<string, Handler> = {
     });
     await audio.setOutputDevice(name);
   },
-  start_mic_test: () => audio.startMicTest(),
+  start_mic_test: ({ monitor }) => audio.startMicTest(monitor == null ? false : bool(monitor, "monitor")),
   stop_mic_test: () => audio.stopMicTest(),
+  start_output_test: () => audio.startOutputTest(),
+  stop_output_test: () => audio.stopOutputTest(),
+  // The browser gates the microphone, so unlike the desktop this really asks —
+  // and unlike everywhere else in this file, it lets the refusal through.
+  request_microphone: () => audio.requestMicrophone(),
+  can_pick_output: () => audio.canPickOutput(),
+  set_audio_setup_version: ({ version }) => {
+    const v = u32(version, "version");
+    updateConfig((c) => {
+      c.audio_setup_version = v;
+    });
+  },
   // No session needed: the audio graph stands on its own, like the mic test
   start_spatial_test: ({ mode }) => {
     const m = proximityMode(mode);

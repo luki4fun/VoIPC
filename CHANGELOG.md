@@ -2,6 +2,107 @@
 
 All notable changes to VoIPC are documented here.
 
+## [0.8.0] - 2026-09-11
+
+Protocol version 8 — client and server must be updated together. A channel can now ask the server to forward each voice only to the people who should hear it, which is a new channel option and a new client message; everything else here is client-side and would have shipped without a bump.
+
+### Added — a mixing desk
+
+Everything the game SDK could ask for was reachable by exactly one thing: a game. Now it is yours too, in any channel no game is driving.
+
+- **A mixer takes the centre column**, the way the virtual room already does, with a tab of its own on a phone. One channel strip per lane, yours pinned at the front: a level meter beside a real vertical fader, a mute, an effect, and the three scalable effects under a disclosure. The faders are 44 px wide and at least 120 px long, so they can be used with a thumb
+- **A lane is a lane.** Your microphone on the way out and each person's voice on the way in are the same thing pointed in different directions, so they carry the same four controls and nothing else: an **effect** (a preset), and **muffle**, **reverb** and **water** at 0–10 each. Reverb and water are scalable effects sitting beside muffle, not a room, not a bus and not a special case. The desk renders every strip from one template, and both the Rust mixer and the browser worklet assert that the two directions produce the same samples from the same settings
+- **Thirteen effect chains instead of two.** Five radio grades (`radio`, `cb`, `walkie`, `aviation`, `police`), five phone grades (`phone`, `landline`, `mobile`, `badvoip`, `intercom`), plus `megaphone`, `gramophone` and `robot`. They are one parametric chain — band, drive, hiss, crackle, bit-crush, ring modulation, squelch — driven by a table, so a CB really does not sound like an aviation set, and a new voice is a row rather than a branch. Every id is a valid game-SDK `mode` and appears in `capabilities`
+- **Per-source level meters**, so you can see who is loud before you reach for a fader
+- **Radio, phone, the squelch and the room now render in the browser too.** One copy of the chain serves the worklet, the sender path and the tests, and both languages assert the same thirteen pinned levels, so the desktop mixer and the browser cannot drift apart unnoticed
+- **A voice changer for your own microphone**, meaning all four controls and not just the effect. Everyone hears them: they are rendered into your voice before it is encoded, so no listener can switch them off, and they stay yours even while a game drives the channel. The microphone test plays the whole lane back to you
+- **The only asymmetry left is who a setting reaches**, and it is not a control. Your own lane goes out to everybody; an incoming lane only changes what you hear, and a game takes the incoming ones over while it drives — the same speaker can be heard directly by one listener and over a phone by another, and only the game knows which. Faders and mutes stay yours throughout
+
+### Added — routed channels, and what the server is told
+
+A proximity channel a game drives can be a whole map. Every listener receiving and decoding every talker is the thing that stops it being one, so a channel may now ask the server to forward selectively. It is **off everywhere by default**, because it is the only state in which this server is told anything about who hears whom — and where it is on, the people in it are told, in the same words in the README and in the toast they get on the way in.
+
+- **`routed`, a channel option** beside hidden, anonymous and hide-members, in `channels.json` and in the channel dialog, with a paragraph under the checkbox saying exactly what it shares. The channel list marks such a channel **R**
+- **Two writers, one rule.** A client says which members it wants to hear (`SetAudioFilter`), which is what a game mod already worked out to cull the mix. A game server may also `POST /game/v1/routes` with a bearer token from `game_token`, and that one is authoritative — so a patched client asking for everybody gains nothing
+- **Buses are opaque.** The game server hashes and salts its own names per run before sending them; the relay hashes them again, resolves "who may hear whom" on receipt, and forgets them. No coordinates, no ranges, no radio channel names, no job names — and the endpoint refuses a body with any field it does not know, so a coordinate cannot arrive by accident. There is deliberately no way to read anything back: a game token is not an admin token, and a `GET /sessions` would walk straight past an anonymous channel's pseudonyms
+- **Fails closed per session, open per table.** Somebody a live table does not list hears nobody; but a table that expires, or was never posted, hands the whole channel back. The other way round, "stop the game server from posting" would be the whole attack
+- **It is not cryptographic separation, and the README says so.** The channel still shares one media key: this stops packets reaching a cheat client, not a cheat client from reading the ones it does get. That is still strictly more than SaltyChat, YACA, TokoVOIP, TFAR or ACRE2 enforce, which is nothing
+
+### Added — VoIPC asks about your audio once, instead of finding out mid-call
+
+A voice app whose first call is "I can't hear you" has failed at the only thing it does. Everything needed to avoid that was already in Settings; what was missing was anybody being walked through it.
+
+- **A four-step setup on the first connection**, while you are still in the lobby where voice is off anyway: which microphone (with a meter that says *we heard you*, or that you are clipping), which ears are which (a voice plays hard left, then hard right, and the screen names the side — so headphones on backwards is something you find out now rather than in a call), and how your microphone opens. On the web it asks for the microphone first, and a refusal is finally said out loud instead of becoming blank device names
+- **Every answer is saved as it is given**, through the same per-setting command Settings uses. Quit halfway and you keep what you chose. **Skip is on every step**, and skipping leaves the offer standing rather than marking it done
+- **The same screen is the re-pick** when a device you chose is unplugged: it opens on that one step and nothing else
+- *Run audio setup again* in Settings, for when something changes
+- **Push-to-talk key capture is one implementation now** (`lib/keybind.ts`), shared by Settings and the setup, with a test — including the case only push-to-talk has, where a bare Ctrl is the binding. It also warns when the key you picked is Ctrl+M or Ctrl+D, which also toggle mute and deafen
+- **`start_output_test`**, which had no equivalent: the spatial test needs a connection and takes eight seconds to answer a question this answers in two
+
+### Added — the rest of the games
+
+- **[docs/GAMES.md](docs/GAMES.md)**: a row per game — how a mod reaches VoIPC there, whether it can see the other players or only its own, and what that costs. Three tiers: nine engines that can do everything (FiveM, RedM, alt:V, RAGE:MP, MTA:SA, Garry's Mod, Minecraft with a client mod, Unity, Unreal), three that can only see their own player and want beacon mode, and five where no client-side code is possible at all — which is the argument for a routed channel driven by the game server. Plus World of Warcraft, and why it is deliberately not shipped
+- **MumbleLink**: some games write their own player's position into shared memory rather than letting a mod talk to anything. Guild Wars 2 is the case worth having — ArenaNet writes it natively and documents it, so proximity voice there needs no addon and no grey area. VoIPC reads **the first 44 bytes and nothing else**: the fields after them name the player's game account and which server they are on, and what is not read cannot leak. A stale block (a game that closed without clearing it) stops the feed rather than freezing a position on the wire. Off by default, and it still only reaches other people if beacon broadcasting is allowed
+- **Two compatibility shims.** `sdk/fivem-voipc-pma/` and `sdk/fivem-voipc-salty/` answer the export names pma-voice and SaltyChat answer. ESX, QBCore, Qbox and the ox resources are not voice integrations of their own — they call one of those two — so switching is: start the shim, stop the old resource, touch no framework script. Where the models genuinely differ (SaltyChat's secondary radio, per-resource volume, mic clicks, radio towers) the shim says once what it is not doing rather than failing quietly, and the natives no shim can stand in for come with the grep that finds them
+- **Calls are groups, not pairs**, in the FiveM resource: a conference call is the same thing with three people in it, and both shims hand their callers a channel id rather than a partner
+- **MTA:SA's origin** (`http://mta`, a bare host with no path — RFC 6454) is allowed out of the box, with a test that `http://mta.attacker.example` still is not
+
+### Added — the game SDK grows a radio and a phone
+
+A proximity plugin has always made you choose: somebody is *either* on your radio *or* standing next to you. VoIPC no longer asks.
+
+- **Layers: one speaker, heard up to four ways at once.** A player entry may carry up to three `layers`, each a full spec of its own — position, range, volume, muffle, effect chain, **which ear**, and **how late it arrives** — all rendered from the one Opus stream. So a colleague two metres away who keys their radio is heard twice, as themselves and over the air; and the tinny earpiece of somebody's phone leaks *at their own head*, two metres from you, which is a thing no TeamSpeak plugin can express
+- **`pan`**, −1 to 1, puts a render in one ear with no softening clamp: "the phone is at my left ear" is not an estimate, unlike a world direction. **`delay`**, up to 100 ms in 20 ms steps, is the radio arriving a beat after the voice in the room
+- **`mode: "off"`** leaves a speaker out of the mix but keeps their layers, which is how a call partner on the other side of the map is heard at all
+- **`{"type":"transmit","on":true}`** holds the player's push-to-talk while their in-game radio key is down, so they hold one key instead of two. Off until they allow it in Settings, it can never talk over mute, and it is let go when the socket closes, when another game takes the mix, when they leave the channel, or after 60 seconds
+- **Beacon mode** (`hello.mode: "beacon"`) is for games whose mods can see where *their* player is and nothing more: VoIPC broadcasts that one position to the channel, encrypted with the channel key like voice, and the other members place themselves. Off until the player allows it, and it sends at a constant rate so the relay cannot read "moving" and "away from the keyboard" out of the packet timing
+- **`modes` beside `capabilities`** in the `state` reply: what `mode` accepts, without the feature flags mixed in, so a mod's dropdown lists chains rather than "layers, pan, beacon"
+- **The FiveM resource does radio and phone for real**, and is the reference for layers. Membership, keying and the **job gate** live on the game server, because a FiveM state bag only reaches clients that have that player in scope — and the other end of a radio never is. `Config.canJoinRadio` and `addChannelCheck` are where a framework's job check goes; the VoIPC server is not told that radio channels exist
+
+### Security — the game SDK, audited and tightened
+
+Every one of these was reachable before this release. A mod is trusted to place people in the channel it named, and nothing else.
+
+- **A refusal no longer names you.** `hello` with the wrong `server` answered with the player's user id, username and mute state — so any page on an allowed origin (every `cfx-nui-*` resource on every FiveM server, any `localhost` page, any local process) could learn who was at the keyboard, and find their server by guessing until the answer changed. It now carries the version and nothing else
+- **Speaking and mute pushes stop at the channel the game joined.** They were keyed to a user id that was set once and never cleared, so a mod went on receiving who-talks-when after the player walked into a private channel, until its socket died. They are also now limited to the players the mod listed: the socket is not a directory of who is in the room
+- **One origin owns the mix.** Ownership went to the newest `hello`, and every `cfx-nui-*` origin is trusted, so any other script on the same game server could take placement off the voice resource — and two of them fighting is silence, because each takeover clears every placement. A different origin is now refused while the owner's socket lives; the same origin still takes over, which is a resource restarting
+- **`hello` must name a channel.** Without one a mod armed itself on whatever channel the player was in — including a private, non-positional one, where no banner says a game is driving and yet every voice can still be given an effect
+- **A player may be listed once.** On a server where players publish their own VoIPC id, a second entry for somebody else's id took over their voice: last write won, so they were heard at the claimer's position or culled out of everyone's mix. Refused now, on both sides — the shipped FiveM resource also ignores a claim on an id somebody else holds
+- **The socket is rate-limited.** Nothing bounded `update` frames, each of which takes the lock the mixer needs every 20 ms; and a `hello` loop with a wrong password raised a toast per attempt. Updates are acted on at up to 50 a second, `hello` at one
+- **A game's name cannot paint the UI.** `game` and `resource` went into a toast and a banner unfiltered; they are now capped at 32 characters with control characters and bidi overrides stripped
+- **`set_position_sync` is refused while a game drives.** Only the checkbox was disabled, not the command underneath it — and taking that path would have cleared the game's placements and started broadcasting a position the *game* chose
+- **A peer's position beacon is checked before it is decrypted**, so a flood of them costs no AES-GCM while we are ignoring them anyway
+
+### Added — you can see what the game is doing
+
+- **A toast when a game takes over**, naming it, its resource and the channel it just moved you into — and, if you have allowed either, that it is broadcasting your position or may press your push-to-talk. The only sign before was a line in a settings panel nobody has open
+- **Culled members are greyed out** in the member list and the mixer, with "out of earshot in the game". A game says who is in earshot by leaving everyone else out — which is how distance culling works, and also how a hostile one would silence a person. Switching the integration off hands everything back
+- **The voice bar says when the game is holding your microphone**, in a different colour from a key you pressed yourself
+
+### Fixed — three of these shipped with a passing test
+
+- **The reverb was inaudible.** Its send used a constant lifted from Freeverb, which normalises an eight-comb bank differently; measured, the wet path sat about 35 dB under the dry at every setting — **−34.8 dB at level 3, now about −18.5**. The send is now normalised by the comb bank's own broadband gain. The old test asserted the energy was above 1e-6, against a value of 3.8e-3: three orders of magnitude of slack while nothing was audible. It now asserts a wet-to-dry ratio in dB
+- **The underwater slider was an on/off switch.** Its cutoff swept from 22 kHz, so the first half of the travel sat above the voice band: steps 1 to 5 moved a 1 kHz tone by 0.83, 0.86, 0.93, 1.11 and 1.49 dB. The cutoffs are now solved backwards from the filter response for an even step, and **every notch moves it between 2.7 and 3.7 dB**
+- **The effects panel's close button did nothing.** It sat inside the panel's drag header, whose pointer capture retargeted the click away from it. The panel is gone, and the UI test now drives every control with real mouse events instead of `el.click()`, which cannot see pointer capture at all
+- **Per-user volume existed twice and disagreed.** The member menu and the panel each kept their own copy. There is now one store, and a test that fails if a second writer appears. Every lane setting goes through the same store, so the same guard covers the effects
+- **Reverb and water were on a bus rather than on a lane.** They were applied once to the finished mix, which meant they could not be put on one person, and the microphone had a second, differently-shaped copy of them. Each lane now carries its own delay lines, the mix-wide pass is gone, and a game's `self.reverb` and `self.underwater` override every incoming lane for as long as it drives
+- **A preset's first frame ramped its level** instead of starting at it, because the makeup gain was applied after the gain was primed. Caught by the cross-language pin
+- **The mixer was unusable in a narrow window.** Its layout switched on the *window* width, but it lives in the centre column between the channel list and the member list — at 700 px that column is barely 300 px, so the desktop layout went into a third of the space it needs and strips ran off the side and painted over each other. It now switches on its own width with a container query, strips stack and scroll, and the fader takes a row of its own when there is no room beside it. The UI test grew lanes at 900, 700 and 600 px that measure the geometry: no strip outside the mixer, no two strips overlapping, the stack scrolling, and the fader at least 40 px each way
+- **Turning placement off was a way to hear through walls.** Unticking *Hear people where they stand*, or being in a channel that is not positional, discarded the game's distance culling, its per-player volume and its muffling in one go — while the radio chain kept playing. Those settings take away direction and distance, which is what they are about; they no longer take away the game's judgement that somebody is behind a wall, or not in earshot at all
+- **The reverb never went idle.** It reported "still audible" from its *settings* rather than from its tail, so a lane with the reverb turned up kept the mixer awake for ever and ran the comb bank on subnormals through every silence. It now answers with the tail, and zeroes its delay lines on the way out
+- **The player's own meter was dead during the microphone test**, which is the one moment it matters: it polled the capture task's level, and the test refuses to run while the capture task does. It now follows the test
+- **`proximity` was misreported to mods and never pushed.** A player with placement switched off was told `"3d"` — the exact field the docs tell a mod to read — and the field only ever appeared in a reply to `hello`, never when it changed. Both fixed, and the docs no longer claim effects are silent in a channel that is not positional, because they are not
+- **A second microphone test inside a minute lost its first half-second**, because the sidetone restarted its numbering while the browser's mixer was still waiting for the next frame
+- **A push-to-talk key bound to Ctrl+M muted the microphone it had just opened.** The two shortcuts had no idea the PTT binding existed
+- The browser's mixer tab was missing from the type that lists mobile tabs, and the browser and Rust reverbs were pinned against different noise, different targets and a tolerance eight times wider. They are now measured the same way, against the same three numbers, to ±0.5 dB
+- **The device pickers in Settings showed the system default**, not the device you had chosen — so the panel claimed you were on the default when you were not
+- **The end-to-end browser test had never opened the Settings panel or a microphone test.** It now drives the whole audio setup — the meter, both ears, the mode — and the Settings panel, which is how a missing screen would have been caught in the first place
+
+### Removed
+
+- The listener-wide room, and with it the `set_room_fx`, `set_sender_room` and `set_sender_effect` commands. Reverb and water are per lane now, and one command each way — `set_user_fx` and `set_mic_fx` — carries all four controls. The saved settings `room_reverb`, `room_underwater`, `mic_underwater` and `sender_effect` are replaced by `mic_effect`, `mic_muffle`, `mic_reverb` and `mic_water`; an older config loses whatever was set on the old room bus and starts clean
+- The floating effects panel, its drag, its viewport clamping, and the per-user **range** and **ignore distance** controls. Distance and placement belong to the virtual room, which already owns them — having them in two places is what made them contradict each other. The `set_user_position` command keeps both arguments for the game SDK; nothing in the UI sends them now, so range stays at its 20 m default unless a game sets it
+
 ## [0.7.0] - 2026-09-09
 
 Protocol version 7 — client and server must be updated together (a channel now carries a proximity mode and four options, and positions travel as a new encrypted media packet). A 0.5.x client connecting to a 0.7 server is told to update and stops reconnecting.

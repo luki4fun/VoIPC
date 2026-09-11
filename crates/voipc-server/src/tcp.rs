@@ -534,6 +534,7 @@ async fn handle_message(
             anonymous,
             screen_share,
             hide_members,
+            routed,
         } => {
             handle_set_channel_options(
                 state,
@@ -544,6 +545,7 @@ async fn handle_message(
                 anonymous,
                 screen_share,
                 hide_members,
+                routed,
                 tx,
             )
             .await?;
@@ -553,6 +555,33 @@ async fn handle_message(
             user_id: target_id,
         } => {
             handle_kick_user(state, user_id, session_id, channel_id, target_id, tx).await?;
+        }
+        ClientMessage::SetAudioFilter { allow } => {
+            // Only honoured in a channel that says it is routed; everywhere
+            // else the client is told nothing about it and we keep nothing
+            // about them, which is the point of the flag being opt-in.
+            let here = state
+                .sessions
+                .get(&session_id)
+                .map(|s| s.channel_id)
+                .unwrap_or(0);
+            let routed = {
+                let channels = state.channels.read().await;
+                channels.get(&here).is_some_and(|ch| ch.info.routed)
+            };
+            if routed {
+                // Bounded by the roster: a client cannot make us hold a set
+                // larger than the server can ever have members.
+                let allow = allow.map(|mut ids| {
+                    ids.sort_unstable();
+                    ids.dedup();
+                    ids.truncate(state.max_users as usize);
+                    ids
+                });
+                state.routing.set_filter(session_id, allow);
+            } else {
+                state.routing.clear_session(session_id);
+            }
         }
         ClientMessage::RequestChannelUsers { channel_id } => {
             let allowed = state.is_channel_public_or_member(channel_id, user_id).await
@@ -1148,6 +1177,7 @@ async fn handle_set_channel_options(
     anonymous: Option<bool>,
     screen_share: Option<bool>,
     hide_members: Option<bool>,
+    routed: Option<bool>,
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
     let is_admin = state.is_admin(session_id);
@@ -1159,6 +1189,7 @@ async fn handle_set_channel_options(
             anonymous,
             screen_share,
             hide_members,
+            routed,
             is_admin,
         )
         .await

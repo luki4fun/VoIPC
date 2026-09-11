@@ -100,6 +100,11 @@ async fn handle_voice_packet(session_id: SessionId, data: Bytes, state: &ServerS
         return;
     }
 
+    let speaker_uid = match state.sessions.get(&session_id) {
+        Some(session) => session.user_id,
+        None => return,
+    };
+
     // Collect recipients under the channels read lock, send after releasing
     // it — the lock is write-preferring, so a join/leave must never wait
     // behind voice fan-out.
@@ -114,12 +119,25 @@ async fn handle_voice_packet(session_id: SessionId, data: Bytes, state: &ServerS
         if is_position && channel.info.proximity == ProximityMode::Off {
             return;
         }
+        // A routed channel forwards to the people who should hear this
+        // speaker; every other channel forwards to all of them, which is
+        // exactly what it did before routing existed. One `now` for the whole
+        // fan-out, so a table cannot expire halfway through one packet.
+        let routed = channel.info.routed;
+        let now = tokio::time::Instant::now();
         channel
             .members
             .iter()
             .filter_map(|member_uid| {
                 let member_sid = *state.user_to_session.get(member_uid)?;
                 if member_sid == session_id {
+                    return None;
+                }
+                if routed
+                    && !state
+                        .routing
+                        .may_hear(channel_id, *member_uid, member_sid, speaker_uid, now)
+                {
                     return None;
                 }
                 Some(state.sessions.get(&member_sid)?.media_tx.clone())
@@ -295,6 +313,114 @@ mod tests {
         // Voice still has its own budget
         handle_packet(alice_sid, encrypted_voice(alice_sid), &state).await;
         assert!(bob_media.try_recv().is_ok());
+    }
+
+    async fn set_routed(state: &ServerState, channel_id: u32, routed: bool) {
+        state.channels.write().await.get_mut(&channel_id).unwrap().info.routed = routed;
+    }
+
+    #[tokio::test]
+    async fn an_unrouted_channel_forwards_to_everyone_whatever_anyone_asked_for() {
+        // Routing is opt-in per channel. In every other channel the relay must
+        // behave exactly as it did before it existed — including for a client
+        // that sent a filter anyway.
+        let state = make_state();
+        let (alice_uid, alice_sid, _) = add_user_with_media(&state, "alice");
+        let (bob_uid, bob_sid, mut bob_media) = add_user_with_media(&state, "bob");
+        put_in_channel(&state, 5, &[(alice_uid, alice_sid), (bob_uid, bob_sid)]).await;
+        state.routing.set_filter(bob_sid, Some(vec![]));
+
+        let packet = encrypted_voice(alice_sid);
+        handle_packet(alice_sid, packet.clone(), &state).await;
+        assert_eq!(bob_media.try_recv().unwrap(), packet);
+    }
+
+    #[tokio::test]
+    async fn a_routed_channel_forwards_only_what_the_listener_asked_for() {
+        let state = make_state();
+        let (alice_uid, alice_sid, _) = add_user_with_media(&state, "alice");
+        let (bob_uid, bob_sid, mut bob_media) = add_user_with_media(&state, "bob");
+        let (carol_uid, carol_sid, mut carol_media) = add_user_with_media(&state, "carol");
+        put_in_channel(
+            &state,
+            5,
+            &[(alice_uid, alice_sid), (bob_uid, bob_sid), (carol_uid, carol_sid)],
+        )
+        .await;
+        set_routed(&state, 5, true).await;
+
+        // Bob wants alice; carol wants nobody
+        state.routing.set_filter(bob_sid, Some(vec![alice_uid]));
+        state.routing.set_filter(carol_sid, Some(vec![]));
+        handle_packet(alice_sid, encrypted_voice(alice_sid), &state).await;
+        assert!(bob_media.try_recv().is_ok());
+        assert!(carol_media.try_recv().is_err(), "carol was sent a voice she culled");
+
+        // Clearing the filter puts the whole channel back
+        state.routing.set_filter(carol_sid, None);
+        handle_packet(alice_sid, encrypted_voice(alice_sid), &state).await;
+        assert!(carol_media.try_recv().is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_game_servers_table_beats_the_client_and_fails_closed_both_ways() {
+        let state = make_state();
+        let (alice_uid, alice_sid, _) = add_user_with_media(&state, "alice");
+        let (bob_uid, bob_sid, mut bob_media) = add_user_with_media(&state, "bob");
+        let (carol_uid, carol_sid, mut carol_media) = add_user_with_media(&state, "carol");
+        put_in_channel(
+            &state,
+            5,
+            &[(alice_uid, alice_sid), (bob_uid, bob_sid), (carol_uid, carol_sid)],
+        )
+        .await;
+        set_routed(&state, 5, true).await;
+
+        // A patched client asking for everybody gains nothing: the table wins,
+        // and carol — whom the game server did not list at all — hears nobody.
+        state.routing.set_filter(bob_sid, None);
+        state.routing.set_filter(carol_sid, None);
+        let mut hear = std::collections::HashMap::new();
+        hear.insert(bob_uid, [alice_uid].into_iter().collect());
+        hear.insert(alice_uid, [bob_uid].into_iter().collect());
+        state
+            .routing
+            .set_routes(
+                5,
+                crate::routing::Routes {
+                    epoch: 1,
+                    boot: "boot-a".into(),
+                    ttl: std::time::Duration::from_secs(3),
+                    hear,
+                },
+                tokio::time::Instant::now(),
+            )
+            .unwrap();
+
+        handle_packet(alice_sid, encrypted_voice(alice_sid), &state).await;
+        assert!(bob_media.try_recv().is_ok(), "a listed pair could not hear each other");
+        assert!(carol_media.try_recv().is_err(), "an unlisted listener heard a voice");
+
+        // And an unlisted *speaker* is heard by nobody either
+        handle_packet(carol_sid, encrypted_voice(carol_sid), &state).await;
+        assert!(bob_media.try_recv().is_err(), "an unlisted speaker was forwarded");
+    }
+
+    #[tokio::test]
+    async fn position_beacons_follow_the_same_rule_as_voice() {
+        let state = make_state();
+        let (alice_uid, alice_sid, _) = add_user_with_media(&state, "alice");
+        let (bob_uid, bob_sid, mut bob_media) = add_user_with_media(&state, "bob");
+        put_in_channel(&state, 5, &[(alice_uid, alice_sid), (bob_uid, bob_sid)]).await;
+        set_proximity(&state, 5, ProximityMode::ThreeD).await;
+        set_routed(&state, 5, true).await;
+        state.routing.set_filter(bob_sid, Some(vec![]));
+
+        handle_packet(alice_sid, position_packet(alice_sid), &state).await;
+        assert!(
+            bob_media.try_recv().is_err(),
+            "a position reached somebody whose voice does not"
+        );
     }
 
     #[tokio::test]

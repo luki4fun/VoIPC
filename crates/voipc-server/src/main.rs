@@ -15,6 +15,7 @@ use tracing::{debug, error, info, warn};
 mod channels;
 mod config;
 mod media;
+mod routing;
 mod settings;
 mod state;
 mod tcp;
@@ -309,6 +310,7 @@ async fn main() -> Result<()> {
         let tls_acceptor = tls_acceptor.clone();
         let limits = limits.clone();
         let wt_info = wt_info.clone();
+        let http_state = state.clone();
 
         tokio::spawn(async move {
             // The 5 s auth timeout only starts after TLS completes; without a
@@ -319,7 +321,7 @@ async fn main() -> Result<()> {
             {
                 Ok(Ok(tls_stream)) => {
                     if tls_stream.get_ref().1.alpn_protocol() == Some(&b"h2"[..]) {
-                        web::serve_h2(tls_stream, wt_info, peer_addr).await;
+                        web::serve_h2(tls_stream, wt_info, http_state, peer_addr).await;
                     } else {
                         debug!(peer = %peer_addr, "legacy (pre-0.5) client, telling it to update");
                         tcp::reject_legacy(tls_stream).await;

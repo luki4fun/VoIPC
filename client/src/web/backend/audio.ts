@@ -15,10 +15,12 @@ import type { AudioApi, SessionContext } from "./types";
 import {
   DEFAULT_RANGE,
   FLAT,
+  MAX_LEVEL,
   MAX_MUFFLE,
   defaultListener,
   defaultSource,
   gains as spatialGains,
+  muffleLpA,
   testSource,
   testVoiceFrame,
   type Gains,
@@ -26,6 +28,20 @@ import {
   type ProximityMode,
   type Source as SpatialSource,
 } from "../../lib/spatial";
+// One copy of the effect chain, shared with the mixer worklet. Importing it
+// here runs its module body on the main thread, which is what the three
+// `globalThis ??=` lines at the top of that file exist for.
+import {
+  FX_NONE,
+  ReverbWater,
+  applySenderFx,
+  effectFromId,
+  newFxState,
+  preset,
+} from "./worklets/mixer-worklet.js";
+
+/** One scalable effect's level, rounded and clamped to its scale. */
+const clamp10 = (v: number, max: number) => Math.min(Math.max(Math.round(v), 0), max);
 
 const SAMPLE_RATE = 48_000;
 const FRAME_US = 20_000;
@@ -46,9 +62,13 @@ const MIC_TEST_EMIT_MS = 45;
  * clear of SCREEN_AUDIO_FLAG, so it collides with no real source.
  */
 const SPATIAL_TEST_KEY = 0x7fff_fffe;
+/** Mixer key of the mic test's self-monitoring, one below the spatial test. */
+const SIDETONE_KEY = 0x7fff_fffd;
 /** Frames kept queued ahead of the worklet (its jitter buffer wants 2 to start). */
 const SPATIAL_TEST_LEAD = 3;
 const SPATIAL_TEST_TICK_MS = 20;
+/** How long the output test spends in each ear (commands.rs OUTPUT_TEST_SIDE). */
+const OUTPUT_TEST_SIDE_MS = 1_200;
 
 /** How often we look at our position while syncing it (network.rs beacon). */
 const POSITION_TICK_MS = 100;
@@ -239,12 +259,42 @@ export class AudioEngine implements AudioApi {
 
   // Mic test
   private micTestActive = false;
+  private sidetoneSequence = 0;
+  /** Latest per-source RMS from the worklet, for the mixer's meters. */
+  private sourceLevels: [number, number][] = [];
   private micTest: Capture | null = null;
+  /** The output test, while it runs: its source, its panner, and its timer. */
+  private outputTest: {
+    source: AudioBufferSourceNode;
+    panner: StereoPannerNode;
+    timer: ReturnType<typeof setInterval>;
+    left: boolean;
+  } | null = null;
   private lastMicLevelEmit = 0;
 
   // Playback
   private sources = new Map<number, Source>();
   private userVolumes = new Map<number, number>();
+  /**
+   * user id -> one incoming lane, as the listener set it:
+   * [effect id, muffle coefficient, muffle level, reverb, water].
+   * The muffle level is kept so a strip can show what was picked; the worklet
+   * only ever needs the coefficient.
+   */
+  private userFx = new Map<number, [number, number, number, number, number]>();
+  /**
+   * Our own microphone's lane: the same four controls an incoming one has, and
+   * the state its filters and delay lines carry between frames.
+   */
+  private senderFx = FX_NONE;
+  private senderFxState = newFxState();
+  private senderRoom = new ReverbWater();
+  private senderMuffleA = 1;
+  private senderMuffle = 0;
+  private senderReverb = 0;
+  private senderWater = 0;
+  /** The mic test's own delay lines, so it never fights the live chain. */
+  private sidetoneRoom = new ReverbWater();
   private framesPlayed = 0;
   private framesLost = 0;
   private screenAudioRecv = 0;
@@ -296,6 +346,10 @@ export class AudioEngine implements AudioApi {
     this.keyMissingEmitted = false;
     this.noDecoderEmitted = false;
     this.userVolumes.clear();
+    // Per-user effects die with the connection: a user id is a session id,
+    // and the next one hands it to somebody else. The room is the listener's
+    // and survives, like the spatial preferences.
+    this.userFx.clear();
     this.clearPositions();
     this.positionSync = false;
     this.proximity = "off";
@@ -523,16 +577,25 @@ export class AudioEngine implements AudioApi {
           // channel writes the same samples to both, as before.
           outputChannelCount: [2],
         });
-        mixer.port.onmessage = (e: MessageEvent<{ type: string; played: number; lost: number }>) => {
+        mixer.port.onmessage = (
+          e: MessageEvent<{ type: string; played: number; lost: number; levels: [number, number][] }>,
+        ) => {
           if (e.data?.type === "stats") {
             this.framesPlayed = e.data.played;
             this.framesLost = e.data.lost;
+          } else if (e.data?.type === "levels") {
+            this.sourceLevels = e.data.levels;
           }
         };
         mixer.connect(master);
         mixer.port.postMessage({ type: "deafen", value: this._deafened });
         for (const [userId, gain] of this.userVolumes) {
           mixer.port.postMessage({ type: "user-volume", userId, gain });
+        }
+        // A rebuilt graph (reconnect, output-device change) starts a fresh
+        // worklet at its defaults, so everything local has to be replayed
+        for (const [userId, [fx, lpA, , reverb, water]] of this.userFx) {
+          mixer.port.postMessage({ type: "user-fx", userId, fx, lpA, reverb, water });
         }
         this.mixer = mixer;
         this.pushSpatialGains(mixer);
@@ -713,9 +776,28 @@ export class AudioEngine implements AudioApi {
     } else if (++this.vadSilentCount > VAD_HOLD_FRAMES) {
       this.vadActive = false;
     }
-    if (!this.transmitting) return;
-    const shouldSend = this.voiceMode === "vad" ? this.vadActive : true;
-    if (!shouldSend || this._muted) return;
+    // Own-voice effect, on every frame whether or not we are transmitting:
+    // the filters have to keep advancing through a pause, or the first frame
+    // after the gate re-opens steps their state and clicks. It runs after the
+    // VAD above on purpose — a radio's hiss would hold that gate open.
+    const onAir =
+      this.transmitting &&
+      (this.voiceMode === "vad" ? this.vadActive : true) &&
+      !this._muted;
+    // Unconditional: the filters and the reverb tail have to keep advancing
+    // through silence, or the first frame after a pause steps them and clicks.
+    // With nothing switched on the chain is a bit-exact bypass.
+    applySenderFx(
+      pcm,
+      this.senderFx,
+      this.senderFxState,
+      onAir,
+      this.senderMuffleA,
+      this.senderRoom,
+      this.senderWater,
+      this.senderReverb,
+    );
+    if (!onAir) return;
 
     const enc = this.ensureEncoder();
     const data = new AudioData({
@@ -813,6 +895,54 @@ export class AudioEngine implements AudioApi {
 
   getUserVolume(userId: number): number {
     return this.userVolumes.get(userId) ?? 1;
+  }
+
+  // ── Effects the listener chose ───────────────────────────────────────
+
+  /** One incoming lane: an effect, plus muffle, reverb and water, each 0-10. */
+  setUserFx(userId: number, effect: string, muffle: number, reverb: number, water: number): void {
+    const fx = effectFromId(effect);
+    const level = clamp10(muffle, MAX_MUFFLE);
+    const rv = clamp10(reverb, MAX_LEVEL);
+    const wt = clamp10(water, MAX_LEVEL);
+    const lpA = muffleLpA(level);
+    if (fx === FX_NONE && level === 0 && rv === 0 && wt === 0) this.userFx.delete(userId);
+    else this.userFx.set(userId, [fx, lpA, level, rv, wt]);
+    this.mixer?.port.postMessage({ type: "user-fx", userId, fx, lpA, reverb: rv, water: wt });
+  }
+
+  /** Every source's level, keyed by user id, for the mixer's meters. */
+  getSourceLevels(): Record<number, number> {
+    return Object.fromEntries(this.sourceLevels);
+  }
+
+  getUserFx(userId: number): [string, number, number, number] {
+    const entry = this.userFx.get(userId);
+    if (!entry) return ["none", 0, 0, 0];
+    return [preset(entry[0])?.id ?? "none", entry[2], entry[3], entry[4]];
+  }
+
+  /**
+   * Our own microphone's lane. The same four controls, in the same order, as
+   * an incoming one — and everyone hears all of it, because it is rendered
+   * into the voice before Opus.
+   */
+  setMicFx(effect: string, muffle: number, reverb: number, water: number): void {
+    this.senderFx = effectFromId(effect);
+    this.senderMuffle = clamp10(muffle, MAX_MUFFLE);
+    this.senderMuffleA = muffleLpA(this.senderMuffle);
+    this.senderReverb = clamp10(reverb, MAX_LEVEL);
+    this.senderWater = clamp10(water, MAX_LEVEL);
+  }
+
+  /** What our own lane is set to, for a strip that has just been opened. */
+  getMicFx(): [string, number, number, number] {
+    return [
+      preset(this.senderFx)?.id ?? "none",
+      this.senderMuffle,
+      this.senderReverb,
+      this.senderWater,
+    ];
   }
 
   // ── Proximity chat ───────────────────────────────────────────────────
@@ -1055,6 +1185,10 @@ export class AudioEngine implements AudioApi {
     output_device: string | null;
     spatial_audio?: boolean;
     screen_audio_spatial?: boolean;
+    mic_effect?: string;
+    mic_muffle?: number;
+    mic_reverb?: number;
+    mic_water?: number;
   }): void {
     this._muted = s.muted;
     this._deafened = s.deafened;
@@ -1069,6 +1203,7 @@ export class AudioEngine implements AudioApi {
     // The persisted spatial preferences, like network.rs seeds SpatialState
     this.spatialEnabled = s.spatial_audio ?? true;
     this.screenAudioSpatial = s.screen_audio_spatial ?? true;
+    this.setMicFx(s.mic_effect ?? "none", s.mic_muffle ?? 0, s.mic_reverb ?? 0, s.mic_water ?? 0);
     this.pushSpatialGains();
     if (this.mixer) void this.applyOutputDevice();
   }
@@ -1133,17 +1268,44 @@ export class AudioEngine implements AudioApi {
 
   // ── Mic test ─────────────────────────────────────────────────────────
 
-  async startMicTest(): Promise<void> {
+  async startMicTest(monitor = false): Promise<void> {
     if (this.transmitting) throw new Error("Cannot test microphone while transmitting");
     if (this.micTestActive) return;
     this.micTestActive = true;
+    // The sequence deliberately carries on from the last test rather than
+    // restarting at 0: the worklet keeps a source for SOURCE_IDLE_PRUNE (60 s)
+    // and discards frames that arrive before the one it is waiting for, so a
+    // second test inside a minute used to spend MAX_LATE_DISCARDS frames
+    // (~500 ms of silence) re-syncing. A fresh source adopts whatever number
+    // arrives first, so nothing needs the counter to start at zero.
     try {
       const ac = await this.ensureGraph();
-      const cap = await this.openCapture(ac, ({ levelDb }) => {
+      const cap = await this.openCapture(ac, ({ pcm, levelDb }) => {
         const now = performance.now();
         if (now - this.lastMicLevelEmit >= MIC_TEST_EMIT_MS) {
           this.lastMicLevelEmit = now;
           emit("mic-test-level", { db: levelDb });
+        }
+        // Self-monitoring: our own voice, through our own lane, into the mixer
+        // that is already up. The same message a real source uses, so deafen
+        // and the master volume apply as they should — and the whole lane, so
+        // "hear myself" is what everybody else hears.
+        if (monitor && this.mixer) {
+          const frame = new Float32Array(pcm);
+          applySenderFx(
+            frame,
+            this.senderFx,
+            this.senderFxState,
+            true,
+            this.senderMuffleA,
+            this.sidetoneRoom,
+            this.senderWater,
+            this.senderReverb,
+          );
+          this.mixer.port.postMessage(
+            { type: "frame", source: SIDETONE_KEY, sequence: this.sidetoneSequence++, pcm: frame },
+            [frame.buffer],
+          );
         }
       });
       if (!this.micTestActive) {
@@ -1161,6 +1323,85 @@ export class AudioEngine implements AudioApi {
     this.micTestActive = false;
     this.micTest?.close();
     this.micTest = null;
+  }
+
+  // ── Output test ──────────────────────────────────────────────────────
+
+  /**
+   * The synthetic voice, hard left then hard right, until stopped.
+   *
+   * Answers the one question the spatial test cannot: *is my left ear my left
+   * ear?* It plays through the graph rather than a bare `Audio` element so
+   * `setSinkId` applies and the chosen output device is really the one being
+   * tested. Emits `output-test-side` on every swap, because an answer the user
+   * has to guess the sides of is not an answer.
+   */
+  async startOutputTest(): Promise<void> {
+    if (this.outputTest) return;
+    const ac = await this.ensureGraph();
+    // One second of the voice, looped: it is periodic per second by design,
+    // so the loop is seamless and there is nothing to schedule.
+    const buffer = ac.createBuffer(1, SAMPLE_RATE, SAMPLE_RATE);
+    buffer.copyToChannel(testVoiceFrame(0, SAMPLE_RATE), 0);
+    const source = ac.createBufferSource();
+    source.buffer = buffer;
+    source.loop = true;
+    const panner = ac.createStereoPanner();
+    panner.pan.value = -1;
+    source.connect(panner).connect(ac.destination);
+    source.start();
+    emit("output-test-side", { side: "left" });
+    const timer = setInterval(() => {
+      const test = this.outputTest;
+      if (!test) return;
+      test.left = !test.left;
+      test.panner.pan.value = test.left ? -1 : 1;
+      emit("output-test-side", { side: test.left ? "left" : "right" });
+    }, OUTPUT_TEST_SIDE_MS);
+    this.outputTest = { source, panner, timer, left: true };
+  }
+
+  stopOutputTest(): void {
+    const test = this.outputTest;
+    if (!test) return;
+    this.outputTest = null;
+    clearInterval(test.timer);
+    try {
+      test.source.stop();
+    } catch {
+      // already stopped
+    }
+    test.source.disconnect();
+    test.panner.disconnect();
+  }
+
+  /**
+   * Can this browser send audio to a device the user picks?
+   *
+   * `AudioContext.setSinkId` is Chromium-only. Elsewhere the output device
+   * list is still shown — it is the system's, and picking from it does
+   * nothing — so the setup says so rather than letting somebody conclude
+   * their headphones are broken.
+   */
+  canPickOutput(): boolean {
+    const ac = this.audioContext as (AudioContext & { setSinkId?: unknown }) | null;
+    return typeof (ac ?? AudioContext.prototype).setSinkId === "function";
+  }
+
+  /**
+   * Ask for the microphone, and let the refusal through.
+   *
+   * Everywhere else a denial is swallowed (device labels stay blank) or
+   * arrives as a toast about retrying. The first-run setup is the one place
+   * that should ask on purpose and say plainly what happened.
+   */
+  async requestMicrophone(): Promise<void> {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      for (const t of stream.getTracks()) t.stop();
+    } catch (e) {
+      throw describeError(e);
+    }
   }
 
   // ── Screen-share audio (send side) ───────────────────────────────────

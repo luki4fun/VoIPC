@@ -30,4 +30,33 @@ Config = {
     oneInVehicle = 4,
     otherRoom = 7,
   },
+
+  -- ── Radio and phone ────────────────────────────────────────────────────
+  --
+  -- Both arrive as *layers*: an extra render of the same voice, so somebody
+  -- talking into their radio two metres away is heard twice — over the air and
+  -- as themselves. Any id from the VoIPC `modes` list works here.
+  radioMode = "walkie",
+  radioVolume = 0.9,
+  phoneMode = "mobile",
+  -- Which ear the phone is at: -1 left, 0 centred, 1 right.
+  phoneEar = -0.9,
+  radioKey = "CAPITAL",
+
+  -- Hold the player's VoIPC push-to-talk while the radio key is down, so the
+  -- radio key is the only key they hold. VoIPC ignores this unless the player
+  -- has ticked "Let a game press my push-to-talk" in Settings → Game
+  -- Integration, so leaving it on here is safe: it asks, it does not take.
+  radioPressesPtt = true,
+
+  --- May this player use this radio channel? The hook a framework fills in
+  --- with its own job check — ESX `xPlayer.job.name`, QBCore `PlayerData.job`,
+  --- whatever you already have. Runs on the server.
+  ---
+  --- This is the whole of radio entitlement, and it is deliberately here
+  --- rather than on the VoIPC server: that one relays encrypted audio to a
+  --- channel and never learns that radio channels exist at all.
+  canJoinRadio = function(_src, _channel)
+    return true
+  end,
 }

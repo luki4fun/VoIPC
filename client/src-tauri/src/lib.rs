@@ -3,6 +3,7 @@ mod commands;
 mod config;
 mod crypto;
 mod global_keys;
+mod mumblelink;
 mod network;
 mod screenshare;
 #[cfg(not(target_os = "android"))]
@@ -115,9 +116,20 @@ pub fn run() {
                     s.deafened = cfg.deafened;
                     s.spatial_audio = cfg.spatial_audio;
                     s.screen_audio_spatial = cfg.screen_audio_spatial;
+                    s.mic_effect = cfg.mic_effect.clone();
+                    s.mic_muffle = cfg.mic_muffle;
+                    s.mic_reverb = cfg.mic_reverb;
+                    s.mic_water = cfg.mic_water;
                 }
                 state.input_gain.store(
                     cfg.input_gain.clamp(0.0, 4.0).to_bits(),
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                state.sender_lane.store(
+                    voipc_audio::spatial::effect_from_str(&cfg.mic_effect) as u32
+                        | (cfg.mic_muffle as u32) << 8
+                        | (cfg.mic_reverb as u32) << 16
+                        | (cfg.mic_water as u32) << 24,
                     std::sync::atomic::Ordering::Relaxed,
                 );
                 // Hydrate the optional global mute/deafen hotkeys
@@ -170,6 +182,9 @@ pub fn run() {
             // Game SDK: idle until the user enables it in Settings
             #[cfg(not(target_os = "android"))]
             sdk::spawn(app.handle().clone());
+            // The other way a game can say where the player is: a block of
+            // shared memory Guild Wars 2 and a few others write natively.
+            mumblelink::spawn(app.handle().clone());
 
             // System tray: closing the window hides to tray (call keeps
             // running); Quit in the tray menu actually exits.
@@ -337,6 +352,11 @@ pub fn run() {
             // Per-user volume
             commands::set_user_volume,
             commands::get_user_volume,
+            // Audio effects
+            commands::set_user_fx,
+            commands::get_user_fx,
+            commands::get_source_levels,
+            commands::set_mic_fx,
             commands::set_channel_proximity,
             commands::set_channel_options,
             commands::set_user_position,
@@ -368,6 +388,10 @@ pub fn run() {
             commands::remove_server,
             commands::start_mic_test,
             commands::stop_mic_test,
+            commands::start_output_test,
+            commands::stop_output_test,
+            commands::request_microphone,
+            commands::set_audio_setup_version,
             commands::reset_config,
             commands::set_config_bool,
             // Notification sounds

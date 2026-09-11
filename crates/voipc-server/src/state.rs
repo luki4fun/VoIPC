@@ -199,6 +199,9 @@ pub struct ServerState {
     next_user_id: AtomicU32,
     /// Next channel_id counter (0 is reserved for General).
     next_channel_id: AtomicU32,
+    /// Who may hear whom, in channels whose `routed` flag is on. Empty on
+    /// every other server, and that is the default.
+    pub routing: crate::routing::Routing,
 }
 
 impl ServerState {
@@ -222,6 +225,7 @@ impl ServerState {
                     has_password: false,
                     created_by: None,
                     proximity: ProximityMode::Off,
+                    routed: false,
                     hidden: false,
                     anonymous: false,
                     screen_share: true,
@@ -273,6 +277,7 @@ impl ServerState {
                         has_password,
                         created_by: None,
                         proximity,
+                        routed: entry.routed,
                         hidden: entry.hidden,
                         anonymous: entry.anonymous,
                         screen_share: entry.screen_share,
@@ -301,7 +306,15 @@ impl ServerState {
             bans: DashMap::new(),
             next_user_id: AtomicU32::new(1),
             next_channel_id: AtomicU32::new(next_id),
+            routing: crate::routing::Routing::default(),
         }
+    }
+
+    /// Forget every routing decision for one channel. Called when its `routed`
+    /// flag goes off, so the switch hands everybody back at once rather than
+    /// leaving a stale table deciding who is audible.
+    pub fn clear_routing(&self, channel_id: ChannelId) {
+        self.routing.clear_channel(channel_id);
     }
 
     /// Allocate a new unique user ID.
@@ -540,6 +553,11 @@ impl ServerState {
         if let Some(mut session) = self.sessions.get_mut(&session_id) {
             session.channel_id = channel_id;
         }
+        // Whatever they asked to hear belonged to the channel they were in.
+        // Carrying it over would cull the new one by a list that means nothing
+        // there — and we would be holding a stale answer about somebody who
+        // has left, which is exactly what this server should not be keeping.
+        self.routing.clear_session(session_id);
 
         Ok(others)
     }
@@ -581,6 +599,7 @@ impl ServerState {
     pub async fn remove_session(&self, session_id: SessionId) -> Option<UserSession> {
         let (_, session) = self.sessions.remove(&session_id)?;
 
+        self.routing.clear_session(session_id);
         self.user_to_session.remove(&session.user_id);
         self.username_to_session.remove(&session.username.to_lowercase());
 
@@ -642,6 +661,7 @@ impl ServerState {
             proximity,
             // A user-created channel is an ordinary room; the rest are set
             // afterwards through SetChannelOptions.
+            routed: false,
             hidden: false,
             anonymous,
             screen_share: true,
@@ -689,6 +709,9 @@ impl ServerState {
         // stored here — aborting it would cancel the ChannelDeleted broadcast
         // that follows at its next yield point.
         let _ = channels.remove(&channel_id);
+        // And with it whatever a game server had told us about who could hear
+        // whom in it: the ids will be handed to different people.
+        self.routing.clear_channel(channel_id);
 
         Ok(())
     }
@@ -762,6 +785,7 @@ impl ServerState {
         anonymous: Option<bool>,
         screen_share: Option<bool>,
         hide_members: Option<bool>,
+        routed: Option<bool>,
         is_admin: bool,
     ) -> anyhow::Result<ChannelInfo> {
         if channel_id == 0 {
@@ -785,6 +809,15 @@ impl ServerState {
         }
         if let Some(v) = hide_members {
             channel.info.hide_members = v;
+        }
+        if let Some(v) = routed {
+            channel.info.routed = v;
+            if !v {
+                // Switching it off hands everybody back at once: whatever any
+                // client asked for, and whatever a game server had us
+                // enforcing, is forgotten rather than left half-applied.
+                self.clear_routing(channel_id);
+            }
         }
         if let Some(v) = anonymous {
             if v != channel.info.anonymous {
@@ -1372,6 +1405,7 @@ pub(crate) mod test_support {
                 has_password: false,
                 created_by: None,
                 proximity: ProximityMode::Off,
+                routed: false,
                 hidden: false,
                 anonymous: false,
                 screen_share: true,
@@ -1795,14 +1829,14 @@ mod tests {
         state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
 
         let on = state
-            .set_channel_options(ch.channel_id, alice, None, Some(true), None, None, false)
+            .set_channel_options(ch.channel_id, alice, None, Some(true), None, None, None, false)
             .await
             .unwrap();
         assert!(on.anonymous);
         assert!(state.display_name(alice, alice_sid).await.starts_with("Guest-"));
 
         let off = state
-            .set_channel_options(ch.channel_id, alice, None, Some(false), None, None, false)
+            .set_channel_options(ch.channel_id, alice, None, Some(false), None, None, None, false)
             .await
             .unwrap();
         assert!(!off.anonymous);
@@ -1821,27 +1855,27 @@ mod tests {
 
         // The creator may, a stranger may not, an admin may
         let updated = state
-            .set_channel_options(ch.channel_id, alice, Some(true), None, Some(false), Some(true), false)
+            .set_channel_options(ch.channel_id, alice, Some(true), None, Some(false), Some(true), None, false)
             .await
             .unwrap();
         assert!(updated.hidden && updated.hide_members && !updated.screen_share);
         assert!(state
-            .set_channel_options(ch.channel_id, bob, Some(false), None, None, None, false)
+            .set_channel_options(ch.channel_id, bob, Some(false), None, None, None, None, false)
             .await
             .is_err());
         assert!(state
-            .set_channel_options(ch.channel_id, bob, Some(false), None, None, None, true)
+            .set_channel_options(ch.channel_id, bob, Some(false), None, None, None, None, true)
             .await
             .is_ok());
         // Never the General channel
         assert!(state
-            .set_channel_options(0, alice, Some(true), None, None, None, true)
+            .set_channel_options(0, alice, Some(true), None, None, None, None, true)
             .await
             .is_err());
 
         // None leaves an option alone
         let before = state
-            .set_channel_options(ch.channel_id, alice, None, None, None, None, false)
+            .set_channel_options(ch.channel_id, alice, None, None, None, None, None, false)
             .await
             .unwrap();
         assert!(!before.hidden, "hidden was set to false above");
@@ -1858,7 +1892,7 @@ mod tests {
             .unwrap();
         state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
         state
-            .set_channel_options(ch.channel_id, alice, None, None, Some(false), None, false)
+            .set_channel_options(ch.channel_id, alice, None, None, Some(false), None, None, false)
             .await
             .unwrap();
 
@@ -1873,7 +1907,7 @@ mod tests {
 
         // Switched back on, sharing works
         state
-            .set_channel_options(ch.channel_id, alice, None, None, Some(true), None, false)
+            .set_channel_options(ch.channel_id, alice, None, None, Some(true), None, None, false)
             .await
             .unwrap();
         assert!(state
@@ -1899,7 +1933,7 @@ mod tests {
             .unwrap();
 
         state
-            .set_channel_options(ch.channel_id, alice, None, None, Some(false), None, false)
+            .set_channel_options(ch.channel_id, alice, None, None, Some(false), None, None, false)
             .await
             .unwrap();
         let sharers: Vec<UserId> = {
@@ -1924,7 +1958,7 @@ mod tests {
             .unwrap();
         state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
         state
-            .set_channel_options(ch.channel_id, alice, None, None, None, Some(true), false)
+            .set_channel_options(ch.channel_id, alice, None, None, None, Some(true), None, false)
             .await
             .unwrap();
 

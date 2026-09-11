@@ -67,6 +67,13 @@
       if (socket && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify(data.update));
       }
+    } else if (data.type === "transmit") {
+      // The radio key holding the player's push-to-talk. VoIPC refuses this
+      // unless they allowed it in Settings, and answers with an error saying
+      // so, which lands in the resource log like any other.
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: "transmit", on: !!data.on }));
+      }
     } else if (data.type === "bye") {
       hello = null;
       clearTimeout(reconnect);

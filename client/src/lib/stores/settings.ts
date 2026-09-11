@@ -75,6 +75,36 @@ export const spatialAudio = writable<boolean>(true);
 /** Place a screen share's audio at its sharer's position. */
 export const screenAudioSpatial = writable<boolean>(true);
 
+// Audio effects
+//
+// A lane is a lane: our own microphone on the way out, or one other person's
+// voice on the way in. Both carry the same four controls — an effect, and
+// muffle, reverb and water at 0-10 each — and both live in stores/mixer.ts,
+// which is the single writer for all of them. Nothing about a lane is kept
+// here, so there is no second copy to drift.
+/** Play our own microphone back to us while the mic test runs (session-only). */
+export const micMonitor = writable<boolean>(false);
+
+/**
+ * What this build's first-run audio setup covers. Bumped when a later release
+ * adds a step worth asking everybody about again; a saved version below it
+ * mounts the wizard once.
+ */
+export const AUDIO_SETUP_VERSION = 1;
+
+/** Which first-run audio setup this user has been through; 0 means never. */
+export const audioSetupVersion = writable<number>(0);
+
+/** Settings → "Run audio setup again" asked for it, whatever the version says. */
+export const audioSetupRequested = writable<boolean>(false);
+
+/**
+ * The audio setup is on screen. VoiceControls reads it: in voice-activation or
+ * always-open mode it re-opens the microphone the instant anything stops it,
+ * which would fight the wizard's own microphone test for the device.
+ */
+export const audioSetupOpen = writable<boolean>(false);
+
 // Saved servers for the connect dialog
 export interface SavedServer {
   name: string;
@@ -142,6 +172,13 @@ export interface AppConfig {
   spatial_audio: boolean;
   /** Place a screen share's audio at its sharer's position. */
   screen_audio_spatial: boolean;
+  /** Our own microphone's lane: an effect, plus three levels at 0-10. */
+  mic_effect: string;
+  mic_muffle: number;
+  mic_reverb: number;
+  mic_water: number;
+  /** Which first-run audio setup the user has been through; 0 = never. */
+  audio_setup_version: number;
   sounds: SoundSettings;
   auto_connect: boolean;
   share_channel_history: boolean;

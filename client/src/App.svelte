@@ -2,6 +2,7 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { onMount } from "svelte";
+  import { get } from "svelte/store";
 
   import ConnectDialog from "./lib/components/ConnectDialog.svelte";
   import ChannelList from "./lib/components/ChannelList.svelte";
@@ -17,6 +18,7 @@
   import ReconnectOverlay from "./lib/components/ReconnectOverlay.svelte";
   import InvitePopup from "./lib/components/InvitePopup.svelte";
   import PokePopup from "./lib/components/PokePopup.svelte";
+  import MixerView from "./lib/components/MixerView.svelte";
   import Icon from "./lib/components/Icons.svelte";
 
   import {
@@ -29,6 +31,7 @@
     isMuted,
     isDeafened,
     isTransmitting,
+    transmitHeldByGame,
     isAdmin,
     pendingInvite,
     channelPasswords,
@@ -50,6 +53,7 @@
     mergeChannelHistory,
   } from "./lib/stores/chat.js";
   import ChatHistorySetup from "./lib/components/ChatHistorySetup.svelte";
+  import AudioSetup from "./lib/components/AudioSetup.svelte";
   import type { ChannelInfo, ChatMessage, UserInfo } from "./lib/types.js";
   import { parseInviteFragment } from "./lib/invite.js";
   import {
@@ -75,6 +79,9 @@
     screenShareCodec,
     spatialAudio,
     screenAudioSpatial,
+    AUDIO_SETUP_VERSION,
+    audioSetupVersion,
+    audioSetupRequested,
     defaultServer,
   } from "./lib/stores/settings.js";
   import type { AppConfig } from "./lib/stores/settings.js";
@@ -91,16 +98,18 @@
   import { isMobile, isWeb, mobileTab } from "./lib/stores/platform.js";
   import type { MobileTab } from "./lib/stores/platform.js";
   import {
+    audibleIds,
+    centreView,
     clearRoom,
     currentProximity,
     drivenBy,
     positions,
     resetRoom,
-    roomOpen,
     selectedUserId,
     syncing,
   } from "./lib/stores/room.js";
   import { upsertById } from "./lib/stores/upsert.js";
+  import { clearMixer, cleanLane, micLane } from "./lib/stores/mixer.js";
   import MobilePTT from "./lib/components/MobilePTT.svelte";
   import {
     addScreenShare,
@@ -148,6 +157,65 @@
   // Deferred auto-connect: waits for chat history to be unlocked first
   let pendingAutoConnect = $state<AppConfig | null>(null);
   let mediaKeyToastId: number | null = null;
+  /** game/resource/channel of the last "a game is placing people" toast, so a
+   *  bridge that reconnects every two seconds cannot paper the screen. */
+  let lastSdkToast: string | null = null;
+  /** Channels we have already explained the `routed` flag for this session. */
+  const routedNoticeShown = new Set<number>();
+
+  // ── First-run audio setup ──────────────────────────────────────────────
+  //
+  // Shown on the first connection this install has ever made, from Settings on
+  // demand, and — as a single step — when a device somebody chose is no longer
+  // there. Never on Android, which has one microphone and one earpiece and no
+  // mic test to drive.
+  let missingDevice = $state<"input" | "output" | null>(null);
+  let audioSetupDone = $state(false);
+  const audioSetupOnly = $derived(
+    $audioSetupVersion >= AUDIO_SETUP_VERSION && !$audioSetupRequested
+      ? (missingDevice ?? undefined)
+      : undefined,
+  );
+  const showAudioSetup = $derived(
+    $connectionState === "connected" &&
+      !($isMobile && !isWeb) &&
+      !audioSetupDone &&
+      ($audioSetupVersion < AUDIO_SETUP_VERSION || $audioSetupRequested || missingDevice !== null),
+  );
+
+  function closeAudioSetup() {
+    audioSetupRequested.set(false);
+    missingDevice = null;
+    // Skipping leaves the version at 0 so the offer stands next time, but not
+    // for the rest of *this* session: being asked again on every reconnect is
+    // how a helpful thing becomes an obstacle.
+    audioSetupDone = true;
+    invoke<AppConfig>("load_config")
+      .then((c) => audioSetupVersion.set(c.audio_setup_version ?? 0))
+      .catch(() => {});
+  }
+
+  // A saved device that is no longer plugged in: the name is all we store
+  // (cpal has no stable id, and a browser's deviceId is wiped with site data),
+  // so a name that is not in the list is a device that went away.
+  $effect(() => {
+    if ($connectionState !== "connected" || ($isMobile && !isWeb)) return;
+    void (async () => {
+      try {
+        const wanted = { input: get(inputDevice), output: get(outputDevice) };
+        if (!wanted.input && !wanted.output) return;
+        const [ins, outs] = await Promise.all([
+          invoke<{ name: string }[]>("get_input_devices"),
+          invoke<{ name: string }[]>("get_output_devices"),
+        ]);
+        if (wanted.input && !ins.some((d) => d.name === wanted.input)) missingDevice = "input";
+        else if (wanted.output && !outs.some((d) => d.name === wanted.output))
+          missingDevice = "output";
+      } catch {
+        // Enumeration failing is its own toast elsewhere; do not stack another
+      }
+    })();
+  });
   // Chat pane below the screen-share viewer (desktop)
   let viewerChatOpen = $state(true);
 
@@ -175,6 +243,7 @@
     if ($connectionState !== "connected") {
       isAdmin.set(false);
       resetRoom();
+      clearMixer();
     }
   });
 
@@ -244,7 +313,8 @@
   // close the room and forget the layout.
   $effect(() => {
     if ($currentProximity === "off") {
-      roomOpen.set(false);
+      // Only the room is proximity-gated; the mixer works in any channel
+      if ($centreView === "room") centreView.set("chat");
       if ($mobileTab === "room") mobileTab.set("chat");
       if ($positions.size > 0 || $syncing) clearRoom();
     }
@@ -400,6 +470,16 @@
       screenShareCodec.set(config.screen_share_codec ?? "h264");
       spatialAudio.set(config.spatial_audio ?? true);
       screenAudioSpatial.set(config.screen_audio_spatial ?? true);
+      audioSetupVersion.set(config.audio_setup_version ?? 0);
+      // Our own lane, as the backend has already seeded it from the same file
+      micLane.set(
+        cleanLane({
+          effect: config.mic_effect ?? "none",
+          muffle: config.mic_muffle ?? 0,
+          reverb: config.mic_reverb ?? 0,
+          water: config.mic_water ?? 0,
+        }),
+      );
       if (config.input_device) inputDevice.set(config.input_device);
       if (config.output_device) outputDevice.set(config.output_device);
       rememberConnection.set(config.remember_connection);
@@ -455,8 +535,28 @@
         if (oldChannelId !== newChannelId) {
           // A room layout belongs to the channel it was made in
           clearRoom();
+          // The backend disarms the game SDK per channel: its player ids mean
+          // nothing here, and its next update is refused until it says hello
+          // again. Without this the room view and the mixer's incoming lanes
+          // stay locked in every channel once any game has ever connected.
+          drivenBy.set(null);
+          audibleIds.set(null);
           resetScreenShareState();
           playChannelSwitchSound();
+          // A routed channel is the one place the server is told anything
+          // about who hears whom. Say so on the way in, once per channel per
+          // session, in the words the README uses.
+          const joined = $channels.find((c) => c.channel_id === newChannelId);
+          if (joined?.routed && !routedNoticeShown.has(newChannelId)) {
+            routedNoticeShown.add(newChannelId);
+            addNotification(
+              `#${joined.name} is a routed channel: the server is told which members you want ` +
+                `to hear, so it forwards only their voice, and a game server connected to it ` +
+                `may narrow that further. It still never receives positions, or audio it can read.`,
+              "info",
+              0,
+            );
+          }
         }
 
         // Clear preview when we actually join a channel
@@ -555,13 +655,56 @@
       // A game took over the positions (or gave them back): the room shows
       // them but stops accepting drags, and our own sharing is off — the
       // backend already cleared it when the game said hello.
-      listen<{ connected: boolean; game: string }>("sdk-status", (event) => {
-        drivenBy.set(event.payload.connected ? event.payload.game || "a game" : null);
-        if (event.payload.connected) {
+      listen<{
+        connected?: boolean;
+        game?: string;
+        resource?: string;
+        channel?: string;
+        beacon?: boolean;
+        transmit?: boolean;
+      }>(
+        "sdk-status",
+        (event) => {
+          const { connected, game, resource, channel, beacon, transmit } = event.payload;
+          if (connected === undefined) return; // a listener-status update
+          drivenBy.set(connected ? game || "a game" : null);
+          if (!connected) {
+            audibleIds.set(null);
+            return;
+          }
           syncing.set(false);
           positions.set(new Map());
           selectedUserId.set(null);
-        }
+          // Say it out loud, once per game and channel. A game placing people
+          // also moves the user into the channel it named, and until now the
+          // only sign of either was a line in a settings panel nobody has
+          // open. The strings are capped and stripped backend-side.
+          const key = `${game}/${resource}/${channel}/${beacon}/${transmit}`;
+          if (key !== lastSdkToast) {
+            lastSdkToast = key;
+            const who = resource ? `${game} (${resource})` : game || "A game";
+            const where = channel ? ` in #${channel}` : "";
+            // …and what it is allowed to do *to* them, not just for them. A
+            // switch ticked once months ago is not consent anybody remembers
+            // giving, so it is named every time a game takes over.
+            const also = [
+              beacon ? "broadcasting your position to the channel" : null,
+              transmit ? "allowed to press your push-to-talk" : null,
+            ].filter(Boolean);
+            const tail = also.length ? `, and is ${also.join(" and ")}` : "";
+            addNotification(`${who} is placing people for you${where}${tail}`, "info");
+          }
+        },
+      ),
+
+      // Who the game currently lets us hear. Everyone else is greyed out in
+      // the member list and the mixer: leaving somebody out is how a game
+      // culls by distance, and also how one would silence a person.
+      listen<{ ids: number[] | null }>("sdk-audible", (event) => {
+        // null is "nobody is culling any more" — the game let go — and is a
+        // different thing from an empty list, which is a game saying nobody
+        // is in earshot.
+        audibleIds.set(event.payload.ids ? new Set(event.payload.ids) : null);
       }),
 
       listen<{ user_id: number; speaking: boolean }>(
@@ -945,6 +1088,11 @@
         invoke("stop_screen_capture").catch(() => {});
       }),
 
+      // A game pressing push-to-talk for us, so the voice bar can say so
+      listen<{ held: boolean }>("sdk-transmit", (event) => {
+        transmitHeldByGame.set(event.payload.held);
+      }),
+
       // Global PTT shortcut events from Rust backend
       listen("ptt-global-pressed", () => {
         isTransmitting.set(true);
@@ -1032,6 +1180,14 @@
   <ReconnectOverlay attempt={reconnectAttempt} error={reconnectError} oncancel={cancelReconnect} />
 {/if}
 
+<!-- Audio, once, while they are still in the lobby where voice is off anyway.
+     After Connect on purpose: that click is the browser gesture the audio
+     graph needs, and it is the moment the user is expecting to be asked
+     things. A device that has since vanished re-opens just its own step. -->
+{#if showAudioSetup}
+  <AudioSetup only={audioSetupOnly} onclose={closeAudioSetup} />
+{/if}
+
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div class="app-layout" class:mobile={$isMobile} oncontextmenu={(e) => e.preventDefault()}>
   <div class="titlebar">
@@ -1050,6 +1206,8 @@
         <ChannelList />
       {:else if $mobileTab === 'chat'}
         <ChatPanel />
+      {:else if $mobileTab === 'mixer'}
+        <MixerView />
       {:else if $mobileTab === 'room'}
         <RoomView />
       {:else}
@@ -1100,6 +1258,14 @@
       {/if}
       <button
         class="tab-btn"
+        class:active={$mobileTab === 'mixer'}
+        onclick={() => mobileTab.set('mixer')}
+      >
+        <Icon name="music-note" size={20} />
+        <span>Mixer</span>
+      </button>
+      <button
+        class="tab-btn"
         class:active={$mobileTab === 'users'}
         onclick={() => mobileTab.set('users')}
       >
@@ -1129,8 +1295,10 @@
             </div>
           {/if}
         </div>
-      {:else if $roomOpen && $currentProximity !== 'off'}
+      {:else if $centreView === 'room' && $currentProximity !== 'off'}
         <RoomView />
+      {:else if $centreView === 'mixer'}
+        <MixerView />
       {:else}
         <ChatPanel />
       {/if}

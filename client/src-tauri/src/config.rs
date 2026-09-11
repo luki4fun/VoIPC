@@ -118,6 +118,25 @@ pub struct AppConfig {
     /// Whether a screen share's audio is placed at its sharer's position or
     /// stays centred. Each viewer decides for themselves.
     pub screen_audio_spatial: bool,
+    /// Our own microphone's lane: the effect it is sent through, plus three
+    /// 0–10 levels. Everybody hears all of it — it is rendered into the voice
+    /// before Opus, so no listener can turn it off.
+    ///
+    /// The lanes we listen through carry the same four controls, but those are
+    /// per connection and are not saved: a user id is a session id.
+    pub mic_effect: String,
+    pub mic_muffle: u8,
+    pub mic_reverb: u8,
+    pub mic_water: u8,
+    /// Which version of the first-run audio setup this user has been through;
+    /// 0 (the default) means never.
+    ///
+    /// A version rather than a bool so a later release that adds a step can
+    /// ask again. It cannot be derived from the other settings: `voice_mode`
+    /// defaults to `"ptt"` whether or not anybody chose it, and a null
+    /// `input_device` legitimately means "whatever the system picks".
+    #[serde(default)]
+    pub audio_setup_version: u32,
     /// Accept connections from a game on the local SDK port.
     pub sdk_enabled: bool,
     /// Port the game SDK listens on (loopback only).
@@ -125,6 +144,28 @@ pub struct AppConfig {
     /// Extra browser origins allowed to connect to the SDK, on top of the
     /// built-in game-runtime patterns. `"null"` covers a `file://` page.
     pub sdk_allowed_origins: Vec<String>,
+    /// Follow MumbleLink: a block of shared memory some games write their own
+    /// player's position into. Off by default — any local process can write
+    /// one, so it is an input the user opts into like the SDK socket.
+    ///
+    /// Reading it only places people locally. Peers see the position only if
+    /// `sdk_beacon_allowed` is on as well, exactly as for a game in beacon
+    /// mode, because it is the same broadcast.
+    #[serde(default)]
+    pub mumblelink_enabled: bool,
+    /// May a game broadcast the user's position to the channel?
+    ///
+    /// Off by default, and the *only* way `sync` is ever turned on by anything
+    /// but the user's own switch. Positions a game feeds in stay on the
+    /// machine unless this is on; with it on, one's own position goes out
+    /// encrypted like voice, and every member of the channel receives it.
+    #[serde(default)]
+    pub sdk_beacon_allowed: bool,
+    /// May a game press the user's push-to-talk, so the in-game radio key is
+    /// the only key they have to hold? Off by default. It can never override
+    /// mute, and it is released the moment the game stops driving.
+    #[serde(default)]
+    pub sdk_transmit_allowed: bool,
 
     // QoL
     pub sounds: SoundSettings,
@@ -165,9 +206,17 @@ impl Default for AppConfig {
             screen_share_codec: "h264".into(),
             spatial_audio: true,
             screen_audio_spatial: true,
+            mic_effect: "none".into(),
+            mic_muffle: 0,
+            mic_reverb: 0,
+            mic_water: 0,
+            audio_setup_version: 0,
             sdk_enabled: false,
             sdk_port: 39987,
             sdk_allowed_origins: Vec::new(),
+            mumblelink_enabled: false,
+            sdk_beacon_allowed: false,
+            sdk_transmit_allowed: false,
             sounds: SoundSettings::default(),
             auto_connect: false,
             share_channel_history: true,

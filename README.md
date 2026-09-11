@@ -49,6 +49,17 @@ No accounts. No telemetry. No compromises.
 - Per-user volume control, 0–400% mic input gain, mic test in settings
 - Audio device hot-recovery when a device dies mid-call
 
+**Mixer**
+- A mixing desk in the centre column, with a tab of its own on a phone: one channel strip per
+  person, yours pinned at the front, each with a level meter, a real vertical fader and a mute
+- **A lane is a lane.** Your microphone on the way out and each voice on the way in carry the same
+  four controls: an **effect**, plus **muffle**, **reverb** and **water** at 0–10 each
+- Thirteen effect chains — five radio grades, five phone grades, megaphone, gramophone and robot —
+  from one parametric chain with drive, hiss, crackle, bit-crush, ring modulation and a squelch
+- What you put on your own microphone is encoded into your voice, so everyone hears it and no
+  listener can switch it off. What you put on somebody else's changes only what you hear, and a
+  game driving the channel takes those over while it runs
+
 **Screen Sharing**
 - H.264 encoding via FFmpeg by default — every viewer can watch, browsers included.
   H.265/HEVC is one setting away when everyone watching is on a desktop client
@@ -89,9 +100,22 @@ No accounts. No telemetry. No compromises.
 - **Game SDK**: a game mod can drive the positions instead, over a local WebSocket. It is the open
   alternative to the TeamSpeak plugins RP servers use (SaltyChat, YACA, TokoVOIP) — no plugin, no
   license server, players addressed by their VoIPC user id. Ranges, per-player volume, distance
-  culling, 0–10 muffling and radio/phone effect chains, with speaking and mute state pushed back to
-  the game. A ready-made FiveM resource is in [sdk/fivem-voipc/](sdk/fivem-voipc/); the protocol is
-  in [docs/SDK.md](docs/SDK.md)
+  culling, 0–10 muffling and thirteen radio/phone effect chains, with speaking and mute state
+  pushed back to the game. A ready-made FiveM resource is in [sdk/fivem-voipc/](sdk/fivem-voipc/);
+  the protocol is in [docs/SDK.md](docs/SDK.md), and which games it reaches — and which it
+  cannot — in [docs/GAMES.md](docs/GAMES.md)
+- **One speaker, heard several ways at once.** Every other proximity plugin makes a mod choose:
+  somebody is *either* on your radio *or* standing next to you. A player here carries up to three
+  extra **layers**, each with its own placement, chain, **ear** and **delay** — so a colleague two
+  metres away who keys their radio is heard twice, and the earpiece of somebody's phone leaks at
+  *their* head rather than yours
+- **MumbleLink**, for games that will not talk to a mod at all: Guild Wars 2 and a few others
+  write your own position into shared memory, and VoIPC can read it — the position and nothing
+  else in the block, not your account name and not which server you are on
+- **What a game may do to you, you decide.** It places people and that is all, until you say
+  otherwise: broadcasting your position to the channel and pressing your push-to-talk are each a
+  switch in Settings, both off by default. A game silencing somebody by leaving them out is shown
+  — they go grey in the member list — and switching the integration off hands everything back
 
 **Quality of Life**
 - Saved servers in the connect dialog, optional auto-connect
@@ -327,11 +351,14 @@ Runtime settings in `server_settings.json`:
   "empty_channel_timeout_secs": 300,
   "max_channels": 50,
   "max_channel_name_len": 32,
-  "proximity_enabled": true
+  "proximity_enabled": true,
+  "game_token": null
 }
 ```
 
 `proximity_enabled: false` switches proximity chat off for the whole server: every channel is served as non-positional, requests to enable it are refused, and position beacons are not relayed.
+
+`game_token` (unset by default) is a bearer token a **game server** may present to `POST /game/v1/routes`, which narrows who hears whom inside a channel whose `routed` flag is on. Unset, that endpoint answers 404 and this server has no idea games exist. It is not the admin token and is deliberately much weaker: no session list, no names, no kick, no bans — only "these players may hear each other, for the next few seconds", as opaque ids it forgets.
 
 **Persistent channels** (optional): drop a `channels.json` next to the binary to pre-create long-lived rooms that survive restarts. See [channels.example.json](channels.example.json) — plaintext `password` fields are hashed to SHA-256 on first load and the file is rewritten atomically. Per channel:
 
@@ -342,6 +369,7 @@ Runtime settings in `server_settings.json`:
 | `anonymous` | `false` | Members see each other as `Guest-1234`, a fresh name per visit. The server substitutes it everywhere, so no client ever learns the real one; admins see the real names, and no chat history is handed over in such a channel |
 | `screen_share` | `true` | `false` refuses screen sharing there |
 | `hide_members` | `false` | Non-admins see no member list, only whoever is speaking (and can still adjust their volume) |
+| `routed` | `false` | The server forwards each voice only to whoever should hear it, instead of to every member. For a channel a game drives, where "every member" can be a whole map. **The one option that tells this server anything about who hears whom** — members in such a channel say which of the others they want to hear, and a game server with `game_token` may narrow that further. Positions, names and audio stay as unreadable to it as ever. Everyone joining is told, and the channel is marked **R** |
 
 The creator of a channel, or any admin, can change these at runtime through the channel's gear icon. Channels from `channels.json` have no creator, so those are admin-only.
 
@@ -434,8 +462,33 @@ npm --prefix client test   # browser-side unit tests (spatial maths, room preset
 - Chat history — stored only on your device, encrypted
 - Your private keys — only public keys are exchanged
 - Where you stand in a proximity room — positions are encrypted with the channel key like voice; the
-  relay sees only that a member is sharing one. Positions a game feeds in never leave your machine
-  at all
+  relay sees only that a member is sharing one. Positions a game feeds in stay on your machine
+  unless you switch on *Let a game broadcast my position* — and then only your own goes out, still
+  encrypted, still unreadable to the relay, though every member of the channel can read it
+- Which radio channel anyone is on, or that radio channels exist. Radio entitlement is a job check
+  in the game server's own resource; the relay forwards encrypted audio to a VoIPC channel and
+  knows nothing else. The cost is worth stating: an honest client renders only what it should, and
+  a patched one can hear the whole channel — exactly as with SaltyChat, YACA and TokoVOIP
+
+### What the server sees in a routed channel
+
+A channel can be marked **routed** (off by default; see the channel options above). There, and
+only there, the relay is told one extra thing so it can forward each voice to the people who
+should hear it instead of to everybody:
+
+- **What it learns:** for each member, the set of other members they currently want to hear, as
+  user ids, changing a few times a second. If the game server is connected to it, that server's
+  own answer for who *may* hear whom, as opaque ids salted per run — which it resolves on receipt
+  and then forgets
+- **What it still never learns:** any position, range or distance; any radio channel, call or job
+  name; any name it did not already have; and any audio it can read. The routing endpoint refuses
+  a request carrying a field it does not recognise, so a coordinate cannot reach it by accident,
+  and there is no way to read anything back out of it
+- **It is not cryptographic separation.** The channel shares one media key, so this stops packets
+  reaching a client, not a client from reading the packets it gets. Radio entitlement is still a
+  job check in the game server's own resource
+- Everyone joining such a channel is told this, in a notice they have to dismiss, and the channel
+  carries an **R** in the list
 
 ### What your device stores
 

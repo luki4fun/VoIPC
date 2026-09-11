@@ -150,6 +150,17 @@ pub struct ChannelInfo {
     /// Non-admins do not see the member list, only whoever is speaking.
     #[serde(default)]
     pub hide_members: bool,
+    /// The relay forwards voice only to the people who should hear it, instead
+    /// of to everyone in the channel (protocol v8).
+    ///
+    /// Off everywhere by default, and it is the **only** state in which the
+    /// relay is told anything about who hears whom. It exists for channels a
+    /// game drives, where "everyone in the channel" can be hundreds of players
+    /// spread over a map; everywhere else fanning out to the whole channel
+    /// costs nothing and tells the server nothing. A client entering one is
+    /// told, in as many words, what it now shares.
+    #[serde(default)]
+    pub routed: bool,
 }
 
 fn default_true() -> bool {
@@ -196,6 +207,7 @@ mod tests {
             anonymous: true,
             screen_share: false,
             hide_members: true,
+            routed: true,
         };
         let bytes = postcard::to_allocvec(&info).unwrap();
         let decoded: ChannelInfo = postcard::from_bytes(&bytes).unwrap();

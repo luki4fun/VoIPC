@@ -21,7 +21,8 @@
     "hidden": true,
     "anonymous": true,
     "screen_share": false,
-    "hide_members": true
+    "hide_members": true,
+    "routed": true
   },
   {
     "name": "Private",

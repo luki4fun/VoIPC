@@ -311,6 +311,11 @@ pub async fn connect_to_server(
     // Per-user volume control — shared between voice mixer and commands
     let user_volumes: Arc<std::sync::Mutex<HashMap<u32, f32>>> =
         Arc::new(std::sync::Mutex::new(HashMap::new()));
+    // Per-user effect the listener chose, same sharing, same lifetime
+    let user_fx: Arc<std::sync::Mutex<HashMap<u32, crate::app_state::LaneFx>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
+    let source_levels: Arc<std::sync::Mutex<HashMap<u32, f32>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     // Proximity chat: positions and the current channel's mode. Seeded from
     // the persisted client settings; the channel's mode arrives with the
@@ -423,6 +428,8 @@ pub async fn connect_to_server(
         output_device_live.clone(),
         is_deafened.clone(),
         user_volumes.clone(),
+        user_fx.clone(),
+        source_levels.clone(),
         spatial.clone(),
         master_volume.clone(),
         voice_frames_played.clone(),
@@ -513,6 +520,8 @@ pub async fn connect_to_server(
         current_audio_level: Arc::new(AtomicI32::new(-9600)),
         noise_suppression: Arc::new(AtomicBool::new(saved_ns)),
         user_volumes,
+        user_fx,
+        source_levels,
         spatial,
         channels: channels_snapshot,
         position_sequence,
@@ -716,6 +725,12 @@ fn on_channel_changed(
         sp.sdk_active = false;
         sp.clear_positions();
     }
+    // Told rather than inferred: a mod that has gone quiet would otherwise keep
+    // receiving who-speaks-when for the channel the user just moved into, right
+    // up until its socket dies.
+    app_handle
+        .state::<AppState>()
+        .sdk_event(crate::app_state::SdkEvent::Detached);
     apply_channel_proximity(spatial, cache, channel_id, app_handle);
 }
 
@@ -758,6 +773,11 @@ fn apply_channel_proximity(
             "proximity-mode",
             serde_json::json!({"channel_id": channel_id, "mode": mode}),
         );
+        // The same news for a game: `proximity` is the field docs/SDK.md tells
+        // a mod to read, and until now it was only ever answered, never pushed.
+        app_handle
+            .state::<AppState>()
+            .sdk_event(crate::app_state::SdkEvent::Proximity { mode });
     }
 }
 
@@ -927,9 +947,11 @@ async fn handle_server_message(
                     set.remove(&user_id);
                 }
             }
-            // Forget where they stood — the id is reused for the next joiner
+            // Forget where they stood — the id is reused for the next joiner,
+            // and so are the extra ways a game had us hearing them
             if let Ok(mut sp) = spatial.lock() {
                 sp.sources.remove(&user_id);
+                sp.layers.remove(&user_id);
             }
 
             let _ = app_handle.emit(
@@ -2102,9 +2124,13 @@ struct MixSource {
     /// buffered tail has fully drained (an immediate reset would clip it).
     eot_received: bool,
     last_activity: std::time::Instant,
-    /// Where this source's gains and muffle filter were left last frame, so
-    /// the next one ramps on from there instead of stepping (which clicks).
-    mix: voipc_audio::mixer::SourceMixState,
+    /// This lane's whole chain — effect, room, gains — so the next frame
+    /// carries on from where the last one left off instead of stepping.
+    chain: voipc_audio::mixer::SourceChain,
+    /// Extra renders of this same voice, in the order the game listed them.
+    /// Grown on demand: a chain carries about 22 kB of delay line, so nobody
+    /// who is heard once pays for the three they are not.
+    layers: Vec<LayerMix>,
 }
 
 impl MixSource {
@@ -2114,9 +2140,99 @@ impl MixSource {
             decoder: voipc_audio::decoder::Decoder::new()?,
             eot_received: false,
             last_activity: std::time::Instant::now(),
-            mix: voipc_audio::mixer::SourceMixState::default(),
+            chain: voipc_audio::mixer::SourceChain::default(),
+            layers: Vec::new(),
         })
     }
+}
+
+/// One extra render of a source: the same decoded frame, mixed again through
+/// its own chain, with its own placement, ear and delay.
+#[derive(Default)]
+struct LayerMix {
+    chain: voipc_audio::mixer::SourceChain,
+    /// Frames held back by `delay_frames`; empty while the layer is not
+    /// delayed, which is the common case and costs nothing.
+    ring: std::collections::VecDeque<Vec<f32>>,
+}
+
+impl LayerMix {
+    /// Put this frame into the delay line and take out whichever one is now
+    /// due. `None` means nothing to play yet: the line is still filling, or —
+    /// with `pcm` `None` — it has drained after the speaker stopped.
+    ///
+    /// A delay of zero keeps no line at all, so the overwhelmingly common
+    /// layer costs one branch.
+    fn delayed(&mut self, pcm: Option<&[f32]>, delay_frames: u8) -> Option<Vec<f32>> {
+        if delay_frames == 0 {
+            self.ring.clear();
+            return None;
+        }
+        if let Some(pcm) = pcm {
+            self.ring.push_back(pcm.to_vec());
+        }
+        if self.ring.len() > delay_frames as usize || (pcm.is_none() && !self.ring.is_empty()) {
+            self.ring.pop_front()
+        } else {
+            None
+        }
+    }
+}
+
+/// Mix one source's extra renders into this frame, and say whether any of them
+/// put anything there.
+///
+/// `pcm` is the frame just decoded, or `None` when the speaker has nothing to
+/// play — a delayed layer still owes whatever is in its line, which is exactly
+/// how a radio double outlives the voice that caused it.
+#[allow(clippy::too_many_arguments)]
+fn mix_layers(
+    layers: &mut Vec<LayerMix>,
+    specs: &[voipc_audio::spatial::Source],
+    sp: &crate::app_state::SpatialState,
+    stereo: &mut [f32],
+    pcm: Option<&[f32]>,
+    vol: f32,
+    drained: bool,
+    deafened: bool,
+    water: u8,
+    reverb: u8,
+    now: std::time::Instant,
+) -> bool {
+    // A game adds and drops layers between ticks. Resizing here is also what
+    // frees the chains of a layer it dropped; its reverb tail goes with it,
+    // which is the price of not keeping a chain per layer anyone ever had.
+    if layers.len() != specs.len() {
+        layers.resize_with(specs.len(), LayerMix::default);
+    }
+    let mut played = false;
+    for (layer, spec) in layers.iter_mut().zip(specs) {
+        let delayed = layer.delayed(pcm, spec.delay_frames);
+        let frame = if spec.delay_frames == 0 {
+            pcm
+        } else {
+            delayed.as_deref()
+        };
+        match frame {
+            Some(f) if !deafened => {
+                let g = sp.render_gains(spec, now);
+                layer
+                    .chain
+                    .render(stereo, f, (g.l * vol, g.r * vol), g.lp_a, spec.fx, water, reverb);
+                played = true;
+            }
+            // Nothing this frame: close the squelch and let the tail run.
+            // Deafened decodes and drops, exactly as the base render does.
+            _ => {
+                let mut nothing: [f32; 0] = [];
+                let out: &mut [f32] = if deafened { &mut nothing } else { stereo };
+                if layer.chain.stop(out, spec.fx, drained, water, reverb) {
+                    played = true;
+                }
+            }
+        }
+    }
+    played
 }
 
 /// Set on the key of screen-share audio sources (session_ids are small counters).
@@ -2140,6 +2256,8 @@ async fn voice_mixer_task(
     output_device_live: Arc<std::sync::Mutex<Option<String>>>,
     is_deafened: Arc<AtomicBool>,
     user_volumes: Arc<std::sync::Mutex<HashMap<u32, f32>>>,
+    user_fx: Arc<std::sync::Mutex<HashMap<u32, crate::app_state::LaneFx>>>,
+    source_levels: Arc<std::sync::Mutex<HashMap<u32, f32>>>,
     spatial: Arc<std::sync::Mutex<crate::app_state::SpatialState>>,
     master_volume: Arc<AtomicU32>,
     voice_frames_played: Arc<AtomicU32>,
@@ -2243,16 +2361,21 @@ async fn voice_mixer_task(
             .lock()
             .map(|v| v.clone())
             .unwrap_or_default();
+        let listener_fx = user_fx.lock().map(|v| v.clone()).unwrap_or_default();
         // ponytail: the spatial state is locked for the whole 20 ms mix; the
         // writers (room drags, SDK updates) hold it for microseconds
         let mut sp = match spatial.lock() {
             Ok(s) => s,
             Err(poisoned) => poisoned.into_inner(),
         };
+        let sdk_room = sp.sdk_room();
 
         stereo.clear();
         stereo.resize(voipc_protocol::voice::OPUS_FRAME_SIZE * 2, 0.0);
         let mut mixed_any = false;
+        // Rebuilt from scratch each frame: an entry left behind by a pruned
+        // source would light a meter for somebody who is no longer here.
+        let mut levels: Vec<(u32, f32)> = Vec::new();
         // One clock for the whole frame: every glide is read against it
         let now = std::time::Instant::now();
         {
@@ -2264,11 +2387,23 @@ async fn voice_mixer_task(
             for (&key, src) in map.iter_mut() {
                 let is_screen_audio = key & SCREEN_AUDIO_FLAG != 0;
                 let user_id = key & !SCREEN_AUDIO_FLAG;
-                // A radio or phone from the game SDK; a screen share is never one
+                // This lane's own controls, or the game's while it drives the
+                // mix; a screen share is never given an effect.
+                let local = if is_screen_audio || sp.sdk_active {
+                    None
+                } else {
+                    listener_fx.get(&user_id).copied()
+                };
                 let fx = if is_screen_audio {
                     voipc_audio::spatial::Effect::None
                 } else {
-                    sp.effect_for(user_id)
+                    local.map_or_else(|| sp.effect_for(user_id), |l| l.effect)
+                };
+                // A game that says the listener is in a cave puts every lane in
+                // it; otherwise each lane carries its own.
+                let (water, reverb) = match sdk_room {
+                    Some(room) if !is_screen_audio => room,
+                    _ => local.map_or((0, 0), |l| (l.water, l.reverb)),
                 };
 
                 // End of transmission: the buffered tail has drained
@@ -2285,9 +2420,25 @@ async fn voice_mixer_task(
                     None => {
                         let mut nothing: [f32; 0] = [];
                         let out: &mut [f32] = if deafened { &mut nothing } else { &mut stereo };
-                        if voipc_audio::mixer::mix_source_stop(out, &mut src.mix, fx, drained) {
+                        if src.chain.stop(out, fx, drained, water, reverb) {
                             mixed_any = true;
                         }
+                        // A delayed layer still owes what is in its line: the
+                        // radio double outlives the voice that caused it.
+                        let vol = volumes.get(&user_id).copied().unwrap_or(1.0) * master;
+                        mixed_any |= mix_layers(
+                            &mut src.layers,
+                            sp.layers_for(user_id),
+                            &sp,
+                            &mut stereo,
+                            None,
+                            vol,
+                            drained,
+                            deafened,
+                            water,
+                            reverb,
+                            now,
+                        );
                         continue;
                     }
                     Some(JitterFrame::Ready(data)) => {
@@ -2316,16 +2467,48 @@ async fn voice_mixer_task(
 
                 let vol = volumes.get(&user_id).copied().unwrap_or(1.0) * master;
                 let g = sp.gains_for(user_id, is_screen_audio, now);
-                voipc_audio::mixer::mix_source_fx(
+                // The listener's own muffle is the filter only, never a level
+                // cut: the volume slider sits right beside it in the panel.
+                let lp_a = match local {
+                    Some(l) if l.muffle > 0 => {
+                        g.lp_a.min(voipc_audio::spatial::muffle_lp_a(l.muffle))
+                    }
+                    _ => g.lp_a,
+                };
+                src.chain.render(
                     &mut stereo,
                     &pcm,
-                    &mut src.mix,
                     (g.l * vol, g.r * vol),
-                    g.lp_a,
+                    lp_a,
                     fx,
+                    water,
+                    reverb,
                 );
+                // Then again, once per extra way this voice is being heard.
+                // The meter stays on the base render: one person, one strip.
+                mix_layers(
+                    &mut src.layers,
+                    sp.layers_for(user_id),
+                    &sp,
+                    &mut stereo,
+                    Some(&pcm),
+                    vol,
+                    drained,
+                    deafened,
+                    water,
+                    reverb,
+                    now,
+                );
+                if !is_screen_audio {
+                    levels.push((user_id, src.chain.mix.level));
+                }
                 mixed_any = true;
             }
+        }
+
+        if let Ok(mut map) = source_levels.lock() {
+            map.clear();
+            map.extend(levels.iter().copied());
         }
 
         // The settings panel's spatial test: a synthetic voice on the test
@@ -2493,7 +2676,15 @@ async fn position_beacon_task(
                     }
                     // A move goes out on the next tick (≤10/s, the rate the
                     // server relays); otherwise the keepalive carries it.
-                    let due = sp.dirty || last_sent.elapsed() >= POSITION_KEEPALIVE;
+                    //
+                    // While a game is beaconing, every tick goes out whether
+                    // the player moved or not. The relay cannot read a
+                    // position, but it can count packets — and "ten a second
+                    // while walking, one a second while still" tells it when
+                    // each member is moving and when they are away from the
+                    // keyboard. A constant cadence tells it nothing.
+                    let due =
+                        sp.beacon || sp.dirty || last_sent.elapsed() >= POSITION_KEEPALIVE;
                     if !due {
                         continue;
                     }
@@ -2825,6 +3016,19 @@ async fn datagram_receiver_task(
                         let header_size = voipc_protocol::voice::ENCRYPTED_VOICE_HEADER_SIZE;
                         if n != voipc_protocol::voice::POSITION_PACKET_SIZE {
                             continue;
+                        }
+                        // Before the decrypt, not after: while our own layout
+                        // is authoritative we are going to throw this away,
+                        // and a member beaconing at us costs an AES-GCM open
+                        // per packet if we find that out too late.
+                        {
+                            let sp = match spatial.lock() {
+                                Ok(s) => s,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            if !sp.sync || sp.sdk_active {
+                                continue;
+                            }
                         }
                         let session_id = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
                         let sequence = u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]);
@@ -3226,6 +3430,94 @@ mod tests {
         assert!(majority_reached(1, 0));
         assert!(!majority_reached(0, 0));
     }
+
+    /// A state with no geometry, so a layer's gains are its own volume and pan
+    /// and nothing else — which is what makes the sums below readable.
+    fn flat_state() -> crate::app_state::SpatialState {
+        crate::app_state::SpatialState::default()
+    }
+
+    fn layer(volume: f32, pan: f32, delay_frames: u8) -> voipc_audio::spatial::Source {
+        voipc_audio::spatial::Source {
+            volume,
+            pan,
+            delay_frames,
+            direct: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn every_layer_is_another_render_of_the_same_voice() {
+        // One speaker, heard twice at once: the phone in the left ear and the
+        // person themselves across the room. Both come out of one Opus frame.
+        let sp = flat_state();
+        let mut layers = Vec::new();
+        let specs = [layer(1.0, -1.0, 0), layer(0.5, 1.0, 0)];
+        let pcm = vec![0.25f32; 960];
+        let mut stereo = vec![0.0f32; 1920];
+
+        let played = mix_layers(
+            &mut layers,
+            &specs,
+            &sp,
+            &mut stereo,
+            Some(&pcm),
+            1.0,
+            false,
+            false,
+            0,
+            0,
+            std::time::Instant::now(),
+        );
+        assert!(played);
+        assert_eq!(layers.len(), 2, "a chain per layer, grown on demand");
+        // Hard left and hard right, so each ear carries exactly one of them
+        let root2 = core::f32::consts::SQRT_2;
+        assert!((stereo[0] - 0.25 * root2).abs() < 1e-5, "left ear: {}", stereo[0]);
+        assert!((stereo[1] - 0.25 * 0.5 * root2).abs() < 1e-5, "right ear: {}", stereo[1]);
+    }
+
+    #[test]
+    fn a_delayed_layer_arrives_late_and_keeps_playing_after_the_voice_stops() {
+        // The radio double: one voice reaching you twice, once through the air
+        // and once a beat later over the radio.
+        let sp = flat_state();
+        let mut layers = Vec::new();
+        let specs = [layer(1.0, 0.0, 2)];
+        let pcm = vec![0.25f32; 960];
+        let now = std::time::Instant::now();
+        let mut run = |frame: Option<&[f32]>| {
+            let mut stereo = vec![0.0f32; 1920];
+            mix_layers(
+                &mut layers, &specs, &sp, &mut stereo, frame, 1.0, false, false, 0, 0, now,
+            );
+            stereo[0]
+        };
+
+        // Two frames held back: nothing comes out yet
+        assert_eq!(run(Some(&pcm)), 0.0);
+        assert_eq!(run(Some(&pcm)), 0.0);
+        assert!(run(Some(&pcm)).abs() > 0.1, "the delay never let go");
+        // And the line drains after the speaker stops, rather than being cut
+        assert!(run(None).abs() > 0.1, "the tail of the delay was dropped");
+        assert!(run(None).abs() > 0.1);
+        assert_eq!(run(None), 0.0, "a drained line kept playing");
+    }
+
+    #[test]
+    fn dropping_a_layer_drops_its_chain() {
+        let sp = flat_state();
+        let mut layers = Vec::new();
+        let pcm = vec![0.25f32; 960];
+        let mut stereo = vec![0.0f32; 1920];
+        let now = std::time::Instant::now();
+        let three = [layer(1.0, 0.0, 0), layer(1.0, 0.0, 0), layer(1.0, 0.0, 0)];
+        mix_layers(&mut layers, &three, &sp, &mut stereo, Some(&pcm), 1.0, false, false, 0, 0, now);
+        assert_eq!(layers.len(), 3);
+        mix_layers(&mut layers, &[], &sp, &mut stereo, Some(&pcm), 1.0, false, false, 0, 0, now);
+        assert!(layers.is_empty(), "a layer the game dropped kept its chain");
+    }
 }
 
 /// Video decode + render task: runs on a blocking thread to avoid stalling
@@ -3391,6 +3683,7 @@ pub fn spawn_capture_encode_task(
     noise_suppression: Arc<AtomicBool>,
     is_muted: Arc<AtomicBool>,
     voice_sequence: Arc<AtomicU32>,
+    sender_lane: Arc<AtomicU32>,
     input_gain: Arc<AtomicU32>,
     app_handle: tauri::AppHandle,
 ) -> tokio::task::JoinHandle<()> {
@@ -3441,6 +3734,10 @@ pub fn spawn_capture_encode_task(
 
         // RNNoise-based noise suppression
         let mut denoiser = voipc_audio::denoise::Denoiser::new();
+
+        // Our own microphone's lane: the same chain, in the same order, that
+        // renders somebody else's voice on the way in.
+        let mut mic_chain = voipc_audio::mixer::SourceChain::default();
 
         info!("capture+encode task started");
 
@@ -3507,6 +3804,32 @@ pub fn spawn_capture_encode_task(
             let level_fixed = (vad.current_level_db() * 100.0) as i32;
             current_audio_level.store(level_fixed, Ordering::Relaxed);
 
+            // Our own lane, applied here and nowhere else.
+            //
+            // Below the VAD and the meter: a radio's hiss and its squelch
+            // burst sit at or above the default threshold of −40 dB, so a
+            // gate that heard them would latch open and transmit forever.
+            //
+            // Above the on-air gate, and unconditional: the filters and the
+            // reverb tail have to keep advancing through silence, exactly as
+            // the denoiser does, or the first frame after a pause steps them
+            // and clicks. With nothing switched on the chain is bit-exact, so
+            // this costs nothing.
+            let packed = sender_lane.load(Ordering::Relaxed);
+            let fx = voipc_audio::spatial::Effect::from_u8((packed & 0xff) as u8);
+            let muffle = ((packed >> 8) & 0xff) as u8;
+            mic_chain.render_mono(
+                &mut pcm_buf,
+                fx,
+                if muffle > 0 {
+                    voipc_audio::spatial::muffle_lp_a(muffle)
+                } else {
+                    1.0
+                },
+                ((packed >> 24) & 0xff) as u8,
+                ((packed >> 16) & 0xff) as u8,
+            );
+
             // Check voice mode to decide whether to send
             let mode = crate::app_state::VoiceMode::from_u8(voice_mode.load(Ordering::Relaxed));
             let should_send = match mode {
@@ -3528,6 +3851,11 @@ pub fn spawn_capture_encode_task(
             }
 
             if !on_air {
+                // Close the transmission so the next one opens its squelch
+                // again. The empty buffer takes the mixer's documented
+                // "drop the burst rather than owe it" path: `talking` clears,
+                // nothing is written, and the filters keep their state.
+                mic_chain.stop(&mut [], fx, true, 0, 0);
                 accumulated = 0;
                 continue;
             }

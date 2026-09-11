@@ -9,16 +9,25 @@
     isTransmitting,
     setSelfDeafened,
     setSelfMuted,
+    transmitHeldByGame,
     userId,
   } from "../stores/connection.js";
   import { currentChannelId } from "../stores/channels.js";
   import { speakingUsers } from "../stores/users.js";
-  import { volume, inputGain, pttKey, pttHoldMode, noiseSuppression } from "../stores/settings.js";
+  import {
+    volume,
+    inputGain,
+    pttKey,
+    pttHoldMode,
+    noiseSuppression,
+    audioSetupOpen,
+  } from "../stores/settings.js";
+  import { micLane } from "../stores/mixer.js";
   import { voiceMode, vadThreshold, audioLevel, speakerMode } from "../stores/voice.js";
   import type { VoiceMode } from "../stores/voice.js";
   import ScreenShareControls from "./ScreenShareControls.svelte";
   import { isMobile } from "../stores/platform.js";
-  import { currentProximity, roomOpen } from "../stores/room.js";
+  import { centreView, currentProximity } from "../stores/room.js";
   import Icon from "./Icons.svelte";
 
   // Voice is disabled in the General lobby (channel 0)
@@ -44,9 +53,20 @@
     }
   }
 
-  // VAD/AlwaysOn: auto-start transmit when connected to a channel
+  // VAD/AlwaysOn: auto-start transmit when connected to a channel.
+  //
+  // Not while the audio setup is up: it is using the capture device for its
+  // own meter, and `start_mic_test` refuses to run while we transmit — so
+  // without this guard the wizard's microphone step would be dead exactly
+  // for the people who most need it to work.
   $effect(() => {
-    if ($voiceMode !== "ptt" && !voiceDisabled && $connectionState === "connected" && !$isTransmitting) {
+    if (
+      $voiceMode !== "ptt" &&
+      !voiceDisabled &&
+      $connectionState === "connected" &&
+      !$isTransmitting &&
+      !$audioSetupOpen
+    ) {
       startTransmit();
     }
   });
@@ -245,6 +265,10 @@
       if ($voiceMode === "ptt" && matchesPttBinding(e) && !e.repeat) {
         e.preventDefault();
         startTransmit();
+        // Whatever else this key is bound to, it is the push-to-talk key
+        // first: Ctrl+M below would otherwise mute the microphone that the
+        // same press just opened.
+        return;
       }
 
       // Ctrl+M / Meta+M = toggle mute
@@ -307,11 +331,15 @@
         <button
           class="ptt-btn"
           class:active={$isTransmitting}
+          class:by-game={$transmitHeldByGame}
           onmousedown={startTransmit}
           onmouseup={stopTransmit}
           onmouseleave={stopTransmit}
+          title={$transmitHeldByGame
+            ? "The game is holding your push-to-talk (Settings → Game Integration)"
+            : undefined}
         >
-          PTT: {$pttKey}
+          {$transmitHeldByGame ? "Game is talking" : `PTT: ${$pttKey}`}
         </button>
       {/if}
     {:else if $voiceMode === "vad"}
@@ -381,13 +409,25 @@
       {#if !$isMobile && $currentProximity !== "off"}
         <button
           class="icon-btn"
-          class:active-success={$roomOpen}
-          onclick={() => roomOpen.update((v) => !v)}
-          title={$roomOpen ? "Back to chat" : "Show the virtual room"}
+          class:active-success={$centreView === "room"}
+          onclick={() => centreView.set($centreView === "room" ? "chat" : "room")}
+          title={$centreView === "room" ? "Back to chat" : "Show the virtual room"}
         >
           <Icon name="room" size={18} />
         </button>
       {/if}
+
+      <button
+        class="icon-btn"
+        class:active-success={$centreView === "mixer" && $micLane.effect === "none"}
+        class:active-danger={$micLane.effect !== "none"}
+        onclick={() => centreView.set($centreView === "mixer" ? "chat" : "mixer")}
+        title={$micLane.effect !== "none"
+          ? `Mixer — your voice is going out as a ${$micLane.effect}`
+          : "Mixer"}
+      >
+        <Icon name="music-note" size={18} />
+      </button>
     </div>
   {/if}
 
@@ -471,6 +511,14 @@
 
   .ptt-btn.active {
     background: var(--success);
+    color: white;
+  }
+
+  /* Somebody else opened this microphone. It is still a microphone that is
+     open, so it stays lit — but not in the colour that means "you pressed
+     the key", because you did not. */
+  .ptt-btn.by-game {
+    background: var(--accent);
     color: white;
   }
 

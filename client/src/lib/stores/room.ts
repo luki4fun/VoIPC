@@ -15,8 +15,17 @@ export type Point = { x: number; y: number; z: number };
 /** Half-width of the room in metres; the view is 2·ROOM_EXTENT square. */
 export const ROOM_EXTENT = 10;
 
-/** Is the room panel showing? */
-export const roomOpen = writable(false);
+/**
+ * Which view owns the centre column: the chat, the virtual room, or the mixing
+ * desk. One selector rather than a boolean each, because the centre column is a
+ * single if/else chain — with two booleans whichever branch comes first wins and
+ * the other button looks broken.
+ */
+export type CentreView = "chat" | "room" | "mixer";
+export const centreView = writable<CentreView>("chat");
+
+/** Is the room panel showing? Derived, so existing readers keep working. */
+export const roomOpen = derived(centreView, ($v) => $v === "room");
 
 /** Are we broadcasting our own position (and accepting the others')? */
 export const syncing = writable(false);
@@ -29,6 +38,19 @@ export const selectedUserId = writable<number | null>(null);
 
 /** A game is driving positions: the room shows them but nothing is draggable. */
 export const drivenBy = writable<string | null>(null);
+
+/**
+ * Who the game currently lets us hear, by user id — the players it listed in
+ * its last update. `null` means no game is culling and everyone is audible.
+ *
+ * A game silences people by leaving them out, which is exactly how distance
+ * culling is meant to work and also exactly how a hostile one would censor
+ * somebody. So it is shown: the member list and the mixer grey out whoever is
+ * not in here, and the escape hatch is the Settings toggle that ends the
+ * integration. The set never goes back to the game — see `event_message` in
+ * sdk.rs, and the reason there.
+ */
+export const audibleIds = writable<Set<number> | null>(null);
 
 /** The proximity mode of the channel we are in. */
 export const currentProximity = derived(
@@ -50,8 +72,9 @@ export function clearRoom(): void {
 /** Disconnected: the room and the game that drove it are both gone. */
 export function resetRoom(): void {
   clearRoom();
-  roomOpen.set(false);
+  centreView.set("chat");
   drivenBy.set(null);
+  audibleIds.set(null);
 }
 
 export type PresetName = "free" | "round" | "classroom" | "line";

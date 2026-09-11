@@ -17,7 +17,9 @@ pub const MAX_MSG_SIZE: u32 = 65_536;
 ///     SetChannelProximity, encrypted Position media packet (0x06)
 /// v7: channel options — ChannelInfo.hidden/anonymous/screen_share/hide_members,
 ///     CreateChannel.anonymous, SetChannelOptions
-pub const PROTOCOL_VERSION: u32 = 7;
+/// v8: routed channels — ChannelInfo.routed, SetChannelOptions.routed,
+///     SetAudioFilter (a client naming who it wants to hear)
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.
@@ -221,6 +223,22 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_set_audio_filter() {
+        // `None` and an empty list are different answers — "everybody" and
+        // "nobody" — and postcard has to carry that difference intact.
+        for allow in [None, Some(vec![]), Some(vec![7, 42])] {
+            let msg = ClientMessage::SetAudioFilter {
+                allow: allow.clone(),
+            };
+            let encoded = encode_client_msg(&msg).unwrap();
+            match decode_client_msg(&encoded[4..]).unwrap() {
+                ClientMessage::SetAudioFilter { allow: back } => assert_eq!(back, allow),
+                _ => panic!("wrong variant"),
+            }
+        }
+    }
+
+    #[test]
     fn roundtrip_set_channel_options() {
         // None leaves an option alone; the server must be able to tell that
         // apart from "set it to false".
@@ -230,6 +248,7 @@ mod tests {
             anonymous: None,
             screen_share: Some(false),
             hide_members: None,
+            routed: Some(true),
         };
         let encoded = encode_client_msg(&msg).unwrap();
         match decode_client_msg(&encoded[4..]).unwrap() {
@@ -239,12 +258,14 @@ mod tests {
                 anonymous,
                 screen_share,
                 hide_members,
+                routed,
             } => {
                 assert_eq!(channel_id, 3);
                 assert_eq!(hidden, Some(true));
                 assert_eq!(anonymous, None);
                 assert_eq!(screen_share, Some(false));
                 assert_eq!(hide_members, None);
+                assert_eq!(routed, Some(true));
             }
             _ => panic!("wrong variant"),
         }

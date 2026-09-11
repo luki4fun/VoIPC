@@ -39,7 +39,7 @@
 
 <div class="row">
   <label style="flex: 1"><span>Channel</span>
-    <input id="channel" placeholder="Ingame (optional)" style="flex: 1"
+    <input id="channel" placeholder="Ingame (required)" style="flex: 1"
            title="Joined by name before the reply says ingame; create it in channels.json" />
   </label>
   <label style="flex: 1"><span>Password</span>
@@ -55,6 +55,8 @@
   <label><span>x</span><input type="range" id="sx" min="-20" max="20" step="0.1" value="0" /><output id="sxv">0</output></label>
   <label><span>y</span><input type="range" id="sy" min="-20" max="20" step="0.1" value="0" /><output id="syv">0</output></label>
   <label><span>facing</span><input type="range" id="syaw" min="0" max="359" step="1" value="0" /><output id="syawv">0°</output></label>
+  <label><span>reverb</span><input type="range" id="srev" min="0" max="10" step="1" value="0" /><output id="srevv">0</output></label>
+  <label><span>underwater</span><input type="range" id="suw" min="0" max="10" step="1" value="0" /><output id="suwv">0</output></label>
 </fieldset>
 
 <fieldset>
@@ -69,10 +71,21 @@
     <select id="pmode">
       <option value="spatial">spatial</option>
       <option value="direct">direct (flat, no effect)</option>
-      <option value="radio">radio (band-limited, hiss, squelch)</option>
-      <option value="phone">phone (band-limited)</option>
+      <option value="off">off (heard only through the layer)</option>
     </select>
   </label>
+</fieldset>
+
+<fieldset>
+  <legend>…and a second way you hear them</legend>
+  <label><span>layer</span>
+    <select id="lmode">
+      <option value="">none</option>
+    </select>
+  </label>
+  <label><span>ear</span><input type="range" id="lpan" min="-1" max="1" step="0.05" value="-0.9" /><output id="lpanv">-0.9</output></label>
+  <label><span>delay ms</span><input type="range" id="ldelay" min="0" max="100" step="20" value="0" /><output id="ldelayv">0</output></label>
+  <label><span>at their head</span><input type="checkbox" id="lpos" /></label>
 </fieldset>
 
 <div id="log"></div>
@@ -83,6 +96,7 @@
   let socket = null;
   let timer = null;
   let capabilities = [];
+  let modes = [];
   const talking = new Set();
   let self = null;
 
@@ -94,12 +108,36 @@
     $("talk").textContent = `talking: ${others}${mine}`;
   }
 
-  /** The build may not render the mode that is selected; say so rather than
-   *  leaving someone wondering why a radio sounds plain. */
+  /** The build may not render what is selected; say so rather than leaving
+   *  someone wondering why a radio sounds plain. */
   function warnUnsupportedMode() {
-    const mode = $("pmode").value;
-    if (capabilities.length && (mode === "radio" || mode === "phone") && !capabilities.includes(mode)) {
-      log(`! this VoIPC build does not render "${mode}" — it will sound flat`);
+    for (const id of ["pmode", "lmode"]) {
+      const mode = $(id).value;
+      if (mode && modes.length && !modes.includes(mode)) {
+        log(`! this VoIPC build does not know the mode "${mode}"`);
+      }
+    }
+    for (const [id, name] of [["srev", "reverb"], ["suw", "underwater"], ["lpan", "pan"]]) {
+      if (capabilities.length && Number($(id).value) !== 0 && !capabilities.includes(name)) {
+        log(`! this VoIPC build does not render "${name}" — the slider does nothing`);
+      }
+    }
+    if ($("lmode").value && capabilities.length && !capabilities.includes("layers")) {
+      log('! this VoIPC build has no "layers" — the second voice will not be heard');
+    }
+  }
+
+  /** Fill both mode pickers from what the build actually reports. */
+  function fillModes() {
+    for (const [id, keep] of [["pmode", 3], ["lmode", 1]]) {
+      const sel = $(id);
+      const chosen = sel.value;
+      while (sel.options.length > keep) sel.remove(keep);
+      for (const mode of modes) {
+        if (mode === "spatial" || mode === "direct" || mode === "off") continue;
+        sel.add(new Option(mode, mode));
+      }
+      sel.value = chosen;
     }
   }
 
@@ -122,7 +160,9 @@
         // Required: a mod naming another server is refused with wrong_server
         server: $("server").value,
       };
-      if ($("channel").value) hello.channel = $("channel").value;
+      // Required: without it a mod would arm itself on whatever channel the
+      // player happens to be in, private ones included
+      hello.channel = $("channel").value;
       if ($("password").value) hello.password = $("password").value;
       connect.hello = hello; // kept so an error can re-send it
       socket.send(JSON.stringify(hello));
@@ -135,7 +175,10 @@
       try { msg = JSON.parse(e.data); } catch { return; }
       if (msg.type === "state" && Array.isArray(msg.capabilities)) {
         capabilities = msg.capabilities;
+        // Older builds send no `modes`; everything they render is in the other list
+        modes = Array.isArray(msg.modes) ? msg.modes : capabilities;
         $("caps").textContent = "capabilities: " + capabilities.join(", ");
+        fillModes();
         warnUnsupportedMode();
       }
       // Any "send hello again" (a reconnect, a channel change, or another
@@ -167,29 +210,53 @@
 
   function sendUpdate() {
     if (!socket || socket.readyState !== WebSocket.OPEN) return;
-    const mode = $("pmode").value;
+    const px = Number($("px").value);
+    const py = Number($("py").value);
+    const player = {
+      id: Number($("pid").value),
+      pos: [px, py, 0],
+      range: Number($("pr").value),
+      volume: Number($("pv").value),
+      muffle: Number($("pm").value),
+      mode: $("pmode").value,
+    };
+    const layerMode = $("lmode").value;
+    if (layerMode) {
+      const layer = { mode: layerMode, pan: Number($("lpan").value), delay: Number($("ldelay").value) };
+      // With a position it is positional *and* effected — the earpiece
+      // leaking at their own head. Without one it is flat, in your ear.
+      if ($("lpos").checked) {
+        layer.pos = [px, py, 1.6];
+        layer.range = 2.5;
+        layer.volume = 0.35;
+      }
+      if (capabilities.includes("layers")) {
+        player.layers = [layer];
+      } else {
+        // The fallback every mod owes older builds: one render, the device
+        delete player.layers;
+        player.mode = layerMode;
+      }
+    }
     socket.send(JSON.stringify({
       type: "update",
       self: {
         pos: [Number($("sx").value), Number($("sy").value), 0],
         yaw: Number($("syaw").value),
+        reverb: Number($("srev").value),
+        underwater: Number($("suw").value),
       },
-      players: [{
-        id: Number($("pid").value),
-        pos: [Number($("px").value), Number($("py").value), 0],
-        range: Number($("pr").value),
-        volume: Number($("pv").value),
-        muffle: Number($("pm").value),
-        mode,
-      }],
+      players: [player],
     }));
   }
 
   // Live read-outs
   for (const [input, out, suffix] of [
     ["sx", "sxv", ""], ["sy", "syv", ""], ["syaw", "syawv", "°"],
+    ["srev", "srevv", ""], ["suw", "suwv", ""],
     ["px", "pxv", ""], ["py", "pyv", ""], ["pr", "prv", ""],
     ["pv", "pvv", ""], ["pm", "pmv", ""],
+    ["lpan", "lpanv", ""], ["ldelay", "ldelayv", ""],
   ]) {
     const el = $(input);
     const show = () => ($(out).value = el.value + suffix);
@@ -198,6 +265,9 @@
   }
 
   $("pmode").addEventListener("change", warnUnsupportedMode);
+  $("lmode").addEventListener("change", warnUnsupportedMode);
+  $("srev").addEventListener("change", warnUnsupportedMode);
+  $("suw").addEventListener("change", warnUnsupportedMode);
   $("connect").addEventListener("click", connect);
   $("disconnect").addEventListener("click", () => socket && socket.close());
 </script>

@@ -57,9 +57,28 @@ pub struct AppState {
     pub config: std::sync::Mutex<crate::config::AppConfig>,
     /// Set while the settings-panel mic test runs; cleared to stop it.
     pub mic_test_active: Arc<AtomicBool>,
+    /// The output test is playing (first-run setup, or Settings).
+    pub output_test_active: Arc<AtomicBool>,
     /// Capture-side mic gain as f32 bits (1.0 = unity), applied in the
     /// audio callback of both the voice capture and the mic test.
     pub input_gain: Arc<AtomicU32>,
+    /// Our own microphone's lane, packed so the capture thread can read it
+    /// without a lock: `effect | muffle << 8 | reverb << 16 | water << 24`.
+    ///
+    /// Independent of every incoming lane, exactly as an incoming lane is
+    /// independent of the others. You can go out through a cave while hearing
+    /// everyone dry, or the other way round.
+    pub sender_lane: Arc<AtomicU32>,
+    /// Who is holding the microphone open: the user's own push-to-talk, and a
+    /// game pressing it for them because they pressed their in-game radio key.
+    ///
+    /// Two flags rather than one, because either one releasing must not cut
+    /// the other off mid-word: a mod that sends `transmit: false` while the
+    /// user is holding their key would otherwise be a way to silence them, and
+    /// a user who lets go would otherwise cut their own radio transmission.
+    /// Mute still beats both — that check lives in `start_capture`.
+    pub ptt_user: Arc<AtomicBool>,
+    pub ptt_sdk: Arc<AtomicBool>,
     /// The game currently driving positions over the SDK socket, by name.
     /// `get_sdk_status` reads it, so Settings opened after the game connected
     /// still shows it (the `sdk-status` event alone would have been missed).
@@ -82,6 +101,16 @@ pub enum SdkEvent {
     /// The server refused something (a channel join, most importantly), so a
     /// mod waiting for its `hello` to complete learns why.
     ChannelError(String),
+    /// How much of a placement the user will actually hear changed: the
+    /// channel's mode, or their own *Hear people where they stand* setting.
+    /// Sent as a partial `state` message, because it is the same field a
+    /// `hello` reply carries and mods are told to read it there.
+    Proximity { mode: ProximityMode },
+    /// No game drives this channel any more — the user moved, or the
+    /// integration was switched off. Every socket drops the user id it was
+    /// pushing edges against, so a mod cannot go on watching who speaks in a
+    /// channel the user walked into without it.
+    Detached,
 }
 
 impl AppState {
@@ -98,7 +127,11 @@ impl AppState {
             deafen_binding: Arc::new(std::sync::RwLock::new(None)),
             config: std::sync::Mutex::new(crate::config::AppConfig::default()),
             mic_test_active: Arc::new(AtomicBool::new(false)),
+            output_test_active: Arc::new(AtomicBool::new(false)),
             input_gain: Arc::new(AtomicU32::new(1.0f32.to_bits())),
+            sender_lane: Arc::new(AtomicU32::new(0)),
+            ptt_user: Arc::new(AtomicBool::new(false)),
+            ptt_sdk: Arc::new(AtomicBool::new(false)),
             sdk_game: Arc::new(std::sync::Mutex::new(None)),
             // Enough for a burst of talk edges; a lagging socket skips ahead
             sdk_events: tokio::sync::broadcast::channel(64).0,
@@ -300,6 +333,19 @@ pub struct ActiveConnection {
     // ── Per-user volume ──
     /// Per-user volume multiplier (0.0 = muted, 1.0 = default, 2.0 = max).
     pub user_volumes: Arc<std::sync::Mutex<HashMap<u32, f32>>>,
+    // ── Per-user effect the *listener* chose ──
+    /// How we hear one other user: the same four controls our own microphone
+    /// has. Keyed like `user_volumes`, and — like it — per connection and never
+    /// persisted, because a user id is a session id and the next connection
+    /// hands it to somebody else.
+    ///
+    /// Deliberately not stored in `spatial.sources`: the game SDK replaces
+    /// that map wholesale on every update, and clearing a room would wipe it.
+    pub user_fx: Arc<std::sync::Mutex<HashMap<u32, LaneFx>>>,
+    /// Each source's level last frame, for the mixer's meters. Rebuilt every
+    /// frame rather than updated in place, so a source that goes away cannot
+    /// leave its meter lit.
+    pub source_levels: Arc<std::sync::Mutex<HashMap<u32, f32>>>,
     // ── Proximity chat ──
     /// Where everyone stands, and how the mixer should render them.
     pub spatial: Arc<std::sync::Mutex<SpatialState>>,
@@ -414,6 +460,11 @@ pub struct SpatialState {
     /// User setting: does a screen share's audio follow its sharer's position
     /// or stay centred?
     pub screen_audio_spatial: bool,
+    /// The room a game says the listener is standing in, 0–10 each. While it
+    /// drives, every incoming lane is rendered through this instead of through
+    /// its own reverb and water.
+    pub sdk_reverb: u8,
+    pub sdk_underwater: u8,
     /// A game is driving positions. Members it does not list are silent
     /// (distance culling), and the room view stops accepting drags.
     pub sdk_active: bool,
@@ -423,6 +474,15 @@ pub struct SpatialState {
     pub sdk_channel: Option<ChannelId>,
     /// Broadcasting our own position, and accepting the other members'.
     pub sync: bool,
+    /// A game is feeding us only our *own* position, and we are beaconing it
+    /// to the channel — the mode for games whose client cannot see where the
+    /// other players are. It turns `sync` on, which is the one thing here that
+    /// puts anything on the wire, so it is refused unless the user allowed it.
+    pub beacon: bool,
+    /// What the user's own *Sync my position* switch said before a game turned
+    /// beaconing on, so closing the game hands their setting straight back
+    /// rather than leaving them broadcasting.
+    pub user_sync: bool,
     /// Our position moved since the last beacon. The beacon task sends at most
     /// ten times a second, so a drag cannot outrun the server's budget.
     pub dirty: bool,
@@ -431,6 +491,15 @@ pub struct SpatialState {
     /// Where each other user is, keyed by user_id (== session_id, the id the
     /// media packets carry), like `user_volumes`.
     pub sources: HashMap<u32, Source>,
+    /// Extra renders of the same voice, keyed the same way: one person heard
+    /// more than once at the same moment. Somebody on the phone to you *and*
+    /// standing across the room is two renders of one Opus stream — the phone
+    /// in one ear, their actual voice where they are standing.
+    ///
+    /// A sibling map rather than a field on `Source`, so the three other
+    /// writers of `sources` (the room view's drags, position beacons, a user
+    /// leaving) stay exactly as they were: only a game ever sets these.
+    pub layers: HashMap<u32, Vec<Source>>,
     /// The settings panel's spatial test, while it runs.
     pub test: Option<SpatialTest>,
     /// Glides for the SDK's placements, keyed like `sources`. A source without
@@ -492,12 +561,17 @@ impl Default for SpatialState {
             mode: ProximityMode::Off,
             enabled: true,
             screen_audio_spatial: true,
+            sdk_reverb: 0,
+            sdk_underwater: 0,
             sdk_active: false,
             sdk_channel: None,
             sync: false,
+            beacon: false,
+            user_sync: false,
             dirty: false,
             listener: Listener::default(),
             sources: HashMap::new(),
+            layers: HashMap::new(),
             test: None,
             motion: HashMap::new(),
             listener_motion: None,
@@ -518,18 +592,17 @@ impl SpatialState {
     /// and `listener`, so every other writer (room drags, position beacons)
     /// keeps snapping the way it always did.
     pub fn gains_for(&self, key: u32, screen_audio: bool, now: std::time::Instant) -> Gains {
-        if !self.active() || (screen_audio && !self.screen_audio_spatial) {
+        // A viewer who wants a share centred gets it centred, whatever else is
+        // going on. This one really is a placement preference and nothing else.
+        if screen_audio && !self.screen_audio_spatial {
             return voipc_audio::spatial::FLAT;
         }
         match self.sources.get(&key) {
             Some(src) => {
-                let listener = match &self.listener_motion {
-                    Some(m) => Listener {
-                        pos: m.pos_at(now),
-                        fwd: m.fwd_at(now),
-                    },
-                    None => self.listener,
-                };
+                // Only the base render glides: a layer is not a claim about a
+                // place in the world, and the mixer ramps its gains across the
+                // frame anyway. ponytail: give layers their own motion map if
+                // a mod ever moves one fast enough to hear it step.
                 let placed = match self.motion.get(&key) {
                     // A direct source has no position to interpolate
                     Some(m) if !src.direct => Source {
@@ -538,12 +611,69 @@ impl SpatialState {
                     },
                     _ => *src,
                 };
-                voipc_audio::spatial::gains(self.mode, &listener, Some(&placed))
+                self.render_gains(&placed, now)
             }
             // A game lists everyone who should be audible; anyone else is out
             // of range. Without a game, an unplaced user just sounds flat.
-            None if self.sdk_active => Gains { l: 0.0, r: 0.0, lp_a: 1.0 },
+            None if self.sdk_active => voipc_audio::spatial::SILENT,
             None => voipc_audio::spatial::FLAT,
+        }
+    }
+
+    /// The extra renders a game asked for on one voice, if any.
+    pub fn layers_for(&self, key: u32) -> &[Source] {
+        self.layers.get(&key).map_or(&[], |v| v.as_slice())
+    }
+
+    /// Gains for one placement, wherever it came from: the base render or a
+    /// layer. The listener's own glide is read here, the source's by the
+    /// caller.
+    pub fn render_gains(&self, src: &Source, now: std::time::Instant) -> Gains {
+        let g = if self.active() {
+            let listener = match &self.listener_motion {
+                Some(m) => Listener {
+                    pos: m.pos_at(now),
+                    fwd: m.fwd_at(now),
+                },
+                None => self.listener,
+            };
+            voipc_audio::spatial::gains(self.mode, &listener, Some(src))
+        } else if src.direct {
+            // Exactly what `gains` does for a direct source, minus nothing:
+            // a radio is not coming from a place, so a wall is not in its way.
+            Gains {
+                l: src.volume,
+                r: src.volume,
+                lp_a: 1.0,
+            }
+        } else {
+            // No geometry — the channel is not positional, or the user turned
+            // placement off. That takes away *direction and distance*, which
+            // is what those two settings are about. It must not take away the
+            // game's own judgements: `volume`, `muffle`, and above all "this
+            // player is not in earshot", which a game states by leaving them
+            // out (handled by the caller). Returning FLAT for everyone made
+            // unticking a checkbox in Settings a way to hear the whole map
+            // through every wall, while `effect_for` went on playing radios.
+            let level = src.volume * voipc_audio::spatial::muffle_cut(src.muffle);
+            Gains {
+                l: level,
+                r: level,
+                lp_a: voipc_audio::spatial::muffle_lp_a(src.muffle),
+            }
+        };
+        voipc_audio::spatial::pan_gains(g, src.pan)
+    }
+
+    /// What a game is told in the `proximity` field: the channel's mode, or
+    /// `Off` when the user has switched placement off for themselves. One
+    /// definition, because the `hello` reply and the pushed update must not be
+    /// able to disagree about it.
+    pub fn proximity_for_sdk(&self) -> ProximityMode {
+        if self.enabled {
+            self.mode
+        } else {
+            ProximityMode::Off
         }
     }
 
@@ -553,15 +683,39 @@ impl SpatialState {
         self.sources.get(&key).map_or(Effect::None, |s| s.fx)
     }
 
+    /// The room a game has put the listener in, if one is driving. `None`
+    /// leaves every lane to its own reverb and water. Deliberately not gated on
+    /// [`active`](Self::active) — a cave is a cave whether or not the channel
+    /// is positional.
+    pub fn sdk_room(&self) -> Option<(u8, u8)> {
+        if self.sdk_active {
+            Some((self.sdk_underwater, self.sdk_reverb))
+        } else {
+            None
+        }
+    }
+
     /// Forget every placement (channel change, room reset, game disconnect).
     /// The settings panel's test is not a placement and keeps running.
     pub fn clear_positions(&mut self) {
+        // A game that was beaconing for us stops beaconing: the user's own
+        // switch decides again, exactly as it did before the game arrived.
+        if self.beacon {
+            self.beacon = false;
+            self.sync = self.user_sync;
+        }
         self.sources.clear();
+        self.layers.clear();
         self.sdk_channel = None;
         self.listener = Listener::default();
         self.motion.clear();
         self.listener_motion = None;
         self.last_update = None;
+        // Only the game's room, never the user's: a game that disconnected
+        // underwater must not leave the mix filtered forever, and a channel
+        // change must not throw away what the user set for themselves.
+        self.sdk_reverb = 0;
+        self.sdk_underwater = 0;
     }
 }
 
@@ -611,6 +765,64 @@ pub fn share_codec_from_str(s: &str) -> VideoCodec {
     }
 }
 
+/// What one lane sounds like: our own microphone on the way out, or one other
+/// person on the way in. The same four controls either way — that symmetry is
+/// the whole point, so neither side grows a concept the other does not have.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct LaneFx {
+    pub effect: Effect,
+    /// All three are 0–10, and 0 is off.
+    pub muffle: u8,
+    pub reverb: u8,
+    pub water: u8,
+}
+
+impl LaneFx {
+    /// Nothing switched on, so the lane can be dropped from the map entirely.
+    pub fn is_plain(&self) -> bool {
+        self.effect == Effect::None && self.muffle == 0 && self.reverb == 0 && self.water == 0
+    }
+}
+
+/// One user's placement, updated field by field.
+///
+/// A caller that only knows where somebody stands (the room view dragging an
+/// avatar) must not silently reset the range, the muffle or the direct flag
+/// somebody else set through the game SDK — so an omitted argument keeps what
+/// was there, and only a first placement falls back to the defaults.
+pub fn merge_source(
+    prev: Option<Source>,
+    pos: [f32; 3],
+    range: Option<f32>,
+    volume: Option<f32>,
+    muffle: Option<u8>,
+    direct: Option<bool>,
+) -> Source {
+    let old = prev.unwrap_or_default();
+    Source {
+        pos,
+        range: range
+            .unwrap_or(if prev.is_some() {
+                old.range
+            } else {
+                voipc_audio::spatial::DEFAULT_RANGE
+            })
+            .max(0.01),
+        volume: volume.unwrap_or(old.volume).clamp(0.0, 2.0),
+        muffle: muffle
+            .unwrap_or(old.muffle)
+            .min(voipc_audio::spatial::MAX_MUFFLE),
+        direct: direct.unwrap_or(old.direct),
+        // The room view and the panel place people, never radios: an effect
+        // the listener chose lives in `user_fx`, where the SDK cannot wipe it.
+        fx: Effect::None,
+        // Nor does either of them put a voice in one ear or hold it back; both
+        // exist for a game, which builds its `Source` from scratch each tick.
+        pan: 0.0,
+        delay_frames: 0,
+    }
+}
+
 /// User settings (in-memory, initialized from config on startup).
 #[allow(dead_code)]
 pub struct UserSettings {
@@ -627,6 +839,11 @@ pub struct UserSettings {
     pub spatial_audio: bool,
     /// Place a screen share's audio at its sharer's position.
     pub screen_audio_spatial: bool,
+    /// Our own microphone's lane: effect id plus three 0–10 levels.
+    pub mic_effect: String,
+    pub mic_muffle: u8,
+    pub mic_reverb: u8,
+    pub mic_water: u8,
 }
 
 impl Default for UserSettings {
@@ -643,6 +860,10 @@ impl Default for UserSettings {
             deafened: false,
             spatial_audio: true,
             screen_audio_spatial: true,
+            mic_effect: "none".into(),
+            mic_muffle: 0,
+            mic_reverb: 0,
+            mic_water: 0,
         }
     }
 }
@@ -719,6 +940,73 @@ mod tests {
         state.screen_audio_spatial = false;
         assert_eq!(state.gains_for(7, true, Instant::now()), FLAT, "…until the viewer centres it");
         assert_eq!(state.gains_for(7, false, Instant::now()), voice, "which leaves the voice alone");
+
+        // And that stays true with the placement switched off, where the voice
+        // now keeps the game's volume and muffle: a centred share is centred,
+        // at unity, whatever the game said about the person sharing it.
+        state.enabled = false;
+        state.sdk_active = true;
+        state.sources.insert(
+            7,
+            Source { volume: 0.5, muffle: 5, ..Source::default() },
+        );
+        assert_eq!(state.gains_for(7, true, Instant::now()), FLAT, "the share stopped being flat");
+        let voice = state.gains_for(7, false, Instant::now());
+        assert!(voice.l < 0.5 && voice.lp_a < 1.0, "the voice lost its muffle: {voice:?}");
+    }
+
+    #[test]
+    fn a_game_that_beacons_hands_the_users_own_switch_back() {
+        // Beacon mode is the one thing a game can ask for that puts something
+        // on the wire, so when the game goes the user's own setting decides
+        // again — never whatever the game left behind.
+        let mut state = SpatialState { user_sync: false, ..Default::default() };
+        state.beacon = true;
+        state.sync = true;
+        state.clear_positions();
+        assert!(!state.sync, "the game left the user broadcasting");
+        assert!(!state.beacon);
+
+        // And a user who was already sharing keeps sharing
+        let mut state = SpatialState { sync: true, user_sync: true, ..Default::default() };
+        state.beacon = true;
+        state.clear_positions();
+        assert!(state.sync, "the user's own sharing was switched off for them");
+    }
+
+    #[test]
+    fn turning_placement_off_is_not_a_way_to_hear_through_walls() {
+        // Unticking *Hear people where they stand*, or sitting in a channel
+        // that is not positional, takes away direction and distance — that is
+        // what those settings are about. It must not take away the game's own
+        // judgements: how loud somebody is, how much wall is in the way, and
+        // above all that they are not in earshot at all, which a game says by
+        // leaving them out. Returning FLAT for everyone here turned a checkbox
+        // in Settings into a way to hear the whole map through every wall,
+        // while `effect_for` went on playing their radio chain.
+        let mut state = SpatialState {
+            mode: ProximityMode::ThreeD,
+            enabled: false,
+            sdk_active: true,
+            ..Default::default()
+        };
+        state.sources.insert(
+            7,
+            Source { pos: [50.0, 0.0, 0.0], volume: 0.5, muffle: 10, ..Source::default() },
+        );
+
+        let heard = state.gains_for(7, false, Instant::now());
+        assert_eq!(heard.l, heard.r, "there is no direction without placement");
+        // volume 0.5 and a full muffle's level cut, and the filter with it
+        let want = 0.5 * voipc_audio::spatial::muffle_cut(10);
+        assert!((heard.l - want).abs() < 1e-6, "{heard:?} is not {want}");
+        assert!(heard.lp_a < 0.1, "a full muffle must still be filtered: {heard:?}");
+
+        // Someone the game did not list is out of earshot, here as anywhere
+        assert_eq!(state.gains_for(9, false, Instant::now()), voipc_audio::spatial::SILENT);
+        // …but with no game driving, an unplaced user is just a user
+        state.sdk_active = false;
+        assert_eq!(state.gains_for(9, false, Instant::now()), FLAT);
     }
 
     // ── Glides between SDK updates ──────────────────────────────────────
@@ -867,6 +1155,57 @@ mod tests {
         // Not gated on the channel being positional: a radio is a radio
         assert_eq!(state.effect_for(7), Effect::Radio);
         assert_eq!(state.effect_for(9), Effect::None);
+    }
+
+    #[test]
+    fn a_game_owns_the_room_until_it_leaves() {
+        // Nothing driving: every lane keeps its own reverb and water.
+        let mut state = SpatialState::default();
+        assert_eq!(state.sdk_room(), None);
+
+        // A game saying "the listener is in a cave" puts every lane in it
+        state.sdk_active = true;
+        state.sdk_reverb = 10;
+        state.sdk_underwater = 3;
+        assert_eq!(state.sdk_room(), Some((3, 10)), "the game did not take over");
+
+        // It leaves: the lanes go back to their own settings
+        state.sdk_active = false;
+        state.clear_positions();
+        assert_eq!(state.sdk_room(), None);
+        assert_eq!((state.sdk_reverb, state.sdk_underwater), (0, 0));
+    }
+
+    #[test]
+    fn a_lane_with_nothing_on_is_plain() {
+        assert!(LaneFx::default().is_plain());
+        for lane in [
+            LaneFx { effect: Effect::Radio, ..Default::default() },
+            LaneFx { muffle: 1, ..Default::default() },
+            LaneFx { reverb: 1, ..Default::default() },
+            LaneFx { water: 1, ..Default::default() },
+        ] {
+            assert!(!lane.is_plain(), "{lane:?} should not count as plain");
+        }
+    }
+
+    #[test]
+    fn a_placement_keeps_what_the_caller_left_out() {
+        let placed = merge_source(None, [1.0, 2.0, 0.0], Some(40.0), None, Some(5), Some(true));
+        assert_eq!((placed.range, placed.volume, placed.muffle, placed.direct), (40.0, 1.0, 5, true));
+
+        // A room drag knows only the position: everything else survives
+        let dragged = merge_source(Some(placed), [3.0, 4.0, 0.0], None, None, None, None);
+        assert_eq!(dragged.pos, [3.0, 4.0, 0.0]);
+        assert_eq!((dragged.range, dragged.muffle, dragged.direct), (40.0, 5, true));
+
+        // A first placement takes the documented defaults, and clamps
+        let fresh = merge_source(None, [0.0; 3], None, None, None, None);
+        assert_eq!(fresh.range, voipc_audio::spatial::DEFAULT_RANGE);
+        assert_eq!((fresh.volume, fresh.muffle, fresh.direct), (1.0, 0, false));
+        let wild = merge_source(None, [0.0; 3], Some(0.0), Some(9.0), Some(250), None);
+        assert_eq!(wild.range, 0.01);
+        assert_eq!((wild.volume, wild.muffle), (2.0, voipc_audio::spatial::MAX_MUFFLE));
     }
 
     #[test]

@@ -82,12 +82,29 @@ pub enum ClientMessage {
         screen_share: Option<bool>,
         #[serde(default)]
         hide_members: Option<bool>,
+        /// Have the relay forward voice only to whoever should hear it
+        /// (protocol v8). See `ChannelInfo::routed`.
+        #[serde(default)]
+        routed: Option<bool>,
     },
 
     /// Kick a user from a channel (creator only).
     KickUser {
         channel_id: ChannelId,
         user_id: UserId,
+    },
+
+    /// The people this client wants to hear, by user id, in a channel whose
+    /// `routed` flag is on. `None` (the default everywhere else) means "all of
+    /// them", which is how every channel behaved before protocol v8.
+    ///
+    /// This is the one message that tells the relay anything about who hears
+    /// whom, and it is self-declared: it saves bandwidth and decoders in a
+    /// channel a game has spread over a map. It is **not** a security
+    /// boundary — a patched client simply asks for everyone. The enforcing
+    /// half is the game server's own `POST /game/v1/routes`.
+    SetAudioFilter {
+        allow: Option<Vec<UserId>>,
     },
 
     /// Request the user list of a channel without joining it (preview).
