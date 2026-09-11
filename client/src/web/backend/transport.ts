@@ -77,7 +77,16 @@ export async function connect(host: string, port: number, handlers: TransportHan
     try {
       wt = await openSession(urlHost, info);
     } catch (e) {
-      throw new Error(`WebTransport handshake with ${urlHost}:${info.port} failed: ${message(e)}`);
+      // Getting here means /wt.json came back over TCP, so the server is up and
+      // reachable — only the UDP/QUIC path failed. The browser keeps the real
+      // reason (blocked port, path MTU) in its own console and out of this
+      // error, so name the two causes worth checking.
+      throw new Error(
+        `WebTransport handshake with ${urlHost}:${info.port} failed: ${message(e)}. ` +
+          `The server answered on TCP, so UDP port ${info.port} is either blocked, ` +
+          `or the path cannot carry a 1278-byte packet — a VPN with a small MTU does that. ` +
+          `The browser console has the exact reason (ERR_MSG_TOO_BIG means the MTU).`,
+      );
     }
   }
 

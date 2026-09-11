@@ -248,11 +248,7 @@ impl WebTransport {
         certs: Vec<CertificateDer<'static>>,
         key: PrivateKeyDer<'static>,
     ) -> Result<Self> {
-        let bind_addr: SocketAddr = format!("{}:{}", config.host, config.udp_port)
-            .parse()
-            .with_context(|| {
-                format!("invalid QUIC address {}:{}", config.host, config.udp_port)
-            })?;
+        let bind_addr = config.bind_addr(config.udp_port)?;
 
         // Browsers pin the certificate by hash (serverCertificateHashes), the
         // SANs just keep it honest: the bind IP when it is a concrete one,

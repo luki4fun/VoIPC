@@ -1,11 +1,17 @@
+use std::net::{SocketAddr, ToSocketAddrs};
+
+use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
 /// Server configuration, loaded from a TOML file.
 #[derive(Debug, Deserialize)]
 pub struct ServerConfig {
-    /// IP address to bind on (default "0.0.0.0").
+    /// IP address to bind on (default "::", the dual-stack wildcard: one
+    /// listener serves IPv6 and IPv4 clients). Use "0.0.0.0" for IPv4 only.
     /// Set this to the public/VPN IP that clients connect to so that QUIC
-    /// packets are sent from the correct source address.
+    /// packets are sent from the correct source address — but note that a
+    /// concrete IPv4 address leaves a published AAAA record unanswered, and
+    /// a browser fails on that where the native client still works.
     #[serde(default = "default_host")]
     pub host: String,
 
@@ -35,8 +41,23 @@ pub struct ServerConfig {
     pub admin_token: Option<String>,
 }
 
+impl ServerConfig {
+    /// Bind address for `port`.
+    ///
+    /// `host` may be a bare IPv6 literal (`"::"`), which needs brackets
+    /// before it parses as a `SocketAddr`, so go through `ToSocketAddrs`
+    /// rather than formatting `host:port` into a string.
+    pub fn bind_addr(&self, port: u16) -> Result<SocketAddr> {
+        (self.host.as_str(), port)
+            .to_socket_addrs()
+            .with_context(|| format!("invalid bind address {}:{port}", self.host))?
+            .next()
+            .ok_or_else(|| anyhow!("{} resolves to no address", self.host))
+    }
+}
+
 fn default_host() -> String {
-    "0.0.0.0".into()
+    "::".into()
 }
 
 fn default_tcp_port() -> u16 {
@@ -93,5 +114,17 @@ mod tests {
         assert_eq!(config.udp_port, 5678);
         assert_eq!(config.max_users, 128);
         assert_eq!(config.cert_path, "test.crt");
+    }
+
+    #[test]
+    fn bind_addr_handles_bare_ipv6_literals() {
+        let mut config = ServerConfig::default();
+        assert_eq!(config.host, "::");
+        // "::9987" does not parse as a SocketAddr — the bracketless host must
+        // still bind, or the dual-stack default refuses to start.
+        assert_eq!(config.bind_addr(9987).unwrap().to_string(), "[::]:9987");
+
+        config.host = "0.0.0.0".into();
+        assert_eq!(config.bind_addr(9987).unwrap().to_string(), "0.0.0.0:9987");
     }
 }

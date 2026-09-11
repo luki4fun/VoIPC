@@ -307,7 +307,7 @@ The server listens on port **9987** by default: UDP for the QUIC endpoint every 
 connects to, TCP for the browser page. Configure via `server.toml`:
 
 ```toml
-host = "0.0.0.0"          # Bind address — set to your public/VPN IP for correct QUIC routing
+host = "::"               # Bind address — "::" serves IPv6 and IPv4 from one listener; "0.0.0.0" for IPv4 only
 tcp_port = 9987           # HTTPS page for the browser client
 udp_port = 9987           # QUIC endpoint (all clients) — keep equal to tcp_port so one host:port reaches both
 max_users = 64
@@ -315,6 +315,8 @@ cert_path = "certs/server.crt"
 key_path = "certs/server.key"
 admin_token = "change-me"  # optional; unset = a random token is printed in the log at every start
 ```
+
+> **IPv6:** `host = "::"` is the default and serves both families from one listener (a host with IPv6 disabled falls back to `0.0.0.0` automatically). Do not pin `host` to a concrete IPv4 address while your domain publishes an AAAA record: the browser client then fails while everything else looks healthy, because the page and `/wt.json` are TCP and Chrome quietly falls back to IPv4 after the refused IPv6 attempt, while the WebTransport session is UDP and has no such fallback — it dies with `ERR_QUIC_PROTOCOL_ERROR`.
 
 > **VPN / multi-homed setups:** If clients connect via a domain name (e.g. `vpn.example.com`) that resolves to a specific IP, set `host` to that IP. Otherwise the server may send QUIC packets from the wrong interface and the handshake never completes. All options can also be passed as CLI flags (`--host`, `--tcp-port`, `--udp-port`, etc.).
 

@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::WebPkiServerVerifier;
@@ -62,43 +62,77 @@ pub struct Link {
 }
 
 /// Resolve `host`, open the QUIC connection and the control stream.
+///
+/// Every resolved address is tried in order, not just the first: a name with
+/// both an A and an AAAA record may well have a server listening on only one
+/// of the two, and the resolver's order decides which one we see first.
 pub async fn connect(host: &str, port: u16, accept_invalid_certs: bool) -> Result<Link, String> {
-    let server_addr = tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host((host, port)))
-        .await
-        .map_err(|_| format!("Timed out resolving {host}"))?
-        .map_err(|e| format!("Could not resolve {host}: {e}"))?
-        .next()
-        .ok_or_else(|| format!("No addresses found for {host}"))?;
-
-    let tls = tls_config(host, port, accept_invalid_certs)?;
-    // Bind in the server's address family: a v6 wildcard socket is not
-    // available everywhere and a v4 one cannot reach a v6 server.
-    let bind: SocketAddr = if server_addr.is_ipv4() {
-        "0.0.0.0:0"
-    } else {
-        "[::]:0"
+    let addrs: Vec<SocketAddr> =
+        tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host((host, port)))
+            .await
+            .map_err(|_| format!("Timed out resolving {host}"))?
+            .map_err(|e| format!("Could not resolve {host}: {e}"))?
+            .collect();
+    if addrs.is_empty() {
+        return Err(format!("No addresses found for {host}"));
     }
-    .parse()
-    .expect("literal bind address");
-    let config = ClientConfig::builder()
-        .with_bind_address(bind)
-        .with_custom_tls(tls)
-        // Keeps NAT mappings alive through silent channels; a vanished
-        // server trips the 30 s idle timeout and surfaces as a read error.
-        .keep_alive_interval(Some(Duration::from_secs(10)))
-        .dns_resolver(Fixed(server_addr))
-        .build();
-    let endpoint =
-        Endpoint::client(config).map_err(|e| format!("Could not create QUIC endpoint: {e}"))?;
 
-    info!("connecting to {server_addr} over QUIC");
-    let connection = tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        endpoint.connect(format!("https://{NATIVE_SNI}:{port}/voipc")),
-    )
-    .await
-    .map_err(|_| format!("Timed out connecting to {host}:{port}"))?
-    .map_err(|e| format!("Could not connect to {host}:{port}: {e}"))?;
+    // One budget for all attempts, so a black-holed address cannot stretch the
+    // connect past what the reconnect loop (and its Cancel button) expects.
+    let deadline = Instant::now() + CONNECT_TIMEOUT;
+    let mut last_err = format!("Could not connect to {host}:{port}");
+    let mut established = None;
+    for server_addr in addrs {
+        let tls = tls_config(host, port, accept_invalid_certs)?;
+        // Bind in the server's address family: a v6 wildcard socket is not
+        // available everywhere and a v4 one cannot reach a v6 server.
+        let bind: SocketAddr = if server_addr.is_ipv4() {
+            "0.0.0.0:0"
+        } else {
+            "[::]:0"
+        }
+        .parse()
+        .expect("literal bind address");
+        let config = ClientConfig::builder()
+            .with_bind_address(bind)
+            .with_custom_tls(tls)
+            // Keeps NAT mappings alive through silent channels; a vanished
+            // server trips the 30 s idle timeout and surfaces as a read error.
+            .keep_alive_interval(Some(Duration::from_secs(10)))
+            .dns_resolver(Fixed(server_addr))
+            .build();
+        let endpoint = match Endpoint::client(config) {
+            Ok(endpoint) => endpoint,
+            Err(e) => {
+                last_err = format!("Could not create QUIC endpoint for {server_addr}: {e}");
+                warn!("{last_err}");
+                continue;
+            }
+        };
+
+        info!("connecting to {server_addr} over QUIC");
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(
+            remaining,
+            endpoint.connect(format!("https://{NATIVE_SNI}:{port}/voipc")),
+        )
+        .await
+        {
+            Ok(Ok(connection)) => {
+                established = Some((endpoint, connection));
+                break;
+            }
+            Ok(Err(e)) => {
+                last_err = format!("Could not connect to {host}:{port} ({server_addr}): {e}");
+                warn!("{last_err}");
+            }
+            Err(_) => {
+                last_err = format!("Timed out connecting to {host}:{port}");
+                break;
+            }
+        }
+    }
+    let (endpoint, connection) = established.ok_or(last_err)?;
     info!("QUIC handshake complete (rtt {:?})", connection.rtt());
 
     let (control_send, control_recv) = tokio::time::timeout(CONNECT_TIMEOUT, async {

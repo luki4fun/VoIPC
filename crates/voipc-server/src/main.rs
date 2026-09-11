@@ -154,6 +154,14 @@ async fn main() -> Result<()> {
     if let Some(host) = args.host {
         config.host = host;
     }
+    // The v6 wildcard is dual-stack (IPV6_V6ONLY off for the TCP listener,
+    // Ipv6DualStackConfig::Allow for QUIC), so one bind serves both families.
+    // A kernel with IPv6 switched off cannot bind it at all; fall back rather
+    // than refuse to start.
+    if config.host == "::" && std::net::UdpSocket::bind("[::]:0").is_err() {
+        warn!("IPv6 is unavailable on this host — binding 0.0.0.0 instead of ::");
+        config.host = "0.0.0.0".into();
+    }
     if let Some(token) = args
         .admin_token
         .or_else(|| std::env::var("VOIPC_ADMIN_TOKEN").ok())
@@ -231,9 +239,10 @@ async fn main() -> Result<()> {
     ));
 
     // Bind TCP listener
-    let tcp_listener = TcpListener::bind(format!("{}:{}", config.host, config.tcp_port))
+    let tcp_addr = config.bind_addr(config.tcp_port)?;
+    let tcp_listener = TcpListener::bind(tcp_addr)
         .await
-        .with_context(|| format!("failed to bind TCP on {}:{}", config.host, config.tcp_port))?;
+        .with_context(|| format!("failed to bind TCP on {tcp_addr}"))?;
 
     info!("TCP listener bound on {}:{}", config.host, config.tcp_port);
 
