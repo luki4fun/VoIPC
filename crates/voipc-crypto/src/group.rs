@@ -107,26 +107,3 @@ pub async fn decrypt_group_message(
     Ok(plaintext)
 }
 
-/// Reset sender key state for a channel (call when membership changes).
-/// After this, you must create and distribute new sender keys.
-pub async fn rotate_sender_key(
-    stores: &mut SignalStores,
-    my_user_id: u32,
-    channel_id: u32,
-) -> anyhow::Result<Vec<u8>> {
-    // Remove old sender key by creating a fresh one
-    // (libsignal creates a new chain on next create_sender_key_distribution_message)
-    let distribution_id = channel_distribution_id(channel_id);
-    let address = user_address(my_user_id);
-
-    // Clear the old sender key record by storing a fresh one
-    let msg = create_sender_key_distribution_message(
-        &address,
-        distribution_id,
-        &mut stores.sender_key,
-        &mut OsRng,
-    )
-    .await?;
-
-    Ok(msg.serialized().to_vec())
-}

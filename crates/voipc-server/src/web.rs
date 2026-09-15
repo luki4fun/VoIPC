@@ -222,6 +222,9 @@ async fn game_routes(req: Request<Incoming>, state: &ServerState) -> Response<Fu
             return owned(StatusCode::BAD_REQUEST, Bytes::from(format!("bad body: {e}")))
         }
     };
+    if let Err(reason) = routes_within_bounds(parsed.players.len(), state.max_users) {
+        return plain(StatusCode::BAD_REQUEST, reason);
+    }
 
     let channel_id = {
         let channels = state.channels.read().await;
@@ -245,14 +248,40 @@ async fn game_routes(req: Request<Incoming>, state: &ServerState) -> Response<Fu
         .routing
         .set_routes(channel_id, routes, tokio::time::Instant::now())
     {
-        Ok(()) => owned(StatusCode::OK, Bytes::from(format!("{forwarded} players"))),
+        Ok(()) => {
+            state.routing.log_accepted(channel_id);
+            owned(StatusCode::OK, Bytes::from(format!("{forwarded} players")))
+        }
         // Logged rather than silent: a game server stuck behind its own epoch
-        // would otherwise stop enforcing with nothing to see.
+        // would otherwise stop enforcing with nothing to see. Once per run of
+        // refusals, though — this arrives a few times a second from a remote
+        // party, and a line per POST is a log somebody else can grow.
         Err(crate::routing::RoutesError::Stale) => {
-            warn!(channel_id, "game routes refused: epoch is not newer than the one held");
+            if state.routing.log_refused(channel_id) {
+                warn!(
+                    channel_id,
+                    "game routes refused: epoch is not newer than the one held \
+                     (further refusals for this channel are not logged)"
+                );
+            }
             plain(StatusCode::CONFLICT, "epoch is not newer than the one held")
         }
     }
+}
+
+/// Does this body name a plausible number of players?
+///
+/// [`resolve`] intersects every listener with every speaker, so its cost — and
+/// the size of the table it leaves behind — is the square of this number. The
+/// body limit alone allows about fifteen thousand of them, which is a quarter of
+/// a second of a runtime worker and a gigabyte of sets, per POST, from a party
+/// holding nothing but the game token. Nobody can hear more people than the
+/// server can hold, so the roster is the bound.
+fn routes_within_bounds(players: usize, max_users: u32) -> Result<(), &'static str> {
+    if players > max_users.max(1) as usize {
+        return Err("more players than this server can hold");
+    }
+    Ok(())
 }
 
 /// Turn buses into "who may hear whom", and forget the buses.
@@ -970,6 +999,44 @@ mod tests {
         .expect("handshake within 5 s")
         .unwrap();
         (endpoint, connection)
+    }
+
+    #[test]
+    fn a_routing_post_is_bounded_by_the_roster() {
+        // `resolve` intersects every listener with every speaker, so a body the
+        // 512 KiB limit allows — about fifteen thousand players — is a quarter
+        // of a second of a runtime worker and a gigabyte of sets, per POST.
+        assert!(routes_within_bounds(64, 64).is_ok());
+        assert!(routes_within_bounds(0, 64).is_ok());
+        assert!(routes_within_bounds(65, 64).is_err(), "an oversized table was accepted");
+        // A server with no configured limit still bounds the endpoint
+        assert!(routes_within_bounds(2, 0).is_err());
+    }
+
+    #[test]
+    fn buses_resolve_to_who_hears_whom_and_nothing_else() {
+        // Two players share a bus, a third shares none: the whole enforcement
+        // model, and the reason the relay never learns what a bus is.
+        let body: RoutesBody = serde_json::from_str(
+            r#"{"channel":"Ingame","epoch":1,"boot":"a","players":[
+                 {"user":1,"pub":["w:7f"],"sub":["w:7f","r:police"]},
+                 {"user":2,"pub":["r:police"],"sub":["w:7f"]},
+                 {"user":3,"pub":["w:aa"],"sub":["w:aa"]}]}"#,
+        )
+        .unwrap();
+        let routes = resolve(body);
+        assert_eq!(routes.hear[&1], [2].into_iter().collect());
+        assert_eq!(routes.hear[&2], [1].into_iter().collect());
+        assert!(routes.hear[&3].is_empty(), "a player heard somebody off their buses");
+        // Nobody hears themselves through this table; that is the mixer's job
+        assert!(!routes.hear[&1].contains(&1));
+
+        // A field this endpoint does not know is refused rather than ignored:
+        // that is what keeps a coordinate from arriving by accident.
+        assert!(serde_json::from_str::<RoutesBody>(
+            r#"{"channel":"I","epoch":1,"players":[{"user":1,"pos":[1,2,3]}]}"#
+        )
+        .is_err());
     }
 
     #[tokio::test]

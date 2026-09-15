@@ -6,7 +6,7 @@
 use libsignal_protocol::{
     message_decrypt, message_decrypt_prekey, message_encrypt, process_prekey_bundle,
     CiphertextMessageType, IdentityKey, PreKeyBundle, PreKeyId, ProtocolAddress, PublicKey,
-    SessionStore, SignedPreKeyId,
+    SignedPreKeyId,
 };
 use rand::rngs::OsRng;
 
@@ -137,14 +137,4 @@ pub async fn decrypt_message(
     Ok(plaintext)
 }
 
-/// Check if we have an established session with a user.
-pub async fn has_session(stores: &SignalStores, remote_user_id: u32) -> bool {
-    let address = user_address(remote_user_id);
-    let result: Result<Option<libsignal_protocol::SessionRecord>, _> = SessionStore::load_session(
-        &stores.session,
-        &address,
-    )
-    .await;
-    result.ok().flatten().is_some()
-}
 

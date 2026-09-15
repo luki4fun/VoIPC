@@ -5,9 +5,47 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, copyFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  CLIENT, ROOT, IS_WINDOWS, capture, checkFfmpegAbi, fail, head, info, npmInstall, ok, run,
-  syncVersion, writeTempConfig,
+  CLIENT, ROOT, MAX_AVCODEC_MAJOR, IS_WINDOWS, avcodecMajor, capture, checkFfmpegAbi, fail,
+  head, info, npmInstall, ok, run, syncVersion, writeTempConfig,
 } from '../lib.mjs';
+
+/**
+ * Refuse to start a Linux build against an FFmpeg the bindings cannot use.
+ *
+ * Only a *newer* FFmpeg breaks: ffmpeg-next compiles its optional features out
+ * against an older one (Ubuntu 24.04 ships libavcodec 60 and CI builds there
+ * happily), while a newer one adds enum variants its exhaustive matches do not
+ * cover. The Windows paths have always checked this against a pinned tree;
+ * Linux did not, because for a long time no distribution shipped anything
+ * newer. Rolling ones now do, and the failure is fourteen screens of
+ * `non-exhaustive patterns` inside generated bindings, minutes in, with nothing
+ * in it naming FFmpeg. One line now, before anything is compiled.
+ */
+function checkLinuxFfmpegAbi() {
+  // Whatever the build will actually compile against: an explicit tree, or
+  // whatever pkg-config resolves.
+  const major = process.env.FFMPEG_DIR
+    ? avcodecMajor(process.env.FFMPEG_DIR)
+    : (capture('pkg-config', ['--modversion', 'libavcodec']) || '').split('.')[0];
+  if (!major) return; // nothing to judge; the build's own probe will complain
+  if (Number(major) <= Number(MAX_AVCODEC_MAJOR)) {
+    ok(`FFmpeg libavcodec ${major} — ffmpeg-next 8.1 builds against this`);
+    return;
+  }
+  fail(`FFmpeg is libavcodec ${major}; ffmpeg-next supports up to ${MAX_AVCODEC_MAJOR}.`,
+    'The Rust bindings will not compile against it: a newer FFmpeg adds enum\n'
+    + '     variants the crate does not know.\n'
+    + '     Either bump ffmpeg-next (crates/voipc-video/Cargo.toml) to a release that\n'
+    + '     knows this FFmpeg, or keep an older tree beside the system one and point\n'
+    + '     FFMPEG_DIR at its prefix. On Arch an older package is often still cached:\n'
+    + '       mkdir -p ~/.local/share/voipc/ffmpeg && tar -C ~/.local/share/voipc/ffmpeg \\\n'
+    + '         --zstd -xf /var/cache/pacman/pkg/ffmpeg-*.pkg.tar.zst usr/include usr/lib\n'
+    + '       FFMPEG_DIR=~/.local/share/voipc/ffmpeg/usr npm run build\n'
+    + '     If a build already ran against the newer one, its generated bindings stay\n'
+    + '     in the target directory and get reused even once FFMPEG_DIR is set.\n'
+    + '     `cargo clean -p ffmpeg-sys-next` does not reach them; delete them:\n'
+    + '       rm -rf target/release/build/ffmpeg-sys-next-* target/release/build/ffmpeg-next-*');
+}
 
 /** Newest entry of a directory, by name. */
 function newestDir(dir) {
@@ -187,6 +225,7 @@ export default function desktop(task, args) {
       if (!userPickedBundles) config.bundle.targets = ['nsis'];
     }
   } else {
+    checkLinuxFfmpegAbi();
     // bindgen's bundled clang cannot find the GCC system headers on its own.
     const gccInclude = capture('gcc', ['-print-file-name=include']);
     if (gccInclude) env.BINDGEN_EXTRA_CLANG_ARGS = `-I${gccInclude}`;

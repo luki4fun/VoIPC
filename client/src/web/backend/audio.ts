@@ -270,6 +270,8 @@ export class AudioEngine implements AudioApi {
     timer: ReturnType<typeof setInterval>;
     left: boolean;
   } | null = null;
+  /** Set while the graph is coming up for the output test (start is async). */
+  private outputTestStarting = false;
   private lastMicLevelEmit = 0;
 
   // Playback
@@ -293,7 +295,14 @@ export class AudioEngine implements AudioApi {
   private senderMuffle = 0;
   private senderReverb = 0;
   private senderWater = 0;
-  /** The mic test's own delay lines, so it never fights the live chain. */
+  /**
+   * The mic test's own filters and delay lines, so it never fights the live
+   * chain. Both halves: sharing `senderFxState` meant two capture streams
+   * advancing one set of filters in alternation, which is a discontinuity in
+   * every transmitted frame — and the squelch bookkeeping of one closing the
+   * other's transmission.
+   */
+  private sidetoneFxState = newFxState();
   private sidetoneRoom = new ReverbWater();
   private framesPlayed = 0;
   private framesLost = 0;
@@ -935,16 +944,6 @@ export class AudioEngine implements AudioApi {
     this.senderWater = clamp10(water, MAX_LEVEL);
   }
 
-  /** What our own lane is set to, for a strip that has just been opened. */
-  getMicFx(): [string, number, number, number] {
-    return [
-      preset(this.senderFx)?.id ?? "none",
-      this.senderMuffle,
-      this.senderReverb,
-      this.senderWater,
-    ];
-  }
-
   // ── Proximity chat ───────────────────────────────────────────────────
 
   /** Place another user, or remove their placement when `pos` is null. */
@@ -1295,7 +1294,7 @@ export class AudioEngine implements AudioApi {
           applySenderFx(
             frame,
             this.senderFx,
-            this.senderFxState,
+            this.sidetoneFxState,
             true,
             this.senderMuffleA,
             this.sidetoneRoom,
@@ -1337,8 +1336,15 @@ export class AudioEngine implements AudioApi {
    * has to guess the sides of is not an answer.
    */
   async startOutputTest(): Promise<void> {
-    if (this.outputTest) return;
+    if (this.outputTest || this.outputTestStarting) return;
+    // Claimed before the first await: building the graph can take a moment on
+    // the first run — which is exactly when this is used, in the setup, before
+    // anybody has connected — and two clicks would otherwise start two looping
+    // voices, of which Stop could only ever reach one.
+    this.outputTestStarting = true;
     const ac = await this.ensureGraph();
+    if (!this.outputTestStarting) return; // stopped while the graph came up
+    this.outputTestStarting = false;
     // One second of the voice, looped: it is periodic per second by design,
     // so the loop is seamless and there is nothing to schedule.
     const buffer = ac.createBuffer(1, SAMPLE_RATE, SAMPLE_RATE);
@@ -1362,6 +1368,9 @@ export class AudioEngine implements AudioApi {
   }
 
   stopOutputTest(): void {
+    // Also cancels one that is still coming up, so a Stop during the graph's
+    // first build is not lost.
+    this.outputTestStarting = false;
     const test = this.outputTest;
     if (!test) return;
     this.outputTest = null;

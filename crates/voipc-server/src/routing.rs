@@ -67,6 +67,9 @@ pub struct Routing {
     filters: DashMap<SessionId, HashSet<UserId>>,
     /// What each game server says may be heard, by channel.
     tables: DashMap<ChannelId, Table>,
+    /// Channels whose current run of stale POSTs has already been logged.
+    /// A refusal a few times a second is a log a remote party can grow.
+    refusals_logged: DashMap<ChannelId, ()>,
 }
 
 /// What a game server is telling us, once its buses have been resolved.
@@ -104,7 +107,14 @@ impl Routing {
             // Same run, and an epoch we have already passed: a POST that
             // overtook its successor. A *different* run starts over, which is
             // what lets a game server restart with a tick counter for an epoch.
-            if existing.boot == routes.boot && routes.epoch <= existing.epoch {
+            //
+            // An expired table has nothing to protect, so it does not get a
+            // vote: a game server that restarts without changing `boot` — and
+            // `boot` is optional — would otherwise be refused for ever, and the
+            // channel would fall back to full fan-out with nothing to see but a
+            // 409 a second.
+            if existing.expires > now && existing.boot == routes.boot && routes.epoch <= existing.epoch
+            {
                 return Err(RoutesError::Stale);
             }
         }
@@ -121,9 +131,19 @@ impl Routing {
     }
 
     /// Forget everything about one channel: it stopped being routed, or its
-    /// last member left.
-    pub fn clear_channel(&self, channel_id: ChannelId) {
+    /// last member left. `sessions` are the members whose own requests go with
+    /// it — switching routing off has to hand *everybody* back at once, and a
+    /// filter left lying about would be enforced again the moment somebody
+    /// switched it back on.
+    pub fn clear_channel(&self, channel_id: ChannelId, sessions: impl IntoIterator<Item = SessionId>) {
         self.tables.remove(&channel_id);
+        // Including whether its refusals have been logged: a channel that is
+        // gone leaves nothing behind, and the next one to take the id starts
+        // its own run of them.
+        self.refusals_logged.remove(&channel_id);
+        for session_id in sessions {
+            self.filters.remove(&session_id);
+        }
     }
 
     /// Forget one session's filter (it disconnected, or changed channel).
@@ -160,6 +180,18 @@ impl Routing {
             Some(allow) => allow.contains(&speaker),
             None => true,
         }
+    }
+
+    /// Should this refusal be logged? True once per run of them, so a game
+    /// server stuck behind its own epoch is visible without letting it write a
+    /// line a few times a second for as long as it is running.
+    pub fn log_refused(&self, channel_id: ChannelId) -> bool {
+        self.refusals_logged.insert(channel_id, ()).is_none()
+    }
+
+    /// A POST went through, so the next refusal is news again.
+    pub fn log_accepted(&self, channel_id: ChannelId) {
+        self.refusals_logged.remove(&channel_id);
     }
 
     /// Whether a live table is driving this channel; the admin-visible answer
@@ -277,7 +309,32 @@ mod tests {
         let r = Routing::default();
         let now = Instant::now();
         r.set_routes(5, routes(1, "boot-a", &[(1, &[2])]), now).unwrap();
-        r.clear_channel(5);
-        assert!(r.may_hear(5, 1, 1, 9, now));
+        // And the members' own requests go with the table: a filter left lying
+        // about would be enforced again the moment somebody switched routing
+        // back on, and nobody would be able to tell why they could not hear.
+        r.set_filter(1, Some(vec![2]));
+        r.clear_channel(5, [1]);
+        assert!(r.may_hear(5, 1, 1, 9, now), "a filter outlived the routing it belonged to");
+    }
+
+    #[test]
+    fn a_restart_is_not_refused_for_ever_once_the_old_table_has_expired() {
+        // `boot` is optional, and a tick counter for an epoch is exactly what
+        // the docs warn about — so a game server that restarts without changing
+        // either would post a lower epoch for ever. Refusing it leaves the
+        // channel in full fan-out with nothing to see but a 409 a second.
+        let r = Routing::default();
+        let now = Instant::now();
+        r.set_routes(5, routes(500, "", &[(1, &[2])]), now).unwrap();
+        assert_eq!(
+            r.set_routes(5, routes(9, "", &[(1, &[9])]), now),
+            Err(RoutesError::Stale),
+            "a late POST overwrote a newer one"
+        );
+        // …but once the table it was protecting has expired, it has nothing
+        // left to protect
+        let later = now + std::time::Duration::from_secs(4);
+        r.set_routes(5, routes(1, "", &[(1, &[9])]), later).unwrap();
+        assert!(r.may_hear(5, 1, 1, 9, later));
     }
 }

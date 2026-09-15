@@ -313,8 +313,16 @@ impl ServerState {
     /// Forget every routing decision for one channel. Called when its `routed`
     /// flag goes off, so the switch hands everybody back at once rather than
     /// leaving a stale table deciding who is audible.
-    pub fn clear_routing(&self, channel_id: ChannelId) {
-        self.routing.clear_channel(channel_id);
+    ///
+    /// `members` are the people standing in it right now: their own "these are
+    /// the ones I want to hear" requests belong to the channel as much as the
+    /// game server's table does, and a filter left behind would be enforced
+    /// again the moment somebody switched routing back on.
+    pub fn clear_routing(&self, channel_id: ChannelId, members: impl IntoIterator<Item = UserId>) {
+        let sessions = members
+            .into_iter()
+            .filter_map(|uid| self.user_to_session.get(&uid).map(|s| *s));
+        self.routing.clear_channel(channel_id, sessions);
     }
 
     /// Allocate a new unique user ID.
@@ -584,6 +592,11 @@ impl ServerState {
         channel.info.user_count = channel.members.len() as u32;
         // Coming back means a new pseudonym, which is the point
         channel.pseudonyms.remove(&user_id);
+        // Whatever they asked to hear belonged to this channel. `join_channel`
+        // clears it on the way in; this is the way out that does not go through
+        // one — stepping back into the lobby — and a stale answer about people
+        // somebody has left is exactly what this server should not be keeping.
+        self.routing.clear_session(session_id);
 
         let remaining: Vec<SessionId> = channel
             .members
@@ -710,8 +723,10 @@ impl ServerState {
         // that follows at its next yield point.
         let _ = channels.remove(&channel_id);
         // And with it whatever a game server had told us about who could hear
-        // whom in it: the ids will be handed to different people.
-        self.routing.clear_channel(channel_id);
+        // whom in it: the ids will be handed to different people. (The channel
+        // is empty — that is checked above — so there are no members' own
+        // requests left to forget.)
+        self.routing.clear_channel(channel_id, []);
 
         Ok(())
     }
@@ -816,7 +831,8 @@ impl ServerState {
                 // Switching it off hands everybody back at once: whatever any
                 // client asked for, and whatever a game server had us
                 // enforcing, is forgotten rather than left half-applied.
-                self.clear_routing(channel_id);
+                let members: Vec<UserId> = channel.members.iter().copied().collect();
+                self.clear_routing(channel_id, members);
             }
         }
         if let Some(v) = anonymous {
@@ -1800,6 +1816,42 @@ mod tests {
         let second = state.display_name(alice, alice_sid).await;
         assert!(second.starts_with("Guest-"));
         let _ = first; // a repeat is possible, just unlikely; identity is not the claim
+    }
+
+    #[tokio::test]
+    async fn what_a_client_asked_to_hear_belongs_to_the_channel_it_asked_in() {
+        // The one thing a routed channel tells this server is who each member
+        // wants to hear. It has to go when they do — and when the channel stops
+        // being routed, or switching it back on would enforce an answer from
+        // another day against people who are not the same people any more.
+        let state = make_state();
+        let (alice, alice_sid) = add_user(&state, "alice");
+        let ch = state
+            .create_channel("Ingame".into(), None, ProximityMode::Off, false, alice)
+            .await
+            .unwrap();
+        state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
+        let now = tokio::time::Instant::now();
+
+        // Stepping back into the lobby
+        state.routing.set_filter(alice_sid, Some(vec![7]));
+        state.leave_current_channel(alice, alice_sid).await;
+        assert!(
+            state.routing.may_hear(ch.channel_id, alice, alice_sid, 9, now),
+            "a filter outlived the channel it was asked in"
+        );
+
+        // …and switching the flag off, with the member still standing there
+        state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
+        state.routing.set_filter(alice_sid, Some(vec![7]));
+        state
+            .set_channel_options(ch.channel_id, alice, None, None, None, None, Some(false), false)
+            .await
+            .unwrap();
+        assert!(
+            state.routing.may_hear(ch.channel_id, alice, alice_sid, 9, now),
+            "a filter outlived the routing it belonged to"
+        );
     }
 
     #[tokio::test]

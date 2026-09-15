@@ -20,7 +20,7 @@ const TARGET = 'x86_64-pc-windows-msvc';
 // An n8.x "-shared" asset: those ship include/ and lib/*.lib, and the major has
 // to be the one ffmpeg-next expects — checkFfmpegAbi() in lib.mjs enforces it.
 const DEFAULT_ASSET = 'ffmpeg-n8.1-latest-win64-gpl-shared-8.1.zip';
-const FFMPEG_HINT = 'Set VOIPC_FFMPEG_ASSET to an n8.x "-shared" build and re-run setup:windows.';
+const FFMPEG_HINT = 'Set VOIPC_FFMPEG_ASSET to an n8.x or n9.x "-shared" build and re-run setup:windows.';
 
 const home = () => process.env.HOME ?? process.env.USERPROFILE ?? '';
 const ffmpegDir = () =>

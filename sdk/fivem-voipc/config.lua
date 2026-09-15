@@ -9,10 +9,15 @@ Config = {
   server = "rp.example.com:9987",
 
   -- Joined by name before VoIPC answers "ingame". Create it in the server's
-  -- channels.json; the recommended entry is hidden, anonymous, without screen
-  -- sharing and without a member list (see channels.example.json).
+  -- channels.json; the recommended entry is hidden, anonymous, password
+  -- protected, without screen sharing and without a member list (see
+  -- channels.example.json).
+  --
+  -- The channel's **password lives in `server_config.lua`**, not here: this
+  -- file is a `shared_script`, so every player downloads it, and a password in
+  -- a file everybody has protects nothing. The server hands it to a client
+  -- when that client is about to join, and only if `mayUseVoice` says so.
   channel = "Ingame",
-  password = nil,
 
   -- Distance at which a voice becomes inaudible, per talk mode. SaltyChat's
   -- values, which is what players are used to.
@@ -57,6 +62,19 @@ Config = {
   --- rather than on the VoIPC server: that one relays encrypted audio to a
   --- channel and never learns that radio channels exist at all.
   canJoinRadio = function(_src, _channel)
+    return true
+  end,
+
+  --- May this player join this call, when the *client* asked to?
+  ---
+  --- Your own resources call `setPlayerCallChannel` on the server and never
+  --- come through here. This is the client-side path the pma-voice shim has to
+  --- answer, because pma-voice lets a client set its own call channel — and a
+  --- call id is guessable (a phone resource that uses a phone number, say), so
+  --- a cheat client that guesses one is in the call. Default true, which is
+  --- what pma-voice itself does; make it a lookup against whoever your phone
+  --- resource says is in that call and it stops being guessable.
+  canJoinCall = function(_src, _id)
     return true
   end,
 }

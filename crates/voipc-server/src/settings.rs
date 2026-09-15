@@ -62,7 +62,26 @@ impl Default for ServerSettings {
 impl ServerSettings {
     pub fn load_from_file(path: &Path) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        Ok(serde_json::from_str(&content)?)
+        let mut settings: Self = serde_json::from_str(&content)?;
+        settings.normalise();
+        Ok(settings)
+    }
+
+    /// An empty `game_token` is no token, exactly as it is for the admin one.
+    ///
+    /// Without this, `""` in a settings file made `POST /game/v1/routes` answer
+    /// a request carrying *no* `Authorization` header at all: the comparison is
+    /// "" against "", which passes. Anybody who could reach the port could then
+    /// post an empty table and silence a routed channel, invisibly, because a
+    /// live table that lists nobody means nobody hears anybody.
+    pub fn normalise(&mut self) {
+        if self
+            .game_token
+            .as_deref()
+            .is_some_and(|t| t.trim().is_empty())
+        {
+            self.game_token = None;
+        }
     }
 }
 
@@ -87,6 +106,21 @@ mod tests {
         // A pre-0.7 settings file keeps proximity available
         let old: ServerSettings = serde_json::from_str(r#"{"max_channels": 10}"#).unwrap();
         assert!(old.proximity_enabled);
+    }
+
+    #[test]
+    fn an_empty_game_token_is_no_game_token() {
+        // "" versus a request with no Authorization header compares "" to "",
+        // which passes — so a placeholder in a settings file would have turned
+        // the routing endpoint into an unauthenticated one.
+        let mut settings: ServerSettings =
+            serde_json::from_str(r#"{"game_token": "   "}"#).unwrap();
+        settings.normalise();
+        assert!(settings.game_token.is_none(), "an empty token stayed a token");
+
+        let mut real: ServerSettings = serde_json::from_str(r#"{"game_token": "s3cret"}"#).unwrap();
+        real.normalise();
+        assert_eq!(real.game_token.as_deref(), Some("s3cret"));
     }
 
     #[test]

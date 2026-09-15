@@ -209,10 +209,7 @@ pub fn spawn(app: tauri::AppHandle) {
             tokio::time::sleep(POLL).await;
             let enabled = {
                 let state = app.state::<AppState>();
-                let config = match state.config.lock() {
-                    Ok(c) => c,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
+                let config = state.config();
                 config.mumblelink_enabled
             };
             if !enabled {
@@ -268,7 +265,14 @@ pub fn spawn(app: tauri::AppHandle) {
                     continue;
                 }
             }
-            apply(&app, link).await;
+            // A game took the mix: let it, and stop feeding positions at it.
+            // `stop_driving` leaves its placements alone, because they are the
+            // game's now.
+            if !apply(&app, link).await {
+                driving = false;
+                last_tick = None;
+                stop_driving(&app).await;
+            }
         }
     });
 }
@@ -277,15 +281,32 @@ pub fn spawn(app: tauri::AppHandle) {
 ///
 /// Returns whether it took: it will not while the user is not connected, and
 /// it will not fight a game that already has the mix.
+/// The name this reader goes by while it drives, in `sdk_game` and in the UI.
+/// The slot is the same one a game's `hello` takes, which is what keeps the two
+/// from writing the listener's position at each other.
+const NAME: &str = "MumbleLink";
+
+/// Does the game SDK's socket own the mix right now?
+fn game_owns_the_mix(state: &tauri::State<'_, AppState>) -> bool {
+    let game = match state.sdk_game.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    game.as_deref().is_some_and(|name| name != NAME)
+}
+
 async fn start_driving(app: &tauri::AppHandle) -> bool {
     let state = app.state::<AppState>();
     let allowed = {
-        let config = match state.config.lock() {
-            Ok(c) => c,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let config = state.config();
         config.sdk_beacon_allowed
     };
+    // One driver at a time. A game in beacon mode leaves `sdk_active` false, so
+    // that flag alone let both of them write the listener's position — and the
+    // other way round, a game taking the mix would not stop this loop.
+    if game_owns_the_mix(&state) {
+        return false;
+    }
     let conn = state.connection.read().await;
     let Some(connection) = conn.as_ref() else {
         return false;
@@ -308,11 +329,16 @@ async fn start_driving(app: &tauri::AppHandle) -> bool {
     if !allowed {
         warn!("MumbleLink is placing you locally; peers will not see you until you allow it");
     }
+    // The same slot a game's `hello` claims, so Settings reports a driver either
+    // way and neither can take the mix from under the other.
+    if let Ok(mut game) = state.sdk_game.lock() {
+        *game = Some(NAME.to_string());
+    }
     let _ = app.emit(
         "sdk-status",
         serde_json::json!({
             "connected": true,
-            "game": "MumbleLink",
+            "game": NAME,
             "resource": "",
             "beacon": allowed,
             "transmit": false,
@@ -325,6 +351,24 @@ async fn start_driving(app: &tauri::AppHandle) -> bool {
 /// Hand the positions back, exactly as a game disconnecting does.
 async fn stop_driving(app: &tauri::AppHandle) {
     let state = app.state::<AppState>();
+    // Only what is still ours. A game that took the mix while this was driving
+    // owns the placements now, and clearing them would silence everybody it has
+    // placed until its next update.
+    let was_ours = {
+        let mut game = match state.sdk_game.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if game.as_deref() == Some(NAME) {
+            *game = None;
+            true
+        } else {
+            false
+        }
+    };
+    if !was_ours {
+        return;
+    }
     {
         let conn = state.connection.read().await;
         if let Some(connection) = conn.as_ref() {
@@ -340,11 +384,20 @@ async fn stop_driving(app: &tauri::AppHandle) {
 }
 
 /// One reading, glided on from the last so 25 Hz does not step.
-async fn apply(app: &tauri::AppHandle, link: Link) {
+async fn apply(app: &tauri::AppHandle, link: Link) -> bool {
     let state = app.state::<AppState>();
+    // A game may have taken the mix since the last tick; from that moment its
+    // `hello` owns the listener, and two writers of one position is a fight
+    // nobody can see the cause of.
+    if game_owns_the_mix(&state) {
+        return false;
+    }
     let conn = state.connection.read().await;
-    let Some(connection) = conn.as_ref() else { return };
+    let Some(connection) = conn.as_ref() else { return false };
     let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+    if spatial.sdk_active {
+        return false;
+    }
     let now = std::time::Instant::now();
     let over = spatial
         .last_update
@@ -369,6 +422,7 @@ async fn apply(app: &tauri::AppHandle, link: Link) {
     spatial.listener = target;
     spatial.listener_motion = Some(motion);
     spatial.dirty = true;
+    true
 }
 
 #[cfg(test)]

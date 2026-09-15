@@ -770,6 +770,13 @@
         addNotification("Audio device restored", "info");
       }),
 
+      // Push-to-talk that only works while the window is focused is the kind of
+      // thing you find out about in a call. Sticky, because it is the setting
+      // they have to change, and it is said once per run.
+      listen<{ reason: string }>("global-keys-unavailable", (event) => {
+        addNotification(`Push-to-talk outside the window: ${event.payload.reason}`, "warning", 0);
+      }),
+
       listen("media-key-missing", () => {
         if (mediaKeyToastId === null) {
           mediaKeyToastId = addNotification(

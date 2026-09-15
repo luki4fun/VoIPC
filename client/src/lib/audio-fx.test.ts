@@ -317,6 +317,51 @@ test("the reverb rings after the speaker stops, then stops itself", () => {
   assert.ok(frames.flat().every((s) => Number.isFinite(s) && Math.abs(s) <= 4), "runaway feedback");
 });
 
+test("a reverb turned back down stops costing anything", () => {
+  // The tail was re-armed by any frame carrying audio, wet or not, so a lane
+  // somebody once put reverb on ran four combs and two allpasses per sample for
+  // the rest of its life. The Rust suite asserts the same rule in
+  // `a_reverb_turned_back_down_stops_costing_anything`.
+  const space = new ReverbWater();
+  const src = Float32Array.from({ length: FRAME }, (_, i) => 0.2 * Math.sin(i * 0.03));
+  for (let f = 0; f < 5; f++) {
+    const buf = Float32Array.from(src);
+    assert.equal(space.applyMono(buf, 0, 8, true), true);
+  }
+  let closed = -1;
+  for (let f = 0; f < 200; f++) {
+    const buf = Float32Array.from(src);
+    // Back at zero, with the speaker still talking — that is the case
+    if (!space.applyMono(buf, 0, 0, true)) {
+      closed = f;
+      break;
+    }
+  }
+  assert.ok(closed >= 0, "a lane with the reverb back at zero never went quiet");
+  const buf = Float32Array.from(src);
+  assert.equal(space.applyMono(buf, 0, 0, true), false);
+  assert.deepEqual([...buf], [...src], "a lane with nothing on is not a bypass");
+  for (const c of space.comb) assert.ok(c.every((s) => s === 0), "a comb kept its tail");
+});
+
+test("underwater alone keeps filtering for ever", () => {
+  // The reverb's tail rule must not wipe the water filters mid-stream: a lane
+  // that is only submerged has no tail, so a shared "wipe when the tail runs
+  // out" would reset its poles on every frame — a click at every frame
+  // boundary, for as long as the lane is underwater.
+  const space = new ReverbWater();
+  const src = Float32Array.from({ length: FRAME }, (_, i) => 0.2 * Math.sin(i * 0.3));
+  let last = new Float32Array(FRAME);
+  for (let f = 0; f < 160; f++) {
+    last = Float32Array.from(src);
+    space.applyMono(last, 8, 0, true);
+  }
+  const energy = last.reduce((a, s) => a + s * s, 0);
+  const dry = src.reduce((a, s) => a + s * s, 0);
+  assert.ok(energy < dry * 0.2, `the water stopped filtering: ${energy} vs ${dry}`);
+  assert.ok(space.uw.some((s) => s !== 0), "the water filters were wiped mid-stream");
+});
+
 test("two fresh lanes sound the same", () => {
   assert.deepEqual(laneThrough(300, 4, 6, 5, 3), laneThrough(300, 4, 6, 5, 3));
 });

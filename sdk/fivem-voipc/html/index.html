@@ -12,6 +12,8 @@
   let hello = null;
   let url = null;
   let reconnect = null;
+  let rehello = null;
+  let talking = false;
 
   const post = (path, body) =>
     fetch(`https://${GetParentResourceName()}/${path}`, {
@@ -41,15 +43,35 @@
       else if (msg.type === "talk" || msg.type === "self" || msg.type === "user") post("talk", msg);
       else if (msg.type === "error") {
         post("error", msg);
-        // Every "say hello again" case says so: a VoIPC reconnect, leaving the
-        // channel, or another socket having taken ownership while we were open
-        if (typeof msg.reason === "string" && msg.reason.includes("hello")) {
-          socket.send(JSON.stringify(hello));
+        // Every "say hello again" case says exactly that: a VoIPC reconnect,
+        // leaving the channel, or another socket having taken ownership while
+        // we were open. Matching plain "hello" also matched VoIPC's *refusals*
+        // of a hello ("one hello per second", "hello needs the channel…"), and
+        // answering those with another hello is a loop at line rate. After the
+        // rate limit, too — one a second is what VoIPC accepts.
+        if (typeof msg.reason === "string" && msg.reason.includes("send hello")) {
+          clearTimeout(rehello);
+          rehello = setTimeout(() => {
+            if (socket && socket.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify(hello));
+            }
+          }, 1100);
+        }
+        // VoIPC lets go of a held push-to-talk after 60 seconds, whatever the
+        // mod believes, so that a crashed one cannot leave a microphone open.
+        // A radio key that is genuinely still down has to say so again, or a
+        // long transmission is cut in the middle and stays cut until the
+        // player releases the key and presses it a second time.
+        if (talking && typeof msg.reason === "string" && msg.reason.includes("released after 60s")) {
+          socket.send(JSON.stringify({ type: "transmit", on: true }));
         }
       }
     };
     socket.onclose = () => {
       socket = null;
+      // Whatever VoIPC was holding for us went with the socket; the next
+      // `transmit` from Lua is what opens the microphone again.
+      talking = false;
       // The player may not have enabled the integration yet, or VoIPC may be
       // closed: keep trying quietly for as long as the resource runs.
       if (hello) reconnect = setTimeout(open, 2000);
@@ -71,12 +93,15 @@
       // The radio key holding the player's push-to-talk. VoIPC refuses this
       // unless they allowed it in Settings, and answers with an error saying
       // so, which lands in the resource log like any other.
+      talking = !!data.on;
       if (socket && socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: "transmit", on: !!data.on }));
+        socket.send(JSON.stringify({ type: "transmit", on: talking }));
       }
     } else if (data.type === "bye") {
       hello = null;
+      talking = false;
       clearTimeout(reconnect);
+      clearTimeout(rehello);
       if (socket && socket.readyState === WebSocket.OPEN) {
         socket.send(JSON.stringify({ type: "bye" }));
         socket.close();

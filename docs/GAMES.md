@@ -47,6 +47,11 @@ pma-voice and SaltyChat answer, and translate them to VoIPC's. ESX, QBCore, Qbox
 and the ox resources are not integrations of their own — they call one of those
 two — so the pair covers all of them at once.
 
+They inherit pma-voice's trust model along with its export names: a client may
+set its own call channel there, and call ids are guessable. `Config.canJoinCall`
+in `sdk/fivem-voipc/config.lua` is the hook that closes that if you want it
+closed; radio channels are gated on both paths already.
+
 **Game natives cannot be shimmed.** A script that calls Mumble directly is
 talking to the game's own voice stack, not to a resource, and no Lua can stand
 in front of that. Find them before you switch:

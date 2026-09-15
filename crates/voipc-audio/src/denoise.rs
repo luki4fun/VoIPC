@@ -29,10 +29,6 @@ impl Denoiser {
         self.enabled = enabled;
     }
 
-    pub fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-
     /// Process audio samples in-place. Samples are f32 in [-1.0, 1.0].
     /// Handles any buffer size by processing in 480-sample chunks.
     /// Leftover samples (< 480) are processed by zero-padding.

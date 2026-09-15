@@ -282,16 +282,26 @@ export class ReverbWater {
     // nothing switched on is the common case and there is one of these per
     // talker, so the bypass path must not wipe 22 kB per lane per frame.
     this.dirty = false;
+    // Whether the comb bank has been fed since it was last wiped. Separate
+    // from `dirty`, because a lane that is only underwater keeps filtering
+    // while its bank sits idle.
+    this.bankLive = false;
   }
 
-  clear() {
+  /** Forget the comb bank, which is where a reverb tail lives. */
+  clearBank() {
     for (const c of this.comb) c.fill(0);
     for (const a of this.allpass) a.fill(0);
     this.combI = [0, 0, 0, 0];
     this.apI = [0, 0];
     this.damp = [0, 0, 0, 0];
-    this.uw = [0, 0, 0, 0];
     this.tail = 0;
+    this.bankLive = false;
+  }
+
+  clear() {
+    this.clearBank();
+    this.uw = [0, 0, 0, 0];
     this.dirty = false;
   }
 
@@ -336,6 +346,14 @@ export class ReverbWater {
     const stepWet = (wetT - this.wet) / n;
     let gain = this.gain;
     let wet = this.wet;
+    // The send this frame starts at, so a wet path ramping down to zero still
+    // counts while it is audible.
+    const wasWet = this.wet;
+    // With no wet path and nothing still ringing, the bank's output is
+    // multiplied by zero: skip it rather than feed it. Mirrors `run_reverb` in
+    // crates/voipc-audio/src/mixer.rs.
+    const runReverb = wetT > 0 || wasWet > 0 || this.tail > 0;
+    if (!runReverb && this.bankLive) this.clearBank();
 
     for (let i = 0; i < n; i++) {
       const lIn = left[i];
@@ -347,22 +365,24 @@ export class ReverbWater {
       const l = (a >= 1 ? lIn : this.uw[1]) * gain;
       const rr = (a >= 1 ? rIn : this.uw[3]) * gain;
 
-      const mono = 0.5 * (l + rr) * revIn;
       let w = 0;
-      for (let k = 0; k < 4; k++) {
-        const buf = this.comb[k];
-        const y = buf[this.combI[k]];
-        this.damp[k] += dampA * (y - this.damp[k]);
-        buf[this.combI[k]] = mono + this.damp[k] * fb;
-        this.combI[k] = (this.combI[k] + 1) % buf.length;
-        w += y;
-      }
-      for (let k = 0; k < 2; k++) {
-        const buf = this.allpass[k];
-        const b = buf[this.apI[k]];
-        buf[this.apI[k]] = w + b * 0.5;
-        this.apI[k] = (this.apI[k] + 1) % buf.length;
-        w = b - w;
+      if (runReverb) {
+        const mono = 0.5 * (l + rr) * revIn;
+        for (let k = 0; k < 4; k++) {
+          const buf = this.comb[k];
+          const y = buf[this.combI[k]];
+          this.damp[k] += dampA * (y - this.damp[k]);
+          buf[this.combI[k]] = mono + this.damp[k] * fb;
+          this.combI[k] = (this.combI[k] + 1) % buf.length;
+          w += y;
+        }
+        for (let k = 0; k < 2; k++) {
+          const buf = this.allpass[k];
+          const b = buf[this.apI[k]];
+          buf[this.apI[k]] = w + b * 0.5;
+          this.apI[k] = (this.apI[k] + 1) % buf.length;
+          w = b - w;
+        }
       }
 
       left[i] = l + w * wet;
@@ -374,12 +394,19 @@ export class ReverbWater {
     this.gain = gainT;
     this.wet = wetT;
     this.dirty = true;
-    this.tail = hadInput ? REVERB_TAIL_FRAMES : Math.max(0, this.tail - 1);
+    this.bankLive = this.bankLive || runReverb;
+    // Input counts as *reverb* input only while there is a wet path to put it
+    // into, or a lane somebody once put reverb on would re-arm its tail on
+    // every frame and never go quiet again.
+    this.tail =
+      hadInput && (wetT > 0 || wasWet > 0) ? REVERB_TAIL_FRAMES : Math.max(0, this.tail - 1);
     // "Still audible" is the tail alone, never the settings: a lane with the
     // reverb turned up is *configured* to ring, but a bank fed nothing for
     // REVERB_TAIL_FRAMES has nothing left in it. Zero the lines on the way
-    // out, so the next voice starts in an empty room. Mirrors `reverb_water`.
-    if (this.tail === 0) this.clear();
+    // out, so the next voice starts in an empty room — though not while audio
+    // is still flowing through the water, where wiping the filters mid-stream
+    // would be a click on every frame. Mirrors `reverb_water`.
+    if (this.tail === 0 && (!hadInput || (wetT === 0 && a >= 1))) this.clear();
     return this.tail > 0;
   }
 }
@@ -710,15 +737,25 @@ class MixerProcessor extends AudioWorkletProcessor {
       const r = drained ? null : src.jitter.pop();
       if (r === null || r === LOST) {
         if (r === LOST) this.framesLost++; // ponytail: silence instead of FEC/PLC
-        const owed = fxStop(src.fx, fx, drained);
+        // A lost packet is not a pause: the speaker is still talking, we simply
+        // did not receive that frame. Counting it as idle closed a radio's
+        // squelch a fifth of a second into a loss burst and opened it again on
+        // the next packet that arrived, so a listener heard two bursts in the
+        // middle of a sentence that a desktop listener hears whole.
+        const owed = r === LOST ? src.fx.burst : fxStop(src.fx, fx, drained);
+        if (r === LOST) src.fx.level = 0;
         if (this.deafened) {
           src.fx.burst = 0; // deafened drops the burst rather than owing it
           src.fx.level = 0;
           continue;
         }
         // A reverb tail outlives the voice that caused it, so the lane's room
-        // keeps running here even with nothing left to play.
-        if (owed > 0 || room[0] > 0 || room[1] > 0 || src.room.tail > 0) {
+        // keeps running here even with nothing left to play — the *tail*, never
+        // the settings. A lane sitting at reverb 6 with nobody talking has an
+        // empty bank, and asking the settings ran four combs and a 27 kB wipe
+        // per lane per frame for as long as the source lived. Same rule as
+        // `SourceChain::stop` in crates/voipc-audio/src/mixer.rs.
+        if (owed > 0 || src.room.tail > 0) {
           const tail = this.laneScratch;
           tail.fill(0);
           for (let i = 0; i < Math.min(owed, FRAME); i++) {

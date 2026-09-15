@@ -672,14 +672,11 @@ pub(crate) async fn sdk_set_transmit(
     on: bool,
 ) -> Result<(), String> {
     state.ptt_sdk.store(on, Ordering::Relaxed);
-    let _ = app_handle.emit(
-        if on {
-            "ptt-global-pressed"
-        } else {
-            "ptt-global-released"
-        },
-        (),
-    );
+    // Deliberately *not* `ptt-global-pressed`/`-released`: those two are the
+    // user's own key, and the UI stops its capture only while it believes it is
+    // transmitting. A game's release firing them made the UI forget a key the
+    // user was still holding, so their own release stopped nothing — a hot mic
+    // out of a mod merely connecting. `sdk-transmit` is the game's indicator.
     let _ = app_handle.emit("sdk-transmit", serde_json::json!({ "held": on }));
     if on {
         start_capture(state, app_handle).await
@@ -903,7 +900,7 @@ pub async fn set_ptt_key(
 
     // Persist to config
     {
-        let mut config = state.config.lock().unwrap();
+        let mut config = state.config();
         config.ptt_key = key_code.clone();
         if let Err(e) = crate::config::save_config(&config) {
             tracing::warn!("Failed to save config: {e}");
@@ -933,7 +930,7 @@ fn set_toggle_key(
 #[tauri::command]
 pub fn set_mute_key(state: State<'_, AppState>, key_code: String) -> Result<(), String> {
     let stored = set_toggle_key(&state.mute_binding, &key_code)?;
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config();
     config.mute_key = stored;
     if let Err(e) = crate::config::save_config(&config) {
         tracing::warn!("Failed to save config: {e}");
@@ -949,7 +946,7 @@ pub fn set_chat_history_disabled(
     state: State<'_, AppState>,
     disabled: bool,
 ) -> Result<(), String> {
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config();
     config.chat_history_disabled = disabled;
     crate::config::save_config(&config)
 }
@@ -958,7 +955,7 @@ pub fn set_chat_history_disabled(
 #[tauri::command]
 pub fn set_deafen_key(state: State<'_, AppState>, key_code: String) -> Result<(), String> {
     let stored = set_toggle_key(&state.deafen_binding, &key_code)?;
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config();
     config.deafen_key = stored;
     if let Err(e) = crate::config::save_config(&config) {
         tracing::warn!("Failed to save config: {e}");
@@ -976,7 +973,7 @@ pub async fn set_ptt_hold_mode(
 ) -> Result<(), String> {
     state.ptt_hold_mode.store(hold_mode, Ordering::Relaxed);
     {
-        let mut config = state.config.lock().unwrap();
+        let mut config = state.config();
         config.ptt_hold_mode = hold_mode;
         if let Err(e) = crate::config::save_config(&config) {
             tracing::warn!("Failed to save config: {e}");
@@ -1009,7 +1006,7 @@ pub async fn toggle_mute(state: State<'_, AppState>) -> Result<bool, String> {
         .await;
         // Persist
         {
-            let mut config = state.config.lock().unwrap();
+            let mut config = state.config();
             config.muted = new_muted;
             if let Err(e) = crate::config::save_config(&config) {
                 tracing::warn!("Failed to save config: {e}");
@@ -1042,7 +1039,7 @@ pub async fn toggle_deafen(state: State<'_, AppState>) -> Result<bool, String> {
         .await;
         // Persist
         {
-            let mut config = state.config.lock().unwrap();
+            let mut config = state.config();
             config.deafened = new_deafened;
             if let Err(e) = crate::config::save_config(&config) {
                 tracing::warn!("Failed to save config: {e}");
@@ -1102,7 +1099,7 @@ pub async fn set_input_device(
     settings.input_device = Some(device_name.clone());
     drop(settings);
     {
-        let mut config = state.config.lock().unwrap();
+        let mut config = state.config();
         config.input_device = Some(device_name);
         if let Err(e) = crate::config::save_config(&config) {
             tracing::warn!("Failed to save config: {e}");
@@ -1122,7 +1119,7 @@ pub async fn set_output_device(
     settings.output_device = Some(device_name.clone());
     drop(settings);
     {
-        let mut config = state.config.lock().unwrap();
+        let mut config = state.config();
         config.output_device = Some(device_name.clone());
         if let Err(e) = crate::config::save_config(&config) {
             tracing::warn!("Failed to save config: {e}");
@@ -1149,7 +1146,7 @@ pub async fn set_volume(
     settings.volume = clamped;
     drop(settings);
     {
-        let mut config = state.config.lock().unwrap();
+        let mut config = state.config();
         config.volume = clamped;
         if let Err(e) = crate::config::save_config(&config) {
             tracing::warn!("Failed to save config: {e}");
@@ -1181,7 +1178,7 @@ pub async fn get_voice_stats(state: State<'_, AppState>) -> Result<(u32, u32), S
 pub fn set_input_gain(state: State<'_, AppState>, gain: f32) -> Result<(), String> {
     let clamped = gain.clamp(0.0, 4.0);
     state.input_gain.store(clamped.to_bits(), Ordering::Relaxed);
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config();
     config.input_gain = clamped;
     if let Err(e) = crate::config::save_config(&config) {
         tracing::warn!("Failed to save config: {e}");
@@ -1254,7 +1251,7 @@ pub async fn start_screen_share(
         // Fixed for the life of this share: viewers are told this codec when
         // they start watching, and a source switch keeps encoding in it.
         let codec = crate::app_state::share_codec_from_str(
-            &state.config.lock().unwrap().screen_share_codec,
+            &state.config().screen_share_codec,
         );
         connection.screen_share_codec = codec;
 
@@ -1338,21 +1335,6 @@ pub async fn stop_watching_screen_share(state: State<'_, AppState>) -> Result<()
     connection.watching_user_id = None;
     connection.watching_user_id_shared.store(0, Ordering::Relaxed);
     Ok(())
-}
-
-/// Request a keyframe from a sharer (e.g. after packet loss).
-#[tauri::command]
-pub async fn request_keyframe(
-    state: State<'_, AppState>,
-    sharer_user_id: u32,
-) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
-    network::send_tcp_message(
-        &connection.tcp_tx,
-        &ClientMessage::RequestKeyframe { sharer_user_id },
-    )
-    .await
 }
 
 /// Toggle screen share audio on/off. Returns the new enabled state.
@@ -1597,7 +1579,7 @@ pub async fn set_screen_share_codec(state: State<'_, AppState>, codec: String) -
     if codec != "h264" && codec != "h265" {
         return Err(format!("unknown screen share codec: {codec}"));
     }
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config();
     config.screen_share_codec = codec;
     if let Err(e) = crate::config::save_config(&config) {
         tracing::warn!("Failed to save config: {e}");
@@ -1627,7 +1609,7 @@ pub async fn set_voice_mode(state: State<'_, AppState>, mode: String) -> Result<
         settings.voice_mode = mode.clone();
     }
     {
-        let mut config = state.config.lock().unwrap();
+        let mut config = state.config();
         config.voice_mode = mode.clone();
         if let Err(e) = crate::config::save_config(&config) {
             tracing::warn!("Failed to save config: {e}");
@@ -1651,7 +1633,7 @@ pub async fn set_vad_threshold(state: State<'_, AppState>, threshold_db: f32) ->
         settings.vad_threshold_db = threshold_db;
     }
     {
-        let mut config = state.config.lock().unwrap();
+        let mut config = state.config();
         config.vad_threshold_db = threshold_db;
         if let Err(e) = crate::config::save_config(&config) {
             tracing::warn!("Failed to save config: {e}");
@@ -1752,7 +1734,12 @@ pub async fn start_mic_test(
                     }
                 }
             }
-            let mut fx_state = voipc_audio::mixer::SourceMixState::default();
+            // The whole lane, not just its effect: the same `SourceChain` the
+            // capture task renders our voice through, so the audition answers
+            // "what will they hear" rather than "what would they hear if the
+            // muffle, the reverb and the water were off".
+            let mut mic_chain = voipc_audio::mixer::SourceChain::default();
+            let mut mono: Vec<f32> = Vec::new();
             let mut scratch: Vec<f32> = Vec::new();
 
             let mut buf = vec![0.0f32; 2400]; // 50ms at 48kHz
@@ -1766,24 +1753,41 @@ pub async fn start_mic_test(
                     let _ = app.emit("mic-test-level", serde_json::json!({"db": db}));
 
                     if let Some((_, producer)) = monitoring.as_mut() {
-                        // The same chain the capture task runs, so what you
-                        // hear here is what the channel will hear
+                        // The same chain, in the same order, with the same four
+                        // controls the capture task reads out of `sender_lane`
                         let packed = sender_lane.load(Ordering::Relaxed);
                         let fx =
                             voipc_audio::spatial::Effect::from_u8((packed & 0xff) as u8);
+                        let muffle = ((packed >> 8) & 0xff) as u8;
+                        mono.clear();
+                        mono.extend_from_slice(&buf[..read]);
+                        mic_chain.render_mono(
+                            &mut mono,
+                            fx,
+                            if muffle > 0 {
+                                voipc_audio::spatial::muffle_lp_a(muffle)
+                            } else {
+                                1.0
+                            },
+                            ((packed >> 24) & 0xff) as u8,
+                            ((packed >> 16) & 0xff) as u8,
+                        );
                         scratch.clear();
                         scratch.resize(read * 2, 0.0);
-                        voipc_audio::mixer::mix_source_fx(
-                            &mut scratch,
-                            &buf[..read],
-                            &mut fx_state,
-                            (1.0, 1.0),
-                            1.0,
-                            fx,
-                        );
+                        for (i, &s) in mono.iter().enumerate() {
+                            scratch[2 * i] = s;
+                            scratch[2 * i + 1] = s;
+                        }
                         voipc_audio::mixer::clamp(&mut scratch);
                         producer.push_slice(&scratch);
                     }
+                } else if monitoring.is_some() {
+                    // Nothing captured: close the transmission so a radio
+                    // squelches shut and opens again on the next word, exactly
+                    // as the capture task does when the gate closes.
+                    let packed = sender_lane.load(Ordering::Relaxed);
+                    let fx = voipc_audio::spatial::Effect::from_u8((packed & 0xff) as u8);
+                    mic_chain.stop(&mut [], fx, true, 0, 0);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(50));
             }
@@ -1911,7 +1915,7 @@ pub async fn set_audio_setup_version(
     state: State<'_, AppState>,
     version: u32,
 ) -> Result<(), String> {
-    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    let mut config = state.config();
     config.audio_setup_version = version;
     crate::config::save_config(&config)
 }
@@ -1935,7 +1939,7 @@ pub async fn toggle_noise_suppression(state: State<'_, AppState>) -> Result<bool
         settings.noise_suppression = new_val;
     }
     {
-        let mut config = state.config.lock().unwrap();
+        let mut config = state.config();
         config.noise_suppression = new_val;
         if let Err(e) = crate::config::save_config(&config) {
             tracing::warn!("Failed to save config: {e}");
@@ -2067,7 +2071,7 @@ pub async fn set_mic_fx(
         settings.mic_reverb = lane.reverb;
         settings.mic_water = lane.water;
     }
-    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    let mut config = state.config();
     config.mic_effect = effect;
     config.mic_muffle = lane.muffle;
     config.mic_reverb = lane.reverb;
@@ -2247,7 +2251,7 @@ pub async fn set_spatial_setting(
         }
     }
 
-    let mut config = state.config.lock().map_err(|e| e.to_string())?;
+    let mut config = state.config();
     match key.as_str() {
         "spatial_audio" => config.spatial_audio = value,
         _ => config.screen_audio_spatial = value,
@@ -2272,7 +2276,7 @@ pub async fn get_sdk_status(state: State<'_, AppState>) -> Result<serde_json::Va
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .clone();
-    let config = state.config.lock().map_err(|e| e.to_string())?;
+    let config = state.config();
     Ok(serde_json::json!({
         "available": cfg!(not(target_os = "android")),
         "enabled": config.sdk_enabled,
@@ -2293,6 +2297,7 @@ pub async fn get_sdk_status(state: State<'_, AppState>) -> Result<serde_json::Va
 #[tauri::command]
 pub async fn set_sdk_config(
     state: State<'_, AppState>,
+    app: tauri::AppHandle,
     enabled: Option<bool>,
     port: Option<u16>,
     origins: Option<Vec<String>>,
@@ -2305,33 +2310,58 @@ pub async fn set_sdk_config(
             return Err("port must be 1024 or above".into());
         }
     }
-    let mut config = state.config.lock().map_err(|e| e.to_string())?;
-    if let Some(enabled) = enabled {
-        config.sdk_enabled = enabled;
+    // The guard is dropped before the revocations below: they await, and the
+    // config mutex is a std one that the SDK socket takes every frame.
+    {
+        let mut config = state.config();
+        if let Some(enabled) = enabled {
+            config.sdk_enabled = enabled;
+        }
+        if let Some(port) = port {
+            config.sdk_port = port;
+        }
+        if let Some(origins) = origins {
+            config.sdk_allowed_origins = origins
+                .into_iter()
+                .map(|o| o.trim().to_string())
+                .filter(|o| !o.is_empty())
+                .collect();
+        }
+        // The two things a game may do *to* the user rather than for them.
+        // Both off by default.
+        if let Some(v) = beacon_allowed {
+            config.sdk_beacon_allowed = v;
+        }
+        if let Some(v) = transmit_allowed {
+            config.sdk_transmit_allowed = v;
+        }
+        if let Some(v) = mumblelink {
+            config.mumblelink_enabled = v;
+        }
+        crate::config::save_config(&config)?;
     }
-    if let Some(port) = port {
-        config.sdk_port = port;
+
+    // Taking consent back has to act on what is happening *now*, not on the
+    // next thing the game asks for. Both switches were read fresh per request,
+    // which meant a held microphone stayed open for up to a minute and a beacon
+    // kept broadcasting until the socket died — a revocation the user cannot
+    // see the effect of is not a revocation.
+    if transmit_allowed == Some(false) {
+        let _ = sdk_set_transmit(&state, app, false).await;
     }
-    if let Some(origins) = origins {
-        config.sdk_allowed_origins = origins
-            .into_iter()
-            .map(|o| o.trim().to_string())
-            .filter(|o| !o.is_empty())
-            .collect();
+    if beacon_allowed == Some(false) {
+        let conn = state.connection.read().await;
+        if let Some(connection) = conn.as_ref() {
+            let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+            if spatial.beacon {
+                // The game keeps placing the listener locally; nothing leaves
+                // the machine any more. Their own switch decides again, which
+                // is what `clear_positions` would have restored anyway.
+                spatial.sync = spatial.user_sync;
+            }
+        }
     }
-    // The two things a game may do *to* the user rather than for them. Both
-    // off by default, and both read fresh on every request, so switching one
-    // off takes effect on the next frame rather than the next connection.
-    if let Some(v) = beacon_allowed {
-        config.sdk_beacon_allowed = v;
-    }
-    if let Some(v) = transmit_allowed {
-        config.sdk_transmit_allowed = v;
-    }
-    if let Some(v) = mumblelink {
-        config.mumblelink_enabled = v;
-    }
-    crate::config::save_config(&config)
+    Ok(())
 }
 
 /// Forget every placement (room reset, or a game disconnecting).
@@ -2420,7 +2450,7 @@ pub struct ChatHistoryStatus {
 pub async fn get_chat_history_status(
     state: State<'_, AppState>,
 ) -> Result<ChatHistoryStatus, String> {
-    let config = state.config.lock().unwrap().clone();
+    let config = state.config().clone();
     let path_configured = config.chat_history_path.is_some();
     let file_path = crate::config::resolve_chat_history_path(&config);
 
@@ -2518,7 +2548,7 @@ pub async fn set_chat_history_path(
 
     // Persist to config
     {
-        let mut config = state.config.lock().unwrap();
+        let mut config = state.config();
         config.chat_history_path = Some(full_path_str.clone());
         crate::config::save_config(&config)
             .map_err(|e| format!("Failed to save config: {e}"))?;
@@ -2557,7 +2587,7 @@ pub async fn delete_chat_history(
 
     // Clear the configured path so user is prompted fresh
     {
-        let mut config = state.config.lock().unwrap();
+        let mut config = state.config();
         config.chat_history_path = None;
         if let Err(e) = crate::config::save_config(&config) {
             tracing::warn!("Failed to save config: {e}");
@@ -2701,53 +2731,6 @@ pub async fn clear_chat_history(state: State<'_, AppState>) -> Result<(), String
 // E2E Encryption commands
 // ---------------------------------------------------------------------------
 
-/// Request another user's pre-key bundle for establishing an encrypted session.
-#[tauri::command]
-pub async fn request_prekey_bundle(
-    state: State<'_, AppState>,
-    target_user_id: u32,
-) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
-    network::send_tcp_message(
-        &connection.tcp_tx,
-        &ClientMessage::RequestPreKeyBundle { target_user_id },
-    )
-    .await
-}
-
-/// Send an encrypted direct message to another user.
-/// Encrypts the plaintext using the pairwise Signal session, then sends ciphertext.
-#[tauri::command]
-pub async fn send_encrypted_direct_message(
-    state: State<'_, AppState>,
-    target_user_id: u32,
-    content: String,
-) -> Result<(), String> {
-    // Encrypt with Signal Protocol pairwise session.
-    // Use block_in_place because libsignal store traits are !Send.
-    let (ciphertext, message_type) = tokio::task::block_in_place(|| {
-        let mut signal = state.signal.lock().map_err(|e| e.to_string())?;
-        let stores = signal.stores.as_mut().ok_or("E2E encryption not initialized".to_string())?;
-        tokio::runtime::Handle::current().block_on(
-            voipc_crypto::session::encrypt_message(stores, target_user_id, content.as_bytes()),
-        )
-        .map_err(|e| format!("encryption failed: {e}"))
-    })?;
-
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
-    network::send_tcp_message(
-        &connection.tcp_tx,
-        &ClientMessage::SendEncryptedDirectMessage {
-            target_user_id,
-            ciphertext,
-            message_type,
-        },
-    )
-    .await
-}
-
 /// Hand recent channel chat to a newcomer: JSON `{ v, messages }` encrypted
 /// with the pairwise Signal session (the frontend picked and trimmed the
 /// messages; the server relays the ciphertext blind).
@@ -2841,77 +2824,11 @@ pub async fn admin_list_bans(state: State<'_, AppState>) -> Result<(), String> {
     send_admin_message(&state, ClientMessage::AdminListBans).await
 }
 
-/// Send an encrypted channel message using Sender Keys.
-/// Encrypts the plaintext using the channel's sender key, then sends ciphertext.
-#[tauri::command]
-pub async fn send_encrypted_channel_message(
-    state: State<'_, AppState>,
-    content: String,
-) -> Result<(), String> {
-    let user_id = {
-        let conn = state.connection.read().await;
-        let connection = conn.as_ref().ok_or("Not connected")?;
-        connection.user_id
-    };
-
-    let channel_id = {
-        let conn = state.connection.read().await;
-        let connection = conn.as_ref().ok_or("Not connected")?;
-        connection.current_channel_id.load(std::sync::atomic::Ordering::Relaxed)
-    };
-
-    if channel_id == 0 {
-        return Err("Chat is not available in the lobby".into());
-    }
-
-    // Encrypt with Sender Key.
-    // Use block_in_place because libsignal store traits are !Send.
-    let ciphertext = tokio::task::block_in_place(|| {
-        let mut signal = state.signal.lock().map_err(|e| e.to_string())?;
-        let stores = signal
-            .stores
-            .as_mut()
-            .ok_or("E2E encryption not initialized".to_string())?;
-        tokio::runtime::Handle::current().block_on(
-            voipc_crypto::group::encrypt_group_message(
-                stores,
-                user_id,
-                channel_id,
-                content.as_bytes(),
-            ),
-        )
-        .map_err(|e| format!("group encryption failed: {e}"))
-    })?;
-
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
-    network::send_tcp_message(
-        &connection.tcp_tx,
-        &ClientMessage::SendEncryptedChannelMessage { ciphertext },
-    )
-    .await
-}
-
 /// Forget the TOFU-pinned certificate of a server (after a legitimate
 /// certificate rotation). Returns whether a pin existed.
 #[tauri::command]
 pub fn forget_server_pin(host: String, port: u16) -> bool {
     crate::transport::tofu_forget(&host, port)
-}
-
-/// Upload replenished one-time pre-keys to the server.
-#[tauri::command]
-pub async fn upload_prekeys(
-    state: State<'_, AppState>,
-    prekeys: Vec<voipc_protocol::types::OneTimePreKey>,
-) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
-    network::send_tcp_message(
-        &connection.tcp_tx,
-        &ClientMessage::UploadPreKeys { prekeys },
-    )
-    .await
 }
 
 /// Flush dirty chat state to disk. Called by the background task and on exit.
@@ -2943,7 +2860,7 @@ pub async fn flush_chat_to_disk(state: &AppState) {
 /// Return the full persisted config to the frontend (called once on init).
 #[tauri::command]
 pub fn load_config(state: State<'_, AppState>) -> crate::config::AppConfig {
-    state.config.lock().unwrap().clone()
+    state.config().clone()
 }
 
 /// Save connection details for pre-filling on next launch.
@@ -2956,7 +2873,7 @@ pub fn save_connection_info(
     accept_self_signed: bool,
     remember: bool,
 ) -> Result<(), String> {
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config();
     config.remember_connection = remember;
     if remember {
         config.last_host = Some(host);
@@ -2983,7 +2900,7 @@ pub fn save_server(
     username: String,
     accept_self_signed: bool,
 ) -> Result<Vec<crate::config::SavedServer>, String> {
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config();
     let entry = crate::config::SavedServer {
         name,
         host,
@@ -3011,7 +2928,7 @@ pub fn remove_server(
     host: String,
     port: u16,
 ) -> Result<Vec<crate::config::SavedServer>, String> {
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config();
     config
         .saved_servers
         .retain(|s| !(s.host == host && s.port == port));
@@ -3040,7 +2957,7 @@ pub async fn reset_config(state: State<'_, AppState>) -> Result<(), String> {
 
     // Reset config
     {
-        let mut config = state.config.lock().unwrap();
+        let mut config = state.config();
         *config = default_config;
     }
     crate::config::delete_config();
@@ -3115,7 +3032,7 @@ pub fn play_notification_sound(
     state: State<'_, AppState>,
     name: String,
 ) -> Result<(), String> {
-    let config = state.config.lock().unwrap();
+    let config = state.config();
     let entry = match name.as_str() {
         "channel_switch" => &config.sounds.channel_switch,
         "user_joined" => &config.sounds.user_joined,
@@ -3169,7 +3086,7 @@ pub fn set_sound_settings(
     state: State<'_, AppState>,
     settings: crate::config::SoundSettings,
 ) -> Result<(), String> {
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config();
     config.sounds = settings;
     crate::config::save_config(&config)
 }
@@ -3189,7 +3106,7 @@ pub fn set_config_bool(
     key: String,
     value: bool,
 ) -> Result<(), String> {
-    let mut config = state.config.lock().unwrap();
+    let mut config = state.config();
     match key.as_str() {
         "auto_connect" => config.auto_connect = value,
         "remember_connection" => config.remember_connection = value,

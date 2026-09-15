@@ -83,7 +83,6 @@ export interface AudioApi {
   getSourceLevels(): Record<number, number>;
   /** Our own microphone's lane — the same four controls, and everyone hears it. */
   setMicFx(effect: string, muffle: number, reverb: number, water: number): void;
-  getMicFx(): [string, number, number, number];
   setUserPosition(
     userId: number,
     pos: [number, number, number] | null,

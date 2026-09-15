@@ -29,14 +29,49 @@ local calls = {}
 --- serverId -> the call id they are in, so leaving is one lookup.
 local callOf = {}
 
+--- Set while a republish is already on its way, so a burst of registrations is
+--- one replication rather than one each. `GlobalState` goes to every client,
+--- and a client may trigger `voipc:register` as often as it likes.
+local rosterQueued = false
+
 local function publishRoster()
-  -- Replicated to every client regardless of scope, which is the whole point.
-  local roster = {}
-  for serverId, id in pairs(voipcOf) do
-    roster[tostring(serverId)] = id
-  end
-  GlobalState.voipc = roster
+  if rosterQueued then return end
+  rosterQueued = true
+  SetTimeout(250, function()
+    rosterQueued = false
+    -- Replicated to every client regardless of scope, which is the whole point.
+    local roster = {}
+    for serverId, id in pairs(voipcOf) do
+      roster[tostring(serverId)] = id
+    end
+    GlobalState.voipc = roster
+  end)
 end
+
+-- ── Letting a player into the voice channel ──────────────────────────────
+--
+-- The channel is hidden and password-protected on the VoIPC server, and the
+-- password lives in `server_config.lua` — a file no player downloads. A client
+-- asks for it when its bridge page comes up; this decides whether that player
+-- gets it.
+
+--- serverId -> when we last answered them, so a client cannot ask in a loop.
+local lastJoinAsk = {}
+local JOIN_ASK_GAP = 5000
+
+RegisterNetEvent("voipc:join", function()
+  local src = source
+  local now = GetGameTimer()
+  if lastJoinAsk[src] and now - lastJoinAsk[src] < JOIN_ASK_GAP then
+    return
+  end
+  lastJoinAsk[src] = now
+  if not ServerConfig.mayUseVoice(src) then
+    TriggerClientEvent("voipc:error", src, "you are not allowed in the voice channel")
+    return
+  end
+  TriggerClientEvent("voipc:join", src, ServerConfig.channelPassword)
+end)
 
 -- ── Who is who ───────────────────────────────────────────────────────────
 
@@ -56,7 +91,10 @@ RegisterNetEvent("voipc:register", function(userId)
     return
   end
   local previous = voipcOf[src]
-  if previous and previous ~= userId then
+  if previous == userId then
+    return -- already registered; a client may send this as often as it likes
+  end
+  if previous then
     serverOf[previous] = nil
   end
   voipcOf[src] = userId
@@ -217,6 +255,19 @@ exports("setPlayerCallChannel", function(src, id)
   setCallChannel(src, id)
 end)
 
+--- The same, for a *client* asking on its own behalf — which is what
+--- pma-voice's `setCallChannel` export is, so the shim needs it. A call id is
+--- guessable, so this one goes through `Config.canJoinCall`; the server-side
+--- export above does not, because your own resource already decided.
+exports("clientJoinCall", function(src, id)
+  if id ~= nil and not Config.canJoinCall(src, id) then
+    TriggerClientEvent("voipc:error", src, "you may not join that call")
+    return false
+  end
+  setCallChannel(src, id)
+  return true
+end)
+
 exports("getPlayersInCall", function(id)
   local out = {}
   for src in pairs(calls[id] or {}) do
@@ -238,6 +289,7 @@ end)
 
 AddEventHandler("playerDropped", function()
   local src = source
+  lastJoinAsk[src] = nil
   setRadioChannel(src, nil)
   setCallChannel(src, nil)
   local id = voipcOf[src]

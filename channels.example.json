@@ -18,6 +18,7 @@
     "name": "Ingame",
     "description": "Driven by the game SDK — see docs/SDK.md",
     "proximity": "3d",
+    "password": "change-me-and-keep-it-on-the-game-server",
     "hidden": true,
     "anonymous": true,
     "screen_share": false,

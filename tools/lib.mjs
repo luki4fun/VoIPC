@@ -233,13 +233,16 @@ export function writeTempConfig(config) {
   return { file, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
-// ffmpeg-next 8.1 (see Cargo.lock) targets FFmpeg 8.x / libavcodec 62. Do not
-// point a build at a 9.x tree without bumping the crate first: the generated
-// bindings do not compile, and the error arrives as a screenful of C ten
-// minutes into a build, naming nothing that leads back to here. This is not
-// hypothetical — vcpkg tracks FFmpeg head and moved its port to 9.0 in August
-// 2026, which is what silently broke both the Windows CI job and `setup.ps1`.
-export const EXPECTED_AVCODEC_MAJOR = '62';
+// The newest FFmpeg the pinned ffmpeg-next knows: 9.0 (see Cargo.lock) tops out
+// at FFmpeg 9.x / libavcodec 63. Older trees are fine — the crate compiles its
+// newer APIs out, which is how one build serves this machine, an Ubuntu runner
+// on 6.1 and the Windows prebuilt on 8.1. A *newer* one is not: its enums grow
+// variants the crate's exhaustive matches do not cover, and the error arrives
+// as a screenful of C minutes into a build, naming nothing that leads back to
+// here. That is not hypothetical — vcpkg tracks FFmpeg head, and Arch moved to
+// 9.0 in September 2026, which is what silently broke `npm run build` here and
+// the Windows CI job before that.
+export const MAX_AVCODEC_MAJOR = '63';
 
 /** LIBAVCODEC_VERSION_MAJOR from an FFmpeg tree's headers, or null. */
 export function avcodecMajor(dir) {
@@ -272,13 +275,13 @@ export function checkFfmpegAbi(dir, hint) {
       'mixed downloads? Delete that directory and install FFmpeg again.');
   }
 
-  if (headerMajor !== EXPECTED_AVCODEC_MAJOR) {
+  if (Number(headerMajor) > Number(MAX_AVCODEC_MAJOR)) {
     fail(`FFmpeg in ${dir} is libavcodec ${headerMajor};`,
-      `ffmpeg-next 8.1 needs ${EXPECTED_AVCODEC_MAJOR} (FFmpeg 8.x).\n`
+      `ffmpeg-next supports up to ${MAX_AVCODEC_MAJOR}.\n`
       + `     The Rust bindings will not compile against it.\n`
       + (hint ? `     ${hint}` : ''));
   }
-  ok(`FFmpeg 8.x (libavcodec ${headerMajor}) — matches ffmpeg-next 8.1`);
+  ok(`FFmpeg libavcodec ${headerMajor} — ffmpeg-next builds against this`);
 }
 
 /** Install the client's npm dependencies if they are missing. */

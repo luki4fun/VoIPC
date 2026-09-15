@@ -88,24 +88,3 @@ pub async fn generate_prekeys(
     })
 }
 
-/// Generate additional one-time pre-keys to replenish supply.
-pub async fn generate_replenish_prekeys(
-    stores: &mut SignalStores,
-    start_id: u32,
-    count: u32,
-) -> anyhow::Result<Vec<SerializablePreKey>> {
-    let mut prekeys = Vec::with_capacity(count as usize);
-
-    for i in 0..count {
-        let id = PreKeyId::from(start_id + i);
-        let key_pair = KeyPair::generate(&mut OsRng);
-        let record = PreKeyRecord::new(id, &key_pair);
-        stores.prekey.save_pre_key(id, &record).await?;
-        prekeys.push(SerializablePreKey {
-            id: id.into(),
-            public_key: key_pair.public_key.serialize().to_vec(),
-        });
-    }
-
-    Ok(prekeys)
-}

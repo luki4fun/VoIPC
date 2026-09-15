@@ -47,15 +47,6 @@ impl VideoPacketType {
         )
     }
 
-    /// Get the encrypted version of this packet type.
-    pub fn to_encrypted(self) -> Self {
-        match self {
-            Self::VideoFragment => Self::EncryptedVideoFragment,
-            Self::VideoKeyframeFragment => Self::EncryptedVideoKeyframeFragment,
-            Self::ScreenShareAudio => Self::EncryptedScreenShareAudio,
-            other => other,
-        }
-    }
 }
 
 /// Header size: 1 (type) + 4 (session_id) + 4 (frame_id)

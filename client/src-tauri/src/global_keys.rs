@@ -234,6 +234,8 @@ fn run_rdev_loop(
     let mut ptt_active = false;
     let mut mute_active = false;
     let mut deafen_active = false;
+    // The callback takes the handle; this copy is for the failure below.
+    let on_failure = handle.clone();
 
     let callback = move |event: rdev::Event| {
         // Mute/deafen toggle hotkeys — checked on every key transition
@@ -319,6 +321,23 @@ fn run_rdev_loop(
         tracing::warn!(
             "Global PTT will not work. \
              Window-level PTT still available when app is focused."
+        );
+        // Said out loud, not only to a log nobody is reading: this is the whole
+        // of push-to-talk failing, and its symptom is "nobody could hear me" in
+        // the one call where it mattered. On Wayland it is the ordinary case —
+        // evdev found no keyboard it may read (the `input` group) and the X11
+        // fallback has no display to record.
+        let _ = on_failure.emit(
+            "global-keys-unavailable",
+            serde_json::json!({
+                "reason": if cfg!(target_os = "linux") {
+                    "VoIPC cannot read the keyboard while it is in the background. \
+                     On Wayland that needs read access to the input devices: \
+                     `sudo usermod -aG input $USER`, then log out and back in."
+                } else {
+                    "VoIPC cannot read the keyboard while it is in the background."
+                },
+            }),
         );
     }
 }

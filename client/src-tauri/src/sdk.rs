@@ -63,9 +63,18 @@ const MAX_FRAME: usize = 64 * 1024;
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// No frame at all for this long (a live mod pings) closes the socket.
 const IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-/// Sockets served at once. One game needs one; the rest is slack for a
-/// reconnect racing a dying socket.
-const MAX_CONNECTIONS: usize = 4;
+/// Sockets served at once, across every origin. One game needs one; the rest is
+/// slack for a reconnect racing a dying socket, and for the shims and test
+/// pages a server may have open beside it. The cap that actually protects the
+/// game is [`MAX_PER_ORIGIN`]; this one only bounds file descriptors.
+const MAX_CONNECTIONS: usize = 8;
+/// Sockets **one origin** may hold at once. Every `https://cfx-nui-*` page on a
+/// FiveM server is a trusted origin, so without this any third-party script
+/// there could open the lot and keep them alive with `ping` — and the voice
+/// resource's next restart would be answered 503 for the rest of the session,
+/// with nothing in Settings to say why. Two, because a resource restarting
+/// opens its new socket while its old one is still dying.
+const MAX_PER_ORIGIN: usize = 2;
 /// How long `hello` waits for the server to confirm the channel join.
 const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 /// Shortest gap between two `update` frames we will act on. The documented
@@ -301,10 +310,7 @@ pub fn spawn(app: tauri::AppHandle) {
         loop {
             let (enabled, port) = {
                 let state = app.state::<AppState>();
-                let config = match state.config.lock() {
-                    Ok(c) => c,
-                    Err(poisoned) => poisoned.into_inner(),
-                };
+                let config = state.config();
                 (config.sdk_enabled, config.sdk_port)
             };
 
@@ -314,7 +320,11 @@ pub fn spawn(app: tauri::AppHandle) {
                     handle.abort();
                     info!("game SDK listener stopped");
                     // Aborting takes the connections with it, and an aborted
-                    // task runs no teardown: hand the mix back here.
+                    // task runs no teardown: hand the mix back here — the
+                    // microphone first. Switching the integration off is the
+                    // documented escape hatch, so it must not be the one path
+                    // that leaves a game's push-to-talk held for ever.
+                    release_transmit(&app).await;
                     clear_sdk_positions(&app).await;
                     if let Ok(mut game) = app.state::<AppState>().sdk_game.lock() {
                         *game = None;
@@ -410,6 +420,53 @@ fn owner_conflict(held: &Owner, generation: u64, origin: &Option<String>) -> boo
     held.generation != 0 && held.generation != generation && &held.origin != origin
 }
 
+/// How many live sockets each origin holds. A native client sends no `Origin`,
+/// and they are one class between themselves, exactly as the ownership rule
+/// already treats them.
+type OriginCounts = Arc<std::sync::Mutex<HashMap<Option<String>, usize>>>;
+
+/// Is this origin already holding as many sockets as it may?
+///
+/// Free-standing so the rule can be read and tested without a listener.
+fn origin_slots_full(counts: &HashMap<Option<String>, usize>, origin: &Option<String>) -> bool {
+    counts.get(origin).copied().unwrap_or(0) >= MAX_PER_ORIGIN
+}
+
+/// One origin's slot, released however the connection ends — including a task
+/// aborted when the integration is switched off.
+struct OriginSlot {
+    counts: OriginCounts,
+    origin: Option<String>,
+}
+
+/// Claim a slot for this origin, or `None` if it already holds its share.
+fn take_origin_slot(counts: &OriginCounts, origin: &Option<String>) -> Option<OriginSlot> {
+    let mut map = counts.lock().unwrap_or_else(|p| p.into_inner());
+    if origin_slots_full(&map, origin) {
+        return None;
+    }
+    *map.entry(origin.clone()).or_insert(0) += 1;
+    Some(OriginSlot {
+        counts: counts.clone(),
+        origin: origin.clone(),
+    })
+}
+
+impl Drop for OriginSlot {
+    fn drop(&mut self) {
+        let mut map = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(n) = map.get_mut(&self.origin) {
+            *n -= 1;
+            // Dropped at zero rather than left at zero: `cfx-nui-<anything>` is
+            // an allowed prefix, so a loop of fresh names would otherwise grow
+            // this map for the life of the app.
+            if *n == 0 {
+                map.remove(&self.origin);
+            }
+        }
+    }
+}
+
 /// Connections that never completed a `hello` (a port scan, a page from a
 /// refused origin, `curl`) can no longer clear the owner's positions on their
 /// way out.
@@ -417,6 +474,7 @@ async fn accept_loop(listener: TcpListener, app: tauri::AppHandle) {
     let owner: OwnerSlot = Arc::new(std::sync::Mutex::new(Owner::default()));
     let mut generation: u64 = 0;
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
+    let per_origin: OriginCounts = Arc::new(std::sync::Mutex::new(HashMap::new()));
     // The connections belong to this loop: dropping the set (which is what
     // aborting this task does) aborts them too, so switching the integration
     // off in Settings really does disconnect the game rather than leaving it
@@ -451,9 +509,10 @@ async fn accept_loop(listener: TcpListener, app: tauri::AppHandle) {
         let my_generation = generation;
         let app = app.clone();
         let owner = owner.clone();
+        let per_origin = per_origin.clone();
         connections.spawn(async move {
             let _permit = permit; // released when this connection ends
-            if let Err(e) = serve(stream, &app, &owner, my_generation).await {
+            if let Err(e) = serve(stream, &app, &owner, my_generation, &per_origin).await {
                 info!("game SDK connection ended: {e}");
             }
             // Only the owner hands the mix back; a socket that was replaced by
@@ -489,18 +548,18 @@ async fn serve(
     app: &tauri::AppHandle,
     owner: &OwnerSlot,
     generation: u64,
+    per_origin: &OriginCounts,
 ) -> anyhow::Result<()> {
     let allowed = {
         let state = app.state::<AppState>();
-        let config = match state.config.lock() {
-            Ok(c) => c,
-            Err(poisoned) => poisoned.into_inner(),
-        };
+        let config = state.config();
         config.sdk_allowed_origins.clone()
     };
-    // A socket that connects and then says nothing must not pin a task
-    let (mut buf, origin) =
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut stream, &allowed))
+    // A socket that connects and then says nothing must not pin a task. The
+    // third value is this origin's slot (see `MAX_PER_ORIGIN`), held for the
+    // life of the connection and released by its `Drop` however it ends.
+    let (mut buf, origin, _origin_slot) =
+        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut stream, &allowed, per_origin))
             .await
             .map_err(|_| anyhow::anyhow!("handshake timed out"))??;
     let (mut rd, mut wr) = stream.into_split();
@@ -522,6 +581,8 @@ async fn serve(
     // Rate gates; see MIN_UPDATE_GAP / MIN_HELLO_GAP.
     let mut last_update: Option<tokio::time::Instant> = None;
     let mut last_hello: Option<tokio::time::Instant> = None;
+    // Consecutive `hello`s refused by the rate limit; see the arm below.
+    let mut hello_floods = 0u8;
     // Is this socket holding the user's push-to-talk down, and since when?
     let mut holding_tx = false;
     let mut last_tx: Option<tokio::time::Instant> = None;
@@ -562,8 +623,19 @@ async fn serve(
                                 r#"{"type":"error","reason":"one hello per second"}"#,
                             )
                             .await?;
+                            // A mod that answers the refusal with another hello
+                            // is a loop at loopback line rate, and both ends
+                            // parse JSON for as long as it runs. Ten of them and
+                            // the socket goes, as for any other client that
+                            // cannot be talked to.
+                            hello_floods = hello_floods.saturating_add(1);
+                            if hello_floods >= 10 {
+                                close(&mut wr, 1008).await;
+                                anyhow::bail!("hello loop: ten refusals in a row");
+                            }
                             continue;
                         }
+                        hello_floods = 0;
                         last_hello = Some(now);
                         // Another game already has the mix. Checked before the
                         // join, so a refused hello cannot move the user.
@@ -593,6 +665,15 @@ async fn serve(
                             hello_user_id =
                                 reply.get("user_id").and_then(|v| v.as_u64()).map(|v| v as u32);
                             listed.clear();
+                            // Start listening from *now*. The join this hello
+                            // just made is itself a channel change, and its
+                            // `Detached` is sitting in the queue: acting on it
+                            // would drop the user id we have this instant, and
+                            // the mod would get no talk pushes and "send hello
+                            // first" for every `transmit` until it said hello
+                            // a second time. Edges from before the hello were
+                            // never this mod's to hear anyway.
+                            events = app.state::<AppState>().sdk_events.subscribe();
                             own.muted = reply.get("muted").and_then(|v| v.as_bool()).unwrap_or(false);
                             own.deafened =
                                 reply.get("deafened").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -677,17 +758,33 @@ async fn serve(
                             continue;
                         }
                         let now = tokio::time::Instant::now();
-                        if on && last_tx.is_some_and(|t| now.duration_since(t) < MIN_UPDATE_GAP) {
-                            continue; // churning the capture task is a denial of service
+                        // The microphone's actual state, not this socket's
+                        // belief about it: the user may have taken their consent
+                        // back under us, in which case the next `transmit: true`
+                        // has to be acted on rather than skipped as a repeat.
+                        let held = app.state::<AppState>().ptt_sdk.load(Ordering::Relaxed);
+                        match transmit_step(on, held, last_tx, now) {
+                            // Nothing to churn — but a repeated press still
+                            // pushes the 60 second deadline out, which is what
+                            // docs/SDK.md tells a mod to do to keep talking.
+                            TxStep::Repeat => {
+                                holding_tx = on;
+                                if on {
+                                    last_tx = Some(now);
+                                }
+                            }
+                            TxStep::RateLimited => {}
+                            TxStep::Act => {
+                                last_tx = Some(now);
+                                holding_tx = on;
+                                let _ = crate::commands::sdk_set_transmit(
+                                    &app.state::<AppState>(),
+                                    app.clone(),
+                                    on,
+                                )
+                                .await;
+                            }
                         }
-                        last_tx = Some(now);
-                        holding_tx = on;
-                        let _ = crate::commands::sdk_set_transmit(
-                            &app.state::<AppState>(),
-                            app.clone(),
-                            on,
-                        )
-                        .await;
                     }
                     Ok(GameMessage::Ping) => send_text(&mut wr, r#"{"type":"pong"}"#).await?,
                     Ok(GameMessage::Bye) => {
@@ -722,7 +819,11 @@ async fn serve(
                     listed.clear();
                     if holding_tx {
                         holding_tx = false;
-                        release_transmit(app).await;
+                        // Only if the microphone is still ours to let go of:
+                        // see `releases_transmit`.
+                        if releases_transmit(owner_slot(owner).generation, generation) {
+                            release_transmit(app).await;
+                        }
                     }
                 }
                 Ok(ev) => {
@@ -730,10 +831,10 @@ async fn serve(
                     if hello_user_id.is_some() && owner_slot(owner).generation != generation {
                         hello_user_id = None;
                         listed.clear();
-                        if holding_tx {
-                            holding_tx = false;
-                            release_transmit(app).await;
-                        }
+                        // Dropped, never released: the socket that took the mix
+                        // may be holding the microphone itself by now, and this
+                        // one letting go would cut it off mid-word.
+                        holding_tx = false;
                     }
                     if let Some(msg) = event_message(&ev, hello_user_id, &mut own, &listed) {
                         send_text(&mut wr, &msg).await?;
@@ -751,7 +852,9 @@ async fn serve(
                 last_tx.unwrap_or_else(tokio::time::Instant::now) + TRANSMIT_HOLD_MAX,
             ), if holding_tx => {
                 holding_tx = false;
-                release_transmit(app).await;
+                if releases_transmit(owner_slot(owner).generation, generation) {
+                    release_transmit(app).await;
+                }
                 send_text(
                     &mut wr,
                     r#"{"type":"error","reason":"push-to-talk released after 60s — send transmit again to keep talking"}"#,
@@ -848,15 +951,66 @@ fn beacon_mode(mode: Option<&str>, allowed: bool) -> Result<bool, String> {
     }
 }
 
+/// What one `transmit` frame does.
+#[derive(Debug, PartialEq, Eq)]
+enum TxStep {
+    /// The microphone is already in that state.
+    Repeat,
+    /// A press too soon after the last one; dropped.
+    RateLimited,
+    /// Press or release the microphone.
+    Act,
+}
+
+/// Should this `transmit` frame be acted on?
+///
+/// Free-standing so the rule can be read and tested without a socket — the two
+/// mistakes it exists to prevent are both invisible from inside `serve`:
+///
+/// - **Only a press is rate-limited.** Each edge takes the connection write
+///   lock and restarts the capture device, so a flood of them is a denial of
+///   service — but rate-limiting the *release* too meant a key tapped inside
+///   [`MIN_UPDATE_GAP`] left the microphone open until the 60 second cap, and a
+///   game's key handling runs per frame (~16 ms at 60 fps). A dropped press is
+///   "I was not heard", which the player notices at once; a dropped release is
+///   a hot mic, which they do not. Releases need no gate of their own: an
+///   accepted one always follows an accepted press, so the press gate bounds
+///   both.
+/// - **A repeat is not a no-op.** `docs/SDK.md` tells a mod to re-send
+///   `transmit: true` to keep a transmission past 60 seconds, so the caller
+///   refreshes the deadline on one.
+fn transmit_step(
+    on: bool,
+    held: bool,
+    last_tx: Option<tokio::time::Instant>,
+    now: tokio::time::Instant,
+) -> TxStep {
+    if on == held {
+        TxStep::Repeat
+    } else if on && last_tx.is_some_and(|t| now.duration_since(t) < MIN_UPDATE_GAP) {
+        TxStep::RateLimited
+    } else {
+        TxStep::Act
+    }
+}
+
+/// May this socket let go of the microphone on the user's behalf?
+///
+/// Only while it still owns the mix. A socket that was replaced by a newer one
+/// (a resource restarting) still believes it is holding the key it pressed, and
+/// its next event — or its 60 second timer — would otherwise release a hold the
+/// *new* socket has since taken, cutting a radio transmission mid-sentence.
+/// `ptt_sdk` is one flag for the whole app, so there is nobody else to ask.
+fn releases_transmit(owner_generation: u64, generation: u64) -> bool {
+    owner_generation == generation
+}
+
 /// Has the user allowed a game to press their push-to-talk? Read fresh every
 /// time, so unticking the box in Settings stops the next frame rather than the
 /// next connection.
 fn transmit_allowed(app: &tauri::AppHandle) -> bool {
     let state = app.state::<AppState>();
-    let config = match state.config.lock() {
-        Ok(c) => c,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let config = state.config();
     config.sdk_transmit_allowed
 }
 
@@ -872,7 +1026,16 @@ async fn release_transmit(app: &tauri::AppHandle) {
 fn short_name(raw: &str, fallback: &str) -> String {
     let clean: String = raw
         .chars()
-        .filter(|c| !c.is_control() && !('\u{202a}'..='\u{202e}').contains(c))
+        .filter(|c| {
+            // Controls, the bidi embedding/override marks, the bidi isolates
+            // (U+2066–2069, which do the same job and are what a modern shaper
+            // actually honours), and the zero-width joiners and marks a name
+            // can hide a second name behind.
+            !c.is_control()
+                && !('\u{200b}'..='\u{200f}').contains(c)
+                && !('\u{202a}'..='\u{202e}').contains(c)
+                && !('\u{2066}'..='\u{2069}').contains(c)
+        })
         .take(MAX_NAME)
         .collect();
     let clean = clean.trim();
@@ -914,10 +1077,7 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> serde_json::Value {
 
     // Beacon mode is the one thing a game can ask for that puts something on
     // the wire, so the user has to have said yes to it first.
-    let beacon_allowed = match state.config.lock() {
-        Ok(c) => c.sdk_beacon_allowed,
-        Err(poisoned) => poisoned.into_inner().sdk_beacon_allowed,
-    };
+    let beacon_allowed = state.config().sdk_beacon_allowed;
     let beacon = match beacon_mode(hello.mode.as_deref(), beacon_allowed) {
         Ok(b) => b,
         Err(reason) => return serde_json::json!({ "type": "error", "reason": reason }),
@@ -1501,7 +1661,8 @@ fn parse_frame(buf: &[u8]) -> anyhow::Result<Option<(Frame, usize)>> {
 async fn handshake(
     stream: &mut TcpStream,
     extra_origins: &[String],
-) -> anyhow::Result<(Vec<u8>, Option<String>)> {
+    per_origin: &OriginCounts,
+) -> anyhow::Result<(Vec<u8>, Option<String>, OriginSlot)> {
     let mut buf = Vec::new();
     let mut chunk = [0u8; 1024];
     let end = loop {
@@ -1540,6 +1701,17 @@ async fn handshake(
         }
     }
 
+    // Before the 101, so a page hoarding sockets is answered with a status line
+    // rather than an open WebSocket it can keep alive with `ping`.
+    let Some(slot) = take_origin_slot(per_origin, &upgrade.origin) else {
+        reject(stream, "503 Service Unavailable").await;
+        warn!(
+            origin = ?upgrade.origin,
+            "game SDK refused a socket: this origin already holds {MAX_PER_ORIGIN}"
+        );
+        anyhow::bail!("origin already holds {MAX_PER_ORIGIN} sockets");
+    };
+
     let response = format!(
         "HTTP/1.1 101 Switching Protocols\r\n\
          Upgrade: websocket\r\n\
@@ -1548,7 +1720,7 @@ async fn handshake(
         accept_key(&upgrade.key)
     );
     stream.write_all(response.as_bytes()).await?;
-    Ok((leftover, upgrade.origin))
+    Ok((leftover, upgrade.origin, slot))
 }
 
 /// Answer an upgrade we will not perform, then let the caller hang up.
@@ -2031,6 +2203,81 @@ mod tests {
     }
 
     #[test]
+    fn one_origin_cannot_hold_every_socket() {
+        // Every `cfx-nui-*` page is a trusted origin, so a third-party script
+        // on the same game server could otherwise open every slot, keep them
+        // alive with `ping`, and the voice resource's next restart would be
+        // answered 503 for the rest of the session.
+        let counts: OriginCounts = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let voice = Some("https://cfx-nui-my-voice".to_string());
+        let menu = Some("https://cfx-nui-some-menu".to_string());
+
+        let first = take_origin_slot(&counts, &menu).expect("the first socket was refused");
+        let second = take_origin_slot(&counts, &menu).expect("a resource restart was refused");
+        assert!(
+            take_origin_slot(&counts, &menu).is_none(),
+            "one origin held a third socket"
+        );
+        // …and the game's own resource still gets in
+        let theirs = take_origin_slot(&counts, &voice).expect("another origin was refused");
+
+        // A socket ending gives its slot back, whatever ended it
+        drop(second);
+        let third = take_origin_slot(&counts, &menu).expect("a slot was never released");
+        drop(third);
+        drop(first);
+        drop(theirs);
+        // `cfx-nui-<anything>` is an allowed prefix, so the map must not keep a
+        // row per name a loop of fresh ones has used
+        assert!(
+            counts.lock().unwrap().is_empty(),
+            "origins with no sockets kept their rows"
+        );
+    }
+
+    #[test]
+    fn a_tapped_radio_key_is_never_left_holding_the_microphone() {
+        let t0 = tokio::time::Instant::now();
+        let soon = t0 + MIN_UPDATE_GAP / 2;
+
+        // A tap: press and release inside one rate-limit window, which is what
+        // a game's per-frame key handling produces at 60 fps. Both are acted
+        // on — rate-limiting the release left the microphone open until the
+        // 60 second cap, out of a key the player tapped once.
+        assert_eq!(transmit_step(true, false, None, t0), TxStep::Act);
+        assert_eq!(
+            transmit_step(false, true, Some(t0), soon),
+            TxStep::Act,
+            "a release was dropped: that is a hot mic"
+        );
+
+        // A press that soon after a press is still a flood, and still refused
+        assert_eq!(transmit_step(true, false, Some(t0), soon), TxStep::RateLimited);
+        // …and once the window has passed it goes through
+        assert_eq!(
+            transmit_step(true, false, Some(t0), t0 + MIN_UPDATE_GAP),
+            TxStep::Act
+        );
+
+        // Re-sending a press the microphone is already holding is the
+        // documented way to keep talking past 60 s: not an edge, but not
+        // nothing either — the caller refreshes the deadline on it.
+        assert_eq!(transmit_step(true, true, Some(t0), soon), TxStep::Repeat);
+        assert_eq!(transmit_step(false, false, Some(t0), soon), TxStep::Repeat);
+    }
+
+    #[test]
+    fn a_socket_that_lost_the_mix_does_not_let_go_of_the_microphone() {
+        // A resource restarting leaves the old socket believing it still holds
+        // the key it pressed. Its next event — or its 60 second timer — would
+        // release a hold the *new* socket has since taken, cutting a radio
+        // transmission mid-sentence; `ptt_sdk` is one flag for the whole app.
+        assert!(releases_transmit(7, 7), "the owner could not let go");
+        assert!(!releases_transmit(9, 7), "a replaced socket released the new owner's hold");
+        assert!(!releases_transmit(0, 7), "a socket released a mix nobody owns");
+    }
+
+    #[test]
     fn beacon_mode_needs_the_players_consent() {
         // The one thing a mod can ask for that leaves the machine.
         assert_eq!(beacon_mode(None, false), Ok(false));
@@ -2237,7 +2484,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let (mut buf, _origin) = handshake(&mut stream, &[]).await.unwrap();
+            let counts: OriginCounts = Arc::new(std::sync::Mutex::new(HashMap::new()));
+            let (mut buf, _origin, _slot) = handshake(&mut stream, &[], &counts).await.unwrap();
             let (mut rd, _wr) = stream.into_split();
             read_frame(&mut rd, &mut buf).await.unwrap()
         });
@@ -2260,7 +2508,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
-            let (mut buf, _origin) = handshake(&mut stream, &[]).await.unwrap();
+            let counts: OriginCounts = Arc::new(std::sync::Mutex::new(HashMap::new()));
+            let (mut buf, _origin, _slot) = handshake(&mut stream, &[], &counts).await.unwrap();
             let (mut rd, _wr) = stream.into_split();
             read_frame(&mut rd, &mut buf).await
         });

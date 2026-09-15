@@ -799,7 +799,8 @@
               For games whose mods can only see where you are, not where everyone else is. Your
               position is encrypted with the channel key like your voice — the server cannot read
               it, but everyone in the channel can. Off by default; without it, positions a game
-              feeds in never leave this machine.
+              feeds in never leave this machine. Unticking it stops a broadcast that is running,
+              this instant; ticking it applies the next time a game says hello.
             </span>
           </label>
           <label class="toggle-row">
@@ -826,7 +827,8 @@
             <span class="toggle-hint">
               So the in-game radio key is the only key you hold. It can never talk over your mute,
               it shows in the voice bar like any other transmission, and it lets go as soon as the
-              game stops driving. Off by default.
+              game stops driving. Off by default. Unticking it lets go of the microphone at once,
+              even mid-word.
             </span>
           </label>
           <span class="toggle-hint">

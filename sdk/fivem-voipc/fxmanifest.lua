@@ -14,4 +14,6 @@ files { 'html/index.html' }
 
 shared_script 'config.lua'
 client_script 'client.lua'
-server_script 'server.lua'
+-- Server-only, and deliberately not shared: it holds the channel password,
+-- and a `shared_script` is a file every player downloads.
+server_scripts { 'server_config.lua', 'server.lua' }

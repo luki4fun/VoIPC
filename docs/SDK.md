@@ -435,8 +435,11 @@ change anything, at the price named above.
 
 - Loopback only, and off until the user turns it on. A handshake must finish
   within 5 seconds, a socket that sends nothing at all for 30 seconds is closed
-  (send `ping` if your mod is otherwise idle), and at most 4 sockets are served
-  at once — the fifth gets `503`.
+  (send `ping` if your mod is otherwise idle), at most 8 sockets are served at
+  once, and **at most 2 of them may come from one origin** — the third gets
+  `503`. Two is a resource restarting while its old socket dies; more than that
+  is a page hoarding the slots the game needs, which any `cfx-nui-*` script on
+  the same server could otherwise do.
 - Client frames must be masked, as the WebSocket standard requires. Every
   browser does this; a hand-rolled client that does not is closed with 1002.
 - A request without an `Origin` header is allowed: only browsers always send
@@ -454,6 +457,22 @@ change anything, at the price named above.
 - `hello.server` and `hello.channel` are both required: the first so a mod
   cannot place people using coordinates from a different session, the second so
   it cannot arm itself on whatever channel the player happens to be in.
+- **Protect the channel your game drives.** A VoIPC channel is a VoIPC channel:
+  a player who knows its name can join it by hand, with no mod running, and
+  then hears every talker in it at full volume with no distance and no
+  direction, because nothing is placing anybody for them. Three things stop
+  that, and they are not equal:
+
+  | | What it actually does |
+  |---|---|
+  | `hidden` | Keeps it out of everybody's channel list but an admin's. Discovery only — it does **not** refuse a join |
+  | `password` | The gate. A join without it is refused by the server |
+  | `routed` + a game server posting route tables | Anyone the table does not list hears nobody and is heard by nobody, even if they are standing in the channel |
+
+  Use all three. `channels.example.json` ships the `Ingame` entry that way.
+  Keep the password out of any file your players download — in FiveM that means
+  a `server_script`, not `config.lua`, and the shipped resource hands it to a
+  client at the moment it joins (`server_config.lua`).
 - A `wrong_server` refusal carries no identity — no user id, name or mute
   state. It is the one reply any allowed origin can provoke.
 - One game owns the mix, and a second **origin** cannot take it while the first
@@ -464,6 +483,14 @@ change anything, at the price named above.
   **pressing their push-to-talk** (`transmit`) each need their own switch in
   Settings → Game Integration, both off by default. Nothing else a mod sends
   leaves the machine or opens a microphone.
+- **Taking either switch back stops what is happening**, not what happens next:
+  unticking *press my push-to-talk* lets the microphone go that instant, and
+  unticking *broadcast my position* stops the beacon on the wire (your mod keeps
+  placing the player locally). Turning one back on applies from the next
+  `hello` — so send one if the player says they have just allowed it.
+- Switching the integration off, in the same panel, disconnects every socket,
+  hands back every placement and lets go of the microphone. It is the escape
+  hatch, and it is meant to be complete.
 - A player the game leaves out is silent, and the member list and mixer grey
   them out while that is happening, so culling is visible rather than
   mysterious. Switching the integration off hands everything back at once.
@@ -484,6 +511,22 @@ shim can stand in for, and the one game deliberately not supported.
 
 ## Testing without a game
 
+`sdk/test-mod.mjs` is the version you run rather than watch. It is a fake mod in
+one file with no dependencies: it opens the socket as a native client, and
+checks the whole pipeline against a VoIPC that is connected to a server —
+`hello` joining the channel, an update placing two players with a radio and a
+phone layer, a duplicate id being refused, `transmit` opening and closing the
+microphone, and a second origin being refused the mix. It hands everything back
+when it finishes.
+
+```bash
+node sdk/test-mod.mjs --server rp.example.com:9987 --channel Ingame --password s3cret
+```
+
+Every line it prints is a rule from this document, so a red one tells you which.
+If your own mod misbehaves, run this first: it says whether the client, the
+channel and the consent switches are in the state you think they are.
+
 `sdk/test-page.html` is a single file with sliders for your own position, how
 much space is around you and how submerged you are, and one other player, plus
 the channel to join, every mode the build reports in `modes`, a layer you can
@@ -496,7 +539,9 @@ does.
 ## A ready-made FiveM resource
 
 `sdk/fivem-voipc/` is a working resource: drop it in, set `server` and
-`channel` in `config.lua`, and `ensure fivem-voipc`. It publishes each player's
+`channel` in `config.lua`, put the channel's password in `server_config.lua`
+(server-only, because `config.lua` is downloaded to every player), and
+`ensure fivem-voipc`. It publishes each player's
 VoIPC id through a state bag, sends head-bone positions and the camera heading
 at 10 Hz, culls by distance, derives muffling from vehicles, interiors and line
 of sight, cycles the voice range on a key, and drowns you while you are
@@ -536,6 +581,15 @@ pair covers all of them, and switching is: start `fivem-voipc`, start the shim,
 stop the old resource. Where the models genuinely differ (SaltyChat's secondary
 radio, per-resource volume, mic clicks, radio towers) the shim logs what it is
 not doing, once, rather than failing quietly.
+
+**One trust model comes with it.** pma-voice lets a *client* set its own call
+channel, and a call id is a guessable string, so a cheat client that guesses one
+is in that call — pma-voice's own behaviour, and the shim keeps it rather than
+breaking phone resources that rely on it. `Config.canJoinCall(src, id)` in
+`sdk/fivem-voipc/config.lua` is where you close it: return whether your phone
+resource actually put that player in that call. Radio channels never took the
+client's word for it — they go through `Config.canJoinRadio` and
+`addChannelCheck` on both paths.
 
 **Game natives cannot be shimmed.** A script calling `MumbleSetVolumeOverrideByServerId`
 or `NetworkIsPlayerTalking` is talking to the game's own voice stack, which

@@ -175,16 +175,15 @@
     }
   }
 
+  // The effect's own cleanup covers unmounting too, so there is no `onDestroy`
+  // for this one — a second clear of the same handle is a second way to get it
+  // wrong.
   $effect(() => {
     if (!poll) poll = setInterval(tickMeters, LEVEL_POLL_MS);
     return () => {
       if (poll) clearInterval(poll);
       poll = null;
     };
-  });
-
-  onDestroy(() => {
-    if (poll) clearInterval(poll);
   });
 
   // Read each member's settings once, so a reconnect cannot leave the desk lying

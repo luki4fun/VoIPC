@@ -457,6 +457,17 @@ pub async fn connect_to_server(
         share_loss_ms.clone(),
     ));
 
+    // Nobody is holding the microphone on a connection that did not exist a
+    // moment ago. Both flags outlive a connection (they are app state, not
+    // connection state), and a game's hold that survived a reconnect would sit
+    // there refusing to let the user's own key close the capture.
+    state
+        .ptt_sdk
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    state
+        .ptt_user
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+
     // Store the active connection
     let connection = ActiveConnection {
         user_id,
@@ -713,24 +724,37 @@ fn on_channel_changed(
     channel_id: u32,
     app_handle: &tauri::AppHandle,
 ) {
-    {
+    let was_driven = {
         let mut sp = match spatial.lock() {
             Ok(s) => s,
             Err(poisoned) => poisoned.into_inner(),
         };
-        sp.sync = false;
         // A game drives one channel: somewhere else its ids match nobody, and
         // leaving culling armed would silence everyone here. The mod's next
         // update is refused and tells it to say hello again.
+        let was_driven = sp.sdk_channel.is_some();
         sp.sdk_active = false;
+        // Before `sync`, not after: `clear_positions` hands a beaconing game's
+        // borrowed sharing back to whatever the user's own switch said, and
+        // doing it the other way round re-armed their position sync in the
+        // channel they just walked into.
         sp.clear_positions();
-    }
+        sp.sync = false;
+        was_driven
+    };
     // Told rather than inferred: a mod that has gone quiet would otherwise keep
     // receiving who-speaks-when for the channel the user just moved into, right
     // up until its socket dies.
-    app_handle
-        .state::<AppState>()
-        .sdk_event(crate::app_state::SdkEvent::Detached);
+    //
+    // Only when a game was actually driving. A `hello` that has to join its
+    // channel *causes* this call, and telling the socket it was detached from
+    // the join it just asked for left it with no user id: no talk pushes, and
+    // `transmit` answered "send hello first" until the mod said hello twice.
+    if was_driven {
+        app_handle
+            .state::<AppState>()
+            .sdk_event(crate::app_state::SdkEvent::Detached);
+    }
     apply_channel_proximity(spatial, cache, channel_id, app_handle);
 }
 
@@ -948,10 +972,12 @@ async fn handle_server_message(
                 }
             }
             // Forget where they stood — the id is reused for the next joiner,
-            // and so are the extra ways a game had us hearing them
+            // and so are the extra ways a game had us hearing them, and the
+            // glide that was carrying them there.
             if let Ok(mut sp) = spatial.lock() {
                 sp.sources.remove(&user_id);
                 sp.layers.remove(&user_id);
+                sp.motion.remove(&user_id);
             }
 
             let _ = app_handle.emit(
@@ -2170,6 +2196,14 @@ impl LayerMix {
         }
         if let Some(pcm) = pcm {
             self.ring.push_back(pcm.to_vec());
+        }
+        // A shorter delay takes effect now, not at the next pause. The line
+        // pops exactly one frame per push, so without this it keeps whatever
+        // length it grew to and the layer stays late for the rest of the
+        // sentence. Dropping the surplus is a cut, which is what asking for a
+        // shorter delay means.
+        while self.ring.len() > delay_frames as usize + 1 {
+            self.ring.pop_front();
         }
         if self.ring.len() > delay_frames as usize || (pcm.is_none() && !self.ring.is_empty()) {
             self.ring.pop_front()
@@ -3503,6 +3537,27 @@ mod tests {
         assert!(run(None).abs() > 0.1, "the tail of the delay was dropped");
         assert!(run(None).abs() > 0.1);
         assert_eq!(run(None), 0.0, "a drained line kept playing");
+    }
+
+    #[test]
+    fn a_shorter_delay_takes_effect_without_waiting_for_a_pause() {
+        // The line pops one frame per push, so it keeps whatever length it grew
+        // to: a mod dropping `delay` from 100 ms to 40 left the layer arriving
+        // 100 ms late for the rest of the sentence.
+        let mut layer = LayerMix::default();
+        let frame = |n: f32| vec![n; 4];
+        for i in 0..5 {
+            layer.delayed(Some(&frame(i as f32)), 5);
+        }
+        assert_eq!(layer.ring.len(), 5, "the line did not fill");
+        // Same tick the mod shortens it: the surplus is dropped, and what comes
+        // out is one frame old rather than five
+        let out = layer.delayed(Some(&frame(5.0)), 1).expect("nothing came out");
+        assert_eq!(out[0], 4.0, "the layer stayed at the old delay");
+        assert_eq!(layer.ring.len(), 1);
+        // And zero clears it entirely, as it always did
+        assert!(layer.delayed(Some(&frame(6.0)), 0).is_none());
+        assert!(layer.ring.is_empty());
     }
 
     #[test]

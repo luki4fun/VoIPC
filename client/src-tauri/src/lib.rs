@@ -49,6 +49,19 @@ pub fn run() {
             .init();
     }
 
+    // A binary built with a bare `cargo build` has no embedded front end: the
+    // window loads `devUrl` (the Vite dev server) instead, and with no dev
+    // server running it shows nothing but "Could not connect to localhost:
+    // Connection refused" — which looks like a broken app rather than a build
+    // that was never finished. `npm run build` (and `npm run dev`, which starts
+    // the dev server) pass the feature that embeds the UI.
+    #[cfg(all(dev, not(target_os = "android")))]
+    tracing::warn!(
+        "built without `tauri/custom-protocol`: this binary loads the UI from the Vite dev \
+         server, not from itself. Run `npm run dev` (with the dev server) or build with \
+         `npm run build` — otherwise the window will say \"Connection refused\"."
+    );
+
     tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
         .manage(AppState::new())
@@ -151,7 +164,7 @@ pub fn run() {
                     .store(cfg.ptt_hold_mode, std::sync::atomic::Ordering::Relaxed);
 
                 // Store loaded config
-                *state.config.lock().unwrap() = cfg;
+                *state.config() = cfg;
 
                 tracing::info!("Loaded user config from {}", config::config_path().display());
             }
@@ -332,7 +345,6 @@ pub fn run() {
             commands::switch_screen_share_source,
             commands::watch_screen_share,
             commands::stop_watching_screen_share,
-            commands::request_keyframe,
             commands::start_screen_capture,
             commands::stop_screen_capture,
             commands::set_keyframe_requested,
@@ -369,10 +381,6 @@ pub fn run() {
             commands::get_sdk_status,
             commands::set_sdk_config,
             // E2E Encryption
-            commands::request_prekey_bundle,
-            commands::send_encrypted_direct_message,
-            commands::send_encrypted_channel_message,
-            commands::upload_prekeys,
             commands::forget_server_pin,
             commands::send_channel_history,
             // Moderation

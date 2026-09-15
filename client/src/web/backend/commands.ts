@@ -352,7 +352,6 @@ const handlers: Record<string, Handler> = {
     });
     audio.setMicFx(name, mu, rv, wt);
   },
-  get_mic_fx: () => audio.getMicFx(),
   set_voice_mode: async ({ mode }) => {
     const value = str(mode, "mode");
     updateConfig((c) => {
@@ -420,8 +419,6 @@ const handlers: Record<string, Handler> = {
   // ── screen share ──
   watch_screen_share: ({ sharerUserId }) => need().watchScreenShare(u32(sharerUserId, "sharerUserId")),
   stop_watching_screen_share: () => need().stopWatchingScreenShare(),
-  request_keyframe: ({ sharerUserId }) =>
-    need().sendControl({ RequestKeyframe: { sharer_user_id: u32(sharerUserId, "sharerUserId") } }),
   get_screen_share_stats: () => {
     need();
     // [frames_sent, bytes_sent] from our own share, the rest from the viewer

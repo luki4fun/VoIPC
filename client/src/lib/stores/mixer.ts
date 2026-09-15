@@ -137,11 +137,6 @@ export function setLaneField<K extends keyof Lane>(
   return setUserFx(id, { ...fxOf(id), [key]: value });
 }
 
-/** One lane, whoever it belongs to. */
-export function laneOf(id: number | "mic"): Lane {
-  return id === "mic" ? get(micLane) : fxOf(id);
-}
-
 /**
  * Read one member's settings back from the backend.
  *

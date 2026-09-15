@@ -36,6 +36,18 @@ straight through to the underlying tool.
 Everything at once, in the same versions a release ships: push a `v*` tag and
 let `.github/workflows/release.yml` build all four platforms.
 
+**Do not run the desktop client straight out of `cargo build`.** The UI is
+embedded into the binary by a Cargo feature that `npm run build` passes and a
+bare `cargo build -p voipc-client` does not, so that binary opens its window on
+the Vite dev server instead of on itself. With no dev server running, the whole
+window is the browser's own error page — *"Could not connect to localhost:
+Connection refused"* — which looks exactly like a broken app. Everything behind
+the window still runs, which is why the game SDK port is open and answering
+while the screen says that. The binary now says so in its log on the first line.
+Use `npm run dev` (dev server plus app) or `npm run build`; to run a release
+binary by hand, build it with `cargo build -p voipc-client --release --features
+tauri/custom-protocol`.
+
 ### Demo builds (a default server in the connect dialog)
 
 `VITE_DEFAULT_SERVER=host[:port]` bakes a server into the connect dialog, so a
@@ -210,12 +222,15 @@ The build defaults `VCPKG_ROOT` to `C:\Program Files\vcpkg`, but honours a pre-s
 value. The CMake generator is detected through vswhere rather than hardcoded, so a
 machine on a newer Visual Studio than 2022 still builds.
 
-**Mind the FFmpeg version.** `ffmpeg-next` 8.1 needs FFmpeg 8.x (libavcodec 62),
-and vcpkg tracks FFmpeg head — its port moved to 9.0 in August 2026, and the Rust
-bindings do not compile against that. The build now checks the major before
-compiling anything and stops with a message instead of a screenful of C errors ten
-minutes in. If your vcpkg is ahead, either pin the port or skip vcpkg for FFmpeg
-and point `FFMPEG_DIR` at an `n8.x-win64-gpl-shared` build from
+**Mind the FFmpeg version.** `ffmpeg-next` 9.0 builds against FFmpeg 9.x
+(libavcodec 63) and anything older, so an Ubuntu runner on 6.1, this project's
+Windows prebuilt on 8.1 and a rolling distribution on 9.0 all work from one pin.
+Only a *newer* FFmpeg breaks it, because the crate's exhaustive matches do not
+know the enum variants a new major adds — and vcpkg tracks FFmpeg head. Every
+build path checks the major before compiling anything and stops with a message
+instead of a screenful of C errors ten minutes in. If your vcpkg runs ahead of
+the crate, either pin the port or skip vcpkg for FFmpeg and point `FFMPEG_DIR`
+at an `n8.x`- or `n9.x-win64-gpl-shared` build from
 [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) — that is the
 same tree the Linux cross build and CI use, and `FFMPEG_DIR` wins over vcpkg for
 headers, import libraries and the DLLs bundled with the app.
@@ -289,8 +304,8 @@ that cache is **not redistributable**, so never commit or ship it.
 | `XWIN_CACHE_DIR` | `~/.cache/cargo-xwin` | Where the MSVC CRT/SDK is cached |
 
 The FFmpeg build must be a **`-shared`** one (those ship `include/` and the MSVC
-`lib/*.lib` import libraries) and must match the FFmpeg major that `ffmpeg-next`
-targets — currently FFmpeg 8.x / libavcodec 62. The GPL variant is required for
+`lib/*.lib` import libraries) and must not be newer than the FFmpeg major
+`ffmpeg-next` knows — currently FFmpeg 9.x / libavcodec 63. The GPL variant is required for
 `libx264` and `libx265`; like the vcpkg build it also has NVENC, AMF and QSV
 compiled in.
 
@@ -350,8 +365,8 @@ Windows is cross-built rather than built on a Windows runner, and it is the same
 `build:windows` task described above — so a red CI build reproduces at home in
 minutes. The native path was tried first and never produced a release: it took
 FFmpeg from the runner's vcpkg, which follows FFmpeg head, so it spent forty
-minutes building FFmpeg 9 and eight more compiling before dying in bindings that
-only support 8.x. No MSI is built; WiX is Windows-only, and nothing here has ever
+minutes building an FFmpeg newer than the crate and eight more compiling before
+dying in its bindings. No MSI is built; WiX is Windows-only, and nothing here has ever
 produced one.
 
 Every build and test step runs through `tools/ci-run.sh`, which repeats the tail of

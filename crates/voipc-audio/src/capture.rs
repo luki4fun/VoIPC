@@ -21,7 +21,6 @@ const TARGET_SAMPLE_RATE: u32 = 48_000;
 /// 48kHz mono) into a lock-free ring buffer that the encoder thread reads from.
 pub struct CaptureStream {
     stream: cpal::Stream,
-    sample_rate: u32,
 }
 
 /// Size of the capture ring buffer in samples (~200ms at 48kHz).
@@ -159,16 +158,10 @@ pub fn start_capture(
 
     stream.play()?;
 
-    Ok((CaptureStream { stream, sample_rate: actual_rate }, consumer))
+    Ok((CaptureStream { stream }, consumer))
 }
 
 impl CaptureStream {
-    /// The hardware sample rate of the capture device.
-    #[allow(dead_code)]
-    pub fn sample_rate(&self) -> u32 {
-        self.sample_rate
-    }
-
     /// Pause the capture stream (e.g., when PTT is released).
     pub fn pause(&self) -> Result<()> {
         self.stream.pause()?;

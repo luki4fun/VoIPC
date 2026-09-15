@@ -86,8 +86,9 @@ async fn handle_voice_packet(session_id: SessionId, data: Bytes, state: &ServerS
         return;
     }
 
-    let channel_id = match state.sessions.get(&session_id) {
-        Some(session) => session.channel_id,
+    // One lookup for both: this runs per voice packet per speaker.
+    let (channel_id, speaker_uid) = match state.sessions.get(&session_id) {
+        Some(session) => (session.channel_id, session.user_id),
         None => {
             warn!(session_id, "voice forward: session not found in state");
             return;
@@ -99,11 +100,6 @@ async fn handle_voice_packet(session_id: SessionId, data: Bytes, state: &ServerS
         debug!(session_id, "voice forward: dropping (General channel)");
         return;
     }
-
-    let speaker_uid = match state.sessions.get(&session_id) {
-        Some(session) => session.user_id,
-        None => return,
-    };
 
     // Collect recipients under the channels read lock, send after releasing
     // it — the lock is write-preferring, so a join/leave must never wait

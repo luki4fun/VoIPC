@@ -24,9 +24,6 @@ export const ROOM_EXTENT = 10;
 export type CentreView = "chat" | "room" | "mixer";
 export const centreView = writable<CentreView>("chat");
 
-/** Is the room panel showing? Derived, so existing readers keep working. */
-export const roomOpen = derived(centreView, ($v) => $v === "room");
-
 /** Are we broadcasting our own position (and accepting the others')? */
 export const syncing = writable(false);
 
@@ -58,10 +55,6 @@ export const currentProximity = derived(
   ([$channels, $id]) =>
     ($channels.find((c) => c.channel_id === $id)?.proximity ?? "off") as ProximityMode,
 );
-
-export function setPosition(userId: number, p: Point): void {
-  positions.update((m) => new Map(m).set(userId, p));
-}
 
 export function clearRoom(): void {
   positions.set(new Map());

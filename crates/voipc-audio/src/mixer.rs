@@ -807,6 +807,11 @@ pub struct ReverbWaterState {
     /// case and there are as many of these as there are people talking, so the
     /// bypass path must not wipe 22 kB per lane per frame.
     dirty: bool,
+    /// Whether the comb bank has been fed since it was last wiped. Separate
+    /// from `dirty` because a lane that is only underwater keeps filtering while
+    /// its bank is idle, and wiping 22 kB every frame is exactly what this is
+    /// here to avoid.
+    bank_live: bool,
 }
 
 impl Default for ReverbWaterState {
@@ -826,14 +831,14 @@ impl Default for ReverbWaterState {
             primed: false,
             tail: 0,
             dirty: false,
+            bank_live: false,
         }
     }
 }
 
 impl ReverbWaterState {
-    /// Forget every delay line. Called when the room is fully off, so turning
-    /// it back on cannot replay a second of stale speech.
-    fn clear(&mut self) {
+    /// Forget the comb bank, which is what a reverb tail lives in.
+    fn clear_bank(&mut self) {
         for c in self.comb.iter_mut() {
             c.clear();
         }
@@ -841,8 +846,15 @@ impl ReverbWaterState {
             a.clear();
         }
         self.damp = [0.0; 4];
-        self.uw = [0.0; 4];
         self.tail = 0;
+        self.bank_live = false;
+    }
+
+    /// Forget every delay line. Called when the room is fully off, so turning
+    /// it back on cannot replay a second of stale speech.
+    fn clear(&mut self) {
+        self.clear_bank();
+        self.uw = [0.0; 4];
         self.dirty = false;
     }
 }
@@ -900,6 +912,19 @@ fn reverb_water(
     let step_gain = (gain_t - st.gain) / n as f32;
     let step_wet = (wet_t - st.wet) / n as f32;
     let (mut gain, mut wet) = (st.gain, st.wet);
+    // The send this frame starts at, so a wet path ramping down to zero still
+    // counts while it is audible.
+    let was_wet = st.wet;
+    // With no wet path and nothing still ringing, the bank's output is
+    // multiplied by zero: skip it rather than feed it. That is the whole cost
+    // of a lane somebody once put reverb on, or of a lane that is only
+    // underwater, and it is four combs and two allpasses per sample.
+    let run_reverb = wet_t > 0.0 || was_wet > 0.0 || st.tail > 0;
+    if !run_reverb && st.bank_live {
+        // Once, on the way down: a reverb switched on later starts in an empty
+        // room rather than replaying what the lane was saying a second ago.
+        st.clear_bank();
+    }
 
     for i in 0..n {
         // Underwater first: two cascaded one-poles per channel, then the cut.
@@ -922,18 +947,20 @@ fn reverb_water(
 
         // The reverb hears the room through the water, which is what a cave
         // with a flooded floor should sound like — and one branch fewer.
-        let mono = 0.5 * (l + r) * rev_in;
         let mut w = 0.0;
-        for k in 0..4 {
-            let y = st.comb[k].read();
-            st.damp[k] += damp_a * (y - st.damp[k]);
-            st.comb[k].write(mono + st.damp[k] * fb);
-            w += y;
-        }
-        for k in 0..2 {
-            let b = st.allpass[k].read();
-            st.allpass[k].write(w + b * 0.5);
-            w = b - w;
+        if run_reverb {
+            let mono = 0.5 * (l + r) * rev_in;
+            for k in 0..4 {
+                let y = st.comb[k].read();
+                st.damp[k] += damp_a * (y - st.damp[k]);
+                st.comb[k].write(mono + st.damp[k] * fb);
+                w += y;
+            }
+            for k in 0..2 {
+                let b = st.allpass[k].read();
+                st.allpass[k].write(w + b * 0.5);
+                w = b - w;
+            }
         }
 
         if stride == 2 {
@@ -949,7 +976,15 @@ fn reverb_water(
     st.gain = gain_t;
     st.wet = wet_t;
     st.dirty = true;
-    st.tail = if had_input {
+    st.bank_live |= run_reverb;
+    // Input only counts as *reverb* input while there is a wet path to put it
+    // into. Counting every frame that carried audio re-armed the tail for ever,
+    // so a lane whose reverb was once turned up and then back to zero never
+    // reached the bypass above again: it ran four combs and two allpasses per
+    // sample for the rest of its life, and the microphone's lane — rendered
+    // every 20 ms whether or not anything is switched on — for the rest of the
+    // session.
+    st.tail = if had_input && (wet_t > 0.0 || was_wet > 0.0) {
         REVERB_TAIL_FRAMES
     } else {
         st.tail.saturating_sub(1)
@@ -960,7 +995,11 @@ fn reverb_water(
     // settings kept the mixer awake for ever and ran the comb bank on
     // subnormals through every silence. Zero the lines on the way out, so the
     // next voice starts in an empty room rather than in a denormal one.
-    if st.tail == 0 {
+    //
+    // Not while audio is still flowing through the water, though: wiping the
+    // water filters mid-stream is a click, and with the reverb off the tail sits
+    // at zero for ever, so it would be a click on every frame.
+    if st.tail == 0 && (!had_input || (wet_t == 0.0 && a >= 1.0)) {
         st.clear();
     }
     st.tail > 0
@@ -1414,6 +1453,60 @@ mod tests {
         );
         assert!(st.allpass.iter().all(|a| a.buf.iter().all(|&s| s == 0.0)));
         assert_eq!(st.uw, [0.0; 4], "the water filters kept their state");
+    }
+
+    #[test]
+    fn a_reverb_turned_back_down_stops_costing_anything() {
+        // The tail was re-armed by any frame carrying audio, wet or not, so a
+        // lane somebody once put reverb on ran four combs and two allpasses per
+        // sample for the rest of its life — and the microphone's lane, which is
+        // rendered every 20 ms whether or not anything is switched on, for the
+        // rest of the session.
+        let src: Vec<f32> = (0..960).map(|i| 0.2 * (i as f32 * 0.03).sin()).collect();
+        let mut st = ReverbWaterState::default();
+        for _ in 0..5 {
+            let mut buf = src.clone();
+            assert!(apply_reverb_water_mono(&mut buf, &mut st, 0, 8, true));
+        }
+        // Back to zero, with the speaker still talking
+        let mut closed = None;
+        for f in 0..REVERB_TAIL_FRAMES + 2 {
+            let mut buf = src.clone();
+            if !apply_reverb_water_mono(&mut buf, &mut st, 0, 0, true) {
+                closed = Some(f);
+                break;
+            }
+        }
+        let closed = closed.expect("a lane with the reverb back at zero never went quiet");
+        assert!(closed <= REVERB_TAIL_FRAMES, "it took {closed} frames");
+        // …and from there it is the bit-exact bypass again
+        let mut buf = src.clone();
+        assert!(!apply_reverb_water_mono(&mut buf, &mut st, 0, 0, true));
+        assert_eq!(buf, src, "a lane with nothing on is not a bypass");
+        for c in st.comb.iter() {
+            assert!(c.buf.iter().all(|s| *s == 0.0), "a comb kept its tail");
+        }
+    }
+
+    #[test]
+    fn underwater_alone_keeps_filtering_for_ever() {
+        // The reverb's tail rule must not wipe the water filters mid-stream: a
+        // lane that is only submerged has no tail, so a shared "wipe when the
+        // tail runs out" would reset its poles on every frame — a click at
+        // every frame boundary, for as long as the lane is underwater.
+        let src: Vec<f32> = (0..960).map(|i| 0.2 * (i as f32 * 0.3).sin()).collect();
+        let mut st = ReverbWaterState::default();
+        let mut last = Vec::new();
+        for _ in 0..REVERB_TAIL_FRAMES + 10 {
+            last = src.clone();
+            apply_reverb_water_mono(&mut last, &mut st, 8, 0, true);
+        }
+        // Still filtering (a 2.3 kHz tone against a 317 Hz cutoff is gone), and
+        // the filter is in its steady state rather than starting from zero
+        let energy: f32 = last.iter().map(|s| s * s).sum();
+        let dry: f32 = src.iter().map(|s| s * s).sum();
+        assert!(energy < dry * 0.2, "the water stopped filtering: {energy} vs {dry}");
+        assert!(st.uw.iter().any(|s| *s != 0.0), "the water filters were wiped mid-stream");
     }
 
     #[test]
@@ -1948,13 +2041,20 @@ mod tests {
         let (fx, muffle, reverb, water) = (Effect::Radio, 4u8, 6u8, 3u8);
         let lp_a = crate::spatial::muffle_lp_a(muffle);
 
-        let mut out = src.clone();
+        // Four frames, and compare the last: the shortest comb is 1215 samples,
+        // so over a single 20 ms frame the reverb has contributed exactly
+        // nothing to either side and the comparison quietly proves less than it
+        // says it does.
+        let mut out = Vec::new();
         let mut mic = SourceChain::default();
-        mic.render_mono(&mut out, fx, lp_a, water, reverb);
-
-        let mut stereo = vec![0.0f32; src.len() * 2];
+        let mut stereo = Vec::new();
         let mut incoming = SourceChain::default();
-        incoming.render(&mut stereo, &src, (1.0, 1.0), lp_a, fx, water, reverb);
+        for _ in 0..4 {
+            out = src.clone();
+            mic.render_mono(&mut out, fx, lp_a, water, reverb);
+            stereo = vec![0.0f32; src.len() * 2];
+            incoming.render(&mut stereo, &src, (1.0, 1.0), lp_a, fx, water, reverb);
+        }
 
         let mut worst = 0.0f32;
         for i in 0..src.len() {

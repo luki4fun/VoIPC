@@ -28,7 +28,6 @@ export const unreadPerChannel = writable<Map<string, number>>(new Map());
 
 // Encrypted chat history state
 export const chatUnlocked = writable<boolean>(false);
-export const chatFileExists = writable<boolean | null>(null);
 
 export interface ChatHistoryStatus {
   path_configured: boolean;

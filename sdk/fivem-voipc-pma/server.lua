@@ -48,7 +48,10 @@ exports("getPlayersInCall", function(channel)
 end)
 
 --- The client half of `setCallChannel`, which pma-voice lets a client call.
+--- Through `clientJoinCall`, so `Config.canJoinCall` gets a say: a call id is
+--- guessable, and a client that names somebody else's is in their call. That is
+--- pma-voice's own trust model, and the hook is where you narrow it.
 RegisterNetEvent("voipc-pma:call", function(channel)
   if channel ~= nil and type(channel) ~= "number" and type(channel) ~= "string" then return end
-  voipc:setPlayerCallChannel(source, channel == 0 and nil or channel)
+  voipc:clientJoinCall(source, channel == 0 and nil or channel)
 end)

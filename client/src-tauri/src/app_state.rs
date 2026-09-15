@@ -143,6 +143,19 @@ impl AppState {
     pub fn sdk_event(&self, event: SdkEvent) {
         let _ = self.sdk_events.send(event);
     }
+
+    /// The persisted config, whoever poisoned the mutex.
+    ///
+    /// One panic anywhere under this lock makes every later `lock()` return
+    /// `Err` — and this one is taken by every settings write, by the SDK
+    /// listener once a second, and on every `hello`. Unwrapping there turns one
+    /// panic into an app that can no longer save a setting or answer a mod.
+    /// `AppConfig` is a plain struct with no invariant a panic could have left
+    /// half-broken, so recovering is the right answer, and it is the one every
+    /// other mutex in this crate already gives.
+    pub fn config(&self) -> std::sync::MutexGuard<'_, crate::config::AppConfig> {
+        self.config.lock().unwrap_or_else(|p| p.into_inner())
+    }
 }
 
 /// A message waiting for encryption to become available.

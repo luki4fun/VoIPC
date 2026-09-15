@@ -38,7 +38,7 @@ end
 
 -- ── Connecting ───────────────────────────────────────────────────────────
 
-local function connect()
+local function connect(password)
   SendNUIMessage({
     type = "connect",
     url = Config.url,
@@ -49,7 +49,7 @@ local function connect()
       resource = GetCurrentResourceName(),
       server = Config.server,
       channel = Config.channel,
-      password = Config.password,
+      password = password,
     },
   })
 end
@@ -57,9 +57,19 @@ end
 -- The NUI page says when its message listener is live. Sending `connect`
 -- before that (the page loads asynchronously) would be dropped silently, and
 -- the resource would sit there doing nothing.
+--
+-- The channel's password is asked for here rather than read from `Config`:
+-- this file's config is a `shared_script`, downloaded to every player, so a
+-- password in it is a password everybody has. The server answers with it once,
+-- for a player it lets into the channel at all.
 RegisterNUICallback("ready", function(_, cb)
   cb({})
-  connect()
+  TriggerServerEvent("voipc:join")
+end)
+
+RegisterNetEvent("voipc:join", function(password)
+  if password ~= nil and type(password) ~= "string" then return end
+  connect(password)
 end)
 
 AddEventHandler("onClientResourceStop", function(resource)

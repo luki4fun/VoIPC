@@ -365,7 +365,7 @@ Runtime settings in `server_settings.json`:
 | Option | Default | Effect |
 |---|---|---|
 | `proximity` | `"off"` | `"2d"` or `"3d"` makes it a proximity room |
-| `hidden` | `false` | Not listed in the sidebar for non-admins. It can still be joined by an invite link or by the game SDK, so it is out of the way, not locked |
+| `hidden` | `false` | Not listed in the sidebar for non-admins. It can still be joined — by an invite link, by the game SDK, or by anyone who knows it is there — so it is out of the way, not locked. Give a channel a `password` if you need it shut, and both if it is the one your game drives |
 | `anonymous` | `false` | Members see each other as `Guest-1234`, a fresh name per visit. The server substitutes it everywhere, so no client ever learns the real one; admins see the real names, and no chat history is handed over in such a channel |
 | `screen_share` | `true` | `false` refuses screen sharing there |
 | `hide_members` | `false` | Non-admins see no member list, only whoever is speaking (and can still adjust their volume) |
