@@ -27,6 +27,7 @@
   import { onDestroy } from "svelte";
   import { users } from "../stores/users.js";
   import { isAdmin, isMuted, userId, username } from "../stores/connection.js";
+  import { toggleMute } from "../stores/voice.js";
   import { channels, currentChannelId } from "../stores/channels.js";
   import { addNotification } from "../stores/notifications.js";
   import { avatarColor } from "../avatar.js";
@@ -117,9 +118,10 @@
 
   function toggleStripMute(strip: Strip) {
     if (strip.own) {
-      invoke<boolean>("toggle_mute")
-        .then((m) => isMuted.set(m))
-        .catch((e) => addNotification(`Could not mute: ${e}`, "error"));
+      // Through the shared action: it patches our own row in the member list
+      // too, which a bare isMuted.set does not — muting from the desk used to
+      // leave the list showing you as unmuted until the next channel change.
+      void toggleMute();
     } else {
       void toggleUserMute(strip.id as number);
     }
@@ -305,6 +307,7 @@
           </div>
           <input
             class="fader"
+            data-no-swipe
             type="range"
             min="0"
             max={strip.own ? 4 : 2}

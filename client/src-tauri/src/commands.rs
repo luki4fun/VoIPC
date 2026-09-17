@@ -951,6 +951,26 @@ pub fn set_chat_history_disabled(
     crate::config::save_config(&config)
 }
 
+/// Store the UI's appearance preferences verbatim.
+///
+/// The one bulk setter in here, and the reason it is allowed to be one is that
+/// nothing on this side reads the value — see the `ui_prefs` field for the
+/// argument. The frontend's `stores/ui-prefs.ts` is its single writer and
+/// debounces, so this is not called per keystroke of a colour picker.
+///
+/// Only an object is accepted. A stray array or number would still round-trip,
+/// but it would mean the frontend lost track of the shape, and a config file
+/// that has to be hand-repaired later is worse than a rejected call now.
+#[tauri::command]
+pub fn set_ui_prefs(state: State<'_, AppState>, prefs: serde_json::Value) -> Result<(), String> {
+    if !prefs.is_object() {
+        return Err("ui_prefs must be an object".into());
+    }
+    let mut config = state.config();
+    config.ui_prefs = prefs;
+    crate::config::save_config(&config)
+}
+
 /// Set (or clear, with an empty string) the global deafen-toggle hotkey.
 #[tauri::command]
 pub fn set_deafen_key(state: State<'_, AppState>, key_code: String) -> Result<(), String> {

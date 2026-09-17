@@ -63,10 +63,20 @@ async function newTab() {
       errors.push(msg.params.args.map((a) => a.value ?? a.description ?? "").join(" "));
     }
   };
-  const send = (method, params = {}) =>
-    new Promise((resolve) => {
+  // Every call gets a deadline. Input.dispatchTouchEvent waits on the renderer
+  // and simply never answers if the page cannot process the event, which turned
+  // one refused touch into a fifteen-minute suite that ended in a bare 124.
+  const send = (method, params = {}, timeoutMs = 30_000) =>
+    new Promise((resolve, reject) => {
       const i = ++id;
-      pending.set(i, resolve);
+      const timer = setTimeout(() => {
+        pending.delete(i);
+        reject(new Error(`CDP timed out after ${timeoutMs}ms: ${method}`));
+      }, timeoutMs);
+      pending.set(i, (msg) => {
+        clearTimeout(timer);
+        resolve(msg);
+      });
       ws.send(JSON.stringify({ id: i, method, params }));
     });
   const evaluate = async (expression) => {
@@ -142,6 +152,22 @@ async function realDrag(tab, selector, dy) {
   return true;
 }
 
+/** A real drag along an element, `dx` pixels horizontally. */
+async function realDragX(tab, selector, dx) {
+  const at = await tab.evaluate(centre(selector));
+  if (!at) return false;
+  await tab.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: at.x, y: at.y, buttons: 0 });
+  await tab.send("Input.dispatchMouseEvent", { type: "mousePressed", x: at.x, y: at.y, button: "left", buttons: 1, clickCount: 1 });
+  for (let i = 1; i <= 5; i++) {
+    await tab.send("Input.dispatchMouseEvent", {
+      type: "mouseMoved", x: Math.round(at.x + (dx * i) / 5), y: at.y, button: "left", buttons: 1,
+    });
+  }
+  await tab.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: at.x + dx, y: at.y, button: "left", buttons: 1, clickCount: 1 });
+  await sleep(200);
+  return true;
+}
+
 /** Channel names as the sidebar renders them, in order. */
 const channelNames = `[...document.querySelectorAll(".channel .channel-name")].map((e) => e.textContent)`;
 /** Users as the member list renders them (UserList.svelte `.users > .user > .name`). */
@@ -179,8 +205,26 @@ async function connect(name) {
     await realClick(tab, ".audio-setup .skip-link");
     await waitFor(tab, `!document.querySelector(".audio-setup")`);
   }
+  await dismissLayoutPicker(tab);
   console.log(`${name}: connected`);
   return tab;
+}
+
+/**
+ * The layout picker follows the audio setup on a fresh profile.
+ *
+ * Conditional, because test-web.sh runs one Chromium with one profile: every
+ * tab shares localStorage, so the first browser is asked and the second is not.
+ * Skipping keeps the classic layout, which is what every selector below expects.
+ * Leaving it up would be worse than a timeout — it is a real overlay, so every
+ * realClick after it would land on its backdrop and read as "element not found".
+ */
+async function dismissLayoutPicker(tab) {
+  await sleep(300);
+  if (await tab.evaluate(`!!document.querySelector(".layout-setup")`)) {
+    await realClick(tab, ".layout-setup .skip-link");
+    await waitFor(tab, `!document.querySelector(".layout-setup")`);
+  }
 }
 
 /** Connect without dismissing the audio setup, for the lane that drives it. */
@@ -458,9 +502,18 @@ check("no real name reached the observer's client", !wireNames.includes("ui-alic
 // Hidden + no sharing + hidden members, set through the settings dialog
 await alice.evaluate(`(() => { const el = document.querySelector(".channel.active .settings-icon"); if (!el) return false; el.click(); return true; })()`);
 await sleep(400);
-// Order in the dialog: hidden, anonymous, hide members, allow screen sharing
-await alice.evaluate(`(() => { const b = [...document.querySelectorAll(".password-dialog .dialog-check input")];
-  b[0].click(); b[2].click(); b[3].click(); return b.length; })()`);
+// By data-opt, not by position: these used to be b[0], b[2] and b[3] of the
+// checkbox list, so inserting an option — or moving this dialog into its own
+// component, which is how it nearly happened — silently set the wrong ones and
+// failed further down as if the server were at fault.
+await alice.evaluate(`(() => {
+  const pick = (opt) => document.querySelector('.password-dialog input[data-opt="' + opt + '"]');
+  for (const opt of ["hidden", "hide-members", "screen-share"]) {
+    const el = pick(opt);
+    if (!el) throw new Error("no channel option checkbox: " + opt);
+    el.click();
+  }
+  return true; })()`);
 await alice.evaluate(click(".password-dialog .create-btn"));
 await sleep(1500);
 
@@ -566,6 +619,28 @@ check(
     (await fresh.evaluate(`JSON.parse(localStorage.getItem("voipc.settings")).audio_setup_version`)) >= 1,
   );
 
+  // The layout picker comes next on this fresh profile — it is the one lane
+  // that reaches it with nothing already answered.
+  await sleep(500);
+  check(
+    "a new user is asked which layout to use",
+    await fresh.evaluate(`!!document.querySelector(".layout-setup")`),
+  );
+  check(
+    "it offers both layouts",
+    (await fresh.evaluate(`document.querySelectorAll(".layout-setup .layout-choice").length`)) === 2,
+  );
+  await realClick(fresh, ".layout-setup .skip-link");
+  await waitFor(fresh, `!document.querySelector(".layout-setup")`);
+  check(
+    "skipping the layout question leaves it unanswered",
+    // The same rule the audio setup keeps: skip is not an answer, so the offer
+    // stands next time. Nothing tests that for the audio setup today either.
+    !(await fresh.evaluate(
+      `JSON.parse(localStorage.getItem("voipc.settings")).ui_prefs?.layout_asked_version`,
+    )),
+  );
+
   const fatal = fresh.errors.filter((e) => !/Failed to load resource/.test(e));
   check("no uncaught error during the audio setup", fatal.length === 0, fatal.slice(0, 3).join(" | "));
 }
@@ -596,6 +671,329 @@ check(
   const close = `document.querySelector(".close-btn")?.click()`;
   await alice.evaluate(close);
   await sleep(400);
+}
+
+// 10. Appearance: the palette actually reaches the document, and what it
+//     reaches it with is readable. Measured rather than eyeballed — the whole
+//     point of driving colours from tokens is that a machine can check them,
+//     and "the light theme has one invisible thing on it" is not a bug anybody
+//     files, they just switch back.
+{
+  await realClick(alice, ".settings-btn");
+  await waitFor(alice, `document.querySelector(".tab")`);
+  const appearanceTab = `[...document.querySelectorAll(".tab")].find((b) => /appearance/i.test(b.textContent))`;
+  check("Settings has an Appearance tab", await alice.evaluate(`!!(${appearanceTab})`));
+  await alice.evaluate(`(${appearanceTab}).click()`);
+  await sleep(300);
+
+  const before = await alice.evaluate(`getComputedStyle(document.body).backgroundColor`);
+
+  const pickPalette = (label) =>
+    `[...document.querySelectorAll(".swatch")].find((b) => ${JSON.stringify(label)} === b.title)`;
+  check("the palettes are offered", await alice.evaluate(`!!(${pickPalette("Discord light")})`));
+  await alice.evaluate(`(${pickPalette("Discord light")}).click()`);
+  await sleep(400);
+
+  const after = await alice.evaluate(`getComputedStyle(document.body).backgroundColor`);
+  check("switching palette repaints the app", before !== after, `${before} -> ${after}`);
+  check(
+    "a light palette says so on the document",
+    (await alice.evaluate(`document.documentElement.dataset.theme`)) === "light",
+  );
+
+  // The contrast probe. theme.test.ts holds every *shipped palette* to this,
+  // but only the live DOM can say whether the token actually reached the rule
+  // that paints the sidebar.
+  const contrast = `(() => {
+    const lum = (c) => {
+      const [r, g, b] = c.match(/\\d+/g).slice(0, 3).map(Number).map((v) => {
+        const s = v / 255;
+        return s <= 0.03928 ? s / 12.92 : Math.pow((s + 0.055) / 1.055, 2.4);
+      });
+      return 0.2126 * r + 0.7152 * g + 0.0722 * b;
+    };
+    const row = document.querySelector(".channel");
+    const list = document.querySelector(".channel-list");
+    if (!row || !list) return null;
+    const a = lum(getComputedStyle(row).color);
+    const b = lum(getComputedStyle(list).backgroundColor);
+    const [hi, lo] = a > b ? [a, b] : [b, a];
+    return Math.round(((hi + 0.05) / (lo + 0.05)) * 100) / 100;
+  })()`;
+  const ratio = await alice.evaluate(contrast);
+  check("a channel name is readable on the light sidebar", ratio !== null && ratio >= 4.5, `${ratio}:1`);
+
+  // Zoom is left at 1 deliberately: it shifts getBoundingClientRect, and the
+  // mixer geometry audit above measures real pixels.
+  await alice.evaluate(`(${pickPalette("VoIPC dark")}).click()`);
+  await sleep(400);
+  check(
+    "switching back restores the dark document",
+    (await alice.evaluate(`document.documentElement.dataset.theme`)) === "dark",
+  );
+  check(
+    "the choice is remembered",
+    (await alice.evaluate(
+      `JSON.parse(localStorage.getItem("voipc.settings")).ui_prefs?.palette`,
+    )) === "voipc-dark",
+  );
+
+  await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
+  await sleep(400);
+}
+
+// 11. The Discord layout. Switched through Settings rather than a query
+//     parameter on purpose: switching is the thing that has to work, and a
+//     test-only way in would be a code path nothing else uses.
+//
+//     The assertion that matters most here is the error census at the end of
+//     the block. Swapping shells destroys and rebuilds every child, which is
+//     exactly where a duplicate-keyed {#each} or a listener registered twice
+//     shows up — the bug class this whole file was written for.
+{
+  const openAppearance = async () => {
+    await realClick(alice, ".settings-btn");
+    await waitFor(alice, `document.querySelector(".tab")`, 8_000);
+    await alice.evaluate(
+      `[...document.querySelectorAll(".tab")].find((b) => /appearance/i.test(b.textContent)).click()`,
+    );
+    await sleep(300);
+  };
+  const pickLayout = (title) =>
+    `[...document.querySelectorAll(".layout-choice")].find((b) => /${title}/i.test(b.textContent))`;
+
+  await openAppearance();
+  check("Appearance offers both layouts", await alice.evaluate(`!!(${pickLayout("Discord style")})`));
+  await alice.evaluate(`(${pickLayout("Discord style")}).click()`);
+  await sleep(500);
+  await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
+  await sleep(500);
+
+  check("the Discord shell replaces the classic one", await alice.evaluate(
+    `!!document.querySelector(".discord-shell") && !document.querySelector(".app-layout")`,
+  ));
+  check("it has a server rail", await alice.evaluate(`!!document.querySelector(".server-rail")`));
+  check("it has a user panel", await alice.evaluate(`!!document.querySelector(".user-panel")`));
+  check("the voice bar is gone", !(await alice.evaluate(`!!document.querySelector(".voice-controls")`)));
+  check("the member list is still grouped by state", await alice.evaluate(
+    `!!document.querySelector(".user-list.discord .group-label")`,
+  ));
+
+  // One click joins, which is the whole point of this layout. In the classic
+  // one the same click only previews — asserted further up.
+  // realClick, not el.click(): the house rule at the top of this file, and a
+  // channel row is exactly the kind of thing that grows pointer behaviour.
+  //
+  // The only other channel on this server is the lobby, where voice is off — so
+  // this goes there and straight back, both in one click, and the mute checks
+  // below still have a channel to talk in. Asserting the *name* changed rather
+  // than "something is active" is what makes it a join and not a no-op.
+  const activeChannel = () =>
+    alice.evaluate(`document.querySelector(".channel-list.discord .channel.active .channel-name")?.textContent`);
+  const nextChannel = () =>
+    alice.evaluate(`document.querySelector(".channel-list.discord .channel:not(.active) .channel-name")?.textContent`);
+
+  // Assert against the row that was clicked, not merely "something is active":
+  // the first non-active row here is the lobby, and "a channel is active" is
+  // true there whether or not the click did anything.
+  const startedIn = await activeChannel();
+  const firstTarget = await nextChannel();
+  await realClick(alice, ".channel-list.discord .channel:not(.active)");
+  await sleep(1200);
+  check(
+    "one click joins the channel it was on",
+    (await activeChannel()) === firstTarget,
+    `wanted ${firstTarget}, in ${await activeChannel()}`,
+  );
+
+  // Again, to prove it was not a one-off. Deliberately not asserting we land
+  // back where we started: this server has several channels, so "the first
+  // non-active row" is not a toggle between two.
+  const secondTarget = await nextChannel();
+  await realClick(alice, ".channel-list.discord .channel:not(.active)");
+  await sleep(1200);
+  check(
+    "and it joins the next one too",
+    (await activeChannel()) === secondTarget,
+    `wanted ${secondTarget} (started in ${startedIn}), in ${await activeChannel()}`,
+  );
+
+  // The mute checks at the end of this block need a channel with voice in it.
+  // Channel 0 is the lobby, where voice is off by design, and a mute button
+  // that is absent for a good reason still reads as a broken mute button.
+  // The voice panel only renders outside the lobby, so its presence is the
+  // check — no need to know which channel id we happen to be in.
+  check(
+    "we are somewhere with voice, not the lobby",
+    await alice.evaluate(`!!document.querySelector(".voice-panel")`),
+    await activeChannel(),
+  );
+
+  // The point of the nested rows: a channel you are NOT in shows who is in it.
+  // bob is in the lobby by now, so the lobby row should name him — without
+  // hovering it, previewing it or joining it. The names for another channel are
+  // never pushed to us, so this is really a check that stores/rosters.ts asked.
+  await sleep(1200);
+  const nestedElsewhere = await alice.evaluate(`(() => {
+    const rows = [...document.querySelectorAll(".channel-list.discord .channel")];
+    const active = document.querySelector(".channel-list.discord .channel.active");
+    for (const row of rows) {
+      if (row === active) continue;
+      const nested = row.nextElementSibling;
+      if (nested && nested.classList.contains("nested")) {
+        return [...nested.querySelectorAll(".nested-name")].map((e) => e.textContent.trim());
+      }
+    }
+    return []; })()`);
+  check(
+    "a channel we are not in lists its members",
+    nestedElsewhere.length > 0,
+    JSON.stringify(nestedElsewhere),
+  );
+
+  // Room and mixer are full-screen activities here, not a centre column.
+  const mixerBtn = `[...document.querySelectorAll(".header-btn")].find((b) => /mixing desk|mixer/i.test(b.title))`;
+  if (await alice.evaluate(`!!(${mixerBtn})`)) {
+    await alice.evaluate(`(${mixerBtn}).click()`);
+    await sleep(600);
+    check("the mixer opens as an activity", await alice.evaluate(
+      `!!document.querySelector(".activity .mixer")`,
+    ));
+    await alice.send("Input.dispatchKeyEvent", {
+      type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27,
+    });
+    await alice.send("Input.dispatchKeyEvent", {
+      type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27,
+    });
+    await sleep(500);
+    check("Escape closes the activity", !(await alice.evaluate(`!!document.querySelector(".activity")`)));
+  }
+
+  // Dragging a sidebar edge, with real pointer events and real pointer capture.
+  const sidebarWidth = `document.querySelector(".discord-shell .sidebar").getBoundingClientRect().width`;
+  const widthBefore = await alice.evaluate(sidebarWidth);
+  await realDragX(alice, ".discord-shell .resize-handle", 60);
+  await sleep(400);
+  const widthAfter = await alice.evaluate(sidebarWidth);
+  check("the sidebar can be dragged wider", widthAfter > widthBefore + 20, `${widthBefore} -> ${widthAfter}`);
+  check("the new width is remembered", await alice.evaluate(
+    `JSON.parse(localStorage.getItem("voipc.settings")).ui_prefs?.panels?.discord?.sidebar > 200`,
+  ));
+
+  // Back to classic, in the same tab and with no reload.
+  await openAppearance();
+  await alice.evaluate(`(${pickLayout("Classic")}).click()`);
+  await sleep(500);
+  await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
+  await sleep(500);
+  check("switching back restores the classic shell", await alice.evaluate(
+    `!!document.querySelector(".app-layout") && !document.querySelector(".discord-shell")`,
+  ));
+  check("the connection survived both switches", await alice.evaluate(
+    `!!document.querySelector(".status-bar") && /Connected/.test(document.querySelector(".status-bar").textContent)`,
+  ));
+
+  // Push-to-talk lives outside the shells precisely so a switch cannot drop it.
+  await alice.evaluate(click('button[title^="Mute"]'));
+  await sleep(600);
+  check("mute still works after switching layouts", await alice.evaluate(rowMuted(null)) === true);
+  await alice.evaluate(click('button[title^="Unmute"]'));
+  await sleep(600);
+  check("and unmute too", await alice.evaluate(rowMuted(null)) === false);
+}
+
+// 12. The phone shape. Driven at 390px with real touch events, because none of
+//     this reproduces with a mouse: the swipe deliberately ignores a mouse
+//     pointer (there are buttons for that), and a drag's velocity — which is
+//     half the settle rule — is something only a finger has.
+{
+  const setLayout = async (title) => {
+    // At phone width the settings gear lives in the user panel, which is inside
+    // the channel drawer — so it has to be opened first, exactly as a person
+    // would. Discord puts it in the same place for the same reason.
+    if (await alice.evaluate(`getComputedStyle(document.querySelector(".drawer-btn") ?? document.body).display !== "none"`)) {
+      if (!(await alice.evaluate(`document.querySelector(".pane-left")?.getBoundingClientRect().right > 8`))) {
+        await realClick(alice, ".drawer-btn");
+        await sleep(500);
+      }
+    }
+    await realClick(alice, ".settings-btn");
+    await waitFor(alice, `document.querySelector(".tab")`, 8_000);
+    await alice.evaluate(
+      `[...document.querySelectorAll(".tab")].find((b) => /appearance/i.test(b.textContent)).click()`,
+    );
+    await sleep(300);
+    await alice.evaluate(
+      `[...document.querySelectorAll(".layout-choice")].find((b) => /${title}/i.test(b.textContent)).click()`,
+    );
+    await sleep(400);
+    await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
+    await sleep(500);
+  };
+
+  await alice.send("Emulation.setDeviceMetricsOverride", {
+    width: 390, height: 844, deviceScaleFactor: 1, mobile: true,
+  });
+  await alice.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 1 });
+  await sleep(400);
+  await setLayout("Discord style");
+
+  // The panes stack on the container's width, not the device's — which is why
+  // this also appears in a narrow desktop window.
+  check("the panes stack at phone width", await alice.evaluate(
+    `getComputedStyle(document.querySelector(".pane-main")).width === "390px"`,
+  ));
+  check("a drawer button appears", await alice.evaluate(
+    `getComputedStyle(document.querySelector(".drawer-btn")).display !== "none"`,
+  ));
+
+  const paneLeftVisible = `document.querySelector(".pane-left").getBoundingClientRect().right > 8`;
+  check("the channel drawer starts closed", !(await alice.evaluate(paneLeftVisible)));
+
+  await realClick(alice, ".drawer-btn");
+  await sleep(500);
+  check("the button opens the channel drawer", await alice.evaluate(paneLeftVisible));
+
+  // …and the button closes it again.
+  await realClick(alice, ".drawer-btn");
+  await sleep(500);
+  check("the button closes it again", !(await alice.evaluate(paneLeftVisible)));
+
+  // Settings is reachable on a phone — through the drawer, which is where the
+  // user panel lives. Worth its own check: a layout that hides its own settings
+  // behind a gesture is one you cannot get out of.
+  await realClick(alice, ".drawer-btn");
+  await sleep(500);
+  check("settings is reachable from the drawer", await alice.evaluate(
+    `(() => { const el = document.querySelector(".user-panel .settings-btn");
+      if (!el) return false;
+      const r = el.getBoundingClientRect();
+      return r.left >= 0 && r.right <= window.innerWidth && r.width > 0; })()`,
+  ));
+  await realClick(alice, ".drawer-btn");
+  await sleep(400);
+
+  // NOT TESTED HERE: closing it with a finger.
+  //
+  // `Input.dispatchTouchEvent` never answers in this headless browser — it
+  // waits on the renderer to acknowledge the event and the acknowledgement does
+  // not come, with or without --touch-events=enabled, so the call times out
+  // rather than failing. It used to hang the whole suite until the outer
+  // `timeout` killed it, which is why every CDP call now carries a deadline.
+  //
+  // What that leaves: the gesture's arithmetic — where a drag settles, and how
+  // its velocity is measured — is unit-tested in actions/swipe.test.ts, and the
+  // drawer itself is driven above through the buttons, which is the path that
+  // has to work anyway for anyone who would rather not swipe. The swipe wiring
+  // between the two is what needs a real device, and has not had one.
+
+  await setLayout("Classic");
+  await alice.send("Emulation.clearDeviceMetricsOverride");
+  await alice.send("Emulation.setTouchEmulationEnabled", { enabled: false });
+  await sleep(400);
+  check("the classic layout comes back at desktop width", await alice.evaluate(
+    `!!document.querySelector(".app-layout .main-content")`,
+  ));
 }
 
 // 7. Nothing threw anywhere. One uncaught exception in a keyed {#each} wedges

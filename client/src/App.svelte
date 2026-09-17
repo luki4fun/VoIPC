@@ -5,21 +5,19 @@
   import { get } from "svelte/store";
 
   import ConnectDialog from "./lib/components/ConnectDialog.svelte";
-  import ChannelList from "./lib/components/ChannelList.svelte";
-  import ChatPanel from "./lib/components/ChatPanel.svelte";
-  import UserList from "./lib/components/UserList.svelte";
-  import VoiceControls from "./lib/components/VoiceControls.svelte";
   import ScreenShareSourcePicker from "./lib/components/ScreenShareSourcePicker.svelte";
-  import ScreenShareViewer from "./lib/components/ScreenShareViewer.svelte";
-  import RoomView from "./lib/components/RoomView.svelte";
-  import StatusBar from "./lib/components/StatusBar.svelte";
   import SettingsPanel from "./lib/components/SettingsPanel.svelte";
   import Toast from "./lib/components/Toast.svelte";
   import ReconnectOverlay from "./lib/components/ReconnectOverlay.svelte";
   import InvitePopup from "./lib/components/InvitePopup.svelte";
   import PokePopup from "./lib/components/PokePopup.svelte";
-  import MixerView from "./lib/components/MixerView.svelte";
-  import Icon from "./lib/components/Icons.svelte";
+  import VoiceKeys from "./lib/components/VoiceKeys.svelte";
+  import LayoutSetup from "./lib/components/LayoutSetup.svelte";
+  import ClassicShell from "./lib/components/shell/ClassicShell.svelte";
+  import DiscordShell from "./lib/components/discord/DiscordShell.svelte";
+  import UserContextMenu from "./lib/components/UserContextMenu.svelte";
+  import ChannelDialogs from "./lib/components/ChannelDialogs.svelte";
+  import AdminDialogs from "./lib/components/AdminDialogs.svelte";
 
   import {
     connectionState,
@@ -48,7 +46,6 @@
     incrementChannelUnread,
     clearChannelUnread,
     chatUnlocked,
-    unreadPerChannel,
     channelMessages,
     mergeChannelHistory,
   } from "./lib/stores/chat.js";
@@ -56,6 +53,7 @@
   import AudioSetup from "./lib/components/AudioSetup.svelte";
   import type { ChannelInfo, ChatMessage, UserInfo } from "./lib/types.js";
   import { parseInviteFragment } from "./lib/invite.js";
+  import { connectTo } from "./lib/connect.js";
   import {
     inputDevice,
     outputDevice,
@@ -85,6 +83,16 @@
     defaultServer,
   } from "./lib/stores/settings.js";
   import type { AppConfig } from "./lib/stores/settings.js";
+  import { hydrateUiPrefs, layoutAskedVersion, uiLayout } from "./lib/stores/ui-prefs.js";
+  import {
+    clearRosters,
+    patchRosters,
+    requestAllRosters,
+    requestRoster,
+    setOwnRoster,
+    setRoster,
+  } from "./lib/stores/rosters.js";
+  import { LAYOUT_PICKER_VERSION } from "./lib/ui-prefs.js";
   import { voiceMode, vadThreshold } from "./lib/stores/voice.js";
   import {
     playChannelSwitchSound,
@@ -96,7 +104,6 @@
     playPokeSound,
   } from "./lib/sounds.js";
   import { isMobile, isWeb, mobileTab } from "./lib/stores/platform.js";
-  import type { MobileTab } from "./lib/stores/platform.js";
   import {
     audibleIds,
     centreView,
@@ -110,7 +117,6 @@
   } from "./lib/stores/room.js";
   import { upsertById } from "./lib/stores/upsert.js";
   import { clearMixer, cleanLane, micLane } from "./lib/stores/mixer.js";
-  import MobilePTT from "./lib/components/MobilePTT.svelte";
   import {
     addScreenShare,
     removeScreenShare,
@@ -183,6 +189,26 @@
       ($audioSetupVersion < AUDIO_SETUP_VERSION || $audioSetupRequested || missingDevice !== null),
   );
 
+  // ── First-run layout choice ────────────────────────────────────────────
+  //
+  // After the audio setup, and for the same reason it is where it is: they are
+  // connected, sitting in the lobby where voice is off, and expecting to be
+  // asked things. Audio first, because a microphone nobody can hear is what
+  // ruins a call and a layout is not.
+  let layoutPickerDone = $state(false);
+  const showLayoutSetup = $derived(
+    $connectionState === "connected" &&
+      !showAudioSetup &&
+      !layoutPickerDone &&
+      $layoutAskedVersion < LAYOUT_PICKER_VERSION,
+  );
+
+  function closeLayoutSetup() {
+    // Skipping writes nothing, so the offer stands next time — but not again
+    // this session, which is how a helpful thing becomes an obstacle.
+    layoutPickerDone = true;
+  }
+
   function closeAudioSetup() {
     audioSetupRequested.set(false);
     missingDevice = null;
@@ -216,9 +242,6 @@
       }
     })();
   });
-  // Chat pane below the screen-share viewer (desktop)
-  let viewerChatOpen = $state(true);
-
   // Invite link: join the named channel once connected and the channel list
   // is known (set from the URL fragment in onMount or by the connect dialog)
   $effect(() => {
@@ -244,6 +267,7 @@
       isAdmin.set(false);
       resetRoom();
       clearMixer();
+      clearRosters();
     }
   });
 
@@ -267,23 +291,15 @@
   }
 
   async function performAutoConnect(config: AppConfig) {
-    connectionState.set("connecting");
-    try {
-      const address = `${config.last_host}:${config.last_port ?? 9987}`;
-      const id = await invoke<number>("connect", {
-        address,
-        username: config.last_username!,
-        acceptInvalidCerts: config.last_accept_self_signed ?? false,
-      });
-      userId.set(id);
-      serverAddress.set(address);
-      username.set(config.last_username!);
-      acceptSelfSigned.set(config.last_accept_self_signed ?? false);
-      connectionState.set("connected");
-    } catch (e) {
-      console.error("Auto-connect failed:", e);
-      connectionState.set("disconnected");
-      addNotification("Auto-connect failed: " + String(e), "warning");
+    const result = await connectTo({
+      host: config.last_host!,
+      port: config.last_port ?? 9987,
+      username: config.last_username!,
+      acceptSelfSigned: config.last_accept_self_signed ?? false,
+    });
+    if (!result.ok) {
+      console.error("Auto-connect failed:", result.error);
+      addNotification("Auto-connect failed: " + result.error, "warning");
     }
   }
 
@@ -471,6 +487,9 @@
       spatialAudio.set(config.spatial_audio ?? true);
       screenAudioSpatial.set(config.screen_audio_spatial ?? true);
       audioSetupVersion.set(config.audio_setup_version ?? 0);
+      // Layout, palette, panel sizes. One blob rather than a field each — see
+      // the `ui_prefs` field in config.rs for why this one is allowed to be.
+      hydrateUiPrefs(config.ui_prefs);
       // Our own lane, as the backend has already seeded it from the same file
       micLane.set(
         cleanLane({
@@ -504,6 +523,10 @@
     const unlisteners = [
       listen<ChannelInfo[]>("channel-list", (event) => {
         channels.set(event.payload);
+        // The sidebar draws the people under every channel, and the names for
+        // any channel but our own have to be asked for — a UserJoined broadcast
+        // deliberately carries no username to outsiders.
+        requestAllRosters();
       }),
 
       listen<{ channel_id: number; users: UserInfo[] }>("user-list", (event) => {
@@ -528,6 +551,13 @@
 
         currentChannelId.set(newChannelId);
         users.set(event.payload.users);
+        setOwnRoster(newChannelId, event.payload.users);
+        // We just left one, and the channel we joined may have been listed with
+        // a roster we fetched before joining.
+        if (oldChannelId !== newChannelId) {
+          requestRoster(oldChannelId);
+          requestAllRosters();
+        }
         const joinedName = channelNameById(newChannelId);
         if (joinedName) clearChannelUnread(joinedName);
 
@@ -591,6 +621,9 @@
             )
           );
         }
+        // The broadcast told us somebody joined but not who, if it is not our
+        // channel. Coalesced, so a filling channel is one question, not ten.
+        requestRoster(event.payload.channel_id);
       }),
 
       listen<{ user_id: number; channel_id: number }>("user-left", (event) => {
@@ -621,6 +654,7 @@
               : ch
           )
         );
+        requestRoster(event.payload.channel_id);
       }),
 
       listen<{ user_id: number; muted: boolean }>("user-muted", (event) => {
@@ -631,6 +665,7 @@
               : user
           )
         );
+        patchRosters(event.payload.user_id, { is_muted: event.payload.muted });
       }),
 
       listen<{ user_id: number; deafened: boolean }>("user-deafened", (event) => {
@@ -641,6 +676,7 @@
               : user
           )
         );
+        patchRosters(event.payload.user_id, { is_deafened: event.payload.deafened });
       }),
 
       // A member of a proximity channel shared where they stand
@@ -811,7 +847,12 @@
         const { user_id: uid, is_admin } = event.payload;
         if (uid === $userId) {
           isAdmin.set(is_admin);
-          if (is_admin) addNotification("You are now a server admin", "info");
+          if (is_admin) {
+            addNotification("You are now a server admin", "info");
+            // An admin is answered about channels that refused us a moment ago,
+            // and gets real names where we were given pseudonyms.
+            requestAllRosters();
+          }
         }
         const mark = (list: UserInfo[]) =>
           list.map((u) => (u.user_id === uid ? { ...u, is_admin } : u));
@@ -903,6 +944,7 @@
 
       // Channel preview response
       listen<{ channel_id: number; users: UserInfo[] }>("channel-users", (event) => {
+        setRoster(event.payload.channel_id, event.payload.users);
         if (event.payload.channel_id === $previewChannelId) {
           previewUsers.set(event.payload.users);
         }
@@ -1015,6 +1057,7 @@
                 : user
             )
           );
+          patchRosters(event.payload.user_id, { is_screen_sharing: true });
         }
       ),
 
@@ -1028,6 +1071,7 @@
               : user
           )
         );
+        patchRosters(event.payload.user_id, { is_screen_sharing: false });
         // If we were watching this user, clear viewer state
         if ($watchingUserId === event.payload.user_id) {
           watchingUserId.set(null);
@@ -1195,127 +1239,25 @@
   <AudioSetup only={audioSetupOnly} onclose={closeAudioSetup} />
 {/if}
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="app-layout" class:mobile={$isMobile} oncontextmenu={(e) => e.preventDefault()}>
-  <div class="titlebar">
-    <span class="title">VoIPC</span>
-    <button class="settings-btn" onclick={() => (showSettings = true)} title="Settings">
-      <Icon name="settings" size={18} />
-    </button>
-  </div>
+{#if showLayoutSetup}
+  <LayoutSetup onclose={closeLayoutSetup} />
+{/if}
 
-  {#if $isMobile}
-    <!-- Mobile: single-column tabbed layout -->
-    <div class="main-content mobile-main">
-      {#if $watchingUserId !== null}
-        <ScreenShareViewer />
-      {:else if $mobileTab === 'channels'}
-        <ChannelList />
-      {:else if $mobileTab === 'chat'}
-        <ChatPanel />
-      {:else if $mobileTab === 'mixer'}
-        <MixerView />
-      {:else if $mobileTab === 'room'}
-        <RoomView />
-      {:else}
-        <UserList />
-      {/if}
-    </div>
+<!-- Push-to-talk, Ctrl+M/Ctrl+D, the tray's toggles and the voice-activation
+     polling. Mounted here rather than inside a layout on purpose: a layout is a
+     subtree that gets destroyed and rebuilt when it is switched, and doing that
+     to the key handlers mid-call would either lose push-to-talk or leave two
+     copies racing each other. -->
+<VoiceKeys />
 
-    <MobilePTT />
-    <VoiceControls />
-    <StatusBar />
+<!-- The layout itself. Both shells read the same stores; App.svelte stays the
+     event bus and the modal stack above them. -->
+{#if $uiLayout === "discord"}
+  <DiscordShell onopensettings={() => (showSettings = true)} />
+{:else}
+  <ClassicShell onopensettings={() => (showSettings = true)} />
+{/if}
 
-    <!-- Bottom tab bar -->
-    <nav class="mobile-tabs">
-      <button
-        class="tab-btn"
-        class:active={$mobileTab === 'channels'}
-        onclick={() => mobileTab.set('channels')}
-      >
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M3 12h4l3-9 4 18 3-9h4"/>
-        </svg>
-        <span>Channels</span>
-      </button>
-      <button
-        class="tab-btn"
-        class:active={$mobileTab === 'chat'}
-        onclick={() => mobileTab.set('chat')}
-      >
-        <div class="tab-icon-wrap">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-            <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
-          </svg>
-          {#if Array.from($unreadPerChannel.values()).reduce((a, b) => a + b, 0) > 0}
-            <span class="tab-badge"></span>
-          {/if}
-        </div>
-        <span>Chat</span>
-      </button>
-      {#if $currentProximity !== 'off'}
-        <button
-          class="tab-btn"
-          class:active={$mobileTab === 'room'}
-          onclick={() => mobileTab.set('room')}
-        >
-          <Icon name="room" size={20} />
-          <span>Room</span>
-        </button>
-      {/if}
-      <button
-        class="tab-btn"
-        class:active={$mobileTab === 'mixer'}
-        onclick={() => mobileTab.set('mixer')}
-      >
-        <Icon name="music-note" size={20} />
-        <span>Mixer</span>
-      </button>
-      <button
-        class="tab-btn"
-        class:active={$mobileTab === 'users'}
-        onclick={() => mobileTab.set('users')}
-      >
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-          <path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/>
-          <circle cx="9" cy="7" r="4"/>
-          <path d="M23 21v-2a4 4 0 0 0-3-3.87"/>
-          <path d="M16 3.13a4 4 0 0 1 0 7.75"/>
-        </svg>
-        <span>Users</span>
-      </button>
-    </nav>
-  {:else}
-    <!-- Desktop: 3-column layout -->
-    <div class="main-content">
-      <ChannelList />
-      {#if $watchingUserId !== null && !$poppedOut}
-        <div class="viewer-with-chat">
-          <ScreenShareViewer />
-          <button
-            class="chat-collapse"
-            onclick={() => (viewerChatOpen = !viewerChatOpen)}
-          >{viewerChatOpen ? "Hide chat ▾" : "Show chat ▴"}</button>
-          {#if viewerChatOpen}
-            <div class="viewer-chat-pane">
-              <ChatPanel />
-            </div>
-          {/if}
-        </div>
-      {:else if $centreView === 'room' && $currentProximity !== 'off'}
-        <RoomView />
-      {:else if $centreView === 'mixer'}
-        <MixerView />
-      {:else}
-        <ChatPanel />
-      {/if}
-      <UserList />
-    </div>
-
-    <VoiceControls />
-    <StatusBar />
-  {/if}
-</div>
 
 {#if showSettings}
   <SettingsPanel onclose={() => (showSettings = false)} />
@@ -1325,195 +1267,12 @@
   <ScreenShareSourcePicker />
 {/if}
 
+<!-- The member menu and the channel dialogs, shared by every list there is. -->
+<UserContextMenu />
+<ChannelDialogs />
+<AdminDialogs />
+
 <Toast />
 <InvitePopup />
 <PokePopup />
 
-<style>
-  .app-layout {
-    display: flex;
-    flex-direction: column;
-    height: 100vh;
-  }
-
-  .titlebar {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 8px 16px;
-    background: var(--bg-primary);
-    border-bottom: 1px solid var(--border);
-  }
-
-  .title {
-    font-size: 16px;
-    font-weight: 700;
-    color: var(--accent);
-    letter-spacing: 1px;
-  }
-
-  .settings-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: var(--icon-btn-size);
-    height: var(--icon-btn-size);
-    padding: 0;
-    background: transparent;
-    color: var(--text-secondary);
-    border: 1px solid transparent;
-    border-radius: var(--icon-btn-radius);
-    transition: color 0.15s, background-color 0.15s;
-  }
-
-  .settings-btn:hover {
-    color: var(--text-primary);
-    background: var(--bg-hover);
-  }
-
-  .main-content {
-    display: flex;
-    flex: 1;
-    overflow: hidden;
-  }
-
-  /* Screen-share viewer with the chat pane stacked below it */
-  .viewer-with-chat {
-    display: flex;
-    flex-direction: column;
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-  }
-
-  .viewer-with-chat > :global(.viewer) {
-    flex: 1;
-    min-height: 0;
-  }
-
-  .chat-collapse {
-    background: var(--bg-secondary);
-    color: var(--text-secondary);
-    border: none;
-    border-top: 1px solid var(--border);
-    padding: 3px 0;
-    font-size: 11px;
-    cursor: pointer;
-  }
-
-  .chat-collapse:hover {
-    color: var(--text-primary);
-  }
-
-  .viewer-chat-pane {
-    height: 280px;
-    flex-shrink: 0;
-    display: flex;
-    min-height: 0;
-  }
-
-  .viewer-chat-pane > :global(*) {
-    flex: 1;
-    min-width: 0;
-  }
-
-  /* ── Mobile layout ── */
-  .app-layout.mobile {
-    height: 100vh;
-    height: 100dvh; /* dynamic viewport height (respects on-screen keyboard) */
-  }
-
-  .app-layout.mobile .titlebar {
-    padding-top: max(8px, env(safe-area-inset-top));
-  }
-
-  .mobile-main {
-    flex-direction: column;
-  }
-
-  /* Mobile: each child fills the full width */
-  .mobile-main > :global(*) {
-    width: 100%;
-    flex: 1;
-    min-height: 0;
-  }
-
-  .mobile-tabs {
-    display: flex;
-    background: var(--bg-primary);
-    border-top: 1px solid var(--border);
-    padding: 4px 0;
-    padding-bottom: max(4px, env(safe-area-inset-bottom));
-    flex-shrink: 0;
-  }
-
-  .tab-btn {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    gap: 2px;
-    padding: 6px 0;
-    background: transparent;
-    color: var(--text-secondary);
-    border: none;
-    border-radius: 0;
-    font-size: 10px;
-    transition: color 0.15s;
-  }
-
-  .tab-btn:active {
-    transform: none;
-  }
-
-  .tab-btn.active {
-    color: var(--accent);
-  }
-
-  .tab-btn span {
-    font-size: 10px;
-    line-height: 1;
-  }
-
-  .tab-icon-wrap {
-    position: relative;
-    display: inline-flex;
-  }
-
-  .tab-badge {
-    position: absolute;
-    top: -3px;
-    right: -5px;
-    width: 8px;
-    height: 8px;
-    background: var(--error, #e53935);
-    border-radius: 50%;
-    border: 1.5px solid var(--bg-primary);
-  }
-
-  /* Mobile: override scoped child component widths */
-  .app-layout.mobile :global(.channel-list) {
-    width: 100%;
-    min-width: 0;
-    border-right: none;
-  }
-
-  .app-layout.mobile :global(.user-list) {
-    width: 100%;
-    min-width: 0;
-    border-left: none;
-  }
-
-  .app-layout.mobile :global(.chat-panel) {
-    width: 100%;
-  }
-
-  .app-layout.mobile :global(.voice-controls) {
-    flex-wrap: wrap;
-    padding: 6px 12px;
-  }
-
-  .app-layout.mobile :global(.status-bar) {
-    padding: 4px 12px;
-  }
-</style>

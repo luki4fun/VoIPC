@@ -2,6 +2,114 @@
 
 All notable changes to VoIPC are documented here.
 
+## [Unreleased]
+
+No protocol change — this is a client-only release, and the version string is
+what a server compares for exact equality, so it stays where it is.
+
+### Added — a second layout, because most people have used Discord
+
+VoIPC has always looked like TeamSpeak: channels on the left, members on the
+right, voice and status bars along the bottom. That is a good layout and it is
+not going anywhere. It is also not the one most people arriving here have spent
+years in.
+
+- **A Discord-shaped layout**, beside the existing one and switchable at any
+  time from Settings → Appearance. Server rail down the far left, channel
+  sidebar with the people in **every** channel nested under it, chat in the
+  middle, members on the right, and your own name with the mute and deafen
+  buttons in the bottom-left corner. **One click joins a channel**, which is the
+  habit the whole thing exists to match — the classic layout still previews on a
+  click and joins on a double click, and neither has learned the other's manners
+- **You can see who is where without going there.** The names for a channel you
+  are not in are never pushed to this client — a join is broadcast to everyone,
+  because it doubles as the user-count update, but it carries an empty username
+  to anyone outside the channel it names, so that moving between an anonymous
+  channel and an ordinary one cannot hand outsiders both names for the same
+  person. So the sidebar asks, through the query the server already answers
+  carefully: a channel that hides its members or carries a password tells nobody
+  outside it who is in there, an anonymous one answers with its pseudonyms, and
+  an admin is answered where everyone else is refused. Every one of those rules
+  stayed on the server, which is where it was; the client only decides when to
+  ask, and coalesces so a filling channel is one question rather than ten
+- **You are asked once**, on the first connection, while you are still in the
+  lobby where voice is off — after the audio setup, because a microphone nobody
+  can hear is what ruins a call and a layout is not. Skipping keeps the classic
+  layout and does not count as an answer, so the offer stands next time. The
+  default is the classic layout: nobody's app should rearrange itself on an
+  update
+- **The virtual room, the mixing desk and a screen share open full screen** in
+  the Discord layout, the way an Activity does, and close with Escape. The
+  classic layout keeps them in the centre column. Both read the same selector,
+  so the room button in one and the room button in the other are the same button
+- **On a phone it is Discord's phone shape**: rail and channels swipe in from
+  the left, members from the right, chat in the middle. Horizontal drags are the
+  drawer's and vertical ones stay with the scroller, so the message list still
+  scrolls at full speed; the mixer's faders and the room's avatars say they do
+  their own dragging and are left alone. There are buttons for all of it too — a
+  drawer you can only reach by swiping is a drawer some people cannot reach
+- **The sidebars can be dragged**, in either layout, and each layout remembers
+  its own widths. Double-click a divider to put it back. The member list folds
+  away and stays folded
+
+### Added — it does not have to be dark blue
+
+- **Four palettes**: VoIPC dark, Discord dark, **Discord light** — the first
+  light theme this app has had — and AMOLED black, which is genuinely black
+  rather than very dark grey, for a phone where that is a pixel that is off
+- **Every colour can be changed**, one by one, and previews as you drag the
+  picker. It is not a skinning engine; it is the seventeen custom properties the
+  whole UI was already drawn from, with a colour input each
+- **Compact messages** and a chat text size, and an interface zoom from 80% to
+  150%
+- **A palette cannot ship unreadable.** The unit tests hold every shipped
+  palette to WCAG AA on the pairs that actually occur — text on each surface,
+  the accent on a sidebar — and the browser test measures the contrast of a real
+  channel name against the real sidebar behind it, in the light theme, in the
+  live document. That is how Discord's blurple ended up slightly lighter here
+  than Discord's own: `#5865f2` is a fill colour with white on top, and as text
+  on those greys it measures 2.99:1, which is why Discord's own links are blue
+
+### Changed
+
+- **The layout is now a component, and App.svelte is the event bus.** The two
+  shells are siblings; everything under them — the channel dialogs, the member
+  menu, the admin dialogs, the create form — moved into shared modules mounted
+  once, so there is one copy of each however many layouts exist. ChannelList went
+  from 861 lines to 386, UserList from 820 to 258, VoiceControls from 607 to 369,
+  StatusBar from 368 to 150
+- **Push-to-talk, Ctrl+M, Ctrl+D and the tray's toggles live outside both
+  layouts now.** A layout is a subtree that is destroyed and rebuilt when you
+  switch it, and doing that to the key handlers mid-call would either lose
+  push-to-talk or leave two copies racing each other
+- **Appearance settings are one stored object**, opaque to the backend and owned
+  entirely by the frontend. It is the only setting written that way, and the
+  reason it may be is that nothing on the other side reads it — so a new palette
+  colour is a change in one language rather than five. Settings written by a
+  newer build survive an older one saving over them
+
+### Fixed
+
+- **Muting yourself from the mixing desk did not mute you in the member list.**
+  The desk set the flag directly instead of going through the helper that also
+  patches your own row — which exists because the server deliberately does not
+  echo your own mute back to you. So the desk said muted, the member list said
+  not, and only a channel change made them agree
+- **Android's volume-key push-to-talk opened the microphone without the app
+  knowing.** It called the command directly and never set the transmitting flag,
+  so the voice bar showed nothing and voice activation could not tell the
+  microphone was already open
+- **The phone's push-to-talk button worked in the lobby**, where voice is off:
+  holding it started a capture task with nowhere to send
+- **A mobile unread badge always fell back to a hard-coded red**, because it
+  named a colour variable that has never been defined. Four more colours carried
+  fallbacks that disagreed with the real value — dead today, and a trap for
+  whoever renamed one
+- **The channel settings dialog's checkboxes are addressed by name now.** The UI
+  test clicked them by position in the list, so adding an option — or moving the
+  dialog into its own file, which is what happened — would have quietly set the
+  wrong ones and failed somewhere else entirely
+
 ## [0.8.0] - 2026-09-11
 
 Protocol version 8 — client and server must be updated together. A channel can now ask the server to forward each voice only to the people who should hear it, which is a new channel option and a new client message; everything else here is client-side and would have shipped without a bump.

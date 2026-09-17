@@ -552,7 +552,7 @@
   }
 
   .hint.warn {
-    color: var(--warning, #faa61a);
+    color: var(--warning);
   }
 
   .error {
@@ -615,7 +615,7 @@
   }
 
   .verdict.warn {
-    color: var(--warning, #faa61a);
+    color: var(--warning);
   }
 
   .choices {

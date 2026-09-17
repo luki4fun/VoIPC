@@ -70,6 +70,21 @@ No accounts. No telemetry. No compromises.
 - Pop-out viewer window and fullscreen viewing; chat stays visible while watching
 - VPN-safe packet sizes (1280 bytes — fits inside WireGuard and OpenVPN tunnels)
 
+**Interface**
+- **Two layouts, switchable at any time.** The classic one — channels left, members right, voice and
+  status bars along the bottom — and a **Discord-style** one: server rail, channel sidebar showing
+  who is in every channel, chat in the middle, members on the right, and one click to join a
+  channel. You are asked which you want on the first connection; the classic layout is the default
+  and skipping the question keeps it
+- Seeing who is in a channel you are not in respects the same rules as everything else: a channel
+  that hides its members or has a password shows nobody, an anonymous one shows its pseudonyms, and
+  the server decides — the client is told, it does not work it out
+- On a phone the Discord layout is Discord's phone layout: channels swipe in from the left, members
+  from the right, with buttons for both
+- **Four palettes** — VoIPC dark, Discord dark, Discord light, AMOLED black — and every colour in
+  them can be changed individually. Compact messages, chat text size and an interface zoom
+- Drag the sidebars to any width; each layout remembers its own
+
 **Text Chat**
 - Channel and direct messages, both end-to-end encrypted
 - Encrypted local chat history (password-protected, AES-256-GCM)
@@ -270,7 +285,7 @@ Client-side data at rest:
 | Max voice packet | 512 bytes |
 | Max video packet | 1,280 bytes |
 | Max control message | 64 KiB |
-| Protocol version | v7 |
+| Protocol version | v8 |
 | Default port | 9987 — UDP for QUIC (all clients), TCP for the browser page |
 
 ### Project Structure

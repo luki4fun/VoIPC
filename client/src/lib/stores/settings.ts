@@ -182,6 +182,14 @@ export interface AppConfig {
   sounds: SoundSettings;
   auto_connect: boolean;
   share_channel_history: boolean;
+  /**
+   * Appearance preferences, opaque to the backend and owned entirely by
+   * `stores/ui-prefs.ts` — see the `ui_prefs` field in config.rs for why this
+   * one setting is a blob when every other is its own command. `null` means
+   * nothing has been chosen yet, which is what the first-run layout picker
+   * keys on.
+   */
+  ui_prefs: Record<string, unknown> | null;
   chat_history_path: string | null;
   chat_history_disabled: boolean;
 }

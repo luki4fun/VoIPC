@@ -13,10 +13,35 @@
   --border: #2a2a4a;
   --speaking: #4caf50;
 
+  /* Recessed surfaces and floating ones. Not derivable from the colours above:
+     on a light palette a well has to get lighter where a dark one gets darker,
+     and a shadow that reads on #1a1a2e is a bruise on #ffffff. */
+  --well: rgba(0, 0, 0, 0.15);
+  --scrollbar: #2a2a4a;
+  --shadow-menu: 0 8px 24px rgba(0, 0, 0, 0.4);
+  --shadow-dialog: 0 8px 32px rgba(0, 0, 0, 0.5);
+
+  /* Panel widths. Variables so they can be dragged and remembered; the values
+     are the ones that were hard-coded in ChannelList and UserList, so nothing
+     moves for anyone who never touches them. Each shell overrides these on its
+     own root element, which is what makes the sizes per-layout for free. */
+  --sidebar-width: 220px;
+  --memberlist-width: 180px;
+
   /* Icon button sizing */
   --icon-btn-size: 36px;
   --icon-btn-size-sm: 28px;
   --icon-btn-radius: 8px;
+
+  /* Chat message size and spacing, driven by Settings → Appearance. */
+  --chat-font-size: 13px;
+  --msg-gap: 8px;
+}
+
+/* Compact packs the message list the way Discord's compact mode does: the
+   grouping itself is unchanged, only the air between groups. */
+:root[data-density="compact"] {
+  --msg-gap: 2px;
 }
 
 * {
@@ -46,6 +71,14 @@ select {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23a0a0a0' stroke-width='1.5'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 10px center;
+}
+
+/* The one rule a palette cannot express: the chevron above is an inlined SVG
+   data URL, and a data URL cannot read a custom property. So the stroke colour
+   is duplicated here for light palettes rather than tokenised. Keep this list
+   short — anything that *can* be a token should be one. */
+:root[data-theme="light"] select {
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%234e5058' stroke-width='1.5'/%3E%3C/svg%3E");
 }
 
 select option {
@@ -133,7 +166,9 @@ input:focus {
 }
 
 ::-webkit-scrollbar-thumb {
-  background: var(--border);
+  /* Its own token, not --border: on a light palette a border is a hairline
+     against a panel and a thumb that faint is one nobody can grab. */
+  background: var(--scrollbar);
   border-radius: 3px;
 }
 

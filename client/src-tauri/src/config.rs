@@ -173,6 +173,24 @@ pub struct AppConfig {
     /// Answer newcomers' requests for recent channel chat (E2E, pairwise).
     pub share_channel_history: bool,
 
+    // Appearance
+    /// Everything the UI remembers about how it looks: which layout, which
+    /// palette and any per-colour overrides, panel widths, message density,
+    /// zoom.
+    ///
+    /// Deliberately opaque to Rust and round-tripped verbatim. Nothing here has
+    /// a second owner — no Rust code reads a byte of it — so unlike the audio
+    /// and hotkey settings it is written as one blob rather than through a
+    /// command per field. That also means a new palette colour is a TypeScript
+    /// change and nothing else, and a client that meets a file written by a
+    /// newer one keeps the keys it does not understand instead of dropping
+    /// them on the next save.
+    ///
+    /// A `Value` rather than a `String` so `settings.json` stays readable and
+    /// hand-editable instead of carrying one long escaped line.
+    #[serde(default)]
+    pub ui_prefs: serde_json::Value,
+
     // Storage
     /// Path to the encrypted chat history file. None = not yet configured (first run).
     pub chat_history_path: Option<String>,
@@ -220,6 +238,10 @@ impl Default for AppConfig {
             sounds: SoundSettings::default(),
             auto_connect: false,
             share_channel_history: true,
+            // Null, not `{}`: "nothing has been chosen yet" is the state the
+            // first-run layout picker keys on, and an empty object would be
+            // indistinguishable from a user who reset every preference.
+            ui_prefs: serde_json::Value::Null,
             chat_history_path: None,
             chat_history_disabled: false,
         }
@@ -332,4 +354,42 @@ pub fn save_config(config: &AppConfig) -> Result<(), String> {
 pub fn delete_config() {
     let path = config_path();
     let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The appearance blob is the one field this side never reads, which is
+    /// exactly why it is worth pinning: if it stopped round-tripping, nothing
+    /// in Rust would notice and the user would just find their layout reset.
+    #[test]
+    fn ui_prefs_round_trip_verbatim() {
+        let mut config = AppConfig::default();
+        config.ui_prefs = serde_json::json!({
+            "layout": "discord",
+            "palette_overrides": { "--accent": "#ff0000" },
+            // A key a newer build wrote and this one knows nothing about. It
+            // has to survive, or running two versions against one config file
+            // loses a setting on every save.
+            "something_from_the_future": [1, 2, 3],
+        });
+
+        let text = serde_json::to_string_pretty(&config).expect("serialize");
+        let back: AppConfig = serde_json::from_str(&text).expect("deserialize");
+
+        assert_eq!(back.ui_prefs, config.ui_prefs);
+        // Readable, not one long escaped line — the reason the field is a
+        // `Value` rather than a `String`.
+        assert!(text.contains("\"--accent\": \"#ff0000\""), "{text}");
+    }
+
+    /// A config written before this field existed must still load.
+    #[test]
+    fn a_config_without_ui_prefs_still_loads() {
+        let older = r#"{ "volume": 0.5, "ptt_key": "KeyV" }"#;
+        let config: AppConfig = serde_json::from_str(older).expect("deserialize");
+        assert_eq!(config.ui_prefs, serde_json::Value::Null);
+        assert_eq!(config.ptt_key, "KeyV");
+    }
 }

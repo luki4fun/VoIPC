@@ -1,294 +1,59 @@
 <script lang="ts">
-  import { invoke } from "@tauri-apps/api/core";
-  import { onDestroy } from "svelte";
-  import { channels, currentChannelId, previewChannelId, previewUsers } from "../stores/channels.js";
-  import { users, speakingUsers, visibleMembers } from "../stores/users.js";
-  import { userId, isAdmin } from "../stores/connection.js";
-  import { openDm } from "../stores/chat.js";
-  import { watchingUserId, currentFrame } from "../stores/screenshare.js";
-  import { addNotification } from "../stores/notifications.js";
-  import { audibleIds, centreView } from "../stores/room.js";
-  import { isMobile, mobileTab } from "../stores/platform.js";
-  import { selectedStrip, setUserVolume, toggleUserMute, userVolumes, volumeOf } from "../stores/mixer.js";
+  // The member list of the classic layout.
+  //
+  // Rows only. Who may appear in them, and who may be kicked or invited, are
+  // rules rather than styling and live in stores/roster.ts; the right-click menu
+  // and its dialogs are UserContextMenu.svelte, mounted once by App.svelte. Both
+  // exist because there are two member lists now and neither of those things
+  // should be written twice — least of all the hide-members rule.
+
+  import { userId } from "../stores/connection.js";
+  import { speakingUsers } from "../stores/users.js";
+  import { audibleIds } from "../stores/room.js";
+  import {
+    displayChannelCreatorId,
+    displayChannelId,
+    displayChannelName,
+    displayUsers,
+    hideMembers,
+    isCulled,
+    isPreviewing,
+  } from "../stores/roster.js";
+  import { openUserMenu } from "../stores/user-menu.js";
   import Icon from "./Icons.svelte";
-  import type { UserInfo } from "../types.js";
-
-  // Are we previewing a different channel?
-  let isPreviewing = $derived(
-    $previewChannelId !== null && $previewChannelId !== $currentChannelId
-  );
-
-  /**
-   * Is this member one the game is currently leaving out of the mix? `null`
-   * means no game is culling. Never applies to the preview of another channel,
-   * which the game is not driving. See `audibleIds` for why this is shown.
-   */
-  function isCulled(id: number, audible: Set<number> | null): boolean {
-    return !isPreviewing && audible !== null && id !== $userId && !audible.has(id);
-  }
-
-  // Which channel's info to show
-  let displayChannelId = $derived(
-    isPreviewing ? $previewChannelId! : $currentChannelId
-  );
-
-  // A channel may hide its members from non-admins. Whoever speaks appears
-  // for a while, so their volume can still be adjusted; after that they fade
-  // out of the list again.
-  const SPEAKER_LINGER_MS = 10_000;
-  let recentSpeakers = $state(new Set<number>());
-  let speakerTimers = new Map<number, ReturnType<typeof setTimeout>>();
-
-  let hideMembers = $derived(
-    !$isAdmin &&
-      ($channels.find((c) => c.channel_id === displayChannelId)?.hide_members ?? false)
-  );
-
-  $effect(() => {
-    if (!hideMembers) return;
-    for (const id of $speakingUsers) {
-      clearTimeout(speakerTimers.get(id));
-      if (!recentSpeakers.has(id)) recentSpeakers = new Set(recentSpeakers).add(id);
-      speakerTimers.set(
-        id,
-        setTimeout(() => {
-          const next = new Set(recentSpeakers);
-          next.delete(id);
-          recentSpeakers = next;
-          speakerTimers.delete(id);
-        }, SPEAKER_LINGER_MS),
-      );
-    }
-  });
-
-  onDestroy(() => {
-    for (const t of speakerTimers.values()) clearTimeout(t);
-    speakerTimers.clear();
-  });
-
-  let displayUsers = $derived(
-    visibleMembers(
-      isPreviewing ? $previewUsers : $users,
-      $userId,
-      recentSpeakers,
-      hideMembers && !isPreviewing,
-    )
-  );
-
-  let channelName = $derived(
-    $channels.find((c) => c.channel_id === displayChannelId)?.name ?? ""
-  );
-
-  // Creator info for the displayed channel
-  let displayChannelCreatorId = $derived(
-    $channels.find((c) => c.channel_id === displayChannelId)?.created_by ?? null
-  );
-
-  // Creator of the user's CURRENT channel (for invite permissions)
-  let currentChannelCreatorId = $derived(
-    $channels.find((c) => c.channel_id === $currentChannelId)?.created_by ?? null
-  );
-
-  let isCurrentChannelCreator = $derived(
-    currentChannelCreatorId === $userId && $currentChannelId !== 0
-  );
-
-  // Channel kick: the creator in their own channel, an admin in any channel
-  let canKick = $derived(
-    displayChannelId !== 0 &&
-      ((!isPreviewing && displayChannelCreatorId === $userId) || $isAdmin)
-  );
-
-  // Invite is available when previewing another channel and you're creator of your current channel
-  let canInvite = $derived(
-    isPreviewing && isCurrentChannelCreator
-  );
-
-  async function kickUser(targetUserId: number) {
-    try {
-      await invoke("kick_user", {
-        channelId: displayChannelId,
-        userId: targetUserId,
-      });
-    } catch (e) {
-      console.error("Failed to kick user:", e);
-    }
-  }
-
-  async function inviteUser(targetUserId: number) {
-    try {
-      await invoke("send_invite", {
-        channelId: $currentChannelId,
-        targetUserId,
-      });
-    } catch (e) {
-      console.error("Failed to invite user:", e);
-    }
-  }
-
-  // Poke dialog state
-  let pokeTarget = $state<{ userId: number; username: string } | null>(null);
-  let pokeMessage = $state("");
-
-  function openPokeDialog(targetUserId: number, targetUsername: string) {
-    pokeTarget = { userId: targetUserId, username: targetUsername };
-    pokeMessage = "";
-  }
-
-  function cancelPoke() {
-    pokeTarget = null;
-    pokeMessage = "";
-  }
-
-  async function sendPoke() {
-    if (!pokeTarget) return;
-    const { userId: targetUserId } = pokeTarget;
-    const message = pokeMessage;
-    pokeTarget = null;
-    pokeMessage = "";
-    try {
-      await invoke("send_poke", { targetUserId, message });
-    } catch (e) {
-      console.error("Failed to poke user:", e);
-    }
-  }
-
-  function handlePokeKeydown(e: KeyboardEvent) {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      sendPoke();
-    } else if (e.key === "Escape") {
-      cancelPoke();
-    }
-  }
-
-  // Admin actions (server kick / IP ban) ask for a reason first
-  type AdminAction = { kind: "kick" | "ban"; userId: number; username: string; durationSecs: number; label: string };
-  let adminAction = $state<AdminAction | null>(null);
-  let adminReason = $state("");
-
-  function openAdminAction(user: UserInfo, kind: "kick" | "ban", durationSecs: number, label: string) {
-    adminAction = { kind, userId: user.user_id, username: user.username, durationSecs, label };
-    adminReason = "";
-  }
-
-  async function confirmAdminAction() {
-    if (!adminAction) return;
-    const a = adminAction;
-    const reason = adminReason;
-    adminAction = null;
-    adminReason = "";
-    try {
-      if (a.kind === "kick") {
-        await invoke("admin_kick", { userId: a.userId, reason });
-      } else {
-        await invoke("admin_ban", { userId: a.userId, reason, durationSecs: a.durationSecs });
-      }
-    } catch (e) {
-      addNotification(`Admin action failed: ${e}`, "error");
-    }
-  }
-
-  function handleAdminKeydown(e: KeyboardEvent) {
-    if (e.key === "Enter") {
-      e.preventDefault();
-      confirmAdminAction();
-    } else if (e.key === "Escape") {
-      adminAction = null;
-    }
-  }
-
-  async function watchUser(targetUserId: number) {
-    try {
-      await invoke("watch_screen_share", { sharerUserId: targetUserId });
-      watchingUserId.set(targetUserId);
-      currentFrame.set(null);
-    } catch (e: any) {
-      addNotification(e.toString(), "error");
-    }
-  }
-
-  // Per-user volume lives in one store, shared with the mixer: this used to be
-  // a component-local record, so the same person had two different volumes
-  // depending on which control you were looking at.
-  function getUserVolume(uid: number): number {
-    return $userVolumes.get(uid) ?? 1.0;
-  }
-
-  function handleUserVolumeInput(targetUserId: number, e: Event) {
-    setUserVolume(targetUserId, parseFloat((e.target as HTMLInputElement).value));
-  }
-
-  // Context menu state
-  let contextMenu = $state<{ user: UserInfo; x: number; y: number } | null>(null);
-  let contextMenuEl: HTMLDivElement | undefined = $state(undefined);
-
-  function showContextMenu(user: UserInfo, e: MouseEvent) {
-    e.preventDefault();
-    e.stopPropagation();
-    if (user.user_id === $userId) return;
-    contextMenu = { user, x: e.clientX, y: e.clientY };
-  }
-
-  function closeContextMenu() {
-    contextMenu = null;
-  }
-
-  // Reposition context menu if it overflows viewport
-  $effect(() => {
-    if (contextMenu && contextMenuEl) {
-      const rect = contextMenuEl.getBoundingClientRect();
-      let { x, y } = contextMenu;
-      if (rect.right > window.innerWidth) {
-        x = window.innerWidth - rect.width - 8;
-      }
-      if (rect.bottom > window.innerHeight) {
-        y = window.innerHeight - rect.height - 8;
-      }
-      if (x !== contextMenu.x || y !== contextMenu.y) {
-        contextMenu = { ...contextMenu, x, y };
-      }
-    }
-  });
-
-  function handleContextMenuKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape") closeContextMenu();
-  }
 </script>
-
-<svelte:window onkeydown={contextMenu ? handleContextMenuKeydown : undefined} />
 
 <div class="user-list">
   <div class="header">
-    {#if isPreviewing}
-      Previewing #{channelName}
+    {#if $isPreviewing}
+      Previewing #{$displayChannelName}
     {:else}
-      Users in #{channelName}
+      Users in #{$displayChannelName}
     {/if}
   </div>
-  {#if hideMembers && !isPreviewing}
+  {#if $hideMembers && !$isPreviewing}
     <div class="hidden-note">Members are hidden here — people appear while they speak</div>
   {/if}
   <div class="users">
-    {#each displayUsers as user (user.user_id)}
+    {#each $displayUsers as user (user.user_id)}
       <div
         class="user"
-        class:speaking={!isPreviewing && $speakingUsers.has(user.user_id)}
-        class:culled={isCulled(user.user_id, $audibleIds)}
-        title={isCulled(user.user_id, $audibleIds)
+        class:speaking={!$isPreviewing && $speakingUsers.has(user.user_id)}
+        class:culled={isCulled(user.user_id, $audibleIds, $userId, $isPreviewing)}
+        title={isCulled(user.user_id, $audibleIds, $userId, $isPreviewing)
           ? "Out of earshot in the game — close it to hear everyone again"
           : undefined}
-        oncontextmenu={(e) => showContextMenu(user, e)}
+        oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); openUserMenu(user, e.clientX, e.clientY); }}
       >
         <div
           class="indicator"
-          class:speaking={!isPreviewing && $speakingUsers.has(user.user_id)}
+          class:speaking={!$isPreviewing && $speakingUsers.has(user.user_id)}
           class:muted={user.is_muted}
           class:deafened={user.is_deafened}
         ></div>
         <span class="name">
           {user.username}
-          {#if user.user_id === displayChannelCreatorId && displayChannelId !== 0}
+          {#if user.user_id === $displayChannelCreatorId && $displayChannelId !== 0}
             <span class="crown" title="Channel creator"><Icon name="crown" size={12} /></span>
           {/if}
           {#if user.is_admin}
@@ -317,7 +82,7 @@
           <button
             class="more-btn"
             title="Actions"
-            onclick={(e) => { e.stopPropagation(); showContextMenu(user, e); }}
+            onclick={(e) => { e.stopPropagation(); openUserMenu(user, e.clientX, e.clientY); }}
           >
             <Icon name="more-vertical" size={16} />
           </button>
@@ -325,165 +90,18 @@
       </div>
     {/each}
   </div>
-  {#if isPreviewing}
+  {#if $isPreviewing}
     <div class="preview-hint">Double-click channel to join</div>
   {/if}
 </div>
-
-<!-- Context menu -->
-{#if contextMenu}
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="ctx-overlay" onclick={closeContextMenu}>
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div
-      class="ctx-menu"
-      style="left: {contextMenu.x}px; top: {contextMenu.y}px;"
-      onclick={(e) => e.stopPropagation()}
-      bind:this={contextMenuEl}
-    >
-      {#if !isPreviewing && contextMenu.user.is_screen_sharing}
-        <button class="ctx-item" onclick={() => { watchUser(contextMenu!.user.user_id); closeContextMenu(); }}>
-          <Icon name="play" size={16} />
-          <span>Watch Screen</span>
-        </button>
-      {/if}
-      <button class="ctx-item" onclick={() => { openDm(contextMenu!.user.user_id, contextMenu!.user.username, $userId); closeContextMenu(); }}>
-        <Icon name="direct-message" size={16} />
-        <span>Direct Message</span>
-      </button>
-      <button class="ctx-item" onclick={() => { openPokeDialog(contextMenu!.user.user_id, contextMenu!.user.username); closeContextMenu(); }}>
-        <Icon name="poke" size={16} />
-        <span>Poke</span>
-      </button>
-      {#if !isPreviewing}
-        <button
-          class="ctx-item"
-          onclick={() => {
-            selectedStrip.set(contextMenu!.user.user_id);
-            if ($isMobile) mobileTab.set("mixer");
-            else centreView.set("mixer");
-            closeContextMenu();
-          }}
-        >
-          <Icon name="music-note" size={16} />
-          <span>Mixer…</span>
-        </button>
-      {/if}
-      {#if canInvite}
-        <button class="ctx-item" onclick={() => { inviteUser(contextMenu!.user.user_id); closeContextMenu(); }}>
-          <Icon name="invite" size={16} />
-          <span>Invite to Channel</span>
-        </button>
-      {/if}
-      {#if canKick}
-        <div class="ctx-separator"></div>
-        <button class="ctx-item danger" onclick={() => { kickUser(contextMenu!.user.user_id); closeContextMenu(); }}>
-          <Icon name="kick" size={16} />
-          <span>Kick from channel</span>
-        </button>
-      {/if}
-      {#if $isAdmin}
-        <div class="ctx-separator"></div>
-        <button class="ctx-item danger" onclick={() => { openAdminAction(contextMenu!.user, "kick", 0, "Kick from server"); closeContextMenu(); }}>
-          <Icon name="shield" size={16} />
-          <span>Kick from server</span>
-        </button>
-        <button class="ctx-item danger" onclick={() => { openAdminAction(contextMenu!.user, "ban", 3600, "Ban for 1 hour"); closeContextMenu(); }}>
-          <Icon name="ban" size={16} />
-          <span>Ban 1 hour</span>
-        </button>
-        <button class="ctx-item danger" onclick={() => { openAdminAction(contextMenu!.user, "ban", 86400, "Ban for 24 hours"); closeContextMenu(); }}>
-          <Icon name="ban" size={16} />
-          <span>Ban 24 hours</span>
-        </button>
-        <button class="ctx-item danger" onclick={() => { openAdminAction(contextMenu!.user, "ban", 0, "Ban until server restart"); closeContextMenu(); }}>
-          <Icon name="ban" size={16} />
-          <span>Ban until restart</span>
-        </button>
-      {/if}
-      {#if !isPreviewing}
-        <div class="ctx-separator"></div>
-        <div class="ctx-volume">
-          <button
-            class="ctx-mute-btn"
-            class:muted={getUserVolume(contextMenu.user.user_id) === 0}
-            title={getUserVolume(contextMenu.user.user_id) === 0 ? "Unmute user" : "Mute user"}
-            onclick={() => toggleUserMute(contextMenu!.user.user_id)}
-          >
-            <Icon name={getUserVolume(contextMenu.user.user_id) === 0 ? "volume-off" : "volume"} size={16} />
-          </button>
-          <input
-            type="range"
-            class="ctx-vol-slider"
-            min="0"
-            max="2"
-            step="0.05"
-            value={getUserVolume(contextMenu.user.user_id)}
-            oninput={(e) => handleUserVolumeInput(contextMenu!.user.user_id, e)}
-            title="Volume: {Math.round(getUserVolume(contextMenu!.user.user_id) * 100)}%"
-          />
-        </div>
-      {/if}
-    </div>
-  </div>
-{/if}
-
-{#if pokeTarget}
-  <div class="poke-overlay" onclick={cancelPoke} onkeydown={() => {}} role="presentation">
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="poke-dialog" onclick={(e) => e.stopPropagation()}>
-      <div class="poke-dialog-header">Poke {pokeTarget.username}</div>
-      <input
-        class="poke-input"
-        type="text"
-        placeholder="Message (optional)"
-        bind:value={pokeMessage}
-        onkeydown={handlePokeKeydown}
-        maxlength="200"
-        autofocus
-      />
-      <div class="poke-dialog-actions">
-        <button class="poke-cancel-btn" onclick={cancelPoke}>Cancel</button>
-        <button class="poke-send-btn" onclick={sendPoke}>Poke</button>
-      </div>
-    </div>
-  </div>
-{/if}
-
-{#if adminAction}
-  <div class="poke-overlay" onclick={() => (adminAction = null)} onkeydown={() => {}} role="presentation">
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="poke-dialog" onclick={(e) => e.stopPropagation()}>
-      <div class="poke-dialog-header">{adminAction.label}: {adminAction.username}</div>
-      {#if adminAction.kind === "ban"}
-        <div class="admin-hint">
-          Bans the user's IP address, so everyone behind the same address is affected.
-          Bans live in server memory until they expire or the server restarts.
-        </div>
-      {/if}
-      <input
-        class="poke-input"
-        type="text"
-        placeholder="Reason (shown to the user)"
-        bind:value={adminReason}
-        onkeydown={handleAdminKeydown}
-        maxlength="200"
-        autofocus
-      />
-      <div class="poke-dialog-actions">
-        <button class="poke-cancel-btn" onclick={() => (adminAction = null)}>Cancel</button>
-        <button class="poke-send-btn danger" onclick={confirmAdminAction}>{adminAction.kind === "kick" ? "Kick" : "Ban"}</button>
-      </div>
-    </div>
-  </div>
-{/if}
 
 <style>
   .user-list {
     display: flex;
     flex-direction: column;
     height: 100%;
-    width: 180px;
+    /* Per-shell, like the channel sidebar — see ChannelList. */
+    width: var(--memberlist-width, 180px);
     min-width: 140px;
     flex-shrink: 1;
     border-left: 1px solid var(--border);
@@ -542,17 +160,6 @@
     color: var(--accent);
     margin-left: 4px;
     vertical-align: middle;
-  }
-
-  .admin-hint {
-    font-size: 12px;
-    color: var(--text-secondary);
-    line-height: 1.4;
-    margin-bottom: 8px;
-  }
-
-  .poke-send-btn.danger {
-    background: var(--danger);
   }
 
   .indicator {
@@ -636,7 +243,7 @@
   }
 
   .more-btn:hover {
-    background: rgba(255, 255, 255, 0.1);
+    background: var(--bg-hover);
     color: var(--text-primary);
   }
 
@@ -647,174 +254,5 @@
     text-align: center;
     border-top: 1px solid var(--border);
     font-style: italic;
-  }
-
-  /* Context menu */
-  .ctx-overlay {
-    position: fixed;
-    inset: 0;
-    z-index: 200;
-  }
-
-  .ctx-menu {
-    position: fixed;
-    min-width: 180px;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 4px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-    z-index: 201;
-  }
-
-  .ctx-item {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    width: 100%;
-    padding: 8px 12px;
-    background: transparent;
-    color: var(--text-secondary);
-    font-size: 13px;
-    border: none;
-    border-radius: 4px;
-    cursor: pointer;
-    text-align: left;
-  }
-
-  .ctx-item:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
-  }
-
-  .ctx-item.danger:hover {
-    background: rgba(231, 76, 60, 0.15);
-    color: var(--danger);
-  }
-
-  .ctx-separator {
-    height: 1px;
-    background: var(--border);
-    margin: 4px 0;
-  }
-
-  .ctx-volume {
-    display: flex;
-    align-items: center;
-    gap: 6px;
-    padding: 6px 12px;
-  }
-
-  .ctx-mute-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 28px;
-    height: 28px;
-    padding: 0;
-    background: transparent;
-    color: var(--text-secondary);
-    border: none;
-    border-radius: 4px;
-    cursor: pointer;
-    flex-shrink: 0;
-  }
-
-  .ctx-mute-btn:hover {
-    background: rgba(255, 255, 255, 0.1);
-    color: var(--text-primary);
-  }
-
-  .ctx-mute-btn.muted {
-    color: var(--danger);
-  }
-
-  .ctx-vol-slider {
-    flex: 1;
-    height: 4px;
-    accent-color: var(--accent);
-    background: transparent;
-    border: none;
-    padding: 0;
-    min-width: 0;
-  }
-
-  /* Poke dialog */
-  .poke-overlay {
-    position: fixed;
-    inset: 0;
-    background: rgba(0, 0, 0, 0.5);
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    z-index: 100;
-  }
-
-  .poke-dialog {
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    padding: 16px;
-    width: 300px;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
-  }
-
-  .poke-dialog-header {
-    font-size: 14px;
-    font-weight: 600;
-    color: var(--text-primary);
-    margin-bottom: 12px;
-  }
-
-  .poke-input {
-    width: 100%;
-    padding: 8px 10px;
-    background: var(--bg-primary);
-    color: var(--text-primary);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    font-size: 13px;
-    outline: none;
-    box-sizing: border-box;
-  }
-
-  .poke-input:focus {
-    border-color: var(--accent);
-  }
-
-  .poke-dialog-actions {
-    display: flex;
-    justify-content: flex-end;
-    gap: 8px;
-    margin-top: 12px;
-  }
-
-  .poke-cancel-btn {
-    background: transparent;
-    color: var(--text-secondary);
-    border: 1px solid var(--border);
-    padding: 6px 14px;
-    font-size: 12px;
-    border-radius: 4px;
-    cursor: pointer;
-  }
-
-  .poke-cancel-btn:hover {
-    color: var(--text-primary);
-    border-color: var(--text-secondary);
-  }
-
-  .poke-send-btn {
-    background: var(--accent);
-    color: white;
-    border: none;
-    padding: 6px 14px;
-    font-size: 12px;
-    border-radius: 4px;
-    cursor: pointer;
-  }
-
-  .poke-send-btn:hover {
-    opacity: 0.9;
   }
 </style>

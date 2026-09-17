@@ -1,7 +1,7 @@
 import { writable } from 'svelte/store';
 import { invoke } from '@tauri-apps/api/core';
 import { addNotification } from './notifications';
-import { setSelfDeafened, setSelfMuted } from './connection';
+import { startTransmit, stopTransmit, toggleDeafen, toggleMute } from './voice';
 
 /** true in the browser build (web client), false in the Tauri app (desktop/Android). */
 export const isWeb: boolean = __WEB__;
@@ -35,12 +35,17 @@ if (typeof window !== 'undefined') {
   // These are called from MainActivity.kt via evaluateJavascript(). The web
   // client has no native side, so an Android browser gets none of them.
   if (isAndroid && !isWeb) {
-    // Volume key PTT press/release
+    // Volume key PTT press/release.
+    //
+    // Through the shared actions, which also set `isTransmitting` — invoking
+    // the commands directly opened the microphone without anything in the UI
+    // knowing, so the voice bar showed nothing and the voice-activation
+    // auto-start could not tell the mic was already open.
     (window as any).__voipc_ptt_press = () => {
-      invoke('start_transmit').catch(() => {});
+      void startTransmit();
     };
     (window as any).__voipc_ptt_release = () => {
-      invoke('stop_transmit').catch(() => {});
+      void stopTransmit();
     };
 
     // Notification action: disconnect
@@ -53,11 +58,11 @@ if (typeof window !== 'undefined') {
     // them, and nothing else in the app learns about a toggle made from the
     // notification shade.
     (window as any).__voipc_toggle_mute = () => {
-      invoke<boolean>('toggle_mute').then(setSelfMuted).catch(() => {});
+      void toggleMute();
     };
 
     (window as any).__voipc_toggle_deafen = () => {
-      invoke<boolean>('toggle_deafen').then(setSelfDeafened).catch(() => {});
+      void toggleDeafen();
     };
 
     // Permission denial feedback from MainActivity

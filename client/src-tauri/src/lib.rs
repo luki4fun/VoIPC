@@ -326,6 +326,7 @@ pub fn run() {
             commands::set_mute_key,
             commands::set_deafen_key,
             commands::set_chat_history_disabled,
+            commands::set_ui_prefs,
             // Chat history (encrypted file)
             commands::get_chat_history_status,
             commands::unlock_chat_history,

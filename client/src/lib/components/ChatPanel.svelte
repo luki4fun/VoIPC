@@ -1,4 +1,17 @@
 <script lang="ts">
+  import type { Snippet } from "svelte";
+
+  interface Props {
+    /**
+     * Extra controls for the right-hand end of the header.
+     *
+     * The classic layout has a voice bar to put its room and mixer buttons in;
+     * the Discord one does not, so they live here. A snippet rather than a
+     * `variant` string: one prop, and the shell keeps its own markup.
+     */
+    headerExtra?: Snippet;
+  }
+  let { headerExtra }: Props = $props();
   import { invoke } from "@tauri-apps/api/core";
   import { tick } from "svelte";
   import { channels, currentChannelId, previewChannelId } from "../stores/channels.js";
@@ -209,7 +222,7 @@
 <svelte:window onclick={() => { if (showEmojiPicker) showEmojiPicker = false; }} onkeydown={showEmojiPicker ? handleEmojiKeydown : undefined} />
 
 <div class="chat-panel">
-  <div class="chat-header">
+  <div class="chat-header" class:custom={headerExtra}>
     {#if isDmMode}
       <button class="back-btn" onclick={backToChannel} title="Back to channel chat"><Icon name="arrow-left" size={16} /></button>
       <span class="chat-title">DM with {$activeDmUsername}</span>
@@ -224,6 +237,9 @@
     {/if}
     {#if displayMessages.length > 0 && !isLobby}
       <button class="clear-chat-btn" onclick={clearCurrentChat} title="Clear chat history"><Icon name="trash" size={16} /></button>
+    {/if}
+    {#if headerExtra}
+      <span class="header-extra">{@render headerExtra()}</span>
     {/if}
   </div>
 
@@ -437,6 +453,19 @@
     color: var(--text-primary);
   }
 
+  /* The clear button sits at the right end unless the shell put controls
+     there, in which case they take the margin and it stays beside the title. */
+  .chat-header.custom .clear-chat-btn {
+    margin-left: 0;
+  }
+
+  .header-extra {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+  }
+
   .clear-chat-btn {
     display: flex;
     align-items: center;
@@ -486,12 +515,12 @@
     display: flex;
     align-items: baseline;
     gap: 8px;
-    margin-top: 8px;
+    margin-top: var(--msg-gap, 8px);
     margin-bottom: 2px;
   }
 
   .msg-username {
-    font-size: 13px;
+    font-size: var(--chat-font-size, 13px);
     font-weight: 600;
     color: var(--text-primary);
   }
@@ -506,7 +535,7 @@
   }
 
   .msg-content {
-    font-size: 13px;
+    font-size: var(--chat-font-size, 13px);
     color: var(--text-primary);
     padding-left: 0;
     line-height: 1.4;
@@ -517,7 +546,7 @@
     background: none;
     border: none;
     padding: 0;
-    font-size: 13px;
+    font-size: var(--chat-font-size, 13px);
     line-height: 1.4;
     color: var(--accent);
     text-decoration: underline;

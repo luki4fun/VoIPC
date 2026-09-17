@@ -528,6 +528,16 @@ const handlers: Record<string, Handler> = {
     resetConfig();
     audio.applySettings(getConfig());
   },
+  // The appearance blob, stored verbatim. Same contract as set_ui_prefs in
+  // commands.rs, including refusing anything that is not an object.
+  set_ui_prefs: ({ prefs }) => {
+    if (prefs === null || typeof prefs !== "object" || Array.isArray(prefs)) {
+      fail("ui_prefs must be an object");
+    }
+    updateConfig((c) => {
+      c.ui_prefs = prefs as Record<string, unknown>;
+    });
+  },
   set_config_bool: ({ key, value }) => {
     const enabled = bool(value, "value");
     updateConfig((c) => {

@@ -40,6 +40,9 @@ export function defaultConfig(): AppConfig {
     sounds: defaultSoundSettings(),
     auto_connect: false,
     share_channel_history: true,
+    // Null, not `{}`: "nothing has been chosen yet" is what the first-run
+    // layout picker keys on (see config.rs).
+    ui_prefs: null,
     chat_history_path: null,
     // The browser has no encrypted chat vault: chat stays in memory.
     chat_history_disabled: true,

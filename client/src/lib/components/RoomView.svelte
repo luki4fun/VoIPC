@@ -264,6 +264,7 @@
         class:draggable={canDrag(id)}
         class:selected={$selectedUserId === id}
         transform="translate({entry.at.x} {-entry.at.y})"
+        data-no-swipe
         onpointerdown={(e) => onPointerDown(e, id)}
       >
         <circle class="halo" r="0.95" />
@@ -422,7 +423,7 @@
   }
 
   .avatar.speaking .halo {
-    stroke: var(--success, #57f287);
+    stroke: var(--success);
   }
 
   .avatar.selected .halo {

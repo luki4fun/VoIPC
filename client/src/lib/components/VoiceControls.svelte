@@ -1,29 +1,34 @@
 <script lang="ts">
+  // The voice bar along the bottom of the classic layout.
+  //
+  // Chrome only. What actually opens the microphone lives in stores/voice.ts,
+  // and the key handling and polling that go with it in VoiceKeys.svelte, which
+  // App.svelte mounts for every layout — this bar is one of two places those
+  // actions are reachable from, not their owner.
+
   import { invoke } from "@tauri-apps/api/core";
-  import { listen } from "@tauri-apps/api/event";
-  import { onMount, onDestroy } from "svelte";
   import {
-    connectionState,
     isMuted,
     isDeafened,
     isTransmitting,
-    setSelfDeafened,
-    setSelfMuted,
     transmitHeldByGame,
-    userId,
   } from "../stores/connection.js";
   import { currentChannelId } from "../stores/channels.js";
-  import { speakingUsers } from "../stores/users.js";
-  import {
-    volume,
-    inputGain,
-    pttKey,
-    pttHoldMode,
-    noiseSuppression,
-    audioSetupOpen,
-  } from "../stores/settings.js";
+  import { volume, inputGain, pttKey, noiseSuppression } from "../stores/settings.js";
   import { micLane } from "../stores/mixer.js";
-  import { voiceMode, vadThreshold, audioLevel, speakerMode } from "../stores/voice.js";
+  import {
+    audioLevel,
+    setVoiceMode,
+    speakerMode,
+    startTransmit,
+    stopTransmit,
+    toggleDeafen,
+    toggleMute,
+    toggleNoiseSuppression,
+    toggleSpeaker,
+    vadThreshold,
+    voiceMode,
+  } from "../stores/voice.js";
   import type { VoiceMode } from "../stores/voice.js";
   import ScreenShareControls from "./ScreenShareControls.svelte";
   import { isMobile } from "../stores/platform.js";
@@ -32,89 +37,6 @@
 
   // Voice is disabled in the General lobby (channel 0)
   let voiceDisabled = $derived($currentChannelId === 0);
-
-  async function startTransmit() {
-    if (voiceDisabled) return;
-    try {
-      await invoke("start_transmit");
-      isTransmitting.set(true);
-    } catch (e) {
-      console.error("Failed to start transmit:", e);
-    }
-  }
-
-  async function stopTransmit() {
-    if (!$isTransmitting) return;
-    try {
-      await invoke("stop_transmit");
-      isTransmitting.set(false);
-    } catch (e) {
-      console.error("Failed to stop transmit:", e);
-    }
-  }
-
-  // VAD/AlwaysOn: auto-start transmit when connected to a channel.
-  //
-  // Not while the audio setup is up: it is using the capture device for its
-  // own meter, and `start_mic_test` refuses to run while we transmit — so
-  // without this guard the wizard's microphone step would be dead exactly
-  // for the people who most need it to work.
-  $effect(() => {
-    if (
-      $voiceMode !== "ptt" &&
-      !voiceDisabled &&
-      $connectionState === "connected" &&
-      !$isTransmitting &&
-      !$audioSetupOpen
-    ) {
-      startTransmit();
-    }
-  });
-
-  // A new connection starts with no capture task; the store must follow,
-  // or the auto-start above never re-arms after a reconnect
-  $effect(() => {
-    if ($connectionState !== "connected") isTransmitting.set(false);
-  });
-
-  async function toggleMute() {
-    try {
-      const muted: boolean = await invoke("toggle_mute");
-      setSelfMuted(muted);
-    } catch (e) {
-      console.error("Failed to toggle mute:", e);
-    }
-  }
-
-  async function toggleDeafen() {
-    try {
-      const deafened: boolean = await invoke("toggle_deafen");
-      setSelfDeafened(deafened);
-    } catch (e) {
-      console.error("Failed to toggle deafen:", e);
-    }
-  }
-
-  async function toggleNoiseSuppression() {
-    try {
-      const enabled: boolean = await invoke("toggle_noise_suppression");
-      noiseSuppression.set(enabled);
-    } catch (e) {
-      console.error("Failed to toggle noise suppression:", e);
-    }
-  }
-
-  function toggleSpeaker() {
-    const newVal = !$speakerMode;
-    try {
-      (window as any).__VoIPC?.setSpeakerphone(newVal);
-      speakerMode.set(newVal);
-    } catch (e) {
-      console.error("Failed to toggle speaker:", e);
-    }
-  }
-
-  let toggleUnlisten: Array<() => void> = [];
 
   async function handleGainChange(e: Event) {
     const gain = parseFloat((e.target as HTMLInputElement).value);
@@ -137,19 +59,8 @@
     }
   }
 
-  async function handleModeChange(e: Event) {
-    const mode = (e.target as HTMLSelectElement).value as VoiceMode;
-    voiceMode.set(mode);
-    try {
-      await invoke("set_voice_mode", { mode });
-    } catch (err) {
-      console.error("Failed to set voice mode:", err);
-    }
-    // Stop transmit when changing modes to reset state cleanly
-    // (handles edge case: key held during mode switch, release event won't fire after unregister)
-    if ($isTransmitting) {
-      await stopTransmit();
-    }
+  function handleModeChange(e: Event) {
+    setVoiceMode((e.target as HTMLSelectElement).value as VoiceMode);
   }
 
   async function handleThresholdChange(e: Event) {
@@ -165,155 +76,6 @@
   // Audio level meter — clamp to -60..0 range for display
   let levelPercent = $derived(Math.max(0, Math.min(100, (($audioLevel + 60) / 60) * 100)));
   let thresholdPercent = $derived(Math.max(0, Math.min(100, (($vadThreshold + 60) / 60) * 100)));
-
-  // Poll audio level when in VAD mode and connected
-  let levelPollInterval: ReturnType<typeof setInterval> | null = null;
-
-  $effect(() => {
-    if ($voiceMode === "vad" && $connectionState === "connected" && $isTransmitting) {
-      if (!levelPollInterval) {
-        levelPollInterval = setInterval(() => {
-          invoke<number>("get_audio_level").then((level) => {
-            audioLevel.set(level);
-          }).catch(() => {});
-        }, 66); // ~15 Hz
-      }
-    } else {
-      if (levelPollInterval) {
-        clearInterval(levelPollInterval);
-        levelPollInterval = null;
-      }
-    }
-
-    return () => {
-      if (levelPollInterval) {
-        clearInterval(levelPollInterval);
-        levelPollInterval = null;
-      }
-    };
-  });
-
-  // Update local user's speaking state in VAD mode based on audio level vs threshold.
-  // This makes the local user's indicator in the UserList reflect actual voice activity
-  // (the server doesn't relay our own voice packets back to us).
-  $effect(() => {
-    if ($voiceMode === "vad" && $isTransmitting && $userId > 0) {
-      const speaking = $audioLevel >= $vadThreshold;
-      speakingUsers.update((set) => {
-        const next = new Set(set);
-        if (speaking) {
-          next.add($userId);
-        } else {
-          next.delete($userId);
-        }
-        return next;
-      });
-    }
-  });
-
-  // Parse the PTT binding string (e.g. "Ctrl+Space", "ControlLeft") into parts
-  function parsePttBinding(): { needCtrl: boolean; needAlt: boolean; needShift: boolean; keyCode: string } {
-    const parts = $pttKey.split("+");
-    let needCtrl = false, needAlt = false, needShift = false;
-    let keyCode = "";
-    for (const part of parts) {
-      if (part === "Ctrl") needCtrl = true;
-      else if (part === "Alt") needAlt = true;
-      else if (part === "Shift") needShift = true;
-      else keyCode = part;
-    }
-    return { needCtrl, needAlt, needShift, keyCode };
-  }
-
-  // Check if the full PTT binding matches (all modifiers + trigger key)
-  function matchesPttBinding(e: KeyboardEvent): boolean {
-    const { needCtrl, needAlt, needShift, keyCode } = parsePttBinding();
-    if (needCtrl && !e.ctrlKey) return false;
-    if (needAlt && !e.altKey) return false;
-    if (needShift && !e.shiftKey) return false;
-    return e.code === keyCode;
-  }
-
-  // Check if a keyup event should stop PTT.
-  // In trigger mode: stop when the trigger key is released.
-  // In hold mode with modifiers: stop when a required modifier is released.
-  // In hold mode without modifiers: stop when the trigger key is released.
-  function shouldStopPtt(e: KeyboardEvent): boolean {
-    const { needCtrl, needAlt, needShift, keyCode } = parsePttBinding();
-    if ($pttHoldMode && (needCtrl || needAlt || needShift)) {
-      // Hold mode with modifiers — stop when any required modifier is released
-      if (needCtrl && e.key === "Control") return true;
-      if (needAlt && e.key === "Alt") return true;
-      if (needShift && e.key === "Shift") return true;
-      return false;
-    }
-    // Trigger mode, or no modifiers — stop when the trigger key is released
-    return e.code === keyCode;
-  }
-
-  // Window-level keyboard PTT and shortcuts (fallback when app is focused)
-  let keydownHandler: ((e: KeyboardEvent) => void) | null = null;
-  let keyupHandler: ((e: KeyboardEvent) => void) | null = null;
-
-  onMount(() => {
-    keydownHandler = (e: KeyboardEvent) => {
-      // Don't trigger shortcuts when typing in input/textarea
-      const target = e.target as HTMLElement;
-      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
-
-      // PTT key — only in PTT mode
-      if ($voiceMode === "ptt" && matchesPttBinding(e) && !e.repeat) {
-        e.preventDefault();
-        startTransmit();
-        // Whatever else this key is bound to, it is the push-to-talk key
-        // first: Ctrl+M below would otherwise mute the microphone that the
-        // same press just opened.
-        return;
-      }
-
-      // Ctrl+M / Meta+M = toggle mute
-      if ((e.ctrlKey || e.metaKey) && e.code === "KeyM") {
-        e.preventDefault();
-        toggleMute();
-      }
-
-      // Ctrl+D / Meta+D = toggle deafen
-      if ((e.ctrlKey || e.metaKey) && e.code === "KeyD") {
-        e.preventDefault();
-        toggleDeafen();
-      }
-    };
-
-    keyupHandler = (e: KeyboardEvent) => {
-      // No input/textarea guard here (unlike keydown): releasing the PTT
-      // key must always stop the mic, even if focus moved into the chat
-      // box while it was held. The path is gated on $isTransmitting.
-
-      // Stop transmit when the released key breaks the PTT binding
-      if ($voiceMode === "ptt" && $isTransmitting && shouldStopPtt(e)) {
-        e.preventDefault();
-        stopTransmit();
-      }
-    };
-
-    window.addEventListener("keydown", keydownHandler);
-    window.addEventListener("keyup", keyupHandler);
-
-    // Tray menu and global hotkeys request toggles via these events —
-    // routed through the same functions so UI + server stay in sync
-    listen("toggle-mute-request", () => toggleMute()).then((fn) =>
-      toggleUnlisten.push(fn),
-    );
-    listen("toggle-deafen-request", () => toggleDeafen()).then((fn) =>
-      toggleUnlisten.push(fn),
-    );
-  });
-
-  onDestroy(() => {
-    if (keydownHandler) window.removeEventListener("keydown", keydownHandler);
-    if (keyupHandler) window.removeEventListener("keyup", keyupHandler);
-    toggleUnlisten.forEach((fn) => fn());
-  });
 </script>
 
 <div class="voice-controls">
@@ -575,7 +337,7 @@
     align-items: center;
     gap: 4px;
     padding: 3px;
-    background: rgba(0, 0, 0, 0.15);
+    background: var(--well);
     border-radius: 10px;
   }
 

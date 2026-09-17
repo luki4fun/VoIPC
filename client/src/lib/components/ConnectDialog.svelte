@@ -1,13 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import {
-    connectionState,
-    serverAddress,
-    username,
-    userId,
-    acceptSelfSigned,
-  } from "../stores/connection.js";
-  import {
     rememberConnection,
     lastHost,
     lastPort,
@@ -19,6 +12,8 @@
   import { isWeb } from "../stores/platform.js";
   import { pendingInvite } from "../stores/connection.js";
   import { parseInviteLink } from "../invite.js";
+  import { connectTo } from "../connect.js";
+  import { pendingConnect } from "../stores/server-switch.js";
 
   // Invite link pasted here: takes host/port from it and joins the channel
   // right after connecting (App.svelte watches pendingInvite)
@@ -54,55 +49,40 @@
     remember = $rememberConnection;
   });
 
-  async function handleConnect() {
-    if (!host || !name) {
-      error = "Please fill in all fields";
-      return;
-    }
+  // The server rail asked for a different server. It disconnects first, which
+  // is what brings this dialog back on screen; we finish the job it started.
+  //
+  // The values go straight to connectWith rather than through the fields: the
+  // effect above re-syncs those from the settings stores whenever they change,
+  // and `connectTo` changes them on success, so a connect driven off the fields
+  // would be racing its own result.
+  $effect(() => {
+    const wanted = $pendingConnect;
+    if (!wanted || connecting) return;
+    pendingConnect.set(null);
+    host = wanted.host;
+    port = wanted.port;
+    if (wanted.username) name = wanted.username;
+    selfSigned = wanted.acceptSelfSigned;
+    void connectWith(wanted.host, wanted.port, wanted.username || name, wanted.acceptSelfSigned);
+  });
 
-    if (port < 1 || port > 65535) {
-      error = "Port must be between 1 and 65535";
-      return;
-    }
-
-    const address = `${host}:${port}`;
+  async function connectWith(h: string, p: number, u: string, selfSignedOk: boolean) {
     error = "";
     connecting = true;
-    connectionState.set("connecting");
+    const result = await connectTo({
+      host: h,
+      port: p,
+      username: u,
+      acceptSelfSigned: selfSignedOk,
+      remember,
+    });
+    connecting = false;
+    if (!result.ok) error = result.error;
+  }
 
-    try {
-      const id = await invoke<number>("connect", {
-        address,
-        username: name,
-        acceptInvalidCerts: selfSigned,
-      });
-      userId.set(id);
-      serverAddress.set(address);
-      username.set(name);
-      acceptSelfSigned.set(selfSigned);
-      connectionState.set("connected");
-
-      // Save connection info if remember is checked
-      await invoke("save_connection_info", {
-        host,
-        port,
-        username: name,
-        acceptSelfSigned: selfSigned,
-        remember,
-      });
-      rememberConnection.set(remember);
-      if (remember) {
-        lastHost.set(host);
-        lastPort.set(port);
-        lastUsername.set(name);
-        lastAcceptSelfSigned.set(selfSigned);
-      }
-    } catch (e) {
-      error = String(e);
-      connectionState.set("disconnected");
-    } finally {
-      connecting = false;
-    }
+  async function handleConnect() {
+    await connectWith(host, port, name, selfSigned);
   }
 
   async function connectToSaved(s: SavedServer) {

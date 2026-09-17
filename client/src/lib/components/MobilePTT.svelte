@@ -1,25 +1,24 @@
 <script lang="ts">
-  import { invoke } from '@tauri-apps/api/core';
   import { isMuted, isDeafened, isTransmitting } from '../stores/connection';
-  import { voiceMode } from '../stores/voice';
+  import { startTransmit, stopTransmit, voiceMode } from '../stores/voice';
 
   let pressing = $state(false);
 
+  // Through the shared actions rather than invoking directly, which is also
+  // what gives this button the lobby guard it never had: voice is off in
+  // channel 0, and holding this there used to start a capture task that had
+  // nowhere to send.
   function onTouchStart(e: TouchEvent) {
     e.preventDefault();
     if ($isMuted || $isDeafened) return;
     pressing = true;
-    invoke('start_transmit').then(() => {
-      isTransmitting.set(true);
-    }).catch(() => {});
+    startTransmit();
   }
 
   function onTouchEnd(e: TouchEvent) {
     e.preventDefault();
     pressing = false;
-    invoke('stop_transmit').then(() => {
-      isTransmitting.set(false);
-    }).catch(() => {});
+    stopTransmit();
   }
 </script>
 

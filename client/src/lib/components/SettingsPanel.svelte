@@ -39,11 +39,35 @@
   } from "../stores/settings.js";
   import type { AudioDeviceInfo } from "../types.js";
   import Icon from "./Icons.svelte";
+  import PaletteEditor from "./PaletteEditor.svelte";
+  import LayoutPreview from "./LayoutPreview.svelte";
+  import { uiPrefs, updateUiPrefs } from "../stores/ui-prefs.js";
+  import {
+    CHAT_FONT_MAX,
+    CHAT_FONT_MIN,
+    ZOOM_MAX,
+    ZOOM_MIN,
+    defaultUiPrefs,
+  } from "../ui-prefs.js";
   import { KeyCapture, shadows } from "../keybind.js";
 
   let { onclose }: { onclose: () => void } = $props();
 
-  let activeTab = $state<"general" | "sounds">("general");
+  let activeTab = $state<"general" | "appearance" | "sounds">("general");
+
+  /** Everything on this tab, back to defaults — but not which layout they chose,
+   *  and not the fact that they were asked. Those are answers, not decoration. */
+  function resetAppearance() {
+    updateUiPrefs((p) => {
+      const d = defaultUiPrefs();
+      p.palette = d.palette;
+      p.palette_overrides = {};
+      p.density = d.density;
+      p.chat_font_size = d.chat_font_size;
+      p.zoom = d.zoom;
+      p.panels = d.panels;
+    });
+  }
 
   let inputDevices = $state<AudioDeviceInfo[]>([]);
   let outputDevices = $state<AudioDeviceInfo[]>([]);
@@ -507,6 +531,11 @@
         class:active={activeTab === "general"}
         onclick={() => (activeTab = "general")}
       >General</button>
+      <button
+        class="tab"
+        class:active={activeTab === "appearance"}
+        onclick={() => (activeTab = "appearance")}
+      >Appearance</button>
       {#if !$isMobile}
         <button
           class="tab"
@@ -907,6 +936,89 @@
       </div>
     {/if}
 
+    {#if activeTab === "appearance"}
+      <div class="section">
+        <h4>Layout</h4>
+        <div class="layout-choices">
+          <LayoutPreview
+            layout="classic"
+            selected={$uiPrefs.layout === "classic"}
+            onpick={() => updateUiPrefs((p) => (p.layout = "classic"))}
+          />
+          <LayoutPreview
+            layout="discord"
+            selected={$uiPrefs.layout === "discord"}
+            onpick={() => updateUiPrefs((p) => (p.layout = "discord"))}
+          />
+        </div>
+      </div>
+
+      <div class="section">
+        <h4>Theme</h4>
+        <PaletteEditor />
+      </div>
+
+      <div class="section">
+        <h4>Messages</h4>
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={$uiPrefs.density === "compact"}
+            onchange={(e) =>
+              updateUiPrefs((p) => {
+                p.density = (e.target as HTMLInputElement).checked ? "compact" : "cosy";
+              })}
+          />
+          <span class="toggle-label">Compact message list</span>
+          <span class="toggle-hint">
+            Takes the air out from between messages. The grouping is the same either way.
+          </span>
+        </label>
+        <label class="slider-row">
+          <span>Chat text size: {$uiPrefs.chat_font_size}px</span>
+          <input
+            type="range"
+            min={CHAT_FONT_MIN}
+            max={CHAT_FONT_MAX}
+            step="1"
+            value={$uiPrefs.chat_font_size}
+            oninput={(e) =>
+              updateUiPrefs((p) => {
+                p.chat_font_size = Number((e.target as HTMLInputElement).value);
+              })}
+          />
+        </label>
+      </div>
+
+      <div class="section">
+        <h4>Zoom</h4>
+        <label class="slider-row">
+          <span>Interface scale: {Math.round($uiPrefs.zoom * 100)}%</span>
+          <input
+            type="range"
+            min={ZOOM_MIN * 100}
+            max={ZOOM_MAX * 100}
+            step="5"
+            value={Math.round($uiPrefs.zoom * 100)}
+            oninput={(e) =>
+              updateUiPrefs((p) => {
+                p.zoom = Number((e.target as HTMLInputElement).value) / 100;
+              })}
+          />
+        </label>
+      </div>
+
+      <div class="section">
+        <h4>Reset</h4>
+        <button class="danger-btn" onclick={resetAppearance}>
+          Reset appearance to defaults
+        </button>
+        <span class="danger-hint">
+          Palette, colours, text size, zoom and panel sizes. Nothing else is touched.
+        </span>
+      </div>
+    {/if}
+
     {#if activeTab === "sounds"}
       <div class="sounds-list">
         {#each soundEvents as event}
@@ -1140,7 +1252,7 @@
   }
 
   .sdk-error {
-    color: var(--danger, #ed4245);
+    color: var(--danger);
   }
 
   .sdk-input {
@@ -1210,6 +1322,35 @@
   .danger-btn:hover {
     background: var(--danger);
     color: white;
+  }
+
+  /* Appearance tab */
+  .layout-choices {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .danger-hint {
+    display: block;
+    margin-top: 6px;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--text-secondary);
+  }
+
+  .slider-row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-top: 10px;
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+
+  .slider-row input[type="range"] {
+    width: 100%;
+    accent-color: var(--accent);
   }
 
   /* Sounds tab */
