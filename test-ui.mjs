@@ -918,14 +918,22 @@ check(
     `wanted ${firstTarget}, in ${await activeChannel()}`,
   );
 
-  // Again, to prove it was not a one-off. Deliberately not asserting we land
-  // back where we started: this server has several channels, so "the first
-  // non-active row" is not a toggle between two.
+  // Again with the other way in — the one a phone is left with, since a touch
+  // screen has no double click: the click opens the pane, and the pane offers
+  // the join. Deliberately not asserting we land back where we started: this
+  // server has several channels, so "the first non-active row" is not a toggle
+  // between two.
   const secondTarget = await nextChannel();
-  await realDoubleClick(alice, ".channel-list.modern .channels.voice .channel:not(.active)");
+  await realClick(alice, ".channel-list.modern .channels.voice .channel:not(.active)");
+  await sleep(900);
+  check(
+    "the pane offers the way into a previewed voice channel",
+    await alice.evaluate(`!!document.querySelector(".join-voice-btn")`),
+  );
+  await realClick(alice, ".join-voice-btn");
   await sleep(1400);
   check(
-    "and it joins the next one too",
+    "the pane's button joins it",
     (await activeChannel()) === secondTarget,
     `wanted ${secondTarget} (started in ${startedIn}), in ${await activeChannel()}`,
   );
@@ -978,6 +986,21 @@ check(
     await realClick(alice, ".join-text-btn");
     await sleep(1500);
     check("the button joins it", (await textRowState())?.unjoined === false);
+
+    // Looking at another channel must not wedge the pane there. A preview
+    // outranks the open text channel in what the pane shows, so until
+    // `openTextChannel` dropped it, one click on a voice channel made every
+    // later click on a text channel we are *in* do nothing visible.
+    await realClick(alice, ".channel-list.modern .channels.voice .channel:not(.active)");
+    await sleep(800);
+    await clickTextRow();
+    await sleep(800);
+    const paneTitle = await alice.evaluate(`document.querySelector(".chat-title")?.textContent.trim()`);
+    check(
+      "a previewed voice channel does not block opening a text channel",
+      paneTitle === TEXT_CHANNEL && !(await alice.evaluate(`!!document.querySelector(".preview-label")`)),
+      `the pane shows ${paneTitle}`,
+    );
     // The leave glyph only exists while the row is hovered
     await alice.evaluate(`(${rowByName(TEXT_CHANNEL)})?.scrollIntoView({block: "center"})`);
     const leaveAt = await alice.evaluate(`(() => {

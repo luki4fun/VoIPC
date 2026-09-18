@@ -17,8 +17,8 @@
   const title = $derived(layout === "modern" ? "Modern" : "Classic");
   const blurb = $derived(
     layout === "modern"
-      ? "The default. Server rail, channels with the people in them, chat in the middle, members on the right. Click to look, double click to join."
-      : "VoIPC's original arrangement. Channels on the left, members on the right, voice and status bars along the bottom. Click to look, double click to join.",
+      ? "The default. Server rail, channels with the people in them, chat in the middle, members on the right. Click to look, join from the chat pane."
+      : "VoIPC's original arrangement. Channels on the left, members on the right, voice and status bars along the bottom. Click to look, join from the chat pane.",
   );
 </script>
 

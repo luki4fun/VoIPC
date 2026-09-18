@@ -94,7 +94,7 @@
     {/each}
   </div>
   {#if $isPreviewing}
-    <div class="preview-hint">Double-click channel to join</div>
+    <div class="preview-hint">Join with the button under the chat</div>
   {/if}
 </div>
 

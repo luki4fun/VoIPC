@@ -35,6 +35,7 @@
   import {
     channelMessageTtl,
     dmMessageTtl,
+    joinChannel,
     joinTextChannel,
     leftTextChannelNames,
     setDmMessageTtl,
@@ -516,8 +517,17 @@
         {/if}
       </button>
     </div>
-  {:else if $isPreviewing && !isLobby && !isPasswordProtected}
-    <div class="preview-footer">Double-click channel to join and chat</div>
+  {:else if $isPreviewing && !isLobby}
+    <!-- The way into a voice channel, next to the pane a click already opened.
+         A double click on the row does the same, but there is no such gesture
+         on a phone. Password-protected too: `joinChannel` opens the prompt. -->
+    <div class="preview-footer">
+      <button
+        class="join-voice-btn"
+        onclick={() => joinChannel($displayChannelId, isPasswordProtected)}
+        title="Moves you into #{channelName}, and takes your voice with you"
+      >Join #{channelName} to talk and chat</button>
+    </div>
   {/if}
 </div>
 
@@ -932,7 +942,8 @@
     font-style: italic;
   }
 
-  .join-text-btn {
+  .join-text-btn,
+  .join-voice-btn {
     padding: 4px 12px;
     background: var(--accent);
     color: #fff;

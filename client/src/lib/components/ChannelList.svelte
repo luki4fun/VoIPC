@@ -2,10 +2,11 @@
   // The channel sidebar of the classic layout: rows, and the direct-message
   // list underneath them.
   //
-  // Click previews a channel, double click joins it — the habit this layout has
-  // always had, and deliberately not the one the modern sidebar uses. What the
-  // two share is everything underneath: the create form, the three dialogs and
-  // every command, all in stores/channel-ui.ts.
+  // Click looks — at a channel's members and its chat — and the way in is a
+  // button in the pane that click just opened. A double click still joins a
+  // voice row, for the hands that have always done it that way; a phone has no
+  // such gesture, which is why it cannot be the only way in. The modern sidebar
+  // does the same, through the same functions in stores/channel-ui.ts.
   //
   // The class names here are driven by test-ui.mjs (`.channel`, `.channel-name`,
   // `.proximity-tag`, `.settings-icon`, `.channel-list`) and the modern sidebar
@@ -29,7 +30,6 @@
     leaveTextChannel,
     leftTextChannelNames,
     openChannelSettings,
-    previewChannel,
     selectChannel,
     showCreateForm,
   } from "../stores/channel-ui.js";
@@ -78,14 +78,13 @@
           : channel.channel_id === $currentChannelId}
         class:unjoined={channel.text && !subscribed}
         class:left
-        title={channel.text && !subscribed
-          ? "Click to read it; joining is a button in the chat pane"
-          : undefined}
+        title={channel.channel_id === $currentChannelId || subscribed
+          ? undefined
+          : "Click to look; joining is a button in the chat pane"}
         class:previewing={!channel.text &&
           channel.channel_id === $previewChannelId &&
           channel.channel_id !== $currentChannelId}
-        onclick={() =>
-          channel.text ? selectChannel(channel) : previewChannel(channel.channel_id)}
+        onclick={() => selectChannel(channel)}
         ondblclick={() =>
           channel.text ? undefined : joinChannel(channel.channel_id, channel.has_password)}
       >

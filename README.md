@@ -85,7 +85,8 @@ No accounts. No telemetry. No compromises.
 - **Two layouts, switchable at any time.** **Modern** — server rail, channel sidebar showing who is
   in every channel, chat in the middle, members on the right — and
   **Classic**, the original: channels left, members right, voice and status bars along the bottom.
-  In both, a click on a channel previews it and a double click joins it.
+  In both, a click on a channel previews it and the button under the chat joins it
+  (a double click on the row still works, where there is a mouse to do it with).
   Modern is the default, inspired by the chat apps most people arrive here from; you are asked
   which you want on the first connection, a layout you picked is kept, and Classic is one click
   away in Settings → Appearance

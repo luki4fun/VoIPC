@@ -1,11 +1,11 @@
 // Creating, joining and configuring a channel: the state behind the sidebar's
 // forms and dialogs, and every command they send.
 //
-// Lifted out of ChannelList when a second sidebar appeared. The rows differ
-// between layouts — the classic list previews on a click and joins on a double
-// click, the modern one joins on the first — but everything under them is the same
-// three dialogs and the same five commands, and a second copy of the channel
-// settings dialog is a second place for the options to drift out of order.
+// Lifted out of ChannelList when a second sidebar appeared. Both sidebars' rows
+// behave the same — a click looks, the pane's button enters — and everything
+// under them is the same three dialogs and the same five commands; a second copy
+// of the channel settings dialog is a second place for the options to drift out
+// of order.
 //
 // The markup is ChannelDialogs.svelte (the overlays, mounted once by App.svelte)
 // and ChannelCreateForm.svelte (inline, because it belongs in the sidebar it
@@ -147,12 +147,14 @@ export async function joinChannel(channelId: number, hasPassword: boolean): Prom
  * One click on a channel row, in either sidebar.
  *
  * A click looks; it never enters. A text channel we are in opens its chat, one
- * we are not in is previewed read-only with the pane's own button as the way
- * in, and a voice channel is previewed — its members and its recent chat,
- * without moving. **Entering a voice channel is a double click** (`joinChannel`,
- * wired to `ondblclick` by both sidebars), because joining announces you to
+ * we are not in is previewed read-only, and a voice channel is previewed — its
+ * members and its recent chat, without moving. **Entering any of them is the
+ * button in the pane this click opens**, because joining announces you to
  * everybody there, takes your voice with you, and undoes having walked out of a
- * text channel — too much to happen by brushing a row on the way past.
+ * text channel — too much to happen by brushing a row on the way past. A double
+ * click on a voice row joins it too, which is the older habit and is still
+ * wired by both sidebars; a phone has no double click, so it cannot be the only
+ * way in.
  *
  * Clicking the voice channel you are already in is how you ask for its chat.
  */
@@ -188,8 +190,9 @@ export async function selectChannel(channel: ChannelInfo): Promise<void> {
 /**
  * Enter a text channel: the deliberate step a click no longer takes.
  *
- * The button in the chat pane is the only way here, so re-entering a channel
- * the user walked out of is something they asked for by name.
+ * Only the button in the chat pane comes here — no row gesture does — so
+ * re-entering a channel the user walked out of is something they asked for by
+ * name.
  */
 export async function joinTextChannel(channel: ChannelInfo): Promise<void> {
   // A password prompt opens instead of a join; the pane follows once the
@@ -198,10 +201,9 @@ export async function joinTextChannel(channel: ChannelInfo): Promise<void> {
   openJoinedTextChannel(channel.channel_id, channel.name);
 }
 
-/** Show a text channel we have just entered, and drop the preview of it. */
+/** Show a text channel we have just entered; `openTextChannel` drops the
+ *  preview of it. */
 function openJoinedTextChannel(channelId: number, name: string): void {
-  previewChannelId.set(null);
-  previewUsers.set([]);
   openTextChannel(channelId);
   clearChannelUnread(name);
   showChatPane();

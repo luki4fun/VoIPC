@@ -9,6 +9,7 @@ import {
   pruneConversations,
   sanitizeHistory,
 } from "../chat-rules.js";
+import { previewChannelId, previewUsers } from "./channels.js";
 import { connectionState, serverKey } from "./connection.js";
 import { maxConversations } from "./settings.js";
 import type { ChatMessage } from "../types.js";
@@ -415,6 +416,19 @@ export function addDmMessage(
 /** Show a text channel's chat, or (null) the chat of the channel we stand in. */
 export function openTextChannel(channelId: number | null) {
   activeTextChannelId.set(channelId);
+  // A preview outranks this in `displayChannelId`, so asking for a channel has
+  // to drop one that is up: looking at any channel you are not in otherwise
+  // wedges the pane there, and every later click on a channel you *are* in
+  // sets this and changes nothing on screen.
+  //
+  // Not for null, which means "back to where I stand" rather than "show me
+  // this": it is passed when a channel disappears under the user, and a preview
+  // up at that moment is what they are reading. The one place that wants both —
+  // clicking the voice channel you are in — drops the preview itself.
+  if (channelId !== null) {
+    previewChannelId.set(null);
+    previewUsers.set([]);
+  }
   closeDm();
 }
 

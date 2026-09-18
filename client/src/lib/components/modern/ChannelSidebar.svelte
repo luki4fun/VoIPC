@@ -14,9 +14,10 @@
   // So a row shows what this client is *allowed* to know, which for most rows is
   // everybody and for some is nobody. That decision stays on the server.
   //
-  // A click previews a channel and a double click joins it, the same as the
-  // classic sidebar: both go through the same functions in
-  // stores/channel-ui.ts, so the two layouts cannot drift on what a click does.
+  // A click previews a channel; the way in is a button in the pane it opens,
+  // with a double click on the row as the desktop shortcut. The classic sidebar
+  // behaves the same, through the same functions in stores/channel-ui.ts, so
+  // the two layouts cannot drift on what a click does.
 
   import { channels, currentChannelId, previewChannelId } from "../../stores/channels.js";
   import { channelRosters } from "../../stores/rosters.js";
@@ -166,7 +167,7 @@
         class:previewing={channel.channel_id === $previewChannelId && !joined}
         onclick={() => selectChannel(channel)}
         ondblclick={() => joinChannel(channel.channel_id, channel.has_password)}
-        title={joined ? "Click to show its chat" : "Click to look, double click to join"}
+        title={joined ? "Click to show its chat" : "Click to look; joining is a button in the chat pane"}
       >
         <span class="channel-icon">
           {#if channel.channel_id === 0}
