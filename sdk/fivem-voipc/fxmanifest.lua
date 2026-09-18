@@ -3,7 +3,7 @@ game 'gta5'
 
 name 'fivem-voipc'
 description 'VoIPC proximity voice for FiveM — the open alternative to a TeamSpeak plugin (see docs/SDK.md)'
-version '0.9.0'
+version '0.9.1'
 
 -- The NUI page is the only thing that can open a WebSocket from inside the
 -- game: Lua has no socket API. It bridges SendNUIMessage to the VoIPC client

@@ -2,6 +2,39 @@
 
 All notable changes to VoIPC are documented here.
 
+## [0.9.1] - 2026-09-18
+
+Protocol version 9, unchanged: a 0.9.1 client and a 0.9.0 server still talk to
+each other, so a server can be updated whenever it suits. Everything here is the
+channel sidebar and the chat pane.
+
+### Fixed
+
+- **One look at a channel you were not in stopped every text channel from
+  opening.** Clicking a voice channel, or a text channel you had not joined,
+  left a preview up — and a preview outranks the text channel whose chat is
+  open, so from then on clicking a channel you *were* in set the state and
+  changed nothing on screen. The only way out was clicking the voice channel you
+  were standing in, which is the one thing that dropped the preview. Asking for
+  a channel's chat now drops the preview along with it, which fixes the same
+  wedge in both layouts and on every path into it
+
+### Changed — joining works without a double click
+
+A double click was the only way into a voice channel, and a phone has no double
+click: on a touch screen the second tap is eaten as a zoom gesture more often
+than not, and nothing on screen ever said what to do instead.
+
+- **The chat pane offers the way in**, the way it already did for text channels:
+  click a channel to look at it and a **Join** button sits under its chat, for
+  voice channels as well as text ones, password-protected ones included — the
+  password prompt opens from the same button. A double click on a voice row
+  still joins it, for the hands that have always done it that way
+- **A click on a channel opens its chat in both layouts.** The classic sidebar
+  previewed a voice channel without bringing the chat forward, so on a phone —
+  where the channel list is a tab covering everything else — tapping a voice
+  channel looked like it did nothing at all
+
 ## [0.9.0] - 2026-09-17
 
 **Protocol 8 → 9.** A client and a server must match exactly, so both have to be
