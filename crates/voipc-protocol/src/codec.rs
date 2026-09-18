@@ -6,6 +6,28 @@ use crate::messages::{ClientMessage, ServerMessage};
 /// Maximum TCP message size: 64 KiB.
 pub const MAX_MSG_SIZE: u32 = 65_536;
 
+/// Largest encrypted blob the server will relay: 60 KiB.
+///
+/// Nothing a client hands the server to pass on comes back out the same size.
+/// The relay re-wraps every blob with the sender's user id, the name they go
+/// by there (up to 32 bytes) and a timestamp, so a blob that only just fits
+/// through `try_decode_frame` on the way in is an unframeable message on the
+/// way out. There is no way to deliver that: every recipient's decoder would
+/// error on the length prefix and their client would drop the connection, so
+/// one message would disconnect everybody in the channel at once. The 4 KiB
+/// of headroom is what the re-wrapping costs, with room left over.
+pub const MAX_RELAY_CIPHERTEXT: usize = 60 * 1024;
+
+/// How many control messages a second one connection may send.
+///
+/// Read from both ends: the server charges a token per frame before it decodes
+/// one, and a client paces itself just under it. Without the second half the
+/// first half is a trap — a client that means no harm can exceed it on a busy
+/// connect (a prekey bundle per person, a sender key per person per channel),
+/// and what it loses is silent: a key that never arrives is a member who
+/// cannot read the channel, with nothing on screen to say so.
+pub const CONTROL_MSGS_PER_SEC: u32 = 50;
+
 /// Current protocol version.
 /// v2: Base protocol with screen share
 /// v3: E2E encryption (Signal Protocol + AES-256-GCM media)
@@ -19,7 +41,17 @@ pub const MAX_MSG_SIZE: u32 = 65_536;
 ///     CreateChannel.anonymous, SetChannelOptions
 /// v8: routed channels — ChannelInfo.routed, SetChannelOptions.routed,
 ///     SetAudioFilter (a client naming who it wants to hear)
-pub const PROTOCOL_VERSION: u32 = 8;
+/// v9: text channels — ChannelInfo.text/auto_join, CreateChannel.text,
+///     LeaveChannel, SendEncryptedChannelMessage.channel_id;
+///     history sharing — UserInfo.shares_history, SetHistorySharing,
+///     UserHistorySharing;
+///     media nonces — encrypted voice/video/screen-audio headers carry a
+///     sender-chosen stream_id, so two members under one channel key cannot
+///     be given the same nonce by the server;
+///     message destruction timers — ChannelInfo.message_ttl_secs,
+///     SetChannelOptions.message_ttl_secs, and a `ttl` inside the message
+///     envelope, which the server never sees
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.
@@ -42,6 +74,15 @@ pub fn decode_client_msg(payload: &[u8]) -> Result<ClientMessage, ProtocolError>
 /// Encode a `ServerMessage` into a length-prefixed byte buffer for TCP transmission.
 pub fn encode_server_msg(msg: &ServerMessage) -> Result<Vec<u8>, ProtocolError> {
     let payload = postcard::to_allocvec(msg)?;
+    // The backstop under `MAX_RELAY_CIPHERTEXT`, which is the policy. A frame
+    // this long cannot be read by anybody — the receiver rejects the length
+    // prefix and drops the connection — so it must never reach a socket, no
+    // matter which relay path built it. Every caller sends through `send_msg`
+    // and discards its `Result`, so this costs one dropped message where the
+    // alternative costs a session.
+    if payload.len() > MAX_MSG_SIZE as usize {
+        return Err(ProtocolError::MessageTooLarge(payload.len()));
+    }
     let mut buf = Vec::with_capacity(4 + payload.len());
     buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     buf.extend_from_slice(&payload);
@@ -203,6 +244,7 @@ mod tests {
             password: None,
             proximity: crate::types::ProximityMode::ThreeD,
             anonymous: true,
+            text: false,
         };
         let encoded = encode_client_msg(&msg).unwrap();
         let decoded = decode_client_msg(&encoded[4..]).unwrap();
@@ -212,11 +254,13 @@ mod tests {
                 password,
                 proximity,
                 anonymous,
+                text,
             } => {
                 assert_eq!(name, "TestRoom");
                 assert!(password.is_none());
                 assert_eq!(proximity, crate::types::ProximityMode::ThreeD);
                 assert!(anonymous);
+                assert!(!text);
             }
             _ => panic!("wrong variant"),
         }
@@ -249,6 +293,7 @@ mod tests {
             screen_share: Some(false),
             hide_members: None,
             routed: Some(true),
+            message_ttl_secs: Some(3600),
         };
         let encoded = encode_client_msg(&msg).unwrap();
         match decode_client_msg(&encoded[4..]).unwrap() {
@@ -259,6 +304,7 @@ mod tests {
                 screen_share,
                 hide_members,
                 routed,
+                message_ttl_secs,
             } => {
                 assert_eq!(channel_id, 3);
                 assert_eq!(hidden, Some(true));
@@ -266,6 +312,7 @@ mod tests {
                 assert_eq!(screen_share, Some(false));
                 assert_eq!(hide_members, None);
                 assert_eq!(routed, Some(true));
+                assert_eq!(message_ttl_secs, Some(3600));
             }
             _ => panic!("wrong variant"),
         }
@@ -361,6 +408,32 @@ mod tests {
         buf.extend_from_slice(&[0u8; 100]);
         let result = try_decode_frame(&mut buf);
         assert!(matches!(result, Err(ProtocolError::MessageTooLarge(_))));
+    }
+
+    /// The two ends of the size chain have to meet: a blob at
+    /// `MAX_RELAY_CIPHERTEXT` must still frame after the relay re-wraps it
+    /// with a full-length name and a timestamp, and anything that does not
+    /// frame must be refused here rather than written to a socket where the
+    /// recipient's decoder would kill the connection over it.
+    #[test]
+    fn a_server_message_too_large_to_frame_is_refused() {
+        let wrapped = |len: usize| ServerMessage::EncryptedChannelChatMessage {
+            channel_id: u32::MAX,
+            user_id: u32::MAX,
+            username: "x".repeat(32),
+            ciphertext: vec![0u8; len],
+            timestamp: u64::MAX,
+        };
+
+        let encoded = encode_server_msg(&wrapped(MAX_RELAY_CIPHERTEXT)).unwrap();
+        assert!(
+            encoded.len() <= MAX_MSG_SIZE as usize,
+            "a relayable blob came back out as an unframeable {} byte message",
+            encoded.len()
+        );
+
+        let err = encode_server_msg(&wrapped(MAX_MSG_SIZE as usize));
+        assert!(matches!(err, Err(ProtocolError::MessageTooLarge(_))));
     }
 
     #[test]

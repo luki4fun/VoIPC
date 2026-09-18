@@ -1,7 +1,7 @@
 {
   "name": "voipc-client",
   "private": true,
-  "version": "0.8.0",
+  "version": "0.9.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,7 +11,7 @@
     "build:wasm": "cd ../crates/voipc-web && wasm-pack build --target web --release --out-dir ../../client/src/lib/wasm --out-name voipc_web",
     "build:web": "npm run build:wasm && vite build --mode web",
     "dev:web": "vite --mode web",
-    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test 'src/lib/**/*.test.ts'"
+    "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test 'src/**/*.test.ts'"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",

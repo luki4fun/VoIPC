@@ -1044,7 +1044,7 @@ mod tests {
         let (web, state, native_hash) = test_server();
         let addr = web.local_addr().unwrap();
         let browser_hash: [u8; 32] = *web.info().cert_hash.read().unwrap().as_ref();
-        tokio::spawn(web.run(state, Arc::new(ConnLimits::new())));
+        tokio::spawn(web.run(state, Arc::new(ConnLimits::from_config(&ServerConfig::default()))));
 
         let seen = Arc::new(Mutex::new(None));
         let (_endpoint, connection) = connect(addr, NATIVE_SNI, seen.clone()).await;
@@ -1062,7 +1062,7 @@ mod tests {
     async fn native_session_authenticates_and_relays_media() {
         let (web, state, _) = test_server();
         let addr = web.local_addr().unwrap();
-        tokio::spawn(web.run(state.clone(), Arc::new(ConnLimits::new())));
+        tokio::spawn(web.run(state.clone(), Arc::new(ConnLimits::from_config(&ServerConfig::default()))));
         let (_endpoint, connection) = connect(addr, NATIVE_SNI, Arc::default()).await;
 
         // Control: Authenticate → Authenticated
@@ -1118,7 +1118,7 @@ mod tests {
         let mut frame = connection.open_uni().await.unwrap().await.unwrap();
         for index in 0..2u8 {
             let packet =
-                VideoPacket::encrypted_fragment(true, session_id, 1, index, 2, 0, 1, vec![7; 100])
+                VideoPacket::encrypted_fragment(true, session_id, 1, index, 2, 0, 1, 0x5EED, vec![7; 100])
                     .to_bytes();
             frame.write_all(&(packet.len() as u16).to_be_bytes()).await.unwrap();
             frame.write_all(&packet).await.unwrap();

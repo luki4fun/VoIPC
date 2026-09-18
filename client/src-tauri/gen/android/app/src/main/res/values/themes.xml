@@ -1,6 +1,23 @@
 <resources xmlns:tools="http://schemas.android.com/tools">
-    <!-- Base application theme. -->
+    <!-- Base application theme.
+
+         The window is drawn edge to edge and the app paints its own background
+         into the status- and navigation-bar strips (the shell pads its content
+         out of them with env(safe-area-inset-*)). So the bars themselves are
+         transparent and Android's contrast scrim is switched off — without
+         that, the navigation bar is an opaque band in the system's colour
+         across the bottom of a dark app.
+
+         The icons are the light set, which is right for three of the four
+         palettes VoIPC ships and for the default. Following the chosen palette
+         exactly would need a native call on every palette change; this is the
+         static approximation. -->
     <style name="Theme.voipc_client" parent="Theme.MaterialComponents.DayNight.NoActionBar">
-        <!-- Customize your theme here. -->
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowLightStatusBar">false</item>
+        <item name="android:windowLightNavigationBar">false</item>
+        <item name="android:enforceStatusBarContrast" tools:targetApi="q">false</item>
+        <item name="android:enforceNavigationBarContrast" tools:targetApi="q">false</item>
     </style>
 </resources>

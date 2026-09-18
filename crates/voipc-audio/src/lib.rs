@@ -73,7 +73,7 @@ pub mod capture {
     pub fn start_capture(
         _device_name: Option<&str>,
         _error_flag: Arc<AtomicBool>,
-        _gain: Arc<std::sync::atomic::AtomicU32>, // ponytail: gain not applied on Android yet
+        _gain: Arc<std::sync::atomic::AtomicU32>, // bernd: gain not applied on Android yet
     ) -> Result<(CaptureStream, ringbuf::HeapCons<f32>)> {
         let rb = HeapRb::<f32>::new(CAPTURE_BUFFER_SIZE);
         let (producer, consumer) = rb.split();
@@ -154,7 +154,7 @@ pub mod playback {
     impl AudioOutputCallback for OboePlayback {
         type FrameType = (f32, Mono);
 
-        // ponytail: the mixer produces stereo, Android plays the mono downmix
+        // bernd: the mixer produces stereo, Android plays the mono downmix
         // — distance attenuation works, panning does not. Real stereo needs
         // set_stereo() + FrameType (f32, Stereo) here and a look at the
         // MODE_IN_COMMUNICATION routing in MainActivity.kt, which mono-ifies

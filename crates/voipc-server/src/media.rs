@@ -185,7 +185,7 @@ mod tests {
     use voipc_protocol::voice::{VoicePacket, ENCRYPTED_VOICE_HEADER_SIZE};
 
     fn encrypted_voice(session_id: u32) -> Bytes {
-        Bytes::from(VoicePacket::encrypted_voice(session_id, 1, 1, vec![9; 40]).to_bytes())
+        Bytes::from(VoicePacket::encrypted_voice(session_id, 1, 1, 0x5EED, vec![9; 40]).to_bytes())
     }
 
     #[tokio::test]
@@ -253,7 +253,7 @@ mod tests {
 
     fn position_packet(session_id: u32) -> Bytes {
         let payload = vec![0u8; POSITION_PACKET_SIZE - ENCRYPTED_VOICE_HEADER_SIZE];
-        Bytes::from(VoicePacket::position(session_id, 1, 1, payload).to_bytes())
+        Bytes::from(VoicePacket::position(session_id, 1, 1, 0x5EED, payload).to_bytes())
     }
 
     async fn set_proximity(state: &ServerState, channel_id: u32, mode: ProximityMode) {
@@ -286,7 +286,7 @@ mod tests {
         put_in_channel(&state, 5, &[(alice_uid, alice_sid), (bob_uid, bob_sid)]).await;
         set_proximity(&state, 5, ProximityMode::ThreeD).await;
 
-        let oversized = Bytes::from(VoicePacket::position(alice_sid, 1, 1, vec![0u8; 99]).to_bytes());
+        let oversized = Bytes::from(VoicePacket::position(alice_sid, 1, 1, 0x5EED, vec![0u8; 99]).to_bytes());
         handle_packet(alice_sid, oversized, &state).await;
         assert!(bob_media.try_recv().is_err());
     }
@@ -441,7 +441,7 @@ mod tests {
             .unwrap();
 
         let packet = Bytes::from(
-            VideoPacket::encrypted_fragment(true, alice_sid, 1, 0, 1, 0, 1, vec![7; 100])
+            VideoPacket::encrypted_fragment(true, alice_sid, 1, 0, 1, 0, 1, 0x5EED, vec![7; 100])
                 .to_bytes(),
         );
         handle_packet(alice_sid, packet.clone(), &state).await;

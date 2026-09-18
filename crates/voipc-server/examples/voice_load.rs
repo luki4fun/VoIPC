@@ -143,6 +143,7 @@ async fn run_client(
             password: None,
             proximity: Default::default(),
             anonymous: false,
+            text: false,
         })?)
         .await?;
         let mut existing: Option<u32> = None;
@@ -206,7 +207,10 @@ async fn run_client(
     }
 
     // ── Voice: 440Hz + per-client offset tone, Opus-encoded, encrypted, 50 pkt/s ──
-    let key = voipc_crypto::MediaKey::generate(channel_id, 1)?;
+    let key = voipc_crypto::MediaKey::generate(channel_id, 1, index as u32)?;
+    // Each simulated client is its own speaker, so each picks its own nonce
+    // prefix exactly as a real one does.
+    let stream_id = 0x5EED_0000u32 | index as u32;
     let aad = voipc_crypto::build_aad(channel_id, 0x05);
     let mut encoder = voipc_audio::encoder::Encoder::new()?;
     let mut pcm = [0.0f32; OPUS_FRAME_SIZE];
@@ -224,8 +228,9 @@ async fn run_client(
         }
         phase %= 2.0 * std::f32::consts::PI;
         let opus = encoder.encode(&pcm)?;
-        let encrypted = voipc_crypto::media_encrypt(&key, session_id, sequence, 0, &aad, &opus)?;
-        let packet = VoicePacket::encrypted_voice(session_id, sequence, key.key_id, encrypted);
+        let encrypted = voipc_crypto::media_encrypt(&key, stream_id, sequence, 0, &aad, &opus)?;
+        let packet =
+            VoicePacket::encrypted_voice(session_id, sequence, key.key_id, stream_id, encrypted);
         sequence = sequence.wrapping_add(1);
         connection.send_datagram(packet.to_bytes())?;
         sent.fetch_add(1, Ordering::Relaxed);

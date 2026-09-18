@@ -10,13 +10,25 @@
     "description": "Away from keyboard"
   },
   {
+    "name": "general",
+    "description": "Text channel everyone lands in",
+    "text": true,
+    "auto_join": true
+  },
+  {
+    "name": "offtopic",
+    "description": "Text channel you join yourself; messages here are deleted after an hour",
+    "text": true,
+    "message_ttl_secs": 3600
+  },
+  {
     "name": "Round Table",
     "description": "Proximity chat: you hear people where they stand",
     "proximity": "2d"
   },
   {
     "name": "Ingame",
-    "description": "Driven by the game SDK — see docs/SDK.md",
+    "description": "Driven by the game SDK \u2014 see docs/SDK.md",
     "proximity": "3d",
     "password": "change-me-and-keep-it-on-the-game-server",
     "hidden": true,

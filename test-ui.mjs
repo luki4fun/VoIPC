@@ -24,6 +24,8 @@ const PORT = process.argv[2] ?? "19987";
 const CDP = process.argv[3] ?? "9222";
 const URL = `https://127.0.0.1:${PORT}/`;
 const CHANNEL = `ui-${process.pid % 10000}`;
+/** The text channel test-web.sh's channels.json asks every client into. */
+const AUTO_JOIN_CHANNEL = "lobby-chat";
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
@@ -135,6 +137,30 @@ async function realClick(tab, selector) {
   return true;
 }
 
+/** A real double click: two trusted clicks at the same point, clickCount 2 on
+ *  the second, which is what the DOM turns into a dblclick event. */
+async function realDoubleClick(tab, selector) {
+  const at = await tab.evaluate(centre(selector));
+  if (!at) return false;
+  const base = { x: at.x, y: at.y, button: "left" };
+  await tab.send("Input.dispatchMouseEvent", { type: "mouseMoved", ...base, buttons: 0, clickCount: 0 });
+  await tab.send("Input.dispatchMouseEvent", { type: "mousePressed", ...base, buttons: 1, clickCount: 1 });
+  await tab.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, buttons: 1, clickCount: 1 });
+  await tab.send("Input.dispatchMouseEvent", { type: "mousePressed", ...base, buttons: 1, clickCount: 2 });
+  await tab.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, buttons: 1, clickCount: 2 });
+  await sleep(150);
+  return true;
+}
+
+/** Put the pointer over an element, for anything a row only reveals on hover. */
+async function hover(tab, selector) {
+  const at = await tab.evaluate(centre(selector));
+  if (!at) return false;
+  await tab.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: at.x, y: at.y, buttons: 0 });
+  await sleep(150);
+  return true;
+}
+
 /** A real drag along an element, `dy` pixels vertically. */
 async function realDrag(tab, selector, dy) {
   const at = await tab.evaluate(centre(selector));
@@ -215,21 +241,49 @@ async function connect(name) {
  *
  * Conditional, because test-web.sh runs one Chromium with one profile: every
  * tab shares localStorage, so the first browser is asked and the second is not.
- * Skipping keeps the classic layout, which is what every selector below expects.
+ * It ANSWERS the question rather than skipping it: the default is the modern
+ * layout, and every selector below this point is the classic one's. Section 11
+ * is where switching between them is exercised on purpose.
  * Leaving it up would be worse than a timeout — it is a real overlay, so every
  * realClick after it would land on its backdrop and read as "element not found".
  */
 async function dismissLayoutPicker(tab) {
   await sleep(300);
   if (await tab.evaluate(`!!document.querySelector(".layout-setup")`)) {
-    await realClick(tab, ".layout-setup .skip-link");
+    await realClick(tab, '.layout-setup .layout-choice[data-layout="classic"]');
+    await sleep(200);
+    await realClick(tab, ".layout-setup .submit-btn");
     await waitFor(tab, `!document.querySelector(".layout-setup")`);
   }
 }
 
-/** Connect without dismissing the audio setup, for the lane that drives it. */
-async function connectRaw(name) {
+/**
+ * Connect without dismissing the audio setup, for the lane that drives it.
+ *
+ * `asNewUser` is what makes "a new user" true: every tab here shares one
+ * Chromium profile, so the questions another tab has already ANSWERED would
+ * not be asked again. It puts back the one answer that is not a skip — the
+ * layout, which the shared lane has to answer to land in the classic shell —
+ * and reloads so the app reads it from scratch. Nothing else is touched.
+ */
+async function connectRaw(name, asNewUser = false) {
   const tab = await newTab();
+  if (asNewUser) {
+    // On a same-origin page that is NOT the app, so the write lands before the
+    // app has read it. Reloading the app instead loses the race the other way:
+    // the config hydrates asynchronously and would overwrite anything typed
+    // into the connect dialog before it landed.
+    await tab.send("Page.navigate", { url: `${URL}favicon.png` });
+    await waitFor(tab, `document.readyState === "complete"`);
+    await tab.evaluate(`(() => {
+      const saved = JSON.parse(localStorage.getItem("voipc.settings") ?? "{}");
+      // null, not a patched object: "nothing has been chosen" is the state a
+      // new install is in, and it is what makes the default testable.
+      saved.ui_prefs = null;
+      localStorage.setItem("voipc.settings", JSON.stringify(saved));
+      return true;
+    })()`);
+  }
   await tab.send("Page.navigate", { url: URL });
   await waitFor(tab, `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`);
   if (await tab.evaluate(`!!document.querySelector(".skip-link")`)) {
@@ -246,6 +300,16 @@ async function connectRaw(name) {
 
 const alice = await connect("ui-alice");
 const bob = await connect("ui-bob");
+check(
+  "answering the layout question is remembered",
+  (await alice.evaluate(
+    `JSON.parse(localStorage.getItem("voipc.settings")).ui_prefs?.layout_asked_version`,
+  )) === 1,
+);
+check(
+  "and it put us in the layout that was picked",
+  await alice.evaluate(`!!document.querySelector(".app-layout") && !document.querySelector(".modern-shell")`),
+);
 await sleep(800);
 
 // 1. Create a proximity channel through the form. The creator is auto-joined,
@@ -285,6 +349,20 @@ await sleep(2500);
 const aliceUsers = await alice.evaluate(userNames);
 check("both members are listed once", new Set(aliceUsers).size === aliceUsers.length, aliceUsers.join(","));
 check("the joiner is in the member list", aliceUsers.some((u) => u.includes("ui-bob")), aliceUsers.join(","));
+
+// The number on the row is arithmetic over join and leave broadcasts, so it
+// drifts away from the roster the moment one of them goes missing. Both sides
+// are on screen here, which is the only place the two can be compared.
+const ownCount = `(() => { const row = [...document.querySelectorAll(".channel")]
+  .find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(CHANNEL)});
+  const text = row?.querySelector(".user-count")?.textContent ?? "";
+  const first = text.match(/[0-9]+/);
+  return first ? Number(first[0]) : -1; })()`;
+check(
+  "the member count matches the list",
+  (await alice.evaluate(ownCount)) === aliceUsers.length,
+  `count ${await alice.evaluate(ownCount)}, listed ${aliceUsers.length}`,
+);
 
 // 3a2. The mixer: it takes the centre column, carries a strip per member with a
 //      real fader and a meter, and every control answers a REAL mouse click.
@@ -538,7 +616,7 @@ check(
 //    drives the microphone and the speakers, and until now nothing checked
 //    that it appears at all — which is how it came to be missing entirely.
 {
-  const fresh = await connectRaw(`ui-setup-${process.pid % 1000}`);
+  const fresh = await connectRaw(`ui-setup-${process.pid % 1000}`, true);
   await sleep(1200);
   check(
     "a new user is offered the audio setup",
@@ -630,15 +708,30 @@ check(
     "it offers both layouts",
     (await fresh.evaluate(`document.querySelectorAll(".layout-setup .layout-choice").length`)) === 2,
   );
+  // The default, asserted where it is decided rather than in a unit test: this
+  // client has no stored appearance at all, and it is in the modern shell.
+  check(
+    "a new user starts in the modern layout",
+    await fresh.evaluate(`!!document.querySelector(".modern-shell") && !document.querySelector(".app-layout")`),
+  );
   await realClick(fresh, ".layout-setup .skip-link");
   await waitFor(fresh, `!document.querySelector(".layout-setup")`);
+  // The same rule the audio setup keeps: skip is not an answer, so the offer
+  // stands next time. Two states are honest here — this user has never written
+  // an appearance blob at all, and if something does write one it must still
+  // say "never asked". Anything else means a skip was recorded as an answer.
+  const skipState = await fresh.evaluate(`(() => {
+    const p = JSON.parse(localStorage.getItem("voipc.settings")).ui_prefs;
+    return p === null ? "nothing written" : String(p.layout_asked_version);
+  })()`);
   check(
     "skipping the layout question leaves it unanswered",
-    // The same rule the audio setup keeps: skip is not an answer, so the offer
-    // stands next time. Nothing tests that for the audio setup today either.
-    !(await fresh.evaluate(
-      `JSON.parse(localStorage.getItem("voipc.settings")).ui_prefs?.layout_asked_version`,
-    )),
+    skipState === "nothing written" || skipState === "0",
+    skipState,
+  );
+  check(
+    "and skipping changes nothing",
+    await fresh.evaluate(`!!document.querySelector(".modern-shell")`),
   );
 
   const fatal = fresh.errors.filter((e) => !/Failed to load resource/.test(e));
@@ -686,12 +779,18 @@ check(
   await alice.evaluate(`(${appearanceTab}).click()`);
   await sleep(300);
 
-  const before = await alice.evaluate(`getComputedStyle(document.body).backgroundColor`);
-
   const pickPalette = (label) =>
     `[...document.querySelectorAll(".swatch")].find((b) => ${JSON.stringify(label)} === b.title)`;
-  check("the palettes are offered", await alice.evaluate(`!!(${pickPalette("Discord light")})`));
-  await alice.evaluate(`(${pickPalette("Discord light")}).click()`);
+  check("the palettes are offered", await alice.evaluate(`!!(${pickPalette("Slate light")})`));
+
+  // Start from a dark palette on purpose. Which palette a fresh client opens in
+  // follows the machine's light/dark setting now, so "switch to the light one
+  // and watch it change" only means something from a known dark starting point
+  // — and this headless browser reports a light preference.
+  await alice.evaluate(`(${pickPalette("VoIPC dark")}).click()`);
+  await sleep(400);
+  const before = await alice.evaluate(`getComputedStyle(document.body).backgroundColor`);
+  await alice.evaluate(`(${pickPalette("Slate light")}).click()`);
   await sleep(400);
 
   const after = await alice.evaluate(`getComputedStyle(document.body).backgroundColor`);
@@ -742,7 +841,7 @@ check(
   await sleep(400);
 }
 
-// 11. The Discord layout. Switched through Settings rather than a query
+// 11. The modern layout. Switched through Settings rather than a query
 //     parameter on purpose: switching is the thing that has to work, and a
 //     test-only way in would be a code path nothing else uses.
 //
@@ -759,49 +858,62 @@ check(
     );
     await sleep(300);
   };
-  const pickLayout = (title) =>
-    `[...document.querySelectorAll(".layout-choice")].find((b) => /${title}/i.test(b.textContent))`;
+  const pickLayout = (id) => `document.querySelector('.layout-choice[data-layout="${id}"]')`;
 
   await openAppearance();
-  check("Appearance offers both layouts", await alice.evaluate(`!!(${pickLayout("Discord style")})`));
-  await alice.evaluate(`(${pickLayout("Discord style")}).click()`);
+  check(
+    "Appearance offers both layouts",
+    (await alice.evaluate(`!!(${pickLayout("modern")})`)) &&
+      (await alice.evaluate(`!!(${pickLayout("classic")})`)),
+  );
+  await alice.evaluate(`(${pickLayout("modern")}).click()`);
   await sleep(500);
   await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
   await sleep(500);
 
-  check("the Discord shell replaces the classic one", await alice.evaluate(
-    `!!document.querySelector(".discord-shell") && !document.querySelector(".app-layout")`,
+  check("the modern shell replaces the classic one", await alice.evaluate(
+    `!!document.querySelector(".modern-shell") && !document.querySelector(".app-layout")`,
   ));
   check("it has a server rail", await alice.evaluate(`!!document.querySelector(".server-rail")`));
   check("it has a user panel", await alice.evaluate(`!!document.querySelector(".user-panel")`));
   check("the voice bar is gone", !(await alice.evaluate(`!!document.querySelector(".voice-controls")`)));
   check("the member list is still grouped by state", await alice.evaluate(
-    `!!document.querySelector(".user-list.discord .group-label")`,
+    `!!document.querySelector(".user-list.modern .group-label")`,
   ));
 
-  // One click joins, which is the whole point of this layout. In the classic
-  // one the same click only previews — asserted further up.
-  // realClick, not el.click(): the house rule at the top of this file, and a
-  // channel row is exactly the kind of thing that grows pointer behaviour.
+  // A click looks, a double click enters — the same rule as the classic
+  // sidebar, and the pair of checks that would catch either half regressing.
+  // realClick / realDoubleClick, not el.click(): the house rule at the top of
+  // this file, and a channel row is exactly the kind of thing that grows
+  // pointer behaviour.
   //
-  // The only other channel on this server is the lobby, where voice is off — so
-  // this goes there and straight back, both in one click, and the mute checks
-  // below still have a channel to talk in. Asserting the *name* changed rather
-  // than "something is active" is what makes it a join and not a no-op.
+  // Voice rows only. A text channel is a subscription with its own rules — a
+  // click there reads it rather than entering it, which the block below asserts
+  // on its own.
   const activeChannel = () =>
-    alice.evaluate(`document.querySelector(".channel-list.discord .channel.active .channel-name")?.textContent`);
+    alice.evaluate(`document.querySelector(".channel-list.modern .channels.voice .channel.active .channel-name")?.textContent`);
   const nextChannel = () =>
-    alice.evaluate(`document.querySelector(".channel-list.discord .channel:not(.active) .channel-name")?.textContent`);
+    alice.evaluate(`document.querySelector(".channel-list.modern .channels.voice .channel:not(.active) .channel-name")?.textContent`);
+  const previewing = () =>
+    alice.evaluate(`document.querySelector(".channel-list.modern .channels.voice .channel.previewing .channel-name")?.textContent`);
 
-  // Assert against the row that was clicked, not merely "something is active":
+  // Assert against the row that was acted on, not merely "something is active":
   // the first non-active row here is the lobby, and "a channel is active" is
   // true there whether or not the click did anything.
   const startedIn = await activeChannel();
   const firstTarget = await nextChannel();
-  await realClick(alice, ".channel-list.discord .channel:not(.active)");
-  await sleep(1200);
+  await realClick(alice, ".channel-list.modern .channels.voice .channel:not(.active)");
+  await sleep(1000);
   check(
-    "one click joins the channel it was on",
+    "one click only previews the channel",
+    (await activeChannel()) === startedIn && (await previewing()) === firstTarget,
+    `active ${await activeChannel()} (was ${startedIn}), previewing ${await previewing()}, wanted preview of ${firstTarget}`,
+  );
+
+  await realDoubleClick(alice, ".channel-list.modern .channels.voice .channel:not(.active)");
+  await sleep(1400);
+  check(
+    "a double click joins it",
     (await activeChannel()) === firstTarget,
     `wanted ${firstTarget}, in ${await activeChannel()}`,
   );
@@ -810,13 +922,94 @@ check(
   // back where we started: this server has several channels, so "the first
   // non-active row" is not a toggle between two.
   const secondTarget = await nextChannel();
-  await realClick(alice, ".channel-list.discord .channel:not(.active)");
-  await sleep(1200);
+  await realDoubleClick(alice, ".channel-list.modern .channels.voice .channel:not(.active)");
+  await sleep(1400);
   check(
     "and it joins the next one too",
     (await activeChannel()) === secondTarget,
     `wanted ${secondTarget} (started in ${startedIn}), in ${await activeChannel()}`,
   );
+
+  // A channel the server asks everyone into is in before anybody clicks. This
+  // is the one lane with a channels.json, and the bug it catches is real: the
+  // join used to fire on the channel list, which arrives while `connect` is
+  // still finishing, and was refused with "Not connected".
+  const rowByName = (name) =>
+    `[...document.querySelectorAll(".channel-list.modern .channels.text .channel")]` +
+    `.find((r) => r.querySelector(".channel-name")?.textContent === ${JSON.stringify(name)})`;
+  check(
+    "a server's auto-join text channel is joined without asking",
+    await alice.evaluate(`!!(${rowByName(AUTO_JOIN_CHANNEL)}) && !(${rowByName(AUTO_JOIN_CHANNEL)}).classList.contains("unjoined")`),
+    await alice.evaluate(`(${rowByName(AUTO_JOIN_CHANNEL)})?.className ?? "no such row"`),
+  );
+
+  // A text channel is not a room you fall into. One click reads it; entering
+  // it is a button of its own, and walking out says so in the sidebar. The
+  // self-test's alice left #e2e-text behind for exactly this.
+  const TEXT_CHANNEL = "e2e-text";
+  const textRow = `.channel-list.modern .channels.text .channel`;
+  const textRowState = () =>
+    alice.evaluate(`(() => {
+      const el = ${rowByName(TEXT_CHANNEL)};
+      return el ? { unjoined: el.classList.contains("unjoined"), left: el.classList.contains("left") } : null;
+    })()`);
+  const clickTextRow = () =>
+    alice.evaluate(`(() => { const el = ${rowByName(TEXT_CHANNEL)}; if (!el) return null;
+      const r = el.getBoundingClientRect(); return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }; })()`)
+      .then(async (at) => {
+        if (!at) return false;
+        const base = { x: at.x, y: at.y, button: "left", clickCount: 1 };
+        await alice.send("Input.dispatchMouseEvent", { type: "mouseMoved", ...base, buttons: 0 });
+        await alice.send("Input.dispatchMouseEvent", { type: "mousePressed", ...base, buttons: 1 });
+        await alice.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, buttons: 1 });
+        await sleep(120);
+        return true;
+      });
+  if ((await textRowState())?.unjoined) {
+    await clickTextRow();
+    await sleep(900);
+    check(
+      "a click on a text channel reads it instead of joining",
+      (await textRowState())?.unjoined === true,
+    );
+    check("the chat pane offers the way in", await alice.evaluate(
+      `!!document.querySelector(".join-text-btn")`,
+    ));
+    await realClick(alice, ".join-text-btn");
+    await sleep(1500);
+    check("the button joins it", (await textRowState())?.unjoined === false);
+    // The leave glyph only exists while the row is hovered
+    await alice.evaluate(`(${rowByName(TEXT_CHANNEL)})?.scrollIntoView({block: "center"})`);
+    const leaveAt = await alice.evaluate(`(() => {
+      const row = ${rowByName(TEXT_CHANNEL)}; if (!row) return null;
+      const r = row.getBoundingClientRect();
+      return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+    })()`);
+    await alice.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: leaveAt.x, y: leaveAt.y, buttons: 0 });
+    await sleep(200);
+    const glyphAt = await alice.evaluate(`(() => {
+      const row = ${rowByName(TEXT_CHANNEL)}; if (!row) return null;
+      const g = row.querySelector('.settings-icon[title="Leave this channel"]'); if (!g) return null;
+      const r = g.getBoundingClientRect();
+      return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+    })()`);
+    if (glyphAt) {
+      const base = { x: glyphAt.x, y: glyphAt.y, button: "left", clickCount: 1 };
+      await alice.send("Input.dispatchMouseEvent", { type: "mouseMoved", ...base, buttons: 0 });
+      await alice.send("Input.dispatchMouseEvent", { type: "mousePressed", ...base, buttons: 1 });
+      await alice.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, buttons: 1 });
+    }
+    await sleep(1500);
+    const afterLeave = await textRowState();
+    check("leaving puts it back out of reach", afterLeave?.unjoined === true);
+    check("and the row says it was left", afterLeave?.left === true);
+    // Back to our own channel: reading another one holds the pane and the
+    // member list, and the checks below are about ourselves.
+    await realClick(alice, ".channel-list.modern .channels.voice .channel.active");
+    await sleep(600);
+  } else {
+    check("a text channel row to test with", false, "no unjoined text channel listed");
+  }
 
   // The mute checks at the end of this block need a channel with voice in it.
   // Channel 0 is the lobby, where voice is off by design, and a mute button
@@ -835,8 +1028,8 @@ check(
   // never pushed to us, so this is really a check that stores/rosters.ts asked.
   await sleep(1200);
   const nestedElsewhere = await alice.evaluate(`(() => {
-    const rows = [...document.querySelectorAll(".channel-list.discord .channel")];
-    const active = document.querySelector(".channel-list.discord .channel.active");
+    const rows = [...document.querySelectorAll(".channel-list.modern .channel")];
+    const active = document.querySelector(".channel-list.modern .channel.active");
     for (const row of rows) {
       if (row === active) continue;
       const nested = row.nextElementSibling;
@@ -870,24 +1063,37 @@ check(
   }
 
   // Dragging a sidebar edge, with real pointer events and real pointer capture.
-  const sidebarWidth = `document.querySelector(".discord-shell .sidebar").getBoundingClientRect().width`;
+  const sidebarWidth = `document.querySelector(".modern-shell .sidebar").getBoundingClientRect().width`;
   const widthBefore = await alice.evaluate(sidebarWidth);
-  await realDragX(alice, ".discord-shell .resize-handle", 60);
+  await realDragX(alice, ".modern-shell .resize-handle", 60);
   await sleep(400);
   const widthAfter = await alice.evaluate(sidebarWidth);
   check("the sidebar can be dragged wider", widthAfter > widthBefore + 20, `${widthBefore} -> ${widthAfter}`);
-  check("the new width is remembered", await alice.evaluate(
-    `JSON.parse(localStorage.getItem("voipc.settings")).ui_prefs?.panels?.discord?.sidebar > 200`,
-  ));
+  // The save is debounced, so this waits for it rather than racing it. Against
+  // the width actually on screen, not against a bar the default already clears.
+  const readStoredWidth = () =>
+    alice.evaluate(
+      `JSON.parse(localStorage.getItem("voipc.settings")).ui_prefs?.panels?.modern?.sidebar`,
+    );
+  let storedWidth = await readStoredWidth();
+  for (let i = 0; i < 20 && Math.abs(storedWidth - widthAfter) >= 4; i++) {
+    await sleep(200);
+    storedWidth = await readStoredWidth();
+  }
+  check(
+    "the new width is remembered",
+    Math.abs(storedWidth - widthAfter) < 4,
+    `stored ${storedWidth}, on screen ${widthAfter}`,
+  );
 
   // Back to classic, in the same tab and with no reload.
   await openAppearance();
-  await alice.evaluate(`(${pickLayout("Classic")}).click()`);
+  await alice.evaluate(`(${pickLayout("classic")}).click()`);
   await sleep(500);
   await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
   await sleep(500);
   check("switching back restores the classic shell", await alice.evaluate(
-    `!!document.querySelector(".app-layout") && !document.querySelector(".discord-shell")`,
+    `!!document.querySelector(".app-layout") && !document.querySelector(".modern-shell")`,
   ));
   check("the connection survived both switches", await alice.evaluate(
     `!!document.querySelector(".status-bar") && /Connected/.test(document.querySelector(".status-bar").textContent)`,
@@ -910,7 +1116,7 @@ check(
   const setLayout = async (title) => {
     // At phone width the settings gear lives in the user panel, which is inside
     // the channel drawer — so it has to be opened first, exactly as a person
-    // would. Discord puts it in the same place for the same reason.
+    // would. The apps this layout borrows from put it in the same place.
     if (await alice.evaluate(`getComputedStyle(document.querySelector(".drawer-btn") ?? document.body).display !== "none"`)) {
       if (!(await alice.evaluate(`document.querySelector(".pane-left")?.getBoundingClientRect().right > 8`))) {
         await realClick(alice, ".drawer-btn");
@@ -923,9 +1129,7 @@ check(
       `[...document.querySelectorAll(".tab")].find((b) => /appearance/i.test(b.textContent)).click()`,
     );
     await sleep(300);
-    await alice.evaluate(
-      `[...document.querySelectorAll(".layout-choice")].find((b) => /${title}/i.test(b.textContent)).click()`,
-    );
+    await alice.evaluate(`document.querySelector('.layout-choice[data-layout="${title}"]').click()`);
     await sleep(400);
     await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
     await sleep(500);
@@ -936,7 +1140,7 @@ check(
   });
   await alice.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 1 });
   await sleep(400);
-  await setLayout("Discord style");
+  await setLayout("modern");
 
   // The panes stack on the container's width, not the device's — which is why
   // this also appears in a narrow desktop window.
@@ -958,6 +1162,15 @@ check(
   await realClick(alice, ".drawer-btn");
   await sleep(500);
   check("the button closes it again", !(await alice.evaluate(paneLeftVisible)));
+
+  // Picking a channel from the drawer has to show the chat: the drawer covers
+  // it, so a tap that only changes what is behind it reads as a tap that did
+  // nothing. This is the phone's main path now that this layout is the default.
+  await realClick(alice, ".drawer-btn");
+  await sleep(500);
+  await realClick(alice, ".pane-left .channels.text .channel");
+  await sleep(700);
+  check("picking a channel closes the drawer", !(await alice.evaluate(paneLeftVisible)));
 
   // Settings is reachable on a phone — through the drawer, which is where the
   // user panel lives. Worth its own check: a layout that hides its own settings
@@ -987,13 +1200,64 @@ check(
   // has to work anyway for anyone who would rather not swipe. The swipe wiring
   // between the two is what needs a real device, and has not had one.
 
-  await setLayout("Classic");
+  await setLayout("classic");
   await alice.send("Emulation.clearDeviceMetricsOverride");
   await alice.send("Emulation.setTouchEmulationEnabled", { enabled: false });
   await sleep(400);
   check("the classic layout comes back at desktop width", await alice.evaluate(
     `!!document.querySelector(".app-layout .main-content")`,
   ));
+}
+
+// 13. Message destruction timers. The rules themselves — what a claimed timer
+//     is worth, what a channel's own timer does to a message somebody re-shares
+//     — are unit-tested in chat-rules.test.ts. What only a browser can show is
+//     the wiring: the dialog writes it, the server announces it, and both the
+//     writer and somebody merely reading the channel are told.
+{
+  const TIMED = `timed-${process.pid % 10000}`;
+  await alice.evaluate(click('button[title="Create channel"]'));
+  await waitFor(alice, `document.querySelector(".create-form")`);
+  await alice.evaluate(setInput(".create-form input[type=text]", TIMED));
+  await alice.evaluate(click('.create-form input[data-kind="text"]'));
+  await sleep(300);
+  await alice.evaluate(click(".create-form .create-btn"));
+  await sleep(2000);
+
+  const opened = await alice.evaluate(
+    `(() => { const row = [...document.querySelectorAll(".channel")].find((e) => e.textContent.includes(${JSON.stringify(TIMED)}));
+       const gear = row?.querySelector('[title="Channel settings"]');
+       if (!gear) return false; gear.dispatchEvent(new MouseEvent("click", { bubbles: true })); return true; })()`,
+  );
+  await sleep(500);
+  // Svelte binds a select through each option's own value, so the choice is
+  // made by selecting the option — assigning `el.value` matches nothing.
+  const picked = await alice.evaluate(`(() => {
+    const el = document.querySelector('select[data-opt="message-ttl"]');
+    if (!el) return false;
+    const i = [...el.options].findIndex((o) => o.textContent.includes("5 minutes"));
+    if (i < 0) return false;
+    el.selectedIndex = i;
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    return true; })()`);
+  check("a channel's destruction timer is in its settings dialog", opened && picked);
+  await alice.evaluate(`(() => { const form = document.querySelector('select[data-opt="message-ttl"]')?.closest("form");
+    form?.querySelector(".create-btn")?.dispatchEvent(new MouseEvent("click", { bubbles: true })); return true; })()`);
+  await sleep(1500);
+
+  const showsTimer = async (tab) => {
+    await tab.evaluate(
+      `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.textContent.includes(${JSON.stringify(TIMED)}));
+         el?.dispatchEvent(new MouseEvent("click", { bubbles: true })); return true; })()`,
+    );
+    for (let i = 0; i < 20; i++) {
+      if (await tab.evaluate(`document.querySelector(".ttl-label")?.textContent?.includes("5 minutes") ?? false`)) return true;
+      await sleep(300);
+    }
+    return false;
+  };
+  check("the writer is told what the channel's timer is", await showsTimer(alice));
+  check("and so is somebody only reading it", await showsTimer(bob));
 }
 
 // 7. Nothing threw anywhere. One uncaught exception in a keyed {#each} wedges

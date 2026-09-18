@@ -59,6 +59,9 @@
           {#if user.is_admin}
             <span class="shield" title="Server admin"><Icon name="shield" size={12} /></span>
           {/if}
+          {#if user.shares_history}
+            <span class="sharing-history" title="Shares recent chat with newcomers"><Icon name="history" size={12} /></span>
+          {/if}
           {#if user.user_id === $userId}
             <span class="you">(you)</span>
           {/if}
@@ -158,6 +161,14 @@
   .shield {
     display: inline-flex;
     color: var(--accent);
+    margin-left: 4px;
+    vertical-align: middle;
+  }
+
+  /* Quieter than the shield: it says what someone offers, not what they are */
+  .sharing-history {
+    display: inline-flex;
+    color: var(--text-secondary);
     margin-left: 4px;
     vertical-align: middle;
   }

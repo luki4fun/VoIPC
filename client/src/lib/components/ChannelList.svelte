@@ -3,23 +3,34 @@
   // list underneath them.
   //
   // Click previews a channel, double click joins it — the habit this layout has
-  // always had, and deliberately not the one the Discord sidebar uses. What the
+  // always had, and deliberately not the one the modern sidebar uses. What the
   // two share is everything underneath: the create form, the three dialogs and
   // every command, all in stores/channel-ui.ts.
   //
   // The class names here are driven by test-ui.mjs (`.channel`, `.channel-name`,
-  // `.proximity-tag`, `.settings-icon`, `.channel-list`) and the Discord sidebar
+  // `.proximity-tag`, `.settings-icon`, `.channel-list`) and the modern sidebar
   // keeps them too, so the same checks can run against either layout.
 
   import { channels, currentChannelId, previewChannelId } from "../stores/channels.js";
   import { userId, isAdmin } from "../stores/connection.js";
-  import { dmConversations, activeDmUserId, openDm, unreadPerChannel } from "../stores/chat.js";
+  import {
+    activeTextChannelId,
+    channelUnread,
+    dmConversations,
+    activeDmUserId,
+    joinedTextChannelIds,
+    openDm,
+    unreadPerChannel,
+  } from "../stores/chat.js";
   import {
     canEditChannel,
     copyInviteLink,
     joinChannel,
+    leaveTextChannel,
+    leftTextChannelNames,
     openChannelSettings,
     previewChannel,
+    selectChannel,
     showCreateForm,
   } from "../stores/channel-ui.js";
   import { avatarColor } from "../avatar.js";
@@ -57,20 +68,36 @@
 
   <div class="channels">
     {#each visibleChannels as channel (channel.channel_id)}
+      {@const subscribed = channel.text && $joinedTextChannelIds.has(channel.channel_id)}
+      {@const left = channel.text && !subscribed && $leftTextChannelNames.has(channel.name)}
+      {@const unread = channelUnread($unreadPerChannel, channel.name)}
       <button
         class="channel"
-        class:active={channel.channel_id === $currentChannelId}
-        class:previewing={channel.channel_id === $previewChannelId && channel.channel_id !== $currentChannelId}
-        onclick={() => previewChannel(channel.channel_id)}
-        ondblclick={() => joinChannel(channel.channel_id, channel.has_password)}
+        class:active={channel.text
+          ? $activeTextChannelId === channel.channel_id
+          : channel.channel_id === $currentChannelId}
+        class:unjoined={channel.text && !subscribed}
+        class:left
+        title={channel.text && !subscribed
+          ? "Click to read it; joining is a button in the chat pane"
+          : undefined}
+        class:previewing={!channel.text &&
+          channel.channel_id === $previewChannelId &&
+          channel.channel_id !== $currentChannelId}
+        onclick={() =>
+          channel.text ? selectChannel(channel) : previewChannel(channel.channel_id)}
+        ondblclick={() =>
+          channel.text ? undefined : joinChannel(channel.channel_id, channel.has_password)}
       >
         <span class="channel-icon">
           {#if channel.channel_id === 0}
             <Icon name="lobby" size={16} />
           {:else if channel.has_password}
             <Icon name="lock" size={16} />
-          {:else}
+          {:else if channel.text}
             <Icon name="hash" size={16} />
+          {:else}
+            <Icon name="speaker" size={16} />
           {/if}
         </span>
         <span class="channel-name-col">
@@ -90,6 +117,9 @@
         {#if channel.hidden}
           <span class="proximity-tag" title="Hidden: only admins see this channel in the list">H</span>
         {/if}
+        {#if left}
+          <span class="proximity-tag" title="You left this channel — click to read, rejoin to write">left</span>
+        {/if}
         {#if channel.routed}
           <span
             class="proximity-tag"
@@ -100,8 +130,18 @@
         {#if !(channel.hide_members && !$isAdmin)}
           <span class="user-count">({channel.user_count}{#if channel.max_users > 0}/{channel.max_users}{/if})</span>
         {/if}
-        {#if ($unreadPerChannel.get(channel.name) ?? 0) > 0}
-          <span class="channel-unread">{$unreadPerChannel.get(channel.name)}</span>
+        {#if unread > 0}
+          <span class="channel-unread">{unread}</span>
+        {/if}
+        {#if subscribed}
+          <!-- svelte-ignore a11y_click_events_have_key_events -->
+          <span
+            class="settings-icon"
+            title="Leave this channel"
+            role="button"
+            tabindex="-1"
+            onclick={(e) => { e.stopPropagation(); leaveTextChannel(channel.channel_id); }}
+          ><Icon name="close" size={14} /></span>
         {/if}
         {#if canEditChannel(channel)}
           <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -230,6 +270,18 @@
     border: 1px dashed var(--accent);
   }
 
+  /* A text channel you are not in: still listed, still readable once joined. */
+  .channel.unjoined {
+    opacity: 0.6;
+  }
+
+  /* One you walked out of, which the tag beside it says in words. Dimmer
+     than merely unjoined, because the difference is a decision you made. */
+  .channel.left {
+    opacity: 0.45;
+    font-style: italic;
+  }
+
   .channel-icon {
     display: flex;
     align-items: center;
@@ -297,6 +349,15 @@
 
   .channel:hover .settings-icon {
     display: flex;
+  }
+
+  /* A touch screen has no hover: without this the leave ✕ and the settings
+     gear exist only while a finger is held on the row, which is not a gesture
+     anybody finds. */
+  @media (hover: none) {
+    .settings-icon {
+      display: flex;
+    }
   }
 
   .settings-icon:hover {

@@ -34,7 +34,33 @@ pub fn run() {
     {
         use tracing_subscriber::prelude::*;
         if let Ok(layer) = tracing_android::layer("VoIPC") {
+            // Filtered, because this layer had none. Two reasons, and the
+            // second is the serious one.
+            //
+            // Volume: the JNI wrapper traces three lines per call and quinn
+            // traces every packet, which on a phone idling in a voice channel
+            // measured ~20,000 lines and 6.7 MB a second.
+            //
+            // Contents: logcat outlives the session and lands in any bug
+            // report, and at `info` the Signal implementation writes base
+            // keys, prekey ids and sender-key distribution ids into it. In an
+            // app whose whole argument is that the keys stay with the people
+            // talking, that is the last place they should be.
+            //
+            // So the default is our own crates at info and everything else at
+            // warn — third-party problems still surface, third-party
+            // bookkeeping does not. RUST_LOG overrides it for a debugging run.
+            let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                "warn,\
+                 voipc_client_lib=info,\
+                 voipc_audio=info,\
+                 voipc_crypto=info,\
+                 voipc_protocol=info,\
+                 voipc_video=info"
+                    .into()
+            });
             let _ = tracing_subscriber::registry()
+                .with(filter)
                 .with(layer)
                 .try_init();
         }
@@ -301,6 +327,7 @@ pub fn run() {
             commands::connect,
             commands::disconnect,
             commands::join_channel,
+            commands::leave_channel,
             commands::create_channel,
             commands::set_channel_password,
             commands::kick_user,
@@ -311,6 +338,8 @@ pub fn run() {
             commands::decline_invite,
             commands::send_channel_message,
             commands::send_direct_message,
+            commands::set_history_sharing,
+            commands::request_channel_history,
             commands::start_transmit,
             commands::stop_transmit,
             commands::toggle_mute,
@@ -403,6 +432,7 @@ pub fn run() {
             commands::set_audio_setup_version,
             commands::reset_config,
             commands::set_config_bool,
+            commands::set_config_u32,
             // Notification sounds
             commands::play_notification_sound,
             commands::browse_sound_file,

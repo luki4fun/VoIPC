@@ -1,5 +1,10 @@
 <script lang="ts">
-  // The Discord-shaped layout: rail, channel sidebar, chat, member list.
+  // The modern layout: rail, channel sidebar, chat, member list.
+  //
+  // Named for what it is rather than what it borrows from. The shape is the one
+  // most people arriving here have spent years in, and the pieces under
+  // components/modern/ exist only for it; everything with behaviour in it is
+  // shared with the classic layout.
   //
   // Every behaviour-carrying piece under it is shared with the classic layout —
   // the channel dialogs, the member menu, the push-to-talk keys. What is here is
@@ -13,7 +18,7 @@
   import { swipeable, type Pane } from "../../actions/swipe.js";
   import { defaultPanels } from "../../ui-prefs.js";
   import { activePanels, updateActivePanels } from "../../stores/ui-prefs.js";
-  import { isMobile } from "../../stores/platform.js";
+  import { isMobile, showChatRequested } from "../../stores/platform.js";
   import { centreView, currentProximity } from "../../stores/room.js";
   import { watchingUserId } from "../../stores/screenshare.js";
   import { micLane } from "../../stores/mixer.js";
@@ -52,10 +57,16 @@
   let pane = $state<Pane>(1);
   /** Live offset while a finger is down; null when it is not. */
   let dragOffset = $state<number | null>(null);
+  /** What the push-to-talk bar actually measures, so the message list reserves
+   *  the space the bar takes rather than a number somebody guessed once. It is
+   *  `position: fixed`, so nothing else makes room for it. */
+  let pttHeight = $state(0);
 
   /** Where the track sits for each pane. Not evenly spaced: the drawers are
-   *  82% of the width and the chat is all of it. */
-  const PANE_OFFSET = ["0cqw", "-82cqw", "-100cqw"];
+   *  82% of the width and the chat is all of it, so the member drawer has to
+   *  travel past both of the panes before it (82 + 100) less the sliver of chat
+   *  it leaves showing, the same sliver the channel drawer leaves on its side. */
+  const PANE_OFFSET = ["0cqw", "-82cqw", "-164cqw"];
 
   // Set as custom properties rather than as a transform, so the container query
   // below decides whether the track moves at all — at desktop width the three
@@ -78,11 +89,20 @@
     pane = pane === which ? 1 : which;
   }
 
+  // Picking a channel asks for the chat, and here the channel list is a drawer
+  // over it: without this the tap changes what is behind the drawer and looks
+  // like it did nothing. The classic layout answers the same request with its
+  // tab (stores/platform.ts showChatPane).
+  $effect(() => {
+    $showChatRequested;
+    if (isNarrow()) pane = 1;
+  });
+
   /** The full voice bar, on demand: mode, VAD meter, gain and output sliders. */
   let voiceOpen = $state(false);
 
   const panels = $derived($activePanels);
-  const defaults = defaultPanels("discord");
+  const defaults = defaultPanels("modern");
 
   function addServer() {
     // Nothing to connect *to* yet — bring up the dialog by leaving the server.
@@ -97,10 +117,10 @@
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
-  class="discord-shell"
+  class="modern-shell"
   class:mobile={$isMobile}
   bind:this={shell}
-  style="--sidebar-width: {panels.sidebar}px; --memberlist-width: {panels.members}px;"
+  style="--sidebar-width: {panels.sidebar}px; --memberlist-width: {panels.members}px; --ptt-space: {pttHeight}px;"
   oncontextmenu={(e) => e.preventDefault()}
 >
   <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -120,7 +140,7 @@
 
   {#if panels.sidebar_open}
     <div class="sidebar">
-      <ServerHeader />
+      <ServerHeader onopensettings={onopensettings} />
       <ChannelSidebar />
       <VoicePanel />
       <UserPanel {onopensettings} onopenvoice={() => (voiceOpen = !voiceOpen)} />
@@ -176,7 +196,7 @@
   </div>
 
   {#if $isMobile}
-    <div class="mobile-ptt-bar"><MobilePTT /></div>
+    <div class="mobile-ptt-bar" bind:clientHeight={pttHeight}><MobilePTT /></div>
   {/if}
 </div>
 
@@ -242,13 +262,22 @@
 {/snippet}
 
 <style>
-  .discord-shell {
+  .modern-shell {
     display: flex;
     height: 100vh;
     height: 100dvh;
     overflow: hidden;
     background: var(--bg-primary);
     container: shell / inline-size;
+    /* Android draws this WebView behind the status and navigation bars, so
+       without these the header sits under the clock and the user panel — the
+       settings gear with it — sits under the back button. Zero everywhere the
+       insets do not exist, which is every desktop and most browsers. */
+    box-sizing: border-box;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
   }
 
   .track {
@@ -309,12 +338,29 @@
     background: var(--accent);
   }
 
+  /* Room for the push-to-talk button, which is `position: fixed` and so makes
+     room for itself nowhere. It is rendered on `$isMobile` rather than on a
+     width, so the space it needs is reserved on the same condition — the
+     container query below is about the shape of the panes, and in landscape it
+     does not match while the bar is still there. Both columns it covers get it:
+     the message list, and the drawer, whose foot is your own name with the
+     mute, deafen and settings buttons on it. On the sidebar rather than on the
+     pane: outside the container query below a pane is `display: contents`, and
+     padding on a box that generates none does nothing — which is how landscape
+     came to keep its own version of this bug. */
+  .modern-shell.mobile .pane-main .content,
+  .modern-shell.mobile .pane-left .sidebar {
+    padding-bottom: calc(var(--ptt-space, 64px) + 16px);
+  }
+
   .mobile-ptt-bar {
     position: fixed;
     left: 8px;
     right: 8px;
     bottom: max(8px, env(safe-area-inset-bottom));
-    z-index: 80;
+    /* Above the panes, below every overlay: Settings is 50, and a talk button
+       drawn over a dialog is a dialog you cannot finish. */
+    z-index: 40;
   }
 
   /* ── The voice popover ── */
@@ -393,7 +439,7 @@
     display: none;
   }
 
-  /* ── Narrow: Discord's phone shape ──────────────────────────────────────
+  /* ── Narrow: the phone shape ────────────────────────────────────────────
      Three panes on a track, dragged with a thumb. A container query rather
      than a media query, for the reason MixerView already gives: it is the
      element's own width that decides, which also means this appears in a
@@ -443,10 +489,7 @@
       display: none;
     }
 
-    /* Room for the push-to-talk button over the message list. */
-    .pane-main .content {
-      padding-bottom: 64px;
-    }
+
 
     .drawer-btn {
       display: flex;
@@ -456,7 +499,7 @@
       position: relative;
     }
 
-    /* Discord's dimmed backdrop: the sliver of chat still showing is the way
+    /* The dimmed backdrop: the sliver of chat still showing is the way
        back, for anyone who would rather tap than swipe. */
     .pane-scrim {
       display: block;

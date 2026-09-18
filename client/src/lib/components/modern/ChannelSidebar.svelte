@@ -1,6 +1,6 @@
 <script lang="ts">
-  // Discord's channel list: a flat list of rows with the people in each channel
-  // nested under it.
+  // The modern layout's channel list: a flat list of rows with the people in
+  // each channel nested under it.
   //
   // The names are *asked* for rather than pushed. A `UserJoined` broadcast goes
   // to every session — it doubles as the user-count update — but it carries an
@@ -14,23 +14,35 @@
   // So a row shows what this client is *allowed* to know, which for most rows is
   // everybody and for some is nobody. That decision stays on the server.
   //
-  // One click joins, which is the habit this layout exists to match. The classic
-  // sidebar still previews on a click and joins on a double click; both go
-  // through the same functions in stores/channel-ui.ts.
+  // A click previews a channel and a double click joins it, the same as the
+  // classic sidebar: both go through the same functions in
+  // stores/channel-ui.ts, so the two layouts cannot drift on what a click does.
 
   import { channels, currentChannelId, previewChannelId } from "../../stores/channels.js";
-  import { channelRosters, rosterOf } from "../../stores/rosters.js";
+  import { channelRosters } from "../../stores/rosters.js";
+  import { rosterForRow } from "../../roster-rules.js";
   import { userId, isAdmin } from "../../stores/connection.js";
-  import { activeDmUserId, dmConversations, openDm, unreadPerChannel } from "../../stores/chat.js";
+  import {
+    activeDmUserId,
+    activeTextChannelId,
+    channelUnread,
+    dmConversations,
+    joinedTextChannelIds,
+    openDm,
+    unreadPerChannel,
+  } from "../../stores/chat.js";
   import {
     canEditChannel,
     joinChannel,
+    leaveTextChannel,
+    leftTextChannelNames,
     openChannelSettings,
+    selectChannel,
     showCreateForm,
   } from "../../stores/channel-ui.js";
   import { users, speakingUsers } from "../../stores/users.js";
   import { audibleIds } from "../../stores/room.js";
-  import { hideMembers, isCulled } from "../../stores/roster.js";
+  import { isCulled } from "../../stores/roster.js";
   import { openUserMenu } from "../../stores/user-menu.js";
   import { avatarColor } from "../../avatar.js";
   import ChannelCreateForm from "../ChannelCreateForm.svelte";
@@ -42,18 +54,23 @@
     $channels.filter((c) => !c.hidden || $isAdmin || c.channel_id === $currentChannelId),
   );
 
+  // Text above voice, the way Discord groups them. A text channel has no
+  // members nested under it: its subscribers are in voice channels of their
+  // own, and listing them twice would say they are in two places at once.
+  const textChannels = $derived(visibleChannels.filter((c) => c.text));
+  const voiceChannels = $derived(visibleChannels.filter((c) => !c.text));
+
   /** The members this client is allowed to show under a row. */
   function membersOf(channel: ChannelInfo): UserInfo[] {
-    // Our own channel is pushed to us and is always fresher than an answer we
-    // asked for — and it is the one place `hide_members` applies to us.
-    if (channel.channel_id === $currentChannelId) {
-      return $hideMembers ? [] : $users;
-    }
-    return rosterOf(channel.channel_id, $channelRosters, $currentChannelId, $users);
+    // Per row, with that row's own hide-members rule — see roster-rules.ts.
+    // The panel-wide `hideMembers` belongs to whichever channel the member list
+    // is showing, which follows the text channel the user opened, and applying
+    // it here emptied the voice room they are standing in.
+    return rosterForRow(channel, $channelRosters, $currentChannelId, $users, $isAdmin);
   }
 </script>
 
-<div class="channel-list discord">
+<div class="channel-list modern">
   <div class="sidebar-head">
     <span class="sidebar-title">Channels</span>
     <button
@@ -67,16 +84,89 @@
 
   <ChannelCreateForm />
 
-  <div class="channels">
-    {#each visibleChannels as channel (channel.channel_id)}
+  {#if textChannels.length > 0}
+    <div class="sidebar-head">
+      <span class="sidebar-title">Text channels</span>
+    </div>
+    <!-- `text`/`voice` name the two groups for test-ui.mjs, which has to click
+         a voice row and a text row and mean different things by each. -->
+    <div class="channels text">
+      {#each textChannels as channel (channel.channel_id)}
+        {@const subscribed = $joinedTextChannelIds.has(channel.channel_id)}
+        {@const left = !subscribed && $leftTextChannelNames.has(channel.name)}
+        {@const unread = channelUnread($unreadPerChannel, channel.name)}
+        <button
+          class="channel"
+          class:active={$activeTextChannelId === channel.channel_id}
+          class:unjoined={!subscribed}
+          class:left
+          onclick={() => selectChannel(channel)}
+          title={subscribed ? undefined : "Click to read it; joining is a button in the chat pane"}
+        >
+          <span class="channel-icon"><Icon name="hash" size={18} /></span>
+          <span class="channel-name">{channel.name}</span>
+
+          {#if left}
+            <span class="proximity-tag" title="You left this channel — click to read, rejoin to write">left</span>
+          {/if}
+          {#if !(channel.hide_members && !$isAdmin)}
+            <span class="user-count">{channel.user_count}</span>
+          {/if}
+          {#if channel.has_password}
+            <span class="channel-icon"><Icon name="lock" size={14} /></span>
+          {/if}
+          {#if channel.anonymous}
+            <span class="proximity-tag" title="Anonymous: members see each other under random names">?</span>
+          {/if}
+          {#if channel.hidden}
+            <span class="proximity-tag" title="Hidden: only admins see this channel in the list">H</span>
+          {/if}
+          {#if unread > 0}
+            <span class="channel-unread">{unread}</span>
+          {/if}
+          {#if subscribed}
+            <!-- svelte-ignore a11y_click_events_have_key_events -->
+            <span
+              class="settings-icon"
+              title="Leave this channel"
+              role="button"
+              tabindex="-1"
+              onclick={(e) => { e.stopPropagation(); leaveTextChannel(channel.channel_id); }}
+              ><Icon name="close" size={14} /></span
+            >
+          {/if}
+          {#if canEditChannel(channel)}
+            <!-- svelte-ignore a11y_click_events_have_key_events -->
+            <span
+              class="settings-icon"
+              title="Channel settings"
+              role="button"
+              tabindex="-1"
+              onclick={(e) => openChannelSettings(channel.channel_id, e)}
+              ><Icon name="channel-settings" size={14} /></span
+            >
+          {/if}
+        </button>
+      {/each}
+    </div>
+
+    <div class="sidebar-head">
+      <span class="sidebar-title">Voice channels</span>
+    </div>
+  {/if}
+
+  <div class="channels voice">
+    {#each voiceChannels as channel (channel.channel_id)}
       {@const joined = channel.channel_id === $currentChannelId}
       {@const members = membersOf(channel)}
+      {@const unread = channelUnread($unreadPerChannel, channel.name)}
       <button
         class="channel"
         class:active={joined}
         class:previewing={channel.channel_id === $previewChannelId && !joined}
-        onclick={() => joinChannel(channel.channel_id, channel.has_password)}
-        title={joined ? undefined : "Click to join"}
+        onclick={() => selectChannel(channel)}
+        ondblclick={() => joinChannel(channel.channel_id, channel.has_password)}
+        title={joined ? "Click to show its chat" : "Click to look, double click to join"}
       >
         <span class="channel-icon">
           {#if channel.channel_id === 0}
@@ -108,8 +198,8 @@
           >
         {/if}
 
-        {#if ($unreadPerChannel.get(channel.name) ?? 0) > 0}
-          <span class="channel-unread">{$unreadPerChannel.get(channel.name)}</span>
+        {#if unread > 0}
+          <span class="channel-unread">{unread}</span>
         {/if}
         {#if !(channel.hide_members && !$isAdmin)}
           <span class="user-count">{channel.user_count}</span>
@@ -185,7 +275,7 @@
 </div>
 
 <style>
-  .channel-list.discord {
+  .channel-list.modern {
     display: flex;
     flex-direction: column;
     flex: 1;
@@ -245,8 +335,8 @@
     text-align: left;
     font-size: 15px;
     border-radius: 4px;
-    /* One click joins here, so no dblclick to protect — but a tap must not be
-       swallowed by double-tap-to-zoom either. */
+    /* `manipulation` keeps the double click that joins while dropping the
+       300ms double-tap-to-zoom delay a tap would otherwise pay. */
     touch-action: manipulation;
   }
 
@@ -262,6 +352,18 @@
 
   .channel.previewing {
     color: var(--text-primary);
+  }
+
+  /* A text channel you are not in: still listed, still readable once joined. */
+  .channel.unjoined {
+    opacity: 0.6;
+  }
+
+  /* One you walked out of, which the tag beside it says in words. Dimmer
+     than merely unjoined, because the difference is a decision you made. */
+  .channel.left {
+    opacity: 0.45;
+    font-style: italic;
   }
 
   .channel-icon {
@@ -317,6 +419,15 @@
 
   .channel:hover .settings-icon {
     display: flex;
+  }
+
+  /* A touch screen has no hover: without this the leave ✕ and the settings
+     gear exist only while a finger is held on the row, which is not a gesture
+     anybody finds. */
+  @media (hover: none) {
+    .settings-icon {
+      display: flex;
+    }
   }
 
   .settings-icon:hover {

@@ -102,9 +102,8 @@ pub async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
             sig.stores = None;
             sig.established_sessions.clear();
             sig.pending_sessions.clear();
-            sig.sender_key_distributed.clear();
-            sig.sender_key_received.clear();
             sig.pending_messages.clear();
+            sig.channels.clear();
         }
 
         tracing::info!("disconnected gracefully");
@@ -134,6 +133,17 @@ pub async fn join_channel(
     // (wrong password, channel full) must leave the current channel's voice
     // working.
 
+    // Subscribing to a text channel is not a move: it costs neither the share
+    // nor the watch. Only a voice join does.
+    let is_text = connection
+        .channels
+        .lock()
+        .map(|list| list.iter().any(|c| c.channel_id == channel_id && c.text))
+        .unwrap_or(false);
+    if is_text {
+        return Ok(());
+    }
+
     // Clean up screen share state when switching channels
     if connection.is_screen_sharing {
         connection.screen_share_active.store(false, Ordering::Relaxed);
@@ -157,6 +167,7 @@ pub async fn create_channel(
     password: Option<String>,
     proximity: Option<String>,
     anonymous: Option<bool>,
+    text: Option<bool>,
 ) -> Result<(), String> {
     if name.is_empty() || name.len() > 128 {
         return Err("channel name must be 1-128 characters".into());
@@ -176,9 +187,83 @@ pub async fn create_channel(
             password,
             proximity,
             anonymous: anonymous.unwrap_or(false),
+            text: text.unwrap_or(false),
         },
     )
     .await
+}
+
+/// Unsubscribe from a text channel. Leaving a voice channel is still
+/// `join_channel(0)` — the lobby is where you stand when you are nowhere.
+#[tauri::command]
+pub async fn leave_channel(state: State<'_, AppState>, channel_id: u32) -> Result<(), String> {
+    let conn = state.connection.read().await;
+    let connection = conn.as_ref().ok_or("Not connected")?;
+    network::send_tcp_message(&connection.tcp_tx, &ClientMessage::LeaveChannel { channel_id })
+        .await
+}
+
+/// Tell the server whether we answer requests for recent channel chat, so a
+/// member list can show who asking would reach. The one thing about chat the
+/// server is told — and it has always seen the requests themselves go past.
+#[tauri::command]
+pub async fn set_history_sharing(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
+    let conn = state.connection.read().await;
+    // Not connected is not a failure: the flag is sent again on the next
+    // connect, from the config the settings toggle has already written.
+    let Some(connection) = conn.as_ref() else {
+        return Ok(());
+    };
+    network::send_tcp_message(
+        &connection.tcp_tx,
+        &ClientMessage::SetHistorySharing { enabled },
+    )
+    .await
+}
+
+/// Ask named members for a channel's recent chat.
+///
+/// The automatic ask happens once per channel entry; this is the user asking
+/// again — after clearing a channel by accident, or because somebody who was
+/// offline then is here now. Only members we hold a live session with are
+/// asked, because only they can answer.
+#[tauri::command]
+pub async fn request_channel_history(
+    state: State<'_, AppState>,
+    channel_id: u32,
+    target_user_ids: Vec<u32>,
+) -> Result<(), String> {
+    let tcp_tx = {
+        let conn = state.connection.read().await;
+        conn.as_ref().ok_or("Not connected")?.tcp_tx.clone()
+    };
+    let targets: Vec<u32> = {
+        let sig = state.signal.lock().map_err(|e| e.to_string())?;
+        // A pairwise session is all an answer needs — history travels over that,
+        // not over the channel's group key. Asking for the group key here would
+        // block the one repair a member has when keying went wrong.
+        let reachable: Vec<u32> = target_user_ids
+            .into_iter()
+            .filter(|uid| sig.established_sessions.contains(uid))
+            .collect();
+        voipc_crypto::pick_history_sources(&reachable)
+            .into_iter()
+            .collect()
+    };
+    if targets.is_empty() {
+        return Err("nobody here can share that history yet".into());
+    }
+    for target_user_id in targets {
+        network::send_tcp_message(
+            &tcp_tx,
+            &ClientMessage::RequestChannelHistory {
+                channel_id,
+                target_user_id,
+            },
+        )
+        .await?;
+    }
+    Ok(())
 }
 
 /// Change a channel's other options (creator, or an admin for a channel from
@@ -192,6 +277,7 @@ pub async fn set_channel_options(
     screen_share: Option<bool>,
     hide_members: Option<bool>,
     routed: Option<bool>,
+    message_ttl_secs: Option<u32>,
 ) -> Result<(), String> {
     let conn = state.connection.read().await;
     let connection = conn.as_ref().ok_or("Not connected")?;
@@ -204,6 +290,7 @@ pub async fn set_channel_options(
             screen_share,
             hide_members,
             routed,
+            message_ttl_secs,
         },
     )
     .await
@@ -428,8 +515,15 @@ pub async fn send_channel_message(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
     content: String,
+    // The text channel to write in. Omitted means the voice channel we stand
+    // in, which is what the classic layout has always sent to.
+    channel_id: Option<u32>,
+    // Seconds this message is meant to live, from the channel's destruction
+    // timer. The front end passes what the channel advertises; it travels
+    // inside the ciphertext, so the relay can neither read it nor change it.
+    ttl_secs: Option<u32>,
 ) -> Result<(), String> {
-    let (user_id, username, channel_id, tcp_tx) = {
+    let (user_id, username, current_channel_id, tcp_tx) = {
         let conn = state.connection.read().await;
         let connection = conn.as_ref().ok_or("Not connected")?;
         (
@@ -439,10 +533,21 @@ pub async fn send_channel_message(
             connection.tcp_tx.clone(),
         )
     };
+    let channel_id = channel_id.unwrap_or(current_channel_id);
 
     if channel_id == 0 {
         return Err("Chat is not available in the lobby".into());
     }
+
+    // Somebody left this channel since we last wrote in it: mint a new sender
+    // key and hand it to the members still here, so the leaver's copy of the
+    // chain cannot read what follows.
+    network::rotate_sender_key_if_stale(channel_id, user_id, &state.signal, &tcp_tx).await;
+
+    // The id travels inside the ciphertext, so our own echo below and every
+    // receiver's copy file the message under the same one.
+    let message_id = crypto::new_message_id();
+    let payload = crypto::envelope(&message_id, &content, ttl_secs);
 
     // Try encrypted channel message via Sender Keys
     let encrypted_result = tokio::task::block_in_place(|| {
@@ -451,11 +556,7 @@ pub async fn send_channel_message(
             return Err("not initialized".to_string());
         }
         // Check if we have distributed sender keys to anyone in this channel
-        let has_distributed = sig
-            .sender_key_distributed
-            .get(&channel_id)
-            .map_or(false, |s| !s.is_empty());
-        if !has_distributed {
+        if !sig.channels.anyone_holds_our_key(channel_id) {
             return Err("no sender keys distributed".to_string());
         }
         drop(sig);
@@ -470,7 +571,7 @@ pub async fn send_channel_message(
                 stores,
                 user_id,
                 channel_id,
-                content.as_bytes(),
+                &payload,
             ))
             .map_err(|e| format!("group encryption: {e}"))
     });
@@ -480,7 +581,10 @@ pub async fn send_channel_message(
             tracing::info!(channel_id, "sending encrypted channel message");
             network::send_tcp_message(
                 &tcp_tx,
-                &ClientMessage::SendEncryptedChannelMessage { ciphertext },
+                &ClientMessage::SendEncryptedChannelMessage {
+                    channel_id,
+                    ciphertext,
+                },
             )
             .await?;
 
@@ -498,6 +602,8 @@ pub async fn send_channel_message(
                     "username": username,
                     "content": content,
                     "timestamp": timestamp,
+                    "message_id": message_id,
+                    "ttl_secs": ttl_secs,
                     "encrypted": true,
                 }),
             );
@@ -510,7 +616,9 @@ pub async fn send_channel_message(
                 let mut sig = state.signal.lock().unwrap_or_else(|p| p.into_inner());
                 sig.pending_messages.push(PendingMessage {
                     target: PendingTarget::Channel { channel_id },
+                    id: message_id.clone(),
                     content: content.clone(),
+                    ttl_secs,
                     queued_at: std::time::Instant::now(),
                 });
             }
@@ -528,6 +636,8 @@ pub async fn send_channel_message(
                     "username": username,
                     "content": content,
                     "timestamp": timestamp,
+                    "message_id": message_id,
+                    "ttl_secs": ttl_secs,
                     "pending": true,
                 }),
             );
@@ -544,12 +654,23 @@ pub async fn send_direct_message(
     app_handle: tauri::AppHandle,
     target_user_id: u32,
     content: String,
+    // Seconds this message is meant to live. A direct message has no channel to
+    // take a policy from, so this is the sender's own timer for that
+    // conversation; it rides inside the envelope like a channel message's does.
+    ttl_secs: Option<u32>,
 ) -> Result<(), String> {
     let (tcp_tx, own_user_id, own_username) = {
         let conn = state.connection.read().await;
         let connection = conn.as_ref().ok_or("Not connected")?;
         (connection.tcp_tx.clone(), connection.user_id, connection.username.clone())
     };
+
+    // A direct message used to be raw UTF-8 inside the pairwise ciphertext,
+    // which left nowhere to put a destruction timer. It is the same envelope a
+    // channel message uses now — which also gives a DM the id it never had, and
+    // costs nothing on the far side: `open_envelope` reads plain text as text.
+    let message_id = crypto::new_message_id();
+    let payload = crypto::envelope(&message_id, &content, ttl_secs);
 
     // Try encrypted direct message via pairwise Signal session
     let encrypted_result = tokio::task::block_in_place(|| {
@@ -568,7 +689,7 @@ pub async fn send_direct_message(
             .block_on(voipc_crypto::session::encrypt_message(
                 stores,
                 target_user_id,
-                content.as_bytes(),
+                &payload,
             ))
             .map_err(|e| format!("pairwise encryption: {e}"))
     });
@@ -600,6 +721,8 @@ pub async fn send_direct_message(
                     "to_user_id": target_user_id,
                     "content": content,
                     "timestamp": timestamp,
+                    "message_id": message_id,
+                    "ttl_secs": ttl_secs,
                     "encrypted": true,
                 }),
             );
@@ -612,7 +735,9 @@ pub async fn send_direct_message(
                 let mut sig = state.signal.lock().unwrap_or_else(|p| p.into_inner());
                 sig.pending_messages.push(PendingMessage {
                     target: PendingTarget::Direct { target_user_id },
+                    id: message_id.clone(),
                     content: content.clone(),
+                    ttl_secs,
                     queued_at: std::time::Instant::now(),
                 });
             }
@@ -630,6 +755,8 @@ pub async fn send_direct_message(
                     "to_user_id": target_user_id,
                     "content": content,
                     "timestamp": timestamp,
+                    "message_id": message_id,
+                    "ttl_secs": ttl_secs,
                     "pending": true,
                 }),
             );
@@ -1729,7 +1856,7 @@ pub async fn start_mic_test(
             // Self-monitoring: the only way to hear your own voice effect
             // before anyone else does. Its own playback stream, because the
             // test runs while disconnected and there is no mixer then.
-            // ponytail: 48 kHz only — a resampler for an audition is not worth
+            // bernd: 48 kHz only — a resampler for an audition is not worth
             // lifting out of the mixer.
             let mut monitoring = None;
             if monitor {
@@ -1855,7 +1982,7 @@ pub async fn start_output_test(
             use ringbuf::traits::Producer as _;
             use tauri::Emitter as _;
             let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            // ponytail: 48 kHz only, exactly like the mic test's monitor path —
+            // bernd: 48 kHz only, exactly like the mic test's monitor path —
             // a resampler for a two-second audition is not worth lifting out
             // of the mixer.
             let (stream, mut producer) =
@@ -2443,6 +2570,7 @@ pub async fn stop_spatial_test(state: State<'_, AppState>) -> Result<(), String>
 pub struct ChatArchivePayload {
     pub channels: HashMap<String, Vec<ChatMessage>>,
     pub dms: HashMap<String, Vec<ChatMessage>>,
+    pub cleared: HashMap<String, u64>,
 }
 
 impl From<&ChatArchive> for ChatArchivePayload {
@@ -2450,6 +2578,7 @@ impl From<&ChatArchive> for ChatArchivePayload {
         Self {
             channels: a.channels.clone(),
             dms: a.dms.clone(),
+            cleared: a.cleared.clone(),
         }
     }
 }
@@ -2662,8 +2791,17 @@ pub async fn unlock_chat_history(
     let data =
         std::fs::read(&chat.file_path).map_err(|e| format!("failed to read file: {e}"))?;
 
-    let (archive, salt, key) =
+    let (mut archive, salt, key) =
         crypto::decrypt_archive(&data, &password).map_err(|e| e.to_string())?;
+    // A message whose timer ran out while the app was closed is not shown and
+    // not kept: the deadline was stamped when it arrived, so it does not matter
+    // that nothing was running when it came due.
+    let now = crypto::now_ms();
+    let gone = crypto::drop_expired(&mut archive.channels, now)
+        + crypto::drop_expired(&mut archive.dms, now);
+    if gone > 0 {
+        tracing::info!(gone, "dropped messages whose destruction timer had passed");
+    }
 
     let payload = ChatArchivePayload::from(&archive);
 
@@ -2713,6 +2851,9 @@ pub async fn save_chat_messages(
     state: State<'_, AppState>,
     channel_messages: HashMap<String, Vec<ChatMessage>>,
     dm_messages: HashMap<String, Vec<ChatMessage>>,
+    // Chat key → newest deleted timestamp. What keeps a cleared channel from
+    // filling back up the next time a member offers their history.
+    cleared: Option<HashMap<String, u64>>,
 ) -> Result<(), String> {
     let mut chat = state.chat.write().await;
 
@@ -2723,6 +2864,15 @@ pub async fn save_chat_messages(
 
     chat.archive.channels = channel_messages;
     chat.archive.dms = dm_messages;
+    if let Some(cleared) = cleared {
+        chat.archive.cleared = cleared;
+    }
+    // Whatever the front end handed us, nothing already past its destruction
+    // deadline is written to disk. The sweep on screen and this one are the
+    // same rule applied to the two copies.
+    let now = crypto::now_ms();
+    crypto::drop_expired(&mut chat.archive.channels, now);
+    crypto::drop_expired(&mut chat.archive.dms, now);
     chat.dirty = true;
 
     Ok(())
@@ -2733,7 +2883,13 @@ pub async fn save_chat_messages(
 pub async fn clear_chat_history(state: State<'_, AppState>) -> Result<(), String> {
     let mut chat = state.chat.write().await;
 
-    chat.archive = ChatArchive::default();
+    // The watermarks survive: "I deleted this" is exactly what must not be
+    // forgotten when the messages go. The frontend rewrites them on its next
+    // save with the timestamps it just cleared.
+    chat.archive = ChatArchive {
+        cleared: std::mem::take(&mut chat.archive.cleared),
+        ..ChatArchive::default()
+    };
 
     // If we have an encryption key, write the empty archive to disk immediately
     if let Some(ref key) = chat.sealing_key {
@@ -2761,9 +2917,10 @@ pub async fn send_channel_history(
     target_user_id: u32,
     messages: serde_json::Value,
 ) -> Result<(), String> {
-    let payload = serde_json::to_vec(&serde_json::json!({ "v": 1, "messages": messages }))
-        .map_err(|e| e.to_string())?;
-    if payload.len() > 60 * 1024 {
+    // The channel travels inside the ciphertext, not only on the envelope the
+    // server writes — see voipc_crypto::envelope::history_payload.
+    let payload = voipc_crypto::history_payload(channel_id, &messages);
+    if payload.len() > voipc_protocol::codec::MAX_RELAY_CIPHERTEXT {
         return Err("history payload too large".into());
     }
     let (ciphertext, message_type) = tokio::task::block_in_place(|| {
@@ -3131,6 +3288,23 @@ pub fn set_config_bool(
         "auto_connect" => config.auto_connect = value,
         "remember_connection" => config.remember_connection = value,
         "share_channel_history" => config.share_channel_history = value,
+        _ => return Err(format!("Unknown config key: {key}")),
+    }
+    crate::config::save_config(&config)
+}
+
+/// The same for the settings that are a number.
+#[tauri::command]
+pub fn set_config_u32(
+    state: State<'_, AppState>,
+    key: String,
+    value: u32,
+) -> Result<(), String> {
+    let mut config = state.config();
+    match key.as_str() {
+        // 0 is "keep every conversation", which is a real answer here rather
+        // than an empty one — see `max_conversations`.
+        "max_conversations" => config.max_conversations = value,
         _ => return Err(format!("Unknown config key: {key}")),
     }
     crate::config::save_config(&config)

@@ -259,6 +259,14 @@ fn sender_key_key(sender: &ProtocolAddress, distribution_id: uuid::Uuid) -> Stri
     )
 }
 
+impl VoipcSenderKeyStore {
+    /// Drop one sender key. Used to rotate our own after a member leaves;
+    /// libsignal has no API for it because it never expects a key to go away.
+    pub fn forget(&mut self, sender: &ProtocolAddress, distribution_id: uuid::Uuid) {
+        self.keys.remove(&sender_key_key(sender, distribution_id));
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl SenderKeyStore for VoipcSenderKeyStore {
     async fn store_sender_key(

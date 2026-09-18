@@ -21,6 +21,8 @@
     settingsAnonymous,
     settingsHidden,
     settingsHideMembers,
+    settingsMessageTtl,
+    settingsIsText,
     settingsProximity,
     settingsRouted,
     settingsScreenShare,
@@ -92,26 +94,50 @@
           Remove the password
         </label>
       {/if}
-      <label class="dialog-label">
-        Proximity chat
-        <select class="dialog-input" bind:value={$settingsProximity}>
-          <option value="off">Off — everyone equally loud</option>
-          <option value="2d">2D — on a floor plan</option>
-          <option value="3d">3D — height counts too</option>
-        </select>
-      </label>
+      <!-- A text channel carries no voice, so the options about voice are not
+           shown for one: there is nothing there to place, forward or share. -->
+      {#if !$settingsIsText}
+        <label class="dialog-label">
+          Proximity chat
+          <select class="dialog-input" bind:value={$settingsProximity}>
+            <option value="off">Off — everyone equally loud</option>
+            <option value="2d">2D — on a floor plan</option>
+            <option value="3d">3D — height counts too</option>
+          </select>
+        </label>
+      {/if}
       <label class="dialog-check">
         <input type="checkbox" data-opt="hidden" bind:checked={$settingsHidden} />
         Hidden — not listed for anyone but admins
       </label>
-      <label class="dialog-check">
-        <input type="checkbox" data-opt="anonymous" bind:checked={$settingsAnonymous} />
-        Anonymous — random names instead of real ones
-      </label>
+      {#if !$settingsIsText}
+        <label class="dialog-check">
+          <input type="checkbox" data-opt="anonymous" bind:checked={$settingsAnonymous} />
+          Anonymous — random names instead of real ones
+        </label>
+      {/if}
       <label class="dialog-check">
         <input type="checkbox" data-opt="hide-members" bind:checked={$settingsHideMembers} />
         Hide members — non-admins see only who is speaking
       </label>
+      <label class="dialog-label">
+        Message destruction timer
+        <select class="dialog-input" data-opt="message-ttl" bind:value={$settingsMessageTtl}>
+          <option value={0}>Off — messages stay until somebody deletes them</option>
+          <option value={300}>5 minutes</option>
+          <option value={3600}>1 hour</option>
+          <option value={28800}>8 hours</option>
+          <option value={86400}>24 hours</option>
+          <option value={604800}>7 days</option>
+        </select>
+      </label>
+      <p class="dialog-note">
+        Every message written here is deleted for everyone once its timer runs out — including
+        from the copies members hand to people who join later. The timer travels inside the
+        encryption, so the server can neither read it nor change it; it applies to what is
+        written from now on, not to what people already have.
+      </p>
+      {#if !$settingsIsText}
       <label class="dialog-check">
         <input type="checkbox" data-opt="screen-share" bind:checked={$settingsScreenShare} />
         Allow screen sharing
@@ -127,6 +153,7 @@
         The server still never receives positions, names it does not already have, or audio it
         can read. Off everywhere else, where fanning out to the whole channel costs nothing.
       </p>
+      {/if}
       <div class="dialog-actions">
         <button class="create-btn" type="submit">Save</button>
         <button class="cancel-btn" type="button" onclick={cancelChannelSettings}>Cancel</button>

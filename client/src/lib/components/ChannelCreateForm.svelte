@@ -12,6 +12,7 @@
     newChannelName,
     newChannelPassword,
     newChannelProximity,
+    newChannelText,
     showCreateForm,
   } from "../stores/channel-ui.js";
 </script>
@@ -32,18 +33,39 @@
         placeholder="Password (optional)"
         bind:value={$newChannelPassword}
       />
-      <label class="create-label">
-        Proximity chat
-        <select class="create-input" bind:value={$newChannelProximity}>
-          <option value="off">Off — everyone equally loud</option>
-          <option value="2d">2D — on a floor plan</option>
-          <option value="3d">3D — height counts too</option>
-        </select>
-      </label>
-      <label class="dialog-check">
-        <input type="checkbox" bind:checked={$newChannelAnonymous} />
-        Anonymous (everyone gets a random name)
-      </label>
+      <!-- Radios rather than a select: `.create-form select` is how test-ui.mjs
+           reaches the proximity dropdown, and a second select above it would
+           silently become the one it sets. -->
+      <div class="create-kind">
+        <label>
+          <input type="radio" data-kind="voice" value={false} bind:group={$newChannelText} />
+          Voice
+        </label>
+        <label>
+          <input type="radio" data-kind="text" value={true} bind:group={$newChannelText} />
+          Text
+        </label>
+      </div>
+      {#if !$newChannelText}
+        <label class="create-label">
+          Proximity chat
+          <select class="create-input" bind:value={$newChannelProximity}>
+            <option value="off">Off — everyone equally loud</option>
+            <option value="2d">2D — on a floor plan</option>
+            <option value="3d">3D — height counts too</option>
+          </select>
+        </label>
+      {/if}
+      {#if !$newChannelText}
+        <!-- A pseudonym only hides somebody who is nowhere else, and a text
+             channel is one you are in *besides* the voice channel you stand
+             in — the same user id is in both rosters. The server refuses the
+             combination; not offering it is how the user finds out early. -->
+        <label class="dialog-check">
+          <input type="checkbox" bind:checked={$newChannelAnonymous} />
+          Anonymous (everyone gets a random name)
+        </label>
+      {/if}
       <div class="create-actions">
         <button class="create-btn" type="submit">Create</button>
         <button class="cancel-btn" type="button" onclick={cancelCreate}>Cancel</button>
@@ -116,6 +138,19 @@
     gap: 4px;
     font-size: 12px;
     color: var(--text-secondary);
+  }
+
+  .create-kind {
+    display: flex;
+    gap: 12px;
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
+  .create-kind label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
   }
 
   .dialog-check {

@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Discord's green "Voice Connected" strip above the user panel: where you are,
+  // The green "Voice Connected" strip above the user panel: where you are,
   // how the line is, and the way out. Same numbers the classic status bar shows.
 
   import { connectionState, latency } from "../../stores/connection.js";

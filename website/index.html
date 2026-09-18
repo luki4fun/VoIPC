@@ -215,6 +215,236 @@
     /* ---------- footer ---------- */
     footer { border-top: 1px solid var(--border); padding: 32px 20px; }
     .footer-inner { max-width: var(--max-width); margin: 0 auto; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; color: var(--text-secondary); font-size: 0.875rem; }
+
+    /* ── The live look: a small VoIPC drawn in CSS, painted with the app's own
+       palette tokens. Not a screenshot, so switching a palette or a layout
+       repaints it the way the real client does. ── */
+    .app-demo[data-palette="voipc-dark"] {
+      --bg-primary: #1a1a2e;
+      --bg-secondary: #16213e;
+      --bg-tertiary: #0f3460;
+      --bg-hover: #1a3a6e;
+      --text-primary: #e0e0e0;
+      --text-secondary: #a0a0a0;
+      --accent: #4a9eff;
+      --success: #4caf50;
+      --danger: #e74c3c;
+      --border: #2a2a4a;
+      --speaking: #4caf50;
+    }
+    .app-demo[data-palette="slate-dark"] {
+      --bg-primary: #313338;
+      --bg-secondary: #2b2d31;
+      --bg-tertiary: #1e1f22;
+      --bg-hover: #404249;
+      --text-primary: #dbdee1;
+      --text-secondary: #b5bac1;
+      --accent: #7983f5;
+      --success: #23a559;
+      --danger: #da373c;
+      --border: #3f4147;
+      --speaking: #23a559;
+    }
+    .app-demo[data-palette="slate-light"] {
+      --bg-primary: #ffffff;
+      --bg-secondary: #f2f3f5;
+      --bg-tertiary: #e3e5e8;
+      --bg-hover: #ebedef;
+      --text-primary: #060607;
+      --text-secondary: #4e5058;
+      --accent: #5865f2;
+      --success: #248046;
+      --danger: #d83c3e;
+      --border: #dcdee1;
+      --speaking: #248046;
+    }
+    .app-demo[data-palette="amoled"] {
+      --bg-primary: #000000;
+      --bg-secondary: #0a0a0a;
+      --bg-tertiary: #141414;
+      --bg-hover: #1f1f1f;
+      --text-primary: #e6e6e6;
+      --text-secondary: #9a9a9a;
+      --accent: #5865f2;
+      --success: #23a559;
+      --danger: #da373c;
+      --border: #262626;
+      --speaking: #23a559;
+    }
+
+    .look-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 20px 32px;
+      align-items: flex-end;
+      margin-bottom: 20px;
+    }
+    .control-group { display: flex; flex-direction: column; gap: 8px; }
+    .control-label {
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--text-secondary);
+    }
+    .control-row { display: flex; flex-wrap: wrap; gap: 8px; }
+    .seg, .swatch {
+      font: inherit;
+      font-size: 13px;
+      color: var(--text-secondary);
+      background: var(--bg-secondary);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 7px 12px;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+    }
+    .seg:hover, .swatch:hover { color: var(--text-primary); border-color: var(--accent); }
+    .seg[aria-pressed="true"], .swatch[aria-pressed="true"] {
+      color: var(--text-primary);
+      border-color: var(--accent);
+      box-shadow: inset 0 0 0 1px var(--accent);
+    }
+    .swatch-chip {
+      width: 26px;
+      height: 14px;
+      border-radius: 3px;
+      border: 1px solid rgba(128, 128, 128, 0.35);
+      background: linear-gradient(135deg, var(--sw-a) 0 45%, var(--sw-b) 45% 72%, var(--sw-c) 72% 100%);
+    }
+
+    .app-demo {
+      --demo-radius: 10px;
+      border: 1px solid var(--border);
+      border-radius: var(--demo-radius);
+      overflow: hidden;
+      background: var(--bg-primary);
+      color: var(--text-primary);
+      font-size: 12px;
+      line-height: 1.5;
+      display: grid;
+      min-height: 420px;
+    }
+    @media (prefers-reduced-motion: no-preference) {
+      .app-demo, .app-demo * { transition: background-color 0.25s ease, color 0.25s ease, border-color 0.25s ease; }
+    }
+    /* Modern: rail, sidebar, chat, members — with your own name under the
+       sidebar, which is where the mute and deafen buttons live. */
+    .app-demo[data-layout="modern"] {
+      grid-template-columns: 56px minmax(150px, 1.1fr) 3fr minmax(120px, 1fr);
+      grid-template-rows: 1fr auto;
+    }
+    .app-demo[data-layout="modern"] .demo-rail { grid-row: 1 / -1; }
+    .app-demo[data-layout="modern"] .demo-side { grid-row: 1; grid-column: 2; }
+    .app-demo[data-layout="modern"] .demo-user { grid-row: 2; grid-column: 2; }
+    .app-demo[data-layout="modern"] .demo-main { grid-row: 1 / -1; grid-column: 3; }
+    .app-demo[data-layout="modern"] .demo-members { grid-row: 1 / -1; grid-column: 4; }
+    /* Classic: sidebar, chat, members — with the voice and status bars along
+       the bottom, across the whole window. */
+    .app-demo[data-layout="classic"] {
+      grid-template-columns: minmax(150px, 1.1fr) 3fr minmax(120px, 1fr);
+      grid-template-rows: 1fr auto;
+    }
+    .app-demo[data-layout="classic"] .demo-side { grid-row: 1; grid-column: 1; }
+    .app-demo[data-layout="classic"] .demo-main { grid-row: 1; grid-column: 2; }
+    .app-demo[data-layout="classic"] .demo-members { grid-row: 1; grid-column: 3; }
+    .app-demo[data-layout="classic"] .demo-bars { grid-row: 2; grid-column: 1 / -1; }
+    .app-demo[data-layout="modern"] .demo-rail { display: flex; }
+    .app-demo[data-layout="classic"] .demo-rail { display: none; }
+    .app-demo[data-layout="classic"] .demo-bars { display: block; }
+    .app-demo[data-layout="modern"] .demo-bars { display: none; }
+    .app-demo[data-layout="classic"] .demo-nested { display: none; }
+
+    .demo-rail {
+      background: var(--bg-tertiary);
+      flex-direction: column;
+      align-items: center;
+      gap: 10px;
+      padding: 10px 0;
+    }
+    .demo-server {
+      width: 34px; height: 34px; border-radius: 12px;
+      background: var(--accent); color: #fff;
+      display: grid; place-items: center; font-weight: 700; font-size: 13px;
+    }
+    .demo-server.ghost { background: transparent; border: 1px dashed var(--border); color: var(--text-secondary); font-weight: 400; }
+    .demo-side { background: var(--bg-secondary); border-right: 1px solid var(--border); padding: 10px 8px; }
+    .demo-side-title {
+      font-size: 10px; letter-spacing: 0.09em; text-transform: uppercase;
+      color: var(--text-secondary); padding: 8px 6px 4px;
+    }
+    .demo-row {
+      display: flex; align-items: center; gap: 7px;
+      padding: 5px 7px; border-radius: 5px; color: var(--text-secondary);
+    }
+    .demo-row.active { background: var(--bg-hover); color: var(--text-primary); }
+    .demo-row .count { margin-left: auto; font-size: 11px; opacity: 0.75; }
+    .demo-nested { display: flex; align-items: center; gap: 7px; padding: 3px 7px 3px 24px; color: var(--text-secondary); }
+    .demo-av {
+      width: 18px; height: 18px; border-radius: 50%; flex-shrink: 0;
+      display: grid; place-items: center; font-size: 10px; color: #12121c; font-weight: 700;
+    }
+    .demo-main { display: flex; flex-direction: column; background: var(--bg-primary); min-width: 0; }
+    .demo-head {
+      display: flex; align-items: center; gap: 8px;
+      padding: 10px 14px; border-bottom: 1px solid var(--border);
+      color: var(--text-primary); font-weight: 600;
+    }
+    .demo-msgs { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; flex: 1; }
+    .demo-msg { display: flex; gap: 9px; }
+    .demo-msg .demo-av { width: 22px; height: 22px; font-size: 11px; }
+    .demo-who { color: var(--accent); font-weight: 600; }
+    .demo-who.self { color: var(--text-primary); }
+    .demo-text { color: var(--text-primary); }
+    .demo-input {
+      margin: 0 14px 14px; padding: 9px 12px;
+      border: 1px solid var(--border); border-radius: 7px;
+      background: var(--bg-secondary); color: var(--text-secondary);
+    }
+    .demo-members { background: var(--bg-secondary); border-left: 1px solid var(--border); padding: 10px 8px; }
+    .demo-bars { grid-column: 1 / -1; }
+    .demo-bar {
+      display: flex; align-items: center; gap: 10px;
+      padding: 7px 12px; border-top: 1px solid var(--border);
+      background: var(--bg-secondary); color: var(--text-secondary);
+    }
+    .demo-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--speaking); flex-shrink: 0; }
+    .demo-pill {
+      margin-left: auto; padding: 2px 8px; border-radius: 999px;
+      background: var(--bg-tertiary); color: var(--text-secondary); font-size: 11px;
+    }
+    .demo-user {
+      grid-column: 2; display: flex; align-items: center; gap: 8px;
+      padding: 8px 10px; border-top: 1px solid var(--border); background: var(--bg-tertiary);
+    }
+    .app-demo[data-layout="classic"] .demo-user { display: none; }
+    .shot-grid {
+      margin-top: 28px;
+      display: grid;
+      gap: 26px;
+      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
+    }
+    .shot-figure { margin-top: 0; }
+    .shot-figure figcaption {
+      margin-top: 10px;
+      color: var(--text-secondary);
+      font-size: 14px;
+    }
+    .demo-hint {
+      margin-top: 14px;
+      padding: 0 7px;
+      font-size: 11px;
+      line-height: 1.45;
+      color: var(--text-secondary);
+    }
+    .demo-caption { margin-top: 12px; color: var(--text-secondary); font-size: 14px; }
+    @media (max-width: 720px) {
+      .app-demo[data-layout="modern"] { grid-template-columns: 44px 1.2fr 2fr; }
+      .app-demo[data-layout="classic"] { grid-template-columns: 1.2fr 2fr; }
+      .demo-members { display: none; }
+      .demo-user { grid-column: 2; }
+    }
   </style>
 </head>
 <body>
@@ -225,6 +455,7 @@
     <button class="menu-btn" id="menuBtn" aria-expanded="false" aria-controls="navLinks">Menu</button>
     <ul class="nav-links" id="navLinks">
       <li><a href="#features">Features</a></li>
+      <li><a href="#look">Look</a></li>
       <li><a href="#tech">Tech</a></li>
       <li><a href="#security">Security</a></li>
       <li><a href="#compare">Compare</a></li>
@@ -237,7 +468,7 @@
 <section id="top">
   <div class="container hero-grid">
     <div>
-      <p class="hero-meta"><a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">v0.8.0</a> · MIT · Linux / Windows / Android / Browser</p>
+      <p class="hero-meta"><a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">v0.9.0</a> · MIT · Linux / Windows / Android / Browser</p>
       <h1>Voice, screen sharing, and chat — on a server you run.</h1>
       <p class="hero-sub">VoIPC is an open-source alternative to Discord and TeamSpeak. Messages are encrypted with the Signal Protocol, voice and video with AES-256-GCM, and the relay server keeps nothing: no accounts, no database, no logs.</p>
       <div class="hero-buttons">
@@ -245,7 +476,7 @@
         <a class="btn btn-outline" href="https://github.com/luki4fun/voipc">Source</a>
       </div>
     </div>
-    <img class="screenshot" src="screenshots/main-window.png" width="1280" height="800" alt="VoIPC main window: channel list, chat, and user list with speaking indicators" fetchpriority="high">
+    <img class="screenshot" src="screenshots/main-window.png" width="1280" height="800" alt="VoIPC in the Modern layout: server rail, channels with the people in each of them, chat in the middle, members on the right" fetchpriority="high">
   </div>
 </section>
 
@@ -334,6 +565,122 @@
         <li>Admin sessions via a server token: kick and IP-ban, no accounts needed</li>
         <li>IPv6 dual-stack, TOFU certificate pinning for self-signed certs</li>
       </ul>
+    </div>
+  </div>
+</section>
+
+<section id="look">
+  <div class="container">
+    <h2>Two layouts, four palettes</h2>
+    <p class="section-sub">The same app underneath. Switch them here — this is a real, live preview drawn with the client's own colour tokens, not a picture of one.</p>
+
+    <div class="look-controls">
+      <div class="control-group">
+        <span class="control-label" id="layoutLabel">Layout</span>
+        <div class="control-row" role="group" aria-labelledby="layoutLabel">
+          <button class="seg" type="button" data-layout="modern" aria-pressed="true">Modern</button>
+          <button class="seg" type="button" data-layout="classic" aria-pressed="false">Classic</button>
+        </div>
+      </div>
+      <div class="control-group">
+        <span class="control-label" id="paletteLabel">Palette</span>
+        <div class="control-row" role="group" aria-labelledby="paletteLabel">
+          <button class="swatch" type="button" data-palette="voipc-dark" aria-pressed="false"
+            style="--sw-a: #16213e; --sw-b: #1a1a2e; --sw-c: #4a9eff">
+            <span class="swatch-chip" aria-hidden="true"></span>VoIPC dark
+          </button>
+          <button class="swatch" type="button" data-palette="slate-dark" aria-pressed="true"
+            style="--sw-a: #2b2d31; --sw-b: #313338; --sw-c: #7983f5">
+            <span class="swatch-chip" aria-hidden="true"></span>Slate dark
+          </button>
+          <button class="swatch" type="button" data-palette="slate-light" aria-pressed="false"
+            style="--sw-a: #f2f3f5; --sw-b: #ffffff; --sw-c: #5865f2">
+            <span class="swatch-chip" aria-hidden="true"></span>Slate light
+          </button>
+          <button class="swatch" type="button" data-palette="amoled" aria-pressed="false"
+            style="--sw-a: #0a0a0a; --sw-b: #000000; --sw-c: #5865f2">
+            <span class="swatch-chip" aria-hidden="true"></span>AMOLED black
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="app-demo" id="appDemo" data-layout="modern" data-palette="slate-dark" role="img"
+         aria-label="A preview of the VoIPC client: channel sidebar, chat in the middle, member list on the right">
+      <div class="demo-rail" aria-hidden="true">
+        <span class="demo-server">V</span>
+        <span class="demo-server ghost">+</span>
+      </div>
+
+      <div class="demo-side">
+        <div class="demo-side-title">Text channels</div>
+        <div class="demo-row"># chat<span class="count">4</span></div>
+        <div class="demo-row"># offtopic<span class="count">2</span></div>
+        <div class="demo-side-title">Voice channels</div>
+        <div class="demo-row active">🔊 Lounge<span class="count">2</span></div>
+        <div class="demo-nested"><span class="demo-av" style="background:#ff5c8a">M</span>Mira</div>
+        <div class="demo-nested"><span class="demo-av" style="background:#ffd166">T</span>Tom</div>
+        <div class="demo-row">🔊 Gaming<span class="count">1</span></div>
+        <div class="demo-nested"><span class="demo-av" style="background:#f4a261">A</span>Ada</div>
+        <div class="demo-row">🔊 AFK<span class="count">0</span></div>
+      </div>
+
+      <div class="demo-main">
+        <div class="demo-head"># Lounge</div>
+        <div class="demo-msgs">
+          <div class="demo-msg">
+            <span class="demo-av" style="background:#ffd166">T</span>
+            <div><span class="demo-who">Tom</span><div class="demo-text">anyone up for a round after this?</div></div>
+          </div>
+          <div class="demo-msg">
+            <span class="demo-av" style="background:#ff5c8a">M</span>
+            <div><span class="demo-who self">Mira</span><div class="demo-text">give me ten minutes, finishing a build</div></div>
+          </div>
+          <div class="demo-msg">
+            <span class="demo-av" style="background:#f4a261">A</span>
+            <div><span class="demo-who">Ada</span><div class="demo-text">the server keeps none of this, by the way</div></div>
+          </div>
+        </div>
+        <div class="demo-input">Message #Lounge…</div>
+      </div>
+
+      <div class="demo-members">
+        <div class="demo-side-title">In voice — 2</div>
+        <div class="demo-row"><span class="demo-av" style="background:#ff5c8a">M</span>Mira</div>
+        <div class="demo-row"><span class="demo-av" style="background:#ffd166">T</span>Tom</div>
+        <p class="demo-hint">Click a channel to look, double click to join. Both layouts.</p>
+      </div>
+
+      <div class="demo-user">
+        <span class="demo-av" style="background:#ff5c8a">M</span>
+        <span>Mira<br><span style="color:var(--text-secondary)">Connected</span></span>
+      </div>
+
+      <div class="demo-bars">
+        <div class="demo-bar"><span class="demo-dot"></span>Push to talk<span class="demo-pill">#Lounge</span></div>
+        <div class="demo-bar">Connected<span class="demo-pill">12 ms</span></div>
+      </div>
+    </div>
+
+    <p class="demo-caption">Modern is what a new install starts in. Classic is the arrangement VoIPC has always had, one click away in Settings. Every colour in either can be changed one by one, and a palette has to clear WCAG AA in the unit tests before it ships.</p>
+
+    <div class="shot-grid">
+      <figure class="shot-figure">
+        <img class="screenshot" src="screenshots/text-channels.png" width="1280" height="800" alt="VoIPC in the Modern layout: text channels in the sidebar, an encrypted conversation, and the member list of the text channel" loading="lazy">
+        <figcaption>Modern, VoIPC dark. Text channels are a subscription, not a move: you read and write in several while staying in the voice channel you are in.</figcaption>
+      </figure>
+      <figure class="shot-figure">
+        <img class="screenshot" src="screenshots/modern-light.png" width="1280" height="800" alt="The same window in the Slate light palette: a light interface with the same channels, conversation and member list" loading="lazy">
+        <figcaption>The same window in Slate light — one of four palettes, each of which has to clear WCAG AA before it ships.</figcaption>
+      </figure>
+      <figure class="shot-figure">
+        <img class="screenshot" src="screenshots/classic-layout.png" width="1280" height="800" alt="VoIPC in the Classic layout: channels on the left, members on the right, voice and status bars along the bottom" loading="lazy">
+        <figcaption>Classic: channels left, members right, voice and status bars along the bottom. The arrangement VoIPC has always had.</figcaption>
+      </figure>
+      <figure class="shot-figure">
+        <img class="screenshot" src="screenshots/appearance.png" width="1280" height="800" alt="Settings, Appearance tab: the two layout cards, the four palettes, and the per-colour editor" loading="lazy">
+        <figcaption>Settings → Appearance. Switch layout, switch palette, or change any of the seventeen colours one by one.</figcaption>
+      </figure>
     </div>
   </div>
 </section>
@@ -635,5 +982,25 @@ openssl req -x509 -newkey ec \
   });
 </script>
 
+
+<script>
+  // The live preview: two attributes on one element, everything else is CSS.
+  (function () {
+    var demo = document.getElementById("appDemo");
+    if (!demo) return;
+    function pick(buttons, attr, value) {
+      buttons.forEach(function (b) { b.setAttribute("aria-pressed", String(b.dataset[attr] === value)); });
+      demo.dataset[attr] = value;
+    }
+    var layouts = [].slice.call(document.querySelectorAll(".seg[data-layout]"));
+    var palettes = [].slice.call(document.querySelectorAll(".swatch[data-palette]"));
+    layouts.forEach(function (b) {
+      b.addEventListener("click", function () { pick(layouts, "layout", b.dataset.layout); });
+    });
+    palettes.forEach(function (b) {
+      b.addEventListener("click", function () { pick(palettes, "palette", b.dataset.palette); });
+    });
+  })();
+</script>
 </body>
 </html>

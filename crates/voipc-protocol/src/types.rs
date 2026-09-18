@@ -27,6 +27,12 @@ pub struct UserInfo {
     /// Logged in with the server's admin token.
     #[serde(default)]
     pub is_admin: bool,
+    /// This user answers a newcomer's request for recent channel chat
+    /// (protocol v9). The one thing about chat the server is told, and only so
+    /// that a member list can say who a history request would reach — the
+    /// server already sees every request and every reply go past.
+    #[serde(default)]
+    pub shares_history: bool,
 }
 
 /// An active IP ban, as shown to admins.
@@ -150,6 +156,27 @@ pub struct ChannelInfo {
     /// Non-admins do not see the member list, only whoever is speaking.
     #[serde(default)]
     pub hide_members: bool,
+    /// A text channel (protocol v9): joining it is a subscription, not a move.
+    /// Several can be joined at once, and joining one leaves the voice channel
+    /// the user stands in alone. No voice, no screen share, no proximity.
+    #[serde(default)]
+    pub text: bool,
+    /// Clients join this text channel on connect unless the user left it
+    /// before (which the client remembers). A hint only — the server never
+    /// joins anybody by itself.
+    #[serde(default)]
+    pub auto_join: bool,
+    /// Seconds a message written here is meant to live; 0 (the default) is no
+    /// timer at all (protocol v9).
+    ///
+    /// The server neither stores chat nor enforces this — it cannot, the
+    /// messages are end-to-end encrypted and it keeps none of them. This is the
+    /// channel saying what it expects, which each client stamps on what it
+    /// sends and applies to what it keeps. A client takes the shorter of this
+    /// and what a message itself claims, so a relay that raises the number
+    /// cannot make anybody's copy outlive what its sender intended.
+    #[serde(default)]
+    pub message_ttl_secs: u32,
     /// The relay forwards voice only to the people who should hear it, instead
     /// of to everyone in the channel (protocol v8).
     ///
@@ -181,6 +208,7 @@ mod tests {
             is_deafened: true,
             is_screen_sharing: false,
             is_admin: true,
+            shares_history: true,
         };
         let bytes = postcard::to_allocvec(&info).unwrap();
         let decoded: UserInfo = postcard::from_bytes(&bytes).unwrap();
@@ -208,6 +236,9 @@ mod tests {
             screen_share: false,
             hide_members: true,
             routed: true,
+            text: true,
+            auto_join: true,
+            message_ttl_secs: 3600,
         };
         let bytes = postcard::to_allocvec(&info).unwrap();
         let decoded: ChannelInfo = postcard::from_bytes(&bytes).unwrap();
@@ -257,6 +288,7 @@ mod tests {
             is_deafened: false,
             is_screen_sharing: false,
             is_admin: false,
+            shares_history: false,
         };
         let bytes = postcard::to_allocvec(&info).unwrap();
         let decoded: UserInfo = postcard::from_bytes(&bytes).unwrap();

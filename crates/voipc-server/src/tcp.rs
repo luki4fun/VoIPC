@@ -9,12 +9,45 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{debug, error, info, warn};
 
 use voipc_protocol::codec::{
-    decode_client_msg, encode_server_msg, try_decode_frame, APP_VERSION, PROTOCOL_VERSION,
+    decode_client_msg, encode_server_msg, try_decode_frame, APP_VERSION, MAX_RELAY_CIPHERTEXT,
+    PROTOCOL_VERSION,
 };
 use voipc_protocol::messages::{ClientMessage, ServerMessage};
 use voipc_protocol::types::*;
 
 use crate::state::ServerState;
+
+/// One-time pre-keys stored per user. A bundle request consumes one and
+/// uploads replenish them at 0.2/s, so 100 is a deep supply — and it is also
+/// the point past which a client is no longer replenishing but filling our
+/// memory with blobs we never read. Applied at every door: the upload handler
+/// and the pre-key bundle a client offers at authentication, which is the
+/// same list arriving under another name.
+const MAX_PREKEYS: usize = 100;
+
+/// Longest public key we will store on a client's behalf, and longest
+/// signature.
+///
+/// Every one of these is opaque to us — a Curve25519 public key is 33 bytes on
+/// the wire and an Ed25519 signature 64 — but they arrive as byte strings with
+/// no length in the type, and we hold them until the session ends and hand them
+/// to whoever asks for a bundle. Unbounded, one client can park 100 pre-keys of
+/// 60 KiB each in our memory, and a bundle built from them comes back out as a
+/// message too long to frame: `encode_server_msg` refuses it, the requester is
+/// told nothing, and they can never open a session with that person again.
+const MAX_KEY_BYTES: usize = 64;
+const MAX_SIGNATURE_BYTES: usize = 128;
+
+/// Whether a pre-key bundle is the shape a client is supposed to send.
+fn bundle_is_sane(bundle: &PreKeyBundleData) -> bool {
+    bundle.identity_key.len() <= MAX_KEY_BYTES
+        && bundle.signed_prekey.len() <= MAX_KEY_BYTES
+        && bundle.signed_prekey_signature.len() <= MAX_SIGNATURE_BYTES
+        && bundle
+            .prekeys
+            .iter()
+            .all(|k| k.public_key.len() <= MAX_KEY_BYTES)
+}
 
 /// A TLS connection on the page port that offered no ALPN is a pre-0.5
 /// native client speaking the old TCP control protocol. Answer with the one
@@ -194,18 +227,25 @@ pub async fn handle_connection<S>(
             match try_decode_frame(&mut buf) {
                 Ok(Some(payload)) => {
                     msgs_this_read += 1;
+                    // The global per-session budget is spent on the frame, not
+                    // on what the frame turns out to contain. Charging only
+                    // the ones that decode leaves a peer free to send framed
+                    // garbage at line rate: it costs us a read and a postcard
+                    // pass every time and costs them nothing.
+                    let allowed = state
+                        .sessions
+                        .get_mut(&session_id)
+                        .map(|mut s| s.global_rate.try_consume())
+                        .unwrap_or(false);
+                    if !allowed {
+                        // debug, not warn: by construction this fires once per
+                        // dropped message, so a peer over its budget would be
+                        // writing our log for us at whatever rate it chose.
+                        debug!(user_id, "global rate limit exceeded, dropping message");
+                        continue;
+                    }
                     match decode_client_msg(&payload) {
                         Ok(msg) => {
-                            // Global per-session rate limiter
-                            let allowed = state
-                                .sessions
-                                .get_mut(&session_id)
-                                .map(|mut s| s.global_rate.try_consume())
-                                .unwrap_or(false);
-                            if !allowed {
-                                warn!(user_id, "global rate limit exceeded, dropping message");
-                                continue;
-                            }
                             if let Err(e) =
                                 handle_message(msg, &state, user_id, session_id, &tx).await
                             {
@@ -213,7 +253,10 @@ pub async fn handle_connection<S>(
                             }
                         }
                         Err(e) => {
-                            warn!(user_id, "failed to decode client message: {}", e);
+                            // Same reason: a malformed frame is now paid for,
+                            // but a line of log per frame is not a price we
+                            // let the sender set.
+                            debug!(user_id, "failed to decode client message: {}", e);
                         }
                     }
                 }
@@ -317,6 +360,15 @@ where
                         anyhow::bail!("invalid username characters");
                     }
 
+                    if prekey_bundle.as_ref().is_some_and(|b| !bundle_is_sane(b)) {
+                        let err_msg = ServerMessage::AuthError {
+                            reason: "pre-key bundle is malformed".into(),
+                        };
+                        let data = encode_server_msg(&err_msg)?;
+                        stream.write_all(&data).await?;
+                        anyhow::bail!("oversized pre-key bundle");
+                    }
+
                     if state.user_count() >= state.max_users as usize {
                         let err_msg = ServerMessage::AuthError {
                             reason: "server is full".into(),
@@ -353,7 +405,7 @@ where
                     let (prekeys, signed_prekey_id, signed_prekey, signed_prekey_signature, registration_id, device_id) =
                         if let Some(ref bundle) = prekey_bundle {
                             (
-                                bundle.prekeys.clone(),
+                                bundle.prekeys.iter().take(MAX_PREKEYS).cloned().collect(),
                                 Some(bundle.signed_prekey_id),
                                 Some(bundle.signed_prekey.clone()),
                                 Some(bundle.signed_prekey_signature.clone()),
@@ -367,49 +419,42 @@ where
                     // Create a placeholder sender (will be replaced after split)
                     let (placeholder_tx, _) = mpsc::channel(1);
 
-                    let session = crate::state::UserSession {
+                    let mut session = crate::state::UserSession::new(
                         user_id,
                         session_id,
-                        username: username.clone(),
-                        channel_id: 0,
-                        is_muted: false,
-                        is_deafened: false,
-                        tcp_tx: placeholder_tx,
+                        username.clone(),
+                        placeholder_tx,
                         media_tx,
                         peer_ip,
-                        is_admin: false,
-                        admin_login_failures: 0,
-                        close: Default::default(),
-                        history_request_rate: crate::state::RateLimiter::new(3.0, 0.5),
-                        udp_voice_rate: crate::state::RateLimiter::new(55.0, 55.0),
-                        // Position beacons: senders coalesce to 10 Hz, so 12/s
-                        // with a matching burst is plenty and keeps them off
-                        // the voice budget.
-                        position_rate: crate::state::RateLimiter::new(12.0, 12.0),
-                        // 1200 pkt/s ≈ 12 Mbps at 1280B packets: covers 1080p60
-                        // video (~7.5 Mbps) + screen audio with headroom; burst
-                        // 400 absorbs a full keyframe (up to 255 fragments).
-                        udp_video_rate: crate::state::RateLimiter::new(400.0, 1200.0),
-                        global_rate: crate::state::RateLimiter::new(50.0, 50.0),
-                        password_attempt_rate: crate::state::RateLimiter::new(3.0, 1.0),
-                        chat_rate: crate::state::RateLimiter::new(5.0, 5.0),
-                        keyframe_relay_rate: crate::state::RateLimiter::new(2.0, 1.0),
-                        loss_report_rate: crate::state::RateLimiter::new(2.0, 1.0),
-                        create_channel_rate: crate::state::RateLimiter::new(1.0, 0.2),
-                        prekey_rate: crate::state::RateLimiter::new(1.0, 0.2),
-                        // Burst covers joining a full channel; refill limits draining
-                        prekey_bundle_rate: crate::state::RateLimiter::new(60.0, 1.0),
-                        is_screen_sharing: false,
-                        watching_screenshare: None,
-                        identity_key,
-                        prekeys,
-                        signed_prekey_id,
-                        signed_prekey,
-                        signed_prekey_signature,
-                        registration_id,
-                        device_id,
-                    };
+                        state.max_users,
+                        state.channel_budget,
+                    );
+                    // What this particular client brought with it; the budgets
+                    // and the rest are the same for everybody (state.rs).
+                    session.identity_key = identity_key;
+                    session.prekeys = prekeys;
+                    session.signed_prekey_id = signed_prekey_id;
+                    session.signed_prekey = signed_prekey;
+                    session.signed_prekey_signature = signed_prekey_signature;
+                    session.registration_id = registration_id;
+                    session.device_id = device_id;
 
+                    // An id that is already taken means the counter wrapped
+                    // and came back round to a session that is still live.
+                    // Inserting over it would drop that connection's writer on
+                    // the floor and leave its loop serving somebody else's
+                    // state, so refuse the new connection instead: the one
+                    // arriving can be told to try again, the one already here
+                    // cannot be told anything.
+                    if state.sessions.contains_key(&session_id) {
+                        state.username_to_session.remove(&username.to_lowercase());
+                        let err_msg = ServerMessage::AuthError {
+                            reason: "session id already in use, please reconnect".into(),
+                        };
+                        let data = encode_server_msg(&err_msg)?;
+                        stream.write_all(&data).await?;
+                        anyhow::bail!("session id {} already in use", session_id);
+                    }
                     state.sessions.insert(session_id, session);
                     state.user_to_session.insert(user_id, session_id);
                     // The bridge can start routing this session's media now
@@ -435,6 +480,95 @@ where
     }
 }
 
+/// Whether a blob a client asked us to pass on is small enough to come back
+/// out as a frame somebody can read.
+///
+/// The inbound limit is not the outbound one: everything relayed is re-wrapped
+/// with the sender's id, the name they go by and a timestamp, so a blob that
+/// only just fit through `try_decode_frame` on the way in makes a message no
+/// recipient can decode on the way out — and their clients drop the connection
+/// over it, which is how one message takes a whole channel down. See
+/// `MAX_RELAY_CIPHERTEXT`.
+///
+/// The sender is told rather than dropped silently: an honest client that hit
+/// this has a message it believes was sent.
+async fn relayable(ciphertext: &[u8], tx: &mpsc::Sender<Vec<u8>>) -> bool {
+    if ciphertext.len() <= MAX_RELAY_CIPHERTEXT {
+        return true;
+    }
+    let _ = send_msg(
+        tx,
+        &ServerMessage::ChannelError {
+            reason: "message too large".into(),
+        },
+    )
+    .await;
+    false
+}
+
+/// Spend one of this session's `state_change_rate` tokens, or say no.
+///
+/// Every message that has to ask is a flag the server keeps about the sender
+/// and then announces to other people: nothing to store, a fan-out to tell.
+/// A refusal is silent — no honest client comes near the budget, and answering
+/// would be one more message going out.
+fn may_change_state(state: &Arc<ServerState>, session_id: SessionId, user_id: UserId) -> bool {
+    let allowed = state
+        .sessions
+        .get_mut(&session_id)
+        .map(|mut s| s.state_change_rate.try_consume())
+        .unwrap_or(false);
+    if !allowed {
+        debug!(user_id, "state change rate limit exceeded, dropping");
+    }
+    allowed
+}
+
+/// Whether both users are members of the channel a relay names.
+async fn both_in_channel(
+    state: &Arc<ServerState>,
+    channel_id: ChannelId,
+    a: UserId,
+    b: UserId,
+) -> bool {
+    let channels = state.channels.read().await;
+    channels
+        .get(&channel_id)
+        .is_some_and(|ch| ch.members.contains(&a) && ch.members.contains(&b))
+}
+
+/// Whether a key distribution may be relayed: both ends in the channel it
+/// names, and the sender still inside their budget **for that target**.
+///
+/// The membership check comes first and is what bounds the budget map — it can
+/// only grow an entry for somebody this user really shares a channel with.
+/// A refusal is silent: an honest client hands its key to each peer once per
+/// channel and never comes near this, and a dishonest one is owed nothing.
+async fn may_relay_key(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    from_user_id: UserId,
+    channel_id: ChannelId,
+    target_user_id: UserId,
+) -> bool {
+    if !both_in_channel(state, channel_id, from_user_id, target_user_id).await {
+        // debug, not warn: clients hand their sender key to every peer they
+        // establish a session with, wherever that peer is; this check is the
+        // filter, not an anomaly.
+        debug!(from_user_id, target_user_id, channel_id, "key relay rejected: not both members");
+        return false;
+    }
+    let allowed = state
+        .sessions
+        .get_mut(&session_id)
+        .map(|mut s| s.may_relay_key_to(target_user_id))
+        .unwrap_or(false);
+    if !allowed {
+        debug!(from_user_id, target_user_id, "key relay rate limit exceeded, dropping");
+    }
+    allowed
+}
+
 /// Handle a client message after authentication.
 async fn handle_message(
     msg: ClientMessage,
@@ -451,11 +585,15 @@ async fn handle_message(
             handle_join_channel(state, user_id, session_id, channel_id, password.as_deref(), tx)
                 .await?;
         }
+        ClientMessage::LeaveChannel { channel_id } => {
+            handle_leave_text_channel(state, user_id, session_id, channel_id, tx).await?;
+        }
         ClientMessage::CreateChannel {
             name,
             password,
             proximity,
             anonymous,
+            text,
         } => {
             let allowed = state
                 .sessions
@@ -468,7 +606,7 @@ async fn handle_message(
                 }).await;
             } else {
                 handle_create_channel(
-                    state, user_id, session_id, name, password, proximity, anonymous, tx,
+                    state, user_id, session_id, name, password, proximity, anonymous, text, tx,
                 )
                 .await?;
             }
@@ -478,6 +616,9 @@ async fn handle_message(
             // Cleanup will happen when the connection loop ends
         }
         ClientMessage::SetMuted { muted } => {
+            if !may_change_state(state, session_id, user_id) {
+                return Ok(());
+            }
             if let Some(mut session) = state.sessions.get_mut(&session_id) {
                 session.is_muted = muted;
             }
@@ -492,7 +633,44 @@ async fn handle_message(
             let msg = ServerMessage::UserMuted { user_id, muted };
             broadcast_to_channel(state, channel_id, &msg, Some(user_id)).await;
         }
+        ClientMessage::SetHistorySharing { enabled } => {
+            if !may_change_state(state, session_id, user_id) {
+                return Ok(());
+            }
+            // Setting the flag to what it already holds is news to nobody,
+            // and this particular announcement goes to every session on the
+            // server — so a client re-sending its state on reconnect, or
+            // toggling a switch back and forth, must not cost a fan-out each
+            // time.
+            let changed = state
+                .sessions
+                .get_mut(&session_id)
+                .map(|mut s| {
+                    let changed = s.shares_history != enabled;
+                    s.shares_history = enabled;
+                    changed
+                })
+                .unwrap_or(false);
+            // To everyone, unlike mute and deafen, and including the sender.
+            // Everyone, because a text channel's subscribers are standing in
+            // voice channels of their own, so "this channel" is not a place
+            // the news would reach them. The sender too, because their own row
+            // in their own member list has to show what everyone else sees —
+            // the mute flag not being echoed is exactly what made that one
+            // disagree with itself.
+            if changed {
+                broadcast_to_all(
+                    state,
+                    &ServerMessage::UserHistorySharing { user_id, enabled },
+                    None,
+                )
+                .await;
+            }
+        }
         ClientMessage::SetDeafened { deafened } => {
+            if !may_change_state(state, session_id, user_id) {
+                return Ok(());
+            }
             if let Some(mut session) = state.sessions.get_mut(&session_id) {
                 session.is_deafened = deafened;
             }
@@ -518,6 +696,9 @@ async fn handle_message(
             channel_id,
             password,
         } => {
+            if !may_change_state(state, session_id, user_id) {
+                return Ok(());
+            }
             handle_set_channel_password(state, user_id, session_id, channel_id, password, tx)
                 .await?;
         }
@@ -525,6 +706,9 @@ async fn handle_message(
             channel_id,
             proximity,
         } => {
+            if !may_change_state(state, session_id, user_id) {
+                return Ok(());
+            }
             handle_set_channel_proximity(state, user_id, session_id, channel_id, proximity, tx)
                 .await?;
         }
@@ -535,7 +719,11 @@ async fn handle_message(
             screen_share,
             hide_members,
             routed,
+            message_ttl_secs,
         } => {
+            if !may_change_state(state, session_id, user_id) {
+                return Ok(());
+            }
             handle_set_channel_options(
                 state,
                 user_id,
@@ -546,6 +734,7 @@ async fn handle_message(
                 screen_share,
                 hide_members,
                 routed,
+                message_ttl_secs,
                 tx,
             )
             .await?;
@@ -557,6 +746,19 @@ async fn handle_message(
             handle_kick_user(state, user_id, session_id, channel_id, target_id, tx).await?;
         }
         ClientMessage::SetAudioFilter { allow } => {
+            // Its own budget, not the one for flags the server announces: a
+            // game drives this one, and dropping an update silently leaves the
+            // relay culling by a filter the game has moved on from. See
+            // `audio_filter_rate`.
+            let allowed = state
+                .sessions
+                .get_mut(&session_id)
+                .map(|mut s| s.audio_filter_rate.try_consume())
+                .unwrap_or(false);
+            if !allowed {
+                debug!(user_id, "audio filter rate limit exceeded, dropping");
+                return Ok(());
+            }
             // Only honoured in a channel that says it is routed; everywhere
             // else the client is told nothing about it and we keep nothing
             // about them, which is the point of the flag being opt-in.
@@ -573,9 +775,14 @@ async fn handle_message(
                 // Bounded by the roster: a client cannot make us hold a set
                 // larger than the server can ever have members.
                 let allow = allow.map(|mut ids| {
+                    // Truncate first. Sorting and deduplicating a list whose
+                    // length the client chose is work done on ids we have
+                    // already decided not to keep — and the list is a
+                    // `Vec<u32>` that arrived over the wire, so its length is
+                    // bounded only by the 64 KiB frame.
+                    ids.truncate(state.max_users as usize);
                     ids.sort_unstable();
                     ids.dedup();
-                    ids.truncate(state.max_users as usize);
                     ids
                 });
                 state.routing.set_filter(session_id, allow);
@@ -630,26 +837,36 @@ async fn handle_message(
             ciphertext,
             message_type,
         } => {
-            // Pokes play a sound and raise an OS notification — same budget as chat
-            let allowed = state
-                .sessions
-                .get_mut(&session_id)
-                .map(|mut s| s.chat_rate.try_consume())
-                .unwrap_or(false);
-            if !allowed {
-                let _ = send_msg(tx, &ServerMessage::ChannelError {
-                    reason: "sending too fast, slow down".into(),
-                }).await;
-            } else {
-                handle_send_poke(state, user_id, session_id, target_user_id, ciphertext, message_type, tx).await?;
+            if relayable(&ciphertext, tx).await {
+                // Pokes play a sound and raise an OS notification — same budget as chat
+                let allowed = state
+                    .sessions
+                    .get_mut(&session_id)
+                    .map(|mut s| s.chat_rate.try_consume())
+                    .unwrap_or(false);
+                if !allowed {
+                    let _ = send_msg(tx, &ServerMessage::ChannelError {
+                        reason: "sending too fast, slow down".into(),
+                    }).await;
+                } else {
+                    handle_send_poke(state, user_id, session_id, target_user_id, ciphertext, message_type, tx).await?;
+                }
             }
         }
         ClientMessage::StartScreenShare { source: _, resolution, codec } => {
+            // Starting and stopping each tell a whole channel, so they cost
+            // what the other "something about me changed" messages cost.
+            if !may_change_state(state, session_id, user_id) {
+                return Ok(());
+            }
             let clamped_resolution = resolution.clamp(240, 4320);
             handle_start_screen_share(state, user_id, session_id, clamped_resolution, codec, tx)
                 .await?;
         }
         ClientMessage::StopScreenShare => {
+            if !may_change_state(state, session_id, user_id) {
+                return Ok(());
+            }
             handle_stop_screen_share(state, user_id, session_id, tx).await?;
         }
         ClientMessage::WatchScreenShare { sharer_user_id } => {
@@ -707,7 +924,10 @@ async fn handle_message(
             }
         }
         ClientMessage::Authenticate { .. } => {
-            warn!(user_id, "received duplicate Authenticate message, ignoring");
+            // debug, like the other things a client can repeat at line rate:
+            // a log line is the cheapest thing on a server to make somebody
+            // else write.
+            debug!(user_id, "received duplicate Authenticate message, ignoring");
         }
 
         // ── E2E Encryption handlers ──────────────────────────────────────
@@ -747,35 +967,42 @@ async fn handle_message(
             ciphertext,
             message_type,
         } => {
-            let allowed = state
-                .sessions
-                .get_mut(&session_id)
-                .map(|mut s| s.chat_rate.try_consume())
-                .unwrap_or(false);
-            if !allowed {
-                let _ = send_msg(tx, &ServerMessage::ChannelError {
-                    reason: "sending too fast, slow down".into(),
-                }).await;
-            } else {
-                handle_encrypted_direct_message(
-                    state, user_id, session_id, target_user_id, ciphertext, message_type, tx,
-                ).await?;
+            if relayable(&ciphertext, tx).await {
+                let allowed = state
+                    .sessions
+                    .get_mut(&session_id)
+                    .map(|mut s| s.chat_rate.try_consume())
+                    .unwrap_or(false);
+                if !allowed {
+                    let _ = send_msg(tx, &ServerMessage::ChannelError {
+                        reason: "sending too fast, slow down".into(),
+                    }).await;
+                } else {
+                    handle_encrypted_direct_message(
+                        state, user_id, session_id, target_user_id, ciphertext, message_type, tx,
+                    ).await?;
+                }
             }
         }
-        ClientMessage::SendEncryptedChannelMessage { ciphertext } => {
-            let allowed = state
-                .sessions
-                .get_mut(&session_id)
-                .map(|mut s| s.chat_rate.try_consume())
-                .unwrap_or(false);
-            if !allowed {
-                let _ = send_msg(tx, &ServerMessage::ChannelError {
-                    reason: "sending too fast, slow down".into(),
-                }).await;
-            } else {
-                handle_encrypted_channel_message(
-                    state, user_id, session_id, ciphertext, tx,
-                ).await?;
+        ClientMessage::SendEncryptedChannelMessage {
+            channel_id,
+            ciphertext,
+        } => {
+            if relayable(&ciphertext, tx).await {
+                let allowed = state
+                    .sessions
+                    .get_mut(&session_id)
+                    .map(|mut s| s.chat_rate.try_consume())
+                    .unwrap_or(false);
+                if !allowed {
+                    let _ = send_msg(tx, &ServerMessage::ChannelError {
+                        reason: "sending too fast, slow down".into(),
+                    }).await;
+                } else {
+                    handle_encrypted_channel_message(
+                        state, user_id, session_id, channel_id, ciphertext, tx,
+                    ).await?;
+                }
             }
         }
         ClientMessage::DistributeSenderKey {
@@ -784,9 +1011,13 @@ async fn handle_message(
             distribution_message,
             message_type,
         } => {
-            handle_distribute_sender_key(
-                state, user_id, channel_id, target_user_id, distribution_message, message_type,
-            ).await?;
+            if relayable(&distribution_message, tx).await
+                && may_relay_key(state, session_id, user_id, channel_id, target_user_id).await
+            {
+                handle_distribute_sender_key(
+                    state, user_id, channel_id, target_user_id, distribution_message, message_type,
+                ).await?;
+            }
         }
         ClientMessage::DistributeMediaKey {
             channel_id,
@@ -794,9 +1025,13 @@ async fn handle_message(
             encrypted_media_key,
             message_type,
         } => {
-            handle_distribute_media_key(
-                state, user_id, channel_id, target_user_id, encrypted_media_key, message_type,
-            ).await?;
+            if relayable(&encrypted_media_key, tx).await
+                && may_relay_key(state, session_id, user_id, channel_id, target_user_id).await
+            {
+                handle_distribute_media_key(
+                    state, user_id, channel_id, target_user_id, encrypted_media_key, message_type,
+                ).await?;
+            }
         }
 
         // ── Moderation ─────────────────────────────────────────────────
@@ -848,16 +1083,18 @@ async fn handle_message(
             }
         }
         ClientMessage::SendChannelHistory { channel_id, target_user_id, ciphertext, message_type } => {
-            let allowed = state
-                .sessions
-                .get_mut(&session_id)
-                .map(|mut s| s.chat_rate.try_consume())
-                .unwrap_or(false);
-            if allowed {
-                handle_send_channel_history(
-                    state, user_id, session_id, channel_id, target_user_id, ciphertext, message_type,
-                )
-                .await;
+            if relayable(&ciphertext, tx).await {
+                let allowed = state
+                    .sessions
+                    .get_mut(&session_id)
+                    .map(|mut s| s.chat_rate.try_consume())
+                    .unwrap_or(false);
+                if allowed {
+                    handle_send_channel_history(
+                        state, user_id, session_id, channel_id, target_user_id, ciphertext, message_type,
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -892,6 +1129,57 @@ async fn handle_join_channel(
         }
     }
 
+    // Either kind of join announces itself to every session on the server —
+    // a voice one twice, being a leave and a join — so both draw on the same
+    // budget. See `join_rate`.
+    let allowed = state
+        .sessions
+        .get_mut(&session_id)
+        .map(|mut s| s.join_rate.try_consume())
+        .unwrap_or(false);
+    if !allowed {
+        let _ = send_msg(
+            tx,
+            &ServerMessage::ChannelError {
+                reason: "joining and leaving too fast, slow down".into(),
+            },
+        )
+        .await;
+        return Ok(());
+    }
+
+    // A text channel is a subscription, not a move: the user keeps the voice
+    // channel they stand in, and every other text channel they are in. It
+    // needs no separate validation pass either — there is no current channel to
+    // protect, and `join_text_channel` checks the password, the capacity and
+    // the per-user subscription cap itself, after the membership check that
+    // makes a repeated join a no-op.
+    if state.is_text_channel(channel_id).await {
+        match state.join_text_channel(user_id, channel_id, password).await {
+            Ok(joined) => {
+                // Even a repeated join answers with the roster: a client that
+                // lost track asks again rather than going without one.
+                let users = state.users_in_channel_for(channel_id, session_id).await;
+                let _ = send_msg(tx, &ServerMessage::UserList { channel_id, users }).await;
+
+                if joined {
+                    let user_info = user_info_for(state, user_id, session_id, channel_id);
+                    broadcast_user_joined(state, user_info).await;
+                }
+            }
+            Err(e) => {
+                let _ = send_msg(
+                    tx,
+                    &ServerMessage::ChannelError {
+                        reason: e.to_string(),
+                    },
+                )
+                .await;
+            }
+        }
+        return Ok(());
+    }
+
     // Validate the join BEFORE leaving the current channel.
     // This way, if the password is wrong or the channel is full,
     // the user stays where they are instead of being dumped into General.
@@ -922,11 +1210,7 @@ async fn handle_join_channel(
     if let Some((left_channel_id, _remaining, remaining_count)) =
         state.leave_current_channel(user_id, session_id).await
     {
-        let leave_msg = ServerMessage::UserLeft {
-            user_id,
-            channel_id: left_channel_id,
-        };
-        broadcast_to_all(state, &leave_msg, Some(user_id)).await;
+        broadcast_user_left(state, user_id, left_channel_id, Some(user_id)).await;
 
         if remaining_count == 0 && left_channel_id != 0 {
             start_channel_delete_timer(state, left_channel_id).await;
@@ -968,30 +1252,85 @@ async fn handle_join_channel(
     // sessions (DistributeMediaKey) — the server never sees them.
 
     // Build user info for the join notification
-    let user_info = UserInfo {
-        user_id,
-        username: state
-            .sessions
-            .get(&session_id)
-            .map(|s| s.username.clone())
-            .unwrap_or_default(),
-        channel_id,
-        is_muted: state
-            .sessions
-            .get(&session_id)
-            .map(|s| s.is_muted)
-            .unwrap_or(false),
-        is_deafened: state
-            .sessions
-            .get(&session_id)
-            .map(|s| s.is_deafened)
-            .unwrap_or(false),
-        is_screen_sharing: false,
-        is_admin: state.is_admin(session_id),
-    };
+    let user_info = user_info_for(state, user_id, session_id, channel_id);
 
     broadcast_user_joined(state, user_info).await;
 
+    Ok(())
+}
+
+/// The joiner, as the join notification describes them. `channel_id` is the
+/// channel they joined — the voice room they moved into, or the text channel
+/// they subscribed to.
+fn user_info_for(
+    state: &Arc<ServerState>,
+    user_id: UserId,
+    session_id: SessionId,
+    channel_id: ChannelId,
+) -> UserInfo {
+    // Everything off the one guard: `state.is_admin` would take the same shard
+    // again while this one is still held, which is the re-entry the invite
+    // handler documents working around.
+    let session = state.sessions.get(&session_id);
+    UserInfo {
+        user_id,
+        username: session.as_ref().map(|s| s.username.clone()).unwrap_or_default(),
+        channel_id,
+        is_muted: session.as_ref().map(|s| s.is_muted).unwrap_or(false),
+        is_deafened: session.as_ref().map(|s| s.is_deafened).unwrap_or(false),
+        is_screen_sharing: false,
+        is_admin: session.as_ref().is_some_and(|s| s.is_admin),
+        shares_history: session.as_ref().is_some_and(|s| s.shares_history),
+    }
+}
+
+/// Unsubscribe from a text channel.
+///
+/// The `UserLeft` goes to everyone including the leaver: it is what tells
+/// their own client the subscription is gone, and everyone else's that the
+/// member list shrank.
+async fn handle_leave_text_channel(
+    state: &Arc<ServerState>,
+    user_id: UserId,
+    session_id: SessionId,
+    channel_id: ChannelId,
+    tx: &mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
+    // Same budget as the join, and for the same reason: leaving is also a
+    // broadcast to every session plus a write of the channel map, and a
+    // subscription can be dropped and retaken as fast as a client likes.
+    let allowed = state
+        .sessions
+        .get_mut(&session_id)
+        .map(|mut s| s.join_rate.try_consume())
+        .unwrap_or(false);
+    if !allowed {
+        let _ = send_msg(
+            tx,
+            &ServerMessage::ChannelError {
+                reason: "joining and leaving too fast, slow down".into(),
+            },
+        )
+        .await;
+        return Ok(());
+    }
+    match state.leave_text_channel(user_id, channel_id).await {
+        Some(remaining) => {
+            broadcast_user_left(state, user_id, channel_id, None).await;
+            if remaining == 0 {
+                start_channel_delete_timer(state, channel_id).await;
+            }
+        }
+        None => {
+            let _ = send_msg(
+                tx,
+                &ServerMessage::ChannelError {
+                    reason: "not a text channel you are in".into(),
+                },
+            )
+            .await;
+        }
+    }
     Ok(())
 }
 
@@ -1004,23 +1343,116 @@ async fn handle_join_channel(
 /// one would hand outsiders both names for the same id, and the members left
 /// behind would learn who the pseudonym had been.
 async fn broadcast_user_joined(state: &Arc<ServerState>, user: UserInfo) {
-    let (real, alias) = state.names_of(user.user_id).await;
+    let (real, alias) = state.names_of_in(user.channel_id, user.user_id).await;
+    let roster = roster_audience(state, user.channel_id).await;
     for entry in state.sessions.iter() {
         let session = entry.value();
         if session.user_id == user.user_id {
             continue;
         }
-        let username = if session.channel_id == user.channel_id || session.is_admin {
+        // Two different questions. The name goes to the channel's own people
+        // only, always has, and that is what keeps a move between an anonymous
+        // channel and an ordinary one from handing outsiders both names for
+        // one person. The *id* is the narrower rule below: a channel that
+        // hides its members hides them here too.
+        let username = if roster.knows_them(session.user_id) || session.is_admin {
             crate::state::pick_name(&real, &alias, session.is_admin)
         } else {
             // The client only renders this for its own channel anyway
             String::new()
         };
+        let may_name = roster.may_name(session.user_id, user.user_id) || session.is_admin;
         let info = UserInfo {
             username,
+            user_id: roster.tell(may_name, user.user_id),
             ..user.clone()
         };
         let _ = send_msg(&session.tcp_tx, &ServerMessage::UserJoined { user: info }).await;
+    }
+}
+
+/// Tell every session that somebody left a channel, under the same rule as
+/// the join above: an outsider gets the count and nothing else.
+///
+/// `exclude` is for the leaver themselves, where something better is already
+/// on its way to them (a `UserList` for the room they moved into, or the end
+/// of their connection). Leaving a *text* channel passes `None`: that
+/// broadcast is what drops the subscription on their own side.
+async fn broadcast_user_left(
+    state: &Arc<ServerState>,
+    user_id: UserId,
+    channel_id: ChannelId,
+    exclude: Option<UserId>,
+) {
+    let roster = roster_audience(state, channel_id).await;
+    for entry in state.sessions.iter() {
+        let session = entry.value();
+        if Some(session.user_id) == exclude {
+            continue;
+        }
+        let may_name = roster.may_name(session.user_id, user_id) || session.is_admin;
+        let msg = ServerMessage::UserLeft {
+            user_id: roster.tell(may_name, user_id),
+            channel_id,
+        };
+        let _ = send_msg(&session.tcp_tx, &msg).await;
+    }
+}
+
+/// Who may learn *who* is in a channel, as opposed to how many.
+///
+/// `is_channel_public_or_member` is that rule and the roster query has always
+/// honoured it. The join and leave broadcasts did not: they go to every
+/// session, because they double as the user-count update, and they carried the
+/// user id even where the name was blanked. One `#general` everybody is in
+/// maps every id to a name, so a client that kept the ids could rebuild
+/// exactly the roster a `hide_members` or password channel withholds. An
+/// outsider now gets the count and nothing else.
+struct RosterAudience {
+    members: std::collections::HashSet<UserId>,
+    private: bool,
+}
+
+impl RosterAudience {
+    /// Whether this recipient is one of the channel's own people, who may be
+    /// told the name. Membership rather than `session.channel_id`: for a text
+    /// channel those people are its subscribers, who are all standing in voice
+    /// channels of their own.
+    fn knows_them(&self, recipient: UserId) -> bool {
+        self.members.contains(&recipient)
+    }
+
+    /// Whether this recipient may be told *which person* it is. Everyone
+    /// learns of a join or leave, because the same message is the member
+    /// count — but in a channel that keeps its roster to itself, an outsider
+    /// learns only that the count moved. You always learn about yourself:
+    /// leaving is a thing your own client has to act on.
+    fn may_name(&self, recipient: UserId, subject: UserId) -> bool {
+        recipient == subject || self.knows_them(recipient) || !self.private
+    }
+
+    /// The id to put on the wire: nobody, for a recipient who may not be told
+    /// (user ids start at 1).
+    fn tell(&self, may_name: bool, user_id: UserId) -> UserId {
+        if may_name {
+            user_id
+        } else {
+            0
+        }
+    }
+}
+
+async fn roster_audience(state: &ServerState, channel_id: ChannelId) -> RosterAudience {
+    let channels = state.channels.read().await;
+    match channels.get(&channel_id) {
+        Some(channel) => RosterAudience {
+            members: channel.members.clone(),
+            private: channel.info.hide_members || channel.password.is_some(),
+        },
+        None => RosterAudience {
+            members: Default::default(),
+            private: false,
+        },
     }
 }
 
@@ -1033,6 +1465,7 @@ async fn handle_create_channel(
     password: Option<String>,
     proximity: ProximityMode,
     anonymous: bool,
+    text: bool,
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
     // Validate and sanitize name
@@ -1066,7 +1499,7 @@ async fn handle_create_channel(
     let join_password = password.clone();
 
     match state
-        .create_channel(name, password, proximity, anonymous, user_id)
+        .create_channel(name, password, proximity, anonymous, text, user_id)
         .await
     {
         Ok(info) => {
@@ -1074,6 +1507,15 @@ async fn handle_create_channel(
             // Broadcast ChannelCreated to all users
             let msg = ServerMessage::ChannelCreated { channel: info };
             broadcast_to_all(state, &msg, None).await;
+
+            // Before the auto-join, not after it: the join below can be
+            // refused — the creator is out of join budget, the password they
+            // set is wrong for the channel they just made — and a channel that
+            // nobody ever joined has no leave to start its timer from. It would
+            // then sit in the map with no members for as long as the server
+            // ran, and enough of them fill `max_channels` for everybody. A join
+            // that does go through aborts this timer (`join_channel`).
+            start_channel_delete_timer(state, channel_id).await;
 
             // Auto-join the creator into the new channel
             handle_join_channel(
@@ -1114,7 +1556,11 @@ async fn handle_set_channel_password(
         .set_channel_password(channel_id, user_id, password, is_admin)
         .await
     {
-        Ok(updated_info) => {
+        // None: the password it already had. Re-sending the options a channel
+        // has is something a client may do, and every one of those would
+        // otherwise be a message to every session on the server.
+        Ok(None) => {}
+        Ok(Some(updated_info)) => {
             let msg = ServerMessage::ChannelUpdated {
                 channel: updated_info,
             };
@@ -1147,7 +1593,9 @@ async fn handle_set_channel_proximity(
         .set_channel_proximity(channel_id, user_id, proximity, is_admin)
         .await
     {
-        Ok(updated_info) => {
+        // None: the mode it was already in — see the password handler above.
+        Ok(None) => {}
+        Ok(Some(updated_info)) => {
             let msg = ServerMessage::ChannelUpdated {
                 channel: updated_info,
             };
@@ -1178,6 +1626,7 @@ async fn handle_set_channel_options(
     screen_share: Option<bool>,
     hide_members: Option<bool>,
     routed: Option<bool>,
+    message_ttl_secs: Option<u32>,
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
     let is_admin = state.is_admin(session_id);
@@ -1190,17 +1639,22 @@ async fn handle_set_channel_options(
             screen_share,
             hide_members,
             routed,
+            message_ttl_secs,
             is_admin,
         )
         .await
     {
-        Ok(updated_info) => {
-            let now_anonymous = updated_info.anonymous;
+        Ok((updated_info, changed)) => {
             let sharing_off = !updated_info.screen_share;
-            let msg = ServerMessage::ChannelUpdated {
-                channel: updated_info,
-            };
-            broadcast_to_all(state, &msg, None).await;
+            // Nothing moved means nothing to tell anybody, and this one goes
+            // to every session on the server: a client re-sending the options
+            // a channel already has must not cost a fan-out each time.
+            if changed.any {
+                let msg = ServerMessage::ChannelUpdated {
+                    channel: updated_info,
+                };
+                broadcast_to_all(state, &msg, None).await;
+            }
 
             // Switching sharing off stops the shares already running: leaving
             // them relaying would make the option a lie, and the sharer's UI
@@ -1235,8 +1689,11 @@ async fn handle_set_channel_options(
             }
 
             // Anonymity changed the names the members go by, and their client
-            // stores hold the old ones: hand each member a fresh list.
-            if anonymous.is_some_and(|v| v == now_anonymous) {
+            // stores hold the old ones: hand each member a fresh list. Only
+            // when it really flipped — this builds one roster per member and
+            // re-takes the channels lock for each of them, and being asked to
+            // set `anonymous` to what it already is must not cost that.
+            if changed.anonymity {
                 resend_user_list(state, channel_id).await;
             }
         }
@@ -1288,6 +1745,7 @@ async fn handle_kick_user(
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
     let by_admin = state.is_admin(requester_session_id);
+    let is_text = state.is_text_channel(channel_id).await;
     match state
         .kick_user(channel_id, requester_id, target_id, by_admin)
         .await
@@ -1295,9 +1753,11 @@ async fn handle_kick_user(
         Ok((target_session_id, remaining_count)) => {
             // Same teardown as leave/disconnect: otherwise a kicked viewer
             // keeps receiving the share's video and a kicked sharer leaves
-            // its viewers stuck.
-            cleanup_and_notify_screen_shares(state, target_id, target_session_id, channel_id)
-                .await;
+            // its viewers stuck. A text channel carries neither.
+            if !is_text {
+                cleanup_and_notify_screen_shares(state, target_id, target_session_id, channel_id)
+                    .await;
+            }
 
             // Notify the kicked user
             if let Some(session) = state.sessions.get(&target_session_id) {
@@ -1315,51 +1775,33 @@ async fn handle_kick_user(
                 .await;
             }
 
-            // Broadcast UserLeft to everyone
-            let leave_msg = ServerMessage::UserLeft {
-                user_id: target_id,
-                channel_id,
-            };
-            broadcast_to_all(state, &leave_msg, Some(target_id)).await;
+            // Broadcast UserLeft to everyone, the leaver included: for a
+            // text channel that broadcast is what drops the subscription on
+            // their side, and they always learn about themselves.
+            broadcast_user_left(state, target_id, channel_id, None).await;
 
-            // Move the kicked user to General (channel 0)
-            let _ = state.join_channel(target_id, target_session_id, 0, None).await;
-            let general_users = state.users_in_channel_for(0, target_session_id).await;
+            // Being kicked out of a text channel costs the subscription and
+            // nothing else — the user stays where they stand.
+            if !is_text {
+                // Move the kicked user to General (channel 0)
+                let _ = state.join_channel(target_id, target_session_id, 0, None).await;
+                let general_users = state.users_in_channel_for(0, target_session_id).await;
 
-            if let Some(session) = state.sessions.get(&target_session_id) {
-                let _ = send_msg(
-                    &session.tcp_tx,
-                    &ServerMessage::UserList {
-                        channel_id: 0,
-                        users: general_users,
-                    },
-                )
-                .await;
+                if let Some(session) = state.sessions.get(&target_session_id) {
+                    let _ = send_msg(
+                        &session.tcp_tx,
+                        &ServerMessage::UserList {
+                            channel_id: 0,
+                            users: general_users,
+                        },
+                    )
+                    .await;
+                }
+
+                // Broadcast UserJoined (to General) to everyone
+                let user_info = user_info_for(state, target_id, target_session_id, 0);
+                broadcast_user_joined(state, user_info).await;
             }
-
-            // Broadcast UserJoined (to General) to everyone
-            let user_info = UserInfo {
-                user_id: target_id,
-                username: state
-                    .sessions
-                    .get(&target_session_id)
-                    .map(|s| s.username.clone())
-                    .unwrap_or_default(),
-                channel_id: 0,
-                is_muted: state
-                    .sessions
-                    .get(&target_session_id)
-                    .map(|s| s.is_muted)
-                    .unwrap_or(false),
-                is_deafened: state
-                    .sessions
-                    .get(&target_session_id)
-                    .map(|s| s.is_deafened)
-                    .unwrap_or(false),
-                is_screen_sharing: false,
-                is_admin: state.is_admin(target_session_id),
-            };
-            broadcast_user_joined(state, user_info).await;
 
             // Start auto-delete timer if the channel is now empty
             if remaining_count == 0 {
@@ -1481,7 +1923,12 @@ async fn handle_decline_invite(
             .and_then(|ch| ch.created_by)
     };
 
-    state.remove_invite(channel_id, user_id).await;
+    // A decline for a channel nobody invited us to is a message of the
+    // sender's choosing aimed at a creator of their choosing; there is nothing
+    // to decline and nobody to tell.
+    if !state.remove_invite(channel_id, user_id).await {
+        return Ok(());
+    }
 
     // Notify the creator
     if let Some(creator_id) = creator_id {
@@ -1643,18 +2090,6 @@ async fn handle_admin_kick(
 
 // ── Channel history hand-off (relay only, payload opaque) ──────────────
 
-async fn both_in_channel(
-    state: &Arc<ServerState>,
-    channel_id: ChannelId,
-    a: UserId,
-    b: UserId,
-) -> bool {
-    let channels = state.channels.read().await;
-    channels
-        .get(&channel_id)
-        .map_or(false, |ch| ch.members.contains(&a) && ch.members.contains(&b))
-}
-
 async fn handle_request_channel_history(
     state: &Arc<ServerState>,
     from_user_id: UserId,
@@ -1671,17 +2106,36 @@ async fn handle_request_channel_history(
     if state.is_anonymous_channel(channel_id).await {
         return;
     }
-    if let Some(target_sid) = state.user_to_session.get(&target_user_id) {
-        if let Some(session) = state.sessions.get(&*target_sid) {
-            let _ = send_msg(
-                &session.tcp_tx,
-                &ServerMessage::ChannelHistoryRequested {
-                    channel_id,
-                    from_user_id,
-                },
-            )
-            .await;
-        }
+    let Some(target_sid) = state.user_to_session.get(&target_user_id).map(|s| *s) else {
+        return;
+    };
+    // Two answers from the target's own session, and both of them are theirs
+    // to give. `shares_history` is the flag they set and the server has been
+    // announcing all along — until now nothing on this side ever read it, so a
+    // client could ask anybody and the client at the other end was the only
+    // thing deciding whether to answer. `history_serve_rate` is the budget of
+    // the one being asked rather than the one asking: `history_request_rate`
+    // bounds a single requester, but every member of a channel may aim at the
+    // same person at once, and each request costs them an encrypt and up to
+    // ~48 KiB. A non-sharer spends no token — there is nothing to protect them
+    // from beyond the question itself.
+    let serve = state
+        .sessions
+        .get_mut(&target_sid)
+        .map(|mut s| s.shares_history && s.history_serve_rate.try_consume())
+        .unwrap_or(false);
+    if !serve {
+        return;
+    }
+    if let Some(session) = state.sessions.get(&target_sid) {
+        let _ = send_msg(
+            &session.tcp_tx,
+            &ServerMessage::ChannelHistoryRequested {
+                channel_id,
+                from_user_id,
+            },
+        )
+        .await;
     }
 }
 
@@ -1747,7 +2201,7 @@ async fn handle_start_screen_share(
         .await
     {
         Ok(member_sessions) => {
-            let (real, alias) = state.names_of(user_id).await;
+            let (real, alias) = state.names_of_in(channel_id, user_id).await;
 
             // Broadcast to all channel members (including sender for confirmation),
             // each under the name they may see
@@ -2043,7 +2497,10 @@ async fn handle_request_prekey_bundle(
         let prekeys = if session.prekeys.is_empty() {
             vec![]
         } else {
-            vec![session.prekeys.remove(0)]
+            // Any of them will do — a one-time pre-key has no order — and
+            // taking the last one is a move instead of shifting the other 99
+            // down on every bundle request.
+            vec![session.prekeys.pop().expect("checked non-empty just above")]
         };
 
         PreKeyBundleData {
@@ -2072,13 +2529,19 @@ async fn handle_upload_prekeys(
     session_id: SessionId,
     prekeys: Vec<OneTimePreKey>,
 ) {
-    const MAX_PREKEYS: usize = 100;
     if let Some(mut session) = state.sessions.get_mut(&session_id) {
         let remaining_capacity = MAX_PREKEYS.saturating_sub(session.prekeys.len());
         if remaining_capacity > 0 {
-            session
-                .prekeys
-                .extend(prekeys.into_iter().take(remaining_capacity));
+            session.prekeys.extend(
+                prekeys
+                    .into_iter()
+                    // The same bound the bundle at authentication passes. A key
+                    // longer than this is not one we could hand on in a
+                    // frameable message, so storing it only buys the memory and
+                    // a bundle request nobody can answer.
+                    .filter(|k| k.public_key.len() <= MAX_KEY_BYTES)
+                    .take(remaining_capacity),
+            );
         }
     }
 }
@@ -2129,20 +2592,26 @@ async fn handle_encrypted_channel_message(
     state: &Arc<ServerState>,
     user_id: UserId,
     session_id: SessionId,
+    channel_id: ChannelId,
     ciphertext: Vec<u8>,
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
-    let (channel_id, username) = {
-        let session = state.sessions.get(&session_id);
-        match session {
-            Some(s) => (s.channel_id, s.username.clone()),
-            None => return Ok(()),
-        }
-    };
+    if state.sessions.get(&session_id).is_none() {
+        return Ok(());
+    }
 
     if channel_id == 0 {
         let _ = send_msg(tx, &ServerMessage::ChannelError {
             reason: "Chat is not available in the lobby".into(),
+        }).await;
+        return Ok(());
+    }
+
+    // The sender names the channel now (they may be in several text channels
+    // at once), so membership is what decides whether they may write there.
+    if !state.is_member(channel_id, user_id).await {
+        let _ = send_msg(tx, &ServerMessage::ChannelError {
+            reason: "you are not in that channel".into(),
         }).await;
         return Ok(());
     }
@@ -2155,8 +2624,7 @@ async fn handle_encrypted_channel_message(
     // Encrypted channel messages go to channel members except the sender
     // (sender can't decrypt their own sender key ciphertext), each under the
     // name they may see
-    let (real, alias) = state.names_of(user_id).await;
-    let _ = username;
+    let (real, alias) = state.names_of_in(channel_id, user_id).await;
     let members: Vec<SessionId> = {
         let channels = state.channels.read().await;
         match channels.get(&channel_id) {
@@ -2185,8 +2653,9 @@ async fn handle_encrypted_channel_message(
     Ok(())
 }
 
-/// Handle a sender key distribution — relay to the target user.
-/// Verifies both sender and target are members of the specified channel.
+/// Relay a sender key to the target user. Admission — both ends in the
+/// channel, and the sender inside their budget for this target — is
+/// `may_relay_key`, which the caller has already asked.
 async fn handle_distribute_sender_key(
     state: &Arc<ServerState>,
     from_user_id: UserId,
@@ -2195,29 +2664,6 @@ async fn handle_distribute_sender_key(
     distribution_message: Vec<u8>,
     message_type: u8,
 ) -> Result<()> {
-    // Verify both users are in the channel before relaying
-    {
-        let channels = state.channels.read().await;
-        if let Some(channel) = channels.get(&channel_id) {
-            if !channel.members.contains(&from_user_id)
-                || !channel.members.contains(&target_user_id)
-            {
-                // debug, not warn: clients hand their sender key to every
-                // peer they establish a session with, wherever that peer
-                // is; this check is the filter, not an anomaly.
-                debug!(
-                    from_user_id,
-                    target_user_id,
-                    channel_id,
-                    "sender key distribution rejected: membership check failed"
-                );
-                return Ok(());
-            }
-        } else {
-            return Ok(());
-        }
-    }
-
     if let Some(target_sid) = state.user_to_session.get(&target_user_id) {
         if let Some(session) = state.sessions.get(&*target_sid) {
             let _ = send_msg(
@@ -2234,8 +2680,8 @@ async fn handle_distribute_sender_key(
     Ok(())
 }
 
-/// Handle a media key distribution — relay to the target user.
-/// Verifies both sender and target are members of the specified channel.
+/// Relay a media key to the target user. Admission is `may_relay_key`, as for
+/// the sender key above.
 async fn handle_distribute_media_key(
     state: &Arc<ServerState>,
     from_user_id: UserId,
@@ -2244,27 +2690,6 @@ async fn handle_distribute_media_key(
     encrypted_media_key: Vec<u8>,
     message_type: u8,
 ) -> Result<()> {
-    // Verify both users are in the channel before relaying
-    {
-        let channels = state.channels.read().await;
-        if let Some(channel) = channels.get(&channel_id) {
-            if !channel.members.contains(&from_user_id)
-                || !channel.members.contains(&target_user_id)
-            {
-                // debug for the same reason as the sender key above
-                debug!(
-                    from_user_id,
-                    target_user_id,
-                    channel_id,
-                    "media key distribution rejected: membership check failed"
-                );
-                return Ok(());
-            }
-        } else {
-            return Ok(());
-        }
-    }
-
     if let Some(target_sid) = state.user_to_session.get(&target_user_id) {
         if let Some(session) = state.sessions.get(&*target_sid) {
             let _ = send_msg(
@@ -2294,15 +2719,20 @@ async fn cleanup_session(state: &Arc<ServerState>, user_id: UserId, session_id: 
         cleanup_and_notify_screen_shares(state, user_id, session_id, channel_id).await;
     }
 
+    // Text subscriptions go first: they are not the channel the session names,
+    // so nothing else would ever clear them.
+    for (text_channel_id, remaining) in state.leave_all_text_channels(user_id).await {
+        broadcast_user_left(state, user_id, text_channel_id, Some(user_id)).await;
+        if remaining == 0 {
+            start_channel_delete_timer(state, text_channel_id).await;
+        }
+    }
+
     // Leave channel and notify ALL users
     if let Some((left_channel_id, _remaining, remaining_count)) =
         state.leave_current_channel(user_id, session_id).await
     {
-        let leave_msg = ServerMessage::UserLeft {
-            user_id,
-            channel_id: left_channel_id,
-        };
-        broadcast_to_all(state, &leave_msg, Some(user_id)).await;
+        broadcast_user_left(state, user_id, left_channel_id, Some(user_id)).await;
 
         // Start auto-delete timer if channel is now empty and not General
         if remaining_count == 0 && left_channel_id != 0 {
@@ -2402,17 +2832,24 @@ async fn start_channel_delete_timer(state: &Arc<ServerState>, channel_id: Channe
 }
 
 /// Broadcast a message to ALL connected users, optionally excluding one.
+///
+/// Serialized once rather than once per recipient: this is the widest fan-out
+/// the server has — every join, leave and channel change goes through it — and
+/// it runs while holding a shard of the session map.
 async fn broadcast_to_all(
     state: &ServerState,
     msg: &ServerMessage,
     exclude_user: Option<UserId>,
 ) {
+    let Ok(data) = encode_server_msg(msg) else {
+        return;
+    };
     for entry in state.sessions.iter() {
         let session = entry.value();
         if Some(session.user_id) == exclude_user {
             continue;
         }
-        let _ = send_msg(&session.tcp_tx, msg).await;
+        let _ = session.tcp_tx.try_send(data.clone());
     }
 }
 
@@ -2423,18 +2860,29 @@ async fn broadcast_to_channel(
     msg: &ServerMessage,
     exclude_user: Option<UserId>,
 ) {
-    let channels = state.channels.read().await;
-    if let Some(channel) = channels.get(&channel_id) {
-        for &uid in &channel.members {
-            if Some(uid) == exclude_user {
-                continue;
-            }
-            if let Some(sid) = state.user_to_session.get(&uid) {
-                if let Some(session) = state.sessions.get(&*sid) {
-                    let _ = send_msg(&session.tcp_tx, msg).await;
-                }
-            }
-        }
+    // Collect the recipients under the channels read lock, send after
+    // releasing it — the same shape, and for the same reason, as the voice
+    // fan-out in `media.rs`. The lock is write-preferring, so a queued join or
+    // leave stalls every reader behind it, and holding it across a loop that
+    // serializes the message once per recipient puts that stall in the path of
+    // every voice packet on the server.
+    let member_txs: Vec<mpsc::Sender<Vec<u8>>> = {
+        let channels = state.channels.read().await;
+        let Some(channel) = channels.get(&channel_id) else {
+            return;
+        };
+        channel
+            .members
+            .iter()
+            .filter(|&&uid| Some(uid) != exclude_user)
+            .filter_map(|uid| {
+                let sid = *state.user_to_session.get(uid)?;
+                Some(state.sessions.get(&sid)?.tcp_tx.clone())
+            })
+            .collect()
+    };
+    for tx in member_txs {
+        let _ = send_msg(&tx, msg).await;
     }
 }
 
@@ -2445,7 +2893,14 @@ async fn broadcast_to_channel(
 /// to park the whole server behind its full queue. A client that cannot
 /// drain 256 control messages is dead anyway.
 async fn send_msg(tx: &mpsc::Sender<Vec<u8>>, msg: &ServerMessage) -> Result<()> {
-    let data = encode_server_msg(msg)?;
+    let data = encode_server_msg(msg).inspect_err(|e| {
+        // Every caller discards this Result, and for the ordinary reason —
+        // a client that has stopped reading is not our problem. A message too
+        // long to frame is a different thing: we built it, nobody asked for it
+        // to be dropped, and the symptom at the other end is a channel list or
+        // a key bundle that simply never arrives.
+        warn!("refusing to send a message that cannot be framed: {e}");
+    })?;
     tx.try_send(data).map_err(|e| match e {
         mpsc::error::TrySendError::Full(_) => {
             anyhow::anyhow!("TCP send queue full (client not reading)")
@@ -2638,6 +3093,131 @@ mod tests {
         client
     }
 
+    /// A channel is created and then joined, and the join can be refused —
+    /// the creator is out of join budget, or their password is wrong for the
+    /// channel they have just made. Before 0.9.0 the timer that removes an
+    /// empty channel was started only by a *leave*, so a channel nobody ever
+    /// joined stayed in the map for the life of the server. Enough of them, at
+    /// one channel per five seconds, and nobody on the server can create one
+    /// again.
+    #[tokio::test]
+    async fn a_channel_whose_creator_never_joined_it_goes_away_on_its_own() {
+        let state = Arc::new(ServerState::new(
+            &ServerConfig::default(),
+            ServerSettings {
+                empty_channel_timeout_secs: 0,
+                ..ServerSettings::default()
+            },
+            Vec::new(),
+            "test-admin-token".into(),
+        ));
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut alice = connect(&state, "alice", lo).await;
+
+        // Spend the joins, so the auto-join that follows the creation cannot.
+        {
+            let mut session = state.sessions.get_mut(&1).unwrap();
+            while session.join_rate.try_consume() {}
+        }
+
+        alice
+            .send(&ClientMessage::CreateChannel {
+                name: "Orphan".into(),
+                password: None,
+                proximity: ProximityMode::Off,
+                anonymous: false,
+                text: true,
+            })
+            .await;
+        alice
+            .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))
+            .await;
+
+        // The timer is spawned with a zero timeout, so it only needs the
+        // scheduler to come round to it.
+        for _ in 0..50 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            if state.channel_list().await.len() == 1 {
+                break;
+            }
+        }
+        let names: Vec<String> = state
+            .channel_list()
+            .await
+            .into_iter()
+            .map(|c| c.name)
+            .collect();
+        assert_eq!(names, vec!["General".to_string()], "the orphan stayed behind");
+    }
+
+    /// The key material a client uploads is opaque to us and we hold it until
+    /// they disconnect. Unbounded, one client parks a hundred 60 KiB blobs in
+    /// our memory — and a bundle built from them is a message too long to
+    /// frame, so whoever asked for it is told nothing at all and can never open
+    /// a session with that person.
+    #[tokio::test]
+    async fn an_oversized_prekey_bundle_is_refused_at_the_door() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let (stream, server) = tokio::io::duplex(65536);
+        let (media_tx, _media_rx) = mpsc::channel(8);
+        let (sid_tx, _sid_rx) = oneshot::channel();
+        let handler = tokio::spawn(handle_connection(
+            server,
+            "mallory".into(),
+            lo,
+            media_tx,
+            sid_tx,
+            state.clone(),
+        ));
+        let mut client = Client { stream, handler, buf: BytesMut::new() };
+        client
+            .send(&ClientMessage::Authenticate {
+                username: "mallory".into(),
+                protocol_version: PROTOCOL_VERSION,
+                app_version: APP_VERSION.to_string(),
+                identity_key: None,
+                prekey_bundle: Some(PreKeyBundleData {
+                    registration_id: 1,
+                    device_id: 1,
+                    identity_key: vec![0u8; 60_000],
+                    signed_prekey_id: 1,
+                    signed_prekey: vec![0u8; 33],
+                    signed_prekey_signature: vec![0u8; 64],
+                    prekeys: Vec::new(),
+                }),
+            })
+            .await;
+        client
+            .expect("AuthError", |m| matches!(m, ServerMessage::AuthError { .. }))
+            .await;
+        assert_eq!(state.user_count(), 0, "the session was registered anyway");
+    }
+
+    /// ...and the same bound on the ones uploaded later, which arrive by
+    /// another door and used to be counted but not measured.
+    #[tokio::test]
+    async fn an_oversized_uploaded_prekey_is_not_stored() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut alice = connect(&state, "alice", lo).await;
+        alice
+            .send(&ClientMessage::UploadPreKeys {
+                prekeys: vec![
+                    OneTimePreKey { id: 1, public_key: vec![0u8; 33] },
+                    OneTimePreKey { id: 2, public_key: vec![0u8; 60_000] },
+                ],
+            })
+            .await;
+        // Answered by nothing, so measure it against a round trip that is.
+        alice.send(&ClientMessage::Ping { timestamp: 7 }).await;
+        alice.expect("Pong", |m| matches!(m, ServerMessage::Pong { .. })).await;
+
+        let session = state.sessions.get(&1).unwrap();
+        assert_eq!(session.prekeys.len(), 1, "the oversized key was stored");
+        assert_eq!(session.prekeys[0].id, 1);
+    }
+
     #[tokio::test]
     async fn admin_login_ban_and_unban() {
         let state = admin_state();
@@ -2730,7 +3310,7 @@ mod tests {
 
         // Sharing needs a real channel; General never carries media.
         alice
-            .send(&ClientMessage::CreateChannel { name: "room".into(), password: None, proximity: ProximityMode::Off, anonymous: false })
+            .send(&ClientMessage::CreateChannel { name: "room".into(), password: None, proximity: ProximityMode::Off, anonymous: false, text: false })
             .await;
         let created = alice
             .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))
@@ -2769,6 +3349,571 @@ mod tests {
             ),
             "the viewer was told the wrong codec: {watching:?}"
         );
+    }
+
+    /// A text channel is a subscription: joining one does not move anybody out
+    /// of the voice channel they stand in, both parties keep receiving its
+    /// chat, and the channel a message names is what decides who gets it.
+    #[tokio::test]
+    async fn text_channel_chat_reaches_members_without_moving_them() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut alice = connect(&state, "alice", lo).await; // user 1
+        let mut bob = connect(&state, "bob", lo).await; // user 2
+
+        // A voice room for alice to stand in, and a text channel for both
+        alice
+            .send(&ClientMessage::CreateChannel { name: "room".into(), password: None, proximity: ProximityMode::Off, anonymous: false, text: false })
+            .await;
+        let ServerMessage::ChannelCreated { channel: voice } = alice
+            .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))
+            .await
+        else {
+            unreachable!()
+        };
+        alice
+            .expect("UserList for the voice room", |m| {
+                matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == voice.channel_id)
+            })
+            .await;
+
+        bob.send(&ClientMessage::CreateChannel { name: "lounge".into(), password: None, proximity: ProximityMode::Off, anonymous: false, text: true })
+            .await;
+        let ServerMessage::ChannelCreated { channel: text } = bob
+            .expect("ChannelCreated", |m| {
+                matches!(m, ServerMessage::ChannelCreated { channel } if channel.text)
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        bob.expect("UserList for the text channel", |m| {
+            matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == text.channel_id)
+        })
+        .await;
+        // Creating a text channel did not move bob out of the lobby
+        assert_eq!(state.sessions.get(&2).unwrap().channel_id, 0);
+
+        alice
+            .send(&ClientMessage::JoinChannel { channel_id: text.channel_id, password: None })
+            .await;
+        alice
+            .expect("UserList for the text channel", |m| {
+                matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == text.channel_id)
+            })
+            .await;
+        // ...and joining it did not take alice out of the voice room
+        assert_eq!(state.sessions.get(&1).unwrap().channel_id, voice.channel_id);
+        assert!(state.is_member(text.channel_id, 1).await);
+
+        // A message naming the text channel reaches its other member
+        alice
+            .send(&ClientMessage::SendEncryptedChannelMessage {
+                channel_id: text.channel_id,
+                ciphertext: vec![1, 2, 3],
+            })
+            .await;
+        let got = bob
+            .expect("EncryptedChannelChatMessage", |m| {
+                matches!(m, ServerMessage::EncryptedChannelChatMessage { .. })
+            })
+            .await;
+        assert!(matches!(
+            got,
+            ServerMessage::EncryptedChannelChatMessage { channel_id, user_id: 1, .. }
+                if channel_id == text.channel_id
+        ));
+
+        // A message naming a channel the sender is not in is refused
+        bob.send(&ClientMessage::SendEncryptedChannelMessage {
+            channel_id: voice.channel_id,
+            ciphertext: vec![4],
+        })
+        .await;
+        let refused = bob
+            .expect("ChannelError", |m| matches!(m, ServerMessage::ChannelError { .. }))
+            .await;
+        assert!(matches!(refused, ServerMessage::ChannelError { reason } if reason.contains("not in")));
+
+        // Leaving is its own message, and everybody hears about it
+        alice
+            .send(&ClientMessage::LeaveChannel { channel_id: text.channel_id })
+            .await;
+        alice
+            .expect("UserLeft for ourselves", |m| {
+                matches!(m, ServerMessage::UserLeft { user_id: 1, channel_id: c } if *c == text.channel_id)
+            })
+            .await;
+        assert!(!state.is_member(text.channel_id, 1).await);
+        // Still standing where they were
+        assert_eq!(state.sessions.get(&1).unwrap().channel_id, voice.channel_id);
+
+        // Leaving a voice channel is still JoinChannel(0), never this
+        alice
+            .send(&ClientMessage::LeaveChannel { channel_id: voice.channel_id })
+            .await;
+        let refused = alice
+            .expect("ChannelError", |m| matches!(m, ServerMessage::ChannelError { .. }))
+            .await;
+        assert!(matches!(refused, ServerMessage::ChannelError { reason } if reason.contains("text channel")));
+        assert_eq!(state.sessions.get(&1).unwrap().channel_id, voice.channel_id);
+    }
+
+    /// Who answers a request for recent chat is the one thing about chat the
+    /// server is told, and everybody is told it — including the person whose
+    /// flag it is, whose own member list has to agree with everyone else's.
+    #[tokio::test]
+    async fn history_sharing_is_announced_to_everyone() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut alice = connect(&state, "alice", lo).await; // user 1
+        let mut bob = connect(&state, "bob", lo).await; // user 2
+
+        alice
+            .send(&ClientMessage::SetHistorySharing { enabled: true })
+            .await;
+        alice
+            .expect("our own UserHistorySharing", |m| {
+                matches!(m, ServerMessage::UserHistorySharing { user_id: 1, enabled: true })
+            })
+            .await;
+        bob.expect("UserHistorySharing", |m| {
+            matches!(m, ServerMessage::UserHistorySharing { user_id: 1, enabled: true })
+        })
+        .await;
+        assert!(state.sessions.get(&1).unwrap().shares_history);
+
+        // ...and it rides in the roster, which is what a member list draws
+        let roster = state.users_in_channel_for(0, 2).await;
+        assert!(roster.iter().any(|u| u.user_id == 1 && u.shares_history));
+        assert!(roster.iter().any(|u| u.user_id == 2 && !u.shares_history));
+
+        alice
+            .send(&ClientMessage::SetHistorySharing { enabled: false })
+            .await;
+        bob.expect("UserHistorySharing, off again", |m| {
+            matches!(m, ServerMessage::UserHistorySharing { user_id: 1, enabled: false })
+        })
+        .await;
+        assert!(!state.sessions.get(&1).unwrap().shares_history);
+    }
+
+    /// Creates a text channel owned by `owner` and subscribes `other` to it.
+    /// Both ends are left drained of the join traffic.
+    async fn text_channel_with_two(
+        owner: &mut Client,
+        other: &mut Client,
+        name: &str,
+    ) -> ChannelId {
+        owner
+            .send(&ClientMessage::CreateChannel {
+                name: name.into(),
+                password: None,
+                proximity: ProximityMode::Off,
+                anonymous: false,
+                text: true,
+            })
+            .await;
+        let ServerMessage::ChannelCreated { channel } = owner
+            .expect("ChannelCreated", |m| {
+                matches!(m, ServerMessage::ChannelCreated { channel } if channel.text)
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        let channel_id = channel.channel_id;
+        owner
+            .expect("UserList", |m| {
+                matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id)
+            })
+            .await;
+        other
+            .send(&ClientMessage::JoinChannel { channel_id, password: None })
+            .await;
+        other
+            .expect("UserList", |m| {
+                matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id)
+            })
+            .await;
+        channel_id
+    }
+
+    /// The whole point of the size chain: a blob the relay could not re-wrap
+    /// into a readable frame is refused at the sender, not delivered to
+    /// everybody else as a length prefix their decoders reject and their
+    /// clients hang up over.
+    #[tokio::test]
+    async fn an_oversized_message_is_refused_instead_of_dropping_the_channel() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut alice = connect(&state, "alice", lo).await; // user 1
+        let mut bob = connect(&state, "bob", lo).await; // user 2
+        let channel_id = text_channel_with_two(&mut alice, &mut bob, "lounge").await;
+
+        alice
+            .send(&ClientMessage::SendEncryptedChannelMessage {
+                channel_id,
+                ciphertext: vec![0u8; MAX_RELAY_CIPHERTEXT + 1],
+            })
+            .await;
+        let refused = alice
+            .expect("ChannelError", |m| matches!(m, ServerMessage::ChannelError { .. }))
+            .await;
+        assert!(matches!(refused, ServerMessage::ChannelError { reason } if reason.contains("too large")));
+
+        // Bob is the one this protects: his connection is still there and
+        // still carrying the channel's chat.
+        alice
+            .send(&ClientMessage::SendEncryptedChannelMessage {
+                channel_id,
+                ciphertext: vec![1, 2, 3],
+            })
+            .await;
+        let got = bob
+            .expect("EncryptedChannelChatMessage", |m| {
+                matches!(m, ServerMessage::EncryptedChannelChatMessage { .. })
+            })
+            .await;
+        assert!(matches!(
+            got,
+            ServerMessage::EncryptedChannelChatMessage { channel_id: c, user_id: 1, .. }
+                if c == channel_id
+        ));
+    }
+
+    /// `hide_members` and a password both mean "nobody outside learns who is
+    /// in here", and the roster query has always honoured that. The join and
+    /// leave broadcasts go to *every* session, because they double as the
+    /// user-count update — and they used to carry the user id even where the
+    /// name was blanked. With one `#general` everybody is in, every id has a
+    /// name, so the ids alone rebuild the withheld roster.
+    #[tokio::test]
+    async fn a_join_to_a_hidden_member_channel_names_nobody_to_outsiders() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut alice = connect(&state, "alice", lo).await; // user 1
+        let mut bob = connect(&state, "bob", lo).await; // user 2
+
+        alice
+            .send(&ClientMessage::CreateChannel {
+                name: "back room".into(),
+                password: Some("pw".into()),
+                proximity: ProximityMode::Off,
+                anonymous: false,
+                text: false,
+            })
+            .await;
+        let ServerMessage::ChannelCreated { channel } = alice
+            .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))
+            .await
+        else {
+            unreachable!()
+        };
+
+        // Bob is not in it: he learns that the count went up and no more.
+        let joined = bob
+            .expect("UserJoined", |m| {
+                matches!(m, ServerMessage::UserJoined { user } if user.channel_id == channel.channel_id)
+            })
+            .await;
+        let ServerMessage::UserJoined { user } = joined else { unreachable!() };
+        assert_eq!(user.user_id, 0, "an outsider was told who joined");
+        assert_eq!(user.username, "");
+
+        // And the same on the way out.
+        alice
+            .send(&ClientMessage::JoinChannel { channel_id: 0, password: None })
+            .await;
+        let left = bob
+            .expect("UserLeft", |m| {
+                matches!(m, ServerMessage::UserLeft { channel_id, .. } if *channel_id == channel.channel_id)
+            })
+            .await;
+        assert!(matches!(left, ServerMessage::UserLeft { user_id: 0, .. }));
+
+        // A member is told, because that is the roster they are allowed.
+        bob.send(&ClientMessage::JoinChannel {
+            channel_id: channel.channel_id,
+            password: Some("pw".into()),
+        })
+        .await;
+        bob.expect("UserList", |m| {
+            matches!(m, ServerMessage::UserList { channel_id, .. } if *channel_id == channel.channel_id)
+        })
+        .await;
+        alice
+            .send(&ClientMessage::JoinChannel {
+                channel_id: channel.channel_id,
+                password: Some("pw".into()),
+            })
+            .await;
+        let joined = bob
+            .expect("UserJoined", |m| {
+                matches!(m, ServerMessage::UserJoined { user } if user.channel_id == channel.channel_id)
+            })
+            .await;
+        let ServerMessage::UserJoined { user } = joined else { unreachable!() };
+        assert_eq!((user.user_id, user.username.as_str()), (1, "alice"));
+    }
+
+    /// The id rule above must not widen the *name* rule it sits next to: an
+    /// ordinary channel's joins carry an id to everybody, and have never
+    /// carried a name to anybody outside it. That is what stops a move between
+    /// an anonymous channel and an ordinary one from handing an outsider both
+    /// names for one person.
+    #[tokio::test]
+    async fn an_ordinary_channel_still_names_its_members_to_nobody_outside() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut alice = connect(&state, "alice", lo).await; // user 1
+        let mut bob = connect(&state, "bob", lo).await; // user 2
+
+        alice
+            .send(&ClientMessage::CreateChannel {
+                name: "lounge".into(),
+                password: None,
+                proximity: ProximityMode::Off,
+                anonymous: false,
+                text: false,
+            })
+            .await;
+        let ServerMessage::ChannelCreated { channel } = alice
+            .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))
+            .await
+        else {
+            unreachable!()
+        };
+        let joined = bob
+            .expect("UserJoined", |m| {
+                matches!(m, ServerMessage::UserJoined { user } if user.channel_id == channel.channel_id)
+            })
+            .await;
+        let ServerMessage::UserJoined { user } = joined else { unreachable!() };
+        assert_eq!(user.user_id, 1, "the count has to be attributable");
+        assert_eq!(user.username, "", "an outsider was told the name");
+    }
+
+    /// A game drives the audio filter in a routed channel — `docs/SDK.md`
+    /// documents up to 20 updates a second — while the budget it drew on
+    /// allows two. The surplus was dropped without a word, so the relay went
+    /// on culling by a filter the game had moved on from.
+    #[tokio::test]
+    async fn a_game_can_update_its_audio_filter_as_fast_as_the_sdk_allows() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut alice = connect(&state, "alice", lo).await; // user 1, session 1
+        alice
+            .send(&ClientMessage::CreateChannel {
+                name: "ingame".into(),
+                password: None,
+                proximity: ProximityMode::Off,
+                anonymous: false,
+                text: false,
+            })
+            .await;
+        let ServerMessage::ChannelCreated { channel } = alice
+            .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))
+            .await
+        else {
+            unreachable!()
+        };
+        alice
+            .send(&ClientMessage::SetChannelOptions {
+                channel_id: channel.channel_id,
+                hidden: None,
+                anonymous: None,
+                screen_share: None,
+                hide_members: None,
+                routed: Some(true),
+                message_ttl_secs: None,
+            })
+            .await;
+        alice
+            .expect("ChannelUpdated", |m| {
+                matches!(m, ServerMessage::ChannelUpdated { channel: c } if c.routed)
+            })
+            .await;
+
+        // One update per player the game moved past, at the documented rate.
+        // The last one is the one that has to be in force.
+        for speaker in 1..=20u32 {
+            alice
+                .send(&ClientMessage::SetAudioFilter { allow: Some(vec![speaker]) })
+                .await;
+        }
+        // Driven by a message that must come back, so the filters ahead of it
+        // have all been handled rather than merely sent.
+        alice.send(&ClientMessage::Ping { timestamp: 1 }).await;
+        alice
+            .expect("Pong", |m| matches!(m, ServerMessage::Pong { timestamp: 1 }))
+            .await;
+
+        let now = tokio::time::Instant::now();
+        assert!(
+            state.routing.may_hear(channel.channel_id, 1, 1, 20, now),
+            "the last filter the game sent was dropped"
+        );
+        assert!(
+            !state.routing.may_hear(channel.channel_id, 1, 1, 19, now),
+            "an earlier filter is still in force"
+        );
+    }
+
+    /// The budget for relaying keys belongs to the pair, not the sender: an
+    /// honest client hands a key to every member of every channel it shares
+    /// with them, which is a wide burst at many people and never a burst at
+    /// one. A single per-session budget could only be set wide enough for the
+    /// first or tight enough for the second — and set wide, a flood at one
+    /// member fills the queue their real keys have to arrive through.
+    #[tokio::test]
+    async fn keys_to_many_members_pass_while_a_flood_at_one_is_capped() {
+        // A small server on purpose: the per-target burst is sized from how
+        // many channels can exist here, and on a 50-channel one it is wider
+        // than the per-frame control budget — which would then be the thing
+        // this test measured.
+        let state = Arc::new(ServerState::new(
+            &ServerConfig::default(),
+            ServerSettings {
+                max_channels: 4,
+                ..ServerSettings::default()
+            },
+            Vec::new(),
+            "test-admin-token".into(),
+        ));
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut alice = connect(&state, "alice", lo).await; // user 1
+        let mut bob = connect(&state, "bob", lo).await; // user 2
+        let mut carol = connect(&state, "carol", lo).await; // user 3
+        let channel_id = text_channel_with_two(&mut alice, &mut bob, "lounge").await;
+        carol
+            .send(&ClientMessage::JoinChannel { channel_id, password: None })
+            .await;
+        carol
+            .expect("UserList", |m| {
+                matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id)
+            })
+            .await;
+
+        // Past one target's budget, aimed at Bob — and deliberately still
+        // inside the per-frame control budget, so it is this limiter being
+        // measured and not that one.
+        let burst = state
+            .sessions
+            .get(&1)
+            .map(|s| s.key_relay_burst as usize)
+            .expect("alice has a session");
+        let flood = burst + 5;
+        for i in 0..flood {
+            alice
+                .send(&ClientMessage::DistributeSenderKey {
+                    channel_id,
+                    target_user_id: 2,
+                    distribution_message: vec![i as u8],
+                    message_type: 1,
+                })
+                .await;
+        }
+        // Carol's key is sent last and must still arrive: her budget is her
+        // own, and the flood at Bob has not touched it.
+        alice
+            .send(&ClientMessage::DistributeSenderKey {
+                channel_id,
+                target_user_id: 3,
+                distribution_message: vec![0xAA],
+                message_type: 1,
+            })
+            .await;
+        let got = carol
+            .expect("SenderKeyReceived", |m| {
+                matches!(m, ServerMessage::SenderKeyReceived { .. })
+            })
+            .await;
+        assert!(matches!(
+            got,
+            ServerMessage::SenderKeyReceived { from_user_id: 1, distribution_message, .. }
+                if distribution_message == vec![0xAA]
+        ));
+
+        // Bob got his burst and no more. Counted against a message that must
+        // arrive after them rather than against a timeout.
+        alice
+            .send(&ClientMessage::SendEncryptedChannelMessage {
+                channel_id,
+                ciphertext: vec![7],
+            })
+            .await;
+        let mut relayed = 0usize;
+        loop {
+            match bob.next().await {
+                Some(ServerMessage::SenderKeyReceived { .. }) => relayed += 1,
+                Some(ServerMessage::EncryptedChannelChatMessage { .. }) => break,
+                Some(_) => continue,
+                None => panic!("connection closed"),
+            }
+        }
+        assert!(
+            relayed < flood && relayed <= burst + 2,
+            "{relayed} of {flood} keys relayed at one member"
+        );
+        assert!(relayed > 0, "an honest key to a member must still pass");
+    }
+
+    /// `shares_history` is a flag the server has always stored and announced
+    /// and never read: a request could be aimed at anybody, and the client on
+    /// the other end was the only thing deciding whether to answer.
+    #[tokio::test]
+    async fn a_history_request_stops_at_a_member_who_does_not_share() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut alice = connect(&state, "alice", lo).await; // user 1
+        let mut bob = connect(&state, "bob", lo).await; // user 2
+        let channel_id = text_channel_with_two(&mut alice, &mut bob, "lounge").await;
+
+        // Bob shares nothing, so the question must not reach him at all.
+        alice
+            .send(&ClientMessage::RequestChannelHistory { channel_id, target_user_id: 2 })
+            .await;
+        // Driven by a message that must arrive rather than by a timeout: if
+        // the request was forwarded it is already in Bob's queue ahead of it.
+        alice
+            .send(&ClientMessage::SendEncryptedChannelMessage {
+                channel_id,
+                ciphertext: vec![7],
+            })
+            .await;
+        loop {
+            match bob.next().await {
+                Some(ServerMessage::ChannelHistoryRequested { .. }) => {
+                    panic!("the request reached a member who does not share history")
+                }
+                Some(ServerMessage::EncryptedChannelChatMessage { .. }) => break,
+                Some(_) => continue,
+                None => panic!("connection closed"),
+            }
+        }
+
+        // ...and it is the flag doing the work: switch it on and the same
+        // request goes through.
+        bob.send(&ClientMessage::SetHistorySharing { enabled: true })
+            .await;
+        bob.expect("our own UserHistorySharing", |m| {
+            matches!(m, ServerMessage::UserHistorySharing { user_id: 2, enabled: true })
+        })
+        .await;
+        alice
+            .send(&ClientMessage::RequestChannelHistory { channel_id, target_user_id: 2 })
+            .await;
+        let asked = bob
+            .expect("ChannelHistoryRequested", |m| {
+                matches!(m, ServerMessage::ChannelHistoryRequested { .. })
+            })
+            .await;
+        assert!(matches!(
+            asked,
+            ServerMessage::ChannelHistoryRequested { channel_id: c, from_user_id: 1 }
+                if c == channel_id
+        ));
     }
 
     #[tokio::test]

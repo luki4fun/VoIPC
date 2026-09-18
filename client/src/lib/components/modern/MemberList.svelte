@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Discord's member list, grouped.
+  // The modern layout's member list, grouped.
   //
   // The sections are by *state*, not by role: `UserInfo` carries
   // user_id/username/channel_id/is_muted/is_deafened/is_screen_sharing/is_admin
@@ -23,6 +23,7 @@
     hideMembers,
     isCulled,
     isPreviewing,
+    displayChannel,
   } from "../../stores/roster.js";
   import { openUserMenu } from "../../stores/user-menu.js";
   import Icon from "../Icons.svelte";
@@ -40,7 +41,12 @@
     [
       { label: "Live", members: live },
       { label: "Speaking", members: talking },
-      { label: $isPreviewing ? `In #${$displayChannelName}` : "In voice", members: rest },
+      {
+        // "In voice" only when that is what the list is: a text channel's
+        // members are subscribers, each standing in a voice channel of their own.
+        label: $isPreviewing || $displayChannel?.text ? `In #${$displayChannelName}` : "In voice",
+        members: rest,
+      },
     ].filter((g) => g.members.length > 0),
   );
 
@@ -51,7 +57,7 @@
   }
 </script>
 
-<aside class="user-list discord">
+<aside class="user-list modern">
   {#if $hideMembers && !$isPreviewing}
     <div class="hidden-note">Members are hidden here — people appear while they speak</div>
   {/if}
@@ -81,6 +87,9 @@
             {#if user.is_admin}
               <span class="shield" title="Server admin"><Icon name="shield" size={12} /></span>
             {/if}
+            {#if user.shares_history}
+              <span class="sharing-history" title="Shares recent chat with newcomers"><Icon name="history" size={12} /></span>
+            {/if}
             {#if user.user_id === $userId}
               <span class="you">(you)</span>
             {/if}
@@ -107,7 +116,7 @@
 </aside>
 
 <style>
-  .user-list.discord {
+  .user-list.modern {
     display: flex;
     flex-direction: column;
     height: 100%;
@@ -195,6 +204,13 @@
 
   .shield {
     color: var(--accent);
+    display: inline-flex;
+    vertical-align: middle;
+  }
+
+  /* Quieter than the shield: it says what someone offers, not what they are */
+  .sharing-history {
+    color: var(--text-secondary);
     display: inline-flex;
     vertical-align: middle;
   }

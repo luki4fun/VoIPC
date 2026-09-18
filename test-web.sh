@@ -69,10 +69,20 @@ openssl x509 -req -in "$WORK/server.csr" -CA "$WORK/ca.crt" -CAkey "$WORK/ca.key
   -extfile <(printf "subjectAltName=DNS:localhost,IP:127.0.0.1\nextendedKeyUsage=serverAuth\nbasicConstraints=critical,CA:FALSE\n") 2>/dev/null
 cat "$WORK/leaf.crt" "$WORK/ca.crt" > "$WORK/server.crt"
 
+# One persistent channel, so the run covers what a server asks every client
+# into: a text channel with auto_join. The join used to be fired from the
+# channel list, which arrives while the client is still connecting, and the
+# command refused it — with no channels.json, nothing here noticed.
+cat > "$WORK/channels.json" <<'CHANNELS'
+[
+  { "name": "lobby-chat", "description": "Text channel everyone lands in", "text": true, "auto_join": true }
+]
+CHANNELS
+
 # exec: the job pid must be the server itself, or the EXIT trap kills only the
 # subshell and the server survives on the test ports
 (cd "$WORK" && exec "$SCRIPT_DIR/$SERVER" --host 127.0.0.1 --tcp-port "$TCP_PORT" --udp-port "$TCP_PORT" \
-  --cert server.crt --key server.key --admin-token e2e-admin > "$WORK/server.log" 2>&1) &
+  --cert server.crt --key server.key --admin-token e2e-admin --channels channels.json > "$WORK/server.log" 2>&1) &
 
 for _ in $(seq 1 50); do
   curl -sk --http2-prior-knowledge "https://127.0.0.1:$TCP_PORT/wt.json" > "$WORK/wt.json" 2>/dev/null && break
@@ -111,7 +121,7 @@ EOF
 # alice creates the channel, becomes admin at the end and kicks bob; bob joins
 # through an invite-link fragment (#channel=…) and expects the kick
 # alice also shares her (synthetic) screen; bob watches it
-run_browser alice talker "&channel=e2e&dm=bob&admin=e2e-admin&kick=bob&share=1&proximity=2d&pos=3,0,0&spatialtest=3d" \
+run_browser alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admin&kick=bob&share=1&proximity=2d&pos=3,0,0&spatialtest=3d" \
   "$WORK/alice.log" "$BROWSER_ALICE"
 # Not a fixed stagger: the run asserts that a message alice sent *before* bob
 # arrived reaches him as channel history, so the harness has to make "before"
@@ -128,7 +138,7 @@ for _ in $(seq 1 300); do
 done
 grep -q 'SELFTEST early-chat-sent' "$WORK/alice.log" ||
   echo "warning: alice never reported her first message — bob starts anyway, expect a history failure"
-run_browser bob listener "&dm=alice&expect_kick=1&watch=1&pos=-3,0,0#channel=e2e" \
+run_browser bob listener "&textchannel=e2e-text&dm=alice&expect_kick=1&watch=1&pos=-3,0,0#channel=e2e" \
   "$WORK/bob.log" "$BROWSER_BOB"
 
 deadline=$(( $(date +%s) + DURATION / 1000 + 30 ))
@@ -176,6 +186,18 @@ check "alice read bob's DM"             "$WORK/alice.txt" 'direct-chat-message.*
 # the history check three lines down instead of this one.
 check "bob joined via the invite link"  "$WORK/bob.txt"   'channel-requested.*"existing":true.*"source":"invite"'
 check "bob received channel history"    "$WORK/bob.txt"   'channel-history-received.*early from alice'
+# The text channel: bob subscribes to it long after the two already hold a
+# pairwise session, which is where the group key used to go missing. Every one
+# of these failed together when it did.
+check "bob joined the text channel"     "$WORK/bob.txt"   'text-channel-joined'
+check "bob read alice's text message"   "$WORK/bob.txt"   'text-channel-read.*text hello from alice'
+check "bob received the text history"   "$WORK/bob.txt"   'channel-history-received.*text early from alice'
+check "alice read bob's first text line" "$WORK/alice.txt" 'text-channel-read.*text first from bob'
+check "alice read bob's text message"   "$WORK/alice.txt" 'text-channel-read.*text hello from bob'
+if grep -q 'decryption failed' "$WORK/alice.txt" "$WORK/bob.txt"; then
+  echo "FAIL a message could not be decrypted:" | tee -a "$WORK/fails.txt"
+  grep -h 'decryption failed' "$WORK/alice.txt" "$WORK/bob.txt" | tee -a "$WORK/fails.txt"; fail=1
+fi
 check "alice became admin"              "$WORK/alice.txt" 'admin-status.*"is_admin":true'
 check "bob was kicked by the admin"     "$WORK/bob.txt"   'server-disconnected.*kicked from this server'
 check "alice shared her screen"         "$WORK/alice.txt" 'share-started'

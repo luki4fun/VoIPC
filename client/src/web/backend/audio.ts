@@ -428,10 +428,10 @@ export class AudioEngine implements AudioApi {
 
   onVoicePacket(bytes: Uint8Array): void {
     const c = this.ctx;
-    if (!c || !c.mediaKey) return; // never feed undecryptable audio anywhere
+    if (!c?.mediaKeys.hasChannel(c.channelId)) return; // never feed undecryptable audio anywhere
     let info;
     try {
-      info = wasm().decryptVoicePacket(c.mediaKey, bytes);
+      info = wasm().decryptVoicePacket(c.mediaKeys, c.channelId, bytes);
     } catch (e) {
       console.warn("voice decryption failed:", e);
       return;
@@ -460,10 +460,10 @@ export class AudioEngine implements AudioApi {
 
   onScreenAudioPacket(bytes: Uint8Array): void {
     const c = this.ctx;
-    if (!c || !c.mediaKey) return;
+    if (!c?.mediaKeys.hasChannel(c.channelId)) return;
     let info;
     try {
-      info = wasm().parseScreenAudioPacket(c.mediaKey, bytes);
+      info = wasm().parseScreenAudioPacket(c.mediaKeys, c.channelId, bytes);
     } catch (e) {
       console.warn("screen audio decryption failed:", e);
       return;
@@ -490,7 +490,7 @@ export class AudioEngine implements AudioApi {
     }
     src.lastActivity = performance.now();
     if (src.decoder.state !== "configured") return;
-    // ponytail: packets are decoded on arrival, so a reordered packet reaches
+    // bernd: packets are decoded on arrival, so a reordered packet reaches
     // the Opus decoder out of order (the jitter buffer reorders the PCM).
     src.pending.push(sequence);
     try {
@@ -833,8 +833,7 @@ export class AudioEngine implements AudioApi {
     // The sequence lives on the connection and never restarts within a
     // session: a restart would reuse AES-GCM nonces under the channel key.
     const sequence = c.nextVoiceSequence();
-    const key = c.mediaKey;
-    if (!key) {
+    if (!c.mediaKeys.hasChannel(c.channelId)) {
       // Never fall back to plaintext: drop the frame while the channel's
       // media key is on its way, and warn the UI once if it drags on.
       const now = performance.now();
@@ -851,7 +850,7 @@ export class AudioEngine implements AudioApi {
     const opus = new Uint8Array(chunk.byteLength);
     chunk.copyTo(opus);
     try {
-      c.sendDatagram(wasm().buildVoicePacket(key, c.sessionId, sequence, opus));
+      c.sendDatagram(wasm().buildVoicePacket(c.mediaKeys, c.sessionId, sequence, opus));
     } catch (e) {
       // Skip the frame (the sequence is consumed; receivers see a gap)
       console.warn(`voice encryption failed (seq ${sequence}):`, e);
@@ -1015,12 +1014,12 @@ export class AudioEngine implements AudioApi {
   /** A peer shared their position (encrypted position beacon, type 0x06). */
   onPositionPacket(bytes: Uint8Array): void {
     const c = this.ctx;
-    if (!c || !c.mediaKey) return;
+    if (!c?.mediaKeys.hasChannel(c.channelId)) return;
     // While we are not syncing, our own layout of the room is authoritative
     if (!this.positionSync) return;
     let info;
     try {
-      info = wasm().decryptPositionPacket(c.mediaKey, bytes);
+      info = wasm().decryptPositionPacket(c.mediaKeys, c.channelId, bytes);
     } catch {
       return;
     }
@@ -1049,10 +1048,10 @@ export class AudioEngine implements AudioApi {
 
   private sendPosition(pos: [number, number, number]): void {
     const c = this.ctx;
-    if (!c || !c.mediaKey) return;
+    if (!c?.mediaKeys.hasChannel(c.channelId)) return;
     try {
       const packet = wasm().buildPositionPacket(
-        c.mediaKey,
+        c.mediaKeys,
         c.sessionId,
         this.positionSequence++,
         pos[0],
@@ -1519,8 +1518,7 @@ export class AudioEngine implements AudioApi {
   private onScreenAudioChunk(chunk: EncodedAudioChunk): void {
     const ctx = this.ctx;
     if (!ctx || !this.screenCapture) return;
-    const key = ctx.mediaKey;
-    if (!key) return; // no key: drop the frame, never send plaintext
+    if (!ctx.mediaKeys.hasChannel(ctx.channelId)) return; // never send plaintext
     // The sequence never restarts within a connection (AES-GCM nonce)
     const sequence = ctx.nextScreenAudioSequence();
     const opus = new Uint8Array(chunk.byteLength);
@@ -1528,7 +1526,7 @@ export class AudioEngine implements AudioApi {
     try {
       ctx.sendDatagram(
         wasm().buildScreenAudioPacket(
-          key,
+          ctx.mediaKeys,
           ctx.sessionId,
           sequence,
           Math.round(chunk.timestamp / 1000),

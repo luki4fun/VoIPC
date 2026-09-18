@@ -7,6 +7,11 @@
 //   name=<username>      required
 //   channel=<name>       channel to create or join (default "e2e"); an invite
 //                        fragment (#channel=<name>) takes precedence
+//   textchannel=<name>   a text channel alongside the voice one: the talker
+//                        creates it and writes in it while alone, the listener
+//                        joins it late — after the two already hold a pairwise
+//                        session, which is the case where a sender key used to
+//                        go missing and every message read as undecryptable
 //   role=talker|listener talker transmits a PTT burst, listener reports stats
 //   dm=<username>        send a direct message to this user once seen
 //   duration=<ms>        main phase before the wrap-up (default 15000)
@@ -27,7 +32,7 @@ import { listen } from "@tauri-apps/api/event";
 import { parseInviteFragment } from "../lib/invite";
 import { checkGoldenValues, testLabel, type ProximityMode } from "../lib/spatial";
 
-interface ChannelInfo { channel_id: number; name: string }
+interface ChannelInfo { channel_id: number; name: string; text?: boolean }
 interface UserInfo { user_id: number; username: string; channel_id: number; is_screen_sharing?: boolean }
 
 /**
@@ -82,6 +87,7 @@ export async function run(params: URLSearchParams): Promise<void> {
   const expectKick = params.has("expect_kick");
   const doShare = params.has("share");
   const doWatch = params.has("watch");
+  const textChannelName = params.get("textchannel");
   const proximity = (params.get("proximity") ?? "off") as ProximityMode;
   const ownPosition = params.get("pos");
   const spatialTest = params.get("spatialtest") as "2d" | "3d" | null;
@@ -108,8 +114,24 @@ export async function run(params: URLSearchParams): Promise<void> {
   let watching = false;
   let sharerUserId = 0;
   let framesDrawn = 0;
-  // What App.svelte would hand to a newcomer: the channel messages we have seen
-  const channelHistory: { user_id: number; username: string; content: string; timestamp: number }[] = [];
+  let textChannelId = 0;
+  let textCreated = false;
+  let textJoined = false;
+  let textEarlySent = false;
+  let textChatSent = false;
+  /** Who else is in the text channel, so the talker writes once somebody reads. */
+  const textPeers = new Set<number>();
+  // What App.svelte would hand to a newcomer, per channel: a member of several
+  // channels must answer each one with its own conversation.
+  type SeenMessage = { user_id: number; username: string; content: string; timestamp: number };
+  const histories = new Map<number, SeenMessage[]>();
+  const historyOf = (channelId: number): SeenMessage[] => {
+    const list = histories.get(channelId);
+    if (list) return list;
+    const fresh: SeenMessage[] = [];
+    histories.set(channelId, fresh);
+    return fresh;
+  };
 
   const watched = [
     "channel-list", "user-list", "user-joined", "user-left", "media-key-installed",
@@ -126,13 +148,33 @@ export async function run(params: URLSearchParams): Promise<void> {
     await listen(ev, (e: { payload: unknown }) => {
       if (ev !== "latency-update") log(`event ${ev}`, e.payload);
       if (ev === "channel-list") channels = e.payload as ChannelInfo[];
+      // The full list is sent once, at login; a channel made afterwards
+      // arrives on its own, and the sidebar folds it in (App.svelte upsertById)
+      if (ev === "channel-created" || ev === "channel-updated") {
+        const ch = e.payload as ChannelInfo;
+        channels = [...channels.filter((c) => c.channel_id !== ch.channel_id), ch];
+      }
+      // A text channel is a subscription, not a move: its roster says nothing
+      // about where anybody stands, so it is kept apart from `users` — which
+      // is what the voice checks below read to find their peer.
+      const isTextChannel = (id: number) => channels.some((c) => c.channel_id === id && c.text);
       if (ev === "user-list") {
         const p = e.payload as { channel_id: number; users: UserInfo[] };
-        for (const u of p.users) users.set(u.user_id, u);
+        if (isTextChannel(p.channel_id)) {
+          if (p.channel_id === textChannelId) {
+            for (const u of p.users) if (u.user_id !== myUserId) textPeers.add(u.user_id);
+          }
+        } else {
+          for (const u of p.users) users.set(u.user_id, u);
+        }
       }
       if (ev === "user-joined") {
         const u = e.payload as UserInfo;
-        users.set(u.user_id, u);
+        if (isTextChannel(u.channel_id)) {
+          if (u.channel_id === textChannelId) textPeers.add(u.user_id);
+        } else {
+          users.set(u.user_id, u);
+        }
       }
       if (ev === "admin-status") {
         const p = e.payload as { user_id: number; is_admin: boolean };
@@ -157,17 +199,27 @@ export async function run(params: URLSearchParams): Promise<void> {
         invoke("set_keyframe_requested").catch(() => {});
       }
       if (ev === "channel-chat-message") {
-        const m = e.payload as { user_id: number; username: string; content: string; timestamp: number };
-        channelHistory.push({ user_id: m.user_id, username: m.username, content: m.content, timestamp: m.timestamp });
+        const m = e.payload as SeenMessage & { channel_id: number; decryption_failed?: boolean };
+        // What App.svelte files: ciphertext we could not open stays on screen
+        // but is never offered to anybody as history.
+        if (!m.decryption_failed) {
+          historyOf(m.channel_id).push({
+            user_id: m.user_id, username: m.username, content: m.content, timestamp: m.timestamp,
+          });
+        }
       }
       if (ev === "channel-history-requested") {
-        // The UI's job in the real app: answer with the recent channel chat
+        // The UI's job in the real app: answer with that channel's recent chat
         const p = e.payload as { channel_id: number; from_user_id: number };
         invoke("send_channel_history", {
           channelId: p.channel_id,
           targetUserId: p.from_user_id,
-          messages: channelHistory.slice(-50),
+          messages: historyOf(p.channel_id).slice(-50),
         }).catch((err) => log("error", { message: `history: ${String(err)}` }));
+      }
+      if (ev === "user-left" && textChannelId !== 0) {
+        const p = e.payload as { user_id: number; channel_id: number };
+        if (p.channel_id === textChannelId) textPeers.delete(p.user_id);
       }
     });
   }
@@ -227,7 +279,7 @@ export async function run(params: URLSearchParams): Promise<void> {
     } else {
       earlySent = true;
       const early = `early from ${name}`;
-      const inHistory = () => channelHistory.some((m) => m.content === early);
+      const inHistory = () => historyOf(joinedChannelId).some((m) => m.content === early);
       try {
         await invoke("send_channel_message", { content: early });
         // "Sent" is not the state the next peer depends on: the message reaches
@@ -241,6 +293,39 @@ export async function run(params: URLSearchParams): Promise<void> {
     }
   }
 
+  // The talker's text channel, made before the loop so its first message is
+  // written while nobody else is in it — which is what the listener later has
+  // to be handed as history.
+  if (textChannelName && role === "talker") {
+    try {
+      textCreated = true;
+      // Creating a channel is rate limited (one, then one per five seconds),
+      // and this is the second one this client asks for — so the refusal comes
+      // back as a channel-error and the channel simply never appears. Ask
+      // again until it does.
+      for (let attempt = 0; attempt < 8 && textChannelId === 0; attempt++) {
+        await invoke("create_channel", {
+          name: textChannelName, password: null, proximity: "off", anonymous: false, text: true,
+        });
+        for (let i = 0; i < 60 && textChannelId === 0; i++) {
+          await sleep(50);
+          textChannelId = channels.find((c) => c.name === textChannelName)?.channel_id ?? 0;
+        }
+      }
+      log("text-channel-created", { channel: textChannelName, channel_id: textChannelId });
+      if (textChannelId !== 0) {
+        textEarlySent = true;
+        const early = `text early from ${name}`;
+        await invoke("send_channel_message", { content: early, channelId: textChannelId });
+        const inHistory = () => historyOf(textChannelId).some((m) => m.content === early);
+        for (let i = 0; i < 100 && !inHistory(); i++) await sleep(50);
+        log("text-early-sent", { in_history: inHistory() });
+      }
+    } catch (e) {
+      log("error", { message: `text channel: ${String(e)}` });
+    }
+  }
+
   const started = Date.now();
   let talked = false;
   let positionShared = false;
@@ -249,6 +334,53 @@ export async function run(params: URLSearchParams): Promise<void> {
     await sleep(500);
     const me = users.get(myUserId);
     if (me && me.channel_id !== 0) joinedChannelId = me.channel_id;
+
+    // The listener joins the text channel late, and on purpose: by now the two
+    // hold a pairwise Signal session from the voice channel, which is exactly
+    // the case where the group key used to go missing — the other side thought
+    // it had already handed one over, and every message read as undecryptable.
+    if (textChannelName && !textCreated && !textJoined && Date.now() - started > 6000) {
+      const listed = channels.find((c) => c.name === textChannelName);
+      if (listed) {
+        textJoined = true;
+        textChannelId = listed.channel_id;
+        try {
+          await invoke("join_channel", { channelId: textChannelId, password: null });
+          log("text-channel-joined", { channel: textChannelName, channel_id: textChannelId });
+        } catch (e) {
+          log("error", { message: `text join: ${String(e)}` });
+        }
+      }
+    }
+
+    // Both sides write once the other is in there, which is what proves the
+    // key exchange worked in both directions.
+    if (textChannelId !== 0 && !textChatSent && textPeers.size > 0) {
+      textChatSent = true;
+      try {
+        await invoke("send_channel_message", {
+          content: `text hello from ${name}`,
+          channelId: textChannelId,
+        });
+        log("text-chat-sent", { peers: textPeers.size });
+      } catch (e) {
+        log("error", { message: `text chat: ${String(e)}` });
+      }
+    }
+    // The listener writes its own first line there too, so the talker's copy
+    // of the newcomer's key is covered by the same run.
+    if (textChannelId !== 0 && textJoined && !textEarlySent && Date.now() - started > 7000) {
+      textEarlySent = true;
+      try {
+        await invoke("send_channel_message", {
+          content: `text first from ${name}`,
+          channelId: textChannelId,
+        });
+        log("text-first-sent");
+      } catch (e) {
+        log("error", { message: `text first: ${String(e)}` });
+      }
+    }
 
     // Proximity chat: stand somewhere and share it, so the peer's client
     // receives a position beacon and places us
@@ -368,6 +500,12 @@ export async function run(params: URLSearchParams): Promise<void> {
     }
   }
 
+  // Everything this side can read in the text channel, named rather than
+  // counted: a missing group key shows up here as the message that is absent.
+  if (textChannelId !== 0) {
+    log("text-channel-read", { messages: historyOf(textChannelId).map((m) => m.content) });
+  }
+
   if (spatialTest) {
     log("spatial-test", { where: testLabel(spatialTest, (Date.now() - started) / 1000) });
     await invoke("stop_spatial_test").catch(() => {});
@@ -411,7 +549,9 @@ export async function run(params: URLSearchParams): Promise<void> {
   // Wrap-up: moderation
   if (adminToken && kickTarget) {
     const peerWrapped = () =>
-      channelHistory.some((m) => m.username === kickTarget && m.content === `wrap-up from ${kickTarget}`);
+      historyOf(joinedChannelId).some(
+        (m) => m.username === kickTarget && m.content === `wrap-up from ${kickTarget}`,
+      );
     for (let i = 0; i < 400 && !peerWrapped(); i++) await sleep(50);
     log("peer-wrap-up", { seen: peerWrapped() });
     await sleep(500);

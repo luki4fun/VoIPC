@@ -53,7 +53,7 @@ fn fill_output(
             _ => {
                 frame[0] = l;
                 frame[1] = r;
-                // ponytail: extra channels get the downmix; proper surround
+                // bernd: extra channels get the downmix; proper surround
                 // placement if anyone ever asks for it
                 for ch in frame[2..].iter_mut() {
                     *ch = 0.5 * (l + r);

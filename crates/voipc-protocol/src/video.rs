@@ -53,8 +53,8 @@ impl VideoPacketType {
 ///            + 1 (fragment_index) + 1 (fragment_count) + 4 (timestamp) = 15 bytes.
 pub const VIDEO_HEADER_SIZE: usize = 15;
 
-/// Encrypted header: standard header + 2 (key_id) = 17 bytes.
-pub const ENCRYPTED_VIDEO_HEADER_SIZE: usize = 17;
+/// Encrypted header: standard header + 2 (key_id) + 4 (stream_id) = 21 bytes.
+pub const ENCRYPTED_VIDEO_HEADER_SIZE: usize = 21;
 
 /// Maximum total video packet size. Fragments travel on QUIC streams, but
 /// keeping them at 1280 bytes bounds per-fragment loss and matches the
@@ -65,7 +65,7 @@ pub const MAX_VIDEO_PACKET_SIZE: usize = 1280;
 pub const MAX_VIDEO_PAYLOAD_SIZE: usize = MAX_VIDEO_PACKET_SIZE - VIDEO_HEADER_SIZE;
 
 /// Maximum payload per encrypted video fragment.
-/// Accounts for encrypted header (17 bytes) + AES-256-GCM tag (16 bytes) appended to payload.
+/// Accounts for encrypted header (21 bytes) + AES-256-GCM tag (16 bytes) appended to payload.
 pub const MAX_ENCRYPTED_VIDEO_PAYLOAD_SIZE: usize =
     MAX_VIDEO_PACKET_SIZE - ENCRYPTED_VIDEO_HEADER_SIZE - 16;
 
@@ -78,6 +78,8 @@ pub const MAX_FRAGMENTS_PER_FRAME: usize = 255;
 /// ```text
 /// [type: u8] [session_id: u32 BE] [frame_id: u32 BE]
 /// [fragment_index: u8] [fragment_count: u8] [timestamp: u32 BE] [payload: variable]
+///
+/// Encrypted types carry [key_id: u16 BE] [stream_id: u32 BE] before the payload.
 /// ```
 #[derive(Debug, Clone)]
 pub struct VideoPacket {
@@ -90,6 +92,9 @@ pub struct VideoPacket {
     pub payload: Vec<u8>,
     /// Media encryption key ID (only used for encrypted packet types).
     pub key_id: u16,
+    /// The sender's own nonce prefix, chosen by the sender and never by the
+    /// server (only used for encrypted types). See `VoicePacket::stream_id`.
+    pub stream_id: u32,
 }
 
 impl VideoPacket {
@@ -116,6 +121,7 @@ impl VideoPacket {
             timestamp,
             payload,
             key_id: 0,
+            stream_id: 0,
         }
     }
 
@@ -128,6 +134,7 @@ impl VideoPacket {
         fragment_count: u8,
         timestamp: u32,
         key_id: u16,
+        stream_id: u32,
         encrypted_payload: Vec<u8>,
     ) -> Self {
         Self {
@@ -143,6 +150,7 @@ impl VideoPacket {
             timestamp,
             payload: encrypted_payload,
             key_id,
+            stream_id,
         }
     }
 
@@ -158,6 +166,7 @@ impl VideoPacket {
             buf.push(self.fragment_count);
             buf.extend_from_slice(&self.timestamp.to_be_bytes());
             buf.extend_from_slice(&self.key_id.to_be_bytes());
+            buf.extend_from_slice(&self.stream_id.to_be_bytes());
             buf.extend_from_slice(&self.payload);
             buf
         } else {
@@ -205,6 +214,7 @@ impl VideoPacket {
                 });
             }
             let key_id = u16::from_be_bytes([data[15], data[16]]);
+            let stream_id = u32::from_be_bytes([data[17], data[18], data[19], data[20]]);
             let payload = data[ENCRYPTED_VIDEO_HEADER_SIZE..].to_vec();
             Ok(Self {
                 packet_type,
@@ -215,6 +225,7 @@ impl VideoPacket {
                 timestamp,
                 payload,
                 key_id,
+                stream_id,
             })
         } else {
             let payload = data[VIDEO_HEADER_SIZE..].to_vec();
@@ -227,6 +238,7 @@ impl VideoPacket {
                 timestamp,
                 payload,
                 key_id: 0,
+                stream_id: 0,
             })
         }
     }
@@ -514,8 +526,8 @@ impl FrameGrouper {
 /// Header size: 1 (type) + 4 (session_id) + 4 (sequence) + 4 (timestamp) = 13 bytes.
 pub const SCREEN_AUDIO_HEADER_SIZE: usize = 13;
 
-/// Encrypted screen audio header: standard + 2 (key_id) = 15 bytes.
-pub const ENCRYPTED_SCREEN_AUDIO_HEADER_SIZE: usize = 15;
+/// Encrypted screen audio header: standard + 2 (key_id) + 4 (stream_id) = 19 bytes.
+pub const ENCRYPTED_SCREEN_AUDIO_HEADER_SIZE: usize = 19;
 
 /// A screen share audio packet.
 ///
@@ -525,6 +537,8 @@ pub const ENCRYPTED_SCREEN_AUDIO_HEADER_SIZE: usize = 15;
 /// Wire format:
 /// ```text
 /// [0x12: u8] [session_id: u32 BE] [sequence: u32 BE] [timestamp: u32 BE] [opus_data: variable]
+///
+/// Encrypted (0x15) carries [key_id: u16 BE] [stream_id: u32 BE] before the payload.
 /// ```
 #[derive(Debug, Clone)]
 pub struct ScreenShareAudioPacket {
@@ -538,6 +552,9 @@ pub struct ScreenShareAudioPacket {
     pub encrypted: bool,
     /// Media encryption key ID (only used when encrypted).
     pub key_id: u16,
+    /// The sender's own nonce prefix (only used when encrypted).
+    /// See `VoicePacket::stream_id`.
+    pub stream_id: u32,
 }
 
 impl ScreenShareAudioPacket {
@@ -549,6 +566,7 @@ impl ScreenShareAudioPacket {
             opus_data,
             encrypted: false,
             key_id: 0,
+            stream_id: 0,
         }
     }
 
@@ -557,6 +575,7 @@ impl ScreenShareAudioPacket {
         sequence: u32,
         timestamp: u32,
         key_id: u16,
+        stream_id: u32,
         encrypted_data: Vec<u8>,
     ) -> Self {
         Self {
@@ -566,6 +585,7 @@ impl ScreenShareAudioPacket {
             opus_data: encrypted_data,
             encrypted: true,
             key_id,
+            stream_id,
         }
     }
 
@@ -579,6 +599,7 @@ impl ScreenShareAudioPacket {
             buf.extend_from_slice(&self.sequence.to_be_bytes());
             buf.extend_from_slice(&self.timestamp.to_be_bytes());
             buf.extend_from_slice(&self.key_id.to_be_bytes());
+            buf.extend_from_slice(&self.stream_id.to_be_bytes());
             buf.extend_from_slice(&self.opus_data);
             buf
         } else {
@@ -622,6 +643,7 @@ impl ScreenShareAudioPacket {
                 });
             }
             let key_id = u16::from_be_bytes([data[13], data[14]]);
+            let stream_id = u32::from_be_bytes([data[15], data[16], data[17], data[18]]);
             let opus_data = data[ENCRYPTED_SCREEN_AUDIO_HEADER_SIZE..].to_vec();
             Ok(Self {
                 session_id,
@@ -630,6 +652,7 @@ impl ScreenShareAudioPacket {
                 opus_data,
                 encrypted: true,
                 key_id,
+                stream_id,
             })
         } else {
             let opus_data = data[SCREEN_AUDIO_HEADER_SIZE..].to_vec();
@@ -640,6 +663,7 @@ impl ScreenShareAudioPacket {
                 opus_data,
                 encrypted: false,
                 key_id: 0,
+                stream_id: 0,
             })
         }
     }
@@ -668,7 +692,7 @@ mod tests {
     #[test]
     fn roundtrip_encrypted_video_packet() {
         let original =
-            VideoPacket::encrypted_fragment(false, 42, 9, 1, 2, 77, 5, vec![1, 2, 3]);
+            VideoPacket::encrypted_fragment(false, 42, 9, 1, 2, 77, 5, 0xABCD_1234, vec![1, 2, 3]);
         let bytes = original.to_bytes();
         assert_eq!(bytes.len(), ENCRYPTED_VIDEO_HEADER_SIZE + 3);
         let decoded = VideoPacket::from_bytes(&bytes).unwrap();
@@ -678,6 +702,7 @@ mod tests {
         assert_eq!(decoded.fragment_count, 2);
         assert_eq!(decoded.timestamp, 77);
         assert_eq!(decoded.key_id, 5);
+        assert_eq!(decoded.stream_id, 0xABCD_1234);
         assert_eq!(decoded.payload, vec![1, 2, 3]);
     }
 
@@ -905,7 +930,7 @@ mod tests {
     #[test]
     fn grouper_matches_real_packets() {
         // The grouper's hand-parsed offsets must agree with VideoPacket::to_bytes
-        let pkt = VideoPacket::encrypted_fragment(true, 7, 0x01020304, 0, 1, 9, 3, vec![1]);
+        let pkt = VideoPacket::encrypted_fragment(true, 7, 0x01020304, 0, 1, 9, 3, 1, vec![1]);
         let mut grouper = FrameGrouper::default();
         assert_eq!(
             grouper.place(&pkt.to_bytes()),
@@ -1067,7 +1092,7 @@ mod tests {
 
     #[test]
     fn roundtrip_encrypted_screen_audio_packet() {
-        let original = ScreenShareAudioPacket::new_encrypted(42, 100, 5000, 9, vec![1, 2]);
+        let original = ScreenShareAudioPacket::new_encrypted(42, 100, 5000, 9, 0xFEED_F00D, vec![1, 2]);
         let bytes = original.to_bytes();
         assert_eq!(bytes[0], 0x15);
         assert_eq!(bytes.len(), ENCRYPTED_SCREEN_AUDIO_HEADER_SIZE + 2);
@@ -1202,7 +1227,7 @@ mod tests {
         let bytes = unenc.to_bytes();
         assert!(ScreenShareAudioPacket::from_bytes(&bytes).is_ok());
 
-        let enc = ScreenShareAudioPacket::new_encrypted(1, 0, 0, 42, vec![1, 2, 3]);
+        let enc = ScreenShareAudioPacket::new_encrypted(1, 0, 0, 42, 7, vec![1, 2, 3]);
         let bytes = enc.to_bytes();
         assert!(ScreenShareAudioPacket::from_bytes(&bytes).is_ok());
     }

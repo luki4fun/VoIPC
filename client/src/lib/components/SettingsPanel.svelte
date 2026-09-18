@@ -33,6 +33,7 @@
   import {
     micMonitor,
     shareChannelHistory,
+    maxConversations,
     spatialAudio,
     screenAudioSpatial,
     audioSetupRequested,
@@ -918,13 +919,43 @@
               invoke("set_config_bool", { key: "share_channel_history", value: enabled }).catch((err: any) => {
                 addNotification(`Failed to save setting: ${err}`, "error");
               });
+              // The people here see who would answer them, so say so now
+              // rather than at the next connect.
+              invoke("set_history_sharing", { enabled }).catch(() => {
+                // Not connected: it goes out with the next connection
+              });
             }}
           />
           <span class="toggle-label">Share recent channel chat with newcomers</span>
           <span class="toggle-hint">
-            When someone joins your channel, your client may hand them the last 50 channel messages it has — end-to-end encrypted to that person only, never through the server in the clear
+            When someone joins a channel you are in, your client may hand them the last 50 messages it has there — end-to-end encrypted to that person only, never through the server in the clear. While this is on, the other people there can see that you are one of the members worth asking
           </span>
         </label>
+        <div class="ptt-config">
+          <span class="hotkey-label">Conversations kept</span>
+          <input
+            class="sdk-input"
+            type="number"
+            min="0"
+            max="100000"
+            value={$maxConversations}
+            onchange={(e) => {
+              const raw = Number((e.target as HTMLInputElement).value);
+              const value = Number.isFinite(raw) ? Math.max(0, Math.min(100000, Math.floor(raw))) : 1000;
+              maxConversations.set(value);
+              (e.target as HTMLInputElement).value = String(value);
+              invoke("set_config_u32", { key: "max_conversations", value }).catch((err: any) => {
+                addNotification(`Failed to save setting: ${err}`, "error");
+              });
+            }}
+          />
+        </div>
+        <span class="toggle-hint">
+          Channels and people together, across every server. The oldest beyond this are dropped
+          the next time chat is saved. 0 keeps all of them — each conversation is capped at 500
+          messages either way, so this is about how much is written out at once, not how far back
+          any one conversation goes.
+        </span>
         <div class="btn-row">
           <button class="danger-btn" onclick={async () => { await clearAllHistory(); addNotification("Chat history cleared", "info"); }}>
             Clear Chat History
@@ -941,14 +972,14 @@
         <h4>Layout</h4>
         <div class="layout-choices">
           <LayoutPreview
+            layout="modern"
+            selected={$uiPrefs.layout === "modern"}
+            onpick={() => updateUiPrefs((p) => (p.layout = "modern"))}
+          />
+          <LayoutPreview
             layout="classic"
             selected={$uiPrefs.layout === "classic"}
             onpick={() => updateUiPrefs((p) => (p.layout = "classic"))}
-          />
-          <LayoutPreview
-            layout="discord"
-            selected={$uiPrefs.layout === "discord"}
-            onpick={() => updateUiPrefs((p) => (p.layout = "discord"))}
           />
         </div>
       </div>

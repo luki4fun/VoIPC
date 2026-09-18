@@ -6,6 +6,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.media.AudioManager
 import android.os.Build
 import android.os.Bundle
@@ -16,9 +17,11 @@ import android.view.View
 import android.view.ViewGroup
 import android.webkit.JavascriptInterface
 import android.webkit.WebView
+import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.WindowInsetsControllerCompat
 
 class MainActivity : TauriActivity() {
 
@@ -50,6 +53,24 @@ class MainActivity : TauriActivity() {
             this@MainActivity.volumeKeyPttEnabled = enabled
         }
 
+        /**
+         * Which way round the status- and navigation-bar icons should be
+         * drawn, for the palette the user has chosen.
+         *
+         * The bars are transparent and the page paints its own background into
+         * them, so the icons are the only part Android still owns — and white
+         * icons on the Slate light palette are invisible.
+         */
+        @JavascriptInterface
+        fun setSystemBarsLight(light: Boolean) {
+            this@MainActivity.runOnUiThread {
+                WindowInsetsControllerCompat(window, window.decorView).apply {
+                    isAppearanceLightStatusBars = light
+                    isAppearanceLightNavigationBars = light
+                }
+            }
+        }
+
         @JavascriptInterface
         fun setSpeakerphone(enabled: Boolean) {
             this@MainActivity.audioManager?.let { am ->
@@ -78,7 +99,20 @@ class MainActivity : TauriActivity() {
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
-        enableEdgeToEdge()
+        // Transparent bars with no scrim and light icons, rather than the
+        // `enableEdgeToEdge()` default, which is `SystemBarStyle.auto(...)`:
+        // that reads the *system* day/night setting at onCreate and paints a
+        // 90%-white scrim across the navigation bar of a dark app, with dark
+        // status icons that vanish against it. The page paints its own
+        // background into both strips and keeps its content out of them with
+        // env(safe-area-inset-*), so there is nothing here for Android to
+        // improve. `setSystemBarsLight` flips the icons when a light palette
+        // is chosen; this is the starting point, and the default palette
+        // is dark.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
+        )
         super.onCreate(savedInstanceState)
 
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager

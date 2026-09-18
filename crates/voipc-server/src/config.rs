@@ -29,6 +29,17 @@ pub struct ServerConfig {
     #[serde(default = "default_max_users")]
     pub max_users: u32,
 
+    /// How many connections one IP address may hold at once.
+    ///
+    /// Not the same as users: a browser client holds two (the page and the
+    /// QUIC session), a native client one. The default allows sixteen browser
+    /// users behind one address, because that is what a household, an office
+    /// or a school looks like from here — and being refused for sharing a NAT
+    /// with your friends is worse than the dial-and-drop loop this bounds,
+    /// which `CONNECT_BURST` is the real answer to.
+    #[serde(default = "default_max_connections_per_ip")]
+    pub max_connections_per_ip: u32,
+
     /// Path to TLS certificate file (PEM).
     pub cert_path: String,
 
@@ -72,6 +83,10 @@ fn default_max_users() -> u32 {
     64
 }
 
+fn default_max_connections_per_ip() -> u32 {
+    32
+}
+
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
@@ -79,6 +94,7 @@ impl Default for ServerConfig {
             tcp_port: default_tcp_port(),
             udp_port: default_udp_port(),
             max_users: default_max_users(),
+            max_connections_per_ip: default_max_connections_per_ip(),
             cert_path: "certs/server.crt".into(),
             key_path: "certs/server.key".into(),
             admin_token: None,
@@ -96,6 +112,7 @@ mod tests {
         assert_eq!(config.tcp_port, 9987);
         assert_eq!(config.udp_port, 9987);
         assert_eq!(config.max_users, 64);
+        assert_eq!(config.max_connections_per_ip, 32);
     }
 
     #[test]

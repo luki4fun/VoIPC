@@ -1,4 +1,4 @@
-// Discord's phone layout: three panes side by side, dragged with a thumb.
+// The modern layout on a phone: three panes side by side, dragged with a thumb.
 //
 // No gesture library. Pointer events plus one rule — do not take over until the
 // movement is clearly horizontal — and `touch-action: pan-y` on the track so the

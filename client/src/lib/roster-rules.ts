@@ -25,12 +25,49 @@ export function worthAsking(
   channel: ChannelInfo,
   currentChannelId: number,
   admin: boolean,
+  joinedTextChannelIds: ReadonlySet<number> = new Set(),
 ): boolean {
   if (channel.channel_id === currentChannelId) return false;
   if (admin) return true;
+  // A text channel we joined answers us as a member: the server asks whether
+  // we are *in* the channel, not which one we stand in. Without this a text
+  // channel with a password or hidden members would be asked about once, at
+  // the join, and then never again — its roster would freeze while people
+  // came and went, in exactly the channels where that matters most.
+  if (joinedTextChannelIds.has(channel.channel_id)) return true;
   if (channel.hide_members) return false;
   if (channel.has_password) return false;
   return true;
+}
+
+/**
+ * Whether a roster that just arrived may correct the channel's member count.
+ *
+ * The count on a row is arithmetic: the server sends the channel list once, at
+ * login, and every join and leave after that is a broadcast the client adds or
+ * subtracts. A broadcast that never arrives — the send queue was full, the
+ * channel was not in our list yet — is a permanent error, and the number stays
+ * wrong until the next reconnect. A roster we asked for is a fresh count, so
+ * it heals that.
+ *
+ * Except when the answer is empty, which the server also sends when it refuses
+ * the question (`RequestChannelUsers` for a locked channel we are not in
+ * answers `users: []`). "Nobody is in there" and "you may not know" are the
+ * same reply, so an empty one only counts where the server would have answered
+ * us honestly.
+ */
+export function trustRosterCount(
+  list: UserInfo[],
+  channel: ChannelInfo,
+  currentChannelId: number,
+  admin: boolean,
+  joinedTextChannelIds: ReadonlySet<number> = new Set(),
+): boolean {
+  if (list.length > 0) return true;
+  return (
+    channel.channel_id === currentChannelId ||
+    worthAsking(channel, currentChannelId, admin, joinedTextChannelIds)
+  );
 }
 
 /**
@@ -47,4 +84,28 @@ export function rosterOf(
   ownUsers: UserInfo[],
 ): UserInfo[] {
   return channelId === currentChannelId ? ownUsers : (rosters.get(channelId) ?? []);
+}
+
+/**
+ * The people to draw under one row, with *that row's* hide-members rule.
+ *
+ * `hide_members` belongs to the channel it is set on. A sidebar that draws
+ * members under every row has to ask the question once per row: reading it off
+ * whichever channel the member list happens to be showing — which follows the
+ * text channel the user opened — blanks the row of the voice room they are
+ * standing in, whose members they could see a moment ago and can hear right now.
+ *
+ * Only our own row needs the rule applied here at all. Every other roster was
+ * answered by the server, which applies it there and refuses rather than
+ * blanking; ours is pushed to us in full, because we are in it.
+ */
+export function rosterForRow(
+  channel: ChannelInfo,
+  rosters: Map<number, UserInfo[]>,
+  currentChannelId: number,
+  ownUsers: UserInfo[],
+  admin: boolean,
+): UserInfo[] {
+  if (channel.channel_id === currentChannelId && channel.hide_members && !admin) return [];
+  return rosterOf(channel.channel_id, rosters, currentChannelId, ownUsers);
 }

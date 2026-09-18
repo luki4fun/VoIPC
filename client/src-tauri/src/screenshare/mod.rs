@@ -336,7 +336,7 @@ pub(crate) struct FrameProcessor {
     pub frame_counter: u32,
     pub video_tx: mpsc::Sender<Vec<u8>>,
     pub session_id: u32,
-    pub media_key: Arc<std::sync::Mutex<Option<voipc_crypto::MediaKey>>>,
+    pub media_key: Arc<std::sync::Mutex<voipc_crypto::MediaKeyRing>>,
     pub channel_id: Arc<AtomicU32>,
     pub frames_sent: Arc<AtomicU32>,
     pub bytes_sent: Arc<AtomicU64>,
@@ -579,14 +579,13 @@ impl FrameProcessor {
 
         // Clone the key (small: id + 32B) instead of holding the mutex across
         // fragmenting/encrypting/sending — voice paths share this mutex.
-        let key_opt = self
-            .media_key
-            .lock()
-            .unwrap_or_else(|poisoned| {
+        let (key_opt, stream_id) = {
+            let guard = self.media_key.lock().unwrap_or_else(|poisoned| {
                 warn!("media key mutex poisoned — recovering");
                 poisoned.into_inner()
-            })
-            .clone();
+            });
+            (guard.current().cloned(), guard.stream_id())
+        };
         let key_opt = key_opt.as_ref();
 
         for ef in encoded_frames {
@@ -636,7 +635,7 @@ impl FrameProcessor {
                     let aad = voipc_crypto::media_keys::build_aad(ch_id, pkt_type);
                     match voipc_crypto::media_encrypt(
                         key,
-                        self.session_id,
+                        stream_id,
                         self.frame_id,
                         pkt.fragment_index as u32,
                         &aad,
@@ -652,6 +651,7 @@ impl FrameProcessor {
                                 pkt.fragment_count,
                                 timestamp,
                                 key.key_id,
+                                stream_id,
                                 encrypted,
                             )
                         }
@@ -745,7 +745,7 @@ pub(crate) struct AudioProcessor {
     pub packet_count: Arc<AtomicU32>,
     pub sample_rate: u32,
     pub channels: u32,
-    pub media_key: Arc<std::sync::Mutex<Option<voipc_crypto::MediaKey>>>,
+    pub media_key: Arc<std::sync::Mutex<voipc_crypto::MediaKeyRing>>,
     pub channel_id: Arc<AtomicU32>,
     /// Device-rate → 48kHz resampler, lazily built when `sample_rate` isn't
     /// 48kHz (WASAPI loopback runs at the output device's rate). Keyed by the
@@ -825,21 +825,20 @@ impl AudioProcessor {
             let timestamp = self.start_time.elapsed().as_millis() as u32;
 
             // Clone instead of holding the shared mutex across encrypt+send.
-            let key_opt = self
-                .media_key
-                .lock()
-                .unwrap_or_else(|poisoned| {
+            let (key_opt, stream_id) = {
+                let guard = self.media_key.lock().unwrap_or_else(|poisoned| {
                     warn!("media key mutex poisoned — recovering");
                     poisoned.into_inner()
-                })
-                .clone();
+                });
+                (guard.current().cloned(), guard.stream_id())
+            };
 
             let packet = if let Some(key) = key_opt.as_ref() {
                 let ch_id = self.channel_id.load(Ordering::Relaxed);
                 let aad = voipc_crypto::media_keys::build_aad(ch_id, 0x15);
                 match voipc_crypto::media_encrypt(
                     key,
-                    self.session_id,
+                    stream_id,
                     self.sequence,
                     0,
                     &aad,
@@ -850,6 +849,7 @@ impl AudioProcessor {
                         self.sequence,
                         timestamp,
                         key.key_id,
+                        stream_id,
                         encrypted,
                     ),
                     Err(e) => {

@@ -2,7 +2,7 @@
   // The status bar along the very bottom of the classic layout.
   //
   // Bar only. Packet loss is polled in stores/connection-quality.ts and the two
-  // admin dialogs are AdminDialogs.svelte, both because the Discord layout shows
+  // admin dialogs are AdminDialogs.svelte, both because the modern layout shows
   // the same things somewhere else and neither should be computed twice.
 
   import { invoke } from "@tauri-apps/api/core";

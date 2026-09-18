@@ -47,8 +47,9 @@ export const serverEntries: Readable<ServerEntry[]> = derived(
 
     if ($address) {
       const { host, port } = splitAddress($address);
-      // Unread is per channel and has no server dimension yet; with one
-      // connection every count belongs to this entry.
+      // Unread is keyed per server now, but the map only ever holds the live
+      // connection's keys — it is cleared with the text channels on
+      // disconnect — so every count in it belongs to this entry.
       let total = 0;
       for (const n of $unread.values()) total += n;
       entries.push({

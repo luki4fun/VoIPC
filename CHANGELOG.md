@@ -2,25 +2,446 @@
 
 All notable changes to VoIPC are documented here.
 
-## [Unreleased]
+## [0.9.0] - 2026-09-17
 
-No protocol change — this is a client-only release, and the version string is
-what a server compares for exact equality, so it stays where it is.
+**Protocol 8 → 9.** A client and a server must match exactly, so both have to be
+updated together.
 
-### Added — a second layout, because most people have used Discord
+### Added — text channels
+
+A voice channel is somewhere you stand, and you can only stand in one place.
+That has been true since the first release and it stays true. It was also the
+only kind of channel there was, which meant chat lived wherever your voice did:
+to read a conversation you had to move your microphone into it.
+
+- **Text channels** are a subscription rather than a move. Join as many as you
+  like, read and write in them while sitting in whatever voice channel you are
+  in, and leave one from the ✕ on its row. Voice is unchanged: still one channel
+  at a time, still the same join, still the same leave
+- **A server can put everyone in one on connect.** A channel in `channels.json`
+  with `"text": true, "auto_join": true` is joined by every client as it
+  arrives — the `#general` a new server wants people to land in. Leave it and it
+  stays left: the client remembers that per server and does not re-join on the
+  next connection, which is also why the server itself joins nobody. Without
+  `auto_join` a text channel is there to be joined by hand
+- **Anyone can create one**, from the same + button as a voice channel, now with
+  a Voice/Text choice. Like any user-created channel it goes away once the last
+  member leaves and the empty-channel timeout passes
+- **Joining a voice channel no longer moves the chat pane.** It shows whatever
+  you last opened until you ask for something else, which is the modern habit;
+  clicking the voice channel you are already in is how you ask for its chat
+- Messages are end-to-end encrypted exactly as channel chat already was, one
+  sender-key group per channel, and the server still stores no history: a
+  newcomer asks the members who offer it, as below
+
+### Added — chat you can keep, and delete, on purpose
+
+Voice and screen share are solved by not persisting: nothing is stored, so
+nothing leaks. Text cannot work that way — a conversation nobody can scroll back
+through is a worse conversation — but it should not turn the app into an archive
+either. So persistence stays opt-in, and the parts of it that were quietly
+broken or missing are now finished.
+
+- **You can see who shares.** A member who answers requests for recent chat is
+  marked in the member list, so it is visible whether a channel has anyone to
+  ask, and who. It is one flag per person, the same shape as mute and deafen,
+  and the only thing about chat the server is told — it has always seen the
+  requests themselves go past
+- **History is merged, not taken from one person.** Different people hold
+  different parts of a conversation: whoever was away has the older half,
+  whoever just arrived has only the newest. A newcomer now asks up to three
+  members who share, and what comes back is folded together in order, without
+  duplicates. Each hand-off leaves its own divider, so it is clear which part
+  came from whom
+- **A message carries an id, inside the encryption.** Minted by its sender and
+  never seen by the server, so two people's copies of the same message are
+  recognised as one. Chat stored before this release has no id and is still
+  deduplicated the old way — same author, same text, close in time
+- **Deleting is permanent, and undoable on purpose.** Clearing a channel records
+  what was there, and nothing older is ever merged back in. So a channel you
+  cleared stays cleared, however many members re-offer it and however often you
+  reconnect. If you deleted it by accident, the history button in the chat
+  header asks the sharers again and takes the deletion back — a thing you do,
+  not a thing that happens to you
+- **Chat history is filed per server.** Two servers' `#general` are two rooms,
+  and they no longer share one bucket. This closes a hole that `auto_join` would
+  otherwise have opened: a server could publish a text channel called `general`,
+  have every client join it on connect, and ask for "the history of #general" —
+  and be handed what its user had written somewhere else entirely. History from
+  before this release is adopted by the first server you connect to
+- **A direct message is filed under the person, not their number.** Every
+  conversation was kept under the two user ids — and a user id is handed out
+  afresh on every connection and passed on as people come and go, so yesterday's
+  conversation with one person was shown as today's with whoever holds that pair
+  of numbers now, on any server. They are filed by server and name from here on.
+  The conversations stored the old way name nobody in particular, so they are
+  not carried over; a name is not proof of who somebody is either, which is why
+  accounts are the next thing on the list. The list of open conversations in the
+  sidebar now belongs to the connection, for the same reason the ids do —
+  opening a direct message with somebody brings back what you wrote to them
+  before
+- **Messages can be given a destruction timer.** Off everywhere unless somebody
+  turns it on. A channel's creator or an admin sets one from the gear icon —
+  five minutes to seven days — and every message written there from then on is
+  deleted by every client when its time is up. A direct message has no channel
+  to take that from, so the clock in the chat header is your own: it travels
+  with the messages you send, and the other side deletes them when it runs out.
+  The timer rides inside the encryption next to the message, where the relay can
+  neither read it nor change it, and the moment is worked out from the message's
+  own timestamp, so every copy of it goes at once rather than a few minutes
+  apart. What a member re-sharing a conversation says about a message is only
+  the outer bound: the channel's timer applies to what they hand over as well,
+  including to a message they strip it from, and a copy of something already
+  here can bring its deletion forward but never push it back. It is a rule about
+  the app and not about people — somebody who was there can still keep their own
+  copy of what they read
+- **How much is kept is yours to set.** The archive keeps a thousand
+  conversations — channels and people together, across every server — and the
+  oldest beyond that are dropped when chat is next saved. Settings → Data has
+  the number, and 0 keeps all of them: what it bounds is how much is written out
+  at once, not how far back any one conversation goes, which is five hundred
+  messages either way
+- **Fixed: the encrypted chat vault could not be reloaded.** It has stored
+  messages in a format it could not read back since 0.4.0, so unlocking an
+  archive that held any message failed. The format is now v2, and a v1 file is
+  read where it still can be — which is every archive that never stored a
+  shared-history divider; the others were never loadable by any build
+
+### Fixed — end-to-end encryption
+
+Text channels mean a client holds several channels' keys at once. Everything
+below was written for one, and this release is where that assumption is made
+good. Two of these are older than text channels and got worse with them.
+
+- **A message is now bound to the channel it was sent in.** The channel id
+  inside the ciphertext is checked against the one the server names, rather than
+  being taken on trust. Without it a relay could re-label a message from one
+  channel as another, and it would be shown, stored, and later shared under the
+  wrong channel's name. The same check applies to sender keys, so a member of
+  one channel cannot install a key for another. Clients also drop a message for
+  a channel they are not in at all
+- **Sender keys are rotated when somebody leaves.** The chain key a departing
+  member holds used to keep working forever, so a former member of a channel
+  could go on reading it. Now the next message sent after anyone leaves starts a
+  fresh chain, handed to the members still there. It costs nothing until
+  somebody writes, and nothing at all for people who only read. Leaving the
+  channel yourself, or re-joining it, forgets the chain rather than cancelling
+  the rotation that was due — and a two-person channel, where the one member
+  who held your key is the one who left, rotates like any other instead of
+  quietly keeping the key they walked out with
+- **Media keys are rotated when somebody leaves, too.** Voice, video and screen
+  audio share one key per channel, and it used to be minted once and never
+  again: a member who left, or was kicked, kept a working key for as long as the
+  channel lasted. Now the lowest remaining user id mints the next generation and
+  hands it to the others over the sessions it already has — nobody is elected by
+  the server, and two members who disagree about the roster for a moment
+  converge on the same key rather than going deaf to each other. The previous
+  generation stays usable for a moment so the rotation is not an audible gap,
+  which is also the only window the member who left can still read
+- **A speaker's nonce no longer comes from the server.** Media packets were
+  numbered with the session id the server hands out. Two members of a channel
+  encrypt under the same key, so a server that gave two of them the same session
+  id got the same key and nonce twice — and the XOR of two people talking.
+  Each client now picks four random bytes for itself when it joins and carries
+  them in the packet header, which is what the README always claimed the nonce
+  did
+- **A media key is taken only from a member of the channel it is for.** Sender
+  keys were checked this way and media keys were not, which is the wrong way
+  round: a sender key decides what one person can read, a media key is the key
+  the microphone encrypts under. Anyone able to open a pairwise session with a
+  client — which is anyone on the server — could hand it a key for the room it
+  was standing in, and a relay willing to carry that could then listen to
+  everything said in there. The key is now refused before it is opened unless
+  the roster puts its sender in the channel, and it is refused again if the
+  channel named inside it is not the room we are in — believing that would
+  otherwise take away sending, receiving and passing the key on, all at once,
+  with nothing on screen to say why
+- **Key generations wrap instead of running out.** They are numbered with two
+  bytes, and the last number was treated as the last generation there could be:
+  a member on their way out could send it and every rotation after that would
+  be refused, freezing the channel on the key they were walking away with —
+  which is the one case rotation exists for
+- **A shared history is accepted only from a member of that channel**, like the
+  keys. It arrives over a pairwise session, so it never needed the channel's
+  group key; a stranger with a colluding relay could hand a client a
+  conversation of their invention, which it would file, show and pass on
+- **Leaving a voice channel no longer resets the pairwise session with the
+  person who left.** It made sense when the only place you shared with somebody
+  was the channel you stood in. Now they may be in three text channels with
+  you, and dropping the session meant the next thing they did anywhere started
+  a second key agreement with them — two sessions for one person, which shows
+  up as one message that cannot be read and then one that quietly decrypts
+  "with the previous session state" — while their sender key was not handed
+  over next door because we believed there was no session to hand it over
+- **A text channel cannot be anonymous.** Pseudonyms hide a member who is
+  nowhere else, and a text channel is one you are in *besides* the voice channel
+  you stand in — where the same user id carries your real name. The server
+  refuses the combination at creation, in `channels.json` and at runtime rather
+  than offering privacy it cannot deliver. Anonymous voice channels are
+  unchanged
+- **A text channel's member list no longer names the voice room its members are
+  standing in.** Each roster now describes the channel it is a roster of
+- **A member who was already in a text channel could not be read at all.** Their
+  messages, and the channel's history, arrived as "decryption failed" until one
+  side left and re-joined. Three things caused it together, and each is fixed
+  where it was: a client recorded having handed its sender key to peers the
+  server had dropped it for — it hands one to every peer it opens a session
+  with, wherever they are, and the server relays only between two members — so
+  it then skipped the person who had actually never received it; nobody was
+  responsible for handing a key *to* a newcomer, because a text channel does not
+  move anybody and the member therefore learns of the join from a broadcast
+  alone; and leaving a voice channel forgot the keys of every channel the two
+  shared, so simply changing rooms broke the text channels next door. A sender
+  key now goes to a member of the named channel and nowhere else, members hand
+  theirs over the moment somebody joins, and a leave only forgets the channel it
+  was a leave from
+- **A message that could not be decrypted is no longer passed on as history.**
+  The placeholder was stored like any other message and handed to the next person
+  to join, which spread one member's missing key down the whole chain of people
+  who arrived after them. It now stays on screen for whoever could not read it,
+  and is offered to nobody; incoming history is filtered the same way, because
+  the peer on the other end may be running an older client
+- **Asking for a channel's history again works when it is most needed.** The
+  button required the other member's group key, which is not what a history
+  hand-off travels over — so the one repair available after a key went missing
+  was refused for the very reason it was being used. It now needs only the
+  pairwise session it actually uses
+
+### Security — a review before the release
+
+Text channels and the second layout went through a full audit of the crypto,
+the server and the seam between text and voice. What it found is below. None of
+it had shipped.
+
+**End-to-end encryption**
+
+- **Shared history is bound to its channel, like everything else.** A hand-off
+  named its channel only on the envelope the server writes, so a relay could
+  take Alice's history of a private channel, label it as a public one Bob is in,
+  and watch Bob merge it, file it, and offer it onward. The channel now travels
+  inside the ciphertext and is checked against what the server claims
+- **A client answers only members of channels it is in.** A request for history
+  was answered on the strength of the user's own opt-in alone; a sender key was
+  installed from anybody at all. Both now require that the channel is one we are
+  in and that the other person is in it with us. It does not make an untrusted
+  server harmless — it can still place somebody in a channel — but it has to do
+  it where the member list shows them, instead of silently
+- **Shared history is shown as second-hand.** There is nothing to check an
+  archived message against: identities are per-connection and never written
+  down, so nothing signs one. A member could therefore hand a newcomer an
+  invented conversation attributed to somebody else, and it would be
+  indistinguishable from what that person actually wrote. Merged history is now
+  marked as what it is and stays marked when it is passed on, so a conversation
+  still outlives its last original witness without a fabrication ever passing
+  for first-hand
+- **A message id cannot be squatted, or used as storage.** Two members'
+  copies of a message are recognised by the id its sender minted — but the
+  comparison ignored who sent it, so one member could shadow another's message
+  by reusing their id. The sender is part of the comparison now, and an id
+  arriving from the wire is bounded, rather than going into the encrypted
+  archive at whatever length it was sent at
+- **A message for a channel you just left no longer lands in that channel's
+  archive.** Leaving while somebody was mid-sentence wrote
+  "[encrypted message — decryption failed]" into the history of the channel you
+  had left, with an unread badge and a sound. The check that drops such a
+  message had been folded into the same step as the decryption, so failing it
+  looked like a failure to decrypt
+- **A far-future timestamp cannot silently disable history.** One message
+  claiming the year 8000 — or an honest client with a dead clock battery —
+  followed by clearing that channel set the "deleted up to here" mark past every
+  future message, and nothing merged into that channel again. Timestamps are
+  now bounded where they enter
+- **The browser client and the desktop client share the code that was drifting.**
+  The membership rules, the sender-key lifecycle, the message envelope and the
+  history payload were written twice, once in Rust and once in TypeScript. Three
+  of the faults above were that hand-port disagreeing with itself — including a
+  rotation the desktop client performed and the browser skipped. There is one
+  implementation now, in the WASM bridge the browser was already using
+
+**The server**
+
+- **One message can no longer disconnect a whole channel.** The relay re-wraps
+  a client's ciphertext with a sender and a timestamp, which could push the
+  result past the frame size every client refuses — so a single large message
+  dropped the connection of everyone in the channel. Blobs are bounded on the
+  way in, and the encoder refuses to emit a frame nobody could read
+- **Text channels cost a budget.** A subscription is not a move, so joining and
+  leaving one is not self-limiting the way changing rooms was: flapping it
+  announced the change to every connected session each time. Subscribe/leave,
+  the history-sharing flag, mute, deafen, the audio filter and channel options
+  now each draw on a per-session budget
+- **A connection can no longer hold every channel open.** Channels a user
+  creates used to free themselves when their creator moved on; with
+  subscriptions the creator can stay in all of them, and fifty of them is the
+  server's limit for everybody. Creation is bounded per user, and the join rate
+  bounds the trick of re-entering a channel to keep its deletion timer from
+  firing
+- **Malformed frames cost what valid ones cost.** A packet that framed but did
+  not decode spent no rate-limit budget and wrote a log line, which made the log
+  the cheapest thing on the server to fill. The budget is charged per frame now,
+  and neither of those lines is written at info level
+- **A request for somebody's chat history honours their answer.** The server
+  broadcast the "I share history" flag and then never read it; a member who had
+  turned sharing off was still asked, and repeatedly, by as many people as cared
+  to. The flag is enforced, and the budget for answering belongs to the person
+  answering
+- **A fan-out no longer holds the lock every voice packet needs.** Broadcasting
+  to a channel held the global channel lock across the whole send, and the lock
+  prefers writers — so one person toggling mute could stall the media relay.
+  Recipients are collected under the lock and sent to after it is released, as
+  the media path already did
+- **A channel that hides its members hides them on the way in and out too.**
+  Joins and leaves are announced to everybody, because the same message doubles
+  as the member count — and they carried the user id even where the name was
+  blanked. With a `#general` everybody is in, every id has a name against it,
+  so those ids alone rebuilt the member list a hidden or password-protected
+  channel exists to withhold. An outsider is now told the count changed and
+  nothing else
+- **Both ends know the message budget.** The server charges a token per message
+  and drops what cannot pay, quietly — and a client that means no harm can go
+  over it just by arriving on a busy server, where it asks for a key bundle per
+  person and then hands a key to each of them per channel. What it lost there
+  was the worst thing to lose: a key that never arrives is a member who cannot
+  read the channel, with nothing to say so. The rate is one number both sides
+  are built from now, and each client keeps itself under it. The budget for
+  relaying a key is also per recipient rather than per sender, because the cost
+  falls on the recipient: handing a key to forty people is what honest software
+  does, and sending forty at one person is not
+- **Changing a channel's password or proximity mode costs what changing its
+  other options costs**, and announces nothing when the value did not change;
+  joining a channel is budgeted like leaving one; starting and stopping a
+  screen share, both of which tell a whole channel, are budgeted at all
+- **A game's audio filter keeps up with the game.** In a routed channel the
+  client tells the relay who the player can hear, and that shares nothing and
+  announces nothing — but it was drawing on the budget meant for the flags the
+  server does announce, which allows two a second where the SDK documents
+  twenty. The surplus was dropped without a word, so the relay went on culling
+  by a filter the game had moved on from: somebody standing next to you that
+  you cannot hear, with nothing on either screen to say why
+- Smaller: a per-IP connect rate, pre-keys bounded at authentication as well as
+  at upload, an abandoned channel-deletion timer that slept instead of being
+  cancelled, ids that are refused rather than allowed to overwrite a live
+  session or replace General, declining an invitation that was never sent no
+  longer reaches the channel's creator, a duplicate login is no longer a log
+  line anybody can ask for at will, and the widest broadcast on the server is
+  built once rather than once per recipient
+
+**A second pass over the same ground**, after the first one's fixes had been
+written. Everything below came out of reading them again.
+
+**Nothing limits how many conversations you can follow.**
+
+- **The cap on text channels is gone.** A build between 0.8.0 and this one let a
+  client hold sixteen at once. It was there to stop one connection creating
+  channels and subscribing to every one, so that none of them ever emptied and
+  expired — and it did that by charging the user for it, on a server whose owner
+  had decided how many conversations it runs. The hoarding is answered where it
+  happens instead: a channel starts its own deletion timer the moment it is
+  created, so one nobody joins goes away by itself. Which was also a hole of its
+  own — a channel whose creation succeeded and whose join was refused had no
+  members and no timer, and stayed in the map for the life of the server. Enough
+  of those and nobody could create a channel again
+- **The budgets are sized from the server, not from a number.** Joining a
+  channel, handing each one's members a key, asking each one's members for its
+  history: every one of those has a per-session budget, and each is now derived
+  from how many channels this server can hold. A client that connects and
+  subscribes to all of them can pay for doing it once, whether that is five
+  channels or five hundred
+- **A server can be as large as its config says.** The ceiling on concurrent
+  connections was a constant of 256, and ten per address, whatever `max_users`
+  said — so a server told to take more users simply could not, with nothing in
+  the log to say why. Both follow the configuration now: connections are
+  `max_users` doubled, because a browser client holds two of them, and
+  `max_connections_per_ip` (32 by default, so sixteen browser users behind one
+  household or office address) is a setting rather than a constant
+- **A reconnect no longer asks for the same channel twice.** Rejoining what you
+  had open and joining what the server auto-joins are two paths to the same
+  channel, and both ran; each one costs a join from the same budget, so a
+  reconnect to a server with a handful of auto-joined channels could exhaust it
+  and land you outside channels you had been in, with a wall of "slow down"
+  where the chat should be
+
+**Keys**
+
+- **A channel can no longer end up with no media key at all.** The key is minted
+  by the lowest-numbered member and re-minted by whoever is lowest after a
+  leave — but re-minting was refused when we held no key to succeed, which is
+  exactly the position the last remaining member is in when the one who held it
+  disconnects. The channel then had no key, everyone who joined later elected
+  the same member, who was still waiting, and nobody in that room could speak
+  for as long as it existed. Holding no key is now the reason to mint the first
+  one rather than the reason not to
+- **A message written before the channel had a key is sent under the current
+  one.** Messages typed before any member holds your sender key are kept and
+  sent when one does. If somebody left in the meantime the chain they hold is
+  the one those messages went out on — the rotation only ever ran for a message
+  typed after it. It runs for these too now
+- **A pre-key bundle is checked for size.** The key material a client uploads is
+  opaque to the server and kept until they disconnect. Nothing bounded how long
+  each piece was, so one client could park a hundred blobs of any size in the
+  server's memory — and a bundle built from them was a message too long to send
+  at all, which the requester was never told: they simply could never open an
+  encrypted session with that person again
+- **Everybody's budget for relaying keys to somebody forgets them when they
+  go.** One rate limiter per person you have shared a channel with, and user ids
+  are never handed out twice, so on a busy server a long-lived session
+  accumulated one for every person who had ever passed through
+
+**Smaller, all of them things that only show up under load or over a long
+uptime:** the sweep that bounds the connect-rate table runs on a timer instead
+of on every connect once the table is large, because it walks the whole table
+and a flood of addresses otherwise makes every connection on the server pay for
+it; a channel description in `channels.json` is bounded like a channel name,
+since the channel list is one message and one over 64 KiB cannot be sent, which
+would leave every client seeing a server with no channels at all; a message the
+server builds and cannot frame says so in the log rather than vanishing; the
+desktop client's outgoing control queue is no longer fixed at 1024 messages,
+which a connect to a busy server could fill — the task that filled it is the one
+reading the socket, so it stopped reading, and the server dropped the keys
+arriving for it; and the list of text channels you have left keeps the newest
+entries rather than the oldest, so leaving a channel on a well-used server is
+not quietly undone at the next connect.
+
+**Fixed: a channel two people joined in the same instant had no media key at
+all.** One member of a channel mints the key and hands it to everyone else, and
+the member who did it was "whoever is alone here" — but two clients arriving
+together each see the other in their very first roster, so neither was alone,
+neither minted, and nobody in that channel could speak until somebody left and
+came back. It is now the same election that decides who re-keys after a leave:
+the lowest user id in the roster. Ids only ever increase, so that is the
+longest-present member and a newcomer never mints over a key that already
+exists.
+
+
+### Looking ahead
+
+Accounts and server-stored history — so a conversation carries on while you are
+offline — are the next step, and this release is shaped to leave room for them:
+message ids live inside the encryption and are stable across every copy, the
+merge and the deletion watermark work against any source, and chat is already
+filed per server. Two things are deliberately not solved yet. Signal state is
+ephemeral per connection by design, so ciphertext a server kept would be
+unreadable after a reconnect: server-side history needs a long-lived per-channel
+key shared between members. And accounts need a persisted identity with a way to
+show when it changes. Neither is in this release.
+
+### Added — a second layout, and it is the new default
 
 VoIPC has always looked like TeamSpeak: channels on the left, members on the
 right, voice and status bars along the bottom. That is a good layout and it is
-not going anywhere. It is also not the one most people arriving here have spent
-years in.
+not going anywhere — it is **Classic**, and it is one click away. It is also not
+the shape most people arriving here have spent years in, so there is a second
+one, **Modern**, inspired by the chat apps they come from. (A build between
+0.8.0 and this one called it after the app it is shaped like. It has a name of
+its own now, and a layout or palette chosen there is carried over, not reset.)
 
-- **A Discord-shaped layout**, beside the existing one and switchable at any
+- **A modern layout**, beside the existing one and switchable at any
   time from Settings → Appearance. Server rail down the far left, channel
   sidebar with the people in **every** channel nested under it, chat in the
   middle, members on the right, and your own name with the mute and deafen
-  buttons in the bottom-left corner. **One click joins a channel**, which is the
-  habit the whole thing exists to match — the classic layout still previews on a
-  click and joins on a double click, and neither has learned the other's manners
+  buttons in the bottom-left corner. A click previews a channel and a double
+  click joins it, the same as the classic layout — the two sidebars look nothing
+  alike and behave identically, because they call the same functions
 - **You can see who is where without going there.** The names for a channel you
   are not in are never pushed to this client — a join is broadcast to everyone,
   because it doubles as the user-count update, but it carries an empty username
@@ -32,18 +453,19 @@ years in.
   an admin is answered where everyone else is refused. Every one of those rules
   stayed on the server, which is where it was; the client only decides when to
   ask, and coalesces so a filling channel is one question rather than ten
-- **You are asked once**, on the first connection, while you are still in the
-  lobby where voice is off — after the audio setup, because a microphone nobody
-  can hear is what ruins a call and a layout is not. Skipping keeps the classic
-  layout and does not count as an answer, so the offer stands next time. The
-  default is the classic layout: nobody's app should rearrange itself on an
-  update
+- **Modern is the default**, and you are asked once, on the first connection,
+  while you are still in the lobby where voice is off — after the audio setup,
+  because a microphone nobody can hear is what ruins a call and a layout is not.
+  A layout you picked is kept. If you never picked one there is nothing stored to
+  keep, so you get the default and the question, and Classic is one click away in
+  Settings → Appearance or from the server-name menu. Skipping is not an answer,
+  so the offer stands next time
 - **The virtual room, the mixing desk and a screen share open full screen** in
-  the Discord layout, the way an Activity does, and close with Escape. The
+  the modern layout, the way an activity pane does, and close with Escape. The
   classic layout keeps them in the centre column. Both read the same selector,
   so the room button in one and the room button in the other are the same button
-- **On a phone it is Discord's phone shape**: rail and channels swipe in from
-  the left, members from the right, chat in the middle. Horizontal drags are the
+- **On a phone it is the phone shape you already know**: rail and channels swipe
+  in from the left, members from the right, chat in the middle. Horizontal drags are the
   drawer's and vertical ones stay with the scroller, so the message list still
   scrolls at full speed; the mixer's faders and the room's avatars say they do
   their own dragging and are left alone. There are buttons for all of it too — a
@@ -54,9 +476,14 @@ years in.
 
 ### Added — it does not have to be dark blue
 
-- **Four palettes**: VoIPC dark, Discord dark, **Discord light** — the first
-  light theme this app has had — and AMOLED black, which is genuinely black
+- **Four palettes**: Slate dark, **Slate light** — the first light theme this
+  app has had — VoIPC dark, and AMOLED black, which is genuinely black
   rather than very dark grey, for a phone where that is a pixel that is off
+- **A new install follows the system.** Slate dark is the default, and on a
+  machine set to a light theme the app opens in Slate light instead — browsers
+  report it through `prefers-color-scheme`, Android and Windows pass it to the
+  WebView. Consulted only when nothing is stored: a palette somebody chose is
+  theirs, and sunset does not get to repaint it
 - **Every colour can be changed**, one by one, and previews as you drag the
   picker. It is not a skinning engine; it is the seventeen custom properties the
   whole UI was already drawn from, with a colour input each
@@ -66,12 +493,60 @@ years in.
   palette to WCAG AA on the pairs that actually occur — text on each surface,
   the accent on a sidebar — and the browser test measures the contrast of a real
   channel name against the real sidebar behind it, in the light theme, in the
-  live document. That is how Discord's blurple ended up slightly lighter here
-  than Discord's own: `#5865f2` is a fill colour with white on top, and as text
-  on those greys it measures 2.99:1, which is why Discord's own links are blue
+  live document. That is how the blurple in the Slate palettes ended up lighter
+  than the one it was taken from: `#5865f2` is a fill colour with white on top,
+  and as text on those greys it measures 2.99:1, which is why the apps that use
+  it put blue links
 
 ### Changed
 
+- **A server's `auto_join` text channels are actually joined now.** The join was
+  fired from the channel list, which the server sends as part of logging in —
+  while the client is still finishing its own connect, so the command was
+  refused with "Not connected" and the `#general` a server wants everyone to
+  land in stayed empty. It now waits for the connection, and the browser test
+  covers it with a `channels.json` of its own
+- **The modern layout fits a phone.** Found by testing on one, over a real
+  server: it drew under the status bar and under the navigation bar, so the
+  header collided with the clock and the user panel — with the settings gear on
+  it — sat under the system buttons, where a tap opened the recents screen
+  instead. The shell now keeps out of both insets. The push-to-talk bar, which
+  is fixed to the bottom and makes room for itself nowhere, covered the message
+  input and half the voice panel: the space it needs is measured from the bar
+  itself now, in portrait and landscape. The member drawer opened a 130-pixel
+  sliver rather than the full width. The Settings dialog was drawn under the
+  push-to-talk bar, so its last rows could not be reached
+- **Android's system bars belong to the app now.** `enableEdgeToEdge()` was
+  called with no arguments, which reads the *phone's* day/night setting once at
+  startup and paints a 90%-white scrim across the navigation bar — a cream slab
+  under a dark app — and picks the icon colour to match the system rather than
+  the app. Both bars are transparent with no scrim, and the status and
+  navigation icons now follow the palette: dark icons on Slate light, where they
+  used to be white on white and simply missing
+- **Android stopped writing the call, and its keys, into logcat.** The logcat
+  layer was registered with no filter at all. Two things came out of that. The
+  volume: the JNI wrapper's three lines per call and quinn's per-packet tracing
+  measured, on a phone idling in a voice channel, about 20,000 lines and 6.7 MB
+  **per second** — 66 MB in the ten seconds it took to measure, now 0. And the
+  contents: at `info` the Signal implementation writes base keys, prekey ids and
+  sender-key distribution ids, and logcat outlives the session and lands in any
+  bug report. In an app whose whole argument is that the keys stay with the
+  people talking, that was the wrong place for them. The default is now our own
+  crates at `info` and everything else at `warn`, so third-party problems still
+  surface and third-party bookkeeping does not. `RUST_LOG` still overrides it
+- **The leave ✕ and the channel settings gear appear without a hover**, which a
+  touch screen does not have. On a phone the only way to reach either was to
+  press and hold a channel row, and letting go joined the channel instead
+- **Settings is in the server-name menu** in the modern layout, beside the
+  layout switch — a second way in that does not depend on the bottom of a drawer
+- **Picking a channel on a phone shows the chat**, in the modern layout too. The
+  channel list is a drawer over the chat there, so a tap that only changed what
+  was behind it read as a tap that did nothing. Both layouts answer the same
+  request now
+- **Neither layout is painted before the settings are read.** The window used to
+  show the default shell for the length of one config round trip and then swap —
+  invisible while the default was the one most people had, and not once it was
+  the other one
 - **The layout is now a component, and App.svelte is the event bus.** The two
   shells are siblings; everything under them — the channel dialogs, the member
   menu, the admin dialogs, the create form — moved into shared modules mounted

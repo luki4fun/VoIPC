@@ -2,7 +2,7 @@
 //
 // From the jitter buffer's conceal counts, which is the only number that says
 // "the call sounds bad" rather than "the network is fine". Lived in StatusBar
-// until the Discord layout needed the same figure in its voice panel; polling
+// until the modern layout needed the same figure in its voice panel; polling
 // it twice would have been two intervals asking the same backend the same
 // question and computing two different answers from interleaved samples.
 

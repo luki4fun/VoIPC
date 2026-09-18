@@ -25,16 +25,27 @@
 No accounts. No telemetry. No compromises.
 
 <p align="center">
-  <img src="website/screenshots/main-window.png" alt="VoIPC main window — channels, chat, and user list with speaking indicators" width="800">
+  <img src="website/screenshots/main-window.png" alt="VoIPC in the Modern layout — server rail, channels with the people in each of them, chat, and the member list" width="800">
 </p>
+
+<p align="center"><em>The Modern layout, which is what a new install starts in. Classic is one click away in Settings.</em></p>
 
 <table>
   <tr>
-    <td><img src="website/screenshots/screenshare.png" alt="Screen share viewer with stream stats and chat"></td>
-    <td><img src="website/screenshots/settings-audio.png" alt="Audio settings with mic test and global hotkeys"></td>
-    <td><img src="website/screenshots/connect.png" alt="Connect dialog with saved servers"></td>
+    <td><img src="website/screenshots/text-channels.png" alt="Text channels in the sidebar, an encrypted conversation, and the member list of the text channel"><br><sub>Text channels — a subscription, not a move</sub></td>
+    <td><img src="website/screenshots/modern-light.png" alt="The same window in the Slate light palette"><br><sub>Slate light, one of four palettes</sub></td>
+    <td><img src="website/screenshots/classic-layout.png" alt="The Classic layout: channels left, members right, voice and status bars along the bottom"><br><sub>Classic, the original arrangement</sub></td>
+  </tr>
+  <tr>
+    <td><img src="website/screenshots/appearance.png" alt="Settings, Appearance tab: layout cards, palettes and the per-colour editor"><br><sub>Appearance: layout, palette, every colour</sub></td>
+    <td><img src="website/screenshots/screenshare.png" alt="Screen share viewer with stream stats and chat"><br><sub>Screen sharing</sub></td>
+    <td><img src="website/screenshots/connect.png" alt="Connect dialog with saved servers"><br><sub>Connecting</sub></td>
   </tr>
 </table>
+
+<p align="center">
+  <em>The site in <a href="website/">website/</a> has the same two layouts and four palettes as a live preview you can switch, rather than pictures of them.</em>
+</p>
 
 ## Features
 
@@ -71,19 +82,24 @@ No accounts. No telemetry. No compromises.
 - VPN-safe packet sizes (1280 bytes — fits inside WireGuard and OpenVPN tunnels)
 
 **Interface**
-- **Two layouts, switchable at any time.** The classic one — channels left, members right, voice and
-  status bars along the bottom — and a **Discord-style** one: server rail, channel sidebar showing
-  who is in every channel, chat in the middle, members on the right, and one click to join a
-  channel. You are asked which you want on the first connection; the classic layout is the default
-  and skipping the question keeps it
+- **Two layouts, switchable at any time.** **Modern** — server rail, channel sidebar showing who is
+  in every channel, chat in the middle, members on the right — and
+  **Classic**, the original: channels left, members right, voice and status bars along the bottom.
+  In both, a click on a channel previews it and a double click joins it.
+  Modern is the default, inspired by the chat apps most people arrive here from; you are asked
+  which you want on the first connection, a layout you picked is kept, and Classic is one click
+  away in Settings → Appearance
 - Seeing who is in a channel you are not in respects the same rules as everything else: a channel
   that hides its members or has a password shows nobody, an anonymous one shows its pseudonyms, and
   the server decides — the client is told, it does not work it out
-- On a phone the Discord layout is Discord's phone layout: channels swipe in from the left, members
-  from the right, with buttons for both
-- **Four palettes** — VoIPC dark, Discord dark, Discord light, AMOLED black — and every colour in
-  them can be changed individually. Compact messages, chat text size and an interface zoom
-- Drag the sidebars to any width; each layout remembers its own
+- On a phone the modern layout is the phone shape you already know: channels swipe in from the left,
+  members from the right, with buttons for both
+- **Four palettes** — Slate dark (the default), Slate light, VoIPC dark, AMOLED black — and every
+  colour in them can be changed individually. A fresh install follows your system's light/dark
+  setting and opens in Slate dark or Slate light; once you pick one it is yours and the system
+  stops deciding. Compact messages, chat text size and an interface zoom
+- Drag the modern layout's sidebars to any width, double-click a divider to put it back, and fold
+  the member list away; each layout remembers its own widths
 
 **Text Chat**
 - Channel and direct messages, both end-to-end encrypted
@@ -188,7 +204,7 @@ Chat messages (channel and DM) use the **Signal Protocol** from the official [li
 - **Curve25519** identity keys (32-byte) with Ed25519 signed pre-keys
 - **100 one-time pre-keys** per user, auto-replenished
 - **Sender Keys** for efficient group/channel message encryption
-- **Perfect Forward Secrecy** — a compromised key cannot decrypt past messages
+- **Perfect Forward Secrecy** — a compromised key cannot decrypt past messages. For channel chat the matching guarantee runs the other way and is what key rotation is for: a chain key stolen today would read *future* messages, so leaving a channel starts a new chain
 - **Ephemeral identities by design** — a fresh identity key pair is generated for every connection and never written to disk. There are no accounts and nothing to fingerprint or link across sessions. The trade-off is explicit: pre-key bundles come from the server, so protection against an *actively malicious* server substituting keys during session setup is not a goal; protection against a passive or compromised-at-rest server is.
 
 ### Layer 3: Media — AES-256-GCM on every packet
@@ -196,11 +212,13 @@ Chat messages (channel and DM) use the **Signal Protocol** from the official [li
 All voice, video, and screen share audio is encrypted with **AES-256-GCM** (via the `ring` crate):
 
 - Per-channel 256-bit symmetric key, randomly generated
-- Deterministic nonce: `session_id(4) || sequence(4) || extra(4)` — prevents reuse by construction; domain-separated per stream type (voice / screen audio / video)
+- Deterministic nonce: `stream_id(4) || sequence(4) || type+fragment(4)` — prevents reuse by construction; domain-separated per stream type (voice / screen audio / video). `stream_id` is four random bytes the **sender** picks for itself on joining, carried in the packet header. Two members of a channel encrypt under the same key, so it is what keeps them off each other's nonces — and it is chosen by the client rather than the server, because a server that handed two speakers the same identifier would otherwise get the XOR of their voices
 - 16-byte authentication tag on every packet — detects tampering
 - AAD (Additional Authenticated Data) binds channel_id + packet_type — blocks cross-channel replay
 - Mandatory key rotation after ~4.3 billion packets
 - Media keys are generated by the first member of a channel and handed to each joiner over the pairwise Signal session; the server relays the encrypted blob and never holds a media key
+- **Rotated when somebody leaves**, so the key does not outlive the membership it was given for: the lowest remaining user id mints the next generation and hands it to the others, with no coordination and nobody elected by the server. The generation before stays usable for a moment, so packets already in flight are not an audible gap — which is also the window in which a member who just left can still read what was sent under the old key. Generations are a counter that wraps rather than a number that runs out, so no member can send the last one on the way out and freeze the channel on the key they are walking away with
+- **Taken only from a member of the channel it names**, and only for the room the client is standing in. A media key is the key the microphone encrypts under, so a key offered by somebody the roster does not put in the channel is refused before it is even opened
 - Plaintext media packet types are never sent and are dropped by both server and clients
 
 ### Layer 4: Local Storage — AES-256-GCM + PBKDF2
@@ -350,6 +368,7 @@ host = "::"               # Bind address — "::" serves IPv6 and IPv4 from one 
 tcp_port = 9987           # HTTPS page for the browser client
 udp_port = 9987           # QUIC endpoint (all clients) — keep equal to tcp_port so one host:port reaches both
 max_users = 64
+max_connections_per_ip = 32   # A browser client holds two of these, a native client one — so 32 is sixteen browser users behind one NAT
 cert_path = "certs/server.crt"
 key_path = "certs/server.key"
 admin_token = "change-me"  # optional; unset = a random token is printed in the log at every start
@@ -381,12 +400,32 @@ Runtime settings in `server_settings.json`:
 |---|---|---|
 | `proximity` | `"off"` | `"2d"` or `"3d"` makes it a proximity room |
 | `hidden` | `false` | Not listed in the sidebar for non-admins. It can still be joined — by an invite link, by the game SDK, or by anyone who knows it is there — so it is out of the way, not locked. Give a channel a `password` if you need it shut, and both if it is the one your game drives |
-| `anonymous` | `false` | Members see each other as `Guest-1234`, a fresh name per visit. The server substitutes it everywhere, so no client ever learns the real one; admins see the real names, and no chat history is handed over in such a channel |
+| `anonymous` | `false` | Members see each other as `Guest-1234`, a fresh name per visit. The server substitutes it everywhere, so no client ever learns the real one; admins see the real names, and no chat history is handed over in such a channel. Voice channels only, and it hides a name rather than a person: user ids are the same everywhere, so somebody who is also in a channel where you can see them can be matched up by id — which is why a text channel, one you are in *besides* the voice channel you stand in, may not be anonymous at all |
 | `screen_share` | `true` | `false` refuses screen sharing there |
-| `hide_members` | `false` | Non-admins see no member list, only whoever is speaking (and can still adjust their volume) |
+| `hide_members` | `false` | Non-admins see no member list, only whoever is speaking (and can still adjust their volume). Nobody outside is told who joins or leaves either — only that the count changed — which is the same rule a password channel follows |
 | `routed` | `false` | The server forwards each voice only to whoever should hear it, instead of to every member. For a channel a game drives, where "every member" can be a whole map. **The one option that tells this server anything about who hears whom** — members in such a channel say which of the others they want to hear, and a game server with `game_token` may narrow that further. Positions, names and audio stay as unreadable to it as ever. Everyone joining is told, and the channel is marked **R** |
+| `text` | `false` | Makes it a **text channel**: no voice, no screen share, no proximity. Joining one is a subscription rather than a move, so any number can be open at once and none of them costs the voice channel you stand in |
+| `message_ttl_secs` | `0` | A **message destruction timer**: seconds a message written here lives before every client deletes it, `0` for none. Up to 30 days. The server stores no chat and deletes nothing — this is what the channel tells its members, and each client stamps it on what it sends, inside the encryption where the relay cannot reach it. It applies to what is written from then on, not to what people already have |
+| `auto_join` | `false` | Only with `text`. Clients join this channel on connect. A user who leaves it is not brought back — the client remembers that, which is why the server joins nobody by itself. There is no limit on how many a client holds: the budgets that pay for joining them are sized from how many channels this server has |
 
 The creator of a channel, or any admin, can change these at runtime through the channel's gear icon. Channels from `channels.json` have no creator, so those are admin-only.
+
+**Text channels.** A voice channel is still one at a time: joining another moves you. A text channel is not — you subscribe to as many as you like, read them while sitting in a voice room, and leave one from the ✕ on its row. Clicking a text channel you are not in reads it rather than joining it; entering is a button in the chat pane, so a stray click never puts you back in a channel you left. Anyone can create one at runtime too (the + button, then *Text*), and like any user-created channel it disappears once the last member leaves and the empty-channel timeout passes. Messages are end-to-end encrypted the same way voice-channel chat is, one sender-key group per channel, and each message is bound to its channel inside the ciphertext — a relay cannot show it as belonging to another one. When somebody leaves a channel, the next message sent there starts a fresh key chain, so a former member stops being able to read along.
+
+**Messages can be given a destruction timer.** Off everywhere by default. A channel's creator, or an admin, sets one from the channel's gear icon — five minutes to seven days — and from then on every message written there is deleted by every client once its time is up, including from the copies members have handed to people who joined later. A direct message has no channel to take that from, so there the clock icon in the chat header is your own: it travels with the messages you send, and the other side deletes them when it runs out.
+
+The timer rides inside the encryption, next to the message, so the relay can neither read it nor change it. A deadline is worked out once, when a message arrives, from the message's own timestamp — which is why every copy of it goes at the same moment rather than a few minutes apart. What a member re-sharing a conversation claims about a message is only ever the outer bound: the channel's own timer applies to what they hand over too, including to a message they strip it from, and a copy of something you already hold can bring its deletion forward but never push it back. What that does not do is make a member trustworthy: somebody who was there can always keep their own copy of what they read, whatever the timer says. It is a rule about the app, not about people.
+
+**Chat history is opt-in, shared between members, and yours to delete.** The server stores no messages, so a channel's past reaches a newcomer only because members offer it.
+
+Because it reaches them that way, it is that member's word: identities are ephemeral and never stored, so there is nothing that signs an archived message and nothing to check one against. Messages that arrive as history are therefore shown as second-hand, and stay second-hand when they are passed on — a member who invents a conversation and attributes it to somebody else can be believed, but never mistaken for the person they are quoting.
+
+- **Who shares** is visible: a member who answers requests is marked in the member list. It is one flag per person, like mute, and the only thing about chat the server is told — it has always seen the requests go past. Turn it off under Settings → Data
+- **Several people are asked, and the answers are merged.** Whoever was away holds the older half of a conversation, whoever just arrived holds only the newest. A newcomer asks up to three members who share, and what comes back is folded into one history in order. Each message carries an id minted by its sender inside the encryption, so two copies of the same message are recognised as one; a divider shows which part came from whom
+- **Deleting is permanent.** Clearing a channel records what was there, and nothing older is merged back in — so what you deleted stays deleted, however often a member re-offers it. The history button in the chat header asks the sharers again and takes that back, for when you cleared it by accident
+- **History is kept per server**, and on desktop in an encrypted file you unlock with a password (Settings → Data, or turn it off and keep chat in memory only). Two servers' `#general` are two conversations, which also means a server cannot ask for what its users wrote somewhere else
+- **Conversations are filed by server and by the name of the person**, so a DM you had yesterday is not shown as one with whoever happens to hold that user id today. Which also means a name is what a conversation follows: on a server where somebody else takes a name after its owner leaves, the two look like one person to your archive — there are no accounts, and the server only keeps a name unique while the person holding it is online
+- **What the server can still do:** it decides who is in a channel, so it can place somebody there and the members will hand them a key. End-to-end encryption means the server cannot read what is said — not that it cannot add a listener. It has to do it in the open, though: a client accepts a sender key, accepts a media key, answers a request for history and shows a message only from somebody the roster says is in the channel with it, so an added listener is one the member list shows. Accounts with lasting identities are what would close the gap entirely, and they are not here yet
 
 **Server administration:** there are no accounts; any connected user becomes admin for their session by entering the admin token (status bar → shield icon). Set `admin_token` in `server.toml`, pass `--admin-token`, or export `VOIPC_ADMIN_TOKEN`; without one the server prints a fresh random token in its log at every start. Admins can kick users from channels or from the server and ban an IP for 1 h, 24 h or until restart — everyone behind that IP is affected, and bans live in memory only. Other users see a shield next to an admin's name. Three wrong tokens disconnect the session.
 

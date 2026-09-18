@@ -10,6 +10,7 @@ import {
   applyTheme,
   paletteById,
   resolveTokens,
+  systemDefaultPaletteId,
 } from "../theme.js";
 import {
   defaultUiPrefs,
@@ -63,11 +64,32 @@ let lastSaved: string | null = null;
 let hydrated = false;
 
 /**
+ * Whether a layout may be painted yet.
+ *
+ * Deliberately not the same flag as `hydrated` above, which guards *writing*: a
+ * config that failed to load must still render — with the defaults — but must
+ * never be written back over the file it failed to read. Without this the first
+ * painted frame is the default layout, which for anybody who chose the other
+ * one is the wrong shell for as long as the config round trip takes.
+ */
+export const uiPrefsReady = writable(false);
+
+/**
  * Adopt the `ui_prefs` blob from `load_config`. Called once, from App.svelte's
  * config hydration, before anything renders a layout.
  */
 export function hydrateUiPrefs(raw: unknown): void {
   const clean = sanitizeUiPrefs(raw);
+  // Nobody has chosen a palette on this install, so the machine's own
+  // light/dark setting decides which of the two default palettes to open in.
+  // Once somebody picks one it is stored, and this never runs again — the OS
+  // switching to light at sunset must not repaint an app somebody set to dark.
+  const chosen = raw && typeof raw === "object" && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>).palette
+    : undefined;
+  if (typeof chosen !== "string" || chosen === "") {
+    clean.palette = systemDefaultPaletteId();
+  }
   unknownKeys = {};
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
@@ -77,6 +99,7 @@ export function hydrateUiPrefs(raw: unknown): void {
   uiPrefs.set(clean);
   lastSaved = serialize(clean);
   hydrated = true;
+  uiPrefsReady.set(true);
 }
 
 /** The exact object `set_ui_prefs` would be handed, as a comparable string. */

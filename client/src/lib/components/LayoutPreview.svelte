@@ -14,17 +14,25 @@
   }
   let { layout, selected, onpick }: Props = $props();
 
-  const title = $derived(layout === "discord" ? "Discord style" : "Classic");
+  const title = $derived(layout === "modern" ? "Modern" : "Classic");
   const blurb = $derived(
-    layout === "discord"
-      ? "Server rail, channels with the people in them, chat in the middle, members on the right. One click joins a channel."
-      : "Channels on the left, members on the right, voice and status bars along the bottom. Click to look, double click to join.",
+    layout === "modern"
+      ? "The default. Server rail, channels with the people in them, chat in the middle, members on the right. Click to look, double click to join."
+      : "VoIPC's original arrangement. Channels on the left, members on the right, voice and status bars along the bottom. Click to look, double click to join.",
   );
 </script>
 
-<button class="layout-choice" class:selected onclick={onpick} aria-pressed={selected}>
-  <span class="wire" class:discord={layout === "discord"} aria-hidden="true">
-    {#if layout === "discord"}
+<!-- `data-layout` so test-ui.mjs can click a named layout rather than the
+     second button in a row, which is what it did until the two were renamed. -->
+<button
+  class="layout-choice"
+  class:selected
+  data-layout={layout}
+  onclick={onpick}
+  aria-pressed={selected}
+>
+  <span class="wire" class:modern={layout === "modern"} aria-hidden="true">
+    {#if layout === "modern"}
       <span class="w-rail"></span>
       <span class="w-side">
         <span class="w-row"></span>
@@ -94,7 +102,7 @@
     overflow: hidden;
   }
 
-  .wire.discord {
+  .wire.modern {
     flex-direction: row;
   }
 

@@ -2,7 +2,7 @@
   // The virtual room, the mixing desk and a screen share, full screen.
   //
   // VoIPC's centre column is a slot the classic layout swaps between chat, room
-  // and mixer. Discord has no such column and no equivalent of any of these, so
+  // and mixer. This layout has no such column and nothing equivalent, so
   // in this layout they take the whole window and close with Escape — the shape
   // Discord uses for an Activity.
   //

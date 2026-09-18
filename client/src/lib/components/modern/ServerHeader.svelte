@@ -1,5 +1,5 @@
 <script lang="ts">
-  // The server name across the top of the sidebar, with Discord's dropdown.
+  // The server name across the top of the sidebar, with its dropdown.
 
   import { isAdmin, serverAddress } from "../../stores/connection.js";
   import { copyInviteLink } from "../../stores/channel-ui.js";
@@ -12,6 +12,14 @@
   import { addNotification } from "../../stores/notifications.js";
   import { updateUiPrefs } from "../../stores/ui-prefs.js";
   import Icon from "../Icons.svelte";
+
+  interface Props {
+    /** The shell's own way into Settings. The gear in the user panel is the
+     *  other one, and on a phone it is at the very bottom of a drawer — which
+     *  is exactly where a system navigation bar sits. */
+    onopensettings?: () => void;
+  }
+  let { onopensettings }: Props = $props();
 
   let open = $state(false);
 
@@ -70,6 +78,18 @@
         <span>{$isAdmin ? "Active bans" : "Admin login"}</span>
       </button>
       <div class="menu-sep"></div>
+      {#if onopensettings}
+        <button
+          class="menu-item"
+          onclick={() => {
+            open = false;
+            onopensettings?.();
+          }}
+        >
+          <Icon name="settings" size={16} />
+          <span>Settings</span>
+        </button>
+      {/if}
       <button
         class="menu-item"
         onclick={() => {

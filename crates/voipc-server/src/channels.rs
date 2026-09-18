@@ -57,6 +57,25 @@ pub struct ChannelEntry {
     /// anything about who hears whom, so it is off unless asked for.
     #[serde(default)]
     pub routed: bool,
+
+    /// A text channel: joining it is a subscription rather than a move, so
+    /// several can be open at once and none of them costs the user their voice
+    /// channel. Voice, screen share and proximity do not apply.
+    #[serde(default)]
+    pub text: bool,
+
+    /// Clients join this text channel on connect. Only meaningful with
+    /// `text`; a user who leaves it is not re-joined, which the client
+    /// remembers — the server joins nobody by itself.
+    #[serde(default)]
+    pub auto_join: bool,
+
+    /// Seconds a message written here is meant to live; 0 (the default) is no
+    /// timer. The server stores no chat and enforces nothing — this is what
+    /// the channel tells its members, and each client stamps it on what it
+    /// sends and applies it to what it keeps.
+    #[serde(default)]
+    pub message_ttl_secs: u32,
 }
 
 fn default_true() -> bool {
@@ -79,6 +98,9 @@ impl Default for ChannelEntry {
             screen_share: true,
             hide_members: false,
             routed: false,
+            text: false,
+            auto_join: false,
+            message_ttl_secs: 0,
         }
     }
 }
@@ -123,7 +145,12 @@ fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
         if name.is_empty() {
             bail!("channel entry {} has an empty name", i);
         }
-        if name.to_lowercase() == "general" {
+        // Reserved for the built-in lobby, which is a voice channel (id 0).
+        // A *text* channel called general is a different thing and cannot be
+        // confused with it — it is the one `channels.example.json` ships and
+        // auto-joins everybody into, and until this distinction existed the
+        // server refused to start on its own example file.
+        if !entry.text && name.to_lowercase() == "general" {
             bail!("channel entry {} uses reserved name 'General'", i);
         }
         if name.chars().any(|c| c.is_control()) {
@@ -132,9 +159,36 @@ fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
         if name.len() > 64 {
             bail!("channel '{}' name exceeds 64 characters", name);
         }
+        // The channel list is one message to every client on every connect,
+        // and a message over 64 KiB cannot be framed at all — so it is not
+        // sent, and everybody arrives at a server that appears to have no
+        // channels. The name is bounded above; the description is the other
+        // field big enough to get there on its own.
+        if entry.description.len() > 256 {
+            bail!("channel '{}' description exceeds 256 characters", name);
+        }
+        // The same bound a message's own timer gets, and the same reason: a
+        // channel advertising a year is advertising "never" in a way that reads
+        // like a setting.
+        if entry.message_ttl_secs > 30 * 24 * 60 * 60 {
+            bail!(
+                "channel '{}' message_ttl_secs exceeds 30 days ({})",
+                name,
+                entry.message_ttl_secs
+            );
+        }
         let lower = name.to_lowercase();
         if !seen_names.insert(lower) {
             bail!("duplicate channel name: '{}'", name);
+        }
+        if entry.auto_join && !entry.text {
+            bail!("channel '{}' has 'auto_join' without 'text'", name);
+        }
+        if entry.text && entry.anonymous {
+            // A pseudonym only hides someone who is nowhere else. A text
+            // channel is one you are in besides the voice channel you stand
+            // in, and the user id is the same in both rosters.
+            bail!("channel '{}' cannot be both 'text' and 'anonymous'", name);
         }
         if entry.password.is_some() && entry.password_hash.is_some() {
             bail!(
@@ -394,6 +448,9 @@ mod tests {
             screen_share: false,
             hide_members: true,
             routed: true,
+            text: false,
+            auto_join: false,
+            message_ttl_secs: 0,
         }];
         assert!(hash_plaintext_passwords(&mut entries));
         let json = serde_json::to_string(&entries).unwrap();
@@ -401,5 +458,37 @@ mod tests {
         assert_eq!(back[0].proximity, ProximityMode::TwoD);
         assert!(back[0].hidden && back[0].anonymous && back[0].hide_members && back[0].routed);
         assert!(!back[0].screen_share, "sharing must stay switched off");
+    }
+
+    #[test]
+    fn text_and_auto_join_load_and_validate() {
+        let entries: Vec<ChannelEntry> = serde_json::from_str(
+            r#"[{"name":"general","text":true,"auto_join":true},
+                {"name":"offtopic","text":true},
+                {"name":"Music"}]"#,
+        )
+        .unwrap();
+        assert!(entries[0].text && entries[0].auto_join);
+        assert!(entries[1].text && !entries[1].auto_join);
+        // A file written before text channels existed gives a voice room
+        assert!(!entries[2].text && !entries[2].auto_join);
+        assert!(validate_entries(&entries).is_ok());
+
+        // auto_join is meaningless without text, and silently ignoring it
+        // would leave an admin wondering why nobody lands there
+        let bad: Vec<ChannelEntry> =
+            serde_json::from_str(r#"[{"name":"Music","auto_join":true}]"#).unwrap();
+        let err = validate_entries(&bad).unwrap_err().to_string();
+        assert!(err.contains("auto_join"), "{err}");
+    }
+
+    #[test]
+    fn a_text_channel_cannot_be_anonymous() {
+        // Pseudonyms cannot hide anybody there: the same user id appears in
+        // the voice channel the member stands in, under their real name.
+        let bad: Vec<ChannelEntry> =
+            serde_json::from_str(r#"[{"name":"secrets","text":true,"anonymous":true}]"#).unwrap();
+        let err = validate_entries(&bad).unwrap_err().to_string();
+        assert!(err.contains("anonymous"), "{err}");
     }
 }

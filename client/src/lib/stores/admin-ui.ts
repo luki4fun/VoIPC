@@ -1,7 +1,7 @@
 // The server-admin token login and the active-bans list.
 //
 // State and commands only; the markup is AdminDialogs.svelte, mounted once by
-// App.svelte. Lifted out of the status bar because the Discord layout has no
+// App.svelte. Lifted out of the status bar because the modern layout has no
 // status bar — it shows the same shield in its voice panel — and because an
 // admin dialog is not something to have two copies of.
 

@@ -2,7 +2,7 @@
 ///
 /// Stateful across calls: the last input sample is carried over so chunk
 /// boundaries interpolate seamlessly.
-// ponytail: linear interp; swap for rubato if voice quality complaints arrive
+// bernd: linear interp; swap for rubato if voice quality complaints arrive
 pub struct LinearResampler {
     /// Input samples advanced per output sample (rate_in / rate_out).
     step: f64,

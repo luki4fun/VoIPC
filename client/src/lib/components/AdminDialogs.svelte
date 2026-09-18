@@ -2,7 +2,7 @@
   // Admin token login, and the list of active bans.
   //
   // Mounted once by App.svelte. Both layouts have a shield button somewhere —
-  // the classic status bar, the Discord voice panel — and both open these.
+  // the classic status bar, the modern layout's voice panel — and both open these.
 
   import {
     adminToken,

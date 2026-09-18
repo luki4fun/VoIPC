@@ -7,7 +7,8 @@ use ring::aead::LessSafeKey;
 use tokio::sync::{mpsc, RwLock};
 
 use voipc_audio::spatial::{Effect, Gains, Listener, Source};
-use voipc_crypto::media_keys::MediaKey;
+use voipc_crypto::media_keys::MediaKeyRing;
+use voipc_crypto::ChannelKeying;
 use voipc_crypto::stores::SignalStores;
 use voipc_protocol::types::*;
 
@@ -162,8 +163,18 @@ impl AppState {
 pub struct PendingMessage {
     /// Channel message (channel_id) or direct message (target_user_id).
     pub target: PendingTarget,
+    /// The id this message was shown under locally. Kept so the copy that
+    /// eventually goes out carries the same one every receiver will file it by.
+    /// Empty for a direct message, which needs no id (DMs are never shared).
+    pub id: String,
     /// The plaintext message content.
     pub content: String,
+    /// The destruction timer this message was written under, in seconds.
+    ///
+    /// Kept with the message rather than read again when the queue drains: the
+    /// timer belongs to what the user wrote, and a channel whose policy changed
+    /// while their message sat here must not silently rewrite it.
+    pub ttl_secs: Option<u32>,
     /// When the message was queued (for timeout/cleanup).
     pub queued_at: std::time::Instant,
 }
@@ -188,15 +199,13 @@ pub struct SignalState {
     pub pending_sessions: HashSet<u32>,
     /// Users we have established pairwise Signal sessions with.
     pub established_sessions: HashSet<u32>,
-    /// channel_id → set of user_ids we've sent our sender key to.
-    pub sender_key_distributed: HashMap<u32, HashSet<u32>>,
-    /// channel_id → set of user_ids whose sender keys we've received.
-    pub sender_key_received: HashMap<u32, HashSet<u32>>,
     /// Messages queued while waiting for encryption to be established.
     pub pending_messages: Vec<PendingMessage>,
-    /// Channel we entered with members already in it: ask the first member
-    /// whose sender key arrives for recent chat (once per entry, 0 = none).
-    pub history_wanted_channel: u32,
+    /// Who is in which channel, and which of them hold which of our keys.
+    ///
+    /// Shared with the browser build rather than written twice: see
+    /// `voipc_crypto::ChannelKeying`.
+    pub channels: ChannelKeying,
 }
 
 impl Default for SignalState {
@@ -207,10 +216,8 @@ impl Default for SignalState {
             own_user_id: None,
             pending_sessions: HashSet::new(),
             established_sessions: HashSet::new(),
-            sender_key_distributed: HashMap::new(),
-            sender_key_received: HashMap::new(),
             pending_messages: Vec::new(),
-            history_wanted_channel: 0,
+            channels: ChannelKeying::default(),
         }
     }
 }
@@ -254,7 +261,7 @@ pub struct ActiveConnection {
     pub is_muted: Arc<AtomicBool>,
     pub is_deafened: Arc<AtomicBool>,
     /// Sender for control messages (framed, onto the control stream).
-    pub tcp_tx: mpsc::Sender<Vec<u8>>,
+    pub tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
     /// Sender for voice packets (QUIC datagrams).
     pub voice_tx: mpsc::Sender<Vec<u8>>,
     /// Sender for video fragments (one QUIC stream per frame).
@@ -330,7 +337,7 @@ pub struct ActiveConnection {
     pub screen_video_resolution: Arc<AtomicU32>,
     /// Current channel's media encryption key (shared with capture/receive tasks).
     /// Updated when the user joins a channel or receives a new media key.
-    pub current_media_key: Arc<std::sync::Mutex<Option<MediaKey>>>,
+    pub current_media_key: Arc<std::sync::Mutex<MediaKeyRing>>,
     /// Current channel ID — tracked for AAD construction in media encryption.
     pub current_channel_id: Arc<AtomicU32>,
     // ── Voice activation state ──
@@ -614,7 +621,7 @@ impl SpatialState {
             Some(src) => {
                 // Only the base render glides: a layer is not a claim about a
                 // place in the world, and the mixer ramps its gains across the
-                // frame anyway. ponytail: give layers their own motion map if
+                // frame anyway. bernd: give layers their own motion map if
                 // a mod ever moves one fast enough to hear it step.
                 let placed = match self.motion.get(&key) {
                     // A direct source has no position to interpolate

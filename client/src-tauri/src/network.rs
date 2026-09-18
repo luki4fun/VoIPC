@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
@@ -11,11 +11,11 @@ use tauri::Emitter;
 // through the handle, and those run on every platform even though the SDK
 // listener itself does not exist on Android.
 use tauri::Manager;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use wtransport::error::SendDatagramError;
 use wtransport::{Connection, SendStream};
 
-use voipc_crypto::media_keys::MediaKey;
+use voipc_crypto::media_keys::{MediaKey, MediaKeyRing};
 use voipc_protocol::codec::{
     decode_server_msg, encode_client_msg, try_decode_frame, APP_VERSION, PROTOCOL_VERSION,
 };
@@ -220,18 +220,17 @@ pub async fn connect_to_server(
 
     info!(user_id, session_id, "authenticated with server");
 
-    // Reset Signal tracking state for the new connection.
-    // User IDs are allocated fresh by the server, so old session tracking is stale.
-    // Keep `stores` and `initialized` — identity key persists within app session,
-    // and old sessions in the store will be overwritten on re-establishment.
+    // Reset Signal tracking state for the new connection. User ids are
+    // allocated fresh by the server, so everything keyed by one is stale — and
+    // the stores themselves were dropped at the top of this function, where a
+    // fresh identity is minted for the connection.
     {
         let mut signal = state.signal.lock().map_err(|e| e.to_string())?;
         signal.own_user_id = Some(user_id);
         signal.established_sessions.clear();
         signal.pending_sessions.clear();
-        signal.sender_key_distributed.clear();
-        signal.sender_key_received.clear();
         signal.pending_messages.clear();
+        signal.channels.clear();
     }
 
     // Start audio playback stream (output to speakers). Failure is not fatal:
@@ -254,8 +253,20 @@ pub async fn connect_to_server(
     let output_device_live = Arc::new(std::sync::Mutex::new(output_device));
     let master_volume = Arc::new(AtomicU32::new(saved_volume.to_bits()));
 
-    // Control writer channel
-    let (tcp_tx, tcp_rx) = mpsc::channel::<Vec<u8>>(64);
+    // Control writer channel.
+    //
+    // Unbounded, which is the one queue here that has to be. It holds a whole
+    // connect — on a full server that is a pre-key bundle request per person
+    // and then a key per person per channel, which is thousands of messages on
+    // a large one — and the writer lets them out at the rate the server accepts
+    // (`ControlPacer`) rather than all at once. The queue is what decouples the
+    // two, and a bounded one does not decouple them at all: the task that
+    // produces most of those sends is the control *reader*, so a full queue
+    // parks it mid-send and it stops reading the socket, for as long as the
+    // pacer takes to drain — while the server, its own queue full, silently
+    // drops the keys arriving for us. What bounds it is the other end: every
+    // message in here answers something the server sent.
+    let (tcp_tx, tcp_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     // Voice datagram channel
     let (voice_tx, voice_rx) = mpsc::channel::<Vec<u8>>(256);
     // Video channel (separate from voice to avoid blocking).
@@ -271,7 +282,7 @@ pub async fn connect_to_server(
     let screen_audio_recv_count = Arc::new(AtomicU32::new(0));
     let transmitting = Arc::new(AtomicBool::new(false));
     let screen_audio_enabled = Arc::new(AtomicBool::new(true));
-    let current_media_key = Arc::new(std::sync::Mutex::new(None));
+    let current_media_key = Arc::new(std::sync::Mutex::new(MediaKeyRing::default()));
     let current_channel_id = Arc::new(AtomicU32::new(0));
 
     // Screen share video stats
@@ -553,20 +564,34 @@ pub async fn connect_to_server(
                 send_tcp_message(&c.tcp_tx, &ClientMessage::SetDeafened { deafened: true }).await;
         }
     }
+    // ...and whether we answer requests for recent chat, so the people here
+    // can see who asking would reach.
+    {
+        let enabled = state.config().share_channel_history;
+        if let Some(c) = conn.as_ref() {
+            let _ = send_tcp_message(
+                &c.tcp_tx,
+                &ClientMessage::SetHistorySharing { enabled },
+            )
+            .await;
+        }
+    }
 
     Ok(user_id)
 }
 
 /// Send a client message over the control stream.
 pub async fn send_tcp_message(
-    tcp_tx: &mpsc::Sender<Vec<u8>>,
+    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
     msg: &ClientMessage,
 ) -> Result<(), String> {
     let data =
         encode_client_msg(msg).map_err(|e| format!("Failed to encode message: {}", e))?;
+    // Never waits: the queue is unbounded and the pacer downstream is what
+    // decides when this actually goes out. Still `async` because every caller
+    // is, and because what it does is send a message over a network.
     tcp_tx
         .send(data)
-        .await
         .map_err(|_| "TCP send channel closed".to_string())
 }
 
@@ -595,12 +620,72 @@ fn parse_address(address: &str) -> Result<(String, u16), String> {
     Ok((host, port))
 }
 
-/// Control writer task: sends encoded messages from the channel to the control stream.
+/// Paces our control messages to just under what the server accepts.
+///
+/// The server charges a token per frame before it decodes one, and a frame
+/// that cannot pay is dropped — silently, because answering a flood is one
+/// more message going out. An honest client can reach that rate without
+/// meaning any harm: arriving on a busy server is a pre-key bundle request per
+/// person, then a sender key per person per channel. What it loses there is
+/// exactly what it cannot afford to lose — a key that never arrives is a
+/// member who cannot read the channel, with nothing on screen to say why.
+///
+/// So the budget is known at both ends (`CONTROL_MSGS_PER_SEC`) and we stay
+/// under it: a burst goes out at once, and the rest waits its turn in the
+/// queue that already exists between the app and this task.
+struct ControlPacer {
+    tokens: f64,
+    last: tokio::time::Instant,
+}
+
+impl ControlPacer {
+    /// Four fifths of what the server allows. The fifth is for the difference
+    /// between two clocks and for the keepalives we do not count here.
+    const RATE: f64 = voipc_protocol::codec::CONTROL_MSGS_PER_SEC as f64 * 0.8;
+
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            tokens: Self::RATE,
+            last: now,
+        }
+    }
+
+    /// Take a token for one message and say how long it has to wait for it.
+    /// Pure, so the arithmetic is checkable without a clock.
+    fn take(&mut self, now: tokio::time::Instant) -> std::time::Duration {
+        let elapsed = now.duration_since(self.last).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * Self::RATE).min(Self::RATE);
+        self.last = now;
+        let wait = if self.tokens < 1.0 {
+            let deficit = 1.0 - self.tokens;
+            self.tokens = 1.0;
+            self.last = now + std::time::Duration::from_secs_f64(deficit / Self::RATE);
+            std::time::Duration::from_secs_f64(deficit / Self::RATE)
+        } else {
+            std::time::Duration::ZERO
+        };
+        self.tokens -= 1.0;
+        wait
+    }
+
+    /// Wait until one more message may go out.
+    async fn acquire(&mut self) {
+        let wait = self.take(tokio::time::Instant::now());
+        if !wait.is_zero() {
+            tokio::time::sleep(wait).await;
+        }
+    }
+}
+
+/// Control writer task: sends encoded messages from the channel to the control
+/// stream, at a rate the server will accept (see `ControlPacer`).
 async fn control_writer_task<W: AsyncWrite + Unpin>(
     mut write_half: W,
-    mut rx: mpsc::Receiver<Vec<u8>>,
+    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
+    let mut pacer = ControlPacer::new(tokio::time::Instant::now());
     while let Some(data) = rx.recv().await {
+        pacer.acquire().await;
         if let Err(e) = write_half.write_all(&data).await {
             error!("control write error: {}", e);
             break;
@@ -618,10 +703,10 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     mut read_half: R,
     mut buf: BytesMut,
     app_handle: tauri::AppHandle,
-    media_key: Arc<std::sync::Mutex<Option<MediaKey>>>,
+    media_key: Arc<std::sync::Mutex<MediaKeyRing>>,
     channel_id: Arc<AtomicU32>,
     signal: Arc<std::sync::Mutex<SignalState>>,
-    tcp_tx: mpsc::Sender<Vec<u8>>,
+    tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
     own_user_id: u32,
     screen_share_active: Arc<AtomicBool>,
     watching_user_id_shared: Arc<AtomicU32>,
@@ -758,6 +843,31 @@ fn on_channel_changed(
     apply_channel_proximity(spatial, cache, channel_id, app_handle);
 }
 
+/// The members of a roster we would ask for recent chat, picked by
+/// `voipc_crypto::history_sources` — this only turns rosters into the pairs it
+/// asks for. An empty answer means nobody here shares, and nothing is sent.
+fn history_sources_of(users: &[UserInfo], own_user_id: u32) -> HashSet<u32> {
+    let pairs: Vec<(u32, bool)> = users
+        .iter()
+        .map(|u| (u.user_id, u.shares_history))
+        .collect();
+    voipc_crypto::history_sources(&pairs, own_user_id)
+}
+
+/// Whether a channel id names a text channel, according to the list the
+/// server sent. Unknown ids read as "not text", which is the safe way round:
+/// the voice path is what every existing channel takes.
+fn is_text_channel(cache: &Arc<std::sync::Mutex<Vec<ChannelInfo>>>, channel_id: u32) -> bool {
+    cache
+        .lock()
+        .ok()
+        .map(|list| {
+            list.iter()
+                .any(|c| c.channel_id == channel_id && c.text)
+        })
+        .unwrap_or(false)
+}
+
 /// Point the mixer at the proximity mode of the channel we are in. Leaving a
 /// proximity channel drops every placement, so a stale layout can never leak
 /// into the next channel.
@@ -809,10 +919,10 @@ fn apply_channel_proximity(
 async fn handle_server_message(
     msg: ServerMessage,
     app_handle: &tauri::AppHandle,
-    media_key: &Arc<std::sync::Mutex<Option<MediaKey>>>,
+    media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
     channel_id_store: &Arc<AtomicU32>,
     signal: &Arc<std::sync::Mutex<SignalState>>,
-    tcp_tx: &mpsc::Sender<Vec<u8>>,
+    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
     own_user_id: u32,
     screen_share_active: &Arc<AtomicBool>,
     watching_user_id_shared: &Arc<AtomicU32>,
@@ -862,25 +972,94 @@ async fn handle_server_message(
             let _ = app_handle.emit("channel-list", &channels);
         }
         ServerMessage::UserList { channel_id, users } => {
+            // A text channel is a subscription: it does not move us, so none
+            // of the channel-change teardown below applies — no media key, no
+            // room, no screen share, and the channel we stand in is untouched.
+            if is_text_channel(channels_snapshot, channel_id) {
+                let newly = {
+                    let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+                    let newly = sig.channels.join_text(channel_id);
+                    // Who a sender key may go to here, and who one may come
+                    // from (send_sender_key and handle_sender_key_received
+                    // both ask).
+                    sig.channels
+                        .set_members(channel_id, users.iter().map(|u| u.user_id));
+                    if newly {
+                        let SignalState { stores, channels, .. } = &mut *sig;
+                        channels.reset_channel(stores.as_mut(), own_user_id, channel_id);
+                        let sources = history_sources_of(&users, own_user_id);
+                        sig.channels.want_history_from(channel_id, sources);
+                    }
+                    newly
+                };
+                if newly {
+                    info!(channel_id, members = users.len(), "joined text channel");
+                }
+
+                request_prekey_bundles_for_users(&users, own_user_id, signal, tcp_tx).await;
+
+                // A voice channel gets its sender keys through the join dance:
+                // everyone already there reciprocates when the newcomer's key
+                // arrives. Here nobody moved, so the subscriber keys up with
+                // the members it already holds a session with.
+                let established: Vec<u32> = {
+                    let sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+                    users
+                        .iter()
+                        .map(|u| u.user_id)
+                        .filter(|uid| {
+                            *uid != own_user_id && sig.established_sessions.contains(uid)
+                        })
+                        .collect()
+                };
+                for uid in established {
+                    distribute_sender_key_to_user(
+                        channel_id, uid, own_user_id, signal, media_key, tcp_tx,
+                    )
+                    .await;
+                }
+
+                let _ = app_handle.emit(
+                    "user-list",
+                    serde_json::json!({"channel_id": channel_id, "users": users}),
+                );
+                return;
+            }
+
             // Update the Rust-side channel tracking so commands (PTT, chat, etc.)
             // know which channel we're in. This handles server-initiated moves
             // (create_channel auto-join, kicks, invites, etc.)
             let old_ch = channel_id_store.swap(channel_id, Ordering::Relaxed);
+            {
+                let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+                // The room we left is not ours to key any more: its roster,
+                // the record of who holds our chain there and the chain itself
+                // all go, exactly as walking out of a text channel does. (The
+                // roster alone used to go, which left a pending rotation and a
+                // usable chain behind for a room we were no longer in.)
+                if old_ch != channel_id {
+                    let SignalState { stores, channels, .. } = &mut *sig;
+                    channels.forget_channel(stores.as_mut(), own_user_id, old_ch);
+                }
+                sig.channels
+                    .set_members(channel_id, users.iter().map(|u| u.user_id));
+            }
             if old_ch != channel_id {
                 // Clear media key — the new channel's key comes from an
                 // existing member over Signal, or we generate one if alone
                 // (see below, after the user list is known)
                 {
                     let mut mk = media_key.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
-                    *mk = None;
+                    mk.clear();
                 }
                 // Reset sender key state for the new channel
                 {
                     let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
-                    sig.sender_key_distributed.remove(&channel_id);
-                    sig.sender_key_received.remove(&channel_id);
-                    // Members already here → ask the first one we key up with for recent chat
-                    sig.history_wanted_channel = if users.len() > 1 { channel_id } else { 0 };
+                    let SignalState { stores, channels, .. } = &mut *sig;
+                    channels.reset_channel(stores.as_mut(), own_user_id, channel_id);
+                    // Ask the members who share, as each one's key arrives
+                    let sources = history_sources_of(&users, own_user_id);
+                    sig.channels.want_history_from(channel_id, sources);
                 }
                 info!(old_ch, channel_id, "channel changed via UserList");
 
@@ -915,24 +1094,36 @@ async fn handle_server_message(
             )
             .await;
 
-            // Media keys never touch the server: the first member of a
-            // channel generates one; everyone else receives it from an
-            // existing member over a pairwise Signal session
-            // (distribute_sender_key_to_user → distribute_media_key_to_user).
-            let alone = users.len() == 1 && users[0].user_id == own_user_id;
-            if channel_id != 0 && alone {
-                let have_key = media_key
-                    .lock()
-                    .map(|g| g.as_ref().is_some_and(|k| k.channel_id == channel_id))
-                    .unwrap_or(false);
-                if !have_key {
-                    match MediaKey::generate(channel_id, 0) {
-                        Ok(key) => {
-                            install_media_key(media_key, key, app_handle);
-                            info!(channel_id, "generated media key (first member)");
-                        }
-                        Err(e) => error!(channel_id, "media key generation failed: {}", e),
+            // Media keys never touch the server: one member of a channel
+            // generates one; everyone else receives it from an existing member
+            // over a pairwise Signal session (distribute_sender_key_to_user →
+            // distribute_media_key_to_user).
+            //
+            // Which member is the same election that picks who re-keys after
+            // somebody leaves: the lowest user id in the roster. "Whoever is
+            // alone here" would be the obvious rule and was the old one, but
+            // two people arriving in the same instant each see the other in
+            // their first roster, so neither is alone, neither mints, and the
+            // channel has no key at all until somebody leaves and comes back.
+            // Ids only ever increase, so the lowest is the longest-present
+            // member and a newcomer never mints over a key that already
+            // exists; if two do mint at once, `MediaKeyRing::install` settles
+            // it the same way on every client.
+            let have_key = media_key
+                .lock()
+                .map(|g| g.has_channel(channel_id))
+                .unwrap_or(false);
+            let we_mint = {
+                let sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+                sig.channels.media_key_minter(channel_id) == Some(own_user_id)
+            };
+            if channel_id != 0 && !have_key && we_mint {
+                match MediaKey::generate(channel_id, 0, own_user_id) {
+                    Ok(key) => {
+                        install_media_key(media_key, channel_id, key, app_handle);
+                        info!(channel_id, members = users.len(), "generated media key");
                     }
+                    Err(e) => error!(channel_id, "media key generation failed: {}", e),
                 }
             }
 
@@ -953,24 +1144,110 @@ async fn handle_server_message(
                 .await;
             }
 
+            // Somebody joined a channel we are in. Nobody else will tell them
+            // our sender key: a text channel does not move us, so we get no
+            // UserList of our own, and waiting for them to key us first only
+            // works if they happen to have no session with us yet. So the
+            // member does it, here, for voice and text alike.
+            let keyed_up = {
+                let own_channel = channel_id_store.load(Ordering::Relaxed);
+                let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+                // The same question the browser asks, in the same words: is
+                // this a channel we are in? (It used to be "do we hold a
+                // roster for it", which is the same answer by a different
+                // route — one question, one predicate.)
+                if user.user_id != own_user_id && sig.channels.in_channel(own_channel, user.channel_id) {
+                    sig.channels.add_member(user.channel_id, user.user_id);
+                    sig.established_sessions.contains(&user.user_id)
+                } else {
+                    false
+                }
+            };
+            if keyed_up {
+                distribute_sender_key_to_user(
+                    user.channel_id,
+                    user.user_id,
+                    own_user_id,
+                    signal,
+                    media_key,
+                    tcp_tx,
+                )
+                .await;
+            }
+
             let _ = app_handle.emit("user-joined", &user);
         }
         ServerMessage::UserLeft {
             user_id,
             channel_id,
         } => {
+            // Leaving a text channel is not leaving the server: the person is
+            // still online, still someone we DM, still in our voice channel
+            // perhaps. Only that channel's group keys go.
+            if is_text_channel(channels_snapshot, channel_id) {
+                {
+                    let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+                    sig.channels.drop_member(channel_id, user_id);
+                    if user_id == own_user_id {
+                        // Our own chain there goes with the subscription. It
+                        // used to be left behind, so re-joining wrote on the
+                        // key every former member still had.
+                        let SignalState { stores, channels, .. } = &mut *sig;
+                        channels.forget_channel(stores.as_mut(), own_user_id, channel_id);
+                    } else if sig.channels.is_text(channel_id) {
+                        // Somebody else walked out of a channel we are in: the
+                        // chain key they hold must stop working, so our next
+                        // message there starts a new one (rotate_sender_key_if_stale).
+                        sig.channels.note_stale(channel_id);
+                    }
+                }
+                let _ = app_handle.emit(
+                    "user-left",
+                    serde_json::json!({"user_id": user_id, "channel_id": channel_id}),
+                );
+                return;
+            }
+
             // Clean up E2E state for departing user
+            let left_our_room;
             {
                 let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
-                sig.pending_sessions.remove(&user_id);
-                sig.established_sessions.remove(&user_id);
-                for set in sig.sender_key_distributed.values_mut() {
-                    set.remove(&user_id);
+                // The pairwise session stays. It is per person and per
+                // connection, not per room: they are still someone we DM, and
+                // now they may be in text channels with us that a voice leave
+                // says nothing about. Forgetting it made their next appearance
+                // anywhere run X3DH a second time — two session states for one
+                // person, which is the `MAC verification failed` followed by a
+                // decrypt "with PREVIOUS session state" — and made us skip
+                // handing them our sender key when they turned up next door.
+                // Only the channel they left. Walking out of a voice room says
+                // nothing about the text channels we still share with them, and
+                // forgetting those keys there would leave both sides unable to
+                // read the other with nothing left to trigger a re-key.
+                sig.channels.drop_member(channel_id, user_id);
+                // They kept the chain key of every channel we shared; our next
+                // message in the one we stand in starts a fresh one.
+                if user_id != own_user_id && channel_id == channel_id_store.load(Ordering::Relaxed) {
+                    sig.channels.note_stale(channel_id);
                 }
-                for set in sig.sender_key_received.values_mut() {
-                    set.remove(&user_id);
-                }
+                left_our_room =
+                    user_id != own_user_id && channel_id == channel_id_store.load(Ordering::Relaxed);
             }
+            // Their copy of the room's media key stops working from the next
+            // generation on; the sender-key half of the same idea is the
+            // `note_stale` above.
+            if left_our_room {
+                rotate_media_key_if_minter(
+                    channel_id,
+                    own_user_id,
+                    signal,
+                    media_key,
+                    tcp_tx,
+                    app_handle,
+                )
+                .await;
+            }
+
             // Forget where they stood — the id is reused for the next joiner,
             // and so are the extra ways a game had us hearing them, and the
             // glide that was carrying them there.
@@ -993,6 +1270,12 @@ async fn handle_server_message(
             app_handle
                 .state::<AppState>()
                 .sdk_event(SdkEvent::Muted { user_id, muted });
+        }
+        ServerMessage::UserHistorySharing { user_id, enabled } => {
+            let _ = app_handle.emit(
+                "user-history-sharing",
+                serde_json::json!({"user_id": user_id, "enabled": enabled}),
+            );
         }
         ServerMessage::UserDeafened { user_id, deafened } => {
             let _ = app_handle.emit(
@@ -1029,6 +1312,12 @@ async fn handle_server_message(
         ServerMessage::ChannelDeleted { channel_id } => {
             if let Ok(mut list) = channels_snapshot.lock() {
                 list.retain(|c| c.channel_id != channel_id);
+            }
+            {
+                let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+                let own = sig.own_user_id.unwrap_or(0);
+                let SignalState { stores, channels, .. } = &mut *sig;
+                channels.forget_channel(stores.as_mut(), own, channel_id);
             }
             let _ = app_handle.emit(
                 "channel-deleted",
@@ -1282,6 +1571,8 @@ async fn handle_server_message(
                 &username,
                 &ciphertext,
                 timestamp,
+                own_user_id,
+                channel_id_store.load(Ordering::Relaxed),
                 signal,
                 app_handle,
             );
@@ -1299,6 +1590,7 @@ async fn handle_server_message(
                 &distribution_message,
                 message_type,
                 own_user_id,
+                channel_id_store.load(Ordering::Relaxed),
                 signal,
                 media_key,
                 tcp_tx,
@@ -1367,6 +1659,7 @@ async fn handle_server_message(
                 &from_username,
                 &ciphertext,
                 message_type,
+                channel_id_store.load(Ordering::Relaxed),
                 signal,
                 app_handle,
             );
@@ -1383,9 +1676,25 @@ fn handle_channel_history_received(
     from_username: &str,
     ciphertext: &[u8],
     message_type: u8,
+    own_channel_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
     app_handle: &tauri::AppHandle,
 ) {
+    // A conversation arriving from somebody the roster does not put in that
+    // channel with us is not history, it is an injection: we file it, show it
+    // and hand it on to the next newcomer as `shared`. The two other pairwise
+    // paths ask the same question.
+    {
+        let sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+        if !sig
+            .channels
+            .shares_channel_with(own_channel_id, channel_id, from_user_id)
+        {
+            debug!(from_user_id, channel_id, "history from a non-member, dropped");
+            return;
+        }
+    }
+
     let result = tokio::task::block_in_place(|| {
         let mut sig = signal.lock().map_err(|e| format!("signal lock: {e}"))?;
         let stores = sig
@@ -1413,13 +1722,10 @@ fn handle_channel_history_received(
         sig.established_sessions.insert(from_user_id);
         sig.pending_sessions.remove(&from_user_id);
     }
-    let messages = match serde_json::from_slice::<serde_json::Value>(&plaintext) {
-        Ok(serde_json::Value::Object(mut map)) => match map.remove("messages") {
-            Some(serde_json::Value::Array(list)) => list,
-            _ => return,
-        },
-        _ => {
-            warn!(from_user_id, channel_id, "channel history: malformed payload");
+    let messages = match voipc_crypto::open_history_payload(channel_id, &plaintext) {
+        Ok(list) => list,
+        Err(e) => {
+            warn!(from_user_id, channel_id, "channel history rejected: {}", e);
             return;
         }
     };
@@ -1441,7 +1747,7 @@ async fn request_prekey_bundles_for_users(
     users: &[UserInfo],
     own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
-    tcp_tx: &mpsc::Sender<Vec<u8>>,
+    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
 ) {
     let mut to_request = Vec::new();
 
@@ -1451,7 +1757,9 @@ async fn request_prekey_bundles_for_users(
             return;
         }
         for user in users {
-            if user.user_id == own_user_id {
+            // Nobody: a join or leave the server would not name, because the
+            // channel hides who is in it. It is a count, not a person.
+            if user.user_id == 0 || user.user_id == own_user_id {
                 continue;
             }
             if sig.established_sessions.contains(&user.user_id) {
@@ -1483,8 +1791,8 @@ async fn handle_prekey_bundle(
     bundle: &PreKeyBundleData,
     own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
-    media_key: &Arc<std::sync::Mutex<Option<MediaKey>>>,
-    tcp_tx: &mpsc::Sender<Vec<u8>>,
+    media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
+    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
     channel_id_store: &Arc<AtomicU32>,
 ) {
     // Extract one-time prekey if available
@@ -1529,11 +1837,20 @@ async fn handle_prekey_bundle(
             // Drain any pending direct messages for this user
             drain_pending_dms(remote_user_id, own_user_id, signal, tcp_tx).await;
 
-            // Distribute our sender key (and the channel media key) for the current channel
-            let current_channel = channel_id_store.load(Ordering::Relaxed);
-            if current_channel != 0 {
+            // Distribute our sender key (and the channel media key) for the
+            // channel we stand in and for every text channel we are in — the
+            // server drops a distribution for a channel either of us is not in.
+            let mut channels = vec![channel_id_store.load(Ordering::Relaxed)];
+            {
+                let sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+                channels.extend(sig.channels.text_channels());
+            }
+            for channel in channels {
+                if channel == 0 {
+                    continue;
+                }
                 distribute_sender_key_to_user(
-                    current_channel,
+                    channel,
                     remote_user_id,
                     own_user_id,
                     signal,
@@ -1559,9 +1876,59 @@ async fn distribute_sender_key_to_user(
     target_user_id: u32,
     own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
-    media_key: &Arc<std::sync::Mutex<Option<MediaKey>>>,
-    tcp_tx: &mpsc::Sender<Vec<u8>>,
+    media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
+    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
 ) {
+    if send_sender_key(channel_id, target_user_id, own_user_id, signal, tcp_tx).await {
+        distribute_media_key_to_user(channel_id, target_user_id, signal, media_key, tcp_tx).await;
+    }
+}
+
+/// Rotate our own sender key for a channel somebody has left, and hand the new
+/// one to the members still there.
+///
+/// Called before sending, so an idle member never pays for it: the cost is one
+/// key per remaining member, and only for whoever actually writes next.
+pub async fn rotate_sender_key_if_stale(
+    channel_id: u32,
+    own_user_id: u32,
+    signal: &Arc<std::sync::Mutex<SignalState>>,
+    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+) {
+    let targets: Vec<u32> = {
+        let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+        let SignalState { stores, channels, .. } = &mut *sig;
+        channels.take_rotation_targets(stores.as_mut(), own_user_id, channel_id)
+    };
+    if targets.is_empty() {
+        return;
+    }
+    info!(channel_id, members = targets.len(), "rotating sender key after a member left");
+    for target_user_id in targets {
+        send_sender_key(channel_id, target_user_id, own_user_id, signal, tcp_tx).await;
+    }
+}
+
+/// Hand our sender key for `channel_id` to one member. Returns whether it went.
+async fn send_sender_key(
+    channel_id: u32,
+    target_user_id: u32,
+    own_user_id: u32,
+    signal: &Arc<std::sync::Mutex<SignalState>>,
+    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+) -> bool {
+    // The server relays a distribution only between two members of the channel
+    // it names, and drops the rest without a word. Recording one of those as
+    // distributed is what makes reciprocation skip a member who never received
+    // anything — so membership is checked here, once, for every caller.
+    {
+        let sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+        if !sig.channels.is_member(channel_id, target_user_id) {
+            debug!(target_user_id, channel_id, "not a member, sender key not sent");
+            return false;
+        }
+    }
+
     let result = tokio::task::block_in_place(|| {
         let mut sig = signal.lock().map_err(|e| format!("signal lock: {e}"))?;
         let stores = sig
@@ -1601,37 +1968,94 @@ async fn distribute_sender_key_to_user(
             };
             if let Err(e) = send_tcp_message(tcp_tx, &msg).await {
                 warn!(target_user_id, "failed to send sender key: {}", e);
+                false
             } else {
                 info!(target_user_id, channel_id, "sender key distributed");
-                distribute_media_key_to_user(channel_id, target_user_id, signal, media_key, tcp_tx)
-                    .await;
                 let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
-                sig.sender_key_distributed
-                    .entry(channel_id)
-                    .or_default()
-                    .insert(target_user_id);
+                sig.channels.record_distributed(channel_id, target_user_id);
+                true
             }
         }
         Err(e) => {
             warn!(target_user_id, channel_id, "failed to distribute sender key: {}", e);
+            false
         }
+    }
+}
+
+/// Mint the channel's next media key and hand it to whoever is left, if we are
+/// the one elected to.
+///
+/// A member who walks out keeps the AES-256-GCM key of the room they were in,
+/// and the relay could go on forwarding them packets — or somebody could have
+/// been recording the traffic and be handed the key later. So the key does not
+/// outlive the membership it was given for.
+///
+/// Nobody is asked who should do it: every member elects the lowest remaining
+/// user id from the roster they hold. Two members whose rosters disagree for a
+/// moment both mint, and `MediaKeyRing::install` settles it the same way on
+/// every client. The generation before this one stays usable for a moment so a
+/// packet already in flight is not a gap in the audio.
+async fn rotate_media_key_if_minter(
+    channel_id: u32,
+    own_user_id: u32,
+    signal: &Arc<std::sync::Mutex<SignalState>>,
+    media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
+    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    app_handle: &tauri::AppHandle,
+) {
+    let remaining: Vec<u32> = {
+        let sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+        if sig.channels.media_key_minter(channel_id) != Some(own_user_id) {
+            return;
+        }
+        sig.channels.others_in(channel_id, own_user_id)
+    };
+
+    // The one after ours, or the channel's first where we hold none — the
+    // member who held it has left and nobody else is going to send one. The
+    // rule lives in `MediaKeyRing` because the browser needs the same answer.
+    let next_id = {
+        let guard = media_key.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+        guard.next_generation(channel_id)
+    };
+
+    match MediaKey::generate(channel_id, next_id, own_user_id) {
+        Ok(key) => install_media_key(media_key, channel_id, key, app_handle),
+        Err(e) => {
+            error!(channel_id, "media key rotation failed: {}", e);
+            return;
+        }
+    }
+    info!(channel_id, key_id = next_id, members = remaining.len(), "rotated media key after a member left");
+    for target in remaining {
+        distribute_media_key_to_user(channel_id, target, signal, media_key, tcp_tx).await;
     }
 }
 
 /// Store a media key for voice/video and tell the UI (clears any
 /// "waiting for media key" warning).
+///
+/// `own_channel` is the room we are standing in: the ring refuses a key for
+/// anywhere else, because the channel named inside a key is its sender's claim
+/// and `has_channel` gates every media path there is.
 fn install_media_key(
-    media_key: &Arc<std::sync::Mutex<Option<MediaKey>>>,
+    media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
+    own_channel: u32,
     key: MediaKey,
     app_handle: &tauri::AppHandle,
 ) {
     let (channel_id, key_id) = (key.channel_id, key.key_id);
-    let mut guard = media_key.lock().unwrap_or_else(|p| {
-        warn!("media key mutex poisoned — recovering");
-        p.into_inner()
-    });
-    *guard = Some(key);
-    drop(guard);
+    let installed = {
+        let mut guard = media_key.lock().unwrap_or_else(|p| {
+            warn!("media key mutex poisoned — recovering");
+            p.into_inner()
+        });
+        guard.install(key, own_channel)
+    };
+    if !installed {
+        return;
+    }
     let _ = app_handle.emit(
         "media-key-installed",
         serde_json::json!({"channel_id": channel_id, "key_id": key_id}),
@@ -1645,15 +2069,15 @@ async fn distribute_media_key_to_user(
     channel_id: u32,
     target_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
-    media_key: &Arc<std::sync::Mutex<Option<MediaKey>>>,
-    tcp_tx: &mpsc::Sender<Vec<u8>>,
+    media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
+    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
 ) {
     let key_bytes = {
         let guard = media_key.lock().unwrap_or_else(|p| {
             warn!("media key mutex poisoned — recovering");
             p.into_inner()
         });
-        match guard.as_ref() {
+        match guard.current() {
             Some(k) if k.channel_id == channel_id => k.to_bytes(),
             _ => return,
         }
@@ -1699,10 +2123,25 @@ async fn handle_media_key_received(
     ciphertext: &[u8],
     message_type: u8,
     signal: &Arc<std::sync::Mutex<SignalState>>,
-    media_key: &Arc<std::sync::Mutex<Option<MediaKey>>>,
+    media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
     channel_id_store: &Arc<AtomicU32>,
     app_handle: &tauri::AppHandle,
 ) {
+    let current = channel_id_store.load(Ordering::Relaxed);
+    // The same check the sender key makes, and for a bigger prize: this is the
+    // key our microphone encrypts under. The server relays a media key only
+    // between two members of the channel it names — but the server is the
+    // adversary here, so without this anybody who can get a pairwise session
+    // with us (which is anybody on the server) hands us the key we then speak
+    // under, and the relay forwards our packets to them.
+    {
+        let sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+        if !sig.channels.shares_channel_with(current, channel_id, from_user_id) {
+            debug!(from_user_id, channel_id, "media key from a non-member, dropped");
+            return;
+        }
+    }
+
     let result = tokio::task::block_in_place(|| {
         let mut sig = signal.lock().map_err(|e| format!("signal lock: {e}"))?;
         let stores = sig
@@ -1735,20 +2174,16 @@ async fn handle_media_key_received(
         sig.pending_sessions.remove(&from_user_id);
     }
 
-    let current = channel_id_store.load(Ordering::Relaxed);
     if key.channel_id != channel_id || channel_id != current {
         info!(from_user_id, channel_id, current, "ignoring media key for another channel");
         return;
     }
-    let newer = media_key
-        .lock()
-        .map(|g| g.as_ref().map_or(true, |k| k.channel_id != channel_id || key.key_id >= k.key_id))
-        .unwrap_or(true);
-    if newer {
-        let key_id = key.key_id;
-        install_media_key(media_key, key, app_handle);
-        info!(from_user_id, channel_id, key_id, "media key installed");
-    }
+    // `install` decides: a later generation wins, and within one generation
+    // the lower minter does, so two members who disagreed about the roster for
+    // a moment converge on the same key instead of going deaf to each other.
+    let key_id = key.key_id;
+    install_media_key(media_key, current, key, app_handle);
+    info!(from_user_id, channel_id, key_id, "media key offered");
 }
 
 /// Handle a received sender key: decrypt pairwise, process distribution message,
@@ -1759,10 +2194,26 @@ async fn handle_sender_key_received(
     ciphertext: &[u8],
     message_type: u8,
     own_user_id: u32,
+    own_channel_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
-    media_key: &Arc<std::sync::Mutex<Option<MediaKey>>>,
-    tcp_tx: &mpsc::Sender<Vec<u8>>,
+    media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
+    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
 ) {
+    // The mirror of the check `send_sender_key` makes outbound. The server
+    // relays a distribution only between two members — but the server is the
+    // adversary here, and without this a stranger with a colluding relay
+    // installs a key for a channel they were never in and then writes to it.
+    {
+        let sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+        if !sig
+            .channels
+            .shares_channel_with(own_channel_id, channel_id, from_user_id)
+        {
+            debug!(from_user_id, channel_id, "sender key from a non-member, dropped");
+            return;
+        }
+    }
+
     let result = tokio::task::block_in_place(|| {
         let mut sig = signal.lock().map_err(|e| format!("signal lock: {e}"))?;
         let stores = sig
@@ -1808,18 +2259,13 @@ async fn handle_sender_key_received(
             // Track the received sender key
             {
                 let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
-                sig.sender_key_received
-                    .entry(channel_id)
-                    .or_default()
-                    .insert(from_user_id);
+                sig.channels.record_received(channel_id, from_user_id);
             }
 
             // Reciprocate: send our sender key if we haven't already
             let need_reciprocate = {
                 let sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
-                !sig.sender_key_distributed
-                    .get(&channel_id)
-                    .map_or(false, |s| s.contains(&from_user_id))
+                !sig.channels.has_distributed(channel_id, from_user_id)
             };
 
             if need_reciprocate {
@@ -1837,17 +2283,13 @@ async fn handle_sender_key_received(
             // Drain any pending channel messages now that we have sender keys
             drain_pending_channel_messages(channel_id, own_user_id, signal, tcp_tx).await;
 
-            // Newcomer: the first member whose sender key arrives holds a
-            // pairwise session with us (they just used it), so ask them for
-            // recent chat. Once per channel entry.
+            // A member whose sender key arrives holds a pairwise session with
+            // us (they just used it), so this is the moment to ask them for
+            // recent chat — once each, for as many sharers as we lined up.
             let ask = {
                 let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
-                if channel_id != 0 && sig.history_wanted_channel == channel_id {
-                    sig.history_wanted_channel = 0;
-                    true
-                } else {
-                    false
-                }
+                let asked = sig.channels.take_history_wanted(channel_id, from_user_id);
+                channel_id != 0 && asked
             };
             if ask {
                 let _ = send_tcp_message(
@@ -1871,10 +2313,11 @@ async fn drain_pending_dms(
     target_user_id: u32,
     _own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
-    tcp_tx: &mpsc::Sender<Vec<u8>>,
+    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
 ) {
-    // Extract pending DMs for this target
-    let pending: Vec<String> = {
+    // Extract pending DMs for this target, each with the id it was shown under
+    // and the destruction timer it was written under
+    let pending: Vec<(String, String, Option<u32>)> = {
         let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
         let mut remaining = Vec::new();
         let mut to_send = Vec::new();
@@ -1884,7 +2327,7 @@ async fn drain_pending_dms(
                 PendingTarget::Direct { target_user_id: tid } if *tid == target_user_id => {
                     // Only send if queued less than 60 seconds ago
                     if msg.queued_at.elapsed().as_secs() < 60 {
-                        to_send.push(msg.content);
+                        to_send.push((msg.id, msg.content, msg.ttl_secs));
                     } else {
                         expired += 1;
                     }
@@ -1899,7 +2342,8 @@ async fn drain_pending_dms(
         to_send
     };
 
-    for content in pending {
+    for (id, content, ttl_secs) in pending {
+        let payload = crate::crypto::envelope(&id, &content, ttl_secs);
         let result = tokio::task::block_in_place(|| {
             let mut sig = signal.lock().map_err(|e| format!("lock: {e}"))?;
             let stores = sig.stores.as_mut().ok_or("not initialized")?;
@@ -1907,7 +2351,7 @@ async fn drain_pending_dms(
                 .block_on(voipc_crypto::session::encrypt_message(
                     stores,
                     target_user_id,
-                    content.as_bytes(),
+                    &payload,
                 ))
                 .map_err(|e| format!("encrypt: {e}"))
         });
@@ -1937,10 +2381,11 @@ async fn drain_pending_channel_messages(
     channel_id: u32,
     own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
-    tcp_tx: &mpsc::Sender<Vec<u8>>,
+    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
 ) {
-    // Extract pending channel messages
-    let pending: Vec<String> = {
+    // Extract pending channel messages, each with the id it was shown under and
+    // the destruction timer it was written under
+    let pending: Vec<(String, String, Option<u32>)> = {
         let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
         let mut remaining = Vec::new();
         let mut to_send = Vec::new();
@@ -1949,7 +2394,7 @@ async fn drain_pending_channel_messages(
             match &msg.target {
                 PendingTarget::Channel { channel_id: cid } if *cid == channel_id => {
                     if msg.queued_at.elapsed().as_secs() < 60 {
-                        to_send.push(msg.content);
+                        to_send.push((msg.id, msg.content, msg.ttl_secs));
                     } else {
                         expired += 1;
                     }
@@ -1964,7 +2409,18 @@ async fn drain_pending_channel_messages(
         to_send
     };
 
-    for content in pending {
+    if pending.is_empty() {
+        return;
+    }
+    // These were written before we had anybody to send them to, and somebody
+    // may have left the channel in between — in which case our chain is stale
+    // and the leaver can still read along it. Sending is the moment that costs
+    // a rotation, and this is a send; `send_channel_message` does the same
+    // thing for a message typed now.
+    rotate_sender_key_if_stale(channel_id, own_user_id, signal, tcp_tx).await;
+
+    for (id, content, ttl_secs) in pending {
+        let payload = crate::crypto::envelope(&id, &content, ttl_secs);
         let result = tokio::task::block_in_place(|| {
             let mut sig = signal.lock().map_err(|e| format!("lock: {e}"))?;
             let stores = sig.stores.as_mut().ok_or("not initialized")?;
@@ -1973,14 +2429,17 @@ async fn drain_pending_channel_messages(
                     stores,
                     own_user_id,
                     channel_id,
-                    content.as_bytes(),
+                    &payload,
                 ))
                 .map_err(|e| format!("group encrypt: {e}"))
         });
 
         match result {
             Ok(ciphertext) => {
-                let msg = ClientMessage::SendEncryptedChannelMessage { ciphertext };
+                let msg = ClientMessage::SendEncryptedChannelMessage {
+                    channel_id,
+                    ciphertext,
+                };
                 if let Err(e) = send_tcp_message(tcp_tx, &msg).await {
                     warn!(channel_id, "failed to send queued channel msg: {}", e);
                 } else {
@@ -2033,7 +2492,9 @@ fn handle_encrypted_direct_message(
 
     match result {
         Ok(plaintext) => {
-            let content = String::from_utf8_lossy(&plaintext);
+            // A DM carries the same envelope a channel message does since
+            // 0.9.0; anything else reads as the text itself.
+            let msg = crate::crypto::open_envelope(&plaintext);
 
             // If this was a PreKeySignalMessage, mark session as established
             if message_type == 1 {
@@ -2042,15 +2503,17 @@ fn handle_encrypted_direct_message(
                 sig.pending_sessions.remove(&from_user_id);
             }
 
-            // Emit as a regular plaintext DM event — frontend is unchanged
+            // Emit as a regular plaintext DM event
             let _ = app_handle.emit(
                 "direct-chat-message",
                 serde_json::json!({
                     "from_user_id": from_user_id,
                     "from_username": from_username,
                     "to_user_id": to_user_id,
-                    "content": content,
+                    "content": msg.text,
                     "timestamp": timestamp,
+                    "message_id": msg.id,
+                    "ttl_secs": msg.ttl_secs,
                     "encrypted": true,
                 }),
             );
@@ -2088,9 +2551,31 @@ fn handle_encrypted_channel_message(
     username: &str,
     ciphertext: &[u8],
     timestamp: u64,
+    own_user_id: u32,
+    own_channel_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
     app_handle: &tauri::AppHandle,
 ) {
+    // Our own message, echoed back. The local copy was shown when it was sent;
+    // a second one only has our own sender chain to decrypt with and would
+    // land in our archive as "decryption failed". The DM path already skips it.
+    if user_id == own_user_id {
+        return;
+    }
+    // A message for a channel we are not in has no business being shown, let
+    // alone written to the archive under that channel's name. Checked before
+    // the decrypt and not inside it: folding the two together is what turned
+    // an ordinary leave racing an in-flight message into an
+    // "[encrypted message — decryption failed]" line in the user's archive,
+    // with an unread badge and a sound to go with it.
+    {
+        let sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+        if !sig.channels.in_channel(own_channel_id, channel_id) {
+            debug!(channel_id, "dropped a message for a channel we are not in");
+            return;
+        }
+    }
+
     let result = tokio::task::block_in_place(|| {
         let mut sig = signal.lock().map_err(|e| format!("signal lock: {e}"))?;
         let stores = sig
@@ -2110,15 +2595,22 @@ fn handle_encrypted_channel_message(
 
     match result {
         Ok(plaintext) => {
-            let content = String::from_utf8_lossy(&plaintext);
+            // The id rides inside the ciphertext, so two members sharing their
+            // history of the same conversation agree on what is the same message.
+            let msg = crate::crypto::open_envelope(&plaintext);
             let _ = app_handle.emit(
                 "channel-chat-message",
                 serde_json::json!({
                     "channel_id": channel_id,
                     "user_id": user_id,
                     "username": username,
-                    "content": content,
+                    "content": msg.text,
                     "timestamp": timestamp,
+                    "message_id": msg.id,
+                    // What the sender says this message's life is. The front
+                    // end takes the shorter of this and the channel's own
+                    // timer — see expiryFor in chat-rules.ts.
+                    "ttl_secs": msg.ttl_secs,
                     "encrypted": true,
                 }),
             );
@@ -2396,7 +2888,7 @@ async fn voice_mixer_task(
             .map(|v| v.clone())
             .unwrap_or_default();
         let listener_fx = user_fx.lock().map(|v| v.clone()).unwrap_or_default();
-        // ponytail: the spatial state is locked for the whole 20 ms mix; the
+        // bernd: the spatial state is locked for the whole 20 ms mix; the
         // writers (room drags, SDK updates) hold it for microseconds
         let mut sp = match spatial.lock() {
             Ok(s) => s,
@@ -2628,19 +3120,19 @@ async fn voice_mixer_task(
 /// one (or the 1 s keepalive) carries the position instead.
 fn send_position_parts(
     voice_tx: &mpsc::Sender<Vec<u8>>,
-    media_key: &Arc<std::sync::Mutex<Option<MediaKey>>>,
+    media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
     session_id: u32,
     channel_id: &AtomicU32,
     position_sequence: &AtomicU32,
     pos: [f32; 3],
 ) {
-    let key = {
+    let (key, stream_id) = {
         let guard = match media_key.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
         };
-        match guard.as_ref() {
-            Some(k) => k.clone(),
+        match guard.current() {
+            Some(k) => (k.clone(), guard.stream_id()),
             None => return, // no channel key yet
         }
     };
@@ -2657,7 +3149,7 @@ fn send_position_parts(
     };
     let encrypted = match voipc_crypto::media_encrypt(
         &key,
-        session_id,
+        stream_id,
         sequence,
         0,
         &aad,
@@ -2669,7 +3161,7 @@ fn send_position_parts(
             return;
         }
     };
-    let packet = VoicePacket::position(session_id, sequence, key.key_id, encrypted);
+    let packet = VoicePacket::position(session_id, sequence, key.key_id, stream_id, encrypted);
     let _ = voice_tx.try_send(packet.to_bytes());
 }
 
@@ -2689,7 +3181,7 @@ async fn position_beacon_task(
     connection: Connection,
     spatial: Arc<std::sync::Mutex<crate::app_state::SpatialState>>,
     voice_tx: mpsc::Sender<Vec<u8>>,
-    media_key: Arc<std::sync::Mutex<Option<MediaKey>>>,
+    media_key: Arc<std::sync::Mutex<MediaKeyRing>>,
     session_id: u32,
     channel_id: Arc<AtomicU32>,
     position_sequence: Arc<AtomicU32>,
@@ -2837,7 +3329,7 @@ struct PathSample {
 /// or an RTT well above the session's minimum (a queue building somewhere on the
 /// path). cwnd is deliberately not used — quinn's is app-limited most of the
 /// time, so it stays small and would read as congestion whenever we send little.
-/// ponytail: a fixed 1% loss floor rather than a loss estimator; if shares still
+/// bernd: a fixed 1% loss floor rather than a loss estimator; if shares still
 /// step down on healthy links, switch to ECN (`PathStats::congestion_events`).
 fn congested(prev: &PathSample, cur: &PathSample, min_rtt: std::time::Duration) -> bool {
     let lost = cur.lost_packets.saturating_sub(prev.lost_packets);
@@ -2924,7 +3416,7 @@ async fn datagram_receiver_task(
     app_handle: tauri::AppHandle,
     sources: MixSources,
     screen_audio_recv_count: Arc<AtomicU32>,
-    media_key: Arc<std::sync::Mutex<Option<MediaKey>>>,
+    media_key: Arc<std::sync::Mutex<MediaKeyRing>>,
     channel_id: Arc<AtomicU32>,
     spatial: Arc<std::sync::Mutex<crate::app_state::SpatialState>>,
 ) {
@@ -2971,19 +3463,26 @@ async fn datagram_receiver_task(
                         let sequence =
                             u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]);
 
+                        // The key generation and the sender's own nonce prefix,
+                        // both from the packet: a rotation leaves packets in
+                        // flight under the old key_id, and every sender has its
+                        // own stream_id under the one channel key.
+                        let key_id = u16::from_be_bytes([buf[9], buf[10]]);
+                        let stream_id =
+                            u32::from_be_bytes([buf[11], buf[12], buf[13], buf[14]]);
+
                         let opus_data: Vec<u8> = {
                             let raw_encrypted = &buf[header_size..n];
+                            let ch_id = channel_id.load(Ordering::Relaxed);
                             let key_guard = media_key.lock().unwrap_or_else(|poisoned| {
                                 warn!("media key mutex poisoned — recovering");
                                 poisoned.into_inner()
                             });
-                            let key_opt = key_guard.as_ref();
-                            if let Some(key) = key_opt {
-                                let ch_id = channel_id.load(Ordering::Relaxed);
+                            if let Some(key) = key_guard.get(ch_id, key_id) {
                                 let aad = voipc_crypto::build_aad(ch_id, 0x05);
                                 match voipc_crypto::media_decrypt(
                                     key,
-                                    session_id,
+                                    stream_id,
                                     sequence,
                                     0,
                                     &aad,
@@ -3067,20 +3566,24 @@ async fn datagram_receiver_task(
                         let session_id = u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]);
                         let sequence = u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]);
 
+                        let key_id = u16::from_be_bytes([buf[9], buf[10]]);
+                        let stream_id =
+                            u32::from_be_bytes([buf[11], buf[12], buf[13], buf[14]]);
+
                         let plaintext = {
+                            let ch_id = channel_id.load(Ordering::Relaxed);
                             let key_guard = media_key.lock().unwrap_or_else(|poisoned| {
                                 warn!("media key mutex poisoned — recovering");
                                 poisoned.into_inner()
                             });
-                            let Some(key) = key_guard.as_ref() else { continue };
-                            let ch_id = channel_id.load(Ordering::Relaxed);
+                            let Some(key) = key_guard.get(ch_id, key_id) else { continue };
                             let aad = voipc_crypto::build_aad(
                                 ch_id,
                                 VoicePacketType::Position as u8,
                             );
                             match voipc_crypto::media_decrypt(
                                 key,
-                                session_id,
+                                stream_id,
                                 sequence,
                                 0,
                                 &aad,
@@ -3169,13 +3672,12 @@ async fn datagram_receiver_task(
                                 warn!("media key mutex poisoned — recovering");
                                 poisoned.into_inner()
                             });
-                            let key_opt = key_guard.as_ref();
-                            if let Some(key) = key_opt {
-                                let ch_id = channel_id.load(Ordering::Relaxed);
+                            let ch_id = channel_id.load(Ordering::Relaxed);
+                            if let Some(key) = key_guard.get(ch_id, packet.key_id) {
                                 let aad = voipc_crypto::build_aad(ch_id, 0x15);
                                 match voipc_crypto::media_decrypt(
                                     key,
-                                    packet.session_id,
+                                    packet.stream_id,
                                     packet.sequence,
                                     0,
                                     &aad,
@@ -3261,12 +3763,12 @@ const LOSS_REPORT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2
 async fn video_stream_receiver_task(
     connection: Connection,
     video_decode_tx: mpsc::Sender<(Vec<u8>, bool)>,
-    media_key: Arc<std::sync::Mutex<Option<MediaKey>>>,
+    media_key: Arc<std::sync::Mutex<MediaKeyRing>>,
     channel_id: Arc<AtomicU32>,
     screen_video_frames_received: Arc<AtomicU32>,
     screen_video_frames_dropped: Arc<AtomicU32>,
     screen_video_bytes_received: Arc<AtomicU64>,
-    tcp_tx: mpsc::Sender<Vec<u8>>,
+    tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
     watching_user_id: Arc<AtomicU32>,
     needs_keyframe: Arc<AtomicBool>,
 ) {
@@ -3323,13 +3825,12 @@ async fn video_stream_receiver_task(
                         warn!("media key mutex poisoned — recovering");
                         poisoned.into_inner()
                     });
-                    let key_opt = key_guard.as_ref();
-                    if let Some(key) = key_opt {
-                        let ch_id = channel_id.load(Ordering::Relaxed);
+                    let ch_id = channel_id.load(Ordering::Relaxed);
+                    if let Some(key) = key_guard.get(ch_id, packet.key_id) {
                         let aad = voipc_crypto::build_aad(ch_id, packet_type);
                         match voipc_crypto::media_decrypt(
                             key,
-                            packet.session_id,
+                            packet.stream_id,
                             packet.frame_id,
                             packet.fragment_index as u32,
                             &aad,
@@ -3367,7 +3868,7 @@ async fn video_stream_receiver_task(
                         if sharer_id != 0 {
                             let msg = ClientMessage::RequestKeyframe { sharer_user_id: sharer_id };
                             if let Ok(data) = encode_client_msg(&msg) {
-                                let _ = tcp_tx.try_send(data);
+                                let _ = tcp_tx.send(data);
                                 info!("auto-requested keyframe (frame loss detected)");
                             }
                             last_keyframe_request = std::time::Instant::now();
@@ -3401,7 +3902,7 @@ async fn video_stream_receiver_task(
                     frames_received: window_received,
                 };
                 if let Ok(data) = encode_client_msg(&msg) {
-                    let _ = tcp_tx.try_send(data);
+                    let _ = tcp_tx.send(data);
                 }
                 info!(
                     dropped = window_dropped,
@@ -3419,6 +3920,55 @@ async fn video_stream_receiver_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The pacer is what keeps an honest client's busy connect — a pre-key
+    /// bundle per person, then a sender key per person per channel — from
+    /// being dropped frame by frame by a budget it cannot see.
+    #[test]
+    fn the_control_pacer_stays_under_what_the_server_accepts() {
+        assert!(
+            ControlPacer::RATE < voipc_protocol::codec::CONTROL_MSGS_PER_SEC as f64,
+            "pacing at or above the server's own rate paces nothing"
+        );
+        let start = tokio::time::Instant::now();
+        let mut pacer = ControlPacer::new(start);
+        // A burst goes out at once — that is what a connect looks like...
+        let burst = ControlPacer::RATE as usize;
+        for _ in 0..burst {
+            assert!(pacer.take(start).is_zero());
+        }
+        // ...and the rest is spread, at the rate and not faster.
+        let mut waited = std::time::Duration::ZERO;
+        for _ in 0..burst * 2 {
+            waited += pacer.take(start + waited);
+        }
+        let seconds = waited.as_secs_f64();
+        assert!((1.9..2.1).contains(&seconds), "{seconds} s for two seconds' traffic");
+    }
+
+    /// The media receive path reads the key generation and the sender's nonce
+    /// prefix straight out of the datagram, because parsing a whole
+    /// `VoicePacket` per packet would allocate on the hot path. Nothing in the
+    /// compiler checks those two offsets against what the sender writes, and
+    /// getting either wrong is silent: every packet simply fails to decrypt,
+    /// which looks exactly like a key that has not arrived yet.
+    #[test]
+    fn the_hand_parsed_media_header_matches_what_a_sender_writes() {
+        use voipc_protocol::voice::{VoicePacket, ENCRYPTED_VOICE_HEADER_SIZE};
+
+        let (session_id, sequence, key_id, stream_id) = (7u32, 99u32, 3u16, 0xDEAD_BEEFu32);
+        let buf = VoicePacket::encrypted_voice(session_id, sequence, key_id, stream_id, vec![1, 2, 3])
+            .to_bytes();
+
+        assert_eq!(u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]), session_id);
+        assert_eq!(u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]), sequence);
+        assert_eq!(u16::from_be_bytes([buf[9], buf[10]]), key_id);
+        assert_eq!(
+            u32::from_be_bytes([buf[11], buf[12], buf[13], buf[14]]),
+            stream_id
+        );
+        assert_eq!(&buf[ENCRYPTED_VOICE_HEADER_SIZE..], &[1, 2, 3]);
+    }
     use std::time::Duration;
 
     fn sample(rtt_ms: u64, lost: u64, sent: u64) -> PathSample {
@@ -3587,7 +4137,7 @@ mod tests {
 fn video_decode_render_task(
     mut decode_rx: mpsc::Receiver<(Vec<u8>, bool)>,
     app_handle: tauri::AppHandle,
-    tcp_tx: mpsc::Sender<Vec<u8>>,
+    tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
     watching_user_id: Arc<AtomicU32>,
     watching_codec: Arc<AtomicU8>,
     screen_video_resolution: Arc<AtomicU32>,
@@ -3668,7 +4218,7 @@ fn video_decode_render_task(
                     if sharer_id != 0 {
                         let msg = ClientMessage::RequestKeyframe { sharer_user_id: sharer_id };
                         if let Ok(data) = encode_client_msg(&msg) {
-                            let _ = tcp_tx.try_send(data);
+                            let _ = tcp_tx.send(data);
                             info!("auto-requested keyframe from sharer {}", sharer_id);
                         }
                         last_keyframe_request = std::time::Instant::now();
@@ -3730,7 +4280,7 @@ pub fn spawn_capture_encode_task(
     session_id: u32,
     transmitting: Arc<AtomicBool>,
     voice_tx: mpsc::Sender<Vec<u8>>,
-    media_key: Arc<std::sync::Mutex<Option<MediaKey>>>,
+    media_key: Arc<std::sync::Mutex<MediaKeyRing>>,
     channel_id: Arc<AtomicU32>,
     voice_mode: Arc<AtomicU8>,
     vad_threshold_db: Arc<AtomicI32>,
@@ -3928,20 +4478,20 @@ pub fn spawn_capture_encode_task(
                             warn!("media key mutex poisoned — recovering");
                             poisoned.into_inner()
                         });
-                        let key_opt = key_guard.as_ref();
-
-                        if let Some(key) = key_opt {
+                        let stream_id = key_guard.stream_id();
+                        if let Some(key) = key_guard.current() {
                             key_missing_since = None;
                             key_missing_emitted = false;
                             let ch_id = channel_id.load(Ordering::Relaxed);
                             let aad = voipc_crypto::build_aad(ch_id, 0x05);
                             match voipc_crypto::media_encrypt(
-                                key, session_id, sequence, 0, &aad, &opus_data,
+                                key, stream_id, sequence, 0, &aad, &opus_data,
                             ) {
                                 Ok(encrypted) => VoicePacket::encrypted_voice(
                                     session_id,
                                     sequence,
                                     key.key_id,
+                                    stream_id,
                                     encrypted,
                                 ),
                                 Err(e) => {

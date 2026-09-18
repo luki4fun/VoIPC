@@ -20,7 +20,7 @@
 //! VoIPC → game
 //!   {"type":"state","state":"ingame","user_id":42,"username":"Luki",
 //!    "channel":"Ingame","proximity":"3d","muted":false,"deafened":false,
-//!    "version":"0.8.0","sdk":1,
+//!    "version":"0.9.0","sdk":1,
 //!    "capabilities":["spatial","direct","volume","muffle","radio","phone","talk",
 //!                    "reverb","underwater"]}
 //!   {"type":"talk","user_id":42,"speaking":true}
@@ -1542,7 +1542,7 @@ fn server_matches(expected: &str, actual: &str) -> bool {
 
 // ── WebSocket (the subset a game's web view speaks) ──────────────────────
 
-// ponytail: text frames, no fragmentation, no extensions — a NUI page sends
+// bernd: text frames, no fragmentation, no extensions — a NUI page sends
 // one small JSON object per frame. tokio-tungstenite if a client ever needs
 // more than that.
 

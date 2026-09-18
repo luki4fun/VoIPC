@@ -10,6 +10,8 @@
 //! Signal state is deliberately not persisted: identities are ephemeral per
 //! launch (no accounts, nothing to fingerprint or link across sessions).
 
+pub mod channel_state;
+pub mod envelope;
 pub mod group;
 pub mod identity;
 pub mod media_keys;
@@ -19,7 +21,12 @@ pub mod stores;
 pub mod time;
 
 // Re-export key types for convenience
+pub use channel_state::{history_sources, pick_history_sources, ChannelKeying, HISTORY_SOURCES};
+pub use envelope::{
+    envelope, history_payload, new_message_id, open_envelope, open_history_payload, Message,
+    MAX_MESSAGE_TTL_SECS,
+};
 pub use identity::{generate_identity_key_pair, SerializableIdentityKeyPair};
-pub use media_keys::{MediaKey, build_aad, media_decrypt, media_encrypt, MAX_SEQUENCE_BEFORE_ROTATION};
+pub use media_keys::{MediaKey, MediaKeyRing, build_aad, media_decrypt, media_encrypt, MAX_SEQUENCE_BEFORE_ROTATION};
 pub use prekey::PreKeySet;
 pub use stores::SignalStores;

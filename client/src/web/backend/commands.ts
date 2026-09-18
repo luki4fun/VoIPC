@@ -128,10 +128,14 @@ const handlers: Record<string, Handler> = {
   join_channel: ({ channelId, password }) => {
     const s = need();
     const channel = u32(channelId, "channelId");
-    s.clearWatching();
+    // Subscribing to a text channel is not a move, so it costs no share and no
+    // viewer: only a voice join does (session.ts onUserList tears down the rest).
+    if (!s.isTextChannel(channel)) s.clearWatching();
     s.sendControl({ JoinChannel: { channel_id: channel, password: optStr(password, "password") } });
   },
-  create_channel: ({ name, password, proximity, anonymous }) => {
+  leave_channel: ({ channelId }) =>
+    need().sendControl({ LeaveChannel: { channel_id: u32(channelId, "channelId") } }),
+  create_channel: ({ name, password, proximity, anonymous, text }) => {
     const channelName = str(name, "name");
     if (channelName.length === 0 || byteLength(channelName) > 128) fail("channel name must be 1-128 characters");
     const pw = optStr(password, "password");
@@ -142,6 +146,7 @@ const handlers: Record<string, Handler> = {
         password: pw,
         proximity: proximityMode(proximity),
         anonymous: anonymous == null ? false : bool(anonymous, "anonymous"),
+        text: text == null ? false : bool(text, "text"),
       },
     });
   },
@@ -157,7 +162,7 @@ const handlers: Record<string, Handler> = {
       },
     }),
   // null leaves an option as it is, so the dialog only sends what changed
-  set_channel_options: ({ channelId, hidden, anonymous, screenShare, hideMembers, routed }) => {
+  set_channel_options: ({ channelId, hidden, anonymous, screenShare, hideMembers, routed, messageTtlSecs }) => {
     const flag = (v: unknown, name: string) => (v == null ? null : bool(v, name));
     need().sendControl({
       SetChannelOptions: {
@@ -167,6 +172,7 @@ const handlers: Record<string, Handler> = {
         screen_share: flag(screenShare, "screenShare"),
         hide_members: flag(hideMembers, "hideMembers"),
         routed: flag(routed, "routed"),
+        message_ttl_secs: messageTtlSecs == null ? null : u32(messageTtlSecs, "messageTtlSecs"),
       },
     });
   },
@@ -189,12 +195,34 @@ const handlers: Record<string, Handler> = {
   // ── chat ──
   send_poke: ({ targetUserId, message }) =>
     need().sendPoke(u32(targetUserId, "targetUserId"), str(message, "message")),
-  send_channel_message: ({ content }) => need().sendChannelMessage(str(content, "content")),
-  send_direct_message: ({ targetUserId, content }) =>
-    need().sendDirectMessage(u32(targetUserId, "targetUserId"), str(content, "content")),
+  send_channel_message: ({ content, channelId, ttlSecs }) =>
+    need().sendChannelMessage(
+      str(content, "content"),
+      channelId == null ? undefined : u32(channelId, "channelId"),
+      ttlSecs == null ? undefined : u32(ttlSecs, "ttlSecs"),
+    ),
+  send_direct_message: ({ targetUserId, content, ttlSecs }) =>
+    need().sendDirectMessage(
+      u32(targetUserId, "targetUserId"),
+      str(content, "content"),
+      ttlSecs == null ? undefined : u32(ttlSecs, "ttlSecs"),
+    ),
   send_channel_history: ({ channelId, targetUserId, messages }) => {
     if (!Array.isArray(messages)) fail("invalid messages");
     need().sendChannelHistory(u32(channelId, "channelId"), u32(targetUserId, "targetUserId"), messages);
+  },
+  request_channel_history: ({ channelId, targetUserIds }) => {
+    if (!Array.isArray(targetUserIds)) fail("invalid targetUserIds");
+    need().requestChannelHistory(
+      u32(channelId, "channelId"),
+      targetUserIds.map((id) => u32(id, "targetUserIds")),
+    );
+  },
+  set_history_sharing: ({ enabled }) => {
+    // Not connected is not a failure: the flag goes out again on the next
+    // connect, from the config the settings toggle has already written.
+    const s = session.activeSession();
+    if (s) s.sendControl({ SetHistorySharing: { enabled: bool(enabled, "enabled") } });
   },
 
   // ── moderation (admin token session) ──
@@ -550,6 +578,18 @@ const handlers: Record<string, Handler> = {
           break;
         case "share_channel_history":
           c.share_channel_history = enabled;
+          break;
+        default:
+          fail(`Unknown config key: ${key}`);
+      }
+    });
+  },
+  set_config_u32: ({ key, value }) => {
+    const n = u32(value, "value");
+    updateConfig((c) => {
+      switch (key) {
+        case "max_conversations":
+          c.max_conversations = n;
           break;
         default:
           fail(`Unknown config key: ${key}`);

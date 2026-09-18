@@ -50,6 +50,12 @@ export async function connectTo(request: ConnectRequest): Promise<ConnectResult>
 
   const address = `${host}:${port}`;
   connectionState.set("connecting");
+  // Before the invoke, not after: the channel list arrives from the reader task
+  // as soon as the server sends it, which can be before this call returns, and
+  // whoever handles it needs to know which server they are on — auto-joining
+  // text channels asks exactly that (`left_text_channels` is per server).
+  const previousAddress = get(serverAddress);
+  serverAddress.set(address);
 
   let id: number;
   try {
@@ -60,11 +66,11 @@ export async function connectTo(request: ConnectRequest): Promise<ConnectResult>
     });
   } catch (e) {
     connectionState.set("disconnected");
+    serverAddress.set(previousAddress);
     return { ok: false, error: String(e) };
   }
 
   userId.set(id);
-  serverAddress.set(address);
   username.set(name);
   acceptSelfSigned.set(selfSigned);
   connectionState.set("connected");

@@ -1,10 +1,17 @@
 <script lang="ts">
-  // Discord's bottom-left panel: who you are, and the two buttons you reach for
+  // The bottom-left panel: who you are, and the two buttons you reach for
   // most. Everything it does goes through stores/voice.ts, the same actions the
   // classic voice bar and the push-to-talk key use.
 
   import { avatarColor } from "../../avatar.js";
-  import { isDeafened, isMuted, isTransmitting, userId, username } from "../../stores/connection.js";
+  import {
+    connectionState,
+    isDeafened,
+    isMuted,
+    isTransmitting,
+    userId,
+    username,
+  } from "../../stores/connection.js";
   import { users } from "../../stores/users.js";
   import { toggleDeafen, toggleMute } from "../../stores/voice.js";
   import Icon from "../Icons.svelte";
@@ -29,7 +36,21 @@
     >
     <span class="who">
       <span class="name">{displayName}</span>
-      <span class="sub">{$isMuted ? "Muted" : $isTransmitting ? "Talking" : "Connected"}</span>
+      <!-- What the line under your name says is about the connection first:
+           it read "Connected" behind the connect dialog otherwise. -->
+      <span class="sub">
+        {$connectionState !== "connected"
+          ? $connectionState === "connecting"
+            ? "Connecting…"
+            : $connectionState === "reconnecting"
+              ? "Reconnecting…"
+              : "Disconnected"
+          : $isMuted
+            ? "Muted"
+            : $isTransmitting
+              ? "Talking"
+              : "Connected"}
+      </span>
     </span>
   </button>
 

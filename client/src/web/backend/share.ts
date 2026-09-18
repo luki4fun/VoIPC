@@ -324,7 +324,7 @@ export class ShareSender implements ShareApi {
   /**
    * Chromium: frames straight off the capture track. Not throttled when the
    * tab is hidden, and no <video> decode in between.
-   * ponytail: runs on the main thread; move the reader into a worker if a
+   * bernd: runs on the main thread; move the reader into a worker if a
    * hidden tab ever starves it.
    */
   private readTrack(track: MediaStreamTrack): void {
@@ -563,8 +563,7 @@ export class ShareSender implements ShareApi {
     if (!ctx || !this.encoding) return;
     // A chunk came out, so this encoder works — reset the failure count.
     this.encoderFailures = 0;
-    const key = ctx.mediaKey;
-    if (!key) return; // no key yet: never send plaintext (screenshare/mod.rs)
+    if (!ctx.mediaKeys.hasChannel(ctx.channelId)) return; // never send plaintext (screenshare/mod.rs)
 
     if (chunk.byteLength > MAX_FRAME_BYTES) {
       // No VBV in WebCodecs: this frame would need more fragments than the
@@ -585,7 +584,7 @@ export class ShareSender implements ShareApi {
     let body: Uint8Array;
     try {
       body = wasm().buildVideoFrameStream(
-        key,
+        ctx.mediaKeys,
         ctx.sessionId,
         frameId,
         timestamp,

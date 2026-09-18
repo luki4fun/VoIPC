@@ -5,7 +5,7 @@
 //! Plaintext media types are never produced and are rejected on receive.
 
 use anyhow::{bail, Context};
-use voipc_crypto::{build_aad, media_decrypt, media_encrypt, MediaKey};
+use voipc_crypto::{build_aad, media_decrypt, media_encrypt, MediaKeyRing};
 use voipc_protocol::video::{
     fragment_frame, FrameAssembler, ScreenShareAudioPacket, VideoPacket, VideoPacketType,
     MAX_ENCRYPTED_VIDEO_PAYLOAD_SIZE, MAX_FRAGMENTS_PER_FRAME,
@@ -19,14 +19,19 @@ const POSITION: u8 = VoicePacketType::Position as u8;
 
 /// Encrypted voice packet (0x05) for one Opus frame.
 pub fn build_voice_packet(
-    key: &MediaKey,
+    keys: &MediaKeyRing,
     session_id: u32,
     sequence: u32,
     opus: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
+    let key = keys.current().context("no media key for this channel")?;
+    let stream = keys.stream_id();
     let aad = build_aad(key.channel_id, ENCRYPTED_VOICE);
-    let encrypted = media_encrypt(key, session_id, sequence, 0, &aad, opus)?;
-    Ok(VoicePacket::encrypted_voice(session_id, sequence, key.key_id, encrypted).to_bytes())
+    let encrypted = media_encrypt(key, stream, sequence, 0, &aad, opus)?;
+    Ok(
+        VoicePacket::encrypted_voice(session_id, sequence, key.key_id, stream, encrypted)
+            .to_bytes(),
+    )
 }
 
 pub fn build_eot_packet(session_id: u32, sequence: u32) -> Vec<u8> {
@@ -47,15 +52,24 @@ pub struct VoiceInfo {
 
 /// Parses a voice-family packet. 0x02 (EOT), 0x03 (ping) and 0x04 (pong) are
 /// header only; 0x05 is decrypted with `key`. Plaintext voice is rejected.
-pub fn parse_voice_packet(key: Option<&MediaKey>, bytes: &[u8]) -> anyhow::Result<VoiceInfo> {
+pub fn parse_voice_packet(
+    keys: Option<&MediaKeyRing>,
+    channel_id: u32,
+    bytes: &[u8],
+) -> anyhow::Result<VoiceInfo> {
     let packet = VoicePacket::from_bytes(bytes)?;
     let opus = match packet.packet_type {
         VoicePacketType::EncryptedOpusVoice => {
-            let key = key.context("encrypted voice but no media key")?;
+            let keys = keys.context("encrypted voice but no media key")?;
+            // By the key generation the packet names, so a rotation does not
+            // drop what was already in flight.
+            let key = keys
+                .get(channel_id, packet.key_id)
+                .context("no media key for that generation")?;
             let aad = build_aad(key.channel_id, ENCRYPTED_VOICE);
             Some(media_decrypt(
                 key,
-                packet.session_id,
+                packet.stream_id,
                 packet.sequence,
                 0,
                 &aad,
@@ -80,17 +94,19 @@ pub fn parse_voice_packet(key: Option<&MediaKey>, bytes: &[u8]) -> anyhow::Resul
 /// `network::send_position`: the channel key, its own sequence counter and a
 /// packet-type byte in the AAD that keeps positions in their own nonce domain.
 pub fn build_position_packet(
-    key: &MediaKey,
+    keys: &MediaKeyRing,
     session_id: u32,
     sequence: u32,
     x: f32,
     y: f32,
     z: f32,
 ) -> anyhow::Result<Vec<u8>> {
+    let key = keys.current().context("no media key for this channel")?;
+    let stream = keys.stream_id();
     let aad = build_aad(key.channel_id, POSITION);
     let payload = PositionPayload { x, y, z };
-    let encrypted = media_encrypt(key, session_id, sequence, 0, &aad, &payload.to_bytes())?;
-    Ok(VoicePacket::position(session_id, sequence, key.key_id, encrypted).to_bytes())
+    let encrypted = media_encrypt(key, stream, sequence, 0, &aad, &payload.to_bytes())?;
+    Ok(VoicePacket::position(session_id, sequence, key.key_id, stream, encrypted).to_bytes())
 }
 
 pub struct PositionInfo {
@@ -101,15 +117,22 @@ pub struct PositionInfo {
 }
 
 /// Decrypts a position beacon (0x06); any other packet type is an error.
-pub fn parse_position_packet(key: &MediaKey, bytes: &[u8]) -> anyhow::Result<PositionInfo> {
+pub fn parse_position_packet(
+    keys: &MediaKeyRing,
+    channel_id: u32,
+    bytes: &[u8],
+) -> anyhow::Result<PositionInfo> {
     let packet = VoicePacket::from_bytes(bytes)?;
     if packet.packet_type != VoicePacketType::Position {
         bail!("not a position packet");
     }
+    let key = keys
+        .get(channel_id, packet.key_id)
+        .context("no media key for that generation")?;
     let aad = build_aad(key.channel_id, POSITION);
     let plaintext = media_decrypt(
         key,
-        packet.session_id,
+        packet.stream_id,
         packet.sequence,
         0,
         &aad,
@@ -128,18 +151,20 @@ pub fn parse_position_packet(key: &MediaKey, bytes: &[u8]) -> anyhow::Result<Pos
 /// side of [`parse_screen_audio_packet`], mirroring the native sharer's
 /// `AudioProcessor` (client/src-tauri/src/screenshare/mod.rs).
 pub fn build_screen_audio_packet(
-    key: &MediaKey,
+    keys: &MediaKeyRing,
     session_id: u32,
     sequence: u32,
     timestamp: u32,
     opus: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
+    let key = keys.current().context("no media key for this channel")?;
+    let stream = keys.stream_id();
     let aad = build_aad(key.channel_id, ENCRYPTED_SCREEN_AUDIO);
-    let encrypted = media_encrypt(key, session_id, sequence, 0, &aad, opus)?;
-    Ok(
-        ScreenShareAudioPacket::new_encrypted(session_id, sequence, timestamp, key.key_id, encrypted)
-            .to_bytes(),
+    let encrypted = media_encrypt(key, stream, sequence, 0, &aad, opus)?;
+    Ok(ScreenShareAudioPacket::new_encrypted(
+        session_id, sequence, timestamp, key.key_id, stream, encrypted,
     )
+    .to_bytes())
 }
 
 /// One encoded video frame as the body of a per-frame stream: fragmented,
@@ -150,7 +175,7 @@ pub fn build_screen_audio_packet(
 /// Fails for a frame that needs more than 255 fragments (~316 KB) instead of
 /// truncating it: a truncated frame would leave every viewer's decoder stuck.
 pub fn build_video_frame_stream(
-    key: &MediaKey,
+    keys: &MediaKeyRing,
     session_id: u32,
     frame_id: u32,
     timestamp: u32,
@@ -165,6 +190,8 @@ pub fn build_video_frame_stream(
         );
     }
 
+    let key = keys.current().context("no media key for this channel")?;
+    let stream = keys.stream_id();
     let packet_type = if is_keyframe { 0x14u8 } else { 0x13u8 };
     let aad = build_aad(key.channel_id, packet_type);
     let mut out = Vec::with_capacity(frame.len() + needed * 64);
@@ -178,7 +205,7 @@ pub fn build_video_frame_stream(
     ) {
         let encrypted = media_encrypt(
             key,
-            session_id,
+            stream,
             frame_id,
             pkt.fragment_index as u32,
             &aad,
@@ -192,6 +219,7 @@ pub fn build_video_frame_stream(
             pkt.fragment_count,
             timestamp,
             key.key_id,
+            stream,
             encrypted,
         )
         .to_bytes();
@@ -210,15 +238,22 @@ pub struct ScreenAudioInfo {
 }
 
 /// Parses and decrypts an encrypted screen-share audio packet (0x15).
-pub fn parse_screen_audio_packet(key: &MediaKey, bytes: &[u8]) -> anyhow::Result<ScreenAudioInfo> {
+pub fn parse_screen_audio_packet(
+    keys: &MediaKeyRing,
+    channel_id: u32,
+    bytes: &[u8],
+) -> anyhow::Result<ScreenAudioInfo> {
     let packet = ScreenShareAudioPacket::from_bytes(bytes)?;
     if !packet.encrypted {
         bail!("plaintext screen audio packet rejected");
     }
+    let key = keys
+        .get(channel_id, packet.key_id)
+        .context("no media key for that generation")?;
     let aad = build_aad(key.channel_id, ENCRYPTED_SCREEN_AUDIO);
     let opus = media_decrypt(
         key,
-        packet.session_id,
+        packet.stream_id,
         packet.sequence,
         0,
         &aad,
@@ -259,7 +294,12 @@ impl VideoAssemblerCore {
         }
     }
 
-    pub fn push(&mut self, key: &MediaKey, bytes: &[u8]) -> anyhow::Result<VideoPush> {
+    pub fn push(
+        &mut self,
+        keys: &MediaKeyRing,
+        channel_id: u32,
+        bytes: &[u8],
+    ) -> anyhow::Result<VideoPush> {
         let mut packet = VideoPacket::from_bytes(bytes)?;
         let packet_type = packet.packet_type;
         if !matches!(
@@ -270,12 +310,16 @@ impl VideoAssemblerCore {
             bail!("not an encrypted video fragment: 0x{:02x}", packet_type as u8);
         }
 
-        // Nonce: session id, frame id as the sequence, fragment index as the
-        // extra; the AAD binds the channel and the exact packet type byte.
+        // Nonce: the sender's own stream id, frame id as the sequence,
+        // fragment index as the extra; the AAD binds the channel and the exact
+        // packet type byte.
+        let key = keys
+            .get(channel_id, packet.key_id)
+            .context("no media key for that generation")?;
         let aad = build_aad(key.channel_id, packet_type as u8);
         packet.payload = media_decrypt(
             key,
-            packet.session_id,
+            packet.stream_id,
             packet.frame_id,
             packet.fragment_index as u32,
             &aad,

@@ -10,7 +10,7 @@
 /**
  * Whether this browser can put the shared screen's sound in the stream.
  *
- * ponytail: user-agent sniffing. There is no feature test for a constraint the
+ * bernd: user-agent sniffing. There is no feature test for a constraint the
  * browser accepts and then ignores, and `getDisplayMedia` cannot be probed
  * without opening a picker in the user's face. Ceiling: a Firefox fork that
  * rewrites its user agent gets the Chromium request, and at worst is back to

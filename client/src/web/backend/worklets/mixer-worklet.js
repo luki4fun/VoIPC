@@ -7,7 +7,7 @@
 // frames per source, pulls one 20 ms frame per source on the audio clock,
 // sums them with per-user gain, clamps, and honors deafen.
 //
-// ponytail: a lost frame is 20 ms of silence. The native client decodes the
+// bernd: a lost frame is 20 ms of silence. The native client decodes the
 // next packet's in-band FEC or runs Opus PLC; WebCodecs exposes neither, so
 // the upgrade path is a wasm Opus decoder driven from inside this worklet.
 
@@ -736,7 +736,7 @@ class MixerProcessor extends AudioWorkletProcessor {
       }
       const r = drained ? null : src.jitter.pop();
       if (r === null || r === LOST) {
-        if (r === LOST) this.framesLost++; // ponytail: silence instead of FEC/PLC
+        if (r === LOST) this.framesLost++; // bernd: silence instead of FEC/PLC
         // A lost packet is not a pause: the speaker is still talking, we simply
         // did not receive that frame. Counting it as idle closed a radio's
         // squelch a fifth of a second into a loss burst and opened it again on

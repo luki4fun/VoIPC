@@ -135,11 +135,11 @@ export class VideoViewer implements VideoApi {
   onVideoPacket(bytes: Uint8Array): void {
     if (!this.watching || !this.decoder || !this.assembler) return;
     this.bytesReceived += bytes.length;
-    const key = this.ctx?.mediaKey;
-    if (!key) return; // encrypted video without a key is dropped
+    const c = this.ctx;
+    if (!c?.mediaKeys.hasChannel(c.channelId)) return; // no key: the fragment is dropped
     let r;
     try {
-      r = this.assembler.push(key, bytes);
+      r = this.assembler.push(c.mediaKeys, c.channelId, bytes);
     } catch (e) {
       console.warn("video decryption failed:", e);
       this.framesDropped++;

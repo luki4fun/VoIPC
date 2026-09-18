@@ -711,7 +711,7 @@ fn split_h264_csd(csd: &[u8]) -> (&[u8], &[u8]) {
 /// fallback, and the real size arrives with INFO_OUTPUT_FORMAT_CHANGED, which
 /// MediaCodec raises before the first decoded buffer (`update_output_format`
 /// then resets stride and slice height along with it).
-/// ponytail: add an H.264 SPS parser only if a device is ever seen to hand out
+/// bernd: add an H.264 SPS parser only if a device is ever seen to hand out
 /// a buffer before that callback.
 fn parse_sps_dimensions(video_codec: VideoCodec, data: &[u8]) -> Option<(u32, u32)> {
     if video_codec != VideoCodec::H265 {

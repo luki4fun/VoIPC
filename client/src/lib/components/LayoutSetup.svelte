@@ -7,11 +7,16 @@
   // a call and a layout somebody would rather not have is not.
   //
   // Skipping writes nothing — the same rule the audio setup keeps, so the offer
-  // stands next time rather than being marked answered by silence. The default
-  // is the classic layout: nobody's app should rearrange itself on an update.
+  // stands next time rather than being marked answered by silence. It also
+  // leaves the app where it is, which for anybody who has never picked a layout
+  // is the default: there is nothing stored to distinguish them from a fresh
+  // install, so they arrive in the modern one and this dialog is how they find
+  // the other.
+
+  import { get } from "svelte/store";
 
   import { LAYOUT_PICKER_VERSION, type LayoutId } from "../ui-prefs.js";
-  import { updateUiPrefs } from "../stores/ui-prefs.js";
+  import { uiPrefs, updateUiPrefs } from "../stores/ui-prefs.js";
   import LayoutPreview from "./LayoutPreview.svelte";
 
   interface Props {
@@ -19,7 +24,9 @@
   }
   let { onclose }: Props = $props();
 
-  let picked = $state<LayoutId>("classic");
+  // Whatever is on screen behind the dialog, so the cards agree with the app:
+  // the default for a new install, and their own layout for anybody who has one.
+  let picked = $state<LayoutId>(get(uiPrefs).layout);
 
   function confirm() {
     updateUiPrefs((p) => {
@@ -39,12 +46,12 @@
     </p>
 
     <div class="choices">
+      <LayoutPreview layout="modern" selected={picked === "modern"} onpick={() => (picked = "modern")} />
       <LayoutPreview layout="classic" selected={picked === "classic"} onpick={() => (picked = "classic")} />
-      <LayoutPreview layout="discord" selected={picked === "discord"} onpick={() => (picked = "discord")} />
     </div>
 
     <div class="actions">
-      <button class="text-link skip-link" onclick={onclose}>Keep the classic layout</button>
+      <button class="text-link skip-link" onclick={onclose}>Decide later</button>
       <button class="submit-btn" onclick={confirm}>Use this layout</button>
     </div>
   </div>

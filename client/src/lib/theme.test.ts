@@ -12,7 +12,10 @@ import {
   PALETTES,
   TOKENS,
   contrastRatio,
+  DEFAULT_LIGHT_PALETTE_ID,
+  migratePaletteId,
   paletteById,
+  systemDefaultPaletteId,
   parseColor,
   resolveTokens,
 } from "./theme.ts";
@@ -39,6 +42,33 @@ test("every palette is readable", () => {
       );
     }
   }
+});
+
+test("both default palettes exist, and one is light", () => {
+  // The pair the app opens in before anybody chooses: the dark one where there
+  // is no machine to ask, the light one where the machine says it prefers light.
+  assert.equal(paletteById(DEFAULT_PALETTE_ID).id, DEFAULT_PALETTE_ID);
+  assert.equal(paletteById(DEFAULT_LIGHT_PALETTE_ID).id, DEFAULT_LIGHT_PALETTE_ID);
+  assert.equal(paletteById(DEFAULT_PALETTE_ID).dark, true);
+  assert.equal(paletteById(DEFAULT_LIGHT_PALETTE_ID).dark, false);
+});
+
+test("with no window to ask, the default palette is the dark one", () => {
+  // Node has no matchMedia; the app must still start, in the documented palette.
+  assert.equal(systemDefaultPaletteId(), DEFAULT_PALETTE_ID);
+});
+
+test("a renamed palette still names a palette that exists", () => {
+  // The migration is only worth having if it points somewhere: a target that
+  // has itself been renamed or dropped falls back to the default, which is the
+  // exact silent repaint the migration exists to prevent.
+  for (const old of ["discord-dark", "discord-light"]) {
+    const migrated = migratePaletteId(old);
+    assert.notEqual(migrated, old, `${old} should migrate`);
+    assert.equal(paletteById(migrated).id, migrated, `${migrated} is not a palette`);
+  }
+  // An id nothing renamed comes back untouched
+  assert.equal(migratePaletteId("voipc-dark"), "voipc-dark");
 });
 
 test("an unknown palette id falls back rather than throwing", () => {

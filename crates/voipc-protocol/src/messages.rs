@@ -22,10 +22,17 @@ pub enum ClientMessage {
     },
 
     /// Request to join a specific channel (with optional password).
+    ///
+    /// A voice channel is a move: the user leaves the one they were in. A text
+    /// channel is a subscription, added to whatever they are already in.
     JoinChannel {
         channel_id: ChannelId,
         password: Option<String>,
     },
+
+    /// Unsubscribe from a text channel (protocol v9). Leaving a voice channel
+    /// is still `JoinChannel { channel_id: 0 }`; this is refused for one.
+    LeaveChannel { channel_id: ChannelId },
 
     /// Create a new channel.
     CreateChannel {
@@ -38,6 +45,9 @@ pub enum ClientMessage {
         /// Members see each other under random pseudonyms (protocol v7).
         #[serde(default)]
         anonymous: bool,
+        /// A text channel rather than a voice room (protocol v9).
+        #[serde(default)]
+        text: bool,
     },
 
     /// Client is disconnecting gracefully.
@@ -48,6 +58,11 @@ pub enum ClientMessage {
 
     /// Client toggled their deafen state (informational for other users).
     SetDeafened { deafened: bool },
+
+    /// Client will (or will no longer) answer requests for recent channel chat
+    /// (protocol v9). Sent once after authenticating and on every change, the
+    /// same way mute and deafen are.
+    SetHistorySharing { enabled: bool },
 
     /// Request the full channel list.
     RequestChannelList,
@@ -86,6 +101,10 @@ pub enum ClientMessage {
         /// (protocol v8). See `ChannelInfo::routed`.
         #[serde(default)]
         routed: Option<bool>,
+        /// Seconds a message written here is meant to live; 0 turns the timer
+        /// off (protocol v9). See `ChannelInfo::message_ttl_secs`.
+        #[serde(default)]
+        message_ttl_secs: Option<u32>,
     },
 
     /// Kick a user from a channel (creator only).
@@ -171,6 +190,10 @@ pub enum ClientMessage {
 
     /// Send an encrypted channel message using Sender Keys.
     SendEncryptedChannelMessage {
+        /// The channel to send to (protocol v9). A user can be in several text
+        /// channels at once, so the server can no longer infer it from the
+        /// session; it checks membership instead.
+        channel_id: ChannelId,
         /// SenderKeyMessage ciphertext.
         ciphertext: Vec<u8>,
     },
@@ -292,6 +315,11 @@ pub enum ServerMessage {
 
     /// A user changed their deafen state.
     UserDeafened { user_id: UserId, deafened: bool },
+
+    /// A user started or stopped answering requests for recent channel chat
+    /// (protocol v9). Broadcast to everyone, not just one channel: a text
+    /// channel's subscribers are standing in voice channels of their own.
+    UserHistorySharing { user_id: UserId, enabled: bool },
 
     /// Server-initiated keepalive ping. Client should reply with ClientMessage::Ping.
     Ping { timestamp: u64 },

@@ -10,7 +10,7 @@ use futures_util::FutureExt;
 use libsignal_protocol::{GenericSignedPreKey, PreKeyRecord, SignedPreKeyId, SignedPreKeyStore};
 use serde::Serialize;
 use voipc_crypto::prekey::INITIAL_PREKEY_COUNT;
-use voipc_crypto::{group, session, SignalStores};
+use voipc_crypto::{group, session, ChannelKeying, SignalStores};
 use voipc_protocol::types::{OneTimePreKey, PreKeyBundleData};
 
 /// Drives a libsignal future to completion. Every store is in memory, so the
@@ -28,6 +28,10 @@ pub struct AuthBundle {
 
 pub struct SignalCore {
     stores: SignalStores,
+    /// Who is in which channel and which of them hold which of our keys. The
+    /// native client keeps the same struct beside the same stores; sharing it
+    /// is what stops the two drifting, as they did over rotation.
+    pub keying: ChannelKeying,
 }
 
 impl SignalCore {
@@ -44,7 +48,10 @@ impl SignalCore {
             INITIAL_PREKEY_COUNT,
         ))
         .context("failed to generate prekeys")?;
-        Ok(Self { stores })
+        Ok(Self {
+            stores,
+            keying: ChannelKeying::default(),
+        })
     }
 
     /// Identity key and pre-key bundle, read back from the stores so one-time
@@ -147,6 +154,24 @@ impl SignalCore {
             channel_id,
             distribution,
         ))
+    }
+
+    /// Start a channel's group keying from nothing, chain included.
+    pub fn reset_channel(&mut self, own_user_id: u32, channel_id: u32) {
+        self.keying
+            .reset_channel(Some(&mut self.stores), own_user_id, channel_id);
+    }
+
+    /// Leave a channel entirely: keys, roster and anything still wanted.
+    pub fn forget_channel(&mut self, own_user_id: u32, channel_id: u32) {
+        self.keying
+            .forget_channel(Some(&mut self.stores), own_user_id, channel_id);
+    }
+
+    /// If a rotation is pending, perform it and return who needs the new key.
+    pub fn take_rotation_targets(&mut self, own_user_id: u32, channel_id: u32) -> Vec<u32> {
+        self.keying
+            .take_rotation_targets(Some(&mut self.stores), own_user_id, channel_id)
     }
 
     pub fn group_encrypt(

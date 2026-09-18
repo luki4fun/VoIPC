@@ -197,6 +197,16 @@ pub struct AppConfig {
     /// User chose to skip the encrypted chat vault — chat stays in-memory
     /// only and the first-run setup gate is not shown.
     pub chat_history_disabled: bool,
+    /// How many conversations the archive keeps — channels and people
+    /// together, across every server. 0 keeps all of them.
+    ///
+    /// What it bounds is the whole map being re-serialised on each save, not
+    /// anything about the chat itself: a conversation is capped at 500 messages
+    /// wherever it came from, and a history hand-off at 50. So the honest
+    /// default is a large number and the honest option is none at all — what
+    /// this drops is somebody's oldest conversations off their own disk.
+    #[serde(default = "default_max_conversations")]
+    pub max_conversations: u32,
 }
 
 impl Default for AppConfig {
@@ -239,11 +249,14 @@ impl Default for AppConfig {
             auto_connect: false,
             share_channel_history: true,
             // Null, not `{}`: "nothing has been chosen yet" is the state the
-            // first-run layout picker keys on, and an empty object would be
-            // indistinguishable from a user who reset every preference.
+            // whole appearance blob starts in, and an empty object would be
+            // indistinguishable from a user who reset every preference. What
+            // the first-run picker itself keys on is `layout_asked_version`,
+            // which is 0 either way.
             ui_prefs: serde_json::Value::Null,
             chat_history_path: None,
             chat_history_disabled: false,
+            max_conversations: default_max_conversations(),
         }
     }
 }
@@ -278,6 +291,10 @@ pub fn config_path() -> PathBuf {
 }
 
 /// Returns the default path to `chat_history.bin` in the VoIPC data directory.
+pub fn default_max_conversations() -> u32 {
+    1000
+}
+
 pub fn default_chat_history_path() -> PathBuf {
     data_dir().join("chat_history.bin")
 }
@@ -367,7 +384,7 @@ mod tests {
     fn ui_prefs_round_trip_verbatim() {
         let mut config = AppConfig::default();
         config.ui_prefs = serde_json::json!({
-            "layout": "discord",
+            "layout": "modern",
             "palette_overrides": { "--accent": "#ff0000" },
             // A key a newer build wrote and this one knows nothing about. It
             // has to survive, or running two versions against one config file

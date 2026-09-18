@@ -39,7 +39,7 @@ use crate::spatial::Effect;
 // Two cascaded one-pole high-passes at 300 Hz and two low-passes at 3.4 kHz:
 // the telephone band, 12 dB per octave on each side. A biquad would have
 // steeper skirts, but this is four floats of state and no new dependency.
-// ponytail: one-pole cascade, swap in a biquad if the skirts ever matter.
+// bernd: one-pole cascade, swap in a biquad if the skirts ever matter.
 
 /// One-pole high-pass coefficient: exp(-2π·300/48000).
 const FX_HP_R: f32 = 0.961_49;
@@ -670,7 +670,7 @@ pub fn clamp(buf: &mut [f32]) {
 // bank into two series allpasses, damped inside the feedback path. Half the
 // combs is half the ringing modes and half the memory, and with speech nobody
 // hears the difference.
-// ponytail: four combs, add the other four if a cathedral ever sounds grainy.
+// bernd: four combs, add the other four if a cathedral ever sounds grainy.
 
 /// Cutoff (Hz) → one-pole coefficient at 48 kHz.
 pub fn one_pole_a(fc: f32) -> f32 {

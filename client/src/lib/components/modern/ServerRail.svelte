@@ -1,5 +1,5 @@
 <script lang="ts">
-  // Discord's 72px strip of server icons.
+  // The 72px strip of server icons down the far left.
   //
   // Reads stores/servers.ts, which is a *list* today containing the one live
   // connection plus the saved bookmarks — see that file for what is and is not
@@ -68,7 +68,7 @@
     flex-shrink: 0;
     padding: 12px 0;
     overflow-y: auto;
-    /* Discord's rail is the darkest surface in the app; --bg-tertiary is the
+    /* The rail is the darkest surface in the app; --bg-tertiary is the
        role that carries "recessed" in every palette. */
     background: var(--bg-tertiary);
   }

@@ -36,9 +36,9 @@ impl VoicePacketType {
 /// Header size: 1 (type) + 4 (session_id) + 4 (sequence) = 9 bytes.
 pub const VOICE_HEADER_SIZE: usize = 9;
 
-/// Header size for encrypted voice: standard header + 2 (key_id) = 11 bytes.
-/// Position packets (0x06) use the same header.
-pub const ENCRYPTED_VOICE_HEADER_SIZE: usize = 11;
+/// Header size for encrypted voice: standard header + 2 (key_id)
+///            + 4 (stream_id) = 15 bytes. Position packets (0x06) use the same.
+pub const ENCRYPTED_VOICE_HEADER_SIZE: usize = 15;
 
 /// Plaintext size of a position beacon: x, y, z as f32 = 12 bytes.
 pub const POSITION_PAYLOAD_SIZE: usize = 12;
@@ -47,7 +47,7 @@ pub const POSITION_PAYLOAD_SIZE: usize = 12;
 pub const POSITION_PACKET_SIZE: usize = ENCRYPTED_VOICE_HEADER_SIZE + POSITION_PAYLOAD_SIZE + 16;
 
 /// Maximum voice packet size (well under the QUIC datagram limit).
-/// Encrypted packets add 18 bytes overhead (2 key_id + 16 GCM tag).
+/// Encrypted packets add 22 bytes overhead (2 key_id + 4 stream_id + 16 GCM tag).
 pub const MAX_VOICE_PACKET_SIZE: usize = 512;
 
 /// Opus audio parameters.
@@ -65,7 +65,7 @@ pub const OPUS_BITRATE: i32 = 48_000; // 48 kbps
 ///
 /// Wire format (encrypted, type 0x05):
 /// ```text
-/// [0x05: u8] [session_id: u32 BE] [sequence: u32 BE] [key_id: u16 BE] [encrypted_opus + 16-byte GCM tag]
+/// [0x05: u8] [session_id: u32 BE] [sequence: u32 BE] [key_id: u16 BE] [stream_id: u32 BE] [encrypted_opus + 16-byte GCM tag]
 /// ```
 #[derive(Debug, Clone)]
 pub struct VoicePacket {
@@ -75,6 +75,10 @@ pub struct VoicePacket {
     pub opus_data: Vec<u8>,
     /// Media encryption key ID (only used for EncryptedOpusVoice).
     pub key_id: u16,
+    /// The sender's own nonce prefix, chosen by the sender and never by the
+    /// server (only used for encrypted types). Two members of a channel share
+    /// one key, so this is what keeps them off each other's (key, nonce).
+    pub stream_id: u32,
 }
 
 impl VoicePacket {
@@ -86,6 +90,7 @@ impl VoicePacket {
             sequence,
             opus_data,
             key_id: 0,
+            stream_id: 0,
         }
     }
 
@@ -94,6 +99,7 @@ impl VoicePacket {
         session_id: u32,
         sequence: u32,
         key_id: u16,
+        stream_id: u32,
         encrypted_data: Vec<u8>,
     ) -> Self {
         Self {
@@ -102,17 +108,25 @@ impl VoicePacket {
             sequence,
             opus_data: encrypted_data,
             key_id,
+            stream_id,
         }
     }
 
     /// Create an encrypted position beacon.
-    pub fn position(session_id: u32, sequence: u32, key_id: u16, encrypted_data: Vec<u8>) -> Self {
+    pub fn position(
+        session_id: u32,
+        sequence: u32,
+        key_id: u16,
+        stream_id: u32,
+        encrypted_data: Vec<u8>,
+    ) -> Self {
         Self {
             packet_type: VoicePacketType::Position,
             session_id,
             sequence,
             opus_data: encrypted_data,
             key_id,
+            stream_id,
         }
     }
 
@@ -124,6 +138,7 @@ impl VoicePacket {
             sequence,
             opus_data: Vec::new(),
             key_id: 0,
+            stream_id: 0,
         }
     }
 
@@ -135,6 +150,7 @@ impl VoicePacket {
             sequence,
             opus_data: Vec::new(),
             key_id: 0,
+            stream_id: 0,
         }
     }
 
@@ -144,13 +160,14 @@ impl VoicePacket {
             self.packet_type,
             VoicePacketType::EncryptedOpusVoice | VoicePacketType::Position
         ) {
-            // Encrypted format: header + key_id(2) + encrypted data
+            // Encrypted format: header + key_id(2) + stream_id(4) + encrypted data
             let mut buf =
                 Vec::with_capacity(ENCRYPTED_VOICE_HEADER_SIZE + self.opus_data.len());
             buf.push(self.packet_type as u8);
             buf.extend_from_slice(&self.session_id.to_be_bytes());
             buf.extend_from_slice(&self.sequence.to_be_bytes());
             buf.extend_from_slice(&self.key_id.to_be_bytes());
+            buf.extend_from_slice(&self.stream_id.to_be_bytes());
             buf.extend_from_slice(&self.opus_data);
             buf
         } else {
@@ -188,6 +205,7 @@ impl VoicePacket {
                 });
             }
             let key_id = u16::from_be_bytes([data[9], data[10]]);
+            let stream_id = u32::from_be_bytes([data[11], data[12], data[13], data[14]]);
             let opus_data = data[ENCRYPTED_VOICE_HEADER_SIZE..].to_vec();
             Ok(Self {
                 packet_type,
@@ -195,6 +213,7 @@ impl VoicePacket {
                 sequence,
                 opus_data,
                 key_id,
+                stream_id,
             })
         } else {
             let opus_data = data[VOICE_HEADER_SIZE..].to_vec();
@@ -204,6 +223,7 @@ impl VoicePacket {
                 sequence,
                 opus_data,
                 key_id: 0,
+                stream_id: 0,
             })
         }
     }
@@ -261,7 +281,7 @@ mod tests {
 
     #[test]
     fn roundtrip_encrypted_voice_packet() {
-        let original = VoicePacket::encrypted_voice(42, 100, 7, vec![9, 8, 7]);
+        let original = VoicePacket::encrypted_voice(42, 100, 7, 0xDEAD_BEEF, vec![9, 8, 7]);
         let bytes = original.to_bytes();
         assert_eq!(bytes.len(), ENCRYPTED_VOICE_HEADER_SIZE + 3);
         let decoded = VoicePacket::from_bytes(&bytes).unwrap();
@@ -270,6 +290,7 @@ mod tests {
         assert_eq!(decoded.session_id, 42);
         assert_eq!(decoded.sequence, 100);
         assert_eq!(decoded.key_id, 7);
+        assert_eq!(decoded.stream_id, 0xDEAD_BEEF);
         assert_eq!(decoded.opus_data, vec![9, 8, 7]);
     }
 
@@ -348,7 +369,7 @@ mod tests {
         // 12-byte payload + 16-byte GCM tag, as the sender produces
         let payload = PositionPayload { x: 1.5, y: -2.25, z: 0.75 };
         let ciphertext = [payload.to_bytes().to_vec(), vec![0u8; 16]].concat();
-        let bytes = VoicePacket::position(42, 9, 3, ciphertext).to_bytes();
+        let bytes = VoicePacket::position(42, 9, 3, 0x1234_5678, ciphertext).to_bytes();
         assert_eq!(bytes.len(), POSITION_PACKET_SIZE);
 
         let decoded = VoicePacket::from_bytes(&bytes).unwrap();

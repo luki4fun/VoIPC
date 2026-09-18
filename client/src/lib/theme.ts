@@ -91,13 +91,14 @@ export const PALETTES: readonly Palette[] = [
     },
   },
   {
-    id: "discord-dark",
-    label: "Discord dark",
+    id: "slate-dark",
+    label: "Slate dark",
     dark: true,
     tokens: {
-      // Discord's own greys, in this app's roles: the chat area is the lighter
-      // surface and the sidebars sit behind it, which is the other way round
-      // from the VoIPC palette and the main reason this reads as Discord.
+      // Greys in the arrangement the chat apps most people come from use: the
+      // chat area is the lighter surface and the sidebars sit behind it, which
+      // is the other way round from the VoIPC palette and the whole reason this
+      // one feels different.
       "--bg-primary": "#313338",
       "--bg-secondary": "#2b2d31",
       "--bg-tertiary": "#1e1f22",
@@ -126,8 +127,8 @@ export const PALETTES: readonly Palette[] = [
     },
   },
   {
-    id: "discord-light",
-    label: "Discord light",
+    id: "slate-light",
+    label: "Slate light",
     dark: false,
     tokens: {
       "--bg-primary": "#ffffff",
@@ -180,7 +181,63 @@ export const PALETTES: readonly Palette[] = [
   },
 ];
 
-export const DEFAULT_PALETTE_ID = "voipc-dark";
+/**
+ * The palette a client uses when nobody has chosen one.
+ *
+ * Dark, because that is what the app is for most of the day and what every
+ * screenshot shows. `systemDefaultPaletteId()` picks the light twin when the
+ * machine says it prefers light; this is the answer where there is no machine
+ * to ask, which includes the Node test runner.
+ */
+export const DEFAULT_PALETTE_ID = "slate-dark";
+
+/** The light palette that pairs with the default. */
+export const DEFAULT_LIGHT_PALETTE_ID = "slate-light";
+
+/**
+ * The palette to start in on this machine, before anybody has chosen.
+ *
+ * Follows the operating system's own light/dark setting, which is what a
+ * browser reports through `prefers-color-scheme` and what Android and Windows
+ * pass through to a WebView. Only consulted when nothing is stored: a palette
+ * somebody picked is theirs, and the OS does not get to change it afterwards.
+ */
+export function systemDefaultPaletteId(): string {
+  if (typeof globalThis.matchMedia !== "function") return DEFAULT_PALETTE_ID;
+  try {
+    return globalThis.matchMedia("(prefers-color-scheme: light)").matches
+      ? DEFAULT_LIGHT_PALETTE_ID
+      : DEFAULT_PALETTE_ID;
+  } catch {
+    return DEFAULT_PALETTE_ID;
+  }
+}
+
+/**
+ * Palettes that have been renamed, old id to new.
+ *
+ * A palette id is stored, and `paletteById` falls back to the default for one
+ * it does not know — so without this a rename would silently repaint the app of
+ * everybody who had chosen that palette.
+ */
+const RENAMED_PALETTES: Record<string, string> = {
+  __proto__: null,
+  "discord-dark": "slate-dark",
+  "discord-light": "slate-light",
+} as unknown as Record<string, string>;
+
+/**
+ * A stored palette id under the name this build knows it by.
+ *
+ * Null-prototype, because the id comes off disk — in the browser, out of
+ * localStorage, which the file above notes anyone with devtools is a writer of.
+ * A plain object literal would answer `migratePaletteId("toString")` with a
+ * function, and that would be written back as somebody's palette.
+ */
+export function migratePaletteId(id: string): string {
+  const renamed = RENAMED_PALETTES[id];
+  return typeof renamed === "string" ? renamed : id;
+}
 
 /** The palette with that id, or the default. An id from a newer build lands here. */
 export function paletteById(id: string): Palette {
@@ -230,6 +287,18 @@ export function applyTheme(tokens: Record<TokenName, string>, dark: boolean): vo
   // where there is no such chrome.
   const meta = document.querySelector('meta[name="theme-color"]');
   if (meta) meta.setAttribute("content", tokens["--bg-primary"]);
+
+  // On Android the window is edge to edge and this page paints its own
+  // background into the status- and navigation-bar strips, so the icons in
+  // them are the only part the system still draws. Dark icons for a light
+  // palette, or they are invisible. The bridge exists only in the Android
+  // app; everywhere else this is a no-op.
+  const bridge = (globalThis as { __VoIPC?: { setSystemBarsLight?: (light: boolean) => void } }).__VoIPC;
+  try {
+    bridge?.setSystemBarsLight?.(!dark);
+  } catch {
+    // An older app shell without this method must not cost the palette change
+  }
 }
 
 // ── Contrast ───────────────────────────────────────────────────────────────

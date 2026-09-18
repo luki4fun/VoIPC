@@ -2,7 +2,7 @@
 // protocol + Signal orchestration) owns the connection; audio.ts and video.ts
 // own the media pipelines and only see the session through `SessionContext`.
 
-import type { MediaKey } from "./wasm";
+import type { MediaKeys } from "./wasm";
 import type { ProximityMode } from "../../lib/spatial";
 
 /** Codec of a screen share, as the protocol names it (voipc-protocol types.rs). */
@@ -14,7 +14,12 @@ export interface SessionContext {
   /** Current channel id (0 = General, where no media is allowed). */
   readonly channelId: number;
   /** Installed media key for the current channel, or null while waiting. */
-  readonly mediaKey: MediaKey | null;
+  /**
+   * The channel's media keys: the generation we encrypt with and the one
+   * before it. Always present — `hasChannel(channelId)` is what says whether
+   * we can send yet.
+   */
+  readonly mediaKeys: MediaKeys;
   /** Monotonic per-connection voice sequence (never restarts within a session). */
   nextVoiceSequence(): number;
   /**
@@ -52,7 +57,7 @@ export interface AudioApi {
   onChannelChanged(proximity?: ProximityMode): void;
   /** The current channel's proximity mode changed under us. */
   setProximityMode(proximity: ProximityMode): void;
-  /** Raw 0x05 packet from the server (decrypt with ctx.mediaKey inside). */
+  /** Raw 0x05 packet from the server (decrypt with ctx.mediaKeys inside). */
   onVoicePacket(bytes: Uint8Array): void;
   /** Raw 0x02 EndOfTransmission packet. */
   onEotPacket(bytes: Uint8Array): void;

@@ -223,7 +223,7 @@ pub struct Source {
     pub pan: f32,
     /// Hold this render back by whole 20 ms frames, so one voice can arrive
     /// twice — over the air and through the room — the way a real radio does.
-    /// ponytail: whole frames only; a sample-accurate delay needs a per-source
+    /// bernd: whole frames only; a sample-accurate delay needs a per-source
     /// ring, and nobody can hear 20 ms of quantisation on a radio double.
     pub delay_frames: u8,
 }

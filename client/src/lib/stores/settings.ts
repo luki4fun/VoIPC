@@ -1,4 +1,5 @@
 import { writable } from "svelte/store";
+import { MAX_CONVERSATIONS } from "../chat-rules.js";
 
 export const inputDevice = writable<string>("");
 export const outputDevice = writable<string>("");
@@ -66,6 +67,11 @@ export const lastAcceptSelfSigned = writable<boolean>(false);
 export const autoConnect = writable<boolean>(false);
 /** Answer newcomers' requests for recent channel chat (E2E, pairwise). */
 export const shareChannelHistory = writable<boolean>(true);
+/**
+ * How many conversations the archive keeps: channels and people together,
+ * across every server. 0 keeps all of them.
+ */
+export const maxConversations = writable<number>(MAX_CONVERSATIONS);
 /** Codec for our own screen share: "h264" (every viewer) or "h265" (desktop viewers). */
 export const screenShareCodec = writable<string>("h264");
 
@@ -182,12 +188,14 @@ export interface AppConfig {
   sounds: SoundSettings;
   auto_connect: boolean;
   share_channel_history: boolean;
+  /** Conversations the archive keeps; 0 = all of them. */
+  max_conversations: number;
   /**
    * Appearance preferences, opaque to the backend and owned entirely by
    * `stores/ui-prefs.ts` — see the `ui_prefs` field in config.rs for why this
    * one setting is a blob when every other is its own command. `null` means
-   * nothing has been chosen yet, which is what the first-run layout picker
-   * keys on.
+   * nothing has been chosen yet; the first-run layout picker itself keys on
+   * `layout_asked_version`, which is 0 either way.
    */
   ui_prefs: Record<string, unknown> | null;
   chat_history_path: string | null;
