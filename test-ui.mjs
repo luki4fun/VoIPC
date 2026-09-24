@@ -22,6 +22,8 @@
 
 const PORT = process.argv[2] ?? "19987";
 const CDP = process.argv[3] ?? "9222";
+/** A second, empty server for the multi-server lane; that lane is skipped without one. */
+const PORT2 = process.argv[4] ?? "";
 const URL = `https://127.0.0.1:${PORT}/`;
 const CHANNEL = `ui-${process.pid % 10000}`;
 /** The text channel test-web.sh's channels.json asks every client into. */
@@ -311,6 +313,21 @@ check(
   await alice.evaluate(`!!document.querySelector(".app-layout") && !document.querySelector(".modern-shell")`),
 );
 await sleep(800);
+
+// 0. Arriving on a server is not walking into a voice channel. The server still
+//    parks every session in its lobby, channel 0, but that is "not in voice"
+//    and the UI must say so: no General row to be standing in, a voice bar with
+//    nothing to leave, and the other people on the server listed as online.
+check(
+  "connecting puts you in no voice channel",
+  await alice.evaluate(`!!document.querySelector(".voice-controls .voice-disabled") && !document.querySelector(".leave-voice-btn")`),
+);
+check("the lobby is not drawn as a channel", !(await alice.evaluate(channelNames)).includes("General"));
+check(
+  "the others on the server are listed as online",
+  (await alice.evaluate(userNames)).some((u) => u.includes("ui-bob")),
+  (await alice.evaluate(userNames)).join(","),
+);
 
 // 1. Create a proximity channel through the form. The creator is auto-joined,
 //    so ChannelCreated and the UserList snapshot race — the bug's trigger.
@@ -897,9 +914,19 @@ check(
   const previewing = () =>
     alice.evaluate(`document.querySelector(".channel-list.modern .channels.voice .channel.previewing .channel-name")?.textContent`);
 
+  // Two joins below each need a voice row alice is not in, and the lobby no
+  // longer counts as one — it is not drawn. bob opens a spare room (and, as its
+  // creator, stands in it), which also leaves somebody in a channel alice is
+  // not in for the nested-members check further down.
+  const SPARE = `spare-${process.pid % 10000}`;
+  await bob.evaluate(click('button[title="Create channel"]'));
+  await waitFor(bob, `document.querySelector(".create-form")`);
+  await bob.evaluate(setInput(".create-form input[type=text]", SPARE));
+  await bob.evaluate(click(".create-form .create-btn"));
+  await sleep(2000);
+
   // Assert against the row that was acted on, not merely "something is active":
-  // the first non-active row here is the lobby, and "a channel is active" is
-  // true there whether or not the click did anything.
+  // "a channel is active" is true whether or not the click did anything.
   const startedIn = await activeChannel();
   const firstTarget = await nextChannel();
   await realClick(alice, ".channel-list.modern .channels.voice .channel:not(.active)");
@@ -1034,37 +1061,41 @@ check(
     check("a text channel row to test with", false, "no unjoined text channel listed");
   }
 
-  // The mute checks at the end of this block need a channel with voice in it.
-  // Channel 0 is the lobby, where voice is off by design, and a mute button
-  // that is absent for a good reason still reads as a broken mute button.
-  // The voice panel only renders outside the lobby, so its presence is the
-  // check — no need to know which channel id we happen to be in.
+  // The mute checks at the end of this block need a channel with voice in it,
+  // and a mute button that is absent because we are in no voice channel still
+  // reads as a broken mute button. The voice panel only renders in voice, so
+  // its presence is the check — no need to know which channel we are in.
   check(
-    "we are somewhere with voice, not the lobby",
+    "we are somewhere with voice",
     await alice.evaluate(`!!document.querySelector(".voice-panel")`),
     await activeChannel(),
   );
 
   // The point of the nested rows: a channel you are NOT in shows who is in it.
-  // bob is in the lobby by now, so the lobby row should name him — without
-  // hovering it, previewing it or joining it. The names for another channel are
-  // never pushed to us, so this is really a check that stores/rosters.ts asked.
-  await sleep(1200);
-  const nestedElsewhere = await alice.evaluate(`(() => {
-    const rows = [...document.querySelectorAll(".channel-list.modern .channel")];
-    const active = document.querySelector(".channel-list.modern .channel.active");
-    for (const row of rows) {
-      if (row === active) continue;
-      const nested = row.nextElementSibling;
-      if (nested && nested.classList.contains("nested")) {
-        return [...nested.querySelectorAll(".nested-name")].map((e) => e.textContent.trim());
-      }
-    }
-    return []; })()`);
+  // bob stands in a room alice is not in — the spare, unless the joins above
+  // put her there, in which case he moves to hers from before — and that row
+  // should name him without hovering it, previewing it or joining it. The names
+  // for another channel are never pushed to us, so this is really a check that
+  // stores/rosters.ts asked.
+  const bobRoom = (await activeChannel()) === SPARE ? CHANNEL : SPARE;
+  if (bobRoom !== SPARE) {
+    await bob.evaluate(
+      `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(bobRoom)});
+         if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
+    );
+  }
+  await sleep(1500);
+  const nestedUnder = await alice.evaluate(`(() => {
+    const row = [...document.querySelectorAll(".channel-list.modern .channel")]
+      .find((r) => r.querySelector(".channel-name")?.textContent === ${JSON.stringify(bobRoom)});
+    const nested = row?.nextElementSibling;
+    return nested && nested.classList.contains("nested")
+      ? [...nested.querySelectorAll(".nested-name")].map((e) => e.textContent.trim())
+      : []; })()`);
   check(
     "a channel we are not in lists its members",
-    nestedElsewhere.length > 0,
-    JSON.stringify(nestedElsewhere),
+    nestedUnder.some((n) => n.includes("ui-bob")),
+    `${bobRoom}: ${JSON.stringify(nestedUnder)}`,
   );
 
   // Room and mixer are full-screen activities here, not a centre column.
@@ -1129,6 +1160,17 @@ check(
   await alice.evaluate(click('button[title^="Unmute"]'));
   await sleep(600);
   check("and unmute too", await alice.evaluate(rowMuted(null)) === false);
+
+  // Out of the voice channel without leaving the server. A real click: this
+  // button sits in the voice bar, the bar that grew pointer behaviour before.
+  check("a real click reaches Leave voice", await realClick(alice, ".voice-controls .leave-voice-btn"));
+  await sleep(1200);
+  check("Leave voice takes you out of the channel", await alice.evaluate(
+    `!!document.querySelector(".voice-controls .voice-disabled") && !document.querySelector(".leave-voice-btn")`,
+  ));
+  check("and keeps you on the server", await alice.evaluate(
+    `/Connected/.test(document.querySelector(".status-bar")?.textContent ?? "")`,
+  ));
 }
 
 // 12. The phone shape. Driven at 390px with real touch events, because none of
@@ -1281,6 +1323,140 @@ check(
   };
   check("the writer is told what the channel's timer is", await showsTimer(alice));
   check("and so is somebody only reading it", await showsTimer(bob));
+}
+
+// 14. Several servers at once. The rail's "+" used to disconnect you to bring
+//     up the connect dialog; now it adds a connection beside the others, a
+//     click on the rail only changes what is on screen, and voice follows the
+//     last channel joined — leaving the call on the other server, never the
+//     server itself.
+if (PORT2) {
+  await alice.send("Emulation.setDeviceMetricsOverride", {
+    width: 1280, height: 800, deviceScaleFactor: 1, mobile: false,
+  });
+  await sleep(400);
+  const S1 = `127.0.0.1:${PORT}`;
+  const S2 = `127.0.0.1:${PORT2}`;
+  const railItem = (id) => `.server-rail .rail-item[data-server="${id}"]`;
+  const openIds = () =>
+    alice.evaluate(`[...document.querySelectorAll(".server-rail .rail-item.open")].map((e) => e.dataset.server)`);
+  const railTitle = (id) => alice.evaluate(`document.querySelector('${railItem(id)}')?.title ?? ""`);
+  const onScreen = () => alice.evaluate(`document.querySelector(".server-rail .rail-item.active")?.dataset.server`);
+  const voiceRowActive = (name) => alice.evaluate(`(() => {
+    const row = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(name)});
+    return row ? row.classList.contains("active") : null; })()`);
+
+  // In a call on server 1 first, so there is something for server 2 to keep
+  await alice.evaluate(
+    `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(CHANNEL)});
+       if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
+  );
+  // bob joins her there, so he can witness her leaving it
+  await bob.evaluate(
+    `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(CHANNEL)});
+       if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
+  );
+  await sleep(1500);
+  check("the other client sees alice in the channel", (await bob.evaluate(userNames)).some((u) => u.includes("ui-alice")));
+  check("the rail lists the server we are on", JSON.stringify(await openIds()) === JSON.stringify([S1]), JSON.stringify(await openIds()));
+  check("and says we are in voice there", /in voice/.test(await railTitle(S1)), await railTitle(S1));
+
+  check("a real click reaches the rail's +", await realClick(alice, ".server-rail .rail-item.add"));
+  await waitFor(alice, `document.querySelector(".connect-btn")`, 8_000);
+  check(
+    "adding a server does not disconnect the first",
+    JSON.stringify(await openIds()) === JSON.stringify([S1]) && /in voice/.test(await railTitle(S1)),
+    await railTitle(S1),
+  );
+  check("the dialog can be closed again", await alice.evaluate(`!!document.querySelector(".connect-close")`));
+  await alice.evaluate(setInput('input[placeholder="localhost"]', "127.0.0.1"));
+  await alice.evaluate(setInput('input[placeholder="9987"]', PORT2));
+  await alice.evaluate(setInput('input[placeholder="Your name"]', "ui-alice"));
+  await alice.evaluate(click(".connect-btn"));
+  await waitFor(alice, `!document.querySelector(".connect-btn") && document.querySelectorAll(".server-rail .rail-item.open").length === 2`);
+  await sleep(800);
+  check("the second server opens beside the first", JSON.stringify(await openIds()) === JSON.stringify([S1, S2]), JSON.stringify(await openIds()));
+  check("and it is the one on screen", (await onScreen()) === S2, await onScreen());
+  check("its channel list is its own", !(await alice.evaluate(channelNames)).includes(CHANNEL));
+  check("the call on server 1 carried on", /in voice/.test(await railTitle(S1)), await railTitle(S1));
+  check("and the voice bar still offers to leave it", await alice.evaluate(`!!document.querySelector(".leave-voice-btn")`));
+
+  await realClick(alice, railItem(S1));
+  await sleep(800);
+  check("the rail brings server 1 back", (await onScreen()) === S1 && (await alice.evaluate(channelNames)).includes(CHANNEL));
+  check("still standing in the same channel", (await voiceRowActive(CHANNEL)) === true);
+
+  // Voice follows the last join: a room on server 2 ends the call on server 1
+  await realClick(alice, railItem(S2));
+  await sleep(600);
+  const MS = `multi-${process.pid % 10000}`;
+  await alice.evaluate(click('button[title="Create channel"]'));
+  await waitFor(alice, `document.querySelector(".create-form")`);
+  await alice.evaluate(setInput(".create-form input[type=text]", MS));
+  await alice.evaluate(click(".create-form .create-btn"));
+  await sleep(2500);
+  check("joining voice on server 2 moves the call there", /in voice/.test(await railTitle(S2)), await railTitle(S2));
+  check("and out of server 1", !/in voice/.test(await railTitle(S1)), await railTitle(S1));
+  check("server 1 stays connected", JSON.stringify(await openIds()) === JSON.stringify([S1, S2]), JSON.stringify(await openIds()));
+  check(
+    "the other client sees alice leave her channel on server 1",
+    !(await bob.evaluate(userNames)).some((u) => u.includes("ui-alice")),
+    (await bob.evaluate(userNames)).join(","),
+  );
+
+  // Mute is global and reaches the call wherever it is
+  await alice.evaluate(click('button[title^="Mute"]'));
+  await sleep(600);
+  check("mute works in a call on the second server", (await alice.evaluate(rowMuted(null))) === true);
+  await alice.evaluate(click('button[title^="Unmute"]'));
+  await sleep(600);
+
+  // Disconnect is per server
+  check("a real click reaches server 2's disconnect", await realClick(alice, ".status-bar .disconnect-btn"));
+  await sleep(1200);
+  check("disconnecting server 2 closes only that one", JSON.stringify(await openIds()) === JSON.stringify([S1]), JSON.stringify(await openIds()));
+  check("server 1 is on screen and connected", (await onScreen()) === S1 && await alice.evaluate(
+    `/Connected/.test(document.querySelector(".status-bar")?.textContent ?? "")`,
+  ));
+  check("and no connect dialog came up", !(await alice.evaluate(`!!document.querySelector(".connect-btn")`)));
+
+  // Starting up with both servers remembered and auto-connect on: every one of
+  // them comes back at once, with nobody clicking anything. This path froze
+  // the whole window once — a store written from inside a $derived while two
+  // connects landed together — and none of the clicking above goes near it.
+  const boot = await newTab();
+  await boot.send("Page.navigate", { url: `${URL}favicon.png` });
+  await waitFor(boot, `document.readyState === "complete"`);
+  const bootName = `ui-boot-${process.pid % 10000}`;
+  const remembered = (port) =>
+    ({ name: "127.0.0.1", host: "127.0.0.1", port: Number(port), username: bootName, accept_self_signed: true });
+  await boot.evaluate(`(() => {
+    const saved = JSON.parse(localStorage.getItem("voipc.settings") ?? "{}");
+    Object.assign(saved, {
+      auto_connect: true, remember_connection: true, chat_history_disabled: true,
+      open_servers: ${JSON.stringify([remembered(PORT), remembered(PORT2)])},
+    });
+    localStorage.setItem("voipc.settings", JSON.stringify(saved));
+    return true; })()`);
+  await boot.send("Page.navigate", { url: URL });
+  const bootOpen = () =>
+    boot.evaluate(`[...document.querySelectorAll(".server-rail .rail-item.open")].map((e) => [e.dataset.server, e.title])`);
+  try {
+    await waitFor(boot, `[...document.querySelectorAll(".server-rail .rail-item.open")].filter((e) => /connected/.test(e.title)).length === 2`);
+  } catch {
+    // reported by the checks below
+  }
+  const opened = await bootOpen();
+  check(
+    "at startup every remembered server connects",
+    opened.length === 2 && opened.every(([, t]) => /connected/.test(t)),
+    JSON.stringify(opened),
+  );
+  check("and the one on screen shows its channels", (await boot.evaluate(channelNames)).includes(CHANNEL));
+  const bootFatal = boot.errors.filter((e) => !/Failed to load resource/.test(e));
+  check("with nothing thrown on the way", bootFatal.length === 0, bootFatal.slice(0, 2).join(" | "));
+} else {
+  console.log("SKIP the multi-server lane (no second server port given)");
 }
 
 // 7. Nothing threw anywhere. One uncaught exception in a keyed {#each} wedges

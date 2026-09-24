@@ -1,7 +1,6 @@
 import { writable } from 'svelte/store';
-import { invoke } from '@tauri-apps/api/core';
 import { addNotification } from './notifications';
-import { startTransmit, stopTransmit, toggleDeafen, toggleMute } from './voice';
+import { leaveVoice, startTransmit, stopTransmit, toggleDeafen, toggleMute } from './voice';
 
 /** true in the browser build (web client), false in the Tauri app (desktop/Android). */
 export const isWeb: boolean = __WEB__;
@@ -64,9 +63,11 @@ if (typeof window !== 'undefined') {
       void stopTransmit();
     };
 
-    // Notification action: disconnect
+    // Notification action: the call notification's button. It is the call's,
+    // so it ends the call — leaving voice, not the server, and not the other
+    // servers that are open.
     (window as any).__voipc_disconnect = () => {
-      invoke('disconnect').catch(() => {});
+      void leaveVoice();
     };
 
     // Notification actions: toggle mute / deafen. The result has to be fed back

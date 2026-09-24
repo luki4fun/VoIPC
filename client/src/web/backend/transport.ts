@@ -21,6 +21,11 @@ const IDLE_TIMEOUT_MS = 150_000;
  * uplink is the bottleneck and dropping a frame beats growing a backlog.
  */
 const MAX_FRAMES_IN_FLIGHT = 30;
+/**
+ * Slots past the cap that only a keyframe may take. Deltas stop at the cap, so
+ * the keyframe that ends a drop always has room (native: must_block).
+ */
+const KEY_RESERVE = 4;
 
 export interface TransportHandlers {
   /** One complete control frame payload (postcard ServerMessage, no length prefix). */
@@ -44,9 +49,12 @@ export interface Transport {
    *
    * Returns false when the frame was dropped because too many earlier frames
    * are still in flight — our uplink is the bottleneck, and the caller should
-   * count that as loss and ask its encoder for a keyframe.
+   * count that as loss and ask its encoder for a keyframe. A keyframe (`key`)
+   * may use a few reserved slots past that point.
    */
-  sendVideoFrame(body: Uint8Array): boolean;
+  sendVideoFrame(body: Uint8Array, key: boolean): boolean;
+  /** Frames whose stream has not finished writing. */
+  videoBacklog(): number;
   /** Flush queued control frames and close the session. onClosed is not called. */
   close(): Promise<void>;
 }
@@ -144,11 +152,11 @@ export async function connect(host: string, port: number, handlers: TransportHan
         // Dropped: datagrams are unreliable by design.
       });
     },
-    sendVideoFrame(body) {
+    sendVideoFrame(body, key) {
       if (closed) return false;
       // A frame goes out whole or not at all: a half-written frame would
       // stall every viewer's assembler until the next keyframe.
-      if (framesInFlight >= MAX_FRAMES_IN_FLIGHT) return false;
+      if (framesInFlight >= MAX_FRAMES_IN_FLIGHT + (key ? KEY_RESERVE : 0)) return false;
       framesInFlight++;
       void (async () => {
         try {
@@ -165,6 +173,7 @@ export async function connect(host: string, port: number, handlers: TransportHan
       })();
       return true;
     },
+    videoBacklog: () => framesInFlight,
     async close() {
       if (closed) return;
       closed = true;

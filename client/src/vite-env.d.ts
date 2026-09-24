@@ -3,6 +3,15 @@
 /** true in the browser build (`vite --mode web`), false in the Tauri app. Set by vite.config.ts. */
 declare const __WEB__: boolean;
 
+/** Workspace version, read from client/package.json at build time. */
+declare const __APP_VERSION__: string;
+
+/** Short commit this bundle was built from, `+` when the tree had edits. Set by vite.config.ts. */
+declare const __BUILD_HASH__: string;
+
+/** When this bundle was built, ISO 8601. Set by vite.config.ts. */
+declare const __BUILD_TIME__: string;
+
 interface ImportMetaEnv {
   /**
    * Server the connect dialog starts with, "host" or "host:port". Set at build

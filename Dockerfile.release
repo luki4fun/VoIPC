@@ -61,6 +61,12 @@ COPY . .
 # Frontend dependencies
 RUN cd client && npm ci
 
+# The build hash the UI shows. The build context has no .git (see
+# .dockerignore), so `npm run release` passes it in. Declared this late so a
+# new commit does not invalidate the dependency layers above.
+ARG VOIPC_BUILD_HASH=""
+ENV VOIPC_BUILD_HASH=$VOIPC_BUILD_HASH
+
 # Build the web client (wasm + Vite) BEFORE the server: the server embeds client/dist-web
 RUN cd client && npm run build:web
 

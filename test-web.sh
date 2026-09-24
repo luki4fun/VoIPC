@@ -91,6 +91,20 @@ done
 grep -q '"hash"' "$WORK/wt.json" || { echo "server did not come up:"; cat "$WORK/server.log"; exit 1; }
 echo "server up: $(cat "$WORK/wt.json")"
 
+# A second, empty server for test-ui.mjs's multi-server lane: one client holding
+# two connections at once is the thing to prove, and two ports on one host are
+# two servers as far as the client can tell. Its own directory, because a server
+# keeps its state next to where it runs. The certificate's SAN covers it too.
+TCP_PORT2=$((TCP_PORT + 1))
+mkdir -p "$WORK/s2"
+cp "$WORK/server.crt" "$WORK/server.key" "$WORK/s2/"
+(cd "$WORK/s2" && exec "$SCRIPT_DIR/$SERVER" --host 127.0.0.1 --tcp-port "$TCP_PORT2" --udp-port "$TCP_PORT2" \
+  --cert server.crt --key server.key > "$WORK/server2.log" 2>&1) &
+for _ in $(seq 1 50); do
+  curl -sk --http2-prior-knowledge "https://127.0.0.1:$TCP_PORT2/wt.json" 2>/dev/null | grep -q '"hash"' && break
+  sleep 0.2
+done
+
 run_browser() { # name role extra-params logfile browser
   local url="https://127.0.0.1:$TCP_PORT/?selftest=1&name=$1&role=$2&duration=$DURATION$3"
   local engine="${5:-$BROWSER}"
@@ -231,7 +245,7 @@ if [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
     curl -s "http://127.0.0.1:$UI_CDP/json/version" > /dev/null 2>&1 && break
     sleep 0.2
   done
-  if node "$SCRIPT_DIR/test-ui.mjs" "$TCP_PORT" "$UI_CDP" | tee "$WORK/ui.txt"; then
+  if node "$SCRIPT_DIR/test-ui.mjs" "$TCP_PORT" "$UI_CDP" "$TCP_PORT2" | tee "$WORK/ui.txt"; then
     echo "PASS the UI survives creating and configuring a proximity channel"
   else
     echo "FAIL the UI regression test" | tee -a "$WORK/fails.txt"

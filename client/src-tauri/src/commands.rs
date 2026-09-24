@@ -9,7 +9,7 @@ use voipc_protocol::messages::ClientMessage;
 use voipc_protocol::types::ProximityMode;
 use voipc_protocol::voice::VoicePacket;
 
-use crate::app_state::{AppState, PendingMessage, PendingTarget};
+use crate::app_state::{conn, conn_mut, voice, voice_mut, AppState, PendingMessage, PendingTarget};
 use crate::crypto::{self, ChatArchive, ChatMessage};
 use crate::network;
 use crate::screenshare;
@@ -21,6 +21,10 @@ pub struct AudioDeviceInfo {
 }
 
 /// Connect to a VoIPC server. Returns the assigned user_id.
+///
+/// `address` is also the server id: every later command and event names this
+/// server by exactly this string. Connecting an id that is already open
+/// replaces that one connection and leaves every other server alone.
 ///
 /// `accept_invalid_certs`: If true, accept self-signed/invalid TLS certificates.
 /// Default should be false for security; set to true only for development.
@@ -53,60 +57,39 @@ pub async fn connect(
     .await
 }
 
-/// Disconnect from the current server.
+/// Disconnect from one server. The others stay connected.
 #[tauri::command]
-pub async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
-    let mut conn = state.connection.write().await;
-    if let Some(mut connection) = conn.take() {
-        // Stop any ongoing voice capture
-        connection.transmitting.store(false, Ordering::Relaxed);
-        if let Some(task) = connection.capture_task.take() {
-            let _ = task.await;
-        }
+pub async fn disconnect(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+    server: String,
+) -> Result<(), String> {
+    // Out of the map under the lock, torn down outside it (see `teardown`).
+    // Its Signal state goes with it: it lived on the connection.
+    let connection = state.connections.write().await.remove(&server);
+    if let Some(connection) = connection {
+        network::teardown(&state, &app_handle, &server, connection).await;
+        tracing::info!(server, "disconnected gracefully");
+    }
+    Ok(())
+}
 
-        // Stop any ongoing screen capture
-        connection.screen_share_active.store(false, Ordering::Relaxed);
-        if let Some(task) = connection.screen_capture_task.take() {
-            let _ = task.await;
-        }
-
-        // Close capture session (stops screen capture)
-        connection.capture_session = None;
-
-        // Send graceful disconnect, then drop tcp_tx so writer can flush and exit
-        let _ = network::send_tcp_message(&connection.tcp_tx, &ClientMessage::Disconnect).await;
-        drop(connection.tcp_tx);
-
-        // Give the writer task a moment to flush the disconnect message
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        // Now abort remaining background tasks
-        for task in connection.tasks {
-            task.abort();
-        }
-
-        // Drop voice/video/screen-audio channels (the aborted mixer task
-        // owned and released the playback stream)
-        drop(connection.voice_tx);
-        drop(connection.video_tx);
-        drop(connection.screen_audio_tx);
-
-        // Tell the server right away (otherwise it holds the username until
-        // its idle timeout and a quick reconnect gets "already taken")
-        connection.quic.close().await;
-
-        // Clear Signal protocol state to prevent stale sessions on reconnect
-        if let Ok(mut sig) = state.signal.lock() {
-            sig.own_user_id = None;
-            sig.initialized = false;
-            sig.stores = None;
-            sig.established_sessions.clear();
-            sig.pending_sessions.clear();
-            sig.pending_messages.clear();
-            sig.channels.clear();
-        }
-
-        tracing::info!("disconnected gracefully");
+/// Disconnect from every server, for a front end that is starting from scratch.
+///
+/// The connections live in this process, the list of them in the page: a
+/// reloaded webview (a dev reload, or Android recreating the activity while
+/// the process lives on) comes back knowing none of them, and one still
+/// holding voice would go on playing and capturing with nothing on screen to
+/// stop it.
+#[tauri::command]
+pub async fn disconnect_all(
+    state: State<'_, AppState>,
+    app_handle: tauri::AppHandle,
+) -> Result<(), String> {
+    let all: Vec<_> = state.connections.write().await.drain().collect();
+    for (server, connection) in all {
+        network::teardown(&state, &app_handle, &server, connection).await;
+        tracing::info!(server, "disconnected: the front end started over");
     }
     Ok(())
 }
@@ -115,11 +98,12 @@ pub async fn disconnect(state: State<'_, AppState>) -> Result<(), String> {
 #[tauri::command]
 pub async fn join_channel(
     state: State<'_, AppState>,
+    server: String,
     channel_id: u32,
     password: Option<String>,
 ) -> Result<(), String> {
-    let mut conn = state.connection.write().await;
-    let connection = conn.as_mut().ok_or("Not connected")?;
+    let mut conns = state.connections.write().await;
+    let connection = conn_mut(&mut conns, &server)?;
     network::send_tcp_message(
         &connection.tcp_tx,
         &ClientMessage::JoinChannel {
@@ -163,6 +147,7 @@ pub async fn join_channel(
 #[tauri::command]
 pub async fn create_channel(
     state: State<'_, AppState>,
+    server: String,
     name: String,
     password: Option<String>,
     proximity: Option<String>,
@@ -178,8 +163,8 @@ pub async fn create_channel(
         }
     }
     let proximity = parse_proximity(proximity.as_deref())?;
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
     network::send_tcp_message(
         &connection.tcp_tx,
         &ClientMessage::CreateChannel {
@@ -196,9 +181,13 @@ pub async fn create_channel(
 /// Unsubscribe from a text channel. Leaving a voice channel is still
 /// `join_channel(0)` — the lobby is where you stand when you are nowhere.
 #[tauri::command]
-pub async fn leave_channel(state: State<'_, AppState>, channel_id: u32) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+pub async fn leave_channel(
+    state: State<'_, AppState>,
+    server: String,
+    channel_id: u32,
+) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
     network::send_tcp_message(&connection.tcp_tx, &ClientMessage::LeaveChannel { channel_id })
         .await
 }
@@ -208,17 +197,17 @@ pub async fn leave_channel(state: State<'_, AppState>, channel_id: u32) -> Resul
 /// server is told — and it has always seen the requests themselves go past.
 #[tauri::command]
 pub async fn set_history_sharing(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    // Not connected is not a failure: the flag is sent again on the next
-    // connect, from the config the settings toggle has already written.
-    let Some(connection) = conn.as_ref() else {
-        return Ok(());
-    };
-    network::send_tcp_message(
-        &connection.tcp_tx,
-        &ClientMessage::SetHistorySharing { enabled },
-    )
-    .await
+    // Every server we are on. None, or a dead link, is not a failure: the flag
+    // is sent again on the next connect, from the config the settings toggle
+    // has already written.
+    for connection in state.connections.read().await.values() {
+        let _ = network::send_tcp_message(
+            &connection.tcp_tx,
+            &ClientMessage::SetHistorySharing { enabled },
+        )
+        .await;
+    }
+    Ok(())
 }
 
 /// Ask named members for a channel's recent chat.
@@ -230,15 +219,17 @@ pub async fn set_history_sharing(state: State<'_, AppState>, enabled: bool) -> R
 #[tauri::command]
 pub async fn request_channel_history(
     state: State<'_, AppState>,
+    server: String,
     channel_id: u32,
     target_user_ids: Vec<u32>,
 ) -> Result<(), String> {
-    let tcp_tx = {
-        let conn = state.connection.read().await;
-        conn.as_ref().ok_or("Not connected")?.tcp_tx.clone()
+    let (tcp_tx, signal) = {
+        let conns = state.connections.read().await;
+        let connection = conn(&conns, &server)?;
+        (connection.tcp_tx.clone(), connection.signal.clone())
     };
     let targets: Vec<u32> = {
-        let sig = state.signal.lock().map_err(|e| e.to_string())?;
+        let sig = signal.lock().map_err(|e| e.to_string())?;
         // A pairwise session is all an answer needs — history travels over that,
         // not over the channel's group key. Asking for the group key here would
         // block the one repair a member has when keying went wrong.
@@ -271,6 +262,7 @@ pub async fn request_channel_history(
 #[tauri::command]
 pub async fn set_channel_options(
     state: State<'_, AppState>,
+    server: String,
     channel_id: u32,
     hidden: Option<bool>,
     anonymous: Option<bool>,
@@ -279,8 +271,8 @@ pub async fn set_channel_options(
     routed: Option<bool>,
     message_ttl_secs: Option<u32>,
 ) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
     network::send_tcp_message(
         &connection.tcp_tx,
         &ClientMessage::SetChannelOptions {
@@ -311,12 +303,13 @@ fn parse_proximity(mode: Option<&str>) -> Result<ProximityMode, String> {
 #[tauri::command]
 pub async fn set_channel_proximity(
     state: State<'_, AppState>,
+    server: String,
     channel_id: u32,
     proximity: String,
 ) -> Result<(), String> {
     let proximity = parse_proximity(Some(&proximity))?;
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
     network::send_tcp_message(
         &connection.tcp_tx,
         &ClientMessage::SetChannelProximity {
@@ -331,11 +324,12 @@ pub async fn set_channel_proximity(
 #[tauri::command]
 pub async fn set_channel_password(
     state: State<'_, AppState>,
+    server: String,
     channel_id: u32,
     password: Option<String>,
 ) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
     network::send_tcp_message(
         &connection.tcp_tx,
         &ClientMessage::SetChannelPassword {
@@ -350,11 +344,12 @@ pub async fn set_channel_password(
 #[tauri::command]
 pub async fn kick_user(
     state: State<'_, AppState>,
+    server: String,
     channel_id: u32,
     user_id: u32,
 ) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
     network::send_tcp_message(
         &connection.tcp_tx,
         &ClientMessage::KickUser {
@@ -369,10 +364,11 @@ pub async fn kick_user(
 #[tauri::command]
 pub async fn request_channel_users(
     state: State<'_, AppState>,
+    server: String,
     channel_id: u32,
 ) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
     network::send_tcp_message(
         &connection.tcp_tx,
         &ClientMessage::RequestChannelUsers { channel_id },
@@ -384,11 +380,12 @@ pub async fn request_channel_users(
 #[tauri::command]
 pub async fn send_invite(
     state: State<'_, AppState>,
+    server: String,
     channel_id: u32,
     target_user_id: u32,
 ) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
     network::send_tcp_message(
         &connection.tcp_tx,
         &ClientMessage::SendInvite {
@@ -405,12 +402,24 @@ pub async fn send_invite(
 pub async fn send_poke(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
+    server: String,
     target_user_id: u32,
     message: String,
 ) -> Result<(), String> {
+    let (tcp_tx, own_user_id, own_username, signal) = {
+        let conns = state.connections.read().await;
+        let connection = conn(&conns, &server)?;
+        (
+            connection.tcp_tx.clone(),
+            connection.user_id,
+            connection.username.clone(),
+            connection.signal.clone(),
+        )
+    };
+
     // Encrypt the poke message with Signal Protocol pairwise session
     let (ciphertext, message_type) = tokio::task::block_in_place(|| {
-        let mut signal = state.signal.lock().map_err(|e| e.to_string())?;
+        let mut signal = signal.lock().map_err(|e| e.to_string())?;
         let stores = signal
             .stores
             .as_mut()
@@ -423,12 +432,6 @@ pub async fn send_poke(
             ))
             .map_err(|e| format!("poke encryption failed: {e}"))
     })?;
-
-    let (tcp_tx, own_user_id, own_username) = {
-        let conn = state.connection.read().await;
-        let connection = conn.as_ref().ok_or("Not connected")?;
-        (connection.tcp_tx.clone(), connection.user_id, connection.username.clone())
-    };
 
     network::send_tcp_message(
         &tcp_tx,
@@ -446,7 +449,9 @@ pub async fn send_poke(
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis() as u64;
-        let _ = app_handle.emit(
+        network::emit_server(
+            &app_handle,
+            &server,
             "direct-chat-message",
             serde_json::json!({
                 "from_user_id": own_user_id,
@@ -465,10 +470,11 @@ pub async fn send_poke(
 #[tauri::command]
 pub async fn accept_invite(
     state: State<'_, AppState>,
+    server: String,
     channel_id: u32,
 ) -> Result<(), String> {
-    let mut conn = state.connection.write().await;
-    let connection = conn.as_mut().ok_or("Not connected")?;
+    let mut conns = state.connections.write().await;
+    let connection = conn_mut(&mut conns, &server)?;
 
     // Clean up screen share state before switching channels
     if connection.is_screen_sharing {
@@ -497,10 +503,11 @@ pub async fn accept_invite(
 #[tauri::command]
 pub async fn decline_invite(
     state: State<'_, AppState>,
+    server: String,
     channel_id: u32,
 ) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
     network::send_tcp_message(
         &connection.tcp_tx,
         &ClientMessage::DeclineInvite { channel_id },
@@ -514,6 +521,7 @@ pub async fn decline_invite(
 pub async fn send_channel_message(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
+    server: String,
     content: String,
     // The text channel to write in. Omitted means the voice channel we stand
     // in, which is what the classic layout has always sent to.
@@ -523,14 +531,15 @@ pub async fn send_channel_message(
     // inside the ciphertext, so the relay can neither read it nor change it.
     ttl_secs: Option<u32>,
 ) -> Result<(), String> {
-    let (user_id, username, current_channel_id, tcp_tx) = {
-        let conn = state.connection.read().await;
-        let connection = conn.as_ref().ok_or("Not connected")?;
+    let (user_id, username, current_channel_id, tcp_tx, signal) = {
+        let conns = state.connections.read().await;
+        let connection = conn(&conns, &server)?;
         (
             connection.user_id,
             connection.username.clone(),
             connection.current_channel_id.load(std::sync::atomic::Ordering::Relaxed),
             connection.tcp_tx.clone(),
+            connection.signal.clone(),
         )
     };
     let channel_id = channel_id.unwrap_or(current_channel_id);
@@ -542,7 +551,7 @@ pub async fn send_channel_message(
     // Somebody left this channel since we last wrote in it: mint a new sender
     // key and hand it to the members still here, so the leaver's copy of the
     // chain cannot read what follows.
-    network::rotate_sender_key_if_stale(channel_id, user_id, &state.signal, &tcp_tx).await;
+    network::rotate_sender_key_if_stale(channel_id, user_id, &signal, &tcp_tx).await;
 
     // The id travels inside the ciphertext, so our own echo below and every
     // receiver's copy file the message under the same one.
@@ -551,7 +560,7 @@ pub async fn send_channel_message(
 
     // Try encrypted channel message via Sender Keys
     let encrypted_result = tokio::task::block_in_place(|| {
-        let sig = state.signal.lock().map_err(|e| e.to_string())?;
+        let sig = signal.lock().map_err(|e| e.to_string())?;
         if !sig.initialized {
             return Err("not initialized".to_string());
         }
@@ -561,7 +570,7 @@ pub async fn send_channel_message(
         }
         drop(sig);
 
-        let mut sig = state.signal.lock().map_err(|e| e.to_string())?;
+        let mut sig = signal.lock().map_err(|e| e.to_string())?;
         let stores = sig
             .stores
             .as_mut()
@@ -594,7 +603,9 @@ pub async fn send_channel_message(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            let _ = app_handle.emit(
+            network::emit_server(
+                &app_handle,
+                &server,
                 "channel-chat-message",
                 serde_json::json!({
                     "channel_id": channel_id,
@@ -613,7 +624,7 @@ pub async fn send_channel_message(
             tracing::info!(channel_id, "encryption not ready ({}), queueing message", reason);
             // Queue the message — it will be sent when sender key distribution completes
             {
-                let mut sig = state.signal.lock().unwrap_or_else(|p| p.into_inner());
+                let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
                 sig.pending_messages.push(PendingMessage {
                     target: PendingTarget::Channel { channel_id },
                     id: message_id.clone(),
@@ -628,7 +639,9 @@ pub async fn send_channel_message(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            let _ = app_handle.emit(
+            network::emit_server(
+                &app_handle,
+                &server,
                 "channel-chat-message",
                 serde_json::json!({
                     "channel_id": channel_id,
@@ -652,6 +665,7 @@ pub async fn send_channel_message(
 pub async fn send_direct_message(
     state: State<'_, AppState>,
     app_handle: tauri::AppHandle,
+    server: String,
     target_user_id: u32,
     content: String,
     // Seconds this message is meant to live. A direct message has no channel to
@@ -659,10 +673,15 @@ pub async fn send_direct_message(
     // conversation; it rides inside the envelope like a channel message's does.
     ttl_secs: Option<u32>,
 ) -> Result<(), String> {
-    let (tcp_tx, own_user_id, own_username) = {
-        let conn = state.connection.read().await;
-        let connection = conn.as_ref().ok_or("Not connected")?;
-        (connection.tcp_tx.clone(), connection.user_id, connection.username.clone())
+    let (tcp_tx, own_user_id, own_username, signal) = {
+        let conns = state.connections.read().await;
+        let connection = conn(&conns, &server)?;
+        (
+            connection.tcp_tx.clone(),
+            connection.user_id,
+            connection.username.clone(),
+            connection.signal.clone(),
+        )
     };
 
     // A direct message used to be raw UTF-8 inside the pairwise ciphertext,
@@ -674,13 +693,13 @@ pub async fn send_direct_message(
 
     // Try encrypted direct message via pairwise Signal session
     let encrypted_result = tokio::task::block_in_place(|| {
-        let sig = state.signal.lock().map_err(|e| e.to_string())?;
+        let sig = signal.lock().map_err(|e| e.to_string())?;
         if !sig.initialized || !sig.established_sessions.contains(&target_user_id) {
             return Err("no session".to_string());
         }
         drop(sig);
 
-        let mut sig = state.signal.lock().map_err(|e| e.to_string())?;
+        let mut sig = signal.lock().map_err(|e| e.to_string())?;
         let stores = sig
             .stores
             .as_mut()
@@ -713,7 +732,9 @@ pub async fn send_direct_message(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            let _ = app_handle.emit(
+            network::emit_server(
+                &app_handle,
+                &server,
                 "direct-chat-message",
                 serde_json::json!({
                     "from_user_id": own_user_id,
@@ -732,7 +753,7 @@ pub async fn send_direct_message(
             tracing::info!(target_user_id, "encryption not ready ({}), queueing DM", reason);
             // Queue the message — it will be sent when pairwise session is established
             {
-                let mut sig = state.signal.lock().unwrap_or_else(|p| p.into_inner());
+                let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
                 sig.pending_messages.push(PendingMessage {
                     target: PendingTarget::Direct { target_user_id },
                     id: message_id.clone(),
@@ -747,7 +768,9 @@ pub async fn send_direct_message(
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_millis() as u64;
-            let _ = app_handle.emit(
+            network::emit_server(
+                &app_handle,
+                &server,
                 "direct-chat-message",
                 serde_json::json!({
                     "from_user_id": own_user_id,
@@ -815,15 +838,15 @@ pub(crate) async fn sdk_set_transmit(
 }
 
 async fn start_capture(state: &AppState, app_handle: tauri::AppHandle) -> Result<(), String> {
-    let mut conn = state.connection.write().await;
-    let connection = conn.as_mut().ok_or("Not connected")?;
+    let mut conns = state.connections.write().await;
+    let connection = voice_mut(state, &mut conns)?;
 
     if connection.transmitting.load(Ordering::Relaxed) {
         return Ok(()); // Already transmitting
     }
 
     if connection.current_channel_id.load(Ordering::Relaxed) == 0 {
-        return Err("Voice is disabled in the General lobby".into());
+        return Err("Join a voice channel first".into());
     }
 
     if connection.is_muted.load(Ordering::Relaxed) {
@@ -852,6 +875,7 @@ async fn start_capture(state: &AppState, app_handle: tauri::AppHandle) -> Result
         state.sender_lane.clone(),
         state.input_gain.clone(),
         app_handle,
+        std::sync::Arc::from(connection.server_address.as_str()),
     );
     connection.capture_task = Some(task);
 
@@ -859,13 +883,16 @@ async fn start_capture(state: &AppState, app_handle: tauri::AppHandle) -> Result
     Ok(())
 }
 
+/// Stop the microphone wherever it is open. Never an error: whatever is not
+/// transmitting is already stopped, and voice may have moved on since.
 async fn stop_capture(state: &AppState) -> Result<(), String> {
-    let mut conn = state.connection.write().await;
-    let connection = conn.as_mut().ok_or("Not connected")?;
-
-    if !connection.transmitting.load(Ordering::Relaxed) {
+    let mut conns = state.connections.write().await;
+    let Some(connection) = conns
+        .values_mut()
+        .find(|c| c.transmitting.load(Ordering::Relaxed))
+    else {
         return Ok(()); // Not transmitting
-    }
+    };
 
     // Signal the capture task to stop
     connection.transmitting.store(false, Ordering::Relaxed);
@@ -1130,79 +1157,78 @@ pub async fn set_ptt_hold_mode(
     Ok(())
 }
 
-/// Toggle self-mute.
+/// Toggle self-mute. One flag for every server, and each of them is told:
+/// the user is muted, not their seat on one server.
 #[tauri::command]
 pub async fn toggle_mute(state: State<'_, AppState>) -> Result<bool, String> {
-    let conn = state.connection.read().await;
-    if let Some(conn) = conn.as_ref() {
-        let was_muted = conn.is_muted.load(Ordering::Relaxed);
-        let new_muted = !was_muted;
-        conn.is_muted.store(new_muted, Ordering::Relaxed);
+    let new_muted = !state.is_muted.fetch_xor(true, Ordering::Relaxed);
+    {
+        let conns = state.connections.read().await;
         // A game showing a muted marker learns about it here; the server's
         // own broadcast never comes back to us
-        state.sdk_event(crate::app_state::SdkEvent::Muted {
-            user_id: conn.user_id,
-            muted: new_muted,
-        });
-        let _ = network::send_tcp_message(
-            &conn.tcp_tx,
-            &ClientMessage::SetMuted {
+        if let Ok(v) = voice(&state, &conns) {
+            state.sdk_event(crate::app_state::SdkEvent::Muted {
+                user_id: v.user_id,
                 muted: new_muted,
-            },
-        )
-        .await;
-        // Persist
-        {
-            let mut config = state.config();
-            config.muted = new_muted;
-            if let Err(e) = crate::config::save_config(&config) {
-                tracing::warn!("Failed to save config: {e}");
-            }
+            });
         }
-        Ok(new_muted)
-    } else {
-        Err("Not connected".into())
+        for connection in conns.values() {
+            let _ = network::send_tcp_message(
+                &connection.tcp_tx,
+                &ClientMessage::SetMuted { muted: new_muted },
+            )
+            .await;
+        }
     }
+    // Persist
+    {
+        let mut config = state.config();
+        config.muted = new_muted;
+        if let Err(e) = crate::config::save_config(&config) {
+            tracing::warn!("Failed to save config: {e}");
+        }
+    }
+    Ok(new_muted)
 }
 
-/// Toggle self-deafen.
+/// Toggle self-deafen, on every server alike (see `toggle_mute`).
 #[tauri::command]
 pub async fn toggle_deafen(state: State<'_, AppState>) -> Result<bool, String> {
-    let conn = state.connection.read().await;
-    if let Some(conn) = conn.as_ref() {
-        let was_deafened = conn.is_deafened.load(Ordering::Relaxed);
-        let new_deafened = !was_deafened;
-        conn.is_deafened.store(new_deafened, Ordering::Relaxed);
-        state.sdk_event(crate::app_state::SdkEvent::Deafened {
-            user_id: conn.user_id,
-            deafened: new_deafened,
-        });
-        let _ = network::send_tcp_message(
-            &conn.tcp_tx,
-            &ClientMessage::SetDeafened {
+    let new_deafened = !state.is_deafened.fetch_xor(true, Ordering::Relaxed);
+    {
+        let conns = state.connections.read().await;
+        if let Ok(v) = voice(&state, &conns) {
+            state.sdk_event(crate::app_state::SdkEvent::Deafened {
+                user_id: v.user_id,
                 deafened: new_deafened,
-            },
-        )
-        .await;
-        // Persist
-        {
-            let mut config = state.config();
-            config.deafened = new_deafened;
-            if let Err(e) = crate::config::save_config(&config) {
-                tracing::warn!("Failed to save config: {e}");
-            }
+            });
         }
-        Ok(new_deafened)
-    } else {
-        Err("Not connected".into())
+        for connection in conns.values() {
+            let _ = network::send_tcp_message(
+                &connection.tcp_tx,
+                &ClientMessage::SetDeafened {
+                    deafened: new_deafened,
+                },
+            )
+            .await;
+        }
     }
+    // Persist
+    {
+        let mut config = state.config();
+        config.deafened = new_deafened;
+        if let Err(e) = crate::config::save_config(&config) {
+            tracing::warn!("Failed to save config: {e}");
+        }
+    }
+    Ok(new_deafened)
 }
 
 /// Send a ping to measure latency.
 #[tauri::command]
-pub async fn ping(state: State<'_, AppState>) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+pub async fn ping(state: State<'_, AppState>, server: String) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -1272,10 +1298,11 @@ pub async fn set_output_device(
             tracing::warn!("Failed to save config: {e}");
         }
     }
-    let conn = state.connection.read().await;
-    if let Some(connection) = conn.as_ref() {
+    // Every connection: only the voice one holds a stream to rebuild, but
+    // the others open theirs from this when voice comes to them.
+    for connection in state.connections.read().await.values() {
         if let Ok(mut live) = connection.output_device_live.lock() {
-            *live = Some(device_name);
+            *live = Some(device_name.clone());
         }
         connection.playback_restart.store(true, Ordering::Relaxed);
     }
@@ -1300,10 +1327,7 @@ pub async fn set_volume(
         }
     }
     // Apply live — the mixer reads this every tick
-    let conn = state.connection.read().await;
-    if let Some(connection) = conn.as_ref() {
-        connection.master_volume.store(clamped.to_bits(), Ordering::Relaxed);
-    }
+    state.master_volume.store(clamped.to_bits(), Ordering::Relaxed);
     Ok(())
 }
 
@@ -1311,8 +1335,8 @@ pub async fn set_volume(
 /// The UI polls this and computes a windowed loss percentage.
 #[tauri::command]
 pub async fn get_voice_stats(state: State<'_, AppState>) -> Result<(u32, u32), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = voice(&state, &conns)?;
     Ok((
         connection.voice_frames_played.load(Ordering::Relaxed),
         connection.voice_frames_lost.load(Ordering::Relaxed),
@@ -1382,11 +1406,11 @@ pub async fn start_screen_share(
         // (fps is stored in the frontend and passed to start_screen_capture later)
         let session = screenshare::request_screencast(&source_type, &source_id).await?;
 
-        let mut conn = state.connection.write().await;
-        let connection = conn.as_mut().ok_or("Not connected")?;
+        let mut conns = state.connections.write().await;
+        let connection = voice_mut(&state, &mut conns)?;
 
         if connection.current_channel_id.load(Ordering::Relaxed) == 0 {
-            return Err("Screen sharing is disabled in the General lobby".into());
+            return Err("Join a voice channel first".into());
         }
 
         if connection.is_screen_sharing {
@@ -1420,8 +1444,8 @@ pub async fn start_screen_share(
 /// Stop screen sharing — stops capture, closes portal session, sends TCP stop.
 #[tauri::command]
 pub async fn stop_screen_share(state: State<'_, AppState>) -> Result<(), String> {
-    let mut conn = state.connection.write().await;
-    let connection = conn.as_mut().ok_or("Not connected")?;
+    let mut conns = state.connections.write().await;
+    let connection = voice_mut(&state, &mut conns)?;
 
     if !connection.is_screen_sharing {
         return Ok(());
@@ -1447,8 +1471,8 @@ pub async fn watch_screen_share(
     state: State<'_, AppState>,
     sharer_user_id: u32,
 ) -> Result<(), String> {
-    let mut conn = state.connection.write().await;
-    let connection = conn.as_mut().ok_or("Not connected")?;
+    let mut conns = state.connections.write().await;
+    let connection = voice_mut(&state, &mut conns)?;
 
     network::send_tcp_message(
         &connection.tcp_tx,
@@ -1471,8 +1495,8 @@ pub async fn watch_screen_share(
 /// Stop watching the current screen share.
 #[tauri::command]
 pub async fn stop_watching_screen_share(state: State<'_, AppState>) -> Result<(), String> {
-    let mut conn = state.connection.write().await;
-    let connection = conn.as_mut().ok_or("Not connected")?;
+    let mut conns = state.connections.write().await;
+    let connection = voice_mut(&state, &mut conns)?;
 
     if connection.watching_user_id.is_none() {
         return Ok(()); // Already not watching
@@ -1487,8 +1511,8 @@ pub async fn stop_watching_screen_share(state: State<'_, AppState>) -> Result<()
 /// Toggle screen share audio on/off. Returns the new enabled state.
 #[tauri::command]
 pub async fn toggle_screen_audio(state: State<'_, AppState>) -> Result<bool, String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = voice(&state, &conns)?;
     let was_enabled = connection
         .screen_audio_enabled
         .fetch_xor(true, Ordering::Relaxed);
@@ -1503,8 +1527,8 @@ pub async fn toggle_screen_audio(state: State<'_, AppState>) -> Result<bool, Str
 pub async fn get_screen_audio_status(
     state: State<'_, AppState>,
 ) -> Result<(u32, u32), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = voice(&state, &conns)?;
     let send = connection
         .screen_audio_send_count
         .load(Ordering::Relaxed);
@@ -1521,8 +1545,8 @@ pub async fn get_screen_audio_status(
 pub async fn get_screen_share_stats(
     state: State<'_, AppState>,
 ) -> Result<(u32, u64, u32, u32, u64, u32), String> {
-    let conn = state.connection.read().await;
-    let c = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let c = voice(&state, &conns)?;
     Ok((
         c.screen_video_frames_sent.load(Ordering::Relaxed),
         c.screen_video_bytes_sent.load(Ordering::Relaxed),
@@ -1559,8 +1583,8 @@ pub async fn start_screen_capture(
 
     #[cfg(not(target_os = "android"))]
     {
-        let mut conn = state.connection.write().await;
-        let connection = conn.as_mut().ok_or("Not connected")?;
+        let mut conns = state.connections.write().await;
+        let connection = voice_mut(&state, &mut conns)?;
 
         if connection.screen_capture_task.is_some() {
             return Ok(()); // Already capturing
@@ -1614,8 +1638,8 @@ pub async fn start_screen_capture(
 /// Stop the screen capture task — called from frontend when viewer_count goes to 0.
 #[tauri::command]
 pub async fn stop_screen_capture(state: State<'_, AppState>) -> Result<(), String> {
-    let mut conn = state.connection.write().await;
-    let connection = conn.as_mut().ok_or("Not connected")?;
+    let mut conns = state.connections.write().await;
+    let connection = voice_mut(&state, &mut conns)?;
 
     connection.screen_share_active.store(false, Ordering::Relaxed);
     if let Some(task) = connection.screen_capture_task.take() {
@@ -1646,8 +1670,8 @@ pub async fn switch_screen_share_source(
     // Acquire the new capture session BEFORE locking (may show portal on Linux).
     let new_session = screenshare::request_screencast(&source_type, &source_id).await?;
 
-    let mut conn = state.connection.write().await;
-    let connection = conn.as_mut().ok_or("Not connected")?;
+    let mut conns = state.connections.write().await;
+    let connection = voice_mut(&state, &mut conns)?;
 
     if !connection.is_screen_sharing {
         return Err("Not currently screen sharing".into());
@@ -1737,8 +1761,8 @@ pub async fn set_screen_share_codec(state: State<'_, AppState>, codec: String) -
 /// Set the keyframe_requested flag — called from frontend on KeyframeRequested event.
 #[tauri::command]
 pub async fn set_keyframe_requested(state: State<'_, AppState>) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = voice(&state, &conns)?;
     connection.keyframe_requested.store(true, Ordering::Relaxed);
     Ok(())
 }
@@ -1762,12 +1786,9 @@ pub async fn set_voice_mode(state: State<'_, AppState>, mode: String) -> Result<
             tracing::warn!("Failed to save config: {e}");
         }
     }
-    // Apply to active connection if connected
-    let conn = state.connection.read().await;
-    if let Some(connection) = conn.as_ref() {
-        let vm = crate::app_state::VoiceMode::from_str(&mode);
-        connection.voice_mode.store(vm as u8, Ordering::Relaxed);
-    }
+    // Live: every connection reads the shared flag
+    let vm = crate::app_state::VoiceMode::from_str(&mode);
+    state.voice_mode.store(vm as u8, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1786,19 +1807,18 @@ pub async fn set_vad_threshold(state: State<'_, AppState>, threshold_db: f32) ->
             tracing::warn!("Failed to save config: {e}");
         }
     }
-    // Apply to active connection if connected
-    let conn = state.connection.read().await;
-    if let Some(connection) = conn.as_ref() {
-        connection.vad_threshold_db.store(threshold_db as i32, Ordering::Relaxed);
-    }
+    // Live: every connection reads the shared value
+    state
+        .vad_threshold_db
+        .store(threshold_db as i32, Ordering::Relaxed);
     Ok(())
 }
 
 /// Get the current audio input level in dB.
 #[tauri::command]
 pub async fn get_audio_level(state: State<'_, AppState>) -> Result<f32, String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = voice(&state, &conns)?;
     let raw = connection.current_audio_level.load(Ordering::Relaxed);
     Ok(raw as f32 / 100.0)
 }
@@ -1819,13 +1839,14 @@ pub async fn start_mic_test(
     }
     #[cfg(not(target_os = "android"))]
     {
+        if state
+            .connections
+            .read()
+            .await
+            .values()
+            .any(|c| c.transmitting.load(Ordering::Relaxed))
         {
-            let conn = state.connection.read().await;
-            if let Some(c) = conn.as_ref() {
-                if c.transmitting.load(Ordering::Relaxed) {
-                    return Err("Cannot test microphone while transmitting".into());
-                }
-            }
+            return Err("Cannot test microphone while transmitting".into());
         }
         if state.mic_test_active.swap(true, Ordering::Relaxed) {
             return Ok(()); // already running
@@ -1861,7 +1882,7 @@ pub async fn start_mic_test(
             let mut monitoring = None;
             if monitor {
                 let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-                match voipc_audio::playback::start_playback(output_device.as_deref(), flag) {
+                match voipc_audio::playback::start_playback(output_device.as_deref(), flag, None) {
                     Ok((stream, producer)) if stream.sample_rate() == 48_000 => {
                         monitoring = Some((stream, producer));
                     }
@@ -1889,7 +1910,10 @@ pub async fn start_mic_test(
             let mut mono: Vec<f32> = Vec::new();
             let mut scratch: Vec<f32> = Vec::new();
 
-            let mut buf = vec![0.0f32; 2400]; // 50ms at 48kHz
+            // The whole capture ring, so each pass drains everything captured
+            // since the last one: a fixed 50 ms read per 50-ms-and-a-bit pass
+            // lets the backlog creep up while the monitor's playback starves.
+            let mut buf = vec![0.0f32; ringbuf::traits::Observer::capacity(&consumer).get()];
             while active.load(Ordering::Relaxed) {
                 let read = ringbuf::traits::Consumer::pop_slice(&mut consumer, &mut buf);
                 if read > 0 {
@@ -1979,14 +2003,14 @@ pub async fn start_output_test(
         let active = state.output_test_active.clone();
         let device = state.settings.read().await.output_device.clone();
         tokio::task::spawn_blocking(move || {
-            use ringbuf::traits::Producer as _;
+            use ringbuf::traits::{Observer as _, Producer as _};
             use tauri::Emitter as _;
             let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             // bernd: 48 kHz only, exactly like the mic test's monitor path —
             // a resampler for a two-second audition is not worth lifting out
             // of the mixer.
             let (stream, mut producer) =
-                match voipc_audio::playback::start_playback(device.as_deref(), flag) {
+                match voipc_audio::playback::start_playback(device.as_deref(), flag, None) {
                     Ok((s, p)) if s.sample_rate() == 48_000 => (s, p),
                     Ok(_) => {
                         active.store(false, Ordering::Relaxed);
@@ -2015,24 +2039,28 @@ pub async fn start_output_test(
             let mut side_started = std::time::Instant::now();
             let _ = app.emit("output-test-side", serde_json::json!({"side": "left"}));
             while active.load(Ordering::Relaxed) {
-                if side_started.elapsed() >= OUTPUT_TEST_SIDE {
-                    left = !left;
-                    side_started = std::time::Instant::now();
-                    let _ = app.emit(
-                        "output-test-side",
-                        serde_json::json!({"side": if left { "left" } else { "right" }}),
-                    );
+                // Topped up by the ring's level, not fed a frame per timer
+                // tick: a sleep overshoots, so one frame per 20 ms sleep runs
+                // short of the device and crackles. Five frames in hand is
+                // latency, but nobody is waiting on a test tone.
+                while producer.occupied_len() < 5 * stereo.len() {
+                    if side_started.elapsed() >= OUTPUT_TEST_SIDE {
+                        left = !left;
+                        side_started = std::time::Instant::now();
+                        let _ = app.emit(
+                            "output-test-side",
+                            serde_json::json!({"side": if left { "left" } else { "right" }}),
+                        );
+                    }
+                    voipc_audio::spatial::test_voice_frame(sample, &mut mono);
+                    sample += frame as u64;
+                    for (i, &s) in mono.iter().enumerate() {
+                        stereo[2 * i] = if left { s } else { 0.0 };
+                        stereo[2 * i + 1] = if left { 0.0 } else { s };
+                    }
+                    producer.push_slice(&stereo);
                 }
-                voipc_audio::spatial::test_voice_frame(sample, &mut mono);
-                sample += frame as u64;
-                for (i, &s) in mono.iter().enumerate() {
-                    stereo[2 * i] = if left { s } else { 0.0 };
-                    stereo[2 * i + 1] = if left { 0.0 } else { s };
-                }
-                // Push what fits and sleep a frame: the ring is the clock, so
-                // a full one simply means we are ahead of the device.
-                producer.push_slice(&stereo);
-                std::thread::sleep(std::time::Duration::from_millis(20));
+                std::thread::sleep(std::time::Duration::from_millis(5));
             }
         });
         Ok(())
@@ -2093,11 +2121,8 @@ pub async fn toggle_noise_suppression(state: State<'_, AppState>) -> Result<bool
         }
     }
 
-    // Apply to active connection if connected
-    let conn = state.connection.read().await;
-    if let Some(connection) = conn.as_ref() {
-        connection.noise_suppression.store(new_val, Ordering::Relaxed);
-    }
+    // Live: every connection reads the shared flag
+    state.noise_suppression.store(new_val, Ordering::Relaxed);
     Ok(new_val)
 }
 
@@ -2111,8 +2136,8 @@ pub async fn set_user_volume(
     user_id: u32,
     volume: f32,
 ) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = voice(&state, &conns)?;
     let vol = volume.clamp(0.0, 2.0);
     let mut volumes = connection.user_volumes.lock().map_err(|e| e.to_string())?;
     if (vol - 1.0).abs() < f32::EPSILON {
@@ -2128,8 +2153,8 @@ pub async fn get_user_volume(
     state: State<'_, AppState>,
     user_id: u32,
 ) -> Result<f32, String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = voice(&state, &conns)?;
     let volumes = connection.user_volumes.lock().map_err(|e| e.to_string())?;
     Ok(volumes.get(&user_id).copied().unwrap_or(1.0))
 }
@@ -2156,8 +2181,8 @@ pub async fn set_user_fx(
     water: u8,
 ) -> Result<(), String> {
     let lane = parse_lane(&effect, muffle, reverb, water)?;
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = voice(&state, &conns)?;
     let mut map = connection.user_fx.lock().map_err(|e| e.to_string())?;
     if lane.is_plain() {
         map.remove(&user_id);
@@ -2233,8 +2258,8 @@ pub async fn get_user_fx(
     state: State<'_, AppState>,
     user_id: u32,
 ) -> Result<(String, u8, u8, u8), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = voice(&state, &conns)?;
     let map = connection.user_fx.lock().map_err(|e| e.to_string())?;
     Ok(match map.get(&user_id) {
         Some(l) => (l.effect.id().to_string(), l.muffle, l.reverb, l.water),
@@ -2249,8 +2274,8 @@ pub async fn get_user_fx(
 /// exactly the muted person you opened the mixer to find.
 #[tauri::command]
 pub async fn get_source_levels(state: State<'_, AppState>) -> Result<HashMap<u32, f32>, String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = voice(&state, &conns)?;
     let levels = connection.source_levels.lock().map_err(|e| e.to_string())?;
     Ok(levels.clone())
 }
@@ -2275,8 +2300,8 @@ pub async fn set_user_position(
     muffle: Option<u8>,
     direct: Option<bool>,
 ) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = voice(&state, &conns)?;
     let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
     match pos {
         None => {
@@ -2319,8 +2344,8 @@ pub async fn set_own_position(
         [0.0, 1.0]
     };
 
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = voice(&state, &conns)?;
     let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
     spatial.listener = Listener { pos, fwd };
     // The beacon task picks this up within 100 ms. Sending here instead would
@@ -2336,8 +2361,8 @@ pub async fn set_position_sync(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = voice(&state, &conns)?;
     let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
     // The room view disables its checkbox while a game drives, but the command
     // is the boundary, not the checkbox: turning sync on here would clear the
@@ -2382,19 +2407,27 @@ pub async fn set_spatial_setting(
             _ => settings.screen_audio_spatial = value,
         }
     }
-    if let Some(connection) = state.connection.read().await.as_ref() {
-        let mode = {
+    {
+        let conns = state.connections.read().await;
+        for connection in conns.values() {
             let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
             match key.as_str() {
                 "spatial_audio" => spatial.enabled = value,
                 _ => spatial.screen_audio_spatial = value,
             }
-            spatial.proximity_for_sdk()
-        };
+        }
         // Turning placement off leaves a game reading "3d" and wondering why
-        // its coordinates do nothing, so tell it what the user just did.
+        // its coordinates do nothing, so tell it what the user just did — as
+        // the call it plays in sees it.
         if key == "spatial_audio" {
-            state.sdk_event(crate::app_state::SdkEvent::Proximity { mode });
+            if let Ok(v) = voice(&state, &conns) {
+                let mode = v
+                    .spatial
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .proximity_for_sdk();
+                state.sdk_event(crate::app_state::SdkEvent::Proximity { mode });
+            }
         }
     }
 
@@ -2497,8 +2530,9 @@ pub async fn set_sdk_config(
         let _ = sdk_set_transmit(&state, app, false).await;
     }
     if beacon_allowed == Some(false) {
-        let conn = state.connection.read().await;
-        if let Some(connection) = conn.as_ref() {
+        // Wherever a game armed it: the beacon belongs to the connection it
+        // said hello on, which need not be the voice one any more.
+        for connection in state.connections.read().await.values() {
             let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
             if spatial.beacon {
                 // The game keeps placing the listener locally; nothing leaves
@@ -2514,8 +2548,8 @@ pub async fn set_sdk_config(
 /// Forget every placement (room reset, or a game disconnecting).
 #[tauri::command]
 pub async fn clear_positions(state: State<'_, AppState>) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+    let conns = state.connections.read().await;
+    let connection = voice(&state, &conns)?;
     let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
     spatial.clear_positions();
     Ok(())
@@ -2524,20 +2558,32 @@ pub async fn clear_positions(state: State<'_, AppState>) -> Result<(), String> {
 /// Start (or re-aim) the spatial test: a synthetic voice orbits the listener
 /// through the live voice mixer, so what the user hears is exactly what
 /// proximity chat will do. Needs a connection: the mixer and the playback
-/// stream only exist while one is up.
+/// stream only exist while one is up. The voice one if we are in a call, so
+/// the test sounds through the stream the call already holds.
 #[tauri::command]
 pub async fn start_spatial_test(state: State<'_, AppState>, mode: String) -> Result<(), String> {
     let mode = parse_proximity(Some(&mode))?;
     if mode == ProximityMode::Off {
         return Err("Pick 2d or 3d".into());
     }
-    let conn = state.connection.read().await;
-    let connection = conn
-        .as_ref()
+    let conns = state.connections.read().await;
+    let connection = voice(&state, &conns)
+        .ok()
+        .or_else(|| conns.values().next())
         .ok_or("Connect to a server first — the test plays through the live voice mixer")?;
+    // Switching modes mid-run keeps the generator phase and the gain ramp —
+    // including a run that started on another connection before voice came
+    let mut previous = None;
+    for other in conns.values() {
+        let taken = other
+            .spatial
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .test
+            .take();
+        previous = previous.or(taken);
+    }
     let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
-    // Switching modes mid-run keeps the generator phase and the gain ramp
-    let previous = spatial.test.take();
     spatial.test = Some(crate::app_state::SpatialTest {
         mode,
         started: std::time::Instant::now(),
@@ -2552,7 +2598,8 @@ pub async fn start_spatial_test(state: State<'_, AppState>, mode: String) -> Res
 /// none runs or we are not connected.
 #[tauri::command]
 pub async fn stop_spatial_test(state: State<'_, AppState>) -> Result<(), String> {
-    if let Some(connection) = state.connection.read().await.as_ref() {
+    // Wherever it runs: it may have started before voice moved
+    for connection in state.connections.read().await.values() {
         let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(test) = spatial.test.as_mut() {
             test.stopping = true;
@@ -2913,6 +2960,7 @@ pub async fn clear_chat_history(state: State<'_, AppState>) -> Result<(), String
 #[tauri::command]
 pub async fn send_channel_history(
     state: State<'_, AppState>,
+    server: String,
     channel_id: u32,
     target_user_id: u32,
     messages: serde_json::Value,
@@ -2923,18 +2971,21 @@ pub async fn send_channel_history(
     if payload.len() > voipc_protocol::codec::MAX_RELAY_CIPHERTEXT {
         return Err("history payload too large".into());
     }
+    let (tcp_tx, signal) = {
+        let conns = state.connections.read().await;
+        let connection = conn(&conns, &server)?;
+        (connection.tcp_tx.clone(), connection.signal.clone())
+    };
     let (ciphertext, message_type) = tokio::task::block_in_place(|| {
-        let mut signal = state.signal.lock().map_err(|e| e.to_string())?;
+        let mut signal = signal.lock().map_err(|e| e.to_string())?;
         let stores = signal.stores.as_mut().ok_or("E2E encryption not initialized".to_string())?;
         tokio::runtime::Handle::current()
             .block_on(voipc_crypto::session::encrypt_message(stores, target_user_id, &payload))
             .map_err(|e| format!("encryption failed: {e}"))
     })?;
 
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
     network::send_tcp_message(
-        &connection.tcp_tx,
+        &tcp_tx,
         &ClientMessage::SendChannelHistory {
             channel_id,
             target_user_id,
@@ -2947,39 +2998,50 @@ pub async fn send_channel_history(
 
 // ── Moderation (admin token session) ──────────────────────────────────
 
-async fn send_admin_message(state: &AppState, msg: ClientMessage) -> Result<(), String> {
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("Not connected")?;
+async fn send_admin_message(
+    state: &AppState,
+    server: &str,
+    msg: ClientMessage,
+) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, server)?;
     network::send_tcp_message(&connection.tcp_tx, &msg).await
 }
 
 /// Log this session in as server admin. The reply arrives as the
 /// `admin-status` event (or `admin-error`).
 #[tauri::command]
-pub async fn admin_login(state: State<'_, AppState>, token: String) -> Result<(), String> {
-    send_admin_message(&state, ClientMessage::AdminLogin { token }).await
+pub async fn admin_login(
+    state: State<'_, AppState>,
+    server: String,
+    token: String,
+) -> Result<(), String> {
+    send_admin_message(&state, &server, ClientMessage::AdminLogin { token }).await
 }
 
 /// Disconnect a user from the server (admin only).
 #[tauri::command]
 pub async fn admin_kick(
     state: State<'_, AppState>,
+    server: String,
     user_id: u32,
     reason: String,
 ) -> Result<(), String> {
-    send_admin_message(&state, ClientMessage::AdminKick { user_id, reason }).await
+    send_admin_message(&state, &server, ClientMessage::AdminKick { user_id, reason }).await
 }
 
 /// Disconnect a user and ban their IP (admin only). `duration_secs` 0 = until restart.
 #[tauri::command]
 pub async fn admin_ban(
     state: State<'_, AppState>,
+    server: String,
     user_id: u32,
     reason: String,
     duration_secs: u32,
 ) -> Result<(), String> {
     send_admin_message(
         &state,
+        &server,
         ClientMessage::AdminBan {
             user_id,
             reason,
@@ -2991,14 +3053,18 @@ pub async fn admin_ban(
 
 /// Lift an IP ban (admin only). The updated list arrives as `admin-bans`.
 #[tauri::command]
-pub async fn admin_unban(state: State<'_, AppState>, ip: String) -> Result<(), String> {
-    send_admin_message(&state, ClientMessage::AdminUnban { ip }).await
+pub async fn admin_unban(
+    state: State<'_, AppState>,
+    server: String,
+    ip: String,
+) -> Result<(), String> {
+    send_admin_message(&state, &server, ClientMessage::AdminUnban { ip }).await
 }
 
 /// Request the ban list (admin only); delivered as the `admin-bans` event.
 #[tauri::command]
-pub async fn admin_list_bans(state: State<'_, AppState>) -> Result<(), String> {
-    send_admin_message(&state, ClientMessage::AdminListBans).await
+pub async fn admin_list_bans(state: State<'_, AppState>, server: String) -> Result<(), String> {
+    send_admin_message(&state, &server, ClientMessage::AdminListBans).await
 }
 
 /// Forget the TOFU-pinned certificate of a server (after a legitimate
@@ -3113,15 +3179,62 @@ pub fn remove_server(
     Ok(config.saved_servers.clone())
 }
 
+/// Remember which servers are open, in the order they were opened, so the
+/// next start reconnects all of them. Written on a manual connect and an
+/// explicit disconnect, never on a lost link: a server that dropped us is
+/// still one the user meant to be on.
+#[tauri::command]
+pub fn save_open_servers(
+    state: State<'_, AppState>,
+    servers: Vec<crate::config::SavedServer>,
+) -> Result<(), String> {
+    let mut config = state.config();
+    config.open_servers = servers;
+    crate::config::save_config(&config)
+}
+
 /// Reset all settings to defaults and delete the config file.
 #[tauri::command]
-pub async fn reset_config(state: State<'_, AppState>) -> Result<(), String> {
+pub async fn reset_config(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+) -> Result<(), String> {
     let default_config = crate::config::AppConfig::default();
 
-    // Reset in-memory settings
+    // The settings are shared with every connection, a call included, so the
+    // microphone closes first: the default mode is push-to-talk, and a capture
+    // left running under it would send every frame it hears.
+    stop_capture(&state).await?;
+    network::release_holds(&app);
+
+    // Reset in-memory settings, and what every connection reads live
+    let (was_muted, was_deafened) = (
+        state.is_muted.load(Ordering::Relaxed),
+        state.is_deafened.load(Ordering::Relaxed),
+    );
     {
         let mut settings = state.settings.write().await;
         *settings = crate::app_state::UserSettings::default();
+        state.seed_shared(&settings);
+    }
+    // ...and every server hears about the mute and deafen that just changed,
+    // or its members go on seeing a muted icon on somebody they can hear.
+    let (muted, deafened) = (
+        state.is_muted.load(Ordering::Relaxed),
+        state.is_deafened.load(Ordering::Relaxed),
+    );
+    for connection in state.connections.read().await.values() {
+        if muted != was_muted {
+            let _ = network::send_tcp_message(&connection.tcp_tx, &ClientMessage::SetMuted { muted })
+                .await;
+        }
+        if deafened != was_deafened {
+            let _ = network::send_tcp_message(
+                &connection.tcp_tx,
+                &ClientMessage::SetDeafened { deafened },
+            )
+            .await;
+        }
     }
     {
         let mut ptt = state.ptt_binding.write().unwrap();

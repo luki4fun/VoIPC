@@ -104,6 +104,11 @@ pub struct AppConfig {
     pub last_accept_self_signed: Option<bool>,
     /// Saved servers for the connect dialog (keyed by host:port).
     pub saved_servers: Vec<SavedServer>,
+    /// The servers that were open when the app last changed them, in the order
+    /// they were opened: what a start with `auto_connect` reconnects. Empty in
+    /// a config written before several servers could be open at once.
+    #[serde(default)]
+    pub open_servers: Vec<SavedServer>,
 
     // Screen share
     /// Codec our own screen share is encoded with: "h264" (default — every
@@ -231,6 +236,7 @@ impl Default for AppConfig {
             last_username: None,
             last_accept_self_signed: None,
             saved_servers: Vec::new(),
+            open_servers: Vec::new(),
             screen_share_codec: "h264".into(),
             spatial_audio: true,
             screen_audio_spatial: true,
@@ -408,5 +414,40 @@ mod tests {
         let config: AppConfig = serde_json::from_str(older).expect("deserialize");
         assert_eq!(config.ui_prefs, serde_json::Value::Null);
         assert_eq!(config.ptt_key, "KeyV");
+    }
+
+    /// Every config written before several servers could be open lacks the
+    /// list. It must load as "none open" — the front end then counts the last
+    /// server as the one — and never as a parse error, which would reset
+    /// every other setting to its default.
+    #[test]
+    fn open_servers_default_to_none_and_round_trip() {
+        let older = r#"{ "last_host": "voice.example", "last_port": 9987 }"#;
+        let config: AppConfig = serde_json::from_str(older).expect("deserialize");
+        assert!(config.open_servers.is_empty());
+        assert_eq!(config.last_host.as_deref(), Some("voice.example"));
+
+        let mut config = AppConfig::default();
+        config.open_servers = vec![
+            SavedServer {
+                name: "one".into(),
+                host: "a.example".into(),
+                port: 9987,
+                username: "luki".into(),
+                accept_self_signed: false,
+            },
+            SavedServer {
+                name: "two".into(),
+                host: "b.example".into(),
+                port: 9988,
+                username: "luki".into(),
+                accept_self_signed: true,
+            },
+        ];
+        let text = serde_json::to_string(&config).expect("serialize");
+        let back: AppConfig = serde_json::from_str(&text).expect("deserialize");
+        let hosts: Vec<_> = back.open_servers.iter().map(|s| (s.host.as_str(), s.port)).collect();
+        assert_eq!(hosts, [("a.example", 9987), ("b.example", 9988)], "order is the opening order");
+        assert!(back.open_servers[1].accept_self_signed);
     }
 }

@@ -5,7 +5,9 @@
   //
   // Nothing about it changed in the move except where the settings gear sends
   // its click, and `.app-layout` / `.main-content` / `.titlebar` are still the
-  // class names test-ui.mjs looks for.
+  // class names test-ui.mjs looks for. Since several servers can be open it
+  // has the modern layout's server rail too: down the far left on a desktop,
+  // beside the channel list in the phone's Channels tab.
 
   import ChannelList from "../ChannelList.svelte";
   import ChatPanel from "../ChatPanel.svelte";
@@ -16,9 +18,12 @@
   import MixerView from "../MixerView.svelte";
   import StatusBar from "../StatusBar.svelte";
   import MobilePTT from "../MobilePTT.svelte";
+  import ReconnectOverlay from "../ReconnectOverlay.svelte";
+  import ServerRail from "../modern/ServerRail.svelte";
   import Icon from "../Icons.svelte";
 
-  import { unreadPerChannel } from "../../stores/chat.js";
+  import { serverEntries, showConnectDialog } from "../../connect.js";
+  import { voice } from "../../stores/channels.js";
   import { isMobile, mobileTab } from "../../stores/platform.js";
   import { centreView, currentProximity } from "../../stores/room.js";
   import { poppedOut, watchingUserId } from "../../stores/screenshare.js";
@@ -47,7 +52,13 @@
       {#if $watchingUserId !== null}
         <ScreenShareViewer />
       {:else if $mobileTab === 'channels'}
-        <ChannelList />
+        <div class="channels-tab">
+          <ServerRail onadd={() => showConnectDialog.set(true)} />
+          <div class="server-pane">
+            <ChannelList />
+            <ReconnectOverlay />
+          </div>
+        </div>
       {:else if $mobileTab === 'chat'}
         <ChatPanel />
       {:else if $mobileTab === 'mixer'}
@@ -57,9 +68,15 @@
       {:else}
         <UserList />
       {/if}
+      <!-- The Channels tab has its own, beside the rail rather than over it -->
+      {#if $watchingUserId !== null || $mobileTab !== 'channels'}
+        <ReconnectOverlay />
+      {/if}
     </div>
 
-    <MobilePTT />
+    {#if $voice !== null}
+      <MobilePTT />
+    {/if}
     <VoiceControls />
     <StatusBar />
 
@@ -84,7 +101,8 @@
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
           </svg>
-          {#if Array.from($unreadPerChannel.values()).reduce((a, b) => a + b, 0) > 0}
+          <!-- This server's; the others' are on their icons in the rail -->
+          {#if ($serverEntries.find((e) => e.active)?.unread ?? 0) > 0}
             <span class="tab-badge"></span>
           {/if}
         </div>
@@ -123,8 +141,10 @@
       </button>
     </nav>
   {:else}
-    <!-- Desktop: 3-column layout -->
+    <!-- Desktop: the rail, then the three columns of the server on screen -->
     <div class="main-content">
+      <ServerRail onadd={() => showConnectDialog.set(true)} />
+      <div class="server-pane">
       <ChannelList />
       {#if $watchingUserId !== null && !$poppedOut}
         <div class="viewer-with-chat">
@@ -147,6 +167,8 @@
         <ChatPanel />
       {/if}
       <UserList />
+      <ReconnectOverlay />
+      </div>
     </div>
 
     <VoiceControls />
@@ -202,6 +224,16 @@
     overflow: hidden;
   }
 
+  /* Everything that belongs to the server on screen, and the box its
+     reconnect overlay covers — the rail beside it stays usable. */
+  .server-pane {
+    position: relative;
+    display: flex;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+  }
+
   /* Screen-share viewer with the chat pane stacked below it */
   .viewer-with-chat {
     display: flex;
@@ -253,7 +285,12 @@
   }
 
   .mobile-main {
+    position: relative;
     flex-direction: column;
+  }
+
+  .channels-tab {
+    display: flex;
   }
 
   /* Mobile: each child fills the full width */

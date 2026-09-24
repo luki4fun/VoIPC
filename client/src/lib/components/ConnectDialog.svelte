@@ -1,4 +1,9 @@
 <script lang="ts">
+  // Opens a server. Up on its own while no server is on screen, and from the
+  // rail's "+" while some are — then with a close button, and connecting here
+  // leaves every open server as it is. It stays up until a connect succeeds,
+  // so the reason one failed stays on screen under the form.
+
   import { invoke } from "@tauri-apps/api/core";
   import {
     rememberConnection,
@@ -10,10 +15,9 @@
     type SavedServer,
   } from "../stores/settings.js";
   import { isWeb } from "../stores/platform.js";
-  import { pendingInvite } from "../stores/connection.js";
+  import { pendingInvite, serverAddress } from "../stores/connection.js";
   import { parseInviteLink } from "../invite.js";
-  import { connectTo } from "../connect.js";
-  import { pendingConnect } from "../stores/server-switch.js";
+  import { connectTo, serverId, showConnectDialog } from "../connect.js";
 
   // Invite link pasted here: takes host/port from it and joins the channel
   // right after connecting (App.svelte watches pendingInvite)
@@ -27,7 +31,11 @@
     }
     host = parsed.host;
     port = parsed.port;
-    pendingInvite.set(parsed.invite);
+    touched = true;
+    // Tagged with its own server now: App.svelte acts on an invite as soon as
+    // its server is connected, and without a server it would take the one on
+    // screen — which, from the rail's "+", is a different one.
+    pendingInvite.set({ ...parsed.invite, server: serverId(parsed.host, parsed.port) });
     inviteLink = "";
     error = "";
   }
@@ -40,36 +48,28 @@
   let selfSigned = $state($lastAcceptSelfSigned);
   let remember = $state($rememberConnection);
 
+  /** Anything typed, pasted or picked here. From then on the fields are the
+   *  user's: a connect finishing elsewhere (a bookmark clicked in the rail)
+   *  rewrites the last-used details, and must not rewrite the form under them. */
+  let touched = false;
+
   // Sync from stores when they're hydrated (async config load may arrive after first render)
   $effect(() => {
-    host = $lastHost;
-    port = $lastPort;
-    name = $lastUsername;
-    selfSigned = $lastAcceptSelfSigned;
-    remember = $rememberConnection;
-  });
-
-  // The server rail asked for a different server. It disconnects first, which
-  // is what brings this dialog back on screen; we finish the job it started.
-  //
-  // The values go straight to connectWith rather than through the fields: the
-  // effect above re-syncs those from the settings stores whenever they change,
-  // and `connectTo` changes them on success, so a connect driven off the fields
-  // would be racing its own result.
-  $effect(() => {
-    const wanted = $pendingConnect;
-    if (!wanted || connecting) return;
-    pendingConnect.set(null);
-    host = wanted.host;
-    port = wanted.port;
-    if (wanted.username) name = wanted.username;
-    selfSigned = wanted.acceptSelfSigned;
-    void connectWith(wanted.host, wanted.port, wanted.username || name, wanted.acceptSelfSigned);
+    const [h, p, u, ss, r] = [$lastHost, $lastPort, $lastUsername, $lastAcceptSelfSigned, $rememberConnection];
+    if (touched) return;
+    host = h;
+    port = p;
+    name = u;
+    selfSigned = ss;
+    remember = r;
   });
 
   async function connectWith(h: string, p: number, u: string, selfSignedOk: boolean) {
     error = "";
     connecting = true;
+    // An invite from this dialog is for the server it connects to — which is
+    // not the one on screen when this is a second server being added.
+    if ($pendingInvite) pendingInvite.set({ ...$pendingInvite, server: serverId(h, p) });
     const result = await connectTo({
       host: h,
       port: p,
@@ -79,6 +79,7 @@
     });
     connecting = false;
     if (!result.ok) error = result.error;
+    else showConnectDialog.set(false);
   }
 
   async function handleConnect() {
@@ -90,6 +91,7 @@
     port = s.port;
     name = s.username;
     selfSigned = s.accept_self_signed;
+    touched = true;
     await handleConnect();
   }
 
@@ -140,8 +142,18 @@
 </script>
 
 <div class="overlay">
-  <div class="dialog">
-    <h2>Connect to Server</h2>
+  <div class="dialog" oninput={() => (touched = true)}>
+    <div class="title-row">
+      <h2>Connect to Server</h2>
+      {#if $serverAddress}
+        <button
+          class="connect-close"
+          onclick={() => showConnectDialog.set(false)}
+          title="Back to the open servers"
+          disabled={connecting}>&#x2715;</button
+        >
+      {/if}
+    </div>
 
     {#if $savedServers.length > 0}
       <div class="saved-servers">
@@ -295,6 +307,29 @@
     display: flex;
     flex-direction: column;
     gap: 16px;
+  }
+
+  .title-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+
+  .title-row h2 {
+    flex: 1;
+  }
+
+  .connect-close {
+    background: transparent;
+    color: var(--text-secondary);
+    border: none;
+    padding: 4px 8px;
+    font-size: 14px;
+  }
+
+  .connect-close:hover {
+    color: var(--text-primary);
   }
 
   h2 {

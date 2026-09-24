@@ -7,14 +7,24 @@
 // the hide-members one is the kind of wrong that leaks a roster somebody asked
 // to keep private.
 //
-// Nothing here is component-local — every input is a global store — so it all
-// moves without changing what it computes.
+// Nothing here is component-local — every input is a store — so it all moves
+// without changing what it computes. The member list is of the server on
+// screen, so these read the bare stores; who is *speaking* is the call's, and
+// only counts when the call is on the server on screen.
 
 import { derived, get, writable, type Readable } from "svelte/store";
 
-import { channels, currentChannelId, previewChannelId, previewUsers } from "./channels.js";
+import {
+  channels,
+  currentChannelId,
+  previewChannelId,
+  previewUsers,
+  viewingVoice,
+  voice,
+  voiceChannel,
+} from "./channels.js";
 import { activeTextChannelId, joinedTextChannelIds } from "./chat.js";
-import { isAdmin, userId } from "./connection.js";
+import { isAdmin, userId, voiceIsAdmin } from "./connection.js";
 import { channelRosters } from "./rosters.js";
 import { speakingUsers, users, visibleMembers } from "./users.js";
 import { rosterOf } from "../roster-rules.js";
@@ -97,10 +107,18 @@ export function clearRecentSpeakers(): void {
 
 // Whoever spoke did so in the channel we were in at the time. Standing
 // somewhere else makes the list meaningless rather than merely stale, so it
-// goes: on a join, on being moved, and on the channel under us being deleted.
-currentChannelId.subscribe(() => clearRecentSpeakers());
+// goes: on a join, on being moved, on leaving voice or taking it to another
+// server. Not when the view changes: looking at another server moves nobody.
+voice.subscribe(() => clearRecentSpeakers());
 
-derived([speakingUsers, hideMembers], ([$speaking, $hide]) => ({ $speaking, $hide })).subscribe(
+/** The channel we talk in hides its members from us. The rule of the call,
+ *  not of whatever the member list shows. */
+const voiceHidesMembers: Readable<boolean> = derived(
+  [voiceIsAdmin, voiceChannel],
+  ([$admin, $channel]) => !$admin && ($channel?.hide_members ?? false),
+);
+
+derived([speakingUsers, voiceHidesMembers], ([$speaking, $hide]) => ({ $speaking, $hide })).subscribe(
   ({ $speaking, $hide }) => {
     if (!$hide) return;
     for (const id of $speaking) {
@@ -135,18 +153,44 @@ export const displayUsers: Readable<UserInfo[]> = derived(
     userId,
     recentSpeakers,
     hideMembers,
+    viewingVoice,
   ],
-  ([$previewing, $previewUsers, $displayId, $rosters, $current, $users, $userId, $recent, $hide]) =>
+  ([
+    $previewing,
+    $previewUsers,
+    $displayId,
+    $rosters,
+    $current,
+    $users,
+    $userId,
+    $recent,
+    $hide,
+    $viewingVoice,
+  ]) =>
     visibleMembers(
       // A text channel's members are its own: `rosterOf` hands back the
       // pushed list for the channel we stand in and the asked-for one
       // otherwise, which is exactly the distinction here.
       $previewing ? $previewUsers : rosterOf($displayId, $rosters, $current, $users),
       $userId,
-      $recent,
+      // Speakers are ids from the call's server; on another one they are
+      // somebody else's numbers.
+      $viewingVoice ? $recent : new Set(),
       // Never applied to a preview: the rule is about the channel you are in.
       $hide && !$previewing,
     ),
+);
+
+/**
+ * Everyone on the server who is in no voice channel — the lobby's roster, which
+ * the UI no longer lists as a channel. Still reachable for a direct message, a
+ * poke or an admin action. Empty while the pane is showing the lobby itself:
+ * they are the member list then, and listing them twice says nothing.
+ */
+export const idleUsers: Readable<UserInfo[]> = derived(
+  [displayChannelId, channelRosters, currentChannelId, users],
+  ([$displayId, $rosters, $current, $users]) =>
+    $displayId === 0 ? [] : rosterOf(0, $rosters, $current, $users),
 );
 
 /** Creator of the channel we are actually in — what invites are gated on. */
@@ -155,7 +199,7 @@ const currentChannelCreatorId: Readable<number | null> = derived(
   ([$channels, $id]) => $channels.find((c) => c.channel_id === $id)?.created_by ?? null,
 );
 
-const isCurrentChannelCreator: Readable<boolean> = derived(
+export const isCurrentChannelCreator: Readable<boolean> = derived(
   [currentChannelCreatorId, userId, currentChannelId],
   ([$creator, $userId, $current]) => $creator === $userId && $current !== 0,
 );

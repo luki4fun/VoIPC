@@ -5,11 +5,8 @@
   import { copyInviteLink } from "../../stores/channel-ui.js";
   import { openAdminPanel, showAdminLogin } from "../../stores/admin-ui.js";
   import { currentChannelId } from "../../stores/channels.js";
-  import { serverEntries } from "../../stores/servers.js";
-  import { invoke } from "@tauri-apps/api/core";
-  import { connectionState } from "../../stores/connection.js";
+  import { disconnectServer, serverEntries } from "../../connect.js";
   import { playDisconnectedSound } from "../../sounds.js";
-  import { addNotification } from "../../stores/notifications.js";
   import { updateUiPrefs } from "../../stores/ui-prefs.js";
   import Icon from "../Icons.svelte";
 
@@ -25,15 +22,11 @@
 
   const name = $derived($serverEntries.find((e) => e.active)?.name ?? $serverAddress);
 
+  // This server only: the others, and the call if it is on one of them, stay
   async function disconnect() {
     open = false;
-    try {
-      await invoke("disconnect");
-      connectionState.set("disconnected");
-      playDisconnectedSound();
-    } catch (e) {
-      addNotification(`Failed to disconnect: ${e}`, "error");
-    }
+    await disconnectServer($serverAddress);
+    playDisconnectedSound();
   }
 </script>
 

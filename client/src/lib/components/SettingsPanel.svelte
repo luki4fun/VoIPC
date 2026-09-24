@@ -25,7 +25,13 @@
   } from "../stores/settings.js";
   import type { SoundSettings, SoundEntry } from "../stores/settings.js";
   import { voiceMode, vadThreshold } from "../stores/voice.js";
-  import { connectionState, isMuted, isDeafened } from "../stores/connection.js";
+  import {
+    connectionState,
+    isDeafened,
+    isTransmitting,
+    setSelfDeafened,
+    setSelfMuted,
+  } from "../stores/connection.js";
   import { testLabel, testSource } from "../spatial.js";
   import { clearAllHistory } from "../stores/chat.js";
   import { addNotification } from "../stores/notifications.js";
@@ -43,6 +49,7 @@
   import PaletteEditor from "./PaletteEditor.svelte";
   import LayoutPreview from "./LayoutPreview.svelte";
   import { uiPrefs, updateUiPrefs } from "../stores/ui-prefs.js";
+  import { buildHash, buildLine, buildTime } from "../build-info.js";
   import {
     CHAT_FONT_MAX,
     CHAT_FONT_MIN,
@@ -320,8 +327,11 @@
       voiceMode.set("ptt");
       vadThreshold.set(-40);
       noiseSuppression.set(true);
-      isMuted.set(false);
-      isDeafened.set(false);
+      // The backend closed the microphone (the default mode is push-to-talk)
+      // and told every server about the mute and deafen: our own rows follow.
+      isTransmitting.set(false);
+      setSelfMuted(false);
+      setSelfDeafened(false);
       rememberConnection.set(false);
       lastHost.set("localhost");
       lastPort.set(9987);
@@ -452,9 +462,12 @@
   let spatialTestWhere = $state("");
   let spatialTestPos = $state<[number, number, number]>([0, 3, 0]);
   let spatialTestTimer: ReturnType<typeof setInterval> | null = null;
-  // On the desktop the test is mixed into the connection's voice mixer; the
-  // browser's audio graph stands on its own.
-  let canSpatialTest = $derived(isWeb || $connectionState === "connected");
+  // On the desktop the test is mixed into a connection's voice mixer — the
+  // call's, else any open one's; the browser's audio graph stands on its own.
+  const connectionStates = connectionState.all();
+  let canSpatialTest = $derived(
+    isWeb || [...$connectionStates.values()].some((s) => s === "connected"),
+  );
 
   function tickSpatialTest() {
     if (!spatialTest) return;
@@ -512,6 +525,19 @@
   onDestroy(() => {
     sdkUnlisten.then((off) => off()).catch(() => {});
   });
+  /**
+   * Hand the build line over for a bug report. If the clipboard is blocked —
+   * it is, in a webview without a user gesture on some platforms — put it in a
+   * notification instead, where it can at least be read off the screen.
+   */
+  async function copyBuildLine() {
+    try {
+      await navigator.clipboard.writeText(buildLine());
+      addNotification("Build copied", "info", 2000);
+    } catch {
+      addNotification(buildLine(), "info", 10000);
+    }
+  }
 </script>
 
 <div class="overlay" role="dialog" onclick={onclose} onkeydown={() => {}}>
@@ -1089,6 +1115,14 @@
         {/each}
       </div>
     {/if}
+
+    <!-- Outside every tab on purpose: which build this is has to be readable
+         without knowing which tab to look under. -->
+    <button
+      class="build-stamp"
+      onclick={copyBuildLine}
+      title={`Built from ${buildHash} at ${buildTime}. Click to copy.`}
+    >{buildLine()}</button>
   </div>
 </div>
 
@@ -1360,6 +1394,26 @@
     display: flex;
     flex-wrap: wrap;
     gap: 10px;
+  }
+
+  /* Deliberately quiet: it is reference material, not a control. */
+  .build-stamp {
+    display: block;
+    width: 100%;
+    margin-top: 20px;
+    padding: 8px 0 0;
+    border: none;
+    border-top: 1px solid var(--border);
+    background: none;
+    color: var(--text-secondary);
+    font-family: inherit;
+    font-size: 11px;
+    text-align: center;
+    cursor: pointer;
+  }
+
+  .build-stamp:hover {
+    color: var(--text-primary);
   }
 
   .danger-hint {

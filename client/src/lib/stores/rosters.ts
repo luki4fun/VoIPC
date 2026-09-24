@@ -14,57 +14,82 @@
 // not an admin. Every rule about who may see whom therefore stays on the
 // server, where it was. This file only decides *when* to ask.
 
-import { get, writable } from "svelte/store";
+import { get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 
 import { channels, currentChannelId } from "./channels.js";
 import { joinedTextChannelIds } from "./chat.js";
 import { isAdmin } from "./connection.js";
+import { scoped } from "./scoped.js";
 import { users } from "./users.js";
 import { rosterOf, trustRosterCount, worthAsking } from "../roster-rules.js";
 import type { UserInfo } from "../types.js";
 
-/** channel_id → who is in it, as far as this client is allowed to know. */
-export const channelRosters = writable<Map<number, UserInfo[]>>(new Map());
+/** channel_id → who is in it, as far as this client is allowed to know; per server. */
+export const channelRosters = scoped<Map<number, UserInfo[]>>(() => new Map());
 
 /**
  * Asking is a round trip, and a busy server moves people constantly — one
  * request per join would put a burst on the wire every time a channel fills.
- * Ids collect here and go out together.
+ * Ids collect here and go out together, per server: the ids are that server's.
  */
-const pending = new Set<number>();
-let flushTimer: ReturnType<typeof setTimeout> | null = null;
+const pending = new Map<string, { ids: Set<number>; timer: ReturnType<typeof setTimeout> | null }>();
 const FLUSH_MS = 250;
 
-function flush(): void {
-  flushTimer = null;
-  const ids = [...pending];
-  pending.clear();
-  for (const channelId of ids) {
-    invoke("request_channel_users", { channelId }).catch(() => {
+function pendingFor(server: string) {
+  let entry = pending.get(server);
+  if (!entry) {
+    entry = { ids: new Set(), timer: null };
+    pending.set(server, entry);
+  }
+  return entry;
+}
+
+function flush(server: string): void {
+  const entry = pending.get(server);
+  if (!entry) return;
+  pending.delete(server);
+  for (const channelId of entry.ids) {
+    invoke("request_channel_users", { server, channelId }).catch(() => {
       // A channel that vanished between the ask and the answer is not an error
     });
   }
 }
 
-/** Ask for one channel's roster, soon. */
-export function requestRoster(channelId: number): void {
-  const list = get(channels).find((c) => c.channel_id === channelId);
-  if (!list || !worthAsking(list, get(currentChannelId), get(isAdmin), get(joinedTextChannelIds)))
-    return;
-  pending.add(channelId);
-  if (flushTimer === null) flushTimer = setTimeout(flush, FLUSH_MS);
+function schedule(server: string): void {
+  const entry = pendingFor(server);
+  if (entry.ids.size > 0 && entry.timer === null) {
+    entry.timer = setTimeout(() => flush(server), FLUSH_MS);
+  }
 }
 
-/** Ask for every channel we are allowed to see into. */
-export function requestAllRosters(): void {
-  const currentId = get(currentChannelId);
-  const admin = get(isAdmin);
-  const joinedText = get(joinedTextChannelIds);
-  for (const channel of get(channels)) {
-    if (worthAsking(channel, currentId, admin, joinedText)) pending.add(channel.channel_id);
+/** Ask for one channel's roster on a server, soon. */
+export function requestRoster(server: string, channelId: number): void {
+  const list = get(channels.of(server)).find((c) => c.channel_id === channelId);
+  if (
+    !list ||
+    !worthAsking(
+      list,
+      get(currentChannelId.of(server)),
+      get(isAdmin.of(server)),
+      get(joinedTextChannelIds.of(server)),
+    )
+  )
+    return;
+  pendingFor(server).ids.add(channelId);
+  schedule(server);
+}
+
+/** Ask for every channel on a server we are allowed to see into. */
+export function requestAllRosters(server: string): void {
+  const currentId = get(currentChannelId.of(server));
+  const admin = get(isAdmin.of(server));
+  const joinedText = get(joinedTextChannelIds.of(server));
+  const ids = pendingFor(server).ids;
+  for (const channel of get(channels.of(server))) {
+    if (worthAsking(channel, currentId, admin, joinedText)) ids.add(channel.channel_id);
   }
-  if (pending.size > 0 && flushTimer === null) flushTimer = setTimeout(flush, FLUSH_MS);
+  schedule(server);
 }
 
 /**
@@ -82,12 +107,18 @@ export function requestAllRosters(): void {
  * two are reconciled. `trustRosterCount` is what keeps a refused answer (also
  * an empty list) from zeroing a channel we are simply not allowed to see into.
  */
-export function setRoster(channelId: number, list: UserInfo[]): void {
-  channelRosters.update((m) => new Map(m).set(channelId, list));
-  const channel = get(channels).find((c) => c.channel_id === channelId);
+export function setRoster(server: string, channelId: number, list: UserInfo[]): void {
+  channelRosters.of(server).update((m) => new Map(m).set(channelId, list));
+  const channel = get(channels.of(server)).find((c) => c.channel_id === channelId);
   if (
     !channel ||
-    !trustRosterCount(list, channel, get(currentChannelId), get(isAdmin), get(joinedTextChannelIds))
+    !trustRosterCount(
+      list,
+      channel,
+      get(currentChannelId.of(server)),
+      get(isAdmin.of(server)),
+      get(joinedTextChannelIds.of(server)),
+    )
   ) {
     return;
   }
@@ -95,7 +126,7 @@ export function setRoster(channelId: number, list: UserInfo[]): void {
   // and not ours) still rides on the arithmetic alone. Put `user_count` in the
   // ChannelUsers reply if that one drifts too.
   if (channel.user_count === list.length) return;
-  channels.update((chs) =>
+  channels.of(server).update((chs) =>
     chs.map((c) => (c.channel_id === channelId ? { ...c, user_count: list.length } : c)),
   );
 }
@@ -107,8 +138,8 @@ export function setRoster(channelId: number, list: UserInfo[]): void {
  * no channel, so rather than re-asking for a roster because somebody muted, the
  * flag is applied to whichever roster holds them.
  */
-export function patchRosters(userId: number, patch: Partial<UserInfo>): void {
-  channelRosters.update((m) => {
+export function patchRosters(server: string, userId: number, patch: Partial<UserInfo>): void {
+  channelRosters.of(server).update((m) => {
     let changed = false;
     const next = new Map(m);
     for (const [channelId, list] of next) {
@@ -123,19 +154,21 @@ export function patchRosters(userId: number, patch: Partial<UserInfo>): void {
   });
 }
 
-/** A connection's rosters die with it. */
-export function clearRosters(): void {
-  pending.clear();
-  if (flushTimer !== null) {
-    clearTimeout(flushTimer);
-    flushTimer = null;
-  }
-  channelRosters.set(new Map());
+/** A connection's questions die with it; its rosters go with `dropServer`. */
+export function clearRosters(server: string): void {
+  const entry = pending.get(server);
+  if (entry?.timer != null) clearTimeout(entry.timer);
+  pending.delete(server);
 }
 
 export { rosterOf };
 
-/** Convenience for components that just want the current values. */
-export function currentRosterOf(channelId: number): UserInfo[] {
-  return rosterOf(channelId, get(channelRosters), get(currentChannelId), get(users));
+/** Convenience for code that just wants the current values. */
+export function currentRosterOf(server: string, channelId: number): UserInfo[] {
+  return rosterOf(
+    channelId,
+    get(channelRosters.of(server)),
+    get(currentChannelId.of(server)),
+    get(users.of(server)),
+  );
 }

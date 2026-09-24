@@ -19,10 +19,15 @@
   // behaves the same, through the same functions in stores/channel-ui.ts, so
   // the two layouts cannot drift on what a click does.
 
-  import { channels, currentChannelId, previewChannelId } from "../../stores/channels.js";
+  import {
+    channels,
+    currentChannelId,
+    previewChannelId,
+    viewingVoice,
+  } from "../../stores/channels.js";
   import { channelRosters } from "../../stores/rosters.js";
   import { rosterForRow } from "../../roster-rules.js";
-  import { userId, isAdmin } from "../../stores/connection.js";
+  import { userId, isAdmin, serverAddress } from "../../stores/connection.js";
   import {
     activeDmUserId,
     activeTextChannelId,
@@ -50,9 +55,12 @@
   import Icon from "../Icons.svelte";
   import type { ChannelInfo, UserInfo } from "../../types.js";
 
-  // A hidden channel is not listed, unless you are an admin or standing in it
+  // A hidden channel is not listed, unless you are an admin or standing in it.
+  // Nor is the lobby, channel 0 — see ChannelList.
   const visibleChannels = $derived(
-    $channels.filter((c) => !c.hidden || $isAdmin || c.channel_id === $currentChannelId),
+    $channels.filter(
+      (c) => c.channel_id !== 0 && (!c.hidden || $isAdmin || c.channel_id === $currentChannelId),
+    ),
   );
 
   // Text above voice, the way Discord groups them. A text channel has no
@@ -95,7 +103,7 @@
       {#each textChannels as channel (channel.channel_id)}
         {@const subscribed = $joinedTextChannelIds.has(channel.channel_id)}
         {@const left = !subscribed && $leftTextChannelNames.has(channel.name)}
-        {@const unread = channelUnread($unreadPerChannel, channel.name)}
+        {@const unread = channelUnread($unreadPerChannel, $serverAddress, channel.name)}
         <button
           class="channel"
           class:active={$activeTextChannelId === channel.channel_id}
@@ -160,7 +168,7 @@
     {#each voiceChannels as channel (channel.channel_id)}
       {@const joined = channel.channel_id === $currentChannelId}
       {@const members = membersOf(channel)}
-      {@const unread = channelUnread($unreadPerChannel, channel.name)}
+      {@const unread = channelUnread($unreadPerChannel, $serverAddress, channel.name)}
       <button
         class="channel"
         class:active={joined}
@@ -170,9 +178,7 @@
         title={joined ? "Click to show its chat" : "Click to look; joining is a button in the chat pane"}
       >
         <span class="channel-icon">
-          {#if channel.channel_id === 0}
-            <Icon name="lobby" size={18} />
-          {:else if channel.has_password}
+          {#if channel.has_password}
             <Icon name="lock" size={18} />
           {:else}
             <Icon name="speaker" size={18} />
@@ -223,8 +229,8 @@
             <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
             <div
               class="nested-member"
-              class:speaking={joined && $speakingUsers.has(member.user_id)}
-              class:culled={isCulled(member.user_id, $audibleIds, $userId, !joined)}
+              class:speaking={joined && $viewingVoice && $speakingUsers.has(member.user_id)}
+              class:culled={isCulled(member.user_id, $audibleIds, $userId, !joined || !$viewingVoice)}
               oncontextmenu={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
@@ -261,7 +267,7 @@
           <button
             class="dm-entry"
             class:active={$activeDmUserId === convo.user_id}
-            onclick={() => openDm(convo.user_id, convo.username, $userId)}
+            onclick={() => openDm($serverAddress, convo.user_id, convo.username)}
           >
             <span class="dm-avatar" style="background: {avatarColor(convo.username)}"
               >{convo.username.charAt(0).toUpperCase()}</span

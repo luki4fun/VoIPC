@@ -91,6 +91,8 @@ export async function run(params: URLSearchParams): Promise<void> {
   const proximity = (params.get("proximity") ?? "off") as ProximityMode;
   const ownPosition = params.get("pos");
   const spatialTest = params.get("spatialtest") as "2d" | "3d" | null;
+  // The server id every server-scoped command names: the address we connect with
+  const server = window.location.host;
 
   // The spatial formula is written twice (Rust for the native mixer, TypeScript
   // for the worklet). This proves the browser copy still matches the table both
@@ -144,8 +146,12 @@ export async function run(params: URLSearchParams): Promise<void> {
     "viewer-count-changed", "keyframe-requested",
     "user-position", "proximity-mode", "channel-created", "channel-updated",
   ];
+  // Every other event comes as {server, data}; the lines below log and read
+  // `data`, so what test-web.sh greps for is what it always was.
+  const bare = new Set(["audio-device-error", "screenshare-frame"]);
   for (const ev of watched) {
-    await listen(ev, (e: { payload: unknown }) => {
+    await listen(ev, (raw: { payload: unknown }) => {
+      const e = { payload: bare.has(ev) ? raw.payload : (raw.payload as { data: unknown }).data };
       if (ev !== "latency-update") log(`event ${ev}`, e.payload);
       if (ev === "channel-list") channels = e.payload as ChannelInfo[];
       // The full list is sent once, at login; a channel made afterwards
@@ -212,6 +218,7 @@ export async function run(params: URLSearchParams): Promise<void> {
         // The UI's job in the real app: answer with that channel's recent chat
         const p = e.payload as { channel_id: number; from_user_id: number };
         invoke("send_channel_history", {
+          server,
           channelId: p.channel_id,
           targetUserId: p.from_user_id,
           messages: historyOf(p.channel_id).slice(-50),
@@ -226,7 +233,7 @@ export async function run(params: URLSearchParams): Promise<void> {
 
   try {
     const userId = await invoke<number>("connect", {
-      address: window.location.host,
+      address: server,
       username: name,
       acceptInvalidCerts: false,
     });
@@ -253,10 +260,10 @@ export async function run(params: URLSearchParams): Promise<void> {
   const existing = channels.find((c) => c.name === channelName);
   try {
     if (existing) {
-      await invoke("join_channel", { channelId: existing.channel_id, password: invite?.password ?? null });
+      await invoke("join_channel", { server, channelId: existing.channel_id, password: invite?.password ?? null });
       joinedChannelId = existing.channel_id;
     } else {
-      await invoke("create_channel", { name: channelName, password: null, proximity });
+      await invoke("create_channel", { server, name: channelName, password: null, proximity });
     }
     log("channel-requested", { channel: channelName, existing: !!existing, source: invite ? "invite" : "param" });
   } catch (e) {
@@ -281,7 +288,7 @@ export async function run(params: URLSearchParams): Promise<void> {
       const early = `early from ${name}`;
       const inHistory = () => historyOf(joinedChannelId).some((m) => m.content === early);
       try {
-        await invoke("send_channel_message", { content: early });
+        await invoke("send_channel_message", { server, content: early });
         // "Sent" is not the state the next peer depends on: the message reaches
         // channelHistory — the list handed to a newcomer — only when the server
         // echoes it back. Log the line the harness waits for once it is there.
@@ -305,6 +312,7 @@ export async function run(params: URLSearchParams): Promise<void> {
       // again until it does.
       for (let attempt = 0; attempt < 8 && textChannelId === 0; attempt++) {
         await invoke("create_channel", {
+          server,
           name: textChannelName, password: null, proximity: "off", anonymous: false, text: true,
         });
         for (let i = 0; i < 60 && textChannelId === 0; i++) {
@@ -316,7 +324,7 @@ export async function run(params: URLSearchParams): Promise<void> {
       if (textChannelId !== 0) {
         textEarlySent = true;
         const early = `text early from ${name}`;
-        await invoke("send_channel_message", { content: early, channelId: textChannelId });
+        await invoke("send_channel_message", { server, content: early, channelId: textChannelId });
         const inHistory = () => historyOf(textChannelId).some((m) => m.content === early);
         for (let i = 0; i < 100 && !inHistory(); i++) await sleep(50);
         log("text-early-sent", { in_history: inHistory() });
@@ -345,7 +353,7 @@ export async function run(params: URLSearchParams): Promise<void> {
         textJoined = true;
         textChannelId = listed.channel_id;
         try {
-          await invoke("join_channel", { channelId: textChannelId, password: null });
+          await invoke("join_channel", { server, channelId: textChannelId, password: null });
           log("text-channel-joined", { channel: textChannelName, channel_id: textChannelId });
         } catch (e) {
           log("error", { message: `text join: ${String(e)}` });
@@ -359,6 +367,7 @@ export async function run(params: URLSearchParams): Promise<void> {
       textChatSent = true;
       try {
         await invoke("send_channel_message", {
+          server,
           content: `text hello from ${name}`,
           channelId: textChannelId,
         });
@@ -373,6 +382,7 @@ export async function run(params: URLSearchParams): Promise<void> {
       textEarlySent = true;
       try {
         await invoke("send_channel_message", {
+          server,
           content: `text first from ${name}`,
           channelId: textChannelId,
         });
@@ -424,7 +434,7 @@ export async function run(params: URLSearchParams): Promise<void> {
     if (role === "talker" && !earlySent && joinedChannelId !== 0) {
       earlySent = true;
       try {
-        await invoke("send_channel_message", { content: `early from ${name}` });
+        await invoke("send_channel_message", { server, content: `early from ${name}` });
         log("early-chat-sent");
       } catch (e) {
         log("error", { message: `early chat: ${String(e)}` });
@@ -434,7 +444,7 @@ export async function run(params: URLSearchParams): Promise<void> {
     if (!chatSent && peers.length > 0 && Date.now() - started > 4000) {
       chatSent = true;
       try {
-        await invoke("send_channel_message", { content: `hello from ${name}` });
+        await invoke("send_channel_message", { server, content: `hello from ${name}` });
         log("chat-sent");
       } catch (e) {
         log("error", { message: `chat: ${String(e)}` });
@@ -445,7 +455,7 @@ export async function run(params: URLSearchParams): Promise<void> {
       if (target && Date.now() - started > 4000) {
         dmSent = true;
         try {
-          await invoke("send_direct_message", { targetUserId: target.user_id, content: `dm from ${name}` });
+          await invoke("send_direct_message", { server, targetUserId: target.user_id, content: `dm from ${name}` });
           log("dm-sent", { to: target.user_id });
         } catch (e) {
           log("error", { message: `dm: ${String(e)}` });
@@ -543,7 +553,7 @@ export async function run(params: URLSearchParams): Promise<void> {
   // history — so the admin cannot assume the other side is as far along as she
   // is. Without this the kick lands mid-run and the kicked side never reports
   // its voice and video stats.
-  await invoke("send_channel_message", { content: `wrap-up from ${name}` }).catch(() => {});
+  await invoke("send_channel_message", { server, content: `wrap-up from ${name}` }).catch(() => {});
   log("wrap-up-sent");
 
   // Wrap-up: moderation
@@ -556,12 +566,12 @@ export async function run(params: URLSearchParams): Promise<void> {
     log("peer-wrap-up", { seen: peerWrapped() });
     await sleep(500);
     try {
-      await invoke("admin_login", { token: adminToken });
+      await invoke("admin_login", { server, token: adminToken });
       for (let i = 0; i < 50 && !isAdmin; i++) await sleep(100);
       log("admin-login", { ok: isAdmin });
       const target = [...users.values()].find((u) => u.username === kickTarget);
       if (isAdmin && target) {
-        await invoke("admin_kick", { userId: target.user_id, reason: "e2e kick" });
+        await invoke("admin_kick", { server, userId: target.user_id, reason: "e2e kick" });
         log("admin-kicked", { user_id: target.user_id });
         await sleep(1000);
       }
@@ -574,7 +584,7 @@ export async function run(params: URLSearchParams): Promise<void> {
   }
 
   try {
-    await invoke("disconnect");
+    await invoke("disconnect", { server });
   } catch {
     // ignore
   }

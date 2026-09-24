@@ -16,7 +16,7 @@
   import { tick } from "svelte";
   import { channels } from "../stores/channels.js";
   import { uiPrefs } from "../stores/ui-prefs.js";
-  import { userId } from "../stores/connection.js";
+  import { serverAddress, serverKey, userId } from "../stores/connection.js";
   import { addNotification } from "../stores/notifications.js";
   import {
     channelMessages,
@@ -35,6 +35,7 @@
   import {
     channelMessageTtl,
     dmMessageTtl,
+    endPreview,
     joinChannel,
     joinTextChannel,
     leftTextChannelNames,
@@ -131,6 +132,8 @@
   let channelName = $derived(effectiveChannel?.name ?? "");
   let isPasswordProtected = $derived(effectiveChannel?.has_password ?? false);
 
+  // The lobby: in no voice channel on this server, and no other channel open.
+  // Nothing to read there — the server keeps no chat for it.
   let isLobby = $derived($displayChannelId === 0);
 
   // Can send messages only in a channel we are in: not a preview, not the
@@ -143,10 +146,12 @@
       (!effectiveChannel?.text || $joinedTextChannelIds.has($displayChannelId))
   );
 
+  // This server's channels: another server's unread is on its icon in the rail
   let totalUnreadChannels = $derived.by(() => {
+    const prefix = `${serverKey($serverAddress)}/`;
     let total = 0;
-    for (const count of $unreadPerChannel.values()) {
-      total += count;
+    for (const [key, count] of $unreadPerChannel) {
+      if (key.startsWith(prefix)) total += count;
     }
     return total;
   });
@@ -159,10 +164,10 @@
     const dmMap = $dmMessages;
 
     if (isDmMode) {
-      const key = dmKey($activeDmUsername);
+      const key = dmKey($serverAddress, $activeDmUsername);
       return [...(dmMap.get(key) ?? [])];
     }
-    return [...(chMap.get(chatKey(channelName)) ?? [])];
+    return [...(chMap.get(chatKey($serverAddress, channelName)) ?? [])];
   });
 
   // Who in this channel would answer a request for its recent chat. The
@@ -177,12 +182,14 @@
   let canResync = $derived(!$isPreviewing && !isLobby && !isDmMode && historySharers.length > 0);
 
   async function resyncHistory() {
+    const server = $serverAddress;
     const names = historySharers.map((u) => u.username).join(", ");
     try {
       // Deliberate, so it also takes back a deletion: asking is how you undo
       // having cleared a channel, and nothing else reopens that door.
-      forgetClearedBefore(channelName);
+      forgetClearedBefore(server, channelName);
       await invoke("request_channel_history", {
+        server,
         channelId: $displayChannelId,
         targetUserIds: historySharers.map((u) => u.user_id),
       });
@@ -198,8 +205,10 @@
   // leave or be kicked from the channel being typed in and the pane falls back
   // to the voice room next door, with everybody in it. `sendMessage` reads the
   // target at send time, so the next Enter would post half a private thought
-  // into a room it was never meant for.
+  // into a room it was never meant for — or, after a click in the rail, into
+  // another server's.
   $effect(() => {
+    void $serverAddress;
     void $displayChannelId;
     void $activeDmUserId;
     messageInput = "";
@@ -262,19 +271,20 @@
   // `$channels` are the two stores those answers live in.
   const activeTtl = $derived(
     isDmMode
-      ? ($uiPrefs, dmMessageTtl($activeDmUsername))
-      : ($channels, channelMessageTtl($displayChannelId)),
+      ? ($uiPrefs, dmMessageTtl($serverAddress, $activeDmUsername))
+      : ($channels, channelMessageTtl($serverAddress, $displayChannelId)),
   );
 
   function chooseTtl(secs: number) {
     showTtlPicker = false;
     if (!isDmMode) return;
-    setDmMessageTtl($activeDmUsername, secs);
+    setDmMessageTtl($serverAddress, $activeDmUsername, secs);
   }
 
   async function sendMessage() {
     const content = messageInput.trim();
     if (!content) return;
+    const server = $serverAddress;
 
     messageInput = "";
 
@@ -285,15 +295,17 @@
       // person. Zero is no timer, which the backend reads as none.
       if (isDmMode) {
         await invoke("send_direct_message", {
+          server,
           targetUserId: $activeDmUserId,
           content,
-          ttlSecs: dmMessageTtl($activeDmUsername) || null,
+          ttlSecs: dmMessageTtl(server, $activeDmUsername) || null,
         });
       } else {
         await invoke("send_channel_message", {
+          server,
           content,
           channelId: $displayChannelId,
-          ttlSecs: channelMessageTtl($displayChannelId) || null,
+          ttlSecs: channelMessageTtl(server, $displayChannelId) || null,
         });
       }
     } catch (e) {
@@ -310,14 +322,14 @@
   }
 
   function backToChannel() {
-    closeDm();
+    closeDm($serverAddress);
   }
 
   function clearCurrentChat() {
     if (isDmMode) {
-      clearDmChat($activeDmUserId!, $activeDmUsername);
+      clearDmChat($serverAddress, $activeDmUserId!, $activeDmUsername);
     } else {
-      clearChannelChat(channelName);
+      clearChannelChat($serverAddress, channelName);
     }
   }
 </script>
@@ -333,7 +345,13 @@
         <span class="unread-badge" title="Unread channel messages">{totalUnreadChannels}</span>
       {/if}
     {:else}
-      <span class="chat-title"><Icon name="hash" size={14} /> {channelName}</span>
+      {#if $isPreviewing}
+        <button class="back-btn" onclick={endPreview} title="Stop previewing"><Icon name="arrow-left" size={16} /></button>
+      {/if}
+      {#if !isLobby}
+        <!-- Channel 0 is "not in voice", not a channel: it has no name to show -->
+        <span class="chat-title"><Icon name="hash" size={14} /> {channelName}</span>
+      {/if}
       {#if $isPreviewing}
         <span class="preview-label">preview</span>
       {/if}
@@ -383,7 +401,7 @@
 
   <div class="messages" bind:this={messagesContainer}>
     {#if !isDmMode && isLobby}
-      <div class="empty-state">Chat is not available in the lobby. Join a channel to chat.</div>
+      <div class="empty-state">Open a text channel to chat</div>
     {:else if !isDmMode && $isPreviewing && isPasswordProtected && !effectiveChannel?.text}
       <div class="empty-state">This channel is password protected. Join to view messages.</div>
     {:else if displayMessages.length === 0}

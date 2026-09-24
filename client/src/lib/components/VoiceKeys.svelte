@@ -14,8 +14,8 @@
   import { listen } from "@tauri-apps/api/event";
   import { onMount, onDestroy } from "svelte";
 
-  import { connectionState, isTransmitting, userId } from "../stores/connection.js";
-  import { currentChannelId } from "../stores/channels.js";
+  import { connectionState, isTransmitting, voiceUserId } from "../stores/connection.js";
+  import { voice, voiceServer } from "../stores/channels.js";
   import { speakingUsers } from "../stores/users.js";
   import { audioSetupOpen, pttKey, pttHoldMode } from "../stores/settings.js";
   import {
@@ -28,20 +28,28 @@
     voiceMode,
   } from "../stores/voice.js";
 
-  // Voice is disabled in the General lobby (channel 0)
-  let voiceDisabled = $derived($currentChannelId === 0);
+  // All of this is about the call, on whichever server carries it — not the
+  // server on screen, which may be one we are only reading.
+  const voiceState = connectionState.at(voiceServer);
 
-  // VAD/AlwaysOn: auto-start transmit when connected to a channel.
+  // In no voice channel on any server there is nothing to talk into
+  let voiceDisabled = $derived($voice === null);
+
+  // VAD/AlwaysOn: auto-start transmit when in a voice channel.
   //
   // Not while the audio setup is up: it is using the capture device for its
   // own meter, and `start_mic_test` refuses to run while we transmit — so
   // without this guard the wizard's microphone step would be dead exactly
   // for the people who most need it to work.
+  //
+  // A new connection starts with no capture task, and voice moving to another
+  // server stops the old one: `isTransmitting` goes false with it (voice.ts),
+  // which is what re-arms this.
   $effect(() => {
     if (
       $voiceMode !== "ptt" &&
       !voiceDisabled &&
-      $connectionState === "connected" &&
+      $voiceState === "connected" &&
       !$isTransmitting &&
       !$audioSetupOpen
     ) {
@@ -49,17 +57,11 @@
     }
   });
 
-  // A new connection starts with no capture task; the store must follow,
-  // or the auto-start above never re-arms after a reconnect
-  $effect(() => {
-    if ($connectionState !== "connected") isTransmitting.set(false);
-  });
-
-  // Poll audio level when in VAD mode and connected
+  // Poll audio level when in VAD mode and in voice
   let levelPollInterval: ReturnType<typeof setInterval> | null = null;
 
   $effect(() => {
-    if ($voiceMode === "vad" && $connectionState === "connected" && $isTransmitting) {
+    if ($voiceMode === "vad" && $voiceState === "connected" && $isTransmitting) {
       if (!levelPollInterval) {
         levelPollInterval = setInterval(() => {
           invoke<number>("get_audio_level").then((level) => {
@@ -86,14 +88,14 @@
   // This makes the local user's indicator in the UserList reflect actual voice activity
   // (the server doesn't relay our own voice packets back to us).
   $effect(() => {
-    if ($voiceMode === "vad" && $isTransmitting && $userId > 0) {
+    if ($voiceMode === "vad" && $isTransmitting && $voiceUserId > 0) {
       const speaking = $audioLevel >= $vadThreshold;
       speakingUsers.update((set) => {
         const next = new Set(set);
         if (speaking) {
-          next.add($userId);
+          next.add($voiceUserId);
         } else {
-          next.delete($userId);
+          next.delete($voiceUserId);
         }
         return next;
       });

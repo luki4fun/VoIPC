@@ -1,9 +1,14 @@
 import { get, writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 
-import { currentChannelId } from "./channels.js";
+import { voice, voiceServer } from "./channels.js";
 import { isTransmitting, setSelfDeafened, setSelfMuted } from "./connection.js";
+import { clearMixer } from "./mixer.js";
+import { addNotification } from "./notifications.js";
+import { resetRoom } from "./room.js";
+import { resetScreenShareState } from "./screenshare.js";
 import { noiseSuppression } from "./settings.js";
+import { speakingUsers } from "./users.js";
 
 export type VoiceMode = "ptt" | "vad" | "always_on";
 
@@ -33,10 +38,47 @@ export const speakerMode = writable<boolean>(true);
 // phone's push-to-talk button, the window key handlers in VoiceKeys.svelte, the
 // tray menu and the OS-wide hotkeys.
 
-/** Voice is off in the General lobby, so nothing may open the microphone there. */
+/** In no voice channel on any server, nothing may open the microphone. */
 function voiceDisabled(): boolean {
-  return get(currentChannelId) === 0;
+  return get(voice) === null;
 }
+
+/**
+ * Leave the voice channel and stay on the server: the lobby, channel 0, is
+ * where the server keeps everyone who is in no voice channel.
+ *
+ * The one writer of that join. Every "leave voice" there is — the voice panel,
+ * the classic voice bar, the phone's call notification — comes here, so none
+ * of them can forget the guard: joining the lobby from the lobby is not a
+ * no-op on the server, which announces a leave and a join again and spends a
+ * join token on it.
+ */
+export async function leaveVoice(): Promise<void> {
+  const seat = get(voice);
+  if (!seat) return;
+  try {
+    await invoke("join_channel", { server: seat.server, channelId: 0, password: null });
+  } catch (e) {
+    addNotification(`Could not leave the voice channel: ${e}`, "error");
+  }
+}
+
+// Everything that belongs to the call rather than to a server goes when the
+// call ends or moves to another server: the room, the mixer's lanes (keyed by
+// that server's user ids), the screen shares, who is speaking. The microphone
+// too — the backend stopped the capture, and `isTransmitting` going false is
+// also what lets VoiceKeys re-open it on the new server in voice-activation
+// or always-open mode. Recent speakers are roster.ts's, on the same store.
+let lastVoiceServer: string | null = null;
+voiceServer.subscribe((server) => {
+  if (server === lastVoiceServer) return;
+  lastVoiceServer = server;
+  isTransmitting.set(false);
+  resetRoom();
+  clearMixer();
+  resetScreenShareState();
+  speakingUsers.set(new Set());
+});
 
 export async function startTransmit(): Promise<void> {
   if (voiceDisabled()) return;

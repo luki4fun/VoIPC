@@ -38,9 +38,11 @@ class VoiceService : Service() {
                     setPackage(packageName)
                 }
                 sendBroadcast(actionIntent)
-                if (intent.action == ACTION_DISCONNECT) {
-                    stopSelf()
-                }
+                // Not stopSelf() on ACTION_DISCONNECT: that action leaves the
+                // voice channel (the server connections stay), and the web
+                // side stops this service once the leave has happened. Stopping
+                // here would drop the foreground service even when the leave
+                // failed and the call is still running.
                 return START_STICKY
             }
         }
@@ -114,13 +116,13 @@ class VoiceService : Service() {
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("VoIPC")
-            .setContentText("Connected to #$channelName")
+            .setContentText("In voice: #$channelName")
             .setSmallIcon(android.R.drawable.ic_lock_silent_mode_off)
             .setOngoing(true)
             .setContentIntent(openPending)
             .addAction(
                 android.R.drawable.ic_menu_close_clear_cancel,
-                "Disconnect",
+                "Leave voice",
                 disconnectPending
             )
             .setCategory(NotificationCompat.CATEGORY_CALL)

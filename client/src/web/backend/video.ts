@@ -33,6 +33,13 @@ function unsupportedReason(codec: VideoCodec): string {
   return `This browser cannot decode the ${codec} video this share uses — try another browser or the desktop app`;
 }
 const KEYFRAME_REQUEST_INTERVAL_MS = 1_000;
+/**
+ * Chunks the decoder may hold before we stop feeding it deltas: about 130 ms
+ * at 30 fps. Past it the decoder is not keeping up.
+ */
+const MAX_DECODE_QUEUE = 4;
+/** Decode errors in a row, with no frame in between, before giving up. */
+const MAX_DECODE_FAILURES = 3;
 /** Loss-report window: dropped/received frame counts sent to the sharer via the server. */
 const LOSS_REPORT_INTERVAL_MS = 2_000;
 
@@ -57,6 +64,8 @@ export class VideoViewer implements VideoApi {
   private suppressRender = false;
   private resumeAtTimestamp = Infinity;
   private lastKeyframeRequest = -Infinity;
+  /** Decode errors since the last decoded frame. */
+  private decodeFailures = 0;
   /** Latest decoded frame awaiting the next animation frame. */
   private pendingFrame: VideoFrame | null = null;
   private rafScheduled = false;
@@ -95,9 +104,10 @@ export class VideoViewer implements VideoApi {
     if (!decoderCodec) {
       this.watching = false;
       this.sharerUserId = 0;
-      emit("screenshare-error", { reason: unsupportedReason(codec) });
-      this.ctx?.stopWatching();
-      emit("stopped-watching-screenshare", { reason: "unsupported" });
+      const c = this.ctx;
+      c?.emit("screenshare-error", { reason: unsupportedReason(codec) });
+      c?.stopWatching();
+      c?.emit("stopped-watching-screenshare", { reason: "unsupported" });
       return;
     }
     this.codec = decoderCodec;
@@ -106,6 +116,9 @@ export class VideoViewer implements VideoApi {
     this.windowDropped = 0;
     this.windowReceived = 0;
     this.lossReportTimer = setInterval(() => this.sendLossReport(), LOSS_REPORT_INTERVAL_MS);
+    // Ask at once rather than wait for the next periodic IDR, which is up to
+    // four seconds of a blank viewer.
+    this.requestKeyframe();
   }
 
   stopWatching(): void {
@@ -122,6 +135,7 @@ export class VideoViewer implements VideoApi {
     // The resolution stays: it is the last thing we decoded, and the native
     // client keeps reporting it too until the next share replaces it.
     this.lastKeyframeRequest = -Infinity;
+    this.decodeFailures = 0;
     this.closeDecoder();
     this.assembler?.free();
     this.assembler = null;
@@ -152,14 +166,29 @@ export class VideoViewer implements VideoApi {
       this.suppress();
       this.requestKeyframe();
     }
+    // Asked before the early return: the assembler hides every delta until
+    // the first keyframe without flagging a drop, and the server rate-limits
+    // keyframe relays and relies on the client asking again.
+    if (this.needKeyframe && !r.is_keyframe) this.requestKeyframe();
     if (!r.frame) return;
     this.framesReceived++;
     this.windowReceived++;
-    if (this.needKeyframe && !r.is_keyframe) {
-      this.requestKeyframe();
-      return;
-    }
+    if (this.needKeyframe && !r.is_keyframe) return;
     const timestamp = r.timestamp * 1000; // ms -> µs
+    // A decoder at or below real time otherwise grows its queue forever and
+    // the picture drifts seconds behind the voice; the native viewer bounds it
+    // with a 64-frame channel. A delta waits for a keyframe; a keyframe starts
+    // over on an empty queue.
+    if (this.decoder.decodeQueueSize > MAX_DECODE_QUEUE) {
+      if (!r.is_keyframe) {
+        this.suppress();
+        this.needKeyframe = true;
+        this.requestKeyframe();
+        return;
+      }
+      this.decoder.reset();
+      this.decoder.configure({ codec: this.codec, optimizeForLatency: true });
+    }
     try {
       this.decoder.decode(
         new EncodedVideoChunk({ type: r.is_keyframe ? "key" : "delta", timestamp, data: r.frame }),
@@ -227,6 +256,17 @@ export class VideoViewer implements VideoApi {
   private onDecodeError(e: Error): void {
     if (!this.watching) return;
     console.warn(`${this.shareCodec} decode error:`, e.message);
+    // A decoder that probed fine and still fails on every keyframe will never
+    // show anything: say so, as the probe failure does, instead of a viewer
+    // that waits forever.
+    if (++this.decodeFailures >= MAX_DECODE_FAILURES) {
+      const c = this.ctx;
+      c?.emit("screenshare-error", { reason: unsupportedReason(this.shareCodec) });
+      c?.stopWatching();
+      c?.emit("stopped-watching-screenshare", { reason: "unsupported" });
+      this.stopWatching();
+      return;
+    }
     this.suppress();
     this.requestKeyframe();
     // A WebCodecs decoder is closed after an error; build a fresh one that
@@ -243,6 +283,7 @@ export class VideoViewer implements VideoApi {
       frame.close();
       return;
     }
+    this.decodeFailures = 0;
     if (this.suppressRender) {
       if (frame.timestamp < this.resumeAtTimestamp) {
         frame.close(); // corrupted delta from before the keyframe
@@ -281,7 +322,8 @@ export class VideoViewer implements VideoApi {
       }
       canvas.getContext("2d")?.drawImage(frame, 0, 0, w, h);
       if (!this.firstFrameShown) {
-        // Flips the viewer from "Waiting for video stream..." to the canvas
+        // Flips the viewer from "Waiting for video stream..." to the canvas.
+        // Bare, like the native frame event: there is only one viewer.
         this.firstFrameShown = true;
         emit("screenshare-frame", "canvas");
       }

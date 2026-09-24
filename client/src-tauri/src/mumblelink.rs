@@ -307,8 +307,10 @@ async fn start_driving(app: &tauri::AppHandle) -> bool {
     if game_owns_the_mix(&state) {
         return false;
     }
-    let conn = state.connection.read().await;
-    let Some(connection) = conn.as_ref() else {
+    // Only into a call: its positions are for the room we are in voice in,
+    // and a server we merely have open has no room to put them in.
+    let conns = state.connections.read().await;
+    let Ok(connection) = crate::app_state::voice(&state, &conns) else {
         return false;
     };
     {
@@ -370,8 +372,8 @@ async fn stop_driving(app: &tauri::AppHandle) {
         return;
     }
     {
-        let conn = state.connection.read().await;
-        if let Some(connection) = conn.as_ref() {
+        let conns = state.connections.read().await;
+        if let Ok(connection) = crate::app_state::voice(&state, &conns) {
             let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
             spatial.clear_positions();
         }
@@ -392,8 +394,8 @@ async fn apply(app: &tauri::AppHandle, link: Link) -> bool {
     if game_owns_the_mix(&state) {
         return false;
     }
-    let conn = state.connection.read().await;
-    let Some(connection) = conn.as_ref() else { return false };
+    let conns = state.connections.read().await;
+    let Ok(connection) = crate::app_state::voice(&state, &conns) else { return false };
     let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
     if spatial.sdk_active {
         return false;

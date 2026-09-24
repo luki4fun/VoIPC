@@ -40,14 +40,14 @@ use voipc_protocol::types::UserId;
 use tokio::task::JoinSet;
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, info, warn};
-use wtransport::config::Ipv6DualStackConfig;
+use wtransport::config::{Ipv6DualStackConfig, QuicTransportConfig};
 use wtransport::endpoint::endpoint_side::Server;
 use wtransport::error::SendDatagramError;
 use wtransport::tls::Sha256Digest;
 use wtransport::{Connection, Endpoint, Identity, SendStream, ServerConfig as WtServerConfig, VarInt};
 
 use voipc_protocol::types::SessionId;
-use voipc_protocol::video::{FrameGrouper, RecordReader};
+use voipc_protocol::video::{FrameGrouper, RecordReader, MAX_FRAGMENTS_PER_FRAME, VIDEO_HEADER_SIZE};
 
 use crate::config::ServerConfig;
 use crate::media;
@@ -354,7 +354,9 @@ fn route(path: &str, wt: &WtInfo) -> Response<Full<Bytes>> {
             let mut resp = Response::new(Full::new(body));
             let mime = HeaderValue::from_str(file.metadata.mimetype())
                 .unwrap_or_else(|_| HeaderValue::from_static("application/octet-stream"));
-            resp.headers_mut().insert(header::CONTENT_TYPE, mime);
+            let headers = resp.headers_mut();
+            headers.insert(header::CONTENT_TYPE, mime);
+            headers.insert(header::CACHE_CONTROL, cache_policy(rel));
             resp
         }
         None if rel == "index.html" && WebAssets::iter().next().is_none() => plain(
@@ -362,6 +364,24 @@ fn route(path: &str, wt: &WtInfo) -> Response<Full<Bytes>> {
             "web client not built: run ./build-web.sh",
         ),
         None => plain(StatusCode::NOT_FOUND, "not found"),
+    }
+}
+
+/// How long a bundle file may be reused without asking us again.
+///
+/// Everything under `assets/` carries a hash of its own contents in its name,
+/// so a changed file is a different URL and the old one can be kept forever.
+/// `index.html` is the opposite: one fixed URL whose whole job is to name the
+/// current hashed files. Served without a policy — which is what this did —
+/// a browser is free to apply its own heuristic to it, and a reload then
+/// quietly re-runs the previous release against a server that has moved on,
+/// with nothing on screen to say so. `no-cache` still lets it be stored; it
+/// just has to ask first, and index.html is a couple of kilobytes.
+fn cache_policy(rel: &str) -> HeaderValue {
+    if rel.starts_with("assets/") {
+        HeaderValue::from_static("public, max-age=31536000, immutable")
+    } else {
+        HeaderValue::from_static("no-cache")
     }
 }
 
@@ -597,6 +617,25 @@ fn server_config(bind_addr: SocketAddr, picker: Arc<CertPicker>) -> WtServerConf
     .with_cert_resolver(picker);
     tls.alpn_protocols = vec![b"h3".to_vec()];
 
+    // Every video frame is one unidirectional stream, so the stream limit is
+    // the number of frames in flight per direction. quinn's defaults (100
+    // streams, a 10 MB send window) let a slow link buffer seconds of video
+    // inside QUIC before anything upstream noticed. 24 is 60 fps over a
+    // 300 ms round trip plus a browser's three HTTP/3 streams. The window
+    // bounds browser viewers, whose own stream limit we cannot set. FIFO
+    // because every viewer reads frame streams one after another: round-robin
+    // across 24 of them only delays each frame's last byte under congestion.
+    // bernd: a byte window is a time window only at a given bitrate. 512 KiB
+    // per 300 ms round trip caps a viewer at about 14 Mbit/s, twice the
+    // highest share (1080p at 60 fps, 7.5 Mbit/s), and the largest keyframe
+    // (255 fragments, about 320 KB) still fits in one window. A faster share
+    // or a longer round trip needs a larger window.
+    let mut transport = QuicTransportConfig::default();
+    transport
+        .max_concurrent_uni_streams(24u32.into())
+        .send_window(512 * 1024)
+        .send_fairness(false);
+
     let builder = match bind_addr {
         SocketAddr::V4(_) => WtServerConfig::builder().with_bind_address(bind_addr),
         SocketAddr::V6(addr) => {
@@ -604,7 +643,7 @@ fn server_config(bind_addr: SocketAddr, picker: Arc<CertPicker>) -> WtServerConf
         }
     };
     builder
-        .with_custom_tls(tls)
+        .with_custom_tls_and_transport(tls, transport)
         // An idle client must not hit its own idle timeout; a vanished peer
         // still trips ours (30 s default) because it never acks.
         .keep_alive_interval(Some(Duration::from_secs(10)))
@@ -642,7 +681,7 @@ async fn run_session(connection: Connection, state: Arc<ServerState>, peer: Sock
     // the client then saw a dead connection instead of the kick reason.
     let mut control = tokio::spawn(pump_control(connection.clone(), bridge_end));
     let mut pumps = JoinSet::new();
-    pumps.spawn(pump_media_out(connection.clone(), media_rx, video_tx));
+    pumps.spawn(pump_media_out(connection.clone(), media_rx, video_tx, state.clone()));
     pumps.spawn(pump_video_streams(connection.clone(), video_rx));
     pumps.spawn(pump_media_in(connection.clone(), sid_rx, state));
 
@@ -689,6 +728,8 @@ async fn pump_control(connection: Connection, bridge_end: DuplexStream) {
             return;
         }
     };
+    // Replies must not wait behind video frames, which go out in order.
+    quic_send.set_priority(1);
     let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge_end);
     tokio::select! {
         r = tokio::io::copy(&mut quic_recv, &mut bridge_write) => debug!("client → server control ended: {r:?}"),
@@ -772,20 +813,37 @@ async fn pump_video_in(connection: &Connection, session_id: SessionId, state: &S
 
 /// Server → client media, read from the session's relay queue. Everything
 /// but video goes out as a datagram right here (`send_datagram` never
-/// blocks); video fragments are queued for the stream writer, dropped when
-/// the queue is full so this loop never stalls on the QUIC side.
+/// blocks); video is queued for the stream writer a whole frame at a time and
+/// dropped whole when it does not fit (see `VideoAdmission`), so this loop
+/// never stalls on the QUIC side. A drop asks the sharer for the keyframe
+/// that ends it.
 async fn pump_media_out(
     connection: Connection,
     mut media_rx: mpsc::Receiver<Bytes>,
     video_tx: mpsc::Sender<Bytes>,
+    state: Arc<ServerState>,
 ) {
     let mut warned_oversize = false;
+    let mut admission = VideoAdmission::default();
     while let Some(packet) = media_rx.recv().await {
         if packet.is_empty() {
             continue;
         }
         match packet[0] {
             0x13 | 0x14 => {
+                let dropping = admission.await_key;
+                if !admission.admit(&packet, video_tx.capacity()) {
+                    // A drop just started. From here the viewer receives
+                    // nothing to notice the gap by, so it cannot ask for the
+                    // keyframe that ends it: ask the sharer on its behalf.
+                    // The session id was checked against the sender on the
+                    // way in (media::handle_packet).
+                    if !dropping && admission.await_key {
+                        let sharer = u32::from_be_bytes([packet[1], packet[2], packet[3], packet[4]]);
+                        crate::tcp::relay_keyframe_request(&state, sharer).await;
+                    }
+                    continue;
+                }
                 if let Err(mpsc::error::TrySendError::Closed(_)) = video_tx.try_send(packet) {
                     return;
                 }
@@ -809,6 +867,45 @@ async fn pump_media_out(
                 }
             }
         }
+    }
+}
+
+/// Whole-frame admission of video fragments into one viewer's stream queue.
+///
+/// Dropping single fragments on a full queue cost the viewer the frame anyway
+/// and let every delta after it through to be discarded on arrival. A frame
+/// is now let in on its first fragment only if all of it fits; after a
+/// refusal, deltas are refused until the keyframe they all depend on. Deltas
+/// also leave room for a whole keyframe, so the one that ends a drop is never
+/// refused for a queue the deltas filled.
+#[derive(Default)]
+struct VideoAdmission {
+    /// (frame_id, admitted) of the frame being queued.
+    current: Option<(u32, bool)>,
+    /// A frame was refused: nothing decodes again before a keyframe.
+    await_key: bool,
+}
+
+impl VideoAdmission {
+    /// `room` is the free space in the queue, in fragments. Reads only
+    /// `frame_id` (bytes 5..9) and `fragment_count` (byte 10), like
+    /// `FrameGrouper`.
+    fn admit(&mut self, packet: &[u8], room: usize) -> bool {
+        if packet.len() < VIDEO_HEADER_SIZE {
+            return false;
+        }
+        let frame_id = u32::from_be_bytes([packet[5], packet[6], packet[7], packet[8]]);
+        if let Some((id, admitted)) = self.current {
+            if id == frame_id {
+                return admitted;
+            }
+        }
+        let key = packet[0] == 0x14;
+        let need = packet[10] as usize + if key { 0 } else { MAX_FRAGMENTS_PER_FRAME };
+        let admitted = (key || !self.await_key) && room >= need;
+        self.await_key = !admitted;
+        self.current = Some((frame_id, admitted));
+        admitted
     }
 }
 
@@ -999,6 +1096,38 @@ mod tests {
         .expect("handshake within 5 s")
         .unwrap();
         (endpoint, connection)
+    }
+
+    #[test]
+    fn video_is_admitted_a_whole_frame_at_a_time() {
+        // Fragments as a sharer writes them, so the hand-read header offsets
+        // are checked against the real encoder.
+        let fragment = |key: bool, id: u32, index: u8, count: u8| {
+            VideoPacket::encrypted_fragment(key, 7, id, index, count, 0, 1, 0x5EED, vec![0; 16])
+                .to_bytes()
+        };
+        let plenty = 512;
+        let mut admission = VideoAdmission::default();
+
+        assert!(admission.admit(&fragment(false, 1, 0, 3), plenty));
+        // A started frame is finished even when the queue has filled up
+        assert!(admission.admit(&fragment(false, 1, 1, 3), 0));
+        assert!(admission.admit(&fragment(false, 1, 2, 3), 0));
+
+        // A delta may not eat the room the next keyframe needs
+        assert!(!admission.admit(&fragment(false, 2, 0, 3), MAX_FRAGMENTS_PER_FRAME + 2));
+        // It is dropped whole, not per fragment, and so is every delta after
+        // it: none of them decode without it
+        assert!(!admission.admit(&fragment(false, 2, 1, 3), plenty));
+        assert!(!admission.admit(&fragment(false, 3, 0, 3), plenty));
+
+        // A keyframe needs room for all of itself, and a refused one keeps
+        // the drop going
+        assert!(!admission.admit(&fragment(true, 4, 0, 200), 199));
+        assert!(!admission.admit(&fragment(false, 5, 0, 3), plenty));
+        // One that fits ends it, even in a tight queue
+        assert!(admission.admit(&fragment(true, 6, 0, 200), 200));
+        assert!(admission.admit(&fragment(false, 7, 0, 3), plenty));
     }
 
     #[test]

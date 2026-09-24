@@ -9,6 +9,7 @@
 import { derived, writable, type Readable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 
+import { voiceServer } from "./channels.js";
 import { connectionState } from "./connection.js";
 
 const POLL_MS = 2000;
@@ -24,28 +25,38 @@ let interval: ReturnType<typeof setInterval> | null = null;
 let lastPlayed = 0;
 let lastLost = 0;
 
-connectionState.subscribe(($state) => {
-  if ($state === "connected") {
-    if (interval) return;
-    // Counters are per connection; a reconnect restarts them, and carrying the
-    // old totals over would report one enormous loss spike on the first tick.
-    lastPlayed = 0;
-    lastLost = 0;
-    interval = setInterval(() => {
-      invoke<[number, number]>("get_voice_stats")
-        .then(([played, lost]) => {
-          const dPlayed = played - lastPlayed;
-          const dLost = lost - lastLost;
-          lastPlayed = played;
-          lastLost = lost;
-          const total = dPlayed + dLost;
-          lossPercent.set(total > 0 ? Math.round((dLost / total) * 100) : 0);
-        })
-        .catch(() => {});
-    }, POLL_MS);
-  } else if (interval) {
+/** The server carrying voice, while it is connected; null otherwise. The loss
+ *  is the call's, wherever the user is looking. */
+const voiceConnection: Readable<string | null> = derived(
+  [voiceServer, connectionState.at(voiceServer)],
+  ([$server, $state]) => ($state === "connected" ? $server : null),
+);
+
+voiceConnection.subscribe(($server) => {
+  if (interval) {
     clearInterval(interval);
     interval = null;
     lossPercent.set(0);
   }
+  if ($server === null) return;
+  // Counters are per connection; a reconnect or a move to another server
+  // starts from other totals, and carrying the old ones over would report one
+  // enormous loss spike. The first tick only takes the baseline.
+  let primed = false;
+  interval = setInterval(() => {
+    invoke<[number, number]>("get_voice_stats")
+      .then(([played, lost]) => {
+        const dPlayed = played - lastPlayed;
+        const dLost = lost - lastLost;
+        lastPlayed = played;
+        lastLost = lost;
+        if (!primed) {
+          primed = true;
+          return;
+        }
+        const total = dPlayed + dLost;
+        lossPercent.set(total > 0 ? Math.round((dLost / total) * 100) : 0);
+      })
+      .catch(() => {});
+  }, POLL_MS);
 });

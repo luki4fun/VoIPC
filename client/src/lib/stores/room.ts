@@ -7,7 +7,7 @@
 
 import { derived, writable, get } from "svelte/store";
 // Explicit extensions so Node's test runner can load this file as-is
-import { channels, currentChannelId } from "./channels.ts";
+import { voiceChannel } from "./channels.ts";
 import type { ProximityMode } from "../spatial.ts";
 
 export type Point = { x: number; y: number; z: number };
@@ -49,11 +49,10 @@ export const drivenBy = writable<string | null>(null);
  */
 export const audibleIds = writable<Set<number> | null>(null);
 
-/** The proximity mode of the channel we are in. */
+/** The proximity mode of the channel we are talking in, on whichever server. */
 export const currentProximity = derived(
-  [channels, currentChannelId],
-  ([$channels, $id]) =>
-    ($channels.find((c) => c.channel_id === $id)?.proximity ?? "off") as ProximityMode,
+  voiceChannel,
+  ($channel) => ($channel?.proximity ?? "off") as ProximityMode,
 );
 
 export function clearRoom(): void {
@@ -62,7 +61,7 @@ export function clearRoom(): void {
   syncing.set(false);
 }
 
-/** Disconnected: the room and the game that drove it are both gone. */
+/** Voice ended or moved to another server: the room and the game that drove it are both gone. */
 export function resetRoom(): void {
   clearRoom();
   centreView.set("chat");

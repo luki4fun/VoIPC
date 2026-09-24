@@ -40,11 +40,10 @@
       }
     }).then((fn) => unlistenFns.push(fn));
 
+    // The main window closes this too, when watching stops (App.svelte). Not on
+    // `screenshare-stopped`: that is anybody in the channel ending theirs, and
+    // closed this window while the one it shows was still live.
     listen("stopped-watching-screenshare", () => {
-      getCurrentWindow().destroy().catch(() => {});
-    }).then((fn) => unlistenFns.push(fn));
-
-    listen<{ user_id: number }>("screenshare-stopped", () => {
       getCurrentWindow().destroy().catch(() => {});
     }).then((fn) => unlistenFns.push(fn));
 

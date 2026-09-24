@@ -3,8 +3,12 @@
 // and of the chat/poke commands that need the Signal state, minus native
 // I/O. Media packets are handed to audio.ts / video.ts, which see this
 // session through the SessionContext interface.
+//
+// One Session per server, keyed by the id the UI connected with. The media
+// modules are single (one mic, one mixer, one viewer), so they serve exactly
+// one of them: the voice session, the one whose voice channel we are in.
 
-import { emit } from "./events";
+import { emit as emitEvent } from "./events";
 import { getConfig } from "./config";
 import { loadWasm, wasm, type MediaKeys, type PreKeyBundleData, type SignalClient } from "./wasm";
 import { connect as openTransport, type Transport } from "./transport";
@@ -60,36 +64,100 @@ const toBytes = (v: number[] | Uint8Array): Uint8Array => (v instanceof Uint8Arr
 /** Milliseconds since the Unix epoch truncated to u32: the ping sequence. */
 const nowU32 = () => Date.now() >>> 0;
 
-let current: Session | null = null;
-/** Connects run one after another (network.rs connect_lock). */
-let connectQueue: Promise<unknown> = Promise.resolve();
+/** Live sessions by server id: the exact `address` the UI connected with. */
+const sessions = new Map<string, Session>();
+/**
+ * Connects to one server run one after another (network.rs connect_lock);
+ * per id, so a server that takes its full auth timeout holds up no other.
+ */
+const connectQueues = new Map<string, Promise<unknown>>();
+/**
+ * The session the media modules are attached to, or null when we are in no
+ * voice channel anywhere. Stored rather than derived from `channelId !== 0`:
+ * during a switch the old server keeps its channel id until its own UserList
+ * arrives, and for that round trip both would claim voice.
+ */
+let voiceOwner: Session | null = null;
 
-/** The live session, or null when disconnected. */
-export function activeSession(): Session | null {
-  return current;
+/** The session for a server id, or null when not connected to it. */
+export function sessionFor(server: string): Session | null {
+  return sessions.get(server) ?? null;
+}
+
+/** The session whose voice channel we are in, or null. */
+export function voiceSession(): Session | null {
+  return voiceOwner;
+}
+
+export function allSessions(): Session[] {
+  return [...sessions.values()];
 }
 
 /** Connect and authenticate. Resolves with our user id. */
 export function connect(address: string, username: string): Promise<number> {
-  const run = connectQueue.then(() => doConnect(address, username));
-  connectQueue = run.catch(() => {});
+  const run = (connectQueues.get(address) ?? Promise.resolve()).then(() => doConnect(address, username));
+  const tail = run.catch(() => {});
+  connectQueues.set(address, tail);
+  void tail.then(() => {
+    if (connectQueues.get(address) === tail) connectQueues.delete(address);
+  });
   return run;
 }
 
-/** Idempotent: sends Disconnect, closes the transport and drops all Signal state. */
-export async function disconnect(): Promise<void> {
-  await current?.end(true);
+/** Idempotent, and an id we are not connected to is fine: sends Disconnect,
+ *  closes the transport and drops all Signal state of that one server. */
+export async function disconnect(server: string): Promise<void> {
+  await sessions.get(server)?.end(true);
+}
+
+/** Hand the media modules to `s`, detaching them from the previous owner. */
+function attachVoice(s: Session): void {
+  detachVoice();
+  voiceOwner = s;
+  audio.attach(s);
+  video.attach(s);
+  share.attach(s);
+}
+
+function detachVoice(): void {
+  if (!voiceOwner) return;
+  voiceOwner = null;
+  audio.detach();
+  video.detach();
+  share.detach();
+}
+
+/**
+ * `s` confirmed a voice channel: it is the voice session now, whoever held
+ * voice before. The latest confirmation wins, so a join the UI did not start
+ * (create-channel auto-join, an accepted invite) moves voice too. This is the
+ * only place the backend leaves voice on its own.
+ */
+function takeVoice(s: Session): void {
+  const previous = voiceOwner;
+  if (previous === s) return;
+  // No await inside: the capture closes and the EOT goes out to the old room
+  // before the media modules move.
+  void audio.stopTransmit();
+  // Moved before the leave: detaching stops a share of ours there, and a
+  // StopScreenShare that arrives after the leave is answered with an error.
+  attachVoice(s);
+  // ponytail: sent once, no retry. A server that refuses the leave keeps us
+  // listed in its room, but our audio there is already closed here; the join
+  // budget (channel_budget + 4, refilling 2/s) makes a refusal unlikely.
+  previous?.sendControl({ JoinChannel: { channel_id: 0, password: null } });
 }
 
 async function doConnect(address: string, username: string): Promise<number> {
-  // Tear down any existing connection first (e.g. after a page reload race)
-  if (current) await current.end(true);
+  // Replaces only this server's connection (e.g. after a page reload race);
+  // every other server stays as it is.
+  await sessions.get(address)?.end(true);
 
   const { host, port } = parseAddress(address);
   const api = await loadWasm();
   // Fresh Signal identity per connection: ephemeral by design, and the
   // server reassigns user ids on restart (network.rs connect_to_server).
-  const session = new Session(api.newSignalClient(), username);
+  const session = new Session(address, api.newSignalClient(), username);
   try {
     session.transport = await openTransport(host, port, {
       onControl: (payload) => session.onControl(payload),
@@ -115,7 +183,7 @@ async function doConnect(address: string, username: string): Promise<number> {
     await session.end(false);
     throw e;
   }
-  current = session;
+  sessions.set(address, session);
   session.start();
   return session.userId;
 }
@@ -149,7 +217,7 @@ function parseAddress(address: string): { host: string; port: number } {
 
 export class Session implements SessionContext {
   sessionId = 0;
-  /** Current channel (0 = General). Set locally on join_channel, confirmed by UserList. */
+  /** Current voice channel (0 = none: the server parks us there). Confirmed by UserList. */
   channelId = 0;
   /** The channel's media keys: what we encrypt with, and the generation
    *  before it so a re-key does not silence packets already in flight. */
@@ -188,15 +256,24 @@ export class Session implements SessionContext {
   private controlTokens = this.controlRate;
   private controlLast = Date.now();
   private controlTimer: ReturnType<typeof setTimeout> | undefined;
-  private attached = false;
   private ended = false;
 
-  constructor(readonly signal: SignalClient, readonly username: string) {
+  constructor(
+    /** The server id: the address the UI connected with, verbatim. */
+    readonly server: string,
+    readonly signal: SignalClient,
+    readonly username: string,
+  ) {
     this.mediaKeys = wasm().newMediaKeys();
   }
 
   get isEnded(): boolean {
     return this.ended;
+  }
+
+  /** A per-connection event: the payload it always had, tagged with its server. */
+  emit(name: string, data: unknown = null): void {
+    emitEvent(name, { server: this.server, data });
   }
 
   /** A channel's proximity mode, "off" for one we have never seen. */
@@ -236,8 +313,12 @@ export class Session implements SessionContext {
     this.transport?.sendDatagram(bytes);
   }
 
-  sendVideoFrame(body: Uint8Array): boolean {
-    return this.transport?.sendVideoFrame(body) ?? false;
+  sendVideoFrame(body: Uint8Array, key: boolean): boolean {
+    return this.transport?.sendVideoFrame(body, key) ?? false;
+  }
+
+  videoBacklog(): number {
+    return this.transport?.videoBacklog() ?? 0;
   }
 
   sendControl(msg: unknown): void {
@@ -311,13 +392,11 @@ export class Session implements SessionContext {
     });
   }
 
-  /** After Authenticated (network.rs:263-330, 540-565). */
+  /**
+   * After Authenticated (network.rs:263-330, 540-565). Media attaches later,
+   * when this server confirms a voice channel (onUserList).
+   */
   start(): void {
-    audio.attach(this);
-    video.attach(this);
-    share.attach(this);
-    this.attached = true;
-
     // First ping: gives the UI an RTT reading right away.
     this.sendPing();
 
@@ -342,14 +421,9 @@ export class Session implements SessionContext {
   async end(sendDisconnect: boolean): Promise<void> {
     if (this.ended) return;
     this.ended = true;
-    if (current === this) current = null;
+    if (sessions.get(this.server) === this) sessions.delete(this.server);
     clearInterval(this.keepalive);
-    if (this.attached) {
-      this.attached = false;
-      audio.detach();
-      video.detach();
-      share.detach();
-    }
+    if (voiceOwner === this) detachVoice();
     if (sendDisconnect) {
       // Whatever was still waiting for the pacer is moot now, and the goodbye
       // is not: it goes out ahead of the queue rather than behind it.
@@ -373,7 +447,7 @@ export class Session implements SessionContext {
       return;
     }
     if (this.ended) return;
-    emit("connection-lost", { reason });
+    this.emit("connection-lost", { reason });
     void this.end(false);
   }
 
@@ -395,23 +469,27 @@ export class Session implements SessionContext {
   }
 
   onVideoPacket(bytes: Uint8Array): void {
-    if (this.attached) video.onVideoPacket(bytes);
+    if (this === voiceOwner) video.onVideoPacket(bytes);
   }
 
-  /** network.rs udp_receiver_task dispatch by packet type. Plaintext media types are never accepted. */
+  /**
+   * network.rs udp_receiver_task dispatch by packet type. Plaintext media
+   * types are never accepted, and media only from the voice session: the
+   * media modules decrypt with *its* keys and mix by *its* session ids.
+   */
   onDatagram(bytes: Uint8Array): void {
     switch (bytes[0]) {
       case 0x05:
-        if (this.attached) audio.onVoicePacket(bytes);
+        if (this === voiceOwner) audio.onVoicePacket(bytes);
         break;
       case 0x02:
-        if (this.attached) audio.onEotPacket(bytes);
+        if (this === voiceOwner) audio.onEotPacket(bytes);
         break;
       case 0x15:
-        if (this.attached) audio.onScreenAudioPacket(bytes);
+        if (this === voiceOwner) audio.onScreenAudioPacket(bytes);
         break;
       case 0x06:
-        if (this.attached) audio.onPositionPacket(bytes);
+        if (this === voiceOwner) audio.onPositionPacket(bytes);
         break;
       case 0x04:
         this.onPong(bytes);
@@ -439,7 +517,7 @@ export class Session implements SessionContext {
     }
     const rtt = (nowU32() - sent) >>> 0;
     // Guard against clock weirdness producing huge values
-    if (rtt < 60_000) emit("latency-update", { ms: rtt });
+    if (rtt < 60_000) this.emit("latency-update", { ms: rtt });
   }
 
   /** network.rs handle_server_message. */
@@ -466,7 +544,7 @@ export class Session implements SessionContext {
       case "ChannelList":
         // Our own copy: the emitted array ends up in the UI's store
         this.channels = [...b.channels];
-        emit("channel-list", b.channels);
+        this.emit("channel-list", b.channels);
         break;
       case "UserList":
         this.onUserList(b.channel_id, b.users);
@@ -478,13 +556,19 @@ export class Session implements SessionContext {
         // sender key: a text channel does not move us, so we get no UserList
         // of our own, and waiting for them to key us first only works while
         // they hold no session with us (network.rs UserJoined).
-        if (b.user.user_id !== this.userId && this.signal.inChannel(this.channelId, b.user.channel_id)) {
+        // Not channel 0: that is where everybody not in voice stands, with
+        // no chat and no media to key.
+        if (
+          b.user.user_id !== this.userId &&
+          b.user.channel_id !== 0 &&
+          this.signal.inChannel(this.channelId, b.user.channel_id)
+        ) {
           this.signal.addMember(b.user.channel_id, b.user.user_id);
           if (this.establishedSessions.has(b.user.user_id)) {
             this.distributeSenderKeyToUser(b.user.channel_id, b.user.user_id);
           }
         }
-        emit("user-joined", b.user);
+        this.emit("user-joined", b.user);
         break;
       }
       case "UserLeft": {
@@ -503,7 +587,7 @@ export class Session implements SessionContext {
             // starts a fresh one they cannot read.
             this.signal.noteStale(b.channel_id);
           }
-          emit("user-left", { user_id: uid, channel_id: b.channel_id });
+          this.emit("user-left", { user_id: uid, channel_id: b.channel_id });
           break;
         }
         // The pairwise session stays: it is per person and per connection, not
@@ -515,24 +599,27 @@ export class Session implements SessionContext {
         // about the text channels we still share with them, and forgetting
         // those keys leaves both sides unreadable with nothing left to re-key.
         this.signal.dropMember(b.channel_id, uid);
-        if (uid !== this.userId && b.channel_id === this.channelId) {
+        // Channel 0 has no key to rotate: nobody there is in voice
+        if (uid !== this.userId && b.channel_id === this.channelId && b.channel_id !== 0) {
           this.signal.noteStale(b.channel_id);
           // Their copy of the room's media key stops working from the next
           // generation on, if we are the one elected to mint it.
           this.rotateMediaKeyIfMinter(b.channel_id);
         }
-        audio.onUserLeft(uid);
-        emit("user-left", { user_id: uid, channel_id: b.channel_id });
+        // Only the voice session's ids are the mixer's: another server's user
+        // with the same number is somebody else.
+        if (this === voiceOwner) audio.onUserLeft(uid);
+        this.emit("user-left", { user_id: uid, channel_id: b.channel_id });
         break;
       }
       case "UserMuted":
-        emit("user-muted", { user_id: b.user_id, muted: b.muted });
+        this.emit("user-muted", { user_id: b.user_id, muted: b.muted });
         break;
       case "UserDeafened":
-        emit("user-deafened", { user_id: b.user_id, deafened: b.deafened });
+        this.emit("user-deafened", { user_id: b.user_id, deafened: b.deafened });
         break;
       case "UserHistorySharing":
-        emit("user-history-sharing", { user_id: b.user_id, enabled: b.enabled });
+        this.emit("user-history-sharing", { user_id: b.user_id, enabled: b.enabled });
         break;
       case "Ping":
         // Reply to the server keepalive to prevent the idle disconnect
@@ -542,86 +629,92 @@ export class Session implements SessionContext {
         // Displayed latency comes from the UDP keepalive RTT (see network.rs)
         break;
       case "ServerShutdown":
-        emit("connection-lost", { reason: `Server shutdown: ${b.reason}` });
+        this.emit("connection-lost", { reason: `Server shutdown: ${b.reason}` });
         break;
       case "MovedToChannel":
         break;
       case "ChannelCreated":
         this.upsertChannel(b.channel);
-        emit("channel-created", b.channel);
+        this.emit("channel-created", b.channel);
         break;
       case "ChannelDeleted":
         this.channels = this.channels.filter((c) => c.channel_id !== b.channel_id);
         this.signal.forgetChannel(this.userId, b.channel_id);
-        emit("channel-deleted", { channel_id: b.channel_id });
+        this.emit("channel-deleted", { channel_id: b.channel_id });
         break;
       case "ChannelError":
-        emit("channel-error", { reason: b.reason });
+        this.emit("channel-error", { reason: b.reason });
         break;
       case "ChannelUpdated":
         this.upsertChannel(b.channel);
-        // The mode of the channel we are in may have just changed
-        audio.setProximityMode(this.proximityOf(this.channelId));
-        emit("channel-updated", b.channel);
+        // The mode of the channel we are in may have just changed. Only for
+        // the voice session: a background server would switch off the spatial
+        // audio of the call we are actually in.
+        if (this === voiceOwner) audio.setProximityMode(this.proximityOf(this.channelId));
+        this.emit("channel-updated", b.channel);
         break;
       case "Kicked":
-        emit("kicked", { channel_id: b.channel_id, reason: b.reason });
+        this.emit("kicked", { channel_id: b.channel_id, reason: b.reason });
         break;
       case "ChannelUsers":
-        emit("channel-users", { channel_id: b.channel_id, users: b.users });
+        this.emit("channel-users", { channel_id: b.channel_id, users: b.users });
         break;
       case "InviteReceived":
-        emit("invite-received", {
+        this.emit("invite-received", {
           channel_id: b.channel_id,
           channel_name: b.channel_name,
           invited_by: b.invited_by,
         });
         break;
       case "InviteAccepted":
-        emit("invite-accepted", { channel_id: b.channel_id, user_id: b.user_id });
+        this.emit("invite-accepted", { channel_id: b.channel_id, user_id: b.user_id });
         break;
       case "InviteDeclined":
-        emit("invite-declined", { channel_id: b.channel_id, user_id: b.user_id });
+        this.emit("invite-declined", { channel_id: b.channel_id, user_id: b.user_id });
         break;
       case "PokeReceived":
         this.onPokeReceived(b.from_user_id, b.from_username, toBytes(b.ciphertext), b.message_type);
         break;
+      // The share and the viewer below are the voice session's; anything
+      // another server says about them is late news for a share it no longer has.
       case "ScreenShareStarted":
         // Our own share was accepted; anyone else's is news for the UI
-        if (b.user_id === this.userId) share.onStarted();
-        emit("screenshare-started", { user_id: b.user_id, username: b.username, resolution: b.resolution });
+        if (b.user_id === this.userId && this === voiceOwner) share.onStarted();
+        this.emit("screenshare-started", { user_id: b.user_id, username: b.username, resolution: b.resolution });
         break;
       case "ScreenShareStopped":
-        emit("screenshare-stopped", { user_id: b.user_id });
+        this.emit("screenshare-stopped", { user_id: b.user_id });
         break;
       case "WatchingScreenShare":
-        emit("watching-screenshare", { sharer_user_id: b.sharer_user_id, codec: b.codec });
-        video
-          .startWatching(b.sharer_user_id, b.codec)
-          .catch((e) => console.error("failed to start watching:", e));
+        this.emit("watching-screenshare", { sharer_user_id: b.sharer_user_id, codec: b.codec });
+        if (this === voiceOwner) {
+          video
+            .startWatching(b.sharer_user_id, b.codec)
+            .catch((e) => console.error("failed to start watching:", e));
+        }
         break;
       case "StoppedWatchingScreenShare":
-        emit("stopped-watching-screenshare", { reason: b.reason });
-        video.stopWatching();
+        this.emit("stopped-watching-screenshare", { reason: b.reason });
+        if (this === voiceOwner) video.stopWatching();
         break;
       case "ViewerCountChanged":
-        emit("viewer-count-changed", { viewer_count: b.viewer_count });
+        this.emit("viewer-count-changed", { viewer_count: b.viewer_count });
         break;
       case "KeyframeRequested":
         // A viewer needs an IDR now. The event exists for parity with the
         // native client, whose UI relays it back through set_keyframe_requested.
-        share.requestKeyframe();
-        emit("keyframe-requested");
+        if (this === voiceOwner) share.requestKeyframe();
+        this.emit("keyframe-requested");
         break;
       case "VideoLossReported":
         // A viewer of our share lost frames: step the encoder down
-        share.onLossReport(b.frames_dropped);
+        if (this === voiceOwner) share.onLossReport(b.frames_dropped);
         break;
       case "ScreenShareError":
-        // A refused StartScreenShare (already sharing, General lobby) must also
+        // A refused StartScreenShare (already sharing, not in voice) must also
         // tear down the capture the browser already granted us.
-        share.onServerError();
-        emit("screenshare-error", { reason: b.reason });
+        if (this === voiceOwner) share.onServerError();
+        this.emit("screenshare-error", { reason: b.reason });
         break;
       case "PreKeyBundle":
         this.onPrekeyBundle(b.user_id, b.bundle);
@@ -631,7 +724,7 @@ export class Session implements SessionContext {
         this.pendingSessions.delete(b.user_id);
         break;
       case "IdentityKeyChanged":
-        emit("identity-key-changed", { user_id: b.user_id, new_identity_key: b.new_identity_key });
+        this.emit("identity-key-changed", { user_id: b.user_id, new_identity_key: b.new_identity_key });
         break;
       case "EncryptedDirectChatMessage":
         this.onEncryptedDirectMessage(
@@ -659,13 +752,13 @@ export class Session implements SessionContext {
         this.onMediaKeyReceived(b.channel_id, b.from_user_id, toBytes(b.encrypted_media_key), b.message_type);
         break;
       case "AdminStatus":
-        emit("admin-status", { user_id: b.user_id, is_admin: b.is_admin });
+        this.emit("admin-status", { user_id: b.user_id, is_admin: b.is_admin });
         break;
       case "AdminError":
-        emit("admin-error", { reason: b.reason });
+        this.emit("admin-error", { reason: b.reason });
         break;
       case "AdminBans":
-        emit("admin-bans", {
+        this.emit("admin-bans", {
           bans: (b.bans as { ip: string; expires_in_secs?: bigint | number }[]).map((x) => ({
             ip: x.ip,
             expires_in_secs: x.expires_in_secs == null ? null : Number(x.expires_in_secs),
@@ -674,10 +767,10 @@ export class Session implements SessionContext {
         break;
       case "Disconnected":
         // The server closes the session right after; the UI must not auto-reconnect
-        emit("server-disconnected", { reason: b.reason });
+        this.emit("server-disconnected", { reason: b.reason });
         break;
       case "ChannelHistoryRequested":
-        emit("channel-history-requested", { channel_id: b.channel_id, from_user_id: b.from_user_id });
+        this.emit("channel-history-requested", { channel_id: b.channel_id, from_user_id: b.from_user_id });
         break;
       case "ChannelHistoryReceived":
         this.onChannelHistoryReceived(
@@ -729,13 +822,17 @@ export class Session implements SessionContext {
           this.distributeSenderKeyToUser(channelId, user.user_id);
         }
       }
-      emit("user-list", { channel_id: channelId, users });
+      this.emit("user-list", { channel_id: channelId, users });
       return;
     }
 
     // Server-initiated moves (create_channel auto-join, kicks, invites) land here
     const oldChannel = this.channelId;
     this.channelId = channelId;
+    // Before the move below, so what it does to the media lands on this
+    // session's freshly attached modules.
+    const tookVoice = channelId !== 0 && voiceOwner !== this;
+    if (tookVoice) takeVoice(this);
     // The room we left is not ours to key any more; the one we joined is
     // The room we left is not ours to key any more: roster, the record of who
     // holds our chain there, and the chain itself — the same as walking out of
@@ -751,12 +848,22 @@ export class Session implements SessionContext {
       if (this.watchingUserId !== 0) {
         this.watchingUserId = 0;
         this.sendControl("StopWatchingScreenShare");
-        emit("screen-share-force-stopped");
-        video.stopWatching();
+        this.emit("screen-share-force-stopped");
+        if (this === voiceOwner) video.stopWatching();
       }
       // Our own share belonged to the old channel's members and its media key
-      if (share.sharing) share.stop();
+      if (this === voiceOwner && share.sharing) share.stop();
+    }
+    // A fresh attach starts flat, so the room's mode is set even when the
+    // channel id itself did not change.
+    if (this === voiceOwner && (tookVoice || oldChannel !== channelId)) {
       audio.onChannelChanged(this.proximityOf(channelId));
+    }
+    // Out of voice, a kick included: close the mic. VAD and always-on would
+    // otherwise keep capturing in a channel that carries no media.
+    if (channelId === 0 && this === voiceOwner) {
+      void audio.stopTransmit();
+      detachVoice();
     }
 
     // Pairwise sessions are needed in every channel (DMs, pokes), not just for channel chat
@@ -778,7 +885,7 @@ export class Session implements SessionContext {
       this.mintMediaKey(channelId, 0);
     }
 
-    emit("user-list", { channel_id: channelId, users });
+    this.emit("user-list", { channel_id: channelId, users });
   }
 
   // ── E2E helpers (network.rs request_prekey_bundles_for_users .. drain_pending_channel_messages) ──
@@ -869,7 +976,7 @@ export class Session implements SessionContext {
       console.error("media key generation failed:", e);
       return false;
     }
-    emit("media-key-installed", { channel_id: channelId, key_id: keyId });
+    this.emit("media-key-installed", { channel_id: channelId, key_id: keyId });
     return true;
   }
 
@@ -883,7 +990,8 @@ export class Session implements SessionContext {
    * hold, and `MediaKeys.install` settles a tie the same way everywhere.
    */
   private rotateMediaKeyIfMinter(channelId: number): void {
-    if (this.signal.mediaKeyMinter(channelId) !== this.userId) return;
+    // Channel 0 carries no media, so it never gets a key to rotate
+    if (channelId === 0 || this.signal.mediaKeyMinter(channelId) !== this.userId) return;
     // The one after ours, or the channel's first where we hold none — the
     // member who held it has left and nobody else is going to send one. Same
     // answer as the desktop client, from the same Rust (media_keys.rs
@@ -922,7 +1030,7 @@ export class Session implements SessionContext {
       // does — so two members who disagreed about the roster for a moment
       // converge instead of going deaf to each other.
       if (this.mediaKeys.install(plaintext, this.channelId)) {
-        emit("media-key-installed", { channel_id: channelId, key_id: this.mediaKeys.keyId ?? 0 });
+        this.emit("media-key-installed", { channel_id: channelId, key_id: this.mediaKeys.keyId ?? 0 });
       }
     } catch (e) {
       console.warn(`media key from ${fromUserId} rejected:`, e);
@@ -997,7 +1105,7 @@ export class Session implements SessionContext {
       return;
     }
     if (messageType === 1) this.markEstablished(fromUserId);
-    emit("channel-history-received", {
+    this.emit("channel-history-received", {
       channel_id: channelId,
       from_user_id: fromUserId,
       from_username: fromUsername,
@@ -1082,10 +1190,10 @@ export class Session implements SessionContext {
       // A DM carries the same envelope a channel message does since 0.9.0;
       // anything else reads as the text itself.
       const { id, text, ttl_secs } = wasm().openEnvelope(plaintext);
-      emit("direct-chat-message", { ...event, content: text, message_id: id, ttl_secs });
+      this.emit("direct-chat-message", { ...event, content: text, message_id: id, ttl_secs });
     } catch (e) {
       console.warn(`failed to decrypt direct message from ${fromUserId}:`, e);
-      emit("direct-chat-message", {
+      this.emit("direct-chat-message", {
         ...event,
         content: "[encrypted message — decryption failed]",
         decryption_failed: true,
@@ -1116,10 +1224,10 @@ export class Session implements SessionContext {
       const { id, text, ttl_secs } = wasm().openEnvelope(plaintext);
       // What the sender says this message's life is; the store takes the
       // shorter of it and the channel's own timer (expiryFor, chat-rules.ts).
-      emit("channel-chat-message", { ...event, content: text, message_id: id, ttl_secs });
+      this.emit("channel-chat-message", { ...event, content: text, message_id: id, ttl_secs });
     } catch (e) {
       console.warn(`failed to decrypt channel message from ${userId}:`, e);
-      emit("channel-chat-message", {
+      this.emit("channel-chat-message", {
         ...event,
         content: "[encrypted message — decryption failed]",
         decryption_failed: true,
@@ -1136,10 +1244,10 @@ export class Session implements SessionContext {
     } catch (e) {
       console.warn(`failed to decrypt poke from ${fromUserId}:`, e);
     }
-    emit("poke-received", { from_user_id: fromUserId, from_username: fromUsername, message });
+    this.emit("poke-received", { from_user_id: fromUserId, from_username: fromUsername, message });
     // Also inject the poke as a DM so it appears in chat history
     if (message !== "") {
-      emit("direct-chat-message", {
+      this.emit("direct-chat-message", {
         from_user_id: fromUserId,
         from_username: fromUsername,
         to_user_id: this.userId,
@@ -1170,7 +1278,7 @@ export class Session implements SessionContext {
   stopWatchingScreenShare(): void {
     if (this.watchingUserId === 0) return;
     this.stopWatching();
-    video.stopWatching();
+    if (this === voiceOwner) video.stopWatching();
   }
 
   /** SessionContext: used by the video module when it gives up on a stream. */
@@ -1193,7 +1301,7 @@ export class Session implements SessionContext {
     });
     // Emit the poke as a local DM for the sender's chat history
     if (message !== "") {
-      emit("direct-chat-message", {
+      this.emit("direct-chat-message", {
         from_user_id: this.userId,
         from_username: this.username,
         to_user_id: targetUserId,
@@ -1253,11 +1361,11 @@ export class Session implements SessionContext {
     if (ciphertext) {
       this.sendControl({ SendEncryptedChannelMessage: { channel_id: channelId, ciphertext } });
       // The server excludes us from the encrypted broadcast: show it locally
-      emit("channel-chat-message", { ...event, encrypted: true });
+      this.emit("channel-chat-message", { ...event, encrypted: true });
     } else {
       // Sent once sender key distribution completes; shown immediately as pending
       this.pendingMessages.push({ target: { kind: "channel", channelId }, id: messageId, content, ttlSecs, queuedAt: Date.now() });
-      emit("channel-chat-message", { ...event, pending: true });
+      this.emit("channel-chat-message", { ...event, pending: true });
     }
   }
 
@@ -1311,10 +1419,10 @@ export class Session implements SessionContext {
         },
       });
       // The server echo cannot be decrypted by the sender (ratchet advanced): show it locally
-      emit("direct-chat-message", { ...event, encrypted: true });
+      this.emit("direct-chat-message", { ...event, encrypted: true });
     } else {
       this.pendingMessages.push({ target: { kind: "direct", targetUserId }, id: messageId, content, ttlSecs, queuedAt: Date.now() });
-      emit("direct-chat-message", { ...event, pending: true });
+      this.emit("direct-chat-message", { ...event, pending: true });
     }
   }
 }

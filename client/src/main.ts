@@ -1,7 +1,14 @@
 import { mount } from "svelte";
 import "./app.css";
+import { buildLine } from "./lib/build-info";
 
 const params = new URLSearchParams(window.location.search);
+
+// Says which build is running before anything else can fail. In the browser
+// this is the quickest answer to "did that reload actually serve the new
+// bundle?" — open the console, reload, read the line. The settings panel
+// carries the same line for anyone who is not in devtools.
+console.info(`%c${buildLine()}`, "color:#7aa2f7");
 
 /**
  * Start applying the saved appearance preferences to this window.

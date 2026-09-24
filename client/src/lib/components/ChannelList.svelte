@@ -13,7 +13,7 @@
   // keeps them too, so the same checks can run against either layout.
 
   import { channels, currentChannelId, previewChannelId } from "../stores/channels.js";
-  import { userId, isAdmin } from "../stores/connection.js";
+  import { isAdmin, serverAddress } from "../stores/connection.js";
   import {
     activeTextChannelId,
     channelUnread,
@@ -41,10 +41,13 @@
     $channels.find((c) => c.channel_id === $currentChannelId)?.name ?? ""
   );
 
-  // A hidden channel is not listed, unless you are an admin or standing in it
+  // A hidden channel is not listed, unless you are an admin or standing in it.
+  // Nor is the lobby, channel 0: it is where the server keeps everyone who is
+  // in no voice channel, which is not a place anybody goes. Its people are the
+  // member list's "Online" group.
   let visibleChannels = $derived(
     $channels.filter(
-      (c) => !c.hidden || $isAdmin || c.channel_id === $currentChannelId,
+      (c) => c.channel_id !== 0 && (!c.hidden || $isAdmin || c.channel_id === $currentChannelId),
     ),
   );
 </script>
@@ -70,7 +73,7 @@
     {#each visibleChannels as channel (channel.channel_id)}
       {@const subscribed = channel.text && $joinedTextChannelIds.has(channel.channel_id)}
       {@const left = channel.text && !subscribed && $leftTextChannelNames.has(channel.name)}
-      {@const unread = channelUnread($unreadPerChannel, channel.name)}
+      {@const unread = channelUnread($unreadPerChannel, $serverAddress, channel.name)}
       <button
         class="channel"
         class:active={channel.text
@@ -89,9 +92,7 @@
           channel.text ? undefined : joinChannel(channel.channel_id, channel.has_password)}
       >
         <span class="channel-icon">
-          {#if channel.channel_id === 0}
-            <Icon name="lobby" size={16} />
-          {:else if channel.has_password}
+          {#if channel.has_password}
             <Icon name="lock" size={16} />
           {:else if channel.text}
             <Icon name="hash" size={16} />
@@ -167,7 +168,7 @@
           <button
             class="dm-entry"
             class:active={$activeDmUserId === convo.user_id}
-            onclick={() => openDm(convo.user_id, convo.username, $userId)}
+            onclick={() => openDm($serverAddress, convo.user_id, convo.username)}
           >
             <span class="dm-avatar" style="background: {avatarColor(convo.username)}">
               {convo.username.charAt(0).toUpperCase()}

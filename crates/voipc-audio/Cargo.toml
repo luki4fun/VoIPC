@@ -8,6 +8,7 @@ voipc-protocol = { workspace = true }
 audiopus = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
+tokio = { workspace = true }
 ringbuf = "0.4"
 nnnoiseless = "0.1"
 

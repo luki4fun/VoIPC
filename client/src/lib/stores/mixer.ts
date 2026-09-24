@@ -159,10 +159,11 @@ export async function loadUser(id: number): Promise<void> {
 }
 
 /**
- * Forget everything about other people. Called on disconnect only — a user id
- * is a session id and is handed to somebody else next time. Deliberately NOT on
- * a channel change: the backend keeps volumes across one, so clearing there
- * would make the UI disagree with what you actually hear.
+ * Forget everything about other people. Called when voice leaves a server —
+ * it ended, moved to another server, or the server went — because a user id is
+ * that server's session id and is handed to somebody else next time.
+ * Deliberately NOT on a channel change: the backend keeps volumes across one,
+ * so clearing there would make the UI disagree with what you actually hear.
  *
  * Our own lane survives, because it is ours and it is saved to disk.
  */

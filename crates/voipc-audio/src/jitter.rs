@@ -17,6 +17,12 @@ const MAX_PLC_RUN: u32 = 50;
 /// Consecutive late-discarded packets before assuming the sender restarted
 /// its sequence counter (e.g. lost EndOfTransmission) and resyncing.
 const MAX_LATE_DISCARDS: u32 = 25;
+/// Frames of concealment played while waiting for a packet that has not
+/// arrived yet. A network hiccup shorter than this is stretched over rather
+/// than cut: the stream keeps playing, the late packet is still played when
+/// it lands, and the cushion is permanently deeper by the size of the hiccup.
+/// Beyond it the pause is treated as the speaker having stopped.
+const MAX_STALL_PLC: u8 = 3;
 const MIN_TARGET_DELAY: usize = 2;
 const MAX_TARGET_DELAY: usize = 8;
 const MAX_BUFFER_CAP: usize = 32;
@@ -24,6 +30,13 @@ const MAX_BUFFER_CAP: usize = 32;
 const DECAY_QUIET: Duration = Duration::from_secs(10);
 /// Minimum time between adaptive-delay growth steps.
 const GROW_COOLDOWN: Duration = Duration::from_secs(1);
+/// Frames above the target a stream may hold standing before one is shed.
+/// Bursty senders and device-clocked pulls swing the depth by a frame or
+/// two on their own; only a surplus beyond that is latency nobody asked for.
+const SHED_MARGIN: usize = 2;
+/// Consecutive pops (50 = 1 s) the surplus must stand before a frame is shed,
+/// and so the most that is ever shed: one frame a second.
+const SHED_AFTER: u8 = 50;
 
 /// Per-user jitter buffer that reorders packets and detects losses.
 ///
@@ -48,6 +61,13 @@ pub struct JitterBuffer {
     late_discards: u32,
     /// Last time the adaptive delay changed or lateness was observed.
     last_change: Option<Instant>,
+    /// Consecutive concealment frames played while the buffer sat empty.
+    plc_run: u8,
+    /// Fewest frames still waiting whenever a packet arrived during playback
+    /// this phrase: whether the cushion ever had to be spent down to nothing.
+    min_depth: Option<usize>,
+    /// Consecutive pops that left more than `SHED_MARGIN` frames above target.
+    deep_pops: u8,
 }
 
 impl JitterBuffer {
@@ -65,6 +85,9 @@ impl JitterBuffer {
             max_buffer: (target_delay * 4).min(MAX_BUFFER_CAP),
             late_discards: 0,
             last_change: None,
+            plc_run: 0,
+            min_depth: None,
+            deep_pops: 0,
         }
     }
 
@@ -78,9 +101,15 @@ impl JitterBuffer {
         self.max_buffer = (self.target_delay * 4).min(MAX_BUFFER_CAP);
     }
 
-    /// On (re-)entering buffering: shrink the delay after a quiet period.
+    /// On (re-)entering buffering: shrink the delay after a quiet period, but
+    /// only if the phrase just played never needed all of it. Bursty senders
+    /// and device-clocked receivers run a 2-frame cushion dry early in most
+    /// phrases; decaying anyway would drop the 3rd frame every other phrase
+    /// only for lateness to grow it straight back.
     fn maybe_decay(&mut self) {
-        if self.target_delay > MIN_TARGET_DELAY
+        let spare = self.min_depth.take().is_some_and(|d| d >= 1);
+        if spare
+            && self.target_delay > MIN_TARGET_DELAY
             && self
                 .last_change
                 .map_or(true, |t| t.elapsed() >= DECAY_QUIET)
@@ -116,6 +145,13 @@ impl JitterBuffer {
             }
         }
 
+        // Measured at arrival, not after pops: every phrase's tail drains to
+        // zero, so only what was left when the next packet landed shows
+        // whether the cushion had a frame to spare.
+        if !self.buffering {
+            let depth = self.buffer.len();
+            self.min_depth = Some(self.min_depth.map_or(depth, |d| d.min(depth)));
+        }
         self.buffer.insert(sequence, opus_data);
 
         // Prevent unbounded growth; fast-forward past dropped frames so the
@@ -149,9 +185,21 @@ impl JitterBuffer {
         let next = self.next_seq?;
 
         if let Some(data) = self.buffer.remove(&next) {
+            if self.plc_run > 0 {
+                // It arrived, just late: the cushion was too shallow for this
+                // link, so the next burst starts one frame deeper.
+                self.note_trouble();
+                self.plc_run = 0;
+            }
             self.next_seq = Some(next.wrapping_add(1));
+            self.deep_pops = if self.buffer.len() > self.target_delay + SHED_MARGIN {
+                self.deep_pops.saturating_add(1)
+            } else {
+                0
+            };
             Some(JitterFrame::Ready(data))
         } else if !self.buffer.is_empty() {
+            self.plc_run = 0;
             let smallest = *self.buffer.keys().next().expect("buffer not empty");
             let gap = smallest.wrapping_sub(next);
             if gap > MAX_PLC_RUN {
@@ -164,10 +212,22 @@ impl JitterBuffer {
             // We have later packets but not the one we need — it's lost
             self.next_seq = Some(next.wrapping_add(1));
             Some(JitterFrame::Lost)
+        } else if self.plc_run < MAX_STALL_PLC {
+            // The packet is not here *yet*. Conceal this frame and keep
+            // next_seq where it is, so a hiccup shorter than MAX_STALL_PLC is
+            // stretched over instead of played as a hole with hard edges —
+            // and the late packet is still played when it lands.
+            self.plc_run += 1;
+            Some(JitterFrame::Lost)
         } else {
-            // Buffer empty — underrun. Re-arm buffering so playback resumes
-            // with a full jitter cushion instead of repeated micro-drops.
-            // next_seq is kept so stale stragglers are still discarded.
+            // Long enough that the speaker has stopped, not stalled. Re-arm
+            // buffering so playback resumes with a full jitter cushion instead
+            // of repeated micro-drops; next_seq is kept so stale stragglers
+            // are still discarded. This is the end of a phrase just like an
+            // end-of-transmission, and streams that never send one (screen
+            // audio, always-on voice, browser VAD) only ever end here, so
+            // the delay decays here too or it stays at its peak for good.
+            self.plc_run = 0;
             self.buffering = true;
             self.maybe_decay();
             None
@@ -187,7 +247,22 @@ impl JitterBuffer {
         self.next_seq = None;
         self.buffering = true;
         self.late_discards = 0;
+        self.plc_run = 0;
+        self.deep_pops = 0;
         self.maybe_decay();
+    }
+
+    /// Whether a standing surplus asks the caller to play one frame fewer;
+    /// true at most once per `SHED_AFTER` pops. A continuous stream never
+    /// reaches `reset`, so latency added by a burst or a bridged stall would
+    /// otherwise stay for good. The caller pops the extra frame itself: it
+    /// has the decoded audio to pick the quieter of the two to drop.
+    pub fn take_surplus(&mut self) -> bool {
+        let due = self.deep_pops >= SHED_AFTER;
+        if due {
+            self.deep_pops = 0;
+        }
+        due
     }
 
     /// Number of packets currently buffered.
@@ -227,7 +302,11 @@ mod tests {
             JitterFrame::Ready(d) => assert_eq!(d, vec![11]),
             JitterFrame::Lost => panic!("expected Ready"),
         }
-        assert!(jb.pop().is_none()); // empty
+        // Empty: the stall is concealed before playback gives up
+        for _ in 0..MAX_STALL_PLC {
+            assert!(matches!(jb.pop(), Some(JitterFrame::Lost)));
+        }
+        assert!(jb.pop().is_none());
     }
 
     #[test]
@@ -263,6 +342,11 @@ mod tests {
 
         // Push a packet older than next_seq (6) — should be discarded
         jb.push(3, vec![30]);
+        // The buffer is empty, so the next pops conceal the stall and only
+        // then fall through to rebuffering
+        for _ in 0..MAX_STALL_PLC {
+            assert!(matches!(jb.pop(), Some(JitterFrame::Lost)));
+        }
         assert!(jb.pop().is_none());
     }
 
@@ -315,6 +399,10 @@ mod tests {
         jb.push(1, vec![11]);
         assert!(matches!(jb.pop(), Some(JitterFrame::Ready(_))));
         assert!(matches!(jb.pop(), Some(JitterFrame::Ready(_))));
+        // The stall is concealed first, then the buffer re-arms
+        for _ in 0..MAX_STALL_PLC {
+            assert!(matches!(jb.pop(), Some(JitterFrame::Lost)));
+        }
         assert!(jb.pop().is_none()); // underrun → re-enters buffering
 
         // One packet is not enough to leave buffering again
@@ -399,6 +487,64 @@ mod tests {
     }
 
     #[test]
+    fn a_short_stall_is_bridged_and_the_late_packet_still_plays() {
+        // The hole this closes: one delayed packet used to end the burst, so
+        // playback stopped dead and restarted 40ms later with a hard edge.
+        let mut jb = JitterBuffer::new(2);
+        jb.push(0, vec![10]);
+        jb.push(1, vec![11]);
+        assert!(matches!(jb.pop(), Some(JitterFrame::Ready(_))));
+        assert!(matches!(jb.pop(), Some(JitterFrame::Ready(_))));
+        let delay_before = jb.target_delay;
+
+        // Two ticks with nothing there: concealed, and still expecting seq 2
+        assert!(matches!(jb.pop(), Some(JitterFrame::Lost)));
+        assert!(matches!(jb.pop(), Some(JitterFrame::Lost)));
+        assert_eq!(jb.next_seq, Some(2), "the late packet was given up on");
+
+        // It lands late and is played, not skipped
+        force_quiet(&mut jb);
+        jb.push(2, vec![12]);
+        match jb.pop().unwrap() {
+            JitterFrame::Ready(d) => assert_eq!(d, vec![12]),
+            JitterFrame::Lost => panic!("the late packet was dropped"),
+        }
+        assert_eq!(
+            jb.target_delay,
+            delay_before + 1,
+            "a bridged stall must deepen the cushion"
+        );
+    }
+
+    #[test]
+    fn a_stall_that_runs_out_rebuffers_without_growing() {
+        // A speaker who simply stopped is not a network problem: conceal the
+        // tail, then go quiet, and leave the cushion where it was.
+        let mut jb = JitterBuffer::new(2);
+        jb.push(0, vec![10]);
+        jb.push(1, vec![11]);
+        assert!(matches!(jb.pop(), Some(JitterFrame::Ready(_))));
+        assert!(matches!(jb.pop(), Some(JitterFrame::Ready(_))));
+        let delay_before = jb.target_delay;
+
+        for _ in 0..MAX_STALL_PLC {
+            assert!(matches!(jb.pop(), Some(JitterFrame::Lost)));
+        }
+        assert!(jb.pop().is_none(), "the concealment never ends");
+        assert!(jb.pop().is_none(), "and stays ended");
+        assert_eq!(jb.target_delay, delay_before, "a pause is not lateness");
+
+        // Speaking again resumes normally
+        force_quiet(&mut jb);
+        jb.push(2, vec![12]);
+        jb.push(3, vec![13]);
+        match jb.pop().unwrap() {
+            JitterFrame::Ready(d) => assert_eq!(d, vec![12]),
+            JitterFrame::Lost => panic!("expected Ready"),
+        }
+    }
+
+    #[test]
     fn adaptive_delay_grows_capped_and_decays() {
         let mut jb = JitterBuffer::new(2);
         for _ in 0..2 * MAX_TARGET_DELAY {
@@ -411,11 +557,56 @@ mod tests {
         // Decays one step per buffering entry once quiet, down to the floor
         for expected in (MIN_TARGET_DELAY..MAX_TARGET_DELAY).rev() {
             force_quiet(&mut jb);
+            jb.min_depth = Some(1);
             jb.reset();
             assert_eq!(jb.target_delay, expected);
         }
         force_quiet(&mut jb);
+        jb.min_depth = Some(1);
         jb.reset();
         assert_eq!(jb.target_delay, MIN_TARGET_DELAY); // floor holds
+    }
+
+    #[test]
+    fn only_a_phrase_with_a_frame_to_spare_decays() {
+        let mut jb = JitterBuffer::new(3);
+        for seq in 0..3 {
+            jb.push(seq, vec![seq as u8]);
+        }
+        for _ in 0..3 {
+            assert!(matches!(jb.pop(), Some(JitterFrame::Ready(_))));
+        }
+        jb.push(3, vec![3]); // lands on an empty buffer: the cushion ran dry
+        assert!(matches!(jb.pop(), Some(JitterFrame::Ready(_))));
+        force_quiet(&mut jb);
+        jb.reset();
+        assert_eq!(jb.target_delay, 3, "a phrase that used it all keeps it");
+
+        for seq in 10..13 {
+            jb.push(seq, vec![seq as u8]);
+        }
+        assert!(matches!(jb.pop(), Some(JitterFrame::Ready(_))));
+        jb.push(13, vec![13]); // two still waiting
+        for _ in 0..3 {
+            assert!(matches!(jb.pop(), Some(JitterFrame::Ready(_))));
+        }
+        force_quiet(&mut jb);
+        jb.reset();
+        assert_eq!(jb.target_delay, 2, "a phrase with a frame to spare decays");
+    }
+
+    #[test]
+    fn a_standing_surplus_is_shed_a_frame_a_second() {
+        let mut jb = JitterBuffer::new(2);
+        for seq in 0..7 {
+            jb.push(seq, vec![seq as u8]);
+        }
+        for seq in 7..7 + SHED_AFTER as u32 {
+            assert!(!jb.take_surplus());
+            assert!(matches!(jb.pop(), Some(JitterFrame::Ready(_))));
+            jb.push(seq, vec![seq as u8]);
+        }
+        assert!(jb.take_surplus());
+        assert!(!jb.take_surplus(), "once per second, not every pop");
     }
 }

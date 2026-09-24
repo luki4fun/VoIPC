@@ -25,10 +25,16 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { onDestroy } from "svelte";
-  import { users } from "../stores/users.js";
-  import { isAdmin, isMuted, userId, username } from "../stores/connection.js";
+  // The call's people and the call's channel, on whichever server carries
+  // voice: the lanes are theirs, whatever server is on screen.
+  import {
+    isMuted,
+    voiceIsAdmin as isAdmin,
+    voiceUserId as userId,
+    voiceUsername as username,
+  } from "../stores/connection.js";
   import { toggleMute } from "../stores/voice.js";
-  import { channels, currentChannelId } from "../stores/channels.js";
+  import { voiceChannel, voiceUsers as users } from "../stores/channels.js";
   import { addNotification } from "../stores/notifications.js";
   import { avatarColor } from "../avatar.js";
   import { audibleIds, drivenBy } from "../stores/room.js";
@@ -61,10 +67,7 @@
   /** One strip. `"mic"` is ours; every other id is a user id. */
   type Strip = { id: number | "mic"; name: string; colour: string; own: boolean };
 
-  const hidesMembers = $derived(
-    !$isAdmin &&
-      ($channels.find((c) => c.channel_id === $currentChannelId)?.hide_members ?? false),
-  );
+  const hidesMembers = $derived(!$isAdmin && ($voiceChannel?.hide_members ?? false));
   const roster = $derived(hidesMembers ? [] : $users.filter((u) => u.user_id !== $userId));
 
   /** Ours first, then everyone else. The same shape for both, on purpose. */

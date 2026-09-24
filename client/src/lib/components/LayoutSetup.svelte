@@ -2,7 +2,7 @@
   // "Which of these do you want?", once.
   //
   // Shown on the first connection, right after the audio setup and for the same
-  // reason: they are in the lobby, voice is off there, and it is the moment
+  // reason: they are connected and in no voice channel yet, and it is the moment
   // people expect to be asked things. After it, because bad audio is what breaks
   // a call and a layout somebody would rather not have is not.
   //

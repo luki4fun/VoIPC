@@ -1,87 +1,122 @@
-// The server rail's list.
+// The servers: which are open, what they are called, and what the rail draws.
 //
-// **One connection exists at a time.** `AppState.connection` is an `Option` in
-// Rust, `session.current` is a `Session | null` in the browser backend, and not
-// one of the ~100 commands takes a connection id. This module does not change
-// that and is not a step towards changing it on its own.
+// Several can be open at once. Each is one connection in the backend, keyed by
+// the id `serverId` builds — the string handed to `connect` as the address and
+// passed as `server` to every command about that connection afterwards. The
+// backend never re-normalizes it, so this is the one place an address becomes
+// an id, and two spellings of one server cannot become two connections.
 //
-// What it does is make the *shape* right, so the rail is written against a list
-// from the first commit rather than against "the connection" plus a special
-// case. The day connections really are plural, this file grows a Map keyed by
-// connection id and the rail does not change. What would still have to happen
-// then, so nobody reads this as "multi-server is nearly done": `AppState
-// .connection` and `session.current` become maps, every command and event gains
-// a connection id, and `chat.ts` stops keying history by channel name alone —
-// two servers with a `#general` collide today.
+// Which one is on screen is `serverAddress` (scoped.ts); which one carries voice
+// is `voice` (channels.ts). Neither is decided here.
+//
+// Pure — `svelte/store` and the address parser — so servers.test.ts can load it
+// under Node. The derived list the rail reads, which needs every store in the
+// app, is `serverEntries` in connect.ts.
 
-import { derived, type Readable } from "svelte/store";
+import { writable } from "svelte/store";
+import { splitAddress } from "../invite.ts";
+import type { ConnectionState } from "./connection.js";
+import type { DmConversation } from "./chat.js";
+import type { SavedServer } from "./settings.js";
 
-import { connectionState, serverAddress, type ConnectionState } from "./connection.js";
-import { unreadPerChannel } from "./chat.js";
-import { savedServers } from "./settings.js";
-import { splitAddress } from "../invite.js";
+/** The open servers, in the order they were opened: connected, connecting or reconnecting. */
+export const openServers = writable<string[]>([]);
+
+/**
+ * The id of a server: the host lower-cased, an IPv6 literal in brackets, then
+ * the port. `Example.org` and `example.org` are one server, and `::1` must be
+ * bracketed or the port cannot be told from the address.
+ */
+export function serverId(host: string, port: number): string {
+  const h = host.trim().toLowerCase().replace(/^\[|\]$/g, "");
+  return h.includes(":") ? `[${h}]:${port}` : `${h}:${port}`;
+}
+
+/**
+ * The prefix everything *named* on a server is kept under — chat history,
+ * unread counts, channel passwords, the text channels a user walked out of —
+ * as `"host:port"`, brackets stripped. That was the shape of those keys before
+ * there was a server id, and keeping it keeps existing history addressable.
+ * `""` for no server.
+ */
+export function serverKey(server: string): string {
+  if (!server) return "";
+  const { host, port } = splitAddress(server);
+  return `${host}:${port}`;
+}
+
+/** What a server is called: its bookmark's name, or else its host. */
+export function serverName(id: string, saved: SavedServer[]): string {
+  const bookmark = saved.find((s) => serverId(s.host, s.port) === id);
+  return bookmark ? bookmark.name || bookmark.host : splitAddress(id).host;
+}
 
 export interface ServerEntry {
-  /** "host:port" today; a connection id the day there is more than one. */
   id: string;
   name: string;
   host: string;
   port: number;
+  /** "disconnected" for a bookmark nobody opened. */
   state: ConnectionState;
   unread: number;
+  /** Open right now, as opposed to only bookmarked. */
+  open: boolean;
   /** The one whose channels and members are on screen. */
   active: boolean;
+  /** The one carrying our voice. */
+  inVoice: boolean;
 }
 
 /**
- * Everything the rail draws: the live connection first, then the bookmarks that
- * are not it.
+ * Everything the rail draws: the open servers in the order they were opened,
+ * then every bookmark that is not open.
  *
- * Nothing downstream may assume this has one entry, or reach past the entry it
- * was handed — that assumption is the thing this exists to prevent.
+ * `unread` is the channel unread map, keyed `"host:port/name"`; a server's
+ * count is the sum of its own keys plus the unread of its conversation list.
  */
-export const serverEntries: Readable<ServerEntry[]> = derived(
-  [connectionState, serverAddress, savedServers, unreadPerChannel],
-  ([$state, $address, $saved, $unread]) => {
-    const entries: ServerEntry[] = [];
+export function buildEntries(
+  open: string[],
+  states: Map<string, ConnectionState>,
+  saved: SavedServer[],
+  unread: Map<string, number>,
+  viewed: string,
+  voice: string | null,
+  dms: Map<string, DmConversation[]> = new Map(),
+): ServerEntry[] {
+  const entries: ServerEntry[] = open.map((id) => {
+    const { host, port } = splitAddress(id);
+    const prefix = `${serverKey(id)}/`;
+    let count = 0;
+    for (const [key, n] of unread) if (key.startsWith(prefix)) count += n;
+    for (const convo of dms.get(id) ?? []) count += convo.unread;
+    return {
+      id,
+      name: serverName(id, saved),
+      host,
+      port,
+      state: states.get(id) ?? "disconnected",
+      unread: count,
+      open: true,
+      active: id === viewed,
+      inVoice: id === voice,
+    };
+  });
 
-    if ($address) {
-      const { host, port } = splitAddress($address);
-      // Unread is keyed per server now, but the map only ever holds the live
-      // connection's keys — it is cleared with the text channels on
-      // disconnect — so every count in it belongs to this entry.
-      let total = 0;
-      for (const n of $unread.values()) total += n;
-      entries.push({
-        id: `${host}:${port}`,
-        name: $saved.find((s) => s.host === host && s.port === port)?.name ?? host,
-        host,
-        port,
-        state: $state,
-        unread: total,
-        active: true,
-      });
-    }
+  for (const bookmark of saved) {
+    const id = serverId(bookmark.host, bookmark.port);
+    if (entries.some((e) => e.id === id)) continue;
+    entries.push({
+      id,
+      name: serverName(id, saved),
+      host: bookmark.host,
+      port: bookmark.port,
+      state: "disconnected",
+      unread: 0,
+      open: false,
+      active: false,
+      inVoice: false,
+    });
+  }
 
-    for (const saved of $saved) {
-      const id = `${saved.host}:${saved.port}`;
-      if (entries.some((e) => e.id === id)) continue;
-      entries.push({
-        id,
-        name: saved.name || saved.host,
-        host: saved.host,
-        port: saved.port,
-        state: "disconnected",
-        unread: 0,
-        active: false,
-      });
-    }
-
-    return entries;
-  },
-);
-
-export const activeServerId: Readable<string | null> = derived(
-  serverEntries,
-  ($entries) => $entries.find((e) => e.active)?.id ?? null,
-);
+  return entries;
+}

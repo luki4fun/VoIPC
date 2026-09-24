@@ -5,9 +5,9 @@
   let pressing = $state(false);
 
   // Through the shared actions rather than invoking directly, which is also
-  // what gives this button the lobby guard it never had: voice is off in
-  // channel 0, and holding this there used to start a capture task that had
-  // nowhere to send.
+  // what gives this button the guard it never had: outside a voice channel
+  // holding it used to start a capture task that had nowhere to send. The
+  // shells now mount it only in voice as well.
   function onTouchStart(e: TouchEvent) {
     e.preventDefault();
     if ($isMuted || $isDeafened) return;

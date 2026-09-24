@@ -2427,17 +2427,23 @@ async fn handle_request_keyframe(
     let Some(sharer_sid) = state.user_to_session.get(&sharer_user_id).map(|s| *s) else {
         return Ok(());
     };
+    relay_keyframe_request(state, sharer_sid).await;
+    Ok(())
+}
+
+/// Ask a sharer for a keyframe, within the per-share budget every viewer's
+/// request shares (a burst of joiners or of losses is one IDR a second).
+pub(crate) async fn relay_keyframe_request(state: &ServerState, sharer_sid: SessionId) {
     let sharer_tx = match state.sessions.get_mut(&sharer_sid) {
         Some(mut session) => {
             if !session.keyframe_relay_rate.try_consume() {
-                return Ok(());
+                return;
             }
             session.tcp_tx.clone()
         }
-        None => return Ok(()),
+        None => return,
     };
     let _ = send_msg(&sharer_tx, &ServerMessage::KeyframeRequested).await;
-    Ok(())
 }
 
 // ── E2E Encryption handler functions ──────────────────────────────────

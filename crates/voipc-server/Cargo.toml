@@ -31,11 +31,11 @@ sha2 = "0.10"
 
 # Web client: HTTP/2-only static page (no http1 feature, on purpose) and the
 # QUIC/WebTransport endpoint all clients use. wtransport stays on ring so the
-# musl build is static.
+# musl build is static; "quinn" exposes the QUIC transport settings.
 hyper = { version = "1", features = ["http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
-wtransport = "0.7"
+wtransport = { version = "0.7", features = ["quinn"] }
 rust-embed = { version = "8", features = ["debug-embed", "mime-guess"] }
 hex = "0.4"
 

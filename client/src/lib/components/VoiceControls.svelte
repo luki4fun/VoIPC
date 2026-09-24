@@ -13,11 +13,13 @@
     isTransmitting,
     transmitHeldByGame,
   } from "../stores/connection.js";
-  import { currentChannelId } from "../stores/channels.js";
+  import { viewingVoice, voice, voiceChannel } from "../stores/channels.js";
+  import { serverEntries } from "../connect.js";
   import { volume, inputGain, pttKey, noiseSuppression } from "../stores/settings.js";
   import { micLane } from "../stores/mixer.js";
   import {
     audioLevel,
+    leaveVoice,
     setVoiceMode,
     speakerMode,
     startTransmit,
@@ -35,8 +37,8 @@
   import { centreView, currentProximity } from "../stores/room.js";
   import Icon from "./Icons.svelte";
 
-  // Voice is disabled in the General lobby (channel 0)
-  let voiceDisabled = $derived($currentChannelId === 0);
+  // In no voice channel on any server there is nothing to talk into
+  let voiceDisabled = $derived($voice === null);
 
   async function handleGainChange(e: Event) {
     const gain = parseFloat((e.target as HTMLInputElement).value);
@@ -73,6 +75,13 @@
     }
   }
 
+  // Where the call is, for when the server on screen is another one: the
+  // sidebar then shows that server, and nothing else names the one this bar
+  // (and its Leave button) acts on.
+  const voiceWhere = $derived(
+    `#${$voiceChannel?.name ?? ""} · ${$serverEntries.find((e) => e.inVoice)?.name ?? ""}`,
+  );
+
   // Audio level meter — clamp to -60..0 range for display
   let levelPercent = $derived(Math.max(0, Math.min(100, (($audioLevel + 60) / 60) * 100)));
   let thresholdPercent = $derived(Math.max(0, Math.min(100, (($vadThreshold + 60) / 60) * 100)));
@@ -80,8 +89,11 @@
 
 <div class="voice-controls">
   {#if voiceDisabled}
-    <span class="voice-disabled">Voice disabled in lobby — join a channel to talk</span>
+    <span class="voice-disabled">Not in a voice channel</span>
   {:else}
+    {#if !$viewingVoice}
+      <span class="voice-where" title="In voice on another server">{voiceWhere}</span>
+    {/if}
     <select class="mode-select" value={$voiceMode} onchange={handleModeChange}>
       <option value="ptt">PTT</option>
       <option value="vad">Voice</option>
@@ -190,6 +202,11 @@
       >
         <Icon name="music-note" size={18} />
       </button>
+
+      <!-- Out of the voice channel, still on the server: stores/voice.ts -->
+      <button class="icon-btn leave-voice-btn" onclick={leaveVoice} title="Leave voice">
+        <Icon name="disconnect" size={18} />
+      </button>
     </div>
   {/if}
 
@@ -241,6 +258,19 @@
     font-size: 12px;
     color: var(--text-secondary);
     font-style: italic;
+  }
+
+  .voice-where {
+    max-width: 180px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--success);
+    font-size: 12px;
+  }
+
+  .leave-voice-btn:hover {
+    color: var(--danger);
   }
 
   .mode-select {

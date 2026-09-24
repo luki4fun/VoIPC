@@ -8,7 +8,6 @@
   import ScreenShareSourcePicker from "./lib/components/ScreenShareSourcePicker.svelte";
   import SettingsPanel from "./lib/components/SettingsPanel.svelte";
   import Toast from "./lib/components/Toast.svelte";
-  import ReconnectOverlay from "./lib/components/ReconnectOverlay.svelte";
   import InvitePopup from "./lib/components/InvitePopup.svelte";
   import PokePopup from "./lib/components/PokePopup.svelte";
   import VoiceKeys from "./lib/components/VoiceKeys.svelte";
@@ -22,20 +21,25 @@
   import {
     connectionState,
     serverAddress,
-    username,
     userId,
     latency,
-    acceptSelfSigned,
     isMuted,
     isDeafened,
     isTransmitting,
     transmitHeldByGame,
     isAdmin,
     pendingInvite,
-    channelPassword,
     rememberChannelPassword,
   } from "./lib/stores/connection.js";
-  import { channels, currentChannelId, previewChannelId, previewUsers } from "./lib/stores/channels.js";
+  import {
+    channels,
+    currentChannelId,
+    previewChannelId,
+    previewUsers,
+    voice,
+    voiceChannel,
+    voiceServer,
+  } from "./lib/stores/channels.js";
   import { users, speakingUsers } from "./lib/stores/users.js";
   import { addNotification, removeNotification } from "./lib/stores/notifications.js";
   import { pendingInvites } from "./lib/stores/invites.js";
@@ -47,8 +51,7 @@
     startExpirySweep,
     activeDmUserId,
     activeTextChannelId,
-    clearDmState,
-    clearTextChannels,
+    dmConversations,
     incrementChannelUnread,
     clearChannelUnread,
     chatKey,
@@ -62,7 +65,18 @@
   import AudioSetup from "./lib/components/AudioSetup.svelte";
   import type { ChannelInfo, ChatMessage, UserInfo } from "./lib/types.js";
   import { parseInviteFragment } from "./lib/invite.js";
-  import { connectTo } from "./lib/connect.js";
+  import {
+    channelListArrived,
+    disconnectServer,
+    fromServer,
+    listenServer,
+    reconnectAll,
+    serverId,
+    resetServer,
+    showConnectDialog,
+    startReconnect,
+  } from "./lib/connect.js";
+  import { openServers } from "./lib/stores/servers.js";
   import {
     inputDevice,
     outputDevice,
@@ -92,27 +106,23 @@
     audioSetupRequested,
     defaultServer,
   } from "./lib/stores/settings.js";
-  import type { AppConfig } from "./lib/stores/settings.js";
+  import type { AppConfig, SavedServer } from "./lib/stores/settings.js";
   import { hydrateUiPrefs, layoutAskedVersion, uiLayout, uiPrefsReady } from "./lib/stores/ui-prefs.js";
   import {
     channelRosters,
-    clearRosters,
     currentRosterOf,
     patchRosters,
     requestAllRosters,
     requestRoster,
     setRoster,
   } from "./lib/stores/rosters.js";
-  import { clearRecentSpeakers } from "./lib/stores/roster.js";
   import {
     autoJoinTextChannels,
     channelMessageTtl,
-    clearAutoJoined,
     dmMessageTtl,
     isTextChannel,
   } from "./lib/stores/channel-ui.js";
   import { expiryFor, HISTORY_MAX_MESSAGES, MAX_CONVERSATIONS } from "./lib/chat-rules.js";
-  import { resolveRejoin } from "./lib/rejoin-rules.js";
   import { LAYOUT_PICKER_VERSION } from "./lib/ui-prefs.js";
   import { voiceMode, vadThreshold } from "./lib/stores/voice.js";
   import {
@@ -132,12 +142,11 @@
     currentProximity,
     drivenBy,
     positions,
-    resetRoom,
     selectedUserId,
     syncing,
   } from "./lib/stores/room.js";
   import { upsertById } from "./lib/stores/upsert.js";
-  import { clearMixer, cleanLane, micLane } from "./lib/stores/mixer.js";
+  import { cleanLane, micLane } from "./lib/stores/mixer.js";
   import {
     addScreenShare,
     removeScreenShare,
@@ -162,9 +171,10 @@
     receiverFramesDropped,
   } from "./lib/stores/screenshare.js";
 
-  // Look up channel name by numeric ID (stable key for chat history)
-  function channelNameById(channelId: number): string {
-    return $channels.find((c) => c.channel_id === channelId)?.name ?? "";
+  // Look up channel name by numeric ID (stable key for chat history). Per
+  // server: an id is a slot in one server's list and means nothing on another.
+  function channelNameById(server: string, channelId: number): string {
+    return get(channels.of(server)).find((c) => c.channel_id === channelId)?.name ?? "";
   }
 
   /**
@@ -178,27 +188,44 @@
    * in — but reading the name off the roster the message belongs to is what
    * keeps it true if that ever changes.
    */
-  function ownDisplayName(fallback: string, channelId?: number): string {
+  function ownDisplayName(server: string, fallback: string, channelId?: number): string {
+    const own = get(users.of(server));
     const roster =
-      channelId === undefined || channelId === $currentChannelId
-        ? $users
-        : ($channelRosters.get(channelId) ?? $users);
-    return roster.find((u) => u.user_id === $userId)?.username ?? fallback;
+      channelId === undefined || channelId === get(currentChannelId.of(server))
+        ? own
+        : (get(channelRosters.of(server)).get(channelId) ?? own);
+    const me = get(userId.of(server));
+    return roster.find((u) => u.user_id === me)?.username ?? fallback;
   }
 
   let showSettings = $state(false);
-  let reconnectAttempt = $state(0);
-  let reconnectCancelled = $state(false);
-  let reconnectError = $state("");
 
   // Deferred auto-connect: waits for chat history to be unlocked first
-  let pendingAutoConnect = $state<AppConfig | null>(null);
-  let mediaKeyToastId: number | null = null;
+  let pendingAutoConnect = $state<SavedServer[] | null>(null);
+  /** The "waiting for the channel's key" warning, and the server it is about. */
+  let mediaKeyToast: { server: string; id: number } | null = null;
+  // The warning is about the call, and the call can move without either event
+  // above ever arriving: to another server, or out of voice. Wherever it went,
+  // the old server's missing key is not what the user is waiting on any more.
+  $effect(() => {
+    const at = $voiceServer;
+    if (mediaKeyToast && mediaKeyToast.server !== at) {
+      removeNotification(mediaKeyToast.id);
+      mediaKeyToast = null;
+    }
+  });
   /** game/resource/channel of the last "a game is placing people" toast, so a
    *  bridge that reconnects every two seconds cannot paper the screen. */
   let lastSdkToast: string | null = null;
-  /** Channels we have already explained the `routed` flag for this session. */
-  const routedNoticeShown = new Set<number>();
+  /** Channels we have already explained the `routed` flag for this session,
+   *  as `server/channel id`. */
+  const routedNoticeShown = new Set<string>();
+
+  // Every server's state and list at once, for what runs per server
+  const connectionStates = connectionState.all();
+  const channelLists = channels.all();
+  // The call's, for what follows voice rather than the view
+  const voiceState = connectionState.at(voiceServer);
 
   // ── First-run audio setup ──────────────────────────────────────────────
   //
@@ -223,8 +250,7 @@
   // ── First-run layout choice ────────────────────────────────────────────
   //
   // After the audio setup, and for the same reason it is where it is: they are
-  // connected, sitting in the lobby where voice is off, and expecting to be
-  // asked things. Audio first, because a microphone nobody can hear is what
+  // connected, in no voice channel yet, and expecting to be asked things. Audio first, because a microphone nobody can hear is what
   // ruins a call and a layout is not.
   let layoutPickerDone = $state(false);
   const showLayoutSetup = $derived(
@@ -253,7 +279,7 @@
   }
 
   // A server can ask every client into a text channel; the ones this user
-  // walked out of are skipped.
+  // walked out of are skipped. Every open server, not just the one on screen.
   //
   // Driven from both the list and the connection rather than from the
   // `channel-list` event, because the event arrives first: the server sends the
@@ -261,8 +287,9 @@
   // refused with "Not connected" until `connect` has finished storing the
   // session. Joining is idempotent, so running this again costs nothing.
   $effect(() => {
-    if ($connectionState !== "connected") return;
-    autoJoinTextChannels($channels);
+    for (const [server, state] of $connectionStates) {
+      if (state === "connected") autoJoinTextChannels(server, $channelLists.get(server) ?? []);
+    }
   });
 
   // A saved device that is no longer plugged in: the name is all we store
@@ -286,47 +313,36 @@
       }
     })();
   });
-  // Invite link: join the named channel once connected and the channel list
-  // is known (set from the URL fragment in onMount or by the connect dialog)
+  // Invite link: join the named channel once its server is connected and its
+  // channel list is known (set from the URL fragment in onMount or by the
+  // connect dialog). An invite that does not name its server yet — the URL's
+  // — is for the first server on screen, the one the page came from.
   $effect(() => {
     const inv = $pendingInvite;
-    if (!inv || $connectionState !== "connected" || $channels.length === 0) return;
-    const ch = $channels.find((c) => c.name === inv.channel);
+    const server = inv?.server ?? $serverAddress;
+    if (!inv || !server) return;
+    const list = $channelLists.get(server) ?? [];
+    if ($connectionStates.get(server) !== "connected" || list.length === 0) return;
+    const ch = list.find((c) => c.name === inv.channel);
     pendingInvite.set(null);
     if (!ch) {
       addNotification(`The invite's channel "${inv.channel}" does not exist on this server`, "warning");
       return;
     }
     if (inv.password) {
-      rememberChannelPassword(ch.name, inv.password);
+      rememberChannelPassword(server, ch.name, inv.password);
     }
-    invoke("join_channel", { channelId: ch.channel_id, password: inv.password }).catch((e: unknown) => {
-      addNotification(`Could not join #${ch.name}: ${e}`, "error");
-    });
+    invoke("join_channel", { server, channelId: ch.channel_id, password: inv.password }).catch(
+      (e: unknown) => {
+        addNotification(`Could not join #${ch.name}: ${e}`, "error");
+      },
+    );
   });
 
-  // Admin status and the room live and die with the connection
-  $effect(() => {
-    if ($connectionState !== "connected") {
-      isAdmin.set(false);
-      resetRoom();
-      clearMixer();
-      clearRosters();
-      clearTextChannels();
-      // The conversation list is this connection's user ids; the messages
-      // behind it are filed by server and name and stay.
-      clearDmState();
-      clearRecentSpeakers();
-      clearAutoJoined();
-      // The channel list too. A channel id is a slot in one server's run — the
-      // reconnect may land on a restarted server where the numbers have been
-      // handed out again — so keeping the old list around is keeping a map of
-      // somewhere that no longer exists. Anything that needs a name from it
-      // takes one before the connection goes; see the `connection-lost`
-      // handler, which runs first and captures the channels to come back to.
-      channels.set([]);
-    }
-  });
+  // What a connection held — admin, the channel list, rosters, the chat's
+  // subscriptions and conversations — is forgotten with it, per server, by
+  // `resetServer` in connect.ts: on a Disconnect, and when the connection is
+  // lost. The call's state goes when voice leaves a server (voice.ts).
 
   // OS notification when the window is not focused (DMs and pokes)
   async function notifyUnfocused(title: string, body: string) {
@@ -347,26 +363,13 @@
     }
   }
 
-  async function performAutoConnect(config: AppConfig) {
-    const result = await connectTo({
-      host: config.last_host!,
-      port: config.last_port ?? 9987,
-      username: config.last_username!,
-      acceptSelfSigned: config.last_accept_self_signed ?? false,
-    });
-    if (!result.ok) {
-      console.error("Auto-connect failed:", result.error);
-      addNotification("Auto-connect failed: " + result.error, "warning");
-    }
-  }
-
   // Trigger auto-connect only after chat history password has been entered
   // (or the vault was skipped — then there is nothing to unlock)
   $effect(() => {
     if (pendingAutoConnect && ($chatUnlocked || $chatHistoryDisabled)) {
-      const config = pendingAutoConnect;
+      const list = pendingAutoConnect;
       pendingAutoConnect = null;
-      performAutoConnect(config);
+      reconnectAll(list);
     }
   });
 
@@ -398,12 +401,24 @@
   // is the voice room next door, whose badge is the user's to keep.
   $effect(() => {
     if ($activeDmUserId === null) {
-      const name = channelNameById($activeTextChannelId ?? $currentChannelId);
-      if (name) clearChannelUnread(name);
+      const channel = $channels.find(
+        (c) => c.channel_id === ($activeTextChannelId ?? $currentChannelId),
+      );
+      if (channel) clearChannelUnread($serverAddress, channel.name);
+    } else if ($serverAddress) {
+      // Back on a server whose DM was left open: what arrived there meanwhile
+      // counted as unread (chat.ts addDmMessage), and it is on screen now.
+      const peer = $activeDmUserId;
+      dmConversations.of($serverAddress).update((cs) =>
+        cs.some((c) => c.user_id === peer && c.unread > 0)
+          ? cs.map((c) => (c.user_id === peer ? { ...c, unread: 0 } : c))
+          : cs,
+      );
     }
   });
 
-  // Android: start/stop foreground voice service when joining/leaving channels
+  // Android: start/stop foreground voice service when joining/leaving voice,
+  // on whichever server — the service is the call's
   $effect(() => {
     if (!$isMobile) return;
     const bridge = (window as any).__VoIPC;
@@ -411,8 +426,8 @@
 
     let timer: ReturnType<typeof setTimeout> | null = null;
 
-    if ($connectionState === 'connected' && $currentChannelId !== 0) {
-      const name = channelNameById($currentChannelId);
+    if ($voiceState === 'connected' && $voice !== null) {
+      const name = $voiceChannel?.name ?? "";
       timer = setTimeout(() => {
         bridge.startVoiceService(name || 'voice channel');
       }, 300);
@@ -423,162 +438,6 @@
     return () => { if (timer) clearTimeout(timer); };
   });
 
-  /**
-   * Whoever is waiting for the channel list a fresh connection pushes.
-   *
-   * The list arrives as part of logging in, so it can land either side of
-   * `invoke("connect")` resolving — which is why a caller registers the wait
-   * *before* connecting rather than after.
-   */
-  let channelListWaiters: Array<(list: ChannelInfo[]) => void> = [];
-
-  function nextChannelList(timeoutMs = 5000): Promise<ChannelInfo[]> {
-    return new Promise((resolve) => {
-      const waiter = (list: ChannelInfo[]) => {
-        clearTimeout(timer);
-        resolve(list);
-      };
-      // No list, no rejoin: with nothing to resolve names against, the honest
-      // answer is to leave the user where the server put them and let them
-      // click. Guessing from a list we held before the drop is the bug.
-      const timer = setTimeout(() => {
-        channelListWaiters = channelListWaiters.filter((w) => w !== waiter);
-        resolve([]);
-      }, timeoutMs);
-      channelListWaiters.push(waiter);
-    });
-  }
-
-  async function startReconnect(
-    address: string,
-    name: string,
-    previousVoiceChannel: string,
-    previousTextChannels: string[],
-    initialError = "",
-  ) {
-    reconnectAttempt = 0;
-    reconnectCancelled = false;
-    reconnectError = initialError;
-    connectionState.set("reconnecting");
-
-    const startTime = Date.now();
-    // Generous budget: a Wi-Fi roam, VPN flap, or laptop lid-close should
-    // not end the session. The overlay has a Cancel button for giving up.
-    const RECONNECT_TIMEOUT_MS = 300_000;
-
-    while (!reconnectCancelled) {
-      reconnectAttempt++;
-      const delay = Math.min(1000 * Math.pow(2, reconnectAttempt - 1), 10000);
-
-      // Wait before retrying
-      await new Promise((resolve) => setTimeout(resolve, delay));
-      if (reconnectCancelled) break;
-
-      // Give up after the reconnect budget
-      if (Date.now() - startTime > RECONNECT_TIMEOUT_MS) {
-        addNotification("Reconnection timed out. Please reconnect manually.", "error");
-        reconnectError = "";
-        connectionState.set("disconnected");
-        return;
-      }
-
-      // Clean up stale connection state
-      try {
-        await invoke("disconnect");
-      } catch {
-        // Ignore — may already be cleaned up
-      }
-
-      try {
-        // Registered before connecting: the server sends the channel list while
-        // logging us in, so it can be here before `connect` has resolved.
-        const listArrived = nextChannelList();
-        const id = await invoke<number>("connect", {
-          address,
-          username: name,
-          acceptInvalidCerts: $acceptSelfSigned,
-        });
-        if (reconnectCancelled) {
-          // Cancelled while this attempt was in flight (possibly after a
-          // manual connect elsewhere) — don't adopt its result
-          invoke("disconnect").catch(() => {});
-          return;
-        }
-        // Success!
-        userId.set(id);
-        connectionState.set("connected");
-        reconnectError = "";
-        addNotification("Reconnected to server", "info");
-
-        // Where to go back to is decided against the list *this* connection
-        // pushed, by name and by kind — see rejoin-rules.ts. Resolving a
-        // remembered name against the ids we held before the drop is how a
-        // reconnect ends up walking somebody into a voice channel.
-        const list = await listArrived;
-
-        // The room they were standing in
-        const [voice] = resolveRejoin(
-          previousVoiceChannel ? [previousVoiceChannel] : [],
-          list,
-          "voice",
-        );
-        if (voice) {
-          try {
-            // With the password, where this session knows one: a password room
-            // is exactly the room a reconnect must not silently drop you out
-            // of, and the text rejoin below has always carried it.
-            await invoke("join_channel", {
-              channelId: voice.channel_id,
-              password: voice.has_password ? channelPassword(voice.name) : null,
-            });
-          } catch {
-            // Password changed, full, gone — stay in the lobby
-          }
-        }
-        // ...and the text channels that were open. An auto-join one comes back
-        // on its own with the channel list; this is for the ones joined by
-        // hand, which nothing else would bring back.
-        for (const ch of resolveRejoin(previousTextChannels, list, "text")) {
-          // An `auto_join` one without a password is the effect's to re-join
-          // (channel-ui.ts autoJoinTextChannels), which fires on the channel
-          // list this connection just pushed. Asking for it here as well spends
-          // two of the server's join tokens on one channel, and a connect that
-          // runs out of them is a text channel that silently never opens. A
-          // password one the effect skips, so it stays ours.
-          if (ch.auto_join && !ch.has_password) continue;
-          // A password one comes back too, when this session knows the password
-          const password = ch.has_password ? channelPassword(ch.name) : null;
-          if (ch.has_password && password === null) continue;
-          invoke("join_channel", { channelId: ch.channel_id, password }).catch(() => {
-            // Gone with the server restart — the user can join it again
-          });
-        }
-        return;
-      } catch (e: any) {
-        const errMsg = typeof e === "string" ? e : e?.message ?? "Unknown error";
-        if (errMsg.includes("username already taken")) {
-          reconnectError = "Username still held by server, waiting...";
-        } else if (errMsg.includes("version mismatch")) {
-          addNotification(errMsg, "error");
-          reconnectError = "";
-          connectionState.set("disconnected");
-          return;
-        } else {
-          reconnectError = errMsg;
-        }
-      }
-    }
-
-    // User cancelled
-    reconnectError = "";
-    connectionState.set("disconnected");
-  }
-
-  function cancelReconnect() {
-    reconnectCancelled = true;
-    connectionState.set("disconnected");
-  }
-
   onMount(async () => {
     // Messages with a destruction timer go when their moment comes, whether or
     // not anybody is looking at them. One sweep for the whole app.
@@ -587,10 +446,22 @@
     // Invite link in the URL fragment (web client): keep it, then drop it from
     // the address bar so it is neither kept in history nor re-applied on reload
     if (window.location.hash.length > 1) {
+      // For the server that served this page, which is the one the link names:
+      // with several open, "whichever is on screen" could be another one.
       const inv = parseInviteFragment(window.location.hash);
-      if (inv) pendingInvite.set(inv);
+      if (inv) {
+        pendingInvite.set({
+          ...inv,
+          server: serverId(window.location.hostname, Number(window.location.port) || 443),
+        });
+      }
       history.replaceState(null, "", window.location.pathname + window.location.search);
     }
+
+    // Connections the backend still holds belong to a page that is gone — a
+    // reload, or Android recreating the activity — and this one cannot see
+    // them, let alone close them. It starts from none.
+    await invoke("disconnect_all").catch(() => {});
 
     // Load persisted config and hydrate all stores
     try {
@@ -640,9 +511,26 @@
         lastAcceptSelfSigned.set(config.last_accept_self_signed ?? false);
       }
 
-      // Schedule auto-connect — will trigger after chat history is unlocked
-      if (config.auto_connect && config.remember_connection && config.last_host && config.last_username) {
-        pendingAutoConnect = config;
+      // Schedule auto-connect — will trigger after chat history is unlocked.
+      // Every server that was open, or, in a config written before there was
+      // a list, the one server it remembered.
+      if (config.auto_connect && config.remember_connection) {
+        const open = config.open_servers ?? [];
+        const list: SavedServer[] =
+          open.length > 0
+            ? open
+            : config.last_host && config.last_username
+              ? [
+                  {
+                    name: config.last_host,
+                    host: config.last_host,
+                    port: config.last_port ?? 9987,
+                    username: config.last_username,
+                    accept_self_signed: config.last_accept_self_signed ?? false,
+                  },
+                ]
+              : [];
+        if (list.length > 0) pendingAutoConnect = list;
       }
     } catch (e) {
       console.error("Failed to load config:", e);
@@ -652,34 +540,40 @@
       uiPrefsReady.set(true);
     }
 
-    // Listen for events from the Rust backend
+    // Listen for events from the backend. Everything one connection says
+    // arrives through `listenServer` with the server it came from, and is
+    // written to that server's stores — never to "whichever server is on
+    // screen", which is another server as often as not. What only makes sense
+    // for the call (sounds, the room, shares) is judged against the server
+    // carrying voice. The rest — the game SDK, audio devices, the keys — is
+    // the app's, and arrives bare.
+    const inVoice = (server: string) => get(voice)?.server === server;
+
     const unlisteners = [
-      listen<ChannelInfo[]>("channel-list", (event) => {
-        channels.set(event.payload);
+      listenServer<ChannelInfo[]>("channel-list", (server, list) => {
+        channels.of(server).set(list);
         // A reconnect waits for this before deciding where to put the user back
-        const waiting = channelListWaiters;
-        channelListWaiters = [];
-        for (const waiter of waiting) waiter(event.payload);
+        channelListArrived(server, list);
         // The sidebar draws the people under every channel, and the names for
         // any channel but our own have to be asked for — a UserJoined broadcast
         // deliberately carries no username to outsiders.
-        requestAllRosters();
+        requestAllRosters(server);
       }),
 
-      listen<{ channel_id: number; users: UserInfo[] }>("user-list", (event) => {
-        const oldChannelId = $currentChannelId;
-        const newChannelId = event.payload.channel_id;
+      listenServer<{ channel_id: number; users: UserInfo[] }>("user-list", (server, data) => {
+        const oldChannelId = get(currentChannelId.of(server));
+        const newChannelId = data.channel_id;
 
         // A text channel is a subscription: we did not move, so none of the
         // channel-switch work below applies, and the chat pane stays where the
         // user put it.
-        if (isTextChannel(newChannelId)) {
-          joinedTextChannelIds.update((s) => new Set(s).add(newChannelId));
+        if (isTextChannel(server, newChannelId)) {
+          joinedTextChannelIds.of(server).update((s) => new Set(s).add(newChannelId));
           // setRoster settles the row's member count from this same list
-          setRoster(newChannelId, event.payload.users);
-          if ($activeTextChannelId === newChannelId) {
-            const name = channelNameById(newChannelId);
-            if (name) clearChannelUnread(name);
+          setRoster(server, newChannelId, data.users);
+          if (get(activeTextChannelId.of(server)) === newChannelId) {
+            const name = channelNameById(server, newChannelId);
+            if (name) clearChannelUnread(server, name);
           }
           return;
         }
@@ -688,29 +582,46 @@
         // movement, so the channel we left loses us here. The one we joined is
         // counted from the list below, by setRoster.
         if (oldChannelId !== newChannelId) {
-          channels.update((chs) =>
+          channels.of(server).update((chs) =>
             chs.map((ch) =>
               ch.channel_id === oldChannelId
                 ? { ...ch, user_count: Math.max(0, ch.user_count - 1) }
                 : ch,
-            )
+            ),
           );
         }
 
-        currentChannelId.set(newChannelId);
-        users.set(event.payload.users);
-        setRoster(newChannelId, event.payload.users);
+        currentChannelId.of(server).set(newChannelId);
+        users.of(server).set(data.users);
+        setRoster(server, newChannelId, data.users);
         // We just left one, and the channel we joined may have been listed with
         // a roster we fetched before joining.
         if (oldChannelId !== newChannelId) {
-          requestRoster(oldChannelId);
-          requestAllRosters();
+          requestRoster(server, oldChannelId);
+          requestAllRosters(server);
         }
-        const joinedName = channelNameById(newChannelId);
-        if (joinedName) clearChannelUnread(joinedName);
+        const joinedName = channelNameById(server, newChannelId);
+        if (joinedName) clearChannelUnread(server, joinedName);
+
+        // Where voice is, mirrored from the backend: a voice channel confirmed
+        // here makes this the voice server, whatever held it before — the
+        // backend has already taken voice off that one and asked it to leave —
+        // and the lobby confirmed here ends voice if it was here. The lobby
+        // confirmed by a server that no longer holds voice is that leave
+        // arriving, and is not the call's business.
+        const heldVoice = inVoice(server);
+        if (newChannelId !== 0) {
+          // A repeat of the same seat is not a move: every change of this
+          // store reads as one (recent speakers, for a start)
+          if (!heldVoice || get(voice)?.channelId !== newChannelId) {
+            voice.set({ server, channelId: newChannelId });
+          }
+        } else if (heldVoice) {
+          voice.set(null);
+        }
 
         // Clear screenshare state and play channel switch sound
-        if (oldChannelId !== newChannelId) {
+        if (oldChannelId !== newChannelId && (heldVoice || newChannelId !== 0)) {
           // A room layout belongs to the channel it was made in
           clearRoom();
           // The backend disarms the game SDK per channel: its player ids mean
@@ -724,9 +635,10 @@
           // A routed channel is the one place the server is told anything
           // about who hears whom. Say so on the way in, once per channel per
           // session, in the words the README uses.
-          const joined = $channels.find((c) => c.channel_id === newChannelId);
-          if (joined?.routed && !routedNoticeShown.has(newChannelId)) {
-            routedNoticeShown.add(newChannelId);
+          const joined = get(channels.of(server)).find((c) => c.channel_id === newChannelId);
+          const noticeKey = `${server}/${newChannelId}`;
+          if (joined?.routed && !routedNoticeShown.has(noticeKey)) {
+            routedNoticeShown.add(noticeKey);
             addNotification(
               `#${joined.name} is a routed channel: the server is told which members you want ` +
                 `to hear, so it forwards only their voice, and a game server connected to it ` +
@@ -738,127 +650,127 @@
         }
 
         // Clear preview when we actually join a channel
-        previewChannelId.set(null);
-        previewUsers.set([]);
+        previewChannelId.of(server).set(null);
+        previewUsers.of(server).set([]);
       }),
 
-      listen<UserInfo>("user-joined", (event) => {
+      listenServer<UserInfo>("user-joined", (server, joiner) => {
         // The user list snapshot and this broadcast are built separately on
         // the server, so a user we already have can arrive again (two joins
         // at once). Replacing is idempotent; appending twice would throw
         // each_key_duplicate and wedge the UI.
         let isNew = true;
-        if (event.payload.channel_id === $currentChannelId) {
-          users.update((u) => {
-            const next = upsertById(u, event.payload, (x) => x.user_id);
+        const current = get(currentChannelId.of(server));
+        if (joiner.channel_id === current) {
+          users.of(server).update((u) => {
+            const next = upsertById(u, joiner, (x) => x.user_id);
             isNew = next.added;
             return next.list;
           });
-          // Play join sound (not for lobby, not for ourselves)
-          if (isNew && $currentChannelId !== 0 && event.payload.user_id !== $userId) {
+          // Play join sound: only in the call — not the lobby, not a server
+          // we are only reading — and not for ourselves
+          if (
+            isNew &&
+            current !== 0 &&
+            inVoice(server) &&
+            joiner.user_id !== get(userId.of(server))
+          ) {
             playUserJoinedSound();
           }
         }
         // Always update channel user count (broadcast to all)
         if (isNew) {
-          channels.update((chs) =>
+          channels.of(server).update((chs) =>
             chs.map((ch) =>
-              ch.channel_id === event.payload.channel_id
-                ? { ...ch, user_count: ch.user_count + 1 }
-                : ch
-            )
+              ch.channel_id === joiner.channel_id ? { ...ch, user_count: ch.user_count + 1 } : ch,
+            ),
           );
         }
         // The broadcast told us somebody joined but not who, if it is not our
         // channel. Coalesced, so a filling channel is one question, not ten.
-        requestRoster(event.payload.channel_id);
+        requestRoster(server, joiner.channel_id);
       }),
 
-      listen<{ user_id: number; channel_id: number }>("user-left", (event) => {
+      listenServer<{ user_id: number; channel_id: number }>("user-left", (server, data) => {
+        const self = get(userId.of(server));
         // Our own departure from a text channel is how we learn a leave (or a
         // kick from one) went through.
-        if (
-          event.payload.user_id === $userId &&
-          isTextChannel(event.payload.channel_id)
-        ) {
-          joinedTextChannelIds.update((s) => {
+        if (data.user_id === self && isTextChannel(server, data.channel_id)) {
+          joinedTextChannelIds.of(server).update((s) => {
             const next = new Set(s);
-            next.delete(event.payload.channel_id);
+            next.delete(data.channel_id);
             return next;
           });
-          if ($activeTextChannelId === event.payload.channel_id) openTextChannel(null);
+          if (get(activeTextChannelId.of(server)) === data.channel_id) openTextChannel(server, null);
         }
 
         // Only remove from local user list if they left our channel
-        if (event.payload.channel_id === $currentChannelId) {
-          // Play leave sound before removing (not for lobby, not for ourselves)
-          if ($currentChannelId !== 0 && event.payload.user_id !== $userId) {
+        const current = get(currentChannelId.of(server));
+        if (data.channel_id === current) {
+          const inCall = current !== 0 && inVoice(server);
+          // Play leave sound before removing (only in the call, not for ourselves)
+          if (inCall && data.user_id !== self) {
             playUserLeftSound();
           }
-          users.update((u) =>
-            u.filter((user) => user.user_id !== event.payload.user_id)
-          );
-          // Forget where they stood: the id belongs to the next joiner
-          positions.update((m) => {
-            if (!m.has(event.payload.user_id)) return m;
-            const next = new Map(m);
-            next.delete(event.payload.user_id);
-            return next;
-          });
-          // A selection pointing at nobody would move a ghost on the next click
-          selectedUserId.update((id) => (id === event.payload.user_id ? null : id));
+          users.of(server).update((u) => u.filter((user) => user.user_id !== data.user_id));
+          if (inCall) {
+            // Forget where they stood: the id belongs to the next joiner
+            positions.update((m) => {
+              if (!m.has(data.user_id)) return m;
+              const next = new Map(m);
+              next.delete(data.user_id);
+              return next;
+            });
+            // A selection pointing at nobody would move a ghost on the next click
+            selectedUserId.update((id) => (id === data.user_id ? null : id));
+          }
         }
         // Always update channel count
-        channels.update((chs) =>
+        channels.of(server).update((chs) =>
           chs.map((ch) =>
-            ch.channel_id === event.payload.channel_id
+            ch.channel_id === data.channel_id
               ? { ...ch, user_count: Math.max(0, ch.user_count - 1) }
-              : ch
-          )
+              : ch,
+          ),
         );
-        requestRoster(event.payload.channel_id);
+        requestRoster(server, data.channel_id);
       }),
 
-      listen<{ user_id: number; muted: boolean }>("user-muted", (event) => {
-        users.update((u) =>
+      listenServer<{ user_id: number; muted: boolean }>("user-muted", (server, data) => {
+        users.of(server).update((u) =>
           u.map((user) =>
-            user.user_id === event.payload.user_id
-              ? { ...user, is_muted: event.payload.muted }
-              : user
-          )
+            user.user_id === data.user_id ? { ...user, is_muted: data.muted } : user,
+          ),
         );
-        patchRosters(event.payload.user_id, { is_muted: event.payload.muted });
+        patchRosters(server, data.user_id, { is_muted: data.muted });
       }),
 
-      listen<{ user_id: number; enabled: boolean }>("user-history-sharing", (event) => {
-        users.update((u) =>
+      listenServer<{ user_id: number; enabled: boolean }>("user-history-sharing", (server, data) => {
+        users.of(server).update((u) =>
           u.map((user) =>
-            user.user_id === event.payload.user_id
-              ? { ...user, shares_history: event.payload.enabled }
-              : user
-          )
+            user.user_id === data.user_id ? { ...user, shares_history: data.enabled } : user,
+          ),
         );
-        patchRosters(event.payload.user_id, { shares_history: event.payload.enabled });
+        patchRosters(server, data.user_id, { shares_history: data.enabled });
       }),
 
-      listen<{ user_id: number; deafened: boolean }>("user-deafened", (event) => {
-        users.update((u) =>
+      listenServer<{ user_id: number; deafened: boolean }>("user-deafened", (server, data) => {
+        users.of(server).update((u) =>
           u.map((user) =>
-            user.user_id === event.payload.user_id
-              ? { ...user, is_deafened: event.payload.deafened }
-              : user
-          )
+            user.user_id === data.user_id ? { ...user, is_deafened: data.deafened } : user,
+          ),
         );
-        patchRosters(event.payload.user_id, { is_deafened: event.payload.deafened });
+        patchRosters(server, data.user_id, { is_deafened: data.deafened });
       }),
 
       // A member of a proximity channel shared where they stand
-      listen<{ user_id: number; x: number; y: number; z: number }>(
+      listenServer<{ user_id: number; x: number; y: number; z: number }>(
         "user-position",
-        (event) => {
-          const { user_id, x, y, z } = event.payload;
+        (server, data) => {
+          if (!inVoice(server)) return;
+          const { user_id, x, y, z } = data;
           positions.update((m) => new Map(m).set(user_id, { x, y, z }));
-        }
+        },
       ),
 
       // A game took over the positions (or gave them back): the room shows
@@ -916,63 +828,58 @@
         audibleIds.set(event.payload.ids ? new Set(event.payload.ids) : null);
       }),
 
-      listen<{ user_id: number; speaking: boolean }>(
-        "user-speaking",
-        (event) => {
-          speakingUsers.update((set) => {
-            const next = new Set(set);
-            if (event.payload.speaking) {
-              next.add(event.payload.user_id);
-            } else {
-              next.delete(event.payload.user_id);
-            }
-            return next;
-          });
-        }
-      ),
-
-      listen<{ ms: number }>("latency-update", (event) => {
-        latency.set(event.payload.ms);
+      listenServer<{ user_id: number; speaking: boolean }>("user-speaking", (server, data) => {
+        // Only the voice connection plays audio; anything else is a straggler
+        // from the one voice just left, and its ids are another server's.
+        if (!inVoice(server)) return;
+        speakingUsers.update((set) => {
+          const next = new Set(set);
+          if (data.speaking) {
+            next.add(data.user_id);
+          } else {
+            next.delete(data.user_id);
+          }
+          return next;
+        });
       }),
 
-      listen<{ reason: string }>("connection-lost", (event) => {
-        const reason = event.payload.reason;
-        console.error("Connection lost:", reason);
-        addNotification(`Connection lost: ${reason}`, "error");
+      listenServer<{ ms: number }>("latency-update", (server, data) => {
+        latency.of(server).set(data.ms);
+      }),
 
-        // Clear screenshare state
-        resetScreenShareState();
+      listenServer<{ reason: string }>("connection-lost", (server, data) => {
+        const reason = data.reason;
+        console.error(`Connection to ${server} lost:`, reason);
+        addNotification(`${fromServer(server)}Connection lost: ${reason}`, "error");
 
         // Session-scoped warnings die with the session
-        if (mediaKeyToastId !== null) {
-          removeNotification(mediaKeyToastId);
-          mediaKeyToastId = null;
+        if (mediaKeyToast?.server === server) {
+          removeNotification(mediaKeyToast.id);
+          mediaKeyToast = null;
         }
+
+        // A second connection-lost during a reconnect (ServerShutdown is
+        // followed by the socket closing) is the loop's business, not a
+        // second loop's; neither is one while the first connect is running.
+        if (get(connectionState.of(server)) !== "connected") return;
 
         // Play disconnected sound on initial loss (not during reconnect retries)
-        if ($connectionState === "connected") {
-          playDisconnectedSound();
-        }
-
-        // If we were connected, start auto-reconnect
-        if ($connectionState === "connected") {
-          const addr = $serverAddress;
-          const name = $username;
-          // By name, both of them, and read here because this runs while the
-          // channel list is still ours: the reconnect may land on a restarted
-          // server, where the ids are new but the channels people were in are
-          // the same ones they would recognise.
-          const prevVoice = $currentChannelId !== 0 ? channelNameById($currentChannelId) : "";
-          const prevText = [...$joinedTextChannelIds]
-            .map((id) => channelNameById(id))
-            .filter((n) => n !== "");
-          startReconnect(addr, name, prevVoice, prevText, reason);
-        } else if ($connectionState !== "reconnecting") {
-          // A second connection-lost during a reconnect (ServerShutdown is
-          // followed by the socket closing) must not hide the overlay while
-          // the retry loop is still running
-          connectionState.set("disconnected");
-        }
+        playDisconnectedSound();
+        // By name, both of them, and read here because this runs while the
+        // channel list is still ours: the reconnect may land on a restarted
+        // server, where the ids are new but the channels people were in are
+        // the same ones they would recognise. The voice channel only if the
+        // call was on this server.
+        const seat = get(voice);
+        const prevVoice = seat?.server === server ? channelNameById(server, seat.channelId) : "";
+        const prevText = [...get(joinedTextChannelIds.of(server))]
+          .map((id) => channelNameById(server, id))
+          .filter((n) => n !== "");
+        // What the connection held goes now, the call with it if it was this
+        // server's: a channel id is a slot in one server's run, and the
+        // reconnect may land on a restarted server that hands them out again.
+        resetServer(server);
+        void startReconnect(server, { voice: prevVoice, text: prevText }, reason);
       }),
 
       listen<{ error: string }>("audio-device-error", (event) => {
@@ -993,29 +900,32 @@
         addNotification(`Push-to-talk outside the window: ${event.payload.reason}`, "warning", 0);
       }),
 
-      listen("media-key-missing", () => {
-        if (mediaKeyToastId === null) {
-          mediaKeyToastId = addNotification(
-            "Waiting for the channel's encryption key — voice and screen share are held back until a member sends it",
-            "error",
-            0,
-          );
+      listenServer("media-key-missing", (server) => {
+        if (mediaKeyToast === null) {
+          mediaKeyToast = {
+            server,
+            id: addNotification(
+              "Waiting for the channel's encryption key — voice and screen share are held back until a member sends it",
+              "error",
+              0,
+            ),
+          };
         }
       }),
 
-      listen("media-key-installed", () => {
-        if (mediaKeyToastId !== null) {
-          removeNotification(mediaKeyToastId);
-          mediaKeyToastId = null;
+      listenServer("media-key-installed", (server) => {
+        if (mediaKeyToast?.server === server) {
+          removeNotification(mediaKeyToast.id);
+          mediaKeyToast = null;
         }
       }),
 
-      listen<{ user_id: number }>("identity-key-changed", (event) => {
-        const uid = event.payload.user_id;
+      listenServer<{ user_id: number }>("identity-key-changed", (server, data) => {
+        const uid = data.user_id;
         const name =
-          $users.find((u) => u.user_id === uid)?.username ?? `User ${uid}`;
+          get(users.of(server)).find((u) => u.user_id === uid)?.username ?? `User ${uid}`;
         addNotification(
-          `Security warning: ${name}'s encryption identity changed. ` +
+          `${fromServer(server)}Security warning: ${name}'s encryption identity changed. ` +
             `Verify with them out-of-band before trusting messages.`,
           "error",
           0,
@@ -1023,245 +933,248 @@
       }),
 
       // ── Moderation ──
-      listen<{ user_id: number; is_admin: boolean }>("admin-status", (event) => {
-        const { user_id: uid, is_admin } = event.payload;
-        if (uid === $userId) {
-          isAdmin.set(is_admin);
+      listenServer<{ user_id: number; is_admin: boolean }>("admin-status", (server, data) => {
+        const { user_id: uid, is_admin } = data;
+        if (uid === get(userId.of(server))) {
+          isAdmin.of(server).set(is_admin);
           if (is_admin) {
-            addNotification("You are now a server admin", "info");
+            addNotification(`${fromServer(server)}You are now a server admin`, "info");
             // An admin is answered about channels that refused us a moment ago,
             // and gets real names where we were given pseudonyms.
-            requestAllRosters();
+            requestAllRosters(server);
           }
         }
         const mark = (list: UserInfo[]) =>
           list.map((u) => (u.user_id === uid ? { ...u, is_admin } : u));
-        users.update(mark);
-        previewUsers.update(mark);
+        users.of(server).update(mark);
+        previewUsers.of(server).update(mark);
       }),
 
-      listen<{ reason: string }>("admin-error", (event) => {
-        addNotification(`Admin: ${event.payload.reason}`, "error");
+      listenServer<{ reason: string }>("admin-error", (server, data) => {
+        addNotification(`${fromServer(server)}Admin: ${data.reason}`, "error");
       }),
 
-      listen<{ reason: string }>("server-disconnected", (event) => {
-        // Set synchronously, before the socket closes: the connection-lost
-        // that follows must not start the 5-minute reconnect loop
-        connectionState.set("disconnected");
-        isAdmin.set(false);
-        addNotification(event.payload.reason, "error", 0);
-        invoke("disconnect").catch(() => {});
+      listenServer<{ reason: string }>("server-disconnected", (server, data) => {
+        addNotification(`${fromServer(server)}${data.reason}`, "error", 0);
+        // This server only, and closed before the socket is: the
+        // connection-lost that follows is then for a server that is not open,
+        // and is dropped before it can start the 5-minute reconnect loop. Not
+        // written to the open list — like a lost connection, it was not the
+        // user's choice, and the next start tries again.
+        void disconnectServer(server, { save: false });
       }),
 
       // ── Channel history hand-off (E2E, member → newcomer) ──
-      listen<{ channel_id: number; from_user_id: number }>("channel-history-requested", (event) => {
-        if (!$shareChannelHistory) return;
-        const channelId = event.payload.channel_id;
-        const chName = channelNameById(channelId);
-        if (!chName) return;
-        // The request reaches us through the server, and the server is the
-        // adversary this whole layer is built against: it can invent one, for
-        // any channel and from any name, and forty-eight kilobytes of our
-        // plaintext would go straight back out. So: a channel we are actually
-        // in, and somebody the roster of that channel holds.
-        //
-        // A relay can still put a stranger *in* that roster — it is the one who
-        // sends the member list. But then the stranger is on screen in the
-        // channel, which is the difference between a silent harvest and a
-        // visible one.
-        if (channelId !== $currentChannelId && !$joinedTextChannelIds.has(channelId)) return;
-        if (!currentRosterOf(channelId).some((u) => u.user_id === event.payload.from_user_id)) {
-          return;
-        }
-        // Second-hand messages go on: a conversation should outlive the last
-        // person who was there for it, and it stays marked as hearsay all the
-        // way down the chain — sanitizeHistory re-stamps whatever it is handed.
-        const now = Date.now();
-        const text = ($channelMessages.get(chatKey(chName)) ?? []).filter(
-          (m) =>
-            (!m.kind || m.kind === "text" || m.kind === "shared") &&
-            // A message whose destruction timer has run out is not history. The
-            // sweep takes it off our own screen within seconds; handing it over
-            // in the meantime would put it back into somebody else's archive
-            // with a fresh copy of the same deadline.
-            !(m.expires_at !== undefined && m.expires_at <= now),
-        );
-        let msgs: ChatMessage[] = text.slice(-HISTORY_MAX_MESSAGES);
-        // Stay well under the 64 KiB control-message cap (Signal envelope + framing)
-        const bytes = (list: ChatMessage[]) => new TextEncoder().encode(JSON.stringify(list)).length;
-        while (msgs.length > 0 && bytes(msgs) > 48 * 1024) msgs = msgs.slice(1);
-        if (msgs.length === 0) return;
-        invoke("send_channel_history", {
-          channelId,
-          targetUserId: event.payload.from_user_id,
-          messages: msgs,
-        }).catch((e: unknown) => console.warn("channel history hand-off failed:", e));
-      }),
-
-      listen<{ channel_id: number; from_user_id: number; from_username: string; messages: unknown[] }>(
-        "channel-history-received",
-        (event) => {
-          const chName = channelNameById(event.payload.channel_id);
-          if (chName) {
-            mergeChannelHistory(
-              chName,
-              event.payload.messages,
-              event.payload.from_username,
-              // What the channel says now. A sharer's claim is clamped by it,
-              // and a message arriving with no claim at all takes it — which is
-              // what stops somebody keeping a message alive by dropping the
-              // field on the way through.
-              channelMessageTtl(event.payload.channel_id),
-            );
+      listenServer<{ channel_id: number; from_user_id: number }>(
+        "channel-history-requested",
+        (server, data) => {
+          if (!$shareChannelHistory) return;
+          const channelId = data.channel_id;
+          const chName = channelNameById(server, channelId);
+          if (!chName) return;
+          // The request reaches us through the server, and the server is the
+          // adversary this whole layer is built against: it can invent one, for
+          // any channel and from any name, and forty-eight kilobytes of our
+          // plaintext would go straight back out. So: a channel we are actually
+          // in, and somebody the roster of that channel holds.
+          //
+          // A relay can still put a stranger *in* that roster — it is the one who
+          // sends the member list. But then the stranger is on screen in the
+          // channel, which is the difference between a silent harvest and a
+          // visible one.
+          if (
+            channelId !== get(currentChannelId.of(server)) &&
+            !get(joinedTextChannelIds.of(server)).has(channelId)
+          )
+            return;
+          if (!currentRosterOf(server, channelId).some((u) => u.user_id === data.from_user_id)) {
+            return;
           }
+          // Second-hand messages go on: a conversation should outlive the last
+          // person who was there for it, and it stays marked as hearsay all the
+          // way down the chain — sanitizeHistory re-stamps whatever it is handed.
+          const now = Date.now();
+          const text = ($channelMessages.get(chatKey(server, chName)) ?? []).filter(
+            (m) =>
+              (!m.kind || m.kind === "text" || m.kind === "shared") &&
+              // A message whose destruction timer has run out is not history. The
+              // sweep takes it off our own screen within seconds; handing it over
+              // in the meantime would put it back into somebody else's archive
+              // with a fresh copy of the same deadline.
+              !(m.expires_at !== undefined && m.expires_at <= now),
+          );
+          let msgs: ChatMessage[] = text.slice(-HISTORY_MAX_MESSAGES);
+          // Stay well under the 64 KiB control-message cap (Signal envelope + framing)
+          const bytes = (list: ChatMessage[]) =>
+            new TextEncoder().encode(JSON.stringify(list)).length;
+          while (msgs.length > 0 && bytes(msgs) > 48 * 1024) msgs = msgs.slice(1);
+          if (msgs.length === 0) return;
+          invoke("send_channel_history", {
+            server,
+            channelId,
+            targetUserId: data.from_user_id,
+            messages: msgs,
+          }).catch((e: unknown) => console.warn("channel history hand-off failed:", e));
         },
       ),
 
-      listen<ChannelInfo>("channel-created", (event) => {
-        // Idempotent: the channel list snapshot may already contain it
-        channels.update(
-          (chs) => upsertById(chs, event.payload, (c) => c.channel_id).list
-        );
+      listenServer<{
+        channel_id: number;
+        from_user_id: number;
+        from_username: string;
+        messages: unknown[];
+      }>("channel-history-received", (server, data) => {
+        const chName = channelNameById(server, data.channel_id);
+        if (chName) {
+          mergeChannelHistory(
+            server,
+            chName,
+            data.messages,
+            data.from_username,
+            // What the channel says now. A sharer's claim is clamped by it,
+            // and a message arriving with no claim at all takes it — which is
+            // what stops somebody keeping a message alive by dropping the
+            // field on the way through.
+            channelMessageTtl(server, data.channel_id),
+          );
+        }
       }),
 
-      listen<{ channel_id: number }>("channel-deleted", (event) => {
+      listenServer<ChannelInfo>("channel-created", (server, created) => {
+        // Idempotent: the channel list snapshot may already contain it
+        channels.of(server).update((chs) => upsertById(chs, created, (c) => c.channel_id).list);
+      }),
+
+      listenServer<{ channel_id: number }>("channel-deleted", (server, data) => {
+        const goneId = data.channel_id;
         // Read before the list loses it: the name is the key to everything the
         // channel owns here, and the list is the only place it exists.
-        const goneName = channelNameById(event.payload.channel_id);
+        const goneName = channelNameById(server, goneId);
         // The badge goes with the channel. What the user *deleted* there does
         // not: `clearedBefore` outlives the channel on purpose, so a channel
         // recreated under the same name cannot be used to hand the messages
         // they threw away straight back to them.
-        if (goneName) clearChannelUnread(goneName);
-        channels.update((chs) =>
-          chs.filter((ch) => ch.channel_id !== event.payload.channel_id)
-        );
+        if (goneName) clearChannelUnread(server, goneName);
+        channels.of(server).update((chs) => chs.filter((ch) => ch.channel_id !== goneId));
         // Nobody is in a channel that does not exist, and the id will be handed
         // out again — a roster left here would be drawn under whatever gets it.
-        channelRosters.update((m) => {
-          if (!m.has(event.payload.channel_id)) return m;
+        channelRosters.of(server).update((m) => {
+          if (!m.has(goneId)) return m;
           const next = new Map(m);
-          next.delete(event.payload.channel_id);
+          next.delete(goneId);
           return next;
         });
-        joinedTextChannelIds.update((s) => {
-          if (!s.has(event.payload.channel_id)) return s;
+        joinedTextChannelIds.of(server).update((s) => {
+          if (!s.has(goneId)) return s;
           const next = new Set(s);
-          next.delete(event.payload.channel_id);
+          next.delete(goneId);
           return next;
         });
-        if ($activeTextChannelId === event.payload.channel_id) openTextChannel(null);
-        // If we were in the deleted channel, switch to General
-        currentChannelId.update((id) => {
-          if (id === event.payload.channel_id) {
-            invoke("join_channel", { channelId: 0, password: null });
-            return 0;
-          }
-          return id;
-        });
+        if (get(activeTextChannelId.of(server)) === goneId) openTextChannel(server, null);
+        // Nothing to do about the voice channel: the server deletes only an
+        // empty one, so it was never the one we stand in.
         // Clear preview if previewing the deleted channel
-        if ($previewChannelId === event.payload.channel_id) {
-          previewChannelId.set(null);
-          previewUsers.set([]);
+        if (get(previewChannelId.of(server)) === goneId) {
+          previewChannelId.of(server).set(null);
+          previewUsers.of(server).set([]);
         }
       }),
 
-      listen<{ reason: string }>("channel-error", (event) => {
-        addNotification(event.payload.reason, "error");
+      listenServer<{ reason: string }>("channel-error", (server, data) => {
+        addNotification(`${fromServer(server)}${data.reason}`, "error");
       }),
 
-      listen<ChannelInfo>("channel-updated", (event) => {
-        channels.update((chs) =>
-          chs.map((ch) =>
-            ch.channel_id === event.payload.channel_id ? event.payload : ch
-          )
+      listenServer<ChannelInfo>("channel-updated", (server, updated) => {
+        channels.of(server).update((chs) =>
+          chs.map((ch) => (ch.channel_id === updated.channel_id ? updated : ch)),
         );
       }),
 
-      listen<{ channel_id: number; reason: string }>("kicked", (event) => {
-        addNotification("You were kicked: " + event.payload.reason, "warning");
-        // The server already moved us to General and will send a user-list event
+      listenServer<{ channel_id: number; reason: string }>("kicked", (server, data) => {
+        // From a voice channel the server moves us to its lobby, which is no
+        // voice channel at all, and the user-list for it follows — that is
+        // what ends voice here. From a text channel we only lose it.
+        const name = channelNameById(server, data.channel_id);
+        const from =
+          name && isTextChannel(server, data.channel_id) ? `#${name}` : "the voice channel";
+        addNotification(
+          `${fromServer(server)}You were removed from ${from}: ${data.reason}`,
+          "warning",
+        );
       }),
 
       // Channel preview response
-      listen<{ channel_id: number; users: UserInfo[] }>("channel-users", (event) => {
-        setRoster(event.payload.channel_id, event.payload.users);
-        if (event.payload.channel_id === $previewChannelId) {
-          previewUsers.set(event.payload.users);
+      listenServer<{ channel_id: number; users: UserInfo[] }>("channel-users", (server, data) => {
+        setRoster(server, data.channel_id, data.users);
+        if (data.channel_id === get(previewChannelId.of(server))) {
+          previewUsers.of(server).set(data.users);
         }
       }),
 
       // Invite events
-      listen<{ channel_id: number; channel_name: string; invited_by: string }>(
+      listenServer<{ channel_id: number; channel_name: string; invited_by: string }>(
         "invite-received",
-        (event) => {
+        (server, data) => {
           pendingInvites.update((inv) => [
-            ...inv.filter((i) => i.channel_id !== event.payload.channel_id),
+            ...inv.filter((i) => !(i.server === server && i.channel_id === data.channel_id)),
             {
-              channel_id: event.payload.channel_id,
-              channel_name: event.payload.channel_name,
-              invited_by: event.payload.invited_by,
+              server,
+              channel_id: data.channel_id,
+              channel_name: data.channel_name,
+              invited_by: data.invited_by,
             },
           ]);
-        }
+        },
       ),
 
-      listen<{ channel_id: number; user_id: number }>("invite-accepted", (event) => {
-        const userName = $users.find((u) => u.user_id === event.payload.user_id)?.username ?? "User";
-        addNotification(`${userName} accepted your invite`, "info");
+      listenServer<{ channel_id: number; user_id: number }>("invite-accepted", (server, data) => {
+        const userName =
+          get(users.of(server)).find((u) => u.user_id === data.user_id)?.username ?? "User";
+        addNotification(`${fromServer(server)}${userName} accepted your invite`, "info");
       }),
 
-      listen<{ channel_id: number; user_id: number }>("invite-declined", () => {
-        addNotification("Your invite was declined", "warning");
+      listenServer<{ channel_id: number; user_id: number }>("invite-declined", (server) => {
+        addNotification(`${fromServer(server)}Your invite was declined`, "warning");
       }),
 
       // Poke events
-      listen<{ from_user_id: number; from_username: string; message: string }>(
+      listenServer<{ from_user_id: number; from_username: string; message: string }>(
         "poke-received",
-        (event) => {
+        (server, data) => {
           pendingPokes.update((p) => [
             ...p,
-            createPoke(
-              event.payload.from_user_id,
-              event.payload.from_username,
-              event.payload.message,
-            ),
+            createPoke(server, data.from_user_id, data.from_username, data.message),
           ]);
           playPokeSound();
-          notifyUnfocused(
-            `Poke from ${event.payload.from_username}`,
-            event.payload.message || "",
-          );
-        }
+          notifyUnfocused(`${fromServer(server)}Poke from ${data.from_username}`, data.message || "");
+        },
       ),
 
       // Chat events
-      listen<{
+      listenServer<{
         channel_id: number;
         user_id: number;
         username: string;
         content: string;
         timestamp: number;
         message_id?: string | null;
+        ttl_secs?: number | null;
         decryption_failed?: boolean;
-      }>("channel-chat-message", (event) => {
-        const { channel_id, user_id: uid, username, content, timestamp, message_id } = event.payload;
-        const chName = channelNameById(channel_id);
+      }>("channel-chat-message", (server, data) => {
+        const { channel_id, user_id: uid, username, content, timestamp, message_id } = data;
+        const chName = channelNameById(server, channel_id);
         if (chName) {
           // The moment this message is to be deleted, worked out once, here:
           // the shorter of what its sender put inside the ciphertext and what
           // the channel itself says now. Every copy of it — ours, the sender's,
           // and any archive it is shared into later — names the same instant.
-          const expires_at = expiryFor(
-            timestamp,
-            event.payload.ttl_secs,
-            channelMessageTtl(channel_id),
-          );
+          const expires_at = expiryFor(timestamp, data.ttl_secs, channelMessageTtl(server, channel_id));
           // Our own messages are echoed locally under the name we connected
           // with; in an anonymous channel that is not the name anyone else
           // sees, so use the one the channel knows us by.
-          const uname = uid === $userId ? ownDisplayName(username, channel_id) : username;
-          addChannelMessage(chName, {
+          const self = get(userId.of(server));
+          const uname = uid === self ? ownDisplayName(server, username, channel_id) : username;
+          addChannelMessage(server, chName, {
             user_id: uid,
             username: uname,
             content,
@@ -1271,20 +1184,22 @@
             // Marked, so it is never handed on as history: a placeholder is
             // not what the sender wrote, and passing it to the next person to
             // join spreads one member's missing key to everybody after them.
-            kind: event.payload.decryption_failed ? "undecryptable" : undefined,
+            kind: data.decryption_failed ? "undecryptable" : undefined,
           });
-          // Track unread if not currently viewing this channel's chat
+          // Track unread unless it is on screen: this server, no DM over the
+          // pane, and this channel in it
           const viewingThisChannel =
-            $activeDmUserId === null &&
-            channel_id === ($activeTextChannelId ?? $currentChannelId);
+            server === get(serverAddress) &&
+            get(activeDmUserId.of(server)) === null &&
+            channel_id === (get(activeTextChannelId.of(server)) ?? get(currentChannelId.of(server)));
           if (!viewingThisChannel) {
-            incrementChannelUnread(chName);
-            if (uid !== $userId) playChannelMessageSound();
+            incrementChannelUnread(server, chName);
+            if (uid !== self) playChannelMessageSound();
           }
         }
       }),
 
-      listen<{
+      listenServer<{
         from_user_id: number;
         from_username: string;
         to_user_id: number;
@@ -1292,82 +1207,81 @@
         timestamp: number;
         message_id?: string | null;
         ttl_secs?: number | null;
-      }>("direct-chat-message", (event) => {
-        const { from_user_id, to_user_id, content, timestamp } = event.payload;
-        const myId = $userId;
+      }>("direct-chat-message", (server, data) => {
+        const { from_user_id, to_user_id, content, timestamp } = data;
+        const myId = get(userId.of(server));
         const from_username =
-          from_user_id === myId
-            ? ownDisplayName(event.payload.from_username)
-            : event.payload.from_username;
+          from_user_id === myId ? ownDisplayName(server, data.from_username) : data.from_username;
         // A direct message has no channel to take a policy from, so the two
         // answers are the sender's timer and this user's own for that person,
         // and the shorter wins. Their name is how the conversation is filed.
-        const peer = from_user_id === myId ? $activeDmUsername : from_username;
-        const expires_at = expiryFor(timestamp, event.payload.ttl_secs, dmMessageTtl(peer));
-        addDmMessage(myId, from_user_id, from_username, to_user_id, {
+        const peer = from_user_id === myId ? get(activeDmUsername.of(server)) : from_username;
+        const expires_at = expiryFor(timestamp, data.ttl_secs, dmMessageTtl(server, peer));
+        addDmMessage(server, myId, from_user_id, from_username, to_user_id, {
           user_id: from_user_id,
           username: from_username,
           content,
           timestamp,
-          id: event.payload.message_id ?? undefined,
+          id: data.message_id ?? undefined,
           expires_at,
         });
         if (from_user_id !== myId) {
           playDirectMessageSound();
-          notifyUnfocused(from_username, content.slice(0, 140));
+          notifyUnfocused(`${fromServer(server)}${from_username}`, content.slice(0, 140));
         }
       }),
 
-      // Screen share events
-      listen<{ user_id: number; username: string; resolution: number }>(
+      // Screen share events. Shares ride on the voice connection; another
+      // server's flags still mark its member rows.
+      listenServer<{ user_id: number; username: string; resolution: number }>(
         "screenshare-started",
-        (event) => {
-          addScreenShare(event.payload);
+        (server, data) => {
+          if (inVoice(server)) addScreenShare(data);
           // Update user list to reflect screen sharing status
-          users.update((u) =>
+          users.of(server).update((u) =>
             u.map((user) =>
-              user.user_id === event.payload.user_id
-                ? { ...user, is_screen_sharing: true }
-                : user
-            )
+              user.user_id === data.user_id ? { ...user, is_screen_sharing: true } : user,
+            ),
           );
-          patchRosters(event.payload.user_id, { is_screen_sharing: true });
-        }
+          patchRosters(server, data.user_id, { is_screen_sharing: true });
+        },
       ),
 
-      listen<{ user_id: number }>("screenshare-stopped", (event) => {
-        removeScreenShare(event.payload.user_id);
+      listenServer<{ user_id: number }>("screenshare-stopped", (server, data) => {
         // Update user list
-        users.update((u) =>
+        users.of(server).update((u) =>
           u.map((user) =>
-            user.user_id === event.payload.user_id
-              ? { ...user, is_screen_sharing: false }
-              : user
-          )
+            user.user_id === data.user_id ? { ...user, is_screen_sharing: false } : user,
+          ),
         );
-        patchRosters(event.payload.user_id, { is_screen_sharing: false });
+        patchRosters(server, data.user_id, { is_screen_sharing: false });
+        if (!inVoice(server)) return;
+        removeScreenShare(data.user_id);
         // If we were watching this user, clear viewer state
-        if ($watchingUserId === event.payload.user_id) {
+        if ($watchingUserId === data.user_id) {
           watchingUserId.set(null);
           currentFrame.set(null);
         }
       }),
 
-      listen<{ sharer_user_id: number }>("watching-screenshare", (event) => {
-        watchingUserId.set(event.payload.sharer_user_id);
+      listenServer<{ sharer_user_id: number }>("watching-screenshare", (server, data) => {
+        if (!inVoice(server)) return;
+        watchingUserId.set(data.sharer_user_id);
         currentFrame.set(null);
       }),
 
-      listen<{ reason: string }>("stopped-watching-screenshare", (event) => {
+      listenServer<{ reason: string }>("stopped-watching-screenshare", (server, data) => {
+        if (!inVoice(server)) return;
         watchingUserId.set(null);
         currentFrame.set(null);
-        if (event.payload.reason !== "requested") {
-          addNotification("Screen share ended: " + event.payload.reason, "info");
+        if (data.reason !== "requested") {
+          addNotification("Screen share ended: " + data.reason, "info");
         }
       }),
 
-      listen<{ viewer_count: number }>("viewer-count-changed", (event) => {
-        const count = event.payload.viewer_count;
+      listenServer<{ viewer_count: number }>("viewer-count-changed", (server, data) => {
+        if (!inVoice(server)) return;
+        const count = data.viewer_count;
         const prevCount = $viewerCount;
         viewerCount.set(count);
 
@@ -1387,15 +1301,16 @@
         }
       }),
 
-      listen("keyframe-requested", () => {
+      listenServer("keyframe-requested", (server) => {
+        if (!inVoice(server)) return;
         invoke("set_keyframe_requested").catch(() => {});
       }),
 
-      listen<{ reason: string }>("screenshare-error", (event) => {
-        addNotification("Screen share error: " + event.payload.reason, "error");
+      listenServer<{ reason: string }>("screenshare-error", (server, data) => {
+        addNotification(`${fromServer(server)}Screen share error: ${data.reason}`, "error");
         // The server refused or ended our share (a channel can switch sharing
         // off under us): stop capturing rather than sending into the void.
-        if ($isSharingScreen) {
+        if (inVoice(server) && $isSharingScreen) {
           isSharingScreen.set(false);
           invoke("stop_screen_capture").catch(() => {});
         }
@@ -1406,7 +1321,8 @@
       }),
 
       // Screen share force-stopped by server (channel change, kick, etc.)
-      listen("screen-share-force-stopped", () => {
+      listenServer("screen-share-force-stopped", (server) => {
+        if (!inVoice(server)) return;
         isSharingScreen.set(false);
         watchingUserId.set(null);
         currentFrame.set(null);
@@ -1427,14 +1343,16 @@
       }),
     ];
 
-    // Periodic ping for latency measurement
+    // Periodic ping for latency measurement, on every server that is up
     const pingInterval = setInterval(() => {
-      if ($connectionState === "connected") {
-        invoke("ping").catch(() => {});
+      for (const server of get(openServers)) {
+        if (get(connectionState.of(server)) === "connected") {
+          invoke("ping", { server }).catch(() => {});
+        }
       }
     }, 5000);
 
-    // Poll screen audio + video stats every 500ms
+    // Poll screen audio + video stats every 500ms, while there is a call
     let lastSendCount = 0;
     let lastRecvCount = 0;
     let lastFramesSent = 0;
@@ -1442,7 +1360,7 @@
     let lastFramesRecv = 0;
     let lastBytesRecv = 0;
     const statsInterval = setInterval(() => {
-      if ($connectionState === "connected") {
+      if ($voiceState === "connected") {
         invoke<[number, number]>("get_screen_audio_status")
           .then(([sendCount, recvCount]) => {
             screenAudioSending.set(sendCount !== lastSendCount);
@@ -1497,18 +1415,18 @@
   <ChatHistorySetup />
 {/if}
 
-{#if $connectionState === "disconnected" || $connectionState === "connecting"}
+<!-- Up by itself while no server is on screen, and from the rail's "+". A
+     server that is connecting or reconnecting says so in its own pane
+     (ReconnectOverlay, mounted by each shell), not here. -->
+{#if $showConnectDialog || !$serverAddress}
   <ConnectDialog />
 {/if}
 
-{#if $connectionState === "reconnecting"}
-  <ReconnectOverlay attempt={reconnectAttempt} error={reconnectError} oncancel={cancelReconnect} />
-{/if}
-
-<!-- Audio, once, while they are still in the lobby where voice is off anyway.
-     After Connect on purpose: that click is the browser gesture the audio
-     graph needs, and it is the moment the user is expecting to be asked
-     things. A device that has since vanished re-opens just its own step. -->
+<!-- Audio, once, while they are still in no voice channel, where the
+     microphone is off anyway. After Connect on purpose: that click is the
+     browser gesture the audio graph needs, and it is the moment the user is
+     expecting to be asked things. A device that has since vanished re-opens
+     just its own step. -->
 {#if showAudioSetup}
   <AudioSetup only={audioSetupOnly} onclose={closeAudioSetup} />
 {/if}

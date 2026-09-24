@@ -13,11 +13,12 @@
 // reads the capture track directly and keeps running while the tab is hidden —
 // which is where a sharer's tab lives. Firefox has no such API, so it draws
 // from a <video> element on a Worker clock; page timers are throttled in a
-// hidden tab but a worker's are not.
+// hidden tab but a worker's are not. Both paths tick on that clock, which is
+// also what encodes the newest frame again when the screen stands still.
 
-import { emit } from "./events";
 import { wasm } from "./wasm";
 import { displayConstraints } from "../../lib/display-capture";
+import { paceFrame, shouldForceKey } from "../../lib/share-rules";
 import type { SessionContext, ShareApi, VideoCodec } from "./types";
 import { audio } from "./audio";
 
@@ -34,8 +35,6 @@ const ENCODER_CANDIDATES: { codec: VideoCodec; webCodec: string }[] = [
 const BITRATE_KBPS: Record<number, number> = { 480: 1500, 720: 3000, 1080: 5000 };
 /** voipc_video::Resolution: the width that goes with each share height. */
 const WIDTH_FOR_HEIGHT: Record<number, number> = { 480: 854, 720: 1280, 1080: 1920 };
-/** voipc_video::KEYFRAME_INTERVAL_SECS — periodic IDR as a safety net. */
-const KEYFRAME_INTERVAL_SECS = 4;
 /**
  * Largest frame the wire format carries: 255 fragments of
  * MAX_ENCRYPTED_VIDEO_PAYLOAD_SIZE (1280 - 17 - 16) bytes. WebCodecs has no
@@ -102,9 +101,21 @@ export class ShareSender implements ShareApi {
   private encoding = false;
   private audioEnabled = true;
   private startedAt = 0;
-  private framesSinceKeyframe = 0;
   private keyframeRequested = false;
-  private lastFrameAt = 0;
+  /** The newest captured frame, for the tick to encode when no newer one comes. */
+  private lastFrame: VideoFrame | null = null;
+  /** Whether lastFrame reached the encoder, or was held back by pacing. */
+  private lastFrameEncoded = true;
+  /** When lastFrame arrived (performance.now()). */
+  private lastArrivalAt = 0;
+  /** Capture-clock deadline (µs) the next frame is paced against. */
+  private dueUs = -Infinity;
+  /** When a keyframe last went out on the wire. */
+  private lastKeyAt = -Infinity;
+  /** When a keyframe was last forced into the encoder. */
+  private lastKeyForcedAt = -Infinity;
+  /** A frame was dropped: every delta until the next keyframe references it. */
+  private dropDeltasUntilKey = false;
   private encoderFailures = 0;
   /** Timestamp of the first encoded chunk; wire timestamps are relative to it. */
   private firstChunkUs: number | null = null;
@@ -142,8 +153,8 @@ export class ShareSender implements ShareApi {
   async start(resolution: number, fps: number): Promise<void> {
     if (!this.available) throw new Error("This browser cannot share a screen (no WebCodecs encoder)");
     const ctx = this.ctx;
-    if (!ctx) throw new Error("Not connected");
-    if (ctx.channelId === 0) throw new Error("Screen sharing is disabled in the General lobby");
+    if (!ctx) throw new Error("Not in a voice channel");
+    if (ctx.channelId === 0) throw new Error("Join a voice channel first");
     if (this._sharing || this.starting) throw new Error("Already screen sharing");
 
     // Claimed before the first await: the picker can stay open for a long time,
@@ -196,7 +207,8 @@ export class ShareSender implements ShareApi {
       track.addEventListener("ended", () => {
         if (!this._sharing) return;
         this.stop();
-        emit("screen-share-force-stopped");
+        // Still the session it started on: a share never outlives its attach
+        ctx.emit("screen-share-force-stopped");
       });
     }
 
@@ -242,15 +254,15 @@ export class ShareSender implements ShareApi {
   }
 
   /**
-   * ScreenShareError. The server refuses a share (already sharing, General
-   * lobby) after we have already opened the capture, so tear it down instead of
-   * leaving the browser's sharing bar up with nothing behind it. Errors that
-   * arrive later belong to watching, not to our share.
+   * ScreenShareError. The server refuses a share (already sharing, not in a
+   * voice channel) after we have already opened the capture, so tear it down
+   * instead of leaving the browser's sharing bar up with nothing behind it.
+   * Errors that arrive later belong to watching, not to our share.
    */
   onServerError(): void {
     if (!this.announced || !this._sharing) return;
     this.stop();
-    emit("screen-share-force-stopped");
+    this.ctx?.emit("screen-share-force-stopped");
   }
 
   startEncoding(resolution: number, fps: number): void {
@@ -259,9 +271,15 @@ export class ShareSender implements ShareApi {
     this.setQuality(resolution, fps);
 
     this.encoding = true;
-    this.framesSinceKeyframe = 0;
     this.keyframeRequested = true; // the first frame of a share is always an IDR
-    this.lastFrameAt = 0;
+    this.lastFrame?.close();
+    this.lastFrame = null;
+    this.lastFrameEncoded = true;
+    this.lastArrivalAt = 0;
+    this.dueUs = -Infinity;
+    this.lastKeyAt = -Infinity;
+    this.lastKeyForcedAt = -Infinity;
+    this.dropDeltasUntilKey = false;
     this.encoderFailures = 0;
     this.firstChunkUs = null;
     // The encoder opens on the first frame, whose size is the one that counts.
@@ -270,6 +288,14 @@ export class ShareSender implements ShareApi {
     const track = this.stream.getVideoTracks()[0];
     if (track && hasTrackProcessor()) this.readTrack(track);
     else this.readVideoElement();
+    // Both paths tick: Firefox samples its <video> on it, and on Chromium it
+    // is what still encodes once the capture track goes quiet.
+    const worker = new Worker(new URL("./worklets/tick-worker.js", import.meta.url), {
+      type: "module",
+    });
+    worker.onmessage = () => this.onTick();
+    worker.postMessage({ type: "start", intervalMs: 1000 / this.fps });
+    this.worker = worker;
   }
 
   stopEncoding(): void {
@@ -279,6 +305,8 @@ export class ShareSender implements ShareApi {
     this.worker = null;
     void this.frameReader?.cancel().catch(() => {});
     this.frameReader = null;
+    this.lastFrame?.close();
+    this.lastFrame = null;
     this.closeEncoder();
     if (this.videoEl) {
       this.videoEl.pause();
@@ -361,77 +389,125 @@ export class ShareSender implements ShareApi {
     video.srcObject = this.stream;
     void video.play().catch((e) => console.warn("share preview play failed:", e));
     this.videoEl = video;
-
-    const worker = new Worker(new URL("./worklets/tick-worker.js", import.meta.url), {
-      type: "module",
-    });
-    worker.onmessage = () => this.onTick();
-    worker.postMessage({ type: "start", intervalMs: 1000 / this.fps });
-    this.worker = worker;
   }
 
-  /** One worker tick: grab the current <video> frame and hand it to the encoder. */
+  /**
+   * One worker tick. Firefox: grab the current <video> frame and hand it on.
+   * Then, on either path, encode the newest frame again if it is owed and
+   * nothing newer came: Chromium's track is damage-driven, so a held-back
+   * frame, a keyframe request and the periodic IDR would otherwise wait for
+   * the next change on screen.
+   */
   private onTick(): void {
+    if (!this.encoding) return;
     const video = this.videoEl;
-    if (!this.encoding || !video || video.readyState < 2) return;
-    let frame: VideoFrame;
+    if (video && video.readyState >= 2) {
+      let frame: VideoFrame | null = null;
+      try {
+        frame = new VideoFrame(video, {
+          timestamp: Math.round((performance.now() - this.startedAt) * 1000),
+        });
+      } catch (e) {
+        console.warn("could not capture a frame:", e);
+      }
+      if (frame) this.onFrame(frame);
+    }
+    const last = this.lastFrame;
+    const sinceArrival = performance.now() - this.lastArrivalAt;
+    if (!last || sinceArrival < 1000 / this.currentFps()) return;
+    if (this.lastFrameEncoded && !this.wantKey()) return;
+    // Stamped as shown now: encoders pace their rate control on timestamps,
+    // and some refuse one that does not move forward.
+    let again: VideoFrame;
     try {
-      frame = new VideoFrame(video, {
-        timestamp: Math.round((performance.now() - this.startedAt) * 1000),
-      });
+      again = new VideoFrame(last, { timestamp: last.timestamp + Math.round(sinceArrival * 1000) });
     } catch (e) {
-      console.warn("could not capture a frame:", e);
+      console.warn("could not repeat a frame:", e);
       return;
     }
-    this.onFrame(frame);
+    try {
+      this.encode(again);
+    } finally {
+      again.close();
+    }
   }
 
-  /** Pace, adapt, encode. Closes `frame` in every path. */
+  /** Keep, pace, encode. Closes `frame` in every path. */
   private onFrame(frame: VideoFrame): void {
     try {
       if (!this.encoding) return;
-      const now = performance.now();
+      this.lastFrame?.close();
+      this.lastFrame = frame.clone();
+      this.lastFrameEncoded = false;
+      this.lastArrivalAt = performance.now();
       // The ladder can halve the frame rate, and a capture track can deliver
-      // faster than we asked: drop anything that comes in too early.
-      const minInterval = 1000 / this.currentFps() - 2;
-      if (this.lastFrameAt !== 0 && now - this.lastFrameAt < minInterval) return;
-      this.lastFrameAt = now;
-
-      this.adapt();
-
-      // The first frame decides the encoder's size (the browser rarely gives
-      // exactly the size we asked for), and a resized window or a renegotiated
-      // capture rebuilds it. The *visible* size, not the coded one: a capture
-      // track pads its buffers to the codec's macroblock grid, and encoding at
-      // the padded size ships the padding to every viewer.
-      const sizeChanged =
-        frame.displayWidth !== this.width || frame.displayHeight !== this.height;
-      if (!this.encoder || sizeChanged) {
-        if (this.encoder && sizeChanged) {
-          console.info(`share source is now ${frame.displayWidth}x${frame.displayHeight}`);
-        }
-        this.width = frame.displayWidth;
-        this.height = frame.displayHeight;
-        this.openEncoder();
-      }
-      const encoder = this.encoder;
-      if (!encoder || encoder.state !== "configured") return;
-      // A backlog in the encoder means we cannot keep up: skip this frame.
-      if (encoder.encodeQueueSize > 2) return;
-
-      const keyFrame =
-        this.keyframeRequested ||
-        this.framesSinceKeyframe >= KEYFRAME_INTERVAL_SECS * this.currentFps();
-      try {
-        encoder.encode(frame, { keyFrame });
-        this.keyframeRequested = false;
-        this.framesSinceKeyframe = keyFrame ? 0 : this.framesSinceKeyframe + 1;
-      } catch (e) {
-        console.warn("encode failed:", e);
-      }
+      // faster than we asked: hold back anything that comes in too early.
+      const due = paceFrame(this.dueUs, frame.timestamp, 1e6 / this.currentFps());
+      if (due === null) return;
+      this.dueUs = due;
+      this.encode(frame);
     } finally {
       frame.close();
     }
+  }
+
+  /** Adapt, (re)open the encoder, encode `frame`. Does not close it. */
+  private encode(frame: VideoFrame): void {
+    // No media key yet: nothing could be sent, so spend no encode on it and
+    // leave an owed keyframe owed (screenshare/mod.rs does the same).
+    const ctx = this.ctx;
+    if (!ctx?.mediaKeys.hasChannel(ctx.channelId)) return;
+    this.adapt();
+
+    // The first frame decides the encoder's size (the browser rarely gives
+    // exactly the size we asked for), and a resized window or a renegotiated
+    // capture rebuilds it. The *visible* size, not the coded one: a capture
+    // track pads its buffers to the codec's macroblock grid, and encoding at
+    // the padded size ships the padding to every viewer.
+    const sizeChanged =
+      frame.displayWidth !== this.width || frame.displayHeight !== this.height;
+    if (!this.encoder || sizeChanged) {
+      if (this.encoder && sizeChanged) {
+        console.info(`share source is now ${frame.displayWidth}x${frame.displayHeight}`);
+      }
+      this.width = frame.displayWidth;
+      this.height = frame.displayHeight;
+      this.openEncoder();
+    }
+    const encoder = this.encoder;
+    if (!encoder || encoder.state !== "configured") return;
+    // A backlog in the encoder means we cannot keep up: skip this frame.
+    if (encoder.encodeQueueSize > 2) return;
+
+    const keyFrame = this.wantKey();
+    try {
+      encoder.encode(frame, { keyFrame });
+      this.lastFrameEncoded = true;
+      // Only a key that was forced answers the request: clearing it on every
+      // frame would lose one the spacing held back.
+      if (keyFrame) {
+        this.keyframeRequested = false;
+        this.lastKeyForcedAt = performance.now();
+      }
+    } catch (e) {
+      console.warn("encode failed:", e);
+    }
+  }
+
+  /**
+   * Whether the next frame is a keyframe (share-rules.ts shouldForceKey). The
+   * periodic IDR counts from a forced key too: its chunk is only sent after the
+   * encoder is done with it, and a slow encoder would otherwise be told to make
+   * a second one first. A forced key that is then dropped asks again anyway.
+   */
+  private wantKey(): boolean {
+    const now = performance.now();
+    return shouldForceKey(
+      this.keyframeRequested,
+      now - Math.max(this.lastKeyAt, this.lastKeyForcedAt),
+      now - this.lastKeyForcedAt,
+      this.ctx?.videoBacklog() ?? 0,
+    );
   }
 
   private currentBitrate(): number {
@@ -483,11 +559,12 @@ export class ShareSender implements ShareApi {
     this.closeEncoder();
     if (!this.encoding) return;
     if (++this.encoderFailures >= MAX_ENCODER_FAILURES) {
-      emit("screenshare-error", {
+      const ctx = this.ctx;
+      ctx?.emit("screenshare-error", {
         reason: `Screen sharing stopped: the video encoder failed (${e.message})`,
       });
       this.stop();
-      emit("screen-share-force-stopped");
+      ctx?.emit("screen-share-force-stopped");
       return;
     }
     this.openEncoder();
@@ -563,14 +640,24 @@ export class ShareSender implements ShareApi {
     if (!ctx || !this.encoding) return;
     // A chunk came out, so this encoder works — reset the failure count.
     this.encoderFailures = 0;
-    if (!ctx.mediaKeys.hasChannel(ctx.channelId)) return; // never send plaintext (screenshare/mod.rs)
+    const key = chunk.type === "key";
+    // Deltas after a dropped frame reference something no viewer got. The
+    // drops below take no frame id, so no viewer would see the gap either.
+    if (this.dropDeltasUntilKey && !key) return;
+    if (!ctx.mediaKeys.hasChannel(ctx.channelId)) {
+      // Never send plaintext (screenshare/mod.rs)
+      this.dropDeltasUntilKey = true;
+      this.keyframeRequested = true;
+      return;
+    }
 
     if (chunk.byteLength > MAX_FRAME_BYTES) {
       // No VBV in WebCodecs: this frame would need more fragments than the
       // wire format has. Drop it and encode the next one smaller.
       console.warn(`dropping a ${chunk.byteLength}-byte frame: over the fragment limit`);
       this.lossAt = performance.now();
-      this.lowerBitrate();
+      this.dropDeltasUntilKey = true;
+      this.lowerBitrate(); // asks for the keyframe
       return;
     }
 
@@ -588,19 +675,24 @@ export class ShareSender implements ShareApi {
         ctx.sessionId,
         frameId,
         timestamp,
-        chunk.type === "key",
+        key,
         data,
       );
     } catch (e) {
       console.warn(`video encryption failed (frame ${frameId}):`, e);
       return;
     }
-    if (!ctx.sendVideoFrame(body)) {
+    if (!ctx.sendVideoFrame(body, key)) {
       // Our uplink is the bottleneck: the ladder treats it as loss, like the
       // native sender's full video channel does.
       this.lossAt = performance.now();
+      this.dropDeltasUntilKey = true;
       this.keyframeRequested = true;
       return;
+    }
+    if (key) {
+      this.lastKeyAt = performance.now();
+      this.dropDeltasUntilKey = false;
     }
     this.framesSent++;
     this.bytesSent += body.length;

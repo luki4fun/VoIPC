@@ -10,7 +10,8 @@ import {
   sanitizeHistory,
 } from "../chat-rules.js";
 import { previewChannelId, previewUsers } from "./channels.js";
-import { connectionState, serverKey } from "./connection.js";
+import { serverAddress, serverKey } from "./connection.js";
+import { scoped } from "./scoped.js";
 import { maxConversations } from "./settings.js";
 import type { ChatMessage } from "../types.js";
 
@@ -43,23 +44,23 @@ export const channelMessages = writable<Map<string, ChatMessage[]>>(new Map());
 export const clearedBefore = writable<Map<string, number>>(new Map());
 
 /**
- * The key a channel's messages are filed under.
+ * The key a channel's messages are filed under, on one server.
  *
- * Before a connection there is no server to name; the bare channel name is
- * used, which is also the shape every key had before this release — see
- * [`populateFromArchive`] for how those are carried over.
+ * Without a server there is none to name; the bare channel name is used, which
+ * is also the shape every key had before 0.9 — see [`adoptLegacyKeys`] for how
+ * those are carried over.
  */
-export function chatKey(channelName: string): string {
-  const server = serverKey();
-  return server ? `${server}/${channelName}` : channelName;
+export function chatKey(server: string, channelName: string): string {
+  const key = serverKey(server);
+  return key ? `${key}/${channelName}` : channelName;
 }
 
 // DM messages: "min-max" key -> messages
 export const dmMessages = writable<Map<string, ChatMessage[]>>(new Map());
 
-// Which DM is currently open (null = showing channel chat)
-export const activeDmUserId = writable<number | null>(null);
-export const activeDmUsername = writable<string>("");
+// Which DM is currently open (null = showing channel chat), per server
+export const activeDmUserId = scoped<number | null>(() => null);
+export const activeDmUsername = scoped<string>(() => "");
 
 /**
  * The text channel whose chat is on screen, or null for the voice channel's.
@@ -68,13 +69,13 @@ export const activeDmUsername = writable<string>("");
  * what lets you read #general while sitting in a voice room — and what keeps
  * joining a voice room from yanking the pane away from what you were reading.
  */
-export const activeTextChannelId = writable<number | null>(null);
+export const activeTextChannelId = scoped<number | null>(() => null);
 
 /** Text channels we are subscribed to, as the server confirmed them. */
-export const joinedTextChannelIds = writable<Set<number>>(new Set());
+export const joinedTextChannelIds = scoped<Set<number>>(() => new Set());
 
-// List of DM conversations for the sidebar
-export const dmConversations = writable<DmConversation[]>([]);
+// List of DM conversations for the sidebar, keyed by that server's user ids
+export const dmConversations = scoped<DmConversation[]>(() => []);
 
 /**
  * Unread message counts, chat key -> count.
@@ -90,10 +91,14 @@ export const dmConversations = writable<DmConversation[]>([]);
 export const unreadPerChannel = writable<Map<string, number>>(new Map());
 
 /** One channel row's unread count, in whichever sidebar is drawing the row. */
-export function channelUnread(unread: Map<string, number>, channelName: string): number {
+export function channelUnread(
+  unread: Map<string, number>,
+  server: string,
+  channelName: string,
+): number {
   // The map is passed in rather than read here so that the row re-renders when
   // it changes: the caller's `$unreadPerChannel` is the subscription.
-  return unread.get(chatKey(channelName)) ?? 0;
+  return unread.get(chatKey(server, channelName)) ?? 0;
 }
 
 // Encrypted chat history state
@@ -118,23 +123,30 @@ export const chatHistoryStatus = writable<ChatHistoryStatus | null>(null);
  * either, but they are what the user reads, and a server keeps them unique
  * while people are on it.
  */
-export function dmKey(peerName: string): string {
-  return chatKey(peerName);
+export function dmKey(server: string, peerName: string): string {
+  return chatKey(server, peerName);
 }
 
 /** What we call the person behind an id: what their conversation is filed
  *  under already, or the name we were given. */
-function peerName(peerId: number, fallback: string): string {
-  return get(dmConversations).find((c) => c.user_id === peerId)?.username || fallback;
+function peerName(server: string, peerId: number, fallback: string): string {
+  return get(dmConversations.of(server)).find((c) => c.user_id === peerId)?.username || fallback;
 }
 
 /** The shape of a scoped key. A channel name may itself contain a slash. */
 const SCOPED_KEY = /^[^/]+:\d+\//;
 
 /**
+ * The server legacy history is filed under: the first one this run connected
+ * to. Set once — with several servers open, "the server we are on" is no
+ * longer one answer, and an archive must not be split between them.
+ */
+let legacyOwner: string | null = null;
+
+/**
  * Take history stored under a bare channel name — everything written before
  * 0.9, when there was one bucket per name and no server in the key — as
- * belonging to the server we are on now.
+ * belonging to the first server this run connected to.
  *
  * A single-server user keeps everything. Somebody who used two servers keeps it
  * on whichever they connect to first, which is the best an unlabelled archive
@@ -144,14 +156,14 @@ const SCOPED_KEY = /^[^/]+:\d+\//;
  * (the archive was already open) and unlocking (we were already connected).
  */
 export function adoptLegacyKeys(): void {
-  const server = serverKey();
-  if (!server) return;
+  const owner = serverKey(legacyOwner ?? "");
+  if (!owner) return;
   let moved = 0;
   channelMessages.update((map) => {
     for (const [key, msgs] of [...map]) {
       if (SCOPED_KEY.test(key)) continue;
-      const scoped = `${server}/${key}`;
-      if (!map.has(scoped)) map.set(scoped, msgs);
+      const scopedKey = `${owner}/${key}`;
+      if (!map.has(scopedKey)) map.set(scopedKey, msgs);
       map.delete(key);
       moved++;
     }
@@ -160,12 +172,15 @@ export function adoptLegacyKeys(): void {
   if (moved > 0) scheduleSave();
 }
 
-// Connecting is one of the two moments a bare key can be sitting there. On the
-// connection rather than the address, which is set before the attempt and put
-// back if it fails — history must not be filed under a server we never reached.
-connectionState.subscribe((state) => {
-  if (state === "connected") adoptLegacyKeys();
-});
+/**
+ * A server finished connecting — the first of the two moments a bare key can
+ * be sitting there. Only once the connection is up, never at the attempt:
+ * history must not be filed under a server we never reached.
+ */
+export function claimLegacyKeys(server: string): void {
+  if (legacyOwner === null) legacyOwner = server;
+  adoptLegacyKeys();
+}
 
 // ---------------------------------------------------------------------------
 // Debounced save to Tauri backend
@@ -315,8 +330,8 @@ export function startExpirySweep(): void {
 // Message operations
 // ---------------------------------------------------------------------------
 
-export function addChannelMessage(channelName: string, msg: ChatMessage) {
-  const key = chatKey(channelName);
+export function addChannelMessage(server: string, channelName: string, msg: ChatMessage) {
+  const key = chatKey(server, channelName);
   channelMessages.update((map) => {
     const existing = map.get(key) ?? [];
     const msgs = [...existing, msg];
@@ -338,6 +353,7 @@ export function addChannelMessage(channelName: string, msg: ChatMessage) {
  * deleted is not brought back.
  */
 export function mergeChannelHistory(
+  server: string,
   channelName: string,
   incoming: unknown[],
   sharedBy: string,
@@ -349,7 +365,7 @@ export function mergeChannelHistory(
   const valid = sanitizeHistory(incoming, policyTtlSecs);
   if (valid.length === 0) return;
 
-  const key = chatKey(channelName);
+  const key = chatKey(server, channelName);
   const watermark = get(clearedBefore).get(key) ?? 0;
   let added = 0;
   channelMessages.update((map) => {
@@ -363,6 +379,7 @@ export function mergeChannelHistory(
 }
 
 export function addDmMessage(
+  server: string,
   myId: number,
   fromId: number,
   fromName: string,
@@ -371,9 +388,17 @@ export function addDmMessage(
 ) {
   const isEcho = fromId === myId;
   const peerId = isEcho ? toId : fromId;
+  // That server's open conversation, not the one on screen: an echo names its
+  // peer by what is open where it was sent.
+  const activeName = get(activeDmUsername.of(server));
+  const activeId = get(activeDmUserId.of(server));
+  // Read only if it is on screen: a conversation left open on a server the
+  // user has since switched away from is not being looked at, and its unread
+  // count is the only thing that puts a badge on that server's rail icon.
+  const onScreen = activeId === peerId && server === get(serverAddress);
   // Our own echo carries our name, not theirs; theirs is what the
   // conversation is filed under.
-  const key = dmKey(isEcho ? peerName(peerId, get(activeDmUsername) || "Unknown") : fromName);
+  const key = dmKey(server, isEcho ? peerName(server, peerId, activeName || "Unknown") : fromName);
 
   dmMessages.update((map) => {
     const existing = map.get(key) ?? [];
@@ -387,26 +412,26 @@ export function addDmMessage(
   scheduleSave();
 
   // Update DM conversations list
-  dmConversations.update((convos) => {
+  dmConversations.of(server).update((convos) => {
     const existing = convos.find((c) => c.user_id === peerId);
     if (existing) {
       // Only update peer name from incoming messages, not our own echo
       if (!isEcho) {
         existing.username = fromName;
       }
-      if (get(activeDmUserId) !== peerId) {
+      if (!onScreen) {
         existing.unread++;
       }
       return [...convos];
     } else {
       // New conversation: use sender name for incoming, active DM name for echo
-      const peerName = isEcho ? get(activeDmUsername) || "Unknown" : fromName;
+      const peerName = isEcho ? activeName || "Unknown" : fromName;
       return [
         ...convos,
         {
           user_id: peerId,
           username: peerName,
-          unread: get(activeDmUserId) === peerId ? 0 : 1,
+          unread: onScreen ? 0 : 1,
         },
       ];
     }
@@ -414,8 +439,8 @@ export function addDmMessage(
 }
 
 /** Show a text channel's chat, or (null) the chat of the channel we stand in. */
-export function openTextChannel(channelId: number | null) {
-  activeTextChannelId.set(channelId);
+export function openTextChannel(server: string, channelId: number | null) {
+  activeTextChannelId.of(server).set(channelId);
   // A preview outranks this in `displayChannelId`, so asking for a channel has
   // to drop one that is up: looking at any channel you are not in otherwise
   // wedges the pane there, and every later click on a channel you *are* in
@@ -426,52 +451,40 @@ export function openTextChannel(channelId: number | null) {
   // up at that moment is what they are reading. The one place that wants both —
   // clicking the voice channel you are in — drops the preview itself.
   if (channelId !== null) {
-    previewChannelId.set(null);
-    previewUsers.set([]);
+    previewChannelId.of(server).set(null);
+    previewUsers.of(server).set([]);
   }
-  closeDm();
+  closeDm(server);
 }
 
-export function openDm(userId: number, username: string, _myId: number) {
-  activeDmUserId.set(userId);
-  activeDmUsername.set(username);
+export function openDm(server: string, userId: number, username: string) {
+  activeDmUserId.of(server).set(userId);
+  activeDmUsername.of(server).set(username);
 
   // Clear unread for this conversation
-  dmConversations.update((convos) => {
+  dmConversations.of(server).update((convos) => {
     const c = convos.find((x) => x.user_id === userId);
     if (c) c.unread = 0;
     return [...convos];
   });
 }
 
-export function closeDm() {
-  activeDmUserId.set(null);
-  activeDmUsername.set("");
+export function closeDm(server: string) {
+  activeDmUserId.of(server).set(null);
+  activeDmUsername.of(server).set("");
 }
 
-/**
- * Forget the conversation list, on disconnect.
- *
- * The messages stay — they are filed by server and name and are the user's
- * history. The *list* is not: every row in it is a user id from the
- * connection that just ended, and the next connection hands those same
- * numbers to other people.
- */
-export function clearDmState() {
-  dmConversations.set([]);
-  closeDm();
-}
-
-export function incrementChannelUnread(channelName: string) {
-  const key = chatKey(channelName);
+export function incrementChannelUnread(server: string, channelName: string) {
+  const key = chatKey(server, channelName);
   unreadPerChannel.update((map) => {
     map.set(key, (map.get(key) ?? 0) + 1);
     return new Map(map);
   });
 }
 
-export function clearChannelUnread(channelName: string) {
-  const key = chatKey(channelName);
+export function clearChannelUnread(server: string, channelName: string) {
+  const key = chatKey(server, channelName);
+  if (!get(unreadPerChannel).has(key)) return;
   unreadPerChannel.update((map) => {
     map.delete(key);
     return new Map(map);
@@ -484,8 +497,8 @@ export function clearChannelUnread(channelName: string) {
  * The watermark is what makes that stick: every other member still holds a
  * copy, and without it the next one to share would hand it all straight back.
  */
-export function clearChannelChat(channelName: string) {
-  const key = chatKey(channelName);
+export function clearChannelChat(server: string, channelName: string) {
+  const key = chatKey(server, channelName);
   channelMessages.update((map) => {
     const newest = newestTimestamp(map.get(key) ?? []);
     if (newest > 0) {
@@ -503,8 +516,8 @@ export function clearChannelChat(channelName: string) {
  * Deliberate, and the only way past the watermark — deleting by accident is
  * recoverable, being re-handed what you meant to delete is not.
  */
-export function forgetClearedBefore(channelName: string) {
-  const key = chatKey(channelName);
+export function forgetClearedBefore(server: string, channelName: string) {
+  const key = chatKey(server, channelName);
   clearedBefore.update((marks) => {
     if (!marks.has(key)) return marks;
     const next = new Map(marks);
@@ -514,18 +527,18 @@ export function forgetClearedBefore(channelName: string) {
   scheduleSave();
 }
 
-export function clearDmChat(peerId: number, peerUsername: string) {
-  const key = dmKey(peerUsername);
+export function clearDmChat(server: string, peerId: number, peerUsername: string) {
+  const key = dmKey(server, peerUsername);
   dmMessages.update((map) => {
     map.delete(key);
     return new Map(map);
   });
-  dmConversations.update((convos) =>
+  dmConversations.of(server).update((convos) =>
     convos.filter((c) => c.user_id !== peerId),
   );
   // If we're viewing this DM, close it
-  if (get(activeDmUserId) === peerId) {
-    closeDm();
+  if (get(activeDmUserId.of(server)) === peerId) {
+    closeDm(server);
   }
   scheduleSave();
 }
@@ -546,16 +559,20 @@ export async function clearAllHistory() {
   }
   channelMessages.set(new Map());
   dmMessages.set(new Map());
-  dmConversations.set([]);
+  for (const server of get(dmConversations.all()).keys()) dmConversations.of(server).set([]);
   // The watermarks the backend kept are rewritten from what we just cleared
   scheduleSave();
 }
 
-/** A connection's subscriptions die with it, and so does what was unread in it. */
-export function clearTextChannels() {
-  joinedTextChannelIds.set(new Set());
-  activeTextChannelId.set(null);
-  // Counts belong to a session: nobody comes back to a badge for messages they
-  // were told about before the drop, and the next server's rows are not these.
-  unreadPerChannel.set(new Map());
+/**
+ * What was unread on one server goes with its connection. Counts belong to a
+ * session: nobody comes back to a badge for messages they were told about
+ * before the drop. The other servers' counts are theirs and stay.
+ */
+export function clearServerUnread(server: string) {
+  const prefix = `${serverKey(server)}/`;
+  unreadPerChannel.update((map) => {
+    const next = new Map([...map].filter(([key]) => !key.startsWith(prefix)));
+    return next.size === map.size ? map : next;
+  });
 }

@@ -172,6 +172,9 @@ export interface AppConfig {
   last_username: string | null;
   last_accept_self_signed: boolean | null;
   saved_servers: SavedServer[];
+  /** The servers that were open when the app last closed, reopened on start
+   *  with auto-connect. Empty in a config written before there was a list. */
+  open_servers: SavedServer[];
   /** Codec for our own screen share: "h264" (default) or "h265". */
   screen_share_codec: string;
   /** Render voices positionally in proximity channels. */

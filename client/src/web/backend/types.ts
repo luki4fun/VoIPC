@@ -8,10 +8,10 @@ import type { ProximityMode } from "../../lib/spatial";
 /** Codec of a screen share, as the protocol names it (voipc-protocol types.rs). */
 export type VideoCodec = "H264" | "H265" | "Vp8" | "Vp9";
 
-/** What the media modules may use from the live session. */
+/** What the media modules may use from the voice session. */
 export interface SessionContext {
   readonly sessionId: number;
-  /** Current channel id (0 = General, where no media is allowed). */
+  /** Current channel id (0 = not in voice, where no media is allowed). */
   readonly channelId: number;
   /** Installed media key for the current channel, or null while waiting. */
   /**
@@ -31,8 +31,13 @@ export interface SessionContext {
   nextScreenAudioSequence(): number;
   /** Send one raw media packet as a QUIC datagram. No-op when not connected. */
   sendDatagram(bytes: Uint8Array): void;
-  /** Send one encoded video frame on a stream of its own; false = dropped, uplink full. */
-  sendVideoFrame(body: Uint8Array): boolean;
+  /**
+   * Send one encoded video frame on a stream of its own; false = dropped,
+   * uplink full. A keyframe (`key`) may use a few slots a delta may not.
+   */
+  sendVideoFrame(body: Uint8Array, key: boolean): boolean;
+  /** Video frames still being written to the uplink (0 when not connected). */
+  videoBacklog(): number;
   /** Encode + send a ClientMessage (externally-tagged object or unit-variant string). */
   sendControl(msg: unknown): void;
   /**
@@ -42,13 +47,18 @@ export interface SessionContext {
    * thinking it is still a viewer.
    */
   stopWatching(): void;
+  /**
+   * Emit a per-connection event as `{server, data}`, tagged with this
+   * session's server. Device and test events stay bare and use events.ts.
+   */
+  emit(name: string, data?: unknown): void;
 }
 
 /** audio.ts — implemented by class AudioEngine. */
 export interface AudioApi {
-  /** Bind to a connected session (called by session.ts after Authenticated). */
+  /** Bind to the voice session (session.ts, once a server confirms a voice channel). */
   attach(ctx: SessionContext): void;
-  /** Session ended: stop capture, drop all playback sources, emit nothing. */
+  /** Voice ended or moved to another server: stop capture, drop all playback sources, emit nothing. */
   detach(): void;
   /**
    * Channel changed (UserList with a new channel id): drop playback sources
@@ -70,7 +80,9 @@ export interface AudioApi {
 
   // invoke() commands (same semantics as client/src-tauri/src/commands.rs)
   startTransmit(): Promise<void>;
+  /** Never fails, attached or not. */
   stopTransmit(): Promise<void>;
+  /** Flip the global flag, attached or not; commands.ts tells every server. */
   toggleMute(): Promise<boolean>;
   toggleDeafen(): Promise<boolean>;
   toggleNoiseSuppression(): Promise<boolean>;
@@ -161,7 +173,7 @@ export interface VideoApi {
 /** share.ts — sharing our own screen from the browser (implemented by ShareSender). */
 export interface ShareApi {
   attach(ctx: SessionContext): void;
-  /** Session ended: stop capture and encoding, send nothing. */
+  /** Voice ended or moved to another server: stop capture and encoding. */
   detach(): void;
   /** Whether this browser can share at all (WebCodecs + getDisplayMedia). */
   readonly available: boolean;

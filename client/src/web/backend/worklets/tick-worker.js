@@ -7,8 +7,11 @@
 // after five minutes hidden). Worker timers are not throttled that way, so the
 // share keeps its frame rate while the tab sits in the background.
 //
-// Only the Firefox path uses this: Chromium reads the capture track directly
-// through MediaStreamTrackProcessor, which is not throttled either.
+// Both paths use it. Firefox samples its <video> element on every tick.
+// Chromium reads the capture track directly through MediaStreamTrackProcessor,
+// which is not throttled either but is damage-driven: a still screen sends no
+// frames, so the tick is what encodes the last one again when a keyframe or a
+// held-back frame is owed.
 //
 // Protocol: postMessage({ type: "start", intervalMs }) begins ticking,
 // { type: "stop" } ends it. Each tick is an empty message — the main thread

@@ -8,8 +8,8 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use super::{
-    AudioProcessor, CapturedFrame, DisplayInfo, FrameProcessor, FrameSlot, PixFmt, WindowInfo,
-    SCREEN_AUDIO_BITRATE, SCREEN_AUDIO_FRAME_SIZE,
+    run_encode_loop, AudioProcessor, CapturedFrame, DisplayInfo, FrameProcessor, FrameSlot,
+    PixFmt, WindowInfo, SCREEN_AUDIO_BITRATE, SCREEN_AUDIO_FRAME_SIZE,
 };
 
 /// An active XDG Desktop Portal ScreenCast session.
@@ -267,18 +267,17 @@ fn run_pipewire_capture(
         full_res_i420_buf: Vec::new(),
         converter: None,
         frame_id: 0,
-        keyframe_interval: voipc_video::KEYFRAME_INTERVAL_SECS * target_fps,
+        last_idr: None,
         start_time,
         target_width,
         target_height,
         active: active.clone(),
-        keyframe_requested: keyframe_requested.clone(),
+        keyframe_requested,
         loss_ms: loss_ms.clone(),
         base_bitrate_kbps: bitrate,
         base_fps: target_fps,
         level: 0,
         level_changed: Instant::now(),
-        frame_counter: 0,
         video_tx,
         session_id,
         media_key: media_key.clone(),
@@ -295,17 +294,7 @@ fn run_pipewire_capture(
     let encode_thread = std::thread::Builder::new()
         .name("pw-encode".into())
         .spawn(move || {
-            let mut processor = processor;
-            while let Some(frame) = encode_slot.take() {
-                processor.process(
-                    &frame.pixels,
-                    frame.width,
-                    frame.height,
-                    frame.stride,
-                    frame.fmt,
-                );
-                encode_slot.recycle(frame.pixels);
-            }
+            run_encode_loop(&encode_slot, processor);
             info!("PipeWire encode thread stopped");
         })
         .map_err(|e| format!("Failed to spawn encode thread: {e}"))?;
@@ -318,7 +307,6 @@ fn run_pipewire_capture(
     // ── PipeWire video stream ────────────────────────────────────────────
     // The process callback is now lightweight (memcpy only); encoding
     // happens on the separate encode thread via the FrameSlot.
-    let frame_interval = std::time::Duration::from_secs_f64(1.0 / target_fps.max(1) as f64);
     let capture_state = RefCell::new(PwVideoState {
         slot: slot.clone(),
         reuse_buf: Vec::new(),
@@ -326,8 +314,6 @@ fn run_pipewire_capture(
         negotiated_height: 0,
         negotiated_stride: 0,
         negotiated_format: PixFmt::Unknown,
-        frame_interval,
-        next_frame: Instant::now(),
     });
 
     let _listener = stream
@@ -382,19 +368,13 @@ fn run_pipewire_capture(
                 return; // Format not fully negotiated yet
             }
 
-            // Skip frames above target fps before paying for the memcpy
-            // (buffer is already dequeued; PipeWire recycles it on return).
-            // The deadline advances by one interval rather than resetting to
-            // now, so the average holds at target fps instead of quantizing to
-            // a subharmonic of the compositor's refresh rate (144 Hz → 60 fps
-            // would otherwise give 48). Clamped to now after a stall.
-            let now = Instant::now();
-            if now < state.next_frame {
-                return;
-            }
-            state.next_frame = (state.next_frame + state.frame_interval).max(now);
-
             // Copy frame data out of PipeWire buffer (returned to PipeWire on callback exit).
+            // Every buffer is copied and put; the newest wins and the encode
+            // thread paces, so it always sees the frame a burst ended on.
+            // ponytail: one memcpy per compositor frame, including those the
+            // encoder replaces unseen (~1.2 GB/s for 1080p at 144 Hz);
+            // upgrade: hold the newest pw_buffer and copy it only when the
+            // encoder takes it.
             if state.reuse_buf.capacity() == 0 {
                 if let Some(b) = state.slot.take_spare() {
                     state.reuse_buf = b;
@@ -444,7 +424,6 @@ fn run_pipewire_capture(
         .map_err(|e| format!("Stream connect: {e}"))?;
 
     info!("PipeWire video stream started (node {})", node_id);
-    keyframe_requested.store(true, Ordering::Relaxed);
 
     // ── Audio stream (desktop audio via default sink monitor) ──
     let audio_props = {
@@ -587,10 +566,6 @@ struct PwVideoState {
     negotiated_height: u32,
     negotiated_stride: u32,
     negotiated_format: PixFmt,
-    /// Pace to the target fps: compositors treat the framerate hint as a hint
-    /// and may deliver at native refresh (e.g. 144 Hz).
-    frame_interval: std::time::Duration,
-    next_frame: Instant,
 }
 
 // ── SPA format pod building/parsing ─────────────────────────────────────

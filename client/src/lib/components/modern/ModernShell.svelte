@@ -22,12 +22,12 @@
   import { centreView, currentProximity } from "../../stores/room.js";
   import { watchingUserId } from "../../stores/screenshare.js";
   import { micLane } from "../../stores/mixer.js";
-  import { pendingConnect } from "../../stores/server-switch.js";
-  import { connectionState } from "../../stores/connection.js";
-  import { invoke } from "@tauri-apps/api/core";
+  import { voice } from "../../stores/channels.js";
+  import { showConnectDialog } from "../../connect.js";
 
   import ChatPanel from "../ChatPanel.svelte";
   import MobilePTT from "../MobilePTT.svelte";
+  import ReconnectOverlay from "../ReconnectOverlay.svelte";
   import VoiceControls from "../VoiceControls.svelte";
   import Icon from "../Icons.svelte";
 
@@ -104,21 +104,16 @@
   const panels = $derived($activePanels);
   const defaults = defaultPanels("modern");
 
-  function addServer() {
-    // Nothing to connect *to* yet — bring up the dialog by leaving the server.
-    // With one connection that is what "add a server" can honestly mean.
-    if ($connectionState === "connected") {
-      pendingConnect.set(null);
-      invoke("disconnect").catch(() => {});
-      connectionState.set("disconnected");
-    }
-  }
+  // The talk button is for the call: out of voice there is nothing it could
+  // open, and the space it takes goes back to the chat.
+  const showPtt = $derived($isMobile && $voice !== null);
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
   class="modern-shell"
   class:mobile={$isMobile}
+  class:ptt={showPtt}
   bind:this={shell}
   style="--sidebar-width: {panels.sidebar}px; --memberlist-width: {panels.members}px; --ptt-space: {pttHeight}px;"
   oncontextmenu={(e) => e.preventDefault()}
@@ -136,7 +131,7 @@
     }}
   >
   <div class="pane pane-left">
-  <ServerRail onadd={addServer} />
+  <ServerRail onadd={() => showConnectDialog.set(true)} />
 
   {#if panels.sidebar_open}
     <div class="sidebar">
@@ -167,6 +162,7 @@
   <div class="pane pane-main">
   <main class="content">
     <ChatPanel headerExtra={headerControls} />
+    <ReconnectOverlay />
   </main>
   {#if pane !== 1}
     <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
@@ -195,7 +191,7 @@
   {/if}
   </div>
 
-  {#if $isMobile}
+  {#if showPtt}
     <div class="mobile-ptt-bar" bind:clientHeight={pttHeight}><MobilePTT /></div>
   {/if}
 </div>
@@ -304,6 +300,7 @@
   }
 
   .content {
+    position: relative;
     display: flex;
     flex-direction: column;
     flex: 1;
@@ -339,8 +336,9 @@
   }
 
   /* Room for the push-to-talk button, which is `position: fixed` and so makes
-     room for itself nowhere. It is rendered on `$isMobile` rather than on a
-     width, so the space it needs is reserved on the same condition — the
+     room for itself nowhere. It is rendered on `$isMobile` (and only in voice)
+     rather than on a width, so the space it needs is reserved on the same
+     condition, `.ptt` — the
      container query below is about the shape of the panes, and in landscape it
      does not match while the bar is still there. Both columns it covers get it:
      the message list, and the drawer, whose foot is your own name with the
@@ -348,8 +346,8 @@
      pane: outside the container query below a pane is `display: contents`, and
      padding on a box that generates none does nothing — which is how landscape
      came to keep its own version of this bug. */
-  .modern-shell.mobile .pane-main .content,
-  .modern-shell.mobile .pane-left .sidebar {
+  .modern-shell.ptt .pane-main .content,
+  .modern-shell.ptt .pane-left .sidebar {
     padding-bottom: calc(var(--ptt-space, 64px) + 16px);
   }
 

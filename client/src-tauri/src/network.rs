@@ -31,6 +31,22 @@ use crate::app_state::{ActiveConnection, AppState, LossTally, PendingTarget, Sdk
 use crate::screenshare;
 use crate::transport::CONNECT_TIMEOUT;
 
+/// Emit an event that belongs to one server, as `{server, data}` with `data`
+/// exactly the payload it always had, so the UI files it under that server.
+pub fn emit_server<S: serde::Serialize + Clone>(
+    app: &tauri::AppHandle,
+    server: &str,
+    event: &str,
+    data: S,
+) {
+    #[derive(serde::Serialize, Clone)]
+    struct Tagged<'a, S> {
+        server: &'a str,
+        data: S,
+    }
+    let _ = app.emit(event, Tagged { server, data });
+}
+
 /// Connect to the server, authenticate, spawn background tasks, and store the connection.
 /// Returns the assigned user_id on success.
 pub async fn connect_to_server(
@@ -40,40 +56,32 @@ pub async fn connect_to_server(
     username: String,
     accept_invalid_certs: bool,
 ) -> Result<u32, String> {
-    // Serialize connects: the reconnect loop and a manual connect can race,
-    // and the write lock below is released before the network phase — the
-    // loser's tasks would otherwise be overwritten without teardown and leak.
-    let _connect_guard = state.connect_lock.lock().await;
+    // Serialize connects to this server: the reconnect loop and a manual
+    // connect can race, and the map lock is not held through the network
+    // phase — the loser's tasks would otherwise be overwritten without
+    // teardown and leak. Other servers connect in parallel.
+    let connect_lock = state
+        .connect_locks
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .entry(address.clone())
+        .or_default()
+        .clone();
+    let _connect_guard = connect_lock.lock().await;
 
-    // Tear down any existing connection first (e.g. after webview reload)
-    {
-        let mut conn = state.connection.write().await;
-        if let Some(mut old) = conn.take() {
-            old.transmitting.store(false, std::sync::atomic::Ordering::Relaxed);
-            old.screen_share_active.store(false, std::sync::atomic::Ordering::Relaxed);
-            if let Some(task) = old.capture_task.take() { let _ = task.await; }
-            if let Some(task) = old.screen_capture_task.take() { let _ = task.await; }
-            let _ = send_tcp_message(&old.tcp_tx, &ClientMessage::Disconnect).await;
-            drop(old.tcp_tx);
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            for task in old.tasks { task.abort(); }
-            drop(old.voice_tx);
-            drop(old.video_tx);
-            drop(old.screen_audio_tx);
-            old.quic.close().await;
-            info!("cleaned up stale connection before reconnecting");
-        }
+    // Replace only this server's connection (e.g. after webview reload). Out of
+    // the map under the lock, torn down outside it.
+    let old = state.connections.write().await.remove(&address);
+    if let Some(old) = old {
+        teardown(state, &app_handle, &address, old).await;
+        info!(server = %address, "cleaned up stale connection before reconnecting");
     }
 
     // Fresh Signal identity per connection (ephemeral by design — no accounts,
     // nothing to fingerprint). Also required for correctness: the server
     // reassigns user ids on restart, and libsignal pins identities to
     // "user_N", so a kept store would reject the new holder of an old id.
-    {
-        let mut signal = state.signal.lock().map_err(|e| e.to_string())?;
-        signal.stores = None;
-        signal.initialized = false;
-    }
+    let signal = Arc::new(std::sync::Mutex::new(SignalState::default()));
 
     let (host, port) = parse_address(&address)?;
 
@@ -86,7 +94,7 @@ pub async fn connect_to_server(
 
     // Initialize Signal Protocol state if not already done
     {
-        let mut signal = state.signal.lock().map_err(|e| e.to_string())?;
+        let mut signal = signal.lock().map_err(|e| e.to_string())?;
         if !signal.initialized {
             info!("initializing Signal Protocol state");
             let identity_key_pair = voipc_crypto::generate_identity_key_pair();
@@ -115,7 +123,7 @@ pub async fn connect_to_server(
 
     // Extract identity key and prekey bundle from Signal stores for authentication
     let (identity_key, prekey_bundle) = {
-        let signal = state.signal.lock().map_err(|e| e.to_string())?;
+        let signal = signal.lock().map_err(|e| e.to_string())?;
         if let Some(ref stores) = signal.stores {
             let ik_bytes = stores.identity.key_pair.public_key.clone();
 
@@ -220,38 +228,23 @@ pub async fn connect_to_server(
 
     info!(user_id, session_id, "authenticated with server");
 
-    // Reset Signal tracking state for the new connection. User ids are
-    // allocated fresh by the server, so everything keyed by one is stale — and
-    // the stores themselves were dropped at the top of this function, where a
-    // fresh identity is minted for the connection.
-    {
-        let mut signal = state.signal.lock().map_err(|e| e.to_string())?;
-        signal.own_user_id = Some(user_id);
-        signal.established_sessions.clear();
-        signal.pending_sessions.clear();
-        signal.pending_messages.clear();
-        signal.channels.clear();
-    }
+    // The Signal state is this connection's own from birth, so all it needs
+    // now is to know who we are here.
+    signal
+        .lock()
+        .map_err(|e| e.to_string())?
+        .own_user_id = Some(user_id);
 
-    // Start audio playback stream (output to speakers). Failure is not fatal:
-    // the mixer task retries via the restart flag and surfaces an event.
-    let settings = state.settings.read().await;
-    let output_device = settings.output_device.clone();
-    let saved_volume = settings.volume;
-    drop(settings);
-
+    // No playback stream yet: the mixer opens one when this connection takes
+    // voice, and nothing here is audible before that.
+    let output_device = state.settings.read().await.output_device.clone();
     let playback_restart = Arc::new(AtomicBool::new(false));
-    let (playback_stream, playback_producer) =
-        match voipc_audio::playback::start_playback(output_device.as_deref(), playback_restart.clone()) {
-            Ok((s, p)) => (Some(s), Some(p)),
-            Err(e) => {
-                error!("Failed to start audio playback (will retry): {}", e);
-                playback_restart.store(true, Ordering::Relaxed);
-                (None, None)
-            }
-        };
+    // The device tells the mixer it took a frame, so the mixer refills on the
+    // device's clock instead of on a timer that drifts against it.
+    let playback_wake = Arc::new(tokio::sync::Notify::new());
     let output_device_live = Arc::new(std::sync::Mutex::new(output_device));
-    let master_volume = Arc::new(AtomicU32::new(saved_volume.to_bits()));
+    let server: Arc<str> = Arc::from(address.as_str());
+    let is_voice = Arc::new(AtomicBool::new(false));
 
     // Control writer channel.
     //
@@ -295,13 +288,12 @@ pub async fn connect_to_server(
 
     // Video decode channel — assembled video frames sent to a blocking decode task
     // to avoid stalling the UDP receiver (which also handles voice).
-    // Tuple: (frame_data, is_keyframe) — the decode task needs is_keyframe to know
-    // when it's safe to resume rendering after corruption suppression.
-    let (video_decode_tx, video_decode_rx) = mpsc::channel::<(Vec<u8>, bool)>(64);
+    // Tuple: (frame_data, is_keyframe, gap_before), in order, so the decode task
+    // sees each loss exactly where it happened.
+    let (video_decode_tx, video_decode_rx) = mpsc::channel::<(Vec<u8>, bool, bool)>(64);
 
-    // Render suppression flag — set by UDP receiver on frame loss, cleared by decode
-    // task when a keyframe is successfully decoded. Prevents displaying gray/corrupted
-    // delta frames that the decoder produces after reference chain breakage.
+    // Render suppression flag — set by the decode task while its reference chain
+    // is broken; the stream receiver re-requests a keyframe while it is set.
     let needs_keyframe = Arc::new(AtomicBool::new(false));
 
     // Last frame-loss signal for our own share (viewer reports, our own path
@@ -345,20 +337,6 @@ pub async fn connect_to_server(
     // Per-user jitter buffers + decoders — UDP receiver pushes, mixer pops
     let mix_sources: MixSources = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-    // Mute/deafen — initialize from persisted settings
-    let (saved_muted, saved_deafened, saved_voice_mode, saved_vad_db, saved_ns) = {
-        let s = state.settings.read().await;
-        (
-            s.muted,
-            s.deafened,
-            s.voice_mode.clone(),
-            s.vad_threshold_db,
-            s.noise_suppression,
-        )
-    };
-    let is_muted = Arc::new(AtomicBool::new(saved_muted));
-    let is_deafened = Arc::new(AtomicBool::new(saved_deafened));
-
     // Spawn background tasks
     let connection = quic.connection.clone();
     let writer_handle = tokio::spawn(control_writer_task(control_send, tcp_rx));
@@ -368,7 +346,7 @@ pub async fn connect_to_server(
         app_handle.clone(),
         current_media_key.clone(),
         current_channel_id.clone(),
-        state.signal.clone(),
+        signal.clone(),
         tcp_tx.clone(),
         user_id,
         screen_share_active.clone(),
@@ -378,6 +356,9 @@ pub async fn connect_to_server(
         share_loss_tally.clone(),
         spatial.clone(),
         channels_snapshot.clone(),
+        server.clone(),
+        is_voice.clone(),
+        transmitting.clone(),
     ));
     let udp_send_handle = tokio::spawn(datagram_sender_task(connection.clone(), voice_rx));
     let video_send_handle = tokio::spawn(video_stream_sender_task(connection.clone(), video_rx));
@@ -385,20 +366,20 @@ pub async fn connect_to_server(
         tokio::spawn(datagram_sender_task(connection.clone(), screen_audio_rx));
     let video_decode_handle = tokio::task::spawn_blocking({
         let app_handle = app_handle.clone();
-        let tcp_tx = tcp_tx.clone();
         let watching_uid = watching_user_id_shared.clone();
         let watch_codec = watching_codec.clone();
         let video_res = screen_video_resolution.clone();
         let needs_kf = needs_keyframe.clone();
+        let server = server.clone();
         move || {
             video_decode_render_task(
                 video_decode_rx,
                 app_handle,
-                tcp_tx,
                 watching_uid,
                 watch_codec,
                 video_res,
                 needs_kf,
+                server,
             )
         }
     });
@@ -415,6 +396,8 @@ pub async fn connect_to_server(
         current_media_key.clone(),
         current_channel_id.clone(),
         spatial.clone(),
+        server.clone(),
+        is_voice.clone(),
     ));
     let video_recv_handle = tokio::spawn(video_stream_receiver_task(
         connection.clone(),
@@ -429,27 +412,32 @@ pub async fn connect_to_server(
         needs_keyframe,
     ));
 
-    // Voice mixer — pops one frame per user per 20ms tick, mixes, and feeds
-    // the playback ring. Owns the playback stream (rebuilds it on error).
+    // Voice mixer — pops one 20ms frame per user whenever the playback ring
+    // has room, mixes, and feeds it. Owns the playback stream, which it holds
+    // only while this connection has voice (rebuilds it on error).
     let mixer_handle = tokio::spawn(voice_mixer_task(
         mix_sources,
-        playback_stream,
-        playback_producer,
         playback_restart.clone(),
+        playback_wake,
         output_device_live.clone(),
-        is_deafened.clone(),
+        state.is_deafened.clone(),
         user_volumes.clone(),
         user_fx.clone(),
         source_levels.clone(),
         spatial.clone(),
-        master_volume.clone(),
+        state.master_volume.clone(),
         voice_frames_played.clone(),
         voice_frames_lost.clone(),
         app_handle.clone(),
+        is_voice.clone(),
     ));
 
     // Latency display from QUIC's RTT estimate (NAT keepalives are QUIC's job)
-    let latency_handle = tokio::spawn(latency_task(connection.clone(), app_handle.clone()));
+    let latency_handle = tokio::spawn(latency_task(
+        connection.clone(),
+        app_handle.clone(),
+        server.clone(),
+    ));
     // Re-announce our position once a second while syncing it
     let position_sequence = Arc::new(AtomicU32::new(0));
     let beacon_handle = tokio::spawn(position_beacon_task(
@@ -468,25 +456,21 @@ pub async fn connect_to_server(
         share_loss_ms.clone(),
     ));
 
-    // Nobody is holding the microphone on a connection that did not exist a
-    // moment ago. Both flags outlive a connection (they are app state, not
-    // connection state), and a game's hold that survived a reconnect would sit
-    // there refusing to let the user's own key close the capture.
-    state
-        .ptt_sdk
-        .store(false, std::sync::atomic::Ordering::Relaxed);
-    state
-        .ptt_user
-        .store(false, std::sync::atomic::Ordering::Relaxed);
+    // No PTT reset here any more: the holds belong to the voice connection,
+    // and another server connecting must not drop them. They are released
+    // where voice ends instead (`release_holds`).
 
     // Store the active connection
+    let tcp = tcp_tx.clone();
     let connection = ActiveConnection {
         user_id,
         username,
         server_address: address.clone(),
         session_id,
-        is_muted,
-        is_deafened,
+        is_muted: state.is_muted.clone(),
+        is_deafened: state.is_deafened.clone(),
+        signal,
+        is_voice,
         tcp_tx,
         voice_tx,
         video_tx,
@@ -509,7 +493,7 @@ pub async fn connect_to_server(
         transmitting,
         capture_task: None,
         voice_sequence: Arc::new(AtomicU32::new(0)),
-        master_volume,
+        master_volume: state.master_volume.clone(),
         voice_frames_played,
         voice_frames_lost,
         output_device_live,
@@ -535,12 +519,10 @@ pub async fn connect_to_server(
         screen_video_resolution,
         current_media_key,
         current_channel_id,
-        voice_mode: Arc::new(AtomicU8::new(
-            crate::app_state::VoiceMode::from_str(&saved_voice_mode) as u8,
-        )),
-        vad_threshold_db: Arc::new(AtomicI32::new(saved_vad_db as i32)),
+        voice_mode: state.voice_mode.clone(),
+        vad_threshold_db: state.vad_threshold_db.clone(),
         current_audio_level: Arc::new(AtomicI32::new(-9600)),
-        noise_suppression: Arc::new(AtomicBool::new(saved_ns)),
+        noise_suppression: state.noise_suppression.clone(),
         user_volumes,
         user_fx,
         source_levels,
@@ -549,35 +531,210 @@ pub async fn connect_to_server(
         position_sequence,
     };
 
-    let mut conn = state.connection.write().await;
-    *conn = Some(connection);
+    state
+        .connections
+        .write()
+        .await
+        .insert(address.clone(), connection);
 
-    // Notify server of persisted mute/deafen state
-    if saved_muted {
-        if let Some(c) = conn.as_ref() {
-            let _ = send_tcp_message(&c.tcp_tx, &ClientMessage::SetMuted { muted: true }).await;
-        }
+    // Notify server of our mute/deafen state
+    if state.is_muted.load(Ordering::Relaxed) {
+        let _ = send_tcp_message(&tcp, &ClientMessage::SetMuted { muted: true }).await;
     }
-    if saved_deafened {
-        if let Some(c) = conn.as_ref() {
-            let _ =
-                send_tcp_message(&c.tcp_tx, &ClientMessage::SetDeafened { deafened: true }).await;
-        }
+    if state.is_deafened.load(Ordering::Relaxed) {
+        let _ = send_tcp_message(&tcp, &ClientMessage::SetDeafened { deafened: true }).await;
     }
     // ...and whether we answer requests for recent chat, so the people here
     // can see who asking would reach.
-    {
-        let enabled = state.config().share_channel_history;
-        if let Some(c) = conn.as_ref() {
-            let _ = send_tcp_message(
-                &c.tcp_tx,
-                &ClientMessage::SetHistorySharing { enabled },
-            )
-            .await;
-        }
-    }
+    let enabled = state.config().share_channel_history;
+    let _ = send_tcp_message(&tcp, &ClientMessage::SetHistorySharing { enabled }).await;
 
     Ok(user_id)
+}
+
+/// Close one connection for good: its microphone and screen capture, the
+/// server's view of us, every task, and QUIC.
+///
+/// Called with the entry already out of `AppState::connections`, never under
+/// that lock: this awaits the capture tasks, sleeps and closes QUIC for up to
+/// half a second, and PTT and every other server would wait behind it.
+pub async fn teardown(
+    state: &AppState,
+    app: &tauri::AppHandle,
+    server: &str,
+    mut connection: ActiveConnection,
+) {
+    connection.is_voice.store(false, Ordering::Relaxed);
+    if clear_voice(state, server) {
+        release_holds(app);
+    }
+
+    // Stop any ongoing voice capture
+    connection.transmitting.store(false, Ordering::Relaxed);
+    if let Some(task) = connection.capture_task.take() {
+        let _ = task.await;
+    }
+
+    // Stop any ongoing screen capture
+    connection.screen_share_active.store(false, Ordering::Relaxed);
+    if let Some(task) = connection.screen_capture_task.take() {
+        let _ = task.await;
+    }
+
+    // Close capture session (stops screen capture)
+    connection.capture_session = None;
+
+    // Send graceful disconnect, then drop tcp_tx so writer can flush and exit
+    let _ = send_tcp_message(&connection.tcp_tx, &ClientMessage::Disconnect).await;
+    drop(connection.tcp_tx);
+
+    // Give the writer task a moment to flush the disconnect message
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // Now abort remaining background tasks
+    for task in connection.tasks {
+        task.abort();
+    }
+
+    // Drop voice/video/screen-audio channels (the aborted mixer task
+    // owned and released the playback stream)
+    drop(connection.voice_tx);
+    drop(connection.video_tx);
+    drop(connection.screen_audio_tx);
+
+    // Tell the server right away (otherwise it holds the username until
+    // its idle timeout and a quick reconnect gets "already taken")
+    connection.quic.close().await;
+}
+
+/// Forget that `server` holds voice, if it does. Returns whether it did.
+fn clear_voice(state: &AppState, server: &str) -> bool {
+    let mut voice = state.voice_server.lock().unwrap_or_else(|p| p.into_inner());
+    if voice.as_deref() == Some(server) {
+        *voice = None;
+        true
+    } else {
+        false
+    }
+}
+
+/// Voice ended, so nobody is holding the microphone any more: not the user's
+/// key, not a game's. Both flags outlive a connection (they are app state),
+/// and a game's hold that survived would sit there refusing to let the user's
+/// own key close the next capture.
+pub(crate) fn release_holds(app: &tauri::AppHandle) {
+    let state = app.state::<AppState>();
+    state.ptt_user.store(false, Ordering::Relaxed);
+    if state.ptt_sdk.swap(false, Ordering::Relaxed) {
+        let _ = app.emit("sdk-transmit", serde_json::json!({ "held": false }));
+    }
+}
+
+/// Our side of a screen share on a connection that is leaving voice. The
+/// capture stops on its flag by itself (nobody here may wait for it), and the
+/// portal session goes with it, so the system's "sharing your screen"
+/// indicator does not outlive the call. Returns whether a share was running.
+fn end_screen_share(c: &mut ActiveConnection) -> bool {
+    c.screen_share_active.store(false, Ordering::Relaxed);
+    c.screen_capture_task = None;
+    c.capture_session = None;
+    c.watching_user_id = None;
+    std::mem::replace(&mut c.is_screen_sharing, false)
+}
+
+/// This connection's server confirmed a voice channel: voice is here now.
+///
+/// The latest confirmation wins. If another server held voice, it is left
+/// right here — its microphone stops, its mixer closes the playback stream,
+/// and its server is asked to take us out of the room. This is the one place
+/// the backend leaves voice on its own, which also covers joins the UI never
+/// asked for (a game's `hello`, the auto-join after creating a channel).
+async fn claim_voice(app: &tauri::AppHandle, server: &str, is_voice: &Arc<AtomicBool>) {
+    let state = app.state::<AppState>();
+    let mut conns = state.connections.write().await;
+    // A connection on its way out is no longer the entry under its id, and a
+    // join it confirms while dying must not take voice from anybody.
+    if !conns
+        .get(server)
+        .is_some_and(|c| Arc::ptr_eq(&c.is_voice, is_voice))
+    {
+        return;
+    }
+    let previous = state
+        .voice_server
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .replace(server.to_string());
+    let moved = previous.filter(|p| p != server);
+    if let Some(other) = moved.as_deref().and_then(|p| conns.get_mut(p)) {
+        other.is_voice.store(false, Ordering::Relaxed);
+        if other.transmitting.swap(false, Ordering::Relaxed) {
+            // So the room we leave hears the phrase end rather than a stall
+            let eot = VoicePacket::end_of_transmission(other.session_id, 0);
+            let _ = other.voice_tx.try_send(eot.to_bytes());
+        }
+        if end_screen_share(other) {
+            let _ = send_tcp_message(&other.tcp_tx, &ClientMessage::StopScreenShare).await;
+        }
+        if other.watching_user_id_shared.swap(0, Ordering::Relaxed) != 0 {
+            let _ =
+                send_tcp_message(&other.tcp_tx, &ClientMessage::StopWatchingScreenShare).await;
+        }
+        // A game driving the old room is detached now, before this claim
+        // lets a `hello` waiting on this server return and subscribe afresh.
+        // Left for the old server's leave to do, the Detached would land on
+        // that new subscription and wipe the hello it just completed.
+        if disarm_spatial(&other.spatial) {
+            state.sdk_event(crate::app_state::SdkEvent::Detached);
+        }
+        // ponytail: asked once, never retried. A refusal (the join budget is
+        // channel_budget+4 with a 2/s refill) leaves us standing in that room
+        // with nothing open — the microphone and the speakers there closed
+        // above — until the user leaves it themselves.
+        let _ = send_tcp_message(
+            &other.tcp_tx,
+            &ClientMessage::JoinChannel {
+                channel_id: 0,
+                password: None,
+            },
+        )
+        .await;
+        info!(from = ?moved, to = server, "voice moved to another server");
+    }
+    // Still under the lock: two servers confirming at once must end with one
+    // of them audible, and the later claim is the one that clears the other.
+    is_voice.store(true, Ordering::Relaxed);
+    drop(conns);
+    if moved.is_some() {
+        release_holds(app);
+    }
+}
+
+/// This connection is in no voice channel any more — its server confirmed
+/// channel 0 (the leave we asked for, a kick, an admin move), or the link
+/// died. The microphone closes whatever held it open: a voice-activated
+/// capture would otherwise go on sending into nowhere.
+async fn leave_voice(
+    app: &tauri::AppHandle,
+    server: &str,
+    is_voice: &Arc<AtomicBool>,
+    transmitting: &AtomicBool,
+) {
+    transmitting.store(false, Ordering::Relaxed);
+    is_voice.store(false, Ordering::Relaxed);
+    let state = app.state::<AppState>();
+    if let Some(c) = state
+        .connections
+        .write()
+        .await
+        .get_mut(server)
+        .filter(|c| Arc::ptr_eq(&c.is_voice, is_voice))
+    {
+        end_screen_share(c);
+    }
+    if clear_voice(&state, server) {
+        release_holds(app);
+    }
 }
 
 /// Send a client message over the control stream.
@@ -715,12 +872,17 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     share_loss_tally: Arc<std::sync::Mutex<LossTally>>,
     spatial: Arc<std::sync::Mutex<crate::app_state::SpatialState>>,
     channels_snapshot: Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
+    server: Arc<str>,
+    is_voice: Arc<AtomicBool>,
+    transmitting: Arc<AtomicBool>,
 ) {
     'read: loop {
         match read_half.read_buf(&mut buf).await {
             Ok(0) => {
                 info!("server closed the control stream");
-                let _ = app_handle.emit(
+                emit_server(
+                    &app_handle,
+                    &server,
                     "connection-lost",
                     serde_json::json!({"reason": "Server closed connection"}),
                 );
@@ -729,7 +891,9 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
             Ok(_) => {}
             Err(e) => {
                 error!("control read error: {}", e);
-                let _ = app_handle.emit(
+                emit_server(
+                    &app_handle,
+                    &server,
                     "connection-lost",
                     serde_json::json!({"reason": format!("Connection lost: {}", e)}),
                 );
@@ -756,6 +920,9 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
                             &share_loss_tally,
                             &spatial,
                             &channels_snapshot,
+                            &server,
+                            &is_voice,
+                            &transmitting,
                         )
                         .await;
                     }
@@ -766,7 +933,9 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
                     // The bad length prefix is never consumed; reading on
                     // would only grow `buf` forever. Treat as a dead link.
                     error!("frame decode error: {}", e);
-                    let _ = app_handle.emit(
+                    emit_server(
+                        &app_handle,
+                        &server,
                         "connection-lost",
                         serde_json::json!({"reason": format!("Protocol error: {}", e)}),
                     );
@@ -775,6 +944,9 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
             }
         }
     }
+    // A dead link is not a call: the UI stops treating this server as the
+    // voice one on `connection-lost`, and so does everything here.
+    leave_voice(&app_handle, &server, &is_voice, &transmitting).await;
     info!("control reader task ended");
 }
 
@@ -808,25 +980,10 @@ fn on_channel_changed(
     cache: &Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
     channel_id: u32,
     app_handle: &tauri::AppHandle,
+    server: &str,
+    is_voice: &AtomicBool,
 ) {
-    let was_driven = {
-        let mut sp = match spatial.lock() {
-            Ok(s) => s,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        // A game drives one channel: somewhere else its ids match nobody, and
-        // leaving culling armed would silence everyone here. The mod's next
-        // update is refused and tells it to say hello again.
-        let was_driven = sp.sdk_channel.is_some();
-        sp.sdk_active = false;
-        // Before `sync`, not after: `clear_positions` hands a beaconing game's
-        // borrowed sharing back to whatever the user's own switch said, and
-        // doing it the other way round re-armed their position sync in the
-        // channel they just walked into.
-        sp.clear_positions();
-        sp.sync = false;
-        was_driven
-    };
+    let was_driven = disarm_spatial(spatial);
     // Told rather than inferred: a mod that has gone quiet would otherwise keep
     // receiving who-speaks-when for the channel the user just moved into, right
     // up until its socket dies.
@@ -835,12 +992,38 @@ fn on_channel_changed(
     // channel *causes* this call, and telling the socket it was detached from
     // the join it just asked for left it with no user id: no talk pushes, and
     // `transmit` answered "send hello first" until the mod said hello twice.
+    //
+    // Not gated on voice like the other SDK events: only the connection a
+    // game drives has `sdk_channel` set. When voice moves to another server,
+    // `claim_voice` disarms the old one on the spot, so its leave arriving
+    // later finds nothing driven here and cannot detach a hello made since.
     if was_driven {
         app_handle
             .state::<AppState>()
             .sdk_event(crate::app_state::SdkEvent::Detached);
     }
-    apply_channel_proximity(spatial, cache, channel_id, app_handle);
+    apply_channel_proximity(spatial, cache, channel_id, app_handle, server, is_voice);
+}
+
+/// Take the game's hands off a connection's spatial state: the channel it
+/// drove is gone, or voice is. Returns whether a game was driving it.
+fn disarm_spatial(spatial: &std::sync::Mutex<crate::app_state::SpatialState>) -> bool {
+    let mut sp = match spatial.lock() {
+        Ok(s) => s,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // A game drives one channel: somewhere else its ids match nobody, and
+    // leaving culling armed would silence everyone here. The mod's next
+    // update is refused and tells it to say hello again.
+    let was_driven = sp.sdk_channel.is_some();
+    sp.sdk_active = false;
+    // Before `sync`, not after: `clear_positions` hands a beaconing game's
+    // borrowed sharing back to whatever the user's own switch said, and
+    // doing it the other way round re-armed their position sync in the
+    // channel they just walked into.
+    sp.clear_positions();
+    sp.sync = false;
+    was_driven
 }
 
 /// The members of a roster we would ask for recent chat, picked by
@@ -876,6 +1059,8 @@ fn apply_channel_proximity(
     cache: &Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
     channel_id: u32,
     app_handle: &tauri::AppHandle,
+    server: &str,
+    is_voice: &AtomicBool,
 ) {
     let mode = cache
         .lock()
@@ -903,15 +1088,20 @@ fn apply_channel_proximity(
         true
     };
     if changed {
-        let _ = app_handle.emit(
+        emit_server(
+            app_handle,
+            server,
             "proximity-mode",
             serde_json::json!({"channel_id": channel_id, "mode": mode}),
         );
         // The same news for a game: `proximity` is the field docs/SDK.md tells
         // a mod to read, and until now it was only ever answered, never pushed.
-        app_handle
-            .state::<AppState>()
-            .sdk_event(crate::app_state::SdkEvent::Proximity { mode });
+        // Only from the voice connection — a game plays in that one call.
+        if is_voice.load(Ordering::Relaxed) {
+            app_handle
+                .state::<AppState>()
+                .sdk_event(crate::app_state::SdkEvent::Proximity { mode });
+        }
     }
 }
 
@@ -931,7 +1121,13 @@ async fn handle_server_message(
     share_loss_tally: &Arc<std::sync::Mutex<LossTally>>,
     spatial: &Arc<std::sync::Mutex<crate::app_state::SpatialState>>,
     channels_snapshot: &Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
+    server: &str,
+    is_voice: &Arc<AtomicBool>,
+    transmitting: &Arc<AtomicBool>,
 ) {
+    // Everything a game hears about comes from the voice connection only: a
+    // user id here means nothing on the server the game is playing on.
+    let in_voice = || is_voice.load(Ordering::Relaxed);
     match msg {
         ServerMessage::VideoLossReported {
             viewer_user_id,
@@ -968,8 +1164,10 @@ async fn handle_server_message(
                 channels_snapshot,
                 channel_id_store.load(Ordering::Relaxed),
                 app_handle,
+                server,
+                is_voice,
             );
-            let _ = app_handle.emit("channel-list", &channels);
+            emit_server(app_handle, server, "channel-list", &channels);
         }
         ServerMessage::UserList { channel_id, users } => {
             // A text channel is a subscription: it does not move us, so none
@@ -1019,7 +1217,9 @@ async fn handle_server_message(
                     .await;
                 }
 
-                let _ = app_handle.emit(
+                emit_server(
+                    app_handle,
+                    server,
                     "user-list",
                     serde_json::json!({"channel_id": channel_id, "users": users}),
                 );
@@ -1067,12 +1267,21 @@ async fn handle_server_message(
                 if screen_share_active.swap(false, Ordering::Relaxed) {
                     // Was sharing — tell server to stop
                     let _ = send_tcp_message(tcp_tx, &ClientMessage::StopScreenShare).await;
-                    let _ = app_handle.emit("screen-share-force-stopped", ());
+                    emit_server(app_handle, server, "screen-share-force-stopped", ());
                     info!("screen share force-stopped due to channel change");
                 }
                 if watching_user_id_shared.swap(0, Ordering::Relaxed) != 0 {
                     let _ = send_tcp_message(tcp_tx, &ClientMessage::StopWatchingScreenShare).await;
-                    let _ = app_handle.emit("screen-share-force-stopped", ());
+                    emit_server(app_handle, server, "screen-share-force-stopped", ());
+                }
+
+                // Voice follows the latest voice channel any server confirms.
+                // Before `on_channel_changed`, so what that tells a game comes
+                // from the connection that has voice by then.
+                if channel_id != 0 {
+                    claim_voice(app_handle, server, is_voice).await;
+                } else {
+                    leave_voice(app_handle, server, is_voice, transmitting).await;
                 }
 
                 // The room belongs to the channel we just left; the new
@@ -1080,7 +1289,21 @@ async fn handle_server_message(
                 // This is the only place a join reaches the spatial state:
                 // the server sends ChannelList once at login and
                 // ChannelUpdated only on a settings change.
-                on_channel_changed(spatial, channels_snapshot, channel_id, app_handle);
+                on_channel_changed(
+                    spatial,
+                    channels_snapshot,
+                    channel_id,
+                    app_handle,
+                    server,
+                    is_voice,
+                );
+            } else if channel_id != 0 && !is_voice.load(Ordering::Relaxed) {
+                // The same room confirmed again while voice is elsewhere: the
+                // leave the handover asked for was refused, and the user has
+                // joined this room anew. It is a confirmation like any other —
+                // the front end and the browser backend take voice on it too,
+                // and all three have to agree on where the call is.
+                claim_voice(app_handle, server, is_voice).await;
             }
 
             // Auto-request prekey bundles for users we don't have sessions with.
@@ -1120,14 +1343,16 @@ async fn handle_server_message(
             if channel_id != 0 && !have_key && we_mint {
                 match MediaKey::generate(channel_id, 0, own_user_id) {
                     Ok(key) => {
-                        install_media_key(media_key, channel_id, key, app_handle);
+                        install_media_key(media_key, channel_id, key, app_handle, server);
                         info!(channel_id, members = users.len(), "generated media key");
                     }
                     Err(e) => error!(channel_id, "media key generation failed: {}", e),
                 }
             }
 
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "user-list",
                 serde_json::json!({"channel_id": channel_id, "users": users}),
             );
@@ -1163,7 +1388,9 @@ async fn handle_server_message(
                     false
                 }
             };
-            if keyed_up {
+            // Never for channel 0: it is where everybody stands who is in no
+            // voice channel, and there is nothing there to encrypt.
+            if keyed_up && user.channel_id != 0 {
                 distribute_sender_key_to_user(
                     user.channel_id,
                     user.user_id,
@@ -1175,7 +1402,7 @@ async fn handle_server_message(
                 .await;
             }
 
-            let _ = app_handle.emit("user-joined", &user);
+            emit_server(app_handle, server, "user-joined", user);
         }
         ServerMessage::UserLeft {
             user_id,
@@ -1201,7 +1428,9 @@ async fn handle_server_message(
                         sig.channels.note_stale(channel_id);
                     }
                 }
-                let _ = app_handle.emit(
+                emit_server(
+                    app_handle,
+                    server,
                     "user-left",
                     serde_json::json!({"user_id": user_id, "channel_id": channel_id}),
                 );
@@ -1235,8 +1464,9 @@ async fn handle_server_message(
             }
             // Their copy of the room's media key stops working from the next
             // generation on; the sender-key half of the same idea is the
-            // `note_stale` above.
-            if left_our_room {
+            // `note_stale` above. Channel 0 has no media key to rotate: it is
+            // no room, only where people stand who are in none.
+            if left_our_room && channel_id != 0 {
                 rotate_media_key_if_minter(
                     channel_id,
                     own_user_id,
@@ -1244,6 +1474,7 @@ async fn handle_server_message(
                     media_key,
                     tcp_tx,
                     app_handle,
+                    server,
                 )
                 .await;
             }
@@ -1257,34 +1488,46 @@ async fn handle_server_message(
                 sp.motion.remove(&user_id);
             }
 
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "user-left",
                 serde_json::json!({"user_id": user_id, "channel_id": channel_id}),
             );
         }
         ServerMessage::UserMuted { user_id, muted } => {
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "user-muted",
                 serde_json::json!({"user_id": user_id, "muted": muted}),
             );
-            app_handle
-                .state::<AppState>()
-                .sdk_event(SdkEvent::Muted { user_id, muted });
+            if in_voice() {
+                app_handle
+                    .state::<AppState>()
+                    .sdk_event(SdkEvent::Muted { user_id, muted });
+            }
         }
         ServerMessage::UserHistorySharing { user_id, enabled } => {
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "user-history-sharing",
                 serde_json::json!({"user_id": user_id, "enabled": enabled}),
             );
         }
         ServerMessage::UserDeafened { user_id, deafened } => {
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "user-deafened",
                 serde_json::json!({"user_id": user_id, "deafened": deafened}),
             );
-            app_handle
-                .state::<AppState>()
-                .sdk_event(SdkEvent::Deafened { user_id, deafened });
+            if in_voice() {
+                app_handle
+                    .state::<AppState>()
+                    .sdk_event(SdkEvent::Deafened { user_id, deafened });
+            }
         }
         ServerMessage::Ping { timestamp } => {
             // Reply to server keepalive ping to prevent idle disconnect
@@ -1297,7 +1540,9 @@ async fn handle_server_message(
             // computing a "RTT" from it yielded clock skew, not latency.
         }
         ServerMessage::ServerShutdown { reason } => {
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "connection-lost",
                 serde_json::json!({"reason": format!("Server shutdown: {}", reason)}),
             );
@@ -1307,7 +1552,7 @@ async fn handle_server_message(
         }
         ServerMessage::ChannelCreated { channel } => {
             upsert_channel(channels_snapshot, channel.clone());
-            let _ = app_handle.emit("channel-created", &channel);
+            emit_server(app_handle, server, "channel-created", &channel);
         }
         ServerMessage::ChannelDeleted { channel_id } => {
             if let Ok(mut list) = channels_snapshot.lock() {
@@ -1319,20 +1564,27 @@ async fn handle_server_message(
                 let SignalState { stores, channels, .. } = &mut *sig;
                 channels.forget_channel(stores.as_mut(), own, channel_id);
             }
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "channel-deleted",
                 serde_json::json!({"channel_id": channel_id}),
             );
         }
         ServerMessage::ChannelError { reason } => {
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "channel-error",
                 serde_json::json!({"reason": reason.clone()}),
             );
-            // A mod waiting for its `hello` join learns why it failed
-            app_handle
-                .state::<AppState>()
-                .sdk_event(SdkEvent::ChannelError(reason));
+            // A mod waiting for its `hello` join learns why it failed — the
+            // one event every connection publishes, because the join it waits
+            // for is not on the voice connection yet; it names the server.
+            app_handle.state::<AppState>().sdk_event(SdkEvent::ChannelError {
+                server: server.to_string(),
+                reason,
+            });
         }
         ServerMessage::ChannelUpdated { channel } => {
             upsert_channel(channels_snapshot, channel.clone());
@@ -1341,17 +1593,23 @@ async fn handle_server_message(
                 channels_snapshot,
                 channel_id_store.load(Ordering::Relaxed),
                 app_handle,
+                server,
+                is_voice,
             );
-            let _ = app_handle.emit("channel-updated", &channel);
+            emit_server(app_handle, server, "channel-updated", &channel);
         }
         ServerMessage::Kicked { channel_id, reason } => {
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "kicked",
                 serde_json::json!({"channel_id": channel_id, "reason": reason}),
             );
         }
         ServerMessage::ChannelUsers { channel_id, users } => {
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "channel-users",
                 serde_json::json!({"channel_id": channel_id, "users": users}),
             );
@@ -1361,7 +1619,9 @@ async fn handle_server_message(
             channel_name,
             invited_by,
         } => {
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "invite-received",
                 serde_json::json!({"channel_id": channel_id, "channel_name": channel_name, "invited_by": invited_by}),
             );
@@ -1370,7 +1630,9 @@ async fn handle_server_message(
             channel_id,
             user_id,
         } => {
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "invite-accepted",
                 serde_json::json!({"channel_id": channel_id, "user_id": user_id}),
             );
@@ -1379,7 +1641,9 @@ async fn handle_server_message(
             channel_id,
             user_id,
         } => {
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "invite-declined",
                 serde_json::json!({"channel_id": channel_id, "user_id": user_id}),
             );
@@ -1422,7 +1686,9 @@ async fn handle_server_message(
                 }
             };
 
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "poke-received",
                 serde_json::json!({
                     "from_user_id": from_user_id,
@@ -1437,7 +1703,9 @@ async fn handle_server_message(
                     .duration_since(std::time::UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_millis() as u64;
-                let _ = app_handle.emit(
+                emit_server(
+                    app_handle,
+                    server,
                     "direct-chat-message",
                     serde_json::json!({
                         "from_user_id": from_user_id,
@@ -1463,13 +1731,17 @@ async fn handle_server_message(
             username,
             resolution,
         } => {
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "screenshare-started",
                 serde_json::json!({"user_id": user_id, "username": username, "resolution": resolution}),
             );
         }
         ServerMessage::ScreenShareStopped { user_id } => {
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "screenshare-stopped",
                 serde_json::json!({"user_id": user_id}),
             );
@@ -1478,13 +1750,17 @@ async fn handle_server_message(
             // Before the first fragment arrives: the decode task builds its
             // decoder from this and rebuilds it when the value changes.
             watching_codec.store(codec as u8, Ordering::Relaxed);
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "watching-screenshare",
                 serde_json::json!({"sharer_user_id": sharer_user_id, "codec": format!("{codec:?}")}),
             );
         }
         ServerMessage::StoppedWatchingScreenShare { reason } => {
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "stopped-watching-screenshare",
                 serde_json::json!({"reason": reason}),
             );
@@ -1494,16 +1770,20 @@ async fn handle_server_message(
                 .lock()
                 .unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() })
                 .viewer_count = viewer_count;
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "viewer-count-changed",
                 serde_json::json!({"viewer_count": viewer_count}),
             );
         }
         ServerMessage::KeyframeRequested => {
-            let _ = app_handle.emit("keyframe-requested", ());
+            emit_server(app_handle, server, "keyframe-requested", ());
         }
         ServerMessage::ScreenShareError { reason } => {
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "screenshare-error",
                 serde_json::json!({"reason": reason}),
             );
@@ -1531,7 +1811,9 @@ async fn handle_server_message(
             user_id,
             new_identity_key,
         } => {
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "identity-key-changed",
                 serde_json::json!({"user_id": user_id, "new_identity_key": new_identity_key}),
             );
@@ -1555,6 +1837,7 @@ async fn handle_server_message(
                 own_user_id,
                 signal,
                 app_handle,
+                server,
             );
         }
         // ── E2E: Encrypted channel message → decrypt and emit as plaintext ──
@@ -1575,6 +1858,7 @@ async fn handle_server_message(
                 channel_id_store.load(Ordering::Relaxed),
                 signal,
                 app_handle,
+                server,
             );
         }
         // ── E2E: Sender key received → decrypt pairwise, process, reciprocate ──
@@ -1612,26 +1896,31 @@ async fn handle_server_message(
                 media_key,
                 channel_id_store,
                 app_handle,
+                server,
             )
             .await;
         }
         // ── Moderation ──
         ServerMessage::AdminStatus { user_id, is_admin } => {
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "admin-status",
                 serde_json::json!({"user_id": user_id, "is_admin": is_admin}),
             );
         }
         ServerMessage::AdminError { reason } => {
-            let _ = app_handle.emit("admin-error", serde_json::json!({"reason": reason}));
+            emit_server(app_handle, server, "admin-error", serde_json::json!({"reason": reason}));
         }
         ServerMessage::AdminBans { bans } => {
-            let _ = app_handle.emit("admin-bans", serde_json::json!({"bans": bans}));
+            emit_server(app_handle, server, "admin-bans", serde_json::json!({"bans": bans}));
         }
         ServerMessage::Disconnected { reason } => {
             // The server closes the socket next; the UI must not auto-reconnect
             info!("disconnected by server: {}", reason);
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "server-disconnected",
                 serde_json::json!({"reason": reason}),
             );
@@ -1641,7 +1930,9 @@ async fn handle_server_message(
             channel_id,
             from_user_id,
         } => {
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "channel-history-requested",
                 serde_json::json!({"channel_id": channel_id, "from_user_id": from_user_id}),
             );
@@ -1662,6 +1953,7 @@ async fn handle_server_message(
                 channel_id_store.load(Ordering::Relaxed),
                 signal,
                 app_handle,
+                server,
             );
         }
         ServerMessage::Authenticated { .. } | ServerMessage::AuthError { .. } => {}
@@ -1679,6 +1971,7 @@ fn handle_channel_history_received(
     own_channel_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
     app_handle: &tauri::AppHandle,
+    server: &str,
 ) {
     // A conversation arriving from somebody the roster does not put in that
     // channel with us is not history, it is an injection: we file it, show it
@@ -1729,7 +2022,9 @@ fn handle_channel_history_received(
             return;
         }
     };
-    let _ = app_handle.emit(
+    emit_server(
+        app_handle,
+        server,
         "channel-history-received",
         serde_json::json!({
             "channel_id": channel_id,
@@ -2003,6 +2298,7 @@ async fn rotate_media_key_if_minter(
     media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
     tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
     app_handle: &tauri::AppHandle,
+    server: &str,
 ) {
     let remaining: Vec<u32> = {
         let sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
@@ -2021,7 +2317,7 @@ async fn rotate_media_key_if_minter(
     };
 
     match MediaKey::generate(channel_id, next_id, own_user_id) {
-        Ok(key) => install_media_key(media_key, channel_id, key, app_handle),
+        Ok(key) => install_media_key(media_key, channel_id, key, app_handle, server),
         Err(e) => {
             error!(channel_id, "media key rotation failed: {}", e);
             return;
@@ -2044,6 +2340,7 @@ fn install_media_key(
     own_channel: u32,
     key: MediaKey,
     app_handle: &tauri::AppHandle,
+    server: &str,
 ) {
     let (channel_id, key_id) = (key.channel_id, key.key_id);
     let installed = {
@@ -2056,7 +2353,9 @@ fn install_media_key(
     if !installed {
         return;
     }
-    let _ = app_handle.emit(
+    emit_server(
+        app_handle,
+        server,
         "media-key-installed",
         serde_json::json!({"channel_id": channel_id, "key_id": key_id}),
     );
@@ -2126,6 +2425,7 @@ async fn handle_media_key_received(
     media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
     channel_id_store: &Arc<AtomicU32>,
     app_handle: &tauri::AppHandle,
+    server: &str,
 ) {
     let current = channel_id_store.load(Ordering::Relaxed);
     // The same check the sender key makes, and for a bigger prize: this is the
@@ -2182,7 +2482,7 @@ async fn handle_media_key_received(
     // the lower minter does, so two members who disagreed about the roster for
     // a moment converge on the same key instead of going deaf to each other.
     let key_id = key.key_id;
-    install_media_key(media_key, current, key, app_handle);
+    install_media_key(media_key, current, key, app_handle, server);
     info!(from_user_id, channel_id, key_id, "media key offered");
 }
 
@@ -2466,6 +2766,7 @@ fn handle_encrypted_direct_message(
     own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
     app_handle: &tauri::AppHandle,
+    server: &str,
 ) {
     // Skip our own echoed messages — the sender emits locally in commands.rs.
     // Attempting to decrypt would corrupt the Signal ratchet state.
@@ -2504,7 +2805,9 @@ fn handle_encrypted_direct_message(
             }
 
             // Emit as a regular plaintext DM event
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "direct-chat-message",
                 serde_json::json!({
                     "from_user_id": from_user_id,
@@ -2528,7 +2831,9 @@ fn handle_encrypted_direct_message(
         }
         Err(e) => {
             warn!(from_user_id, "failed to decrypt direct message: {}", e);
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "direct-chat-message",
                 serde_json::json!({
                     "from_user_id": from_user_id,
@@ -2555,6 +2860,7 @@ fn handle_encrypted_channel_message(
     own_channel_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
     app_handle: &tauri::AppHandle,
+    server: &str,
 ) {
     // Our own message, echoed back. The local copy was shown when it was sent;
     // a second one only has our own sender chain to decrypt with and would
@@ -2598,7 +2904,9 @@ fn handle_encrypted_channel_message(
             // The id rides inside the ciphertext, so two members sharing their
             // history of the same conversation agree on what is the same message.
             let msg = crate::crypto::open_envelope(&plaintext);
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "channel-chat-message",
                 serde_json::json!({
                     "channel_id": channel_id,
@@ -2617,7 +2925,9 @@ fn handle_encrypted_channel_message(
         }
         Err(e) => {
             warn!(user_id, channel_id, "failed to decrypt channel message: {}", e);
-            let _ = app_handle.emit(
+            emit_server(
+                app_handle,
+                server,
                 "channel-chat-message",
                 serde_json::json!({
                     "channel_id": channel_id,
@@ -2768,17 +3078,30 @@ const SOURCE_IDLE_PRUNE: std::time::Duration = std::time::Duration::from_secs(60
 
 type MixSources = Arc<std::sync::Mutex<HashMap<u32, MixSource>>>;
 
-/// Clocked voice mixer: every 20ms, pop one frame per active source, decode
-/// (FEC/PLC on loss), sum with per-user and master gain, and push the mixed
-/// frame to the playback ring. Owns the playback stream and rebuilds it when
-/// `playback_restart` is set (device error or output device change).
+/// Device-clocked voice mixer: whenever the playback ring has room, pop one
+/// 20ms frame per active source, decode (FEC/PLC on loss), sum with per-user
+/// and master gain, and push the mixed frame. Owns the playback stream and
+/// rebuilds it when `playback_restart` is set (device error or output device
+/// change).
+///
+/// Holds a stream only while this connection has voice, or runs the settings
+/// panel's spatial test. One stream per open server was that many low-latency
+/// streams on one device — on Android, battery and fast-track budget — and
+/// every mixer drained the process-wide underrun statistics, stealing the
+/// voice stream's readings. With no stream it keeps its 20 ms clock, so the
+/// jitter buffers still drain.
+///
+/// Pulled by the device rather than driven by a timer: a 20ms `interval` and
+/// the device clock drift against each other, and cpal's ALSA backend asks for
+/// every free frame per wake (25ms periods, more when the thread woke late),
+/// so a timer-fed ring sits one late tick away from a hole at all times. That
+/// hole is zero-filled into the device buffer, which is the crack people hear.
 #[allow(clippy::too_many_arguments)]
-#[allow(unused_assignments)] // playback_stream is a hold-to-keep-alive handle
+#[allow(unused_assignments)] // _playback_stream is a hold-to-keep-alive handle
 async fn voice_mixer_task(
     sources: MixSources,
-    mut playback_stream: Option<voipc_audio::playback::PlaybackStream>,
-    mut producer: Option<ringbuf::HeapProd<f32>>,
     playback_restart: Arc<AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
     output_device_live: Arc<std::sync::Mutex<Option<String>>>,
     is_deafened: Arc<AtomicBool>,
     user_volumes: Arc<std::sync::Mutex<HashMap<u32, f32>>>,
@@ -2789,23 +3112,41 @@ async fn voice_mixer_task(
     voice_frames_played: Arc<AtomicU32>,
     voice_frames_lost: Arc<AtomicU32>,
     app_handle: tauri::AppHandle,
+    is_voice: Arc<AtomicBool>,
 ) {
     use ringbuf::traits::Observer;
-    use voipc_audio::jitter::JitterFrame;
+    use voipc_audio::decoder::Decoder;
+    use voipc_audio::jitter::{JitterBuffer, JitterFrame};
 
-    let mut interval = tokio::time::interval(std::time::Duration::from_millis(20));
-    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    /// Least cushion kept in the playback ring, in 20ms frames. Also what is
+    /// used until the device has said how much it takes at once. 60ms matches
+    /// what the old timer-driven mixer held while audio was flowing, so this
+    /// is not a latency change — it is the same depth, never allowed to drain.
+    const MIN_FILL_FRAMES: usize = 3;
+    /// Runaway guard, and it must stay below the ring's 10-frame capacity: a
+    /// cushion that could not fit another whole frame would have `push_slice`
+    /// write half of one, and half a stereo frame swaps the channels for the
+    /// rest of the session.
+    const MAX_FILL_FRAMES: usize = 8;
+    /// How long to wait for the device before looking around anyway: a dead
+    /// device stops calling back, and `playback_restart` still has to be seen.
+    const WAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(20);
+    /// How often the device's appetite is re-read.
+    const STATS_WINDOW: std::time::Duration = std::time::Duration::from_secs(1);
 
+    // Opened through the restart path below, once this connection is audible
+    let mut _playback_stream: Option<voipc_audio::playback::PlaybackStream> = None;
+    let mut producer: Option<ringbuf::HeapProd<f32>> = None;
     // Resamplers for output devices that can't run 48kHz — one per channel,
     // each carrying its own interpolation state
-    let mut out_rate = playback_stream.as_ref().map_or(48_000, |s| s.sample_rate());
-    let mut resampler = (out_rate != 48_000).then(|| {
-        (
-            voipc_audio::resample::LinearResampler::new(48_000, out_rate),
-            voipc_audio::resample::LinearResampler::new(48_000, out_rate),
-        )
-    });
+    let mut out_rate = 48_000;
+    let mut resampler: Option<(
+        voipc_audio::resample::LinearResampler,
+        voipc_audio::resample::LinearResampler,
+    )> = None;
     let mut last_restart_attempt: Option<std::time::Instant> = None;
+    // Frames pushed since this connection stopped being audible
+    let mut idle_frames = 0usize;
     let mut error_emitted = false;
     // Interleaved stereo mix for one 20 ms frame
     let mut stereo: Vec<f32> = Vec::new();
@@ -2816,12 +3157,82 @@ async fn voice_mixer_task(
     let mut out_l: Vec<f32> = Vec::new();
     let mut out_r: Vec<f32> = Vec::new();
     let mut resampled: Vec<f32> = Vec::new();
+    // The device's appetite over the last two windows. Two rather than one so
+    // the reading survives a roll, and rolling rather than an all-time maximum
+    // so the outsized first callback of a stream is forgotten again.
+    let mut last_stats_roll = std::time::Instant::now();
+    let mut request_max = (0u32, 0u32);
 
     loop {
-        interval.tick().await;
+        let testing = match spatial.lock() {
+            Ok(s) => s.test.is_some(),
+            Err(poisoned) => poisoned.into_inner().test.is_some(),
+        };
+        let wanted = is_voice.load(Ordering::Relaxed) || testing;
+        if wanted {
+            idle_frames = 0;
+            if producer.is_none() {
+                playback_restart.store(true, Ordering::Relaxed);
+            }
+        } else if producer.is_some() {
+            // Played out rather than cut: what is still in the ring is the
+            // tail of the call, or the test's own fade, and dropping the
+            // stream under it clicks. A full cushion later the ring holds
+            // only what was mixed after.
+            idle_frames += 1;
+            if idle_frames > MAX_FILL_FRAMES {
+                _playback_stream = None;
+                producer = None;
+                // Rejoining a moment from now must not wait out the throttle
+                last_restart_attempt = None;
+                info!("playback stream closed: no voice on this connection");
+            }
+        }
 
-        // Rebuild the playback stream if the device died or was switched
-        if playback_restart.swap(false, Ordering::Relaxed) {
+        // ×2: the ring carries interleaved stereo
+        let frame_out = (out_rate as usize * 20) / 1000 * 2;
+        // Only the stream the voice plays on reads the device's statistics:
+        // they are process-wide, and a read resets them.
+        if wanted && producer.is_some() && last_stats_roll.elapsed() >= STATS_WINDOW {
+            last_stats_roll = std::time::Instant::now();
+            request_max = (voipc_audio::take_request_max(), request_max.0);
+            let gaps = voipc_audio::take_underruns();
+            if gaps > 0 {
+                // Never expected: the cushion is sized off this same device's
+                // own callbacks. If this fires, it is the crack people hear.
+                warn!("playback underruns in the last second: {}", gaps);
+            }
+        }
+        // Enough for the biggest callback this device has taken lately, and a
+        // frame in hand. cpal's ALSA backend swallows 40ms+ at a time, WASAPI
+        // about 10ms, so this is not a number worth guessing.
+        let cushion = (request_max.0.max(request_max.1) as usize + frame_out)
+            .clamp(MIN_FILL_FRAMES * frame_out, MAX_FILL_FRAMES * frame_out);
+        // Wait until the device has taken enough for another frame to fit
+        // under the cushion. With no device at all, fall back to the clock so
+        // the jitter buffers still drain and the restart below still runs.
+        loop {
+            // Read the fill and drop the borrow before any await: the ring's
+            // producer half is not Send, and this task is spawned.
+            let room = producer.as_ref().map(|p| p.occupied_len() < cushion);
+            match room {
+                None => {
+                    tokio::time::sleep(WAKE_TIMEOUT).await;
+                    break;
+                }
+                Some(true) => break,
+                Some(false) => {
+                    let _ = tokio::time::timeout(WAKE_TIMEOUT, wake.notified()).await;
+                }
+            }
+            if playback_restart.load(Ordering::Relaxed) {
+                break; // the device is gone; stop waiting on its callbacks
+            }
+        }
+
+        // Rebuild the playback stream if the device died or was switched, or
+        // open it for voice. Never for a connection nobody is listening to.
+        if wanted && playback_restart.swap(false, Ordering::Relaxed) {
             if last_restart_attempt.is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(1)) {
                 playback_restart.store(true, Ordering::Relaxed); // retry later
             } else {
@@ -2831,11 +3242,12 @@ async fn voice_mixer_task(
                     .map(|d| d.clone())
                     .unwrap_or_default();
                 // Drop the old stream before opening the device again
-                playback_stream = None;
+                _playback_stream = None;
                 producer = None;
                 match voipc_audio::playback::start_playback(
                     device_name.as_deref(),
                     playback_restart.clone(),
+                    Some(wake.clone()),
                 ) {
                     Ok((stream, prod)) => {
                         out_rate = stream.sample_rate();
@@ -2845,8 +3257,11 @@ async fn voice_mixer_task(
                                 voipc_audio::resample::LinearResampler::new(48_000, out_rate),
                             )
                         });
-                        playback_stream = Some(stream);
+                        _playback_stream = Some(stream);
                         producer = Some(prod);
+                        // The old device's appetite says nothing about the new one
+                        request_max = (0, 0);
+                        last_stats_roll = std::time::Instant::now();
                         info!("playback stream (re)started at {}Hz", out_rate);
                         if error_emitted {
                             error_emitted = false;
@@ -2868,20 +3283,18 @@ async fn voice_mixer_task(
             }
         }
 
-        // Backpressure: if the ring already holds >3 frames, skip this tick
-        // (caps clock drift between our timer and the device clock)
-        // ×2: the ring carries interleaved stereo
-        let frame_out = (out_rate as usize * 20) / 1000 * 2;
-        if let Some(p) = producer.as_ref() {
-            if p.occupied_len() > 3 * frame_out {
-                continue;
-            }
-        }
-
         // Pull, decode and mix one frame per source. Mixing runs under the
         // same lock as the decode so each source's gain ramp state stays with
         // it — a per-frame gain step would click.
-        let master = f32::from_bits(master_volume.load(Ordering::Relaxed));
+        // Silent while nobody listens here. Every lane's gain ramps to it over
+        // one frame, so the old room fades out instead of being played on top
+        // of the new one, and the stream closes on silence rather than being
+        // cut from under live speech — that cut would click.
+        let master = if wanted {
+            f32::from_bits(master_volume.load(Ordering::Relaxed))
+        } else {
+            0.0
+        };
         let deafened = is_deafened.load(Ordering::Relaxed);
         let volumes = user_volumes
             .lock()
@@ -2910,6 +3323,23 @@ async fn voice_mixer_task(
                 Err(poisoned) => poisoned.into_inner(),
             };
             map.retain(|_, s| s.last_activity.elapsed() < SOURCE_IDLE_PRUNE);
+            // One frame out of a lane's jitter buffer, concealed if it was lost
+            let decode = |jitter: &JitterBuffer, decoder: &mut Decoder, frame: JitterFrame| {
+                match frame {
+                    JitterFrame::Ready(data) => {
+                        voice_frames_played.fetch_add(1, Ordering::Relaxed);
+                        decoder.decode(&data)
+                    }
+                    JitterFrame::Lost => {
+                        voice_frames_lost.fetch_add(1, Ordering::Relaxed);
+                        match jitter.peek_next() {
+                            // The next packet carries in-band FEC for the lost frame
+                            Some(next) => decoder.decode_fec(next),
+                            None => decoder.decode_lost(),
+                        }
+                    }
+                }
+            };
             for (&key, src) in map.iter_mut() {
                 let is_screen_audio = key & SCREEN_AUDIO_FLAG != 0;
                 let user_id = key & !SCREEN_AUDIO_FLAG;
@@ -2967,26 +3397,26 @@ async fn voice_mixer_task(
                         );
                         continue;
                     }
-                    Some(JitterFrame::Ready(data)) => {
-                        voice_frames_played.fetch_add(1, Ordering::Relaxed);
-                        decoder.decode(&data)
-                    }
-                    Some(JitterFrame::Lost) => {
-                        voice_frames_lost.fetch_add(1, Ordering::Relaxed);
-                        match jitter.peek_next() {
-                            // The next packet carries in-band FEC for the lost frame
-                            Some(next) => decoder.decode_fec(next),
-                            None => decoder.decode_lost(),
-                        }
-                    }
+                    Some(frame) => decode(jitter, decoder, frame),
                 };
-                let pcm = match pcm {
+                let mut pcm = match pcm {
                     Ok(pcm) => pcm,
                     Err(e) => {
                         warn!("Opus decode error from source {:#x}: {}", key, e);
                         continue;
                     }
                 };
+                // A stream that never pauses has no reset to lose latency at,
+                // so a standing surplus is shed here instead. Both frames are
+                // decoded so Opus runs on, and the cut lands on the quieter one.
+                if jitter.take_surplus() {
+                    if let Some(Ok(next)) = jitter.pop().map(|f| decode(jitter, decoder, f)) {
+                        let energy = |pcm: &[f32]| pcm.iter().map(|s| s * s).sum::<f32>();
+                        if energy(&next) > energy(&pcm) {
+                            pcm = next;
+                        }
+                    }
+                }
                 if deafened {
                     continue; // decoded to keep the Opus state, then dropped
                 }
@@ -3074,10 +3504,14 @@ async fn voice_mixer_task(
         }
         drop(sp);
 
-        if !mixed_any {
-            continue; // ring drains to silence; decode above kept Opus state
+        // A quiet frame is still pushed. The ring is what the device eats
+        // from, so letting it run dry between talk bursts throws the cushion
+        // away and re-rolls the underrun phase at every burst start — and in
+        // this pull model an unfed ring never reports room, so the loop would
+        // spin. `mixed_any` only says whether anything needed clamping.
+        if mixed_any {
+            voipc_audio::mixer::clamp(&mut stereo);
         }
-        voipc_audio::mixer::clamp(&mut stereo);
 
         if let Some(p) = producer.as_mut() {
             match resampler.as_mut() {
@@ -3393,14 +3827,14 @@ async fn congestion_task(
 }
 
 /// Latency for the status bar from QUIC's own RTT estimate, every 10 s.
-async fn latency_task(connection: Connection, app_handle: tauri::AppHandle) {
+async fn latency_task(connection: Connection, app_handle: tauri::AppHandle, server: Arc<str>) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         tokio::select! {
             _ = interval.tick() => {
                 let ms = connection.rtt().as_millis() as u64;
-                let _ = app_handle.emit("latency-update", serde_json::json!({"ms": ms}));
+                emit_server(&app_handle, &server, "latency-update", serde_json::json!({"ms": ms}));
             }
             _ = connection.closed() => return,
         }
@@ -3419,7 +3853,11 @@ async fn datagram_receiver_task(
     media_key: Arc<std::sync::Mutex<MediaKeyRing>>,
     channel_id: Arc<AtomicU32>,
     spatial: Arc<std::sync::Mutex<crate::app_state::SpatialState>>,
+    server: Arc<str>,
+    is_voice: Arc<AtomicBool>,
 ) {
+    // A game hears who talks only in the call it is placing people in
+    let in_voice = || is_voice.load(Ordering::Relaxed);
     let mut recv_count: u64 = 0;
     // Track last voice packet time per user for speaking timeout
     let mut last_voice_time: HashMap<u32, std::time::Instant> = HashMap::new();
@@ -3534,14 +3972,18 @@ async fn datagram_receiver_task(
                             .insert(session_id, std::time::Instant::now())
                             .is_none()
                         {
-                            let _ = app_handle.emit(
+                            emit_server(
+                                &app_handle,
+                                &server,
                                 "user-speaking",
                                 serde_json::json!({"user_id": session_id, "speaking": true}),
                             );
-                            app_handle.state::<AppState>().sdk_event(SdkEvent::Talk {
-                                user_id: session_id,
-                                speaking: true,
-                            });
+                            if in_voice() {
+                                app_handle.state::<AppState>().sdk_event(SdkEvent::Talk {
+                                    user_id: session_id,
+                                    speaking: true,
+                                });
+                            }
                         }
                     }
                     // Position beacon from a member who syncs their position
@@ -3619,7 +4061,9 @@ async fn datagram_receiver_task(
                             }
                         };
                         if accepted {
-                            let _ = app_handle.emit(
+                            emit_server(
+                                &app_handle,
+                                &server,
                                 "user-position",
                                 serde_json::json!({
                                     "user_id": session_id,
@@ -3647,14 +4091,18 @@ async fn datagram_receiver_task(
                             }
                         }
                         last_voice_time.remove(&session_id);
-                        let _ = app_handle.emit(
+                        emit_server(
+                            &app_handle,
+                            &server,
                             "user-speaking",
                             serde_json::json!({"user_id": session_id, "speaking": false}),
                         );
-                        app_handle.state::<AppState>().sdk_event(SdkEvent::Talk {
-                            user_id: session_id,
-                            speaking: false,
-                        });
+                        if in_voice() {
+                            app_handle.state::<AppState>().sdk_event(SdkEvent::Talk {
+                                user_id: session_id,
+                                speaking: false,
+                            });
+                        }
                     }
                     // Screen share audio (encrypted only)
                     0x15 => {
@@ -3735,13 +4183,17 @@ async fn datagram_receiver_task(
                     .collect();
                 for user_id in expired {
                     last_voice_time.remove(&user_id);
-                    let _ = app_handle.emit(
+                    emit_server(
+                        &app_handle,
+                        &server,
                         "user-speaking",
                         serde_json::json!({"user_id": user_id, "speaking": false}),
                     );
-                    app_handle
-                        .state::<AppState>()
-                        .sdk_event(SdkEvent::Talk { user_id, speaking: false });
+                    if in_voice() {
+                        app_handle
+                            .state::<AppState>()
+                            .sdk_event(SdkEvent::Talk { user_id, speaking: false });
+                    }
                 }
             }
         }
@@ -3757,12 +4209,12 @@ const LOSS_REPORT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2
 /// `[u16 BE len][packet]` records, fed to the assembler as they arrive (waiting
 /// for the frame's FIN would add its whole transmission time to the latency).
 /// Decrypts, reassembles, hands complete frames to the decode task, requests a
-/// keyframe on loss and reports the loss to the sharer every 2 s so it can
-/// lower its bitrate/fps.
+/// keyframe on loss and keeps asking while there is nothing clean to show, and
+/// reports the loss to the sharer every 2 s so it can lower its bitrate/fps.
 #[allow(clippy::too_many_arguments)]
 async fn video_stream_receiver_task(
     connection: Connection,
-    video_decode_tx: mpsc::Sender<(Vec<u8>, bool)>,
+    video_decode_tx: mpsc::Sender<(Vec<u8>, bool, bool)>,
     media_key: Arc<std::sync::Mutex<MediaKeyRing>>,
     channel_id: Arc<AtomicU32>,
     screen_video_frames_received: Arc<AtomicU32>,
@@ -3775,10 +4227,26 @@ async fn video_stream_receiver_task(
     let mut video_assembler = FrameAssembler::new();
     let mut current_video_session: Option<u32> = None;
     let mut last_keyframe_request = std::time::Instant::now() - std::time::Duration::from_secs(10);
+    // A frame went missing since the last one handed to the decode task
+    let mut gap = false;
     let mut window_started = std::time::Instant::now();
     let mut window_dropped: u32 = 0;
     let mut window_received: u32 = 0;
     let mut chunk = vec![0u8; 16 * 1024];
+    // At most once a second, which is also all the server relays: a request
+    // that went unanswered (rate-limited, or its keyframe lost) is made again.
+    let request_keyframe = |last: &mut std::time::Instant| {
+        let sharer_id = watching_user_id.load(Ordering::Relaxed);
+        if sharer_id == 0 || last.elapsed() < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let msg = ClientMessage::RequestKeyframe { sharer_user_id: sharer_id };
+        if let Ok(data) = encode_client_msg(&msg) {
+            let _ = tcp_tx.send(data);
+            info!("requested a keyframe from sharer {}", sharer_id);
+        }
+        *last = std::time::Instant::now();
+    };
 
     loop {
         let mut stream = match connection.accept_uni().await {
@@ -3857,34 +4325,37 @@ async fn video_stream_receiver_task(
 
                 let result = video_assembler.add_fragment(&packet);
 
-                // Incomplete frame was dropped — signal render suppression
-                // and request keyframe to recover
+                // A frame was lost: the next one handed on carries the gap, and
+                // the decode task suppresses rendering from there
                 if result.frame_dropped {
                     screen_video_frames_dropped.fetch_add(1, Ordering::Relaxed);
                     window_dropped += 1;
-                    needs_keyframe.store(true, Ordering::Release);
-                    if last_keyframe_request.elapsed() >= std::time::Duration::from_secs(1) {
-                        let sharer_id = watching_user_id.load(Ordering::Relaxed);
-                        if sharer_id != 0 {
-                            let msg = ClientMessage::RequestKeyframe { sharer_user_id: sharer_id };
-                            if let Ok(data) = encode_client_msg(&msg) {
-                                let _ = tcp_tx.send(data);
-                                info!("auto-requested keyframe (frame loss detected)");
-                            }
-                            last_keyframe_request = std::time::Instant::now();
-                        }
-                    }
+                    gap = true;
+                    request_keyframe(&mut last_keyframe_request);
                 }
 
                 if let Some((frame_data, is_keyframe)) = result.frame {
                     screen_video_frames_received.fetch_add(1, Ordering::Relaxed);
                     window_received += 1;
-                    // Send to decode task — drop if full to avoid stalling voice
-                    if video_decode_tx.try_send((frame_data, is_keyframe)).is_err() {
-                        screen_video_frames_dropped.fetch_add(1, Ordering::Relaxed);
-                        window_dropped += 1;
-                        warn!("video decode channel full — dropping assembled frame");
+                    // Send to decode task — drop if full to avoid stalling voice.
+                    // Lost here is lost like on the wire.
+                    match video_decode_tx.try_send((frame_data, is_keyframe, gap)) {
+                        Ok(()) => gap = false,
+                        Err(_) => {
+                            gap = true;
+                            screen_video_frames_dropped.fetch_add(1, Ordering::Relaxed);
+                            window_dropped += 1;
+                            warn!("video decode channel full — dropping assembled frame");
+                            request_keyframe(&mut last_keyframe_request);
+                        }
                     }
+                }
+
+                // Keep asking while there is nothing clean to show: the server
+                // rate-limits keyframe relays, so the one a join or a loss
+                // triggered may never have come.
+                if needs_keyframe.load(Ordering::Acquire) || !video_assembler.has_keyframe() {
+                    request_keyframe(&mut last_keyframe_request);
                 }
             }
             if reader.is_broken() {
@@ -4123,25 +4594,40 @@ mod tests {
         mix_layers(&mut layers, &[], &sp, &mut stereo, Some(&pcm), 1.0, false, false, 0, 0, now);
         assert!(layers.is_empty(), "a layer the game dropped kept its chain");
     }
+
+    #[test]
+    fn only_a_keyframe_after_the_last_gap_resumes_rendering() {
+        // (gap_before, is_keyframe) per frame, every one decoding fine
+        let run = |fs: &[(bool, bool)]| {
+            fs.iter().fold(true, |ok, &(gap, key)| chain_intact(ok, gap, key, true))
+        };
+        // A keyframe queued before a loss does not vouch for what follows it
+        assert!(!run(&[(false, true), (true, false), (false, false)]));
+        assert!(run(&[(true, false), (false, true), (false, false)]));
+        assert!(run(&[(true, true)]));
+        assert!(!chain_intact(true, false, false, false), "a failed decode breaks it");
+    }
 }
 
 /// Video decode + render task: runs on a blocking thread to avoid stalling
 /// the media receivers. Decodes ALL frames to maintain codec state, but only
 /// JPEG-encodes and emits the most recent frame (frame skipping).
 ///
-/// **Render suppression:** When packet loss breaks the decoder's reference chain,
-/// all subsequent delta frames decode to gray/corrupted pixels. Instead of displaying
-/// these, we suppress rendering until a keyframe arrives and resets the decoder state.
+/// **Render suppression:** When loss breaks the decoder's reference chain, all
+/// subsequent delta frames decode to gray/corrupted pixels. Instead of displaying
+/// these, we suppress rendering until a keyframe decodes and resets the decoder
+/// state. Judged frame by frame in arrival order (`chain_intact`), so a keyframe
+/// queued before a loss does not vouch for the frames after it. While suppressed,
+/// `needs_keyframe` is set and the stream receiver keeps asking for a keyframe.
 /// The viewer sees the last good frame (frozen) instead of gray corruption.
-#[allow(clippy::too_many_arguments)]
 fn video_decode_render_task(
-    mut decode_rx: mpsc::Receiver<(Vec<u8>, bool)>,
+    mut decode_rx: mpsc::Receiver<(Vec<u8>, bool, bool)>,
     app_handle: tauri::AppHandle,
-    tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
     watching_user_id: Arc<AtomicU32>,
     watching_codec: Arc<AtomicU8>,
     screen_video_resolution: Arc<AtomicU32>,
     needs_keyframe: Arc<AtomicBool>,
+    server: Arc<str>,
 ) {
     let mut decoder: Option<voipc_video::decoder::Decoder> = None;
     let mut buffers = match screenshare::FrameDecodeBuffers::new() {
@@ -4151,19 +4637,13 @@ fn video_decode_render_task(
             return;
         }
     };
-    let mut last_keyframe_request = std::time::Instant::now() - std::time::Duration::from_secs(10);
     let mut suppress_render = false;
     // The share the current decoder belongs to (sharer, codec); a change in
     // either invalidates its reference frames.
     let mut decoder_for: Option<(u32, voipc_protocol::types::VideoCodec)> = None;
     let mut reported_missing_decoder: Option<voipc_protocol::types::VideoCodec> = None;
 
-    while let Some((frame_data, is_keyframe)) = decode_rx.blocking_recv() {
-        // Check shared flag from UDP receiver (frame loss detected)
-        if needs_keyframe.load(Ordering::Acquire) {
-            suppress_render = true;
-        }
-
+    while let Some(first) = decode_rx.blocking_recv() {
         // A different codec cannot be read by this decoder at all, and a
         // different sharer's deltas would decode against the previous share's
         // reference frames. Either way: start over and wait for a keyframe.
@@ -4186,11 +4666,14 @@ fn video_decode_render_task(
                 }
                 Err(e) => {
                     warn!("{want_codec:?} decoder creation failed: {e} — skipping frame");
+                    suppress_render = true;
                     needs_keyframe.store(true, Ordering::Release);
                     // Tell the user once per codec instead of logging per frame
                     if reported_missing_decoder != Some(want_codec) {
                         reported_missing_decoder = Some(want_codec);
-                        let _ = app_handle.emit(
+                        emit_server(
+                            &app_handle,
+                            &server,
                             "screenshare-error",
                             serde_json::json!({
                                 "reason": format!(
@@ -4206,57 +4689,26 @@ fn video_decode_render_task(
 
         // ALWAYS decode — maintains codec reference state even when render is suppressed.
         // Skipping decode would cause even more corruption when rendering resumes.
-        let mut latest_decoded = match dec.decode(&frame_data) {
-            Ok(d) => d,
-            Err(e) => {
+        // Everything queued is decoded in order, but only the latest result is
+        // kept for rendering.
+        let mut latest_decoded = Vec::new();
+        let mut next = Some(first);
+        while let Some((frame_data, is_keyframe, gap_before)) = next {
+            let decoded = dec.decode(&frame_data);
+            if let Err(e) = &decoded {
                 warn!("{want_codec:?} decode error: {}", e);
-                suppress_render = true;
-                needs_keyframe.store(true, Ordering::Release);
-                // Auto-request keyframe on decode failure (max once per second)
-                if last_keyframe_request.elapsed() >= std::time::Duration::from_secs(1) {
-                    let sharer_id = watching_user_id.load(Ordering::Relaxed);
-                    if sharer_id != 0 {
-                        let msg = ClientMessage::RequestKeyframe { sharer_user_id: sharer_id };
-                        if let Ok(data) = encode_client_msg(&msg) {
-                            let _ = tcp_tx.send(data);
-                            info!("auto-requested keyframe from sharer {}", sharer_id);
-                        }
-                        last_keyframe_request = std::time::Instant::now();
-                    }
-                }
-                continue;
             }
-        };
-
-        // Track whether any keyframe *decoded* in this batch. A keyframe that
-        // failed to decode (a leftover frame of the previous share hitting the
-        // new decoder) must not resume rendering.
-        let mut keyframe_seen = is_keyframe;
-
-        // Drain any queued frames — decode all to maintain codec state,
-        // but only keep the latest decoded result for rendering
-        while let Ok((next_frame, next_is_keyframe)) = decode_rx.try_recv() {
-            match dec.decode(&next_frame) {
-                Ok(d) => {
-                    latest_decoded = d;
-                    if next_is_keyframe {
-                        keyframe_seen = true;
-                    }
-                }
-                Err(e) => {
-                    warn!("{want_codec:?} decode error (drain): {}", e);
-                    suppress_render = true;
-                    needs_keyframe.store(true, Ordering::Release);
-                }
+            let intact = chain_intact(!suppress_render, gap_before, is_keyframe, decoded.is_ok());
+            if intact && suppress_render {
+                info!("render resumed after keyframe");
             }
+            suppress_render = !intact;
+            if let Ok(d) = decoded {
+                latest_decoded = d;
+            }
+            next = decode_rx.try_recv().ok();
         }
-
-        // Keyframe decoded in this batch → reference chain is clean, resume rendering
-        if suppress_render && keyframe_seen {
-            suppress_render = false;
-            needs_keyframe.store(false, Ordering::Release);
-            info!("render resumed after keyframe");
-        }
+        needs_keyframe.store(suppress_render, Ordering::Release);
 
         // JPEG-encode and emit only if not suppressed
         if !suppress_render {
@@ -4268,6 +4720,13 @@ fn video_decode_render_task(
         }
     }
     info!("video decode+render task ended");
+}
+
+/// Whether the decoder's reference chain is intact after one more frame: a
+/// keyframe that decoded mends it; a gap in front of a frame, or a frame that
+/// failed to decode, breaks it.
+fn chain_intact(intact: bool, gap_before: bool, is_keyframe: bool, decoded: bool) -> bool {
+    decoded && (is_keyframe || (intact && !gap_before))
 }
 
 /// Capture+encode task: reads from mic, encodes to Opus, encrypts with
@@ -4291,6 +4750,7 @@ pub fn spawn_capture_encode_task(
     sender_lane: Arc<AtomicU32>,
     input_gain: Arc<AtomicU32>,
     app_handle: tauri::AppHandle,
+    server: Arc<str>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         // Whether voice was going out on the previous frame (talk edges)
@@ -4449,6 +4909,19 @@ pub fn spawn_capture_encode_task(
             let on_air = should_send && !is_muted.load(Ordering::Relaxed);
             if on_air != was_on_air {
                 was_on_air = on_air;
+                if !on_air {
+                    // Say the phrase ended, exactly as releasing push-to-talk
+                    // does. A voice-activated sender otherwise just stops, and
+                    // a pause is then indistinguishable from a network stall:
+                    // every receiver conceals its way into the silence before
+                    // its jitter buffer re-arms, and a radio's squelch waits
+                    // out the full idle timeout instead of closing on the end.
+                    let eot = VoicePacket::end_of_transmission(session_id, 0);
+                    let _ = voice_tx.blocking_send(eot.to_bytes());
+                }
+                // Not gated on voice like the receive side: a capture only
+                // ever starts on the voice connection, and its closing edge
+                // has to reach the mod even when voice has just moved on.
                 app_handle.state::<AppState>().sdk_event(SdkEvent::Talk {
                     user_id: session_id,
                     speaking: on_air,
@@ -4515,7 +4988,7 @@ pub fn spawn_capture_encode_task(
                             {
                                 key_missing_emitted = true;
                                 warn!("no media key for 2s — voice frames are being dropped");
-                                let _ = app_handle.emit("media-key-missing", ());
+                                emit_server(&app_handle, &server, "media-key-missing", ());
                             }
                             accumulated = 0;
                             continue;

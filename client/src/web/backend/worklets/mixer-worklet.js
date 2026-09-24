@@ -7,14 +7,16 @@
 // frames per source, pulls one 20 ms frame per source on the audio clock,
 // sums them with per-user gain, clamps, and honors deafen.
 //
-// bernd: a lost frame is 20 ms of silence. The native client decodes the
-// next packet's in-band FEC or runs Opus PLC; WebCodecs exposes neither, so
-// the upgrade path is a wasm Opus decoder driven from inside this worklet.
+// bernd: a lost frame is 20 ms of silence, faded out and back in so its
+// edges do not click. The native client decodes the next packet's in-band FEC
+// or runs Opus PLC; WebCodecs exposes neither, so the upgrade path is a wasm
+// Opus decoder driven from inside this worklet.
 
 // @ts-nocheck — AudioWorkletGlobalScope (currentTime, registerProcessor,
 // AudioWorkletProcessor) is not in the DOM lib, and this file only became
 // visible to tsc when audio.ts started importing its pure functions. The DSP
-// here is covered by client/src/lib/audio-fx.test.ts instead.
+// here is covered by client/src/lib/audio-fx.test.ts and the jitter buffer by
+// client/src/lib/jitter-buffer.test.ts instead.
 
 // Importable off the audio thread — the sender chain in audio.ts and the Node
 // tests both pull the pure functions out of this file, so there is exactly one
@@ -25,7 +27,7 @@ globalThis.registerProcessor ??= () => {};
 globalThis.currentTime ??= 0;
 
 const FRAME = 960;
-const LOST = Symbol("lost");
+export const LOST = Symbol("lost");
 
 // ── The effect chain, mirrored from crates/voipc-audio/src/mixer.rs ──────
 //
@@ -460,6 +462,22 @@ export function applySenderFx(pcm, fx, st, onAir, muffleA = 1, room = null, wate
 // jitter.rs constants (time in seconds on the audio clock)
 const MAX_PLC_RUN = 50;
 const MAX_LATE_DISCARDS = 25;
+/**
+ * Frames of concealment played while waiting for a packet that has not
+ * arrived yet. A network hiccup shorter than this is stretched over rather
+ * than cut: the stream keeps playing, the late packet is still played when it
+ * lands, and the cushion is permanently deeper by the size of the hiccup.
+ * Beyond it the pause is treated as the speaker having stopped.
+ */
+const MAX_STALL_PLC = 3;
+/**
+ * Frames above the target a stream may hold standing before one is shed.
+ * Bursty senders and clocked pulls swing the depth by a frame or two on their
+ * own; only a surplus beyond that is latency nobody asked for.
+ */
+const SHED_MARGIN = 2;
+/** Consecutive pops (50 = 1 s) the surplus must stand before a frame is shed. */
+export const SHED_AFTER = 50;
 const MIN_TARGET_DELAY = 2;
 const MAX_TARGET_DELAY = 8;
 const MAX_BUFFER_CAP = 32;
@@ -472,12 +490,21 @@ const SOURCE_IDLE_PRUNE = 60;
 const STATS_INTERVAL_FRAMES = 25;
 /** Meters refresh every 3 frames (60 ms): fast enough to follow speech. */
 const LEVEL_INTERVAL_FRAMES = 3;
+/** Samples a lane fades over where it stops or starts mid-waveform (2 ms). */
+const FADE = 96;
 
 const wrapSub = (a, b) => (a - b) >>> 0;
 const wrapAdd1 = (a) => (a + 1) >>> 0;
 
+/** Sum of squares: which of two frames is the louder. */
+function energy(pcm) {
+  let e = 0;
+  for (let i = 0; i < pcm.length; i++) e += pcm[i] * pcm[i];
+  return e;
+}
+
 /** Port of jitter.rs `JitterBuffer` holding decoded PCM instead of Opus. */
-class JitterBuffer {
+export class JitterBuffer {
   constructor(targetDelay) {
     /** Sorted by sequence ascending (like the BTreeMap): [{seq, pcm}] */
     this.entries = [];
@@ -487,6 +514,12 @@ class JitterBuffer {
     this.maxBuffer = Math.min(targetDelay * 4, MAX_BUFFER_CAP);
     this.lateDiscards = 0;
     this.lastChange = null;
+    /** Consecutive concealment frames played while the buffer sat empty. */
+    this.plcRun = 0;
+    /** Fewest frames waiting when a packet arrived this phrase (null: none yet). */
+    this.minDepth = null;
+    /** Consecutive pops that left more than SHED_MARGIN over the target. */
+    this.deepPops = 0;
   }
 
   noteTrouble() {
@@ -497,8 +530,18 @@ class JitterBuffer {
     this.maxBuffer = Math.min(this.targetDelay * 4, MAX_BUFFER_CAP);
   }
 
+  /**
+   * On (re-)entering buffering: shrink the delay after a quiet period, and only
+   * when the phrase just ended had a frame to spare at every arrival. A phrase
+   * whose cushion ran dry would just grow it back; bursty senders and receivers
+   * do that to a two-frame cushion early in most phrases. Measured at arrival
+   * because every tail drains to zero.
+   */
   maybeDecay() {
+    const spare = this.minDepth !== null && this.minDepth >= 1;
+    this.minDepth = null;
     if (
+      spare &&
       this.targetDelay > MIN_TARGET_DELAY &&
       (this.lastChange === null || currentTime - this.lastChange >= DECAY_QUIET)
     ) {
@@ -526,6 +569,7 @@ class JitterBuffer {
         this.lateDiscards = 0;
       }
     }
+    if (!this.buffering) this.minDepth = Math.min(this.minDepth ?? Infinity, this.entries.length);
 
     // Sorted insert; a duplicate sequence replaces the stored frame
     let i = this.entries.length;
@@ -558,11 +602,19 @@ class JitterBuffer {
 
     const idx = this.entries.findIndex((e) => e.seq === next);
     if (idx >= 0) {
+      if (this.plcRun > 0) {
+        // It arrived, just late: the cushion was too shallow for this link,
+        // so the next burst starts one frame deeper.
+        this.noteTrouble();
+        this.plcRun = 0;
+      }
       const [e] = this.entries.splice(idx, 1);
       this.nextSeq = wrapAdd1(next);
+      this.deepPops = this.entries.length > this.targetDelay + SHED_MARGIN ? this.deepPops + 1 : 0;
       return e.pcm;
     }
     if (this.entries.length > 0) {
+      this.plcRun = 0;
       const smallest = this.entries[0].seq;
       if (wrapSub(smallest, next) > MAX_PLC_RUN) {
         // Discontinuity too large to conceal: skip to the buffered data
@@ -572,10 +624,38 @@ class JitterBuffer {
       this.nextSeq = wrapAdd1(next);
       return LOST;
     }
-    // Underrun: re-arm buffering, keep nextSeq so stragglers are discarded
+    if (this.plcRun < MAX_STALL_PLC) {
+      // The packet is not here *yet*. Conceal this frame and keep nextSeq
+      // where it is, so a hiccup shorter than MAX_STALL_PLC is stretched over
+      // instead of played as a hole with hard edges — and the late packet is
+      // still played when it lands.
+      // bernd: silence stands in for Opus PLC (see the note at the top).
+      this.plcRun++;
+      return LOST;
+    }
+    // Long enough that the speaker has stopped, not stalled. Re-arm buffering
+    // so playback resumes with a full jitter cushion instead of repeated
+    // micro-drops; nextSeq is kept so stale stragglers are still discarded.
+    // This is the end of a phrase just like an end-of-transmission, and
+    // streams that never send one (screen audio, always-on voice) only ever
+    // end here, so the delay decays here too (see maybeDecay).
+    // Mirrors crates/voipc-audio/src/jitter.rs.
+    this.plcRun = 0;
     this.buffering = true;
     this.maybeDecay();
     return null;
+  }
+
+  /**
+   * Whether a standing surplus asks the caller to play one frame fewer; true
+   * at most once per SHED_AFTER pops. A continuous stream never reaches
+   * reset(), so latency added by a burst or a bridged stall would otherwise
+   * stay for good.
+   */
+  takeSurplus() {
+    if (this.deepPops < SHED_AFTER) return false;
+    this.deepPops = 0;
+    return true;
   }
 
   /** EndOfTransmission: clear, keeping the learned delay. */
@@ -584,6 +664,8 @@ class JitterBuffer {
     this.nextSeq = null;
     this.buffering = true;
     this.lateDiscards = 0;
+    this.plcRun = 0;
+    this.deepPops = 0;
     this.maybeDecay();
   }
 
@@ -644,6 +726,10 @@ class MixerProcessor extends AudioWorkletProcessor {
             fx: newFxState(),
             // This lane's own reverb and water, with its own delay lines
             room: new ReverbWater(),
+            // The lane's last output sample, and whether nothing played last
+            // frame: where a fade out starts, and whether a fade in is owed
+            last: 0,
+            gap: true,
           };
           this.sources.set(m.source, src);
         }
@@ -734,9 +820,11 @@ class MixerProcessor extends AudioWorkletProcessor {
         src.jitter.reset();
         src.eotReceived = false;
       }
-      const r = drained ? null : src.jitter.pop();
+      let r = drained ? null : src.jitter.pop();
       if (r === null || r === LOST) {
         if (r === LOST) this.framesLost++; // bernd: silence instead of FEC/PLC
+        const wasPlaying = !src.gap;
+        src.gap = true;
         // A lost packet is not a pause: the speaker is still talking, we simply
         // did not receive that frame. Counting it as idle closed a radio's
         // squelch a fifth of a second into a loss burst and opened it again on
@@ -748,6 +836,15 @@ class MixerProcessor extends AudioWorkletProcessor {
           src.fx.burst = 0; // deafened drops the burst rather than owing it
           src.fx.level = 0;
           continue;
+        }
+        // The lane stops mid-waveform; a step to zero is a click.
+        if (wasPlaying && src.last !== 0) {
+          for (let i = 0; i < FADE; i++) {
+            const s = src.last * (1 - (i + 1) / FADE);
+            this.mixL[i] += s * src.gainL;
+            this.mixR[i] += s * src.gainR;
+          }
+          mixed = true;
         }
         // A reverb tail outlives the voice that caused it, so the lane's room
         // keeps running here even with nothing left to play — the *tail*, never
@@ -772,7 +869,21 @@ class MixerProcessor extends AudioWorkletProcessor {
         continue;
       }
       this.framesPlayed++;
-      if (this.deafened) continue; // popped so the buffer keeps flowing
+      // A cushion that stayed deep for a second: play the louder of this frame
+      // and the next, so the one skipped is the one least missed (jitter.rs
+      // take_surplus).
+      if (src.jitter.takeSurplus()) {
+        const next = src.jitter.pop();
+        if (next === LOST) this.framesLost++;
+        else if (next) {
+          this.framesPlayed++;
+          if (energy(next) > energy(r)) r = next;
+        }
+      }
+      if (this.deafened) {
+        src.gap = true;
+        continue; // popped so the buffer keeps flowing
+      }
       // Screen-audio sources (high bit set) follow their sharer's volume
       const gain = this.userVolumes.get(key & 0x7fffffff) ?? 1;
       // Spatial placement, if any: [gainL, gainR, lowpass coefficient].
@@ -805,6 +916,12 @@ class MixerProcessor extends AudioWorkletProcessor {
       const lane = this.laneScratch.subarray(0, n);
       for (let i = 0; i < n; i++) lane[i] = fxSample(src.fx, r[i], lpA, fxp);
       src.room.applyMono(lane, room[0], room[1], true);
+      // Starting after silence: the first sample is wherever the waveform is.
+      if (src.gap) {
+        for (let i = 0; i < Math.min(FADE, n); i++) lane[i] *= i / FADE;
+      }
+      src.gap = false;
+      src.last = lane[n - 1];
       let sum = 0;
       for (let i = 0; i < n; i++) {
         const s = lane[i];

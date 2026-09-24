@@ -7,9 +7,10 @@
   // else's comes from their own beacons.
 
   import { invoke } from "@tauri-apps/api/core";
-  import { users, speakingUsers } from "../stores/users.js";
-  import { isAdmin, userId } from "../stores/connection.js";
-  import { channels, currentChannelId } from "../stores/channels.js";
+  import { speakingUsers } from "../stores/users.js";
+  // The room of the channel we talk in, on whichever server carries voice
+  import { voiceIsAdmin as isAdmin, voiceUserId as userId } from "../stores/connection.js";
+  import { voiceChannel, voiceUsers as users } from "../stores/channels.js";
   import { addNotification } from "../stores/notifications.js";
   import { avatarColor } from "../avatar.js";
   import {
@@ -33,9 +34,7 @@
   let preset = $state<PresetName>("free");
   let dragging: number | null = $state(null);
 
-  const channelCreator = $derived(
-    $channels.find((c) => c.channel_id === $currentChannelId)?.created_by ?? null,
-  );
+  const channelCreator = $derived($voiceChannel?.created_by ?? null);
   const is3d = $derived($currentProximity === "3d");
   const locked = $derived($drivenBy !== null);
 
@@ -44,7 +43,7 @@
    * here too — otherwise the plan would name everyone the list does not.
    */
   const roomUsers = $derived(
-    $channels.find((c) => c.channel_id === $currentChannelId)?.hide_members && !$isAdmin
+    $voiceChannel?.hide_members && !$isAdmin
       ? $users.filter((u) => u.user_id === $userId)
       : $users,
   );

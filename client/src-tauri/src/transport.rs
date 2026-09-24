@@ -25,7 +25,7 @@ use rustls::client::WebPkiServerVerifier;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{DigitallySignedStruct, SignatureScheme};
 use tracing::{info, warn};
-use wtransport::config::{DnsLookupFuture, DnsResolver};
+use wtransport::config::{DnsLookupFuture, DnsResolver, QuicTransportConfig};
 use wtransport::endpoint::endpoint_side::Client;
 use wtransport::{ClientConfig, Connection, Endpoint, RecvStream, SendStream, VarInt};
 
@@ -93,9 +93,15 @@ pub async fn connect(host: &str, port: u16, accept_invalid_certs: bool) -> Resul
         }
         .parse()
         .expect("literal bind address");
+        // Few video frames in flight, sent in order: see server_config in
+        // crates/voipc-server/src/web.rs for why.
+        let mut transport = QuicTransportConfig::default();
+        transport
+            .max_concurrent_uni_streams(24u32.into())
+            .send_fairness(false);
         let config = ClientConfig::builder()
             .with_bind_address(bind)
-            .with_custom_tls(tls)
+            .with_custom_tls_and_transport(tls, transport)
             // Keeps NAT mappings alive through silent channels; a vanished
             // server trips the 30 s idle timeout and surfaces as a read error.
             .keep_alive_interval(Some(Duration::from_secs(10)))
@@ -142,6 +148,8 @@ pub async fn connect(host: &str, port: u16, accept_invalid_certs: bool) -> Resul
     .await
     .map_err(|_| "Timed out opening the control stream".to_string())?
     .map_err(|e| format!("Could not open the control stream: {e}"))?;
+    // Control messages must not wait behind video frames, which go out in order.
+    control_send.set_priority(1);
 
     Ok(Link {
         quic: Quic {

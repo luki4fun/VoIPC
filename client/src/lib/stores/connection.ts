@@ -1,29 +1,25 @@
 import { get, writable } from "svelte/store";
 import { patchUser, users } from "./users.js";
-import { splitAddress } from "../invite.js";
+import { scoped, serverAddress } from "./scoped.js";
+import { openServers, serverKey } from "./servers.js";
+import { voiceServer } from "./channels.js";
 
 export type ConnectionState = "disconnected" | "connecting" | "connected" | "reconnecting";
 
-export const connectionState = writable<ConnectionState>("disconnected");
-export const serverAddress = writable<string>("");
+/** Each server's connection. The bare store is the one on screen. */
+export const connectionState = scoped<ConnectionState>(() => "disconnected");
 
-/**
- * The server we are on, as `"host:port"`, or `""` before a connection.
- *
- * Anything kept per server is filed under this: the text channels a user
- * walked out of, and the chat history itself — two servers' `#general` are not
- * the same room, and one server must never be handed the other's messages.
- */
-export function serverKey(): string {
-  const address = get(serverAddress);
-  if (!address) return "";
-  const { host, port } = splitAddress(address);
-  return `${host}:${port}`;
-}
-export const username = writable<string>("");
-export const userId = writable<number>(0);
+// The server on screen, and the key anything named on a server is filed under
+// — two servers' `#general` are not the same room, and one server must never be
+// handed the other's messages. Both live with the server list now; re-exported
+// because this is where everything else has always imported them from.
+export { serverAddress, serverKey };
+
+export const username = scoped<string>(() => "");
+export const userId = scoped<number>(() => 0);
 export const sessionId = writable<number>(0);
-export const latency = writable<number>(0);
+export const latency = scoped<number>(() => 0);
+/** Mute and deafen are ours, not a server's: one flag, sent to every server. */
 export const isMuted = writable<boolean>(false);
 export const isDeafened = writable<boolean>(false);
 
@@ -38,12 +34,20 @@ export const isDeafened = writable<boolean>(false);
  */
 export function setSelfMuted(muted: boolean): void {
   isMuted.set(muted);
-  users.update((all) => patchUser(all, get(userId), { is_muted: muted }));
+  patchSelf({ is_muted: muted });
 }
 
 export function setSelfDeafened(deafened: boolean): void {
   isDeafened.set(deafened);
-  users.update((all) => patchUser(all, get(userId), { is_deafened: deafened }));
+  patchSelf({ is_deafened: deafened });
+}
+
+/** Our own row on every open server: the flag went to all of them. */
+function patchSelf(patch: { is_muted?: boolean; is_deafened?: boolean }): void {
+  for (const server of get(openServers)) {
+    const self = get(userId.of(server));
+    users.of(server).update((all) => patchUser(all, self, patch));
+  }
 }
 export const isTransmitting = writable<boolean>(false);
 
@@ -54,15 +58,23 @@ export const isTransmitting = writable<boolean>(false);
  * you opened yourself.
  */
 export const transmitHeldByGame = writable<boolean>(false);
-export const acceptSelfSigned = writable<boolean>(false);
+export const acceptSelfSigned = scoped<boolean>(() => false);
 
 /** This session is logged in with the server's admin token. */
-export const isAdmin = writable<boolean>(false);
+export const isAdmin = scoped<boolean>(() => false);
+
+// Who we are on the server carrying voice: the mixer, the room and the voice
+// keys are about the call, whichever server is on screen.
+export const voiceUserId = userId.at(voiceServer);
+export const voiceUsername = username.at(voiceServer);
+export const voiceIsAdmin = isAdmin.at(voiceServer);
 
 /** From an invite link: the channel to join once connected. */
 export interface PendingInvite {
   channel: string;
   password: string | null;
+  /** The server it is for; unset until known, and then the server on screen. */
+  server?: string;
 }
 export const pendingInvite = writable<PendingInvite | null>(null);
 
@@ -73,23 +85,23 @@ export const pendingInvite = writable<PendingInvite | null>(null);
  *  Use the three helpers below rather than the map. */
 export const channelPasswords = writable<Map<string, string>>(new Map());
 
-const passwordKey = (name: string) => `${serverKey()}/${name}`;
+const passwordKey = (server: string, name: string) => `${serverKey(server)}/${name}`;
 
-/** Remember the password this session used for a channel on this server. */
-export function rememberChannelPassword(name: string, password: string): void {
-  channelPasswords.update((m) => new Map(m).set(passwordKey(name), password));
+/** Remember the password this session used for a channel on a server. */
+export function rememberChannelPassword(server: string, name: string, password: string): void {
+  channelPasswords.update((m) => new Map(m).set(passwordKey(server, name), password));
 }
 
 /** Forget it — the channel no longer has one. */
-export function forgetChannelPassword(name: string): void {
+export function forgetChannelPassword(server: string, name: string): void {
   channelPasswords.update((m) => {
     const next = new Map(m);
-    next.delete(passwordKey(name));
+    next.delete(passwordKey(server, name));
     return next;
   });
 }
 
-/** The password this session knows for a channel here, if any. */
-export function channelPassword(name: string): string | null {
-  return get(channelPasswords).get(passwordKey(name)) ?? null;
+/** The password this session knows for a channel on a server, if any. */
+export function channelPassword(server: string, name: string): string | null {
+  return get(channelPasswords).get(passwordKey(server, name)) ?? null;
 }

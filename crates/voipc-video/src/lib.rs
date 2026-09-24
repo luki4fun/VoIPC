@@ -200,7 +200,9 @@ pub mod convert {
     }
 }
 
-/// Seconds between the periodic IDRs the app forces (`frame_id % (this × fps)`).
+/// Seconds between the periodic IDRs the app forces, timed from the last one
+/// that went out whole: a still screen captures no frames to count, so the
+/// sharer re-encodes its last one when this runs out.
 /// Video travels on reliable QUIC streams, so loss no longer breaks the decoder
 /// chain; the periodic keyframe is only a safety net (a new viewer asks for one
 /// explicitly) and costs 10–20× a delta frame.

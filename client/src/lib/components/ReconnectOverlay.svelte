@@ -1,34 +1,40 @@
 <script lang="ts">
-  interface Props {
-    attempt: number;
-    error?: string;
-    oncancel: () => void;
-  }
+  // "This server is not up": over the pane of the server on screen while it
+  // connects or reconnects. Inside the pane rather than over the window, so the
+  // rail, the other servers and the call — which may be on one of them — stay
+  // usable while this one retries.
 
-  let { attempt, error = "", oncancel }: Props = $props();
+  import { connectionState, serverAddress } from "../stores/connection.js";
+  import { cancelReconnect, reconnectInfo } from "../connect.js";
 </script>
 
-<div class="overlay">
-  <div class="dialog">
-    <div class="spinner"></div>
-    <h2>Connection Lost</h2>
-    <p class="message">Reconnecting... attempt #{attempt}</p>
-    {#if error}
-      <p class="error-detail">{error}</p>
-    {/if}
-    <button class="cancel-btn" onclick={oncancel}>Cancel</button>
+{#if $connectionState === "reconnecting" || $connectionState === "connecting"}
+  <div class="overlay">
+    <div class="dialog">
+      <div class="spinner"></div>
+      {#if $connectionState === "connecting"}
+        <h2>Connecting</h2>
+      {:else}
+        <h2>Connection Lost</h2>
+        <p class="message">Reconnecting... attempt #{$reconnectInfo.attempt}</p>
+      {/if}
+      {#if $reconnectInfo.error}
+        <p class="error-detail">{$reconnectInfo.error}</p>
+      {/if}
+      <button class="cancel-btn" onclick={() => cancelReconnect($serverAddress)}>Cancel</button>
+    </div>
   </div>
-</div>
+{/if}
 
 <style>
   .overlay {
-    position: fixed;
+    position: absolute;
     inset: 0;
     background: rgba(0, 0, 0, 0.7);
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 100;
+    z-index: 30;
   }
 
   .dialog {
@@ -36,7 +42,8 @@
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 32px;
-    width: 320px;
+    width: min(320px, 90%);
+    box-sizing: border-box;
     display: flex;
     flex-direction: column;
     align-items: center;

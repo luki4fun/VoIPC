@@ -311,9 +311,11 @@ impl Decoder {
         unsafe {
             let idx = ffi::AMediaCodec_dequeueInputBuffer(self.codec, 10_000); // 10ms
             if idx < 0 {
-                // No buffer available — drop this frame
-                tracing::trace!("AMediaCodec: no input buffer available, dropping frame");
-                return Ok(());
+                // The frame is lost, and that has to be said: a silently
+                // dropped frame breaks the reference chain while every later
+                // delta still decodes. An error makes the caller suppress
+                // rendering and ask for a keyframe.
+                return Err(anyhow!("AMediaCodec: no input buffer within 10 ms, frame dropped"));
             }
             let idx = idx as usize;
 
@@ -350,13 +352,24 @@ impl Decoder {
     }
 
     /// Drain all available decoded frames from the output.
+    ///
+    /// Hardware decoders finish asynchronously, so the first picture is waited
+    /// for (up to 10 ms) and only the rest are polled: polling at 0 right after
+    /// queueing returned the previous frame, so the display ran one input
+    /// behind and a still share never showed its last update. The wait lasts
+    /// until a picture rather than one call, because the very first one comes
+    /// in behind INFO_OUTPUT_FORMAT_CHANGED.
+    /// ponytail: a decode that outlasts the wait can still leave the display a
+    /// picture behind for a while; waiting for the pts just queued would not.
     fn drain_output(&mut self) -> Result<Vec<DecodedFrame>> {
         let mut frames = Vec::new();
+        let mut timeout_us: i64 = 10_000;
 
         loop {
             let mut info = ffi::AMediaCodecBufferInfo::default();
-            let idx =
-                unsafe { ffi::AMediaCodec_dequeueOutputBuffer(self.codec, &mut info, 0) };
+            let idx = unsafe {
+                ffi::AMediaCodec_dequeueOutputBuffer(self.codec, &mut info, timeout_us)
+            };
 
             if idx == ffi::AMEDIACODEC_INFO_TRY_AGAIN_LATER {
                 break;
@@ -375,6 +388,7 @@ impl Decoder {
                 tracing::warn!("AMediaCodec: dequeueOutputBuffer unexpected: {}", idx);
                 break;
             }
+            timeout_us = 0;
 
             let idx_u = idx as usize;
 

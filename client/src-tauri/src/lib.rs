@@ -159,6 +159,8 @@ pub fn run() {
                     s.mic_muffle = cfg.mic_muffle;
                     s.mic_reverb = cfg.mic_reverb;
                     s.mic_water = cfg.mic_water;
+                    // ...and what every connection reads live
+                    state.seed_shared(&s);
                 }
                 state.input_gain.store(
                     cfg.input_gain.clamp(0.0, 4.0).to_bits(),
@@ -326,6 +328,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::connect,
             commands::disconnect,
+            commands::disconnect_all,
             commands::join_channel,
             commands::leave_channel,
             commands::create_channel,
@@ -424,6 +427,7 @@ pub fn run() {
             commands::save_connection_info,
             commands::save_server,
             commands::remove_server,
+            commands::save_open_servers,
             commands::start_mic_test,
             commands::stop_mic_test,
             commands::start_output_test,

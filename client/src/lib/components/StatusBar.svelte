@@ -5,24 +5,24 @@
   // admin dialogs are AdminDialogs.svelte, both because the modern layout shows
   // the same things somewhere else and neither should be computed twice.
 
-  import { invoke } from "@tauri-apps/api/core";
   import { connectionState, serverAddress, latency, isAdmin } from "../stores/connection.js";
+  import { viewingVoice } from "../stores/channels.js";
   import { lossPercent, quality } from "../stores/connection-quality.js";
   import { openAdminPanel, showAdminLogin } from "../stores/admin-ui.js";
+  import { disconnectServer } from "../connect.js";
   import { playDisconnectedSound } from "../sounds.js";
-  import { addNotification } from "../stores/notifications.js";
   import Icon from "./Icons.svelte";
 
+  // The server on screen only: the others, and the call if it is on one of
+  // them, stay.
   async function disconnect() {
-    try {
-      await invoke("disconnect");
-      connectionState.set("disconnected");
-      playDisconnectedSound();
-    } catch (e) {
-      console.error("Failed to disconnect:", e);
-      addNotification(`Failed to disconnect: ${e}`, "error");
-    }
+    await disconnectServer($serverAddress);
+    playDisconnectedSound();
   }
+
+  // The loss is the call's; next to another server's ping it would be a number
+  // about somewhere else.
+  const loss = $derived($viewingVoice ? $lossPercent : 0);
 </script>
 
 <div class="status-bar">
@@ -42,8 +42,8 @@
   </div>
 
   {#if $connectionState === "connected"}
-    <span class="latency quality-{$quality}" title="Voice packet loss (2s window)">
-      Ping: {$latency}ms{#if $lossPercent > 0}&nbsp;· {$lossPercent}% loss{/if}
+    <span class="latency quality-{$viewingVoice ? $quality : 'good'}" title="Voice packet loss (2s window)">
+      Ping: {$latency}ms{#if loss > 0}&nbsp;· {loss}% loss{/if}
     </span>
     <button
       class="admin-btn"

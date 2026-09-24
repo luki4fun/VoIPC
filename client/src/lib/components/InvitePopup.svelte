@@ -1,24 +1,27 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { pendingInvites } from "../stores/invites.js";
+  import { pendingInvites, type PendingInvite } from "../stores/invites.js";
+  import { serverAddress } from "../stores/connection.js";
+  import { serverEntries } from "../connect.js";
 
-  async function accept(channelId: number) {
-    pendingInvites.update((inv) =>
-      inv.filter((i) => i.channel_id !== channelId),
-    );
+  function drop(invite: PendingInvite) {
+    pendingInvites.update((inv) => inv.filter((i) => i !== invite));
+  }
+
+  // Back to the server that sent it, whichever one is on screen now
+  async function accept(invite: PendingInvite) {
+    drop(invite);
     try {
-      await invoke("accept_invite", { channelId });
+      await invoke("accept_invite", { server: invite.server, channelId: invite.channel_id });
     } catch (e) {
       console.error("Failed to accept invite:", e);
     }
   }
 
-  async function decline(channelId: number) {
-    pendingInvites.update((inv) =>
-      inv.filter((i) => i.channel_id !== channelId),
-    );
+  async function decline(invite: PendingInvite) {
+    drop(invite);
     try {
-      await invoke("decline_invite", { channelId });
+      await invoke("decline_invite", { server: invite.server, channelId: invite.channel_id });
     } catch (e) {
       console.error("Failed to decline invite:", e);
     }
@@ -27,14 +30,15 @@
 
 {#if $pendingInvites.length > 0}
   <div class="invite-container">
-    {#each $pendingInvites as invite (invite.channel_id)}
+    {#each $pendingInvites as invite (invite.server + "/" + invite.channel_id)}
       <div class="invite">
         <span class="invite-text">
-          <strong>{invite.invited_by}</strong> invited you to <strong>#{invite.channel_name}</strong>
+          <strong>{invite.invited_by}</strong> invited you to <strong>#{invite.channel_name}</strong
+          >{#if invite.server !== $serverAddress}&nbsp;on {$serverEntries.find((e) => e.id === invite.server)?.name ?? invite.server}{/if}
         </span>
         <div class="invite-actions">
-          <button class="accept-btn" onclick={() => accept(invite.channel_id)}>Accept</button>
-          <button class="decline-btn" onclick={() => decline(invite.channel_id)}>Decline</button>
+          <button class="accept-btn" onclick={() => accept(invite)}>Accept</button>
+          <button class="decline-btn" onclick={() => decline(invite)}>Decline</button>
         </div>
       </div>
     {/each}

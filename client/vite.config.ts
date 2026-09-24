@@ -1,5 +1,7 @@
 import { defineConfig } from "vite";
 import { svelte } from "@sveltejs/vite-plugin-svelte";
+import { execFileSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 // Browser build (`vite build --mode web` / `vite --mode web`): the Tauri API
@@ -17,8 +19,52 @@ const webAliases = [
   { find: /^@tauri-apps\/plugin-notification$/, replacement: shim("notification") },
 ];
 
+const here = fileURLToPath(new URL(".", import.meta.url));
+
+/**
+ * Which build this is, substituted into the bundle.
+ *
+ * The version answers "which release" and nothing finer — it moves once per
+ * release, and a browser hands back a cached bundle that claims the same one.
+ * So two more things are stamped in: the commit says which code, and the build
+ * time says which build of that code, which is the only part that still moves
+ * while the work is uncommitted — which is most of the time it matters.
+ *
+ * Under `vite dev` this is the moment the dev server started, not the moment
+ * of the last hot reload; there is no build to date in that mode.
+ */
+function buildStamp() {
+  const git = (...args: string[]) => {
+    try {
+      return execFileSync("git", args, {
+        cwd: here,
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .toString()
+        .trim();
+    } catch {
+      // No git binary, or no checkout to ask: the release image drops .git
+      // (see .dockerignore), so that build stamps VOIPC_BUILD_HASH or nothing.
+      return "";
+    }
+  };
+  const pinned = process.env.VOIPC_BUILD_HASH;
+  const head = pinned || git("rev-parse", "--short", "HEAD");
+  // Tracked edits only — an untracked scratch file is not a different build.
+  const dirty =
+    !pinned && head && git("status", "--porcelain", "--untracked-files=no");
+  return {
+    hash: head ? `${head}${dirty ? "+" : ""}` : "no-git",
+    time: new Date().toISOString(),
+  };
+}
+
 export default defineConfig(({ mode }) => {
   const web = mode === "web";
+  const stamp = buildStamp();
+  const pkg = JSON.parse(
+    readFileSync(new URL("./package.json", import.meta.url), "utf8"),
+  );
   return {
     plugins: [svelte()],
     clearScreen: false,
@@ -29,6 +75,9 @@ export default defineConfig(({ mode }) => {
     envPrefix: ["VITE_", "TAURI_"],
     define: {
       __WEB__: web,
+      __APP_VERSION__: JSON.stringify(pkg.version),
+      __BUILD_HASH__: JSON.stringify(stamp.hash),
+      __BUILD_TIME__: JSON.stringify(stamp.time),
     },
     resolve: web ? { alias: webAliases } : undefined,
     build: {

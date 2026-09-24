@@ -13,6 +13,49 @@ pub mod resample;
 pub mod spatial;
 pub mod vad;
 
+// ── Playback stats ───────────────────────────────────────────────────────
+//
+// Reported by whichever backend is compiled in (cpal or Oboe) and read by the
+// mixer, which has to know two things about the device it cannot ask for:
+// whether it is starving, and how much it swallows at once.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+
+static UNDERRUNS: AtomicU32 = AtomicU32::new(0);
+static REQUEST_MAX: AtomicU32 = AtomicU32::new(0);
+
+/// A callback found the ring only partly filled: that is an audible gap. A
+/// fully dry ring is silence, not a gap, and is not counted.
+pub(crate) fn note_underrun() {
+    UNDERRUNS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// A callback asked for `samples` interleaved-stereo samples' worth of audio.
+pub(crate) fn note_request(samples: usize) {
+    REQUEST_MAX.fetch_max(samples as u32, Ordering::Relaxed);
+}
+
+/// Playback underruns since the last call.
+pub fn take_underruns() -> u32 {
+    UNDERRUNS.swap(0, Ordering::Relaxed)
+}
+
+/// The largest callback since the last call, in interleaved-stereo samples.
+///
+/// Read periodically rather than kept forever, so one outsized callback sizes
+/// the cushion for a couple of seconds, not for the rest of the session. The
+/// biggest of all, a stream's first (the device's whole buffer: 100 ms on ALSA
+/// here, against 42.7 ms in steady state), is never noted: the prime covers it.
+pub fn take_request_max() -> u32 {
+    REQUEST_MAX.swap(0, Ordering::Relaxed)
+}
+
+/// Forget both, e.g. when a new stream is opened on a different device.
+pub fn reset_playback_stats() {
+    UNDERRUNS.store(0, Ordering::Relaxed);
+    REQUEST_MAX.store(0, Ordering::Relaxed);
+}
+
 // Android audio via Oboe (AAudio/OpenSL ES)
 #[cfg(target_os = "android")]
 pub mod capture {
@@ -138,8 +181,10 @@ pub mod playback {
         AudioStreamBuilder, DataCallbackResult, Mono, PerformanceMode, SharingMode,
         Usage, ContentType,
     };
-    use ringbuf::traits::{Consumer, Split};
+    use ringbuf::traits::{Consumer, Producer, Split};
     use ringbuf::HeapRb;
+    use std::sync::Arc;
+    use tokio::sync::Notify;
 
     const TARGET_SAMPLE_RATE: u32 = 48_000;
     // ~200ms of interleaved stereo samples
@@ -149,6 +194,12 @@ pub mod playback {
         consumer: ringbuf::HeapCons<f32>,
         /// Interleaved stereo pulled from the ring before the downmix.
         scratch: Vec<f32>,
+        /// Told after every callback so the mixer runs on the device clock;
+        /// `None` for a stream that is not the voice mixer's, which also
+        /// leaves the playback stats alone.
+        wake: Option<Arc<Notify>>,
+        /// No callback yet: its outsized ask is covered by the prime.
+        first: bool,
     }
 
     impl AudioOutputCallback for OboePlayback {
@@ -165,6 +216,10 @@ pub mod playback {
             audio_data: &mut [f32],
         ) -> DataCallbackResult {
             let frames = audio_data.len();
+            let report = self.wake.is_some();
+            if report && !std::mem::take(&mut self.first) {
+                crate::note_request(frames * 2);
+            }
             self.scratch.clear();
             self.scratch.resize(frames * 2, 0.0);
             let read = self.consumer.pop_slice(&mut self.scratch) / 2;
@@ -174,6 +229,9 @@ pub mod playback {
             }
             if read < frames {
                 // Underrun: fade out last samples to avoid clicks, then silence
+                if read > 0 && report {
+                    crate::note_underrun();
+                }
                 let fade_len = read.min(32);
                 for i in 0..fade_len {
                     let factor = 1.0 - (i as f32 / fade_len as f32);
@@ -182,6 +240,9 @@ pub mod playback {
                 for sample in &mut audio_data[read..] {
                     *sample = 0.0;
                 }
+            }
+            if let Some(wake) = &self.wake {
+                wake.notify_one();
             }
             DataCallbackResult::Continue
         }
@@ -208,13 +269,25 @@ pub mod playback {
     pub fn start_playback(
         _device_name: Option<&str>,
         _error_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        wake: Option<Arc<Notify>>,
     ) -> Result<(PlaybackStream, ringbuf::HeapProd<f32>)> {
+        if wake.is_some() {
+            crate::reset_playback_stats();
+        }
         let rb = HeapRb::<f32>::new(PLAYBACK_BUFFER_SIZE);
-        let (producer, consumer) = rb.split();
+        let (mut producer, consumer) = rb.split();
+
+        // Silence in front of the first callback, for the same reason the cpal
+        // path does it: nothing can size a cushion before the device has asked
+        // for anything once.
+        let prime = vec![0.0f32; TARGET_SAMPLE_RATE as usize / 10 * 2];
+        let _ = producer.push_slice(&prime);
 
         let callback = OboePlayback {
             consumer,
             scratch: Vec::new(),
+            wake,
+            first: true,
         };
 
         let mut stream = AudioStreamBuilder::default()

@@ -10,10 +10,11 @@
   // .ctx-item and .ctx-vol-slider by hand. They came across unchanged.
 
   import { openDm } from "../stores/chat.js";
-  import { userId, isAdmin } from "../stores/connection.js";
+  import { viewingVoice } from "../stores/channels.js";
+  import { isAdmin, serverAddress } from "../stores/connection.js";
   import { isMobile, mobileTab } from "../stores/platform.js";
   import { centreView } from "../stores/room.js";
-  import { canInvite, canKick, isPreviewing } from "../stores/roster.js";
+  import { canInvite, canKick, isCurrentChannelCreator, isPreviewing } from "../stores/roster.js";
   import { selectedStrip, setUserVolume, toggleUserMute, userVolumes } from "../stores/mixer.js";
   import {
     adminAction,
@@ -93,13 +94,16 @@
       onclick={(e) => e.stopPropagation()}
       bind:this={menuEl}
     >
-      {#if !$isPreviewing && menu.user.is_screen_sharing}
+      <!-- Watching, the mixer and the volume are the call's, so only for
+           somebody on the server carrying it: an id on another server is a
+           different person to the backend's voice connection. -->
+      {#if !$isPreviewing && $viewingVoice && menu.user.is_screen_sharing}
         <button class="ctx-item" onclick={() => { watchUser(menu.user.user_id); closeUserMenu(); }}>
           <Icon name="play" size={16} />
           <span>Watch Screen</span>
         </button>
       {/if}
-      <button class="ctx-item" onclick={() => { openDm(menu.user.user_id, menu.user.username, $userId); closeUserMenu(); }}>
+      <button class="ctx-item" onclick={() => { openDm($serverAddress, menu.user.user_id, menu.user.username); closeUserMenu(); }}>
         <Icon name="direct-message" size={16} />
         <span>Direct Message</span>
       </button>
@@ -107,7 +111,7 @@
         <Icon name="poke" size={16} />
         <span>Poke</span>
       </button>
-      {#if !$isPreviewing}
+      {#if !$isPreviewing && $viewingVoice}
         <button
           class="ctx-item"
           onclick={() => {
@@ -121,13 +125,13 @@
           <span>Mixer…</span>
         </button>
       {/if}
-      {#if $canInvite}
+      {#if $canInvite || (menu.idle && $isCurrentChannelCreator)}
         <button class="ctx-item" onclick={() => { inviteUser(menu.user.user_id); closeUserMenu(); }}>
           <Icon name="invite" size={16} />
           <span>Invite to Channel</span>
         </button>
       {/if}
-      {#if $canKick}
+      {#if $canKick && !menu.idle}
         <div class="ctx-separator"></div>
         <button class="ctx-item danger" onclick={() => { kickUser(menu.user.user_id); closeUserMenu(); }}>
           <Icon name="kick" size={16} />
@@ -153,7 +157,7 @@
           <span>Ban until restart</span>
         </button>
       {/if}
-      {#if !$isPreviewing}
+      {#if !$isPreviewing && $viewingVoice}
         <div class="ctx-separator"></div>
         <div class="ctx-volume">
           <button

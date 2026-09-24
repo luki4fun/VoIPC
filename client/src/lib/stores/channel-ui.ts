@@ -24,6 +24,7 @@ import {
   serverKey,
   userId,
 } from "./connection.js";
+import { scoped } from "./scoped.js";
 import {
   activeDmUserId,
   activeTextChannelId,
@@ -60,19 +61,26 @@ function resetCreateForm(): void {
 
 export const cancelCreate = resetCreateForm;
 
+// Every action below is one the user took on the server on screen, so each
+// reads `serverAddress` once, on the way in, and names that server from then
+// on. Reading it again after an `await` could land the rest of the work on a
+// server the user switched to in the meantime.
+
 export async function createChannel(): Promise<void> {
+  const server = get(serverAddress);
   const name = get(newChannelName).trim();
   if (!name) return;
   const password = get(newChannelPassword);
   try {
     await invoke("create_channel", {
+      server,
       name,
       password: password || null,
       proximity: get(newChannelProximity),
       anonymous: get(newChannelAnonymous),
       text: get(newChannelText),
     });
-    if (password) rememberChannelPassword(name, password);
+    if (password) rememberChannelPassword(server, name, password);
     resetCreateForm();
   } catch (e) {
     console.error("Failed to create channel:", e);
@@ -90,21 +98,31 @@ export async function createChannel(): Promise<void> {
  * one request per row on the way past.
  */
 export function previewChannel(channelId: number): void {
+  const server = get(serverAddress);
   // Always exit DM mode when picking a channel
-  if (get(activeDmUserId) !== null) closeDm();
+  if (get(activeDmUserId) !== null) closeDm(server);
 
   if (channelId === get(currentChannelId)) {
     // Picking our own channel clears the preview and shows its chat
-    previewChannelId.set(null);
-    previewUsers.set([]);
+    previewChannelId.of(server).set(null);
+    previewUsers.of(server).set([]);
     return;
   }
-  previewChannelId.set(channelId);
+  previewChannelId.of(server).set(channelId);
   const name = get(channels).find((c) => c.channel_id === channelId)?.name;
-  if (name) clearChannelUnread(name);
-  invoke("request_channel_users", { channelId }).catch((e: unknown) =>
+  if (name) clearChannelUnread(server, name);
+  invoke("request_channel_users", { server, channelId }).catch((e: unknown) =>
     console.error("Failed to request channel users:", e),
   );
+}
+
+/** Stop looking at another channel: back to the one we stand in, or — out of
+ *  voice — to the plain "pick something" pane, which has no row of its own to
+ *  click any more now that the lobby is not listed. */
+export function endPreview(): void {
+  const server = get(serverAddress);
+  previewChannelId.of(server).set(null);
+  previewUsers.of(server).set([]);
 }
 
 /**
@@ -115,19 +133,23 @@ export function previewChannel(channelId: number): void {
  * fire a join the server refuses.
  */
 export async function joinChannel(channelId: number, hasPassword: boolean): Promise<boolean> {
+  const server = get(serverAddress);
   const alreadyIn =
     channelId === get(currentChannelId) || get(joinedTextChannelIds).has(channelId);
   if (hasPassword && !alreadyIn) {
+    promptServer = server;
     passwordPromptChannelId.set(channelId);
     passwordPromptInput.set("");
     // Asked, not joined: the caller must not act as though we were in it
     return false;
   }
   try {
-    await invoke("join_channel", { channelId, password: null });
+    // Joining a voice channel here takes voice away from any other server:
+    // the backend leaves it there once this join is confirmed.
+    await invoke("join_channel", { server, channelId, password: null });
     // Asking to be in a text channel undoes having walked out of it. Only a
     // text channel: the list is of names, and a voice room may share one.
-    if (isTextChannel(channelId)) forgetLeft(channelId);
+    if (isTextChannel(server, channelId)) forgetLeft(server, channelId);
     return true;
   } catch (e) {
     console.error("Failed to join channel:", e);
@@ -141,7 +163,7 @@ export async function joinChannel(channelId: number, hasPassword: boolean): Prom
 // A text channel is a subscription: joining one does not cost you the voice
 // channel you stand in, and several can be open at once. That is why leaving
 // needs its own command — `join_channel(0)`, which is how you leave a voice
-// channel, means "stand in the lobby" and says nothing about a subscription.
+// channel (`leaveVoice` in voice.ts), says nothing about a subscription.
 
 /**
  * One click on a channel row, in either sidebar.
@@ -159,14 +181,15 @@ export async function joinChannel(channelId: number, hasPassword: boolean): Prom
  * Clicking the voice channel you are already in is how you ask for its chat.
  */
 export async function selectChannel(channel: ChannelInfo): Promise<void> {
+  const server = get(serverAddress);
   if (channel.text) {
     if (!get(joinedTextChannelIds).has(channel.channel_id)) {
       previewChannel(channel.channel_id);
       showChatPane();
       return;
     }
-    openTextChannel(channel.channel_id);
-    clearChannelUnread(channel.name);
+    openTextChannel(server, channel.channel_id);
+    clearChannelUnread(server, channel.name);
     // On a phone the channel list is a tab of its own in one layout and a
     // drawer over the chat in the other: picking a channel to read has to show
     // the chat in both, or the tap looks like it did nothing.
@@ -177,9 +200,9 @@ export async function selectChannel(channel: ChannelInfo): Promise<void> {
     // Back to where we stand, from whatever we were reading: the pane and the
     // member list both follow the preview, so clicking our own channel has to
     // clear it or there is no way back to our own members.
-    previewChannelId.set(null);
-    previewUsers.set([]);
-    openTextChannel(null);
+    previewChannelId.of(server).set(null);
+    previewUsers.of(server).set([]);
+    openTextChannel(server, null);
     showChatPane();
     return;
   }
@@ -195,32 +218,36 @@ export async function selectChannel(channel: ChannelInfo): Promise<void> {
  * name.
  */
 export async function joinTextChannel(channel: ChannelInfo): Promise<void> {
+  const server = get(serverAddress);
   // A password prompt opens instead of a join; the pane follows once the
   // password goes through, not while the dialog is still up.
   if (!(await joinChannel(channel.channel_id, channel.has_password))) return;
-  openJoinedTextChannel(channel.channel_id, channel.name);
+  openJoinedTextChannel(server, channel.channel_id, channel.name);
 }
 
 /** Show a text channel we have just entered; `openTextChannel` drops the
  *  preview of it. */
-function openJoinedTextChannel(channelId: number, name: string): void {
-  openTextChannel(channelId);
-  clearChannelUnread(name);
-  showChatPane();
+function openJoinedTextChannel(server: string, channelId: number, name: string): void {
+  openTextChannel(server, channelId);
+  clearChannelUnread(server, name);
+  // Only where it is on screen: the user may have gone to look at another
+  // server while the join was on its way.
+  if (get(serverAddress) === server) showChatPane();
 }
 
 /** Walk out of a text channel, and remember it for the next connect. */
 export async function leaveTextChannel(channelId: number): Promise<void> {
-  const name = channelName(channelId);
+  const server = get(serverAddress);
+  const name = channelName(server, channelId);
   try {
-    await invoke("leave_channel", { channelId });
-    rememberLeft(channelId);
+    await invoke("leave_channel", { server, channelId });
+    rememberLeft(server, channelId);
     // Stay on the channel rather than dropping the user somewhere else: the
     // pane turns read-only and offers the way back in, which is what tells
     // them the leave went through.
-    if (get(activeTextChannelId) === channelId) {
-      openTextChannel(null);
-      previewChannel(channelId);
+    if (get(activeTextChannelId.of(server)) === channelId) {
+      openTextChannel(server, null);
+      if (get(serverAddress) === server) previewChannel(channelId);
     }
     addNotification(`Left #${name ?? channelId} — click it to read, rejoin to write`, "info", 4000);
   } catch (e) {
@@ -230,7 +257,8 @@ export async function leaveTextChannel(channelId: number): Promise<void> {
 }
 
 /**
- * The auto-joins already asked for on this connection.
+ * The auto-joins already asked for on each connection. It goes with the
+ * connection (`dropServer`), so a reconnect asks again.
  *
  * The caller is an effect over the channel list, and the list is rewritten
  * every time a roster reply reconciles a member count — so on connect it
@@ -239,33 +267,29 @@ export async function leaveTextChannel(channelId: number): Promise<void> {
  * then asked for again on every pass: twenty redundant joins out of a budget of
  * fifty a second, each one a global broadcast on the server.
  */
-const autoJoinAsked = new Set<number>();
-
-/** A connection's auto-joins die with it. */
-export function clearAutoJoined(): void {
-  autoJoinAsked.clear();
-}
+const autoJoinAsked = scoped<Set<number>>(() => new Set());
 
 /**
- * Join the text channels this server asks every client into.
+ * Join the text channels a server asks every client into.
  *
  * Skipped for one the user left, and for a password-protected one — we hold no
  * password to offer, and a prompt nobody asked for on every connect is worse
  * than joining it by hand.
  */
-export function autoJoinTextChannels(list: ChannelInfo[]): void {
-  const joined = get(joinedTextChannelIds);
+export function autoJoinTextChannels(server: string, list: ChannelInfo[]): void {
+  const joined = get(joinedTextChannelIds.of(server));
+  const asked = get(autoJoinAsked.of(server));
   for (const channel of list) {
     if (!channel.text || !channel.auto_join) continue;
     if (channel.has_password || joined.has(channel.channel_id)) continue;
-    if (autoJoinAsked.has(channel.channel_id) || isLeft(channel.name)) continue;
-    autoJoinAsked.add(channel.channel_id);
-    invoke("join_channel", { channelId: channel.channel_id, password: null }).catch(
+    if (asked.has(channel.channel_id) || isLeft(server, channel.name)) continue;
+    asked.add(channel.channel_id);
+    invoke("join_channel", { server, channelId: channel.channel_id, password: null }).catch(
       (e: unknown) => {
         // Put it back, so the next pass tries again: re-firing was also the
         // safety net for a join sent a moment too early, and only the ones
         // that went through should stop it.
-        autoJoinAsked.delete(channel.channel_id);
+        asked.delete(channel.channel_id);
         console.error("Failed to auto-join text channel:", e);
       },
     );
@@ -283,14 +307,13 @@ export function autoJoinTextChannels(list: ChannelInfo[]): void {
  */
 export const leftTextChannelNames: Readable<Set<string>> = derived(
   [uiPrefs, serverAddress],
-  ([$prefs, $address]) => {
-    const { host, port } = splitAddress($address);
-    return new Set($address ? ($prefs.left_text_channels[`${host}:${port}`] ?? []) : []);
-  },
+  ([$prefs, $address]) =>
+    new Set($address ? ($prefs.left_text_channels[serverKey($address)] ?? []) : []),
 );
 
-export function isLeft(channelName: string): boolean {
-  return get(leftTextChannelNames).has(channelName);
+export function isLeft(server: string, channelName: string): boolean {
+  const key = serverKey(server);
+  return !!key && (get(uiPrefs).left_text_channels[key] ?? []).includes(channelName);
 }
 
 // ── Destruction timers ─────────────────────────────────────────────────────
@@ -303,20 +326,20 @@ export function isLeft(channelName: string): boolean {
  * announces every change of it, and a message takes the one in force when it
  * arrives.
  */
-export function channelMessageTtl(channelId: number): number {
-  return get(channels).find((c) => c.channel_id === channelId)?.message_ttl_secs ?? 0;
+export function channelMessageTtl(server: string, channelId: number): number {
+  return get(channels.of(server)).find((c) => c.channel_id === channelId)?.message_ttl_secs ?? 0;
 }
 
-/** The timer this user set for their messages to one person; 0 is off. */
-export function dmMessageTtl(peerName: string): number {
-  const key = serverKey();
+/** The timer this user set for their messages to one person on a server; 0 is off. */
+export function dmMessageTtl(server: string, peerName: string): number {
+  const key = serverKey(server);
   if (!key) return 0;
   return get(uiPrefs).dm_timers[`${key}/${peerName}`] ?? 0;
 }
 
 /** Set, or with 0 clear, the timer for messages written to one person. */
-export function setDmMessageTtl(peerName: string, secs: number): void {
-  const key = serverKey();
+export function setDmMessageTtl(server: string, peerName: string, secs: number): void {
+  const key = serverKey(server);
   if (!key) return;
   updateUiPrefs((p) => {
     if (secs > 0) p.dm_timers[`${key}/${peerName}`] = secs;
@@ -324,18 +347,18 @@ export function setDmMessageTtl(peerName: string, secs: number): void {
   });
 }
 
-function channelName(channelId: number): string | undefined {
-  return get(channels).find((c) => c.channel_id === channelId)?.name;
+function channelName(server: string, channelId: number): string | undefined {
+  return get(channels.of(server)).find((c) => c.channel_id === channelId)?.name;
 }
 
-/** Whether an id names a text channel, per the list the server sent. */
-export function isTextChannel(channelId: number): boolean {
-  return get(channels).some((c) => c.channel_id === channelId && c.text);
+/** Whether an id names a text channel, per the list that server sent. */
+export function isTextChannel(server: string, channelId: number): boolean {
+  return get(channels.of(server)).some((c) => c.channel_id === channelId && c.text);
 }
 
-function rememberLeft(channelId: number): void {
-  const key = serverKey();
-  const name = channelName(channelId);
+function rememberLeft(server: string, channelId: number): void {
+  const key = serverKey(server);
+  const name = channelName(server, channelId);
   if (!key || !name) return;
   updateUiPrefs((p) => {
     const list = p.left_text_channels[key] ?? [];
@@ -343,9 +366,9 @@ function rememberLeft(channelId: number): void {
   });
 }
 
-function forgetLeft(channelId: number): void {
-  const key = serverKey();
-  const name = channelName(channelId);
+function forgetLeft(server: string, channelId: number): void {
+  const key = serverKey(server);
+  const name = channelName(server, channelId);
   if (!key || !name) return;
   updateUiPrefs((p) => {
     const list = p.left_text_channels[key];
@@ -360,6 +383,9 @@ function forgetLeft(channelId: number): void {
 
 export const passwordPromptChannelId = writable<number | null>(null);
 export const passwordPromptInput = writable("");
+/** The server the prompt was opened on: the answer goes there, whatever is on
+ *  screen by the time it is typed. */
+let promptServer = "";
 
 export function cancelPasswordPrompt(): void {
   passwordPromptChannelId.set(null);
@@ -369,15 +395,16 @@ export function cancelPasswordPrompt(): void {
 export async function submitPasswordJoin(): Promise<void> {
   const channelId = get(passwordPromptChannelId);
   if (channelId === null) return;
+  const server = promptServer;
   const password = get(passwordPromptInput);
   try {
-    await invoke("join_channel", { channelId, password: password || null });
-    const channel = get(channels).find((c) => c.channel_id === channelId);
-    if (channel && password) rememberChannelPassword(channel.name, password);
-    if (channel?.text) forgetLeft(channelId);
+    await invoke("join_channel", { server, channelId, password: password || null });
+    const channel = get(channels.of(server)).find((c) => c.channel_id === channelId);
+    if (channel && password) rememberChannelPassword(server, channel.name, password);
+    if (channel?.text) forgetLeft(server, channelId);
     cancelPasswordPrompt();
     // A text channel was picked to be read: show it, now that we are in it
-    if (channel?.text) openJoinedTextChannel(channelId, channel.name);
+    if (channel?.text) openJoinedTextChannel(server, channelId, channel.name);
   } catch (e) {
     console.error("Failed to join channel:", e);
     addNotification(`Failed to join channel: ${e}`, "error");
@@ -390,12 +417,13 @@ export async function submitPasswordJoin(): Promise<void> {
 export const inviteLinkPopup = writable<string | null>(null);
 
 export async function copyInviteLink(): Promise<void> {
+  const server = get(serverAddress);
   const channel = get(channels).find((c) => c.channel_id === get(currentChannelId));
   if (!channel || channel.channel_id === 0) return;
-  const { host, port } = splitAddress(get(serverAddress));
+  const { host, port } = splitAddress(server);
   // The password rides along only when this session knows it — it created the
   // channel, or joined with it.
-  const password = channel.has_password ? channelPassword(channel.name) : null;
+  const password = channel.has_password ? channelPassword(server, channel.name) : null;
   const link = buildInviteLink(host, port, channel.name, password);
   if (channel.has_password && !password) {
     addNotification(
@@ -435,6 +463,8 @@ export const settingsIsText = writable(false);
 
 /** The channel as it was when the dialog opened, so only changes are sent. */
 let settingsBefore: ChannelInfo | null = null;
+/** The server it was opened on — see `promptServer`. */
+let settingsServer = "";
 
 export function canEditChannel(channel: {
   channel_id: number;
@@ -445,6 +475,7 @@ export function canEditChannel(channel: {
 
 export function openChannelSettings(channelId: number, e?: Event): void {
   e?.stopPropagation();
+  settingsServer = get(serverAddress);
   const channel = get(channels).find((c) => c.channel_id === channelId);
   passwordEditChannelId.set(channelId);
   // Leave the input empty — an empty field keeps the current password
@@ -471,7 +502,9 @@ export function cancelChannelSettings(): void {
 export async function submitChannelSettings(): Promise<void> {
   const channelId = get(passwordEditChannelId);
   if (channelId === null) return;
-  const before = get(channels).find((c) => c.channel_id === channelId)?.proximity ?? "off";
+  const server = settingsServer;
+  const before =
+    get(channels.of(server)).find((c) => c.channel_id === channelId)?.proximity ?? "off";
   const remove = get(passwordEditRemove);
   const password = get(passwordEditInput);
   const proximity = get(settingsProximity);
@@ -479,15 +512,19 @@ export async function submitChannelSettings(): Promise<void> {
     // Only touch the password when the user actually asked to: saving this
     // dialog to change the proximity mode must not drop it
     if (remove || password) {
-      await invoke("set_channel_password", { channelId, password: remove ? null : password });
-      const name = get(channels).find((c) => c.channel_id === channelId)?.name;
+      await invoke("set_channel_password", {
+        server,
+        channelId,
+        password: remove ? null : password,
+      });
+      const name = get(channels.of(server)).find((c) => c.channel_id === channelId)?.name;
       if (name) {
-        if (remove) forgetChannelPassword(name);
-        else rememberChannelPassword(name, password);
+        if (remove) forgetChannelPassword(server, name);
+        else rememberChannelPassword(server, name, password);
       }
     }
     if (proximity !== before) {
-      await invoke("set_channel_proximity", { channelId, proximity });
+      await invoke("set_channel_proximity", { server, channelId, proximity });
     }
     // Only what actually changed; null leaves an option alone
     const was = settingsBefore;
@@ -510,6 +547,7 @@ export async function submitChannelSettings(): Promise<void> {
         now.messageTtlSecs !== was.message_ttl_secs)
     ) {
       await invoke("set_channel_options", {
+        server,
         channelId,
         hidden: changed(now.hidden, was.hidden),
         anonymous: changed(now.anonymous, was.anonymous),

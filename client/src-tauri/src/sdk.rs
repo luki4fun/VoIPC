@@ -20,7 +20,7 @@
 //! VoIPC → game
 //!   {"type":"state","state":"ingame","user_id":42,"username":"Luki",
 //!    "channel":"Ingame","proximity":"3d","muted":false,"deafened":false,
-//!    "version":"0.9.1","sdk":1,
+//!    "version":"0.10.0","sdk":1,
 //!    "capabilities":["spatial","direct","volume","muffle","radio","phone","talk",
 //!                    "reverb","underwater"]}
 //!   {"type":"talk","user_id":42,"speaking":true}
@@ -574,6 +574,9 @@ async fn serve(
     // mix), so a mod cannot keep reading who talks when in a channel the user
     // walked away from it into.
     let mut hello_user_id: Option<u32> = None;
+    // The server that id belongs to. Ids are per server as well as per
+    // connection, so the same number on another server is somebody else.
+    let mut hello_server: Option<String> = None;
     // The ids this socket listed in its last update. A mod is told about the
     // players it placed, and about the user — not about everybody else in the
     // channel, which it has no other way to enumerate.
@@ -650,7 +653,7 @@ async fn serve(
                         }
                         let game = short_name(&hello.game, "a game");
                         let resource = short_name(&hello.resource, "");
-                        let reply = on_hello(app, &hello).await;
+                        let (reply, answered_for) = on_hello(app, &hello).await;
                         // Only a game that is actually in the channel owns the
                         // mix, and only then does the panel say one is connected
                         if reply.get("state").and_then(|s| s.as_str()) == Some("ingame") {
@@ -664,6 +667,7 @@ async fn serve(
                             };
                             hello_user_id =
                                 reply.get("user_id").and_then(|v| v.as_u64()).map(|v| v as u32);
+                            hello_server = answered_for;
                             listed.clear();
                             // Start listening from *now*. The join this hello
                             // just made is itself a channel change, and its
@@ -715,7 +719,8 @@ async fn serve(
                             continue;
                         }
                         last_update = Some(now);
-                        match apply_update(app, update, hello_user_id).await {
+                        let hello = hello_server.as_deref().zip(hello_user_id);
+                        match apply_update(app, update, hello).await {
                             Ok(ids) => listed = ids,
                             Err(reason) => {
                                 // "Send hello again" means we are not driving
@@ -1047,12 +1052,14 @@ fn short_name(raw: &str, fallback: &str) -> String {
 }
 
 /// Answer a `hello`: report who and where we are, and join the named channel.
-async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> serde_json::Value {
+/// Also returns the server it answered for, when the game is now in its
+/// channel there: the identity every later `update` is checked against.
+async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> (serde_json::Value, Option<String>) {
     let state = app.state::<AppState>();
-    let conn = state.connection.read().await;
-    let Some(connection) = conn.as_ref() else {
-        return state_message("disconnected", None, None);
-    };
+    let conns = state.connections.read().await;
+    if conns.is_empty() {
+        return (state_message("disconnected", None, None), None);
+    }
 
     // A mod that thinks we are on another server must not drive our audio: it
     // would place people using coordinates from a different game session. The
@@ -1062,17 +1069,26 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> serde_json::Value {
     // that has never been near this server can provoke, and filling it in told
     // any allowed page the user's id, name, mute state and — by guessing
     // `server` until the answer changes — which server they are on.
-    let actual = connection.server_address.clone();
-    match hello.server.as_deref() {
-        Some(expected) if actual.is_empty() || server_matches(expected, &actual) => {}
-        _ => return state_message("wrong_server", None, None),
-    }
+    let voice_id = state.voice_id();
+    let picked = hello.server.as_deref().and_then(|expected| {
+        pick_server(
+            expected,
+            conns.keys().map(String::as_str),
+            voice_id.as_deref(),
+        )
+    });
+    let Some(connection) = picked.and_then(|id| conns.get(id)) else {
+        return (state_message("wrong_server", None, None), None);
+    };
 
     if hello.sdk != 1 {
-        return serde_json::json!({
-            "type": "error",
-            "reason": format!("unsupported SDK version {}", hello.sdk),
-        });
+        return (
+            serde_json::json!({
+                "type": "error",
+                "reason": format!("unsupported SDK version {}", hello.sdk),
+            }),
+            None,
+        );
     }
 
     // Beacon mode is the one thing a game can ask for that puts something on
@@ -1080,7 +1096,7 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> serde_json::Value {
     let beacon_allowed = state.config().sdk_beacon_allowed;
     let beacon = match beacon_mode(hello.mode.as_deref(), beacon_allowed) {
         Ok(b) => b,
-        Err(reason) => return serde_json::json!({ "type": "error", "reason": reason }),
+        Err(reason) => return (serde_json::json!({ "type": "error", "reason": reason }), None),
     };
 
     // Naming the channel is required. Without it a mod armed itself on
@@ -1088,10 +1104,13 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> serde_json::Value {
     // non-positional one, where the room view shows no "a game is placing
     // people" banner and yet every voice can still be given an effect.
     let Some(wanted) = hello.channel.as_deref().filter(|n| !n.is_empty()) else {
-        return serde_json::json!({
-            "type": "error",
-            "reason": "hello needs the channel your players talk in",
-        });
+        return (
+            serde_json::json!({
+                "type": "error",
+                "reason": "hello needs the channel your players talk in",
+            }),
+            None,
+        );
     };
     let channel = connection
         .channels
@@ -1099,26 +1118,36 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> serde_json::Value {
         .ok()
         .and_then(|list| list.iter().find(|c| c.name == wanted).cloned());
     let Some(channel) = channel else {
-        return serde_json::json!({
-            "type": "error",
-            "reason": format!("no channel named {wanted}"),
-        });
+        return (
+            serde_json::json!({
+                "type": "error",
+                "reason": format!("no channel named {wanted}"),
+            }),
+            None,
+        );
     };
 
     // Everything needed after the guard is dropped: a stalled control stream
     // would otherwise park this task inside the lock, and the next
     // connect/disconnect would wait behind a game.
+    let server = connection.server_address.clone();
     let tcp_tx = connection.tcp_tx.clone();
     let current_channel = connection.current_channel_id.clone();
+    let is_voice = connection.is_voice.clone();
     let user_id = connection.user_id;
     let (channel_id, name) = (channel.channel_id, channel.name);
     // Subscribed before the join is sent, so its refusal cannot be missed
     let mut events = state.sdk_events.subscribe();
-    drop(conn);
+    drop(conns);
 
     // Wait for the join before claiming to be ingame. Arming the SDK on a
     // join that never happened would leave distance culling on with nobody
-    // driving it, i.e. everyone silent.
+    // driving it, i.e. everyone silent. Joined means voice is here as well:
+    // the channel id is swapped a moment before voice moves over, and an
+    // update in between would find the call still on the old server.
+    let joined = || {
+        current_channel.load(Ordering::Relaxed) == channel_id && is_voice.load(Ordering::Relaxed)
+    };
     if current_channel.load(Ordering::Relaxed) != channel_id {
         let _ = crate::network::send_tcp_message(
             &tcp_tx,
@@ -1128,28 +1157,33 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> serde_json::Value {
             },
         )
         .await;
-
-        let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
-        loop {
-            if current_channel.load(Ordering::Relaxed) == channel_id {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                return serde_json::json!({
+    }
+    let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
+    while !joined() {
+        if tokio::time::Instant::now() >= deadline {
+            return (
+                serde_json::json!({
                     "type": "error",
                     "reason": format!("could not join {name}: timed out"),
-                });
-            }
-            tokio::select! {
-                // The channel id is swapped when the server's UserList
-                // arrives, so a short poll is all this needs
-                _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
-                event = events.recv() => {
-                    if let Ok(SdkEvent::ChannelError(reason)) = event {
-                        return serde_json::json!({
-                            "type": "error",
-                            "reason": format!("could not join {name}: {reason}"),
-                        });
+                }),
+                None,
+            );
+        }
+        tokio::select! {
+            // The channel id is swapped when the server's UserList
+            // arrives, so a short poll is all this needs
+            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
+            event = events.recv() => {
+                // Only this server's refusal is about this join
+                if let Ok(SdkEvent::ChannelError { server: from, reason }) = event {
+                    if from == server {
+                        return (
+                            serde_json::json!({
+                                "type": "error",
+                                "reason": format!("could not join {name}: {reason}"),
+                            }),
+                            None,
+                        );
                     }
                 }
             }
@@ -1157,10 +1191,11 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> serde_json::Value {
     }
 
     // In the channel: from here on the game owns the positions. The connection
-    // may have been replaced while we waited, so check it is still ours.
-    let conn = state.connection.read().await;
-    let Some(connection) = conn.as_ref().filter(|c| c.user_id == user_id) else {
-        return state_message("disconnected", None, None);
+    // may have been replaced while we waited, so check it is still ours — the
+    // same server, and the same session on it.
+    let conns = state.connections.read().await;
+    let Some(connection) = conns.get(&server).filter(|c| c.user_id == user_id) else {
+        return (state_message("disconnected", None, None), None);
     };
     if let Ok(mut spatial) = connection.spatial.lock() {
         spatial.clear_positions();
@@ -1183,7 +1218,20 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> serde_json::Value {
     // Confirms which mode the mod actually got — it asked, the user's settings
     // answered — and is what the toast reads to tell them what they allowed.
     msg["beacon"] = beacon.into();
-    msg
+    (msg, Some(server))
+}
+
+/// Which open server a `hello` means. `server_matches` lets a mod leave the
+/// port out, so several open servers can match one `hello.server`: the one on
+/// exactly that `host:port` wins, then the one we are in voice on. `None` when
+/// nothing matches, which is the only case that answers `wrong_server`.
+fn pick_server<'a>(
+    expected: &str,
+    open: impl Iterator<Item = &'a str>,
+    voice: Option<&str>,
+) -> Option<&'a str> {
+    open.filter(|id| server_matches(expected, id))
+        .max_by_key(|id| (id.eq_ignore_ascii_case(expected), Some(*id) == voice))
 }
 
 /// Apply one bulk update. Players the game leaves out are silent — that is how
@@ -1195,16 +1243,23 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> serde_json::Value {
 async fn apply_update(
     app: &tauri::AppHandle,
     update: Update,
-    hello_user_id: Option<u32>,
+    hello: Option<(&str, u32)>,
 ) -> Result<std::collections::HashSet<u32>, String> {
     let state = app.state::<AppState>();
-    let conn = state.connection.read().await;
-    let connection = conn.as_ref().ok_or("not connected to a server")?;
+    let conns = state.connections.read().await;
+    // The call is what a game places people in; a server we merely have open
+    // has nobody to place.
+    let connection =
+        crate::app_state::voice(&state, &conns).map_err(|_| "not in a voice channel")?;
 
     // The server issues fresh user ids on every connection: after a VoIPC
     // reconnect the mod's ids name nobody, and applying them would cull every
-    // speaker out of the mix in silence. Tell the mod to say hello again.
-    if let Some(id) = hello_user_id {
+    // speaker out of the mix in silence. Tell the mod to say hello again. The
+    // same for a call that moved to another server, where they name strangers.
+    if let Some((server, id)) = hello {
+        if server != connection.server_address {
+            return Err("voice moved to another server — send hello again".into());
+        }
         if id != connection.user_id {
             return Err("reconnected to the server — send hello again".into());
         }
@@ -1462,8 +1517,8 @@ fn source_from(spec: &RenderSpec, base: bool, id: u32) -> Result<Option<Source>,
 /// leave SDK culling armed with no game, i.e. everyone silent.
 async fn clear_sdk_positions(app: &tauri::AppHandle) {
     let state = app.state::<AppState>();
-    let conn = state.connection.read().await;
-    if let Some(connection) = conn.as_ref() {
+    let conns = state.connections.read().await;
+    if let Ok(connection) = crate::app_state::voice(&state, &conns) {
         {
             let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
             spatial.sdk_active = false;
@@ -1883,6 +1938,23 @@ mod tests {
     }
 
     #[test]
+    fn a_hello_picks_the_exact_server_then_the_one_in_voice() {
+        let (a, b) = ("rp.example.com:9987", "rp.example.com:9988");
+        let open = [a, b, "other.example:9987"];
+        let pick = |expected: &str, voice: Option<&str>| {
+            pick_server(expected, open.into_iter(), voice)
+        };
+        // The port settles it whenever the mod names one
+        assert_eq!(pick(b, Some(a)), Some(b));
+        assert_eq!(pick("RP.Example.com:9987", None), Some(a));
+        // Without one, both match: the call wins
+        assert_eq!(pick("rp.example.com", Some(b)), Some(b));
+        assert_eq!(pick("rp.example.com", Some(a)), Some(a));
+        // Nothing open there is the only `wrong_server`
+        assert_eq!(pick("nowhere.example", Some(a)), None);
+    }
+
+    #[test]
     fn facing_accepts_a_vector_or_a_gta_heading() {
         assert_eq!(facing(Some([0.0, 5.0]), None), [0.0, 1.0]);
         let east = facing(None, Some(270.0));
@@ -2116,10 +2188,11 @@ mod tests {
             &listed
         )
         .is_none());
-        assert!(
-            event_message(&SdkEvent::ChannelError("nope".into()), Some(42), &mut own, &listed)
-                .is_none()
-        );
+        let refusal = SdkEvent::ChannelError {
+            server: "voice.example:9987".into(),
+            reason: "nope".into(),
+        };
+        assert!(event_message(&refusal, Some(42), &mut own, &listed).is_none());
     }
 
     #[test]

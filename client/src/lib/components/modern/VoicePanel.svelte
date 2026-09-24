@@ -1,30 +1,27 @@
 <script lang="ts">
   // The green "Voice Connected" strip above the user panel: where you are,
   // how the line is, and the way out. Same numbers the classic status bar shows.
+  //
+  // The call's, whichever server is on screen: it names the server too when
+  // the call is on another one, and its leave button leaves the call there.
 
   import { connectionState, latency } from "../../stores/connection.js";
   import { lossPercent, quality } from "../../stores/connection-quality.js";
-  import { channels, currentChannelId } from "../../stores/channels.js";
+  import { viewingVoice, voiceChannel, voiceServer } from "../../stores/channels.js";
   import { isMobile } from "../../stores/platform.js";
-  import { invoke } from "@tauri-apps/api/core";
-  import { addNotification } from "../../stores/notifications.js";
+  import { leaveVoice } from "../../stores/voice.js";
+  import { serverEntries } from "../../connect.js";
   import ScreenShareControls from "../ScreenShareControls.svelte";
   import Icon from "../Icons.svelte";
 
-  const channelName = $derived(
-    $channels.find((c) => c.channel_id === $currentChannelId)?.name ?? "",
-  );
+  const voiceState = connectionState.at(voiceServer);
+  const voiceLatency = latency.at(voiceServer);
 
-  // Voice is off in the lobby, so there is nothing to report there.
-  const inVoice = $derived($connectionState === "connected" && $currentChannelId !== 0);
+  const channelName = $derived($voiceChannel?.name ?? "");
+  const serverName = $derived($serverEntries.find((e) => e.inVoice)?.name ?? "");
 
-  async function leave() {
-    try {
-      await invoke("join_channel", { channelId: 0, password: null });
-    } catch (e) {
-      addNotification(`Could not leave the channel: ${e}`, "error");
-    }
-  }
+  // Nothing to report while we are in no voice channel.
+  const inVoice = $derived($voiceState === "connected" && $voiceServer !== null);
 </script>
 
 {#if inVoice}
@@ -34,14 +31,16 @@
         <Icon name="speaker" size={16} />
         <span>Voice connected</span>
       </span>
-      <button class="leave-btn" onclick={leave} title="Leave the channel">
+      <button class="leave-btn" onclick={leaveVoice} title="Leave voice">
         <Icon name="disconnect" size={16} />
       </button>
     </div>
     <div class="voice-meta">
-      <span class="channel">#{channelName}</span>
+      <span class="channel"
+        >#{channelName}{#if !$viewingVoice}&nbsp;· {serverName}{/if}</span
+      >
       <span class="ping quality-{$quality}" title="Voice packet loss (2s window)">
-        {$latency}ms{#if $lossPercent > 0}&nbsp;· {$lossPercent}%{/if}
+        {$voiceLatency}ms{#if $lossPercent > 0}&nbsp;· {$lossPercent}%{/if}
       </span>
     </div>
     {#if !$isMobile}

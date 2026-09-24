@@ -409,6 +409,11 @@ impl FrameAssembler {
         FragmentResult { frame: None, frame_dropped }
     }
 
+    /// Whether a keyframe has completed since the last reset (no frame is emitted before one).
+    pub fn has_keyframe(&self) -> bool {
+        self.has_received_keyframe
+    }
+
     /// Reset the assembler state (e.g., when switching what we're watching).
     pub fn reset(&mut self) {
         self.current_frame_id = None;

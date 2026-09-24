@@ -29,6 +29,8 @@ export function defaultConfig(): AppConfig {
     last_username: null,
     last_accept_self_signed: null,
     saved_servers: [],
+    // The servers open when the page last saved them, reconnected on startup
+    open_servers: [],
     screen_share_codec: "h264",
     spatial_audio: true,
     screen_audio_spatial: true,

@@ -198,8 +198,11 @@ impl FrameSlot {
         old
     }
 
-    /// Take the current frame, blocking until one is available or active becomes false.
-    pub fn take(&self) -> Option<CapturedFrame> {
+    /// Take the current frame, waiting up to `timeout` for one
+    /// (`Duration::ZERO` just looks). `None` on timeout or once active is
+    /// cleared.
+    pub fn take_timeout(&self, timeout: Duration) -> Option<CapturedFrame> {
+        let deadline = Instant::now() + timeout;
         let mut slot = self.frame.lock().unwrap_or_else(|p| p.into_inner());
         loop {
             if !self.active.load(Ordering::Relaxed) {
@@ -208,11 +211,82 @@ impl FrameSlot {
             if let Some(frame) = slot.take() {
                 return Some(frame);
             }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            // Capped: teardown only clears `active`, it does not notify
             let (guard, _) = self
                 .notify
-                .wait_timeout(slot, Duration::from_millis(50))
+                .wait_timeout(slot, (deadline - now).min(Duration::from_millis(50)))
                 .unwrap_or_else(|p| p.into_inner());
             slot = guard;
+        }
+    }
+}
+
+/// Longest the encode thread waits for a captured frame before it looks at
+/// the last one again. Damage-driven capture (PipeWire screencast, WGC)
+/// sends nothing while the screen is still, so neither a viewer's keyframe
+/// request nor the periodic IDR could be served from new frames, and a late
+/// joiner waited on a blank viewer until something moved.
+#[cfg(not(target_os = "android"))]
+const IDLE_TICK: Duration = Duration::from_millis(200);
+
+/// When to encode a frame that arrived at `now` while the next encode is
+/// `due`: at once if at most a quarter interval early (compositor jitter, or
+/// two buffers handed over in one loop pass), else at `due`, as whatever
+/// frame is newest by then, so the last one of a burst is never the one
+/// dropped.
+#[cfg(not(target_os = "android"))]
+fn encode_at(due: Instant, now: Instant, interval: Duration) -> Instant {
+    if now + interval / 4 >= due { now } else { due }
+}
+
+/// Whether the periodic IDR is due. Timed, not counted, since a still screen
+/// has no frames to count.
+#[cfg(not(target_os = "android"))]
+fn idr_due(last_idr: Option<Instant>) -> bool {
+    last_idr.is_none_or(|t| {
+        t.elapsed() >= Duration::from_secs(voipc_video::KEYFRAME_INTERVAL_SECS as u64)
+    })
+}
+
+/// The encode side of both capture backends: paces the captured frames to
+/// the ladder's fps by time, and while nothing new arrives re-encodes the
+/// last one whenever a keyframe is owed or due.
+///
+/// The idle re-encode keeps the last `CapturedFrame` and re-runs `process()`,
+/// which survives converter rebuilds and the scalar fallback; the cost is one
+/// held capture buffer and one conversion per idle IDR.
+#[cfg(not(target_os = "android"))]
+pub(crate) fn run_encode_loop(slot: &FrameSlot, mut processor: FrameProcessor) {
+    let mut last: Option<CapturedFrame> = None;
+    let mut due = Instant::now();
+    while processor.active.load(Ordering::Relaxed) {
+        let Some(mut frame) = slot.take_timeout(IDLE_TICK) else {
+            if let Some(frame) = &last {
+                if processor.keyframe_requested.load(Ordering::Relaxed)
+                    || idr_due(processor.last_idr)
+                {
+                    processor.process(frame);
+                }
+            }
+            continue;
+        };
+        let interval = processor.frame_interval();
+        let now = Instant::now();
+        let at = encode_at(due, now, interval);
+        if at > now {
+            std::thread::sleep(at - now);
+            if let Some(newer) = slot.take_timeout(Duration::ZERO) {
+                slot.recycle(std::mem::replace(&mut frame, newer).pixels);
+            }
+        }
+        due = (due + interval).max(at);
+        processor.process(&frame);
+        if let Some(old) = last.replace(frame) {
+            slot.recycle(old.pixels);
         }
     }
 }
@@ -301,6 +375,43 @@ mod ladder_tests {
             assert!(scale > 0.0 && divisor >= 1);
         }
     }
+
+    /// Indices of the arrivals `run_encode_loop` encodes, on a fake clock
+    /// (the loop's pacing with the sleeps taken out).
+    fn encoded(arrivals_us: &[u64], fps: u32) -> Vec<usize> {
+        let t0 = Instant::now();
+        let t = |us: u64| t0 + Duration::from_micros(us);
+        let interval = Duration::from_secs(1) / fps;
+        let (mut due, mut out, mut i) = (t0, Vec::new(), 0);
+        while i < arrivals_us.len() {
+            let at = encode_at(due, t(arrivals_us[i]), interval);
+            while i + 1 < arrivals_us.len() && t(arrivals_us[i + 1]) <= at {
+                i += 1;
+            }
+            out.push(i);
+            due = (due + interval).max(at);
+            i += 1;
+        }
+        out
+    }
+
+    #[test]
+    fn pacing_holds_the_rate_without_dropping_the_last_frame() {
+        // Paired buffers (two process callbacks in one loop pass) at 60 fps
+        let paired: Vec<u64> = (0..60).map(|k| (k / 2) * 33_333 + (k % 2) * 1_000).collect();
+        assert_eq!(encoded(&paired, 60).len(), 60);
+        // A 144 Hz compositor paced to 60 fps, ending on its last frame
+        let fast: Vec<u64> = (0..144).map(|k| k * 6_944).collect();
+        let out = encoded(&fast, 60);
+        assert!((59..=61).contains(&out.len()), "{} encoded", out.len());
+        assert_eq!(out.last(), Some(&143));
+    }
+
+    #[test]
+    fn periodic_idr_is_timed() {
+        assert!(idr_due(None));
+        assert!(!idr_due(Some(Instant::now())));
+    }
 }
 
 #[cfg(not(target_os = "android"))]
@@ -317,7 +428,8 @@ pub(crate) struct FrameProcessor {
     /// Current frame's id — assigned from [`SHARE_FRAME_ID`] per frame, never
     /// incremented locally (nonce uniqueness across share sessions).
     pub frame_id: u32,
-    pub keyframe_interval: u32,
+    /// When a keyframe last went out whole; the periodic IDR is timed from it.
+    pub last_idr: Option<Instant>,
     pub start_time: Instant,
     pub target_width: u32,
     pub target_height: u32,
@@ -332,8 +444,6 @@ pub(crate) struct FrameProcessor {
     /// Ladder level currently applied to the encoder.
     pub level: u8,
     pub level_changed: Instant,
-    /// Captured frames seen — fps reduction skips every Nth.
-    pub frame_counter: u32,
     pub video_tx: mpsc::Sender<Vec<u8>>,
     pub session_id: u32,
     pub media_key: Arc<std::sync::Mutex<voipc_crypto::MediaKeyRing>>,
@@ -371,7 +481,6 @@ impl FrameProcessor {
                     self.converter = None;
                 }
                 self.encoder = encoder;
-                self.keyframe_interval = voipc_video::KEYFRAME_INTERVAL_SECS * fps;
                 self.keyframe_requested.store(true, Ordering::Relaxed);
                 info!(
                     from = self.level,
@@ -388,21 +497,33 @@ impl FrameProcessor {
         self.level_changed = Instant::now();
     }
 
+    /// Time between two encodes at the current ladder level.
+    fn frame_interval(&self) -> Duration {
+        Duration::from_secs(LEVELS[self.level as usize].1 as u64) / self.base_fps.max(1)
+    }
+
     /// Process a single captured frame: convert → encode → fragment → encrypt → send.
-    pub fn process(
-        &mut self,
-        frame_bytes: &[u8],
-        src_w: usize,
-        src_h: usize,
-        stride: usize,
-        fmt: PixFmt,
-    ) {
-        // Congestion control first, and before a frame id is consumed:
-        // frames skipped for the fps divisor must not leave gaps that the
-        // viewers' assemblers would read as loss.
+    pub fn process(&mut self, frame: &CapturedFrame) {
+        let CapturedFrame {
+            pixels: ref frame_bytes,
+            width: src_w,
+            height: src_h,
+            stride,
+            fmt,
+        } = *frame;
+
+        // Congestion control first: a new level rebuilds the encoder and owes
+        // an IDR; its fps divisor is paced by time in `run_encode_loop`.
         self.adapt();
-        self.frame_counter = self.frame_counter.wrapping_add(1);
-        if self.frame_counter % LEVELS[self.level as usize].1 != 0 {
+        // No media key yet: spend neither an encode nor a frame id, and an
+        // owed IDR stays owed
+        if self
+            .media_key
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .current()
+            .is_none()
+        {
             return;
         }
 
@@ -473,19 +594,12 @@ impl FrameProcessor {
         };
 
         self.frame_id = SHARE_FRAME_ID.fetch_add(1, Ordering::Relaxed);
-        let force_keyframe = self.keyframe_requested.swap(false, Ordering::Relaxed)
-            || (self.frame_id % self.keyframe_interval == 0);
+        let force_keyframe =
+            self.keyframe_requested.swap(false, Ordering::Relaxed) || idr_due(self.last_idr);
 
         let timestamp = self.start_time.elapsed().as_millis() as u32;
-        let encoded_frames = match self.encoder.encode_video_frame(yuv_frame, force_keyframe) {
-            Ok(frames) => frames,
-            Err(e) => {
-                warn!("{:?} encode error: {}", self.codec, e);
-                return;
-            }
-        };
-
-        self.send_encoded_frames(encoded_frames, timestamp);
+        let encoded = self.encoder.encode_video_frame(yuv_frame, force_keyframe);
+        self.send_or_owe(encoded, force_keyframe, timestamp);
     }
 
     /// Fallback: process using the naive scalar BGRA→I420 conversion.
@@ -548,63 +662,74 @@ impl FrameProcessor {
         }
 
         self.frame_id = SHARE_FRAME_ID.fetch_add(1, Ordering::Relaxed);
-        let force_keyframe = self.keyframe_requested.swap(false, Ordering::Relaxed)
-            || (self.frame_id % self.keyframe_interval == 0);
+        let force_keyframe =
+            self.keyframe_requested.swap(false, Ordering::Relaxed) || idr_due(self.last_idr);
 
         let timestamp = self.start_time.elapsed().as_millis() as u32;
-        let encoded_frames =
-            match self
-                .encoder
-                .encode(&self.i420_buf, self.frame_id as i64, force_keyframe)
-            {
-                Ok(frames) => frames,
-                Err(e) => {
-                    warn!("{:?} encode error (scalar fallback): {}", self.codec, e);
-                    return;
-                }
-            };
+        let encoded = self
+            .encoder
+            .encode(&self.i420_buf, self.frame_id as i64, force_keyframe);
+        self.send_or_owe(encoded, force_keyframe, timestamp);
+    }
 
-        self.send_encoded_frames(encoded_frames, timestamp);
+    /// Send what the encoder produced. A forced IDR that did not go out
+    /// whole is owed again; the next frame or the idle tick retries.
+    fn send_or_owe(
+        &mut self,
+        encoded: anyhow::Result<Vec<voipc_video::encoder::EncodedFrame>>,
+        force_keyframe: bool,
+        timestamp: u32,
+    ) {
+        let sent_key = match encoded {
+            Ok(frames) => self.send_encoded_frames(frames, timestamp),
+            Err(e) => {
+                warn!("{:?} encode error: {}", self.codec, e);
+                false
+            }
+        };
+        if force_keyframe && !sent_key {
+            self.keyframe_requested.store(true, Ordering::Relaxed);
+        }
     }
 
     /// Fragment → encrypt → send encoded frames over the video channel.
     /// Shared by both the fast (SwsContext) and scalar fallback paths.
+    /// Returns whether a keyframe went out whole.
     fn send_encoded_frames(
         &mut self,
         encoded_frames: Vec<voipc_video::encoder::EncodedFrame>,
         timestamp: u32,
-    ) {
+    ) -> bool {
         let mut total_bytes: u64 = 0;
         let mut send_failed = false;
+        let mut sent_key = false;
 
         // Clone the key (small: id + 32B) instead of holding the mutex across
         // fragmenting/encrypting/sending — voice paths share this mutex.
-        let (key_opt, stream_id) = {
+        let (key, stream_id) = {
             let guard = self.media_key.lock().unwrap_or_else(|poisoned| {
                 warn!("media key mutex poisoned — recovering");
                 poisoned.into_inner()
             });
             (guard.current().cloned(), guard.stream_id())
         };
-        let key_opt = key_opt.as_ref();
+        // Never send plaintext: no key means we are still waiting for the
+        // channel's media key (the viewer sees a gap).
+        let Some(key) = key else {
+            return false;
+        };
 
         for ef in encoded_frames {
-
-            // Use smaller fragment size when encrypting to account for
-            // GCM tag (16B) + key_id header (2B) — keeps total packet
-            // under MAX_VIDEO_PACKET_SIZE (VPN-safe).
-            let max_payload = if key_opt.is_some() {
-                voipc_protocol::video::MAX_ENCRYPTED_VIDEO_PAYLOAD_SIZE
-            } else {
-                voipc_protocol::video::MAX_VIDEO_PAYLOAD_SIZE
-            };
+            // The smaller fragment size accounts for the GCM tag (16B) +
+            // key_id header (2B) — keeps the total packet under
+            // MAX_VIDEO_PACKET_SIZE (VPN-safe).
             let packets = fragment_frame(
                 &ef.data,
                 ef.is_keyframe,
                 self.session_id,
                 self.frame_id,
                 timestamp,
-                max_payload,
+                voipc_protocol::video::MAX_ENCRYPTED_VIDEO_PAYLOAD_SIZE,
             );
 
             // Pre-check: ensure channel has room for ALL fragments before
@@ -628,42 +753,38 @@ impl FrameProcessor {
                 false
             };
 
+            let mut whole = true;
             for pkt in packets {
-                let final_pkt = if let Some(key) = key_opt {
-                    let ch_id = self.channel_id.load(Ordering::Relaxed);
-                    let pkt_type = if ef.is_keyframe { 0x14u8 } else { 0x13u8 };
-                    let aad = voipc_crypto::media_keys::build_aad(ch_id, pkt_type);
-                    match voipc_crypto::media_encrypt(
-                        key,
-                        stream_id,
-                        self.frame_id,
-                        pkt.fragment_index as u32,
-                        &aad,
-                        &pkt.payload,
-                    ) {
-                        Ok(encrypted) => {
-                            use voipc_protocol::video::VideoPacket;
-                            VideoPacket::encrypted_fragment(
-                                ef.is_keyframe,
-                                self.session_id,
-                                self.frame_id,
-                                pkt.fragment_index,
-                                pkt.fragment_count,
-                                timestamp,
-                                key.key_id,
-                                stream_id,
-                                encrypted,
-                            )
-                        }
-                        Err(e) => {
-                            warn!("Video encryption failed: {}", e);
-                            continue;
-                        }
+                let ch_id = self.channel_id.load(Ordering::Relaxed);
+                let pkt_type = if ef.is_keyframe { 0x14u8 } else { 0x13u8 };
+                let aad = voipc_crypto::media_keys::build_aad(ch_id, pkt_type);
+                let final_pkt = match voipc_crypto::media_encrypt(
+                    &key,
+                    stream_id,
+                    self.frame_id,
+                    pkt.fragment_index as u32,
+                    &aad,
+                    &pkt.payload,
+                ) {
+                    Ok(encrypted) => {
+                        use voipc_protocol::video::VideoPacket;
+                        VideoPacket::encrypted_fragment(
+                            ef.is_keyframe,
+                            self.session_id,
+                            self.frame_id,
+                            pkt.fragment_index,
+                            pkt.fragment_count,
+                            timestamp,
+                            key.key_id,
+                            stream_id,
+                            encrypted,
+                        )
                     }
-                } else {
-                    // Never send plaintext: no key means we are still waiting
-                    // for the channel's media key (the viewer sees a gap).
-                    continue;
+                    Err(e) => {
+                        warn!("Video encryption failed: {}", e);
+                        whole = false;
+                        continue;
+                    }
                 };
 
                 let bytes = final_pkt.to_bytes();
@@ -685,14 +806,14 @@ impl FrameProcessor {
                             }
                             Err(mpsc::error::TrySendError::Full(returned)) => {
                                 if !self.active.load(Ordering::Relaxed) {
-                                    return;
+                                    return false;
                                 }
                                 pending = returned;
                                 std::thread::sleep(Duration::from_millis(2));
                             }
                             Err(mpsc::error::TrySendError::Closed(_)) => {
                                 self.active.store(false, Ordering::Relaxed);
-                                return;
+                                return false;
                             }
                         }
                     }
@@ -707,14 +828,14 @@ impl FrameProcessor {
                                 self.frame_id
                             );
                             self.keyframe_requested.store(true, Ordering::Relaxed);
-                    // Our own uplink is the bottleneck: counts as loss for the ladder
-                    self.loss_ms.store(epoch_ms(), Ordering::Relaxed);
+                            // Our own uplink is the bottleneck: counts as loss for the ladder
+                            self.loss_ms.store(epoch_ms(), Ordering::Relaxed);
                             send_failed = true;
                             break;
                         }
                         Err(mpsc::error::TrySendError::Closed(_)) => {
                             self.active.store(false, Ordering::Relaxed);
-                            return;
+                            return false;
                         }
                     }
                 }
@@ -722,10 +843,15 @@ impl FrameProcessor {
             if send_failed {
                 break;
             }
+            if ef.is_keyframe && whole {
+                sent_key = true;
+                self.last_idr = Some(Instant::now());
+            }
         }
 
         self.frames_sent.fetch_add(1, Ordering::Relaxed);
         self.bytes_sent.fetch_add(total_bytes, Ordering::Relaxed);
+        sent_key
     }
 }
 

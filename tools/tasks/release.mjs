@@ -26,7 +26,13 @@ export default function release(_task, args) {
   const version = syncVersion();
   head(`Building VoIPC ${version} release`);
 
-  run('docker', ['build', '-f', 'Dockerfile.release', '-t', IMAGE, '.', ...args]);
+  // The image has no .git to ask (see .dockerignore), so the build hash the UI
+  // shows is taken here, the way client/vite.config.ts takes it. The user's
+  // args come last so they can override it.
+  const hash = capture('git', ['rev-parse', '--short', 'HEAD']);
+  const dirty = hash && capture('git', ['status', '--porcelain', '--untracked-files=no']);
+  const hashArg = hash ? ['--build-arg', `VOIPC_BUILD_HASH=${hash}${dirty ? '+' : ''}`] : [];
+  run('docker', ['build', '-f', 'Dockerfile.release', '-t', IMAGE, ...hashArg, '.', ...args]);
 
   // The image's final stage is FROM scratch, so it has no shell — an explicit
   // entrypoint is required just to create a container to copy out of.

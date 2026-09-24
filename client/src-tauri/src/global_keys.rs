@@ -266,18 +266,13 @@ fn run_rdev_loop(
                     let h = handle.clone();
                     tauri::async_runtime::spawn(async move {
                         let state = h.state::<AppState>();
+                        // Not in a call is not an error to log: the key is
+                        // an ordinary key everywhere else on the desktop.
+                        if VoiceMode::from_u8(state.voice_mode.load(Ordering::Relaxed))
+                            != VoiceMode::Ptt
+                            || state.voice_id().is_none()
                         {
-                            let conn = state.connection.read().await;
-                            if let Some(c) = conn.as_ref() {
-                                let mode = VoiceMode::from_u8(
-                                    c.voice_mode.load(Ordering::Relaxed),
-                                );
-                                if mode != VoiceMode::Ptt {
-                                    return;
-                                }
-                            } else {
-                                return;
-                            }
+                            return;
                         }
                         if let Err(e) = commands::do_start_transmit(&state, h.clone()).await {
                             tracing::warn!("Global PTT start failed: {e}");
@@ -575,22 +570,14 @@ fn run_evdev_loop(
                                         let h = handle.clone();
                                         tauri::async_runtime::spawn(async move {
                                             let state = h.state::<AppState>();
+                                            // As in the rdev loop: not in a
+                                            // call, the key is just a key
+                                            if VoiceMode::from_u8(
+                                                state.voice_mode.load(Ordering::Relaxed),
+                                            ) != VoiceMode::Ptt
+                                                || state.voice_id().is_none()
                                             {
-                                                let conn =
-                                                    state.connection.read().await;
-                                                if let Some(c) = conn.as_ref() {
-                                                    let mode =
-                                                        VoiceMode::from_u8(
-                                                            c.voice_mode.load(
-                                                                Ordering::Relaxed,
-                                                            ),
-                                                        );
-                                                    if mode != VoiceMode::Ptt {
-                                                        return;
-                                                    }
-                                                } else {
-                                                    return;
-                                                }
+                                                return;
                                             }
                                             if let Err(e) =
                                                 commands::do_start_transmit(

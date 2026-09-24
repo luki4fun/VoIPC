@@ -1,5 +1,7 @@
 <script lang="ts">
   import { pendingPokes } from "../stores/pokes.js";
+  import { serverAddress } from "../stores/connection.js";
+  import { serverEntries } from "../connect.js";
 
   function dismiss(id: number) {
     pendingPokes.update((p) => p.filter((poke) => poke.id !== id));
@@ -12,7 +14,7 @@
       <div class="poke">
         <div class="poke-content">
           <span class="poke-text">
-            <strong>{poke.from_username}</strong> poked you
+            <strong>{poke.from_username}</strong> poked you{#if poke.server !== $serverAddress}&nbsp;on {$serverEntries.find((e) => e.id === poke.server)?.name ?? poke.server}{/if}
           </span>
           {#if poke.message}
             <span class="poke-message">"{poke.message}"</span>

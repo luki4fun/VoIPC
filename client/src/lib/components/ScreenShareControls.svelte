@@ -1,6 +1,6 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
-  import { channels, currentChannelId } from "../stores/channels.js";
+  import { voice, voiceChannel } from "../stores/channels.js";
   import {
     isSharingScreen,
     viewerCount,
@@ -16,11 +16,10 @@
   import { isWeb } from "../stores/platform.js";
   import Icon from "./Icons.svelte";
 
-  let inLobby = $derived($currentChannelId === 0);
+  // A share goes to the voice channel we are in, on whichever server that is
+  let inLobby = $derived($voice === null);
   // A channel can switch sharing off (the server refuses it there too)
-  let shareOff = $derived(
-    $channels.find((c) => c.channel_id === $currentChannelId)?.screen_share === false,
-  );
+  let shareOff = $derived($voiceChannel?.screen_share === false);
 
   // The browser client shares through WebCodecs + getDisplayMedia; a browser
   // without them (or a mobile one) keeps the button hidden.

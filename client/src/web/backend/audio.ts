@@ -102,6 +102,8 @@ interface Source {
   decoder: AudioDecoder;
   /** Sequence numbers of chunks submitted to the decoder, in order. */
   pending: number[];
+  /** An EOT that arrived while frames were still decoding: posted after them. */
+  eotAfter: boolean;
   lastActivity: number;
 }
 
@@ -251,6 +253,8 @@ export class AudioEngine implements AudioApi {
   private encodeTimestampUs = 0;
   private vadSilentCount = VAD_HOLD_FRAMES + 1;
   private vadActive = false;
+  /** Whether the last captured frame went on air: an edge ends the phrase. */
+  private wasOnAir = false;
   private levelDb = -96;
   private keyMissingSince: number | null = null;
   private keyMissingEmitted = false;
@@ -421,7 +425,8 @@ export class AudioEngine implements AudioApi {
     }
     this.pushSpatialGains();
     // Same payload shape as network.rs, channel included
-    emit("proximity-mode", { channel_id: this.ctx?.channelId ?? 0, mode: proximity });
+    const c = this.ctx;
+    c?.emit("proximity-mode", { channel_id: c.channelId, mode: proximity });
   }
 
   // ── Incoming media ───────────────────────────────────────────────────
@@ -440,7 +445,7 @@ export class AudioEngine implements AudioApi {
     // Edge-triggered: only the first packet of a burst emits speaking:true;
     // the sweep and the EOT branch emit speaking:false and clear the entry.
     if (!this.speaking.has(info.session_id)) {
-      emit("user-speaking", { user_id: info.session_id, speaking: true });
+      c.emit("user-speaking", { user_id: info.session_id, speaking: true });
     }
     this.speaking.set(info.session_id, performance.now());
   }
@@ -452,10 +457,14 @@ export class AudioEngine implements AudioApi {
     } catch {
       return;
     }
-    // The mixer resets the jitter buffer once the buffered tail drained
-    this.mixer?.port.postMessage({ type: "eot", source: info.session_id });
+    // The mixer resets the jitter buffer once the buffered tail drained. Frames
+    // still in the decoder come out after this packet, and the worklet reads
+    // any frame as "talking again": post it behind them, or it is cancelled.
+    const src = this.sources.get(info.session_id);
+    if (src && src.pending.length > 0) src.eotAfter = true;
+    else this.mixer?.port.postMessage({ type: "eot", source: info.session_id });
     this.speaking.delete(info.session_id);
-    emit("user-speaking", { user_id: info.session_id, speaking: false });
+    this.ctx?.emit("user-speaking", { user_id: info.session_id, speaking: false });
   }
 
   onScreenAudioPacket(bytes: Uint8Array): void {
@@ -493,6 +502,7 @@ export class AudioEngine implements AudioApi {
     // bernd: packets are decoded on arrival, so a reordered packet reaches
     // the Opus decoder out of order (the jitter buffer reorders the PCM).
     src.pending.push(sequence);
+    src.eotAfter = false; // new audio cancels the EOT, the worklet's own rule
     try {
       src.decoder.decode(
         new EncodedAudioChunk({ type: "key", timestamp: sequence * FRAME_US, data: opus }),
@@ -504,7 +514,12 @@ export class AudioEngine implements AudioApi {
   }
 
   private createSource(key: number): Source {
-    const src: Source = { decoder: null as unknown as AudioDecoder, pending: [], lastActivity: 0 };
+    const src: Source = {
+      decoder: null as unknown as AudioDecoder,
+      pending: [],
+      eotAfter: false,
+      lastActivity: 0,
+    };
     src.decoder = new AudioDecoder({
       output: (data) => {
         const sequence = src.pending.shift();
@@ -521,6 +536,10 @@ export class AudioEngine implements AudioApi {
           data.close();
         }
         this.mixer.port.postMessage({ type: "frame", source: key, sequence, pcm }, [pcm.buffer]);
+        if (src.eotAfter && src.pending.length === 0) {
+          src.eotAfter = false;
+          this.mixer.port.postMessage({ type: "eot", source: key });
+        }
       },
       error: (e) => {
         console.warn(`Opus decode error from source ${key.toString(16)}: ${e.message}`);
@@ -549,7 +568,7 @@ export class AudioEngine implements AudioApi {
     for (const [userId, t] of this.speaking) {
       if (now - t > SPEAKING_TIMEOUT_MS) {
         this.speaking.delete(userId);
-        emit("user-speaking", { user_id: userId, speaking: false });
+        this.ctx?.emit("user-speaking", { user_id: userId, speaking: false });
       }
     }
     for (const [key, src] of this.sources) {
@@ -624,7 +643,7 @@ export class AudioEngine implements AudioApi {
     return ac;
   }
 
-  /** Auto-connect reaches attach() without a click: resume on the first gesture. */
+  /** attach() runs when the server confirms a join, not on a click: resume on the first gesture. */
   private armResumeOnGesture(ac: AudioContext): void {
     if (this.gestureArmed) return;
     this.gestureArmed = true;
@@ -666,9 +685,9 @@ export class AudioEngine implements AudioApi {
 
   async startTransmit(): Promise<void> {
     const c = this.ctx;
-    if (!c) throw new Error("Not connected");
+    if (!c) throw new Error("Not in a voice channel");
     if (this.transmitting) return;
-    if (c.channelId === 0) throw new Error("Voice is disabled in the General lobby");
+    if (c.channelId === 0) throw new Error("Join a voice channel first");
     if (this._muted) return;
     this.transmitting = true;
     try {
@@ -693,10 +712,10 @@ export class AudioEngine implements AudioApi {
     }
   }
 
+  /** Never fails: without a voice session nothing is transmitting (detach stopped it). */
   async stopTransmit(): Promise<void> {
     const c = this.ctx;
-    if (!c) throw new Error("Not connected");
-    if (!this.transmitting) return;
+    if (!c || !this.transmitting) return;
     this.transmitting = false;
     this.stopCapture();
     // Tell the others we stopped talking (clears their speaking indicator)
@@ -710,6 +729,8 @@ export class AudioEngine implements AudioApi {
     }
     this.capture?.close();
     this.capture = null;
+    // stopTransmit sends its own EOT; a pending VAD one must not double it
+    this.wasOnAir = false;
     if (this.encoder) {
       try {
         this.encoder.close();
@@ -767,7 +788,11 @@ export class AudioEngine implements AudioApi {
         frameDuration: FRAME_US,
         useinbandfec: true,
         packetlossperc: 15,
-        usedtx: true,
+        // Chrome never emits the 1-byte DTX packets, so with DTX the stream
+        // had real-time holes and no gap in its sequence numbers, which a
+        // listener's stall bridge counts as lateness. Native senders do send
+        // theirs, so this makes both streams equally continuous.
+        usedtx: false,
       } as OpusEncoderConfig, // `application` is missing from the TS DOM lib
     });
     this.encoder = enc;
@@ -806,6 +831,26 @@ export class AudioEngine implements AudioApi {
       this.senderWater,
       this.senderReverb,
     );
+    if (this.wasOnAir && !onAir) {
+      // Say the phrase ended, exactly as releasing push-to-talk does. A
+      // voice-activated sender otherwise just stops, and a pause is then
+      // indistinguishable from a network stall: every receiver conceals its
+      // way into the silence before its jitter buffer re-arms, and a radio's
+      // squelch waits out the full idle timeout instead of closing on the end.
+      // Mirrors spawn_capture_encode_task in client/src-tauri/src/network.rs.
+      // Sent once the encoder has emitted what it still holds, or the last
+      // voice packet goes out after the EOT and cancels it on every receiver.
+      const c = this.ctx;
+      const enc = this.encoder;
+      const send = () => {
+        if (this.ctx === c && c && !this.wasOnAir) {
+          c.sendDatagram(wasm().buildEotPacket(c.sessionId, c.nextVoiceSequence()));
+        }
+      };
+      if (enc && enc.state === "configured") enc.flush().then(send, () => {});
+      else send();
+    }
+    this.wasOnAir = onAir;
     if (!onAir) return;
 
     const enc = this.ensureEncoder();
@@ -841,7 +886,7 @@ export class AudioEngine implements AudioApi {
       if (!this.keyMissingEmitted && now - this.keyMissingSince > KEY_MISSING_WARN_MS) {
         this.keyMissingEmitted = true;
         console.warn("no media key for 2s — voice frames are being dropped");
-        emit("media-key-missing");
+        c.emit("media-key-missing");
       }
       return;
     }
@@ -859,20 +904,15 @@ export class AudioEngine implements AudioApi {
 
   // ── Mute / deafen / settings ─────────────────────────────────────────
 
+  // One flag across every server, voice or not: commands.ts tells each of them.
   async toggleMute(): Promise<boolean> {
-    const c = this.ctx;
-    if (!c) throw new Error("Not connected");
     this._muted = !this._muted;
-    c.sendControl({ SetMuted: { muted: this._muted } });
     return this._muted;
   }
 
   async toggleDeafen(): Promise<boolean> {
-    const c = this.ctx;
-    if (!c) throw new Error("Not connected");
     this._deafened = !this._deafened;
     this.mixer?.port.postMessage({ type: "deafen", value: this._deafened });
-    c.sendControl({ SetDeafened: { deafened: this._deafened } });
     return this._deafened;
   }
 
@@ -1027,7 +1067,7 @@ export class AudioEngine implements AudioApi {
     const pos: [number, number, number] = [info.x, info.y, info.z];
     this.positions.set(info.session_id, existing ? { ...existing, pos } : defaultSource(pos));
     this.pushSpatialGains();
-    emit("user-position", { user_id: info.session_id, x: info.x, y: info.y, z: info.z });
+    c.emit("user-position", { user_id: info.session_id, x: info.x, y: info.y, z: info.z });
   }
 
   /** Drop a user's placement (they left the channel). */
@@ -1512,7 +1552,7 @@ export class AudioEngine implements AudioApi {
     if (this.screenEncoderFailed) return;
     this.screenEncoderFailed = true;
     console.warn("screen audio encoder failed, sharing video only:", message);
-    emit("screenshare-error", { reason: `Screen audio is not being sent: ${message}` });
+    this.ctx?.emit("screenshare-error", { reason: `Screen audio is not being sent: ${message}` });
   }
 
   private onScreenAudioChunk(chunk: EncodedAudioChunk): void {

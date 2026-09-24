@@ -7,32 +7,43 @@
 
 import { get, writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
 
-import { isAdmin } from "./connection.js";
+import { listenServer } from "../connect.js";
+import { isAdmin, serverAddress } from "./connection.js";
 import { addNotification } from "./notifications.js";
+import { scoped } from "./scoped.js";
 import type { BanInfo } from "../types.js";
 
 export const showAdminLogin = writable(false);
 export const showAdminPanel = writable(false);
 export const adminToken = writable("");
-export const bans = writable<BanInfo[]>([]);
+/** Each server's ban list; the dialogs show the one on screen. */
+export const bans = scoped<BanInfo[]>(() => []);
 
 // A login that succeeds arrives back as `admin-status`, which App.svelte routes
-// into `isAdmin`; losing admin closes the panel with it.
+// into `isAdmin`; losing admin closes the panel with it — and so does looking
+// at a server we are not admin on.
 isAdmin.subscribe((admin) => {
   if (admin) showAdminLogin.set(false);
   else showAdminPanel.set(false);
 });
 
-listen<{ bans: BanInfo[] }>("admin-bans", (e) => bans.set(e.payload.bans));
+// The login is for the server on screen when it is submitted: a token typed
+// for one must not go to another because the view moved while it was up.
+serverAddress.subscribe(() => {
+  showAdminLogin.set(false);
+  adminToken.set("");
+});
+
+listenServer<{ bans: BanInfo[] }>("admin-bans", (server, data) => bans.of(server).set(data.bans));
 
 export async function submitAdminLogin(): Promise<void> {
+  const server = get(serverAddress);
   const token = get(adminToken).trim();
   adminToken.set("");
   if (!token) return;
   try {
-    await invoke("admin_login", { token });
+    await invoke("admin_login", { server, token });
   } catch (e) {
     addNotification(`Admin login failed: ${e}`, "error");
   }
@@ -40,14 +51,14 @@ export async function submitAdminLogin(): Promise<void> {
 
 export function openAdminPanel(): void {
   showAdminPanel.set(true);
-  invoke("admin_list_bans").catch((e: unknown) =>
+  invoke("admin_list_bans", { server: get(serverAddress) }).catch((e: unknown) =>
     addNotification(`Could not load bans: ${e}`, "error"),
   );
 }
 
 export async function unban(ip: string): Promise<void> {
   try {
-    await invoke("admin_unban", { ip });
+    await invoke("admin_unban", { server: get(serverAddress), ip });
   } catch (e) {
     addNotification(`Unban failed: ${e}`, "error");
   }

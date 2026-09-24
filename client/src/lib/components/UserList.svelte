@@ -6,8 +6,13 @@
   // and its dialogs are UserContextMenu.svelte, mounted once by App.svelte. Both
   // exist because there are two member lists now and neither of those things
   // should be written twice — least of all the hide-members rule.
+  //
+  // Under the channel's members, everyone on the server who is in no voice
+  // channel: "Online", in its own box — test-ui.mjs counts `.users .user` as
+  // the channel's members.
 
   import { userId } from "../stores/connection.js";
+  import { viewingVoice } from "../stores/channels.js";
   import { speakingUsers } from "../stores/users.js";
   import { audibleIds } from "../stores/room.js";
   import {
@@ -16,17 +21,22 @@
     displayChannelName,
     displayUsers,
     hideMembers,
+    idleUsers,
     isCulled,
     isPreviewing,
   } from "../stores/roster.js";
   import { openUserMenu } from "../stores/user-menu.js";
   import Icon from "./Icons.svelte";
+  import type { UserInfo } from "../types.js";
 </script>
 
 <div class="user-list">
   <div class="header">
     {#if $isPreviewing}
       Previewing #{$displayChannelName}
+    {:else if $displayChannelId === 0}
+      <!-- The lobby: in no voice channel here, and no other channel open -->
+      Online
     {:else}
       Users in #{$displayChannelName}
     {/if}
@@ -36,67 +46,82 @@
   {/if}
   <div class="users">
     {#each $displayUsers as user (user.user_id)}
-      <div
-        class="user"
-        class:speaking={!$isPreviewing && $speakingUsers.has(user.user_id)}
-        class:culled={isCulled(user.user_id, $audibleIds, $userId, $isPreviewing)}
-        title={isCulled(user.user_id, $audibleIds, $userId, $isPreviewing)
-          ? "Out of earshot in the game — close it to hear everyone again"
-          : undefined}
-        oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); openUserMenu(user, e.clientX, e.clientY); }}
-      >
-        <div
-          class="indicator"
-          class:speaking={!$isPreviewing && $speakingUsers.has(user.user_id)}
-          class:muted={user.is_muted}
-          class:deafened={user.is_deafened}
-        ></div>
-        <span class="name">
-          {user.username}
-          {#if user.user_id === $displayChannelCreatorId && $displayChannelId !== 0}
-            <span class="crown" title="Channel creator"><Icon name="crown" size={12} /></span>
-          {/if}
-          {#if user.is_admin}
-            <span class="shield" title="Server admin"><Icon name="shield" size={12} /></span>
-          {/if}
-          {#if user.shares_history}
-            <span class="sharing-history" title="Shares recent chat with newcomers"><Icon name="history" size={12} /></span>
-          {/if}
-          {#if user.user_id === $userId}
-            <span class="you">(you)</span>
-          {/if}
-        </span>
-        {#if user.is_muted}
-          <span class="status-icon muted" title="Muted">
-            <Icon name="mic-off" size={14} />
-          </span>
-        {/if}
-        {#if user.is_deafened}
-          <span class="status-icon deafened" title="Deafened">
-            <Icon name="headphones-off" size={14} />
-          </span>
-        {/if}
-        {#if user.is_screen_sharing}
-          <span class="status-icon sharing" title="Sharing screen">
-            <Icon name="monitor" size={14} />
-          </span>
-        {/if}
-        {#if user.user_id !== $userId}
-          <button
-            class="more-btn"
-            title="Actions"
-            onclick={(e) => { e.stopPropagation(); openUserMenu(user, e.clientX, e.clientY); }}
-          >
-            <Icon name="more-vertical" size={16} />
-          </button>
-        {/if}
-      </div>
+      {@render member(user, !$isPreviewing && $viewingVoice, true)}
     {/each}
   </div>
+  {#if $idleUsers.length > 0}
+    <div class="idle-users">
+      <div class="idle-header">Online — {$idleUsers.length}</div>
+      {#each $idleUsers as user (user.user_id)}
+        {@render member(user, false, false)}
+      {/each}
+    </div>
+  {/if}
   {#if $isPreviewing}
     <div class="preview-hint">Join with the button under the chat</div>
   {/if}
 </div>
+
+<!-- One row. `inCall` is whether this list is the call's: speaking and the
+     game's culling are about the people we hear, and nobody else. `inChannel`
+     is whether it is the channel on screen's, which is what the crown is about. -->
+{#snippet member(user: UserInfo, inCall: boolean, inChannel: boolean)}
+  <div
+    class="user"
+    class:speaking={inCall && $speakingUsers.has(user.user_id)}
+    class:culled={isCulled(user.user_id, $audibleIds, $userId, !inCall)}
+    title={isCulled(user.user_id, $audibleIds, $userId, !inCall)
+      ? "Out of earshot in the game — close it to hear everyone again"
+      : undefined}
+    oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); openUserMenu(user, e.clientX, e.clientY, !inChannel); }}
+  >
+    <div
+      class="indicator"
+      class:speaking={inCall && $speakingUsers.has(user.user_id)}
+      class:muted={user.is_muted}
+      class:deafened={user.is_deafened}
+    ></div>
+    <span class="name">
+      {user.username}
+      {#if inChannel && user.user_id === $displayChannelCreatorId && $displayChannelId !== 0}
+        <span class="crown" title="Channel creator"><Icon name="crown" size={12} /></span>
+      {/if}
+      {#if user.is_admin}
+        <span class="shield" title="Server admin"><Icon name="shield" size={12} /></span>
+      {/if}
+      {#if user.shares_history}
+        <span class="sharing-history" title="Shares recent chat with newcomers"><Icon name="history" size={12} /></span>
+      {/if}
+      {#if user.user_id === $userId}
+        <span class="you">(you)</span>
+      {/if}
+    </span>
+    {#if user.is_muted}
+      <span class="status-icon muted" title="Muted">
+        <Icon name="mic-off" size={14} />
+      </span>
+    {/if}
+    {#if user.is_deafened}
+      <span class="status-icon deafened" title="Deafened">
+        <Icon name="headphones-off" size={14} />
+      </span>
+    {/if}
+    {#if user.is_screen_sharing}
+      <span class="status-icon sharing" title="Sharing screen">
+        <Icon name="monitor" size={14} />
+      </span>
+    {/if}
+    {#if user.user_id !== $userId}
+      <button
+        class="more-btn"
+        title="Actions"
+        onclick={(e) => { e.stopPropagation(); openUserMenu(user, e.clientX, e.clientY, !inChannel); }}
+      >
+        <Icon name="more-vertical" size={16} />
+      </button>
+    {/if}
+  </div>
+{/snippet}
 
 <style>
   .user-list {
@@ -131,6 +156,23 @@
     flex: 1;
     overflow-y: auto;
     padding: 8px;
+  }
+
+  /* Below the channel's members, capped so a busy lobby cannot push them off
+     screen; it scrolls on its own. */
+  .idle-users {
+    max-height: 40%;
+    overflow-y: auto;
+    padding: 0 8px 8px;
+    border-top: 1px solid var(--border);
+  }
+
+  .idle-header {
+    padding: 8px 8px 4px;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    color: var(--text-secondary);
   }
 
   .user {

@@ -36,15 +36,46 @@ impl Default for PttBinding {
     }
 }
 
+/// Every open server connection, keyed by server id.
+pub type Connections = HashMap<String, ActiveConnection>;
+
+/// What a voice-scoped command answers when no server holds voice.
+pub const NOT_IN_VOICE: &str = "Not in a voice channel";
+
 /// Application state managed by Tauri.
 pub struct AppState {
-    pub connection: RwLock<Option<ActiveConnection>>,
-    /// Held for the whole of `connect_to_server` so concurrent connects
-    /// (reconnect loop vs. manual) run one after the other.
-    pub connect_lock: tokio::sync::Mutex<()>,
+    /// Keyed by the exact `address` the front end passed to `connect`, never
+    /// re-normalised: later commands name the server by that same string.
+    pub connections: RwLock<Connections>,
+    /// The server whose voice channel we are in, if any.
+    ///
+    /// Stored, not derived from which connection has a channel other than 0:
+    /// while voice moves from one server to another, the one we are leaving
+    /// keeps its channel id until its server confirms the leave, and for that
+    /// round trip two connections would claim it. The latest confirmation wins
+    /// — see `network::claim_voice`.
+    pub voice_server: std::sync::Mutex<Option<String>>,
+    /// One lock per server id, held for the whole of `connect_to_server` so
+    /// concurrent connects to one server (reconnect loop vs. manual) run one
+    /// after the other — and one server's ten-second timeout never holds up
+    /// another's. ponytail: entries are never removed; one per server id this
+    /// session ever connected to.
+    pub connect_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     pub settings: RwLock<UserSettings>,
     pub chat: RwLock<ChatState>,
-    pub signal: Arc<std::sync::Mutex<SignalState>>,
+    // ── Settings every connection shares ──
+    // One user, one microphone, one pair of ears: each connection holds a
+    // clone of these (like `input_gain`), so a setter writes one place and
+    // whichever connection has voice reads it.
+    pub is_muted: Arc<AtomicBool>,
+    pub is_deafened: Arc<AtomicBool>,
+    /// Master output volume as f32 bits.
+    pub master_volume: Arc<AtomicU32>,
+    /// 0 = PTT, 1 = VAD, 2 = Always On (see `VoiceMode`).
+    pub voice_mode: Arc<AtomicU8>,
+    /// VAD threshold in dB.
+    pub vad_threshold_db: Arc<AtomicI32>,
+    pub noise_suppression: Arc<AtomicBool>,
     /// PTT binding shared with the global key listener (std RwLock for sync access).
     pub ptt_binding: Arc<std::sync::RwLock<PttBinding>>,
     /// When true, for combo bindings (e.g. Ctrl+Space), PTT stays active as long as the
@@ -100,8 +131,9 @@ pub enum SdkEvent {
     Muted { user_id: UserId, muted: bool },
     Deafened { user_id: UserId, deafened: bool },
     /// The server refused something (a channel join, most importantly), so a
-    /// mod waiting for its `hello` to complete learns why.
-    ChannelError(String),
+    /// mod waiting for its `hello` to complete learns why. Names the server,
+    /// because a refusal from any other connection is not about that join.
+    ChannelError { server: String, reason: String },
     /// How much of a placement the user will actually hear changed: the
     /// channel's mode, or their own *Hear people where they stand* setting.
     /// Sent as a partial `state` message, because it is the same field a
@@ -116,12 +148,18 @@ pub enum SdkEvent {
 
 impl AppState {
     pub fn new() -> Self {
-        Self {
-            connection: RwLock::new(None),
-            connect_lock: tokio::sync::Mutex::new(()),
+        let state = Self {
+            connections: RwLock::new(HashMap::new()),
+            voice_server: std::sync::Mutex::new(None),
+            connect_locks: std::sync::Mutex::new(HashMap::new()),
             settings: RwLock::new(UserSettings::default()),
             chat: RwLock::new(ChatState::default()),
-            signal: Arc::new(std::sync::Mutex::new(SignalState::default())),
+            is_muted: Arc::new(AtomicBool::new(false)),
+            is_deafened: Arc::new(AtomicBool::new(false)),
+            master_volume: Arc::new(AtomicU32::new(0)),
+            voice_mode: Arc::new(AtomicU8::new(0)),
+            vad_threshold_db: Arc::new(AtomicI32::new(0)),
+            noise_suppression: Arc::new(AtomicBool::new(false)),
             ptt_binding: Arc::new(std::sync::RwLock::new(PttBinding::default())),
             ptt_hold_mode: Arc::new(AtomicBool::new(true)),
             mute_binding: Arc::new(std::sync::RwLock::new(None)),
@@ -137,12 +175,35 @@ impl AppState {
             // Enough for a burst of talk edges; a lagging socket skips ahead
             sdk_events: tokio::sync::broadcast::channel(64).0,
             sdk_listen_error: Arc::new(std::sync::Mutex::new(None)),
-        }
+        };
+        state.seed_shared(&UserSettings::default());
+        state
+    }
+
+    /// Point the settings every connection shares at `s`: at startup from the
+    /// config, and again when the user resets it. They used to be seeded per
+    /// connect; nothing re-reads them there any more.
+    pub fn seed_shared(&self, s: &UserSettings) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.is_muted.store(s.muted, Relaxed);
+        self.is_deafened.store(s.deafened, Relaxed);
+        self.master_volume.store(s.volume.to_bits(), Relaxed);
+        self.voice_mode.store(VoiceMode::from_str(&s.voice_mode) as u8, Relaxed);
+        self.vad_threshold_db.store(s.vad_threshold_db as i32, Relaxed);
+        self.noise_suppression.store(s.noise_suppression, Relaxed);
     }
 
     /// Publish to the SDK sockets. Nobody listening is the normal case.
     pub fn sdk_event(&self, event: SdkEvent) {
         let _ = self.sdk_events.send(event);
+    }
+
+    /// The server we are in voice on, if any.
+    pub fn voice_id(&self) -> Option<String> {
+        self.voice_server
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     /// The persisted config, whoever poisoned the mutex.
@@ -157,6 +218,37 @@ impl AppState {
     pub fn config(&self) -> std::sync::MutexGuard<'_, crate::config::AppConfig> {
         self.config.lock().unwrap_or_else(|p| p.into_inner())
     }
+}
+
+/// The connection to one server, for a command that names it.
+pub fn conn<'a>(map: &'a Connections, server: &str) -> Result<&'a ActiveConnection, String> {
+    map.get(server).ok_or_else(|| format!("Not connected to {server}"))
+}
+
+pub fn conn_mut<'a>(
+    map: &'a mut Connections,
+    server: &str,
+) -> Result<&'a mut ActiveConnection, String> {
+    map.get_mut(server).ok_or_else(|| format!("Not connected to {server}"))
+}
+
+/// The connection we are in voice on, for a command that acts on the call
+/// rather than on a server.
+pub fn voice<'a>(state: &AppState, map: &'a Connections) -> Result<&'a ActiveConnection, String> {
+    state
+        .voice_id()
+        .and_then(|id| map.get(&id))
+        .ok_or_else(|| NOT_IN_VOICE.to_string())
+}
+
+pub fn voice_mut<'a>(
+    state: &AppState,
+    map: &'a mut Connections,
+) -> Result<&'a mut ActiveConnection, String> {
+    state
+        .voice_id()
+        .and_then(|id| map.get_mut(&id))
+        .ok_or_else(|| NOT_IN_VOICE.to_string())
 }
 
 /// A message waiting for encryption to become available.
@@ -253,13 +345,22 @@ impl Default for ChatState {
 pub struct ActiveConnection {
     pub user_id: UserId,
     pub username: String,
-    /// The `host:port` we connected to, as the user typed it. The game SDK
-    /// checks a mod's expectation against it before letting the game drive
-    /// the mix.
+    /// The server id: the `host:port` we connected to, exactly as the front
+    /// end passed it, and this connection's key in `AppState::connections`.
+    /// The game SDK checks a mod's expectation against it before letting the
+    /// game drive the mix.
     pub server_address: String,
     pub session_id: SessionId,
+    /// Shared with `AppState` and every other connection.
     pub is_muted: Arc<AtomicBool>,
     pub is_deafened: Arc<AtomicBool>,
+    /// This connection's E2E state. Per connection because every key in it is
+    /// a per-server id: user 5 here and user 5 on another server are two
+    /// people, and one store would pin the first one's identity on both.
+    pub signal: Arc<std::sync::Mutex<SignalState>>,
+    /// This is the voice connection (`AppState::voice_server`). The mixer
+    /// reads it to decide whether to hold a playback stream at all.
+    pub is_voice: Arc<AtomicBool>,
     /// Sender for control messages (framed, onto the control stream).
     pub tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
     /// Sender for voice packets (QUIC datagrams).
@@ -281,6 +382,7 @@ pub struct ActiveConnection {
     /// channel key and receivers never see a backwards jump.
     pub voice_sequence: Arc<AtomicU32>,
     /// Master output volume as f32 bits (applied by the voice mixer task).
+    /// Shared with `AppState`.
     pub master_volume: Arc<AtomicU32>,
     /// Voice frames played / concealed (jitter-buffer loss) — for the quality indicator.
     pub voice_frames_played: Arc<AtomicU32>,
@@ -341,14 +443,17 @@ pub struct ActiveConnection {
     /// Current channel ID — tracked for AAD construction in media encryption.
     pub current_channel_id: Arc<AtomicU32>,
     // ── Voice activation state ──
-    /// Voice mode: 0 = PTT, 1 = VAD, 2 = Always On. Shared with capture task.
+    /// Voice mode: 0 = PTT, 1 = VAD, 2 = Always On. Shared with capture task
+    /// and with `AppState`.
     pub voice_mode: Arc<AtomicU8>,
-    /// VAD threshold in dB, stored as i32 (e.g. -40). Shared with capture task.
+    /// VAD threshold in dB, stored as i32 (e.g. -40). Shared with capture task
+    /// and with `AppState`.
     pub vad_threshold_db: Arc<AtomicI32>,
     /// Current audio input level in dB × 100 (fixed-point). Updated by capture task.
     pub current_audio_level: Arc<AtomicI32>,
     // ── Noise suppression ──
-    /// Whether noise suppression is enabled. Shared with capture task.
+    /// Whether noise suppression is enabled. Shared with capture task and
+    /// with `AppState`.
     pub noise_suppression: Arc<AtomicBool>,
     // ── Per-user volume ──
     /// Per-user volume multiplier (0.0 = muted, 1.0 = default, 2.0 = max).

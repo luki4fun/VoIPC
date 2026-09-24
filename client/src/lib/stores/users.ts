@@ -1,7 +1,11 @@
 import { writable } from "svelte/store";
 import type { UserInfo } from "../types.js";
+// Explicit extension so Node's test runner can load this file as-is
+import { scoped } from "./scoped.ts";
 
-export const users = writable<UserInfo[]>([]);
+/** Who stands in the voice channel we are in on each server (channel 0 there: the lobby). */
+export const users = scoped<UserInfo[]>(() => []);
+/** Who is talking in the call. The call's, not a server's: only one carries voice. */
 export const speakingUsers = writable<Set<number>>(new Set());
 
 /** One user's entry replaced. A list with nobody of that id comes back as it went in. */

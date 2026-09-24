@@ -23,8 +23,15 @@ function fail(msg: string): never {
   throw msg;
 }
 
-function need(): session.Session {
-  return session.activeSession() ?? fail("Not connected");
+/** A server-scoped command's connection: `server` is the id connect was given. */
+function need(server: unknown): session.Session {
+  const id = str(server, "server");
+  return session.sessionFor(id) ?? fail(`Not connected to ${id}`);
+}
+
+/** A voice-scoped command's connection: the one whose voice channel we are in. */
+function voice(): session.Session {
+  return session.voiceSession() ?? fail("Not in a voice channel");
 }
 
 function str(v: unknown, name: string): string {
@@ -120,27 +127,32 @@ const handlers: Record<string, Handler> = {
     if (name.length === 0 || byteLength(name) > 32) fail("username must be 1-32 characters");
     return session.connect(addr, name);
   },
-  disconnect: () => session.disconnect(),
-  ping: () => need().sendControl({ Ping: { timestamp: Date.now() } }),
+  disconnect: ({ server }) => session.disconnect(str(server, "server")),
+  // A page load starts with no sessions anyway; this is here for the desktop
+  // backend's sake, where a reloaded page can find connections still open.
+  disconnect_all: async () => {
+    await Promise.all(session.allSessions().map((s) => s.end(true)));
+  },
+  ping: ({ server }) => need(server).sendControl({ Ping: { timestamp: Date.now() } }),
   get_platform: () => "web",
 
   // ── channels ──
-  join_channel: ({ channelId, password }) => {
-    const s = need();
+  join_channel: ({ server, channelId, password }) => {
+    const s = need(server);
     const channel = u32(channelId, "channelId");
     // Subscribing to a text channel is not a move, so it costs no share and no
     // viewer: only a voice join does (session.ts onUserList tears down the rest).
     if (!s.isTextChannel(channel)) s.clearWatching();
     s.sendControl({ JoinChannel: { channel_id: channel, password: optStr(password, "password") } });
   },
-  leave_channel: ({ channelId }) =>
-    need().sendControl({ LeaveChannel: { channel_id: u32(channelId, "channelId") } }),
-  create_channel: ({ name, password, proximity, anonymous, text }) => {
+  leave_channel: ({ server, channelId }) =>
+    need(server).sendControl({ LeaveChannel: { channel_id: u32(channelId, "channelId") } }),
+  create_channel: ({ server, name, password, proximity, anonymous, text }) => {
     const channelName = str(name, "name");
     if (channelName.length === 0 || byteLength(channelName) > 128) fail("channel name must be 1-128 characters");
     const pw = optStr(password, "password");
     if (pw !== null && byteLength(pw) > 128) fail("password too long");
-    need().sendControl({
+    need(server).sendControl({
       CreateChannel: {
         name: channelName,
         password: pw,
@@ -150,21 +162,21 @@ const handlers: Record<string, Handler> = {
       },
     });
   },
-  set_channel_password: ({ channelId, password }) =>
-    need().sendControl({
+  set_channel_password: ({ server, channelId, password }) =>
+    need(server).sendControl({
       SetChannelPassword: { channel_id: u32(channelId, "channelId"), password: optStr(password, "password") },
     }),
-  set_channel_proximity: ({ channelId, proximity }) =>
-    need().sendControl({
+  set_channel_proximity: ({ server, channelId, proximity }) =>
+    need(server).sendControl({
       SetChannelProximity: {
         channel_id: u32(channelId, "channelId"),
         proximity: proximityMode(proximity),
       },
     }),
   // null leaves an option as it is, so the dialog only sends what changed
-  set_channel_options: ({ channelId, hidden, anonymous, screenShare, hideMembers, routed, messageTtlSecs }) => {
+  set_channel_options: ({ server, channelId, hidden, anonymous, screenShare, hideMembers, routed, messageTtlSecs }) => {
     const flag = (v: unknown, name: string) => (v == null ? null : bool(v, name));
-    need().sendControl({
+    need(server).sendControl({
       SetChannelOptions: {
         channel_id: u32(channelId, "channelId"),
         hidden: flag(hidden, "hidden"),
@@ -176,91 +188,91 @@ const handlers: Record<string, Handler> = {
       },
     });
   },
-  kick_user: ({ channelId, userId }) =>
-    need().sendControl({ KickUser: { channel_id: u32(channelId, "channelId"), user_id: u32(userId, "userId") } }),
-  request_channel_users: ({ channelId }) =>
-    need().sendControl({ RequestChannelUsers: { channel_id: u32(channelId, "channelId") } }),
-  send_invite: ({ channelId, targetUserId }) =>
-    need().sendControl({
+  kick_user: ({ server, channelId, userId }) =>
+    need(server).sendControl({ KickUser: { channel_id: u32(channelId, "channelId"), user_id: u32(userId, "userId") } }),
+  request_channel_users: ({ server, channelId }) =>
+    need(server).sendControl({ RequestChannelUsers: { channel_id: u32(channelId, "channelId") } }),
+  send_invite: ({ server, channelId, targetUserId }) =>
+    need(server).sendControl({
       SendInvite: { channel_id: u32(channelId, "channelId"), target_user_id: u32(targetUserId, "targetUserId") },
     }),
-  accept_invite: ({ channelId }) => {
-    const s = need();
+  accept_invite: ({ server, channelId }) => {
+    const s = need(server);
     s.clearWatching();
     s.sendControl({ AcceptInvite: { channel_id: u32(channelId, "channelId") } });
   },
-  decline_invite: ({ channelId }) =>
-    need().sendControl({ DeclineInvite: { channel_id: u32(channelId, "channelId") } }),
+  decline_invite: ({ server, channelId }) =>
+    need(server).sendControl({ DeclineInvite: { channel_id: u32(channelId, "channelId") } }),
 
   // ── chat ──
-  send_poke: ({ targetUserId, message }) =>
-    need().sendPoke(u32(targetUserId, "targetUserId"), str(message, "message")),
-  send_channel_message: ({ content, channelId, ttlSecs }) =>
-    need().sendChannelMessage(
+  send_poke: ({ server, targetUserId, message }) =>
+    need(server).sendPoke(u32(targetUserId, "targetUserId"), str(message, "message")),
+  send_channel_message: ({ server, content, channelId, ttlSecs }) =>
+    need(server).sendChannelMessage(
       str(content, "content"),
       channelId == null ? undefined : u32(channelId, "channelId"),
       ttlSecs == null ? undefined : u32(ttlSecs, "ttlSecs"),
     ),
-  send_direct_message: ({ targetUserId, content, ttlSecs }) =>
-    need().sendDirectMessage(
+  send_direct_message: ({ server, targetUserId, content, ttlSecs }) =>
+    need(server).sendDirectMessage(
       u32(targetUserId, "targetUserId"),
       str(content, "content"),
       ttlSecs == null ? undefined : u32(ttlSecs, "ttlSecs"),
     ),
-  send_channel_history: ({ channelId, targetUserId, messages }) => {
+  send_channel_history: ({ server, channelId, targetUserId, messages }) => {
     if (!Array.isArray(messages)) fail("invalid messages");
-    need().sendChannelHistory(u32(channelId, "channelId"), u32(targetUserId, "targetUserId"), messages);
+    need(server).sendChannelHistory(u32(channelId, "channelId"), u32(targetUserId, "targetUserId"), messages);
   },
-  request_channel_history: ({ channelId, targetUserIds }) => {
+  request_channel_history: ({ server, channelId, targetUserIds }) => {
     if (!Array.isArray(targetUserIds)) fail("invalid targetUserIds");
-    need().requestChannelHistory(
+    need(server).requestChannelHistory(
       u32(channelId, "channelId"),
       targetUserIds.map((id) => u32(id, "targetUserIds")),
     );
   },
   set_history_sharing: ({ enabled }) => {
-    // Not connected is not a failure: the flag goes out again on the next
-    // connect, from the config the settings toggle has already written.
-    const s = session.activeSession();
-    if (s) s.sendControl({ SetHistorySharing: { enabled: bool(enabled, "enabled") } });
+    // To every server, and none is not a failure: the flag goes out again on
+    // the next connect, from the config the settings toggle has already written.
+    const on = bool(enabled, "enabled");
+    for (const s of session.allSessions()) s.sendControl({ SetHistorySharing: { enabled: on } });
   },
 
   // ── moderation (admin token session) ──
-  admin_login: ({ token }) => need().sendControl({ AdminLogin: { token: str(token, "token") } }),
-  admin_kick: ({ userId, reason }) =>
-    need().sendControl({ AdminKick: { user_id: u32(userId, "userId"), reason: str(reason, "reason") } }),
-  admin_ban: ({ userId, reason, durationSecs }) =>
-    need().sendControl({
+  admin_login: ({ server, token }) => need(server).sendControl({ AdminLogin: { token: str(token, "token") } }),
+  admin_kick: ({ server, userId, reason }) =>
+    need(server).sendControl({ AdminKick: { user_id: u32(userId, "userId"), reason: str(reason, "reason") } }),
+  admin_ban: ({ server, userId, reason, durationSecs }) =>
+    need(server).sendControl({
       AdminBan: {
         user_id: u32(userId, "userId"),
         reason: str(reason, "reason"),
         duration_secs: u32(durationSecs, "durationSecs"),
       },
     }),
-  admin_unban: ({ ip }) => need().sendControl({ AdminUnban: { ip: str(ip, "ip") } }),
-  admin_list_bans: () => need().sendControl("AdminListBans"),
+  admin_unban: ({ server, ip }) => need(server).sendControl({ AdminUnban: { ip: str(ip, "ip") } }),
+  admin_list_bans: ({ server }) => need(server).sendControl("AdminListBans"),
 
   // ── voice ──
   start_transmit: async () => {
-    const s = need();
-    if (s.channelId === 0) fail("Voice is disabled in the General lobby");
+    const s = voice();
+    if (s.channelId === 0) fail("Join a voice channel first");
     await audio.startTransmit();
   },
-  stop_transmit: async () => {
-    need();
-    await audio.stopTransmit();
-  },
+  // Never fails: whichever session transmits is the voice session, if any
+  stop_transmit: () => audio.stopTransmit(),
+  // Mute and deafen are one flag across servers, voice or not: every server
+  // shows them next to our name.
   toggle_mute: async () => {
-    need();
-    const muted = await audio.toggleMute(); // also tells the server
+    const muted = await audio.toggleMute();
+    for (const s of session.allSessions()) s.sendControl({ SetMuted: { muted } });
     updateConfig((c) => {
       c.muted = muted;
     });
     return muted;
   },
   toggle_deafen: async () => {
-    need();
-    const deafened = await audio.toggleDeafen(); // also tells the server
+    const deafened = await audio.toggleDeafen();
+    for (const s of session.allSessions()) s.sendControl({ SetDeafened: { deafened } });
     updateConfig((c) => {
       c.deafened = deafened;
     });
@@ -288,11 +300,11 @@ const handlers: Record<string, Handler> = {
     audio.setVolume(value);
   },
   set_user_volume: ({ userId, volume }) => {
-    need();
+    voice();
     audio.setUserVolume(u32(userId, "userId"), clamp(num(volume, "volume"), 0, 2));
   },
   set_user_position: ({ userId, pos, range, volume, muffle, direct }) => {
-    need();
+    voice();
     audio.setUserPosition(u32(userId, "userId"), position(pos, "pos"), {
       range: range == null ? undefined : num(range, "range"),
       volume: volume == null ? undefined : num(volume, "volume"),
@@ -301,7 +313,7 @@ const handlers: Record<string, Handler> = {
     });
   },
   set_own_position: ({ pos, fwd }) => {
-    need();
+    voice();
     const p = position(pos, "pos") ?? fail("invalid pos");
     let facing: [number, number] | undefined;
     if (fwd != null) {
@@ -311,11 +323,11 @@ const handlers: Record<string, Handler> = {
     audio.setOwnPosition(p, facing);
   },
   set_position_sync: ({ enabled }) => {
-    need();
+    voice();
     audio.setPositionSync(bool(enabled, "enabled"));
   },
   clear_positions: () => {
-    need();
+    voice();
     audio.clearPositions();
   },
   // A browser page cannot host a socket, so the game SDK is desktop-only
@@ -342,13 +354,13 @@ const handlers: Record<string, Handler> = {
     audio.setSpatialSetting(name, enabled);
   },
   get_user_volume: ({ userId }) => {
-    need();
+    voice();
     return audio.getUserVolume(u32(userId, "userId"));
   },
   // Audio effects. Validated here as well as in the Rust command: for a web
   // build this handler *is* the trust boundary, not a mirror of one.
   set_user_fx: ({ userId, effect, muffle, reverb, water }) => {
-    need();
+    voice();
     audio.setUserFx(
       u32(userId, "userId"),
       laneEffect(effect),
@@ -358,15 +370,15 @@ const handlers: Record<string, Handler> = {
     );
   },
   get_source_levels: () => {
-    need();
+    voice();
     return audio.getSourceLevels();
   },
   get_user_fx: ({ userId }) => {
-    need();
+    voice();
     return audio.getUserFx(u32(userId, "userId"));
   },
   // Our own microphone's lane: the same four controls, the same validation.
-  // No need(): a preference, settable while disconnected, like the others.
+  // No session needed: a preference, settable while disconnected, like the others.
   set_mic_fx: ({ effect, muffle, reverb, water }) => {
     const name = laneEffect(effect);
     const mu = clamp(num(muffle, "muffle"), 0, 10);
@@ -395,7 +407,7 @@ const handlers: Record<string, Handler> = {
     audio.setVadThreshold(value);
   },
   get_audio_level: () => {
-    need();
+    voice();
     return audio.getAudioLevel();
   },
   get_input_devices: () => audio.getInputDevices(),
@@ -436,19 +448,19 @@ const handlers: Record<string, Handler> = {
   },
   stop_spatial_test: () => audio.stopSpatialTest(),
   get_voice_stats: () => {
-    need();
+    voice();
     return audio.getVoiceStats();
   },
   get_screen_audio_status: () => {
-    need();
+    voice();
     return audio.getScreenAudioStatus();
   },
 
   // ── screen share ──
-  watch_screen_share: ({ sharerUserId }) => need().watchScreenShare(u32(sharerUserId, "sharerUserId")),
-  stop_watching_screen_share: () => need().stopWatchingScreenShare(),
+  watch_screen_share: ({ sharerUserId }) => voice().watchScreenShare(u32(sharerUserId, "sharerUserId")),
+  stop_watching_screen_share: () => voice().stopWatchingScreenShare(),
   get_screen_share_stats: () => {
-    need();
+    voice();
     // [frames_sent, bytes_sent] from our own share, the rest from the viewer
     const [, , recv, dropped, bytesRecv, resolution] = video.getStats();
     const [sent, bytesSent] = share.getStats();
@@ -456,7 +468,7 @@ const handlers: Record<string, Handler> = {
   },
   // The browser opens its own source picker, so sourceType/sourceId are unused
   start_screen_share: ({ resolution, fps }) => {
-    need();
+    voice();
     return share.start(u32(resolution, "resolution"), u32(fps, "fps"));
   },
   // getDisplayMedia has no switch: the button is hidden on web, and stopping
@@ -551,6 +563,25 @@ const handlers: Record<string, Handler> = {
       c.saved_servers = c.saved_servers.filter((s) => !(s.host === h && s.port === p));
     });
     return structuredClone(getConfig().saved_servers);
+  },
+  // The servers open right now, reconnected on the next start. Entries arrive
+  // in the stored shape (snake_case), unlike save_server's arguments.
+  save_open_servers: ({ servers }) => {
+    if (!Array.isArray(servers)) fail("invalid servers");
+    const list = servers.map((v: unknown): SavedServer => {
+      if (v === null || typeof v !== "object") fail("invalid servers");
+      const s = v as Record<string, unknown>;
+      return {
+        name: str(s.name, "name"),
+        host: str(s.host, "host"),
+        port: u32(s.port, "port"),
+        username: str(s.username, "username"),
+        accept_self_signed: bool(s.accept_self_signed, "accept_self_signed"),
+      };
+    });
+    updateConfig((c) => {
+      c.open_servers = list;
+    });
   },
   reset_config: () => {
     resetConfig();

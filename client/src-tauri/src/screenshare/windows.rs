@@ -7,8 +7,8 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use super::{
-    AudioProcessor, CapturedFrame, DisplayInfo, FrameProcessor, FrameSlot, PixFmt, WindowInfo,
-    SCREEN_AUDIO_BITRATE, SCREEN_AUDIO_FRAME_SIZE,
+    run_encode_loop, AudioProcessor, CapturedFrame, DisplayInfo, FrameProcessor, FrameSlot,
+    PixFmt, WindowInfo, SCREEN_AUDIO_BITRATE, SCREEN_AUDIO_FRAME_SIZE,
 };
 
 // ── Win32 imports for window/monitor enumeration ──────────────────────────
@@ -416,14 +416,14 @@ fn run_capture_and_encode(
     );
 
     // ── Run encode loop on this thread ───────────────────────────────────
-    let mut processor = FrameProcessor {
+    let processor = FrameProcessor {
         encoder,
         codec,
         i420_buf: Vec::new(),
         full_res_i420_buf: Vec::new(),
         converter: None,
         frame_id: 0,
-        keyframe_interval: voipc_video::KEYFRAME_INTERVAL_SECS * target_fps,
+        last_idr: None,
         start_time,
         target_width,
         target_height,
@@ -434,7 +434,6 @@ fn run_capture_and_encode(
         base_fps: target_fps,
         level: 0,
         level_changed: Instant::now(),
-        frame_counter: 0,
         video_tx,
         session_id,
         media_key,
@@ -443,10 +442,7 @@ fn run_capture_and_encode(
         bytes_sent,
     };
 
-    while let Some(frame) = slot.take() {
-        processor.process(&frame.pixels, frame.width, frame.height, frame.stride, frame.fmt);
-        slot.recycle(frame.pixels);
-    }
+    run_encode_loop(&slot, processor);
 
     // ── Cleanup ──────────────────────────────────────────────────────────
     let _ = capture_thread.join();
@@ -456,6 +452,10 @@ fn run_capture_and_encode(
 }
 
 // ── Unified WGC capture loop (runs on dedicated thread) ──────────────────
+
+/// Frame pool depth: two, so a change that lands while the other buffer is
+/// being copied out is still captured (Microsoft's sample uses two too).
+const POOL_BUFFERS: i32 = 2;
 
 /// Windows.Graphics.Capture-based capture loop for both displays and windows.
 ///
@@ -502,10 +502,12 @@ fn run_wgc_capture_loop(
     let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
         &direct3d_device,
         DirectXPixelFormat::B8G8R8A8UIntNormalized,
-        1,
+        POOL_BUFFERS,
         size,
     )
     .map_err(|e| format!("Failed to create frame pool: {e}"))?;
+    let mut pool_size = size;
+    let mut resize_to = None;
 
     // Create and start capture session
     let capture_session = pool
@@ -544,7 +546,34 @@ fn run_wgc_capture_loop(
         // body's own duration doesn't accumulate as drift below target fps.
         next_frame = (next_frame + frame_interval).max(Instant::now());
 
-        if let Ok(frame) = pool.TryGetNextFrame() {
+        if let Some(size) = resize_to.take() {
+            if let Err(e) = pool.Recreate(
+                &direct3d_device,
+                DirectXPixelFormat::B8G8R8A8UIntNormalized,
+                POOL_BUFFERS,
+                size,
+            ) {
+                warn!("WGC: failed to resize the frame pool: {}", e);
+            }
+        }
+
+        // Only the newest frame is copied; dropping an older one hands its
+        // buffer back to the pool.
+        let mut newest = None;
+        while let Ok(frame) = pool.TryGetNextFrame() {
+            newest = Some(frame);
+        }
+
+        if let Some(frame) = newest {
+            // A resized window keeps arriving at the old buffer size (cropped,
+            // or padded with stale pixels) until the pool is rebuilt.
+            if let Ok(content) = frame.ContentSize() {
+                if content != pool_size && content.Width > 0 && content.Height > 0 {
+                    pool_size = content;
+                    resize_to = Some(content);
+                }
+            }
+
             // Get the D3D11 texture from the captured frame
             let surface = match frame.Surface() {
                 Ok(s) => s,

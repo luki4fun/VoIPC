@@ -2,6 +2,286 @@
 
 All notable changes to VoIPC are documented here.
 
+## [0.10.0] - 2026-09-25
+
+The client now stays connected to several servers at once, and voice is
+something you join rather than something you arrive in. Protocol version 9,
+unchanged, and nothing on the server side had to change for either — but a
+server still admits only a client of its own version, so update both together.
+
+Much of the rest is voice playback — the irregular cracks people have been
+hearing, which turned out to be a handful of separate faults all wearing the
+same symptom. Screen sharing was then checked for the same kind of fault and had
+several: a still screen that never answered a new viewer, the last frame of a
+burst thrown away, recovery that trusted the wrong keyframe, and a relay that
+could bank seconds of video. Plus a way to tell one client build from the next.
+
+### Added — several servers at once
+
+The server rail used to be a list with one live entry: its "+" disconnected
+you from the server you were on, without asking, just to bring up the connect
+dialog. A client now holds a connection to every server in the rail at the same
+time, on the desktop, on Android and in the browser.
+
+- **Adding a server keeps the others.** "+" opens the connect dialog over the
+  app; close it and nothing changed. Clicking a server in the rail shows it;
+  clicking a saved one that is not connected connects it in the background
+- **Every connected server stays live**: its chat arrives, its unread count
+  sits on its rail icon, its pokes and messages notify you, all while you are
+  looking at another one. Right-click an icon to disconnect from that server
+  alone, or to remove the bookmark
+- **Voice is on one server at a time.** Joining a voice channel on one server
+  leaves the one you were in on another, the way a phone call ends when you
+  take the next one. The voice panel names the server whenever it is not the
+  one on screen
+- **The classic layout has the rail too**
+- **With auto-connect on, every server that was open comes back** at the next
+  start, not only the last one. A server that is down at that moment keeps
+  retrying in the background rather than dropping out of the list
+- **A server that drops no longer takes the window with it.** The reconnect
+  overlay covers that server's pane only, so the rail and a call on another
+  server stay usable while it retries
+
+In the browser, a second server has to have a certificate the browser trusts:
+there is no trust-on-first-use for a page's own connections.
+
+### Changed — voice is something you join
+
+Connecting used to put you in "General", which looked and behaved like a voice
+channel you were standing in, with no way out of it short of disconnecting.
+You now arrive in no voice channel at all, join one when you want to talk, and
+leave it again with a button — in either layout — while staying on the server.
+
+- The "General" row is gone. The people on a server who are not in any voice
+  channel are listed under **Online** in the member list, so they are still a
+  right-click away for a message, a poke or an admin action
+- **Leaving voice closes the microphone**, however it happens. With voice
+  activation on, being moved out by a channel kick used to leave the capture
+  running with nothing to send it to
+- On Android the call notification's button says **Leave voice**, and does
+  exactly that: the servers stay connected
+- Reconnecting after a dropped link still puts you back in the voice channel
+  you were in — unless you joined voice on another server in the meantime
+
+None of this is the server's doing: it still parks every arrival in its
+lobby, and the client now treats that lobby as "not in voice".
+
+### Fixed — the cracks in voice playback
+
+None of this was the codec or the network. The playback ring — the handful of
+milliseconds of audio waiting in front of the sound card — was running dry, and
+a callback that finds it half full plays the half and silence for the rest. That
+is the crack. It sounded patternless because it happened once per pause in
+speech, and people do not pause on a schedule.
+
+- **The mixer now runs on the output device's clock.** It used to push one 20 ms
+  frame per timer tick, and a timer and a sound card drift against each other
+  all day: sooner or later a tick lands late, and the device is already at the
+  ring asking for audio that was not written yet. The device now says when it
+  took something and the mixer refills on that, which cannot drift because there
+  is no second clock left to drift against
+- **How deep the cushion is kept is read off the device instead of guessed.**
+  Devices differ by an order of magnitude in how much they swallow per wake-up —
+  cpal's ALSA backend took 42.7 ms at a time on the machine this was found on,
+  WASAPI asks for about 10 ms, Oboe for a couple of frames — so any fixed number
+  is wrong somewhere. A fixed two-frame cushion measured *worse* than the bug it
+  would have replaced: 23 underruns a second. It is now sized from the device's
+  own recent callbacks, floored at 60 ms and capped at eight frames
+- **A pause between phrases no longer empties the ring.** With nobody audible
+  the mixer pushed nothing at all, so every gap between two sentences drained
+  the cushion and the next burst opened by underrunning its way back up to
+  depth. Quiet is now pushed like anything else. Measured on a 2 s-on / 1 s-off
+  talk pattern: 2.16 underruns per second before, 0 after. This is not a latency
+  change — 60 ms is the same depth the old mixer held *while* audio was flowing,
+  it is just never allowed to fall out of it again
+- **Starting playback, and switching output device, clicked exactly once.** A
+  fresh stream's first callback asks for the device's whole buffer — 100 ms here
+  against 42.7 ms in steady state — and it arrives before anything has had the
+  chance to learn that, so nobody could have filled it in time. The ring is now
+  handed 100 ms of silence up front rather than a hole. It drains back down to
+  the normal cushion by itself, so it costs no lasting latency
+- **A packet arriving a little late no longer ends the phrase.** The jitter
+  buffer gave up the instant it ran dry: one delayed packet stopped playback
+  dead, and the sound came back 40 ms later with a hard edge on both sides of
+  the gap. Up to 60 ms of a stall is now concealed while the buffer goes on
+  expecting that exact packet — so it is played when it lands, rather than being
+  thrown away as a straggler — and the cushion for that speaker is left one
+  frame deeper, since the link just said it needed it. Past 60 ms the speaker
+  has stopped rather than stalled, and playback re-arms as it always did
+- **The cushion only shrinks after a phrase that had room to spare.** Running
+  dry made the adaptive delay decay, which is precisely backwards: an underrun
+  is the one moment that argues for holding *more* audio, not less. It now
+  decays at the end of a phrase — an end-of-transmission, or the speaker simply
+  stopping, which is the only end a screen share, an always-on microphone or an
+  older client ever sends — and only if every packet of that phrase landed with
+  at least one frame still waiting. Senders and devices that move audio in
+  bursts (ALSA hands over 42.7 ms at a time) used to run a two-frame cushion dry
+  early in most phrases, grow it, shrink it again ten seconds later, and repeat
+- **A stream that never pauses sheds the delay it picks up.** A screen share's
+  audio, or an always-on microphone, never reaches the end of a phrase, so every
+  network hiccup it rode out stayed as extra delay for good, and a sender whose
+  sound card runs a little fast added more on top. Once a speaker has sat more
+  than two frames above their target for a second, one frame is dropped: of the
+  next two, the quieter one, and both are decoded, so the cut lands on the least
+  audible 20 ms and Opus never loses its place. At most one frame a second
+- **Switching output device mid-call no longer pulls everyone's speech
+  forward.** The new stream's outsized first ask was counted as its appetite,
+  so for two seconds the cushion was sized for 100 ms: the mixer pulled two or
+  three extra frames out of every speaker's buffer at once, which is concealment
+  in the middle of whoever was talking, and then left that audio parked as
+  delay. The first ask is covered by the silence the stream starts with and is
+  no longer counted, and a new device starts from a clean slate
+- **The speaker test and the microphone monitor crackled the same way.** Both
+  still pushed audio on a timer — the speaker test one 20 ms frame per 20 ms
+  sleep, which always oversleeps and so always runs short of the device. The
+  speaker test now tops up by how full the ring is, and the monitor drains
+  everything the microphone captured on every pass. Neither counts towards the
+  voice mixer's own figures any more, which they used to reset and pollute
+- **The browser client rides out a short stall too, and without clicks.** It
+  now bridges up to 60 ms of a late packet the way the desktop client does, and
+  grows its cushion when that happened, instead of re-arming on every hiccup.
+  It has no Opus decoder to conceal with, so the bridge is silence — but a lane
+  that stops now fades out over 2 ms from wherever its waveform was, and fades
+  back in when it resumes, where it used to step to zero and back: two clicks
+  around every lost packet. It sheds standing delay by the same rule as above
+
+### Changed — voice activation says when you stopped
+
+Releasing push-to-talk has always sent an end-of-transmission packet. Voice
+activation just stopped sending, and a sender who stops is indistinguishable
+from a network that stalled.
+
+- **A voice-activated phrase now ends the way a push-to-talk one does.** Without
+  it every listener concealed its way into the silence and then sat through a
+  re-arm before the next word, and a FiveM-style radio's squelch waited out the
+  whole idle timeout instead of closing when the speaker actually finished. The
+  packet is one every released client already understands, so this helps whoever
+  is listening to you whether or not they have updated
+- **The browser client sends it too**, once its encoder has handed over the
+  last packet of the phrase — sent any earlier, that packet would arrive after
+  the end-of-transmission and cancel it on every listener
+- **A browser listener no longer loses one that lands right behind the last
+  packet.** Voice is decoded off the audio thread and comes back a moment later,
+  so the end-of-transmission used to reach the mixer first and be undone by the
+  frame behind it. It now waits for the frames still in the decoder
+- **The browser client no longer uses Opus DTX.** Chrome drops DTX's tiny
+  keep-alive packets instead of sending them, which left holes in the stream
+  with nothing in the sequence numbers to say so, and a listener reads a hole
+  it cannot explain as a late network. The desktop client always sent its
+  packets, so both are now equally continuous
+
+### Fixed — screen sharing
+
+The same questions, asked of video: who paces what, and what happens when
+nothing arrives.
+
+- **A viewer who joins a still screen gets a picture.** Screen capture on Linux
+  and Windows only delivers a frame when something on screen changes, and a
+  keyframe could only be made from a new frame, so a viewer who clicked Watch
+  on a slide or a document sat on "Waiting for video stream…" until the sharer
+  moved the mouse — and one who lost a frame stayed frozen the same way. The
+  sharer now re-encodes its last frame when a keyframe is owed and nothing new
+  came within 200 ms, and the periodic keyframe is timed rather than counted,
+  since a still screen has no frames to count. The browser sharer does the same
+  on Chromium, whose capture is equally quiet
+- **The last frame of a burst is always the one that is shown.** Frames that
+  arrived faster than the share's frame rate were thrown away on arrival, so the
+  frame a scroll stopped on, or a slide flipped to while the share was stepped
+  down to half rate, could be the one dropped — and on a still screen nothing
+  came after it to correct the picture. The newest frame is now kept and the
+  encoder paces by time, so it always encodes the one a burst ended on. On Linux
+  this also stops a 60 fps share from losing frames to the compositor handing
+  over two buffers at once
+- **A keyframe request is repeated until it is answered.** The server allows
+  each share one keyframe relay a second and relies on viewers asking again,
+  but the desktop client asked only once per loss — so a third viewer joining
+  within a second of two others, or a request whose keyframe was itself lost,
+  waited for the next periodic one. It now asks every second for as long as it
+  has nothing clean to show, and the browser viewer asks the moment it starts
+  watching
+- **Recovery waits for a keyframe that came after the loss.** Frames are now
+  judged in the order they arrived, so a keyframe that happened to be queued
+  just before a loss no longer resumes the picture over the corruption behind it
+- **No frame is dropped quietly any more.** A frame lost where the desktop
+  viewer hands frames to its decoder, one Android's hardware decoder had no room
+  for, and one the browser sharer dropped before sending (no media key yet, too
+  large, or an uplink already full) all used to vanish without anyone noticing,
+  and every frame after it was decoded against a picture that was never there.
+  All of them now count as loss: the viewer freezes on the last good picture and
+  asks for a keyframe, and the browser sharer sends nothing more until it has one
+- **Android shows the newest picture, not the one before it.** Its hardware
+  decoder finishes a moment after it is handed a frame, and the client looked
+  for the result without waiting, so it always found the previous frame's — and
+  a still share never showed its last update at all
+- **A browser sharer on a slow uplink no longer sends nothing but keyframes.**
+  Every frame dropped for a full uplink asked for a keyframe, so under steady
+  congestion almost everything that got out was a keyframe, ten times the size
+  of a normal frame. Forced keyframes are now spaced a second apart while
+  frames are still queued, and a keyframe may use a few slots a normal frame may
+  not, so the one that ends a drop always gets out
+- **A browser viewer whose decoder cannot keep up stops falling behind.** Frames
+  used to queue in front of it without limit and the picture drifted seconds
+  behind the voice. Past a few queued frames it now skips to the next keyframe.
+  A decoder that fails on every keyframe says so and stops, instead of leaving a
+  black viewer
+- **Windows: resizing a shared window no longer crops it.** The capture kept
+  the size the window had when the share started. It now follows the window, and
+  keeps a second buffer so a change that lands mid-copy is not lost
+
+### Changed — the relay no longer banks seconds of video
+
+Every video frame travels on a stream of its own, and QUIC's defaults let a
+hundred of them — several seconds of video — pile up inside a slow connection
+before anything upstream noticed. The relay then dropped single pieces of
+frames, keyframes included, which cost the viewer the whole frame anyway.
+
+- **Fewer frames in flight per connection, sent in order.** The server and the
+  desktop client allow 24 frame streams at a time, the server keeps at most
+  512 KiB unacknowledged per viewer — about twice what the fastest share needs
+  over a 300 ms round trip — and frames go out oldest first. Control messages
+  are sent ahead of video, so a full video queue cannot delay them
+- **The relay drops whole frames, and asks for the keyframe that ends it.** A
+  frame is queued for a viewer only if all of it fits, room is always left for a
+  keyframe, and once a frame is dropped the frames that depended on it are not
+  sent either. Since that viewer then receives nothing to notice the gap by, the
+  relay asks the sharer for the keyframe itself, within the same one-a-second
+  allowance a viewer's own request has
+
+### Added — which build am I running
+
+A release version moves once per release and the protocol version moves less
+often than that, so between two releases nothing on screen changed when the
+client did. In the browser that is worse than merely unhelpful: a page served
+from cache is indistinguishable from a freshly built one, and there was no way
+to tell whether a reload had picked up the new bundle or quietly re-run the old.
+
+- **The bottom of the settings panel says which build this is** — version, the
+  commit it was built from, and when it was built — on every tab, since it is
+  the kind of thing you go looking for without knowing which tab to look under.
+  A `+` after the commit means the tree had uncommitted edits, and the build
+  time is the part that still moves while work is uncommitted. Click it to copy
+  the line for a bug report
+- **The same line is logged to the browser console at startup**, which is the
+  quickest answer to "did that reload actually take?" without leaving devtools
+- **The server no longer lets a browser guess how long to keep the page.**
+  `index.html` is sent `no-cache` and the hashed files under `assets/` are sent
+  `immutable` — previously neither carried any policy at all, which left the
+  browser free to apply its own heuristic to the one file whose whole job is to
+  name the current bundle. This is the half that makes a reload *work*, rather
+  than merely making it observable
+- **Release images carry the commit too.** `npm run release` builds in Docker
+  from a context without `.git`, so its web bundle and AppImage said `no-git`;
+  the commit is now handed in from outside
+
+### Looking ahead
+
+The browser client bridges a short stall with silence, because there is no Opus
+decoder inside the mixer worklet to conceal with — real concealment, and the
+next packet's forward error correction, wait on a wasm one. On Linux the sharer
+now copies every frame the compositor hands over so that the newest is always
+there to encode; holding on to the compositor's buffer instead would save that
+copy if it ever shows up in a profile.
+
 ## [0.9.1] - 2026-09-18
 
 Protocol version 9, unchanged: a 0.9.1 client and a 0.9.0 server still talk to
