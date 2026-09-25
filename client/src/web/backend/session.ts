@@ -63,6 +63,8 @@ const toBytes = (v: number[] | Uint8Array): Uint8Array => (v instanceof Uint8Arr
 
 /** Milliseconds since the Unix epoch truncated to u32: the ping sequence. */
 const nowU32 = () => Date.now() >>> 0;
+/** How long an ask for a voice seat stays good (network.rs VOICE_ASK_TTL_MS). */
+const VOICE_ASK_TTL_MS = 10_000;
 
 /** Live sessions by server id: the exact `address` the UI connected with. */
 const sessions = new Map<string, Session>();
@@ -257,6 +259,12 @@ export class Session implements SessionContext {
   private controlLast = Date.now();
   private controlTimer: ReturnType<typeof setTimeout> | undefined;
   private ended = false;
+  /**
+   * When we last asked this server for a voice seat (Date.now(), 0 = never):
+   * a join, a voice channel's creation, an accepted invite. Only such an ask
+   * lets this server take voice (network.rs `take_voice_ask`).
+   */
+  private voiceAskedAt = 0;
 
   constructor(
     /** The server id: the address the UI connected with, verbatim. */
@@ -723,6 +731,9 @@ export class Session implements SessionContext {
         // Remove from pending so we don't loop
         this.pendingSessions.delete(b.user_id);
         break;
+      case "DirectMessageUndelivered":
+        this.emit("dm-undelivered", { user_id: b.target_user_id });
+        break;
       case "IdentityKeyChanged":
         this.emit("identity-key-changed", { user_id: b.user_id, new_identity_key: b.new_identity_key });
         break;
@@ -823,6 +834,20 @@ export class Session implements SessionContext {
         }
       }
       this.emit("user-list", { channel_id: channelId, users });
+      return;
+    }
+
+    // A voice seat we did not ask this server for is refused, before anything
+    // here changes: taking voice ends the call on whichever server had it and
+    // opens the microphone into a room whose members, and so whose media key,
+    // this server chooses. One that already carries our voice may still move
+    // us between its own rooms. Mirrors network.rs handle_server_message.
+    if (channelId !== 0 && voiceOwner !== this && !this.takeVoiceAsk()) {
+      console.warn(`${this.server} seated us in voice channel ${channelId} unasked; leaving it`);
+      this.sendControl({ JoinChannel: { channel_id: 0, password: null } });
+      this.emit("channel-error", {
+        reason: "The server put you in a voice channel you did not join — you were taken out of it again",
+      });
       return;
     }
 
@@ -1267,6 +1292,18 @@ export class Session implements SessionContext {
    */
   clearWatching(): void {
     this.watchingUserId = 0;
+  }
+
+  /** We are about to ask this server for a voice seat; before the request, so its answer cannot beat it. */
+  askVoice(): void {
+    this.voiceAskedAt = Date.now();
+  }
+
+  /** Whether the seat just given was asked for lately; one ask pays for one seat. */
+  private takeVoiceAsk(): boolean {
+    const at = this.voiceAskedAt;
+    this.voiceAskedAt = 0;
+    return at !== 0 && Date.now() - at < VOICE_ASK_TTL_MS;
   }
 
   watchScreenShare(sharerUserId: number): void {

@@ -2,6 +2,54 @@
 
 All notable changes to VoIPC are documented here.
 
+## [0.10.1] - 2026-09-25
+
+People can share a name now, and a direct message to somebody who has left
+says so instead of vanishing. Protocol version 10, for the one new message that
+takes: the server's answer to a direct message it had nobody to deliver to. As
+always, a server admits only a client of its own version, so update both
+together.
+
+### Added — name tags
+
+A name was unique on a server, so the second "Luki" to arrive was turned away.
+A name now carries a four-digit tag, `Luki#0420`, the way Discord's used to,
+and it is the name and its tag together that a server keeps unique.
+
+- **The tag is picked in the connect dialog**, next to the name, and is random
+  until you choose one. It is remembered with the rest of the connection
+  details, bookmarks and the servers open at the last start included
+- **A tag somebody already has on a server no longer stops you connecting.**
+  The client tries again under a random one and tells you which; the tag you
+  chose stays the one it asks for next time. A dropped connection coming back
+  still waits for its own name, as before: what holds it for those few seconds
+  is your own old session
+- **The tag stays out of the way.** Member lists, chat, the mixer and the room
+  show the name alone. Hovering a name shows it in full, and the right-click
+  menu spells it out at the top, which is how to tell two Lukis apart
+- A name saved before tags existed gets a random one at the next connect, and
+  keeps it
+- Direct-message history is filed under the name with its tag. Conversations
+  an earlier version kept under the bare name stay in the archive, but no
+  longer show up
+- The game SDK's `state` carries the tagged name. Mods address players by id,
+  as before, so nothing changes for them
+
+Nothing checks that a name belongs to anybody yet; that waits for accounts. The
+server still accepts a name without a tag.
+
+### Fixed — messages to somebody who has left
+
+A direct message to somebody who had left the server vanished. The server
+dropped it without a word, and your own copy was already on screen as sent, so
+you could go on writing into a conversation nobody was reading — even after
+they came back, which is a new connection with a new id. The server now answers
+such a message, and the conversation says **Not delivered — Luki left the
+server** right under it.
+
+A message still waiting for the two of you to set up encryption, when they
+leave before that finishes, expires after a minute without a word, as before.
+
 ## [0.10.0] - 2026-09-25
 
 The client now stays connected to several servers at once, and voice is
@@ -272,6 +320,51 @@ to tell whether a reload had picked up the new bundle or quietly re-run the old.
 - **Release images carry the commit too.** `npm run release` builds in Docker
   from a context without `.git`, so its web bundle and AppImage said `no-git`;
   the commit is now handed in from outside
+
+### Security — a review before the release
+
+Several servers at once raised one question above the rest: can one of them
+reach what happens on another? End-to-end encryption held — every connection
+has its own keys and sessions, every chat, password and history hand-off is
+filed and sent per server, and moving voice closes the microphone and the share
+on the server it leaves. One path did not hold, and the review also turned up
+older ways to knock a server, or a user, over. None of it had shipped.
+
+- **A server can no longer pull you into voice.** Any server you had open —
+  even one you only read — could put you in a voice channel of its choosing on
+  its own. The client took that as voice moving there: your call on the other
+  server ended, and with voice activation or an always-on microphone, capture
+  started straight into a room whose members, and so whose encryption key, that
+  server had picked. Voice now only goes where you asked it to: a join, a voice
+  channel you created, an invitation you accepted, or a game you allowed to
+  place you. Anything else is left at once, and a notice says so. A server that
+  already carries your call can still move you between its own rooms, as
+  before. The same hole reached honest servers too: when the leave that a
+  switch asks for was refused, a later refresh of that room's member list
+  pulled voice back
+- **A client that never logs in can no longer fill a server's memory.** QUIC
+  buffers whatever arrives on a stream, whether the server reads that stream or
+  not, and nothing capped the total: a connection could park about 155 MB
+  before it had authenticated, 32 connections per address. Everything a peer
+  may have in flight is now capped per connection, which also bounds what a
+  hostile server can make a client hold for each server it has open
+- **IPv6 addresses no longer each count as a separate visitor.** The
+  per-address connection limit and the connect-rate limit counted every IPv6
+  address on its own, and one subscriber has 2^64 of them to dial from. They
+  now count per /64, and an IPv4 client reaching a dual-stack server is still
+  counted by its own address. Bans still name exact addresses
+- **Pokes can no longer bury the window.** Every poke opened its own popup
+  that only a click would close, with a sound and a system notification, so
+  anybody on a server could fill your screen at 50 a second. A second poke from
+  the same person now replaces their first, and at most five are shown
+- **Messages can no longer set off dozens of sounds at once.** On the desktop
+  each notification sound opens its own output on the device the call plays
+  on; a burst of messages opened one per message. Each sound now plays at most
+  once a second, and system notifications come at most every two seconds
+- **Joining a channel no longer holds up the other servers.** Joining a voice
+  channel or accepting an invitation while sharing your screen waited up to a
+  second for the capture to stop, with every other server's commands, and
+  push-to-talk, waiting behind it
 
 ### Looking ahead
 

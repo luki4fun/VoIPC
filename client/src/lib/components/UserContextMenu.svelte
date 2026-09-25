@@ -35,6 +35,7 @@
     watchUser,
   } from "../stores/user-menu.js";
   import Icon from "./Icons.svelte";
+  import { splitName, shortName } from "../username.js";
 
   const menu = $derived($userMenu);
   let menuEl: HTMLDivElement | undefined = $state(undefined);
@@ -85,6 +86,7 @@
 
 <!-- Context menu -->
 {#if menu}
+  {@const who = splitName(menu.user.username)}
   <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div class="ctx-overlay" onclick={closeUserMenu}>
     <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
@@ -94,6 +96,9 @@
       onclick={(e) => e.stopPropagation()}
       bind:this={menuEl}
     >
+      <!-- Who exactly: the one place a name's tag is spelled out -->
+      <div class="ctx-title">{who.name}{#if who.tag}<span class="ctx-tag">#{who.tag}</span>{/if}</div>
+      <div class="ctx-separator"></div>
       <!-- Watching, the mixer and the volume are the call's, so only for
            somebody on the server carrying it: an id on another server is a
            different person to the backend's voice connection. -->
@@ -188,7 +193,7 @@
   <div class="poke-overlay" onclick={cancelPoke} onkeydown={() => {}} role="presentation">
     <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
     <div class="poke-dialog" onclick={(e) => e.stopPropagation()}>
-      <div class="poke-dialog-header">Poke {$pokeTarget.username}</div>
+      <div class="poke-dialog-header">Poke {shortName($pokeTarget.username)}</div>
       <input
         class="poke-input"
         type="text"
@@ -261,6 +266,19 @@
     padding: 4px;
     box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
     z-index: 201;
+  }
+
+  .ctx-title {
+    padding: 6px 12px 4px;
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+  }
+
+  .ctx-tag {
+    font-weight: 400;
+    color: var(--text-secondary);
   }
 
   .ctx-item {

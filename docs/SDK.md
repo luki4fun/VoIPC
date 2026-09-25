@@ -68,9 +68,9 @@ socket.onopen = () => socket.send(JSON.stringify({
 VoIPC answers with a `state` message:
 
 ```json
-{"type":"state","state":"ingame","user_id":42,"username":"Luki",
+{"type":"state","state":"ingame","user_id":42,"username":"Luki#0420",
  "channel":"Ingame","proximity":"3d","muted":false,"deafened":false,
- "version":"0.10.0","sdk":1,
+ "version":"0.10.1","sdk":1,
  "capabilities":["spatial","direct","volume","muffle","talk","reverb","underwater",
                  "layers","pan","delay","beacon","transmit",
                  "phone","radio","cb","walkie","aviation","police","landline",
@@ -80,6 +80,8 @@ VoIPC answers with a `state` message:
           "gramophone","robot"]}
 ```
 
+- **`username` is for display only**, and carries the player's four-digit tag
+  (`Luki#0420`): two players may share a name. Address players by `user_id`.
 - **`channel` is required.** Without it a mod would arm itself on whichever
   channel the player happens to be in, which may be a private one where
   nothing on screen says a game is driving.

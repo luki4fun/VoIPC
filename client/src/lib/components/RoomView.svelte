@@ -13,6 +13,7 @@
   import { voiceChannel, voiceUsers as users } from "../stores/channels.js";
   import { addNotification } from "../stores/notifications.js";
   import { avatarColor } from "../avatar.js";
+  import { shortName } from "../username.js";
   import {
     PRESETS,
     ROOM_EXTENT,
@@ -274,7 +275,7 @@
         />
         <text class="initial" y="0.18">{entry.user.username.charAt(0).toUpperCase()}</text>
         <text class="name" y="1.5">
-          {entry.user.username}{#if is3d && entry.at.z !== 0}&nbsp;({entry.at.z > 0 ? "+" : ""}{entry.at.z.toFixed(1)} m){/if}
+          {shortName(entry.user.username)}{#if is3d && entry.at.z !== 0}&nbsp;({entry.at.z > 0 ? "+" : ""}{entry.at.z.toFixed(1)} m){/if}
         </text>
       </g>
     {/each}
@@ -304,10 +305,10 @@
           class="chip"
           disabled={!canDrag(u.user_id)}
           onclick={() => place(u.user_id, { x: 0, y: 0, z: 0 })}
-          title="Place {u.username} in the middle"
+          title="Place {shortName(u.username)} in the middle"
         >
           <span class="chip-dot" style="background: {avatarColor(u.username)}"></span>
-          {u.username}
+          {shortName(u.username)}
         </button>
       {/each}
     </div>

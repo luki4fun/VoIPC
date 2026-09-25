@@ -17,6 +17,7 @@
   // `.users`, which test-ui.mjs counts as the channel's members.
 
   import { avatarColor } from "../../avatar.js";
+  import { shortName } from "../../username.js";
   import { userId } from "../../stores/connection.js";
   import { viewingVoice } from "../../stores/channels.js";
   import { speakingUsers } from "../../stores/users.js";
@@ -110,8 +111,8 @@
     <span class="avatar" style="background: {avatarColor(user.username)}"
       >{user.username.charAt(0).toUpperCase()}</span
     >
-    <span class="name">
-      {user.username}
+    <span class="name" title={user.username}>
+      {shortName(user.username)}
       {#if inChannel && user.user_id === $displayChannelCreatorId && $displayChannelId !== 0}
         <span class="crown" title="Channel creator"><Icon name="crown" size={12} /></span>
       {/if}

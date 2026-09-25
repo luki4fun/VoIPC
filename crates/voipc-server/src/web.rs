@@ -607,6 +607,10 @@ impl WebTransport {
     }
 }
 
+/// Most a peer may have in flight towards us per connection, across every
+/// stream (see `server_config`).
+const RECEIVE_WINDOW: u32 = 2 * 1024 * 1024;
+
 fn server_config(bind_addr: SocketAddr, picker: Arc<CertPicker>) -> WtServerConfig {
     let mut tls = rustls::ServerConfig::builder_with_provider(Arc::new(
         rustls::crypto::ring::default_provider(),
@@ -630,9 +634,21 @@ fn server_config(bind_addr: SocketAddr, picker: Arc<CertPicker>) -> WtServerConf
     // highest share (1080p at 60 fps, 7.5 Mbit/s), and the largest keyframe
     // (255 fragments, about 320 KB) still fits in one window. A faster share
     // or a longer round trip needs a larger window.
+    //
+    // What a peer may make us *hold* is bounded here too. quinn buffers every
+    // byte sent on a stream the moment it arrives, accepted by us or not, up
+    // to each stream's window, and by default nothing caps the sum: 100 bidi
+    // and 24 uni streams at 1.25 MB each let a client that never logs in park
+    // ~155 MB here per connection, 32 connections per address. The
+    // connection-wide window caps all of it, whatever the stream count. 2 MiB
+    // per 300 ms round trip is ~56 Mbit/s of sharer uplink, several times the
+    // highest share. Datagrams are drained as they come; 256 KiB is half a
+    // minute of voice.
     let mut transport = QuicTransportConfig::default();
     transport
         .max_concurrent_uni_streams(24u32.into())
+        .receive_window(RECEIVE_WINDOW.into())
+        .datagram_receive_buffer_size(Some(256 * 1024))
         .send_window(512 * 1024)
         .send_fairness(false);
 

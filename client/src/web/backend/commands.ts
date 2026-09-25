@@ -124,7 +124,8 @@ const handlers: Record<string, Handler> = {
     const addr = str(address, "address");
     const name = str(username, "username");
     if (addr.length === 0 || addr.length > 253) fail("address must be 1-253 characters");
-    if (name.length === 0 || byteLength(name) > 32) fail("username must be 1-32 characters");
+    // 32 for the name and 5 for its "#0000" tag; the server checks each part
+    if (name.length === 0 || byteLength(name) > 37) fail("username must be 1-32 characters");
     return session.connect(addr, name);
   },
   disconnect: ({ server }) => session.disconnect(str(server, "server")),
@@ -142,7 +143,10 @@ const handlers: Record<string, Handler> = {
     const channel = u32(channelId, "channelId");
     // Subscribing to a text channel is not a move, so it costs no share and no
     // viewer: only a voice join does (session.ts onUserList tears down the rest).
-    if (!s.isTextChannel(channel)) s.clearWatching();
+    if (!s.isTextChannel(channel)) {
+      s.clearWatching();
+      if (channel !== 0) s.askVoice();
+    }
     s.sendControl({ JoinChannel: { channel_id: channel, password: optStr(password, "password") } });
   },
   leave_channel: ({ server, channelId }) =>
@@ -152,13 +156,17 @@ const handlers: Record<string, Handler> = {
     if (channelName.length === 0 || byteLength(channelName) > 128) fail("channel name must be 1-128 characters");
     const pw = optStr(password, "password");
     if (pw !== null && byteLength(pw) > 128) fail("password too long");
-    need(server).sendControl({
+    const isText = text == null ? false : bool(text, "text");
+    const s = need(server);
+    // The server seats the creator in a new voice channel
+    if (!isText) s.askVoice();
+    s.sendControl({
       CreateChannel: {
         name: channelName,
         password: pw,
         proximity: proximityMode(proximity),
         anonymous: anonymous == null ? false : bool(anonymous, "anonymous"),
-        text: text == null ? false : bool(text, "text"),
+        text: isText,
       },
     });
   },
@@ -199,6 +207,7 @@ const handlers: Record<string, Handler> = {
   accept_invite: ({ server, channelId }) => {
     const s = need(server);
     s.clearWatching();
+    s.askVoice();
     s.sendControl({ AcceptInvite: { channel_id: u32(channelId, "channelId") } });
   },
   decline_invite: ({ server, channelId }) =>

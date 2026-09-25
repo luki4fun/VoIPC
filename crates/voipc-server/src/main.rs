@@ -145,6 +145,7 @@ impl ConnLimits {
     /// Take a slot for `ip`. On `Err` nothing was taken; the value is the
     /// reason for the log line.
     pub fn acquire(&self, ip: IpAddr) -> Result<(), &'static str> {
+        let ip = limit_key(ip);
         // First, because it is the cheapest refusal and the one that protects
         // the most expensive work.
         if !self.take_connect_token(ip) {
@@ -200,6 +201,7 @@ impl ConnLimits {
     }
 
     pub fn release(&self, ip: IpAddr) {
+        let ip = limit_key(ip);
         self.total.fetch_sub(1, Ordering::Relaxed);
         if let Some(mut count) = self.per_ip.get_mut(&ip) {
             *count = count.saturating_sub(1);
@@ -211,6 +213,22 @@ impl ConnLimits {
         // `connect_rate` is untouched on purpose. Evicting the entry here
         // would hand the whole burst back on every disconnect, which is
         // exactly the pattern the budget exists to bound.
+    }
+}
+
+/// Who a connection is counted against: an IPv4 address, or an IPv6 /64.
+///
+/// One subscriber gets a whole /64 — 2^64 addresses to dial from — so per
+/// address, the per-IP ceiling and the connect-rate bucket bounded nothing for
+/// anyone on IPv6. Canonical first: a dual-stack socket reports IPv4 peers as
+/// `::ffff:a.b.c.d`, and masking that would count every IPv4 client as one.
+fn limit_key(ip: IpAddr) -> IpAddr {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => {
+            let prefix = u128::from(v6) & !((1u128 << 64) - 1);
+            IpAddr::V6(prefix.into())
+        }
+        v4 => v4,
     }
 }
 
@@ -498,6 +516,38 @@ mod tests {
     /// The connection *counts* are handed back when a connection ends, so on
     /// their own they let one peer dial as fast as it can as long as it hangs
     /// up each time — and every one of those dials costs a TLS handshake.
+    #[test]
+    fn ipv6_is_counted_per_64_and_mapped_ipv4_as_ipv4() {
+        let v6 = |s: &str| IpAddr::V6(s.parse().unwrap());
+        let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7));
+        assert_eq!(limit_key(v4), v4);
+        assert_eq!(limit_key(v6("::ffff:192.0.2.7")), v4, "a dual-stack socket's IPv4 peer");
+        assert_ne!(
+            limit_key(v6("::ffff:192.0.2.7")),
+            limit_key(v6("::ffff:192.0.2.8")),
+            "IPv4 peers must not share one key"
+        );
+        assert_eq!(limit_key(v6("2001:db8:1:2::1")), limit_key(v6("2001:db8:1:2:ffff::9")));
+        assert_ne!(limit_key(v6("2001:db8:1:2::1")), limit_key(v6("2001:db8:1:3::1")));
+    }
+
+    /// Rotating through one /64 is the same subscriber dialling again.
+    #[test]
+    fn the_per_ip_ceiling_holds_across_a_64() {
+        let config = ServerConfig {
+            max_connections_per_ip: 2,
+            ..ServerConfig::default()
+        };
+        let limits = ConnLimits::from_config(&config);
+        let v6 = |s: &str| IpAddr::V6(s.parse().unwrap());
+        limits.acquire(v6("2001:db8:1:2::1")).unwrap();
+        limits.acquire(v6("2001:db8:1:2::2")).unwrap();
+        assert_eq!(limits.acquire(v6("2001:db8:1:2::3")), Err("per-IP limit reached"));
+        assert!(limits.acquire(v6("2001:db8:1:3::1")).is_ok(), "the next /64 is somebody else");
+        limits.release(v6("2001:db8:1:2::1"));
+        assert!(limits.acquire(v6("2001:db8:1:2::4")).is_ok(), "released under the same key");
+    }
+
     #[test]
     fn connects_from_one_ip_are_rate_limited() {
         let limits = ConnLimits::from_config(&ServerConfig::default());

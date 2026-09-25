@@ -18,9 +18,9 @@
 //!   {"type":"ping"} {"type":"bye"}
 //!
 //! VoIPC → game
-//!   {"type":"state","state":"ingame","user_id":42,"username":"Luki",
+//!   {"type":"state","state":"ingame","user_id":42,"username":"Luki#0420",
 //!    "channel":"Ingame","proximity":"3d","muted":false,"deafened":false,
-//!    "version":"0.10.0","sdk":1,
+//!    "version":"0.10.1","sdk":1,
 //!    "capabilities":["spatial","direct","volume","muffle","radio","phone","talk",
 //!                    "reverb","underwater"]}
 //!   {"type":"talk","user_id":42,"speaking":true}
@@ -1134,6 +1134,7 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> (serde_json::Value, 
     let tcp_tx = connection.tcp_tx.clone();
     let current_channel = connection.current_channel_id.clone();
     let is_voice = connection.is_voice.clone();
+    let voice_asked_at = connection.voice_asked_at.clone();
     let user_id = connection.user_id;
     let (channel_id, name) = (channel.channel_id, channel.name);
     // Subscribed before the join is sent, so its refusal cannot be missed
@@ -1149,6 +1150,9 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> (serde_json::Value, 
         current_channel.load(Ordering::Relaxed) == channel_id && is_voice.load(Ordering::Relaxed)
     };
     if current_channel.load(Ordering::Relaxed) != channel_id {
+        // The user allowed games to do this (Game Integration is opt-in),
+        // so the seat counts as asked for
+        crate::network::ask_voice(&voice_asked_at);
         let _ = crate::network::send_tcp_message(
             &tcp_tx,
             &voipc_protocol::messages::ClientMessage::JoinChannel {

@@ -1296,7 +1296,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voipc-crypto"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1318,7 +1318,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-protocol"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "bytes",
  "postcard",
@@ -1329,7 +1329,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-web"
-version = "0.10.0"
+version = "0.10.1"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",

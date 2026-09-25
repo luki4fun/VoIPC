@@ -512,4 +512,11 @@ pub enum ServerMessage {
         frames_dropped: u32,
         frames_received: u32,
     },
+
+    // ── Direct messages ──────────────────────────────────────────────
+
+    /// A direct message found nobody to deliver it to: that user has left the
+    /// server (protocol v10). User ids are never handed out twice, so they are
+    /// not coming back under this one.
+    DirectMessageUndelivered { target_user_id: UserId },
 }

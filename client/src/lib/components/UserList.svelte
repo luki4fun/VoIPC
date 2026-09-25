@@ -27,6 +27,7 @@
   } from "../stores/roster.js";
   import { openUserMenu } from "../stores/user-menu.js";
   import Icon from "./Icons.svelte";
+  import { shortName } from "../username.js";
   import type { UserInfo } from "../types.js";
 </script>
 
@@ -81,8 +82,8 @@
       class:muted={user.is_muted}
       class:deafened={user.is_deafened}
     ></div>
-    <span class="name">
-      {user.username}
+    <span class="name" title={user.username}>
+      {shortName(user.username)}
       {#if inChannel && user.user_id === $displayChannelCreatorId && $displayChannelId !== 0}
         <span class="crown" title="Channel creator"><Icon name="crown" size={12} /></span>
       {/if}

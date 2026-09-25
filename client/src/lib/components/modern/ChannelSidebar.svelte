@@ -51,6 +51,7 @@
   import { isCulled } from "../../stores/roster.js";
   import { openUserMenu } from "../../stores/user-menu.js";
   import { avatarColor } from "../../avatar.js";
+  import { shortName } from "../../username.js";
   import ChannelCreateForm from "../ChannelCreateForm.svelte";
   import Icon from "../Icons.svelte";
   import type { ChannelInfo, UserInfo } from "../../types.js";
@@ -240,7 +241,7 @@
               <span class="nested-avatar" style="background: {avatarColor(member.username)}"
                 >{member.username.charAt(0).toUpperCase()}</span
               >
-              <span class="nested-name">{member.username}</span>
+              <span class="nested-name" title={member.username}>{shortName(member.username)}</span>
               {#if member.is_muted}
                 <span class="status-icon muted" title="Muted"><Icon name="mic-off" size={12} /></span>
               {/if}
@@ -272,7 +273,7 @@
             <span class="dm-avatar" style="background: {avatarColor(convo.username)}"
               >{convo.username.charAt(0).toUpperCase()}</span
             >
-            <span class="dm-name">{convo.username}</span>
+            <span class="dm-name" title={convo.username}>{shortName(convo.username)}</span>
             {#if convo.unread > 0}<span class="dm-unread">{convo.unread}</span>{/if}
           </button>
         {/each}

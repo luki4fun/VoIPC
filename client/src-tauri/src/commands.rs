@@ -40,7 +40,8 @@ pub async fn connect(
     if address.is_empty() || address.len() > 253 {
         return Err("address must be 1-253 characters".into());
     }
-    if username.is_empty() || username.len() > 32 {
+    // 32 for the name and 5 for its "#0000" tag; the server checks each part
+    if username.is_empty() || username.len() > 37 {
         return Err("username must be 1-32 characters".into());
     }
 
@@ -104,6 +105,16 @@ pub async fn join_channel(
 ) -> Result<(), String> {
     let mut conns = state.connections.write().await;
     let connection = conn_mut(&mut conns, &server)?;
+    // Subscribing to a text channel is not a move: it costs neither the share
+    // nor the watch. Only a voice join does.
+    let is_text = connection
+        .channels
+        .lock()
+        .map(|list| list.iter().any(|c| c.channel_id == channel_id && c.text))
+        .unwrap_or(false);
+    if !is_text && channel_id != 0 {
+        network::ask_voice(&connection.voice_asked_at);
+    }
     network::send_tcp_message(
         &connection.tcp_tx,
         &ClientMessage::JoinChannel {
@@ -116,31 +127,41 @@ pub async fn join_channel(
     // confirms the move (UserList, handled in network.rs): a rejected join
     // (wrong password, channel full) must leave the current channel's voice
     // working.
-
-    // Subscribing to a text channel is not a move: it costs neither the share
-    // nor the watch. Only a voice join does.
-    let is_text = connection
-        .channels
-        .lock()
-        .map(|list| list.iter().any(|c| c.channel_id == channel_id && c.text))
-        .unwrap_or(false);
     if is_text {
         return Ok(());
     }
 
     // Clean up screen share state when switching channels
+    let capture = end_share_for_move(connection);
+    // Waited for outside the lock: every other server's commands, PTT and
+    // the readers' voice handover all take it.
+    drop(conns);
+    wait_for_capture(capture).await;
+    Ok(())
+}
+
+/// Our share and our watching end with a channel move: the flags drop here,
+/// and the capture task is handed back to be waited for once the connections
+/// lock is released.
+fn end_share_for_move(
+    connection: &mut crate::app_state::ActiveConnection,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let mut capture = None;
     if connection.is_screen_sharing {
         connection.screen_share_active.store(false, Ordering::Relaxed);
-        if let Some(task) = connection.screen_capture_task.take() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), task).await;
-        }
+        capture = connection.screen_capture_task.take();
         connection.capture_session = None;
         connection.is_screen_sharing = false;
     }
     connection.watching_user_id = None;
     connection.watching_user_id_shared.store(0, Ordering::Relaxed);
+    capture
+}
 
-    Ok(())
+async fn wait_for_capture(capture: Option<tokio::task::JoinHandle<()>>) {
+    if let Some(task) = capture {
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(1), task).await;
+    }
 }
 
 /// Create a new channel.
@@ -165,6 +186,11 @@ pub async fn create_channel(
     let proximity = parse_proximity(proximity.as_deref())?;
     let conns = state.connections.read().await;
     let connection = conn(&conns, &server)?;
+    let text = text.unwrap_or(false);
+    // The server seats the creator in a new voice channel
+    if !text {
+        network::ask_voice(&connection.voice_asked_at);
+    }
     network::send_tcp_message(
         &connection.tcp_tx,
         &ClientMessage::CreateChannel {
@@ -172,7 +198,7 @@ pub async fn create_channel(
             password,
             proximity,
             anonymous: anonymous.unwrap_or(false),
-            text: text.unwrap_or(false),
+            text,
         },
     )
     .await
@@ -482,21 +508,18 @@ pub async fn accept_invite(
             &connection.tcp_tx,
             &ClientMessage::StopScreenShare,
         ).await;
-        connection.screen_share_active.store(false, Ordering::Relaxed);
-        if let Some(task) = connection.screen_capture_task.take() {
-            let _ = tokio::time::timeout(std::time::Duration::from_secs(1), task).await;
-        }
-        connection.capture_session = None;
-        connection.is_screen_sharing = false;
     }
-    connection.watching_user_id = None;
-    connection.watching_user_id_shared.store(0, Ordering::Relaxed);
+    let capture = end_share_for_move(connection);
 
-    network::send_tcp_message(
+    network::ask_voice(&connection.voice_asked_at);
+    let sent = network::send_tcp_message(
         &connection.tcp_tx,
         &ClientMessage::AcceptInvite { channel_id },
     )
-    .await
+    .await;
+    drop(conns);
+    wait_for_capture(capture).await;
+    sent
 }
 
 /// Decline a channel invite.

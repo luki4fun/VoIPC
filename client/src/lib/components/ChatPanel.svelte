@@ -45,6 +45,7 @@
   import { channelRosters } from "../stores/rosters.js";
   import type { ChatMessage } from "../types.js";
   import Icon from "./Icons.svelte";
+  import { shortName } from "../username.js";
 
   let messageInput = $state("");
   let messagesContainer = $state<HTMLDivElement | null>(null);
@@ -183,7 +184,7 @@
 
   async function resyncHistory() {
     const server = $serverAddress;
-    const names = historySharers.map((u) => u.username).join(", ");
+    const names = historySharers.map((u) => shortName(u.username)).join(", ");
     try {
       // Deliberate, so it also takes back a deletion: asking is how you undo
       // having cleared a channel, and nothing else reopens that door.
@@ -237,6 +238,7 @@
     // Show header if different user, after a history divider, or more than 5 minutes apart
     return (
       prev.kind === "history-marker" ||
+      prev.kind === "notice" ||
       prev.user_id !== curr.user_id ||
       // Where a name came from is part of what the header says, so a second-hand
       // message never folds into a run of first-hand ones and inherits its badge.
@@ -340,7 +342,7 @@
   <div class="chat-header" class:custom={headerExtra}>
     {#if isDmMode}
       <button class="back-btn" onclick={backToChannel} title="Back to channel chat"><Icon name="arrow-left" size={16} /></button>
-      <span class="chat-title">DM with {$activeDmUsername}</span>
+      <span class="chat-title" title={$activeDmUsername}>DM with {shortName($activeDmUsername)}</span>
       {#if totalUnreadChannels > 0}
         <span class="unread-badge" title="Unread channel messages">{totalUnreadChannels}</span>
       {/if}
@@ -361,7 +363,7 @@
         class="resync-btn"
         class:first={displayMessages.length === 0 || isLobby}
         onclick={resyncHistory}
-        title="Ask {historySharers.map((u) => u.username).join(', ')} for recent messages"
+        title="Ask {historySharers.map((u) => shortName(u.username)).join(', ')} for recent messages"
       ><Icon name="history" size={16} /></button>
     {/if}
     {#if activeTtl > 0}
@@ -378,7 +380,7 @@
       {#if showTtlPicker}
         <div class="ttl-picker">
           <p class="ttl-note">
-            Messages you send {$activeDmUsername} are deleted on both sides once the timer runs
+            Messages you send {shortName($activeDmUsername)} are deleted on both sides once the timer runs
             out. What they send you carries theirs.
           </p>
           {#each TTL_CHOICES as choice (choice.secs)}
@@ -414,12 +416,12 @@
       </div>
     {:else}
       {#each displayMessages as msg, i (msg.timestamp + "-" + msg.user_id + "-" + i)}
-        {#if msg.kind === "history-marker"}
+        {#if msg.kind === "history-marker" || msg.kind === "notice"}
           <div class="history-marker"><span>{msg.content}</span></div>
         {:else}
           {#if shouldShowHeader(i)}
             <div class="msg-header">
-              <span class="msg-username" class:self={msg.user_id === $userId}>{msg.username}</span>
+              <span class="msg-username" class:self={msg.user_id === $userId} title={msg.username}>{shortName(msg.username)}</span>
               <span class="msg-time">{formatTime(msg.timestamp)}</span>
               {#if msg.kind === "shared"}
                 <span
@@ -452,7 +454,7 @@
       <input
         class="chat-input"
         type="text"
-        placeholder={`Message ${$activeDmUsername}...`}
+        placeholder={`Message ${shortName($activeDmUsername)}...`}
         bind:value={messageInput}
         bind:this={chatInputEl}
         onkeydown={handleKeydown}

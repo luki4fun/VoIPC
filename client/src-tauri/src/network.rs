@@ -245,6 +245,7 @@ pub async fn connect_to_server(
     let output_device_live = Arc::new(std::sync::Mutex::new(output_device));
     let server: Arc<str> = Arc::from(address.as_str());
     let is_voice = Arc::new(AtomicBool::new(false));
+    let voice_asked_at = Arc::new(AtomicU64::new(0));
 
     // Control writer channel.
     //
@@ -358,6 +359,7 @@ pub async fn connect_to_server(
         channels_snapshot.clone(),
         server.clone(),
         is_voice.clone(),
+        voice_asked_at.clone(),
         transmitting.clone(),
     ));
     let udp_send_handle = tokio::spawn(datagram_sender_task(connection.clone(), voice_rx));
@@ -471,6 +473,7 @@ pub async fn connect_to_server(
         is_deafened: state.is_deafened.clone(),
         signal,
         is_voice,
+        voice_asked_at,
         tcp_tx,
         voice_tx,
         video_tx,
@@ -737,6 +740,26 @@ async fn leave_voice(
     }
 }
 
+/// How long an ask for a voice seat stays good: the server's answer is one
+/// round trip away, a game's `hello` waits up to its own join timeout.
+const VOICE_ASK_TTL_MS: u64 = 10_000;
+
+/// We are about to ask this connection's server for a voice seat. Called
+/// before the request goes out, so the answer cannot beat it.
+pub fn ask_voice(asked_at: &AtomicU64) {
+    asked_at.store(screenshare::epoch_ms().max(1), Ordering::Relaxed);
+}
+
+/// Whether a voice seat the server just gave us was asked for, spending the
+/// ask: one ask pays for one seat.
+fn take_voice_ask(asked_at: &AtomicU64) -> bool {
+    voice_ask_fresh(asked_at.swap(0, Ordering::Relaxed), screenshare::epoch_ms())
+}
+
+fn voice_ask_fresh(asked_at: u64, now: u64) -> bool {
+    asked_at != 0 && now.saturating_sub(asked_at) < VOICE_ASK_TTL_MS
+}
+
 /// Send a client message over the control stream.
 pub async fn send_tcp_message(
     tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
@@ -874,6 +897,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     channels_snapshot: Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
     server: Arc<str>,
     is_voice: Arc<AtomicBool>,
+    voice_asked_at: Arc<AtomicU64>,
     transmitting: Arc<AtomicBool>,
 ) {
     'read: loop {
@@ -922,6 +946,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
                             &channels_snapshot,
                             &server,
                             &is_voice,
+                            &voice_asked_at,
                             &transmitting,
                         )
                         .await;
@@ -1123,6 +1148,7 @@ async fn handle_server_message(
     channels_snapshot: &Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
     server: &str,
     is_voice: &Arc<AtomicBool>,
+    voice_asked_at: &AtomicU64,
     transmitting: &Arc<AtomicBool>,
 ) {
     // Everything a game hears about comes from the voice connection only: a
@@ -1226,6 +1252,34 @@ async fn handle_server_message(
                 return;
             }
 
+            // A voice seat we did not ask this server for is refused, before
+            // anything here changes. Taking voice ends the call on whichever
+            // server had it and opens the microphone into this room — whose
+            // members, and so whose media key, the server chooses. An honest
+            // server only seats us where we asked (a join, a created channel,
+            // an accepted invite, a game's hello); one that already carries
+            // our voice may still move us between its own rooms.
+            if channel_id != 0 && !is_voice.load(Ordering::Relaxed) && !take_voice_ask(voice_asked_at) {
+                warn!(server, channel_id, "server seated us in a voice channel we did not join; leaving it");
+                let _ = send_tcp_message(
+                    tcp_tx,
+                    &ClientMessage::JoinChannel {
+                        channel_id: 0,
+                        password: None,
+                    },
+                )
+                .await;
+                emit_server(
+                    app_handle,
+                    server,
+                    "channel-error",
+                    serde_json::json!({
+                        "reason": "The server put you in a voice channel you did not join — you were taken out of it again"
+                    }),
+                );
+                return;
+            }
+
             // Update the Rust-side channel tracking so commands (PTT, chat, etc.)
             // know which channel we're in. This handles server-initiated moves
             // (create_channel auto-join, kicks, invites, etc.)
@@ -1300,9 +1354,11 @@ async fn handle_server_message(
             } else if channel_id != 0 && !is_voice.load(Ordering::Relaxed) {
                 // The same room confirmed again while voice is elsewhere: the
                 // leave the handover asked for was refused, and the user has
-                // joined this room anew. It is a confirmation like any other —
-                // the front end and the browser backend take voice on it too,
-                // and all three have to agree on where the call is.
+                // joined this room anew (the ask was checked above — a mere
+                // roster refresh of that room does not get here). It is a
+                // confirmation like any other — the front end and the browser
+                // backend take voice on it too, and all three have to agree on
+                // where the call is.
                 claim_voice(app_handle, server, is_voice).await;
             }
 
@@ -1806,6 +1862,14 @@ async fn handle_server_message(
             // Remove from pending so we don't loop
             let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
             sig.pending_sessions.remove(&user_id);
+        }
+        ServerMessage::DirectMessageUndelivered { target_user_id } => {
+            emit_server(
+                app_handle,
+                server,
+                "dm-undelivered",
+                serde_json::json!({"user_id": target_user_id}),
+            );
         }
         ServerMessage::IdentityKeyChanged {
             user_id,
@@ -4593,6 +4657,16 @@ mod tests {
         assert_eq!(layers.len(), 3);
         mix_layers(&mut layers, &[], &sp, &mut stereo, Some(&pcm), 1.0, false, false, 0, 0, now);
         assert!(layers.is_empty(), "a layer the game dropped kept its chain");
+    }
+
+    #[test]
+    fn only_an_ask_we_made_lately_lets_a_server_seat_us() {
+        assert!(!voice_ask_fresh(0, 50_000), "never asked");
+        assert!(voice_ask_fresh(40_000, 40_000));
+        assert!(voice_ask_fresh(40_000, 40_000 + VOICE_ASK_TTL_MS - 1));
+        assert!(!voice_ask_fresh(40_000, 40_000 + VOICE_ASK_TTL_MS), "stale");
+        // A clock that stepped back is not an ask from the future
+        assert!(voice_ask_fresh(40_000, 39_000));
     }
 
     #[test]

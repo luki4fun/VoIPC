@@ -51,7 +51,9 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 ///     message destruction timers — ChannelInfo.message_ttl_secs,
 ///     SetChannelOptions.message_ttl_secs, and a `ttl` inside the message
 ///     envelope, which the server never sees
-pub const PROTOCOL_VERSION: u32 = 9;
+/// v10: DirectMessageUndelivered, the sender's answer when a direct message's
+///      recipient has left
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.
@@ -194,6 +196,14 @@ mod tests {
             decoded,
             ServerMessage::VideoLossReported { viewer_user_id: 9, frames_dropped: 3, frames_received: 40 }
         ));
+    }
+
+    #[test]
+    fn roundtrip_direct_message_undelivered() {
+        let msg = ServerMessage::DirectMessageUndelivered { target_user_id: 7 };
+        let encoded = encode_server_msg(&msg).unwrap();
+        let decoded = decode_server_msg(&encoded[4..]).unwrap();
+        assert!(matches!(decoded, ServerMessage::DirectMessageUndelivered { target_user_id: 7 }));
     }
 
     #[test]
@@ -420,7 +430,8 @@ mod tests {
         let wrapped = |len: usize| ServerMessage::EncryptedChannelChatMessage {
             channel_id: u32::MAX,
             user_id: u32::MAX,
-            username: "x".repeat(32),
+            // The longest name the server admits: 32 bytes and a "#0000" tag
+            username: "x".repeat(37),
             ciphertext: vec![0u8; len],
             timestamp: u64::MAX,
         };

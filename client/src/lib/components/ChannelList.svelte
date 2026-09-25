@@ -34,6 +34,7 @@
     showCreateForm,
   } from "../stores/channel-ui.js";
   import { avatarColor } from "../avatar.js";
+  import { shortName } from "../username.js";
   import ChannelCreateForm from "./ChannelCreateForm.svelte";
   import Icon from "./Icons.svelte";
 
@@ -173,7 +174,7 @@
             <span class="dm-avatar" style="background: {avatarColor(convo.username)}">
               {convo.username.charAt(0).toUpperCase()}
             </span>
-            <span class="dm-name">{convo.username}</span>
+            <span class="dm-name" title={convo.username}>{shortName(convo.username)}</span>
             {#if convo.unread > 0}
               <span class="dm-unread">{convo.unread}</span>
             {/if}

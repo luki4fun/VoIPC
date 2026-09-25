@@ -4,6 +4,7 @@
   // classic voice bar and the push-to-talk key use.
 
   import { avatarColor } from "../../avatar.js";
+  import { shortName } from "../../username.js";
   import {
     connectionState,
     isDeafened,
@@ -35,7 +36,7 @@
       >{displayName.charAt(0).toUpperCase() || "?"}</span
     >
     <span class="who">
-      <span class="name">{displayName}</span>
+      <span class="name" title={displayName}>{shortName(displayName)}</span>
       <!-- What the line under your name says is about the connection first:
            it read "Connected" behind the connect dialog otherwise. -->
       <span class="sub">

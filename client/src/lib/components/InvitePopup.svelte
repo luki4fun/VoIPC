@@ -3,6 +3,7 @@
   import { pendingInvites, type PendingInvite } from "../stores/invites.js";
   import { serverAddress } from "../stores/connection.js";
   import { serverEntries } from "../connect.js";
+  import { shortName } from "../username.js";
 
   function drop(invite: PendingInvite) {
     pendingInvites.update((inv) => inv.filter((i) => i !== invite));
@@ -33,7 +34,7 @@
     {#each $pendingInvites as invite (invite.server + "/" + invite.channel_id)}
       <div class="invite">
         <span class="invite-text">
-          <strong>{invite.invited_by}</strong> invited you to <strong>#{invite.channel_name}</strong
+          <strong title={invite.invited_by}>{shortName(invite.invited_by)}</strong> invited you to <strong>#{invite.channel_name}</strong
           >{#if invite.server !== $serverAddress}&nbsp;on {$serverEntries.find((e) => e.id === invite.server)?.name ?? invite.server}{/if}
         </span>
         <div class="invite-actions">

@@ -93,11 +93,14 @@ pub async fn connect(host: &str, port: u16, accept_invalid_certs: bool) -> Resul
         }
         .parse()
         .expect("literal bind address");
-        // Few video frames in flight, sent in order: see server_config in
-        // crates/voipc-server/src/web.rs for why.
+        // Few video frames in flight, sent in order, and a cap on what the
+        // server may make us hold across every stream (by default nothing caps
+        // the sum, so a hostile server could park ~155 MB here per open
+        // server): see server_config in crates/voipc-server/src/web.rs for why.
         let mut transport = QuicTransportConfig::default();
         transport
             .max_concurrent_uni_streams(24u32.into())
+            .receive_window((2u32 * 1024 * 1024).into())
             .send_fairness(false);
         let config = ClientConfig::builder()
             .with_bind_address(bind)

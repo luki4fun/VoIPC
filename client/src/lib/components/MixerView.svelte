@@ -37,6 +37,7 @@
   import { voiceChannel, voiceUsers as users } from "../stores/channels.js";
   import { addNotification } from "../stores/notifications.js";
   import { avatarColor } from "../avatar.js";
+  import { shortName } from "../username.js";
   import { audibleIds, drivenBy } from "../stores/room.js";
   import { micMonitor, inputGain } from "../stores/settings.js";
   import {
@@ -72,10 +73,10 @@
 
   /** Ours first, then everyone else. The same shape for both, on purpose. */
   const lanes = $derived<Strip[]>([
-    { id: "mic", name: $username || "You", colour: avatarColor($username), own: true },
+    { id: "mic", name: shortName($username) || "You", colour: avatarColor($username), own: true },
     ...roster.map((u) => ({
       id: u.user_id,
-      name: u.username,
+      name: shortName(u.username),
       colour: avatarColor(u.username),
       own: false,
     })),

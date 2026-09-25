@@ -104,7 +104,8 @@ export interface ChatMessage {
    * fabrication can never launder itself back into first-hand.
    *
    * "history-marker" = the divider inserted where a member's shared history
-   * ends. "undecryptable" = ciphertext we could not open, kept on screen but
+   * ends. "notice" = a line of our own in a conversation, shown the same way
+   * ("Not delivered — bob left the server"); never sent to anybody. "undecryptable" = ciphertext we could not open, kept on screen but
    * never handed to anyone as history: a placeholder is not what was written,
    * and re-sharing it spreads one member's missing key to everyone who joins
    * after them. Anything else (a future attachment type) renders as a

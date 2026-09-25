@@ -196,7 +196,8 @@ export function sanitizeHistory(
     if (expires_at !== undefined && expires_at <= now) continue;
     valid.push({
       user_id: m.user_id,
-      username: m.username.slice(0, 32),
+      // A name and its "#0000" tag
+      username: m.username.slice(0, 37),
       content: m.content.slice(0, HISTORY_MAX_CONTENT),
       timestamp: m.timestamp,
       // Whatever it claimed to be. Once hearsay, always hearsay: a message

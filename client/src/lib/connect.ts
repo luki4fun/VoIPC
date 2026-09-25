@@ -32,6 +32,7 @@ import {
 import { pendingInvites } from "./stores/invites.js";
 import { addNotification } from "./stores/notifications.js";
 import { pendingPokes } from "./stores/pokes.js";
+import { splitName, withTag } from "./username.js";
 import { clearRosters } from "./stores/rosters.js";
 import { dropServer, scoped } from "./stores/scoped.js";
 import {
@@ -109,7 +110,12 @@ export const showConnectDialog = writable(false);
 interface OpenDetails {
   host: string;
   port: number;
+  /** The name in use there, which a reconnect asks for again: while the
+   *  server still holds it, that is our own dropped session. */
   username: string;
+  /** The name the user chose, which is what is remembered. Not the same as
+   *  `username` when its tag was taken and a random one stood in. */
+  asked: string;
   acceptSelfSigned: boolean;
 }
 const details = new Map<string, OpenDetails>();
@@ -151,8 +157,11 @@ export async function connectTo(
   request: ConnectRequest,
   { manual = true, view = true }: ConnectOptions = {},
 ): Promise<ConnectResult> {
-  const { host, port, username: name, acceptSelfSigned: selfSigned } = request;
-  if (!host.trim() || !name) return { ok: false, error: "Please fill in all fields" };
+  const { host, port, acceptSelfSigned: selfSigned } = request;
+  // A name from before tags (a bookmark, the servers open at the last start)
+  // takes the tag last used, or a new one, and keeps it
+  const { name, tag } = splitName(request.username.trim());
+  if (!host.trim() || !name.trim()) return { ok: false, error: "Please fill in all fields" };
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     return { ok: false, error: "Port must be between 1 and 65535" };
   }
@@ -164,7 +173,9 @@ export async function connectTo(
     return { ok: true, server, userId: get(userId.of(server)) };
   }
 
-  details.set(server, { host, port, username: name, acceptSelfSigned: selfSigned });
+  const asked = withTag(name, tag || splitName(get(lastUsername)).tag);
+  let actual = asked;
+  details.set(server, { host, port, username: actual, asked, acceptSelfSigned: selfSigned });
   // Open before the invoke, not after: the channel list arrives from the
   // reader task as soon as the server sends it, which can be before this call
   // returns, and `listenServer` drops events for servers that are not open.
@@ -172,23 +183,33 @@ export async function connectTo(
   connectionState.of(server).set("connecting");
 
   let id: number;
-  try {
-    id = await invoke<number>("connect", {
-      address: server,
-      username: name,
-      acceptInvalidCerts: selfSigned,
-    });
-  } catch (e) {
-    const error = String(e);
-    // Closed while it was trying: that already was the answer
-    if (!get(openServers).includes(server)) return { ok: false, error };
-    if (manual) {
-      removeServer(server);
-    } else {
-      addNotification(`${serverName(server, get(savedServers))}: could not connect: ${error}`, "warning");
-      void startReconnect(server, { voice: "", text: [] }, error);
+  for (let tries = 0; ; tries++) {
+    try {
+      id = await invoke<number>("connect", {
+        address: server,
+        username: actual,
+        acceptInvalidCerts: selfSigned,
+      });
+      break;
+    } catch (e) {
+      const error = String(e);
+      // Closed while it was trying: that already was the answer
+      if (!get(openServers).includes(server)) return { ok: false, error };
+      // Somebody there goes by this name and tag already. Another tag is
+      // another name, and nobody's name is proof of who they are yet.
+      if (error.includes("username already taken") && tries < 3) {
+        actual = withTag(name, "");
+        details.set(server, { host, port, username: actual, asked, acceptSelfSigned: selfSigned });
+        continue;
+      }
+      if (manual) {
+        removeServer(server);
+      } else {
+        addNotification(`${serverName(server, get(savedServers))}: could not connect: ${error}`, "warning");
+        void startReconnect(server, { voice: "", text: [] }, error);
+      }
+      return { ok: false, error };
     }
-    return { ok: false, error };
   }
 
   if (!get(openServers).includes(server)) {
@@ -198,10 +219,13 @@ export async function connectTo(
   }
 
   userId.of(server).set(id);
-  username.of(server).set(name);
+  username.of(server).set(actual);
   acceptSelfSigned.of(server).set(selfSigned);
   connectionState.of(server).set("connected");
   claimLegacyKeys(server);
+  if (actual !== asked) {
+    addNotification(`${fromServer(server)}${asked} is taken there — you are ${actual}`, "info");
+  }
   // Not asked to show it, but nothing else is on screen: better this one than
   // an empty window behind the connect dialog
   if (view || !get(serverAddress)) serverAddress.set(server);
@@ -214,7 +238,7 @@ export async function connectTo(
       await invoke("save_connection_info", {
         host,
         port,
-        username: name,
+        username: asked,
         acceptSelfSigned: selfSigned,
         remember,
       });
@@ -222,12 +246,16 @@ export async function connectTo(
       if (remember) {
         lastHost.set(host);
         lastPort.set(port);
-        lastUsername.set(name);
+        lastUsername.set(asked);
         lastAcceptSelfSigned.set(selfSigned);
       }
     } catch (e) {
       console.warn("Could not save connection details:", e);
     }
+    await saveOpenServers();
+  } else if (!tag) {
+    // The tag just made up for a name from before tags, kept: otherwise every
+    // start would make up another
     await saveOpenServers();
   }
 
@@ -271,7 +299,7 @@ export async function saveOpenServers(): Promise<void> {
             name: serverName(id, saved),
             host: d.host,
             port: d.port,
-            username: d.username,
+            username: d.asked,
             accept_self_signed: d.acceptSelfSigned,
           },
         ];

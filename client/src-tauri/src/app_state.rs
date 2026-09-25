@@ -361,6 +361,11 @@ pub struct ActiveConnection {
     /// This is the voice connection (`AppState::voice_server`). The mixer
     /// reads it to decide whether to hold a playback stream at all.
     pub is_voice: Arc<AtomicBool>,
+    /// When we last asked this server for a voice seat (epoch ms, 0 = never):
+    /// a join, a voice channel's creation, an accepted invite, a game's
+    /// `hello`. Only such an ask lets this server take voice (network.rs
+    /// `take_voice_ask`).
+    pub voice_asked_at: Arc<AtomicU64>,
     /// Sender for control messages (framed, onto the control stream).
     pub tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
     /// Sender for voice packets (QUIC datagrams).

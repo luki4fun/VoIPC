@@ -342,7 +342,16 @@ where
                     }
 
                     let username = username.trim().to_string();
-                    if username.is_empty() || username.len() > 32 {
+                    // A name may carry a "#1234" tag (the client adds one) so
+                    // that two people can go by the same name; only the name
+                    // counts against the limit. Uniqueness is on the whole.
+                    // ponytail: a tag is not required, so tools and tests can
+                    // log in bare; require it once there are accounts.
+                    let name = match username.rsplit_once('#') {
+                        Some((name, tag)) if tag.len() == 4 && tag.bytes().all(|b| b.is_ascii_digit()) => name,
+                        _ => username.as_str(),
+                    };
+                    if name.trim().is_empty() || name.len() > 32 {
                         let err_msg = ServerMessage::AuthError {
                             reason: "username must be 1-32 characters".into(),
                         };
@@ -2577,12 +2586,22 @@ async fn handle_encrypted_direct_message(
         timestamp,
     };
 
-    // Attempt delivery to target (silently fail if offline — prevents user enumeration)
+    let mut delivered = false;
     if let Some(target_sid) = state.user_to_session.get(&target_user_id) {
         if let Some(session) = state.sessions.get(&*target_sid) {
             let name = crate::state::pick_name(&real, &alias, session.is_admin);
             let _ = send_msg(&session.tcp_tx, &message(name)).await;
+            // A full queue is a client still here and not reading; a closed
+            // one is a session on its way out
+            delivered = !session.tcp_tx.is_closed();
         }
+    }
+    // Nobody to hand it to: they left. The sender is told, or they go on
+    // writing to somebody who is gone. It says nothing an id's owner did not
+    // already make public by leaving — ids are never reused, and
+    // RequestPreKeyBundle answers the same question.
+    if !delivered {
+        let _ = send_msg(tx, &ServerMessage::DirectMessageUndelivered { target_user_id }).await;
     }
 
     // Always echo back to sender regardless of delivery success, under the
@@ -3068,6 +3087,24 @@ mod tests {
 
     /// Authenticates `username` from `ip` over a duplex.
     async fn connect(state: &Arc<ServerState>, username: &str, ip: IpAddr) -> Client {
+        let mut client = open(state, username, ip).await;
+        client
+            .expect("Authenticated", |m| matches!(m, ServerMessage::Authenticated { .. }))
+            .await;
+        client
+    }
+
+    /// Why the server turned `username` away.
+    async fn refusal(state: &Arc<ServerState>, username: &str) -> String {
+        let mut client = open(state, username, IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+        match client.next().await {
+            Some(ServerMessage::AuthError { reason }) => reason,
+            other => panic!("{username} was not refused: {other:?}"),
+        }
+    }
+
+    /// Sends the `Authenticate` for `username` from `ip`, and no more.
+    async fn open(state: &Arc<ServerState>, username: &str, ip: IpAddr) -> Client {
         let (stream, server) = tokio::io::duplex(65536);
         let (media_tx, _media_rx) = mpsc::channel(8);
         let (sid_tx, _sid_rx) = oneshot::channel();
@@ -3092,9 +3129,6 @@ mod tests {
                 identity_key: None,
                 prekey_bundle: None,
             })
-            .await;
-        client
-            .expect("Authenticated", |m| matches!(m, ServerMessage::Authenticated { .. }))
             .await;
         client
     }
@@ -3586,6 +3620,65 @@ mod tests {
             ServerMessage::EncryptedChannelChatMessage { channel_id: c, user_id: 1, .. }
                 if c == channel_id
         ));
+    }
+
+    /// A name is unique together with its tag, not on its own: two people can
+    /// both be alice as long as their tags differ. The tag rides on top of the
+    /// 32 bytes a name may have, and only a real tag does.
+    #[tokio::test]
+    async fn a_tag_lets_two_people_share_a_name() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let _first = connect(&state, "alice#0001", lo).await;
+        let _second = connect(&state, "alice#0002", lo).await;
+        let _longest = connect(&state, &format!("{}#1234", "x".repeat(32)), lo).await;
+
+        assert!(refusal(&state, "ALICE#0001").await.contains("taken"));
+        assert!(refusal(&state, &"x".repeat(33)).await.contains("1-32"));
+        // Five digits are no tag, so all of it is the name
+        assert!(refusal(&state, &format!("{}#12345", "x".repeat(32))).await.contains("1-32"));
+        assert!(refusal(&state, "#0001").await.contains("1-32"));
+    }
+
+    /// A direct message to somebody who has left used to vanish: the server
+    /// dropped it, and the sender's client had already shown it as sent. The
+    /// sender is told now, and only then.
+    #[tokio::test]
+    async fn a_direct_message_to_somebody_who_left_is_answered() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut alice = connect(&state, "alice", lo).await; // user 1
+        let bob = connect(&state, "bob", lo).await; // user 2
+        let dm = ClientMessage::SendEncryptedDirectMessage {
+            target_user_id: 2,
+            ciphertext: vec![1, 2, 3],
+            message_type: 2,
+        };
+        let answer = |m: &ServerMessage| {
+            matches!(
+                m,
+                ServerMessage::EncryptedDirectChatMessage { .. }
+                    | ServerMessage::DirectMessageUndelivered { .. }
+            )
+        };
+
+        // Delivered: the echo comes back, with no "undelivered" ahead of it
+        alice.send(&dm).await;
+        let got = alice.expect("the echo", answer).await;
+        assert!(matches!(got, ServerMessage::EncryptedDirectChatMessage { to_user_id: 2, .. }));
+
+        drop(bob);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.user_to_session.contains_key(&2) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("bob's session is cleaned up");
+
+        alice.send(&dm).await;
+        let got = alice.expect("the answer", answer).await;
+        assert!(matches!(got, ServerMessage::DirectMessageUndelivered { target_user_id: 2 }));
     }
 
     /// `hide_members` and a password both mean "nobody outside learns who is

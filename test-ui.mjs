@@ -210,7 +210,7 @@ const ownProximityTag = `(() => { const row = [...document.querySelectorAll(".ch
   .find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(CHANNEL)});
   return row?.querySelector(".proximity-tag")?.textContent?.trim() ?? ""; })()`;
 
-async function connect(name) {
+async function connect(name, tag = "") {
   const tab = await newTab();
   await tab.send("Page.navigate", { url: URL });
   await waitFor(tab, `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`);
@@ -222,6 +222,7 @@ async function connect(name) {
   await tab.evaluate(setInput('input[placeholder="localhost"]', "127.0.0.1"));
   await tab.evaluate(setInput('input[placeholder="9987"]', PORT));
   await tab.evaluate(setInput('input[placeholder="Your name"]', name));
+  if (tag) await tab.evaluate(setInput("#tag", tag));
   await tab.evaluate(click(".connect-btn"));
   await waitFor(tab, `document.querySelector(".channel-list")`);
   // First run also offers the audio setup, a moment after the channel list
@@ -1323,6 +1324,78 @@ check(
   };
   check("the writer is told what the channel's timer is", await showsTimer(alice));
   check("and so is somebody only reading it", await showsTimer(bob));
+}
+
+// 15. Name tags, and a direct message to somebody who has left. A name is
+//     unique with its four-digit tag, and a tag somebody already holds is
+//     swapped for a random one rather than refusing the connect. The tag is
+//     shown only where somebody asks who exactly this is. And a message to
+//     somebody who has left used to vanish without a word.
+{
+  const twin = `ui-twin-${process.pid % 10000}`;
+  const first = await connect(twin, "0420");
+  const second = await connect(twin, "0420");
+  const toast = await second.evaluate(
+    `[...document.querySelectorAll(".toast-message")].map((e) => e.textContent).find((t) => t.includes("is taken there")) ?? ""`,
+  );
+  const tag = /you are .*#(\d{4})/.exec(toast)?.[1] ?? "";
+  check("a taken name and tag still connect, under another tag", tag !== "" && tag !== "0420", toast);
+
+  const other = `${twin}#${tag}`;
+  const row = `[...document.querySelectorAll(".user .name")].find((e) => e.title === ${JSON.stringify(other)})`;
+  await waitFor(first, row).catch(() => {});
+  check(
+    "the list shows the name without its tag",
+    (await first.evaluate(`${row}?.textContent.trim() ?? ""`)) === twin,
+    await first.evaluate(`[...document.querySelectorAll(".user .name")].map((e) => e.title).join(", ")`),
+  );
+  await first.evaluate(
+    `(() => { const el = ${row}?.closest(".user"); if (!el) return false;
+       el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 40 })); return true; })()`,
+  );
+  await sleep(300);
+  check(
+    "the member menu spells the tag out",
+    (await first.evaluate(`document.querySelector(".ctx-title")?.textContent ?? ""`)) === other &&
+      (await first.evaluate(`document.querySelector(".ctx-tag")?.textContent ?? ""`)) === `#${tag}`,
+  );
+  await first.evaluate(
+    `(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => e.textContent.includes("Direct Message"));
+       if (!b) return false; b.click(); return true; })()`,
+  );
+  await waitFor(first, `document.querySelector(".input-bar .chat-input")`).catch(() => {});
+  const say = (text) =>
+    first.evaluate(`(() => { const input = document.querySelector(".input-bar .chat-input"); if (!input) return false;
+      input.value = ${JSON.stringify(text)}; input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.closest("form").requestSubmit(); return true; })()`);
+  const notDelivered = `[...document.querySelectorAll(".history-marker")].some((e) => e.textContent.includes("Not delivered"))`;
+
+  // Delivered first — which also means the two have a session by now, so the
+  // second message really goes to the server instead of waiting in a queue
+  await say("hello twin");
+  let delivered = false;
+  try {
+    await waitFor(second, `[...document.querySelectorAll(".dm-name")].some((e) => e.title === "${twin}#0420")`);
+    delivered = true;
+  } catch {
+    // reported below
+  }
+  check("a direct message to a twin arrives", delivered);
+  check("with no complaint", !(await first.evaluate(notDelivered)));
+
+  await realClick(second, ".status-bar .disconnect-btn");
+  await waitFor(first, `!${row}`).catch(() => {});
+  await say("are you still there?");
+  let told = false;
+  try {
+    await waitFor(first, notDelivered, 5000);
+    told = true;
+  } catch {
+    // reported below
+  }
+  check("a direct message to somebody who left says it was not delivered", told);
+  const fatal = [...first.errors, ...second.errors].filter((e) => !/Failed to load resource/.test(e));
+  check("and the twins threw nothing", fatal.length === 0, fatal.slice(0, 2).join(" | "));
 }
 
 // 14. Several servers at once. The rail's "+" used to disconnect you to bring

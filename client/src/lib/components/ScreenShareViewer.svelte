@@ -17,6 +17,7 @@
   } from "../stores/screenshare.js";
   import { isMobile, isWeb } from "../stores/platform.js";
   import { addNotification } from "../stores/notifications.js";
+  import { shortName } from "../username.js";
   import { currentProximity } from "../stores/room.js";
   import { screenAudioSpatial, spatialAudio } from "../stores/settings.js";
 
@@ -27,7 +28,7 @@
   );
 
   let sharerName = $derived(
-    $activeScreenShares.find((s) => s.user_id === $watchingUserId)?.username ?? "Unknown"
+    shortName($activeScreenShares.find((s) => s.user_id === $watchingUserId)?.username ?? "Unknown")
   );
 
   // requestAnimationFrame coalescing: only render the latest frame per vsync tick

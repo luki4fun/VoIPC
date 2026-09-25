@@ -132,7 +132,7 @@ test("a peer cannot put anything it likes into our archive", () => {
     { user_id: 3, username: "ok", content: "fine", timestamp: T, kind: "image", id: "z".repeat(200) },
   ]);
   assert.equal(cleaned.length, 2);
-  assert.equal(cleaned[0].username.length, 32);
+  assert.equal(cleaned[0].username.length, 37, "a name and its tag");
   assert.equal(cleaned[0].content.length, 2000);
   assert.equal(cleaned[0].kind, "shared", 'a claim of "text" is still second-hand');
   assert.equal(cleaned[1].kind, "shared", "and so is a claim of anything else");

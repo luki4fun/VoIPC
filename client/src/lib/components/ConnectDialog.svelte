@@ -18,6 +18,7 @@
   import { pendingInvite, serverAddress } from "../stores/connection.js";
   import { parseInviteLink } from "../invite.js";
   import { connectTo, serverId, showConnectDialog } from "../connect.js";
+  import { randomTag, splitName, withTag } from "../username.js";
 
   // Invite link pasted here: takes host/port from it and joins the channel
   // right after connecting (App.svelte watches pendingInvite)
@@ -42,7 +43,9 @@
 
   let host = $state($lastHost);
   let port = $state($lastPort);
-  let name = $state($lastUsername);
+  let name = $state(splitName($lastUsername).name);
+  /** The four digits after the name. Random unless the user picks them. */
+  let tag = $state(splitName($lastUsername).tag || randomTag());
   let error = $state("");
   let connecting = $state(false);
   let selfSigned = $state($lastAcceptSelfSigned);
@@ -59,7 +62,9 @@
     if (touched) return;
     host = h;
     port = p;
-    name = u;
+    const parts = splitName(u);
+    name = parts.name;
+    tag = parts.tag || tag;
     selfSigned = ss;
     remember = r;
   });
@@ -82,14 +87,24 @@
     else showConnectDialog.set(false);
   }
 
+  /** Name and tag as sent. A tag that is not four digits is replaced, here
+   *  too, so the field shows the one that was used. */
+  function fullName(): string {
+    const full = withTag(name, tag);
+    tag = splitName(full).tag;
+    return full;
+  }
+
   async function handleConnect() {
-    await connectWith(host, port, name, selfSigned);
+    await connectWith(host, port, fullName(), selfSigned);
   }
 
   async function connectToSaved(s: SavedServer) {
     host = s.host;
     port = s.port;
-    name = s.username;
+    const parts = splitName(s.username);
+    name = parts.name;
+    tag = parts.tag || tag;
     selfSigned = s.accept_self_signed;
     touched = true;
     await handleConnect();
@@ -105,7 +120,7 @@
         name: host,
         host,
         port,
-        username: name,
+        username: fullName(),
         acceptSelfSigned: selfSigned,
       });
       savedServers.set(list);
@@ -224,17 +239,36 @@
       </div>
     {/if}
 
-    <div class="field">
-      <label for="username">Username</label>
-      <input
-        id="username"
-        type="text"
-        bind:value={name}
-        placeholder="Your name"
-        disabled={connecting}
-        maxlength={32}
-        onkeydown={(e) => e.key === "Enter" && handleConnect()}
-      />
+    <div class="address-row">
+      <div class="field host-field">
+        <label for="username">Username</label>
+        <input
+          id="username"
+          type="text"
+          bind:value={name}
+          placeholder="Your name"
+          disabled={connecting}
+          maxlength={32}
+          onkeydown={(e) => e.key === "Enter" && handleConnect()}
+        />
+      </div>
+      <div class="field tag-field">
+        <label for="tag" title="Tells you apart from anybody else of the same name. If it is taken on a server, you get a random one there.">Tag</label>
+        <div class="tag-input">
+          <span>#</span>
+          <input
+            id="tag"
+            type="text"
+            inputmode="numeric"
+            bind:value={tag}
+            placeholder="0000"
+            disabled={connecting}
+            maxlength={4}
+            oninput={() => (tag = tag.replace(/\D/g, ""))}
+            onkeydown={(e) => e.key === "Enter" && handleConnect()}
+          />
+        </div>
+      </div>
     </div>
 
     {#if !isWeb}
@@ -347,12 +381,25 @@
     flex: 1;
   }
 
-  .port-field {
+  .port-field,
+  .tag-field {
     width: 90px;
   }
 
   .port-field input {
     width: 100%;
+  }
+
+  .tag-input {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    color: var(--text-secondary);
+  }
+
+  .tag-input input {
+    width: 100%;
+    min-width: 0;
   }
 
   .field {

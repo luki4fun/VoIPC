@@ -43,7 +43,7 @@
   import { users, speakingUsers } from "./lib/stores/users.js";
   import { addNotification, removeNotification } from "./lib/stores/notifications.js";
   import { pendingInvites } from "./lib/stores/invites.js";
-  import { pendingPokes, createPoke } from "./lib/stores/pokes.js";
+  import { pendingPokes, createPoke, addPoke } from "./lib/stores/pokes.js";
   import {
     addChannelMessage,
     addDmMessage,
@@ -146,6 +146,7 @@
     syncing,
   } from "./lib/stores/room.js";
   import { upsertById } from "./lib/stores/upsert.js";
+  import { shortName } from "./lib/username.js";
   import { cleanLane, micLane } from "./lib/stores/mixer.js";
   import {
     addScreenShare,
@@ -345,8 +346,16 @@
   // lost. The call's state goes when voice leaves a server (voice.ts).
 
   // OS notification when the window is not focused (DMs and pokes)
+  // At most one system notification every two seconds: a peer's DMs or
+  // pokes at the relay's full rate would otherwise stack dozens a second on
+  // the desktop. The unread counts still say what arrived.
+  let lastNotifyAt = -Infinity;
+
   async function notifyUnfocused(title: string, body: string) {
     if (document.hasFocus()) return;
+    const now = performance.now();
+    if (now - lastNotifyAt < 2000) return;
+    lastNotifyAt = now;
     try {
       const notif = await import("@tauri-apps/plugin-notification");
       let granted = await notif.isPermissionGranted();
@@ -1030,7 +1039,7 @@
             server,
             chName,
             data.messages,
-            data.from_username,
+            shortName(data.from_username),
             // What the channel says now. A sharer's claim is clamped by it,
             // and a message arriving with no claim at all takes it — which is
             // what stops somebody keeping a message alive by dropping the
@@ -1130,7 +1139,7 @@
       listenServer<{ channel_id: number; user_id: number }>("invite-accepted", (server, data) => {
         const userName =
           get(users.of(server)).find((u) => u.user_id === data.user_id)?.username ?? "User";
-        addNotification(`${fromServer(server)}${userName} accepted your invite`, "info");
+        addNotification(`${fromServer(server)}${shortName(userName)} accepted your invite`, "info");
       }),
 
       listenServer<{ channel_id: number; user_id: number }>("invite-declined", (server) => {
@@ -1141,12 +1150,17 @@
       listenServer<{ from_user_id: number; from_username: string; message: string }>(
         "poke-received",
         (server, data) => {
-          pendingPokes.update((p) => [
-            ...p,
-            createPoke(server, data.from_user_id, data.from_username, data.message),
-          ]);
+          const poke = createPoke(server, data.from_user_id, data.from_username, data.message);
+          let fresh = false;
+          pendingPokes.update((p) => {
+            const added = addPoke(p, poke);
+            fresh = added.fresh;
+            return added.list;
+          });
+          // A sender poking again only refreshes their popup
+          if (!fresh) return;
           playPokeSound();
-          notifyUnfocused(`${fromServer(server)}Poke from ${data.from_username}`, data.message || "");
+          notifyUnfocused(`${fromServer(server)}Poke from ${shortName(data.from_username)}`, data.message || "");
         },
       ),
 
@@ -1227,8 +1241,22 @@
         });
         if (from_user_id !== myId) {
           playDirectMessageSound();
-          notifyUnfocused(`${fromServer(server)}${from_username}`, content.slice(0, 140));
+          notifyUnfocused(`${fromServer(server)}${shortName(from_username)}`, content.slice(0, 140));
         }
+      }),
+
+      // A direct message found nobody: the person it was for has left. Said
+      // in the conversation, under the message, which is where it was missed.
+      listenServer<{ user_id: number }>("dm-undelivered", (server, { user_id }) => {
+        const myId = get(userId.of(server));
+        const peer = get(dmConversations.of(server)).find((c) => c.user_id === user_id)?.username;
+        addDmMessage(server, myId, myId, "", user_id, {
+          user_id: 0,
+          username: "",
+          content: `Not delivered — ${peer ? shortName(peer) : "they"} left the server`,
+          timestamp: Date.now(),
+          kind: "notice",
+        });
       }),
 
       // Screen share events. Shares ride on the voice connection; another
