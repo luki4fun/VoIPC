@@ -59,12 +59,25 @@ async function newTab() {
       pending.delete(msg.id);
       return;
     }
+    // Only the page's own code counts. Chrome's built-in component scripts run
+    // in the page too (content-utils.js, "Attempting to use a disconnected port
+    // object" while a screen is shared) and report into the same console.
+    const foreign = (url) => !!url && !/^https?:/.test(url);
+    const where = (at) => (at ? ` @${at.url}:${at.lineNumber + 1}` : "");
+    const preview = (o) =>
+      o?.preview ? JSON.stringify(Object.fromEntries(o.preview.properties.map((x) => [x.name, x.value]))) : "";
     if (msg.method === "Runtime.exceptionThrown") {
+      // A rejection with a plain object describes itself as "Object": its
+      // preview and where it was thrown are what make the report readable
       const d = msg.params.exceptionDetails;
-      errors.push(d.exception?.description ?? d.text ?? "unknown exception");
+      const at = d.stackTrace?.callFrames?.[0] ?? (d.url ? { url: d.url, lineNumber: d.lineNumber ?? 0 } : null);
+      if (foreign(at?.url)) return;
+      errors.push(`${d.text ?? ""} ${d.exception?.description ?? ""} ${preview(d.exception)}`.trim() + where(at));
     }
     if (msg.method === "Runtime.consoleAPICalled" && msg.params.type === "error") {
-      errors.push(msg.params.args.map((a) => a.value ?? a.description ?? "").join(" "));
+      const at = msg.params.stackTrace?.callFrames?.[0];
+      if (foreign(at?.url)) return;
+      errors.push(msg.params.args.map((a) => a.value ?? (preview(a) || a.description) ?? "").join(" ") + where(at));
     }
   };
   // Every call gets a deadline. Input.dispatchTouchEvent waits on the renderer
@@ -223,6 +236,12 @@ async function connect(name, tag = "") {
   await tab.evaluate(setInput('input[placeholder="9987"]', PORT));
   await tab.evaluate(setInput('input[placeholder="Your name"]', name));
   if (tag) await tab.evaluate(setInput("#tag", tag));
+  // Every toast from here on, kept: one lasts 5 s, and on a slow runner the
+  // first-run dialogs below take most of that before a check gets to read it
+  await tab.evaluate(`(() => { window.__toasts = [];
+    new MutationObserver(() => { for (const e of document.querySelectorAll(".toast-message"))
+      if (!window.__toasts.includes(e.textContent)) window.__toasts.push(e.textContent); })
+      .observe(document.body, { childList: true, subtree: true, characterData: true }); })()`);
   await tab.evaluate(click(".connect-btn"));
   await waitFor(tab, `document.querySelector(".channel-list")`);
   // First run also offers the audio setup, a moment after the channel list
@@ -848,11 +867,14 @@ check(
     "switching back restores the dark document",
     (await alice.evaluate(`document.documentElement.dataset.theme`)) === "dark",
   );
+  // Waited for, not slept on: saving is debounced by as long as the sleep
+  // above (SAVE_DELAY_MS, 400 ms), and a tab Chrome has put in the background
+  // runs that timer late — a race that CI's Chrome started losing half the time.
+  const saved = `JSON.parse(localStorage.getItem("voipc.settings") ?? "{}").ui_prefs?.palette`;
   check(
     "the choice is remembered",
-    (await alice.evaluate(
-      `JSON.parse(localStorage.getItem("voipc.settings")).ui_prefs?.palette`,
-    )) === "voipc-dark",
+    await waitFor(alice, `${saved} === "voipc-dark"`, 5000).catch(() => false),
+    await alice.evaluate(saved),
   );
 
   await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
@@ -1335,9 +1357,7 @@ check(
   const twin = `ui-twin-${process.pid % 10000}`;
   const first = await connect(twin, "0420");
   const second = await connect(twin, "0420");
-  const toast = await second.evaluate(
-    `[...document.querySelectorAll(".toast-message")].map((e) => e.textContent).find((t) => t.includes("is taken there")) ?? ""`,
-  );
+  const toast = await second.evaluate(`window.__toasts.find((t) => t.includes("is taken there")) ?? ""`);
   const tag = /you are .*#(\d{4})/.exec(toast)?.[1] ?? "";
   check("a taken name and tag still connect, under another tag", tag !== "" && tag !== "0420", toast);
 
@@ -1396,6 +1416,256 @@ check(
   check("a direct message to somebody who left says it was not delivered", told);
   const fatal = [...first.errors, ...second.errors].filter((e) => !/Failed to load resource/.test(e));
   check("and the twins threw nothing", fatal.length === 0, fatal.slice(0, 2).join(" | "));
+}
+
+// 16. A share, from both ends, and the rows people are clicked on. The sharer
+//     sees what they send before anybody watches; a viewer gets there in one
+//     click and can keep the chat beside the stream or under it, sized and
+//     remembered. A member row opens its menu on a left click and from the
+//     keyboard too, and says so with the pointer. Two fresh users, so nothing
+//     above decides which channel or layout this starts in.
+{
+  const n = process.pid % 10000;
+  const SHOW = `show-${n}`;
+  const host = await connect(`ui-host-${n}`);
+  const guest = await connect(`ui-guest-${n}`);
+
+  const useLayout = async (tab, id) => {
+    await realClick(tab, ".settings-btn");
+    await waitFor(tab, `document.querySelector(".tab")`, 8_000);
+    await tab.evaluate(
+      `[...document.querySelectorAll(".tab")].find((b) => /appearance/i.test(b.textContent)).click()`,
+    );
+    await sleep(300);
+    await tab.evaluate(`document.querySelector('.layout-choice[data-layout="${id}"]').click()`);
+    await sleep(500);
+    await tab.evaluate(`document.querySelector(".close-btn")?.click()`);
+    await sleep(500);
+  };
+  /** A real click on whatever `expr` evaluates to, near its left edge — on a
+   *  member row that is the avatar, clear of the buttons at its end. */
+  const clickEl = async (tab, expr) => {
+    const at = await tab.evaluate(`(() => { const el = ${expr}; if (!el) return null;
+      el.scrollIntoView({ block: "center" }); const r = el.getBoundingClientRect();
+      return { x: Math.round(r.left + Math.min(20, r.width / 2)), y: Math.round(r.top + r.height / 2) }; })()`);
+    if (!at) return false;
+    const base = { x: at.x, y: at.y, button: "left", clickCount: 1 };
+    await tab.send("Input.dispatchMouseEvent", { type: "mouseMoved", ...base, buttons: 0 });
+    await tab.send("Input.dispatchMouseEvent", { type: "mousePressed", ...base, buttons: 1 });
+    await tab.send("Input.dispatchMouseEvent", { type: "mouseReleased", ...base, buttons: 1 });
+    await sleep(200);
+    return true;
+  };
+  const key = async (tab, k, code, vk) => {
+    await tab.send("Input.dispatchKeyEvent", { type: "keyDown", key: k, code, windowsVirtualKeyCode: vk });
+    await tab.send("Input.dispatchKeyEvent", { type: "keyUp", key: k, code, windowsVirtualKeyCode: vk });
+    await sleep(250);
+  };
+  const escape = (tab) => key(tab, "Escape", "Escape", 27);
+  const stored = (tab, path) =>
+    tab.evaluate(`JSON.parse(localStorage.getItem("voipc.settings")).ui_prefs?.${path}`);
+  /** The debounced save, waited for rather than raced. */
+  const storedSoon = async (tab, path, want) => {
+    let v = await stored(tab, path);
+    for (let i = 0; i < 20 && Math.abs(v - want) >= 4; i++) {
+      await sleep(200);
+      v = await stored(tab, path);
+    }
+    return v;
+  };
+
+  await useLayout(host, "modern");
+  await useLayout(guest, "modern");
+  await host.evaluate(click('button[title="Create channel"]'));
+  await waitFor(host, `document.querySelector(".create-form")`);
+  await host.evaluate(setInput(".create-form input[type=text]", SHOW));
+  await host.evaluate(click(".create-form .create-btn"));
+  await sleep(2000);
+  await guest.evaluate(
+    `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(SHOW)});
+       if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
+  );
+  await waitFor(guest, `document.querySelector(".voice-panel")`).catch(() => {});
+  await sleep(1500);
+
+  // ── Member rows ──
+  const rowOf = (who) =>
+    `[...document.querySelectorAll(".user-list.modern .users .user")].find((e) => e.querySelector(".name")?.title.startsWith(${JSON.stringify(who)}))`;
+  const ownRow = `[...document.querySelectorAll(".user-list.modern .users .user")].find((e) => e.querySelector(".you"))`;
+  await waitFor(host, rowOf(`ui-guest-${n}`)).catch(() => {});
+  check(
+    "a member row with a menu shows the pointer",
+    (await host.evaluate(`getComputedStyle(${rowOf(`ui-guest-${n}`)}).cursor`)) === "pointer",
+  );
+  check(
+    "our own row, which has none, does not",
+    (await host.evaluate(`getComputedStyle(${ownRow}).cursor`)) !== "pointer",
+  );
+  await clickEl(host, rowOf(`ui-guest-${n}`));
+  check(
+    "a left click on a member opens their menu",
+    (await host.evaluate(`document.querySelector(".ctx-title")?.textContent ?? ""`)).startsWith(`ui-guest-${n}`),
+  );
+  await escape(host);
+  check("Escape closes it again", !(await host.evaluate(`!!document.querySelector(".ctx-menu")`)));
+  await host.evaluate(`${rowOf(`ui-guest-${n}`)}.focus()`);
+  await key(host, "Enter", "Enter", 13);
+  check(
+    "so does Enter on a focused row",
+    (await host.evaluate(`document.querySelector(".ctx-title")?.textContent ?? ""`)).startsWith(`ui-guest-${n}`),
+  );
+  await escape(host);
+  await clickEl(host, ownRow);
+  check("a click on our own row opens nothing", !(await host.evaluate(`!!document.querySelector(".ctx-menu")`)));
+
+  // ── The sharer's preview, before anybody watches ──
+  // Headless Chromium has no screen and no picker: an animated canvas stands
+  // in for the display, as in the self-test (web/selftest.ts).
+  await host.evaluate(`(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 640; canvas.height = 360;
+    const ctx = canvas.getContext("2d");
+    let f = 0;
+    setInterval(() => { f++; ctx.fillStyle = "hsl(" + (f * 9) % 360 + ", 70%, 45%)";
+      ctx.fillRect(0, 0, 640, 360); ctx.fillStyle = "#fff"; ctx.fillRect((f * 11) % 640, 100, 120, 120); }, 66);
+    const stream = canvas.captureStream(15);
+    navigator.mediaDevices.getDisplayMedia = async () => stream;
+    return true; })()`);
+  await realClick(host, ".voice-panel .share-btn");
+  await waitFor(host, `document.querySelector(".start-btn")`, 8_000).catch(() => {});
+  await realClick(host, ".start-btn");
+  let previewPlays = false;
+  try {
+    await waitFor(host, `document.querySelector(".share-preview video")?.videoWidth > 0`, 10_000);
+    previewPlays = true;
+  } catch {
+    // reported below
+  }
+  check("the sharer sees their own stream", previewPlays);
+  check(
+    "with nobody watching yet",
+    /nobody/i.test(await host.evaluate(`document.querySelector(".share-preview .audience")?.textContent ?? ""`)),
+  );
+
+  // ── One click to watch, and the chat beside it ──
+  await waitFor(guest, `document.querySelector(".channel-list.modern button.live-tag.watch")`).catch(() => {});
+  await realClick(guest, ".channel-list.modern button.live-tag.watch");
+  let watching = false;
+  try {
+    await waitFor(guest, `document.querySelector(".activity .stream-stage .viewer")`, 8_000);
+    watching = true;
+  } catch {
+    // reported below
+  }
+  check("one click on LIVE watches the share", watching);
+  try {
+    await waitFor(host, `/1 watching/.test(document.querySelector(".share-preview .audience")?.textContent ?? "")`, 8_000);
+  } catch {
+    // reported below
+  }
+  check(
+    "and the sharer's preview counts the viewer",
+    /1 watching/.test(await host.evaluate(`document.querySelector(".share-preview .audience")?.textContent ?? ""`)),
+  );
+  check(
+    "the stream view starts without the chat here",
+    !(await guest.evaluate(`!!document.querySelector(".stream-stage .stream-chat")`)),
+  );
+  await realClick(guest, ".stream-stage .chat-toggle");
+  check(
+    "the chat toggle docks the chat beside the stream",
+    await guest.evaluate(`!!document.querySelector(".stream-stage.side .stream-chat .chat-panel")`),
+  );
+  const chatSize = (dim) =>
+    guest.evaluate(`document.querySelector(".stream-stage .stream-chat")?.getBoundingClientRect().${dim} ?? 0`);
+  const wideBefore = await chatSize("width");
+  await realDragX(guest, ".stream-stage .split-handle", -80);
+  const wideAfter = await chatSize("width");
+  check("the chat can be dragged wider", wideAfter > wideBefore + 40, `${wideBefore} -> ${wideAfter}`);
+  check(
+    "and the width is remembered",
+    Math.abs((await storedSoon(guest, "stream_chat?.modern?.width", wideAfter)) - wideAfter) < 4,
+  );
+  await realClick(guest, ".stream-stage .split-toggle");
+  check(
+    "the other button puts it under the stream",
+    await guest.evaluate(`!!document.querySelector(".stream-stage.below .stream-chat .chat-panel")`),
+  );
+  const tallBefore = await chatSize("height");
+  await realDrag(guest, ".stream-stage .split-handle", -60);
+  const tallAfter = await chatSize("height");
+  check("and drags taller there", tallAfter > tallBefore + 30, `${tallBefore} -> ${tallAfter}`);
+  check(
+    "remembering the height as well",
+    Math.abs((await storedSoon(guest, "stream_chat?.modern?.height", tallAfter)) - tallAfter) < 4,
+  );
+
+  // ── News while the chat is hidden ──
+  await realClick(guest, ".stream-stage .chat-toggle");
+  check("the toggle hides it again", !(await guest.evaluate(`!!document.querySelector(".stream-stage .stream-chat")`)));
+  check("with nothing new to point at", !(await guest.evaluate(`!!document.querySelector(".chat-toggle .unread-dot")`)));
+  await host.evaluate(`(() => { const input = document.querySelector(".input-bar .chat-input"); if (!input) return false;
+    input.value = "look at this"; input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.closest("form").requestSubmit(); return true; })()`);
+  let dot = false;
+  try {
+    await waitFor(guest, `document.querySelector(".chat-toggle .unread-dot")`, 10_000);
+    dot = true;
+  } catch {
+    // reported below
+  }
+  check(
+    "a message meanwhile marks the chat toggle",
+    dot,
+    `host shows ${await host.evaluate(`document.querySelector(".chat-title")?.textContent.trim()`)}`,
+  );
+  await realClick(guest, ".stream-stage .chat-toggle");
+  check("opening the chat clears it", !(await guest.evaluate(`!!document.querySelector(".chat-toggle .unread-dot")`)));
+
+  // ── The classic layout gets the same view, chat below by default ──
+  // The modern stream view covers the whole window, Settings included, so
+  // out of it first — and back in from the classic list's own one click.
+  await realClick(guest, ".stream-stage .stop-btn");
+  await waitFor(guest, `!document.querySelector(".activity")`, 5_000).catch(() => {});
+  await useLayout(guest, "classic");
+  // Hover first: the row shows its ⋮ on hover, which moves the icon over by
+  // one button — a hand is on the row before it aims, a synthetic click is not.
+  await hover(guest, ".users .user button.status-icon.watch");
+  await realClick(guest, ".users .user button.status-icon.watch");
+  await waitFor(guest, `document.querySelector(".app-layout .stream-stage")`, 8_000).catch(() => {});
+  check(
+    "classic shows the share with its chat below",
+    await guest.evaluate(`!!document.querySelector(".app-layout .stream-stage.below .stream-chat .chat-panel")`),
+    await guest.evaluate(`JSON.stringify({
+      classic: !!document.querySelector(".app-layout"),
+      watchButton: !!document.querySelector(".users .user button.status-icon.watch"),
+      stage: document.querySelector(".stream-stage")?.className ?? null })`),
+  );
+
+  // ── The sharer's preview, big ──
+  await realClick(host, '.share-preview .bar-btn[title^="Enlarge"]');
+  check(
+    "the preview enlarges into the stream view",
+    await host.evaluate(`!!document.querySelector(".activity .share-preview.stage") && !document.querySelector(".share-preview:not(.stage)")`),
+  );
+  await escape(host);
+  check(
+    "Escape puts it back in its corner",
+    await host.evaluate(`!document.querySelector(".activity") && !!document.querySelector(".share-preview:not(.stage)")`),
+  );
+
+  await realClick(host, ".voice-panel .share-btn.active");
+  await sleep(1200);
+  check("stopping the share takes the preview away", !(await host.evaluate(`!!document.querySelector(".share-preview")`)));
+  check("and the viewer's stream view closes", !(await guest.evaluate(`!!document.querySelector(".stream-stage")`)));
+
+  for (const [who, tab] of [["sharer", host], ["viewer", guest]]) {
+    const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));
+    check(`the ${who} threw nothing`, fatal.length === 0, fatal.slice(0, 2).join(" | "));
+  }
+  // The profile is shared by every tab: leave it in the layout the rest of
+  // this file expects of a fresh connect.
+  await useLayout(host, "classic");
 }
 
 // 14. Several servers at once. The rail's "+" used to disconnect you to bring

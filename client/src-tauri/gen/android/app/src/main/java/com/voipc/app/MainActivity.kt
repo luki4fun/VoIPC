@@ -151,11 +151,10 @@ class MainActivity : TauriActivity() {
             addAction(VoiceService.ACTION_MUTE)
             addAction(VoiceService.ACTION_DEAFEN)
         }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(actionReceiver, filter, RECEIVER_NOT_EXPORTED)
-        } else {
-            registerReceiver(actionReceiver, filter)
-        }
+        // Not exported on every API level: below 33 a plain registerReceiver
+        // lets any installed app send ACTION_MUTE, which toggles — unmutes.
+        // ContextCompat guards the old levels with a signature permission.
+        ContextCompat.registerReceiver(this, actionReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
 
         // Add JS interface to WebView after Tauri creates it (delayed to ensure WebView exists)
         Handler(Looper.getMainLooper()).postDelayed({

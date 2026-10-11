@@ -209,6 +209,36 @@
     <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/>
     <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/>
 
+  {:else if name === "eye"}
+    <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z"/>
+    <circle cx="12" cy="12" r="3"/>
+
+  {:else if name === "eye-off"}
+    <path d="M9.9 4.24A9.1 9.1 0 0 1 12 4c6.5 0 10 8 10 8a18.5 18.5 0 0 1-2.16 3.19"/>
+    <path d="M6.61 6.61A13.53 13.53 0 0 0 2 12s3.5 8 10 8a9.74 9.74 0 0 0 5.39-1.61"/>
+    <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"/>
+    <line x1="2" y1="2" x2="22" y2="22"/>
+
+  {:else if name === "split-side"}
+    <rect x="3" y="4" width="18" height="16" rx="2"/>
+    <line x1="15" y1="4" x2="15" y2="20"/>
+
+  {:else if name === "split-below"}
+    <rect x="3" y="4" width="18" height="16" rx="2"/>
+    <line x1="3" y1="14" x2="21" y2="14"/>
+
+  {:else if name === "maximize"}
+    <polyline points="15 3 21 3 21 9"/>
+    <polyline points="9 21 3 21 3 15"/>
+    <line x1="21" y1="3" x2="14" y2="10"/>
+    <line x1="3" y1="21" x2="10" y2="14"/>
+
+  {:else if name === "minimize"}
+    <polyline points="4 14 10 14 10 20"/>
+    <polyline points="20 10 14 10 14 4"/>
+    <line x1="14" y1="10" x2="21" y2="3"/>
+    <line x1="3" y1="21" x2="10" y2="14"/>
+
   {/if}
 </svg>
 

@@ -153,8 +153,8 @@ fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
         if !entry.text && name.to_lowercase() == "general" {
             bail!("channel entry {} uses reserved name 'General'", i);
         }
-        if name.chars().any(|c| c.is_control()) {
-            bail!("channel '{}' contains control characters", name);
+        if name.chars().any(crate::tcp::bad_name_char) {
+            bail!("channel {:?} contains control or invisible characters", name);
         }
         if name.len() > 64 {
             bail!("channel '{}' name exceeds 64 characters", name);

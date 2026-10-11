@@ -14,6 +14,7 @@
   import UserList from "../UserList.svelte";
   import VoiceControls from "../VoiceControls.svelte";
   import ScreenShareViewer from "../ScreenShareViewer.svelte";
+  import StreamStage from "../StreamStage.svelte";
   import RoomView from "../RoomView.svelte";
   import MixerView from "../MixerView.svelte";
   import StatusBar from "../StatusBar.svelte";
@@ -26,15 +27,12 @@
   import { voice } from "../../stores/channels.js";
   import { isMobile, mobileTab } from "../../stores/platform.js";
   import { centreView, currentProximity } from "../../stores/room.js";
-  import { poppedOut, watchingUserId } from "../../stores/screenshare.js";
+  import { streamStage, watchingUserId } from "../../stores/screenshare.js";
 
   interface Props {
     onopensettings: () => void;
   }
   let { onopensettings }: Props = $props();
-
-  // Chat pane below the screen-share viewer (desktop)
-  let viewerChatOpen = $state(true);
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -146,19 +144,9 @@
       <ServerRail onadd={() => showConnectDialog.set(true)} />
       <div class="server-pane">
       <ChannelList />
-      {#if $watchingUserId !== null && !$poppedOut}
-        <div class="viewer-with-chat">
-          <ScreenShareViewer />
-          <button
-            class="chat-collapse"
-            onclick={() => (viewerChatOpen = !viewerChatOpen)}
-          >{viewerChatOpen ? "Hide chat ▾" : "Show chat ▴"}</button>
-          {#if viewerChatOpen}
-            <div class="viewer-chat-pane">
-              <ChatPanel />
-            </div>
-          {/if}
-        </div>
+      {#if $streamStage !== null}
+        <!-- The share and its chat: the same view as the modern layout's -->
+        <StreamStage />
       {:else if $centreView === 'room' && $currentProximity !== 'off'}
         <RoomView />
       {:else if $centreView === 'mixer'}
@@ -232,46 +220,6 @@
     flex: 1;
     min-width: 0;
     overflow: hidden;
-  }
-
-  /* Screen-share viewer with the chat pane stacked below it */
-  .viewer-with-chat {
-    display: flex;
-    flex-direction: column;
-    flex: 1;
-    min-width: 0;
-    overflow: hidden;
-  }
-
-  .viewer-with-chat > :global(.viewer) {
-    flex: 1;
-    min-height: 0;
-  }
-
-  .chat-collapse {
-    background: var(--bg-secondary);
-    color: var(--text-secondary);
-    border: none;
-    border-top: 1px solid var(--border);
-    padding: 3px 0;
-    font-size: 11px;
-    cursor: pointer;
-  }
-
-  .chat-collapse:hover {
-    color: var(--text-primary);
-  }
-
-  .viewer-chat-pane {
-    height: 280px;
-    flex-shrink: 0;
-    display: flex;
-    min-height: 0;
-  }
-
-  .viewer-chat-pane > :global(*) {
-    flex: 1;
-    min-width: 0;
   }
 
   /* ── Mobile layout ── */

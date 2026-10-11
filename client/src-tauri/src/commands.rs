@@ -152,6 +152,7 @@ fn end_share_for_move(
         capture = connection.screen_capture_task.take();
         connection.capture_session = None;
         connection.is_screen_sharing = false;
+        connection.share_viewers.store(0, Ordering::Relaxed);
     }
     connection.watching_user_id = None;
     connection.watching_user_id_shared.store(0, Ordering::Relaxed);
@@ -1448,6 +1449,8 @@ pub async fn start_screen_share(
             &state.config().screen_share_codec,
         );
         connection.screen_share_codec = codec;
+        // A new share starts unwatched; the server counts its viewers afresh
+        connection.share_viewers.store(0, Ordering::Relaxed);
 
         network::send_tcp_message(
             &connection.tcp_tx,
@@ -1482,6 +1485,7 @@ pub async fn stop_screen_share(state: State<'_, AppState>) -> Result<(), String>
 
     // Close the capture session (stops screen capture)
     connection.capture_session = None;
+    connection.share_viewers.store(0, Ordering::Relaxed);
 
     network::send_tcp_message(&connection.tcp_tx, &ClientMessage::StopScreenShare).await?;
     connection.is_screen_sharing = false;
@@ -1581,7 +1585,8 @@ pub async fn get_screen_share_stats(
 }
 
 /// Drop the previous share's viewer loss reports so they cannot vote the new
-/// one down; the viewer count arrives again from the server as viewers join.
+/// one down. The viewer count is not in the tally: it stays what the server
+/// last said (`share_viewers`), which a source switch does not change.
 #[cfg(not(target_os = "android"))]
 fn clear_loss_tally(connection: &crate::app_state::ActiveConnection) {
     let mut tally = connection
@@ -1591,16 +1596,18 @@ fn clear_loss_tally(connection: &crate::app_state::ActiveConnection) {
     *tally = crate::app_state::LossTally::default();
 }
 
-/// Start the screen capture task — called from frontend when viewer_count goes from 0 to N.
+/// Start the screen capture task — called from the frontend while somebody
+/// watches or the sharer's own preview is on screen.
 #[tauri::command]
 pub async fn start_screen_capture(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     resolution: u16,
     fps: u32,
 ) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
-        let _ = (state, resolution, fps);
+        let _ = (app, state, resolution, fps);
         return Err("Screen capture is not available on Android".into());
     }
 
@@ -1609,8 +1616,14 @@ pub async fn start_screen_capture(
         let mut conns = state.connections.write().await;
         let connection = voice_mut(&state, &mut conns)?;
 
-        if connection.screen_capture_task.is_some() {
-            return Ok(()); // Already capturing
+        // Already capturing — unless the capture thread ended by itself (a
+        // PipeWire error, a failed encoder), which must not block a restart
+        if connection
+            .screen_capture_task
+            .as_ref()
+            .is_some_and(|task| !task.is_finished())
+        {
+            return Ok(());
         }
 
         let session = connection
@@ -1651,6 +1664,9 @@ pub async fn start_screen_capture(
             connection.current_channel_id.clone(),
             connection.screen_video_frames_sent.clone(),
             connection.screen_video_bytes_sent.clone(),
+            app,
+            connection.share_preview.clone(),
+            connection.share_viewers.clone(),
         )?;
 
         connection.screen_capture_task = Some(task);
@@ -1658,7 +1674,7 @@ pub async fn start_screen_capture(
     }
 }
 
-/// Stop the screen capture task — called from frontend when viewer_count goes to 0.
+/// Stop the screen capture task — nobody watches and the preview is hidden.
 #[tauri::command]
 pub async fn stop_screen_capture(state: State<'_, AppState>) -> Result<(), String> {
     let mut conns = state.connections.write().await;
@@ -1676,6 +1692,7 @@ pub async fn stop_screen_capture(state: State<'_, AppState>) -> Result<(), Strin
 /// if viewers are present. The server is not notified — the stream continues.
 #[tauri::command]
 pub async fn switch_screen_share_source(
+    app: tauri::AppHandle,
     state: State<'_, AppState>,
     source_type: String,
     source_id: String,
@@ -1684,7 +1701,7 @@ pub async fn switch_screen_share_source(
 ) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
-        let _ = (state, source_type, source_id, resolution, fps);
+        let _ = (app, state, source_type, source_id, resolution, fps);
         return Err("Screen sharing is not available on Android".into());
     }
 
@@ -1757,6 +1774,9 @@ pub async fn switch_screen_share_source(
             connection.current_channel_id.clone(),
             connection.screen_video_frames_sent.clone(),
             connection.screen_video_bytes_sent.clone(),
+            app,
+            connection.share_preview.clone(),
+            connection.share_viewers.clone(),
         )?;
 
         connection.screen_capture_task = Some(task);
@@ -1778,6 +1798,16 @@ pub async fn set_screen_share_codec(state: State<'_, AppState>, codec: String) -
     if let Err(e) = crate::config::save_config(&config) {
         tracing::warn!("Failed to save config: {e}");
     }
+    Ok(())
+}
+
+/// Whether the sharer's own preview is on screen; the capture task renders to
+/// it only then (`screenshare-preview` events).
+#[tauri::command]
+pub async fn set_share_preview(state: State<'_, AppState>, on: bool) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = voice(&state, &conns)?;
+    connection.share_preview.store(on, Ordering::Relaxed);
     Ok(())
 }
 
@@ -2903,7 +2933,7 @@ pub async fn create_chat_history(
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("failed to create data dir: {e}"))?;
     }
-    std::fs::write(&chat.file_path, &file_data)
+    crate::config::write_atomic(&chat.file_path, &file_data)
         .map_err(|e| format!("failed to write file: {e}"))?;
 
     chat.archive = archive;
@@ -2965,7 +2995,7 @@ pub async fn clear_chat_history(state: State<'_, AppState>) -> Result<(), String
     if let Some(ref key) = chat.sealing_key {
         let file_data =
             crypto::encrypt_archive(&chat.archive, key, &chat.salt).map_err(|e| e.to_string())?;
-        std::fs::write(&chat.file_path, &file_data)
+        crate::config::write_atomic(&chat.file_path, &file_data)
             .map_err(|e| format!("failed to write file: {e}"))?;
     }
 
@@ -3106,7 +3136,7 @@ pub async fn flush_chat_to_disk(state: &AppState) {
     if let Some(ref key) = chat.sealing_key {
         match crypto::encrypt_archive(&chat.archive, key, &chat.salt) {
             Ok(file_data) => {
-                if let Err(e) = std::fs::write(&chat.file_path, &file_data) {
+                if let Err(e) = crate::config::write_atomic(&chat.file_path, &file_data) {
                     tracing::error!("failed to flush chat history: {e}");
                 } else {
                     chat.dirty = false;

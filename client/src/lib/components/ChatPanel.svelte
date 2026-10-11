@@ -19,10 +19,6 @@
   import { serverAddress, serverKey, userId } from "../stores/connection.js";
   import { addNotification } from "../stores/notifications.js";
   import {
-    channelMessages,
-    chatKey,
-    dmKey,
-    dmMessages,
     activeDmUserId,
     activeDmUsername,
     closeDm,
@@ -41,9 +37,8 @@
     leftTextChannelNames,
     setDmMessageTtl,
   } from "../stores/channel-ui.js";
-  import { displayChannelId, isPreviewing } from "../stores/roster.js";
+  import { displayChannelId, isPreviewing, shownMessages } from "../stores/roster.js";
   import { channelRosters } from "../stores/rosters.js";
-  import type { ChatMessage } from "../types.js";
   import Icon from "./Icons.svelte";
   import { shortName } from "../username.js";
 
@@ -157,19 +152,9 @@
     return total;
   });
 
-  let displayMessages = $derived.by((): ChatMessage[] => {
-    // Read both stores unconditionally so Svelte always tracks them as
-    // dependencies — otherwise the branch that isn't taken loses its
-    // subscription and accumulated messages won't appear when switching views.
-    const chMap = $channelMessages;
-    const dmMap = $dmMessages;
-
-    if (isDmMode) {
-      const key = dmKey($serverAddress, $activeDmUsername);
-      return [...(dmMap.get(key) ?? [])];
-    }
-    return [...(chMap.get(chatKey($serverAddress, channelName)) ?? [])];
-  });
+  // stores/roster.ts decides which conversation is on screen, for this pane
+  // and for the stream view's unread dot alike.
+  let displayMessages = $derived($shownMessages);
 
   // Who in this channel would answer a request for its recent chat. The
   // automatic ask happens once, when joining; this is what the user can do

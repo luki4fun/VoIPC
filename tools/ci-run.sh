@@ -25,9 +25,12 @@ status=$?
 
 if [ "$status" -ne 0 ] && [ -n "${GITHUB_ACTIONS:-}" ]; then
   # Same escaping as test-web.sh: a workflow command is one line, so every
-  # newline becomes %0A and a literal % has to be escaped first.
+  # newline becomes %0A and a literal % has to be escaped first. GitHub keeps
+  # about 3000 characters of an annotation, and the reason a step failed is in
+  # its *last* lines: so the colour codes go and the end is what is kept — the
+  # start of 40 lines of linker warnings once hid the one line that mattered.
   printf '::error title=%s::%s\n' "$title" \
-    "$(tail -40 "$log" | head -c 3000 |
+    "$(tail -40 "$log" | sed 's/\x1b\[[0-9;]*m//g' | tail -c 2900 |
        awk '{ gsub(/%/, "%25"); gsub(/\r/, "%0D"); printf "%s%%0A", $0 }')"
 fi
 

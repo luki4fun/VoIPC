@@ -8,6 +8,12 @@
 # and BROWSER_BOB override it per side, which is how the mixed lane runs a
 # Chromium sharer (H.264) against a Firefox viewer and the other way round.
 #
+# TRANSPORT=quic (default) or TRANSPORT=tcp picks how the browsers connect, and
+# TRANSPORT_ALICE / TRANSPORT_BOB override it per side: tcp skips WebTransport
+# (?transport=tcp) and runs the session through the server's TCP fallback, so
+# every check below then proves the tunnel carries what QUIC does — and a mixed
+# run, that the relay is the same across the two.
+#
 # Prerequisites: npm run web (or npm run build:web + cargo build -p voipc-server --release),
 # openssl, curl with HTTP/2, and either chromium (CHROME=/path/to/chrome) or,
 # for the Firefox lane, firefox (FIREFOX=...) plus certutil to trust the test
@@ -42,7 +48,18 @@ for b in "$BROWSER_ALICE" "$BROWSER_BOB"; do
     *) echo "unknown browser '$b' (chromium or firefox)" >&2; exit 1 ;;
   esac
 done
-echo "browsers: alice=$BROWSER_ALICE bob=$BROWSER_BOB"
+TRANSPORT="${TRANSPORT:-quic}"
+TRANSPORT_ALICE="${TRANSPORT_ALICE:-$TRANSPORT}"
+TRANSPORT_BOB="${TRANSPORT_BOB:-$TRANSPORT}"
+for t in "$TRANSPORT_ALICE" "$TRANSPORT_BOB"; do
+  case "$t" in
+    quic | tcp) ;;
+    *) echo "unknown transport '$t' (quic or tcp)" >&2; exit 1 ;;
+  esac
+done
+# The query parameter that puts a side on the TCP fallback
+via() { [ "$1" = tcp ] && echo "&transport=tcp" || true; }
+echo "browsers: alice=$BROWSER_ALICE over $TRANSPORT_ALICE, bob=$BROWSER_BOB over $TRANSPORT_BOB"
 SERVER="${SERVER:-target/release/voipc-server}"
 [ -x "$SERVER" ] || { echo "$SERVER missing — run npm run web first" >&2; exit 1; }
 
@@ -81,8 +98,11 @@ CHANNELS
 
 # exec: the job pid must be the server itself, or the EXIT trap kills only the
 # subshell and the server survives on the test ports
+# --tcp-fallback on both servers, whatever the transport: the QUIC runs then
+# also prove that offering the tunnel's http/1.1 leaves the h2 page alone.
 (cd "$WORK" && exec "$SCRIPT_DIR/$SERVER" --host 127.0.0.1 --tcp-port "$TCP_PORT" --udp-port "$TCP_PORT" \
-  --cert server.crt --key server.key --admin-token e2e-admin --channels channels.json > "$WORK/server.log" 2>&1) &
+  --cert server.crt --key server.key --admin-token e2e-admin --channels channels.json --tcp-fallback \
+  > "$WORK/server.log" 2>&1) &
 
 for _ in $(seq 1 50); do
   curl -sk --http2-prior-knowledge "https://127.0.0.1:$TCP_PORT/wt.json" > "$WORK/wt.json" 2>/dev/null && break
@@ -99,7 +119,7 @@ TCP_PORT2=$((TCP_PORT + 1))
 mkdir -p "$WORK/s2"
 cp "$WORK/server.crt" "$WORK/server.key" "$WORK/s2/"
 (cd "$WORK/s2" && exec "$SCRIPT_DIR/$SERVER" --host 127.0.0.1 --tcp-port "$TCP_PORT2" --udp-port "$TCP_PORT2" \
-  --cert server.crt --key server.key > "$WORK/server2.log" 2>&1) &
+  --cert server.crt --key server.key --tcp-fallback > "$WORK/server2.log" 2>&1) &
 for _ in $(seq 1 50); do
   curl -sk --http2-prior-knowledge "https://127.0.0.1:$TCP_PORT2/wt.json" 2>/dev/null | grep -q '"hash"' && break
   sleep 0.2
@@ -135,7 +155,7 @@ EOF
 # alice creates the channel, becomes admin at the end and kicks bob; bob joins
 # through an invite-link fragment (#channel=…) and expects the kick
 # alice also shares her (synthetic) screen; bob watches it
-run_browser alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admin&kick=bob&share=1&proximity=2d&pos=3,0,0&spatialtest=3d" \
+run_browser alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admin&kick=bob&share=1&proximity=2d&pos=3,0,0&spatialtest=3d$(via "$TRANSPORT_ALICE")" \
   "$WORK/alice.log" "$BROWSER_ALICE"
 # Not a fixed stagger: the run asserts that a message alice sent *before* bob
 # arrived reaches him as channel history, so the harness has to make "before"
@@ -152,7 +172,7 @@ for _ in $(seq 1 300); do
 done
 grep -q 'SELFTEST early-chat-sent' "$WORK/alice.log" ||
   echo "warning: alice never reported her first message — bob starts anyway, expect a history failure"
-run_browser bob listener "&textchannel=e2e-text&dm=alice&expect_kick=1&watch=1&pos=-3,0,0#channel=e2e" \
+run_browser bob listener "&textchannel=e2e-text&dm=alice&expect_kick=1&watch=1&pos=-3,0,0$(via "$TRANSPORT_BOB")#channel=e2e" \
   "$WORK/bob.log" "$BROWSER_BOB"
 
 deadline=$(( $(date +%s) + DURATION / 1000 + 30 ))
@@ -227,6 +247,16 @@ fi
 if grep -q 'SELFTEST error' "$WORK/alice.txt" "$WORK/bob.txt" || grep -q 'connection-lost' "$WORK/alice.txt"; then
   echo "FAIL errors/connection loss reported:" | tee -a "$WORK/fails.txt"
   grep -h 'connection-lost\|SELFTEST error' "$WORK/alice.txt" "$WORK/bob.txt" | tee -a "$WORK/fails.txt"; fail=1
+fi
+
+# Which way the sessions really went. A side asked onto TCP must have got
+# there, and with both on QUIC none may have fallen back: the race would
+# otherwise hide a broken QUIC path behind a passing run.
+tunnels=$(grep -c 'session established over the TCP fallback' "$WORK/server.log" || true)
+if [ "$TRANSPORT_ALICE" = tcp ] || [ "$TRANSPORT_BOB" = tcp ]; then
+  check "sessions ran over the TCP fallback" "$WORK/server.log" 'session established over the TCP fallback'
+elif [ "$tunnels" -gt 0 ]; then
+  echo "FAIL $tunnels session(s) fell back to TCP in a QUIC run" | tee -a "$WORK/fails.txt"; fail=1
 fi
 
 # The self-test above never renders a component: it drives the backend through

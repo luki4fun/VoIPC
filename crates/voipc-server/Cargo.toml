@@ -28,6 +28,10 @@ zeroize = { version = "1", features = ["derive"] }
 socket2 = { version = "0.6.2", features = ["all"] }
 subtle = "2"
 sha2 = "0.10"
+# The TCP fallback's WebSocket handshake (Sec-WebSocket-Accept is base64 of a
+# SHA-1); both already come in through rustls and the client.
+ring = "0.17"
+base64 = "0.22"
 
 # Web client: HTTP/2-only static page (no http1 feature, on purpose) and the
 # QUIC/WebTransport endpoint all clients use. wtransport stays on ring so the

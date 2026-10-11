@@ -111,6 +111,17 @@ button:active {
   transform: scale(0.98);
 }
 
+/* A row that opens a menu (actions/member-menu.ts): clickable like a button,
+   and reachable from the keyboard. */
+.has-menu {
+  cursor: pointer;
+}
+
+.has-menu:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+
 input {
   background: var(--bg-primary);
   border: 1px solid var(--border);

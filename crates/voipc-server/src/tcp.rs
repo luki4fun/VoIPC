@@ -38,6 +38,23 @@ const MAX_PREKEYS: usize = 100;
 const MAX_KEY_BYTES: usize = 64;
 const MAX_SIGNATURE_BYTES: usize = 128;
 
+/// A character no user or channel name may contain: control characters, and
+/// the ones that print as nothing or reorder what follows them — with those,
+/// "admin\u{200B}" passes for "admin" and an RTL override turns a tag around.
+/// Look-alike letters from other scripts are not caught here.
+pub(crate) fn bad_name_char(c: char) -> bool {
+    c.is_control()
+        || matches!(c,
+            '\u{00AD}'                      // soft hyphen
+            | '\u{115F}' | '\u{1160}' | '\u{3164}' | '\u{FFA0}' // Hangul fillers
+            | '\u{200B}'..='\u{200F}'       // zero-width space/joiners, LRM, RLM
+            | '\u{202A}'..='\u{202E}'       // bidi embeddings and overrides
+            | '\u{2060}'..='\u{2064}'       // word joiner, invisible operators
+            | '\u{2066}'..='\u{2069}'       // bidi isolates
+            | '\u{FEFF}'                    // zero-width no-break space
+        )
+}
+
 /// Whether a pre-key bundle is the shape a client is supposed to send.
 fn bundle_is_sane(bundle: &PreKeyBundleData) -> bool {
     bundle.identity_key.len() <= MAX_KEY_BYTES
@@ -360,7 +377,7 @@ where
                         anyhow::bail!("invalid username");
                     }
 
-                    if username.chars().any(|c| c.is_control()) {
+                    if username.chars().any(bad_name_char) {
                         let err_msg = ServerMessage::AuthError {
                             reason: "username contains invalid characters".into(),
                         };
@@ -1493,7 +1510,7 @@ async fn handle_create_channel(
         return Ok(());
     }
 
-    if name.chars().any(|c| c.is_control()) {
+    if name.chars().any(bad_name_char) {
         let _ = send_msg(
             tx,
             &ServerMessage::ChannelError {
@@ -2944,6 +2961,18 @@ mod tests {
 
     use crate::config::ServerConfig;
     use crate::settings::ServerSettings;
+
+    #[test]
+    fn names_refuse_invisible_and_reordering_characters() {
+        let bad = |name: &str| name.chars().any(bad_name_char);
+        assert!(bad("admin\u{200B}"), "zero-width space");
+        assert!(bad("Luki\u{202E}0240#"), "RTL override");
+        assert!(bad("\u{3164}"), "Hangul filler, a name that prints as nothing");
+        assert!(bad("tab\there"), "control characters, as before");
+        for fine in ["Luki#0420", "Zoë", "Ærøskøbing", "名前", "Ελένη", "a b-c_d.e"] {
+            assert!(!bad(fine), "{fine} must pass");
+        }
+    }
 
     /// Drives `handle_connection` over an in-memory duplex without QUIC —
     /// exactly how the session bridge feeds it.

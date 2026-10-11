@@ -5,7 +5,7 @@
   // The call's, whichever server is on screen: it names the server too when
   // the call is on another one, and its leave button leaves the call there.
 
-  import { connectionState, latency } from "../../stores/connection.js";
+  import { connectionState, latency, viaTcp, TCP_HINT } from "../../stores/connection.js";
   import { lossPercent, quality } from "../../stores/connection-quality.js";
   import { viewingVoice, voiceChannel, voiceServer } from "../../stores/channels.js";
   import { isMobile } from "../../stores/platform.js";
@@ -16,6 +16,7 @@
 
   const voiceState = connectionState.at(voiceServer);
   const voiceLatency = latency.at(voiceServer);
+  const voiceTcp = viaTcp.at(voiceServer);
 
   const channelName = $derived($voiceChannel?.name ?? "");
   const serverName = $derived($serverEntries.find((e) => e.inVoice)?.name ?? "");
@@ -39,8 +40,11 @@
       <span class="channel"
         >#{channelName}{#if !$viewingVoice}&nbsp;· {serverName}{/if}</span
       >
-      <span class="ping quality-{$quality}" title="Voice packet loss (2s window)">
-        {$voiceLatency}ms{#if $lossPercent > 0}&nbsp;· {$lossPercent}%{/if}
+      <span
+        class="ping quality-{$quality}"
+        title={$voiceTcp ? `${TCP_HINT} Voice packet loss (2s window)` : "Voice packet loss (2s window)"}
+      >
+        {$voiceLatency}ms{#if $voiceTcp}&nbsp;· TCP{/if}{#if $lossPercent > 0}&nbsp;· {$lossPercent}%{/if}
       </span>
     </div>
     {#if !$isMobile}

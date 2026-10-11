@@ -11,7 +11,7 @@ import { currentChannelId, voice } from "./channels.js";
 import { serverAddress, userId } from "./connection.js";
 import { addNotification } from "./notifications.js";
 import { displayChannelId } from "./roster.js";
-import { currentFrame, watchingUserId } from "./screenshare.js";
+import { currentFrame, previewStage, watchingUserId } from "./screenshare.js";
 import type { UserInfo } from "../types.js";
 
 export interface UserMenu {
@@ -93,6 +93,13 @@ export async function watchUser(targetUserId: number): Promise<void> {
   } catch (e: any) {
     addNotification(e.toString(), "error");
   }
+}
+
+/** One click on a LIVE marker: watch that share — or, on our own, open the
+ *  preview of what we send. */
+export function openShare(sharerUserId: number): void {
+  if (sharerUserId === get(userId)) previewStage.set(true);
+  else void watchUser(sharerUserId);
 }
 
 // ── Poke ───────────────────────────────────────────────────────────────────

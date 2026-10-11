@@ -15,6 +15,8 @@ use tracing::{debug, error, info, warn};
 use wtransport::error::SendDatagramError;
 use wtransport::{Connection, SendStream};
 
+use crate::transport::{Conn, DatagramIn, VideoIn};
+
 use voipc_crypto::media_keys::{MediaKey, MediaKeyRing};
 use voipc_protocol::codec::{
     decode_server_msg, encode_client_msg, try_decode_frame, APP_VERSION, PROTOCOL_VERSION,
@@ -22,8 +24,8 @@ use voipc_protocol::codec::{
 use voipc_protocol::messages::{ClientMessage, ServerMessage};
 use voipc_protocol::types::*;
 use voipc_protocol::video::{
-    FrameAssembler, FrameGrouper, RecordReader, ScreenShareAudioPacket, VideoPacket,
-    SCREEN_AUDIO_HEADER_SIZE, VIDEO_HEADER_SIZE,
+    FrameAssembler, FrameGrouper, ScreenShareAudioPacket, VideoPacket, SCREEN_AUDIO_HEADER_SIZE,
+    VIDEO_HEADER_SIZE,
 };
 use voipc_protocol::voice::{PositionPayload, VoicePacket, VoicePacketType};
 
@@ -85,9 +87,10 @@ pub async fn connect_to_server(
 
     let (host, port) = parse_address(&address)?;
 
-    // QUIC connect + control stream (every phase bounded, see transport.rs)
+    // QUIC and its control stream, or the TCP fallback when UDP does not get
+    // through (every phase bounded, see transport.rs)
     let crate::transport::Link {
-        quic,
+        mut conn,
         mut control_send,
         mut control_recv,
     } = crate::transport::connect(&host, port, accept_invalid_certs).await?;
@@ -302,6 +305,10 @@ pub async fn connect_to_server(
     // which viewer reports count as loss.
     let share_loss_ms = Arc::new(AtomicU64::new(0));
     let share_loss_tally = Arc::new(std::sync::Mutex::new(LossTally::default()));
+    // People watching our share, as the server last counted them. The tally's
+    // majority reads it, and the capture task sends nothing while it is 0 —
+    // capture may run for the sharer's own preview alone.
+    let share_viewers = Arc::new(AtomicU32::new(0));
 
     // Shared screen share state — created early so the control reader can reset on channel change
     let screen_share_active = Arc::new(AtomicBool::new(false));
@@ -338,8 +345,29 @@ pub async fn connect_to_server(
     // Per-user jitter buffers + decoders — UDP receiver pushes, mixer pops
     let mix_sources: MixSources = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
-    // Spawn background tasks
-    let connection = quic.connection.clone();
+    // Spawn background tasks. Sending and receiving media is all that
+    // depends on the transport.
+    let tunnel = conn.is_tunnel();
+    let (udp_send_handle, video_send_handle, screen_audio_send_handle, datagram_in, video_in) =
+        match &mut conn {
+            Conn::Quic(quic) => {
+                let connection = &quic.connection;
+                (
+                    tokio::spawn(datagram_sender_task(connection.clone(), voice_rx)),
+                    tokio::spawn(video_stream_sender_task(connection.clone(), video_rx)),
+                    tokio::spawn(datagram_sender_task(connection.clone(), screen_audio_rx)),
+                    DatagramIn::Quic(connection.clone()),
+                    VideoIn::quic(connection.clone()),
+                )
+            }
+            Conn::Tunnel(lanes) => (
+                tokio::spawn(tunnel_datagram_task(lanes.datagrams.clone(), voice_rx)),
+                tokio::spawn(tunnel_video_task(lanes.video.clone(), video_rx)),
+                tokio::spawn(tunnel_datagram_task(lanes.datagrams.clone(), screen_audio_rx)),
+                DatagramIn::Tunnel(lanes.datagrams_in.take().expect("taken once")),
+                VideoIn::Tunnel(lanes.video_in.take().expect("taken once")),
+            ),
+        };
     let writer_handle = tokio::spawn(control_writer_task(control_send, tcp_rx));
     let reader_handle = tokio::spawn(control_reader_task(
         control_recv,
@@ -355,6 +383,7 @@ pub async fn connect_to_server(
         watching_codec.clone(),
         share_loss_ms.clone(),
         share_loss_tally.clone(),
+        share_viewers.clone(),
         spatial.clone(),
         channels_snapshot.clone(),
         server.clone(),
@@ -362,10 +391,6 @@ pub async fn connect_to_server(
         voice_asked_at.clone(),
         transmitting.clone(),
     ));
-    let udp_send_handle = tokio::spawn(datagram_sender_task(connection.clone(), voice_rx));
-    let video_send_handle = tokio::spawn(video_stream_sender_task(connection.clone(), video_rx));
-    let screen_audio_send_handle =
-        tokio::spawn(datagram_sender_task(connection.clone(), screen_audio_rx));
     let video_decode_handle = tokio::task::spawn_blocking({
         let app_handle = app_handle.clone();
         let watching_uid = watching_user_id_shared.clone();
@@ -391,7 +416,8 @@ pub async fn connect_to_server(
     let voice_frames_lost = Arc::new(AtomicU32::new(0));
 
     let udp_recv_handle = tokio::spawn(datagram_receiver_task(
-        connection.clone(),
+        datagram_in,
+        tunnel,
         app_handle.clone(),
         mix_sources.clone(),
         screen_audio_recv_count.clone(),
@@ -402,7 +428,7 @@ pub async fn connect_to_server(
         is_voice.clone(),
     ));
     let video_recv_handle = tokio::spawn(video_stream_receiver_task(
-        connection.clone(),
+        video_in,
         video_decode_tx,
         current_media_key.clone(),
         current_channel_id.clone(),
@@ -434,16 +460,12 @@ pub async fn connect_to_server(
         is_voice.clone(),
     ));
 
-    // Latency display from QUIC's RTT estimate (NAT keepalives are QUIC's job)
-    let latency_handle = tokio::spawn(latency_task(
-        connection.clone(),
-        app_handle.clone(),
-        server.clone(),
-    ));
+    // A ping every 10 s on the media path, either transport: its pong is
+    // the latency display, and on the TCP fallback also the keepalive
+    let latency_handle = tokio::spawn(latency_task(voice_tx.clone(), session_id));
     // Re-announce our position once a second while syncing it
     let position_sequence = Arc::new(AtomicU32::new(0));
     let beacon_handle = tokio::spawn(position_beacon_task(
-        connection.clone(),
         spatial.clone(),
         voice_tx.clone(),
         current_media_key.clone(),
@@ -451,12 +473,17 @@ pub async fn connect_to_server(
         current_channel_id.clone(),
         position_sequence.clone(),
     ));
-    // Our own uplink's congestion, which viewer reports cannot see
-    let congestion_handle = tokio::spawn(congestion_task(
-        connection,
-        screen_share_active.clone(),
-        share_loss_ms.clone(),
-    ));
+    // Our own uplink's congestion, which viewer reports cannot see. QUIC's
+    // path statistics only: over the TCP fallback a congested uplink shows as
+    // backpressure on video_tx, which the encoder reads as loss.
+    let congestion_handle = match &conn {
+        Conn::Quic(quic) => Some(tokio::spawn(congestion_task(
+            quic.connection.clone(),
+            screen_share_active.clone(),
+            share_loss_ms.clone(),
+        ))),
+        Conn::Tunnel(_) => None,
+    };
 
     // No PTT reset here any more: the holds belong to the voice connection,
     // and another server connecting must not drop them. They are released
@@ -478,8 +505,8 @@ pub async fn connect_to_server(
         voice_tx,
         video_tx,
         screen_audio_tx,
-        quic,
-        tasks: vec![
+        conn,
+        tasks: [
             writer_handle,
             reader_handle,
             udp_send_handle,
@@ -491,8 +518,10 @@ pub async fn connect_to_server(
             mixer_handle,
             latency_handle,
             beacon_handle,
-            congestion_handle,
-        ],
+        ]
+        .into_iter()
+        .chain(congestion_handle)
+        .collect(),
         transmitting,
         capture_task: None,
         voice_sequence: Arc::new(AtomicU32::new(0)),
@@ -508,6 +537,8 @@ pub async fn connect_to_server(
         keyframe_requested: Arc::new(AtomicBool::new(false)),
         share_loss_ms,
         share_loss_tally,
+        share_viewers,
+        share_preview: Arc::new(AtomicBool::new(false)),
         watching_user_id: None,
         watching_user_id_shared,
         capture_session: None,
@@ -607,7 +638,7 @@ pub async fn teardown(
 
     // Tell the server right away (otherwise it holds the username until
     // its idle timeout and a quick reconnect gets "already taken")
-    connection.quic.close().await;
+    connection.conn.close().await;
 }
 
 /// Forget that `server` holds voice, if it does. Returns whether it did.
@@ -893,6 +924,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     watching_codec: Arc<AtomicU8>,
     share_loss_ms: Arc<AtomicU64>,
     share_loss_tally: Arc<std::sync::Mutex<LossTally>>,
+    share_viewers: Arc<AtomicU32>,
     spatial: Arc<std::sync::Mutex<crate::app_state::SpatialState>>,
     channels_snapshot: Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
     server: Arc<str>,
@@ -942,6 +974,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
                             &watching_codec,
                             &share_loss_ms,
                             &share_loss_tally,
+                            &share_viewers,
                             &spatial,
                             &channels_snapshot,
                             &server,
@@ -1144,6 +1177,7 @@ async fn handle_server_message(
     watching_codec: &Arc<AtomicU8>,
     share_loss_ms: &Arc<AtomicU64>,
     share_loss_tally: &Arc<std::sync::Mutex<LossTally>>,
+    share_viewers: &AtomicU32,
     spatial: &Arc<std::sync::Mutex<crate::app_state::SpatialState>>,
     channels_snapshot: &Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
     server: &str,
@@ -1172,7 +1206,8 @@ async fn handle_server_message(
                 tally
                     .reports
                     .retain(|_, at| now.saturating_sub(*at) < LOSS_REPORT_TTL_MS);
-                let (reporters, viewers) = (tally.reports.len(), tally.viewer_count);
+                let (reporters, viewers) =
+                    (tally.reports.len(), share_viewers.load(Ordering::Relaxed));
                 drop(tally);
                 if majority_reached(reporters, viewers) {
                     share_loss_ms.store(now, Ordering::Relaxed);
@@ -1822,10 +1857,7 @@ async fn handle_server_message(
             );
         }
         ServerMessage::ViewerCountChanged { viewer_count } => {
-            share_loss_tally
-                .lock()
-                .unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() })
-                .viewer_count = viewer_count;
+            share_viewers.store(viewer_count, Ordering::Relaxed);
             emit_server(
                 app_handle,
                 server,
@@ -3676,7 +3708,6 @@ const POSITION_KEEPALIVE: std::time::Duration = std::time::Duration::from_secs(1
 /// Beacons are unreliable datagrams and a member who joins later has missed
 /// every earlier one, so the keepalive is what makes the room converge.
 async fn position_beacon_task(
-    connection: Connection,
     spatial: Arc<std::sync::Mutex<crate::app_state::SpatialState>>,
     voice_tx: mpsc::Sender<Vec<u8>>,
     media_key: Arc<std::sync::Mutex<MediaKeyRing>>,
@@ -3725,7 +3756,8 @@ async fn position_beacon_task(
                     pos,
                 );
             }
-            _ = connection.closed() => return,
+            // The link is gone (its datagram sender ended)
+            _ = voice_tx.closed() => return,
         }
     }
 }
@@ -3802,6 +3834,28 @@ async fn video_stream_sender_task(connection: Connection, mut rx: mpsc::Receiver
 async fn finish_frame(stream: Option<SendStream>) {
     if let Some(mut stream) = stream {
         let _ = stream.shutdown().await;
+    }
+}
+
+/// Voice / screen-audio packets → the TCP fallback's datagram lane, which
+/// goes out ahead of everything else. A full lane drops the packet, like
+/// the UDP these replace.
+async fn tunnel_datagram_task(lane: mpsc::Sender<Vec<u8>>, mut rx: mpsc::Receiver<Vec<u8>>) {
+    while let Some(data) = rx.recv().await {
+        if let Err(mpsc::error::TrySendError::Closed(_)) = lane.try_send(data) {
+            return;
+        }
+    }
+}
+
+/// Video fragments → the TCP fallback's video lane. It waits for room, so
+/// a slow uplink backs up into video_tx, where the encoder sees it as loss
+/// and steps the share down (screenshare::FrameProcessor).
+async fn tunnel_video_task(lane: mpsc::Sender<Vec<u8>>, mut rx: mpsc::Receiver<Vec<u8>>) {
+    while let Some(packet) = rx.recv().await {
+        if lane.send(packet).await.is_err() {
+            return;
+        }
     }
 }
 
@@ -3890,27 +3944,33 @@ async fn congestion_task(
     }
 }
 
-/// Latency for the status bar from QUIC's own RTT estimate, every 10 s.
-async fn latency_task(connection: Connection, app_handle: tauri::AppHandle, server: Arc<str>) {
+/// A ping on the media path every 10 s, its sequence our send time — the
+/// browser's keepalive too. The server answers it with a pong, whose round
+/// trip `datagram_receiver_task` shows as the latency. The same on either
+/// transport, and on the TCP fallback it is also what keeps the tunnel from
+/// looking idle (transport.rs `TUNNEL_IDLE_TIMEOUT`).
+async fn latency_task(voice_tx: mpsc::Sender<Vec<u8>>, session_id: u32) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        tokio::select! {
-            _ = interval.tick() => {
-                let ms = connection.rtt().as_millis() as u64;
-                emit_server(&app_handle, &server, "latency-update", serde_json::json!({"ms": ms}));
-            }
-            _ = connection.closed() => return,
+        interval.tick().await;
+        let ping = VoicePacket::ping(session_id, screenshare::epoch_ms() as u32).to_bytes();
+        if let Err(mpsc::error::TrySendError::Closed(_)) = voice_tx.try_send(ping) {
+            return;
         }
     }
 }
 
 /// Server → client datagrams: voice (0x05), end-of-transmission (0x02) and
 /// screen-share audio (0x15), decrypted and fed to the mixer's per-source
-/// jitter buffers; also drives the speaking indicator. Video arrives on
-/// streams (`video_stream_receiver_task`).
+/// jitter buffers; also drives the speaking indicator, and turns the pong to
+/// our keepalive ping (0x04) into the latency display. Video arrives on its
+/// own (`video_stream_receiver_task`). `tunnel`: the link is the TCP fallback,
+/// which the latency display says.
+#[allow(clippy::too_many_arguments)]
 async fn datagram_receiver_task(
-    connection: Connection,
+    mut input: DatagramIn,
+    tunnel: bool,
     app_handle: tauri::AppHandle,
     sources: MixSources,
     screen_audio_recv_count: Arc<AtomicU32>,
@@ -3931,13 +3991,9 @@ async fn datagram_receiver_task(
 
     loop {
         tokio::select! {
-            result = connection.receive_datagram() => {
-                let datagram = match result {
-                    Ok(datagram) => datagram,
-                    Err(e) => {
-                        info!("datagram receive ended: {}", e);
-                        break;
-                    }
+            received = input.recv() => {
+                let Some(datagram) = received else {
+                    break;
                 };
                 let buf: &[u8] = &datagram;
                 let n = buf.len();
@@ -4235,6 +4291,21 @@ async fn datagram_receiver_task(
                         }
                         screen_audio_recv_count.fetch_add(1, Ordering::Relaxed);
                     }
+                    // The pong to our keepalive ping (latency_task)
+                    0x04 => {
+                        if let Ok(pong) = VoicePacket::from_bytes(buf) {
+                            let rtt = (screenshare::epoch_ms() as u32).wrapping_sub(pong.sequence);
+                            // A wrapped or stale sequence would read as minutes
+                            if rtt < 60_000 {
+                                emit_server(
+                                    &app_handle,
+                                    &server,
+                                    "latency-update",
+                                    serde_json::json!({"ms": rtt, "tcp": tunnel}),
+                                );
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -4264,20 +4335,18 @@ async fn datagram_receiver_task(
     }
 }
 
-/// Largest per-frame video stream we accept (a 1080p keyframe is well under 1 MiB).
-const MAX_FRAME_STREAM_BYTES: u64 = 8 * 1024 * 1024;
 /// Viewer loss reports to the sharer cover this window.
 const LOSS_REPORT_WINDOW: std::time::Duration = std::time::Duration::from_secs(2);
 
-/// Server → client video: each unidirectional stream is one frame as
-/// `[u16 BE len][packet]` records, fed to the assembler as they arrive (waiting
-/// for the frame's FIN would add its whole transmission time to the latency).
+/// Server → client video: the packets of every frame in arrival order
+/// (`VideoIn`: QUIC's per-frame streams or the tunnel's messages), fed to the
+/// assembler as they arrive.
 /// Decrypts, reassembles, hands complete frames to the decode task, requests a
 /// keyframe on loss and keeps asking while there is nothing clean to show, and
 /// reports the loss to the sharer every 2 s so it can lower its bitrate/fps.
 #[allow(clippy::too_many_arguments)]
 async fn video_stream_receiver_task(
-    connection: Connection,
+    mut input: VideoIn,
     video_decode_tx: mpsc::Sender<(Vec<u8>, bool, bool)>,
     media_key: Arc<std::sync::Mutex<MediaKeyRing>>,
     channel_id: Arc<AtomicU32>,
@@ -4296,7 +4365,6 @@ async fn video_stream_receiver_task(
     let mut window_started = std::time::Instant::now();
     let mut window_dropped: u32 = 0;
     let mut window_received: u32 = 0;
-    let mut chunk = vec![0u8; 16 * 1024];
     // At most once a second, which is also all the server relays: a request
     // that went unanswered (rate-limited, or its keyframe lost) is made again.
     let request_keyframe = |last: &mut std::time::Instant| {
@@ -4312,118 +4380,92 @@ async fn video_stream_receiver_task(
         *last = std::time::Instant::now();
     };
 
-    loop {
-        let mut stream = match connection.accept_uni().await {
-            Ok(stream) => stream,
-            Err(e) => {
-                info!("video stream accept ended: {}", e);
-                return;
+    while let Some(records) = input.next().await {
+        for packet_bytes in records {
+            let n = packet_bytes.len();
+            if n < VIDEO_HEADER_SIZE {
+                continue;
             }
-        };
-        // Frames are read one after another so fragments reach the assembler in order.
-        let mut reader = RecordReader::default();
-        let mut total: u64 = 0;
-
-        loop {
-            // Err = reset by the server: the frame is lost, the assembler sees the gap
-            let read = match stream.read(&mut chunk).await {
-                Ok(Some(n)) => n,
-                Ok(None) | Err(_) => break,
+            let packet_type = packet_bytes[0];
+            if packet_type != 0x13 && packet_type != 0x14 {
+                continue;
+            }
+            let mut packet = match VideoPacket::from_bytes(&packet_bytes) {
+                Ok(p) => p,
+                Err(_) => continue,
             };
-            total += read as u64;
-            if total > MAX_FRAME_STREAM_BYTES {
-                break;
-            }
 
-            for packet_bytes in reader.push(&chunk[..read]) {
-                let n = packet_bytes.len();
-                if n < VIDEO_HEADER_SIZE {
-                    continue;
-                }
-                let packet_type = packet_bytes[0];
-                if packet_type != 0x13 && packet_type != 0x14 {
-                    continue;
-                }
-                let mut packet = match VideoPacket::from_bytes(&packet_bytes) {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
+            screen_video_bytes_received.fetch_add(n as u64, Ordering::Relaxed);
 
-                screen_video_bytes_received.fetch_add(n as u64, Ordering::Relaxed);
-
-                // Decrypt (plaintext video is never relayed)
-                {
-                    let key_guard = media_key.lock().unwrap_or_else(|poisoned| {
-                        warn!("media key mutex poisoned — recovering");
-                        poisoned.into_inner()
-                    });
-                    let ch_id = channel_id.load(Ordering::Relaxed);
-                    if let Some(key) = key_guard.get(ch_id, packet.key_id) {
-                        let aad = voipc_crypto::build_aad(ch_id, packet_type);
-                        match voipc_crypto::media_decrypt(
-                            key,
-                            packet.stream_id,
-                            packet.frame_id,
-                            packet.fragment_index as u32,
-                            &aad,
-                            &packet.payload,
-                        ) {
-                            Ok(decrypted) => packet.payload = decrypted,
-                            Err(e) => {
-                                warn!("Video decryption failed: {}", e);
-                                continue;
-                            }
-                        }
-                    } else {
-                        warn!("Received encrypted video but no media key");
-                        continue;
-                    }
-                }
-
-                // Detect sharer change — reset assembler (the old
-                // sharer's audio source just goes idle and is pruned)
-                if current_video_session != Some(packet.session_id) {
-                    video_assembler.reset();
-                    current_video_session = Some(packet.session_id);
-                }
-
-                let result = video_assembler.add_fragment(&packet);
-
-                // A frame was lost: the next one handed on carries the gap, and
-                // the decode task suppresses rendering from there
-                if result.frame_dropped {
-                    screen_video_frames_dropped.fetch_add(1, Ordering::Relaxed);
-                    window_dropped += 1;
-                    gap = true;
-                    request_keyframe(&mut last_keyframe_request);
-                }
-
-                if let Some((frame_data, is_keyframe)) = result.frame {
-                    screen_video_frames_received.fetch_add(1, Ordering::Relaxed);
-                    window_received += 1;
-                    // Send to decode task — drop if full to avoid stalling voice.
-                    // Lost here is lost like on the wire.
-                    match video_decode_tx.try_send((frame_data, is_keyframe, gap)) {
-                        Ok(()) => gap = false,
-                        Err(_) => {
-                            gap = true;
-                            screen_video_frames_dropped.fetch_add(1, Ordering::Relaxed);
-                            window_dropped += 1;
-                            warn!("video decode channel full — dropping assembled frame");
-                            request_keyframe(&mut last_keyframe_request);
+            // Decrypt (plaintext video is never relayed)
+            {
+                let key_guard = media_key.lock().unwrap_or_else(|poisoned| {
+                    warn!("media key mutex poisoned — recovering");
+                    poisoned.into_inner()
+                });
+                let ch_id = channel_id.load(Ordering::Relaxed);
+                if let Some(key) = key_guard.get(ch_id, packet.key_id) {
+                    let aad = voipc_crypto::build_aad(ch_id, packet_type);
+                    match voipc_crypto::media_decrypt(
+                        key,
+                        packet.stream_id,
+                        packet.frame_id,
+                        packet.fragment_index as u32,
+                        &aad,
+                        &packet.payload,
+                    ) {
+                        Ok(decrypted) => packet.payload = decrypted,
+                        Err(e) => {
+                            warn!("Video decryption failed: {}", e);
+                            continue;
                         }
                     }
-                }
-
-                // Keep asking while there is nothing clean to show: the server
-                // rate-limits keyframe relays, so the one a join or a loss
-                // triggered may never have come.
-                if needs_keyframe.load(Ordering::Acquire) || !video_assembler.has_keyframe() {
-                    request_keyframe(&mut last_keyframe_request);
+                } else {
+                    warn!("Received encrypted video but no media key");
+                    continue;
                 }
             }
-            if reader.is_broken() {
-                break;
+
+            // Detect sharer change — reset assembler (the old
+            // sharer's audio source just goes idle and is pruned)
+            if current_video_session != Some(packet.session_id) {
+                video_assembler.reset();
+                current_video_session = Some(packet.session_id);
+            }
+
+            let result = video_assembler.add_fragment(&packet);
+
+            // A frame was lost: the next one handed on carries the gap, and
+            // the decode task suppresses rendering from there
+            if result.frame_dropped {
+                screen_video_frames_dropped.fetch_add(1, Ordering::Relaxed);
+                window_dropped += 1;
+                gap = true;
+                request_keyframe(&mut last_keyframe_request);
+            }
+
+            if let Some((frame_data, is_keyframe)) = result.frame {
+                screen_video_frames_received.fetch_add(1, Ordering::Relaxed);
+                window_received += 1;
+                // Send to decode task — drop if full to avoid stalling voice.
+                // Lost here is lost like on the wire.
+                match video_decode_tx.try_send((frame_data, is_keyframe, gap)) {
+                    Ok(()) => gap = false,
+                    Err(_) => {
+                        gap = true;
+                        screen_video_frames_dropped.fetch_add(1, Ordering::Relaxed);
+                        window_dropped += 1;
+                        warn!("video decode channel full — dropping assembled frame");
+                        request_keyframe(&mut last_keyframe_request);
+                    }
+                }
+            }
+
+            // Keep asking while there is nothing clean to show: the server
+            // rate-limits keyframe relays, so the one a join or a loss
+            // triggered may never have come.
+            if needs_keyframe.load(Ordering::Acquire) || !video_assembler.has_keyframe() {
+                request_keyframe(&mut last_keyframe_request);
             }
         }
 

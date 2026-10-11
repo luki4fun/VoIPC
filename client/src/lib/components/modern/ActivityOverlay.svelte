@@ -6,32 +6,45 @@
   // in this layout they take the whole window and close with Escape — the shape
   // Discord uses for an Activity.
   //
-  // Driven by `centreView` and `watchingUserId`, the same two stores the classic
+  // Driven by `centreView` and `streamStage`, the same two stores the classic
   // layout reads. There is deliberately no third selector: the comment in
   // stores/room.ts explains why one selector beats three booleans, and that
   // reasoning did not stop applying because a second layout arrived.
+  //
+  // A share — watched, or the preview of our own — comes with its chat when
+  // asked for (StreamStage), so this view no longer costs the conversation.
 
   import { centreView, currentProximity } from "../../stores/room.js";
-  import { poppedOut, watchingUserId } from "../../stores/screenshare.js";
+  import { previewStage, streamStage } from "../../stores/screenshare.js";
   import RoomView from "../RoomView.svelte";
   import MixerView from "../MixerView.svelte";
-  import ScreenShareViewer from "../ScreenShareViewer.svelte";
+  import StreamStage from "../StreamStage.svelte";
   import Icon from "../Icons.svelte";
 
-  const watching = $derived($watchingUserId !== null && !$poppedOut);
+  const watching = $derived($streamStage === "watch");
   const showRoom = $derived($centreView === "room" && $currentProximity !== "off");
   const showMixer = $derived($centreView === "mixer");
-  const open = $derived(watching || showRoom || showMixer);
+  const open = $derived($streamStage !== null || showRoom || showMixer);
 
   const title = $derived(
-    watching ? "Screen share" : showRoom ? "Virtual room" : showMixer ? "Mixing desk" : "",
+    watching
+      ? "Screen share"
+      : $streamStage === "preview"
+        ? "Your screen"
+        : showRoom
+          ? "Virtual room"
+          : showMixer
+            ? "Mixing desk"
+            : "",
   );
 
   function close() {
-    // Only the centre view is ours to reset. A share is stopped by its own
+    // Only the view is ours to reset. A watched share is stopped by its own
     // button, which knows to tell the server; closing this must not look like
-    // that and silently keep decoding in the background.
-    if (!watching) centreView.set("chat");
+    // that and silently keep decoding in the background. Our own preview
+    // just goes back to its card.
+    if ($streamStage === "preview") previewStage.set(false);
+    else if (!watching) centreView.set("chat");
   }
 
   function onkeydown(e: KeyboardEvent) {
@@ -55,8 +68,8 @@
       {/if}
     </div>
     <div class="activity-body">
-      {#if watching}
-        <ScreenShareViewer />
+      {#if $streamStage !== null}
+        <StreamStage />
       {:else if showRoom}
         <RoomView />
       {:else if showMixer}
@@ -74,6 +87,12 @@
     display: flex;
     flex-direction: column;
     background: var(--bg-primary);
+    /* Android draws the WebView under its status and navigation bars, the
+       same as for the shell: without these the bar sits under the clock and
+       a docked chat's message box under the back button. Zero elsewhere. */
+    box-sizing: border-box;
+    padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom)
+      env(safe-area-inset-left);
   }
 
   .activity-bar {

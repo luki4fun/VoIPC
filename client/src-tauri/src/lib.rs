@@ -381,6 +381,7 @@ pub fn run() {
             commands::start_screen_capture,
             commands::stop_screen_capture,
             commands::set_keyframe_requested,
+            commands::set_share_preview,
             commands::set_screen_share_codec,
             commands::toggle_screen_audio,
             commands::get_screen_audio_status,

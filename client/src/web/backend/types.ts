@@ -178,6 +178,9 @@ export interface ShareApi {
   /** Whether this browser can share at all (WebCodecs + getDisplayMedia). */
   readonly available: boolean;
   readonly sharing: boolean;
+  /** What getDisplayMedia handed us, for the sharer's own preview — from
+   *  start to stop, whether or not anybody watches. */
+  readonly previewStream: MediaStream | null;
   /**
    * start_screen_share: ask the browser for a source (its own picker), pick a
    * codec this browser can actually encode, and announce the share. Encoding

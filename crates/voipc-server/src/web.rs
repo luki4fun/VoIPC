@@ -1,6 +1,8 @@
 //! Client transport: the QUIC (WebTransport) endpoint every client connects
 //! to, and the HTTP/2-only static page browsers load first (the embedded
-//! `client/dist-web` bundle plus `/wt.json`).
+//! `client/dist-web` bundle plus `/wt.json`). The TCP fallback for clients
+//! that cannot reach UDP lives in `tunnel.rs` and shares the session setup
+//! and the media relay below.
 //!
 //! One session maps onto the native paths: control bytes go through an
 //! in-process duplex into `tcp::handle_connection`, media packets go
@@ -16,7 +18,7 @@
 
 use std::borrow::Cow;
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::{Arc, PoisonError, RwLock};
 use std::time::Duration;
 
@@ -37,7 +39,7 @@ use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 use voipc_protocol::types::UserId;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, info, warn};
 use wtransport::config::{Ipv6DualStackConfig, QuicTransportConfig};
@@ -64,11 +66,15 @@ const MAX_FRAME_STREAM_BYTES: u64 = 8 * 1024 * 1024;
 
 /// Sent with every response. Scripts are the bundle's own (wasm needs
 /// `wasm-unsafe-eval`), `connect-src https:` lets the page fetch `/wt.json`
-/// and open the WebTransport session, media comes from blob: URLs, and
-/// Svelte's component styles are inline.
-const CSP: &str = "default-src 'self'; connect-src 'self' https:; \
+/// and open the WebTransport session, `wss:` the TCP fallback tunnel (to this
+/// server or another one the client has open), media comes from blob: URLs,
+/// and Svelte's component styles are inline. Nothing may frame the client: a
+/// page embedding it could lend it the microphone and screen capture and
+/// steer the clicks.
+const CSP: &str = "default-src 'self'; connect-src 'self' https: wss:; \
     script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; \
-    img-src 'self' data: blob:; media-src blob:; style-src 'self' 'unsafe-inline'";
+    img-src 'self' data: blob:; media-src blob:; style-src 'self' 'unsafe-inline'; \
+    frame-ancestors 'none'";
 
 /// The built web client (`./build-web.sh`), embedded at compile time.
 #[derive(Embed)]
@@ -80,9 +86,24 @@ pub struct WtInfo {
     port: u16,
     /// SHA-256 of the current browser certificate; replaced on rotation.
     cert_hash: RwLock<Sha256Digest>,
+    /// Whether the TCP fallback tunnel is on (`tcp_fallback`), so a page whose
+    /// WebTransport session cannot get through knows whether to try it.
+    tcp: bool,
 }
 
 // ── HTTP/2 static page ──────────────────────────────────────────────────
+
+/// How long one page connection lives. A browser loads the page and
+/// `/wt.json` in seconds and then keeps the connection open with nothing on
+/// it, holding one of the connection slots QUIC sessions need too — so a few
+/// addresses opening idle ones could lock everybody out. After this the
+/// connection is closed gracefully; browsers, and the game server's HTTP
+/// client on `/game/v1/routes`, simply open a new one for their next request.
+///
+/// ponytail: a fixed lifetime, not an idle timer — re-dialling is bounded by
+/// the connect rate (`ConnLimits`). An idle timer if a real page load ever
+/// takes this long.
+const PAGE_CONN_LIFETIME: Duration = Duration::from_secs(60);
 
 /// Serve the web client over HTTP/2 on a TLS stream that negotiated `h2`.
 pub async fn serve_h2(
@@ -96,10 +117,20 @@ pub async fn serve_h2(
         let state = state.clone();
         async move { Ok::<_, Infallible>(handle_request(req, &wt, &state).await) }
     });
-    if let Err(e) = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
-        .serve_connection(TokioIo::new(tls), service)
-        .await
-    {
+    let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+        .serve_connection(TokioIo::new(tls), service);
+    tokio::pin!(conn);
+    let result = tokio::select! {
+        result = conn.as_mut() => result,
+        _ = tokio::time::sleep(PAGE_CONN_LIFETIME) => {
+            // GOAWAY: requests in flight finish; a peer that ignores the
+            // goodbye, or never even sent its preface (hyper waits for it),
+            // is dropped after as long again
+            conn.as_mut().graceful_shutdown();
+            tokio::time::timeout(PAGE_CONN_LIFETIME, conn).await.unwrap_or(Ok(()))
+        }
+    };
+    if let Err(e) = result {
         debug!(%peer, "h2 connection ended: {e}");
     }
 }
@@ -322,7 +353,12 @@ fn route(path: &str, wt: &WtInfo) -> Response<Full<Bytes>> {
     if path == "/wt.json" {
         let hash = wt.cert_hash.read().unwrap_or_else(PoisonError::into_inner);
         let hash: &[u8; 32] = hash.as_ref();
-        let body = format!(r#"{{"port":{},"hash":"{}"}}"#, wt.port, hex::encode(hash));
+        let body = format!(
+            r#"{{"port":{},"hash":"{}","tcp":{}}}"#,
+            wt.port,
+            hex::encode(hash),
+            wt.tcp
+        );
         let mut resp = Response::new(Full::new(Bytes::from(body)));
         let headers = resp.headers_mut();
         headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -504,6 +540,7 @@ impl WebTransport {
             info: Arc::new(WtInfo {
                 port: config.udp_port,
                 cert_hash: RwLock::new(cert_hash),
+                tcp: config.tcp_fallback,
             }),
         })
     }
@@ -668,25 +705,53 @@ fn server_config(bind_addr: SocketAddr, picker: Arc<CertPicker>) -> WtServerConf
 
 // ── Per-session bridge ──────────────────────────────────────────────────
 
+/// What every client session starts from, whichever transport carries it
+/// (this QUIC bridge or the TCP tunnel): the control handler on one end of an
+/// in-process duplex, the relay's queue of media for this client, and the
+/// session id once it authenticated.
+pub(crate) struct SessionStart {
+    pub handler: JoinHandle<()>,
+    /// The transport's end of the control duplex.
+    pub bridge: DuplexStream,
+    pub media_rx: mpsc::Receiver<Bytes>,
+    pub sid_rx: oneshot::Receiver<SessionId>,
+}
+
+/// Start the control handler for a new session. It starts now, so its 5 s
+/// authentication deadline covers the client opening its control channel as
+/// well.
+pub(crate) fn start_session(label: &str, peer: IpAddr, state: &Arc<ServerState>) -> SessionStart {
+    let (handler_end, bridge) = tokio::io::duplex(65536);
+    let (media_tx, media_rx) = mpsc::channel::<Bytes>(512);
+    let (sid_tx, sid_rx) = oneshot::channel::<SessionId>();
+    let handler = tokio::spawn(tcp::handle_connection(
+        handler_end,
+        label.to_string(),
+        peer,
+        media_tx,
+        sid_tx,
+        state.clone(),
+    ));
+    SessionStart {
+        handler,
+        bridge,
+        media_rx,
+        sid_rx,
+    }
+}
+
 /// Bridge one QUIC session onto the control handler and the media relay
 /// until either side goes away.
 async fn run_session(connection: Connection, state: Arc<ServerState>, peer: SocketAddr) {
     let label = format!("quic:{}", peer.ip());
     info!(peer = %label, "session established");
 
-    let (handler_end, bridge_end) = tokio::io::duplex(65536);
-    let (media_tx, media_rx) = mpsc::channel::<Bytes>(512);
-    let (sid_tx, sid_rx) = oneshot::channel::<SessionId>();
-    // The control handler starts now, so its 5 s authentication deadline
-    // covers the client opening the control stream as well.
-    let mut handler = tokio::spawn(tcp::handle_connection(
-        handler_end,
-        label.clone(),
-        peer.ip(),
-        media_tx,
-        sid_tx,
-        state.clone(),
-    ));
+    let SessionStart {
+        mut handler,
+        bridge: bridge_end,
+        media_rx,
+        sid_rx,
+    } = start_session(&label, peer.ip(), &state);
 
     let (video_tx, video_rx) = mpsc::channel::<Bytes>(512);
     // The control leg is kept apart from the media pumps: it is the one that
@@ -697,7 +762,12 @@ async fn run_session(connection: Connection, state: Arc<ServerState>, peer: Sock
     // the client then saw a dead connection instead of the kick reason.
     let mut control = tokio::spawn(pump_control(connection.clone(), bridge_end));
     let mut pumps = JoinSet::new();
-    pumps.spawn(pump_media_out(connection.clone(), media_rx, video_tx, state.clone()));
+    pumps.spawn(pump_media_out(
+        DatagramSink::Quic(connection.clone()),
+        media_rx,
+        video_tx,
+        state.clone(),
+    ));
     pumps.spawn(pump_video_streams(connection.clone(), video_rx));
     pumps.spawn(pump_media_in(connection.clone(), sid_rx, state));
 
@@ -827,14 +897,23 @@ async fn pump_video_in(connection: &Connection, session_id: SessionId, state: &S
     }
 }
 
+/// Where `pump_media_out` puts everything that is not video.
+pub(crate) enum DatagramSink {
+    /// QUIC datagrams.
+    Quic(Connection),
+    /// The TCP tunnel's datagram lane (`tunnel.rs`), which its writer sends
+    /// ahead of control and video. A full lane drops the packet, as UDP would.
+    Tunnel(mpsc::Sender<Bytes>),
+}
+
 /// Server → client media, read from the session's relay queue. Everything
-/// but video goes out as a datagram right here (`send_datagram` never
-/// blocks); video is queued for the stream writer a whole frame at a time and
-/// dropped whole when it does not fit (see `VideoAdmission`), so this loop
-/// never stalls on the QUIC side. A drop asks the sharer for the keyframe
-/// that ends it.
-async fn pump_media_out(
-    connection: Connection,
+/// but video goes out as a datagram right here (neither sink ever blocks);
+/// video is queued for the stream writer a whole frame at a time and dropped
+/// whole when it does not fit (see `VideoAdmission`), so this loop never
+/// stalls on the transport. A drop asks the sharer for the keyframe that
+/// ends it.
+pub(crate) async fn pump_media_out(
+    sink: DatagramSink,
     mut media_rx: mpsc::Receiver<Bytes>,
     video_tx: mpsc::Sender<Bytes>,
     state: Arc<ServerState>,
@@ -864,24 +943,31 @@ async fn pump_media_out(
                     return;
                 }
             }
-            _ => {
-                let max = connection.max_datagram_size().unwrap_or(1200);
-                if packet.len() > max {
-                    if !warned_oversize {
-                        warn!(len = packet.len(), max, "dropping media packet larger than the datagram limit");
-                        warned_oversize = true;
+            _ => match &sink {
+                DatagramSink::Quic(connection) => {
+                    let max = connection.max_datagram_size().unwrap_or(1200);
+                    if packet.len() > max {
+                        if !warned_oversize {
+                            warn!(len = packet.len(), max, "dropping media packet larger than the datagram limit");
+                            warned_oversize = true;
+                        }
+                        continue;
                     }
-                    continue;
+                    match connection.send_datagram(packet) {
+                        Ok(()) | Err(SendDatagramError::TooLarge) => {}
+                        Err(SendDatagramError::UnsupportedByPeer) => {
+                            warn!("peer does not support datagrams, media disabled");
+                            return;
+                        }
+                        Err(SendDatagramError::NotConnected) => return,
+                    }
                 }
-                match connection.send_datagram(packet) {
-                    Ok(()) | Err(SendDatagramError::TooLarge) => {}
-                    Err(SendDatagramError::UnsupportedByPeer) => {
-                        warn!("peer does not support datagrams, media disabled");
+                DatagramSink::Tunnel(lane) => {
+                    if let Err(mpsc::error::TrySendError::Closed(_)) = lane.try_send(packet) {
                         return;
                     }
-                    Err(SendDatagramError::NotConnected) => return,
                 }
-            }
+            },
         }
     }
 }

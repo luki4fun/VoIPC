@@ -173,6 +173,9 @@ pub fn spawn_capture_task(
     channel_id: Arc<AtomicU32>,
     frames_sent: Arc<AtomicU32>,
     bytes_sent: Arc<AtomicU64>,
+    app: tauri::AppHandle,
+    preview: Arc<AtomicBool>,
+    viewers: Arc<AtomicU32>,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
     let fd = session
         .pw_fd
@@ -201,6 +204,9 @@ pub fn spawn_capture_task(
             channel_id,
             frames_sent,
             bytes_sent,
+            app,
+            preview,
+            viewers,
         ) {
             error!("PipeWire capture error: {}", e);
         }
@@ -228,6 +234,9 @@ fn run_pipewire_capture(
     channel_id: Arc<AtomicU32>,
     frames_sent: Arc<AtomicU32>,
     bytes_sent: Arc<AtomicU64>,
+    app: tauri::AppHandle,
+    preview: Arc<AtomicBool>,
+    viewers: Arc<AtomicU32>,
 ) -> Result<(), String> {
     pipewire::init();
 
@@ -284,6 +293,13 @@ fn run_pipewire_capture(
         channel_id: channel_id.clone(),
         frames_sent,
         bytes_sent,
+        viewers: viewers.clone(),
+        watched: false,
+        preview,
+        app,
+        preview_conv: None,
+        preview_jpeg: None,
+        preview_at: None,
     };
 
     // ── Shared frame slot between PipeWire callback and encode thread ────
@@ -458,6 +474,7 @@ fn run_pipewire_capture(
         channel_id: channel_id.clone(),
         resampler: None,
         mono_buf: Vec::new(),
+        viewers,
     });
 
     let _audio_listener = audio_stream

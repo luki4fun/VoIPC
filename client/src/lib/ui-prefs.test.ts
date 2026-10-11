@@ -11,8 +11,11 @@ import assert from "node:assert/strict";
 import {
   SIDEBAR_MAX,
   SIDEBAR_MIN,
+  STREAM_CHAT_HEIGHT_MIN,
+  STREAM_CHAT_WIDTH_MAX,
   ZOOM_MAX,
   defaultPanels,
+  defaultStreamChat,
   defaultUiPrefs,
   sanitizeUiPrefs,
 } from "./ui-prefs.ts";
@@ -129,4 +132,34 @@ test("a malformed left-text-channel list costs that entry, not the app", () => {
   assert.deepEqual(p.left_text_channels["b.example:9987"], ["ok"]);
   assert.equal(p.left_text_channels["c.example:9987"], undefined);
   assert.deepEqual(sanitizeUiPrefs({ left_text_channels: ["nope"] }).left_text_channels, {});
+});
+
+test("the stream view's chat: off in modern, below in classic, until chosen", () => {
+  const p = sanitizeUiPrefs({});
+  assert.deepEqual(p.stream_chat.modern, defaultStreamChat("modern"));
+  assert.equal(p.stream_chat.modern.open, false);
+  assert.equal(p.stream_chat.classic.open, true);
+  assert.equal(p.stream_chat.classic.split, "below");
+  assert.equal(p.share_preview, true);
+
+  const saved = defaultUiPrefs();
+  saved.stream_chat.modern = { open: true, split: "below", width: 500, height: 300 };
+  saved.share_preview = false;
+  assert.deepEqual(sanitizeUiPrefs(structuredClone(saved)), saved);
+});
+
+test("a stream chat size is clamped and a bad split falls back", () => {
+  const p = sanitizeUiPrefs({
+    stream_chat: {
+      modern: { open: "yes", split: "diagonal", width: 9000, height: 3 },
+      classic: "nonsense",
+    },
+    share_preview: "maybe",
+  });
+  assert.equal(p.stream_chat.modern.open, false);
+  assert.equal(p.stream_chat.modern.split, "side");
+  assert.equal(p.stream_chat.modern.width, STREAM_CHAT_WIDTH_MAX);
+  assert.equal(p.stream_chat.modern.height, STREAM_CHAT_HEIGHT_MIN);
+  assert.deepEqual(p.stream_chat.classic, defaultStreamChat("classic"));
+  assert.equal(p.share_preview, true);
 });

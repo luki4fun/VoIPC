@@ -5,7 +5,14 @@
   // admin dialogs are AdminDialogs.svelte, both because the modern layout shows
   // the same things somewhere else and neither should be computed twice.
 
-  import { connectionState, serverAddress, latency, isAdmin } from "../stores/connection.js";
+  import {
+    connectionState,
+    serverAddress,
+    latency,
+    viaTcp,
+    TCP_HINT,
+    isAdmin,
+  } from "../stores/connection.js";
   import { viewingVoice } from "../stores/channels.js";
   import { lossPercent, quality } from "../stores/connection-quality.js";
   import { openAdminPanel, showAdminLogin } from "../stores/admin-ui.js";
@@ -42,8 +49,11 @@
   </div>
 
   {#if $connectionState === "connected"}
-    <span class="latency quality-{$viewingVoice ? $quality : 'good'}" title="Voice packet loss (2s window)">
-      Ping: {$latency}ms{#if loss > 0}&nbsp;· {loss}% loss{/if}
+    <span
+      class="latency quality-{$viewingVoice ? $quality : 'good'}"
+      title={$viaTcp ? `${TCP_HINT} Voice packet loss (2s window)` : "Voice packet loss (2s window)"}
+    >
+      Ping: {$latency}ms{#if $viaTcp}&nbsp;· TCP{/if}{#if loss > 0}&nbsp;· {loss}% loss{/if}
     </span>
     <button
       class="admin-btn"

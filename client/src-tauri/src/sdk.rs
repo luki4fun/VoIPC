@@ -20,7 +20,7 @@
 //! VoIPC → game
 //!   {"type":"state","state":"ingame","user_id":42,"username":"Luki#0420",
 //!    "channel":"Ingame","proximity":"3d","muted":false,"deafened":false,
-//!    "version":"0.10.1","sdk":1,
+//!    "version":"0.11.0","sdk":1,
 //!    "capabilities":["spatial","direct","volume","muffle","radio","phone","talk",
 //!                    "reverb","underwater"]}
 //!   {"type":"talk","user_id":42,"speaking":true}
@@ -38,7 +38,6 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use base64::Engine as _;
 use serde::Deserialize;
 use tauri::{Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -50,11 +49,10 @@ use voipc_audio::spatial::{
     MAX_UNDERWATER,
 };
 use voipc_protocol::types::ProximityMode;
+use voipc_protocol::ws;
 
 use crate::app_state::{AppState, Motion, SdkEvent, MAX_GLIDE, MIN_GLIDE};
 
-/// RFC 6455 handshake constant.
-const WS_GUID: &str = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 /// Largest HTTP upgrade request we read before giving up.
 const MAX_HANDSHAKE: usize = 8 * 1024;
 /// Largest WebSocket frame we accept (a bulk update of a full server).
@@ -1602,8 +1600,8 @@ fn server_matches(expected: &str, actual: &str) -> bool {
 // ── WebSocket (the subset a game's web view speaks) ──────────────────────
 
 // bernd: text frames, no fragmentation, no extensions — a NUI page sends
-// one small JSON object per frame. tokio-tungstenite if a client ever needs
-// more than that.
+// one small JSON object per frame. The framing is voipc_protocol::ws, which
+// the TCP fallback shares; tokio-tungstenite if a client ever needs more.
 
 #[derive(Debug)]
 enum Frame {
@@ -1613,46 +1611,6 @@ enum Frame {
     Other,
 }
 
-/// What the upgrade request carried, once it passed validation.
-#[derive(Debug, PartialEq, Eq)]
-struct Upgrade {
-    key: String,
-    origin: Option<String>,
-}
-
-/// Parse the HTTP upgrade request. `Err` is the status line to answer with.
-fn parse_handshake(head: &str) -> Result<Upgrade, &'static str> {
-    let mut lines = head.lines();
-    if !lines.next().unwrap_or("").starts_with("GET ") {
-        return Err("405 Method Not Allowed");
-    }
-    let (mut key, mut origin, mut upgrade, mut version) = (None, None, false, false);
-    for line in lines {
-        let Some((name, value)) = line.split_once(':') else {
-            continue;
-        };
-        let value = value.trim();
-        match name.trim().to_ascii_lowercase().as_str() {
-            "sec-websocket-key" => key = Some(value.to_string()),
-            "origin" => origin = Some(value.to_string()),
-            "upgrade" => upgrade = value.eq_ignore_ascii_case("websocket"),
-            "sec-websocket-version" => version = value == "13",
-            _ => {}
-        }
-    }
-    if !upgrade {
-        return Err("400 Bad Request");
-    }
-    if !version {
-        // RFC 6455 §4.2.2: the reply names the version we do speak
-        return Err("426 Upgrade Required");
-    }
-    Ok(Upgrade {
-        key: key.ok_or("400 Bad Request")?,
-        origin,
-    })
-}
-
 /// One frame from the front of `buf`, and how many bytes it used; `None` while
 /// it is still incomplete.
 ///
@@ -1660,54 +1618,20 @@ fn parse_handshake(head: &str) -> Result<Upgrade, &'static str> {
 /// until a whole frame is there, so a `select!` that drops the future mid-read
 /// loses nothing.
 fn parse_frame(buf: &[u8]) -> anyhow::Result<Option<(Frame, usize)>> {
-    if buf.len() < 2 {
+    // RFC 6455 §5.1: a client frame that is not masked fails the connection
+    let Some((frame, used)) = ws::parse_frame(buf, true, MAX_FRAME)? else {
         return Ok(None);
-    }
-    let (fin, opcode, masked) = (buf[0] & 0x80 != 0, buf[0] & 0x0f, buf[1] & 0x80 != 0);
-    if !fin || opcode == 0 {
+    };
+    if !frame.fin || frame.opcode == ws::OP_CONTINUATION {
         anyhow::bail!("fragmented frames are not supported");
     }
-    // RFC 6455 §5.1: a client frame that is not masked fails the connection
-    if !masked {
-        anyhow::bail!("unmasked client frame");
-    }
-    let mut len = (buf[1] & 0x7f) as usize;
-    let mut at = 2;
-    if len == 126 {
-        if buf.len() < 4 {
-            return Ok(None);
-        }
-        len = u16::from_be_bytes([buf[2], buf[3]]) as usize;
-        at = 4;
-    } else if len == 127 {
-        if buf.len() < 10 {
-            return Ok(None);
-        }
-        len = u64::from_be_bytes(buf[2..10].try_into().unwrap()) as usize;
-        at = 10;
-    }
-    // Checked before the payload arrives, so a huge claim costs nothing
-    if len > MAX_FRAME {
-        anyhow::bail!("frame of {len} bytes exceeds the {MAX_FRAME} byte limit");
-    }
-    if buf.len() < at + 4 + len {
-        return Ok(None);
-    }
-    let mask = [buf[at], buf[at + 1], buf[at + 2], buf[at + 3]];
-    at += 4;
-    let payload: Vec<u8> = buf[at..at + len]
-        .iter()
-        .enumerate()
-        .map(|(i, b)| b ^ mask[i % 4])
-        .collect();
-    at += len;
-    let frame = match opcode {
-        0x1 => Frame::Text(String::from_utf8(payload)?),
-        0x8 => Frame::Close,
-        0x9 => Frame::Ping(payload),
+    let frame = match frame.opcode {
+        ws::OP_TEXT => Frame::Text(String::from_utf8(frame.payload)?),
+        ws::OP_CLOSE => Frame::Close,
+        ws::OP_PING => Frame::Ping(frame.payload),
         _ => Frame::Other,
     };
-    Ok(Some((frame, at)))
+    Ok(Some((frame, used)))
 }
 
 /// Read and answer the upgrade request.
@@ -1730,7 +1654,7 @@ async fn handshake(
             anyhow::bail!("client closed during handshake");
         }
         buf.extend_from_slice(&chunk[..n]);
-        if let Some(end) = find_header_end(&buf) {
+        if let Some(end) = ws::find_header_end(&buf) {
             break end;
         }
         if buf.len() > MAX_HANDSHAKE {
@@ -1740,7 +1664,7 @@ async fn handshake(
     let head = String::from_utf8_lossy(&buf[..end]).into_owned();
     let leftover = buf.split_off(end);
 
-    let upgrade = match parse_handshake(&head) {
+    let upgrade = match ws::parse_upgrade(&head) {
         Ok(u) => u,
         Err(status) => {
             reject(stream, status).await;
@@ -1776,7 +1700,7 @@ async fn handshake(
          Upgrade: websocket\r\n\
          Connection: Upgrade\r\n\
          Sec-WebSocket-Accept: {}\r\n\r\n",
-        accept_key(&upgrade.key)
+        crate::transport::accept_key(&upgrade.key)
     );
     stream.write_all(response.as_bytes()).await?;
     Ok((leftover, upgrade.origin, slot))
@@ -1793,19 +1717,6 @@ async fn reject(stream: &mut TcpStream, status: &str) {
             .as_bytes(),
         )
         .await;
-}
-
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
-}
-
-/// RFC 6455: base64(SHA-1(key + GUID)).
-fn accept_key(key: &str) -> String {
-    let digest = ring::digest::digest(
-        &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
-        format!("{key}{WS_GUID}").as_bytes(),
-    );
-    base64::engine::general_purpose::STANDARD.encode(digest.as_ref())
 }
 
 fn origin_allowed(origin: &str, extra: &[String]) -> bool {
@@ -1864,18 +1775,8 @@ async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
     payload: &[u8],
 ) -> anyhow::Result<()> {
     let mut frame = Vec::with_capacity(payload.len() + 10);
-    frame.push(0x80 | opcode);
     // Server frames are never masked
-    if payload.len() < 126 {
-        frame.push(payload.len() as u8);
-    } else if payload.len() <= u16::MAX as usize {
-        frame.push(126);
-        frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    } else {
-        frame.push(127);
-        frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-    }
-    frame.extend_from_slice(payload);
+    ws::encode_frame(&mut frame, opcode, &[payload], None);
     stream.write_all(&frame).await?;
     Ok(())
 }
@@ -1883,15 +1784,6 @@ async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn accept_key_matches_the_rfc_example() {
-        // RFC 6455 §1.3
-        assert_eq!(
-            accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
-            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
-        );
-    }
 
     #[test]
     fn origins_are_limited_to_game_runtimes_unless_allowed() {
@@ -2057,29 +1949,14 @@ mod tests {
     /// The framing half of `write_frame`, without a socket.
     fn frame_bytes(opcode: u8, payload: &[u8]) -> Vec<u8> {
         let mut frame = Vec::new();
-        frame.push(0x80 | opcode);
-        if payload.len() < 126 {
-            frame.push(payload.len() as u8);
-        } else if payload.len() <= u16::MAX as usize {
-            frame.push(126);
-            frame.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-        } else {
-            frame.push(127);
-            frame.extend_from_slice(&(payload.len() as u64).to_be_bytes());
-        }
-        frame.extend_from_slice(payload);
+        ws::encode_frame(&mut frame, opcode, &[payload], None);
         frame
     }
 
     /// A client frame, which unlike a server frame must be masked.
     fn masked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
-        let mask = [0xA1u8, 0xB2, 0xC3, 0xD4];
         let mut frame = Vec::new();
-        frame.push(0x80 | opcode);
-        assert!(payload.len() < 126, "test helper only does short frames");
-        frame.push(0x80 | payload.len() as u8);
-        frame.extend_from_slice(&mask);
-        frame.extend(payload.iter().enumerate().map(|(i, b)| b ^ mask[i % 4]));
+        ws::encode_frame(&mut frame, opcode, &[payload], Some([0xA1, 0xB2, 0xC3, 0xD4]));
         frame
     }
 
@@ -2089,7 +1966,7 @@ mod tests {
 
     #[test]
     fn the_handshake_requires_a_websocket_upgrade() {
-        let ok = parse_handshake(UPGRADE).expect("a valid upgrade was refused");
+        let ok = ws::parse_upgrade(UPGRADE).expect("a valid upgrade was refused");
         assert_eq!(ok.key, "dGhlIHNhbXBsZSBub25jZQ==");
         assert!(ok.origin.is_none(), "a native client sends no Origin");
 
@@ -2100,15 +1977,15 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\r\n")
         };
-        assert_eq!(parse_handshake(&without("upgrade")), Err("400 Bad Request"));
-        assert_eq!(parse_handshake(&without("sec-websocket-key")), Err("400 Bad Request"));
+        assert_eq!(ws::parse_upgrade(&without("upgrade")), Err("400 Bad Request"));
+        assert_eq!(ws::parse_upgrade(&without("sec-websocket-key")), Err("400 Bad Request"));
         // A version we do not speak gets 426, and the reply names 13
         assert_eq!(
-            parse_handshake(&UPGRADE.replace("Version: 13", "Version: 8")),
+            ws::parse_upgrade(&UPGRADE.replace("Version: 13", "Version: 8")),
             Err("426 Upgrade Required")
         );
         assert_eq!(
-            parse_handshake(&UPGRADE.replace("GET /", "POST /")),
+            ws::parse_upgrade(&UPGRADE.replace("GET /", "POST /")),
             Err("405 Method Not Allowed")
         );
     }

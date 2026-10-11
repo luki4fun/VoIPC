@@ -1,7 +1,7 @@
 <script lang="ts">
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
-  import { onMount } from "svelte";
+  import { onMount, untrack } from "svelte";
   import { get } from "svelte/store";
 
   import ConnectDialog from "./lib/components/ConnectDialog.svelte";
@@ -15,6 +15,7 @@
   import ClassicShell from "./lib/components/shell/ClassicShell.svelte";
   import ModernShell from "./lib/components/modern/ModernShell.svelte";
   import UserContextMenu from "./lib/components/UserContextMenu.svelte";
+  import SharePreview from "./lib/components/SharePreview.svelte";
   import ChannelDialogs from "./lib/components/ChannelDialogs.svelte";
   import AdminDialogs from "./lib/components/AdminDialogs.svelte";
 
@@ -23,6 +24,7 @@
     serverAddress,
     userId,
     latency,
+    viaTcp,
     isMuted,
     isDeafened,
     isTransmitting,
@@ -107,7 +109,13 @@
     defaultServer,
   } from "./lib/stores/settings.js";
   import type { AppConfig, SavedServer } from "./lib/stores/settings.js";
-  import { hydrateUiPrefs, layoutAskedVersion, uiLayout, uiPrefsReady } from "./lib/stores/ui-prefs.js";
+  import {
+    hydrateUiPrefs,
+    layoutAskedVersion,
+    uiLayout,
+    uiPrefs,
+    uiPrefsReady,
+  } from "./lib/stores/ui-prefs.js";
   import {
     channelRosters,
     currentRosterOf,
@@ -170,6 +178,9 @@
     receiverBitrate,
     receiverResolution,
     receiverFramesDropped,
+    previewFrame,
+    previewShown,
+    streamStage,
   } from "./lib/stores/screenshare.js";
 
   // Look up channel name by numeric ID (stable key for chat history). Per
@@ -380,6 +391,35 @@
       pendingAutoConnect = null;
       reconnectAll(list);
     }
+  });
+
+  // ── Our share's capture ──
+  //
+  // Native capture runs while anybody watches, or while our own preview is on
+  // screen — then with nothing encoded or sent until a viewer arrives
+  // (FrameProcessor::process). The browser previews straight from its
+  // MediaStream, so there only viewers start the encoder. No "capturing" flag
+  // here: Rust also stops capture by itself (stop, a channel move, a failed
+  // source switch), and both commands are safe to repeat.
+  const captureWanted = $derived(
+    $isSharingScreen && ($viewerCount > 0 || (!isWeb && $previewShown)),
+  );
+  $effect(() => {
+    if (captureWanted) {
+      const [resolution, fps] = untrack(() => [$shareResolution, $shareFps]);
+      invoke("start_screen_capture", { resolution, fps }).catch((e: any) => {
+        console.error("Failed to start capture:", e);
+        addNotification(`Failed to start screen capture: ${e}`, "error");
+      });
+    } else if (untrack(() => $isSharingScreen)) {
+      invoke("stop_screen_capture").catch((e: any) => console.error("Failed to stop capture:", e));
+    }
+  });
+
+  // The capture task renders the preview only while it is on screen
+  $effect(() => {
+    if (isWeb) return;
+    invoke("set_share_preview", { on: $previewShown }).catch(() => {});
   });
 
   // Close pop-out window when watching stops
@@ -852,8 +892,9 @@
         });
       }),
 
-      listenServer<{ ms: number }>("latency-update", (server, data) => {
+      listenServer<{ ms: number; tcp?: boolean }>("latency-update", (server, data) => {
         latency.of(server).set(data.ms);
+        viaTcp.of(server).set(data.tcp === true);
       }),
 
       listenServer<{ reason: string }>("connection-lost", (server, data) => {
@@ -1309,24 +1350,8 @@
 
       listenServer<{ viewer_count: number }>("viewer-count-changed", (server, data) => {
         if (!inVoice(server)) return;
-        const count = data.viewer_count;
-        const prevCount = $viewerCount;
-        viewerCount.set(count);
-
-        // Start/stop capture based on viewer count
-        if (prevCount === 0 && count > 0 && $isSharingScreen) {
-          invoke("start_screen_capture", {
-            resolution: $shareResolution,
-            fps: $shareFps,
-          }).catch((e: any) => {
-            console.error("Failed to start capture:", e);
-            addNotification(`Failed to start screen capture: ${e}`, "error");
-          });
-        } else if (count === 0 && prevCount > 0) {
-          invoke("stop_screen_capture").catch((e: any) =>
-            console.error("Failed to stop capture:", e)
-          );
-        }
+        // Capture follows this (captureWanted, above)
+        viewerCount.set(data.viewer_count);
       }),
 
       listenServer("keyframe-requested", (server) => {
@@ -1340,6 +1365,7 @@
         // off under us): stop capturing rather than sending into the void.
         if (inVoice(server) && $isSharingScreen) {
           isSharingScreen.set(false);
+          viewerCount.set(0);
           invoke("stop_screen_capture").catch(() => {});
         }
       }),
@@ -1348,10 +1374,16 @@
         currentFrame.set(event.payload);
       }),
 
+      // What our own share sends, for the preview (native only)
+      listen<string>("screenshare-preview", (event) => {
+        if ($isSharingScreen) previewFrame.set(event.payload);
+      }),
+
       // Screen share force-stopped by server (channel change, kick, etc.)
       listenServer("screen-share-force-stopped", (server) => {
         if (!inVoice(server)) return;
         isSharingScreen.set(false);
+        viewerCount.set(0);
         watchingUserId.set(null);
         currentFrame.set(null);
         invoke("stop_screen_capture").catch(() => {});
@@ -1491,6 +1523,11 @@
 
 <!-- The member menu and the channel dialogs, shared by every list there is. -->
 <UserContextMenu />
+
+<!-- Our own share, small; the stream view shows it big instead -->
+{#if $isSharingScreen && $uiPrefs.share_preview && $streamStage !== "preview" && !showSettings}
+  <SharePreview />
+{/if}
 <ChannelDialogs />
 <AdminDialogs />
 

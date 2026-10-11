@@ -266,6 +266,11 @@ pub(crate) fn run_encode_loop(slot: &FrameSlot, mut processor: FrameProcessor) {
     while processor.active.load(Ordering::Relaxed) {
         let Some(mut frame) = slot.take_timeout(IDLE_TICK) else {
             if let Some(frame) = &last {
+                // A preview switched on over a still screen has nothing new
+                // coming; it gets the last frame once
+                if processor.preview_at.is_none() {
+                    processor.render_preview(frame);
+                }
                 if processor.keyframe_requested.load(Ordering::Relaxed)
                     || idr_due(processor.last_idr)
                 {
@@ -284,6 +289,9 @@ pub(crate) fn run_encode_loop(slot: &FrameSlot, mut processor: FrameProcessor) {
             }
         }
         due = (due + interval).max(at);
+        // Fresh frames only: the idle re-encode above repeats `last`, and a
+        // still screen does not need the same picture sent to the UI again.
+        processor.render_preview(&frame);
         processor.process(&frame);
         if let Some(old) = last.replace(frame) {
             slot.recycle(old.pixels);
@@ -450,10 +458,110 @@ pub(crate) struct FrameProcessor {
     pub channel_id: Arc<AtomicU32>,
     pub frames_sent: Arc<AtomicU32>,
     pub bytes_sent: Arc<AtomicU64>,
+    /// People watching (`ActiveConnection::share_viewers`). Capture also runs
+    /// for the sharer's own preview with nobody watching; nothing is encoded
+    /// or sent then.
+    pub viewers: Arc<AtomicU32>,
+    /// Whether the last frame had anyone to go to: the first one that does
+    /// is a keyframe.
+    pub watched: bool,
+    /// The sharer's own preview is on screen (`set_share_preview`).
+    pub preview: Arc<AtomicBool>,
+    pub app: tauri::AppHandle,
+    /// Source → stream size in RGB, for the preview JPEG. Rebuilt like the
+    /// encoder's converter when the source changes.
+    pub preview_conv: Option<convert::FrameConverter>,
+    pub preview_jpeg: Option<turbojpeg::Compressor>,
+    /// Last preview rendered; None while it is off, or not drawn yet.
+    pub preview_at: Option<Instant>,
 }
+
+/// How often the sharer's own preview is redrawn. It is a check of what goes
+/// out, not the stream itself, and every frame of it is a JPEG over IPC.
+#[cfg(not(target_os = "android"))]
+const PREVIEW_INTERVAL: Duration = Duration::from_millis(100);
 
 #[cfg(not(target_os = "android"))]
 impl FrameProcessor {
+    /// Show the sharer what they send: the frame at the stream's own size and
+    /// scaling, as a JPEG data URL on `screenshare-preview`, at most every
+    /// `PREVIEW_INTERVAL`.
+    ///
+    /// bernd: a second scale/convert pass beside the encoder's, which on most
+    /// encoders already holds the same picture in YUV. Reuse that if this
+    /// ever shows in a profile.
+    pub fn render_preview(&mut self, frame: &CapturedFrame) {
+        if !self.preview.load(Ordering::Relaxed) {
+            // Shown again later, it starts from the last frame (run_encode_loop)
+            self.preview_at = None;
+            return;
+        }
+        if self.preview_at.is_some_and(|t| t.elapsed() < PREVIEW_INTERVAL) {
+            return;
+        }
+        let fmt = match frame.fmt {
+            PixFmt::Bgra | PixFmt::Bgrx => convert::Pixel::BGRA,
+            PixFmt::Rgba | PixFmt::Rgbx => convert::Pixel::RGBA,
+            PixFmt::Unknown => return,
+        };
+        let (src_w, src_h) = (frame.width as u32, frame.height as u32);
+        if self
+            .preview_conv
+            .as_ref()
+            .is_some_and(|c| c.src_dims() != (src_w, src_h) || c.input_format() != fmt)
+        {
+            self.preview_conv = None;
+        }
+        let (tw, th) = (self.target_width, self.target_height);
+        let conv = match &mut self.preview_conv {
+            Some(c) => c,
+            None => match convert::FrameConverter::new(fmt, src_w, src_h, tw, th, convert::Pixel::RGB24) {
+                Ok(c) => self.preview_conv.insert(c),
+                Err(e) => {
+                    warn!("preview converter: {e}");
+                    // Retried at the preview's rate, not on every frame
+                    self.preview_at = Some(Instant::now());
+                    return;
+                }
+            },
+        };
+        self.preview_at = Some(Instant::now());
+        let rgb = match conv.convert_strided(&frame.pixels, frame.stride) {
+            Ok(f) => f,
+            Err(e) => {
+                warn!("preview convert: {e}");
+                self.preview_conv = None;
+                return;
+            }
+        };
+        if self.preview_jpeg.is_none() {
+            match FrameDecodeBuffers::new() {
+                Ok(b) => self.preview_jpeg = Some(b.compressor),
+                Err(e) => {
+                    warn!("preview JPEG: {e}");
+                    return;
+                }
+            }
+        }
+        let Some(jpeg) = self.preview_jpeg.as_mut() else { return };
+        let image = turbojpeg::Image {
+            pixels: rgb.data(0),
+            width: tw as usize,
+            pitch: rgb.stride(0),
+            height: th as usize,
+            format: turbojpeg::PixelFormat::RGB,
+        };
+        match jpeg.compress_to_vec(image) {
+            Ok(data) => {
+                let b64 = base64::engine::general_purpose::STANDARD.encode(&data);
+                let data_url = format!("data:image/jpeg;base64,{b64}");
+                // The main window's: the popout shows somebody else's share
+                let _ = self.app.emit_to("main", "screenshare-preview", &data_url);
+            }
+            Err(e) => warn!("preview JPEG encode: {e}"),
+        }
+    }
+
     /// Step the quality ladder if the loss picture changed: rebuilds the
     /// encoder at the new bitrate/fps (a fresh encoder starts with an IDR,
     /// which the viewers need anyway). Keeps the old encoder if the rebuild
@@ -511,6 +619,20 @@ impl FrameProcessor {
             stride,
             fmt,
         } = *frame;
+
+        // Nobody watching: capture runs for the sharer's preview alone. Before
+        // the ladder, the media key and the keyframe swap, so an owed keyframe
+        // stays owed; and the first watched frame is one, since a viewer
+        // arriving within the IDR interval would otherwise start on deltas and
+        // the server's keyframe relay is rate-limited.
+        let watched = self.viewers.load(Ordering::Relaxed) > 0;
+        if watched && !self.watched {
+            self.keyframe_requested.store(true, Ordering::Relaxed);
+        }
+        self.watched = watched;
+        if !watched {
+            return;
+        }
 
         // Congestion control first: a new level rebuilds the encoder and owes
         // an IDR; its fps divisor is paced by time in `run_encode_loop`.
@@ -879,13 +1001,16 @@ pub(crate) struct AudioProcessor {
     pub resampler: Option<(u32, voipc_audio::resample::LinearResampler)>,
     /// Scratch for the downmixed mono chunk before resampling.
     pub mono_buf: Vec<f32>,
+    /// People watching; with none, capture runs for the video preview only
+    /// and no screen audio is sent.
+    pub viewers: Arc<AtomicU32>,
 }
 
 #[cfg(not(target_os = "android"))]
 impl AudioProcessor {
     /// Process raw f32 audio bytes: downmix to mono, accumulate, Opus-encode, send.
     pub fn process(&mut self, raw_data: &[u8]) {
-        if !self.audio_enabled.load(Ordering::Relaxed) {
+        if !self.audio_enabled.load(Ordering::Relaxed) || self.viewers.load(Ordering::Relaxed) == 0 {
             self.accumulator.clear();
             return;
         }

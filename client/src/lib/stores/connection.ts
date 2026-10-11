@@ -19,6 +19,14 @@ export const username = scoped<string>(() => "");
 export const userId = scoped<number>(() => 0);
 export const sessionId = writable<number>(0);
 export const latency = scoped<number>(() => 0);
+/**
+ * The session runs over the server's TCP fallback: UDP does not get through,
+ * so voice and video share one TCP stream and stall on every lost packet.
+ */
+export const viaTcp = scoped<boolean>(() => false);
+/** What the "· TCP" next to the ping means, for its tooltip. */
+export const TCP_HINT =
+  "UDP does not get through to this server, so everything runs over its TCP fallback — voice stalls whenever a packet is lost.";
 /** Mute and deafen are ours, not a server's: one flag, sent to every server. */
 export const isMuted = writable<boolean>(false);
 export const isDeafened = writable<boolean>(false);

@@ -15,8 +15,10 @@ export interface ResizeOptions {
   prop: string;
   min: number;
   max: number;
-  /** Dragging left grows the panel (a handle on the panel's left edge). */
+  /** Dragging left (or up) grows the panel: a handle on its left (top) edge. */
   invert?: boolean;
+  /** "y" sizes a height, dragged up and down. Default "x", a width. */
+  axis?: "x" | "y";
   /** Current width, read when a drag starts. */
   current: () => number;
   /** What a double-click on the handle goes back to. */
@@ -27,10 +29,12 @@ export interface ResizeOptions {
 
 export function resizeHandle(node: HTMLElement, options: ResizeOptions) {
   let opts = options;
-  let startX = 0;
+  let start = 0;
   let startWidth = 0;
   let width = 0;
   let dragging = false;
+
+  const pos = (e: PointerEvent) => (opts.axis === "y" ? e.clientY : e.clientX);
 
   function clamp(px: number): number {
     return Math.min(opts.max, Math.max(opts.min, Math.round(px)));
@@ -41,18 +45,18 @@ export function resizeHandle(node: HTMLElement, options: ResizeOptions) {
     e.preventDefault();
     node.setPointerCapture(e.pointerId);
     dragging = true;
-    startX = e.clientX;
+    start = pos(e);
     startWidth = opts.current();
     width = startWidth;
     // The centre column is not covered by app.css's user-select rule, so a
     // drag across it would otherwise select the whole conversation.
     document.body.style.userSelect = "none";
-    document.body.style.cursor = "col-resize";
+    document.body.style.cursor = opts.axis === "y" ? "row-resize" : "col-resize";
   }
 
   function onPointerMove(e: PointerEvent) {
     if (!dragging) return;
-    const delta = opts.invert ? startX - e.clientX : e.clientX - startX;
+    const delta = opts.invert ? start - pos(e) : pos(e) - start;
     width = clamp(startWidth + delta);
     // Straight to the element, deliberately bypassing Svelte: pushing sixty
     // updates a second through a store would re-run every $derived that reads

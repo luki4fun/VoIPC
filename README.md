@@ -155,7 +155,7 @@ No accounts. No telemetry. No compromises.
 - Voice quality indicator: live ping + packet-loss % in the status bar
 - One QUIC connection per client — connection migration survives NAT rebinds, Wi-Fi roams and address changes
 - Auto-reconnect keeps trying for 5 minutes (laptop sleep, server restart)
-- A blocked UDP port fails the connect with a clear error instead of a silent mute
+- UDP blocked on the way? With the server's TCP fallback on, the session moves to TCP by itself (the status bar says **· TCP**); without it, the connect fails with an error that says so instead of a silent mute
 - Screen share adapts bitrate and frame rate to what the link carries (viewers report loss, the sharer steps down)
 - Server admin session: log in with the server's admin token (status bar shield) to kick users from any channel or from the server and to IP-ban them for 1 h, 24 h or until restart; bans are memory-only and listed with an Unban button
 
@@ -273,6 +273,9 @@ Client-side data at rest:
   channels, chat, encryption key exchange) on a bidirectional stream, voice and screen-share
   audio as datagrams, each video frame on its own unidirectional stream. NAT rebinds and
   address changes are handled by QUIC connection migration
+- **TCP fallback** (opt-in, `tcp_fallback`): where UDP does not get through, clients carry
+  the same session through a WebSocket on the server's TLS port — control, voice and video,
+  voice first — and the server relays it exactly as it relays QUIC
 - **SFU** (Selective Forwarding Unit) — server relays encrypted packets without decoding
 - **HTTP/2 page** for browsers: the same origin serves the web client, which then opens the
   same QUIC endpoint the desktop app uses. Browsers get no plaintext the native clients
@@ -305,7 +308,7 @@ Client-side data at rest:
 | Max video packet | 1,280 bytes |
 | Max control message | 64 KiB |
 | Protocol version | v8 |
-| Default port | 9987 — UDP for QUIC (all clients), TCP for the browser page |
+| Default port | 9987 — UDP for QUIC (all clients), TCP for the browser page and the TCP fallback |
 
 ### Project Structure
 
@@ -313,7 +316,7 @@ Client-side data at rest:
 VoIPC/
 ├── crates/
 │   ├── voipc-protocol/     # Message types, packet formats, codec
-│   ├── voipc-server/       # Server binary (QUIC/WebTransport endpoint + HTTPS page)
+│   ├── voipc-server/       # Server binary (QUIC/WebTransport endpoint, HTTPS page, TCP fallback)
 │   ├── voipc-audio/        # Capture, playback, Opus, RNNoise, VAD, jitter buffer
 │   ├── voipc-video/        # H.264/H.265 encoding, H.264/H.265/VP8/VP9 decoding, fragment assembly
 │   ├── voipc-crypto/       # Signal Protocol, AES-256-GCM, key management
@@ -321,7 +324,7 @@ VoIPC/
 ├── client/
 │   ├── src-tauri/src/      # Tauri Rust backend (network, crypto, state, commands)
 │   │   ├── screenshare/    # Platform-specific capture (linux.rs, windows.rs)
-│   │   ├── transport.rs    # QUIC connection, certificate pinning (TOFU)
+│   │   ├── transport.rs    # QUIC connection or TCP fallback, certificate pinning (TOFU)
 │   │   ├── network.rs      # Control/media tasks, Signal session setup
 │   │   ├── crypto.rs       # Chat history encryption (PBKDF2 + AES-256-GCM)
 │   │   ├── app_state.rs    # Central app state (connections, audio, crypto)
@@ -366,8 +369,9 @@ connects to, TCP for the browser page. Configure via `server.toml`:
 
 ```toml
 host = "::"               # Bind address — "::" serves IPv6 and IPv4 from one listener; "0.0.0.0" for IPv4 only
-tcp_port = 9987           # HTTPS page for the browser client
+tcp_port = 9987           # HTTPS page for the browser client (and the TCP fallback)
 udp_port = 9987           # QUIC endpoint (all clients) — keep equal to tcp_port so one host:port reaches both
+tcp_fallback = false      # true: clients that cannot reach UDP carry everything over tcp_port (see below)
 max_users = 64
 max_connections_per_ip = 32   # A browser client holds two of these, a native client one — so 32 is sixteen browser users behind one NAT
 cert_path = "certs/server.crt"
@@ -376,6 +380,16 @@ admin_token = "change-me"  # optional; unset = a random token is printed in the 
 ```
 
 > **IPv6:** `host = "::"` is the default and serves both families from one listener (a host with IPv6 disabled falls back to `0.0.0.0` automatically). Do not pin `host` to a concrete IPv4 address while your domain publishes an AAAA record: the browser client then fails while everything else looks healthy, because the page and `/wt.json` are TCP and Chrome quietly falls back to IPv4 after the refused IPv6 attempt, while the WebTransport session is UDP and has no such fallback — it dies with `ERR_QUIC_PROTOCOL_ERROR`.
+
+> **UDP blocked?** Some hosts drop UDP in front of the server (a provider firewall, an
+> anti-DDoS filter): the page loads, but every client times out connecting over QUIC.
+> `sudo tools/udp-diag.sh` finds where the packets die. Where UDP cannot be opened, set
+> `tcp_fallback = true` (or pass `--tcp-fallback`): a client that does not get through over
+> QUIC within two seconds then carries the whole session — control, voice, video — through
+> a WebSocket on `tcp_port`, the port the page already uses. TCP waits for every lost packet,
+> so on a lossy network voice lags more than over QUIC; the status bar says **· TCP** while
+> it is in use. Desktop and Android clients dial the fallback on the port they were given,
+> so keep `tcp_port` equal to `udp_port`.
 
 > **VPN / multi-homed setups:** If clients connect via a domain name (e.g. `vpn.example.com`) that resolves to a specific IP, set `host` to that IP. Otherwise the server may send QUIC packets from the wrong interface and the handshake never completes. All options can also be passed as CLI flags (`--host`, `--tcp-port`, `--udp-port`, etc.).
 
@@ -426,7 +440,7 @@ Because it reaches them that way, it is that member's word: identities are ephem
 - **Deleting is permanent.** Clearing a channel records what was there, and nothing older is merged back in — so what you deleted stays deleted, however often a member re-offers it. The history button in the chat header asks the sharers again and takes that back, for when you cleared it by accident
 - **History is kept per server**, and on desktop in an encrypted file you unlock with a password (Settings → Data, or turn it off and keep chat in memory only). Two servers' `#general` are two conversations, which also means a server cannot ask for what its users wrote somewhere else
 - **Conversations are filed by server and by the name of the person**, so a DM you had yesterday is not shown as one with whoever happens to hold that user id today. Which also means a name is what a conversation follows: on a server where somebody else takes a name after its owner leaves, the two look like one person to your archive — there are no accounts, and the server only keeps a name unique while the person holding it is online
-- **What the server can still do:** it decides who is in a channel, so it can place somebody there and the members will hand them a key. End-to-end encryption means the server cannot read what is said — not that it cannot add a listener. It has to do it in the open, though: a client accepts a sender key, accepts a media key, answers a request for history and shows a message only from somebody the roster says is in the channel with it, so an added listener is one the member list shows. Accounts with lasting identities are what would close the gap entirely, and they are not here yet
+- **What the server can still do:** it decides who is in a channel, so it can place somebody there and the members will hand them a key. End-to-end encryption means the server cannot read what is said — not that it cannot add a listener. It has to do it in the open, though: a client accepts a sender key, accepts a media key, answers a request for history and shows a message only from somebody the roster says is in the channel with it, so an added listener is one the member list shows. That holds against a server that seats somebody, not against one that swaps the keys it relays: identities are made fresh for every connection and nobody verifies them, so a server that hands out its own keys in place of a member's can still read along unseen. Accounts with lasting identities are what would close that gap, and they are not here yet
 
 **Server administration:** there are no accounts; any connected user becomes admin for their session by entering the admin token (status bar → shield icon). Set `admin_token` in `server.toml`, pass `--admin-token`, or export `VOIPC_ADMIN_TOKEN`; without one the server prints a fresh random token in its log at every start. Admins can kick users from channels or from the server and ban an IP for 1 h, 24 h or until restart — everyone behind that IP is affected, and bans live in memory only. Other users see a shield next to an admin's name. Three wrong tokens disconnect the session.
 
@@ -475,7 +489,8 @@ https://your-server:9987
 
 The server binary serves the web client over HTTP/2 and carries voice, video and control
 messages over WebTransport on the same UDP port the desktop app uses (**9987**) — no extra
-port to open. With a self-signed certificate the browser shows a warning on the first visit;
+port to open. Where UDP is blocked and the server has its TCP fallback on, the page carries
+the session through a WebSocket on its own TCP port instead. With a self-signed certificate the browser shows a warning on the first visit;
 accept it once and the app works (generate the certificate with a `subjectAltName`, see the
 openssl line above, or use a real certificate from a CA). Browsers pin the QUIC endpoint by
 certificate hash, so for them the server presents a short-lived certificate it generates,
@@ -571,7 +586,17 @@ VoIPC is MIT licensed. Contributions are welcome.
 
 ## License
 
-[MIT](LICENSE)
+VoIPC's own source code is [MIT](LICENSE).
+
+The binaries are built with third-party code under other licences, and whoever passes them on
+does so under those terms as well:
+
+- **[libsignal](https://github.com/signalapp/libsignal)**, the end-to-end encryption, is
+  **AGPL-3.0-only**. It is linked into the desktop and Android clients, the server and the
+  browser client's WebAssembly.
+- **FFmpeg** is **GPL** in the builds VoIPC bundles: the Windows installer ships BtbN's
+  `gpl-shared` build, and the AppImage carries FFmpeg with x264 and x265. The `.deb` uses the
+  system's FFmpeg.
 
 ---
 

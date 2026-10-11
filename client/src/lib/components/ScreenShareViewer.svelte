@@ -1,4 +1,5 @@
 <script lang="ts">
+  import type { Snippet } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
   import { onDestroy } from "svelte";
@@ -20,6 +21,12 @@
   import { shortName } from "../username.js";
   import { currentProximity } from "../stores/room.js";
   import { screenAudioSpatial, spatialAudio } from "../stores/settings.js";
+
+  interface Props {
+    /** The stream view's own controls (the chat toggles), before Stop. */
+    headerExtra?: Snippet;
+  }
+  let { headerExtra }: Props = $props();
 
   let bitrateLabel = $derived(
     $receiverBitrate >= 1000
@@ -169,6 +176,7 @@
     {#if !$isMobile && !isWeb}
       <button class="popout-btn no-auto-margin" onclick={popOut} title="Pop out to separate window">&#8599;</button>
     {/if}
+    {#if headerExtra}{@render headerExtra()}{/if}
     <button class="stop-btn" onclick={stopWatching}>Stop Watching</button>
   </div>
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->

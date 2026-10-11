@@ -25,7 +25,8 @@
     isCulled,
     isPreviewing,
   } from "../stores/roster.js";
-  import { openUserMenu } from "../stores/user-menu.js";
+  import { openShare, openUserMenu } from "../stores/user-menu.js";
+  import { memberMenu } from "../actions/member-menu.js";
   import Icon from "./Icons.svelte";
   import { shortName } from "../username.js";
   import type { UserInfo } from "../types.js";
@@ -67,6 +68,7 @@
      game's culling are about the people we hear, and nobody else. `inChannel`
      is whether it is the channel on screen's, which is what the crown is about. -->
 {#snippet member(user: UserInfo, inCall: boolean, inChannel: boolean)}
+  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div
     class="user"
     class:speaking={inCall && $speakingUsers.has(user.user_id)}
@@ -74,7 +76,7 @@
     title={isCulled(user.user_id, $audibleIds, $userId, !inCall)
       ? "Out of earshot in the game — close it to hear everyone again"
       : undefined}
-    oncontextmenu={(e) => { e.preventDefault(); e.stopPropagation(); openUserMenu(user, e.clientX, e.clientY, !inChannel); }}
+    use:memberMenu={{ user, idle: !inChannel, self: user.user_id === $userId }}
   >
     <div
       class="indicator"
@@ -108,9 +110,20 @@
       </span>
     {/if}
     {#if user.is_screen_sharing}
-      <span class="status-icon sharing" title="Sharing screen">
-        <Icon name="monitor" size={14} />
-      </span>
+      <!-- One click watches, in the call we are in; elsewhere a marker -->
+      {#if inCall}
+        <button
+          class="status-icon sharing watch"
+          title={user.user_id === $userId ? "Show what you are sharing" : "Watch the stream"}
+          onclick={(e) => { e.stopPropagation(); openShare(user.user_id); }}
+        >
+          <Icon name="monitor" size={14} />
+        </button>
+      {:else}
+        <span class="status-icon sharing" title="Sharing screen">
+          <Icon name="monitor" size={14} />
+        </span>
+      {/if}
     {/if}
     {#if user.user_id !== $userId}
       <button
@@ -275,6 +288,16 @@
 
   .status-icon.sharing {
     color: var(--success);
+  }
+
+  .status-icon.watch {
+    padding: 2px;
+    background: transparent;
+    border-radius: 4px;
+  }
+
+  .status-icon.watch:hover {
+    background: var(--bg-tertiary);
   }
 
   .more-btn {

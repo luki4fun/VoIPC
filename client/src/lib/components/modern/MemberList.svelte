@@ -33,7 +33,8 @@
     isPreviewing,
     displayChannel,
   } from "../../stores/roster.js";
-  import { openUserMenu } from "../../stores/user-menu.js";
+  import { openShare, openUserMenu } from "../../stores/user-menu.js";
+  import { memberMenu } from "../../actions/member-menu.js";
   import Icon from "../Icons.svelte";
   import type { UserInfo } from "../../types.js";
 
@@ -106,7 +107,7 @@
     title={isCulled(user.user_id, $audibleIds, $userId, !inCall)
       ? "Out of earshot in the game — close it to hear everyone again"
       : undefined}
-    oncontextmenu={(e) => menu(user, e, !inChannel)}
+    use:memberMenu={{ user, idle: !inChannel, self: user.user_id === $userId }}
   >
     <span class="avatar" style="background: {avatarColor(user.username)}"
       >{user.username.charAt(0).toUpperCase()}</span
@@ -131,6 +132,19 @@
     {/if}
     {#if user.is_deafened}
       <span class="status-icon deafened" title="Deafened"><Icon name="headphones-off" size={14} /></span>
+    {/if}
+    <!-- Watching is the call's, as in the menu: one click instead of two -->
+    {#if user.is_screen_sharing && inCall}
+      <button
+        class="watch-btn"
+        title={user.user_id === $userId ? "Show what you are sharing" : "Watch the stream"}
+        onclick={(e) => {
+          e.stopPropagation();
+          openShare(user.user_id);
+        }}
+      >
+        <Icon name="play" size={14} />
+      </button>
     {/if}
     {#if user.user_id !== $userId}
       <button class="more-btn" title="Actions" onclick={(e) => menu(user, e, !inChannel)}>
@@ -288,6 +302,23 @@
   .more-btn:hover {
     background: var(--bg-tertiary);
     color: var(--text-primary);
+  }
+
+  .watch-btn {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 24px;
+    height: 24px;
+    padding: 0;
+    background: var(--danger);
+    color: #fff;
+    border-radius: 4px;
+    flex-shrink: 0;
+  }
+
+  .watch-btn:hover {
+    opacity: 0.85;
   }
 
   .preview-hint {

@@ -49,7 +49,8 @@
   import { users, speakingUsers } from "../../stores/users.js";
   import { audibleIds } from "../../stores/room.js";
   import { isCulled } from "../../stores/roster.js";
-  import { openUserMenu } from "../../stores/user-menu.js";
+  import { openShare } from "../../stores/user-menu.js";
+  import { memberMenu } from "../../actions/member-menu.js";
   import { avatarColor } from "../../avatar.js";
   import { shortName } from "../../username.js";
   import ChannelCreateForm from "../ChannelCreateForm.svelte";
@@ -232,11 +233,7 @@
               class="nested-member"
               class:speaking={joined && $viewingVoice && $speakingUsers.has(member.user_id)}
               class:culled={isCulled(member.user_id, $audibleIds, $userId, !joined || !$viewingVoice)}
-              oncontextmenu={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                openUserMenu(member, e.clientX, e.clientY);
-              }}
+              use:memberMenu={{ user: member, self: member.user_id === $userId }}
             >
               <span class="nested-avatar" style="background: {avatarColor(member.username)}"
                 >{member.username.charAt(0).toUpperCase()}</span
@@ -249,7 +246,19 @@
                 <span class="status-icon deafened" title="Deafened"><Icon name="headphones-off" size={12} /></span>
               {/if}
               {#if member.is_screen_sharing}
-                <span class="live-tag" title="Sharing screen">LIVE</span>
+                <!-- One click watches, in the call we are in; elsewhere a marker -->
+                {#if joined && $viewingVoice}
+                  <button
+                    class="live-tag watch"
+                    title={member.user_id === $userId ? "Show what you are sharing" : "Watch the stream"}
+                    onclick={(e) => {
+                      e.stopPropagation();
+                      openShare(member.user_id);
+                    }}>LIVE</button
+                  >
+                {:else}
+                  <span class="live-tag" title="Sharing screen">LIVE</span>
+                {/if}
               {/if}
             </div>
           {/each}
@@ -517,6 +526,16 @@
     border: 1px solid var(--danger);
     color: var(--danger);
     flex-shrink: 0;
+  }
+
+  button.live-tag {
+    background: transparent;
+    line-height: inherit;
+  }
+
+  button.live-tag:hover {
+    background: var(--danger);
+    color: #fff;
   }
 
   .dm-section {

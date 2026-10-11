@@ -525,7 +525,7 @@ export class Session implements SessionContext {
     }
     const rtt = (nowU32() - sent) >>> 0;
     // Guard against clock weirdness producing huge values
-    if (rtt < 60_000) this.emit("latency-update", { ms: rtt });
+    if (rtt < 60_000) this.emit("latency-update", { ms: rtt, tcp: this.transport?.tcp ?? false });
   }
 
   /** network.rs handle_server_message. */

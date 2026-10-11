@@ -16,6 +16,7 @@ import {
   defaultUiPrefs,
   sanitizeUiPrefs,
   type PanelPrefs,
+  type StreamChatPrefs,
   type UiPrefs,
 } from "../ui-prefs.js";
 
@@ -29,6 +30,12 @@ export const layoutAskedVersion = derived(uiPrefs, (p) => p.layout_asked_version
 
 /** The panel sizes belonging to the layout that is on screen. */
 export const activePanels = derived(uiPrefs, (p): PanelPrefs => p.panels[p.layout]);
+
+/** How the chat docks to a screen share in the layout on screen. */
+export const activeStreamChat = derived(
+  uiPrefs,
+  (p): StreamChatPrefs => p.stream_chat[p.layout],
+);
 
 /**
  * Keys `sanitizeUiPrefs` did not recognise, kept aside and written back
@@ -119,6 +126,11 @@ export function updateUiPrefs(change: (p: UiPrefs) => void): void {
 /** Change the panel sizes of the layout currently on screen. */
 export function updateActivePanels(change: (panels: PanelPrefs) => void): void {
   updateUiPrefs((p) => change(p.panels[p.layout]));
+}
+
+/** Change the stream view's chat of the layout currently on screen. */
+export function updateActiveStreamChat(change: (chat: StreamChatPrefs) => void): void {
+  updateUiPrefs((p) => change(p.stream_chat[p.layout]));
 }
 
 // ── Saving ─────────────────────────────────────────────────────────────────

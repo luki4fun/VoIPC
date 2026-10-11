@@ -284,11 +284,32 @@ export function checkFfmpegAbi(dir, hint) {
   ok(`FFmpeg libavcodec ${headerMajor} — ffmpeg-next builds against this`);
 }
 
-/** Install the client's npm dependencies if they are missing. */
+/**
+ * Abort a bundling build on a Linux host that has no appindicator library.
+ *
+ * The tray (tauri's `tray-icon` feature) makes the Tauri CLI look the library
+ * up through pkg-config when it bundles — since CLI 2.12, which also reads the
+ * desktop-only tauri features — and panic when it is missing, after the whole
+ * release build. The check is the *host's*, so a Windows installer built from
+ * Linux needs the library just the same.
+ */
+export function checkTrayLib() {
+  const found = ['ayatana-appindicator3-0.1', 'appindicator3-0.1']
+    .some((lib) => capture('pkg-config', ['--variable=libdir', lib]));
+  if (found) return;
+  fail('No appindicator library found (pkg-config ayatana-appindicator3-0.1).',
+    'The Tauri CLI needs it to bundle, even for Windows. Install it, then build again:\n'
+    + '       Arch:          sudo pacman -S libayatana-appindicator\n'
+    + '       Debian/Ubuntu: sudo apt install libayatana-appindicator3-dev');
+}
+
+/** Install the client's npm dependencies if they are missing — exactly the
+ *  lockfile's (`npm ci`), so a release runner builds what was tested. */
 export function npmInstall() {
   if (existsSync(join(CLIENT, 'node_modules'))) return;
   info('installing npm dependencies...');
-  run('npm', ['install'], { cwd: CLIENT });
+  const locked = existsSync(join(CLIENT, 'package-lock.json'));
+  run('npm', [locked ? 'ci' : 'install'], { cwd: CLIENT });
 }
 
 /** Add a rustup target unless it is already installed. */

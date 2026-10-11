@@ -38,7 +38,7 @@ impl FrameConverter {
     ///
     /// `input_format` should be `Pixel::BGRA` (Windows DXGI) or `Pixel::RGBA` (Linux).
     /// `output_format` must match the encoder's pixel format (YUV420P or NV12 —
-    /// QSV only accepts NV12). If `dst_width`/`dst_height` differ from
+    /// QSV only accepts NV12), or RGB24 for the sharer's JPEG preview. If `dst_width`/`dst_height` differ from
     /// `src_width`/`src_height`, the conversion also scales in the same pass
     /// (replacing the separate `scale_i420_nearest`).
     pub fn new(
@@ -572,14 +572,23 @@ mod tests {
 
     #[test]
     fn frame_converter_outputs_requested_format() {
-        // QSV encoders open with NV12 — the converter must honor it.
-        for fmt in [Pixel::YUV420P, Pixel::NV12] {
+        // QSV encoders open with NV12 — the converter must honor it. RGB24 is
+        // the sharer's preview, handed to turbojpeg as one packed plane.
+        for fmt in [Pixel::YUV420P, Pixel::NV12, Pixel::RGB24] {
             let mut c = FrameConverter::new(Pixel::BGRA, 64, 64, 64, 64, fmt)
                 .expect("converter init");
             let bgra = vec![128u8; 64 * 64 * 4];
             let frame = c.convert(&bgra).expect("convert");
             assert_eq!(frame.format(), fmt);
         }
+        // Scaled and strided, as the preview uses it: turbojpeg asserts the
+        // plane covers `pitch * (height - 1) + width * 3` bytes.
+        let mut c = FrameConverter::new(Pixel::BGRA, 100, 60, 64, 36, Pixel::RGB24)
+            .expect("converter init");
+        let stride = 100 * 4 + 32;
+        let frame = c.convert_strided(&vec![200u8; stride * 60], stride).expect("convert");
+        assert!(frame.stride(0) >= 64 * 3);
+        assert!(frame.data(0).len() >= frame.stride(0) * 35 + 64 * 3);
     }
 
     #[test]

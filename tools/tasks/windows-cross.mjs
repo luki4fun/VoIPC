@@ -11,7 +11,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  CLIENT, ROOT, capture, checkFfmpegAbi, err, fail, head, info, npmInstall, ok, run, syncVersion,
+  CLIENT, ROOT, capture, checkFfmpegAbi, checkTrayLib, err, fail, head, info, npmInstall, ok, run, syncVersion,
   which, writeTempConfig,
 } from '../lib.mjs';
 
@@ -239,7 +239,7 @@ function stageDlls() {
 }
 
 // DLLs that are part of Windows itself and are never bundled.
-const SYSTEM_DLLS = /^(api-ms-win-|kernel32|ntdll|user32|gdi32|ole32|oleaut32|shell32|shlwapi|psapi|ws2_32|bcrypt|bcryptprimitives|comctl32|d3d11|dwmapi|advapi32|dbghelp|version|crypt32|secur32|dxgi|winmm|userenv|ucrtbase|msvcrt|combase|propsys)/i;
+const SYSTEM_DLLS = /^(api-ms-win-|kernel32|ntdll|user32|gdi32|ole32|oleaut32|shell32|shlwapi|psapi|ws2_32|bcrypt|bcryptprimitives|comctl32|d3d11|dwmapi|advapi32|dbghelp|version|crypt32|secur32|dxgi|winmm|userenv|ucrtbase|msvcrt|combase|propsys|imm32)/i;
 
 function auditImports(exe, staging) {
   if (!which('llvm-readobj')) return;
@@ -331,7 +331,10 @@ function build(args) {
     build: { beforeBundleCommand: '' },
     bundle: { resources: { 'external-dlls/*': './' } },
   };
-  if (!noBundle) Object.assign(config.bundle, { active: true, targets: ['nsis'] });
+  if (!noBundle) {
+    checkTrayLib();
+    Object.assign(config.bundle, { active: true, targets: ['nsis'] });
+  }
 
   npmInstall();
   const cfg = writeTempConfig(config);

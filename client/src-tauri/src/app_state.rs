@@ -368,14 +368,15 @@ pub struct ActiveConnection {
     pub voice_asked_at: Arc<AtomicU64>,
     /// Sender for control messages (framed, onto the control stream).
     pub tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
-    /// Sender for voice packets (QUIC datagrams).
+    /// Sender for voice packets (QUIC datagrams, or the TCP fallback's datagram lane).
     pub voice_tx: mpsc::Sender<Vec<u8>>,
-    /// Sender for video fragments (one QUIC stream per frame).
+    /// Sender for video fragments (one QUIC stream per frame, or the TCP fallback).
     pub video_tx: mpsc::Sender<Vec<u8>>,
-    /// Sender for screen share audio packets (QUIC datagrams).
+    /// Sender for screen share audio packets (like voice).
     pub screen_audio_tx: mpsc::Sender<Vec<u8>>,
-    /// QUIC endpoint + connection; closed explicitly on disconnect.
-    pub quic: crate::transport::Quic,
+    /// What carries the session (QUIC, or the TCP fallback); closed
+    /// explicitly on disconnect.
+    pub conn: crate::transport::Conn,
     /// Join handles for cleanup on disconnect.
     pub tasks: Vec<tokio::task::JoinHandle<()>>,
     /// Flag to signal the capture+encode loop to stop.
@@ -417,6 +418,11 @@ pub struct ActiveConnection {
     /// Recent viewer loss reports; only a majority of viewers steps the share
     /// down, so one flaky (or hostile) viewer cannot degrade it for everyone.
     pub share_loss_tally: Arc<std::sync::Mutex<LossTally>>,
+    /// How many people watch our share, as the server last said. Capture can
+    /// run with none (the sharer's own preview); nothing is encoded or sent then.
+    pub share_viewers: Arc<AtomicU32>,
+    /// The sharer's own preview is on screen: the capture task renders to it.
+    pub share_preview: Arc<AtomicBool>,
     /// The user_id of the screenshare we're currently watching (if any).
     pub watching_user_id: Option<UserId>,
     /// Shared atomic version of watching_user_id for cross-task access (0 = not watching).
@@ -849,11 +855,10 @@ impl SpatialState {
     }
 }
 
-/// Who reported frame loss on our screen share, and how many viewers there are
-/// to compare that against. See `network::majority_reached`.
+/// Who reported frame loss on our screen share; compared against
+/// `ActiveConnection::share_viewers`. See `network::majority_reached`.
 #[derive(Default)]
 pub struct LossTally {
-    pub viewer_count: u32,
     /// Viewer user id → epoch ms of its last report of dropped frames.
     pub reports: HashMap<UserId, u64>,
 }

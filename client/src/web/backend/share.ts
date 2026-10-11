@@ -141,6 +141,10 @@ export class ShareSender implements ShareApi {
     return this._sharing;
   }
 
+  get previewStream(): MediaStream | null {
+    return this.stream;
+  }
+
   attach(ctx: SessionContext): void {
     this.ctx = ctx;
   }

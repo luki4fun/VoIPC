@@ -360,17 +360,28 @@ pub fn load_config() -> AppConfig {
     }
 }
 
-/// Save config to disk atomically (write to .tmp, then rename).
+/// Replace `path` with `data` whole or not at all: write a `.tmp` beside it,
+/// flush it to the disk, then rename it over. A crash or power cut part way
+/// through a plain write leaves a truncated file — for the chat vault, one
+/// AES-GCM refuses entirely, which loses the whole history.
+pub fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
+    tmp_name.push(".tmp");
+    let tmp_path = path.with_file_name(tmp_name);
+    let mut file = std::fs::File::create(&tmp_path)?;
+    file.write_all(data)?;
+    file.sync_all()?;
+    std::fs::rename(&tmp_path, path)
+}
+
+/// Save config to disk atomically.
 pub fn save_config(config: &AppConfig) -> Result<(), String> {
     let path = config_path();
-    let tmp_path = path.with_extension("json.tmp");
     let json = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize config: {e}"))?;
-    std::fs::write(&tmp_path, json)
-        .map_err(|e| format!("Failed to write {}: {e}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, &path)
-        .map_err(|e| format!("Failed to rename config: {e}"))?;
-    Ok(())
+    write_atomic(&path, json.as_bytes())
+        .map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
 
 /// Delete the config file (for reset).
@@ -382,6 +393,19 @@ pub fn delete_config() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn write_atomic_replaces_the_file_and_leaves_no_tmp() {
+        let dir = std::env::temp_dir().join(format!("voipc-atomic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chat_history.bin");
+        write_atomic(&path, b"first").unwrap();
+        write_atomic(&path, b"second, longer").unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"second, longer");
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["chat_history.bin"], "the .tmp was renamed over, not left behind");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// The appearance blob is the one field this side never reads, which is
     /// exactly why it is worth pinning: if it stopped round-tripping, nothing

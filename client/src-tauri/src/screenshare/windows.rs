@@ -281,6 +281,9 @@ pub fn spawn_capture_task(
     channel_id: Arc<AtomicU32>,
     frames_sent: Arc<AtomicU32>,
     bytes_sent: Arc<AtomicU64>,
+    app: tauri::AppHandle,
+    preview: Arc<AtomicBool>,
+    viewers: Arc<AtomicU32>,
 ) -> Result<tokio::task::JoinHandle<()>, String> {
     let source = session.source.clone();
 
@@ -309,6 +312,9 @@ pub fn spawn_capture_task(
             channel_id,
             frames_sent,
             bytes_sent,
+            app,
+            preview,
+            viewers,
         ) {
             error!("Screen capture error: {}", e);
         }
@@ -371,6 +377,9 @@ fn run_capture_and_encode(
     channel_id: Arc<AtomicU32>,
     frames_sent: Arc<AtomicU32>,
     bytes_sent: Arc<AtomicU64>,
+    app: tauri::AppHandle,
+    preview: Arc<AtomicBool>,
+    viewers: Arc<AtomicU32>,
 ) -> Result<(), String> {
     let encoder = voipc_video::encoder::Encoder::new(codec, target_width, target_height, bitrate, target_fps)
         .map_err(|e| format!("Failed to create the {codec:?} encoder: {e}"))?;
@@ -413,6 +422,7 @@ fn run_capture_and_encode(
         audio_send_count,
         media_key.clone(),
         channel_id.clone(),
+        viewers.clone(),
     );
 
     // ── Run encode loop on this thread ───────────────────────────────────
@@ -440,6 +450,13 @@ fn run_capture_and_encode(
         channel_id,
         frames_sent,
         bytes_sent,
+        viewers,
+        watched: false,
+        preview,
+        app,
+        preview_conv: None,
+        preview_jpeg: None,
+        preview_at: None,
     };
 
     run_encode_loop(&slot, processor);
@@ -798,6 +815,7 @@ fn setup_loopback_audio(
     audio_send_count: Arc<AtomicU32>,
     media_key: Arc<std::sync::Mutex<voipc_crypto::MediaKeyRing>>,
     channel_id: Arc<AtomicU32>,
+    viewers: Arc<AtomicU32>,
 ) -> Option<cpal::Stream> {
     match setup_loopback_audio_inner(
         session_id,
@@ -808,6 +826,7 @@ fn setup_loopback_audio(
         audio_send_count,
         media_key,
         channel_id,
+        viewers,
     ) {
         Ok(stream) => {
             info!("WASAPI loopback audio capture started");
@@ -833,6 +852,7 @@ fn setup_loopback_audio_inner(
     audio_send_count: Arc<AtomicU32>,
     media_key: Arc<std::sync::Mutex<voipc_crypto::MediaKeyRing>>,
     channel_id: Arc<AtomicU32>,
+    viewers: Arc<AtomicU32>,
 ) -> Result<cpal::Stream, String> {
     let host = cpal::default_host();
     let device = host
@@ -881,6 +901,7 @@ fn setup_loopback_audio_inner(
         channel_id,
         resampler: None,
         mono_buf: Vec::new(),
+        viewers,
     }));
 
     let stream_config = cpal::StreamConfig {

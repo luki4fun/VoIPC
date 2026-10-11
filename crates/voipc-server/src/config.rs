@@ -15,7 +15,8 @@ pub struct ServerConfig {
     #[serde(default = "default_host")]
     pub host: String,
 
-    /// TCP port serving the browser client's page (HTTPS, HTTP/2).
+    /// TCP port serving the browser client's page (HTTPS, HTTP/2) and, with
+    /// `tcp_fallback`, the tunnel for clients that cannot reach UDP.
     #[serde(default = "default_tcp_port")]
     pub tcp_port: u16,
 
@@ -31,14 +32,25 @@ pub struct ServerConfig {
 
     /// How many connections one IP address may hold at once.
     ///
-    /// Not the same as users: a browser client holds two (the page and the
-    /// QUIC session), a native client one. The default allows sixteen browser
+    /// Not the same as users: a browser client holds two (the page and its
+    /// QUIC session or TCP tunnel), a native client one. The default allows sixteen browser
     /// users behind one address, because that is what a household, an office
     /// or a school looks like from here — and being refused for sharing a NAT
     /// with your friends is worse than the dial-and-drop loop this bounds,
     /// which `CONNECT_BURST` is the real answer to.
     #[serde(default = "default_max_connections_per_ip")]
     pub max_connections_per_ip: u32,
+
+    /// Let clients that cannot reach the QUIC endpoint — because something
+    /// between them and this server drops UDP — tunnel the whole session,
+    /// control, voice and video, through a WebSocket on `tcp_port`
+    /// (`GET /voipc`, offered as TLS ALPN `http/1.1` next to the page's `h2`).
+    /// Clients try QUIC first and fall back by themselves. Off by default:
+    /// TCP stalls on every lost packet, so it is for hosts whose UDP is blocked.
+    /// Native clients dial the port they were given over TCP as well, so
+    /// they need `tcp_port == udp_port` (the default).
+    #[serde(default)]
+    pub tcp_fallback: bool,
 
     /// Path to TLS certificate file (PEM).
     pub cert_path: String,
@@ -95,6 +107,7 @@ impl Default for ServerConfig {
             udp_port: default_udp_port(),
             max_users: default_max_users(),
             max_connections_per_ip: default_max_connections_per_ip(),
+            tcp_fallback: false,
             cert_path: "certs/server.crt".into(),
             key_path: "certs/server.key".into(),
             admin_token: None,
@@ -113,6 +126,7 @@ mod tests {
         assert_eq!(config.udp_port, 9987);
         assert_eq!(config.max_users, 64);
         assert_eq!(config.max_connections_per_ip, 32);
+        assert!(!config.tcp_fallback, "the TCP fallback is opt-in");
     }
 
     #[test]
@@ -131,6 +145,11 @@ mod tests {
         assert_eq!(config.udp_port, 5678);
         assert_eq!(config.max_users, 128);
         assert_eq!(config.cert_path, "test.crt");
+        assert!(!config.tcp_fallback);
+
+        let config: ServerConfig =
+            toml::from_str("tcp_fallback = true\ncert_path = \"c\"\nkey_path = \"k\"").unwrap();
+        assert!(config.tcp_fallback);
     }
 
     #[test]

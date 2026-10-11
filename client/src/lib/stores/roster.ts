@@ -23,12 +23,21 @@ import {
   voice,
   voiceChannel,
 } from "./channels.js";
-import { activeTextChannelId, joinedTextChannelIds } from "./chat.js";
-import { isAdmin, userId, voiceIsAdmin } from "./connection.js";
+import {
+  activeDmUserId,
+  activeDmUsername,
+  activeTextChannelId,
+  channelMessages,
+  chatKey,
+  dmKey,
+  dmMessages,
+  joinedTextChannelIds,
+} from "./chat.js";
+import { isAdmin, serverAddress, userId, voiceIsAdmin } from "./connection.js";
 import { channelRosters } from "./rosters.js";
 import { speakingUsers, users, visibleMembers } from "./users.js";
 import { rosterOf } from "../roster-rules.js";
-import type { ChannelInfo, UserInfo } from "../types.js";
+import type { ChannelInfo, ChatMessage, UserInfo } from "../types.js";
 
 /**
  * Looking at a channel we are not in.
@@ -60,6 +69,20 @@ export const displayChannel: Readable<ChannelInfo | undefined> = derived(
 export const displayChannelName: Readable<string> = derived(
   displayChannel,
   ($channel) => $channel?.name ?? "",
+);
+
+/**
+ * The conversation the chat pane shows: the open direct message, else the
+ * channel on display. ChatPanel lists it, and the stream view's chat toggle
+ * watches it for news while that chat is hidden — one answer for both. A fresh
+ * array each time, so a message pushed into the same one still reads as new.
+ */
+export const shownMessages: Readable<ChatMessage[]> = derived(
+  [activeDmUserId, activeDmUsername, serverAddress, displayChannelName, channelMessages, dmMessages],
+  ([$dm, $dmName, $server, $name, $channels, $dms]) => [
+    ...(($dm !== null ? $dms.get(dmKey($server, $dmName)) : $channels.get(chatKey($server, $name))) ??
+      []),
+  ],
 );
 
 export const displayChannelCreatorId: Readable<number | null> = derived(

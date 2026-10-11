@@ -11,7 +11,10 @@
     senderFps,
     senderBitrate,
     shareResolution,
+    previewShown,
+    previewStage,
   } from "../stores/screenshare.js";
+  import { updateUiPrefs } from "../stores/ui-prefs.js";
   import { addNotification } from "../stores/notifications.js";
   import { isWeb } from "../stores/platform.js";
   import Icon from "./Icons.svelte";
@@ -69,6 +72,13 @@
     }
   }
 
+  /** Our own preview: the floating card, or off (and out of the stream view). */
+  function togglePreview() {
+    const show = !$previewShown;
+    if (!show) previewStage.set(false);
+    updateUiPrefs((p) => (p.share_preview = show));
+  }
+
   async function toggleAudio() {
     try {
       const enabled = await invoke<boolean>("toggle_screen_audio");
@@ -91,6 +101,14 @@
       {#if $viewerCount > 0}
         <span class="viewer-badge">{$viewerCount}</span>
       {/if}
+    </button>
+    <button
+      class="icon-btn-sm preview-toggle"
+      class:on={$previewShown}
+      onclick={togglePreview}
+      title={$previewShown ? "Hide the preview of your screen" : "Show what you are sharing"}
+    >
+      <Icon name={$previewShown ? "eye" : "eye-off"} size={16} />
     </button>
     {#if !isWeb}
       <button class="icon-btn-sm" onclick={openSwitchPicker} title="Switch capture source">
@@ -181,6 +199,10 @@
 
   .icon-btn-sm:hover {
     background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+
+  .icon-btn-sm.on {
     color: var(--text-primary);
   }
 

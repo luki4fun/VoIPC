@@ -5,6 +5,7 @@
 // fills in the sender half of getStats().
 
 import { emit } from "./events";
+import { share } from "./share";
 import { wasm } from "./wasm";
 import type { VideoAssembler } from "./wasm";
 import type { SessionContext, VideoApi, VideoCodec } from "./types";
@@ -357,10 +358,12 @@ export class VideoViewer implements VideoApi {
 
 export const video: VideoApi = new VideoViewer();
 
-// The only bridge from the Svelte layer to the web backend: the viewer
-// component hands over its <canvas> (components never import src/web).
+// The only bridge from the Svelte layer to the web backend (components never
+// import src/web): the viewer component hands over its <canvas>, and the
+// sharer's preview borrows the stream being captured.
 if (typeof window !== "undefined") {
   (window as unknown as { __voipc_web: unknown }).__voipc_web = {
     setVideoCanvas: (canvas: HTMLCanvasElement | null) => video.setCanvas(canvas),
+    shareStream: (): MediaStream | null => share.previewStream,
   };
 }

@@ -20,7 +20,7 @@
   import { activePanels, updateActivePanels } from "../../stores/ui-prefs.js";
   import { isMobile, showChatRequested } from "../../stores/platform.js";
   import { centreView, currentProximity } from "../../stores/room.js";
-  import { watchingUserId } from "../../stores/screenshare.js";
+  import { streamStage } from "../../stores/screenshare.js";
   import { micLane } from "../../stores/mixer.js";
   import { voice } from "../../stores/channels.js";
   import { showConnectDialog } from "../../connect.js";
@@ -78,7 +78,7 @@
 
   // An activity covers the whole window, so the drawers must not also be
   // draggable underneath it.
-  const activityOpen = $derived($centreView !== "chat" || $watchingUserId !== null);
+  const activityOpen = $derived($centreView !== "chat" || $streamStage !== null);
 
   /** Are the panes stacked? Read on demand rather than watched: a
    *  ResizeObserver would be a second opinion on what the container query

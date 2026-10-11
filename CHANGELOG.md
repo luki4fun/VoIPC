@@ -2,6 +2,136 @@
 
 All notable changes to VoIPC are documented here.
 
+## [0.11.0] - 2026-10-11
+
+Whoever shares a screen now sees what they are sending, and a share no longer
+costs you the conversation: the chat docks beside the stream or under it. Plus
+member rows that open their menu on an ordinary click, and a way in over TCP
+for servers whose UDP is blocked. Protocol version 10, unchanged — the TCP
+fallback carries the same messages — but the server changed for it, and a
+server still admits only a client of its own version, so update both together.
+
+### Added — see what you share
+
+The server sends a share to its viewers only, so the person sharing never saw
+it. Now a small preview sits in the corner while you share, labelled with how
+many people are watching.
+
+- **It works before anybody watches.** That is when it matters: check that you
+  picked the right window before somebody else sees it. Until the first viewer
+  arrives the desktop client captures for the preview alone — nothing is
+  encoded or sent, video or screen audio
+- **It shows the stream as it goes out**: the size and scaling of the
+  resolution you picked, about ten frames a second. The browser shows the
+  capture itself
+- **Enlarge it** into the stream view, chat and all; the shrink button puts it
+  back (Escape too, in the modern layout). The ✕ hides it, and stays hidden for later shares; the
+  eye next to Stop brings it back
+- Clicking LIVE on your own row opens the enlarged preview
+
+### Added — the stream and the chat at once
+
+The modern layout opened a share over the whole window, chat included. The
+viewer's header now has a chat button.
+
+- **Beside or under the stream**, switched with the button next to it. Drag the
+  edge between them to size the chat; a double click puts it back. Open or not,
+  where and how big are remembered per layout
+- **A dot on the chat button** when somebody writes while the chat is hidden
+- In a narrow window, and on a phone, the chat always goes under the stream
+- The classic layout gets the same view. It shows the chat under the stream by
+  default, as before, and that can now be dragged and moved beside it too
+- Your own preview, enlarged, works the same way
+
+### Added — one click to watch
+
+LIVE in the channel list, the ▶ on a Live row in the member list and the screen
+icon in the classic list start watching straight away; the menu is no longer
+the only way in.
+
+### Added — a TCP fallback for servers whose UDP is blocked
+
+Every client has connected over QUIC, which is UDP, since 0.5. Where a
+provider's firewall or anti-DDoS filter drops UDP, the page still loaded but
+nobody got in: every connect timed out. A server can now carry the whole
+session over TCP as well, on the port its page already uses — no second port
+to open.
+
+- **Opt-in on the server**: `tcp_fallback = true` in `server.toml`, or
+  `--tcp-fallback`. Left off, nothing changes. `tools/udp-diag.sh` shows where
+  the UDP packets die, for when opening the port is an option after all
+- **Clients fall back by themselves.** QUIC gets two seconds to connect, then a
+  WebSocket on the server's TLS port joins the race, and whichever connects
+  first carries the session: control, voice, screen audio and video, relayed
+  exactly as over QUIC, so people on QUIC and on TCP share a room. The status
+  bar says **· TCP** while it is in use
+- **Voice goes first.** One TCP stream waits for every lost packet, so the
+  tunnel sends voice ahead of control and control ahead of video, keeps what
+  the kernel holds back short, and drops voice rather than queueing it late. A
+  share steps down when the link cannot carry it, as it does over QUIC
+- **When neither gets through**, the error names both reasons — "this server
+  has no TCP fallback" among them — instead of a bare timeout
+- **The same rules hold**: the tunnel takes one of the connection slots a QUIC
+  session would, bans and the per-address limits apply, and every packet
+  passes the same checks and rate limits
+- The desktop and Android clients dial the fallback on the port they were
+  given, so it needs `tcp_port` and `udp_port` to be the same, which is the
+  default
+- A browser without WebTransport can now get in through the fallback, where
+  the server has it on (WebCodecs is still needed)
+
+### Changed — a click on a member opens their menu
+
+- **A left click opens the member menu**, as a right click does. On a phone
+  that is a tap, where the ⋮ button only appeared on hover
+- **The pointer says so**: rows with a menu show the hand. Your own row has no
+  menu and does not
+- **And from the keyboard**: rows can be reached with Tab and opened with Enter
+  or Space
+
+### Fixed
+
+- **A source switch let one viewer's lost frames lower the share for
+  everybody.** Switching what you share reset the viewer count the quality
+  ladder compares loss reports against, so until somebody joined or left, a
+  single viewer on a bad link counted as a majority. The count no longer lives
+  in that tally
+- **A crash while the chat history was being saved could lose all of it.** The
+  encrypted history file was rewritten in place, and a file cut off half way
+  cannot be decrypted at all. It is now written beside the old one and swapped
+  in whole; the remembered server certificates are saved the same way
+- **Screen capture that stopped by itself could not be started again** until
+  the share was stopped: a new viewer, or the preview, found it "already
+  running"
+
+### Security — a review before the release
+
+- **On Android 8 to 12, any installed app could unmute you.** The buttons in
+  VoIPC's notification — mute, deafen, disconnect — reach the app as a
+  broadcast, and below Android 13 the app accepted that broadcast from
+  anybody. Mute is a toggle, so another app could switch a muted microphone
+  back on. Only VoIPC's own notification can send them now
+- **The browser client can no longer be put inside another page.** A site
+  embedding it could lend it the microphone and screen capture and steer the
+  clicks — onto Join or Share. Browsers now refuse to show it in a frame
+- **A handful of addresses could lock everybody out.** A browser's page
+  connection stays open with nothing on it after the page loaded, and it holds
+  one of the connection slots a voice session needs too; idle ones from a few
+  addresses could take them all. A page connection now closes after a minute
+  — browsers open a new one for their next request without anybody noticing
+- **Names can no longer hide characters.** User and channel names refused
+  control characters only, so "admin" with a zero-width space after it passed
+  for "admin", and a right-to-left override turned a name around. Invisible
+  and direction-changing characters are refused now. A server whose
+  `channels.json` names a channel with one of them says so at start instead
+  of starting
+- **Dependencies brought up to date**, among them rustls 0.23.45 for a TLS 1.3
+  handshake flaw (RUSTSEC-2026-0285) on the page port, the tunnel and QUIC,
+  Tauri 2.12 and Svelte 5.57
+- **The README is plainer about what a server can still do** — swap the keys
+  it relays and read along unseen, until lasting identities exist — and names
+  the AGPL and GPL code the binaries are built with
+
 ## [0.10.1] - 2026-09-25
 
 People can share a name now, and a direct message to somebody who has left

@@ -32,6 +32,19 @@ export interface PanelPrefs {
   members_open: boolean;
 }
 
+/** Where the chat sits beside a screen share. */
+export type StreamChatSplit = "side" | "below";
+
+/** The chat docked to a screen share (the stream view), per layout. */
+export interface StreamChatPrefs {
+  open: boolean;
+  split: StreamChatSplit;
+  /** Chat width beside the stream, px. */
+  width: number;
+  /** Chat height below the stream, px. */
+  height: number;
+}
+
 export interface UiPrefs {
   layout: LayoutId;
   /** Which layout question this user has answered; 0 means never. */
@@ -45,6 +58,10 @@ export interface UiPrefs {
   zoom: number;
   /** Remembered per layout: the two shells want very different widths. */
   panels: Record<LayoutId, PanelPrefs>;
+  /** Per layout too: the classic one has always shown it, below. */
+  stream_chat: Record<LayoutId, StreamChatPrefs>;
+  /** The floating preview of your own share. Off once you hide it. */
+  share_preview: boolean;
   /**
    * Text channels the user walked out of, per server (`"host:port"` → names).
    *
@@ -77,6 +94,10 @@ export const CHAT_FONT_MIN = 11;
 export const CHAT_FONT_MAX = 20;
 export const ZOOM_MIN = 0.8;
 export const ZOOM_MAX = 1.5;
+export const STREAM_CHAT_WIDTH_MIN = 240;
+export const STREAM_CHAT_WIDTH_MAX = 800;
+export const STREAM_CHAT_HEIGHT_MIN = 120;
+export const STREAM_CHAT_HEIGHT_MAX = 720;
 
 export function defaultPanels(layout: LayoutId): PanelPrefs {
   // The classic defaults are the widths that were hard-coded in ChannelList
@@ -86,6 +107,14 @@ export function defaultPanels(layout: LayoutId): PanelPrefs {
   return layout === "modern"
     ? { sidebar: 240, members: 240, sidebar_open: true, members_open: true }
     : { sidebar: 220, members: 180, sidebar_open: true, members_open: true };
+}
+
+export function defaultStreamChat(layout: LayoutId): StreamChatPrefs {
+  // Modern opens a share full-window and the chat is asked for with a toggle;
+  // classic has shown it under the viewer, 280 px tall, since before either.
+  return layout === "modern"
+    ? { open: false, split: "side", width: 360, height: 280 }
+    : { open: true, split: "below", width: 360, height: 280 };
 }
 
 export function defaultUiPrefs(): UiPrefs {
@@ -98,6 +127,8 @@ export function defaultUiPrefs(): UiPrefs {
     chat_font_size: 13,
     zoom: 1,
     panels: { classic: defaultPanels("classic"), modern: defaultPanels("modern") },
+    stream_chat: { classic: defaultStreamChat("classic"), modern: defaultStreamChat("modern") },
+    share_preview: true,
     left_text_channels: {},
     dm_timers: {},
   };
@@ -177,6 +208,18 @@ function panels(raw: unknown, layout: LayoutId): PanelPrefs {
   };
 }
 
+function streamChat(raw: unknown, layout: LayoutId): StreamChatPrefs {
+  const d = defaultStreamChat(layout);
+  if (!raw || typeof raw !== "object") return d;
+  const r = raw as Record<string, unknown>;
+  return {
+    open: bool(r.open, d.open),
+    split: r.split === "side" || r.split === "below" ? r.split : d.split,
+    width: clamp(r.width, STREAM_CHAT_WIDTH_MIN, STREAM_CHAT_WIDTH_MAX, d.width),
+    height: clamp(r.height, STREAM_CHAT_HEIGHT_MIN, STREAM_CHAT_HEIGHT_MAX, d.height),
+  };
+}
+
 /**
  * Whatever came out of settings.json, made safe.
  *
@@ -208,6 +251,10 @@ export function sanitizeUiPrefs(raw: unknown): UiPrefs {
   }
 
   const p = r.panels && typeof r.panels === "object" ? (r.panels as Record<string, unknown>) : {};
+  const sc =
+    r.stream_chat && typeof r.stream_chat === "object"
+      ? (r.stream_chat as Record<string, unknown>)
+      : {};
 
   return {
     layout: layoutId(r.layout, d.layout),
@@ -230,6 +277,11 @@ export function sanitizeUiPrefs(raw: unknown): UiPrefs {
       classic: panels(p.classic ?? p.legacy, "classic"),
       modern: panels(p.modern ?? p.discord, "modern"),
     },
+    stream_chat: {
+      classic: streamChat(sc.classic, "classic"),
+      modern: streamChat(sc.modern, "modern"),
+    },
+    share_preview: bool(r.share_preview, d.share_preview),
     left_text_channels: leftTextChannels(r.left_text_channels),
     dm_timers: dmTimers(r.dm_timers),
   };

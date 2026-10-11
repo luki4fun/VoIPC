@@ -5,7 +5,7 @@
 import { existsSync, mkdirSync, readdirSync, readFileSync, rmSync, copyFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
-  CLIENT, ROOT, MAX_AVCODEC_MAJOR, IS_WINDOWS, avcodecMajor, capture, checkFfmpegAbi, fail,
+  CLIENT, ROOT, MAX_AVCODEC_MAJOR, IS_WINDOWS, avcodecMajor, capture, checkFfmpegAbi, checkTrayLib, fail,
   head, info, npmInstall, ok, run, syncVersion, writeTempConfig,
 } from '../lib.mjs';
 
@@ -231,6 +231,8 @@ export default function desktop(task, args) {
     if (gccInclude) env.BINDGEN_EXTRA_CLANG_ARGS = `-I${gccInclude}`;
 
     if (!isDev) {
+      checkTrayLib();
+
       // bundle-libs stages the app's shared libraries into appimage-libs/;
       // this mapping is what copies them into the AppImage. It used to be set
       // through TAURI_CONFIG, which the v2 CLI ignores, so the staged

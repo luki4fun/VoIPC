@@ -20,6 +20,10 @@ pub enum ProtocolError {
     #[error("message too large: {0} bytes (max 65536)")]
     MessageTooLarge(usize),
 
+    /// A WebSocket frame broke RFC 6455 or our limits (`ws.rs`).
+    #[error("websocket: {0}")]
+    WebSocket(&'static str),
+
     #[error("serialization error: {0}")]
     Serialization(#[from] postcard::Error),
 

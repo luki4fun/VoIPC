@@ -19,6 +19,7 @@ mod routing;
 mod settings;
 mod state;
 mod tcp;
+mod tunnel;
 mod web;
 
 use config::ServerConfig;
@@ -63,6 +64,10 @@ struct Args {
     /// Admin token (overrides config and VOIPC_ADMIN_TOKEN); unset = generated per start
     #[arg(long)]
     admin_token: Option<String>,
+
+    /// Turn on the TCP fallback for clients that cannot reach UDP (tcp_fallback)
+    #[arg(long)]
+    tcp_fallback: bool,
 }
 
 /// One IP's connect budget, and when we last saw it. The timestamp is only
@@ -77,7 +82,8 @@ struct ConnectRate {
 pub struct ConnLimits {
     total: AtomicU32,
     /// Ceiling on concurrent connections, derived from `max_users` rather than
-    /// fixed: a browser client holds two of these, so a server told to take
+    /// fixed: a browser client holds two of these (page plus QUIC session or
+    /// TCP tunnel), so a server told to take
     /// 300 users needs room for 600 connections. A constant here was a second,
     /// invisible `max_users` that no configuration could raise.
     max_total: u32,
@@ -121,9 +127,10 @@ impl ConnLimits {
     const MAX_RATE_ENTRIES: usize = 4096;
     const RATE_ENTRY_TTL: Duration = Duration::from_secs(60);
 
-    /// A browser holds two slots (the HTTP/2 page connection and the QUIC
-    /// session), a native client one (QUIC only) — hence the doubling, plus a
-    /// little room for the ones mid-handshake.
+    /// A browser holds two slots (the HTTP/2 page connection and its QUIC
+    /// session or TCP tunnel), a native client one (QUIC or tunnel) — hence
+    /// the doubling, plus a little room for the ones mid-handshake and for a
+    /// client racing QUIC against the tunnel.
     pub fn from_config(config: &ServerConfig) -> Self {
         Self::new(
             config.max_users.saturating_mul(2).saturating_add(16),
@@ -274,6 +281,9 @@ async fn main() -> Result<()> {
     if let Some(host) = args.host {
         config.host = host;
     }
+    if args.tcp_fallback {
+        config.tcp_fallback = true;
+    }
     // The v6 wildcard is dual-stack (IPV6_V6ONLY off for the TCP listener,
     // Ipv6DualStackConfig::Allow for QUIC), so one bind serves both families.
     // A kernel with IPv6 switched off cannot bind it at all; fall back rather
@@ -320,6 +330,7 @@ async fn main() -> Result<()> {
         max_users = config.max_users,
         max_connections = config.max_users.saturating_mul(2).saturating_add(16),
         max_connections_per_ip = config.max_connections_per_ip,
+        tcp_fallback = config.tcp_fallback,
         empty_channel_timeout = server_settings.empty_channel_timeout_secs,
         persistent_channels = persistent_channels.len(),
     );
@@ -334,10 +345,9 @@ async fn main() -> Result<()> {
             .with_no_client_auth()
             .with_single_cert(certs.clone(), key.clone_key())
             .context("invalid TLS configuration")?;
-    // Browsers get the web client over HTTP/2 only; anything offering just
-    // http/1.1 fails the handshake. Pre-0.5 native clients send no ALPN and
-    // are told to update (tcp::reject_legacy).
-    tls_config.alpn_protocols = vec![b"h2".to_vec()];
+    // Browsers get the web client over HTTP/2 only. Pre-0.5 native clients
+    // send no ALPN and are told to update (tcp::reject_legacy).
+    tls_config.alpn_protocols = alpn_protocols(config.tcp_fallback);
 
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
@@ -378,6 +388,12 @@ async fn main() -> Result<()> {
         "QUIC endpoint bound on UDP {}:{} (web client at https://{}:{}/)",
         config.host, config.udp_port, config.host, config.tcp_port
     );
+    if config.tcp_fallback {
+        info!(
+            "TCP fallback on: clients that cannot reach UDP {} tunnel through TCP {}",
+            config.udp_port, config.tcp_port
+        );
+    }
 
     // TCP accept loop with connection limits
     info!("server ready, accepting connections");
@@ -440,14 +456,18 @@ async fn main() -> Result<()> {
             match tokio::time::timeout(Duration::from_secs(10), tls_acceptor.accept(tcp_stream))
                 .await
             {
-                Ok(Ok(tls_stream)) => {
-                    if tls_stream.get_ref().1.alpn_protocol() == Some(&b"h2"[..]) {
-                        web::serve_h2(tls_stream, wt_info, http_state, peer_addr).await;
-                    } else {
+                Ok(Ok(tls_stream)) => match tls_stream.get_ref().1.alpn_protocol() {
+                    Some(b"h2") => web::serve_h2(tls_stream, wt_info, http_state, peer_addr).await,
+                    // Only offered with tcp_fallback on
+                    Some(b"http/1.1") => {
+                        tunnel::tune(tls_stream.get_ref().0, peer_addr);
+                        tunnel::serve(tls_stream, http_state, peer_addr).await;
+                    }
+                    _ => {
                         debug!(peer = %peer_addr, "legacy (pre-0.5) client, telling it to update");
                         tcp::reject_legacy(tls_stream).await;
                     }
-                }
+                },
                 Ok(Err(e)) => {
                     // Browsers open speculative connections and drop them
                     // without a ClientHello; that is normal traffic, not an error.
@@ -477,6 +497,19 @@ async fn main() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(500)).await;
     info!("server shut down");
     Ok(())
+}
+
+/// What the TLS listener offers. `h2` comes first because rustls picks in the
+/// server's order: a browser loading the page offers both and gets HTTP/2.
+/// `http/1.1` is there for one thing only, the TCP fallback's WebSocket
+/// (tunnel.rs) — a new WebSocket connection offers nothing else — and without
+/// the fallback anything offering just http/1.1 fails the handshake, as before.
+fn alpn_protocols(tcp_fallback: bool) -> Vec<Vec<u8>> {
+    let mut alpn = vec![b"h2".to_vec()];
+    if tcp_fallback {
+        alpn.push(b"http/1.1".to_vec());
+    }
+    alpn
 }
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
@@ -512,6 +545,53 @@ fn load_key(path: &str) -> Result<PrivateKeyDer<'static>> {
 mod tests {
     use super::*;
     use std::net::Ipv4Addr;
+
+    /// A page load must keep getting HTTP/2, and only the fallback may offer
+    /// the WebSocket's http/1.1. Through a real handshake, because it is also
+    /// what a native client sees on a server with the fallback off: refused
+    /// on ALPN before any certificate is looked at, with the alert the client
+    /// turns into "this server has no TCP fallback" (transport.rs).
+    #[tokio::test]
+    async fn http1_is_offered_only_with_the_fallback() {
+        use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
+
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let operator = wtransport::Identity::self_signed(["localhost"]).unwrap();
+        let cert = CertificateDer::from(operator.certificate_chain().as_slice()[0].der().to_vec());
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
+            operator.private_key().secret_der().to_vec(),
+        ));
+        let handshake = |fallback: bool, offer: &'static [u8]| {
+            let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_no_client_auth()
+                .with_single_cert(vec![cert.clone()], key.clone_key())
+                .unwrap();
+            server.alpn_protocols = alpn_protocols(fallback);
+            // No roots: a handshake that gets past ALPN fails on the certificate
+            let mut client = rustls::ClientConfig::builder_with_provider(provider.clone())
+                .with_protocol_versions(&[&rustls::version::TLS13])
+                .unwrap()
+                .with_root_certificates(rustls::RootCertStore::empty())
+                .with_no_client_auth();
+            client.alpn_protocols = vec![offer.to_vec()];
+            async move {
+                let (c, s) = tokio::io::duplex(1 << 16);
+                tokio::spawn(async move { TlsAcceptor::from(Arc::new(server)).accept(s).await });
+                let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
+                let name = ServerName::try_from("localhost").unwrap();
+                connector.connect(name, c).await.unwrap_err().to_string()
+            }
+        };
+
+        let refused = handshake(false, b"http/1.1").await;
+        assert!(refused.contains("NoApplicationProtocol"), "{refused}");
+        let past_alpn = handshake(true, b"http/1.1").await;
+        assert!(!past_alpn.contains("NoApplicationProtocol"), "{past_alpn}");
+        assert_eq!(alpn_protocols(true)[0], b"h2", "page loads would get HTTP/1.1");
+        assert_eq!(alpn_protocols(false), [b"h2".to_vec()]);
+    }
 
     /// The connection *counts* are handed back when a connection ends, so on
     /// their own they let one peer dial as fast as it can as long as it hangs

@@ -1,4 +1,5 @@
-import { writable } from "svelte/store";
+import { derived, writable } from "svelte/store";
+import { uiPrefs } from "./ui-prefs.js";
 
 export interface ScreenShareInfo {
   user_id: number;
@@ -28,6 +29,44 @@ export const viewerCount = writable<number>(0);
 
 // Current frame as data URL (base64 JPEG)
 export const currentFrame = writable<string | null>(null);
+
+// ── Our own share, as we send it ───────────────────────────────────────────
+
+/** The native preview of our own share, a JPEG data URL (`screenshare-preview`).
+ *  The browser shows its MediaStream instead and never sets this. */
+export const previewFrame = writable<string | null>(null);
+
+/** Our preview enlarged into the stream view, where a watched share goes. */
+export const previewStage = writable(false);
+
+/**
+ * What the stream view shows: a share we watch, our own preview, or nothing.
+ *
+ * The one answer every layout reads — the modern overlay, its swipe guard and
+ * the classic centre column — so none of them can disagree about whether the
+ * view is open. Watching wins: there is one view, and while somebody else's
+ * share is in it our own preview stays the floating card.
+ */
+export const streamStage = derived(
+  [watchingUserId, poppedOut, previewStage, isSharingScreen],
+  ([$watching, $popped, $stage, $sharing]): "watch" | "preview" | null =>
+    $watching !== null && !$popped ? "watch" : $stage && $sharing ? "preview" : null,
+);
+
+/** Is our own preview on screen anywhere — the floating card or the stream
+ *  view? Native capture runs for it and renders it only then. */
+export const previewShown = derived(
+  [isSharingScreen, streamStage, uiPrefs],
+  ([$sharing, $stage, $prefs]) => $sharing && ($stage === "preview" || $prefs.share_preview),
+);
+
+// A share's preview ends with it
+isSharingScreen.subscribe((sharing) => {
+  if (!sharing) {
+    previewStage.set(false);
+    previewFrame.set(null);
+  }
+});
 
 // Settings chosen when starting share (needed for start_screen_capture later)
 export const shareResolution = writable<number>(720);
@@ -84,6 +123,8 @@ export function resetScreenShareState() {
   isSharingScreen.set(false);
   viewerCount.set(0);
   currentFrame.set(null);
+  previewFrame.set(null);
+  previewStage.set(false);
   shareResolution.set(720);
   shareFps.set(30);
   showSourcePicker.set(false);

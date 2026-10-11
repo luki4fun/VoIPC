@@ -22,6 +22,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v5
+        # No token left in .git/config for build scripts to find
+        with: { persist-credentials: false }
 
       # The same list the Linux release job installs; voipc-video links FFmpeg
       # and voipc-client links the desktop stack even for `cargo test`.
@@ -88,6 +90,8 @@ jobs:
       CHROME: /usr/bin/google-chrome
     steps:
       - uses: actions/checkout@v5
+        # No token left in .git/config for build scripts to find
+        with: { persist-credentials: false }
 
       - name: System dependencies
         run: |
@@ -156,3 +160,15 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./test-web.sh
         env: { BROWSER_ALICE: firefox, BROWSER_BOB: chromium }
+      # The TCP fallback for servers whose UDP is blocked: the whole run over
+      # the WebSocket tunnel, then a Firefox sharer on the tunnel (its
+      # WebSocket must land on http/1.1, not the page's h2) against a
+      # Chromium viewer on QUIC — the relay is the same across the two.
+      - name: Chromium ↔ Chromium over TCP
+        if: ${{ !cancelled() }}
+        run: ./test-web.sh
+        env: { BROWSER: chromium, TRANSPORT: tcp }
+      - name: Firefox over TCP shares, Chromium over QUIC watches
+        if: ${{ !cancelled() }}
+        run: ./test-web.sh
+        env: { BROWSER_ALICE: firefox, TRANSPORT_ALICE: tcp, BROWSER_BOB: chromium }

@@ -10,6 +10,7 @@
     shareFps,
     currentSourceType,
     currentSourceId,
+    viewerCount,
   } from "../stores/screenshare.js";
 
   interface DisplayInfo {
@@ -120,6 +121,9 @@
           resolution,
           fps,
         });
+        // A new share starts unwatched: a count left from the last one would
+        // start capture (in the browser, encoding) for nobody
+        viewerCount.set(0);
         isSharingScreen.set(true);
       }
       currentSourceType.set(sourceType);
