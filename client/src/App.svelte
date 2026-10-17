@@ -881,6 +881,8 @@
         // Only the voice connection plays audio; anything else is a straggler
         // from the one voice just left, and its ids are another server's.
         if (!inVoice(server)) return;
+        // A new set wakes every member list; only when the answer moved
+        if (get(speakingUsers).has(data.user_id) === data.speaking) return;
         speakingUsers.update((set) => {
           const next = new Set(set);
           if (data.speaking) {
@@ -1439,15 +1441,15 @@
             senderFps.set(Math.round(sentDelta / dt));
             lastFramesSent = framesSent;
 
-            const sentBytesDelta = bytesSent - lastBytesSent;
+            const sentBytesDelta = Math.max(0, bytesSent - lastBytesSent);
             senderBitrate.set(Math.round((sentBytesDelta * 8) / (dt * 1000)));
             lastBytesSent = bytesSent;
 
-            const recvDelta = framesRecv - lastFramesRecv;
+            const recvDelta = Math.max(0, framesRecv - lastFramesRecv);
             receiverFps.set(Math.round(recvDelta / dt));
             lastFramesRecv = framesRecv;
 
-            const recvBytesDelta = bytesRecv - lastBytesRecv;
+            const recvBytesDelta = Math.max(0, bytesRecv - lastBytesRecv);
             receiverBitrate.set(Math.round((recvBytesDelta * 8) / (dt * 1000)));
             lastBytesRecv = bytesRecv;
 

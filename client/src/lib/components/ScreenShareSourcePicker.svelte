@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { addNotification } from "../stores/notifications.js";
   import { canShareDisplayAudio } from "../display-capture.js";
@@ -37,8 +38,9 @@
   let loading = $state(true);
   let platform = $state<string>("linux");
 
-  // Load sources on mount
-  $effect(() => {
+  // Load sources on mount — once: an effect would fetch again whenever
+  // something the fetch reads changed
+  onMount(() => {
     loadSources();
   });
 

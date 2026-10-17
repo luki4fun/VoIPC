@@ -196,7 +196,7 @@ impl Routing {
 
     /// Whether a live table is driving this channel; the admin-visible answer
     /// to "is the game server actually talking to us".
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn table_live(&self, channel_id: ChannelId, now: Instant) -> bool {
         self.tables
             .get(&channel_id)

@@ -103,7 +103,7 @@ impl Encoder {
             }
         };
 
-        if width % 2 != 0 || height % 2 != 0 {
+        if !width.is_multiple_of(2) || !height.is_multiple_of(2) {
             bail!("{video_codec:?} encoder: width and height must be divisible by 2");
         }
 
@@ -307,7 +307,10 @@ impl Encoder {
     /// If the encoder uses NV12 format (e.g. QSV), the I420 data is converted
     /// automatically by interleaving the U and V planes.
     pub fn encode(&mut self, i420_data: &[u8], pts: i64, force_keyframe: bool) -> Result<Vec<EncodedFrame>> {
-        let expected_size = (self.width as usize) * (self.height as usize) * 3 / 2;
+        // Chroma is half size rounded up, which is what the copy below reads:
+        // `w*h*3/2` comes out short for odd sizes and the copy slices past it.
+        let (w, h) = (self.width as usize, self.height as usize);
+        let expected_size = w * h + 2 * w.div_ceil(2) * h.div_ceil(2);
         if i420_data.len() < expected_size {
             bail!(
                 "{:?} encoder: I420 data too short (got {}, expected {})",
@@ -324,10 +327,8 @@ impl Encoder {
             frame.set_kind(ffmpeg::picture::Type::I);
         }
 
-        let w = self.width as usize;
-        let h = self.height as usize;
-        let uv_w = (w + 1) / 2;
-        let uv_h = (h + 1) / 2;
+        let uv_w = w.div_ceil(2);
+        let uv_h = h.div_ceil(2);
         let y_size = w * h;
         let uv_size = uv_w * uv_h;
 
@@ -568,6 +569,26 @@ mod tests {
 
             let mut dec = Decoder::new(codec).unwrap();
             assert!(!dec.decode(&frames[0].data).unwrap().is_empty());
+        }
+    }
+
+    /// A frame bigger than the viewer's cap is an error from the decoder, not
+    /// an allocation of whatever size the sharer's parameter sets claim.
+    #[test]
+    fn decoder_refuses_frames_over_its_pixel_cap() {
+        for codec in NATIVE {
+            let mut enc = Encoder::new(codec, 128, 128, 500, 30).unwrap();
+            let i420 = vec![128u8; 128 * 128 + 2 * 64 * 64];
+            let frames = enc.encode(&i420, 0, true).unwrap();
+
+            let mut capped = Decoder::with_max_pixels(codec, 64 * 64).unwrap();
+            let got = capped.decode(&frames[0].data);
+            assert!(
+                got.as_ref().map_or(true, |f| f.is_empty()),
+                "{codec:?}: a 128x128 frame came out of a 64x64 decoder"
+            );
+            let mut normal = Decoder::new(codec).unwrap();
+            assert!(!normal.decode(&frames[0].data).unwrap().is_empty());
         }
     }
 

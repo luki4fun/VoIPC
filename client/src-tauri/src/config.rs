@@ -8,7 +8,7 @@ static DATA_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 /// Set the data directory explicitly. Called from lib.rs setup on Android
 /// with Tauri's app_data_dir(). Must be called before any other config function.
-#[allow(dead_code)]
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
 pub fn init_data_dir(dir: PathBuf) {
     let _ = DATA_DIR_OVERRIDE.set(dir);
 }
@@ -34,6 +34,7 @@ impl Default for SoundEntry {
 /// All notification sound settings.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+#[derive(Default)]
 pub struct SoundSettings {
     pub channel_switch: SoundEntry,
     pub user_joined: SoundEntry,
@@ -44,19 +45,6 @@ pub struct SoundSettings {
     pub poke: SoundEntry,
 }
 
-impl Default for SoundSettings {
-    fn default() -> Self {
-        Self {
-            channel_switch: SoundEntry::default(),
-            user_joined: SoundEntry::default(),
-            user_left: SoundEntry::default(),
-            disconnected: SoundEntry::default(),
-            direct_message: SoundEntry::default(),
-            channel_message: SoundEntry::default(),
-            poke: SoundEntry::default(),
-        }
-    }
-}
 
 /// A saved server entry shown in the connect dialog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -270,6 +258,7 @@ impl Default for AppConfig {
 /// Returns the VoIPC data directory.
 /// - Desktop: `~/.config/VoIPC/` (Linux) or `%APPDATA%/VoIPC` (Windows)
 /// - Android: Tauri's `app_data_dir()` (set via `init_data_dir` in setup)
+///
 /// Creates the directory if it doesn't exist.
 pub fn data_dir() -> PathBuf {
     let dir = if let Some(d) = DATA_DIR_OVERRIDE.get() {

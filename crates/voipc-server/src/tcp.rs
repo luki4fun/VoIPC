@@ -447,7 +447,6 @@ where
 
                     let mut session = crate::state::UserSession::new(
                         user_id,
-                        session_id,
                         username.clone(),
                         placeholder_tx,
                         media_tx,
@@ -830,15 +829,45 @@ async fn handle_message(
             channel_id,
             target_user_id,
         } => {
-            handle_send_invite(state, user_id, channel_id, target_user_id, tx).await?;
+            // An invite raises a popup on the target's screen, every time it
+            // is sent — the invite set dedupes, the notification does not. The
+            // same budget as a poke, for the same reason.
+            let allowed = state
+                .sessions
+                .get_mut(&session_id)
+                .map(|mut s| s.chat_rate.try_consume())
+                .unwrap_or(false);
+            if !allowed {
+                let _ = send_msg(tx, &ServerMessage::ChannelError {
+                    reason: "sending too fast, slow down".into(),
+                }).await;
+            } else {
+                handle_send_invite(state, user_id, channel_id, target_user_id, tx).await?;
+            }
         }
         ClientMessage::AcceptInvite { channel_id } => {
+            // Whether there is anything to accept, read before the join spends
+            // the invite. The join answers Ok whether or not it went through,
+            // so without this anybody could make any creator's client say that
+            // somebody of their choosing had accepted.
+            let invited = {
+                let channels = state.channels.read().await;
+                channels
+                    .get(&channel_id)
+                    .is_some_and(|ch| ch.invited_users.contains(&user_id))
+            };
+            if !invited {
+                return Ok(());
+            }
             // Join with no password — validate_join will check invite set
             handle_join_channel(state, user_id, session_id, channel_id, None, tx).await?;
-            // Notify the channel creator that the invite was accepted
+            // Notify the channel creator, if the join really happened
             let creator_id = {
                 let channels = state.channels.read().await;
-                channels.get(&channel_id).and_then(|ch| ch.created_by)
+                channels
+                    .get(&channel_id)
+                    .filter(|ch| ch.members.contains(&user_id))
+                    .and_then(|ch| ch.info.created_by)
             };
             if let Some(creator_id) = creator_id {
                 if let Some(creator_sid) = state.user_to_session.get(&creator_id) {
@@ -1946,7 +1975,7 @@ async fn handle_decline_invite(
         let channels = state.channels.read().await;
         channels
             .get(&channel_id)
-            .and_then(|ch| ch.created_by)
+            .and_then(|ch| ch.info.created_by)
     };
 
     // A decline for a channel nobody invited us to is a message of the
@@ -2223,7 +2252,7 @@ async fn handle_start_screen_share(
         .unwrap_or(0);
 
     match state
-        .start_screen_share(user_id, session_id, channel_id, resolution, codec)
+        .start_screen_share(user_id, session_id, channel_id, codec)
         .await
     {
         Ok(member_sessions) => {
@@ -3708,6 +3737,52 @@ mod tests {
         alice.send(&dm).await;
         let got = alice.expect("the answer", answer).await;
         assert!(matches!(got, ServerMessage::DirectMessageUndelivered { target_user_id: 2 }));
+    }
+
+    /// An `AcceptInvite` for a channel that never invited you joined nothing,
+    /// and used to tell the channel's creator you had accepted all the same.
+    #[tokio::test]
+    async fn an_acceptance_without_an_invite_reaches_nobody() {
+        let state = admin_state();
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut alice = connect(&state, "alice", lo).await;
+        let mut bob = connect(&state, "bob", lo).await; // user 2
+        alice
+            .send(&ClientMessage::CreateChannel {
+                name: "Room".into(),
+                password: Some("pw".into()),
+                proximity: ProximityMode::Off,
+                anonymous: false,
+                text: false,
+            })
+            .await;
+        let created = alice
+            .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))
+            .await;
+        let ServerMessage::ChannelCreated { channel } = created else { unreachable!() };
+        let room = channel.channel_id;
+        let pong = |m: &ServerMessage| {
+            matches!(m, ServerMessage::Pong { .. } | ServerMessage::InviteAccepted { .. })
+        };
+
+        // Uninvited: bob's handler is done with it once his Pong is back, and
+        // anything it sent alice is then queued ahead of hers
+        bob.send(&ClientMessage::AcceptInvite { channel_id: room }).await;
+        bob.send(&ClientMessage::Ping { timestamp: 1 }).await;
+        bob.expect("Pong", |m| matches!(m, ServerMessage::Pong { .. })).await;
+        alice.send(&ClientMessage::Ping { timestamp: 2 }).await;
+        let got = alice.expect("Pong", pong).await;
+        assert!(matches!(got, ServerMessage::Pong { .. }), "fake acceptance: {got:?}");
+
+        // Invited: the acceptance does go through
+        alice
+            .send(&ClientMessage::SendInvite { channel_id: room, target_user_id: 2 })
+            .await;
+        bob.expect("InviteReceived", |m| matches!(m, ServerMessage::InviteReceived { .. }))
+            .await;
+        bob.send(&ClientMessage::AcceptInvite { channel_id: room }).await;
+        let got = alice.expect("InviteAccepted", pong).await;
+        assert!(matches!(got, ServerMessage::InviteAccepted { user_id: 2, .. }));
     }
 
     /// `hide_members` and a password both mean "nobody outside learns who is

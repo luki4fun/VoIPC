@@ -119,6 +119,14 @@ pub struct Link {
 ///
 /// `VOIPC_TRANSPORT=tcp` skips QUIC, to test the fallback without blocking UDP.
 pub async fn connect(host: &str, port: u16, accept_invalid_certs: bool) -> Result<Link, String> {
+    let link = connect_any(host, port, accept_invalid_certs).await;
+    if accept_invalid_certs {
+        tofu_settle(&tofu_key(host, port), link.is_ok());
+    }
+    link
+}
+
+async fn connect_any(host: &str, port: u16, accept_invalid_certs: bool) -> Result<Link, String> {
     let addrs: Vec<SocketAddr> =
         tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host((host, port)))
             .await
@@ -797,6 +805,32 @@ impl ServerCertVerifier for VerifyAs {
 static TOFU_STORE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<u8>>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(tofu_load_from_disk()));
 
+/// First sight of a server's certificate, until the connection it was shown
+/// on is up. The verifier runs before the handshake proves the server holds
+/// the key, so pinning there let anybody on the path who could show *a*
+/// certificate — with no key behind it — pin theirs, and lock the real server
+/// out as "fingerprint changed".
+static TOFU_PENDING: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<u8>>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Pin what the verifier saw first on a connect that succeeded; forget it on
+/// one that did not.
+fn tofu_settle(key: &str, connected: bool) {
+    let seen = TOFU_PENDING
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(key);
+    let Some(fingerprint) = seen.filter(|_| connected) else {
+        return;
+    };
+    let mut store = TOFU_STORE.lock().unwrap_or_else(|p| p.into_inner());
+    if !store.contains_key(key) {
+        info!("TOFU: pinning certificate for {} (first connection)", key);
+        store.insert(key.to_string(), fingerprint);
+        tofu_save_to_disk(&store);
+    }
+}
+
 /// Load TOFU pins from disk. Returns empty map on any error.
 fn tofu_load_from_disk() -> HashMap<String, Vec<u8>> {
     use base64::{engine::general_purpose::STANDARD, Engine};
@@ -874,7 +908,7 @@ impl ServerCertVerifier for TofuCertVerifier {
         let fp_bytes = fingerprint.as_ref().to_vec();
         let host_key = &self.key;
 
-        let mut store = TOFU_STORE.lock().unwrap_or_else(|p| {
+        let store = TOFU_STORE.lock().unwrap_or_else(|p| {
             warn!("mutex poisoned, recovering");
             p.into_inner()
         });
@@ -897,10 +931,13 @@ impl ServerCertVerifier for TofuCertVerifier {
             }
             info!("TOFU: certificate fingerprint matches for {}", host_key);
         } else {
-            // First connection — pin the certificate and persist to disk
-            info!("TOFU: pinning certificate for {} (first connection)", host_key);
-            store.insert(host_key.clone(), fp_bytes);
-            tofu_save_to_disk(&store);
+            // First connection: pinned by `connect` once the handshake has
+            // proved the key (`tofu_settle`), not here
+            drop(store);
+            TOFU_PENDING
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(host_key.clone(), fp_bytes);
         }
 
         Ok(ServerCertVerified::assertion())
@@ -952,6 +989,27 @@ impl ServerCertVerifier for TofuCertVerifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The verifier sees the certificate before the handshake proves the
+    /// server holds its key, so it must not pin by itself: only a connect
+    /// that went through does (`tofu_settle`).
+    #[test]
+    fn first_sight_pins_nothing_until_the_connection_is_up() {
+        let key = tofu_key("tofu-test.invalid", 1);
+        let verifier = TofuCertVerifier { key: key.clone() };
+        let cert = CertificateDer::from(vec![1u8, 2, 3]);
+        let name = ServerName::try_from("tofu-test.invalid").unwrap();
+        verifier
+            .verify_server_cert(&cert, &[], &name, &[], UnixTime::now())
+            .unwrap();
+        assert!(!TOFU_STORE.lock().unwrap().contains_key(&key));
+        assert!(TOFU_PENDING.lock().unwrap().contains_key(&key));
+
+        // A handshake that failed leaves nothing behind
+        tofu_settle(&key, false);
+        assert!(!TOFU_PENDING.lock().unwrap().contains_key(&key));
+        assert!(!TOFU_STORE.lock().unwrap().contains_key(&key));
+    }
 
     #[test]
     fn accept_key_matches_the_rfc_example() {

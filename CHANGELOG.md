@@ -2,6 +2,99 @@
 
 All notable changes to VoIPC are documented here.
 
+## [0.11.1] - 2026-10-17
+
+A review of the whole app, and what it found: a microphone that could stay on
+after a quick push-to-talk, a self-test anybody could start with a link, a
+certificate pin a stranger could plant, and a share size nobody checked.
+Protocol version 10, unchanged. A server still admits only a client of its own
+version, so update both together.
+
+### Fixed — the microphone
+
+- **A quick tap of push-to-talk could leave the microphone on.** The release
+  could arrive while the microphone was still opening, find nothing to close,
+  and the microphone opened afterwards with no key held. The window's keys and
+  the system-wide hotkeys now both close it the moment it is open
+- **In a browser, switching windows while holding push-to-talk left the
+  microphone on**: the release went to the other window. Leaving the window
+  now counts as letting go
+- **Voice activation and always-on stayed silent after unmuting** if you had
+  joined while muted
+- **"Hold modifier to talk" now works for the system-wide hotkeys too.**
+  Releasing the trigger key keeps you talking while the modifier is held, as
+  the setting says and the window's own keys already did
+- Closing the settings, the mixer or the audio setup while a microphone or
+  spatial test was still starting left the test running, with nothing on
+  screen to stop it
+
+### Fixed — everything else
+
+- **Stopping a screen share on Linux left the desktop's "sharing" indicator
+  on**: the portal session was never closed
+- **Disconnecting could hang for ever on a stuck audio or capture device**,
+  and every reconnect to that server with it
+- **The chat jumped to its newest message whenever anybody wrote, anywhere**,
+  on any server, pulling you out of the history you were reading. It follows
+  only the conversation on screen now, and only when you are at its end
+- A busy channel's chat was saved only once it went quiet for two seconds. It
+  is now saved at least every ten
+- A failed change to position sharing left its checkbox showing the wrong state
+- A restarted share no longer shows a negative frame rate or bitrate
+- At most eight notifications are shown, and a security warning that repeats
+  is shown once
+- In a browser: the output test could not be started again after one failed
+  attempt; a double click on Watch leaked a decoder and a timer; switching the
+  microphone while pressing push-to-talk could leave a second capture open; and
+  leaving a server could drop its goodbye
+
+### Security
+
+- **rustls 0.23.46.** Four advisories against 0.23.45 were published on
+  2026-10-14. The worst, rated medium, is TLS secrets in its debug output
+- **The browser client no longer ships its built-in self-test.** For a page
+  opened with `?selftest` it connects, joins a channel, writes in it and opens
+  the microphone, all with nothing on screen. A link to your own server could
+  do that to anybody who had allowed it the microphone. It is now in test
+  builds only: `VOIPC_SELFTEST=1 npm run web`
+- **A self-signed certificate is pinned only once the connection proves it.**
+  On a first connection the certificate was remembered before the handshake
+  had shown that the server holds its key. Anybody on the path could get theirs
+  pinned instead, and the real server was then refused as "fingerprint changed"
+- **A viewer decodes a share of at most 4096×4096.** The size came from the
+  sharer's own stream, and one crafted keyframe could make every viewer
+  allocate gigabytes
+- **Accepting an invite nobody sent no longer tells the channel's creator that
+  you accepted.** Any user could make any creator see it
+- **Invites cost what a poke costs.** Each one raises a popup, and a creator
+  could send fifty a second
+- **Watching somebody who is not sharing no longer stops the stream you are
+  watching.** Nor does it let you send that person keyframe requests and loss
+  reports any more
+- **The desktop mixer holds at most 256 voices.** The sender id in a media
+  header is not covered by the encryption, so a malicious server could turn one
+  packet into a new decoder per id, without end
+- **MumbleLink reads only a regular file of your own in `/dev/shm`.** Another
+  user of the same machine could leave a pipe there under your name, which
+  blocked the app, or a file of their own that fed it positions
+- **Android's hardware decoder checks the sizes and buffer bounds the codec
+  reports**, and passes its errors on, so the viewer asks for a keyframe
+  instead of staying blank
+- Guards against panics on odd frame sizes and strides, a zero jitter delay,
+  pre-key ids at the end of their range, and chat history that is not a list
+
+### Performance
+
+- A missing media key logged a line per packet: fifty a second per speaker,
+  after every join. Now at most one a second
+- Unlocking or creating the chat history no longer stalls the app for half a
+  second
+- Voice activation no longer redraws every member list fifteen times a second
+- A full chat no longer rebuilds all 500 rows for each new message
+- Fewer copies per packet in the media encryption, and one video scaler per
+  stream instead of one per frame
+- At most four notification sounds play at once
+
 ## [0.11.0] - 2026-10-11
 
 Whoever shares a screen now sees what they are sending, and a share no longer

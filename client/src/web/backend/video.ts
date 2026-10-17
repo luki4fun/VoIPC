@@ -55,6 +55,13 @@ export class VideoViewer implements VideoApi {
   private assembler: VideoAssembler | null = null;
   private sharerUserId = 0;
   private watching = false;
+  /**
+   * Bumped by every start and stop. Two starts for the same sharer while the
+   * codec probe is out (a double click) both got past the check below, and
+   * the second overwrote the first's assembler and loss-report timer, which
+   * nothing could free or clear after that.
+   */
+  private watchGen = 0;
   /** A fresh decoder must see a key chunk first (WebCodecs rejects deltas). */
   private needKeyframe = true;
   /**
@@ -100,8 +107,9 @@ export class VideoViewer implements VideoApi {
     this.resolution = 0;
     this.firstFrameShown = false;
 
+    const gen = this.watchGen;
     const decoderCodec = await this.probeCodec(codec);
-    if (!this.watching || this.sharerUserId !== sharerUserId) return; // stopped meanwhile
+    if (gen !== this.watchGen) return; // stopped, or started again, meanwhile
     if (!decoderCodec) {
       this.watching = false;
       this.sharerUserId = 0;
@@ -123,6 +131,7 @@ export class VideoViewer implements VideoApi {
   }
 
   stopWatching(): void {
+    this.watchGen++;
     this.watching = false;
     this.sharerUserId = 0;
     if (this.lossReportTimer !== null) {

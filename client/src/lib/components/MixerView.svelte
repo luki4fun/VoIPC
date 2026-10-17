@@ -48,7 +48,6 @@
     selectedStrip,
     setLaneField,
     setUserVolume,
-    sourceLevels,
     toggleUserMute,
     userFx,
     userVolumes,
@@ -163,7 +162,6 @@
         next[u.user_id] = Math.max(dbToPercent(db), (meters[u.user_id] ?? 0) * METER_RELEASE);
       }
       meters = next;
-      sourceLevels.set(new Map(Object.entries(levels).map(([k, v]) => [Number(k), v])));
     } catch {
       meters = {};
     }
@@ -200,6 +198,7 @@
   // ── The microphone test, which lives with our own strip ────────────────
 
   let micTesting = $state(false);
+  let destroyed = false;
   /** Dropped when the test stops, so the meter goes back to the capture task. */
   let micTestUnlisten: Array<() => void> = [];
 
@@ -222,6 +221,12 @@
           }),
         );
         await invoke("start_mic_test", { monitor: $micMonitor });
+        // Closed while it was starting: onDestroy saw no test to stop
+        if (destroyed) {
+          invoke("stop_mic_test").catch(() => {});
+          stopListeningToMicTest();
+          return;
+        }
         micTesting = true;
       }
     } catch (e) {
@@ -238,6 +243,7 @@
   }
 
   onDestroy(() => {
+    destroyed = true;
     if (micTesting) invoke("stop_mic_test").catch(() => {});
     micTestUnlisten.forEach((off) => off());
   });

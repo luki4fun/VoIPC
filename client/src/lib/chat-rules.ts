@@ -163,11 +163,14 @@ export function plausibleTimestamp(t: number, now = Date.now()): boolean {
  * account, and it also means a peer cannot forge one of our own dividers.
  */
 export function sanitizeHistory(
-  incoming: unknown[],
+  incoming: unknown,
   policyTtlSecs?: number | null,
   now = Date.now(),
 ): ChatMessage[] {
   const valid: ChatMessage[] = [];
+  // A peer's JSON, parsed and handed straight here: `{}` or `null` is as
+  // possible as a list, and has nothing to offer
+  if (!Array.isArray(incoming)) return valid;
   for (const raw of incoming.slice(-HISTORY_MAX_MESSAGES)) {
     const m = raw as Partial<ChatMessage> | null;
     if (

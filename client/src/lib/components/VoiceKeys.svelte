@@ -13,8 +13,9 @@
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { onMount, onDestroy } from "svelte";
+  import { get } from "svelte/store";
 
-  import { connectionState, isTransmitting, voiceUserId } from "../stores/connection.js";
+  import { connectionState, isMuted, isTransmitting, voiceUserId } from "../stores/connection.js";
   import { voice, voiceServer } from "../stores/channels.js";
   import { speakingUsers } from "../stores/users.js";
   import { audioSetupOpen, pttKey, pttHoldMode } from "../stores/settings.js";
@@ -51,6 +52,7 @@
       !voiceDisabled &&
       $voiceState === "connected" &&
       !$isTransmitting &&
+      !$isMuted &&
       !$audioSetupOpen
     ) {
       startTransmit();
@@ -87,19 +89,22 @@
   // Update local user's speaking state in VAD mode based on audio level vs threshold.
   // This makes the local user's indicator in the UserList reflect actual voice activity
   // (the server doesn't relay our own voice packets back to us).
+  //
+  // Only on a change: the level arrives fifteen times a second, and a new set
+  // each time re-rendered every member list on screen. And off when voice
+  // activation stops or we mute, or our ring stayed lit.
   $effect(() => {
-    if ($voiceMode === "vad" && $isTransmitting && $voiceUserId > 0) {
-      const speaking = $audioLevel >= $vadThreshold;
-      speakingUsers.update((set) => {
-        const next = new Set(set);
-        if (speaking) {
-          next.add($voiceUserId);
-        } else {
-          next.delete($voiceUserId);
-        }
-        return next;
-      });
-    }
+    const id = $voiceUserId;
+    if (id <= 0) return;
+    const speaking =
+      $voiceMode === "vad" && $isTransmitting && !$isMuted && $audioLevel >= $vadThreshold;
+    if (speaking === get(speakingUsers).has(id)) return;
+    speakingUsers.update((set) => {
+      const next = new Set(set);
+      if (speaking) next.add(id);
+      else next.delete(id);
+      return next;
+    });
   });
 
   // Parse the PTT binding string (e.g. "Ctrl+Space", "ControlLeft") into parts
@@ -179,10 +184,12 @@
     keyupHandler = (e: KeyboardEvent) => {
       // No input/textarea guard here (unlike keydown): releasing the PTT
       // key must always stop the mic, even if focus moved into the chat
-      // box while it was held. The path is gated on $isTransmitting.
+      // box while it was held. Not gated on $isTransmitting either: a start
+      // still opening the device is not transmitting yet, and has to be
+      // told (stores/voice.ts).
 
       // Stop transmit when the released key breaks the PTT binding
-      if ($voiceMode === "ptt" && $isTransmitting && shouldStopPtt(e)) {
+      if ($voiceMode === "ptt" && shouldStopPtt(e)) {
         e.preventDefault();
         stopTransmit();
       }
@@ -190,6 +197,10 @@
 
     window.addEventListener("keydown", keydownHandler);
     window.addEventListener("keyup", keyupHandler);
+    // In a browser the window keys are the only keys: switch away while
+    // holding push-to-talk and the release goes to another window, leaving
+    // the mic open. The desktop app's OS-wide hotkeys see that release.
+    if (__WEB__) window.addEventListener("blur", releaseOnBlur);
 
     // Tray menu and global hotkeys request toggles via these events —
     // routed through the same functions so UI + server stay in sync
@@ -201,9 +212,14 @@
     );
   });
 
+  function releaseOnBlur() {
+    if ($voiceMode === "ptt") stopTransmit();
+  }
+
   onDestroy(() => {
     if (keydownHandler) window.removeEventListener("keydown", keydownHandler);
     if (keyupHandler) window.removeEventListener("keyup", keyupHandler);
+    window.removeEventListener("blur", releaseOnBlur);
     toggleUnlisten.forEach((fn) => fn());
   });
 </script>

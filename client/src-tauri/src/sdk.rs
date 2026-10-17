@@ -20,7 +20,7 @@
 //! VoIPC → game
 //!   {"type":"state","state":"ingame","user_id":42,"username":"Luki#0420",
 //!    "channel":"Ingame","proximity":"3d","muted":false,"deafened":false,
-//!    "version":"0.11.0","sdk":1,
+//!    "version":"0.11.1","sdk":1,
 //!    "capabilities":["spatial","direct","volume","muffle","radio","phone","talk",
 //!                    "reverb","underwater"]}
 //!   {"type":"talk","user_id":42,"speaking":true}
@@ -1930,11 +1930,11 @@ mod tests {
 
     #[test]
     fn frames_are_written_with_the_right_length_form() {
-        let short = frame_bytes(0x1, &vec![b'x'; 10]);
+        let short = frame_bytes(0x1, &[b'x'; 10]);
         assert_eq!(short[0], 0x81);
         assert_eq!(short[1], 10);
 
-        let medium = frame_bytes(0x1, &vec![b'x'; 200]);
+        let medium = frame_bytes(0x1, &[b'x'; 200]);
         assert_eq!(medium[1], 126);
         assert_eq!(u16::from_be_bytes([medium[2], medium[3]]), 200);
 

@@ -126,6 +126,8 @@
   let heard = $state(false);
   let clipped = $state(false);
   let unlisten: Array<() => void> = [];
+  /** A test still starting when the dialog closes stops itself on arrival. */
+  let destroyed = false;
 
   const levelPercent = $derived(Math.max(0, Math.min(100, ((levelDb + 60) / 60) * 100)));
 
@@ -146,6 +148,8 @@
         }),
       );
       await invoke("start_mic_test", { monitor: false });
+      // Closed while it was starting: onDestroy's stop ran first and missed it
+      if (destroyed) return void stopMicTest();
       micTesting = true;
     } catch (e) {
       error = String(e);
@@ -188,6 +192,7 @@
         }),
       );
       await invoke("start_output_test");
+      if (destroyed) return void stopOutputTest();
       playing = true;
     } catch (e) {
       error = String(e);
@@ -317,6 +322,7 @@
   });
 
   onDestroy(() => {
+    destroyed = true;
     audioSetupOpen.set(false);
     unlisten.forEach((off) => off());
     outUnlisten.forEach((off) => off());

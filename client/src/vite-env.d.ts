@@ -3,6 +3,9 @@
 /** true in the browser build (`vite --mode web`), false in the Tauri app. Set by vite.config.ts. */
 declare const __WEB__: boolean;
 
+/** true only in a web build made with VOIPC_SELFTEST=1, for test-web.sh. Set by vite.config.ts. */
+declare const __SELFTEST__: boolean;
+
 /** Workspace version, read from client/package.json at build time. */
 declare const __APP_VERSION__: string;
 

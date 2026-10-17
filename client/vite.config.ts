@@ -75,6 +75,10 @@ export default defineConfig(({ mode }) => {
     envPrefix: ["VITE_", "TAURI_"],
     define: {
       __WEB__: web,
+      // The headless self-test (src/web/selftest.ts) connects, joins, writes
+      // and opens the microphone with nothing on screen, for any page loaded
+      // with `?selftest`. A test build only: `VOIPC_SELFTEST=1 npm run web`.
+      __SELFTEST__: web && process.env.VOIPC_SELFTEST === "1",
       __APP_VERSION__: JSON.stringify(pkg.version),
       __BUILD_HASH__: JSON.stringify(stamp.hash),
       __BUILD_TIME__: JSON.stringify(stamp.time),

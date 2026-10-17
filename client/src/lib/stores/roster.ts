@@ -90,6 +90,18 @@ export const displayChannelCreatorId: Readable<number | null> = derived(
   ($channel) => $channel?.created_by ?? null,
 );
 
+/**
+ * The channels a sidebar lists. A hidden one is not listed, unless you are an
+ * admin or standing in it. Nor is the lobby, channel 0: it is where the server
+ * keeps everyone who is in no voice channel, which is not a place anybody
+ * goes. Its people are the member list's "Online" group.
+ */
+export const visibleChannels: Readable<ChannelInfo[]> = derived(
+  [channels, isAdmin, currentChannelId],
+  ([$channels, $admin, $current]) =>
+    $channels.filter((c) => c.channel_id !== 0 && (!c.hidden || $admin || c.channel_id === $current)),
+);
+
 /** This channel hides its roster from us. Admins always see it. */
 export const hideMembers: Readable<boolean> = derived(
   [isAdmin, displayChannel],

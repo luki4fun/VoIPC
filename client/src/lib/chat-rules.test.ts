@@ -139,6 +139,12 @@ test("a peer cannot put anything it likes into our archive", () => {
   assert.equal(cleaned[1].id?.length, 64);
 });
 
+test("history that is not a list offers nothing instead of throwing", () => {
+  for (const offered of [{}, null, "x", 3, { length: 2 }]) {
+    assert.deepEqual(sanitizeHistory(offered), []);
+  }
+});
+
 test("shared history is marked second-hand and stays second-hand", () => {
   const offered = [{ user_id: 1, username: "alice", content: "hello", timestamp: T, id: "a" }];
   assert.deepEqual(sanitizeHistory(offered).map((m) => m.kind), ["shared"]);

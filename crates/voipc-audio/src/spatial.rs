@@ -167,7 +167,7 @@ pub fn pan_gains(g: Gains, pan: f32) -> Gains {
     if pan == 0.0 || !pan.is_finite() {
         return g;
     }
-    // The same constant-power law the world pan uses, at spatial.rs:263-268
+    // The same constant-power law the world pan uses (`gains`, below)
     let angle = (pan.clamp(-1.0, 1.0) + 1.0) * 0.5 * core::f32::consts::FRAC_PI_2;
     Gains {
         l: g.l * angle.cos() * core::f32::consts::SQRT_2,

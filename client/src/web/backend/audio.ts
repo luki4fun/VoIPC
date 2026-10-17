@@ -247,6 +247,15 @@ export class AudioEngine implements AudioApi {
 
   // Transmit
   private transmitting = false;
+  /**
+   * Bumped by every start, stop and device switch of the voice capture (and
+   * `micTestGen` of the mic test). Opening a device takes a while, and a stop
+   * and a new start in that time used to let two opens land: the later one
+   * overwrote the earlier, which stayed live with nothing able to close it.
+   * An open whose generation has moved on closes itself instead.
+   */
+  private captureGen = 0;
+  private micTestGen = 0;
   private capture: Capture | null = null;
   private captureRestartTimer: ReturnType<typeof setTimeout> | null = null;
   private encoder: AudioEncoder | null = null;
@@ -690,6 +699,7 @@ export class AudioEngine implements AudioApi {
     if (c.channelId === 0) throw new Error("Join a voice channel first");
     if (this._muted) return;
     this.transmitting = true;
+    const gen = ++this.captureGen;
     try {
       const ac = await this.ensureGraph();
       if (typeof AudioEncoder === "undefined") {
@@ -698,13 +708,14 @@ export class AudioEngine implements AudioApi {
         );
       }
       const cap = await this.openCapture(ac, (f) => this.onCaptureFrame(f));
-      if (!this.transmitting) {
-        cap.close(); // released while the device was opening
+      if (!this.transmitting || gen !== this.captureGen) {
+        cap.close(); // released, or started again, while the device was opening
         return;
       }
       cap.onended = () => this.onCaptureEnded();
       this.capture = cap;
     } catch (e) {
+      if (gen !== this.captureGen) return; // a later start owns the capture now
       // Like the native capture task: report and give up this transmission
       this.transmitting = false;
       this.stopCapture();
@@ -717,6 +728,7 @@ export class AudioEngine implements AudioApi {
     const c = this.ctx;
     if (!c || !this.transmitting) return;
     this.transmitting = false;
+    this.captureGen++;
     this.stopCapture();
     // Tell the others we stopped talking (clears their speaking indicator)
     c.sendDatagram(wasm().buildEotPacket(c.sessionId, c.nextVoiceSequence()));
@@ -1285,9 +1297,10 @@ export class AudioEngine implements AudioApi {
     if (this.transmitting && this.capture && this.audioContext) {
       this.capture.close();
       this.capture = null;
+      const gen = ++this.captureGen;
       try {
         const cap = await this.openCapture(this.audioContext, (f) => this.onCaptureFrame(f));
-        if (!this.transmitting) {
+        if (!this.transmitting || gen !== this.captureGen) {
           cap.close();
           return;
         }
@@ -1310,6 +1323,7 @@ export class AudioEngine implements AudioApi {
     if (this.transmitting) throw new Error("Cannot test microphone while transmitting");
     if (this.micTestActive) return;
     this.micTestActive = true;
+    const gen = ++this.micTestGen;
     // The sequence deliberately carries on from the last test rather than
     // restarting at 0: the worklet keeps a source for SOURCE_IDLE_PRUNE (60 s)
     // and discards frames that arrive before the one it is waiting for, so a
@@ -1346,12 +1360,13 @@ export class AudioEngine implements AudioApi {
           );
         }
       });
-      if (!this.micTestActive) {
+      if (!this.micTestActive || gen !== this.micTestGen) {
         cap.close();
         return;
       }
       this.micTest = cap;
     } catch (e) {
+      if (gen !== this.micTestGen) return;
       this.micTestActive = false;
       emit("mic-test-error", { error: describeError(e) });
     }
@@ -1359,6 +1374,7 @@ export class AudioEngine implements AudioApi {
 
   stopMicTest(): void {
     this.micTestActive = false;
+    this.micTestGen++;
     this.micTest?.close();
     this.micTest = null;
   }
@@ -1381,7 +1397,14 @@ export class AudioEngine implements AudioApi {
     // anybody has connected — and two clicks would otherwise start two looping
     // voices, of which Stop could only ever reach one.
     this.outputTestStarting = true;
-    const ac = await this.ensureGraph();
+    let ac: AudioContext;
+    try {
+      ac = await this.ensureGraph();
+    } catch (e) {
+      // Or the flag stays up and no later click can start the test again
+      this.outputTestStarting = false;
+      throw e;
+    }
     if (!this.outputTestStarting) return; // stopped while the graph came up
     this.outputTestStarting = false;
     // One second of the voice, looped: it is periodic per second by design,

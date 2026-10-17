@@ -61,9 +61,6 @@ export const userFx = writable<Map<number, Lane>>(new Map());
  */
 export const micLane = writable<Lane>({ ...PLAIN_LANE });
 
-/** user_id -> most recent RMS level, for the meters. */
-export const sourceLevels = writable<Map<number, number>>(new Map());
-
 /** Whose strip has its controls open. `"mic"` is our own. */
 export const selectedStrip = writable<number | "mic" | null>(null);
 
@@ -170,7 +167,6 @@ export async function loadUser(id: number): Promise<void> {
 export function clearMixer(): void {
   userVolumes.set(new Map());
   userFx.set(new Map());
-  sourceLevels.set(new Map());
   selectedStrip.set(null);
   premute.clear();
 }

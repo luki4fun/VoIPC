@@ -51,10 +51,8 @@ impl RateLimiter {
 }
 
 /// Per-user session state held by the server.
-#[allow(dead_code)]
 pub struct UserSession {
     pub user_id: UserId,
-    pub session_id: SessionId,
     pub username: String,
     pub channel_id: ChannelId,
     pub is_muted: bool,
@@ -187,7 +185,6 @@ impl UserSession {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         user_id: UserId,
-        session_id: SessionId,
         username: String,
         tcp_tx: mpsc::Sender<Vec<u8>>,
         media_tx: mpsc::Sender<Bytes>,
@@ -197,7 +194,6 @@ impl UserSession {
     ) -> Self {
         Self {
             user_id,
-            session_id,
             username,
             channel_id: 0,
             is_muted: false,
@@ -311,20 +307,16 @@ fn voipc_crypto_max_ttl() -> u32 {
 const KEY_RELAY_REFILL: f64 = 2.0;
 
 /// Tracks an active screen share session within a channel.
-#[allow(dead_code)]
 pub struct ScreenShareSession {
     pub sharer_user_id: UserId,
     pub sharer_session_id: SessionId,
     /// Set of user_ids currently watching this share.
     pub viewers: HashSet<UserId>,
-    /// Resolution being shared.
-    pub resolution: u16,
     /// Codec the sharer encodes with; handed to every viewer on watch.
     pub codec: VideoCodec,
 }
 
 /// A channel/room on the server.
-#[allow(dead_code)]
 pub struct Channel {
     pub info: ChannelInfo,
     /// Set of user_ids currently in this channel.
@@ -333,8 +325,6 @@ pub struct Channel {
     pub password: Option<Zeroizing<String>>,
     /// Handle to the auto-delete timer task (cancelled when a user joins).
     pub delete_timer: Option<tokio::task::JoinHandle<()>>,
-    /// Who created this channel (None for the permanent General channel).
-    pub created_by: Option<UserId>,
     /// Users who have been invited (bypass password on join).
     pub invited_users: HashSet<UserId>,
     /// Active screen shares: sharer_user_id -> ScreenShareSession.
@@ -492,7 +482,6 @@ impl ServerState {
                 members: HashSet::new(),
                 password: None,
                 delete_timer: None,
-                created_by: None,
                 invited_users: HashSet::new(),
                 screen_shares: HashMap::new(),
                 persistent: false,
@@ -548,7 +537,6 @@ impl ServerState {
                     members: HashSet::new(),
                     password,
                     delete_timer: None,
-                    created_by: None,
                     invited_users: HashSet::new(),
                     screen_shares: HashMap::new(),
                     persistent: true,
@@ -646,7 +634,7 @@ impl ServerState {
     /// Active bans, sorted by IP; expired ones are purged.
     pub fn list_bans(&self) -> Vec<BanInfo> {
         let now = Instant::now();
-        self.bans.retain(|_, until| until.map_or(true, |u| u > now));
+        self.bans.retain(|_, until| until.is_none_or(|u| u > now));
         let mut bans: Vec<BanInfo> = self
             .bans
             .iter()
@@ -1053,7 +1041,6 @@ impl ServerState {
                 members: HashSet::new(),
                 password: password.map(Zeroizing::new),
                 delete_timer: None,
-                created_by: Some(created_by),
                 invited_users: HashSet::new(),
                 screen_shares: HashMap::new(),
                 persistent: false,
@@ -1116,7 +1103,7 @@ impl ServerState {
             .get_mut(&channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel does not exist"))?;
 
-        if !is_admin && channel.created_by != Some(user_id) {
+        if !is_admin && channel.info.created_by != Some(user_id) {
             anyhow::bail!("only the channel creator can change the password");
         }
 
@@ -1152,7 +1139,7 @@ impl ServerState {
             .get_mut(&channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel does not exist"))?;
 
-        if !is_admin && channel.created_by != Some(user_id) {
+        if !is_admin && channel.info.created_by != Some(user_id) {
             anyhow::bail!("only the channel creator can change the proximity mode");
         }
         if channel.info.text {
@@ -1192,7 +1179,7 @@ impl ServerState {
             .get_mut(&channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel does not exist"))?;
 
-        if !is_admin && channel.created_by != Some(user_id) {
+        if !is_admin && channel.info.created_by != Some(user_id) {
             anyhow::bail!("only the channel creator can change the channel options");
         }
 
@@ -1343,7 +1330,7 @@ impl ServerState {
             .get_mut(&channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel does not exist"))?;
 
-        if !requester_is_admin && channel.created_by != Some(requester_id) {
+        if !requester_is_admin && channel.info.created_by != Some(requester_id) {
             anyhow::bail!("only the channel creator can kick users");
         }
 
@@ -1402,7 +1389,7 @@ impl ServerState {
             .get_mut(&channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel does not exist"))?;
 
-        if channel.created_by != Some(requester_id) {
+        if channel.info.created_by != Some(requester_id) {
             anyhow::bail!("only the channel creator can invite users");
         }
 
@@ -1466,7 +1453,6 @@ impl ServerState {
         user_id: UserId,
         session_id: SessionId,
         channel_id: ChannelId,
-        resolution: u16,
         codec: VideoCodec,
     ) -> anyhow::Result<Vec<SessionId>> {
         if channel_id == 0 {
@@ -1500,7 +1486,6 @@ impl ServerState {
                 sharer_user_id: user_id,
                 sharer_session_id: session_id,
                 viewers: HashSet::new(),
-                resolution,
                 codec,
             },
         );
@@ -1581,32 +1566,30 @@ impl ServerState {
             session.watching_screenshare
         };
 
-        let mut prev_info = None;
-        if let Some(prev_sharer_id) = prev_unwatch {
-            if prev_sharer_id != sharer_user_id {
-                // Unwatch previous
-                let mut channels = self.channels.write().await;
-                if let Some(channel) = channels.get_mut(&channel_id) {
-                    if let Some(prev_share) = channel.screen_shares.get_mut(&prev_sharer_id) {
-                        prev_share.viewers.remove(&viewer_user_id);
-                        let new_count = prev_share.viewers.len() as u32;
-                        prev_info =
-                            Some((prev_sharer_id, prev_share.sharer_session_id, new_count));
-                    }
-                }
-                drop(channels);
-            }
-        }
-
-        // Set watching state
-        if let Some(mut session) = self.sessions.get_mut(&viewer_session_id) {
-            session.watching_screenshare = Some(sharer_user_id);
-        }
-
+        // Every refusal comes before anything changes: a click on somebody
+        // whose share just ended must not cost the stream being watched, nor
+        // leave a watch recorded for a share that does not exist (it is what
+        // lets a session ask that user for keyframes and report losses).
         let mut channels = self.channels.write().await;
         let channel = channels
             .get_mut(&channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel not found"))?;
+        if !channel.screen_shares.contains_key(&sharer_user_id) {
+            anyhow::bail!("user is not screen sharing");
+        }
+
+        let mut prev_info = None;
+        if let Some(prev_sharer_id) = prev_unwatch.filter(|&id| id != sharer_user_id) {
+            if let Some(prev_share) = channel.screen_shares.get_mut(&prev_sharer_id) {
+                prev_share.viewers.remove(&viewer_user_id);
+                let new_count = prev_share.viewers.len() as u32;
+                prev_info = Some((prev_sharer_id, prev_share.sharer_session_id, new_count));
+            }
+        }
+
+        if let Some(mut session) = self.sessions.get_mut(&viewer_session_id) {
+            session.watching_screenshare = Some(sharer_user_id);
+        }
 
         let share = channel
             .screen_shares
@@ -1717,7 +1700,6 @@ impl ServerState {
                     cleanup.viewers_to_notify_stopped.push(viewer_sid);
                 }
             }
-            cleanup.notify_channel_share_stopped = true;
             cleanup.stopped_sharer_user_id = Some(user_id);
         }
 
@@ -1761,8 +1743,6 @@ impl ServerState {
 pub struct ScreenShareCleanup {
     /// Viewers to notify that the share they were watching stopped.
     pub viewers_to_notify_stopped: Vec<SessionId>,
-    /// Whether to broadcast ScreenShareStopped to channel members.
-    pub notify_channel_share_stopped: bool,
     /// The user_id of the share that stopped (if any).
     pub stopped_sharer_user_id: Option<UserId>,
     /// If the leaving user was a viewer, notify the sharer of new viewer count.
@@ -1808,7 +1788,6 @@ pub(crate) mod test_support {
         let (media_tx, media_rx) = mpsc::channel(16);
         let session = UserSession::new(
             user_id,
-            session_id,
             username.into(),
             tx,
             media_tx,
@@ -1854,7 +1833,6 @@ pub(crate) mod test_support {
             members: HashSet::new(),
             password: None,
             delete_timer: None,
-            created_by: None,
             invited_users: HashSet::new(),
             screen_shares: HashMap::new(),
             persistent: false,
@@ -1927,7 +1905,7 @@ mod tests {
         let general = channels.get(&0).expect("General channel should exist");
         assert_eq!(general.info.name, "General");
         assert_eq!(general.info.channel_id, 0);
-        assert!(general.created_by.is_none());
+        assert!(general.info.created_by.is_none());
     }
 
     #[test]
@@ -2435,7 +2413,7 @@ mod tests {
             .unwrap();
 
         let err = state
-            .start_screen_share(alice, alice_sid, ch.channel_id, 720, VideoCodec::H264)
+            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264)
             .await
             .unwrap_err();
         assert!(err.to_string().contains("off in this channel"), "{err}");
@@ -2449,7 +2427,7 @@ mod tests {
             .await
             .unwrap();
         assert!(state
-            .start_screen_share(alice, alice_sid, ch.channel_id, 720, VideoCodec::H264)
+            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264)
             .await
             .is_ok());
     }
@@ -2466,7 +2444,7 @@ mod tests {
             .unwrap();
         state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
         state
-            .start_screen_share(alice, alice_sid, ch.channel_id, 720, VideoCodec::H264)
+            .start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264)
             .await
             .unwrap();
 
@@ -2949,7 +2927,7 @@ mod tests {
         let (uid, sid) = add_user(&state, "alice");
         let ch = state.create_channel("Room".into(), None, ProximityMode::Off, false, false, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
-        let others = state.start_screen_share(uid, sid, ch.channel_id, 720, VideoCodec::H264).await.unwrap();
+        let others = state.start_screen_share(uid, sid, ch.channel_id, VideoCodec::H264).await.unwrap();
         assert!(others.is_empty());
         assert!(state.sessions.get(&sid).unwrap().is_screen_sharing);
         let channels = state.channels.read().await;
@@ -2960,7 +2938,7 @@ mod tests {
     async fn start_screen_share_general_fails() {
         let state = make_state();
         let (uid, sid) = add_user(&state, "alice");
-        let err = state.start_screen_share(uid, sid, 0, 720, VideoCodec::H264).await;
+        let err = state.start_screen_share(uid, sid, 0, VideoCodec::H264).await;
         assert!(err.unwrap_err().to_string().contains("General"));
     }
 
@@ -2970,7 +2948,7 @@ mod tests {
         let (uid, sid) = add_user(&state, "alice");
         let ch = state.create_channel("Room".into(), None, ProximityMode::Off, false, false, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
-        state.start_screen_share(uid, sid, ch.channel_id, 720, VideoCodec::H264).await.unwrap();
+        state.start_screen_share(uid, sid, ch.channel_id, VideoCodec::H264).await.unwrap();
         state.stop_screen_share(uid, sid, ch.channel_id).await.unwrap();
         assert!(!state.sessions.get(&sid).unwrap().is_screen_sharing);
         let channels = state.channels.read().await;
@@ -2983,7 +2961,7 @@ mod tests {
         let (uid, sid) = add_user(&state, "alice");
         let ch = state.create_channel("Room".into(), None, ProximityMode::Off, false, false, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
-        state.start_screen_share(uid, sid, ch.channel_id, 720, VideoCodec::H265).await.unwrap();
+        state.start_screen_share(uid, sid, ch.channel_id, VideoCodec::H265).await.unwrap();
         let (uid2, sid2) = add_user(&state, "bob");
         state.join_channel(uid2, sid2, ch.channel_id, None).await.unwrap();
         let (sharer_sid, old, new, prev, codec) =
@@ -2997,17 +2975,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn watching_a_non_sharer_keeps_the_current_watch() {
+        let state = make_state();
+        let (alice, alice_sid) = add_user(&state, "alice");
+        let ch = state.create_channel("Room".into(), None, ProximityMode::Off, false, false, alice).await.unwrap();
+        let (bob, bob_sid) = add_user(&state, "bob");
+        let (carol, carol_sid) = add_user(&state, "carol");
+        for (uid, sid) in [(alice, alice_sid), (bob, bob_sid), (carol, carol_sid)] {
+            state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
+        }
+        state.start_screen_share(alice, alice_sid, ch.channel_id, VideoCodec::H264).await.unwrap();
+        state.watch_screen_share(bob, bob_sid, alice, ch.channel_id).await.unwrap();
+
+        // Carol is not sharing: refused, and Bob is still watching Alice
+        let err = state.watch_screen_share(bob, bob_sid, carol, ch.channel_id).await;
+        assert!(err.unwrap_err().to_string().contains("not screen sharing"));
+        assert_eq!(state.sessions.get(&bob_sid).unwrap().watching_screenshare, Some(alice));
+        let channels = state.channels.read().await;
+        let share = &channels.get(&ch.channel_id).unwrap().screen_shares[&alice];
+        assert!(share.viewers.contains(&bob));
+    }
+
+    #[tokio::test]
     async fn cleanup_screen_shares_for_user() {
         let state = make_state();
         let (uid, sid) = add_user(&state, "alice");
         let ch = state.create_channel("Room".into(), None, ProximityMode::Off, false, false, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
-        state.start_screen_share(uid, sid, ch.channel_id, 720, VideoCodec::H264).await.unwrap();
+        state.start_screen_share(uid, sid, ch.channel_id, VideoCodec::H264).await.unwrap();
         let (uid2, sid2) = add_user(&state, "bob");
         state.join_channel(uid2, sid2, ch.channel_id, None).await.unwrap();
         state.watch_screen_share(uid2, sid2, uid, ch.channel_id).await.unwrap();
         let cleanup = state.cleanup_screen_shares_for_user(uid, sid, ch.channel_id).await;
-        assert!(cleanup.notify_channel_share_stopped);
         assert_eq!(cleanup.stopped_sharer_user_id, Some(uid));
         assert!(cleanup.viewers_to_notify_stopped.contains(&sid2));
     }

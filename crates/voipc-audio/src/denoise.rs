@@ -15,6 +15,12 @@ pub struct Denoiser {
     output_buf: [f32; RNNOISE_FRAME_SIZE],
 }
 
+impl Default for Denoiser {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Denoiser {
     pub fn new() -> Self {
         Self {

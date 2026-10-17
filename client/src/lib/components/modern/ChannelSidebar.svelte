@@ -48,7 +48,7 @@
   } from "../../stores/channel-ui.js";
   import { users, speakingUsers } from "../../stores/users.js";
   import { audibleIds } from "../../stores/room.js";
-  import { isCulled } from "../../stores/roster.js";
+  import { isCulled, visibleChannels } from "../../stores/roster.js";
   import { openShare } from "../../stores/user-menu.js";
   import { memberMenu } from "../../actions/member-menu.js";
   import { avatarColor } from "../../avatar.js";
@@ -57,19 +57,13 @@
   import Icon from "../Icons.svelte";
   import type { ChannelInfo, UserInfo } from "../../types.js";
 
-  // A hidden channel is not listed, unless you are an admin or standing in it.
-  // Nor is the lobby, channel 0 — see ChannelList.
-  const visibleChannels = $derived(
-    $channels.filter(
-      (c) => c.channel_id !== 0 && (!c.hidden || $isAdmin || c.channel_id === $currentChannelId),
-    ),
-  );
 
   // Text above voice, the way Discord groups them. A text channel has no
   // members nested under it: its subscribers are in voice channels of their
   // own, and listing them twice would say they are in two places at once.
-  const textChannels = $derived(visibleChannels.filter((c) => c.text));
-  const voiceChannels = $derived(visibleChannels.filter((c) => !c.text));
+  // Which channels are listed at all: stores/roster.ts `visibleChannels`
+  const textChannels = $derived($visibleChannels.filter((c) => c.text));
+  const voiceChannels = $derived($visibleChannels.filter((c) => !c.text));
 
   /** The members this client is allowed to show under a row. */
   function membersOf(channel: ChannelInfo): UserInfo[] {

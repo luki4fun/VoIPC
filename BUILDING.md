@@ -461,8 +461,12 @@ workflow section below.
 
 ```bash
 npm run web         # wasm crate + Vite bundle + server binary that embeds it
-npm run test:web    # headless two-browser end-to-end check
+VOIPC_SELFTEST=1 npm run web && npm run test:web   # headless two-browser end-to-end check
 ```
+
+The end-to-end check drives the page's built-in self-test, which only a bundle built with
+`VOIPC_SELFTEST=1` contains: in a release it would let a crafted `?selftest` link connect,
+write and open the microphone with nothing on screen. `test-web.sh` says so if it is missing.
 
 `npm run web` installs the `wasm32-unknown-unknown` Rust target if missing, builds
 `crates/voipc-web` with `wasm-pack` (a client devDependency, no global install), bundles the

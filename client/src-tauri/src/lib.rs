@@ -204,7 +204,7 @@ pub fn run() {
                 loop {
                     interval.tick().await;
                     let state = handle.state::<AppState>();
-                    commands::flush_chat_to_disk(&*state).await;
+                    commands::flush_chat_to_disk(&state).await;
                 }
             });
 

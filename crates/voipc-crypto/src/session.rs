@@ -109,7 +109,7 @@ pub async fn decrypt_message(
                 &mut stores.session,
                 &mut stores.identity,
                 &mut stores.prekey,
-                &mut stores.signed_prekey,
+                &stores.signed_prekey,
                 &mut stores.kyber,
                 &mut OsRng,
             )
@@ -125,7 +125,7 @@ pub async fn decrypt_message(
                 &mut stores.session,
                 &mut stores.identity,
                 &mut stores.prekey,
-                &mut stores.signed_prekey,
+                &stores.signed_prekey,
                 &mut stores.kyber,
                 &mut OsRng,
             )

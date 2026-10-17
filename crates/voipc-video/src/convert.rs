@@ -11,7 +11,7 @@ use ffmpeg::util::frame::video::Video;
 /// Clamp an i32 to u8 range.
 #[inline(always)]
 fn clamp_u8(v: i32) -> u8 {
-    v.max(0).min(255) as u8
+    v.clamp(0, 255) as u8
 }
 
 // ── SIMD-accelerated conversion via FFmpeg SwsContext ─────────────────────
@@ -129,6 +129,9 @@ impl FrameConverter {
         if stride == row_bytes {
             return self.convert(pixel_data);
         }
+        if stride < row_bytes {
+            bail!("FrameConverter: stride {stride} is shorter than a row ({row_bytes})");
+        }
 
         let expected = stride * h;
         if pixel_data.len() < expected {
@@ -162,8 +165,8 @@ impl FrameConverter {
 /// Uses integer BT.601: Y = (66*R + 129*G + 25*B + 128)>>8 + 16
 pub fn bgra_to_i420(bgra: &[u8], width: usize, height: usize, i420: &mut Vec<u8>) {
     let y_size = width * height;
-    let uv_width = (width + 1) / 2;
-    let uv_height = (height + 1) / 2;
+    let uv_width = width.div_ceil(2);
+    let uv_height = height.div_ceil(2);
     let total = y_size + 2 * uv_width * uv_height;
 
     i420.clear();
@@ -221,8 +224,8 @@ pub fn bgra_to_i420(bgra: &[u8], width: usize, height: usize, i420: &mut Vec<u8>
 /// Uses integer BT.601: Y = (66*R + 129*G + 25*B + 128)>>8 + 16
 pub fn rgba_to_i420(rgba: &[u8], width: usize, height: usize, i420: &mut Vec<u8>) {
     let y_size = width * height;
-    let uv_width = (width + 1) / 2;
-    let uv_height = (height + 1) / 2;
+    let uv_width = width.div_ceil(2);
+    let uv_height = height.div_ceil(2);
     let total = y_size + 2 * uv_width * uv_height;
 
     i420.clear();
@@ -288,12 +291,12 @@ pub fn scale_i420_nearest(
     dst_h: usize,
 ) {
     let src_y_size = src_w * src_h;
-    let src_uv_w = (src_w + 1) / 2;
-    let src_uv_h = (src_h + 1) / 2;
+    let src_uv_w = src_w.div_ceil(2);
+    let src_uv_h = src_h.div_ceil(2);
 
     let dst_y_size = dst_w * dst_h;
-    let dst_uv_w = (dst_w + 1) / 2;
-    let dst_uv_h = (dst_h + 1) / 2;
+    let dst_uv_w = dst_w.div_ceil(2);
+    let dst_uv_h = dst_h.div_ceil(2);
     let dst_total = dst_y_size + 2 * dst_uv_w * dst_uv_h;
 
     dst.clear();
@@ -336,15 +339,16 @@ pub fn scale_i420_nearest(
 ///   R = clip((298*C + 409*E + 128) >> 8)
 ///   G = clip((298*C - 100*D - 208*E + 128) >> 8)
 ///   B = clip((298*C + 516*D + 128) >> 8)
+#[cfg(test)] // no caller in the desktop build; lib.rs has the Android copy
 pub fn i420_to_rgb_into(i420: &[u8], width: usize, height: usize, rgb: &mut Vec<u8>) {
     let rgb_size = width * height * 3;
     rgb.clear();
     rgb.resize(rgb_size, 0);
 
     let y_plane = &i420[..width * height];
-    let uv_width = (width + 1) / 2;
+    let uv_width = width.div_ceil(2);
     let u_offset = width * height;
-    let v_offset = u_offset + uv_width * ((height + 1) / 2);
+    let v_offset = u_offset + uv_width * height.div_ceil(2);
 
     for row in 0..height {
         let row_off = row * width;
@@ -363,6 +367,7 @@ pub fn i420_to_rgb_into(i420: &[u8], width: usize, height: usize, rgb: &mut Vec<
 }
 
 /// Convert I420 (YUV420 planar) to RGBA pixels.
+#[cfg(test)] // no caller in the desktop build; lib.rs has the Android copy
 pub fn i420_to_rgba(i420: &[u8], width: usize, height: usize) -> Vec<u8> {
     let mut rgba = vec![0u8; width * height * 4];
     i420_to_rgba_into(i420, width, height, &mut rgba);
@@ -370,11 +375,12 @@ pub fn i420_to_rgba(i420: &[u8], width: usize, height: usize) -> Vec<u8> {
 }
 
 /// Convert I420 (YUV420 planar) to RGBA pixels, writing into an existing buffer.
+#[cfg(test)] // no caller in the desktop build; lib.rs has the Android copy
 pub fn i420_to_rgba_into(i420: &[u8], width: usize, height: usize, rgba: &mut [u8]) {
     let y_plane = &i420[..width * height];
-    let uv_width = (width + 1) / 2;
+    let uv_width = width.div_ceil(2);
     let u_offset = width * height;
-    let v_offset = u_offset + uv_width * ((height + 1) / 2);
+    let v_offset = u_offset + uv_width * height.div_ceil(2);
 
     for row in 0..height {
         let row_off = row * width;
@@ -461,8 +467,8 @@ mod tests {
         let bgra = vec![128u8; 3 * 3 * 4];
         let mut i420 = Vec::new();
         bgra_to_i420(&bgra, 3, 3, &mut i420);
-        let uv_w = (3 + 1) / 2; // 2
-        let uv_h = (3 + 1) / 2; // 2
+        let uv_w = 3_usize.div_ceil(2); // 2
+        let uv_h = 3_usize.div_ceil(2); // 2
         assert_eq!(i420.len(), 3 * 3 + 2 * uv_w * uv_h); // 9 + 8 = 17
     }
 

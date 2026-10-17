@@ -280,6 +280,7 @@ pub enum PendingTarget {
 }
 
 /// E2E encryption state using Signal Protocol.
+#[derive(Default)]
 pub struct SignalState {
     /// Signal Protocol stores (identity, pre-keys, sessions, sender keys).
     pub stores: Option<SignalStores>,
@@ -300,19 +301,6 @@ pub struct SignalState {
     pub channels: ChannelKeying,
 }
 
-impl Default for SignalState {
-    fn default() -> Self {
-        Self {
-            stores: None,
-            initialized: false,
-            own_user_id: None,
-            pending_sessions: HashSet::new(),
-            established_sessions: HashSet::new(),
-            pending_messages: Vec::new(),
-            channels: ChannelKeying::default(),
-        }
-    }
-}
 
 /// Encrypted chat history state.
 pub struct ChatState {
@@ -341,7 +329,6 @@ impl Default for ChatState {
 }
 
 /// State of an active server connection.
-#[allow(dead_code)]
 pub struct ActiveConnection {
     pub user_id: UserId,
     pub username: String,
@@ -387,9 +374,6 @@ pub struct ActiveConnection {
     /// AES-GCM nonce (session_id ‖ sequence) is never reused under the
     /// channel key and receivers never see a backwards jump.
     pub voice_sequence: Arc<AtomicU32>,
-    /// Master output volume as f32 bits (applied by the voice mixer task).
-    /// Shared with `AppState`.
-    pub master_volume: Arc<AtomicU32>,
     /// Voice frames played / concealed (jitter-buffer loss) — for the quality indicator.
     pub voice_frames_played: Arc<AtomicU32>,
     pub voice_frames_lost: Arc<AtomicU32>,
@@ -489,9 +473,6 @@ pub struct ActiveConnection {
     /// channel's proximity mode (and, for the game SDK, a channel by name)
     /// without asking the UI.
     pub channels: Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
-    /// Sequence counter for position beacons. Their own nonce domain, so it
-    /// must never share the voice counter.
-    pub position_sequence: Arc<AtomicU32>,
 }
 
 /// Longest glide between two SDK updates: later than this is a stall, not
@@ -959,7 +940,6 @@ pub fn merge_source(
 }
 
 /// User settings (in-memory, initialized from config on startup).
-#[allow(dead_code)]
 pub struct UserSettings {
     pub input_device: Option<String>,
     pub output_device: Option<String>,

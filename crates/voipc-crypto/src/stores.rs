@@ -86,7 +86,7 @@ impl IdentityKeyStore for VoipcIdentityStore {
         let serialized = identity.serialize().to_vec();
         let existing = self.known_identities.insert(key, serialized.clone());
         // Return true if the identity key changed (trust-on-first-use)
-        Ok(existing.map_or(false, |old| old != serialized))
+        Ok(existing.is_some_and(|old| old != serialized))
     }
 
     async fn is_trusted_identity(

@@ -48,7 +48,7 @@ pub async fn generate_prekeys(
 
     // Generate one-time pre-keys
     for i in 0..count {
-        let id = PreKeyId::from(start_id + i);
+        let id = PreKeyId::from(start_id.wrapping_add(i));
         let key_pair = KeyPair::generate(&mut OsRng);
         let record = PreKeyRecord::new(id, &key_pair);
         stores.prekey.save_pre_key(id, &record).await?;

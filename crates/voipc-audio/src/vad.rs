@@ -23,11 +23,7 @@ impl VoiceActivityDetector {
     /// `hold_ms`: How long to keep transmitting after voice stops, in milliseconds.
     /// `frame_duration_ms`: Duration of each audio frame in milliseconds (typically 20).
     pub fn new(threshold_db: f32, hold_ms: u32, frame_duration_ms: u32) -> Self {
-        let hold_frames = if frame_duration_ms > 0 {
-            hold_ms / frame_duration_ms
-        } else {
-            15
-        };
+        let hold_frames = hold_ms.checked_div(frame_duration_ms).unwrap_or(15);
         Self {
             threshold_db,
             hold_frames,

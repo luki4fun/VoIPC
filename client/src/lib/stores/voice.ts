@@ -2,13 +2,14 @@ import { get, writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 
 import { voice, voiceServer } from "./channels.js";
-import { isTransmitting, setSelfDeafened, setSelfMuted } from "./connection.js";
+import { isMuted, isTransmitting, setSelfDeafened, setSelfMuted } from "./connection.js";
 import { clearMixer } from "./mixer.js";
 import { addNotification } from "./notifications.js";
 import { resetRoom } from "./room.js";
 import { resetScreenShareState } from "./screenshare.js";
 import { noiseSuppression } from "./settings.js";
 import { speakingUsers } from "./users.js";
+import { transmitOrder } from "../transmit-order.js";
 
 export type VoiceMode = "ptt" | "vad" | "always_on";
 
@@ -80,24 +81,38 @@ voiceServer.subscribe((server) => {
   speakingUsers.set(new Set());
 });
 
+// Opens and closes in the order asked (see transmit-order.ts): a key released
+// while the device is still opening closes it once it is open.
+const transmit = transmitOrder(
+  async () => {
+    try {
+      await invoke("start_transmit");
+      isTransmitting.set(true);
+    } catch (e) {
+      console.error("Failed to start transmit:", e);
+    }
+  },
+  async () => {
+    if (!get(isTransmitting)) return;
+    try {
+      await invoke("stop_transmit");
+      isTransmitting.set(false);
+    } catch (e) {
+      console.error("Failed to stop transmit:", e);
+    }
+  },
+);
+
 export async function startTransmit(): Promise<void> {
-  if (voiceDisabled()) return;
-  try {
-    await invoke("start_transmit");
-    isTransmitting.set(true);
-  } catch (e) {
-    console.error("Failed to start transmit:", e);
-  }
+  // Muted, both backends treat a start as done without opening anything, and
+  // `isTransmitting` would then claim a microphone nobody opened — so voice
+  // activation, which waits for it to go false, never opened it after unmute
+  if (voiceDisabled() || get(isMuted)) return;
+  return transmit.start();
 }
 
-export async function stopTransmit(): Promise<void> {
-  if (!get(isTransmitting)) return;
-  try {
-    await invoke("stop_transmit");
-    isTransmitting.set(false);
-  } catch (e) {
-    console.error("Failed to stop transmit:", e);
-  }
+export function stopTransmit(): Promise<void> {
+  return transmit.stop();
 }
 
 export async function toggleMute(): Promise<void> {

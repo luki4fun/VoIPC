@@ -89,7 +89,8 @@ pub mod capture {
             if !self.active.load(Ordering::Relaxed) {
                 return DataCallbackResult::Continue;
             }
-            // Push samples into ring buffer (lock-free, drops oldest if full)
+            // Push samples into ring buffer (lock-free; when it is full the
+            // newest samples are the ones dropped)
             let _ = self.producer.push_slice(audio_data);
             DataCallbackResult::Continue
         }

@@ -125,6 +125,9 @@ mod ffi {
     }
 }
 
+/// Largest width or height believed, from a parameter set or from the codec.
+const MAX_DIMENSION: i32 = 8192;
+
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
@@ -134,7 +137,7 @@ mod ffi {
 pub struct DecodedFrame {
     pub width: u32,
     pub height: u32,
-    /// I420 data (Y + U + V planes, total width*height*3/2 bytes).
+    /// I420 data: the Y plane, then U and V at half size rounded up.
     pub i420_data: Vec<u8>,
 }
 
@@ -293,6 +296,9 @@ impl Decoder {
 
             let status = ffi::AMediaCodec_start(self.codec);
             if status != ffi::AMEDIA_OK {
+                // Back to unconfigured, or the next keyframe's configure is
+                // refused for a codec that already is, and so is every one after
+                ffi::AMediaCodec_stop(self.codec);
                 return Err(anyhow!("AMediaCodec_start failed: status {}", status));
             }
         }
@@ -345,7 +351,8 @@ impl Decoder {
                 0,
             );
             if status != ffi::AMEDIA_OK {
-                tracing::warn!("AMediaCodec: queueInputBuffer failed: {}", status);
+                // As for a missing input buffer: the frame is lost, so say so
+                return Err(anyhow!("AMediaCodec: queueInputBuffer failed: {status}"));
             }
         }
         Ok(())
@@ -385,8 +392,10 @@ impl Decoder {
             }
 
             if idx < 0 {
-                tracing::warn!("AMediaCodec: dequeueOutputBuffer unexpected: {}", idx);
-                break;
+                // An error code, not a hint: the codec is in trouble, and an
+                // empty Ok would leave the caller showing nothing and asking
+                // for nothing
+                return Err(anyhow!("AMediaCodec: dequeueOutputBuffer failed: {idx}"));
             }
             timeout_us = 0;
 
@@ -397,7 +406,14 @@ impl Decoder {
                 let buf =
                     ffi::AMediaCodec_getOutputBuffer(self.codec, idx_u, &mut buf_size);
 
-                let result = if !buf.is_null() && info.size > 0 {
+                // The codec describes its own buffer; check it says something
+                // that fits before making a slice of it
+                let in_bounds = info.offset >= 0
+                    && info.size > 0
+                    && (info.offset as usize)
+                        .checked_add(info.size as usize)
+                        .is_some_and(|end| end <= buf_size);
+                let result = if !buf.is_null() && in_bounds {
                     let offset = info.offset as usize;
                     let size = info.size as usize;
                     let raw = std::slice::from_raw_parts(buf.add(offset), size);
@@ -430,17 +446,24 @@ impl Decoder {
                 return;
             }
 
+            // A driver reporting a negative or absurd size would otherwise be
+            // a multi-gigabyte allocation (or a wrapped one on 32-bit ARM)
+            let sane = |v: i32, max: i32| (1..=max).contains(&v).then_some(v as u32);
             let mut val: i32 = 0;
             if ffi::AMediaFormat_getInt32(format, b"width\0".as_ptr() as *const _, &mut val)
             {
-                self.width = val as u32;
+                if let Some(v) = sane(val, MAX_DIMENSION) {
+                    self.width = v;
+                }
             }
             if ffi::AMediaFormat_getInt32(
                 format,
                 b"height\0".as_ptr() as *const _,
                 &mut val,
             ) {
-                self.height = val as u32;
+                if let Some(v) = sane(val, MAX_DIMENSION) {
+                    self.height = v;
+                }
             }
             // The configure hint was a guess (1920x1080 for anything but HEVC),
             // so its stride must not survive into the real size. Devices that
@@ -477,14 +500,18 @@ impl Decoder {
                 b"stride\0".as_ptr() as *const _,
                 &mut val,
             ) {
-                self.stride = val as u32;
+                if let Some(v) = sane(val, 2 * MAX_DIMENSION) {
+                    self.stride = v;
+                }
             }
             if ffi::AMediaFormat_getInt32(
                 format,
                 b"slice-height\0".as_ptr() as *const _,
                 &mut val,
             ) {
-                self.slice_height = val as u32;
+                if let Some(v) = sane(val, 2 * MAX_DIMENSION) {
+                    self.slice_height = v;
+                }
             }
             if ffi::AMediaFormat_getInt32(
                 format,
@@ -788,7 +815,8 @@ fn parse_sps_nal(nal: &[u8]) -> Option<(u32, u32)> {
     // pic_height_in_luma_samples: ue(v)
     let height = reader.read_ue()?;
 
-    if width > 0 && height > 0 && width <= 8192 && height <= 8192 {
+    let max = MAX_DIMENSION as u32;
+    if width > 0 && height > 0 && width <= max && height <= max {
         Some((width, height))
     } else {
         None

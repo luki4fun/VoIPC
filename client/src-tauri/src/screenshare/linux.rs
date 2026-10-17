@@ -26,8 +26,10 @@ pub struct CaptureSession {
 
 impl Drop for CaptureSession {
     fn drop(&mut self) {
+        // Only the signal: the task closes the session itself (bounded, see
+        // below). Aborting it here as well cancelled that close every time,
+        // which left the compositor's "sharing" indicator up after a stop.
         self._shutdown_guard.take();
-        self._keep_alive.abort();
     }
 }
 
@@ -124,8 +126,10 @@ pub async fn request_screencast(
             Ok((fd_clone, node_id, _fd, session)) => {
                 let _ = result_tx.send(Ok((fd_clone, node_id)));
                 let _ = shutdown_rx.await;
-                if let Err(e) = session.close().await {
-                    warn!("failed to close portal session: {e}");
+                match tokio::time::timeout(std::time::Duration::from_secs(5), session.close()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => warn!("failed to close portal session: {e}"),
+                    Err(_) => warn!("portal session close timed out"),
                 }
                 info!("portal session closed");
             }

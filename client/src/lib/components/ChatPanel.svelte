@@ -13,7 +13,7 @@
   }
   let { headerExtra }: Props = $props();
   import { invoke } from "@tauri-apps/api/core";
-  import { tick } from "svelte";
+  import { tick, untrack } from "svelte";
   import { channels } from "../stores/channels.js";
   import { uiPrefs } from "../stores/ui-prefs.js";
   import { serverAddress, serverKey, userId } from "../stores/connection.js";
@@ -200,10 +200,25 @@
     messageInput = "";
   });
 
-  // Auto-scroll when messages change
-  $effect(() => {
-    // Access displayMessages to track changes
-    displayMessages;
+  // Follow the conversation to its end — when it is another conversation, or
+  // when this one grew and the reader was already at the end. Not on every
+  // change of the list: it is rebuilt for a message on any channel of any
+  // server, and following each of those pulled a reader out of the history
+  // they were scrolled back into. Measured before the DOM update (`.pre`),
+  // which is the only moment "at the end" still describes what they saw.
+  let followedConversation = "";
+  let followedEnd = "";
+  $effect.pre(() => {
+    const conversation = `${$serverAddress}|${$displayChannelId}|${$activeDmUserId}`;
+    const last = displayMessages.at(-1);
+    const end = `${displayMessages.length}|${last?.id ?? last?.timestamp ?? ""}`;
+    const switched = conversation !== followedConversation;
+    if (!switched && end === followedEnd) return;
+    followedConversation = conversation;
+    followedEnd = end;
+    const el = untrack(() => messagesContainer);
+    const atEnd = !el || el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    if (!switched && !atEnd) return;
     tick().then(() => {
       if (messagesContainer) {
         messagesContainer.scrollTop = messagesContainer.scrollHeight;
@@ -323,6 +338,36 @@
 
 <svelte:window onclick={() => { if (showEmojiPicker) showEmojiPicker = false; }} onkeydown={showEmojiPicker ? handleEmojiKeydown : undefined} />
 
+<!-- One picker for both forms: the direct message one and the channel one -->
+{#snippet emojiPicker()}
+  <div class="emoji-wrapper">
+    <button class="emoji-btn" type="button" onclick={(e) => { e.stopPropagation(); toggleEmojiPicker(); }} title="Emoji">
+      <Icon name="smile" size={20} />
+    </button>
+    {#if showEmojiPicker}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div class="emoji-picker" onkeydown={handleEmojiKeydown} onclick={(e) => e.stopPropagation()}>
+        <div class="emoji-tabs">
+          {#each EMOJI_CATEGORIES as cat, idx}
+            <button
+              class="emoji-tab"
+              class:active={emojiCategory === idx}
+              type="button"
+              onclick={() => (emojiCategory = idx)}
+              title={cat.label}
+            >{cat.emojis[0]}</button>
+          {/each}
+        </div>
+        <div class="emoji-grid">
+          {#each EMOJI_CATEGORIES[emojiCategory].emojis as emoji}
+            <button class="emoji-item" type="button" onclick={() => insertEmoji(emoji)}>{emoji}</button>
+          {/each}
+        </div>
+      </div>
+    {/if}
+  </div>
+{/snippet}
+
 <div class="chat-panel">
   <div class="chat-header" class:custom={headerExtra}>
     {#if isDmMode}
@@ -400,7 +445,12 @@
         {/if}
       </div>
     {:else}
-      {#each displayMessages as msg, i (msg.timestamp + "-" + msg.user_id + "-" + i)}
+      <!-- Keyed by the message object, which the stores carry over from one
+           update to the next. The index used to be in the key, so once a
+           conversation was full every new message shifted every key and
+           rebuilt all 500 rows; the ids a sender mints are not unique enough
+           on their own — a peer can repeat one, and a duplicate key throws. -->
+      {#each displayMessages as msg, i (msg)}
         {#if msg.kind === "history-marker" || msg.kind === "notice"}
           <div class="history-marker"><span>{msg.content}</span></div>
         {:else}
@@ -445,32 +495,7 @@
         onkeydown={handleKeydown}
         maxlength="2000"
       />
-      <div class="emoji-wrapper">
-        <button class="emoji-btn" type="button" onclick={(e) => { e.stopPropagation(); toggleEmojiPicker(); }} title="Emoji">
-          <Icon name="smile" size={20} />
-        </button>
-        {#if showEmojiPicker}
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
-          <div class="emoji-picker" onkeydown={handleEmojiKeydown} onclick={(e) => e.stopPropagation()}>
-            <div class="emoji-tabs">
-              {#each EMOJI_CATEGORIES as cat, idx}
-                <button
-                  class="emoji-tab"
-                  class:active={emojiCategory === idx}
-                  type="button"
-                  onclick={() => (emojiCategory = idx)}
-                  title={cat.label}
-                >{cat.emojis[0]}</button>
-              {/each}
-            </div>
-            <div class="emoji-grid">
-              {#each EMOJI_CATEGORIES[emojiCategory].emojis as emoji}
-                <button class="emoji-item" type="button" onclick={() => insertEmoji(emoji)}>{emoji}</button>
-              {/each}
-            </div>
-          </div>
-        {/if}
-      </div>
+      {@render emojiPicker()}
       <button class="send-btn" type="submit" disabled={!messageInput.trim()}>Send</button>
     </form>
   {:else if canSendChannelMessage}
@@ -484,32 +509,7 @@
         onkeydown={handleKeydown}
         maxlength="2000"
       />
-      <div class="emoji-wrapper">
-        <button class="emoji-btn" type="button" onclick={(e) => { e.stopPropagation(); toggleEmojiPicker(); }} title="Emoji">
-          <Icon name="smile" size={20} />
-        </button>
-        {#if showEmojiPicker}
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
-          <div class="emoji-picker" onkeydown={handleEmojiKeydown} onclick={(e) => e.stopPropagation()}>
-            <div class="emoji-tabs">
-              {#each EMOJI_CATEGORIES as cat, idx}
-                <button
-                  class="emoji-tab"
-                  class:active={emojiCategory === idx}
-                  type="button"
-                  onclick={() => (emojiCategory = idx)}
-                  title={cat.label}
-                >{cat.emojis[0]}</button>
-              {/each}
-            </div>
-            <div class="emoji-grid">
-              {#each EMOJI_CATEGORIES[emojiCategory].emojis as emoji}
-                <button class="emoji-item" type="button" onclick={() => insertEmoji(emoji)}>{emoji}</button>
-              {/each}
-            </div>
-          </div>
-        {/if}
-      </div>
+      {@render emojiPicker()}
       <button class="send-btn" type="submit" disabled={!messageInput.trim()}>Send</button>
     </form>
   {:else if effectiveChannel?.text}

@@ -463,7 +463,9 @@ pub async fn connect_to_server(
     // A ping every 10 s on the media path, either transport: its pong is
     // the latency display, and on the TCP fallback also the keepalive
     let latency_handle = tokio::spawn(latency_task(voice_tx.clone(), session_id));
-    // Re-announce our position once a second while syncing it
+    // Re-announce our position once a second while syncing it. The beacons
+    // have their own sequence counter, their own nonce domain: it must never
+    // be the voice one.
     let position_sequence = Arc::new(AtomicU32::new(0));
     let beacon_handle = tokio::spawn(position_beacon_task(
         spatial.clone(),
@@ -525,7 +527,6 @@ pub async fn connect_to_server(
         transmitting,
         capture_task: None,
         voice_sequence: Arc::new(AtomicU32::new(0)),
-        master_volume: state.master_volume.clone(),
         voice_frames_played,
         voice_frames_lost,
         output_device_live,
@@ -562,7 +563,6 @@ pub async fn connect_to_server(
         source_levels,
         spatial,
         channels: channels_snapshot,
-        position_sequence,
     };
 
     state
@@ -603,16 +603,23 @@ pub async fn teardown(
         release_holds(app);
     }
 
-    // Stop any ongoing voice capture
+    // Stop any ongoing voice and screen capture. Bounded, as `stop_capture`
+    // is: a wedged device must not hang the disconnect — and with it, through
+    // the connect lock, every reconnect to this server.
     connection.transmitting.store(false, Ordering::Relaxed);
-    if let Some(task) = connection.capture_task.take() {
-        let _ = task.await;
-    }
-
-    // Stop any ongoing screen capture
     connection.screen_share_active.store(false, Ordering::Relaxed);
-    if let Some(task) = connection.screen_capture_task.take() {
-        let _ = task.await;
+    for task in [connection.capture_task.take(), connection.screen_capture_task.take()]
+        .into_iter()
+        .flatten()
+    {
+        let mut task = task;
+        if tokio::time::timeout(std::time::Duration::from_secs(2), &mut task)
+            .await
+            .is_err()
+        {
+            warn!("capture task did not stop within 2 s, leaving it behind");
+            task.abort();
+        }
     }
 
     // Close capture session (stops screen capture)
@@ -1008,10 +1015,6 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     info!("control reader task ended");
 }
 
-/// Dispatch a server message to the appropriate Tauri event.
-/// Also handles E2E encryption orchestration (session establishment, sender key
-/// distribution, and automatic decryption of encrypted messages).
-#[allow(clippy::too_many_arguments)]
 /// Replace the cached channel list.
 fn set_channels(cache: &Arc<std::sync::Mutex<Vec<ChannelInfo>>>, channels: Vec<ChannelInfo>) {
     if let Ok(mut list) = cache.lock() {
@@ -1163,6 +1166,9 @@ fn apply_channel_proximity(
     }
 }
 
+/// Dispatch a server message to the appropriate Tauri event.
+/// Also handles E2E encryption orchestration (session establishment, sender key
+/// distribution, and automatic decryption of encrypted messages).
 #[allow(clippy::too_many_arguments)]
 async fn handle_server_message(
     msg: ServerMessage,
@@ -1452,7 +1458,7 @@ async fn handle_server_message(
             // Auto-request prekey bundle for new user (all channels, needed for DMs/pokes)
             if user.user_id != own_user_id {
                 request_prekey_bundles_for_users(
-                    &[user.clone()],
+                    std::slice::from_ref(user),
                     own_user_id,
                     signal,
                     tcp_tx,
@@ -2226,7 +2232,7 @@ async fn handle_prekey_bundle(
             }
 
             // Drain any pending direct messages for this user
-            drain_pending_dms(remote_user_id, own_user_id, signal, tcp_tx).await;
+            drain_pending_dms(remote_user_id, signal, tcp_tx).await;
 
             // Distribute our sender key (and the channel media key) for the
             // channel we stand in and for every text channel we are in — the
@@ -2707,7 +2713,6 @@ async fn handle_sender_key_received(
 /// Drain and send pending direct messages for a specific user whose session was just established.
 async fn drain_pending_dms(
     target_user_id: u32,
-    _own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
     tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
 ) {
@@ -3174,6 +3179,32 @@ const SOURCE_IDLE_PRUNE: std::time::Duration = std::time::Duration::from_secs(60
 
 type MixSources = Arc<std::sync::Mutex<HashMap<u32, MixSource>>>;
 
+/// Most sources the mixer holds at once — talkers and shares heard in the
+/// last [`SOURCE_IDLE_PRUNE`]. The session id a source is keyed by is not
+/// covered by the media encryption, so a relay rewriting it could otherwise
+/// make one valid packet into a decoder each, without end.
+const MAX_MIX_SOURCES: usize = 256;
+
+/// True at most once a second per `last`: a line per packet is fifty a
+/// second per speaker while a key is missing — every join, until it arrives.
+fn log_due(last: &mut Option<std::time::Instant>) -> bool {
+    let now = std::time::Instant::now();
+    if last.is_some_and(|t| now.duration_since(t) < std::time::Duration::from_secs(1)) {
+        return false;
+    }
+    *last = Some(now);
+    true
+}
+
+/// Whether the mixer is at [`MAX_MIX_SOURCES`]; says so once a second.
+fn full_sources(map: &HashMap<u32, MixSource>, log: &mut Option<std::time::Instant>) -> bool {
+    let full = map.len() >= MAX_MIX_SOURCES;
+    if full && log_due(log) {
+        warn!(sources = map.len(), "mixer is full, dropping audio from a new source");
+    }
+    full
+}
+
 /// Device-clocked voice mixer: whenever the playback ring has room, pop one
 /// 20ms frame per active source, decode (FEC/PLC on loss), sum with per-user
 /// and master gain, and push the mixed frame. Owns the playback stream and
@@ -3244,6 +3275,7 @@ async fn voice_mixer_task(
     // Frames pushed since this connection stopped being audible
     let mut idle_frames = 0usize;
     let mut error_emitted = false;
+    let mut decode_log = None;
     // Interleaved stereo mix for one 20 ms frame
     let mut stereo: Vec<f32> = Vec::new();
     // One frame of the settings panel's spatial test, when it runs
@@ -3498,7 +3530,9 @@ async fn voice_mixer_task(
                 let mut pcm = match pcm {
                     Ok(pcm) => pcm,
                     Err(e) => {
-                        warn!("Opus decode error from source {:#x}: {}", key, e);
+                        if log_due(&mut decode_log) {
+                            warn!("Opus decode error from source {:#x}: {}", key, e);
+                        }
                         continue;
                     }
                 };
@@ -3615,7 +3649,7 @@ async fn voice_mixer_task(
                     // Resample each channel on its own state, then re-interleave
                     chan_l.clear();
                     chan_r.clear();
-                    for pair in stereo.chunks_exact(2) {
+                    for pair in stereo.as_chunks::<2>().0 {
                         chan_l.push(pair[0]);
                         chan_r.push(pair[1]);
                     }
@@ -3866,7 +3900,7 @@ const LOSS_REPORT_TTL_MS: u64 = 2_000;
 /// Whether enough of the current viewers report loss to step the share down.
 /// With no viewer count yet (nothing received), a single report is enough.
 fn majority_reached(reporters: usize, viewers: u32) -> bool {
-    reporters as u32 >= ((viewers + 1) / 2).max(1)
+    reporters as u32 >= viewers.div_ceil(2).max(1)
 }
 
 /// One second of this connection's QUIC path statistics.
@@ -3983,6 +4017,7 @@ async fn datagram_receiver_task(
     // A game hears who talks only in the call it is placing people in
     let in_voice = || is_voice.load(Ordering::Relaxed);
     let mut recv_count: u64 = 0;
+    let (mut key_log, mut decrypt_log, mut source_log) = (None, None, None);
     // Track last voice packet time per user for speaking timeout
     let mut last_voice_time: HashMap<u32, std::time::Instant> = HashMap::new();
     let mut speaking_timeout = tokio::time::interval(std::time::Duration::from_millis(300));
@@ -4048,15 +4083,19 @@ async fn datagram_receiver_task(
                                 ) {
                                     Ok(decrypted) => decrypted,
                                     Err(e) => {
-                                        warn!(
-                                            "Voice decryption failed from session {}: {}",
-                                            session_id, e
-                                        );
+                                        if log_due(&mut decrypt_log) {
+                                            warn!(
+                                                "Voice decryption failed from session {}: {}",
+                                                session_id, e
+                                            );
+                                        }
                                         continue;
                                     }
                                 }
                             } else {
-                                warn!("Received encrypted voice but no media key available");
+                                if log_due(&mut key_log) {
+                                    warn!("Received encrypted voice but no media key available");
+                                }
                                 continue;
                             }
                         };
@@ -4068,6 +4107,9 @@ async fn datagram_receiver_task(
                                 Ok(m) => m,
                                 Err(poisoned) => poisoned.into_inner(),
                             };
+                            if !map.contains_key(&session_id) && full_sources(&map, &mut source_log) {
+                                continue;
+                            }
                             let src = match map.entry(session_id) {
                                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                                 std::collections::hash_map::Entry::Vacant(v) => {
@@ -4153,7 +4195,9 @@ async fn datagram_receiver_task(
                             ) {
                                 Ok(decrypted) => decrypted,
                                 Err(e) => {
-                                    warn!("position decryption failed from session {session_id}: {e}");
+                                    if log_due(&mut decrypt_log) {
+                                        warn!("position decryption failed from session {session_id}: {e}");
+                                    }
                                     continue;
                                 }
                             }
@@ -4253,12 +4297,16 @@ async fn datagram_receiver_task(
                                 ) {
                                     Ok(decrypted) => decrypted,
                                     Err(e) => {
-                                        warn!("Screen audio decryption failed: {}", e);
+                                        if log_due(&mut decrypt_log) {
+                                            warn!("Screen audio decryption failed: {}", e);
+                                        }
                                         continue;
                                     }
                                 }
                             } else {
-                                warn!("Received encrypted screen audio but no media key");
+                                if log_due(&mut key_log) {
+                                    warn!("Received encrypted screen audio but no media key");
+                                }
                                 continue;
                             }
                         } else {
@@ -4274,6 +4322,9 @@ async fn datagram_receiver_task(
                                 Err(poisoned) => poisoned.into_inner(),
                             };
                             let key = packet.session_id | SCREEN_AUDIO_FLAG;
+                            if !map.contains_key(&key) && full_sources(&map, &mut source_log) {
+                                continue;
+                            }
                             let src = match map.entry(key) {
                                 std::collections::hash_map::Entry::Occupied(e) => e.into_mut(),
                                 std::collections::hash_map::Entry::Vacant(v) => {
@@ -4359,6 +4410,7 @@ async fn video_stream_receiver_task(
 ) {
     let mut video_assembler = FrameAssembler::new();
     let mut current_video_session: Option<u32> = None;
+    let (mut key_log, mut decrypt_log) = (None, None);
     let mut last_keyframe_request = std::time::Instant::now() - std::time::Duration::from_secs(10);
     // A frame went missing since the last one handed to the decode task
     let mut gap = false;
@@ -4416,12 +4468,16 @@ async fn video_stream_receiver_task(
                     ) {
                         Ok(decrypted) => packet.payload = decrypted,
                         Err(e) => {
-                            warn!("Video decryption failed: {}", e);
+                            if log_due(&mut decrypt_log) {
+                                warn!("Video decryption failed: {}", e);
+                            }
                             continue;
                         }
                     }
                 } else {
-                    warn!("Received encrypted video but no media key");
+                    if log_due(&mut key_log) {
+                        warn!("Received encrypted video but no media key");
+                    }
                     continue;
                 }
             }
@@ -4491,237 +4547,6 @@ async fn video_stream_receiver_task(
             window_dropped = 0;
             window_received = 0;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The pacer is what keeps an honest client's busy connect — a pre-key
-    /// bundle per person, then a sender key per person per channel — from
-    /// being dropped frame by frame by a budget it cannot see.
-    #[test]
-    fn the_control_pacer_stays_under_what_the_server_accepts() {
-        assert!(
-            ControlPacer::RATE < voipc_protocol::codec::CONTROL_MSGS_PER_SEC as f64,
-            "pacing at or above the server's own rate paces nothing"
-        );
-        let start = tokio::time::Instant::now();
-        let mut pacer = ControlPacer::new(start);
-        // A burst goes out at once — that is what a connect looks like...
-        let burst = ControlPacer::RATE as usize;
-        for _ in 0..burst {
-            assert!(pacer.take(start).is_zero());
-        }
-        // ...and the rest is spread, at the rate and not faster.
-        let mut waited = std::time::Duration::ZERO;
-        for _ in 0..burst * 2 {
-            waited += pacer.take(start + waited);
-        }
-        let seconds = waited.as_secs_f64();
-        assert!((1.9..2.1).contains(&seconds), "{seconds} s for two seconds' traffic");
-    }
-
-    /// The media receive path reads the key generation and the sender's nonce
-    /// prefix straight out of the datagram, because parsing a whole
-    /// `VoicePacket` per packet would allocate on the hot path. Nothing in the
-    /// compiler checks those two offsets against what the sender writes, and
-    /// getting either wrong is silent: every packet simply fails to decrypt,
-    /// which looks exactly like a key that has not arrived yet.
-    #[test]
-    fn the_hand_parsed_media_header_matches_what_a_sender_writes() {
-        use voipc_protocol::voice::{VoicePacket, ENCRYPTED_VOICE_HEADER_SIZE};
-
-        let (session_id, sequence, key_id, stream_id) = (7u32, 99u32, 3u16, 0xDEAD_BEEFu32);
-        let buf = VoicePacket::encrypted_voice(session_id, sequence, key_id, stream_id, vec![1, 2, 3])
-            .to_bytes();
-
-        assert_eq!(u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]), session_id);
-        assert_eq!(u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]), sequence);
-        assert_eq!(u16::from_be_bytes([buf[9], buf[10]]), key_id);
-        assert_eq!(
-            u32::from_be_bytes([buf[11], buf[12], buf[13], buf[14]]),
-            stream_id
-        );
-        assert_eq!(&buf[ENCRYPTED_VOICE_HEADER_SIZE..], &[1, 2, 3]);
-    }
-    use std::time::Duration;
-
-    fn sample(rtt_ms: u64, lost: u64, sent: u64) -> PathSample {
-        PathSample {
-            rtt: Duration::from_millis(rtt_ms),
-            lost_packets: lost,
-            sent_packets: sent,
-        }
-    }
-
-    #[test]
-    fn congestion_needs_real_loss_or_a_growing_queue() {
-        let min_rtt = Duration::from_millis(20);
-        let prev = sample(20, 0, 1_000);
-
-        // A quiet second: no loss, RTT at the session minimum
-        assert!(!congested(&prev, &sample(20, 0, 1_500), min_rtt));
-        // One lost packet in 500 is normal wireless noise, not congestion
-        assert!(!congested(&prev, &sample(20, 1, 1_500), min_rtt));
-        // 1% of the window lost
-        assert!(congested(&prev, &sample(20, 5, 1_500), min_rtt));
-        // RTT doubled (the 2× branch, which decides while min_rtt is large)
-        assert!(congested(&prev, &sample(200, 0, 1_500), min_rtt));
-        // Doubling a tiny min_rtt is not enough on its own: +100 ms is the floor
-        assert!(!congested(&prev, &sample(50, 0, 1_500), min_rtt));
-        assert!(congested(&prev, &sample(150, 0, 1_500), min_rtt));
-        // On a link whose minimum is already high, doubling is the wider bound,
-        // so +100 ms of jitter is not yet congestion
-        let far = Duration::from_millis(300);
-        assert!(!congested(&prev, &sample(450, 0, 1_500), far));
-        assert!(congested(&prev, &sample(700, 0, 1_500), far));
-    }
-
-    #[test]
-    fn majority_of_viewers_steps_the_share_down() {
-        assert!(majority_reached(1, 1)); // the only viewer
-        assert!(majority_reached(1, 2)); // half of two is a majority here
-        assert!(!majority_reached(1, 3)); // one of three is not
-        assert!(majority_reached(2, 3));
-        assert!(!majority_reached(2, 5));
-        assert!(majority_reached(3, 5));
-        // No viewer count seen yet: trust the report we did get
-        assert!(majority_reached(1, 0));
-        assert!(!majority_reached(0, 0));
-    }
-
-    /// A state with no geometry, so a layer's gains are its own volume and pan
-    /// and nothing else — which is what makes the sums below readable.
-    fn flat_state() -> crate::app_state::SpatialState {
-        crate::app_state::SpatialState::default()
-    }
-
-    fn layer(volume: f32, pan: f32, delay_frames: u8) -> voipc_audio::spatial::Source {
-        voipc_audio::spatial::Source {
-            volume,
-            pan,
-            delay_frames,
-            direct: true,
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn every_layer_is_another_render_of_the_same_voice() {
-        // One speaker, heard twice at once: the phone in the left ear and the
-        // person themselves across the room. Both come out of one Opus frame.
-        let sp = flat_state();
-        let mut layers = Vec::new();
-        let specs = [layer(1.0, -1.0, 0), layer(0.5, 1.0, 0)];
-        let pcm = vec![0.25f32; 960];
-        let mut stereo = vec![0.0f32; 1920];
-
-        let played = mix_layers(
-            &mut layers,
-            &specs,
-            &sp,
-            &mut stereo,
-            Some(&pcm),
-            1.0,
-            false,
-            false,
-            0,
-            0,
-            std::time::Instant::now(),
-        );
-        assert!(played);
-        assert_eq!(layers.len(), 2, "a chain per layer, grown on demand");
-        // Hard left and hard right, so each ear carries exactly one of them
-        let root2 = core::f32::consts::SQRT_2;
-        assert!((stereo[0] - 0.25 * root2).abs() < 1e-5, "left ear: {}", stereo[0]);
-        assert!((stereo[1] - 0.25 * 0.5 * root2).abs() < 1e-5, "right ear: {}", stereo[1]);
-    }
-
-    #[test]
-    fn a_delayed_layer_arrives_late_and_keeps_playing_after_the_voice_stops() {
-        // The radio double: one voice reaching you twice, once through the air
-        // and once a beat later over the radio.
-        let sp = flat_state();
-        let mut layers = Vec::new();
-        let specs = [layer(1.0, 0.0, 2)];
-        let pcm = vec![0.25f32; 960];
-        let now = std::time::Instant::now();
-        let mut run = |frame: Option<&[f32]>| {
-            let mut stereo = vec![0.0f32; 1920];
-            mix_layers(
-                &mut layers, &specs, &sp, &mut stereo, frame, 1.0, false, false, 0, 0, now,
-            );
-            stereo[0]
-        };
-
-        // Two frames held back: nothing comes out yet
-        assert_eq!(run(Some(&pcm)), 0.0);
-        assert_eq!(run(Some(&pcm)), 0.0);
-        assert!(run(Some(&pcm)).abs() > 0.1, "the delay never let go");
-        // And the line drains after the speaker stops, rather than being cut
-        assert!(run(None).abs() > 0.1, "the tail of the delay was dropped");
-        assert!(run(None).abs() > 0.1);
-        assert_eq!(run(None), 0.0, "a drained line kept playing");
-    }
-
-    #[test]
-    fn a_shorter_delay_takes_effect_without_waiting_for_a_pause() {
-        // The line pops one frame per push, so it keeps whatever length it grew
-        // to: a mod dropping `delay` from 100 ms to 40 left the layer arriving
-        // 100 ms late for the rest of the sentence.
-        let mut layer = LayerMix::default();
-        let frame = |n: f32| vec![n; 4];
-        for i in 0..5 {
-            layer.delayed(Some(&frame(i as f32)), 5);
-        }
-        assert_eq!(layer.ring.len(), 5, "the line did not fill");
-        // Same tick the mod shortens it: the surplus is dropped, and what comes
-        // out is one frame old rather than five
-        let out = layer.delayed(Some(&frame(5.0)), 1).expect("nothing came out");
-        assert_eq!(out[0], 4.0, "the layer stayed at the old delay");
-        assert_eq!(layer.ring.len(), 1);
-        // And zero clears it entirely, as it always did
-        assert!(layer.delayed(Some(&frame(6.0)), 0).is_none());
-        assert!(layer.ring.is_empty());
-    }
-
-    #[test]
-    fn dropping_a_layer_drops_its_chain() {
-        let sp = flat_state();
-        let mut layers = Vec::new();
-        let pcm = vec![0.25f32; 960];
-        let mut stereo = vec![0.0f32; 1920];
-        let now = std::time::Instant::now();
-        let three = [layer(1.0, 0.0, 0), layer(1.0, 0.0, 0), layer(1.0, 0.0, 0)];
-        mix_layers(&mut layers, &three, &sp, &mut stereo, Some(&pcm), 1.0, false, false, 0, 0, now);
-        assert_eq!(layers.len(), 3);
-        mix_layers(&mut layers, &[], &sp, &mut stereo, Some(&pcm), 1.0, false, false, 0, 0, now);
-        assert!(layers.is_empty(), "a layer the game dropped kept its chain");
-    }
-
-    #[test]
-    fn only_an_ask_we_made_lately_lets_a_server_seat_us() {
-        assert!(!voice_ask_fresh(0, 50_000), "never asked");
-        assert!(voice_ask_fresh(40_000, 40_000));
-        assert!(voice_ask_fresh(40_000, 40_000 + VOICE_ASK_TTL_MS - 1));
-        assert!(!voice_ask_fresh(40_000, 40_000 + VOICE_ASK_TTL_MS), "stale");
-        // A clock that stepped back is not an ask from the future
-        assert!(voice_ask_fresh(40_000, 39_000));
-    }
-
-    #[test]
-    fn only_a_keyframe_after_the_last_gap_resumes_rendering() {
-        // (gap_before, is_keyframe) per frame, every one decoding fine
-        let run = |fs: &[(bool, bool)]| {
-            fs.iter().fold(true, |ok, &(gap, key)| chain_intact(ok, gap, key, true))
-        };
-        // A keyframe queued before a loss does not vouch for what follows it
-        assert!(!run(&[(false, true), (true, false), (false, false)]));
-        assert!(run(&[(true, false), (false, true), (false, false)]));
-        assert!(run(&[(true, true)]));
-        assert!(!chain_intact(true, false, false, false), "a failed decode breaks it");
     }
 }
 
@@ -4829,7 +4654,7 @@ fn video_decode_render_task(
         // JPEG-encode and emit only if not suppressed
         if !suppress_render {
             for df in &latest_decoded {
-                let packed = ((df.width as u32) << 16) | (df.height as u32);
+                let packed = (df.width << 16) | df.height;
                 screen_video_resolution.store(packed, Ordering::Relaxed);
                 screenshare::render_frame(df, &app_handle, &mut buffers);
             }
@@ -5133,5 +4958,236 @@ pub fn spawn_capture_encode_task(
         }
         info!("capture+encode task stopped");
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The pacer is what keeps an honest client's busy connect — a pre-key
+    /// bundle per person, then a sender key per person per channel — from
+    /// being dropped frame by frame by a budget it cannot see.
+    #[test]
+    fn the_control_pacer_stays_under_what_the_server_accepts() {
+        assert!(
+            ControlPacer::RATE < voipc_protocol::codec::CONTROL_MSGS_PER_SEC as f64,
+            "pacing at or above the server's own rate paces nothing"
+        );
+        let start = tokio::time::Instant::now();
+        let mut pacer = ControlPacer::new(start);
+        // A burst goes out at once — that is what a connect looks like...
+        let burst = ControlPacer::RATE as usize;
+        for _ in 0..burst {
+            assert!(pacer.take(start).is_zero());
+        }
+        // ...and the rest is spread, at the rate and not faster.
+        let mut waited = std::time::Duration::ZERO;
+        for _ in 0..burst * 2 {
+            waited += pacer.take(start + waited);
+        }
+        let seconds = waited.as_secs_f64();
+        assert!((1.9..2.1).contains(&seconds), "{seconds} s for two seconds' traffic");
+    }
+
+    /// The media receive path reads the key generation and the sender's nonce
+    /// prefix straight out of the datagram, because parsing a whole
+    /// `VoicePacket` per packet would allocate on the hot path. Nothing in the
+    /// compiler checks those two offsets against what the sender writes, and
+    /// getting either wrong is silent: every packet simply fails to decrypt,
+    /// which looks exactly like a key that has not arrived yet.
+    #[test]
+    fn the_hand_parsed_media_header_matches_what_a_sender_writes() {
+        use voipc_protocol::voice::{VoicePacket, ENCRYPTED_VOICE_HEADER_SIZE};
+
+        let (session_id, sequence, key_id, stream_id) = (7u32, 99u32, 3u16, 0xDEAD_BEEFu32);
+        let buf = VoicePacket::encrypted_voice(session_id, sequence, key_id, stream_id, vec![1, 2, 3])
+            .to_bytes();
+
+        assert_eq!(u32::from_be_bytes([buf[1], buf[2], buf[3], buf[4]]), session_id);
+        assert_eq!(u32::from_be_bytes([buf[5], buf[6], buf[7], buf[8]]), sequence);
+        assert_eq!(u16::from_be_bytes([buf[9], buf[10]]), key_id);
+        assert_eq!(
+            u32::from_be_bytes([buf[11], buf[12], buf[13], buf[14]]),
+            stream_id
+        );
+        assert_eq!(&buf[ENCRYPTED_VOICE_HEADER_SIZE..], &[1, 2, 3]);
+    }
+    use std::time::Duration;
+
+    fn sample(rtt_ms: u64, lost: u64, sent: u64) -> PathSample {
+        PathSample {
+            rtt: Duration::from_millis(rtt_ms),
+            lost_packets: lost,
+            sent_packets: sent,
+        }
+    }
+
+    #[test]
+    fn congestion_needs_real_loss_or_a_growing_queue() {
+        let min_rtt = Duration::from_millis(20);
+        let prev = sample(20, 0, 1_000);
+
+        // A quiet second: no loss, RTT at the session minimum
+        assert!(!congested(&prev, &sample(20, 0, 1_500), min_rtt));
+        // One lost packet in 500 is normal wireless noise, not congestion
+        assert!(!congested(&prev, &sample(20, 1, 1_500), min_rtt));
+        // 1% of the window lost
+        assert!(congested(&prev, &sample(20, 5, 1_500), min_rtt));
+        // RTT doubled (the 2× branch, which decides while min_rtt is large)
+        assert!(congested(&prev, &sample(200, 0, 1_500), min_rtt));
+        // Doubling a tiny min_rtt is not enough on its own: +100 ms is the floor
+        assert!(!congested(&prev, &sample(50, 0, 1_500), min_rtt));
+        assert!(congested(&prev, &sample(150, 0, 1_500), min_rtt));
+        // On a link whose minimum is already high, doubling is the wider bound,
+        // so +100 ms of jitter is not yet congestion
+        let far = Duration::from_millis(300);
+        assert!(!congested(&prev, &sample(450, 0, 1_500), far));
+        assert!(congested(&prev, &sample(700, 0, 1_500), far));
+    }
+
+    #[test]
+    fn majority_of_viewers_steps_the_share_down() {
+        assert!(majority_reached(1, 1)); // the only viewer
+        assert!(majority_reached(1, 2)); // half of two is a majority here
+        assert!(!majority_reached(1, 3)); // one of three is not
+        assert!(majority_reached(2, 3));
+        assert!(!majority_reached(2, 5));
+        assert!(majority_reached(3, 5));
+        // No viewer count seen yet: trust the report we did get
+        assert!(majority_reached(1, 0));
+        assert!(!majority_reached(0, 0));
+    }
+
+    /// A state with no geometry, so a layer's gains are its own volume and pan
+    /// and nothing else — which is what makes the sums below readable.
+    fn flat_state() -> crate::app_state::SpatialState {
+        crate::app_state::SpatialState::default()
+    }
+
+    fn layer(volume: f32, pan: f32, delay_frames: u8) -> voipc_audio::spatial::Source {
+        voipc_audio::spatial::Source {
+            volume,
+            pan,
+            delay_frames,
+            direct: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn every_layer_is_another_render_of_the_same_voice() {
+        // One speaker, heard twice at once: the phone in the left ear and the
+        // person themselves across the room. Both come out of one Opus frame.
+        let sp = flat_state();
+        let mut layers = Vec::new();
+        let specs = [layer(1.0, -1.0, 0), layer(0.5, 1.0, 0)];
+        let pcm = vec![0.25f32; 960];
+        let mut stereo = vec![0.0f32; 1920];
+
+        let played = mix_layers(
+            &mut layers,
+            &specs,
+            &sp,
+            &mut stereo,
+            Some(&pcm),
+            1.0,
+            false,
+            false,
+            0,
+            0,
+            std::time::Instant::now(),
+        );
+        assert!(played);
+        assert_eq!(layers.len(), 2, "a chain per layer, grown on demand");
+        // Hard left and hard right, so each ear carries exactly one of them
+        let root2 = core::f32::consts::SQRT_2;
+        assert!((stereo[0] - 0.25 * root2).abs() < 1e-5, "left ear: {}", stereo[0]);
+        assert!((stereo[1] - 0.25 * 0.5 * root2).abs() < 1e-5, "right ear: {}", stereo[1]);
+    }
+
+    #[test]
+    fn a_delayed_layer_arrives_late_and_keeps_playing_after_the_voice_stops() {
+        // The radio double: one voice reaching you twice, once through the air
+        // and once a beat later over the radio.
+        let sp = flat_state();
+        let mut layers = Vec::new();
+        let specs = [layer(1.0, 0.0, 2)];
+        let pcm = vec![0.25f32; 960];
+        let now = std::time::Instant::now();
+        let mut run = |frame: Option<&[f32]>| {
+            let mut stereo = vec![0.0f32; 1920];
+            mix_layers(
+                &mut layers, &specs, &sp, &mut stereo, frame, 1.0, false, false, 0, 0, now,
+            );
+            stereo[0]
+        };
+
+        // Two frames held back: nothing comes out yet
+        assert_eq!(run(Some(&pcm)), 0.0);
+        assert_eq!(run(Some(&pcm)), 0.0);
+        assert!(run(Some(&pcm)).abs() > 0.1, "the delay never let go");
+        // And the line drains after the speaker stops, rather than being cut
+        assert!(run(None).abs() > 0.1, "the tail of the delay was dropped");
+        assert!(run(None).abs() > 0.1);
+        assert_eq!(run(None), 0.0, "a drained line kept playing");
+    }
+
+    #[test]
+    fn a_shorter_delay_takes_effect_without_waiting_for_a_pause() {
+        // The line pops one frame per push, so it keeps whatever length it grew
+        // to: a mod dropping `delay` from 100 ms to 40 left the layer arriving
+        // 100 ms late for the rest of the sentence.
+        let mut layer = LayerMix::default();
+        let frame = |n: f32| vec![n; 4];
+        for i in 0..5 {
+            layer.delayed(Some(&frame(i as f32)), 5);
+        }
+        assert_eq!(layer.ring.len(), 5, "the line did not fill");
+        // Same tick the mod shortens it: the surplus is dropped, and what comes
+        // out is one frame old rather than five
+        let out = layer.delayed(Some(&frame(5.0)), 1).expect("nothing came out");
+        assert_eq!(out[0], 4.0, "the layer stayed at the old delay");
+        assert_eq!(layer.ring.len(), 1);
+        // And zero clears it entirely, as it always did
+        assert!(layer.delayed(Some(&frame(6.0)), 0).is_none());
+        assert!(layer.ring.is_empty());
+    }
+
+    #[test]
+    fn dropping_a_layer_drops_its_chain() {
+        let sp = flat_state();
+        let mut layers = Vec::new();
+        let pcm = vec![0.25f32; 960];
+        let mut stereo = vec![0.0f32; 1920];
+        let now = std::time::Instant::now();
+        let three = [layer(1.0, 0.0, 0), layer(1.0, 0.0, 0), layer(1.0, 0.0, 0)];
+        mix_layers(&mut layers, &three, &sp, &mut stereo, Some(&pcm), 1.0, false, false, 0, 0, now);
+        assert_eq!(layers.len(), 3);
+        mix_layers(&mut layers, &[], &sp, &mut stereo, Some(&pcm), 1.0, false, false, 0, 0, now);
+        assert!(layers.is_empty(), "a layer the game dropped kept its chain");
+    }
+
+    #[test]
+    fn only_an_ask_we_made_lately_lets_a_server_seat_us() {
+        assert!(!voice_ask_fresh(0, 50_000), "never asked");
+        assert!(voice_ask_fresh(40_000, 40_000));
+        assert!(voice_ask_fresh(40_000, 40_000 + VOICE_ASK_TTL_MS - 1));
+        assert!(!voice_ask_fresh(40_000, 40_000 + VOICE_ASK_TTL_MS), "stale");
+        // A clock that stepped back is not an ask from the future
+        assert!(voice_ask_fresh(40_000, 39_000));
+    }
+
+    #[test]
+    fn only_a_keyframe_after_the_last_gap_resumes_rendering() {
+        // (gap_before, is_keyframe) per frame, every one decoding fine
+        let run = |fs: &[(bool, bool)]| {
+            fs.iter().fold(true, |ok, &(gap, key)| chain_intact(ok, gap, key, true))
+        };
+        // A keyframe queued before a loss does not vouch for what follows it
+        assert!(!run(&[(false, true), (true, false), (false, false)]));
+        assert!(run(&[(true, false), (false, true), (false, false)]));
+        assert!(run(&[(true, true)]));
+        assert!(!chain_intact(true, false, false, false), "a failed decode breaks it");
+    }
 }
 

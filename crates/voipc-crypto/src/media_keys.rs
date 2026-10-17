@@ -167,7 +167,7 @@ fn build_nonce(stream_id: u32, sequence: u32, extra: u32, aad_context: &[u8]) ->
 }
 
 /// Maximum sequence number before a key rotation MUST occur.
-/// At ~50 packets/sec (20ms voice frames), this is ~24 hours.
+/// At ~50 packets/sec (20ms voice frames), this is about 2.7 years.
 /// After this, nonce uniqueness cannot be guaranteed under the same key.
 pub const MAX_SEQUENCE_BEFORE_ROTATION: u32 = u32::MAX - 1000;
 
@@ -189,7 +189,7 @@ pub fn media_encrypt(
     plaintext: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
     // bernd: refusing to encrypt is the whole answer here — reached only
-    // after ~24 h of continuous speech on one connection, where the fix is to
+    // after years of continuous speech on one connection, where the fix is to
     // rotate the key and re-roll the sender's `stream_id`. Do that if anybody
     // ever holds a call that long.
     if sequence >= MAX_SEQUENCE_BEFORE_ROTATION {
@@ -202,7 +202,9 @@ pub fn media_encrypt(
     let aead_key = key.to_aead_key()?;
     let nonce = build_nonce(stream_id, sequence, extra, aad_context);
 
-    let mut in_out = plaintext.to_vec();
+    // Room for the tag up front: it is appended to every packet
+    let mut in_out = Vec::with_capacity(plaintext.len() + GCM_TAG_SIZE);
+    in_out.extend_from_slice(plaintext);
     aead_key
         .seal_in_place_append_tag(nonce, Aad::from(aad_context), &mut in_out)
         .map_err(|_| anyhow::anyhow!("encryption failed"))?;
@@ -232,11 +234,13 @@ pub fn media_decrypt(
     let nonce = build_nonce(stream_id, sequence, extra, aad_context);
 
     let mut in_out = ciphertext.to_vec();
-    let plaintext = aead_key
+    let len = aead_key
         .open_in_place(nonce, Aad::from(aad_context), &mut in_out)
-        .map_err(|_| anyhow::anyhow!("decryption failed: invalid key or tampered data"))?;
-
-    Ok(plaintext.to_vec())
+        .map_err(|_| anyhow::anyhow!("decryption failed: invalid key or tampered data"))?
+        .len();
+    // The plaintext is the front of the buffer; drop the tag rather than copy
+    in_out.truncate(len);
+    Ok(in_out)
 }
 
 /// The media keys a client holds for the channel it is in: the one it encrypts
@@ -369,11 +373,9 @@ impl MediaKeyRing {
 /// Build AAD context bytes for media encryption.
 /// Binds the channel_id and packet_type to the ciphertext, preventing
 /// cross-channel replay attacks and packet type confusion.
-pub fn build_aad(channel_id: u32, packet_type: u8) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(5);
-    aad.extend_from_slice(&channel_id.to_be_bytes());
-    aad.push(packet_type);
-    aad
+pub fn build_aad(channel_id: u32, packet_type: u8) -> [u8; 5] {
+    let c = channel_id.to_be_bytes();
+    [c[0], c[1], c[2], c[3], packet_type]
 }
 
 #[cfg(test)]

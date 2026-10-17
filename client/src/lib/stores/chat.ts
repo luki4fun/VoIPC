@@ -187,9 +187,22 @@ export function claimLegacyKeys(server: string): void {
 // ---------------------------------------------------------------------------
 
 let saveTimeout: ReturnType<typeof setTimeout> | null = null;
+/** When the save now waiting was first asked for. */
+let saveAskedAt = 0;
+/**
+ * Debounced, but not for ever: a channel with a message every two seconds
+ * restarted the wait with each one and was never saved until it went quiet.
+ */
+const SAVE_MAX_WAIT_MS = 10_000;
 
 function scheduleSave() {
-  if (saveTimeout) clearTimeout(saveTimeout);
+  if (saveTimeout) {
+    // Long enough waiting: let the one already set go off
+    if (Date.now() - saveAskedAt >= SAVE_MAX_WAIT_MS) return;
+    clearTimeout(saveTimeout);
+  } else {
+    saveAskedAt = Date.now();
+  }
   saveTimeout = setTimeout(async () => {
     saveTimeout = null;
 

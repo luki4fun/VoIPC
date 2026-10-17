@@ -508,6 +508,7 @@ To build it yourself:
 
 ```bash
 npm run web        # wasm + Vite bundle, then a server binary that embeds it
+VOIPC_SELFTEST=1 npm run web   # the same with the in-page self-test, which test:web needs
 npm run test:web   # headless two-browser end-to-end check (voice, chat, DMs, screen share,
                    # proximity, and a run through the real UI in the Chromium lanes)
 npm --prefix client test   # browser-side unit tests (spatial maths, room presets)

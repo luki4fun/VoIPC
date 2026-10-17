@@ -308,6 +308,12 @@ pub struct FrameAssembler {
     last_completed_frame_id: Option<u32>,
 }
 
+impl Default for FrameAssembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FrameAssembler {
     pub fn new() -> Self {
         Self {
@@ -375,10 +381,8 @@ impl FrameAssembler {
         // Check if frame is complete
         if self.received_count == self.fragment_count {
             let mut frame_data = Vec::new();
-            for frag in &self.fragments {
-                if let Some(data) = frag {
-                    frame_data.extend_from_slice(data);
-                }
+            for data in self.fragments.iter().flatten() {
+                frame_data.extend_from_slice(data);
             }
             let is_keyframe = self.is_keyframe;
             if is_keyframe {

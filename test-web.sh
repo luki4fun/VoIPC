@@ -14,7 +14,7 @@
 # every check below then proves the tunnel carries what QUIC does — and a mixed
 # run, that the relay is the same across the two.
 #
-# Prerequisites: npm run web (or npm run build:web + cargo build -p voipc-server --release),
+# Prerequisites: VOIPC_SELFTEST=1 npm run web (a release bundle has no self-test),
 # openssl, curl with HTTP/2, and either chromium (CHROME=/path/to/chrome) or,
 # for the Firefox lane, firefox (FIREFOX=...) plus certutil to trust the test
 # certificate (Arch: nss, Debian/Ubuntu: libnss3-tools).
@@ -61,7 +61,11 @@ done
 via() { [ "$1" = tcp ] && echo "&transport=tcp" || true; }
 echo "browsers: alice=$BROWSER_ALICE over $TRANSPORT_ALICE, bob=$BROWSER_BOB over $TRANSPORT_BOB"
 SERVER="${SERVER:-target/release/voipc-server}"
-[ -x "$SERVER" ] || { echo "$SERVER missing — run npm run web first" >&2; exit 1; }
+[ -x "$SERVER" ] || { echo "$SERVER missing — run VOIPC_SELFTEST=1 npm run web first" >&2; exit 1; }
+grep -qs SELFTEST client/dist-web/assets/*.js || {
+  echo "client/dist-web has no self-test — rebuild with VOIPC_SELFTEST=1 npm run web" >&2
+  exit 1
+}
 
 TCP_PORT="${TCP_PORT:-19987}"
 DURATION="${DURATION:-15000}"

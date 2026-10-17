@@ -137,8 +137,10 @@ jobs:
       - run: npm ci
         working-directory: client
 
-      # wasm + web bundle + the server that embeds it
+      # wasm + web bundle (with the self-test test-web.sh drives) + the server
+      # that embeds it
       - run: npm run web
+        env: { VOIPC_SELFTEST: '1' }
 
       # Both engines, and both mixed pairings: a Chromium sharer feeds a Firefox
       # viewer H.264, a Firefox sharer feeds a Chromium viewer VP9.

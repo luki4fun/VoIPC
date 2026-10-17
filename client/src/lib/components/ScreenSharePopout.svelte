@@ -62,11 +62,12 @@
         .then(([, , framesRecv, framesDropped, bytesRecv, resPacked]) => {
           const dt = 0.5;
 
-          const recvDelta = framesRecv - lastFramesRecv;
+          // A restarted share resets the counters: never a negative rate
+          const recvDelta = Math.max(0, framesRecv - lastFramesRecv);
           popoutFps = Math.round(recvDelta / dt);
           lastFramesRecv = framesRecv;
 
-          const bytesDelta = bytesRecv - lastBytesRecv;
+          const bytesDelta = Math.max(0, bytesRecv - lastBytesRecv);
           popoutBitrate = Math.round((bytesDelta * 8) / (dt * 1000));
           lastBytesRecv = bytesRecv;
 

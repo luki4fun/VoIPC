@@ -2888,11 +2888,15 @@ pub async fn unlock_chat_history(
 ) -> Result<ChatArchivePayload, String> {
     let mut chat = state.chat.write().await;
 
-    let data =
-        std::fs::read(&chat.file_path).map_err(|e| format!("failed to read file: {e}"))?;
-
-    let (mut archive, salt, key) =
-        crypto::decrypt_archive(&data, &password).map_err(|e| e.to_string())?;
+    // Off the async runtime: the key derivation is 600k PBKDF2 rounds, about
+    // half a second of CPU that would stall everything else on that worker
+    let path = chat.file_path.clone();
+    let (mut archive, salt, key) = tokio::task::spawn_blocking(move || {
+        let data = std::fs::read(&path).map_err(|e| format!("failed to read file: {e}"))?;
+        crypto::decrypt_archive(&data, &password).map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     // A message whose timer ran out while the app was closed is not shown and
     // not kept: the deadline was stamped when it arrived, so it does not matter
     // that nothing was running when it came due.
@@ -2922,7 +2926,10 @@ pub async fn create_chat_history(
     let mut chat = state.chat.write().await;
 
     let salt = crypto::generate_salt();
-    let key = crypto::derive_key(&password, &salt);
+    // The same derivation as unlocking, and off the runtime for the same reason
+    let key = tokio::task::spawn_blocking(move || crypto::derive_key(&password, &salt))
+        .await
+        .map_err(|e| e.to_string())?;
     let archive = ChatArchive::default();
 
     // Write the initial (empty) encrypted file
@@ -3337,10 +3344,31 @@ fn validate_sound_path(path_str: &str) -> Result<std::path::PathBuf, String> {
 }
 
 /// Play an audio file in a background thread via rodio.
+///
+/// At most [`MAX_SOUNDS`] at once: each one is a thread and an output stream,
+/// and a server can make the events behind them (joins, leaves, messages,
+/// pokes) arrive as fast as it likes. A sound over the limit is skipped —
+/// four already playing say the same thing.
 fn play_audio_file(path: std::path::PathBuf) {
     #[cfg(not(target_os = "android"))]
     {
+        use std::sync::atomic::AtomicUsize;
+        const MAX_SOUNDS: usize = 4;
+        static PLAYING: AtomicUsize = AtomicUsize::new(0);
+        if PLAYING.fetch_add(1, Ordering::Relaxed) >= MAX_SOUNDS {
+            PLAYING.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+        /// Gives the slot back however the thread ends.
+        struct Slot;
+        impl Drop for Slot {
+            fn drop(&mut self) {
+                PLAYING.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let slot = Slot;
         std::thread::spawn(move || {
+            let _slot = slot;
             let Ok((_stream, handle)) = rodio::OutputStream::try_default() else {
                 tracing::warn!("Failed to open audio output for notification sound");
                 return;

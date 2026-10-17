@@ -13,6 +13,7 @@
   // keeps them too, so the same checks can run against either layout.
 
   import { channels, currentChannelId, previewChannelId } from "../stores/channels.js";
+  import { visibleChannels } from "../stores/roster.js";
   import { isAdmin, serverAddress } from "../stores/connection.js";
   import {
     activeTextChannelId,
@@ -41,16 +42,6 @@
   let currentChannelName = $derived(
     $channels.find((c) => c.channel_id === $currentChannelId)?.name ?? ""
   );
-
-  // A hidden channel is not listed, unless you are an admin or standing in it.
-  // Nor is the lobby, channel 0: it is where the server keeps everyone who is
-  // in no voice channel, which is not a place anybody goes. Its people are the
-  // member list's "Online" group.
-  let visibleChannels = $derived(
-    $channels.filter(
-      (c) => c.channel_id !== 0 && (!c.hidden || $isAdmin || c.channel_id === $currentChannelId),
-    ),
-  );
 </script>
 
 <div class="channel-list">
@@ -71,7 +62,7 @@
 
 
   <div class="channels">
-    {#each visibleChannels as channel (channel.channel_id)}
+    {#each $visibleChannels as channel (channel.channel_id)}
       {@const subscribed = channel.text && $joinedTextChannelIds.has(channel.channel_id)}
       {@const left = channel.text && !subscribed && $leftTextChannelNames.has(channel.name)}
       {@const unread = channelUnread($unreadPerChannel, $serverAddress, channel.name)}

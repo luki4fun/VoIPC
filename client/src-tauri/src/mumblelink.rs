@@ -119,7 +119,18 @@ mod source {
 
     impl Block {
         pub fn open() -> Option<Self> {
-            std::fs::File::open(path()).ok().map(Block)
+            use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+            // /dev/shm is writable by every local user: one could leave a FIFO
+            // under our name (an open or a read that never returns, on a
+            // runtime worker) or a block of their own making. Only a regular
+            // file that is ours is read.
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path())
+                .ok()?;
+            let meta = file.metadata().ok()?;
+            (meta.is_file() && meta.uid() == unsafe { libc::getuid() }).then_some(Block(file))
         }
 
         pub fn read(&mut self, buf: &mut [u8]) -> bool {

@@ -432,11 +432,16 @@ export class Session implements SessionContext {
     if (sessions.get(this.server) === this) sessions.delete(this.server);
     clearInterval(this.keepalive);
     if (voiceOwner === this) detachVoice();
-    if (sendDisconnect) {
+    if (sendDisconnect && this.transport) {
       // Whatever was still waiting for the pacer is moot now, and the goodbye
-      // is not: it goes out ahead of the queue rather than behind it.
+      // is not: it goes out ahead of the queue, and past the pacer too — over
+      // budget it was queued, and the queue is cleared just below.
       this.controlQueue.length = 0;
-      this.sendControl("Disconnect");
+      try {
+        this.transport.sendControl(wasm().encodeClientMsg("Disconnect"));
+      } catch (e) {
+        console.warn("could not send the goodbye:", e);
+      }
     }
     // After the goodbye, so a queue that was over budget cannot leave a timer
     // running against a transport that is about to close.

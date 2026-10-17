@@ -436,6 +436,8 @@
         }),
       );
       await invoke("start_mic_test", { monitor: $micMonitor });
+      // Closed while it was starting: onDestroy saw no test to stop
+      if (destroyed) return stopMicTest();
       micTestRunning = true;
     } catch (e) {
       addNotification(`Mic test failed: ${e}`, "error");
@@ -479,6 +481,10 @@
   async function startSpatialTest(mode: "2d" | "3d") {
     try {
       await invoke("start_spatial_test", { mode });
+      if (destroyed) {
+        invoke("stop_spatial_test").catch(() => {});
+        return;
+      }
       spatialTest = { mode, started: performance.now() };
       if (!spatialTestTimer) spatialTestTimer = setInterval(tickSpatialTest, 100);
       tickSpatialTest();
@@ -499,7 +505,10 @@
     if (!canSpatialTest && spatialTest) stopSpatialTest();
   });
 
+  /** A test still starting when the panel closes stops itself on arrival. */
+  let destroyed = false;
   onDestroy(() => {
+    destroyed = true;
     if (micTestRunning) stopMicTest();
     if (spatialTest) stopSpatialTest();
   });
