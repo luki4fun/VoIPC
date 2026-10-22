@@ -3,6 +3,7 @@
   import { pendingInvites, type PendingInvite } from "../stores/invites.js";
   import { serverAddress } from "../stores/connection.js";
   import { serverEntries } from "../connect.js";
+  import { askNsfwConsent } from "../stores/channel-ui.js";
   import { shortName } from "../username.js";
 
   function drop(invite: PendingInvite) {
@@ -12,11 +13,15 @@
   // Back to the server that sent it, whichever one is on screen now
   async function accept(invite: PendingInvite) {
     drop(invite);
-    try {
-      await invoke("accept_invite", { server: invite.server, channelId: invite.channel_id });
-    } catch (e) {
-      console.error("Failed to accept invite:", e);
-    }
+    const go = async () => {
+      try {
+        await invoke("accept_invite", { server: invite.server, channelId: invite.channel_id });
+      } catch (e) {
+        console.error("Failed to accept invite:", e);
+      }
+    };
+    // Into an 18+ channel only once the user has said they may be there
+    if (askNsfwConsent(invite.server, invite.channel_id, () => void go())) await go();
   }
 
   async function decline(invite: PendingInvite) {

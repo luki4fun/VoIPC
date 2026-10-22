@@ -14,8 +14,10 @@ const MAGIC: &[u8; 4] = b"VOIP";
 ///
 /// A new field is a new version for the same reason: postcard writes no names,
 /// so a v2 file read as v3 runs off the end of the first message and into the
-/// next one's bytes.
-const VERSION: u8 = 0x03;
+/// next one's bytes. v4 adds the sender's account to a message and the
+/// devices remembered by relays with accounts.
+const VERSION: u8 = 0x04;
+const VERSION_V3: u8 = 0x03;
 const VERSION_V2: u8 = 0x02;
 const VERSION_V1: u8 = 0x01;
 const SALT_LEN: usize = 32;
@@ -51,9 +53,30 @@ pub struct ChatMessage {
     /// already stored.
     #[serde(default)]
     pub expires_at: Option<u64>,
+    /// The sender's relay account (hex), for one who had one: with the
+    /// message id, what names a message across connects. `None` for a guest.
+    #[serde(default)]
+    pub account: Option<String>,
 }
 
-#[derive(Serialize, Deserialize, Default, Clone, Debug)]
+/// A device a relay with accounts remembers: its key stands in for the
+/// password and the second factor there, and the vault's DEK kept with it
+/// opens the account's vault without the password. Lives only inside this
+/// encrypted archive (and only in memory while the archive is switched off).
+#[derive(Serialize, Deserialize, Clone)]
+pub struct DeviceRecord {
+    /// The address it was remembered at (`host:port`, as the connection's id).
+    pub server: String,
+    pub relay_id: [u8; 16],
+    /// The account name, normalised.
+    pub name: String,
+    pub device_id: [u8; 16],
+    /// Ed25519, PKCS#8.
+    pub device_key: Vec<u8>,
+    pub dek: [u8; 32],
+}
+
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct ChatArchive {
     pub channels: HashMap<String, Vec<ChatMessage>>,
     pub dms: HashMap<String, Vec<ChatMessage>>,
@@ -62,6 +85,56 @@ pub struct ChatArchive {
     /// cleared; asking for a re-sync drops the entry.
     #[serde(default)]
     pub cleared: HashMap<String, u64>,
+    #[serde(default)]
+    pub devices: Vec<DeviceRecord>,
+    /// What this device keeps of each account's stored-message log (how far
+    /// it has read, who it has named as readers): `"<relay hex>|<account name>"`.
+    #[serde(default)]
+    pub cursors: HashMap<String, voipc_crypto::sync::LogMemory>,
+}
+
+impl std::fmt::Debug for ChatArchive {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatArchive")
+            .field("channels", &self.channels.len())
+            .field("dms", &self.dms.len())
+            .field("devices", &self.devices.len())
+            .finish_non_exhaustive()
+    }
+}
+
+/// A v3 message: everything but the sender's account.
+#[derive(Deserialize)]
+struct V3ChatMessage {
+    user_id: u32,
+    username: String,
+    content: String,
+    timestamp: u64,
+    kind: Option<String>,
+    id: Option<String>,
+    expires_at: Option<u64>,
+}
+
+#[derive(Deserialize, Default)]
+struct V3ChatArchive {
+    channels: HashMap<String, Vec<V3ChatMessage>>,
+    dms: HashMap<String, Vec<V3ChatMessage>>,
+    cleared: HashMap<String, u64>,
+}
+
+impl From<V3ChatMessage> for ChatMessage {
+    fn from(m: V3ChatMessage) -> Self {
+        Self {
+            user_id: m.user_id,
+            username: m.username,
+            content: m.content,
+            timestamp: m.timestamp,
+            kind: m.kind,
+            id: m.id,
+            expires_at: m.expires_at,
+            account: None,
+        }
+    }
 }
 
 /// A v2 message: everything but the destruction deadline.
@@ -95,6 +168,7 @@ impl From<V2ChatMessage> for ChatMessage {
             // under one. A timer a channel sets now applies to what arrives
             // after it, not to this.
             expires_at: None,
+            account: None,
         }
     }
 }
@@ -126,6 +200,7 @@ impl From<LegacyChatMessage> for ChatMessage {
             kind: None,
             id: None,
             expires_at: None,
+            account: None,
         }
     }
 }
@@ -234,7 +309,7 @@ pub fn decrypt_archive(
         anyhow::bail!("invalid file format");
     }
     let version = file_data[4];
-    if version != VERSION && version != VERSION_V2 && version != VERSION_V1 {
+    if ![VERSION, VERSION_V3, VERSION_V2, VERSION_V1].contains(&version) {
         anyhow::bail!("unsupported file version");
     }
 
@@ -273,13 +348,25 @@ pub fn decrypt_archive(
 
     // Deserialize. An older file is read through the shape it was written with
     // and written back as the current version on the next save.
-    let archive = if version == VERSION_V2 {
+    let archive = if version == VERSION_V3 {
+        let v3: V3ChatArchive = postcard::from_bytes(plaintext)
+            .map_err(|e| anyhow::anyhow!("deserialization failed: {e}"))?;
+        ChatArchive {
+            channels: convert(v3.channels),
+            dms: convert(v3.dms),
+            cleared: v3.cleared,
+            devices: Vec::new(),
+            cursors: HashMap::new(),
+        }
+    } else if version == VERSION_V2 {
         let v2: V2ChatArchive = postcard::from_bytes(plaintext)
             .map_err(|e| anyhow::anyhow!("deserialization failed: {e}"))?;
         ChatArchive {
             channels: convert(v2.channels),
             dms: convert(v2.dms),
             cleared: v2.cleared,
+            devices: Vec::new(),
+            cursors: HashMap::new(),
         }
     } else if version == VERSION_V1 {
         let legacy: LegacyChatArchive = postcard::from_bytes(plaintext).map_err(|_| {
@@ -292,6 +379,8 @@ pub fn decrypt_archive(
             channels: convert(legacy.channels),
             dms: convert(legacy.dms),
             cleared: HashMap::new(),
+            devices: Vec::new(),
+            cursors: HashMap::new(),
         }
     } else {
         postcard::from_bytes(plaintext)
@@ -305,7 +394,7 @@ pub fn decrypt_archive(
 pub fn has_valid_header(file_data: &[u8]) -> bool {
     file_data.len() >= HEADER_LEN
         && &file_data[0..4] == MAGIC
-        && (file_data[4] == VERSION || file_data[4] == VERSION_V2 || file_data[4] == VERSION_V1)
+        && [VERSION, VERSION_V3, VERSION_V2, VERSION_V1].contains(&file_data[4])
 }
 
 /// Generate a fresh random salt.
@@ -336,6 +425,7 @@ mod tests {
             kind: kind.map(str::to_string),
             id: None,
             expires_at: None,
+            account: None,
         }
     }
 
@@ -524,6 +614,86 @@ mod tests {
         assert_eq!(archive.cleared["host:9987/general"], 1_500_000_000_000);
     }
 
+    /// v3 → v4: a file from 0.11 opens, and what v4 adds starts empty.
+    #[test]
+    fn a_v3_archive_still_opens_with_no_devices() {
+        #[derive(Serialize)]
+        struct V3Message {
+            user_id: u32,
+            username: String,
+            content: String,
+            timestamp: u64,
+            kind: Option<String>,
+            id: Option<String>,
+            expires_at: Option<u64>,
+        }
+        #[derive(Serialize)]
+        struct V3Archive {
+            channels: HashMap<String, Vec<V3Message>>,
+            dms: HashMap<String, Vec<V3Message>>,
+            cleared: HashMap<String, u64>,
+        }
+        let mut dms = HashMap::new();
+        dms.insert(
+            "host:9987/bob".to_string(),
+            vec![V3Message {
+                user_id: 7,
+                username: "bob".into(),
+                content: "from 0.11".into(),
+                timestamp: 1_600_000_000_000,
+                kind: None,
+                id: Some("abc".into()),
+                expires_at: Some(u64::MAX),
+            }],
+        );
+        let plaintext = postcard::to_allocvec(&V3Archive { channels: HashMap::new(), dms, cleared: HashMap::new() }).unwrap();
+        let salt = generate_salt();
+        let key = derive_key("pw", &salt);
+        let mut aad = [0u8; 5];
+        aad[..4].copy_from_slice(MAGIC);
+        aad[4] = VERSION_V3;
+        let mut in_out = plaintext;
+        key.seal_in_place_append_tag(Nonce::assume_unique_for_key([0u8; NONCE_LEN]), Aad::from(&aad), &mut in_out).unwrap();
+        let mut file = Vec::new();
+        file.extend_from_slice(MAGIC);
+        file.push(VERSION_V3);
+        file.extend_from_slice(&salt);
+        file.extend_from_slice(&[0u8; NONCE_LEN]);
+        file.extend_from_slice(&(in_out.len() as u32).to_be_bytes());
+        file.extend_from_slice(&in_out);
+
+        let (archive, _, _) = decrypt_archive(&file, "pw").unwrap();
+        let m = &archive.dms["host:9987/bob"][0];
+        assert_eq!((m.content.as_str(), m.expires_at, m.account.as_deref()), ("from 0.11", Some(u64::MAX), None));
+        assert!(archive.devices.is_empty());
+    }
+
+    /// A remembered device survives the archive's round trip, and clearing
+    /// the chat does not take it.
+    #[test]
+    fn a_remembered_device_round_trips() {
+        let mut archive = ChatArchive::default();
+        archive.devices.push(DeviceRecord {
+            server: "voice.example:9987".into(),
+            relay_id: [1; 16],
+            name: "luki".into(),
+            device_id: [2; 16],
+            device_key: vec![3; 83],
+            dek: [4; 32],
+        });
+        let mut m = msg("hi", None);
+        m.account = Some("ab".repeat(16));
+        archive.channels.insert("k".into(), vec![m]);
+        let salt = generate_salt();
+        let key = derive_key("pw", &salt);
+        let file = encrypt_archive(&archive, &key, &salt).unwrap();
+        assert_eq!(file[4], VERSION);
+        let (back, _, _) = decrypt_archive(&file, "pw").unwrap();
+        assert_eq!(back.devices.len(), 1);
+        assert_eq!((back.devices[0].name.as_str(), back.devices[0].dek), ("luki", [4; 32]));
+        assert_eq!(back.channels["k"][0].account.as_deref(), Some("ab".repeat(16).as_str()));
+    }
+
     #[test]
     fn a_message_past_its_deadline_is_not_kept() {
         let now = now_ms();
@@ -535,6 +705,7 @@ mod tests {
             kind: None,
             id: None,
             expires_at,
+            account: None,
         };
         let mut map = HashMap::new();
         map.insert("a".to_string(), vec![msg(Some(now - 1)), msg(None)]);

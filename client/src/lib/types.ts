@@ -11,6 +11,9 @@ export interface UserInfo {
   is_screen_sharing: boolean;
   /** Logged in with the server's admin token. */
   is_admin: boolean;
+  /** Holds the moderator role (servers with accounts): kicks, bans, and every
+   *  channel's settings. */
+  is_moderator?: boolean;
   /**
    * This user answers a newcomer's request for recent channel chat.
    *
@@ -18,6 +21,9 @@ export interface UserInfo {
    * show who asking would reach — it has always seen the requests go past.
    */
   shares_history: boolean;
+  /** The relay account they signed in with (16 bytes); absent for a guest,
+   *  and never shown behind a pseudonym. */
+  account?: number[] | null;
 }
 
 /** An active IP ban (admin view). */
@@ -69,6 +75,17 @@ export interface ChannelInfo {
    * intent.
    */
   message_ttl_secs: number;
+  /** Only the channel's managers — its creator, admins, moderators — may post
+   *  here; the server refuses everybody else's messages. Text channels only. */
+  announce?: boolean;
+  /** A member may post once per this many seconds (0 = off); the channel's
+   *  managers are exempt. The server enforces it. */
+  slow_mode_secs?: number;
+  /** Marked 18+: the client asks for consent before joining or showing it. */
+  nsfw?: boolean;
+  /** Its stored-message log (`c:<uid>`), on relays that keep one for
+   *  accounts; empty or absent where there is none (protocol v11). */
+  log?: string;
 }
 
 export interface ConnectionInfo {
@@ -93,6 +110,12 @@ export interface ChatMessage {
    * before this release, and for the dividers we make ourselves.
    */
   id?: string;
+  /**
+   * The sender's relay account (hex), when they had one. With `id` it names a
+   * message across connects, where `user_id` is new every time: what lets a
+   * message from the stored log meet its live copy as one message.
+   */
+  account?: string;
   /**
    * Absent/"text" = a normal message we received first-hand.
    *
@@ -124,4 +147,25 @@ export interface ChatMessage {
    * only ever bring its deadline forward — see `expiryFor` in chat-rules.ts.
    */
   expires_at?: number;
+}
+
+/** A relay with accounts, as `Authenticated.accounts` describes it (protocol v11). */
+export interface RelayAccounts {
+  /** Guests are refused. */
+  required: boolean;
+  registration: "Open" | "Invite" | "Closed";
+  /** Members may keep an encrypted copy of their messages there. */
+  cloud: boolean;
+  relay_id: number[];
+}
+
+/** The account a connection signed in with. */
+export interface AccountInfo {
+  id: number[];
+  name: string;
+  /** What it may do now: "*", "voipc:moderate", … */
+  scopes: string[];
+  /** It holds a role whose rights wait for a second factor. */
+  needs_2fa: boolean;
+  totp_enabled: boolean;
 }

@@ -10,10 +10,14 @@ import { video } from "./video";
 import { share } from "./share";
 import { getConfig, resetConfig, updateConfig } from "./config";
 import * as session from "./session";
+import { forgetDevice, listDevices } from "./devices";
+import { wasm } from "./wasm";
+import type { AccountArgs } from "./account";
 import { playCue } from "./sounds";
 import type { SavedServer, SoundSettings } from "../../lib/stores/settings";
 import type { ProximityMode } from "../../lib/spatial";
 import { FX_NONE, effectFromId } from "./worklets/mixer-worklet.js";
+import { toHex } from "../../lib/hex";
 
 type Args = Record<string, unknown>;
 type Handler = (args: Args) => unknown;
@@ -27,6 +31,12 @@ function fail(msg: string): never {
 function need(server: unknown): session.Session {
   const id = str(server, "server");
   return session.sessionFor(id) ?? fail(`Not connected to ${id}`);
+}
+
+/** An account command's connection and its account (account.rs `signed_in`). */
+function needAccount(server: unknown): { s: session.Session; account: NonNullable<session.Session["account"]> } {
+  const s = session.sessionFor(str(server, "server")) ?? fail("Not connected to that server");
+  return { s, account: s.account ?? fail("Not signed in to an account on that server") };
 }
 
 /** A voice-scoped command's connection: the one whose voice channel we are in. */
@@ -106,6 +116,22 @@ function setToggleKey(field: "mute_key" | "deafen_key", keyCode: unknown): void 
 
 const WEB_NO_CHAT_HISTORY = "Chat history is not available in the web client";
 
+/** The `account` argument of `connect`: checked here, the trust boundary for a web build. */
+function accountArgs(raw: unknown): AccountArgs | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  const a = raw as Record<string, unknown>;
+  switch (a.kind) {
+    case "login":
+      return { kind: "login", password: str(a.password, "password") };
+    case "register":
+      return { kind: "register", password: str(a.password, "password"), invite: a.invite == null ? null : str(a.invite, "invite") };
+    case "device":
+      return { kind: "device" };
+    default:
+      fail("unknown account sign-in");
+  }
+}
+
 /**
  * A lane's effect id: any preset, plus "none". The preset table is the single
  * source of truth on both sides, so adding a chain does not mean remembering
@@ -120,13 +146,50 @@ function laneEffect(effect: unknown): string {
 
 const handlers: Record<string, Handler> = {
   // ── connection ──
-  connect: ({ address, username }) => {
+  connect: ({ address, username, account }) => {
     const addr = str(address, "address");
     const name = str(username, "username");
     if (addr.length === 0 || addr.length > 253) fail("address must be 1-253 characters");
     // 32 for the name and 5 for its "#0000" tag; the server checks each part
     if (name.length === 0 || byteLength(name) > 37) fail("username must be 1-32 characters");
-    return session.connect(addr, name);
+    return session.connect(addr, name, accountArgs(account));
+  },
+
+  // ── accounts (client/src-tauri/src/account.rs) ──
+  // Asked mid-sign-in, before the session is listed.
+  account_totp: ({ server, code, recovery }) => {
+    const s = session.sessionOrSigningIn(str(server, "server"));
+    if (!s?.account) fail("No sign-in is waiting for a code.");
+    s.account.answerTotp(str(code, "code"), recovery === true);
+  },
+  account_cancel: ({ server }) => {
+    session.sessionOrSigningIn(str(server, "server"))?.account?.cancel();
+  },
+  account_request: ({ server, request }) => needAccount(server).s.sendControl({ Account: request }),
+  account_devices: async () =>
+    (await listDevices()).map((d) => ({
+      server: d.server,
+      name: d.name,
+      relay_id: toHex(d.relay_id),
+    })),
+  forget_device: ({ server, name }) => forgetDevice(str(server, "server"), str(name, "name")),
+  account_prefs: ({ server }) => needAccount(server).account.prefs() ?? fail("Not signed in to an account on that server"),
+  send_kept_dm: ({ server, account, content, ttlSecs }) =>
+    need(server).sendKeptDm(str(account, "account"), str(content, "content"), ttlSecs == null ? undefined : u32(ttlSecs, "ttlSecs")),
+  account_enter: ({ server, conv }) => {
+    const { s, account } = needAccount(server);
+    account.enter(s, str(conv, "conv"));
+  },
+  account_set_prefs: ({ server, prefs }) => {
+    const { s, account } = needAccount(server);
+    const p = prefs as Record<string, unknown>;
+    account.setPrefs(s, bool(p?.cloud, "cloud"), bool(p?.asked, "asked"));
+  },
+  safety_number: ({ server, userId }) => need(server).safetyNumber(u32(userId, "userId")),
+  qr_svg: ({ text }) => {
+    const t = str(text, "text");
+    if (!t.startsWith("otpauth://") || t.length > 512) fail("not an authenticator link");
+    return wasm().qrSvg(t) ?? fail("could not draw the code");
   },
   disconnect: ({ server }) => session.disconnect(str(server, "server")),
   // A page load starts with no sessions anyway; this is here for the desktop
@@ -182,17 +245,25 @@ const handlers: Record<string, Handler> = {
       },
     }),
   // null leaves an option as it is, so the dialog only sends what changed
-  set_channel_options: ({ server, channelId, hidden, anonymous, screenShare, hideMembers, routed, messageTtlSecs }) => {
-    const flag = (v: unknown, name: string) => (v == null ? null : bool(v, name));
+  // `options`: voipc_protocol ChannelOptions, the names as on the wire.
+  set_channel_options: ({ server, channelId, options }) => {
+    const o = (options ?? {}) as Record<string, unknown>;
+    const flag = (name: string) => (o[name] == null ? null : bool(o[name], name));
+    const secs = (name: string) => (o[name] == null ? null : u32(o[name], name));
     need(server).sendControl({
       SetChannelOptions: {
         channel_id: u32(channelId, "channelId"),
-        hidden: flag(hidden, "hidden"),
-        anonymous: flag(anonymous, "anonymous"),
-        screen_share: flag(screenShare, "screenShare"),
-        hide_members: flag(hideMembers, "hideMembers"),
-        routed: flag(routed, "routed"),
-        message_ttl_secs: messageTtlSecs == null ? null : u32(messageTtlSecs, "messageTtlSecs"),
+        options: {
+          hidden: flag("hidden"),
+          anonymous: flag("anonymous"),
+          screen_share: flag("screen_share"),
+          hide_members: flag("hide_members"),
+          routed: flag("routed"),
+          message_ttl_secs: secs("message_ttl_secs"),
+          announce: flag("announce"),
+          slow_mode_secs: secs("slow_mode_secs"),
+          nsfw: flag("nsfw"),
+        },
       },
     });
   },
@@ -243,7 +314,11 @@ const handlers: Record<string, Handler> = {
     // To every server, and none is not a failure: the flag goes out again on
     // the next connect, from the config the settings toggle has already written.
     const on = bool(enabled, "enabled");
-    for (const s of session.allSessions()) s.sendControl({ SetHistorySharing: { enabled: on } });
+    for (const s of session.allSessions()) {
+      s.sendControl({ SetHistorySharing: { enabled: on } });
+      // The same consent hands our older keys to who joins a channel's log.
+      s.account?.setShare(on);
+    }
   },
 
   // ── moderation (admin token session) ──
@@ -550,13 +625,14 @@ const handlers: Record<string, Handler> = {
       if (!keep) c.auto_connect = false;
     });
   },
-  save_server: ({ name, host, port, username, acceptSelfSigned }) => {
+  save_server: ({ name, host, port, username, acceptSelfSigned, account }) => {
     const entry: SavedServer = {
       name: str(name, "name"),
       host: str(host, "host"),
       port: u32(port, "port"),
       username: str(username, "username"),
       accept_self_signed: bool(acceptSelfSigned, "acceptSelfSigned"),
+      account: account === true,
     };
     updateConfig((c) => {
       const i = c.saved_servers.findIndex((s) => s.host === entry.host && s.port === entry.port);
@@ -586,6 +662,7 @@ const handlers: Record<string, Handler> = {
         port: u32(s.port, "port"),
         username: str(s.username, "username"),
         accept_self_signed: bool(s.accept_self_signed, "accept_self_signed"),
+        account: s.account === true,
       };
     });
     updateConfig((c) => {

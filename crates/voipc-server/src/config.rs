@@ -60,8 +60,75 @@ pub struct ServerConfig {
 
     /// Token that turns a session into a server admin (`AdminLogin`).
     /// Unset: a random token is generated at startup and written to the log.
+    /// With accounts on, it only claims the first admin account (see
+    /// `accounts.rs`).
     #[serde(default)]
     pub admin_token: Option<String>,
+
+    /// Opt-in accounts (`[accounts]`). Off by default: no database is made.
+    #[serde(default)]
+    pub accounts: AccountsConfig,
+}
+
+/// Whether guests may stay when the relay has accounts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum AccountsMode {
+    /// No accounts, no database: the relay as it always was.
+    #[default]
+    Off,
+    /// Accounts for whoever wants one; guests (with a #tag) still welcome.
+    Optional,
+    /// Everybody signs in.
+    Required,
+}
+
+/// Who may make an account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum RegistrationMode {
+    /// Anyone, behind a proof of work their client solves.
+    Open,
+    /// With an admin's invite code.
+    #[default]
+    Invite,
+    /// Only with a code an admin made for that one name.
+    Closed,
+}
+
+/// `[accounts]`. Unknown keys are refused, so a typo fails the start instead
+/// of quietly keeping a default.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct AccountsConfig {
+    pub mode: AccountsMode,
+    /// `sqlite://voipc.db` (a file next to the server) or `postgres://…`.
+    pub database: String,
+    pub registration: RegistrationMode,
+    /// Members may keep an encrypted copy of their messages on the relay.
+    pub cloud: bool,
+    /// How long a stored message stays at most.
+    pub retention_days: u32,
+    /// Per account: the vault and stored messages together.
+    pub quota_mb: u32,
+    /// The master key (seals second-factor secrets). Made on first start,
+    /// readable by the server's user only; `VOIPC_ACCOUNTS_KEY` wins over it.
+    /// Back it up: without it nobody's two-factor codes work.
+    pub key_file: String,
+}
+
+impl Default for AccountsConfig {
+    fn default() -> Self {
+        Self {
+            mode: AccountsMode::Off,
+            database: "sqlite://voipc.db".into(),
+            registration: RegistrationMode::Invite,
+            cloud: true,
+            retention_days: 365,
+            quota_mb: 50,
+            key_file: "voipc-accounts.key".into(),
+        }
+    }
 }
 
 impl ServerConfig {
@@ -111,6 +178,7 @@ impl Default for ServerConfig {
             cert_path: "certs/server.crt".into(),
             key_path: "certs/server.key".into(),
             admin_token: None,
+            accounts: AccountsConfig::default(),
         }
     }
 }
@@ -150,6 +218,22 @@ mod tests {
         let config: ServerConfig =
             toml::from_str("tcp_fallback = true\ncert_path = \"c\"\nkey_path = \"k\"").unwrap();
         assert!(config.tcp_fallback);
+    }
+
+    #[test]
+    fn accounts_are_off_by_default_and_refuse_typos() {
+        let config = ServerConfig::default();
+        assert_eq!(config.accounts.mode, AccountsMode::Off, "no database unless asked for");
+        let config: ServerConfig = toml::from_str(
+            "cert_path = \"c\"\nkey_path = \"k\"\n[accounts]\nmode = \"optional\"\nregistration = \"open\"\ndatabase = \"postgres://x/y\"",
+        )
+        .unwrap();
+        assert_eq!(config.accounts.mode, AccountsMode::Optional);
+        assert_eq!(config.accounts.registration, RegistrationMode::Open);
+        assert_eq!(config.accounts.database, "postgres://x/y");
+        assert!(config.accounts.cloud, "the rest keep their defaults");
+        let typo = toml::from_str::<ServerConfig>("cert_path = \"c\"\nkey_path = \"k\"\n[accounts]\nmod = \"optional\"");
+        assert!(typo.is_err(), "an unknown key fails the start");
     }
 
     #[test]

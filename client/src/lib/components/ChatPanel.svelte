@@ -18,7 +18,12 @@
   import { uiPrefs } from "../stores/ui-prefs.js";
   import { serverAddress, serverKey, userId } from "../stores/connection.js";
   import { addNotification } from "../stores/notifications.js";
+  import { get } from "svelte/store";
+  import { account, accountHex } from "../stores/account.js";
+  import { expiryFor } from "../chat-rules.js";
   import {
+    addDmMessage,
+    dmConversations,
     activeDmUserId,
     activeDmUsername,
     closeDm,
@@ -32,11 +37,17 @@
     channelMessageTtl,
     dmMessageTtl,
     endPreview,
+    giveNsfwConsent,
     joinChannel,
     joinTextChannel,
+    lastPostAt,
     leftTextChannelNames,
+    me,
+    notePost,
+    nsfwConsented,
     setDmMessageTtl,
   } from "../stores/channel-ui.js";
+  import { canManage, needsNsfwConsent, postBlock, slowModeLabel } from "../channel-post-rules.js";
   import { displayChannelId, isPreviewing, shownMessages } from "../stores/roster.js";
   import { channelRosters } from "../stores/rosters.js";
   import Icon from "./Icons.svelte";
@@ -141,6 +152,30 @@
       !isDmMode &&
       (!effectiveChannel?.text || $joinedTextChannelIds.has($displayChannelId))
   );
+
+  // An announcement channel, or slow mode still counting down: the server
+  // would refuse the post, and the pane shows a sent message before it hears
+  // back — so the composer asks first (channel-post-rules.ts).
+  let isManager = $derived(effectiveChannel ? canManage(effectiveChannel, $me) : false);
+  let slowModeSecs = $derived(effectiveChannel?.slow_mode_secs ?? 0);
+  /** Ticks once a second while a slow-mode countdown is on screen. */
+  let now = $state(Date.now());
+  /** Bumped on every send, so the countdown starts without waiting for a tick. */
+  let sentCount = $state(0);
+  let block = $derived.by(() => {
+    void sentCount;
+    if (isDmMode || !effectiveChannel) return null;
+    return postBlock(effectiveChannel, isManager, lastPostAt($serverAddress, $displayChannelId), now);
+  });
+  $effect(() => {
+    if (slowModeSecs === 0 || isManager || isDmMode) return;
+    const timer = setInterval(() => (now = Date.now()), 1000);
+    return () => clearInterval(timer);
+  });
+
+  // A channel marked 18+ that this server has no consent for: its messages
+  // stay hidden behind the question until the user answers it.
+  let nsfwGated = $derived(!isDmMode && needsNsfwConsent(effectiveChannel, $nsfwConsented));
 
   // This server's channels: another server's unread is on its icon in the rail
   let totalUnreadChannels = $derived.by(() => {
@@ -286,6 +321,8 @@
   async function sendMessage() {
     const content = messageInput.trim();
     if (!content) return;
+    // Kept in the input rather than sent to be refused
+    if (!isDmMode && block) return;
     const server = $serverAddress;
 
     messageInput = "";
@@ -296,18 +333,39 @@
       // channel's own, or for a direct message the one this user set for that
       // person. Zero is no timer, which the backend reads as none.
       if (isDmMode) {
-        await invoke("send_direct_message", {
-          server,
-          targetUserId: $activeDmUserId,
-          content,
-          ttlSecs: dmMessageTtl(server, $activeDmUsername) || null,
-        });
+        const ttlSecs = dmMessageTtl(server, $activeDmUsername) || null;
+        const away = ($activeDmUserId ?? 0) < 0 ? $dmConversations.find((c) => c.user_id === $activeDmUserId) : undefined;
+        if (away?.account) {
+          // They are away: the server's copy is the one way it reaches them,
+          // and this is our own copy of it.
+          const id = await invoke<string>("send_kept_dm", { server, account: away.account, content, ttlSecs });
+          const own = get(account.of(server));
+          const myId = get(userId.of(server));
+          const now = Date.now();
+          addDmMessage(server, myId, myId, own?.name ?? "", away.user_id, {
+            user_id: myId,
+            username: own?.name ?? "",
+            content,
+            timestamp: now,
+            id,
+            account: own ? accountHex(own.info.id) : undefined,
+            expires_at: expiryFor(now, ttlSecs, ttlSecs),
+          });
+        } else {
+          await invoke("send_direct_message", { server, targetUserId: $activeDmUserId, content, ttlSecs });
+        }
       } else {
+        const channelId = $displayChannelId;
+        if (slowModeSecs > 0) {
+          notePost(server, channelId);
+          now = Date.now();
+          sentCount++;
+        }
         await invoke("send_channel_message", {
           server,
           content,
-          channelId: $displayChannelId,
-          ttlSecs: channelMessageTtl(server, $displayChannelId) || null,
+          channelId,
+          ttlSecs: channelMessageTtl(server, channelId) || null,
         });
       }
     } catch (e) {
@@ -401,6 +459,22 @@
         <Icon name="clock" size={13} /> {ttlLabel(activeTtl)}
       </span>
     {/if}
+    {#if !isDmMode && !isLobby && effectiveChannel?.text && effectiveChannel?.announce}
+      <span class="ttl-label" title="Only the channel's moderators post here">
+        <Icon name="megaphone" size={13} /> Announcements
+      </span>
+    {/if}
+    {#if !isDmMode && !isLobby && slowModeSecs > 0}
+      <span
+        class="ttl-label"
+        title="Slow mode: each member may post once every {slowModeLabel(slowModeSecs)}; moderators are exempt"
+      >
+        <Icon name="hourglass" size={13} /> {slowModeLabel(slowModeSecs)}
+      </span>
+    {/if}
+    {#if !isDmMode && !isLobby && effectiveChannel?.nsfw}
+      <span class="ttl-label nsfw-label" title="This channel is marked 18+">18+</span>
+    {/if}
     {#if isDmMode}
       <button
         class="clear-chat-btn"
@@ -434,6 +508,14 @@
   <div class="messages" bind:this={messagesContainer}>
     {#if !isDmMode && isLobby}
       <div class="empty-state">Open a text channel to chat</div>
+    {:else if nsfwGated}
+      <div class="empty-state nsfw-gate">
+        <p>#{channelName} is marked <strong>18+</strong>.</p>
+        <p>Only open it if you are 18 or older. You will not be asked again on this server.</p>
+        <button class="join-text-btn" onclick={() => giveNsfwConsent($serverAddress)}>
+          I am 18 or older — show it
+        </button>
+      </div>
     {:else if !isDmMode && $isPreviewing && isPasswordProtected && !effectiveChannel?.text}
       <div class="empty-state">This channel is password protected. Join to view messages.</div>
     {:else if displayMessages.length === 0}
@@ -498,6 +580,10 @@
       {@render emojiPicker()}
       <button class="send-btn" type="submit" disabled={!messageInput.trim()}>Send</button>
     </form>
+  {:else if canSendChannelMessage && block?.kind === "announce"}
+    <div class="preview-footer post-block">
+      <Icon name="megaphone" size={14} /> Only moderators can post in #{channelName}
+    </div>
   {:else if canSendChannelMessage}
     <form class="input-bar" onsubmit={(e) => { e.preventDefault(); sendMessage(); }}>
       <input
@@ -510,7 +596,16 @@
         maxlength="2000"
       />
       {@render emojiPicker()}
-      <button class="send-btn" type="submit" disabled={!messageInput.trim()}>Send</button>
+      {#if block?.kind === "slow"}
+        <button
+          class="send-btn"
+          type="submit"
+          disabled
+          title="Slow mode: one message every {slowModeLabel(slowModeSecs)}"
+        >{slowModeLabel(block.remainingSecs)}</button>
+      {:else}
+        <button class="send-btn" type="submit" disabled={!messageInput.trim()}>Send</button>
+      {/if}
     </form>
   {:else if effectiveChannel?.text}
     <div class="preview-footer">
@@ -945,6 +1040,23 @@
     text-align: center;
     border-top: 1px solid var(--border);
     font-style: italic;
+  }
+
+  .preview-footer.post-block {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+
+  .nsfw-label {
+    color: var(--danger);
+    font-weight: 600;
+  }
+
+  .nsfw-gate p {
+    margin: 0 0 10px;
+    font-style: normal;
   }
 
   .join-text-btn,

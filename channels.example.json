@@ -16,10 +16,18 @@
     "auto_join": true
   },
   {
-    "name": "offtopic",
-    "description": "Text channel you join yourself; messages here are deleted after an hour",
+    "name": "news",
+    "description": "Announcements: only admins and moderators post here",
     "text": true,
-    "message_ttl_secs": 3600
+    "auto_join": true,
+    "announce": true
+  },
+  {
+    "name": "offtopic",
+    "description": "Text channel you join yourself; one post every 10 s, and messages are deleted after an hour",
+    "text": true,
+    "message_ttl_secs": 3600,
+    "slow_mode_secs": 10
   },
   {
     "name": "Round Table",

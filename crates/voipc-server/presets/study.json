@@ -1,0 +1,58 @@
+{
+  "id": "study",
+  "label": "Study group or co-working",
+  "summary": "A silent room to work in company, a proximity library, small group rooms and one-to-one tutoring.",
+  "channels": [
+    {
+      "name": "general",
+      "description": "Where everybody lands",
+      "text": true,
+      "auto_join": true
+    },
+    {
+      "name": "daily-goals",
+      "description": "What you want to get done today; posts go after a day",
+      "text": true,
+      "auto_join": true,
+      "message_ttl_secs": 86400
+    },
+    {
+      "name": "homework-help",
+      "description": "Stuck on something? Ask here",
+      "text": true
+    },
+    {
+      "name": "resources",
+      "description": "Notes, links and material worth keeping",
+      "text": true
+    },
+    {
+      "name": "Silent Study",
+      "description": "Working in company: microphones off, everybody gets on with it"
+    },
+    {
+      "name": "Library",
+      "description": "Proximity: whisper to whoever sits near you without disturbing the room",
+      "proximity": "2d"
+    },
+    {
+      "name": "Group Study 1",
+      "description": "Studying together in a small group",
+      "max_users": 6
+    },
+    {
+      "name": "Group Study 2",
+      "description": "Studying together in a small group",
+      "max_users": 6
+    },
+    {
+      "name": "Tutoring",
+      "description": "One-to-one help",
+      "max_users": 2
+    },
+    {
+      "name": "Break Room",
+      "description": "Take a break and chat"
+    }
+  ]
+}

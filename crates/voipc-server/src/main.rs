@@ -12,9 +12,12 @@ use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
+mod accounts;
 mod channels;
 mod config;
+mod fsutil;
 mod media;
+mod presets;
 mod routing;
 mod settings;
 mod state;
@@ -68,6 +71,62 @@ struct Args {
     /// Turn on the TCP fallback for clients that cannot reach UDP (tcp_fallback)
     #[arg(long)]
     tcp_fallback: bool,
+
+    /// Accounts: off, optional or required (overrides `[accounts] mode`)
+    #[arg(long, value_enum)]
+    accounts: Option<config::AccountsMode>,
+
+    /// Accounts database, sqlite://… or postgres://… (overrides `[accounts] database`)
+    #[arg(long)]
+    database: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Jobs instead of serving.
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Channel presets: list them, or write channels.json from one.
+    #[command(subcommand)]
+    Channels(presets::ChannelsCommand),
+    /// Account administration from the server's own shell.
+    #[command(subcommand)]
+    Admin(AdminCommand),
+    /// The accounts database.
+    #[command(subcommand)]
+    Db(DbCommand),
+}
+
+#[derive(clap::Subcommand)]
+enum AdminCommand {
+    /// Give an account a role (admin or moderator). It still needs
+    /// two-factor codes before the role's rights apply.
+    Grant { name: String, role: String },
+    /// Take a role away again; the account is signed out everywhere. The last
+    /// admin keeps the role.
+    Revoke { name: String, role: String },
+    /// Remove an account's two-factor and recovery codes, forget its devices
+    /// and sign it out everywhere — the way back in for an admin who lost
+    /// their phone.
+    #[command(name = "reset-2fa")]
+    Reset2fa { name: String },
+    /// Print a single-use sign-up code (registration = "invite" or "closed").
+    Invite {
+        /// Only this account name can use it.
+        #[arg(long = "for")]
+        name: Option<String>,
+        /// Days it stays valid (1 to 30).
+        #[arg(long, default_value_t = 7)]
+        days: i64,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum DbCommand {
+    /// Copy a SQLite accounts database while the server runs (VACUUM INTO).
+    /// For Postgres use pg_dump. Keep the key file with the copy.
+    Backup { path: String },
 }
 
 /// One IP's connect budget, and when we last saw it. The timestamp is only
@@ -239,6 +298,75 @@ fn limit_key(ip: IpAddr) -> IpAddr {
     }
 }
 
+async fn run_command(config: &ServerConfig, command: Command) -> Result<()> {
+    if config.accounts.mode == config::AccountsMode::Off {
+        anyhow::bail!("accounts are off: set [accounts] mode, or pass --accounts optional");
+    }
+    let relay = accounts::Relay::open(&config.accounts).await.context("opening the accounts database")?;
+    let store = relay.store();
+    // The server's own shell: no signed-in admin acts, the audit rows say so.
+    let ctx = relay.ctx(std::net::IpAddr::from([127, 0, 0, 1]), voipc_protocol::codec::APP_VERSION);
+    let l4f = |e: l4f_accounts::service::Error| anyhow::anyhow!(e.message());
+    let user_named = |name: String| async move {
+        let name = name.trim().to_ascii_lowercase();
+        store.user_by_username(&name).await?.with_context(|| format!("no account named {name:?}"))
+    };
+    match command {
+        Command::Admin(AdminCommand::Grant { name, role }) => {
+            let user = user_named(name).await?;
+            if relay.accounts.grant_role_as_host(&ctx, user.id, &role).await.map_err(l4f)? {
+                println!("{} now holds {role}; its rights apply once the account has two-factor codes.", user.username);
+            } else {
+                println!("{} already holds {role}.", user.username);
+            }
+        }
+        Command::Admin(AdminCommand::Revoke { name, role }) => {
+            let user = user_named(name).await?;
+            if relay.accounts.revoke_role_as_host(&ctx, user.id, &role).await.map_err(l4f)? {
+                println!("{} no longer holds {role} and is signed out everywhere (a running server ends its connection within {} minutes).", user.username, accounts::REVALIDATE_MINUTES);
+            } else {
+                println!("{} does not hold {role}.", user.username);
+            }
+        }
+        Command::Admin(AdminCommand::Reset2fa { name }) => {
+            let user = user_named(name).await?;
+            if relay.accounts.reset_2fa_as_host(&ctx, user.id).await.map_err(l4f)? {
+                println!(
+                    "{}: second factors and recovery codes removed, devices forgotten, signed out everywhere (a running server ends its connection within {} minutes).",
+                    user.username,
+                    accounts::REVALIDATE_MINUTES
+                );
+            } else {
+                println!("{} has no second factor, remembered device or session; nothing changed.", user.username);
+            }
+        }
+        Command::Admin(AdminCommand::Invite { name, days }) => {
+            // Closed: only an admin makes accounts, each for a name it picked.
+            if config.accounts.registration == config::RegistrationMode::Closed && name.as_deref().is_none_or(|n| n.trim().is_empty()) {
+                anyhow::bail!("registration is \"closed\": name the account the code is for with --for <name>");
+            }
+            let code = relay.accounts.invite_create_as_host(&ctx, name.as_deref(), days).await.map_err(l4f)?;
+            // The code alone on stdout, for scripts; the rest is for whoever reads it.
+            println!("{code}");
+            let bound = name.map(|n| format!(", only for the name {n:?}")).unwrap_or_default();
+            eprintln!("One sign-up, valid {} days{bound}: Create account, then this as the invite code.", days.clamp(1, 30));
+        }
+        Command::Channels(_) => unreachable!("handled before the database is opened"),
+        Command::Db(DbCommand::Backup { path }) => match store {
+            l4f_accounts::store::Store::Lite(b) => {
+                sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{}'", path.replace('\'', "''"))))
+                    .execute(&b.0)
+                    .await
+                    .with_context(|| format!("backing up to {path}"))?;
+                fsutil::owner_only(std::path::Path::new(&path)).with_context(|| format!("making {path} readable by this user only"))?;
+                println!("copied to {path}; keep {} with it", config.accounts.key_file);
+            }
+            l4f_accounts::store::Store::Pg(_) => anyhow::bail!("this is Postgres: back it up with pg_dump"),
+        },
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     // Install the ring crypto provider for rustls
@@ -255,6 +383,12 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // Files only, and none of them server.toml: a broken config must not stop
+    // the tool that writes channels.json.
+    if let Some(Command::Channels(command)) = args.command {
+        return presets::run(command, args.channels.as_deref(), args.settings.as_deref());
+    }
 
     // Load config
     let mut config = if let Some(config_path) = &args.config {
@@ -283,6 +417,15 @@ async fn main() -> Result<()> {
     }
     if args.tcp_fallback {
         config.tcp_fallback = true;
+    }
+    if let Some(mode) = args.accounts {
+        config.accounts.mode = mode;
+    }
+    if let Some(url) = args.database {
+        config.accounts.database = url;
+    }
+    if let Some(command) = args.command {
+        return run_command(&config, command).await;
     }
     // The v6 wildcard is dual-stack (IPV6_V6ONLY off for the TCP listener,
     // Ipv6DualStackConfig::Allow for QUIC), so one bind serves both families.
@@ -353,22 +496,74 @@ async fn main() -> Result<()> {
 
     // Admin token: configured, or generated for this run and shown once
     // (like a TeamSpeak privilege key). Nothing is persisted.
-    let admin_token = match config.admin_token.clone().filter(|t| !t.is_empty()) {
-        Some(token) => token,
-        None => {
-            let token = hex::encode(rand::random::<[u8; 32]>());
-            info!("no admin_token configured — admin token for this run: {token}");
-            token
-        }
+    let configured_token = config.admin_token.clone().filter(|t| !t.is_empty());
+    let generated_token = configured_token.is_none();
+    let admin_token = configured_token.unwrap_or_else(|| hex::encode(rand::random::<[u8; 32]>()));
+
+    // Opt-in accounts: the database is only ever opened (or made) when asked for.
+    let relay = if config.accounts.mode == config::AccountsMode::Off {
+        None
+    } else {
+        let relay = Arc::new(accounts::Relay::open(&config.accounts).await.context("opening the accounts database")?);
+        info!(
+            mode = ?config.accounts.mode,
+            registration = ?config.accounts.registration,
+            cloud = config.accounts.cloud,
+            relay_id = %hex::encode(relay.relay_id),
+            "accounts on"
+        );
+        // Expired sessions, invites, old audit rows and unused device keys.
+        let sweeper = relay.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                every.tick().await;
+                if let Err(e) = sweeper.accounts.sweep(l4f_accounts::util::now()).await {
+                    warn!("accounts sweep: {e}");
+                }
+                match accounts::log::sweep(&sweeper).await {
+                    Ok(n) if n > 0 => info!(dropped = n, "stored messages past their time"),
+                    Ok(_) => {}
+                    Err(e) => warn!("stored-message sweep: {e}"),
+                }
+            }
+        });
+        Some(relay)
     };
 
+    // The token is shown only where it can still do something: with accounts
+    // it makes the first admin, for good, so a log reader must not get one
+    // once an admin exists — and the shell can grant the role instead.
+    if generated_token {
+        match &relay {
+            None => info!("no admin_token configured — admin token for this run: {admin_token}"),
+            Some(r) if r.store().holders_of_scope_star().await.context("counting admins")? > 0 => {
+                info!("this server has an admin account: the admin token is not used here (voipc-server admin grant gives roles)")
+            }
+            Some(_) => info!(
+                "no admin account yet — admin token for this run, which makes the account that enters it the first admin: {admin_token} \
+                 (or: voipc-server admin grant <name> admin)"
+            ),
+        }
+    }
+
     // Create shared state
-    let state = Arc::new(ServerState::new(
-        &config,
-        server_settings,
-        persistent_channels,
-        admin_token,
-    ));
+    let mut state = ServerState::new(&config, server_settings, persistent_channels, admin_token);
+    state.accounts = relay;
+    let state = Arc::new(state);
+    if state.accounts.is_some() {
+        accounts::locked_logs_at_boot(&state).await.context("checking the channel logs' passwords")?;
+        // What the server's shell changes reaches connections already open.
+        let watched = state.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(60 * accounts::REVALIDATE_MINUTES));
+            every.tick().await;
+            loop {
+                every.tick().await;
+                accounts::revalidate(&watched).await;
+            }
+        });
+    }
 
     // Bind TCP listener
     let tcp_addr = config.bind_addr(config.tcp_port)?;

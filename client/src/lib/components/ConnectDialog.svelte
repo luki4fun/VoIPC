@@ -17,7 +17,7 @@
   import { isWeb } from "../stores/platform.js";
   import { pendingInvite, serverAddress } from "../stores/connection.js";
   import { parseInviteLink } from "../invite.js";
-  import { connectTo, serverId, showConnectDialog } from "../connect.js";
+  import { connectTo, serverId, showConnectDialog, signInAgain, type AccountSignIn } from "../connect.js";
   import { randomTag, splitName, withTag } from "../username.js";
 
   // Invite link pasted here: takes host/port from it and joins the channel
@@ -51,6 +51,55 @@
   let selfSigned = $state($lastAcceptSelfSigned);
   let remember = $state($rememberConnection);
 
+  // ── Accounts ──
+  /** Come as a guest (name#tag), or sign in to an account on the server. */
+  let mode = $state<"guest" | "account">("guest");
+  let accountAction = $state<"signin" | "create">("signin");
+  let password = $state("");
+  let password2 = $state("");
+  let signupInvite = $state("");
+  /** This device is remembered for that account there: no password needed. */
+  let remembered = $state(false);
+
+  // A reconnect that needs the password again opens the dialog on that account.
+  $effect(() => {
+    const again = $signInAgain;
+    if (!again) return;
+    host = again.host;
+    port = again.port;
+    name = again.name;
+    mode = "account";
+    accountAction = "signin";
+    signInAgain.set(null);
+  });
+
+  $effect(() => {
+    const [h, p, n, m] = [host, port, name, mode];
+    if (m !== "account" || !h || !n) {
+      remembered = false;
+      return;
+    }
+    const server = serverId(h, p);
+    const want = n.trim().toLowerCase();
+    invoke<{ server: string; name: string }[]>("account_devices")
+      .then((list) => (remembered = list.some((d) => d.server === server && d.name === want)))
+      .catch(() => (remembered = false));
+  });
+
+  /** What the connect signs in with, or a reason it cannot yet. */
+  function accountRequest(): AccountSignIn | string {
+    // One spelling of the password on every device: the keys come from its bytes.
+    const pw = password.normalize("NFC");
+    if (accountAction === "create") {
+      if (pw.length < 10) return "Use a password of at least 10 characters.";
+      if (pw !== password2.normalize("NFC")) return "The passwords do not match.";
+      return { mode: "register", password: pw, invite: signupInvite.trim() || null };
+    }
+    if (!pw && remembered) return { mode: "device" };
+    if (!pw) return "Enter your password.";
+    return { mode: "login", password: pw };
+  }
+
   /** Anything typed, pasted or picked here. From then on the fields are the
    *  user's: a connect finishing elsewhere (a bookmark clicked in the rail)
    *  rewrites the last-used details, and must not rewrite the form under them. */
@@ -71,6 +120,15 @@
 
   async function connectWith(h: string, p: number, u: string, selfSignedOk: boolean) {
     error = "";
+    let account: AccountSignIn | undefined;
+    if (mode === "account") {
+      const req = accountRequest();
+      if (typeof req === "string") {
+        error = req;
+        return;
+      }
+      account = req;
+    }
     connecting = true;
     // An invite from this dialog is for the server it connects to — which is
     // not the one on screen when this is a second server being added.
@@ -81,10 +139,16 @@
       username: u,
       acceptSelfSigned: selfSignedOk,
       remember,
+      account,
     });
     connecting = false;
-    if (!result.ok) error = result.error;
-    else showConnectDialog.set(false);
+    password = "";
+    password2 = "";
+    if (!result.ok) {
+      error = result.error;
+      // A server that takes no guests: the form turns to signing in.
+      if (error.includes("needs an account")) mode = "account";
+    } else showConnectDialog.set(false);
   }
 
   /** Name and tag as sent. A tag that is not four digits is replaced, here
@@ -96,7 +160,7 @@
   }
 
   async function handleConnect() {
-    await connectWith(host, port, fullName(), selfSigned);
+    await connectWith(host, port, mode === "account" ? name.trim() : fullName(), selfSigned);
   }
 
   async function connectToSaved(s: SavedServer) {
@@ -106,7 +170,17 @@
     name = parts.name;
     tag = parts.tag || tag;
     selfSigned = s.accept_self_signed;
+    mode = s.account ? "account" : "guest";
+    accountAction = "signin";
     touched = true;
+    // An account bookmark connects at once only where this device is
+    // remembered; otherwise the form waits for the password.
+    if (s.account) {
+      const server = serverId(s.host, s.port);
+      const list = await invoke<{ server: string; name: string }[]>("account_devices").catch(() => []);
+      if (!list.some((d) => d.server === server && d.name === parts.name.toLowerCase())) return;
+      remembered = true;
+    }
     await handleConnect();
   }
 
@@ -120,8 +194,9 @@
         name: host,
         host,
         port,
-        username: fullName(),
+        username: mode === "account" ? name.trim() : fullName(),
         acceptSelfSigned: selfSigned,
+        account: mode === "account",
       });
       savedServers.set(list);
       error = "";
@@ -132,6 +207,23 @@
 
   // Offered when the TOFU pin rejected the server's certificate
   let pinRejected = $derived(error.includes("fingerprint changed"));
+
+  // Offered when a server named a relay id this app knows from another
+  // address, or a different one than before (account.rs `relay_ok`)
+  let relayClash = $derived(
+    error.includes("forget its account id")
+      ? (error.match(/says it is (\S+), another server/)?.[1] ?? serverId(host, port))
+      : null,
+  );
+
+  async function forgetRelayId(server: string) {
+    try {
+      await invoke("forget_relay_id", { server });
+      error = "";
+    } catch (e) {
+      error = String(e);
+    }
+  }
 
   async function forgetPin() {
     try {
@@ -239,37 +331,96 @@
       </div>
     {/if}
 
-    <div class="address-row">
-      <div class="field host-field">
-        <label for="username">Username</label>
+    <div class="mode-switch" role="tablist" aria-label="How to join">
+      <button type="button" role="tab" class:active={mode === "guest"} aria-selected={mode === "guest"} onclick={() => (mode = "guest")} disabled={connecting}>Guest</button>
+      <button type="button" role="tab" class:active={mode === "account"} aria-selected={mode === "account"} onclick={() => (mode = "account")} disabled={connecting}>Account</button>
+    </div>
+
+    {#if mode === "guest"}
+      <div class="address-row">
+        <div class="field host-field">
+          <label for="username">Username</label>
+          <input
+            id="username"
+            type="text"
+            bind:value={name}
+            placeholder="Your name"
+            disabled={connecting}
+            maxlength={32}
+            onkeydown={(e) => e.key === "Enter" && handleConnect()}
+          />
+        </div>
+        <div class="field tag-field">
+          <label for="tag" title="Tells you apart from anybody else of the same name. If it is taken on a server, you get a random one there.">Tag</label>
+          <div class="tag-input">
+            <span>#</span>
+            <input
+              id="tag"
+              type="text"
+              inputmode="numeric"
+              bind:value={tag}
+              placeholder="0000"
+              disabled={connecting}
+              maxlength={4}
+              oninput={() => (tag = tag.replace(/\D/g, ""))}
+              onkeydown={(e) => e.key === "Enter" && handleConnect()}
+            />
+          </div>
+        </div>
+      </div>
+    {:else}
+      <div class="mode-switch small">
+        <button type="button" class:active={accountAction === "signin"} onclick={() => (accountAction = "signin")} disabled={connecting}>Sign in</button>
+        <button type="button" class:active={accountAction === "create"} onclick={() => (accountAction = "create")} disabled={connecting}>Create account</button>
+      </div>
+      <div class="field">
+        <label for="account-name">Account name</label>
         <input
-          id="username"
+          id="account-name"
           type="text"
           bind:value={name}
-          placeholder="Your name"
+          placeholder="a-z, 0-9, _ and -"
+          autocomplete="username"
           disabled={connecting}
           maxlength={32}
           onkeydown={(e) => e.key === "Enter" && handleConnect()}
         />
       </div>
-      <div class="field tag-field">
-        <label for="tag" title="Tells you apart from anybody else of the same name. If it is taken on a server, you get a random one there.">Tag</label>
-        <div class="tag-input">
-          <span>#</span>
+      <div class="field">
+        <label for="account-password">Password{#if accountAction === "signin" && remembered} (not needed on this device){/if}</label>
+        <input
+          id="account-password"
+          type="password"
+          bind:value={password}
+          autocomplete={accountAction === "create" ? "new-password" : "current-password"}
+          placeholder={accountAction === "signin" && remembered ? "This device is remembered" : "Password"}
+          disabled={connecting}
+          onkeydown={(e) => e.key === "Enter" && handleConnect()}
+        />
+      </div>
+      {#if accountAction === "create"}
+        <div class="field">
+          <label for="account-password2">Password again</label>
           <input
-            id="tag"
-            type="text"
-            inputmode="numeric"
-            bind:value={tag}
-            placeholder="0000"
+            id="account-password2"
+            type="password"
+            bind:value={password2}
+            autocomplete="new-password"
             disabled={connecting}
-            maxlength={4}
-            oninput={() => (tag = tag.replace(/\D/g, ""))}
             onkeydown={(e) => e.key === "Enter" && handleConnect()}
           />
         </div>
-      </div>
-    </div>
+        <div class="field">
+          <label for="signup-invite">Invite code (if the server asks for one)</label>
+          <input id="signup-invite" type="text" bind:value={signupInvite} disabled={connecting} />
+        </div>
+        <p class="account-note">
+          Your password never leaves this device: the server gets a key made from it. Forget it, and only your
+          recovery key opens your encrypted account data. Use a password you use on no other server: a server
+          could pretend to be another one.
+        </p>
+      {/if}
+    {/if}
 
     {#if !isWeb}
       <label class="checkbox-label">
@@ -305,6 +456,16 @@
           Forget pinned certificate for {host}:{port}
         </button>
       {/if}
+      {#if relayClash && !isWeb}
+        <button
+          type="button"
+          class="save-server-btn"
+          onclick={() => forgetRelayId(relayClash)}
+          disabled={connecting}
+        >
+          Forget the account id of {relayClash}
+        </button>
+      {/if}
     {/if}
 
     <div class="btn-row">
@@ -322,6 +483,37 @@
 </div>
 
 <style>
+  .mode-switch {
+    display: flex;
+    gap: 4px;
+    background: var(--bg-primary);
+    border-radius: 6px;
+    padding: 3px;
+  }
+
+  .mode-switch button {
+    flex: 1;
+    padding: 6px;
+    font-size: 13px;
+    background: transparent;
+    color: var(--text-secondary);
+  }
+
+  .mode-switch button.active {
+    background: var(--accent);
+    color: white;
+  }
+
+  .mode-switch.small button {
+    padding: 4px;
+    font-size: 12px;
+  }
+
+  .account-note {
+    font-size: 12px;
+    color: var(--text-secondary);
+  }
+
   .overlay {
     position: fixed;
     inset: 0;

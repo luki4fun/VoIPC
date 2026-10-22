@@ -1,0 +1,92 @@
+{
+  "id": "project",
+  "label": "Project or team — Slack-style organisation",
+  "summary": "Announcements, team channels and written stand-ups, meeting rooms with screen sharing, and a proximity virtual office.",
+  "notes": [
+    "Without accounts the server stores no chat: somebody new gets past messages from members who share their history. With accounts, members can also keep end-to-end-encrypted copies on the server.",
+    "Add a channel per team or topic as the project grows.",
+    "Posting in an announcement channel takes an admin (the admin token) or, on a server with accounts, a moderator."
+  ],
+  "channels": [
+    {
+      "name": "announcements",
+      "description": "Decisions, releases and news. Leads post here.",
+      "text": true,
+      "auto_join": true,
+      "announce": true
+    },
+    {
+      "name": "general",
+      "description": "Day-to-day talk for the whole team",
+      "text": true,
+      "auto_join": true
+    },
+    {
+      "name": "random",
+      "description": "The water cooler; posts go after a week",
+      "text": true,
+      "auto_join": true,
+      "message_ttl_secs": 604800
+    },
+    {
+      "name": "standup",
+      "description": "Written stand-ups: yesterday, today, blockers. Posts go after a week.",
+      "text": true,
+      "message_ttl_secs": 604800
+    },
+    {
+      "name": "engineering",
+      "description": "Code, infrastructure and technical decisions",
+      "text": true
+    },
+    {
+      "name": "design",
+      "description": "Design work, mock-ups and feedback",
+      "text": true
+    },
+    {
+      "name": "planning",
+      "description": "Roadmap, priorities and who does what",
+      "text": true
+    },
+    {
+      "name": "leads",
+      "description": "Leads only",
+      "text": true,
+      "hidden": true,
+      "password": "<generate>"
+    },
+    {
+      "name": "Daily Standup",
+      "description": "The daily stand-up — share your screen for the board"
+    },
+    {
+      "name": "Meeting Room 1",
+      "description": "Meetings, with screen sharing"
+    },
+    {
+      "name": "Meeting Room 2",
+      "description": "Meetings, with screen sharing"
+    },
+    {
+      "name": "Pairing",
+      "description": "Pair programming and reviews over a shared screen",
+      "max_users": 3
+    },
+    {
+      "name": "Virtual Office",
+      "description": "Proximity: sit at your desk, walk over to whoever you want to talk to",
+      "proximity": "2d"
+    },
+    {
+      "name": "Coffee Break",
+      "description": "Not about work"
+    },
+    {
+      "name": "Leads Meeting",
+      "description": "Leads only",
+      "hidden": true,
+      "password": "<generate>"
+    }
+  ]
+}

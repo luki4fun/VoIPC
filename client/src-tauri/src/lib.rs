@@ -1,3 +1,4 @@
+mod account;
 mod app_state;
 mod commands;
 mod config;
@@ -327,6 +328,18 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::connect,
+            account::account_totp,
+            account::qr_svg,
+            account::safety_number,
+            account::forget_relay_id,
+            account::account_prefs,
+            account::account_set_prefs,
+            account::account_enter,
+            account::send_kept_dm,
+            account::account_cancel,
+            account::account_request,
+            account::account_devices,
+            account::forget_device,
             commands::disconnect,
             commands::disconnect_all,
             commands::join_channel,

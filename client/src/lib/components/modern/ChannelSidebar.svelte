@@ -55,6 +55,7 @@
   import { shortName } from "../../username.js";
   import ChannelCreateForm from "../ChannelCreateForm.svelte";
   import Icon from "../Icons.svelte";
+  import ChannelTags from "../ChannelTags.svelte";
   import type { ChannelInfo, UserInfo } from "../../types.js";
 
 
@@ -120,12 +121,7 @@
           {#if channel.has_password}
             <span class="channel-icon"><Icon name="lock" size={14} /></span>
           {/if}
-          {#if channel.anonymous}
-            <span class="proximity-tag" title="Anonymous: members see each other under random names">?</span>
-          {/if}
-          {#if channel.hidden}
-            <span class="proximity-tag" title="Hidden: only admins see this channel in the list">H</span>
-          {/if}
+          <ChannelTags {channel} />
           {#if unread > 0}
             <span class="channel-unread">{unread}</span>
           {/if}
@@ -187,19 +183,7 @@
             >{channel.proximity.toUpperCase()}</span
           >
         {/if}
-        {#if channel.anonymous}
-          <span class="proximity-tag" title="Anonymous: members see each other under random names">?</span>
-        {/if}
-        {#if channel.hidden}
-          <span class="proximity-tag" title="Hidden: only admins see this channel in the list">H</span>
-        {/if}
-        {#if channel.routed}
-          <span
-            class="proximity-tag"
-            title="Routed: the server is told which members you want to hear, and forwards only their voice"
-            >R</span
-          >
-        {/if}
+        <ChannelTags {channel} />
 
         {#if unread > 0}
           <span class="channel-unread">{unread}</span>
@@ -392,7 +376,8 @@
     min-width: 0;
   }
 
-  .proximity-tag {
+  .proximity-tag,
+  .channel :global(.proximity-tag) {
     font-size: 9px;
     font-weight: 700;
     letter-spacing: 0.05em;

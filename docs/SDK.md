@@ -70,7 +70,7 @@ VoIPC answers with a `state` message:
 ```json
 {"type":"state","state":"ingame","user_id":42,"username":"Luki#0420",
  "channel":"Ingame","proximity":"3d","muted":false,"deafened":false,
- "version":"0.11.1","sdk":1,
+ "version":"0.12.0","sdk":1,
  "capabilities":["spatial","direct","volume","muffle","talk","reverb","underwater",
                  "layers","pan","delay","beacon","transmit",
                  "phone","radio","cb","walkie","aviation","police","landline",
@@ -120,6 +120,11 @@ seconds, is answered with an error instead of `ingame`:
 ```json
 {"type":"error","reason":"could not join Ingame: incorrect channel password"}
 ```
+
+A channel marked 18+ is joined only once the user has said yes to that
+server's 18+ channels in the app; a game cannot say it for them. Until then
+`hello` is answered with
+`{"type":"error","reason":"Ingame is marked 18+: join it once in the app first"}`.
 
 Send `hello` again after a reconnect; ids are per connection. VoIPC checks
 this for you: an `update` whose ids are from the connection before a reconnect
@@ -362,7 +367,11 @@ the people in the channel are told when they join, and you should turn it on
 only where you need it.
 
 Set `"routed": true` on the channel in `channels.json` (or tick it in the
-channel dialog). Two things then feed it:
+channel dialog). `voipc-server channels init roleplay` writes a `channels.json`
+with such an `Ingame` channel already set up — hidden, locked, routed — and a
+`game_token` in `server_settings.json` (an existing one is left alone, and the
+token is printed for you to add), and prints both secrets once. Two things then
+feed it:
 
 1. **Each client** tells the server which members its mod is currently
    listing. That happens by itself — your mod already worked the set out to

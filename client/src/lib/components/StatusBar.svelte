@@ -16,6 +16,7 @@
   import { viewingVoice } from "../stores/channels.js";
   import { lossPercent, quality } from "../stores/connection-quality.js";
   import { openAdminPanel, showAdminLogin } from "../stores/admin-ui.js";
+  import { account, showPrompt } from "../stores/account.js";
   import { disconnectServer } from "../connect.js";
   import { playDisconnectedSound } from "../sounds.js";
   import Icon from "./Icons.svelte";
@@ -55,6 +56,16 @@
     >
       Ping: {$latency}ms{#if $viaTcp}&nbsp;· TCP{/if}{#if loss > 0}&nbsp;· {loss}% loss{/if}
     </span>
+    {#if $account}
+      <button
+        class="admin-btn"
+        title="Your account on this server"
+        onclick={() => showPrompt({ kind: "account", server: $serverAddress })}
+      >
+        <Icon name="lock" size={14} />
+        {$account.name}
+      </button>
+    {/if}
     <button
       class="admin-btn"
       class:active={$isAdmin}

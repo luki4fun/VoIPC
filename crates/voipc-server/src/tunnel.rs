@@ -479,6 +479,7 @@ mod tests {
                 app_version: app_version.into(),
                 identity_key: None,
                 prekey_bundle: None,
+                account: None,
             })
             .await;
         }

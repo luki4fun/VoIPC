@@ -4,4 +4,6 @@
 fn main() {
     std::fs::create_dir_all("../../client/dist-web").expect("create client/dist-web");
     println!("cargo:rerun-if-changed=../../client/dist-web");
+    // sqlx::migrate! embeds migrations/ at compile time; cargo cannot see that.
+    println!("cargo:rerun-if-changed=migrations");
 }

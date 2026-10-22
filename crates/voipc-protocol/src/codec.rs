@@ -53,7 +53,12 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 ///     envelope, which the server never sees
 /// v10: DirectMessageUndelivered, the sender's answer when a direct message's
 ///      recipient has left
-pub const PROTOCOL_VERSION: u32 = 10;
+/// v11: relay accounts — Authenticate.account, AuthStep/AuthContinue,
+///      Authenticated.accounts/account, UserInfo.account/is_moderator,
+///      AccountRequest/AccountReply;
+///      channel options — ChannelInfo.announce/slow_mode_secs/nsfw and the
+///      same three in SetChannelOptions
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.
@@ -134,6 +139,7 @@ mod tests {
             app_version: APP_VERSION.to_string(),
             identity_key: None,
             prekey_bundle: None,
+            account: None,
         };
         let encoded = encode_client_msg(&msg).unwrap();
         // Skip the 4-byte length prefix
@@ -156,6 +162,8 @@ mod tests {
         let msg = ServerMessage::Authenticated {
             user_id: 1,
             session_id: 42,
+            accounts: None,
+            account: None,
         };
         let encoded = encode_server_msg(&msg).unwrap();
         let decoded = decode_server_msg(&encoded[4..]).unwrap();
@@ -163,6 +171,7 @@ mod tests {
             ServerMessage::Authenticated {
                 user_id,
                 session_id,
+                ..
             } => {
                 assert_eq!(user_id, 1);
                 assert_eq!(session_id, 42);
@@ -296,33 +305,21 @@ mod tests {
     fn roundtrip_set_channel_options() {
         // None leaves an option alone; the server must be able to tell that
         // apart from "set it to false".
-        let msg = ClientMessage::SetChannelOptions {
-            channel_id: 3,
+        let options = crate::types::ChannelOptions {
             hidden: Some(true),
-            anonymous: None,
             screen_share: Some(false),
-            hide_members: None,
             routed: Some(true),
             message_ttl_secs: Some(3600),
+            announce: Some(true),
+            nsfw: Some(false),
+            ..Default::default()
         };
+        let msg = ClientMessage::SetChannelOptions { channel_id: 3, options };
         let encoded = encode_client_msg(&msg).unwrap();
         match decode_client_msg(&encoded[4..]).unwrap() {
-            ClientMessage::SetChannelOptions {
-                channel_id,
-                hidden,
-                anonymous,
-                screen_share,
-                hide_members,
-                routed,
-                message_ttl_secs,
-            } => {
+            ClientMessage::SetChannelOptions { channel_id, options: back } => {
                 assert_eq!(channel_id, 3);
-                assert_eq!(hidden, Some(true));
-                assert_eq!(anonymous, None);
-                assert_eq!(screen_share, Some(false));
-                assert_eq!(hide_members, None);
-                assert_eq!(routed, Some(true));
-                assert_eq!(message_ttl_secs, Some(3600));
+                assert_eq!(back, options);
             }
             _ => panic!("wrong variant"),
         }

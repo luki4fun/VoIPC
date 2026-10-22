@@ -10,7 +10,7 @@ import {
   sanitizeHistory,
 } from "../chat-rules.js";
 import { previewChannelId, previewUsers } from "./channels.js";
-import { serverAddress, serverKey } from "./connection.js";
+import { serverAddress, serverKey, userId } from "./connection.js";
 import { scoped } from "./scoped.js";
 import { maxConversations } from "./settings.js";
 import type { ChatMessage } from "../types.js";
@@ -19,6 +19,9 @@ export interface DmConversation {
   user_id: number;
   username: string;
   unread: number;
+  /** Their relay account (hex), for a conversation filed from the stored
+   *  log: while they are away (a negative `user_id`), a reply goes there. */
+  account?: string;
 }
 
 /**
@@ -343,8 +346,17 @@ export function startExpirySweep(): void {
 // Message operations
 // ---------------------------------------------------------------------------
 
-export function addChannelMessage(server: string, channelName: string, msg: ChatMessage) {
+/** Already here: the same message by its sender's account and id, read from
+ *  the stored log before it came live (a message queued while its writer was
+ *  alone goes out live later). */
+function held(existing: ChatMessage[] | undefined, m: ChatMessage): boolean {
+  return !!m.id && !!m.account && !!existing?.some((h) => h.id === m.id && h.account === m.account);
+}
+
+/** Returns whether it was new. */
+export function addChannelMessage(server: string, channelName: string, msg: ChatMessage): boolean {
   const key = chatKey(server, channelName);
+  if (held(get(channelMessages).get(key), msg)) return false;
   channelMessages.update((map) => {
     const existing = map.get(key) ?? [];
     const msgs = [...existing, msg];
@@ -355,6 +367,29 @@ export function addChannelMessage(server: string, channelName: string, msg: Chat
     return new Map(map);
   });
   scheduleSave();
+  return true;
+}
+
+/**
+ * A message from a channel's stored log (`ChannelInfo.log`), merged the way
+ * a member's history is — a copy of one already here is the same message, by
+ * its writer's account and id — but not hearsay: its writer signed it. What
+ * the user cleared stays cleared. Returns whether it was new.
+ */
+export function fileStoredChannelMessage(server: string, channelName: string, msg: ChatMessage): boolean {
+  if (msg.expires_at !== undefined && msg.expires_at <= Date.now()) return false;
+  const key = chatKey(server, channelName);
+  const watermark = get(clearedBefore).get(key) ?? 0;
+  let added = false;
+  channelMessages.update((map) => {
+    const { messages, added: n } = mergeHistory(map.get(key) ?? [], [msg], "", watermark);
+    if (n === 0) return map;
+    added = true;
+    map.set(key, messages.filter((x) => x.kind !== "history-marker").slice(-MAX_MESSAGES));
+    return new Map(map);
+  });
+  if (added) scheduleSave();
+  return added;
 }
 
 /**
@@ -412,6 +447,7 @@ export function addDmMessage(
   // Our own echo carries our name, not theirs; theirs is what the
   // conversation is filed under.
   const key = dmKey(server, isEcho ? peerName(server, peerId, activeName || "Unknown") : fromName);
+  if (held(get(dmMessages).get(key), msg)) return;
 
   dmMessages.update((map) => {
     const existing = map.get(key) ?? [];
@@ -426,7 +462,12 @@ export function addDmMessage(
 
   // Update DM conversations list
   dmConversations.of(server).update((convos) => {
-    const existing = convos.find((c) => c.user_id === peerId);
+    // A conversation filed from the stored log, before its peer was here (a
+    // made-up negative id), becomes theirs.
+    const existing =
+      convos.find((c) => c.user_id === peerId) ??
+      convos.find((c) => c.user_id < 0 && !isEcho && c.username === fromName);
+    if (existing) existing.user_id = peerId;
     if (existing) {
       // Only update peer name from incoming messages, not our own echo
       if (!isEcho) {
@@ -448,6 +489,66 @@ export function addDmMessage(
         },
       ];
     }
+  });
+}
+
+/**
+ * A message from a direct conversation's stored log (an account's, kept on the
+ * relay while one of us was away), filed under the peer's name and merged the
+ * way a member's history is: a copy of one already here — live, or fetched
+ * on another occasion — is the same message, by its sender's account and id.
+ */
+export function fileStoredDm(
+  server: string,
+  m: {
+    peer_name: string;
+    peer_account: string;
+    from_me: boolean;
+    message_id: string | null;
+    content: string;
+    timestamp: number;
+  },
+  own: { name: string; account: string },
+  expires_at: number | undefined,
+  peerUserId: number | undefined,
+) {
+  // A name the relay did not give: filed under the account instead of lost,
+  // since the read cursor has already moved past it.
+  const peerName = m.peer_name || `account ${m.peer_account.slice(0, 8)}`;
+  const key = dmKey(server, peerName);
+  const msg: ChatMessage = {
+    user_id: m.from_me ? get(userId.of(server)) : (peerUserId ?? 0),
+    username: m.from_me ? own.name : peerName,
+    content: m.content,
+    timestamp: m.timestamp,
+    id: m.message_id ?? undefined,
+    account: m.from_me ? own.account : m.peer_account,
+    expires_at,
+  };
+  if (expires_at !== undefined && expires_at <= Date.now()) return;
+  let added = false;
+  dmMessages.update((map) => {
+    const existing = map.get(key) ?? [];
+    const { messages, added: n } = mergeHistory(existing, [msg], "", 0);
+    if (n === 0) return map;
+    added = true;
+    // The marker a member's hand-off draws is not wanted here: the log is the
+    // conversation itself, not somebody's copy of it.
+    map.set(key, messages.filter((x) => x.kind !== "history-marker").slice(-MAX_MESSAGES));
+    return new Map(map);
+  });
+  if (!added) return;
+  scheduleSave();
+  dmConversations.of(server).update((convos) => {
+    const existing = convos.find((c) => c.username === peerName);
+    if (existing) {
+      existing.account = m.peer_account;
+      if (!m.from_me) existing.unread++;
+      return [...convos];
+    }
+    // Not here now: a negative id stands in until they are (addDmMessage).
+    const id = peerUserId ?? -parseInt(m.peer_account.slice(0, 7), 16) - 1;
+    return [...convos, { user_id: id, username: peerName, unread: m.from_me ? 0 : 1, account: m.peer_account }];
   });
 }
 

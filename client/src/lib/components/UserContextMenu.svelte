@@ -14,7 +14,7 @@
   import { isAdmin, serverAddress } from "../stores/connection.js";
   import { isMobile, mobileTab } from "../stores/platform.js";
   import { centreView } from "../stores/room.js";
-  import { canInvite, canKick, isCurrentChannelCreator, isPreviewing } from "../stores/roster.js";
+  import { canInvite, canKick, isCurrentChannelCreator, isModerator, isPreviewing } from "../stores/roster.js";
   import { selectedStrip, setUserVolume, toggleUserMute, userVolumes } from "../stores/mixer.js";
   import {
     adminAction,
@@ -36,9 +36,26 @@
   } from "../stores/user-menu.js";
   import Icon from "./Icons.svelte";
   import { splitName, shortName } from "../username.js";
+  import { invoke } from "@tauri-apps/api/core";
+  import { account as ownAccount, showPrompt } from "../stores/account.js";
+  import { addNotification } from "../stores/notifications.js";
+
+  /** Both of us have accounts here: the number to compare with them. */
+  async function verifyIdentity(userId: number, name: string) {
+    const server = $serverAddress;
+    try {
+      const number = await invoke<string>("safety_number", { server, userId });
+      showPrompt({ kind: "safety", server, name: shortName(name), number });
+    } catch (e) {
+      addNotification(String(e), "warning");
+    }
+  }
 
   const menu = $derived($userMenu);
   let menuEl: HTMLDivElement | undefined = $state(undefined);
+  // A moderator acts on people, not on admins or other moderators (the server
+  // holds to that too); in their own channel they still kick as its creator.
+  const spared = $derived(!!menu && !$isAdmin && !!(menu.user.is_admin || menu.user.is_moderator));
 
   // Per-user volume lives in one store, shared with the mixer: this used to be
   // a component-local record, so the same person had two different volumes
@@ -116,6 +133,12 @@
         <Icon name="poke" size={16} />
         <span>Poke</span>
       </button>
+      {#if menu.user.account && $ownAccount}
+        <button class="ctx-item" onclick={() => { void verifyIdentity(menu.user.user_id, menu.user.username); closeUserMenu(); }}>
+          <Icon name="lock" size={16} />
+          <span>Verify identity</span>
+        </button>
+      {/if}
       {#if !$isPreviewing && $viewingVoice}
         <button
           class="ctx-item"
@@ -136,14 +159,14 @@
           <span>Invite to Channel</span>
         </button>
       {/if}
-      {#if $canKick && !menu.idle}
+      {#if $canKick && !menu.idle && !(spared && !$isCurrentChannelCreator)}
         <div class="ctx-separator"></div>
         <button class="ctx-item danger" onclick={() => { kickUser(menu.user.user_id); closeUserMenu(); }}>
           <Icon name="kick" size={16} />
           <span>Kick from channel</span>
         </button>
       {/if}
-      {#if $isAdmin}
+      {#if $isAdmin || ($isModerator && !spared)}
         <div class="ctx-separator"></div>
         <button class="ctx-item danger" onclick={() => { openAdminAction(menu.user, "kick", 0, "Kick from server"); closeUserMenu(); }}>
           <Icon name="shield" size={16} />

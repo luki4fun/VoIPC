@@ -20,7 +20,7 @@
 //! VoIPC → game
 //!   {"type":"state","state":"ingame","user_id":42,"username":"Luki#0420",
 //!    "channel":"Ingame","proximity":"3d","muted":false,"deafened":false,
-//!    "version":"0.11.1","sdk":1,
+//!    "version":"0.12.0","sdk":1,
 //!    "capabilities":["spatial","direct","volume","muffle","radio","phone","talk",
 //!                    "reverb","underwater"]}
 //!   {"type":"talk","user_id":42,"speaking":true}
@@ -1124,6 +1124,17 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> (serde_json::Value, 
             None,
         );
     };
+    // 18+ is the user's own word, given in the app once per server; a game
+    // cannot give it for them.
+    if channel.nsfw && !nsfw_consented(&state.config().ui_prefs, &connection.server_address) {
+        return (
+            serde_json::json!({
+                "type": "error",
+                "reason": format!("{wanted} is marked 18+: join it once in the app first"),
+            }),
+            None,
+        );
+    }
 
     // Everything needed after the guard is dropped: a stalled control stream
     // would otherwise park this task inside the lock, and the next
@@ -1781,8 +1792,24 @@ async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Whether the user said yes to this server's 18+ channels (channel-ui.ts
+/// `hasNsfwConsent`: the server key is `host:port`, an IPv6 host unbracketed).
+fn nsfw_consented(ui_prefs: &serde_json::Value, server: &str) -> bool {
+    let key = server.replacen('[', "", 1).replacen("]:", ":", 1);
+    ui_prefs["nsfw_ok"].as_array().is_some_and(|ok| ok.iter().any(|v| v.as_str() == Some(key.as_str())))
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_18_plus_channel_needs_the_users_own_yes() {
+        let prefs = serde_json::json!({ "nsfw_ok": ["a.example:9987", "::1:9987"] });
+        assert!(nsfw_consented(&prefs, "a.example:9987"));
+        assert!(nsfw_consented(&prefs, "[::1]:9987"), "the same key as the front end's");
+        assert!(!nsfw_consented(&prefs, "b.example:9987"));
+        assert!(!nsfw_consented(&serde_json::Value::Null, "a.example:9987"));
+    }
     use super::*;
 
     #[test]

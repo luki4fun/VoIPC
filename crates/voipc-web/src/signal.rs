@@ -38,12 +38,17 @@ impl SignalCore {
     /// Fresh identity, random registration id, signed pre-key 1 and
     /// `INITIAL_PREKEY_COUNT` one-time pre-keys with ids starting at 1.
     pub fn new() -> anyhow::Result<Self> {
-        let identity_key_pair = voipc_crypto::generate_identity_key_pair();
+        Self::with_identity(&voipc_crypto::generate_identity_key_pair())
+    }
+
+    /// The same, for an account's identity from its vault: only the identity
+    /// outlives the connection, the pre-keys and stores are new every time.
+    pub fn with_identity(identity_key_pair: &libsignal_protocol::IdentityKeyPair) -> anyhow::Result<Self> {
         let registration_id: u32 = rand::Rng::gen(&mut rand::thread_rng());
-        let mut stores = SignalStores::new(&identity_key_pair, registration_id);
+        let mut stores = SignalStores::new(identity_key_pair, registration_id);
         run(voipc_crypto::prekey::generate_prekeys(
             &mut stores,
-            &identity_key_pair,
+            identity_key_pair,
             1,
             INITIAL_PREKEY_COUNT,
         ))
@@ -157,6 +162,17 @@ impl SignalCore {
     }
 
     /// Start a channel's group keying from nothing, chain included.
+    /// `(user id, identity key)` for each identity the stores took in since
+    /// the last call: a session a peer opened among them.
+    pub fn take_seen(&mut self) -> Vec<(u32, Vec<u8>)> {
+        self.stores.identity.take_seen()
+    }
+
+    /// The identity key the session with `user_id` runs on, if there is one.
+    pub fn identity_of(&self, user_id: u32) -> Option<Vec<u8>> {
+        self.stores.identity.identity_of(user_id).map(<[u8]>::to_vec)
+    }
+
     pub fn reset_channel(&mut self, own_user_id: u32, channel_id: u32) {
         self.keying
             .reset_channel(Some(&mut self.stores), own_user_id, channel_id);

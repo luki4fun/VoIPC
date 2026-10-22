@@ -1,0 +1,95 @@
+{
+  "id": "roleplay",
+  "label": "Role-play — a game server with in-game proximity voice",
+  "summary": "An in-game channel the game drives (positions, radio, phone), out-of-character rooms, support and staff.",
+  "settings": {
+    "game_token": "<generate>"
+  },
+  "notes": [
+    "The Ingame password goes into the game resource's server config (sdk/fivem-voipc/server_config.lua, channelPassword), the game_token into the game server's VoIPC settings — never in front of players. See docs/SDK.md.",
+    "Factions — police, medics, gangs — usually want rooms of their own: add one per faction, each with a password.",
+    "Posting in an announcement channel takes an admin (the admin token) or, on a server with accounts, a moderator."
+  ],
+  "channels": [
+    {
+      "name": "welcome",
+      "description": "Rules, how to connect your game, and how whitelisting works. Only staff post here.",
+      "text": true,
+      "auto_join": true,
+      "announce": true
+    },
+    {
+      "name": "announcements",
+      "description": "Restarts, updates and wipes. Only staff post here.",
+      "text": true,
+      "auto_join": true,
+      "announce": true
+    },
+    {
+      "name": "ooc-chat",
+      "description": "Out of character: talk as yourself, not as your character",
+      "text": true,
+      "auto_join": true
+    },
+    {
+      "name": "looking-for-rp",
+      "description": "Looking for a scene or a partner? One post a minute; posts go after a day.",
+      "text": true,
+      "message_ttl_secs": 86400,
+      "slow_mode_secs": 60
+    },
+    {
+      "name": "staff",
+      "description": "Staff only",
+      "text": true,
+      "hidden": true,
+      "password": "<generate>"
+    },
+    {
+      "name": "Ingame",
+      "description": "In-character voice, driven by the game: join it from inside the game, not from here. Where you stand decides who hears you; radio and phone work inside it.",
+      "proximity": "3d",
+      "routed": true,
+      "hidden": true,
+      "hide_members": true,
+      "anonymous": true,
+      "screen_share": false,
+      "password": "<generate>"
+    },
+    {
+      "name": "OOC Lounge",
+      "description": "Out-of-character voice chat"
+    },
+    {
+      "name": "Support Waiting Room",
+      "description": "Need staff? Wait here and somebody will come and get you"
+    },
+    {
+      "name": "Support 1",
+      "description": "Staff and the player they are helping",
+      "max_users": 3
+    },
+    {
+      "name": "Support 2",
+      "description": "Staff and the player they are helping",
+      "max_users": 3
+    },
+    {
+      "name": "Whitelist Interview",
+      "description": "Whitelist interviews; staff give you the password",
+      "max_users": 4,
+      "password": "<generate>"
+    },
+    {
+      "name": "Staff Meeting",
+      "description": "Staff only",
+      "hidden": true,
+      "password": "<generate>"
+    },
+    {
+      "name": "AFK",
+      "description": "Away from keyboard",
+      "screen_share": false
+    }
+  ]
+}

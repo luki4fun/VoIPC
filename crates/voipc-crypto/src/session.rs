@@ -18,6 +18,11 @@ pub fn user_address(user_id: u32) -> ProtocolAddress {
     ProtocolAddress::new(format!("user_{}", user_id), 1.into())
 }
 
+/// The user id back from a `user_address` name.
+pub fn user_of(address_name: &str) -> Option<u32> {
+    address_name.strip_prefix("user_")?.parse().ok()
+}
+
 /// Process a remote user's pre-key bundle to establish a session.
 pub async fn establish_session(
     stores: &mut SignalStores,
@@ -138,3 +143,53 @@ pub async fn decrypt_message(
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::task::{Context, Poll, Waker};
+
+    /// In-memory stores are ready on the first poll (as in group.rs).
+    fn ready<T>(fut: impl Future<Output = T>) -> T {
+        match Box::pin(fut).as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+            Poll::Ready(v) => v,
+            Poll::Pending => panic!("in-memory stores never pend"),
+        }
+    }
+
+    /// A session the peer opens (their PreKey message) stores their identity
+    /// without a bundle of theirs ever passing the pin check: the stores tell
+    /// the host (`take_seen`), which checks it like a fetched bundle.
+    #[test]
+    fn a_session_the_peer_opens_is_handed_to_the_pin_check() {
+        let (alice, bob) = (1u32, 2u32);
+        let (alice_key, bob_key) = (crate::generate_identity_key_pair(), crate::generate_identity_key_pair());
+        let mut a = SignalStores::new(&alice_key, 1001);
+        let mut b = SignalStores::new(&bob_key, 1002);
+        let set = ready(crate::prekey::generate_prekeys(&mut b, &bob_key, 1, 1)).unwrap();
+        let otk = &set.one_time_prekeys[0];
+        ready(establish_session(
+            &mut a,
+            bob,
+            set.registration_id,
+            set.device_id,
+            &bob_key.public_key().serialize(),
+            set.signed_prekey_id,
+            &set.signed_prekey_public,
+            &set.signed_prekey_signature,
+            Some(otk.id),
+            Some(&otk.public_key),
+        ))
+        .unwrap();
+        let seen = a.identity.take_seen();
+        assert_eq!(seen, vec![(bob, bob_key.public_key().serialize().to_vec())], "the bundle's identity, for the outgoing check");
+        assert!(a.identity.take_seen().is_empty(), "handed over once");
+
+        let (ct, kind) = ready(encrypt_message(&mut a, bob, b"hi")).unwrap();
+        assert!(b.identity.take_seen().is_empty());
+        assert_eq!(ready(decrypt_message(&mut b, alice, &ct, kind)).unwrap(), b"hi");
+        assert_eq!(b.identity.take_seen(), vec![(alice, alice_key.public_key().serialize().to_vec())], "the session alice opened");
+        assert_eq!(b.identity.identity_of(alice), Some(&alice_key.public_key().serialize()[..]), "the key that session runs on");
+    }
+}

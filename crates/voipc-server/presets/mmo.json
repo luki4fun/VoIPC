@@ -1,0 +1,107 @@
+{
+  "id": "mmo",
+  "label": "RPG guild or clan — WoW, Final Fantasy XIV and co",
+  "summary": "Guild hall, raid comms, party rooms, sign-ups that expire with the weekly lockout, and an officers' corner.",
+  "notes": [
+    "Posting in an announcement channel takes an admin (the admin token) or, on a server with accounts, a moderator.",
+    "Running more raid groups? Copy the Raid Team 2 entry and give it a new name."
+  ],
+  "channels": [
+    {
+      "name": "announcements",
+      "description": "Guild news, raid times and patch notes. Officers post here.",
+      "text": true,
+      "auto_join": true,
+      "announce": true
+    },
+    {
+      "name": "guild-chat",
+      "description": "The guild's main chat",
+      "text": true,
+      "auto_join": true
+    },
+    {
+      "name": "raid-signups",
+      "description": "Sign up for this week's raids. Posts go after a week, with the lockout.",
+      "text": true,
+      "auto_join": true,
+      "message_ttl_secs": 604800
+    },
+    {
+      "name": "lfg",
+      "description": "Dungeons, keys, maps, trials: say what you need. One post a minute; posts go after a day.",
+      "text": true,
+      "message_ttl_secs": 86400,
+      "slow_mode_secs": 60
+    },
+    {
+      "name": "guides-and-builds",
+      "description": "Builds, rotations, routes and guides worth keeping",
+      "text": true
+    },
+    {
+      "name": "trade-and-crafting",
+      "description": "Buying, selling and crafting orders; posts go after a week",
+      "text": true,
+      "message_ttl_secs": 604800
+    },
+    {
+      "name": "officers",
+      "description": "Officers only",
+      "text": true,
+      "hidden": true,
+      "password": "<generate>"
+    },
+    {
+      "name": "Guild Hall",
+      "description": "Hang out with the guild"
+    },
+    {
+      "name": "Raid",
+      "description": "Raid comms: the raid leader calls, everybody else keeps it short"
+    },
+    {
+      "name": "Raid Team 2",
+      "description": "A second raid group"
+    },
+    {
+      "name": "Party 1",
+      "description": "Dungeons, keys and trials — up to eight",
+      "max_users": 8
+    },
+    {
+      "name": "Party 2",
+      "description": "Dungeons, keys and trials — up to eight",
+      "max_users": 8
+    },
+    {
+      "name": "Party 3",
+      "description": "Dungeons, keys and trials — up to eight",
+      "max_users": 8
+    },
+    {
+      "name": "PvP",
+      "description": "Arenas, battlegrounds and world PvP"
+    },
+    {
+      "name": "Farming & Crafting",
+      "description": "Grinding, gathering and crafting in company"
+    },
+    {
+      "name": "Recruitment Interview",
+      "description": "Officers talking to an applicant",
+      "max_users": 3
+    },
+    {
+      "name": "Officer Room",
+      "description": "Officers only",
+      "hidden": true,
+      "password": "<generate>"
+    },
+    {
+      "name": "AFK",
+      "description": "Away from keyboard",
+      "screen_share": false
+    }
+  ]
+}

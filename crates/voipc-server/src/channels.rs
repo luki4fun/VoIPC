@@ -9,6 +9,24 @@ use voipc_protocol::types::ProximityMode;
 
 const SHA256_PREFIX: &str = "sha256:";
 
+/// What a preset writes where a secret belongs. `voipc-server channels init`
+/// replaces it with a fresh one; a file that still carries it was copied by
+/// hand, and starting with it would hand every server that did so the same
+/// password — so it is refused instead.
+pub const PRESET_PLACEHOLDER: &str = "<generate>";
+
+/// Refuses a secret that is still the preset's placeholder; `what` names it.
+pub fn refuse_placeholder(what: &str, value: Option<&str>) -> anyhow::Result<()> {
+    if value == Some(PRESET_PLACEHOLDER) {
+        bail!("{what} is still the preset placeholder {PRESET_PLACEHOLDER:?}: set a real one, or write the file with `voipc-server channels init`");
+    }
+    Ok(())
+}
+
+/// The longest slow mode a channel may ask for (6 h). Past that it stops being
+/// a pace and becomes a ban on talking, which is what `announce` is for.
+pub const MAX_SLOW_MODE_SECS: u32 = 6 * 60 * 60;
+
 /// A single channel entry as read from channels.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelEntry {
@@ -76,6 +94,41 @@ pub struct ChannelEntry {
     /// sends and applies it to what it keeps.
     #[serde(default)]
     pub message_ttl_secs: u32,
+
+    /// Only the channel's managers (admins and moderators, for a channel from
+    /// this file) may post; the relay refuses everybody else. Text channels
+    /// only.
+    #[serde(default)]
+    pub announce: bool,
+
+    /// A member may post once per this many seconds; 0 (the default) is off.
+    /// Admins and moderators are exempt. Up to six hours.
+    #[serde(default)]
+    pub slow_mode_secs: u32,
+
+    /// Marked 18+: clients ask for consent before joining or showing it.
+    #[serde(default)]
+    pub nsfw: bool,
+
+    /// What names this channel's stored-message log (relays with accounts).
+    /// Without one the log is named after the channel, so renaming the
+    /// channel starts a new log; set it (letters, digits, `-`, `_`) to keep
+    /// one log across renames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+}
+
+impl ChannelEntry {
+    /// The conversation id of this channel's stored-message log.
+    pub fn log_conv(&self) -> String {
+        match &self.uid {
+            Some(uid) => format!("c:{uid}"),
+            None => {
+                let digest = Sha256::digest(format!("voipc-channel/v1|{}", self.name.trim().to_lowercase()).as_bytes());
+                format!("c:{}", hex::encode(&digest[..16]))
+            }
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -101,6 +154,10 @@ impl Default for ChannelEntry {
             text: false,
             auto_join: false,
             message_ttl_secs: 0,
+            announce: false,
+            slow_mode_secs: 0,
+            nsfw: false,
+            uid: None,
         }
     }
 }
@@ -137,8 +194,9 @@ pub fn load_and_prepare_channels(path: &Path) -> anyhow::Result<Vec<ChannelEntry
     Ok(entries)
 }
 
-fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
+pub(crate) fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
     let mut seen_names: HashSet<String> = HashSet::new();
+    let mut seen_logs: HashSet<String> = HashSet::new();
 
     for (i, entry) in entries.iter().enumerate() {
         let name = entry.name.trim();
@@ -181,9 +239,28 @@ fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
         if !seen_names.insert(lower) {
             bail!("duplicate channel name: '{}'", name);
         }
+        if let Some(uid) = &entry.uid {
+            if uid.is_empty() || uid.len() > 64 || !uid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                bail!("channel '{}' uid must be 1-64 letters, digits, '-' or '_'", name);
+            }
+        }
+        if !seen_logs.insert(entry.log_conv()) {
+            bail!("channel '{}' has the same uid as another channel", name);
+        }
         if entry.auto_join && !entry.text {
             bail!("channel '{}' has 'auto_join' without 'text'", name);
         }
+        if entry.announce && !entry.text {
+            bail!("channel '{}' has 'announce' without 'text'", name);
+        }
+        if entry.slow_mode_secs > MAX_SLOW_MODE_SECS {
+            bail!(
+                "channel '{}' slow_mode_secs exceeds 6 hours ({})",
+                name,
+                entry.slow_mode_secs
+            );
+        }
+        refuse_placeholder(&format!("channel '{name}' password"), entry.password.as_deref())?;
         if entry.text && entry.anonymous {
             // A pseudonym only hides someone who is nowhere else. A text
             // channel is one you are in besides the voice channel you stand
@@ -227,15 +304,11 @@ fn hash_plaintext_passwords(entries: &mut [ChannelEntry]) -> bool {
 }
 
 /// Write entries to a temp file then atomically rename over the original.
-fn atomic_rewrite(path: &Path, entries: &[ChannelEntry]) -> anyhow::Result<()> {
+pub(crate) fn atomic_rewrite(path: &Path, entries: &[ChannelEntry]) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(entries).context("failed to serialize channels")?;
 
-    let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, json.as_bytes())
-        .with_context(|| format!("failed to write temp file: {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, path)
-        .with_context(|| format!("failed to rename temp file to {}", path.display()))?;
-
+    // Password hashes: for the server's own user only.
+    crate::fsutil::atomic_write(path, json.as_bytes(), true).with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 
@@ -451,6 +524,10 @@ mod tests {
             text: false,
             auto_join: false,
             message_ttl_secs: 0,
+            announce: false,
+            slow_mode_secs: 45,
+            nsfw: true,
+            uid: Some("ingame-1".into()),
         }];
         assert!(hash_plaintext_passwords(&mut entries));
         let json = serde_json::to_string(&entries).unwrap();
@@ -458,6 +535,21 @@ mod tests {
         assert_eq!(back[0].proximity, ProximityMode::TwoD);
         assert!(back[0].hidden && back[0].anonymous && back[0].hide_members && back[0].routed);
         assert!(!back[0].screen_share, "sharing must stay switched off");
+        assert!(back[0].nsfw && back[0].slow_mode_secs == 45);
+        assert_eq!(back[0].uid.as_deref(), Some("ingame-1"));
+    }
+
+    #[test]
+    fn a_log_is_named_by_uid_or_else_by_the_channel_name() {
+        let named = |json: &str| serde_json::from_str::<Vec<ChannelEntry>>(json).unwrap();
+        let a = named(r#"[{"name":"Lounge"}]"#);
+        let b = named(r#"[{"name":"lounge "}]"#);
+        assert_eq!(a[0].log_conv(), b[0].log_conv(), "case and spaces do not make a new log");
+        assert!(a[0].log_conv().starts_with("c:") && a[0].log_conv().len() == 34);
+        let kept = named(r#"[{"name":"Renamed","uid":"lounge-1"}]"#);
+        assert_eq!(kept[0].log_conv(), "c:lounge-1");
+        assert!(validate_entries(&named(r#"[{"name":"a","uid":"x y"}]"#)).is_err(), "uid characters");
+        assert!(validate_entries(&named(r#"[{"name":"a","uid":"same"},{"name":"b","uid":"same"}]"#)).is_err(), "uid twice");
     }
 
     #[test]
@@ -490,5 +582,55 @@ mod tests {
             serde_json::from_str(r#"[{"name":"secrets","text":true,"anonymous":true}]"#).unwrap();
         let err = validate_entries(&bad).unwrap_err().to_string();
         assert!(err.contains("anonymous"), "{err}");
+    }
+
+    #[test]
+    fn announce_slow_mode_and_nsfw_load_and_validate() {
+        let entries: Vec<ChannelEntry> = serde_json::from_str(
+            r#"[{"name":"news","text":true,"announce":true,"auto_join":true},
+                {"name":"general","text":true,"slow_mode_secs":10},
+                {"name":"After Dark","nsfw":true},
+                {"name":"Music"}]"#,
+        )
+        .unwrap();
+        assert!(entries[0].announce && entries[1].slow_mode_secs == 10 && entries[2].nsfw);
+        assert!(!entries[3].announce && entries[3].slow_mode_secs == 0 && !entries[3].nsfw);
+        assert!(validate_entries(&entries).is_ok());
+
+        // A voice room has no posts of its own to keep for its managers
+        let bad: Vec<ChannelEntry> =
+            serde_json::from_str(r#"[{"name":"Stage","announce":true}]"#).unwrap();
+        let err = validate_entries(&bad).unwrap_err().to_string();
+        assert!(err.contains("announce"), "{err}");
+
+        let slow = ChannelEntry {
+            name: "x".into(),
+            text: true,
+            slow_mode_secs: MAX_SLOW_MODE_SECS + 1,
+            ..Default::default()
+        };
+        assert!(validate_entries(&[slow]).is_err());
+    }
+
+    #[test]
+    fn a_preset_placeholder_password_is_refused() {
+        // Somebody copied a preset by hand: starting would give every such
+        // server the same, published password.
+        let entries = vec![ChannelEntry {
+            name: "Staff".into(),
+            password: Some(PRESET_PLACEHOLDER.into()),
+            ..Default::default()
+        }];
+        let err = validate_entries(&entries).unwrap_err().to_string();
+        assert!(err.contains("channels init"), "{err}");
+    }
+
+    #[test]
+    fn the_example_file_loads() {
+        // The server once refused to start on its own example; keep it honest.
+        let entries: Vec<ChannelEntry> =
+            serde_json::from_str(include_str!("../../../channels.example.json")).unwrap();
+        validate_entries(&entries).unwrap();
+        assert!(entries.iter().any(|e| e.announce) && entries.iter().any(|e| e.slow_mode_secs > 0));
     }
 }

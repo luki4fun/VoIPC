@@ -43,6 +43,17 @@ wtransport = { version = "0.7", features = ["quinn"] }
 rust-embed = { version = "8", features = ["debug-embed", "mime-guess"] }
 hex = "0.4"
 
+# Opt-in relay accounts (`[accounts]` in the config). SQLite for a small relay,
+# Postgres for a big one, chosen by the database URL; SQLite is bundled, so the
+# musl build stays static. Postgres speaks TLS through rustls on ring.
+# To build against a checkout of l4f-accounts next to this repo, add
+#   [patch."https://github.com/luki4fun/l4f-accounts.git"]
+#   l4f-accounts = { path = "../l4f-accounts" }
+# to the workspace Cargo.toml while you need it; commit neither that nor the
+# Cargo.lock it changes.
+l4f-accounts = { git = "https://github.com/luki4fun/l4f-accounts.git", tag = "v0.9.0", features = ["postgres", "sqlite"] }
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "sqlite", "migrate", "macros"] }
+
 [dev-dependencies]
 # For the voice_load example (Opus encoding + media encryption of the test tone)
 voipc-audio = { workspace = true }

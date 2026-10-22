@@ -2,6 +2,138 @@
 
 All notable changes to VoIPC are documented here.
 
+## [0.12.0] - 2026-10-20
+
+Accounts, if a server wants them: a name that stays yours, an identity other
+people can check, and end-to-end-encrypted copies of your messages that wait
+for you while you are away. Plus eleven ready-made channel layouts, and
+announcement, slow-mode and 18+ channels. A server without `[accounts]` in its
+`server.toml` runs as before. Protocol version 11: a server still admits only a
+client of its own version, so update both together.
+
+### Added — accounts and kept messages (opt-in)
+
+- **Accounts, if the server wants them.** `[accounts] mode = "optional"` or
+  `"required"` in `server.toml` (default `off`, which opens no database at all).
+  SQLite or Postgres, picked by the `database` URL. An account's name is
+  reserved: guests keep their `#tag` and cannot take it. See
+  [docs/ACCOUNTS.md](docs/ACCOUNTS.md)
+- **Setting them up.** `[accounts]` also takes `registration`, `cloud` (on by
+  default: members may keep copies), `retention_days` (365), `quota_mb` (50)
+  and `key_file`. The key file is made at the first start and seals every
+  two-factor secret: back it up with the database, and give both full paths. A
+  server refuses to start with another key; `VOIPC_ACCOUNTS_KEY` stands in for
+  the file. `--accounts` and `--database` set the mode and the database on the
+  command line, and an unknown key in `[accounts]` stops the start
+- **One password and a recovery key.** The app derives the secret the server
+  checks and the key to the account's vault from the password, which never
+  leaves the device. A device signed in once with the password is remembered
+  and signs in without it after that. Signing in on another device ends the
+  older session
+- **Lasting identities.** An account keeps its identity key in its vault. Other
+  people pin it the first time, together with the account behind the name, and
+  are told when either changes — whether the key came in a bundle or in a
+  session the other side opened, and whether or not they are online. They can
+  compare a safety number under *Verify identity*. Between accounts this
+  narrows the gap the 0.5.0 review left open, a server swapping keys, to the
+  first meeting, and comparing safety numbers closes that too
+- **Roles with two-factor codes.** Admin and moderator are account roles, and
+  both need authenticator codes before their rights apply. The admin token
+  makes the first admin once, then is refused (and is no longer printed once
+  an admin exists). Moderators can kick, ban and change any channel's
+  settings; they cannot kick or ban an admin or another moderator (a channel's
+  creator still kicks anyone out of their own channel), and the ban list, with
+  its addresses, stays with admins
+- **Kept messages.** Each member chooses once, at their first connect, whether
+  to keep end-to-end-encrypted copies of their messages on the server. Kept
+  messages follow you to other devices, and what people wrote while you were
+  away waits for you: in direct messages, and in channels from `channels.json`
+  that are neither anonymous nor hide their members. The server learns who
+  wrote where, when, how long each message is and when its copy may go, never
+  the text and never a key. Copies are signed, so the people they are for can
+  prove who wrote them, and they have no forward secrecy: whoever later gets
+  into an account reads what that account could read. The same switch as
+  *Share recent channel chat with newcomers*, on by default, decides whether
+  people who join later read what you kept there before. Every account that
+  gets a key to your messages is named in the channel as it happens. A kept
+  copy follows the channel's rules as a post does: announce, slow mode, and
+  being in the channel
+- **Sign-up** is `open` (a proof-of-work puzzle in the app), `invite` (the
+  default) or `closed`. `voipc-server admin invite [--for <name>] [--days N]`
+  prints a code
+- **Server commands:** `admin grant <name> admin|moderator`,
+  `admin revoke <name> admin|moderator`, `admin reset-2fa <name>`,
+  `admin invite` and `db backup <path>`. Give them the server's own config,
+  before the command: `voipc-server -c server.toml admin invite`. A running
+  server picks up what they change within five minutes
+- **`uid` in `channels.json`** keeps a channel's log across a rename. Without
+  it, the log follows the channel's name
+- Protocol version 11; the desktop chat archive is version 4
+
+### Known limits — accounts
+
+- An account's password cannot be changed yet, and a forgotten one cannot be
+  reset. A remembered device still signs in; without one, a lost password
+  loses the account. The recovery key shown at sign-up is for the version that
+  adds the reset
+- Roles, invites and two-factor resets are on the server's command line only;
+  there is no admin dialog for them in the app yet
+- Bans still go by address and live in memory; there are no account bans
+- Copies already on the server cannot be deleted from the app yet: turning
+  copies off stops new ones, and the rest expire
+- Leaving a channel does not leave its kept copies: a reader stays one until
+  they are kicked from the channel or its password changes
+- A direct message to somebody away works only in a conversation the app
+  already has with them; one with an account that has not been online since
+  you connected cannot be started yet
+- The browser keeps no chat between visits beyond the server's copies
+- What a server that turns hostile can still do — drop or roll back what it
+  keeps, decide who is listed as a member, meet you first, and in the browser
+  serve a page that reads what you type and uses what the browser keeps for
+  your account — is listed in docs/ACCOUNTS.md. Use a password there that you
+  use on no other server; the desktop app refuses a server that claims another
+  server's account id
+
+### Added — channel presets and options
+
+- **Channel presets.** `voipc-server channels presets` lists eleven ready-made
+  layouts — starter, gaming, role-play with an in-game proximity channel, MMO
+  guild, shooter/MOBA, tabletop, study, LAN party, Slack-style project, family,
+  and creator community — and `voipc-server channels init <preset>` writes one
+  to `channels.json`. No preset ships a password: every locked channel gets a
+  fresh one, printed once, and the file keeps only its hash. A layout that
+  needs server settings (a `game_token` for role-play) gets a
+  `server_settings.json` when there is none; an existing one is left alone and
+  `init` prints what to put in it. `init --force` keeps every earlier file
+  (`channels.json.bak`, `.bak.2`, …, readable by the server's user only)
+- **Announcement channels** (`announce`, text channels only): only the
+  channel's managers — admins, moderators, and the creator of a user-made
+  channel — may post, and the server refuses everybody else's messages
+- **Slow mode** (`slow_mode_secs`, up to 6 hours): one post per interval per
+  member, held to by the server; managers are exempt. The chat shows the
+  countdown instead of letting a message be sent and refused
+- **18+ channels** (`nsfw`): the app asks once per server before joining or
+  showing one, and never joins one by itself — nor does a game through the
+  SDK's `hello`, or a reconnect, before that yes. The server only carries the
+  flag — a password is still what keeps people out
+- All three are in `channels.json` and in the channel's gear dialog. The
+  sidebars mark announcement and 18+ channels, and the chat header shows slow
+  mode. Protocol version 11
+
+### Changed
+
+- `channels.json` (password hashes) and a preset's `server_settings.json`
+  (game token) are written readable by the server's user only, through a new
+  temporary file each time
+
+### Fixed
+
+- Channel names made in the app are compared ignoring case, as `channels.json`
+  already was, so nobody can make an `Announcements` next to `announcements`
+- A channel-settings change the server refused partway — making a text channel
+  anonymous along with other options — no longer leaves the other options
+  changed with nobody told
+
 ## [0.11.1] - 2026-10-17
 
 A review of the whole app, and what it found: a microphone that could stay on

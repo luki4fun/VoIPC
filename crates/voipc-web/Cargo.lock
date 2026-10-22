@@ -848,6 +848,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+
+[[package]]
 name = "quote"
 version = "1.0.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1296,7 +1302,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voipc-crypto"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1305,6 +1311,7 @@ dependencies = [
  "js-sys",
  "libsignal-protocol",
  "postcard",
+ "qrcode",
  "rand",
  "ring",
  "serde",
@@ -1313,12 +1320,13 @@ dependencies = [
  "thiserror",
  "tracing",
  "uuid",
+ "voipc-protocol",
  "zeroize",
 ]
 
 [[package]]
 name = "voipc-protocol"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "bytes",
  "postcard",
@@ -1329,7 +1337,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-web"
-version = "0.11.1"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "console_error_panic_hook",

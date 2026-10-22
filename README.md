@@ -20,9 +20,9 @@
 
 ---
 
-**VoIPC** is an encrypted, self-hosted voice/video/chat application. Think Discord or TeamSpeak, but with end-to-end encryption, zero data collection, and a server that never stores anything to disk.
+**VoIPC** is an encrypted, self-hosted voice/video/chat application. Think Discord or TeamSpeak, but with end-to-end encryption, zero data collection, and a server that stores nothing on disk unless its operator turns on accounts.
 
-No accounts. No telemetry. No compromises.
+No accounts required. No telemetry. No compromises.
 
 <p align="center">
   <img src="website/screenshots/main-window.png" alt="VoIPC in the Modern layout — server rail, channels with the people in each of them, chat, and the member list" width="800">
@@ -120,7 +120,7 @@ No accounts. No telemetry. No compromises.
 
 **Proximity Chat**
 - A channel can be **2D** (a floor plan) or **3D** (height counts too), set when it is created and
-  changeable afterwards by its creator or an admin; operators can switch the whole feature off
+  changeable afterwards by its creator, an admin or a moderator; operators can switch the whole feature off
 - Voices are placed left/right and get quieter with distance, using the constant-power pan law and
   the inverse distance model every other implementation converged on. Desktop and browser render it;
   Android gets the distance but not the panning yet
@@ -157,7 +157,7 @@ No accounts. No telemetry. No compromises.
 - Auto-reconnect keeps trying for 5 minutes (laptop sleep, server restart)
 - UDP blocked on the way? With the server's TCP fallback on, the session moves to TCP by itself (the status bar says **· TCP**); without it, the connect fails with an error that says so instead of a silent mute
 - Screen share adapts bitrate and frame rate to what the link carries (viewers report loss, the sharer steps down)
-- Server admin session: log in with the server's admin token (status bar shield) to kick users from any channel or from the server and to IP-ban them for 1 h, 24 h or until restart; bans are memory-only and listed with an Unban button
+- Server admin session (without accounts): log in with the server's admin token (status bar shield) to kick users from any channel or from the server and to IP-ban them for 1 h, 24 h or until restart; bans are memory-only and listed with an Unban button. With accounts, admin and moderator are roles of accounts ([docs/ACCOUNTS.md](docs/ACCOUNTS.md))
 
 **Platform Support**
 
@@ -194,7 +194,7 @@ VoIPC encrypts everything at multiple layers. The server acts as a blind relay �
 
 ### Layer 1: Transport — TLS on every connection
 
-All TCP control traffic is encrypted with TLS 1.2+ via **rustls** (pure-Rust, no OpenSSL). For self-signed server certs, the client pins the certificate fingerprint per `host:port` on first connect via **TOFU** (`TofuCertVerifier`) and aborts the handshake if it ever changes. If a server legitimately replaced its certificate, the connect dialog offers *Forget pinned certificate*; the next connect pins the new one. Plaintext connections are never accepted.
+All control traffic is encrypted with TLS 1.3 via **rustls** (pure-Rust, no OpenSSL). For self-signed server certs, the client pins the certificate fingerprint per `host:port` on first connect via **TOFU** (`TofuCertVerifier`) and aborts the handshake if it ever changes. If a server legitimately replaced its certificate, the connect dialog offers *Forget pinned certificate*; the next connect pins the new one. Plaintext connections are never accepted.
 
 ### Layer 2: End-to-End Messages — Signal Protocol
 
@@ -205,8 +205,9 @@ Chat messages (channel and DM) use the **Signal Protocol** from the official [li
 - **Curve25519** identity keys (32-byte) with Ed25519 signed pre-keys
 - **100 one-time pre-keys** per user, auto-replenished
 - **Sender Keys** for efficient group/channel message encryption
-- **Perfect Forward Secrecy** — a compromised key cannot decrypt past messages. For channel chat the matching guarantee runs the other way and is what key rotation is for: a chain key stolen today would read *future* messages, so leaving a channel starts a new chain
-- **Ephemeral identities by design** — a fresh identity key pair is generated for every connection and never written to disk. There are no accounts and nothing to fingerprint or link across sessions. The trade-off is explicit: pre-key bundles come from the server, so protection against an *actively malicious* server substituting keys during session setup is not a goal; protection against a passive or compromised-at-rest server is.
+- **Perfect Forward Secrecy** — a compromised key cannot decrypt past messages. Copies kept on a server with accounts are the exception: they have no forward secrecy (see *Data Transparency*). For channel chat the matching guarantee runs the other way and is what key rotation is for: a chain key stolen today would read *future* messages, so leaving a channel starts a new chain
+- **Ephemeral identities by design** — for a guest, a fresh identity key pair is generated for every connection and never written to disk. A guest has no account and nothing to fingerprint or link across sessions. The trade-off is explicit: pre-key bundles come from the server, so protection against an *actively malicious* server substituting keys during session setup is not a goal for guests; protection against a passive or compromised-at-rest server is.
+- **Lasting identities for accounts** (opt-in per server, see [docs/ACCOUNTS.md](docs/ACCOUNTS.md)) — an account keeps one identity key in its encrypted vault, and the people it talks to pin it the first time they see it. A changed key is announced instead of accepted silently, and *Verify identity* in a member's menu shows a safety number the two of you can compare in person: if it matches, nobody stands between you, not even the server.
 
 ### Layer 3: Media — AES-256-GCM on every packet
 
@@ -228,15 +229,15 @@ Client-side data at rest:
 
 - Chat history encrypted with **PBKDF2-HMAC-SHA256** (600,000 iterations) + **AES-256-GCM**
 - 32-byte random salt + 12-byte random nonce per file
-- Signal Protocol state is never stored (see *Ephemeral identities* above)
+- Signal session state is never stored. A guest's identity is not stored either (see *Ephemeral identities* above); an account's identity key lives in its encrypted vault on the server, and a remembered device keeps the key to that vault
 - All secrets wrapped in `Zeroizing<T>` — memory-zeroized on drop
 
 ### Layer 5: Zero-Knowledge Server
 
 - Server **never** sees plaintext messages (encrypted client-side)
-- Server **never** stores chat history (no persistence, no disk writes)
+- Server **never** stores readable chat history — without accounts nothing at all, with accounts only the encrypted copies members choose (see *Data Transparency*)
 - Server **never** decodes voice/video (SFU architecture — relays encrypted packets)
-- Server **never** logs conversations (memory-only state, restart = clean slate)
+- Server **never** logs conversations (without accounts: memory-only state, restart = clean slate)
 
 ### What the comparison looks like
 
@@ -247,8 +248,8 @@ Client-side data at rest:
 | Self-Hosted | Yes | No | Yes |
 | Open Source | MIT | No | No |
 | Account Required | No | Yes | No |
-| Data Collection | None | Extensive | Some |
-| Server Persistence | None | Everything | Everything |
+| Data Collection | None (with accounts: sign-in records, hashed IPs) | Extensive | Some |
+| Server Persistence | None by default; opt-in accounts database (messages only end-to-end encrypted) | Everything | Everything |
 | Screen Share Codec | H.264 or H.265, HW-accel | H.264/VP8 | Limited |
 
 ## Technology
@@ -289,7 +290,7 @@ Client-side data at rest:
 | **Noise Suppression** | nnnoiseless (RNNoise) | ML-based, 480-sample frames at 48 kHz |
 | **Video Codec** | H.264 (default) or H.265 via FFmpeg 8 | NVENC → QSV → AMF → libx264/libx265 fallback; browsers also send VP9/VP8 |
 | **Encryption** | libsignal-protocol + ring | Signal Protocol for messages, AES-256-GCM for media |
-| **TLS** | rustls 0.23 + ring | Pure-Rust TLS 1.2+, TOFU cert pinning |
+| **TLS** | rustls 0.23 + ring | Pure-Rust TLS 1.3, TOFU cert pinning |
 | **Serialization** | postcard | Binary, no_std compatible, minimal overhead |
 | **Server Runtime** | Tokio | Async, single-binary, DashMap lock-free concurrency |
 | **Client Backend** | Tauri 2 (Rust) | Native IPC, audio/video/crypto all in Rust |
@@ -302,12 +303,12 @@ Client-side data at rest:
 
 | Metric | Value |
 |---|---|
-| Voice packet header | 9 bytes (11 encrypted) |
-| Video packet header | 15 bytes (17 encrypted) |
+| Voice packet header | 9 bytes (15 encrypted) |
+| Video packet header | 15 bytes (21 encrypted) |
 | Max voice packet | 512 bytes |
 | Max video packet | 1,280 bytes |
 | Max control message | 64 KiB |
-| Protocol version | v8 |
+| Protocol version | v11 |
 | Default port | 9987 — UDP for QUIC (all clients), TCP for the browser page and the TCP fallback |
 
 ### Project Structure
@@ -365,7 +366,9 @@ openssl req -x509 -newkey ec \
 ```
 
 The server listens on port **9987** by default: UDP for the QUIC endpoint every client
-connects to, TCP for the browser page. Configure via `server.toml`:
+connects to, TCP for the browser page. Configure it with a TOML file, which it reads only when
+started with `-c` (`voipc-server -c server.toml`; the `admin` and `db` commands need the same
+`-c server.toml`, before the command):
 
 ```toml
 host = "::"               # Bind address — "::" serves IPv6 and IPv4 from one listener; "0.0.0.0" for IPv4 only
@@ -376,7 +379,7 @@ max_users = 64
 max_connections_per_ip = 32   # A browser client holds two of these, a native client one — so 32 is sixteen browser users behind one NAT
 cert_path = "certs/server.crt"
 key_path = "certs/server.key"
-admin_token = "change-me"  # optional; unset = a random token is printed in the log at every start
+admin_token = "change-me"  # optional; unset = a random token is printed in the log at every start (with accounts, only while no account is admin)
 ```
 
 > **IPv6:** `host = "::"` is the default and serves both families from one listener (a host with IPv6 disabled falls back to `0.0.0.0` automatically). Do not pin `host` to a concrete IPv4 address while your domain publishes an AAAA record: the browser client then fails while everything else looks healthy, because the page and `/wt.json` are TCP and Chrome quietly falls back to IPv4 after the refused IPv6 attempt, while the WebTransport session is UDP and has no such fallback — it dies with `ERR_QUIC_PROTOCOL_ERROR`.
@@ -391,7 +394,7 @@ admin_token = "change-me"  # optional; unset = a random token is printed in the 
 > it is in use. Desktop and Android clients dial the fallback on the port they were given,
 > so keep `tcp_port` equal to `udp_port`.
 
-> **VPN / multi-homed setups:** If clients connect via a domain name (e.g. `vpn.example.com`) that resolves to a specific IP, set `host` to that IP. Otherwise the server may send QUIC packets from the wrong interface and the handshake never completes. All options can also be passed as CLI flags (`--host`, `--tcp-port`, `--udp-port`, etc.).
+> **VPN / multi-homed setups:** If clients connect via a domain name (e.g. `vpn.example.com`) that resolves to a specific IP, set `host` to that IP. Otherwise the server may send QUIC packets from the wrong interface and the handshake never completes. Some options can also be passed as CLI flags (`--host`, `--tcp-port`, `--udp-port`, etc.; `voipc-server --help` lists them).
 
 Runtime settings in `server_settings.json`:
 
@@ -409,7 +412,7 @@ Runtime settings in `server_settings.json`:
 
 `game_token` (unset by default) is a bearer token a **game server** may present to `POST /game/v1/routes`, which narrows who hears whom inside a channel whose `routed` flag is on. Unset, that endpoint answers 404 and this server has no idea games exist. It is not the admin token and is deliberately much weaker: no session list, no names, no kick, no bans — only "these players may hear each other, for the next few seconds", as opaque ids it forgets.
 
-**Persistent channels** (optional): drop a `channels.json` next to the binary to pre-create long-lived rooms that survive restarts. See [channels.example.json](channels.example.json) — plaintext `password` fields are hashed to SHA-256 on first load and the file is rewritten atomically. Per channel:
+**Persistent channels** (optional): drop a `channels.json` in the directory the server runs from (or pass `--channels <path>`) to pre-create long-lived rooms that survive restarts. See [channels.example.json](channels.example.json) — plaintext `password` fields are hashed to SHA-256 on first load and the file is rewritten atomically. Per channel:
 
 | Option | Default | Effect |
 |---|---|---|
@@ -420,29 +423,58 @@ Runtime settings in `server_settings.json`:
 | `hide_members` | `false` | Non-admins see no member list, only whoever is speaking (and can still adjust their volume). Nobody outside is told who joins or leaves either — only that the count changed — which is the same rule a password channel follows |
 | `routed` | `false` | The server forwards each voice only to whoever should hear it, instead of to every member. For a channel a game drives, where "every member" can be a whole map. **The one option that tells this server anything about who hears whom** — members in such a channel say which of the others they want to hear, and a game server with `game_token` may narrow that further. Positions, names and audio stay as unreadable to it as ever. Everyone joining is told, and the channel is marked **R** |
 | `text` | `false` | Makes it a **text channel**: no voice, no screen share, no proximity. Joining one is a subscription rather than a move, so any number can be open at once and none of them costs the voice channel you stand in |
-| `message_ttl_secs` | `0` | A **message destruction timer**: seconds a message written here lives before every client deletes it, `0` for none. Up to 30 days. The server stores no chat and deletes nothing — this is what the channel tells its members, and each client stamps it on what it sends, inside the encryption where the relay cannot reach it. It applies to what is written from then on, not to what people already have |
+| `message_ttl_secs` | `0` | A **message destruction timer**: seconds a message written here lives before every client deletes it, `0` for none. Up to 30 days. Without accounts the server stores no chat and deletes nothing — this is what the channel tells its members, and each client stamps it on what it sends, inside the encryption where the relay cannot reach it. With accounts, the server also deletes the copies members keep there when their timer runs out. It applies to what is written from then on, not to what people already have |
 | `auto_join` | `false` | Only with `text`. Clients join this channel on connect. A user who leaves it is not brought back — the client remembers that, which is why the server joins nobody by itself. There is no limit on how many a client holds: the budgets that pay for joining them are sized from how many channels this server has |
+| `announce` | `false` | Only with `text`. An **announcement channel**: only its managers — admins and moderators, and for a channel somebody created, its creator — may post, and the server refuses everybody else's messages. It reads none of them; who posts where is all it checks. A member's shared history from such a channel is still shown as second-hand, as everywhere |
+| `slow_mode_secs` | `0` | **Slow mode**: each member may post once per this many seconds, up to 6 hours; `0` is off. The server holds them to it, the channel's managers are exempt, and the chat shows the countdown rather than letting a message be sent and refused |
+| `nsfw` | `false` | Marks the channel **18+**. Each app asks its user, once per server, to confirm being 18 or older before joining or showing such a channel, and never joins one by itself (`auto_join` waits for that answer). The server only carries the flag. It is a question, not an age check: give the channel a `password` too if it has to stay shut |
 
-The creator of a channel, or any admin, can change these at runtime through the channel's gear icon. Channels from `channels.json` have no creator, so those are admin-only.
+The creator of a channel, or any admin or moderator, can change these at runtime through the channel's gear icon. Channels from `channels.json` have no creator, so only admins and moderators can change those.
 
-**Text channels.** A voice channel is still one at a time: joining another moves you. A text channel is not — you subscribe to as many as you like, read them while sitting in a voice room, and leave one from the ✕ on its row. Clicking a text channel you are not in reads it rather than joining it; entering is a button in the chat pane, so a stray click never puts you back in a channel you left. Anyone can create one at runtime too (the + button, then *Text*), and like any user-created channel it disappears once the last member leaves and the empty-channel timeout passes. Messages are end-to-end encrypted the same way voice-channel chat is, one sender-key group per channel, and each message is bound to its channel inside the ciphertext — a relay cannot show it as belonging to another one. When somebody leaves a channel, the next message sent there starts a fresh key chain, so a former member stops being able to read along.
+**Channel presets.** Rather than writing `channels.json` by hand, start from one of the built-in layouts and edit from there:
 
-**Messages can be given a destruction timer.** Off everywhere by default. A channel's creator, or an admin, sets one from the channel's gear icon — five minutes to seven days — and from then on every message written there is deleted by every client once its time is up, including from the copies members have handed to people who joined later. A direct message has no channel to take that from, so there the clock icon in the chat header is your own: it travels with the messages you send, and the other side deletes them when it runs out.
+```bash
+./voipc-server channels presets                   # list them
+./voipc-server channels init community            # write channels.json from one
+./voipc-server channels init roleplay --dry-run   # look first; writes nothing
+```
 
-The timer rides inside the encryption, next to the message, so the relay can neither read it nor change it. A deadline is worked out once, when a message arrives, from the message's own timestamp — which is why every copy of it goes at the same moment rather than a few minutes apart. What a member re-sharing a conversation claims about a message is only ever the outer bound: the channel's own timer applies to what they hand over too, including to a message they strip it from, and a copy of something you already hold can bring its deletion forward but never push it back. What that does not do is make a member trustworthy: somebody who was there can always keep their own copy of what they read, whatever the timer says. It is a rule about the app, not about people.
+| Preset | For |
+|---|---|
+| `starter` | A small all-round server: one chat everybody lands in, a few rooms, AFK |
+| `gaming` | A friend group or multi-game community: game rooms, a stream room, a proximity campfire, a looking-for-group board with slow mode |
+| `roleplay` | A role-play game server: a hidden, locked, routed `Ingame` channel the game drives ([docs/SDK.md](docs/SDK.md)), out-of-character rooms, support and whitelist rooms, staff-only announcements |
+| `mmo` | A guild or clan (WoW, FFXIV and co): guild hall, raid comms, party rooms capped at eight, raid sign-ups that expire with the weekly lockout, officers' rooms |
+| `competitive` | Shooters and MOBAs: duo, trio, squad and five-stack rooms capped at their size, an in-house lobby with two team rooms, VOD review |
+| `tabletop` | Pen & paper: a proximity table the game master shares a map at, a whisper corner, a tavern, lore and character channels |
+| `study` | A study group or co-working: a silent room, a proximity library, small group rooms, one-to-one tutoring |
+| `lan` | A LAN party or tournament: info and brackets only the orga posts in, match rooms per team, a locked casters' room, a help desk |
+| `project` | A team, Slack-style: announcements, team channels, written stand-ups, meeting rooms, a proximity virtual office |
+| `family` | Family and friends: a chat everyone lands in, a living room, movie and game nights, a locked corner for the grown-ups |
+| `community` | Creators and communities: moderator-only announcements, slow mode, feedback and bug reports, a stage, playtests, and a locked 18+ area |
 
-**Chat history is opt-in, shared between members, and yours to delete.** The server stores no messages, so a channel's past reaches a newcomer only because members offer it.
+No preset ships a password: one in a preset would be the same on every server that used it. Every locked channel is given a fresh random one instead, printed once when `init` runs; the file keeps only its hash. Where a layout needs server settings — `roleplay` a `game_token`, `family` and `community` a lower `max_channels` — `init` writes `server_settings.json` if there is none, and otherwise leaves yours alone and prints what to put in it. An existing `channels.json` is only replaced with `--force`, which keeps the old one as `channels.json.bak` (`.bak.2` and so on after that). `--out` writes it elsewhere; `--channels` and `--settings` choose other paths too, but go before the command: `voipc-server --settings path/server_settings.json channels init roleplay`. What comes out is an ordinary `channels.json`: restart the server to load it. A preset copied by hand still says `"<generate>"` where a secret belongs, and the server refuses to start on it rather than lock a channel with a password everybody can read.
 
-Because it reaches them that way, it is that member's word: identities are ephemeral and never stored, so there is nothing that signs an archived message and nothing to check one against. Messages that arrive as history are therefore shown as second-hand, and stay second-hand when they are passed on — a member who invents a conversation and attributes it to somebody else can be believed, but never mistaken for the person they are quoting.
+**Text channels.** A voice channel is still one at a time: joining another moves you. A text channel is not — you subscribe to as many as you like, read them while sitting in a voice room, and leave one from the ✕ on its row. Clicking a text channel you are not in reads it rather than joining it; entering is a button in the chat pane, so a stray click never puts you back in a channel you left. Anyone can create one at runtime too (the + button, then *Text*), and like any user-created channel it disappears once the last member leaves and the empty-channel timeout passes. Messages are end-to-end encrypted the same way voice-channel chat is, one sender-key group per channel, and each message is bound to its channel inside the ciphertext — a relay cannot show it as belonging to another one. When somebody leaves a channel, the next message sent there starts a fresh key chain, so a former member stops reading the live chat. On a server with accounts, an account that kept copies of the channel stays a reader of what is kept there after leaving, until it is kicked from that channel or the channel gets a new password.
 
-- **Who shares** is visible: a member who answers requests is marked in the member list. It is one flag per person, like mute, and the only thing about chat the server is told — it has always seen the requests go past. Turn it off under Settings → Data
+**Messages can be given a destruction timer.** Off everywhere by default. A channel's creator, an admin or a moderator sets one from the channel's gear icon — five minutes to seven days — and from then on every message written there is deleted by every client once its time is up, including from the copies members have handed to people who joined later. A direct message has no channel to take that from, so there the clock icon in the chat header is your own: it travels with the messages you send, and the other side deletes them when it runs out.
+
+The timer rides inside the encryption, next to the message, so the relay can neither read nor change that copy of it. A copy kept on a server with accounts also tells the server its timer, so the server can delete it on time; the app still goes by the one inside. A deadline is worked out once, when a message arrives, from the message's own timestamp — which is why every copy of it goes at the same moment rather than a few minutes apart. What a member re-sharing a conversation claims about a message is only ever the outer bound: the channel's own timer applies to what they hand over too, including to a message they strip it from, and a copy of something you already hold can bring its deletion forward but never push it back. What that does not do is make a member trustworthy: somebody who was there can always keep their own copy of what they read, whatever the timer says. It is a rule about the app, not about people.
+
+**Chat history is opt-in, shared between members, and yours to delete.** Without accounts the server stores no messages, so a channel's past reaches a newcomer only because members offer it. With accounts it can also come from the copies members keep on the server ([docs/ACCOUNTS.md](docs/ACCOUNTS.md)).
+
+Because it reaches them that way, it is that member's word: a guest's identity is ephemeral and never stored, so nothing signs what a member hands over and there is nothing to check it against. Between accounts, the copies kept on the server are signed by their writers ([docs/ACCOUNTS.md](docs/ACCOUNTS.md)), but history handed over by a member is still only that member's word. Messages that arrive as history are therefore shown as second-hand, and stay second-hand when they are passed on — a member who invents a conversation and attributes it to somebody else can be believed, but never mistaken for the person they are quoting.
+
+- **Who shares** is visible: a member who answers requests is marked in the member list. It is one flag per person, like mute, and, on a server without accounts, the only thing about chat the server is told — it has always seen the requests go past. Turn it off under Settings → Data
 - **Several people are asked, and the answers are merged.** Whoever was away holds the older half of a conversation, whoever just arrived holds only the newest. A newcomer asks up to three members who share, and what comes back is folded into one history in order. Each message carries an id minted by its sender inside the encryption, so two copies of the same message are recognised as one; a divider shows which part came from whom
 - **Deleting is permanent.** Clearing a channel records what was there, and nothing older is merged back in — so what you deleted stays deleted, however often a member re-offers it. The history button in the chat header asks the sharers again and takes that back, for when you cleared it by accident
 - **History is kept per server**, and on desktop in an encrypted file you unlock with a password (Settings → Data, or turn it off and keep chat in memory only). Two servers' `#general` are two conversations, which also means a server cannot ask for what its users wrote somewhere else
-- **Conversations are filed by server and by the name of the person**, so a DM you had yesterday is not shown as one with whoever happens to hold that user id today. Which also means a name is what a conversation follows: on a server where somebody else takes a name after its owner leaves, the two look like one person to your archive — there are no accounts, and the server only keeps a name unique while the person holding it is online
-- **What the server can still do:** it decides who is in a channel, so it can place somebody there and the members will hand them a key. End-to-end encryption means the server cannot read what is said — not that it cannot add a listener. It has to do it in the open, though: a client accepts a sender key, accepts a media key, answers a request for history and shows a message only from somebody the roster says is in the channel with it, so an added listener is one the member list shows. That holds against a server that seats somebody, not against one that swaps the keys it relays: identities are made fresh for every connection and nobody verifies them, so a server that hands out its own keys in place of a member's can still read along unseen. Accounts with lasting identities are what would close that gap, and they are not here yet
+- **Conversations are filed by server and by the name of the person**, so a DM you had yesterday is not shown as one with whoever happens to hold that user id today. Which also means a name is what a conversation follows: on a server where somebody else takes a name after its owner leaves, the two look like one person to your archive — a guest's name is only kept unique while the person holding it is online. On a server with accounts, an account's name stays its own, and a guest cannot take it
+- **What the server can still do:** it decides who is in a channel, so it can place somebody there and the members will hand them a key. End-to-end encryption means the server cannot read what is said — not that it cannot add a listener. It has to do it in the open, though: a client accepts a sender key, accepts a media key, answers a request for history and shows a message only from somebody the roster says is in the channel with it, so an added listener is one the member list shows (kept copies on a server with accounts are the exception: their readers need not be in the member list, and your app names each new one in the channel instead). That holds against a server that seats somebody, not against one that swaps the keys it relays: a guest's identity is made fresh for every connection and nobody verifies it, so a server that hands out its own keys in place of a guest's can still read along unseen. Between accounts the gap narrows to the first meeting: identities are pinned, a later change is announced, and comparing safety numbers shows a key that is not the person's
 
-**Server administration:** there are no accounts; any connected user becomes admin for their session by entering the admin token (status bar → shield icon). Set `admin_token` in `server.toml`, pass `--admin-token`, or export `VOIPC_ADMIN_TOKEN`; without one the server prints a fresh random token in its log at every start. Admins can kick users from channels or from the server and ban an IP for 1 h, 24 h or until restart — everyone behind that IP is affected, and bans live in memory only. Other users see a shield next to an admin's name. Three wrong tokens disconnect the session.
+**Accounts (optional):** set `[accounts] mode = "optional"` (or `"required"`) in `server.toml` and the server keeps accounts in SQLite or Postgres: a name that is reserved, two-factor codes for admins and moderators on new devices, and — for members who choose it — encrypted copies of their messages, so what was written while they were away is there when they come back. Guests still work unless you say otherwise. Setup, the command line (`voipc-server admin invite`, `admin grant`, `admin revoke`, `admin reset-2fa`, `db backup`) and what the server learns are in [docs/ACCOUNTS.md](docs/ACCOUNTS.md).
+
+**Server administration:** without accounts, any connected user becomes admin for their session by entering the admin token (status bar → shield icon). With accounts, roles belong to accounts: admin and moderator. Moderators can kick, ban and change any channel's settings, but cannot kick or ban an admin or another moderator (though they can kick one out of a channel they created themselves), and only admins see the ban list. The admin token makes the first admin, once, then is refused on that server. Set `admin_token` in `server.toml`, pass `--admin-token`, or export `VOIPC_ADMIN_TOKEN`; without one the server prints a fresh random token in its log at every start (with accounts, only while no account is admin). Admins can kick users from channels or from the server and ban an IP for 1 h, 24 h or until restart — everyone behind that IP is affected, and bans live in memory only. Other users see a shield next to an admin's name. Three wrong tokens disconnect the session.
 
 ### Client
 
@@ -524,14 +556,16 @@ npm --prefix client test   # browser-side unit tests (spatial maths, room preset
 - Media encryption keys per channel (`Zeroizing<[u8; 32]>`)
 - Pre-key bundles for Signal session establishment
 
-**Nothing is written to disk. Server restart = complete clean slate.**
+**Without accounts, nothing is written to disk: a server restart is a clean slate.** Accounts are something a server's operator turns on; what such a server keeps is listed below.
 
 ### What the server never sees
 
 - Message contents — encrypted with Signal Protocol before leaving your device
 - Voice/video content — encrypted with AES-256-GCM before transmission
-- Chat history — stored only on your device, encrypted
-- Your private keys — only public keys are exchanged
+- Chat history — stored on your device, encrypted; on a server with accounts also as end-to-end-encrypted
+  copies for members who choose them, which the server cannot read
+- Your private keys — only public keys are exchanged; an account's private keys reach the server only
+  sealed in its encrypted vault
 - Where you stand in a proximity room — positions are encrypted with the channel key like voice; the
   relay sees only that a member is sharing one. Positions a game feeds in stay on your machine
   unless you switch on *Let a game broadcast my position* — and then only your own goes out, still
@@ -561,17 +595,34 @@ should hear it instead of to everybody:
 - Everyone joining such a channel is told this, in a notice they have to dismiss, and the channel
   carries an **R** in the list
 
+### What a server with accounts keeps (opt-in)
+
+Off unless the operator sets `[accounts] mode`. Then the server keeps a database — and every member is told what is in it:
+
+- **For every account:** its name; an Argon2id hash of a secret the app derives from your password (the password itself never leaves your device); your identity's public key; the public key of each device you sign in on with your password, which lets that device sign in without the password (*Forget* under *Your account* ends that; the server deletes a key unused for 90 days); your two-factor secret, sealed with a key file kept outside the database; your roles; and sign-in records with hashed IP addresses (the server's own log names the address next to the account at each sign-in)
+- **Your vault,** encrypted on your device. It opens with your password, on a device the server remembers, or with your recovery key (which this version's apps cannot take yet). It holds your identity key, other people's pinned identities, your choices and your log key. The server keeps it and cannot open it
+- **Only if you say yes to copies on the server** (asked once, changed under *Your account*): your messages, encrypted end to end. The server learns who wrote in which channel or direct conversation, when, how long each message is, each message's destruction timer (for a direct message, the one you chose), and which channels you keep — never the text and never a key. Copies go when their timer runs out, or after the server's retention (a year unless the operator chooses otherwise)
+- **People who join a channel later** can read what you wrote there before unless you say no: it is the switch *Share recent channel chat with newcomers*, which is on by default and ticked in the copies question. With it on, someone who joins gets the keys to everything you kept in that channel, not only recent chat. Either way, every account your app hands a key to is named in the channel as it happens, on the device that hands it over, so nobody is added without you seeing it
+- **Kept messages are signed** by you, so the people they are for can prove you wrote them, and a kept copy has no forward secrecy: whoever later gets into a member's account can read what that member could
+- **The browser client is served by the server itself,** so a server that turns hostile can change the page. It can read what you type there, and it can use what the browser keeps for the account (the remembered device key and the key to your vault) to sign in as you and read everything kept for you. The desktop app does not have that problem; use it where you do not run the server yourself
+- **A server that turns hostile still cannot read kept messages** (except through a browser it serves, above), but it holds your vault and decides who is listed as a member: it can drop or roll back what it keeps, and meet you before the person you meant to meet. Your app names every new reader, warns when a known name turns up as another account, and safety numbers show who is in between ([docs/ACCOUNTS.md](docs/ACCOUNTS.md))
+- **Use a password you use on no other server:** a server can pretend to be another one. The desktop app refuses a server that claims an id it knows from another address
+
 ### What your device stores
 
 - Encrypted chat history (`VOIP` binary format, password-protected)
 - Audio/video settings and device preferences
 - Max 500 messages per channel, auto-rotated
+- With an account: a remembered device's key and, with it, the key to your vault (desktop: inside the encrypted
+  chat history, or only in memory while that is off; browser: IndexedDB, under a key the page cannot export),
+  how far it has read the server's copies, and whom it has named as readers
+- On the desktop, which account id each server address gave at its last sign-in (`relay_ids` in `settings.json`)
 
 ### What is never stored anywhere
 
 - No analytics or telemetry
-- No user accounts or profiles
-- No server-side message logs
+- No user accounts or profiles, unless the server's operator turns accounts on
+- No server-side message logs — only the end-to-end-encrypted copies of members who choose them
 - No tracking of any kind
 - No third-party data sharing
 

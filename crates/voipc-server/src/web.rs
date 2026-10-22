@@ -1304,6 +1304,7 @@ mod tests {
             app_version: APP_VERSION.to_string(),
             identity_key: None,
             prekey_bundle: None,
+            account: None,
         };
         send.write_all(&encode_client_msg(&auth).unwrap()).await.unwrap();
         let mut buf = BytesMut::new();

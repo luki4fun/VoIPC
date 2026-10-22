@@ -83,6 +83,14 @@ export interface UiPrefs {
    * the two wins wherever a copy is stored (`expiryFor`).
    */
   dm_timers: Record<string, number>;
+  /**
+   * Servers (`"host:port"`) on which the user confirmed being 18 or older, so
+   * their channels marked 18+ join and show without asking again.
+   *
+   * Per server, because it is each server's channels the answer was about.
+   * The server is never told: the flag on a channel is all it carries.
+   */
+  nsfw_ok: string[];
 }
 
 /** Bounds. A width outside these is a panel you cannot get back by dragging. */
@@ -131,6 +139,7 @@ export function defaultUiPrefs(): UiPrefs {
     share_preview: true,
     left_text_channels: {},
     dm_timers: {},
+    nsfw_ok: [],
   };
 }
 
@@ -168,6 +177,15 @@ function dmTimers(raw: unknown): Record<string, number> {
     if (Number.isFinite(n) && n > 0) out[key] = Math.min(n, DM_TIMER_MAX_SECS);
   }
   return out;
+}
+
+/** How many servers' 18+ consent this remembers, newest kept. */
+const NSFW_OK_MAX = 200;
+
+function nsfwOk(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const list = raw.filter((k): k is string => typeof k === "string" && k !== "");
+  return [...new Set(list)].slice(-NSFW_OK_MAX);
 }
 
 function clamp(value: unknown, lo: number, hi: number, fallback: number): number {
@@ -284,5 +302,6 @@ export function sanitizeUiPrefs(raw: unknown): UiPrefs {
     share_preview: bool(r.share_preview, d.share_preview),
     left_text_channels: leftTextChannels(r.left_text_channels),
     dm_timers: dmTimers(r.dm_timers),
+    nsfw_ok: nsfwOk(r.nsfw_ok),
   };
 }

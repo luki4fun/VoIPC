@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -12,7 +13,7 @@ use zeroize::Zeroizing;
 
 use voipc_protocol::types::*;
 
-use crate::channels::ChannelEntry;
+use crate::channels::{ChannelEntry, MAX_SLOW_MODE_SECS};
 use crate::config::ServerConfig;
 use crate::settings::ServerSettings;
 
@@ -64,8 +65,12 @@ pub struct UserSession {
     pub media_tx: mpsc::Sender<Bytes>,
     /// The client's IP (bans).
     pub peer_ip: IpAddr,
-    /// Logged in with the admin token.
+    /// Logged in with the admin token, or (with accounts) holds `*`.
     pub is_admin: bool,
+    /// Holds the moderator role: kick, ban, any channel's settings.
+    pub is_moderator: bool,
+    /// The relay account this connection signed in with; `None` for a guest.
+    pub account: Option<AccountSession>,
     /// This user answers requests for recent channel chat. Told to the server
     /// only so a member list can show who asking would reach; the server has
     /// always seen the requests themselves go past.
@@ -174,7 +179,38 @@ pub struct UserSession {
     pub device_id: u32,
 }
 
+/// A connection's account: who, its l4f session (ended with the connection),
+/// and what it may do now.
+pub struct AccountSession {
+    pub user: l4f_accounts::model::User,
+    pub token: String,
+    pub info: l4f_accounts::model::SessionInfo,
+    pub scopes: Vec<String>,
+    /// What the account was last told: a role of its waits for codes. A role
+    /// given from the shell changes this and no scope (`accounts::revalidate`).
+    pub needs_2fa: bool,
+    /// A device-key enrolment challenge waiting for its signature, and the
+    /// nonce it was issued against (kept here, never sent).
+    pub device_challenge: Option<(String, [u8; 16])>,
+}
+
 impl UserSession {
+    /// The relay account this session signed in with, if any.
+    pub fn account_id(&self) -> Option<[u8; 16]> {
+        self.account.as_ref().map(|a| a.user.id.0)
+    }
+
+    /// The account's roles as `scopes` say: the admin and moderator powers,
+    /// and the scopes kept to compare against later (`accounts::revalidate`).
+    /// The one place they are set, at sign-in and after a change alike.
+    pub fn set_scopes(&mut self, user: l4f_accounts::model::User, scopes: Vec<String>) {
+        (self.is_admin, self.is_moderator) = crate::accounts::powers(&scopes);
+        if let Some(a) = self.account.as_mut() {
+            a.user = user;
+            a.scopes = scopes;
+        }
+    }
+
     /// A session with every budget at full, as a client that has just
     /// authenticated gets it.
     ///
@@ -202,6 +238,8 @@ impl UserSession {
             media_tx,
             peer_ip,
             is_admin: false,
+            is_moderator: false,
+            account: None,
             shares_history: false,
             admin_login_failures: 0,
             close: Default::default(),
@@ -334,6 +372,18 @@ pub struct Channel {
     /// The name each member is known by here while the channel is anonymous.
     /// Assigned on join, dropped on leave; admins are told the real names.
     pub pseudonyms: HashMap<UserId, String>,
+    /// The stored-message log this channel would keep (`ChannelEntry::log_conv`):
+    /// persistent channels on a relay with accounts and storage, else empty.
+    pub log_conv: String,
+}
+
+impl Channel {
+    /// Offers the log in `info.log` unless an option rules it out: in an
+    /// anonymous channel, or one hiding its members, a log would show who is
+    /// there (its members wrap keys to each other by account).
+    pub fn refresh_log(&mut self) {
+        self.info.log = if self.info.anonymous || self.info.hide_members { String::new() } else { self.log_conv.clone() };
+    }
 }
 
 /// The one admission decision. Returns whether an invite is what let them in —
@@ -392,6 +442,35 @@ pub struct OptionsChanged {
     pub anonymity: bool,
 }
 
+/// How long `last` (a member's previous post) still holds them back in a
+/// channel with `secs` of slow mode, in whole seconds rounded up; `None` when
+/// they may post now.
+///
+/// Half a second of grace: the client counts the wait from when it sent, we
+/// count it from when the previous post arrived, and the two posts need not
+/// cross the network equally fast. Without it a client that waits exactly as
+/// long as it was told is refused now and then.
+pub fn slow_mode_wait(last: Option<Instant>, now: Instant, secs: u32) -> Option<u64> {
+    if secs == 0 {
+        return None;
+    }
+    let elapsed = now.saturating_duration_since(last?) + std::time::Duration::from_millis(500);
+    let need = std::time::Duration::from_secs(secs.into());
+    (elapsed < need).then(|| (need - elapsed).as_secs_f64().ceil().max(1.0) as u64)
+}
+
+/// The account behind a member, for one viewer: only where that viewer is
+/// shown the real name, or to an admin. An account id is as good as the name
+/// (any account can look its name up), so it may go no further than the name:
+/// not behind a pseudonym, and not to the outsiders of a channel.
+pub fn account_shown(account: Option<[u8; 16]>, sees_real_name: bool, viewer_is_admin: bool) -> Option<[u8; 16]> {
+    if sees_real_name || viewer_is_admin {
+        account
+    } else {
+        None
+    }
+}
+
 /// The name one recipient may see: the pseudonym unless they are an admin.
 pub fn pick_name(real: &str, alias: &Option<String>, viewer_is_admin: bool) -> String {
     match alias {
@@ -447,6 +526,31 @@ pub struct ServerState {
     /// Who may hear whom, in channels whose `routed` flag is on. Empty on
     /// every other server, and that is the default.
     pub routing: crate::routing::Routing,
+    /// Opt-in accounts; `None` when `[accounts] mode = "off"`.
+    pub accounts: Option<Arc<crate::accounts::Relay>>,
+    /// The live session of each signed-in account: a new sign-in replaces it.
+    pub account_sessions: DashMap<[u8; 16], SessionId>,
+    /// When each member last wrote in each slow-mode channel (`post_rules`).
+    /// Here rather than on the channel, so leaving and coming back does not
+    /// reset the clock; an account's goes across its connections.
+    pub post_marks: DashMap<(ChannelId, Poster, PostStamp), Instant>,
+}
+
+/// Which of a member's posts slow mode counts: the live message, or its copy
+/// in the channel's stored log. Each has its own clock, so a post and its
+/// copy do not hold each other back.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum PostStamp {
+    Live,
+    Kept,
+}
+
+/// Who slow mode holds back: an account across every connection it makes (a
+/// reconnect does not reset the clock), a guest per connection.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum Poster {
+    Account([u8; 16]),
+    Session(SessionId),
 }
 
 impl ServerState {
@@ -465,19 +569,7 @@ impl ServerState {
                     channel_id: 0,
                     name: "General".into(),
                     description: "Lobby — no voice".into(),
-                    max_users: 0,
-                    user_count: 0,
-                    has_password: false,
-                    created_by: None,
-                    proximity: ProximityMode::Off,
-                    routed: false,
-                    hidden: false,
-                    anonymous: false,
-                    screen_share: true,
-                    hide_members: false,
-                    text: false,
-                    auto_join: false,
-                    message_ttl_secs: 0,
+                    ..Default::default()
                 },
                 members: HashSet::new(),
                 password: None,
@@ -486,8 +578,13 @@ impl ServerState {
                 screen_shares: HashMap::new(),
                 persistent: false,
                 pseudonyms: HashMap::new(),
+                log_conv: String::new(),
             },
         );
+
+        // A channel's stored-message log exists where accounts and storage
+        // are on; `Channel::refresh_log` decides whether it is offered.
+        let logs = config.accounts.mode != crate::config::AccountsMode::Off && config.accounts.cloud;
 
         // Insert persistent channels from channels.json with IDs starting at 1
         let mut next_id: u32 = 1;
@@ -520,9 +617,7 @@ impl ServerState {
                         name: entry.name.clone(),
                         description: entry.description.clone(),
                         max_users: entry.max_users,
-                        user_count: 0,
                         has_password,
-                        created_by: None,
                         // A text channel has no voice, so no mode to serve.
                         proximity: if entry.text { ProximityMode::Off } else { proximity },
                         routed: entry.routed,
@@ -533,6 +628,10 @@ impl ServerState {
                         text: entry.text,
                         auto_join: entry.auto_join,
                         message_ttl_secs: entry.message_ttl_secs,
+                        announce: entry.announce && entry.text,
+                        slow_mode_secs: entry.slow_mode_secs.min(MAX_SLOW_MODE_SECS),
+                        nsfw: entry.nsfw,
+                        ..Default::default()
                     },
                     members: HashSet::new(),
                     password,
@@ -541,8 +640,12 @@ impl ServerState {
                     screen_shares: HashMap::new(),
                     persistent: true,
                     pseudonyms: HashMap::new(),
+                    log_conv: if logs { entry.log_conv() } else { String::new() },
                 },
             );
+            if let Some(ch) = channels.get_mut(&channel_id) {
+                ch.refresh_log();
+            }
         }
 
         Self {
@@ -561,7 +664,54 @@ impl ServerState {
             next_user_id: AtomicU32::new(1),
             next_channel_id: AtomicU32::new(next_id),
             routing: crate::routing::Routing::default(),
+            accounts: None,
+            account_sessions: DashMap::new(),
+            post_marks: DashMap::new(),
         }
+    }
+
+    /// Whether this session may write in `channel_id` now, live or into the
+    /// channel's stored log: a member there, the announcement rule, and slow
+    /// mode, whose clock starts when the post passes. Neither rule needs to
+    /// read a post: who writes where, and when, is all they are about, and
+    /// the relay has always seen that much. The channel's managers are held
+    /// to neither.
+    pub async fn post_rules(&self, session_id: SessionId, user_id: UserId, channel_id: ChannelId, stamp: PostStamp) -> Result<(), String> {
+        if channel_id == 0 {
+            return Err("Chat is not available in the lobby".into());
+        }
+        // The sender names the channel (they may be in several text channels
+        // at once), so membership is what decides whether they may write there.
+        if !self.is_member(channel_id, user_id).await {
+            return Err("you are not in that channel".into());
+        }
+        let rules = {
+            let channels = self.channels.read().await;
+            channels.get(&channel_id).map(|c| (c.info.announce, c.info.slow_mode_secs, c.info.created_by, c.info.name.clone()))
+        };
+        let Some((announce, slow_mode_secs, created_by, name)) = rules else {
+            return Err("you are not in that channel".into());
+        };
+        if !(announce || slow_mode_secs > 0) || self.may_manage(session_id, created_by) {
+            return Ok(());
+        }
+        if announce {
+            return Err(format!("only moderators can post in #{name}"));
+        }
+        let poster = match self.sessions.get(&session_id).and_then(|s| s.account_id()) {
+            Some(a) => Poster::Account(a),
+            None => Poster::Session(session_id),
+        };
+        let key = (channel_id, poster, stamp);
+        let now = Instant::now();
+        if let Some(wait) = slow_mode_wait(self.post_marks.get(&key).map(|t| *t), now, slow_mode_secs) {
+            return Err(format!("slow mode in #{name}: wait {wait} s"));
+        }
+        // Nothing older than the longest slow mode can still hold anybody back.
+        let longest = std::time::Duration::from_secs(MAX_SLOW_MODE_SECS.into());
+        self.post_marks.retain(|_, t| now.saturating_duration_since(*t) < longest);
+        self.post_marks.insert(key, now);
+        Ok(())
     }
 
     /// Forget every routing decision for one channel. Called when its `routed`
@@ -599,6 +749,20 @@ impl ServerState {
     }
 
     // ── Moderation ─────────────────────────────────────────────────────
+
+    /// Admin or moderator: kicks, bans and every channel's settings.
+    pub fn can_moderate(&self, session_id: SessionId) -> bool {
+        self.sessions.get(&session_id).is_some_and(|s| s.is_admin || s.is_moderator)
+    }
+
+    /// Whoever may change a channel's settings: its creator (`created_by`), an admin or a
+    /// moderator. They are also the ones an announcement channel lets post
+    /// and slow mode does not hold back.
+    pub fn may_manage(&self, session_id: SessionId, created_by: Option<UserId>) -> bool {
+        self.sessions
+            .get(&session_id)
+            .is_some_and(|s| s.is_admin || s.is_moderator || created_by == Some(s.user_id))
+    }
 
     /// Whether the session is logged in as admin.
     pub fn is_admin(&self, session_id: SessionId) -> bool {
@@ -700,6 +864,9 @@ impl ServerState {
                     is_screen_sharing: session.is_screen_sharing,
                     is_admin: session.is_admin,
                     shares_history: session.shares_history,
+                    // Never under a pseudonym: it would name the account.
+                    account: account_shown(session.account_id(), !anonymous, false),
+                    is_moderator: session.is_moderator,
                 })
             })
             .collect()
@@ -936,7 +1103,14 @@ impl ServerState {
 
         self.routing.clear_session(session_id);
         self.user_to_session.remove(&session.user_id);
-        self.username_to_session.remove(&session.username.to_lowercase());
+        // Only if it is still ours: an account signing in again elsewhere
+        // took the name over, and this cleanup runs after that.
+        self.username_to_session.remove_if(&session.username.to_lowercase(), |_, sid| *sid == session_id);
+        if let Some(a) = &session.account {
+            self.account_sessions.remove_if(&a.user.id.0, |_, sid| *sid == session_id);
+        }
+        // A guest's slow-mode clock goes with its connection; an account's stays.
+        self.post_marks.retain(|(_, p, _), _| *p != Poster::Session(session_id));
 
         // Remove from channel
         let mut channels = self.channels.write().await;
@@ -993,8 +1167,10 @@ impl ServerState {
             anyhow::bail!("maximum number of channels reached");
         }
 
-        // Check for duplicate names
-        if channels.values().any(|ch| ch.info.name == name) {
+        // Check for duplicate names, ignoring case as channels.json does: a
+        // made-up "Announcements" beside the real "announcements" is a look-alike.
+        let lower = name.to_lowercase();
+        if channels.values().any(|ch| ch.info.name.to_lowercase() == lower) {
             anyhow::bail!("a channel with that name already exists");
         }
 
@@ -1013,25 +1189,22 @@ impl ServerState {
         let info = ChannelInfo {
             channel_id,
             name,
-            description: String::new(),
-            max_users: 0,
-            user_count: 0,
             has_password,
             created_by: Some(created_by),
             proximity,
             // A user-created channel is an ordinary room; the rest are set
             // afterwards through SetChannelOptions.
-            routed: false,
-            hidden: false,
             anonymous,
             screen_share: !text,
-            hide_members: false,
             text,
             // Only a channel from channels.json can ask every client to join
             // it; a user-created one is joined by the people who want it.
             auto_join: false,
             // Off until somebody sets it, like every other option here.
             message_ttl_secs: 0,
+            // A temporary channel keeps nothing: it is gone when it empties.
+            log: String::new(),
+            ..Default::default()
         };
 
         channels.insert(
@@ -1045,6 +1218,7 @@ impl ServerState {
                 screen_shares: HashMap::new(),
                 persistent: false,
                 pseudonyms: HashMap::new(),
+                log_conv: String::new(),
             },
         );
 
@@ -1162,14 +1336,20 @@ impl ServerState {
         &self,
         channel_id: ChannelId,
         user_id: UserId,
-        hidden: Option<bool>,
-        anonymous: Option<bool>,
-        screen_share: Option<bool>,
-        hide_members: Option<bool>,
-        routed: Option<bool>,
-        message_ttl_secs: Option<u32>,
+        request: ChannelOptions,
         is_admin: bool,
     ) -> anyhow::Result<(ChannelInfo, OptionsChanged)> {
+        let ChannelOptions {
+            hidden,
+            anonymous,
+            screen_share,
+            hide_members,
+            routed,
+            message_ttl_secs,
+            announce,
+            slow_mode_secs,
+            nsfw,
+        } = request;
         if channel_id == 0 {
             anyhow::bail!("cannot modify the General channel");
         }
@@ -1187,6 +1367,21 @@ impl ServerState {
         // apply there — and turning screen share "on" in one would advertise
         // something the share path refuses anyway.
         let voice = !channel.info.text;
+
+        // Everything that can be refused is refused before anything changes:
+        // a request that fails halfway would leave the channel with part of
+        // it applied and nobody told, because the error is all that is sent.
+        if anonymous == Some(true) && !voice {
+            // Same reason as at creation: a text channel's members are in other
+            // channels at the same time, where the same ids carry real names.
+            anyhow::bail!("a text channel cannot be anonymous");
+        }
+        if announce == Some(true) && voice {
+            anyhow::bail!("only a text channel can be an announcement channel");
+        }
+        if slow_mode_secs.is_some_and(|v| v > MAX_SLOW_MODE_SECS) {
+            anyhow::bail!("slow mode can be at most 6 hours");
+        }
 
         let mut changed = OptionsChanged::default();
 
@@ -1225,12 +1420,19 @@ impl ServerState {
             changed.any |= channel.info.message_ttl_secs != v;
             channel.info.message_ttl_secs = v;
         }
+        if let Some(v) = announce {
+            changed.any |= channel.info.announce != v;
+            channel.info.announce = v;
+        }
+        if let Some(v) = slow_mode_secs {
+            changed.any |= channel.info.slow_mode_secs != v;
+            channel.info.slow_mode_secs = v;
+        }
+        if let Some(v) = nsfw {
+            changed.any |= channel.info.nsfw != v;
+            channel.info.nsfw = v;
+        }
         if let Some(v) = anonymous {
-            // Same reason as at creation: a text channel's members are in other
-            // channels at the same time, where the same ids carry real names.
-            if v && channel.info.text {
-                anyhow::bail!("a text channel cannot be anonymous");
-            }
             if v != channel.info.anonymous {
                 changed.any = true;
                 changed.anonymity = true;
@@ -1247,6 +1449,9 @@ impl ServerState {
                 }
             }
         }
+        // ponytail: a log switched off this way keeps its stored members and
+        // entries until they expire; clients just stop writing to it.
+        channel.refresh_log();
 
         Ok((channel.info.clone(), changed))
     }
@@ -1315,7 +1520,8 @@ impl ServerState {
         channel_id: ChannelId,
         requester_id: UserId,
         target_id: UserId,
-        requester_is_admin: bool,
+        requester_moderates: bool,
+        target_spared: bool,
     ) -> anyhow::Result<(SessionId, usize)> {
         if channel_id == 0 {
             anyhow::bail!("cannot kick users from the General channel");
@@ -1330,8 +1536,12 @@ impl ServerState {
             .get_mut(&channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel does not exist"))?;
 
-        if !requester_is_admin && channel.info.created_by != Some(requester_id) {
+        let creator = channel.info.created_by == Some(requester_id);
+        if !requester_moderates && !creator {
             anyhow::bail!("only the channel creator can kick users");
+        }
+        if target_spared && !creator {
+            anyhow::bail!("only an admin can kick an admin or a moderator");
         }
 
         if !channel.members.remove(&target_id) {
@@ -1815,20 +2025,7 @@ pub(crate) mod test_support {
             info: ChannelInfo {
                 channel_id,
                 name: format!("test-{channel_id}"),
-                description: String::new(),
-                max_users: 0,
-                user_count: 0,
-                has_password: false,
-                created_by: None,
-                proximity: ProximityMode::Off,
-                message_ttl_secs: 0,
-                routed: false,
-                hidden: false,
-                anonymous: false,
-                screen_share: true,
-                hide_members: false,
-                text: false,
-                auto_join: false,
+                ..Default::default()
             },
             members: HashSet::new(),
             password: None,
@@ -1837,6 +2034,7 @@ pub(crate) mod test_support {
             screen_shares: HashMap::new(),
             persistent: false,
             pseudonyms: HashMap::new(),
+            log_conv: String::new(),
         });
         for &(user_id, session_id) in users {
             channel.members.insert(user_id);
@@ -2254,7 +2452,7 @@ mod tests {
         state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
         state.routing.set_filter(alice_sid, Some(vec![7]));
         state
-            .set_channel_options(ch.channel_id, alice, None, None, None, None, Some(false), None, false)
+            .set_channel_options(ch.channel_id, alice, ChannelOptions { routed: Some(false), ..Default::default() }, false)
             .await
             .unwrap();
         assert!(
@@ -2290,7 +2488,7 @@ mod tests {
         state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
 
         let (on, changed) = state
-            .set_channel_options(ch.channel_id, alice, None, Some(true), None, None, None, None, false)
+            .set_channel_options(ch.channel_id, alice, ChannelOptions { anonymous: Some(true), ..Default::default() }, false)
             .await
             .unwrap();
         assert!(on.anonymous);
@@ -2300,13 +2498,13 @@ mod tests {
         // Setting it to what it already holds moves nothing, so nobody has to
         // be told and no roster has to be rebuilt.
         let (_, again) = state
-            .set_channel_options(ch.channel_id, alice, None, Some(true), None, None, None, None, false)
+            .set_channel_options(ch.channel_id, alice, ChannelOptions { anonymous: Some(true), ..Default::default() }, false)
             .await
             .unwrap();
         assert!(!again.any && !again.anonymity);
 
         let (off, changed) = state
-            .set_channel_options(ch.channel_id, alice, None, Some(false), None, None, None, None, false)
+            .set_channel_options(ch.channel_id, alice, ChannelOptions { anonymous: Some(false), ..Default::default() }, false)
             .await
             .unwrap();
         assert!(!off.anonymous);
@@ -2326,27 +2524,27 @@ mod tests {
 
         // The creator may, a stranger may not, an admin may
         let (updated, _) = state
-            .set_channel_options(ch.channel_id, alice, Some(true), None, Some(false), Some(true), None, None, false)
+            .set_channel_options(ch.channel_id, alice, ChannelOptions { hidden: Some(true), screen_share: Some(false), hide_members: Some(true), ..Default::default() }, false)
             .await
             .unwrap();
         assert!(updated.hidden && updated.hide_members && !updated.screen_share);
         assert!(state
-            .set_channel_options(ch.channel_id, bob, Some(false), None, None, None, None, None, false)
+            .set_channel_options(ch.channel_id, bob, ChannelOptions { hidden: Some(false), ..Default::default() }, false)
             .await
             .is_err());
         assert!(state
-            .set_channel_options(ch.channel_id, bob, Some(false), None, None, None, None, None, true)
+            .set_channel_options(ch.channel_id, bob, ChannelOptions { hidden: Some(false), ..Default::default() }, true)
             .await
             .is_ok());
         // Never the General channel
         assert!(state
-            .set_channel_options(0, alice, Some(true), None, None, None, None, None, true)
+            .set_channel_options(0, alice, ChannelOptions { hidden: Some(true), ..Default::default() }, true)
             .await
             .is_err());
 
         // None leaves an option alone
         let (before, changed) = state
-            .set_channel_options(ch.channel_id, alice, None, None, None, None, None, None, false)
+            .set_channel_options(ch.channel_id, alice, ChannelOptions::default(), false)
             .await
             .unwrap();
         assert!(!before.hidden, "hidden was set to false above");
@@ -2368,7 +2566,7 @@ mod tests {
         assert_eq!(ch.message_ttl_secs, 0, "a new channel has no timer");
 
         let (updated, changed) = state
-            .set_channel_options(ch.channel_id, alice, None, None, None, None, None, Some(3600), false)
+            .set_channel_options(ch.channel_id, alice, ChannelOptions { message_ttl_secs: Some(3600), ..Default::default() }, false)
             .await
             .unwrap();
         assert_eq!(updated.message_ttl_secs, 3600);
@@ -2377,25 +2575,99 @@ mod tests {
         // Setting the same value again announces nothing: this goes to every
         // session on the server.
         let (_, changed) = state
-            .set_channel_options(ch.channel_id, alice, None, None, None, None, None, Some(3600), false)
+            .set_channel_options(ch.channel_id, alice, ChannelOptions { message_ttl_secs: Some(3600), ..Default::default() }, false)
             .await
             .unwrap();
         assert!(!changed.any);
 
         // A year is "never" dressed up as a setting.
         let (updated, _) = state
-            .set_channel_options(ch.channel_id, alice, None, None, None, None, None, Some(u32::MAX), false)
+            .set_channel_options(ch.channel_id, alice, ChannelOptions { message_ttl_secs: Some(u32::MAX), ..Default::default() }, false)
             .await
             .unwrap();
         assert_eq!(updated.message_ttl_secs, 30 * 24 * 60 * 60);
 
         // And it can be switched off again.
         let (updated, changed) = state
-            .set_channel_options(ch.channel_id, alice, None, None, None, None, None, Some(0), false)
+            .set_channel_options(ch.channel_id, alice, ChannelOptions { message_ttl_secs: Some(0), ..Default::default() }, false)
             .await
             .unwrap();
         assert_eq!(updated.message_ttl_secs, 0);
         assert!(changed.any);
+    }
+
+    /// A request that is refused leaves the channel exactly as it was: the
+    /// error is all its sender is told, so half of it applied would be a
+    /// change nobody knows about.
+    #[tokio::test]
+    async fn a_refused_options_request_changes_nothing() {
+        let state = make_state();
+        let (alice, _) = add_user(&state, "alice");
+        let voice = state
+            .create_channel("Room".into(), None, ProximityMode::Off, false, false, alice)
+            .await
+            .unwrap();
+        let text = state
+            .create_channel("news".into(), None, ProximityMode::Off, false, true, alice)
+            .await
+            .unwrap();
+        let hidden_of = |id: ChannelId| {
+            let state = &state;
+            async move { state.channels.read().await[&id].info.hidden }
+        };
+
+        // A voice room has no posts of its own to reserve for its managers
+        let err = state
+            .set_channel_options(voice.channel_id, alice, ChannelOptions { hidden: Some(true), announce: Some(true), ..Default::default() }, false)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("text channel"), "{err}");
+        assert!(!hidden_of(voice.channel_id).await, "hidden was applied before the refusal");
+
+        // The text channel's old refusal used to come after the rest had moved
+        assert!(state
+            .set_channel_options(text.channel_id, alice, ChannelOptions { hidden: Some(true), anonymous: Some(true), ..Default::default() }, false)
+            .await
+            .is_err());
+        assert!(!hidden_of(text.channel_id).await, "hidden was applied before the refusal");
+
+        assert!(state
+            .set_channel_options(text.channel_id, alice, ChannelOptions { hidden: Some(true), slow_mode_secs: Some(MAX_SLOW_MODE_SECS + 1), ..Default::default() }, false)
+            .await
+            .is_err());
+        assert!(!hidden_of(text.channel_id).await, "hidden was applied before the refusal");
+
+        // What does apply, applies — and says so once
+        let (updated, changed) = state
+            .set_channel_options(text.channel_id, alice, ChannelOptions { announce: Some(true), slow_mode_secs: Some(30), nsfw: Some(true), ..Default::default() }, false)
+            .await
+            .unwrap();
+        assert!(updated.announce && updated.nsfw && updated.slow_mode_secs == 30);
+        assert!(changed.any);
+        let (_, changed) = state
+            .set_channel_options(text.channel_id, alice, ChannelOptions { announce: Some(true), slow_mode_secs: Some(30), nsfw: Some(true), ..Default::default() }, false)
+            .await
+            .unwrap();
+        assert!(!changed.any);
+        let (updated, _) = state
+            .set_channel_options(voice.channel_id, alice, ChannelOptions { nsfw: Some(true), slow_mode_secs: Some(5), ..Default::default() }, false)
+            .await
+            .unwrap();
+        assert!(updated.nsfw && updated.slow_mode_secs == 5, "a voice room's chat can be paced and marked 18+");
+    }
+
+    #[test]
+    fn slow_mode_wait_counts_from_the_last_post_with_a_little_grace() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + std::time::Duration::from_millis(ms);
+        assert_eq!(slow_mode_wait(None, at(0), 30), None, "a first post is never held back");
+        assert_eq!(slow_mode_wait(Some(t0), at(5_000), 0), None, "0 is off");
+        assert_eq!(slow_mode_wait(Some(t0), at(0), 30), Some(30));
+        assert_eq!(slow_mode_wait(Some(t0), at(10_000), 30), Some(20));
+        // Half a second short is network jitter, not impatience
+        assert_eq!(slow_mode_wait(Some(t0), at(29_500), 30), None);
+        assert_eq!(slow_mode_wait(Some(t0), at(29_400), 30), Some(1));
+        assert_eq!(slow_mode_wait(Some(t0), at(31_000), 30), None);
     }
 
     #[tokio::test]
@@ -2408,7 +2680,7 @@ mod tests {
             .unwrap();
         state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
         state
-            .set_channel_options(ch.channel_id, alice, None, None, Some(false), None, None, None, false)
+            .set_channel_options(ch.channel_id, alice, ChannelOptions { screen_share: Some(false), ..Default::default() }, false)
             .await
             .unwrap();
 
@@ -2423,7 +2695,7 @@ mod tests {
 
         // Switched back on, sharing works
         state
-            .set_channel_options(ch.channel_id, alice, None, None, Some(true), None, None, None, false)
+            .set_channel_options(ch.channel_id, alice, ChannelOptions { screen_share: Some(true), ..Default::default() }, false)
             .await
             .unwrap();
         assert!(state
@@ -2449,7 +2721,7 @@ mod tests {
             .unwrap();
 
         state
-            .set_channel_options(ch.channel_id, alice, None, None, Some(false), None, None, None, false)
+            .set_channel_options(ch.channel_id, alice, ChannelOptions { screen_share: Some(false), ..Default::default() }, false)
             .await
             .unwrap();
         let sharers: Vec<UserId> = {
@@ -2474,7 +2746,7 @@ mod tests {
             .unwrap();
         state.join_channel(alice, alice_sid, ch.channel_id, None).await.unwrap();
         state
-            .set_channel_options(ch.channel_id, alice, None, None, None, Some(true), None, None, false)
+            .set_channel_options(ch.channel_id, alice, ChannelOptions { hide_members: Some(true), ..Default::default() }, false)
             .await
             .unwrap();
 
@@ -2787,7 +3059,7 @@ mod tests {
             .await
             .unwrap();
         let err = state
-            .set_channel_options(ch.channel_id, alice, None, Some(true), None, None, None, None, false)
+            .set_channel_options(ch.channel_id, alice, ChannelOptions { anonymous: Some(true), ..Default::default() }, false)
             .await
             .unwrap_err()
             .to_string();
@@ -2865,7 +3137,7 @@ mod tests {
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
         let (uid2, sid2) = add_user(&state, "bob");
         state.join_channel(uid2, sid2, ch.channel_id, None).await.unwrap();
-        let (kicked_sid, remaining) = state.kick_user(ch.channel_id, uid, uid2, false).await.unwrap();
+        let (kicked_sid, remaining) = state.kick_user(ch.channel_id, uid, uid2, false, false).await.unwrap();
         assert_eq!(kicked_sid, sid2);
         assert_eq!(remaining, 1);
     }
@@ -2876,7 +3148,7 @@ mod tests {
         let (uid, sid) = add_user(&state, "alice");
         let ch = state.create_channel("Room".into(), None, ProximityMode::Off, false, false, uid).await.unwrap();
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
-        let err = state.kick_user(ch.channel_id, uid, uid, false).await;
+        let err = state.kick_user(ch.channel_id, uid, uid, false, false).await;
         assert!(err.unwrap_err().to_string().contains("yourself"));
     }
 
@@ -2888,7 +3160,7 @@ mod tests {
         state.join_channel(uid, sid, ch.channel_id, None).await.unwrap();
         let (uid2, sid2) = add_user(&state, "bob");
         state.join_channel(uid2, sid2, ch.channel_id, None).await.unwrap();
-        let err = state.kick_user(ch.channel_id, uid2, uid, false).await;
+        let err = state.kick_user(ch.channel_id, uid2, uid, false, false).await;
         assert!(err.unwrap_err().to_string().contains("creator"));
     }
 

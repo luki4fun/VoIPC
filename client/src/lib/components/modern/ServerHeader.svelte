@@ -8,6 +8,7 @@
   import { disconnectServer, serverEntries } from "../../connect.js";
   import { playDisconnectedSound } from "../../sounds.js";
   import { updateUiPrefs } from "../../stores/ui-prefs.js";
+  import { account, showPrompt } from "../../stores/account.js";
   import Icon from "../Icons.svelte";
 
   interface Props {
@@ -58,6 +59,18 @@
         >
           <Icon name="user-plus" size={16} />
           <span>Invite people</span>
+        </button>
+      {/if}
+      {#if $account}
+        <button
+          class="menu-item"
+          onclick={() => {
+            open = false;
+            showPrompt({ kind: "account", server: $serverAddress });
+          }}
+        >
+          <Icon name="lock" size={16} />
+          <span>Your account</span>
         </button>
       {/if}
       <button

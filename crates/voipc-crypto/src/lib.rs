@@ -7,13 +7,19 @@
 //! - Group encryption via Sender Keys
 //! - Symmetric AES-256-GCM encryption for voice/video media
 //!
-//! Signal state is deliberately not persisted: identities are ephemeral per
-//! launch (no accounts, nothing to fingerprint or link across sessions).
+//! Signal state is deliberately not persisted: a guest's identity is new on
+//! every connect (nothing to fingerprint or link across sessions). An
+//! account's identity lives in its vault (`account`), and peers pin it.
 
+pub mod account;
+pub mod account_session;
+mod aead;
 pub mod channel_state;
 pub mod envelope;
 pub mod group;
 pub mod identity;
+pub mod log;
+pub mod sync;
 pub mod media_keys;
 pub mod prekey;
 pub mod session;

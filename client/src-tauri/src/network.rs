@@ -21,7 +21,7 @@ use voipc_crypto::media_keys::{MediaKey, MediaKeyRing};
 use voipc_protocol::codec::{
     decode_server_msg, encode_client_msg, try_decode_frame, APP_VERSION, PROTOCOL_VERSION,
 };
-use voipc_protocol::messages::{ClientMessage, ServerMessage};
+use voipc_protocol::messages::{AuthStep, ClientMessage, ServerMessage};
 use voipc_protocol::types::*;
 use voipc_protocol::video::{
     FrameAssembler, FrameGrouper, ScreenShareAudioPacket, VideoPacket, SCREEN_AUDIO_HEADER_SIZE,
@@ -57,6 +57,7 @@ pub async fn connect_to_server(
     address: String,
     username: String,
     accept_invalid_certs: bool,
+    account: Option<crate::account::AccountArgs>,
 ) -> Result<u32, String> {
     // Serialize connects to this server: the reconnect loop and a manual
     // connect can race, and the map lock is not held through the network
@@ -79,10 +80,10 @@ pub async fn connect_to_server(
         info!(server = %address, "cleaned up stale connection before reconnecting");
     }
 
-    // Fresh Signal identity per connection (ephemeral by design — no accounts,
-    // nothing to fingerprint). Also required for correctness: the server
-    // reassigns user ids on restart, and libsignal pins identities to
-    // "user_N", so a kept store would reject the new holder of an old id.
+    // Signal stores are this connection's own, always: the server reassigns
+    // user ids on restart, and libsignal pins identities to "user_N", so a kept
+    // store would reject the new holder of an old id. What an account keeps
+    // across connections is only its identity key, from its vault.
     let signal = Arc::new(std::sync::Mutex::new(SignalState::default()));
 
     let (host, port) = parse_address(&address)?;
@@ -95,137 +96,91 @@ pub async fn connect_to_server(
         mut control_recv,
     } = crate::transport::connect(&host, port, accept_invalid_certs).await?;
 
-    // Initialize Signal Protocol state if not already done
-    {
-        let mut signal = signal.lock().map_err(|e| e.to_string())?;
-        if !signal.initialized {
-            info!("initializing Signal Protocol state");
-            let identity_key_pair = voipc_crypto::generate_identity_key_pair();
-            let registration_id: u32 = rand::Rng::gen(&mut rand::thread_rng());
-            let mut stores =
-                voipc_crypto::SignalStores::new(&identity_key_pair, registration_id);
-
-            // Generate prekeys synchronously (libsignal stores are !Send)
-            let _prekey_set = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(
-                    voipc_crypto::prekey::generate_prekeys(
-                        &mut stores,
-                        &identity_key_pair,
-                        1,
-                        voipc_crypto::prekey::INITIAL_PREKEY_COUNT,
-                    ),
-                )
-            })
-            .map_err(|e| format!("failed to generate prekeys: {e}"))?;
-
-            signal.stores = Some(stores);
-            signal.initialized = true;
-            info!("Signal Protocol state initialized");
+    // Whatever arrives after the sign-in in the same read goes on to the
+    // reader with the rest.
+    let mut buf = BytesMut::with_capacity(4096);
+    // Guests get a fresh identity per connection (ephemeral by design); an
+    // account's comes out of its vault during the sign-in, and its stores are
+    // made then (`account::sign_in` calls `init_signal` itself).
+    let (user_id, session_id, account) = match account {
+        Some(args) => {
+            let (user_id, session_id, link) = crate::account::sign_in(
+                state,
+                &app_handle,
+                &address,
+                &username,
+                args,
+                &signal,
+                &mut control_send,
+                &mut control_recv,
+                &mut buf,
+            )
+            .await?;
+            (user_id, session_id, Some(link))
         }
-    }
-
-    // Extract identity key and prekey bundle from Signal stores for authentication
-    let (identity_key, prekey_bundle) = {
-        let signal = signal.lock().map_err(|e| e.to_string())?;
-        if let Some(ref stores) = signal.stores {
-            let ik_bytes = stores.identity.key_pair.public_key.clone();
-
-            // Extract signed prekey from the store
-            let signed_prekey_data = tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    use libsignal_protocol::{GenericSignedPreKey, SignedPreKeyId, SignedPreKeyStore};
-                    let record = stores
-                        .signed_prekey
-                        .get_signed_pre_key(SignedPreKeyId::from(1u32))
-                        .await
-                        .ok()?;
-                    let pub_key = record.public_key().ok()?.serialize().to_vec();
-                    let signature = record.signature().ok()?.to_vec();
-                    Some((pub_key, signature))
-                })
-            });
-
-            let (spk_public, spk_signature) = match signed_prekey_data {
-                Some(data) => data,
-                None => {
-                    warn!("failed to extract signed prekey — bundle will have empty signed prekey");
-                    (Vec::new(), Vec::new())
-                }
+        None => {
+            let (identity_key, prekey_bundle) = {
+                let bundle = init_signal(&signal, &voipc_crypto::generate_identity_key_pair())?;
+                (Some(bundle.identity_key.clone()), Some(bundle))
             };
+            let auth_msg = ClientMessage::Authenticate {
+                username: username.clone(),
+                protocol_version: PROTOCOL_VERSION,
+                app_version: APP_VERSION.to_string(),
+                identity_key,
+                prekey_bundle,
+                account: None,
+            };
+            let data =
+                encode_client_msg(&auth_msg).map_err(|e| format!("Failed to encode auth: {}", e))?;
+            control_send
+                .write_all(&data)
+                .await
+                .map_err(|e| format!("Failed to send auth: {}", e))?;
 
-            // Extract one-time prekeys from the store
-            let mut one_time_prekeys = Vec::new();
-            for (&id, bytes) in &stores.prekey.prekeys {
-                if let Ok(record) = libsignal_protocol::PreKeyRecord::deserialize(bytes) {
-                    if let Ok(pub_key) = record.public_key() {
-                        one_time_prekeys.push(OneTimePreKey {
-                            id,
-                            public_key: pub_key.serialize().to_vec(),
-                        });
+            // Read until we get the Authenticated or AuthError response
+            let (user_id, session_id) = loop {
+                let n = tokio::time::timeout(CONNECT_TIMEOUT, control_recv.read_buf(&mut buf))
+                    .await
+                    .map_err(|_| "Timed out waiting for the authentication response".to_string())?
+                    .map_err(|e| format!("Failed to read auth response: {}", e))?;
+
+                if n == 0 {
+                    return Err("Server closed connection during authentication".into());
+                }
+
+                if let Some(payload) =
+                    try_decode_frame(&mut buf).map_err(|e| format!("Frame decode error: {}", e))?
+                {
+                    let msg = decode_server_msg(&payload)
+                        .map_err(|e| format!("Failed to decode response: {}", e))?;
+
+                    match msg {
+                        ServerMessage::Authenticated {
+                            user_id,
+                            session_id,
+                            accounts,
+                            ..
+                        } => {
+                            // A guest on a relay with accounts: the UI can offer one.
+                            if let Some(accounts) = accounts {
+                                emit_server(&app_handle, &address, "relay-accounts", accounts);
+                            }
+                            break (user_id, session_id);
+                        }
+                        ServerMessage::AuthError { reason } => {
+                            return Err(format!("Authentication failed: {}", reason));
+                        }
+                        ServerMessage::AuthStep(AuthStep::AccountRequired { .. }) => {
+                            return Err(crate::account::ACCOUNT_REQUIRED.into());
+                        }
+                        other => {
+                            warn!("unexpected message during auth: {:?}", other);
+                        }
                     }
                 }
-            }
-
-            let bundle = PreKeyBundleData {
-                registration_id: stores.identity.registration_id,
-                device_id: 1,
-                identity_key: ik_bytes.clone(),
-                signed_prekey_id: 1,
-                signed_prekey: spk_public,
-                signed_prekey_signature: spk_signature,
-                prekeys: one_time_prekeys,
             };
-
-            (Some(ik_bytes), Some(bundle))
-        } else {
-            (None, None)
-        }
-    };
-
-    let auth_msg = ClientMessage::Authenticate {
-        username: username.clone(),
-        protocol_version: PROTOCOL_VERSION,
-        app_version: APP_VERSION.to_string(),
-        identity_key,
-        prekey_bundle,
-    };
-    let data =
-        encode_client_msg(&auth_msg).map_err(|e| format!("Failed to encode auth: {}", e))?;
-    control_send
-        .write_all(&data)
-        .await
-        .map_err(|e| format!("Failed to send auth: {}", e))?;
-
-    // Read until we get the Authenticated or AuthError response
-    let mut buf = BytesMut::with_capacity(4096);
-    let (user_id, session_id) = loop {
-        let n = tokio::time::timeout(CONNECT_TIMEOUT, control_recv.read_buf(&mut buf))
-            .await
-            .map_err(|_| "Timed out waiting for the authentication response".to_string())?
-            .map_err(|e| format!("Failed to read auth response: {}", e))?;
-
-        if n == 0 {
-            return Err("Server closed connection during authentication".into());
-        }
-
-        if let Some(payload) =
-            try_decode_frame(&mut buf).map_err(|e| format!("Frame decode error: {}", e))?
-        {
-            let msg = decode_server_msg(&payload)
-                .map_err(|e| format!("Failed to decode response: {}", e))?;
-
-            match msg {
-                ServerMessage::Authenticated {
-                    user_id,
-                    session_id,
-                } => break (user_id, session_id),
-                ServerMessage::AuthError { reason } => {
-                    return Err(format!("Authentication failed: {}", reason));
-                }
-                other => {
-                    warn!("unexpected message during auth: {:?}", other);
-                }
-            }
+            (user_id, session_id, None)
         }
     };
 
@@ -390,7 +345,11 @@ pub async fn connect_to_server(
         is_voice.clone(),
         voice_asked_at.clone(),
         transmitting.clone(),
+        account.clone(),
     ));
+    if let Some(link) = &account {
+        crate::account::after_connect(&app_handle, &address, link, &tcp_tx).await;
+    }
     let video_decode_handle = tokio::task::spawn_blocking({
         let app_handle = app_handle.clone();
         let watching_uid = watching_user_id_shared.clone();
@@ -494,6 +453,7 @@ pub async fn connect_to_server(
     // Store the active connection
     let tcp = tcp_tx.clone();
     let connection = ActiveConnection {
+        account: account.clone(),
         user_id,
         username,
         server_address: address.clone(),
@@ -799,6 +759,14 @@ fn voice_ask_fresh(asked_at: u64, now: u64) -> bool {
 }
 
 /// Send a client message over the control stream.
+/// `send_tcp_message` for a caller that is not async; a failure is a closed
+/// connection, which its reader reports.
+pub fn send_tcp_message_sync(tcp_tx: &mpsc::UnboundedSender<Vec<u8>>, msg: &ClientMessage) {
+    if let Ok(data) = encode_client_msg(msg) {
+        let _ = tcp_tx.send(data);
+    }
+}
+
 pub async fn send_tcp_message(
     tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
     msg: &ClientMessage,
@@ -938,6 +906,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     is_voice: Arc<AtomicBool>,
     voice_asked_at: Arc<AtomicU64>,
     transmitting: Arc<AtomicBool>,
+    account: Option<Arc<crate::account::AccountLink>>,
 ) {
     'read: loop {
         match read_half.read_buf(&mut buf).await {
@@ -988,8 +957,10 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
                             &is_voice,
                             &voice_asked_at,
                             &transmitting,
+                            account.as_deref(),
                         )
                         .await;
+                        crate::account::check_seen(&app_handle, &server, account.as_deref(), &signal, &tcp_tx).await;
                     }
                     Err(e) => warn!("failed to decode server message: {}", e),
                 },
@@ -1166,6 +1137,74 @@ fn apply_channel_proximity(
     }
 }
 
+/// Signal stores for `identity` with a fresh signed pre-key and one-time
+/// pre-keys, kept in `signal`, and the bundle the server hands to peers.
+pub(crate) fn init_signal(
+    signal: &Arc<std::sync::Mutex<SignalState>>,
+    identity_key_pair: &libsignal_protocol::IdentityKeyPair,
+) -> Result<PreKeyBundleData, String> {
+    let mut signal = signal.lock().map_err(|e| e.to_string())?;
+    info!("initializing Signal Protocol state");
+    let registration_id: u32 = rand::Rng::gen(&mut rand::thread_rng());
+    let mut stores = voipc_crypto::SignalStores::new(identity_key_pair, registration_id);
+
+    // Generate prekeys synchronously (libsignal stores are !Send)
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(voipc_crypto::prekey::generate_prekeys(
+            &mut stores,
+            identity_key_pair,
+            1,
+            voipc_crypto::prekey::INITIAL_PREKEY_COUNT,
+        ))
+    })
+    .map_err(|e| format!("failed to generate prekeys: {e}"))?;
+
+    let ik_bytes = stores.identity.key_pair.public_key.clone();
+
+    // Extract signed prekey from the store
+    let signed_prekey_data = tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(async {
+            use libsignal_protocol::{GenericSignedPreKey, SignedPreKeyId, SignedPreKeyStore};
+            let record = stores.signed_prekey.get_signed_pre_key(SignedPreKeyId::from(1u32)).await.ok()?;
+            let pub_key = record.public_key().ok()?.serialize().to_vec();
+            let signature = record.signature().ok()?.to_vec();
+            Some((pub_key, signature))
+        })
+    });
+
+    let (spk_public, spk_signature) = match signed_prekey_data {
+        Some(data) => data,
+        None => {
+            warn!("failed to extract signed prekey — bundle will have empty signed prekey");
+            (Vec::new(), Vec::new())
+        }
+    };
+
+    // Extract one-time prekeys from the store
+    let mut one_time_prekeys = Vec::new();
+    for (&id, bytes) in &stores.prekey.prekeys {
+        if let Ok(record) = libsignal_protocol::PreKeyRecord::deserialize(bytes) {
+            if let Ok(pub_key) = record.public_key() {
+                one_time_prekeys.push(OneTimePreKey { id, public_key: pub_key.serialize().to_vec() });
+            }
+        }
+    }
+
+    let bundle = PreKeyBundleData {
+        registration_id: stores.identity.registration_id,
+        device_id: 1,
+        identity_key: ik_bytes,
+        signed_prekey_id: 1,
+        signed_prekey: spk_public,
+        signed_prekey_signature: spk_signature,
+        prekeys: one_time_prekeys,
+    };
+    signal.stores = Some(stores);
+    signal.initialized = true;
+    info!("Signal Protocol state initialized");
+    Ok(bundle)
+}
+
 /// Dispatch a server message to the appropriate Tauri event.
 /// Also handles E2E encryption orchestration (session establishment, sender key
 /// distribution, and automatic decryption of encrypted messages).
@@ -1190,10 +1229,21 @@ async fn handle_server_message(
     is_voice: &Arc<AtomicBool>,
     voice_asked_at: &AtomicU64,
     transmitting: &Arc<AtomicBool>,
+    account: Option<&crate::account::AccountLink>,
 ) {
     // Everything a game hears about comes from the voice connection only: a
     // user id here means nothing on the server the game is playing on.
     let in_voice = || is_voice.load(Ordering::Relaxed);
+    // Who is which account, for the pins. The server never sends an account
+    // behind a pseudonym, so an anonymous channel adds nothing here.
+    let seen: &[UserInfo] = match &msg {
+        ServerMessage::UserList { users, .. } => users,
+        ServerMessage::UserJoined { user } => std::slice::from_ref(user),
+        _ => &[],
+    };
+    if let Some(link) = account {
+        link.session().note_roster(seen);
+    }
     match msg {
         ServerMessage::VideoLossReported {
             viewer_user_id,
@@ -1237,6 +1287,19 @@ async fn handle_server_message(
             emit_server(app_handle, server, "channel-list", &channels);
         }
         ServerMessage::UserList { channel_id, users } => {
+            // In a channel with a log: keep it (with cloud copies on), and
+            // read what it kept since last time.
+            if let Some(link) = account {
+                let log = channels_snapshot
+                    .lock()
+                    .ok()
+                    .and_then(|c| c.iter().find(|ch| ch.channel_id == channel_id).map(|ch| ch.log.clone()))
+                    .unwrap_or_default();
+                if !log.is_empty() {
+                    let a = link.session().enter(&log);
+                    crate::account::run(app_handle, server, tcp_tx, a).await;
+                }
+            }
             // A text channel is a subscription: it does not move us, so none
             // of the channel-change teardown below applies — no media key, no
             // room, no screen share, and the channel we stand in is untouched.
@@ -1884,6 +1947,11 @@ async fn handle_server_message(
         }
         // ── E2E Encryption: PreKeyBundle → establish session + distribute sender keys ──
         ServerMessage::PreKeyBundle { user_id, bundle } => {
+            // Their identity against the one first seen for their account.
+            if let Some(link) = account {
+                let a = link.session().check_identity(user_id, &bundle.identity_key);
+                crate::account::run(app_handle, server, tcp_tx, a).await;
+            }
             handle_prekey_bundle(
                 user_id,
                 &bundle,
@@ -1902,11 +1970,14 @@ async fn handle_server_message(
             sig.pending_sessions.remove(&user_id);
         }
         ServerMessage::DirectMessageUndelivered { target_user_id } => {
+            // Between two accounts with cloud copies on, it went into the stored
+            // log as well (send_direct_message): they read it when they are back.
+            let kept = account.is_some_and(|l| l.session().kept_for(target_user_id));
             emit_server(
                 app_handle,
                 server,
                 "dm-undelivered",
-                serde_json::json!({"user_id": target_user_id}),
+                serde_json::json!({"user_id": target_user_id, "kept": kept}),
             );
         }
         ServerMessage::IdentityKeyChanged {
@@ -2058,7 +2129,11 @@ async fn handle_server_message(
                 server,
             );
         }
-        ServerMessage::Authenticated { .. } | ServerMessage::AuthError { .. } => {}
+        ServerMessage::Account(reply) => match account {
+            Some(link) => crate::account::on_reply(app_handle, server, link, tcp_tx, reply).await,
+            None => debug!("account reply on a guest connection, ignoring"),
+        },
+        ServerMessage::Authenticated { .. } | ServerMessage::AuthError { .. } | ServerMessage::AuthStep(_) => {}
     }
 }
 

@@ -1,0 +1,96 @@
+{
+  "id": "lan",
+  "label": "LAN party or tournament",
+  "summary": "Event info and brackets only the orga posts in, match rooms per team, casters, a help desk and an orga room.",
+  "notes": [
+    "Posting in an announcement channel takes an admin (the admin token) or, on a server with accounts, a moderator.",
+    "Teams can open more rooms with +; for a big event raise max_channels in server_settings.json.",
+    "Need more matches at once? Copy a pair of Match rooms and number them on."
+  ],
+  "channels": [
+    {
+      "name": "info",
+      "description": "Schedule, rules, seating, network: everything about the event. Only the orga posts here.",
+      "text": true,
+      "auto_join": true,
+      "announce": true
+    },
+    {
+      "name": "brackets",
+      "description": "Brackets, results and who plays next. Only the orga posts here.",
+      "text": true,
+      "auto_join": true,
+      "announce": true
+    },
+    {
+      "name": "general",
+      "description": "Where everybody lands",
+      "text": true,
+      "auto_join": true
+    },
+    {
+      "name": "looking-for-team",
+      "description": "Missing a player? One post a minute; posts go after a day.",
+      "text": true,
+      "message_ttl_secs": 86400,
+      "slow_mode_secs": 60
+    },
+    {
+      "name": "tech-help",
+      "description": "Problems with your setup, the network or a game",
+      "text": true
+    },
+    {
+      "name": "orga",
+      "description": "Organisers only",
+      "text": true,
+      "hidden": true,
+      "password": "<generate>"
+    },
+    {
+      "name": "Main Hall",
+      "description": "Opening, announcements and the final — the stage shares its screen"
+    },
+    {
+      "name": "Casters",
+      "description": "Casting the matches; the orga gives casters the password",
+      "max_users": 4,
+      "password": "<generate>"
+    },
+    {
+      "name": "Match 1 Team A",
+      "description": "Match 1",
+      "max_users": 5
+    },
+    {
+      "name": "Match 1 Team B",
+      "description": "Match 1",
+      "max_users": 5
+    },
+    {
+      "name": "Match 2 Team A",
+      "description": "Match 2",
+      "max_users": 5
+    },
+    {
+      "name": "Match 2 Team B",
+      "description": "Match 2",
+      "max_users": 5
+    },
+    {
+      "name": "Help Desk",
+      "description": "Talk to an organiser",
+      "max_users": 4
+    },
+    {
+      "name": "Chill Zone",
+      "description": "Between matches"
+    },
+    {
+      "name": "Orga Room",
+      "description": "Organisers only",
+      "hidden": true,
+      "password": "<generate>"
+    }
+  ]
+}

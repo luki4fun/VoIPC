@@ -33,6 +33,84 @@ pub struct UserInfo {
     /// server already sees every request and every reply go past.
     #[serde(default)]
     pub shares_history: bool,
+    /// The relay account this user signed in with (protocol v11), or `None`
+    /// for a guest. Peers show a verified mark for it, and key what they
+    /// remember about a person (an identity, a message id) by it instead of by
+    /// the user id, which is new on every connect.
+    #[serde(default)]
+    pub account: Option<[u8; 16]>,
+    /// Holds the moderator role (kick, ban, any channel's settings).
+    #[serde(default)]
+    pub is_moderator: bool,
+}
+
+// ── Accounts (protocol v11) ──────────────────────────────────────────────
+
+/// Who may make an account on a relay that has them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Registration {
+    /// Anyone, behind a proof of work the client solves.
+    Open,
+    /// With a code from an admin, which may be bound to one name.
+    Invite,
+    /// Only with a code an admin made for that name.
+    Closed,
+}
+
+/// What a relay with accounts tells every client in `Authenticated`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RelayAccounts {
+    /// Guests are refused; everybody signs in.
+    pub required: bool,
+    pub registration: Registration,
+    /// Members may keep an encrypted copy of their messages here.
+    pub cloud: bool,
+    /// The relay's own id: the client derives its keys from it, so they
+    /// survive the relay moving to another address.
+    pub relay_id: [u8; 16],
+}
+
+/// How a client means to sign in, in `Authenticate.account`. The account name
+/// is `Authenticate.username`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AccountStart {
+    /// With the password (the secret derived from it).
+    Login,
+    /// A new account; `invite` is the code from an invite link.
+    Register { invite: Option<String> },
+    /// With the key this device was given at an earlier sign-in.
+    DeviceKey { device_id: Vec<u8> },
+}
+
+/// The sign-up proof of work: an ALTCHA challenge (JSON) and the relay's
+/// signed timestamp, both handed back with the solution.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PowChallenge {
+    pub altcha: String,
+    pub ts: String,
+}
+
+/// One item of the account's vault as the relay keeps it: ciphertext the
+/// client made, under a key the relay never sees.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VaultBlob {
+    pub k: String,
+    pub v: Vec<u8>,
+    /// Compare-and-set version; 0 = new.
+    pub version: i64,
+}
+
+/// The signed-in account, in `Authenticated` and after it changes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountInfo {
+    pub id: [u8; 16],
+    pub name: String,
+    /// What the account may do right now (`*`, `voipc:moderate`, …).
+    pub scopes: Vec<String>,
+    /// It holds a role whose rights wait for a second factor: the client
+    /// asks the user to set one up.
+    pub needs_2fa: bool,
+    pub totp_enabled: bool,
 }
 
 /// An active IP ban, as shown to admins.
@@ -188,6 +266,90 @@ pub struct ChannelInfo {
     /// told, in as many words, what it now shares.
     #[serde(default)]
     pub routed: bool,
+    /// An announcement channel (protocol v11): only its managers — the
+    /// creator, admins and moderators — may post, and the relay refuses
+    /// everybody else's messages. Text channels only.
+    #[serde(default)]
+    pub announce: bool,
+    /// Slow mode (protocol v11): a member may post once per this many seconds;
+    /// 0 is off. Enforced by the relay, which sees who posts where and when
+    /// but nothing of what; the channel's managers are exempt.
+    #[serde(default)]
+    pub slow_mode_secs: u32,
+    /// Marked 18+ (protocol v11). The relay only carries the flag: each client
+    /// asks its user for consent before joining or showing the channel.
+    #[serde(default)]
+    pub nsfw: bool,
+    /// The stored-message log this channel keeps for accounts that ask for
+    /// one (protocol v11): `c:<uid>`. Empty where there is none — a relay
+    /// without accounts or without storage, a temporary channel, and one that
+    /// is anonymous or hides its members (a log's members see each other).
+    #[serde(default)]
+    pub log: String,
+}
+
+/// The options a `SetChannelOptions` asks for; `None` leaves one as it is.
+/// One struct from the settings dialog to the relay's checks (protocol v11),
+/// so a new option is a field here and one in `ChannelInfo`, not one per layer.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelOptions {
+    #[serde(default)]
+    pub hidden: Option<bool>,
+    #[serde(default)]
+    pub anonymous: Option<bool>,
+    #[serde(default)]
+    pub screen_share: Option<bool>,
+    #[serde(default)]
+    pub hide_members: Option<bool>,
+    /// Have the relay forward voice only to whoever should hear it
+    /// (protocol v8). See `ChannelInfo::routed`.
+    #[serde(default)]
+    pub routed: Option<bool>,
+    /// Seconds a message written here is meant to live; 0 turns the timer
+    /// off (protocol v9). See `ChannelInfo::message_ttl_secs`.
+    #[serde(default)]
+    pub message_ttl_secs: Option<u32>,
+    /// Only the channel's managers may post (protocol v11; text channels
+    /// only). See `ChannelInfo::announce`.
+    #[serde(default)]
+    pub announce: Option<bool>,
+    /// One post per this many seconds per member, 0 = off (protocol v11).
+    /// See `ChannelInfo::slow_mode_secs`.
+    #[serde(default)]
+    pub slow_mode_secs: Option<u32>,
+    /// Mark the channel 18+ (protocol v11). See `ChannelInfo::nsfw`.
+    #[serde(default)]
+    pub nsfw: Option<bool>,
+}
+
+/// An empty channel with every option off, but screen sharing on (as an
+/// older peer's message reads too): what a literal fills in with
+/// `..Default::default()`, so a new field is one edit, not one per site.
+impl Default for ChannelInfo {
+    fn default() -> Self {
+        ChannelInfo {
+            channel_id: 0,
+            name: String::new(),
+            description: String::new(),
+            max_users: 0,
+            user_count: 0,
+            has_password: false,
+            created_by: None,
+            proximity: ProximityMode::default(),
+            hidden: false,
+            anonymous: false,
+            screen_share: true,
+            hide_members: false,
+            text: false,
+            auto_join: false,
+            message_ttl_secs: 0,
+            routed: false,
+            announce: false,
+            slow_mode_secs: 0,
+            nsfw: false,
+            log: String::new(),
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -209,6 +371,8 @@ mod tests {
             is_screen_sharing: false,
             is_admin: true,
             shares_history: true,
+            account: None,
+            is_moderator: false,
         };
         let bytes = postcard::to_allocvec(&info).unwrap();
         let decoded: UserInfo = postcard::from_bytes(&bytes).unwrap();
@@ -239,6 +403,10 @@ mod tests {
             text: true,
             auto_join: true,
             message_ttl_secs: 3600,
+            announce: true,
+            slow_mode_secs: 30,
+            nsfw: true,
+            log: "c:abc".into(),
         };
         let bytes = postcard::to_allocvec(&info).unwrap();
         let decoded: ChannelInfo = postcard::from_bytes(&bytes).unwrap();
@@ -250,6 +418,8 @@ mod tests {
         assert_eq!(decoded.proximity, ProximityMode::TwoD);
         assert!(decoded.hidden && decoded.anonymous && decoded.hide_members);
         assert!(!decoded.screen_share);
+        assert!(decoded.announce && decoded.nsfw);
+        assert_eq!(decoded.slow_mode_secs, 30);
     }
 
     #[test]
@@ -265,6 +435,7 @@ mod tests {
         assert!(!info.hidden && !info.anonymous && !info.hide_members);
         assert!(info.screen_share, "sharing must stay on unless switched off");
         assert_eq!(info.proximity, ProximityMode::Off);
+        assert!(!info.announce && !info.nsfw && info.slow_mode_secs == 0);
     }
 
     #[test]
@@ -289,6 +460,8 @@ mod tests {
             is_screen_sharing: false,
             is_admin: false,
             shares_history: false,
+            account: None,
+            is_moderator: false,
         };
         let bytes = postcard::to_allocvec(&info).unwrap();
         let decoded: UserInfo = postcard::from_bytes(&bytes).unwrap();

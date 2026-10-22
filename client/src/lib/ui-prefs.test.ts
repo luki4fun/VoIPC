@@ -134,6 +134,18 @@ test("a malformed left-text-channel list costs that entry, not the app", () => {
   assert.deepEqual(sanitizeUiPrefs({ left_text_channels: ["nope"] }).left_text_channels, {});
 });
 
+test("18+ consent is remembered per server, and junk in it is dropped", () => {
+  assert.deepEqual(sanitizeUiPrefs({}).nsfw_ok, [], "nobody has said yes yet");
+  assert.deepEqual(
+    sanitizeUiPrefs({ nsfw_ok: ["a.example:9987", "b.example:9987"] }).nsfw_ok,
+    ["a.example:9987", "b.example:9987"],
+  );
+  // Hand-edited or from a newer build: a bad entry costs that entry
+  assert.deepEqual(sanitizeUiPrefs({ nsfw_ok: ["a:1", 42, "", "a:1", null] }).nsfw_ok, ["a:1"]);
+  assert.deepEqual(sanitizeUiPrefs({ nsfw_ok: "a:1" }).nsfw_ok, []);
+  assert.deepEqual(sanitizeUiPrefs({ nsfw_ok: { "a:1": true } }).nsfw_ok, []);
+});
+
 test("the stream view's chat: off in modern, below in classic, until chosen", () => {
   const p = sanitizeUiPrefs({});
   assert.deepEqual(p.stream_chat.modern, defaultStreamChat("modern"));

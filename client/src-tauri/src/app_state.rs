@@ -61,6 +61,8 @@ pub struct AppState {
     /// another's. ponytail: entries are never removed; one per server id this
     /// session ever connected to.
     pub connect_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Sign-ins waiting for the person to type a code, by server id.
+    pub totp_answers: std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<crate::account::TotpAnswer>>>,
     pub settings: RwLock<UserSettings>,
     pub chat: RwLock<ChatState>,
     // ── Settings every connection shares ──
@@ -152,6 +154,7 @@ impl AppState {
             connections: RwLock::new(HashMap::new()),
             voice_server: std::sync::Mutex::new(None),
             connect_locks: std::sync::Mutex::new(HashMap::new()),
+            totp_answers: std::sync::Mutex::new(HashMap::new()),
             settings: RwLock::new(UserSettings::default()),
             chat: RwLock::new(ChatState::default()),
             is_muted: Arc::new(AtomicBool::new(false)),
@@ -355,6 +358,8 @@ pub struct ActiveConnection {
     pub voice_asked_at: Arc<AtomicU64>,
     /// Sender for control messages (framed, onto the control stream).
     pub tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// The relay account this connection signed in with; `None` for a guest.
+    pub account: Option<Arc<crate::account::AccountLink>>,
     /// Sender for voice packets (QUIC datagrams, or the TCP fallback's datagram lane).
     pub voice_tx: mpsc::Sender<Vec<u8>>,
     /// Sender for video fragments (one QUIC stream per frame, or the TCP fallback).

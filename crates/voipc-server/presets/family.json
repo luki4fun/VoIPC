@@ -1,0 +1,56 @@
+{
+  "id": "family",
+  "label": "Family and friends",
+  "summary": "A chat and a plans channel for everyone, a living room, movie and game nights, and a corner for the grown-ups.",
+  "settings": {
+    "max_channels": 10
+  },
+  "notes": [
+    "Give the grown-ups password to the adults only.",
+    "Family Gathering is a proximity room: at a big holiday call, several conversations can happen side by side."
+  ],
+  "channels": [
+    {
+      "name": "chat",
+      "description": "Everything and nothing",
+      "text": true,
+      "auto_join": true
+    },
+    {
+      "name": "plans",
+      "description": "Birthdays, visits, holidays and who brings what",
+      "text": true,
+      "auto_join": true
+    },
+    {
+      "name": "grown-ups",
+      "description": "For the adults: surprises, presents and plans the kids must not see",
+      "text": true,
+      "hidden": true,
+      "password": "<generate>"
+    },
+    {
+      "name": "Living Room",
+      "description": "Sit down and talk"
+    },
+    {
+      "name": "Family Gathering",
+      "description": "For the big calls: you hear whoever sits near you, so several conversations can happen at once",
+      "proximity": "2d"
+    },
+    {
+      "name": "Movie Night",
+      "description": "Watch together: one shares the screen, the rest watch"
+    },
+    {
+      "name": "Game Night",
+      "description": "Play together"
+    },
+    {
+      "name": "Private Room",
+      "description": "A quiet room with a password",
+      "max_users": 4,
+      "password": "<generate>"
+    }
+  ]
+}

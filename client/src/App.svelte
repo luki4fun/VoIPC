@@ -17,6 +17,7 @@
   import UserContextMenu from "./lib/components/UserContextMenu.svelte";
   import SharePreview from "./lib/components/SharePreview.svelte";
   import ChannelDialogs from "./lib/components/ChannelDialogs.svelte";
+  import AccountPrompts from "./lib/components/AccountPrompts.svelte";
   import AdminDialogs from "./lib/components/AdminDialogs.svelte";
 
   import {
@@ -43,12 +44,14 @@
     voiceServer,
   } from "./lib/stores/channels.js";
   import { users, speakingUsers } from "./lib/stores/users.js";
+  import { account, accountHex } from "./lib/stores/account.js";
   import { addNotification, removeNotification } from "./lib/stores/notifications.js";
   import { pendingInvites } from "./lib/stores/invites.js";
   import { pendingPokes, createPoke, addPoke } from "./lib/stores/pokes.js";
   import {
     addChannelMessage,
     addDmMessage,
+    fileStoredChannelMessage,
     activeDmUsername,
     startExpirySweep,
     activeDmUserId,
@@ -125,6 +128,7 @@
     setRoster,
   } from "./lib/stores/rosters.js";
   import {
+    askNsfwConsent,
     autoJoinTextChannels,
     channelMessageTtl,
     dmMessageTtl,
@@ -344,11 +348,14 @@
     if (inv.password) {
       rememberChannelPassword(server, ch.name, inv.password);
     }
-    invoke("join_channel", { server, channelId: ch.channel_id, password: inv.password }).catch(
-      (e: unknown) => {
-        addNotification(`Could not join #${ch.name}: ${e}`, "error");
-      },
-    );
+    const join = () =>
+      invoke("join_channel", { server, channelId: ch.channel_id, password: inv.password }).catch(
+        (e: unknown) => {
+          addNotification(`Could not join #${ch.name}: ${e}`, "error");
+        },
+      );
+    // A link is somebody else's idea: an 18+ channel still asks first
+    if (askNsfwConsent(server, ch.channel_id, () => void join())) void join();
   });
 
   // What a connection held — admin, the channel list, rosters, the chat's
@@ -486,6 +493,16 @@
 
     return () => { if (timer) clearTimeout(timer); };
   });
+
+  /** That channel's chat is on screen: this server, no DM over the pane,
+   *  and this channel in it. */
+  function viewingChannel(server: string, channelId: number): boolean {
+    return (
+      server === get(serverAddress) &&
+      get(activeDmUserId.of(server)) === null &&
+      channelId === (get(activeTextChannelId.of(server)) ?? get(currentChannelId.of(server)))
+    );
+  }
 
   onMount(async () => {
     // Messages with a destruction timer go when their moment comes, whether or
@@ -972,10 +989,13 @@
         }
       }),
 
-      listenServer<{ user_id: number }>("identity-key-changed", (server, data) => {
+      // `name` comes with an account's change, which may be somebody away.
+      listenServer<{ user_id?: number | null; name?: string }>("identity-key-changed", (server, data) => {
         const uid = data.user_id;
         const name =
-          get(users.of(server)).find((u) => u.user_id === uid)?.username ?? `User ${uid}`;
+          (uid != null ? get(users.of(server)).find((u) => u.user_id === uid)?.username : undefined) ??
+          data.name ??
+          `User ${uid}`;
         addNotification(
           `${fromServer(server)}Security warning: ${name}'s encryption identity changed. ` +
             `Verify with them out-of-band before trusting messages.`,
@@ -1231,7 +1251,12 @@
           // sees, so use the one the channel knows us by.
           const self = get(userId.of(server));
           const uname = uid === self ? ownDisplayName(server, username, channel_id) : username;
-          addChannelMessage(server, chName, {
+          // Tagged with the writer's account, so the same message read from
+          // the channel's stored log is recognised (sameMessage).
+          const writer = uid === self
+            ? get(account.of(server))?.info.id
+            : get(users.of(server)).find((u) => u.user_id === uid)?.account;
+          const added = addChannelMessage(server, chName, {
             user_id: uid,
             username: uname,
             content,
@@ -1242,18 +1267,58 @@
             // not what the sender wrote, and passing it to the next person to
             // join spreads one member's missing key to everybody after them.
             kind: data.decryption_failed ? "undecryptable" : undefined,
+            account: writer ? accountHex(writer) : undefined,
           });
-          // Track unread unless it is on screen: this server, no DM over the
-          // pane, and this channel in it
-          const viewingThisChannel =
-            server === get(serverAddress) &&
-            get(activeDmUserId.of(server)) === null &&
-            channel_id === (get(activeTextChannelId.of(server)) ?? get(currentChannelId.of(server)));
-          if (!viewingThisChannel) {
+          if (added && !viewingChannel(server, channel_id)) {
             incrementChannelUnread(server, chName);
             if (uid !== self) playChannelMessageSound();
           }
         }
+      }),
+
+      // A channel's stored log: what was written while we were away (or that
+      // nobody was here to receive live), filed like the channel's chat.
+      listenServer<{
+        conv: string;
+        sender_account: string;
+        sender_name: string;
+        from_me: boolean;
+        message_id: string | null;
+        content: string;
+        ttl_secs: number | null;
+        timestamp: number;
+      }>("stored-channel-message", (server, m) => {
+        const ch = get(channels.of(server)).find((c) => c.log === m.conv);
+        if (!ch) return;
+        const self = get(userId.of(server));
+        const online = m.from_me ? undefined : get(users.of(server)).find((u) => u.username === m.sender_name);
+        const added = fileStoredChannelMessage(server, ch.name, {
+          user_id: m.from_me ? self : (online?.user_id ?? 0),
+          username: m.sender_name,
+          content: m.content,
+          timestamp: m.timestamp,
+          id: m.message_id ?? undefined,
+          account: m.sender_account,
+          expires_at: expiryFor(m.timestamp, m.ttl_secs, channelMessageTtl(server, ch.channel_id)),
+        });
+        if (added && !m.from_me && !viewingChannel(server, ch.channel_id)) incrementChannelUnread(server, ch.name);
+      }),
+
+      // Who can read what we write in a channel's stored log, said where it
+      // happens: nobody gets our keys without the user seeing their name.
+      listenServer<{ conv: string; names: string[]; history: boolean }>("log-readers", (server, d) => {
+        const ch = get(channels.of(server)).find((c) => c.log === d.conv);
+        if (!ch || d.names.length === 0) return;
+        const names = d.names.map((n) => shortName(n) || "someone").join(", ");
+        addChannelMessage(server, ch.name, {
+          user_id: 0,
+          username: "",
+          content: d.history
+            ? `${names} can now read your kept messages here, earlier ones included`
+            : `Your kept messages here can be read by ${names}`,
+          timestamp: Date.now(),
+          kind: "notice",
+        });
       }),
 
       listenServer<{
@@ -1274,6 +1339,11 @@
         // and the shorter wins. Their name is how the conversation is filed.
         const peer = from_user_id === myId ? get(activeDmUsername.of(server)) : from_username;
         const expires_at = expiryFor(timestamp, data.ttl_secs, dmMessageTtl(server, peer));
+        // Tagged with the sender's account, so the same message read back from
+        // the stored log later is recognised (sameMessage).
+        const sender = from_user_id === myId
+          ? get(account.of(server))?.info.id
+          : get(users.of(server)).find((u) => u.user_id === from_user_id)?.account;
         addDmMessage(server, myId, from_user_id, from_username, to_user_id, {
           user_id: from_user_id,
           username: from_username,
@@ -1281,6 +1351,7 @@
           timestamp,
           id: data.message_id ?? undefined,
           expires_at,
+          account: sender ? accountHex(sender) : undefined,
         });
         if (from_user_id !== myId) {
           playDirectMessageSound();
@@ -1290,13 +1361,16 @@
 
       // A direct message found nobody: the person it was for has left. Said
       // in the conversation, under the message, which is where it was missed.
-      listenServer<{ user_id: number }>("dm-undelivered", (server, { user_id }) => {
+      listenServer<{ user_id: number; kept?: boolean }>("dm-undelivered", (server, { user_id, kept }) => {
         const myId = get(userId.of(server));
         const peer = get(dmConversations.of(server)).find((c) => c.user_id === user_id)?.username;
+        const who = peer ? shortName(peer) : "they";
         addDmMessage(server, myId, myId, "", user_id, {
           user_id: 0,
           username: "",
-          content: `Not delivered — ${peer ? shortName(peer) : "they"} left the server`,
+          content: kept
+            ? `${who} left the server — kept there for when they are back`
+            : `Not delivered — ${who} left the server`,
           timestamp: Date.now(),
           kind: "notice",
         });
@@ -1531,6 +1605,7 @@
   <SharePreview />
 {/if}
 <ChannelDialogs />
+<AccountPrompts />
 <AdminDialogs />
 
 <Toast />

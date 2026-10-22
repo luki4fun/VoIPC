@@ -6,6 +6,7 @@
 //! The logic lives in `signal` and `media` (plain Rust, host-testable); this
 //! file only converts between JS and Rust values.
 
+pub mod account;
 pub mod media;
 pub mod signal;
 
@@ -90,6 +91,13 @@ impl SignalClient {
         })
     }
 
+    /// Stores for an account's identity (`AccountSignIn.identity()`).
+    #[wasm_bindgen(js_name = fromIdentity)]
+    pub fn from_identity(identity: &[u8]) -> Result<SignalClient, JsError> {
+        let identity = libsignal_protocol::IdentityKeyPair::try_from(identity).map_err(|e| JsError::new(&e.to_string()))?;
+        Ok(Self { core: signal::SignalCore::with_identity(&identity).map_err(js_err)? })
+    }
+
     /// `{ identity_key: number[], prekey_bundle: PreKeyBundleData }` for Authenticate.
     pub fn bundle(&self) -> Result<JsValue, JsError> {
         Ok(serde_wasm_bindgen::to_value(&self.core.bundle().map_err(js_err)?)?)
@@ -120,6 +128,24 @@ impl SignalClient {
         self.core
             .decrypt(user_id, ciphertext, message_type)
             .map_err(js_err)
+    }
+
+    /// `[{ user_id, key: Uint8Array }]`: the identities the stores took in
+    /// since the last call — a session a peer opened among them — for the
+    /// account's pins (network.rs `check_seen`).
+    #[wasm_bindgen(js_name = takeSeen)]
+    pub fn take_seen(&mut self) -> js_sys::Array {
+        self.core
+            .take_seen()
+            .into_iter()
+            .map(|(user_id, key)| js_object(&[("user_id", JsValue::from(user_id)), ("key", uint8array(&key))]))
+            .collect()
+    }
+
+    /// The identity key the session with `user_id` runs on, if there is one.
+    #[wasm_bindgen(js_name = identityOf)]
+    pub fn identity_of(&self, user_id: u32) -> Option<Vec<u8>> {
+        self.core.identity_of(user_id)
     }
 
     #[wasm_bindgen(js_name = createSenderKeyDistribution)]

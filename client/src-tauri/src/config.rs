@@ -55,6 +55,9 @@ pub struct SavedServer {
     pub username: String,
     #[serde(default)]
     pub accept_self_signed: bool,
+    /// `username` is a relay account there, signed in with this device's key.
+    #[serde(default)]
+    pub account: bool,
 }
 
 /// Persistent user configuration, saved as `settings.json` in the VoIPC data directory.
@@ -200,6 +203,11 @@ pub struct AppConfig {
     /// this drops is somebody's oldest conversations off their own disk.
     #[serde(default = "default_max_conversations")]
     pub max_conversations: u32,
+    /// The relay id each address said at its last account sign-in (address →
+    /// hex). A server that names the id another address has here is refused
+    /// before any password secret goes to it (`SignIn::expect_relay`).
+    #[serde(default)]
+    pub relay_ids: std::collections::BTreeMap<String, String>,
 }
 
 impl Default for AppConfig {
@@ -251,6 +259,7 @@ impl Default for AppConfig {
             chat_history_path: None,
             chat_history_disabled: false,
             max_conversations: default_max_conversations(),
+            relay_ids: Default::default(),
         }
     }
 }
@@ -448,6 +457,7 @@ mod tests {
                 port: 9987,
                 username: "luki".into(),
                 accept_self_signed: false,
+                account: false,
             },
             SavedServer {
                 name: "two".into(),
@@ -455,6 +465,7 @@ mod tests {
                 port: 9988,
                 username: "luki".into(),
                 accept_self_signed: true,
+                account: true,
             },
         ];
         let text = serde_json::to_string(&config).expect("serialize");

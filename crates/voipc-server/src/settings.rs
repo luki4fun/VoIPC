@@ -64,6 +64,9 @@ impl ServerSettings {
         let content = std::fs::read_to_string(path)?;
         let mut settings: Self = serde_json::from_str(&content)?;
         settings.normalise();
+        // A preset's stand-in, copied by hand: as a token it would be the same
+        // published string on every server that did so.
+        crate::channels::refuse_placeholder("game_token", settings.game_token.as_deref())?;
         Ok(settings)
     }
 
@@ -134,5 +137,18 @@ mod tests {
         assert_eq!(settings.empty_channel_timeout_secs, 600);
         assert_eq!(settings.max_channels, 100);
         assert_eq!(settings.max_channel_name_len, 64);
+    }
+
+    #[test]
+    fn a_preset_placeholder_game_token_is_refused() {
+        let dir = std::env::temp_dir().join(format!("voipc-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server_settings.json");
+        std::fs::write(&path, r#"{"game_token": "<generate>"}"#).unwrap();
+        let err = ServerSettings::load_from_file(&path).unwrap_err().to_string();
+        assert!(err.contains("channels init"), "{err}");
+        std::fs::write(&path, r#"{"game_token": "a-real-token"}"#).unwrap();
+        assert!(ServerSettings::load_from_file(&path).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -1,0 +1,108 @@
+{
+  "id": "competitive",
+  "label": "Shooter or MOBA — 2v2, 3v3, 5v5 and in-houses",
+  "summary": "Rooms sized for duos, trios, squads and five-stacks, an in-house lobby that splits into two teams, and VOD review.",
+  "notes": [
+    "The room sizes are caps: a full Duo room keeps a third person out, so a team is never interrupted mid-match."
+  ],
+  "channels": [
+    {
+      "name": "general",
+      "description": "Where everybody lands",
+      "text": true,
+      "auto_join": true
+    },
+    {
+      "name": "lfg",
+      "description": "Rank, role, region, game: find a team. One post a minute; posts go after 8 hours.",
+      "text": true,
+      "auto_join": true,
+      "message_ttl_secs": 28800,
+      "slow_mode_secs": 60
+    },
+    {
+      "name": "scrims",
+      "description": "Scrims and tournaments: who, when, where. Posts go after a week.",
+      "text": true,
+      "message_ttl_secs": 604800
+    },
+    {
+      "name": "strats",
+      "description": "Lineups, setups, builds and notes from VOD reviews",
+      "text": true
+    },
+    {
+      "name": "Hangout",
+      "description": "Between matches"
+    },
+    {
+      "name": "Duo 1",
+      "description": "2v2 and duo queue",
+      "max_users": 2
+    },
+    {
+      "name": "Duo 2",
+      "description": "2v2 and duo queue",
+      "max_users": 2
+    },
+    {
+      "name": "Trio 1",
+      "description": "3v3 and trios",
+      "max_users": 3
+    },
+    {
+      "name": "Trio 2",
+      "description": "3v3 and trios",
+      "max_users": 3
+    },
+    {
+      "name": "Squad 1",
+      "description": "Squads of four — battle royale and co",
+      "max_users": 4
+    },
+    {
+      "name": "Squad 2",
+      "description": "Squads of four — battle royale and co",
+      "max_users": 4
+    },
+    {
+      "name": "Team 1",
+      "description": "Five-stacks: 5v5 ranked and premades",
+      "max_users": 5
+    },
+    {
+      "name": "Team 2",
+      "description": "Five-stacks: 5v5 ranked and premades",
+      "max_users": 5
+    },
+    {
+      "name": "Team 3",
+      "description": "Five-stacks: 5v5 ranked and premades",
+      "max_users": 5
+    },
+    {
+      "name": "In-House Lobby",
+      "description": "Gather here for in-house games, then split into Team A and Team B",
+      "max_users": 12
+    },
+    {
+      "name": "In-House Team A",
+      "description": "In-house games",
+      "max_users": 5
+    },
+    {
+      "name": "In-House Team B",
+      "description": "In-house games",
+      "max_users": 5
+    },
+    {
+      "name": "Review Room",
+      "description": "VOD review: share your screen and go through a match together"
+    },
+    {
+      "name": "AFK",
+      "description": "Away from keyboard",
+      "screen_share": false
+    }
+  ]
+}

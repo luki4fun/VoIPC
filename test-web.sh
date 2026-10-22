@@ -129,6 +129,30 @@ for _ in $(seq 1 50); do
   sleep 0.2
 done
 
+# A third server with accounts and open sign-up, for test-ui.mjs's accounts
+# lane: a SQLite database and a key file of its own, both made at first start.
+TCP_PORT3=$((TCP_PORT + 2))
+mkdir -p "$WORK/s3"
+cp "$WORK/server.crt" "$WORK/server.key" "$WORK/s3/"
+cat > "$WORK/s3/server.toml" <<TOML
+cert_path = "server.crt"
+key_path = "server.key"
+[accounts]
+mode = "optional"
+registration = "open"
+TOML
+# One persistent text channel everyone lands in: its log is what the accounts
+# lane reads back after its writer's reader was away.
+cat > "$WORK/s3/channels.json" <<'CHANNELS'
+[{ "name": "kept", "text": true, "auto_join": true }]
+CHANNELS
+(cd "$WORK/s3" && exec "$SCRIPT_DIR/$SERVER" --config server.toml --host 127.0.0.1 --tcp-port "$TCP_PORT3" \
+  --udp-port "$TCP_PORT3" > "$WORK/server3.log" 2>&1) &
+for _ in $(seq 1 50); do
+  curl -sk --http2-prior-knowledge "https://127.0.0.1:$TCP_PORT3/wt.json" 2>/dev/null | grep -q '"hash"' && break
+  sleep 0.2
+done
+
 run_browser() { # name role extra-params logfile browser
   local url="https://127.0.0.1:$TCP_PORT/?selftest=1&name=$1&role=$2&duration=$DURATION$3"
   local engine="${5:-$BROWSER}"
@@ -279,7 +303,7 @@ if [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
     curl -s "http://127.0.0.1:$UI_CDP/json/version" > /dev/null 2>&1 && break
     sleep 0.2
   done
-  if node "$SCRIPT_DIR/test-ui.mjs" "$TCP_PORT" "$UI_CDP" "$TCP_PORT2" | tee "$WORK/ui.txt"; then
+  if node "$SCRIPT_DIR/test-ui.mjs" "$TCP_PORT" "$UI_CDP" "$TCP_PORT2" "$TCP_PORT3" | tee "$WORK/ui.txt"; then
     echo "PASS the UI survives creating and configuring a proximity channel"
   else
     echo "FAIL the UI regression test" | tee -a "$WORK/fails.txt"

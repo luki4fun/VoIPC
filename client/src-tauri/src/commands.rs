@@ -35,6 +35,8 @@ pub async fn connect(
     address: String,
     username: String,
     accept_invalid_certs: Option<bool>,
+    // Sign in to an account on this server; `None` is a guest.
+    account: Option<crate::account::AccountArgs>,
 ) -> Result<u32, String> {
     // Input validation
     if address.is_empty() || address.len() > 253 {
@@ -54,6 +56,7 @@ pub async fn connect(
         address,
         username,
         accept_invalid_certs.unwrap_or(false),
+        account,
     )
     .await
 }
@@ -233,6 +236,10 @@ pub async fn set_history_sharing(state: State<'_, AppState>, enabled: bool) -> R
             &ClientMessage::SetHistorySharing { enabled },
         )
         .await;
+        // The same consent hands our older keys to who joins a channel's log.
+        if let Some(link) = &connection.account {
+            link.session().set_share(enabled);
+        }
     }
     Ok(())
 }
@@ -291,28 +298,11 @@ pub async fn set_channel_options(
     state: State<'_, AppState>,
     server: String,
     channel_id: u32,
-    hidden: Option<bool>,
-    anonymous: Option<bool>,
-    screen_share: Option<bool>,
-    hide_members: Option<bool>,
-    routed: Option<bool>,
-    message_ttl_secs: Option<u32>,
+    options: voipc_protocol::types::ChannelOptions,
 ) -> Result<(), String> {
     let conns = state.connections.read().await;
     let connection = conn(&conns, &server)?;
-    network::send_tcp_message(
-        &connection.tcp_tx,
-        &ClientMessage::SetChannelOptions {
-            channel_id,
-            hidden,
-            anonymous,
-            screen_share,
-            hide_members,
-            routed,
-            message_ttl_secs,
-        },
-    )
-    .await
+    network::send_tcp_message(&connection.tcp_tx, &ClientMessage::SetChannelOptions { channel_id, options }).await
 }
 
 /// Parse the UI's proximity string. None keeps the channel non-positional.
@@ -555,7 +545,7 @@ pub async fn send_channel_message(
     // inside the ciphertext, so the relay can neither read it nor change it.
     ttl_secs: Option<u32>,
 ) -> Result<(), String> {
-    let (user_id, username, current_channel_id, tcp_tx, signal) = {
+    let (user_id, username, current_channel_id, tcp_tx, signal, account, channels) = {
         let conns = state.connections.read().await;
         let connection = conn(&conns, &server)?;
         (
@@ -564,6 +554,8 @@ pub async fn send_channel_message(
             connection.current_channel_id.load(std::sync::atomic::Ordering::Relaxed),
             connection.tcp_tx.clone(),
             connection.signal.clone(),
+            connection.account.clone(),
+            connection.channels.clone(),
         )
     };
     let channel_id = channel_id.unwrap_or(current_channel_id);
@@ -581,6 +573,18 @@ pub async fn send_channel_message(
     // receiver's copy file the message under the same one.
     let message_id = crypto::new_message_id();
     let payload = crypto::envelope(&message_id, &content, ttl_secs);
+
+    // A channel with a log keeps it for its members too (cloud copies on),
+    // whether or not anybody is here to read it now.
+    if let Some(link) = &account {
+        let log = channels
+            .lock()
+            .ok()
+            .and_then(|c| c.iter().find(|ch| ch.channel_id == channel_id).map(|ch| ch.log.clone()))
+            .unwrap_or_default();
+        let a = link.session().outgoing_channel(&log, payload.clone(), crypto::now_ms(), ttl_secs);
+        crate::account::run(&app_handle, &server, &tcp_tx, a).await;
+    }
 
     // Try encrypted channel message via Sender Keys
     let encrypted_result = tokio::task::block_in_place(|| {
@@ -697,7 +701,7 @@ pub async fn send_direct_message(
     // conversation; it rides inside the envelope like a channel message's does.
     ttl_secs: Option<u32>,
 ) -> Result<(), String> {
-    let (tcp_tx, own_user_id, own_username, signal) = {
+    let (tcp_tx, own_user_id, own_username, signal, account) = {
         let conns = state.connections.read().await;
         let connection = conn(&conns, &server)?;
         (
@@ -705,6 +709,7 @@ pub async fn send_direct_message(
             connection.user_id,
             connection.username.clone(),
             connection.signal.clone(),
+            connection.account.clone(),
         )
     };
 
@@ -714,6 +719,13 @@ pub async fn send_direct_message(
     // costs nothing on the far side: `open_envelope` reads plain text as text.
     let message_id = crypto::new_message_id();
     let payload = crypto::envelope(&message_id, &content, ttl_secs);
+
+    // Between two accounts, and with cloud copies on, it is kept for them too:
+    // whether or not they are here to get it now.
+    if let Some(link) = &account {
+        let a = link.session().outgoing_dm(target_user_id, payload.clone(), crypto::now_ms(), ttl_secs);
+        crate::account::run(&app_handle, &server, &tcp_tx, a).await;
+    }
 
     // Try encrypted direct message via pairwise Signal session
     let encrypted_result = tokio::task::block_in_place(|| {
@@ -2909,10 +2921,18 @@ pub async fn unlock_chat_history(
 
     let payload = ChatArchivePayload::from(&archive);
 
+    // A device remembered before the vault was opened (this session) joins
+    // the ones on disk instead of being dropped.
+    let fresh = std::mem::take(&mut chat.archive.devices);
+    let added = !fresh.is_empty();
+    for d in fresh {
+        archive.devices.retain(|k| !(k.relay_id == d.relay_id && k.name == d.name));
+        archive.devices.push(d);
+    }
     chat.archive = archive;
     chat.salt = salt;
     chat.sealing_key = Some(key);
-    chat.dirty = false;
+    chat.dirty = added;
 
     Ok(payload)
 }
@@ -2930,7 +2950,8 @@ pub async fn create_chat_history(
     let key = tokio::task::spawn_blocking(move || crypto::derive_key(&password, &salt))
         .await
         .map_err(|e| e.to_string())?;
-    let archive = ChatArchive::default();
+    // Devices remembered while the vault was off are kept from now on.
+    let archive = ChatArchive { devices: std::mem::take(&mut chat.archive.devices), ..ChatArchive::default() };
 
     // Write the initial (empty) encrypted file
     let file_data =
@@ -2995,6 +3016,10 @@ pub async fn clear_chat_history(state: State<'_, AppState>) -> Result<(), String
     // save with the timestamps it just cleared.
     chat.archive = ChatArchive {
         cleared: std::mem::take(&mut chat.archive.cleared),
+        // Not chat: the devices relays remember are how this one signs in.
+        devices: std::mem::take(&mut chat.archive.devices),
+        // What was read stays read: cleared chat is not fetched back from the log.
+        cursors: std::mem::take(&mut chat.archive.cursors),
         ..ChatArchive::default()
     };
 
@@ -3202,6 +3227,7 @@ pub fn save_server(
     port: u16,
     username: String,
     accept_self_signed: bool,
+    account: Option<bool>,
 ) -> Result<Vec<crate::config::SavedServer>, String> {
     let mut config = state.config();
     let entry = crate::config::SavedServer {
@@ -3210,6 +3236,7 @@ pub fn save_server(
         port,
         username,
         accept_self_signed,
+        account: account.unwrap_or(false),
     };
     if let Some(existing) = config
         .saved_servers

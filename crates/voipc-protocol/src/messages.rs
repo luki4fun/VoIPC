@@ -19,6 +19,11 @@ pub enum ClientMessage {
         /// Initial pre-key bundle for other users to establish sessions.
         #[serde(default)]
         prekey_bundle: Option<PreKeyBundleData>,
+        /// Sign in to a relay account (protocol v11); `None` is a guest. An
+        /// account's keys come later, in `AuthContinue::Keys`: a new device
+        /// only has its identity once it has opened the vault.
+        #[serde(default)]
+        account: Option<AccountStart>,
     },
 
     /// Request to join a specific channel (with optional password).
@@ -87,25 +92,7 @@ pub enum ClientMessage {
     /// Change the other channel options (creator or admin; persistent
     /// channels admin only). `None` leaves an option as it is. Answered with
     /// ChannelUpdated or ChannelError.
-    SetChannelOptions {
-        channel_id: ChannelId,
-        #[serde(default)]
-        hidden: Option<bool>,
-        #[serde(default)]
-        anonymous: Option<bool>,
-        #[serde(default)]
-        screen_share: Option<bool>,
-        #[serde(default)]
-        hide_members: Option<bool>,
-        /// Have the relay forward voice only to whoever should hear it
-        /// (protocol v8). See `ChannelInfo::routed`.
-        #[serde(default)]
-        routed: Option<bool>,
-        /// Seconds a message written here is meant to live; 0 turns the timer
-        /// off (protocol v9). See `ChannelInfo::message_ttl_secs`.
-        #[serde(default)]
-        message_ttl_secs: Option<u32>,
-    },
+    SetChannelOptions { channel_id: ChannelId, options: ChannelOptions },
 
     /// Kick a user from a channel (creator only).
     KickUser {
@@ -277,6 +264,175 @@ pub enum ClientMessage {
         frames_dropped: u32,
         frames_received: u32,
     },
+
+    // ── Accounts (protocol v11) ──────────────────────────────────────
+
+    /// The client's next step of an account sign-in, answering an `AuthStep`.
+    AuthContinue(AuthContinue),
+
+    /// Managing the signed-in account: device keys, codes, the vault.
+    Account(AccountRequest),
+}
+
+/// The client's side of an account sign-in, between `Authenticate` and
+/// `Authenticated`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AuthContinue {
+    /// The secret derived from the password (32 bytes), never the password.
+    Secret { auth_secret: Vec<u8> },
+    /// A new account: the secret, the solved proof of work (empty where an
+    /// invite stands in for it), and the vault the client just made.
+    Register {
+        auth_secret: Vec<u8>,
+        altcha: String,
+        ts: String,
+        vault: Vec<VaultBlob>,
+    },
+    /// The device key's signature over the challenge.
+    DeviceSig { signature: Vec<u8> },
+    Totp { code: String },
+    Recovery { code: String },
+    /// The account's identity and this connection's pre-keys. A different
+    /// identity than the one on record is refused unless `reset_identity`:
+    /// then everyone who knew the old one is told it changed.
+    Keys {
+        identity_key: Vec<u8>,
+        prekey_bundle: PreKeyBundleData,
+        reset_identity: bool,
+    },
+}
+
+/// Account management after sign-in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AccountRequest {
+    /// A challenge for remembering this device (needs a recent sign-in).
+    DeviceChallenge,
+    /// `public_key` is Ed25519; the signature is over the challenge.
+    DeviceAdd {
+        device_id: Vec<u8>,
+        public_key: Vec<u8>,
+        signature: Vec<u8>,
+    },
+    TotpSetup,
+    TotpEnable { sealed: String, code: String },
+    /// Write one vault item; `expect` is the version it replaces, 0 for new.
+    VaultPut { k: String, v: Vec<u8>, expect: i64 },
+
+    // ── The stored-message log (voipc_crypto::log) ──
+    /// This account's log key (33 bytes) and its identity's signature over it.
+    LogKeyPublish { logkey: Vec<u8>, sig: Vec<u8> },
+    /// Other accounts' identity and log keys (at most 64 at a time).
+    LogKeys { accounts: Vec<[u8; 16]> },
+    /// One of our epoch keys for `conv`, wrapped to each member (and to us).
+    EpochPut { conv: String, epoch: u32, wraps: Vec<WrapIn> },
+    /// Every wrap for us in `conv`.
+    WrapsFetch { conv: String },
+    /// A sealed entry for `conv` under our epoch `epoch`. `ttl_secs` is the
+    /// message's own timer, for when the relay may drop it.
+    LogAppend { conv: String, epoch: u32, ct: Vec<u8>, ttl_secs: Option<u32> },
+    /// Entries of `conv` after sequence number `after`, a page at a time.
+    LogFetch { conv: String, after: i64 },
+    /// The conversations with entries for us, and their newest entry.
+    LogIndex,
+    /// Become a stored member of a channel's log (`ChannelInfo::log`): the
+    /// accounts its writers wrap their keys to. Only while in the channel.
+    LogJoin { conv: String },
+    /// Stop being one.
+    LogLeave { conv: String },
+    /// The stored members of `conv` (we must be one), with their keys.
+    LogMembers { conv: String },
+}
+
+/// The relay's side of an account sign-in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AuthStep {
+    /// Derive the secret with this relay id (and solve `pow` to register).
+    Salt { relay_id: [u8; 16], pow: Option<PowChallenge> },
+    /// Sign this with the device key.
+    DeviceChallenge { relay_id: [u8; 16], challenge: String },
+    /// A code from the authenticator app, or a recovery code.
+    NeedTotp,
+    /// The account's vault, to open on this device; then send `Keys`.
+    Vault { blobs: Vec<VaultBlob> },
+    /// This relay takes no guests. Sent before the connection closes.
+    AccountRequired { registration: Registration },
+}
+
+/// Answers to `AccountRequest`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AccountReply {
+    DeviceChallenge { challenge: String },
+    DeviceAdded,
+    TotpSetup { secret: String, uri: String, sealed: String },
+    /// Codes are on; the recovery codes are shown once.
+    TotpEnabled { recovery_codes: Vec<String> },
+    VaultStored { k: String, version: i64 },
+    /// Someone wrote item `k` since `expect`: here it is now (`None`: gone).
+    VaultConflict { k: String, blob: Option<VaultBlob> },
+    /// The account changed (scopes, codes on).
+    Info(AccountInfo),
+    /// `request` names what was refused.
+    Error { request: String, reason: String },
+    LogKeyStored,
+    /// Accounts without a published log key are left out.
+    LogKeysFound { keys: Vec<LogKeyInfo> },
+    EpochStored { conv: String, epoch: u32 },
+    Wraps { conv: String, wraps: Vec<WrapOut> },
+    LogAppended { conv: String, seq: i64, server_at: u64 },
+    /// `more`: there is another page after the last of these. `owed`: the
+    /// writers here who have not yet answered our joining (their entries
+    /// we cannot open yet may still become readable).
+    LogPage { conv: String, entries: Vec<LogEntry>, more: bool, owed: Vec<[u8; 16]> },
+    LogConvs { convs: Vec<(String, i64)> },
+    LogJoined { conv: String },
+    LogLeft { conv: String },
+    LogMembersFound { conv: String, members: Vec<LogKeyInfo> },
+    /// Not appended: our epoch for `conv` is not wrapped to exactly its
+    /// members any more (somebody joined or left). Mint another and resend.
+    LogRekey { conv: String },
+    /// Accounts that joined `conv` since we last wrapped our keys there. They
+    /// wait for our answer: our older keys too, if we share with joiners.
+    LogPending { conv: String, joiners: Vec<[u8; 16]> },
+    /// Somebody wrapped a key to us in `conv`.
+    LogNews { conv: String },
+}
+
+/// A wrapped epoch key for one member (`AccountRequest::EpochPut`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WrapIn {
+    pub recipient: [u8; 16],
+    pub wrapped: Vec<u8>,
+}
+
+/// A wrapped epoch key for us, from `owner`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WrapOut {
+    pub owner: [u8; 16],
+    pub epoch: u32,
+    pub wrapped: Vec<u8>,
+}
+
+/// An account's keys as the relay has them; the client checks the
+/// signature against the identity it pinned before using `logkey`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogKeyInfo {
+    pub account: [u8; 16],
+    /// The account's name, for filing what it wrote.
+    pub name: String,
+    pub identity: Vec<u8>,
+    pub logkey: Vec<u8>,
+    pub sig: Vec<u8>,
+}
+
+/// One stored message, still sealed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub seq: i64,
+    pub sender: [u8; 16],
+    pub epoch: u32,
+    /// When the relay filed it (Unix ms).
+    pub server_at: u64,
+    pub ct: Vec<u8>,
 }
 
 /// Messages sent from server to client over the control stream.
@@ -287,6 +443,12 @@ pub enum ServerMessage {
     Authenticated {
         user_id: UserId,
         session_id: SessionId,
+        /// The relay has accounts (protocol v11); `None` when it has none.
+        #[serde(default)]
+        accounts: Option<RelayAccounts>,
+        /// The account this connection signed in with.
+        #[serde(default)]
+        account: Option<AccountInfo>,
     },
 
     /// Authentication failed.
@@ -519,4 +681,12 @@ pub enum ServerMessage {
     /// server (protocol v10). User ids are never handed out twice, so they are
     /// not coming back under this one.
     DirectMessageUndelivered { target_user_id: UserId },
+
+    // ── Accounts (protocol v11) ──────────────────────────────────────
+
+    /// The next step of an account sign-in.
+    AuthStep(AuthStep),
+
+    /// An answer to an `AccountRequest`, or news about the account.
+    Account(AccountReply),
 }

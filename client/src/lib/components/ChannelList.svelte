@@ -38,6 +38,7 @@
   import { shortName } from "../username.js";
   import ChannelCreateForm from "./ChannelCreateForm.svelte";
   import Icon from "./Icons.svelte";
+  import ChannelTags from "./ChannelTags.svelte";
 
   let currentChannelName = $derived(
     $channels.find((c) => c.channel_id === $currentChannelId)?.name ?? ""
@@ -103,22 +104,10 @@
             {channel.proximity.toUpperCase()}
           </span>
         {/if}
-        {#if channel.anonymous}
-          <span class="proximity-tag" title="Anonymous: members see each other under random names">?</span>
-        {/if}
-        {#if channel.hidden}
-          <span class="proximity-tag" title="Hidden: only admins see this channel in the list">H</span>
-        {/if}
         {#if left}
           <span class="proximity-tag" title="You left this channel — click to read, rejoin to write">left</span>
         {/if}
-        {#if channel.routed}
-          <span
-            class="proximity-tag"
-            title="Routed: the server is told which members you want to hear, and forwards only their voice"
-            >R</span
-          >
-        {/if}
+        <ChannelTags {channel} />
         {#if !(channel.hide_members && !$isAdmin)}
           <span class="user-count">({channel.user_count}{#if channel.max_users > 0}/{channel.max_users}{/if})</span>
         {/if}
@@ -311,7 +300,8 @@
     color: var(--text-secondary);
   }
 
-  .proximity-tag {
+  .proximity-tag,
+  .channel :global(.proximity-tag) {
     font-size: 9px;
     font-weight: 600;
     letter-spacing: 0.05em;

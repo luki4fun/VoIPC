@@ -118,6 +118,8 @@ export interface SavedServer {
   port: number;
   username: string;
   accept_self_signed: boolean;
+  /** `username` is an account there (signed in with this device's key). */
+  account?: boolean;
 }
 
 export const savedServers = writable<SavedServer[]>([]);

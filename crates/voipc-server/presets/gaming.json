@@ -1,0 +1,59 @@
+{
+  "id": "gaming",
+  "label": "Gaming — a friend group or multi-game community",
+  "summary": "Game rooms, a stream room, a proximity campfire and a looking-for-group board.",
+  "notes": [
+    "More rooms on a busy evening: anyone can open one with + and it disappears once empty."
+  ],
+  "channels": [
+    {
+      "name": "general",
+      "description": "Where everybody lands: talk about anything",
+      "text": true,
+      "auto_join": true
+    },
+    {
+      "name": "looking-for-group",
+      "description": "Say what you want to play and when. One post a minute; posts go after a day.",
+      "text": true,
+      "auto_join": true,
+      "message_ttl_secs": 86400,
+      "slow_mode_secs": 60
+    },
+    {
+      "name": "clips-and-screens",
+      "description": "Highlights, screenshots and links worth keeping",
+      "text": true
+    },
+    {
+      "name": "Lounge",
+      "description": "Hang out between games"
+    },
+    {
+      "name": "Game Room 1",
+      "description": "Playing together — share your screen if the others want to watch"
+    },
+    {
+      "name": "Game Room 2",
+      "description": "Playing together — share your screen if the others want to watch"
+    },
+    {
+      "name": "Game Room 3",
+      "description": "Playing together — share your screen if the others want to watch"
+    },
+    {
+      "name": "Stream Room",
+      "description": "One of you streams a game, the rest watch and chat"
+    },
+    {
+      "name": "Campfire",
+      "description": "Proximity chat: you hear whoever sits next to you — move around to join a conversation",
+      "proximity": "2d"
+    },
+    {
+      "name": "AFK",
+      "description": "Away from keyboard",
+      "screen_share": false
+    }
+  ]
+}

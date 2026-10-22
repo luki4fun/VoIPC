@@ -33,6 +33,7 @@ impl SignalStores {
                 key_pair: SerializableIdentityKeyPair::from_identity_key_pair(identity_key_pair),
                 registration_id,
                 known_identities: HashMap::new(),
+                seen: Vec::new(),
             },
             prekey: VoipcPreKeyStore {
                 prekeys: HashMap::new(),
@@ -59,6 +60,25 @@ pub struct VoipcIdentityStore {
     pub registration_id: u32,
     /// Remote users' identity keys: "name.device_id" -> serialized public key
     pub known_identities: HashMap<String, Vec<u8>>,
+    /// Identities stored since the host last looked (`take_seen`), new or
+    /// changed, in either direction: a session a peer opens with a PreKey
+    /// message stores one too, and only the host knows the account pins to
+    /// check it against.
+    #[serde(skip, default)]
+    pub seen: Vec<(String, Vec<u8>)>,
+}
+
+impl VoipcIdentityStore {
+    /// `(user id, identity key)` for each identity stored since the last call.
+    pub fn take_seen(&mut self) -> Vec<(u32, Vec<u8>)> {
+        std::mem::take(&mut self.seen).into_iter().filter_map(|(name, key)| Some((crate::session::user_of(&name)?, key))).collect()
+    }
+
+    /// The identity key the session with `user_id` runs on, if there is one.
+    pub fn identity_of(&self, user_id: u32) -> Option<&[u8]> {
+        let a = crate::session::user_address(user_id);
+        self.known_identities.get(&address_key(&a)).map(Vec::as_slice)
+    }
 }
 
 fn address_key(addr: &ProtocolAddress) -> String {
@@ -85,6 +105,9 @@ impl IdentityKeyStore for VoipcIdentityStore {
         let key = address_key(address);
         let serialized = identity.serialize().to_vec();
         let existing = self.known_identities.insert(key, serialized.clone());
+        if existing.as_ref() != Some(&serialized) {
+            self.seen.push((address.name().to_string(), serialized.clone()));
+        }
         // Return true if the identity key changed (trust-on-first-use)
         Ok(existing.is_some_and(|old| old != serialized))
     }

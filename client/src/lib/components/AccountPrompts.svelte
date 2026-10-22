@@ -1,0 +1,568 @@
+<script lang="ts">
+  // The dialogs a relay account needs: the code a sign-in waits for, a new
+  // account's recovery key (shown once), setting up the authenticator app
+  // (when a role needs it, or when chosen), the recovery codes that come with
+  // it, the one question about keeping copies on the server (the first-connect
+  // setup), and the account panel. Listens for the account events both
+  // backends emit itself, so App.svelte only mounts it.
+
+  import { onDestroy, onMount } from "svelte";
+  import { get } from "svelte/store";
+  import { invoke } from "@tauri-apps/api/core";
+  import type { UnlistenFn } from "@tauri-apps/api/event";
+  import { listenServer, fromServer } from "../connect.js";
+  import { account, accountHex, accountPrompt, closePrompt, relayAccounts, showPrompt } from "../stores/account.js";
+  import { fileStoredDm, joinedTextChannelIds } from "../stores/chat.js";
+  import { channels, currentChannelId } from "../stores/channels.js";
+  import { shareChannelHistory } from "../stores/settings.js";
+  import { users } from "../stores/users.js";
+  import { expiryFor } from "../chat-rules.js";
+  import { dmMessageTtl } from "../stores/channel-ui.js";
+  import { addNotification } from "../stores/notifications.js";
+  import type { AccountInfo, RelayAccounts } from "../types.js";
+
+  let code = $state("");
+  let useRecovery = $state(false);
+  let error = $state("");
+  let busy = $state(false);
+  let qr = $state("");
+  let copied = $state(false);
+
+  /** The question about copies on the server, once the dialogs that came
+   *  first (recovery key, codes) are out of the way. */
+  let cloudNext: string | null = null;
+  let cloudChoice = $state(false);
+  let shareChoice = $state(true);
+
+  function askCloud(server: string) {
+    if (!get(relayAccounts.of(server))?.cloud) return;
+    if (get(accountPrompt)) {
+      cloudNext = server;
+      return;
+    }
+    reset();
+    cloudChoice = get(account.of(server))?.cloud ?? false;
+    shareChoice = get(shareChannelHistory);
+    showPrompt({ kind: "cloud", server, cloud: cloudChoice, share: shareChoice });
+  }
+
+  $effect(() => {
+    if (!$accountPrompt && cloudNext) {
+      const server = cloudNext;
+      cloudNext = null;
+      askCloud(server);
+    }
+  });
+
+  /** One consent, two ways: answering newcomers' requests for chat, and
+   *  handing them our older keys in a channel's log. */
+  function setShare(enabled: boolean) {
+    shareChannelHistory.set(enabled);
+    invoke("set_config_bool", { key: "share_channel_history", value: enabled }).catch((e) =>
+      addNotification(`Failed to save setting: ${e}`, "error"),
+    );
+    invoke("set_history_sharing", { enabled }).catch(() => {});
+  }
+
+  /** The logs of the channels we are in now: kept from here on. */
+  function enterLogs(server: string) {
+    const here = new Set([get(currentChannelId.of(server)), ...get(joinedTextChannelIds.of(server))]);
+    for (const ch of get(channels.of(server))) {
+      if (ch.log && here.has(ch.channel_id)) invoke("account_enter", { server, conv: ch.log }).catch(() => {});
+    }
+  }
+
+  async function submitCloud(server: string, keep: boolean) {
+    busy = true;
+    error = "";
+    try {
+      await invoke("account_set_prefs", { server, prefs: { cloud: keep, asked: true } });
+      account.of(server).update((a) => (a ? { ...a, cloud: keep } : a));
+      if (shareChoice !== get(shareChannelHistory)) setShare(shareChoice);
+      if (keep) enterLogs(server);
+      closePrompt();
+    } catch (e) {
+      error = String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  function reset() {
+    code = "";
+    useRecovery = false;
+    error = "";
+    busy = false;
+    qr = "";
+    copied = false;
+  }
+
+  function askTotpSetup(server: string) {
+    invoke("account_request", { server, request: "TotpSetup" }).catch((e) =>
+      addNotification(`${fromServer(server)}could not start two-factor setup: ${e}`, "warning"),
+    );
+  }
+
+  const unlisten: Promise<UnlistenFn>[] = [];
+  onMount(() => {
+    unlisten.push(
+      listenServer<RelayAccounts>("relay-accounts", (server, data) => relayAccounts.of(server).set(data)),
+      listenServer<{
+        name: string;
+        relay_id: string;
+        info: AccountInfo;
+        recovery: string | null;
+        prefs: { cloud: boolean; asked: boolean };
+      }>(
+        "account-signed-in",
+        (server, d) => {
+          account.of(server).set({ name: d.name, relayId: d.relay_id, info: d.info, cloud: d.prefs.cloud });
+          // The second factor a role needs is asked for by the backend once the
+          // connection is listed (account.rs after_connect); its setup waits
+          // behind the recovery key, which nothing replaces.
+          if (d.recovery) {
+            reset();
+            showPrompt({ kind: "recovery", server, key: d.recovery });
+          }
+          // The first-connect setup's question, once per account, after the
+          // recovery key (which waits for nothing).
+          if (!d.prefs.asked) askCloud(server);
+        },
+      ),
+      listenServer<boolean>("account-need-totp", (server, retry) => {
+        reset();
+        showPrompt({ kind: "totp", server, retry });
+      }),
+      listenServer<unknown>("account-reply", (server, reply) => onReply(server, reply)),
+      // The stored log of a direct conversation: what was written while one of us was away.
+      listenServer<{
+        peer_name: string;
+        peer_account: string;
+        from_me: boolean;
+        message_id: string | null;
+        content: string;
+        ttl_secs: number | null;
+        timestamp: number;
+      }>("stored-dm", (server, m) => {
+        const me = get(account.of(server));
+        if (!me) return;
+        const online = get(users.of(server)).find((u) => u.username === m.peer_name);
+        fileStoredDm(
+          server,
+          m,
+          { name: me.name, account: accountHex(me.info.id) },
+          expiryFor(m.timestamp, m.ttl_secs ?? undefined, dmMessageTtl(server, m.peer_name)),
+          online?.user_id,
+        );
+      }),
+      listenServer<{ reason: string }>("stored-not-kept", (server, d) =>
+        addNotification(`${fromServer(server)}not kept on the server: ${d.reason}`, "warning"),
+      ),
+    );
+  });
+  onDestroy(() => unlisten.forEach((u) => u.then((f) => f())));
+
+  function onReply(server: string, reply: unknown) {
+    const [tag, body] =
+      typeof reply === "string" ? [reply, {}] : (Object.entries(reply as Record<string, any>)[0] ?? ["", {}]);
+    const prompt = get(accountPrompt);
+    switch (tag) {
+      case "TotpSetup": {
+        // A role's codes come first; the question waits for them.
+        if (prompt?.kind === "cloud") cloudNext = prompt.server;
+        reset();
+        const why = get(account.of(server))?.info.needs_2fa ? "required" : "chosen";
+        showPrompt({ kind: "totp-setup", server, secret: body.secret, uri: body.uri, sealed: body.sealed, why });
+        invoke<string>("qr_svg", { text: body.uri }).then((svg) => (qr = svg), () => (qr = ""));
+        break;
+      }
+      case "TotpEnabled":
+        reset();
+        showPrompt({ kind: "recovery-codes", server, codes: body.recovery_codes });
+        break;
+      case "Info": {
+        const before = get(account.of(server))?.info.needs_2fa;
+        account.of(server).update((a) => (a ? { ...a, info: body as AccountInfo } : a));
+        // A role arrived (the admin token's claim, a grant): it waits for codes.
+        if ((body as AccountInfo).needs_2fa && !before && prompt?.kind !== "totp-setup") askTotpSetup(server);
+        break;
+      }
+      case "DeviceAdded":
+        addNotification(`${fromServer(server)}this device is remembered — no password next time`, "info");
+        break;
+      case "Error":
+        if (prompt && prompt.server === server && prompt.kind === "totp-setup") {
+          error = body.reason;
+          busy = false;
+        } else {
+          addNotification(`${fromServer(server)}${body.reason}`, "warning");
+        }
+        break;
+    }
+  }
+
+  async function submitTotp() {
+    const p = get(accountPrompt);
+    if (!p || p.kind !== "totp" || !code.trim()) return;
+    busy = true;
+    try {
+      await invoke("account_totp", { server: p.server, code: code.trim(), recovery: useRecovery });
+      closePrompt(p);
+    } catch (e) {
+      error = String(e);
+    } finally {
+      busy = false;
+    }
+  }
+
+  function cancelTotp() {
+    const p = get(accountPrompt);
+    if (p) invoke("account_cancel", { server: p.server }).catch(() => {});
+    closePrompt();
+  }
+
+  async function submitSetup() {
+    const p = get(accountPrompt);
+    if (!p || p.kind !== "totp-setup" || !/^\d{6}$/.test(code.trim())) {
+      error = "Type the 6 digits the app shows.";
+      return;
+    }
+    busy = true;
+    error = "";
+    try {
+      await invoke("account_request", {
+        server: p.server,
+        request: { TotpEnable: { sealed: p.sealed, code: code.trim() } },
+      });
+    } catch (e) {
+      error = String(e);
+      busy = false;
+    }
+  }
+
+  async function copy(text: string) {
+    try {
+      await navigator.clipboard.writeText(text);
+      copied = true;
+    } catch {
+      copied = false;
+    }
+  }
+
+  function closeRecovery() {
+    closePrompt();
+  }
+</script>
+
+{#if $accountPrompt}
+  {@const p = $accountPrompt}
+  <div class="overlay">
+    <div class="dialog account-dialog" data-kind={p.kind}>
+      {#if p.kind === "totp"}
+        <h2>Two-factor code</h2>
+        <p class="hint">
+          {#if p.retry}That code was not right — try the next one.
+          {:else}{fromServer(p.server)}enter the code from your authenticator app.{/if}
+        </p>
+        <div class="field">
+          <label for="acct-code">{useRecovery ? "Recovery code" : "Code"}</label>
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            id="acct-code"
+            type="text"
+            inputmode={useRecovery ? "text" : "numeric"}
+            autocomplete="one-time-code"
+            autofocus
+            bind:value={code}
+            placeholder={useRecovery ? "abcd-efgh-jkmn" : "123456"}
+            disabled={busy}
+            onkeydown={(e) => e.key === "Enter" && submitTotp()}
+          />
+        </div>
+        <button type="button" class="link" onclick={() => (useRecovery = !useRecovery)}>
+          {useRecovery ? "Use a code from the app" : "Lost your phone? Use a recovery code"}
+        </button>
+        {#if error}<div class="error">{error}</div>{/if}
+        <div class="buttons">
+          <button type="button" class="secondary" onclick={cancelTotp} disabled={busy}>Cancel</button>
+          <button type="button" class="submit-btn" onclick={submitTotp} disabled={busy || !code.trim()}>Sign in</button>
+        </div>
+      {:else if p.kind === "recovery"}
+        <h2>Your recovery key</h2>
+        <p class="hint">
+          Write it down and keep it somewhere safe: it is how you will get back into your account's encrypted vault
+          if you lose your password, once VoIPC can reset one (this version cannot yet). VoIPC shows it only now,
+          and the server cannot recover it for you.
+        </p>
+        <code class="secret">{p.key}</code>
+        <button type="button" class="secondary" onclick={() => copy(p.key)}>{copied ? "Copied" : "Copy"}</button>
+        <button type="button" class="submit-btn" onclick={closeRecovery}>I have written it down</button>
+      {:else if p.kind === "totp-setup"}
+        <h2>Set up two-factor codes</h2>
+        <p class="hint">
+          {#if p.why === "required"}Your role on this server needs a second factor before its rights apply.{/if}
+          Scan this with an authenticator app (Aegis, 2FAS, Google Authenticator…), then type the code it shows.
+        </p>
+        {#if qr}
+          <div class="qr">{@html qr}</div>
+        {/if}
+        <details>
+          <summary>Can't scan? Type the key in</summary>
+          <code class="secret">{p.secret}</code>
+        </details>
+        <div class="field">
+          <label for="acct-setup-code">Code</label>
+          <input
+            id="acct-setup-code"
+            type="text"
+            inputmode="numeric"
+            autocomplete="one-time-code"
+            bind:value={code}
+            placeholder="123456"
+            disabled={busy}
+            onkeydown={(e) => e.key === "Enter" && submitSetup()}
+          />
+        </div>
+        {#if error}<div class="error">{error}</div>{/if}
+        <div class="buttons">
+          <button type="button" class="secondary" onclick={() => closePrompt()} disabled={busy}>Later</button>
+          <button type="button" class="submit-btn" onclick={submitSetup} disabled={busy}>Turn on</button>
+        </div>
+      {:else if p.kind === "safety"}
+        <h2>Verify {p.name}</h2>
+        <p class="hint">
+          Compare this number with {p.name} in person or on a call. If it matches theirs, nobody — not even this
+          server — stands between your encrypted messages. It changes when either of you gets a new identity.
+        </p>
+        <code class="secret codes safety">{p.number}</code>
+        <button type="button" class="submit-btn" onclick={() => closePrompt()}>Done</button>
+      {:else if p.kind === "cloud"}
+        <h2>Keep your messages here too?</h2>
+        <p class="hint">
+          With a copy on {fromServer(p.server).replace(/: $/, "") || "this server"}, you can read your messages on
+          your other devices, and what people write while you are away waits for you. This device keeps them only in
+          its own chat history, if that is on; the browser keeps none between visits.
+        </p>
+        <p class="hint small">
+          The copy is end-to-end encrypted: the server cannot read it. It does learn who wrote in which channel or
+          conversation, when, how long each message is and when its copy may be deleted, and which channels you keep.
+          Kept messages are signed by you, so the people they are for can prove you wrote them, and whoever gets into
+          your account later can read them.
+        </p>
+        <label class="check">
+          <input type="checkbox" bind:checked={shareChoice} disabled={busy} />
+          <span>Let people who join a channel later read what I wrote there before</span>
+        </label>
+        {#if error}<div class="error">{error}</div>{/if}
+        <div class="buttons">
+          <button type="button" class="secondary" onclick={() => submitCloud(p.server, false)} disabled={busy}>
+            Only on this device
+          </button>
+          <button type="button" class="submit-btn" onclick={() => submitCloud(p.server, true)} disabled={busy}>
+            Keep a copy here
+          </button>
+        </div>
+      {:else if p.kind === "account" && $account}
+        <!-- `p` follows the store: a handler reads p.server before closePrompt(). -->
+        <h2>{$account.name}</h2>
+        <p class="hint">
+          {$account.info.scopes.includes("*") ? "Admin" : $account.info.scopes.includes("voipc:moderate") ? "Moderator" : "Member"}
+          · two-factor codes {$account.info.totp_enabled ? "on" : "off"}
+        </p>
+        <div class="rows">
+          <div class="row">
+            <span>Messages kept on this server: <strong>{$account.cloud ? "yes" : "no"}</strong></span>
+            <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); askCloud(server); }}>Change</button>
+          </div>
+          {#if !$account.info.totp_enabled}
+            <div class="row">
+              <span>Two-factor codes protect the account on new devices.</span>
+              <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); askTotpSetup(server); }}>Set up</button>
+            </div>
+          {/if}
+          <div class="row">
+            <span>If this device is remembered, it signs in without the password.</span>
+            <button
+              type="button"
+              class="secondary"
+              onclick={() =>
+                invoke("forget_device", { server: p.server, name: $account?.name ?? "" }).then(
+                  () => addNotification(`${fromServer(p.server)}this device is forgotten: the password is needed next time`, "info"),
+                  (e) => addNotification(String(e), "warning"),
+                )}
+            >Forget</button>
+          </div>
+        </div>
+        <button type="button" class="submit-btn" onclick={() => closePrompt()}>Done</button>
+      {:else if p.kind === "recovery-codes"}
+        <h2>Recovery codes</h2>
+        <p class="hint">
+          Each one signs you in once without your phone. Keep them with your recovery key; they are shown only now.
+        </p>
+        <code class="secret codes">{p.codes.join("\n")}</code>
+        <button type="button" class="secondary" onclick={() => copy(p.codes.join("\n"))}>{copied ? "Copied" : "Copy"}</button>
+        <button type="button" class="submit-btn" onclick={() => closePrompt()}>Done</button>
+      {/if}
+    </div>
+  </div>
+{/if}
+
+<style>
+  .overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.7);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    /* Above the connect dialog (100) and the setup pop-ups (200/210): a
+       sign-in waiting for a code must not sit behind them. */
+    z-index: 220;
+  }
+
+  .dialog {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 28px;
+    width: 380px;
+    max-width: calc(100vw - 32px);
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+  }
+
+  h2 {
+    text-align: center;
+    font-size: 20px;
+    color: var(--accent);
+  }
+
+  .hint {
+    text-align: center;
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+
+  .field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+  }
+
+  label {
+    font-size: 12px;
+    color: var(--text-secondary);
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+
+  .secret {
+    display: block;
+    padding: 10px;
+    background: var(--bg-primary);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    font-family: monospace;
+    font-size: 14px;
+    word-break: break-all;
+    text-align: center;
+    user-select: all;
+  }
+
+  .codes {
+    white-space: pre;
+  }
+
+  .small {
+    font-size: 12px;
+  }
+
+  .check {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    text-transform: none;
+    letter-spacing: normal;
+    font-size: 13px;
+    color: var(--text-primary);
+  }
+
+  .rows {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+
+  .row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 13px;
+  }
+
+  .row span {
+    flex: 1;
+  }
+
+  .safety {
+    white-space: normal;
+    letter-spacing: 1px;
+    line-height: 1.8;
+  }
+
+  .qr {
+    align-self: center;
+    background: white;
+    padding: 8px;
+    border-radius: 6px;
+    line-height: 0;
+  }
+
+  .link {
+    background: none;
+    border: none;
+    color: var(--accent);
+    font-size: 12px;
+    cursor: pointer;
+    align-self: center;
+  }
+
+  .error {
+    color: var(--danger);
+    font-size: 13px;
+    text-align: center;
+  }
+
+  .buttons {
+    display: flex;
+    gap: 8px;
+  }
+
+  .buttons > * {
+    flex: 1;
+  }
+
+  .submit-btn {
+    background: var(--accent);
+    color: white;
+    padding: 10px;
+    font-size: 14px;
+    font-weight: 600;
+  }
+
+  .submit-btn:hover:not(:disabled) {
+    background: var(--accent-hover);
+  }
+
+  .submit-btn:disabled,
+  .secondary:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+  }
+
+  .secondary {
+    padding: 10px;
+    font-size: 14px;
+  }
+</style>

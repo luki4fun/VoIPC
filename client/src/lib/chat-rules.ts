@@ -224,6 +224,9 @@ function sameMessage(a: ChatMessage, b: ChatMessage): boolean {
   // every member can, so one member could note another's, offer a history
   // containing their own message under it, and have whichever copy landed first
   // shadow the real one. An id only identifies a message among that sender's.
+  // Between accounts, the account is the author: a user id is new on every
+  // connect, so a message from the stored log carries none worth comparing.
+  if (a.id && b.id && a.account && b.account) return a.account === b.account && a.id === b.id;
   if (a.id && b.id) return a.user_id === b.user_id && a.id === b.id;
   return (
     a.user_id === b.user_id &&
