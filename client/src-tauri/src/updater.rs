@@ -335,7 +335,7 @@ mod tests {
             .unwrap();
         let key = String::from_utf8(key).unwrap();
         assert!(
-            key.contains("minisign public key: 7A18259E495D3861"),
+            key.contains("minisign public key: 5F2A2C7C66012298"),
             "{key}"
         );
         // What the plugin does with it at start: a config it cannot read
