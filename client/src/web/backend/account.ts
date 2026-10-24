@@ -6,15 +6,63 @@
 // desktop's counterpart is client/src-tauri/src/account.rs; both emit the
 // same events, so one front end serves both.
 
+import { toHex } from "../../lib/hex";
 import { getConfig } from "./config";
 import { cursorStorageKey, findDevice, saveDevice } from "./devices";
-import { wasm, type AccountActions, type AccountMethod, type AccountSession, type AccountSignIn, type SignalClient } from "./wasm";
+import { wasm, type AccountActions, type AccountMethod, type AccountSession, type AccountSignIn, type SignInStep, type SignalClient } from "./wasm";
 
 /** How the front end wants a connection to sign in. */
 export type AccountArgs =
   | { kind: "login"; password: string }
   | { kind: "register"; password: string; invite?: string | null }
-  | { kind: "device" };
+  | { kind: "device" }
+  | { kind: "reset"; recovery: string; password: string };
+
+/** What a reset ends with (account.rs RESET_DONE): the relay closes that
+ *  connection, and the front end signs in with the new password. */
+export const RESET_DONE = "Your password was reset. Sign in with the new one.";
+
+/** The relay id (hex) each address named at its last account sign-in, as the
+ *  desktop keeps `relay_ids` in its settings (1.0 audit H5-01): a server
+ *  claiming another's id never gets a password stretched for that one. */
+const RELAY_IDS = "voipc.relay_ids";
+
+function relayIds(): Record<string, string> {
+  try {
+    const o = JSON.parse(localStorage.getItem(RELAY_IDS) ?? "{}");
+    return o && typeof o === "object" ? o : {};
+  } catch {
+    return {};
+  }
+}
+
+function setRelayId(server: string, id: string | null): boolean {
+  const ids = relayIds();
+  const had = server in ids;
+  if (id === null) delete ids[server];
+  else ids[server] = id;
+  try {
+    localStorage.setItem(RELAY_IDS, JSON.stringify(ids));
+  } catch {
+    // Asked again at the next sign-in
+  }
+  return had;
+}
+
+/** Forget the relay id remembered for `server` (it moved, or was set up again). */
+export function forgetRelayId(server: string): boolean {
+  return setRelayId(server, null);
+}
+
+/** PBKDF2-SHA256 of a password (NFC, as the front end hands it) with `salt`:
+ *  voipc_crypto::account::stretch in WebCrypto, which is about eight times
+ *  faster than in wasm on a phone (1.0 audit H5-18). */
+async function stretch(password: string, salt: string): Promise<Uint8Array> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey("raw", enc.encode(password), "PBKDF2", false, ["deriveBits"]);
+  const bits = await crypto.subtle.deriveBits({ name: "PBKDF2", hash: "SHA-256", salt: enc.encode(salt), iterations: wasm().kdfRounds() }, key, 256);
+  return new Uint8Array(bits);
+}
 
 /** What the driver needs from its session. */
 export interface AccountHost {
@@ -28,8 +76,9 @@ export interface AccountHost {
 }
 
 /** What this browser keeps of an account's stored log (how far it read, who
- *  it named as readers). localStorage is per origin, and the relay is the
- *  origin, so the key needs only the account. */
+ *  it named as readers), under a key with the relay id and the account
+ *  (`cursorStorageKey`): one page's localStorage serves every server opened
+ *  in it, not only the one that served it. */
 function readCursors(key: string): string | null {
   try {
     return localStorage.getItem(key);
@@ -58,7 +107,12 @@ export class AccountDriver {
   /** What follows the sign-in (voipc_crypto::account_session, as on the desktop). */
   private session: AccountSession | null = null;
 
-  private constructor(signIn: AccountSignIn, private readonly passwordBased: boolean) {
+  private constructor(
+    signIn: AccountSignIn,
+    private readonly passwordBased: boolean,
+    /** For the `stretch` step; none for a device-key sign-in. */
+    private readonly password: string | null,
+  ) {
     this.signIn = signIn;
   }
 
@@ -76,7 +130,15 @@ export class AccountDriver {
     } else {
       method = args;
     }
-    return new AccountDriver(api.newAccountSignIn(name, method), args.kind !== "device");
+    const signIn = api.newAccountSignIn(name, method);
+    const ids = relayIds();
+    signIn.expectRelay(
+      ids[server],
+      Object.entries(ids)
+        .filter(([s]) => s !== server)
+        .map(([s, id]) => [id, s]),
+    );
+    return new AccountDriver(signIn, args.kind !== "device", args.kind === "device" ? null : args.password);
   }
 
   /** The Authenticate payload. */
@@ -89,24 +151,39 @@ export class AccountDriver {
   onPayload(host: AccountHost, payload: Uint8Array): void {
     const signIn = this.signIn;
     if (!signIn) return;
-    let steps;
     try {
-      // The password's stretching runs in here, on this thread: a second or two.
-      steps = signIn.step(payload);
+      this.steps(host, signIn, signIn.step(payload));
     } catch (e) {
       host.failAuth(e instanceof Error ? e : new Error(String(e)));
-      return;
     }
+  }
+
+  private steps(host: AccountHost, signIn: AccountSignIn, steps: SignInStep[]): void {
     for (const s of steps) {
       if (s.send) {
         host.sendRaw(s.send);
       } else if (s.keys) {
-        const client = wasm().signalClientFromIdentity(signIn.identity());
+        const client = signIn.signalClient();
         host.replaceSignal(client);
         host.sendRaw(signIn.keys(client.bundle().prekey_bundle));
       } else if (s.needTotp) {
         void this.askTotp(host, signIn);
+      } else if (s.stretch !== undefined) {
+        void this.stretchThen(host, signIn, s.stretch);
+      } else if (s.resetDone) {
+        host.failAuth(new Error(RESET_DONE));
       }
+    }
+  }
+
+  /** The password's stretching, off the page's thread, then the machine's next steps. */
+  private async stretchThen(host: AccountHost, signIn: AccountSignIn, salt: string): Promise<void> {
+    try {
+      const master = await stretch(this.password ?? "", salt);
+      // The sign-in may have ended meanwhile
+      if (this.signIn === signIn) this.steps(host, signIn, signIn.stretched(master));
+    } catch (e) {
+      host.failAuth(e instanceof Error ? e : new Error(String(e)));
     }
   }
 
@@ -143,6 +220,7 @@ export class AccountDriver {
     if (!this.signIn) return;
     const signIn = this.signIn;
     const done = signIn.finish();
+    if (relayIds()[host.server] !== toHex(done.relay_id)) setRelayId(host.server, toHex(done.relay_id));
     const memory = readCursors(cursorStorageKey(done.relay_id, done.name));
     const { session, actions } = signIn.startSession(info, memory, getConfig().share_channel_history, this.passwordBased);
     signIn.free();
@@ -184,9 +262,9 @@ export class AccountDriver {
 
   /** The users of a UserList or UserJoined, for the pins. Never throws: the
    *  roster itself must still be shown. */
-  noteRoster(users: unknown[]): void {
+  noteRoster(host: AccountHost, users: unknown[]): void {
     try {
-      this.session?.noteRoster(users);
+      if (this.session) this.run(host, this.session.noteRoster(users));
     } catch (e) {
       console.warn("could not read the roster's accounts:", e);
     }
@@ -218,6 +296,26 @@ export class AccountDriver {
     if (this.session) this.run(host, this.session.enter(conv));
   }
 
+  /** Delete what this account wrote to the stored logs, in `conv` or everywhere. */
+  purge(host: AccountHost, conv: string | null): void {
+    if (!this.session) throw new Error("Not signed in to an account on that server");
+    this.run(host, this.session.purge(conv));
+  }
+
+  /** Delete this account; `AccountDeleted` answers as `account-reply`. */
+  async deleteAccount(host: AccountHost, password: string, totp: string | null, recovery: string | null): Promise<void> {
+    const session = this.session;
+    if (!session) throw new Error("Not signed in to an account on that server");
+    const master = await stretch(password, session.kdfSalt());
+    if (this.session !== session) throw new Error("The connection ended.");
+    this.run(host, session.deleteAccount(master, totp, recovery));
+  }
+
+  /** Out of channel log `conv`; with `tell`, the relay is asked to take us out. */
+  leave(host: AccountHost, conv: string, tell: boolean): void {
+    if (this.session) this.run(host, this.session.leave(conv, tell));
+  }
+
   keptFor(userId: number): boolean {
     return this.session?.keptFor(userId) ?? false;
   }
@@ -234,6 +332,19 @@ export class AccountDriver {
 
   prefs(): { cloud: boolean; asked: boolean } | null {
     return this.session ? { cloud: this.session.cloud(), asked: this.session.asked() } : null;
+  }
+
+  /** A new password: the current one, and a code where the account has codes
+   *  on. The answer comes as `account-reply` (`PasswordChanged`, or an Error
+   *  for `PasswordChange`). */
+  async passwordChange(host: AccountHost, old: string, next: string, totp: string | null, recovery: string | null): Promise<void> {
+    const session = this.session;
+    if (!session) throw new Error("Not signed in to an account on that server");
+    if ([...next].length < 10) throw new Error("Use a password of at least 10 characters.");
+    const salt = session.kdfSalt();
+    const [o, n] = await Promise.all([stretch(old, salt), stretch(next, salt)]);
+    if (this.session !== session) throw new Error("The connection ended.");
+    this.run(host, session.passwordChange(o, n, totp, recovery));
   }
 
   setPrefs(host: AccountHost, cloud: boolean, asked: boolean): void {

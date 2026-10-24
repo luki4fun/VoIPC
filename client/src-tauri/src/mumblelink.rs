@@ -47,64 +47,7 @@ const POLL: std::time::Duration = std::time::Duration::from_millis(50);
 /// that stops updating), and the last position is stale.
 const STALE: std::time::Duration = std::time::Duration::from_secs(1);
 
-/// Bytes of the block we read: `uiVersion` (4) + `uiTick` (4) + three
-/// `[f32; 3]` vectors (36). Everything after this is text about the player.
-const HEAD: usize = 44;
-
-/// The only version of the layout anyone writes.
-const LINK_VERSION: u32 = 2;
-
-/// The part of `LinkedMem` this reads.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Link {
-    pub tick: u32,
-    /// Metres, VoIPC's frame: x/y on the ground, z up.
-    pub pos: [f32; 3],
-    /// Unit forward vector in the ground plane.
-    pub fwd: [f32; 2],
-}
-
-/// Parse the head of a MumbleLink block, or `None` if it is not one we trust.
-///
-/// Free-standing and pure, so every rule above can be checked without a game,
-/// a mapping or an app.
-pub fn parse_link(buf: &[u8]) -> Option<Link> {
-    if buf.len() < HEAD {
-        return None;
-    }
-    let u32_at = |i: usize| u32::from_le_bytes(buf[i..i + 4].try_into().expect("4 bytes"));
-    let f32_at = |i: usize| f32::from_le_bytes(buf[i..i + 4].try_into().expect("4 bytes"));
-    if u32_at(0) != LINK_VERSION {
-        return None;
-    }
-    let tick = u32_at(4);
-    // A block nobody has written yet reads as zeroes, which is a valid
-    // position at the origin — the tick is what tells the two apart.
-    if tick == 0 {
-        return None;
-    }
-    let avatar_pos = [f32_at(8), f32_at(12), f32_at(16)];
-    let avatar_front = [f32_at(20), f32_at(24), f32_at(28)];
-    if !avatar_pos.iter().chain(avatar_front.iter()).all(|c| c.is_finite()) {
-        return None;
-    }
-    // Mumble's frame is the one games render in: Y up, and metres. VoIPC's is
-    // the one games *simulate* in, which GTA and every mod so far agree on:
-    // x/y on the ground, z up. So y and z swap.
-    let pos = [avatar_pos[0], avatar_pos[2], avatar_pos[1]];
-    let fwd = {
-        let (x, y) = (avatar_front[0], avatar_front[2]);
-        let len = (x * x + y * y).sqrt();
-        if len > 1e-6 {
-            [x / len, y / len]
-        } else {
-            // Looking straight up or down: keep the default rather than
-            // dividing by nothing.
-            [0.0, 1.0]
-        }
-    };
-    Some(Link { tick, pos, fwd })
-}
+use voipc_audio::game::{parse_link, Link, LINK_HEAD as HEAD};
 
 /// Where the block lives, and how to read it.
 #[cfg(target_os = "linux")]
@@ -259,10 +202,16 @@ pub fn spawn(app: tauri::AppHandle) {
             // for the rest of the session is worse than beaconing none.
             match last_tick {
                 Some((tick, _)) if tick == link.tick => {
-                    if driving && last_tick.is_some_and(|(_, at)| at.elapsed() >= STALE) {
-                        info!("MumbleLink went stale — handing positions back");
-                        driving = false;
-                        stop_driving(&app).await;
+                    if last_tick.is_some_and(|(_, at)| at.elapsed() >= STALE) {
+                        // Reopened on the next poll: a restarted game may have
+                        // made a new file, and the old one, unlinked, still
+                        // reads — the frozen tick, for ever (H4-19).
+                        block = None;
+                        if driving {
+                            info!("MumbleLink went stale — handing positions back");
+                            driving = false;
+                            stop_driving(&app).await;
+                        }
                     }
                     continue;
                 }

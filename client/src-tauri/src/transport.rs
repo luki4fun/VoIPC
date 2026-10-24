@@ -118,15 +118,26 @@ pub struct Link {
 /// carries the session; when neither does, the error names both.
 ///
 /// `VOIPC_TRANSPORT=tcp` skips QUIC, to test the fallback without blocking UDP.
-pub async fn connect(host: &str, port: u16, accept_invalid_certs: bool) -> Result<Link, String> {
-    let link = connect_any(host, port, accept_invalid_certs).await;
-    if accept_invalid_certs {
-        tofu_settle(&tofu_key(host, port), link.is_ok());
-    }
-    link
+/// With the link, the fingerprint pinned on this connect when it was the
+/// first sight of the server's certificate, for the person to compare with
+/// what the server's operator gives them (`voipc-server cert fingerprint`).
+pub async fn connect(host: &str, port: u16, accept_invalid_certs: bool) -> Result<(Link, Option<String>), String> {
+    let (link, first_sight) = connect_any(host, port, accept_invalid_certs).await?;
+    let pinned = if accept_invalid_certs { tofu_pin(&tofu_key(host, port), &first_sight) } else { None };
+    Ok((link, pinned))
 }
 
-async fn connect_any(host: &str, port: u16, accept_invalid_certs: bool) -> Result<Link, String> {
+/// SHA-256 as the server prints it: colon-separated upper-case hex.
+fn fingerprint_text(fp: &[u8]) -> String {
+    fp.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
+}
+
+/// What one attempt's verifier saw of a certificate never pinned before. Its
+/// own, per attempt: the QUIC and TCP attempts race, and only the one that
+/// carries the session may be pinned (a loser verified last must not be).
+type FirstSight = Arc<std::sync::Mutex<Option<Vec<u8>>>>;
+
+async fn connect_any(host: &str, port: u16, accept_invalid_certs: bool) -> Result<(Link, FirstSight), String> {
     let addrs: Vec<SocketAddr> =
         tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host((host, port)))
             .await
@@ -187,11 +198,11 @@ async fn connect_quic(
     addrs: &[SocketAddr],
     accept_invalid_certs: bool,
     deadline: Instant,
-) -> Result<Link, String> {
+) -> Result<(Link, FirstSight), String> {
     let mut last_err = format!("Could not connect to {host}:{port}");
     let mut established = None;
     for &server_addr in addrs {
-        let tls = tls_config(host, port, accept_invalid_certs, b"h3")?;
+        let (tls, sight) = tls_config(host, port, accept_invalid_certs, b"h3")?;
         // Bind in the server's address family: a v6 wildcard socket is not
         // available everywhere and a v4 one cannot reach a v6 server.
         let bind: SocketAddr = if server_addr.is_ipv4() {
@@ -209,7 +220,10 @@ async fn connect_quic(
         transport
             .max_concurrent_uni_streams(24u32.into())
             .receive_window((2u32 * 1024 * 1024).into())
-            .send_fairness(false);
+            .send_fairness(false)
+            // Stale voice is dropped, oldest first, instead of a 1 MiB backlog
+            // bursting out after a stall (as on the relay, web.rs)
+            .datagram_send_buffer_size(64 * 1024);
         let config = ClientConfig::builder()
             .with_bind_address(bind)
             .with_custom_tls_and_transport(tls, transport)
@@ -236,7 +250,7 @@ async fn connect_quic(
         .await
         {
             Ok(Ok(connection)) => {
-                established = Some((endpoint, connection));
+                established = Some((endpoint, connection, sight));
                 break;
             }
             Ok(Err(e)) => {
@@ -249,7 +263,7 @@ async fn connect_quic(
             }
         }
     }
-    let (endpoint, connection) = established.ok_or(last_err)?;
+    let (endpoint, connection, sight) = established.ok_or(last_err)?;
     info!("QUIC handshake complete (rtt {:?})", connection.rtt());
 
     let (control_send, control_recv) = tokio::time::timeout(CONNECT_TIMEOUT, async {
@@ -262,14 +276,17 @@ async fn connect_quic(
     // Control messages must not wait behind video frames, which go out in order.
     control_send.set_priority(1);
 
-    Ok(Link {
-        conn: Conn::Quic(Quic {
-            endpoint,
-            connection,
-        }),
-        control_send: Box::new(control_send),
-        control_recv: Box::new(control_recv),
-    })
+    Ok((
+        Link {
+            conn: Conn::Quic(Quic {
+                endpoint,
+                connection,
+            }),
+            control_send: Box::new(control_send),
+            control_recv: Box::new(control_recv),
+        },
+        sight,
+    ))
 }
 
 // ── Media inputs ─────────────────────────────────────────────────────────
@@ -423,8 +440,10 @@ async fn connect_tunnel(
     addrs: &[SocketAddr],
     accept_invalid_certs: bool,
     deadline: Instant,
-) -> Result<Link, String> {
-    let tls = tls_config(host, port, accept_invalid_certs, b"http/1.1")?;
+) -> Result<(Link, FirstSight), String> {
+    // One attempt at a time below, so the slot holds the last one tried: the
+    // one that connected.
+    let (tls, sight) = tls_config(host, port, accept_invalid_certs, b"http/1.1")?;
     let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
     // The real name, unlike QUIC's NATIVE_SNI: the TLS port shows everyone
     // the operator certificate, and a proxy routing by SNI needs the name.
@@ -442,7 +461,7 @@ async fn connect_tunnel(
         match tokio::time::timeout(remaining, open_tunnel(&connector, name.clone(), addr, &host_header))
             .await
         {
-            Ok(Ok(link)) => return Ok(link),
+            Ok(Ok(link)) => return Ok((link, sight)),
             Ok(Err(e)) => {
                 warn!("{e}");
                 last_err = e;
@@ -709,7 +728,8 @@ fn tls_config(
     port: u16,
     accept_invalid_certs: bool,
     alpn: &[u8],
-) -> Result<rustls::ClientConfig, String> {
+) -> Result<(rustls::ClientConfig, FirstSight), String> {
+    let sight = FirstSight::default();
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let builder = rustls::ClientConfig::builder_with_provider(provider.clone())
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -721,6 +741,7 @@ fn tls_config(
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(TofuCertVerifier {
                 key: tofu_key(host, port),
+                seen: sight.clone(),
             }))
             .with_no_client_auth()
     } else {
@@ -736,7 +757,7 @@ fn tls_config(
             .with_no_client_auth()
     };
     config.alpn_protocols = vec![alpn.to_vec()];
-    Ok(config)
+    Ok((config, sight))
 }
 
 /// Resolves any host name to the server address, so the URL can carry
@@ -805,52 +826,75 @@ impl ServerCertVerifier for VerifyAs {
 static TOFU_STORE: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<u8>>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(tofu_load_from_disk()));
 
-/// First sight of a server's certificate, until the connection it was shown
-/// on is up. The verifier runs before the handshake proves the server holds
+/// The pin file could not be read. It is left as it is, nothing is pinned or
+/// saved, and self-signed servers are refused until "Forget pinned
+/// certificate" starts the list over: with no pins, every server would be a
+/// first sight, and a man in the middle would be pinned unseen.
+static TOFU_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Pin what the verifier of the connection that carries the session saw, on
+/// first sight. The verifier runs before the handshake proves the server holds
 /// the key, so pinning there let anybody on the path who could show *a*
 /// certificate — with no key behind it — pin theirs, and lock the real server
 /// out as "fingerprint changed".
-static TOFU_PENDING: std::sync::LazyLock<std::sync::Mutex<HashMap<String, Vec<u8>>>> =
-    std::sync::LazyLock::new(Default::default);
-
-/// Pin what the verifier saw first on a connect that succeeded; forget it on
-/// one that did not.
-fn tofu_settle(key: &str, connected: bool) {
-    let seen = TOFU_PENDING
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .remove(key);
-    let Some(fingerprint) = seen.filter(|_| connected) else {
-        return;
-    };
+fn tofu_pin(key: &str, seen: &FirstSight) -> Option<String> {
+    let fingerprint = seen.lock().unwrap_or_else(|p| p.into_inner()).take()?;
     let mut store = TOFU_STORE.lock().unwrap_or_else(|p| p.into_inner());
-    if !store.contains_key(key) {
-        info!("TOFU: pinning certificate for {} (first connection)", key);
-        store.insert(key.to_string(), fingerprint);
-        tofu_save_to_disk(&store);
+    if store.contains_key(key) {
+        return None;
     }
+    info!("TOFU: pinning certificate for {} (first connection)", key);
+    let text = fingerprint_text(&fingerprint);
+    store.insert(key.to_string(), fingerprint);
+    tofu_save_to_disk(&store);
+    Some(text)
 }
 
-/// Load TOFU pins from disk. Returns empty map on any error.
-fn tofu_load_from_disk() -> HashMap<String, Vec<u8>> {
+fn tofu_path() -> std::path::PathBuf {
+    crate::config::data_dir().join("tofu_pins.json")
+}
+
+/// Load TOFU pins from disk: none for a missing file; for one that does not
+/// read, none and `TOFU_BROKEN`.
+/// The pin file: `{ "host:port": "base64 fingerprint", ... }`, the shape
+/// since 0.x (an older build fails open on any other); `None` if any of it
+/// does not read.
+pub(crate) fn tofu_parse(data: &str) -> Option<HashMap<String, Vec<u8>>> {
     use base64::{engine::general_purpose::STANDARD, Engine};
-    let path = crate::config::data_dir().join("tofu_pins.json");
-    let Ok(data) = std::fs::read_to_string(&path) else {
-        return HashMap::new();
-    };
-    // Stored as { "host:port": "base64-encoded-fingerprint", ... }
-    let Ok(map): Result<HashMap<String, String>, _> = serde_json::from_str(&data) else {
-        return HashMap::new();
-    };
-    map.into_iter()
-        .filter_map(|(k, v)| STANDARD.decode(&v).ok().map(|bytes| (k, bytes)))
-        .collect()
+    serde_json::from_str::<HashMap<String, String>>(data)
+        .ok()
+        .and_then(|map| map.into_iter().map(|(k, v)| STANDARD.decode(&v).ok().map(|bytes| (k, bytes))).collect())
 }
 
-/// Save TOFU pins to disk. Errors are logged but non-fatal.
+fn tofu_load_from_disk() -> HashMap<String, Vec<u8>> {
+    let path = tofu_path();
+    let data = match std::fs::read_to_string(&path) {
+        Ok(data) => data,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return HashMap::new(),
+        Err(e) => {
+            warn!("TOFU: cannot read {}: {e}", path.display());
+            TOFU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+            return HashMap::new();
+        }
+    };
+    tofu_parse(&data).unwrap_or_else(|| {
+        warn!("TOFU: {} does not read; it is kept, and self-signed servers are refused until the pins are reset", path.display());
+        TOFU_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
+        HashMap::new()
+    })
+}
+
+/// Save TOFU pins to disk, keeping the previous file as `.bak`. Errors are
+/// logged but non-fatal; nothing is written over a file that did not read.
 fn tofu_save_to_disk(store: &HashMap<String, Vec<u8>>) {
     use base64::{engine::general_purpose::STANDARD, Engine};
-    let path = crate::config::data_dir().join("tofu_pins.json");
+    if TOFU_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
+        return;
+    }
+    let path = tofu_path();
+    if path.exists() {
+        let _ = std::fs::copy(&path, path.with_file_name("tofu_pins.json.bak"));
+    }
     let b64_map: HashMap<&str, String> = store
         .iter()
         .map(|(k, v)| (k.as_str(), STANDARD.encode(v)))
@@ -878,6 +922,18 @@ pub fn tofu_forget(host: &str, port: u16) -> bool {
         warn!("mutex poisoned, recovering");
         p.into_inner()
     });
+    // A pin list that did not read starts over here, by the person's choice:
+    // the old file is kept beside it.
+    if TOFU_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
+        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let path = tofu_path();
+        if std::fs::rename(&path, path.with_file_name(format!("tofu_pins.json.unreadable-{secs}"))).is_ok() {
+            TOFU_BROKEN.store(false, std::sync::atomic::Ordering::Relaxed);
+            store.clear();
+            return true;
+        }
+        return false;
+    }
     let removed = store.remove(&tofu_key(host, port)).is_some();
     if removed {
         tofu_save_to_disk(&store);
@@ -891,6 +947,7 @@ pub fn tofu_forget(host: &str, port: u16) -> bool {
 #[derive(Debug)]
 struct TofuCertVerifier {
     key: String,
+    seen: FirstSight,
 }
 
 impl ServerCertVerifier for TofuCertVerifier {
@@ -912,6 +969,16 @@ impl ServerCertVerifier for TofuCertVerifier {
             warn!("mutex poisoned, recovering");
             p.into_inner()
         });
+        // The UI matches on "fingerprint changed" to offer forgetting the
+        // pin, which is also what starts an unreadable pin list over.
+        if TOFU_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(rustls::Error::General(
+                "The saved certificate fingerprint changed state: the pin file (tofu_pins.json) could not be read. \
+                 It is kept as it is, and self-signed servers are refused until you use \"Forget pinned certificate\", \
+                 which starts the pin list over."
+                    .into(),
+            ));
+        }
 
         if let Some(pinned) = store.get(host_key) {
             // We've connected to this host before — verify the fingerprint matches
@@ -932,12 +999,8 @@ impl ServerCertVerifier for TofuCertVerifier {
             info!("TOFU: certificate fingerprint matches for {}", host_key);
         } else {
             // First connection: pinned by `connect` once the handshake has
-            // proved the key (`tofu_settle`), not here
-            drop(store);
-            TOFU_PENDING
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(host_key.clone(), fp_bytes);
+            // proved the key, and only for the attempt that won (`tofu_pin`)
+            *self.seen.lock().unwrap_or_else(|p| p.into_inner()) = Some(fp_bytes);
         }
 
         Ok(ServerCertVerified::assertion())
@@ -996,19 +1059,33 @@ mod tests {
     #[test]
     fn first_sight_pins_nothing_until_the_connection_is_up() {
         let key = tofu_key("tofu-test.invalid", 1);
-        let verifier = TofuCertVerifier { key: key.clone() };
+        let verifier = TofuCertVerifier { key: key.clone(), seen: FirstSight::default() };
         let cert = CertificateDer::from(vec![1u8, 2, 3]);
         let name = ServerName::try_from("tofu-test.invalid").unwrap();
         verifier
             .verify_server_cert(&cert, &[], &name, &[], UnixTime::now())
             .unwrap();
         assert!(!TOFU_STORE.lock().unwrap().contains_key(&key));
-        assert!(TOFU_PENDING.lock().unwrap().contains_key(&key));
+        assert!(verifier.seen.lock().unwrap().is_some(), "seen, for the connect to pin if it wins");
+    }
 
-        // A handshake that failed leaves nothing behind
-        tofu_settle(&key, false);
-        assert!(!TOFU_PENDING.lock().unwrap().contains_key(&key));
-        assert!(!TOFU_STORE.lock().unwrap().contains_key(&key));
+    /// H4-04: the QUIC and TCP attempts race. A loser that verifies last (an
+    /// injected certificate with no key behind it) must not be what is
+    /// pinned; the winner's own slot is.
+    #[test]
+    fn only_the_attempt_that_carries_the_session_is_pinned() {
+        // Pinning saves: never into the real data directory (config::data_dir)
+        assert!(crate::config::data_dir().starts_with(std::env::temp_dir()));
+        let key = tofu_key("tofu-race.invalid", 2);
+        let name = ServerName::try_from("tofu-race.invalid").unwrap();
+        let winner = TofuCertVerifier { key: key.clone(), seen: FirstSight::default() };
+        let loser = TofuCertVerifier { key: key.clone(), seen: FirstSight::default() };
+        winner.verify_server_cert(&CertificateDer::from(vec![1u8]), &[], &name, &[], UnixTime::now()).unwrap();
+        loser.verify_server_cert(&CertificateDer::from(vec![6u8, 6, 6]), &[], &name, &[], UnixTime::now()).unwrap();
+        tofu_pin(&key, &winner.seen);
+        let pinned = TOFU_STORE.lock().unwrap().get(&key).cloned();
+        assert_eq!(pinned.as_deref(), Some(ring::digest::digest(&ring::digest::SHA256, &[1u8]).as_ref()));
+        TOFU_STORE.lock().unwrap().remove(&key);
     }
 
     #[test]

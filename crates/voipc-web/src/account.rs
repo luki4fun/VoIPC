@@ -5,7 +5,8 @@
 
 use serde::Deserialize;
 
-use voipc_crypto::account::{normalize_name, password_ok, DeviceKey, Method, SignIn, SignedIn, Step, Zeroizing};
+use voipc_crypto::account::{normalize_name, password_ok, recovery_parse, DeviceKey, Method, SignIn, SignedIn, Step, Zeroizing, KDF_ROUNDS};
+use voipc_protocol::conv::unhex16;
 use voipc_crypto::account_session::{AccountSession as Session, Actions};
 use voipc_crypto::sync::{LogMemory, Prefs};
 use voipc_protocol::messages::AccountReply;
@@ -36,6 +37,8 @@ enum MethodJs {
     Login { password: String },
     Register { password: String, invite: Option<String> },
     Device { device_id: Vec<u8>, device_key: Vec<u8>, relay_id: Vec<u8>, dek: Vec<u8> },
+    /// A forgotten password, with the recovery key as shown (`recovery`).
+    Reset { recovery: String, password: String },
 }
 
 #[wasm_bindgen]
@@ -49,8 +52,10 @@ pub struct AccountSignIn {
 #[wasm_bindgen]
 impl AccountSignIn {
     /// `method`: `{ kind: "login", password }`, `{ kind: "register",
-    /// password, invite }` or `{ kind: "device", device_id, device_key,
-    /// relay_id, dek }` (byte fields as arrays or Uint8Arrays).
+    /// password, invite }`, `{ kind: "device", device_id, device_key,
+    /// relay_id, dek }` (byte fields as arrays or Uint8Arrays) or `{ kind:
+    /// "reset", recovery, password }`. The page stretches the password itself
+    /// (`{ stretch: salt }`, then `stretched`), with WebCrypto.
     #[wasm_bindgen(constructor)]
     pub fn new(name: &str, method: JsValue) -> Result<AccountSignIn, JsError> {
         let name = normalize_name(name).map_err(JsError::new)?;
@@ -65,8 +70,14 @@ impl AccountSignIn {
                 let dek: [u8; 32] = dek.try_into().map_err(|_| JsError::new("the vault key is not 32 bytes"))?;
                 Method::Device { key, relay_id: array16(&relay_id, "relay id")?, dek }
             }
+            MethodJs::Reset { recovery, password } => {
+                password_ok(&password).map_err(JsError::new)?;
+                let recovery = recovery_parse(&recovery).ok_or_else(|| JsError::new(NOT_A_RECOVERY_KEY))?;
+                Method::Reset { recovery: Zeroizing::new(recovery), password: Zeroizing::new(password) }
+            }
         };
-        let (machine, first) = SignIn::start(&name, method, PROTOCOL_VERSION, APP_VERSION);
+        let (mut machine, first) = SignIn::start(&name, method, PROTOCOL_VERSION, APP_VERSION);
+        machine.stretch_outside();
         Ok(AccountSignIn { machine: Some(machine), first: bytes(&first), signed: None })
     }
 
@@ -79,34 +90,43 @@ impl AccountSignIn {
         self.machine.as_ref().ok_or_else(|| JsError::new("the sign-in is over"))
     }
 
+    /// What this browser knows of relay ids (H5-01): the hex id this address
+    /// had before, if any, and `[hex id, address]` for the others. A server
+    /// naming another's id is refused before the password is stretched.
+    #[wasm_bindgen(js_name = expectRelay)]
+    pub fn expect_relay(&mut self, here: Option<String>, elsewhere: JsValue) -> Result<(), JsError> {
+        let elsewhere: Vec<(String, String)> = serde_wasm_bindgen::from_value(elsewhere)?;
+        let elsewhere = elsewhere.into_iter().filter_map(|(id, addr)| Some((unhex16(&id)?, addr))).collect();
+        let m = self.machine.as_mut().ok_or_else(|| JsError::new("the sign-in is over"))?;
+        m.expect_relay(here.as_deref().and_then(unhex16), elsewhere);
+        Ok(())
+    }
+
     /// One server payload in, the steps out: `{ send: Uint8Array }`,
-    /// `{ keys: true }` (build the Signal client from `identity()`, then send
-    /// `keys(bundle)`), `{ needTotp: true }`; unrelated messages give none.
+    /// `{ keys: true }` (take `signalClient()`, then send `keys(bundle)`),
+    /// `{ needTotp: true }`, `{ stretch: salt }` (PBKDF2 the password, then
+    /// `stretched`), `{ resetDone: true }`; unrelated messages give none.
     /// Throws the reason when the sign-in fails.
     pub fn step(&mut self, payload: &[u8]) -> Result<js_sys::Array, JsError> {
         let msg: ServerMessage = decode_server_msg(payload)?;
         let m = self.machine.as_mut().ok_or_else(|| JsError::new("the sign-in is over"))?;
-        let out = js_sys::Array::new();
-        for step in m.on_message(&msg).map_err(|e| JsError::new(&e))? {
-            match step {
-                Step::Send(c) => {
-                    out.push(&obj("send", js_sys::Uint8Array::from(&bytes(&c)[..]).into()));
-                }
-                Step::Keys => {
-                    out.push(&obj("keys", JsValue::TRUE));
-                }
-                Step::NeedTotp => {
-                    out.push(&obj("needTotp", JsValue::TRUE));
-                }
-                Step::Ignore => {}
-            }
-        }
-        Ok(out)
+        Ok(steps(m.on_message(&msg).map_err(|e| JsError::new(&e))?))
     }
 
-    /// The account's identity key pair, for `SignalClient.fromIdentity`.
-    pub fn identity(&self) -> Result<Vec<u8>, JsError> {
-        Ok(self.m()?.identity().ok_or_else(|| JsError::new("no identity yet"))?.serialize().to_vec())
+    /// PBKDF2-SHA256 (`kdfRounds()`, 32 bytes) of the password with the salt
+    /// `{ stretch }` named; the steps that follow, as `step` gives them.
+    pub fn stretched(&mut self, master: &[u8]) -> Result<js_sys::Array, JsError> {
+        let master: [u8; 32] = master.try_into().map_err(|_| JsError::new("the stretched password is not 32 bytes"))?;
+        let m = self.machine.as_mut().ok_or_else(|| JsError::new("the sign-in is over"))?;
+        Ok(steps(m.stretched(&master).map_err(|e| JsError::new(&e))?))
+    }
+
+    /// The Signal client for the account's identity, made here: the identity's
+    /// private key never reaches JS (1.0 audit H2-10).
+    #[wasm_bindgen(js_name = signalClient)]
+    pub fn signal_client(&self) -> Result<crate::SignalClient, JsError> {
+        let identity = self.m()?.identity().ok_or_else(|| JsError::new("no identity yet"))?;
+        Ok(crate::SignalClient { core: crate::signal::SignalCore::with_identity(identity).map_err(crate::js_err)? })
     }
 
     /// The `Keys` payload, from `SignalClient.bundle().prekey_bundle`.
@@ -155,6 +175,39 @@ impl AccountSignIn {
         let _ = js_sys::Reflect::set(&o, &"actions".into(), &actions(started)?);
         Ok(o.into())
     }
+}
+
+const NOT_A_RECOVERY_KEY: &str = "That is not a recovery key: 52 letters and digits, as it was shown.";
+
+fn steps(steps: Vec<Step>) -> js_sys::Array {
+    let out = js_sys::Array::new();
+    for step in steps {
+        match step {
+            Step::Send(c) => {
+                out.push(&obj("send", js_sys::Uint8Array::from(&bytes(&c)[..]).into()));
+            }
+            Step::Keys => {
+                out.push(&obj("keys", JsValue::TRUE));
+            }
+            Step::NeedTotp => {
+                out.push(&obj("needTotp", JsValue::TRUE));
+            }
+            Step::Stretch { salt } => {
+                out.push(&obj("stretch", JsValue::from_str(&salt)));
+            }
+            Step::ResetDone => {
+                out.push(&obj("resetDone", JsValue::TRUE));
+            }
+            Step::Ignore => {}
+        }
+    }
+    out
+}
+
+/// The PBKDF2 rounds of `stretch` (`voipc_crypto::account::KDF_ROUNDS`).
+#[wasm_bindgen(js_name = kdfRounds)]
+pub fn kdf_rounds() -> u32 {
+    KDF_ROUNDS
 }
 
 fn payloads(out: Vec<ClientMessage>) -> js_sys::Array {
@@ -217,10 +270,9 @@ impl AccountSession {
 
     /// The `users` of a `UserList` or `UserJoined`, for the pins.
     #[wasm_bindgen(js_name = noteRoster)]
-    pub fn note_roster(&mut self, users: JsValue) -> Result<(), JsError> {
+    pub fn note_roster(&mut self, users: JsValue) -> Result<JsValue, JsError> {
         let users: Vec<UserInfo> = serde_wasm_bindgen::from_value(users)?;
-        self.session.note_roster(&users);
-        Ok(())
+        actions(self.session.note_roster(&users))
     }
 
     /// An identity `user_id` showed (a pre-key bundle, or a session they
@@ -252,6 +304,24 @@ impl AccountSession {
         actions(self.session.enter(conv))
     }
 
+    /// Delete what this account wrote to the stored logs, in `conv` or
+    /// (null) everywhere.
+    pub fn purge(&mut self, conv: Option<String>) -> Result<JsValue, JsError> {
+        actions(self.session.purge(conv.as_deref()))
+    }
+
+    /// Delete this account, from its stretched password (`kdfSalt`).
+    #[wasm_bindgen(js_name = deleteAccount)]
+    pub fn delete_account(&self, master: &[u8], totp: Option<String>, recovery_code: Option<String>) -> Result<JsValue, JsError> {
+        let master: [u8; 32] = master.try_into().map_err(|_| JsError::new("the stretched password is not 32 bytes"))?;
+        actions(self.session.delete_account(&master, totp, recovery_code))
+    }
+
+    /// Out of channel log `conv`; with `tell`, asks the relay to take us out.
+    pub fn leave(&mut self, conv: &str, tell: bool) -> Result<JsValue, JsError> {
+        actions(self.session.leave(conv, tell))
+    }
+
     #[wasm_bindgen(js_name = keptFor)]
     pub fn kept_for(&self, user_id: u32) -> bool {
         self.session.kept_for(user_id)
@@ -279,6 +349,20 @@ impl AccountSession {
     #[wasm_bindgen(js_name = setShare)]
     pub fn set_share(&mut self, share: bool) {
         self.session.set_share(share);
+    }
+
+    /// The PBKDF2 salt for this account's passwords.
+    #[wasm_bindgen(js_name = kdfSalt)]
+    pub fn kdf_salt(&self) -> String {
+        self.session.kdf_salt()
+    }
+
+    /// A new password, from the stretched old and new ones (`kdfSalt`), and
+    /// a code where the account has codes on.
+    #[wasm_bindgen(js_name = passwordChange)]
+    pub fn password_change(&self, old_master: &[u8], new_master: &[u8], totp: Option<String>, recovery_code: Option<String>) -> Result<JsValue, JsError> {
+        let m32 = |m: &[u8]| -> Result<[u8; 32], JsError> { m.try_into().map_err(|_| JsError::new("a stretched password is not 32 bytes")) };
+        actions(self.session.password_change(&m32(old_master)?, &m32(new_master)?, totp, recovery_code))
     }
 }
 

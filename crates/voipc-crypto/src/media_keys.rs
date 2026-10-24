@@ -371,11 +371,13 @@ impl MediaKeyRing {
 }
 
 /// Build AAD context bytes for media encryption.
-/// Binds the channel_id and packet_type to the ciphertext, preventing
-/// cross-channel replay attacks and packet type confusion.
-pub fn build_aad(channel_id: u32, packet_type: u8) -> [u8; 5] {
-    let c = channel_id.to_be_bytes();
-    [c[0], c[1], c[2], c[3], packet_type]
+/// Binds the channel_id, the packet_type and the sender (the header's session
+/// id) to the ciphertext: no cross-channel replay, no packet type confusion,
+/// and a relay that rewrites the header's sender breaks the tag instead of
+/// making one member's voice play as another's (protocol v12).
+pub fn build_aad(channel_id: u32, packet_type: u8, sender: u32) -> [u8; 9] {
+    let (c, s) = (channel_id.to_be_bytes(), sender.to_be_bytes());
+    [c[0], c[1], c[2], c[3], packet_type, s[0], s[1], s[2], s[3]]
 }
 
 #[cfg(test)]
@@ -388,7 +390,7 @@ mod tests {
         let plaintext = b"hello voice data";
         let session_id = 42;
         let sequence = 100;
-        let aad = build_aad(1, 0x01);
+        let aad = build_aad(1, 0x01, 42);
 
         let encrypted =
             media_encrypt(&key, session_id, sequence, 0, &aad, plaintext).unwrap();
@@ -405,7 +407,7 @@ mod tests {
         let key1 = MediaKey::generate(1, 0, 1).unwrap();
         let key2 = MediaKey::generate(1, 1, 1).unwrap();
         let plaintext = b"secret";
-        let aad = build_aad(1, 0x01);
+        let aad = build_aad(1, 0x01, 42);
 
         let encrypted = media_encrypt(&key1, 1, 1, 0, &aad, plaintext).unwrap();
         let result = media_decrypt(&key2, 1, 1, 0, &aad, &encrypted);
@@ -416,7 +418,7 @@ mod tests {
     fn wrong_nonce_fails() {
         let key = MediaKey::generate(1, 0, 1).unwrap();
         let plaintext = b"secret";
-        let aad = build_aad(1, 0x01);
+        let aad = build_aad(1, 0x01, 42);
 
         let encrypted = media_encrypt(&key, 1, 1, 0, &aad, plaintext).unwrap();
         // Wrong sequence number
@@ -428,7 +430,7 @@ mod tests {
     fn tampered_data_fails() {
         let key = MediaKey::generate(1, 0, 1).unwrap();
         let plaintext = b"secret";
-        let aad = build_aad(1, 0x01);
+        let aad = build_aad(1, 0x01, 42);
 
         let mut encrypted = media_encrypt(&key, 1, 1, 0, &aad, plaintext).unwrap();
         encrypted[0] ^= 0xFF; // flip a byte
@@ -440,19 +442,29 @@ mod tests {
     fn wrong_aad_fails() {
         let key = MediaKey::generate(1, 0, 1).unwrap();
         let plaintext = b"secret";
-        let aad1 = build_aad(1, 0x01);
-        let aad2 = build_aad(2, 0x01); // different channel
+        let aad1 = build_aad(1, 0x01, 42);
+        let aad2 = build_aad(2, 0x01, 42); // different channel
 
         let encrypted = media_encrypt(&key, 1, 1, 0, &aad1, plaintext).unwrap();
         let result = media_decrypt(&key, 1, 1, 0, &aad2, &encrypted);
         assert!(result.is_err());
     }
 
+    /// A relay that rewrites the header's sender cannot make one member's
+    /// voice play as another's: the tag no longer verifies.
+    #[test]
+    fn a_rewritten_sender_fails() {
+        let key = MediaKey::generate(1, 0, 1).unwrap();
+        let encrypted = media_encrypt(&key, 7, 1, 0, &build_aad(1, 0x05, 42), b"alice speaking").unwrap();
+        assert!(media_decrypt(&key, 7, 1, 0, &build_aad(1, 0x05, 43), &encrypted).is_err());
+        assert!(media_decrypt(&key, 7, 1, 0, &build_aad(1, 0x05, 42), &encrypted).is_ok());
+    }
+
     #[test]
     fn sequence_exceeds_rotation_threshold() {
         let key = MediaKey::generate(1, 0, 1).unwrap();
         let plaintext = b"secret";
-        let aad = build_aad(1, 0x01);
+        let aad = build_aad(1, 0x01, 42);
 
         let result = media_encrypt(&key, 1, MAX_SEQUENCE_BEFORE_ROTATION, 0, &aad, plaintext);
         assert!(result.is_err());
@@ -467,8 +479,8 @@ mod tests {
         // same keystream.
         let key = MediaKey::generate(1, 0, 1).unwrap();
         let plaintext = b"same plaintext";
-        let voice_aad = build_aad(1, 0x05);
-        let screen_aad = build_aad(1, 0x15);
+        let voice_aad = build_aad(1, 0x05, 42);
+        let screen_aad = build_aad(1, 0x15, 42);
 
         let voice_ct = media_encrypt(&key, 7, 42, 0, &voice_aad, plaintext).unwrap();
         let screen_ct = media_encrypt(&key, 7, 42, 0, &screen_aad, plaintext).unwrap();
@@ -492,7 +504,7 @@ mod tests {
     #[test]
     fn two_speakers_under_one_key_never_share_a_nonce() {
         let key = MediaKey::generate(1, 0, 1).unwrap();
-        let aad = build_aad(1, 0x05);
+        let aad = build_aad(1, 0x05, 42);
         // Same key, same sequence, same everything the server controls — the
         // only difference is the stream id each speaker picked for itself.
         let alice = media_encrypt(&key, 0xA1A1_A1A1, 42, 0, &aad, b"hello").unwrap();

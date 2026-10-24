@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { dialog } from "../actions/dialog.js";
   // Opens a server. Up on its own while no server is on screen, and from the
   // rail's "+" while some are — then with a close button, and connecting here
   // leaves every open server as it is. It stays up until a connect succeeds,
@@ -17,8 +18,11 @@
   import { isWeb } from "../stores/platform.js";
   import { pendingInvite, serverAddress } from "../stores/connection.js";
   import { parseInviteLink } from "../invite.js";
-  import { connectTo, serverId, showConnectDialog, signInAgain, type AccountSignIn } from "../connect.js";
+  import { DOWNLOAD_PAGE, RESET_DONE, connectTo, serverId, showConnectDialog, signInAgain, updateNeeded, type AccountSignIn } from "../connect.js";
   import { randomTag, splitName, withTag } from "../username.js";
+  import { availableUpdate, checkForUpdate, checkUpdates, installUpdate, updateBusy, updatesSupported } from "../stores/updates.js";
+  import { updateFits } from "../update-rules.js";
+  import { voice } from "../stores/channels.js";
 
   // Invite link pasted here: takes host/port from it and joins the channel
   // right after connecting (App.svelte watches pendingInvite)
@@ -54,9 +58,11 @@
   // ── Accounts ──
   /** Come as a guest (name#tag), or sign in to an account on the server. */
   let mode = $state<"guest" | "account">("guest");
-  let accountAction = $state<"signin" | "create">("signin");
+  let accountAction = $state<"signin" | "create" | "reset">("signin");
   let password = $state("");
   let password2 = $state("");
+  /** "Forgot your password?": the recovery key, as it was shown. */
+  let recoveryKey = $state("");
   let signupInvite = $state("");
   /** This device is remembered for that account there: no password needed. */
   let remembered = $state(false);
@@ -90,9 +96,11 @@
   function accountRequest(): AccountSignIn | string {
     // One spelling of the password on every device: the keys come from its bytes.
     const pw = password.normalize("NFC");
-    if (accountAction === "create") {
-      if (pw.length < 10) return "Use a password of at least 10 characters.";
+    if (accountAction === "create" || accountAction === "reset") {
+      if (accountAction === "reset" && !recoveryKey.trim()) return "Enter your recovery key.";
+      if ([...pw].length < 10) return "Use a password of at least 10 characters.";
       if (pw !== password2.normalize("NFC")) return "The passwords do not match.";
+      if (accountAction === "reset") return { mode: "reset", recovery: recoveryKey.trim(), password: pw };
       return { mode: "register", password: pw, invite: signupInvite.trim() || null };
     }
     if (!pw && remembered) return { mode: "device" };
@@ -120,6 +128,7 @@
 
   async function connectWith(h: string, p: number, u: string, selfSignedOk: boolean) {
     error = "";
+    updateNeeded.set(null);
     let account: AccountSignIn | undefined;
     if (mode === "account") {
       const req = accountRequest();
@@ -133,14 +142,14 @@
     // An invite from this dialog is for the server it connects to — which is
     // not the one on screen when this is a second server being added.
     if ($pendingInvite) pendingInvite.set({ ...$pendingInvite, server: serverId(h, p) });
-    const result = await connectTo({
-      host: h,
-      port: p,
-      username: u,
-      acceptSelfSigned: selfSignedOk,
-      remember,
-      account,
-    });
+    const request = { host: h, port: p, username: u, acceptSelfSigned: selfSignedOk, remember, account };
+    let result = await connectTo(request);
+    // A reset ends its connection: sign in with the new password at once
+    if (!result.ok && account?.mode === "reset" && result.error.includes(RESET_DONE)) {
+      accountAction = "signin";
+      recoveryKey = "";
+      result = await connectTo({ ...request, account: { mode: "login", password: account.password } });
+    }
     connecting = false;
     password = "";
     password2 = "";
@@ -207,6 +216,22 @@
 
   // Offered when the TOFU pin rejected the server's certificate
   let pinRejected = $derived(error.includes("fingerprint changed"));
+  // A refusal for another protocol, for the server in the form
+  let update = $derived($updateNeeded?.server === serverId(host, port) ? $updateNeeded : null);
+  // In the browser, the server this page came from: a reload brings its version
+  const pageServer = isWeb ? serverId(location.hostname, Number(location.port) || 443) : "";
+  // Refused for an older protocol: look for an update at once, not tomorrow
+  let lookedForUpdate = $state(false);
+  let updateError = $state("");
+  $effect(() => {
+    if (!update || isWeb || update.server_protocol <= update.our_protocol) return;
+    lookedForUpdate = false;
+    void checkForUpdate().then(() => (lookedForUpdate = true));
+  });
+  let fittingUpdate = $derived(update && updateFits($availableUpdate, update.server_protocol) ? $availableUpdate : null);
+  async function updateNow() {
+    updateError = await installUpdate();
+  }
 
   // Offered when a server named a relay id this app knows from another
   // address, or a different one than before (account.rs `relay_ok`)
@@ -249,7 +274,11 @@
 </script>
 
 <div class="overlay">
-  <div class="dialog" oninput={() => (touched = true)}>
+  <div
+    class="dialog"
+    oninput={() => (touched = true)}
+    use:dialog={{ onclose: $serverAddress && !connecting ? () => showConnectDialog.set(false) : undefined }}
+  >
     <div class="title-row">
       <h2>Connect to Server</h2>
       {#if $serverAddress}
@@ -257,6 +286,7 @@
           class="connect-close"
           onclick={() => showConnectDialog.set(false)}
           title="Back to the open servers"
+          aria-label="Back to the open servers"
           disabled={connecting}>&#x2715;</button
         >
       {/if}
@@ -386,18 +416,58 @@
           onkeydown={(e) => e.key === "Enter" && handleConnect()}
         />
       </div>
+      {#if isWeb && host && serverId(host, port) !== pageServer}
+        <p class="account-note">
+          This page comes from {pageServer}, which sees what you do on {serverId(host, port)} in it. For an account
+          there, open https://{serverId(host, port)}/ instead.
+        </p>
+      {/if}
+      {#if accountAction === "reset"}
+        <div class="field">
+          <label for="account-recovery">Recovery key</label>
+          <input
+            id="account-recovery"
+            type="text"
+            bind:value={recoveryKey}
+            placeholder="ABCD-EFGH-…"
+            autocomplete="off"
+            spellcheck="false"
+            disabled={connecting}
+          />
+        </div>
+      {/if}
       <div class="field">
-        <label for="account-password">Password{#if accountAction === "signin" && remembered} (not needed on this device){/if}</label>
+        <label for="account-password">{accountAction === "reset" ? "New password" : "Password"}{#if accountAction === "signin" && remembered} (not needed on this device){/if}</label>
         <input
           id="account-password"
           type="password"
           bind:value={password}
-          autocomplete={accountAction === "create" ? "new-password" : "current-password"}
+          autocomplete={accountAction === "signin" ? "current-password" : "new-password"}
           placeholder={accountAction === "signin" && remembered ? "This device is remembered" : "Password"}
           disabled={connecting}
           onkeydown={(e) => e.key === "Enter" && handleConnect()}
         />
+        {#if accountAction === "signin"}
+          <button type="button" class="link-btn" onclick={() => (accountAction = "reset")} disabled={connecting}>Forgot your password?</button>
+        {/if}
       </div>
+      {#if accountAction === "reset"}
+        <div class="field">
+          <label for="account-password2">New password again</label>
+          <input
+            id="account-password2"
+            type="password"
+            bind:value={password2}
+            autocomplete="new-password"
+            disabled={connecting}
+            onkeydown={(e) => e.key === "Enter" && handleConnect()}
+          />
+        </div>
+        <p class="account-note">
+          The recovery key you were shown when the account was made opens your encrypted account data, so nothing
+          is lost. Your other devices are signed out and need the new password.
+        </p>
+      {/if}
       {#if accountAction === "create"}
         <div class="field">
           <label for="account-password2">Password again</label>
@@ -444,7 +514,49 @@
       Remember connection details
     </label>
 
-    {#if error}
+    {#if update}
+      <div class="error update-panel">
+        <p>
+          {update.server} runs VoIPC {update.server_version} (protocol {update.server_protocol}). This app is
+          {update.our_version} (protocol {update.our_protocol}).
+        </p>
+        {#if update.server_protocol < update.our_protocol}
+          <p>The server needs an update — tell its operator. There is nothing to do in this app.</p>
+        {:else if isWeb && update.server === pageServer}
+          <p>This page is out of date.</p>
+          <button type="button" class="save-server-btn" onclick={() => location.reload()}>Reload the page</button>
+        {:else if isWeb}
+          <p>The server's own page brings the matching version.</p>
+          <button type="button" class="save-server-btn" onclick={() => window.open(`https://${update.server}/`, "_blank", "noopener")}>
+            Open {update.server}'s page
+          </button>
+        {:else if $updatesSupported && fittingUpdate}
+          <p>VoIPC {fittingUpdate.version} speaks this server's protocol. Installing it restarts VoIPC.</p>
+          <button
+            type="button"
+            class="save-server-btn"
+            onclick={updateNow}
+            disabled={$updateBusy !== null || $voice !== null}
+          >
+            {$updateBusy === "installing"
+              ? "Updating…"
+              : $voice !== null
+                ? "Update after the call"
+                : `Update VoIPC to ${fittingUpdate.version}`}
+          </button>
+          {#if updateError}<p>{updateError}</p>{/if}
+        {:else}
+          {#if $updatesSupported && $checkUpdates && update.server_protocol > update.our_protocol}
+            <p>{$updateBusy === "checking" || !lookedForUpdate ? "Looking for an update…" : "There is no update for this server's version yet."}</p>
+          {/if}
+          <p>Update VoIPC to connect. Download it from:</p>
+          <div class="update-link">
+            <code>{DOWNLOAD_PAGE}</code>
+            <button type="button" class="save-server-btn" onclick={() => navigator.clipboard?.writeText(DOWNLOAD_PAGE)}>Copy</button>
+          </div>
+        {/if}
+      </div>
+    {:else if error}
       <div class="error">{error}</div>
       {#if pinRejected && !isWeb}
         <button
@@ -456,7 +568,7 @@
           Forget pinned certificate for {host}:{port}
         </button>
       {/if}
-      {#if relayClash && !isWeb}
+      {#if relayClash}
         <button
           type="button"
           class="save-server-btn"
@@ -512,6 +624,20 @@
   .account-note {
     font-size: 12px;
     color: var(--text-secondary);
+  }
+
+  .link-btn {
+    align-self: flex-start;
+    background: none;
+    border: none;
+    padding: 2px 0;
+    font-size: 12px;
+    color: var(--accent);
+    cursor: pointer;
+  }
+
+  .link-btn:hover:not(:disabled) {
+    text-decoration: underline;
   }
 
   .overlay {
@@ -662,6 +788,21 @@
     color: var(--danger);
     font-size: 13px;
     text-align: center;
+  }
+
+  .update-panel p {
+    margin: 0 0 6px;
+  }
+
+  .update-link {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    flex-wrap: wrap;
+  }
+
+  .update-link code {
+    overflow-wrap: anywhere;
   }
 
   .saved-servers {

@@ -46,6 +46,8 @@
   import { users, speakingUsers } from "./lib/stores/users.js";
   import { account, accountHex } from "./lib/stores/account.js";
   import { addNotification, removeNotification } from "./lib/stores/notifications.js";
+  import { availableUpdate, initUpdates } from "./lib/stores/updates.js";
+  import type { UpdateInfo } from "./lib/update-rules.js";
   import { pendingInvites } from "./lib/stores/invites.js";
   import { pendingPokes, createPoke, addPoke } from "./lib/stores/pokes.js";
   import {
@@ -65,6 +67,7 @@
     joinedTextChannelIds,
     mergeChannelHistory,
     openTextChannel,
+    flushChatSave,
   } from "./lib/stores/chat.js";
   import ChatHistorySetup from "./lib/components/ChatHistorySetup.svelte";
   import AudioSetup from "./lib/components/AudioSetup.svelte";
@@ -80,8 +83,10 @@
     resetServer,
     showConnectDialog,
     startReconnect,
+    updateNeeded,
+    type UpdateNeeded,
   } from "./lib/connect.js";
-  import { openServers } from "./lib/stores/servers.js";
+  import { openServers, serverName } from "./lib/stores/servers.js";
   import {
     inputDevice,
     outputDevice,
@@ -190,7 +195,7 @@
   // Look up channel name by numeric ID (stable key for chat history). Per
   // server: an id is a slot in one server's list and means nothing on another.
   function channelNameById(server: string, channelId: number): string {
-    return get(channels.of(server)).find((c) => c.channel_id === channelId)?.name ?? "";
+    return get(channels.peek(server)).find((c) => c.channel_id === channelId)?.name ?? "";
   }
 
   /**
@@ -205,12 +210,12 @@
    * keeps it true if that ever changes.
    */
   function ownDisplayName(server: string, fallback: string, channelId?: number): string {
-    const own = get(users.of(server));
+    const own = get(users.peek(server));
     const roster =
-      channelId === undefined || channelId === get(currentChannelId.of(server))
+      channelId === undefined || channelId === get(currentChannelId.peek(server))
         ? own
-        : (get(channelRosters.of(server)).get(channelId) ?? own);
-    const me = get(userId.of(server));
+        : (get(channelRosters.peek(server)).get(channelId) ?? own);
+    const me = get(userId.peek(server));
     return roster.find((u) => u.user_id === me)?.username ?? fallback;
   }
 
@@ -233,6 +238,12 @@
   /** game/resource/channel of the last "a game is placing people" toast, so a
    *  bridge that reconnects every two seconds cannot paper the screen. */
   let lastSdkToast: string | null = null;
+  /** The same for "a game could not place you", which a mod retries. */
+  let lastSdkRefusal: string | null = null;
+  /** The background-keys warning is sticky; one is enough per run. */
+  let keysToastShown = false;
+  /** The update a toast already announced: the daily check finds it again. */
+  let announcedUpdate = "";
   /** Channels we have already explained the `routed` flag for this session,
    *  as `server/channel id`. */
   const routedNoticeShown = new Set<string>();
@@ -377,13 +388,16 @@
     try {
       const notif = await import("@tauri-apps/plugin-notification");
       let granted = await notif.isPermissionGranted();
-      if (!granted) {
+      // A browser grants it only from a click: Settings asks (H5-13)
+      if (!granted && !isWeb) {
         granted = (await notif.requestPermission()) === "granted";
       }
       // Freedesktop daemons render the body as markup; peers must not be
-      // able to inject links or styling into a system notification
+      // able to inject links or styling into a system notification. Nothing
+      // else does, and there "<3" would arrive as "&lt;3".
+      const markup = !isWeb && /Linux/.test(navigator.userAgent) && !/Android/.test(navigator.userAgent);
       const esc = (s: string) =>
-        s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+        markup ? s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;") : s;
       if (granted) notif.sendNotification({ title: esc(title), body: esc(body) });
     } catch (e) {
       console.error("Desktop notification failed:", e);
@@ -499,15 +513,19 @@
   function viewingChannel(server: string, channelId: number): boolean {
     return (
       server === get(serverAddress) &&
-      get(activeDmUserId.of(server)) === null &&
-      channelId === (get(activeTextChannelId.of(server)) ?? get(currentChannelId.of(server)))
+      get(activeDmUserId.peek(server)) === null &&
+      channelId === (get(activeTextChannelId.peek(server)) ?? get(currentChannelId.peek(server)))
     );
   }
 
-  onMount(async () => {
+  // Svelte calls the cleanup only when onMount returns it synchronously
+  onMount(() => {
+    const cleanup = (async () => {
     // Messages with a destruction timer go when their moment comes, whether or
     // not anybody is looking at them. One sweep for the whole app.
     startExpirySweep();
+    // A reload, or a window closed under us: the debounced chat save goes now
+    window.addEventListener("beforeunload", () => void flushChatSave());
 
     // Invite link in the URL fragment (web client): keep it, then drop it from
     // the address bar so it is neither kept in history nor re-applied on reload
@@ -616,6 +634,18 @@
     const inVoice = (server: string) => get(voice)?.server === server;
 
     const unlisteners = [
+      // Refused for another protocol: ConnectDialog shows which side updates
+      listenServer<Omit<UpdateNeeded, "server">>("update-needed", (server, d) => updateNeeded.set({ server, ...d })),
+      // First meeting with a self-signed server: what was pinned, to compare
+      listenServer<{ fingerprint: string }>("tofu-pinned", (server, d) =>
+        addNotification(
+          `${serverName(server, get(savedServers))} uses its own certificate, and this app now trusts it. ` +
+            `Its fingerprint is ${d.fingerprint}. Compare it with the one the server's operator gives you ` +
+            `(voipc-server cert fingerprint). If it differs, disconnect, use "Forget pinned certificate", and do not use this server.`,
+          "warning",
+          0,
+        ),
+      ),
       listenServer<ChannelInfo[]>("channel-list", (server, list) => {
         channels.of(server).set(list);
         // A reconnect waits for this before deciding where to put the user back
@@ -627,7 +657,7 @@
       }),
 
       listenServer<{ channel_id: number; users: UserInfo[] }>("user-list", (server, data) => {
-        const oldChannelId = get(currentChannelId.of(server));
+        const oldChannelId = get(currentChannelId.peek(server));
         const newChannelId = data.channel_id;
 
         // A text channel is a subscription: we did not move, so none of the
@@ -637,7 +667,7 @@
           joinedTextChannelIds.of(server).update((s) => new Set(s).add(newChannelId));
           // setRoster settles the row's member count from this same list
           setRoster(server, newChannelId, data.users);
-          if (get(activeTextChannelId.of(server)) === newChannelId) {
+          if (get(activeTextChannelId.peek(server)) === newChannelId) {
             const name = channelNameById(server, newChannelId);
             if (name) clearChannelUnread(server, name);
           }
@@ -701,7 +731,7 @@
           // A routed channel is the one place the server is told anything
           // about who hears whom. Say so on the way in, once per channel per
           // session, in the words the README uses.
-          const joined = get(channels.of(server)).find((c) => c.channel_id === newChannelId);
+          const joined = get(channels.peek(server)).find((c) => c.channel_id === newChannelId);
           const noticeKey = `${server}/${newChannelId}`;
           if (joined?.routed && !routedNoticeShown.has(noticeKey)) {
             routedNoticeShown.add(noticeKey);
@@ -726,7 +756,7 @@
         // at once). Replacing is idempotent; appending twice would throw
         // each_key_duplicate and wedge the UI.
         let isNew = true;
-        const current = get(currentChannelId.of(server));
+        const current = get(currentChannelId.peek(server));
         if (joiner.channel_id === current) {
           users.of(server).update((u) => {
             const next = upsertById(u, joiner, (x) => x.user_id);
@@ -739,7 +769,7 @@
             isNew &&
             current !== 0 &&
             inVoice(server) &&
-            joiner.user_id !== get(userId.of(server))
+            joiner.user_id !== get(userId.peek(server))
           ) {
             playUserJoinedSound();
           }
@@ -758,7 +788,7 @@
       }),
 
       listenServer<{ user_id: number; channel_id: number }>("user-left", (server, data) => {
-        const self = get(userId.of(server));
+        const self = get(userId.peek(server));
         // Our own departure from a text channel is how we learn a leave (or a
         // kick from one) went through.
         if (data.user_id === self && isTextChannel(server, data.channel_id)) {
@@ -767,11 +797,11 @@
             next.delete(data.channel_id);
             return next;
           });
-          if (get(activeTextChannelId.of(server)) === data.channel_id) openTextChannel(server, null);
+          if (get(activeTextChannelId.peek(server)) === data.channel_id) openTextChannel(server, null);
         }
 
         // Only remove from local user list if they left our channel
-        const current = get(currentChannelId.of(server));
+        const current = get(currentChannelId.peek(server));
         if (data.channel_id === current) {
           const inCall = current !== 0 && inVoice(server);
           // Play leave sound before removing (only in the call, not for ourselves)
@@ -849,10 +879,22 @@
         channel?: string;
         beacon?: boolean;
         transmit?: boolean;
+        refused?: string;
       }>(
         "sdk-status",
         (event) => {
-          const { connected, game, resource, channel, beacon, transmit } = event.payload;
+          const { connected, game, resource, channel, beacon, transmit, refused } = event.payload;
+          // The game is told only "wrong_server", whatever the cause, so the
+          // player is the one who learns which (once per cause, not per retry).
+          if (refused) {
+            const key = `${game}/${resource}/${refused}`;
+            if (key !== lastSdkRefusal) {
+              lastSdkRefusal = key;
+              const who = resource ? `${game} (${resource})` : game || "A game";
+              addNotification(`${who} could not place you: ${refused}`, "warning");
+            }
+            return;
+          }
           if (connected === undefined) return; // a listener-status update
           drivenBy.set(connected ? game || "a game" : null);
           if (!connected) {
@@ -930,7 +972,7 @@
         // A second connection-lost during a reconnect (ServerShutdown is
         // followed by the socket closing) is the loop's business, not a
         // second loop's; neither is one while the first connect is running.
-        if (get(connectionState.of(server)) !== "connected") return;
+        if (get(connectionState.peek(server)) !== "connected") return;
 
         // Play disconnected sound on initial loss (not during reconnect retries)
         playDisconnectedSound();
@@ -941,7 +983,7 @@
         // call was on this server.
         const seat = get(voice);
         const prevVoice = seat?.server === server ? channelNameById(server, seat.channelId) : "";
-        const prevText = [...get(joinedTextChannelIds.of(server))]
+        const prevText = [...get(joinedTextChannelIds.peek(server))]
           .map((id) => channelNameById(server, id))
           .filter((n) => n !== "");
         // What the connection held goes now, the call with it if it was this
@@ -966,7 +1008,27 @@
       // thing you find out about in a call. Sticky, because it is the setting
       // they have to change, and it is said once per run.
       listen<{ reason: string }>("global-keys-unavailable", (event) => {
+        if (keysToastShown) return;
+        keysToastShown = true;
         addNotification(`Push-to-talk outside the window: ${event.payload.reason}`, "warning", 0);
+      }),
+
+      // Quitting (the tray, or closing the window without one): hand the
+      // backend the chat the debounce still holds, then let it exit and write
+      // the archive. It does not wait for us for long.
+      listen("quit-requested", async () => {
+        await flushChatSave();
+        await invoke("quit_app");
+      }),
+
+      // A newer VoIPC (updater.rs looks once a day): said once, and Settings
+      // has the button
+      listen<UpdateInfo>("update-available", (event) => {
+        availableUpdate.set(event.payload);
+        if (announcedUpdate !== event.payload.version) {
+          announcedUpdate = event.payload.version;
+          addNotification(`VoIPC ${event.payload.version} is available: Settings, Updates.`, "info", 10000);
+        }
       }),
 
       listenServer("media-key-missing", (server) => {
@@ -990,15 +1052,22 @@
       }),
 
       // `name` comes with an account's change, which may be somebody away.
-      listenServer<{ user_id?: number | null; name?: string }>("identity-key-changed", (server, data) => {
+      // `as_guest`: a name first met as an account turned up without one.
+      listenServer<{ user_id?: number | null; name?: string; as_guest?: boolean; replaced?: boolean }>("identity-key-changed", (server, data) => {
         const uid = data.user_id;
         const name =
-          (uid != null ? get(users.of(server)).find((u) => u.user_id === uid)?.username : undefined) ??
+          (uid != null ? get(users.peek(server)).find((u) => u.user_id === uid)?.username : undefined) ??
           data.name ??
           `User ${uid}`;
         addNotification(
-          `${fromServer(server)}Security warning: ${name}'s encryption identity changed. ` +
-            `Verify with them out-of-band before trusting messages.`,
+          data.as_guest
+            ? `${fromServer(server)}Security warning: ${name} is not signed in as the account you know by that name. ` +
+                `Do not trust it to be them until you have checked.`
+            : data.replaced
+            ? `${fromServer(server)}${name} is another account now: the one you knew by that name was deleted, or this ` +
+                `server gave the name to someone else. Verify them before trusting messages.`
+            : `${fromServer(server)}Security warning: ${name}'s encryption identity changed. ` +
+                `Verify with them out-of-band before trusting messages.`,
           "error",
           0,
         );
@@ -1007,7 +1076,7 @@
       // ── Moderation ──
       listenServer<{ user_id: number; is_admin: boolean }>("admin-status", (server, data) => {
         const { user_id: uid, is_admin } = data;
-        if (uid === get(userId.of(server))) {
+        if (uid === get(userId.peek(server))) {
           isAdmin.of(server).set(is_admin);
           if (is_admin) {
             addNotification(`${fromServer(server)}You are now a server admin`, "info");
@@ -1055,8 +1124,8 @@
           // channel, which is the difference between a silent harvest and a
           // visible one.
           if (
-            channelId !== get(currentChannelId.of(server)) &&
-            !get(joinedTextChannelIds.of(server)).has(channelId)
+            channelId !== get(currentChannelId.peek(server)) &&
+            !get(joinedTextChannelIds.peek(server)).has(channelId)
           )
             return;
           if (!currentRosterOf(server, channelId).some((u) => u.user_id === data.from_user_id)) {
@@ -1142,11 +1211,11 @@
           next.delete(goneId);
           return next;
         });
-        if (get(activeTextChannelId.of(server)) === goneId) openTextChannel(server, null);
+        if (get(activeTextChannelId.peek(server)) === goneId) openTextChannel(server, null);
         // Nothing to do about the voice channel: the server deletes only an
         // empty one, so it was never the one we stand in.
         // Clear preview if previewing the deleted channel
-        if (get(previewChannelId.of(server)) === goneId) {
+        if (get(previewChannelId.peek(server)) === goneId) {
           previewChannelId.of(server).set(null);
           previewUsers.of(server).set([]);
         }
@@ -1178,7 +1247,7 @@
       // Channel preview response
       listenServer<{ channel_id: number; users: UserInfo[] }>("channel-users", (server, data) => {
         setRoster(server, data.channel_id, data.users);
-        if (data.channel_id === get(previewChannelId.of(server))) {
+        if (data.channel_id === get(previewChannelId.peek(server))) {
           previewUsers.of(server).set(data.users);
         }
       }),
@@ -1201,7 +1270,7 @@
 
       listenServer<{ channel_id: number; user_id: number }>("invite-accepted", (server, data) => {
         const userName =
-          get(users.of(server)).find((u) => u.user_id === data.user_id)?.username ?? "User";
+          get(users.peek(server)).find((u) => u.user_id === data.user_id)?.username ?? "User";
         addNotification(`${fromServer(server)}${shortName(userName)} accepted your invite`, "info");
       }),
 
@@ -1249,13 +1318,13 @@
           // Our own messages are echoed locally under the name we connected
           // with; in an anonymous channel that is not the name anyone else
           // sees, so use the one the channel knows us by.
-          const self = get(userId.of(server));
+          const self = get(userId.peek(server));
           const uname = uid === self ? ownDisplayName(server, username, channel_id) : username;
           // Tagged with the writer's account, so the same message read from
           // the channel's stored log is recognised (sameMessage).
           const writer = uid === self
-            ? get(account.of(server))?.info.id
-            : get(users.of(server)).find((u) => u.user_id === uid)?.account;
+            ? get(account.peek(server))?.info.id
+            : get(users.peek(server)).find((u) => u.user_id === uid)?.account;
           const added = addChannelMessage(server, chName, {
             user_id: uid,
             username: uname,
@@ -1288,10 +1357,10 @@
         ttl_secs: number | null;
         timestamp: number;
       }>("stored-channel-message", (server, m) => {
-        const ch = get(channels.of(server)).find((c) => c.log === m.conv);
+        const ch = get(channels.peek(server)).find((c) => c.log === m.conv);
         if (!ch) return;
-        const self = get(userId.of(server));
-        const online = m.from_me ? undefined : get(users.of(server)).find((u) => u.username === m.sender_name);
+        const self = get(userId.peek(server));
+        const online = m.from_me ? undefined : get(users.peek(server)).find((u) => u.username === m.sender_name);
         const added = fileStoredChannelMessage(server, ch.name, {
           user_id: m.from_me ? self : (online?.user_id ?? 0),
           username: m.sender_name,
@@ -1307,7 +1376,7 @@
       // Who can read what we write in a channel's stored log, said where it
       // happens: nobody gets our keys without the user seeing their name.
       listenServer<{ conv: string; names: string[]; history: boolean }>("log-readers", (server, d) => {
-        const ch = get(channels.of(server)).find((c) => c.log === d.conv);
+        const ch = get(channels.peek(server)).find((c) => c.log === d.conv);
         if (!ch || d.names.length === 0) return;
         const names = d.names.map((n) => shortName(n) || "someone").join(", ");
         addChannelMessage(server, ch.name, {
@@ -1331,19 +1400,19 @@
         ttl_secs?: number | null;
       }>("direct-chat-message", (server, data) => {
         const { from_user_id, to_user_id, content, timestamp } = data;
-        const myId = get(userId.of(server));
+        const myId = get(userId.peek(server));
         const from_username =
           from_user_id === myId ? ownDisplayName(server, data.from_username) : data.from_username;
         // A direct message has no channel to take a policy from, so the two
         // answers are the sender's timer and this user's own for that person,
         // and the shorter wins. Their name is how the conversation is filed.
-        const peer = from_user_id === myId ? get(activeDmUsername.of(server)) : from_username;
+        const peer = from_user_id === myId ? get(activeDmUsername.peek(server)) : from_username;
         const expires_at = expiryFor(timestamp, data.ttl_secs, dmMessageTtl(server, peer));
         // Tagged with the sender's account, so the same message read back from
         // the stored log later is recognised (sameMessage).
         const sender = from_user_id === myId
-          ? get(account.of(server))?.info.id
-          : get(users.of(server)).find((u) => u.user_id === from_user_id)?.account;
+          ? get(account.peek(server))?.info.id
+          : get(users.peek(server)).find((u) => u.user_id === from_user_id)?.account;
         addDmMessage(server, myId, from_user_id, from_username, to_user_id, {
           user_id: from_user_id,
           username: from_username,
@@ -1361,16 +1430,37 @@
 
       // A direct message found nobody: the person it was for has left. Said
       // in the conversation, under the message, which is where it was missed.
-      listenServer<{ user_id: number; kept?: boolean }>("dm-undelivered", (server, { user_id, kept }) => {
-        const myId = get(userId.of(server));
-        const peer = get(dmConversations.of(server)).find((c) => c.user_id === user_id)?.username;
-        const who = peer ? shortName(peer) : "they";
-        addDmMessage(server, myId, myId, "", user_id, {
+      // `expired`: it waited a minute for a secure session with them and none
+      // came up, so it was never sent at all.
+      listenServer<{ user_id: number; kept?: boolean; expired?: number }>(
+        "dm-undelivered",
+        (server, { user_id, kept, expired }) => {
+          const myId = get(userId.peek(server));
+          const peer = get(dmConversations.peek(server)).find((c) => c.user_id === user_id)?.username;
+          const who = peer ? shortName(peer) : "they";
+          addDmMessage(server, myId, myId, "", user_id, {
+            user_id: 0,
+            username: "",
+            content: expired
+              ? `Not delivered — no secure session with ${peer ? who : "them"} within a minute`
+              : kept
+                ? `${who} left the server — kept there for when they are back`
+                : `Not delivered — ${who} left the server`,
+            timestamp: Date.now(),
+            kind: "notice",
+          });
+        },
+      ),
+
+      // The channel's keys did not arrive within a minute of writing, so what
+      // was written then was never sent, though it showed as sent.
+      listenServer<{ channel_id: number; expired: number }>("channel-undelivered", (server, d) => {
+        const ch = get(channels.peek(server)).find((c) => c.channel_id === d.channel_id);
+        if (!ch) return;
+        addChannelMessage(server, ch.name, {
           user_id: 0,
           username: "",
-          content: kept
-            ? `${who} left the server — kept there for when they are back`
-            : `Not delivered — ${who} left the server`,
+          content: `Not delivered — the channel's keys did not arrive within a minute (${d.expired} ${d.expired === 1 ? "message" : "messages"})`,
           timestamp: Date.now(),
           kind: "notice",
         });
@@ -1478,11 +1568,12 @@
         isTransmitting.set(false);
       }),
     ];
+    void initUpdates();
 
     // Periodic ping for latency measurement, on every server that is up
     const pingInterval = setInterval(() => {
       for (const server of get(openServers)) {
-        if (get(connectionState.of(server)) === "connected") {
+        if (get(connectionState.peek(server)) === "connected") {
           invoke("ping", { server }).catch(() => {});
         }
       }
@@ -1544,6 +1635,8 @@
       clearInterval(statsInterval);
       unlisteners.forEach((p) => p.then((unlisten) => unlisten()));
     };
+    })();
+    return () => void cleanup.then((c) => c());
   });
 </script>
 

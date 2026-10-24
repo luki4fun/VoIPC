@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { backdrop, dialog } from "../actions/dialog.js";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { onDestroy } from "svelte";
@@ -23,7 +24,7 @@
     soundSettings,
     defaultSoundSettings,
   } from "../stores/settings.js";
-  import type { SoundSettings, SoundEntry } from "../stores/settings.js";
+  import type { SoundSettings } from "../stores/settings.js";
   import { voiceMode, vadThreshold } from "../stores/voice.js";
   import {
     connectionState,
@@ -44,7 +45,17 @@
     screenAudioSpatial,
     audioSetupRequested,
   } from "../stores/settings.js";
-  import type { AudioDeviceInfo } from "../types.js";
+  import {
+    defaultDeviceName,
+    inputDevices,
+    loadDevices as loadDeviceLists,
+    outputDevices,
+    pickInput,
+    pickOutput,
+  } from "../stores/audio-devices.js";
+  import { micTestLevel, micTesting, startMicTest, stopMicTest } from "../stores/mic-test.js";
+  import { availableUpdate, checkForUpdate, checkUpdates, installUpdate, setCheckUpdates, updateBusy, updatesSupported } from "../stores/updates.js";
+  import { voice } from "../stores/channels.js";
   import Icon from "./Icons.svelte";
   import PaletteEditor from "./PaletteEditor.svelte";
   import LayoutPreview from "./LayoutPreview.svelte";
@@ -63,6 +74,18 @@
 
   let activeTab = $state<"general" | "appearance" | "sounds">("general");
 
+  // The accounts this device signs in to without a password (1.0 audit H5-12)
+  let remembered = $state<{ server: string; name: string }[]>([]);
+  const loadRemembered = () =>
+    invoke<{ server: string; name: string }[]>("account_devices").then((list) => (remembered = list), () => (remembered = []));
+  $effect(() => {
+    if (activeTab === "general") void loadRemembered();
+  });
+  async function forgetRemembered(list: { server: string; name: string }[]) {
+    for (const d of list) await invoke("forget_device", { server: d.server, name: d.name }).catch(() => {});
+    await loadRemembered();
+  }
+
   /** Everything on this tab, back to defaults — but not which layout they chose,
    *  and not the fact that they were asked. Those are answers, not decoration. */
   function resetAppearance() {
@@ -77,8 +100,6 @@
     });
   }
 
-  let inputDevices = $state<AudioDeviceInfo[]>([]);
-  let outputDevices = $state<AudioDeviceInfo[]>([]);
 
   // Game SDK (desktop only): the local port a game mod connects to
   let sdkEnabled = $state(false);
@@ -163,8 +184,7 @@
 
   async function loadDevices() {
     try {
-      inputDevices = await invoke("get_input_devices");
-      outputDevices = await invoke("get_output_devices");
+      await loadDeviceLists();
     } catch (e) {
       console.error("Failed to load devices:", e);
       addNotification(`Failed to load audio devices: ${e}`, "error");
@@ -193,15 +213,9 @@
   }
 
   async function changeInputDevice(e: Event) {
-    const target = e.target as HTMLSelectElement;
-    inputDevice.set(target.value);
     try {
-      await invoke("set_input_device", { deviceName: target.value });
-      // Re-open the test stream on the newly selected device
-      if (micTestRunning) {
-        stopMicTest();
-        await startMicTest();
-      }
+      // A running test moves to the new device (stores/audio-devices.ts)
+      await pickInput((e.target as HTMLSelectElement).value);
     } catch (err) {
       console.error("Failed to set input device:", err);
       addNotification(`Failed to set input device: ${err}`, "error");
@@ -209,15 +223,14 @@
   }
 
   async function changeOutputDevice(e: Event) {
-    const target = e.target as HTMLSelectElement;
-    outputDevice.set(target.value);
     try {
-      await invoke("set_output_device", { deviceName: target.value });
+      await pickOutput((e.target as HTMLSelectElement).value);
     } catch (err) {
       console.error("Failed to set output device:", err);
       addNotification(`Failed to set output device: ${err}`, "error");
     }
   }
+
 
   // PTT key capture
   let isCapturingKey = $state(false);
@@ -286,10 +299,6 @@
   }
 
   /** What a picker shows when nothing is saved: the system's own default. */
-  function defaultDeviceName(list: AudioDeviceInfo[]): string {
-    return list.find((d) => d.is_default)?.name ?? list[0]?.name ?? "";
-  }
-
   /** Ask the four first-run questions again, from Settings. */
   function runAudioSetup() {
     audioSetupRequested.set(true);
@@ -413,50 +422,29 @@
     volumeKeyPtt.set(checked);
   }
 
+  // Updates (B6): what the last "Check now" or install said
+  let upToDate = $state(false);
+  let updateError = $state("");
+
+  // A browser grants notifications only from a click (H5-13)
+  let notifyPermission = $state(
+    typeof Notification === "undefined" ? "denied" : Notification.permission,
+  );
+  async function askNotifyPermission() {
+    notifyPermission = await Notification.requestPermission();
+  }
+
   // --- Mic test (settings-panel level meter, independent of VAD/calls) ---
 
-  let micTestRunning = $state(false);
-  let micLevelDb = $state(-100);
   let micLevelPercent = $derived(
-    Math.max(0, Math.min(100, ((micLevelDb + 60) / 60) * 100)),
+    Math.max(0, Math.min(100, (($micTestLevel + 60) / 60) * 100)),
   );
-  let micUnlisten: Array<() => void> = [];
-
-  async function startMicTest() {
-    try {
-      micUnlisten.push(
-        await listen<{ db: number }>("mic-test-level", (e) => {
-          micLevelDb = e.payload.db;
-        }),
-      );
-      micUnlisten.push(
-        await listen<{ error: string }>("mic-test-error", (e) => {
-          addNotification(`Mic test failed: ${e.payload.error}`, "error");
-          stopMicTest();
-        }),
-      );
-      await invoke("start_mic_test", { monitor: $micMonitor });
-      // Closed while it was starting: onDestroy saw no test to stop
-      if (destroyed) return stopMicTest();
-      micTestRunning = true;
-    } catch (e) {
-      addNotification(`Mic test failed: ${e}`, "error");
-      stopMicTest();
-    }
-  }
-
-  function stopMicTest() {
-    micUnlisten.forEach((fn) => fn());
-    micUnlisten = [];
-    micTestRunning = false;
-    micLevelDb = -100;
-    invoke("stop_mic_test").catch(() => {});
-  }
 
   function toggleMicTest() {
-    if (micTestRunning) stopMicTest();
-    else startMicTest();
+    if ($micTesting) void stopMicTest();
+    else void startMicTest($micMonitor);
   }
+
 
   // --- Spatial test: a synthetic voice orbits you through the real mixer ---
 
@@ -509,7 +497,7 @@
   let destroyed = false;
   onDestroy(() => {
     destroyed = true;
-    if (micTestRunning) stopMicTest();
+    if ($micTesting) void stopMicTest();
     if (spatialTest) stopSpatialTest();
   });
 
@@ -549,16 +537,11 @@
   }
 </script>
 
-<div class="overlay" role="dialog" onclick={onclose} onkeydown={() => {}}>
-  <div
-    class="panel"
-    onclick={(e) => e.stopPropagation()}
-    onkeydown={() => {}}
-    role="dialog"
-  >
+<div class="overlay" role="presentation" onclick={backdrop(onclose)}>
+  <div class="panel" use:dialog={{ onclose }}>
     <div class="panel-header">
       <h3>Settings</h3>
-      <button class="close-btn" onclick={onclose} title="Close"><Icon name="close" size={18} /></button>
+      <button class="close-btn" onclick={onclose} title="Close" aria-label="Close settings"><Icon name="close" size={18} /></button>
     </div>
 
     <div class="tabs">
@@ -588,8 +571,8 @@
           <!-- Bound to what is saved, not to `is_default`: a device somebody
                chose on purpose was shown as unselected, so the panel claimed
                they were on the system default when they were not. -->
-          <select value={$inputDevice || defaultDeviceName(inputDevices)} onchange={changeInputDevice}>
-            {#each inputDevices as device}
+          <select value={$inputDevice || defaultDeviceName($inputDevices)} onchange={changeInputDevice}>
+            {#each $inputDevices as device}
               <option value={device.name}>
                 {device.name}
                 {device.is_default ? " (Default)" : ""}
@@ -598,9 +581,9 @@
           </select>
           <div class="mic-test">
             <button class="mic-test-btn" onclick={toggleMicTest}>
-              {micTestRunning ? "Stop test" : "Test microphone"}
+              {$micTesting ? "Stop test" : "Test microphone"}
             </button>
-            {#if micTestRunning}
+            {#if $micTesting}
               <div class="level-track">
                 <div class="level-fill" style="width: {micLevelPercent}%"></div>
               </div>
@@ -610,7 +593,7 @@
             <input
               type="checkbox"
               checked={$micMonitor}
-              disabled={micTestRunning}
+              disabled={$micTesting}
               onchange={(e) => micMonitor.set((e.target as HTMLInputElement).checked)}
             />
             <span class="toggle-label">Hear myself during the test (headphones only)</span>
@@ -624,8 +607,8 @@
 
         <div class="section">
           <h4>Audio Output</h4>
-          <select value={$outputDevice || defaultDeviceName(outputDevices)} onchange={changeOutputDevice}>
-            {#each outputDevices as device}
+          <select value={$outputDevice || defaultDeviceName($outputDevices)} onchange={changeOutputDevice}>
+            {#each $outputDevices as device}
               <option value={device.name}>
                 {device.name}
                 {device.is_default ? " (Default)" : ""}
@@ -643,10 +626,10 @@
           <h4>Push to Talk Key</h4>
           <div class="ptt-config">
             {#if isCapturingKey && captureTarget === "ptt"}
-              <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_static_element_interactions -->
               <span
                 class="current-key capturing"
                 tabindex="0"
+                role="button"
                 onkeydown={handleCaptureKeyDown}
                 onkeyup={handleCaptureKeyUp}
                 onblur={cancelKeyCapture}
@@ -682,10 +665,10 @@
           <div class="ptt-config">
             <span class="hotkey-label">Toggle mute</span>
             {#if isCapturingKey && captureTarget === "mute"}
-              <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_static_element_interactions -->
               <span
                 class="current-key capturing"
                 tabindex="0"
+                role="button"
                 onkeydown={handleCaptureKeyDown}
                 onkeyup={handleCaptureKeyUp}
                 onblur={cancelKeyCapture}
@@ -702,10 +685,10 @@
           <div class="ptt-config">
             <span class="hotkey-label">Toggle deafen</span>
             {#if isCapturingKey && captureTarget === "deafen"}
-              <!-- svelte-ignore a11y_no_noninteractive_tabindex a11y_no_static_element_interactions -->
               <span
                 class="current-key capturing"
                 tabindex="0"
+                role="button"
                 onkeydown={handleCaptureKeyDown}
                 onkeyup={handleCaptureKeyUp}
                 onblur={cancelKeyCapture}
@@ -919,6 +902,77 @@
             <span class="toggle-hint">Enable "Remember connection details" in the connect dialog first</span>
           {/if}
         </label>
+      </div>
+
+      {#if !isWeb && $updatesSupported}
+        <div class="section">
+          <h4>Updates</h4>
+          <label class="toggle-row">
+            <input
+              type="checkbox"
+              checked={$checkUpdates}
+              onchange={(e) => void setCheckUpdates(e.currentTarget.checked)}
+            />
+            <span class="toggle-label">Check for updates once a day</span>
+            <span class="toggle-hint">Each check asks GitHub for the newest release, so GitHub sees your address and this version.</span>
+          </label>
+          {#if $availableUpdate}
+            <span class="toggle-hint">VoIPC {$availableUpdate.version} is available. Installing it restarts VoIPC.</span>
+            <button
+              class="mic-test-btn"
+              onclick={async () => (updateError = await installUpdate())}
+              disabled={$updateBusy !== null || $voice !== null}
+            >
+              {$updateBusy === "installing"
+                ? "Updating…"
+                : $voice !== null
+                  ? "Update after the call"
+                  : `Update to ${$availableUpdate.version}`}
+            </button>
+          {:else if $checkUpdates}
+            <button
+              class="mic-test-btn"
+              onclick={async () => {
+                await checkForUpdate();
+                upToDate = $availableUpdate === null;
+              }}
+              disabled={$updateBusy !== null}
+            >
+              {$updateBusy === "checking" ? "Checking…" : "Check now"}
+            </button>
+            {#if upToDate}<span class="toggle-hint">No newer VoIPC.</span>{/if}
+          {/if}
+          {#if updateError}<span class="toggle-hint">{updateError}</span>{/if}
+        </div>
+      {/if}
+
+      {#if isWeb && notifyPermission === "default"}
+        <div class="section">
+          <h4>Notifications</h4>
+          <button class="mic-test-btn" onclick={askNotifyPermission}>Allow notifications</button>
+          <span class="toggle-hint">
+            For direct messages while this tab is in the background. A browser asks only
+            after a click, so it is asked here.
+          </span>
+        </div>
+      {/if}
+
+      <div class="section">
+        <h4>Remembered accounts</h4>
+        {#if remembered.length === 0}
+          <span class="toggle-hint">No account signs in here without its password.</span>
+        {:else}
+          {#each remembered as d (`${d.server}|${d.name}`)}
+            <div class="device-row">
+              <span>{d.name} on {d.server}</span>
+              <button class="danger-btn" onclick={() => forgetRemembered([d])}>Forget</button>
+            </div>
+          {/each}
+          {#if remembered.length > 1}
+            <button class="danger-btn" onclick={() => forgetRemembered(remembered)}>Forget all</button>
+          {/if}
+          <span class="toggle-hint">Forgotten, an account needs its password again on this {isWeb ? "browser" : "device"}.</span>
+        {/if}
       </div>
 
       <div class="section">
@@ -1381,6 +1435,15 @@
   .btn-row {
     display: flex;
     gap: 8px;
+  }
+
+  .device-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+    font-size: 13px;
   }
 
   .danger-btn {

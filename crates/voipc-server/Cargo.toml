@@ -2,6 +2,8 @@
 name = "voipc-server"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+publish = false
 
 [[bin]]
 name = "voipc-server"
@@ -12,7 +14,6 @@ voipc-protocol = { workspace = true }
 tokio = { workspace = true }
 tokio-rustls = { workspace = true }
 rustls = { workspace = true }
-rustls-pemfile = { workspace = true }
 serde = { workspace = true }
 postcard = { workspace = true }
 tracing = { workspace = true }
@@ -40,7 +41,9 @@ hyper = { version = "1", features = ["http2", "server"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 http-body-util = "0.1"
 wtransport = { version = "0.7", features = ["quinn"] }
-rust-embed = { version = "8", features = ["debug-embed", "mime-guess"] }
+# deterministic-timestamps: the embedded files carry no mtime, so the binary
+# is reproducible (the server never reads last_modified).
+rust-embed = { version = "8", features = ["debug-embed", "mime-guess", "deterministic-timestamps"] }
 hex = "0.4"
 
 # Opt-in relay accounts (`[accounts]` in the config). SQLite for a small relay,
@@ -51,10 +54,12 @@ hex = "0.4"
 #   l4f-accounts = { path = "../l4f-accounts" }
 # to the workspace Cargo.toml while you need it; commit neither that nor the
 # Cargo.lock it changes.
-l4f-accounts = { git = "https://github.com/luki4fun/l4f-accounts.git", tag = "v0.9.0", features = ["postgres", "sqlite"] }
+l4f-accounts = { git = "https://github.com/luki4fun/l4f-accounts.git", tag = "v0.10.0", features = ["postgres", "sqlite"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "sqlite", "migrate", "macros"] }
+
+# The recovery-key reset's proof: an identity signature (libsignal)
+voipc-crypto = { workspace = true }
 
 [dev-dependencies]
 # For the voice_load example (Opus encoding + media encryption of the test tone)
 voipc-audio = { workspace = true }
-voipc-crypto = { workspace = true }

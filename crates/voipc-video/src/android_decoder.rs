@@ -139,6 +139,11 @@ pub struct DecodedFrame {
     pub height: u32,
     /// I420 data: the Y plane, then U and V at half size rounded up.
     pub i420_data: Vec<u8>,
+    /// What the stream says it carries: full range, and the BT.709 matrix.
+    /// [`crate::to_jpeg_ycbcr`] turns the frame into JPEG's YCbCr when it is
+    /// shown; it is not done here, for frames that are only decoded.
+    pub full_range: bool,
+    pub bt709: bool,
 }
 
 /// Screen-share decoder backed by Android's hardware MediaCodec.
@@ -152,6 +157,9 @@ pub struct Decoder {
     slice_height: u32,
     color_format: i32,
     pts_counter: u64,
+    /// The stream's range and matrix, from the output format.
+    full_range: bool,
+    bt709: bool,
 }
 
 // SAFETY: The decoder is only used from a single blocking tokio task.
@@ -187,6 +195,8 @@ impl Decoder {
             slice_height: 0,
             color_format: ffi::COLOR_FormatYUV420SemiPlanar,
             pts_counter: 0,
+            full_range: matches!(video_codec, VideoCodec::Vp8 | VideoCodec::Vp9),
+            bt709: false,
         })
     }
 
@@ -260,6 +270,10 @@ impl Decoder {
                 b"height\0".as_ptr() as *const _,
                 h as i32,
             );
+            // KEY_LOW_LATENCY (API 30+; older decoders ignore the key): hand
+            // each frame out as soon as it is decoded, rather than after a
+            // few more for reordering a screen share never uses (H3-07)
+            ffi::AMediaFormat_setInt32(format, b"low-latency\0".as_ptr() as *const _, 1);
             // Parameter sets, with start codes
             if !csd0.is_empty() {
                 ffi::AMediaFormat_setBuffer(
@@ -431,6 +445,8 @@ impl Decoder {
                     width: self.width,
                     height: self.height,
                     i420_data,
+                    full_range: self.full_range,
+                    bt709: self.bt709,
                 });
             }
         }
@@ -464,6 +480,17 @@ impl Decoder {
                 if let Some(v) = sane(val, MAX_DIMENSION) {
                     self.height = v;
                 }
+            }
+            // What the stream says it carries (KEY_COLOR_RANGE: 1 full,
+            // 2 limited; KEY_COLOR_STANDARD: 1 BT.709). Untagged is limited for
+            // H.264/H.265 and full for VP8/VP9, as on the desktop.
+            self.full_range = matches!(self.video_codec, VideoCodec::Vp8 | VideoCodec::Vp9);
+            self.bt709 = false;
+            if ffi::AMediaFormat_getInt32(format, b"color-range\0".as_ptr() as *const _, &mut val) {
+                self.full_range = val == 1;
+            }
+            if ffi::AMediaFormat_getInt32(format, b"color-standard\0".as_ptr() as *const _, &mut val) {
+                self.bt709 = val == 1;
             }
             // The configure hint was a guess (1920x1080 for anything but HEVC),
             // so its stride must not survive into the real size. Devices that

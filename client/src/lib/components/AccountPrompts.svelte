@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { dialog } from "../actions/dialog.js";
   // The dialogs a relay account needs: the code a sign-in waits for, a new
   // account's recovery key (shown once), setting up the authenticator app
   // (when a role needs it, or when chosen), the recovery codes that come with
@@ -12,7 +13,7 @@
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { listenServer, fromServer } from "../connect.js";
   import { account, accountHex, accountPrompt, closePrompt, relayAccounts, showPrompt } from "../stores/account.js";
-  import { fileStoredDm, joinedTextChannelIds } from "../stores/chat.js";
+  import { fileStoredDm, joinedTextChannelIds, purgeWritten } from "../stores/chat.js";
   import { channels, currentChannelId } from "../stores/channels.js";
   import { shareChannelHistory } from "../stores/settings.js";
   import { users } from "../stores/users.js";
@@ -22,36 +23,38 @@
   import type { AccountInfo, RelayAccounts } from "../types.js";
 
   let code = $state("");
+  let oldPassword = $state("");
+  let newPassword = $state("");
+  let newPassword2 = $state("");
+  /** The account name, typed again to delete it. */
+  let confirmName = $state("");
   let useRecovery = $state(false);
   let error = $state("");
   let busy = $state(false);
   let qr = $state("");
   let copied = $state(false);
 
-  /** The question about copies on the server, once the dialogs that came
-   *  first (recovery key, codes) are out of the way. */
-  let cloudNext: string | null = null;
+  /** The servers whose question about copies waits for the dialogs that
+   *  came first (recovery key, codes) to be out of the way. */
+  const cloudNext: string[] = [];
   let cloudChoice = $state(false);
   let shareChoice = $state(true);
 
   function askCloud(server: string) {
-    if (!get(relayAccounts.of(server))?.cloud) return;
+    if (!get(relayAccounts.peek(server))?.cloud || !get(account.peek(server))) return;
     if (get(accountPrompt)) {
-      cloudNext = server;
+      if (!cloudNext.includes(server)) cloudNext.push(server);
       return;
     }
     reset();
-    cloudChoice = get(account.of(server))?.cloud ?? false;
+    cloudChoice = get(account.peek(server))?.cloud ?? false;
     shareChoice = get(shareChannelHistory);
     showPrompt({ kind: "cloud", server, cloud: cloudChoice, share: shareChoice });
   }
 
   $effect(() => {
-    if (!$accountPrompt && cloudNext) {
-      const server = cloudNext;
-      cloudNext = null;
-      askCloud(server);
-    }
+    const server = !$accountPrompt && cloudNext.shift();
+    if (server) askCloud(server);
   });
 
   /** One consent, two ways: answering newcomers' requests for chat, and
@@ -66,8 +69,8 @@
 
   /** The logs of the channels we are in now: kept from here on. */
   function enterLogs(server: string) {
-    const here = new Set([get(currentChannelId.of(server)), ...get(joinedTextChannelIds.of(server))]);
-    for (const ch of get(channels.of(server))) {
+    const here = new Set([get(currentChannelId.peek(server)), ...get(joinedTextChannelIds.peek(server))]);
+    for (const ch of get(channels.peek(server))) {
       if (ch.log && here.has(ch.channel_id)) invoke("account_enter", { server, conv: ch.log }).catch(() => {});
     }
   }
@@ -90,6 +93,10 @@
 
   function reset() {
     code = "";
+    oldPassword = "";
+    newPassword = "";
+    newPassword2 = "";
+    confirmName = "";
     useRecovery = false;
     error = "";
     busy = false;
@@ -144,9 +151,9 @@
         ttl_secs: number | null;
         timestamp: number;
       }>("stored-dm", (server, m) => {
-        const me = get(account.of(server));
+        const me = get(account.peek(server));
         if (!me) return;
-        const online = get(users.of(server)).find((u) => u.username === m.peer_name);
+        const online = get(users.peek(server)).find((u) => u.username === m.peer_name);
         fileStoredDm(
           server,
           m,
@@ -155,9 +162,34 @@
           online?.user_id,
         );
       }),
+      // A tombstone: its writer deleted what they wrote there up to `before`.
+      listenServer<{ conv: string; name: string; account: string; from_me: boolean; before: number }>("stored-purge", (server, t) => {
+        const me = get(account.peek(server));
+        if (!me) return;
+        const writer = t.from_me ? accountHex(me.info.id) : t.account;
+        const ch = get(channels.peek(server)).find((c) => c.log === t.conv);
+        if (ch) purgeWritten(server, "channel", ch.name, writer, t.before);
+        else if (t.conv.startsWith("d:")) purgeWritten(server, "dm", t.name, writer, t.before);
+      }),
       listenServer<{ reason: string }>("stored-not-kept", (server, d) =>
         addNotification(`${fromServer(server)}not kept on the server: ${d.reason}`, "warning"),
       ),
+      // A vault item this device will not use as the server holds it (and so
+      // never saves over this session).
+      listenServer<{ item: string; problem: string }>("vault-problem", (server, d) => {
+        const what =
+          d.item === "item.pins" ? "the identities you pinned" : d.item === "item.logkey" ? "your key for kept messages" : "your account settings";
+        const why =
+          d.problem === "newer"
+            ? "were saved by a newer VoIPC — update to use them"
+            : d.problem === "older"
+              ? "came back older than this device saw them: the server may be rolling them back"
+              : d.problem === "missing"
+                ? "are missing, though this device saw them before: the server may be withholding them"
+                : "could not be read";
+        const warn = d.item === "item.pins" ? ". People you meet now are not checked against them." : ".";
+        addNotification(`${fromServer(server)}Security warning: ${what} ${why}${warn}`, "error", 0);
+      }),
     );
   });
   onDestroy(() => unlisten.forEach((u) => u.then((f) => f())));
@@ -169,9 +201,9 @@
     switch (tag) {
       case "TotpSetup": {
         // A role's codes come first; the question waits for them.
-        if (prompt?.kind === "cloud") cloudNext = prompt.server;
+        if (prompt?.kind === "cloud" && !cloudNext.includes(prompt.server)) cloudNext.unshift(prompt.server);
         reset();
-        const why = get(account.of(server))?.info.needs_2fa ? "required" : "chosen";
+        const why = get(account.peek(server))?.info.needs_2fa ? "required" : "chosen";
         showPrompt({ kind: "totp-setup", server, secret: body.secret, uri: body.uri, sealed: body.sealed, why });
         invoke<string>("qr_svg", { text: body.uri }).then((svg) => (qr = svg), () => (qr = ""));
         break;
@@ -181,17 +213,42 @@
         showPrompt({ kind: "recovery-codes", server, codes: body.recovery_codes });
         break;
       case "Info": {
-        const before = get(account.of(server))?.info.needs_2fa;
+        const before = get(account.peek(server))?.info.needs_2fa;
         account.of(server).update((a) => (a ? { ...a, info: body as AccountInfo } : a));
         // A role arrived (the admin token's claim, a grant): it waits for codes.
         if ((body as AccountInfo).needs_2fa && !before && prompt?.kind !== "totp-setup") askTotpSetup(server);
         break;
       }
+      case "LogPurged":
+        addNotification(`${fromServer(server)}${body.entries} kept message${body.entries === 1 ? "" : "s"} deleted from the server`, "info");
+        break;
+      case "AccountDeleted": {
+        if (prompt?.kind === "delete" && prompt.server === server) closePrompt(prompt);
+        reset();
+        const name = get(account.peek(server))?.name ?? "";
+        // Nothing of it is any use here now: the remembered device, the
+        // server's account id (a new account there is another one)
+        invoke("forget_device", { server, name }).catch(() => {});
+        invoke("forget_relay_id", { server }).catch(() => {});
+        addNotification(`${fromServer(server)}account ${name} deleted`, "info");
+        break;
+      }
+      case "PasswordChanged":
+        if (prompt?.kind === "password" && prompt.server === server) closePrompt(prompt);
+        reset();
+        addNotification(`${fromServer(server)}password changed. Your other devices need the new one.`, "info");
+        break;
       case "DeviceAdded":
         addNotification(`${fromServer(server)}this device is remembered — no password next time`, "info");
         break;
       case "Error":
-        if (prompt && prompt.server === server && prompt.kind === "totp-setup") {
+        if (
+          prompt &&
+          prompt.server === server &&
+          (prompt.kind === "totp-setup" ||
+            (prompt.kind === "password" && body.request === "PasswordChange") ||
+            (prompt.kind === "delete" && body.request === "DeleteAccount"))
+        ) {
           error = body.reason;
           busy = false;
         } else {
@@ -240,6 +297,67 @@
     }
   }
 
+  async function submitDelete() {
+    const p = get(accountPrompt);
+    if (!p || p.kind !== "delete") return;
+    const server = p.server;
+    if (p.what === "kept") {
+      closePrompt(p);
+      invoke("account_purge", { server, conv: null }).catch((e) => addNotification(`${fromServer(server)}${e}`, "error"));
+      return;
+    }
+    const me = get(account.peek(server));
+    const codes = me?.info.totp_enabled ?? false;
+    error =
+      confirmName.trim().toLowerCase() !== me?.name ? "Type the account's name to confirm."
+      : !oldPassword ? "Enter your password."
+      : codes && !code.trim() ? (useRecovery ? "Enter a recovery code." : "Enter the code from your authenticator app.")
+      : "";
+    if (error) return;
+    busy = true;
+    try {
+      // The answer comes as account-reply (onReply)
+      await invoke("account_delete", {
+        server,
+        password: oldPassword.normalize("NFC"),
+        totp: codes && !useRecovery ? code.trim() : null,
+        recovery: codes && useRecovery ? code.trim() : null,
+      });
+    } catch (e) {
+      error = String(e);
+      busy = false;
+    }
+  }
+
+  async function submitPassword() {
+    const p = get(accountPrompt);
+    if (!p || p.kind !== "password") return;
+    // One spelling of the password on every device: the keys come from its bytes.
+    const [old, next] = [oldPassword.normalize("NFC"), newPassword.normalize("NFC")];
+    const codes = get(account.peek(p.server))?.info.totp_enabled ?? false;
+    error =
+      !old ? "Enter your current password."
+      : [...next].length < 10 ? "Use a new password of at least 10 characters."
+      : next !== newPassword2.normalize("NFC") ? "The new passwords do not match."
+      : codes && !code.trim() ? (useRecovery ? "Enter a recovery code." : "Enter the code from your authenticator app.")
+      : "";
+    if (error) return;
+    busy = true;
+    try {
+      // The answer comes as account-reply (onReply)
+      await invoke("account_password_change", {
+        server: p.server,
+        old,
+        new: next,
+        totp: codes && !useRecovery ? code.trim() : null,
+        recovery: codes && useRecovery ? code.trim() : null,
+      });
+    } catch (e) {
+      error = String(e);
+      busy = false;
+    }
+  }
+
   async function copy(text: string) {
     try {
       await navigator.clipboard.writeText(text);
@@ -252,12 +370,24 @@
   function closeRecovery() {
     closePrompt();
   }
+
+  /**
+   * What Escape does: the prompt's own Cancel, Later or Done. Nothing for
+   * the ones that need an answer (a key or codes to write down, the
+   * keep-messages question), or while a request is on its way.
+   */
+  function escapeFor(kind: string): (() => void) | undefined {
+    if (busy) return undefined;
+    if (kind === "totp") return cancelTotp;
+    if (["totp-setup", "safety", "account", "delete", "password"].includes(kind)) return () => closePrompt();
+    return undefined;
+  }
 </script>
 
 {#if $accountPrompt}
   {@const p = $accountPrompt}
   <div class="overlay">
-    <div class="dialog account-dialog" data-kind={p.kind}>
+    <div class="dialog account-dialog" data-kind={p.kind} use:dialog={{ onclose: escapeFor(p.kind) }}>
       {#if p.kind === "totp"}
         <h2>Two-factor code</h2>
         <p class="hint">
@@ -288,17 +418,17 @@
           <button type="button" class="submit-btn" onclick={submitTotp} disabled={busy || !code.trim()}>Sign in</button>
         </div>
       {:else if p.kind === "recovery"}
-        <h2>Your recovery key</h2>
+        <h2>{fromServer(p.server)}Your recovery key</h2>
         <p class="hint">
-          Write it down and keep it somewhere safe: it is how you will get back into your account's encrypted vault
-          if you lose your password, once VoIPC can reset one (this version cannot yet). VoIPC shows it only now,
-          and the server cannot recover it for you.
+          Write it down and keep it somewhere safe: if you forget your password, it sets a new one ("Forgot your
+          password?" when you sign in) and opens your account's encrypted vault. VoIPC shows it only now, and the
+          server cannot recover it for you.
         </p>
         <code class="secret">{p.key}</code>
         <button type="button" class="secondary" onclick={() => copy(p.key)}>{copied ? "Copied" : "Copy"}</button>
         <button type="button" class="submit-btn" onclick={closeRecovery}>I have written it down</button>
       {:else if p.kind === "totp-setup"}
-        <h2>Set up two-factor codes</h2>
+        <h2>{fromServer(p.server)}Set up two-factor codes</h2>
         <p class="hint">
           {#if p.why === "required"}Your role on this server needs a second factor before its rights apply.{/if}
           Scan this with an authenticator app (Aegis, 2FAS, Google Authenticator…), then type the code it shows.
@@ -329,7 +459,7 @@
           <button type="button" class="submit-btn" onclick={submitSetup} disabled={busy}>Turn on</button>
         </div>
       {:else if p.kind === "safety"}
-        <h2>Verify {p.name}</h2>
+        <h2>{fromServer(p.server)}Verify {p.name}</h2>
         <p class="hint">
           Compare this number with {p.name} in person or on a call. If it matches theirs, nobody — not even this
           server — stands between your encrypted messages. It changes when either of you gets a new identity.
@@ -374,10 +504,20 @@
             <span>Messages kept on this server: <strong>{$account.cloud ? "yes" : "no"}</strong></span>
             <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); askCloud(server); }}>Change</button>
           </div>
+          <div class="row">
+            <span>Password</span>
+            <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); reset(); showPrompt({ kind: "password", server }); }}>Change</button>
+          </div>
           {#if !$account.info.totp_enabled}
             <div class="row">
               <span>Two-factor codes protect the account on new devices.</span>
               <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); askTotpSetup(server); }}>Set up</button>
+            </div>
+          {/if}
+          {#if $account.cloud}
+            <div class="row">
+              <span>Messages you kept here</span>
+              <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); reset(); showPrompt({ kind: "delete", server, what: "kept" }); }}>Delete</button>
             </div>
           {/if}
           <div class="row">
@@ -393,9 +533,103 @@
             >Forget</button>
           </div>
         </div>
-        <button type="button" class="submit-btn" onclick={() => closePrompt()}>Done</button>
+        <div class="buttons">
+          <button type="button" class="secondary danger" onclick={() => { const server = p.server; closePrompt(); reset(); showPrompt({ kind: "delete", server, what: "account" }); }}>Delete account…</button>
+          <button type="button" class="submit-btn" onclick={() => closePrompt()}>Done</button>
+        </div>
+      {:else if p.kind === "delete" && p.what === "kept"}
+        <h2>{fromServer(p.server)}Delete your kept messages?</h2>
+        <p class="hint">
+          Every message you kept on this server goes from it, in every channel and conversation. Copies people's
+          devices already fetched may stay there. New messages are still kept while copies are on.
+        </p>
+        <div class="buttons">
+          <button type="button" class="secondary" onclick={() => closePrompt()}>Cancel</button>
+          <button type="button" class="submit-btn danger" onclick={submitDelete}>Delete them</button>
+        </div>
+      {:else if p.kind === "delete"}
+        {@const codes = $account?.info.totp_enabled ?? false}
+        <h2>{fromServer(p.server)}Delete your account?</h2>
+        <p class="hint">
+          This deletes {$account?.name ?? "the account"} on this server for good: its vault (your identity and the
+          people you verified), the messages it kept, its remembered devices and its sessions. The name is free for
+          someone else afterwards. What other people wrote to you, and copies of your messages their devices already
+          have, stay theirs.
+        </p>
+        <div class="field">
+          <label for="acct-delete-name">Type the account's name</label>
+          <!-- svelte-ignore a11y_autofocus -->
+          <input id="acct-delete-name" type="text" autocomplete="off" autofocus bind:value={confirmName} disabled={busy} />
+        </div>
+        <div class="field">
+          <label for="acct-delete-password">Password</label>
+          <input id="acct-delete-password" type="password" autocomplete="current-password" bind:value={oldPassword} disabled={busy} />
+        </div>
+        {#if codes}
+          <div class="field">
+            <label for="acct-delete-code">{useRecovery ? "Recovery code" : "Code from your authenticator app"}</label>
+            <input id="acct-delete-code" type="text" autocomplete="one-time-code" bind:value={code} disabled={busy} />
+          </div>
+          <button type="button" class="link" onclick={() => (useRecovery = !useRecovery)}>
+            {useRecovery ? "Use a code from the app" : "Lost your phone? Use a recovery code"}
+          </button>
+        {/if}
+        {#if error}<div class="error">{error}</div>{/if}
+        <div class="buttons">
+          <button type="button" class="secondary" onclick={() => closePrompt()} disabled={busy}>Cancel</button>
+          <button type="button" class="submit-btn danger" onclick={submitDelete} disabled={busy}>Delete account</button>
+        </div>
+      {:else if p.kind === "password"}
+        {@const codes = $account?.info.totp_enabled ?? false}
+        <h2>{fromServer(p.server)}Change your password</h2>
+        <p class="hint">
+          Your other devices are signed out and need the new password. Your recovery key stays the same.
+        </p>
+        <div class="field">
+          <label for="acct-old-password">Current password</label>
+          <!-- svelte-ignore a11y_autofocus -->
+          <input id="acct-old-password" type="password" autocomplete="current-password" autofocus bind:value={oldPassword} disabled={busy} />
+        </div>
+        <div class="field">
+          <label for="acct-new-password">New password</label>
+          <input id="acct-new-password" type="password" autocomplete="new-password" bind:value={newPassword} disabled={busy} />
+        </div>
+        <div class="field">
+          <label for="acct-new-password2">New password again</label>
+          <input
+            id="acct-new-password2"
+            type="password"
+            autocomplete="new-password"
+            bind:value={newPassword2}
+            disabled={busy}
+            onkeydown={(e) => e.key === "Enter" && !codes && submitPassword()}
+          />
+        </div>
+        {#if codes}
+          <div class="field">
+            <label for="acct-password-code">{useRecovery ? "Recovery code" : "Code from your authenticator app"}</label>
+            <input
+              id="acct-password-code"
+              type="text"
+              inputmode={useRecovery ? "text" : "numeric"}
+              autocomplete="one-time-code"
+              bind:value={code}
+              placeholder={useRecovery ? "abcd-efgh-jkmn" : "123456"}
+              disabled={busy}
+              onkeydown={(e) => e.key === "Enter" && submitPassword()}
+            />
+          </div>
+          <button type="button" class="link" onclick={() => (useRecovery = !useRecovery)}>
+            {useRecovery ? "Use a code from the app" : "Lost your phone? Use a recovery code"}
+          </button>
+        {/if}
+        {#if error}<div class="error">{error}</div>{/if}
+        <div class="buttons">
+          <button type="button" class="secondary" onclick={() => closePrompt()} disabled={busy}>Cancel</button>
+          <button type="button" class="submit-btn" onclick={submitPassword} disabled={busy}>Change password</button>
+        </div>
       {:else if p.kind === "recovery-codes"}
-        <h2>Recovery codes</h2>
+        <h2>{fromServer(p.server)}Recovery codes</h2>
         <p class="hint">
           Each one signs you in once without your phone. Keep them with your recovery key; they are shown only now.
         </p>
@@ -564,5 +798,14 @@
   .secondary {
     padding: 10px;
     font-size: 14px;
+  }
+
+  .danger {
+    color: var(--danger, #e5534b);
+  }
+
+  .submit-btn.danger {
+    background: var(--danger, #e5534b);
+    color: white;
   }
 </style>

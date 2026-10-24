@@ -191,7 +191,7 @@
   }
 
   .audio-status.active {
-    color: #43b581;
+    color: var(--success);
     background: rgba(67, 181, 129, 0.1);
   }
 
@@ -241,7 +241,7 @@
   }
 
   .stat.dropped {
-    color: #faa61a;
+    color: var(--warning);
   }
 
   .fullscreen-btn {

@@ -1,2 +1,2 @@
-# Standalone workspace: cargo/wasm-pack build here, not in the root target dir.
+# Standalone workspace: cargo builds here, not in the root target dir.
 /target

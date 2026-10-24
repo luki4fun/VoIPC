@@ -15,6 +15,16 @@
   let rehello = null;
   let talking = false;
 
+  // Say hello again, after VoIPC's one-per-second limit.
+  function sayHelloAgain() {
+    clearTimeout(rehello);
+    rehello = setTimeout(() => {
+      if (socket && socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify(hello));
+      }
+    }, 1100);
+  }
+
   const post = (path, body) =>
     fetch(`https://${GetParentResourceName()}/${path}`, {
       method: "POST",
@@ -39,30 +49,27 @@
       } catch {
         return;
       }
-      if (msg.type === "state") post("state", msg);
+      if (msg.type === "state") {
+        post("state", msg);
+        // The player came back to our channel on their own: arm again.
+        if (msg.state === "returned") sayHelloAgain();
+      }
       else if (msg.type === "talk" || msg.type === "self" || msg.type === "user") post("talk", msg);
       else if (msg.type === "error") {
         post("error", msg);
-        // Every "say hello again" case says exactly that: a VoIPC reconnect,
-        // leaving the channel, or another socket having taken ownership while
-        // we were open. Matching plain "hello" also matched VoIPC's *refusals*
-        // of a hello ("one hello per second", "hello needs the channel…"), and
-        // answering those with another hello is a loop at line rate. After the
-        // rate limit, too — one a second is what VoIPC accepts.
-        if (typeof msg.reason === "string" && msg.reason.includes("send hello")) {
-          clearTimeout(rehello);
-          rehello = setTimeout(() => {
-            if (socket && socket.readyState === WebSocket.OPEN) {
-              socket.send(JSON.stringify(hello));
-            }
-          }, 1100);
-        }
+        // Match the code, never the English. `rehello` is a VoIPC reconnect
+        // or an admin moving the player; `no_hello` is another socket having
+        // taken the mix while we were open. `player_left` is the player
+        // walking away themselves: a hello would not bring them back, so wait
+        // for `state: returned`. Answering any other refusal with a hello is a
+        // loop.
+        if (msg.code === "rehello" || msg.code === "no_hello") sayHelloAgain();
         // VoIPC lets go of a held push-to-talk after 60 seconds, whatever the
         // mod believes, so that a crashed one cannot leave a microphone open.
         // A radio key that is genuinely still down has to say so again, or a
         // long transmission is cut in the middle and stays cut until the
         // player releases the key and presses it a second time.
-        if (talking && typeof msg.reason === "string" && msg.reason.includes("released after 60s")) {
+        if (talking && msg.code === "transmit_expired") {
           socket.send(JSON.stringify({ type: "transmit", on: true }));
         }
       }

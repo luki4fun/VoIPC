@@ -15,10 +15,12 @@
 // back when it is finished.
 //
 // What it checks, in order: the handshake; that a mod naming the wrong server
-// is refused without being told who is at the keyboard; that `hello` joins the
+// is refused without being told who is at the keyboard, and that a channel it
+// does not have is refused the same way; that `hello` joins the
 // named channel and answers `ingame`; that an update placing people is
 // accepted; that a layered player (a radio and a phone in one ear) is accepted;
-// that listing one id twice is refused; that `transmit` opens and closes the
+// that listing one id twice is refused; that a type from a newer SDK is
+// answered without closing the socket; that `transmit` opens and closes the
 // microphone when the player has allowed it; and that a second origin cannot
 // take the mix while this one holds it.
 
@@ -160,6 +162,17 @@ check(
   "and the refusal says nothing about the player",
 );
 
+// The right server with a channel it does not have gets the very same answer:
+// otherwise any allowed page could map the player's servers and channels
+await wait(1100);
+mod.send(hello({ channel: "no-such-channel-here" }));
+const nochan = await mod.next();
+check(
+  JSON.stringify(nochan) === JSON.stringify(wrong),
+  "an unknown channel looks exactly like a wrong server",
+  JSON.stringify(nochan),
+);
+
 await wait(1100); // one hello per second
 mod.send(hello());
 const state = await mod.next();
@@ -209,7 +222,15 @@ mod.send({
   ],
 });
 const dup = await mod.next();
-check(/twice/.test(dup.reason ?? ""), "one player listed twice is refused", dup.reason);
+check(dup.code === "bad_update", "one player listed twice is refused", dup.reason);
+
+// A type from a newer SDK is answered, not counted: three of them and the
+// socket is still open (three malformed messages would close it)
+mod.messages.length = 0;
+for (let i = 0; i < 3; i++) mod.send({ type: "from-the-future" });
+const unknown = await mod.next();
+check(unknown.code === "unknown_type", "an unknown type is answered with unknown_type", unknown.reason);
+await wait(300); // the other two answers, before the next check reads errors
 
 mod.messages.length = 0;
 mod.send({ type: "transmit", on: true });
@@ -233,7 +254,7 @@ const second = await connect("http://localhost:3000");
 second.send(hello({ game: "another" }));
 const taken = await second.next();
 check(
-  /another game/.test(taken.reason ?? ""),
+  taken.code === "mix_taken",
   "a second origin cannot take the mix",
   taken.reason ?? taken.state,
 );

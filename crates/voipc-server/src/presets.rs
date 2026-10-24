@@ -120,7 +120,7 @@ pub fn instantiate(preset: &Preset) -> Instance {
         .map(|mut entry| {
             if let Some(password) = entry.password.take() {
                 let password = if password == PRESET_PLACEHOLDER { generate_password() } else { password };
-                entry.password_hash = Some(channels::hash_password(&password));
+                entry.password_hash = Some(channels::hash_password(&password).expect("a preset's passwords are 1 to 512 characters"));
                 passwords.push((entry.name.clone(), password));
             }
             entry
@@ -309,11 +309,11 @@ fn init(preset: &Preset, out: &Path, settings_path: &Path, force: bool) -> anyho
             .map(|n| PathBuf::from(if n == 1 { format!("{}.bak", out.display()) } else { format!("{}.bak.{n}", out.display()) }))
             .find(|p| !p.exists())
             .expect("a free name");
-        std::fs::copy(out, &backup)
+        // Private from the start: a channels.json from before 0.12 was written
+        // world-readable, and its password hashes are not
+        std::fs::read(out)
+            .and_then(|old| crate::fsutil::create_private(&backup, &old))
             .with_context(|| format!("keeping a copy of {} as {}", out.display(), backup.display()))?;
-        // The copy keeps the old file's mode, and a channels.json from before
-        // 0.12 was written world-readable: its password hashes are not.
-        crate::fsutil::owner_only(&backup).with_context(|| format!("making {} readable by this user only", backup.display()))?;
         println!("Kept the old file as {}", backup.display());
     }
     channels::atomic_rewrite(out, &instance.channels)

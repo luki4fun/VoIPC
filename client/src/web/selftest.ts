@@ -524,6 +524,11 @@ export async function run(params: URLSearchParams): Promise<void> {
   try {
     const [played, lost] = await invoke<[number, number]>("get_voice_stats");
     log("voice-stats", { played, lost });
+    // The bundle ships the worklet's Opus decoder: falling back to WebCodecs
+    // here means FEC and PLC are silently gone (H3-05)
+    const decoder = await invoke<string>("get_voice_decoder");
+    log("voice-decoder", { decoder });
+    if (decoder !== "worklet") log("error", { message: `voice decoded by ${decoder}, not the worklet's Opus decoder` });
   } catch (e) {
     log("error", { message: `voice-stats: ${String(e)}` });
   }

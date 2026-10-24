@@ -15,6 +15,7 @@ import { AccountDriver, type AccountArgs, type AccountHost } from "./account";
 import { connect as openTransport, type Transport } from "./transport";
 import type { SessionContext } from "./types";
 import type { ChannelInfo } from "../../lib/types";
+import { parseHostPort } from "../../lib/invite";
 import type { ProximityMode } from "../../lib/spatial";
 import { audio } from "./audio";
 import { video } from "./video";
@@ -213,31 +214,11 @@ async function doConnect(address: string, username: string, account?: AccountArg
   return session.userId;
 }
 
-/** Port of network.rs parse_address; the port defaults to 9987. */
+/** network.rs parse_address's rules: the port defaults to 9987. */
 function parseAddress(address: string): { host: string; port: number } {
-  let host: string;
-  let portStr: string | null;
-  if (address.startsWith("[")) {
-    // IPv6: [::1]:9987
-    const end = address.indexOf("]");
-    if (end < 0) throw new Error("Invalid IPv6 address format, expected [host]:port");
-    host = address.slice(1, end);
-    const rest = address.slice(end + 1);
-    if (rest === "") portStr = null;
-    else if (rest.startsWith(":")) portStr = rest.slice(1);
-    else throw new Error("Invalid IPv6 address format, expected [host]:port");
-  } else {
-    const colon = address.lastIndexOf(":");
-    host = colon < 0 ? address : address.slice(0, colon);
-    portStr = colon < 0 ? null : address.slice(colon + 1);
-  }
-  let port = 9987;
-  if (portStr !== null) {
-    if (!/^\d{1,5}$/.test(portStr) || Number(portStr) > 65535) throw new Error("Invalid port number");
-    port = Number(portStr);
-  }
-  if (host === "") throw new Error("Host cannot be empty");
-  return { host, port };
+  const parsed = parseHostPort(address);
+  if (!parsed) throw new Error("Invalid address, expected host:port or [IPv6]:port");
+  return parsed;
 }
 
 export class Session implements SessionContext, AccountHost {
@@ -607,6 +588,8 @@ export class Session implements SessionContext, AccountHost {
       case "Authenticated":
         this.userId = b.user_id;
         this.sessionId = b.session_id;
+        // libsignal binds both parties' ids into every pairwise message
+        this.signal.setOwnUserId(b.user_id);
         if (b.accounts) this.emit("relay-accounts", b.accounts);
         // An account sign-in ends signed in to that account, or not at all
         // (account.rs sign_in waits for exactly this).
@@ -637,13 +620,25 @@ export class Session implements SessionContext, AccountHost {
       case "AuthError":
         this.auth?.reject(new Error(`Authentication failed: ${b.reason}`));
         break;
+      case "Refused":
+        // Another protocol: the facts for the "update" panel, and the text,
+        // which says "version mismatch" (connect.ts stops reconnecting on it)
+        this.emit("update-needed", {
+          code: b.code,
+          server_protocol: b.server_protocol,
+          server_version: b.server_version,
+          our_protocol: wasm().protocolVersion(),
+          our_version: wasm().appVersion(),
+        });
+        this.auth?.reject(new Error(b.text));
+        break;
       case "ChannelList":
         // Our own copy: the emitted array ends up in the UI's store
         this.channels = [...b.channels];
         this.emit("channel-list", b.channels);
         break;
       case "UserList": {
-        this.account?.noteRoster(b.users);
+        this.account?.noteRoster(this, b.users);
         // In a channel with a log: keep it (with cloud copies on), and read
         // what it kept since last time.
         const log = this.channels.find((c) => c.channel_id === b.channel_id)?.log;
@@ -652,7 +647,7 @@ export class Session implements SessionContext, AccountHost {
         break;
       }
       case "UserJoined": {
-        this.account?.noteRoster([b.user]);
+        this.account?.noteRoster(this, [b.user]);
         // Pairwise sessions are needed in every channel (DMs, pokes)
         if (b.user.user_id !== this.userId) this.requestPrekeyBundlesForUsers([b.user]);
         // Somebody joined a channel we are in. Nobody else hands them our
@@ -685,6 +680,10 @@ export class Session implements SessionContext, AccountHost {
             // behind is what let a re-join write on the key every former
             // member still had.
             this.signal.forgetChannel(this.userId, b.channel_id);
+            // Out of the channel's log too: the relay took us out of it
+            // (1.0, D10), and a rejoin keeps it again
+            const log = this.channels.find((c) => c.channel_id === b.channel_id)?.log;
+            if (log) this.account?.leave(this, log, false);
           } else if (this.signal.isTextChannel(b.channel_id)) {
             // They keep the chain key they were given; our next message here
             // starts a fresh one they cannot read.
@@ -824,6 +823,10 @@ export class Session implements SessionContext, AccountHost {
         this.account?.checkIdentity(this, b.user_id, b.bundle.identity_key);
         this.onPrekeyBundle(b.user_id, b.bundle);
         break;
+      case "PreKeysLow":
+        // The relay has handed out most of our one-time pre-keys
+        this.sendControl({ UploadPreKeys: { prekeys: this.signal.morePrekeys() } });
+        break;
       case "PreKeyBundleUnavailable":
         // Remove from pending so we don't loop
         this.pendingSessions.delete(b.user_id);
@@ -871,9 +874,25 @@ export class Session implements SessionContext, AccountHost {
         this.emit("admin-error", { reason: b.reason });
         break;
       case "AdminBans":
+        // u64s may arrive as BigInt: plain numbers for the UI (types.ts BanInfo)
         this.emit("admin-bans", {
-          bans: (b.bans as { ip: string; expires_in_secs?: bigint | number }[]).map((x) => ({
-            ip: x.ip,
+          bans: (
+            b.bans as {
+              id: bigint | number;
+              account: boolean;
+              label: string;
+              reason: string;
+              by: string;
+              created_at: bigint | number;
+              expires_in_secs?: bigint | number | null;
+            }[]
+          ).map((x) => ({
+            id: Number(x.id),
+            account: x.account,
+            label: x.label,
+            reason: x.reason,
+            by: x.by,
+            created_at: Number(x.created_at),
             expires_in_secs: x.expires_in_secs == null ? null : Number(x.expires_in_secs),
           })),
         });
@@ -1245,9 +1264,13 @@ export class Session implements SessionContext, AccountHost {
     this.pendingSessions.delete(userId);
   }
 
-  /** Take the queued messages for `matches`, dropping those older than the TTL. */
+  /**
+   * Take the queued messages for `matches`, dropping those older than the TTL.
+   * `undelivered` is the event that says so: they were shown as sent (H4-10).
+   */
   private takePending(
     matches: (t: PendingTarget) => boolean,
+    undelivered: [string, Record<string, number>],
   ): { id: string; content: string; ttlSecs?: number }[] {
     const now = Date.now();
     const send: { id: string; content: string; ttlSecs?: number }[] = [];
@@ -1258,13 +1281,19 @@ export class Session implements SessionContext, AccountHost {
       else if (now - m.queuedAt < PENDING_MESSAGE_TTL_MS) send.push({ id: m.id, content: m.content, ttlSecs: m.ttlSecs });
       else expired++;
     }
-    if (expired > 0) console.warn(`dropped ${expired} expired pending messages`);
+    if (expired > 0) {
+      console.warn(`dropped ${expired} expired pending messages`);
+      this.emit(undelivered[0], { ...undelivered[1], expired });
+    }
     this.pendingMessages = remaining;
     return send;
   }
 
   private drainPendingDms(targetUserId: number): void {
-    for (const { id, content, ttlSecs } of this.takePending((t) => t.kind === "direct" && t.targetUserId === targetUserId)) {
+    for (const { id, content, ttlSecs } of this.takePending((t) => t.kind === "direct" && t.targetUserId === targetUserId, [
+      "dm-undelivered",
+      { user_id: targetUserId },
+    ])) {
       try {
         const { ciphertext, message_type } = this.signal.encrypt(
           targetUserId,
@@ -1278,7 +1307,10 @@ export class Session implements SessionContext, AccountHost {
   }
 
   private drainPendingChannelMessages(channelId: number): void {
-    const pending = this.takePending((t) => t.kind === "channel" && t.channelId === channelId);
+    const pending = this.takePending((t) => t.kind === "channel" && t.channelId === channelId, [
+      "channel-undelivered",
+      { channel_id: channelId },
+    ]);
     if (pending.length === 0) return;
     // Written before we had anybody to send them to, and somebody may have
     // left the channel in between — in which case our chain is stale and the

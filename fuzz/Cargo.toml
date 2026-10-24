@@ -1,0 +1,114 @@
+[package]
+name = "voipc-fuzz"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# Its own workspace, on nightly: `cargo +nightly fuzz run <target>` from here.
+# Each target calls a `fuzz_<name>` function that lives next to the code it
+# tests, behind cfg(any(test, fuzzing)), so the crate's own tests replay it
+# on stable.
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+voipc-opus-wasm = { path = "../crates/voipc-opus-wasm" }
+voipc-protocol = { path = "../crates/voipc-protocol" }
+voipc-crypto = { path = "../crates/voipc-crypto" }
+voipc-audio = { path = "../crates/voipc-audio" }
+voipc-web = { path = "../crates/voipc-web" }
+
+[[bin]]
+name = "opus_decode"
+path = "fuzz_targets/opus_decode.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "codec"
+path = "fuzz_targets/codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "media_packets"
+path = "fuzz_targets/media_packets.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "video_assembly"
+path = "fuzz_targets/video_assembly.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ws"
+path = "fuzz_targets/ws.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "envelope"
+path = "fuzz_targets/envelope.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "keys"
+path = "fuzz_targets/keys.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "log"
+path = "fuzz_targets/log.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "vault"
+path = "fuzz_targets/vault.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jitter"
+path = "fuzz_targets/jitter.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "opus"
+path = "fuzz_targets/opus.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "game"
+path = "fuzz_targets/game.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "web_media"
+path = "fuzz_targets/web_media.rs"
+test = false
+doc = false
+bench = false

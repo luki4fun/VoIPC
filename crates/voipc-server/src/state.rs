@@ -35,6 +35,21 @@ impl RateLimiter {
         }
     }
 
+    /// Whether the bucket has refilled completely.
+    pub fn is_full(&mut self) -> bool {
+        self.has_token();
+        self.tokens >= self.max_tokens
+    }
+
+    /// Whether one token is there, without taking it.
+    pub fn has_token(&mut self) -> bool {
+        let now = Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.max_tokens);
+        self.last_refill = now;
+        self.tokens >= 1.0
+    }
+
     /// Try to consume one token. Returns true if allowed, false if rate-limited.
     pub fn try_consume(&mut self) -> bool {
         let now = Instant::now();
@@ -97,6 +112,9 @@ pub struct UserSession {
     pub password_attempt_rate: RateLimiter,
     /// Rate limiter for chat messages (channel + DM).
     pub chat_rate: RateLimiter,
+    /// Account requests (the database work behind kept messages and the
+    /// vault): 10 a second, 30 at once.
+    pub account_rate: RateLimiter,
     /// Rate limiter for keyframe requests relayed *to* this user as a sharer
     /// (each one forces an IDR); per share, so many viewers losing the same
     /// frames cannot storm the sharer.
@@ -167,16 +185,9 @@ pub struct UserSession {
     // ── E2E Encryption fields ─────────────────────────────────────────
     /// Client's long-term identity public key (Curve25519). Opaque to server.
     pub identity_key: Option<Vec<u8>>,
-    /// Available one-time pre-keys (consumed when another user requests a bundle).
-    pub prekeys: Vec<OneTimePreKey>,
-    /// Current signed pre-key data.
-    pub signed_prekey_id: Option<u32>,
-    pub signed_prekey: Option<Vec<u8>>,
-    pub signed_prekey_signature: Option<Vec<u8>>,
-    /// Signal Protocol registration ID.
-    pub registration_id: u32,
-    /// Device ID (always 1 for now — single device per user).
-    pub device_id: u32,
+    /// The pre-key bundle the client brought. Its `prekeys` is the pool of
+    /// one-time keys: each bundle request takes one, `UploadPreKeys` refills it.
+    pub bundle: Option<PreKeyBundleData>,
 }
 
 /// A connection's account: who, its l4f session (ended with the connection),
@@ -267,6 +278,7 @@ impl UserSession {
             ),
             password_attempt_rate: RateLimiter::new(3.0, 1.0),
             chat_rate: RateLimiter::new(5.0, 5.0),
+            account_rate: RateLimiter::new(30.0, 10.0),
             keyframe_relay_rate: RateLimiter::new(2.0, 1.0),
             loss_report_rate: RateLimiter::new(2.0, 1.0),
             // Everything a client says about itself — muted, deafened, sharing
@@ -304,12 +316,7 @@ impl UserSession {
             is_screen_sharing: false,
             watching_screenshare: None,
             identity_key: None,
-            prekeys: Vec::new(),
-            signed_prekey_id: None,
-            signed_prekey: None,
-            signed_prekey_signature: None,
-            registration_id: 0,
-            device_id: 1,
+            bundle: None,
         }
     }
 
@@ -403,16 +410,12 @@ fn check_admission(
 
     if !is_invited {
         if let Some(ref channel_pw) = channel.password {
+            // A channel from channels.json keeps a hash, which the attempt
+            // was checked against before the lock: what arrives here is that
+            // hash, or nothing that matches (`channel_password_attempt`).
+            // Channels people make keep the password as typed.
             let matches: bool = match password {
-                Some(pw) if channel.persistent => {
-                    // Persistent channels store a SHA-256 hash — hash the attempt first
-                    let attempt_hash = crate::channels::hash_password(pw);
-                    attempt_hash.as_bytes().ct_eq(channel_pw.as_bytes()).into()
-                }
-                Some(pw) => {
-                    // User-created channels store plaintext passwords
-                    pw.as_bytes().ct_eq(channel_pw.as_bytes()).into()
-                }
+                Some(pw) => pw.as_bytes().ct_eq(channel_pw.as_bytes()).into(),
                 None => false,
             };
             if !matches {
@@ -493,7 +496,21 @@ fn mint_pseudonym(taken: &HashMap<UserId, String>) -> String {
 }
 
 /// The shared server state, designed for concurrent access.
+/// Wrong admin or game tokens an address may present: 10, then one per 90 s.
+/// One budget for both doors, per address (IPv4) or /64 (IPv6): a session
+/// count reset by reconnecting, or none at all on the HTTP door, let a weak
+/// token be guessed at line rate (1.0 audit H1-09).
+pub const TOKEN_GUESSES: f64 = 10.0;
+pub const TOKEN_GUESS_REFILL: f64 = 1.0 / 90.0;
+/// The shortest admin or game token a server starts with.
+pub const MIN_TOKEN_LEN: usize = 16;
+
 pub struct ServerState {
+    /// Wrong-token budgets (`TOKEN_GUESSES`), by `ConnLimits` key.
+    pub token_failures: DashMap<IpAddr, RateLimiter>,
+    /// The connection slots (`ConnLimits`): authentication moves a session
+    /// into the main pool, its cleanup back.
+    pub limits: Arc<crate::ConnLimits>,
     /// All active sessions, keyed by session_id.
     pub sessions: DashMap<SessionId, UserSession>,
     /// Reverse lookup: user_id -> session_id.
@@ -517,8 +534,17 @@ pub struct ServerState {
     pub settings: ServerSettings,
     /// Admin token (from config, or generated at startup).
     pub admin_token: String,
-    /// Banned IPs with their expiry (None = until restart). Memory only.
-    pub bans: DashMap<IpAddr, Option<Instant>>,
+    /// Argon2 runs for channel passwords at once (`channel_password_attempt`):
+    /// each takes 19 MiB, so a flood of wrong ones waits instead.
+    pub channel_kdf: tokio::sync::Semaphore,
+    /// Bans in force (`crate::bans`), as kept in the database or `bans.json`.
+    pub bans: DashMap<crate::bans::Key, crate::bans::Ban>,
+    /// Address bans' hash key on a relay without accounts (made at start).
+    pub ban_salt: [u8; 32],
+    /// `bans.json`, on a relay without accounts; None keeps bans in memory.
+    pub bans_file: Option<std::path::PathBuf>,
+    /// One writer of `bans.json` at a time.
+    pub bans_writer: std::sync::Mutex<()>,
     /// Next user_id counter (session_id is always equal to user_id).
     next_user_id: AtomicU32,
     /// Next channel_id counter (0 is reserved for General).
@@ -554,6 +580,21 @@ pub enum Poster {
 }
 
 impl ServerState {
+    /// Whether `ip` may present a token at all: it has wrong guesses left.
+    pub fn token_guess_allowed(&self, ip: IpAddr) -> bool {
+        self.token_failures.get_mut(&crate::limit_key(ip)).is_none_or(|mut b| b.has_token())
+    }
+
+    /// One wrong token from `ip`.
+    pub fn token_guess_failed(&self, ip: IpAddr) {
+        // Bounded like the connect-rate table: addresses whose budget is
+        // whole again say nothing a new entry would not
+        if self.token_failures.len() > 4096 {
+            self.token_failures.retain(|_, b| !b.is_full());
+        }
+        self.token_failures.entry(crate::limit_key(ip)).or_insert_with(|| RateLimiter::new(TOKEN_GUESSES, TOKEN_GUESS_REFILL)).try_consume();
+    }
+
     /// Create a new server state from the given configuration.
     pub fn new(
         config: &ServerConfig,
@@ -653,6 +694,8 @@ impl ServerState {
             user_to_session: DashMap::new(),
             username_to_session: DashMap::new(),
             channels: RwLock::new(channels),
+            limits: Arc::new(crate::ConnLimits::from_config(config)),
+            token_failures: DashMap::new(),
             max_users: config.max_users,
             channel_budget: settings
                 .max_channels
@@ -660,7 +703,11 @@ impl ServerState {
                 .saturating_add(1),
             settings,
             admin_token,
+            channel_kdf: tokio::sync::Semaphore::new(2),
             bans: DashMap::new(),
+            ban_salt: rand::random(),
+            bans_file: None,
+            bans_writer: std::sync::Mutex::new(()),
             next_user_id: AtomicU32::new(1),
             next_channel_id: AtomicU32::new(next_id),
             routing: crate::routing::Routing::default(),
@@ -772,47 +819,6 @@ impl ServerState {
             .unwrap_or(false)
     }
 
-    /// Whether `ip` is banned. An expired entry is dropped on the way.
-    pub fn is_banned(&self, ip: IpAddr) -> bool {
-        match self.bans.get(&ip).map(|e| *e) {
-            None => false,
-            Some(None) => true,
-            Some(Some(until)) if Instant::now() < until => true,
-            Some(Some(_)) => {
-                self.bans.remove(&ip);
-                false
-            }
-        }
-    }
-
-    /// Ban `ip` for `duration` (None = until the server restarts).
-    pub fn ban(&self, ip: IpAddr, duration: Option<std::time::Duration>) {
-        self.bans.insert(ip, duration.map(|d| Instant::now() + d));
-    }
-
-    /// Lift a ban. Returns whether one existed.
-    pub fn unban(&self, ip: IpAddr) -> bool {
-        self.bans.remove(&ip).is_some()
-    }
-
-    /// Active bans, sorted by IP; expired ones are purged.
-    pub fn list_bans(&self) -> Vec<BanInfo> {
-        let now = Instant::now();
-        self.bans.retain(|_, until| until.is_none_or(|u| u > now));
-        let mut bans: Vec<BanInfo> = self
-            .bans
-            .iter()
-            .map(|e| BanInfo {
-                ip: e.key().to_string(),
-                expires_in_secs: e
-                    .value()
-                    .map(|u| u.saturating_duration_since(now).as_secs()),
-            })
-            .collect();
-        bans.sort_by(|a, b| a.ip.cmp(&b.ip));
-        bans
-    }
-
     /// Broadcast a raw serialized message to all connected sessions.
     pub async fn broadcast_raw_to_all(&self, data: &[u8]) {
         for entry in self.sessions.iter() {
@@ -882,6 +888,24 @@ impl ServerState {
 
     /// Check if a join would succeed (password, capacity) without modifying state.
     /// Invited users bypass the password check.
+    /// For a channel from channels.json, which keeps a hash: the hash itself
+    /// when `attempt` is its password, else an empty string, which matches
+    /// nothing. Run before the channel lock is taken, since Argon2 takes tens
+    /// of milliseconds; `check_admission` then compares what it is given.
+    /// Other channels get the attempt as typed.
+    pub async fn channel_password_attempt(&self, channel_id: ChannelId, attempt: Option<&str>) -> Option<Zeroizing<String>> {
+        let attempt = Zeroizing::new(attempt?.to_string());
+        let stored = match self.channels.read().await.get(&channel_id) {
+            Some(c) if c.persistent => c.password.clone(),
+            _ => None,
+        };
+        let Some(stored) = stored else { return Some(attempt) };
+        let Ok(_turn) = self.channel_kdf.acquire().await else { return Some(Zeroizing::new(String::new())) };
+        let hash = stored.clone();
+        let ok = tokio::task::spawn_blocking(move || crate::channels::verify_password(&attempt, &hash)).await.unwrap_or(false);
+        Some(if ok { stored } else { Zeroizing::new(String::new()) })
+    }
+
     pub async fn validate_join(
         &self,
         channel_id: ChannelId,
@@ -1272,6 +1296,19 @@ impl ServerState {
             anyhow::bail!("cannot modify the General channel");
         }
 
+        // A channel from channels.json is checked against a hash
+        // (`check_admission`), so that is what it keeps here too: stored as
+        // typed, the right password never matched and nobody got in
+        // (1.0 audit H1-05). Hashed before the lock: Argon2 takes a while.
+        let persistent = self.channels.read().await.get(&channel_id).is_some_and(|c| c.persistent);
+        let password = match password {
+            Some(p) if persistent => {
+                let _turn = self.channel_kdf.acquire().await?;
+                Some(tokio::task::spawn_blocking(move || crate::channels::hash_password(&p)).await??)
+            }
+            p => p,
+        };
+
         let mut channels = self.channels.write().await;
         let channel = channels
             .get_mut(&channel_id)
@@ -1280,7 +1317,9 @@ impl ServerState {
         if !is_admin && channel.info.created_by != Some(user_id) {
             anyhow::bail!("only the channel creator can change the password");
         }
-
+        if channel.persistent != persistent {
+            anyhow::bail!("the channel changed meanwhile, try again");
+        }
         if channel.password.as_ref().map(|p| p.as_str()) == password.as_deref() {
             return Ok(None);
         }
@@ -2776,6 +2815,21 @@ mod tests {
         assert!(info.hidden && info.anonymous && info.hide_members);
         assert!(!info.screen_share);
         assert_eq!(info.proximity, ProximityMode::ThreeD);
+    }
+
+    /// H1-05: a password an admin sets at runtime on a channel from
+    /// channels.json lets in whoever types it.
+    #[tokio::test]
+    async fn a_runtime_password_on_a_persistent_channel_admits() {
+        let state = ServerState::new(&ServerConfig::default(), ServerSettings::default(), vec![ChannelEntry { name: "Lounge".into(), ..Default::default() }], "t".into());
+        assert!(state.set_channel_password(1, 9, Some("pw".into()), true).await.unwrap().is_some());
+        assert!(state.channels.read().await[&1].password.as_ref().unwrap().starts_with("$argon2id$"));
+        let right = state.channel_password_attempt(1, Some("pw")).await;
+        let wrong = state.channel_password_attempt(1, Some("nope")).await;
+        let channels = state.channels.read().await;
+        assert!(check_admission(&channels[&1], 5, right.as_deref().map(|p| p.as_str())).is_ok());
+        assert!(check_admission(&channels[&1], 5, wrong.as_deref().map(|p| p.as_str())).is_err());
+        assert!(check_admission(&channels[&1], 5, Some("pw")).is_err(), "only an attempt checked against the hash gets in");
     }
 
     #[tokio::test]

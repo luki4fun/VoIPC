@@ -12,7 +12,7 @@ import { getConfig, resetConfig, updateConfig } from "./config";
 import * as session from "./session";
 import { forgetDevice, listDevices } from "./devices";
 import { wasm } from "./wasm";
-import type { AccountArgs } from "./account";
+import { forgetRelayId, type AccountArgs } from "./account";
 import { playCue } from "./sounds";
 import type { SavedServer, SoundSettings } from "../../lib/stores/settings";
 import type { ProximityMode } from "../../lib/spatial";
@@ -127,6 +127,8 @@ function accountArgs(raw: unknown): AccountArgs | undefined {
       return { kind: "register", password: str(a.password, "password"), invite: a.invite == null ? null : str(a.invite, "invite") };
     case "device":
       return { kind: "device" };
+    case "reset":
+      return { kind: "reset", recovery: str(a.recovery, "recovery"), password: str(a.password, "password") };
     default:
       fail("unknown account sign-in");
   }
@@ -166,6 +168,12 @@ const handlers: Record<string, Handler> = {
     session.sessionOrSigningIn(str(server, "server"))?.account?.cancel();
   },
   account_request: ({ server, request }) => needAccount(server).s.sendControl({ Account: request }),
+  account_password_change: ({ server, old, new: next, totp, recovery }) => {
+    const { s, account } = needAccount(server);
+    const opt = (v: unknown, name: string) => (v == null ? null : str(v, name));
+    return account.passwordChange(s, str(old, "old"), str(next, "new"), opt(totp, "totp"), opt(recovery, "recovery"));
+  },
+  forget_relay_id: ({ server }) => forgetRelayId(str(server, "server")),
   account_devices: async () =>
     (await listDevices()).map((d) => ({
       server: d.server,
@@ -179,6 +187,19 @@ const handlers: Record<string, Handler> = {
   account_enter: ({ server, conv }) => {
     const { s, account } = needAccount(server);
     account.enter(s, str(conv, "conv"));
+  },
+  account_purge: ({ server, conv }) => {
+    const { s, account } = needAccount(server);
+    account.purge(s, conv == null ? null : str(conv, "conv"));
+  },
+  account_delete: ({ server, password, totp, recovery }) => {
+    const { s, account } = needAccount(server);
+    const opt = (v: unknown, name: string) => (v == null ? null : str(v, name));
+    return account.deleteAccount(s, str(password, "password"), opt(totp, "totp"), opt(recovery, "recovery"));
+  },
+  account_leave: ({ server, conv }) => {
+    const { s, account } = needAccount(server);
+    account.leave(s, str(conv, "conv"), true);
   },
   account_set_prefs: ({ server, prefs }) => {
     const { s, account } = needAccount(server);
@@ -325,15 +346,23 @@ const handlers: Record<string, Handler> = {
   admin_login: ({ server, token }) => need(server).sendControl({ AdminLogin: { token: str(token, "token") } }),
   admin_kick: ({ server, userId, reason }) =>
     need(server).sendControl({ AdminKick: { user_id: u32(userId, "userId"), reason: str(reason, "reason") } }),
-  admin_ban: ({ server, userId, reason, durationSecs }) =>
+  admin_ban: ({ server, userId, reason, durationSecs, account }) =>
     need(server).sendControl({
       AdminBan: {
         user_id: u32(userId, "userId"),
         reason: str(reason, "reason"),
         duration_secs: u32(durationSecs, "durationSecs"),
+        account: account === true,
       },
     }),
-  admin_unban: ({ server, ip }) => need(server).sendControl({ AdminUnban: { ip: str(ip, "ip") } }),
+  admin_ban_account: ({ server, name, reason, durationSecs }) =>
+    need(server).sendControl({
+      AdminBanAccount: { name: str(name, "name"), reason: str(reason, "reason"), duration_secs: u32(durationSecs, "durationSecs") },
+    }),
+  admin_unban: ({ server, id }) => {
+    if (!Number.isSafeInteger(id) || (id as number) < 0) fail("id must be a ban's id");
+    return need(server).sendControl({ AdminUnban: { id } });
+  },
   admin_list_bans: ({ server }) => need(server).sendControl("AdminListBans"),
 
   // ── voice ──
@@ -535,6 +564,8 @@ const handlers: Record<string, Handler> = {
     voice();
     return audio.getVoiceStats();
   },
+  // Web only (the self-test asks it): native voice is decoded in Rust
+  get_voice_decoder: () => audio.voiceDecoder(),
   get_screen_audio_status: () => {
     voice();
     return audio.getScreenAudioStatus();

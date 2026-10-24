@@ -130,6 +130,7 @@ export interface AudioApi {
   /** Ask for the microphone, and throw the refusal rather than swallow it. */
   requestMicrophone(): Promise<void>;
   /** [frames_played, frames_lost] cumulative, for get_voice_stats. */
+  voiceDecoder(): "worklet" | "webcodecs";
   getVoiceStats(): [number, number];
   /** [send_count, recv_count] cumulative screen-audio packets, for get_screen_audio_status. */
   getScreenAudioStatus(): [number, number];

@@ -1,0 +1,17 @@
+Wrote channels.json from the "gaming" preset: 3 text and 7 voice channels.
+
+  #general            text, auto-join
+  #looking-for-group  text, auto-join, slow mode 60 s, messages live 1 d
+  #clips-and-screens  text
+  Lounge              voice
+  Game Room 1         voice
+  Game Room 2         voice
+  Game Room 3         voice
+  Stream Room         voice
+  Campfire            voice, 2d proximity
+  AFK                 voice, no screen share
+
+Restart the server to load it. To change a password for good, put
+"password": "…" in place of that channel's "password_hash".
+
+- More rooms on a busy evening: anyone can open one with + and it disappears once empty.

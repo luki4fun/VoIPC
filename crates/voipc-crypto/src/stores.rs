@@ -3,13 +3,14 @@
 //! These wrap libsignal's `InMem*` stores and are persisted to disk
 //! via the persistence module.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use libsignal_protocol::{
-    Direction, GenericSignedPreKey, IdentityKey, IdentityKeyPair, IdentityKeyStore,
-    KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore, PreKeyId, PreKeyRecord, PreKeyStore,
-    ProtocolAddress, SenderKeyRecord, SenderKeyStore, SessionRecord, SessionStore,
-    SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore,
+    CiphertextMessageType, Direction, GenericSignedPreKey, IdentityChange, IdentityKey,
+    IdentityKeyPair, IdentityKeyStore, KyberPreKeyId, KyberPreKeyRecord, KyberPreKeyStore,
+    PreKeyId, PreKeyRecord, PreKeyStore, ProtocolAddress, PublicKey, SenderKeyRecord,
+    SenderKeyStore, SessionRecord, SessionStore, SignalProtocolError, SignedPreKeyId,
+    SignedPreKeyRecord, SignedPreKeyStore,
 };
 use serde::{Deserialize, Serialize};
 
@@ -24,6 +25,9 @@ pub struct SignalStores {
     pub session: VoipcSessionStore,
     pub sender_key: VoipcSenderKeyStore,
     pub kyber: VoipcKyberPreKeyStore,
+    /// Our user id on this connection, once `Authenticated` named it: libsignal
+    /// binds both parties' addresses into every message.
+    pub own_user_id: u32,
 }
 
 impl SignalStores {
@@ -37,6 +41,7 @@ impl SignalStores {
             },
             prekey: VoipcPreKeyStore {
                 prekeys: HashMap::new(),
+                next_id: 1,
             },
             signed_prekey: VoipcSignedPreKeyStore {
                 signed_prekeys: HashMap::new(),
@@ -47,7 +52,8 @@ impl SignalStores {
             sender_key: VoipcSenderKeyStore {
                 keys: HashMap::new(),
             },
-            kyber: VoipcKyberPreKeyStore,
+            kyber: VoipcKyberPreKeyStore::default(),
+            own_user_id: 0,
         }
     }
 }
@@ -101,15 +107,15 @@ impl IdentityKeyStore for VoipcIdentityStore {
         &mut self,
         address: &ProtocolAddress,
         identity: &IdentityKey,
-    ) -> Result<bool, SignalProtocolError> {
+    ) -> Result<IdentityChange, SignalProtocolError> {
         let key = address_key(address);
         let serialized = identity.serialize().to_vec();
         let existing = self.known_identities.insert(key, serialized.clone());
         if existing.as_ref() != Some(&serialized) {
             self.seen.push((address.name().to_string(), serialized.clone()));
         }
-        // Return true if the identity key changed (trust-on-first-use)
-        Ok(existing.is_some_and(|old| old != serialized))
+        // Trust on first use: only a different key replaces one
+        Ok(if existing.is_some_and(|old| old != serialized) { IdentityChange::ReplacedExisting } else { IdentityChange::NewOrUnchanged })
     }
 
     async fn is_trusted_identity(
@@ -138,33 +144,46 @@ impl IdentityKeyStore for VoipcIdentityStore {
 }
 
 // ── Kyber Pre-Key Store ────────────────────────────────────────────────
-// VoIPC does not use post-quantum (Kyber) keys, but the Signal Protocol
-// decrypt functions require a KyberPreKeyStore. This is a no-op stub.
 
-#[derive(Serialize, Deserialize)]
-pub struct VoipcKyberPreKeyStore;
+/// The post-quantum half of a session start (PQXDH). One last-resort key per
+/// connection: it is never deleted, so a PreKey message that uses it with a
+/// base key seen before is a replay and refused.
+#[derive(Serialize, Deserialize, Default)]
+pub struct VoipcKyberPreKeyStore {
+    /// kyber_pre_key_id -> serialized KyberPreKeyRecord
+    pub keys: HashMap<u32, Vec<u8>>,
+    /// (kyber id, signed pre-key id, base key) of every session started on it
+    pub used: HashSet<(u32, u32, Vec<u8>)>,
+}
 
 #[async_trait::async_trait(?Send)]
 impl KyberPreKeyStore for VoipcKyberPreKeyStore {
     async fn get_kyber_pre_key(
         &self,
-        _kyber_prekey_id: KyberPreKeyId,
+        id: KyberPreKeyId,
     ) -> Result<KyberPreKeyRecord, SignalProtocolError> {
-        Err(SignalProtocolError::InvalidKyberPreKeyId)
+        let bytes = self.keys.get(&id.into()).ok_or(SignalProtocolError::InvalidKyberPreKeyId)?;
+        KyberPreKeyRecord::deserialize(bytes)
     }
 
     async fn save_kyber_pre_key(
         &mut self,
-        _kyber_prekey_id: KyberPreKeyId,
-        _record: &KyberPreKeyRecord,
+        id: KyberPreKeyId,
+        record: &KyberPreKeyRecord,
     ) -> Result<(), SignalProtocolError> {
+        self.keys.insert(id.into(), record.serialize()?);
         Ok(())
     }
 
     async fn mark_kyber_pre_key_used(
         &mut self,
-        _kyber_prekey_id: KyberPreKeyId,
+        id: KyberPreKeyId,
+        ec_prekey_id: SignedPreKeyId,
+        base_key: &PublicKey,
     ) -> Result<(), SignalProtocolError> {
+        if !self.used.insert((id.into(), ec_prekey_id.into(), base_key.serialize().to_vec())) {
+            return Err(SignalProtocolError::InvalidMessage(CiphertextMessageType::PreKey, "reused base key".into()));
+        }
         Ok(())
     }
 }
@@ -175,6 +194,8 @@ impl KyberPreKeyStore for VoipcKyberPreKeyStore {
 pub struct VoipcPreKeyStore {
     /// pre_key_id -> serialized PreKeyRecord
     pub prekeys: HashMap<u32, Vec<u8>>,
+    /// The id the next new one-time key gets (`prekey::more_prekeys`)
+    pub next_id: u32,
 }
 
 #[async_trait::async_trait(?Send)]

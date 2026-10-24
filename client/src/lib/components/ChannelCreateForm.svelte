@@ -131,8 +131,7 @@
     color: var(--text-primary);
   }
 
-  .create-label,
-  .dialog-label {
+  .create-label {
     display: flex;
     flex-direction: column;
     gap: 4px;

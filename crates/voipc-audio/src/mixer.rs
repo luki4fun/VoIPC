@@ -656,6 +656,65 @@ pub fn clamp(buf: &mut [f32]) {
     }
 }
 
+/// Where the limiter holds peaks: −0.2 dBFS.
+const LIMIT_CEILING: f32 = 0.977;
+/// 50 ms release, as a one-pole coefficient at 48 kHz.
+const LIMIT_RELEASE: f32 = 0.999_583; // e^(-1/2400)
+/// How long a peak is held before the release starts: longer than a period of
+/// the lowest voice, or the gain would rise between two crests and the next
+/// one would overshoot.
+const LIMIT_HOLD: u32 = 480; // 10 ms
+
+/// A peak limiter in place of a hard clamp (H3-09).
+///
+/// A clamp squares off every peak above full scale: two loud talkers, or one
+/// at 200 %, buzz on a few percent of frames. This turns the level down at
+/// the first sample over the ceiling (no look-ahead, so nothing is delayed)
+/// and lets it back up over 50 ms once the peaks stop, with the channels
+/// linked so a placed voice does not move.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Limiter {
+    /// The peak level being limited against: follows a rising peak at once,
+    /// is held for [`LIMIT_HOLD`], then falls with the release.
+    env: f32,
+    hold: u32,
+}
+
+impl Limiter {
+    /// Limit `buf` in place: `channels` interleaved samples per frame.
+    pub fn process(&mut self, buf: &mut [f32], channels: usize) {
+        for frame in buf.chunks_exact_mut(channels.max(1)) {
+            let peak = frame.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+            if peak >= self.env {
+                self.env = peak;
+                self.hold = LIMIT_HOLD;
+            } else if self.hold > 0 {
+                self.hold -= 1;
+            } else {
+                self.env = peak + LIMIT_RELEASE * (self.env - peak);
+            }
+            let gain = if self.env > LIMIT_CEILING { LIMIT_CEILING / self.env } else { 1.0 };
+            for s in frame {
+                *s *= gain;
+            }
+        }
+    }
+}
+
+/// Samples over which a shed frame is faded into the one kept (2.5 ms).
+pub const SHED_XFADE: usize = 120;
+
+/// Fade `from` — the frame that would have played next — into the start of
+/// `into`, the one that plays instead: shedding a surplus frame is a cut, and
+/// a hard cut clicks (H3-10).
+pub fn crossfade_into(from: &[f32], into: &mut [f32]) {
+    let n = SHED_XFADE.min(from.len()).min(into.len());
+    for i in 0..n {
+        let w = i as f32 / n as f32;
+        into[i] = from[i] * (1.0 - w) + into[i] * w;
+    }
+}
+
 // ── Reverb and water ─────────────────────────────────────────────────────
 //
 // Two scalable effects, 0–10 each, exactly like muffle. They belong to a lane:
@@ -2015,6 +2074,39 @@ mod tests {
             }
             println!("PIN {} {:.4}", fx.id(), rms_db(&kept));
         }
+    }
+
+    #[test]
+    fn the_limiter_bends_peaks_instead_of_squaring_them() {
+        let mut lim = Limiter::default();
+        // A 1 kHz tone at twice full scale, stereo
+        let mut buf: Vec<f32> = (0..9600)
+            .flat_map(|i| {
+                let s = 2.0 * (i as f32 * 2.0 * std::f32::consts::PI * 1000.0 / 48_000.0).sin();
+                [s, s]
+            })
+            .collect();
+        lim.process(&mut buf, 2);
+        assert!(buf.iter().all(|s| s.abs() <= 1.0));
+        // After the attack, nothing reaches the clamp: the wave is scaled, not cut
+        let settled = &buf[2 * 480..];
+        assert!(settled.iter().all(|s| s.abs() <= LIMIT_CEILING + 1e-3));
+        let top = settled.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+        assert!(top > 0.9, "limited far below the ceiling: {top}");
+        // Quiet audio afterwards comes back to unity within the release
+        let mut quiet = vec![0.1f32; 2 * 48_000 / 2];
+        lim.process(&mut quiet, 2);
+        assert!((quiet[quiet.len() - 1] - 0.1).abs() < 1e-3, "{}", quiet[quiet.len() - 1]);
+    }
+
+    #[test]
+    fn a_shed_frame_fades_into_the_one_kept() {
+        let from = vec![0.5f32; 960];
+        let mut into = vec![-0.5f32; 960];
+        crossfade_into(&from, &mut into);
+        assert_eq!(into[0], 0.5, "the joint starts where the frame that would have played starts");
+        assert!(into[SHED_XFADE / 2].abs() < 0.02);
+        assert_eq!(into[SHED_XFADE], -0.5);
     }
 
     #[test]

@@ -1,90 +1,83 @@
-//! Pre-key and signed pre-key generation.
-//!
-//! Pre-keys are one-time-use Curve25519 key pairs used in the X3DH
-//! key agreement protocol. Signed pre-keys are medium-term keys
-//! signed by the identity key.
+//! Pre-keys: what a peer needs to start a session with us without us being
+//! there (PQXDH). One signed Curve25519 key, one signed Kyber1024 last-resort
+//! key, and one-time Curve25519 keys the relay hands out one per session.
+//! All of them are new on every connect, like the stores that hold them.
 
+use anyhow::Context;
 use libsignal_protocol::{
-    GenericSignedPreKey, IdentityKeyPair, KeyPair, PreKeyId, PreKeyRecord, PreKeyStore,
-    SignedPreKeyId, SignedPreKeyRecord, SignedPreKeyStore, Timestamp,
+    kem, GenericSignedPreKey, IdentityKeyPair, KeyPair, KyberPreKeyRecord, PreKeyId, PreKeyRecord,
+    SignedPreKeyRecord, Timestamp,
 };
-use rand::rngs::OsRng;
-use serde::{Deserialize, Serialize};
+use voipc_protocol::types::{OneTimePreKey, PreKeyBundleData};
 
 use crate::stores::SignalStores;
 
-/// Number of one-time pre-keys to generate initially.
+/// One-time pre-keys at connect.
 pub const INITIAL_PREKEY_COUNT: u32 = 100;
+/// One-time pre-keys sent when the relay says it runs low (`PreKeysLow`).
+pub const PREKEY_REFILL_COUNT: u32 = 50;
 
-/// Threshold below which we should replenish pre-keys.
-pub const PREKEY_REPLENISH_THRESHOLD: u32 = 10;
+const SIGNED_PREKEY_ID: u32 = 1;
+const KYBER_PREKEY_ID: u32 = 1;
 
-/// A set of pre-keys ready to be uploaded to the server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PreKeySet {
-    pub registration_id: u32,
-    pub device_id: u32,
-    pub signed_prekey_id: u32,
-    pub signed_prekey_public: Vec<u8>,
-    pub signed_prekey_signature: Vec<u8>,
-    pub one_time_prekeys: Vec<SerializablePreKey>,
+/// The signed pre-key, the Kyber last-resort key and `INITIAL_PREKEY_COUNT`
+/// one-time keys, into fresh stores.
+pub fn generate_prekeys(stores: &mut SignalStores, identity: &IdentityKeyPair) -> anyhow::Result<()> {
+    let now = Timestamp::from_epoch_millis(crate::time::now_millis());
+    let signed = KeyPair::generate(&mut crate::rng());
+    let signature = identity.private_key().calculate_signature(&signed.public_key.serialize(), &mut crate::rng())?;
+    let record = SignedPreKeyRecord::new(SIGNED_PREKEY_ID.into(), now, &signed, &signature);
+    stores.signed_prekey.signed_prekeys.insert(SIGNED_PREKEY_ID, record.serialize()?);
+
+    // Built by hand rather than `KyberPreKeyRecord::generate`, which reads
+    // SystemTime: that panics on wasm32
+    let kyber = kem::KeyPair::generate(kem::KeyType::Kyber1024, &mut crate::rng());
+    let signature = identity.private_key().calculate_signature(&kyber.public_key.serialize(), &mut crate::rng())?;
+    let record = KyberPreKeyRecord::new(KYBER_PREKEY_ID.into(), now, &kyber, &signature);
+    stores.kyber.keys.insert(KYBER_PREKEY_ID, record.serialize()?);
+
+    more_prekeys(stores, INITIAL_PREKEY_COUNT)?;
+    Ok(())
 }
 
-/// A one-time pre-key's public portion for protocol transmission.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SerializablePreKey {
-    pub id: u32,
-    pub public_key: Vec<u8>,
-}
-
-/// Generate the initial set of pre-keys and store them.
-pub async fn generate_prekeys(
-    stores: &mut SignalStores,
-    identity_key_pair: &IdentityKeyPair,
-    start_id: u32,
-    count: u32,
-) -> anyhow::Result<PreKeySet> {
-    let mut one_time_prekeys = Vec::with_capacity(count as usize);
-
-    // Generate one-time pre-keys
-    for i in 0..count {
-        let id = PreKeyId::from(start_id.wrapping_add(i));
-        let key_pair = KeyPair::generate(&mut OsRng);
-        let record = PreKeyRecord::new(id, &key_pair);
-        stores.prekey.save_pre_key(id, &record).await?;
-        one_time_prekeys.push(SerializablePreKey {
-            id: id.into(),
-            public_key: key_pair.public_key.serialize().to_vec(),
-        });
+/// `count` new one-time keys, stored, and their public halves for the relay.
+/// Ids only ever grow, so a key the relay still holds never names a new one.
+pub fn more_prekeys(stores: &mut SignalStores, count: u32) -> anyhow::Result<Vec<OneTimePreKey>> {
+    let mut out = Vec::with_capacity(count as usize);
+    for _ in 0..count {
+        stores.prekey.next_id = stores.prekey.next_id.max(1);
+        let id = stores.prekey.next_id;
+        stores.prekey.next_id = id.checked_add(1).context("pre-key ids exhausted")?;
+        let pair = KeyPair::generate(&mut crate::rng());
+        stores.prekey.prekeys.insert(id, PreKeyRecord::new(PreKeyId::from(id), &pair).serialize()?);
+        out.push(OneTimePreKey { id, public_key: pair.public_key.serialize().to_vec() });
     }
+    Ok(out)
+}
 
-    // Generate signed pre-key
-    let signed_prekey_id = SignedPreKeyId::from(1u32);
-    let signed_key_pair = KeyPair::generate(&mut OsRng);
-    let timestamp = Timestamp::from_epoch_millis(crate::time::now_millis());
-
-    let signature = identity_key_pair
-        .private_key()
-        .calculate_signature(&signed_key_pair.public_key.serialize(), &mut OsRng)?;
-
-    let signed_record = SignedPreKeyRecord::new(
-        signed_prekey_id,
-        timestamp,
-        &signed_key_pair,
-        &signature,
-    );
-    stores
-        .signed_prekey
-        .save_signed_pre_key(signed_prekey_id, &signed_record)
-        .await?;
-
-    Ok(PreKeySet {
+/// What `Authenticate` (and an account's `Keys` step) carries, read back from
+/// the stores so one-time keys an earlier session used are not offered again.
+pub fn bundle(stores: &SignalStores) -> anyhow::Result<PreKeyBundleData> {
+    let signed = stores.signed_prekey.signed_prekeys.get(&SIGNED_PREKEY_ID).context("signed pre-key missing")?;
+    let signed = SignedPreKeyRecord::deserialize(signed)?;
+    let kyber = stores.kyber.keys.get(&KYBER_PREKEY_ID).context("Kyber pre-key missing")?;
+    let kyber = KyberPreKeyRecord::deserialize(kyber)?;
+    let prekeys = stores
+        .prekey
+        .prekeys
+        .iter()
+        .map(|(&id, bytes)| Ok(OneTimePreKey { id, public_key: PreKeyRecord::deserialize(bytes)?.public_key()?.serialize().to_vec() }))
+        .collect::<anyhow::Result<_>>()?;
+    Ok(PreKeyBundleData {
         registration_id: stores.identity.registration_id,
         device_id: 1,
-        signed_prekey_id: signed_prekey_id.into(),
-        signed_prekey_public: signed_key_pair.public_key.serialize().to_vec(),
-        signed_prekey_signature: signature.to_vec(),
-        one_time_prekeys,
+        identity_key: stores.identity.key_pair.public_key.clone(),
+        signed_prekey_id: SIGNED_PREKEY_ID,
+        signed_prekey: signed.public_key()?.serialize().to_vec(),
+        signed_prekey_signature: signed.signature()?,
+        prekeys,
+        kyber_prekey_id: KYBER_PREKEY_ID,
+        kyber_prekey: kyber.public_key()?.serialize().to_vec(),
+        kyber_prekey_signature: kyber.signature()?,
     })
 }
-

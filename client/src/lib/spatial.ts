@@ -196,7 +196,7 @@ export function testVoiceSample(n: number): number {
 }
 
 /** One 20 ms frame (960 samples) starting at sample index `first`. */
-export function testVoiceFrame(first: number, length = 960): Float32Array {
+export function testVoiceFrame(first: number, length = 960): Float32Array<ArrayBuffer> {
   const out = new Float32Array(length);
   for (let i = 0; i < length; i++) out[i] = testVoiceSample(first + i);
   return out;

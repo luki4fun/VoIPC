@@ -252,7 +252,7 @@ export async function leaveTextChannel(channelId: number): Promise<void> {
     // Stay on the channel rather than dropping the user somewhere else: the
     // pane turns read-only and offers the way back in, which is what tells
     // them the leave went through.
-    if (get(activeTextChannelId.of(server)) === channelId) {
+    if (get(activeTextChannelId.peek(server)) === channelId) {
       openTextChannel(server, null);
       if (get(serverAddress) === server) previewChannel(channelId);
     }
@@ -285,8 +285,8 @@ const autoJoinAsked = scoped<Set<number>>(() => new Set());
  * said they are: nobody is put in such a channel without having been asked.
  */
 export function autoJoinTextChannels(server: string, list: ChannelInfo[]): void {
-  const joined = get(joinedTextChannelIds.of(server));
-  const asked = get(autoJoinAsked.of(server));
+  const joined = get(joinedTextChannelIds.peek(server));
+  const asked = get(autoJoinAsked.peek(server));
   const consented = hasNsfwConsent(server);
   for (const channel of list) {
     if (!channel.text || !channel.auto_join) continue;
@@ -337,7 +337,7 @@ export function isLeft(server: string, channelName: string): boolean {
  * arrives.
  */
 export function channelMessageTtl(server: string, channelId: number): number {
-  return get(channels.of(server)).find((c) => c.channel_id === channelId)?.message_ttl_secs ?? 0;
+  return get(channels.peek(server)).find((c) => c.channel_id === channelId)?.message_ttl_secs ?? 0;
 }
 
 /** The timer this user set for their messages to one person on a server; 0 is off. */
@@ -358,12 +358,12 @@ export function setDmMessageTtl(server: string, peerName: string, secs: number):
 }
 
 function channelName(server: string, channelId: number): string | undefined {
-  return get(channels.of(server)).find((c) => c.channel_id === channelId)?.name;
+  return get(channels.peek(server)).find((c) => c.channel_id === channelId)?.name;
 }
 
 /** Whether an id names a text channel, per the list that server sent. */
 export function isTextChannel(server: string, channelId: number): boolean {
-  return get(channels.of(server)).some((c) => c.channel_id === channelId && c.text);
+  return get(channels.peek(server)).some((c) => c.channel_id === channelId && c.text);
 }
 
 function rememberLeft(server: string, channelId: number): void {
@@ -425,7 +425,7 @@ export const nsfwPrompt = writable<{ server: string; name: string; then: () => v
  * opens and `then` runs if the user confirms.
  */
 export function askNsfwConsent(server: string, channelId: number, then: () => void): boolean {
-  const channel = get(channels.of(server)).find((c) => c.channel_id === channelId);
+  const channel = get(channels.peek(server)).find((c) => c.channel_id === channelId);
   if (!needsNsfwConsent(channel, hasNsfwConsent(server))) return true;
   // The join it leads to acts on the server on screen: if that changed while
   // the dialog was up, the yes is kept for `server`, and nothing is joined.
@@ -489,7 +489,7 @@ export async function submitPasswordJoin(): Promise<void> {
   const password = get(passwordPromptInput);
   try {
     await invoke("join_channel", { server, channelId, password: password || null });
-    const channel = get(channels.of(server)).find((c) => c.channel_id === channelId);
+    const channel = get(channels.peek(server)).find((c) => c.channel_id === channelId);
     if (channel && password) rememberChannelPassword(server, channel.name, password);
     if (channel?.text) forgetLeft(server, channelId);
     cancelPasswordPrompt();
@@ -613,7 +613,7 @@ export async function submitChannelSettings(): Promise<void> {
   if (channelId === null) return;
   const server = settingsServer;
   const before =
-    get(channels.of(server)).find((c) => c.channel_id === channelId)?.proximity ?? "off";
+    get(channels.peek(server)).find((c) => c.channel_id === channelId)?.proximity ?? "off";
   const remove = get(passwordEditRemove);
   const password = get(passwordEditInput);
   const proximity = get(settingsProximity);
@@ -626,7 +626,7 @@ export async function submitChannelSettings(): Promise<void> {
         channelId,
         password: remove ? null : password,
       });
-      const name = get(channels.of(server)).find((c) => c.channel_id === channelId)?.name;
+      const name = get(channels.peek(server)).find((c) => c.channel_id === channelId)?.name;
       if (name) {
         if (remove) forgetChannelPassword(server, name);
         else rememberChannelPassword(server, name, password);

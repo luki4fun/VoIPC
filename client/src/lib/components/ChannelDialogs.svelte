@@ -8,6 +8,7 @@
   // by array index, and moving this markup is exactly the change that would
   // have silently set the wrong options.
 
+  import { backdrop, dialog } from "../actions/dialog.js";
   import {
     cancelChannelSettings,
     cancelNsfwPrompt,
@@ -47,13 +48,10 @@
 </script>
 
 {#if $passwordPromptChannelId !== null}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div class="overlay" onclick={cancelPasswordPrompt} role="presentation">
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_to_interactive_role a11y_no_noninteractive_element_interactions -->
+  <div class="overlay" onclick={backdrop(cancelPasswordPrompt)} role="presentation">
     <form
       class="password-dialog"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => { if (e.key === 'Escape') cancelPasswordPrompt(); }}
+      use:dialog={{ onclose: cancelPasswordPrompt }}
       onsubmit={(e) => { e.preventDefault(); submitPasswordJoin(); }}
     >
       <div class="dialog-title">Enter Password</div>
@@ -72,13 +70,10 @@
 {/if}
 
 {#if $nsfwPrompt !== null}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div class="overlay" onclick={cancelNsfwPrompt} role="presentation">
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_to_interactive_role a11y_no_noninteractive_element_interactions -->
+  <div class="overlay" onclick={backdrop(cancelNsfwPrompt)} role="presentation">
     <form
       class="password-dialog"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => { if (e.key === 'Escape') cancelNsfwPrompt(); }}
+      use:dialog={{ onclose: cancelNsfwPrompt }}
       onsubmit={(e) => { e.preventDefault(); confirmNsfwPrompt(); }}
     >
       <div class="dialog-title">18+ channel</div>
@@ -95,10 +90,11 @@
 {/if}
 
 {#if $inviteLinkPopup !== null}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div class="overlay" onclick={() => inviteLinkPopup.set(null)} role="presentation">
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="password-dialog" onclick={(e) => e.stopPropagation()}>
+  <div class="overlay" onclick={backdrop(() => inviteLinkPopup.set(null))} role="presentation">
+    <div
+      class="password-dialog"
+      use:dialog={{ onclose: () => inviteLinkPopup.set(null) }}
+    >
       <div class="dialog-title">Invite link</div>
       <input class="dialog-input" readonly value={$inviteLinkPopup} onfocus={(e) => e.currentTarget.select()} />
       <div class="dialog-actions">
@@ -109,13 +105,10 @@
 {/if}
 
 {#if $passwordEditChannelId !== null}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div class="overlay" onclick={cancelChannelSettings} role="presentation">
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_to_interactive_role a11y_no_noninteractive_element_interactions -->
+  <div class="overlay" onclick={backdrop(cancelChannelSettings)} role="presentation">
     <form
       class="password-dialog"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => { if (e.key === 'Escape') cancelChannelSettings(); }}
+      use:dialog={{ onclose: cancelChannelSettings }}
       onsubmit={(e) => { e.preventDefault(); submitChannelSettings(); }}
     >
       <div class="dialog-title">Channel Settings</div>
@@ -272,7 +265,6 @@
     gap: 8px;
   }
 
-  .create-label,
   .dialog-label {
     display: flex;
     flex-direction: column;

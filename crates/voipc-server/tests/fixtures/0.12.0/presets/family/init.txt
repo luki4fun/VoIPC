@@ -1,0 +1,22 @@
+Wrote channels.json from the "family" preset: 3 text and 5 voice channels.
+
+  #chat             text, auto-join
+  #plans            text, auto-join
+  #grown-ups        text, hidden, password
+  Living Room       voice
+  Family Gathering  voice, 2d proximity
+  Movie Night       voice
+  Game Night        voice
+  Private Room      voice, max 4, password
+
+Passwords — shown this once; channels.json keeps only their hashes:
+  grown-ups     td3j-vd7e-usxh
+  Private Room  wayw-evu3-hw9r
+
+Wrote server_settings.json.
+
+Restart the server to load it. To change a password for good, put
+"password": "…" in place of that channel's "password_hash".
+
+- Give the grown-ups password to the adults only.
+- Family Gathering is a proximity room: at a big holiday call, several conversations can happen side by side.

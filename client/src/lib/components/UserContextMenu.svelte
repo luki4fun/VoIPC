@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { backdrop, dialog } from "../actions/dialog.js";
   // The member context menu, the poke dialog and the admin kick/ban dialog.
   //
   // Mounted once in App.svelte, outside either layout. Both member lists open it
@@ -18,6 +19,7 @@
   import { selectedStrip, setUserVolume, toggleUserMute, userVolumes } from "../stores/mixer.js";
   import {
     adminAction,
+    adminBanAccount,
     adminReason,
     cancelAdminAction,
     cancelPoke,
@@ -81,11 +83,10 @@
   }
 
   function handlePokeKeydown(e: KeyboardEvent) {
+    // Escape is the dialog's (actions/dialog.ts)
     if (e.key === "Enter") {
       e.preventDefault();
       sendPoke();
-    } else if (e.key === "Escape") {
-      cancelPoke();
     }
   }
 
@@ -93,8 +94,6 @@
     if (e.key === "Enter") {
       e.preventDefault();
       confirmAdminAction();
-    } else if (e.key === "Escape") {
-      cancelAdminAction();
     }
   }
 </script>
@@ -104,13 +103,10 @@
 <!-- Context menu -->
 {#if menu}
   {@const who = splitName(menu.user.username)}
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="ctx-overlay" onclick={closeUserMenu}>
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
+  <div class="ctx-overlay" role="presentation" onclick={backdrop(closeUserMenu)}>
     <div
       class="ctx-menu"
       style="left: {menu.x}px; top: {menu.y}px;"
-      onclick={(e) => e.stopPropagation()}
       bind:this={menuEl}
     >
       <!-- Who exactly: the one place a name's tag is spelled out -->
@@ -180,9 +176,9 @@
           <Icon name="ban" size={16} />
           <span>Ban 24 hours</span>
         </button>
-        <button class="ctx-item danger" onclick={() => { openAdminAction(menu.user, "ban", 0, "Ban until server restart"); closeUserMenu(); }}>
+        <button class="ctx-item danger" onclick={() => { openAdminAction(menu.user, "ban", 0, "Ban for good"); closeUserMenu(); }}>
           <Icon name="ban" size={16} />
-          <span>Ban until restart</span>
+          <span>Ban for good</span>
         </button>
       {/if}
       {#if !$isPreviewing && $viewingVoice}
@@ -213,10 +209,10 @@
 {/if}
 
 {#if $pokeTarget}
-  <div class="poke-overlay" onclick={cancelPoke} onkeydown={() => {}} role="presentation">
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="poke-dialog" onclick={(e) => e.stopPropagation()}>
+  <div class="poke-overlay" onclick={backdrop(cancelPoke)} role="presentation">
+    <div class="poke-dialog" use:dialog={{ onclose: cancelPoke }}>
       <div class="poke-dialog-header">Poke {shortName($pokeTarget.username)}</div>
+      <!-- svelte-ignore a11y_autofocus -->
       <input
         class="poke-input"
         type="text"
@@ -235,16 +231,22 @@
 {/if}
 
 {#if $adminAction}
-  <div class="poke-overlay" onclick={cancelAdminAction} onkeydown={() => {}} role="presentation">
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="poke-dialog" onclick={(e) => e.stopPropagation()}>
+  <div class="poke-overlay" onclick={backdrop(cancelAdminAction)} role="presentation">
+    <div class="poke-dialog" use:dialog={{ onclose: cancelAdminAction }}>
       <div class="poke-dialog-header">{$adminAction.label}: {$adminAction.username}</div>
       {#if $adminAction.kind === "ban"}
         <div class="admin-hint">
-          Bans the user's IP address, so everyone behind the same address is affected.
-          Bans live in server memory until they expire or the server restarts.
+          Bans the address they connect from, so everyone behind it is kept out too, except people who hold a
+          role here. The ban outlasts a server restart; admins can lift it under Active bans.
         </div>
+        {#if $adminAction.hasAccount}
+          <label class="admin-check">
+            <input type="checkbox" bind:checked={$adminBanAccount} />
+            <span>Ban the account too, from any address</span>
+          </label>
+        {/if}
       {/if}
+      <!-- svelte-ignore a11y_autofocus -->
       <input
         class="poke-input"
         type="text"
@@ -267,6 +269,14 @@
     font-size: 12px;
     color: var(--text-secondary);
     line-height: 1.4;
+    margin-bottom: 8px;
+  }
+
+  .admin-check {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
     margin-bottom: 8px;
   }
 

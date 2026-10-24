@@ -70,11 +70,12 @@ const MAX_FRAME_STREAM_BYTES: u64 = 8 * 1024 * 1024;
 /// server or another one the client has open), media comes from blob: URLs,
 /// and Svelte's component styles are inline. Nothing may frame the client: a
 /// page embedding it could lend it the microphone and screen capture and
-/// steer the clicks.
+/// steer the clicks. `base-uri` and `form-action` are not covered by
+/// `default-src`: no injected `<base>` or form may point anywhere.
 const CSP: &str = "default-src 'self'; connect-src 'self' https: wss:; \
     script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; \
     img-src 'self' data: blob:; media-src blob:; style-src 'self' 'unsafe-inline'; \
-    frame-ancestors 'none'";
+    frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
 /// The built web client (`./build-web.sh`), embedded at compile time.
 #[derive(Embed)]
@@ -100,10 +101,12 @@ pub struct WtInfo {
 /// connection is closed gracefully; browsers, and the game server's HTTP
 /// client on `/game/v1/routes`, simply open a new one for their next request.
 ///
-/// ponytail: a fixed lifetime, not an idle timer — re-dialling is bounded by
-/// the connect rate (`ConnLimits`). An idle timer if a real page load ever
-/// takes this long.
-const PAGE_CONN_LIFETIME: Duration = Duration::from_secs(60);
+/// shortcut: a fixed lifetime, not an idle timer — re-dialling is bounded by
+/// the connect rate, and these connections sit in the pre-authentication pool
+/// (`ConnLimits`). An idle timer if a real page load (a 2.4 MB wasm on a slow
+/// phone) ever takes longer than the lifetime plus the same again for the
+/// requests in flight.
+const PAGE_CONN_LIFETIME: Duration = Duration::from_secs(30);
 
 /// Serve the web client over HTTP/2 on a TLS stream that negotiated `h2`.
 pub async fn serve_h2(
@@ -115,7 +118,7 @@ pub async fn serve_h2(
     let service = service_fn(move |req: Request<Incoming>| {
         let wt = wt.clone();
         let state = state.clone();
-        async move { Ok::<_, Infallible>(handle_request(req, &wt, &state).await) }
+        async move { Ok::<_, Infallible>(handle_request(req, &wt, &state, peer.ip()).await) }
     });
     let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
         .serve_connection(TokioIo::new(tls), service);
@@ -139,12 +142,13 @@ async fn handle_request(
     req: Request<Incoming>,
     wt: &WtInfo,
     state: &ServerState,
+    peer_ip: std::net::IpAddr,
 ) -> Response<Full<Bytes>> {
     let head_only = req.method() == Method::HEAD;
     let mut resp = if req.method() == Method::GET || head_only {
         route(req.uri().path(), wt)
     } else if req.method() == Method::POST && req.uri().path() == GAME_ROUTES_PATH {
-        game_routes(req, state).await
+        game_routes(req, state, peer_ip).await
     } else {
         let mut resp = plain(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
         resp.headers_mut()
@@ -220,10 +224,13 @@ fn default_ttl_ms() -> u64 {
     3_000
 }
 
-async fn game_routes(req: Request<Incoming>, state: &ServerState) -> Response<Full<Bytes>> {
+async fn game_routes(req: Request<Incoming>, state: &ServerState, peer_ip: std::net::IpAddr) -> Response<Full<Bytes>> {
     let Some(expected) = state.settings.game_token.as_deref() else {
         return plain(StatusCode::NOT_FOUND, "not found");
     };
+    if !state.token_guess_allowed(peer_ip) {
+        return plain(StatusCode::TOO_MANY_REQUESTS, "too many wrong tokens");
+    }
     let presented = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -237,6 +244,7 @@ async fn game_routes(req: Request<Incoming>, state: &ServerState) -> Response<Fu
         presented.as_bytes().ct_eq(expected.as_bytes()).into()
     };
     if !ok {
+        state.token_guess_failed(peer_ip);
         return plain(StatusCode::UNAUTHORIZED, "bad token");
     }
 
@@ -587,13 +595,13 @@ impl WebTransport {
                 incoming.retry();
                 continue;
             }
-            if state.is_banned(peer.ip()) {
+            if crate::bans::refused_at_accept(&state, peer.ip()) {
                 debug!(%peer, "refusing session: banned");
                 incoming.refuse();
                 continue;
             }
             if let Err(reason) = limits.acquire(peer.ip()) {
-                warn!(%peer, "rejecting session: {reason}");
+                debug!(%peer, "rejecting session: {reason}");
                 incoming.refuse();
                 continue;
             }
@@ -605,17 +613,17 @@ impl WebTransport {
                 match tokio::time::timeout(Duration::from_secs(10), incoming).await {
                     Ok(Ok(request)) => {
                         if request.path() != "/voipc" {
-                            warn!(%peer, path = request.path(), "rejecting session: unknown path");
+                            debug!(%peer, "rejecting session: unknown path");
                             request.not_found().await;
                         } else {
                             match request.accept().await {
                                 Ok(connection) => run_session(connection, state, peer).await,
-                                Err(e) => warn!(%peer, "session accept failed: {e}"),
+                                Err(e) => debug!(%peer, "session accept failed: {e}"),
                             }
                         }
                     }
-                    Ok(Err(e)) => warn!(%peer, "QUIC handshake failed: {e}"),
-                    Err(_) => warn!(%peer, "QUIC handshake timed out"),
+                    Ok(Err(e)) => debug!(%peer, "QUIC handshake failed: {e}"),
+                    Err(_) => debug!(%peer, "QUIC handshake timed out"),
                 }
                 limits.release(peer.ip());
             });
@@ -686,6 +694,10 @@ fn server_config(bind_addr: SocketAddr, picker: Arc<CertPicker>) -> WtServerConf
         .max_concurrent_uni_streams(24u32.into())
         .receive_window(RECEIVE_WINDOW.into())
         .datagram_receive_buffer_size(Some(256 * 1024))
+        // Voice that cannot go out within about a second is stale: quinn
+        // drops the oldest instead of bursting seconds of it after a stall
+        // (its default holds 1 MiB)
+        .datagram_send_buffer_size(64 * 1024)
         .send_window(512 * 1024)
         .send_fairness(false);
 
@@ -744,7 +756,9 @@ pub(crate) fn start_session(label: &str, peer: IpAddr, state: &Arc<ServerState>)
 /// until either side goes away.
 async fn run_session(connection: Connection, state: Arc<ServerState>, peer: SocketAddr) {
     let label = format!("quic:{}", peer.ip());
-    info!(peer = %label, "session established");
+    // Addresses and names only at debug: the default log keeps no record of
+    // who connected from where (the relay knows as little as it can)
+    debug!(peer = %label, "session established");
 
     let SessionStart {
         mut handler,
@@ -801,7 +815,7 @@ async fn run_session(connection: Connection, state: Arc<ServerState>, peer: Sock
         warn!(peer = %label, "control handler did not exit after EOF, aborting");
         handler.abort();
     }
-    info!(peer = %label, "session ended");
+    debug!(peer = %label, "session ended");
 }
 
 /// Control leg: the client's single bidirectional stream carries the native

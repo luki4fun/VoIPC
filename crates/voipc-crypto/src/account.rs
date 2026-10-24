@@ -21,13 +21,12 @@ use std::num::NonZeroU32;
 
 use hkdf::Hkdf;
 use libsignal_protocol::IdentityKeyPair;
-use rand::rngs::OsRng;
 use ring::rand::SystemRandom;
 use ring::signature::{Ed25519KeyPair, KeyPair};
 use sha2::{Digest, Sha256};
 use voipc_protocol::conv::hex;
 use voipc_protocol::messages::{AccountReply, AccountRequest, AuthContinue, AuthStep, ClientMessage, ServerMessage};
-use voipc_protocol::types::{AccountStart, PreKeyBundleData, VaultBlob};
+use voipc_protocol::types::{AccountStart, PowChallenge, PreKeyBundleData, VaultBlob};
 pub use zeroize::Zeroizing;
 
 use crate::aead::{open, random, seal};
@@ -90,11 +89,20 @@ fn hkdf32(ikm: &[u8], salt: &[u8], info: &str) -> [u8; 32] {
     out
 }
 
-/// `password` as the person typed it, NFC-normalised by the caller (the
-/// browser and the desktop share one front end, which does it); `name`
-/// normalised (`normalize_name`).
-pub fn derive(password: &str, relay_id: &[u8; 16], name: &str) -> Derived {
-    let salt = format!("voipc/v1|{}|{}", hex(relay_id), name);
+/// The PBKDF2 salt: the relay id and the normalised account name.
+pub fn kdf_salt(relay_id: &[u8; 16], name: &str) -> String {
+    format!("voipc/v1|{}|{}", hex(relay_id), name)
+}
+
+/// The slow half of `derive`: PBKDF2-HMAC-SHA256, `KDF_ROUNDS`, 32 bytes. The
+/// browser runs the same with WebCrypto's `deriveBits` (UTF-8 password and
+/// salt), about eight times faster than this in wasm (1.0 audit H5-18).
+pub fn stretch(password: &str, relay_id: &[u8; 16], name: &str) -> Zeroizing<[u8; 32]> {
+    stretch_salted(password, &kdf_salt(relay_id, name))
+}
+
+/// `stretch` with the salt as `kdf_salt` (or `AccountSession::kdf_salt`) gave it.
+pub fn stretch_salted(password: &str, salt: &str) -> Zeroizing<[u8; 32]> {
     let mut master = Zeroizing::new([0u8; 32]);
     ring::pbkdf2::derive(
         ring::pbkdf2::PBKDF2_HMAC_SHA256,
@@ -103,10 +111,19 @@ pub fn derive(password: &str, relay_id: &[u8; 16], name: &str) -> Derived {
         password.as_bytes(),
         &mut *master,
     );
-    Derived {
-        auth_secret: hkdf32(&*master, b"", "voipc-auth/v1"),
-        vault_key: Zeroizing::new(hkdf32(&*master, b"", "voipc-vault/v1")),
-    }
+    master
+}
+
+/// The fast half of `derive`, from `stretch`'s output.
+pub fn derive_from_master(master: &[u8; 32]) -> Derived {
+    Derived { auth_secret: hkdf32(master, b"", "voipc-auth/v1"), vault_key: Zeroizing::new(hkdf32(master, b"", "voipc-vault/v1")) }
+}
+
+/// `password` as the person typed it, NFC-normalised by the caller (the
+/// browser and the desktop share one front end, which does it); `name`
+/// normalised (`normalize_name`).
+pub fn derive(password: &str, relay_id: &[u8; 16], name: &str) -> Derived {
+    derive_from_master(&stretch(password, relay_id, name))
 }
 
 // ── The vault ─────────────────────────────────────────────────────────────
@@ -118,6 +135,8 @@ pub enum VaultError {
     /// An item that does not decrypt: tampered with, or another vault's.
     Corrupt,
     Missing,
+    /// An item a newer VoIPC wrote, in a format this one does not know.
+    Newer,
 }
 
 impl std::fmt::Display for VaultError {
@@ -126,6 +145,7 @@ impl std::fmt::Display for VaultError {
             VaultError::WrongKey => "the vault does not open with that key",
             VaultError::Corrupt => "a vault item does not decrypt",
             VaultError::Missing => "the vault has no such item",
+            VaultError::Newer => "a newer VoIPC wrote this vault item",
         })
     }
 }
@@ -214,25 +234,62 @@ impl Vault {
         Self::open_slot(relay_id, name, blobs, SLOT_RECOVERY, recovery)
     }
 
-    /// An item: `0x01 | dek_id(8) | iv(12) | ciphertext + tag`.
-    pub fn seal_item(&self, key: &str, plaintext: &[u8]) -> VaultBlob {
-        let (iv, ct) = seal(&self.dek, &self.item_aad(key), plaintext);
+    /// An item: `0x02 | dek_id(8) | iv(12) | ciphertext + tag`, sealing
+    /// `format(2) | gen(8) | payload`. `gen` grows by one on every save, so a
+    /// device that saw a newer one notices a relay handing back an older copy.
+    pub fn seal_item(&self, key: &str, gen: u64, payload: &[u8]) -> VaultBlob {
+        let mut plaintext = Vec::with_capacity(10 + payload.len());
+        plaintext.extend_from_slice(&ITEM_FORMAT.to_be_bytes());
+        plaintext.extend_from_slice(&gen.to_be_bytes());
+        plaintext.extend_from_slice(payload);
+        let (iv, ct) = seal(&self.dek, &self.item_aad(key), &plaintext);
         let mut v = Vec::with_capacity(1 + 8 + 12 + ct.len());
-        v.push(1);
+        v.push(ITEM_V2);
         v.extend_from_slice(&self.dek_id());
         v.extend_from_slice(&iv);
         v.extend_from_slice(&ct);
         VaultBlob { k: key.into(), v, version: 0 }
     }
 
-    pub fn open_item(&self, blobs: &[VaultBlob], key: &str) -> Result<Vec<u8>, VaultError> {
+    /// An item, telling apart missing, damaged and written by a newer VoIPC.
+    /// 0.12's items (`0x01`, the payload only) read as generation 0.
+    pub fn open_item(&self, blobs: &[VaultBlob], key: &str) -> Result<Item, VaultError> {
         let b = blobs.iter().find(|b| b.k == key).ok_or(VaultError::Missing)?;
-        if b.v.len() < 1 + 8 + 12 + 16 || b.v[0] != 1 || b.v[1..9] != self.dek_id() {
+        match b.v.first() {
+            Some(&ITEM_V1) | Some(&ITEM_V2) => {}
+            Some(_) => return Err(VaultError::Newer),
+            None => return Err(VaultError::Corrupt),
+        }
+        if b.v.len() < 1 + 8 + 12 + 16 || b.v[1..9] != self.dek_id() {
             return Err(VaultError::Corrupt);
         }
-        open(&self.dek, &self.item_aad(key), &b.v[9..21], &b.v[21..]).ok_or(VaultError::Corrupt)
+        let plain = open(&self.dek, &self.item_aad(key), &b.v[9..21], &b.v[21..]).ok_or(VaultError::Corrupt)?;
+        if b.v[0] == ITEM_V1 {
+            return Ok(Item { gen: 0, payload: plain });
+        }
+        if plain.len() < 10 {
+            return Err(VaultError::Corrupt);
+        }
+        if u16::from_be_bytes([plain[0], plain[1]]) > ITEM_FORMAT {
+            return Err(VaultError::Newer);
+        }
+        Ok(Item { gen: u64::from_be_bytes(plain[2..10].try_into().expect("8 bytes")), payload: plain[10..].to_vec() })
     }
 }
+
+/// An opened vault item.
+pub struct Item {
+    /// How many times it was saved (0 for one 0.12 wrote).
+    pub gen: u64,
+    pub payload: Vec<u8>,
+}
+
+const ITEM_V1: u8 = 1;
+const ITEM_V2: u8 = 2;
+/// The newest item payload format this build reads (inside `ITEM_V2`). A 1.x
+/// that changes what an item holds raises it, and older builds then leave
+/// the item alone instead of overwriting it.
+pub const ITEM_FORMAT: u16 = 1;
 
 // ── Pinned identities ─────────────────────────────────────────────────────
 
@@ -252,7 +309,7 @@ pub struct Pins {
     names: std::collections::BTreeMap<String, [u8; 16]>,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PinCheck {
     /// Never met: pinned now (save the pins).
     New,
@@ -260,6 +317,16 @@ pub enum PinCheck {
     /// A different key than the pinned one: the person must be told. The new
     /// key is pinned from now on, so they are told once.
     Changed,
+    /// The name was first met as another account: deleted and taken again,
+    /// or a relay showing someone else under it. Told as such, once.
+    Replaced,
+}
+
+impl PinCheck {
+    /// The person must be told.
+    pub fn warns(self) -> bool {
+        matches!(self, PinCheck::Changed | PinCheck::Replaced)
+    }
 }
 
 impl Pins {
@@ -291,7 +358,8 @@ impl Pins {
             self.names.insert(name, *account);
         }
         match (by_key, by_name) {
-            (PinCheck::Changed, _) | (_, PinCheck::Changed) => PinCheck::Changed,
+            (PinCheck::Changed, _) => PinCheck::Changed,
+            (_, PinCheck::Changed) => PinCheck::Replaced,
             (PinCheck::Same, PinCheck::Same) => PinCheck::Same,
             _ => PinCheck::New,
         }
@@ -300,9 +368,27 @@ impl Pins {
     /// Another device's pins, written while this one held its own: the union,
     /// theirs winning where both met the same account (whichever pinned it
     /// first was here first, and a disagreement was reported where it arose).
-    pub fn merge(&mut self, theirs: Pins) {
+    /// Returns the accounts (and a name each goes by) whose key or name the
+    /// two disagreed on: adopted without a word, a relay could move a device
+    /// to an old key through a conflict copy.
+    pub fn merge(&mut self, theirs: Pins) -> Vec<([u8; 16], String)> {
+        let mut changed: Vec<[u8; 16]> = theirs.keys.iter().filter(|(a, k)| self.keys.get(*a).is_some_and(|ours| ours != *k)).map(|(a, _)| *a).collect();
+        changed.extend(theirs.names.iter().filter(|(n, a)| self.names.get(*n).is_some_and(|ours| ours != *a)).map(|(_, a)| *a));
         self.keys.extend(theirs.keys);
         self.names.extend(theirs.names);
+        changed.sort();
+        changed.dedup();
+        changed.into_iter().map(|a| (a, self.name_of(&a))).collect()
+    }
+
+    fn name_of(&self, account: &[u8; 16]) -> String {
+        self.names.iter().find(|(_, a)| *a == account).map(|(n, _)| n.clone()).unwrap_or_default()
+    }
+
+    /// Whether `name` (the part before any `#tag`) was first met as an account.
+    pub fn knows_name(&self, name: &str) -> bool {
+        let name = name.split('#').next().unwrap_or("").trim().to_ascii_lowercase();
+        !name.is_empty() && self.names.contains_key(&name)
     }
 
     /// The key pinned for `account`, if any.
@@ -329,6 +415,27 @@ pub fn safety_number(own_account: &[u8; 16], own_key: &[u8], peer_account: &[u8;
     let peer = IdentityKey::decode(peer_key).ok()?;
     let digits = Fingerprint::new(2, 5200, own_account, &own, peer_account, &peer).ok()?.display_string().ok()?;
     Some(digits.as_bytes().chunks(5).map(|c| std::str::from_utf8(c).expect("digits")).collect::<Vec<_>>().join(" "))
+}
+
+// ── Reset with the recovery key ──────────────────────────────────────────
+
+/// What a reset signs: this relay, this account and the relay's challenge.
+/// The identity key it is signed with opens only from the vault's recovery
+/// slot, so the signature is the proof of holding the recovery key, for
+/// accounts made before 1.0 as well.
+fn reset_message(relay_id: &[u8; 16], name: &str, challenge: &[u8]) -> Vec<u8> {
+    let mut m = format!("voipc-reset/v1|{}|{}|", hex(relay_id), name.trim().to_ascii_lowercase()).into_bytes();
+    m.extend_from_slice(challenge);
+    m
+}
+
+pub fn reset_proof(identity: &IdentityKeyPair, relay_id: &[u8; 16], name: &str, challenge: &[u8]) -> Vec<u8> {
+    identity.private_key().calculate_signature(&reset_message(relay_id, name, challenge), &mut crate::rng()).expect("sign").to_vec()
+}
+
+/// The relay's check of `reset_proof` against the identity on record.
+pub fn reset_proof_ok(identity_key: &[u8], relay_id: &[u8; 16], name: &str, challenge: &[u8], signature: &[u8]) -> bool {
+    libsignal_protocol::IdentityKey::decode(identity_key).is_ok_and(|k| k.public_key().verify_signature(&reset_message(relay_id, name, challenge), signature))
 }
 
 // ── Recovery key ──────────────────────────────────────────────────────────
@@ -455,6 +562,16 @@ pub enum Method {
     /// The key this device got at an earlier sign-in, and the vault's DEK
     /// kept with it (a device key opens no slot).
     Device { key: DeviceKey, relay_id: [u8; 16], dek: [u8; 32] },
+    /// A forgotten password: the recovery key opens the vault, its identity
+    /// signs the relay's challenge, and `password` becomes the new one. Ends
+    /// in `Step::ResetDone`, not in a sign-in.
+    Reset { recovery: Zeroizing<[u8; 32]>, password: Zeroizing<String> },
+}
+
+/// What waits for the stretched password (`Step::Stretch`).
+enum Pending {
+    Salt(Option<PowChallenge>),
+    Reset { challenge: Vec<u8>, blobs: Vec<VaultBlob>, second_factor: bool },
 }
 
 /// What the host does next. Short-lived, one or two at a time: the size of
@@ -466,6 +583,12 @@ pub enum Step {
     NeedTotp,
     /// Build the pre-keys from `identity()` and send `keys(…)`.
     Keys,
+    /// Only with `stretch_outside`: run PBKDF2 (`stretch`) on the password
+    /// with this salt, then hand the result to `stretched`.
+    Stretch { salt: String },
+    /// The reset went through: sign in with the new password (the relay ends
+    /// this connection).
+    ResetDone,
     /// Nothing to do with that message.
     Ignore,
 }
@@ -499,6 +622,11 @@ pub struct SignIn {
     /// (`expect_relay`).
     relay_here: Option<[u8; 16]>,
     relay_elsewhere: Vec<([u8; 16], String)>,
+    /// The host stretches the password itself (`Step::Stretch`).
+    stretch_outside: bool,
+    pending: Option<Pending>,
+    /// A reset waiting for the person's code (`totp`, `recovery_code`).
+    reset: Option<AuthContinue>,
 }
 
 impl SignIn {
@@ -509,6 +637,7 @@ impl SignIn {
             Method::Password { .. } => AccountStart::Login,
             Method::Register { invite, .. } => AccountStart::Register { invite: invite.clone() },
             Method::Device { key, .. } => AccountStart::DeviceKey { device_id: key.device_id.to_vec() },
+            Method::Reset { .. } => AccountStart::Reset,
         };
         let relay_id = match &method {
             Method::Device { relay_id, .. } => Some(*relay_id),
@@ -534,8 +663,17 @@ impl SignIn {
             totp_asked: false,
             relay_here: None,
             relay_elsewhere: Vec::new(),
+            stretch_outside: false,
+            pending: None,
+            reset: None,
         };
         (m, auth)
+    }
+
+    /// The host runs PBKDF2 itself (the browser, with WebCrypto): the machine
+    /// asks with `Step::Stretch` instead of stretching in `on_message`.
+    pub fn stretch_outside(&mut self) {
+        self.stretch_outside = true;
     }
 
     /// What this device knows of relay ids: the one this address said before,
@@ -578,11 +716,102 @@ impl SignIn {
     }
 
     pub fn totp(&self, code: &str) -> ClientMessage {
-        ClientMessage::AuthContinue(AuthContinue::Totp { code: code.trim().replace(' ', "") })
+        let code = code.trim().replace(' ', "");
+        match &self.reset {
+            Some(AuthContinue::Reset { signature, auth_secret, pass_slot, .. }) => ClientMessage::AuthContinue(AuthContinue::Reset {
+                signature: signature.clone(),
+                auth_secret: auth_secret.clone(),
+                pass_slot: pass_slot.clone(),
+                totp: Some(code),
+                recovery_code: None,
+            }),
+            _ => ClientMessage::AuthContinue(AuthContinue::Totp { code }),
+        }
     }
 
     pub fn recovery_code(&self, code: &str) -> ClientMessage {
-        ClientMessage::AuthContinue(AuthContinue::Recovery { code: code.trim().to_string() })
+        let code = code.trim().to_string();
+        match &self.reset {
+            Some(AuthContinue::Reset { signature, auth_secret, pass_slot, .. }) => ClientMessage::AuthContinue(AuthContinue::Reset {
+                signature: signature.clone(),
+                auth_secret: auth_secret.clone(),
+                pass_slot: pass_slot.clone(),
+                totp: None,
+                recovery_code: Some(code),
+            }),
+            _ => ClientMessage::AuthContinue(AuthContinue::Recovery { code }),
+        }
+    }
+
+    /// `stretch`'s output for the salt `Step::Stretch` named.
+    pub fn stretched(&mut self, master: &[u8; 32]) -> Result<Vec<Step>, String> {
+        let relay_id = self.relay_id.ok_or("unexpected sign-in step")?;
+        let d = derive_from_master(master);
+        match (self.pending.take().ok_or("unexpected sign-in step")?, &self.method) {
+            (Pending::Salt(_), Method::Password { .. }) => {
+                self.vault_key = Some(d.vault_key);
+                Ok(vec![Step::Send(ClientMessage::AuthContinue(AuthContinue::Secret { auth_secret: d.auth_secret.to_vec() }))])
+            }
+            (Pending::Salt(pow), Method::Register { .. }) => {
+                let (altcha, ts) = match pow {
+                    Some(p) => (solve_pow(&p.altcha).ok_or("The server's sign-up puzzle did not solve.")?, p.ts),
+                    None => (String::new(), String::new()),
+                };
+                let vault = Vault::create(relay_id, &self.name);
+                let recovery = random::<32>();
+                let identity = IdentityKeyPair::generate(&mut crate::rng());
+                let blobs = vec![vault.pass_slot(&d.vault_key), vault.recovery_slot(&recovery), vault.seal_item(ITEM_IDENTITY, 1, &identity.serialize())];
+                self.recovery = Some(recovery_text(&recovery));
+                self.vault = Some(vault);
+                self.identity = Some(identity);
+                self.blobs = blobs.clone();
+                let register = AuthContinue::Register { auth_secret: d.auth_secret.to_vec(), altcha, ts, vault: blobs };
+                // The relay sends no vault back to a new account: the keys follow at once.
+                Ok(vec![Step::Send(ClientMessage::AuthContinue(register)), Step::Keys])
+            }
+            (Pending::Reset { challenge, blobs, second_factor }, Method::Reset { recovery, .. }) => {
+                let vault = Vault::open_with_recovery(relay_id, &self.name, &blobs, recovery).map_err(|e| match e {
+                    VaultError::WrongKey => "That recovery key does not open this account.".to_string(),
+                    e => e.to_string(),
+                })?;
+                let identity = vault.open_item(&blobs, ITEM_IDENTITY).map_err(|e| e.to_string())?.payload;
+                let identity = IdentityKeyPair::try_from(&identity[..]).map_err(|_| "The vault's identity key is damaged.".to_string())?;
+                let reset = AuthContinue::Reset {
+                    signature: reset_proof(&identity, &relay_id, &self.name, &challenge),
+                    auth_secret: d.auth_secret.to_vec(),
+                    pass_slot: vault.pass_slot(&d.vault_key).v,
+                    totp: None,
+                    recovery_code: None,
+                };
+                if second_factor {
+                    self.reset = Some(reset);
+                    self.totp_asked = true;
+                    return Ok(vec![Step::NeedTotp]);
+                }
+                Ok(vec![Step::Send(ClientMessage::AuthContinue(reset))])
+            }
+            _ => Err("unexpected sign-in step".into()),
+        }
+    }
+
+    /// The password to stretch, for `Step::Stretch` (the host may hold it
+    /// already).
+    fn password(&self) -> Option<&str> {
+        match &self.method {
+            Method::Password { password } | Method::Register { password, .. } | Method::Reset { password, .. } => Some(password),
+            Method::Device { .. } => None,
+        }
+    }
+
+    /// Stretches here, or asks the host to (`stretch_outside`).
+    fn stretch_then(&mut self, pending: Pending) -> Result<Vec<Step>, String> {
+        let relay_id = self.relay_id.ok_or("unexpected sign-in step")?;
+        self.pending = Some(pending);
+        if self.stretch_outside {
+            return Ok(vec![Step::Stretch { salt: kdf_salt(&relay_id, &self.name) }]);
+        }
+        let master = stretch(self.password().ok_or("unexpected sign-in step")?, &relay_id, &self.name);
+        self.stretched(&master)
     }
 
     pub fn keys(&self, prekey_bundle: PreKeyBundleData) -> ClientMessage {
@@ -599,41 +828,25 @@ impl SignIn {
     pub fn on_message(&mut self, msg: &ServerMessage) -> Result<Vec<Step>, String> {
         match msg {
             ServerMessage::AuthError { reason } => Err(reason.clone()),
+            ServerMessage::Refused { text, .. } => Err(text.clone()),
             ServerMessage::AuthStep(AuthStep::AccountRequired { .. }) => Err("This server needs an account.".into()),
             ServerMessage::AuthStep(AuthStep::Salt { relay_id, pow }) => {
+                if !matches!(self.method, Method::Password { .. } | Method::Register { .. }) || self.relay_id.is_some() {
+                    return Err("unexpected sign-in step".into());
+                }
                 self.relay_ok(relay_id)?;
                 self.relay_id = Some(*relay_id);
-                match &self.method {
-                    Method::Password { password } => {
-                        let d = derive(password, relay_id, &self.name);
-                        self.vault_key = Some(d.vault_key);
-                        Ok(vec![Step::Send(ClientMessage::AuthContinue(AuthContinue::Secret { auth_secret: d.auth_secret.to_vec() }))])
-                    }
-                    Method::Register { password, .. } => {
-                        let (altcha, ts) = match pow {
-                            Some(p) => (solve_pow(&p.altcha).ok_or("The server's sign-up puzzle did not solve.")?, p.ts.clone()),
-                            None => (String::new(), String::new()),
-                        };
-                        let d = derive(password, relay_id, &self.name);
-                        let vault = Vault::create(*relay_id, &self.name);
-                        let recovery = random::<32>();
-                        let identity = IdentityKeyPair::generate(&mut OsRng);
-                        let blobs = vec![
-                            vault.pass_slot(&d.vault_key),
-                            vault.recovery_slot(&recovery),
-                            vault.seal_item(ITEM_IDENTITY, &identity.serialize()),
-                        ];
-                        self.recovery = Some(recovery_text(&recovery));
-                        self.vault = Some(vault);
-                        self.identity = Some(identity);
-                        self.blobs = blobs.clone();
-                        let register = AuthContinue::Register { auth_secret: d.auth_secret.to_vec(), altcha, ts, vault: blobs };
-                        // The relay sends no vault back to a new account: the keys follow at once.
-                        Ok(vec![Step::Send(ClientMessage::AuthContinue(register)), Step::Keys])
-                    }
-                    Method::Device { .. } => Err("unexpected sign-in step".into()),
-                }
+                self.stretch_then(Pending::Salt(pow.clone()))
             }
+            ServerMessage::AuthStep(AuthStep::ResetChallenge { relay_id, challenge, blobs, second_factor }) => {
+                if !matches!(self.method, Method::Reset { .. }) || self.relay_id.is_some() {
+                    return Err("unexpected sign-in step".into());
+                }
+                self.relay_ok(relay_id)?;
+                self.relay_id = Some(*relay_id);
+                self.stretch_then(Pending::Reset { challenge: challenge.clone(), blobs: blobs.clone(), second_factor: *second_factor })
+            }
+            ServerMessage::AuthStep(AuthStep::ResetDone) if matches!(self.method, Method::Reset { .. }) => Ok(vec![Step::ResetDone]),
             ServerMessage::AuthStep(AuthStep::DeviceChallenge { relay_id, challenge }) => match &self.method {
                 Method::Device { key, relay_id: known, .. } if known == relay_id => {
                     Ok(vec![Step::Send(ClientMessage::AuthContinue(AuthContinue::DeviceSig { signature: key.sign(relay_id, challenge) }))])
@@ -653,9 +866,9 @@ impl SignIn {
                         Vault::open_with_password(relay_id, &self.name, blobs, &key).map_err(|e| e.to_string())?
                     }
                     Method::Device { dek, .. } => Vault::from_dek(relay_id, &self.name, *dek),
-                    Method::Register { .. } => return Err("unexpected sign-in step".into()),
+                    Method::Register { .. } | Method::Reset { .. } => return Err("unexpected sign-in step".into()),
                 };
-                let identity = vault.open_item(blobs, ITEM_IDENTITY).map_err(|e| e.to_string())?;
+                let identity = vault.open_item(blobs, ITEM_IDENTITY).map_err(|e| e.to_string())?.payload;
                 self.identity = Some(IdentityKeyPair::try_from(&identity[..]).map_err(|_| "The vault's identity key is damaged.".to_string())?);
                 self.vault = Some(vault);
                 self.blobs = blobs.clone();
@@ -743,14 +956,14 @@ mod tests {
         let v = Vault::create(RELAY, "luki");
         let d = derive("pw-pw-pw-pw", &RELAY, "luki");
         let rec = random::<32>();
-        let identity = IdentityKeyPair::generate(&mut OsRng);
-        let blobs = vec![v.pass_slot(&d.vault_key), v.recovery_slot(&rec), v.seal_item(ITEM_IDENTITY, &identity.serialize())];
+        let identity = IdentityKeyPair::generate(&mut crate::rng());
+        let blobs = vec![v.pass_slot(&d.vault_key), v.recovery_slot(&rec), v.seal_item(ITEM_IDENTITY, 1, &identity.serialize())];
 
         let by_pw = Vault::open_with_password(RELAY, "luki", &blobs, &d.vault_key).unwrap();
         assert_eq!(by_pw.dek(), v.dek());
         let by_rec = Vault::open_with_recovery(RELAY, "luki", &blobs, &recovery_parse(&recovery_text(&rec)).unwrap()).unwrap();
         assert_eq!(by_rec.dek(), v.dek());
-        assert_eq!(by_rec.open_item(&blobs, ITEM_IDENTITY).unwrap(), identity.serialize().to_vec());
+        assert_eq!(by_rec.open_item(&blobs, ITEM_IDENTITY).unwrap().payload, identity.serialize().to_vec());
 
         assert_eq!(Vault::open_with_password(RELAY, "luki", &blobs, &[0; 32]).err(), Some(VaultError::WrongKey));
         // Bound to the relay and the name: the relay cannot hand it to another account.
@@ -764,6 +977,20 @@ mod tests {
         let last = flipped[2].v.len() - 1;
         flipped[2].v[last] ^= 1;
         assert_eq!(by_pw.open_item(&flipped, ITEM_IDENTITY).err(), Some(VaultError::Corrupt));
+
+        // A newer VoIPC's item is told apart from a damaged one, by its first
+        // byte or by the format inside: never mistaken for "missing" and
+        // replaced.
+        let mut newer = vec![v.seal_item("item.x", 3, b"p")];
+        let item = by_pw.open_item(&newer, "item.x").unwrap();
+        assert_eq!((item.gen, item.payload.as_slice()), (3, &b"p"[..]));
+        newer[0].v[0] = 3;
+        assert_eq!(by_pw.open_item(&newer, "item.x").err(), Some(VaultError::Newer));
+        let mut inner = (ITEM_FORMAT + 1).to_be_bytes().to_vec();
+        inner.extend_from_slice(&[0; 8]);
+        let (iv, ct) = seal(&v.dek, &v.item_aad("item.x"), &inner);
+        let blob = VaultBlob { k: "item.x".into(), v: [&[ITEM_V2][..], &v.dek_id(), &iv, &ct].concat(), version: 1 };
+        assert_eq!(by_pw.open_item(&[blob], "item.x").err(), Some(VaultError::Newer));
     }
 
     #[test]
@@ -806,21 +1033,21 @@ mod tests {
         assert_eq!(p.check(&bob, "bob", &[5; 33]), PinCheck::New);
         // The relay shows "bob" under a fresh id, with a key of its own: no
         // pin by id, but the name was bob's.
-        assert_eq!(p.check(&fake, "Bob", &[6; 33]), PinCheck::Changed);
+        assert_eq!(p.check(&fake, "Bob", &[6; 33]), PinCheck::Replaced);
         assert_eq!(p.check(&fake, "bob", &[6; 33]), PinCheck::Same, "told once");
-        assert_eq!(p.check(&bob, "bob", &[5; 33]), PinCheck::Changed, "and back again is a change too");
+        assert_eq!(p.check(&bob, "bob", &[5; 33]), PinCheck::Replaced, "and back again is a change too");
         assert_eq!(p.check(&[3; 16], "", &[7; 33]), PinCheck::New, "no name: the key alone");
     }
 
     #[test]
     fn both_sides_see_the_same_safety_number_and_another_key_changes_it() {
-        let (a, b) = (IdentityKeyPair::generate(&mut OsRng), IdentityKeyPair::generate(&mut OsRng));
+        let (a, b) = (IdentityKeyPair::generate(&mut crate::rng()), IdentityKeyPair::generate(&mut crate::rng()));
         let (ka, kb) = (a.public_key().serialize(), b.public_key().serialize());
         let ab = safety_number(&[1; 16], &ka, &[2; 16], &kb).unwrap();
         let ba = safety_number(&[2; 16], &kb, &[1; 16], &ka).unwrap();
         assert_eq!(ab, ba);
         assert_eq!(ab.len(), 60 + 11, "12 groups of five");
-        let m = IdentityKeyPair::generate(&mut OsRng);
+        let m = IdentityKeyPair::generate(&mut crate::rng());
         assert_ne!(ab, safety_number(&[1; 16], &ka, &[2; 16], &m.public_key().serialize()).unwrap(), "a relay's key shows");
     }
 

@@ -16,6 +16,8 @@ pub mod account_session;
 mod aead;
 pub mod channel_state;
 pub mod envelope;
+#[cfg(any(test, fuzzing))]
+pub mod fuzz;
 pub mod group;
 pub mod identity;
 pub mod log;
@@ -34,5 +36,10 @@ pub use envelope::{
 };
 pub use identity::{generate_identity_key_pair, SerializableIdentityKeyPair};
 pub use media_keys::{MediaKey, MediaKeyRing, build_aad, media_decrypt, media_encrypt, MAX_SEQUENCE_BEFORE_ROTATION};
-pub use prekey::PreKeySet;
 pub use stores::SignalStores;
+
+/// The OS's randomness, in the form libsignal's APIs take.
+pub fn rng() -> impl rand::CryptoRng {
+    use rand::TryRngCore;
+    rand::rngs::OsRng.unwrap_err()
+}

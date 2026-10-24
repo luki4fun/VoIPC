@@ -1,3 +1,9 @@
+//! A note on `#[serde(default)]` in the wire types: it only helps JSON
+//! callers (the browser builds messages as JS objects and may leave a field
+//! out). On the wire, postcard is positional, so it never lets an older and a
+//! newer layout read each other: every layout change is a protocol bump, which
+//! `tests/golden.rs` enforces.
+
 use serde::{Deserialize, Serialize};
 
 /// Unique user identifier assigned by the server upon connection.
@@ -80,6 +86,10 @@ pub enum AccountStart {
     Register { invite: Option<String> },
     /// With the key this device was given at an earlier sign-in.
     DeviceKey { device_id: Vec<u8> },
+    /// A forgotten password, set anew with the recovery key (1.0): the
+    /// account proves itself with its identity key, which only the vault's
+    /// recovery slot opens. It ends in `AuthStep::ResetDone`, not a sign-in.
+    Reset,
 }
 
 /// The sign-up proof of work: an ALTCHA challenge (JSON) and the relay's
@@ -113,11 +123,22 @@ pub struct AccountInfo {
     pub totp_enabled: bool,
 }
 
-/// An active IP ban, as shown to admins.
+/// An active ban, as shown to admins. An address ban shows the name it was
+/// given under, never the address (the relay keeps a keyed hash of it).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BanInfo {
-    pub ip: String,
-    /// Seconds until the ban expires; None = until the server restarts.
+    /// What `AdminUnban` lifts.
+    pub id: u64,
+    /// An account ban; else an address ban (an IPv4 address, or an IPv6 /64).
+    pub account: bool,
+    /// The account's name, or the name the user went by when banned.
+    pub label: String,
+    pub reason: String,
+    /// Who banned: an account's name, "admin token" or "server shell".
+    pub by: String,
+    /// Unix seconds.
+    pub created_at: u64,
+    /// Seconds until the ban expires; None = permanent.
     pub expires_in_secs: Option<u64>,
 }
 
@@ -170,10 +191,17 @@ pub struct PreKeyBundleData {
     pub signed_prekey_id: u32,
     /// 32-byte Curve25519 public key.
     pub signed_prekey: Vec<u8>,
-    /// 64-byte Ed25519 signature over the signed pre-key.
+    /// 64-byte XEdDSA signature by the identity key over the signed pre-key.
     pub signed_prekey_signature: Vec<u8>,
     /// Batch of one-time pre-keys.
     pub prekeys: Vec<OneTimePreKey>,
+    /// The signed Kyber1024 last-resort pre-key (protocol v12): every session
+    /// start is post-quantum (PQXDH).
+    pub kyber_prekey_id: u32,
+    /// 1569 bytes: a type byte, then the Kyber1024 public key.
+    pub kyber_prekey: Vec<u8>,
+    /// 64-byte XEdDSA signature by the identity key over `kyber_prekey`.
+    pub kyber_prekey_signature: Vec<u8>,
 }
 
 /// A single one-time pre-key's public portion.

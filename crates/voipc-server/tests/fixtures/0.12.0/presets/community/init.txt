@@ -1,0 +1,35 @@
+Wrote channels.json from the "community" preset: 9 text and 8 voice channels.
+
+  #welcome        text, auto-join, announcements
+  #announcements  text, auto-join, announcements
+  #general        text, auto-join, slow mode 5 s
+  #feedback       text, slow mode 60 s
+  #bug-reports    text, slow mode 60 s
+  #media          text, slow mode 30 s
+  #off-topic      text, slow mode 5 s, messages live 7 d
+  #nsfw           text, slow mode 10 s, messages live 7 d, 18+, password
+  #mods           text, hidden, password
+  Stage           voice
+  Watch Party     voice
+  Lounge 1        voice
+  Lounge 2        voice
+  Playtest        voice
+  After Dark      voice, no screen share, 18+, password
+  Mod Room        voice, hidden, password
+  AFK             voice, no screen share
+
+Passwords — shown this once; channels.json keeps only their hashes:
+  nsfw        pz7f-thvv-u3m4
+  mods        q6uj-c6eu-7pwu
+  After Dark  zx8x-eq55-99gb
+  Mod Room    h8kk-vatn-54vc
+
+Wrote server_settings.json.
+
+Restart the server to load it. To change a password for good, put
+"password": "…" in place of that channel's "password_hash".
+
+- A big community needs room: raise max_users in server.toml (64 by default).
+- Posting in an announcement channel takes an admin (the admin token) or, on a server with accounts, a moderator.
+- The 18+ channels ask every member to confirm their age before opening them, but a click proves nothing: their password, handed out by moderators after an age check, is the real gate.
+- max_channels is 10 here, so rooms members open with + cannot flood the list.

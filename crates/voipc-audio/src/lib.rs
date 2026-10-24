@@ -3,8 +3,13 @@ pub mod capture;
 pub mod decoder;
 pub mod denoise;
 #[cfg(not(target_os = "android"))]
+pub mod echo;
+#[cfg(not(target_os = "android"))]
 pub mod device;
 pub mod encoder;
+#[cfg(any(test, fuzzing))]
+pub mod fuzz;
+pub mod game;
 pub mod jitter;
 pub mod mixer;
 #[cfg(not(target_os = "android"))]
@@ -67,7 +72,7 @@ pub mod capture {
     };
     use ringbuf::traits::{Producer, Split};
     use ringbuf::HeapRb;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
 
     const TARGET_SAMPLE_RATE: u32 = 48_000;
@@ -76,6 +81,13 @@ pub mod capture {
     struct OboeCapture {
         producer: ringbuf::HeapProd<f32>,
         active: Arc<AtomicBool>,
+        /// The input gain (f32 bits, 1.0 = unity), read per callback as the
+        /// desktop capture does.
+        gain: Arc<AtomicU32>,
+        /// Gained samples, kept so the callback does not allocate.
+        scratch: Vec<f32>,
+        /// Raised when the stream dies; the capture task then reopens it.
+        error: Arc<AtomicBool>,
     }
 
     impl AudioInputCallback for OboeCapture {
@@ -91,7 +103,15 @@ pub mod capture {
             }
             // Push samples into ring buffer (lock-free; when it is full the
             // newest samples are the ones dropped)
-            let _ = self.producer.push_slice(audio_data);
+            let g = f32::from_bits(self.gain.load(Ordering::Relaxed));
+            if g == 1.0 {
+                let _ = self.producer.push_slice(audio_data);
+            } else {
+                self.scratch.clear();
+                self.scratch
+                    .extend(audio_data.iter().map(|s| s * g));
+                let _ = self.producer.push_slice(&self.scratch);
+            }
             DataCallbackResult::Continue
         }
 
@@ -101,6 +121,9 @@ pub mod capture {
             error: oboe::Error,
         ) {
             tracing::error!("Oboe input stream error: {:?}", error);
+            // A route change (the call mode, a headset) disconnects the stream
+            // for good; the capture task rebuilds it on this flag, as on desktop
+            self.error.store(true, Ordering::Relaxed);
         }
     }
 
@@ -116,8 +139,8 @@ pub mod capture {
 
     pub fn start_capture(
         _device_name: Option<&str>,
-        _error_flag: Arc<AtomicBool>,
-        _gain: Arc<std::sync::atomic::AtomicU32>, // bernd: gain not applied on Android yet
+        error_flag: Arc<AtomicBool>,
+        gain: Arc<AtomicU32>,
     ) -> Result<(CaptureStream, ringbuf::HeapCons<f32>)> {
         let rb = HeapRb::<f32>::new(CAPTURE_BUFFER_SIZE);
         let (producer, consumer) = rb.split();
@@ -126,9 +149,15 @@ pub mod capture {
         let callback = OboeCapture {
             producer,
             active: active.clone(),
+            gain,
+            scratch: Vec::with_capacity(4096),
+            error: error_flag,
         };
 
-        // Use Unprocessed preset — we apply our own RNNoise denoising
+        // VoiceCommunication, not Unprocessed: it is the preset that turns on
+        // the platform's echo canceller. On the loudspeaker, which is how a
+        // phone call here starts, Unprocessed sent everybody their own voice
+        // back (H3-01). RNNoise still runs on top, as the user's switch says.
         let mut stream = AudioStreamBuilder::default()
             .set_input()
             .set_sample_rate(TARGET_SAMPLE_RATE as i32)
@@ -136,7 +165,7 @@ pub mod capture {
             .set_f32()
             .set_performance_mode(PerformanceMode::LowLatency)
             .set_sharing_mode(SharingMode::Shared)
-            .set_input_preset(InputPreset::Unprocessed)
+            .set_input_preset(InputPreset::VoiceCommunication)
             .set_callback(callback)
             .open_stream()
             .map_err(|e| anyhow::anyhow!("Failed to open Oboe input stream: {:?}", e))?;
@@ -201,6 +230,8 @@ pub mod playback {
         wake: Option<Arc<Notify>>,
         /// No callback yet: its outsized ask is covered by the prime.
         first: bool,
+        /// Raised when the stream dies; the mixer then reopens it.
+        error: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl AudioOutputCallback for OboePlayback {
@@ -254,6 +285,7 @@ pub mod playback {
             error: oboe::Error,
         ) {
             tracing::error!("Oboe output stream error: {:?}", error);
+            self.error.store(true, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -269,7 +301,7 @@ pub mod playback {
 
     pub fn start_playback(
         _device_name: Option<&str>,
-        _error_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        error_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
         wake: Option<Arc<Notify>>,
     ) -> Result<(PlaybackStream, ringbuf::HeapProd<f32>)> {
         if wake.is_some() {
@@ -289,6 +321,7 @@ pub mod playback {
             scratch: Vec::new(),
             wake,
             first: true,
+            error: error_flag,
         };
 
         let mut stream = AudioStreamBuilder::default()

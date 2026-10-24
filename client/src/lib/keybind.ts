@@ -61,7 +61,7 @@ export class KeyCapture {
   }
 
   /** `null` while the capture is still waiting for something bindable. */
-  keyup(e: KeyboardEvent): CaptureStep | null {
+  keyup(e: KeyboardEvent): { kind: "binding"; binding: string } | null {
     if (MODIFIER_KEYS.includes(e.key) && !this.sawKey) {
       return { kind: "binding", binding: e.code };
     }

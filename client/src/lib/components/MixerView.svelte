@@ -23,7 +23,6 @@
   // another, and only the game knows which — and never touches yours.
 
   import { invoke } from "@tauri-apps/api/core";
-  import { listen } from "@tauri-apps/api/event";
   import { onDestroy } from "svelte";
   // The call's people and the call's channel, on whichever server carries
   // voice: the lanes are theirs, whatever server is on screen.
@@ -40,6 +39,7 @@
   import { shortName } from "../username.js";
   import { audibleIds, drivenBy } from "../stores/room.js";
   import { micMonitor, inputGain } from "../stores/settings.js";
+  import { micTestLevel, micTesting, startMicTest, stopMicTest } from "../stores/mic-test.js";
   import {
     MAX_LEVEL,
     PLAIN_LANE,
@@ -170,7 +170,7 @@
     // test refuses to start while we do. Polling it during the test therefore
     // read a dead value for exactly the strip the test is about — so while the
     // test runs, the `mic-test-level` event feeds the meter instead.
-    if (micTesting) return;
+    if ($micTesting) return;
     try {
       const db = await invoke<number>("get_audio_level");
       ownLevel = Math.max(dbToPercent(db), ownLevel * METER_RELEASE);
@@ -196,57 +196,22 @@
   });
 
   // ── The microphone test, which lives with our own strip ────────────────
+  // One test for the whole app (stores/mic-test.ts): while it runs, its level
+  // feeds our strip instead of the capture task's.
 
-  let micTesting = $state(false);
-  let destroyed = false;
-  /** Dropped when the test stops, so the meter goes back to the capture task. */
-  let micTestUnlisten: Array<() => void> = [];
+  $effect(() => {
+    if ($micTesting) ownLevel = Math.max(dbToPercent($micTestLevel), ownLevel * METER_RELEASE);
+  });
 
-  async function toggleMicTest() {
-    try {
-      if (micTesting) {
-        await invoke("stop_mic_test");
-        stopListeningToMicTest();
-      } else {
-        micTestUnlisten.push(
-          await listen<{ db: number }>("mic-test-level", (e) => {
-            ownLevel = Math.max(dbToPercent(e.payload.db), ownLevel * METER_RELEASE);
-          }),
-        );
-        micTestUnlisten.push(
-          await listen<{ error: string }>("mic-test-error", (e) => {
-            addNotification(`Microphone test failed: ${e.payload.error}`, "error");
-            invoke("stop_mic_test").catch(() => {});
-            stopListeningToMicTest();
-          }),
-        );
-        await invoke("start_mic_test", { monitor: $micMonitor });
-        // Closed while it was starting: onDestroy saw no test to stop
-        if (destroyed) {
-          invoke("stop_mic_test").catch(() => {});
-          stopListeningToMicTest();
-          return;
-        }
-        micTesting = true;
-      }
-    } catch (e) {
-      stopListeningToMicTest();
-      addNotification(`Microphone test failed: ${e}`, "error");
-    }
-  }
-
-  function stopListeningToMicTest() {
-    micTesting = false;
-    micTestUnlisten.forEach((off) => off());
-    micTestUnlisten = [];
-    ownLevel = 0;
+  function toggleMicTest() {
+    if ($micTesting) void stopMicTest();
+    else void startMicTest($micMonitor);
   }
 
   onDestroy(() => {
-    destroyed = true;
-    if (micTesting) invoke("stop_mic_test").catch(() => {});
-    micTestUnlisten.forEach((off) => off());
+    if ($micTesting) void stopMicTest();
   });
+;
 
   const selected = $derived(lanes.find((l) => l.id === $selectedStrip) ?? null);
 </script>
@@ -390,14 +355,14 @@
 
       {#if strip.own}
         <div class="extras">
-          <button class="mic-test" class:on={micTesting} onclick={toggleMicTest}>
-            {micTesting ? "Stop test" : "Test mic"}
+          <button class="mic-test" class:on={$micTesting} onclick={toggleMicTest}>
+            {$micTesting ? "Stop test" : "Test mic"}
           </button>
           <label class="check">
             <input
               type="checkbox"
               checked={$micMonitor}
-              disabled={micTesting}
+              disabled={$micTesting}
               onchange={(e) => micMonitor.set(e.currentTarget.checked)}
             />
             <span class="tiny">Hear myself</span>

@@ -45,6 +45,24 @@ const clamp10 = (v: number, max: number) => Math.min(Math.max(Math.round(v), 0),
 
 const SAMPLE_RATE = 48_000;
 const FRAME_US = 20_000;
+
+/**
+ * The worklet's Opus decoder (crates/voipc-opus-wasm), fetched once here: a
+ * worklet cannot fetch. The bytes go to the worklet, which compiles them —
+ * Chromium will not hand a compiled `WebAssembly.Module` to an AudioWorklet
+ * (the port fires `messageerror`). `null` when it cannot be had; WebCodecs
+ * then decodes as before.
+ */
+let opusBytes: Promise<ArrayBuffer | null> | null = null;
+function fetchOpus(): Promise<ArrayBuffer | null> {
+  opusBytes ??= fetch(new URL("../../lib/wasm/voipc_opus.wasm", import.meta.url))
+    .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .catch((e) => {
+      console.warn("no wasm Opus decoder for the worklet, using WebCodecs:", e);
+      return null;
+    });
+  return opusBytes;
+}
 /** Set on the mixer key of screen-share audio sources (network.rs SCREEN_AUDIO_FLAG). */
 const SCREEN_AUDIO_FLAG = 0x8000_0000;
 /** Decoders with no packets for this long are dropped (mirrors the mixer). */
@@ -319,6 +337,8 @@ export class AudioEngine implements AudioApi {
   private sidetoneRoom = new ReverbWater();
   private framesPlayed = 0;
   private framesLost = 0;
+  /** The mixer worklet decodes Opus itself: packets go to it undecoded. */
+  private opusInWorklet = false;
   private screenAudioRecv = 0;
   private screenAudioSent = 0;
   /** Desktop-audio capture while sharing our screen (share.ts drives it). */
@@ -491,6 +511,12 @@ export class AudioEngine implements AudioApi {
   }
 
   private feedSource(key: number, sequence: number, opus: Uint8Array): void {
+    // The worklet decodes it when it plays, in order, with FEC and PLC (H3-05)
+    if (this.opusInWorklet && this.mixer) {
+      const packet = opus.slice();
+      this.mixer.port.postMessage({ type: "packet", source: key, sequence, opus: packet }, [packet.buffer]);
+      return;
+    }
     if (typeof AudioDecoder === "undefined") {
       // Silence would look like everyone else being quiet: say why, once.
       if (!this.noDecoderEmitted) {
@@ -622,9 +648,20 @@ export class AudioEngine implements AudioApi {
             this.framesLost = e.data.lost;
           } else if (e.data?.type === "levels") {
             this.sourceLevels = e.data.levels;
+          } else if (e.data?.type === "opus-ready") {
+            this.opusInWorklet = this.mixer === mixer;
+          } else if (e.data?.type === "opus-failed") {
+            // WebCodecs again, which plays a lost frame as silence
+            console.warn("the worklet's Opus decoder failed:", (e.data as { error?: string }).error);
+            this.opusInWorklet = false;
           }
         };
         mixer.connect(master);
+        // A new worklet decodes nothing until its own decoder is ready
+        this.opusInWorklet = false;
+        void fetchOpus().then((bytes) => {
+          if (bytes) mixer.port.postMessage({ type: "opus", bytes });
+        });
         mixer.port.postMessage({ type: "deafen", value: this._deafened });
         for (const [userId, gain] of this.userVolumes) {
           mixer.port.postMessage({ type: "user-volume", userId, gain });
@@ -1456,7 +1493,8 @@ export class AudioEngine implements AudioApi {
    */
   canPickOutput(): boolean {
     const ac = this.audioContext as (AudioContext & { setSinkId?: unknown }) | null;
-    return typeof (ac ?? AudioContext.prototype).setSinkId === "function";
+    const target = (ac ?? AudioContext.prototype) as { setSinkId?: unknown };
+    return typeof target.setSinkId === "function";
   }
 
   /**
@@ -1603,6 +1641,11 @@ export class AudioEngine implements AudioApi {
   }
 
   // ── Stats ────────────────────────────────────────────────────────────
+
+  /** Which decoder plays incoming voice: the worklet's wasm Opus, or WebCodecs. */
+  voiceDecoder(): "worklet" | "webcodecs" {
+    return this.opusInWorklet ? "worklet" : "webcodecs";
+  }
 
   getVoiceStats(): [number, number] {
     return [this.framesPlayed, this.framesLost];

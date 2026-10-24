@@ -13,7 +13,7 @@ use voipc_protocol::messages::{AccountReply, AccountRequest, ClientMessage};
 use voipc_protocol::types::{AccountInfo, UserInfo};
 use zeroize::Zeroizing;
 
-use crate::account::{DeviceEnrol, PinCheck, SignedIn};
+use crate::account::{derive_from_master, kdf_salt, DeviceEnrol, PinCheck, SignedIn, Vault};
 use crate::sync::{AccountSync, Event, LogMemory, Prefs};
 
 /// A device the relay remembers now: what signs this account in there next
@@ -64,6 +64,9 @@ pub struct AccountSession {
     enrol: Option<DeviceEnrol>,
     /// Who here is which account, and the name they go by (the rosters).
     roster: HashMap<u32, ([u8; 16], String)>,
+    /// Conversations purged on request, whose tombstone follows the relay's
+    /// `LogPurged` (sent before it, the purge would take it too).
+    tombstones: std::collections::HashSet<String>,
 }
 
 impl AccountSession {
@@ -91,6 +94,7 @@ impl AccountSession {
             needs_2fa: info.needs_2fa,
             enrol: None,
             roster: HashMap::new(),
+            tombstones: Default::default(),
         };
         (s, Actions { emit: vec![("account-signed-in", signed_in)], ..Default::default() })
     }
@@ -149,6 +153,15 @@ impl AccountSession {
                 self.remembered = false;
                 self.needs_2fa = false;
             }
+            // A new password forgets every device key, this one's too: the
+            // person just typed the password, so remember this device again.
+            AccountReply::PasswordChanged => {
+                self.remembered = false;
+                self.password_based = true;
+                if !self.needs_2fa {
+                    self.start_enrol(&mut a);
+                }
+            }
             AccountReply::Info(info) => {
                 self.needs_2fa = info.needs_2fa;
                 if !info.needs_2fa && self.password_based && !self.remembered {
@@ -156,18 +169,28 @@ impl AccountSession {
                 }
             }
             AccountReply::Error { request, .. } if request.starts_with("Device") => self.enrol = None,
+            // Our entries in `conv` are gone from the relay: a tombstone
+            // tells the readers' devices to drop their copies too.
+            AccountReply::LogPurged { conv: Some(conv), .. } if self.tombstones.remove(conv) => {
+                let now = crate::time::now_millis();
+                let tomb = crate::envelope::purge_envelope(&crate::envelope::new_message_id(), now);
+                match voipc_protocol::conv::dm_parties(conv) {
+                    Some((x, y)) => a.send.extend(self.sync.send_dm(if x == self.me { y } else { x }, tomb, now, None)),
+                    None => a.send.extend(self.sync.send_channel(conv, tomb, now, None)),
+                }
+            }
             _ => {}
         }
         a.emit.push(("account-reply", serde_json::to_value(reply).unwrap_or(Value::Null)));
         a
     }
 
-    fn events(&self, events: Vec<Event>, a: &mut Actions) {
-        let mut read = false;
+    fn events(&mut self, events: Vec<Event>, a: &mut Actions) {
+        let mut read = self.sync.take_memory_changed();
         for e in events {
             read |= e.reads();
             match &e {
-                Event::IdentityChanged { account, name } => self.identity_changed(account, name, a),
+                Event::IdentityChanged { account, name, replaced } => self.identity_changed(account, name, *replaced, a),
                 _ => a.emit.extend(e.to_wire()),
             }
         }
@@ -178,24 +201,34 @@ impl AccountSession {
 
     /// Told by user id where they are here, else by name: they may be away,
     /// and a change nobody hears of is pinned all the same.
-    fn identity_changed(&self, account: &[u8; 16], name: &str, a: &mut Actions) {
+    fn identity_changed(&self, account: &[u8; 16], name: &str, replaced: bool, a: &mut Actions) {
         let here: Vec<u32> = self.roster.iter().filter(|(_, (acc, _))| acc == account).map(|(u, _)| *u).collect();
         if here.is_empty() {
-            a.emit.push(("identity-key-changed", json!({ "user_id": null, "name": name })));
+            a.emit.push(("identity-key-changed", json!({ "user_id": null, "name": name, "replaced": replaced })));
         }
         for user_id in here {
-            a.emit.push(("identity-key-changed", json!({ "user_id": user_id, "name": name })));
+            a.emit.push(("identity-key-changed", json!({ "user_id": user_id, "name": name, "replaced": replaced })));
         }
     }
 
     /// The accounts in a roster (`UserList`, `UserJoined`), for the pins. The
-    /// relay never sends an account behind a pseudonym.
-    pub fn note_roster(&mut self, users: &[UserInfo]) {
+    /// relay never sends an account behind a pseudonym. A name this account
+    /// first met as an account, shown now as a guest, is a warning: an honest
+    /// relay with accounts never lets a guest use an account's name.
+    pub fn note_roster(&mut self, users: &[UserInfo]) -> Actions {
+        let mut a = Actions::default();
         for u in users {
-            if let Some(account) = u.account {
-                self.roster.insert(u.user_id, (account, u.username.clone()));
+            match u.account {
+                Some(account) => {
+                    self.roster.insert(u.user_id, (account, u.username.clone()));
+                }
+                None if self.sync.knows_name(&u.username) => {
+                    a.emit.push(("identity-key-changed", json!({ "user_id": u.user_id, "name": u.username, "as_guest": true })));
+                }
+                None => {}
             }
         }
+        a
     }
 
     /// An identity `user_id` showed — in a pre-key bundle, or in a session
@@ -204,8 +237,8 @@ impl AccountSession {
         let Some((account, name)) = self.roster.get(&user_id).cloned() else { return Actions::default() };
         let (check, send) = self.sync.check_peer(&account, &name, key);
         let mut a = Actions::sending(send);
-        if check == PinCheck::Changed {
-            a.emit.push(("identity-key-changed", json!({ "user_id": user_id, "name": name, "new_identity_key": key })));
+        if check.warns() {
+            a.emit.push(("identity-key-changed", json!({ "user_id": user_id, "name": name, "new_identity_key": key, "replaced": check == PinCheck::Replaced })));
         }
         a
     }
@@ -245,6 +278,11 @@ impl AccountSession {
 
     /// Whether a direct message to `user_id` that did not arrive is kept for
     /// them all the same (`DirectMessageUndelivered`).
+    /// Out of channel log `conv` (`AccountSync::leave`).
+    pub fn leave(&mut self, conv: &str, tell: bool) -> Actions {
+        Actions::sending(self.sync.leave(conv, tell))
+    }
+
     pub fn kept_for(&self, user_id: u32) -> bool {
         self.cloud() && self.roster.contains_key(&user_id)
     }
@@ -259,6 +297,48 @@ impl AccountSession {
             return Err("Their identity changed: the conversation runs on another key than the one pinned. Reconnect, then verify again.".into());
         }
         crate::account::safety_number(&self.me, own_key, peer, pinned).ok_or_else(|| "could not compute the safety number".into())
+    }
+
+    /// Deletes what this account wrote to the stored logs: in `conv` (then a
+    /// tombstone asks the readers' devices to drop their copies too), or
+    /// (None) everywhere, where the copies already read stay.
+    pub fn purge(&mut self, conv: Option<&str>) -> Actions {
+        if let Some(c) = conv {
+            self.tombstones.insert(c.to_string());
+        }
+        Actions::sending(vec![ClientMessage::Account(AccountRequest::LogPurge { conv: conv.map(str::to_string) })])
+    }
+
+    /// Deletes this account, from `stretch` of its password and the second
+    /// factor where it has one. `AccountDeleted` answers; the relay then
+    /// closes the connection.
+    pub fn delete_account(&self, master: &[u8; 32], totp: Option<String>, recovery_code: Option<String>) -> Actions {
+        Actions::sending(vec![ClientMessage::Account(AccountRequest::DeleteAccount {
+            secret: derive_from_master(master).auth_secret.to_vec(),
+            totp: totp.map(|c| c.trim().replace(' ', "")).filter(|c| !c.is_empty()),
+            recovery_code: recovery_code.map(|c| c.trim().to_string()).filter(|c| !c.is_empty()),
+        })])
+    }
+
+    /// The PBKDF2 salt for this account's passwords (`account::stretch`).
+    pub fn kdf_salt(&self) -> String {
+        kdf_salt(&self.relay_id, &self.name)
+    }
+
+    /// A new password, from `stretch` of the old one and of the new one, and
+    /// the second factor where the account has one. The vault's password
+    /// slot is wrapped again for the new one; the DEK and the recovery slot
+    /// stay. `PasswordChanged` answers it; every other device is signed out.
+    pub fn password_change(&self, old_master: &[u8; 32], new_master: &[u8; 32], totp: Option<String>, recovery_code: Option<String>) -> Actions {
+        let (old, new) = (derive_from_master(old_master), derive_from_master(new_master));
+        let vault = Vault::from_dek(self.relay_id, &self.name, *self.dek);
+        Actions::sending(vec![ClientMessage::Account(AccountRequest::PasswordChange {
+            old_secret: old.auth_secret.to_vec(),
+            new_secret: new.auth_secret.to_vec(),
+            pass_slot: vault.pass_slot(&new.vault_key).v,
+            totp: totp.map(|c| c.trim().replace(' ', "")).filter(|c| !c.is_empty()),
+            recovery_code: recovery_code.map(|c| c.trim().to_string()).filter(|c| !c.is_empty()),
+        })])
     }
 
     pub fn cloud(&self) -> bool {
@@ -293,7 +373,6 @@ mod tests {
     use super::*;
     use crate::account::Vault;
     use libsignal_protocol::IdentityKeyPair;
-    use rand::rngs::OsRng;
 
     const RELAY: [u8; 16] = [7; 16];
     const ME: [u8; 16] = [1; 16];
@@ -307,7 +386,7 @@ mod tests {
             relay_id: RELAY,
             name: "me".into(),
             vault: Vault::create(RELAY, "me"),
-            identity: IdentityKeyPair::generate(&mut OsRng),
+            identity: IdentityKeyPair::generate(&mut crate::rng()),
             recovery: None,
             blobs: Vec::new(),
         };
@@ -331,6 +410,24 @@ mod tests {
             account: Some(account),
             is_moderator: false,
         }
+    }
+
+    /// A conversation's tombstone goes only after the relay purged it: sent
+    /// before, the purge would take it too. A purge of everything sends none.
+    #[test]
+    fn a_purge_sends_its_tombstone_after_the_relay_did_it() {
+        let (mut s, _) = session(true, false);
+        s.set_prefs(Prefs { cloud: true, asked: true });
+        let conv = format!("c:{}", "ab".repeat(16));
+        let a = s.purge(Some(&conv));
+        assert_eq!(sends(&a, "LogPurge"), 1);
+        assert!(s.on_reply(&AccountReply::LogPurged { conv: Some("c:other".into()), entries: 0 }).send.is_empty(), "not one we asked for");
+        let a = s.on_reply(&AccountReply::LogPurged { conv: Some(conv.clone()), entries: 2 });
+        assert!(!a.send.is_empty(), "the tombstone is on its way (its first ask)");
+        assert!(a.emit.iter().any(|(n, _)| *n == "account-reply"));
+        assert!(s.on_reply(&AccountReply::LogPurged { conv: Some(conv), entries: 0 }).send.is_empty(), "once");
+        s.purge(None);
+        assert!(s.on_reply(&AccountReply::LogPurged { conv: None, entries: 5 }).send.is_empty());
     }
 
     #[test]
@@ -372,7 +469,7 @@ mod tests {
     #[test]
     fn identities_are_checked_for_the_accounts_the_rosters_name() {
         let (mut s, _) = session(false, false);
-        let key = || IdentityKeyPair::generate(&mut OsRng).public_key().serialize().to_vec();
+        let key = || IdentityKeyPair::generate(&mut crate::rng()).public_key().serialize().to_vec();
         let (k1, k2) = (key(), key());
         assert!(s.check_identity(5, &k1).emit.is_empty(), "a guest: nothing to check");
         s.note_roster(&[user(5, [5; 16], "bob")]);

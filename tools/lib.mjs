@@ -109,10 +109,9 @@ export function workspaceVersion() {
   return m[1];
 }
 
-// Files carrying a copy of the version, and how to find it in each.
-// The server compares client and server version strings for exact equality
-// (crates/voipc-server/src/tcp.rs), so a stale copy here ships a client that
-// every server rejects.
+// Files carrying a copy of the version, and how to find it in each. A relay
+// admits any app that speaks its protocol, so a stale copy here does not lock
+// anyone out — but the app would call itself something else than its release.
 const VERSION_SITES = [
   {
     file: join(CLIENT, 'src-tauri', 'tauri.conf.json'),
@@ -145,7 +144,9 @@ const VERSION_SITES = [
   {
     // The download blurb on the website; nothing else syncs it.
     file: join(ROOT, 'website', 'index.html'),
-    re: /(<a href="[^"]*CHANGELOG\.md">)v\d+\.\d+\.\d+(<\/a>)/,
+    // With an optional -rc.N: after one rc sync the site says v1.0.0-rc.1,
+    // and a regex without the suffix would skip it silently from then on.
+    re: /(<a href="[^"]*CHANGELOG\.md">)v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?(<\/a>)/,
     make: (v) => `$1v${v}$2`,
     optional: true,
   },

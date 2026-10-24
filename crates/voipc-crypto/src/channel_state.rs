@@ -279,9 +279,9 @@ pub fn history_sources(candidates: &[(u32, bool)], own_user_id: u32) -> HashSet<
 /// each owe an encryption of up to 48 KiB per asker and have a budget for
 /// answering. Spread out, the same work lands on everybody who volunteered.
 pub fn pick_history_sources(sharers: &[u32]) -> HashSet<u32> {
-    use rand::seq::SliceRandom;
+    use rand::seq::IndexedRandom;
     sharers
-        .choose_multiple(&mut rand::rngs::OsRng, HISTORY_SOURCES)
+        .choose_multiple(&mut crate::rng(), HISTORY_SOURCES)
         .copied()
         .collect()
 }

@@ -70,9 +70,17 @@ channel's settings). Either role needs two-factor codes before its rights apply.
 On a new device, the account signs in with its password and a code; a device the
 server remembers signs in without either.
 
-A moderator kicks and bans people, not admins or other moderators. The ban list
-is addresses, so listing and lifting bans stay with admins, and a moderator who
-bans somebody is not shown their address.
+A moderator kicks and bans people, not admins or other moderators. Listing and
+lifting bans stay with admins.
+
+A ban covers the address someone connects from (an IPv4 address, or the IPv6
+/64), and with *Ban the account too* their account, from any address. Everyone
+behind a banned address is kept out, except accounts that hold a role here: they
+are let in after they sign in. The database keeps a keyed hash of a banned
+address, never the address, so the list shows the name the person used. An
+admin can also ban an account by name from *Active bans*, and the shell can:
+`voipc-server ban add --account NAME` (or `--ip ADDR`, `--reason`, `--days`),
+`ban list`, `ban remove ID`.
 
 From the server's shell. Each command reads `[accounts]` from the server's own
 config, given before the command — `voipc-server -c server.toml admin invite` —
@@ -98,13 +106,20 @@ connections that are already open within that time.
 - **One password, one recovery key.** The app derives everything from your password:
   the secret the server checks, and the key to your vault. The password itself never
   leaves your device. A new account is shown a recovery key once; write it down.
+- **A new password.** *Your account → Password: Change* asks for the current one,
+  and for a code when two-factor codes are on. *Forgot your password?* in the
+  connect dialog sets a new one with the recovery key instead, again with a code
+  when codes are on. Either way the server signs out every other device and
+  forgets every remembered one; the device you did it on is remembered again. The
+  vault, your identity (and what others pinned of it) and the recovery key stay as
+  they were.
 - **A password for this server only.** What the app derives is salted with the id
   the server gives itself, and a server could give itself another server's id:
   with one password on both, it would get what signs you in there. The desktop app
   remembers which id each address had and refuses a server that claims an id it
   knows from another address (*Forget the account id of …* in the connect dialog,
-  for a server that really moved). The browser cannot do that for you: the page
-  comes from the server it signs in to.
+  for a server that really moved). The browser does the same for the servers you
+  open from one server's page; each page keeps its own list.
 - **Remembered devices.** After you sign in with your password, the app asks the
   server to remember this device. Next time it signs in without the password. On
   the desktop the device is kept in the encrypted chat history: it signs in alone
@@ -130,17 +145,34 @@ connections that are already open within that time.
 - **Who can read what you keep** is said in the channel, by name, when your app
   hands them a key. If a name there is new to you, the server added a member you
   did not see join. The server cannot add a reader to your messages without that
-  notice on the device that hands the key over. A reader stays one after leaving
-  the channel — leaving does not leave its log — until they are kicked from it or
-  its password changes. The same goes for you: a channel you kept goes on sending
-  you its copies.
+  notice on the device that hands the key over.
+- **Leaving ends it.** Leaving a text channel, or being kicked from it, takes you
+  out of its log: the server does it, and every writer's next message there is
+  under a new key you do not get. What you already have stays yours. Moving
+  between voice channels keeps their logs; *Stop keeping this channel's messages
+  for me* (under the chat's bin) ends one until you come back to it.
+- **Deleting what you kept.** The bin in a conversation offers *Clear here, and
+  delete what I wrote from the server's copy*: your messages there go from the
+  server, and a tombstone, signed like a message, asks the readers' devices to
+  drop their copies too. *Your account → Messages you kept here: Delete* removes
+  them from every conversation (without tombstones). Either way, copies people's
+  devices already have may stay, and a server can hold a tombstone back, though
+  it cannot make one up.
+- **Deleting your account.** *Your account → Delete account…* asks for the name,
+  the password and, with codes on, a code. The vault, the messages the account
+  kept, its keys, its memberships, sessions and remembered devices go from the
+  server; the name is free for someone else, and people who pinned the old
+  account are told the new one is another account. What others wrote to you
+  stays theirs until it expires, and so do their copies of what you wrote. The
+  last admin cannot delete itself: make another admin first.
 - **Kept copies follow the channel's rules.** In an announcement channel only its
   managers' copies are kept, slow mode paces copies as it paces posts, and a copy
   is only kept from inside the channel.
 - **Verify identity** in a member's menu shows a safety number for the two of you.
   Compare it in person or on a call. If it matches, nobody stands between you,
   including the server. When somebody's identity changes, you are told — also when
-  they are away, and also when a name you know turns up as a different account.
+  they are away, when a name you know turns up as a different account (deleted
+  and taken again, say), and when an account you know shows up as a guest.
   While the conversation runs on another key than the one pinned, there is no
   number to compare: reconnect to them first.
 
@@ -155,7 +187,11 @@ From accounts:
 - two-factor secrets, sealed by the key file
 - roles
 - sign-in records with hashed IP addresses
-- each account's vault, which it cannot open
+- each account's vault, which it cannot open without guessing the password: each
+  guess costs 600,000 PBKDF2-SHA256 rounds, so a long password used nowhere else
+  is what protects it
+- bans: a keyed hash of each banned address (never the address), and banned
+  accounts
 
 From kept messages:
 
@@ -185,11 +221,16 @@ app does not have that problem.
 ## What a server that turns hostile can still do
 
 The encryption keeps the text and the keys from the server. The server still
-holds the vault, the member lists and the copies, so it can:
+holds the vault, the member lists and the copies, so it can (the whole table is
+in [THREAT-MODEL.md](THREAT-MODEL.md)):
 
 - **drop or roll back what it holds**: hide copies, or give a device an older
-  copy of your vault (an older list of pinned identities lets it introduce
-  itself as somebody you have not met yet on that device);
+  copy of your vault, or none (an older or missing list of pinned identities
+  lets it introduce itself as somebody you have not met yet on that device). A
+  device that saw a newer copy before warns and does not save over it;
+- **withhold or replay kept copies**, but not forge or alter one: each is signed
+  by its writer;
+- **guess your password offline**, at the cost above;
 - **decide who is a member** of a channel's log: a member it made up gets keys
   only with the notice above, and that notice is shown on the device that hands
   the key over;
@@ -199,7 +240,11 @@ holds the vault, the member lists and the copies, so it can:
   your app pinned when it first met them, which is why a known name under a new
   account is reported;
 - **meet you first**: the first time two people meet, nothing is pinned yet.
-  Safety numbers are how you find out.
+  Safety numbers are how you find out;
+- **reach the other servers in its page**: in the browser, the page comes from
+  the server you opened, and that page handles every server you add in the same
+  tab, their remembered device keys included. For an account on another server,
+  open that server's own page, or use the desktop app.
 
 ## Limits
 
@@ -214,15 +259,8 @@ holds the vault, the member lists and the copies, so it can:
 
 ## Not in this version
 
-- Changing your password, or resetting a forgotten one. A remembered device
-  still signs in. Without one, an account whose password is lost cannot be
-  recovered yet. The recovery key opens the vault once that flow exists.
 - An admin dialog in the app. Roles, invites and two-factor resets are on the
   command line for now.
-- Account bans. Bans stay per address and in memory.
-- Deleting your copies from the server. Turning copies off stops new ones, but the
-  ones already kept stay until they expire, and so does your place in the logs of
-  channels you kept.
 - Starting a direct conversation with an account that has not been online since
   you connected.
 - Keeping chat in the browser between visits. The browser keeps the server's copies

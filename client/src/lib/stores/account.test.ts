@@ -44,3 +44,15 @@ test("a server that goes takes its prompts along, but not a once-only one on scr
   dropPrompts("b:2");
   assert.equal(kind(), null);
 });
+
+test("a sign-in waiting for its code is not replaced by another server's prompt", () => {
+  showPrompt({ kind: "totp", server: "a:1", retry: false });
+  showPrompt({ kind: "totp-setup", server: "b:2", secret: "s", uri: "otpauth://x", sealed: "x", why: "required" });
+  assert.equal(kind(), "totp", "a:1's sign-in would fail unseen when its wait runs out");
+  showPrompt({ kind: "totp", server: "a:1", retry: true });
+  assert.deepEqual(get(accountPrompt), { kind: "totp", server: "a:1", retry: true }, "its own retry replaces it");
+  closePrompt();
+  assert.equal(kind(), "totp-setup", "then the other server's, as it came");
+  closePrompt();
+  assert.equal(kind(), null);
+});

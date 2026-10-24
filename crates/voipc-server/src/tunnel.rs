@@ -195,7 +195,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let label = format!("tcp:{}", peer.ip());
-    info!(peer = %label, "session established over the TCP fallback");
+    // test-web.sh counts this line; the address only at debug
+    info!("session established over the TCP fallback");
+    debug!(peer = %label, "tunnel opened");
 
     let SessionStart {
         mut handler,
@@ -257,7 +259,7 @@ where
         warn!(peer = %label, "control handler did not exit after EOF, aborting");
         handler.abort();
     }
-    info!(peer = %label, "session ended");
+    debug!(peer = %label, "session ended");
 }
 
 /// Client → server: control chunks into the handler's duplex, media packets
@@ -390,7 +392,7 @@ mod tests {
     use bytes::BytesMut;
 
     use voipc_protocol::codec::{
-        decode_server_msg, encode_client_msg, encode_server_msg, try_decode_frame, APP_VERSION,
+        decode_server_msg, encode_client_msg, encode_server_msg, try_decode_frame,
         PROTOCOL_VERSION,
     };
     use voipc_protocol::messages::{ClientMessage, ServerMessage};
@@ -472,11 +474,11 @@ mod tests {
             self.send(&[&[0x00], &encode_client_msg(msg).unwrap()]).await;
         }
 
-        async fn authenticate(&mut self, app_version: &str) {
+        async fn authenticate(&mut self, protocol_version: u32) {
             self.send_control(&ClientMessage::Authenticate {
                 username: "tunnel".into(),
-                protocol_version: PROTOCOL_VERSION,
-                app_version: app_version.into(),
+                protocol_version,
+                app_version: "1.0.0".into(),
                 identity_key: None,
                 prekey_bundle: None,
                 account: None,
@@ -540,7 +542,7 @@ mod tests {
         let state = test_state();
         let mut client = Client::connect(&state).await;
 
-        client.authenticate(APP_VERSION).await;
+        client.authenticate(PROTOCOL_VERSION).await;
         let session_id = match client.next_control().await {
             ServerMessage::Authenticated { session_id, .. } => session_id,
             other => panic!("unexpected reply: {other:?}"),
@@ -589,7 +591,7 @@ mod tests {
     async fn a_refused_login_hears_why_before_the_tunnel_closes() {
         let state = test_state();
         let mut client = Client::connect(&state).await;
-        client.authenticate("0.0.0").await;
+        client.authenticate(PROTOCOL_VERSION - 1).await;
         match client.next_control().await {
             ServerMessage::AuthError { reason } => assert!(reason.contains("version mismatch"), "{reason}"),
             other => panic!("unexpected reply: {other:?}"),
@@ -602,7 +604,7 @@ mod tests {
     async fn a_kick_reason_arrives_before_the_tunnel_closes() {
         let state = test_state();
         let mut client = Client::connect(&state).await;
-        client.authenticate(APP_VERSION).await;
+        client.authenticate(PROTOCOL_VERSION).await;
         let session_id = match client.next_control().await {
             ServerMessage::Authenticated { session_id, .. } => session_id,
             other => panic!("unexpected reply: {other:?}"),

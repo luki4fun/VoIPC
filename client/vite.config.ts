@@ -55,7 +55,13 @@ function buildStamp() {
     !pinned && head && git("status", "--porcelain", "--untracked-files=no");
   return {
     hash: head ? `${head}${dirty ? "+" : ""}` : "no-git",
-    time: new Date().toISOString(),
+    // SOURCE_DATE_EPOCH (the commit's time in CI) keeps the bundle
+    // reproducible; a local build stamps its own time.
+    time: new Date(
+      process.env.SOURCE_DATE_EPOCH
+        ? Number(process.env.SOURCE_DATE_EPOCH) * 1000
+        : Date.now(),
+    ).toISOString(),
   };
 }
 

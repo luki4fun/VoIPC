@@ -90,11 +90,19 @@ pub async fn connect_to_server(
 
     // QUIC and its control stream, or the TCP fallback when UDP does not get
     // through (every phase bounded, see transport.rs)
-    let crate::transport::Link {
-        mut conn,
-        mut control_send,
-        mut control_recv,
-    } = crate::transport::connect(&host, port, accept_invalid_certs).await?;
+    let (
+        crate::transport::Link {
+            mut conn,
+            mut control_send,
+            mut control_recv,
+        },
+        first_pin,
+    ) = crate::transport::connect(&host, port, accept_invalid_certs).await?;
+    // A self-signed server met for the first time: what was pinned, for the
+    // person to compare with the operator's `voipc-server cert fingerprint`
+    if let Some(fingerprint) = first_pin {
+        emit_server(&app_handle, &address, "tofu-pinned", serde_json::json!({ "fingerprint": fingerprint }));
+    }
 
     // Whatever arrives after the sign-in in the same read goes on to the
     // reader with the rest.
@@ -171,6 +179,10 @@ pub async fn connect_to_server(
                         ServerMessage::AuthError { reason } => {
                             return Err(format!("Authentication failed: {}", reason));
                         }
+                        ServerMessage::Refused { ref text, .. } => {
+                            note_refusal(&app_handle, &address, &msg);
+                            return Err(text.clone());
+                        }
                         ServerMessage::AuthStep(AuthStep::AccountRequired { .. }) => {
                             return Err(crate::account::ACCOUNT_REQUIRED.into());
                         }
@@ -188,10 +200,14 @@ pub async fn connect_to_server(
 
     // The Signal state is this connection's own from birth, so all it needs
     // now is to know who we are here.
-    signal
-        .lock()
-        .map_err(|e| e.to_string())?
-        .own_user_id = Some(user_id);
+    {
+        let mut sig = signal.lock().map_err(|e| e.to_string())?;
+        sig.own_user_id = Some(user_id);
+        // libsignal binds both parties' ids into every pairwise message
+        if let Some(stores) = sig.stores.as_mut() {
+            stores.own_user_id = user_id;
+        }
+    }
 
     // No playback stream yet: the mixer opens one when this connection takes
     // voice, and nothing here is audible before that.
@@ -795,6 +811,10 @@ fn parse_address(address: &str) -> Result<(String, u16), String> {
         if parts.len() != 2 {
             return Err("Invalid address format, expected host:port".into());
         }
+        // `::1:9987` would be host `::1`, port 9987 — or host `:`, port 1
+        if parts[1].contains(':') {
+            return Err("An IPv6 address needs brackets: [host]:port".into());
+        }
         (parts[1].to_string(), parts[0])
     };
     let port: u16 = port_str
@@ -908,6 +928,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     transmitting: Arc<AtomicBool>,
     account: Option<Arc<crate::account::AccountLink>>,
 ) {
+    let mut inbound = Inbound::new(std::time::Instant::now());
     'read: loop {
         match read_half.read_buf(&mut buf).await {
             Ok(0) => {
@@ -936,6 +957,16 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
         loop {
             match try_decode_frame(&mut buf) {
                 Ok(Some(payload)) => match decode_server_msg(&payload) {
+                    Ok(_) if !inbound.take(std::time::Instant::now()) => {
+                        warn!("server sent more than the inbound budget; disconnecting");
+                        emit_server(
+                            &app_handle,
+                            &server,
+                            "connection-lost",
+                            serde_json::json!({"reason": "This server is flooding the app"}),
+                        );
+                        break 'read;
+                    }
                     Ok(msg) => {
                         handle_server_message(
                             msg,
@@ -986,6 +1017,39 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     info!("control reader task ended");
 }
 
+/// Control messages a server may send per second, sustained, and in one
+/// burst. A real relay sends a few dozen a second at its busiest (a big
+/// channel's join churn, a kept-log catch-up). Nearly every message becomes an
+/// event on the webview's one thread, so a relay that sends them at line rate
+/// freezes the window — Disconnect button included — while the call on another
+/// server plays on. It is cut off instead (H4-21).
+const INBOUND_PER_SEC: f64 = 1000.0;
+const INBOUND_BURST: f64 = 5000.0;
+
+/// A token bucket over one connection's control messages.
+struct Inbound {
+    tokens: f64,
+    at: std::time::Instant,
+}
+
+impl Inbound {
+    fn new(now: std::time::Instant) -> Self {
+        Self { tokens: INBOUND_BURST, at: now }
+    }
+
+    /// Take one message; false once the server has outrun the budget.
+    fn take(&mut self, now: std::time::Instant) -> bool {
+        let refill = now.saturating_duration_since(self.at).as_secs_f64() * INBOUND_PER_SEC;
+        self.tokens = (self.tokens + refill).min(INBOUND_BURST);
+        self.at = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
 /// Replace the cached channel list.
 fn set_channels(cache: &Arc<std::sync::Mutex<Vec<ChannelInfo>>>, channels: Vec<ChannelInfo>) {
     if let Ok(mut list) = cache.lock() {
@@ -1029,11 +1093,11 @@ fn on_channel_changed(
     // game drives has `sdk_channel` set. When voice moves to another server,
     // `claim_voice` disarms the old one on the spot, so its leave arriving
     // later finds nothing driven here and cannot detach a hello made since.
-    if was_driven {
-        app_handle
-            .state::<AppState>()
-            .sdk_event(crate::app_state::SdkEvent::Detached);
-    }
+    app_handle.state::<AppState>().sdk_event(if was_driven {
+        crate::app_state::SdkEvent::Detached
+    } else {
+        crate::app_state::SdkEvent::Moved
+    });
     apply_channel_proximity(spatial, cache, channel_id, app_handle, server, is_voice);
 }
 
@@ -1137,6 +1201,25 @@ fn apply_channel_proximity(
     }
 }
 
+/// A refused connection's facts, for the "update" panel: which version the
+/// server runs and which one we do (`update-needed`).
+pub(crate) fn note_refusal(app: &tauri::AppHandle, server: &str, msg: &ServerMessage) {
+    if let ServerMessage::Refused { code, server_protocol, server_version, .. } = msg {
+        emit_server(
+            app,
+            server,
+            "update-needed",
+            serde_json::json!({
+                "code": code,
+                "server_protocol": server_protocol,
+                "server_version": server_version,
+                "our_protocol": PROTOCOL_VERSION,
+                "our_version": APP_VERSION,
+            }),
+        );
+    }
+}
+
 /// Signal stores for `identity` with a fresh signed pre-key and one-time
 /// pre-keys, kept in `signal`, and the bundle the server hands to peers.
 pub(crate) fn init_signal(
@@ -1145,60 +1228,11 @@ pub(crate) fn init_signal(
 ) -> Result<PreKeyBundleData, String> {
     let mut signal = signal.lock().map_err(|e| e.to_string())?;
     info!("initializing Signal Protocol state");
-    let registration_id: u32 = rand::Rng::gen(&mut rand::thread_rng());
+    let registration_id: u32 = rand::random();
     let mut stores = voipc_crypto::SignalStores::new(identity_key_pair, registration_id);
-
-    // Generate prekeys synchronously (libsignal stores are !Send)
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(voipc_crypto::prekey::generate_prekeys(
-            &mut stores,
-            identity_key_pair,
-            1,
-            voipc_crypto::prekey::INITIAL_PREKEY_COUNT,
-        ))
-    })
-    .map_err(|e| format!("failed to generate prekeys: {e}"))?;
-
-    let ik_bytes = stores.identity.key_pair.public_key.clone();
-
-    // Extract signed prekey from the store
-    let signed_prekey_data = tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            use libsignal_protocol::{GenericSignedPreKey, SignedPreKeyId, SignedPreKeyStore};
-            let record = stores.signed_prekey.get_signed_pre_key(SignedPreKeyId::from(1u32)).await.ok()?;
-            let pub_key = record.public_key().ok()?.serialize().to_vec();
-            let signature = record.signature().ok()?.to_vec();
-            Some((pub_key, signature))
-        })
-    });
-
-    let (spk_public, spk_signature) = match signed_prekey_data {
-        Some(data) => data,
-        None => {
-            warn!("failed to extract signed prekey — bundle will have empty signed prekey");
-            (Vec::new(), Vec::new())
-        }
-    };
-
-    // Extract one-time prekeys from the store
-    let mut one_time_prekeys = Vec::new();
-    for (&id, bytes) in &stores.prekey.prekeys {
-        if let Ok(record) = libsignal_protocol::PreKeyRecord::deserialize(bytes) {
-            if let Ok(pub_key) = record.public_key() {
-                one_time_prekeys.push(OneTimePreKey { id, public_key: pub_key.serialize().to_vec() });
-            }
-        }
-    }
-
-    let bundle = PreKeyBundleData {
-        registration_id: stores.identity.registration_id,
-        device_id: 1,
-        identity_key: ik_bytes,
-        signed_prekey_id: 1,
-        signed_prekey: spk_public,
-        signed_prekey_signature: spk_signature,
-        prekeys: one_time_prekeys,
-    };
+    voipc_crypto::prekey::generate_prekeys(&mut stores, identity_key_pair)
+        .map_err(|e| format!("failed to generate prekeys: {e}"))?;
+    let bundle = voipc_crypto::prekey::bundle(&stores).map_err(|e| format!("failed to read the pre-key bundle: {e}"))?;
     signal.stores = Some(stores);
     signal.initialized = true;
     info!("Signal Protocol state initialized");
@@ -1242,7 +1276,8 @@ async fn handle_server_message(
         _ => &[],
     };
     if let Some(link) = account {
-        link.session().note_roster(seen);
+        let a = link.session().note_roster(seen);
+        crate::account::run(app_handle, server, tcp_tx, a).await;
     }
     match msg {
         ServerMessage::VideoLossReported {
@@ -1464,6 +1499,11 @@ async fn handle_server_message(
                 // backend take voice on it too, and all three have to agree on
                 // where the call is.
                 claim_voice(app_handle, server, is_voice).await;
+                // A game the user walked away from may be waiting for them
+                // here (sdk.rs `returned`)
+                app_handle
+                    .state::<AppState>()
+                    .sdk_event(crate::app_state::SdkEvent::Moved);
             }
 
             // Auto-request prekey bundles for users we don't have sessions with.
@@ -1586,6 +1626,21 @@ async fn handle_server_message(
                         // chain key they hold must stop working, so our next
                         // message there starts a new one (rotate_sender_key_if_stale).
                         sig.channels.note_stale(channel_id);
+                    }
+                }
+                // Out of the channel's log too: the relay took us out of it
+                // (1.0, D10), and a rejoin keeps it again
+                if user_id == own_user_id {
+                    if let Some(link) = account {
+                        let log = channels_snapshot
+                            .lock()
+                            .ok()
+                            .and_then(|c| c.iter().find(|ch| ch.channel_id == channel_id).map(|ch| ch.log.clone()))
+                            .unwrap_or_default();
+                        if !log.is_empty() {
+                            let a = link.session().leave(&log, false);
+                            crate::account::run(app_handle, server, tcp_tx, a).await;
+                        }
                     }
                 }
                 emit_server(
@@ -1960,6 +2015,7 @@ async fn handle_server_message(
                 media_key,
                 tcp_tx,
                 channel_id_store,
+                (app_handle, server),
             )
             .await;
         }
@@ -1968,6 +2024,23 @@ async fn handle_server_message(
             // Remove from pending so we don't loop
             let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
             sig.pending_sessions.remove(&user_id);
+        }
+        ServerMessage::PreKeysLow { .. } => {
+            // The relay has handed out most of our one-time pre-keys
+            let more = {
+                let mut sig = signal.lock().unwrap_or_else(|p| { warn!("mutex poisoned, recovering"); p.into_inner() });
+                sig.stores.as_mut().map(|s| voipc_crypto::prekey::more_prekeys(s, voipc_crypto::prekey::PREKEY_REFILL_COUNT))
+            };
+            match more {
+                Some(Ok(prekeys)) => match encode_client_msg(&ClientMessage::UploadPreKeys { prekeys }) {
+                    Ok(data) => {
+                        let _ = tcp_tx.send(data);
+                    }
+                    Err(e) => warn!("could not encode the pre-key refill: {e}"),
+                },
+                Some(Err(e)) => warn!("could not make more pre-keys: {e}"),
+                None => {}
+            }
         }
         ServerMessage::DirectMessageUndelivered { target_user_id } => {
             // Between two accounts with cloud copies on, it went into the stored
@@ -2051,6 +2124,7 @@ async fn handle_server_message(
                 signal,
                 media_key,
                 tcp_tx,
+                (app_handle, server),
             )
             .await;
         }
@@ -2133,7 +2207,7 @@ async fn handle_server_message(
             Some(link) => crate::account::on_reply(app_handle, server, link, tcp_tx, reply).await,
             None => debug!("account reply on a guest connection, ignoring"),
         },
-        ServerMessage::Authenticated { .. } | ServerMessage::AuthError { .. } | ServerMessage::AuthStep(_) => {}
+        ServerMessage::Authenticated { .. } | ServerMessage::AuthError { .. } | ServerMessage::AuthStep(_) | ServerMessage::Refused { .. } => {}
     }
 }
 
@@ -2266,14 +2340,8 @@ async fn handle_prekey_bundle(
     media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
     tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
     channel_id_store: &Arc<AtomicU32>,
+    ui: (&tauri::AppHandle, &str),
 ) {
-    // Extract one-time prekey if available
-    let (otp_id, otp_bytes): (Option<u32>, Option<Vec<u8>>) = if let Some(otp) = bundle.prekeys.first() {
-        (Some(otp.id), Some(otp.public_key.clone()))
-    } else {
-        (None, None)
-    };
-
     // Establish the pairwise session using block_in_place for !Send futures
     let session_result = tokio::task::block_in_place(|| {
         let mut sig = signal.lock().map_err(|e| format!("signal lock: {e}"))?;
@@ -2282,19 +2350,9 @@ async fn handle_prekey_bundle(
             .as_mut()
             .ok_or_else(|| "Signal not initialized".to_string())?;
 
-        tokio::runtime::Handle::current().block_on(voipc_crypto::session::establish_session(
-            stores,
-            remote_user_id,
-            bundle.registration_id,
-            bundle.device_id,
-            &bundle.identity_key,
-            bundle.signed_prekey_id,
-            &bundle.signed_prekey,
-            &bundle.signed_prekey_signature,
-            otp_id,
-            otp_bytes.as_deref(),
-        ))
-        .map_err(|e| format!("establish_session failed: {e}"))
+        tokio::runtime::Handle::current()
+            .block_on(voipc_crypto::session::establish_session(stores, remote_user_id, bundle))
+            .map_err(|e| format!("establish_session failed: {e}"))
     });
 
     match session_result {
@@ -2307,7 +2365,7 @@ async fn handle_prekey_bundle(
             }
 
             // Drain any pending direct messages for this user
-            drain_pending_dms(remote_user_id, signal, tcp_tx).await;
+            drain_pending_dms(remote_user_id, signal, tcp_tx, ui).await;
 
             // Distribute our sender key (and the channel media key) for the
             // channel we stand in and for every text channel we are in — the
@@ -2675,6 +2733,7 @@ async fn handle_sender_key_received(
     signal: &Arc<std::sync::Mutex<SignalState>>,
     media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
     tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    ui: (&tauri::AppHandle, &str),
 ) {
     // The mirror of the check `send_sender_key` makes outbound. The server
     // relays a distribution only between two members — but the server is the
@@ -2758,7 +2817,7 @@ async fn handle_sender_key_received(
             }
 
             // Drain any pending channel messages now that we have sender keys
-            drain_pending_channel_messages(channel_id, own_user_id, signal, tcp_tx).await;
+            drain_pending_channel_messages(channel_id, own_user_id, signal, tcp_tx, ui).await;
 
             // A member whose sender key arrives holds a pairwise session with
             // us (they just used it), so this is the moment to ask them for
@@ -2790,6 +2849,7 @@ async fn drain_pending_dms(
     target_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
     tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    (app_handle, server): (&tauri::AppHandle, &str),
 ) {
     // Extract pending DMs for this target, each with the id it was shown under
     // and the destruction timer it was written under
@@ -2813,6 +2873,13 @@ async fn drain_pending_dms(
         }
         if expired > 0 {
             warn!(target_user_id, expired, "dropped expired pending DMs");
+            // Shown as sent when it was typed; say that it was not (H4-10)
+            emit_server(
+                app_handle,
+                server,
+                "dm-undelivered",
+                serde_json::json!({"user_id": target_user_id, "expired": expired}),
+            );
         }
         sig.pending_messages = remaining;
         to_send
@@ -2858,6 +2925,7 @@ async fn drain_pending_channel_messages(
     own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
     tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    (app_handle, server): (&tauri::AppHandle, &str),
 ) {
     // Extract pending channel messages, each with the id it was shown under and
     // the destruction timer it was written under
@@ -2880,6 +2948,12 @@ async fn drain_pending_channel_messages(
         }
         if expired > 0 {
             warn!(channel_id, expired, "dropped expired pending channel messages");
+            emit_server(
+                app_handle,
+                server,
+                "channel-undelivered",
+                serde_json::json!({"channel_id": channel_id, "expired": expired}),
+            );
         }
         sig.pending_messages = remaining;
         to_send
@@ -3135,6 +3209,9 @@ struct MixSource {
     /// Grown on demand: a chain carries about 22 kB of delay line, so nobody
     /// who is heard once pays for the three they are not.
     layers: Vec<LayerMix>,
+    /// The frame a surplus shed dropped after the one it kept, to be faded
+    /// into the frame that follows (H3-10).
+    shed: Option<Vec<f32>>,
 }
 
 impl MixSource {
@@ -3146,6 +3223,7 @@ impl MixSource {
             last_activity: std::time::Instant::now(),
             chain: voipc_audio::mixer::SourceChain::default(),
             layers: Vec::new(),
+            shed: None,
         })
     }
 }
@@ -3343,10 +3421,13 @@ async fn voice_mixer_task(
     // each carrying its own interpolation state
     let mut out_rate = 48_000;
     let mut resampler: Option<(
-        voipc_audio::resample::LinearResampler,
-        voipc_audio::resample::LinearResampler,
+        voipc_audio::resample::Resampler,
+        voipc_audio::resample::Resampler,
     )> = None;
     let mut last_restart_attempt: Option<std::time::Instant> = None;
+    let mut limiter = voipc_audio::mixer::Limiter::default();
+    #[cfg(not(target_os = "android"))]
+    let echo_reference = app_handle.state::<AppState>().echo_reference.clone();
     // Frames pushed since this connection stopped being audible
     let mut idle_frames = 0usize;
     let mut error_emitted = false;
@@ -3456,8 +3537,8 @@ async fn voice_mixer_task(
                         out_rate = stream.sample_rate();
                         resampler = (out_rate != 48_000).then(|| {
                             (
-                                voipc_audio::resample::LinearResampler::new(48_000, out_rate),
-                                voipc_audio::resample::LinearResampler::new(48_000, out_rate),
+                                voipc_audio::resample::Resampler::new(48_000, out_rate),
+                                voipc_audio::resample::Resampler::new(48_000, out_rate),
                             )
                         });
                         _playback_stream = Some(stream);
@@ -3514,7 +3595,6 @@ async fn voice_mixer_task(
 
         stereo.clear();
         stereo.resize(voipc_protocol::voice::OPUS_FRAME_SIZE * 2, 0.0);
-        let mut mixed_any = false;
         // Rebuilt from scratch each frame: an entry left behind by a pruned
         // source would light a meter for somebody who is no longer here.
         let mut levels: Vec<(u32, f32)> = Vec::new();
@@ -3577,15 +3657,14 @@ async fn voice_mixer_task(
                     // Nothing to play: a radio closes its squelch, at once on
                     // an end-of-transmission and after a pause otherwise
                     None => {
+                        src.shed = None; // nothing follows it now
                         let mut nothing: [f32; 0] = [];
                         let out: &mut [f32] = if deafened { &mut nothing } else { &mut stereo };
-                        if src.chain.stop(out, fx, drained, water, reverb) {
-                            mixed_any = true;
-                        }
+                        src.chain.stop(out, fx, drained, water, reverb);
                         // A delayed layer still owes what is in its line: the
                         // radio double outlives the voice that caused it.
                         let vol = volumes.get(&user_id).copied().unwrap_or(1.0) * master;
-                        mixed_any |= mix_layers(
+                        mix_layers(
                             &mut src.layers,
                             sp.layers_for(user_id),
                             &sp,
@@ -3611,14 +3690,23 @@ async fn voice_mixer_task(
                         continue;
                     }
                 };
+                if let Some(dropped) = src.shed.take() {
+                    voipc_audio::mixer::crossfade_into(&dropped, &mut pcm);
+                }
                 // A stream that never pauses has no reset to lose latency at,
                 // so a standing surplus is shed here instead. Both frames are
-                // decoded so Opus runs on, and the cut lands on the quieter one.
+                // decoded so Opus runs on, and the cut lands on the quieter
+                // one — faded from the frame that would have played, so the
+                // joint does not click: at once when the second frame is
+                // kept, at the start of the next one when the first is.
                 if jitter.take_surplus() {
-                    if let Some(Ok(next)) = jitter.pop().map(|f| decode(jitter, decoder, f)) {
+                    if let Some(Ok(mut next)) = jitter.pop().map(|f| decode(jitter, decoder, f)) {
                         let energy = |pcm: &[f32]| pcm.iter().map(|s| s * s).sum::<f32>();
                         if energy(&next) > energy(&pcm) {
+                            voipc_audio::mixer::crossfade_into(&pcm, &mut next);
                             pcm = next;
+                        } else {
+                            src.shed = Some(next);
                         }
                     }
                 }
@@ -3663,7 +3751,6 @@ async fn voice_mixer_task(
                 if !is_screen_audio {
                     levels.push((user_id, src.chain.mix.level));
                 }
-                mixed_any = true;
             }
         }
 
@@ -3700,7 +3787,6 @@ async fn voice_mixer_task(
                     target,
                     lp_a,
                 );
-                mixed_any = true;
                 test_finished = test.stopping;
             }
         }
@@ -3713,9 +3799,14 @@ async fn voice_mixer_task(
         // from, so letting it run dry between talk bursts throws the cushion
         // away and re-rolls the underrun phase at every burst start — and in
         // this pull model an unfed ring never reports room, so the loop would
-        // spin. `mixed_any` only says whether anything needed clamping.
-        if mixed_any {
-            voipc_audio::mixer::clamp(&mut stereo);
+        // spin. The limiter runs on quiet frames too, so its release carries
+        // on between bursts.
+        limiter.process(&mut stereo, 2);
+        // …and exactly this is what the microphone's echo canceller takes out,
+        // from the mixer that is feeding a device: every connection runs one
+        #[cfg(not(target_os = "android"))]
+        if producer.is_some() {
+            echo_reference.push_stereo(&stereo);
         }
 
         if let Some(p) = producer.as_mut() {
@@ -3780,6 +3871,7 @@ fn send_position_parts(
     let aad = voipc_crypto::build_aad(
         channel_id.load(Ordering::Relaxed),
         VoicePacketType::Position as u8,
+        session_id,
     );
     let payload = PositionPayload {
         x: pos[0],
@@ -4147,7 +4239,7 @@ async fn datagram_receiver_task(
                                 poisoned.into_inner()
                             });
                             if let Some(key) = key_guard.get(ch_id, key_id) {
-                                let aad = voipc_crypto::build_aad(ch_id, 0x05);
+                                let aad = voipc_crypto::build_aad(ch_id, 0x05, session_id);
                                 match voipc_crypto::media_decrypt(
                                     key,
                                     stream_id,
@@ -4259,6 +4351,7 @@ async fn datagram_receiver_task(
                             let aad = voipc_crypto::build_aad(
                                 ch_id,
                                 VoicePacketType::Position as u8,
+                                session_id,
                             );
                             match voipc_crypto::media_decrypt(
                                 key,
@@ -4361,7 +4454,7 @@ async fn datagram_receiver_task(
                             });
                             let ch_id = channel_id.load(Ordering::Relaxed);
                             if let Some(key) = key_guard.get(ch_id, packet.key_id) {
-                                let aad = voipc_crypto::build_aad(ch_id, 0x15);
+                                let aad = voipc_crypto::build_aad(ch_id, 0x15, packet.session_id);
                                 match voipc_crypto::media_decrypt(
                                     key,
                                     packet.stream_id,
@@ -4532,7 +4625,7 @@ async fn video_stream_receiver_task(
                 });
                 let ch_id = channel_id.load(Ordering::Relaxed);
                 if let Some(key) = key_guard.get(ch_id, packet.key_id) {
-                    let aad = voipc_crypto::build_aad(ch_id, packet_type);
+                    let aad = voipc_crypto::build_aad(ch_id, packet_type, packet.session_id);
                     match voipc_crypto::media_decrypt(
                         key,
                         packet.stream_id,
@@ -4625,6 +4718,9 @@ async fn video_stream_receiver_task(
     }
 }
 
+/// The most frames decoded between two renders (about 130 ms at 60 fps).
+const MAX_DECODE_BATCH: usize = 8;
+
 /// Video decode + render task: runs on a blocking thread to avoid stalling
 /// the media receivers. Decodes ALL frames to maintain codec state, but only
 /// JPEG-encodes and emits the most recent frame (frame skipping).
@@ -4709,7 +4805,9 @@ fn video_decode_render_task(
         // kept for rendering.
         let mut latest_decoded = Vec::new();
         let mut next = Some(first);
+        let mut batch = 0;
         while let Some((frame_data, is_keyframe, gap_before)) = next {
+            batch += 1;
             let decoded = dec.decode(&frame_data);
             if let Err(e) = &decoded {
                 warn!("{want_codec:?} decode error: {}", e);
@@ -4722,13 +4820,16 @@ fn video_decode_render_task(
             if let Ok(d) = decoded {
                 latest_decoded = d;
             }
-            next = decode_rx.try_recv().ok();
+            // Show a picture every few frames even when the stream outruns
+            // the decoder: draining "everything queued" never ends then, and
+            // the viewer stays on "Waiting for video stream" for good
+            next = if batch < MAX_DECODE_BATCH { decode_rx.try_recv().ok() } else { None };
         }
         needs_keyframe.store(suppress_render, Ordering::Release);
 
         // JPEG-encode and emit only if not suppressed
         if !suppress_render {
-            for df in &latest_decoded {
+            for df in &mut latest_decoded {
                 let packed = (df.width << 16) | df.height;
                 screen_video_resolution.store(packed, Ordering::Relaxed);
                 screenshare::render_frame(df, &app_handle, &mut buffers);
@@ -4799,9 +4900,19 @@ pub fn spawn_capture_encode_task(
 
         let frame_size = encoder.frame_size(); // 960 samples
         let mut pcm_buf = vec![0.0f32; frame_size];
+        let mut mic_limiter = voipc_audio::mixer::Limiter::default();
+        // The echo canceller, fed with what the mixer plays from now on
+        #[cfg(not(target_os = "android"))]
+        let (mut echo, echo_reference) = {
+            let reference = app_handle.state::<AppState>().echo_reference.clone();
+            reference.clear();
+            (voipc_audio::echo::EchoCanceller::new(), reference)
+        };
         let mut accumulated: usize = 0;
         let mut stream_dead = false;
         let mut last_rebuild = std::time::Instant::now();
+        // Whether the UI was told the microphone is gone
+        let mut capture_error_said = false;
         // "Waiting for media key" UI warning, emitted once per gap
         let mut key_missing_since: Option<std::time::Instant> = None;
         let mut key_missing_emitted = false;
@@ -4824,13 +4935,12 @@ pub fn spawn_capture_encode_task(
 
         while transmitting.load(Ordering::Relaxed) {
             // Rebuild the capture stream if the device died (unplug etc.)
+            // Said only when the reopen fails, as for playback: Android
+            // disconnects the stream on every route change, the call's own
+            // mode switch included, and a reopen a moment later is no news.
             if capture_error.swap(false, Ordering::Relaxed) && !stream_dead {
                 stream_dead = true;
                 warn!("capture device error — attempting recovery");
-                let _ = app_handle.emit(
-                    "audio-device-error",
-                    serde_json::json!({"error": "capture device error"}),
-                );
             }
             if stream_dead {
                 if last_rebuild.elapsed() >= std::time::Duration::from_secs(1) {
@@ -4846,9 +4956,19 @@ pub fn spawn_capture_encode_task(
                             stream_dead = false;
                             accumulated = 0;
                             info!("capture stream restored");
-                            let _ = app_handle.emit("audio-device-restored", ());
+                            if std::mem::take(&mut capture_error_said) {
+                                let _ = app_handle.emit("audio-device-restored", ());
+                            }
                         }
-                        Err(e) => warn!("capture restart failed (retrying): {}", e),
+                        Err(e) => {
+                            warn!("capture restart failed (retrying): {}", e);
+                            if !std::mem::replace(&mut capture_error_said, true) {
+                                let _ = app_handle.emit(
+                                    "audio-device-error",
+                                    serde_json::json!({"error": "capture device error"}),
+                                );
+                            }
+                        }
                     }
                 }
                 if stream_dead {
@@ -4870,16 +4990,21 @@ pub fn spawn_capture_encode_task(
                 continue;
             }
 
+            // The speakers' echo out first: RNNoise is non-linear, and after it
+            // the echo is no longer the reference passed through a room
+            #[cfg(not(target_os = "android"))]
+            echo.process(&echo_reference, &mut pcm_buf);
+
             // Apply noise suppression before VAD and encoding
             denoiser.set_enabled(noise_suppression.load(Ordering::Relaxed));
-            denoiser.process(&mut pcm_buf);
+            let voice = denoiser.process(&mut pcm_buf);
 
             // Update VAD threshold from shared state (user may adjust in real-time)
             let threshold = vad_threshold_db.load(Ordering::Relaxed) as f32;
             vad.set_threshold_db(threshold);
 
             // Run VAD to compute audio level (always, for the UI meter)
-            let voice_detected = vad.process(&pcm_buf);
+            let voice_detected = vad.process(&pcm_buf, voice);
 
             // Store current level for UI (×100 for fixed-point precision)
             let level_fixed = (vad.current_level_db() * 100.0) as i32;
@@ -4959,6 +5084,9 @@ pub fn spawn_capture_encode_task(
             // restarts within a session: a restart would reuse AES-GCM
             // nonces under the channel key and desync receivers' jitter
             // buffers when the EndOfTransmission packet is lost.
+            // The input gain is not clamped any more (it would square the
+            // peaks before RNNoise, H3-09): the limit is here, last
+            mic_limiter.process(&mut pcm_buf, 1);
             let sequence = voice_sequence.fetch_add(1, Ordering::Relaxed);
             match encoder.encode(&pcm_buf) {
                 Ok(opus_data) => {
@@ -4972,7 +5100,7 @@ pub fn spawn_capture_encode_task(
                             key_missing_since = None;
                             key_missing_emitted = false;
                             let ch_id = channel_id.load(Ordering::Relaxed);
-                            let aad = voipc_crypto::build_aad(ch_id, 0x05);
+                            let aad = voipc_crypto::build_aad(ch_id, 0x05, session_id);
                             match voipc_crypto::media_encrypt(
                                 key, stream_id, sequence, 0, &aad, &opus_data,
                             ) {
@@ -5038,6 +5166,41 @@ pub fn spawn_capture_encode_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_address_is_split_only_where_it_is_unambiguous() {
+        assert_eq!(parse_address("example.com:9987"), Ok(("example.com".into(), 9987)));
+        assert_eq!(parse_address("[::1]:9000"), Ok(("::1".into(), 9000)));
+        // H5-09: this was host ":" and port 1
+        assert!(parse_address("::1").is_err());
+        assert!(parse_address("::1:9987").is_err());
+        assert!(parse_address("example.com").is_err(), "the port is required here");
+        assert!(parse_address(":9987").is_err());
+    }
+
+    #[test]
+    fn a_flooding_server_runs_out_of_budget_and_an_honest_one_never_does() {
+        let t0 = std::time::Instant::now();
+        let mut inbound = Inbound::new(t0);
+        // A burst the size of the bucket goes through at once…
+        for _ in 0..INBOUND_BURST as usize {
+            assert!(inbound.take(t0));
+        }
+        // …and the next message in the same instant is over
+        assert!(!inbound.take(t0), "a line-rate flood was never cut off");
+        // A second later there is a second's worth again
+        let t1 = t0 + std::time::Duration::from_secs(1);
+        for _ in 0..INBOUND_PER_SEC as usize {
+            assert!(inbound.take(t1));
+        }
+        assert!(!inbound.take(t1));
+        // A busy relay at a tenth of the rate, for a minute, is never refused
+        let mut honest = Inbound::new(t0);
+        for i in 0..6000u64 {
+            let at = t0 + std::time::Duration::from_millis(i * 10);
+            assert!(honest.take(at), "an honest relay was cut off at message {i}");
+        }
+    }
 
     /// The pacer is what keeps an honest client's busy connect — a pre-key
     /// bundle per person, then a sender key per person per channel — from

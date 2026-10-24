@@ -157,7 +157,7 @@ No accounts required. No telemetry. No compromises.
 - Auto-reconnect keeps trying for 5 minutes (laptop sleep, server restart)
 - UDP blocked on the way? With the server's TCP fallback on, the session moves to TCP by itself (the status bar says **· TCP**); without it, the connect fails with an error that says so instead of a silent mute
 - Screen share adapts bitrate and frame rate to what the link carries (viewers report loss, the sharer steps down)
-- Server admin session (without accounts): log in with the server's admin token (status bar shield) to kick users from any channel or from the server and to IP-ban them for 1 h, 24 h or until restart; bans are memory-only and listed with an Unban button. With accounts, admin and moderator are roles of accounts ([docs/ACCOUNTS.md](docs/ACCOUNTS.md))
+- Server admin session (without accounts): log in with the server's admin token (status bar shield) to kick users from any channel or from the server and to ban them for 1 h, 24 h or for good; bans outlast a restart and are listed with an Unban button. With accounts, admin and moderator are roles of accounts ([docs/ACCOUNTS.md](docs/ACCOUNTS.md))
 
 **Platform Support**
 
@@ -190,24 +190,24 @@ is broken, [Bugzilla 1918769](https://bugzilla.mozilla.org/show_bug.cgi?id=19187
 
 ## Security
 
-VoIPC encrypts everything at multiple layers. The server acts as a blind relay — it forwards encrypted packets without ever being able to read them.
+VoIPC encrypts everything at multiple layers. The server acts as a blind relay — it forwards encrypted packets without ever being able to read them. [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) lists what a relay, a channel member, someone with your disk and a hostile page can and cannot do, and which code and tests hold each part.
 
 ### Layer 1: Transport — TLS on every connection
 
-All control traffic is encrypted with TLS 1.3 via **rustls** (pure-Rust, no OpenSSL). For self-signed server certs, the client pins the certificate fingerprint per `host:port` on first connect via **TOFU** (`TofuCertVerifier`) and aborts the handshake if it ever changes. If a server legitimately replaced its certificate, the connect dialog offers *Forget pinned certificate*; the next connect pins the new one. Plaintext connections are never accepted.
+All control traffic is encrypted with TLS 1.3 via **rustls** (pure-Rust, no OpenSSL). For self-signed server certs, the client pins the certificate fingerprint per `host:port` on first connect via **TOFU** (`TofuCertVerifier`) and aborts the handshake if it ever changes. If a server legitimately replaced its certificate, the connect dialog offers *Forget pinned certificate*; the next connect pins the new one. The first connection to a self-signed server is trusted blindly: the app shows the fingerprint it pinned, to compare with what `voipc-server cert fingerprint` prints on the server. Plaintext connections are never accepted.
 
 ### Layer 2: End-to-End Messages — Signal Protocol
 
 Chat messages (channel and DM) use the **Signal Protocol** from the official [libsignal](https://github.com/signalapp/libsignal) crate by Signal Foundation:
 
-- **X3DH** (Extended Triple Diffie-Hellman) for session establishment
-- **Double Ratchet** algorithm — new key for every message
-- **Curve25519** identity keys (32-byte) with Ed25519 signed pre-keys
-- **100 one-time pre-keys** per user, auto-replenished
+- **PQXDH** (X25519 + ML-KEM-1024) for session establishment, so a session recorded today stays closed to a quantum computer later
+- **Double Ratchet** together with **SPQR**, Signal's post-quantum ratchet — new key for every message
+- **Curve25519** identity keys; pre-keys are signed with XEdDSA
+- **100 one-time pre-keys** per connection plus a signed ML-KEM last-resort key; the server asks for 50 more when it is down to 10, and a replayed session start on the last-resort key is refused
 - **Sender Keys** for efficient group/channel message encryption
 - **Perfect Forward Secrecy** — a compromised key cannot decrypt past messages. Copies kept on a server with accounts are the exception: they have no forward secrecy (see *Data Transparency*). For channel chat the matching guarantee runs the other way and is what key rotation is for: a chain key stolen today would read *future* messages, so leaving a channel starts a new chain
 - **Ephemeral identities by design** — for a guest, a fresh identity key pair is generated for every connection and never written to disk. A guest has no account and nothing to fingerprint or link across sessions. The trade-off is explicit: pre-key bundles come from the server, so protection against an *actively malicious* server substituting keys during session setup is not a goal for guests; protection against a passive or compromised-at-rest server is.
-- **Lasting identities for accounts** (opt-in per server, see [docs/ACCOUNTS.md](docs/ACCOUNTS.md)) — an account keeps one identity key in its encrypted vault, and the people it talks to pin it the first time they see it. A changed key is announced instead of accepted silently, and *Verify identity* in a member's menu shows a safety number the two of you can compare in person: if it matches, nobody stands between you, not even the server.
+- **Lasting identities for accounts** (opt-in per server, see [docs/ACCOUNTS.md](docs/ACCOUNTS.md)) — an account keeps one identity key in its encrypted vault, and the people it talks to pin it the first time they see it. A changed key, a known name under another account, or a known account shown as a guest is announced instead of accepted silently. The server can still meet you first, and it can hand a device an old copy of the pins, or none: the app warns when it notices, which it does on a device that has seen them before. *Verify identity* in a member's menu shows a safety number the two of you can compare in person: if it matches, nobody stands between you, not even the server.
 
 ### Layer 3: Media — AES-256-GCM on every packet
 
@@ -216,8 +216,8 @@ All voice, video, and screen share audio is encrypted with **AES-256-GCM** (via 
 - Per-channel 256-bit symmetric key, randomly generated
 - Deterministic nonce: `stream_id(4) || sequence(4) || type+fragment(4)` — prevents reuse by construction; domain-separated per stream type (voice / screen audio / video). `stream_id` is four random bytes the **sender** picks for itself on joining, carried in the packet header. Two members of a channel encrypt under the same key, so it is what keeps them off each other's nonces — and it is chosen by the client rather than the server, because a server that handed two speakers the same identifier would otherwise get the XOR of their voices
 - 16-byte authentication tag on every packet — detects tampering
-- AAD (Additional Authenticated Data) binds channel_id + packet_type — blocks cross-channel replay
-- Mandatory key rotation after ~4.3 billion packets
+- AAD (Additional Authenticated Data) binds channel_id + packet_type + the sender's session id — blocks cross-channel replay, and a relay rewriting the header cannot make one member's voice play as another's
+- A sender stops after 2³²−1000 packets on one connection (years of speech) rather than reuse a nonce
 - Media keys are generated by the first member of a channel and handed to each joiner over the pairwise Signal session; the server relays the encrypted blob and never holds a media key
 - **Rotated when somebody leaves**, so the key does not outlive the membership it was given for: the lowest remaining user id mints the next generation and hands it to the others, with no coordination and nobody elected by the server. The generation before stays usable for a moment, so packets already in flight are not an audible gap — which is also the window in which a member who just left can still read what was sent under the old key. Generations are a counter that wraps rather than a number that runs out, so no member can send the last one on the way out and freeze the channel on the key they are walking away with
 - **Taken only from a member of the channel it names**, and only for the room the client is standing in. A media key is the key the microphone encrypts under, so a key offered by somebody the roster does not put in the channel is refused before it is even opened
@@ -227,17 +227,18 @@ All voice, video, and screen share audio is encrypted with **AES-256-GCM** (via 
 
 Client-side data at rest:
 
-- Chat history encrypted with **PBKDF2-HMAC-SHA256** (600,000 iterations) + **AES-256-GCM**
-- 32-byte random salt + 12-byte random nonce per file
+- The desktop keeps chat history, remembered devices and how far it read the server's copies in one file encrypted with your history password: **PBKDF2-HMAC-SHA256** (600,000 iterations) + **AES-256-GCM**
+- 32-byte random salt + 12-byte random nonce per file; the data folder is readable by your user only, and the settings, the certificate pins and the history file are written 0600 (on Linux and Android)
+- The browser keeps remembered devices sealed under a key it cannot export (IndexedDB), and read positions in plain localStorage
 - Signal session state is never stored. A guest's identity is not stored either (see *Ephemeral identities* above); an account's identity key lives in its encrypted vault on the server, and a remembered device keeps the key to that vault
-- All secrets wrapped in `Zeroizing<T>` — memory-zeroized on drop
+- Most key material is wiped from memory when it is dropped (`Zeroizing<T>`); not every copy is (a channel's media key, values that pass through the browser's JavaScript)
 
 ### Layer 5: Zero-Knowledge Server
 
 - Server **never** sees plaintext messages (encrypted client-side)
 - Server **never** stores readable chat history — without accounts nothing at all, with accounts only the encrypted copies members choose (see *Data Transparency*)
 - Server **never** decodes voice/video (SFU architecture — relays encrypted packets)
-- Server **never** logs conversations (without accounts: memory-only state, restart = clean slate)
+- Server **never** logs conversations (without accounts: memory-only state, restart = clean slate, except the bans an admin made). At its default log level it writes no addresses or names; `debug` does
 
 ### What the comparison looks like
 
@@ -308,7 +309,7 @@ Client-side data at rest:
 | Max voice packet | 512 bytes |
 | Max video packet | 1,280 bytes |
 | Max control message | 64 KiB |
-| Protocol version | v11 |
+| Protocol version | v12 (client and relay must match; [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)) |
 | Default port | 9987 — UDP for QUIC (all clients), TCP for the browser page and the TCP fallback |
 
 ### Project Structure
@@ -474,7 +475,7 @@ Because it reaches them that way, it is that member's word: a guest's identity i
 
 **Accounts (optional):** set `[accounts] mode = "optional"` (or `"required"`) in `server.toml` and the server keeps accounts in SQLite or Postgres: a name that is reserved, two-factor codes for admins and moderators on new devices, and — for members who choose it — encrypted copies of their messages, so what was written while they were away is there when they come back. Guests still work unless you say otherwise. Setup, the command line (`voipc-server admin invite`, `admin grant`, `admin revoke`, `admin reset-2fa`, `db backup`) and what the server learns are in [docs/ACCOUNTS.md](docs/ACCOUNTS.md).
 
-**Server administration:** without accounts, any connected user becomes admin for their session by entering the admin token (status bar → shield icon). With accounts, roles belong to accounts: admin and moderator. Moderators can kick, ban and change any channel's settings, but cannot kick or ban an admin or another moderator (though they can kick one out of a channel they created themselves), and only admins see the ban list. The admin token makes the first admin, once, then is refused on that server. Set `admin_token` in `server.toml`, pass `--admin-token`, or export `VOIPC_ADMIN_TOKEN`; without one the server prints a fresh random token in its log at every start (with accounts, only while no account is admin). Admins can kick users from channels or from the server and ban an IP for 1 h, 24 h or until restart — everyone behind that IP is affected, and bans live in memory only. Other users see a shield next to an admin's name. Three wrong tokens disconnect the session.
+**Server administration:** without accounts, any connected user becomes admin for their session by entering the admin token (status bar → shield icon). With accounts, roles belong to accounts: admin and moderator. Moderators can kick, ban and change any channel's settings, but cannot kick or ban an admin or another moderator (though they can kick one out of a channel they created themselves), and only admins see the ban list. The admin token makes the first admin, once, then is refused on that server. Set `admin_token` in `server.toml`, pass `--admin-token`, or export `VOIPC_ADMIN_TOKEN`; without one the server prints a fresh random token in its log at every start (with accounts, only while no account is admin). Admins can kick users from channels or from the server and ban them for 1 h, 24 h or for good. A ban covers the address (an IPv4 address, or the IPv6 /64), so everyone behind it is kept out too, except accounts that hold a role there; with accounts, it can cover the account as well, from any address, and an admin can ban an account by name from the ban list. Bans outlast a restart: with accounts they are kept in the database as a keyed hash of the address, never the address; without accounts in `bans.json` (readable by the server's user only) next to `channels.json`. From the server's shell: `voipc-server ban list`, `ban add --account NAME` or `--ip ADDR` (with `--reason` and `--days`), `ban remove ID`; a running server picks changes up within five minutes. Other users see a shield next to an admin's name. Three wrong tokens disconnect the session.
 
 ### Client
 
@@ -500,14 +501,10 @@ npx tauri dev     # Dev build + run
 npx tauri build   # Release build
 ```
 
-Or build portable release binaries via Docker (no local dependencies needed):
-
-```bash
-npm run release    # Outputs release/VoIPC_*.AppImage + release/voipc-server + release/VoIPC-web-*.tar.gz
-```
-
-Without Docker it falls back to a host build — the server and the web bundle, no AppImage —
-and tells you what it skipped and why.
+`npm run release` builds the web bundle and the server that embeds it into `release/`. The
+portable release files (the static server, the AppImage, the .deb, the Windows installer and the
+APK) come from the release workflow on GitHub, with `SHA256SUMS` and build attestations
+([SECURITY.md](SECURITY.md#verifying-a-download)).
 
 See [BUILDING.md](BUILDING.md) for detailed platform-specific instructions and dependency lists.
 
@@ -553,10 +550,11 @@ npm --prefix client test   # browser-side unit tests (spatial maths, room preset
 - Active usernames and channel memberships
 - Channel names, descriptions, passwords (`Zeroizing<String>` — cleared on drop)
 - Connection metadata (IP addresses while connected)
-- Media encryption keys per channel (`Zeroizing<[u8; 32]>`)
 - Pre-key bundles for Signal session establishment
 
-**Without accounts, nothing is written to disk: a server restart is a clean slate.** Accounts are something a server's operator turns on; what such a server keeps is listed below.
+The server never holds a media key: it relays the encrypted blobs members hand each other.
+
+**Without accounts, nothing is written to disk but `bans.json`, once an admin bans someone: a server restart is otherwise a clean slate.** Accounts are something a server's operator turns on; what such a server keeps is listed below.
 
 ### What the server never sees
 
@@ -599,14 +597,14 @@ should hear it instead of to everybody:
 
 Off unless the operator sets `[accounts] mode`. Then the server keeps a database — and every member is told what is in it:
 
-- **For every account:** its name; an Argon2id hash of a secret the app derives from your password (the password itself never leaves your device); your identity's public key; the public key of each device you sign in on with your password, which lets that device sign in without the password (*Forget* under *Your account* ends that; the server deletes a key unused for 90 days); your two-factor secret, sealed with a key file kept outside the database; your roles; and sign-in records with hashed IP addresses (the server's own log names the address next to the account at each sign-in)
-- **Your vault,** encrypted on your device. It opens with your password, on a device the server remembers, or with your recovery key (which this version's apps cannot take yet). It holds your identity key, other people's pinned identities, your choices and your log key. The server keeps it and cannot open it
+- **For every account:** its name; an Argon2id hash of a secret the app derives from your password (the password itself never leaves your device); your identity's public key; the public key of each device you sign in on with your password, which lets that device sign in without the password (*Forget* under *Your account* ends that; the server deletes a key unused for 90 days); your two-factor secret, sealed with a key file kept outside the database; your roles; and sign-in records with hashed IP addresses (the server's log holds plain addresses only at its `debug` level). Bans: a keyed hash of a banned address, never the address, and banned accounts
+- **Your vault,** encrypted on your device. It opens with your password, on a device the server remembers, or with your recovery key (*Forgot your password?* when you sign in). It holds your identity key, other people's pinned identities, your choices and your log key. The server keeps it and cannot open it without guessing your password: each guess costs 600,000 PBKDF2-SHA256 rounds, so a long password you use nowhere else is what protects it
 - **Only if you say yes to copies on the server** (asked once, changed under *Your account*): your messages, encrypted end to end. The server learns who wrote in which channel or direct conversation, when, how long each message is, each message's destruction timer (for a direct message, the one you chose), and which channels you keep — never the text and never a key. Copies go when their timer runs out, or after the server's retention (a year unless the operator chooses otherwise)
 - **People who join a channel later** can read what you wrote there before unless you say no: it is the switch *Share recent channel chat with newcomers*, which is on by default and ticked in the copies question. With it on, someone who joins gets the keys to everything you kept in that channel, not only recent chat. Either way, every account your app hands a key to is named in the channel as it happens, on the device that hands it over, so nobody is added without you seeing it
-- **Kept messages are signed** by you, so the people they are for can prove you wrote them, and a kept copy has no forward secrecy: whoever later gets into a member's account can read what that member could
-- **The browser client is served by the server itself,** so a server that turns hostile can change the page. It can read what you type there, and it can use what the browser keeps for the account (the remembered device key and the key to your vault) to sign in as you and read everything kept for you. The desktop app does not have that problem; use it where you do not run the server yourself
-- **A server that turns hostile still cannot read kept messages** (except through a browser it serves, above), but it holds your vault and decides who is listed as a member: it can drop or roll back what it keeps, and meet you before the person you meant to meet. Your app names every new reader, warns when a known name turns up as another account, and safety numbers show who is in between ([docs/ACCOUNTS.md](docs/ACCOUNTS.md))
-- **Use a password you use on no other server:** a server can pretend to be another one. The desktop app refuses a server that claims an id it knows from another address
+- **Kept messages are signed** by you, so the people they are for can prove you wrote them, and a kept copy has no forward secrecy: whoever later gets into a member's account can read what that member could. The server can withhold or replay copies; it cannot forge or alter them. You can delete yours, and your account, from the server (*Your account*); copies people's devices already have may stay
+- **The browser client is served by the server itself,** so a server that turns hostile can change the page. It can read what you type there, and it can use what the browser keeps for the account (the remembered device key and the key to your vault) to sign in as you and read everything kept for you. The same goes for every other server you open in that page: it handles them all. The desktop app does not have that problem; use it where you do not run the server yourself
+- **A server that turns hostile still cannot read kept messages** (except through a browser it serves, above), but it holds your vault and decides who is listed as a member: it can drop or roll back what it keeps (your pinned identities too: your app warns when it notices), guess your password offline at the cost above, and meet you before the person you meant to meet. Your app names every new reader, warns when a known name turns up as another account, and safety numbers show who is in between ([docs/ACCOUNTS.md](docs/ACCOUNTS.md))
+- **Use a password you use on no other server:** a server can pretend to be another one. The app and the browser refuse a server that claims an id they know from another address
 
 ### What your device stores
 
@@ -616,7 +614,7 @@ Off unless the operator sets `[accounts] mode`. Then the server keeps a database
 - With an account: a remembered device's key and, with it, the key to your vault (desktop: inside the encrypted
   chat history, or only in memory while that is off; browser: IndexedDB, under a key the page cannot export),
   how far it has read the server's copies, and whom it has named as readers
-- On the desktop, which account id each server address gave at its last sign-in (`relay_ids` in `settings.json`)
+- Which account id each server address gave at its last sign-in (desktop: `relay_ids` in `settings.json`; browser: `voipc.relay_ids` in localStorage)
 
 ### What is never stored anywhere
 
@@ -633,8 +631,13 @@ VoIPC is MIT licensed. Contributions are welcome.
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes
-4. Run `cargo build --workspace` to verify everything compiles
+4. Run the checks CI runs: `cargo test --workspace --locked` and `npm --prefix client test`
+   (and `./test-web.sh` after `VOIPC_SELFTEST=1 npm run web` for anything the browser client
+   touches)
 5. Submit a pull request
+
+Security issues go to [SECURITY.md](SECURITY.md), not to a public issue. Running a relay:
+[docs/OPERATING.md](docs/OPERATING.md).
 
 ## License
 
@@ -648,7 +651,7 @@ does so under those terms as well:
   browser client's WebAssembly.
 - **FFmpeg** is **GPL** in the builds VoIPC bundles: the Windows installer ships BtbN's
   `gpl-shared` build, and the AppImage carries FFmpeg with x264 and x265. The `.deb` uses the
-  system's FFmpeg.
+  system's FFmpeg. Each release's notes name the exact FFmpeg build and link its source.
 
 ---
 

@@ -58,10 +58,18 @@ function load(): AppConfig {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return defaults;
     const saved = JSON.parse(raw);
-    if (!saved || typeof saved !== "object") return defaults;
+    if (!saved || typeof saved !== "object") throw new Error("not an object");
     return { ...defaults, ...saved, sounds: { ...defaults.sounds, ...(saved.sounds ?? {}) } };
   } catch (e) {
-    console.warn("Could not load settings, using defaults:", e);
+    // Kept aside rather than overwritten by the next save, which would take
+    // the remembered servers with it
+    console.warn("Could not load settings, using defaults (the old ones are kept as voipc.settings.unreadable):", e);
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) localStorage.setItem(`${STORAGE_KEY}.unreadable`, raw);
+    } catch {
+      // storage unavailable: nothing to keep
+    }
     return defaults;
   }
 }

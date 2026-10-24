@@ -1,3 +1,9 @@
+//! A note on `#[serde(default)]` in the wire types: it only helps JSON
+//! callers (the browser builds messages as JS objects and may leave a field
+//! out). On the wire, postcard is positional, so it never lets an older and a
+//! newer layout read each other: every layout change is a protocol bump, which
+//! `tests/golden.rs` enforces.
+
 use serde::{Deserialize, Serialize};
 
 use crate::types::*;
@@ -223,19 +229,25 @@ pub enum ClientMessage {
     /// Disconnect a user from the server (admin only).
     AdminKick { user_id: UserId, reason: String },
 
-    /// Disconnect a user and ban their IP (admin only).
-    /// `duration_secs` 0 = until the server restarts.
+    /// Disconnect a user and ban their address; with `account`, their account
+    /// too, where they signed in with one (admin or moderator; a moderator
+    /// bans people without a role only). `duration_secs` 0 = permanent.
     AdminBan {
         user_id: UserId,
         reason: String,
         duration_secs: u32,
+        account: bool,
     },
 
-    /// Lift an IP ban (admin only).
-    AdminUnban { ip: String },
+    /// Lift a ban, by its `BanInfo.id` (admin only).
+    AdminUnban { id: u64 },
 
     /// Request the list of active bans (admin only).
     AdminListBans,
+
+    /// Ban an account by name, online or not (admin only). `duration_secs` 0
+    /// = permanent.
+    AdminBanAccount { name: String, reason: String, duration_secs: u32 },
 
     // ── Channel history hand-off (E2E) ───────────────────────────────
 
@@ -300,6 +312,17 @@ pub enum AuthContinue {
         prekey_bundle: PreKeyBundleData,
         reset_identity: bool,
     },
+    /// The answer to `ResetChallenge`: the identity's signature over the
+    /// challenge (`voipc-reset/v1|<relay>|<name>|<challenge>`), the new
+    /// password's secret and its `slot.pass` (the same vault key under the new
+    /// password), and the second factor when the account has one.
+    Reset {
+        signature: Vec<u8>,
+        auth_secret: Vec<u8>,
+        pass_slot: Vec<u8>,
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    },
 }
 
 /// Account management after sign-in.
@@ -341,6 +364,25 @@ pub enum AccountRequest {
     LogLeave { conv: String },
     /// The stored members of `conv` (we must be one), with their keys.
     LogMembers { conv: String },
+
+    // ── The account (1.0) ──
+    /// A new password: the old one's secret (the relay checks it), the new
+    /// one's, its `slot.pass` (the same vault key), and the second factor when
+    /// the account has one. Every other session and remembered device ends.
+    PasswordChange {
+        old_secret: Vec<u8>,
+        new_secret: Vec<u8>,
+        pass_slot: Vec<u8>,
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    },
+    /// Delete what this account wrote to the stored logs, in `conv` or (None)
+    /// everywhere, and the keys it handed out for it. What others wrote stays.
+    LogPurge { conv: Option<String> },
+    /// Delete this account: the password's secret, and the second factor when
+    /// it has one. `AccountDeleted` answers, then the relay closes the
+    /// connection.
+    DeleteAccount { secret: Vec<u8>, totp: Option<String>, recovery_code: Option<String> },
 }
 
 /// The relay's side of an account sign-in.
@@ -356,6 +398,14 @@ pub enum AuthStep {
     Vault { blobs: Vec<VaultBlob> },
     /// This relay takes no guests. Sent before the connection closes.
     AccountRequired { registration: Registration },
+    /// A reset (`AccountStart::Reset`): sign this with the identity key. The
+    /// vault's recovery slot and identity item come with it, never the
+    /// password slot (which would let anyone guess the password offline).
+    /// `second_factor`: send a code or a recovery code with the answer.
+    ResetChallenge { relay_id: [u8; 16], challenge: Vec<u8>, blobs: Vec<VaultBlob>, second_factor: bool },
+    /// The password is reset; sign in with the new one. Every other device
+    /// and session of the account was signed out.
+    ResetDone,
 }
 
 /// Answers to `AccountRequest`.
@@ -395,6 +445,13 @@ pub enum AccountReply {
     LogPending { conv: String, joiners: Vec<[u8; 16]> },
     /// Somebody wrapped a key to us in `conv`.
     LogNews { conv: String },
+    /// The password changed (`PasswordChange`). This device's key was
+    /// forgotten with every other: remember it again if it was remembered.
+    PasswordChanged,
+    /// `LogPurge` done: `entries` of ours deleted.
+    LogPurged { conv: Option<String>, entries: u64 },
+    /// The account is gone; the connection closes.
+    AccountDeleted,
 }
 
 /// A wrapped epoch key for one member (`AccountRequest::EpochPut`).
@@ -689,4 +746,22 @@ pub enum ServerMessage {
 
     /// An answer to an `AccountRequest`, or news about the account.
     Account(AccountReply),
+
+    // ── Pre-keys (protocol v12) ──────────────────────────────────────
+
+    /// The relay has handed out all but `remaining` of your one-time pre-keys:
+    /// send more with `UploadPreKeys`.
+    PreKeysLow { remaining: u32 },
+
+    /// The connection is refused, in a form every later version can read: this
+    /// variant's index and fields never change (protocol v12, frozen). `code`
+    /// is a number, not an enum, so a newer relay's new reason still decodes.
+    /// Sent only to clients of protocol 12 or later; older ones get `AuthError`.
+    Refused { code: u16, server_protocol: u32, server_version: String, text: String },
 }
+
+/// `Refused.code`: the client speaks another protocol version.
+/// `server_protocol` above the client's means the client must update.
+pub const REFUSED_VERSION: u16 = 1;
+/// The first protocol version that decodes `ServerMessage::Refused`.
+pub const FIRST_STRUCTURED_REFUSAL: u32 = 12;

@@ -20,7 +20,6 @@
   // the two layouts cannot drift on what a click does.
 
   import {
-    channels,
     currentChannelId,
     previewChannelId,
     viewingVoice,
@@ -28,6 +27,7 @@
   import { channelRosters } from "../../stores/rosters.js";
   import { rosterForRow } from "../../roster-rules.js";
   import { userId, isAdmin, serverAddress } from "../../stores/connection.js";
+  import { account } from "../../stores/account.js";
   import {
     activeDmUserId,
     activeTextChannelId,
@@ -101,8 +101,10 @@
         {@const subscribed = $joinedTextChannelIds.has(channel.channel_id)}
         {@const left = !subscribed && $leftTextChannelNames.has(channel.name)}
         {@const unread = channelUnread($unreadPerChannel, $serverAddress, channel.name)}
+        <div class="channel-row">
         <button
           class="channel"
+          class:has-actions={subscribed || canEditChannel(channel)}
           class:active={$activeTextChannelId === channel.channel_id}
           class:unjoined={!subscribed}
           class:left
@@ -125,29 +127,28 @@
           {#if unread > 0}
             <span class="channel-unread">{unread}</span>
           {/if}
-          {#if subscribed}
-            <!-- svelte-ignore a11y_click_events_have_key_events -->
-            <span
-              class="settings-icon"
-              title="Leave this channel"
-              role="button"
-              tabindex="-1"
-              onclick={(e) => { e.stopPropagation(); leaveTextChannel(channel.channel_id); }}
-              ><Icon name="close" size={14} /></span
-            >
-          {/if}
-          {#if canEditChannel(channel)}
-            <!-- svelte-ignore a11y_click_events_have_key_events -->
-            <span
-              class="settings-icon"
-              title="Channel settings"
-              role="button"
-              tabindex="-1"
-              onclick={(e) => openChannelSettings(channel.channel_id, e)}
-              ><Icon name="channel-settings" size={14} /></span
-            >
-          {/if}
         </button>
+        {#if subscribed || canEditChannel(channel)}
+          <span class="row-actions">
+            {#if subscribed}
+              <button
+                class="settings-icon"
+                title={channel.log && $account?.cloud ? "Leave this channel: its kept messages stop coming to you; what you have stays" : "Leave this channel"}
+                aria-label={channel.log && $account?.cloud ? "Leave this channel: its kept messages stop coming to you; what you have stays" : "Leave this channel"}
+                onclick={() => leaveTextChannel(channel.channel_id)}
+              ><Icon name="close" size={14} /></button>
+            {/if}
+            {#if canEditChannel(channel)}
+              <button
+                class="settings-icon"
+                title="Channel settings"
+                aria-label="Channel settings"
+                onclick={(e) => openChannelSettings(channel.channel_id, e)}
+              ><Icon name="channel-settings" size={14} /></button>
+            {/if}
+          </span>
+        {/if}
+        </div>
       {/each}
     </div>
 
@@ -161,8 +162,10 @@
       {@const joined = channel.channel_id === $currentChannelId}
       {@const members = membersOf(channel)}
       {@const unread = channelUnread($unreadPerChannel, $serverAddress, channel.name)}
+      <div class="channel-row">
       <button
         class="channel"
+        class:has-actions={canEditChannel(channel)}
         class:active={joined}
         class:previewing={channel.channel_id === $previewChannelId && !joined}
         onclick={() => selectChannel(channel)}
@@ -191,17 +194,18 @@
         {#if !(channel.hide_members && !$isAdmin)}
           <span class="user-count">{channel.user_count}</span>
         {/if}
-        {#if canEditChannel(channel)}
-          <!-- svelte-ignore a11y_click_events_have_key_events -->
-          <span
+      </button>
+      {#if canEditChannel(channel)}
+        <span class="row-actions">
+          <button
             class="settings-icon"
             title="Channel settings"
-            role="button"
-            tabindex="-1"
-            onclick={(e) => openChannelSettings(channel.channel_id, e)}><Icon name="channel-settings" size={14} /></span
-          >
-        {/if}
-      </button>
+            aria-label="Channel settings"
+            onclick={(e) => openChannelSettings(channel.channel_id, e)}
+          ><Icon name="channel-settings" size={14} /></button>
+        </span>
+      {/if}
+      </div>
 
       {#if members.length > 0}
         <div class="nested">
@@ -335,7 +339,8 @@
     touch-action: manipulation;
   }
 
-  .channel:hover {
+  .channel:hover,
+  .channel-row:hover > .channel {
     background: var(--bg-hover);
     color: var(--text-primary);
   }
@@ -406,15 +411,40 @@
     flex-shrink: 0;
   }
 
+  /* The row's own controls are buttons beside the row's button, not spans
+     inside it: a button in a button is invalid, and Tab never reached them
+     (H5-04). They sit over the row's right edge, as they did. */
+  .channel-row {
+    position: relative;
+  }
+
+  .row-actions {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    gap: 4px;
+  }
+
   .settings-icon {
     display: none;
     align-items: center;
+    padding: 2px;
+    background: none;
+    border: none;
     color: var(--text-secondary);
-    flex-shrink: 0;
+    cursor: pointer;
   }
 
-  .channel:hover .settings-icon {
+  .channel-row:hover .settings-icon,
+  .channel-row:focus-within .settings-icon {
     display: flex;
+  }
+
+  .channel-row:hover > .channel.has-actions,
+  .channel-row:focus-within > .channel.has-actions {
+    padding-right: 52px;
   }
 
   /* A touch screen has no hover: without this the leave ✕ and the settings
@@ -423,6 +453,9 @@
   @media (hover: none) {
     .settings-icon {
       display: flex;
+    }
+    .channel.has-actions {
+      padding-right: 52px;
     }
   }
 

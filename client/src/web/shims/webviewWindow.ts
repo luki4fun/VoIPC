@@ -7,4 +7,8 @@ export class WebviewWindow extends Window {
   constructor(_label: string, _options?: Record<string, unknown>) {
     super();
   }
+
+  static async getByLabel(_label: string): Promise<WebviewWindow | null> {
+    return null;
+  }
 }

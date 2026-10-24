@@ -29,6 +29,19 @@ pub fn atomic_write(path: &Path, bytes: &[u8], secret: bool) -> std::io::Result<
     r
 }
 
+/// A new file (never one already there) holding `bytes`, mode 0600 from the
+/// start: a copy made with the umask and narrowed afterwards is readable by
+/// others for a moment (1.0 audit H1-17).
+pub fn create_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    let mut f = o.open(path)?;
+    f.write_all(bytes)?;
+    f.sync_all()
+}
+
 /// Readable and writable by this user only (a no-op off Unix).
 pub fn owner_only(path: &Path) -> std::io::Result<()> {
     #[cfg(unix)]

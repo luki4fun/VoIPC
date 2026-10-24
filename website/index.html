@@ -472,7 +472,7 @@
       <h1>Voice, screen sharing, and chat — on a server you run.</h1>
       <p class="hero-sub">VoIPC is an open-source alternative to Discord and TeamSpeak. Messages are encrypted with the Signal Protocol, voice and video with AES-256-GCM, and by default the relay server keeps nothing: no accounts, no database, no logs. Turn on accounts and it keeps a database of them, and end-to-end-encrypted copies of messages for members who want them.</p>
       <div class="hero-buttons">
-        <a class="btn btn-primary" href="https://github.com/luki4fun/voipc/releases">Download</a>
+        <a class="btn btn-primary" href="https://github.com/luki4fun/voipc/releases/latest">Download</a>
         <a class="btn btn-outline" href="https://github.com/luki4fun/voipc">Source</a>
       </div>
     </div>
@@ -715,7 +715,7 @@
       <div class="spec-card">
         <h3>Protocol</h3>
         <dl>
-          <dt>Version</dt><dd>v11, postcard binary serialization</dd>
+          <dt>Version</dt><dd>v12, postcard binary serialization</dd>
           <dt>Control</dt><dd>QUIC stream, TLS 1.3 (rustls), max 64 KiB/msg</dd>
           <dt>Media</dt><dd>QUIC datagrams (voice ≤ 512 B), one stream per video frame</dd>
           <dt>Headers</dt><dd>15 B voice · 21 B video (encrypted)</dd>
@@ -943,9 +943,9 @@
     <div class="dl-grid">
       <div>
         <h3>Client</h3>
-        <p>Prebuilt packages on the <a href="https://github.com/luki4fun/voipc/releases">GitHub releases page</a>, or build from source — <code>setup.sh</code> / <code>setup.ps1</code> installs the dependencies, <code>npm run build</code> builds. See <a href="https://github.com/luki4fun/voipc/blob/main/BUILDING.md">BUILDING.md</a> for the per-platform details.</p>
+        <p>Prebuilt packages on the <a href="https://github.com/luki4fun/voipc/releases/latest">GitHub releases page</a>, or build from source — <code>setup.sh</code> / <code>setup.ps1</code> installs the dependencies, <code>npm run build</code> builds. See <a href="https://github.com/luki4fun/voipc/blob/main/BUILDING.md">BUILDING.md</a> for the per-platform details.</p>
         <p>Or install nothing: the server hosts a browser client at <code>https://your-server:9987</code>, with the same Signal and AES-256-GCM encryption compiled to WebAssembly.</p>
-        <a class="btn btn-primary" href="https://github.com/luki4fun/voipc/releases">Releases</a>
+        <a class="btn btn-primary" href="https://github.com/luki4fun/voipc/releases/latest">Releases</a>
       </div>
       <div>
         <h3>Server</h3>

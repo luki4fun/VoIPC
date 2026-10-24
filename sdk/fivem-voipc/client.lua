@@ -95,7 +95,12 @@ RegisterNUICallback("state", function(data, cb)
   elseif data.state == "disconnected" then
     print("[voipc] VoIPC is not connected to a server — ask the player to connect to " .. Config.server)
   elseif data.state == "wrong_server" then
-    print("[voipc] VoIPC is connected to a different server than " .. Config.server)
+    -- Also a missing channel, or an 18+ one the player has not said yes to:
+    -- VoIPC tells the player which, not the game.
+    print("[voipc] VoIPC will not join " .. Config.channel .. " on " .. Config.server ..
+      " — the player sees why in VoIPC")
+  elseif data.state == "returned" then
+    print("[voipc] the player is back in " .. Config.channel)
   end
 end)
 

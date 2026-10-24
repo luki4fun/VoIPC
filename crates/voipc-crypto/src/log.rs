@@ -22,7 +22,6 @@
 
 use hkdf::Hkdf;
 use libsignal_protocol::{IdentityKey, IdentityKeyPair, KeyPair, PrivateKey, PublicKey};
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use voipc_protocol::conv::hex;
@@ -79,7 +78,7 @@ pub struct LogKey {
 
 impl LogKey {
     pub fn generate() -> LogKey {
-        LogKey { pair: KeyPair::generate(&mut OsRng) }
+        LogKey { pair: KeyPair::generate(&mut crate::rng()) }
     }
 
     /// The vault item's plaintext: the private key (32 bytes).
@@ -101,7 +100,7 @@ impl LogKey {
     /// identity they pinned before trusting a wrap to it.
     pub fn endorse(&self, identity: &IdentityKeyPair) -> Vec<u8> {
         let msg = endorsement(&self.public());
-        identity.private_key().calculate_signature(&msg, &mut OsRng).expect("sign").to_vec()
+        identity.private_key().calculate_signature(&msg, &mut crate::rng()).expect("sign").to_vec()
     }
 }
 
@@ -128,7 +127,7 @@ fn wrap_ctx(conv: &str, owner: &[u8; 16], epoch: u32, recipient: &[u8; 16]) -> S
 /// `key` for `recipient`: `ephemeral public (33) | iv (12) | sealed key + tag (48)`.
 pub fn wrap(recipient_logkey: &[u8], key: &[u8; 32], conv: &str, owner: &[u8; 16], epoch: u32, recipient: &[u8; 16]) -> Option<Vec<u8>> {
     let them = PublicKey::deserialize(recipient_logkey).ok()?;
-    let eph = KeyPair::generate(&mut OsRng);
+    let eph = KeyPair::generate(&mut crate::rng());
     let shared = Zeroizing::new(eph.private_key.calculate_agreement(&them).ok()?.to_vec());
     let eph_pub = eph.public_key.serialize();
     let ctx = wrap_ctx(conv, owner, epoch, recipient);
@@ -211,7 +210,7 @@ fn signed_part(conv: &str, sender: &[u8; 16], epoch: u32, sent_at: u64, envelope
 
 /// A log entry's sealed bytes.
 pub fn seal_entry(key: &[u8; 32], conv: &str, sender: &[u8; 16], epoch: u32, signer: &LogKey, envelope: &[u8], sent_at: u64) -> Vec<u8> {
-    let sig = signer.pair.calculate_signature(&signed_part(conv, sender, epoch, sent_at, envelope), &mut OsRng).expect("sign").to_vec();
+    let sig = signer.pair.calculate_signature(&signed_part(conv, sender, epoch, sent_at, envelope), &mut crate::rng()).expect("sign").to_vec();
     let payload = postcard::to_allocvec(&Payload { envelope: envelope.to_vec(), sent_at, sig }).expect("encodes");
     seal(key, &entry_aad(conv, sender, epoch), &payload)
 }
@@ -237,8 +236,8 @@ mod tests {
 
     #[test]
     fn a_log_key_is_endorsed_by_its_identity_only() {
-        let id = IdentityKeyPair::generate(&mut OsRng);
-        let other = IdentityKeyPair::generate(&mut OsRng);
+        let id = IdentityKeyPair::generate(&mut crate::rng());
+        let other = IdentityKeyPair::generate(&mut crate::rng());
         let lk = LogKey::generate();
         let sig = lk.endorse(&id);
         assert!(endorsed(&id.public_key().serialize(), &lk.public(), &sig));

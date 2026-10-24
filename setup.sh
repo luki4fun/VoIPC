@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # VoIPC Linux development environment setup (Ubuntu/Debian via apt, Arch via pacman)
-# Installs system packages, Rust, Node.js, and runs npm install.
+# Installs system packages, Rust, Node.js, and runs npm ci.
 set -euo pipefail
 
 GREEN='\033[0;32m'
@@ -92,11 +92,11 @@ else
     ok "Node.js installed ($(node --version))"
 fi
 
-# ── npm install ───────────────────────────────────────────────────────────
+# ── npm ci ─────────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-info "Running npm install in client/..."
+info "Running npm ci in client/..."
 cd "$SCRIPT_DIR/client"
-npm install
+npm ci
 ok "npm dependencies installed"
 
 echo -e "\n${CYAN}=== Setup complete ===${NC}"

@@ -9,6 +9,7 @@
     "build": "node tools/voipc.mjs build",
     "setup:windows": "node tools/voipc.mjs setup:windows",
     "build:windows": "node tools/voipc.mjs build:windows",
+    "check:windows": "node tools/voipc.mjs check:windows",
     "web": "node tools/voipc.mjs web",
     "setup:android": "node tools/voipc.mjs setup:android",
     "android": "node tools/voipc.mjs android",

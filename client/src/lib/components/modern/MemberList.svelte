@@ -245,7 +245,7 @@
   }
 
   .crown {
-    color: #ffc107;
+    color: var(--warning);
     display: inline-flex;
     vertical-align: middle;
   }

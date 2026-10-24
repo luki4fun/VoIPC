@@ -7,6 +7,8 @@
 //! file only converts between JS and Rust values.
 
 pub mod account;
+#[cfg(any(test, fuzzing))]
+pub mod fuzz;
 pub mod media;
 pub mod signal;
 
@@ -91,19 +93,24 @@ impl SignalClient {
         })
     }
 
-    /// Stores for an account's identity (`AccountSignIn.identity()`).
-    #[wasm_bindgen(js_name = fromIdentity)]
-    pub fn from_identity(identity: &[u8]) -> Result<SignalClient, JsError> {
-        let identity = libsignal_protocol::IdentityKeyPair::try_from(identity).map_err(|e| JsError::new(&e.to_string()))?;
-        Ok(Self { core: signal::SignalCore::with_identity(&identity).map_err(js_err)? })
-    }
-
     /// `{ identity_key: number[], prekey_bundle: PreKeyBundleData }` for Authenticate.
     pub fn bundle(&self) -> Result<JsValue, JsError> {
         Ok(serde_wasm_bindgen::to_value(&self.core.bundle().map_err(js_err)?)?)
     }
 
-    /// X3DH with a peer's `PreKeyBundleData` (as decoded from `ServerMessage.PreKeyBundle`).
+    /// Our user id from `Authenticated`: every pairwise message is bound to it.
+    #[wasm_bindgen(js_name = setOwnUserId)]
+    pub fn set_own_user_id(&mut self, user_id: u32) {
+        self.core.set_own_user_id(user_id);
+    }
+
+    /// `OneTimePreKey[]` for `UploadPreKeys`, answering `PreKeysLow`.
+    #[wasm_bindgen(js_name = morePrekeys)]
+    pub fn more_prekeys(&mut self) -> Result<JsValue, JsError> {
+        Ok(serde_wasm_bindgen::to_value(&self.core.more_prekeys().map_err(js_err)?)?)
+    }
+
+    /// PQXDH with a peer's `PreKeyBundleData` (as decoded from `ServerMessage.PreKeyBundle`).
     #[wasm_bindgen(js_name = establishSession)]
     pub fn establish_session(&mut self, user_id: u32, bundle: JsValue) -> Result<(), JsError> {
         let bundle: PreKeyBundleData = serde_wasm_bindgen::from_value(bundle)?;

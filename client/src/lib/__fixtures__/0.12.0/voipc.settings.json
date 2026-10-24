@@ -1,0 +1,78 @@
+{
+  "input_device": null,
+  "output_device": null,
+  "volume": 0.8,
+  "input_gain": 1,
+  "noise_suppression": true,
+  "voice_mode": "vad",
+  "vad_threshold_db": -42.5,
+  "ptt_key": "Space",
+  "ptt_hold_mode": true,
+  "mute_key": null,
+  "deafen_key": null,
+  "muted": false,
+  "deafened": false,
+  "remember_connection": false,
+  "last_host": "voice.example.org",
+  "last_port": 9987,
+  "last_username": "luki",
+  "last_accept_self_signed": null,
+  "saved_servers": [
+    {
+      "name": "Home",
+      "host": "voice.example.org",
+      "port": 9987,
+      "username": "luki",
+      "accept_self_signed": false,
+      "account": true
+    }
+  ],
+  "open_servers": [],
+  "screen_share_codec": "h264",
+  "spatial_audio": true,
+  "screen_audio_spatial": true,
+  "mic_effect": "none",
+  "mic_muffle": 0,
+  "mic_reverb": 0,
+  "mic_water": 0,
+  "audio_setup_version": 0,
+  "sounds": {
+    "channel_switch": {
+      "enabled": true,
+      "path": null
+    },
+    "user_joined": {
+      "enabled": true,
+      "path": null
+    },
+    "user_left": {
+      "enabled": true,
+      "path": null
+    },
+    "disconnected": {
+      "enabled": true,
+      "path": null
+    },
+    "direct_message": {
+      "enabled": true,
+      "path": null
+    },
+    "channel_message": {
+      "enabled": true,
+      "path": null
+    },
+    "poke": {
+      "enabled": true,
+      "path": null
+    }
+  },
+  "auto_connect": false,
+  "share_channel_history": true,
+  "max_conversations": 1000,
+  "ui_prefs": {
+    "layout": "modern",
+    "zoom": 1.1
+  },
+  "chat_history_path": null,
+  "chat_history_disabled": true
+}

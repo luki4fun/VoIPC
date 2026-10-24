@@ -24,7 +24,7 @@ use voipc_protocol::messages::{AccountReply, AccountRequest, ClientMessage, LogE
 use voipc_protocol::types::VaultBlob;
 use zeroize::Zeroizing;
 
-use crate::account::{PinCheck, Pins, SignedIn, Vault, ITEM_PINS};
+use crate::account::{PinCheck, Pins, SignedIn, Vault, VaultError, ITEM_PINS};
 use crate::log::{endorsed, epoch_key, open_entry, seal_entry, self_unwrap, self_wrap, unwrap, wrap, LogKey};
 
 pub const ITEM_LOGKEY: &str = "item.logkey";
@@ -53,6 +53,10 @@ pub struct LogMemory {
     /// Per channel log, the accounts this device has told its user can read
     /// what they write there (`Event::Readers`).
     pub readers: HashMap<String, Vec<[u8; 16]>>,
+    /// Per vault item, the newest generation this device has seen: an older
+    /// one, or none, from the relay later is a rollback.
+    #[serde(default)]
+    pub vault_gens: HashMap<String, u64>,
 }
 
 /// What comes out besides messages to send.
@@ -65,7 +69,8 @@ pub enum Event {
     ChannelMessage { conv: String, sender: [u8; 16], sender_name: String, from_me: bool, envelope: Vec<u8>, sent_at: u64, server_at: u64, seq: i64 },
     /// `account` (going by `name`) has another identity than the one pinned,
     /// or the name belonged to another account: told once.
-    IdentityChanged { account: [u8; 16], name: String },
+    /// `replaced`: the name was another account's (`PinCheck::Replaced`).
+    IdentityChanged { account: [u8; 16], name: String, replaced: bool },
     /// A message we sent is kept for its recipient (`id` from its envelope).
     Kept { conv: String, seq: i64 },
     /// The relay refused to keep something (over quota, no storage).
@@ -74,6 +79,10 @@ pub enum Event {
     /// on (`history`: what we wrote there before, too). Shown to the user, so
     /// nobody — a member the relay made up included — gets our keys unseen.
     Readers { conv: String, accounts: Vec<([u8; 16], String)>, history: bool },
+    /// A vault item this device cannot use as the relay holds it ("missing",
+    /// "older" than one seen before, "newer" VoIPC, "unreadable"): it is left
+    /// alone this session, and the person is told.
+    VaultProblem { item: &'static str, problem: &'static str },
 }
 
 impl Event {
@@ -88,6 +97,19 @@ impl Event {
             let m = crate::envelope::open_envelope(envelope);
             (m.id, m.text, m.ttl_secs, sent_at.min(server_at))
         };
+        // A tombstone: its writer's copies up to `before` go, wherever this
+        // device keeps them. Never later than the relay filed it.
+        let purge = |envelope: &[u8], server_at: u64| crate::envelope::open_envelope(envelope).purge_before.map(|b| b.min(server_at));
+        if let Event::Message { conv, peer, peer_name, from_me, envelope, server_at, .. } = self {
+            if let Some(before) = purge(envelope, *server_at) {
+                return Some(("stored-purge", serde_json::json!({ "conv": conv, "name": peer_name, "account": hex(peer), "from_me": from_me, "before": before })));
+            }
+        }
+        if let Event::ChannelMessage { conv, sender, sender_name, from_me, envelope, server_at, .. } = self {
+            if let Some(before) = purge(envelope, *server_at) {
+                return Some(("stored-purge", serde_json::json!({ "conv": conv, "name": sender_name, "account": hex(sender), "from_me": from_me, "before": before })));
+            }
+        }
         Some(match self {
             Event::Message { conv, peer, peer_name, from_me, envelope, sent_at, server_at, seq } => {
                 let (id, text, ttl, at) = opened(envelope, *sent_at, *server_at);
@@ -111,6 +133,7 @@ impl Event {
             }
             Event::Kept { conv, seq } => ("dm-kept", serde_json::json!({ "conv": conv, "seq": seq })),
             Event::NotKept { reason } => ("stored-not-kept", serde_json::json!({ "reason": reason })),
+            Event::VaultProblem { item, problem } => ("vault-problem", serde_json::json!({ "item": item, "problem": problem })),
             Event::IdentityChanged { .. } => return None,
         })
     }
@@ -168,6 +191,13 @@ pub struct AccountSync {
     /// One write per item at a time; `dirty` says another is due after it.
     saving: HashSet<&'static str>,
     dirty: HashSet<&'static str>,
+    /// Items the relay's copy of which we cannot use: never saved over.
+    read_only: HashSet<&'static str>,
+    /// `LogMemory::vault_gens`, and the generation each write in flight carries.
+    gens: HashMap<String, u64>,
+    writing_gen: HashMap<&'static str, u64>,
+    /// `gens` moved since the host last kept the memory.
+    memory_changed: bool,
     logkey: LogKey,
     logkey_version: i64,
     /// A log key made this run: published only once the vault keeps it, and
@@ -227,11 +257,38 @@ impl AccountSync {
     pub fn start(signed: &SignedIn, me: [u8; 16], memory: LogMemory, share: bool) -> (AccountSync, Vec<ClientMessage>) {
         let blobs = &signed.blobs;
         let version = |k: &str| blobs.iter().find(|b| b.k == k).map_or(0, |b| b.version);
-        let item = |k: &str| signed.vault.open_item(blobs, k).ok();
         let mut out = Vec::new();
-        let pins = item(ITEM_PINS).and_then(|b| Pins::from_bytes(&b)).unwrap_or_default();
-        let prefs = item(ITEM_PREFS).and_then(|b| postcard::from_bytes(&b).ok()).unwrap_or_default();
-        let (logkey, logkey_version, fresh) = match item(ITEM_LOGKEY).and_then(|b| LogKey::from_bytes(&b)) {
+        let mut gens = memory.vault_gens;
+        let mut read_only = HashSet::new();
+        let mut problems = Vec::new();
+        // An item this device cannot use as the relay holds it is told about
+        // and left alone: saving over it would let a relay (or an older
+        // VoIPC) wipe it for every device of the account.
+        let mut load = |k: &'static str, usable: &dyn Fn(&[u8]) -> bool| -> Option<Vec<u8>> {
+            let seen = gens.get(k).copied().unwrap_or(0);
+            let problem = match signed.vault.open_item(blobs, k) {
+                Ok(item) if !usable(&item.payload) => "unreadable",
+                Ok(item) if item.gen < seen => {
+                    read_only.insert(k);
+                    problems.push(Event::VaultProblem { item: k, problem: "older" });
+                    return Some(item.payload);
+                }
+                Ok(item) => {
+                    gens.insert(k.to_string(), item.gen);
+                    return Some(item.payload);
+                }
+                Err(VaultError::Missing) if seen == 0 => return None,
+                Err(VaultError::Missing) => "missing",
+                Err(VaultError::Newer) => "newer",
+                Err(_) => "unreadable",
+            };
+            read_only.insert(k);
+            problems.push(Event::VaultProblem { item: k, problem });
+            None
+        };
+        let pins = load(ITEM_PINS, &|b| Pins::from_bytes(b).is_some()).and_then(|b| Pins::from_bytes(&b)).unwrap_or_default();
+        let prefs = load(ITEM_PREFS, &|b| postcard::from_bytes::<Prefs>(b).is_ok()).and_then(|b| postcard::from_bytes(&b).ok()).unwrap_or_default();
+        let (logkey, logkey_version, fresh) = match load(ITEM_LOGKEY, &|b| LogKey::from_bytes(b).is_some()).and_then(|b| LogKey::from_bytes(&b)) {
             Some(k) => (k, version(ITEM_LOGKEY), false),
             None => (LogKey::generate(), 0, true),
         };
@@ -247,6 +304,10 @@ impl AccountSync {
             share,
             saving: HashSet::new(),
             dirty: HashSet::new(),
+            read_only,
+            gens,
+            writing_gen: HashMap::new(),
+            memory_changed: true,
             logkey,
             logkey_version,
             logkey_unsettled: fresh,
@@ -272,7 +333,7 @@ impl AccountSync {
             target: HashSet::new(),
             waiting: Vec::new(),
             opened: HashSet::new(),
-            later: Vec::new(),
+            later: problems,
         };
         if fresh {
             out.extend(s.save(ITEM_LOGKEY));
@@ -307,7 +368,20 @@ impl AccountSync {
         LogMemory {
             cursors: self.cursors.clone(),
             readers: self.readers.iter().map(|(c, r)| (c.clone(), r.iter().copied().collect())).collect(),
+            vault_gens: self.gens.clone(),
         }
+    }
+
+    /// Whether what `memory` returns moved in a way not tied to reading (a
+    /// vault item's generation): the host keeps it again. Clears the flag.
+    pub fn take_memory_changed(&mut self) -> bool {
+        std::mem::take(&mut self.memory_changed)
+    }
+
+    /// Whether `name` was first met as an account (a guest using it now is a
+    /// warning: `AccountSession::note_roster`).
+    pub fn knows_name(&self, name: &str) -> bool {
+        self.pins.knows_name(name)
     }
 
     /// The key pinned for `account`, if any (for safety numbers).
@@ -334,12 +408,17 @@ impl AccountSync {
     }
 
     fn save(&mut self, k: &'static str) -> Vec<ClientMessage> {
+        if self.read_only.contains(k) {
+            return Vec::new();
+        }
         if !self.saving.insert(k) {
             self.dirty.insert(k);
             return Vec::new();
         }
         self.dirty.remove(k);
-        let blob = self.vault.seal_item(k, &self.item_bytes(k));
+        let gen = self.gens.get(k).copied().unwrap_or(0) + 1;
+        self.writing_gen.insert(k, gen);
+        let blob = self.vault.seal_item(k, gen, &self.item_bytes(k));
         let expect = *self.version_of(k);
         vec![ask(AccountRequest::VaultPut { k: blob.k, v: blob.v, expect })]
     }
@@ -351,16 +430,31 @@ impl AccountSync {
     /// A vault answer for one of our items.
     fn on_vault(&mut self, k: &'static str, stored: Option<i64>, theirs: Option<&VaultBlob>) -> Vec<ClientMessage> {
         let mut settled = stored.is_some();
+        let written = self.writing_gen.remove(k);
         match (stored, theirs) {
-            (Some(v), _) => *self.version_of(k) = v,
+            (Some(v), _) => {
+                *self.version_of(k) = v;
+                if let Some(gen) = written {
+                    self.gens.insert(k.to_string(), gen);
+                    self.memory_changed = true;
+                }
+            }
             (None, Some(b)) => {
                 // Another device wrote first: pins join, a log key or prefs of
                 // theirs win (the log key: two would leave wraps to the wrong one).
-                if let Ok(plain) = self.vault.open_item(std::slice::from_ref(b), k) {
+                // One we cannot use is left alone, as at start.
+                match self.vault.open_item(std::slice::from_ref(b), k) {
+                    Ok(item) => {
+                        let seen = self.gens.entry(k.to_string()).or_insert(0);
+                        *seen = (*seen).max(item.gen);
+                        self.memory_changed = true;
+                        let plain = item.payload;
                     match k {
                         ITEM_PINS => {
                             if let Some(p) = Pins::from_bytes(&plain) {
-                                self.pins.merge(p);
+                                for (account, name) in self.pins.merge(p) {
+                                    self.later.push(Event::IdentityChanged { account, name, replaced: false });
+                                }
                                 self.dirty.insert(k);
                             }
                         }
@@ -375,6 +469,13 @@ impl AccountSync {
                                 settled = true;
                             }
                         }
+                    }
+                    }
+                    Err(e) => {
+                        let problem = if e == VaultError::Newer { "newer" } else { "unreadable" };
+                        self.read_only.insert(k);
+                        self.dirty.remove(k);
+                        self.later.push(Event::VaultProblem { item: k, problem });
                     }
                 }
                 *self.version_of(k) = b.version;
@@ -405,7 +506,7 @@ impl AccountSync {
     pub fn check_peer(&mut self, account: &[u8; 16], name: &str, identity: &[u8]) -> (PinCheck, Vec<ClientMessage>) {
         let check = self.pins.check(account, name, identity);
         let out = if check == PinCheck::Same { Vec::new() } else { self.save(ITEM_PINS) };
-        if check == PinCheck::Changed {
+        if check.warns() {
             // Keys learned under the old identity are not good any more.
             self.peers.remove(account);
             self.asked_keys.remove(account);
@@ -429,8 +530,8 @@ impl AccountSync {
             }
             let (check, save) = self.check_peer(account, name, identity);
             out.extend(save);
-            if check == PinCheck::Changed {
-                events.push(Event::IdentityChanged { account: *account, name: name.clone() });
+            if check.warns() {
+                events.push(Event::IdentityChanged { account: *account, name: name.clone(), replaced: check == PinCheck::Replaced });
             }
             self.peers.insert(*account, Peer { name: name.clone(), logkey: logkey.clone() });
             self.distrusted.remove(account);
@@ -488,6 +589,33 @@ impl AccountSync {
             return vec![ask(AccountRequest::LogJoin { conv: conv.to_string() })];
         }
         self.fetch(conv)
+    }
+
+    /// Out of a channel's log: the relay took us out (we left the text
+    /// channel, or were kicked) or, with `tell`, is asked to ("Stop keeping
+    /// this channel", for a voice channel's log, where moving between rooms
+    /// keeps it). What this run knew of it goes, so a rejoin keeps it again
+    /// and names its readers again; every remaining writer starts a new key
+    /// on their next post. The keys already held stay: what was written
+    /// while we were in is still ours to read.
+    pub fn leave(&mut self, conv: &str, tell: bool) -> Vec<ClientMessage> {
+        if !is_channel(conv) {
+            return Vec::new();
+        }
+        self.joined.remove(conv);
+        self.members.remove(conv);
+        self.asked_members.remove(conv);
+        self.own_epochs.remove(conv);
+        self.target.remove(conv);
+        self.owed.remove(conv);
+        self.joiners.remove(conv);
+        self.readers.remove(conv);
+        self.rekeys.remove(conv);
+        if tell {
+            vec![ask(AccountRequest::LogLeave { conv: conv.to_string() })]
+        } else {
+            Vec::new()
+        }
     }
 
     /// Starts reading `conv` from our cursor: its wraps first, then entries.
@@ -682,6 +810,11 @@ impl AccountSync {
             if dm_parties(&conv).is_some_and(|(a, b)| !(a == me || b == me) || !(e.sender == a || e.sender == b)) {
                 continue;
             }
+            // Read before: a relay that hands it out again (ignoring `after`)
+            // must not bring back what the person cleared (1.0 audit H2-06)
+            if e.seq <= self.cursors.get(&conv).copied().unwrap_or(0) {
+                continue;
+            }
             let Some(key) = self.keys.get(&(conv.clone(), e.sender, e.epoch)) else {
                 // Not ours to read, unless its writer still owes us an answer.
                 if self.owed.get(&conv).is_some_and(|o| o.contains(&e.sender)) {
@@ -715,7 +848,7 @@ impl AccountSync {
         // Read up to the first entry still waiting: it may open next time.
         for (conv, last) in &self.fetched {
             let held = self.waiting.iter().filter(|(c, _)| c == conv).map(|(_, e)| e.seq).min();
-            let upto = held.map_or(*last, |h| (h - 1).min(*last));
+            let upto = held.map_or(*last, |h| h.saturating_sub(1).min(*last));
             let c = self.cursors.entry(conv.clone()).or_insert(0);
             *c = (*c).max(upto);
         }
@@ -743,6 +876,18 @@ impl AccountSync {
                 events.push(Event::NotKept { reason: reason.clone() });
             }
             AccountReply::LogKeyStored | AccountReply::EpochStored { .. } | AccountReply::LogLeft { .. } => {}
+            // Our entries there are gone, and the keys we handed out with
+            // them: the next post starts a new one. The front end hears of it
+            // too (`account-reply`).
+            AccountReply::LogPurged { conv, .. } => {
+                match conv {
+                    Some(c) => {
+                        self.own_epochs.remove(c);
+                    }
+                    None => self.own_epochs.clear(),
+                }
+                return None;
+            }
             AccountReply::LogConvs { convs } => {
                 for (conv, last) in convs {
                     if *last > self.cursors.get(conv).copied().unwrap_or(0) && (dm_parties(conv).is_some() || is_channel(conv)) {
@@ -831,7 +976,7 @@ impl AccountSync {
                 self.rekeys.remove(conv);
                 // Ours: nothing to fetch back up to here.
                 let c = self.cursors.entry(conv.clone()).or_insert(0);
-                if *c + 1 >= *seq {
+                if c.saturating_add(1) >= *seq {
                     *c = *seq;
                 }
                 events.push(Event::Kept { conv: conv.clone(), seq: *seq });
@@ -894,7 +1039,6 @@ mod tests {
     use crate::account::{SignedIn, Vault};
     use crate::envelope::envelope;
     use crate::log::{dm_conv, open_entry};
-    use rand::rngs::OsRng;
     use voipc_protocol::messages::WrapOut;
 
     const RELAY: [u8; 16] = [9; 16];
@@ -906,7 +1050,7 @@ mod tests {
     }
 
     fn account(n: u8) -> Account {
-        Account { id: [n; 16], identity: IdentityKeyPair::generate(&mut OsRng), logkey: LogKey::generate() }
+        Account { id: [n; 16], identity: IdentityKeyPair::generate(&mut crate::rng()), logkey: LogKey::generate() }
     }
 
     impl Account {
@@ -926,7 +1070,7 @@ mod tests {
     /// so nothing waits for a vault answer.
     fn sync_for(me: &Account) -> AccountSync {
         let vault = Vault::create(RELAY, "me");
-        let blobs = vec![VaultBlob { version: 1, ..vault.seal_item(ITEM_LOGKEY, &me.logkey.to_bytes()) }];
+        let blobs = vec![VaultBlob { version: 1, ..vault.seal_item(ITEM_LOGKEY, 1, &me.logkey.to_bytes()) }];
         let signed = SignedIn { relay_id: RELAY, name: "me".into(), vault, identity: me.identity, recovery: None, blobs };
         let (mut s, _) = AccountSync::start(&signed, me.id, LogMemory::default(), false);
         s.prefs.cloud = true;
@@ -1007,12 +1151,86 @@ mod tests {
         assert!(out.is_empty(), "{out:?}");
         // Another device's key won the vault meanwhile: that one is published.
         let other = LogKey::generate();
-        let theirs = VaultBlob { version: 3, ..signed.vault.seal_item(ITEM_LOGKEY, &other.to_bytes()) };
+        let theirs = VaultBlob { version: 3, ..signed.vault.seal_item(ITEM_LOGKEY, 1, &other.to_bytes()) };
         let (out, _) = s.on_reply(&AccountReply::VaultConflict { k: ITEM_LOGKEY.into(), blob: Some(theirs) }).unwrap();
         let Some(AccountRequest::LogKeyPublish { logkey, .. }) = sent(&out, "LogKeyPublish").first().copied() else {
             panic!("published: {out:?}");
         };
         assert_eq!(*logkey, other.public());
         assert_eq!(sent(&out, "LogKeys").len(), 1, "and the waiting message goes on");
+    }
+
+    /// `me` signed in with `pins` as the vault holds them, and this device's memory.
+    fn start_with(me: &Account, dek: [u8; 32], pins: Option<VaultBlob>, memory: LogMemory) -> (AccountSync, SignedIn) {
+        let vault = Vault::from_dek(RELAY, "me", dek);
+        let mut blobs = vec![VaultBlob { version: 1, ..vault.seal_item(ITEM_LOGKEY, 1, &me.logkey.to_bytes()) }];
+        blobs.extend(pins);
+        let signed = SignedIn { relay_id: RELAY, name: "me".into(), vault, identity: me.identity, recovery: None, blobs };
+        let (s, _) = AccountSync::start(&signed, me.id, memory, false);
+        (s, signed)
+    }
+
+    /// The problems the first reply hands over.
+    fn problems(s: &mut AccountSync) -> Vec<(&'static str, &'static str)> {
+        let (_, events) = s.on_reply(&AccountReply::LogConvs { convs: Vec::new() }).unwrap();
+        events.into_iter().filter_map(|e| if let Event::VaultProblem { item, problem } = e { Some((item, problem)) } else { None }).collect()
+    }
+
+    /// H2-01: pins this device cannot read, or an older copy than it saw, or
+    /// none where it saw some, are never saved over (that would turn off every
+    /// pin, for every device), and the person is told.
+    #[test]
+    fn vault_pins_it_cannot_trust_are_reported_and_never_saved_over() {
+        let me = account(1);
+        let peer = account(2);
+        let key = peer.identity.public_key().serialize();
+        let vault = Vault::create(RELAY, "me");
+
+        // Damaged: the relay flipped a byte
+        let mut damaged = VaultBlob { version: 4, ..vault.seal_item(ITEM_PINS, 3, &Pins::default().to_bytes()) };
+        let last = damaged.v.len() - 1;
+        damaged.v[last] ^= 1;
+        let (mut s, _) = start_with(&me, vault.dek(), Some(damaged), LogMemory::default());
+        assert_eq!(problems(&mut s), vec![(ITEM_PINS, "unreadable")]);
+        let (_, out) = s.check_peer(&peer.id, "bob", &key);
+        assert!(sent(&out, "VaultPut").is_empty(), "saved over pins it could not read: {out:?}");
+
+        // Older than this device saw (the relay handed back an old copy)
+        let old = VaultBlob { version: 2, ..vault.seal_item(ITEM_PINS, 1, &Pins::default().to_bytes()) };
+        let seen = LogMemory { vault_gens: [(ITEM_PINS.to_string(), 5)].into(), ..Default::default() };
+        let (mut s, _) = start_with(&me, vault.dek(), Some(old), seen.clone());
+        assert_eq!(problems(&mut s), vec![(ITEM_PINS, "older")]);
+        assert!(sent(&s.check_peer(&peer.id, "bob", &key).1, "VaultPut").is_empty());
+
+        // None at all, where this device saw some
+        let (mut s, _) = start_with(&me, vault.dek(), None, seen);
+        assert_eq!(problems(&mut s), vec![(ITEM_PINS, "missing")]);
+        assert!(sent(&s.check_peer(&peer.id, "bob", &key).1, "VaultPut").is_empty());
+
+        // A first device with no pins yet saves them, and remembers the
+        // generation once the vault confirms it
+        let (mut s, _) = start_with(&me, vault.dek(), None, LogMemory::default());
+        assert!(problems(&mut s).is_empty());
+        let (_, out) = s.check_peer(&peer.id, "bob", &key);
+        assert_eq!(sent(&out, "VaultPut").len(), 1);
+        s.on_reply(&AccountReply::VaultStored { k: ITEM_PINS.into(), version: 1 }).unwrap();
+        assert_eq!(s.memory().vault_gens.get(ITEM_PINS), Some(&1));
+        assert!(s.take_memory_changed());
+    }
+
+    /// H2-08: a conflict copy that pins someone to another key is not adopted
+    /// silently.
+    #[test]
+    fn a_merged_pin_that_disagrees_is_reported() {
+        let me = account(1);
+        let peer = account(2);
+        let (mut s, signed) = start_with(&me, [7; 32], None, LogMemory::default());
+        problems(&mut s);
+        s.check_peer(&peer.id, "bob", &peer.identity.public_key().serialize());
+        let mut theirs = Pins::default();
+        theirs.check(&peer.id, "bob", &account(3).identity.public_key().serialize());
+        let blob = VaultBlob { version: 2, ..Vault::from_dek(RELAY, "me", signed.vault.dek()).seal_item(ITEM_PINS, 1, &theirs.to_bytes()) };
+        let (_, events) = s.on_reply(&AccountReply::VaultConflict { k: ITEM_PINS.into(), blob: Some(blob) }).unwrap();
+        assert!(events.iter().any(|e| matches!(e, Event::IdentityChanged { account, .. } if *account == peer.id)), "{events:?}");
     }
 }

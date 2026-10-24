@@ -212,7 +212,7 @@ async fn run_client(
     // Each simulated client is its own speaker, so each picks its own nonce
     // prefix exactly as a real one does.
     let stream_id = 0x5EED_0000u32 | index as u32;
-    let aad = voipc_crypto::build_aad(channel_id, 0x05);
+    let aad = voipc_crypto::build_aad(channel_id, 0x05, session_id);
     let mut encoder = voipc_audio::encoder::Encoder::new()?;
     let mut pcm = [0.0f32; OPUS_FRAME_SIZE];
     let freq = 220.0 + 20.0 * index as f32;

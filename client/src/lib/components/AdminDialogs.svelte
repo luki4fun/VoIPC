@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { backdrop, dialog } from "../actions/dialog.js";
   // Admin token login, and the list of active bans.
   //
   // Mounted once by App.svelte. Both layouts have a shield button somewhere —
@@ -6,6 +7,7 @@
 
   import {
     adminToken,
+    banAccount,
     bans,
     expiry,
     showAdminLogin,
@@ -13,12 +15,43 @@
     submitAdminLogin,
     unban,
   } from "../stores/admin-ui.js";
+  import { relayAccounts } from "../stores/account.js";
+  import type { BanInfo } from "../types.js";
+
+  let accountBans = $derived($bans.filter((b) => b.account));
+  let addressBans = $derived($bans.filter((b) => !b.account));
+  // Banning an account that is not here (admins only, as the list is)
+  let banName = $state("");
+  let banReason = $state("");
+  let banDays = $state(0);
+
+  async function submitBan() {
+    if (!banName.trim()) return;
+    await banAccount(banName, banReason, banDays * 86_400);
+    banName = "";
+    banReason = "";
+  }
 </script>
 
+{#snippet banRow(ban: BanInfo)}
+  <li>
+    <div class="ban-what">
+      <span class="ban-label">{ban.label}</span>
+      <span class="ban-reason">{ban.reason} · by {ban.by}</span>
+    </div>
+    <span class="ban-expiry">{expiry(ban)}</span>
+    <button class="admin-cancel" onclick={() => unban(ban.id)}>Unban</button>
+  </li>
+{/snippet}
+
 {#if $showAdminLogin}
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="admin-overlay" onclick={() => showAdminLogin.set(false)}>
-    <form class="admin-dialog" onclick={(e) => e.stopPropagation()} onsubmit={(e) => { e.preventDefault(); submitAdminLogin(); }}>
+  <div class="admin-overlay" role="presentation" onclick={backdrop(() => showAdminLogin.set(false))}>
+    <form
+      class="admin-dialog"
+      onsubmit={(e) => { e.preventDefault(); submitAdminLogin(); }}
+      aria-label="Admin login"
+      use:dialog={{ onclose: () => showAdminLogin.set(false) }}
+    >
       <div class="admin-title">Admin login</div>
       <div class="admin-hint">The admin token is in the server's config (<code>admin_token</code>) or, if none is set, in the server log at startup.</div>
       <!-- svelte-ignore a11y_autofocus -->
@@ -32,22 +65,41 @@
 {/if}
 
 {#if $showAdminPanel}
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="admin-overlay" onclick={() => showAdminPanel.set(false)}>
-    <div class="admin-dialog" onclick={(e) => e.stopPropagation()}>
+  <div class="admin-overlay" role="presentation" onclick={backdrop(() => showAdminPanel.set(false))}>
+    <div
+      class="admin-dialog"
+      aria-label="Active bans"
+      use:dialog={{ onclose: () => showAdminPanel.set(false) }}
+    >
       <div class="admin-title">Active bans</div>
+      {#if $relayAccounts}
+        <form class="ban-add" onsubmit={(e) => { e.preventDefault(); submitBan(); }}>
+          <input class="admin-input" placeholder="Account name" aria-label="Account to ban" bind:value={banName} />
+          <input class="admin-input" placeholder="Reason" aria-label="Reason" bind:value={banReason} maxlength="200" />
+          <select aria-label="How long" bind:value={banDays}>
+            <option value={0}>Permanent</option>
+            <option value={1}>1 day</option>
+            <option value={7}>7 days</option>
+            <option value={30}>30 days</option>
+          </select>
+          <button type="submit" class="admin-ok" disabled={!banName.trim()}>Ban account</button>
+        </form>
+      {/if}
       {#if $bans.length === 0}
         <div class="admin-hint">No active bans. Right-click a user to kick or ban.</div>
       {:else}
-        <ul class="ban-list">
-          {#each $bans as ban (ban.ip)}
-            <li>
-              <span class="ban-ip">{ban.ip}</span>
-              <span class="ban-expiry">{expiry(ban)}</span>
-              <button class="admin-cancel" onclick={() => unban(ban.ip)}>Unban</button>
-            </li>
-          {/each}
-        </ul>
+        {#if accountBans.length}
+          <div class="ban-heading">Accounts</div>
+          <ul class="ban-list">
+            {#each accountBans as ban (ban.id)}{@render banRow(ban)}{/each}
+          </ul>
+        {/if}
+        {#if addressBans.length}
+          <div class="ban-heading">Addresses <span class="admin-hint">(by the name used from there)</span></div>
+          <ul class="ban-list">
+            {#each addressBans as ban (ban.id)}{@render banRow(ban)}{/each}
+          </ul>
+        {/if}
       {/if}
       <div class="admin-actions">
         <button type="button" class="admin-cancel" onclick={() => showAdminPanel.set(false)}>Close</button>
@@ -132,8 +184,37 @@
     gap: 8px;
   }
 
-  .ban-ip {
-    font-family: monospace;
+  .ban-heading {
+    font-weight: 600;
+    font-size: 12px;
+  }
+
+  .ban-add {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .ban-add .admin-input {
+    flex: 1 1 140px;
+  }
+
+  .ban-what {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .ban-label {
+    font-weight: 600;
+  }
+
+  .ban-reason {
+    font-size: 11px;
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .ban-expiry {

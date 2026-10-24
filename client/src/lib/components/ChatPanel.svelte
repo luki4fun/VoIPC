@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { backdrop, dialog } from "../actions/dialog.js";
   import type { Snippet } from "svelte";
 
   interface Props {
@@ -20,6 +21,7 @@
   import { addNotification } from "../stores/notifications.js";
   import { get } from "svelte/store";
   import { account, accountHex } from "../stores/account.js";
+  import { users } from "../stores/users.js";
   import { expiryFor } from "../chat-rules.js";
   import {
     addDmMessage,
@@ -306,11 +308,13 @@
   let showTtlPicker = $state(false);
   // Re-read whenever the conversation changes, or the prefs do: `$uiPrefs` and
   // `$channels` are the two stores those answers live in.
-  const activeTtl = $derived(
-    isDmMode
-      ? ($uiPrefs, dmMessageTtl($serverAddress, $activeDmUsername))
-      : ($channels, channelMessageTtl($serverAddress, $displayChannelId)),
-  );
+  const activeTtl = $derived.by(() => {
+    void $uiPrefs;
+    void $channels;
+    return isDmMode
+      ? dmMessageTtl($serverAddress, $activeDmUsername)
+      : channelMessageTtl($serverAddress, $displayChannelId);
+  });
 
   function chooseTtl(secs: number) {
     showTtlPicker = false;
@@ -339,8 +343,8 @@
           // They are away: the server's copy is the one way it reaches them,
           // and this is our own copy of it.
           const id = await invoke<string>("send_kept_dm", { server, account: away.account, content, ttlSecs });
-          const own = get(account.of(server));
-          const myId = get(userId.of(server));
+          const own = get(account.peek(server));
+          const myId = get(userId.peek(server));
           const now = Date.now();
           addDmMessage(server, myId, myId, own?.name ?? "", away.user_id, {
             user_id: myId,
@@ -392,9 +396,38 @@
       clearChannelChat($serverAddress, channelName);
     }
   }
+
+  // The server's copy of this conversation, where this account keeps one:
+  // clearing can delete what we wrote there too (1.0, A6)
+  let showClearMenu = $state(false);
+  let keptConv = $derived.by(() => {
+    const me = $account;
+    if (!me?.cloud) return null;
+    if (!isDmMode) return effectiveChannel?.log || null;
+    const peer =
+      $dmConversations.find((c) => c.user_id === $activeDmUserId)?.account ??
+      ((a) => (a ? accountHex(a) : undefined))($users.find((u) => u.user_id === $activeDmUserId)?.account);
+    if (!peer) return null;
+    const [lo, hi] = [accountHex(me.info.id), peer].sort();
+    return `d:${lo}:${hi}`;
+  });
+
+  function clearAndPurge() {
+    const [server, conv] = [$serverAddress, keptConv];
+    clearCurrentChat();
+    if (conv) invoke("account_purge", { server, conv }).catch((e) => addNotification(`Could not delete the server's copy: ${e}`, "error"));
+  }
+
+  function stopKeeping() {
+    const [server, conv] = [$serverAddress, keptConv];
+    if (conv) invoke("account_leave", { server, conv }).then(
+      () => addNotification(`#${channelName} is no longer kept for you, until you come back to it`, "info"),
+      (e) => addNotification(String(e), "error"),
+    );
+  }
 </script>
 
-<svelte:window onclick={() => { if (showEmojiPicker) showEmojiPicker = false; }} onkeydown={showEmojiPicker ? handleEmojiKeydown : undefined} />
+<svelte:window onclick={() => { if (showEmojiPicker) showEmojiPicker = false; showClearMenu = false; }} onkeydown={showEmojiPicker ? handleEmojiKeydown : undefined} />
 
 <!-- One picker for both forms: the direct message one and the channel one -->
 {#snippet emojiPicker()}
@@ -429,14 +462,14 @@
 <div class="chat-panel">
   <div class="chat-header" class:custom={headerExtra}>
     {#if isDmMode}
-      <button class="back-btn" onclick={backToChannel} title="Back to channel chat"><Icon name="arrow-left" size={16} /></button>
+      <button aria-label="Back to channel chat" class="back-btn" onclick={backToChannel} title="Back to channel chat"><Icon name="arrow-left" size={16} /></button>
       <span class="chat-title" title={$activeDmUsername}>DM with {shortName($activeDmUsername)}</span>
       {#if totalUnreadChannels > 0}
         <span class="unread-badge" title="Unread channel messages">{totalUnreadChannels}</span>
       {/if}
     {:else}
       {#if $isPreviewing}
-        <button class="back-btn" onclick={endPreview} title="Stop previewing"><Icon name="arrow-left" size={16} /></button>
+        <button aria-label="Stop previewing" class="back-btn" onclick={endPreview} title="Stop previewing"><Icon name="arrow-left" size={16} /></button>
       {/if}
       {#if !isLobby}
         <!-- Channel 0 is "not in voice", not a channel: it has no name to show -->
@@ -498,7 +531,26 @@
       {/if}
     {/if}
     {#if displayMessages.length > 0 && !isLobby}
-      <button class="clear-chat-btn" onclick={clearCurrentChat} title="Clear chat history"><Icon name="trash" size={16} /></button>
+      <button
+        class="clear-chat-btn"
+        onclick={(e) => { if (keptConv) { e.stopPropagation(); showClearMenu = !showClearMenu; } else clearCurrentChat(); }}
+        title="Clear chat history"
+      ><Icon name="trash" size={16} /></button>
+      {#if showClearMenu && keptConv}
+        <div class="ttl-picker clear-menu" role="presentation" onclick={(e) => e.stopPropagation()}>
+          <button class="ttl-choice" onclick={() => { showClearMenu = false; clearCurrentChat(); }}>Clear here</button>
+          <button class="ttl-choice" onclick={() => { showClearMenu = false; clearAndPurge(); }}>
+            Clear here, and delete what I wrote from the server's copy
+          </button>
+          {#if !isDmMode && !effectiveChannel?.text}
+            <button class="ttl-choice" onclick={() => { showClearMenu = false; stopKeeping(); }}>Stop keeping this channel's messages for me</button>
+          {/if}
+          <p class="ttl-note">
+            Other people's devices are asked to drop their copies of what you wrote; one that already read them
+            may keep them.
+          </p>
+        </div>
+      {/if}
     {/if}
     {#if headerExtra}
       <span class="header-extra">{@render headerExtra()}</span>
@@ -632,9 +684,12 @@
 </div>
 
 {#if linkPopupUrl !== null}
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="link-overlay" onclick={() => (linkPopupUrl = null)}>
-    <div class="link-dialog" onclick={(e) => e.stopPropagation()}>
+  <div class="link-overlay" role="presentation" onclick={backdrop(() => (linkPopupUrl = null))}>
+    <div
+      class="link-dialog"
+      aria-label="Copy link"
+      use:dialog={{ onclose: () => (linkPopupUrl = null) }}
+    >
       <span class="link-title">Copy link</span>
       <input
         class="link-input"

@@ -560,7 +560,7 @@ await sleep(800);
 check("unmuting clears your own row again", (await alice.evaluate(rowMuted(null))) === false);
 
 // 4. Channel settings: change the proximity mode (and leave the password alone)
-await alice.evaluate(`(() => { const el = document.querySelector(".channel.active .settings-icon"); if (!el) return false; el.click(); return true; })()`);
+await alice.evaluate(`(() => { const el = document.querySelector(".channel-row:has(> .channel.active) .settings-icon"); if (!el) return false; el.click(); return true; })()`);
 await sleep(400);
 if (await alice.evaluate(`!!document.querySelector(".password-dialog select")`)) {
   await alice.evaluate(setSelect(".password-dialog select", "3d"));
@@ -573,7 +573,7 @@ if (await alice.evaluate(`!!document.querySelector(".password-dialog select")`))
 }
 
 // 5. Switching the channel off closes the room again
-await alice.evaluate(`(() => { const el = document.querySelector(".channel.active .settings-icon"); if (!el) return false; el.click(); return true; })()`);
+await alice.evaluate(`(() => { const el = document.querySelector(".channel-row:has(> .channel.active) .settings-icon"); if (!el) return false; el.click(); return true; })()`);
 await sleep(400);
 await alice.evaluate(setSelect(".password-dialog select", "off"));
 await alice.evaluate(click(".password-dialog .create-btn"));
@@ -619,7 +619,7 @@ const wireNames = await bob.evaluate(
 check("no real name reached the observer's client", !wireNames.includes("ui-alice"), wireNames);
 
 // Hidden + no sharing + hidden members, set through the settings dialog
-await alice.evaluate(`(() => { const el = document.querySelector(".channel.active .settings-icon"); if (!el) return false; el.click(); return true; })()`);
+await alice.evaluate(`(() => { const el = document.querySelector(".channel-row:has(> .channel.active) .settings-icon"); if (!el) return false; el.click(); return true; })()`);
 await sleep(400);
 // By data-opt, not by position: these used to be b[0], b[2] and b[3] of the
 // checkbox list, so inserting an option — or moving this dialog into its own
@@ -805,6 +805,56 @@ check(
   const close = `document.querySelector(".close-btn")?.click()`;
   await alice.evaluate(close);
   await sleep(400);
+}
+
+// 9b. Keyboard (H5-04). Every overlay shares one modal behaviour
+//     (actions/dialog.ts): it is announced as a modal dialog named after its
+//     title, focus moves into it, Tab cannot walk out into the page behind,
+//     Escape closes it, and focus goes back to what opened it. A channel row's
+//     own controls are buttons beside the row, so Tab reaches them.
+{
+  const press = async (k, code, vk, modifiers = 0) => {
+    await alice.send("Input.dispatchKeyEvent", { type: "rawKeyDown", key: k, code, windowsVirtualKeyCode: vk, modifiers });
+    await alice.send("Input.dispatchKeyEvent", { type: "keyUp", key: k, code, windowsVirtualKeyCode: vk, modifiers });
+    await sleep(150);
+  };
+  const SHIFT = 8;
+  const modal = `document.querySelector('[role="dialog"][aria-modal="true"]')`;
+  const inside = `(() => { const d = ${modal}; return !!d && d.contains(document.activeElement); })()`;
+
+  await realClick(alice, ".settings-btn");
+  await waitFor(alice, modal);
+  await sleep(300);
+  const title = await alice.evaluate(
+    `(() => { const d = ${modal}; return document.getElementById(d?.getAttribute("aria-labelledby"))?.textContent.trim() ?? null; })()`,
+  );
+  check("Settings is a modal dialog named after its title", title === "Settings", String(title));
+  check("opening it puts focus inside", await alice.evaluate(inside));
+  let stayed = true;
+  for (let i = 0; i < 3; i++) {
+    await press("Tab", "Tab", 9, SHIFT);
+    stayed &&= await alice.evaluate(inside);
+  }
+  check("Shift+Tab does not leave it", stayed);
+  await press("Escape", "Escape", 27);
+  check("Escape closes it", !(await alice.evaluate(`!!${modal}`)));
+  check(
+    "and focus goes back to the button that opened it",
+    await alice.evaluate(`!!document.activeElement?.classList.contains("settings-btn")`),
+  );
+
+  const row = `document.querySelector(".channel-row:has(.settings-icon) > .channel")`;
+  if (await alice.evaluate(`!!${row}`)) {
+    await alice.evaluate(`${row}.focus()`);
+    await press("Tab", "Tab", 9);
+    check(
+      "Tab goes from a channel row to its own controls",
+      await alice.evaluate(
+        `document.activeElement?.tagName === "BUTTON" && document.activeElement.classList.contains("settings-icon") && !document.activeElement.closest(".channel")`,
+      ),
+    );
+    await alice.evaluate(`document.activeElement?.blur()`);
+  }
 }
 
 // 10. Appearance: the palette actually reaches the document, and what it
@@ -1066,7 +1116,7 @@ check(
     await sleep(200);
     const glyphAt = await alice.evaluate(`(() => {
       const row = ${rowByName(TEXT_CHANNEL)}; if (!row) return null;
-      const g = row.querySelector('.settings-icon[title="Leave this channel"]'); if (!g) return null;
+      const g = row.parentElement.querySelector('.settings-icon[title="Leave this channel"]'); if (!g) return null;
       const r = g.getBoundingClientRect();
       return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
     })()`);
@@ -1115,7 +1165,7 @@ check(
   const nestedUnder = await alice.evaluate(`(() => {
     const row = [...document.querySelectorAll(".channel-list.modern .channel")]
       .find((r) => r.querySelector(".channel-name")?.textContent === ${JSON.stringify(bobRoom)});
-    const nested = row?.nextElementSibling;
+    const nested = row?.parentElement?.nextElementSibling;
     return nested && nested.classList.contains("nested")
       ? [...nested.querySelectorAll(".nested-name")].map((e) => e.textContent.trim())
       : []; })()`);
@@ -1318,7 +1368,7 @@ check(
 
   const opened = await alice.evaluate(
     `(() => { const row = [...document.querySelectorAll(".channel")].find((e) => e.textContent.includes(${JSON.stringify(TIMED)}));
-       const gear = row?.querySelector('[title="Channel settings"]');
+       const gear = row?.parentElement?.querySelector('[title="Channel settings"]');
        if (!gear) return false; gear.dispatchEvent(new MouseEvent("click", { bubbles: true })); return true; })()`,
   );
   await sleep(500);
@@ -1906,6 +1956,7 @@ if (PORT3) {
   await two.evaluate(setInput("#account-password2", pw));
   await realClick(two, ".connect-btn");
   await waitFor(two, `document.querySelector('.account-dialog[data-kind="recovery"]')`, 60_000);
+  const keyB = await two.evaluate(`document.querySelector('.account-dialog .secret')?.textContent ?? ""`);
   await realClick(two, '.account-dialog[data-kind="recovery"] .submit-btn');
   await settle(two);
   const safety = async (tab, other) => {
@@ -2021,6 +2072,16 @@ if (PORT3) {
     10_000,
   ).then(() => true, () => false));
   check("and the reply is there when they come back", replyCaught, replyListed ? await texts(aliceAgain) : "no conversation listed");
+  // 1.0 (A6): the writer deletes what she kept in the channel, the server's
+  // copy included (a tombstone follows for the readers' devices).
+  await openKept(aliceAgain);
+  await waitFor(aliceAgain, `[...document.querySelectorAll(".msg-content")].some((e) => e.textContent.includes(${JSON.stringify(note)}))`, 15_000).catch(() => {});
+  await aliceAgain.evaluate(click('button.clear-chat-btn[title="Clear chat history"]'));
+  const menu = await waitFor(aliceAgain, `document.querySelector(".clear-menu")`, 5_000).then(() => true, () => false);
+  if (menu) await aliceAgain.evaluate(`[...document.querySelectorAll(".clear-menu .ttl-choice")].find((b) => b.textContent.includes("server's copy"))?.click()`);
+  const purgedToast = await waitFor(aliceAgain, `(window.__toasts ?? []).some((t) => /[1-9]\d* kept messages? deleted/.test(t))`, 15_000).then(() => true, () => false);
+  check("a writer deletes what she kept in a channel from the server", menu && purgedToast, await aliceAgain.evaluate(`(window.__toasts ?? []).join(" | ")`));
+  await sleep(1500); // the tombstone goes out
   await aliceAgain.send("Page.close").catch(() => {});
 
   // Two-factor codes, set up from the account panel, then a sign-in on a
@@ -2088,7 +2149,123 @@ if (PORT3) {
     (await four.evaluate(`document.querySelector(".account-dialog .error")?.textContent ?? document.querySelector(".error")?.textContent ?? ""`)) +
       " | " + (await four.evaluate(`(window.__toasts ?? []).join(" | ")`)),
   );
+  // 1.0 (A5): bans that outlast a restart. The admin token makes this account
+  // (codes on) the first admin; it bans the second account by name from
+  // Active bans, which then cannot sign in, and lifting it lets it back.
+  if (inWithCode) {
+    // DOM clicks: a toast from the sign-in may cover the status bar. (The
+    // account's own button there is an .admin-btn too.)
+    await four.evaluate(click('button.admin-btn[title^="Admin login"]'));
+    await waitFor(four, `document.querySelector(".admin-dialog .admin-input")`);
+    await four.evaluate(setInput('.admin-dialog input[type="password"]', "e2e-admin-token-0001"));
+    await four.evaluate(click(".admin-dialog .admin-ok"));
+    const madeAdmin = await waitFor(four, `document.querySelector(".admin-btn.active")`, 15_000).then(() => true, () => false);
+    check("the admin token makes an account with codes the first admin", madeAdmin, await four.evaluate(`(window.__toasts ?? []).join(" | ")`));
+    if (madeAdmin) {
+      await four.evaluate(click("button.admin-btn.active"));
+      await waitFor(four, `document.querySelector(".ban-add")`);
+      await four.evaluate(setInput('.ban-add input[aria-label="Account to ban"]', acctB));
+      await four.evaluate(setInput('.ban-add input[aria-label="Reason"]', "e2e ban"));
+      await four.evaluate(click(".ban-add .admin-ok"));
+      const banRow = `[...document.querySelectorAll(".ban-list li")].find((li) => li.querySelector(".ban-label")?.textContent === ${JSON.stringify(acctB)})`;
+      const listed = await waitFor(four, `!!(${banRow})`, 10_000).then(() => true, () => false);
+      check("an account banned by name is listed under Active bans", listed, await four.evaluate(`document.querySelector(".admin-dialog")?.innerText ?? ""`));
+      const banned = await openDialog();
+      await banned.evaluate(setInput("#account-name", acctB));
+      await banned.evaluate(setInput("#account-password", pw));
+      await realClick(banned, ".connect-btn");
+      const refusedBan = await waitFor(banned, `/This account is banned/.test(document.querySelector(".error")?.textContent ?? "")`, 30_000).then(() => true, () => false);
+      check("and cannot sign in", refusedBan, await banned.evaluate(`document.querySelector(".error")?.textContent ?? ""`));
+      await banned.send("Page.close").catch(() => {});
+      await four.evaluate(`${banRow}?.querySelector("button")?.click()`);
+      const lifted = await waitFor(four, `!(${banRow})`, 10_000).then(() => true, () => false);
+      check("Unban lifts it", listed && lifted);
+    }
+  }
   await four.send("Page.close").catch(() => {});
+
+  // A new password from the account panel, on a browser the relay remembers
+  // (a device-key session, never "fresh": the form asks for the current
+  // password). Every device key goes with the old password, this browser's
+  // too, so it is remembered again at once.
+  const pw2 = "a brand new passphrase";
+  const five = await openDialog();
+  await five.evaluate(setInput("#account-name", acct));
+  await waitFor(five, `document.querySelector("#account-password")?.placeholder?.includes("remembered")`);
+  await realClick(five, ".connect-btn");
+  await settle(five);
+  await waitFor(five, `document.querySelector('${panel}')`, 10_000);
+  await realClick(five, panel);
+  await waitFor(five, `document.querySelector('.account-dialog[data-kind="account"]')`);
+  await five.evaluate(`[...document.querySelectorAll('.account-dialog[data-kind="account"] .row')].find((r) => r.querySelector("span")?.textContent === "Password").querySelector("button").click()`);
+  await waitFor(five, `document.querySelector("#acct-old-password")`);
+  await five.evaluate(setInput("#acct-old-password", pw));
+  await five.evaluate(setInput("#acct-new-password", pw2));
+  await five.evaluate(setInput("#acct-new-password2", pw2));
+  await realClick(five, '.account-dialog[data-kind="password"] .submit-btn');
+  const changed = await waitFor(five, `(window.__toasts ?? []).some((t) => /password changed/.test(t))`, 30_000).then(() => true, () => false);
+  check(
+    "a new password from the account panel",
+    changed,
+    (await five.evaluate(`document.querySelector(".account-dialog .error")?.textContent ?? ""`)) + " | " + (await five.evaluate(`(window.__toasts ?? []).join(" | ")`)),
+  );
+  const reRemembered = await waitFor(five, `(window.__toasts ?? []).some((t) => /this device is remembered/.test(t))`, 15_000).then(() => true, () => false);
+  check("and this browser is remembered again at once", reRemembered, await five.evaluate(`(window.__toasts ?? []).join(" | ")`));
+  await five.send("Page.close").catch(() => {});
+
+  // 1.0 audit H5-01: a server naming the relay id this browser knows from
+  // another address is refused before anything of the password goes out.
+  // Planted here, as a second account relay would have left it.
+  const clash = await openDialog();
+  const ids = JSON.parse(await clash.evaluate(`localStorage.getItem("voipc.relay_ids") ?? "{}"`));
+  const realId = Object.values(ids)[0];
+  check("the browser remembers the relay's id", typeof realId === "string" && realId.length === 32, JSON.stringify(ids));
+  await clash.evaluate(`localStorage.setItem("voipc.relay_ids", ${JSON.stringify(JSON.stringify({ "elsewhere.example:9987": realId }))})`);
+  await clash.evaluate(setInput("#account-name", acct));
+  await clash.evaluate(setInput("#account-password", pw2));
+  await realClick(clash, ".connect-btn");
+  const clashed = await waitFor(clash, `/another server you use/.test(document.querySelector(".error")?.textContent ?? "")`, 30_000).then(() => true, () => false);
+  check("a server claiming another's relay id is refused", clashed, await clash.evaluate(`document.querySelector(".error")?.textContent ?? ""`));
+  // The way out the dialog offers: forget that id; then the new password signs in.
+  await clash.evaluate(`[...document.querySelectorAll(".save-server-btn")].find((b) => b.textContent.includes("Forget the account id"))?.click()`);
+  await clash.evaluate(setInput("#account-password", pw2));
+  await realClick(clash, ".connect-btn");
+  const newIn = await waitFor(clash, `!!document.querySelector('${panel}')`, 60_000).then(() => true, () => false);
+  check(
+    "and once it is forgotten, the new password signs in",
+    newIn,
+    (await clash.evaluate(`document.querySelector(".error")?.textContent ?? ""`)) + " | " + (await clash.evaluate(`(window.__toasts ?? []).join(" | ")`)),
+  );
+  await clash.send("Page.close").catch(() => {});
+
+  // Forgot the password: the recovery key sets a new one, and the dialog
+  // signs in with it at once.
+  const pw3 = "reset with the recovery key";
+  const six = await openDialog();
+  await six.evaluate(setInput("#account-name", acctB));
+  await realClick(six, ".link-btn");
+  await waitFor(six, `document.querySelector("#account-recovery")`);
+  await six.evaluate(setInput("#account-recovery", keyB));
+  await six.evaluate(setInput("#account-password", pw3));
+  await six.evaluate(setInput("#account-password2", pw3));
+  await realClick(six, ".connect-btn");
+  const resetIn = await waitFor(six, `!!document.querySelector('${panel}')`, 60_000).then(() => true, () => false);
+  check(
+    "the recovery key sets a new password and signs in with it",
+    resetIn,
+    (await six.evaluate(`document.querySelector(".error")?.textContent ?? ""`)) + " | " + (await six.evaluate(`(window.__toasts ?? []).join(" | ")`)),
+  );
+  if (resetIn) {
+    // What the writer deleted above does not come back to this reader
+    await openKept(six);
+    await sleep(5000);
+    check(
+      "and a message its writer deleted is not there for the reader",
+      !(await six.evaluate(`[...document.querySelectorAll(".msg-content")].some((e) => e.textContent.includes(${JSON.stringify(note)}))`)),
+      await texts(six),
+    );
+  }
+  await six.send("Page.close").catch(() => {});
 
   // The name is the account's now: a guest cannot take it.
   const guest = await newTab();
@@ -2111,12 +2288,44 @@ if (PORT3) {
   await realClick(guest, ".connect-btn");
   await waitFor(guest, `/Wrong username or password/.test(document.querySelector(".error")?.textContent ?? "")`, 30_000);
   check("a wrong password is refused", true);
-  const fatal = [...up.errors, ...back.errors, ...two.errors, ...bobAgain.errors, ...aliceAgain.errors, ...three.errors, ...four.errors, ...guest.errors].filter(
+  const fatal = [...up.errors, ...back.errors, ...two.errors, ...bobAgain.errors, ...aliceAgain.errors, ...three.errors, ...four.errors, ...five.errors, ...clash.errors, ...six.errors, ...guest.errors].filter(
     (e) => !/Failed to load resource/.test(e),
   );
   check("the accounts lane threw nothing", fatal.length === 0, fatal.slice(0, 2).join(" | "));
 } else {
   console.log("SKIP the accounts lane (no accounts server port given)");
+}
+
+// 18. A browser that ran 0.12.0 (1.0 upgrade fixtures). Its voipc.settings,
+//     written by 0.12.0's own config.ts (client/src/lib/__fixtures__/0.12.0),
+//     must load as it is: nothing set aside as unreadable, the saved server
+//     still offered. On the second server's origin, because localStorage is
+//     per origin and every other lane shares the first one's.
+if (PORT2) {
+  const { readFileSync } = await import("node:fs");
+  const settings = readFileSync(new globalThis.URL("client/src/lib/__fixtures__/0.12.0/voipc.settings.json", import.meta.url), "utf8");
+  const old = await newTab();
+  await old.send("Page.navigate", { url: `https://127.0.0.1:${PORT2}/favicon.png` });
+  await waitFor(old, `document.readyState === "complete"`);
+  await old.evaluate(`(() => { localStorage.clear();
+    localStorage.setItem("voipc.settings", ${JSON.stringify(settings)}); return true; })()`);
+  await old.send("Page.navigate", { url: `https://127.0.0.1:${PORT2}/` });
+  await waitFor(old, `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`);
+  if (await old.evaluate(`!!document.querySelector(".skip-link")`)) {
+    await old.evaluate(click(".skip-link"));
+    await waitFor(old, `document.querySelector(".connect-btn")`);
+  }
+  check(
+    "a 0.12 browser's settings are not set aside as unreadable",
+    await old.evaluate(`localStorage.getItem("voipc.settings.unreadable") === null`),
+  );
+  check(
+    "a 0.12 browser's saved server is still offered",
+    await old.evaluate(`[...document.querySelectorAll(".saved-server")].some((e) =>
+      e.querySelector(".saved-name")?.textContent === "Home" && /voice\.example\.org:9987/.test(e.textContent))`),
+  );
+  const fatal = old.errors.filter((e) => !/Failed to load resource/.test(e));
+  check("the 0.12 settings threw nothing", fatal.length === 0, fatal.slice(0, 2).join(" | "));
 }
 
 // 7. Nothing threw anywhere. One uncaught exception in a keyed {#each} wedges

@@ -47,6 +47,18 @@ pub struct AppState {
     /// Keyed by the exact `address` the front end passed to `connect`, never
     /// re-normalised: later commands name the server by that same string.
     pub connections: RwLock<Connections>,
+    /// Held from a capture's start or stop until its thread has really
+    /// finished — the microphone's and the screen's, one each. A stop waits up
+    /// to 2 s for the device to close, and it waits on this, not on
+    /// `connections`: under that lock the wait stalled every command, the SDK
+    /// and the push-to-talk release behind it (H4-07). A start takes the same
+    /// gate, so it never reopens a device whose old thread is still closing.
+    /// Order: a gate first, then `connections`.
+    pub mic_gate: tokio::sync::Mutex<()>,
+    pub share_gate: tokio::sync::Mutex<()>,
+    /// What the voice mixer plays, for the microphone's echo canceller.
+    #[cfg(not(target_os = "android"))]
+    pub echo_reference: Arc<voipc_audio::echo::EchoReference>,
     /// The server whose voice channel we are in, if any.
     ///
     /// Stored, not derived from which connection has a channel other than 0:
@@ -121,6 +133,10 @@ pub struct AppState {
     /// connection because the listener outlives connections: a socket
     /// subscribes once and keeps receiving across a reconnect.
     pub sdk_events: tokio::sync::broadcast::Sender<SdkEvent>,
+    /// Bumped by every voice move the user makes themselves (`join_channel`
+    /// outside text). A game socket notes it at its `hello`; once it moved,
+    /// that socket may no longer move the user back (docs/SDK.md, `player_left`).
+    pub user_moved: AtomicU64,
     /// Why the SDK listener could not bind, for Settings; None while it listens.
     pub sdk_listen_error: Arc<std::sync::Mutex<Option<String>>>,
 }
@@ -146,12 +162,19 @@ pub enum SdkEvent {
     /// pushing edges against, so a mod cannot go on watching who speaks in a
     /// channel the user walked into without it.
     Detached,
+    /// The user's channel changed while no game was driving it. A socket the
+    /// user walked away from checks whether they are back (`returned`).
+    Moved,
 }
 
 impl AppState {
     pub fn new() -> Self {
         let state = Self {
             connections: RwLock::new(HashMap::new()),
+            mic_gate: tokio::sync::Mutex::new(()),
+            share_gate: tokio::sync::Mutex::new(()),
+            #[cfg(not(target_os = "android"))]
+            echo_reference: Arc::default(),
             voice_server: std::sync::Mutex::new(None),
             connect_locks: std::sync::Mutex::new(HashMap::new()),
             totp_answers: std::sync::Mutex::new(HashMap::new()),
@@ -177,6 +200,7 @@ impl AppState {
             sdk_game: Arc::new(std::sync::Mutex::new(None)),
             // Enough for a burst of talk edges; a lagging socket skips ahead
             sdk_events: tokio::sync::broadcast::channel(64).0,
+            user_moved: AtomicU64::new(0),
             sdk_listen_error: Arc::new(std::sync::Mutex::new(None)),
         };
         state.seed_shared(&UserSettings::default());
@@ -480,95 +504,7 @@ pub struct ActiveConnection {
     pub channels: Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
 }
 
-/// Longest glide between two SDK updates: later than this is a stall, not
-/// motion, so the source waits where it is instead of crawling.
-pub const MAX_GLIDE: std::time::Duration = std::time::Duration::from_millis(250);
-pub const MIN_GLIDE: std::time::Duration = std::time::Duration::from_millis(20);
-/// Further than this in one update is a teleport (respawn, warp), not a walk.
-/// A car at 50 m/s covers 12.5 m per 4 Hz tick, so the bar is deliberately high.
-pub const TELEPORT_M: f32 = 50.0;
-
-/// A placement on its way from where the game last had it to where it is now.
-///
-/// Updates arrive 4–10 times a second; rendered as they come, the pan and the
-/// volume step at that rate. The mixer reads the interpolated pose instead, so
-/// a 4 Hz mod sounds continuous. Room drags and position beacons do not use
-/// this — they snap, as they always did.
-#[derive(Debug, Clone, Copy)]
-pub struct Motion {
-    pub from: [f32; 3],
-    pub to: [f32; 3],
-    /// Facing at both ends; only the listener turns.
-    pub fwd: Option<([f32; 2], [f32; 2])>,
-    pub at: std::time::Instant,
-    pub over: std::time::Duration,
-}
-
-impl Motion {
-    pub fn snap(pos: [f32; 3], now: std::time::Instant) -> Self {
-        Self {
-            from: pos,
-            to: pos,
-            fwd: None,
-            at: now,
-            over: std::time::Duration::ZERO,
-        }
-    }
-
-    /// Glide on from wherever `prev` is right now: an update that arrives
-    /// mid-flight must not jump back to the previous start.
-    pub fn glide(
-        prev: &Motion,
-        to: [f32; 3],
-        over: std::time::Duration,
-        now: std::time::Instant,
-    ) -> Self {
-        let from = prev.pos_at(now);
-        let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
-        if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() > TELEPORT_M {
-            return Self::snap(to, now);
-        }
-        Self {
-            from,
-            to,
-            fwd: None,
-            at: now,
-            over,
-        }
-    }
-
-    fn t(&self, now: std::time::Instant) -> f32 {
-        if self.over.is_zero() {
-            return 1.0;
-        }
-        (now.saturating_duration_since(self.at).as_secs_f32() / self.over.as_secs_f32()).min(1.0)
-    }
-
-    pub fn pos_at(&self, now: std::time::Instant) -> [f32; 3] {
-        let t = self.t(now);
-        [
-            self.from[0] + (self.to[0] - self.from[0]) * t,
-            self.from[1] + (self.to[1] - self.from[1]) * t,
-            self.from[2] + (self.to[2] - self.from[2]) * t,
-        ]
-    }
-
-    /// Lerp and renormalise. An exact U-turn passes through zero length, which
-    /// has no direction, so it faces the new way instead.
-    pub fn fwd_at(&self, now: std::time::Instant) -> [f32; 2] {
-        let Some((a, b)) = self.fwd else {
-            return [0.0, 1.0];
-        };
-        let t = self.t(now);
-        let v = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
-        let len = (v[0] * v[0] + v[1] * v[1]).sqrt();
-        if len > 1e-3 {
-            [v[0] / len, v[1] / len]
-        } else {
-            b
-        }
-    }
-}
+pub use voipc_audio::game::{Motion, MAX_GLIDE, MIN_GLIDE};
 
 /// Everything the mixer needs to render voices positionally.
 ///
@@ -992,6 +928,7 @@ impl Default for UserSettings {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
+    use voipc_audio::game::TELEPORT_M;
     use voipc_audio::spatial::{FLAT, MAX_MUFFLE, Source};
 
     fn test_state(mode: ProximityMode, stopping: bool) -> SpatialTest {

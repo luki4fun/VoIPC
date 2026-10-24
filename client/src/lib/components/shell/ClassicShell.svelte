@@ -39,7 +39,7 @@
 <div class="app-layout" class:mobile={$isMobile} oncontextmenu={(e) => e.preventDefault()}>
   <div class="titlebar">
     <span class="title">VoIPC</span>
-    <button class="settings-btn" onclick={onopensettings} title="Settings">
+    <button aria-label="Settings" class="settings-btn" onclick={onopensettings} title="Settings">
       <Icon name="settings" size={18} />
     </button>
   </div>

@@ -21,6 +21,30 @@ const MAX_LOGKEY_LOOKUPS: usize = 64;
 /// Most stored members a channel's log takes: a key goes to each of them in
 /// one frame (`EpochPut`), and their keys come back in one (`LogMembersFound`).
 const MAX_MEMBERS: i64 = 256;
+/// New epochs one writer may start in one conversation per hour: a rekey for
+/// every member who joins or leaves, with room to spare. Each is a row per
+/// member, so unbounded they filled the database at the message rate
+/// (1.0 audit H1-03).
+const NEW_EPOCHS_PER_HOUR: i64 = 60;
+/// Wraps one fetch returns, under the 64 KiB frame.
+const WRAPS_PER_FETCH: i64 = 400;
+
+/// What an account keeps here: its entries and the keys it wrapped for them.
+async fn used_bytes(relay: &Relay, me: &AccountId) -> Result<i64> {
+    let entries: i64 = db!(relay.store(), pool => {
+        sqlx::query_scalar("SELECT CAST(COALESCE(SUM(LENGTH(ct)), 0) AS BIGINT) FROM voipc_log WHERE sender = $1")
+            .bind(&me.0[..])
+            .fetch_one(pool)
+            .await?
+    });
+    let wraps: i64 = db!(relay.store(), pool => {
+        sqlx::query_scalar("SELECT CAST(COALESCE(SUM(LENGTH(wrapped)), 0) AS BIGINT) FROM voipc_wraps WHERE owner = $1")
+            .bind(&me.0[..])
+            .fetch_one(pool)
+            .await?
+    });
+    Ok(entries + wraps)
+}
 
 /// Rows as they come back: an account's keys (name, identity, log key,
 /// signature), an entry (seq, sender, epoch, server_at, sealed), and a
@@ -106,11 +130,38 @@ pub(super) async fn epoch_put(relay: &Relay, me: AccountId, conv: &str, epoch: u
         return Ok((refused("EpochPut", "wraps for somebody outside the conversation"), Vec::new()));
     }
     let now = util::now();
-    for w in wraps {
-        // Insert only: an epoch key once handed out is never replaced, so a
-        // second device minting the same epoch at the same moment loses
-        // quietly and reads the first one's instead.
-        db!(relay.store(), pool => {
+    let known: i64 = db!(relay.store(), pool => {
+        sqlx::query_scalar("SELECT COUNT(*) FROM voipc_wraps WHERE conv = $1 AND owner = $2 AND epoch = $3")
+            .bind(conv)
+            .bind(&me.0[..])
+            .bind(i64::from(epoch))
+            .fetch_one(pool)
+            .await?
+    });
+    if known == 0 {
+        let recent: i64 = db!(relay.store(), pool => {
+            sqlx::query_scalar("SELECT COUNT(DISTINCT epoch) FROM voipc_wraps WHERE conv = $1 AND owner = $2 AND created_at > $3")
+                .bind(conv)
+                .bind(&me.0[..])
+                .bind(now - 3600)
+                .fetch_one(pool)
+                .await?
+        });
+        if recent >= NEW_EPOCHS_PER_HOUR {
+            return Ok((refused("EpochPut", "Too many new keys for this conversation; try again later."), Vec::new()));
+        }
+    }
+    let adding: i64 = wraps.iter().map(|w| w.wrapped.len() as i64).sum();
+    if used_bytes(relay, &me).await? + adding > relay.quota {
+        return Ok((refused("EpochPut", "Your stored messages are over this server's limit."), Vec::new()));
+    }
+    // One transaction: one commit for the whole epoch, not one per member
+    db!(relay.store(), pool => {
+        let mut tx = pool.begin().await?;
+        for w in wraps {
+            // Insert only: an epoch key once handed out is never replaced, so
+            // a second device minting the same epoch at the same moment loses
+            // quietly and reads the first one's instead.
             sqlx::query(
                 "INSERT INTO voipc_wraps (conv, owner, epoch, recipient, wrapped, created_at) VALUES ($1, $2, $3, $4, $5, $6)
                  ON CONFLICT DO NOTHING",
@@ -121,19 +172,18 @@ pub(super) async fn epoch_put(relay: &Relay, me: AccountId, conv: &str, epoch: u
             .bind(&w.recipient[..])
             .bind(&w.wrapped)
             .bind(now)
-            .execute(pool)
+            .execute(&mut *tx)
             .await?;
-        });
-        // A key to somebody who joined is our answer to their joining.
-        db!(relay.store(), pool => {
+            // A key to somebody who joined is our answer to their joining.
             sqlx::query("DELETE FROM voipc_pending WHERE conv = $1 AND owner = $2 AND recipient = $3")
                 .bind(conv)
                 .bind(&me.0[..])
                 .bind(&w.recipient[..])
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
-        });
-    }
+        }
+        tx.commit().await?;
+    });
     let told = wraps.iter().map(|w| w.recipient).filter(|r| *r != me.0).collect();
     Ok((AccountReply::EpochStored { conv: conv.to_string(), epoch }, told))
 }
@@ -142,14 +192,32 @@ pub(super) async fn wraps(relay: &Relay, me: AccountId, conv: &str) -> Result<Ac
     if members(relay, conv, &me.0).await?.is_none() {
         return Ok(refused("WrapsFetch", "not a conversation of yours"));
     }
-    // ponytail: the newest 400 only. Wraps of epochs with nothing left in
-    // them go with the sweep, so this is a bound on keys still in use.
-    let rows: Vec<(Vec<u8>, i64, Vec<u8>)> = db!(relay.store(), pool => {
-        sqlx::query_as("SELECT owner, epoch, wrapped FROM voipc_wraps WHERE recipient = $1 AND conv = $2 ORDER BY created_at DESC LIMIT 400")
+    // shortcut: the newest 400 only (wraps of epochs with nothing left in
+    // them go with the sweep), but each writer's newest share of them: one
+    // member minting epochs no longer pushes everybody else's keys out of the
+    // window (1.0 audit H1-04). Paging if conversations outgrow the share.
+    let owners: i64 = db!(relay.store(), pool => {
+        sqlx::query_scalar("SELECT COUNT(DISTINCT owner) FROM voipc_wraps WHERE recipient = $1 AND conv = $2")
             .bind(&me.0[..])
             .bind(conv)
-            .fetch_all(pool)
+            .fetch_one(pool)
             .await?
+    });
+    let share = (WRAPS_PER_FETCH / owners.max(1)).max(8);
+    let rows: Vec<(Vec<u8>, i64, Vec<u8>)> = db!(relay.store(), pool => {
+        sqlx::query_as(
+            "SELECT owner, epoch, wrapped FROM (
+                 SELECT owner, epoch, wrapped, created_at,
+                        ROW_NUMBER() OVER (PARTITION BY owner ORDER BY created_at DESC) AS rn
+                 FROM voipc_wraps WHERE recipient = $1 AND conv = $2
+             ) AS w WHERE rn <= $3 ORDER BY created_at DESC LIMIT $4",
+        )
+        .bind(&me.0[..])
+        .bind(conv)
+        .bind(share)
+        .bind(WRAPS_PER_FETCH)
+        .fetch_all(pool)
+        .await?
     });
     let wraps = rows.into_iter().map(|(owner, epoch, wrapped)| WrapOut { owner: id16(owner), epoch: epoch as u32, wrapped }).collect();
     Ok(AccountReply::Wraps { conv: conv.to_string(), wraps })
@@ -184,13 +252,7 @@ pub(super) async fn append(relay: &Relay, me: AccountId, conv: &str, epoch: u32,
             return Ok(AccountReply::LogRekey { conv: conv.to_string() });
         }
     }
-    let used: i64 = db!(relay.store(), pool => {
-        sqlx::query_scalar("SELECT CAST(COALESCE(SUM(LENGTH(ct)), 0) AS BIGINT) FROM voipc_log WHERE sender = $1")
-            .bind(&me.0[..])
-            .fetch_one(pool)
-            .await?
-    });
-    if used + ct.len() as i64 > relay.quota {
+    if used_bytes(relay, &me).await? + ct.len() as i64 > relay.quota {
         return Ok(refused("LogAppend", "Your stored messages are over this server's limit."));
     }
     let server_at = now_ms();
@@ -338,6 +400,25 @@ pub(super) async fn leave(relay: &Relay, me: AccountId, conv: &str) -> Result<Ac
     }
     remove(relay.store(), conv, &me.0).await?;
     Ok(AccountReply::LogLeft { conv: conv.to_string() })
+}
+
+/// Deletes what `me` wrote to the stored logs, in `conv` or everywhere, and
+/// the keys it handed out for it. Other people's entries stay: they are
+/// theirs. Its next post there starts a new key.
+pub(super) async fn purge(relay: &Relay, me: AccountId, conv: Option<&str>) -> Result<AccountReply> {
+    let entries: u64 = db!(relay.store(), pool => {
+        let mut tx = pool.begin().await?;
+        let n = sqlx::query("DELETE FROM voipc_log WHERE sender = $1 AND ($2 IS NULL OR conv = $2)")
+            .bind(&me.0[..])
+            .bind(conv)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        sqlx::query("DELETE FROM voipc_wraps WHERE owner = $1 AND ($2 IS NULL OR conv = $2)").bind(&me.0[..]).bind(conv).execute(&mut *tx).await?;
+        tx.commit().await?;
+        n
+    });
+    Ok(AccountReply::LogPurged { conv: conv.map(str::to_string), entries })
 }
 
 /// Takes `account` out of a channel's log: it leaves, is kicked, or no longer

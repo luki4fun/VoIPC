@@ -3,9 +3,19 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 
-/// Server configuration, loaded from a TOML file.
+/// Server configuration, loaded from a TOML file. Unknown keys are refused, so
+/// a typo (`tcp_fallbak`) stops the start instead of quietly keeping a default,
+/// and an older server refuses a newer config rather than half-applying it.
+/// 1.x only ever adds keys.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServerConfig {
+    /// Gone since 0.5.0 (the page moved to `tcp_port`); still accepted so an
+    /// old file starts.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub(crate) web_port: Option<u16>,
+
     /// IP address to bind on (default "::", the dual-stack wildcard: one
     /// listener serves IPv6 and IPv4 clients). Use "0.0.0.0" for IPv4 only.
     /// Set this to the public/VPN IP that clients connect to so that QUIC
@@ -132,6 +142,26 @@ impl Default for AccountsConfig {
 }
 
 impl ServerConfig {
+    /// Numbers that would make the server look up but not work: refused at
+    /// the start, where the operator sees why (1.0 audit H1-06).
+    pub fn validate(&self) -> Result<()> {
+        if self.max_users == 0 {
+            return Err(anyhow!("max_users must be at least 1"));
+        }
+        if self.max_connections_per_ip < 2 {
+            return Err(anyhow!("max_connections_per_ip must be at least 2 (a browser holds two connections)"));
+        }
+        if self.accounts.mode != AccountsMode::Off {
+            if self.accounts.quota_mb == 0 {
+                return Err(anyhow!("[accounts] quota_mb must be at least 1: with 0, a new account's vault cannot be stored"));
+            }
+            if self.accounts.retention_days == 0 {
+                return Err(anyhow!("[accounts] retention_days must be at least 1: with 0, a kept message expires as it arrives"));
+            }
+        }
+        Ok(())
+    }
+
     /// Bind address for `port`.
     ///
     /// `host` may be a bare IPv6 literal (`"::"`), which needs brackets
@@ -169,6 +199,7 @@ fn default_max_connections_per_ip() -> u32 {
 impl Default for ServerConfig {
     fn default() -> Self {
         Self {
+            web_port: None,
             host: default_host(),
             tcp_port: default_tcp_port(),
             udp_port: default_udp_port(),
@@ -234,6 +265,23 @@ mod tests {
         assert!(config.accounts.cloud, "the rest keep their defaults");
         let typo = toml::from_str::<ServerConfig>("cert_path = \"c\"\nkey_path = \"k\"\n[accounts]\nmod = \"optional\"");
         assert!(typo.is_err(), "an unknown key fails the start");
+        let top = toml::from_str::<ServerConfig>("cert_path = \"c\"\nkey_path = \"k\"\ntcp_fallbak = true");
+        assert!(top.unwrap_err().to_string().contains("tcp_fallbak"), "a top-level typo fails the start, by name");
+    }
+
+    /// H1-06: numbers that would leave a server up but broken stop the start.
+    #[test]
+    fn numbers_that_would_break_the_server_are_refused() {
+        assert!(ServerConfig::default().validate().is_ok());
+        let parse = |extra: &str| toml::from_str::<ServerConfig>(&format!("cert_path = \"c\"\nkey_path = \"k\"\n{extra}")).unwrap();
+        let quota = parse("[accounts]\nmode = \"optional\"\nquota_mb = 0");
+        assert!(quota.validate().unwrap_err().to_string().contains("quota_mb"));
+        let retention = parse("[accounts]\nmode = \"optional\"\nretention_days = 0");
+        assert!(retention.validate().unwrap_err().to_string().contains("retention_days"));
+        let off = parse("[accounts]\nquota_mb = 0");
+        assert!(off.validate().is_ok(), "no accounts, no quota to mind");
+        assert!(parse("max_users = 0").validate().is_err());
+        assert!(parse("max_connections_per_ip = 1").validate().is_err());
     }
 
     #[test]

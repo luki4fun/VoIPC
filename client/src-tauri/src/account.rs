@@ -16,7 +16,7 @@ use tauri::{Manager, State};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
-use voipc_crypto::account::{normalize_name, password_ok, DeviceKey, Method, SignIn, Step, Zeroizing};
+use voipc_crypto::account::{normalize_name, password_ok, recovery_parse, stretch_salted, DeviceKey, Method, SignIn, Step, Zeroizing};
 use voipc_crypto::account_session::{memory_key, AccountSession, Actions};
 use voipc_crypto::sync::Prefs;
 use voipc_protocol::codec::{decode_server_msg, encode_client_msg, try_decode_frame, APP_VERSION, PROTOCOL_VERSION};
@@ -41,7 +41,14 @@ pub enum AccountArgs {
     Register { password: String, invite: Option<String> },
     /// With the key this device was given here before.
     Device,
+    /// A forgotten password: the recovery key (as shown) and the new one.
+    /// Ends with the error `RESET_DONE`, never signed in.
+    Reset { recovery: String, password: String },
 }
+
+/// What a reset ends with: the relay closes that connection, and the front
+/// end signs in with the new password (connect.ts `RESET_DONE`).
+pub const RESET_DONE: &str = "Your password was reset. Sign in with the new one.";
 
 /// What an account connection keeps: the shared session, fed and carried
 /// out here.
@@ -147,6 +154,11 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
             let key = DeviceKey::from_parts(rec.device_id, rec.device_key.clone()).ok_or("This device's key is damaged. Sign in with your password.")?;
             Method::Device { key, relay_id: rec.relay_id, dek: rec.dek }
         }
+        AccountArgs::Reset { recovery, password } => {
+            password_ok(&password)?;
+            let recovery = recovery_parse(&recovery).ok_or("That is not a recovery key: 52 letters and digits, as it was shown.")?;
+            Method::Reset { recovery: Zeroizing::new(recovery), password: Zeroizing::new(password) }
+        }
     };
     let password_based = !matches!(method, Method::Device { .. });
     let (mut machine, first) = SignIn::start(&name, method, PROTOCOL_VERSION, APP_VERSION);
@@ -168,6 +180,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
             }
             break (user_id, session_id, info);
         }
+        crate::network::note_refusal(app, server, &msg);
         // The password's stretching runs here: half a second of CPU, kept
         // off the other tasks on this worker.
         let steps = tokio::task::block_in_place(|| machine.on_message(&msg))?;
@@ -185,6 +198,12 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                     let out = if answer.recovery { machine.recovery_code(&answer.code) } else { machine.totp(&answer.code) };
                     write(send, &out).await?;
                 }
+                Step::ResetDone => {
+                    info!(server, "account password reset with the recovery key");
+                    return Err(RESET_DONE.into());
+                }
+                // Only the browser stretches outside the machine
+                Step::Stretch { .. } => return Err("unexpected sign-in step".into()),
                 Step::Ignore => {}
             }
         }
@@ -314,6 +333,55 @@ pub async fn account_enter(state: State<'_, AppState>, app: tauri::AppHandle, se
     Ok(())
 }
 
+/// Delete what this account wrote to the stored logs: in `conv`, with a
+/// tombstone for the readers' copies, or (None) everywhere. `LogPurged`
+/// answers as `account-reply`.
+#[tauri::command]
+pub async fn account_purge(state: State<'_, AppState>, app: tauri::AppHandle, server: String, conv: Option<String>) -> Result<(), String> {
+    let connections = state.connections.read().await;
+    let (connection, link) = signed_in(&connections, &server)?;
+    let a = link.session().purge(conv.as_deref());
+    run(&app, &server, &connection.tcp_tx, a).await;
+    Ok(())
+}
+
+/// Delete the account signed in on `server`: its password, and a code where
+/// it has codes on. `AccountDeleted` (or an `Error` for `DeleteAccount`)
+/// answers as `account-reply`; then the server closes the connection.
+#[tauri::command]
+pub async fn account_delete(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    server: String,
+    password: String,
+    totp: Option<String>,
+    recovery: Option<String>,
+) -> Result<(), String> {
+    let salt = {
+        let connections = state.connections.read().await;
+        let (_, link) = signed_in(&connections, &server)?;
+        let salt = link.session().kdf_salt();
+        salt
+    };
+    let master = tokio::task::spawn_blocking(move || stretch_salted(&password, &salt)).await.map_err(|e| e.to_string())?;
+    let connections = state.connections.read().await;
+    let (connection, link) = signed_in(&connections, &server)?;
+    let a = link.session().delete_account(&master, totp, recovery);
+    run(&app, &server, &connection.tcp_tx, a).await;
+    Ok(())
+}
+
+/// Stop keeping channel log `conv` (a voice channel's: moving between rooms
+/// keeps one). Every remaining writer starts a new key on their next post.
+#[tauri::command]
+pub async fn account_leave(state: State<'_, AppState>, app: tauri::AppHandle, server: String, conv: String) -> Result<(), String> {
+    let connections = state.connections.read().await;
+    let (connection, link) = signed_in(&connections, &server)?;
+    let a = link.session().leave(&conv, true);
+    run(&app, &server, &connection.tcp_tx, a).await;
+    Ok(())
+}
+
 /// Forget the relay id remembered for `server` (it moved, or was set up
 /// again); the next account sign-in there remembers the new one.
 #[tauri::command]
@@ -373,6 +441,35 @@ pub async fn account_totp(state: State<'_, AppState>, server: String, code: Stri
 #[tauri::command]
 pub async fn account_cancel(state: State<'_, AppState>, server: String) -> Result<(), String> {
     state.totp_answers.lock().unwrap_or_else(|p| p.into_inner()).remove(&server);
+    Ok(())
+}
+
+/// A new password for the account signed in on `server`: the current one,
+/// and a code where the account has codes on. The answer comes back as
+/// `account-reply` (`PasswordChanged`, or an `Error` for `PasswordChange`).
+#[tauri::command]
+pub async fn account_password_change(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    server: String,
+    old: String,
+    new: String,
+    totp: Option<String>,
+    recovery: Option<String>,
+) -> Result<(), String> {
+    password_ok(&new)?;
+    let salt = {
+        let connections = state.connections.read().await;
+        let (_, link) = signed_in(&connections, &server)?;
+        let salt = link.session().kdf_salt();
+        salt
+    };
+    // Two stretches, off the async workers
+    let (old_m, new_m) = tokio::task::spawn_blocking(move || (stretch_salted(&old, &salt), stretch_salted(&new, &salt))).await.map_err(|e| e.to_string())?;
+    let connections = state.connections.read().await;
+    let (connection, link) = signed_in(&connections, &server)?;
+    let a = link.session().password_change(&old_m, &new_m, totp, recovery);
+    run(&app, &server, &connection.tcp_tx, a).await;
     Ok(())
 }
 

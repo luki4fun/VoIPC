@@ -26,6 +26,11 @@ pub struct Encoder {
     frame_index: i64,
     /// Pixel format used by this encoder (YUV420P for most, NV12 for QSV).
     pixel_format: Pixel,
+    /// The frame rate it was opened with: its time base, which an in-place
+    /// rate change keeps.
+    fps: u32,
+    /// libx264 takes a new rate on the open context (see [`Encoder::set_rate`]).
+    in_place: bool,
 }
 
 // SAFETY: The FFmpeg encoder context is not Send by default due to raw pointers,
@@ -58,6 +63,20 @@ fn format_name(p: Pixel) -> &'static str {
 /// - VBV: bufsize caps the largest compliant frame. The UDP wire format
 ///   truncates frames above 255 fragments × 1239 B ≈ 316 KB, so bufsize is
 ///   clamped to 2.4 Mbit (300 KB) to keep keyframes under that ceiling.
+/// Say in the stream what it carries (H3-03). The converter produces sws's
+/// default, the BT.601 matrix at limited range, from sRGB-primaried screen
+/// pixels, and nothing said so: Chromium read the untagged stream as BT.709 and
+/// shifted greens and reds. The matrix is tagged as produced rather than
+/// converted to BT.709, because every native viewer hands the frame to JPEG,
+/// whose YCbCr is BT.601: a phone then needs a range expansion, not a re-matrix.
+fn tag_colour(encoder: &mut encoder::video::Video) {
+    use ffmpeg::util::color::{Primaries, Range, Space, TransferCharacteristic};
+    encoder.set_colorspace(Space::SMPTE170M);
+    encoder.set_color_range(Range::MPEG);
+    encoder.set_color_primaries(Primaries::BT709);
+    encoder.set_color_transfer_characteristic(TransferCharacteristic::BT709);
+}
+
 fn set_rate_control_opts(opts: &mut Dictionary, bitrate_kbps: u32, fps: u32) {
     let bits = bitrate_kbps as u64 * 1000;
     opts.set("g", &(2 * crate::KEYFRAME_INTERVAL_SECS * fps).to_string());
@@ -193,6 +212,7 @@ impl Encoder {
         encoder.set_frame_rate(Some(Rational::new(fps as i32, 1)));
         encoder.set_bit_rate(bitrate_kbps as usize * 1000);
         encoder.set_max_b_frames(0);
+        tag_colour(&mut encoder);
 
         let mut opts = Dictionary::new();
         set_rate_control_opts(&mut opts, bitrate_kbps, fps);
@@ -203,7 +223,10 @@ impl Encoder {
             "nvenc" => {
                 opts.set("preset", "p1");           // Fastest NVENC preset
                 opts.set("tune", "ull");             // Ultra low latency
-                opts.set("rc", "cbr");               // Constant bitrate
+                // VBR capped at the rate (maxrate, set above): CBR padded a
+                // busy-but-static screen with 55–60 % filler NAL units, which
+                // the relay fanned out to every viewer (H3-06)
+                opts.set("rc", "vbr");
                 opts.set("delay", "0");              // No encoding delay
                 opts.set("zerolatency", "1");
                 opts.set("forced-idr", "1");         // pict_type I → real IDR
@@ -233,6 +256,8 @@ impl Encoder {
             height,
             frame_index: 0,
             pixel_format,
+            fps,
+            in_place: false,
         })
     }
 
@@ -264,10 +289,13 @@ impl Encoder {
         encoder.set_frame_rate(Some(Rational::new(fps as i32, 1)));
         encoder.set_bit_rate(bitrate_kbps as usize * 1000);
         encoder.set_max_b_frames(0);
+        tag_colour(&mut encoder);
 
         let mut opts = Dictionary::new();
         set_rate_control_opts(&mut opts, bitrate_kbps, fps);
-        opts.set("preset", "ultrafast");
+        // superfast without the old `me=dia:subme=0`: +1–2 dB on text at the
+        // bottom rungs for half a millisecond a frame (H3-13)
+        opts.set("preset", "superfast");
         opts.set("tune", "zerolatency");
         opts.set("forced-idr", "1");
 
@@ -277,7 +305,7 @@ impl Encoder {
         // parameter sets, and a late joiner must be able to start on any IDR.
         let k = 2 * crate::KEYFRAME_INTERVAL_SECS * fps;
         let params = format!(
-            "scenecut=0:me=dia:subme=0:keyint={k}:min-keyint={k}:repeat-headers=1:annexb=1"
+            "scenecut=0:keyint={k}:min-keyint={k}:repeat-headers=1:annexb=1"
         );
         match video_codec {
             VideoCodec::H264 => opts.set("x264-params", &params),
@@ -295,6 +323,8 @@ impl Encoder {
             height,
             frame_index: 0,
             pixel_format: Pixel::YUV420P,
+            fps,
+            in_place: name == "libx264",
         })
     }
 
@@ -461,6 +491,31 @@ impl Encoder {
     pub fn pixel_format(&self) -> Pixel {
         self.pixel_format
     }
+
+    /// Change the rate on the open encoder, for frames now arriving at `fps`.
+    /// `false` when this encoder cannot, and has to be rebuilt instead.
+    ///
+    /// Rebuilding forces an IDR — 250 ms of the new rate at 1080p — into the
+    /// link that just reported loss (H3-08). libx264 reconfigures on the next
+    /// frame without one. Its time base stays the opening fps, so a ladder
+    /// step that also halves the frame rate doubles the per-frame budget here.
+    /// libx265 and the hardware encoders keep the rebuild: FFmpeg's NVENC
+    /// forces an IDR on any rate change anyway, and libx265 has no reconfigure.
+    pub fn set_rate(&mut self, bitrate_kbps: u32, fps: u32) -> bool {
+        if !self.in_place || fps == 0 {
+            return false;
+        }
+        let bits = bitrate_kbps as i64 * 1000 * self.fps as i64 / fps as i64;
+        // SAFETY: plain fields of the context this encoder owns; libx264's
+        // wrapper compares them with its own settings before every frame.
+        unsafe {
+            let ctx = self.encoder.as_mut_ptr();
+            (*ctx).bit_rate = bits;
+            (*ctx).rc_max_rate = bits;
+            (*ctx).rc_buffer_size = (bits / 2).min(2_400_000) as i32;
+        }
+        true
+    }
 }
 
 impl Drop for Encoder {
@@ -570,6 +625,44 @@ mod tests {
             let mut dec = Decoder::new(codec).unwrap();
             assert!(!dec.decode(&frames[0].data).unwrap().is_empty());
         }
+    }
+
+    /// H3-08: libx264 drops its rate on the open encoder, with no keyframe;
+    /// the others say they cannot, so the ladder rebuilds them.
+    #[test]
+    fn libx264_changes_rate_in_place_without_a_keyframe() {
+        init_ffmpeg();
+        let (w, h) = (320usize, 240usize);
+        let mut enc = Encoder::open_software("libx264", VideoCodec::H264, 320, 240, 2000, 30).unwrap();
+        // Noise that moves every frame, so the rate control has work to do
+        let mut seed = 1u32;
+        let mut frame = || {
+            (0..w * h + 2 * (w / 2) * (h / 2))
+                .map(|_| {
+                    seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (seed >> 24) as u8
+                })
+                .collect::<Vec<u8>>()
+        };
+        let mut bytes = |enc: &mut Encoder, from: i64, n: i64| {
+            let mut total = 0usize;
+            let mut keys = 0;
+            for pts in from..from + n {
+                for f in enc.encode(&frame(), pts, pts == 0).unwrap() {
+                    total += f.data.len();
+                    keys += (f.is_keyframe && pts != 0) as usize;
+                }
+            }
+            (total, keys)
+        };
+        let (before, _) = bytes(&mut enc, 0, 60);
+        assert!(enc.set_rate(400, 30));
+        let (after, keys) = bytes(&mut enc, 60, 60);
+        assert_eq!(keys, 0, "the rate change forced a keyframe");
+        assert!(after * 2 < before, "the rate did not drop: {before} -> {after} bytes");
+
+        let mut x265 = Encoder::open_software("libx265", VideoCodec::H265, 64, 64, 500, 30).unwrap();
+        assert!(!x265.set_rate(250, 30), "libx265 has no in-place reconfigure");
     }
 
     /// A frame bigger than the viewer's cap is an error from the decoder, not

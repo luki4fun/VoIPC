@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.content.pm.ServiceInfo
 import android.os.Build
 import android.os.IBinder
@@ -43,14 +44,26 @@ class VoiceService : Service() {
                 // side stops this service once the leave has happened. Stopping
                 // here would drop the foreground service even when the leave
                 // failed and the call is still running.
-                return START_STICKY
+                return START_NOT_STICKY
             }
         }
 
         val channelName = intent?.getStringExtra(EXTRA_CHANNEL_NAME) ?: "voice channel"
         val notification = buildNotification(channelName)
 
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // The microphone type is what keeps the capture alive with the
+            // screen locked or another app in front; without it Android 11+
+            // hands the call silence (H4-02). Only with the permission:
+            // Android 14 throws for a microphone-type start without it, and
+            // MainActivity starts this again once it is granted.
+            var types = ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+            if (checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                == PackageManager.PERMISSION_GRANTED) {
+                types = types or ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+            }
+            startForeground(NOTIFICATION_ID, notification, types)
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(
                 NOTIFICATION_ID,
                 notification,
@@ -60,16 +73,22 @@ class VoiceService : Service() {
             startForeground(NOTIFICATION_ID, notification)
         }
 
-        // Acquire partial wake lock to keep CPU running for voice processing
+        // Acquire partial wake lock to keep CPU running for voice processing.
+        // Every start lands here (a channel switch, the permission upgrade),
+        // so the previous one goes first rather than piling up.
+        wakeLock?.let { if (it.isHeld) it.release() }
         val pm = getSystemService(POWER_SERVICE) as PowerManager
         wakeLock = pm.newWakeLock(
             PowerManager.PARTIAL_WAKE_LOCK,
             "VoIPC::VoiceCall"
         ).apply {
-            acquire(30 * 60 * 1000L) // 30 min max (re-acquired on service restart)
+            acquire(30 * 60 * 1000L) // 30 min max
         }
 
-        return START_STICKY
+        // Not sticky: the call lives in the activity's process. A service
+        // Android restarts on its own after that process died has no call to
+        // hold, and would show "In voice" over nothing (H4-14).
+        return START_NOT_STICKY
     }
 
     override fun onBind(intent: Intent?): IBinder? = null

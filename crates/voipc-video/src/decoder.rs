@@ -46,6 +46,11 @@ pub struct DecodedFrame {
     pub height: u32,
     /// I420 data: the Y plane, then U and V at half size rounded up.
     pub i420_data: Vec<u8>,
+    /// What the stream says it carries: full range, and the BT.709 matrix.
+    /// [`crate::to_jpeg_ycbcr`] turns the frame into JPEG's YCbCr when it is
+    /// shown; it is not done here, for frames that are only decoded.
+    pub full_range: bool,
+    pub bt709: bool,
 }
 
 impl Decoder {
@@ -112,18 +117,33 @@ impl Decoder {
             let height = decoded_frame.height();
 
             // Convert to I420 if needed
-            let i420_data = if decoded_frame.format() == Pixel::YUV420P {
+            let extracted = decoded_frame.format() == Pixel::YUV420P;
+            let i420_data = if extracted {
                 // Already I420, just copy planes
                 Self::extract_i420_from_frame(&decoded_frame)
             } else {
                 // Need to convert to I420
                 self.convert_to_i420(&decoded_frame)?
             };
+            // Then to JPEG's YCbCr, from what the frame says it carries. sws
+            // hands over limited range; an untagged frame is limited for
+            // H.264/H.265, as 0.12 senders send it, and full for VP8/VP9, as
+            // browsers send those.
+            use ffmpeg::util::color::{Range, Space};
+            let full_range = extracted
+                && match decoded_frame.color_range() {
+                    Range::JPEG => true,
+                    Range::MPEG => false,
+                    _ => matches!(self.video_codec, VideoCodec::Vp8 | VideoCodec::Vp9),
+                };
+            let bt709 = decoded_frame.color_space() == Space::BT709;
 
             frames.push(DecodedFrame {
                 width,
                 height,
                 i420_data,
+                full_range,
+                bt709,
             });
         }
 

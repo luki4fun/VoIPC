@@ -8,7 +8,6 @@ use libsignal_protocol::{
     create_sender_key_distribution_message, group_decrypt, group_encrypt,
     process_sender_key_distribution_message, SenderKeyDistributionMessage, SenderKeyMessage,
 };
-use rand::rngs::OsRng;
 use uuid::Uuid;
 
 use crate::session::user_address;
@@ -36,7 +35,7 @@ pub async fn create_distribution_message(
         &address,
         distribution_id,
         &mut stores.sender_key,
-        &mut OsRng,
+        &mut crate::rng(),
     )
     .await?;
 
@@ -88,7 +87,7 @@ pub async fn encrypt_group_message(
         &address,
         distribution_id,
         plaintext,
-        &mut OsRng,
+        &mut crate::rng(),
     )
     .await?;
 

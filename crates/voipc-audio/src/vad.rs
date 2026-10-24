@@ -2,6 +2,9 @@
 ///
 /// Designed for real-time use in the audio capture loop (20ms frames at 48kHz).
 /// Supports configurable threshold in dB with hold time to avoid choppy cutoffs.
+/// RNNoise's speech probability above which a loud frame counts as voice.
+const VOICE_PROBABILITY: f32 = 0.5;
+
 pub struct VoiceActivityDetector {
     /// Threshold in dB (e.g. -40.0). Samples above this are considered voice.
     threshold_db: f32,
@@ -37,12 +40,16 @@ impl VoiceActivityDetector {
     ///
     /// Returns `true` if the audio level is above the threshold or within the
     /// hold period after voice was last detected.
-    pub fn process(&mut self, samples: &[f32]) -> bool {
+    ///
+    /// `voice` is RNNoise's probability that the frame is speech, when noise
+    /// suppression runs: loud is not enough then, so typing and a fan stop
+    /// opening the gate. `None` gates on level alone.
+    pub fn process(&mut self, samples: &[f32], voice: Option<f32>) -> bool {
         let rms = compute_rms(samples);
         let db = amplitude_to_db(rms);
         self.current_level_db = db;
 
-        if db >= self.threshold_db {
+        if db >= self.threshold_db && voice.is_none_or(|p| p >= VOICE_PROBABILITY) {
             // Voice detected
             self.silent_count = 0;
             self.active = true;
@@ -101,7 +108,7 @@ mod tests {
     fn silence_is_not_detected() {
         let mut vad = VoiceActivityDetector::new(-40.0, 300, 20);
         let silence = vec![0.0f32; 960];
-        assert!(!vad.process(&silence));
+        assert!(!vad.process(&silence, None));
     }
 
     #[test]
@@ -109,7 +116,7 @@ mod tests {
         let mut vad = VoiceActivityDetector::new(-40.0, 300, 20);
         // 0.1 amplitude = -20 dB, well above -40 threshold
         let loud = vec![0.1f32; 960];
-        assert!(vad.process(&loud));
+        assert!(vad.process(&loud, None));
     }
 
     #[test]
@@ -121,15 +128,15 @@ mod tests {
         let silence = vec![0.0f32; 960];
 
         // Activate
-        assert!(vad.process(&loud));
+        assert!(vad.process(&loud, None));
 
         // 3 silent frames should still be active (hold period)
-        assert!(vad.process(&silence)); // silent_count=1
-        assert!(vad.process(&silence)); // silent_count=2
-        assert!(vad.process(&silence)); // silent_count=3
+        assert!(vad.process(&silence, None)); // silent_count=1
+        assert!(vad.process(&silence, None)); // silent_count=2
+        assert!(vad.process(&silence, None)); // silent_count=3
 
         // 4th silent frame should deactivate
-        assert!(!vad.process(&silence)); // silent_count=4 > hold_frames=3
+        assert!(!vad.process(&silence, None)); // silent_count=4 > hold_frames=3
     }
 
     #[test]
@@ -137,11 +144,23 @@ mod tests {
         let mut vad = VoiceActivityDetector::new(-40.0, 300, 20);
         // 0.001 amplitude = -60 dB, below -40 threshold
         let quiet = vec![0.001f32; 960];
-        assert!(!vad.process(&quiet));
+        assert!(!vad.process(&quiet, None));
 
         // Lower threshold to -70 dB — now it should detect
         vad.set_threshold_db(-70.0);
-        assert!(vad.process(&quiet));
+        assert!(vad.process(&quiet, None));
+    }
+
+    #[test]
+    fn loud_is_not_enough_when_rnnoise_hears_no_voice() {
+        // H3-15: a keyboard or a fan is loud too
+        let mut vad = VoiceActivityDetector::new(-40.0, 0, 20);
+        let loud = vec![0.3f32; 960];
+        assert!(!vad.process(&loud, Some(0.1)), "a loud non-voice frame opened the gate");
+        assert!(vad.process(&loud, Some(0.9)));
+        // Quiet speech stays below the user's threshold either way
+        let quiet = vec![0.001f32; 960];
+        assert!(!vad.process(&quiet, Some(0.99)));
     }
 
     #[test]

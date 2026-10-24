@@ -65,14 +65,14 @@ function schedule(server: string): void {
 
 /** Ask for one channel's roster on a server, soon. */
 export function requestRoster(server: string, channelId: number): void {
-  const list = get(channels.of(server)).find((c) => c.channel_id === channelId);
+  const list = get(channels.peek(server)).find((c) => c.channel_id === channelId);
   if (
     !list ||
     !worthAsking(
       list,
-      get(currentChannelId.of(server)),
-      get(isAdmin.of(server)),
-      get(joinedTextChannelIds.of(server)),
+      get(currentChannelId.peek(server)),
+      get(isAdmin.peek(server)),
+      get(joinedTextChannelIds.peek(server)),
     )
   )
     return;
@@ -82,11 +82,11 @@ export function requestRoster(server: string, channelId: number): void {
 
 /** Ask for every channel on a server we are allowed to see into. */
 export function requestAllRosters(server: string): void {
-  const currentId = get(currentChannelId.of(server));
-  const admin = get(isAdmin.of(server));
-  const joinedText = get(joinedTextChannelIds.of(server));
+  const currentId = get(currentChannelId.peek(server));
+  const admin = get(isAdmin.peek(server));
+  const joinedText = get(joinedTextChannelIds.peek(server));
   const ids = pendingFor(server).ids;
-  for (const channel of get(channels.of(server))) {
+  for (const channel of get(channels.peek(server))) {
     if (worthAsking(channel, currentId, admin, joinedText)) ids.add(channel.channel_id);
   }
   schedule(server);
@@ -109,15 +109,15 @@ export function requestAllRosters(server: string): void {
  */
 export function setRoster(server: string, channelId: number, list: UserInfo[]): void {
   channelRosters.of(server).update((m) => new Map(m).set(channelId, list));
-  const channel = get(channels.of(server)).find((c) => c.channel_id === channelId);
+  const channel = get(channels.peek(server)).find((c) => c.channel_id === channelId);
   if (
     !channel ||
     !trustRosterCount(
       list,
       channel,
-      get(currentChannelId.of(server)),
-      get(isAdmin.of(server)),
-      get(joinedTextChannelIds.of(server)),
+      get(currentChannelId.peek(server)),
+      get(isAdmin.peek(server)),
+      get(joinedTextChannelIds.peek(server)),
     )
   ) {
     return;
@@ -167,8 +167,8 @@ export { rosterOf };
 export function currentRosterOf(server: string, channelId: number): UserInfo[] {
   return rosterOf(
     channelId,
-    get(channelRosters.of(server)),
-    get(currentChannelId.of(server)),
-    get(users.of(server)),
+    get(channelRosters.peek(server)),
+    get(currentChannelId.peek(server)),
+    get(users.peek(server)),
   );
 }

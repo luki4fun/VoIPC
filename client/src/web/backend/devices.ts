@@ -29,9 +29,15 @@ const DEVICES = "devices";
 function open(): Promise<IDBDatabase> {
   return new Promise((resolve, reject) => {
     const req = indexedDB.open(DB, 1);
-    req.onupgradeneeded = () => {
-      req.result.createObjectStore(KEYS);
-      req.result.createObjectStore(DEVICES);
+    // By the version the database had: a later version adds its own step
+    // after this one instead of creating stores that already exist. A
+    // database a newer VoIPC raised past 1 fails to open here (VersionError):
+    // listing finds none, saving refuses, nothing is overwritten.
+    req.onupgradeneeded = (e) => {
+      if (e.oldVersion < 1) {
+        req.result.createObjectStore(KEYS);
+        req.result.createObjectStore(DEVICES);
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);

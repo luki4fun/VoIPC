@@ -58,7 +58,10 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 ///      AccountRequest/AccountReply;
 ///      channel options — ChannelInfo.announce/slow_mode_secs/nsfw and the
 ///      same three in SetChannelOptions
-pub const PROTOCOL_VERSION: u32 = 11;
+/// v12: libsignal with post-quantum sessions — PreKeyBundleData carries a
+///      signed Kyber1024 pre-key; PreKeysLow asks for more one-time pre-keys;
+///      the media AAD names the sender
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.

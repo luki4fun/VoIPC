@@ -1,5 +1,6 @@
 import { writable } from "svelte/store";
 import { MAX_CONVERSATIONS } from "../chat-rules.js";
+import { parseHostPort } from "../invite.js";
 
 export const inputDevice = writable<string>("");
 export const outputDevice = writable<string>("");
@@ -34,24 +35,15 @@ export function defaultServer(): { host: string; port: number } {
     console.warn(`ignoring malformed VITE_DEFAULT_SERVER: ${baked}`);
   }
   if (__WEB__ && typeof location !== "undefined" && location.hostname) {
-    return { host: location.hostname, port: Number(location.port) || 9987 };
+    // No port in the URL is the scheme's default: 443 for the page a relay
+    // serves on the TLS port, which is where its tunnel and WebTransport are
+    // (H5-08)
+    return {
+      host: location.hostname,
+      port: Number(location.port) || (location.protocol === "https:" ? 443 : 9987),
+    };
   }
   return { host: "localhost", port: 9987 };
-}
-
-/** "host", "host:port" or "[v6::addr]:port" — port defaults to 9987. */
-function parseHostPort(value: string): { host: string; port: number } | null {
-  const bracketed = value.match(/^\[([^\]]+)\](?::(\d+))?$/);
-  if (bracketed) {
-    return { host: bracketed[1], port: bracketed[2] ? Number(bracketed[2]) : 9987 };
-  }
-  const parts = value.split(":");
-  if (parts.length === 1) return parts[0] ? { host: parts[0], port: 9987 } : null;
-  if (parts.length === 2 && parts[0]) {
-    const port = Number(parts[1]);
-    if (Number.isInteger(port) && port >= 1 && port <= 65535) return { host: parts[0], port };
-  }
-  return null; // bare IPv6 without brackets, empty host, junk port
 }
 
 const initialServer = defaultServer();

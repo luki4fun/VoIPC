@@ -30,8 +30,9 @@ straight through to the underlying tool.
 | `npm run build:windows` | Windows client, cross-compiled from Linux | `target/x86_64-pc-windows-msvc/release/` + `bundle/nsis/` |
 | `npm run web` | wasm + Vite bundle, then the server that embeds it | `target/release/voipc-server`, `release/VoIPC-web-<v>.tar.gz` |
 | `npm run android -- release` | signed APK (needs `keystore.properties`) | `release/VoIPC-android-release.apk` |
-| `npm run release` | all Linux artifacts in Docker, portable | `release/` — AppImage, musl server, web bundle |
-| `VOIPC_NO_DOCKER=1 npm run release` | the same, minus what needs Docker | `release/voipc-server` (host glibc), `release/VoIPC-web-<v>.tar.gz` |
+| `npm run release` | the web bundle and the server, copied into `release/` | `release/voipc-server` (host glibc), `release/VoIPC-web-<v>.tar.gz` |
+| `npm run check:windows` | `cargo check` of the Windows client, cross from Linux (what CI runs on a pull request) | — |
+| `npm run android -- check` | `cargo check` of the Android client | — |
 
 Everything at once, in the same versions a release ships: push a `v*` tag and
 let `.github/workflows/release.yml` build all four platforms.
@@ -58,7 +59,6 @@ build handed to someone starts pointing at your relay. The port defaults to
 VITE_DEFAULT_SERVER=demo.example.org npm run build            # desktop
 VITE_DEFAULT_SERVER=demo.example.org npm run web              # web bundle + server
 VITE_DEFAULT_SERVER=demo.example.org npm run android -- release
-npm run release -- --build-arg VITE_DEFAULT_SERVER=demo.example.org   # Docker
 ```
 
 Leave it unset for a normal release: the dialog then starts at `localhost:9987`
@@ -75,7 +75,7 @@ run it by hand from the Actions tab; tag builds never set it.
 | `npm run web -- --debug` | debug server binary at `target/debug/voipc-server` |
 | `npm run android -- debug` | unsigned debug APK — no keystore needed |
 
-`npm run build:windows` and `npm run release` are release-only. A debug Windows
+`npm run build:windows` is release-only. A debug Windows
 cross build would need the real debug CRT, which cannot be shipped and is
 deliberately stubbed out (see the cross-compiling section).
 
@@ -344,20 +344,38 @@ release for review. Push a tag to run it, or dispatch it manually from the
 Actions tab to rehearse without tagging:
 
 ```bash
-git tag v0.7.0 && git push origin v0.7.0
+git tag v1.0.0 && git push origin v1.0.0
 ```
 
 It refuses to build if the tag and `[workspace.package] version` disagree, or if
-any copy of the version has drifted — the server compares version strings for
-exact equality, so a mismatched release ships clients that every server rejects.
-Release notes come from the matching `## [x.y.z]` section of `CHANGELOG.md`.
+any copy of the version has drifted. The version is `X.Y.Z` or `X.Y.Z-rc.N`. A
+release candidate becomes a pre-release, never "latest", and ships no `.deb`.
+Release notes come from the matching `## [x.y.z]` section of `CHANGELOG.md`; a
+release candidate falls back to its final version's section. The workflow adds a
+"Third-party code and its source" section, read from the pins.
+
+Publishing the draft starts `release-published.yml`. That workflow pushes the relay's
+container image and updates the release-candidate updater feed.
+
+**Pins and checks.** Every action is pinned by commit, and Dependabot moves the pins.
+Every job first checks the lockfiles against the manifests (`cargo fetch --locked`).
+The Windows FFmpeg is a pinned month-end build, checked against its SHA-256. The Gradle
+distribution is checked against its checksum, and the wrapper jar is validated.
+
+**Reproducible builds.** The static server, the web tarball and the wasm build to the
+same bytes from the same commit, given the same paths: `SOURCE_DATE_EPOCH` is the
+commit time, and `nightly.yml` builds them twice and compares. The AppImage, the
+`.deb` and the installer can be rebuilt but are not bit-identical: they bundle the
+runner's system libraries of that day.
 
 | Job | Runner | Produces |
 |---|---|---|
 | `linux` | ubuntu-24.04 | AppImage, `.deb`, static musl server, web bundle |
 | `windows` | ubuntu-24.04 | NSIS `.exe`, cross-built with cargo-xwin |
 | `windows-smoke` | windows-2025 | installs that `.exe` and checks the app starts |
-| `android` | ubuntu-24.04 | signed APK |
+| `android` | ubuntu-24.04 | the APK, unsigned |
+| `sign` | ubuntu-24.04, `environment: release` | the signed APK, the updater signatures, `latest.json` |
+| `publish` | ubuntu-24.04 | `SHA256SUMS`, build attestations, the draft release |
 
 The repository is public, so all of this runs on free standard runners.
 
@@ -379,10 +397,11 @@ curl -s https://api.github.com/repos/luki4fun/VoIPC/actions/runs/<run-id>/jobs
 curl -s https://api.github.com/repos/luki4fun/VoIPC/check-runs/<job-id>/annotations
 ```
 
-### Android signing secrets
+### Signing secrets
 
-The Android job is skipped unless these repository secrets exist
-(Settings → Secrets and variables → Actions):
+No build job has a signing key. The `sign` job runs after every build is done, on tags
+only, and in the `release` environment. That environment asks a reviewer before each run
+and deploys only from `v*` tags and `main` (Settings → Environments). Its secrets:
 
 | Secret | Value |
 |---|---|
@@ -390,9 +409,16 @@ The Android job is skipped unless these repository secrets exist
 | `ANDROID_KEYSTORE_PASSWORD` | the keystore password |
 | `ANDROID_KEY_ALIAS` | the key alias, e.g. `voipc` |
 | `ANDROID_KEY_PASSWORD` | the key password |
+| `TAURI_SIGNING_PRIVATE_KEY` | the updater's private key (`npx tauri signer generate`) |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | its password |
 
-The job writes them back into a `keystore.properties` and keystore at the repo
-root, builds, and deletes both afterwards.
+A missing secret fails the tag's run instead of shipping without it.
+
+**What the `sign` job does:**
+- **The APK:** it signs it with `apksigner`, then fails unless the certificate is the one every
+  earlier VoIPC APK carried (pinned in the workflow).
+- **The updater:** it signs the AppImage and the NSIS installer for their version, and writes
+  `latest.json`.
 
 ## Toolchain (all platforms)
 
@@ -468,25 +494,26 @@ The end-to-end check drives the page's built-in self-test, which only a bundle b
 `VOIPC_SELFTEST=1` contains: in a release it would let a crafted `?selftest` link connect,
 write and open the microphone with nothing on screen. `test-web.sh` says so if it is missing.
 
-`npm run web` installs the `wasm32-unknown-unknown` Rust target if missing, builds
-`crates/voipc-web` with `wasm-pack` (a client devDependency, no global install), bundles the
-Svelte app in web mode to `client/dist-web`, and then builds the server, which embeds that
-directory with `rust-embed`. Outputs:
+`npm run web` installs the `wasm32-unknown-unknown` Rust target if missing. It then builds
+`crates/voipc-web` with cargo, and writes the JS glue with `wasm-bindgen`. The first run installs
+the exact `wasm-bindgen-cli` version the crate's `Cargo.lock` names, with
+`cargo install --locked`. Next it builds the browser's Opus decoder (`crates/voipc-opus-wasm`),
+bundles the Svelte app in web mode to `client/dist-web`, and finally builds the server, which
+embeds that directory with `rust-embed`. Outputs:
 
 - `target/release/voipc-server` — serves the web client at `https://<host>:<tcp_port>/`
 - `release/VoIPC-web-<version>.tar.gz` — the static bundle, if you want to host it elsewhere
 
-The wasm crate is a separate Cargo workspace (`crates/voipc-web`), because it replaces
-`pqcrypto-kyber` with a stub (its C code cannot build for wasm and VoIPC never negotiates
-Kyber) and enables wasm-only features of `getrandom` and `ring`. Nothing of that leaks into
-the native build.
+The wasm crates are separate Cargo workspaces (`crates/voipc-web`, `crates/voipc-opus-wasm`)
+because they enable wasm-only features of `getrandom` and `ring`. Nothing of that leaks into the
+native build.
 
 Manual steps, if you prefer:
 
 ```bash
 cd client
 npm install
-npm run build:wasm   # wasm-pack → client/src/lib/wasm
+npm run build:wasm   # cargo + wasm-bindgen → client/src/lib/wasm (plus the Opus decoder)
 npm run build:web    # wasm + vite build --mode web → client/dist-web
 npm run dev:web      # dev server on http://localhost:1420 (point it at a running server)
 cd .. && cargo build -p voipc-server --release
@@ -508,34 +535,6 @@ BROWSER_ALICE=firefox BROWSER_BOB=chromium ./test-web.sh   # Firefox shares VP9,
 
 The Firefox lane needs `certutil` (Arch: `nss`, Debian/Ubuntu: `libnss3-tools`) to trust the
 test certificate.
-
-## Docker Release Build (AppImage)
-
-Build portable release binaries inside Docker without installing any local dependencies:
-
-```bash
-npm run release
-```
-
-This builds inside Ubuntu 24.04 and produces:
-- `release/voipc-server` — static binary (musl, zero runtime deps), serving the embedded web client
-- `release/VoIPC_*.AppImage` — portable client (runs on glibc >= 2.39)
-- `release/VoIPC-web-*.tar.gz` — the web client bundle (already inside the server binary)
-
-Requires only Docker on the host. No Rust, Node.js, or system libraries needed.
-
-**Without Docker** the task no longer stops: it falls back to a host build of the web bundle
-and the server, and says which artifact it had to skip. `VOIPC_NO_DOCKER=1 npm run release`
-takes that path deliberately. Two things are lost, and both matter for a real release — the
-AppImage (Docker is what pins glibc 2.39, so one build runs on every distro) and the static
-musl server (the host build links against whatever glibc this machine has). Use it to get a
-server and a web bundle out quickly, not to cut a release.
-
-To build the Docker image manually:
-
-```bash
-docker build -f Dockerfile.release -t voipc-release .
-```
 
 ## Server
 

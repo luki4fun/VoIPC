@@ -143,10 +143,14 @@ export interface AdminAction {
   durationSecs: number;
   label: string;
   server: string;
+  /** Signed in with an account, which a ban can cover too. */
+  hasAccount: boolean;
 }
 
 export const adminAction = writable<AdminAction | null>(null);
 export const adminReason = writable("");
+/** "Ban the account too", for a user with one; on by default. */
+export const adminBanAccount = writable(true);
 
 export function openAdminAction(
   user: UserInfo,
@@ -161,8 +165,10 @@ export function openAdminAction(
     durationSecs,
     label,
     server: get(serverAddress),
+    hasAccount: !!user.account,
   });
   adminReason.set("");
+  adminBanAccount.set(true);
 }
 
 export function cancelAdminAction(): void {
@@ -184,6 +190,7 @@ export async function confirmAdminAction(): Promise<void> {
         userId: action.userId,
         reason,
         durationSecs: action.durationSecs,
+        account: action.hasAccount && get(adminBanAccount),
       });
     }
   } catch (e) {

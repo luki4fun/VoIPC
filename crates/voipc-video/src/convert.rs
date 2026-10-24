@@ -49,6 +49,17 @@ impl FrameConverter {
         dst_height: u32,
         output_format: Pixel,
     ) -> Result<Self> {
+        // Bicubic where the share is scaled down: a 1440p or 4K screen shared
+        // at 1080p, or 1080p at 720p, keeps its text 12 dB sharper for under a
+        // millisecond more (H3-12). Not at the same size, where it only
+        // sharpens the chroma, which a low rung then pays for in luma; and not
+        // for the sharer's own preview, which stays cheap.
+        let scales = (src_width, src_height) != (dst_width, dst_height);
+        let flags = if scales && output_format != Pixel::RGB24 {
+            scaling::Flags::BICUBIC
+        } else {
+            scaling::Flags::FAST_BILINEAR
+        };
         let scaler = scaling::Context::get(
             input_format,
             src_width,
@@ -56,7 +67,7 @@ impl FrameConverter {
             output_format,
             dst_width,
             dst_height,
-            scaling::Flags::FAST_BILINEAR,
+            flags,
         )
         .context("failed to create SwsContext for color conversion")?;
 

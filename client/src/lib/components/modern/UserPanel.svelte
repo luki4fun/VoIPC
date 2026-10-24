@@ -56,7 +56,7 @@
   </button>
 
   <div class="panel-actions">
-    <button
+    <button aria-label="Mute" aria-pressed={$isMuted}
       class="panel-btn"
       class:danger={$isMuted}
       onclick={toggleMute}
@@ -64,7 +64,7 @@
     >
       <Icon name={$isMuted ? "mic-off" : "mic-on"} size={18} />
     </button>
-    <button
+    <button aria-label="Deafen" aria-pressed={$isDeafened}
       class="panel-btn"
       class:danger={$isDeafened}
       onclick={toggleDeafen}
@@ -75,7 +75,7 @@
     <!-- `settings-btn` as well as the panel styling: "open settings" is then one
          selector in either layout, which is the same reason the channel rows and
          member rows kept their class names across the split. -->
-    <button class="panel-btn settings-btn" onclick={onopensettings} title="Settings">
+    <button aria-label="Settings" class="panel-btn settings-btn" onclick={onopensettings} title="Settings">
       <Icon name="settings" size={18} />
     </button>
   </div>

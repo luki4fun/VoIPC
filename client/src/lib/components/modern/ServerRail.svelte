@@ -7,6 +7,7 @@
   // up — neither touches any other server, or the call. Right-click, or a long
   // press on a phone, for Disconnect and Remove bookmark.
 
+  import { backdrop } from "../../actions/dialog.js";
   import { invoke } from "@tauri-apps/api/core";
   import { avatarColor } from "../../avatar.js";
   import { serverAddress } from "../../stores/connection.js";
@@ -144,23 +145,22 @@
     </button>
   {/each}
 
-  <button class="rail-item add" onclick={onadd} title="Add a server">
+  <button aria-label="Add a server" class="rail-item add" onclick={onadd} title="Add a server">
     <span class="badge plus"><Icon name="plus" size={20} /></span>
   </button>
 </nav>
 
 {#if menu}
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
   <div
     class="rail-menu-overlay"
-    onclick={() => (menu = null)}
+    role="presentation"
+    onclick={backdrop(() => (menu = null))}
     oncontextmenu={(e) => {
       e.preventDefault();
       menu = null;
     }}
   >
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="rail-menu" style="left: {menu.x}px; top: {menu.y}px;" onclick={(e) => e.stopPropagation()}>
+    <div class="rail-menu" style="left: {menu.x}px; top: {menu.y}px;">
       <div class="rail-menu-title">{menu.entry.name}</div>
       {#if menu.entry.open}
         <button class="rail-menu-item danger" onclick={() => disconnect(menu!.entry)}>

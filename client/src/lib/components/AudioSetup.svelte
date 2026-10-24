@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { dialog } from "../actions/dialog.js";
   // The one time VoIPC asks about audio before anything goes wrong.
   //
   // Everything here already existed in Settings; what did not exist was anyone
@@ -36,7 +37,21 @@
   import { isWeb } from "../stores/platform.js";
   import { addNotification } from "../stores/notifications.js";
   import { KeyCapture, shadows } from "../keybind.js";
-  import type { AudioDeviceInfo } from "../types.js";
+  import {
+    defaultDeviceName as defaultName,
+    inputDevices,
+    loadDevices as loadDeviceLists,
+    outputDevices,
+    pickInput as saveInput,
+    pickOutput as saveOutput,
+  } from "../stores/audio-devices.js";
+  import {
+    micTestError,
+    micTestLevel,
+    micTesting,
+    startMicTest as startTest,
+    stopMicTest,
+  } from "../stores/mic-test.js";
 
   interface Props {
     /** Show one step only: the compact re-pick for a device that vanished. */
@@ -61,8 +76,6 @@
   const step = $derived(steps[at]);
   const last = $derived(at === steps.length - 1);
 
-  let inputDevices = $state<AudioDeviceInfo[]>([]);
-  let outputDevices = $state<AudioDeviceInfo[]>([]);
   let error = $state("");
   let busy = $state(false);
 
@@ -91,27 +104,15 @@
   // ── Devices ───────────────────────────────────────────────────────────
 
   async function loadDevices() {
-    try {
-      inputDevices = await invoke<AudioDeviceInfo[]>("get_input_devices");
-      outputDevices = await invoke<AudioDeviceInfo[]>("get_output_devices");
-    } catch (e) {
-      error = String(e);
-    }
+    await loadDeviceLists().catch((e) => (error = String(e)));
   }
 
-  /** What the picker shows when nothing is saved: the system's own default. */
-  const defaultName = (list: AudioDeviceInfo[]) =>
-    list.find((d) => d.is_default)?.name ?? list[0]?.name ?? "";
-
   async function pickInput(name: string) {
-    inputDevice.set(name);
-    await invoke("set_input_device", { deviceName: name }).catch((e) => (error = String(e)));
-    if (micTesting) await restartMicTest();
+    await saveInput(name).catch((e) => (error = String(e)));
   }
 
   async function pickOutput(name: string) {
-    outputDevice.set(name);
-    await invoke("set_output_device", { deviceName: name }).catch((e) => (error = String(e)));
+    await saveOutput(name).catch((e) => (error = String(e)));
   }
 
   // ── The microphone meter ──────────────────────────────────────────────
@@ -121,54 +122,23 @@
   /** Loud enough to be clipping, where the fix is the gain and not the mic. */
   const CLIPPING_DB = -1;
 
-  let micTesting = $state(false);
-  let levelDb = $state(-100);
   let heard = $state(false);
   let clipped = $state(false);
-  let unlisten: Array<() => void> = [];
   /** A test still starting when the dialog closes stops itself on arrival. */
   let destroyed = false;
 
-  const levelPercent = $derived(Math.max(0, Math.min(100, ((levelDb + 60) / 60) * 100)));
+  const levelPercent = $derived(Math.max(0, Math.min(100, (($micTestLevel + 60) / 60) * 100)));
+  $effect(() => {
+    if ($micTestLevel >= HEARD_DB) heard = true;
+    if ($micTestLevel >= CLIPPING_DB) clipped = true;
+  });
+  // Said here as well as in the toast: this is the step it is about
+  $effect(() => {
+    if ($micTestError) error = $micTestError;
+  });
 
-  async function startMicTest() {
-    if (micTesting) return;
-    try {
-      unlisten.push(
-        await listen<{ db: number }>("mic-test-level", (e) => {
-          levelDb = e.payload.db;
-          if (levelDb >= HEARD_DB) heard = true;
-          if (levelDb >= CLIPPING_DB) clipped = true;
-        }),
-      );
-      unlisten.push(
-        await listen<{ error: string }>("mic-test-error", (e) => {
-          error = e.payload.error;
-          void stopMicTest();
-        }),
-      );
-      await invoke("start_mic_test", { monitor: false });
-      // Closed while it was starting: onDestroy's stop ran first and missed it
-      if (destroyed) return void stopMicTest();
-      micTesting = true;
-    } catch (e) {
-      error = String(e);
-      void stopMicTest();
-    }
-  }
-
-  async function stopMicTest() {
-    micTesting = false;
-    levelDb = -100;
-    unlisten.forEach((off) => off());
-    unlisten = [];
-    await invoke("stop_mic_test").catch(() => {});
-  }
-
-  async function restartMicTest() {
-    await stopMicTest();
-    await startMicTest();
-  }
+  /** The wizard's meter never plays the microphone back. */
+  const startMicTest = () => startTest(false);
 
   // ── The output test ───────────────────────────────────────────────────
 
@@ -250,7 +220,7 @@
     // Voice activation wants the meter running, so the threshold can be set
     // against a voice rather than against a number.
     if (mode === "vad") await startMicTest();
-    else if (micTesting && step === "mode") await stopMicTest();
+    else if ($micTesting && step === "mode") await stopMicTest();
   }
 
   async function changeThreshold(e: Event) {
@@ -324,15 +294,14 @@
   onDestroy(() => {
     destroyed = true;
     audioSetupOpen.set(false);
-    unlisten.forEach((off) => off());
     outUnlisten.forEach((off) => off());
-    invoke("stop_mic_test").catch(() => {});
+    void stopMicTest();
     invoke("stop_output_test").catch(() => {});
   });
 </script>
 
 <div class="overlay">
-  <div class="dialog audio-setup">
+  <div class="dialog audio-setup" use:dialog={{ onclose: close }}>
     {#if step === "permission"}
       <h2>Let VoIPC hear you</h2>
       <p class="hint">
@@ -354,10 +323,10 @@
       <select
         class="device"
         aria-label="Microphone"
-        value={$inputDevice || defaultName(inputDevices)}
+        value={$inputDevice || defaultName($inputDevices)}
         onchange={(e) => pickInput(e.currentTarget.value)}
       >
-        {#each inputDevices as device (device.name)}
+        {#each $inputDevices as device (device.name)}
           <option value={device.name}>{device.name}{device.is_default ? " (Default)" : ""}</option>
         {/each}
       </select>
@@ -385,10 +354,10 @@
         class="device"
         aria-label="Speakers"
         disabled={!canPickOutput}
-        value={$outputDevice || defaultName(outputDevices)}
+        value={$outputDevice || defaultName($outputDevices)}
         onchange={(e) => pickOutput(e.currentTarget.value)}
       >
-        {#each outputDevices as device (device.name)}
+        {#each $outputDevices as device (device.name)}
           <option value={device.name}>{device.name}{device.is_default ? " (Default)" : ""}</option>
         {/each}
       </select>
@@ -617,7 +586,7 @@
   }
 
   .verdict.good {
-    color: #43b581;
+    color: var(--success);
   }
 
   .verdict.warn {

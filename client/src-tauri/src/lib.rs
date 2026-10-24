@@ -10,6 +10,9 @@ mod screenshare;
 #[cfg(not(target_os = "android"))]
 mod sdk;
 mod transport;
+#[cfg(test)]
+mod upgrade_fixtures;
+mod updater;
 
 use app_state::AppState;
 use tauri::Manager;
@@ -89,8 +92,11 @@ pub fn run() {
          `npm run build` — otherwise the window will say \"Connection refused\"."
     );
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_notification::init())
+    let builder = tauri::Builder::default().plugin(tauri_plugin_notification::init());
+    // No `updater:*` capability: the page reaches it only through updater.rs
+    #[cfg(not(target_os = "android"))]
+    let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
+    builder
         .manage(AppState::new())
         .setup(|app| {
             // On Android, dirs::config_dir() returns None (no $HOME env var).
@@ -115,8 +121,8 @@ pub fn run() {
             if cfg.chat_history_path.is_none() {
                 let default_path = config::default_chat_history_path();
                 if default_path.exists() {
-                    if let Ok(data) = std::fs::read(&default_path) {
-                        if crypto::has_valid_header(&data) {
+                    {
+                        if matches!(crypto::file_kind(&default_path), crypto::FileKind::Ours(_) | crypto::FileKind::Newer) {
                             cfg.chat_history_path =
                                 Some(default_path.to_string_lossy().to_string());
                             if let Err(e) = config::save_config(&cfg) {
@@ -227,6 +233,12 @@ pub fn run() {
             // The other way a game can say where the player is: a block of
             // shared memory Guild Wars 2 and a few others write natively.
             mumblelink::spawn(app.handle().clone());
+            // Updates: NSIS and AppImage builds only, once a day (updater.rs)
+            #[cfg(not(target_os = "android"))]
+            {
+                app.manage(updater::Updates::default());
+                updater::start(app.handle().clone());
+            }
 
             // System tray: closing the window hides to tray (call keeps
             // running); Quit in the tray menu actually exits.
@@ -269,7 +281,7 @@ pub fn run() {
                             "deafen" => {
                                 let _ = app.emit("toggle-deafen-request", ());
                             }
-                            "quit" => app.exit(0),
+                            "quit" => request_quit(app),
                             _ => {}
                         })
                         .on_tray_icon_event(|tray, event| {
@@ -321,6 +333,10 @@ pub fn run() {
                 {
                     api.prevent_close();
                     let _ = window.hide();
+                } else if window.label() == "main" {
+                    // Closing the window is quitting: let the chat save first
+                    api.prevent_close();
+                    request_quit(window.app_handle());
                 }
             }
             #[cfg(target_os = "android")]
@@ -329,6 +345,10 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::connect,
             account::account_totp,
+            account::account_password_change,
+            account::account_leave,
+            account::account_purge,
+            account::account_delete,
             account::qr_svg,
             account::safety_number,
             account::forget_relay_id,
@@ -376,6 +396,7 @@ pub fn run() {
             commands::get_chat_history_status,
             commands::unlock_chat_history,
             commands::create_chat_history,
+            commands::move_chat_history_aside,
             commands::save_chat_messages,
             commands::clear_chat_history,
             commands::delete_chat_history,
@@ -435,6 +456,7 @@ pub fn run() {
             commands::admin_kick,
             commands::admin_ban,
             commands::admin_unban,
+            commands::admin_ban_account,
             commands::admin_list_bans,
             // Persistent config
             commands::load_config,
@@ -456,11 +478,41 @@ pub fn run() {
             commands::browse_sound_file,
             commands::set_sound_settings,
             commands::preview_sound,
+            commands::quit_app,
+            commands::open_share_popout,
+            updater::updates_supported,
+            updater::pending_update,
+            updater::check_for_update,
+            updater::install_update,
+            updater::set_check_updates,
         ])
-        .run(tauri::generate_context!())
+        .build(tauri::generate_context!())
+        .map(|app| {
+            app.run(|app, event| {
+                // The 5 s flush loop dies with the runtime: write what it has
+                // not written yet, or the last seconds of chat are lost (H4-09)
+                if let tauri::RunEvent::Exit = event {
+                    let state = app.state::<AppState>();
+                    tauri::async_runtime::block_on(commands::flush_chat_to_disk(&state));
+                }
+            })
+        })
         .unwrap_or_else(|e| {
             tracing::error!("Tauri runtime failed: {e}");
             #[cfg(not(target_os = "android"))]
             eprintln!("Tauri runtime failed: {e}");
         });
+}
+
+/// Quit once the front end has handed over the chat it has not saved yet: it
+/// hears `quit-requested`, saves, and calls `quit_app`. One that does not
+/// answer is not waited for long.
+#[cfg(not(target_os = "android"))]
+fn request_quit(app: &tauri::AppHandle) {
+    let _ = tauri::Emitter::emit(app, "quit-requested", ());
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        app.exit(0);
+    });
 }

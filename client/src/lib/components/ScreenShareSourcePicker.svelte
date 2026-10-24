@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { backdrop, dialog } from "../actions/dialog.js";
   import { onMount } from "svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { addNotification } from "../stores/notifications.js";
@@ -141,8 +142,6 @@
     }
   }
 
-  // Linux (portal) and the browser both show their own picker after Start
-  let isLinux = $derived(platform === "linux");
   // Said out loud rather than downgraded silently: on Firefox the share goes
   // out without the screen's sound, which is the price of being offered
   // anything but a browser tab.
@@ -159,11 +158,15 @@
   );
 </script>
 
-<div class="overlay" onclick={close} role="presentation">
-  <div class="picker" onclick={(e) => e.stopPropagation()} role="dialog">
+<div class="overlay" onclick={backdrop(close)} role="presentation">
+  <div
+    class="picker"
+    aria-label={$pickerSwitchMode ? "Switch source" : "Share screen"}
+    use:dialog={{ onclose: starting ? undefined : close }}
+  >
     <div class="picker-header">
       <span>{$pickerSwitchMode ? "Switch Source" : "Share Screen"}</span>
-      <button class="close-btn" onclick={close} disabled={starting}>&times;</button>
+      <button class="close-btn" onclick={close} disabled={starting} aria-label="Close">&times;</button>
     </div>
 
     <!-- Tabs -->
@@ -270,8 +273,8 @@
     <!-- Settings -->
     <div class="settings-body">
       <div class="setting-row">
-        <label>Resolution:</label>
-        <select bind:value={resolution} disabled={starting}>
+        <label for="share-resolution">Resolution:</label>
+        <select id="share-resolution" bind:value={resolution} disabled={starting}>
           <option value={480}>480p</option>
           <option value={720}>720p</option>
           <option value={1080}>1080p</option>
@@ -279,8 +282,8 @@
       </div>
 
       <div class="setting-row">
-        <label>Frame Rate:</label>
-        <select bind:value={fps} disabled={starting}>
+        <label for="share-fps">Frame Rate:</label>
+        <select id="share-fps" bind:value={fps} disabled={starting}>
           <option value={30}>30 FPS</option>
           <option value={60}>60 FPS</option>
         </select>

@@ -1,13 +1,19 @@
 name: Tests
 
-# Runs on every push and pull request, and as the gate the release workflow
-# calls before it builds anything.
+# Runs on pushes to main and on pull requests, and as the gate the release
+# workflow calls before it builds anything. Not on every branch push: a branch
+# with a pull request would run twice.
 
 on:
   push:
-    branches: ['**']
+    branches: [main]
   pull_request:
   workflow_call:
+
+# Nothing here writes. Without this a push event's token gets the repository's
+# default permissions, which may include write.
+permissions:
+  contents: read
 
 concurrency:
   # `github.workflow` is the *caller's* name, so the copy the release workflow
@@ -20,8 +26,9 @@ jobs:
   rust:
     name: Rust
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         # No token left in .git/config for build scripts to find
         with: { persist-credentials: false }
 
@@ -39,13 +46,21 @@ jobs:
             libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev \
             libssl-dev libclang-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Rust toolchain
+        run: rustup update --no-self-update stable
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: |
             . -> target
             crates/voipc-web -> target
+            crates/voipc-opus-wasm -> target
+
+      # Before anything builds: a manifest edited without its lockfile fails
+      # here, instead of CI resolving fresh versions nobody reviewed. With the
+      # lockfiles consistent, no later cargo command can change them.
+      - name: Lockfiles match the manifests
+        run: for d in . crates/voipc-web crates/voipc-opus-wasm; do (cd "$d" && cargo fetch --locked); done
 
       - name: Version fields agree with Cargo.toml
         run: node tools/voipc.mjs version --check
@@ -53,7 +68,7 @@ jobs:
       # Through tools/ci-run.sh so a failure repeats its tail as an annotation:
       # Actions logs need admin rights to read through the API, annotations do
       # not, so this is the only part of a red run anyone can actually see.
-      - run: bash tools/ci-run.sh "cargo test" cargo test --workspace
+      - run: bash tools/ci-run.sh "cargo test" cargo test --workspace --locked
 
       # The browser half of the spatial maths and the room presets, under
       # Node's own test runner. Needs Node 22 for --experimental-strip-types;
@@ -63,7 +78,7 @@ jobs:
       # is Node's own: room.test.ts and users.test.ts reach `svelte/store`
       # through room.ts and users.ts, and a fresh checkout has no node_modules
       # anywhere, so without this the step dies instantly on ERR_MODULE_NOT_FOUND.
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 22
           cache: npm
@@ -75,12 +90,19 @@ jobs:
 
       # Separate workspace (wasm-only dependencies), so it needs its own run.
       - name: Test the wasm crate on the host
-        run: bash ../../tools/ci-run.sh "wasm crate test" cargo test
+        run: bash ../../tools/ci-run.sh "wasm crate test" cargo test --locked
         working-directory: crates/voipc-web
+
+      # The browser's Opus decoder, its own workspace too; its tests replay the
+      # fuzz target on stable.
+      - name: Test the Opus wasm crate on the host
+        run: bash ../../tools/ci-run.sh "opus wasm crate test" cargo test --locked
+        working-directory: crates/voipc-opus-wasm
 
   browser:
     name: Browser end-to-end
     runs-on: ubuntu-24.04
+    timeout-minutes: 60
     # The image has both, and test-web.sh would pick `chromium` first — but that
     # one is an unbranded snapshot build (no proprietary codecs), so the browser
     # sharer quietly falls back to VP9 and no lane exercises the H.264 path that
@@ -89,7 +111,7 @@ jobs:
     env:
       CHROME: /usr/bin/google-chrome
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         # No token left in .git/config for build scripts to find
         with: { persist-credentials: false }
 
@@ -120,19 +142,21 @@ jobs:
           pactl load-module module-null-sink sink_name=voipc-test
           pactl info   # fails the step here, not six checks later, if none of that worked
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: client/package-lock.json
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: wasm32-unknown-unknown
+      - name: Rust toolchain
+        run: rustup update --no-self-update stable && rustup target add wasm32-unknown-unknown
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: '. -> target'
+
+      - name: Lockfiles match the manifests
+        run: for d in . crates/voipc-web crates/voipc-opus-wasm; do (cd "$d" && cargo fetch --locked); done
 
       - run: npm ci
         working-directory: client
@@ -174,3 +198,92 @@ jobs:
         if: ${{ !cancelled() }}
         run: ./test-web.sh
         env: { BROWSER_ALICE: firefox, TRANSPORT_ALICE: tcp, BROWSER_BOB: chromium }
+      # A network that drops UDP: both browsers ask for QUIC and must race
+      # over to the TCP fallback on their own. Only the first two test relays
+      # are blocked; the accounts relay of test-ui.mjs keeps its UDP.
+      - name: UDP blocked — both fall back to TCP
+        if: ${{ !cancelled() }}
+        run: |
+          rule=(INPUT -i lo -p udp --dport 19987:19988 -j DROP)
+          sudo iptables -I "${rule[@]}"
+          trap 'sudo iptables -D "${rule[@]}"' EXIT
+          ./test-web.sh
+        env: { BROWSER: chromium, EXPECT_FALLBACK: '1' }
+      # Delay, jitter (which also reorders) and 5 % loss on loopback. It
+      # reports, it does not gate: it has never run, and the thresholds that
+      # will gate it come from its first runs.
+      - name: Lossy link (netem, report only)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        timeout-minutes: 15
+        run: |
+          if ! sudo modprobe sch_netem; then
+            sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+            sudo modprobe sch_netem
+          fi
+          sudo tc qdisc add dev lo root netem delay 40ms 20ms loss 5%
+          trap 'sudo tc qdisc del dev lo root' EXIT
+          ./test-web.sh
+        env: { BROWSER: chromium }
+
+  # The Windows and Android builds compile on every pull request, not first
+  # in a release run. cargo check only, with the caches release.yml uses.
+  cross:
+    name: Windows and Android cargo check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      CARGO_XWIN_VERSION: '0.23.1'
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with: { persist-credentials: false }
+
+      - name: Cross toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            clang lld llvm ninja-build cmake nasm protobuf-compiler unzip curl pkg-config
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+
+      - name: Rust toolchain
+        run: rustup update --no-self-update stable && rustup target add x86_64-pc-windows-msvc aarch64-linux-android
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: '. -> target'
+
+      - name: Lockfiles match the manifests
+        run: cargo fetch --locked
+
+      - uses: gradle/actions/wrapper-validation@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
+
+      - name: Restore cargo-xwin
+        id: xwin
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cargo/bin/cargo-xwin
+          key: cargo-xwin-${{ env.CARGO_XWIN_VERSION }}
+
+      - name: Install cargo-xwin
+        if: steps.xwin.outputs.cache-hit != 'true'
+        run: cargo install --locked "cargo-xwin@$CARGO_XWIN_VERSION"
+
+      - name: Restore the pinned Windows FFmpeg
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.local/share/voipc/ffmpeg-win64
+          key: voipc-ffmpeg-win64-${{ hashFiles('tools/tasks/windows-cross.mjs') }}
+
+      # check:windows downloads FFmpeg only on a cache miss, checked against
+      # its pinned SHA-256; the release workflow saves the cache.
+      - name: Windows
+        run: bash tools/ci-run.sh "windows check" node tools/voipc.mjs check:windows
+
+      - name: Android
+        run: |
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;28.0.13004108"
+          export ANDROID_NDK_HOME="$ANDROID_HOME/ndk/28.0.13004108"
+          bash tools/ci-run.sh "android check" node tools/voipc.mjs android check

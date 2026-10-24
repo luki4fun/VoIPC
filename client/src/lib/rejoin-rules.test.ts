@@ -5,7 +5,7 @@
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolveRejoin } from "./rejoin-rules.ts";
+import { reconnectDelay, resolveRejoin } from "./rejoin-rules.ts";
 import type { ChannelInfo } from "./types.ts";
 
 function channel(over: Partial<ChannelInfo> & { channel_id: number; name: string }): ChannelInfo {
@@ -64,4 +64,13 @@ test("a channel that is gone is simply not rejoined", () => {
     ["general"],
   );
   assert.deepEqual(resolveRejoin([], list, "text"), []);
+});
+
+test("reconnects spread out, within half to one and a half times the backoff", () => {
+  assert.equal(reconnectDelay(1, () => 0), 500);
+  assert.ok(reconnectDelay(1, () => 0.999999) < 1500);
+  assert.equal(reconnectDelay(3, () => 0.5), 4000);
+  assert.equal(reconnectDelay(40, () => 0.5), 10000, "capped");
+  const seen = new Set(Array.from({ length: 20 }, () => Math.round(reconnectDelay(2))));
+  assert.ok(seen.size > 1, "not all in step");
 });

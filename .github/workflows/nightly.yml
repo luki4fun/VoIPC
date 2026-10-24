@@ -1,0 +1,165 @@
+name: Nightly
+
+# Slow checks that need no pull request to trigger them.
+#
+# GitHub turns a scheduled workflow off after 60 days without activity in the
+# repository. After a quiet spell, turn it back on in the Actions tab.
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Every trust-boundary parser, ten minutes each (fuzz/README.md). The corpus
+  # carries over from night to night in the cache. A crash fails the job,
+  # repeats its tail as an annotation and uploads the input; it becomes a file
+  # in fuzz/regressions/<target>/, which `cargo test` replays on stable, and a
+  # finding for whoever owns that code.
+  fuzz:
+    name: Fuzz ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [codec, media_packets, video_assembly, ws, envelope, keys, log, vault,
+                 jitter, opus, game, web_media, opus_decode]
+    env:
+      NIGHTLY: nightly-2026-10-23
+      CARGO_FUZZ_VERSION: '0.13.2'
+      TARGET: ${{ matrix.target }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with: { persist-credentials: false }
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake protobuf-compiler libasound2-dev libclang-dev
+
+      - name: Rust nightly
+        run: rustup toolchain install "$NIGHTLY" --profile minimal
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: 'fuzz -> target'
+          shared-key: fuzz
+
+      - name: Restore cargo-fuzz
+        id: cargo-fuzz
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-${{ env.CARGO_FUZZ_VERSION }}
+
+      - name: Install cargo-fuzz
+        if: steps.cargo-fuzz.outputs.cache-hit != 'true'
+        run: cargo install --locked "cargo-fuzz@$CARGO_FUZZ_VERSION"
+
+      - name: Save cargo-fuzz
+        if: always() && steps.cargo-fuzz.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cargo/bin/cargo-fuzz
+          key: cargo-fuzz-${{ env.CARGO_FUZZ_VERSION }}
+
+      - name: Lockfile matches the manifest
+        run: cargo fetch --locked
+        working-directory: fuzz
+
+      - name: Restore the corpus
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+          restore-keys: fuzz-corpus-${{ matrix.target }}-
+
+      - name: Fuzz
+        working-directory: fuzz
+        run: |
+          mkdir -p "corpus/$TARGET"
+          bash ../tools/ci-run.sh "fuzz $TARGET" \
+            cargo "+$NIGHTLY" fuzz run "$TARGET" "corpus/$TARGET" -- -max_total_time=600
+
+      - name: Save the corpus
+        if: always()
+        continue-on-error: true
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: fuzz/corpus/${{ matrix.target }}
+          key: fuzz-corpus-${{ matrix.target }}-${{ github.run_id }}
+
+      - name: Upload the crashing input
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: fuzz-crash-${{ matrix.target }}
+          path: fuzz/artifacts/${{ matrix.target }}
+
+  # The release's static server, its web tarball and the wasm inside it are
+  # reproducible: the same commit builds the same bytes. Built twice from
+  # clean, at the same paths (absolute paths end up in panic messages), and
+  # compared. The desktop bundles are rebuildable but not bit-identical: they
+  # carry the runner's apt libraries of the day (BUILDING.md).
+  repro:
+    name: Reproducible server and web bundle
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with: { persist-credentials: false }
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake protobuf-compiler musl-tools
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Rust toolchain
+        run: rustup update --no-self-update stable && rustup target add x86_64-unknown-linux-musl wasm32-unknown-unknown
+
+      - name: Lockfiles match the manifests
+        run: for d in . crates/voipc-web crates/voipc-opus-wasm; do (cd "$d" && cargo fetch --locked); done
+
+      - run: npm ci
+        working-directory: client
+
+      - name: Build twice and compare
+        run: |
+          # What release.yml's linux job does, into $1
+          build() {
+            (cd client && npm run build:web)
+            cargo build -p voipc-server --release --locked --target x86_64-unknown-linux-musl
+            mkdir -p "$1"
+            cp target/x86_64-unknown-linux-musl/release/voipc-server client/src/lib/wasm/*.wasm "$1/"
+            # The same command as release.yml's "Collect artifacts"
+            tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+              -cf - -C client dist-web | gzip -9n > "$1/web.tar.gz"
+          }
+          clean() {
+            cargo clean
+            (cd crates/voipc-web && cargo clean)
+            rm -rf client/dist-web client/src/lib/wasm
+          }
+          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          build "$RUNNER_TEMP/a"
+          clean
+          build "$RUNNER_TEMP/b"
+          (cd "$RUNNER_TEMP/a" && sha256sum -- *) | tee "$RUNNER_TEMP/a.sums"
+          (cd "$RUNNER_TEMP/b" && sha256sum -- *) > "$RUNNER_TEMP/b.sums"
+          if ! diff "$RUNNER_TEMP/a.sums" "$RUNNER_TEMP/b.sums"; then
+            differ=$(diff "$RUNNER_TEMP/a.sums" "$RUNNER_TEMP/b.sums" | sed -n 's/^< [0-9a-f]*  //p' | tr '\n' ' ')
+            echo "::error title=not reproducible::two clean builds of $GITHUB_SHA differ in: $differ"
+            exit 1
+          fi

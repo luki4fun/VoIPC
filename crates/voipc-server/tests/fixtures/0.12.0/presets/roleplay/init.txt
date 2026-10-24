@@ -1,0 +1,31 @@
+Wrote channels.json from the "roleplay" preset: 5 text and 8 voice channels.
+
+  #welcome              text, auto-join, announcements
+  #announcements        text, auto-join, announcements
+  #ooc-chat             text, auto-join
+  #looking-for-rp       text, slow mode 60 s, messages live 1 d
+  #staff                text, hidden, password
+  Ingame                voice, 3d proximity, routed, hidden, members hidden, anonymous, no screen share, password
+  OOC Lounge            voice
+  Support Waiting Room  voice
+  Support 1             voice, max 3
+  Support 2             voice, max 3
+  Whitelist Interview   voice, max 4, password
+  Staff Meeting         voice, hidden, password
+  AFK                   voice, no screen share
+
+Passwords — shown this once; channels.json keeps only their hashes:
+  staff                uwnt-mab3-jegy
+  Ingame               6vkr-2x9k-ch49
+  Whitelist Interview  gxwy-7kzf-d3s4
+  Staff Meeting        w7hk-jx48-wpst
+
+Wrote server_settings.json.
+game_token: 7abed082a215c3244f1072f30786e83e52a5d1170f89b6e95578f4eb5c7909f4
+
+Restart the server to load it. To change a password for good, put
+"password": "…" in place of that channel's "password_hash".
+
+- The Ingame password goes into the game resource's server config (sdk/fivem-voipc/server_config.lua, channelPassword), the game_token into the game server's VoIPC settings — never in front of players. See docs/SDK.md.
+- Factions — police, medics, gangs — usually want rooms of their own: add one per faction, each with a password.
+- Posting in an announcement channel takes an admin (the admin token) or, on a server with accounts, a moderator.

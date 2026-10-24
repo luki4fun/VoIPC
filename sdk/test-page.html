@@ -181,9 +181,11 @@
         fillModes();
         warnUnsupportedMode();
       }
-      // Any "send hello again" (a reconnect, a channel change, or another
-      // socket taking over) is recoverable without touching the sliders
-      if (msg.type === "error" && typeof msg.reason === "string" && msg.reason.includes("hello")) {
+      // "Say hello again" (a reconnect, an admin move, another socket taking
+      // over) and the player coming back are recoverable without touching the
+      // sliders. `player_left` is not: the player walked away themselves.
+      if ((msg.type === "error" && (msg.code === "rehello" || msg.code === "no_hello")) ||
+          (msg.type === "state" && msg.state === "returned")) {
         log("! re-sending hello");
         connect.hello && socket.send(JSON.stringify(connect.hello));
       }

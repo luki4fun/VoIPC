@@ -9,7 +9,7 @@ use ringbuf::HeapRb;
 use tracing::{error, info, warn};
 
 use crate::device;
-use crate::resample::LinearResampler;
+use crate::resample::Resampler;
 
 /// The sample rate Opus expects. We prefer this on the capture device;
 /// if unsupported, samples are resampled to 48kHz before hitting the ring.
@@ -34,7 +34,7 @@ fn push_input(
     data: &[f32],
     channels: usize,
     gain: f32,
-    resampler: &mut Option<LinearResampler>,
+    resampler: &mut Option<Resampler>,
     mono: &mut Vec<f32>,
     resampled: &mut Vec<f32>,
 ) {
@@ -42,14 +42,14 @@ fn push_input(
         data
     } else if channels == 1 {
         mono.clear();
-        mono.extend(data.iter().map(|s| (s * gain).clamp(-1.0, 1.0)));
+        mono.extend(data.iter().map(|s| s * gain));
         mono
     } else {
         // If stereo or multi-channel, take only the first channel
         mono.clear();
         mono.extend(
             data.chunks(channels)
-                .map(|c| (c[0] * gain).clamp(-1.0, 1.0)),
+                .map(|c| c[0] * gain),
         );
         mono
     };
@@ -112,7 +112,7 @@ pub fn start_capture(
     );
 
     let mut resampler =
-        (actual_rate != TARGET_SAMPLE_RATE).then(|| LinearResampler::new(actual_rate, TARGET_SAMPLE_RATE));
+        (actual_rate != TARGET_SAMPLE_RATE).then(|| Resampler::new(actual_rate, TARGET_SAMPLE_RATE));
     let mut mono: Vec<f32> = Vec::new();
     let mut resampled: Vec<f32> = Vec::new();
 

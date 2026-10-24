@@ -26,10 +26,21 @@ export interface UserInfo {
   account?: number[] | null;
 }
 
-/** An active IP ban (admin view). */
+/** An active ban (admin view). An address ban shows the name it was given
+ *  under, never the address. */
 export interface BanInfo {
-  ip: string;
-  /** Seconds until expiry; null = until the server restarts. */
+  /** What `admin_unban` lifts. */
+  id: number;
+  /** An account ban; else an address ban. */
+  account: boolean;
+  /** The account's name, or the name the user went by when banned. */
+  label: string;
+  reason: string;
+  /** An account's name, "admin token" or "server shell". */
+  by: string;
+  /** Unix seconds. */
+  created_at: number;
+  /** Seconds until expiry; null = permanent. */
   expires_in_secs: number | null;
 }
 

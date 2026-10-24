@@ -14,6 +14,10 @@
 # every check below then proves the tunnel carries what QUIC does — and a mixed
 # run, that the relay is the same across the two.
 #
+# EXPECT_FALLBACK=1 is for a run with the relay's UDP ports blocked (the CI
+# lane drops them with iptables): both browsers ask for QUIC as usual, and
+# both must have raced over to the TCP fallback on their own.
+#
 # Prerequisites: VOIPC_SELFTEST=1 npm run web (a release bundle has no self-test),
 # openssl, curl with HTTP/2, and either chromium (CHROME=/path/to/chrome) or,
 # for the Firefox lane, firefox (FIREFOX=...) plus certutil to trust the test
@@ -105,7 +109,7 @@ CHANNELS
 # --tcp-fallback on both servers, whatever the transport: the QUIC runs then
 # also prove that offering the tunnel's http/1.1 leaves the h2 page alone.
 (cd "$WORK" && exec "$SCRIPT_DIR/$SERVER" --host 127.0.0.1 --tcp-port "$TCP_PORT" --udp-port "$TCP_PORT" \
-  --cert server.crt --key server.key --admin-token e2e-admin --channels channels.json --tcp-fallback \
+  --cert server.crt --key server.key --admin-token e2e-admin-token-0001 --channels channels.json --tcp-fallback \
   > "$WORK/server.log" 2>&1) &
 
 for _ in $(seq 1 50); do
@@ -147,7 +151,7 @@ cat > "$WORK/s3/channels.json" <<'CHANNELS'
 [{ "name": "kept", "text": true, "auto_join": true }]
 CHANNELS
 (cd "$WORK/s3" && exec "$SCRIPT_DIR/$SERVER" --config server.toml --host 127.0.0.1 --tcp-port "$TCP_PORT3" \
-  --udp-port "$TCP_PORT3" > "$WORK/server3.log" 2>&1) &
+  --udp-port "$TCP_PORT3" --admin-token e2e-admin-token-0001 > "$WORK/server3.log" 2>&1) &
 for _ in $(seq 1 50); do
   curl -sk --http2-prior-knowledge "https://127.0.0.1:$TCP_PORT3/wt.json" 2>/dev/null | grep -q '"hash"' && break
   sleep 0.2
@@ -183,7 +187,7 @@ EOF
 # alice creates the channel, becomes admin at the end and kicks bob; bob joins
 # through an invite-link fragment (#channel=…) and expects the kick
 # alice also shares her (synthetic) screen; bob watches it
-run_browser alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admin&kick=bob&share=1&proximity=2d&pos=3,0,0&spatialtest=3d$(via "$TRANSPORT_ALICE")" \
+run_browser alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admin-token-0001&kick=bob&share=1&proximity=2d&pos=3,0,0&spatialtest=3d$(via "$TRANSPORT_ALICE")" \
   "$WORK/alice.log" "$BROWSER_ALICE"
 # Not a fixed stagger: the run asserts that a message alice sent *before* bob
 # arrived reaches him as channel history, so the harness has to make "before"
@@ -279,9 +283,16 @@ fi
 
 # Which way the sessions really went. A side asked onto TCP must have got
 # there, and with both on QUIC none may have fallen back: the race would
-# otherwise hide a broken QUIC path behind a passing run.
+# otherwise hide a broken QUIC path behind a passing run. With UDP blocked,
+# both must have fallen back.
 tunnels=$(grep -c 'session established over the TCP fallback' "$WORK/server.log" || true)
-if [ "$TRANSPORT_ALICE" = tcp ] || [ "$TRANSPORT_BOB" = tcp ]; then
+if [ "${EXPECT_FALLBACK:-}" = 1 ]; then
+  if [ "$tunnels" -ge 2 ]; then
+    echo "PASS both sessions fell back to TCP with UDP blocked"
+  else
+    echo "FAIL $tunnels of 2 sessions fell back to TCP with UDP blocked" | tee -a "$WORK/fails.txt"; fail=1
+  fi
+elif [ "$TRANSPORT_ALICE" = tcp ] || [ "$TRANSPORT_BOB" = tcp ]; then
   check "sessions ran over the TCP fallback" "$WORK/server.log" 'session established over the TCP fallback'
 elif [ "$tunnels" -gt 0 ]; then
   echo "FAIL $tunnels session(s) fell back to TCP in a QUIC run" | tee -a "$WORK/fails.txt"; fail=1

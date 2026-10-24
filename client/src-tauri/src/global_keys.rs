@@ -32,6 +32,12 @@ use crate::app_state::{AppState, PttBinding, VoiceMode};
 #[cfg(not(target_os = "android"))]
 use crate::commands;
 
+/// Why global keys fail on Linux, as the player is told it.
+#[cfg(not(target_os = "android"))]
+const LINUX_KEYS_REASON: &str = "VoIPC cannot read the keyboard while it is in the background. \
+     On Wayland that needs read access to the input devices: \
+     `sudo usermod -aG input $USER`, then log out and back in.";
+
 #[cfg(not(target_os = "android"))]
 /// Spawn a background thread that monitors global keyboard events and triggers
 /// PTT start/stop. Keys are NOT consumed — they still propagate to all applications.
@@ -67,6 +73,15 @@ pub fn spawn_listener(
                 "Global PTT: evdev unavailable (tip: 'sudo usermod -aG input $USER' \
                  for Wayland support). Falling back to X11..."
             );
+            // Under XWayland the X11 fallback starts without an error, so the
+            // toast below never fires — yet it hears keys only while an X11
+            // window has focus, which on a Wayland desktop is almost never (H4-13).
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                let _ = handle.emit(
+                    "global-keys-unavailable",
+                    serde_json::json!({ "reason": LINUX_KEYS_REASON }),
+                );
+            }
         }
 
         run_rdev_loop(handle, ptt_binding, ptt_hold_mode, mute_binding, deafen_binding);
@@ -343,9 +358,7 @@ fn run_rdev_loop(
             "global-keys-unavailable",
             serde_json::json!({
                 "reason": if cfg!(target_os = "linux") {
-                    "VoIPC cannot read the keyboard while it is in the background. \
-                     On Wayland that needs read access to the input devices: \
-                     `sudo usermod -aG input $USER`, then log out and back in."
+                    LINUX_KEYS_REASON
                 } else {
                     "VoIPC cannot read the keyboard while it is in the background."
                 },
@@ -537,6 +550,16 @@ fn run_evdev_loop(
         check_toggle_hotkey(handle, d_match, deafen_active, "toggle-deafen-request");
     };
 
+    // Is the PTT binding still down, by the rule of the current mode?
+    let ptt_still_held = |held: &HashSet<Key>| {
+        let b = ptt_binding.read().unwrap_or_else(|p| p.into_inner());
+        if ptt_hold_mode.load(Ordering::Relaxed) {
+            evdev_binding_held(held, &b)
+        } else {
+            evdev_binding_matches(held, &b)
+        }
+    };
+
     // Set all devices to non-blocking mode via fcntl
     for dev in &devices {
         unsafe {
@@ -593,17 +616,7 @@ fn run_evdev_loop(
                                     // Key release
                                     held_keys.remove(&key);
                                     update_toggles(&held_keys, &mut mute_active, &mut deafen_active);
-                                    let b = ptt_binding.read().unwrap_or_else(|p| p.into_inner());
-                                    let hold =
-                                        ptt_hold_mode.load(Ordering::Relaxed);
-                                    let still = if hold {
-                                        evdev_binding_held(&held_keys, &b)
-                                    } else {
-                                        evdev_binding_matches(&held_keys, &b)
-                                    };
-                                    drop(b);
-
-                                    if !still && ptt_active {
+                                    if !ptt_still_held(&held_keys) && ptt_active {
                                         ptt_active = false;
                                         let _ = ptt.send(false);
                                     }
@@ -629,14 +642,10 @@ fn run_evdev_loop(
         // Drop unplugged devices now. Keeping a dead fd makes poll() return
         // immediately (POLLHUP) forever: 100% CPU and a log line per spin
         // until a replacement keyboard shows up.
+        let mut devices_changed = !dead_fds.is_empty();
         if !dead_fds.is_empty() {
             devices.retain(|d| !dead_fds.contains(&d.as_raw_fd()));
             dead_fds.clear();
-            if devices.is_empty() && ptt_active {
-                // The key can never be released now — don't leave the mic open
-                ptt_active = false;
-                let _ = ptt.send(false);
-            }
         }
 
         // Re-enumerate keyboards on device removal or every 30s (handles hotplug)
@@ -650,9 +659,28 @@ fn run_evdev_loop(
                     }
                 }
                 tracing::debug!("Re-enumerated {} keyboard devices", devices.len());
+                devices_changed = true;
             }
             needs_reenumerate = false;
             last_enum = std::time::Instant::now();
+        }
+
+        // A release can go missing with a device: a second keyboard unplugged
+        // while the key is down, or a release queued on an fd the re-scan just
+        // replaced. Either leaves the microphone open until the key is pressed
+        // again, so ask the kernel what is down now instead (H4-06). No
+        // keyboard left reads as nothing held, which lets go too.
+        if devices_changed {
+            held_keys = devices
+                .iter()
+                .filter_map(|d| d.get_key_state().ok())
+                .flat_map(|keys| keys.iter().collect::<Vec<_>>())
+                .collect();
+            update_toggles(&held_keys, &mut mute_active, &mut deafen_active);
+            if ptt_active && !ptt_still_held(&held_keys) {
+                ptt_active = false;
+                let _ = ptt.send(false);
+            }
         }
     }
 }

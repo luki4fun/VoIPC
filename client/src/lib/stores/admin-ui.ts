@@ -56,17 +56,26 @@ export function openAdminPanel(): void {
   );
 }
 
-export async function unban(ip: string): Promise<void> {
+export async function unban(id: number): Promise<void> {
   try {
-    await invoke("admin_unban", { server: get(serverAddress), ip });
+    await invoke("admin_unban", { server: get(serverAddress), id });
   } catch (e) {
     addNotification(`Unban failed: ${e}`, "error");
   }
 }
 
+/** Ban an account by name, online or not; `durationSecs` 0 = permanent. */
+export async function banAccount(name: string, reason: string, durationSecs: number): Promise<void> {
+  try {
+    await invoke("admin_ban_account", { server: get(serverAddress), name: name.trim(), reason, durationSecs });
+  } catch (e) {
+    addNotification(`Ban failed: ${e}`, "error");
+  }
+}
+
 /** How long a ban has left, for the list. */
 export function expiry(ban: BanInfo): string {
-  if (ban.expires_in_secs === null) return "until server restart";
+  if (ban.expires_in_secs === null) return "permanent";
   const s = ban.expires_in_secs;
   if (s >= 3600) return `${Math.ceil(s / 3600)} h left`;
   if (s >= 60) return `${Math.ceil(s / 60)} min left`;

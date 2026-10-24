@@ -60,12 +60,17 @@ const STEP_WAIT: Duration = Duration::from_secs(30);
 const TOTP_WAIT: Duration = Duration::from_secs(120);
 /// The proof of work and making a vault.
 const REGISTER_WAIT: Duration = Duration::from_secs(60);
-/// Sign-ins in progress at once: each holds a connection slot for up to two
-/// minutes, so a flood of half-finished ones must not hold all of them.
+/// Sign-in work at once: a password hash, a device signature, the database.
+/// Held only while the relay works, never while it waits for the client or a
+/// person typing a code: held across those, a few addresses re-dialling every
+/// minute kept every permit and nobody could sign in (1.0 audit H1-02). The
+/// connections themselves are bounded by the pre-authentication pool.
 const PENDING_SIGN_INS: usize = 32;
 /// Of those, at most this many from one address (IPv6: one /64), so one
 /// address cannot hold them all.
 const PENDING_PER_ADDRESS: usize = 4;
+/// What a sign-in hears when no permit is free.
+pub const BUSY: &str = "the server is busy signing people in — try again in a moment";
 /// How often every signed-in connection is checked against the database: a
 /// role taken away, codes reset or a session ended from the server's shell
 /// (a separate process) reaches a live connection within this.
@@ -88,6 +93,7 @@ macro_rules! db {
     };
 }
 
+pub mod bans;
 pub mod log;
 
 /// What l4f calls back into.
@@ -125,7 +131,16 @@ pub struct Relay {
     pending: Arc<Semaphore>,
     pending_by_address: Arc<DashMap<String, usize>>,
     pow_key: Vec<u8>,
+    /// What address bans are hashed with (`crate::bans`).
+    ban_key: Vec<u8>,
+    /// Recovery-key resets per address (`ConnLimits` key): each fetches a
+    /// vault's recovery slot, so they are few (5, then one per 3 minutes).
+    resets: DashMap<IpAddr, crate::state::RateLimiter>,
 }
+
+/// A key slot as `voipc_crypto::account::Vault` writes it: version byte,
+/// salt (32), DEK id (8), nonce (12), the wrapped DEK and its tag (48).
+const SLOT_LEN: usize = 1 + 32 + 8 + 12 + 48;
 
 /// One sign-in in progress: a share of the relay's slots and of its
 /// address's, both given back when it ends.
@@ -170,6 +185,7 @@ impl Relay {
         let keys = Keys::new(master, None).map_err(|e| anyhow!("accounts master key: {e:?}"))?;
         check_key(&store, &keys).await?;
         let pow_key = keys.subkey("voipc-pow").to_vec();
+        let ban_key = keys.subkey("voipc-ban").to_vec();
         let ip_salt = keys.subkey("voipc-ip").to_vec();
         let host = RelayHost { cfg: Arc::new(l4f_config(cfg, relay_id)), store: store.clone() };
         let accounts = Accounts::build(store.clone(), keys, Arc::default(), host, APP_SCOPES, Some(pow_key.clone()), ip_salt).await?;
@@ -185,6 +201,8 @@ impl Relay {
             pending: Arc::new(Semaphore::new(PENDING_SIGN_INS)),
             pending_by_address: Arc::default(),
             pow_key,
+            ban_key,
+            resets: DashMap::new(),
         })
     }
 
@@ -522,7 +540,9 @@ fn unexpected() -> String {
 /// Runs an account sign-in on a connection whose `Authenticate` named one, up
 /// to the keys. `Err` is the reason for the client (`AuthError`). A session
 /// made on the way is ended again when a later step fails.
+#[allow(clippy::too_many_arguments)]
 pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
+    state: &ServerState,
     relay: &Relay,
     stream: &mut S,
     buf: &mut BytesMut,
@@ -534,6 +554,7 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
     let ctx = relay.ctx(ip, app_version);
     let mut answers = 0u32;
     let mut registered = false;
+    let work = || relay.pending_slot(ip).ok_or_else(|| BUSY.to_string());
     let session: NewSession = match start {
         AccountStart::Login => {
             step(stream, AuthStep::Salt { relay_id: relay.relay_id, pow: None }).await?;
@@ -541,9 +562,13 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                 return Err(unexpected());
             };
             let pw = secret_text(&auth_secret)?;
-            match relay.accounts.login_password(&ctx, name, &pw, None).await {
+            let login = {
+                let _work = work()?;
+                relay.accounts.login_password(&ctx, name, &pw, None).await
+            };
+            match login {
                 Ok(LoginStep::Done(s)) => s,
-                Ok(LoginStep::NeedMfa(pending)) => second_factor(relay, stream, buf, &ctx, pending, &mut answers).await?,
+                Ok(LoginStep::NeedMfa(pending)) => second_factor(relay, stream, buf, &ctx, pending, &mut answers, ip).await?,
                 Err(e) => return Err(e.message().into()),
             }
         }
@@ -556,12 +581,14 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             let AuthContinue::DeviceSig { signature } = next(stream, buf, STEP_WAIT, &mut answers).await? else {
                 return Err(unexpected());
             };
+            let _work = work()?;
             relay
                 .accounts
                 .devkey_login(&ctx, &challenge, &nonce, &device_id, &signature)
                 .await
                 .map_err(|e| e.message().to_string())?
         }
+        AccountStart::Reset => return reset(state, relay, stream, buf, name, &ctx, ip, &mut answers).await,
         AccountStart::Register { invite } => {
             let invite = invite.filter(|c| !c.trim().is_empty());
             if invite.is_none() && relay.registration != RegistrationMode::Open {
@@ -588,6 +615,7 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                 return Err(reason.into());
             }
             let pw = secret_text(&auth_secret)?;
+            let _work = work()?;
             let s = match &invite {
                 Some(code) => {
                     let form = InviteForm { code, username: name, password: &pw, email: None, display_name: None };
@@ -606,10 +634,17 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             }
             .map_err(|e| e.message().to_string())?;
             for b in &vault {
-                if let Err(e) = relay.store().put_blob(s.info.user_id, VAULT_NS, &b.k, &b.v, 0, relay.quota).await {
-                    let _ = relay.accounts.logout(&s.token).await;
-                    warn!("storing a new account's vault: {e}");
-                    return Err("Something went wrong. Please try again.".into());
+                // Anything but a write (over quota, a conflict) is a failure
+                // too: an account without its vault cannot be opened on
+                // another device, nor on this one after a reinstall
+                // (1.0 audit H1-06)
+                match relay.store().put_blob(s.info.user_id, VAULT_NS, &b.k, &b.v, 0, relay.quota).await {
+                    Ok(l4f_accounts::store::PutBlob::Done(_)) => {}
+                    other => {
+                        let _ = relay.accounts.logout(&s.token).await;
+                        warn!("storing a new account's vault: {other:?}");
+                        return Err("Something went wrong. Please try again.".into());
+                    }
                 }
             }
             registered = true;
@@ -617,7 +652,7 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
     let token = session.token.clone();
-    let r = finish(relay, stream, buf, name, session, registered, &mut answers).await;
+    let r = finish(relay, stream, buf, name, session, registered, &mut answers, ip).await;
     if r.is_err() {
         let _ = relay.accounts.logout(&token).await;
     }
@@ -626,6 +661,95 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
 
 /// A code from the authenticator app or a recovery code. A wrong one asks
 /// again (another `NeedTotp`) until the connection's answers run out.
+/// A forgotten password, set anew with the recovery key (`AccountStart::Reset`).
+/// Ends with `ResetDone`, then an `Err` that closes the connection: the person
+/// signs in with the new password, as on any other device.
+#[allow(clippy::too_many_arguments)]
+async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
+    state: &ServerState,
+    relay: &Relay,
+    stream: &mut S,
+    buf: &mut BytesMut,
+    name: &str,
+    ctx: &Ctx,
+    ip: IpAddr,
+    answers: &mut u32,
+) -> Result<SignedIn, String> {
+    let gone = || "Something went wrong. Please try again.".to_string();
+    let allowed = relay
+        .resets
+        .entry(crate::limit_key(ip))
+        .or_insert_with(|| crate::state::RateLimiter::new(5.0, 1.0 / 180.0))
+        .try_consume();
+    if !allowed {
+        return Err("Too many resets from your address. Try again later.".into());
+    }
+    let (user, identity, vault) = {
+        let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
+        let Ok(clean) = scope::normalize_username(name, &[]) else { return Err("No account of that name.".into()) };
+        let user = relay.store().user_by_username(&clean).await.map_err(|_| gone())?.ok_or("No account of that name.")?;
+        let identity = relay.identity(user.id).await.map_err(|_| gone())?.ok_or("This account cannot be reset.")?;
+        let vault = relay.vault(user.id).await.map_err(|_| gone())?;
+        (user, identity, vault)
+    };
+    // Never the password slot: with it anyone could guess the password offline
+    let blobs: Vec<VaultBlob> = vault.iter().filter(|b| b.k == "slot.recovery" || b.k == "item.identity").cloned().collect();
+    if !blobs.iter().any(|b| b.k == "slot.recovery") {
+        return Err("This account has no recovery key.".into());
+    }
+    let challenge: [u8; 32] = rand::random();
+    let second_factor = l4f_accounts::service::has_second_factor(&user);
+    step(stream, AuthStep::ResetChallenge { relay_id: relay.relay_id, challenge: challenge.to_vec(), blobs, second_factor }).await?;
+    let AuthContinue::Reset { signature, auth_secret, pass_slot, totp, recovery_code } = next(stream, buf, TOTP_WAIT, answers).await? else {
+        return Err(unexpected());
+    };
+    if !voipc_crypto::account::reset_proof_ok(&identity, &relay.relay_id, &user.username, &challenge, &signature) {
+        return Err("That recovery key is not this account's.".into());
+    }
+    if pass_slot.len() != SLOT_LEN {
+        return Err(unexpected());
+    }
+    let pw = secret_text(&auth_secret)?;
+    let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
+    if second_factor {
+        let factor = match (&totp, &recovery_code) {
+            (Some(code), _) => l4f_accounts::service::SecondFactor::Totp(code),
+            (None, Some(code)) => l4f_accounts::service::SecondFactor::Recovery(code),
+            (None, None) => return Err("This account needs a code from the authenticator app, or a recovery code.".into()),
+        };
+        relay.accounts.second_factor_check(ctx, &user, factor).await.map_err(|e| e.message().to_string())?;
+    }
+    replace_pass_slot(relay, user.id, &vault, &pass_slot, || relay.accounts.password_set_as_host(ctx, user.id, &pw)).await?;
+    info!(user = %user.id.hex(), "account password reset with the recovery key");
+    sign_out_account(state, user.id).await;
+    step(stream, AuthStep::ResetDone).await?;
+    Err("Your password was reset. Sign in with the new one.".into())
+}
+
+/// `slot.pass` and the password change together: the slot first
+/// (compare-and-set), then `change`; the old slot goes back if `change`
+/// fails, so the vault keeps opening with whichever password signs in. (A
+/// crash between the two is left to the recovery key.)
+pub(crate) async fn replace_pass_slot<F, Fut>(relay: &Relay, user: AccountId, vault: &[VaultBlob], slot: &[u8], change: F) -> Result<(), String>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(), l4f_accounts::service::Error>>,
+{
+    let gone = || "Something went wrong. Please try again.".to_string();
+    let old = vault.iter().find(|b| b.k == "slot.pass");
+    let written = match relay.store().put_blob(user, VAULT_NS, "slot.pass", slot, old.map_or(0, |b| b.version), relay.quota).await {
+        Ok(PutBlob::Done(v)) => v,
+        _ => return Err(gone()),
+    };
+    if let Err(e) = change().await {
+        if let Some(old) = old {
+            let _ = relay.store().put_blob(user, VAULT_NS, "slot.pass", &old.v, written, relay.quota).await;
+        }
+        return Err(e.message().to_string());
+    }
+    Ok(())
+}
+
 async fn second_factor<S: AsyncRead + AsyncWrite + Unpin>(
     relay: &Relay,
     stream: &mut S,
@@ -633,6 +757,7 @@ async fn second_factor<S: AsyncRead + AsyncWrite + Unpin>(
     ctx: &Ctx,
     pending: NewSession,
     answers: &mut u32,
+    ip: IpAddr,
 ) -> Result<NewSession, String> {
     let Ok(Some(user)) = relay.store().user_by_id(pending.info.user_id).await else {
         return Err("Wrong username or password.".into());
@@ -640,7 +765,9 @@ async fn second_factor<S: AsyncRead + AsyncWrite + Unpin>(
     let r = async {
         loop {
             step(stream, AuthStep::NeedTotp).await?;
-            let r = match next(stream, buf, TOTP_WAIT, answers).await? {
+            let answer = next(stream, buf, TOTP_WAIT, answers).await?;
+            let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
+            let r = match answer {
                 AuthContinue::Totp { code } => relay.accounts.mfa_totp(ctx, &user, &pending.info, &code).await,
                 AuthContinue::Recovery { code } => relay.accounts.mfa_recovery(ctx, &user, &pending.info, &code).await.map(|(s, _)| s),
                 _ => return Err(unexpected()),
@@ -660,6 +787,7 @@ async fn second_factor<S: AsyncRead + AsyncWrite + Unpin>(
     r
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
     relay: &Relay,
     stream: &mut S,
@@ -668,15 +796,21 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
     session: NewSession,
     registered: bool,
     answers: &mut u32,
+    ip: IpAddr,
 ) -> Result<SignedIn, String> {
     let gone = || "Something went wrong. Please try again.".to_string();
-    let (user, info, scopes) = relay.accounts.session_from_token(&session.token, util::now()).await.map_err(|_| gone())?.ok_or_else(gone)?;
+    let work = || relay.pending_slot(ip).ok_or_else(|| BUSY.to_string());
+    let (user, info, scopes, blobs) = {
+        let _work = work()?;
+        let (user, info, scopes) = relay.accounts.session_from_token(&session.token, util::now()).await.map_err(|_| gone())?.ok_or_else(gone)?;
+        let blobs = if registered { None } else { Some(relay.vault(user.id).await.map_err(|_| gone())?) };
+        (user, info, scopes, blobs)
+    };
     // A device key names its account itself; the name typed must be it.
     if !user.username.eq_ignore_ascii_case(name.trim()) {
         return Err("That device belongs to another account.".into());
     }
-    if !registered {
-        let blobs = relay.vault(user.id).await.map_err(|_| gone())?;
+    if let Some(blobs) = blobs {
         step(stream, AuthStep::Vault { blobs }).await?;
     }
     let AuthContinue::Keys { identity_key, prekey_bundle, reset_identity } = next(stream, buf, STEP_WAIT, answers).await? else {
@@ -686,10 +820,17 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
     if identity_key.is_empty() || identity_key.len() > 64 {
         return Err("malformed identity key".into());
     }
+    let _work = work()?;
     match relay.identity(user.id).await.map_err(|_| gone())? {
         Some(known) if known == identity_key => {}
         Some(_) if !reset_identity => {
             return Err("This device's identity key is not your account's. Open your vault, or reset your identity in the account settings.".into());
+        }
+        // Replacing the identity every peer pinned takes the password (and
+        // codes), not a remembered device's key: one stolen device must not
+        // turn every contact's pin into a warning (1.0 audit H1-14).
+        Some(_) if !relay.accounts.fresh(&info, util::now()) => {
+            return Err("Sign in with your password to reset your identity.".into());
         }
         _ => relay.set_identity(user.id, &identity_key).await.map_err(|_| gone())?,
     }
@@ -699,6 +840,108 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 // ── After sign-in ─────────────────────────────────────────────────────────
+
+/// A signed-in account's new password: the old one checked, a fresh session
+/// (the second factor where there is one), the vault's password slot and the
+/// password together. This session stays; every other l4f session and every
+/// remembered device goes.
+#[allow(clippy::too_many_arguments)]
+async fn password_change(
+    state: &ServerState,
+    relay: &Relay,
+    session_id: u32,
+    ctx: &Ctx,
+    user: &User,
+    info: &SessionInfo,
+    (old_secret, new_secret, pass_slot): (Vec<u8>, Vec<u8>, Vec<u8>),
+    (totp, recovery_code): (Option<String>, Option<String>),
+) -> Result<(), String> {
+    let (old, new) = (secret_text(&old_secret)?, secret_text(&new_secret)?);
+    if pass_slot.len() != SLOT_LEN {
+        return Err("malformed password slot".into());
+    }
+    let (user, fresh) = confirm_again(state, relay, session_id, ctx, user, info, &old, (totp, recovery_code)).await?;
+    let vault = relay.vault(user.id).await.map_err(|e| e.to_string())?;
+    replace_pass_slot(relay, user.id, &vault, &pass_slot, || relay.accounts.password_change(ctx, &user, &fresh.info, &new)).await?;
+    info!(user = %user.id.hex(), "account password changed");
+    Ok(())
+}
+
+/// The person at this connection proves it again before an account-wide
+/// change: the password, and the second factor where the account has one.
+/// The session comes out fresh, with a new token this connection now holds.
+/// Returns the account as the database has it now (codes turned on from
+/// another device since this connection signed in count).
+#[allow(clippy::too_many_arguments)]
+async fn confirm_again(
+    state: &ServerState,
+    relay: &Relay,
+    session_id: u32,
+    ctx: &Ctx,
+    user: &User,
+    info: &SessionInfo,
+    password: &str,
+    (totp, recovery_code): (Option<String>, Option<String>),
+) -> Result<(User, NewSession), String> {
+    let msg = |e: l4f_accounts::service::Error| e.message().to_string();
+    let user = relay.store().user_by_id(user.id).await.map_err(|e| e.to_string())?.ok_or("This account is gone.")?;
+    let fresh = if l4f_accounts::service::has_second_factor(&user) {
+        relay.accounts.confirm_password(ctx, &user, password).await.map_err(msg)?;
+        match (&totp, &recovery_code) {
+            (Some(code), _) => relay.accounts.step_up_totp(ctx, &user, info, code).await,
+            (None, Some(code)) => relay.accounts.step_up_recovery(ctx, &user, info, code).await,
+            (None, None) => return Err("This account needs a code from the authenticator app, or a recovery code.".into()),
+        }
+    } else {
+        relay.accounts.step_up(ctx, &user, info, password).await
+    }
+    .map_err(msg)?;
+    // The step-up gave this session a new token; the old one no longer
+    // resolves, so `revalidate` would end this connection
+    if let Some(a) = state.sessions.get_mut(&session_id).as_mut().and_then(|s| s.account.as_mut()) {
+        a.token = fresh.token.clone();
+        a.info = fresh.info.clone();
+    }
+    Ok((user, fresh))
+}
+
+/// Deletes the account at this connection, once it proved itself again. Its
+/// vault, identity, log key, what it wrote to the stored logs, the keys to
+/// and from it, its memberships, sessions and device keys go (the database's
+/// cascades); what others wrote to it stays theirs until it expires (D9).
+/// The name is free again.
+#[allow(clippy::too_many_arguments)]
+async fn delete_account(
+    state: &ServerState,
+    relay: &Relay,
+    session_id: u32,
+    ctx: &Ctx,
+    user: &User,
+    info: &SessionInfo,
+    secret: &[u8],
+    second: (Option<String>, Option<String>),
+) -> Result<(), String> {
+    let password = secret_text(secret)?;
+    let (user, _) = confirm_again(state, relay, session_id, ctx, user, info, &password, second).await?;
+    let scopes = state.sessions.get(&session_id).and_then(|s| s.account.as_ref().map(|a| a.scopes.clone())).unwrap_or_default();
+    let actor = l4f_accounts::service::Actor { user: &user, scopes: &scopes };
+    relay.accounts.delete_account(ctx, actor, user.id, false).await.map_err(|e| match e {
+        l4f_accounts::service::Error::LastAdmin => "This is the last admin account here: make another admin first.".to_string(),
+        e => e.message().to_string(),
+    })?;
+    info!(user = %user.id.hex(), "account deleted by its owner");
+    Ok(())
+}
+
+/// Ends this relay's connection of an account whose sessions l4f just ended,
+/// now rather than at the next `revalidate`. (One at most: a sign-in takes
+/// an account's connection over.)
+async fn sign_out_account(state: &ServerState, user: AccountId) {
+    let ids: Vec<u32> = state.sessions.iter().filter(|e| e.value().account.as_ref().is_some_and(|a| a.user.id == user)).map(|e| *e.key()).collect();
+    for id in ids {
+        crate::tcp::force_disconnect(state, id, "Your password was changed. Sign in with the new one.").await;
+    }
+}
 
 /// `is_admin` / `is_moderator` as the scopes say.
 pub fn powers(scopes: &[String]) -> (bool, bool) {
@@ -716,6 +959,15 @@ pub async fn handle_request(state: &ServerState, session_id: u32, req: AccountRe
     else {
         return crate::tcp::send_msg(tx, &reply(refused("Account", "Sign in with an account first."))).await;
     };
+    // Database work, so budgeted on its own beside the 50 messages a second
+    // every message shares (1.0 audit H1-03). The variant's name is what a
+    // client's error handling goes by.
+    let allowed = state.sessions.get_mut(&session_id).is_some_and(|mut s| s.account_rate.try_consume());
+    if !allowed {
+        let name = format!("{req:?}");
+        let name = name.split([' ', '{', '(']).next().unwrap_or("Account");
+        return crate::tcp::send_msg(tx, &reply(refused(name, "Too many requests at once; slow down."))).await;
+    }
     let ctx = relay.ctx(peer_ip, voipc_protocol::codec::APP_VERSION);
     let now = util::now();
     let out = match req {
@@ -777,6 +1029,23 @@ pub async fn handle_request(state: &ServerState, session_id: u32, req: AccountRe
             }
         }
         AccountRequest::VaultPut { k, v, expect } => relay.vault_put(user.id, &k, &v, expect).await?,
+        AccountRequest::LogPurge { conv } => log::purge(&relay, user.id, conv.as_deref()).await?,
+        AccountRequest::DeleteAccount { secret, totp, recovery_code } => {
+            match delete_account(state, &relay, session_id, &ctx, &user, &info, &secret, (totp, recovery_code)).await {
+                Ok(()) => {
+                    crate::tcp::send_msg(tx, &reply(AccountReply::AccountDeleted)).await?;
+                    crate::tcp::force_disconnect(state, session_id, "Your account was deleted.").await;
+                    return Ok(());
+                }
+                Err(reason) => refused("DeleteAccount", &reason),
+            }
+        }
+        AccountRequest::PasswordChange { old_secret, new_secret, pass_slot, totp, recovery_code } => {
+            match password_change(state, &relay, session_id, &ctx, &user, &info, (old_secret, new_secret, pass_slot), (totp, recovery_code)).await {
+                Ok(()) => AccountReply::PasswordChanged,
+                Err(reason) => refused("PasswordChange", &reason),
+            }
+        }
         AccountRequest::LogKeyPublish { logkey, sig } => log::publish(&relay, user.id, &logkey, &sig).await?,
         AccountRequest::LogKeys { accounts } => log::keys(&relay, &accounts).await?,
         AccountRequest::EpochPut { conv, epoch, wraps } => {
@@ -836,8 +1105,11 @@ async fn kept_post_ok(state: &ServerState, session_id: u32, conv: &str) -> Resul
 }
 
 /// The account behind `session_id` leaves `channel_id`'s log: kicked from
-/// the channel, so what is written there from now on is not for them.
-pub async fn kicked_from_log(state: &ServerState, channel_id: u32, session_id: u32) {
+/// the channel, or it left a text channel (1.0, D10: the relay does it, so a
+/// modified client cannot stay a reader), so what is written there from now
+/// on is not for them. Moving between voice channels keeps a log; "Stop
+/// keeping this channel" (`LogLeave`) ends it there.
+pub async fn out_of_log(state: &ServerState, channel_id: u32, session_id: u32) {
     let Some(relay) = state.accounts.as_ref() else { return };
     let Some(account) = state.sessions.get(&session_id).and_then(|s| s.account.as_ref().map(|a| a.user.id.0)) else { return };
     let conv = state.channels.read().await.get(&channel_id).map(|c| c.info.log.clone()).unwrap_or_default();
@@ -942,7 +1214,15 @@ pub async fn revalidate(state: &Arc<ServerState>) {
         .collect();
     for (session_id, token, scopes, needs_2fa) in live {
         match relay.accounts.session_from_token(&token, util::now()).await {
-            Ok(None) => crate::tcp::force_disconnect(state, session_id, "You were signed out of this server.").await,
+            Ok(None) => {
+                // The token may have been rotated while this pass ran (turning
+                // codes on does that): only the token the session still holds
+                // counts (1.0 audit H1-11)
+                let current = state.sessions.get(&session_id).and_then(|s| s.account.as_ref().map(|a| a.token.clone()));
+                if current.as_deref() == Some(token.as_str()) {
+                    crate::tcp::force_disconnect(state, session_id, "You were signed out of this server.").await;
+                }
+            }
             Ok(Some((user, _, now))) => {
                 // A role given to an account without codes changes no scope
                 // (its rights wait for them), only what the account is asked.

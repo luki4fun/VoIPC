@@ -122,3 +122,15 @@ test("of() for a new server writes nothing any view is subscribed to, there and 
   stop();
   serverAddress.set("");
 });
+
+test("peek() reads a server without bringing it into being (H5-16)", async () => {
+  const names = scoped<string[]>(() => []);
+  names.of("a:1").set(["alice"]);
+  assert.deepEqual(get(names.peek("a:1")), ["alice"]);
+  assert.deepEqual(get(names.peek("")), [], "a server with no store reads empty");
+  // Mutating what was read never reaches another server's empty value
+  get(names.peek("ghost:9")).push("x");
+  assert.deepEqual(get(names.peek("other:8")), []);
+  await Promise.resolve();
+  assert.deepEqual([...get(names.all()).keys()], ["a:1"], "a read left a ghost entry");
+});

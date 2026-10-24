@@ -1,0 +1,29 @@
+Wrote channels.json from the "lan" preset: 6 text and 9 voice channels.
+
+  #info              text, auto-join, announcements
+  #brackets          text, auto-join, announcements
+  #general           text, auto-join
+  #looking-for-team  text, slow mode 60 s, messages live 1 d
+  #tech-help         text
+  #orga              text, hidden, password
+  Main Hall          voice
+  Casters            voice, max 4, password
+  Match 1 Team A     voice, max 5
+  Match 1 Team B     voice, max 5
+  Match 2 Team A     voice, max 5
+  Match 2 Team B     voice, max 5
+  Help Desk          voice, max 4
+  Chill Zone         voice
+  Orga Room          voice, hidden, password
+
+Passwords — shown this once; channels.json keeps only their hashes:
+  orga       uby6-q9x9-mczm
+  Casters    zaqm-d95z-xeev
+  Orga Room  6fk9-yr58-d7uk
+
+Restart the server to load it. To change a password for good, put
+"password": "…" in place of that channel's "password_hash".
+
+- Posting in an announcement channel takes an admin (the admin token) or, on a server with accounts, a moderator.
+- Teams can open more rooms with +; for a big event raise max_channels in server_settings.json.
+- Need more matches at once? Copy a pair of Match rooms and number them on.

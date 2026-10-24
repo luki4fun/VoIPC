@@ -208,7 +208,20 @@ pub struct AppConfig {
     /// before any password secret goes to it (`SignIn::expect_relay`).
     #[serde(default)]
     pub relay_ids: std::collections::BTreeMap<String, String>,
+    /// Look for a new VoIPC once a day (desktop NSIS and AppImage builds).
+    /// Each look tells GitHub this address and version, hence the switch.
+    pub check_updates: bool,
+    /// The file's format. A newer VoIPC that changes the meaning of a key
+    /// raises it; this version then reads what it can and saves nothing.
+    pub format: u32,
+    /// Keys this version does not know, written back as they are, so an
+    /// older VoIPC does not delete a newer one's settings.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
+
+/// The `settings.json` format this build writes.
+pub const SETTINGS_FORMAT: u32 = 1;
 
 impl Default for AppConfig {
     fn default() -> Self {
@@ -260,6 +273,9 @@ impl Default for AppConfig {
             chat_history_disabled: false,
             max_conversations: default_max_conversations(),
             relay_ids: Default::default(),
+            check_updates: true,
+            format: SETTINGS_FORMAT,
+            extra: serde_json::Map::new(),
         }
     }
 }
@@ -272,20 +288,32 @@ impl Default for AppConfig {
 pub fn data_dir() -> PathBuf {
     let dir = if let Some(d) = DATA_DIR_OVERRIDE.get() {
         d.clone()
+    } else if cfg!(test) {
+        // Tests never touch the person's real settings, pins or history
+        std::env::temp_dir().join(format!("voipc-test-{}", std::process::id()))
     } else {
         dirs::config_dir()
             .unwrap_or_else(|| std::env::temp_dir().join("voipc_fallback"))
             .join("VoIPC")
     };
-    if !dir.exists() {
-        if let Err(e) = std::fs::create_dir_all(&dir) {
+    // Private to this user: it holds the servers, names and pins, and the
+    // history's salt. No fallback into a shared temp directory, where another
+    // user could have made it first and swap what we read.
+    static TIGHTENED: std::sync::Once = std::sync::Once::new();
+    TIGHTENED.call_once(|| {
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        if let Err(e) = builder.create(&dir) {
             tracing::error!("failed to create VoIPC config directory {:?}: {e}", dir);
-            // Fall back to temp directory
-            let fallback = std::env::temp_dir().join("VoIPC");
-            let _ = std::fs::create_dir_all(&fallback);
-            return fallback;
         }
-    }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+    });
     dir
 }
 
@@ -340,14 +368,20 @@ pub fn migrate_legacy_paths() {
     }
 }
 
-/// Load config from disk. Returns defaults on any error (missing file, parse error).
+/// Load config from disk. Returns defaults on any error (missing file, parse
+/// error). A file that does not parse is kept aside first
+/// (`settings.json.unreadable-<unix>`): the next save would otherwise replace
+/// it, and with it the remembered servers and relay ids.
 pub fn load_config() -> AppConfig {
     let path = config_path();
     match std::fs::read_to_string(&path) {
         Ok(contents) => match serde_json::from_str(&contents) {
             Ok(config) => config,
             Err(e) => {
-                tracing::warn!("Failed to parse {}: {e} — using defaults", path.display());
+                let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+                let aside = path.with_file_name(format!("settings.json.unreadable-{secs}"));
+                let kept = std::fs::rename(&path, &aside);
+                tracing::warn!("Failed to parse {}: {e} — using defaults (the file is kept as {}: {kept:?})", path.display(), aside.display());
                 AppConfig::default()
             }
         },
@@ -367,7 +401,14 @@ pub fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
     let mut tmp_name = path.file_name().unwrap_or_default().to_os_string();
     tmp_name.push(".tmp");
     let tmp_path = path.with_file_name(tmp_name);
-    let mut file = std::fs::File::create(&tmp_path)?;
+    // Readable by this user only, made fresh (a stale one from a crash is
+    // removed first): the rename gives the file the same mode.
+    let _ = std::fs::remove_file(&tmp_path);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&tmp_path)?;
     file.write_all(data)?;
     file.sync_all()?;
     std::fs::rename(&tmp_path, path)
@@ -376,8 +417,14 @@ pub fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
 /// Save config to disk atomically.
 pub fn save_config(config: &AppConfig) -> Result<(), String> {
     let path = config_path();
+    if config.format > SETTINGS_FORMAT {
+        return Err("Settings were saved by a newer VoIPC: changes are not saved by this one".into());
+    }
     let json = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize config: {e}"))?;
+    // Never write a file the next start cannot read: a float that is not
+    // finite becomes `null`, which then fails the whole parse.
+    serde_json::from_str::<AppConfig>(&json).map_err(|e| format!("Refusing to save settings that would not load again: {e}"))?;
     write_atomic(&path, json.as_bytes())
         .map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
@@ -402,7 +449,39 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), b"second, longer");
         let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
         assert_eq!(names, ["chat_history.bin"], "the .tmp was renamed over, not left behind");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600, "readable by this user only");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A key a newer VoIPC added survives this one's save; a newer format is
+    /// read but never saved over; a value that would not load again is not
+    /// written (H4-12: one `inf` used to reset the whole file).
+    #[test]
+    fn settings_keep_what_they_do_not_know_and_never_write_what_will_not_load() {
+        let mut config: AppConfig = serde_json::from_str(r#"{"volume": 0.5, "from_1_1": {"x": 1}}"#).unwrap();
+        assert_eq!(config.format, SETTINGS_FORMAT, "a 0.12 file is format 1");
+        let text = serde_json::to_string(&config).unwrap();
+        assert!(text.contains("from_1_1"), "{text}");
+
+        let newer: AppConfig = serde_json::from_str(r#"{"format": 2}"#).unwrap();
+        assert!(save_config(&newer).unwrap_err().contains("newer VoIPC"));
+
+        config.volume = f32::INFINITY;
+        assert!(save_config(&config).unwrap_err().contains("would not load"));
+    }
+
+    /// D15: checking for updates is on unless the user switched it off, also
+    /// for a settings file from before the switch existed.
+    #[test]
+    fn update_checks_are_on_until_switched_off() {
+        let old: AppConfig = serde_json::from_str(r#"{"volume": 0.5}"#).unwrap();
+        assert!(old.check_updates);
+        let off: AppConfig = serde_json::from_str(r#"{"check_updates": false}"#).unwrap();
+        assert!(!off.check_updates);
     }
 
     /// The appearance blob is the one field this side never reads, which is

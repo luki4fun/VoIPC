@@ -1,0 +1,11 @@
+{
+  "alice": "d864f06cc6e9cb88abc033e0fa69c9f6",
+  "alice_logkey_public": "0547c1ec186c12e18d9d53b5fcc703a4b8ded1dd2bbde059e317efeefd96b71c3e",
+  "bob": "bf285eafa40130fefaecad02d2452fe1",
+  "bob_logkey": "48c121a8efb1538d65decfab8e3f2c0eba03930644d0c2a3a268fd3867721b4e",
+  "conv": "d:bf285eafa40130fefaecad02d2452fe1:d864f06cc6e9cb88abc033e0fa69c9f6",
+  "made_by": "voipc 0.12.0 (49bf256), crates/voipc-server/src/tcp.rs write_upgrade_fixtures",
+  "password": "correct horse battery",
+  "relay_id": "e11ff2bd3bdee6bffda05a36c9f08507",
+  "text": "kept by 0.12.0"
+}

@@ -4,10 +4,12 @@ use std::path::Path;
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tracing::info;
 use voipc_protocol::types::ProximityMode;
 
 const SHA256_PREFIX: &str = "sha256:";
+const ARGON2_PREFIX: &str = "$argon2id$";
 
 /// What a preset writes where a secret belongs. `voipc-server channels init`
 /// replaces it with a fresh one; a file that still carries it was copied by
@@ -39,7 +41,8 @@ pub struct ChannelEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
 
-    /// SHA-256 hash of the password: `"sha256:<64 hex chars>"`.
+    /// The password's hash (`hash_password`): Argon2id as a PHC string, or
+    /// `"sha256:<64 hex chars>"` as written before 1.0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_hash: Option<String>,
 
@@ -116,6 +119,12 @@ pub struct ChannelEntry {
     /// one log across renames.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub uid: Option<String>,
+
+    /// Keys this version does not know, kept as they are: the server rewrites
+    /// the file when it hashes a password, and must not delete what a newer
+    /// version wrote.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 impl ChannelEntry {
@@ -158,15 +167,31 @@ impl Default for ChannelEntry {
             slow_mode_secs: 0,
             nsfw: false,
             uid: None,
+            extra: serde_json::Map::new(),
         }
     }
 }
 
-/// Hash a plaintext password to `"sha256:<64 hex chars>"`.
-pub fn hash_password(plaintext: &str) -> String {
-    let digest = Sha256::digest(plaintext.as_bytes());
-    let hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
-    format!("{}{}", SHA256_PREFIX, hex)
+/// A channel password as `channels.json` keeps it: Argon2id, as a PHC string
+/// (`$argon2id$v=19$…`, l4f's parameters). Before 1.0 it was unsalted SHA-256
+/// (`sha256:<hex>`), which `verify_password` still reads (1.0 audit H1-16).
+pub fn hash_password(plaintext: &str) -> anyhow::Result<String> {
+    if plaintext.is_empty() || plaintext.chars().nth(l4f_accounts::password::MAX_LEN).is_some() {
+        bail!("a channel password must be 1 to {} characters", l4f_accounts::password::MAX_LEN);
+    }
+    Ok(l4f_accounts::password::hash(plaintext))
+}
+
+/// Whether `attempt` is the password `stored` (`hash_password`'s, or a
+/// `sha256:` one from before 1.0). Argon2: tens of milliseconds, so never
+/// under the channel lock (`ServerState::channel_password_attempt`).
+pub fn verify_password(attempt: &str, stored: &str) -> bool {
+    if let Some(hex) = stored.strip_prefix(SHA256_PREFIX) {
+        let digest = Sha256::digest(attempt.as_bytes());
+        let mine: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+        return mine.as_bytes().ct_eq(hex.to_ascii_lowercase().as_bytes()).into();
+    }
+    stored.starts_with(ARGON2_PREFIX) && l4f_accounts::password::verify(attempt, stored).ok
 }
 
 /// Load, validate, and prepare persistent channel entries from a JSON file.
@@ -183,7 +208,7 @@ pub fn load_and_prepare_channels(path: &Path) -> anyhow::Result<Vec<ChannelEntry
 
     validate_entries(&entries)?;
 
-    let needs_rewrite = hash_plaintext_passwords(&mut entries);
+    let needs_rewrite = hash_plaintext_passwords(&mut entries)?;
 
     if needs_rewrite {
         atomic_rewrite(path, &entries)
@@ -274,16 +299,12 @@ pub(crate) fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
             );
         }
         if let Some(ref hash) = entry.password_hash {
-            if !hash.starts_with(SHA256_PREFIX) {
-                bail!(
-                    "channel '{}' password_hash must start with '{}'",
-                    name,
-                    SHA256_PREFIX
-                );
-            }
-            let hex_part = &hash[SHA256_PREFIX.len()..];
-            if hex_part.len() != 64 || !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
-                bail!("channel '{}' password_hash has invalid SHA-256 hex", name);
+            if let Some(hex_part) = hash.strip_prefix(SHA256_PREFIX) {
+                if hex_part.len() != 64 || !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                    bail!("channel '{}' password_hash has invalid SHA-256 hex", name);
+                }
+            } else if !hash.starts_with(ARGON2_PREFIX) {
+                bail!("channel '{}' password_hash must start with '{}' (or '{}', before 1.0)", name, ARGON2_PREFIX, SHA256_PREFIX);
             }
         }
     }
@@ -292,15 +313,15 @@ pub(crate) fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
 }
 
 /// Convert any plaintext passwords to hashed form. Returns `true` if any were converted.
-fn hash_plaintext_passwords(entries: &mut [ChannelEntry]) -> bool {
+fn hash_plaintext_passwords(entries: &mut [ChannelEntry]) -> anyhow::Result<bool> {
     let mut changed = false;
     for entry in entries.iter_mut() {
         if let Some(plaintext) = entry.password.take() {
-            entry.password_hash = Some(hash_password(&plaintext));
+            entry.password_hash = Some(hash_password(&plaintext)?);
             changed = true;
         }
     }
-    changed
+    Ok(changed)
 }
 
 /// Write entries to a temp file then atomically rename over the original.
@@ -316,16 +337,20 @@ pub(crate) fn atomic_rewrite(path: &Path, entries: &[ChannelEntry]) -> anyhow::R
 mod tests {
     use super::*;
 
+    /// 1.0 audit H1-16: Argon2id and salted; a `sha256:` hash from before
+    /// 1.0 still lets its password in, whatever case its hex is in.
     #[test]
-    fn hash_password_produces_correct_format() {
-        let hash = hash_password("secretpass");
-        assert!(hash.starts_with("sha256:"));
-        assert_eq!(hash.len(), 7 + 64); // "sha256:" + 64 hex chars
-    }
-
-    #[test]
-    fn hash_password_is_deterministic() {
-        assert_eq!(hash_password("test"), hash_password("test"));
+    fn channel_passwords_are_argon2id_and_old_hashes_still_work() {
+        let hash = hash_password("secretpass").unwrap();
+        assert!(hash.starts_with("$argon2id$"), "{hash}");
+        assert_ne!(hash, hash_password("secretpass").unwrap(), "salted");
+        assert!(verify_password("secretpass", &hash));
+        assert!(!verify_password("secretpas", &hash));
+        let old = "sha256:2BB80D537B1DA3E38BD30361AA855686BDE0EACD7162FEF6A25FE97BF527A25B"; // "secret"
+        assert!(verify_password("secret", old) && verify_password("secret", &old.to_ascii_lowercase()));
+        assert!(!verify_password("secret2", old));
+        assert!(!verify_password("secret", "md5:5ebe2294ecd0e0f08eab7690d2a6ee69"));
+        assert!(hash_password("").is_err());
     }
 
     #[test]
@@ -411,7 +436,7 @@ mod tests {
                 name: "AFK".into(),
                 description: String::new(),
                 password: None,
-                password_hash: Some(hash_password("test")),
+                password_hash: Some(hash_password("test").unwrap()),
                 max_users: 0,
                 proximity: ProximityMode::Off,
                 ..Default::default()
@@ -431,19 +456,19 @@ mod tests {
             proximity: ProximityMode::Off,
             ..Default::default()
         }];
-        let changed = hash_plaintext_passwords(&mut entries);
+        let changed = hash_plaintext_passwords(&mut entries).unwrap();
         assert!(changed);
         assert!(entries[0].password.is_none());
         assert!(entries[0]
             .password_hash
             .as_ref()
             .unwrap()
-            .starts_with("sha256:"));
+            .starts_with("$argon2id$"));
     }
 
     #[test]
     fn hash_plaintext_passwords_no_change_when_already_hashed() {
-        let hash = hash_password("test");
+        let hash = hash_password("test").unwrap();
         let mut entries = vec![ChannelEntry {
             name: "Test".into(),
             description: String::new(),
@@ -453,7 +478,7 @@ mod tests {
             proximity: ProximityMode::Off,
             ..Default::default()
         }];
-        let changed = hash_plaintext_passwords(&mut entries);
+        let changed = hash_plaintext_passwords(&mut entries).unwrap();
         assert!(!changed);
         assert_eq!(entries[0].password_hash.as_ref().unwrap(), &hash);
     }
@@ -528,14 +553,17 @@ mod tests {
             slow_mode_secs: 45,
             nsfw: true,
             uid: Some("ingame-1".into()),
+            // What a newer version wrote, which this one must not delete
+            extra: serde_json::from_str(r#"{"later_option": {"x": 7}}"#).unwrap(),
         }];
-        assert!(hash_plaintext_passwords(&mut entries));
+        assert!(hash_plaintext_passwords(&mut entries).unwrap());
         let json = serde_json::to_string(&entries).unwrap();
         let back: Vec<ChannelEntry> = serde_json::from_str(&json).unwrap();
         assert_eq!(back[0].proximity, ProximityMode::TwoD);
         assert!(back[0].hidden && back[0].anonymous && back[0].hide_members && back[0].routed);
         assert!(!back[0].screen_share, "sharing must stay switched off");
         assert!(back[0].nsfw && back[0].slow_mode_secs == 45);
+        assert_eq!(back[0].extra["later_option"]["x"], 7, "an unknown key was dropped");
         assert_eq!(back[0].uid.as_deref(), Some("ingame-1"));
     }
 

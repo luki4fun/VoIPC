@@ -1,0 +1,20 @@
+Wrote channels.json from the "tabletop" preset: 6 text and 4 voice channels.
+
+  #table-talk         text, auto-join
+  #sessions           text, auto-join
+  #lore-and-handouts  text
+  #characters         text
+  #rules-questions    text
+  #gm-notes           text, hidden, password
+  The Table           voice, 2d proximity
+  Second Table        voice, 2d proximity
+  GM Whisper          voice, max 2
+  Tavern              voice
+
+Passwords — shown this once; channels.json keeps only their hashes:
+  gm-notes  snjr-zdjh-eu6g
+
+Restart the server to load it. To change a password for good, put
+"password": "…" in place of that channel's "password_hash".
+
+- The Table is a proximity room: arrange the seats around a table in the room view, and the game master shares the map with a screen share.

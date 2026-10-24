@@ -26,7 +26,7 @@ pub fn build_voice_packet(
 ) -> anyhow::Result<Vec<u8>> {
     let key = keys.current().context("no media key for this channel")?;
     let stream = keys.stream_id();
-    let aad = build_aad(key.channel_id, ENCRYPTED_VOICE);
+    let aad = build_aad(key.channel_id, ENCRYPTED_VOICE, session_id);
     let encrypted = media_encrypt(key, stream, sequence, 0, &aad, opus)?;
     Ok(
         VoicePacket::encrypted_voice(session_id, sequence, key.key_id, stream, encrypted)
@@ -66,7 +66,7 @@ pub fn parse_voice_packet(
             let key = keys
                 .get(channel_id, packet.key_id)
                 .context("no media key for that generation")?;
-            let aad = build_aad(key.channel_id, ENCRYPTED_VOICE);
+            let aad = build_aad(key.channel_id, ENCRYPTED_VOICE, packet.session_id);
             Some(media_decrypt(
                 key,
                 packet.stream_id,
@@ -103,7 +103,7 @@ pub fn build_position_packet(
 ) -> anyhow::Result<Vec<u8>> {
     let key = keys.current().context("no media key for this channel")?;
     let stream = keys.stream_id();
-    let aad = build_aad(key.channel_id, POSITION);
+    let aad = build_aad(key.channel_id, POSITION, session_id);
     let payload = PositionPayload { x, y, z };
     let encrypted = media_encrypt(key, stream, sequence, 0, &aad, &payload.to_bytes())?;
     Ok(VoicePacket::position(session_id, sequence, key.key_id, stream, encrypted).to_bytes())
@@ -129,7 +129,7 @@ pub fn parse_position_packet(
     let key = keys
         .get(channel_id, packet.key_id)
         .context("no media key for that generation")?;
-    let aad = build_aad(key.channel_id, POSITION);
+    let aad = build_aad(key.channel_id, POSITION, packet.session_id);
     let plaintext = media_decrypt(
         key,
         packet.stream_id,
@@ -159,7 +159,7 @@ pub fn build_screen_audio_packet(
 ) -> anyhow::Result<Vec<u8>> {
     let key = keys.current().context("no media key for this channel")?;
     let stream = keys.stream_id();
-    let aad = build_aad(key.channel_id, ENCRYPTED_SCREEN_AUDIO);
+    let aad = build_aad(key.channel_id, ENCRYPTED_SCREEN_AUDIO, session_id);
     let encrypted = media_encrypt(key, stream, sequence, 0, &aad, opus)?;
     Ok(ScreenShareAudioPacket::new_encrypted(
         session_id, sequence, timestamp, key.key_id, stream, encrypted,
@@ -193,7 +193,7 @@ pub fn build_video_frame_stream(
     let key = keys.current().context("no media key for this channel")?;
     let stream = keys.stream_id();
     let packet_type = if is_keyframe { 0x14u8 } else { 0x13u8 };
-    let aad = build_aad(key.channel_id, packet_type);
+    let aad = build_aad(key.channel_id, packet_type, session_id);
     let mut out = Vec::with_capacity(frame.len() + needed * 64);
     for pkt in fragment_frame(
         frame,
@@ -250,7 +250,7 @@ pub fn parse_screen_audio_packet(
     let key = keys
         .get(channel_id, packet.key_id)
         .context("no media key for that generation")?;
-    let aad = build_aad(key.channel_id, ENCRYPTED_SCREEN_AUDIO);
+    let aad = build_aad(key.channel_id, ENCRYPTED_SCREEN_AUDIO, packet.session_id);
     let opus = media_decrypt(
         key,
         packet.stream_id,
@@ -316,7 +316,7 @@ impl VideoAssemblerCore {
         let key = keys
             .get(channel_id, packet.key_id)
             .context("no media key for that generation")?;
-        let aad = build_aad(key.channel_id, packet_type as u8);
+        let aad = build_aad(key.channel_id, packet_type as u8, packet.session_id);
         packet.payload = media_decrypt(
             key,
             packet.stream_id,
