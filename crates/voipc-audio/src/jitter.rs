@@ -112,9 +112,7 @@ impl JitterBuffer {
         let spare = self.min_depth.take().is_some_and(|d| d >= 1);
         if spare
             && self.target_delay > MIN_TARGET_DELAY
-            && self
-                .last_change
-                .is_none_or(|t| t.elapsed() >= DECAY_QUIET)
+            && self.last_change.is_none_or(|t| t.elapsed() >= DECAY_QUIET)
         {
             self.target_delay -= 1;
             self.last_change = Some(Instant::now());

@@ -1,16 +1,16 @@
 #[cfg(not(target_os = "android"))]
-pub mod encoder;
+pub mod convert;
 #[cfg(not(target_os = "android"))]
 pub mod decoder;
 #[cfg(not(target_os = "android"))]
-pub mod convert;
+pub mod encoder;
 
 // Android video decoder via NDK AMediaCodec
 #[cfg(target_os = "android")]
 mod android_decoder;
 #[cfg(target_os = "android")]
 pub mod decoder {
-    pub use super::android_decoder::{Decoder, DecodedFrame};
+    pub use super::android_decoder::{DecodedFrame, Decoder};
 }
 
 #[cfg(target_os = "android")]
@@ -41,13 +41,24 @@ pub mod encoder {
             anyhow::bail!("screen share encoding is not available on Android")
         }
 
-        pub fn encode(&mut self, _i420_data: &[u8], _pts: i64, _force_keyframe: bool) -> Result<Vec<EncodedFrame>> {
+        pub fn encode(
+            &mut self,
+            _i420_data: &[u8],
+            _pts: i64,
+            _force_keyframe: bool,
+        ) -> Result<Vec<EncodedFrame>> {
             anyhow::bail!("screen share encoding is not available on Android")
         }
 
-        pub fn width(&self) -> u32 { 0 }
-        pub fn height(&self) -> u32 { 0 }
-        pub fn codec(&self) -> VideoCodec { VideoCodec::H264 }
+        pub fn width(&self) -> u32 {
+            0
+        }
+        pub fn height(&self) -> u32 {
+            0
+        }
+        pub fn codec(&self) -> VideoCodec {
+            VideoCodec::H264
+        }
     }
 }
 
@@ -88,10 +99,14 @@ pub mod convert {
                 let mut count = 0i32;
                 for dy in 0..2u32 {
                     let py = row + dy as usize;
-                    if py >= height { break; }
+                    if py >= height {
+                        break;
+                    }
                     for dx in 0..2u32 {
                         let px = col + dx as usize;
-                        if px >= width { break; }
+                        if px >= width {
+                            break;
+                        }
                         let idx = (py * width + px) * 4;
                         b_sum += bgra[idx] as i32;
                         g_sum += bgra[idx + 1] as i32;
@@ -161,8 +176,12 @@ pub mod convert {
     }
 
     pub fn scale_i420_nearest(
-        src: &[u8], src_w: usize, src_h: usize,
-        dst: &mut Vec<u8>, dst_w: usize, dst_h: usize,
+        src: &[u8],
+        src_w: usize,
+        src_h: usize,
+        dst: &mut Vec<u8>,
+        dst_w: usize,
+        dst_h: usize,
     ) {
         let src_y_size = src_w * src_h;
         let src_uv_w = (src_w + 1) / 2;
@@ -224,7 +243,11 @@ pub fn to_jpeg_ycbcr(i420: &mut [u8], width: usize, height: usize, full_range: b
         return;
     }
     // Normalised: Y in 0..1, chroma in -0.5..0.5
-    let (y_off, y_scale, c_scale) = if full_range { (0.0, 255.0, 255.0) } else { (16.0, 219.0, 224.0) };
+    let (y_off, y_scale, c_scale) = if full_range {
+        (0.0, 255.0, 255.0)
+    } else {
+        (16.0, 219.0, 224.0)
+    };
     let y_of = |v: u8| (v as f32 - y_off) / y_scale;
     let c_of = |v: u8| (v as f32 - 128.0) / c_scale;
     let to_u8 = |v: f32| (v + 0.5).clamp(0.0, 255.0) as u8;
@@ -234,7 +257,9 @@ pub fn to_jpeg_ycbcr(i420: &mut [u8], width: usize, height: usize, full_range: b
         let clut: [u8; 256] = std::array::from_fn(|v| to_u8(c_of(v as u8) * 255.0 + 128.0));
         let (y, c) = i420.split_at_mut(y_len);
         y.iter_mut().for_each(|v| *v = ylut[*v as usize]);
-        c[..2 * c_len].iter_mut().for_each(|v| *v = clut[*v as usize]);
+        c[..2 * c_len]
+            .iter_mut()
+            .for_each(|v| *v = clut[*v as usize]);
         return;
     }
     // BT.709 to BT.601 in YCbCr, by way of RGB: Y gains a part of the chroma,
@@ -246,8 +271,17 @@ pub fn to_jpeg_ycbcr(i420: &mut [u8], width: usize, height: usize, full_range: b
     let fixed = |v: f32| (v * (1 << SHIFT) as f32).round() as i32;
     let [yu, cbu, cru] = bt709_to_bt601(0.0, 1.0, 0.0);
     let [yv, cbv, crv] = bt709_to_bt601(0.0, 0.0, 1.0);
-    let (ay, ayu, ayv) = (fixed(255.0 / y_scale), fixed(yu / c_scale), fixed(yv / c_scale));
-    let (acbu, acbv, acru, acrv) = (fixed(cbu / c_scale), fixed(cbv / c_scale), fixed(cru / c_scale), fixed(crv / c_scale));
+    let (ay, ayu, ayv) = (
+        fixed(255.0 / y_scale),
+        fixed(yu / c_scale),
+        fixed(yv / c_scale),
+    );
+    let (acbu, acbv, acru, acrv) = (
+        fixed(cbu / c_scale),
+        fixed(cbv / c_scale),
+        fixed(cru / c_scale),
+        fixed(crv / c_scale),
+    );
     // The offsets, plus a half for rounding
     let half = 1 << (SHIFT - 1);
     let ky = half - fixed(255.0 / y_scale * y_off) - 128 * (ayu + ayv);
@@ -273,7 +307,10 @@ pub fn to_jpeg_ycbcr(i420: &mut [u8], width: usize, height: usize, full_range: b
     }
     for (u, v) in us.iter_mut().zip(vs.iter_mut()) {
         let (cb, cr) = (*u as i32, *v as i32);
-        (*u, *v) = (out(acbu * cb + acbv * cr + kcb), out(acru * cb + acrv * cr + kcr));
+        (*u, *v) = (
+            out(acbu * cb + acbv * cr + kcb),
+            out(acru * cb + acrv * cr + kcr),
+        );
     }
 }
 
@@ -286,7 +323,11 @@ fn bt709_to_bt601(y: f32, cb: f32, cr: f32) -> [f32; 3] {
     let b = y + 2.0 * (1.0 - kb) * cb;
     let g = (y - kr * r - kb * b) / (1.0 - kr - kb);
     let y6 = kr6 * r + (1.0 - kr6 - kb6) * g + kb6 * b;
-    [y6 * 255.0, (b - y6) / (2.0 * (1.0 - kb6)) * 255.0, (r - y6) / (2.0 * (1.0 - kr6)) * 255.0]
+    [
+        y6 * 255.0,
+        (b - y6) / (2.0 * (1.0 - kb6)) * 255.0,
+        (r - y6) / (2.0 * (1.0 - kr6)) * 255.0,
+    ]
 }
 
 /// Screen share resolution presets.
@@ -389,7 +430,10 @@ mod tests {
         to_jpeg_ycbcr(&mut px, 2, 2, true, true);
         // BT.601 green: Y = 0.587 → 150, Cb = -0.3313 → 44, Cr = -0.4187 → 21
         let near = |a: u8, b: u8| a.abs_diff(b) <= 2;
-        assert!(near(px[0], 150) && near(px[4], 44) && near(px[5], 21), "{px:?}");
+        assert!(
+            near(px[0], 150) && near(px[4], 44) && near(px[5], 21),
+            "{px:?}"
+        );
     }
 
     #[test]
@@ -407,7 +451,11 @@ mod tests {
             })
             .collect();
         for full_range in [false, true] {
-            let (y_off, y_scale, c_scale) = if full_range { (0.0, 255.0, 255.0) } else { (16.0, 219.0, 224.0) };
+            let (y_off, y_scale, c_scale) = if full_range {
+                (0.0, 255.0, 255.0)
+            } else {
+                (16.0, 219.0, 224.0)
+            };
             let y_of = |v: u8| (v as f32 - y_off) / y_scale;
             let c_of = |v: u8| (v as f32 - 128.0) / c_scale;
             let to_u8 = |v: f32| (v + 0.5).clamp(0.0, 255.0) as u8;
@@ -417,14 +465,21 @@ mod tests {
             for row in 0..h {
                 for col in 0..w {
                     let ci = (row / 2) * cw + col / 2;
-                    let [y6, _, _] = bt709_to_bt601(y_of(frame[row * w + col]), c_of(u[ci]), c_of(v[ci]));
-                    assert!(out[row * w + col].abs_diff(to_u8(y6)) <= 1, "luma {row},{col}");
+                    let [y6, _, _] =
+                        bt709_to_bt601(y_of(frame[row * w + col]), c_of(u[ci]), c_of(v[ci]));
+                    assert!(
+                        out[row * w + col].abs_diff(to_u8(y6)) <= 1,
+                        "luma {row},{col}"
+                    );
                 }
             }
             for ci in 0..cw * ch {
                 let [_, cb, cr] = bt709_to_bt601(0.0, c_of(u[ci]), c_of(v[ci]));
                 assert!(out[w * h + ci].abs_diff(to_u8(cb + 128.0)) <= 1, "cb {ci}");
-                assert!(out[w * h + cw * ch + ci].abs_diff(to_u8(cr + 128.0)) <= 1, "cr {ci}");
+                assert!(
+                    out[w * h + cw * ch + ci].abs_diff(to_u8(cr + 128.0)) <= 1,
+                    "cr {ci}"
+                );
             }
         }
     }
@@ -445,9 +500,18 @@ mod tests {
 
     #[test]
     fn resolution_dimensions() {
-        assert_eq!((Resolution::P480.width(), Resolution::P480.height()), (854, 480));
-        assert_eq!((Resolution::P720.width(), Resolution::P720.height()), (1280, 720));
-        assert_eq!((Resolution::P1080.width(), Resolution::P1080.height()), (1920, 1080));
+        assert_eq!(
+            (Resolution::P480.width(), Resolution::P480.height()),
+            (854, 480)
+        );
+        assert_eq!(
+            (Resolution::P720.width(), Resolution::P720.height()),
+            (1280, 720)
+        );
+        assert_eq!(
+            (Resolution::P1080.width(), Resolution::P1080.height()),
+            (1920, 1080)
+        );
     }
 
     #[test]

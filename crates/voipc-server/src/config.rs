@@ -149,7 +149,9 @@ impl ServerConfig {
             return Err(anyhow!("max_users must be at least 1"));
         }
         if self.max_connections_per_ip < 2 {
-            return Err(anyhow!("max_connections_per_ip must be at least 2 (a browser holds two connections)"));
+            return Err(anyhow!(
+                "max_connections_per_ip must be at least 2 (a browser holds two connections)"
+            ));
         }
         if self.accounts.mode != AccountsMode::Off {
             if self.accounts.quota_mb == 0 {
@@ -254,7 +256,11 @@ mod tests {
     #[test]
     fn accounts_are_off_by_default_and_refuse_typos() {
         let config = ServerConfig::default();
-        assert_eq!(config.accounts.mode, AccountsMode::Off, "no database unless asked for");
+        assert_eq!(
+            config.accounts.mode,
+            AccountsMode::Off,
+            "no database unless asked for"
+        );
         let config: ServerConfig = toml::from_str(
             "cert_path = \"c\"\nkey_path = \"k\"\n[accounts]\nmode = \"optional\"\nregistration = \"open\"\ndatabase = \"postgres://x/y\"",
         )
@@ -263,21 +269,39 @@ mod tests {
         assert_eq!(config.accounts.registration, RegistrationMode::Open);
         assert_eq!(config.accounts.database, "postgres://x/y");
         assert!(config.accounts.cloud, "the rest keep their defaults");
-        let typo = toml::from_str::<ServerConfig>("cert_path = \"c\"\nkey_path = \"k\"\n[accounts]\nmod = \"optional\"");
+        let typo = toml::from_str::<ServerConfig>(
+            "cert_path = \"c\"\nkey_path = \"k\"\n[accounts]\nmod = \"optional\"",
+        );
         assert!(typo.is_err(), "an unknown key fails the start");
-        let top = toml::from_str::<ServerConfig>("cert_path = \"c\"\nkey_path = \"k\"\ntcp_fallbak = true");
-        assert!(top.unwrap_err().to_string().contains("tcp_fallbak"), "a top-level typo fails the start, by name");
+        let top = toml::from_str::<ServerConfig>(
+            "cert_path = \"c\"\nkey_path = \"k\"\ntcp_fallbak = true",
+        );
+        assert!(
+            top.unwrap_err().to_string().contains("tcp_fallbak"),
+            "a top-level typo fails the start, by name"
+        );
     }
 
     /// H1-06: numbers that would leave a server up but broken stop the start.
     #[test]
     fn numbers_that_would_break_the_server_are_refused() {
         assert!(ServerConfig::default().validate().is_ok());
-        let parse = |extra: &str| toml::from_str::<ServerConfig>(&format!("cert_path = \"c\"\nkey_path = \"k\"\n{extra}")).unwrap();
+        let parse = |extra: &str| {
+            toml::from_str::<ServerConfig>(&format!("cert_path = \"c\"\nkey_path = \"k\"\n{extra}"))
+                .unwrap()
+        };
         let quota = parse("[accounts]\nmode = \"optional\"\nquota_mb = 0");
-        assert!(quota.validate().unwrap_err().to_string().contains("quota_mb"));
+        assert!(quota
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("quota_mb"));
         let retention = parse("[accounts]\nmode = \"optional\"\nretention_days = 0");
-        assert!(retention.validate().unwrap_err().to_string().contains("retention_days"));
+        assert!(retention
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("retention_days"));
         let off = parse("[accounts]\nquota_mb = 0");
         assert!(off.validate().is_ok(), "no accounts, no quota to mind");
         assert!(parse("max_users = 0").validate().is_err());

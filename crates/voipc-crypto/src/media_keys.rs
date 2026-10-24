@@ -103,8 +103,8 @@ impl MediaKey {
     fn to_aead_key(&self) -> anyhow::Result<&LessSafeKey> {
         // 32 bytes is always a valid AES-256 key length, so init can't fail
         Ok(self.aead_cache.get_or_init(|| {
-            let unbound = UnboundKey::new(&AES_256_GCM, &self.key_bytes)
-                .expect("AES-256 key is 32 bytes");
+            let unbound =
+                UnboundKey::new(&AES_256_GCM, &self.key_bytes).expect("AES-256 key is 32 bytes");
             LessSafeKey::new(unbound)
         }))
     }
@@ -392,13 +392,11 @@ mod tests {
         let sequence = 100;
         let aad = build_aad(1, 0x01, 42);
 
-        let encrypted =
-            media_encrypt(&key, session_id, sequence, 0, &aad, plaintext).unwrap();
+        let encrypted = media_encrypt(&key, session_id, sequence, 0, &aad, plaintext).unwrap();
         assert_ne!(encrypted, plaintext);
         assert_eq!(encrypted.len(), plaintext.len() + GCM_TAG_SIZE);
 
-        let decrypted =
-            media_decrypt(&key, session_id, sequence, 0, &aad, &encrypted).unwrap();
+        let decrypted = media_decrypt(&key, session_id, sequence, 0, &aad, &encrypted).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -455,7 +453,8 @@ mod tests {
     #[test]
     fn a_rewritten_sender_fails() {
         let key = MediaKey::generate(1, 0, 1).unwrap();
-        let encrypted = media_encrypt(&key, 7, 1, 0, &build_aad(1, 0x05, 42), b"alice speaking").unwrap();
+        let encrypted =
+            media_encrypt(&key, 7, 1, 0, &build_aad(1, 0x05, 42), b"alice speaking").unwrap();
         assert!(media_decrypt(&key, 7, 1, 0, &build_aad(1, 0x05, 43), &encrypted).is_err());
         assert!(media_decrypt(&key, 7, 1, 0, &build_aad(1, 0x05, 42), &encrypted).is_ok());
     }
@@ -538,7 +537,10 @@ mod tests {
         // And moving rooms is not blocked by what the old room left behind
         assert!(ring.install(MediaKey::generate(2, 0, 1).unwrap(), 2));
         assert!(ring.has_channel(2));
-        assert!(ring.get(1, 0).is_none(), "the room we left is not ours to decrypt");
+        assert!(
+            ring.get(1, 0).is_none(),
+            "the room we left is not ours to decrypt"
+        );
     }
 
     /// `key_id` is a counter, not a limit. If the last generation were really
@@ -563,10 +565,18 @@ mod tests {
     #[test]
     fn a_minter_with_no_key_starts_the_channel_rather_than_waiting() {
         let mut ring = MediaKeyRing::default();
-        assert_eq!(ring.next_generation(5), 0, "an empty ring starts at the first generation");
+        assert_eq!(
+            ring.next_generation(5),
+            0,
+            "an empty ring starts at the first generation"
+        );
 
         ring.install(MediaKey::new(5, 7, 1, [1u8; 32]), 5);
-        assert_eq!(ring.next_generation(5), 8, "with a key it is the one after ours");
+        assert_eq!(
+            ring.next_generation(5),
+            8,
+            "with a key it is the one after ours"
+        );
         // A key for a room we are not in is not ours to succeed; the ring is
         // cleared on the way out, and this is the same answer from what it holds.
         assert_eq!(ring.next_generation(6), 0);
@@ -609,5 +619,4 @@ mod tests {
         assert_eq!((back.channel_id, back.key_id, back.minter), (7, 3, 11));
         assert!(MediaKey::from_bytes(&key.to_bytes()[..41]).is_err());
     }
-
 }

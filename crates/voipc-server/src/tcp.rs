@@ -12,7 +12,9 @@ use voipc_protocol::codec::{
     decode_client_msg, encode_server_msg, try_decode_frame, APP_VERSION, MAX_RELAY_CIPHERTEXT,
     PROTOCOL_VERSION,
 };
-use voipc_protocol::messages::{AuthStep, ClientMessage, ServerMessage, FIRST_STRUCTURED_REFUSAL, REFUSED_VERSION};
+use voipc_protocol::messages::{
+    AuthStep, ClientMessage, ServerMessage, FIRST_STRUCTURED_REFUSAL, REFUSED_VERSION,
+};
 use voipc_protocol::types::*;
 
 use crate::state::ServerState;
@@ -121,8 +123,21 @@ pub async fn handle_connection<S>(
 
     // --- Authentication phase (each step with its own timeout) ---
     let mut buf = BytesMut::with_capacity(4096);
-    let auth_result = authenticate(&mut stream, &mut buf, &state, &peer_addr, peer_ip, media_tx, sid_tx).await;
-    let Admitted { user_id, session_id, account } = match auth_result {
+    let auth_result = authenticate(
+        &mut stream,
+        &mut buf,
+        &state,
+        &peer_addr,
+        peer_ip,
+        media_tx,
+        sid_tx,
+    )
+    .await;
+    let Admitted {
+        user_id,
+        session_id,
+        account,
+    } = match auth_result {
         Ok(admitted) => admitted,
         Err(e) => {
             // A stranger can repeat this as fast as it can dial: debug only
@@ -135,7 +150,11 @@ pub async fn handle_connection<S>(
     // From here the session is listed: whatever ends this task, a panic
     // included, takes it out again (a ghost would keep its name, its seat and
     // its roster entry until a restart)
-    let mut cleanup = CleanupGuard { state: Some(state.clone()), user_id, session_id };
+    let mut cleanup = CleanupGuard {
+        state: Some(state.clone()),
+        user_id,
+        session_id,
+    };
 
     // --- Split into reader/writer ---
     let (read_half, mut write_half) = tokio::io::split(stream);
@@ -181,7 +200,13 @@ pub async fn handle_connection<S>(
 
     // Send channel list
     let channel_list = state.channel_list().await;
-    let _ = send_msg(&tx, &ServerMessage::ChannelList { channels: channel_list }).await;
+    let _ = send_msg(
+        &tx,
+        &ServerMessage::ChannelList {
+            channels: channel_list,
+        },
+    )
+    .await;
 
     // Auto-join General (channel 0)
     if let Err(e) = handle_join_channel(&state, user_id, session_id, 0, None, &tx).await {
@@ -192,7 +217,14 @@ pub async fn handle_connection<S>(
     // on. The client learns that only from AdminStatus, as after a token
     // login; the others already read it in the roster.
     if state.is_admin(session_id) {
-        let _ = send_msg(&tx, &ServerMessage::AdminStatus { user_id, is_admin: true }).await;
+        let _ = send_msg(
+            &tx,
+            &ServerMessage::AdminStatus {
+                user_id,
+                is_admin: true,
+            },
+        )
+        .await;
     }
 
     // --- Message loop with keepalive ---
@@ -330,7 +362,10 @@ impl Drop for CleanupGuard {
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
             let (user_id, session_id) = (self.user_id, self.session_id);
-            error!(user_id, session_id, "connection task ended without cleaning up; cleaning up now");
+            error!(
+                user_id,
+                session_id, "connection task ended without cleaning up; cleaning up now"
+            );
             tokio::spawn(async move { cleanup_session(&state, user_id, session_id).await });
         }
     }
@@ -350,9 +385,19 @@ fn legacy_protocol_version(payload: &[u8]) -> Option<u32> {
     #[derive(serde::Deserialize)]
     #[allow(dead_code)]
     enum First {
-        Authenticate { username: String, protocol_version: u32 },
+        Authenticate {
+            username: String,
+            protocol_version: u32,
+        },
     }
-    postcard::take_from_bytes::<First>(payload).ok().map(|(First::Authenticate { protocol_version, .. }, _)| protocol_version)
+    postcard::take_from_bytes::<First>(payload).ok().map(
+        |(
+            First::Authenticate {
+                protocol_version, ..
+            },
+            _,
+        )| protocol_version,
+    )
 }
 
 /// Why no frame came (`read_frame`).
@@ -364,7 +409,11 @@ pub(crate) enum NoFrame {
 
 /// The next whole frame on a connection not split into reader and writer yet
 /// (the sign-in), within `wait`.
-pub(crate) async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut BytesMut, wait: Duration) -> std::result::Result<Vec<u8>, NoFrame> {
+pub(crate) async fn read_frame<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    buf: &mut BytesMut,
+    wait: Duration,
+) -> std::result::Result<Vec<u8>, NoFrame> {
     let read = async {
         loop {
             match try_decode_frame(buf) {
@@ -378,17 +427,28 @@ pub(crate) async fn read_frame<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut B
             }
         }
     };
-    tokio::time::timeout(wait, read).await.map_err(|_| NoFrame::TimedOut)?
+    tokio::time::timeout(wait, read)
+        .await
+        .map_err(|_| NoFrame::TimedOut)?
 }
 
 /// One message on a connection not split yet (the sign-in).
-pub(crate) async fn write_msg<S: AsyncWrite + Unpin>(stream: &mut S, msg: &ServerMessage) -> Result<()> {
+pub(crate) async fn write_msg<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    msg: &ServerMessage,
+) -> Result<()> {
     stream.write_all(&encode_server_msg(msg)?).await?;
     Ok(())
 }
 
 async fn refuse<S: AsyncWrite + Unpin>(stream: &mut S, reason: &str) -> Result<()> {
-    write_msg(stream, &ServerMessage::AuthError { reason: reason.to_string() }).await
+    write_msg(
+        stream,
+        &ServerMessage::AuthError {
+            reason: reason.to_string(),
+        },
+    )
+    .await
 }
 
 /// A client of another protocol, told which side has to update. Clients only
@@ -403,7 +463,12 @@ async fn refuse_version<S: AsyncWrite + Unpin>(stream: &mut S, client_protocol: 
     if client_protocol < FIRST_STRUCTURED_REFUSAL {
         return refuse(stream, &text).await;
     }
-    let refused = ServerMessage::Refused { code: REFUSED_VERSION, server_protocol: PROTOCOL_VERSION, server_version: APP_VERSION.into(), text };
+    let refused = ServerMessage::Refused {
+        code: REFUSED_VERSION,
+        server_protocol: PROTOCOL_VERSION,
+        server_version: APP_VERSION.into(),
+        text,
+    };
     write_msg(stream, &refused).await
 }
 
@@ -440,7 +505,15 @@ where
             return Err(e.into());
         }
     };
-    let ClientMessage::Authenticate { username, protocol_version, app_version, identity_key, prekey_bundle, account } = msg else {
+    let ClientMessage::Authenticate {
+        username,
+        protocol_version,
+        app_version,
+        identity_key,
+        prekey_bundle,
+        account,
+    } = msg
+    else {
         anyhow::bail!("expected Authenticate message, got unexpected message type");
     };
 
@@ -465,7 +538,18 @@ where
         }
         (Some(relay), Some(start)) => {
             // Permits are taken inside, around the relay's own work only
-            match crate::accounts::sign_in(state, relay, stream, buf, &username, start, peer_ip, &app_version).await {
+            match crate::accounts::sign_in(
+                state,
+                relay,
+                stream,
+                buf,
+                &username,
+                start,
+                peer_ip,
+                &app_version,
+            )
+            .await
+            {
                 Ok(s) => Some(s),
                 Err(reason) => {
                     refuse(stream, &reason).await?;
@@ -474,7 +558,13 @@ where
             }
         }
         (Some(relay), None) if relay.required => {
-            write_msg(stream, &ServerMessage::AuthStep(AuthStep::AccountRequired { registration: relay.info().registration })).await?;
+            write_msg(
+                stream,
+                &ServerMessage::AuthStep(AuthStep::AccountRequired {
+                    registration: relay.info().registration,
+                }),
+            )
+            .await?;
             anyhow::bail!("guest on a server that requires accounts");
         }
         _ => None,
@@ -483,7 +573,11 @@ where
     // An account's name is the account's (l4f checked it); a guest's is
     // checked here.
     let (username, identity_key, prekey_bundle) = match &signed_in {
-        Some(s) => (s.user.username.clone(), Some(s.identity_key.clone()), Some(s.prekey_bundle.clone())),
+        Some(s) => (
+            s.user.username.clone(),
+            Some(s.identity_key.clone()),
+            Some(s.prekey_bundle.clone()),
+        ),
         None => (username.trim().to_string(), identity_key, prekey_bundle),
     };
     // A name may carry a "#1234" tag (the client adds one) so that two people
@@ -491,7 +585,9 @@ where
     // Uniqueness is on the whole. Without accounts the tag is optional, so
     // tools and tests can log in bare; with them a guest needs one, and the
     // name part must not be an account's.
-    let tagged = username.rsplit_once('#').filter(|(_, tag)| tag.len() == 4 && tag.bytes().all(|b| b.is_ascii_digit()));
+    let tagged = username
+        .rsplit_once('#')
+        .filter(|(_, tag)| tag.len() == 4 && tag.bytes().all(|b| b.is_ascii_digit()));
     let name = tagged.map_or(username.as_str(), |(name, _)| name);
     if name.trim().is_empty() || name.len() > 32 {
         refuse(stream, "username must be 1-32 characters").await?;
@@ -509,14 +605,24 @@ where
             anyhow::bail!("untagged guest name");
         }
         if relay.is_account_name(name).await? {
-            refuse(stream, "that name belongs to an account here — sign in, or pick another").await?;
+            refuse(
+                stream,
+                "that name belongs to an account here — sign in, or pick another",
+            )
+            .await?;
             anyhow::bail!("guest took an account's name");
         }
     }
 
     // An account's ban, then the address's; someone holding a role here gets
     // past an address ban (1.0 audit H1-07)
-    if let Some(why) = crate::bans::refusal(state, peer_ip, signed_in.as_ref().map(|s| (s.user.id.0, !s.scopes.is_empty()))) {
+    if let Some(why) = crate::bans::refusal(
+        state,
+        peer_ip,
+        signed_in
+            .as_ref()
+            .map(|s| (s.user.id.0, !s.scopes.is_empty())),
+    ) {
         end_unused_sign_in(state, signed_in.as_ref().map(|s| s.token.as_str())).await;
         refuse(stream, &why).await?;
         anyhow::bail!("banned");
@@ -540,7 +646,9 @@ where
         // An account signing in again takes over: the name and the account
         // move to this connection, and the old one is told why it closes.
         Some(s) => {
-            state.username_to_session.insert(username_lower.clone(), session_id);
+            state
+                .username_to_session
+                .insert(username_lower.clone(), session_id);
             if let Some(old) = state.account_sessions.insert(s.user.id.0, session_id) {
                 force_disconnect(state, old, "signed in on another device").await;
             }
@@ -598,9 +706,13 @@ where
     // arriving can be told to try again, the one already here
     // cannot be told anything.
     if state.sessions.contains_key(&session_id) {
-        state.username_to_session.remove_if(&username_lower, |_, sid| *sid == session_id);
+        state
+            .username_to_session
+            .remove_if(&username_lower, |_, sid| *sid == session_id);
         if let Some(a) = &session.account {
-            state.account_sessions.remove_if(&a.user.id.0, |_, sid| *sid == session_id);
+            state
+                .account_sessions
+                .remove_if(&a.user.id.0, |_, sid| *sid == session_id);
         }
         end_unused_sign_in(state, session.account.as_ref().map(|a| a.token.as_str())).await;
         refuse(stream, "session id already in use, please reconnect").await?;
@@ -609,11 +721,19 @@ where
     // Out of the pre-authentication pool, which page loads and handshakes
     // share, into the one signed-in sessions use (main.rs `ConnLimits`). The
     // server may have filled up while an account signed in (1.0 audit H1-18).
-    let admitted = if state.user_count() >= state.max_users as usize { Err("server is full") } else { state.limits.promote(peer_ip) };
+    let admitted = if state.user_count() >= state.max_users as usize {
+        Err("server is full")
+    } else {
+        state.limits.promote(peer_ip)
+    };
     if let Err(reason) = admitted {
-        state.username_to_session.remove_if(&username_lower, |_, sid| *sid == session_id);
+        state
+            .username_to_session
+            .remove_if(&username_lower, |_, sid| *sid == session_id);
         if let Some(a) = &session.account {
-            state.account_sessions.remove_if(&a.user.id.0, |_, sid| *sid == session_id);
+            state
+                .account_sessions
+                .remove_if(&a.user.id.0, |_, sid| *sid == session_id);
         }
         end_unused_sign_in(state, session.account.as_ref().map(|a| a.token.as_str())).await;
         refuse(stream, reason).await?;
@@ -625,7 +745,11 @@ where
     // ran before either was listed, so the later one found nothing to close.
     // Whichever does not hold the account now steps aside (1.0 audit H1-10).
     if let Some(id) = account_id {
-        if state.account_sessions.get(&id).is_some_and(|sid| *sid != session_id) {
+        if state
+            .account_sessions
+            .get(&id)
+            .is_some_and(|sid| *sid != session_id)
+        {
             force_disconnect(state, session_id, "signed in on another device").await;
         }
     }
@@ -643,7 +767,11 @@ where
         "authenticated"
     );
 
-    Ok(Admitted { user_id, session_id, account })
+    Ok(Admitted {
+        user_id,
+        session_id,
+        account,
+    })
 }
 
 /// Whether a blob a client asked us to pass on is small enough to come back
@@ -715,7 +843,10 @@ async fn may_relay_key(
         // debug, not warn: clients hand their sender key to every peer they
         // establish a session with, wherever that peer is; this check is the
         // filter, not an anomaly.
-        debug!(from_user_id, target_user_id, channel_id, "key relay rejected: not both members");
+        debug!(
+            from_user_id,
+            target_user_id, channel_id, "key relay rejected: not both members"
+        );
         return false;
     }
     let allowed = state
@@ -724,7 +855,10 @@ async fn may_relay_key(
         .map(|mut s| s.may_relay_key_to(target_user_id))
         .unwrap_or(false);
     if !allowed {
-        debug!(from_user_id, target_user_id, "key relay rate limit exceeded, dropping");
+        debug!(
+            from_user_id,
+            target_user_id, "key relay rate limit exceeded, dropping"
+        );
     }
     allowed
 }
@@ -742,8 +876,15 @@ async fn handle_message(
             channel_id,
             password,
         } => {
-            handle_join_channel(state, user_id, session_id, channel_id, password.as_deref(), tx)
-                .await?;
+            handle_join_channel(
+                state,
+                user_id,
+                session_id,
+                channel_id,
+                password.as_deref(),
+                tx,
+            )
+            .await?;
         }
         ClientMessage::LeaveChannel { channel_id } => {
             handle_leave_text_channel(state, user_id, session_id, channel_id, tx).await?;
@@ -870,7 +1011,10 @@ async fn handle_message(
             handle_set_channel_proximity(state, user_id, session_id, channel_id, proximity, tx)
                 .await?;
         }
-        ClientMessage::SetChannelOptions { channel_id, options } => {
+        ClientMessage::SetChannelOptions {
+            channel_id,
+            options,
+        } => {
             if !may_change_state(state, session_id, user_id) {
                 return Ok(());
             }
@@ -1012,11 +1156,24 @@ async fn handle_message(
                 if !allowed {
                     channel_error(tx, "sending too fast, slow down").await;
                 } else {
-                    handle_send_poke(state, user_id, session_id, target_user_id, ciphertext, message_type, tx).await?;
+                    handle_send_poke(
+                        state,
+                        user_id,
+                        session_id,
+                        target_user_id,
+                        ciphertext,
+                        message_type,
+                        tx,
+                    )
+                    .await?;
                 }
             }
         }
-        ClientMessage::StartScreenShare { source: _, resolution, codec } => {
+        ClientMessage::StartScreenShare {
+            source: _,
+            resolution,
+            codec,
+        } => {
             // Starting and stopping each tell a whole channel, so they cost
             // what the other "something about me changed" messages cost.
             if !may_change_state(state, session_id, user_id) {
@@ -1090,7 +1247,10 @@ async fn handle_message(
             // debug, like the other things a client can repeat at line rate:
             // a log line is the cheapest thing on a server to make somebody
             // else write.
-            debug!(user_id, "received a sign-in message after sign-in, ignoring");
+            debug!(
+                user_id,
+                "received a sign-in message after sign-in, ignoring"
+            );
         }
         ClientMessage::Account(req) => {
             crate::accounts::handle_request(state, session_id, req, tx).await?;
@@ -1143,8 +1303,15 @@ async fn handle_message(
                     channel_error(tx, "sending too fast, slow down").await;
                 } else {
                     handle_encrypted_direct_message(
-                        state, user_id, session_id, target_user_id, ciphertext, message_type, tx,
-                    ).await?;
+                        state,
+                        user_id,
+                        session_id,
+                        target_user_id,
+                        ciphertext,
+                        message_type,
+                        tx,
+                    )
+                    .await?;
                 }
             }
         }
@@ -1163,7 +1330,8 @@ async fn handle_message(
                 } else {
                     handle_encrypted_channel_message(
                         state, user_id, session_id, channel_id, ciphertext, tx,
-                    ).await?;
+                    )
+                    .await?;
                 }
             }
         }
@@ -1177,8 +1345,14 @@ async fn handle_message(
                 && may_relay_key(state, session_id, user_id, channel_id, target_user_id).await
             {
                 handle_distribute_sender_key(
-                    state, user_id, channel_id, target_user_id, distribution_message, message_type,
-                ).await?;
+                    state,
+                    user_id,
+                    channel_id,
+                    target_user_id,
+                    distribution_message,
+                    message_type,
+                )
+                .await?;
             }
         }
         ClientMessage::DistributeMediaKey {
@@ -1191,8 +1365,14 @@ async fn handle_message(
                 && may_relay_key(state, session_id, user_id, channel_id, target_user_id).await
             {
                 handle_distribute_media_key(
-                    state, user_id, channel_id, target_user_id, encrypted_media_key, message_type,
-                ).await?;
+                    state,
+                    user_id,
+                    channel_id,
+                    target_user_id,
+                    encrypted_media_key,
+                    message_type,
+                )
+                .await?;
             }
         }
 
@@ -1200,16 +1380,42 @@ async fn handle_message(
         ClientMessage::AdminLogin { token } => {
             handle_admin_login(state, user_id, session_id, &token, tx).await;
         }
-        ClientMessage::AdminKick { user_id: target_id, reason } => {
+        ClientMessage::AdminKick {
+            user_id: target_id,
+            reason,
+        } => {
             if state.can_moderate(session_id) {
-                handle_admin_kick(state, user_id, state.is_admin(session_id), target_id, reason, None, tx).await;
+                handle_admin_kick(
+                    state,
+                    user_id,
+                    state.is_admin(session_id),
+                    target_id,
+                    reason,
+                    None,
+                    tx,
+                )
+                .await;
             } else {
                 admin_error(tx, "not an admin").await;
             }
         }
-        ClientMessage::AdminBan { user_id: target_id, reason, duration_secs, account } => {
+        ClientMessage::AdminBan {
+            user_id: target_id,
+            reason,
+            duration_secs,
+            account,
+        } => {
             if state.can_moderate(session_id) {
-                handle_admin_kick(state, user_id, state.is_admin(session_id), target_id, reason, Some((duration_secs, account)), tx).await;
+                handle_admin_kick(
+                    state,
+                    user_id,
+                    state.is_admin(session_id),
+                    target_id,
+                    reason,
+                    Some((duration_secs, account)),
+                    tx,
+                )
+                .await;
             } else {
                 admin_error(tx, "not an admin").await;
             }
@@ -1224,17 +1430,33 @@ async fn handle_message(
                     Ok(false) => {}
                     Err(e) => warn!("lifting a ban: {e:#}"),
                 }
-                let _ = send_msg(tx, &ServerMessage::AdminBans { bans: crate::bans::list(state) }).await;
+                let _ = send_msg(
+                    tx,
+                    &ServerMessage::AdminBans {
+                        bans: crate::bans::list(state),
+                    },
+                )
+                .await;
             }
         }
         ClientMessage::AdminListBans => {
             if state.is_admin(session_id) {
-                let _ = send_msg(tx, &ServerMessage::AdminBans { bans: crate::bans::list(state) }).await;
+                let _ = send_msg(
+                    tx,
+                    &ServerMessage::AdminBans {
+                        bans: crate::bans::list(state),
+                    },
+                )
+                .await;
             } else {
                 admin_error(tx, "not an admin").await;
             }
         }
-        ClientMessage::AdminBanAccount { name, reason, duration_secs } => {
+        ClientMessage::AdminBanAccount {
+            name,
+            reason,
+            duration_secs,
+        } => {
             if state.is_admin(session_id) {
                 handle_admin_ban_account(state, session_id, &name, reason, duration_secs, tx).await;
             } else {
@@ -1243,7 +1465,10 @@ async fn handle_message(
         }
 
         // ── Channel history hand-off ───────────────────────────────────
-        ClientMessage::RequestChannelHistory { channel_id, target_user_id } => {
+        ClientMessage::RequestChannelHistory {
+            channel_id,
+            target_user_id,
+        } => {
             let allowed = state
                 .sessions
                 .get_mut(&session_id)
@@ -1253,7 +1478,12 @@ async fn handle_message(
                 handle_request_channel_history(state, user_id, channel_id, target_user_id).await;
             }
         }
-        ClientMessage::SendChannelHistory { channel_id, target_user_id, ciphertext, message_type } => {
+        ClientMessage::SendChannelHistory {
+            channel_id,
+            target_user_id,
+            ciphertext,
+            message_type,
+        } => {
             if relayable(&ciphertext, tx).await {
                 let allowed = state
                     .sessions
@@ -1262,7 +1492,13 @@ async fn handle_message(
                     .unwrap_or(false);
                 if allowed {
                     handle_send_channel_history(
-                        state, user_id, session_id, channel_id, target_user_id, ciphertext, message_type,
+                        state,
+                        user_id,
+                        session_id,
+                        channel_id,
+                        target_user_id,
+                        ciphertext,
+                        message_type,
                     )
                     .await;
                 }
@@ -1391,14 +1627,7 @@ async fn handle_join_channel(
 
     // Send user list for the new channel to the joining user
     let users = state.users_in_channel_for(channel_id, session_id).await;
-    let _ = send_msg(
-        tx,
-        &ServerMessage::UserList {
-            channel_id,
-            users,
-        },
-    )
-    .await;
+    let _ = send_msg(tx, &ServerMessage::UserList { channel_id, users }).await;
 
     // Media keys are generated by clients and exchanged over pairwise Signal
     // sessions (DistributeMediaKey) — the server never sees them.
@@ -1426,14 +1655,19 @@ fn user_info_for(
     let session = state.sessions.get(&session_id);
     UserInfo {
         user_id,
-        username: session.as_ref().map(|s| s.username.clone()).unwrap_or_default(),
+        username: session
+            .as_ref()
+            .map(|s| s.username.clone())
+            .unwrap_or_default(),
         channel_id,
         is_muted: session.as_ref().map(|s| s.is_muted).unwrap_or(false),
         is_deafened: session.as_ref().map(|s| s.is_deafened).unwrap_or(false),
         is_screen_sharing: false,
         is_admin: session.as_ref().is_some_and(|s| s.is_admin),
         shares_history: session.as_ref().is_some_and(|s| s.shares_history),
-        account: session.as_ref().and_then(|s| s.account.as_ref().map(|a| a.user.id.0)),
+        account: session
+            .as_ref()
+            .and_then(|s| s.account.as_ref().map(|a| a.user.id.0)),
         is_moderator: session.as_ref().is_some_and(|s| s.is_moderator),
     }
 }
@@ -1507,7 +1741,11 @@ async fn broadcast_user_joined(state: &Arc<ServerState>, user: UserInfo) {
             String::new()
         };
         let may_name = roster.may_name(session.user_id, user.user_id) || session.is_admin;
-        let account = crate::state::account_shown(user.account, roster.knows_them(session.user_id) && alias.is_none(), session.is_admin);
+        let account = crate::state::account_shown(
+            user.account,
+            roster.knows_them(session.user_id) && alias.is_none(),
+            session.is_admin,
+        );
         let info = UserInfo {
             username,
             user_id: roster.tell(may_name, user.user_id),
@@ -1604,6 +1842,7 @@ async fn roster_audience(state: &ServerState, channel_id: ChannelId) -> RosterAu
 }
 
 /// Handle a create channel request.
+#[allow(clippy::too_many_arguments)]
 async fn handle_create_channel(
     state: &Arc<ServerState>,
     user_id: UserId,
@@ -1618,10 +1857,14 @@ async fn handle_create_channel(
     // Validate and sanitize name
     let name = name.trim().to_string();
     if name.is_empty() || name.len() > state.settings.max_channel_name_len {
-        channel_error(tx, format!(
-                    "channel name must be 1-{} characters",
-                    state.settings.max_channel_name_len
-                )).await;
+        channel_error(
+            tx,
+            format!(
+                "channel name must be 1-{} characters",
+                state.settings.max_channel_name_len
+            ),
+        )
+        .await;
         return Ok(());
     }
 
@@ -1739,7 +1982,10 @@ async fn handle_set_channel_options(
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
     let is_admin = state.can_moderate(session_id);
-    match state.set_channel_options(channel_id, user_id, request, is_admin).await {
+    match state
+        .set_channel_options(channel_id, user_id, request, is_admin)
+        .await
+    {
         Ok((updated_info, changed)) => {
             let sharing_off = !updated_info.screen_share;
             // Nothing moved means nothing to tell anybody, and this one goes
@@ -1837,7 +2083,12 @@ async fn handle_kick_user(
     // has a creator's say in their own channel).
     let spared = moderates
         && !admin
-        && state.user_to_session.get(&target_id).is_some_and(|sid| state.sessions.get(&*sid).is_some_and(|t| t.is_admin || t.is_moderator));
+        && state.user_to_session.get(&target_id).is_some_and(|sid| {
+            state
+                .sessions
+                .get(&*sid)
+                .is_some_and(|t| t.is_admin || t.is_moderator)
+        });
     let is_text = state.is_text_channel(channel_id).await;
     match state
         .kick_user(channel_id, requester_id, target_id, moderates, spared)
@@ -1880,7 +2131,9 @@ async fn handle_kick_user(
             // nothing else — the user stays where they stand.
             if !is_text {
                 // Move the kicked user to General (channel 0)
-                let _ = state.join_channel(target_id, target_session_id, 0, None).await;
+                let _ = state
+                    .join_channel(target_id, target_session_id, 0, None)
+                    .await;
                 let general_users = state.users_in_channel_for(0, target_session_id).await;
 
                 if let Some(session) = state.sessions.get(&target_session_id) {
@@ -1919,7 +2172,10 @@ async fn handle_send_invite(
     target_user_id: UserId,
     tx: &mpsc::Sender<Vec<u8>>,
 ) -> Result<()> {
-    match state.add_invite(channel_id, requester_id, target_user_id).await {
+    match state
+        .add_invite(channel_id, requester_id, target_user_id)
+        .await
+    {
         Ok((channel_name, mut invited_by)) => {
             // Bound to a `let` first: in an `if let` the DashMap guard lives
             // to the end of the block, and `display_name` takes the channels
@@ -2002,9 +2258,7 @@ async fn handle_decline_invite(
     // Look up the channel creator to notify them
     let creator_id = {
         let channels = state.channels.read().await;
-        channels
-            .get(&channel_id)
-            .and_then(|ch| ch.info.created_by)
+        channels.get(&channel_id).and_then(|ch| ch.info.created_by)
     };
 
     // A decline for a channel nobody invited us to is a message of the
@@ -2050,7 +2304,13 @@ async fn end_unused_sign_in(state: &ServerState, token: Option<&str>) {
 
 /// A `ChannelError` for the sender alone: what they asked for was refused.
 async fn channel_error(tx: &mpsc::Sender<Vec<u8>>, reason: impl Into<String>) {
-    let _ = send_msg(tx, &ServerMessage::ChannelError { reason: reason.into() }).await;
+    let _ = send_msg(
+        tx,
+        &ServerMessage::ChannelError {
+            reason: reason.into(),
+        },
+    )
+    .await;
 }
 
 async fn admin_error(tx: &mpsc::Sender<Vec<u8>>, reason: &str) {
@@ -2072,7 +2332,10 @@ async fn handle_admin_login(
     tx: &mpsc::Sender<Vec<u8>>,
 ) {
     use subtle::ConstantTimeEq;
-    let (has_account, peer_ip) = state.sessions.get(&session_id).map_or((false, None), |s| (s.account.is_some(), Some(s.peer_ip)));
+    let (has_account, peer_ip) = state
+        .sessions
+        .get(&session_id)
+        .map_or((false, None), |s| (s.account.is_some(), Some(s.peer_ip)));
     // Before the comparison: answering a guest differently for a right token
     // than for a wrong one confirmed the token (1.0 audit H1-09)
     if state.accounts.is_some() && !has_account {
@@ -2080,18 +2343,22 @@ async fn handle_admin_login(
         return;
     }
     if peer_ip.is_some_and(|ip| !state.token_guess_allowed(ip)) {
-        admin_error(tx, "too many wrong admin tokens from your address; try again later").await;
+        admin_error(
+            tx,
+            "too many wrong admin tokens from your address; try again later",
+        )
+        .await;
         return;
     }
-    let ok: bool = token
-        .as_bytes()
-        .ct_eq(state.admin_token.as_bytes())
-        .into();
+    let ok: bool = token.as_bytes().ct_eq(state.admin_token.as_bytes()).into();
     // With accounts the token is no session-long admin pass: it makes the
     // signed-in account the first admin, while there is none, and then stops
     // working. That admin's rights wait for two-factor codes like any admin's.
     if let (true, Some(relay)) = (ok, state.accounts.clone()) {
-        let account = state.sessions.get(&session_id).and_then(|s| s.account.as_ref().map(|a| (a.user.id, s.peer_ip)));
+        let account = state
+            .sessions
+            .get(&session_id)
+            .and_then(|s| s.account.as_ref().map(|a| (a.user.id, s.peer_ip)));
         let Some((account, peer_ip)) = account else {
             admin_error(tx, "sign in with an account: on this server the admin token makes an account its first admin").await;
             return;
@@ -2104,7 +2371,13 @@ async fn handle_admin_login(
                     warn!(user_id, "after the admin grant: {e}");
                 }
             }
-            Ok(false) => admin_error(tx, "this server has an admin account already; the token no longer works here").await,
+            Ok(false) => {
+                admin_error(
+                    tx,
+                    "this server has an admin account already; the token no longer works here",
+                )
+                .await
+            }
             Err(e) => {
                 warn!(user_id, "admin grant: {}", e.message());
                 admin_error(tx, e.message()).await;
@@ -2168,7 +2441,11 @@ pub(crate) async fn force_disconnect(state: &ServerState, session_id: SessionId,
 
 /// Who a ban says banned: the account's name, or the admin token's holder.
 fn banned_by(state: &ServerState, session_id: SessionId) -> String {
-    state.sessions.get(&session_id).and_then(|s| s.account.as_ref().map(|a| a.user.username.clone())).unwrap_or_else(|| "admin token".into())
+    state
+        .sessions
+        .get(&session_id)
+        .and_then(|s| s.account.as_ref().map(|a| a.user.username.clone()))
+        .unwrap_or_else(|| "admin token".into())
 }
 
 fn ban_reason(reason: String) -> String {
@@ -2200,7 +2477,12 @@ async fn handle_admin_kick(
         return;
     };
     // A moderator moderates people, not the ones who moderate.
-    if !by_admin && state.sessions.get(&target_sid).is_some_and(|s| s.is_admin || s.is_moderator) {
+    if !by_admin
+        && state
+            .sessions
+            .get(&target_sid)
+            .is_some_and(|s| s.is_admin || s.is_moderator)
+    {
         admin_error(tx, "only an admin can kick or ban an admin or a moderator").await;
         return;
     }
@@ -2217,7 +2499,13 @@ async fn handle_admin_kick(
         return;
     };
 
-    let Some((ip, label, account)) = state.sessions.get(&target_sid).map(|s| (s.peer_ip, s.username.clone(), s.account.as_ref().map(|a| a.user.id.0))) else {
+    let Some((ip, label, account)) = state.sessions.get(&target_sid).map(|s| {
+        (
+            s.peer_ip,
+            s.username.clone(),
+            s.account.as_ref().map(|a| a.user.id.0),
+        )
+    }) else {
         admin_error(tx, "user not found").await;
         return;
     };
@@ -2234,18 +2522,42 @@ async fn handle_admin_kick(
             return;
         }
     }
-    info!(admin = admin_user_id, target = target_id, duration_secs, account = with_account && account.is_some(), "admin ban");
+    info!(
+        admin = admin_user_id,
+        target = target_id,
+        duration_secs,
+        account = with_account && account.is_some(),
+        "admin ban"
+    );
     // The one banned goes whatever their role; then whoever else the ban
     // covers (their address, but not a role holder there)
-    force_disconnect(state, target_sid, &format!("You were banned from this server: {reason}")).await;
+    force_disconnect(
+        state,
+        target_sid,
+        &format!("You were banned from this server: {reason}"),
+    )
+    .await;
     crate::bans::enforce(state, Some(target_sid)).await;
     if by_admin {
-        let _ = send_msg(tx, &ServerMessage::AdminBans { bans: crate::bans::list(state) }).await;
+        let _ = send_msg(
+            tx,
+            &ServerMessage::AdminBans {
+                bans: crate::bans::list(state),
+            },
+        )
+        .await;
     }
 }
 
 /// Bans an account by name, online or not (admin only).
-async fn handle_admin_ban_account(state: &Arc<ServerState>, session_id: SessionId, name: &str, reason: String, duration_secs: u32, tx: &mpsc::Sender<Vec<u8>>) {
+async fn handle_admin_ban_account(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    name: &str,
+    reason: String,
+    duration_secs: u32,
+    tx: &mpsc::Sender<Vec<u8>>,
+) {
     let Some(relay) = state.accounts.clone() else {
         admin_error(tx, "this server has no accounts").await;
         return;
@@ -2262,18 +2574,38 @@ async fn handle_admin_ban_account(state: &Arc<ServerState>, session_id: SessionI
             return admin_error(tx, "the ban could not be kept").await;
         }
     };
-    if state.sessions.get(&session_id).and_then(|s| s.account.as_ref().map(|a| a.user.id)) == Some(user.id) {
+    if state
+        .sessions
+        .get(&session_id)
+        .and_then(|s| s.account.as_ref().map(|a| a.user.id))
+        == Some(user.id)
+    {
         return admin_error(tx, "you cannot ban yourself").await;
     }
     let duration = (duration_secs > 0).then(|| Duration::from_secs(u64::from(duration_secs)));
     let reason = ban_reason(reason);
-    if let Err(e) = crate::bans::add(state, crate::bans::Target::Account(user.id.0), &user.username, &reason, &banned_by(state, session_id), duration).await {
+    if let Err(e) = crate::bans::add(
+        state,
+        crate::bans::Target::Account(user.id.0),
+        &user.username,
+        &reason,
+        &banned_by(state, session_id),
+        duration,
+    )
+    .await
+    {
         warn!("keeping a ban: {e:#}");
         return admin_error(tx, "the ban could not be kept").await;
     }
     info!(admin = session_id, duration_secs, "admin account ban");
     crate::bans::enforce(state, None).await;
-    let _ = send_msg(tx, &ServerMessage::AdminBans { bans: crate::bans::list(state) }).await;
+    let _ = send_msg(
+        tx,
+        &ServerMessage::AdminBans {
+            bans: crate::bans::list(state),
+        },
+    )
+    .await;
 }
 
 // ── Channel history hand-off (relay only, payload opaque) ──────────────
@@ -2495,14 +2827,22 @@ async fn handle_watch_screen_share(
         .unwrap_or(0);
 
     match state
-        .watch_screen_share(viewer_user_id, viewer_session_id, sharer_user_id, channel_id)
+        .watch_screen_share(
+            viewer_user_id,
+            viewer_session_id,
+            sharer_user_id,
+            channel_id,
+        )
         .await
     {
         Ok((sharer_sid, _old_count, new_count, prev_unwatch, codec)) => {
             // Confirm to viewer, with the codec its decoder needs
             let _ = send_msg(
                 tx,
-                &ServerMessage::WatchingScreenShare { sharer_user_id, codec },
+                &ServerMessage::WatchingScreenShare {
+                    sharer_user_id,
+                    codec,
+                },
             )
             .await;
 
@@ -2608,10 +2948,7 @@ async fn handle_stop_watching(
 
 /// Handle a keyframe request — relay to the sharer, at most ~1/s per share
 /// however many viewers ask (each relayed request forces an IDR).
-async fn handle_request_keyframe(
-    state: &Arc<ServerState>,
-    sharer_user_id: UserId,
-) -> Result<()> {
+async fn handle_request_keyframe(state: &Arc<ServerState>, sharer_user_id: UserId) -> Result<()> {
     let Some(sharer_sid) = state.user_to_session.get(&sharer_user_id).map(|s| *s) else {
         return Ok(());
     };
@@ -2645,9 +2982,13 @@ async fn handle_request_prekey_bundle(
     let target_sid = match state.user_to_session.get(&target_user_id) {
         Some(sid) => *sid,
         None => {
-            let _ = send_msg(tx, &ServerMessage::PreKeyBundleUnavailable {
-                user_id: target_user_id,
-            }).await;
+            let _ = send_msg(
+                tx,
+                &ServerMessage::PreKeyBundleUnavailable {
+                    user_id: target_user_id,
+                },
+            )
+            .await;
             return Ok(());
         }
     };
@@ -2656,18 +2997,27 @@ async fn handle_request_prekey_bundle(
         let mut session = match state.sessions.get_mut(&target_sid) {
             Some(s) => s,
             None => {
-                let _ = send_msg(tx, &ServerMessage::PreKeyBundleUnavailable {
-                    user_id: target_user_id,
-                }).await;
+                let _ = send_msg(
+                    tx,
+                    &ServerMessage::PreKeyBundleUnavailable {
+                        user_id: target_user_id,
+                    },
+                )
+                .await;
                 return Ok(());
             }
         };
 
         // Need the identity key and a bundle at minimum
-        let (Some(identity_key), Some(b)) = (session.identity_key.clone(), session.bundle.as_mut()) else {
-            let _ = send_msg(tx, &ServerMessage::PreKeyBundleUnavailable {
-                user_id: target_user_id,
-            }).await;
+        let (Some(identity_key), Some(b)) = (session.identity_key.clone(), session.bundle.as_mut())
+        else {
+            let _ = send_msg(
+                tx,
+                &ServerMessage::PreKeyBundleUnavailable {
+                    user_id: target_user_id,
+                },
+            )
+            .await;
             return Ok(());
         };
 
@@ -2692,13 +3042,23 @@ async fn handle_request_prekey_bundle(
         (bundle, running_low.then(|| session.tcp_tx.clone()))
     };
     if let Some(owner) = running_low {
-        let _ = send_msg(&owner, &ServerMessage::PreKeysLow { remaining: PREKEYS_LOW as u32 }).await;
+        let _ = send_msg(
+            &owner,
+            &ServerMessage::PreKeysLow {
+                remaining: PREKEYS_LOW as u32,
+            },
+        )
+        .await;
     }
 
-    let _ = send_msg(tx, &ServerMessage::PreKeyBundle {
-        user_id: target_user_id,
-        bundle,
-    }).await;
+    let _ = send_msg(
+        tx,
+        &ServerMessage::PreKeyBundle {
+            user_id: target_user_id,
+            bundle,
+        },
+    )
+    .await;
 
     Ok(())
 }
@@ -2710,7 +3070,12 @@ async fn handle_upload_prekeys(
     session_id: SessionId,
     prekeys: Vec<OneTimePreKey>,
 ) {
-    if let Some(b) = state.sessions.get_mut(&session_id).as_deref_mut().and_then(|s| s.bundle.as_mut()) {
+    if let Some(b) = state
+        .sessions
+        .get_mut(&session_id)
+        .as_deref_mut()
+        .and_then(|s| s.bundle.as_mut())
+    {
         let remaining_capacity = MAX_PREKEYS.saturating_sub(b.prekeys.len());
         if remaining_capacity > 0 {
             b.prekeys.extend(
@@ -2767,7 +3132,11 @@ async fn handle_encrypted_direct_message(
     // already make public by leaving — ids are never reused, and
     // RequestPreKeyBundle answers the same question.
     if !delivered {
-        let _ = send_msg(tx, &ServerMessage::DirectMessageUndelivered { target_user_id }).await;
+        let _ = send_msg(
+            tx,
+            &ServerMessage::DirectMessageUndelivered { target_user_id },
+        )
+        .await;
     }
 
     // Always echo back to sender regardless of delivery success, under the
@@ -2792,7 +3161,15 @@ async fn handle_encrypted_channel_message(
     }
 
     // The same rules hold the channel's stored log to (accounts.rs LogAppend).
-    if let Err(reason) = state.post_rules(session_id, user_id, channel_id, crate::state::PostStamp::Live).await {
+    if let Err(reason) = state
+        .post_rules(
+            session_id,
+            user_id,
+            channel_id,
+            crate::state::PostStamp::Live,
+        )
+        .await
+    {
         channel_error(tx, reason).await;
         return Ok(());
     }
@@ -2855,7 +3232,8 @@ async fn handle_distribute_sender_key(
                     distribution_message,
                     message_type,
                 },
-            ).await;
+            )
+            .await;
         }
     }
     Ok(())
@@ -2881,7 +3259,8 @@ async fn handle_distribute_media_key(
                     encrypted_media_key,
                     message_type,
                 },
-            ).await;
+            )
+            .await;
         }
     }
     Ok(())
@@ -2928,7 +3307,8 @@ async fn cleanup_session(state: &Arc<ServerState>, user_id: UserId, session_id: 
     let removed = state.remove_session(session_id).await;
     // The account's l4f session ends with the connection: rows for every
     // reconnect would otherwise wait for the sweep.
-    if let (Some(relay), Some(account)) = (state.accounts.clone(), removed.and_then(|s| s.account)) {
+    if let (Some(relay), Some(account)) = (state.accounts.clone(), removed.and_then(|s| s.account))
+    {
         if let Err(e) = relay.accounts.logout(&account.token).await {
             warn!(user_id, "ending the account session: {e}");
         }
@@ -3028,11 +3408,7 @@ async fn start_channel_delete_timer(state: &Arc<ServerState>, channel_id: Channe
 /// Serialized once rather than once per recipient: this is the widest fan-out
 /// the server has — every join, leave and channel change goes through it — and
 /// it runs while holding a shard of the session map.
-async fn broadcast_to_all(
-    state: &ServerState,
-    msg: &ServerMessage,
-    exclude_user: Option<UserId>,
-) {
+async fn broadcast_to_all(state: &ServerState, msg: &ServerMessage, exclude_user: Option<UserId>) {
     let Ok(data) = encode_server_msg(msg) else {
         return;
     };
@@ -3117,9 +3493,19 @@ mod tests {
         let bad = |name: &str| name.chars().any(bad_name_char);
         assert!(bad("admin\u{200B}"), "zero-width space");
         assert!(bad("Luki\u{202E}0240#"), "RTL override");
-        assert!(bad("\u{3164}"), "Hangul filler, a name that prints as nothing");
+        assert!(
+            bad("\u{3164}"),
+            "Hangul filler, a name that prints as nothing"
+        );
         assert!(bad("tab\there"), "control characters, as before");
-        for fine in ["Luki#0420", "Zoë", "Ærøskøbing", "名前", "Ελένη", "a b-c_d.e"] {
+        for fine in [
+            "Luki#0420",
+            "Zoë",
+            "Ærøskøbing",
+            "名前",
+            "Ελένη",
+            "a b-c_d.e",
+        ] {
             assert!(!bad(fine), "{fine} must pass");
         }
     }
@@ -3248,7 +3634,10 @@ mod tests {
         }
 
         async fn assert_closed(mut self) {
-            assert!(self.next().await.is_none(), "server should close the stream");
+            assert!(
+                self.next().await.is_none(),
+                "server should close the stream"
+            );
             tokio::time::timeout(Duration::from_secs(5), &mut self.handler)
                 .await
                 .expect("handler exits")
@@ -3269,7 +3658,9 @@ mod tests {
     async fn connect(state: &Arc<ServerState>, username: &str, ip: IpAddr) -> Client {
         let mut client = open(state, username, ip).await;
         client
-            .expect("Authenticated", |m| matches!(m, ServerMessage::Authenticated { .. }))
+            .expect("Authenticated", |m| {
+                matches!(m, ServerMessage::Authenticated { .. })
+            })
             .await;
         client
     }
@@ -3351,7 +3742,9 @@ mod tests {
             })
             .await;
         alice
-            .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))
+            .expect("ChannelCreated", |m| {
+                matches!(m, ServerMessage::ChannelCreated { .. })
+            })
             .await;
 
         // The timer is spawned with a zero timeout, so it only needs the
@@ -3368,7 +3761,11 @@ mod tests {
             .into_iter()
             .map(|c| c.name)
             .collect();
-        assert_eq!(names, vec!["General".to_string()], "the orphan stayed behind");
+        assert_eq!(
+            names,
+            vec!["General".to_string()],
+            "the orphan stayed behind"
+        );
     }
 
     /// The key material a client uploads is opaque to us and we hold it until
@@ -3391,19 +3788,28 @@ mod tests {
             sid_tx,
             state.clone(),
         ));
-        let mut client = Client { stream, handler, buf: BytesMut::new() };
+        let mut client = Client {
+            stream,
+            handler,
+            buf: BytesMut::new(),
+        };
         client
             .send(&ClientMessage::Authenticate {
                 username: "mallory".into(),
                 protocol_version: PROTOCOL_VERSION,
                 app_version: APP_VERSION.to_string(),
                 identity_key: None,
-                prekey_bundle: Some(PreKeyBundleData { identity_key: vec![0u8; 60_000], ..test_bundle(0) }),
+                prekey_bundle: Some(PreKeyBundleData {
+                    identity_key: vec![0u8; 60_000],
+                    ..test_bundle(0)
+                }),
                 account: None,
             })
             .await;
         client
-            .expect("AuthError", |m| matches!(m, ServerMessage::AuthError { .. }))
+            .expect("AuthError", |m| {
+                matches!(m, ServerMessage::AuthError { .. })
+            })
             .await;
         assert_eq!(state.user_count(), 0, "the session was registered anyway");
     }
@@ -3417,14 +3823,22 @@ mod tests {
         alice
             .send(&ClientMessage::UploadPreKeys {
                 prekeys: vec![
-                    OneTimePreKey { id: 1, public_key: vec![0u8; 33] },
-                    OneTimePreKey { id: 2, public_key: vec![0u8; 60_000] },
+                    OneTimePreKey {
+                        id: 1,
+                        public_key: vec![0u8; 33],
+                    },
+                    OneTimePreKey {
+                        id: 2,
+                        public_key: vec![0u8; 60_000],
+                    },
                 ],
             })
             .await;
         // Answered by nothing, so measure it against a round trip that is.
         alice.send(&ClientMessage::Ping { timestamp: 7 }).await;
-        alice.expect("Pong", |m| matches!(m, ServerMessage::Pong { .. })).await;
+        alice
+            .expect("Pong", |m| matches!(m, ServerMessage::Pong { .. }))
+            .await;
 
         let session = state.sessions.get(&1).unwrap();
         let prekeys = &session.bundle.as_ref().unwrap().prekeys;
@@ -3439,7 +3853,11 @@ mod tests {
         let state = admin_state();
         let _alice = connect(&state, "alice", IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
         assert_eq!(state.user_count(), 1);
-        drop(CleanupGuard { state: Some(state.clone()), user_id: 1, session_id: 1 });
+        drop(CleanupGuard {
+            state: Some(state.clone()),
+            user_id: 1,
+            session_id: 1,
+        });
         tokio::time::timeout(Duration::from_secs(5), async {
             while state.user_count() > 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -3458,7 +3876,12 @@ mod tests {
             signed_prekey_id: 1,
             signed_prekey: vec![0u8; 33],
             signed_prekey_signature: vec![0u8; 64],
-            prekeys: (1..=n).map(|id| OneTimePreKey { id, public_key: vec![id as u8; 33] }).collect(),
+            prekeys: (1..=n)
+                .map(|id| OneTimePreKey {
+                    id,
+                    public_key: vec![id as u8; 33],
+                })
+                .collect(),
             kyber_prekey_id: 1,
             kyber_prekey: vec![7u8; MAX_KEM_KEY_BYTES],
             kyber_prekey_signature: vec![9u8; 64],
@@ -3466,12 +3889,27 @@ mod tests {
     }
 
     /// Authenticates `username` with `bundle`; the client and its user id.
-    async fn connect_with_bundle(state: &Arc<ServerState>, username: &str, bundle: PreKeyBundleData) -> (Client, UserId) {
+    async fn connect_with_bundle(
+        state: &Arc<ServerState>,
+        username: &str,
+        bundle: PreKeyBundleData,
+    ) -> (Client, UserId) {
         let (stream, server) = tokio::io::duplex(65536);
         let (media_tx, _media_rx) = mpsc::channel(8);
         let (sid_tx, _sid_rx) = oneshot::channel();
-        let handler = tokio::spawn(handle_connection(server, username.into(), IpAddr::V4(Ipv4Addr::LOCALHOST), media_tx, sid_tx, state.clone()));
-        let mut client = Client { stream, handler, buf: BytesMut::new() };
+        let handler = tokio::spawn(handle_connection(
+            server,
+            username.into(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            media_tx,
+            sid_tx,
+            state.clone(),
+        ));
+        let mut client = Client {
+            stream,
+            handler,
+            buf: BytesMut::new(),
+        };
         client
             .send(&ClientMessage::Authenticate {
                 username: username.into(),
@@ -3482,7 +3920,14 @@ mod tests {
                 account: None,
             })
             .await;
-        let ServerMessage::Authenticated { user_id, .. } = client.expect("Authenticated", |m| matches!(m, ServerMessage::Authenticated { .. })).await else { unreachable!() };
+        let ServerMessage::Authenticated { user_id, .. } = client
+            .expect("Authenticated", |m| {
+                matches!(m, ServerMessage::Authenticated { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
         (client, user_id)
     }
 
@@ -3491,27 +3936,64 @@ mod tests {
     #[tokio::test]
     async fn a_bundle_carries_the_kyber_key_and_a_low_pool_asks_for_more() {
         let state = admin_state();
-        let (mut alice, alice_id) = connect_with_bundle(&state, "alice", test_bundle(PREKEYS_LOW as u32 + 1)).await;
+        let (mut alice, alice_id) =
+            connect_with_bundle(&state, "alice", test_bundle(PREKEYS_LOW as u32 + 1)).await;
         let (mut bob, _) = connect_with_bundle(&state, "bob", test_bundle(0)).await;
 
-        bob.send(&ClientMessage::RequestPreKeyBundle { target_user_id: alice_id }).await;
-        let ServerMessage::PreKeyBundle { bundle, .. } = bob.expect("PreKeyBundle", |m| matches!(m, ServerMessage::PreKeyBundle { .. })).await else { unreachable!() };
+        bob.send(&ClientMessage::RequestPreKeyBundle {
+            target_user_id: alice_id,
+        })
+        .await;
+        let ServerMessage::PreKeyBundle { bundle, .. } = bob
+            .expect("PreKeyBundle", |m| {
+                matches!(m, ServerMessage::PreKeyBundle { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
         assert_eq!(bundle.prekeys.len(), 1);
-        assert_eq!((bundle.kyber_prekey_id, bundle.kyber_prekey.len(), bundle.kyber_prekey_signature.len()), (1, MAX_KEM_KEY_BYTES, 64));
+        assert_eq!(
+            (
+                bundle.kyber_prekey_id,
+                bundle.kyber_prekey.len(),
+                bundle.kyber_prekey_signature.len()
+            ),
+            (1, MAX_KEM_KEY_BYTES, 64)
+        );
         alice.expect("PreKeysLow", |m| matches!(m, ServerMessage::PreKeysLow { remaining } if *remaining == PREKEYS_LOW as u32)).await;
 
         // Below the mark: no second ask
-        bob.send(&ClientMessage::RequestPreKeyBundle { target_user_id: alice_id }).await;
-        bob.expect("PreKeyBundle", |m| matches!(m, ServerMessage::PreKeyBundle { .. })).await;
+        bob.send(&ClientMessage::RequestPreKeyBundle {
+            target_user_id: alice_id,
+        })
+        .await;
+        bob.expect("PreKeyBundle", |m| {
+            matches!(m, ServerMessage::PreKeyBundle { .. })
+        })
+        .await;
         alice.send(&ClientMessage::Ping { timestamp: 1 }).await;
-        let next = alice.expect("Pong or PreKeysLow", |m| matches!(m, ServerMessage::Pong { .. } | ServerMessage::PreKeysLow { .. })).await;
-        assert!(matches!(next, ServerMessage::Pong { .. }), "asked again: {next:?}");
+        let next = alice
+            .expect("Pong or PreKeysLow", |m| {
+                matches!(
+                    m,
+                    ServerMessage::Pong { .. } | ServerMessage::PreKeysLow { .. }
+                )
+            })
+            .await;
+        assert!(
+            matches!(next, ServerMessage::Pong { .. }),
+            "asked again: {next:?}"
+        );
     }
 
     /// A Kyber key larger than Kyber1024 is refused at the door like any key.
     #[test]
     fn an_oversized_kyber_key_is_refused() {
-        let b = PreKeyBundleData { kyber_prekey: vec![0u8; MAX_KEM_KEY_BYTES + 1], ..test_bundle(0) };
+        let b = PreKeyBundleData {
+            kyber_prekey: vec![0u8; MAX_KEM_KEY_BYTES + 1],
+            ..test_bundle(0)
+        };
         assert!(!bundle_is_sane(&b));
         assert!(bundle_is_sane(&test_bundle(3)));
     }
@@ -3526,18 +4008,42 @@ mod tests {
         for round in 0..4 {
             let mut c = connect(&state, &format!("g{round}"), ip).await;
             for _ in 0..3 {
-                c.send(&ClientMessage::AdminLogin { token: "wrong-wrong-wrong".into() }).await;
-                c.expect("AdminError", |m| matches!(m, ServerMessage::AdminError { .. })).await;
+                c.send(&ClientMessage::AdminLogin {
+                    token: "wrong-wrong-wrong".into(),
+                })
+                .await;
+                c.expect("AdminError", |m| {
+                    matches!(m, ServerMessage::AdminError { .. })
+                })
+                .await;
             }
         }
         let mut c = connect(&state, "last", ip).await;
-        c.send(&ClientMessage::AdminLogin { token: "test-admin-token".into() }).await;
-        let ServerMessage::AdminError { reason } = c.expect("AdminError", |m| matches!(m, ServerMessage::AdminError { .. })).await else { unreachable!() };
+        c.send(&ClientMessage::AdminLogin {
+            token: "test-admin-token".into(),
+        })
+        .await;
+        let ServerMessage::AdminError { reason } = c
+            .expect("AdminError", |m| {
+                matches!(m, ServerMessage::AdminError { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
         assert!(reason.contains("too many wrong"), "{reason}");
         // Somebody else's address has its own budget
         let mut other = connect(&state, "other", IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10))).await;
-        other.send(&ClientMessage::AdminLogin { token: "test-admin-token".into() }).await;
-        other.expect("AdminStatus", |m| matches!(m, ServerMessage::AdminStatus { is_admin: true, .. })).await;
+        other
+            .send(&ClientMessage::AdminLogin {
+                token: "test-admin-token".into(),
+            })
+            .await;
+        other
+            .expect("AdminStatus", |m| {
+                matches!(m, ServerMessage::AdminStatus { is_admin: true, .. })
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -3549,23 +4055,40 @@ mod tests {
         let mut bob = connect(&state, "bob", far).await; // user 2
 
         // Not an admin: refused
-        bob.send(&ClientMessage::AdminKick { user_id: 1, reason: String::new() })
-            .await;
-        bob.expect("AdminError", |m| matches!(m, ServerMessage::AdminError { .. }))
-            .await;
+        bob.send(&ClientMessage::AdminKick {
+            user_id: 1,
+            reason: String::new(),
+        })
+        .await;
+        bob.expect("AdminError", |m| {
+            matches!(m, ServerMessage::AdminError { .. })
+        })
+        .await;
 
         // Wrong token, then the right one; everyone learns about the login
         alice
-            .send(&ClientMessage::AdminLogin { token: "nope".into() })
+            .send(&ClientMessage::AdminLogin {
+                token: "nope".into(),
+            })
             .await;
         alice
-            .expect("AdminError", |m| matches!(m, ServerMessage::AdminError { .. }))
+            .expect("AdminError", |m| {
+                matches!(m, ServerMessage::AdminError { .. })
+            })
             .await;
         alice
-            .send(&ClientMessage::AdminLogin { token: "test-admin-token".into() })
+            .send(&ClientMessage::AdminLogin {
+                token: "test-admin-token".into(),
+            })
             .await;
         let is_login = |m: &ServerMessage| {
-            matches!(m, ServerMessage::AdminStatus { user_id: 1, is_admin: true })
+            matches!(
+                m,
+                ServerMessage::AdminStatus {
+                    user_id: 1,
+                    is_admin: true
+                }
+            )
         };
         alice.expect("AdminStatus", is_login).await;
         bob.expect("AdminStatus broadcast", is_login).await;
@@ -3582,7 +4105,9 @@ mod tests {
             })
             .await;
         let gone = bob
-            .expect("Disconnected", |m| matches!(m, ServerMessage::Disconnected { .. }))
+            .expect("Disconnected", |m| {
+                matches!(m, ServerMessage::Disconnected { .. })
+            })
             .await;
         assert!(matches!(gone, ServerMessage::Disconnected { reason } if reason.contains("spam")));
         bob.assert_closed().await;
@@ -3590,19 +4115,34 @@ mod tests {
         assert!(!crate::bans::refused_at_accept(&state, lo));
         assert_eq!(state.sessions.len(), 1);
         let bans = alice
-            .expect("AdminBans", |m| matches!(m, ServerMessage::AdminBans { .. }))
+            .expect("AdminBans", |m| {
+                matches!(m, ServerMessage::AdminBans { .. })
+            })
             .await;
-        let ServerMessage::AdminBans { bans } = bans else { unreachable!() };
+        let ServerMessage::AdminBans { bans } = bans else {
+            unreachable!()
+        };
         assert_eq!(bans.len(), 1, "a guest has no account to ban");
-        assert!(!bans[0].account && bans[0].label == "bob" && bans[0].reason == "spam" && bans[0].by == "admin token", "{bans:?}");
-        assert!(format!("{bans:?}").find("10.0.0.5").is_none(), "the list names no address");
+        assert!(
+            !bans[0].account
+                && bans[0].label == "bob"
+                && bans[0].reason == "spam"
+                && bans[0].by == "admin token",
+            "{bans:?}"
+        );
+        assert!(
+            format!("{bans:?}").find("10.0.0.5").is_none(),
+            "the list names no address"
+        );
 
         // Unban
         alice
             .send(&ClientMessage::AdminUnban { id: bans[0].id })
             .await;
         let bans = alice
-            .expect("AdminBans", |m| matches!(m, ServerMessage::AdminBans { .. }))
+            .expect("AdminBans", |m| {
+                matches!(m, ServerMessage::AdminBans { .. })
+            })
             .await;
         assert!(matches!(&bans, ServerMessage::AdminBans { bans } if bans.is_empty()));
         assert!(!crate::bans::refused_at_accept(&state, far));
@@ -3613,13 +4153,19 @@ mod tests {
         let state = admin_state();
         let mut dave = connect(&state, "dave", IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
         for _ in 0..3 {
-            dave.send(&ClientMessage::AdminLogin { token: "wrong".into() })
-                .await;
-            dave.expect("AdminError", |m| matches!(m, ServerMessage::AdminError { .. }))
-                .await;
-        }
-        dave.expect("Disconnected", |m| matches!(m, ServerMessage::Disconnected { .. }))
+            dave.send(&ClientMessage::AdminLogin {
+                token: "wrong".into(),
+            })
             .await;
+            dave.expect("AdminError", |m| {
+                matches!(m, ServerMessage::AdminError { .. })
+            })
+            .await;
+        }
+        dave.expect("Disconnected", |m| {
+            matches!(m, ServerMessage::Disconnected { .. })
+        })
+        .await;
         dave.assert_closed().await;
         assert!(state.sessions.is_empty());
     }
@@ -3636,17 +4182,33 @@ mod tests {
 
         // Sharing needs a real channel; General never carries media.
         alice
-            .send(&ClientMessage::CreateChannel { name: "room".into(), password: None, proximity: ProximityMode::Off, anonymous: false, text: false })
+            .send(&ClientMessage::CreateChannel {
+                name: "room".into(),
+                password: None,
+                proximity: ProximityMode::Off,
+                anonymous: false,
+                text: false,
+            })
             .await;
         let created = alice
-            .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))
+            .expect("ChannelCreated", |m| {
+                matches!(m, ServerMessage::ChannelCreated { .. })
+            })
             .await;
-        let ServerMessage::ChannelCreated { channel } = created else { unreachable!() };
+        let ServerMessage::ChannelCreated { channel } = created else {
+            unreachable!()
+        };
         let channel_id = channel.channel_id;
-        bob.send(&ClientMessage::JoinChannel { channel_id, password: None })
-            .await;
-        bob.expect("UserList", |m| matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id))
-            .await;
+        bob.send(&ClientMessage::JoinChannel {
+            channel_id,
+            password: None,
+        })
+        .await;
+        bob.expect(
+            "UserList",
+            |m| matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id),
+        )
+        .await;
 
         // Alice shares in a codec that is not the default
         alice
@@ -3671,7 +4233,10 @@ mod tests {
         assert!(
             matches!(
                 watching,
-                ServerMessage::WatchingScreenShare { sharer_user_id: 1, codec: VideoCodec::Vp9 }
+                ServerMessage::WatchingScreenShare {
+                    sharer_user_id: 1,
+                    codec: VideoCodec::Vp9
+                }
             ),
             "the viewer was told the wrong codec: {watching:?}"
         );
@@ -3689,10 +4254,18 @@ mod tests {
 
         // A voice room for alice to stand in, and a text channel for both
         alice
-            .send(&ClientMessage::CreateChannel { name: "room".into(), password: None, proximity: ProximityMode::Off, anonymous: false, text: false })
+            .send(&ClientMessage::CreateChannel {
+                name: "room".into(),
+                password: None,
+                proximity: ProximityMode::Off,
+                anonymous: false,
+                text: false,
+            })
             .await;
         let ServerMessage::ChannelCreated { channel: voice } = alice
-            .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))
+            .expect("ChannelCreated", |m| {
+                matches!(m, ServerMessage::ChannelCreated { .. })
+            })
             .await
         else {
             unreachable!()
@@ -3703,25 +4276,36 @@ mod tests {
             })
             .await;
 
-        bob.send(&ClientMessage::CreateChannel { name: "lounge".into(), password: None, proximity: ProximityMode::Off, anonymous: false, text: true })
-            .await;
+        bob.send(&ClientMessage::CreateChannel {
+            name: "lounge".into(),
+            password: None,
+            proximity: ProximityMode::Off,
+            anonymous: false,
+            text: true,
+        })
+        .await;
         let ServerMessage::ChannelCreated { channel: text } = bob
-            .expect("ChannelCreated", |m| {
-                matches!(m, ServerMessage::ChannelCreated { channel } if channel.text)
-            })
+            .expect(
+                "ChannelCreated",
+                |m| matches!(m, ServerMessage::ChannelCreated { channel } if channel.text),
+            )
             .await
         else {
             unreachable!()
         };
-        bob.expect("UserList for the text channel", |m| {
-            matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == text.channel_id)
-        })
+        bob.expect(
+            "UserList for the text channel",
+            |m| matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == text.channel_id),
+        )
         .await;
         // Creating a text channel did not move bob out of the lobby
         assert_eq!(state.sessions.get(&2).unwrap().channel_id, 0);
 
         alice
-            .send(&ClientMessage::JoinChannel { channel_id: text.channel_id, password: None })
+            .send(&ClientMessage::JoinChannel {
+                channel_id: text.channel_id,
+                password: None,
+            })
             .await;
         alice
             .expect("UserList for the text channel", |m| {
@@ -3757,13 +4341,19 @@ mod tests {
         })
         .await;
         let refused = bob
-            .expect("ChannelError", |m| matches!(m, ServerMessage::ChannelError { .. }))
+            .expect("ChannelError", |m| {
+                matches!(m, ServerMessage::ChannelError { .. })
+            })
             .await;
-        assert!(matches!(refused, ServerMessage::ChannelError { reason } if reason.contains("not in")));
+        assert!(
+            matches!(refused, ServerMessage::ChannelError { reason } if reason.contains("not in"))
+        );
 
         // Leaving is its own message, and everybody hears about it
         alice
-            .send(&ClientMessage::LeaveChannel { channel_id: text.channel_id })
+            .send(&ClientMessage::LeaveChannel {
+                channel_id: text.channel_id,
+            })
             .await;
         alice
             .expect("UserLeft for ourselves", |m| {
@@ -3776,12 +4366,18 @@ mod tests {
 
         // Leaving a voice channel is still JoinChannel(0), never this
         alice
-            .send(&ClientMessage::LeaveChannel { channel_id: voice.channel_id })
+            .send(&ClientMessage::LeaveChannel {
+                channel_id: voice.channel_id,
+            })
             .await;
         let refused = alice
-            .expect("ChannelError", |m| matches!(m, ServerMessage::ChannelError { .. }))
+            .expect("ChannelError", |m| {
+                matches!(m, ServerMessage::ChannelError { .. })
+            })
             .await;
-        assert!(matches!(refused, ServerMessage::ChannelError { reason } if reason.contains("text channel")));
+        assert!(
+            matches!(refused, ServerMessage::ChannelError { reason } if reason.contains("text channel"))
+        );
         assert_eq!(state.sessions.get(&1).unwrap().channel_id, voice.channel_id);
     }
 
@@ -3796,42 +4392,64 @@ mod tests {
         let mut bob = connect(&state, "bob", lo).await; // user 2
 
         // bob's text channel, so bob is its creator and manages it
-        bob.send(&ClientMessage::CreateChannel { name: "news".into(), password: None, proximity: ProximityMode::Off, anonymous: false, text: true })
-            .await;
+        bob.send(&ClientMessage::CreateChannel {
+            name: "news".into(),
+            password: None,
+            proximity: ProximityMode::Off,
+            anonymous: false,
+            text: true,
+        })
+        .await;
         let ServerMessage::ChannelCreated { channel } = bob
-            .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))
+            .expect("ChannelCreated", |m| {
+                matches!(m, ServerMessage::ChannelCreated { .. })
+            })
             .await
         else {
             unreachable!()
         };
         let news = channel.channel_id;
-        alice.send(&ClientMessage::JoinChannel { channel_id: news, password: None }).await;
         alice
-            .expect("UserList for news", |m| {
-                matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == news)
+            .send(&ClientMessage::JoinChannel {
+                channel_id: news,
+                password: None,
             })
             .await;
+        alice
+            .expect(
+                "UserList for news",
+                |m| matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == news),
+            )
+            .await;
 
-        let set = |announce: Option<bool>, slow_mode_secs: Option<u32>| ClientMessage::SetChannelOptions {
-            channel_id: news,
-            options: ChannelOptions { announce, slow_mode_secs, ..Default::default() },
-        };
-        let post = |byte: u8| ClientMessage::SendEncryptedChannelMessage { channel_id: news, ciphertext: vec![byte] };
-        let is_post = |byte: u8| {
-            move |m: &ServerMessage| {
-                matches!(m, ServerMessage::EncryptedChannelChatMessage { ciphertext, .. } if ciphertext == &vec![byte])
+        let set = |announce: Option<bool>, slow_mode_secs: Option<u32>| {
+            ClientMessage::SetChannelOptions {
+                channel_id: news,
+                options: ChannelOptions {
+                    announce,
+                    slow_mode_secs,
+                    ..Default::default()
+                },
             }
         };
-        let is_refusal = |what: &'static str| {
-            move |m: &ServerMessage| matches!(m, ServerMessage::ChannelError { reason } if reason.contains(what))
+        let post = |byte: u8| ClientMessage::SendEncryptedChannelMessage {
+            channel_id: news,
+            ciphertext: vec![byte],
         };
+        let is_post = |byte: u8| move |m: &ServerMessage| matches!(m, ServerMessage::EncryptedChannelChatMessage { ciphertext, .. } if ciphertext == &vec![byte]);
+        let is_refusal = |what: &'static str| move |m: &ServerMessage| matches!(m, ServerMessage::ChannelError { reason } if reason.contains(what));
 
         // Announcements: alice is refused, the creator gets through
         bob.send(&set(Some(true), None)).await;
-        bob.expect("ChannelUpdated", |m| matches!(m, ServerMessage::ChannelUpdated { channel } if channel.announce))
-            .await;
+        bob.expect(
+            "ChannelUpdated",
+            |m| matches!(m, ServerMessage::ChannelUpdated { channel } if channel.announce),
+        )
+        .await;
         alice.send(&post(1)).await;
-        alice.expect("announce refusal", is_refusal("only moderators")).await;
+        alice
+            .expect("announce refusal", is_refusal("only moderators"))
+            .await;
         bob.send(&post(2)).await;
         alice.expect("bob's announcement", is_post(2)).await;
 
@@ -3843,12 +4461,19 @@ mod tests {
         .await;
         alice.send(&post(3)).await;
         alice.send(&post(4)).await;
-        alice.expect("slow mode refusal", is_refusal("slow mode")).await;
+        alice
+            .expect("slow mode refusal", is_refusal("slow mode"))
+            .await;
         // The first post bob gets from alice is 3, so 1 never left the relay
         let got = bob
-            .expect("a post", |m| matches!(m, ServerMessage::EncryptedChannelChatMessage { .. }))
+            .expect("a post", |m| {
+                matches!(m, ServerMessage::EncryptedChannelChatMessage { .. })
+            })
             .await;
-        assert!(is_post(3)(&got), "a refused announcement was relayed: {got:?}");
+        assert!(
+            is_post(3)(&got),
+            "a refused announcement was relayed: {got:?}"
+        );
 
         // The creator is not held back, nor is a moderator
         bob.send(&post(5)).await;
@@ -3859,9 +4484,14 @@ mod tests {
         alice.send(&post(7)).await;
         // ...and the next one is 7, so 4 did not either
         let got = bob
-            .expect("a post", |m| matches!(m, ServerMessage::EncryptedChannelChatMessage { .. }))
+            .expect("a post", |m| {
+                matches!(m, ServerMessage::EncryptedChannelChatMessage { .. })
+            })
             .await;
-        assert!(is_post(7)(&got), "a post refused by slow mode was relayed: {got:?}");
+        assert!(
+            is_post(7)(&got),
+            "a post refused by slow mode was relayed: {got:?}"
+        );
     }
 
     /// Who answers a request for recent chat is the one thing about chat the
@@ -3879,11 +4509,23 @@ mod tests {
             .await;
         alice
             .expect("our own UserHistorySharing", |m| {
-                matches!(m, ServerMessage::UserHistorySharing { user_id: 1, enabled: true })
+                matches!(
+                    m,
+                    ServerMessage::UserHistorySharing {
+                        user_id: 1,
+                        enabled: true
+                    }
+                )
             })
             .await;
         bob.expect("UserHistorySharing", |m| {
-            matches!(m, ServerMessage::UserHistorySharing { user_id: 1, enabled: true })
+            matches!(
+                m,
+                ServerMessage::UserHistorySharing {
+                    user_id: 1,
+                    enabled: true
+                }
+            )
         })
         .await;
         assert!(state.sessions.get(&1).unwrap().shares_history);
@@ -3897,7 +4539,13 @@ mod tests {
             .send(&ClientMessage::SetHistorySharing { enabled: false })
             .await;
         bob.expect("UserHistorySharing, off again", |m| {
-            matches!(m, ServerMessage::UserHistorySharing { user_id: 1, enabled: false })
+            matches!(
+                m,
+                ServerMessage::UserHistorySharing {
+                    user_id: 1,
+                    enabled: false
+                }
+            )
         })
         .await;
         assert!(!state.sessions.get(&1).unwrap().shares_history);
@@ -3920,26 +4568,32 @@ mod tests {
             })
             .await;
         let ServerMessage::ChannelCreated { channel } = owner
-            .expect("ChannelCreated", |m| {
-                matches!(m, ServerMessage::ChannelCreated { channel } if channel.text)
-            })
+            .expect(
+                "ChannelCreated",
+                |m| matches!(m, ServerMessage::ChannelCreated { channel } if channel.text),
+            )
             .await
         else {
             unreachable!()
         };
         let channel_id = channel.channel_id;
         owner
-            .expect("UserList", |m| {
-                matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id)
+            .expect(
+                "UserList",
+                |m| matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id),
+            )
+            .await;
+        other
+            .send(&ClientMessage::JoinChannel {
+                channel_id,
+                password: None,
             })
             .await;
         other
-            .send(&ClientMessage::JoinChannel { channel_id, password: None })
-            .await;
-        other
-            .expect("UserList", |m| {
-                matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id)
-            })
+            .expect(
+                "UserList",
+                |m| matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id),
+            )
             .await;
         channel_id
     }
@@ -3963,9 +4617,13 @@ mod tests {
             })
             .await;
         let refused = alice
-            .expect("ChannelError", |m| matches!(m, ServerMessage::ChannelError { .. }))
+            .expect("ChannelError", |m| {
+                matches!(m, ServerMessage::ChannelError { .. })
+            })
             .await;
-        assert!(matches!(refused, ServerMessage::ChannelError { reason } if reason.contains("too large")));
+        assert!(
+            matches!(refused, ServerMessage::ChannelError { reason } if reason.contains("too large"))
+        );
 
         // Bob is the one this protects: his connection is still there and
         // still carrying the channel's chat.
@@ -4001,7 +4659,9 @@ mod tests {
         assert!(refusal(&state, "ALICE#0001").await.contains("taken"));
         assert!(refusal(&state, &"x".repeat(33)).await.contains("1-32"));
         // Five digits are no tag, so all of it is the name
-        assert!(refusal(&state, &format!("{}#12345", "x".repeat(32))).await.contains("1-32"));
+        assert!(refusal(&state, &format!("{}#12345", "x".repeat(32)))
+            .await
+            .contains("1-32"));
         assert!(refusal(&state, "#0001").await.contains("1-32"));
     }
 
@@ -4030,7 +4690,10 @@ mod tests {
         // Delivered: the echo comes back, with no "undelivered" ahead of it
         alice.send(&dm).await;
         let got = alice.expect("the echo", answer).await;
-        assert!(matches!(got, ServerMessage::EncryptedDirectChatMessage { to_user_id: 2, .. }));
+        assert!(matches!(
+            got,
+            ServerMessage::EncryptedDirectChatMessage { to_user_id: 2, .. }
+        ));
 
         drop(bob);
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -4043,7 +4706,10 @@ mod tests {
 
         alice.send(&dm).await;
         let got = alice.expect("the answer", answer).await;
-        assert!(matches!(got, ServerMessage::DirectMessageUndelivered { target_user_id: 2 }));
+        assert!(matches!(
+            got,
+            ServerMessage::DirectMessageUndelivered { target_user_id: 2 }
+        ));
     }
 
     /// An `AcceptInvite` for a channel that never invited you joined nothing,
@@ -4064,32 +4730,53 @@ mod tests {
             })
             .await;
         let created = alice
-            .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))
+            .expect("ChannelCreated", |m| {
+                matches!(m, ServerMessage::ChannelCreated { .. })
+            })
             .await;
-        let ServerMessage::ChannelCreated { channel } = created else { unreachable!() };
+        let ServerMessage::ChannelCreated { channel } = created else {
+            unreachable!()
+        };
         let room = channel.channel_id;
         let pong = |m: &ServerMessage| {
-            matches!(m, ServerMessage::Pong { .. } | ServerMessage::InviteAccepted { .. })
+            matches!(
+                m,
+                ServerMessage::Pong { .. } | ServerMessage::InviteAccepted { .. }
+            )
         };
 
         // Uninvited: bob's handler is done with it once his Pong is back, and
         // anything it sent alice is then queued ahead of hers
-        bob.send(&ClientMessage::AcceptInvite { channel_id: room }).await;
+        bob.send(&ClientMessage::AcceptInvite { channel_id: room })
+            .await;
         bob.send(&ClientMessage::Ping { timestamp: 1 }).await;
-        bob.expect("Pong", |m| matches!(m, ServerMessage::Pong { .. })).await;
+        bob.expect("Pong", |m| matches!(m, ServerMessage::Pong { .. }))
+            .await;
         alice.send(&ClientMessage::Ping { timestamp: 2 }).await;
         let got = alice.expect("Pong", pong).await;
-        assert!(matches!(got, ServerMessage::Pong { .. }), "fake acceptance: {got:?}");
+        assert!(
+            matches!(got, ServerMessage::Pong { .. }),
+            "fake acceptance: {got:?}"
+        );
 
         // Invited: the acceptance does go through
         alice
-            .send(&ClientMessage::SendInvite { channel_id: room, target_user_id: 2 })
+            .send(&ClientMessage::SendInvite {
+                channel_id: room,
+                target_user_id: 2,
+            })
             .await;
-        bob.expect("InviteReceived", |m| matches!(m, ServerMessage::InviteReceived { .. }))
+        bob.expect("InviteReceived", |m| {
+            matches!(m, ServerMessage::InviteReceived { .. })
+        })
+        .await;
+        bob.send(&ClientMessage::AcceptInvite { channel_id: room })
             .await;
-        bob.send(&ClientMessage::AcceptInvite { channel_id: room }).await;
         let got = alice.expect("InviteAccepted", pong).await;
-        assert!(matches!(got, ServerMessage::InviteAccepted { user_id: 2, .. }));
+        assert!(matches!(
+            got,
+            ServerMessage::InviteAccepted { user_id: 2, .. }
+        ));
     }
 
     /// `hide_members` and a password both mean "nobody outside learns who is
@@ -4115,7 +4802,9 @@ mod tests {
             })
             .await;
         let ServerMessage::ChannelCreated { channel } = alice
-            .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))
+            .expect("ChannelCreated", |m| {
+                matches!(m, ServerMessage::ChannelCreated { .. })
+            })
             .await
         else {
             unreachable!()
@@ -4127,13 +4816,18 @@ mod tests {
                 matches!(m, ServerMessage::UserJoined { user } if user.channel_id == channel.channel_id)
             })
             .await;
-        let ServerMessage::UserJoined { user } = joined else { unreachable!() };
+        let ServerMessage::UserJoined { user } = joined else {
+            unreachable!()
+        };
         assert_eq!(user.user_id, 0, "an outsider was told who joined");
         assert_eq!(user.username, "");
 
         // And the same on the way out.
         alice
-            .send(&ClientMessage::JoinChannel { channel_id: 0, password: None })
+            .send(&ClientMessage::JoinChannel {
+                channel_id: 0,
+                password: None,
+            })
             .await;
         let left = bob
             .expect("UserLeft", |m| {
@@ -4163,7 +4857,9 @@ mod tests {
                 matches!(m, ServerMessage::UserJoined { user } if user.channel_id == channel.channel_id)
             })
             .await;
-        let ServerMessage::UserJoined { user } = joined else { unreachable!() };
+        let ServerMessage::UserJoined { user } = joined else {
+            unreachable!()
+        };
         assert_eq!((user.user_id, user.username.as_str()), (1, "alice"));
     }
 
@@ -4189,7 +4885,9 @@ mod tests {
             })
             .await;
         let ServerMessage::ChannelCreated { channel } = alice
-            .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))
+            .expect("ChannelCreated", |m| {
+                matches!(m, ServerMessage::ChannelCreated { .. })
+            })
             .await
         else {
             unreachable!()
@@ -4199,7 +4897,9 @@ mod tests {
                 matches!(m, ServerMessage::UserJoined { user } if user.channel_id == channel.channel_id)
             })
             .await;
-        let ServerMessage::UserJoined { user } = joined else { unreachable!() };
+        let ServerMessage::UserJoined { user } = joined else {
+            unreachable!()
+        };
         assert_eq!(user.user_id, 1, "the count has to be attributable");
         assert_eq!(user.username, "", "an outsider was told the name");
     }
@@ -4223,7 +4923,9 @@ mod tests {
             })
             .await;
         let ServerMessage::ChannelCreated { channel } = alice
-            .expect("ChannelCreated", |m| matches!(m, ServerMessage::ChannelCreated { .. }))
+            .expect("ChannelCreated", |m| {
+                matches!(m, ServerMessage::ChannelCreated { .. })
+            })
             .await
         else {
             unreachable!()
@@ -4231,27 +4933,35 @@ mod tests {
         alice
             .send(&ClientMessage::SetChannelOptions {
                 channel_id: channel.channel_id,
-                options: ChannelOptions { routed: Some(true), ..Default::default() },
+                options: ChannelOptions {
+                    routed: Some(true),
+                    ..Default::default()
+                },
             })
             .await;
         alice
-            .expect("ChannelUpdated", |m| {
-                matches!(m, ServerMessage::ChannelUpdated { channel: c } if c.routed)
-            })
+            .expect(
+                "ChannelUpdated",
+                |m| matches!(m, ServerMessage::ChannelUpdated { channel: c } if c.routed),
+            )
             .await;
 
         // One update per player the game moved past, at the documented rate.
         // The last one is the one that has to be in force.
         for speaker in 1..=20u32 {
             alice
-                .send(&ClientMessage::SetAudioFilter { allow: Some(vec![speaker]) })
+                .send(&ClientMessage::SetAudioFilter {
+                    allow: Some(vec![speaker]),
+                })
                 .await;
         }
         // Driven by a message that must come back, so the filters ahead of it
         // have all been handled rather than merely sent.
         alice.send(&ClientMessage::Ping { timestamp: 1 }).await;
         alice
-            .expect("Pong", |m| matches!(m, ServerMessage::Pong { timestamp: 1 }))
+            .expect("Pong", |m| {
+                matches!(m, ServerMessage::Pong { timestamp: 1 })
+            })
             .await;
 
         let now = tokio::time::Instant::now();
@@ -4292,12 +5002,16 @@ mod tests {
         let mut carol = connect(&state, "carol", lo).await; // user 3
         let channel_id = text_channel_with_two(&mut alice, &mut bob, "lounge").await;
         carol
-            .send(&ClientMessage::JoinChannel { channel_id, password: None })
+            .send(&ClientMessage::JoinChannel {
+                channel_id,
+                password: None,
+            })
             .await;
         carol
-            .expect("UserList", |m| {
-                matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id)
-            })
+            .expect(
+                "UserList",
+                |m| matches!(m, ServerMessage::UserList { channel_id: c, .. } if *c == channel_id),
+            )
             .await;
 
         // Past one target's budget, aimed at Bob — and deliberately still
@@ -4377,7 +5091,10 @@ mod tests {
 
         // Bob shares nothing, so the question must not reach him at all.
         alice
-            .send(&ClientMessage::RequestChannelHistory { channel_id, target_user_id: 2 })
+            .send(&ClientMessage::RequestChannelHistory {
+                channel_id,
+                target_user_id: 2,
+            })
             .await;
         // Driven by a message that must arrive rather than by a timeout: if
         // the request was forwarded it is already in Bob's queue ahead of it.
@@ -4403,11 +5120,20 @@ mod tests {
         bob.send(&ClientMessage::SetHistorySharing { enabled: true })
             .await;
         bob.expect("our own UserHistorySharing", |m| {
-            matches!(m, ServerMessage::UserHistorySharing { user_id: 2, enabled: true })
+            matches!(
+                m,
+                ServerMessage::UserHistorySharing {
+                    user_id: 2,
+                    enabled: true
+                }
+            )
         })
         .await;
         alice
-            .send(&ClientMessage::RequestChannelHistory { channel_id, target_user_id: 2 })
+            .send(&ClientMessage::RequestChannelHistory {
+                channel_id,
+                target_user_id: 2,
+            })
             .await;
         let asked = bob
             .expect("ChannelHistoryRequested", |m| {
@@ -4425,13 +5151,35 @@ mod tests {
     async fn bans_expire() {
         let state = admin_state();
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 9));
-        crate::bans::add(&state, crate::bans::Target::Addr(ip), "x", "r", "admin token", Some(Duration::from_secs(1))).await.unwrap();
+        crate::bans::add(
+            &state,
+            crate::bans::Target::Addr(ip),
+            "x",
+            "r",
+            "admin token",
+            Some(Duration::from_secs(1)),
+        )
+        .await
+        .unwrap();
         assert!(crate::bans::refused_at_accept(&state, ip));
         tokio::time::sleep(Duration::from_millis(2100)).await;
         assert!(!crate::bans::refused_at_accept(&state, ip));
         assert!(crate::bans::list(&state).is_empty());
-        crate::bans::add(&state, crate::bans::Target::Addr(ip), "x", "r", "admin token", None).await.unwrap();
-        assert_eq!(crate::bans::list(&state)[0].expires_in_secs, None, "permanent");
+        crate::bans::add(
+            &state,
+            crate::bans::Target::Addr(ip),
+            "x",
+            "r",
+            "admin token",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            crate::bans::list(&state)[0].expires_in_secs,
+            None,
+            "permanent"
+        );
     }
 
     /// A relay without accounts keeps its bans in bans.json, with the plain
@@ -4439,25 +5187,59 @@ mod tests {
     /// the /64.
     #[tokio::test]
     async fn bans_outlive_a_restart_without_accounts() {
-        let path = std::env::temp_dir().join(format!("voipc-bans-{}.json", hex::encode(rand::random::<[u8; 8]>())));
-        let mut first = ServerState::new(&ServerConfig::default(), ServerSettings::default(), Vec::new(), "test-admin-token".into());
+        let path = std::env::temp_dir().join(format!(
+            "voipc-bans-{}.json",
+            hex::encode(rand::random::<[u8; 8]>())
+        ));
+        let mut first = ServerState::new(
+            &ServerConfig::default(),
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        );
         first.bans_file = Some(path.clone());
         let v6: IpAddr = "2001:db8:1:2::77".parse().unwrap();
-        crate::bans::add(&first, crate::bans::Target::Addr(v6), "eve#0001", "spam", "admin token", None).await.unwrap();
+        crate::bans::add(
+            &first,
+            crate::bans::Target::Addr(v6),
+            "eve#0001",
+            "spam",
+            "admin token",
+            None,
+        )
+        .await
+        .unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
-        let mut second = ServerState::new(&ServerConfig::default(), ServerSettings::default(), Vec::new(), "test-admin-token".into());
+        let mut second = ServerState::new(
+            &ServerConfig::default(),
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        );
         second.bans_file = Some(path.clone());
         crate::bans::load(&second).await.unwrap();
-        assert!(crate::bans::refused_at_accept(&second, "2001:db8:1:2:ffff::1".parse().unwrap()), "the same /64");
-        assert!(!crate::bans::refused_at_accept(&second, "2001:db8:1:3::77".parse().unwrap()), "another /64");
+        assert!(
+            crate::bans::refused_at_accept(&second, "2001:db8:1:2:ffff::1".parse().unwrap()),
+            "the same /64"
+        );
+        assert!(
+            !crate::bans::refused_at_accept(&second, "2001:db8:1:3::77".parse().unwrap()),
+            "another /64"
+        );
         let id = crate::bans::list(&second)[0].id;
         assert!(crate::bans::remove(&second, id).await.unwrap());
         crate::bans::load(&first).await.unwrap();
-        assert!(!crate::bans::refused_at_accept(&first, v6), "lifted in the file, so for the other reader too");
+        assert!(
+            !crate::bans::refused_at_accept(&first, v6),
+            "lifted in the file, so for the other reader too"
+        );
         let _ = std::fs::remove_file(&path);
     }
 
@@ -4484,14 +5266,29 @@ mod tests {
     }
 
     /// A relay with accounts on a fresh SQLite database.
-    async fn relay_state(mode: AccountsMode, registration: RegistrationMode) -> (Arc<ServerState>, TempDb) {
+    async fn relay_state(
+        mode: AccountsMode,
+        registration: RegistrationMode,
+    ) -> (Arc<ServerState>, TempDb) {
         let mut config = ServerConfig::default();
         config.accounts.mode = mode;
         config.accounts.registration = registration;
-        let db = TempDb(std::env::temp_dir().join(format!("voipc-relay-{}.db", hex::encode(rand::random::<[u8; 8]>()))));
-        let store = l4f_accounts::store::Store::connect(&format!("sqlite://{}", db.0.display())).await.unwrap();
-        let relay = crate::accounts::Relay::open_with(&config.accounts, store, &[9u8; 32]).await.unwrap();
-        let mut state = ServerState::new(&config, ServerSettings::default(), Vec::new(), "test-admin-token".into());
+        let db = TempDb(std::env::temp_dir().join(format!(
+            "voipc-relay-{}.db",
+            hex::encode(rand::random::<[u8; 8]>())
+        )));
+        let store = l4f_accounts::store::Store::connect(&format!("sqlite://{}", db.0.display()))
+            .await
+            .unwrap();
+        let relay = crate::accounts::Relay::open_with(&config.accounts, store, &[9u8; 32])
+            .await
+            .unwrap();
+        let mut state = ServerState::new(
+            &config,
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        );
         state.accounts = Some(Arc::new(relay));
         (Arc::new(state), db)
     }
@@ -4512,7 +5309,11 @@ mod tests {
     }
 
     fn keys(identity: &[u8], reset_identity: bool) -> ClientMessage {
-        ClientMessage::AuthContinue(AuthContinue::Keys { identity_key: identity.to_vec(), prekey_bundle: bundle(), reset_identity })
+        ClientMessage::AuthContinue(AuthContinue::Keys {
+            identity_key: identity.to_vec(),
+            prekey_bundle: bundle(),
+            reset_identity,
+        })
     }
 
     async fn open_account(state: &Arc<ServerState>, name: &str, start: AccountStart) -> Client {
@@ -4520,8 +5321,19 @@ mod tests {
         let (media_tx, _media_rx) = mpsc::channel(8);
         let (sid_tx, _sid_rx) = oneshot::channel();
         let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let handler = tokio::spawn(handle_connection(server, name.into(), lo, media_tx, sid_tx, state.clone()));
-        let mut client = Client { stream, handler, buf: BytesMut::new() };
+        let handler = tokio::spawn(handle_connection(
+            server,
+            name.into(),
+            lo,
+            media_tx,
+            sid_tx,
+            state.clone(),
+        ));
+        let mut client = Client {
+            stream,
+            handler,
+            buf: BytesMut::new(),
+        };
         client
             .send(&ClientMessage::Authenticate {
                 username: name.into(),
@@ -4539,7 +5351,10 @@ mod tests {
     fn solve(altcha: &str) -> String {
         use sha2::Digest;
         let c: serde_json::Value = serde_json::from_str(altcha).unwrap();
-        let (salt, challenge) = (c["salt"].as_str().unwrap(), c["challenge"].as_str().unwrap());
+        let (salt, challenge) = (
+            c["salt"].as_str().unwrap(),
+            c["challenge"].as_str().unwrap(),
+        );
         for n in 0..=c["maxnumber"].as_u64().unwrap() {
             if hex::encode(sha2::Sha256::digest(format!("{salt}{n}").as_bytes())) == challenge {
                 return serde_json::json!({
@@ -4562,15 +5377,33 @@ mod tests {
     /// Signs up `name` on an open relay; returns the signed-in connection.
     async fn register(state: &Arc<ServerState>, name: &str) -> (Client, AccountInfo) {
         let mut c = open_account(state, name, AccountStart::Register { invite: None }).await;
-        let Some(ServerMessage::AuthStep(AuthStep::Salt { pow: Some(pow), .. })) = c.next().await else {
+        let Some(ServerMessage::AuthStep(AuthStep::Salt { pow: Some(pow), .. })) = c.next().await
+        else {
             panic!("an open relay hands out a proof of work");
         };
-        let vault = vec![VaultBlob { k: "slot.hkdf".into(), v: vec![1, 2, 3], version: 0 }];
+        let vault = vec![VaultBlob {
+            k: "slot.hkdf".into(),
+            v: vec![1, 2, 3],
+            version: 0,
+        }];
         let altcha = solve(&pow.altcha);
-        c.send(&ClientMessage::AuthContinue(AuthContinue::Register { auth_secret: SECRET.to_vec(), altcha, ts: pow.ts, vault })).await;
+        c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
+            auth_secret: SECRET.to_vec(),
+            altcha,
+            ts: pow.ts,
+            vault,
+        }))
+        .await;
         c.send(&keys(&IDENTITY, false)).await;
-        let ServerMessage::Authenticated { account: Some(info), accounts: Some(relay), .. } =
-            c.expect("Authenticated", |m| matches!(m, ServerMessage::Authenticated { .. })).await
+        let ServerMessage::Authenticated {
+            account: Some(info),
+            accounts: Some(relay),
+            ..
+        } = c
+            .expect("Authenticated", |m| {
+                matches!(m, ServerMessage::Authenticated { .. })
+            })
+            .await
         else {
             panic!("an account sign-in says which account and which relay");
         };
@@ -4581,8 +5414,14 @@ mod tests {
     /// Signs `name` in with the password secret; answers a code with `code`.
     async fn login(state: &Arc<ServerState>, name: &str, identity: &[u8], reset: bool) -> Client {
         let mut c = open_account(state, name, AccountStart::Login).await;
-        assert!(matches!(c.next().await, Some(ServerMessage::AuthStep(AuthStep::Salt { pow: None, .. }))));
-        c.send(&ClientMessage::AuthContinue(AuthContinue::Secret { auth_secret: SECRET.to_vec() })).await;
+        assert!(matches!(
+            c.next().await,
+            Some(ServerMessage::AuthStep(AuthStep::Salt { pow: None, .. }))
+        ));
+        c.send(&ClientMessage::AuthContinue(AuthContinue::Secret {
+            auth_secret: SECRET.to_vec(),
+        }))
+        .await;
         c.send(&keys(identity, reset)).await;
         c
     }
@@ -4601,25 +5440,68 @@ mod tests {
 
         // Signing in again: the vault comes back, the identity must match.
         let mut c = login(&state, "Alice", &IDENTITY, false).await;
-        let ServerMessage::AuthStep(AuthStep::Vault { blobs }) = c.expect("Vault", |m| matches!(m, ServerMessage::AuthStep(_))).await else {
+        let ServerMessage::AuthStep(AuthStep::Vault { blobs }) = c
+            .expect("Vault", |m| matches!(m, ServerMessage::AuthStep(_)))
+            .await
+        else {
             unreachable!()
         };
-        assert_eq!((blobs[0].k.as_str(), blobs[0].v.as_slice()), ("slot.hkdf", &[1, 2, 3][..]));
-        c.expect("Authenticated", |m| matches!(m, ServerMessage::Authenticated { account: Some(_), .. })).await;
+        assert_eq!(
+            (blobs[0].k.as_str(), blobs[0].v.as_slice()),
+            ("slot.hkdf", &[1, 2, 3][..])
+        );
+        c.expect("Authenticated", |m| {
+            matches!(
+                m,
+                ServerMessage::Authenticated {
+                    account: Some(_),
+                    ..
+                }
+            )
+        })
+        .await;
 
         let mut other = login(&state, "alice", &[6; 33], false).await;
-        let ServerMessage::AuthError { reason } = other.expect("refusal", |m| matches!(m, ServerMessage::AuthError { .. })).await else {
+        let ServerMessage::AuthError { reason } = other
+            .expect("refusal", |m| matches!(m, ServerMessage::AuthError { .. }))
+            .await
+        else {
             unreachable!()
         };
         assert!(reason.contains("identity"), "{reason}");
         let mut reset = login(&state, "alice", &[6; 33], true).await;
-        reset.expect("Authenticated", |m| matches!(m, ServerMessage::Authenticated { account: Some(_), .. })).await;
-        assert_eq!(state.accounts.as_ref().unwrap().identity(l4f_accounts::model::AccountId(info.id)).await.unwrap(), Some(vec![6; 33]));
+        reset
+            .expect("Authenticated", |m| {
+                matches!(
+                    m,
+                    ServerMessage::Authenticated {
+                        account: Some(_),
+                        ..
+                    }
+                )
+            })
+            .await;
+        assert_eq!(
+            state
+                .accounts
+                .as_ref()
+                .unwrap()
+                .identity(l4f_accounts::model::AccountId(info.id))
+                .await
+                .unwrap(),
+            Some(vec![6; 33])
+        );
 
         let mut wrong = open_account(&state, "alice", AccountStart::Login).await;
         wrong.next().await;
-        wrong.send(&ClientMessage::AuthContinue(AuthContinue::Secret { auth_secret: vec![8; 32] })).await;
-        assert!(matches!(wrong.next().await, Some(ServerMessage::AuthError { reason }) if reason.contains("Wrong")));
+        wrong
+            .send(&ClientMessage::AuthContinue(AuthContinue::Secret {
+                auth_secret: vec![8; 32],
+            }))
+            .await;
+        assert!(
+            matches!(wrong.next().await, Some(ServerMessage::AuthError { reason }) if reason.contains("Wrong"))
+        );
     }
 
     #[tokio::test]
@@ -4627,8 +5509,17 @@ mod tests {
         let (state, _db_state) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let (mut first, _) = register(&state, "bob").await;
         let mut second = login(&state, "bob", &IDENTITY, false).await;
-        second.expect("Authenticated", |m| matches!(m, ServerMessage::Authenticated { .. })).await;
-        let ServerMessage::Disconnected { reason } = first.expect("Disconnected", |m| matches!(m, ServerMessage::Disconnected { .. })).await else {
+        second
+            .expect("Authenticated", |m| {
+                matches!(m, ServerMessage::Authenticated { .. })
+            })
+            .await;
+        let ServerMessage::Disconnected { reason } = first
+            .expect("Disconnected", |m| {
+                matches!(m, ServerMessage::Disconnected { .. })
+            })
+            .await
+        else {
             unreachable!()
         };
         assert!(reason.contains("another device"), "{reason}");
@@ -4639,7 +5530,10 @@ mod tests {
         assert_eq!(state.sessions.len(), 1);
         let sid = *state.username_to_session.get("bob").unwrap();
         assert!(state.sessions.contains_key(&sid));
-        assert_eq!(state.account_sessions.iter().next().map(|e| *e.value()), Some(sid));
+        assert_eq!(
+            state.account_sessions.iter().next().map(|e| *e.value()),
+            Some(sid)
+        );
     }
 
     #[tokio::test]
@@ -4647,19 +5541,36 @@ mod tests {
         let (state, _db_state) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let (_carol, _) = register(&state, "carol").await;
         assert!(refusal(&state, "dave").await.contains("#tag"));
-        assert!(refusal(&state, "Carol#1234").await.contains("belongs to an account"));
+        assert!(refusal(&state, "Carol#1234")
+            .await
+            .contains("belongs to an account"));
         let mut guest = connect(&state, "dave#1234", IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
-        guest.send(&ClientMessage::AdminLogin { token: "test-admin-token".into() }).await;
-        let ServerMessage::AdminError { reason } = guest.expect("AdminError", |m| matches!(m, ServerMessage::AdminError { .. })).await else {
+        guest
+            .send(&ClientMessage::AdminLogin {
+                token: "test-admin-token".into(),
+            })
+            .await;
+        let ServerMessage::AdminError { reason } = guest
+            .expect("AdminError", |m| {
+                matches!(m, ServerMessage::AdminError { .. })
+            })
+            .await
+        else {
             unreachable!()
         };
-        assert!(reason.contains("account"), "a guest cannot claim admin with the token: {reason}");
+        assert!(
+            reason.contains("account"),
+            "a guest cannot claim admin with the token: {reason}"
+        );
 
-        let (required, _db_required) = relay_state(AccountsMode::Required, RegistrationMode::Invite).await;
+        let (required, _db_required) =
+            relay_state(AccountsMode::Required, RegistrationMode::Invite).await;
         let mut g = open(&required, "erin#1234", IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
         assert!(matches!(
             g.next().await,
-            Some(ServerMessage::AuthStep(AuthStep::AccountRequired { registration: Registration::Invite }))
+            Some(ServerMessage::AuthStep(AuthStep::AccountRequired {
+                registration: Registration::Invite
+            }))
         ));
         g.assert_closed().await;
     }
@@ -4667,32 +5578,78 @@ mod tests {
     #[tokio::test]
     async fn invites_are_the_way_in_when_sign_up_is_not_open() {
         use sha2::Digest;
-        let (state, _db_state) = relay_state(AccountsMode::Optional, RegistrationMode::Invite).await;
+        let (state, _db_state) =
+            relay_state(AccountsMode::Optional, RegistrationMode::Invite).await;
         let mut c = open_account(&state, "frank", AccountStart::Register { invite: None }).await;
-        assert!(matches!(c.next().await, Some(ServerMessage::AuthError { reason }) if reason.contains("invite")));
+        assert!(
+            matches!(c.next().await, Some(ServerMessage::AuthError { reason }) if reason.contains("invite"))
+        );
 
         let raw = [3u8; 16];
         let hash: [u8; 32] = sha2::Sha256::digest(raw).into();
         let relay = state.accounts.as_ref().unwrap();
-        relay.store().insert_invite(&hash, None, Some("frank"), l4f_accounts::util::now() + 3600).await.unwrap();
+        relay
+            .store()
+            .insert_invite(&hash, None, Some("frank"), l4f_accounts::util::now() + 3600)
+            .await
+            .unwrap();
         let code = l4f_accounts::util::b64u(&raw);
-        let mut c = open_account(&state, "frank", AccountStart::Register { invite: Some(code) }).await;
-        assert!(matches!(c.next().await, Some(ServerMessage::AuthStep(AuthStep::Salt { pow: None, .. }))), "no proof of work with an invite");
-        c.send(&ClientMessage::AuthContinue(AuthContinue::Register { auth_secret: SECRET.to_vec(), altcha: String::new(), ts: String::new(), vault: Vec::new() })).await;
+        let mut c = open_account(
+            &state,
+            "frank",
+            AccountStart::Register { invite: Some(code) },
+        )
+        .await;
+        assert!(
+            matches!(
+                c.next().await,
+                Some(ServerMessage::AuthStep(AuthStep::Salt { pow: None, .. }))
+            ),
+            "no proof of work with an invite"
+        );
+        c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
+            auth_secret: SECRET.to_vec(),
+            altcha: String::new(),
+            ts: String::new(),
+            vault: Vec::new(),
+        }))
+        .await;
         c.send(&keys(&IDENTITY, false)).await;
-        c.expect("Authenticated", |m| matches!(m, ServerMessage::Authenticated { account: Some(_), .. })).await;
+        c.expect("Authenticated", |m| {
+            matches!(
+                m,
+                ServerMessage::Authenticated {
+                    account: Some(_),
+                    ..
+                }
+            )
+        })
+        .await;
     }
 
     async fn totp_on(c: &mut Client) -> Vec<u8> {
-        c.send(&ClientMessage::Account(AccountRequest::TotpSetup)).await;
-        let ServerMessage::Account(AccountReply::TotpSetup { secret, sealed, .. }) = c.expect("TotpSetup", |m| reply(m).is_some()).await else {
+        c.send(&ClientMessage::Account(AccountRequest::TotpSetup))
+            .await;
+        let ServerMessage::Account(AccountReply::TotpSetup { secret, sealed, .. }) =
+            c.expect("TotpSetup", |m| reply(m).is_some()).await
+        else {
             panic!("TotpSetup")
         };
         let secret = l4f_accounts::totp::base32_decode(&secret).unwrap();
-        let code = format!("{:06}", l4f_accounts::totp::code_at(&secret, l4f_accounts::util::now() / 30));
-        c.send(&ClientMessage::Account(AccountRequest::TotpEnable { sealed, code })).await;
+        let code = format!(
+            "{:06}",
+            l4f_accounts::totp::code_at(&secret, l4f_accounts::util::now() / 30)
+        );
+        c.send(&ClientMessage::Account(AccountRequest::TotpEnable {
+            sealed,
+            code,
+        }))
+        .await;
         let msg = c.expect("TotpEnabled", |m| reply(m).is_some()).await;
-        assert!(matches!(msg, ServerMessage::Account(AccountReply::TotpEnabled { ref recovery_codes }) if recovery_codes.len() == 10), "{msg:?}");
+        assert!(
+            matches!(msg, ServerMessage::Account(AccountReply::TotpEnabled { ref recovery_codes }) if recovery_codes.len() == 10),
+            "{msg:?}"
+        );
         secret
     }
 
@@ -4700,24 +5657,48 @@ mod tests {
     async fn the_admin_token_makes_the_first_admin_whose_rights_wait_for_codes() {
         let (state, _db_state) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let (mut gina, _) = register(&state, "gina").await;
-        gina.send(&ClientMessage::AdminLogin { token: "test-admin-token".into() }).await;
-        let ServerMessage::Account(AccountReply::Info(info)) = gina.expect("Info", |m| reply(m).is_some()).await else {
+        gina.send(&ClientMessage::AdminLogin {
+            token: "test-admin-token".into(),
+        })
+        .await;
+        let ServerMessage::Account(AccountReply::Info(info)) =
+            gina.expect("Info", |m| reply(m).is_some()).await
+        else {
             panic!("the new admin is told what changed")
         };
-        assert!(info.needs_2fa && info.scopes.is_empty(), "admin rights wait for a second factor: {info:?}");
+        assert!(
+            info.needs_2fa && info.scopes.is_empty(),
+            "admin rights wait for a second factor: {info:?}"
+        );
         assert!(!state.can_moderate(*state.username_to_session.get("gina").unwrap()));
 
         let secret = totp_on(&mut gina).await;
-        let ServerMessage::Account(AccountReply::Info(info)) = gina.expect("Info", |m| matches!(m, ServerMessage::Account(AccountReply::Info(_)))).await else {
+        let ServerMessage::Account(AccountReply::Info(info)) = gina
+            .expect("Info", |m| {
+                matches!(m, ServerMessage::Account(AccountReply::Info(_)))
+            })
+            .await
+        else {
             unreachable!()
         };
         assert_eq!(info.scopes, ["*"]);
-        gina.expect("AdminStatus", |m| matches!(m, ServerMessage::AdminStatus { is_admin: true, .. })).await;
+        gina.expect("AdminStatus", |m| {
+            matches!(m, ServerMessage::AdminStatus { is_admin: true, .. })
+        })
+        .await;
 
         // The token is spent once an admin exists.
         let (mut hank, _) = register(&state, "hank").await;
-        hank.send(&ClientMessage::AdminLogin { token: "test-admin-token".into() }).await;
-        let ServerMessage::AdminError { reason } = hank.expect("AdminError", |m| matches!(m, ServerMessage::AdminError { .. })).await else {
+        hank.send(&ClientMessage::AdminLogin {
+            token: "test-admin-token".into(),
+        })
+        .await;
+        let ServerMessage::AdminError { reason } = hank
+            .expect("AdminError", |m| {
+                matches!(m, ServerMessage::AdminError { .. })
+            })
+            .await
+        else {
             unreachable!()
         };
         assert!(reason.contains("already"), "{reason}");
@@ -4725,15 +5706,45 @@ mod tests {
         // A new device: password, then a code; a wrong code asks again.
         let mut c = open_account(&state, "gina", AccountStart::Login).await;
         c.next().await;
-        c.send(&ClientMessage::AuthContinue(AuthContinue::Secret { auth_secret: SECRET.to_vec() })).await;
-        assert!(matches!(c.next().await, Some(ServerMessage::AuthStep(AuthStep::NeedTotp))));
-        c.send(&ClientMessage::AuthContinue(AuthContinue::Totp { code: "000000".into() })).await;
-        assert!(matches!(c.next().await, Some(ServerMessage::AuthStep(AuthStep::NeedTotp))), "a wrong code asks again");
-        let code = format!("{:06}", l4f_accounts::totp::code_at(&secret, l4f_accounts::util::now() / 30 + 1));
-        c.send(&ClientMessage::AuthContinue(AuthContinue::Totp { code })).await;
-        c.expect("Vault", |m| matches!(m, ServerMessage::AuthStep(AuthStep::Vault { .. }))).await;
+        c.send(&ClientMessage::AuthContinue(AuthContinue::Secret {
+            auth_secret: SECRET.to_vec(),
+        }))
+        .await;
+        assert!(matches!(
+            c.next().await,
+            Some(ServerMessage::AuthStep(AuthStep::NeedTotp))
+        ));
+        c.send(&ClientMessage::AuthContinue(AuthContinue::Totp {
+            code: "000000".into(),
+        }))
+        .await;
+        assert!(
+            matches!(
+                c.next().await,
+                Some(ServerMessage::AuthStep(AuthStep::NeedTotp))
+            ),
+            "a wrong code asks again"
+        );
+        let code = format!(
+            "{:06}",
+            l4f_accounts::totp::code_at(&secret, l4f_accounts::util::now() / 30 + 1)
+        );
+        c.send(&ClientMessage::AuthContinue(AuthContinue::Totp { code }))
+            .await;
+        c.expect("Vault", |m| {
+            matches!(m, ServerMessage::AuthStep(AuthStep::Vault { .. }))
+        })
+        .await;
         c.send(&keys(&IDENTITY, false)).await;
-        let ServerMessage::Authenticated { account: Some(info), .. } = c.expect("Authenticated", |m| matches!(m, ServerMessage::Authenticated { .. })).await else {
+        let ServerMessage::Authenticated {
+            account: Some(info),
+            ..
+        } = c
+            .expect("Authenticated", |m| {
+                matches!(m, ServerMessage::Authenticated { .. })
+            })
+            .await
+        else {
             unreachable!()
         };
         assert_eq!(info.scopes, ["*"]);
@@ -4751,48 +5762,125 @@ mod tests {
         let (state, _db_state) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let relay_id = state.accounts.as_ref().unwrap().relay_id;
         let (mut ivy, _) = register(&state, "ivy").await;
-        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new()).unwrap();
+        let pkcs8 =
+            ring::signature::Ed25519KeyPair::generate_pkcs8(&ring::rand::SystemRandom::new())
+                .unwrap();
         let key = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
         let device_id = vec![0x42u8; 16];
         let origin = format!("voipc://{}", hex::encode(relay_id));
         let sign = |challenge: &str| {
-            let msg = l4f_accounts::verify::devkey::message(&origin, &device_id, &l4f_accounts::challenge::challenge_bytes(challenge));
+            let msg = l4f_accounts::verify::devkey::message(
+                &origin,
+                &device_id,
+                &l4f_accounts::challenge::challenge_bytes(challenge),
+            );
             key.sign(&msg).as_ref().to_vec()
         };
-        ivy.send(&ClientMessage::Account(AccountRequest::DeviceChallenge)).await;
-        let ServerMessage::Account(AccountReply::DeviceChallenge { challenge }) = ivy.expect("challenge", |m| reply(m).is_some()).await else {
+        ivy.send(&ClientMessage::Account(AccountRequest::DeviceChallenge))
+            .await;
+        let ServerMessage::Account(AccountReply::DeviceChallenge { challenge }) =
+            ivy.expect("challenge", |m| reply(m).is_some()).await
+        else {
             panic!("a fresh sign-in may remember its device")
         };
         let signature = sign(&challenge);
-        ivy.send(&ClientMessage::Account(AccountRequest::DeviceAdd { device_id: device_id.clone(), public_key: key.public_key().as_ref().to_vec(), signature }))
-            .await;
-        assert!(matches!(ivy.expect("added", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::DeviceAdded)));
+        ivy.send(&ClientMessage::Account(AccountRequest::DeviceAdd {
+            device_id: device_id.clone(),
+            public_key: key.public_key().as_ref().to_vec(),
+            signature,
+        }))
+        .await;
+        assert!(matches!(
+            ivy.expect("added", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::DeviceAdded)
+        ));
 
-        let mut d = open_account(&state, "ivy", AccountStart::DeviceKey { device_id: device_id.clone() }).await;
-        let Some(ServerMessage::AuthStep(AuthStep::DeviceChallenge { challenge, relay_id: rid })) = d.next().await else {
+        let mut d = open_account(
+            &state,
+            "ivy",
+            AccountStart::DeviceKey {
+                device_id: device_id.clone(),
+            },
+        )
+        .await;
+        let Some(ServerMessage::AuthStep(AuthStep::DeviceChallenge {
+            challenge,
+            relay_id: rid,
+        })) = d.next().await
+        else {
             panic!("a device challenge")
         };
         assert_eq!(rid, relay_id);
         let first_sig = sign(&challenge);
-        d.send(&ClientMessage::AuthContinue(AuthContinue::DeviceSig { signature: first_sig.clone() })).await;
-        d.expect("Vault", |m| matches!(m, ServerMessage::AuthStep(AuthStep::Vault { .. }))).await;
+        d.send(&ClientMessage::AuthContinue(AuthContinue::DeviceSig {
+            signature: first_sig.clone(),
+        }))
+        .await;
+        d.expect("Vault", |m| {
+            matches!(m, ServerMessage::AuthStep(AuthStep::Vault { .. }))
+        })
+        .await;
         d.send(&keys(&IDENTITY, false)).await;
-        d.expect("Authenticated", |m| matches!(m, ServerMessage::Authenticated { account: Some(_), .. })).await;
+        d.expect("Authenticated", |m| {
+            matches!(
+                m,
+                ServerMessage::Authenticated {
+                    account: Some(_),
+                    ..
+                }
+            )
+        })
+        .await;
 
         // The same signature on another connection: another challenge, another nonce.
-        let mut replay = open_account(&state, "ivy", AccountStart::DeviceKey { device_id: device_id.clone() }).await;
+        let mut replay = open_account(
+            &state,
+            "ivy",
+            AccountStart::DeviceKey {
+                device_id: device_id.clone(),
+            },
+        )
+        .await;
         replay.next().await;
-        replay.send(&ClientMessage::AuthContinue(AuthContinue::DeviceSig { signature: first_sig })).await;
-        assert!(matches!(replay.next().await, Some(ServerMessage::AuthError { .. })), "a replayed signature is refused");
+        replay
+            .send(&ClientMessage::AuthContinue(AuthContinue::DeviceSig {
+                signature: first_sig,
+            }))
+            .await;
+        assert!(
+            matches!(replay.next().await, Some(ServerMessage::AuthError { .. })),
+            "a replayed signature is refused"
+        );
 
         // H1-14: a remembered device alone cannot replace the identity every
         // contact pinned; that takes the password
-        let mut reset = open_account(&state, "ivy", AccountStart::DeviceKey { device_id: device_id.clone() }).await;
-        let Some(ServerMessage::AuthStep(AuthStep::DeviceChallenge { challenge, .. })) = reset.next().await else { panic!("a device challenge") };
-        reset.send(&ClientMessage::AuthContinue(AuthContinue::DeviceSig { signature: sign(&challenge) })).await;
-        reset.expect("Vault", |m| matches!(m, ServerMessage::AuthStep(AuthStep::Vault { .. }))).await;
+        let mut reset = open_account(
+            &state,
+            "ivy",
+            AccountStart::DeviceKey {
+                device_id: device_id.clone(),
+            },
+        )
+        .await;
+        let Some(ServerMessage::AuthStep(AuthStep::DeviceChallenge { challenge, .. })) =
+            reset.next().await
+        else {
+            panic!("a device challenge")
+        };
+        reset
+            .send(&ClientMessage::AuthContinue(AuthContinue::DeviceSig {
+                signature: sign(&challenge),
+            }))
+            .await;
+        reset
+            .expect("Vault", |m| {
+                matches!(m, ServerMessage::AuthStep(AuthStep::Vault { .. }))
+            })
+            .await;
         reset.send(&keys(&[7u8; 33], true)).await;
-        let Some(ServerMessage::AuthError { reason }) = reset.next().await else { panic!("the reset went through") };
+        let Some(ServerMessage::AuthError { reason }) = reset.next().await else {
+            panic!("the reset went through")
+        };
         assert!(reason.contains("password"), "{reason}");
     }
 
@@ -4800,13 +5888,26 @@ mod tests {
     async fn a_client_one_protocol_behind_is_told_to_update() {
         #[derive(serde::Serialize)]
         enum Old {
-            Authenticate { username: String, protocol_version: u32, app_version: String, identity_key: Option<Vec<u8>>, prekey_bundle: Option<PreKeyBundleData> },
+            Authenticate {
+                username: String,
+                protocol_version: u32,
+                app_version: String,
+                identity_key: Option<Vec<u8>>,
+                prekey_bundle: Option<PreKeyBundleData>,
+            },
         }
         let state = admin_state();
         let (mut stream, server) = tokio::io::duplex(65536);
         let (media_tx, _media_rx) = mpsc::channel(8);
         let (sid_tx, _sid_rx) = oneshot::channel();
-        let handler = tokio::spawn(handle_connection(server, "old".into(), IpAddr::V4(Ipv4Addr::LOCALHOST), media_tx, sid_tx, state.clone()));
+        let handler = tokio::spawn(handle_connection(
+            server,
+            "old".into(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            media_tx,
+            sid_tx,
+            state.clone(),
+        ));
         let payload = postcard::to_allocvec(&Old::Authenticate {
             username: "old".into(),
             protocol_version: PROTOCOL_VERSION - 1,
@@ -4815,12 +5916,24 @@ mod tests {
             prekey_bundle: None,
         })
         .unwrap();
-        stream.write_all(&(payload.len() as u32).to_be_bytes()).await.unwrap();
+        stream
+            .write_all(&(payload.len() as u32).to_be_bytes())
+            .await
+            .unwrap();
         stream.write_all(&payload).await.unwrap();
-        let mut c = Client { stream, handler, buf: BytesMut::new() };
-        let Some(ServerMessage::AuthError { reason }) = c.next().await else { panic!("an old client hears why") };
+        let mut c = Client {
+            stream,
+            handler,
+            buf: BytesMut::new(),
+        };
+        let Some(ServerMessage::AuthError { reason }) = c.next().await else {
+            panic!("an old client hears why")
+        };
         // The words a 0.12 client stops reconnecting on (connect.ts)
-        assert!(reason.contains("version mismatch") && reason.contains("please update your app"), "{reason}");
+        assert!(
+            reason.contains("version mismatch") && reason.contains("please update your app"),
+            "{reason}"
+        );
     }
 
     /// Protocol match only: another app version on the same protocol is in.
@@ -4836,7 +5949,10 @@ mod tests {
             account: None,
         };
         let mut c = open_raw(&state, &first).await;
-        c.expect("Authenticated", |m| matches!(m, ServerMessage::Authenticated { .. })).await;
+        c.expect("Authenticated", |m| {
+            matches!(m, ServerMessage::Authenticated { .. })
+        })
+        .await;
     }
 
     /// A newer client hears, in a form it can read, that the server is the
@@ -4853,17 +5969,38 @@ mod tests {
             account: None,
         };
         let mut c = open_raw(&state, &first).await;
-        let Some(ServerMessage::Refused { code, server_protocol, server_version, text }) = c.next().await else { panic!("not refused") };
-        assert_eq!((code, server_protocol, server_version.as_str()), (REFUSED_VERSION, PROTOCOL_VERSION, APP_VERSION));
-        assert!(text.contains("version mismatch") && text.contains("the server needs an update"), "{text}");
+        let Some(ServerMessage::Refused {
+            code,
+            server_protocol,
+            server_version,
+            text,
+        }) = c.next().await
+        else {
+            panic!("not refused")
+        };
+        assert_eq!(
+            (code, server_protocol, server_version.as_str()),
+            (REFUSED_VERSION, PROTOCOL_VERSION, APP_VERSION)
+        );
+        assert!(
+            text.contains("version mismatch") && text.contains("the server needs an update"),
+            "{text}"
+        );
     }
 
     /// Runs the client's sign-in machine (voipc-crypto) against this relay.
-    async fn drive(c: &mut Client, m: &mut voipc_crypto::account::SignIn) -> Result<AccountInfo, String> {
+    async fn drive(
+        c: &mut Client,
+        m: &mut voipc_crypto::account::SignIn,
+    ) -> Result<AccountInfo, String> {
         use voipc_crypto::account::Step;
         loop {
             let msg = c.next().await.ok_or("closed")?;
-            if let ServerMessage::Authenticated { account: Some(info), .. } = &msg {
+            if let ServerMessage::Authenticated {
+                account: Some(info),
+                ..
+            } = &msg
+            {
                 return Ok(info.clone());
             }
             for step in m.on_message(&msg)? {
@@ -4871,11 +6008,16 @@ mod tests {
                     Step::Send(out) => c.send(&out).await,
                     Step::Keys => {
                         let ik = m.identity().unwrap().public_key().serialize().to_vec();
-                        let b = PreKeyBundleData { identity_key: ik, ..bundle() };
+                        let b = PreKeyBundleData {
+                            identity_key: ik,
+                            ..bundle()
+                        };
                         c.send(&m.keys(b)).await;
                     }
                     Step::NeedTotp => return Err("asked for a code".into()),
-                    Step::Stretch { .. } | Step::ResetDone => return Err("not a sign-in step".into()),
+                    Step::Stretch { .. } | Step::ResetDone => {
+                        return Err("not a sign-in step".into())
+                    }
                     Step::Ignore => {}
                 }
             }
@@ -4884,10 +6026,20 @@ mod tests {
 
     /// Runs a reset with the recovery key through the client's machine;
     /// `code` answers a second factor.
-    async fn reset_with(state: &Arc<ServerState>, name: &str, recovery: &str, password: &str, code: Option<&str>) -> Result<(), String> {
+    async fn reset_with(
+        state: &Arc<ServerState>,
+        name: &str,
+        recovery: &str,
+        password: &str,
+        code: Option<&str>,
+    ) -> Result<(), String> {
         use voipc_crypto::account::{recovery_parse, Method, SignIn, Step};
-        let recovery = zeroize::Zeroizing::new(recovery_parse(recovery).ok_or("not a recovery key")?);
-        let method = Method::Reset { recovery, password: zeroize::Zeroizing::new(password.into()) };
+        let recovery =
+            zeroize::Zeroizing::new(recovery_parse(recovery).ok_or("not a recovery key")?);
+        let method = Method::Reset {
+            recovery,
+            password: zeroize::Zeroizing::new(password.into()),
+        };
         let (mut m, first) = SignIn::start(name, method, PROTOCOL_VERSION, APP_VERSION);
         let mut c = open_raw(state, &first).await;
         loop {
@@ -4903,9 +6055,20 @@ mod tests {
         }
     }
 
-    async fn password_sign_in(state: &Arc<ServerState>, name: &str, password: &str) -> Result<voipc_crypto::account::SignedIn, String> {
+    async fn password_sign_in(
+        state: &Arc<ServerState>,
+        name: &str,
+        password: &str,
+    ) -> Result<voipc_crypto::account::SignedIn, String> {
         use voipc_crypto::account::{Method, SignIn};
-        let (mut m, first) = SignIn::start(name, Method::Password { password: zeroize::Zeroizing::new(password.into()) }, PROTOCOL_VERSION, APP_VERSION);
+        let (mut m, first) = SignIn::start(
+            name,
+            Method::Password {
+                password: zeroize::Zeroizing::new(password.into()),
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
         drive(&mut open_raw(state, &first).await, &mut m).await?;
         m.finish()
     }
@@ -4922,31 +6085,93 @@ mod tests {
         let identity = signed.identity.public_key().serialize().to_vec();
         let (enrol, ask) = DeviceEnrol::start(signed.relay_id);
         c.send(&ask).await;
-        let ServerMessage::Account(r) = c.expect("challenge", |m| reply(m).is_some()).await else { unreachable!() };
+        let ServerMessage::Account(r) = c.expect("challenge", |m| reply(m).is_some()).await else {
+            unreachable!()
+        };
         c.send(&enrol.on_reply(&r).unwrap()).await;
-        assert!(matches!(c.expect("added", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::DeviceAdded)));
+        assert!(matches!(
+            c.expect("added", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::DeviceAdded)
+        ));
 
         // Another key opens nothing; the client stops there.
         let other = voipc_crypto::account::recovery_text(&[7u8; 32]);
-        let e = reset_with(&state, "kim", &other, "a brand new password", None).await.unwrap_err();
+        let e = reset_with(&state, "kim", &other, "a brand new password", None)
+            .await
+            .unwrap_err();
         assert!(e.contains("recovery key"), "{e}");
         // The relay hands out no password slot, and refuses another identity's signature.
         let mut raw = open_account(&state, "kim", AccountStart::Reset).await;
-        let Some(ServerMessage::AuthStep(AuthStep::ResetChallenge { blobs, second_factor: false, .. })) = raw.next().await else { panic!("a challenge") };
-        assert!(blobs.iter().all(|b| b.k == "slot.recovery" || b.k == "item.identity") && blobs.len() == 2, "{blobs:?}");
-        let forged = voipc_crypto::account::reset_proof(&voipc_crypto::generate_identity_key_pair(), &signed.relay_id, "kim", b"x");
-        raw.send(&ClientMessage::AuthContinue(AuthContinue::Reset { signature: forged, auth_secret: SECRET.to_vec(), pass_slot: vec![1; 101], totp: None, recovery_code: None })).await;
-        let ServerMessage::AuthError { reason } = raw.expect("refusal", |m| matches!(m, ServerMessage::AuthError { .. })).await else { unreachable!() };
+        let Some(ServerMessage::AuthStep(AuthStep::ResetChallenge {
+            blobs,
+            second_factor: false,
+            ..
+        })) = raw.next().await
+        else {
+            panic!("a challenge")
+        };
+        assert!(
+            blobs
+                .iter()
+                .all(|b| b.k == "slot.recovery" || b.k == "item.identity")
+                && blobs.len() == 2,
+            "{blobs:?}"
+        );
+        let forged = voipc_crypto::account::reset_proof(
+            &voipc_crypto::generate_identity_key_pair(),
+            &signed.relay_id,
+            "kim",
+            b"x",
+        );
+        raw.send(&ClientMessage::AuthContinue(AuthContinue::Reset {
+            signature: forged,
+            auth_secret: SECRET.to_vec(),
+            pass_slot: vec![1; 101],
+            totp: None,
+            recovery_code: None,
+        }))
+        .await;
+        let ServerMessage::AuthError { reason } = raw
+            .expect("refusal", |m| matches!(m, ServerMessage::AuthError { .. }))
+            .await
+        else {
+            unreachable!()
+        };
         assert!(reason.contains("not this account's"), "{reason}");
 
-        reset_with(&state, "kim", &recovery, "a brand new password", None).await.unwrap();
-        c.expect("signed out", |m| matches!(m, ServerMessage::Disconnected { .. })).await;
-        assert!(password_sign_in(&state, "kim", "correct horse battery").await.err().unwrap().contains("Wrong"));
+        reset_with(&state, "kim", &recovery, "a brand new password", None)
+            .await
+            .unwrap();
+        c.expect("signed out", |m| {
+            matches!(m, ServerMessage::Disconnected { .. })
+        })
+        .await;
+        assert!(password_sign_in(&state, "kim", "correct horse battery")
+            .await
+            .err()
+            .unwrap()
+            .contains("Wrong"));
         let key = DeviceKey::from_parts(enrol.key.device_id, enrol.key.pkcs8().to_vec()).unwrap();
-        let (mut m, first) = SignIn::start("kim", Method::Device { key, relay_id: signed.relay_id, dek: signed.vault.dek() }, PROTOCOL_VERSION, APP_VERSION);
-        assert!(drive(&mut open_raw(&state, &first).await, &mut m).await.is_err(), "the remembered device is forgotten");
+        let (mut m, first) = SignIn::start(
+            "kim",
+            Method::Device {
+                key,
+                relay_id: signed.relay_id,
+                dek: signed.vault.dek(),
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        assert!(
+            drive(&mut open_raw(&state, &first).await, &mut m)
+                .await
+                .is_err(),
+            "the remembered device is forgotten"
+        );
         // The new password opens the same vault: the same identity, so nobody's pins break.
-        let again = password_sign_in(&state, "kim", "a brand new password").await.unwrap();
+        let again = password_sign_in(&state, "kim", "a brand new password")
+            .await
+            .unwrap();
         assert_eq!(again.identity.public_key().serialize().to_vec(), identity);
     }
 
@@ -4956,53 +6181,130 @@ mod tests {
         let (mut c, _, signed) = register_with(&state, "lou").await;
         let secret = totp_on(&mut c).await;
         let recovery = signed.recovery.clone().unwrap();
-        assert_eq!(reset_with(&state, "lou", &recovery, "a brand new password", None).await.unwrap_err(), "asked for a code");
-        assert!(reset_with(&state, "lou", &recovery, "a brand new password", Some("000000")).await.is_err());
-        let code = format!("{:06}", l4f_accounts::totp::code_at(&secret, l4f_accounts::util::now() / 30 + 1));
-        reset_with(&state, "lou", &recovery, "a brand new password", Some(&code)).await.unwrap();
-        assert_eq!(password_sign_in(&state, "lou", "a brand new password").await.err().as_deref(), Some("asked for a code"), "codes stay on");
-        assert!(password_sign_in(&state, "lou", "correct horse battery").await.err().unwrap().contains("Wrong"));
+        assert_eq!(
+            reset_with(&state, "lou", &recovery, "a brand new password", None)
+                .await
+                .unwrap_err(),
+            "asked for a code"
+        );
+        assert!(reset_with(
+            &state,
+            "lou",
+            &recovery,
+            "a brand new password",
+            Some("000000")
+        )
+        .await
+        .is_err());
+        let code = format!(
+            "{:06}",
+            l4f_accounts::totp::code_at(&secret, l4f_accounts::util::now() / 30 + 1)
+        );
+        reset_with(
+            &state,
+            "lou",
+            &recovery,
+            "a brand new password",
+            Some(&code),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            password_sign_in(&state, "lou", "a brand new password")
+                .await
+                .err()
+                .as_deref(),
+            Some("asked for a code"),
+            "codes stay on"
+        );
+        assert!(password_sign_in(&state, "lou", "correct horse battery")
+            .await
+            .err()
+            .unwrap()
+            .contains("Wrong"));
     }
 
     #[tokio::test]
     async fn a_password_change_keeps_this_connection_and_forgets_the_device_keys() {
         use voipc_crypto::account::stretch;
-        use voipc_crypto::account_session::AccountSession;
         use voipc_crypto::account::{DeviceEnrol, DeviceKey, Method, SignIn};
+        use voipc_crypto::account_session::AccountSession;
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let (mut c, info, signed) = register_with(&state, "max").await;
         let (enrol, ask) = DeviceEnrol::start(signed.relay_id);
         c.send(&ask).await;
-        let ServerMessage::Account(r) = c.expect("challenge", |m| reply(m).is_some()).await else { unreachable!() };
+        let ServerMessage::Account(r) = c.expect("challenge", |m| reply(m).is_some()).await else {
+            unreachable!()
+        };
         c.send(&enrol.on_reply(&r).unwrap()).await;
-        assert!(matches!(c.expect("added", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::DeviceAdded)));
+        assert!(matches!(
+            c.expect("added", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::DeviceAdded)
+        ));
         let (relay_id, dek) = (signed.relay_id, signed.vault.dek());
-        let (mut session, _) = AccountSession::start(signed, &info, Default::default(), false, true);
+        let (mut session, _) =
+            AccountSession::start(signed, &info, Default::default(), false, true);
         let old = stretch("correct horse battery", &relay_id, "max");
         let new = stretch("another good password", &relay_id, "max");
         for m in session.password_change(&new, &new, None, None).send {
             c.send(&m).await;
         }
         let msg = c.expect("refused", |m| reply(m).is_some()).await;
-        assert!(matches!(msg, ServerMessage::Account(AccountReply::Error { ref request, .. }) if request == "PasswordChange"), "the old password must be right: {msg:?}");
+        assert!(
+            matches!(msg, ServerMessage::Account(AccountReply::Error { ref request, .. }) if request == "PasswordChange"),
+            "the old password must be right: {msg:?}"
+        );
         for m in session.password_change(&old, &new, None, None).send {
             c.send(&m).await;
         }
-        let ServerMessage::Account(changed) = c.expect("changed", |m| reply(m).is_some()).await else { unreachable!() };
-        assert!(matches!(changed, AccountReply::PasswordChanged), "{changed:?}");
+        let ServerMessage::Account(changed) = c.expect("changed", |m| reply(m).is_some()).await
+        else {
+            unreachable!()
+        };
+        assert!(
+            matches!(changed, AccountReply::PasswordChanged),
+            "{changed:?}"
+        );
         // Every device key went with the old password, this one's too: the
         // session asks to remember this device again.
         let again = session.on_reply(&changed);
-        assert!(again.send.iter().any(|m| matches!(m, ClientMessage::Account(AccountRequest::DeviceChallenge))));
+        assert!(again
+            .send
+            .iter()
+            .any(|m| matches!(m, ClientMessage::Account(AccountRequest::DeviceChallenge))));
         // This connection's token was swapped with l4f's, so it stays.
         crate::accounts::revalidate(&state).await;
-        c.send(&ClientMessage::Account(AccountRequest::VaultPut { k: "item.still".into(), v: b"here".to_vec(), expect: 0 })).await;
-        assert!(matches!(c.expect("stored", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::VaultStored { .. })));
+        c.send(&ClientMessage::Account(AccountRequest::VaultPut {
+            k: "item.still".into(),
+            v: b"here".to_vec(),
+            expect: 0,
+        }))
+        .await;
+        assert!(matches!(
+            c.expect("stored", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::VaultStored { .. })
+        ));
         let key = DeviceKey::from_parts(enrol.key.device_id, enrol.key.pkcs8().to_vec()).unwrap();
-        let (mut m, first) = SignIn::start("max", Method::Device { key, relay_id, dek }, PROTOCOL_VERSION, APP_VERSION);
-        assert!(drive(&mut open_raw(&state, &first).await, &mut m).await.is_err(), "the old device key is forgotten");
-        assert!(password_sign_in(&state, "max", "correct horse battery").await.err().unwrap().contains("Wrong"));
-        let again = password_sign_in(&state, "max", "another good password").await.expect("the new password opens the vault");
+        let (mut m, first) = SignIn::start(
+            "max",
+            Method::Device { key, relay_id, dek },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        assert!(
+            drive(&mut open_raw(&state, &first).await, &mut m)
+                .await
+                .is_err(),
+            "the old device key is forgotten"
+        );
+        assert!(password_sign_in(&state, "max", "correct horse battery")
+            .await
+            .err()
+            .unwrap()
+            .contains("Wrong"));
+        let again = password_sign_in(&state, "max", "another good password")
+            .await
+            .expect("the new password opens the vault");
         assert_eq!(again.vault.dek(), dek, "the same vault: the DEK stays");
     }
 
@@ -5016,10 +6318,16 @@ mod tests {
         let id = l4f_accounts::model::AccountId(info.id);
         let slot = |v: &[VaultBlob]| v.iter().find(|b| b.k == "slot.pass").unwrap().v.clone();
         let before = relay.vault(id).await.unwrap();
-        let failed = crate::accounts::replace_pass_slot(&relay, id, &before, &[1u8; 101], || async { Err(l4f_accounts::service::Error::Invalid("refused")) }).await;
+        let failed =
+            crate::accounts::replace_pass_slot(&relay, id, &before, &[1u8; 101], || async {
+                Err(l4f_accounts::service::Error::Invalid("refused"))
+            })
+            .await;
         assert_eq!(failed.unwrap_err(), "refused");
         assert_eq!(slot(&relay.vault(id).await.unwrap()), slot(&before));
-        password_sign_in(&state, "ned", "correct horse battery").await.expect("the old password still opens the vault");
+        password_sign_in(&state, "ned", "correct horse battery")
+            .await
+            .expect("the old password still opens the vault");
     }
 
     async fn open_raw(state: &Arc<ServerState>, first: &ClientMessage) -> Client {
@@ -5027,16 +6335,46 @@ mod tests {
         let (media_tx, _media_rx) = mpsc::channel(8);
         let (sid_tx, _sid_rx) = oneshot::channel();
         let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let handler = tokio::spawn(handle_connection(server, "raw".into(), lo, media_tx, sid_tx, state.clone()));
-        let mut c = Client { stream, handler, buf: BytesMut::new() };
+        let handler = tokio::spawn(handle_connection(
+            server,
+            "raw".into(),
+            lo,
+            media_tx,
+            sid_tx,
+            state.clone(),
+        ));
+        let mut c = Client {
+            stream,
+            handler,
+            buf: BytesMut::new(),
+        };
         c.send(first).await;
         c
     }
 
     async fn epoch_put(c: &mut Client, conv: &str, epoch: u32, to: &[[u8; 16]]) -> ServerMessage {
-        let wraps = to.iter().map(|r| voipc_protocol::messages::WrapIn { recipient: *r, wrapped: vec![0xAB; 92] }).collect();
-        c.send(&ClientMessage::Account(AccountRequest::EpochPut { conv: conv.into(), epoch, wraps })).await;
-        c.expect("an EpochPut answer", |m| matches!(m, ServerMessage::Account(AccountReply::EpochStored { .. } | AccountReply::Error { .. }))).await
+        let wraps = to
+            .iter()
+            .map(|r| voipc_protocol::messages::WrapIn {
+                recipient: *r,
+                wrapped: vec![0xAB; 92],
+            })
+            .collect();
+        c.send(&ClientMessage::Account(AccountRequest::EpochPut {
+            conv: conv.into(),
+            epoch,
+            wraps,
+        }))
+        .await;
+        c.expect("an EpochPut answer", |m| {
+            matches!(
+                m,
+                ServerMessage::Account(
+                    AccountReply::EpochStored { .. } | AccountReply::Error { .. }
+                )
+            )
+        })
+        .await
     }
 
     /// H1-03: new epochs per writer and conversation are capped per hour; an
@@ -5056,9 +6394,18 @@ mod tests {
             )).await.unwrap();
         }
         let refused = epoch_put(&mut eve, &conv, 1000, &[e.id, b.id]).await;
-        assert!(matches!(refused, ServerMessage::Account(AccountReply::Error { ref reason, .. }) if reason.contains("Too many new keys")), "{refused:?}");
+        assert!(
+            matches!(refused, ServerMessage::Account(AccountReply::Error { ref reason, .. }) if reason.contains("Too many new keys")),
+            "{refused:?}"
+        );
         let known = epoch_put(&mut eve, &conv, 5, &[e.id, b.id]).await;
-        assert!(matches!(known, ServerMessage::Account(AccountReply::EpochStored { .. })), "{known:?}");
+        assert!(
+            matches!(
+                known,
+                ServerMessage::Account(AccountReply::EpochStored { .. })
+            ),
+            "{known:?}"
+        );
     }
 
     /// H1-04: one member minting epochs no longer pushes another writer's key
@@ -5074,7 +6421,10 @@ mod tests {
         for id in [a.id, b.id, e.id] {
             crate::accounts::raw(&relay, &format!("INSERT INTO voipc_members (conv, account, joined_at) VALUES ('{conv}', x'{}', 0)", hex::encode(id))).await.unwrap();
         }
-        assert!(matches!(epoch_put(&mut alice, conv, 1, &[a.id, b.id, e.id]).await, ServerMessage::Account(AccountReply::EpochStored { .. })));
+        assert!(matches!(
+            epoch_put(&mut alice, conv, 1, &[a.id, b.id, e.id]).await,
+            ServerMessage::Account(AccountReply::EpochStored { .. })
+        ));
         let later = l4f_accounts::util::now() + 10;
         for epoch in 0..400 {
             crate::accounts::raw(&relay, &format!(
@@ -5082,9 +6432,22 @@ mod tests {
                 hex::encode(e.id), hex::encode(b.id)
             )).await.unwrap();
         }
-        bob.send(&ClientMessage::Account(AccountRequest::WrapsFetch { conv: conv.into() })).await;
-        let ServerMessage::Account(AccountReply::Wraps { wraps, .. }) = bob.expect("Wraps", |m| matches!(m, ServerMessage::Account(AccountReply::Wraps { .. }))).await else { unreachable!() };
-        assert!(wraps.iter().any(|w| w.owner == a.id), "alice's key was pushed out");
+        bob.send(&ClientMessage::Account(AccountRequest::WrapsFetch {
+            conv: conv.into(),
+        }))
+        .await;
+        let ServerMessage::Account(AccountReply::Wraps { wraps, .. }) = bob
+            .expect("Wraps", |m| {
+                matches!(m, ServerMessage::Account(AccountReply::Wraps { .. }))
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        assert!(
+            wraps.iter().any(|w| w.owner == a.id),
+            "alice's key was pushed out"
+        );
         assert!(wraps.len() <= 400);
     }
 
@@ -5096,18 +6459,38 @@ mod tests {
         use zeroize::Zeroizing;
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let pw = || Zeroizing::new("correct horse battery".to_string());
-        let (mut m, first) = SignIn::start("kim", Method::Register { password: pw(), invite: None }, PROTOCOL_VERSION, APP_VERSION);
-        drive(&mut open_raw(&state, &first).await, &mut m).await.unwrap();
+        let (mut m, first) = SignIn::start(
+            "kim",
+            Method::Register {
+                password: pw(),
+                invite: None,
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        drive(&mut open_raw(&state, &first).await, &mut m)
+            .await
+            .unwrap();
 
         // More stalled sign-ins from this address than it has permits
         let mut stalled = Vec::new();
         for _ in 0..4 + 2 {
             let mut c = open_account(&state, "kim", AccountStart::Login).await;
-            assert!(matches!(c.next().await, Some(ServerMessage::AuthStep(AuthStep::Salt { .. }))));
+            assert!(matches!(
+                c.next().await,
+                Some(ServerMessage::AuthStep(AuthStep::Salt { .. }))
+            ));
             stalled.push(c);
         }
-        let (mut m, first) = SignIn::start("kim", Method::Password { password: pw() }, PROTOCOL_VERSION, APP_VERSION);
-        drive(&mut open_raw(&state, &first).await, &mut m).await.expect("signs in beside the stalled ones");
+        let (mut m, first) = SignIn::start(
+            "kim",
+            Method::Password { password: pw() },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        drive(&mut open_raw(&state, &first).await, &mut m)
+            .await
+            .expect("signs in beside the stalled ones");
     }
 
     #[tokio::test]
@@ -5117,36 +6500,94 @@ mod tests {
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let pw = || Zeroizing::new("correct horse battery".to_string());
 
-        let (mut m, first) = SignIn::start("jules", Method::Register { password: pw(), invite: None }, PROTOCOL_VERSION, APP_VERSION);
+        let (mut m, first) = SignIn::start(
+            "jules",
+            Method::Register {
+                password: pw(),
+                invite: None,
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
         let mut c = open_raw(&state, &first).await;
         drive(&mut c, &mut m).await.unwrap();
         let signed = m.finish().unwrap();
-        assert!(signed.recovery.is_some(), "a new account gets its recovery key");
+        assert!(
+            signed.recovery.is_some(),
+            "a new account gets its recovery key"
+        );
         let identity = signed.identity.public_key().serialize().to_vec();
 
         // Remember this device.
         let (enrol, ask) = DeviceEnrol::start(signed.relay_id);
         c.send(&ask).await;
-        let ServerMessage::Account(r) = c.expect("challenge", |m| reply(m).is_some()).await else { unreachable!() };
-        c.send(&enrol.on_reply(&r).expect("a challenge to sign")).await;
-        assert!(matches!(c.expect("added", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::DeviceAdded)));
+        let ServerMessage::Account(r) = c.expect("challenge", |m| reply(m).is_some()).await else {
+            unreachable!()
+        };
+        c.send(&enrol.on_reply(&r).expect("a challenge to sign"))
+            .await;
+        assert!(matches!(
+            c.expect("added", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::DeviceAdded)
+        ));
         let dek = signed.vault.dek();
 
         // A new device: the password opens the same vault and the same identity.
-        let (mut m, first) = SignIn::start("jules", Method::Password { password: pw() }, PROTOCOL_VERSION, APP_VERSION);
+        let (mut m, first) = SignIn::start(
+            "jules",
+            Method::Password { password: pw() },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
         let mut c2 = open_raw(&state, &first).await;
         drive(&mut c2, &mut m).await.unwrap();
-        assert_eq!(m.finish().unwrap().identity.public_key().serialize().to_vec(), identity);
+        assert_eq!(
+            m.finish()
+                .unwrap()
+                .identity
+                .public_key()
+                .serialize()
+                .to_vec(),
+            identity
+        );
 
         // The remembered device: no password.
-        let key = voipc_crypto::account::DeviceKey::from_parts(enrol.key.device_id, enrol.key.pkcs8().to_vec()).unwrap();
-        let (mut m, first) = SignIn::start("jules", Method::Device { key, relay_id: signed.relay_id, dek }, PROTOCOL_VERSION, APP_VERSION);
+        let key = voipc_crypto::account::DeviceKey::from_parts(
+            enrol.key.device_id,
+            enrol.key.pkcs8().to_vec(),
+        )
+        .unwrap();
+        let (mut m, first) = SignIn::start(
+            "jules",
+            Method::Device {
+                key,
+                relay_id: signed.relay_id,
+                dek,
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
         let mut c3 = open_raw(&state, &first).await;
         drive(&mut c3, &mut m).await.unwrap();
-        assert_eq!(m.finish().unwrap().identity.public_key().serialize().to_vec(), identity);
+        assert_eq!(
+            m.finish()
+                .unwrap()
+                .identity
+                .public_key()
+                .serialize()
+                .to_vec(),
+            identity
+        );
 
         // A wrong password does not open the vault the relay would never hand out anyway.
-        let (mut m, first) = SignIn::start("jules", Method::Password { password: Zeroizing::new("wrong wrong wrong".into()) }, PROTOCOL_VERSION, APP_VERSION);
+        let (mut m, first) = SignIn::start(
+            "jules",
+            Method::Password {
+                password: Zeroizing::new("wrong wrong wrong".into()),
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
         let mut c4 = open_raw(&state, &first).await;
         assert!(drive(&mut c4, &mut m).await.unwrap_err().contains("Wrong"));
     }
@@ -5156,16 +6597,24 @@ mod tests {
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let (mut c, _) = register(&state, "kim").await;
         let put = |k: &str, v: &[u8], expect: i64| {
-            ClientMessage::Account(AccountRequest::VaultPut { k: k.into(), v: v.to_vec(), expect })
+            ClientMessage::Account(AccountRequest::VaultPut {
+                k: k.into(),
+                v: v.to_vec(),
+                expect,
+            })
         };
         c.send(&put("item.pins", b"one", 0)).await;
-        let ServerMessage::Account(AccountReply::VaultStored { version, .. }) = c.expect("stored", |m| reply(m).is_some()).await else {
+        let ServerMessage::Account(AccountReply::VaultStored { version, .. }) =
+            c.expect("stored", |m| reply(m).is_some()).await
+        else {
             panic!("a new item is stored")
         };
         assert_eq!(version, 1);
         // A second writer that did not see version 1 gets it back to merge with.
         c.send(&put("item.pins", b"two", 0)).await;
-        let ServerMessage::Account(AccountReply::VaultConflict { blob: Some(b), .. }) = c.expect("conflict", |m| reply(m).is_some()).await else {
+        let ServerMessage::Account(AccountReply::VaultConflict { blob: Some(b), .. }) =
+            c.expect("conflict", |m| reply(m).is_some()).await
+        else {
             panic!("a stale write is refused with what is there")
         };
         assert_eq!((b.v.as_slice(), b.version), (&b"one"[..], 1));
@@ -5175,32 +6624,61 @@ mod tests {
             ServerMessage::Account(AccountReply::VaultStored { version: 2, .. })
         ));
         c.send(&put("Bad Name!", b"x", 0)).await;
-        assert!(matches!(c.expect("refused", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::Error { .. })));
+        assert!(matches!(
+            c.expect("refused", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::Error { .. })
+        ));
         // One item, and the whole vault, stay under the frame a sign-in sends them in.
         c.send(&put("item.big", &vec![0u8; 49 * 1024], 0)).await;
-        assert!(matches!(c.expect("refused", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::Error { .. })));
+        assert!(matches!(
+            c.expect("refused", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::Error { .. })
+        ));
         c.send(&put("item.a", &vec![0u8; 40 * 1024], 0)).await;
-        assert!(matches!(c.expect("stored", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::VaultStored { .. })));
+        assert!(matches!(
+            c.expect("stored", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::VaultStored { .. })
+        ));
         c.send(&put("item.b", &vec![0u8; 20 * 1024], 0)).await;
-        assert!(matches!(c.expect("refused", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::Error { .. })));
+        assert!(matches!(
+            c.expect("refused", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::Error { .. })
+        ));
         // And it still fits the frame at sign-in.
         drop(c);
         let mut again = login(&state, "kim", &IDENTITY, false).await;
-        let ServerMessage::AuthStep(AuthStep::Vault { blobs }) = again.expect("Vault", |m| matches!(m, ServerMessage::AuthStep(_))).await else {
+        let ServerMessage::AuthStep(AuthStep::Vault { blobs }) = again
+            .expect("Vault", |m| matches!(m, ServerMessage::AuthStep(_)))
+            .await
+        else {
             unreachable!()
         };
         assert!(blobs.iter().any(|b| b.k == "item.a"));
         // A guest has no vault.
         let mut g = connect(&state, "lee#1234", IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
         g.send(&put("item.pins", b"x", 0)).await;
-        assert!(matches!(g.expect("refused", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::Error { .. })));
+        assert!(matches!(
+            g.expect("refused", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::Error { .. })
+        ));
     }
 
     /// Registers `name` with a real identity (so its log key can be endorsed).
-    async fn register_with(state: &Arc<ServerState>, name: &str) -> (Client, AccountInfo, voipc_crypto::account::SignedIn) {
+    async fn register_with(
+        state: &Arc<ServerState>,
+        name: &str,
+    ) -> (Client, AccountInfo, voipc_crypto::account::SignedIn) {
         use voipc_crypto::account::{Method, SignIn};
         use zeroize::Zeroizing;
-        let (mut m, first) = SignIn::start(name, Method::Register { password: Zeroizing::new("correct horse battery".into()), invite: None }, PROTOCOL_VERSION, APP_VERSION);
+        let (mut m, first) = SignIn::start(
+            name,
+            Method::Register {
+                password: Zeroizing::new("correct horse battery".into()),
+                invite: None,
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
         let mut c = open_raw(state, &first).await;
         let info = drive(&mut c, &mut m).await.unwrap();
         (c, info, m.finish().unwrap())
@@ -5208,90 +6686,241 @@ mod tests {
 
     #[tokio::test]
     async fn a_dm_kept_for_somebody_offline_reaches_them_sealed_end_to_end() {
-        use voipc_crypto::log::{dm_conv, endorsed, epoch_key, open_entry, seal_entry, unwrap, wrap, LogKey};
+        use voipc_crypto::log::{
+            dm_conv, endorsed, epoch_key, open_entry, seal_entry, unwrap, wrap, LogKey,
+        };
         use voipc_protocol::messages::WrapIn;
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let (mut alice, a, alice_id) = register_with(&state, "alice").await;
         let (mut bob, b, bob_id) = register_with(&state, "bob").await;
         let (alice_lk, bob_lk) = (LogKey::generate(), LogKey::generate());
         let ask = |r: AccountRequest| ClientMessage::Account(r);
-        for (c, lk, id) in [(&mut alice, &alice_lk, &alice_id), (&mut bob, &bob_lk, &bob_id)] {
-            c.send(&ask(AccountRequest::LogKeyPublish { logkey: lk.public(), sig: lk.endorse(&id.identity) })).await;
-            assert!(matches!(c.expect("stored", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::LogKeyStored)));
+        for (c, lk, id) in [
+            (&mut alice, &alice_lk, &alice_id),
+            (&mut bob, &bob_lk, &bob_id),
+        ] {
+            c.send(&ask(AccountRequest::LogKeyPublish {
+                logkey: lk.public(),
+                sig: lk.endorse(&id.identity),
+            }))
+            .await;
+            assert!(matches!(
+                c.expect("stored", |m| reply(m).is_some()).await,
+                ServerMessage::Account(AccountReply::LogKeyStored)
+            ));
         }
         // Alice looks bob's log key up and checks it is his identity's.
-        alice.send(&ask(AccountRequest::LogKeys { accounts: vec![b.id] })).await;
-        let ServerMessage::Account(AccountReply::LogKeysFound { keys }) = alice.expect("keys", |m| reply(m).is_some()).await else { panic!() };
+        alice
+            .send(&ask(AccountRequest::LogKeys {
+                accounts: vec![b.id],
+            }))
+            .await;
+        let ServerMessage::Account(AccountReply::LogKeysFound { keys }) =
+            alice.expect("keys", |m| reply(m).is_some()).await
+        else {
+            panic!()
+        };
         assert_eq!(keys.len(), 1);
-        assert!(endorsed(&keys[0].identity, &keys[0].logkey, &keys[0].sig), "bob's log key is endorsed by bob's identity");
+        assert!(
+            endorsed(&keys[0].identity, &keys[0].logkey, &keys[0].sig),
+            "bob's log key is endorsed by bob's identity"
+        );
         let conv = dm_conv(&a.id, &b.id);
         let k = epoch_key();
         let wraps = vec![
-            WrapIn { recipient: a.id, wrapped: wrap(&alice_lk.public(), &k, &conv, &a.id, 1, &a.id).unwrap() },
-            WrapIn { recipient: b.id, wrapped: wrap(&keys[0].logkey, &k, &conv, &a.id, 1, &b.id).unwrap() },
+            WrapIn {
+                recipient: a.id,
+                wrapped: wrap(&alice_lk.public(), &k, &conv, &a.id, 1, &a.id).unwrap(),
+            },
+            WrapIn {
+                recipient: b.id,
+                wrapped: wrap(&keys[0].logkey, &k, &conv, &a.id, 1, &b.id).unwrap(),
+            },
         ];
-        alice.send(&ask(AccountRequest::EpochPut { conv: conv.clone(), epoch: 1, wraps })).await;
-        assert!(matches!(alice.expect("epoch", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::EpochStored { epoch: 1, .. })));
+        alice
+            .send(&ask(AccountRequest::EpochPut {
+                conv: conv.clone(),
+                epoch: 1,
+                wraps,
+            }))
+            .await;
+        assert!(matches!(
+            alice.expect("epoch", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::EpochStored { epoch: 1, .. })
+        ));
         let env = voipc_crypto::envelope::envelope("m1", "while you were away", None);
         let ct = seal_entry(&k, &conv, &a.id, 1, &alice_lk, &env, 1_700_000_000_000);
-        alice.send(&ask(AccountRequest::LogAppend { conv: conv.clone(), epoch: 1, ct, ttl_secs: None })).await;
-        let ServerMessage::Account(AccountReply::LogAppended { seq, .. }) = alice.expect("appended", |m| reply(m).is_some()).await else { panic!() };
+        alice
+            .send(&ask(AccountRequest::LogAppend {
+                conv: conv.clone(),
+                epoch: 1,
+                ct,
+                ttl_secs: None,
+            }))
+            .await;
+        let ServerMessage::Account(AccountReply::LogAppended { seq, .. }) =
+            alice.expect("appended", |m| reply(m).is_some()).await
+        else {
+            panic!()
+        };
         // A message whose timer is zero is never handed out.
-        let gone = seal_entry(&k, &conv, &a.id, 1, &alice_lk, &voipc_crypto::envelope::envelope("m0", "gone", Some(1)), 1);
-        alice.send(&ask(AccountRequest::LogAppend { conv: conv.clone(), epoch: 1, ct: gone, ttl_secs: Some(0) })).await;
+        let gone = seal_entry(
+            &k,
+            &conv,
+            &a.id,
+            1,
+            &alice_lk,
+            &voipc_crypto::envelope::envelope("m0", "gone", Some(1)),
+            1,
+        );
+        alice
+            .send(&ask(AccountRequest::LogAppend {
+                conv: conv.clone(),
+                epoch: 1,
+                ct: gone,
+                ttl_secs: Some(0),
+            }))
+            .await;
         alice.expect("appended", |m| reply(m).is_some()).await;
 
         // Bob, later: the index names the conversation, the wrap and the entry open.
         bob.send(&ask(AccountRequest::LogIndex)).await;
         // (Past the news of alice's key for him, pushed when she filed it.)
-        let ServerMessage::Account(AccountReply::LogConvs { convs }) =
-            bob.expect("index", |m| matches!(m, ServerMessage::Account(AccountReply::LogConvs { .. }))).await
+        let ServerMessage::Account(AccountReply::LogConvs { convs }) = bob
+            .expect("index", |m| {
+                matches!(m, ServerMessage::Account(AccountReply::LogConvs { .. }))
+            })
+            .await
         else {
             panic!()
         };
-        assert!(convs.iter().any(|(c, last)| *c == conv && *last >= seq), "{convs:?}");
-        bob.send(&ask(AccountRequest::WrapsFetch { conv: conv.clone() })).await;
-        let ServerMessage::Account(AccountReply::Wraps { wraps, .. }) = bob.expect("wraps", |m| reply(m).is_some()).await else { panic!() };
+        assert!(
+            convs.iter().any(|(c, last)| *c == conv && *last >= seq),
+            "{convs:?}"
+        );
+        bob.send(&ask(AccountRequest::WrapsFetch { conv: conv.clone() }))
+            .await;
+        let ServerMessage::Account(AccountReply::Wraps { wraps, .. }) =
+            bob.expect("wraps", |m| reply(m).is_some()).await
+        else {
+            panic!()
+        };
         assert_eq!(wraps.len(), 1, "only the wrap for bob");
-        let key = unwrap(&bob_lk, &wraps[0].wrapped, &conv, &wraps[0].owner, wraps[0].epoch, &b.id).unwrap();
-        bob.send(&ask(AccountRequest::LogFetch { conv: conv.clone(), after: 0 })).await;
-        let ServerMessage::Account(AccountReply::LogPage { entries, more, .. }) = bob.expect("page", |m| reply(m).is_some()).await else { panic!() };
+        let key = unwrap(
+            &bob_lk,
+            &wraps[0].wrapped,
+            &conv,
+            &wraps[0].owner,
+            wraps[0].epoch,
+            &b.id,
+        )
+        .unwrap();
+        bob.send(&ask(AccountRequest::LogFetch {
+            conv: conv.clone(),
+            after: 0,
+        }))
+        .await;
+        let ServerMessage::Account(AccountReply::LogPage { entries, more, .. }) =
+            bob.expect("page", |m| reply(m).is_some()).await
+        else {
+            panic!()
+        };
         assert!(!more);
         assert_eq!(entries.len(), 1, "the zero-timer entry is not handed out");
-        let (envelope, _) = open_entry(&key, &conv, &entries[0].sender, entries[0].epoch, &alice_lk.public(), &entries[0].ct).unwrap();
-        assert_eq!(voipc_crypto::envelope::open_envelope(&envelope).text, "while you were away");
+        let (envelope, _) = open_entry(
+            &key,
+            &conv,
+            &entries[0].sender,
+            entries[0].epoch,
+            &alice_lk.public(),
+            &entries[0].ct,
+        )
+        .unwrap();
+        assert_eq!(
+            voipc_crypto::envelope::open_envelope(&envelope).text,
+            "while you were away"
+        );
 
         // Nobody else reads it, and wraps go to members only.
         let (mut carol, c, _) = register_with(&state, "carol").await;
-        carol.send(&ask(AccountRequest::LogFetch { conv: conv.clone(), after: 0 })).await;
-        assert!(matches!(carol.expect("refused", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::Error { .. })));
-        let outsider = vec![WrapIn { recipient: c.id, wrapped: vec![0; 93] }];
-        alice.send(&ask(AccountRequest::EpochPut { conv: conv.clone(), epoch: 2, wraps: outsider })).await;
-        assert!(matches!(alice.expect("refused", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::Error { .. })));
+        carol
+            .send(&ask(AccountRequest::LogFetch {
+                conv: conv.clone(),
+                after: 0,
+            }))
+            .await;
+        assert!(matches!(
+            carol.expect("refused", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::Error { .. })
+        ));
+        let outsider = vec![WrapIn {
+            recipient: c.id,
+            wrapped: vec![0; 93],
+        }];
+        alice
+            .send(&ask(AccountRequest::EpochPut {
+                conv: conv.clone(),
+                epoch: 2,
+                wraps: outsider,
+            }))
+            .await;
+        assert!(matches!(
+            alice.expect("refused", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::Error { .. })
+        ));
         let mut guest = connect(&state, "dan#1234", IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
-        guest.send(&ask(AccountRequest::LogFetch { conv, after: 0 })).await;
-        assert!(matches!(guest.expect("refused", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::Error { .. })));
+        guest
+            .send(&ask(AccountRequest::LogFetch { conv, after: 0 }))
+            .await;
+        assert!(matches!(
+            guest.expect("refused", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::Error { .. })
+        ));
     }
 
     #[tokio::test]
     async fn a_relay_that_keeps_no_messages_refuses_them() {
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         // `cloud = false`, after the fact: the flag the operator sets.
-        let mut relay = std::sync::Arc::try_unwrap(state).ok().expect("one owner").accounts.take().unwrap();
+        let mut relay = std::sync::Arc::try_unwrap(state)
+            .ok()
+            .expect("one owner")
+            .accounts
+            .take()
+            .unwrap();
         std::sync::Arc::get_mut(&mut relay).unwrap().cloud = false;
-        let mut s = ServerState::new(&ServerConfig::default(), ServerSettings::default(), Vec::new(), "t".into());
+        let mut s = ServerState::new(
+            &ServerConfig::default(),
+            ServerSettings::default(),
+            Vec::new(),
+            "t".into(),
+        );
         s.accounts = Some(relay);
         let state = Arc::new(s);
         let (mut a, info) = register(&state, "erin").await;
         let conv = voipc_protocol::conv::dm_conv(&info.id, &[0xff; 16]);
-        a.send(&ClientMessage::Account(AccountRequest::LogAppend { conv, epoch: 1, ct: vec![1; 40], ttl_secs: None })).await;
-        let ServerMessage::Account(AccountReply::Error { reason, .. }) = a.expect("refused", |m| reply(m).is_some()).await else { panic!() };
+        a.send(&ClientMessage::Account(AccountRequest::LogAppend {
+            conv,
+            epoch: 1,
+            ct: vec![1; 40],
+            ttl_secs: None,
+        }))
+        .await;
+        let ServerMessage::Account(AccountReply::Error { reason, .. }) =
+            a.expect("refused", |m| reply(m).is_some()).await
+        else {
+            panic!()
+        };
         assert!(reason.contains("keeps no messages"), "{reason}");
     }
 
     /// Feeds every account reply to `sync` and sends what it answers, until
     /// the relay has been quiet for a moment. Returns the events.
-    async fn pump(c: &mut Client, sync: &mut voipc_crypto::sync::AccountSync, first: Vec<ClientMessage>) -> Vec<voipc_crypto::sync::Event> {
+    async fn pump(
+        c: &mut Client,
+        sync: &mut voipc_crypto::sync::AccountSync,
+        first: Vec<ClientMessage>,
+    ) -> Vec<voipc_crypto::sync::Event> {
         for m in first {
             c.send(&m).await;
         }
@@ -5307,7 +6936,9 @@ mod tests {
                     }
                 }
             };
-            let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(400), next).await else { return events };
+            let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(400), next).await else {
+                return events;
+            };
             if let ServerMessage::Account(r) = msg {
                 if let Some((out, ev)) = sync.on_reply(&r) {
                     for m in out {
@@ -5319,9 +6950,19 @@ mod tests {
         }
     }
 
-    async fn sign_in_password(state: &Arc<ServerState>, name: &str) -> (Client, AccountInfo, voipc_crypto::account::SignedIn) {
+    async fn sign_in_password(
+        state: &Arc<ServerState>,
+        name: &str,
+    ) -> (Client, AccountInfo, voipc_crypto::account::SignedIn) {
         use voipc_crypto::account::{Method, SignIn};
-        let (mut m, first) = SignIn::start(name, Method::Password { password: zeroize::Zeroizing::new("correct horse battery".into()) }, PROTOCOL_VERSION, APP_VERSION);
+        let (mut m, first) = SignIn::start(
+            name,
+            Method::Password {
+                password: zeroize::Zeroizing::new("correct horse battery".into()),
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
         let mut c = open_raw(state, &first).await;
         let info = drive(&mut c, &mut m).await.unwrap();
         (c, info, m.finish().unwrap())
@@ -5341,12 +6982,22 @@ mod tests {
 
         // Off by default: nothing is kept until alice says so.
         let env = voipc_crypto::envelope::envelope("m1", "hi bob, while you were away", None);
-        assert!(sa.send_dm(b.id, env.clone(), 1_700_000_000_000, None).is_empty(), "opt-in");
-        let save = sa.set_prefs(Prefs { cloud: true, asked: true });
+        assert!(
+            sa.send_dm(b.id, env.clone(), 1_700_000_000_000, None)
+                .is_empty(),
+            "opt-in"
+        );
+        let save = sa.set_prefs(Prefs {
+            cloud: true,
+            asked: true,
+        });
         pump(&mut alice, &mut sa, save).await;
         let out = sa.send_dm(b.id, env, 1_700_000_000_000, None);
         let events = pump(&mut alice, &mut sa, out).await;
-        assert!(events.iter().any(|e| matches!(e, Event::Kept { .. })), "{events:?}");
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Kept { .. })),
+            "{events:?}"
+        );
 
         // Bob comes back: it is there, from alice, opened and proven.
         let (mut bob2, _, bob_signed2) = sign_in_password(&state, "bob").await;
@@ -5355,27 +7006,54 @@ mod tests {
         let got: Vec<_> = events
             .iter()
             .filter_map(|e| match e {
-                Event::Message { envelope, from_me, peer, peer_name, .. } => {
-                    Some((voipc_crypto::envelope::open_envelope(envelope).text, *from_me, *peer, peer_name.clone()))
-                }
+                Event::Message {
+                    envelope,
+                    from_me,
+                    peer,
+                    peer_name,
+                    ..
+                } => Some((
+                    voipc_crypto::envelope::open_envelope(envelope).text,
+                    *from_me,
+                    *peer,
+                    peer_name.clone(),
+                )),
                 _ => None,
             })
             .collect();
-        assert_eq!(got, vec![("hi bob, while you were away".to_string(), false, a.id, "alice".to_string())]);
+        assert_eq!(
+            got,
+            vec![(
+                "hi bob, while you were away".to_string(),
+                false,
+                a.id,
+                "alice".to_string()
+            )]
+        );
         // Read once: with this device's cursors it is not handed over again.
         let memory = sb2.memory();
         drop(bob2);
         let (mut bob3, _, bob_signed3) = sign_in_password(&state, "bob").await;
         let (mut sb3, first) = AccountSync::start(&bob_signed3, b.id, memory, true);
         let again = pump(&mut bob3, &mut sb3, first).await;
-        assert!(!again.iter().any(|e| matches!(e, Event::Message { .. })), "{again:?}");
+        assert!(
+            !again.iter().any(|e| matches!(e, Event::Message { .. })),
+            "{again:?}"
+        );
         // And alice's other device sees her own message as hers.
         drop(alice);
         let (mut alice2, _, alice_signed2) = sign_in_password(&state, "alice").await;
         let (mut sa2, first) = AccountSync::start(&alice_signed2, a.id, Default::default(), true);
         let mine = pump(&mut alice2, &mut sa2, first).await;
-        assert!(mine.iter().any(|e| matches!(e, Event::Message { from_me: true, peer, .. } if *peer == b.id)), "{mine:?}");
-        assert!(sa2.prefs().cloud, "the choice followed her to the other device");
+        assert!(
+            mine.iter()
+                .any(|e| matches!(e, Event::Message { from_me: true, peer, .. } if *peer == b.id)),
+            "{mine:?}"
+        );
+        assert!(
+            sa2.prefs().cloud,
+            "the choice followed her to the other device"
+        );
     }
 
     // ── channel logs ──
@@ -5386,14 +7064,33 @@ mod tests {
         let mut config = ServerConfig::default();
         config.accounts.mode = AccountsMode::Optional;
         config.accounts.registration = RegistrationMode::Open;
-        let db = TempDb(std::env::temp_dir().join(format!("voipc-relay-{}.db", hex::encode(rand::random::<[u8; 8]>()))));
-        let store = l4f_accounts::store::Store::connect(&format!("sqlite://{}", db.0.display())).await.unwrap();
-        let relay = crate::accounts::Relay::open_with(&config.accounts, store, &[9u8; 32]).await.unwrap();
-        let lounge = crate::channels::ChannelEntry { name: "lounge".into(), text: true, ..Default::default() };
-        let mut state = ServerState::new(&config, ServerSettings::default(), vec![lounge], "test-admin-token".into());
+        let db = TempDb(std::env::temp_dir().join(format!(
+            "voipc-relay-{}.db",
+            hex::encode(rand::random::<[u8; 8]>())
+        )));
+        let store = l4f_accounts::store::Store::connect(&format!("sqlite://{}", db.0.display()))
+            .await
+            .unwrap();
+        let relay = crate::accounts::Relay::open_with(&config.accounts, store, &[9u8; 32])
+            .await
+            .unwrap();
+        let lounge = crate::channels::ChannelEntry {
+            name: "lounge".into(),
+            text: true,
+            ..Default::default()
+        };
+        let mut state = ServerState::new(
+            &config,
+            ServerSettings::default(),
+            vec![lounge],
+            "test-admin-token".into(),
+        );
         state.accounts = Some(Arc::new(relay));
         let log = state.channels.get_mut()[&1].info.log.clone();
-        assert!(log.starts_with("c:"), "a persistent channel on a relay with accounts keeps a log: {log:?}");
+        assert!(
+            log.starts_with("c:"),
+            "a persistent channel on a relay with accounts keeps a log: {log:?}"
+        );
         (Arc::new(state), db, log)
     }
 
@@ -5405,12 +7102,20 @@ mod tests {
     }
 
     /// Signs `name` up with cloud copies on, in channel 1, keeping its log.
-    async fn member(state: &Arc<ServerState>, log: &str, name: &str, share: bool) -> (Client, AccountInfo, voipc_crypto::sync::AccountSync) {
+    async fn member(
+        state: &Arc<ServerState>,
+        log: &str,
+        name: &str,
+        share: bool,
+    ) -> (Client, AccountInfo, voipc_crypto::sync::AccountSync) {
         use voipc_crypto::sync::{AccountSync, Prefs};
         let (mut c, info, signed) = register_with(state, name).await;
         let (mut s, first) = AccountSync::start(&signed, info.id, Default::default(), share);
         pump(&mut c, &mut s, first).await;
-        let save = s.set_prefs(Prefs { cloud: true, asked: true });
+        let save = s.set_prefs(Prefs {
+            cloud: true,
+            asked: true,
+        });
         pump(&mut c, &mut s, save).await;
         into_lounge(state, &info.id).await;
         let out = s.enter(log);
@@ -5423,9 +7128,14 @@ mod tests {
         events
             .iter()
             .filter_map(|e| match e {
-                voipc_crypto::sync::Event::ChannelMessage { sender_name, envelope, .. } => {
-                    Some((sender_name.clone(), voipc_crypto::envelope::open_envelope(envelope).text))
-                }
+                voipc_crypto::sync::Event::ChannelMessage {
+                    sender_name,
+                    envelope,
+                    ..
+                } => Some((
+                    sender_name.clone(),
+                    voipc_crypto::envelope::open_envelope(envelope).text,
+                )),
                 _ => None,
             })
             .collect()
@@ -5436,7 +7146,9 @@ mod tests {
         events
             .iter()
             .filter_map(|e| match e {
-                voipc_crypto::sync::Event::Readers { accounts, history, .. } => Some((accounts.iter().map(|(_, n)| n.clone()).collect(), *history)),
+                voipc_crypto::sync::Event::Readers {
+                    accounts, history, ..
+                } => Some((accounts.iter().map(|(_, n)| n.clone()).collect(), *history)),
                 _ => None,
             })
             .collect()
@@ -5458,14 +7170,20 @@ mod tests {
         // told who that is.
         let out = sa.send_channel(&log, say("m1", "for later"), 1_700_000_000_000, None);
         let events = pump(&mut alice, &mut sa, out).await;
-        assert!(events.iter().any(|e| matches!(e, Event::Kept { .. })), "{events:?}");
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Kept { .. })),
+            "{events:?}"
+        );
         assert_eq!(readers(&events), vec![(vec!["bob".to_string()], false)]);
 
         // Bob, on another device and not in the channel: it is there for him.
         let (mut bob2, _, signed) = sign_in_password(&state, "bob").await;
         let (mut sb2, first) = AccountSync::start(&signed, b.id, Default::default(), true);
         let events = pump(&mut bob2, &mut sb2, first).await;
-        assert_eq!(channel_texts(&events), vec![("alice".to_string(), "for later".to_string())]);
+        assert_eq!(
+            channel_texts(&events),
+            vec![("alice".to_string(), "for later".to_string())]
+        );
         // Read once.
         let memory = sb2.memory();
         drop(bob2);
@@ -5477,10 +7195,24 @@ mod tests {
         // start keeping it from outside.
         let (mut carol, _, _) = register_with(&state, "carol").await;
         let ask = |r: AccountRequest| ClientMessage::Account(r);
-        carol.send(&ask(AccountRequest::LogFetch { conv: log.clone(), after: 0 })).await;
-        assert!(matches!(carol.expect("refused", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::Error { .. })));
-        carol.send(&ask(AccountRequest::LogJoin { conv: log.clone() })).await;
-        let ServerMessage::Account(AccountReply::Error { reason, .. }) = carol.expect("refused", |m| reply(m).is_some()).await else { panic!() };
+        carol
+            .send(&ask(AccountRequest::LogFetch {
+                conv: log.clone(),
+                after: 0,
+            }))
+            .await;
+        assert!(matches!(
+            carol.expect("refused", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::Error { .. })
+        ));
+        carol
+            .send(&ask(AccountRequest::LogJoin { conv: log.clone() }))
+            .await;
+        let ServerMessage::Account(AccountReply::Error { reason, .. }) =
+            carol.expect("refused", |m| reply(m).is_some()).await
+        else {
+            panic!()
+        };
         assert!(reason.contains("Join the channel"), "{reason}");
     }
 
@@ -5491,13 +7223,26 @@ mod tests {
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let (mut c, info) = register(&state, "sam").await;
         crate::accounts::revalidate(&state).await;
-        assert!(state.account_sessions.contains_key(&info.id), "nothing changed, nothing ends");
+        assert!(
+            state.account_sessions.contains_key(&info.id),
+            "nothing changed, nothing ends"
+        );
         // What `voipc-server admin reset-2fa` does to the account's sessions.
         let relay = state.accounts.clone().unwrap();
-        relay.store().delete_sessions_of(l4f_accounts::model::AccountId(info.id), None).await.unwrap();
+        relay
+            .store()
+            .delete_sessions_of(l4f_accounts::model::AccountId(info.id), None)
+            .await
+            .unwrap();
         crate::accounts::revalidate(&state).await;
-        let msg = c.expect("Disconnected", |m| matches!(m, ServerMessage::Disconnected { .. })).await;
-        assert!(matches!(msg, ServerMessage::Disconnected { reason } if reason.contains("signed out")));
+        let msg = c
+            .expect("Disconnected", |m| {
+                matches!(m, ServerMessage::Disconnected { .. })
+            })
+            .await;
+        assert!(
+            matches!(msg, ServerMessage::Disconnected { reason } if reason.contains("signed out"))
+        );
     }
 
     /// A role given from the shell to an account without codes changes none of
@@ -5509,17 +7254,35 @@ mod tests {
         let (mut c, info) = register(&state, "rita").await;
         let relay = state.accounts.clone().unwrap();
         let ctx = relay.ctx(IpAddr::V4(Ipv4Addr::LOCALHOST), "test");
-        relay.accounts.grant_role_as_host(&ctx, l4f_accounts::model::AccountId(info.id), "moderator").await.unwrap();
+        relay
+            .accounts
+            .grant_role_as_host(&ctx, l4f_accounts::model::AccountId(info.id), "moderator")
+            .await
+            .unwrap();
         crate::accounts::revalidate(&state).await;
-        let ServerMessage::Account(AccountReply::Info(now)) = c.expect("Info", |m| matches!(m, ServerMessage::Account(AccountReply::Info(_)))).await else {
+        let ServerMessage::Account(AccountReply::Info(now)) = c
+            .expect("Info", |m| {
+                matches!(m, ServerMessage::Account(AccountReply::Info(_)))
+            })
+            .await
+        else {
             unreachable!()
         };
         assert!(now.needs_2fa && now.scopes.is_empty(), "{now:?}");
         // Told once: the next check finds nothing new.
         crate::accounts::revalidate(&state).await;
-        c.send(&ClientMessage::Account(AccountRequest::LogKeys { accounts: Vec::new() })).await;
+        c.send(&ClientMessage::Account(AccountRequest::LogKeys {
+            accounts: Vec::new(),
+        }))
+        .await;
         let msg = c.expect("a reply", |m| reply(m).is_some()).await;
-        assert!(matches!(msg, ServerMessage::Account(AccountReply::LogKeysFound { .. })), "{msg:?}");
+        assert!(
+            matches!(
+                msg,
+                ServerMessage::Account(AccountReply::LogKeysFound { .. })
+            ),
+            "{msg:?}"
+        );
     }
 
     /// Codes are the account's first second factor: l4f ends its other
@@ -5530,9 +7293,18 @@ mod tests {
         let (mut c, _) = register(&state, "tess").await;
         totp_on(&mut c).await;
         crate::accounts::revalidate(&state).await;
-        c.send(&ClientMessage::Account(AccountRequest::LogKeys { accounts: Vec::new() })).await;
+        c.send(&ClientMessage::Account(AccountRequest::LogKeys {
+            accounts: Vec::new(),
+        }))
+        .await;
         let msg = c
-            .expect("a reply", |m| matches!(m, ServerMessage::Account(AccountReply::LogKeysFound { .. }) | ServerMessage::Disconnected { .. }))
+            .expect("a reply", |m| {
+                matches!(
+                    m,
+                    ServerMessage::Account(AccountReply::LogKeysFound { .. })
+                        | ServerMessage::Disconnected { .. }
+                )
+            })
             .await;
         assert!(matches!(msg, ServerMessage::Account(_)), "{msg:?}");
     }
@@ -5551,12 +7323,33 @@ mod tests {
         crate::state::test_support::put_in_channel(&state, 1, &[(uid(si), si)]).await;
         let joined_one = |m: &ServerMessage| matches!(m, ServerMessage::UserJoined { user } if user.channel_id == 1);
         for hide in [false, true] {
-            state.channels.write().await.get_mut(&1).unwrap().info.hide_members = hide;
+            state
+                .channels
+                .write()
+                .await
+                .get_mut(&1)
+                .unwrap()
+                .info
+                .hide_members = hide;
             broadcast_user_joined(&state, user_info_for(&state, uid(sj), sj, 1)).await;
-            let ServerMessage::UserJoined { user } = out.expect("UserJoined", joined_one).await else { unreachable!() };
-            assert_eq!((user.account, user.username.as_str()), (None, ""), "an outsider gets the count, no account (hide_members={hide})");
-            let ServerMessage::UserJoined { user } = inside.expect("UserJoined", joined_one).await else { unreachable!() };
-            assert_eq!(user.account, Some(j.id), "a member sees who joined (hide_members={hide})");
+            let ServerMessage::UserJoined { user } = out.expect("UserJoined", joined_one).await
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                (user.account, user.username.as_str()),
+                (None, ""),
+                "an outsider gets the count, no account (hide_members={hide})"
+            );
+            let ServerMessage::UserJoined { user } = inside.expect("UserJoined", joined_one).await
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                user.account,
+                Some(j.id),
+                "a member sees who joined (hide_members={hide})"
+            );
         }
     }
 
@@ -5565,11 +7358,30 @@ mod tests {
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let relay = state.accounts.clone().unwrap();
         let a: IpAddr = "203.0.113.5".parse().unwrap();
-        let held: Vec<_> = (0..4).map(|_| relay.pending_slot(a).expect("a share")).collect();
-        assert!(relay.pending_slot(a).is_none(), "that address's share is used up");
-        assert!(relay.pending_slot("203.0.113.6".parse().unwrap()).is_some(), "another address still gets in");
-        let v6: Vec<_> = (0..4).map(|i| relay.pending_slot(format!("2001:db8::{i}").parse().unwrap()).expect("a share")).collect();
-        assert!(relay.pending_slot("2001:db8::99".parse().unwrap()).is_none(), "one /64 is one address");
+        let held: Vec<_> = (0..4)
+            .map(|_| relay.pending_slot(a).expect("a share"))
+            .collect();
+        assert!(
+            relay.pending_slot(a).is_none(),
+            "that address's share is used up"
+        );
+        assert!(
+            relay.pending_slot("203.0.113.6".parse().unwrap()).is_some(),
+            "another address still gets in"
+        );
+        let v6: Vec<_> = (0..4)
+            .map(|i| {
+                relay
+                    .pending_slot(format!("2001:db8::{i}").parse().unwrap())
+                    .expect("a share")
+            })
+            .collect();
+        assert!(
+            relay
+                .pending_slot("2001:db8::99".parse().unwrap())
+                .is_none(),
+            "one /64 is one address"
+        );
         drop((held, v6));
         assert!(relay.pending_slot(a).is_some(), "given back when they end");
     }
@@ -5578,12 +7390,20 @@ mod tests {
     async fn an_open_sign_up_needs_its_puzzle_solved() {
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let mut c = open_account(&state, "gus", AccountStart::Register { invite: None }).await;
-        let Some(ServerMessage::AuthStep(AuthStep::Salt { pow: Some(pow), .. })) = c.next().await else {
+        let Some(ServerMessage::AuthStep(AuthStep::Salt { pow: Some(pow), .. })) = c.next().await
+        else {
             panic!("an open relay hands out a proof of work");
         };
-        let register = AuthContinue::Register { auth_secret: SECRET.to_vec(), altcha: String::new(), ts: pow.ts, vault: Vec::new() };
+        let register = AuthContinue::Register {
+            auth_secret: SECRET.to_vec(),
+            altcha: String::new(),
+            ts: pow.ts,
+            vault: Vec::new(),
+        };
         c.send(&ClientMessage::AuthContinue(register)).await;
-        assert!(matches!(c.next().await, Some(ServerMessage::AuthError { reason }) if reason.contains("puzzle")));
+        assert!(
+            matches!(c.next().await, Some(ServerMessage::AuthError { reason }) if reason.contains("puzzle"))
+        );
     }
 
     /// 1.0 (A5): bans with accounts. The account goes wherever it signs in
@@ -5595,58 +7415,174 @@ mod tests {
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let (mut gina, _) = register(&state, "gina").await;
-        gina.send(&ClientMessage::AdminLogin { token: "test-admin-token".into() }).await;
+        gina.send(&ClientMessage::AdminLogin {
+            token: "test-admin-token".into(),
+        })
+        .await;
         gina.expect("Info", |m| reply(m).is_some()).await;
         let secret = totp_on(&mut gina).await;
-        gina.expect("AdminStatus", |m| matches!(m, ServerMessage::AdminStatus { is_admin: true, .. })).await;
+        gina.expect("AdminStatus", |m| {
+            matches!(m, ServerMessage::AdminStatus { is_admin: true, .. })
+        })
+        .await;
         let (mut hank, hi) = register(&state, "hank").await;
-        let hank_uid = state.sessions.get(&*state.account_sessions.get(&hi.id).unwrap()).unwrap().user_id;
-        let bans_reply = |m: &ServerMessage| matches!(m, ServerMessage::AdminBans { .. } | ServerMessage::AdminError { .. });
+        let hank_uid = state
+            .sessions
+            .get(&*state.account_sessions.get(&hi.id).unwrap())
+            .unwrap()
+            .user_id;
+        let bans_reply = |m: &ServerMessage| {
+            matches!(
+                m,
+                ServerMessage::AdminBans { .. } | ServerMessage::AdminError { .. }
+            )
+        };
 
-        gina.send(&ClientMessage::AdminBan { user_id: hank_uid, reason: "spam".into(), duration_secs: 0, account: true }).await;
-        hank.expect("Disconnected", |m| matches!(m, ServerMessage::Disconnected { reason } if reason.contains("spam"))).await;
-        let ServerMessage::AdminBans { bans } = gina.expect("the list", bans_reply).await else { panic!("refused") };
+        gina.send(&ClientMessage::AdminBan {
+            user_id: hank_uid,
+            reason: "spam".into(),
+            duration_secs: 0,
+            account: true,
+        })
+        .await;
+        hank.expect(
+            "Disconnected",
+            |m| matches!(m, ServerMessage::Disconnected { reason } if reason.contains("spam")),
+        )
+        .await;
+        let ServerMessage::AdminBans { bans } = gina.expect("the list", bans_reply).await else {
+            panic!("refused")
+        };
         assert_eq!(bans.len(), 2, "{bans:?}");
-        assert!(bans[0].account && bans[0].label == "hank" && bans[0].by == "gina" && bans[0].expires_in_secs.is_none(), "accounts first: {bans:?}");
+        assert!(
+            bans[0].account
+                && bans[0].label == "hank"
+                && bans[0].by == "gina"
+                && bans[0].expires_in_secs.is_none(),
+            "accounts first: {bans:?}"
+        );
         assert!(!bans[1].account && bans[1].label == "hank", "{bans:?}");
-        let gina_sid = *state.account_sessions.get(&state.sessions.iter().find(|e| e.value().username == "gina").unwrap().account.as_ref().unwrap().user.id.0).unwrap();
-        assert!(state.sessions.contains_key(&gina_sid), "the admin on the same address stays");
-        assert!(refusal(&state, "lee#1234").await.contains("You are banned"), "a guest from the address is kept out");
+        let gina_sid = *state
+            .account_sessions
+            .get(
+                &state
+                    .sessions
+                    .iter()
+                    .find(|e| e.value().username == "gina")
+                    .unwrap()
+                    .account
+                    .as_ref()
+                    .unwrap()
+                    .user
+                    .id
+                    .0,
+            )
+            .unwrap();
+        assert!(
+            state.sessions.contains_key(&gina_sid),
+            "the admin on the same address stays"
+        );
+        assert!(
+            refusal(&state, "lee#1234").await.contains("You are banned"),
+            "a guest from the address is kept out"
+        );
 
         // The admin signs in again from the banned address: password, code, in.
         let mut c = open_account(&state, "gina", AccountStart::Login).await;
         c.next().await;
-        c.send(&ClientMessage::AuthContinue(AuthContinue::Secret { auth_secret: SECRET.to_vec() })).await;
-        assert!(matches!(c.next().await, Some(ServerMessage::AuthStep(AuthStep::NeedTotp))));
-        let code = format!("{:06}", l4f_accounts::totp::code_at(&secret, l4f_accounts::util::now() / 30 + 1));
-        c.send(&ClientMessage::AuthContinue(AuthContinue::Totp { code })).await;
-        c.expect("Vault", |m| matches!(m, ServerMessage::AuthStep(AuthStep::Vault { .. }))).await;
+        c.send(&ClientMessage::AuthContinue(AuthContinue::Secret {
+            auth_secret: SECRET.to_vec(),
+        }))
+        .await;
+        assert!(matches!(
+            c.next().await,
+            Some(ServerMessage::AuthStep(AuthStep::NeedTotp))
+        ));
+        let code = format!(
+            "{:06}",
+            l4f_accounts::totp::code_at(&secret, l4f_accounts::util::now() / 30 + 1)
+        );
+        c.send(&ClientMessage::AuthContinue(AuthContinue::Totp { code }))
+            .await;
+        c.expect("Vault", |m| {
+            matches!(m, ServerMessage::AuthStep(AuthStep::Vault { .. }))
+        })
+        .await;
         c.send(&keys(&IDENTITY, false)).await;
-        c.expect("Authenticated", |m| matches!(m, ServerMessage::Authenticated { account: Some(_), .. })).await;
+        c.expect("Authenticated", |m| {
+            matches!(
+                m,
+                ServerMessage::Authenticated {
+                    account: Some(_),
+                    ..
+                }
+            )
+        })
+        .await;
 
         // The address lifted, the account still goes, from anywhere.
         c.send(&ClientMessage::AdminUnban { id: bans[1].id }).await;
-        let ServerMessage::AdminBans { bans: left } = c.expect("the list", bans_reply).await else { panic!("refused") };
+        let ServerMessage::AdminBans { bans: left } = c.expect("the list", bans_reply).await else {
+            panic!("refused")
+        };
         assert_eq!(left.len(), 1);
         let mut again = login(&state, "hank", &IDENTITY, false).await;
-        let ServerMessage::AuthError { reason } = again.expect("refusal", |m| matches!(m, ServerMessage::AuthError { .. })).await else { unreachable!() };
-        assert!(reason.contains("This account is banned") && reason.contains("spam"), "{reason}");
+        let ServerMessage::AuthError { reason } = again
+            .expect("refusal", |m| matches!(m, ServerMessage::AuthError { .. }))
+            .await
+        else {
+            unreachable!()
+        };
+        assert!(
+            reason.contains("This account is banned") && reason.contains("spam"),
+            "{reason}"
+        );
         drop(connect(&state, "lee#1234", lo).await); // guests are back
 
         // Kept in the database: a restarted relay reads it back.
-        let mut restarted = ServerState::new(&ServerConfig::default(), ServerSettings::default(), Vec::new(), "t".into());
+        let mut restarted = ServerState::new(
+            &ServerConfig::default(),
+            ServerSettings::default(),
+            Vec::new(),
+            "t".into(),
+        );
         restarted.accounts = state.accounts.clone();
         crate::bans::load(&restarted).await.unwrap();
-        assert!(crate::bans::refusal(&restarted, "198.51.100.1".parse().unwrap(), Some((hi.id, false))).is_some());
+        assert!(crate::bans::refusal(
+            &restarted,
+            "198.51.100.1".parse().unwrap(),
+            Some((hi.id, false))
+        )
+        .is_some());
 
         // An account that is not here, by name.
         let (ivy, _) = register(&state, "ivy").await;
         drop(ivy);
-        c.send(&ClientMessage::AdminBanAccount { name: "Ivy".into(), reason: "later".into(), duration_secs: 3600 }).await;
-        let ServerMessage::AdminBans { bans } = c.expect("the list", bans_reply).await else { panic!("refused") };
-        assert!(bans.iter().any(|b| b.account && b.label == "ivy" && b.expires_in_secs.is_some_and(|s| s <= 3600)), "{bans:?}");
-        c.send(&ClientMessage::AdminBanAccount { name: "nobody".into(), reason: String::new(), duration_secs: 0 }).await;
-        assert!(matches!(c.expect("refused", bans_reply).await, ServerMessage::AdminError { .. }));
+        c.send(&ClientMessage::AdminBanAccount {
+            name: "Ivy".into(),
+            reason: "later".into(),
+            duration_secs: 3600,
+        })
+        .await;
+        let ServerMessage::AdminBans { bans } = c.expect("the list", bans_reply).await else {
+            panic!("refused")
+        };
+        assert!(
+            bans.iter().any(|b| b.account
+                && b.label == "ivy"
+                && b.expires_in_secs.is_some_and(|s| s <= 3600)),
+            "{bans:?}"
+        );
+        c.send(&ClientMessage::AdminBanAccount {
+            name: "nobody".into(),
+            reason: String::new(),
+            duration_secs: 0,
+        })
+        .await;
+        assert!(matches!(
+            c.expect("refused", bans_reply).await,
+            ServerMessage::AdminError { .. }
+        ));
     }
 
     /// Moderators moderate people: not admins, not each other, and never with
@@ -5660,30 +7596,96 @@ mod tests {
         state.sessions.get_mut(&sid(&mi.id)).unwrap().is_moderator = true;
         state.sessions.get_mut(&sid(&bi.id)).unwrap().is_admin = true;
         let boss_uid = state.sessions.get(&sid(&bi.id)).unwrap().user_id;
-        let admin_reply = |m: &ServerMessage| matches!(m, ServerMessage::AdminError { .. } | ServerMessage::AdminBans { .. });
-        m.send(&ClientMessage::AdminKick { user_id: boss_uid, reason: String::new() }).await;
-        let ServerMessage::AdminError { reason } = m.expect("refused", admin_reply).await else { panic!("refused") };
+        let admin_reply = |m: &ServerMessage| {
+            matches!(
+                m,
+                ServerMessage::AdminError { .. } | ServerMessage::AdminBans { .. }
+            )
+        };
+        m.send(&ClientMessage::AdminKick {
+            user_id: boss_uid,
+            reason: String::new(),
+        })
+        .await;
+        let ServerMessage::AdminError { reason } = m.expect("refused", admin_reply).await else {
+            panic!("refused")
+        };
         assert!(reason.contains("only an admin"), "{reason}");
         assert!(state.sessions.contains_key(&sid(&bi.id)), "the admin stays");
         m.send(&ClientMessage::AdminListBans).await;
-        assert!(matches!(m.expect("refused", admin_reply).await, ServerMessage::AdminError { .. }), "no addresses for a moderator");
+        assert!(
+            matches!(
+                m.expect("refused", admin_reply).await,
+                ServerMessage::AdminError { .. }
+            ),
+            "no addresses for a moderator"
+        );
         // A guest from elsewhere: banned, and the moderator is told no address.
         let mut pat = connect(&state, "pat#1234", "203.0.113.9".parse().unwrap()).await;
-        let pat_uid = state.sessions.iter().find(|e| e.value().username == "pat#1234").map(|e| e.value().user_id).unwrap();
+        let pat_uid = state
+            .sessions
+            .iter()
+            .find(|e| e.value().username == "pat#1234")
+            .map(|e| e.value().user_id)
+            .unwrap();
         // Out of a channel, too: the admin stays, the guest goes.
         let uid = |a: &[u8; 16]| state.sessions.get(&sid(a)).unwrap().user_id;
         let pat_sid = *state.user_to_session.get(&pat_uid).unwrap();
-        crate::state::test_support::put_in_channel(&state, 1, &[(uid(&mi.id), sid(&mi.id)), (boss_uid, sid(&bi.id)), (pat_uid, pat_sid)]).await;
-        m.send(&ClientMessage::KickUser { channel_id: 1, user_id: boss_uid }).await;
-        let ServerMessage::ChannelError { reason } = m.expect("refused", |m| matches!(m, ServerMessage::ChannelError { .. })).await else { unreachable!() };
+        crate::state::test_support::put_in_channel(
+            &state,
+            1,
+            &[
+                (uid(&mi.id), sid(&mi.id)),
+                (boss_uid, sid(&bi.id)),
+                (pat_uid, pat_sid),
+            ],
+        )
+        .await;
+        m.send(&ClientMessage::KickUser {
+            channel_id: 1,
+            user_id: boss_uid,
+        })
+        .await;
+        let ServerMessage::ChannelError { reason } = m
+            .expect("refused", |m| {
+                matches!(m, ServerMessage::ChannelError { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
         assert!(reason.contains("only an admin"), "{reason}");
-        assert!(state.channels.read().await[&1].members.contains(&boss_uid), "the admin stays in the channel");
-        m.send(&ClientMessage::KickUser { channel_id: 1, user_id: pat_uid }).await;
-        let ServerMessage::Kicked { reason, .. } = pat.expect("Kicked", |m| matches!(m, ServerMessage::Kicked { .. })).await else { unreachable!() };
+        assert!(
+            state.channels.read().await[&1].members.contains(&boss_uid),
+            "the admin stays in the channel"
+        );
+        m.send(&ClientMessage::KickUser {
+            channel_id: 1,
+            user_id: pat_uid,
+        })
+        .await;
+        let ServerMessage::Kicked { reason, .. } = pat
+            .expect("Kicked", |m| matches!(m, ServerMessage::Kicked { .. }))
+            .await
+        else {
+            unreachable!()
+        };
         assert!(reason.contains("by a moderator"), "{reason}");
-        m.send(&ClientMessage::AdminBan { user_id: pat_uid, reason: String::new(), duration_secs: 60, account: true }).await;
+        m.send(&ClientMessage::AdminBan {
+            user_id: pat_uid,
+            reason: String::new(),
+            duration_secs: 60,
+            account: true,
+        })
+        .await;
         m.send(&ClientMessage::AdminListBans).await;
-        assert!(matches!(m.expect("refused", admin_reply).await, ServerMessage::AdminError { .. }), "the ban came back without the list");
+        assert!(
+            matches!(
+                m.expect("refused", admin_reply).await,
+                ServerMessage::AdminError { .. }
+            ),
+            "the ban came back without the list"
+        );
         assert!(crate::bans::refusal(&state, "203.0.113.9".parse().unwrap(), None).is_some());
         drop(pat);
     }
@@ -5695,15 +7697,29 @@ mod tests {
         let (state, _db, log) = relay_with_log().await;
         let (_alice, _, _) = member(&state, &log, "alice", true).await;
         let relay = state.accounts.clone().unwrap();
-        let members = || async { crate::accounts::raw(&relay, "SELECT COUNT(*) FROM voipc_members").await.unwrap() };
+        let members = || async {
+            crate::accounts::raw(&relay, "SELECT COUNT(*) FROM voipc_members")
+                .await
+                .unwrap()
+        };
         crate::accounts::locked_logs_at_boot(&state).await.unwrap();
         assert_eq!(members().await, 1, "an open channel keeps its members");
-        state.channels.write().await.get_mut(&1).unwrap().password = Some(zeroize::Zeroizing::new(crate::channels::hash_password("s3cret").unwrap()));
+        state.channels.write().await.get_mut(&1).unwrap().password = Some(zeroize::Zeroizing::new(
+            crate::channels::hash_password("s3cret").unwrap(),
+        ));
         crate::accounts::locked_logs_at_boot(&state).await.unwrap();
-        assert_eq!(members().await, 0, "nobody showed they know the new password");
+        assert_eq!(
+            members().await,
+            0,
+            "nobody showed they know the new password"
+        );
         let (_bob, _, _) = member(&state, &log, "bob", true).await;
         crate::accounts::locked_logs_at_boot(&state).await.unwrap();
-        assert_eq!(members().await, 1, "the same password again changes nothing");
+        assert_eq!(
+            members().await,
+            1,
+            "the same password again changes nothing"
+        );
     }
 
     /// The stored copy of a channel post keeps to the channel's rules, as the
@@ -5716,13 +7732,22 @@ mod tests {
         let (state, _db, log) = relay_with_log().await;
         let (mut alice, a, mut sa) = member(&state, &log, "alice", true).await;
         let (_bob, _, _) = member(&state, &log, "bob", true).await;
-        let not_kept = |events: &[Event]| events.iter().find_map(|e| match e {
-            Event::NotKept { reason } => Some(reason.clone()),
-            _ => None,
-        });
+        let not_kept = |events: &[Event]| {
+            events.iter().find_map(|e| match e {
+                Event::NotKept { reason } => Some(reason.clone()),
+                _ => None,
+            })
+        };
         // Alice manages nothing here: in an announcement channel her copy is
         // refused like her post would be.
-        state.channels.write().await.get_mut(&1).unwrap().info.announce = true;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&1)
+            .unwrap()
+            .info
+            .announce = true;
         let out = sa.send_channel(&log, say("a1", "not an announcement"), 1, None);
         let reason = not_kept(&pump(&mut alice, &mut sa, out).await).expect("refused");
         assert!(reason.contains("only moderators"), "{reason}");
@@ -5736,21 +7761,39 @@ mod tests {
         }
         let out = sa.send_channel(&log, say("s1", "first"), 2, None);
         let events = pump(&mut alice, &mut sa, out).await;
-        assert!(events.iter().any(|e| matches!(e, Event::Kept { .. })), "{events:?}");
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Kept { .. })),
+            "{events:?}"
+        );
         let out = sa.send_channel(&log, say("s2", "too soon"), 3, None);
         let reason = not_kept(&pump(&mut alice, &mut sa, out).await).expect("held back");
         assert!(reason.contains("slow mode"), "{reason}");
         let sid = *state.account_sessions.get(&a.id).unwrap();
         let uid = state.sessions.get(&sid).unwrap().user_id;
-        assert!(state.post_rules(sid, uid, 1, PostStamp::Live).await.is_ok(), "the post itself is not held back by its copy");
-        assert!(state.post_rules(sid, uid, 1, PostStamp::Live).await.is_err());
         assert!(
-            state.post_marks.contains_key(&(1, Poster::Account(a.id), PostStamp::Live)),
+            state.post_rules(sid, uid, 1, PostStamp::Live).await.is_ok(),
+            "the post itself is not held back by its copy"
+        );
+        assert!(state
+            .post_rules(sid, uid, 1, PostStamp::Live)
+            .await
+            .is_err());
+        assert!(
+            state
+                .post_marks
+                .contains_key(&(1, Poster::Account(a.id), PostStamp::Live)),
             "an account's clock, which a reconnect does not reset"
         );
 
         // From outside the channel: refused too.
-        state.channels.write().await.get_mut(&1).unwrap().info.slow_mode_secs = 0;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&1)
+            .unwrap()
+            .info
+            .slow_mode_secs = 0;
         state.leave_text_channel(uid, 1).await;
         let out = sa.send_channel(&log, say("o1", "from outside"), 4, None);
         let reason = not_kept(&pump(&mut alice, &mut sa, out).await).expect("refused");
@@ -5770,18 +7813,33 @@ mod tests {
         // Carol joins: both writers are here and answer her.
         let (mut carol, _, mut sc) = member(&state, &log, "carol", true).await;
         let from_alice = pump(&mut alice, &mut sa, Vec::new()).await;
-        assert_eq!(readers(&from_alice), vec![(vec!["carol".to_string()], true)], "alice shares what she wrote before");
+        assert_eq!(
+            readers(&from_alice),
+            vec![(vec!["carol".to_string()], true)],
+            "alice shares what she wrote before"
+        );
         let from_bob = pump(&mut bob, &mut sb, Vec::new()).await;
-        assert_eq!(readers(&from_bob), vec![(vec!["carol".to_string()], false)], "bob only lets her read what comes next");
+        assert_eq!(
+            readers(&from_bob),
+            vec![(vec!["carol".to_string()], false)],
+            "bob only lets her read what comes next"
+        );
         let got = channel_texts(&pump(&mut carol, &mut sc, Vec::new()).await);
-        assert_eq!(got, vec![("alice".to_string(), "from alice, before".to_string())], "bob's earlier message stays closed to her");
+        assert_eq!(
+            got,
+            vec![("alice".to_string(), "from alice, before".to_string())],
+            "bob's earlier message stays closed to her"
+        );
 
         // What bob writes now, she reads.
         let out = sb.send_channel(&log, say("b2", "from bob, after"), 3, None);
         pump(&mut bob, &mut sb, out).await;
         let out = sc.enter(&log);
         let got = channel_texts(&pump(&mut carol, &mut sc, out).await);
-        assert_eq!(got, vec![("bob".to_string(), "from bob, after".to_string())]);
+        assert_eq!(
+            got,
+            vec![("bob".to_string(), "from bob, after".to_string())]
+        );
     }
 
     #[tokio::test]
@@ -5793,12 +7851,23 @@ mod tests {
         pump(&mut alice, &mut sa, out).await;
 
         // Bob leaves: alice's next message needs a key he does not have.
-        bob.send(&ClientMessage::Account(AccountRequest::LogLeave { conv: log.clone() })).await;
+        bob.send(&ClientMessage::Account(AccountRequest::LogLeave {
+            conv: log.clone(),
+        }))
+        .await;
         // (Past the news of alice's key for him, which came first.)
-        bob.expect("left", |m| matches!(m, ServerMessage::Account(AccountReply::LogLeft { .. }))).await;
+        bob.expect("left", |m| {
+            matches!(m, ServerMessage::Account(AccountReply::LogLeft { .. }))
+        })
+        .await;
         let out = sa.send_channel(&log, say("m2", "just me"), 2, None);
         let events = pump(&mut alice, &mut sa, out).await;
-        assert!(events.iter().any(|e| matches!(e, voipc_crypto::sync::Event::Kept { .. })), "kept after a new key: {events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, voipc_crypto::sync::Event::Kept { .. })),
+            "kept after a new key: {events:?}"
+        );
         let relay = state.accounts.clone().unwrap();
         let bobs = crate::accounts::raw(
             &relay,
@@ -5806,20 +7875,35 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(bobs, 0, "the key of what came after he left is not wrapped to him");
-        bob.send(&ClientMessage::Account(AccountRequest::LogFetch { conv: log.clone(), after: 0 })).await;
+        assert_eq!(
+            bobs, 0,
+            "the key of what came after he left is not wrapped to him"
+        );
+        bob.send(&ClientMessage::Account(AccountRequest::LogFetch {
+            conv: log.clone(),
+            after: 0,
+        }))
+        .await;
         bob.expect("refused", |m| matches!(m, ServerMessage::Account(AccountReply::Error { request, .. }) if request == "LogFetch")).await;
 
         // A relay that makes up a member (eve, never in the channel) cannot
         // slip her in unseen: alice's client names her before her key is used.
         let (_eve, e, eve_signed) = register_with(&state, "eve").await;
-        let (mut se, first) = voipc_crypto::sync::AccountSync::start(&eve_signed, e.id, Default::default(), true);
+        let (mut se, first) =
+            voipc_crypto::sync::AccountSync::start(&eve_signed, e.id, Default::default(), true);
         let mut eve = _eve;
         pump(&mut eve, &mut se, first).await; // publishes her log key
-        crate::accounts::log::join(&relay, l4f_accounts::model::AccountId(e.id), &log, true).await.unwrap();
+        crate::accounts::log::join(&relay, l4f_accounts::model::AccountId(e.id), &log, true)
+            .await
+            .unwrap();
         let out = sa.send_channel(&log, say("m3", "who reads this?"), 3, None);
         let events = pump(&mut alice, &mut sa, out).await;
-        assert!(readers(&events).iter().any(|(names, _)| names.contains(&"eve".to_string())), "{events:?}");
+        assert!(
+            readers(&events)
+                .iter()
+                .any(|(names, _)| names.contains(&"eve".to_string())),
+            "{events:?}"
+        );
     }
 
     #[tokio::test]
@@ -5828,19 +7912,57 @@ mod tests {
         let (mut alice, _, _) = member(&state, &log, "alice", true).await;
         let (mut bob, b, _) = member(&state, &log, "bob", true).await;
         // Bob steps out; the channel gets a password.
-        let uid = state.sessions.get(&*state.account_sessions.get(&b.id).unwrap()).unwrap().user_id;
-        state.channels.write().await.get_mut(&1).unwrap().members.remove(&uid);
+        let uid = state
+            .sessions
+            .get(&*state.account_sessions.get(&b.id).unwrap())
+            .unwrap()
+            .user_id;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&1)
+            .unwrap()
+            .members
+            .remove(&uid);
         crate::accounts::locked_log(&state, 1).await;
-        let fetch = ClientMessage::Account(AccountRequest::LogFetch { conv: log.clone(), after: 0 });
+        let fetch = ClientMessage::Account(AccountRequest::LogFetch {
+            conv: log.clone(),
+            after: 0,
+        });
         bob.send(&fetch).await;
-        assert!(matches!(bob.expect("refused", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::Error { .. })));
+        assert!(matches!(
+            bob.expect("refused", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::Error { .. })
+        ));
         alice.send(&fetch).await;
-        assert!(matches!(alice.expect("page", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::LogPage { .. })));
+        assert!(matches!(
+            alice.expect("page", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::LogPage { .. })
+        ));
         // Alice is kicked from it.
-        let sid = *state.account_sessions.get(&state.sessions.iter().find(|s| s.username == "alice").unwrap().account.as_ref().unwrap().user.id.0).unwrap();
+        let sid = *state
+            .account_sessions
+            .get(
+                &state
+                    .sessions
+                    .iter()
+                    .find(|s| s.username == "alice")
+                    .unwrap()
+                    .account
+                    .as_ref()
+                    .unwrap()
+                    .user
+                    .id
+                    .0,
+            )
+            .unwrap();
         crate::accounts::out_of_log(&state, 1, sid).await;
         alice.send(&fetch).await;
-        assert!(matches!(alice.expect("refused", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::Error { .. })));
+        assert!(matches!(
+            alice.expect("refused", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::Error { .. })
+        ));
     }
 
     /// 1.0 (D10): leaving a text channel takes its account out of the log
@@ -5850,19 +7972,42 @@ mod tests {
         let (state, _db, log) = relay_with_log().await;
         let (_alice, _, _) = member(&state, &log, "alice", true).await;
         let (mut bob, b, mut sb) = member(&state, &log, "bob", true).await;
-        let fetch = ClientMessage::Account(AccountRequest::LogFetch { conv: log.clone(), after: 0 });
-        bob.send(&ClientMessage::LeaveChannel { channel_id: 1 }).await;
-        bob.expect("left", |m| matches!(m, ServerMessage::UserLeft { channel_id: 1, .. })).await;
+        let fetch = ClientMessage::Account(AccountRequest::LogFetch {
+            conv: log.clone(),
+            after: 0,
+        });
+        bob.send(&ClientMessage::LeaveChannel { channel_id: 1 })
+            .await;
+        bob.expect("left", |m| {
+            matches!(m, ServerMessage::UserLeft { channel_id: 1, .. })
+        })
+        .await;
         bob.send(&fetch).await;
-        assert!(matches!(bob.expect("refused", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::Error { .. })), "no reader any more");
+        assert!(
+            matches!(
+                bob.expect("refused", |m| reply(m).is_some()).await,
+                ServerMessage::Account(AccountReply::Error { .. })
+            ),
+            "no reader any more"
+        );
         // His client forgets what this run knew of it, so a rejoin asks again.
-        assert!(sb.leave(&log, false).is_empty(), "the relay did it: nothing to send");
+        assert!(
+            sb.leave(&log, false).is_empty(),
+            "the relay did it: nothing to send"
+        );
         into_lounge(&state, &b.id).await;
         let out = sb.enter(&log);
-        assert!(out.iter().any(|m| matches!(m, ClientMessage::Account(AccountRequest::LogJoin { .. }))), "{out:?}");
+        assert!(
+            out.iter()
+                .any(|m| matches!(m, ClientMessage::Account(AccountRequest::LogJoin { .. }))),
+            "{out:?}"
+        );
         pump(&mut bob, &mut sb, out).await;
         bob.send(&fetch).await;
-        assert!(matches!(bob.expect("page", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::LogPage { .. })));
+        assert!(matches!(
+            bob.expect("page", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::LogPage { .. })
+        ));
     }
 
     /// 1.0 (A6): a writer deletes what they kept in a conversation; a
@@ -5879,26 +8024,71 @@ mod tests {
         let out = sb.send_channel(&log, say("b1", "bob's"), 2, None);
         pump(&mut bob, &mut sb, out).await;
         let relay = state.accounts.clone().unwrap();
-        let mine = format!("SELECT COUNT(*) FROM voipc_log WHERE sender = x'{}'", hex::encode(a.id));
+        let mine = format!(
+            "SELECT COUNT(*) FROM voipc_log WHERE sender = x'{}'",
+            hex::encode(a.id)
+        );
         assert_eq!(crate::accounts::raw(&relay, &mine).await.unwrap(), 2);
 
-        alice.send(&ClientMessage::Account(AccountRequest::LogPurge { conv: Some(log.clone()) })).await;
-        let ServerMessage::Account(r) = alice.expect("purged", |m| matches!(reply(m), Some(AccountReply::LogPurged { .. }))).await else { unreachable!() };
-        assert!(matches!(&r, AccountReply::LogPurged { entries: 2, .. }), "{r:?}");
-        assert_eq!(crate::accounts::raw(&relay, &mine).await.unwrap(), 0, "hers are gone");
-        assert_eq!(crate::accounts::raw(&relay, "SELECT COUNT(*) FROM voipc_log").await.unwrap(), 1, "bob's stays: it is his");
+        alice
+            .send(&ClientMessage::Account(AccountRequest::LogPurge {
+                conv: Some(log.clone()),
+            }))
+            .await;
+        let ServerMessage::Account(r) = alice
+            .expect("purged", |m| {
+                matches!(reply(m), Some(AccountReply::LogPurged { .. }))
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        assert!(
+            matches!(&r, AccountReply::LogPurged { entries: 2, .. }),
+            "{r:?}"
+        );
+        assert_eq!(
+            crate::accounts::raw(&relay, &mine).await.unwrap(),
+            0,
+            "hers are gone"
+        );
+        assert_eq!(
+            crate::accounts::raw(&relay, "SELECT COUNT(*) FROM voipc_log")
+                .await
+                .unwrap(),
+            1,
+            "bob's stays: it is his"
+        );
         assert!(sa.on_reply(&r).is_none(), "the front end hears of it too");
         // The tombstone, on a new key (the old one went with the purge).
-        let out = sa.send_channel(&log, voipc_crypto::envelope::purge_envelope("t1", 9_000_000_000_000), 9, None);
+        let out = sa.send_channel(
+            &log,
+            voipc_crypto::envelope::purge_envelope("t1", 9_000_000_000_000),
+            9,
+            None,
+        );
         let events = pump(&mut alice, &mut sa, out).await;
-        assert!(events.iter().any(|e| matches!(e, voipc_crypto::sync::Event::Kept { .. }) || matches!(e, voipc_crypto::sync::Event::Readers { .. })), "{events:?}");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, voipc_crypto::sync::Event::Kept { .. })
+                    || matches!(e, voipc_crypto::sync::Event::Readers { .. })),
+            "{events:?}"
+        );
         // Bob's device fetches it: a purge for alice, never past when the relay filed it.
         let out = sb.enter(&log);
         let events = pump(&mut bob, &mut sb, out).await;
-        let wire: Vec<_> = events.iter().filter_map(|e| e.to_wire()).filter(|(n, _)| *n == "stored-purge").collect();
+        let wire: Vec<_> = events
+            .iter()
+            .filter_map(|e| e.to_wire())
+            .filter(|(n, _)| *n == "stored-purge")
+            .collect();
         assert_eq!(wire.len(), 1, "{events:?}");
         assert_eq!(wire[0].1["account"], hex::encode(a.id));
-        assert!(wire[0].1["before"].as_u64().unwrap() < 9_000_000_000_000, "clamped to the relay's time");
+        assert!(
+            wire[0].1["before"].as_u64().unwrap() < 9_000_000_000_000,
+            "clamped to the relay's time"
+        );
     }
 
     /// 1.0 (A6): an account deletes itself with its password; its rows go
@@ -5910,30 +8100,79 @@ mod tests {
         let out = sd.send_channel(&log, say("d1", "bye"), 1, None);
         pump(&mut dora, &mut sd, out).await;
         let relay = state.accounts.clone().unwrap();
-        let secret = |pw: &str| voipc_crypto::account::derive(pw, &relay.relay_id, "dora").auth_secret.to_vec();
-        let delete = |secret: Vec<u8>| ClientMessage::Account(AccountRequest::DeleteAccount { secret, totp: None, recovery_code: None });
+        let secret = |pw: &str| {
+            voipc_crypto::account::derive(pw, &relay.relay_id, "dora")
+                .auth_secret
+                .to_vec()
+        };
+        let delete = |secret: Vec<u8>| {
+            ClientMessage::Account(AccountRequest::DeleteAccount {
+                secret,
+                totp: None,
+                recovery_code: None,
+            })
+        };
         dora.send(&delete(secret("not her password"))).await;
         let msg = dora.expect("refused", |m| reply(m).is_some()).await;
-        assert!(matches!(&msg, ServerMessage::Account(AccountReply::Error { request, .. }) if request == "DeleteAccount"), "{msg:?}");
+        assert!(
+            matches!(&msg, ServerMessage::Account(AccountReply::Error { request, .. }) if request == "DeleteAccount"),
+            "{msg:?}"
+        );
         dora.send(&delete(secret("correct horse battery"))).await;
-        assert!(matches!(dora.expect("deleted", |m| reply(m).is_some()).await, ServerMessage::Account(AccountReply::AccountDeleted)));
-        dora.expect("closed", |m| matches!(m, ServerMessage::Disconnected { .. })).await;
+        assert!(matches!(
+            dora.expect("deleted", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::AccountDeleted)
+        ));
+        dora.expect("closed", |m| {
+            matches!(m, ServerMessage::Disconnected { .. })
+        })
+        .await;
         let id = hex::encode(d.id);
-        for table in ["voipc_identity WHERE account", "voipc_logkeys WHERE account", "voipc_members WHERE account", "voipc_log WHERE sender", "voipc_wraps WHERE owner"] {
-            assert_eq!(crate::accounts::raw(&relay, &format!("SELECT COUNT(*) FROM {table} = x'{id}'")).await.unwrap(), 0, "{table}");
+        for table in [
+            "voipc_identity WHERE account",
+            "voipc_logkeys WHERE account",
+            "voipc_members WHERE account",
+            "voipc_log WHERE sender",
+            "voipc_wraps WHERE owner",
+        ] {
+            assert_eq!(
+                crate::accounts::raw(&relay, &format!("SELECT COUNT(*) FROM {table} = x'{id}'"))
+                    .await
+                    .unwrap(),
+                0,
+                "{table}"
+            );
         }
         let (_again, d2, _) = register_with(&state, "dora").await;
         assert_ne!(d2.id, d.id, "the name is free: a new account under it");
 
         // The only admin stays.
         let (mut gina, _) = register(&state, "gina").await;
-        gina.send(&ClientMessage::AdminLogin { token: "test-admin-token".into() }).await;
+        gina.send(&ClientMessage::AdminLogin {
+            token: "test-admin-token".into(),
+        })
+        .await;
         gina.expect("Info", |m| reply(m).is_some()).await;
         let secret = totp_on(&mut gina).await;
-        gina.expect("AdminStatus", |m| matches!(m, ServerMessage::AdminStatus { is_admin: true, .. })).await;
-        let code = format!("{:06}", l4f_accounts::totp::code_at(&secret, l4f_accounts::util::now() / 30 + 1));
-        gina.send(&ClientMessage::Account(AccountRequest::DeleteAccount { secret: SECRET.to_vec(), totp: Some(code), recovery_code: None })).await;
-        let ServerMessage::Account(AccountReply::Error { reason, .. }) = gina.expect("refused", |m| reply(m).is_some()).await else { panic!("deleted the last admin") };
+        gina.expect("AdminStatus", |m| {
+            matches!(m, ServerMessage::AdminStatus { is_admin: true, .. })
+        })
+        .await;
+        let code = format!(
+            "{:06}",
+            l4f_accounts::totp::code_at(&secret, l4f_accounts::util::now() / 30 + 1)
+        );
+        gina.send(&ClientMessage::Account(AccountRequest::DeleteAccount {
+            secret: SECRET.to_vec(),
+            totp: Some(code),
+            recovery_code: None,
+        }))
+        .await;
+        let ServerMessage::Account(AccountReply::Error { reason, .. }) =
+            gina.expect("refused", |m| reply(m).is_some()).await
+        else {
+            panic!("deleted the last admin")
+        };
         assert!(reason.contains("last admin"), "{reason}");
     }
 
@@ -5947,14 +8186,23 @@ mod tests {
         let me = hex::encode(a.id);
         // A key minted long ago that no entry uses, beside one that is used.
         crate::accounts::raw(&relay, &format!("INSERT INTO voipc_wraps (conv, owner, epoch, recipient, wrapped, created_at) VALUES ('{log}', x'{me}', 99, x'{me}', x'00', 0)")).await.unwrap();
-        crate::accounts::raw(&relay, "UPDATE voipc_wraps SET created_at = 0").await.unwrap();
+        crate::accounts::raw(&relay, "UPDATE voipc_wraps SET created_at = 0")
+            .await
+            .unwrap();
         crate::accounts::log::sweep(&relay).await.unwrap();
         let count = |sql: String| {
             let relay = relay.clone();
             async move { crate::accounts::raw(&relay, &sql).await.unwrap() }
         };
-        assert_eq!(count("SELECT COUNT(*) FROM voipc_wraps WHERE epoch = 99".into()).await, 0, "the unused key went");
-        assert!(count("SELECT COUNT(*) FROM voipc_wraps".into()).await > 0, "the used one stayed");
+        assert_eq!(
+            count("SELECT COUNT(*) FROM voipc_wraps WHERE epoch = 99".into()).await,
+            0,
+            "the unused key went"
+        );
+        assert!(
+            count("SELECT COUNT(*) FROM voipc_wraps".into()).await > 0,
+            "the used one stayed"
+        );
         assert_eq!(count("SELECT COUNT(*) FROM voipc_log".into()).await, 1);
     }
 
@@ -5966,8 +8214,13 @@ mod tests {
     async fn a_0_12_accounts_database_opens_signs_in_and_keeps_its_messages() {
         use voipc_crypto::log::{open_entry, unwrap, LogKey};
         let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/0.12.0");
-        let meta: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(dir.join("accounts.json")).unwrap()).unwrap();
-        let tmp = std::env::temp_dir().join(format!("voipc-upgrade-{}", hex::encode(rand::random::<[u8; 8]>())));
+        let meta: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("accounts.json")).unwrap())
+                .unwrap();
+        let tmp = std::env::temp_dir().join(format!(
+            "voipc-upgrade-{}",
+            hex::encode(rand::random::<[u8; 8]>())
+        ));
         std::fs::create_dir_all(&tmp).unwrap();
         for f in ["voipc.db", "accounts.key"] {
             std::fs::copy(dir.join(f), tmp.join(f)).unwrap();
@@ -5977,24 +8230,67 @@ mod tests {
         config.accounts.registration = RegistrationMode::Open;
         config.accounts.database = format!("sqlite://{}", tmp.join("voipc.db").display());
         config.accounts.key_file = tmp.join("accounts.key").display().to_string();
-        let relay = crate::accounts::Relay::open(&config.accounts).await.unwrap();
+        let relay = crate::accounts::Relay::open(&config.accounts)
+            .await
+            .unwrap();
         assert_eq!(hex::encode(relay.relay_id), meta["relay_id"]);
-        let mut state = ServerState::new(&config, ServerSettings::default(), Vec::new(), "test-admin-token".into());
+        let mut state = ServerState::new(
+            &config,
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        );
         state.accounts = Some(Arc::new(relay));
         let state = Arc::new(state);
 
         let (mut bob, b, _) = sign_in_password(&state, "bob").await;
         assert_eq!(hex::encode(b.id), meta["bob"]);
         let conv = meta["conv"].as_str().unwrap().to_string();
-        bob.send(&ClientMessage::Account(AccountRequest::WrapsFetch { conv: conv.clone() })).await;
-        let ServerMessage::Account(AccountReply::Wraps { wraps, .. }) = bob.expect("wraps", |m| reply(m).is_some()).await else { panic!() };
-        let bob_lk = LogKey::from_bytes(&hex::decode(meta["bob_logkey"].as_str().unwrap()).unwrap()).unwrap();
-        let key = unwrap(&bob_lk, &wraps[0].wrapped, &conv, &wraps[0].owner, wraps[0].epoch, &b.id).unwrap();
-        bob.send(&ClientMessage::Account(AccountRequest::LogFetch { conv: conv.clone(), after: 0 })).await;
-        let ServerMessage::Account(AccountReply::LogPage { entries, .. }) = bob.expect("page", |m| reply(m).is_some()).await else { panic!() };
+        bob.send(&ClientMessage::Account(AccountRequest::WrapsFetch {
+            conv: conv.clone(),
+        }))
+        .await;
+        let ServerMessage::Account(AccountReply::Wraps { wraps, .. }) =
+            bob.expect("wraps", |m| reply(m).is_some()).await
+        else {
+            panic!()
+        };
+        let bob_lk =
+            LogKey::from_bytes(&hex::decode(meta["bob_logkey"].as_str().unwrap()).unwrap())
+                .unwrap();
+        let key = unwrap(
+            &bob_lk,
+            &wraps[0].wrapped,
+            &conv,
+            &wraps[0].owner,
+            wraps[0].epoch,
+            &b.id,
+        )
+        .unwrap();
+        bob.send(&ClientMessage::Account(AccountRequest::LogFetch {
+            conv: conv.clone(),
+            after: 0,
+        }))
+        .await;
+        let ServerMessage::Account(AccountReply::LogPage { entries, .. }) =
+            bob.expect("page", |m| reply(m).is_some()).await
+        else {
+            panic!()
+        };
         let alice_lk = hex::decode(meta["alice_logkey_public"].as_str().unwrap()).unwrap();
-        let (envelope, _) = open_entry(&key, &conv, &entries[0].sender, entries[0].epoch, &alice_lk, &entries[0].ct).unwrap();
-        assert_eq!(voipc_crypto::envelope::open_envelope(&envelope).text, meta["text"]);
+        let (envelope, _) = open_entry(
+            &key,
+            &conv,
+            &entries[0].sender,
+            entries[0].epoch,
+            &alice_lk,
+            &entries[0].ct,
+        )
+        .unwrap();
+        assert_eq!(
+            voipc_crypto::envelope::open_envelope(&envelope).text,
+            meta["text"]
+        );
         drop(bob);
         drop(state);
         let _ = std::fs::remove_dir_all(&tmp);

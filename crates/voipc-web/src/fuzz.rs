@@ -30,7 +30,8 @@ mod tests {
         for input in [&[][..], &[0xff; 64], &[0; 64], &[0x05; 300]] {
             fuzz_web_media(input);
         }
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/regressions/web_media");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fuzz/regressions/web_media");
         for file in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             fuzz_web_media(&std::fs::read(file.path()).unwrap());
         }

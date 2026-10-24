@@ -44,7 +44,15 @@ mod tests {
         assert_eq!(c, dm_conv(&a, &b));
         assert_eq!(dm_parties(&c), Some((a, b)));
         assert_eq!(dm_parties("d:zz:yy"), None);
-        assert_eq!(dm_parties(&format!("d:{}:{}", hex(&b), hex(&a))), None, "only the canonical order");
-        assert_eq!(dm_parties(&format!("d:{}:{}", hex(&a), hex(&a))), None, "not with oneself");
+        assert_eq!(
+            dm_parties(&format!("d:{}:{}", hex(&b), hex(&a))),
+            None,
+            "only the canonical order"
+        );
+        assert_eq!(
+            dm_parties(&format!("d:{}:{}", hex(&a), hex(&a))),
+            None,
+            "not with oneself"
+        );
     }
 }

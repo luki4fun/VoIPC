@@ -78,7 +78,9 @@ pub struct LogKey {
 
 impl LogKey {
     pub fn generate() -> LogKey {
-        LogKey { pair: KeyPair::generate(&mut crate::rng()) }
+        LogKey {
+            pair: KeyPair::generate(&mut crate::rng()),
+        }
     }
 
     /// The vault item's plaintext: the private key (32 bytes).
@@ -89,7 +91,9 @@ impl LogKey {
     pub fn from_bytes(b: &[u8]) -> Option<LogKey> {
         let private_key = PrivateKey::deserialize(b).ok()?;
         let public_key = private_key.public_key().ok()?;
-        Some(LogKey { pair: KeyPair::new(public_key, private_key) })
+        Some(LogKey {
+            pair: KeyPair::new(public_key, private_key),
+        })
     }
 
     pub fn public(&self) -> Vec<u8> {
@@ -100,7 +104,11 @@ impl LogKey {
     /// identity they pinned before trusting a wrap to it.
     pub fn endorse(&self, identity: &IdentityKeyPair) -> Vec<u8> {
         let msg = endorsement(&self.public());
-        identity.private_key().calculate_signature(&msg, &mut crate::rng()).expect("sign").to_vec()
+        identity
+            .private_key()
+            .calculate_signature(&msg, &mut crate::rng())
+            .expect("sign")
+            .to_vec()
     }
 }
 
@@ -113,7 +121,12 @@ fn endorsement(logkey: &[u8]) -> Vec<u8> {
 /// Whether `identity` endorsed `logkey` (`LogKey::endorse`).
 pub fn endorsed(identity: &[u8], logkey: &[u8], signature: &[u8]) -> bool {
     match IdentityKey::decode(identity) {
-        Ok(ik) => PublicKey::deserialize(logkey).is_ok() && ik.public_key().verify_signature(&endorsement(logkey), signature),
+        Ok(ik) => {
+            PublicKey::deserialize(logkey).is_ok()
+                && ik
+                    .public_key()
+                    .verify_signature(&endorsement(logkey), signature)
+        }
         Err(_) => false,
     }
 }
@@ -121,11 +134,22 @@ pub fn endorsed(identity: &[u8], logkey: &[u8], signature: &[u8]) -> bool {
 // ── Wraps ─────────────────────────────────────────────────────────────────
 
 fn wrap_ctx(conv: &str, owner: &[u8; 16], epoch: u32, recipient: &[u8; 16]) -> String {
-    format!("voipc-wrap/v1|{conv}|{}|{epoch}|{}", hex(owner), hex(recipient))
+    format!(
+        "voipc-wrap/v1|{conv}|{}|{epoch}|{}",
+        hex(owner),
+        hex(recipient)
+    )
 }
 
 /// `key` for `recipient`: `ephemeral public (33) | iv (12) | sealed key + tag (48)`.
-pub fn wrap(recipient_logkey: &[u8], key: &[u8; 32], conv: &str, owner: &[u8; 16], epoch: u32, recipient: &[u8; 16]) -> Option<Vec<u8>> {
+pub fn wrap(
+    recipient_logkey: &[u8],
+    key: &[u8; 32],
+    conv: &str,
+    owner: &[u8; 16],
+    epoch: u32,
+    recipient: &[u8; 16],
+) -> Option<Vec<u8>> {
     let them = PublicKey::deserialize(recipient_logkey).ok()?;
     let eph = KeyPair::generate(&mut crate::rng());
     let shared = Zeroizing::new(eph.private_key.calculate_agreement(&them).ok()?.to_vec());
@@ -134,24 +158,43 @@ pub fn wrap(recipient_logkey: &[u8], key: &[u8; 32], conv: &str, owner: &[u8; 16
     let mut salt = eph_pub.to_vec();
     salt.extend_from_slice(recipient_logkey);
     let mut kek = Zeroizing::new([0u8; 32]);
-    Hkdf::<Sha256>::new(Some(&salt), &shared).expand(ctx.as_bytes(), &mut *kek).ok()?;
+    Hkdf::<Sha256>::new(Some(&salt), &shared)
+        .expand(ctx.as_bytes(), &mut *kek)
+        .ok()?;
     let mut out = eph_pub.to_vec();
     out.extend_from_slice(&seal(&kek, &ctx, key));
     Some(out)
 }
 
-pub fn unwrap(own: &LogKey, wrapped: &[u8], conv: &str, owner: &[u8; 16], epoch: u32, recipient: &[u8; 16]) -> Result<[u8; 32], LogError> {
+pub fn unwrap(
+    own: &LogKey,
+    wrapped: &[u8],
+    conv: &str,
+    owner: &[u8; 16],
+    epoch: u32,
+    recipient: &[u8; 16],
+) -> Result<[u8; 32], LogError> {
     if wrapped.len() != 33 + 12 + 48 {
         return Err(LogError::Malformed);
     }
     let eph = PublicKey::deserialize(&wrapped[..33]).map_err(|_| LogError::Malformed)?;
-    let shared = Zeroizing::new(own.pair.private_key.calculate_agreement(&eph).map_err(|_| LogError::Malformed)?.to_vec());
+    let shared = Zeroizing::new(
+        own.pair
+            .private_key
+            .calculate_agreement(&eph)
+            .map_err(|_| LogError::Malformed)?
+            .to_vec(),
+    );
     let ctx = wrap_ctx(conv, owner, epoch, recipient);
     let mut salt = wrapped[..33].to_vec();
     salt.extend_from_slice(&own.public());
     let mut kek = Zeroizing::new([0u8; 32]);
-    Hkdf::<Sha256>::new(Some(&salt), &shared).expand(ctx.as_bytes(), &mut *kek).map_err(|_| LogError::Malformed)?;
-    open(&kek, &ctx, &wrapped[33..])?.try_into().map_err(|_| LogError::Malformed)
+    Hkdf::<Sha256>::new(Some(&salt), &shared)
+        .expand(ctx.as_bytes(), &mut *kek)
+        .map_err(|_| LogError::Malformed)?;
+    open(&kek, &ctx, &wrapped[33..])?
+        .try_into()
+        .map_err(|_| LogError::Malformed)
 }
 
 /// The key our own devices seal our epoch keys for each other under: from
@@ -159,7 +202,9 @@ pub fn unwrap(own: &LogKey, wrapped: &[u8], conv: &str, owner: &[u8; 16], epoch:
 fn self_key(own: &LogKey) -> Zeroizing<[u8; 32]> {
     let mut k = Zeroizing::new([0u8; 32]);
     let private = Zeroizing::new(own.pair.private_key.serialize());
-    Hkdf::<Sha256>::new(None, &private).expand(b"voipc-selfwrap/v1", &mut *k).expect("32 bytes is a valid HKDF length");
+    Hkdf::<Sha256>::new(None, &private)
+        .expand(b"voipc-selfwrap/v1", &mut *k)
+        .expect("32 bytes is a valid HKDF length");
     k
 }
 
@@ -170,11 +215,19 @@ pub fn self_wrap(own: &LogKey, key: &[u8; 32], conv: &str, me: &[u8; 16], epoch:
 
 /// One of our own epoch keys back. An ECIES wrap made from our public key —
 /// which the relay can make — does not open here.
-pub fn self_unwrap(own: &LogKey, wrapped: &[u8], conv: &str, me: &[u8; 16], epoch: u32) -> Result<[u8; 32], LogError> {
+pub fn self_unwrap(
+    own: &LogKey,
+    wrapped: &[u8],
+    conv: &str,
+    me: &[u8; 16],
+    epoch: u32,
+) -> Result<[u8; 32], LogError> {
     if wrapped.len() != 12 + 48 {
         return Err(LogError::Malformed);
     }
-    open(&self_key(own), &wrap_ctx(conv, me, epoch, me), wrapped)?.try_into().map_err(|_| LogError::Malformed)
+    open(&self_key(own), &wrap_ctx(conv, me, epoch, me), wrapped)?
+        .try_into()
+        .map_err(|_| LogError::Malformed)
 }
 
 /// A fresh epoch key.
@@ -200,7 +253,13 @@ fn entry_aad(conv: &str, sender: &[u8; 16], epoch: u32) -> String {
     format!("voipc-log/v1|{conv}|{}|{epoch}", hex(sender))
 }
 
-fn signed_part(conv: &str, sender: &[u8; 16], epoch: u32, sent_at: u64, envelope: &[u8]) -> Vec<u8> {
+fn signed_part(
+    conv: &str,
+    sender: &[u8; 16],
+    epoch: u32,
+    sent_at: u64,
+    envelope: &[u8],
+) -> Vec<u8> {
     let mut m = entry_aad(conv, sender, epoch).into_bytes();
     m.push(b'|');
     m.extend_from_slice(&sent_at.to_be_bytes());
@@ -209,19 +268,49 @@ fn signed_part(conv: &str, sender: &[u8; 16], epoch: u32, sent_at: u64, envelope
 }
 
 /// A log entry's sealed bytes.
-pub fn seal_entry(key: &[u8; 32], conv: &str, sender: &[u8; 16], epoch: u32, signer: &LogKey, envelope: &[u8], sent_at: u64) -> Vec<u8> {
-    let sig = signer.pair.calculate_signature(&signed_part(conv, sender, epoch, sent_at, envelope), &mut crate::rng()).expect("sign").to_vec();
-    let payload = postcard::to_allocvec(&Payload { envelope: envelope.to_vec(), sent_at, sig }).expect("encodes");
+pub fn seal_entry(
+    key: &[u8; 32],
+    conv: &str,
+    sender: &[u8; 16],
+    epoch: u32,
+    signer: &LogKey,
+    envelope: &[u8],
+    sent_at: u64,
+) -> Vec<u8> {
+    let sig = signer
+        .pair
+        .calculate_signature(
+            &signed_part(conv, sender, epoch, sent_at, envelope),
+            &mut crate::rng(),
+        )
+        .expect("sign")
+        .to_vec();
+    let payload = postcard::to_allocvec(&Payload {
+        envelope: envelope.to_vec(),
+        sent_at,
+        sig,
+    })
+    .expect("encodes");
     seal(key, &entry_aad(conv, sender, epoch), &payload)
 }
 
 /// An entry opened and its signature checked against the sender's log key:
 /// the envelope and when it was sent.
-pub fn open_entry(key: &[u8; 32], conv: &str, sender: &[u8; 16], epoch: u32, sender_logkey: &[u8], sealed: &[u8]) -> Result<(Vec<u8>, u64), LogError> {
+pub fn open_entry(
+    key: &[u8; 32],
+    conv: &str,
+    sender: &[u8; 16],
+    epoch: u32,
+    sender_logkey: &[u8],
+    sealed: &[u8],
+) -> Result<(Vec<u8>, u64), LogError> {
     let plain = open(key, &entry_aad(conv, sender, epoch), sealed)?;
     let p: Payload = postcard::from_bytes(&plain).map_err(|_| LogError::Malformed)?;
     let pk = PublicKey::deserialize(sender_logkey).map_err(|_| LogError::Malformed)?;
-    if !pk.verify_signature(&signed_part(conv, sender, epoch, p.sent_at, &p.envelope), &p.sig) {
+    if !pk.verify_signature(
+        &signed_part(conv, sender, epoch, p.sent_at, &p.envelope),
+        &p.sig,
+    ) {
         return Err(LogError::Forged);
     }
     Ok((p.envelope, p.sent_at))
@@ -241,8 +330,18 @@ mod tests {
         let lk = LogKey::generate();
         let sig = lk.endorse(&id);
         assert!(endorsed(&id.public_key().serialize(), &lk.public(), &sig));
-        assert!(!endorsed(&other.public_key().serialize(), &lk.public(), &sig), "another identity's");
-        assert!(!endorsed(&id.public_key().serialize(), &LogKey::generate().public(), &sig), "another key");
+        assert!(
+            !endorsed(&other.public_key().serialize(), &lk.public(), &sig),
+            "another identity's"
+        );
+        assert!(
+            !endorsed(
+                &id.public_key().serialize(),
+                &LogKey::generate().public(),
+                &sig
+            ),
+            "another key"
+        );
         let again = LogKey::from_bytes(&lk.to_bytes()).unwrap();
         assert_eq!(again.public(), lk.public());
     }
@@ -254,10 +353,26 @@ mod tests {
         let c = dm_conv(&A, &B);
         let w = wrap(&bob.public(), &k, &c, &A, 1, &B).unwrap();
         assert_eq!(unwrap(&bob, &w, &c, &A, 1, &B).unwrap(), *k);
-        assert_eq!(unwrap(&alice, &w, &c, &A, 1, &B).err(), Some(LogError::Sealed), "not alice's");
-        assert_eq!(unwrap(&bob, &w, &c, &A, 2, &B).err(), Some(LogError::Sealed), "another epoch");
-        assert_eq!(unwrap(&bob, &w, &c, &B, 1, &B).err(), Some(LogError::Sealed), "another owner");
-        assert_eq!(unwrap(&bob, &w, "d:x", &A, 1, &B).err(), Some(LogError::Sealed), "another conversation");
+        assert_eq!(
+            unwrap(&alice, &w, &c, &A, 1, &B).err(),
+            Some(LogError::Sealed),
+            "not alice's"
+        );
+        assert_eq!(
+            unwrap(&bob, &w, &c, &A, 2, &B).err(),
+            Some(LogError::Sealed),
+            "another epoch"
+        );
+        assert_eq!(
+            unwrap(&bob, &w, &c, &B, 1, &B).err(),
+            Some(LogError::Sealed),
+            "another owner"
+        );
+        assert_eq!(
+            unwrap(&bob, &w, "d:x", &A, 1, &B).err(),
+            Some(LogError::Sealed),
+            "another conversation"
+        );
     }
 
     #[test]
@@ -268,13 +383,32 @@ mod tests {
         let w = self_wrap(&me, &k, &c, &A, 7);
         assert_eq!(w.len(), 60, "under the relay's 128-byte bound for a wrap");
         let again = LogKey::from_bytes(&me.to_bytes()).unwrap();
-        assert_eq!(self_unwrap(&again, &w, &c, &A, 7).unwrap(), *k, "another device of the same account");
-        assert_eq!(self_unwrap(&other, &w, &c, &A, 7).err(), Some(LogError::Sealed), "another account's");
-        assert_eq!(self_unwrap(&me, &w, &c, &A, 8).err(), Some(LogError::Sealed), "another epoch");
-        assert_eq!(self_unwrap(&me, &w, "d:x", &A, 7).err(), Some(LogError::Sealed), "another conversation");
+        assert_eq!(
+            self_unwrap(&again, &w, &c, &A, 7).unwrap(),
+            *k,
+            "another device of the same account"
+        );
+        assert_eq!(
+            self_unwrap(&other, &w, &c, &A, 7).err(),
+            Some(LogError::Sealed),
+            "another account's"
+        );
+        assert_eq!(
+            self_unwrap(&me, &w, &c, &A, 8).err(),
+            Some(LogError::Sealed),
+            "another epoch"
+        );
+        assert_eq!(
+            self_unwrap(&me, &w, "d:x", &A, 7).err(),
+            Some(LogError::Sealed),
+            "another conversation"
+        );
         // What the relay can make: an ECIES wrap to our public log key, "from us".
         let forged = wrap(&me.public(), &epoch_key(), &c, &A, 7, &A).unwrap();
-        assert!(self_unwrap(&me, &forged, &c, &A, 7).is_err(), "an ECIES wrap is never one of our own");
+        assert!(
+            self_unwrap(&me, &forged, &c, &A, 7).is_err(),
+            "an ECIES wrap is never one of our own"
+        );
     }
 
     #[test]
@@ -287,10 +421,19 @@ mod tests {
         let (back, at) = open_entry(&k, &c, &A, 1, &alice.public(), &sealed).unwrap();
         assert_eq!((back, at), (env.clone(), 1_700_000_000_000));
         // Moved to another conversation, sender or epoch by the relay: does not open.
-        assert_eq!(open_entry(&k, "d:other", &A, 1, &alice.public(), &sealed).err(), Some(LogError::Sealed));
-        assert_eq!(open_entry(&k, &c, &B, 1, &alice.public(), &sealed).err(), Some(LogError::Sealed));
+        assert_eq!(
+            open_entry(&k, "d:other", &A, 1, &alice.public(), &sealed).err(),
+            Some(LogError::Sealed)
+        );
+        assert_eq!(
+            open_entry(&k, &c, &B, 1, &alice.public(), &sealed).err(),
+            Some(LogError::Sealed)
+        );
         // A member holding K cannot write as alice: their signature is not hers.
         let forged = seal_entry(&k, &c, &A, 1, &mallory, &env, 1);
-        assert_eq!(open_entry(&k, &c, &A, 1, &alice.public(), &forged).err(), Some(LogError::Forged));
+        assert_eq!(
+            open_entry(&k, &c, &A, 1, &alice.public(), &forged).err(),
+            Some(LogError::Forged)
+        );
     }
 }

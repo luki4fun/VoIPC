@@ -46,7 +46,11 @@ pub fn fuzz_log(data: &[u8]) {
 pub fn fuzz_vault(data: &[u8]) {
     let blobs: Vec<VaultBlob> = ["slot.pass", "item.fuzz"]
         .iter()
-        .map(|k| VaultBlob { k: (*k).into(), v: data.to_vec(), version: 0 })
+        .map(|k| VaultBlob {
+            k: (*k).into(),
+            v: data.to_vec(),
+            version: 0,
+        })
         .collect();
     let _ = Vault::open_with_password(RELAY, "fuzz", &blobs, &[7; 32]);
     let _ = Vault::from_dek(RELAY, "fuzz", [7; 32]).open_item(&blobs, "item.fuzz");
@@ -72,9 +76,17 @@ mod tests {
     #[test]
     fn the_fuzz_targets_replay_on_stable() {
         let vault = Vault::from_dek(RELAY, "fuzz", [7; 32]);
-        replay("envelope", br#"{"v":1,"kind":"chat","text":"hi"}"#, fuzz_envelope);
+        replay(
+            "envelope",
+            br#"{"v":1,"kind":"chat","text":"hi"}"#,
+            fuzz_envelope,
+        );
         replay("keys", &[0x11; 32], fuzz_keys);
         replay("log", &[33; 64], fuzz_log);
-        replay("vault", &vault.seal_item("item.fuzz", 1, b"payload").v, fuzz_vault);
+        replay(
+            "vault",
+            &vault.seal_item("item.fuzz", 1, b"payload").v,
+            fuzz_vault,
+        );
     }
 }

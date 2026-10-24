@@ -3,9 +3,9 @@ pub mod capture;
 pub mod decoder;
 pub mod denoise;
 #[cfg(not(target_os = "android"))]
-pub mod echo;
-#[cfg(not(target_os = "android"))]
 pub mod device;
+#[cfg(not(target_os = "android"))]
+pub mod echo;
 pub mod encoder;
 #[cfg(any(test, fuzzing))]
 pub mod fuzz;
@@ -66,9 +66,8 @@ pub fn reset_playback_stats() {
 pub mod capture {
     use anyhow::Result;
     use oboe::{
-        AudioInputCallback, AudioInputStreamSafe, AudioStream, AudioStreamBase,
-        AudioStreamBuilder, DataCallbackResult, InputPreset, Mono, PerformanceMode,
-        SharingMode,
+        AudioInputCallback, AudioInputStreamSafe, AudioStream, AudioStreamBase, AudioStreamBuilder,
+        DataCallbackResult, InputPreset, Mono, PerformanceMode, SharingMode,
     };
     use ringbuf::traits::{Producer, Split};
     use ringbuf::HeapRb;
@@ -108,8 +107,7 @@ pub mod capture {
                 let _ = self.producer.push_slice(audio_data);
             } else {
                 self.scratch.clear();
-                self.scratch
-                    .extend(audio_data.iter().map(|s| s * g));
+                self.scratch.extend(audio_data.iter().map(|s| s * g));
                 let _ = self.producer.push_slice(&self.scratch);
             }
             DataCallbackResult::Continue
@@ -208,8 +206,8 @@ pub mod playback {
     use anyhow::Result;
     use oboe::{
         AudioOutputCallback, AudioOutputStreamSafe, AudioStream, AudioStreamBase,
-        AudioStreamBuilder, DataCallbackResult, Mono, PerformanceMode, SharingMode,
-        Usage, ContentType,
+        AudioStreamBuilder, ContentType, DataCallbackResult, Mono, PerformanceMode, SharingMode,
+        Usage,
     };
     use ringbuf::traits::{Consumer, Producer, Split};
     use ringbuf::HeapRb;

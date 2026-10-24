@@ -68,7 +68,9 @@ pub const PURGED: &str = "(earlier messages deleted by their writer)";
 /// writer wrote in this conversation up to `before` (ms) is to go from the
 /// readers' copies too. A relay can withhold one, never forge one.
 pub fn purge_envelope(id: &str, before: u64) -> Vec<u8> {
-    serde_json::json!({ "v": 2, "id": id, "kind": "purge", "before": before, "text": PURGED }).to_string().into_bytes()
+    serde_json::json!({ "v": 2, "id": id, "kind": "purge", "before": before, "text": PURGED })
+        .to_string()
+        .into_bytes()
 }
 
 /// Pack a message for sending.
@@ -94,16 +96,36 @@ pub fn envelope(id: &str, text: &str, ttl_secs: Option<u32>) -> Vec<u8> {
 /// no id for it.
 pub fn open_envelope(plaintext: &[u8]) -> Message {
     if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(plaintext) {
-        let id = || map.get("id").and_then(|v| v.as_str()).filter(|i| !i.is_empty()).map(|i| i.chars().take(MAX_MESSAGE_ID).collect());
-        let newer = map.get("v").and_then(|v| v.as_u64()).is_some_and(|v| v > ENVELOPE_V);
+        let id = || {
+            map.get("id")
+                .and_then(|v| v.as_str())
+                .filter(|i| !i.is_empty())
+                .map(|i| i.chars().take(MAX_MESSAGE_ID).collect())
+        };
+        let newer = map
+            .get("v")
+            .and_then(|v| v.as_u64())
+            .is_some_and(|v| v > ENVELOPE_V);
         match map.get("kind").and_then(|k| k.as_str()) {
             Some("purge") if !newer => {
                 if let Some(before) = map.get("before").and_then(|b| b.as_u64()) {
-                    return Message { id: id(), text: PURGED.into(), ttl_secs: None, purge_before: Some(before) };
+                    return Message {
+                        id: id(),
+                        text: PURGED.into(),
+                        ttl_secs: None,
+                        purge_before: Some(before),
+                    };
                 }
             }
             None if !newer => {}
-            _ => return Message { id: id(), text: NEWER_MESSAGE.into(), ttl_secs: None, purge_before: None },
+            _ => {
+                return Message {
+                    id: id(),
+                    text: NEWER_MESSAGE.into(),
+                    ttl_secs: None,
+                    purge_before: None,
+                }
+            }
         }
         if let Some(serde_json::Value::String(text)) = map.get("text") {
             let id = match map.get("id") {
@@ -120,7 +142,12 @@ pub fn open_envelope(plaintext: &[u8]) -> Message {
                 .and_then(|v| v.as_u64())
                 .filter(|t| *t > 0)
                 .map(|t| t.min(MAX_MESSAGE_TTL_SECS as u64) as u32);
-            return Message { id, text: text.clone(), ttl_secs, purge_before: None };
+            return Message {
+                id,
+                text: text.clone(),
+                ttl_secs,
+                purge_before: None,
+            };
         }
     }
     Message {
@@ -154,7 +181,11 @@ pub fn open_history_payload(
     let serde_json::Value::Object(map) = serde_json::from_slice(payload)? else {
         anyhow::bail!("history payload is not an object");
     };
-    if map.get("v").and_then(|v| v.as_u64()).is_some_and(|v| v > HISTORY_V) {
+    if map
+        .get("v")
+        .and_then(|v| v.as_u64())
+        .is_some_and(|v| v > HISTORY_V)
+    {
         anyhow::bail!("history from a newer VoIPC");
     }
     match map.get("channel").and_then(|v| v.as_u64()) {
@@ -179,14 +210,33 @@ mod tests {
     #[test]
     fn an_envelope_from_a_newer_voipc_is_a_placeholder() {
         let later = br#"{"v":3,"id":"abc","text":"hi","kind":"edit","target":"x"}"#;
-        assert_eq!(open_envelope(later), Message { id: Some("abc".into()), text: NEWER_MESSAGE.into(), ttl_secs: None, purge_before: None });
+        assert_eq!(
+            open_envelope(later),
+            Message {
+                id: Some("abc".into()),
+                text: NEWER_MESSAGE.into(),
+                ttl_secs: None,
+                purge_before: None
+            }
+        );
         let tomb = open_envelope(&purge_envelope("t1", 1_700_000_000_000));
-        assert_eq!((tomb.purge_before, tomb.text.as_str()), (Some(1_700_000_000_000), PURGED));
+        assert_eq!(
+            (tomb.purge_before, tomb.text.as_str()),
+            (Some(1_700_000_000_000), PURGED)
+        );
         let bad = br#"{"v":2,"id":"t2","kind":"purge","text":"x"}"#;
-        assert_eq!(open_envelope(bad).purge_before, None, "a tombstone without its moment is not one");
+        assert_eq!(
+            open_envelope(bad).purge_before,
+            None,
+            "a tombstone without its moment is not one"
+        );
         let no_text = br#"{"v":9,"id":"abc","reaction":"+1"}"#;
         assert_eq!(open_envelope(no_text).text, NEWER_MESSAGE);
-        assert_eq!(open_envelope(&envelope("i", "plain", None)).text, "plain", "today's still read");
+        assert_eq!(
+            open_envelope(&envelope("i", "plain", None)).text,
+            "plain",
+            "today's still read"
+        );
         assert!(open_history_payload(1, br#"{"v":4,"channel":1,"messages":[]}"#).is_err());
     }
 
@@ -207,7 +257,10 @@ mod tests {
         let m = open_envelope(&envelope("abc", "gone in an hour", Some(3600)));
         assert_eq!(m.ttl_secs, Some(3600));
         // A timer of zero is no timer, not a message that dies on arrival.
-        assert_eq!(open_envelope(&envelope("abc", "hi", Some(0))).ttl_secs, None);
+        assert_eq!(
+            open_envelope(&envelope("abc", "hi", Some(0))).ttl_secs,
+            None
+        );
         // One longer than we will keep is cut down where it enters, rather than
         // being written into somebody's archive as a date in the year 40000.
         let far = open_envelope(&envelope("abc", "hi", Some(u32::MAX)));

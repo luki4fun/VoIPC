@@ -42,7 +42,8 @@ jobs:
             build-essential pkg-config cmake protobuf-compiler libasound2-dev libclang-dev
 
       - name: Rust nightly
-        run: rustup toolchain install "$NIGHTLY" --profile minimal
+        # The pinned stable too: cargo-fuzz installs, and the lockfile check runs, with it
+        run: rustup toolchain install && rustup toolchain install "$NIGHTLY" --profile minimal
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -127,7 +128,7 @@ jobs:
           cache-dependency-path: client/package-lock.json
 
       - name: Rust toolchain
-        run: rustup update --no-self-update stable && rustup target add x86_64-unknown-linux-musl wasm32-unknown-unknown
+        run: rustup toolchain install && rustup target add x86_64-unknown-linux-musl wasm32-unknown-unknown
 
       - name: Lockfiles match the manifests
         run: for d in . crates/voipc-web crates/voipc-opus-wasm; do (cd "$d" && cargo fetch --locked); done

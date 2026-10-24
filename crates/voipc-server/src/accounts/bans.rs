@@ -6,7 +6,16 @@ use l4f_accounts::store::Store;
 use super::Relay;
 use crate::bans::{Ban, Key};
 
-type Row = (i64, Option<Vec<u8>>, Option<Vec<u8>>, String, String, String, i64, Option<i64>);
+type Row = (
+    i64,
+    Option<Vec<u8>>,
+    Option<Vec<u8>>,
+    String,
+    String,
+    String,
+    i64,
+    Option<i64>,
+);
 
 impl Relay {
     /// The key address bans are hashed with.
@@ -65,14 +74,27 @@ impl Relay {
         });
         Ok(rows
             .into_iter()
-            .filter_map(|(id, addr, account, label, reason, by, created_at, expires_at)| {
-                let key = match (addr, account) {
-                    (Some(h), None) => Key::Addr(h.try_into().ok()?),
-                    (None, Some(a)) => Key::Account(a.try_into().ok()?),
-                    _ => return None,
-                };
-                Some((key, Ban { id: id as u64, label, reason, by, created_at, expires_at, addr: None }))
-            })
+            .filter_map(
+                |(id, addr, account, label, reason, by, created_at, expires_at)| {
+                    let key = match (addr, account) {
+                        (Some(h), None) => Key::Addr(h.try_into().ok()?),
+                        (None, Some(a)) => Key::Account(a.try_into().ok()?),
+                        _ => return None,
+                    };
+                    Some((
+                        key,
+                        Ban {
+                            id: id as u64,
+                            label,
+                            reason,
+                            by,
+                            created_at,
+                            expires_at,
+                            addr: None,
+                        },
+                    ))
+                },
+            )
             .collect())
     }
 }

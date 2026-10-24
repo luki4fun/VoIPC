@@ -69,7 +69,9 @@ pub enum GameMessage {
     Update(Update),
     /// Press or release the user's push-to-talk, because they pressed their
     /// in-game radio key. Refused unless the user allowed it in Settings.
-    Transmit { on: bool },
+    Transmit {
+        on: bool,
+    },
     Ping,
     Bye,
 }
@@ -226,9 +228,11 @@ pub fn beacon_mode(mode: Option<&str>, allowed: bool) -> Result<bool, String> {
     match mode {
         None | Some("players") => Ok(false),
         Some("beacon") if allowed => Ok(true),
-        Some("beacon") => Err("the player has not allowed a game to broadcast their position \
+        Some("beacon") => Err(
+            "the player has not allowed a game to broadcast their position \
                                (Settings → Game Integration)"
-            .into()),
+                .into(),
+        ),
         Some(other) => Err(format!("unknown hello mode {other}")),
     }
 }
@@ -413,7 +417,11 @@ impl Placements {
     /// Everybody the game is letting through, base render or layer. A player
     /// heard only through a layer is still heard.
     pub fn audible(&self) -> std::collections::HashSet<u32> {
-        self.sources.keys().chain(self.layers.keys()).copied().collect()
+        self.sources
+            .keys()
+            .chain(self.layers.keys())
+            .copied()
+            .collect()
     }
 }
 
@@ -444,7 +452,10 @@ pub fn source_from(spec: &RenderSpec, base: bool, id: u32) -> Result<Option<Sour
     }
     // Every float is checked: one NaN would make the gains NaN and, through
     // the mixer's ramp state, silence that source for good.
-    let range = spec.range.filter(|r| r.is_finite()).unwrap_or(DEFAULT_RANGE);
+    let range = spec
+        .range
+        .filter(|r| r.is_finite())
+        .unwrap_or(DEFAULT_RANGE);
     let volume = spec.volume.filter(|v| v.is_finite()).unwrap_or(1.0);
     let pan = spec.pan.filter(|p| p.is_finite()).unwrap_or(0.0);
     Ok(Some(Source {
@@ -530,13 +541,19 @@ pub fn origin_allowed(origin: &str, extra: &[String]) -> bool {
         // Exactly the host, or the host followed by a port — never a longer
         // name that merely starts with it
         origin == host
-            || origin.strip_prefix(host).and_then(|rest| rest.strip_prefix(':')).is_some_and(
-                |port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()),
-            )
+            || origin
+                .strip_prefix(host)
+                .and_then(|rest| rest.strip_prefix(':'))
+                .is_some_and(|port| !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()))
     };
-    let fivem = origin.strip_prefix(FIVEM_ORIGIN_PREFIX).is_some_and(|name| {
-        !name.is_empty() && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-    });
+    let fivem = origin
+        .strip_prefix(FIVEM_ORIGIN_PREFIX)
+        .is_some_and(|name| {
+            !name.is_empty()
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+        });
     fivem
         || DEFAULT_ORIGIN_HOSTS.iter().any(|h| host_match(h))
         // What the user typed into Settings is matched exactly, for the same reason
@@ -583,7 +600,11 @@ pub fn parse_link(buf: &[u8]) -> Option<Link> {
     }
     let avatar_pos = [f32_at(8), f32_at(12), f32_at(16)];
     let avatar_front = [f32_at(20), f32_at(24), f32_at(28)];
-    if !avatar_pos.iter().chain(avatar_front.iter()).all(|c| c.is_finite()) {
+    if !avatar_pos
+        .iter()
+        .chain(avatar_front.iter())
+        .all(|c| c.is_finite())
+    {
         return None;
     }
     // Mumble's frame is the one games render in: Y up, and metres. VoIPC's is

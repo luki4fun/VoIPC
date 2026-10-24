@@ -7,8 +7,8 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use super::{
-    run_encode_loop, AudioProcessor, CapturedFrame, DisplayInfo, FrameProcessor, FrameSlot,
-    PixFmt, WindowInfo, SCREEN_AUDIO_BITRATE, SCREEN_AUDIO_FRAME_SIZE,
+    run_encode_loop, AudioProcessor, CapturedFrame, DisplayInfo, FrameProcessor, FrameSlot, PixFmt,
+    WindowInfo, SCREEN_AUDIO_BITRATE, SCREEN_AUDIO_FRAME_SIZE,
 };
 
 // ── Win32 imports for window/monitor enumeration ──────────────────────────
@@ -21,25 +21,25 @@ use windows::Win32::Graphics::Gdi::{
 use windows::Win32::System::ProcessStatus::GetModuleFileNameExW;
 use windows::Win32::System::Threading::{OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EnumWindows, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW,
-    GetWindowThreadProcessId, IsWindowVisible, GWL_EXSTYLE, GWL_STYLE, WS_CHILD, WS_EX_TOOLWINDOW,
+    EnumWindows, GetWindowLongW, GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId,
+    IsWindowVisible, GWL_EXSTYLE, GWL_STYLE, WS_CHILD, WS_EX_TOOLWINDOW,
 };
 
 // ── WGC imports for screen capture (displays + windows) ──────────────────
 
+use windows::core::Interface;
 use windows::Graphics::Capture::{Direct3D11CaptureFramePool, GraphicsCaptureItem};
 use windows::Graphics::DirectX::DirectXPixelFormat;
+use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Direct3D11::{
     D3D11CreateDevice, ID3D11Device, ID3D11Resource, ID3D11Texture2D, D3D11_CPU_ACCESS_READ,
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
-use windows::Win32::Graphics::Direct3D::D3D_DRIVER_TYPE_HARDWARE;
 use windows::Win32::Graphics::Dxgi::IDXGIDevice;
 use windows::Win32::System::WinRT::Direct3D11::{
     CreateDirect3D11DeviceFromDXGIDevice, IDirect3DDxgiInterfaceAccess,
 };
-use windows::core::Interface;
 
 // ── Public API ──────────────────────────────────────────────────────────
 
@@ -237,7 +237,9 @@ pub async fn request_screencast(
             }
 
             Ok(CaptureSession {
-                source: CaptureSource::Display { hmonitor: hmonitor_val },
+                source: CaptureSource::Display {
+                    hmonitor: hmonitor_val,
+                },
             })
         }
         "window" => {
@@ -381,8 +383,9 @@ fn run_capture_and_encode(
     preview: Arc<AtomicBool>,
     viewers: Arc<AtomicU32>,
 ) -> Result<(), String> {
-    let encoder = voipc_video::encoder::Encoder::new(codec, target_width, target_height, bitrate, target_fps)
-        .map_err(|e| format!("Failed to create the {codec:?} encoder: {e}"))?;
+    let encoder =
+        voipc_video::encoder::Encoder::new(codec, target_width, target_height, bitrate, target_fps)
+            .map_err(|e| format!("Failed to create the {codec:?} encoder: {e}"))?;
 
     let source_desc = match &source {
         CaptureSource::Display { hmonitor } => format!("WGC monitor 0x{:x}", hmonitor),
@@ -406,7 +409,9 @@ fn run_capture_and_encode(
     let capture_thread = std::thread::Builder::new()
         .name("wgc-capture".into())
         .spawn(move || {
-            if let Err(e) = run_wgc_capture_loop(capture_source, target_fps, capture_active, capture_slot) {
+            if let Err(e) =
+                run_wgc_capture_loop(capture_source, target_fps, capture_active, capture_slot)
+            {
                 error!("WGC capture error: {}", e);
             }
         })
@@ -499,21 +504,22 @@ fn run_wgc_capture_loop(
 
     // Create D3D11 device for WGC frame pool
     let (d3d_device, d3d_context) = create_d3d11_device()?;
-    let dxgi_device: IDXGIDevice = d3d_device.cast()
+    let dxgi_device: IDXGIDevice = d3d_device
+        .cast()
         .map_err(|e| format!("Failed to cast to IDXGIDevice: {e}"))?;
 
-    let inspectable = unsafe {
-        CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device)
-    }
-    .map_err(|e| format!("CreateDirect3D11DeviceFromDXGIDevice: {e}"))?;
+    let inspectable = unsafe { CreateDirect3D11DeviceFromDXGIDevice(&dxgi_device) }
+        .map_err(|e| format!("CreateDirect3D11DeviceFromDXGIDevice: {e}"))?;
 
-    let direct3d_device: windows::Graphics::DirectX::Direct3D11::IDirect3DDevice =
-        inspectable.cast()
-            .map_err(|e| format!("Failed to cast to IDirect3DDevice: {e}"))?;
+    let direct3d_device: windows::Graphics::DirectX::Direct3D11::IDirect3DDevice = inspectable
+        .cast()
+        .map_err(|e| format!("Failed to cast to IDirect3DDevice: {e}"))?;
 
     // Create capture item from the source (monitor or window)
     let item = create_capture_item(&source)?;
-    let size = item.Size().map_err(|e| format!("Failed to get capture item size: {e}"))?;
+    let size = item
+        .Size()
+        .map_err(|e| format!("Failed to get capture item size: {e}"))?;
 
     // Create frame pool
     let pool = Direct3D11CaptureFramePool::CreateFreeThreaded(
@@ -650,7 +656,9 @@ fn run_wgc_capture_loop(
 
                 let new_staging = unsafe {
                     let mut staging_opt: Option<ID3D11Texture2D> = None;
-                    if let Err(e) = d3d_device.CreateTexture2D(&staging_desc, None, Some(&mut staging_opt)) {
+                    if let Err(e) =
+                        d3d_device.CreateTexture2D(&staging_desc, None, Some(&mut staging_opt))
+                    {
                         warn!("WGC: failed to create staging texture: {}", e);
                         continue;
                     }
@@ -694,10 +702,8 @@ fn run_wgc_capture_loop(
 
             // Map the staging texture for CPU read
             let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-            if unsafe {
-                d3d_context.Map(staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped))
-            }
-            .is_err()
+            if unsafe { d3d_context.Map(staging_res, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
+                .is_err()
             {
                 warn!("WGC: failed to map staging texture");
                 continue;
@@ -743,7 +749,13 @@ fn run_wgc_capture_loop(
 }
 
 /// Create a D3D11 device for WGC frame processing.
-fn create_d3d11_device() -> Result<(ID3D11Device, windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext), String> {
+fn create_d3d11_device() -> Result<
+    (
+        ID3D11Device,
+        windows::Win32::Graphics::Direct3D11::ID3D11DeviceContext,
+    ),
+    String,
+> {
     let mut device = None;
     let mut context = None;
 

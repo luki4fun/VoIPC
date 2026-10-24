@@ -54,7 +54,10 @@ type EntryRow = (i64, Vec<u8>, i64, i64, Vec<u8>);
 type MemberRow = (Vec<u8>, String, Vec<u8>, Vec<u8>, Vec<u8>);
 
 fn now_ms() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as i64
 }
 
 fn id16(v: Vec<u8>) -> [u8; 16] {
@@ -81,7 +84,12 @@ async fn members(relay: &Relay, conv: &str, me: &[u8; 16]) -> Result<Option<Vec<
     Ok(members.contains(me).then_some(members))
 }
 
-pub(super) async fn publish(relay: &Relay, me: AccountId, logkey: &[u8], sig: &[u8]) -> Result<AccountReply> {
+pub(super) async fn publish(
+    relay: &Relay,
+    me: AccountId,
+    logkey: &[u8],
+    sig: &[u8],
+) -> Result<AccountReply> {
     if logkey.len() != 33 || sig.len() != 64 {
         return Ok(refused("LogKeyPublish", "malformed log key"));
     }
@@ -117,17 +125,42 @@ pub(super) async fn keys(relay: &Relay, accounts: &[[u8; 16]]) -> Result<Account
             .await?
         });
         if let Some((name, identity, logkey, sig)) = row {
-            found.push(LogKeyInfo { account: *a, name, identity, logkey, sig });
+            found.push(LogKeyInfo {
+                account: *a,
+                name,
+                identity,
+                logkey,
+                sig,
+            });
         }
     }
     Ok(AccountReply::LogKeysFound { keys: found })
 }
 
 /// Files the wraps; also says which recipients to tell (`LogNews`).
-pub(super) async fn epoch_put(relay: &Relay, me: AccountId, conv: &str, epoch: u32, wraps: &[WrapIn]) -> Result<(AccountReply, Vec<[u8; 16]>)> {
-    let Some(members) = members(relay, conv, &me.0).await? else { return Ok((refused("EpochPut", "not a conversation of yours"), Vec::new())) };
-    if wraps.is_empty() || wraps.len() > members.len() || wraps.iter().any(|w| !members.contains(&w.recipient) || w.wrapped.len() > 128) {
-        return Ok((refused("EpochPut", "wraps for somebody outside the conversation"), Vec::new()));
+pub(super) async fn epoch_put(
+    relay: &Relay,
+    me: AccountId,
+    conv: &str,
+    epoch: u32,
+    wraps: &[WrapIn],
+) -> Result<(AccountReply, Vec<[u8; 16]>)> {
+    let Some(members) = members(relay, conv, &me.0).await? else {
+        return Ok((
+            refused("EpochPut", "not a conversation of yours"),
+            Vec::new(),
+        ));
+    };
+    if wraps.is_empty()
+        || wraps.len() > members.len()
+        || wraps
+            .iter()
+            .any(|w| !members.contains(&w.recipient) || w.wrapped.len() > 128)
+    {
+        return Ok((
+            refused("EpochPut", "wraps for somebody outside the conversation"),
+            Vec::new(),
+        ));
     }
     let now = util::now();
     let known: i64 = db!(relay.store(), pool => {
@@ -148,12 +181,24 @@ pub(super) async fn epoch_put(relay: &Relay, me: AccountId, conv: &str, epoch: u
                 .await?
         });
         if recent >= NEW_EPOCHS_PER_HOUR {
-            return Ok((refused("EpochPut", "Too many new keys for this conversation; try again later."), Vec::new()));
+            return Ok((
+                refused(
+                    "EpochPut",
+                    "Too many new keys for this conversation; try again later.",
+                ),
+                Vec::new(),
+            ));
         }
     }
     let adding: i64 = wraps.iter().map(|w| w.wrapped.len() as i64).sum();
     if used_bytes(relay, &me).await? + adding > relay.quota {
-        return Ok((refused("EpochPut", "Your stored messages are over this server's limit."), Vec::new()));
+        return Ok((
+            refused(
+                "EpochPut",
+                "Your stored messages are over this server's limit.",
+            ),
+            Vec::new(),
+        ));
     }
     // One transaction: one commit for the whole epoch, not one per member
     db!(relay.store(), pool => {
@@ -184,8 +229,18 @@ pub(super) async fn epoch_put(relay: &Relay, me: AccountId, conv: &str, epoch: u
         }
         tx.commit().await?;
     });
-    let told = wraps.iter().map(|w| w.recipient).filter(|r| *r != me.0).collect();
-    Ok((AccountReply::EpochStored { conv: conv.to_string(), epoch }, told))
+    let told = wraps
+        .iter()
+        .map(|w| w.recipient)
+        .filter(|r| *r != me.0)
+        .collect();
+    Ok((
+        AccountReply::EpochStored {
+            conv: conv.to_string(),
+            epoch,
+        },
+        told,
+    ))
 }
 
 pub(super) async fn wraps(relay: &Relay, me: AccountId, conv: &str) -> Result<AccountReply> {
@@ -219,11 +274,28 @@ pub(super) async fn wraps(relay: &Relay, me: AccountId, conv: &str) -> Result<Ac
         .fetch_all(pool)
         .await?
     });
-    let wraps = rows.into_iter().map(|(owner, epoch, wrapped)| WrapOut { owner: id16(owner), epoch: epoch as u32, wrapped }).collect();
-    Ok(AccountReply::Wraps { conv: conv.to_string(), wraps })
+    let wraps = rows
+        .into_iter()
+        .map(|(owner, epoch, wrapped)| WrapOut {
+            owner: id16(owner),
+            epoch: epoch as u32,
+            wrapped,
+        })
+        .collect();
+    Ok(AccountReply::Wraps {
+        conv: conv.to_string(),
+        wraps,
+    })
 }
 
-pub(super) async fn append(relay: &Relay, me: AccountId, conv: &str, epoch: u32, ct: &[u8], ttl_secs: Option<u32>) -> Result<AccountReply> {
+pub(super) async fn append(
+    relay: &Relay,
+    me: AccountId,
+    conv: &str,
+    epoch: u32,
+    ct: &[u8],
+    ttl_secs: Option<u32>,
+) -> Result<AccountReply> {
     if !relay.cloud {
         return Ok(refused("LogAppend", "This server keeps no messages."));
     }
@@ -249,15 +321,23 @@ pub(super) async fn append(relay: &Relay, me: AccountId, conv: &str, epoch: u32,
         got.sort_unstable();
         want.sort_unstable();
         if got != want {
-            return Ok(AccountReply::LogRekey { conv: conv.to_string() });
+            return Ok(AccountReply::LogRekey {
+                conv: conv.to_string(),
+            });
         }
     }
     if used_bytes(relay, &me).await? + ct.len() as i64 > relay.quota {
-        return Ok(refused("LogAppend", "Your stored messages are over this server's limit."));
+        return Ok(refused(
+            "LogAppend",
+            "Your stored messages are over this server's limit.",
+        ));
     }
     let server_at = now_ms();
     // The message's own timer when it has one, never past the relay's retention.
-    let keep = ttl_secs.map(|t| i64::from(t) * 1000).unwrap_or(i64::MAX).min(relay.retention_ms);
+    let keep = ttl_secs
+        .map(|t| i64::from(t) * 1000)
+        .unwrap_or(i64::MAX)
+        .min(relay.retention_ms);
     let keep_until = server_at.saturating_add(keep);
     let seq: i64 = db!(relay.store(), pool => {
         sqlx::query_scalar(
@@ -272,10 +352,19 @@ pub(super) async fn append(relay: &Relay, me: AccountId, conv: &str, epoch: u32,
         .fetch_one(pool)
         .await?
     });
-    Ok(AccountReply::LogAppended { conv: conv.to_string(), seq, server_at: server_at as u64 })
+    Ok(AccountReply::LogAppended {
+        conv: conv.to_string(),
+        seq,
+        server_at: server_at as u64,
+    })
 }
 
-pub(super) async fn fetch(relay: &Relay, me: AccountId, conv: &str, after: i64) -> Result<AccountReply> {
+pub(super) async fn fetch(
+    relay: &Relay,
+    me: AccountId,
+    conv: &str,
+    after: i64,
+) -> Result<AccountReply> {
     if members(relay, conv, &me.0).await?.is_none() {
         return Ok(refused("LogFetch", "not a conversation of yours"));
     }
@@ -301,17 +390,31 @@ pub(super) async fn fetch(relay: &Relay, me: AccountId, conv: &str, after: i64) 
             more = true;
             break;
         }
-        entries.push(LogEntry { seq, sender: id16(sender), epoch: epoch as u32, server_at: server_at as u64, ct });
+        entries.push(LogEntry {
+            seq,
+            sender: id16(sender),
+            epoch: epoch as u32,
+            server_at: server_at as u64,
+            ct,
+        });
     }
     let owed: Vec<Vec<u8>> = db!(relay.store(), pool => {
         sqlx::query_scalar("SELECT owner FROM voipc_pending WHERE conv = $1 AND recipient = $2").bind(conv).bind(&me.0[..]).fetch_all(pool).await?
     });
-    Ok(AccountReply::LogPage { conv: conv.to_string(), entries, more, owed: owed.into_iter().map(id16).collect() })
+    Ok(AccountReply::LogPage {
+        conv: conv.to_string(),
+        entries,
+        more,
+        owed: owed.into_iter().map(id16).collect(),
+    })
 }
 
 /// The conversations with something for us, and every joiner still waiting
 /// for our keys (one `LogPending` per conversation).
-pub(super) async fn index(relay: &Relay, me: AccountId) -> Result<(AccountReply, Vec<AccountReply>)> {
+pub(super) async fn index(
+    relay: &Relay,
+    me: AccountId,
+) -> Result<(AccountReply, Vec<AccountReply>)> {
     let hex = me.hex();
     let now_ms = now_ms();
     let convs: Vec<(String, i64)> = db!(relay.store(), pool => {
@@ -336,8 +439,15 @@ pub(super) async fn index(relay: &Relay, me: AccountId) -> Result<(AccountReply,
     let mut pending: Vec<AccountReply> = Vec::new();
     for (conv, r) in rows {
         match pending.last_mut() {
-            Some(AccountReply::LogPending { conv: c, joiners }) if *c == conv && joiners.len() < MAX_MEMBERS as usize => joiners.push(id16(r)),
-            _ => pending.push(AccountReply::LogPending { conv, joiners: vec![id16(r)] }),
+            Some(AccountReply::LogPending { conv: c, joiners })
+                if *c == conv && joiners.len() < MAX_MEMBERS as usize =>
+            {
+                joiners.push(id16(r))
+            }
+            _ => pending.push(AccountReply::LogPending {
+                conv,
+                joiners: vec![id16(r)],
+            }),
         }
     }
     Ok((AccountReply::LogConvs { convs }, pending))
@@ -346,9 +456,17 @@ pub(super) async fn index(relay: &Relay, me: AccountId) -> Result<(AccountReply,
 /// Makes `me` a stored member of a channel's log; `present` says the session
 /// is in that channel now (the relay's own admission decided that). Also
 /// says which writers to tell: each one that keeps keys here owes us an answer.
-pub(crate) async fn join(relay: &Relay, me: AccountId, conv: &str, present: bool) -> Result<(AccountReply, Vec<[u8; 16]>)> {
+pub(crate) async fn join(
+    relay: &Relay,
+    me: AccountId,
+    conv: &str,
+    present: bool,
+) -> Result<(AccountReply, Vec<[u8; 16]>)> {
     if !relay.cloud {
-        return Ok((refused("LogJoin", "This server keeps no messages."), Vec::new()));
+        return Ok((
+            refused("LogJoin", "This server keeps no messages."),
+            Vec::new(),
+        ));
     }
     if !is_channel(conv) || !present {
         return Ok((refused("LogJoin", "Join the channel first."), Vec::new()));
@@ -367,12 +485,23 @@ pub(crate) async fn join(relay: &Relay, me: AccountId, conv: &str, present: bool
             .rows_affected()
     });
     if added == 0 {
-        return Ok((AccountReply::LogJoined { conv: conv.to_string() }, Vec::new()));
+        return Ok((
+            AccountReply::LogJoined {
+                conv: conv.to_string(),
+            },
+            Vec::new(),
+        ));
     }
     if count >= MAX_MEMBERS {
         // ponytail: counted before the insert, so two at once can pass it by one.
         remove(relay.store(), conv, &me.0).await?;
-        return Ok((refused("LogJoin", "This channel keeps history for as many people as it can."), Vec::new()));
+        return Ok((
+            refused(
+                "LogJoin",
+                "This channel keeps history for as many people as it can.",
+            ),
+            Vec::new(),
+        ));
     }
     db!(relay.store(), pool => {
         sqlx::query(
@@ -391,7 +520,12 @@ pub(crate) async fn join(relay: &Relay, me: AccountId, conv: &str, present: bool
     let owners: Vec<Vec<u8>> = db!(relay.store(), pool => {
         sqlx::query_scalar("SELECT owner FROM voipc_pending WHERE conv = $1 AND recipient = $2").bind(conv).bind(&me.0[..]).fetch_all(pool).await?
     });
-    Ok((AccountReply::LogJoined { conv: conv.to_string() }, owners.into_iter().map(id16).collect()))
+    Ok((
+        AccountReply::LogJoined {
+            conv: conv.to_string(),
+        },
+        owners.into_iter().map(id16).collect(),
+    ))
 }
 
 pub(super) async fn leave(relay: &Relay, me: AccountId, conv: &str) -> Result<AccountReply> {
@@ -399,13 +533,19 @@ pub(super) async fn leave(relay: &Relay, me: AccountId, conv: &str) -> Result<Ac
         return Ok(refused("LogLeave", "not a channel's log"));
     }
     remove(relay.store(), conv, &me.0).await?;
-    Ok(AccountReply::LogLeft { conv: conv.to_string() })
+    Ok(AccountReply::LogLeft {
+        conv: conv.to_string(),
+    })
 }
 
 /// Deletes what `me` wrote to the stored logs, in `conv` or everywhere, and
 /// the keys it handed out for it. Other people's entries stay: they are
 /// theirs. Its next post there starts a new key.
-pub(super) async fn purge(relay: &Relay, me: AccountId, conv: Option<&str>) -> Result<AccountReply> {
+pub(super) async fn purge(
+    relay: &Relay,
+    me: AccountId,
+    conv: Option<&str>,
+) -> Result<AccountReply> {
     let entries: u64 = db!(relay.store(), pool => {
         let mut tx = pool.begin().await?;
         let n = sqlx::query("DELETE FROM voipc_log WHERE sender = $1 AND ($2 IS NULL OR conv = $2)")
@@ -418,7 +558,10 @@ pub(super) async fn purge(relay: &Relay, me: AccountId, conv: Option<&str>) -> R
         tx.commit().await?;
         n
     });
-    Ok(AccountReply::LogPurged { conv: conv.map(str::to_string), entries })
+    Ok(AccountReply::LogPurged {
+        conv: conv.map(str::to_string),
+        entries,
+    })
 }
 
 /// Takes `account` out of a channel's log: it leaves, is kicked, or no longer
@@ -461,8 +604,20 @@ pub(super) async fn members_of(relay: &Relay, me: AccountId, conv: &str) -> Resu
         .fetch_all(pool)
         .await?
     });
-    let members = rows.into_iter().map(|(a, name, identity, logkey, sig)| LogKeyInfo { account: id16(a), name, identity, logkey, sig }).collect();
-    Ok(AccountReply::LogMembersFound { conv: conv.to_string(), members })
+    let members = rows
+        .into_iter()
+        .map(|(a, name, identity, logkey, sig)| LogKeyInfo {
+            account: id16(a),
+            name,
+            identity,
+            logkey,
+            sig,
+        })
+        .collect();
+    Ok(AccountReply::LogMembersFound {
+        conv: conv.to_string(),
+        members,
+    })
 }
 
 /// Entries past their time, and the keys and pending answers nothing needs

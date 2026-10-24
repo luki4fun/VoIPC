@@ -45,7 +45,6 @@ pub struct SoundSettings {
     pub poke: SoundEntry,
 }
 
-
 /// A saved server entry shown in the connect dialog.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedServer {
@@ -344,7 +343,9 @@ pub fn resolve_chat_history_path(config: &AppConfig) -> PathBuf {
 /// to the new XDG-compliant directory. Only runs once — skips if files already exist
 /// at the new location or if old files don't exist.
 pub fn migrate_legacy_paths() {
-    let Ok(exe) = std::env::current_exe() else { return };
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
     let Some(exe_dir) = exe.parent() else { return };
 
     let new_dir = data_dir();
@@ -375,18 +376,25 @@ pub fn migrate_legacy_paths() {
 pub fn load_config() -> AppConfig {
     let path = config_path();
     match std::fs::read_to_string(&path) {
-        Ok(contents) => match serde_json::from_str(&contents) {
-            Ok(config) => config,
-            Err(e) => {
-                let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
-                let aside = path.with_file_name(format!("settings.json.unreadable-{secs}"));
-                let kept = std::fs::rename(&path, &aside);
-                tracing::warn!("Failed to parse {}: {e} — using defaults (the file is kept as {}: {kept:?})", path.display(), aside.display());
-                AppConfig::default()
+        Ok(contents) => {
+            match serde_json::from_str(&contents) {
+                Ok(config) => config,
+                Err(e) => {
+                    let secs = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map_or(0, |d| d.as_secs());
+                    let aside = path.with_file_name(format!("settings.json.unreadable-{secs}"));
+                    let kept = std::fs::rename(&path, &aside);
+                    tracing::warn!("Failed to parse {}: {e} — using defaults (the file is kept as {}: {kept:?})", path.display(), aside.display());
+                    AppConfig::default()
+                }
             }
-        },
+        }
         Err(e) => {
-            tracing::info!("Could not read config {}: {e} — using defaults", path.display());
+            tracing::info!(
+                "Could not read config {}: {e} — using defaults",
+                path.display()
+            );
             AppConfig::default()
         }
     }
@@ -418,13 +426,16 @@ pub fn write_atomic(path: &std::path::Path, data: &[u8]) -> std::io::Result<()> 
 pub fn save_config(config: &AppConfig) -> Result<(), String> {
     let path = config_path();
     if config.format > SETTINGS_FORMAT {
-        return Err("Settings were saved by a newer VoIPC: changes are not saved by this one".into());
+        return Err(
+            "Settings were saved by a newer VoIPC: changes are not saved by this one".into(),
+        );
     }
     let json = serde_json::to_string_pretty(config)
         .map_err(|e| format!("Failed to serialize config: {e}"))?;
     // Never write a file the next start cannot read: a float that is not
     // finite becomes `null`, which then fails the whole parse.
-    serde_json::from_str::<AppConfig>(&json).map_err(|e| format!("Refusing to save settings that would not load again: {e}"))?;
+    serde_json::from_str::<AppConfig>(&json)
+        .map_err(|e| format!("Refusing to save settings that would not load again: {e}"))?;
     write_atomic(&path, json.as_bytes())
         .map_err(|e| format!("Failed to write {}: {e}", path.display()))
 }
@@ -447,12 +458,23 @@ mod tests {
         write_atomic(&path, b"first").unwrap();
         write_atomic(&path, b"second, longer").unwrap();
         assert_eq!(std::fs::read(&path).unwrap(), b"second, longer");
-        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
-        assert_eq!(names, ["chat_history.bin"], "the .tmp was renamed over, not left behind");
+        let names: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(
+            names,
+            ["chat_history.bin"],
+            "the .tmp was renamed over, not left behind"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600, "readable by this user only");
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "readable by this user only"
+            );
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -462,7 +484,8 @@ mod tests {
     /// written (H4-12: one `inf` used to reset the whole file).
     #[test]
     fn settings_keep_what_they_do_not_know_and_never_write_what_will_not_load() {
-        let mut config: AppConfig = serde_json::from_str(r#"{"volume": 0.5, "from_1_1": {"x": 1}}"#).unwrap();
+        let mut config: AppConfig =
+            serde_json::from_str(r#"{"volume": 0.5, "from_1_1": {"x": 1}}"#).unwrap();
         assert_eq!(config.format, SETTINGS_FORMAT, "a 0.12 file is format 1");
         let text = serde_json::to_string(&config).unwrap();
         assert!(text.contains("from_1_1"), "{text}");
@@ -489,15 +512,17 @@ mod tests {
     /// in Rust would notice and the user would just find their layout reset.
     #[test]
     fn ui_prefs_round_trip_verbatim() {
-        let mut config = AppConfig::default();
-        config.ui_prefs = serde_json::json!({
-            "layout": "modern",
-            "palette_overrides": { "--accent": "#ff0000" },
-            // A key a newer build wrote and this one knows nothing about. It
-            // has to survive, or running two versions against one config file
-            // loses a setting on every save.
-            "something_from_the_future": [1, 2, 3],
-        });
+        let config = AppConfig {
+            ui_prefs: serde_json::json!({
+                "layout": "modern",
+                "palette_overrides": { "--accent": "#ff0000" },
+                // A key a newer build wrote and this one knows nothing about. It
+                // has to survive, or running two versions against one config file
+                // loses a setting on every save.
+                "something_from_the_future": [1, 2, 3],
+            }),
+            ..AppConfig::default()
+        };
 
         let text = serde_json::to_string_pretty(&config).expect("serialize");
         let back: AppConfig = serde_json::from_str(&text).expect("deserialize");
@@ -528,29 +553,39 @@ mod tests {
         assert!(config.open_servers.is_empty());
         assert_eq!(config.last_host.as_deref(), Some("voice.example"));
 
-        let mut config = AppConfig::default();
-        config.open_servers = vec![
-            SavedServer {
-                name: "one".into(),
-                host: "a.example".into(),
-                port: 9987,
-                username: "luki".into(),
-                accept_self_signed: false,
-                account: false,
-            },
-            SavedServer {
-                name: "two".into(),
-                host: "b.example".into(),
-                port: 9988,
-                username: "luki".into(),
-                accept_self_signed: true,
-                account: true,
-            },
-        ];
+        let config = AppConfig {
+            open_servers: vec![
+                SavedServer {
+                    name: "one".into(),
+                    host: "a.example".into(),
+                    port: 9987,
+                    username: "luki".into(),
+                    accept_self_signed: false,
+                    account: false,
+                },
+                SavedServer {
+                    name: "two".into(),
+                    host: "b.example".into(),
+                    port: 9988,
+                    username: "luki".into(),
+                    accept_self_signed: true,
+                    account: true,
+                },
+            ],
+            ..AppConfig::default()
+        };
         let text = serde_json::to_string(&config).expect("serialize");
         let back: AppConfig = serde_json::from_str(&text).expect("deserialize");
-        let hosts: Vec<_> = back.open_servers.iter().map(|s| (s.host.as_str(), s.port)).collect();
-        assert_eq!(hosts, [("a.example", 9987), ("b.example", 9988)], "order is the opening order");
+        let hosts: Vec<_> = back
+            .open_servers
+            .iter()
+            .map(|s| (s.host.as_str(), s.port))
+            .collect();
+        assert_eq!(
+            hosts,
+            [("a.example", 9987), ("b.example", 9988)],
+            "order is the opening order"
+        );
         assert!(back.open_servers[1].accept_self_signed);
     }
 }

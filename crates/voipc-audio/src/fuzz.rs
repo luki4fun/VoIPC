@@ -13,9 +13,11 @@ use std::time::{Duration, Instant};
 /// (op, sequence) that push, pop or peek. The buffer stays within its cap,
 /// and draining it ends.
 pub fn fuzz_jitter(data: &[u8]) {
-    let Some((&delay, ops)) = data.split_first() else { return };
+    let Some((&delay, ops)) = data.split_first() else {
+        return;
+    };
     let mut jb = JitterBuffer::new(delay as usize % 10);
-    for record in ops.chunks_exact(5) {
+    for record in ops.as_chunks::<5>().0 {
         let seq = u32::from_be_bytes([record[1], record[2], record[3], record[4]]);
         match record[0] % 4 {
             0 | 1 => jb.push(seq, vec![record[0]]),
@@ -67,27 +69,41 @@ pub fn fuzz_game(data: &[u8]) {
     if let Some(link) = game::parse_link(data) {
         assert!(link.pos.iter().chain(&link.fwd).all(|c| c.is_finite()));
     }
-    let Ok(text) = std::str::from_utf8(data) else { return };
+    let Ok(text) = std::str::from_utf8(data) else {
+        return;
+    };
     // H4-01: nothing but FiveM's exact shape and the default hosts gets in
     if game::origin_allowed(text, &[]) {
         let o = text.trim();
         assert!(
             o.starts_with(game::FIVEM_ORIGIN_PREFIX)
-                || game::DEFAULT_ORIGIN_HOSTS.iter().any(|h| o == *h || o.starts_with(&format!("{h}:"))),
+                || game::DEFAULT_ORIGIN_HOSTS
+                    .iter()
+                    .any(|h| o == *h || o.starts_with(&format!("{h}:"))),
             "origin {o:?} was allowed"
         );
     }
     let name = game::short_name(text, "fallback");
     assert!(!name.is_empty() && name.chars().count() <= game::MAX_NAME);
     if let Ok(GameMessage::Update(update)) = serde_json::from_str::<GameMessage>(text) {
-        let Ok(placed) = game::sources_from(update.players, &HashMap::new(), Duration::from_millis(50), Instant::now())
-        else {
+        let Ok(placed) = game::sources_from(
+            update.players,
+            &HashMap::new(),
+            Duration::from_millis(50),
+            Instant::now(),
+        ) else {
             return;
         };
         assert!(placed.layers.values().all(|l| l.len() <= game::MAX_LAYERS));
-        for s in placed.sources.values().chain(placed.layers.values().flatten()) {
+        for s in placed
+            .sources
+            .values()
+            .chain(placed.layers.values().flatten())
+        {
             assert!(s.pos.iter().all(|c| c.is_finite()));
-            assert!(s.range >= 0.01 && (0.0..=2.0).contains(&s.volume) && (-1.0..=1.0).contains(&s.pan));
+            assert!(
+                s.range >= 0.01 && (0.0..=2.0).contains(&s.volume) && (-1.0..=1.0).contains(&s.pan)
+            );
             assert!(u32::from(s.delay_frames) <= game::MAX_DELAY_MS / game::FRAME_MS);
         }
     }
@@ -113,7 +129,10 @@ mod tests {
     #[test]
     fn the_fuzz_targets_replay_on_stable() {
         // push 1, 3, 2, a wrapped 0xffffffff, then pops
-        let jitter = [2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 3, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff, 0xff];
+        let jitter = [
+            2, 0, 0, 0, 0, 1, 0, 0, 0, 0, 3, 0, 0, 0, 0, 2, 2, 0, 0, 0, 0, 0, 0xff, 0xff, 0xff,
+            0xff,
+        ];
         replay("jitter", &jitter, fuzz_jitter);
         replay("opus", &[0, 3, 0, 0xfc, 0xff, 0xfe, 2, 0, 0], fuzz_opus);
         let update = br#"{"type":"update","players":[{"id":1,"pos":[1,2,3],"range":1e30,"volume":9,"pan":-7,"delay":99999,"layers":[{},{},{},{}]}]}"#;

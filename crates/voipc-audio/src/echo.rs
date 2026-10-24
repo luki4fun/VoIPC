@@ -31,7 +31,13 @@ impl EchoReference {
     /// Add one mixed frame (interleaved stereo), downmixed to mono.
     pub fn push_stereo(&self, interleaved: &[f32]) {
         let mut buf = self.buf.lock().unwrap_or_else(|p| p.into_inner());
-        buf.extend(interleaved.chunks_exact(2).map(|lr| 0.5 * (lr[0] + lr[1])));
+        buf.extend(
+            interleaved
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|[l, r]| 0.5 * (l + r)),
+        );
         let over = buf.len().saturating_sub(REFERENCE_MAX);
         buf.drain(..over);
     }
@@ -88,7 +94,7 @@ impl EchoCanceller {
     /// Cancel the echo in one capture frame (a multiple of 10 ms), in place.
     /// A chunk the canceller refuses is left as it was.
     pub fn process(&mut self, reference: &EchoReference, frame: &mut [f32]) {
-        for chunk in frame.chunks_exact_mut(APM_FRAME) {
+        for chunk in frame.as_chunks_mut::<APM_FRAME>().0 {
             reference.take(&mut self.render);
             let _ = self
                 .apm
@@ -125,14 +131,24 @@ mod tests {
         let total = 48_000 * 4;
         let far: Vec<f32> = (0..total).map(|_| noise()).collect();
         let delay = 48 * 40;
-        let mic: Vec<f32> =
-            (0..total).map(|i| if i >= delay { far[i - delay] * 0.5 } else { 0.0 }).collect();
+        let mic: Vec<f32> = (0..total)
+            .map(|i| {
+                if i >= delay {
+                    far[i - delay] * 0.5
+                } else {
+                    0.0
+                }
+            })
+            .collect();
 
         let reference = EchoReference::default();
         let mut aec = EchoCanceller::new();
         let mut out = mic.clone();
         for k in 0..total / 960 {
-            let played: Vec<f32> = far[k * 960..(k + 1) * 960].iter().flat_map(|&s| [s, s]).collect();
+            let played: Vec<f32> = far[k * 960..(k + 1) * 960]
+                .iter()
+                .flat_map(|&s| [s, s])
+                .collect();
             reference.push_stereo(&played);
             aec.process(&reference, &mut out[k * 960..(k + 1) * 960]);
         }

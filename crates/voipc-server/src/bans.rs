@@ -58,16 +58,25 @@ impl Ban {
 }
 
 pub fn now_secs() -> i64 {
-    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs() as i64
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64
 }
 
 /// The address's key: an HMAC under the relay's ban key (from the accounts
 /// master key) or, without accounts, a key made at start (`bans.json` holds
 /// the addresses, so nothing stored depends on it).
 pub fn addr_key(state: &ServerState, ip: IpAddr) -> [u8; 32] {
-    let secret = state.accounts.as_ref().map_or(&state.ban_salt[..], |r| r.ban_key());
+    let secret = state
+        .accounts
+        .as_ref()
+        .map_or(&state.ban_salt[..], |r| r.ban_key());
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret);
-    ring::hmac::sign(&key, crate::limit_key(ip).to_string().as_bytes()).as_ref().try_into().expect("32 bytes")
+    ring::hmac::sign(&key, crate::limit_key(ip).to_string().as_bytes())
+        .as_ref()
+        .try_into()
+        .expect("32 bytes")
 }
 
 fn key_of(state: &ServerState, target: &Target) -> Key {
@@ -79,30 +88,45 @@ fn key_of(state: &ServerState, target: &Target) -> Key {
 
 /// The ban `key` falls under now, if any.
 fn active(state: &ServerState, key: &Key) -> Option<Ban> {
-    state.bans.get(key).map(|b| b.clone()).filter(|b| b.active(now_secs()))
+    state
+        .bans
+        .get(key)
+        .map(|b| b.clone())
+        .filter(|b| b.active(now_secs()))
 }
 
 /// At accept: an address ban refuses at once on a relay without accounts.
 /// With accounts it waits for the sign-in, since someone holding a role here
 /// gets past an address ban (people share addresses; 1.0 audit H1-07).
 pub fn refused_at_accept(state: &ServerState, ip: IpAddr) -> bool {
-    state.accounts.is_none() && !state.bans.is_empty() && active(state, &Key::Addr(addr_key(state, ip))).is_some()
+    state.accounts.is_none()
+        && !state.bans.is_empty()
+        && active(state, &Key::Addr(addr_key(state, ip))).is_some()
 }
 
 /// Why a connection may not stay: its account's ban, else its address's,
 /// unless the account (`account`: its id, and whether it holds a role here)
 /// holds a role.
-pub fn refusal(state: &ServerState, ip: IpAddr, account: Option<([u8; 16], bool)>) -> Option<String> {
+pub fn refusal(
+    state: &ServerState,
+    ip: IpAddr,
+    account: Option<([u8; 16], bool)>,
+) -> Option<String> {
     if state.bans.is_empty() {
         return None;
     }
     if let Some(b) = account.and_then(|(id, _)| active(state, &Key::Account(id))) {
-        return Some(format!("This account is banned from this server: {}{}", b.reason, until(&b)));
+        return Some(format!(
+            "This account is banned from this server: {}{}",
+            b.reason,
+            until(&b)
+        ));
     }
     if account.is_some_and(|(_, role)| role) {
         return None;
     }
-    active(state, &Key::Addr(addr_key(state, ip))).map(|b| format!("You are banned from this server: {}{}", b.reason, until(&b)))
+    active(state, &Key::Addr(addr_key(state, ip)))
+        .map(|b| format!("You are banned from this server: {}{}", b.reason, until(&b)))
 }
 
 fn until(b: &Ban) -> String {
@@ -116,7 +140,14 @@ fn until(b: &Ban) -> String {
 
 /// Bans `target` for `duration` (None = permanent) and keeps it. Replaces an
 /// earlier ban of the same address or account.
-pub async fn add(state: &ServerState, target: Target, label: &str, reason: &str, by: &str, duration: Option<Duration>) -> Result<Ban> {
+pub async fn add(
+    state: &ServerState,
+    target: Target,
+    label: &str,
+    reason: &str,
+    by: &str,
+    duration: Option<Duration>,
+) -> Result<Ban> {
     let now = now_secs();
     let key = key_of(state, &target);
     let mut ban = Ban {
@@ -131,7 +162,9 @@ pub async fn add(state: &ServerState, target: Target, label: &str, reason: &str,
     if let Some(relay) = &state.accounts {
         ban.id = relay.ban_put(&key, &ban).await?;
     } else {
-        let Target::Addr(ip) = target else { anyhow::bail!("this server has no accounts") };
+        let Target::Addr(ip) = target else {
+            anyhow::bail!("this server has no accounts")
+        };
         ban.addr = Some(crate::limit_key(ip));
         let _held = state.bans_writer.lock().unwrap_or_else(|p| p.into_inner());
         let mut list = read_file(state)?;
@@ -156,7 +189,11 @@ pub async fn remove(state: &ServerState, id: u64) -> Result<bool> {
         write_file(state, &list)?;
         list.len() != before
     };
-    let was_here = state.bans.iter().find(|e| e.value().id == id).map(|e| *e.key());
+    let was_here = state
+        .bans
+        .iter()
+        .find(|e| e.value().id == id)
+        .map(|e| *e.key());
     if let Some(key) = was_here {
         state.bans.remove(&key);
     }
@@ -183,7 +220,11 @@ pub fn list(state: &ServerState) -> Vec<BanInfo> {
             }
         })
         .collect();
-    bans.sort_by(|a, b| b.account.cmp(&a.account).then(b.created_at.cmp(&a.created_at)));
+    bans.sort_by(|a, b| {
+        b.account
+            .cmp(&a.account)
+            .then(b.created_at.cmp(&a.created_at))
+    });
     bans
 }
 
@@ -201,7 +242,9 @@ pub async fn load(state: &ServerState) -> Result<()> {
         if !gone.is_empty() {
             write_file(state, &keep)?;
         }
-        keep.into_iter().filter_map(|b| Some((Key::Addr(addr_key(state, b.addr?)), b))).collect()
+        keep.into_iter()
+            .filter_map(|b| Some((Key::Addr(addr_key(state, b.addr?)), b)))
+            .collect()
     } else {
         Vec::new()
     };
@@ -224,7 +267,10 @@ pub async fn enforce(state: &Arc<ServerState>, skip: Option<u32>) {
         .filter(|e| Some(*e.key()) != skip)
         .filter_map(|e| {
             let s = e.value();
-            let account = s.account.as_ref().map(|a| (a.user.id.0, !a.scopes.is_empty()));
+            let account = s
+                .account
+                .as_ref()
+                .map(|a| (a.user.id.0, !a.scopes.is_empty()));
             refusal(state, s.peer_ip, account).map(|why| (*e.key(), why))
         })
         .collect();
@@ -244,7 +290,9 @@ struct File {
 const FILE_FORMAT: u32 = 1;
 
 fn read_file(state: &ServerState) -> Result<Vec<Ban>> {
-    let Some(path) = &state.bans_file else { return Ok(Vec::new()) };
+    let Some(path) = &state.bans_file else {
+        return Ok(Vec::new());
+    };
     read_path(path)
 }
 
@@ -254,17 +302,28 @@ pub fn read_path(path: &Path) -> Result<Vec<Ban>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let file: File = serde_json::from_str(&text).with_context(|| format!("{} does not read", path.display()))?;
-    anyhow::ensure!(file.format <= FILE_FORMAT, "{} was written by a newer VoIPC", path.display());
+    let file: File =
+        serde_json::from_str(&text).with_context(|| format!("{} does not read", path.display()))?;
+    anyhow::ensure!(
+        file.format <= FILE_FORMAT,
+        "{} was written by a newer VoIPC",
+        path.display()
+    );
     Ok(file.bans)
 }
 
 fn write_file(state: &ServerState, list: &[Ban]) -> Result<()> {
-    let Some(path) = &state.bans_file else { return Ok(()) };
+    let Some(path) = &state.bans_file else {
+        return Ok(());
+    };
     write_path(path, list)
 }
 
 pub fn write_path(path: &Path, list: &[Ban]) -> Result<()> {
-    let text = serde_json::to_string_pretty(&File { format: FILE_FORMAT, bans: list.to_vec() })?;
-    crate::fsutil::atomic_write(path, text.as_bytes(), true).with_context(|| format!("writing {}", path.display()))
+    let text = serde_json::to_string_pretty(&File {
+        format: FILE_FORMAT,
+        bans: list.to_vec(),
+    })?;
+    crate::fsutil::atomic_write(path, text.as_bytes(), true)
+        .with_context(|| format!("writing {}", path.display()))
 }

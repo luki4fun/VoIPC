@@ -42,13 +42,18 @@ fn traced_format() -> String {
         VideoCodec,
         ProximityMode,
     );
-    let registry = tracer.registry().expect("every variant of every enum is traced; add the one named here to trace!");
+    let registry = tracer
+        .registry()
+        .expect("every variant of every enum is traced; add the one named here to trace!");
     serde_json::to_string_pretty(&registry).unwrap() + "\n"
 }
 
 #[test]
 fn the_wire_format_matches_its_protocol_version() {
-    let path = format!("{}/tests/golden/v{PROTOCOL_VERSION}.json", env!("CARGO_MANIFEST_DIR"));
+    let path = format!(
+        "{}/tests/golden/v{PROTOCOL_VERSION}.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
     let now = traced_format();
     if std::env::var_os("VOIPC_WRITE_GOLDEN").is_some() {
         std::fs::create_dir_all(format!("{}/tests/golden", env!("CARGO_MANIFEST_DIR"))).unwrap();
@@ -80,15 +85,31 @@ fn what_tells_another_version_to_update_never_changes() {
         prekey_bundle: None,
         account: None,
     };
-    assert!(hex(&encode_client_msg(&auth).unwrap()[4..]).starts_with("00026162ac02"), "Authenticate's start moved");
+    assert!(
+        hex(&encode_client_msg(&auth).unwrap()[4..]).starts_with("00026162ac02"),
+        "Authenticate's start moved"
+    );
 
     // AuthError is variant 1: what every client before 0.12 (protocol 12) shows.
     let err = ServerMessage::AuthError { reason: "x".into() };
-    assert_eq!(hex(&encode_server_msg(&err).unwrap()), "00000003010178", "AuthError moved");
+    assert_eq!(
+        hex(&encode_server_msg(&err).unwrap()),
+        "00000003010178",
+        "AuthError moved"
+    );
 
     // Refused: its variant index and fields, for every later version.
-    let refused = ServerMessage::Refused { code: REFUSED_VERSION, server_protocol: 12, server_version: "1.0.0".into(), text: "t".into() };
-    assert_eq!(hex(&encode_server_msg(&refused).unwrap()), "0000000b30010c05312e302e300174", "Refused moved");
+    let refused = ServerMessage::Refused {
+        code: REFUSED_VERSION,
+        server_protocol: 12,
+        server_version: "1.0.0".into(),
+        text: "t".into(),
+    };
+    assert_eq!(
+        hex(&encode_server_msg(&refused).unwrap()),
+        "0000000b30010c05312e302e300174",
+        "Refused moved"
+    );
     assert_eq!((REFUSED_VERSION, FIRST_STRUCTURED_REFUSAL), (1, 12));
 
     // The frame: a big-endian length, then the message, at most 64 KiB.
@@ -103,8 +124,14 @@ fn media_packets_keep_their_layout() {
     assert_eq!(hex(&voice), "05010203040000000500060708090aee");
     let position = VoicePacket::position(1, 2, 3, 4, vec![0xee]).to_bytes();
     assert_eq!(hex(&position), "060000000100000002000300000004ee");
-    assert_eq!(hex(&VoicePacket::end_of_transmission(1, 2).to_bytes()), "020000000100000002");
-    assert_eq!(hex(&VoicePacket::ping(1, 2).to_bytes()), "030000000100000002");
+    assert_eq!(
+        hex(&VoicePacket::end_of_transmission(1, 2).to_bytes()),
+        "020000000100000002"
+    );
+    assert_eq!(
+        hex(&VoicePacket::ping(1, 2).to_bytes()),
+        "030000000100000002"
+    );
     let video = VideoPacket::encrypted_fragment(true, 1, 2, 3, 4, 5, 6, 7, vec![0xee]).to_bytes();
     assert_eq!(hex(&video), "140000000100000002030400000005000600000007ee");
     let audio = ScreenShareAudioPacket::new_encrypted(1, 2, 3, 4, 5, vec![0xee]).to_bytes();

@@ -121,15 +121,26 @@ pub struct Link {
 /// With the link, the fingerprint pinned on this connect when it was the
 /// first sight of the server's certificate, for the person to compare with
 /// what the server's operator gives them (`voipc-server cert fingerprint`).
-pub async fn connect(host: &str, port: u16, accept_invalid_certs: bool) -> Result<(Link, Option<String>), String> {
+pub async fn connect(
+    host: &str,
+    port: u16,
+    accept_invalid_certs: bool,
+) -> Result<(Link, Option<String>), String> {
     let (link, first_sight) = connect_any(host, port, accept_invalid_certs).await?;
-    let pinned = if accept_invalid_certs { tofu_pin(&tofu_key(host, port), &first_sight) } else { None };
+    let pinned = if accept_invalid_certs {
+        tofu_pin(&tofu_key(host, port), &first_sight)
+    } else {
+        None
+    };
     Ok((link, pinned))
 }
 
 /// SHA-256 as the server prints it: colon-separated upper-case hex.
 fn fingerprint_text(fp: &[u8]) -> String {
-    fp.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
+    fp.iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// What one attempt's verifier saw of a certificate never pinned before. Its
@@ -137,7 +148,11 @@ fn fingerprint_text(fp: &[u8]) -> String {
 /// carries the session may be pinned (a loser verified last must not be).
 type FirstSight = Arc<std::sync::Mutex<Option<Vec<u8>>>>;
 
-async fn connect_any(host: &str, port: u16, accept_invalid_certs: bool) -> Result<(Link, FirstSight), String> {
+async fn connect_any(
+    host: &str,
+    port: u16,
+    accept_invalid_certs: bool,
+) -> Result<(Link, FirstSight), String> {
     let addrs: Vec<SocketAddr> =
         tokio::time::timeout(CONNECT_TIMEOUT, tokio::net::lookup_host((host, port)))
             .await
@@ -458,8 +473,11 @@ async fn connect_tunnel(
     for &addr in addrs {
         info!("connecting to {addr} over the TCP fallback");
         let remaining = deadline.saturating_duration_since(Instant::now());
-        match tokio::time::timeout(remaining, open_tunnel(&connector, name.clone(), addr, &host_header))
-            .await
+        match tokio::time::timeout(
+            remaining,
+            open_tunnel(&connector, name.clone(), addr, &host_header),
+        )
+        .await
         {
             Ok(Ok(link)) => return Ok((link, sight)),
             Ok(Err(e)) => {
@@ -501,8 +519,11 @@ async fn open_tunnel(
         "GET /voipc HTTP/1.1\r\nHost: {host_header}\r\nUpgrade: websocket\r\n\
          Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
     );
-    let upgrade_failed = |e: std::io::Error| format!("TCP fallback upgrade with {addr} failed: {e}");
-    tls.write_all(request.as_bytes()).await.map_err(upgrade_failed)?;
+    let upgrade_failed =
+        |e: std::io::Error| format!("TCP fallback upgrade with {addr} failed: {e}");
+    tls.write_all(request.as_bytes())
+        .await
+        .map_err(upgrade_failed)?;
     tls.flush().await.map_err(upgrade_failed)?;
 
     let mut buf = Vec::new();
@@ -510,14 +531,18 @@ async fn open_tunnel(
     let end = loop {
         let n = tls.read(&mut chunk).await.map_err(upgrade_failed)?;
         if n == 0 {
-            return Err(format!("{addr} closed the connection during the TCP fallback upgrade"));
+            return Err(format!(
+                "{addr} closed the connection during the TCP fallback upgrade"
+            ));
         }
         buf.extend_from_slice(&chunk[..n]);
         if let Some(end) = ws::find_header_end(&buf) {
             break end;
         }
         if buf.len() > 8 * 1024 {
-            return Err(format!("{addr} answered the TCP fallback upgrade with junk"));
+            return Err(format!(
+                "{addr} answered the TCP fallback upgrade with junk"
+            ));
         }
     };
     let head = String::from_utf8_lossy(&buf[..end]).into_owned();
@@ -694,7 +719,12 @@ async fn tunnel_writer<W: AsyncWrite + Unpin>(
         }
     }
     out.clear();
-    ws::encode_frame(&mut out, ws::OP_CLOSE, &[&1000u16.to_be_bytes()], Some(rand::random()));
+    ws::encode_frame(
+        &mut out,
+        ws::OP_CLOSE,
+        &[&1000u16.to_be_bytes()],
+        Some(rand::random()),
+    );
     let _ = send_frame(&mut tls, &out).await;
     let _ = tls.shutdown().await;
 }
@@ -719,7 +749,8 @@ fn server_name(host: &str) -> Result<ServerName<'static>, String> {
     if let Ok(ip) = host.parse::<IpAddr>() {
         Ok(ServerName::IpAddress(ip.into()))
     } else {
-        ServerName::try_from(host.to_string()).map_err(|e| format!("Invalid server name '{host}': {e}"))
+        ServerName::try_from(host.to_string())
+            .map_err(|e| format!("Invalid server name '{host}': {e}"))
     }
 }
 
@@ -863,7 +894,11 @@ pub(crate) fn tofu_parse(data: &str) -> Option<HashMap<String, Vec<u8>>> {
     use base64::{engine::general_purpose::STANDARD, Engine};
     serde_json::from_str::<HashMap<String, String>>(data)
         .ok()
-        .and_then(|map| map.into_iter().map(|(k, v)| STANDARD.decode(&v).ok().map(|bytes| (k, bytes))).collect())
+        .and_then(|map| {
+            map.into_iter()
+                .map(|(k, v)| STANDARD.decode(&v).ok().map(|bytes| (k, bytes)))
+                .collect()
+        })
 }
 
 fn tofu_load_from_disk() -> HashMap<String, Vec<u8>> {
@@ -925,9 +960,16 @@ pub fn tofu_forget(host: &str, port: u16) -> bool {
     // A pin list that did not read starts over here, by the person's choice:
     // the old file is kept beside it.
     if TOFU_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
-        let secs = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_secs());
+        let secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
         let path = tofu_path();
-        if std::fs::rename(&path, path.with_file_name(format!("tofu_pins.json.unreadable-{secs}"))).is_ok() {
+        if std::fs::rename(
+            &path,
+            path.with_file_name(format!("tofu_pins.json.unreadable-{secs}")),
+        )
+        .is_ok()
+        {
             TOFU_BROKEN.store(false, std::sync::atomic::Ordering::Relaxed);
             store.clear();
             return true;
@@ -1059,14 +1101,20 @@ mod tests {
     #[test]
     fn first_sight_pins_nothing_until_the_connection_is_up() {
         let key = tofu_key("tofu-test.invalid", 1);
-        let verifier = TofuCertVerifier { key: key.clone(), seen: FirstSight::default() };
+        let verifier = TofuCertVerifier {
+            key: key.clone(),
+            seen: FirstSight::default(),
+        };
         let cert = CertificateDer::from(vec![1u8, 2, 3]);
         let name = ServerName::try_from("tofu-test.invalid").unwrap();
         verifier
             .verify_server_cert(&cert, &[], &name, &[], UnixTime::now())
             .unwrap();
         assert!(!TOFU_STORE.lock().unwrap().contains_key(&key));
-        assert!(verifier.seen.lock().unwrap().is_some(), "seen, for the connect to pin if it wins");
+        assert!(
+            verifier.seen.lock().unwrap().is_some(),
+            "seen, for the connect to pin if it wins"
+        );
     }
 
     /// H4-04: the QUIC and TCP attempts race. A loser that verifies last (an
@@ -1078,20 +1126,48 @@ mod tests {
         assert!(crate::config::data_dir().starts_with(std::env::temp_dir()));
         let key = tofu_key("tofu-race.invalid", 2);
         let name = ServerName::try_from("tofu-race.invalid").unwrap();
-        let winner = TofuCertVerifier { key: key.clone(), seen: FirstSight::default() };
-        let loser = TofuCertVerifier { key: key.clone(), seen: FirstSight::default() };
-        winner.verify_server_cert(&CertificateDer::from(vec![1u8]), &[], &name, &[], UnixTime::now()).unwrap();
-        loser.verify_server_cert(&CertificateDer::from(vec![6u8, 6, 6]), &[], &name, &[], UnixTime::now()).unwrap();
+        let winner = TofuCertVerifier {
+            key: key.clone(),
+            seen: FirstSight::default(),
+        };
+        let loser = TofuCertVerifier {
+            key: key.clone(),
+            seen: FirstSight::default(),
+        };
+        winner
+            .verify_server_cert(
+                &CertificateDer::from(vec![1u8]),
+                &[],
+                &name,
+                &[],
+                UnixTime::now(),
+            )
+            .unwrap();
+        loser
+            .verify_server_cert(
+                &CertificateDer::from(vec![6u8, 6, 6]),
+                &[],
+                &name,
+                &[],
+                UnixTime::now(),
+            )
+            .unwrap();
         tofu_pin(&key, &winner.seen);
         let pinned = TOFU_STORE.lock().unwrap().get(&key).cloned();
-        assert_eq!(pinned.as_deref(), Some(ring::digest::digest(&ring::digest::SHA256, &[1u8]).as_ref()));
+        assert_eq!(
+            pinned.as_deref(),
+            Some(ring::digest::digest(&ring::digest::SHA256, &[1u8]).as_ref())
+        );
         TOFU_STORE.lock().unwrap().remove(&key);
     }
 
     #[test]
     fn accept_key_matches_the_rfc_example() {
         // RFC 6455 §1.3
-        assert_eq!(accept_key("dGhlIHNhbXBsZSBub25jZQ=="), "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+        assert_eq!(
+            accept_key("dGhlIHNhbXBsZSBub25jZQ=="),
+            "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+        );
     }
 
     /// The tunnel's two tasks against an in-memory server: routing by tag and

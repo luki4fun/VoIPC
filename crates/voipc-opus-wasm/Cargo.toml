@@ -3,6 +3,7 @@ name = "voipc-opus-wasm"
 version = "0.12.0"
 edition = "2021"
 license = "MIT"
+rust-version = "1.99"
 description = "The browser's Opus decoder, run inside the mixer's AudioWorklet (in-order decode, FEC, PLC)"
 publish = false
 

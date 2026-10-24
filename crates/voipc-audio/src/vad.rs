@@ -156,7 +156,10 @@ mod tests {
         // H3-15: a keyboard or a fan is loud too
         let mut vad = VoiceActivityDetector::new(-40.0, 0, 20);
         let loud = vec![0.3f32; 960];
-        assert!(!vad.process(&loud, Some(0.1)), "a loud non-voice frame opened the gate");
+        assert!(
+            !vad.process(&loud, Some(0.1)),
+            "a loud non-voice frame opened the gate"
+        );
         assert!(vad.process(&loud, Some(0.9)));
         // Quiet speech stays below the user's threshold either way
         let quiet = vec![0.001f32; 960];

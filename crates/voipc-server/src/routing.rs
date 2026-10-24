@@ -102,7 +102,12 @@ impl Routing {
     }
 
     /// Take a game server's answer for one channel.
-    pub fn set_routes(&self, channel_id: ChannelId, routes: Routes, now: Instant) -> Result<(), RoutesError> {
+    pub fn set_routes(
+        &self,
+        channel_id: ChannelId,
+        routes: Routes,
+        now: Instant,
+    ) -> Result<(), RoutesError> {
         if let Some(existing) = self.tables.get(&channel_id) {
             // Same run, and an epoch we have already passed: a POST that
             // overtook its successor. A *different* run starts over, which is
@@ -113,7 +118,9 @@ impl Routing {
             // `boot` is optional — would otherwise be refused for ever, and the
             // channel would fall back to full fan-out with nothing to see but a
             // 409 a second.
-            if existing.expires > now && existing.boot == routes.boot && routes.epoch <= existing.epoch
+            if existing.expires > now
+                && existing.boot == routes.boot
+                && routes.epoch <= existing.epoch
             {
                 return Err(RoutesError::Stale);
             }
@@ -135,7 +142,11 @@ impl Routing {
     /// it — switching routing off has to hand *everybody* back at once, and a
     /// filter left lying about would be enforced again the moment somebody
     /// switched it back on.
-    pub fn clear_channel(&self, channel_id: ChannelId, sessions: impl IntoIterator<Item = SessionId>) {
+    pub fn clear_channel(
+        &self,
+        channel_id: ChannelId,
+        sessions: impl IntoIterator<Item = SessionId>,
+    ) {
         self.tables.remove(&channel_id);
         // Including whether its refusals have been logged: a channel that is
         // gone leaves nothing behind, and the next one to take the id starts
@@ -173,7 +184,10 @@ impl Routing {
     ) -> bool {
         if let Some(table) = self.tables.get(&channel_id) {
             if table.expires > now {
-                return table.hear.get(&listener).is_some_and(|s| s.contains(&speaker));
+                return table
+                    .hear
+                    .get(&listener)
+                    .is_some_and(|s| s.contains(&speaker));
             }
         }
         match self.filters.get(&listener_session) {
@@ -228,7 +242,10 @@ mod tests {
     fn with_nothing_configured_everyone_hears_everyone() {
         let r = Routing::default();
         let now = Instant::now();
-        assert!(r.may_hear(5, 1, 1, 2, now), "a quiet router must not silence anybody");
+        assert!(
+            r.may_hear(5, 1, 1, 2, now),
+            "a quiet router must not silence anybody"
+        );
     }
 
     #[test]
@@ -237,7 +254,10 @@ mod tests {
         let now = Instant::now();
         r.set_filter(1, Some(vec![2, 3]));
         assert!(r.may_hear(5, 1, 1, 2, now));
-        assert!(!r.may_hear(5, 1, 1, 9, now), "an unlisted speaker was forwarded");
+        assert!(
+            !r.may_hear(5, 1, 1, 9, now),
+            "an unlisted speaker was forwarded"
+        );
         // It is the listener's own filter, not anybody else's
         assert!(r.may_hear(5, 7, 7, 9, now));
         // And clearing it restores the whole channel
@@ -251,13 +271,23 @@ mod tests {
         let now = Instant::now();
         // The client asks for everybody by asking for nothing
         r.set_filter(1, None);
-        r.set_routes(5, routes(1, "boot-a", &[(1, &[2]), (2, &[1])]), now).unwrap();
+        r.set_routes(5, routes(1, "boot-a", &[(1, &[2]), (2, &[1])]), now)
+            .unwrap();
         assert!(r.may_hear(5, 1, 1, 2, now));
         // A patched client cannot widen it
-        assert!(!r.may_hear(5, 1, 1, 9, now), "a client widened the game server's table");
+        assert!(
+            !r.may_hear(5, 1, 1, 9, now),
+            "a client widened the game server's table"
+        );
         // Fails closed per session, in both directions
-        assert!(!r.may_hear(5, 9, 9, 1, now), "an unlisted listener heard somebody");
-        assert!(!r.may_hear(5, 1, 1, 9, now), "an unlisted speaker was heard");
+        assert!(
+            !r.may_hear(5, 9, 9, 1, now),
+            "an unlisted listener heard somebody"
+        );
+        assert!(
+            !r.may_hear(5, 1, 1, 9, now),
+            "an unlisted speaker was heard"
+        );
     }
 
     #[test]
@@ -267,10 +297,14 @@ mod tests {
         // goes quiet.
         let r = Routing::default();
         let now = Instant::now();
-        r.set_routes(5, routes(1, "boot-a", &[(1, &[2])]), now).unwrap();
+        r.set_routes(5, routes(1, "boot-a", &[(1, &[2])]), now)
+            .unwrap();
         assert!(!r.may_hear(5, 1, 1, 9, now));
         let later = now + std::time::Duration::from_secs(4);
-        assert!(r.may_hear(5, 1, 1, 9, later), "an expired table kept culling");
+        assert!(
+            r.may_hear(5, 1, 1, 9, later),
+            "an expired table kept culling"
+        );
         assert!(!r.table_live(5, later));
     }
 
@@ -288,7 +322,8 @@ mod tests {
     fn a_restarted_game_server_is_not_refused_for_ever() {
         let r = Routing::default();
         let now = Instant::now();
-        r.set_routes(5, routes(100, "boot-a", &[(1, &[2])]), now).unwrap();
+        r.set_routes(5, routes(100, "boot-a", &[(1, &[2])]), now)
+            .unwrap();
         // A POST that overtook its successor is dropped
         assert_eq!(
             r.set_routes(5, routes(99, "boot-a", &[(1, &[9])]), now),
@@ -299,7 +334,8 @@ mod tests {
         // other way round, a game server whose epoch is a tick counter would
         // be refused for ever after a restart, and the channel would fall back
         // to full fan-out with nothing to notice.
-        r.set_routes(5, routes(1, "boot-b", &[(1, &[9])]), now).unwrap();
+        r.set_routes(5, routes(1, "boot-b", &[(1, &[9])]), now)
+            .unwrap();
         assert!(r.may_hear(5, 1, 1, 9, now));
         assert!(!r.may_hear(5, 1, 1, 2, now));
     }
@@ -308,13 +344,17 @@ mod tests {
     fn switching_routing_off_hands_everybody_back() {
         let r = Routing::default();
         let now = Instant::now();
-        r.set_routes(5, routes(1, "boot-a", &[(1, &[2])]), now).unwrap();
+        r.set_routes(5, routes(1, "boot-a", &[(1, &[2])]), now)
+            .unwrap();
         // And the members' own requests go with the table: a filter left lying
         // about would be enforced again the moment somebody switched routing
         // back on, and nobody would be able to tell why they could not hear.
         r.set_filter(1, Some(vec![2]));
         r.clear_channel(5, [1]);
-        assert!(r.may_hear(5, 1, 1, 9, now), "a filter outlived the routing it belonged to");
+        assert!(
+            r.may_hear(5, 1, 1, 9, now),
+            "a filter outlived the routing it belonged to"
+        );
     }
 
     #[test]

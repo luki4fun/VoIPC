@@ -631,9 +631,13 @@ VoIPC is MIT licensed. Contributions are welcome.
 1. Fork the repository
 2. Create a feature branch
 3. Make your changes
-4. Run the checks CI runs: `cargo test --workspace --locked` and `npm --prefix client test`
-   (and `./test-web.sh` after `VOIPC_SELFTEST=1 npm run web` for anything the browser client
-   touches)
+4. Run the checks CI runs:
+   - `cargo fmt --all` and `cargo clippy --workspace --all-targets -- -D warnings`;
+   - `cargo test --workspace --locked` and `npm --prefix client test`;
+   - `./test-web.sh` after `VOIPC_SELFTEST=1 npm run web`, for anything the browser client
+     touches.
+
+   [BUILDING.md](BUILDING.md#toolchain-all-platforms) lists the full gate.
 5. Submit a pull request
 
 Security issues go to [SECURITY.md](SECURITY.md), not to a public issue. Running a relay:

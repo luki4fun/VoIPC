@@ -22,19 +22,32 @@ const KYBER_PREKEY_ID: u32 = 1;
 
 /// The signed pre-key, the Kyber last-resort key and `INITIAL_PREKEY_COUNT`
 /// one-time keys, into fresh stores.
-pub fn generate_prekeys(stores: &mut SignalStores, identity: &IdentityKeyPair) -> anyhow::Result<()> {
+pub fn generate_prekeys(
+    stores: &mut SignalStores,
+    identity: &IdentityKeyPair,
+) -> anyhow::Result<()> {
     let now = Timestamp::from_epoch_millis(crate::time::now_millis());
     let signed = KeyPair::generate(&mut crate::rng());
-    let signature = identity.private_key().calculate_signature(&signed.public_key.serialize(), &mut crate::rng())?;
+    let signature = identity
+        .private_key()
+        .calculate_signature(&signed.public_key.serialize(), &mut crate::rng())?;
     let record = SignedPreKeyRecord::new(SIGNED_PREKEY_ID.into(), now, &signed, &signature);
-    stores.signed_prekey.signed_prekeys.insert(SIGNED_PREKEY_ID, record.serialize()?);
+    stores
+        .signed_prekey
+        .signed_prekeys
+        .insert(SIGNED_PREKEY_ID, record.serialize()?);
 
     // Built by hand rather than `KyberPreKeyRecord::generate`, which reads
     // SystemTime: that panics on wasm32
     let kyber = kem::KeyPair::generate(kem::KeyType::Kyber1024, &mut crate::rng());
-    let signature = identity.private_key().calculate_signature(&kyber.public_key.serialize(), &mut crate::rng())?;
+    let signature = identity
+        .private_key()
+        .calculate_signature(&kyber.public_key.serialize(), &mut crate::rng())?;
     let record = KyberPreKeyRecord::new(KYBER_PREKEY_ID.into(), now, &kyber, &signature);
-    stores.kyber.keys.insert(KYBER_PREKEY_ID, record.serialize()?);
+    stores
+        .kyber
+        .keys
+        .insert(KYBER_PREKEY_ID, record.serialize()?);
 
     more_prekeys(stores, INITIAL_PREKEY_COUNT)?;
     Ok(())
@@ -49,8 +62,14 @@ pub fn more_prekeys(stores: &mut SignalStores, count: u32) -> anyhow::Result<Vec
         let id = stores.prekey.next_id;
         stores.prekey.next_id = id.checked_add(1).context("pre-key ids exhausted")?;
         let pair = KeyPair::generate(&mut crate::rng());
-        stores.prekey.prekeys.insert(id, PreKeyRecord::new(PreKeyId::from(id), &pair).serialize()?);
-        out.push(OneTimePreKey { id, public_key: pair.public_key.serialize().to_vec() });
+        stores.prekey.prekeys.insert(
+            id,
+            PreKeyRecord::new(PreKeyId::from(id), &pair).serialize()?,
+        );
+        out.push(OneTimePreKey {
+            id,
+            public_key: pair.public_key.serialize().to_vec(),
+        });
     }
     Ok(out)
 }
@@ -58,15 +77,31 @@ pub fn more_prekeys(stores: &mut SignalStores, count: u32) -> anyhow::Result<Vec
 /// What `Authenticate` (and an account's `Keys` step) carries, read back from
 /// the stores so one-time keys an earlier session used are not offered again.
 pub fn bundle(stores: &SignalStores) -> anyhow::Result<PreKeyBundleData> {
-    let signed = stores.signed_prekey.signed_prekeys.get(&SIGNED_PREKEY_ID).context("signed pre-key missing")?;
+    let signed = stores
+        .signed_prekey
+        .signed_prekeys
+        .get(&SIGNED_PREKEY_ID)
+        .context("signed pre-key missing")?;
     let signed = SignedPreKeyRecord::deserialize(signed)?;
-    let kyber = stores.kyber.keys.get(&KYBER_PREKEY_ID).context("Kyber pre-key missing")?;
+    let kyber = stores
+        .kyber
+        .keys
+        .get(&KYBER_PREKEY_ID)
+        .context("Kyber pre-key missing")?;
     let kyber = KyberPreKeyRecord::deserialize(kyber)?;
     let prekeys = stores
         .prekey
         .prekeys
         .iter()
-        .map(|(&id, bytes)| Ok(OneTimePreKey { id, public_key: PreKeyRecord::deserialize(bytes)?.public_key()?.serialize().to_vec() }))
+        .map(|(&id, bytes)| {
+            Ok(OneTimePreKey {
+                id,
+                public_key: PreKeyRecord::deserialize(bytes)?
+                    .public_key()?
+                    .serialize()
+                    .to_vec(),
+            })
+        })
         .collect::<anyhow::Result<_>>()?;
     Ok(PreKeyBundleData {
         registration_id: stores.identity.registration_id,

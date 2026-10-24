@@ -1,0 +1,6 @@
+# The Rust every build uses, here and in CI. A new version comes with new
+# clippy lints and rustfmt changes, so a bump is its own change, with those
+# fixed in it. Each build adds the targets it needs (rustup target add).
+[toolchain]
+channel = "1.99.1"
+components = ["clippy", "rustfmt"]

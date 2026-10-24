@@ -24,7 +24,7 @@ mod ffi {
     pub const AMEDIACODEC_BUFFER_FLAG_CODEC_CONFIG: u32 = 2;
 
     // Common color formats
-    pub const COLOR_FormatYUV420Planar: i32 = 19;   // I420
+    pub const COLOR_FormatYUV420Planar: i32 = 19; // I420
     pub const COLOR_FormatYUV420SemiPlanar: i32 = 21; // NV12
     pub const COLOR_FormatYUV420Flexible: i32 = 0x7F420888;
 
@@ -49,9 +49,7 @@ mod ffi {
 
     #[link(name = "mediandk")]
     extern "C" {
-        pub fn AMediaCodec_createDecoderByType(
-            mime_type: *const c_char,
-        ) -> *mut AMediaCodec;
+        pub fn AMediaCodec_createDecoderByType(mime_type: *const c_char) -> *mut AMediaCodec;
         pub fn AMediaCodec_delete(codec: *mut AMediaCodec) -> media_status_t;
         pub fn AMediaCodec_configure(
             codec: *mut AMediaCodec,
@@ -63,10 +61,7 @@ mod ffi {
         pub fn AMediaCodec_start(codec: *mut AMediaCodec) -> media_status_t;
         pub fn AMediaCodec_stop(codec: *mut AMediaCodec) -> media_status_t;
         pub fn AMediaCodec_flush(codec: *mut AMediaCodec) -> media_status_t;
-        pub fn AMediaCodec_dequeueInputBuffer(
-            codec: *mut AMediaCodec,
-            timeout_us: i64,
-        ) -> isize;
+        pub fn AMediaCodec_dequeueInputBuffer(codec: *mut AMediaCodec, timeout_us: i64) -> isize;
         pub fn AMediaCodec_getInputBuffer(
             codec: *mut AMediaCodec,
             idx: usize,
@@ -95,9 +90,7 @@ mod ffi {
             idx: usize,
             render: bool,
         ) -> media_status_t;
-        pub fn AMediaCodec_getOutputFormat(
-            codec: *mut AMediaCodec,
-        ) -> *mut AMediaFormat;
+        pub fn AMediaCodec_getOutputFormat(codec: *mut AMediaCodec) -> *mut AMediaFormat;
 
         pub fn AMediaFormat_new() -> *mut AMediaFormat;
         pub fn AMediaFormat_delete(format: *mut AMediaFormat) -> media_status_t;
@@ -106,11 +99,7 @@ mod ffi {
             name: *const c_char,
             value: *const c_char,
         );
-        pub fn AMediaFormat_setInt32(
-            format: *mut AMediaFormat,
-            name: *const c_char,
-            value: i32,
-        );
+        pub fn AMediaFormat_setInt32(format: *mut AMediaFormat, name: *const c_char, value: i32);
         pub fn AMediaFormat_getInt32(
             format: *mut AMediaFormat,
             name: *const c_char,
@@ -177,8 +166,7 @@ impl Decoder {
             VideoCodec::Vp8 => b"video/x-vnd.on2.vp8\0",
             VideoCodec::Vp9 => b"video/x-vnd.on2.vp9\0",
         };
-        let codec =
-            unsafe { ffi::AMediaCodec_createDecoderByType(mime.as_ptr() as *const _) };
+        let codec = unsafe { ffi::AMediaCodec_createDecoderByType(mime.as_ptr() as *const _) };
         if codec.is_null() {
             return Err(anyhow!(
                 "AMediaCodec: no {video_codec:?} decoder available on this device"
@@ -238,7 +226,11 @@ impl Decoder {
         // Find CSD (everything up to the first non-parameter-set NAL unit).
         // H.264 wants SPS in csd-0 and PPS in csd-1; HEVC takes VPS+SPS+PPS
         // concatenated in csd-0 (Android's documented layout for each).
-        let csd = if needs_csd { extract_csd(self.video_codec, data) } else { &[][..] };
+        let csd = if needs_csd {
+            extract_csd(self.video_codec, data)
+        } else {
+            &[][..]
+        };
         if needs_csd && csd.is_empty() {
             return Err(anyhow!(
                 "AMediaCodec: first frame has no parameter sets — waiting for keyframe"
@@ -265,11 +257,7 @@ impl Decoder {
                 mime.as_ptr() as *const _,
             );
             ffi::AMediaFormat_setInt32(format, b"width\0".as_ptr() as *const _, w as i32);
-            ffi::AMediaFormat_setInt32(
-                format,
-                b"height\0".as_ptr() as *const _,
-                h as i32,
-            );
+            ffi::AMediaFormat_setInt32(format, b"height\0".as_ptr() as *const _, h as i32);
             // KEY_LOW_LATENCY (API 30+; older decoders ignore the key): hand
             // each frame out as soon as it is decoded, rather than after a
             // few more for reordering a screen share never uses (H3-07)
@@ -292,20 +280,12 @@ impl Decoder {
                 );
             }
 
-            let status = ffi::AMediaCodec_configure(
-                self.codec,
-                format,
-                ptr::null_mut(),
-                ptr::null_mut(),
-                0,
-            );
+            let status =
+                ffi::AMediaCodec_configure(self.codec, format, ptr::null_mut(), ptr::null_mut(), 0);
             ffi::AMediaFormat_delete(format);
 
             if status != ffi::AMEDIA_OK {
-                return Err(anyhow!(
-                    "AMediaCodec_configure failed: status {}",
-                    status
-                ));
+                return Err(anyhow!("AMediaCodec_configure failed: status {}", status));
             }
 
             let status = ffi::AMediaCodec_start(self.codec);
@@ -335,7 +315,9 @@ impl Decoder {
                 // dropped frame breaks the reference chain while every later
                 // delta still decodes. An error makes the caller suppress
                 // rendering and ask for a keyframe.
-                return Err(anyhow!("AMediaCodec: no input buffer within 10 ms, frame dropped"));
+                return Err(anyhow!(
+                    "AMediaCodec: no input buffer within 10 ms, frame dropped"
+                ));
             }
             let idx = idx as usize;
 
@@ -356,14 +338,8 @@ impl Decoder {
             let pts = self.pts_counter;
             self.pts_counter += 1;
 
-            let status = ffi::AMediaCodec_queueInputBuffer(
-                self.codec,
-                idx,
-                0,
-                data.len() as u32,
-                pts,
-                0,
-            );
+            let status =
+                ffi::AMediaCodec_queueInputBuffer(self.codec, idx, 0, data.len() as u32, pts, 0);
             if status != ffi::AMEDIA_OK {
                 // As for a missing input buffer: the frame is lost, so say so
                 return Err(anyhow!("AMediaCodec: queueInputBuffer failed: {status}"));
@@ -388,9 +364,8 @@ impl Decoder {
 
         loop {
             let mut info = ffi::AMediaCodecBufferInfo::default();
-            let idx = unsafe {
-                ffi::AMediaCodec_dequeueOutputBuffer(self.codec, &mut info, timeout_us)
-            };
+            let idx =
+                unsafe { ffi::AMediaCodec_dequeueOutputBuffer(self.codec, &mut info, timeout_us) };
 
             if idx == ffi::AMEDIACODEC_INFO_TRY_AGAIN_LATER {
                 break;
@@ -417,8 +392,7 @@ impl Decoder {
 
             let frame = unsafe {
                 let mut buf_size: usize = 0;
-                let buf =
-                    ffi::AMediaCodec_getOutputBuffer(self.codec, idx_u, &mut buf_size);
+                let buf = ffi::AMediaCodec_getOutputBuffer(self.codec, idx_u, &mut buf_size);
 
                 // The codec describes its own buffer; check it says something
                 // that fits before making a slice of it
@@ -466,17 +440,12 @@ impl Decoder {
             // a multi-gigabyte allocation (or a wrapped one on 32-bit ARM)
             let sane = |v: i32, max: i32| (1..=max).contains(&v).then_some(v as u32);
             let mut val: i32 = 0;
-            if ffi::AMediaFormat_getInt32(format, b"width\0".as_ptr() as *const _, &mut val)
-            {
+            if ffi::AMediaFormat_getInt32(format, b"width\0".as_ptr() as *const _, &mut val) {
                 if let Some(v) = sane(val, MAX_DIMENSION) {
                     self.width = v;
                 }
             }
-            if ffi::AMediaFormat_getInt32(
-                format,
-                b"height\0".as_ptr() as *const _,
-                &mut val,
-            ) {
+            if ffi::AMediaFormat_getInt32(format, b"height\0".as_ptr() as *const _, &mut val) {
                 if let Some(v) = sane(val, MAX_DIMENSION) {
                     self.height = v;
                 }
@@ -489,7 +458,11 @@ impl Decoder {
             if ffi::AMediaFormat_getInt32(format, b"color-range\0".as_ptr() as *const _, &mut val) {
                 self.full_range = val == 1;
             }
-            if ffi::AMediaFormat_getInt32(format, b"color-standard\0".as_ptr() as *const _, &mut val) {
+            if ffi::AMediaFormat_getInt32(
+                format,
+                b"color-standard\0".as_ptr() as *const _,
+                &mut val,
+            ) {
                 self.bt709 = val == 1;
             }
             // The configure hint was a guess (1920x1080 for anything but HEVC),
@@ -506,9 +479,17 @@ impl Decoder {
             let mut top = 0i32;
             let mut bottom = 0i32;
             if ffi::AMediaFormat_getInt32(format, b"crop-left\0".as_ptr() as *const _, &mut left)
-                && ffi::AMediaFormat_getInt32(format, b"crop-right\0".as_ptr() as *const _, &mut right)
+                && ffi::AMediaFormat_getInt32(
+                    format,
+                    b"crop-right\0".as_ptr() as *const _,
+                    &mut right,
+                )
                 && ffi::AMediaFormat_getInt32(format, b"crop-top\0".as_ptr() as *const _, &mut top)
-                && ffi::AMediaFormat_getInt32(format, b"crop-bottom\0".as_ptr() as *const _, &mut bottom)
+                && ffi::AMediaFormat_getInt32(
+                    format,
+                    b"crop-bottom\0".as_ptr() as *const _,
+                    &mut bottom,
+                )
             {
                 // The rectangle is inclusive on both edges.
                 let cropped_w = right - left + 1;
@@ -522,29 +503,19 @@ impl Decoder {
                     self.height = cropped_h as u32;
                 }
             }
-            if ffi::AMediaFormat_getInt32(
-                format,
-                b"stride\0".as_ptr() as *const _,
-                &mut val,
-            ) {
+            if ffi::AMediaFormat_getInt32(format, b"stride\0".as_ptr() as *const _, &mut val) {
                 if let Some(v) = sane(val, 2 * MAX_DIMENSION) {
                     self.stride = v;
                 }
             }
-            if ffi::AMediaFormat_getInt32(
-                format,
-                b"slice-height\0".as_ptr() as *const _,
-                &mut val,
-            ) {
+            if ffi::AMediaFormat_getInt32(format, b"slice-height\0".as_ptr() as *const _, &mut val)
+            {
                 if let Some(v) = sane(val, 2 * MAX_DIMENSION) {
                     self.slice_height = v;
                 }
             }
-            if ffi::AMediaFormat_getInt32(
-                format,
-                b"color-format\0".as_ptr() as *const _,
-                &mut val,
-            ) {
+            if ffi::AMediaFormat_getInt32(format, b"color-format\0".as_ptr() as *const _, &mut val)
+            {
                 self.color_format = val;
             }
 
@@ -638,8 +609,7 @@ impl Decoder {
                             // U
                             i420[y_size + row * uv_w + col] = raw[src_idx];
                             // V
-                            i420[y_size + uv_w * uv_h + row * uv_w + col] =
-                                raw[src_idx + 1];
+                            i420[y_size + uv_w * uv_h + row * uv_w + col] = raw[src_idx + 1];
                         }
                     }
                 }
@@ -794,11 +764,7 @@ fn parse_sps_dimensions(video_codec: VideoCodec, data: &[u8]) -> Option<(u32, u3
         };
         if t == sps_nal_type(video_codec) {
             // SPS NAL type
-            let hdr_offset = if data[pos + 2] == 1 {
-                pos + 3
-            } else {
-                pos + 4
-            };
+            let hdr_offset = if data[pos + 2] == 1 { pos + 3 } else { pos + 4 };
             let nal_end = if i + 1 < positions.len() {
                 positions[i + 1]
             } else {

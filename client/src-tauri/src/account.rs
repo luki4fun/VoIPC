@@ -16,10 +16,15 @@ use tauri::{Manager, State};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
-use voipc_crypto::account::{normalize_name, password_ok, recovery_parse, stretch_salted, DeviceKey, Method, SignIn, Step, Zeroizing};
+use voipc_crypto::account::{
+    normalize_name, password_ok, recovery_parse, stretch_salted, DeviceKey, Method, SignIn, Step,
+    Zeroizing,
+};
 use voipc_crypto::account_session::{memory_key, AccountSession, Actions};
 use voipc_crypto::sync::Prefs;
-use voipc_protocol::codec::{decode_server_msg, encode_client_msg, try_decode_frame, APP_VERSION, PROTOCOL_VERSION};
+use voipc_protocol::codec::{
+    decode_server_msg, encode_client_msg, try_decode_frame, APP_VERSION, PROTOCOL_VERSION,
+};
 use voipc_protocol::conv::{hex, unhex16};
 use voipc_protocol::messages::{AccountReply, AccountRequest, ClientMessage, ServerMessage};
 
@@ -38,7 +43,10 @@ pub enum AccountArgs {
     /// With the password (a device the relay does not know yet).
     Login { password: String },
     /// Make the account.
-    Register { password: String, invite: Option<String> },
+    Register {
+        password: String,
+        invite: Option<String>,
+    },
     /// With the key this device was given here before.
     Device,
     /// A forgotten password: the recovery key (as shown) and the new one.
@@ -66,7 +74,12 @@ impl AccountLink {
 /// What the session asked for: its messages out, its events to the front
 /// end, and what this device keeps of it in the local archive (only in memory
 /// while the archive is switched off).
-pub async fn run(app: &tauri::AppHandle, server: &str, tcp_tx: &mpsc::UnboundedSender<Vec<u8>>, a: Actions) {
+pub async fn run(
+    app: &tauri::AppHandle,
+    server: &str,
+    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    a: Actions,
+) {
     for m in &a.send {
         crate::network::send_tcp_message_sync(tcp_tx, m);
     }
@@ -79,7 +92,9 @@ pub async fn run(app: &tauri::AppHandle, server: &str, tcp_tx: &mpsc::UnboundedS
     let state = app.state::<AppState>();
     let mut chat = state.chat.write().await;
     if let Some(r) = a.remember {
-        chat.archive.devices.retain(|d| !(d.relay_id == r.relay_id && d.name == r.name));
+        chat.archive
+            .devices
+            .retain(|d| !(d.relay_id == r.relay_id && d.name == r.name));
         chat.archive.devices.push(DeviceRecord {
             server: server.to_string(),
             relay_id: r.relay_id,
@@ -104,13 +119,21 @@ pub struct TotpAnswer {
 
 async fn write<S: AsyncWrite + Unpin>(send: &mut S, msg: &ClientMessage) -> Result<(), String> {
     let data = encode_client_msg(msg).map_err(|e| format!("encode: {e}"))?;
-    send.write_all(&data).await.map_err(|e| format!("Connection lost during sign-in: {e}"))
+    send.write_all(&data)
+        .await
+        .map_err(|e| format!("Connection lost during sign-in: {e}"))
 }
 
-async fn read<R: AsyncRead + Unpin>(recv: &mut R, buf: &mut BytesMut) -> Result<ServerMessage, String> {
+async fn read<R: AsyncRead + Unpin>(
+    recv: &mut R,
+    buf: &mut BytesMut,
+) -> Result<ServerMessage, String> {
     loop {
-        if let Some(payload) = try_decode_frame(buf).map_err(|e| format!("Frame decode error: {e}"))? {
-            return decode_server_msg(&payload).map_err(|e| format!("Failed to decode response: {e}"));
+        if let Some(payload) =
+            try_decode_frame(buf).map_err(|e| format!("Frame decode error: {e}"))?
+        {
+            return decode_server_msg(&payload)
+                .map_err(|e| format!("Failed to decode response: {e}"));
         }
         let n = tokio::time::timeout(CONNECT_TIMEOUT, recv.read_buf(buf))
             .await
@@ -138,10 +161,15 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
 ) -> Result<(u32, u32, Arc<AccountLink>), String> {
     let name = normalize_name(username)?;
     let method = match args {
-        AccountArgs::Login { password } => Method::Password { password: Zeroizing::new(password) },
+        AccountArgs::Login { password } => Method::Password {
+            password: Zeroizing::new(password),
+        },
         AccountArgs::Register { password, invite } => {
             password_ok(&password)?;
-            Method::Register { password: Zeroizing::new(password), invite }
+            Method::Register {
+                password: Zeroizing::new(password),
+                invite,
+            }
         }
         AccountArgs::Device => {
             let chat = state.chat.read().await;
@@ -150,14 +178,25 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                 .devices
                 .iter()
                 .find(|d| d.server == server && d.name == name)
-                .ok_or("This device is not remembered on this server. Sign in with your password.")?;
-            let key = DeviceKey::from_parts(rec.device_id, rec.device_key.clone()).ok_or("This device's key is damaged. Sign in with your password.")?;
-            Method::Device { key, relay_id: rec.relay_id, dek: rec.dek }
+                .ok_or(
+                    "This device is not remembered on this server. Sign in with your password.",
+                )?;
+            let key = DeviceKey::from_parts(rec.device_id, rec.device_key.clone())
+                .ok_or("This device's key is damaged. Sign in with your password.")?;
+            Method::Device {
+                key,
+                relay_id: rec.relay_id,
+                dek: rec.dek,
+            }
         }
         AccountArgs::Reset { recovery, password } => {
             password_ok(&password)?;
-            let recovery = recovery_parse(&recovery).ok_or("That is not a recovery key: 52 letters and digits, as it was shown.")?;
-            Method::Reset { recovery: Zeroizing::new(recovery), password: Zeroizing::new(password) }
+            let recovery = recovery_parse(&recovery)
+                .ok_or("That is not a recovery key: 52 letters and digits, as it was shown.")?;
+            Method::Reset {
+                recovery: Zeroizing::new(recovery),
+                password: Zeroizing::new(password),
+            }
         }
     };
     let password_based = !matches!(method, Method::Device { .. });
@@ -165,7 +204,12 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     let known_here = {
         let cfg = state.config();
         let here = cfg.relay_ids.get(server).and_then(|h| unhex16(h));
-        let elsewhere = cfg.relay_ids.iter().filter(|(s, _)| s.as_str() != server).filter_map(|(s, h)| Some((unhex16(h)?, s.clone()))).collect();
+        let elsewhere = cfg
+            .relay_ids
+            .iter()
+            .filter(|(s, _)| s.as_str() != server)
+            .filter_map(|(s, h)| Some((unhex16(h)?, s.clone())))
+            .collect();
         machine.expect_relay(here, elsewhere);
         here
     };
@@ -174,7 +218,13 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     let mut asked = 0u32;
     let (user_id, session_id, info) = loop {
         let msg = read(recv, buf).await?;
-        if let ServerMessage::Authenticated { user_id, session_id, account: Some(info), accounts } = msg {
+        if let ServerMessage::Authenticated {
+            user_id,
+            session_id,
+            account: Some(info),
+            accounts,
+        } = msg
+        {
             if let Some(accounts) = accounts {
                 emit_server(app, server, "relay-accounts", accounts);
             }
@@ -195,7 +245,11 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                 Step::NeedTotp => {
                     let answer = ask_totp(state, app, server, asked > 0).await?;
                     asked += 1;
-                    let out = if answer.recovery { machine.recovery_code(&answer.code) } else { machine.totp(&answer.code) };
+                    let out = if answer.recovery {
+                        machine.recovery_code(&answer.code)
+                    } else {
+                        machine.totp(&answer.code)
+                    };
                     write(send, &out).await?;
                 }
                 Step::ResetDone => {
@@ -212,12 +266,21 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     let signed = machine.finish()?;
     if known_here != Some(signed.relay_id) {
         let mut cfg = state.config();
-        cfg.relay_ids.insert(server.to_string(), hex(&signed.relay_id));
+        cfg.relay_ids
+            .insert(server.to_string(), hex(&signed.relay_id));
         if let Err(e) = crate::config::save_config(&cfg) {
             warn!(server, "could not remember the relay id: {e}");
         }
     }
-    let memory = state.chat.read().await.archive.cursors.get(&memory_key(&signed.relay_id, &signed.name)).cloned().unwrap_or_default();
+    let memory = state
+        .chat
+        .read()
+        .await
+        .archive
+        .cursors
+        .get(&memory_key(&signed.relay_id, &signed.name))
+        .cloned()
+        .unwrap_or_default();
     // Joiners of a channel's log get our older keys on the same consent as
     // handing them the channel's history in person.
     let share = state.config().share_channel_history;
@@ -228,17 +291,36 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     for (name, payload) in started.emit {
         emit_server(app, server, name, payload);
     }
-    Ok((user_id, session_id, Arc::new(AccountLink { session: std::sync::Mutex::new(session) })))
+    Ok((
+        user_id,
+        session_id,
+        Arc::new(AccountLink {
+            session: std::sync::Mutex::new(session),
+        }),
+    ))
 }
 
 /// Asks the front end for a code and waits for `account_totp`. The relay
 /// waits two minutes; so does this.
-async fn ask_totp(state: &AppState, app: &tauri::AppHandle, server: &str, retry: bool) -> Result<TotpAnswer, String> {
+async fn ask_totp(
+    state: &AppState,
+    app: &tauri::AppHandle,
+    server: &str,
+    retry: bool,
+) -> Result<TotpAnswer, String> {
     let (tx, rx) = oneshot::channel();
-    state.totp_answers.lock().unwrap_or_else(|p| p.into_inner()).insert(server.to_string(), tx);
+    state
+        .totp_answers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .insert(server.to_string(), tx);
     emit_server(app, server, "account-need-totp", retry);
     let answer = tokio::time::timeout(std::time::Duration::from_secs(115), rx).await;
-    state.totp_answers.lock().unwrap_or_else(|p| p.into_inner()).remove(server);
+    state
+        .totp_answers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(server);
     match answer {
         Ok(Ok(a)) => Ok(a),
         Ok(Err(_)) => Err("Sign-in cancelled.".into()),
@@ -248,7 +330,12 @@ async fn ask_totp(state: &AppState, app: &tauri::AppHandle, server: &str, retry:
 
 /// Once the connection's writer runs: what the sync asks first, then the
 /// second-factor setup a role waits for, or remembering this device.
-pub async fn after_connect(app: &tauri::AppHandle, server: &str, link: &AccountLink, tcp_tx: &mpsc::UnboundedSender<Vec<u8>>) {
+pub async fn after_connect(
+    app: &tauri::AppHandle,
+    server: &str,
+    link: &AccountLink,
+    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+) {
     let a = link.session().after_connect();
     run(app, server, tcp_tx, a).await;
 }
@@ -264,7 +351,13 @@ pub async fn check_seen(
     signal: &std::sync::Mutex<SignalState>,
     tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
 ) {
-    let seen = signal.lock().unwrap_or_else(|p| p.into_inner()).stores.as_mut().map(|s| s.identity.take_seen()).unwrap_or_default();
+    let seen = signal
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .stores
+        .as_mut()
+        .map(|s| s.identity.take_seen())
+        .unwrap_or_default();
     let Some(link) = link else { return };
     for (user_id, key) in seen {
         let a = link.session().check_identity(user_id, &key);
@@ -273,7 +366,13 @@ pub async fn check_seen(
 }
 
 /// An `AccountReply` on an account connection.
-pub async fn on_reply(app: &tauri::AppHandle, server: &str, link: &AccountLink, tcp_tx: &mpsc::UnboundedSender<Vec<u8>>, reply: AccountReply) {
+pub async fn on_reply(
+    app: &tauri::AppHandle,
+    server: &str,
+    link: &AccountLink,
+    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    reply: AccountReply,
+) {
     if let AccountReply::Error { request, reason } = &reply {
         if request.starts_with("Device") {
             warn!(server, "could not remember this device: {reason}");
@@ -286,9 +385,17 @@ pub async fn on_reply(app: &tauri::AppHandle, server: &str, link: &AccountLink, 
 // ── Commands ──────────────────────────────────────────────────────────────
 
 /// The connection to `server` and the account it signed in with.
-fn signed_in<'a>(connections: &'a crate::app_state::Connections, server: &str) -> Result<(&'a crate::app_state::ActiveConnection, &'a Arc<AccountLink>), String> {
-    let connection = connections.get(server).ok_or("Not connected to that server")?;
-    let link = connection.account.as_ref().ok_or("Not signed in to an account on that server")?;
+fn signed_in<'a>(
+    connections: &'a crate::app_state::Connections,
+    server: &str,
+) -> Result<(&'a crate::app_state::ActiveConnection, &'a Arc<AccountLink>), String> {
+    let connection = connections
+        .get(server)
+        .ok_or("Not connected to that server")?;
+    let link = connection
+        .account
+        .as_ref()
+        .ok_or("Not signed in to an account on that server")?;
     Ok((connection, link))
 }
 
@@ -317,7 +424,9 @@ pub async fn send_kept_dm(
     let (connection, link) = signed_in(&connections, &server)?;
     let id = crate::crypto::new_message_id();
     let payload = crate::crypto::envelope(&id, &content, ttl_secs);
-    let a = link.session().kept_dm(&account, payload, crate::crypto::now_ms(), ttl_secs)?;
+    let a = link
+        .session()
+        .kept_dm(&account, payload, crate::crypto::now_ms(), ttl_secs)?;
     run(&app, &server, &connection.tcp_tx, a).await;
     Ok(id)
 }
@@ -325,7 +434,12 @@ pub async fn send_kept_dm(
 /// Keep channel log `conv` from now on (cloud copies just turned on, while
 /// already in the channel).
 #[tauri::command]
-pub async fn account_enter(state: State<'_, AppState>, app: tauri::AppHandle, server: String, conv: String) -> Result<(), String> {
+pub async fn account_enter(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    server: String,
+    conv: String,
+) -> Result<(), String> {
     let connections = state.connections.read().await;
     let (connection, link) = signed_in(&connections, &server)?;
     let a = link.session().enter(&conv);
@@ -337,7 +451,12 @@ pub async fn account_enter(state: State<'_, AppState>, app: tauri::AppHandle, se
 /// tombstone for the readers' copies, or (None) everywhere. `LogPurged`
 /// answers as `account-reply`.
 #[tauri::command]
-pub async fn account_purge(state: State<'_, AppState>, app: tauri::AppHandle, server: String, conv: Option<String>) -> Result<(), String> {
+pub async fn account_purge(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    server: String,
+    conv: Option<String>,
+) -> Result<(), String> {
     let connections = state.connections.read().await;
     let (connection, link) = signed_in(&connections, &server)?;
     let a = link.session().purge(conv.as_deref());
@@ -363,7 +482,9 @@ pub async fn account_delete(
         let salt = link.session().kdf_salt();
         salt
     };
-    let master = tokio::task::spawn_blocking(move || stretch_salted(&password, &salt)).await.map_err(|e| e.to_string())?;
+    let master = tokio::task::spawn_blocking(move || stretch_salted(&password, &salt))
+        .await
+        .map_err(|e| e.to_string())?;
     let connections = state.connections.read().await;
     let (connection, link) = signed_in(&connections, &server)?;
     let a = link.session().delete_account(&master, totp, recovery);
@@ -374,7 +495,12 @@ pub async fn account_delete(
 /// Stop keeping channel log `conv` (a voice channel's: moving between rooms
 /// keeps one). Every remaining writer starts a new key on their next post.
 #[tauri::command]
-pub async fn account_leave(state: State<'_, AppState>, app: tauri::AppHandle, server: String, conv: String) -> Result<(), String> {
+pub async fn account_leave(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    server: String,
+    conv: String,
+) -> Result<(), String> {
     let connections = state.connections.read().await;
     let (connection, link) = signed_in(&connections, &server)?;
     let a = link.session().leave(&conv, true);
@@ -393,7 +519,12 @@ pub fn forget_relay_id(state: State<'_, AppState>, server: String) -> Result<boo
 }
 
 #[tauri::command]
-pub async fn account_set_prefs(state: State<'_, AppState>, app: tauri::AppHandle, server: String, prefs: Prefs) -> Result<(), String> {
+pub async fn account_set_prefs(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    server: String,
+    prefs: Prefs,
+) -> Result<(), String> {
     let connections = state.connections.read().await;
     let (connection, link) = signed_in(&connections, &server)?;
     let a = link.session().set_prefs(prefs);
@@ -404,16 +535,30 @@ pub async fn account_set_prefs(state: State<'_, AppState>, app: tauri::AppHandle
 /// The safety number with `user_id` on `server`: both of us signed in to
 /// accounts there, and their identity pinned.
 #[tauri::command]
-pub async fn safety_number(state: State<'_, AppState>, server: String, user_id: u32) -> Result<String, String> {
+pub async fn safety_number(
+    state: State<'_, AppState>,
+    server: String,
+    user_id: u32,
+) -> Result<String, String> {
     let connections = state.connections.read().await;
-    let connection = connections.get(&server).ok_or("Not connected to that server")?;
-    let link = connection.account.as_ref().ok_or("Sign in to an account to verify people")?;
+    let connection = connections
+        .get(&server)
+        .ok_or("Not connected to that server")?;
+    let link = connection
+        .account
+        .as_ref()
+        .ok_or("Sign in to an account to verify people")?;
     let (own_key, live) = {
         let sig = connection.signal.lock().map_err(|e| e.to_string())?;
         let stores = sig.stores.as_ref().ok_or("no identity yet")?;
-        (stores.identity.key_pair.public_key.clone(), stores.identity.identity_of(user_id).map(<[u8]>::to_vec))
+        (
+            stores.identity.key_pair.public_key.clone(),
+            stores.identity.identity_of(user_id).map(<[u8]>::to_vec),
+        )
     };
-    let number = link.session().safety_number(user_id, &own_key, live.as_deref());
+    let number = link
+        .session()
+        .safety_number(user_id, &own_key, live.as_deref());
     number
 }
 
@@ -429,10 +574,24 @@ pub fn qr_svg(text: String) -> Result<String, String> {
 
 /// The code (or a recovery code) for a sign-in waiting on one.
 #[tauri::command]
-pub async fn account_totp(state: State<'_, AppState>, server: String, code: String, recovery: Option<bool>) -> Result<(), String> {
-    let waiting = state.totp_answers.lock().unwrap_or_else(|p| p.into_inner()).remove(&server);
+pub async fn account_totp(
+    state: State<'_, AppState>,
+    server: String,
+    code: String,
+    recovery: Option<bool>,
+) -> Result<(), String> {
+    let waiting = state
+        .totp_answers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&server);
     match waiting {
-        Some(tx) => tx.send(TotpAnswer { code, recovery: recovery.unwrap_or(false) }).map_err(|_| "That sign-in is over.".to_string()),
+        Some(tx) => tx
+            .send(TotpAnswer {
+                code,
+                recovery: recovery.unwrap_or(false),
+            })
+            .map_err(|_| "That sign-in is over.".to_string()),
         None => Err("No sign-in is waiting for a code.".into()),
     }
 }
@@ -440,7 +599,11 @@ pub async fn account_totp(state: State<'_, AppState>, server: String, code: Stri
 /// Ends a sign-in waiting for a code (the person closed the prompt).
 #[tauri::command]
 pub async fn account_cancel(state: State<'_, AppState>, server: String) -> Result<(), String> {
-    state.totp_answers.lock().unwrap_or_else(|p| p.into_inner()).remove(&server);
+    state
+        .totp_answers
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .remove(&server);
     Ok(())
 }
 
@@ -465,17 +628,27 @@ pub async fn account_password_change(
         salt
     };
     // Two stretches, off the async workers
-    let (old_m, new_m) = tokio::task::spawn_blocking(move || (stretch_salted(&old, &salt), stretch_salted(&new, &salt))).await.map_err(|e| e.to_string())?;
+    let (old_m, new_m) = tokio::task::spawn_blocking(move || {
+        (stretch_salted(&old, &salt), stretch_salted(&new, &salt))
+    })
+    .await
+    .map_err(|e| e.to_string())?;
     let connections = state.connections.read().await;
     let (connection, link) = signed_in(&connections, &server)?;
-    let a = link.session().password_change(&old_m, &new_m, totp, recovery);
+    let a = link
+        .session()
+        .password_change(&old_m, &new_m, totp, recovery);
     run(&app, &server, &connection.tcp_tx, a).await;
     Ok(())
 }
 
 /// An account request on a signed-in connection (codes, the vault).
 #[tauri::command]
-pub async fn account_request(state: State<'_, AppState>, server: String, request: AccountRequest) -> Result<(), String> {
+pub async fn account_request(
+    state: State<'_, AppState>,
+    server: String,
+    request: AccountRequest,
+) -> Result<(), String> {
     let connections = state.connections.read().await;
     let (connection, _) = signed_in(&connections, &server)?;
     crate::network::send_tcp_message_sync(&connection.tcp_tx, &ClientMessage::Account(request));
@@ -497,21 +670,37 @@ pub async fn account_devices(state: State<'_, AppState>) -> Result<Vec<Remembere
         .archive
         .devices
         .iter()
-        .map(|d| RememberedDevice { server: d.server.clone(), name: d.name.clone(), relay_id: hex(&d.relay_id) })
+        .map(|d| RememberedDevice {
+            server: d.server.clone(),
+            name: d.name.clone(),
+            relay_id: hex(&d.relay_id),
+        })
         .collect())
 }
 
 /// Forget this device's key for an account here (the relay keeps its half
 /// until it expires or the account removes it).
 #[tauri::command]
-pub async fn forget_device(state: State<'_, AppState>, server: String, name: String) -> Result<(), String> {
+pub async fn forget_device(
+    state: State<'_, AppState>,
+    server: String,
+    name: String,
+) -> Result<(), String> {
     let mut chat = state.chat.write().await;
     // What it read there, and who it named as readers, goes with it.
-    let relays: Vec<[u8; 16]> = chat.archive.devices.iter().filter(|d| d.server == server && d.name == name).map(|d| d.relay_id).collect();
+    let relays: Vec<[u8; 16]> = chat
+        .archive
+        .devices
+        .iter()
+        .filter(|d| d.server == server && d.name == name)
+        .map(|d| d.relay_id)
+        .collect();
     for relay_id in relays {
         chat.archive.cursors.remove(&memory_key(&relay_id, &name));
     }
-    chat.archive.devices.retain(|d| !(d.server == server && d.name == name));
+    chat.archive
+        .devices
+        .retain(|d| !(d.server == server && d.name == name));
     chat.dirty = true;
     Ok(())
 }

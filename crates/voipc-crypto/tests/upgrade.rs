@@ -47,7 +47,10 @@ fn hex(b: &[u8]) -> String {
 }
 
 fn unhex(s: &str) -> Vec<u8> {
-    (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex")).collect()
+    (0..s.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&s[i..i + 2], 16).expect("hex"))
+        .collect()
 }
 
 fn arr<const N: usize>(s: &str) -> [u8; N] {
@@ -55,12 +58,22 @@ fn arr<const N: usize>(s: &str) -> [u8; N] {
 }
 
 fn load(version: &str) -> Kat {
-    let path = format!("{}/tests/fixtures/{version}/kat.json", env!("CARGO_MANIFEST_DIR"));
+    let path = format!(
+        "{}/tests/fixtures/{version}/kat.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
     serde_json::from_str(&std::fs::read_to_string(path).expect("fixture")).expect("fixture json")
 }
 
 fn blobs(k: &Kat) -> Vec<VaultBlob> {
-    k.blobs.iter().map(|b| VaultBlob { k: b.k.clone(), v: unhex(&b.v), version: 1 }).collect()
+    k.blobs
+        .iter()
+        .map(|b| VaultBlob {
+            k: b.k.clone(),
+            v: unhex(&b.v),
+            version: 1,
+        })
+        .collect()
 }
 
 #[test]
@@ -69,13 +82,27 @@ fn a_0_12_vault_opens_with_its_password_and_its_recovery_key() {
     let relay = arr::<16>(&k.relay_id);
     let blobs = blobs(&k);
     let d = derive(&k.password, &relay, &k.name);
-    let by_pw = Vault::open_with_password(relay, &k.name, &blobs, &d.vault_key).expect("password opens");
-    let by_rec = Vault::open_with_recovery(relay, &k.name, &blobs, &arr::<32>(&k.recovery)).expect("recovery key opens");
+    let by_pw =
+        Vault::open_with_password(relay, &k.name, &blobs, &d.vault_key).expect("password opens");
+    let by_rec = Vault::open_with_recovery(relay, &k.name, &blobs, &arr::<32>(&k.recovery))
+        .expect("recovery key opens");
     assert_eq!(by_pw.dek(), by_rec.dek());
 
-    let identity = IdentityKeyPair::try_from(&by_pw.open_item(&blobs, ITEM_IDENTITY).expect("identity item").payload[..]).expect("identity parses");
+    let identity = IdentityKeyPair::try_from(
+        &by_pw
+            .open_item(&blobs, ITEM_IDENTITY)
+            .expect("identity item")
+            .payload[..],
+    )
+    .expect("identity parses");
     assert_eq!(hex(&identity.public_key().serialize()), k.identity_public);
-    let logkey = LogKey::from_bytes(&by_pw.open_item(&blobs, ITEM_LOGKEY).expect("log key item").payload).expect("log key parses");
+    let logkey = LogKey::from_bytes(
+        &by_pw
+            .open_item(&blobs, ITEM_LOGKEY)
+            .expect("log key item")
+            .payload,
+    )
+    .expect("log key parses");
     assert_eq!(hex(&logkey.public()), k.logkey_public);
 }
 
@@ -83,11 +110,22 @@ fn a_0_12_vault_opens_with_its_password_and_its_recovery_key() {
 fn a_0_12_log_key_endorsement_and_kept_entry_still_verify() {
     let k = load("0.12.0");
     let (identity, logkey_pub) = (unhex(&k.identity_public), unhex(&k.logkey_public));
-    assert!(endorsed(&identity, &logkey_pub, &unhex(&k.endorsement)), "endorsement");
+    assert!(
+        endorsed(&identity, &logkey_pub, &unhex(&k.endorsement)),
+        "endorsement"
+    );
 
     let sender = arr::<16>(&k.sender);
     let key = arr::<32>(&k.epoch_key);
-    let (envelope, sent_at) = open_entry(&key, &k.conv, &sender, k.epoch, &logkey_pub, &unhex(&k.sealed)).expect("entry opens and verifies");
+    let (envelope, sent_at) = open_entry(
+        &key,
+        &k.conv,
+        &sender,
+        k.epoch,
+        &logkey_pub,
+        &unhex(&k.sealed),
+    )
+    .expect("entry opens and verifies");
     assert_eq!(envelope, k.envelope.as_bytes());
     assert_eq!(sent_at, k.sent_at);
 }
@@ -97,18 +135,43 @@ fn a_0_12_epoch_key_unwraps_from_a_wrap_and_a_self_wrap() {
     let k = load("0.12.0");
     let relay = arr::<16>(&k.relay_id);
     let blobs = blobs(&k);
-    let vault = Vault::open_with_password(relay, &k.name, &blobs, &derive(&k.password, &relay, &k.name).vault_key).unwrap();
+    let vault = Vault::open_with_password(
+        relay,
+        &k.name,
+        &blobs,
+        &derive(&k.password, &relay, &k.name).vault_key,
+    )
+    .unwrap();
     let own = LogKey::from_bytes(&vault.open_item(&blobs, ITEM_LOGKEY).unwrap().payload).unwrap();
     let sender = arr::<16>(&k.sender);
     let key = arr::<32>(&k.epoch_key);
-    assert_eq!(unwrap(&own, &unhex(&k.wrapped), &k.conv, &sender, k.epoch, &arr::<16>(&k.recipient)).expect("wrap"), key);
-    assert_eq!(self_unwrap(&own, &unhex(&k.self_wrapped), &k.conv, &sender, k.epoch).expect("self-wrap"), key);
+    assert_eq!(
+        unwrap(
+            &own,
+            &unhex(&k.wrapped),
+            &k.conv,
+            &sender,
+            k.epoch,
+            &arr::<16>(&k.recipient)
+        )
+        .expect("wrap"),
+        key
+    );
+    assert_eq!(
+        self_unwrap(&own, &unhex(&k.self_wrapped), &k.conv, &sender, k.epoch).expect("self-wrap"),
+        key
+    );
 }
 
 #[test]
 fn a_0_12_safety_number_is_unchanged() {
     let k = load("0.12.0");
-    let shown = safety_number(&arr::<16>(&k.sender), &unhex(&k.identity_public), &arr::<16>(&k.peer_account), &unhex(&k.peer_identity_public));
+    let shown = safety_number(
+        &arr::<16>(&k.sender),
+        &unhex(&k.identity_public),
+        &arr::<16>(&k.peer_account),
+        &unhex(&k.peer_identity_public),
+    );
     assert_eq!(shown.as_deref(), Some(k.safety_number.as_str()));
 }
 
@@ -121,7 +184,9 @@ fn a_0_12_safety_number_is_unchanged() {
 fn write_fixtures() {
     use voipc_crypto::account::ITEM_PINS;
     use voipc_crypto::log::{epoch_key, seal_entry, self_wrap, wrap};
-    let Ok(version) = std::env::var("VOIPC_WRITE_FIXTURES") else { return };
+    let Ok(version) = std::env::var("VOIPC_WRITE_FIXTURES") else {
+        return;
+    };
 
     let relay = [0x5a; 16];
     let (name, password) = ("luki", "correct horse battery staple");
@@ -135,7 +200,11 @@ fn write_fixtures() {
         vault.recovery_slot(&recovery),
         vault.seal_item(ITEM_IDENTITY, 1, &identity.serialize()),
         vault.seal_item(ITEM_LOGKEY, 1, &logkey.to_bytes()),
-        vault.seal_item(ITEM_PINS, 1, &voipc_crypto::account::Pins::default().to_bytes()),
+        vault.seal_item(
+            ITEM_PINS,
+            1,
+            &voipc_crypto::account::Pins::default().to_bytes(),
+        ),
     ];
 
     let sender = [0x11; 16];
@@ -153,7 +222,13 @@ fn write_fixtures() {
         name: name.into(),
         password: password.into(),
         recovery: hex(&recovery),
-        blobs: vblobs.iter().map(|b| Blob { k: b.k.clone(), v: hex(&b.v) }).collect(),
+        blobs: vblobs
+            .iter()
+            .map(|b| Blob {
+                k: b.k.clone(),
+                v: hex(&b.v),
+            })
+            .collect(),
         identity_public: hex(&identity_public),
         logkey_public: hex(&logkey.public()),
         endorsement: hex(&logkey.endorse(&identity)),
@@ -163,15 +238,30 @@ fn write_fixtures() {
         epoch_key: hex(&*key),
         envelope: envelope.into(),
         sent_at,
-        sealed: hex(&seal_entry(&key, conv, &sender, epoch, &logkey, envelope.as_bytes(), sent_at)),
+        sealed: hex(&seal_entry(
+            &key,
+            conv,
+            &sender,
+            epoch,
+            &logkey,
+            envelope.as_bytes(),
+            sent_at,
+        )),
         recipient: hex(&recipient),
-        wrapped: hex(&wrap(&logkey.public(), &key, conv, &sender, epoch, &recipient).expect("wrap")),
+        wrapped: hex(
+            &wrap(&logkey.public(), &key, conv, &sender, epoch, &recipient).expect("wrap"),
+        ),
         self_wrapped: hex(&self_wrap(&logkey, &key, conv, &sender, epoch)),
         peer_account: hex(&peer_account),
         peer_identity_public: hex(&peer_public),
-        safety_number: safety_number(&sender, &identity_public, &peer_account, &peer_public).expect("safety number"),
+        safety_number: safety_number(&sender, &identity_public, &peer_account, &peer_public)
+            .expect("safety number"),
     };
     let dir = format!("{}/tests/fixtures/{version}", env!("CARGO_MANIFEST_DIR"));
     std::fs::create_dir_all(&dir).unwrap();
-    std::fs::write(format!("{dir}/kat.json"), serde_json::to_string_pretty(&kat).unwrap() + "\n").unwrap();
+    std::fs::write(
+        format!("{dir}/kat.json"),
+        serde_json::to_string_pretty(&kat).unwrap() + "\n",
+    )
+    .unwrap();
 }

@@ -1,3 +1,8 @@
+// Android builds leave out the desktop's capture, SDK and hotkey paths, so the
+// state and helpers only those read are unused there. Desktop builds still
+// report any code that is dead everywhere.
+#![cfg_attr(target_os = "android", allow(dead_code))]
+
 mod account;
 mod app_state;
 mod commands;
@@ -10,9 +15,9 @@ mod screenshare;
 #[cfg(not(target_os = "android"))]
 mod sdk;
 mod transport;
+mod updater;
 #[cfg(test)]
 mod upgrade_fixtures;
-mod updater;
 
 use app_state::AppState;
 use tauri::Manager;
@@ -54,15 +59,16 @@ pub fn run() {
             // So the default is our own crates at info and everything else at
             // warn — third-party problems still surface, third-party
             // bookkeeping does not. RUST_LOG overrides it for a debugging run.
-            let filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                "warn,\
+            let filter =
+                tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    "warn,\
                  voipc_client_lib=info,\
                  voipc_audio=info,\
                  voipc_crypto=info,\
                  voipc_protocol=info,\
                  voipc_video=info"
-                    .into()
-            });
+                        .into()
+                });
             let _ = tracing_subscriber::registry()
                 .with(filter)
                 .with(layer)

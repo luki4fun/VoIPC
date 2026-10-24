@@ -95,7 +95,9 @@ impl SignalClient {
 
     /// `{ identity_key: number[], prekey_bundle: PreKeyBundleData }` for Authenticate.
     pub fn bundle(&self) -> Result<JsValue, JsError> {
-        Ok(serde_wasm_bindgen::to_value(&self.core.bundle().map_err(js_err)?)?)
+        Ok(serde_wasm_bindgen::to_value(
+            &self.core.bundle().map_err(js_err)?,
+        )?)
     }
 
     /// Our user id from `Authenticated`: every pairwise message is bound to it.
@@ -107,14 +109,18 @@ impl SignalClient {
     /// `OneTimePreKey[]` for `UploadPreKeys`, answering `PreKeysLow`.
     #[wasm_bindgen(js_name = morePrekeys)]
     pub fn more_prekeys(&mut self) -> Result<JsValue, JsError> {
-        Ok(serde_wasm_bindgen::to_value(&self.core.more_prekeys().map_err(js_err)?)?)
+        Ok(serde_wasm_bindgen::to_value(
+            &self.core.more_prekeys().map_err(js_err)?,
+        )?)
     }
 
     /// PQXDH with a peer's `PreKeyBundleData` (as decoded from `ServerMessage.PreKeyBundle`).
     #[wasm_bindgen(js_name = establishSession)]
     pub fn establish_session(&mut self, user_id: u32, bundle: JsValue) -> Result<(), JsError> {
         let bundle: PreKeyBundleData = serde_wasm_bindgen::from_value(bundle)?;
-        self.core.establish_session(user_id, &bundle).map_err(js_err)
+        self.core
+            .establish_session(user_id, &bundle)
+            .map_err(js_err)
     }
 
     /// `{ ciphertext: Uint8Array, message_type: number }` (1 = PreKey, 2 = Whisper).
@@ -145,7 +151,12 @@ impl SignalClient {
         self.core
             .take_seen()
             .into_iter()
-            .map(|(user_id, key)| js_object(&[("user_id", JsValue::from(user_id)), ("key", uint8array(&key))]))
+            .map(|(user_id, key)| {
+                js_object(&[
+                    ("user_id", JsValue::from(user_id)),
+                    ("key", uint8array(&key)),
+                ])
+            })
             .collect()
     }
 
@@ -646,6 +657,7 @@ pub fn parse_screen_audio_packet(
 
 /// Reassembles encrypted video fragments (0x13/0x14) into whole frames.
 #[wasm_bindgen]
+#[derive(Default)]
 pub struct VideoAssembler {
     core: media::VideoAssemblerCore,
 }
@@ -654,9 +666,7 @@ pub struct VideoAssembler {
 impl VideoAssembler {
     #[wasm_bindgen(constructor)]
     pub fn new() -> VideoAssembler {
-        Self {
-            core: media::VideoAssemblerCore::new(),
-        }
+        Self::default()
     }
 
     /// `{ frame?: Uint8Array, is_keyframe, timestamp, frame_dropped }`.
@@ -666,7 +676,10 @@ impl VideoAssembler {
         channel_id: u32,
         data: &[u8],
     ) -> Result<JsValue, JsError> {
-        let result = self.core.push(&keys.inner, channel_id, data).map_err(js_err)?;
+        let result = self
+            .core
+            .push(&keys.inner, channel_id, data)
+            .map_err(js_err)?;
         let mut fields = vec![
             ("is_keyframe", JsValue::from_bool(result.is_keyframe)),
             ("timestamp", JsValue::from(result.timestamp)),

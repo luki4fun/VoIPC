@@ -53,9 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let channel_tx = channel_tx.clone();
         let channel_rx = channel_rx.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                run_client(i, &server, sent, received, channel_tx, channel_rx).await
-            {
+            if let Err(e) = run_client(i, &server, sent, received, channel_tx, channel_rx).await {
                 eprintln!("client {i} failed: {e}");
             }
         });

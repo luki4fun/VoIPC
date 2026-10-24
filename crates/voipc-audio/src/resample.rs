@@ -77,7 +77,11 @@ mod tests {
         let mut out = Vec::new();
         r.process(&input, &mut out);
         // 100ms at 48kHz = 4800 samples, less what is still in the filter
-        assert!((out.len() as i64 - 4800).unsigned_abs() <= FILTER_DELAY, "len = {}", out.len());
+        assert!(
+            (out.len() as i64 - 4800).unsigned_abs() <= FILTER_DELAY,
+            "len = {}",
+            out.len()
+        );
     }
 
     #[test]
@@ -86,7 +90,11 @@ mod tests {
         let input = vec![0.0f32; 4800];
         let mut out = Vec::new();
         r.process(&input, &mut out);
-        assert!((out.len() as i64 - 4410).unsigned_abs() <= FILTER_DELAY, "len = {}", out.len());
+        assert!(
+            (out.len() as i64 - 4410).unsigned_abs() <= FILTER_DELAY,
+            "len = {}",
+            out.len()
+        );
     }
 
     #[test]

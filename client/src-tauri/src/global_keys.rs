@@ -84,7 +84,13 @@ pub fn spawn_listener(
             }
         }
 
-        run_rdev_loop(handle, ptt_binding, ptt_hold_mode, mute_binding, deafen_binding);
+        run_rdev_loop(
+            handle,
+            ptt_binding,
+            ptt_hold_mode,
+            mute_binding,
+            deafen_binding,
+        );
     });
 }
 
@@ -229,19 +235,13 @@ fn spawn_ptt_worker(handle: tauri::AppHandle) -> tokio::sync::mpsc::UnboundedSen
 #[cfg(not(target_os = "android"))]
 fn rdev_binding_matches(held: &HashSet<rdev::Key>, binding: &PttBinding) -> bool {
     use rdev::Key;
-    if binding.ctrl
-        && !held.contains(&Key::ControlLeft)
-        && !held.contains(&Key::ControlRight)
-    {
+    if binding.ctrl && !held.contains(&Key::ControlLeft) && !held.contains(&Key::ControlRight) {
         return false;
     }
     if binding.alt && !held.contains(&Key::Alt) && !held.contains(&Key::AltGr) {
         return false;
     }
-    if binding.shift
-        && !held.contains(&Key::ShiftLeft)
-        && !held.contains(&Key::ShiftRight)
-    {
+    if binding.shift && !held.contains(&Key::ShiftLeft) && !held.contains(&Key::ShiftRight) {
         return false;
     }
     if let Some(target) = js_code_to_rdev_key(&binding.code) {
@@ -257,19 +257,13 @@ fn rdev_binding_held(held: &HashSet<rdev::Key>, binding: &PttBinding) -> bool {
     if !binding.ctrl && !binding.alt && !binding.shift {
         return rdev_binding_matches(held, binding);
     }
-    if binding.ctrl
-        && !held.contains(&Key::ControlLeft)
-        && !held.contains(&Key::ControlRight)
-    {
+    if binding.ctrl && !held.contains(&Key::ControlLeft) && !held.contains(&Key::ControlRight) {
         return false;
     }
     if binding.alt && !held.contains(&Key::Alt) && !held.contains(&Key::AltGr) {
         return false;
     }
-    if binding.shift
-        && !held.contains(&Key::ShiftLeft)
-        && !held.contains(&Key::ShiftRight)
-    {
+    if binding.shift && !held.contains(&Key::ShiftLeft) && !held.contains(&Key::ShiftRight) {
         return false;
     }
     // Hold mode: the modifiers alone keep it open once the trigger started
@@ -451,21 +445,13 @@ fn js_code_to_evdev_key(code: &str) -> Option<evdev::Key> {
 #[cfg(target_os = "linux")]
 fn evdev_binding_matches(held: &HashSet<evdev::Key>, binding: &PttBinding) -> bool {
     use evdev::Key;
-    if binding.ctrl
-        && !held.contains(&Key::KEY_LEFTCTRL)
-        && !held.contains(&Key::KEY_RIGHTCTRL)
-    {
+    if binding.ctrl && !held.contains(&Key::KEY_LEFTCTRL) && !held.contains(&Key::KEY_RIGHTCTRL) {
         return false;
     }
-    if binding.alt
-        && !held.contains(&Key::KEY_LEFTALT)
-        && !held.contains(&Key::KEY_RIGHTALT)
-    {
+    if binding.alt && !held.contains(&Key::KEY_LEFTALT) && !held.contains(&Key::KEY_RIGHTALT) {
         return false;
     }
-    if binding.shift
-        && !held.contains(&Key::KEY_LEFTSHIFT)
-        && !held.contains(&Key::KEY_RIGHTSHIFT)
+    if binding.shift && !held.contains(&Key::KEY_LEFTSHIFT) && !held.contains(&Key::KEY_RIGHTSHIFT)
     {
         return false;
     }
@@ -482,21 +468,13 @@ fn evdev_binding_held(held: &HashSet<evdev::Key>, binding: &PttBinding) -> bool 
     if !binding.ctrl && !binding.alt && !binding.shift {
         return evdev_binding_matches(held, binding);
     }
-    if binding.ctrl
-        && !held.contains(&Key::KEY_LEFTCTRL)
-        && !held.contains(&Key::KEY_RIGHTCTRL)
-    {
+    if binding.ctrl && !held.contains(&Key::KEY_LEFTCTRL) && !held.contains(&Key::KEY_RIGHTCTRL) {
         return false;
     }
-    if binding.alt
-        && !held.contains(&Key::KEY_LEFTALT)
-        && !held.contains(&Key::KEY_RIGHTALT)
-    {
+    if binding.alt && !held.contains(&Key::KEY_LEFTALT) && !held.contains(&Key::KEY_RIGHTALT) {
         return false;
     }
-    if binding.shift
-        && !held.contains(&Key::KEY_LEFTSHIFT)
-        && !held.contains(&Key::KEY_RIGHTSHIFT)
+    if binding.shift && !held.contains(&Key::KEY_LEFTSHIFT) && !held.contains(&Key::KEY_RIGHTSHIFT)
     {
         return false;
     }
@@ -537,9 +515,7 @@ fn run_evdev_loop(
 
     let mut mute_active = false;
     let mut deafen_active = false;
-    let update_toggles = |held: &HashSet<Key>,
-                          mute_active: &mut bool,
-                          deafen_active: &mut bool| {
+    let update_toggles = |held: &HashSet<Key>, mute_active: &mut bool, deafen_active: &mut bool| {
         let m = mute_binding.read().unwrap_or_else(|p| p.into_inner());
         let m_match = m.as_ref().is_some_and(|b| evdev_binding_matches(held, b));
         drop(m);
@@ -601,10 +577,13 @@ fn run_evdev_loop(
                                 1 => {
                                     // Key press
                                     held_keys.insert(key);
-                                    update_toggles(&held_keys, &mut mute_active, &mut deafen_active);
+                                    update_toggles(
+                                        &held_keys,
+                                        &mut mute_active,
+                                        &mut deafen_active,
+                                    );
                                     let b = ptt_binding.read().unwrap_or_else(|p| p.into_inner());
-                                    let matches =
-                                        evdev_binding_matches(&held_keys, &b);
+                                    let matches = evdev_binding_matches(&held_keys, &b);
                                     drop(b);
 
                                     if matches && !ptt_active {
@@ -615,7 +594,11 @@ fn run_evdev_loop(
                                 0 => {
                                     // Key release
                                     held_keys.remove(&key);
-                                    update_toggles(&held_keys, &mut mute_active, &mut deafen_active);
+                                    update_toggles(
+                                        &held_keys,
+                                        &mut mute_active,
+                                        &mut deafen_active,
+                                    );
                                     if !ptt_still_held(&held_keys) && ptt_active {
                                         ptt_active = false;
                                         let _ = ptt.send(false);

@@ -55,7 +55,9 @@ pub struct UpdateInfo {
 /// The feed's extra `protocol` field, if it carries a sane one.
 #[cfg(any(not(target_os = "android"), test))]
 fn protocol_of(raw: &serde_json::Value) -> Option<u32> {
-    raw.get("protocol")?.as_u64().and_then(|p| u32::try_from(p).ok())
+    raw.get("protocol")?
+        .as_u64()
+        .and_then(|p| u32::try_from(p).ok())
 }
 
 #[cfg(not(target_os = "android"))]
@@ -81,7 +83,10 @@ mod desktop {
 
     impl Updates {
         pub fn pending(&self) -> Option<Update> {
-            self.pending.lock().unwrap_or_else(|p| p.into_inner()).clone()
+            self.pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .clone()
         }
         fn set(&self, update: Option<Update>) {
             *self.pending.lock().unwrap_or_else(|p| p.into_inner()) = update;
@@ -115,7 +120,11 @@ mod desktop {
             return false;
         };
         let probe = dir.join(format!(".voipc-update-{}", std::process::id()));
-        let writable = std::fs::OpenOptions::new().write(true).create_new(true).open(&probe).is_ok();
+        let writable = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&probe)
+            .is_ok();
         let _ = std::fs::remove_file(&probe);
         writable
     }
@@ -129,7 +138,9 @@ mod desktop {
         let updates = app.state::<Updates>();
         let _one = updates.busy.lock().await;
         let found = async {
-            let url = feed(env!("CARGO_PKG_VERSION")).parse().map_err(|e| format!("{e}"))?;
+            let url = feed(env!("CARGO_PKG_VERSION"))
+                .parse()
+                .map_err(|e| format!("{e}"))?;
             app.updater_builder()
                 .endpoints(vec![url])
                 .map_err(|e| e.to_string())?
@@ -192,7 +203,9 @@ mod desktop {
         }
         crate::commands::flush_chat_to_disk(&state).await;
         // Windows: starts the installer and exits. Linux: replaces the AppImage.
-        update.install(&bytes).map_err(|e| format!("The update could not be installed: {e}"))?;
+        update
+            .install(&bytes)
+            .map_err(|e| format!("The update could not be installed: {e}"))?;
         app.restart();
     }
 }
@@ -215,7 +228,10 @@ pub fn pending_update(app: tauri::AppHandle) -> Option<UpdateInfo> {
     #[cfg(not(target_os = "android"))]
     {
         use tauri::Manager;
-        return app.state::<Updates>().pending().as_ref().map(desktop::info_of);
+        app.state::<Updates>()
+            .pending()
+            .as_ref()
+            .map(desktop::info_of)
     }
     #[cfg(target_os = "android")]
     {
@@ -280,11 +296,17 @@ mod tests {
 
     #[test]
     fn the_feed_may_say_which_protocol_an_update_speaks() {
-        assert_eq!(protocol_of(&serde_json::json!({"version": "1.0.0", "protocol": 12})), Some(12));
+        assert_eq!(
+            protocol_of(&serde_json::json!({"version": "1.0.0", "protocol": 12})),
+            Some(12)
+        );
         assert_eq!(protocol_of(&serde_json::json!({"version": "1.0.0"})), None);
         assert_eq!(protocol_of(&serde_json::json!({"protocol": "12"})), None);
         assert_eq!(protocol_of(&serde_json::json!({"protocol": -1})), None);
-        assert_eq!(protocol_of(&serde_json::json!({"protocol": 1u64 << 40})), None);
+        assert_eq!(
+            protocol_of(&serde_json::json!({"protocol": 1u64 << 40})),
+            None
+        );
     }
 
     /// The key every update must be signed with, and the version binding, are
@@ -292,22 +314,36 @@ mod tests {
     /// through (or every update fail).
     #[test]
     fn updates_must_be_signed_by_our_key_for_the_version_they_claim() {
-        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
         let updater = &conf["plugins"]["updater"];
-        assert_eq!(updater["requireSignedVersion"], true, "requireSignedVersion must stay on");
-        assert!(updater.get("allowDowngrades").is_none_or(|v| v == false), "downgrades must stay off");
-        assert!(updater.get("endpoints").is_none(), "the feed is chosen in updater.rs, not in the config");
+        assert_eq!(
+            updater["requireSignedVersion"], true,
+            "requireSignedVersion must stay on"
+        );
+        assert!(
+            updater.get("allowDowngrades").is_none_or(|v| v == false),
+            "downgrades must stay off"
+        );
+        assert!(
+            updater.get("endpoints").is_none(),
+            "the feed is chosen in updater.rs, not in the config"
+        );
         use base64::Engine;
         let key = base64::engine::general_purpose::STANDARD
             .decode(updater["pubkey"].as_str().unwrap())
             .unwrap();
         let key = String::from_utf8(key).unwrap();
-        assert!(key.contains("minisign public key: 7A18259E495D3861"), "{key}");
+        assert!(
+            key.contains("minisign public key: 7A18259E495D3861"),
+            "{key}"
+        );
         // What the plugin does with it at start: a config it cannot read
         // would stop the app from starting at all
         #[cfg(not(target_os = "android"))]
         {
-            let parsed: tauri_plugin_updater::Config = serde_json::from_value(updater.clone()).unwrap();
+            let parsed: tauri_plugin_updater::Config =
+                serde_json::from_value(updater.clone()).unwrap();
             assert!(parsed.require_signed_version && !parsed.allow_downgrades);
         }
     }

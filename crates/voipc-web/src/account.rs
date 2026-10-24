@@ -5,15 +5,18 @@
 
 use serde::Deserialize;
 
-use voipc_crypto::account::{normalize_name, password_ok, recovery_parse, DeviceKey, Method, SignIn, SignedIn, Step, Zeroizing, KDF_ROUNDS};
-use voipc_protocol::conv::unhex16;
+use voipc_crypto::account::{
+    normalize_name, password_ok, recovery_parse, DeviceKey, Method, SignIn, SignedIn, Step,
+    Zeroizing, KDF_ROUNDS,
+};
 use voipc_crypto::account_session::{AccountSession as Session, Actions};
 use voipc_crypto::sync::{LogMemory, Prefs};
-use voipc_protocol::messages::AccountReply;
-use voipc_protocol::types::{AccountInfo, UserInfo};
 use voipc_protocol::codec::{decode_server_msg, APP_VERSION, PROTOCOL_VERSION};
+use voipc_protocol::conv::unhex16;
+use voipc_protocol::messages::AccountReply;
 use voipc_protocol::messages::{ClientMessage, ServerMessage};
 use voipc_protocol::types::PreKeyBundleData;
+use voipc_protocol::types::{AccountInfo, UserInfo};
 use wasm_bindgen::prelude::*;
 
 fn bytes(msg: &ClientMessage) -> Vec<u8> {
@@ -27,18 +30,32 @@ fn obj(key: &str, value: JsValue) -> JsValue {
 }
 
 fn array16(v: &[u8], what: &str) -> Result<[u8; 16], JsError> {
-    v.try_into().map_err(|_| JsError::new(&format!("{what} is not 16 bytes")))
+    v.try_into()
+        .map_err(|_| JsError::new(&format!("{what} is not 16 bytes")))
 }
 
 /// How the browser signs in, from JS.
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "camelCase")]
 enum MethodJs {
-    Login { password: String },
-    Register { password: String, invite: Option<String> },
-    Device { device_id: Vec<u8>, device_key: Vec<u8>, relay_id: Vec<u8>, dek: Vec<u8> },
+    Login {
+        password: String,
+    },
+    Register {
+        password: String,
+        invite: Option<String>,
+    },
+    Device {
+        device_id: Vec<u8>,
+        device_key: Vec<u8>,
+        relay_id: Vec<u8>,
+        dek: Vec<u8>,
+    },
     /// A forgotten password, with the recovery key as shown (`recovery`).
-    Reset { recovery: String, password: String },
+    Reset {
+        recovery: String,
+        password: String,
+    },
 }
 
 #[wasm_bindgen]
@@ -60,25 +77,50 @@ impl AccountSignIn {
     pub fn new(name: &str, method: JsValue) -> Result<AccountSignIn, JsError> {
         let name = normalize_name(name).map_err(JsError::new)?;
         let method = match serde_wasm_bindgen::from_value::<MethodJs>(method)? {
-            MethodJs::Login { password } => Method::Password { password: Zeroizing::new(password) },
+            MethodJs::Login { password } => Method::Password {
+                password: Zeroizing::new(password),
+            },
             MethodJs::Register { password, invite } => {
                 password_ok(&password).map_err(JsError::new)?;
-                Method::Register { password: Zeroizing::new(password), invite }
+                Method::Register {
+                    password: Zeroizing::new(password),
+                    invite,
+                }
             }
-            MethodJs::Device { device_id, device_key, relay_id, dek } => {
-                let key = DeviceKey::from_parts(array16(&device_id, "device id")?, device_key).ok_or_else(|| JsError::new("This device's key is damaged."))?;
-                let dek: [u8; 32] = dek.try_into().map_err(|_| JsError::new("the vault key is not 32 bytes"))?;
-                Method::Device { key, relay_id: array16(&relay_id, "relay id")?, dek }
+            MethodJs::Device {
+                device_id,
+                device_key,
+                relay_id,
+                dek,
+            } => {
+                let key = DeviceKey::from_parts(array16(&device_id, "device id")?, device_key)
+                    .ok_or_else(|| JsError::new("This device's key is damaged."))?;
+                let dek: [u8; 32] = dek
+                    .try_into()
+                    .map_err(|_| JsError::new("the vault key is not 32 bytes"))?;
+                Method::Device {
+                    key,
+                    relay_id: array16(&relay_id, "relay id")?,
+                    dek,
+                }
             }
             MethodJs::Reset { recovery, password } => {
                 password_ok(&password).map_err(JsError::new)?;
-                let recovery = recovery_parse(&recovery).ok_or_else(|| JsError::new(NOT_A_RECOVERY_KEY))?;
-                Method::Reset { recovery: Zeroizing::new(recovery), password: Zeroizing::new(password) }
+                let recovery =
+                    recovery_parse(&recovery).ok_or_else(|| JsError::new(NOT_A_RECOVERY_KEY))?;
+                Method::Reset {
+                    recovery: Zeroizing::new(recovery),
+                    password: Zeroizing::new(password),
+                }
             }
         };
         let (mut machine, first) = SignIn::start(&name, method, PROTOCOL_VERSION, APP_VERSION);
         machine.stretch_outside();
-        Ok(AccountSignIn { machine: Some(machine), first: bytes(&first), signed: None })
+        Ok(AccountSignIn {
+            machine: Some(machine),
+            first: bytes(&first),
+            signed: None,
+        })
     }
 
     /// The `Authenticate` payload to open the connection with.
@@ -87,17 +129,29 @@ impl AccountSignIn {
     }
 
     fn m(&self) -> Result<&SignIn, JsError> {
-        self.machine.as_ref().ok_or_else(|| JsError::new("the sign-in is over"))
+        self.machine
+            .as_ref()
+            .ok_or_else(|| JsError::new("the sign-in is over"))
     }
 
     /// What this browser knows of relay ids (H5-01): the hex id this address
     /// had before, if any, and `[hex id, address]` for the others. A server
     /// naming another's id is refused before the password is stretched.
     #[wasm_bindgen(js_name = expectRelay)]
-    pub fn expect_relay(&mut self, here: Option<String>, elsewhere: JsValue) -> Result<(), JsError> {
+    pub fn expect_relay(
+        &mut self,
+        here: Option<String>,
+        elsewhere: JsValue,
+    ) -> Result<(), JsError> {
         let elsewhere: Vec<(String, String)> = serde_wasm_bindgen::from_value(elsewhere)?;
-        let elsewhere = elsewhere.into_iter().filter_map(|(id, addr)| Some((unhex16(&id)?, addr))).collect();
-        let m = self.machine.as_mut().ok_or_else(|| JsError::new("the sign-in is over"))?;
+        let elsewhere = elsewhere
+            .into_iter()
+            .filter_map(|(id, addr)| Some((unhex16(&id)?, addr)))
+            .collect();
+        let m = self
+            .machine
+            .as_mut()
+            .ok_or_else(|| JsError::new("the sign-in is over"))?;
         m.expect_relay(here.as_deref().and_then(unhex16), elsewhere);
         Ok(())
     }
@@ -109,15 +163,23 @@ impl AccountSignIn {
     /// Throws the reason when the sign-in fails.
     pub fn step(&mut self, payload: &[u8]) -> Result<js_sys::Array, JsError> {
         let msg: ServerMessage = decode_server_msg(payload)?;
-        let m = self.machine.as_mut().ok_or_else(|| JsError::new("the sign-in is over"))?;
+        let m = self
+            .machine
+            .as_mut()
+            .ok_or_else(|| JsError::new("the sign-in is over"))?;
         Ok(steps(m.on_message(&msg).map_err(|e| JsError::new(&e))?))
     }
 
     /// PBKDF2-SHA256 (`kdfRounds()`, 32 bytes) of the password with the salt
     /// `{ stretch }` named; the steps that follow, as `step` gives them.
     pub fn stretched(&mut self, master: &[u8]) -> Result<js_sys::Array, JsError> {
-        let master: [u8; 32] = master.try_into().map_err(|_| JsError::new("the stretched password is not 32 bytes"))?;
-        let m = self.machine.as_mut().ok_or_else(|| JsError::new("the sign-in is over"))?;
+        let master: [u8; 32] = master
+            .try_into()
+            .map_err(|_| JsError::new("the stretched password is not 32 bytes"))?;
+        let m = self
+            .machine
+            .as_mut()
+            .ok_or_else(|| JsError::new("the sign-in is over"))?;
         Ok(steps(m.stretched(&master).map_err(|e| JsError::new(&e))?))
     }
 
@@ -125,8 +187,13 @@ impl AccountSignIn {
     /// private key never reaches JS (1.0 audit H2-10).
     #[wasm_bindgen(js_name = signalClient)]
     pub fn signal_client(&self) -> Result<crate::SignalClient, JsError> {
-        let identity = self.m()?.identity().ok_or_else(|| JsError::new("no identity yet"))?;
-        Ok(crate::SignalClient { core: crate::signal::SignalCore::with_identity(identity).map_err(crate::js_err)? })
+        let identity = self
+            .m()?
+            .identity()
+            .ok_or_else(|| JsError::new("no identity yet"))?;
+        Ok(crate::SignalClient {
+            core: crate::signal::SignalCore::with_identity(identity).map_err(crate::js_err)?,
+        })
     }
 
     /// The `Keys` payload, from `SignalClient.bundle().prekey_bundle`.
@@ -146,7 +213,10 @@ impl AccountSignIn {
     /// After `Authenticated`: `{ relay_id: Uint8Array, name }`, which name
     /// where this browser kept the log's read cursors (`memoryKey`).
     pub fn finish(&mut self) -> Result<JsValue, JsError> {
-        let m = self.machine.take().ok_or_else(|| JsError::new("the sign-in is over"))?;
+        let m = self
+            .machine
+            .take()
+            .ok_or_else(|| JsError::new("the sign-in is over"))?;
         let s = m.finish().map_err(|e| JsError::new(&e))?;
         let o = js_sys::Object::new();
         let set = |k: &str, v: JsValue| {
@@ -165,10 +235,21 @@ impl AccountSignIn {
     /// whether this sign-in was with the password.
     /// `{ session: AccountSession, actions }` (`AccountSession` for actions).
     #[wasm_bindgen(js_name = startSession)]
-    pub fn start_session(&mut self, info: JsValue, memory: Option<String>, share: bool, password_based: bool) -> Result<JsValue, JsError> {
-        let signed = self.signed.take().ok_or_else(|| JsError::new("finish the sign-in first"))?;
+    pub fn start_session(
+        &mut self,
+        info: JsValue,
+        memory: Option<String>,
+        share: bool,
+        password_based: bool,
+    ) -> Result<JsValue, JsError> {
+        let signed = self
+            .signed
+            .take()
+            .ok_or_else(|| JsError::new("finish the sign-in first"))?;
         let info: AccountInfo = serde_wasm_bindgen::from_value(info)?;
-        let memory: LogMemory = memory.and_then(|c| serde_json::from_str(&c).ok()).unwrap_or_default();
+        let memory: LogMemory = memory
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default();
         let (session, started) = Session::start(signed, &info, memory, share, password_based);
         let o = js_sys::Object::new();
         let _ = js_sys::Reflect::set(&o, &"session".into(), &AccountSession { session }.into());
@@ -177,14 +258,18 @@ impl AccountSignIn {
     }
 }
 
-const NOT_A_RECOVERY_KEY: &str = "That is not a recovery key: 52 letters and digits, as it was shown.";
+const NOT_A_RECOVERY_KEY: &str =
+    "That is not a recovery key: 52 letters and digits, as it was shown.";
 
 fn steps(steps: Vec<Step>) -> js_sys::Array {
     let out = js_sys::Array::new();
     for step in steps {
         match step {
             Step::Send(c) => {
-                out.push(&obj("send", js_sys::Uint8Array::from(&bytes(&c)[..]).into()));
+                out.push(&obj(
+                    "send",
+                    js_sys::Uint8Array::from(&bytes(&c)[..]).into(),
+                ));
             }
             Step::Keys => {
                 out.push(&obj("keys", JsValue::TRUE));
@@ -211,15 +296,18 @@ pub fn kdf_rounds() -> u32 {
 }
 
 fn payloads(out: Vec<ClientMessage>) -> js_sys::Array {
-    out.iter().map(|m| JsValue::from(js_sys::Uint8Array::from(&bytes(m)[..]))).collect()
+    out.iter()
+        .map(|m| JsValue::from(js_sys::Uint8Array::from(&bytes(m)[..])))
+        .collect()
 }
-
 
 /// What the session asks the page to do (`voipc_crypto::account_session::Actions`):
 /// `{ send: Uint8Array[], emit: { name, payload }[], remember?: { relay_id,
 /// name, device_id, device_key, dek }, memory?: { key, json } }`.
 fn actions(a: Actions) -> Result<JsValue, JsError> {
-    let plain = |v: &serde_json::Value| serde::Serialize::serialize(v, &serde_wasm_bindgen::Serializer::json_compatible());
+    let plain = |v: &serde_json::Value| {
+        serde::Serialize::serialize(v, &serde_wasm_bindgen::Serializer::json_compatible())
+    };
     let o = js_sys::Object::new();
     let set = |k: &str, v: &JsValue| {
         let _ = js_sys::Reflect::set(&o, &JsValue::from_str(k), v);
@@ -229,7 +317,9 @@ fn actions(a: Actions) -> Result<JsValue, JsError> {
     for (name, payload) in a.emit {
         // As plain objects: by default a JSON object comes out as a JS Map,
         // whose fields a property read does not see.
-        emit.push(&plain(&serde_json::json!({ "name": name, "payload": payload }))?);
+        emit.push(&plain(
+            &serde_json::json!({ "name": name, "payload": payload }),
+        )?);
     }
     set("emit", &emit.into());
     if let Some(r) = a.remember {
@@ -240,7 +330,12 @@ fn actions(a: Actions) -> Result<JsValue, JsError> {
         set("remember", &plain(&device)?);
     }
     if let Some((key, memory)) = a.memory {
-        set("memory", &plain(&serde_json::json!({ "key": key, "json": serde_json::to_string(&memory).unwrap_or_default() }))?);
+        set(
+            "memory",
+            &plain(
+                &serde_json::json!({ "key": key, "json": serde_json::to_string(&memory).unwrap_or_default() }),
+            )?,
+        );
     }
     Ok(o.into())
 }
@@ -283,20 +378,47 @@ impl AccountSession {
     }
 
     #[wasm_bindgen(js_name = outgoingDm)]
-    pub fn outgoing_dm(&mut self, user_id: u32, envelope: &[u8], sent_at: f64, ttl_secs: Option<u32>) -> Result<JsValue, JsError> {
-        actions(self.session.outgoing_dm(user_id, envelope.to_vec(), sent_at as u64, ttl_secs))
+    pub fn outgoing_dm(
+        &mut self,
+        user_id: u32,
+        envelope: &[u8],
+        sent_at: f64,
+        ttl_secs: Option<u32>,
+    ) -> Result<JsValue, JsError> {
+        actions(
+            self.session
+                .outgoing_dm(user_id, envelope.to_vec(), sent_at as u64, ttl_secs),
+        )
     }
 
     /// A direct message for an account that is away (its hex id).
     #[wasm_bindgen(js_name = keptDm)]
-    pub fn kept_dm(&mut self, account_hex: &str, envelope: &[u8], sent_at: f64, ttl_secs: Option<u32>) -> Result<JsValue, JsError> {
-        let a = self.session.kept_dm(account_hex, envelope.to_vec(), sent_at as u64, ttl_secs).map_err(|e| JsError::new(&e))?;
+    pub fn kept_dm(
+        &mut self,
+        account_hex: &str,
+        envelope: &[u8],
+        sent_at: f64,
+        ttl_secs: Option<u32>,
+    ) -> Result<JsValue, JsError> {
+        let a = self
+            .session
+            .kept_dm(account_hex, envelope.to_vec(), sent_at as u64, ttl_secs)
+            .map_err(|e| JsError::new(&e))?;
         actions(a)
     }
 
     #[wasm_bindgen(js_name = outgoingChannel)]
-    pub fn outgoing_channel(&mut self, log: &str, envelope: &[u8], sent_at: f64, ttl_secs: Option<u32>) -> Result<JsValue, JsError> {
-        actions(self.session.outgoing_channel(log, envelope.to_vec(), sent_at as u64, ttl_secs))
+    pub fn outgoing_channel(
+        &mut self,
+        log: &str,
+        envelope: &[u8],
+        sent_at: f64,
+        ttl_secs: Option<u32>,
+    ) -> Result<JsValue, JsError> {
+        actions(
+            self.session
+                .outgoing_channel(log, envelope.to_vec(), sent_at as u64, ttl_secs),
+        )
     }
 
     /// In a channel with log `conv`: keep it, and read what it kept.
@@ -312,8 +434,15 @@ impl AccountSession {
 
     /// Delete this account, from its stretched password (`kdfSalt`).
     #[wasm_bindgen(js_name = deleteAccount)]
-    pub fn delete_account(&self, master: &[u8], totp: Option<String>, recovery_code: Option<String>) -> Result<JsValue, JsError> {
-        let master: [u8; 32] = master.try_into().map_err(|_| JsError::new("the stretched password is not 32 bytes"))?;
+    pub fn delete_account(
+        &self,
+        master: &[u8],
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    ) -> Result<JsValue, JsError> {
+        let master: [u8; 32] = master
+            .try_into()
+            .map_err(|_| JsError::new("the stretched password is not 32 bytes"))?;
         actions(self.session.delete_account(&master, totp, recovery_code))
     }
 
@@ -329,8 +458,15 @@ impl AccountSession {
 
     /// Throws why there is none (not an account, never seen, a key changed).
     #[wasm_bindgen(js_name = safetyNumber)]
-    pub fn safety_number(&self, user_id: u32, own_key: &[u8], live: Option<Vec<u8>>) -> Result<String, JsError> {
-        self.session.safety_number(user_id, own_key, live.as_deref()).map_err(|e| JsError::new(&e))
+    pub fn safety_number(
+        &self,
+        user_id: u32,
+        own_key: &[u8],
+        live: Option<Vec<u8>>,
+    ) -> Result<String, JsError> {
+        self.session
+            .safety_number(user_id, own_key, live.as_deref())
+            .map_err(|e| JsError::new(&e))
     }
 
     pub fn cloud(&self) -> bool {
@@ -360,9 +496,23 @@ impl AccountSession {
     /// A new password, from the stretched old and new ones (`kdfSalt`), and
     /// a code where the account has codes on.
     #[wasm_bindgen(js_name = passwordChange)]
-    pub fn password_change(&self, old_master: &[u8], new_master: &[u8], totp: Option<String>, recovery_code: Option<String>) -> Result<JsValue, JsError> {
-        let m32 = |m: &[u8]| -> Result<[u8; 32], JsError> { m.try_into().map_err(|_| JsError::new("a stretched password is not 32 bytes")) };
-        actions(self.session.password_change(&m32(old_master)?, &m32(new_master)?, totp, recovery_code))
+    pub fn password_change(
+        &self,
+        old_master: &[u8],
+        new_master: &[u8],
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    ) -> Result<JsValue, JsError> {
+        let m32 = |m: &[u8]| -> Result<[u8; 32], JsError> {
+            m.try_into()
+                .map_err(|_| JsError::new("a stretched password is not 32 bytes"))
+        };
+        actions(self.session.password_change(
+            &m32(old_master)?,
+            &m32(new_master)?,
+            totp,
+            recovery_code,
+        ))
     }
 }
 

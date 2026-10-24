@@ -76,9 +76,7 @@ pub fn parse_voice_packet(
                 &packet.opus_data,
             )?)
         }
-        VoicePacketType::EndOfTransmission | VoicePacketType::Ping | VoicePacketType::Pong => {
-            None
-        }
+        VoicePacketType::EndOfTransmission | VoicePacketType::Ping | VoicePacketType::Pong => None,
         VoicePacketType::OpusVoice => bail!("plaintext voice packet rejected"),
         VoicePacketType::Position => bail!("position packet is not voice"),
     };
@@ -280,6 +278,7 @@ pub struct VideoPush {
 }
 
 /// Reassembles encrypted video fragments (0x13/0x14) into whole frames.
+#[derive(Default)]
 pub struct VideoAssemblerCore {
     assembler: FrameAssembler,
     /// Sharer session the fragments belong to; a change resets the assembler.
@@ -288,10 +287,7 @@ pub struct VideoAssemblerCore {
 
 impl VideoAssemblerCore {
     pub fn new() -> Self {
-        Self {
-            assembler: FrameAssembler::new(),
-            current_session: None,
-        }
+        Self::default()
     }
 
     pub fn push(
@@ -307,7 +303,10 @@ impl VideoAssemblerCore {
             VideoPacketType::EncryptedVideoFragment
                 | VideoPacketType::EncryptedVideoKeyframeFragment
         ) {
-            bail!("not an encrypted video fragment: 0x{:02x}", packet_type as u8);
+            bail!(
+                "not an encrypted video fragment: 0x{:02x}",
+                packet_type as u8
+            );
         }
 
         // Nonce: the sender's own stream id, frame id as the sequence,

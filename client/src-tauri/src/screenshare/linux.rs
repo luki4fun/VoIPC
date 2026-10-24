@@ -8,8 +8,8 @@ use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use super::{
-    run_encode_loop, AudioProcessor, CapturedFrame, DisplayInfo, FrameProcessor, FrameSlot,
-    PixFmt, WindowInfo, SCREEN_AUDIO_BITRATE, SCREEN_AUDIO_FRAME_SIZE,
+    run_encode_loop, AudioProcessor, CapturedFrame, DisplayInfo, FrameProcessor, FrameSlot, PixFmt,
+    WindowInfo, SCREEN_AUDIO_BITRATE, SCREEN_AUDIO_FRAME_SIZE,
 };
 
 /// An active XDG Desktop Portal ScreenCast session.
@@ -70,8 +70,7 @@ pub async fn request_screencast(
         _ => SourceType::Monitor | SourceType::Window,
     };
 
-    let (result_tx, result_rx) =
-        tokio::sync::oneshot::channel::<Result<(OwnedFd, u32), String>>();
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel::<Result<(OwnedFd, u32), String>>();
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
 
     let keep_alive = tokio::spawn(async move {
@@ -126,7 +125,8 @@ pub async fn request_screencast(
             Ok((fd_clone, node_id, _fd, session)) => {
                 let _ = result_tx.send(Ok((fd_clone, node_id)));
                 let _ = shutdown_rx.await;
-                match tokio::time::timeout(std::time::Duration::from_secs(5), session.close()).await {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), session.close()).await
+                {
                     Ok(Ok(())) => {}
                     Ok(Err(e)) => warn!("failed to close portal session: {e}"),
                     Err(_) => warn!("portal session close timed out"),
@@ -158,6 +158,7 @@ pub async fn request_screencast(
 }
 
 /// Spawn the PipeWire screen capture + encode + fragment task.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_capture_task(
     session: &CaptureSession,
     target_width: u32,
@@ -218,6 +219,7 @@ pub fn spawn_capture_task(
 }
 
 /// PipeWire capture main loop.
+#[allow(clippy::too_many_arguments)]
 fn run_pipewire_capture(
     pw_fd: OwnedFd,
     node_id: u32,
@@ -244,8 +246,8 @@ fn run_pipewire_capture(
 ) -> Result<(), String> {
     pipewire::init();
 
-    let mainloop = pipewire::main_loop::MainLoopRc::new(None)
-        .map_err(|e| format!("MainLoopRc::new: {e}"))?;
+    let mainloop =
+        pipewire::main_loop::MainLoopRc::new(None).map_err(|e| format!("MainLoopRc::new: {e}"))?;
     let context = pipewire::context::ContextRc::new(&mainloop, None)
         .map_err(|e| format!("ContextRc::new: {e}"))?;
     let core = context
@@ -554,8 +556,7 @@ fn run_pipewire_capture(
         .connect(
             pipewire::spa::utils::Direction::Input,
             None,
-            pipewire::stream::StreamFlags::AUTOCONNECT
-                | pipewire::stream::StreamFlags::MAP_BUFFERS,
+            pipewire::stream::StreamFlags::AUTOCONNECT | pipewire::stream::StreamFlags::MAP_BUFFERS,
             &mut [audio_pod],
         )
         .map_err(|e| format!("Audio stream connect: {e}"))?;
@@ -640,10 +641,7 @@ fn build_video_format_pod(width: u32, height: u32, fps: u32) -> Result<Vec<u8>, 
             Fraction,
             spa::utils::Fraction { num: fps, denom: 1 },
             spa::utils::Fraction { num: 0, denom: 1 },
-            spa::utils::Fraction {
-                num: 60,
-                denom: 1
-            }
+            spa::utils::Fraction { num: 60, denom: 1 }
         ),
     );
 

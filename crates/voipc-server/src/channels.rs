@@ -133,7 +133,9 @@ impl ChannelEntry {
         match &self.uid {
             Some(uid) => format!("c:{uid}"),
             None => {
-                let digest = Sha256::digest(format!("voipc-channel/v1|{}", self.name.trim().to_lowercase()).as_bytes());
+                let digest = Sha256::digest(
+                    format!("voipc-channel/v1|{}", self.name.trim().to_lowercase()).as_bytes(),
+                );
                 format!("c:{}", hex::encode(&digest[..16]))
             }
         }
@@ -176,8 +178,16 @@ impl Default for ChannelEntry {
 /// (`$argon2id$v=19$…`, l4f's parameters). Before 1.0 it was unsalted SHA-256
 /// (`sha256:<hex>`), which `verify_password` still reads (1.0 audit H1-16).
 pub fn hash_password(plaintext: &str) -> anyhow::Result<String> {
-    if plaintext.is_empty() || plaintext.chars().nth(l4f_accounts::password::MAX_LEN).is_some() {
-        bail!("a channel password must be 1 to {} characters", l4f_accounts::password::MAX_LEN);
+    if plaintext.is_empty()
+        || plaintext
+            .chars()
+            .nth(l4f_accounts::password::MAX_LEN)
+            .is_some()
+    {
+        bail!(
+            "a channel password must be 1 to {} characters",
+            l4f_accounts::password::MAX_LEN
+        );
     }
     Ok(l4f_accounts::password::hash(plaintext))
 }
@@ -189,7 +199,10 @@ pub fn verify_password(attempt: &str, stored: &str) -> bool {
     if let Some(hex) = stored.strip_prefix(SHA256_PREFIX) {
         let digest = Sha256::digest(attempt.as_bytes());
         let mine: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
-        return mine.as_bytes().ct_eq(hex.to_ascii_lowercase().as_bytes()).into();
+        return mine
+            .as_bytes()
+            .ct_eq(hex.to_ascii_lowercase().as_bytes())
+            .into();
     }
     stored.starts_with(ARGON2_PREFIX) && l4f_accounts::password::verify(attempt, stored).ok
 }
@@ -237,7 +250,10 @@ pub(crate) fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
             bail!("channel entry {} uses reserved name 'General'", i);
         }
         if name.chars().any(crate::tcp::bad_name_char) {
-            bail!("channel {:?} contains control or invisible characters", name);
+            bail!(
+                "channel {:?} contains control or invisible characters",
+                name
+            );
         }
         if name.len() > 64 {
             bail!("channel '{}' name exceeds 64 characters", name);
@@ -265,8 +281,16 @@ pub(crate) fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
             bail!("duplicate channel name: '{}'", name);
         }
         if let Some(uid) = &entry.uid {
-            if uid.is_empty() || uid.len() > 64 || !uid.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
-                bail!("channel '{}' uid must be 1-64 letters, digits, '-' or '_'", name);
+            if uid.is_empty()
+                || uid.len() > 64
+                || !uid
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                bail!(
+                    "channel '{}' uid must be 1-64 letters, digits, '-' or '_'",
+                    name
+                );
             }
         }
         if !seen_logs.insert(entry.log_conv()) {
@@ -285,7 +309,10 @@ pub(crate) fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
                 entry.slow_mode_secs
             );
         }
-        refuse_placeholder(&format!("channel '{name}' password"), entry.password.as_deref())?;
+        refuse_placeholder(
+            &format!("channel '{name}' password"),
+            entry.password.as_deref(),
+        )?;
         if entry.text && entry.anonymous {
             // A pseudonym only hides someone who is nowhere else. A text
             // channel is one you are in besides the voice channel you stand
@@ -304,7 +331,12 @@ pub(crate) fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
                     bail!("channel '{}' password_hash has invalid SHA-256 hex", name);
                 }
             } else if !hash.starts_with(ARGON2_PREFIX) {
-                bail!("channel '{}' password_hash must start with '{}' (or '{}', before 1.0)", name, ARGON2_PREFIX, SHA256_PREFIX);
+                bail!(
+                    "channel '{}' password_hash must start with '{}' (or '{}', before 1.0)",
+                    name,
+                    ARGON2_PREFIX,
+                    SHA256_PREFIX
+                );
             }
         }
     }
@@ -329,7 +361,8 @@ pub(crate) fn atomic_rewrite(path: &Path, entries: &[ChannelEntry]) -> anyhow::R
     let json = serde_json::to_string_pretty(entries).context("failed to serialize channels")?;
 
     // Password hashes: for the server's own user only.
-    crate::fsutil::atomic_write(path, json.as_bytes(), true).with_context(|| format!("failed to write {}", path.display()))?;
+    crate::fsutil::atomic_write(path, json.as_bytes(), true)
+        .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 
@@ -347,9 +380,14 @@ mod tests {
         assert!(verify_password("secretpass", &hash));
         assert!(!verify_password("secretpas", &hash));
         let old = "sha256:2BB80D537B1DA3E38BD30361AA855686BDE0EACD7162FEF6A25FE97BF527A25B"; // "secret"
-        assert!(verify_password("secret", old) && verify_password("secret", &old.to_ascii_lowercase()));
+        assert!(
+            verify_password("secret", old) && verify_password("secret", &old.to_ascii_lowercase())
+        );
         assert!(!verify_password("secret2", old));
-        assert!(!verify_password("secret", "md5:5ebe2294ecd0e0f08eab7690d2a6ee69"));
+        assert!(!verify_password(
+            "secret",
+            "md5:5ebe2294ecd0e0f08eab7690d2a6ee69"
+        ));
         assert!(hash_password("").is_err());
     }
 
@@ -504,14 +542,15 @@ mod tests {
 
     #[test]
     fn proximity_parses_and_defaults_to_off() {
-        let entries: Vec<ChannelEntry> = serde_json::from_str(
-            r#"[{"name":"Ingame","proximity":"3d"},{"name":"AFK"}]"#,
-        )
-        .unwrap();
+        let entries: Vec<ChannelEntry> =
+            serde_json::from_str(r#"[{"name":"Ingame","proximity":"3d"},{"name":"AFK"}]"#).unwrap();
         assert_eq!(entries[0].proximity, ProximityMode::ThreeD);
         assert_eq!(entries[1].proximity, ProximityMode::Off);
         // An unknown mode is a load error, not a silent Off
-        assert!(serde_json::from_str::<Vec<ChannelEntry>>(r#"[{"name":"X","proximity":"4d"}]"#).is_err());
+        assert!(
+            serde_json::from_str::<Vec<ChannelEntry>>(r#"[{"name":"X","proximity":"4d"}]"#)
+                .is_err()
+        );
     }
 
     #[test]
@@ -563,7 +602,10 @@ mod tests {
         assert!(back[0].hidden && back[0].anonymous && back[0].hide_members && back[0].routed);
         assert!(!back[0].screen_share, "sharing must stay switched off");
         assert!(back[0].nsfw && back[0].slow_mode_secs == 45);
-        assert_eq!(back[0].extra["later_option"]["x"], 7, "an unknown key was dropped");
+        assert_eq!(
+            back[0].extra["later_option"]["x"], 7,
+            "an unknown key was dropped"
+        );
         assert_eq!(back[0].uid.as_deref(), Some("ingame-1"));
     }
 
@@ -572,12 +614,25 @@ mod tests {
         let named = |json: &str| serde_json::from_str::<Vec<ChannelEntry>>(json).unwrap();
         let a = named(r#"[{"name":"Lounge"}]"#);
         let b = named(r#"[{"name":"lounge "}]"#);
-        assert_eq!(a[0].log_conv(), b[0].log_conv(), "case and spaces do not make a new log");
+        assert_eq!(
+            a[0].log_conv(),
+            b[0].log_conv(),
+            "case and spaces do not make a new log"
+        );
         assert!(a[0].log_conv().starts_with("c:") && a[0].log_conv().len() == 34);
         let kept = named(r#"[{"name":"Renamed","uid":"lounge-1"}]"#);
         assert_eq!(kept[0].log_conv(), "c:lounge-1");
-        assert!(validate_entries(&named(r#"[{"name":"a","uid":"x y"}]"#)).is_err(), "uid characters");
-        assert!(validate_entries(&named(r#"[{"name":"a","uid":"same"},{"name":"b","uid":"same"}]"#)).is_err(), "uid twice");
+        assert!(
+            validate_entries(&named(r#"[{"name":"a","uid":"x y"}]"#)).is_err(),
+            "uid characters"
+        );
+        assert!(
+            validate_entries(&named(
+                r#"[{"name":"a","uid":"same"},{"name":"b","uid":"same"}]"#
+            ))
+            .is_err(),
+            "uid twice"
+        );
     }
 
     #[test]

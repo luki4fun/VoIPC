@@ -94,7 +94,9 @@ pub fn all() -> Vec<Preset> {
 }
 
 pub fn by_id(id: &str) -> Option<Preset> {
-    all().into_iter().find(|p| p.id.eq_ignore_ascii_case(id.trim()))
+    all()
+        .into_iter()
+        .find(|p| p.id.eq_ignore_ascii_case(id.trim()))
 }
 
 /// Twelve characters as `xxxx-xxxx-xxxx`: about 59 bits, and short enough to
@@ -119,8 +121,15 @@ pub fn instantiate(preset: &Preset) -> Instance {
         .cloned()
         .map(|mut entry| {
             if let Some(password) = entry.password.take() {
-                let password = if password == PRESET_PLACEHOLDER { generate_password() } else { password };
-                entry.password_hash = Some(channels::hash_password(&password).expect("a preset's passwords are 1 to 512 characters"));
+                let password = if password == PRESET_PLACEHOLDER {
+                    generate_password()
+                } else {
+                    password
+                };
+                entry.password_hash = Some(
+                    channels::hash_password(&password)
+                        .expect("a preset's passwords are 1 to 512 characters"),
+                );
                 passwords.push((entry.name.clone(), password));
             }
             entry
@@ -141,7 +150,12 @@ pub fn instantiate(preset: &Preset) -> Instance {
             (key.clone(), value)
         })
         .collect();
-    Instance { channels, passwords, settings, secrets }
+    Instance {
+        channels,
+        passwords,
+        settings,
+        secrets,
+    }
 }
 
 /// `ServerSettings::default()` with `overrides` on top, refused if a key is
@@ -172,11 +186,17 @@ fn describe(entry: &ChannelEntry) -> String {
         parts.push(format!("slow mode {} s", entry.slow_mode_secs));
     }
     if entry.message_ttl_secs > 0 {
-        parts.push(format!("messages live {}", duration(entry.message_ttl_secs)));
+        parts.push(format!(
+            "messages live {}",
+            duration(entry.message_ttl_secs)
+        ));
     }
     if entry.proximity != voipc_protocol::types::ProximityMode::Off {
         let mode = serde_json::to_value(entry.proximity).ok();
-        parts.push(format!("{} proximity", mode.as_ref().and_then(Value::as_str).unwrap_or("?")));
+        parts.push(format!(
+            "{} proximity",
+            mode.as_ref().and_then(Value::as_str).unwrap_or("?")
+        ));
     }
     if entry.routed {
         parts.push("routed".into());
@@ -244,7 +264,12 @@ pub fn run(
             println!("\nvoipc-server channels init <id> writes one to channels.json.");
             Ok(())
         }
-        ChannelsCommand::Init { preset, out, force, dry_run } => {
+        ChannelsCommand::Init {
+            preset,
+            out,
+            force,
+            dry_run,
+        } => {
             let Some(preset) = by_id(&preset) else {
                 let ids: Vec<String> = all().into_iter().map(|p| p.id).collect();
                 bail!("no preset called {preset:?}; there are: {}", ids.join(", "));
@@ -293,7 +318,8 @@ fn init(preset: &Preset, out: &Path, settings_path: &Path, force: bool) -> anyho
     } else {
         let json = serde_json::to_string_pretty(&settings)?;
         // A game token: for the server's own user only.
-        crate::fsutil::atomic_write(settings_path, json.as_bytes(), true).with_context(|| format!("writing {}", settings_path.display()))?;
+        crate::fsutil::atomic_write(settings_path, json.as_bytes(), true)
+            .with_context(|| format!("writing {}", settings_path.display()))?;
         let mut note = format!("Wrote {}.", settings_path.display());
         for key in &instance.secrets {
             if let Some(value) = instance.settings.get(key).and_then(Value::as_str) {
@@ -306,14 +332,26 @@ fn init(preset: &Preset, out: &Path, settings_path: &Path, force: bool) -> anyho
     if out.exists() {
         // Never over an older copy: a second `--force` keeps the first original.
         let backup = (1..)
-            .map(|n| PathBuf::from(if n == 1 { format!("{}.bak", out.display()) } else { format!("{}.bak.{n}", out.display()) }))
+            .map(|n| {
+                PathBuf::from(if n == 1 {
+                    format!("{}.bak", out.display())
+                } else {
+                    format!("{}.bak.{n}", out.display())
+                })
+            })
             .find(|p| !p.exists())
             .expect("a free name");
         // Private from the start: a channels.json from before 0.12 was written
         // world-readable, and its password hashes are not
         std::fs::read(out)
             .and_then(|old| crate::fsutil::create_private(&backup, &old))
-            .with_context(|| format!("keeping a copy of {} as {}", out.display(), backup.display()))?;
+            .with_context(|| {
+                format!(
+                    "keeping a copy of {} as {}",
+                    out.display(),
+                    backup.display()
+                )
+            })?;
         println!("Kept the old file as {}", backup.display());
     }
     channels::atomic_rewrite(out, &instance.channels)
@@ -325,13 +363,26 @@ fn init(preset: &Preset, out: &Path, settings_path: &Path, force: bool) -> anyho
         out.display(),
         preset.id
     );
-    let width = instance.channels.iter().map(|c| channel_label(c).chars().count()).max().unwrap_or(0);
+    let width = instance
+        .channels
+        .iter()
+        .map(|c| channel_label(c).chars().count())
+        .max()
+        .unwrap_or(0);
     for entry in &instance.channels {
         println!("  {:<width$}  {}", channel_label(entry), describe(entry));
     }
     if !instance.passwords.is_empty() {
-        println!("\nPasswords — shown this once; {} keeps only their hashes:", out.display());
-        let width = instance.passwords.iter().map(|(n, _)| n.chars().count()).max().unwrap_or(0);
+        println!(
+            "\nPasswords — shown this once; {} keeps only their hashes:",
+            out.display()
+        );
+        let width = instance
+            .passwords
+            .iter()
+            .map(|(n, _)| n.chars().count())
+            .max()
+            .unwrap_or(0);
         for (name, password) in &instance.passwords {
             println!("  {name:<width$}  {password}");
         }
@@ -365,7 +416,9 @@ mod tests {
             password_hash: Some(String::new()),
             ..Default::default()
         };
-        let Value::Object(map) = serde_json::to_value(entry).unwrap() else { unreachable!() };
+        let Value::Object(map) = serde_json::to_value(entry).unwrap() else {
+            unreachable!()
+        };
         map.keys().cloned().collect()
     }
 
@@ -376,10 +429,18 @@ mod tests {
         for src in SOURCES {
             let raw: Value = serde_json::from_str(src).unwrap();
             let preset: Preset = serde_json::from_str(src).unwrap();
-            assert!(ids.insert(preset.id.clone()), "two presets are called {}", preset.id);
+            assert!(
+                ids.insert(preset.id.clone()),
+                "two presets are called {}",
+                preset.id
+            );
             for channel in raw["channels"].as_array().unwrap() {
                 for key in channel.as_object().unwrap().keys() {
-                    assert!(known.contains(key), "{}: unknown channel key {key:?}", preset.id);
+                    assert!(
+                        known.contains(key),
+                        "{}: unknown channel key {key:?}",
+                        preset.id
+                    );
                 }
             }
         }
@@ -397,13 +458,27 @@ mod tests {
             for entry in &instance.channels {
                 // What a user may type for a channel of their own, so a preset
                 // never shows names the server would refuse at runtime.
-                assert!(entry.name.chars().count() <= 32, "{id}: {:?} is too long", entry.name);
-                assert!(entry.password.is_none(), "{id}: plaintext left in {}", entry.name);
+                assert!(
+                    entry.name.chars().count() <= 32,
+                    "{id}: {:?} is too long",
+                    entry.name
+                );
+                assert!(
+                    entry.password.is_none(),
+                    "{id}: plaintext left in {}",
+                    entry.name
+                );
             }
             let json = serde_json::to_string(&instance.channels).unwrap();
-            assert!(!json.contains(PRESET_PLACEHOLDER), "{id}: a placeholder survived");
+            assert!(
+                !json.contains(PRESET_PLACEHOLDER),
+                "{id}: a placeholder survived"
+            );
             let settings = serde_json::to_string(&instance.settings).unwrap();
-            assert!(!settings.contains(PRESET_PLACEHOLDER), "{id}: a placeholder survived");
+            assert!(
+                !settings.contains(PRESET_PLACEHOLDER),
+                "{id}: a placeholder survived"
+            );
 
             // The lobby has no chat, so somebody arriving needs somewhere to land
             assert!(
@@ -412,7 +487,11 @@ mod tests {
             );
             // Every locked channel got its own password, and none is shared
             let distinct: HashSet<&String> = instance.passwords.iter().map(|(_, p)| p).collect();
-            assert_eq!(distinct.len(), instance.passwords.len(), "{id}: a password repeats");
+            assert_eq!(
+                distinct.len(),
+                instance.passwords.len(),
+                "{id}: a password repeats"
+            );
         }
     }
 
@@ -432,13 +511,18 @@ mod tests {
             assert_eq!(pw.len(), 14, "{pw}");
             let groups: Vec<&str> = pw.split('-').collect();
             assert_eq!(groups.len(), 3, "{pw}");
-            assert!(groups.iter().all(|g| g.len() == 4 && g.bytes().all(|b| PASSWORD_ALPHABET.contains(&b))));
+            assert!(groups
+                .iter()
+                .all(|g| g.len() == 4 && g.bytes().all(|b| PASSWORD_ALPHABET.contains(&b))));
         }
     }
 
     #[test]
     fn init_writes_hashes_and_keeps_an_existing_settings_file() {
-        let dir = std::env::temp_dir().join(format!("voipc-presets-{}", hex::encode(rand::random::<[u8; 6]>())));
+        let dir = std::env::temp_dir().join(format!(
+            "voipc-presets-{}",
+            hex::encode(rand::random::<[u8; 6]>())
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("channels.json");
         let settings = dir.join("server_settings.json");
@@ -448,25 +532,45 @@ mod tests {
         let loaded = channels::load_and_prepare_channels(&out).unwrap();
         assert_eq!(loaded.len(), preset.channels.len());
         let written = std::fs::read_to_string(&out).unwrap();
-        assert!(!written.contains("\"password\""), "plaintext reached the file");
-        let token = ServerSettings::load_from_file(&settings).unwrap().game_token;
+        assert!(
+            !written.contains("\"password\""),
+            "plaintext reached the file"
+        );
+        let token = ServerSettings::load_from_file(&settings)
+            .unwrap()
+            .game_token;
         assert!(token.is_some_and(|t| t.len() == 64));
 
         // Not over an existing file without --force, and with it, a backup
         assert!(init(&preset, &out, &settings, false).is_err());
         let before = std::fs::read_to_string(&settings).unwrap();
         init(&preset, &out, &settings, true).unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("channels.json.bak")).unwrap(), written);
-        assert_eq!(std::fs::read_to_string(&settings).unwrap(), before, "settings were rewritten");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("channels.json.bak")).unwrap(),
+            written
+        );
+        assert_eq!(
+            std::fs::read_to_string(&settings).unwrap(),
+            before,
+            "settings were rewritten"
+        );
         // A second --force keeps the first copy of the original.
         init(&preset, &out, &settings, true).unwrap();
-        assert_eq!(std::fs::read_to_string(dir.join("channels.json.bak")).unwrap(), written);
+        assert_eq!(
+            std::fs::read_to_string(dir.join("channels.json.bak")).unwrap(),
+            written
+        );
         assert!(dir.join("channels.json.bak.2").exists());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             for f in [&out, &settings] {
-                assert_eq!(std::fs::metadata(f).unwrap().permissions().mode() & 0o777, 0o600, "{}", f.display());
+                assert_eq!(
+                    std::fs::metadata(f).unwrap().permissions().mode() & 0o777,
+                    0o600,
+                    "{}",
+                    f.display()
+                );
             }
         }
 
@@ -475,14 +579,21 @@ mod tests {
 
     #[test]
     fn a_settings_file_that_cannot_be_written_leaves_channels_json_alone() {
-        let dir = std::env::temp_dir().join(format!("voipc-presets-{}", hex::encode(rand::random::<[u8; 6]>())));
+        let dir = std::env::temp_dir().join(format!(
+            "voipc-presets-{}",
+            hex::encode(rand::random::<[u8; 6]>())
+        ));
         std::fs::create_dir_all(&dir).unwrap();
         let out = dir.join("channels.json");
         std::fs::write(&out, "[]").unwrap();
         // The game token's file cannot be made: its folder is not there.
         let settings = dir.join("missing").join("server_settings.json");
         assert!(init(&by_id("roleplay").unwrap(), &out, &settings, true).is_err());
-        assert_eq!(std::fs::read_to_string(&out).unwrap(), "[]", "no channel passwords that were never shown");
+        assert_eq!(
+            std::fs::read_to_string(&out).unwrap(),
+            "[]",
+            "no channel passwords that were never shown"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

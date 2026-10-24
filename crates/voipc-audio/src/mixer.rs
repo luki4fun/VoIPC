@@ -189,44 +189,155 @@ const PLAIN: FxPreset = FxPreset {
 /// Every chain, indexed by `Effect as usize - 1`.
 pub const PRESETS: [FxPreset; 13] = [
     // The two originals, untouched, so the golden vector still holds.
-    FxPreset { id: "phone", label: "Phone (legacy)", family: FxFamily::Phone, ..PLAIN },
-    FxPreset { id: "radio", label: "Radio", family: FxFamily::Radio,
-               drive: RADIO_DRIVE, noise: RADIO_HISS, squelch: true, ..PLAIN },
+    FxPreset {
+        id: "phone",
+        label: "Phone (legacy)",
+        family: FxFamily::Phone,
+        ..PLAIN
+    },
+    FxPreset {
+        id: "radio",
+        label: "Radio",
+        family: FxFamily::Radio,
+        drive: RADIO_DRIVE,
+        noise: RADIO_HISS,
+        squelch: true,
+        ..PLAIN
+    },
     // Radios. What separates them is band, push and hiss: a CB is narrow and
     // driven hard, an aviation set is hissy, a police set is a little digital.
-    FxPreset { id: "cb", label: "CB radio", family: FxFamily::Radio,
-               hp_r: 0.948_987, lp_a: 0.297_724, drive: 4.0, noise: 0.030,
-               squelch: true, gain: 0.80, ..PLAIN },
-    FxPreset { id: "walkie", label: "Walkie-talkie", family: FxFamily::Radio,
-               hp_r: 0.942_796, lp_a: 0.288_471, drive: 3.0, noise: 0.022,
-               squelch: true, ..PLAIN },
-    FxPreset { id: "aviation", label: "Aviation radio", family: FxFamily::Radio,
-               hp_r: 0.955_219, lp_a: 0.279_096, drive: 2.0, noise: 0.045,
-               squelch: true, gain: 1.25, ..PLAIN },
-    FxPreset { id: "police", label: "Police radio", family: FxFamily::Radio,
-               hp_r: 0.948_987, lp_a: 0.324_768, drive: 3.5, noise: 0.018,
-               squelch: true, crush_hold: 3, crush_step: 1.0 / 128.0, gain: 0.85, ..PLAIN },
+    FxPreset {
+        id: "cb",
+        label: "CB radio",
+        family: FxFamily::Radio,
+        hp_r: 0.948_987,
+        lp_a: 0.297_724,
+        drive: 4.0,
+        noise: 0.030,
+        squelch: true,
+        gain: 0.80,
+        ..PLAIN
+    },
+    FxPreset {
+        id: "walkie",
+        label: "Walkie-talkie",
+        family: FxFamily::Radio,
+        hp_r: 0.942_796,
+        lp_a: 0.288_471,
+        drive: 3.0,
+        noise: 0.022,
+        squelch: true,
+        ..PLAIN
+    },
+    FxPreset {
+        id: "aviation",
+        label: "Aviation radio",
+        family: FxFamily::Radio,
+        hp_r: 0.955_219,
+        lp_a: 0.279_096,
+        drive: 2.0,
+        noise: 0.045,
+        squelch: true,
+        gain: 1.25,
+        ..PLAIN
+    },
+    FxPreset {
+        id: "police",
+        label: "Police radio",
+        family: FxFamily::Radio,
+        hp_r: 0.948_987,
+        lp_a: 0.324_768,
+        drive: 3.5,
+        noise: 0.018,
+        squelch: true,
+        crush_hold: 3,
+        crush_step: 1.0 / 128.0,
+        gain: 0.85,
+        ..PLAIN
+    },
     // Phones. A landline is clean and loud, a mobile is codec-y, bad VoIP is
     // what a congested link does to a voice.
-    FxPreset { id: "landline", label: "Landline", family: FxFamily::Phone,
-               drive: 0.8, noise: 0.004, gain: 2.30, ..PLAIN },
-    FxPreset { id: "mobile", label: "Mobile", family: FxFamily::Phone,
-               hp_r: 0.967_805, lp_a: 0.375_772, drive: 1.2, noise: 0.006,
-               crush_hold: 3, crush_step: 1.0 / 128.0, gain: 1.55, ..PLAIN },
-    FxPreset { id: "badvoip", label: "Bad VoIP", family: FxFamily::Phone,
-               hp_r: 0.974_160, lp_a: 0.391_902, drive: 1.5, noise: 0.010,
-               crush_hold: 6, crush_step: 1.0 / 48.0, gain: 1.20, ..PLAIN },
-    FxPreset { id: "intercom", label: "Intercom", family: FxFamily::Phone,
-               hp_r: 0.955_219, lp_a: 0.342_216, drive: 2.0, noise: 0.012,
-               gain: 1.15, ..PLAIN },
+    FxPreset {
+        id: "landline",
+        label: "Landline",
+        family: FxFamily::Phone,
+        drive: 0.8,
+        noise: 0.004,
+        gain: 2.30,
+        ..PLAIN
+    },
+    FxPreset {
+        id: "mobile",
+        label: "Mobile",
+        family: FxFamily::Phone,
+        hp_r: 0.967_805,
+        lp_a: 0.375_772,
+        drive: 1.2,
+        noise: 0.006,
+        crush_hold: 3,
+        crush_step: 1.0 / 128.0,
+        gain: 1.55,
+        ..PLAIN
+    },
+    FxPreset {
+        id: "badvoip",
+        label: "Bad VoIP",
+        family: FxFamily::Phone,
+        hp_r: 0.974_160,
+        lp_a: 0.391_902,
+        drive: 1.5,
+        noise: 0.010,
+        crush_hold: 6,
+        crush_step: 1.0 / 48.0,
+        gain: 1.20,
+        ..PLAIN
+    },
+    FxPreset {
+        id: "intercom",
+        label: "Intercom",
+        family: FxFamily::Phone,
+        hp_r: 0.955_219,
+        lp_a: 0.342_216,
+        drive: 2.0,
+        noise: 0.012,
+        gain: 1.15,
+        ..PLAIN
+    },
     // Colour: not a device, just a voice that is not yours.
-    FxPreset { id: "megaphone", label: "Megaphone", family: FxFamily::Colour,
-               hp_r: 0.936_646, lp_a: 0.324_768, drive: 6.0, gain: 0.65, ..PLAIN },
-    FxPreset { id: "gramophone", label: "Gramophone", family: FxFamily::Colour,
-               hp_r: 0.974_160, lp_a: 0.324_768, drive: 1.5, noise: 0.012,
-               crackle: 0.05, crush_hold: 2, crush_step: 1.0 / 160.0, gain: 1.20, ..PLAIN },
-    FxPreset { id: "robot", label: "Robot", family: FxFamily::Colour,
-               hp_r: 0.974_160, drive: 1.5, ring_k: 0.007_854, gain: 1.70, ..PLAIN },
+    FxPreset {
+        id: "megaphone",
+        label: "Megaphone",
+        family: FxFamily::Colour,
+        hp_r: 0.936_646,
+        lp_a: 0.324_768,
+        drive: 6.0,
+        gain: 0.65,
+        ..PLAIN
+    },
+    FxPreset {
+        id: "gramophone",
+        label: "Gramophone",
+        family: FxFamily::Colour,
+        hp_r: 0.974_160,
+        lp_a: 0.324_768,
+        drive: 1.5,
+        noise: 0.012,
+        crackle: 0.05,
+        crush_hold: 2,
+        crush_step: 1.0 / 160.0,
+        gain: 1.20,
+        ..PLAIN
+    },
+    FxPreset {
+        id: "robot",
+        label: "Robot",
+        family: FxFamily::Colour,
+        hp_r: 0.974_160,
+        drive: 1.5,
+        ring_k: 0.007_854,
+        gain: 1.70,
+        ..PLAIN
+    },
 ];
 
 /// The parameters for a chain, or `None` for no effect at all.
@@ -497,7 +608,6 @@ pub struct SourceChain {
     scratch: Vec<f32>,
 }
 
-
 impl SourceChain {
     /// Render one frame of this lane into the interleaved stereo mix.
     ///
@@ -555,7 +665,14 @@ impl SourceChain {
 
     /// Render one frame of our own microphone, in place and mono, on its way
     /// out. The same chain in the same order as a lane coming in.
-    pub fn render_mono(&mut self, buf: &mut [f32], fx: Effect, lp_a: f32, underwater: u8, reverb: u8) {
+    pub fn render_mono(
+        &mut self,
+        buf: &mut [f32],
+        fx: Effect,
+        lp_a: f32,
+        underwater: u8,
+        reverb: u8,
+    ) {
         self.scratch.clear();
         self.scratch.extend_from_slice(buf);
         self.effect_pass(fx, lp_a);
@@ -615,8 +732,13 @@ impl SourceChain {
                 self.scratch[i] = fx_sample(&mut self.mix, 0.0, lp_a, p);
             }
         }
-        let ringing =
-            apply_reverb_water_mono(&mut self.scratch, &mut self.room, underwater, reverb, owed > 0);
+        let ringing = apply_reverb_water_mono(
+            &mut self.scratch,
+            &mut self.room,
+            underwater,
+            reverb,
+            owed > 0,
+        );
         let (gl, gr) = (self.mix.gain_l, self.mix.gain_r);
         let mut wrote = false;
         for i in 0..n {
@@ -693,7 +815,11 @@ impl Limiter {
             } else {
                 self.env = peak + LIMIT_RELEASE * (self.env - peak);
             }
-            let gain = if self.env > LIMIT_CEILING { LIMIT_CEILING / self.env } else { 1.0 };
+            let gain = if self.env > LIMIT_CEILING {
+                LIMIT_CEILING / self.env
+            } else {
+                1.0
+            };
             for s in frame {
                 *s *= gain;
             }
@@ -1152,7 +1278,11 @@ mod tests {
         };
         mix_source_stereo(&mut out, &pcm, &mut st, (0.25, 0.75), 1.0);
         for i in 0..4 {
-            assert!((out[2 * i] - 0.25).abs() < 1e-6, "left {i} = {}", out[2 * i]);
+            assert!(
+                (out[2 * i] - 0.25).abs() < 1e-6,
+                "left {i} = {}",
+                out[2 * i]
+            );
             assert!((out[2 * i + 1] - 0.75).abs() < 1e-6);
         }
     }
@@ -1190,7 +1320,10 @@ mod tests {
         let mut out = vec![0.0f32; 16];
         let mut st = SourceMixState::default();
         mix_source_stereo(&mut out, &pcm, &mut st, (0.0, 0.0), 1.0);
-        assert!(out.iter().all(|&s| s == 0.0), "first frame was not silent: {out:?}");
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "first frame was not silent: {out:?}"
+        );
 
         // And a quiet target is reached immediately, not after a ramp
         let mut out2 = vec![0.0f32; 16];
@@ -1225,7 +1358,9 @@ mod tests {
     #[test]
     fn muffle_coefficient_low_passes() {
         // Alternating ±1 is Nyquist: a low-pass must shrink it hard.
-        let pcm: Vec<f32> = (0..64).map(|i| if i % 2 == 0 { 1.0 } else { -1.0 }).collect();
+        let pcm: Vec<f32> = (0..64)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
         let mut out = vec![0.0f32; 128];
         let mut st = SourceMixState::default();
         mix_source_stereo(&mut out, &pcm, &mut st, (1.0, 1.0), 0.045);
@@ -1279,9 +1414,21 @@ mod tests {
         let mid = rms_db(&through(1_000.0, 0.1, Effect::Phone, 6, 2));
         let low = rms_db(&through(100.0, 0.1, Effect::Phone, 6, 2));
         let high = rms_db(&through(6_000.0, 0.1, Effect::Phone, 6, 2));
-        assert!((mid - reference).abs() < 3.0, "1 kHz moved by {} dB", mid - reference);
-        assert!(reference - low > 15.0, "100 Hz only cut by {} dB", reference - low);
-        assert!(reference - high > 9.0, "6 kHz only cut by {} dB", reference - high);
+        assert!(
+            (mid - reference).abs() < 3.0,
+            "1 kHz moved by {} dB",
+            mid - reference
+        );
+        assert!(
+            reference - low > 15.0,
+            "100 Hz only cut by {} dB",
+            reference - low
+        );
+        assert!(
+            reference - high > 9.0,
+            "6 kHz only cut by {} dB",
+            reference - high
+        );
     }
 
     #[test]
@@ -1295,11 +1442,24 @@ mod tests {
         // Once it stops, the squelch closes and then there is nothing
         let mut st = SourceMixState::default();
         let mut out = vec![0.0f32; 1920];
-        mix_source_fx(&mut out, &[0.0; 960], &mut st, (1.0, 1.0), 1.0, Effect::Radio);
-        assert!(mix_source_stop(&mut out, &mut st, Effect::Radio, true), "no end burst");
+        mix_source_fx(
+            &mut out,
+            &[0.0; 960],
+            &mut st,
+            (1.0, 1.0),
+            1.0,
+            Effect::Radio,
+        );
+        assert!(
+            mix_source_stop(&mut out, &mut st, Effect::Radio, true),
+            "no end burst"
+        );
         let mut quiet = vec![0.0f32; 1920];
         assert!(!mix_source_stop(&mut quiet, &mut st, Effect::Radio, true));
-        assert!(quiet.iter().all(|&s| s == 0.0), "a closed radio still made noise");
+        assert!(
+            quiet.iter().all(|&s| s == 0.0),
+            "a closed radio still made noise"
+        );
     }
 
     #[test]
@@ -1325,7 +1485,10 @@ mod tests {
                 "closed after only {frame} idle frames"
             );
         }
-        assert!(mix_source_stop(&mut out, &mut st, Effect::Radio, false), "never closed");
+        assert!(
+            mix_source_stop(&mut out, &mut st, Effect::Radio, false),
+            "never closed"
+        );
         // Speaking again opens it again
         let mut again = vec![0.0f32; 1920];
         mix_source_fx(&mut again, &pcm, &mut st, (1.0, 1.0), 1.0, Effect::Radio);
@@ -1335,7 +1498,14 @@ mod tests {
     #[test]
     fn a_deafened_stop_drops_the_burst() {
         let mut st = SourceMixState::default();
-        mix_source_fx(&mut vec![0.0f32; 1920], &[0.0; 960], &mut st, (1.0, 1.0), 1.0, Effect::Radio);
+        mix_source_fx(
+            &mut vec![0.0f32; 1920],
+            &[0.0; 960],
+            &mut st,
+            (1.0, 1.0),
+            1.0,
+            Effect::Radio,
+        );
         // Deafened: no buffer to write into, so the burst is dropped, not owed
         assert!(!mix_source_stop(&mut [], &mut st, Effect::Radio, true));
         let mut out = vec![0.0f32; 1920];
@@ -1384,11 +1554,22 @@ mod tests {
         // Radio, then plain: after one frame the plain path is bit-exact again
         let mut st = SourceMixState::default();
         let pcm: Vec<f32> = (0..960).map(|i| (i as f32 * 0.03).sin()).collect();
-        mix_source_fx(&mut vec![0.0f32; 1920], &pcm, &mut st, (1.0, 1.0), 1.0, Effect::Radio);
+        mix_source_fx(
+            &mut vec![0.0f32; 1920],
+            &pcm,
+            &mut st,
+            (1.0, 1.0),
+            1.0,
+            Effect::Radio,
+        );
         let mut out = vec![0.0f32; 1920];
         mix_source_fx(&mut out, &pcm, &mut st, (1.0, 1.0), 1.0, Effect::None);
         for (i, &s) in pcm.iter().enumerate() {
-            assert_eq!(out[2 * i], s, "sample {i} was altered after the effect ended");
+            assert_eq!(
+                out[2 * i],
+                s,
+                "sample {i} was altered after the effect ended"
+            );
         }
     }
 
@@ -1562,8 +1743,14 @@ mod tests {
         // the filter is in its steady state rather than starting from zero
         let energy: f32 = last.iter().map(|s| s * s).sum();
         let dry: f32 = src.iter().map(|s| s * s).sum();
-        assert!(energy < dry * 0.2, "the water stopped filtering: {energy} vs {dry}");
-        assert!(st.uw.iter().any(|s| *s != 0.0), "the water filters were wiped mid-stream");
+        assert!(
+            energy < dry * 0.2,
+            "the water stopped filtering: {energy} vs {dry}"
+        );
+        assert!(
+            st.uw.iter().any(|s| *s != 0.0),
+            "the water filters were wiped mid-stream"
+        );
     }
 
     #[test]
@@ -1586,7 +1773,11 @@ mod tests {
         }
         // One frame later than the bank goes idle: the frame that drains the
         // last of the tail still writes those samples, so it still counts.
-        assert_eq!(closed, Some(REVERB_TAIL_FRAMES), "the lane never went quiet");
+        assert_eq!(
+            closed,
+            Some(REVERB_TAIL_FRAMES),
+            "the lane never went quiet"
+        );
     }
 
     #[test]
@@ -1624,23 +1815,43 @@ mod tests {
         let energy = |b: &[f32]| b.iter().step_by(2).map(|s| s * s).sum::<f32>();
 
         scratch.fill(0.0);
-        mix_source_fx(&mut scratch, &[0.0; 960], &mut st, (1.0, 1.0), 1.0, Effect::Radio);
+        mix_source_fx(
+            &mut scratch,
+            &[0.0; 960],
+            &mut st,
+            (1.0, 1.0),
+            1.0,
+            Effect::Radio,
+        );
         let first = energy(&scratch);
 
         // Off air: clears `talking` without owing a burst
         assert!(!mix_source_stop(&mut [], &mut st, Effect::Radio, true));
         scratch.fill(0.0);
-        mix_source_fx(&mut scratch, &[0.0; 960], &mut st, (1.0, 1.0), 1.0, Effect::Radio);
+        mix_source_fx(
+            &mut scratch,
+            &[0.0; 960],
+            &mut st,
+            (1.0, 1.0),
+            1.0,
+            Effect::Radio,
+        );
         let second = energy(&scratch);
 
         scratch.fill(0.0);
-        mix_source_fx(&mut scratch, &[0.0; 960], &mut st, (1.0, 1.0), 1.0, Effect::Radio);
+        mix_source_fx(
+            &mut scratch,
+            &[0.0; 960],
+            &mut st,
+            (1.0, 1.0),
+            1.0,
+            Effect::Radio,
+        );
         let third = energy(&scratch);
 
         assert!(second > 4.0 * third, "the squelch did not re-open");
         assert!(first > 4.0 * third, "the first burst is missing");
     }
-
 
     /// Sample indices the golden vector pins, chosen around the squelch edge
     /// (480) and the frame boundaries (960, 1920).
@@ -1674,8 +1885,8 @@ mod tests {
         // test and `npm test` fail together. Generated by running this chain
         // once, exactly as the spatial golden table was made.
         const GOLDEN: [f32; 12] = [
-            0.0054195, -0.0201902, 0.0135253, 0.2030956, 0.210_66, 0.2191669, 0.1964534,
-            0.2025039, 0.1896579, 0.2002891, 0.1951476, 0.1954625,
+            0.0054195, -0.0201902, 0.0135253, 0.2030956, 0.210_66, 0.2191669, 0.1964534, 0.2025039,
+            0.1896579, 0.2002891, 0.1951476, 0.1954625,
         ];
         let all = golden_radio_pass();
         for (k, &i) in GOLDEN_IDX.iter().enumerate() {
@@ -1687,7 +1898,6 @@ mod tests {
             );
         }
     }
-
 
     // ── Reverb and water, measured rather than assumed ─────────────────
     //
@@ -1836,7 +2046,11 @@ mod tests {
             "the dry path is not trimmed: {}",
             out[0] / 0.5
         );
-        assert!(dry_trim(10) < 0.90, "trim {} buys no headroom", dry_trim(10));
+        assert!(
+            dry_trim(10) < 0.90,
+            "trim {} buys no headroom",
+            dry_trim(10)
+        );
         assert_eq!(dry_trim(0), 1.0, "a dry room must not touch the level");
 
         // And four people in a cathedral stay inside the rails before `clamp`
@@ -1912,8 +2126,16 @@ mod tests {
         // The complaint this catches: two effects, one flavour each. On the
         // build that was rejected this read 1 and 1.
         let count = |f: FxFamily| PRESETS.iter().filter(|p| p.family == f).count();
-        assert!(count(FxFamily::Radio) >= 4, "only {} radios", count(FxFamily::Radio));
-        assert!(count(FxFamily::Phone) >= 4, "only {} phones", count(FxFamily::Phone));
+        assert!(
+            count(FxFamily::Radio) >= 4,
+            "only {} radios",
+            count(FxFamily::Radio)
+        );
+        assert!(
+            count(FxFamily::Phone) >= 4,
+            "only {} phones",
+            count(FxFamily::Phone)
+        );
     }
 
     #[test]
@@ -1940,7 +2162,10 @@ mod tests {
         // One unguarded noise call anywhere in the chain shifts the xorshift
         // stream and breaks the golden vector for every preset at once, so each
         // stage sits behind its own guard. This is the cheapest tripwire for it.
-        for p in PRESETS.iter().filter(|p| p.noise == 0.0 && p.crackle == 0.0 && !p.squelch) {
+        for p in PRESETS
+            .iter()
+            .filter(|p| p.noise == 0.0 && p.crackle == 0.0 && !p.squelch)
+        {
             let mut st = SourceMixState::default();
             let seed = st.noise;
             for i in 0..960 {
@@ -2096,7 +2321,11 @@ mod tests {
         // Quiet audio afterwards comes back to unity within the release
         let mut quiet = vec![0.1f32; 2 * 48_000 / 2];
         lim.process(&mut quiet, 2);
-        assert!((quiet[quiet.len() - 1] - 0.1).abs() < 1e-3, "{}", quiet[quiet.len() - 1]);
+        assert!(
+            (quiet[quiet.len() - 1] - 0.1).abs() < 1e-3,
+            "{}",
+            quiet[quiet.len() - 1]
+        );
     }
 
     #[test]
@@ -2104,7 +2333,10 @@ mod tests {
         let from = vec![0.5f32; 960];
         let mut into = vec![-0.5f32; 960];
         crossfade_into(&from, &mut into);
-        assert_eq!(into[0], 0.5, "the joint starts where the frame that would have played starts");
+        assert_eq!(
+            into[0], 0.5,
+            "the joint starts where the frame that would have played starts"
+        );
         assert!(into[SHED_XFADE / 2].abs() < 0.02);
         assert_eq!(into[SHED_XFADE], -0.5);
     }
@@ -2196,7 +2428,10 @@ mod tests {
             // "does it reach the microphone at all" guard — the loudness
             // ladders are `every_underwater_step_is_audible` and
             // `the_reverb_is_loud_enough_to_hear`.
-            assert!(db > -24.0, "{name} changed the outgoing voice by only {db:.1} dB");
+            assert!(
+                db > -24.0,
+                "{name} changed the outgoing voice by only {db:.1} dB"
+            );
         }
     }
 }

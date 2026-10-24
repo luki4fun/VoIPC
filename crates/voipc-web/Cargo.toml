@@ -3,6 +3,7 @@ name = "voipc-web"
 version = "0.12.0"
 edition = "2021"
 license = "MIT"
+rust-version = "1.99"
 description = "VoIPC protocol codec, Signal Protocol and media crypto compiled to wasm for the browser client"
 publish = false
 

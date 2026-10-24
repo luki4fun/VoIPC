@@ -3,10 +3,10 @@
 // f32 multiplies/divides on every pixel.
 
 use anyhow::{bail, Context as _, Result};
-use ffmpeg_next as ffmpeg;
 pub use ffmpeg::format::Pixel;
 use ffmpeg::software::scaling;
 use ffmpeg::util::frame::video::Video;
+use ffmpeg_next as ffmpeg;
 
 /// Clamp an i32 to u8 range.
 #[inline(always)]
@@ -208,10 +208,14 @@ pub fn bgra_to_i420(bgra: &[u8], width: usize, height: usize, i420: &mut Vec<u8>
 
             for dy in 0..2u32 {
                 let py = row + dy as usize;
-                if py >= height { break; }
+                if py >= height {
+                    break;
+                }
                 for dx in 0..2u32 {
                     let px = col + dx as usize;
-                    if px >= width { break; }
+                    if px >= width {
+                        break;
+                    }
                     let idx = (py * width + px) * 4;
                     b_sum += bgra[idx] as i32;
                     g_sum += bgra[idx + 1] as i32;
@@ -267,10 +271,14 @@ pub fn rgba_to_i420(rgba: &[u8], width: usize, height: usize, i420: &mut Vec<u8>
 
             for dy in 0..2u32 {
                 let py = row + dy as usize;
-                if py >= height { break; }
+                if py >= height {
+                    break;
+                }
                 for dx in 0..2u32 {
                     let px = col + dx as usize;
-                    if px >= width { break; }
+                    if px >= width {
+                        break;
+                    }
                     let idx = (py * width + px) * 4;
                     r_sum += rgba[idx] as i32;
                     g_sum += rgba[idx + 1] as i32;
@@ -582,8 +590,8 @@ mod tests {
 
         // All Y values should be the same as source
         let y_val = src[0];
-        for i in 0..16 {
-            assert_eq!(dst[i], y_val, "Y[{}] mismatch", i);
+        for (i, y) in dst[..16].iter().enumerate() {
+            assert_eq!(*y, y_val, "Y[{}] mismatch", i);
         }
     }
 
@@ -592,8 +600,8 @@ mod tests {
         // QSV encoders open with NV12 — the converter must honor it. RGB24 is
         // the sharer's preview, handed to turbojpeg as one packed plane.
         for fmt in [Pixel::YUV420P, Pixel::NV12, Pixel::RGB24] {
-            let mut c = FrameConverter::new(Pixel::BGRA, 64, 64, 64, 64, fmt)
-                .expect("converter init");
+            let mut c =
+                FrameConverter::new(Pixel::BGRA, 64, 64, 64, 64, fmt).expect("converter init");
             let bgra = vec![128u8; 64 * 64 * 4];
             let frame = c.convert(&bgra).expect("convert");
             assert_eq!(frame.format(), fmt);
@@ -603,7 +611,9 @@ mod tests {
         let mut c = FrameConverter::new(Pixel::BGRA, 100, 60, 64, 36, Pixel::RGB24)
             .expect("converter init");
         let stride = 100 * 4 + 32;
-        let frame = c.convert_strided(&vec![200u8; stride * 60], stride).expect("convert");
+        let frame = c
+            .convert_strided(&vec![200u8; stride * 60], stride)
+            .expect("convert");
         assert!(frame.stride(0) >= 64 * 3);
         assert!(frame.data(0).len() >= frame.stride(0) * 35 + 64 * 3);
     }

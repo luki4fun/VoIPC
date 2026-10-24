@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Context, Result};
-use ffmpeg_next as ffmpeg;
 use ffmpeg::codec::{self, decoder};
 use ffmpeg::format::Pixel;
 use ffmpeg::util::frame::video::Video;
+use ffmpeg_next as ffmpeg;
 use std::sync::Once;
 use voipc_protocol::types::VideoCodec;
 
@@ -105,7 +105,8 @@ impl Decoder {
         let packet = ffmpeg::Packet::copy(data);
 
         // Send packet to decoder
-        self.decoder.send_packet(&packet)
+        self.decoder
+            .send_packet(&packet)
             .with_context(|| format!("{:?} decoder: failed to send packet", self.video_codec))?;
 
         // Collect decoded frames
@@ -208,7 +209,8 @@ impl Decoder {
                     ffmpeg::software::scaling::flag::Flags::BILINEAR,
                 )
                 .context("decoder: failed to create scaler context")?;
-                let (.., scaler, out) = slot.insert((format, width, height, scaler, Video::empty()));
+                let (.., scaler, out) =
+                    slot.insert((format, width, height, scaler, Video::empty()));
                 (scaler, out)
             }
         };

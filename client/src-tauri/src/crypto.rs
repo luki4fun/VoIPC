@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::num::NonZeroU32;
 
-use ring::aead::{LessSafeKey, UnboundKey, AES_256_GCM, Nonce, Aad};
+use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use ring::pbkdf2;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
@@ -251,7 +251,9 @@ pub fn drop_expired(map: &mut HashMap<String, Vec<ChatMessage>>, now: u64) -> us
 
 /// Read an older archive's messages as current ones. Generic over the shape,
 /// because there are two of them now and there will be more.
-fn convert<T: Into<ChatMessage>>(map: HashMap<String, Vec<T>>) -> HashMap<String, Vec<ChatMessage>> {
+fn convert<T: Into<ChatMessage>>(
+    map: HashMap<String, Vec<T>>,
+) -> HashMap<String, Vec<ChatMessage>> {
     map.into_iter()
         .map(|(k, v)| (k, v.into_iter().map(Into::into).collect()))
         .collect()
@@ -280,8 +282,8 @@ pub fn encrypt_archive(
     let rng = SystemRandom::new();
 
     // Serialize archive with postcard
-    let plaintext = postcard::to_allocvec(archive)
-        .map_err(|e| anyhow::anyhow!("serialization failed: {e}"))?;
+    let plaintext =
+        postcard::to_allocvec(archive).map_err(|e| anyhow::anyhow!("serialization failed: {e}"))?;
 
     // Generate random nonce
     let mut nonce_bytes = [0u8; NONCE_LEN];
@@ -382,7 +384,16 @@ pub fn decrypt_archive(
             cursors: v4
                 .cursors
                 .into_iter()
-                .map(|(k, m)| (k, voipc_crypto::sync::LogMemory { cursors: m.cursors, readers: m.readers, vault_gens: HashMap::new() }))
+                .map(|(k, m)| {
+                    (
+                        k,
+                        voipc_crypto::sync::LogMemory {
+                            cursors: m.cursors,
+                            readers: m.readers,
+                            vault_gens: HashMap::new(),
+                        },
+                    )
+                })
                 .collect(),
         }
     } else if version == VERSION_V3 {
@@ -502,12 +513,14 @@ mod tests {
         let salt = generate_salt();
         let key = derive_key("hunter2", &salt);
         let mut archive = ChatArchive::default();
-        archive
-            .channels
-            .insert("localhost:9987/general".into(), vec![msg("hello", None), msg("there", None)]);
-        archive
-            .channels
-            .insert("localhost:9987/off".into(), vec![msg("shared", Some("history-marker"))]);
+        archive.channels.insert(
+            "localhost:9987/general".into(),
+            vec![msg("hello", None), msg("there", None)],
+        );
+        archive.channels.insert(
+            "localhost:9987/off".into(),
+            vec![msg("shared", Some("history-marker"))],
+        );
         archive.dms.insert("1-2".into(), vec![msg("psst", None)]);
         archive.cleared.insert("localhost:9987/gone".into(), 42);
 
@@ -712,14 +725,24 @@ mod tests {
                 expires_at: Some(u64::MAX),
             }],
         );
-        let plaintext = postcard::to_allocvec(&V3Archive { channels: HashMap::new(), dms, cleared: HashMap::new() }).unwrap();
+        let plaintext = postcard::to_allocvec(&V3Archive {
+            channels: HashMap::new(),
+            dms,
+            cleared: HashMap::new(),
+        })
+        .unwrap();
         let salt = generate_salt();
         let key = derive_key("pw", &salt);
         let mut aad = [0u8; 5];
         aad[..4].copy_from_slice(MAGIC);
         aad[4] = VERSION_V3;
         let mut in_out = plaintext;
-        key.seal_in_place_append_tag(Nonce::assume_unique_for_key([0u8; NONCE_LEN]), Aad::from(&aad), &mut in_out).unwrap();
+        key.seal_in_place_append_tag(
+            Nonce::assume_unique_for_key([0u8; NONCE_LEN]),
+            Aad::from(&aad),
+            &mut in_out,
+        )
+        .unwrap();
         let mut file = Vec::new();
         file.extend_from_slice(MAGIC);
         file.push(VERSION_V3);
@@ -730,7 +753,10 @@ mod tests {
 
         let (archive, _, _, _) = decrypt_archive(&file, "pw").unwrap();
         let m = &archive.dms["host:9987/bob"][0];
-        assert_eq!((m.content.as_str(), m.expires_at, m.account.as_deref()), ("from 0.11", Some(u64::MAX), None));
+        assert_eq!(
+            (m.content.as_str(), m.expires_at, m.account.as_deref()),
+            ("from 0.11", Some(u64::MAX), None)
+        );
         assert!(archive.devices.is_empty());
     }
 
@@ -756,8 +782,14 @@ mod tests {
         assert_eq!(file[4], VERSION);
         let (back, _, _, _) = decrypt_archive(&file, "pw").unwrap();
         assert_eq!(back.devices.len(), 1);
-        assert_eq!((back.devices[0].name.as_str(), back.devices[0].dek), ("luki", [4; 32]));
-        assert_eq!(back.channels["k"][0].account.as_deref(), Some("ab".repeat(16).as_str()));
+        assert_eq!(
+            (back.devices[0].name.as_str(), back.devices[0].dek),
+            ("luki", [4; 32])
+        );
+        assert_eq!(
+            back.channels["k"][0].account.as_deref(),
+            Some("ab".repeat(16).as_str())
+        );
     }
 
     /// What 0.12 wrote (v4) opens, with no vault generations yet; a newer
@@ -777,8 +809,17 @@ mod tests {
             devices: Vec<DeviceRecord>,
             cursors: HashMap<String, V4Memory>,
         }
-        let memory = V4Memory { cursors: [("d:x".to_string(), 7)].into(), readers: HashMap::new() };
-        let v4 = V4 { channels: HashMap::new(), dms: [("k".to_string(), vec![msg("from 0.12", None)])].into(), cleared: HashMap::new(), devices: Vec::new(), cursors: [("r|luki".to_string(), memory)].into() };
+        let memory = V4Memory {
+            cursors: [("d:x".to_string(), 7)].into(),
+            readers: HashMap::new(),
+        };
+        let v4 = V4 {
+            channels: HashMap::new(),
+            dms: [("k".to_string(), vec![msg("from 0.12", None)])].into(),
+            cleared: HashMap::new(),
+            devices: Vec::new(),
+            cursors: [("r|luki".to_string(), memory)].into(),
+        };
         let seal = |version: u8, plaintext: Vec<u8>| {
             let salt = generate_salt();
             let key = derive_key("pw", &salt);
@@ -786,7 +827,12 @@ mod tests {
             aad[..4].copy_from_slice(MAGIC);
             aad[4] = version;
             let mut in_out = plaintext;
-            key.seal_in_place_append_tag(Nonce::assume_unique_for_key([0u8; NONCE_LEN]), Aad::from(&aad), &mut in_out).unwrap();
+            key.seal_in_place_append_tag(
+                Nonce::assume_unique_for_key([0u8; NONCE_LEN]),
+                Aad::from(&aad),
+                &mut in_out,
+            )
+            .unwrap();
             let mut file = MAGIC.to_vec();
             file.push(version);
             file.extend_from_slice(&salt);
@@ -805,8 +851,14 @@ mod tests {
 
         let newer = seal(VERSION + 1, vec![1, 2, 3]);
         assert_eq!(kind_of(&newer), FileKind::Newer);
-        assert!(decrypt_archive(&newer, "pw").unwrap_err().to_string().contains("newer VoIPC"));
-        assert_eq!(kind_of(b"not a history file at all, but long enough to have a header ......."), FileKind::Unreadable);
+        assert!(decrypt_archive(&newer, "pw")
+            .unwrap_err()
+            .to_string()
+            .contains("newer VoIPC"));
+        assert_eq!(
+            kind_of(b"not a history file at all, but long enough to have a header ......."),
+            FileKind::Unreadable
+        );
     }
 
     #[test]
@@ -830,7 +882,10 @@ mod tests {
 
         assert_eq!(drop_expired(&mut map, now), 2);
         assert_eq!(map["a"].len(), 1, "the one with no timer stays");
-        assert!(!map.contains_key("b"), "an emptied conversation is dropped too");
+        assert!(
+            !map.contains_key("b"),
+            "an emptied conversation is dropped too"
+        );
         assert_eq!(map["c"].len(), 1, "one still in its life stays");
     }
 }

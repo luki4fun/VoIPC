@@ -17,7 +17,12 @@ pub(crate) fn seal(key: &[u8; 32], aad: &str, plaintext: &[u8]) -> ([u8; 12], Ve
     let iv = random::<12>();
     let k = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).expect("32-byte key"));
     let mut buf = plaintext.to_vec();
-    k.seal_in_place_append_tag(Nonce::assume_unique_for_key(iv), Aad::from(aad.as_bytes()), &mut buf).expect("seal");
+    k.seal_in_place_append_tag(
+        Nonce::assume_unique_for_key(iv),
+        Aad::from(aad.as_bytes()),
+        &mut buf,
+    )
+    .expect("seal");
     (iv, buf)
 }
 
@@ -26,5 +31,9 @@ pub(crate) fn open(key: &[u8; 32], aad: &str, iv: &[u8], ct: &[u8]) -> Option<Ve
     let k = LessSafeKey::new(UnboundKey::new(&AES_256_GCM, key).ok()?);
     let nonce = Nonce::try_assume_unique_for_key(iv).ok()?;
     let mut buf = ct.to_vec();
-    Some(k.open_in_place(nonce, Aad::from(aad.as_bytes()), &mut buf).ok()?.to_vec())
+    Some(
+        k.open_in_place(nonce, Aad::from(aad.as_bytes()), &mut buf)
+            .ok()?
+            .to_vec(),
+    )
 }

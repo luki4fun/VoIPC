@@ -9,7 +9,11 @@ use std::path::{Path, PathBuf};
 /// that is there already, so a link planted under that name is not followed —
 /// synced, then renamed over `path`. `secret`: mode 0600.
 pub fn atomic_write(path: &Path, bytes: &[u8], secret: bool) -> std::io::Result<()> {
-    let tmp = PathBuf::from(format!("{}.{:08x}.tmp", path.display(), rand::random::<u32>()));
+    let tmp = PathBuf::from(format!(
+        "{}.{:08x}.tmp",
+        path.display(),
+        rand::random::<u32>()
+    ));
     let mut o = std::fs::OpenOptions::new();
     o.write(true).create_new(true);
     #[cfg(unix)]
@@ -71,9 +75,16 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
         }
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temporary file left behind");
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no temporary file left behind"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

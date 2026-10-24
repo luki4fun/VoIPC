@@ -422,13 +422,22 @@ A missing secret fails the tag's run instead of shipping without it.
 
 ## Toolchain (all platforms)
 
-- Rust via [rustup](https://rustup.rs/)
+- Rust via [rustup](https://rustup.rs/). `rust-toolchain.toml` pins the version (1.99.1,
+  with clippy and rustfmt); rustup installs it on the first build. Each build adds the
+  targets it needs.
 - Node.js (for the Svelte frontend)
-- Tauri CLI: `npm install` in `client/`
+- Tauri CLI: `npm ci` in `client/`
 
-`Cargo.lock` (both the workspace's and `crates/voipc-web`'s) and
+`Cargo.lock` (the workspace's, `crates/voipc-web`'s and `crates/voipc-opus-wasm`'s) and
 `client/package-lock.json` are committed: a tag has to build the same
-dependency versions a year from now. `npm run version:sync` keeps the npm
+dependency versions a year from now. CI checks them before anything builds.
+
+CI's lint job is the bar for a change:
+- `cargo fmt --all -- --check`;
+- `cargo clippy --workspace --all-targets --locked -- -D warnings`, plus the wasm crates for
+  `wasm32-unknown-unknown`;
+- `npx tsc --noEmit` and `npx svelte-check --fail-on-warnings` in `client/`;
+- `cargo deny check` against `deny.toml` (licences, crate sources, advisories). `npm run version:sync` keeps the npm
 lockfile's own version field in step with `Cargo.toml`.
 
 ## Android

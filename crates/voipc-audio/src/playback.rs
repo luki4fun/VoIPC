@@ -65,8 +65,7 @@ fn fill_output(
             scratch[2 * (fade_start + i) + 1] *= factor;
         }
     }
-    for (frame, pair) in data.chunks_mut(channels).zip(scratch.chunks_exact(2)) {
-        let (l, r) = (pair[0], pair[1]);
+    for (frame, &[l, r]) in data.chunks_mut(channels).zip(scratch.as_chunks::<2>().0) {
         match channels {
             1 => frame[0] = 0.5 * (l + r),
             _ => {
@@ -107,8 +106,12 @@ pub fn start_playback(
 
     let default_rate = config.sample_rate().0;
     let actual_rate = if default_rate == TARGET_SAMPLE_RATE
-        || device::output_supports_rate(&device, sample_format, config.channels(), TARGET_SAMPLE_RATE)
-    {
+        || device::output_supports_rate(
+            &device,
+            sample_format,
+            config.channels(),
+            TARGET_SAMPLE_RATE,
+        ) {
         TARGET_SAMPLE_RATE
     } else {
         warn!(
@@ -211,7 +214,13 @@ pub fn start_playback(
 
     stream.play()?;
 
-    Ok((PlaybackStream { stream, sample_rate: actual_rate }, producer))
+    Ok((
+        PlaybackStream {
+            stream,
+            sample_rate: actual_rate,
+        },
+        producer,
+    ))
 }
 
 // SAFETY: PlaybackStream only holds the cpal::Stream handle to keep it alive.
@@ -246,7 +255,14 @@ mod tests {
         }
         let mut data = vec![0.0f32; frames * channels];
         let mut scratch = Vec::new();
-        fill_output(&mut consumer, &mut data, channels, &mut scratch, true, false);
+        fill_output(
+            &mut consumer,
+            &mut data,
+            channels,
+            &mut scratch,
+            true,
+            false,
+        );
         data
     }
 
@@ -280,7 +296,11 @@ mod tests {
     /// the author's machine asks for 2048 frames (42.7 ms) at a time, which is
     /// more than one 20 ms frame — so a producer that keeps one frame in hand
     /// starves on every single callback.
-    fn drive(ask: usize, callbacks: usize, mut feeder: impl FnMut(&mut ringbuf::HeapProd<f32>)) -> u32 {
+    fn drive(
+        ask: usize,
+        callbacks: usize,
+        mut feeder: impl FnMut(&mut ringbuf::HeapProd<f32>),
+    ) -> u32 {
         let rb = HeapRb::<f32>::new(48_000 / 5 * 2); // the real ring: 200 ms
         let (mut producer, mut consumer) = rb.split();
         let mut data = vec![0.0f32; ask * 2];
@@ -318,7 +338,10 @@ mod tests {
                 let _ = p.push_slice(&[0.5f32; FRAME]);
             }
         });
-        assert!(starved > 100, "a one-frame cushion should starve, got {starved}");
+        assert!(
+            starved > 100,
+            "a one-frame cushion should starve, got {starved}"
+        );
     }
 
     #[test]
@@ -328,7 +351,10 @@ mod tests {
         let _guard = STATS.lock().unwrap_or_else(|p| p.into_inner());
         crate::reset_playback_stats();
         let out = render(&[], 8, 2);
-        assert!(out.iter().all(|&s| s == 0.0), "a dry ring is silence, not noise");
+        assert!(
+            out.iter().all(|&s| s == 0.0),
+            "a dry ring is silence, not noise"
+        );
         assert_eq!(crate::take_underruns(), 0, "a dry ring is not a gap");
 
         // 40 frames available, 100 asked for: the last 32 fade out
@@ -340,9 +366,17 @@ mod tests {
         for &s in &out[80..] {
             assert_eq!(s, 0.0, "past the data it must be silent");
         }
-        assert_eq!(crate::take_underruns(), 1, "a partial read is the audible gap");
+        assert_eq!(
+            crate::take_underruns(),
+            1,
+            "a partial read is the audible gap"
+        );
         // And the device's appetite is reported in the ring's own units
-        assert_eq!(crate::take_request_max(), 200, "100 frames as stereo samples");
+        assert_eq!(
+            crate::take_request_max(),
+            200,
+            "100 frames as stereo samples"
+        );
     }
 
     #[test]
@@ -359,10 +393,22 @@ mod tests {
         };
         crate::reset_playback_stats();
         callback(false, false);
-        assert_eq!(crate::take_underruns(), 0, "a speaker test is not the mixer's");
-        assert_eq!(crate::take_request_max(), 0, "a speaker test is not the mixer's");
+        assert_eq!(
+            crate::take_underruns(),
+            0,
+            "a speaker test is not the mixer's"
+        );
+        assert_eq!(
+            crate::take_request_max(),
+            0,
+            "a speaker test is not the mixer's"
+        );
         callback(true, true);
-        assert_eq!(crate::take_request_max(), 0, "the prime covers the first ask");
+        assert_eq!(
+            crate::take_request_max(),
+            0,
+            "the prime covers the first ask"
+        );
         assert_eq!(crate::take_underruns(), 1, "a gap is a gap, first or not");
     }
 }

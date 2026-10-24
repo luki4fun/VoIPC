@@ -47,7 +47,7 @@ jobs:
             libssl-dev libclang-dev
 
       - name: Rust toolchain
-        run: rustup update --no-self-update stable
+        run: rustup toolchain install
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -99,6 +99,118 @@ jobs:
         run: bash ../../tools/ci-run.sh "opus wasm crate test" cargo test --locked
         working-directory: crates/voipc-opus-wasm
 
+  # Formatting, clippy and the front end's types, all as errors. Clippy and
+  # rustfmt come from rust-toolchain.toml, so a new lint arrives only with a
+  # deliberate toolchain bump, fixed in the same change.
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with: { persist-credentials: false }
+
+      # Clippy compiles the desktop client, so the same list as the Rust job
+      - name: System dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential curl ca-certificates pkg-config nasm cmake protobuf-compiler \
+            libavcodec-dev libavformat-dev libavfilter-dev libavdevice-dev \
+            libavutil-dev libswscale-dev libx264-dev libx265-dev \
+            libpipewire-0.3-dev libgbm-dev libasound2-dev libturbojpeg0-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev \
+            libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev \
+            libssl-dev libclang-dev
+
+      - name: Rust toolchain
+        run: rustup toolchain install && rustup target add wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: |
+            . -> target
+            crates/voipc-web -> target
+            crates/voipc-opus-wasm -> target
+
+      - name: Lockfiles match the manifests
+        run: for d in . crates/voipc-web crates/voipc-opus-wasm; do (cd "$d" && cargo fetch --locked); done
+
+      - name: rustfmt
+        run: |
+          cargo fmt --all -- --check
+          for d in crates/voipc-web crates/voipc-opus-wasm fuzz; do (cd "$d" && cargo fmt -- --check); done
+
+      - name: clippy
+        run: |
+          bash tools/ci-run.sh "clippy" cargo clippy --workspace --all-targets --locked -- -D warnings
+          for d in crates/voipc-web crates/voipc-opus-wasm; do
+            (cd "$d" && bash ../../tools/ci-run.sh "clippy $d" \
+              cargo clippy --locked --target wasm32-unknown-unknown --all-targets -- -D warnings)
+          done
+
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+      - run: npm ci
+        working-directory: client
+      - name: TypeScript and Svelte
+        working-directory: client
+        run: |
+          bash ../tools/ci-run.sh "tsc" npx tsc --noEmit
+          bash ../tools/ci-run.sh "svelte-check" npx svelte-check --fail-on-warnings
+
+  # Licences, crate sources and banned crates block always. A new RustSec
+  # advisory shows on every push but blocks only a release: it lands without
+  # a code change, and a pull request should not turn red for it.
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      CARGO_DENY_VERSION: '0.20.2'
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with: { persist-credentials: false }
+
+      - name: Rust toolchain
+        run: rustup toolchain install
+
+      - name: Restore cargo-deny
+        id: deny
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ env.CARGO_DENY_VERSION }}
+
+      - name: Install cargo-deny
+        if: steps.deny.outputs.cache-hit != 'true'
+        run: cargo install --locked "cargo-deny@$CARGO_DENY_VERSION"
+
+      - name: Save cargo-deny
+        if: always() && steps.deny.outputs.cache-hit != 'true'
+        continue-on-error: true
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
+        with:
+          path: ~/.cargo/bin/cargo-deny
+          key: cargo-deny-${{ env.CARGO_DENY_VERSION }}
+
+      # deny.toml at the root; cargo-deny finds it from each workspace
+      - name: Licences, sources, bans
+        run: |
+          for m in Cargo.toml crates/voipc-web/Cargo.toml crates/voipc-opus-wasm/Cargo.toml; do
+            bash tools/ci-run.sh "cargo-deny $m" cargo deny --manifest-path "$m" check licenses sources bans
+          done
+
+      - name: Advisories
+        continue-on-error: ${{ github.ref_type != 'tag' }}
+        run: |
+          for m in Cargo.toml crates/voipc-web/Cargo.toml crates/voipc-opus-wasm/Cargo.toml; do
+            bash tools/ci-run.sh "cargo-deny advisories $m" cargo deny --manifest-path "$m" check advisories
+          done
+
   browser:
     name: Browser end-to-end
     runs-on: ubuntu-24.04
@@ -149,7 +261,7 @@ jobs:
           cache-dependency-path: client/package-lock.json
 
       - name: Rust toolchain
-        run: rustup update --no-self-update stable && rustup target add wasm32-unknown-unknown
+        run: rustup toolchain install && rustup target add wasm32-unknown-unknown
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
@@ -249,7 +361,7 @@ jobs:
           node-version: 22
 
       - name: Rust toolchain
-        run: rustup update --no-self-update stable && rustup target add x86_64-pc-windows-msvc aarch64-linux-android
+        run: rustup toolchain install && rustup target add x86_64-pc-windows-msvc aarch64-linux-android
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:

@@ -77,13 +77,18 @@ pub struct VoipcIdentityStore {
 impl VoipcIdentityStore {
     /// `(user id, identity key)` for each identity stored since the last call.
     pub fn take_seen(&mut self) -> Vec<(u32, Vec<u8>)> {
-        std::mem::take(&mut self.seen).into_iter().filter_map(|(name, key)| Some((crate::session::user_of(&name)?, key))).collect()
+        std::mem::take(&mut self.seen)
+            .into_iter()
+            .filter_map(|(name, key)| Some((crate::session::user_of(&name)?, key)))
+            .collect()
     }
 
     /// The identity key the session with `user_id` runs on, if there is one.
     pub fn identity_of(&self, user_id: u32) -> Option<&[u8]> {
         let a = crate::session::user_address(user_id);
-        self.known_identities.get(&address_key(&a)).map(Vec::as_slice)
+        self.known_identities
+            .get(&address_key(&a))
+            .map(Vec::as_slice)
     }
 }
 
@@ -112,10 +117,15 @@ impl IdentityKeyStore for VoipcIdentityStore {
         let serialized = identity.serialize().to_vec();
         let existing = self.known_identities.insert(key, serialized.clone());
         if existing.as_ref() != Some(&serialized) {
-            self.seen.push((address.name().to_string(), serialized.clone()));
+            self.seen
+                .push((address.name().to_string(), serialized.clone()));
         }
         // Trust on first use: only a different key replaces one
-        Ok(if existing.is_some_and(|old| old != serialized) { IdentityChange::ReplacedExisting } else { IdentityChange::NewOrUnchanged })
+        Ok(if existing.is_some_and(|old| old != serialized) {
+            IdentityChange::ReplacedExisting
+        } else {
+            IdentityChange::NewOrUnchanged
+        })
     }
 
     async fn is_trusted_identity(
@@ -162,7 +172,10 @@ impl KyberPreKeyStore for VoipcKyberPreKeyStore {
         &self,
         id: KyberPreKeyId,
     ) -> Result<KyberPreKeyRecord, SignalProtocolError> {
-        let bytes = self.keys.get(&id.into()).ok_or(SignalProtocolError::InvalidKyberPreKeyId)?;
+        let bytes = self
+            .keys
+            .get(&id.into())
+            .ok_or(SignalProtocolError::InvalidKyberPreKeyId)?;
         KyberPreKeyRecord::deserialize(bytes)
     }
 
@@ -181,8 +194,15 @@ impl KyberPreKeyStore for VoipcKyberPreKeyStore {
         ec_prekey_id: SignedPreKeyId,
         base_key: &PublicKey,
     ) -> Result<(), SignalProtocolError> {
-        if !self.used.insert((id.into(), ec_prekey_id.into(), base_key.serialize().to_vec())) {
-            return Err(SignalProtocolError::InvalidMessage(CiphertextMessageType::PreKey, "reused base key".into()));
+        if !self.used.insert((
+            id.into(),
+            ec_prekey_id.into(),
+            base_key.serialize().to_vec(),
+        )) {
+            return Err(SignalProtocolError::InvalidMessage(
+                CiphertextMessageType::PreKey,
+                "reused base key".into(),
+            ));
         }
         Ok(())
     }

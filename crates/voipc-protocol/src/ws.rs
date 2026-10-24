@@ -72,7 +72,10 @@ pub fn parse_frame(
             if buf.len() < 10 {
                 return Ok(None);
             }
-            (u64::from_be_bytes(buf[2..10].try_into().expect("8 bytes")), 10)
+            (
+                u64::from_be_bytes(buf[2..10].try_into().expect("8 bytes")),
+                10,
+            )
         }
         n => (n as u64, 2),
     };
@@ -96,7 +99,14 @@ pub fn parse_frame(
             *b ^= key[i % 4];
         }
     }
-    Ok(Some((Frame { fin, opcode, payload }, end)))
+    Ok(Some((
+        Frame {
+            fin,
+            opcode,
+            payload,
+        },
+        end,
+    )))
 }
 
 /// Append one whole (FIN) frame whose payload is `parts`, back to back — so a
@@ -189,7 +199,8 @@ impl Decoder {
     #[allow(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<Option<Message>, ProtocolError> {
         loop {
-            let Some((frame, used)) = parse_frame(&self.buf[self.pos..], self.from_client, self.max)?
+            let Some((frame, used)) =
+                parse_frame(&self.buf[self.pos..], self.from_client, self.max)?
             else {
                 return Ok(None);
             };
@@ -300,7 +311,14 @@ mod tests {
                 let bytes = frame(OP_BINARY, &payload, mask);
                 let (parsed, used) = parse_frame(&bytes, from_client, 1 << 20).unwrap().unwrap();
                 assert_eq!(used, bytes.len(), "len {len}");
-                assert_eq!(parsed, Frame { fin: true, opcode: OP_BINARY, payload: payload.clone() });
+                assert_eq!(
+                    parsed,
+                    Frame {
+                        fin: true,
+                        opcode: OP_BINARY,
+                        payload: payload.clone()
+                    }
+                );
             }
         }
     }
@@ -317,7 +335,10 @@ mod tests {
     fn a_frame_is_none_until_all_of_it_arrived() {
         let bytes = frame(OP_BINARY, &[7; 300], Some(KEY));
         for cut in 0..bytes.len() {
-            assert!(parse_frame(&bytes[..cut], true, 1024).unwrap().is_none(), "cut at {cut}");
+            assert!(
+                parse_frame(&bytes[..cut], true, 1024).unwrap().is_none(),
+                "cut at {cut}"
+            );
         }
     }
 
@@ -436,10 +457,19 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\r\n")
         };
-        assert_eq!(parse_upgrade(&UPGRADE.replacen("GET", "POST", 1)), Err("405 Method Not Allowed"));
+        assert_eq!(
+            parse_upgrade(&UPGRADE.replacen("GET", "POST", 1)),
+            Err("405 Method Not Allowed")
+        );
         assert_eq!(parse_upgrade(&without("upgrade")), Err("400 Bad Request"));
-        assert_eq!(parse_upgrade(&without("sec-websocket-version")), Err("426 Upgrade Required"));
-        assert_eq!(parse_upgrade(&without("sec-websocket-key")), Err("400 Bad Request"));
+        assert_eq!(
+            parse_upgrade(&without("sec-websocket-version")),
+            Err("426 Upgrade Required")
+        );
+        assert_eq!(
+            parse_upgrade(&without("sec-websocket-key")),
+            Err("400 Bad Request")
+        );
         assert_eq!(header(UPGRADE, "HOST"), Some("127.0.0.1"));
         assert_eq!(find_header_end(UPGRADE.as_bytes()), Some(UPGRADE.len()));
     }

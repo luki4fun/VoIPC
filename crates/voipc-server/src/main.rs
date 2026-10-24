@@ -137,44 +137,103 @@ enum BanCommand {
 const BANS_FILE: &str = "bans.json";
 
 async fn run_ban(config: &ServerConfig, command: BanCommand) -> Result<()> {
-    let mut state = ServerState::new(config, settings::ServerSettings::default(), Vec::new(), String::new());
+    let mut state = ServerState::new(
+        config,
+        settings::ServerSettings::default(),
+        Vec::new(),
+        String::new(),
+    );
     if config.accounts.mode == config::AccountsMode::Off {
         state.bans_file = Some(std::path::PathBuf::from(BANS_FILE));
     } else {
-        state.accounts = Some(Arc::new(accounts::Relay::open(&config.accounts).await.context("opening the accounts database")?));
+        state.accounts = Some(Arc::new(
+            accounts::Relay::open(&config.accounts)
+                .await
+                .context("opening the accounts database")?,
+        ));
     }
     bans::load(&state).await.context("reading the bans")?;
     match command {
         BanCommand::List => {
-            let plain: std::collections::HashMap<u64, std::net::IpAddr> = state.bans.iter().filter_map(|e| Some((e.value().id, e.value().addr?))).collect();
+            let plain: std::collections::HashMap<u64, std::net::IpAddr> = state
+                .bans
+                .iter()
+                .filter_map(|e| Some((e.value().id, e.value().addr?)))
+                .collect();
             for b in bans::list(&state) {
                 let what = match (b.account, plain.get(&b.id)) {
                     (true, _) => "account".to_string(),
                     (false, Some(ip)) => format!("address {ip}"),
                     (false, None) => "address".to_string(),
                 };
-                let left = b.expires_in_secs.map_or("permanent".to_string(), |s| format!("{} more hours", s.div_ceil(3600)));
-                println!("{}	{what}	{}	{left}	by {}	{}", b.id, b.label, b.by, b.reason);
+                let left = b.expires_in_secs.map_or("permanent".to_string(), |s| {
+                    format!("{} more hours", s.div_ceil(3600))
+                });
+                println!(
+                    "{}	{what}	{}	{left}	by {}	{}",
+                    b.id, b.label, b.by, b.reason
+                );
             }
         }
-        BanCommand::Add { account, ip, reason, days } => {
+        BanCommand::Add {
+            account,
+            ip,
+            reason,
+            days,
+        } => {
             let duration = (days > 0).then(|| Duration::from_secs(u64::from(days) * 86_400));
-            let reason = if reason.trim().is_empty() { "no reason given".to_string() } else { reason };
+            let reason = if reason.trim().is_empty() {
+                "no reason given".to_string()
+            } else {
+                reason
+            };
             let ban = match (account, ip) {
                 (Some(name), _) => {
-                    let relay = state.accounts.clone().context("accounts are off: only addresses can be banned")?;
+                    let relay = state
+                        .accounts
+                        .clone()
+                        .context("accounts are off: only addresses can be banned")?;
                     let name = name.trim().to_ascii_lowercase();
-                    let user = relay.store().user_by_username(&name).await?.with_context(|| format!("no account named {name:?}"))?;
-                    bans::add(&state, bans::Target::Account(user.id.0), &user.username, &reason, "server shell", duration).await?
+                    let user = relay
+                        .store()
+                        .user_by_username(&name)
+                        .await?
+                        .with_context(|| format!("no account named {name:?}"))?;
+                    bans::add(
+                        &state,
+                        bans::Target::Account(user.id.0),
+                        &user.username,
+                        &reason,
+                        "server shell",
+                        duration,
+                    )
+                    .await?
                 }
-                (None, Some(ip)) => bans::add(&state, bans::Target::Addr(ip), "(from the server shell)", &reason, "server shell", duration).await?,
+                (None, Some(ip)) => {
+                    bans::add(
+                        &state,
+                        bans::Target::Addr(ip),
+                        "(from the server shell)",
+                        &reason,
+                        "server shell",
+                        duration,
+                    )
+                    .await?
+                }
                 (None, None) => unreachable!("clap requires one"),
             };
-            println!("ban {} kept; a running server applies it within {} minutes", ban.id, accounts::REVALIDATE_MINUTES);
+            println!(
+                "ban {} kept; a running server applies it within {} minutes",
+                ban.id,
+                accounts::REVALIDATE_MINUTES
+            );
         }
         BanCommand::Remove { id } => {
             if bans::remove(&state, id).await? {
-                println!("ban {id} lifted; a running server lets them in again within {} minutes", accounts::REVALIDATE_MINUTES);
+                println!(
+                    "ban {id} lifted; a running server lets them in again within {} minutes",
+                    accounts::REVALIDATE_MINUTES
+                );
             } else {
                 anyhow::bail!("no ban {id}");
             }
@@ -336,7 +395,11 @@ impl ConnLimits {
             return Err("pre-authentication limit reached");
         }
         let site = site_key(ip);
-        if site.is_some_and(|s| self.pre_per_site.get(&s).is_some_and(|c| *c >= Self::PRE_PER_SITE)) {
+        if site.is_some_and(|s| {
+            self.pre_per_site
+                .get(&s)
+                .is_some_and(|c| *c >= Self::PRE_PER_SITE)
+        }) {
             return Err("per-site limit reached");
         }
         {
@@ -376,7 +439,11 @@ impl ConnLimits {
     /// which the accept loop then releases.
     pub fn demote(&self, ip: IpAddr) {
         let key = limit_key(ip);
-        let _ = self.total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
+        let _ = self
+            .total
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
         decrement(&self.per_ip, key);
         *self.pre_per_ip.entry(key).or_insert(0) += 1;
         if let Some(site) = site_key(ip) {
@@ -422,7 +489,11 @@ impl ConnLimits {
 
     /// Hand back a pre-authentication slot.
     pub fn release(&self, ip: IpAddr) {
-        let _ = self.pre_total.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| Some(v.saturating_sub(1)));
+        let _ = self
+            .pre_total
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
         decrement(&self.pre_per_ip, limit_key(ip));
         if let Some(site) = site_key(ip) {
             decrement(&self.pre_per_site, site);
@@ -472,27 +543,48 @@ async fn run_command(config: &ServerConfig, command: Command) -> Result<()> {
     if config.accounts.mode == config::AccountsMode::Off {
         anyhow::bail!("accounts are off: set [accounts] mode, or pass --accounts optional");
     }
-    let relay = accounts::Relay::open(&config.accounts).await.context("opening the accounts database")?;
+    let relay = accounts::Relay::open(&config.accounts)
+        .await
+        .context("opening the accounts database")?;
     let store = relay.store();
     // The server's own shell: no signed-in admin acts, the audit rows say so.
-    let ctx = relay.ctx(std::net::IpAddr::from([127, 0, 0, 1]), voipc_protocol::codec::APP_VERSION);
+    let ctx = relay.ctx(
+        std::net::IpAddr::from([127, 0, 0, 1]),
+        voipc_protocol::codec::APP_VERSION,
+    );
     let l4f = |e: l4f_accounts::service::Error| anyhow::anyhow!(e.message());
     let user_named = |name: String| async move {
         let name = name.trim().to_ascii_lowercase();
-        store.user_by_username(&name).await?.with_context(|| format!("no account named {name:?}"))
+        store
+            .user_by_username(&name)
+            .await?
+            .with_context(|| format!("no account named {name:?}"))
     };
     match command {
         Command::Admin(AdminCommand::Grant { name, role }) => {
             let user = user_named(name).await?;
-            if relay.accounts.grant_role_as_host(&ctx, user.id, &role).await.map_err(l4f)? {
-                println!("{} now holds {role}; its rights apply once the account has two-factor codes.", user.username);
+            if relay
+                .accounts
+                .grant_role_as_host(&ctx, user.id, &role)
+                .await
+                .map_err(l4f)?
+            {
+                println!(
+                    "{} now holds {role}; its rights apply once the account has two-factor codes.",
+                    user.username
+                );
             } else {
                 println!("{} already holds {role}.", user.username);
             }
         }
         Command::Admin(AdminCommand::Revoke { name, role }) => {
             let user = user_named(name).await?;
-            if relay.accounts.revoke_role_as_host(&ctx, user.id, &role).await.map_err(l4f)? {
+            if relay
+                .accounts
+                .revoke_role_as_host(&ctx, user.id, &role)
+                .await
+                .map_err(l4f)?
+            {
                 println!("{} no longer holds {role} and is signed out everywhere (a running server ends its connection within {} minutes).", user.username, accounts::REVALIDATE_MINUTES);
             } else {
                 println!("{} does not hold {role}.", user.username);
@@ -500,40 +592,71 @@ async fn run_command(config: &ServerConfig, command: Command) -> Result<()> {
         }
         Command::Admin(AdminCommand::Reset2fa { name }) => {
             let user = user_named(name).await?;
-            if relay.accounts.reset_2fa_as_host(&ctx, user.id).await.map_err(l4f)? {
+            if relay
+                .accounts
+                .reset_2fa_as_host(&ctx, user.id)
+                .await
+                .map_err(l4f)?
+            {
                 println!(
                     "{}: second factors and recovery codes removed, devices forgotten, signed out everywhere (a running server ends its connection within {} minutes).",
                     user.username,
                     accounts::REVALIDATE_MINUTES
                 );
             } else {
-                println!("{} has no second factor, remembered device or session; nothing changed.", user.username);
+                println!(
+                    "{} has no second factor, remembered device or session; nothing changed.",
+                    user.username
+                );
             }
         }
         Command::Admin(AdminCommand::Invite { name, days }) => {
             // Closed: only an admin makes accounts, each for a name it picked.
-            if config.accounts.registration == config::RegistrationMode::Closed && name.as_deref().is_none_or(|n| n.trim().is_empty()) {
+            if config.accounts.registration == config::RegistrationMode::Closed
+                && name.as_deref().is_none_or(|n| n.trim().is_empty())
+            {
                 anyhow::bail!("registration is \"closed\": name the account the code is for with --for <name>");
             }
-            let code = relay.accounts.invite_create_as_host(&ctx, name.as_deref(), days).await.map_err(l4f)?;
+            let code = relay
+                .accounts
+                .invite_create_as_host(&ctx, name.as_deref(), days)
+                .await
+                .map_err(l4f)?;
             // The code alone on stdout, for scripts; the rest is for whoever reads it.
             println!("{code}");
-            let bound = name.map(|n| format!(", only for the name {n:?}")).unwrap_or_default();
-            eprintln!("One sign-up, valid {} days{bound}: Create account, then this as the invite code.", days.clamp(1, 30));
+            let bound = name
+                .map(|n| format!(", only for the name {n:?}"))
+                .unwrap_or_default();
+            eprintln!(
+                "One sign-up, valid {} days{bound}: Create account, then this as the invite code.",
+                days.clamp(1, 30)
+            );
         }
-        Command::Channels(_) | Command::Cert(_) | Command::Health | Command::Ban(_) => unreachable!("handled before the database is opened"),
+        Command::Channels(_) | Command::Cert(_) | Command::Health | Command::Ban(_) => {
+            unreachable!("handled before the database is opened")
+        }
         Command::Db(DbCommand::Backup { path }) => match store {
             l4f_accounts::store::Store::Lite(b) => {
                 // Made empty and private first: SQLite copies into an empty file
-                fsutil::create_private(std::path::Path::new(&path), &[]).with_context(|| format!("creating {path}"))?;
-                sqlx::query(sqlx::AssertSqlSafe(format!("VACUUM INTO '{}'", path.replace('\'', "''"))))
-                    .execute(&b.0)
-                    .await
-                    .with_context(|| format!("backing up to {path}"))?;
-                fsutil::owner_only(std::path::Path::new(&path)).with_context(|| format!("making {path} readable by this user only"))?;
-                println!("copied to {path}; keep {} with it", config.accounts.key_file);
+                fsutil::create_private(std::path::Path::new(&path), &[])
+                    .with_context(|| format!("creating {path}"))?;
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "VACUUM INTO '{}'",
+                    path.replace('\'', "''")
+                )))
+                .execute(&b.0)
+                .await
+                .with_context(|| format!("backing up to {path}"))?;
+                fsutil::owner_only(std::path::Path::new(&path))
+                    .with_context(|| format!("making {path} readable by this user only"))?;
+                println!(
+                    "copied to {path}; keep {} with it",
+                    config.accounts.key_file
+                );
             }
-            l4f_accounts::store::Store::Pg(_) => anyhow::bail!("this is Postgres: back it up with pg_dump"),
+            l4f_accounts::store::Store::Pg(_) => {
+                anyhow::bail!("this is Postgres: back it up with pg_dump")
+            }
         },
     }
     Ok(())
@@ -606,8 +729,16 @@ async fn main() -> Result<()> {
         // request is served; a TLS h2 request if a hung server ever passes it
         Some(Command::Health) => {
             let port = config.tcp_port;
-            let host = if config.host == "::" || config.host == "0.0.0.0" { "127.0.0.1" } else { config.host.as_str() };
-            let up = tokio::time::timeout(Duration::from_secs(3), tokio::net::TcpStream::connect((host, port))).await;
+            let host = if config.host == "::" || config.host == "0.0.0.0" {
+                "127.0.0.1"
+            } else {
+                config.host.as_str()
+            };
+            let up = tokio::time::timeout(
+                Duration::from_secs(3),
+                tokio::net::TcpStream::connect((host, port)),
+            )
+            .await;
             if !matches!(up, Ok(Ok(_))) {
                 anyhow::bail!("nothing answers on TCP port {port}");
             }
@@ -674,7 +805,10 @@ async fn main() -> Result<()> {
     let key = load_key(&config.key_path)?;
     // What an app pins when it first meets a self-signed server: users can
     // compare it (`voipc-server cert fingerprint` prints it too)
-    info!("certificate fingerprint (SHA-256): {}", fingerprint(&certs[0]));
+    info!(
+        "certificate fingerprint (SHA-256): {}",
+        fingerprint(&certs[0])
+    );
 
     let mut tls_config =
         rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -690,7 +824,10 @@ async fn main() -> Result<()> {
     // Admin token: configured, or generated for this run and shown once
     // (like a TeamSpeak privilege key). Nothing is persisted.
     let configured_token = config.admin_token.clone().filter(|t| !t.is_empty());
-    if configured_token.as_ref().is_some_and(|t| t.chars().count() < state::MIN_TOKEN_LEN) {
+    if configured_token
+        .as_ref()
+        .is_some_and(|t| t.chars().count() < state::MIN_TOKEN_LEN)
+    {
         anyhow::bail!(
             "admin_token is shorter than {} characters, which can be guessed: set a long random one (`openssl rand -hex 32`), or none to get one for each run",
             state::MIN_TOKEN_LEN
@@ -703,7 +840,11 @@ async fn main() -> Result<()> {
     let relay = if config.accounts.mode == config::AccountsMode::Off {
         None
     } else {
-        let relay = Arc::new(accounts::Relay::open(&config.accounts).await.context("opening the accounts database")?);
+        let relay = Arc::new(
+            accounts::Relay::open(&config.accounts)
+                .await
+                .context("opening the accounts database")?,
+        );
         info!(
             mode = ?config.accounts.mode,
             registration = ?config.accounts.registration,
@@ -757,18 +898,25 @@ async fn main() -> Result<()> {
     // Every client gets the channel list in one frame. Too many channels with
     // long descriptions and it cannot be sent, and clients see no channels at
     // all: say so now instead (1.0 audit H1-06)
-    let list = voipc_protocol::codec::encode_server_msg(&voipc_protocol::messages::ServerMessage::ChannelList { channels: state.channel_list().await });
+    let list = voipc_protocol::codec::encode_server_msg(
+        &voipc_protocol::messages::ServerMessage::ChannelList {
+            channels: state.channel_list().await,
+        },
+    );
     if list.as_ref().map_or(true, |b| b.len() > 60 * 1024) {
         anyhow::bail!("channels.json describes more channels than fit in one channel list (60 KiB): shorten descriptions or remove channels");
     }
     if state.accounts.is_some() {
-        accounts::locked_logs_at_boot(&state).await.context("checking the channel logs' passwords")?;
+        accounts::locked_logs_at_boot(&state)
+            .await
+            .context("checking the channel logs' passwords")?;
     }
     // What the server's shell changes (roles, codes, bans) reaches
     // connections already open.
     let watched = state.clone();
     tokio::spawn(async move {
-        let mut every = tokio::time::interval(Duration::from_secs(60 * accounts::REVALIDATE_MINUTES));
+        let mut every =
+            tokio::time::interval(Duration::from_secs(60 * accounts::REVALIDATE_MINUTES));
         every.tick().await;
         loop {
             every.tick().await;
@@ -957,13 +1105,19 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
 /// for a self-signed server (`transport.rs` `TofuCertVerifier`).
 fn fingerprint(cert: &CertificateDer<'_>) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, cert.as_ref());
-    digest.as_ref().iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(":")
+    digest
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
 }
 
 /// The first PKCS#1, PKCS#8 or SEC1 private key in the file.
 fn load_key(path: &str) -> Result<PrivateKeyDer<'static>> {
     let key_data = fs::read(path).with_context(|| format!("failed to read key: {}", path))?;
-    PrivateKeyDer::from_pem_slice(&key_data).with_context(|| format!("no private key found in {}", path))
+    PrivateKeyDer::from_pem_slice(&key_data)
+        .with_context(|| format!("no private key found in {}", path))
 }
 
 #[cfg(test)]
@@ -1014,7 +1168,11 @@ mod tests {
         assert!(refused.contains("NoApplicationProtocol"), "{refused}");
         let past_alpn = handshake(true, b"http/1.1").await;
         assert!(!past_alpn.contains("NoApplicationProtocol"), "{past_alpn}");
-        assert_eq!(alpn_protocols(true)[0], b"h2", "page loads would get HTTP/1.1");
+        assert_eq!(
+            alpn_protocols(true)[0],
+            b"h2",
+            "page loads would get HTTP/1.1"
+        );
         assert_eq!(alpn_protocols(false), [b"h2".to_vec()]);
     }
 
@@ -1026,14 +1184,24 @@ mod tests {
         let v6 = |s: &str| IpAddr::V6(s.parse().unwrap());
         let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7));
         assert_eq!(limit_key(v4), v4);
-        assert_eq!(limit_key(v6("::ffff:192.0.2.7")), v4, "a dual-stack socket's IPv4 peer");
+        assert_eq!(
+            limit_key(v6("::ffff:192.0.2.7")),
+            v4,
+            "a dual-stack socket's IPv4 peer"
+        );
         assert_ne!(
             limit_key(v6("::ffff:192.0.2.7")),
             limit_key(v6("::ffff:192.0.2.8")),
             "IPv4 peers must not share one key"
         );
-        assert_eq!(limit_key(v6("2001:db8:1:2::1")), limit_key(v6("2001:db8:1:2:ffff::9")));
-        assert_ne!(limit_key(v6("2001:db8:1:2::1")), limit_key(v6("2001:db8:1:3::1")));
+        assert_eq!(
+            limit_key(v6("2001:db8:1:2::1")),
+            limit_key(v6("2001:db8:1:2:ffff::9"))
+        );
+        assert_ne!(
+            limit_key(v6("2001:db8:1:2::1")),
+            limit_key(v6("2001:db8:1:3::1"))
+        );
     }
 
     /// Rotating through one /64 is the same subscriber dialling again.
@@ -1048,11 +1216,20 @@ mod tests {
         let signed_in = |s: &str| limits.acquire(v6(s)).and_then(|()| limits.promote(v6(s)));
         signed_in("2001:db8:1:2::1").unwrap();
         signed_in("2001:db8:1:2::2").unwrap();
-        assert_eq!(signed_in("2001:db8:1:2::3"), Err("too many connections from your address"));
-        assert!(signed_in("2001:db8:1:3::1").is_ok(), "the next /64 is somebody else");
+        assert_eq!(
+            signed_in("2001:db8:1:2::3"),
+            Err("too many connections from your address")
+        );
+        assert!(
+            signed_in("2001:db8:1:3::1").is_ok(),
+            "the next /64 is somebody else"
+        );
         limits.demote(v6("2001:db8:1:2::1"));
         limits.release(v6("2001:db8:1:2::1"));
-        assert!(signed_in("2001:db8:1:2::4").is_ok(), "released under the same key");
+        assert!(
+            signed_in("2001:db8:1:2::4").is_ok(),
+            "released under the same key"
+        );
     }
 
     /// H1-01: connections that never sign in (idle page loads, stalled
@@ -1070,7 +1247,11 @@ mod tests {
         let b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8));
         limits.acquire(b).unwrap();
         limits.promote(b).unwrap();
-        assert_eq!(limits.total.load(Ordering::Relaxed), 1, "only the signed-in session takes main room");
+        assert_eq!(
+            limits.total.load(Ordering::Relaxed),
+            1,
+            "only the signed-in session takes main room"
+        );
         // A whole IPv6 site cannot rotate through its /64s
         let site = |n: u16| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 7, n, 0, 0, 0, 1));
         for n in 0..ConnLimits::PRE_PER_SITE as u16 {
@@ -1127,7 +1308,10 @@ mod tests {
         }
         limits.promote(ip).unwrap();
         limits.promote(ip).unwrap();
-        assert_eq!(limits.promote(ip), Err("too many connections from your address"));
+        assert_eq!(
+            limits.promote(ip),
+            Err("too many connections from your address")
+        );
     }
 
     /// The connect-rate map is the one table a stranger can grow, and the

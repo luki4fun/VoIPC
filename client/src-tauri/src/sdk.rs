@@ -359,10 +359,12 @@ async fn serve(
     // A socket that connects and then says nothing must not pin a task. The
     // third value is this origin's slot (see `MAX_PER_ORIGIN`), held for the
     // life of the connection and released by its `Drop` however it ends.
-    let (mut buf, origin, _origin_slot) =
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut stream, &allowed, per_origin))
-            .await
-            .map_err(|_| anyhow::anyhow!("handshake timed out"))??;
+    let (mut buf, origin, _origin_slot) = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        handshake(&mut stream, &allowed, per_origin),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("handshake timed out"))??;
     let (mut rd, mut wr) = stream.into_split();
 
     let mut bad_messages = 0u8;
@@ -878,7 +880,11 @@ async fn on_hello(
     // cannot give it for them.
     if channel.nsfw && !nsfw_consented(&state.config().ui_prefs, &connection.server_address) {
         let wanted = short_name(wanted, "");
-        return refuse(app, hello, format!("{wanted} is marked 18+: join it once in the app first"));
+        return refuse(
+            app,
+            hello,
+            format!("{wanted} is marked 18+: join it once in the app first"),
+        );
     }
 
     // Everything needed after the guard is dropped: a stalled control stream
@@ -904,7 +910,13 @@ async fn on_hello(
         current_channel.load(Ordering::Relaxed) == channel_id && is_voice.load(Ordering::Relaxed)
     };
     if !may_move && !joined() {
-        return (error("player_left", "the player left the channel this game joined"), None);
+        return (
+            error(
+                "player_left",
+                "the player left the channel this game joined",
+            ),
+            None,
+        );
     }
     if current_channel.load(Ordering::Relaxed) != channel_id {
         // The user allowed games to do this (Game Integration is opt-in),
@@ -922,7 +934,10 @@ async fn on_hello(
     let deadline = tokio::time::Instant::now() + JOIN_TIMEOUT;
     while !joined() {
         if tokio::time::Instant::now() >= deadline {
-            return (error("join_failed", format!("could not join {name}: timed out")), None);
+            return (
+                error("join_failed", format!("could not join {name}: timed out")),
+                None,
+            );
         }
         tokio::select! {
             // The channel id is swapped when the server's UserList
@@ -1042,10 +1057,16 @@ async fn apply_update(
     // same for a call that moved to another server, where they name strangers.
     if let Some((server, id)) = hello {
         if server != connection.server_address {
-            return Err(("rehello", "voice moved to another server — send hello again".into()));
+            return Err((
+                "rehello",
+                "voice moved to another server — send hello again".into(),
+            ));
         }
         if id != connection.user_id {
-            return Err(("rehello", "reconnected to the server — send hello again".into()));
+            return Err((
+                "rehello",
+                "reconnected to the server — send hello again".into(),
+            ));
         }
     }
 
@@ -1061,7 +1082,10 @@ async fn apply_update(
         if spatial.sdk_channel != Some(here) {
             spatial.sdk_active = false;
             spatial.clear_positions();
-            return Err(("rehello", "left the channel this game joined — send hello again".into()));
+            return Err((
+                "rehello",
+                "left the channel this game joined — send hello again".into(),
+            ));
         }
 
         // Updates arrive 4-10 times a second; each one is glided over the gap to
@@ -1157,10 +1181,7 @@ fn channel_is_routed(connection: &crate::app_state::ActiveConnection, channel_id
         .channels
         .lock()
         .ok()
-        .is_some_and(|list| {
-            list.iter()
-                .any(|c| c.channel_id == channel_id && c.routed)
-        })
+        .is_some_and(|list| list.iter().any(|c| c.channel_id == channel_id && c.routed))
 }
 
 /// Stop asking the relay to cull for us. Sent whenever the game stops driving
@@ -1189,7 +1210,10 @@ async fn clear_sdk_positions(app: &tauri::AppHandle) {
         }
         clear_audio_filter(connection).await;
     }
-    let _ = app.emit("sdk-audible", serde_json::json!({ "ids": serde_json::Value::Null }));
+    let _ = app.emit(
+        "sdk-audible",
+        serde_json::json!({ "ids": serde_json::Value::Null }),
+    );
 }
 
 fn state_message(
@@ -1277,7 +1301,10 @@ async fn handshake(
     if let Some(origin) = upgrade.origin.as_deref() {
         if !origin_allowed(origin, extra_origins) {
             reject(stream, "403 Forbidden").await;
-            warn!(origin, "game SDK rejected a connection from an unknown origin");
+            warn!(
+                origin,
+                "game SDK rejected a connection from an unknown origin"
+            );
             anyhow::bail!("origin not allowed: {origin}");
         }
     }
@@ -1377,7 +1404,9 @@ async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
 /// `hasNsfwConsent`: the server key is `host:port`, an IPv6 host unbracketed).
 fn nsfw_consented(ui_prefs: &serde_json::Value, server: &str) -> bool {
     let key = server.replacen('[', "", 1).replacen("]:", ":", 1);
-    ui_prefs["nsfw_ok"].as_array().is_some_and(|ok| ok.iter().any(|v| v.as_str() == Some(key.as_str())))
+    ui_prefs["nsfw_ok"]
+        .as_array()
+        .is_some_and(|ok| ok.iter().any(|v| v.as_str() == Some(key.as_str())))
 }
 
 #[cfg(test)]
@@ -1387,7 +1416,10 @@ mod tests {
     fn an_18_plus_channel_needs_the_users_own_yes() {
         let prefs = serde_json::json!({ "nsfw_ok": ["a.example:9987", "::1:9987"] });
         assert!(nsfw_consented(&prefs, "a.example:9987"));
-        assert!(nsfw_consented(&prefs, "[::1]:9987"), "the same key as the front end's");
+        assert!(
+            nsfw_consented(&prefs, "[::1]:9987"),
+            "the same key as the front end's"
+        );
         assert!(!nsfw_consented(&prefs, "b.example:9987"));
         assert!(!nsfw_consented(&serde_json::Value::Null, "a.example:9987"));
     }
@@ -1405,7 +1437,10 @@ mod tests {
         assert!(origin_allowed("http://localhost:3000", &[]));
         assert!(origin_allowed("http://localhost", &[]));
         assert!(origin_allowed("http://127.0.0.1:8080", &[]));
-        assert!(origin_allowed("http://mta", &[]), "MTA:SA's CEF was refused");
+        assert!(
+            origin_allowed("http://mta", &[]),
+            "MTA:SA's CEF was refused"
+        );
         // A page from the internet cannot drive the mix, even from loopback
         assert!(!origin_allowed("https://evil.example", &[]));
         assert!(!origin_allowed("null", &[]));
@@ -1453,7 +1488,10 @@ mod tests {
         assert!(server_matches("rp.example.com:9987", "rp.example.com:9987"));
         assert!(server_matches("rp.example.com", "rp.example.com:9987"));
         assert!(server_matches("RP.Example.com:9987", "rp.example.com:9987"));
-        assert!(!server_matches("rp.example.com:9988", "rp.example.com:9987"));
+        assert!(!server_matches(
+            "rp.example.com:9988",
+            "rp.example.com:9987"
+        ));
         assert!(!server_matches("other.example.com", "rp.example.com:9987"));
     }
 
@@ -1461,9 +1499,8 @@ mod tests {
     fn a_hello_picks_the_exact_server_then_the_one_in_voice() {
         let (a, b) = ("rp.example.com:9987", "rp.example.com:9988");
         let open = [a, b, "other.example:9987"];
-        let pick = |expected: &str, voice: Option<&str>| {
-            pick_server(expected, open.into_iter(), voice)
-        };
+        let pick =
+            |expected: &str, voice: Option<&str>| pick_server(expected, open.into_iter(), voice);
         // The port settles it whenever the mod names one
         assert_eq!(pick(b, Some(a)), Some(b));
         assert_eq!(pick("RP.Example.com:9987", None), Some(a));
@@ -1564,10 +1601,7 @@ mod tests {
 
         let long = frame_bytes(0x1, &vec![b'x'; 70_000]);
         assert_eq!(long[1], 127);
-        assert_eq!(
-            u64::from_be_bytes(long[2..10].try_into().unwrap()),
-            70_000
-        );
+        assert_eq!(u64::from_be_bytes(long[2..10].try_into().unwrap()), 70_000);
     }
 
     /// The framing half of `write_frame`, without a socket.
@@ -1580,7 +1614,12 @@ mod tests {
     /// A client frame, which unlike a server frame must be masked.
     fn masked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
         let mut frame = Vec::new();
-        ws::encode_frame(&mut frame, opcode, &[payload], Some([0xA1, 0xB2, 0xC3, 0xD4]));
+        ws::encode_frame(
+            &mut frame,
+            opcode,
+            &[payload],
+            Some([0xA1, 0xB2, 0xC3, 0xD4]),
+        );
         frame
     }
 
@@ -1601,8 +1640,14 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\r\n")
         };
-        assert_eq!(ws::parse_upgrade(&without("upgrade")), Err("400 Bad Request"));
-        assert_eq!(ws::parse_upgrade(&without("sec-websocket-key")), Err("400 Bad Request"));
+        assert_eq!(
+            ws::parse_upgrade(&without("upgrade")),
+            Err("400 Bad Request")
+        );
+        assert_eq!(
+            ws::parse_upgrade(&without("sec-websocket-key")),
+            Err("400 Bad Request")
+        );
         // A version we do not speak gets 426, and the reply names 13
         assert_eq!(
             ws::parse_upgrade(&UPGRADE.replace("Version: 13", "Version: 8")),
@@ -1626,7 +1671,10 @@ mod tests {
         assert!(parse_frame(&[]).unwrap().is_none());
 
         // RFC 6455: a client frame must be masked
-        assert!(parse_frame(&frame_bytes(0x1, b"hello")).is_err(), "unmasked frame accepted");
+        assert!(
+            parse_frame(&frame_bytes(0x1, b"hello")).is_err(),
+            "unmasked frame accepted"
+        );
         // Fragments are refused rather than half-read
         let mut fragment = masked_frame(0x1, b"x");
         fragment[0] &= 0x7f;
@@ -1661,7 +1709,10 @@ mod tests {
         let listed = placed(&[7]);
         // Somebody else: a plain talk message, our own state untouched
         let msg = event_message(
-            &SdkEvent::Talk { user_id: 7, speaking: true },
+            &SdkEvent::Talk {
+                user_id: 7,
+                speaking: true,
+            },
             Some(42),
             &mut own,
             &listed,
@@ -1673,9 +1724,20 @@ mod tests {
         assert!(!own.speaking);
 
         // Ourselves: a `self` message carrying every field
-        event_message(&SdkEvent::Muted { user_id: 42, muted: true }, Some(42), &mut own, &listed);
+        event_message(
+            &SdkEvent::Muted {
+                user_id: 42,
+                muted: true,
+            },
+            Some(42),
+            &mut own,
+            &listed,
+        );
         let msg = event_message(
-            &SdkEvent::Talk { user_id: 42, speaking: true },
+            &SdkEvent::Talk {
+                user_id: 42,
+                speaking: true,
+            },
             Some(42),
             &mut own,
             &listed,
@@ -1687,7 +1749,10 @@ mod tests {
 
         // A socket that never said hello, and events that are not the mod's
         assert!(event_message(
-            &SdkEvent::Talk { user_id: 7, speaking: true },
+            &SdkEvent::Talk {
+                user_id: 7,
+                speaking: true
+            },
             None,
             &mut own,
             &listed
@@ -1709,22 +1774,44 @@ mod tests {
         let mut own = Own::default();
         let listed = placed(&[7]);
         let talk = |id: u32, own: &mut Own| {
-            event_message(&SdkEvent::Talk { user_id: id, speaking: true }, Some(42), own, &listed)
+            event_message(
+                &SdkEvent::Talk {
+                    user_id: id,
+                    speaking: true,
+                },
+                Some(42),
+                own,
+                &listed,
+            )
         };
-        assert!(talk(7, &mut own).is_some(), "a placed player must be reported");
+        assert!(
+            talk(7, &mut own).is_some(),
+            "a placed player must be reported"
+        );
         assert!(talk(9, &mut own).is_none(), "an unplaced player leaked");
         // Ours always goes out: it is the user's own state, to the user's game
         assert!(talk(42, &mut own).is_some());
         assert!(
-            event_message(&SdkEvent::Muted { user_id: 9, muted: true }, Some(42), &mut own, &listed)
-                .is_none(),
+            event_message(
+                &SdkEvent::Muted {
+                    user_id: 9,
+                    muted: true
+                },
+                Some(42),
+                &mut own,
+                &listed
+            )
+            .is_none(),
             "an unplaced player's mute leaked"
         );
 
         // And with nothing placed yet, only our own state is pushed
         let empty = placed(&[]);
         assert!(event_message(
-            &SdkEvent::Talk { user_id: 7, speaking: true },
+            &SdkEvent::Talk {
+                user_id: 7,
+                speaking: true
+            },
             Some(42),
             &mut own,
             &empty
@@ -1736,7 +1823,9 @@ mod tests {
     fn a_proximity_change_is_pushed_as_a_partial_state() {
         let mut own = Own::default();
         let msg = event_message(
-            &SdkEvent::Proximity { mode: ProximityMode::Off },
+            &SdkEvent::Proximity {
+                mode: ProximityMode::Off,
+            },
             Some(42),
             &mut own,
             &placed(&[]),
@@ -1765,17 +1854,35 @@ mod tests {
         let nobody = Owner::default();
         let fivem = Some("https://cfx-nui-my-voice".to_string());
         let other = Some("https://cfx-nui-some-menu".to_string());
-        let held = Owner { generation: 7, origin: fivem.clone() };
+        let held = Owner {
+            generation: 7,
+            origin: fivem.clone(),
+        };
 
-        assert!(!owner_conflict(&nobody, 9, &fivem), "an idle mix was refused");
-        assert!(!owner_conflict(&held, 7, &fivem), "the owner was refused its own mix");
+        assert!(
+            !owner_conflict(&nobody, 9, &fivem),
+            "an idle mix was refused"
+        );
+        assert!(
+            !owner_conflict(&held, 7, &fivem),
+            "the owner was refused its own mix"
+        );
         // A resource restarting: same origin, newer socket, takes over
         assert!(!owner_conflict(&held, 9, &fivem));
         // Anybody else waits until that socket dies
-        assert!(owner_conflict(&held, 9, &other), "a second origin took the mix");
-        assert!(owner_conflict(&held, 9, &None), "a native client took the mix");
+        assert!(
+            owner_conflict(&held, 9, &other),
+            "a second origin took the mix"
+        );
+        assert!(
+            owner_conflict(&held, 9, &None),
+            "a native client took the mix"
+        );
         // Native clients have no Origin to tell apart, so they are one class
-        let native = Owner { generation: 7, origin: None };
+        let native = Owner {
+            generation: 7,
+            origin: None,
+        };
         assert!(!owner_conflict(&native, 9, &None));
         assert!(owner_conflict(&native, 9, &fivem));
     }
@@ -1830,7 +1937,10 @@ mod tests {
         );
 
         // A press that soon after a press is still a flood, and still refused
-        assert_eq!(transmit_step(true, false, Some(t0), soon), TxStep::RateLimited);
+        assert_eq!(
+            transmit_step(true, false, Some(t0), soon),
+            TxStep::RateLimited
+        );
         // …and once the window has passed it goes through
         assert_eq!(
             transmit_step(true, false, Some(t0), t0 + MIN_UPDATE_GAP),
@@ -1851,8 +1961,14 @@ mod tests {
         // release a hold the *new* socket has since taken, cutting a radio
         // transmission mid-sentence; `ptt_sdk` is one flag for the whole app.
         assert!(releases_transmit(7, 7), "the owner could not let go");
-        assert!(!releases_transmit(9, 7), "a replaced socket released the new owner's hold");
-        assert!(!releases_transmit(0, 7), "a socket released a mix nobody owns");
+        assert!(
+            !releases_transmit(9, 7),
+            "a replaced socket released the new owner's hold"
+        );
+        assert!(
+            !releases_transmit(0, 7),
+            "a socket released a mix nobody owns"
+        );
     }
 
     #[test]
@@ -1868,14 +1984,20 @@ mod tests {
 
     #[test]
     fn an_unknown_type_is_a_newer_mod_not_a_broken_one() {
-        assert_eq!(unknown_type(r#"{"type":"whisper","to":7}"#).as_deref(), Some("whisper"));
+        assert_eq!(
+            unknown_type(r#"{"type":"whisper","to":7}"#).as_deref(),
+            Some("whisper")
+        );
         // Known types that fail on their fields, and things that are not
         // messages at all, still count toward the close
         assert_eq!(unknown_type(r#"{"type":"update","players":5}"#), None);
         assert_eq!(unknown_type(r#"{"to":7}"#), None);
         assert_eq!(unknown_type("not json"), None);
         // The name is echoed back, so it is cleaned like any other mod string
-        assert_eq!(unknown_type("{\"type\":\"a\\u202eb\"}").as_deref(), Some("ab"));
+        assert_eq!(
+            unknown_type("{\"type\":\"a\\u202eb\"}").as_deref(),
+            Some("ab")
+        );
     }
 
     #[test]
@@ -1909,8 +2031,18 @@ mod tests {
         // state, and let it find their server by guessing `server` until the
         // answer changed.
         let msg = state_message("wrong_server", None, None);
-        for field in ["user_id", "username", "muted", "deafened", "proximity", "channel"] {
-            assert!(msg.get(field).is_none(), "{field} leaked in a refusal: {msg}");
+        for field in [
+            "user_id",
+            "username",
+            "muted",
+            "deafened",
+            "proximity",
+            "channel",
+        ] {
+            assert!(
+                msg.get(field).is_none(),
+                "{field} leaked in a refusal: {msg}"
+            );
         }
         // What a mod legitimately needs to report the problem stays
         assert_eq!(msg["state"], "wrong_server");
@@ -1933,13 +2065,21 @@ mod tests {
     fn player(id: u32) -> PlayerState {
         PlayerState {
             id,
-            spec: RenderSpec { pos: Some([1.0, 2.0, 3.0]), ..RenderSpec::default() },
+            spec: RenderSpec {
+                pos: Some([1.0, 2.0, 3.0]),
+                ..RenderSpec::default()
+            },
             layers: Vec::new(),
         }
     }
 
     fn place(players: Vec<PlayerState>) -> Result<Placements, String> {
-        sources_from(players, &HashMap::new(), MIN_GLIDE, std::time::Instant::now())
+        sources_from(
+            players,
+            &HashMap::new(),
+            MIN_GLIDE,
+            std::time::Instant::now(),
+        )
     }
 
     #[test]
@@ -1956,7 +2096,10 @@ mod tests {
         assert_eq!(placed.motion.len(), 2);
         // …and a duplicate is caught even when neither has a base render
         let silent = |id| PlayerState {
-            spec: RenderSpec { mode: Some("off".into()), ..RenderSpec::default() },
+            spec: RenderSpec {
+                mode: Some("off".into()),
+                ..RenderSpec::default()
+            },
             ..player(id)
         };
         assert!(place(vec![silent(7), silent(7)]).is_err());
@@ -1965,10 +2108,12 @@ mod tests {
     #[test]
     fn a_placement_is_clamped_and_a_nan_is_refused() {
         let one = |spec: RenderSpec| {
-            place(vec![PlayerState { spec, ..player(1) }])
-                .map(|p| (p.sources[&1], p.motion.len()))
+            place(vec![PlayerState { spec, ..player(1) }]).map(|p| (p.sources[&1], p.motion.len()))
         };
-        let base = RenderSpec { pos: Some([0.0; 3]), ..RenderSpec::default() };
+        let base = RenderSpec {
+            pos: Some([0.0; 3]),
+            ..RenderSpec::default()
+        };
 
         let (src, glides) = one(base.clone()).unwrap();
         assert_eq!((src.range, src.volume, src.muffle), (DEFAULT_RANGE, 1.0, 0));
@@ -1995,17 +2140,29 @@ mod tests {
         );
 
         // A chain implies `direct` on the base, and a direct source gets no glide
-        let (src, glides) = one(RenderSpec { mode: Some("walkie".into()), ..base.clone() }).unwrap();
+        let (src, glides) = one(RenderSpec {
+            mode: Some("walkie".into()),
+            ..base.clone()
+        })
+        .unwrap();
         assert!(src.direct && src.fx == Effect::Walkie);
         assert_eq!(glides, 0);
         // An unknown mode stays positional, so a mod written against a later
         // VoIPC keeps working here
-        let (src, _) = one(RenderSpec { mode: Some("hologram".into()), ..base.clone() }).unwrap();
+        let (src, _) = one(RenderSpec {
+            mode: Some("hologram".into()),
+            ..base.clone()
+        })
+        .unwrap();
         assert!(!src.direct && src.fx == Effect::None);
 
         // NaN would make the gains NaN and, through the ramp, silence that
         // source for good — so it is refused rather than clamped
-        assert!(one(RenderSpec { pos: Some([f32::NAN, 0.0, 0.0]), ..base.clone() }).is_err());
+        assert!(one(RenderSpec {
+            pos: Some([f32::NAN, 0.0, 0.0]),
+            ..base.clone()
+        })
+        .is_err());
         // …while a NaN range, volume or pan falls back to the default
         let (src, _) = one(RenderSpec {
             range: Some(f32::NAN),
@@ -2023,9 +2180,16 @@ mod tests {
         // phone to you *and* standing across the room. Their voice arrives
         // twice — the earpiece in one ear, their real voice where they stand.
         let placed = place(vec![PlayerState {
-            spec: RenderSpec { pos: Some([10.0, 0.0, 0.0]), ..RenderSpec::default() },
+            spec: RenderSpec {
+                pos: Some([10.0, 0.0, 0.0]),
+                ..RenderSpec::default()
+            },
             layers: vec![
-                RenderSpec { mode: Some("mobile".into()), pan: Some(-0.9), ..RenderSpec::default() },
+                RenderSpec {
+                    mode: Some("mobile".into()),
+                    pan: Some(-0.9),
+                    ..RenderSpec::default()
+                },
                 RenderSpec {
                     mode: Some("badvoip".into()),
                     pos: Some([10.0, 0.0, 1.6]),
@@ -2039,14 +2203,20 @@ mod tests {
         .unwrap();
 
         let base = placed.sources[&7];
-        assert!(!base.direct && base.fx == Effect::None, "the base is still a person");
+        assert!(
+            !base.direct && base.fx == Effect::None,
+            "the base is still a person"
+        );
         let layers = &placed.layers[&7];
         assert_eq!(layers.len(), 2);
         // The phone: no position, so direct, and in the left ear
         assert!(layers[0].direct && layers[0].fx == Effect::Mobile && layers[0].pan == -0.9);
         // The earpiece leaking at their head: positional *and* effected, which
         // is the one rule a layer does not share with the base render
-        assert!(!layers[1].direct, "a layer with a position must stay positional");
+        assert!(
+            !layers[1].direct,
+            "a layer with a position must stay positional"
+        );
         assert_eq!(layers[1].fx, Effect::BadVoip);
         assert_eq!((layers[1].range, layers[1].volume), (2.5, 0.35));
         // Only the base glides
@@ -2061,12 +2231,21 @@ mod tests {
         // is not the way to say that: in a channel that is not positional the
         // gains never reach `volume`, and they would play at full level.
         let placed = place(vec![PlayerState {
-            spec: RenderSpec { mode: Some("off".into()), ..RenderSpec::default() },
-            layers: vec![RenderSpec { mode: Some("landline".into()), ..RenderSpec::default() }],
+            spec: RenderSpec {
+                mode: Some("off".into()),
+                ..RenderSpec::default()
+            },
+            layers: vec![RenderSpec {
+                mode: Some("landline".into()),
+                ..RenderSpec::default()
+            }],
             ..player(7)
         }])
         .unwrap();
-        assert!(placed.sources.is_empty(), "mode:off still placed the speaker");
+        assert!(
+            placed.sources.is_empty(),
+            "mode:off still placed the speaker"
+        );
         assert!(placed.motion.is_empty());
         assert_eq!(placed.layers[&7].len(), 1);
         // Heard, though — the member list must not grey them out
@@ -2078,7 +2257,13 @@ mod tests {
         // Refusing the tick would freeze the whole mix, which is much worse
         // than one missing render.
         let placed = place(vec![PlayerState {
-            layers: vec![RenderSpec { mode: Some("radio".into()), ..RenderSpec::default() }; 9],
+            layers: vec![
+                RenderSpec {
+                    mode: Some("radio".into()),
+                    ..RenderSpec::default()
+                };
+                9
+            ],
             ..player(7)
         }])
         .unwrap();
@@ -2126,6 +2311,9 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(UPGRADE.as_bytes()).await.unwrap();
         client.write_all(&frame_bytes(0x1, b"hi")).await.unwrap();
-        assert!(server.await.unwrap().is_err(), "an unmasked frame was accepted");
+        assert!(
+            server.await.unwrap().is_err(),
+            "an unmasked frame was accepted"
+        );
     }
 }

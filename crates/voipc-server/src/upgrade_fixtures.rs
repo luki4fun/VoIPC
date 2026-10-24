@@ -31,21 +31,38 @@ fn printed_passwords(init: &str) -> Vec<(String, String)> {
 #[test]
 fn every_0_12_preset_still_loads_and_its_passwords_still_open() {
     let mut presets = 0;
-    for dir in std::fs::read_dir(fixtures().join("presets")).unwrap().flatten() {
+    for dir in std::fs::read_dir(fixtures().join("presets"))
+        .unwrap()
+        .flatten()
+    {
         let dir = dir.path();
         // A copy: loading may rewrite the file
-        let tmp = std::env::temp_dir().join(format!("voipc-preset-{}.json", hex::encode(rand::random::<[u8; 8]>())));
+        let tmp = std::env::temp_dir().join(format!(
+            "voipc-preset-{}.json",
+            hex::encode(rand::random::<[u8; 8]>())
+        ));
         std::fs::copy(dir.join("channels.json"), &tmp).unwrap();
-        let entries = load_and_prepare_channels(&tmp).unwrap_or_else(|e| panic!("{}: {e:#}", dir.display()));
+        let entries =
+            load_and_prepare_channels(&tmp).unwrap_or_else(|e| panic!("{}: {e:#}", dir.display()));
         let _ = std::fs::remove_file(&tmp);
         assert!(!entries.is_empty(), "{}", dir.display());
-        for (name, password) in printed_passwords(&std::fs::read_to_string(dir.join("init.txt")).unwrap()) {
-            let entry = entries.iter().find(|e| e.name == name).unwrap_or_else(|| panic!("{name} in {}", dir.display()));
+        for (name, password) in
+            printed_passwords(&std::fs::read_to_string(dir.join("init.txt")).unwrap())
+        {
+            let entry = entries
+                .iter()
+                .find(|e| e.name == name)
+                .unwrap_or_else(|| panic!("{name} in {}", dir.display()));
             let stored = entry.password_hash.as_deref().expect("kept as a hash");
-            assert!(verify_password(&password, stored), "{name} in {}", dir.display());
+            assert!(
+                verify_password(&password, stored),
+                "{name} in {}",
+                dir.display()
+            );
         }
         if dir.join("server_settings.json").exists() {
-            ServerSettings::load_from_file(&dir.join("server_settings.json")).unwrap_or_else(|e| panic!("{}: {e:#}", dir.display()));
+            ServerSettings::load_from_file(&dir.join("server_settings.json"))
+                .unwrap_or_else(|e| panic!("{}: {e:#}", dir.display()));
         }
         presets += 1;
     }

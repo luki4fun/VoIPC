@@ -461,16 +461,28 @@ mod tests {
         )
         .unwrap();
         assert!(!info.hidden && !info.anonymous && !info.hide_members);
-        assert!(info.screen_share, "sharing must stay on unless switched off");
+        assert!(
+            info.screen_share,
+            "sharing must stay on unless switched off"
+        );
         assert_eq!(info.proximity, ProximityMode::Off);
         assert!(!info.announce && !info.nsfw && info.slow_mode_secs == 0);
     }
 
     #[test]
     fn proximity_mode_json_names() {
-        assert_eq!(serde_json::to_string(&ProximityMode::Off).unwrap(), "\"off\"");
-        assert_eq!(serde_json::to_string(&ProximityMode::TwoD).unwrap(), "\"2d\"");
-        assert_eq!(serde_json::to_string(&ProximityMode::ThreeD).unwrap(), "\"3d\"");
+        assert_eq!(
+            serde_json::to_string(&ProximityMode::Off).unwrap(),
+            "\"off\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ProximityMode::TwoD).unwrap(),
+            "\"2d\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ProximityMode::ThreeD).unwrap(),
+            "\"3d\""
+        );
         let m: ProximityMode = serde_json::from_str("\"3d\"").unwrap();
         assert_eq!(m, ProximityMode::ThreeD);
         assert!(serde_json::from_str::<ProximityMode>("\"4d\"").is_err());

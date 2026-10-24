@@ -16,7 +16,10 @@ use crate::stores::SignalStores;
 /// Build a ProtocolAddress for a VoIPC user.
 /// We use "user_<id>" as the name and device_id = 1 (single device).
 pub fn user_address(user_id: u32) -> ProtocolAddress {
-    ProtocolAddress::new(format!("user_{}", user_id), DeviceId::new(1).expect("1 is a device id"))
+    ProtocolAddress::new(
+        format!("user_{}", user_id),
+        DeviceId::new(1).expect("1 is a device id"),
+    )
 }
 
 /// The user id back from a `user_address` name.
@@ -33,7 +36,11 @@ fn own_address(stores: &SignalStores) -> anyhow::Result<ProtocolAddress> {
 
 /// Start a session from a peer's pre-key bundle (PQXDH), using its first
 /// one-time key if the relay handed one out.
-pub async fn establish_session(stores: &mut SignalStores, remote_user_id: u32, b: &PreKeyBundleData) -> anyhow::Result<()> {
+pub async fn establish_session(
+    stores: &mut SignalStores,
+    remote_user_id: u32,
+    b: &PreKeyBundleData,
+) -> anyhow::Result<()> {
     let address = user_address(remote_user_id);
     let local = own_address(stores)?;
     let one_time = match b.prekeys.first() {
@@ -41,7 +48,10 @@ pub async fn establish_session(stores: &mut SignalStores, remote_user_id: u32, b
         None => None,
     };
     // The relay picks the device id; one it made up is an error, not a panic
-    let device_id = u8::try_from(b.device_id).ok().and_then(|d| DeviceId::new(d).ok()).context("invalid device id in bundle")?;
+    let device_id = u8::try_from(b.device_id)
+        .ok()
+        .and_then(|d| DeviceId::new(d).ok())
+        .context("invalid device id in bundle")?;
     let bundle = PreKeyBundle::new(
         b.registration_id,
         device_id,
@@ -54,7 +64,16 @@ pub async fn establish_session(stores: &mut SignalStores, remote_user_id: u32, b
         b.kyber_prekey_signature.clone(),
         IdentityKey::decode(&b.identity_key)?,
     )?;
-    process_prekey_bundle(&address, &local, &mut stores.session, &mut stores.identity, &bundle, crate::time::now(), &mut crate::rng()).await?;
+    process_prekey_bundle(
+        &address,
+        &local,
+        &mut stores.session,
+        &mut stores.identity,
+        &bundle,
+        crate::time::now(),
+        &mut crate::rng(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -146,7 +165,10 @@ mod tests {
 
     /// In-memory stores are ready on the first poll (as in group.rs).
     fn ready<T>(fut: impl Future<Output = T>) -> T {
-        match Box::pin(fut).as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        match Box::pin(fut)
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
             Poll::Ready(v) => v,
             Poll::Pending => panic!("in-memory stores never pend"),
         }
@@ -158,7 +180,10 @@ mod tests {
     #[test]
     fn a_replayed_session_start_on_the_last_resort_key_is_refused() {
         let (alice, bob) = (1u32, 2u32);
-        let (alice_key, bob_key) = (crate::generate_identity_key_pair(), crate::generate_identity_key_pair());
+        let (alice_key, bob_key) = (
+            crate::generate_identity_key_pair(),
+            crate::generate_identity_key_pair(),
+        );
         let mut a = SignalStores::new(&alice_key, 1001);
         let mut b = SignalStores::new(&bob_key, 1002);
         (a.own_user_id, b.own_user_id) = (alice, bob);
@@ -169,9 +194,14 @@ mod tests {
 
         let (ct, kind) = ready(encrypt_message(&mut a, bob, b"hi")).unwrap();
         assert_eq!(kind, 1, "a PreKey message");
-        assert_eq!(ready(decrypt_message(&mut b, alice, &ct, kind)).unwrap(), b"hi");
+        assert_eq!(
+            ready(decrypt_message(&mut b, alice, &ct, kind)).unwrap(),
+            b"hi"
+        );
         b.session.sessions.clear();
-        let err = ready(decrypt_message(&mut b, alice, &ct, kind)).unwrap_err().to_string();
+        let err = ready(decrypt_message(&mut b, alice, &ct, kind))
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("reused base key"), "{err}");
     }
 
@@ -181,7 +211,10 @@ mod tests {
     #[test]
     fn a_session_the_peer_opens_is_handed_to_the_pin_check() {
         let (alice, bob) = (1u32, 2u32);
-        let (alice_key, bob_key) = (crate::generate_identity_key_pair(), crate::generate_identity_key_pair());
+        let (alice_key, bob_key) = (
+            crate::generate_identity_key_pair(),
+            crate::generate_identity_key_pair(),
+        );
         let mut a = SignalStores::new(&alice_key, 1001);
         let mut b = SignalStores::new(&bob_key, 1002);
         (a.own_user_id, b.own_user_id) = (alice, bob);
@@ -189,13 +222,28 @@ mod tests {
         let bundle = crate::prekey::bundle(&b).unwrap();
         ready(establish_session(&mut a, bob, &bundle)).unwrap();
         let seen = a.identity.take_seen();
-        assert_eq!(seen, vec![(bob, bob_key.public_key().serialize().to_vec())], "the bundle's identity, for the outgoing check");
+        assert_eq!(
+            seen,
+            vec![(bob, bob_key.public_key().serialize().to_vec())],
+            "the bundle's identity, for the outgoing check"
+        );
         assert!(a.identity.take_seen().is_empty(), "handed over once");
 
         let (ct, kind) = ready(encrypt_message(&mut a, bob, b"hi")).unwrap();
         assert!(b.identity.take_seen().is_empty());
-        assert_eq!(ready(decrypt_message(&mut b, alice, &ct, kind)).unwrap(), b"hi");
-        assert_eq!(b.identity.take_seen(), vec![(alice, alice_key.public_key().serialize().to_vec())], "the session alice opened");
-        assert_eq!(b.identity.identity_of(alice), Some(&alice_key.public_key().serialize()[..]), "the key that session runs on");
+        assert_eq!(
+            ready(decrypt_message(&mut b, alice, &ct, kind)).unwrap(),
+            b"hi"
+        );
+        assert_eq!(
+            b.identity.take_seen(),
+            vec![(alice, alice_key.public_key().serialize().to_vec())],
+            "the session alice opened"
+        );
+        assert_eq!(
+            b.identity.identity_of(alice),
+            Some(&alice_key.public_key().serialize()[..]),
+            "the key that session runs on"
+        );
     }
 }

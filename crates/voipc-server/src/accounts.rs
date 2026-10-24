@@ -22,22 +22,32 @@ use dashmap::DashMap;
 use l4f_accounts::keys::Keys;
 use l4f_accounts::model::{AccountId, SessionInfo, User};
 use l4f_accounts::scope::ScopeDef;
-use l4f_accounts::service::{Accounts, Config, Ctx, Host, InviteForm, LoginStep, NewSession, RegisterForm};
+use l4f_accounts::service::{
+    Accounts, Config, Ctx, Host, InviteForm, LoginStep, NewSession, RegisterForm,
+};
 use l4f_accounts::store::{PutBlob, PutLimited, Store, StoreConn};
 use l4f_accounts::{pow, scope, util, IpMode};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{info, warn};
 use voipc_protocol::codec::{decode_client_msg, encode_server_msg};
-use voipc_protocol::messages::{AccountReply, AccountRequest, AuthContinue, AuthStep, ClientMessage, ServerMessage};
-use voipc_protocol::types::{AccountInfo, AccountStart, PowChallenge, PreKeyBundleData, Registration, RelayAccounts, VaultBlob};
+use voipc_protocol::messages::{
+    AccountReply, AccountRequest, AuthContinue, AuthStep, ClientMessage, ServerMessage,
+};
+use voipc_protocol::types::{
+    AccountInfo, AccountStart, PowChallenge, PreKeyBundleData, Registration, RelayAccounts,
+    VaultBlob,
+};
 
 use crate::config::{AccountsConfig, AccountsMode, RegistrationMode};
 use crate::state::ServerState;
 
 /// Kick, ban, and every channel's settings.
 pub const MODERATE: &str = "voipc:moderate";
-const APP_SCOPES: &[ScopeDef] = &[ScopeDef { name: MODERATE, description: "Kick, ban and change any channel's settings" }];
+const APP_SCOPES: &[ScopeDef] = &[ScopeDef {
+    name: MODERATE,
+    description: "Kick, ban and change any channel's settings",
+}];
 
 /// The vault's blobs, in l4f's storage under this namespace.
 const VAULT_NS: &str = "voipc";
@@ -109,11 +119,19 @@ impl Host for RelayHost {
 
     async fn export(&self, user: AccountId) -> Vec<(String, serde_json::Value)> {
         let identity = identity_of(&self.store, user).await.ok().flatten();
-        vec![("identity_key".into(), serde_json::json!(identity.map(hex::encode)))]
+        vec![(
+            "identity_key".into(),
+            serde_json::json!(identity.map(hex::encode)),
+        )]
     }
 
     /// The relay's rows go with the account through their foreign keys.
-    async fn delete_user(&self, _tx: StoreConn<'_>, _user: AccountId, _delete_owned: bool) -> sqlx::Result<()> {
+    async fn delete_user(
+        &self,
+        _tx: StoreConn<'_>,
+        _user: AccountId,
+        _delete_owned: bool,
+    ) -> sqlx::Result<()> {
         Ok(())
     }
 }
@@ -168,7 +186,9 @@ impl Relay {
         owner_only_sqlite(&cfg.database);
         // Migrated first: whether this database was made with a key decides
         // whether a key file that is not there may be made anew.
-        l4f_accounts::migrate::run(&store).await.context("account migrations")?;
+        l4f_accounts::migrate::run(&store)
+            .await
+            .context("account migrations")?;
         migrate_relay(&store).await.context("relay migrations")?;
         let made_with_key = db!(&store, pool => {
             sqlx::query_scalar::<_, Vec<u8>>("SELECT v FROM voipc_meta WHERE k = 'key_check'").fetch_optional(pool).await?
@@ -179,7 +199,9 @@ impl Relay {
     }
 
     pub async fn open_with(cfg: &AccountsConfig, store: Store, master: &[u8]) -> Result<Relay> {
-        l4f_accounts::migrate::run(&store).await.context("account migrations")?;
+        l4f_accounts::migrate::run(&store)
+            .await
+            .context("account migrations")?;
         migrate_relay(&store).await.context("relay migrations")?;
         let relay_id = relay_id(&store).await?;
         let keys = Keys::new(master, None).map_err(|e| anyhow!("accounts master key: {e:?}"))?;
@@ -187,8 +209,20 @@ impl Relay {
         let pow_key = keys.subkey("voipc-pow").to_vec();
         let ban_key = keys.subkey("voipc-ban").to_vec();
         let ip_salt = keys.subkey("voipc-ip").to_vec();
-        let host = RelayHost { cfg: Arc::new(l4f_config(cfg, relay_id)), store: store.clone() };
-        let accounts = Accounts::build(store.clone(), keys, Arc::default(), host, APP_SCOPES, Some(pow_key.clone()), ip_salt).await?;
+        let host = RelayHost {
+            cfg: Arc::new(l4f_config(cfg, relay_id)),
+            store: store.clone(),
+        };
+        let accounts = Accounts::build(
+            store.clone(),
+            keys,
+            Arc::default(),
+            host,
+            APP_SCOPES,
+            Some(pow_key.clone()),
+            ip_salt,
+        )
+        .await?;
         ensure_moderator(&store).await?;
         Ok(Relay {
             accounts,
@@ -222,7 +256,11 @@ impl Relay {
             *n += 1;
         }
         // From here on, dropping the slot gives the address's share back.
-        let mut slot = PendingSlot { _permit: None, by_address: self.pending_by_address.clone(), key };
+        let mut slot = PendingSlot {
+            _permit: None,
+            by_address: self.pending_by_address.clone(),
+            key,
+        };
         slot._permit = Some(self.pending.clone().try_acquire_owned().ok()?);
         Some(slot)
     }
@@ -241,12 +279,18 @@ impl Relay {
     }
 
     pub fn ctx(&self, ip: IpAddr, app_version: &str) -> Ctx {
-        Ctx { ip, ua: format!("VoIPC {app_version}"), sec_fetch_site: String::new() }
+        Ctx {
+            ip,
+            ua: format!("VoIPC {app_version}"),
+            sec_fetch_site: String::new(),
+        }
     }
 
     /// Whether a guest's name (without its #tag) is an account's here.
     pub async fn is_account_name(&self, name: &str) -> Result<bool> {
-        let Ok(name) = scope::normalize_username(name, &[]) else { return Ok(false) };
+        let Ok(name) = scope::normalize_username(name, &[]) else {
+            return Ok(false);
+        };
         Ok(self.store().user_by_username(&name).await?.is_some())
     }
 
@@ -256,12 +300,22 @@ impl Relay {
             .blobs(user, VAULT_NS)
             .await?
             .into_iter()
-            .map(|b| VaultBlob { k: b.k, v: b.v, version: b.version })
+            .map(|b| VaultBlob {
+                k: b.k,
+                v: b.v,
+                version: b.version,
+            })
             .collect())
     }
 
     /// One vault item, compare-and-set on `expect` (0 = new).
-    pub async fn vault_put(&self, user: AccountId, k: &str, v: &[u8], expect: i64) -> Result<AccountReply> {
+    pub async fn vault_put(
+        &self,
+        user: AccountId,
+        k: &str,
+        v: &[u8],
+        expect: i64,
+    ) -> Result<AccountReply> {
         if let Err(reason) = vault_item_ok(k, v) {
             return Ok(refused("VaultPut", reason));
         }
@@ -269,20 +323,54 @@ impl Relay {
         // once, at sign-up; no client writes them after that. Refused, so a
         // session somebody else got hold of cannot lock the owner out.
         if k.starts_with("slot.") || k == "item.identity" {
-            return Ok(refused("VaultPut", "That part of the vault is only written when the account is made."));
+            return Ok(refused(
+                "VaultPut",
+                "That part of the vault is only written when the account is made.",
+            ));
         }
         // The count and the size are checked inside the write's transaction, so
         // two writes at once cannot both pass. The vault is all an account
         // keeps in l4f's storage, so its total is the quota there.
         let quota = self.quota.min(VAULT_TOTAL_BYTES as i64);
-        Ok(match self.store().put_blob_limited(user, VAULT_NS, k, v, expect, quota, Some(VAULT_MAX_ITEMS), false).await? {
-            PutLimited::Put(PutBlob::Done(version)) => AccountReply::VaultStored { k: k.to_string(), version },
-            PutLimited::Put(PutBlob::Conflict) => {
-                let blob = self.store().blob(user, VAULT_NS, k).await?.map(|b| VaultBlob { k: b.k, v: b.v, version: b.version });
-                AccountReply::VaultConflict { k: k.to_string(), blob }
-            }
-            PutLimited::Put(PutBlob::Quota) | PutLimited::Full | PutLimited::SyncOff => refused("VaultPut", "The vault is full."),
-        })
+        Ok(
+            match self
+                .store()
+                .put_blob_limited(
+                    user,
+                    VAULT_NS,
+                    k,
+                    v,
+                    expect,
+                    quota,
+                    Some(VAULT_MAX_ITEMS),
+                    false,
+                )
+                .await?
+            {
+                PutLimited::Put(PutBlob::Done(version)) => AccountReply::VaultStored {
+                    k: k.to_string(),
+                    version,
+                },
+                PutLimited::Put(PutBlob::Conflict) => {
+                    let blob = self
+                        .store()
+                        .blob(user, VAULT_NS, k)
+                        .await?
+                        .map(|b| VaultBlob {
+                            k: b.k,
+                            v: b.v,
+                            version: b.version,
+                        });
+                    AccountReply::VaultConflict {
+                        k: k.to_string(),
+                        blob,
+                    }
+                }
+                PutLimited::Put(PutBlob::Quota) | PutLimited::Full | PutLimited::SyncOff => {
+                    refused("VaultPut", "The vault is full.")
+                }
+            },
+        )
     }
 
     pub async fn identity(&self, user: AccountId) -> Result<Option<Vec<u8>>> {
@@ -358,7 +446,12 @@ async fn check_key(store: &Store, keys: &Keys) -> Result<()> {
 /// A SQLite database file readable by this user only: it holds the secret
 /// hashes, the sealed two-factor secrets and the audit log.
 fn owner_only_sqlite(url: &str) {
-    let Some(path) = url.strip_prefix("sqlite://").or_else(|| url.strip_prefix("sqlite:")) else { return };
+    let Some(path) = url
+        .strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+    else {
+        return;
+    };
     let path = path.split('?').next().unwrap_or(path);
     if let Err(e) = crate::fsutil::owner_only(std::path::Path::new(path)) {
         warn!("could not make {path} readable by this user only: {e}");
@@ -372,7 +465,8 @@ async fn relay_id(store: &Store) -> Result<[u8; 16]> {
         sqlx::query("INSERT INTO voipc_meta (k, v) VALUES ('relay_id', $1) ON CONFLICT DO NOTHING").bind(&fresh[..]).execute(pool).await?;
         sqlx::query_scalar("SELECT v FROM voipc_meta WHERE k = 'relay_id'").fetch_one(pool).await?
     });
-    v.try_into().map_err(|_| anyhow!("voipc_meta.relay_id is not 16 bytes"))
+    v.try_into()
+        .map_err(|_| anyhow!("voipc_meta.relay_id is not 16 bytes"))
 }
 
 async fn ensure_moderator(store: &Store) -> Result<()> {
@@ -381,7 +475,14 @@ async fn ensure_moderator(store: &Store) -> Result<()> {
     }
     // None: another boot made it first. The scope comes in the same
     // transaction, so a crash never leaves a moderator role that grants nothing.
-    store.create_role_with_scopes("moderator", "Kick, ban and change any channel's settings", Some("mod"), &[MODERATE.to_string()]).await?;
+    store
+        .create_role_with_scopes(
+            "moderator",
+            "Kick, ban and change any channel's settings",
+            Some("mod"),
+            &[MODERATE.to_string()],
+        )
+        .await?;
     Ok(())
 }
 
@@ -411,7 +512,12 @@ fn l4f_config(cfg: &AccountsConfig, relay_id: [u8; 16]) -> Config {
         // that together. The per-account cap still stops guessing at one name.
         login_per_15min: 30,
         login_per_15min_global: 1000,
-        reserved_usernames: vec!["voipc".into(), "guest".into(), "moderator".into(), "general".into()],
+        reserved_usernames: vec![
+            "voipc".into(),
+            "guest".into(),
+            "moderator".into(),
+            "general".into(),
+        ],
         storage_quota_bytes: i64::from(cfg.quota_mb) * 1024 * 1024,
         totp_issuer: "VoIPC".into(),
         // Device keys sign for this origin; it names the relay, not its address.
@@ -428,7 +534,10 @@ fn l4f_config(cfg: &AccountsConfig, relay_id: [u8; 16]) -> Config {
 fn master_key(path: &str, made_with_key: bool) -> Result<Vec<u8>> {
     if let Ok(k) = std::env::var("VOIPC_ACCOUNTS_KEY") {
         if k.len() < l4f_accounts::keys::MIN_MASTER_LEN {
-            bail!("VOIPC_ACCOUNTS_KEY needs at least {} characters", l4f_accounts::keys::MIN_MASTER_LEN);
+            bail!(
+                "VOIPC_ACCOUNTS_KEY needs at least {} characters",
+                l4f_accounts::keys::MIN_MASTER_LEN
+            );
         }
         return Ok(k.into_bytes());
     }
@@ -474,7 +583,11 @@ fn redact(url: &str) -> String {
 }
 
 fn vault_item_ok(k: &str, v: &[u8]) -> Result<(), &'static str> {
-    if !(1..=64).contains(&k.len()) || !k.bytes().all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-')) {
+    if !(1..=64).contains(&k.len())
+        || !k
+            .bytes()
+            .all(|b| matches!(b, b'a'..=b'z' | b'0'..=b'9' | b'.' | b'_' | b'-'))
+    {
         return Err("A vault item's name is 1 to 64 characters of a-z, 0-9, '.', '_' and '-'.");
     }
     if v.len() > VAULT_MAX_BYTES {
@@ -484,7 +597,10 @@ fn vault_item_ok(k: &str, v: &[u8]) -> Result<(), &'static str> {
 }
 
 fn refused(request: &str, reason: &str) -> AccountReply {
-    AccountReply::Error { request: request.into(), reason: reason.into() }
+    AccountReply::Error {
+        request: request.into(),
+        reason: reason.into(),
+    }
 }
 
 /// The derived secret as l4f's password field: base64url, 43 characters.
@@ -509,7 +625,9 @@ pub struct SignedIn {
 }
 
 async fn send<S: AsyncWrite + Unpin>(stream: &mut S, msg: &ServerMessage) -> Result<(), String> {
-    crate::tcp::write_msg(stream, msg).await.map_err(|_| "connection lost during sign-in".to_string())
+    crate::tcp::write_msg(stream, msg)
+        .await
+        .map_err(|_| "connection lost during sign-in".to_string())
 }
 
 async fn step<S: AsyncWrite + Unpin>(stream: &mut S, s: AuthStep) -> Result<(), String> {
@@ -517,16 +635,23 @@ async fn step<S: AsyncWrite + Unpin>(stream: &mut S, s: AuthStep) -> Result<(), 
 }
 
 /// The client's next sign-in answer, within `wait`.
-async fn next<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut BytesMut, wait: Duration, answers: &mut u32) -> Result<AuthContinue, String> {
+async fn next<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    buf: &mut BytesMut,
+    wait: Duration,
+    answers: &mut u32,
+) -> Result<AuthContinue, String> {
     *answers += 1;
     if *answers > MAX_CONTINUES {
         return Err("Too many sign-in attempts on one connection.".into());
     }
-    let payload = crate::tcp::read_frame(stream, buf, wait).await.map_err(|e| match e {
-        crate::tcp::NoFrame::TimedOut => "Sign-in timed out.".to_string(),
-        crate::tcp::NoFrame::Malformed => "malformed frame".to_string(),
-        crate::tcp::NoFrame::Closed => "connection closed during sign-in".to_string(),
-    })?;
+    let payload = crate::tcp::read_frame(stream, buf, wait)
+        .await
+        .map_err(|e| match e {
+            crate::tcp::NoFrame::TimedOut => "Sign-in timed out.".to_string(),
+            crate::tcp::NoFrame::Malformed => "malformed frame".to_string(),
+            crate::tcp::NoFrame::Closed => "connection closed during sign-in".to_string(),
+        })?;
     match decode_client_msg(&payload) {
         Ok(ClientMessage::AuthContinue(c)) => Ok(c),
         _ => Err("unexpected message during sign-in".into()),
@@ -557,8 +682,17 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
     let work = || relay.pending_slot(ip).ok_or_else(|| BUSY.to_string());
     let session: NewSession = match start {
         AccountStart::Login => {
-            step(stream, AuthStep::Salt { relay_id: relay.relay_id, pow: None }).await?;
-            let AuthContinue::Secret { auth_secret } = next(stream, buf, STEP_WAIT, &mut answers).await? else {
+            step(
+                stream,
+                AuthStep::Salt {
+                    relay_id: relay.relay_id,
+                    pow: None,
+                },
+            )
+            .await?;
+            let AuthContinue::Secret { auth_secret } =
+                next(stream, buf, STEP_WAIT, &mut answers).await?
+            else {
                 return Err(unexpected());
             };
             let pw = secret_text(&auth_secret)?;
@@ -568,7 +702,9 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             };
             match login {
                 Ok(LoginStep::Done(s)) => s,
-                Ok(LoginStep::NeedMfa(pending)) => second_factor(relay, stream, buf, &ctx, pending, &mut answers, ip).await?,
+                Ok(LoginStep::NeedMfa(pending)) => {
+                    second_factor(relay, stream, buf, &ctx, pending, &mut answers, ip).await?
+                }
                 Err(e) => return Err(e.message().into()),
             }
         }
@@ -577,8 +713,17 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             // connection, even after a restart, carries the wrong nonce.
             let nonce: [u8; 16] = rand::random();
             let challenge = relay.accounts.devkey_challenge(None, &nonce);
-            step(stream, AuthStep::DeviceChallenge { relay_id: relay.relay_id, challenge: challenge.clone() }).await?;
-            let AuthContinue::DeviceSig { signature } = next(stream, buf, STEP_WAIT, &mut answers).await? else {
+            step(
+                stream,
+                AuthStep::DeviceChallenge {
+                    relay_id: relay.relay_id,
+                    challenge: challenge.clone(),
+                },
+            )
+            .await?;
+            let AuthContinue::DeviceSig { signature } =
+                next(stream, buf, STEP_WAIT, &mut answers).await?
+            else {
                 return Err(unexpected());
             };
             let _work = work()?;
@@ -588,7 +733,9 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                 .await
                 .map_err(|e| e.message().to_string())?
         }
-        AccountStart::Reset => return reset(state, relay, stream, buf, name, &ctx, ip, &mut answers).await,
+        AccountStart::Reset => {
+            return reset(state, relay, stream, buf, name, &ctx, ip, &mut answers).await
+        }
         AccountStart::Register { invite } => {
             let invite = invite.filter(|c| !c.trim().is_empty());
             if invite.is_none() && relay.registration != RegistrationMode::Open {
@@ -596,7 +743,11 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             }
             let pow = if invite.is_none() {
                 let cfg = relay.accounts.host.config();
-                let ch = pow::issue(&relay.pow_key, cfg.signup.pow_maxnumber, cfg.signup.pow_ttl_minutes.saturating_mul(60));
+                let ch = pow::issue(
+                    &relay.pow_key,
+                    cfg.signup.pow_maxnumber,
+                    cfg.signup.pow_ttl_minutes.saturating_mul(60),
+                );
                 Some(PowChallenge {
                     altcha: serde_json::to_string(&ch).map_err(|e| e.to_string())?,
                     ts: pow::stamp(&relay.pow_key, util::now_secs()),
@@ -604,11 +755,26 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             } else {
                 None
             };
-            step(stream, AuthStep::Salt { relay_id: relay.relay_id, pow }).await?;
-            let AuthContinue::Register { auth_secret, altcha, ts, vault } = next(stream, buf, REGISTER_WAIT, &mut answers).await? else {
+            step(
+                stream,
+                AuthStep::Salt {
+                    relay_id: relay.relay_id,
+                    pow,
+                },
+            )
+            .await?;
+            let AuthContinue::Register {
+                auth_secret,
+                altcha,
+                ts,
+                vault,
+            } = next(stream, buf, REGISTER_WAIT, &mut answers).await?
+            else {
                 return Err(unexpected());
             };
-            if vault.len() as i64 > VAULT_MAX_ITEMS || vault.iter().map(|b| b.v.len()).sum::<usize>() > VAULT_TOTAL_BYTES {
+            if vault.len() as i64 > VAULT_MAX_ITEMS
+                || vault.iter().map(|b| b.v.len()).sum::<usize>() > VAULT_TOTAL_BYTES
+            {
                 return Err("The new vault is too big.".into());
             }
             if let Some(reason) = vault.iter().find_map(|b| vault_item_ok(&b.k, &b.v).err()) {
@@ -618,7 +784,13 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             let _work = work()?;
             let s = match &invite {
                 Some(code) => {
-                    let form = InviteForm { code, username: name, password: &pw, email: None, display_name: None };
+                    let form = InviteForm {
+                        code,
+                        username: name,
+                        password: &pw,
+                        email: None,
+                        display_name: None,
+                    };
                     relay.accounts.register_invite(&ctx, form).await
                 }
                 None => {
@@ -627,8 +799,18 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                     if altcha.is_empty() {
                         return Err("The sign-up puzzle was not solved.".into());
                     }
-                    let proof = pow::Proof { altcha: &altcha, ts: &ts, ..Default::default() };
-                    let form = RegisterForm { username: name, password: &pw, email: None, display_name: None, proof };
+                    let proof = pow::Proof {
+                        altcha: &altcha,
+                        ts: &ts,
+                        ..Default::default()
+                    };
+                    let form = RegisterForm {
+                        username: name,
+                        password: &pw,
+                        email: None,
+                        display_name: None,
+                        proof,
+                    };
                     relay.accounts.register(&ctx, form).await
                 }
             }
@@ -638,7 +820,11 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
                 // too: an account without its vault cannot be opened on
                 // another device, nor on this one after a reinstall
                 // (1.0 audit H1-06)
-                match relay.store().put_blob(s.info.user_id, VAULT_NS, &b.k, &b.v, 0, relay.quota).await {
+                match relay
+                    .store()
+                    .put_blob(s.info.user_id, VAULT_NS, &b.k, &b.v, 0, relay.quota)
+                    .await
+                {
                     Ok(l4f_accounts::store::PutBlob::Done(_)) => {}
                     other => {
                         let _ = relay.accounts.logout(&s.token).await;
@@ -652,7 +838,17 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
         }
     };
     let token = session.token.clone();
-    let r = finish(relay, stream, buf, name, session, registered, &mut answers, ip).await;
+    let r = finish(
+        relay,
+        stream,
+        buf,
+        name,
+        session,
+        registered,
+        &mut answers,
+        ip,
+    )
+    .await;
     if r.is_err() {
         let _ = relay.accounts.logout(&token).await;
     }
@@ -686,24 +882,61 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
     }
     let (user, identity, vault) = {
         let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
-        let Ok(clean) = scope::normalize_username(name, &[]) else { return Err("No account of that name.".into()) };
-        let user = relay.store().user_by_username(&clean).await.map_err(|_| gone())?.ok_or("No account of that name.")?;
-        let identity = relay.identity(user.id).await.map_err(|_| gone())?.ok_or("This account cannot be reset.")?;
+        let Ok(clean) = scope::normalize_username(name, &[]) else {
+            return Err("No account of that name.".into());
+        };
+        let user = relay
+            .store()
+            .user_by_username(&clean)
+            .await
+            .map_err(|_| gone())?
+            .ok_or("No account of that name.")?;
+        let identity = relay
+            .identity(user.id)
+            .await
+            .map_err(|_| gone())?
+            .ok_or("This account cannot be reset.")?;
         let vault = relay.vault(user.id).await.map_err(|_| gone())?;
         (user, identity, vault)
     };
     // Never the password slot: with it anyone could guess the password offline
-    let blobs: Vec<VaultBlob> = vault.iter().filter(|b| b.k == "slot.recovery" || b.k == "item.identity").cloned().collect();
+    let blobs: Vec<VaultBlob> = vault
+        .iter()
+        .filter(|b| b.k == "slot.recovery" || b.k == "item.identity")
+        .cloned()
+        .collect();
     if !blobs.iter().any(|b| b.k == "slot.recovery") {
         return Err("This account has no recovery key.".into());
     }
     let challenge: [u8; 32] = rand::random();
     let second_factor = l4f_accounts::service::has_second_factor(&user);
-    step(stream, AuthStep::ResetChallenge { relay_id: relay.relay_id, challenge: challenge.to_vec(), blobs, second_factor }).await?;
-    let AuthContinue::Reset { signature, auth_secret, pass_slot, totp, recovery_code } = next(stream, buf, TOTP_WAIT, answers).await? else {
+    step(
+        stream,
+        AuthStep::ResetChallenge {
+            relay_id: relay.relay_id,
+            challenge: challenge.to_vec(),
+            blobs,
+            second_factor,
+        },
+    )
+    .await?;
+    let AuthContinue::Reset {
+        signature,
+        auth_secret,
+        pass_slot,
+        totp,
+        recovery_code,
+    } = next(stream, buf, TOTP_WAIT, answers).await?
+    else {
         return Err(unexpected());
     };
-    if !voipc_crypto::account::reset_proof_ok(&identity, &relay.relay_id, &user.username, &challenge, &signature) {
+    if !voipc_crypto::account::reset_proof_ok(
+        &identity,
+        &relay.relay_id,
+        &user.username,
+        &challenge,
+        &signature,
+    ) {
         return Err("That recovery key is not this account's.".into());
     }
     if pass_slot.len() != SLOT_LEN {
@@ -715,11 +948,23 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
         let factor = match (&totp, &recovery_code) {
             (Some(code), _) => l4f_accounts::service::SecondFactor::Totp(code),
             (None, Some(code)) => l4f_accounts::service::SecondFactor::Recovery(code),
-            (None, None) => return Err("This account needs a code from the authenticator app, or a recovery code.".into()),
+            (None, None) => {
+                return Err(
+                    "This account needs a code from the authenticator app, or a recovery code."
+                        .into(),
+                )
+            }
         };
-        relay.accounts.second_factor_check(ctx, &user, factor).await.map_err(|e| e.message().to_string())?;
+        relay
+            .accounts
+            .second_factor_check(ctx, &user, factor)
+            .await
+            .map_err(|e| e.message().to_string())?;
     }
-    replace_pass_slot(relay, user.id, &vault, &pass_slot, || relay.accounts.password_set_as_host(ctx, user.id, &pw)).await?;
+    replace_pass_slot(relay, user.id, &vault, &pass_slot, || {
+        relay.accounts.password_set_as_host(ctx, user.id, &pw)
+    })
+    .await?;
     info!(user = %user.id.hex(), "account password reset with the recovery key");
     sign_out_account(state, user.id).await;
     step(stream, AuthStep::ResetDone).await?;
@@ -730,20 +975,40 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
 /// (compare-and-set), then `change`; the old slot goes back if `change`
 /// fails, so the vault keeps opening with whichever password signs in. (A
 /// crash between the two is left to the recovery key.)
-pub(crate) async fn replace_pass_slot<F, Fut>(relay: &Relay, user: AccountId, vault: &[VaultBlob], slot: &[u8], change: F) -> Result<(), String>
+pub(crate) async fn replace_pass_slot<F, Fut>(
+    relay: &Relay,
+    user: AccountId,
+    vault: &[VaultBlob],
+    slot: &[u8],
+    change: F,
+) -> Result<(), String>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = std::result::Result<(), l4f_accounts::service::Error>>,
 {
     let gone = || "Something went wrong. Please try again.".to_string();
     let old = vault.iter().find(|b| b.k == "slot.pass");
-    let written = match relay.store().put_blob(user, VAULT_NS, "slot.pass", slot, old.map_or(0, |b| b.version), relay.quota).await {
+    let written = match relay
+        .store()
+        .put_blob(
+            user,
+            VAULT_NS,
+            "slot.pass",
+            slot,
+            old.map_or(0, |b| b.version),
+            relay.quota,
+        )
+        .await
+    {
         Ok(PutBlob::Done(v)) => v,
         _ => return Err(gone()),
     };
     if let Err(e) = change().await {
         if let Some(old) = old {
-            let _ = relay.store().put_blob(user, VAULT_NS, "slot.pass", &old.v, written, relay.quota).await;
+            let _ = relay
+                .store()
+                .put_blob(user, VAULT_NS, "slot.pass", &old.v, written, relay.quota)
+                .await;
         }
         return Err(e.message().to_string());
     }
@@ -768,8 +1033,17 @@ async fn second_factor<S: AsyncRead + AsyncWrite + Unpin>(
             let answer = next(stream, buf, TOTP_WAIT, answers).await?;
             let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
             let r = match answer {
-                AuthContinue::Totp { code } => relay.accounts.mfa_totp(ctx, &user, &pending.info, &code).await,
-                AuthContinue::Recovery { code } => relay.accounts.mfa_recovery(ctx, &user, &pending.info, &code).await.map(|(s, _)| s),
+                AuthContinue::Totp { code } => {
+                    relay
+                        .accounts
+                        .mfa_totp(ctx, &user, &pending.info, &code)
+                        .await
+                }
+                AuthContinue::Recovery { code } => relay
+                    .accounts
+                    .mfa_recovery(ctx, &user, &pending.info, &code)
+                    .await
+                    .map(|(s, _)| s),
                 _ => return Err(unexpected()),
             };
             match r {
@@ -802,8 +1076,17 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
     let work = || relay.pending_slot(ip).ok_or_else(|| BUSY.to_string());
     let (user, info, scopes, blobs) = {
         let _work = work()?;
-        let (user, info, scopes) = relay.accounts.session_from_token(&session.token, util::now()).await.map_err(|_| gone())?.ok_or_else(gone)?;
-        let blobs = if registered { None } else { Some(relay.vault(user.id).await.map_err(|_| gone())?) };
+        let (user, info, scopes) = relay
+            .accounts
+            .session_from_token(&session.token, util::now())
+            .await
+            .map_err(|_| gone())?
+            .ok_or_else(gone)?;
+        let blobs = if registered {
+            None
+        } else {
+            Some(relay.vault(user.id).await.map_err(|_| gone())?)
+        };
         (user, info, scopes, blobs)
     };
     // A device key names its account itself; the name typed must be it.
@@ -813,7 +1096,12 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
     if let Some(blobs) = blobs {
         step(stream, AuthStep::Vault { blobs }).await?;
     }
-    let AuthContinue::Keys { identity_key, prekey_bundle, reset_identity } = next(stream, buf, STEP_WAIT, answers).await? else {
+    let AuthContinue::Keys {
+        identity_key,
+        prekey_bundle,
+        reset_identity,
+    } = next(stream, buf, STEP_WAIT, answers).await?
+    else {
         return Err(unexpected());
     };
     // Stored for good, so bounded here (the bundle is checked by the caller).
@@ -832,11 +1120,22 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
         Some(_) if !relay.accounts.fresh(&info, util::now()) => {
             return Err("Sign in with your password to reset your identity.".into());
         }
-        _ => relay.set_identity(user.id, &identity_key).await.map_err(|_| gone())?,
+        _ => relay
+            .set_identity(user.id, &identity_key)
+            .await
+            .map_err(|_| gone())?,
     }
     let account = relay.info_of(&user, &scopes).await.map_err(|_| gone())?;
     info!(user = %user.id.hex(), method = %info.method, "account signed in");
-    Ok(SignedIn { user, token: session.token, info, scopes, account, identity_key, prekey_bundle })
+    Ok(SignedIn {
+        user,
+        token: session.token,
+        info,
+        scopes,
+        account,
+        identity_key,
+        prekey_bundle,
+    })
 }
 
 // ── After sign-in ─────────────────────────────────────────────────────────
@@ -860,9 +1159,24 @@ async fn password_change(
     if pass_slot.len() != SLOT_LEN {
         return Err("malformed password slot".into());
     }
-    let (user, fresh) = confirm_again(state, relay, session_id, ctx, user, info, &old, (totp, recovery_code)).await?;
+    let (user, fresh) = confirm_again(
+        state,
+        relay,
+        session_id,
+        ctx,
+        user,
+        info,
+        &old,
+        (totp, recovery_code),
+    )
+    .await?;
     let vault = relay.vault(user.id).await.map_err(|e| e.to_string())?;
-    replace_pass_slot(relay, user.id, &vault, &pass_slot, || relay.accounts.password_change(ctx, &user, &fresh.info, &new)).await?;
+    replace_pass_slot(relay, user.id, &vault, &pass_slot, || {
+        relay
+            .accounts
+            .password_change(ctx, &user, &fresh.info, &new)
+    })
+    .await?;
     info!(user = %user.id.hex(), "account password changed");
     Ok(())
 }
@@ -884,13 +1198,32 @@ async fn confirm_again(
     (totp, recovery_code): (Option<String>, Option<String>),
 ) -> Result<(User, NewSession), String> {
     let msg = |e: l4f_accounts::service::Error| e.message().to_string();
-    let user = relay.store().user_by_id(user.id).await.map_err(|e| e.to_string())?.ok_or("This account is gone.")?;
+    let user = relay
+        .store()
+        .user_by_id(user.id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("This account is gone.")?;
     let fresh = if l4f_accounts::service::has_second_factor(&user) {
-        relay.accounts.confirm_password(ctx, &user, password).await.map_err(msg)?;
+        relay
+            .accounts
+            .confirm_password(ctx, &user, password)
+            .await
+            .map_err(msg)?;
         match (&totp, &recovery_code) {
             (Some(code), _) => relay.accounts.step_up_totp(ctx, &user, info, code).await,
-            (None, Some(code)) => relay.accounts.step_up_recovery(ctx, &user, info, code).await,
-            (None, None) => return Err("This account needs a code from the authenticator app, or a recovery code.".into()),
+            (None, Some(code)) => {
+                relay
+                    .accounts
+                    .step_up_recovery(ctx, &user, info, code)
+                    .await
+            }
+            (None, None) => {
+                return Err(
+                    "This account needs a code from the authenticator app, or a recovery code."
+                        .into(),
+                )
+            }
         }
     } else {
         relay.accounts.step_up(ctx, &user, info, password).await
@@ -898,7 +1231,12 @@ async fn confirm_again(
     .map_err(msg)?;
     // The step-up gave this session a new token; the old one no longer
     // resolves, so `revalidate` would end this connection
-    if let Some(a) = state.sessions.get_mut(&session_id).as_mut().and_then(|s| s.account.as_mut()) {
+    if let Some(a) = state
+        .sessions
+        .get_mut(&session_id)
+        .as_mut()
+        .and_then(|s| s.account.as_mut())
+    {
         a.token = fresh.token.clone();
         a.info = fresh.info.clone();
     }
@@ -922,13 +1260,27 @@ async fn delete_account(
     second: (Option<String>, Option<String>),
 ) -> Result<(), String> {
     let password = secret_text(secret)?;
-    let (user, _) = confirm_again(state, relay, session_id, ctx, user, info, &password, second).await?;
-    let scopes = state.sessions.get(&session_id).and_then(|s| s.account.as_ref().map(|a| a.scopes.clone())).unwrap_or_default();
-    let actor = l4f_accounts::service::Actor { user: &user, scopes: &scopes };
-    relay.accounts.delete_account(ctx, actor, user.id, false).await.map_err(|e| match e {
-        l4f_accounts::service::Error::LastAdmin => "This is the last admin account here: make another admin first.".to_string(),
-        e => e.message().to_string(),
-    })?;
+    let (user, _) =
+        confirm_again(state, relay, session_id, ctx, user, info, &password, second).await?;
+    let scopes = state
+        .sessions
+        .get(&session_id)
+        .and_then(|s| s.account.as_ref().map(|a| a.scopes.clone()))
+        .unwrap_or_default();
+    let actor = l4f_accounts::service::Actor {
+        user: &user,
+        scopes: &scopes,
+    };
+    relay
+        .accounts
+        .delete_account(ctx, actor, user.id, false)
+        .await
+        .map_err(|e| match e {
+            l4f_accounts::service::Error::LastAdmin => {
+                "This is the last admin account here: make another admin first.".to_string()
+            }
+            e => e.message().to_string(),
+        })?;
     info!(user = %user.id.hex(), "account deleted by its owner");
     Ok(())
 }
@@ -937,43 +1289,87 @@ async fn delete_account(
 /// now rather than at the next `revalidate`. (One at most: a sign-in takes
 /// an account's connection over.)
 async fn sign_out_account(state: &ServerState, user: AccountId) {
-    let ids: Vec<u32> = state.sessions.iter().filter(|e| e.value().account.as_ref().is_some_and(|a| a.user.id == user)).map(|e| *e.key()).collect();
+    let ids: Vec<u32> = state
+        .sessions
+        .iter()
+        .filter(|e| {
+            e.value()
+                .account
+                .as_ref()
+                .is_some_and(|a| a.user.id == user)
+        })
+        .map(|e| *e.key())
+        .collect();
     for id in ids {
-        crate::tcp::force_disconnect(state, id, "Your password was changed. Sign in with the new one.").await;
+        crate::tcp::force_disconnect(
+            state,
+            id,
+            "Your password was changed. Sign in with the new one.",
+        )
+        .await;
     }
 }
 
 /// `is_admin` / `is_moderator` as the scopes say.
 pub fn powers(scopes: &[String]) -> (bool, bool) {
     // `allowed` never answers for `*` (a wildcard is no requirement); `covers` does.
-    (scope::covers(scopes, &["*".to_string()]), scope::allowed(scopes, MODERATE))
+    (
+        scope::covers(scopes, &["*".to_string()]),
+        scope::allowed(scopes, MODERATE),
+    )
 }
 
 /// One `AccountRequest` from a signed-in connection.
-pub async fn handle_request(state: &ServerState, session_id: u32, req: AccountRequest, tx: &mpsc::Sender<Vec<u8>>) -> Result<()> {
+pub async fn handle_request(
+    state: &ServerState,
+    session_id: u32,
+    req: AccountRequest,
+    tx: &mpsc::Sender<Vec<u8>>,
+) -> Result<()> {
     let reply = |r: AccountReply| ServerMessage::Account(r);
     let Some(relay) = state.accounts.clone() else {
-        return crate::tcp::send_msg(tx, &reply(refused("Account", "This relay has no accounts."))).await;
+        return crate::tcp::send_msg(
+            tx,
+            &reply(refused("Account", "This relay has no accounts.")),
+        )
+        .await;
     };
-    let Some((user, info, peer_ip)) = state.sessions.get(&session_id).and_then(|s| s.account.as_ref().map(|a| (a.user.clone(), a.info.clone(), s.peer_ip)))
-    else {
-        return crate::tcp::send_msg(tx, &reply(refused("Account", "Sign in with an account first."))).await;
+    let Some((user, info, peer_ip)) = state.sessions.get(&session_id).and_then(|s| {
+        s.account
+            .as_ref()
+            .map(|a| (a.user.clone(), a.info.clone(), s.peer_ip))
+    }) else {
+        return crate::tcp::send_msg(
+            tx,
+            &reply(refused("Account", "Sign in with an account first.")),
+        )
+        .await;
     };
     // Database work, so budgeted on its own beside the 50 messages a second
     // every message shares (1.0 audit H1-03). The variant's name is what a
     // client's error handling goes by.
-    let allowed = state.sessions.get_mut(&session_id).is_some_and(|mut s| s.account_rate.try_consume());
+    let allowed = state
+        .sessions
+        .get_mut(&session_id)
+        .is_some_and(|mut s| s.account_rate.try_consume());
     if !allowed {
         let name = format!("{req:?}");
         let name = name.split([' ', '{', '(']).next().unwrap_or("Account");
-        return crate::tcp::send_msg(tx, &reply(refused(name, "Too many requests at once; slow down."))).await;
+        return crate::tcp::send_msg(
+            tx,
+            &reply(refused(name, "Too many requests at once; slow down.")),
+        )
+        .await;
     }
     let ctx = relay.ctx(peer_ip, voipc_protocol::codec::APP_VERSION);
     let now = util::now();
     let out = match req {
         AccountRequest::DeviceChallenge => {
             if !relay.accounts.fresh(&info, now) {
-                refused("DeviceChallenge", "Sign in with your password again to remember this device.")
+                refused(
+                    "DeviceChallenge",
+                    "Sign in with your password again to remember this device.",
+                )
             } else if relay.accounts.needs_2fa(&user).await? {
                 refused("DeviceChallenge", "Set up two-factor codes first.")
             } else {
@@ -987,13 +1383,28 @@ pub async fn handle_request(state: &ServerState, session_id: u32, req: AccountRe
                 AccountReply::DeviceChallenge { challenge }
             }
         }
-        AccountRequest::DeviceAdd { device_id, public_key, signature } => {
-            let pending = state.sessions.get_mut(&session_id).and_then(|mut s| s.account.as_mut().and_then(|a| a.device_challenge.take()));
+        AccountRequest::DeviceAdd {
+            device_id,
+            public_key,
+            signature,
+        } => {
+            let pending = state
+                .sessions
+                .get_mut(&session_id)
+                .and_then(|mut s| s.account.as_mut().and_then(|a| a.device_challenge.take()));
             match pending {
                 None => refused("DeviceAdd", "Ask for a challenge first."),
                 Some((challenge, nonce)) => {
-                    let key = l4f_accounts::service::NewDeviceKey { device_id: &device_id, public_key: &public_key, signature: &signature };
-                    match relay.accounts.devkey_add(&ctx, &user, &challenge, &nonce, key).await {
+                    let key = l4f_accounts::service::NewDeviceKey {
+                        device_id: &device_id,
+                        public_key: &public_key,
+                        signature: &signature,
+                    };
+                    match relay
+                        .accounts
+                        .devkey_add(&ctx, &user, &challenge, &nonce, key)
+                        .await
+                    {
                         Ok(()) => AccountReply::DeviceAdded,
                         Err(e) => refused("DeviceAdd", e.message()),
                     }
@@ -1002,25 +1413,45 @@ pub async fn handle_request(state: &ServerState, session_id: u32, req: AccountRe
         }
         AccountRequest::TotpSetup => {
             let s = relay.accounts.totp_setup(&user);
-            AccountReply::TotpSetup { secret: s.secret, uri: s.uri, sealed: s.sealed }
+            AccountReply::TotpSetup {
+                secret: s.secret,
+                uri: s.uri,
+                sealed: s.sealed,
+            }
         }
         AccountRequest::TotpEnable { sealed, code } => {
             if !relay.accounts.fresh(&info, now) {
-                refused("TotpEnable", "Sign in with your password again to turn codes on.")
+                refused(
+                    "TotpEnable",
+                    "Sign in with your password again to turn codes on.",
+                )
             } else {
-                match relay.accounts.totp_enable(&ctx, &user, &info, &sealed, &code).await {
+                match relay
+                    .accounts
+                    .totp_enable(&ctx, &user, &info, &sealed, &code)
+                    .await
+                {
                     Ok((recovery_codes, rotated)) => {
                         // The account's first second factor: l4f ended its other
                         // sessions and gave this one a new token. The old one no
                         // longer resolves, so `revalidate` would end this
                         // connection.
                         if let Some(new) = rotated {
-                            if let Some(a) = state.sessions.get_mut(&session_id).as_mut().and_then(|s| s.account.as_mut()) {
+                            if let Some(a) = state
+                                .sessions
+                                .get_mut(&session_id)
+                                .as_mut()
+                                .and_then(|s| s.account.as_mut())
+                            {
                                 a.token = new.token;
                                 a.info = new.info;
                             }
                         }
-                        crate::tcp::send_msg(tx, &reply(AccountReply::TotpEnabled { recovery_codes })).await?;
+                        crate::tcp::send_msg(
+                            tx,
+                            &reply(AccountReply::TotpEnabled { recovery_codes }),
+                        )
+                        .await?;
                         refresh(state, &relay, session_id, user.id).await?;
                         return Ok(());
                     }
@@ -1028,25 +1459,62 @@ pub async fn handle_request(state: &ServerState, session_id: u32, req: AccountRe
                 }
             }
         }
-        AccountRequest::VaultPut { k, v, expect } => relay.vault_put(user.id, &k, &v, expect).await?,
+        AccountRequest::VaultPut { k, v, expect } => {
+            relay.vault_put(user.id, &k, &v, expect).await?
+        }
         AccountRequest::LogPurge { conv } => log::purge(&relay, user.id, conv.as_deref()).await?,
-        AccountRequest::DeleteAccount { secret, totp, recovery_code } => {
-            match delete_account(state, &relay, session_id, &ctx, &user, &info, &secret, (totp, recovery_code)).await {
+        AccountRequest::DeleteAccount {
+            secret,
+            totp,
+            recovery_code,
+        } => {
+            match delete_account(
+                state,
+                &relay,
+                session_id,
+                &ctx,
+                &user,
+                &info,
+                &secret,
+                (totp, recovery_code),
+            )
+            .await
+            {
                 Ok(()) => {
                     crate::tcp::send_msg(tx, &reply(AccountReply::AccountDeleted)).await?;
-                    crate::tcp::force_disconnect(state, session_id, "Your account was deleted.").await;
+                    crate::tcp::force_disconnect(state, session_id, "Your account was deleted.")
+                        .await;
                     return Ok(());
                 }
                 Err(reason) => refused("DeleteAccount", &reason),
             }
         }
-        AccountRequest::PasswordChange { old_secret, new_secret, pass_slot, totp, recovery_code } => {
-            match password_change(state, &relay, session_id, &ctx, &user, &info, (old_secret, new_secret, pass_slot), (totp, recovery_code)).await {
+        AccountRequest::PasswordChange {
+            old_secret,
+            new_secret,
+            pass_slot,
+            totp,
+            recovery_code,
+        } => {
+            match password_change(
+                state,
+                &relay,
+                session_id,
+                &ctx,
+                &user,
+                &info,
+                (old_secret, new_secret, pass_slot),
+                (totp, recovery_code),
+            )
+            .await
+            {
                 Ok(()) => AccountReply::PasswordChanged,
                 Err(reason) => refused("PasswordChange", &reason),
             }
         }
-        AccountRequest::LogKeyPublish { logkey, sig } => log::publish(&relay, user.id, &logkey, &sig).await?,
+        AccountRequest::LogKeyPublish { logkey, sig } => {
+            log::publish(&relay, user.id, &logkey, &sig).await?
+        }
         AccountRequest::LogKeys { accounts } => log::keys(&relay, &accounts).await?,
         AccountRequest::EpochPut { conv, epoch, wraps } => {
             let (out, told) = log::epoch_put(&relay, user.id, &conv, epoch, &wraps).await?;
@@ -1056,11 +1524,18 @@ pub async fn handle_request(state: &ServerState, session_id: u32, req: AccountRe
             out
         }
         AccountRequest::WrapsFetch { conv } => log::wraps(&relay, user.id, &conv).await?,
-        AccountRequest::LogAppend { conv, epoch, ct, ttl_secs } => match kept_post_ok(state, session_id, &conv).await {
+        AccountRequest::LogAppend {
+            conv,
+            epoch,
+            ct,
+            ttl_secs,
+        } => match kept_post_ok(state, session_id, &conv).await {
             Err(reason) => refused("LogAppend", &reason),
             Ok(()) => log::append(&relay, user.id, &conv, epoch, &ct, ttl_secs).await?,
         },
-        AccountRequest::LogFetch { conv, after } => log::fetch(&relay, user.id, &conv, after).await?,
+        AccountRequest::LogFetch { conv, after } => {
+            log::fetch(&relay, user.id, &conv, after).await?
+        }
         AccountRequest::LogIndex => {
             let (convs, pending) = log::index(&relay, user.id).await?;
             for p in pending {
@@ -1071,12 +1546,22 @@ pub async fn handle_request(state: &ServerState, session_id: u32, req: AccountRe
         AccountRequest::LogJoin { conv } => {
             let user_id = state.sessions.get(&session_id).map(|s| s.user_id);
             let present = match user_id {
-                Some(uid) => state.channels.read().await.values().any(|c| !c.info.log.is_empty() && c.info.log == conv && c.members.contains(&uid)),
+                Some(uid) => state.channels.read().await.values().any(|c| {
+                    !c.info.log.is_empty() && c.info.log == conv && c.members.contains(&uid)
+                }),
                 None => false,
             };
             let (out, owners) = log::join(&relay, user.id, &conv, present).await?;
             for o in owners {
-                tell(state, &o, AccountReply::LogPending { conv: conv.clone(), joiners: vec![user.id.0] }).await;
+                tell(
+                    state,
+                    &o,
+                    AccountReply::LogPending {
+                        conv: conv.clone(),
+                        joiners: vec![user.id.0],
+                    },
+                )
+                .await;
             }
             out
         }
@@ -1094,14 +1579,28 @@ async fn kept_post_ok(state: &ServerState, session_id: u32, conv: &str) -> Resul
     if !conv.starts_with("c:") {
         return Ok(());
     }
-    let user_id = state.sessions.get(&session_id).map(|s| s.user_id).ok_or("Sign in with an account first.")?;
+    let user_id = state
+        .sessions
+        .get(&session_id)
+        .map(|s| s.user_id)
+        .ok_or("Sign in with an account first.")?;
     let channel_id = {
         let channels = state.channels.read().await;
-        channels.iter().find(|(_, c)| !c.info.log.is_empty() && c.info.log == conv).map(|(id, _)| *id)
+        channels
+            .iter()
+            .find(|(_, c)| !c.info.log.is_empty() && c.info.log == conv)
+            .map(|(id, _)| *id)
     };
     // An anonymous channel, or one hiding its members, offers no log.
     let channel_id = channel_id.ok_or("That channel keeps no messages.")?;
-    state.post_rules(session_id, user_id, channel_id, crate::state::PostStamp::Kept).await
+    state
+        .post_rules(
+            session_id,
+            user_id,
+            channel_id,
+            crate::state::PostStamp::Kept,
+        )
+        .await
 }
 
 /// The account behind `session_id` leaves `channel_id`'s log: kicked from
@@ -1110,9 +1609,23 @@ async fn kept_post_ok(state: &ServerState, session_id: u32, conv: &str) -> Resul
 /// on is not for them. Moving between voice channels keeps a log; "Stop
 /// keeping this channel" (`LogLeave`) ends it there.
 pub async fn out_of_log(state: &ServerState, channel_id: u32, session_id: u32) {
-    let Some(relay) = state.accounts.as_ref() else { return };
-    let Some(account) = state.sessions.get(&session_id).and_then(|s| s.account.as_ref().map(|a| a.user.id.0)) else { return };
-    let conv = state.channels.read().await.get(&channel_id).map(|c| c.info.log.clone()).unwrap_or_default();
+    let Some(relay) = state.accounts.as_ref() else {
+        return;
+    };
+    let Some(account) = state
+        .sessions
+        .get(&session_id)
+        .and_then(|s| s.account.as_ref().map(|a| a.user.id.0))
+    else {
+        return;
+    };
+    let conv = state
+        .channels
+        .read()
+        .await
+        .get(&channel_id)
+        .map(|c| c.info.log.clone())
+        .unwrap_or_default();
     if conv.is_empty() {
         return;
     }
@@ -1127,15 +1640,28 @@ pub async fn out_of_log(state: &ServerState, channel_id: u32, session_id: u32) {
 /// stored members — nobody was there to show they know the new one — and they
 /// come back the next time they join it with the password.
 pub async fn locked_logs_at_boot(state: &ServerState) -> Result<()> {
-    let Some(relay) = state.accounts.as_ref() else { return Ok(()) };
+    let Some(relay) = state.accounts.as_ref() else {
+        return Ok(());
+    };
     let logs: Vec<(String, Option<String>)> = {
         let channels = state.channels.read().await;
-        channels.values().filter(|c| c.persistent && !c.log_conv.is_empty()).map(|c| (c.log_conv.clone(), c.password.as_ref().map(|p| p.to_string()))).collect()
+        channels
+            .values()
+            .filter(|c| c.persistent && !c.log_conv.is_empty())
+            .map(|c| {
+                (
+                    c.log_conv.clone(),
+                    c.password.as_ref().map(|p| p.to_string()),
+                )
+            })
+            .collect()
     };
     for (conv, password) in logs {
         use sha2::{Digest, Sha256};
         let k = format!("pw:{}", &hex::encode(Sha256::digest(conv.as_bytes()))[..29]);
-        let fp: Vec<u8> = password.map(|p| Sha256::digest(format!("voipc-lock/v1|{p}").as_bytes()).to_vec()).unwrap_or_default();
+        let fp: Vec<u8> = password
+            .map(|p| Sha256::digest(format!("voipc-lock/v1|{p}").as_bytes()).to_vec())
+            .unwrap_or_default();
         let was: Option<Vec<u8>> = db!(relay.store(), pool => {
             sqlx::query_scalar("SELECT v FROM voipc_meta WHERE k = $1").bind(&k).fetch_optional(pool).await?
         });
@@ -1156,11 +1682,18 @@ pub async fn locked_logs_at_boot(state: &ServerState) -> Result<()> {
 /// `channel_id` has a new password: of its log's members, only those in the
 /// channel now (who were let in) stay.
 pub async fn locked_log(state: &ServerState, channel_id: u32) {
-    let Some(relay) = state.accounts.as_ref() else { return };
+    let Some(relay) = state.accounts.as_ref() else {
+        return;
+    };
     let (conv, users) = {
         let channels = state.channels.read().await;
-        let Some(c) = channels.get(&channel_id) else { return };
-        (c.info.log.clone(), c.members.iter().copied().collect::<Vec<_>>())
+        let Some(c) = channels.get(&channel_id) else {
+            return;
+        };
+        (
+            c.info.log.clone(),
+            c.members.iter().copied().collect::<Vec<_>>(),
+        )
     };
     if conv.is_empty() {
         return;
@@ -1168,7 +1701,12 @@ pub async fn locked_log(state: &ServerState, channel_id: u32) {
     let keep: Vec<[u8; 16]> = users
         .iter()
         .filter_map(|u| state.user_to_session.get(u).map(|sid| *sid))
-        .filter_map(|sid| state.sessions.get(&sid).and_then(|s| s.account.as_ref().map(|a| a.user.id.0)))
+        .filter_map(|sid| {
+            state
+                .sessions
+                .get(&sid)
+                .and_then(|s| s.account.as_ref().map(|a| a.user.id.0))
+        })
         .collect();
     if let Err(e) = log::keep_only(relay.store(), &conv, &keep).await {
         warn!("log membership after a new password: {e}");
@@ -1187,7 +1725,10 @@ pub(crate) async fn raw(relay: &Relay, sql: &str) -> Result<i64> {
 
 /// An account reply to whichever session `account` has here, if any.
 async fn tell(state: &ServerState, account: &[u8; 16], r: AccountReply) {
-    let tx = state.account_sessions.get(account).and_then(|sid| state.sessions.get(&*sid).map(|s| s.tcp_tx.clone()));
+    let tx = state
+        .account_sessions
+        .get(account)
+        .and_then(|sid| state.sessions.get(&*sid).map(|s| s.tcp_tx.clone()));
     if let Some(tx) = tx {
         let _ = crate::tcp::send_msg(&tx, &ServerMessage::Account(r)).await;
     }
@@ -1195,8 +1736,15 @@ async fn tell(state: &ServerState, account: &[u8; 16], r: AccountReply) {
 
 /// Re-reads the account after a change (codes on, a role granted) and tells
 /// the client; an admin it became is announced to everyone as before.
-pub async fn refresh(state: &ServerState, relay: &Relay, session_id: u32, user: AccountId) -> Result<()> {
-    let Some(user) = relay.store().user_by_id(user).await? else { return Ok(()) };
+pub async fn refresh(
+    state: &ServerState,
+    relay: &Relay,
+    session_id: u32,
+    user: AccountId,
+) -> Result<()> {
+    let Some(user) = relay.store().user_by_id(user).await? else {
+        return Ok(());
+    };
     let scopes = relay.accounts.effective_scopes(&user).await?;
     apply_scopes(state, relay, session_id, user, scopes).await
 }
@@ -1206,11 +1754,18 @@ pub async fn refresh(state: &ServerState, relay: &Relay, session_id: u32, user: 
 /// role given or taken away, codes reset, the sessions ended — reaches
 /// connections already open.
 pub async fn revalidate(state: &Arc<ServerState>) {
-    let Some(relay) = state.accounts.clone() else { return };
+    let Some(relay) = state.accounts.clone() else {
+        return;
+    };
     let live: Vec<(u32, String, Vec<String>, bool)> = state
         .sessions
         .iter()
-        .filter_map(|e| e.value().account.as_ref().map(|a| (*e.key(), a.token.clone(), a.scopes.clone(), a.needs_2fa)))
+        .filter_map(|e| {
+            e.value()
+                .account
+                .as_ref()
+                .map(|a| (*e.key(), a.token.clone(), a.scopes.clone(), a.needs_2fa))
+        })
         .collect();
     for (session_id, token, scopes, needs_2fa) in live {
         match relay.accounts.session_from_token(&token, util::now()).await {
@@ -1218,15 +1773,28 @@ pub async fn revalidate(state: &Arc<ServerState>) {
                 // The token may have been rotated while this pass ran (turning
                 // codes on does that): only the token the session still holds
                 // counts (1.0 audit H1-11)
-                let current = state.sessions.get(&session_id).and_then(|s| s.account.as_ref().map(|a| a.token.clone()));
+                let current = state
+                    .sessions
+                    .get(&session_id)
+                    .and_then(|s| s.account.as_ref().map(|a| a.token.clone()));
                 if current.as_deref() == Some(token.as_str()) {
-                    crate::tcp::force_disconnect(state, session_id, "You were signed out of this server.").await;
+                    crate::tcp::force_disconnect(
+                        state,
+                        session_id,
+                        "You were signed out of this server.",
+                    )
+                    .await;
                 }
             }
             Ok(Some((user, _, now))) => {
                 // A role given to an account without codes changes no scope
                 // (its rights wait for them), only what the account is asked.
-                let changed = now != scopes || relay.accounts.needs_2fa(&user).await.is_ok_and(|n| n != needs_2fa);
+                let changed = now != scopes
+                    || relay
+                        .accounts
+                        .needs_2fa(&user)
+                        .await
+                        .is_ok_and(|n| n != needs_2fa);
                 if changed {
                     if let Err(e) = apply_scopes(state, &relay, session_id, user, now).await {
                         warn!("a change from the server's shell: {e}");
@@ -1239,16 +1807,29 @@ pub async fn revalidate(state: &Arc<ServerState>) {
 }
 
 /// The session's powers as `scopes` say, and the account told.
-async fn apply_scopes(state: &ServerState, relay: &Relay, session_id: u32, user: User, scopes: Vec<String>) -> Result<()> {
+async fn apply_scopes(
+    state: &ServerState,
+    relay: &Relay,
+    session_id: u32,
+    user: User,
+    scopes: Vec<String>,
+) -> Result<()> {
     let info = relay.info_of(&user, &scopes).await?;
     let (tx, user_id, is_admin, became_admin) = {
-        let Some(mut s) = state.sessions.get_mut(&session_id) else { return Ok(()) };
+        let Some(mut s) = state.sessions.get_mut(&session_id) else {
+            return Ok(());
+        };
         let was_admin = s.is_admin;
         s.set_scopes(user, scopes);
         if let Some(a) = s.account.as_mut() {
             a.needs_2fa = info.needs_2fa;
         }
-        (s.tcp_tx.clone(), s.user_id, s.is_admin, s.is_admin != was_admin)
+        (
+            s.tcp_tx.clone(),
+            s.user_id,
+            s.is_admin,
+            s.is_admin != was_admin,
+        )
     };
     crate::tcp::send_msg(&tx, &ServerMessage::Account(AccountReply::Info(info))).await?;
     if became_admin {
@@ -1264,8 +1845,14 @@ mod tests {
 
     #[test]
     fn a_database_url_is_logged_without_its_password() {
-        assert_eq!(redact("postgres://u:pw@db.example/voipc"), "postgres://…@db.example/voipc");
-        assert_eq!(redact("postgres://u@db.example/voipc?password=pw"), "postgres://…@db.example/voipc?…");
+        assert_eq!(
+            redact("postgres://u:pw@db.example/voipc"),
+            "postgres://…@db.example/voipc"
+        );
+        assert_eq!(
+            redact("postgres://u@db.example/voipc?password=pw"),
+            "postgres://…@db.example/voipc?…"
+        );
         assert_eq!(redact("sqlite://voipc.db?mode=rwc"), "sqlite://voipc.db?…");
         assert_eq!(redact("sqlite://voipc.db"), "sqlite://voipc.db");
     }
@@ -1276,7 +1863,10 @@ mod tests {
         let p = path.to_str().unwrap();
         let e = master_key(p, true).unwrap_err().to_string();
         assert!(e.contains("not here"), "{e}");
-        assert!(!path.exists(), "no new key next to a database made with another");
+        assert!(
+            !path.exists(),
+            "no new key next to a database made with another"
+        );
         let k = master_key(p, false).unwrap();
         assert_eq!(master_key(p, true).unwrap(), k, "read back");
         std::fs::remove_file(&path).unwrap();
@@ -1284,14 +1874,26 @@ mod tests {
 
     #[tokio::test]
     async fn a_database_refuses_another_accounts_key() {
-        let db = std::env::temp_dir().join(format!("voipc-keycheck-{:08x}.db", rand::random::<u32>()));
+        let db =
+            std::env::temp_dir().join(format!("voipc-keycheck-{:08x}.db", rand::random::<u32>()));
         let url = format!("sqlite://{}?mode=rwc", db.display());
-        let cfg = AccountsConfig { mode: AccountsMode::Optional, ..Default::default() };
+        let cfg = AccountsConfig {
+            mode: AccountsMode::Optional,
+            ..Default::default()
+        };
         let store = Store::connect(&url).await.unwrap();
-        Relay::open_with(&cfg, store.clone(), &[9u8; 32]).await.unwrap();
-        let e = Relay::open_with(&cfg, store.clone(), &[8u8; 32]).await.err().expect("refused").to_string();
+        Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+            .await
+            .unwrap();
+        let e = Relay::open_with(&cfg, store.clone(), &[8u8; 32])
+            .await
+            .err()
+            .expect("refused")
+            .to_string();
         assert!(e.contains("not the one this database was made with"), "{e}");
-        Relay::open_with(&cfg, store, &[9u8; 32]).await.expect("its own key still opens it");
+        Relay::open_with(&cfg, store, &[9u8; 32])
+            .await
+            .expect("its own key still opens it");
         for suffix in ["", "-wal", "-shm", ".lock"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
         }

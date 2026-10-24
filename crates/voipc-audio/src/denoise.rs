@@ -61,7 +61,10 @@ impl Denoiser {
                 self.input_buf[i] = 0.0;
             }
 
-            voice = voice.max(self.state.process_frame(&mut self.output_buf, &self.input_buf));
+            voice = voice.max(
+                self.state
+                    .process_frame(&mut self.output_buf, &self.input_buf),
+            );
 
             // Scale back to [-1.0, 1.0] range
             for i in 0..chunk_len {

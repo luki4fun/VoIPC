@@ -17,7 +17,10 @@ const BOB: u32 = 2;
 /// the channel's key.
 fn ring(channel_id: u32, key_id: u16) -> MediaKeyRing {
     let mut ring = MediaKeyRing::default();
-    ring.install(MediaKey::generate(channel_id, key_id, ALICE).unwrap(), channel_id);
+    ring.install(
+        MediaKey::generate(channel_id, key_id, ALICE).unwrap(),
+        channel_id,
+    );
     ring
 }
 
@@ -30,8 +33,15 @@ fn signal_pairwise_and_group_round_trip() {
 
     let bob_bundle = bob.bundle().unwrap();
     assert_eq!(bob_bundle.prekey_bundle.prekeys.len(), 100);
-    assert_eq!(bob_bundle.prekey_bundle.kyber_prekey.len(), 1569, "a Kyber1024 last-resort key");
-    assert_eq!(bob_bundle.identity_key, bob_bundle.prekey_bundle.identity_key);
+    assert_eq!(
+        bob_bundle.prekey_bundle.kyber_prekey.len(),
+        1569,
+        "a Kyber1024 last-resort key"
+    );
+    assert_eq!(
+        bob_bundle.identity_key,
+        bob_bundle.prekey_bundle.identity_key
+    );
     assert_eq!(bob_bundle.prekey_bundle.device_id, 1);
     assert_eq!(bob_bundle.prekey_bundle.signed_prekey_id, 1);
 
@@ -59,7 +69,8 @@ fn signal_pairwise_and_group_round_trip() {
 
     // Sender keys for channel 5.
     let dist = alice.create_sender_key_distribution(ALICE, 5).unwrap();
-    bob.process_sender_key_distribution(ALICE, 5, &dist).unwrap();
+    bob.process_sender_key_distribution(ALICE, 5, &dist)
+        .unwrap();
     let ct = alice.group_encrypt(ALICE, 5, b"channel text").unwrap();
     assert_eq!(bob.group_decrypt(ALICE, 5, &ct).unwrap(), b"channel text");
 }
@@ -86,7 +97,10 @@ fn voice_packet_round_trip() {
 
     // EOT and ping are header only and need no key.
     let eot = media::parse_voice_packet(None, 7, &media::build_eot_packet(42, 11)).unwrap();
-    assert_eq!((eot.packet_type, eot.session_id, eot.sequence), (0x02, 42, 11));
+    assert_eq!(
+        (eot.packet_type, eot.session_id, eot.sequence),
+        (0x02, 42, 11)
+    );
     assert!(eot.opus.is_none());
     let ping = media::parse_voice_packet(None, 7, &media::build_ping_packet(42, 12)).unwrap();
     assert_eq!((ping.packet_type, ping.sequence), (0x03, 12));
@@ -119,12 +133,14 @@ fn screen_audio_round_trip() {
     let aad = build_aad(7, 0x15, 8);
     let stream = keys.stream_id();
     let encrypted = media_encrypt(key, stream, 100, 0, &aad, &opus).unwrap();
-    let packet =
-        ScreenShareAudioPacket::new_encrypted(8, 100, 2500, key.key_id, stream, encrypted)
-            .to_bytes();
+    let packet = ScreenShareAudioPacket::new_encrypted(8, 100, 2500, key.key_id, stream, encrypted)
+        .to_bytes();
 
     let info = media::parse_screen_audio_packet(&keys, 7, &packet).unwrap();
-    assert_eq!((info.session_id, info.sequence, info.timestamp), (8, 100, 2500));
+    assert_eq!(
+        (info.session_id, info.sequence, info.timestamp),
+        (8, 100, 2500)
+    );
     assert_eq!(info.opus, opus);
 
     // Plaintext screen audio is refused.
@@ -260,7 +276,10 @@ fn screen_audio_packet_round_trip() {
     assert_eq!(packet[0], 0x15);
 
     let info = media::parse_screen_audio_packet(&keys, 7, &packet).unwrap();
-    assert_eq!((info.session_id, info.sequence, info.timestamp), (8, 101, 2540));
+    assert_eq!(
+        (info.session_id, info.sequence, info.timestamp),
+        (8, 101, 2540)
+    );
     assert_eq!(info.opus, opus);
 
     // Another key fails authentication instead of playing noise
@@ -299,7 +318,10 @@ fn voice_interoperates_with_the_native_client() {
         u16::from_be_bytes(packet[9..11].try_into().unwrap()),
         key.key_id
     );
-    assert_eq!(u32::from_be_bytes(packet[11..15].try_into().unwrap()), stream);
+    assert_eq!(
+        u32::from_be_bytes(packet[11..15].try_into().unwrap()),
+        stream
+    );
     let decrypted = voipc_crypto::media_decrypt(
         key,
         stream,

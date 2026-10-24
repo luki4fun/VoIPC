@@ -441,6 +441,24 @@ All notable changes to VoIPC are documented here.
     rollback;
   - logs and the container image.
 
+### Track C — the quality bar
+
+- **One Rust for everyone.** `rust-toolchain.toml` pins 1.99.1, with clippy
+  and rustfmt; rustup installs it on the first build.
+- **CI now fails a change** that is not formatted, has a clippy warning, has a
+  TypeScript or Svelte error or warning, or brings in a crate whose licence or
+  source is not allowed. A new security advisory shows on every push and
+  blocks a release.
+- **The whole tree went through rustfmt once.** Apart from that, the clippy
+  fixes are small:
+  - a documentation comment had been attached to the wrong function;
+  - deprecated atomics calls replaced;
+  - long thread entry points allowed by name.
+- **Two advisories fixed in the lockfiles:**
+  - `ctutils` 0.4.5 (RUSTSEC-2026-0385, non-constant-time comparisons, under
+    libsignal);
+  - `tokio` 1.53.3 (RUSTSEC-2026-0386).
+
 ## [0.12.0] - 2026-10-20
 
 Accounts, if a server wants them: a name that stays yours, an identity other

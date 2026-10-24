@@ -24,14 +24,14 @@ use voipc_video::convert;
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    CaptureSession, enumerate_displays, enumerate_windows, request_screencast, spawn_capture_task,
+    enumerate_displays, enumerate_windows, request_screencast, spawn_capture_task, CaptureSession,
 };
 
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::{
-    CaptureSession, enumerate_displays, enumerate_windows, request_screencast, spawn_capture_task,
+    enumerate_displays, enumerate_windows, request_screencast, spawn_capture_task, CaptureSession,
 };
 
 // ── Android stubs ────────────────────────────────────────────────────────
@@ -73,6 +73,8 @@ pub struct WindowInfo {
 
 #[cfg(not(target_os = "android"))]
 #[derive(Debug, Clone, Copy, PartialEq)]
+// Windows capture only ever delivers BGRA; PipeWire delivers the rest
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) enum PixFmt {
     Bgra,
     Bgrx,
@@ -188,7 +190,11 @@ const IDLE_TICK: Duration = Duration::from_millis(200);
 /// dropped.
 #[cfg(not(target_os = "android"))]
 fn encode_at(due: Instant, now: Instant, interval: Duration) -> Instant {
-    if now + interval / 4 >= due { now } else { due }
+    if now + interval / 4 >= due {
+        now
+    } else {
+        due
+    }
 }
 
 /// Whether the periodic IDR is due. Timed, not counted, since a still screen
@@ -354,7 +360,9 @@ mod ladder_tests {
     #[test]
     fn pacing_holds_the_rate_without_dropping_the_last_frame() {
         // Paired buffers (two process callbacks in one loop pass) at 60 fps
-        let paired: Vec<u64> = (0..60).map(|k| (k / 2) * 33_333 + (k % 2) * 1_000).collect();
+        let paired: Vec<u64> = (0..60)
+            .map(|k| (k / 2) * 33_333 + (k % 2) * 1_000)
+            .collect();
         assert_eq!(encoded(&paired, 60).len(), 60);
         // A 144 Hz compositor paced to 60 fps, ending on its last frame
         let fast: Vec<u64> = (0..144).map(|k| k * 6_944).collect();
@@ -444,7 +452,10 @@ impl FrameProcessor {
             self.preview_at = None;
             return;
         }
-        if self.preview_at.is_some_and(|t| t.elapsed() < PREVIEW_INTERVAL) {
+        if self
+            .preview_at
+            .is_some_and(|t| t.elapsed() < PREVIEW_INTERVAL)
+        {
             return;
         }
         let fmt = match frame.fmt {
@@ -463,15 +474,18 @@ impl FrameProcessor {
         let (tw, th) = (self.target_width, self.target_height);
         let conv = match &mut self.preview_conv {
             Some(c) => c,
-            None => match convert::FrameConverter::new(fmt, src_w, src_h, tw, th, convert::Pixel::RGB24) {
-                Ok(c) => self.preview_conv.insert(c),
-                Err(e) => {
-                    warn!("preview converter: {e}");
-                    // Retried at the preview's rate, not on every frame
-                    self.preview_at = Some(Instant::now());
-                    return;
+            None => {
+                match convert::FrameConverter::new(fmt, src_w, src_h, tw, th, convert::Pixel::RGB24)
+                {
+                    Ok(c) => self.preview_conv.insert(c),
+                    Err(e) => {
+                        warn!("preview converter: {e}");
+                        // Retried at the preview's rate, not on every frame
+                        self.preview_at = Some(Instant::now());
+                        return;
+                    }
                 }
-            },
+            }
         };
         self.preview_at = Some(Instant::now());
         let rgb = match conv.convert_strided(&frame.pixels, frame.stride) {
@@ -491,7 +505,9 @@ impl FrameProcessor {
                 }
             }
         }
-        let Some(jpeg) = self.preview_jpeg.as_mut() else { return };
+        let Some(jpeg) = self.preview_jpeg.as_mut() else {
+            return;
+        };
         let image = turbojpeg::Image {
             pixels: rgb.data(0),
             width: tw as usize,
@@ -527,7 +543,13 @@ impl FrameProcessor {
         // In place where the encoder can, without the IDR a rebuild forces
         // into the congested link (H3-08)
         if self.encoder.set_rate(kbps, fps) {
-            info!(from = self.level, to = next, kbps, fps, "screen share quality level changed in place");
+            info!(
+                from = self.level,
+                to = next,
+                kbps,
+                fps,
+                "screen share quality level changed in place"
+            );
             self.level = next;
             self.level_changed = Instant::now();
             return;
@@ -724,8 +746,12 @@ impl FrameProcessor {
                 PixFmt::Unknown => return,
             }
             convert::scale_i420_nearest(
-                &self.full_res_i420_buf, src_w, src_h,
-                &mut self.i420_buf, tw, th,
+                &self.full_res_i420_buf,
+                src_w,
+                src_h,
+                &mut self.i420_buf,
+                tw,
+                th,
             );
         } else {
             match fmt {
@@ -820,7 +846,9 @@ impl FrameProcessor {
                 } else {
                     warn!(
                         "video channel low ({} < {} fragments) — skipping delta frame {}",
-                        self.video_tx.capacity(), fragment_count, self.frame_id
+                        self.video_tx.capacity(),
+                        fragment_count,
+                        self.frame_id
                     );
                     self.keyframe_requested.store(true, Ordering::Relaxed);
                     // Our own uplink is the bottleneck: counts as loss for the ladder
@@ -966,7 +994,8 @@ pub(crate) struct AudioProcessor {
 impl AudioProcessor {
     /// Process raw f32 audio bytes: downmix to mono, accumulate, Opus-encode, send.
     pub fn process(&mut self, raw_data: &[u8]) {
-        if !self.audio_enabled.load(Ordering::Relaxed) || self.viewers.load(Ordering::Relaxed) == 0 {
+        if !self.audio_enabled.load(Ordering::Relaxed) || self.viewers.load(Ordering::Relaxed) == 0
+        {
             self.accumulator.clear();
             return;
         }
@@ -984,9 +1013,8 @@ impl AudioProcessor {
         let sample_count = raw_data.len() / 4;
         // Read, not cast: a PipeWire or WASAPI buffer need not be 4-aligned,
         // and a `&[f32]` over one that is not is undefined behaviour (H3-17)
-        let sample = |i: usize| {
-            f32::from_ne_bytes(raw_data[i * 4..i * 4 + 4].try_into().expect("4 bytes"))
-        };
+        let sample =
+            |i: usize| f32::from_ne_bytes(raw_data[i * 4..i * 4 + 4].try_into().expect("4 bytes"));
 
         let frame_count = sample_count / channels;
         let rate = self.sample_rate;
@@ -1003,8 +1031,7 @@ impl AudioProcessor {
                 self.mono_buf.push(sum / channels as f32);
             }
             if self.resampler.as_ref().is_none_or(|(r, _)| *r != rate) {
-                self.resampler =
-                    Some((rate, voipc_audio::resample::Resampler::new(rate, 48_000)));
+                self.resampler = Some((rate, voipc_audio::resample::Resampler::new(rate, 48_000)));
             }
             let (_, resampler) = self.resampler.as_mut().expect("just set");
             resampler.process(&self.mono_buf, &mut self.accumulator);

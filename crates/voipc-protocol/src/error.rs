@@ -37,7 +37,10 @@ mod tests {
 
     #[test]
     fn packet_too_short_display() {
-        let e = ProtocolError::PacketTooShort { expected: 17, got: 5 };
+        let e = ProtocolError::PacketTooShort {
+            expected: 17,
+            got: 5,
+        };
         let msg = e.to_string();
         assert!(msg.contains("17"));
         assert!(msg.contains("5"));

@@ -115,7 +115,11 @@ mod source {
 
         pub fn read(&mut self, buf: &mut [u8]) -> bool {
             unsafe {
-                std::ptr::copy_nonoverlapping(self.view.Value as *const u8, buf.as_mut_ptr(), buf.len());
+                std::ptr::copy_nonoverlapping(
+                    self.view.Value as *const u8,
+                    buf.as_mut_ptr(),
+                    buf.len(),
+                );
             }
             true
         }
@@ -355,7 +359,9 @@ async fn apply(app: &tauri::AppHandle, link: Link) -> bool {
         return false;
     }
     let conns = state.connections.read().await;
-    let Ok(connection) = crate::app_state::voice(&state, &conns) else { return false };
+    let Ok(connection) = crate::app_state::voice(&state, &conns) else {
+        return false;
+    };
     let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
     if spatial.sdk_active {
         return false;
@@ -397,7 +403,11 @@ mod tests {
         let mut buf = Vec::with_capacity(HEAD);
         buf.extend_from_slice(&version.to_le_bytes());
         buf.extend_from_slice(&tick.to_le_bytes());
-        for v in pos.iter().chain(front.iter()).chain([0.0f32, 1.0, 0.0].iter()) {
+        for v in pos
+            .iter()
+            .chain(front.iter())
+            .chain([0.0f32, 1.0, 0.0].iter())
+        {
             buf.extend_from_slice(&v.to_le_bytes());
         }
         buf
@@ -416,7 +426,11 @@ mod tests {
         // Facing is normalised, and its height component is dropped
         let link = parse_link(&block(2, 8, [0.0; 3], [3.0, 9.0, 4.0])).unwrap();
         let len = (link.fwd[0] * link.fwd[0] + link.fwd[1] * link.fwd[1]).sqrt();
-        assert!((len - 1.0).abs() < 1e-5, "facing is not a unit vector: {:?}", link.fwd);
+        assert!(
+            (len - 1.0).abs() < 1e-5,
+            "facing is not a unit vector: {:?}",
+            link.fwd
+        );
         assert!(link.fwd[0] > 0.0 && link.fwd[1] > 0.0);
 
         // Looking straight up has no direction in the ground plane
@@ -430,7 +444,10 @@ mod tests {
         // boundary and not a parser.
         assert!(parse_link(&[]).is_none(), "an empty read was accepted");
         assert!(parse_link(&block(2, 1, [0.0; 3], [0.0, 0.0, 1.0])[..20]).is_none());
-        assert!(parse_link(&block(1, 1, [0.0; 3], [0.0, 0.0, 1.0])).is_none(), "wrong version");
+        assert!(
+            parse_link(&block(1, 1, [0.0; 3], [0.0, 0.0, 1.0])).is_none(),
+            "wrong version"
+        );
         // Untouched shared memory is all zeroes, which is a valid position;
         // the tick is what says somebody actually wrote it.
         assert!(parse_link(&block(2, 0, [0.0; 3], [0.0, 0.0, 1.0])).is_none());

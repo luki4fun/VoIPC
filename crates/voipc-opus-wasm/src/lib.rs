@@ -40,7 +40,12 @@ pub enum Mode {
 
 /// Decode into `out`; the number of samples written, or `None` when the
 /// packet is refused. Never more than [`FRAME`].
-pub fn decode(decoder: &mut OpusDecoder, packet: &[u8], mode: Mode, out: &mut [f32; FRAME]) -> Option<usize> {
+pub fn decode(
+    decoder: &mut OpusDecoder,
+    packet: &[u8],
+    mode: Mode,
+    out: &mut [f32; FRAME],
+) -> Option<usize> {
     if packet.len() > MAX_PACKET {
         return None;
     }
@@ -110,7 +115,12 @@ pub unsafe extern "C" fn opus_decode(slot: *mut Slot, len: usize, mode: u32) -> 
         _ => Mode::Conceal,
     };
     let len = len.min(MAX_PACKET);
-    match decode(&mut slot.decoder, &slot.input[..len], mode, &mut slot.output) {
+    match decode(
+        &mut slot.decoder,
+        &slot.input[..len],
+        mode,
+        &mut slot.output,
+    ) {
         Some(n) => n as i32,
         None => -1,
     }
@@ -135,7 +145,10 @@ pub fn fuzz_decode(data: &[u8]) {
         let (packet, after) = tail.split_at(len);
         if let Some(n) = decode(&mut decoder, packet, mode, &mut out) {
             assert!(n <= FRAME);
-            assert!(out[..n].iter().all(|s| s.is_finite()), "a decoded sample is not finite");
+            assert!(
+                out[..n].iter().all(|s| s.is_finite()),
+                "a decoded sample is not finite"
+            );
         }
         rest = after;
     }
@@ -151,7 +164,11 @@ mod tests {
         (0..n)
             .map(|k| {
                 let pcm: Vec<f32> = (0..FRAME)
-                    .map(|i| 0.3 * ((k * FRAME + i) as f32 * 2.0 * std::f32::consts::PI * 300.0 / 48_000.0).sin())
+                    .map(|i| {
+                        0.3 * ((k * FRAME + i) as f32 * 2.0 * std::f32::consts::PI * 300.0
+                            / 48_000.0)
+                            .sin()
+                    })
                     .collect();
                 let mut out = vec![0u8; MAX_PACKET];
                 let len = enc.encode(&pcm, FRAME, &mut out).unwrap();
@@ -212,7 +229,8 @@ mod tests {
             .collect();
         fuzz_decode(&records);
         // and every input the nightly fuzz run kept (fuzz/README.md)
-        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/regressions/opus_decode");
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../fuzz/regressions/opus_decode");
         for file in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             fuzz_decode(&std::fs::read(file.path()).unwrap());
         }

@@ -14,7 +14,10 @@ pub fn fuzz_codec(data: &[u8]) {
     loop {
         let before = buf.len();
         match codec::try_decode_frame(&mut buf) {
-            Ok(Some(_)) => assert!(buf.len() < before, "a frame was read without consuming bytes"),
+            Ok(Some(_)) => assert!(
+                buf.len() < before,
+                "a frame was read without consuming bytes"
+            ),
             _ => break,
         }
     }
@@ -50,7 +53,10 @@ pub fn fuzz_video_assembly(data: &[u8]) {
             let _ = grouper.place(&record);
             if let Ok(packet) = video::VideoPacket::from_bytes(&record) {
                 if let Some((frame, _)) = assembler.add_fragment(&packet).frame {
-                    assert!(frame.len() <= video::MAX_FRAGMENTS_PER_FRAME * video::MAX_VIDEO_PACKET_SIZE);
+                    assert!(
+                        frame.len()
+                            <= video::MAX_FRAGMENTS_PER_FRAME * video::MAX_VIDEO_PACKET_SIZE
+                    );
                 }
             }
         }
@@ -96,7 +102,8 @@ mod tests {
 
     #[test]
     fn the_fuzz_targets_replay_on_stable() {
-        let packets = video::fragment_frame(&[7; 3000], true, 1, 2, 3, video::MAX_VIDEO_PAYLOAD_SIZE);
+        let packets =
+            video::fragment_frame(&[7; 3000], true, 1, 2, 3, video::MAX_VIDEO_PAYLOAD_SIZE);
         let records: Vec<u8> = packets
             .iter()
             .flat_map(|p| {
@@ -104,10 +111,19 @@ mod tests {
                 [(b.len() as u16).to_be_bytes().to_vec(), b].concat()
             })
             .collect();
-        let ping = codec::encode_client_msg(&crate::messages::ClientMessage::Ping { timestamp: 1 }).unwrap();
+        let ping = codec::encode_client_msg(&crate::messages::ClientMessage::Ping { timestamp: 1 })
+            .unwrap();
         replay("codec", &ping, fuzz_codec);
-        replay("media_packets", &voice::VoicePacket::voice(1, 2, vec![1, 2, 3]).to_bytes(), fuzz_media_packets);
+        replay(
+            "media_packets",
+            &voice::VoicePacket::voice(1, 2, vec![1, 2, 3]).to_bytes(),
+            fuzz_media_packets,
+        );
         replay("video_assembly", &records, fuzz_video_assembly);
-        replay("ws", b"GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n", fuzz_ws);
+        replay(
+            "ws",
+            b"GET / HTTP/1.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n",
+            fuzz_ws,
+        );
     }
 }

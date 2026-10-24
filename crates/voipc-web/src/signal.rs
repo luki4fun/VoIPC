@@ -41,7 +41,9 @@ impl SignalCore {
 
     /// The same, for an account's identity from its vault: only the identity
     /// outlives the connection, the pre-keys and stores are new every time.
-    pub fn with_identity(identity_key_pair: &libsignal_protocol::IdentityKeyPair) -> anyhow::Result<Self> {
+    pub fn with_identity(
+        identity_key_pair: &libsignal_protocol::IdentityKeyPair,
+    ) -> anyhow::Result<Self> {
         let registration_id: u32 = rand::random();
         let mut stores = SignalStores::new(identity_key_pair, registration_id);
         prekey::generate_prekeys(&mut stores, identity_key_pair)?;
@@ -54,7 +56,10 @@ impl SignalCore {
     /// Identity key and pre-key bundle for Authenticate.
     pub fn bundle(&self) -> anyhow::Result<AuthBundle> {
         let prekey_bundle = prekey::bundle(&self.stores)?;
-        Ok(AuthBundle { identity_key: prekey_bundle.identity_key.clone(), prekey_bundle })
+        Ok(AuthBundle {
+            identity_key: prekey_bundle.identity_key.clone(),
+            prekey_bundle,
+        })
     }
 
     /// Our user id from `Authenticated`: every pairwise message is bound to it.
@@ -73,12 +78,20 @@ impl SignalCore {
         user_id: u32,
         bundle: &PreKeyBundleData,
     ) -> anyhow::Result<()> {
-        run(session::establish_session(&mut self.stores, user_id, bundle))
+        run(session::establish_session(
+            &mut self.stores,
+            user_id,
+            bundle,
+        ))
     }
 
     /// Returns (ciphertext, message_type) with 1 = PreKey, 2 = Whisper.
     pub fn encrypt(&mut self, user_id: u32, plaintext: &[u8]) -> anyhow::Result<(Vec<u8>, u8)> {
-        run(session::encrypt_message(&mut self.stores, user_id, plaintext))
+        run(session::encrypt_message(
+            &mut self.stores,
+            user_id,
+            plaintext,
+        ))
     }
 
     pub fn decrypt(
@@ -130,7 +143,10 @@ impl SignalCore {
 
     /// The identity key the session with `user_id` runs on, if there is one.
     pub fn identity_of(&self, user_id: u32) -> Option<Vec<u8>> {
-        self.stores.identity.identity_of(user_id).map(<[u8]>::to_vec)
+        self.stores
+            .identity
+            .identity_of(user_id)
+            .map(<[u8]>::to_vec)
     }
 
     pub fn reset_channel(&mut self, own_user_id: u32, channel_id: u32) {

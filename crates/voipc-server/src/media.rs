@@ -28,7 +28,10 @@ pub async fn handle_packet(session_id: SessionId, data: Bytes, state: &ServerSta
     // id would let one client inject into another's stream.
     let claimed = u32::from_be_bytes([data[1], data[2], data[3], data[4]]);
     if claimed != session_id {
-        debug!(session_id, claimed, "dropping media packet with foreign session id");
+        debug!(
+            session_id,
+            claimed, "dropping media packet with foreign session id"
+        );
         return;
     }
 
@@ -55,7 +58,11 @@ async fn handle_voice_packet(session_id: SessionId, data: Bytes, state: &ServerS
 
     // Positions are a fixed size; anything else claiming to be one is junk.
     if is_position && data.len() != POSITION_PACKET_SIZE {
-        debug!(session_id, len = data.len(), "dropping malformed position packet");
+        debug!(
+            session_id,
+            len = data.len(),
+            "dropping malformed position packet"
+        );
         return;
     }
 
@@ -130,9 +137,13 @@ async fn handle_voice_packet(session_id: SessionId, data: Bytes, state: &ServerS
                     return None;
                 }
                 if routed
-                    && !state
-                        .routing
-                        .may_hear(channel_id, *member_uid, member_sid, speaker_uid, now)
+                    && !state.routing.may_hear(
+                        channel_id,
+                        *member_uid,
+                        member_sid,
+                        speaker_uid,
+                        now,
+                    )
                 {
                     return None;
                 }
@@ -194,7 +205,12 @@ mod tests {
         let (_, alice_sid, mut alice_media) = add_user_with_media(&state, "alice");
         let (_, _bob_sid, mut bob_media) = add_user_with_media(&state, "bob");
 
-        handle_packet(alice_sid, Bytes::from(VoicePacket::ping(alice_sid, 77).to_bytes()), &state).await;
+        handle_packet(
+            alice_sid,
+            Bytes::from(VoicePacket::ping(alice_sid, 77).to_bytes()),
+            &state,
+        )
+        .await;
 
         let pong = VoicePacket::from_bytes(&alice_media.try_recv().unwrap()).unwrap();
         assert_eq!(pong.packet_type, VoicePacketType::Pong);
@@ -246,7 +262,12 @@ mod tests {
         .await;
         // Too short / too long
         handle_packet(alice_sid, Bytes::from_static(&[0x05, 0, 0, 0, 1]), &state).await;
-        handle_packet(alice_sid, Bytes::from(vec![0x05; MAX_PACKET_SIZE + 1]), &state).await;
+        handle_packet(
+            alice_sid,
+            Bytes::from(vec![0x05; MAX_PACKET_SIZE + 1]),
+            &state,
+        )
+        .await;
 
         assert!(bob_media.try_recv().is_err());
     }
@@ -257,7 +278,14 @@ mod tests {
     }
 
     async fn set_proximity(state: &ServerState, channel_id: u32, mode: ProximityMode) {
-        state.channels.write().await.get_mut(&channel_id).unwrap().info.proximity = mode;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&channel_id)
+            .unwrap()
+            .info
+            .proximity = mode;
     }
 
     #[tokio::test]
@@ -286,7 +314,8 @@ mod tests {
         put_in_channel(&state, 5, &[(alice_uid, alice_sid), (bob_uid, bob_sid)]).await;
         set_proximity(&state, 5, ProximityMode::ThreeD).await;
 
-        let oversized = Bytes::from(VoicePacket::position(alice_sid, 1, 1, 0x5EED, vec![0u8; 99]).to_bytes());
+        let oversized =
+            Bytes::from(VoicePacket::position(alice_sid, 1, 1, 0x5EED, vec![0u8; 99]).to_bytes());
         handle_packet(alice_sid, oversized, &state).await;
         assert!(bob_media.try_recv().is_err());
     }
@@ -312,7 +341,14 @@ mod tests {
     }
 
     async fn set_routed(state: &ServerState, channel_id: u32, routed: bool) {
-        state.channels.write().await.get_mut(&channel_id).unwrap().info.routed = routed;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&channel_id)
+            .unwrap()
+            .info
+            .routed = routed;
     }
 
     #[tokio::test]
@@ -340,7 +376,11 @@ mod tests {
         put_in_channel(
             &state,
             5,
-            &[(alice_uid, alice_sid), (bob_uid, bob_sid), (carol_uid, carol_sid)],
+            &[
+                (alice_uid, alice_sid),
+                (bob_uid, bob_sid),
+                (carol_uid, carol_sid),
+            ],
         )
         .await;
         set_routed(&state, 5, true).await;
@@ -350,7 +390,10 @@ mod tests {
         state.routing.set_filter(carol_sid, Some(vec![]));
         handle_packet(alice_sid, encrypted_voice(alice_sid), &state).await;
         assert!(bob_media.try_recv().is_ok());
-        assert!(carol_media.try_recv().is_err(), "carol was sent a voice she culled");
+        assert!(
+            carol_media.try_recv().is_err(),
+            "carol was sent a voice she culled"
+        );
 
         // Clearing the filter puts the whole channel back
         state.routing.set_filter(carol_sid, None);
@@ -367,7 +410,11 @@ mod tests {
         put_in_channel(
             &state,
             5,
-            &[(alice_uid, alice_sid), (bob_uid, bob_sid), (carol_uid, carol_sid)],
+            &[
+                (alice_uid, alice_sid),
+                (bob_uid, bob_sid),
+                (carol_uid, carol_sid),
+            ],
         )
         .await;
         set_routed(&state, 5, true).await;
@@ -394,12 +441,21 @@ mod tests {
             .unwrap();
 
         handle_packet(alice_sid, encrypted_voice(alice_sid), &state).await;
-        assert!(bob_media.try_recv().is_ok(), "a listed pair could not hear each other");
-        assert!(carol_media.try_recv().is_err(), "an unlisted listener heard a voice");
+        assert!(
+            bob_media.try_recv().is_ok(),
+            "a listed pair could not hear each other"
+        );
+        assert!(
+            carol_media.try_recv().is_err(),
+            "an unlisted listener heard a voice"
+        );
 
         // And an unlisted *speaker* is heard by nobody either
         handle_packet(carol_sid, encrypted_voice(carol_sid), &state).await;
-        assert!(bob_media.try_recv().is_err(), "an unlisted speaker was forwarded");
+        assert!(
+            bob_media.try_recv().is_err(),
+            "an unlisted speaker was forwarded"
+        );
     }
 
     #[tokio::test]
@@ -428,7 +484,11 @@ mod tests {
         put_in_channel(
             &state,
             5,
-            &[(alice_uid, alice_sid), (bob_uid, bob_sid), (carol_uid, carol_sid)],
+            &[
+                (alice_uid, alice_sid),
+                (bob_uid, bob_sid),
+                (carol_uid, carol_sid),
+            ],
         )
         .await;
         state
