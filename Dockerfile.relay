@@ -23,7 +23,7 @@ RUN mkdir /data
 
 # A static binary needs no libc. No /etc/ssl either: the relay's TLS roots
 # (webpki-roots) are compiled in.
-FROM gcr.io/distroless/static-debian13:nonroot@sha256:d62067879de890a1def9da0e7766b7d20810a5e5555cef8506b752437d7a3e88
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:18f4cc26c9ffa7f20a359298be7deadac5c607c8e03a02b8119f1a5fc2f82c99
 COPY --chmod=0755 voipc-server-linux-x86_64 /voipc-server
 COPY --from=prep --chown=65532:65532 /data /data
 WORKDIR /data
