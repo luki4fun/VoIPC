@@ -20,7 +20,7 @@
 //! VoIPC → game
 //!   {"type":"state","state":"ingame","user_id":42,"username":"Luki#0420",
 //!    "channel":"Ingame","proximity":"3d","muted":false,"deafened":false,
-//!    "version":"1.0.0-rc.1","sdk":1,
+//!    "version":"1.0.0-rc.2","sdk":1,
 //!    "capabilities":["spatial","direct","volume","muffle","radio","phone","talk",
 //!                    "reverb","underwater"]}
 //!   {"type":"talk","user_id":42,"speaking":true}
