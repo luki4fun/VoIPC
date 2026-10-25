@@ -70,7 +70,7 @@ VoIPC answers with a `state` message:
 ```json
 {"type":"state","state":"ingame","user_id":42,"username":"Luki#0420",
  "channel":"Ingame","proximity":"3d","muted":false,"deafened":false,
- "version":"0.11.0","sdk":1,
+ "version":"1.0.0","sdk":1,
  "capabilities":["spatial","direct","volume","muffle","talk","reverb","underwater",
                  "layers","pan","delay","beacon","transmit",
                  "phone","radio","cb","walkie","aviation","police","landline",
@@ -92,7 +92,8 @@ VoIPC answers with a `state` message:
   place themselves — for games whose client can see where *it* is and nothing
   more. Beacon mode is the one thing here that puts anything on the wire, so
   the player has to allow it in Settings → Game Integration first; until they
-  do, `hello` is answered with an error naming the setting.
+  do, `hello` is answered with the error `beacon_not_allowed`, naming the
+  setting.
 
 `state` is one of:
 
@@ -100,17 +101,20 @@ VoIPC answers with a `state` message:
 |---|---|
 | `ingame` | Connected, **in the channel** (the join has completed), ready for updates |
 | `disconnected` | VoIPC is not connected to any server; ask the player to connect |
-| `wrong_server` | VoIPC is on a different server than the one in `hello.server`, or that field is missing |
+| `wrong_server` | VoIPC will not join what `hello` names: it is not on `hello.server` (or the field is missing), `hello.channel` is missing or no channel has that name, or the channel is 18+ and the player has not said yes to that yet |
+| `returned` | Pushed, not an answer: the player has come back by their own hand to the channel your game joined (see below). Send `hello` again |
 
-A `wrong_server` reply carries no `user_id`, `username` or mute state. Any page
-on an allowed origin can provoke one, and it is not entitled to know who is
-using this machine.
+A `wrong_server` reply carries no `user_id`, `username` or mute state, and its
+four causes look the same on purpose. Any page on an allowed origin can provoke
+one, and it is not entitled to learn which servers the player is on or which
+channels exist there. The player sees the actual reason in VoIPC, and it is in
+VoIPC's log: debug it from the player's side.
 
 **One game at a time, and one origin at a time.** The newest `hello` from the
 origin that already owns the mix takes over — that is your resource
 restarting. A `hello` from a *different* origin while the owner's socket is
-alive is refused with `{"type":"error","reason":"another game is already
-placing people"}`, so a second script on the same server cannot take the mix
+alive is refused with `{"type":"error","code":"mix_taken","reason":"another
+game is already placing people"}`, so a second script on the same server cannot take the mix
 off your voice resource (and two of them cannot fight over it, which sounds
 like silence). A native client with no `Origin` header is one class of its own.
 
@@ -118,13 +122,27 @@ A join that the server refuses, or that does not complete within three
 seconds, is answered with an error instead of `ingame`:
 
 ```json
-{"type":"error","reason":"could not join Ingame: incorrect channel password"}
+{"type":"error","code":"join_failed","reason":"could not join Ingame: incorrect channel password"}
 ```
+
+A channel marked 18+ is joined only once the user has said yes to that
+server's 18+ channels in the app; a game cannot say it for them. Until then
+`hello` is answered with `wrong_server`.
 
 Send `hello` again after a reconnect; ids are per connection. VoIPC checks
 this for you: an `update` whose ids are from the connection before a reconnect
-is refused with `{"type":"error","reason":"reconnected to the server — send
-hello again"}` instead of silently culling everyone out of the mix.
+is refused with `{"type":"error","code":"rehello","reason":"reconnected to the
+server — send hello again"}` instead of silently culling everyone out of the
+mix. The same code comes when an admin moved the player out of your channel.
+
+**The player's own move wins.** When the player leaves your channel
+themselves (another channel, *Leave voice*, or voice on another server), your
+next `update` or `transmit` is answered with `player_left`, and so is a
+`hello`: VoIPC does not move them back. When they return to your channel by
+their own hand, VoIPC pushes `{"type":"state","state":"returned"}`, and your
+`hello` then arms the game again without moving anybody. Do not answer
+`player_left` with `hello`; wait for `returned`. A new socket (your resource
+restarting) starts afresh.
 
 Only the newest connection that completed a `hello` drives the mix. Reconnect
 freely after a resource restart; the old socket cannot take the positions with
@@ -274,14 +292,15 @@ Send this while the radio key is down and they only hold one:
 ```
 
 - The player has to tick *Let a game press my push-to-talk* in Settings → Game
-  Integration first. Until they do, this is answered with an error naming the
-  setting — send it anyway and log the error; it is not something to probe for.
+  Integration first. Until they do, this is answered with `transmit_not_allowed`,
+  naming the setting — send it anyway and log the error; it is not something
+  to probe for.
 - It **cannot talk over mute**, it lights the same indicator any transmission
   does (labelled so they can see it was the game), and a `transmit: false`
   never cuts a press the player is making themselves.
 - It is let go automatically when your socket closes, when another game takes
-  the mix, when the player leaves the channel, and after 60 seconds — re-send
-  `on: true` to keep a long transmission going.
+  the mix, when the player leaves the channel, and after 60 seconds
+  (`transmit_expired`) — re-send `on: true` to keep a long transmission going.
 
 Other messages: `{"type":"ping"}` (answered with `{"type":"pong"}`) and
 `{"type":"bye"}`. Closing the socket does the same as `bye`: every placement is
@@ -362,7 +381,11 @@ the people in the channel are told when they join, and you should turn it on
 only where you need it.
 
 Set `"routed": true` on the channel in `channels.json` (or tick it in the
-channel dialog). Two things then feed it:
+channel dialog). `voipc-server channels init roleplay` writes a `channels.json`
+with such an `Ingame` channel already set up — hidden, locked, routed — and a
+`game_token` in `server_settings.json` (an existing one is left alone, and the
+token is printed for you to add), and prints both secrets once. Two things then
+feed it:
 
 1. **Each client** tells the server which members its mod is currently
    listing. That happens by itself — your mod already worked the set out to
@@ -449,9 +472,12 @@ change anything, at the price named above.
   matches the trust model below — any local process can connect.
 - If the port cannot be taken (another program has it), Settings → Game
   Integration says so instead of silently never connecting.
-- Origins are checked: the game runtimes (`https://cfx-nui-…`, `http://resource/…`,
-  `http://package/…`) are matched by prefix, and `localhost` / `127.0.0.1` only
-  as the exact host (with an optional port). Everything else is refused,
+- Origins are checked. FiveM / RedM is `https://cfx-nui-` followed by the
+  resource name and nothing else (letters, digits, `-`, `_`: no dot, port or
+  path, because a host name may start with `cfx-nui-` too). alt:V
+  (`http://resource`), RAGE:MP (`http://package`), MTA:SA (`http://mta`),
+  `localhost` and `127.0.0.1` are matched as the exact host, with an optional
+  port. An origin never carries a path. Everything else is refused,
   because any web page a player has open can otherwise reach a local port — and
   a name like `localhost.example.com` is an ordinary internet host, not
   loopback. Settings → Game Integration takes extra origins, one per line, each
@@ -476,7 +502,8 @@ change anything, at the price named above.
   a `server_script`, not `config.lua`, and the shipped resource hands it to a
   client at the moment it joins (`server_config.lua`).
 - A `wrong_server` refusal carries no identity — no user id, name or mute
-  state. It is the one reply any allowed origin can provoke.
+  state — and does not say whether the server, the channel or the 18+ consent
+  was the problem. It is the one reply any allowed origin can provoke.
 - One game owns the mix, and a second **origin** cannot take it while the first
   socket lives.
 - `talk`, `user` and `self` pushes are limited to the players the mod listed,
@@ -606,11 +633,33 @@ grep -rnE 'Mumble[A-Za-z]*|NetworkIsPlayerTalking' resources/
 To check your headphones without any of this, use Settings → Spatial Audio →
 *Test 2D* / *Test 3D*: a synthetic voice circles you through the same mixer.
 
+## Errors
+
+Every error is `{"type":"error","code":"…","reason":"…"}`. Match on `code`,
+which is stable from 1.0 on; `reason` is English for a log and may change.
+
+| `code` | Answer to | What to do |
+|---|---|---|
+| `bad_message` | anything that does not parse | Fix the message. Three in a row close the socket |
+| `unknown_type` | a `type` this VoIPC does not know | Nothing: it is ignored, and does not count toward the close. A newer mod on an older VoIPC |
+| `rate_limited` | a second `hello` within a second | Wait. Ten in a row close the socket |
+| `mix_taken` | `hello` while another origin owns the mix | Nothing; the other game has it |
+| `sdk_version` | `hello` with an `sdk` this VoIPC does not speak | Speak `sdk: 1` |
+| `bad_mode` | `hello` with an unknown `mode` | Use `players` or `beacon` |
+| `beacon_not_allowed` | `hello` with `mode: "beacon"` | Ask the player to allow it in Settings → Game Integration |
+| `join_failed` | `hello`, when the server refused the join or it timed out | Log it; wrong password, full channel |
+| `no_hello` | `update` or `transmit` before an `ingame` `hello` | Send `hello` |
+| `rehello` | `update` after a reconnect, a voice move or an admin move | Send `hello` again |
+| `player_left` | `update`, `transmit` or `hello` after the player moved themselves | Wait for `state: returned` |
+| `not_in_voice` | `update` while the player is in no voice channel | Wait |
+| `bad_update` | `update` with a non-finite position or a player listed twice | Fix the update; it was not applied |
+| `transmit_not_allowed` | `transmit` | Ask the player to allow it in Settings → Game Integration |
+| `transmit_expired` | pushed: a `transmit` held for 60 s was let go | Send `on: true` again if the key is still down |
+
 ## Protocol version
 
 `sdk: 1`. New fields will be added to these messages; unknown fields are
-ignored, and a mod that does not send a field gets the documented default. A
-breaking change bumps the number, and VoIPC then answers a `hello` that names
-a version it does not speak with `{"type":"error","reason":"unsupported SDK
-version 2"}`. That check comes after the connection checks, so a mod talking
-to a VoIPC that is not connected to a server sees `state: disconnected` first.
+ignored, and a mod that does not send a field gets the documented default. New
+message types answer `unknown_type` on a VoIPC that predates them. A breaking
+change bumps the number, and VoIPC then answers a `hello` that names a version
+it does not speak with `sdk_version`, before anything else.

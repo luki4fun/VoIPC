@@ -368,6 +368,9 @@ export const CONTRAST_PAIRS: readonly {
   { fg: "--text-secondary", bg: "--bg-primary", min: 4.5, where: "status bar" },
   { fg: "--text-secondary", bg: "--bg-secondary", min: 4.5, where: "channel descriptions" },
   { fg: "--accent", bg: "--bg-secondary", min: 3.0, where: "links, active channel" },
+  // Status words in colour: "Live", "Sharing", a reconnecting badge (H5-05)
+  { fg: "--success", bg: "--bg-secondary", min: 3.0, where: "a live or sharing status" },
+  { fg: "--warning", bg: "--bg-secondary", min: 3.0, where: "a warning status" },
   // Not a WCAG figure: a divider is not text. 1.1 is simply "visible at all",
   // and it is the floor today's dark palette sits just above (#2a2a4a on
   // #16213e is 1.15). It exists so a palette cannot ship with borders that

@@ -1,14 +1,15 @@
 {
   "name": "voipc-client",
   "private": true,
-  "version": "0.11.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
     "tauri": "tauri",
-    "build:wasm": "cd ../crates/voipc-web && wasm-pack build --target web --release --out-dir ../../client/src/lib/wasm --out-name voipc_web",
+    "build:wasm": "node ../tools/voipc.mjs build:wasm && npm run build:opus",
+    "build:opus": "cargo build --manifest-path ../crates/voipc-opus-wasm/Cargo.toml --target wasm32-unknown-unknown --release --locked --target-dir ../target/opus-wasm && node -e \"require('fs').copyFileSync('../target/opus-wasm/wasm32-unknown-unknown/release/voipc_opus_wasm.wasm', 'src/lib/wasm/voipc_opus.wasm')\"",
     "build:web": "npm run build:wasm && vite build --mode web",
     "dev:web": "vite --mode web",
     "test": "node --experimental-strip-types --disable-warning=ExperimentalWarning --test 'src/**/*.test.ts'"
@@ -21,8 +22,8 @@
     "@sveltejs/vite-plugin-svelte": "^5",
     "@tauri-apps/cli": "^2",
     "svelte": "^5",
+    "svelte-check": "4.7.7",
     "typescript": "^5",
-    "vite": "^6",
-    "wasm-pack": "^0.13"
+    "vite": "^6"
   }
 }

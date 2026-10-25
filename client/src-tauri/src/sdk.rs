@@ -20,13 +20,14 @@
 //! VoIPC → game
 //!   {"type":"state","state":"ingame","user_id":42,"username":"Luki#0420",
 //!    "channel":"Ingame","proximity":"3d","muted":false,"deafened":false,
-//!    "version":"0.11.0","sdk":1,
+//!    "version":"1.0.0","sdk":1,
 //!    "capabilities":["spatial","direct","volume","muffle","radio","phone","talk",
 //!                    "reverb","underwater"]}
 //!   {"type":"talk","user_id":42,"speaking":true}
 //!   {"type":"self","muted":false,"deafened":false,"speaking":true}
 //!   {"type":"user","user_id":7,"muted":true}
-//!   {"type":"pong"} {"type":"error","reason":"…"}
+//!   {"type":"pong"} {"type":"error","code":"…","reason":"…"}
+//!   {"type":"state","state":"returned"}
 //!
 //! Security: the listener binds loopback only, is off until the user turns it
 //! on in Settings, and rejects browser origins that are not a known game
@@ -38,16 +39,17 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use serde::Deserialize;
 use tauri::{Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{info, warn};
 
-use voipc_audio::spatial::{
-    effect_from_str, Effect, Listener, Source, DEFAULT_RANGE, MAX_MUFFLE, MAX_REVERB,
-    MAX_UNDERWATER,
+use voipc_audio::game::{
+    beacon_mode, facing, may_move, origin_allowed, owner_conflict, parse_frame, pick_server,
+    releases_transmit, reverb_water_from, short_name, sources_from, transmit_step, Frame,
+    GameMessage, Hello, Owner, TxStep, Update, MIN_UPDATE_GAP,
 };
+use voipc_audio::spatial::Listener;
 use voipc_protocol::types::ProximityMode;
 use voipc_protocol::ws;
 
@@ -55,8 +57,6 @@ use crate::app_state::{AppState, Motion, SdkEvent, MAX_GLIDE, MIN_GLIDE};
 
 /// Largest HTTP upgrade request we read before giving up.
 const MAX_HANDSHAKE: usize = 8 * 1024;
-/// Largest WebSocket frame we accept (a bulk update of a full server).
-const MAX_FRAME: usize = 64 * 1024;
 /// A connection has this long to finish its HTTP upgrade.
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 /// No frame at all for this long (a live mod pings) closes the socket.
@@ -75,27 +75,10 @@ const MAX_CONNECTIONS: usize = 8;
 const MAX_PER_ORIGIN: usize = 2;
 /// How long `hello` waits for the server to confirm the channel join.
 const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-/// Shortest gap between two `update` frames we will act on. The documented
-/// ceiling is 20 Hz and a real mod sends 4–10, so this is pure slack — but
-/// without it a mod (or a page on an allowed origin) can hold the spatial
-/// mutex, which the mixer needs every 20 ms, at loopback line rate.
-const MIN_UPDATE_GAP: std::time::Duration = std::time::Duration::from_millis(20);
 /// Shortest gap between two `hello` frames. Each one may send a JoinChannel to
 /// the server, whose password limiter is 3 burst / 1 per second, and each
 /// refusal raises a toast — so a hello loop is a way to paper the UI.
 const MIN_HELLO_GAP: std::time::Duration = std::time::Duration::from_secs(1);
-/// Longest `game` / `resource` string kept. They are attacker-controlled and
-/// end up in a toast and a banner; a name is a name, not a paragraph.
-const MAX_NAME: usize = 32;
-/// Extra renders one voice may have on top of its own. Four voices from one
-/// speaker is already more than anybody can follow, and each one costs a
-/// filter chain and a reverb bank in the mixer.
-const MAX_LAYERS: usize = 3;
-/// Longest `delay` honoured, in milliseconds. Bounds the ring a delayed layer
-/// keeps: without a cap, `delay` is a request to allocate.
-const MAX_DELAY_MS: u32 = 100;
-/// One mixer frame, in milliseconds — the resolution `delay` is quantised to.
-const FRAME_MS: u32 = 20;
 /// Longest a game may hold the user's push-to-talk down before it has to ask
 /// again. A radio key nobody is pressing must not be able to leave a
 /// microphone open, whatever the mod believes about its own state.
@@ -146,156 +129,6 @@ fn modes() -> &'static Vec<&'static str> {
             .chain(voipc_audio::mixer::PRESETS.iter().map(|p| p.id))
             .collect()
     })
-}
-
-/// Origin prefixes allowed without configuration: the game runtimes' own web
-/// views, whose origin carries the resource name after the prefix.
-const DEFAULT_ORIGIN_PREFIXES: &[&str] = &[
-    "https://cfx-nui-", // FiveM / RedM NUI
-    "http://resource/", // alt:V
-    "http://package/",  // RAGE:MP CEF
-];
-
-/// Hosts allowed without configuration. Matched exactly (a port may follow):
-/// a prefix match would accept `https://localhost.attacker.example`, which is
-/// an ordinary internet page that can reach loopback like any other.
-const DEFAULT_ORIGIN_HOSTS: &[&str] = &[
-    "http://localhost",
-    "https://localhost",
-    "http://127.0.0.1",
-    "https://127.0.0.1",
-    // MTA:SA's CEF. An origin is scheme + host + port and nothing else
-    // (RFC 6454), so this one has no trailing path to match a prefix against —
-    // it belongs here, where the host is matched exactly, and not with the
-    // runtimes above whose origin carries the resource name.
-    "http://mta",
-];
-
-// ── Wire types ───────────────────────────────────────────────────────────
-
-#[derive(Debug, Deserialize)]
-#[serde(tag = "type", rename_all = "lowercase")]
-enum GameMessage {
-    Hello(Hello),
-    Update(Update),
-    /// Press or release the user's push-to-talk, because they pressed their
-    /// in-game radio key. Refused unless the user allowed it in Settings.
-    Transmit { on: bool },
-    Ping,
-    Bye,
-}
-
-#[derive(Debug, Deserialize)]
-struct Hello {
-    /// SDK protocol version the mod speaks.
-    #[serde(default = "one")]
-    sdk: u32,
-    #[serde(default)]
-    game: String,
-    #[serde(default)]
-    resource: String,
-    /// `"players"` (the default): the mod places everybody, and VoIPC culls to
-    /// what it lists. `"beacon"`: the mod can only see where its own player
-    /// stands, so VoIPC broadcasts that position to the channel — encrypted
-    /// like voice — and the other members' beacons place them. Beacon mode
-    /// needs the user's consent, because it is the one thing here that puts
-    /// something on the wire.
-    #[serde(default)]
-    mode: Option<String>,
-    /// The server the mod expects us to be on, as `host:port`.
-    #[serde(default)]
-    server: Option<String>,
-    /// Channel to join by name (the game's ingame channel).
-    #[serde(default)]
-    channel: Option<String>,
-    #[serde(default)]
-    password: Option<String>,
-}
-
-fn one() -> u32 {
-    1
-}
-
-#[derive(Debug, Deserialize)]
-struct Update {
-    #[serde(rename = "self")]
-    own: Option<SelfState>,
-    #[serde(default)]
-    players: Vec<PlayerState>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SelfState {
-    pos: [f32; 3],
-    /// Facing in the x/y plane. `yaw` (degrees, 0 = +y, counter-clockwise) is
-    /// accepted instead, because that is what the GTA natives hand a script.
-    #[serde(default)]
-    fwd: Option<[f32; 2]>,
-    #[serde(default)]
-    yaw: Option<f32>,
-    /// Reverberation of the room the listener is in, 0–10: 0 outdoors, 4 a
-    /// room, 7 a garage, 10 a cathedral. Applied to the whole mix.
-    #[serde(default)]
-    reverb: Option<u8>,
-    /// How submerged the listener is, 0–10. Muffles and quietens everything.
-    #[serde(default)]
-    underwater: Option<u8>,
-}
-
-/// The listener's surroundings from one `self` object, clamped to the
-/// documented range. A field the mod leaves out is off, like every other
-/// omitted field. Free-standing so the clamp is testable without an app.
-fn reverb_water_from(own: &SelfState) -> (u8, u8) {
-    (
-        own.underwater.unwrap_or(0).min(MAX_UNDERWATER),
-        own.reverb.unwrap_or(0).min(MAX_REVERB),
-    )
-}
-
-/// One render of one voice: a player as they are heard, or one of the extra
-/// ways they are heard at the same moment.
-///
-/// The same seven fields either way — that symmetry is the point, so a mod
-/// never has to learn two shapes. The one rule that differs is `mode`; see
-/// [`source_from`].
-#[derive(Debug, Clone, Default, Deserialize)]
-struct RenderSpec {
-    #[serde(default)]
-    pos: Option<[f32; 3]>,
-    /// Distance at which this player becomes inaudible (whisper/normal/shout).
-    #[serde(default)]
-    range: Option<f32>,
-    #[serde(default)]
-    volume: Option<f32>,
-    /// Occlusion 0–10, as SaltyChat and YACA use it.
-    #[serde(default)]
-    muffle: Option<u8>,
-    /// "spatial" (default), "direct", "off", or the id of an effect chain.
-    #[serde(default)]
-    mode: Option<String>,
-    /// Which ear: −1 left, 0 centred (the default), +1 right. A phone held to
-    /// an ear, or ACRE2's LEFT/CENTER/RIGHT for a radio.
-    #[serde(default)]
-    pan: Option<f32>,
-    /// Hold this render back by up to [`MAX_DELAY_MS`], quantised to 20 ms
-    /// frames: the radio arriving a beat after the voice in the room.
-    #[serde(default)]
-    delay: Option<u32>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct PlayerState {
-    /// The player's VoIPC user id, published by the game server.
-    id: u32,
-    /// How this voice is heard. `mode: "off"` silences it, which is what a
-    /// caller on the far side of the map needs: no base render, layers only.
-    #[serde(flatten)]
-    spec: RenderSpec,
-    /// Up to [`MAX_LAYERS`] further renders of the same voice, each a full
-    /// spec of its own. Over the cap they are dropped, never refused —
-    /// rejecting a tick freezes the whole mix.
-    #[serde(default)]
-    layers: Vec<RenderSpec>,
 }
 
 // ── The listener ─────────────────────────────────────────────────────────
@@ -382,40 +215,10 @@ fn publish_listening(app: &tauri::AppHandle, error: Option<String>) {
     );
 }
 
-/// Who owns the mix right now.
-///
-/// One game at a time, and **one origin** at a time: the newest connection
-/// from the owner's own origin takes over (that is a resource restarting),
-/// while a connection from a different origin is refused for as long as the
-/// owner's socket lives. Without that second half, every `https://cfx-nui-*`
-/// page on the server — any third-party script, or a compromised one — could
-/// take the mix off the voice resource, and each takeover clears every
-/// placement, so two scripts fighting is silence.
-///
-/// `None` in `origin` is a native client (a plugin, `curl`); they are one
-/// class between themselves, exactly as the origin check already treats them.
-#[derive(Default, Clone)]
-struct Owner {
-    /// Generation of the owning connection; 0 = nobody owns the mix.
-    generation: u64,
-    origin: Option<String>,
-}
-
 type OwnerSlot = Arc<std::sync::Mutex<Owner>>;
 
 fn owner_slot(owner: &OwnerSlot) -> Owner {
     owner.lock().unwrap_or_else(|p| p.into_inner()).clone()
-}
-
-/// Must this `hello` be refused because another game already owns the mix?
-///
-/// Free-standing so the rule can be read and tested on its own: everything
-/// around it in `serve` is a socket. Nobody owning it, or the owner being this
-/// same connection, or a newer socket from the **same origin** (a resource
-/// restarting) all go through; a different origin does not, for as long as the
-/// owner's socket lives.
-fn owner_conflict(held: &Owner, generation: u64, origin: &Option<String>) -> bool {
-    held.generation != 0 && held.generation != generation && &held.origin != origin
 }
 
 /// How many live sockets each origin holds. A native client sends no `Origin`,
@@ -556,10 +359,12 @@ async fn serve(
     // A socket that connects and then says nothing must not pin a task. The
     // third value is this origin's slot (see `MAX_PER_ORIGIN`), held for the
     // life of the connection and released by its `Drop` however it ends.
-    let (mut buf, origin, _origin_slot) =
-        tokio::time::timeout(HANDSHAKE_TIMEOUT, handshake(&mut stream, &allowed, per_origin))
-            .await
-            .map_err(|_| anyhow::anyhow!("handshake timed out"))??;
+    let (mut buf, origin, _origin_slot) = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        handshake(&mut stream, &allowed, per_origin),
+    )
+    .await
+    .map_err(|_| anyhow::anyhow!("handshake timed out"))??;
     let (mut rd, mut wr) = stream.into_split();
 
     let mut bad_messages = 0u8;
@@ -575,6 +380,14 @@ async fn serve(
     // The server that id belongs to. Ids are per server as well as per
     // connection, so the same number on another server is somebody else.
     let mut hello_server: Option<String> = None;
+    // Where this socket's last `hello` put the player (server, channel id), and
+    // the user's move counter at that moment (`AppState::user_moved`). Once the
+    // user moves themselves, the game may not move them back; the socket is
+    // `parked` until they return to that channel on their own, and is then told
+    // so (`returned`).
+    let mut hello_target: Option<(String, u32)> = None;
+    let mut moved_at_hello: Option<u64> = None;
+    let mut parked = false;
     // The ids this socket listed in its last update. A mod is told about the
     // players it placed, and about the user — not about everybody else in the
     // channel, which it has no other way to enumerate.
@@ -619,11 +432,8 @@ async fn serve(
                         bad_messages = 0;
                         let now = tokio::time::Instant::now();
                         if last_hello.is_some_and(|t| now.duration_since(t) < MIN_HELLO_GAP) {
-                            send_text(
-                                &mut wr,
-                                r#"{"type":"error","reason":"one hello per second"}"#,
-                            )
-                            .await?;
+                            send_json(&mut wr, &error("rate_limited", "one hello per second"))
+                                .await?;
                             // A mod that answers the refusal with another hello
                             // is a loop at loopback line rate, and both ends
                             // parse JSON for as long as it runs. Ten of them and
@@ -642,16 +452,20 @@ async fn serve(
                         // join, so a refused hello cannot move the user.
                         if owner_conflict(&owner_slot(owner), generation, &origin) {
                             warn!(?origin, "game SDK refused a second game the mix");
-                            send_text(
+                            send_json(
                                 &mut wr,
-                                r#"{"type":"error","reason":"another game is already placing people"}"#,
+                                &error("mix_taken", "another game is already placing people"),
                             )
                             .await?;
                             continue;
                         }
                         let game = short_name(&hello.game, "a game");
                         let resource = short_name(&hello.resource, "");
-                        let (reply, answered_for) = on_hello(app, &hello).await;
+                        let may = may_move(moved_at_hello, user_moved(app));
+                        let (reply, answered_for) = on_hello(app, &hello, may).await;
+                        if reply.get("code").and_then(|c| c.as_str()) == Some("player_left") {
+                            parked = true;
+                        }
                         // Only a game that is actually in the channel owns the
                         // mix, and only then does the panel say one is connected
                         if reply.get("state").and_then(|s| s.as_str()) == Some("ingame") {
@@ -665,7 +479,10 @@ async fn serve(
                             };
                             hello_user_id =
                                 reply.get("user_id").and_then(|v| v.as_u64()).map(|v| v as u32);
-                            hello_server = answered_for;
+                            hello_server = answered_for.as_ref().map(|(server, _)| server.clone());
+                            hello_target = answered_for;
+                            moved_at_hello = Some(user_moved(app));
+                            parked = false;
                             listed.clear();
                             // Start listening from *now*. The join this hello
                             // just made is itself a channel change, and its
@@ -705,8 +522,7 @@ async fn serve(
                     Ok(GameMessage::Update(update)) => {
                         bad_messages = 0;
                         if owner_slot(owner).generation != generation {
-                            send_text(&mut wr, r#"{"type":"error","reason":"send hello first"}"#)
-                                .await?;
+                            send_json(&mut wr, &error("no_hello", "send hello first")).await?;
                             continue;
                         }
                         let now = tokio::time::Instant::now();
@@ -720,20 +536,21 @@ async fn serve(
                         let hello = hello_server.as_deref().zip(hello_user_id);
                         match apply_update(app, update, hello).await {
                             Ok(ids) => listed = ids,
-                            Err(reason) => {
-                                // "Send hello again" means we are not driving
+                            Err((mut code, reason)) => {
+                                // "Say hello again" means we are not driving
                                 // this channel any more, so the pushes stop
                                 // here too — not when the socket finally dies.
-                                if reason.contains("hello") {
+                                if code == "rehello" {
                                     hello_user_id = None;
                                     listed.clear();
+                                    // …and if the user walked away themselves,
+                                    // a hello will not bring them back.
+                                    if !may_move(moved_at_hello, user_moved(app)) {
+                                        code = "player_left";
+                                        parked = true;
+                                    }
                                 }
-                                send_text(
-                                    &mut wr,
-                                    &serde_json::json!({"type": "error", "reason": reason})
-                                        .to_string(),
-                                )
-                                .await?;
+                                send_json(&mut wr, &error(code, reason)).await?;
                             }
                         }
                     }
@@ -748,14 +565,22 @@ async fn serve(
                         if hello_user_id.is_none()
                             || owner_slot(owner).generation != generation
                         {
-                            send_text(&mut wr, r#"{"type":"error","reason":"send hello first"}"#)
-                                .await?;
+                            let reply = if !may_move(moved_at_hello, user_moved(app)) {
+                                parked = true;
+                                error("player_left", "the player left the channel this game joined")
+                            } else {
+                                error("no_hello", "send hello first")
+                            };
+                            send_json(&mut wr, &reply).await?;
                             continue;
                         }
                         if !transmit_allowed(app) {
-                            send_text(
+                            send_json(
                                 &mut wr,
-                                r#"{"type":"error","reason":"the player has not allowed a game to press their push-to-talk (Settings → Game Integration)"}"#,
+                                &error(
+                                    "transmit_not_allowed",
+                                    "the player has not allowed a game to press their push-to-talk (Settings → Game Integration)",
+                                ),
                             )
                             .await?;
                             continue;
@@ -797,13 +622,16 @@ async fn serve(
                         return Ok(());
                     }
                     Err(e) => {
+                        // A `type` this build does not know is a newer mod,
+                        // not a broken one: answered, never counted, so a 1.1
+                        // message cannot get a 1.0 client to hang up on it.
+                        if let Some(kind) = unknown_type(&text) {
+                            send_json(&mut wr, &error("unknown_type", format!("unknown type {kind}")))
+                                .await?;
+                            continue;
+                        }
                         bad_messages += 1;
-                        send_text(
-                            &mut wr,
-                            &serde_json::json!({"type": "error", "reason": e.to_string()})
-                                .to_string(),
-                        )
-                        .await?;
+                        send_json(&mut wr, &error("bad_message", e)).await?;
                         if bad_messages >= 3 {
                             anyhow::bail!("three malformed messages in a row");
                         }
@@ -820,6 +648,9 @@ async fn serve(
                 Ok(SdkEvent::Detached) => {
                     hello_user_id = None;
                     listed.clear();
+                    if !may_move(moved_at_hello, user_moved(app)) {
+                        parked = true;
+                    }
                     if holding_tx {
                         holding_tx = false;
                         // Only if the microphone is still ours to let go of:
@@ -830,6 +661,23 @@ async fn serve(
                     }
                 }
                 Ok(ev) => {
+                    // The user is back, by their own hand, where this game had
+                    // them: tell it, so its `hello` can arm it again.
+                    if parked
+                        && matches!(ev, SdkEvent::Moved)
+                        && owner_slot(owner).generation == generation
+                    {
+                        if let Some(target) = &hello_target {
+                            if back_in(app, target).await {
+                                parked = false;
+                                send_json(
+                                    &mut wr,
+                                    &serde_json::json!({"type": "state", "state": "returned"}),
+                                )
+                                .await?;
+                            }
+                        }
+                    }
                     // Losing the mix to another socket ends the pushes too
                     if hello_user_id.is_some() && owner_slot(owner).generation != generation {
                         hello_user_id = None;
@@ -858,9 +706,12 @@ async fn serve(
                 if releases_transmit(owner_slot(owner).generation, generation) {
                     release_transmit(app).await;
                 }
-                send_text(
+                send_json(
                     &mut wr,
-                    r#"{"type":"error","reason":"push-to-talk released after 60s — send transmit again to keep talking"}"#,
+                    &error(
+                        "transmit_expired",
+                        "push-to-talk released after 60s — send transmit again to keep talking",
+                    ),
                 )
                 .await?;
             }
@@ -938,76 +789,6 @@ fn event_message(
     Some(msg.to_string())
 }
 
-/// Which `hello.mode` this is, or why it is refused.
-///
-/// Free-standing for the same reason as [`owner_conflict`]: this is the gate
-/// on the only thing a mod can ask for that leaves the machine, and a gate
-/// worth having is a gate worth testing without a socket and an app around it.
-fn beacon_mode(mode: Option<&str>, allowed: bool) -> Result<bool, String> {
-    match mode {
-        None | Some("players") => Ok(false),
-        Some("beacon") if allowed => Ok(true),
-        Some("beacon") => Err("the player has not allowed a game to broadcast their position \
-                               (Settings → Game Integration)"
-            .into()),
-        Some(other) => Err(format!("unknown hello mode {other}")),
-    }
-}
-
-/// What one `transmit` frame does.
-#[derive(Debug, PartialEq, Eq)]
-enum TxStep {
-    /// The microphone is already in that state.
-    Repeat,
-    /// A press too soon after the last one; dropped.
-    RateLimited,
-    /// Press or release the microphone.
-    Act,
-}
-
-/// Should this `transmit` frame be acted on?
-///
-/// Free-standing so the rule can be read and tested without a socket — the two
-/// mistakes it exists to prevent are both invisible from inside `serve`:
-///
-/// - **Only a press is rate-limited.** Each edge takes the connection write
-///   lock and restarts the capture device, so a flood of them is a denial of
-///   service — but rate-limiting the *release* too meant a key tapped inside
-///   [`MIN_UPDATE_GAP`] left the microphone open until the 60 second cap, and a
-///   game's key handling runs per frame (~16 ms at 60 fps). A dropped press is
-///   "I was not heard", which the player notices at once; a dropped release is
-///   a hot mic, which they do not. Releases need no gate of their own: an
-///   accepted one always follows an accepted press, so the press gate bounds
-///   both.
-/// - **A repeat is not a no-op.** `docs/SDK.md` tells a mod to re-send
-///   `transmit: true` to keep a transmission past 60 seconds, so the caller
-///   refreshes the deadline on one.
-fn transmit_step(
-    on: bool,
-    held: bool,
-    last_tx: Option<tokio::time::Instant>,
-    now: tokio::time::Instant,
-) -> TxStep {
-    if on == held {
-        TxStep::Repeat
-    } else if on && last_tx.is_some_and(|t| now.duration_since(t) < MIN_UPDATE_GAP) {
-        TxStep::RateLimited
-    } else {
-        TxStep::Act
-    }
-}
-
-/// May this socket let go of the microphone on the user's behalf?
-///
-/// Only while it still owns the mix. A socket that was replaced by a newer one
-/// (a resource restarting) still believes it is holding the key it pressed, and
-/// its next event — or its 60 second timer — would otherwise release a hold the
-/// *new* socket has since taken, cutting a radio transmission mid-sentence.
-/// `ptt_sdk` is one flag for the whole app, so there is nobody else to ask.
-fn releases_transmit(owner_generation: u64, generation: u64) -> bool {
-    owner_generation == generation
-}
-
 /// Has the user allowed a game to press their push-to-talk? Read fresh every
 /// time, so unticking the box in Settings stops the next frame rather than the
 /// next connection.
@@ -1022,37 +803,34 @@ async fn release_transmit(app: &tauri::AppHandle) {
     let _ = crate::commands::sdk_set_transmit(&app.state::<AppState>(), app.clone(), false).await;
 }
 
-/// An attacker-controlled name on its way to a toast and a banner: capped, and
-/// stripped of anything that is not a printable character. A newline or a
-/// right-to-left override in a resource name is how "VoIPC: re-enter your
-/// password" gets drawn in VoIPC's own colours.
-fn short_name(raw: &str, fallback: &str) -> String {
-    let clean: String = raw
-        .chars()
-        .filter(|c| {
-            // Controls, the bidi embedding/override marks, the bidi isolates
-            // (U+2066–2069, which do the same job and are what a modern shaper
-            // actually honours), and the zero-width joiners and marks a name
-            // can hide a second name behind.
-            !c.is_control()
-                && !('\u{200b}'..='\u{200f}').contains(c)
-                && !('\u{202a}'..='\u{202e}').contains(c)
-                && !('\u{2066}'..='\u{2069}').contains(c)
-        })
-        .take(MAX_NAME)
-        .collect();
-    let clean = clean.trim();
-    if clean.is_empty() {
-        fallback.to_string()
-    } else {
-        clean.to_string()
-    }
-}
-
 /// Answer a `hello`: report who and where we are, and join the named channel.
-/// Also returns the server it answered for, when the game is now in its
-/// channel there: the identity every later `update` is checked against.
-async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> (serde_json::Value, Option<String>) {
+/// Also returns the server and channel it answered for, when the game is now in
+/// its channel there: the identity every later `update` is checked against.
+///
+/// `may_move` is false once the user has moved themselves since this socket's
+/// last `hello` ([`may_move`]): the hello then works only if they are already
+/// back in that channel.
+async fn on_hello(
+    app: &tauri::AppHandle,
+    hello: &Hello,
+    may_move: bool,
+) -> (serde_json::Value, Option<(String, u32)>) {
+    if hello.sdk != 1 {
+        let reason = format!("unsupported SDK version {}", hello.sdk);
+        return (error("sdk_version", reason), None);
+    }
+    // Beacon mode is the one thing a game can ask for that puts something on
+    // the wire, so the user has to have said yes to it first. Checked before
+    // the server, so the answer says nothing about where the user is.
+    let beacon_allowed = app.state::<AppState>().config().sdk_beacon_allowed;
+    let beacon = match beacon_mode(hello.mode.as_deref(), beacon_allowed) {
+        Ok(b) => b,
+        Err(reason) if hello.mode.as_deref() == Some("beacon") => {
+            return (error("beacon_not_allowed", reason), None)
+        }
+        Err(reason) => return (error("bad_mode", reason), None),
+    };
+
     let state = app.state::<AppState>();
     let conns = state.connections.read().await;
     if conns.is_empty() {
@@ -1063,10 +841,12 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> (serde_json::Value, 
     // would place people using coordinates from a different game session. The
     // field is required, so a mod cannot skip the check by leaving it out.
     //
-    // The refusal carries **no** connection: this is the one reply an origin
-    // that has never been near this server can provoke, and filling it in told
-    // any allowed page the user's id, name, mute state and — by guessing
-    // `server` until the answer changes — which server they are on.
+    // Every refusal from here to the join is the same `wrong_server`, with
+    // **no** connection in it. These are the replies an origin that has never
+    // been near this server can provoke, and any difference between them is an
+    // oracle: which servers the player is on, which channels exist there. A
+    // probe now needs server *and* channel right at once. The reason goes to
+    // the player, who is the one who can act on it.
     let voice_id = state.voice_id();
     let picked = hello.server.as_deref().and_then(|expected| {
         pick_server(
@@ -1076,25 +856,8 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> (serde_json::Value, 
         )
     });
     let Some(connection) = picked.and_then(|id| conns.get(id)) else {
-        return (state_message("wrong_server", None, None), None);
-    };
-
-    if hello.sdk != 1 {
-        return (
-            serde_json::json!({
-                "type": "error",
-                "reason": format!("unsupported SDK version {}", hello.sdk),
-            }),
-            None,
-        );
-    }
-
-    // Beacon mode is the one thing a game can ask for that puts something on
-    // the wire, so the user has to have said yes to it first.
-    let beacon_allowed = state.config().sdk_beacon_allowed;
-    let beacon = match beacon_mode(hello.mode.as_deref(), beacon_allowed) {
-        Ok(b) => b,
-        Err(reason) => return (serde_json::json!({ "type": "error", "reason": reason }), None),
+        let server = short_name(hello.server.as_deref().unwrap_or(""), "no server");
+        return refuse(app, hello, format!("VoIPC is not on {server}"));
     };
 
     // Naming the channel is required. Without it a mod armed itself on
@@ -1102,13 +865,7 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> (serde_json::Value, 
     // non-positional one, where the room view shows no "a game is placing
     // people" banner and yet every voice can still be given an effect.
     let Some(wanted) = hello.channel.as_deref().filter(|n| !n.is_empty()) else {
-        return (
-            serde_json::json!({
-                "type": "error",
-                "reason": "hello needs the channel your players talk in",
-            }),
-            None,
-        );
+        return refuse(app, hello, "its hello named no channel".into());
     };
     let channel = connection
         .channels
@@ -1116,14 +873,19 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> (serde_json::Value, 
         .ok()
         .and_then(|list| list.iter().find(|c| c.name == wanted).cloned());
     let Some(channel) = channel else {
-        return (
-            serde_json::json!({
-                "type": "error",
-                "reason": format!("no channel named {wanted}"),
-            }),
-            None,
-        );
+        let wanted = short_name(wanted, "");
+        return refuse(app, hello, format!("there is no channel named {wanted}"));
     };
+    // 18+ is the user's own word, given in the app once per server; a game
+    // cannot give it for them.
+    if channel.nsfw && !nsfw_consented(&state.config().ui_prefs, &connection.server_address) {
+        let wanted = short_name(wanted, "");
+        return refuse(
+            app,
+            hello,
+            format!("{wanted} is marked 18+: join it once in the app first"),
+        );
+    }
 
     // Everything needed after the guard is dropped: a stalled control stream
     // would otherwise park this task inside the lock, and the next
@@ -1147,6 +909,15 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> (serde_json::Value, 
     let joined = || {
         current_channel.load(Ordering::Relaxed) == channel_id && is_voice.load(Ordering::Relaxed)
     };
+    if !may_move && !joined() {
+        return (
+            error(
+                "player_left",
+                "the player left the channel this game joined",
+            ),
+            None,
+        );
+    }
     if current_channel.load(Ordering::Relaxed) != channel_id {
         // The user allowed games to do this (Game Integration is opt-in),
         // so the seat counts as asked for
@@ -1164,10 +935,7 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> (serde_json::Value, 
     while !joined() {
         if tokio::time::Instant::now() >= deadline {
             return (
-                serde_json::json!({
-                    "type": "error",
-                    "reason": format!("could not join {name}: timed out"),
-                }),
+                error("join_failed", format!("could not join {name}: timed out")),
                 None,
             );
         }
@@ -1179,13 +947,8 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> (serde_json::Value, 
                 // Only this server's refusal is about this join
                 if let Ok(SdkEvent::ChannelError { server: from, reason }) = event {
                     if from == server {
-                        return (
-                            serde_json::json!({
-                                "type": "error",
-                                "reason": format!("could not join {name}: {reason}"),
-                            }),
-                            None,
-                        );
+                        let reason = format!("could not join {name}: {reason}");
+                        return (error("join_failed", reason), None);
                     }
                 }
             }
@@ -1220,20 +983,54 @@ async fn on_hello(app: &tauri::AppHandle, hello: &Hello) -> (serde_json::Value, 
     // Confirms which mode the mod actually got — it asked, the user's settings
     // answered — and is what the toast reads to tell them what they allowed.
     msg["beacon"] = beacon.into();
-    (msg, Some(server))
+    (msg, Some((server, channel_id)))
 }
 
-/// Which open server a `hello` means. `server_matches` lets a mod leave the
-/// port out, so several open servers can match one `hello.server`: the one on
-/// exactly that `host:port` wins, then the one we are in voice on. `None` when
-/// nothing matches, which is the only case that answers `wrong_server`.
-fn pick_server<'a>(
-    expected: &str,
-    open: impl Iterator<Item = &'a str>,
-    voice: Option<&str>,
-) -> Option<&'a str> {
-    open.filter(|id| server_matches(expected, id))
-        .max_by_key(|id| (id.eq_ignore_ascii_case(expected), Some(*id) == voice))
+/// The one answer to a `hello` that names a server or channel we will not
+/// join (see `on_hello`). The detail goes to the log and to the player.
+fn refuse(
+    app: &tauri::AppHandle,
+    hello: &Hello,
+    detail: String,
+) -> (serde_json::Value, Option<(String, u32)>) {
+    let game = short_name(&hello.game, "a game");
+    let resource = short_name(&hello.resource, "");
+    info!(game, resource, "game SDK refused a hello: {detail}");
+    let _ = app.emit(
+        "sdk-status",
+        serde_json::json!({"refused": detail, "game": game, "resource": resource}),
+    );
+    (state_message("wrong_server", None, None), None)
+}
+
+/// An error frame. `code` is the stable part a mod matches on (the table in
+/// docs/SDK.md); `reason` is for people and may change.
+fn error(code: &str, reason: impl std::fmt::Display) -> serde_json::Value {
+    serde_json::json!({"type": "error", "code": code, "reason": reason.to_string()})
+}
+
+/// The `type` of a JSON object this build has no message for, if that is
+/// what failed to parse.
+fn unknown_type(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let kind = value.get("type")?.as_str()?;
+    let known = ["hello", "update", "transmit", "ping", "bye"];
+    (!known.contains(&kind)).then(|| short_name(kind, "?"))
+}
+
+/// The user's voice-move counter (`AppState::user_moved`).
+fn user_moved(app: &tauri::AppHandle) -> u64 {
+    app.state::<AppState>().user_moved.load(Ordering::Relaxed)
+}
+
+/// Is the user in this channel on this server, with voice there?
+async fn back_in(app: &tauri::AppHandle, (server, channel_id): &(String, u32)) -> bool {
+    let state = app.state::<AppState>();
+    let conns = state.connections.read().await;
+    conns.get(server).is_some_and(|c| {
+        c.current_channel_id.load(Ordering::Relaxed) == *channel_id
+            && c.is_voice.load(Ordering::Relaxed)
+    })
 }
 
 /// Apply one bulk update. Players the game leaves out are silent — that is how
@@ -1246,13 +1043,13 @@ async fn apply_update(
     app: &tauri::AppHandle,
     update: Update,
     hello: Option<(&str, u32)>,
-) -> Result<std::collections::HashSet<u32>, String> {
+) -> Result<std::collections::HashSet<u32>, (&'static str, String)> {
     let state = app.state::<AppState>();
     let conns = state.connections.read().await;
     // The call is what a game places people in; a server we merely have open
     // has nobody to place.
-    let connection =
-        crate::app_state::voice(&state, &conns).map_err(|_| "not in a voice channel")?;
+    let connection = crate::app_state::voice(&state, &conns)
+        .map_err(|_| ("not_in_voice", "not in a voice channel".to_string()))?;
 
     // The server issues fresh user ids on every connection: after a VoIPC
     // reconnect the mod's ids name nobody, and applying them would cull every
@@ -1260,10 +1057,16 @@ async fn apply_update(
     // same for a call that moved to another server, where they name strangers.
     if let Some((server, id)) = hello {
         if server != connection.server_address {
-            return Err("voice moved to another server — send hello again".into());
+            return Err((
+                "rehello",
+                "voice moved to another server — send hello again".into(),
+            ));
         }
         if id != connection.user_id {
-            return Err("reconnected to the server — send hello again".into());
+            return Err((
+                "rehello",
+                "reconnected to the server — send hello again".into(),
+            ));
         }
     }
 
@@ -1279,7 +1082,10 @@ async fn apply_update(
         if spatial.sdk_channel != Some(here) {
             spatial.sdk_active = false;
             spatial.clear_positions();
-            return Err("left the channel this game joined — send hello again".into());
+            return Err((
+                "rehello",
+                "left the channel this game joined — send hello again".into(),
+            ));
         }
 
         // Updates arrive 4-10 times a second; each one is glided over the gap to
@@ -1295,7 +1101,7 @@ async fn apply_update(
 
         if let Some(own) = update.own {
             if !own.pos.iter().all(|c| c.is_finite()) {
-                return Err("self position must be finite".into());
+                return Err(("bad_update", "self position must be finite".into()));
             }
             let target = Listener {
                 pos: own.pos,
@@ -1329,7 +1135,8 @@ async fn apply_update(
             return Ok(std::collections::HashSet::new());
         }
 
-        let placed = sources_from(update.players, &spatial.motion, over, now)?;
+        let placed = sources_from(update.players, &spatial.motion, over, now)
+            .map_err(|reason| ("bad_update", reason))?;
         let audible = placed.audible();
         let was: std::collections::HashSet<u32> = spatial
             .sources
@@ -1374,10 +1181,7 @@ fn channel_is_routed(connection: &crate::app_state::ActiveConnection, channel_id
         .channels
         .lock()
         .ok()
-        .is_some_and(|list| {
-            list.iter()
-                .any(|c| c.channel_id == channel_id && c.routed)
-        })
+        .is_some_and(|list| list.iter().any(|c| c.channel_id == channel_id && c.routed))
 }
 
 /// Stop asking the relay to cull for us. Sent whenever the game stops driving
@@ -1390,128 +1194,6 @@ async fn clear_audio_filter(connection: &crate::app_state::ActiveConnection) {
         &voipc_protocol::messages::ClientMessage::SetAudioFilter { allow: None },
     )
     .await;
-}
-
-/// Turn one update's `players` into placements and glides.
-///
-/// Free-standing and synchronous, so every rule below can be tested without an
-/// app, a connection or a socket: the whole of `apply_update` around it is
-/// locks and `await`s.
-fn sources_from(
-    players: Vec<PlayerState>,
-    prev_motion: &HashMap<u32, Motion>,
-    over: std::time::Duration,
-    now: std::time::Instant,
-) -> Result<Placements, String> {
-    let mut out = Placements {
-        sources: HashMap::with_capacity(players.len()),
-        layers: HashMap::new(),
-        motion: HashMap::with_capacity(players.len()),
-    };
-    let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    for player in players {
-        // Two entries for one id is not a mod being sloppy: on a game server
-        // where players publish their own VoIPC id (which is the documented
-        // trust model), it is how one player claims another's — the second
-        // entry would win the insert, and that speaker would be heard at the
-        // claimer's position, or culled. Refuse the whole update instead.
-        if !seen.insert(player.id) {
-            return Err(format!("player {} is listed twice", player.id));
-        }
-        // Over the cap they are dropped rather than refused: a tick the mixer
-        // never applies is a frozen mix, which is worse than a missing layer.
-        let extra: Vec<Source> = player
-            .layers
-            .iter()
-            .take(MAX_LAYERS)
-            .map(|spec| source_from(spec, false, player.id))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter()
-            .flatten()
-            .collect();
-        if !extra.is_empty() {
-            out.layers.insert(player.id, extra);
-        }
-        // `mode: "off"` leaves the base render out, which is how a mod says
-        // "you hear this person only through the layers" — the caller across
-        // the map, who has no position in your world at all.
-        let Some(src) = source_from(&player.spec, true, player.id)? else {
-            continue;
-        };
-        if !src.direct {
-            // Someone the game listed before glides on; a newcomer, or someone
-            // who was culled and came back, snaps.
-            out.motion.insert(
-                player.id,
-                match prev_motion.get(&player.id) {
-                    Some(prev) => Motion::glide(prev, src.pos, over, now),
-                    None => Motion::snap(src.pos, now),
-                },
-            );
-        }
-        out.sources.insert(player.id, src);
-    }
-    Ok(out)
-}
-
-/// What one update places: a base render per player, the extra renders some of
-/// them carry, and the glides for whatever is positional.
-#[derive(Debug)]
-struct Placements {
-    sources: HashMap<u32, Source>,
-    layers: HashMap<u32, Vec<Source>>,
-    motion: HashMap<u32, Motion>,
-}
-
-impl Placements {
-    /// Everybody the game is letting through, base render or layer. A player
-    /// heard only through a layer is still heard.
-    fn audible(&self) -> std::collections::HashSet<u32> {
-        self.sources.keys().chain(self.layers.keys()).copied().collect()
-    }
-}
-
-/// One render from one spec, or `None` for `mode: "off"`.
-///
-/// `base` picks between the two `mode` rules:
-///
-/// - On the **base** render a chain implies `direct`. That is documented, and
-///   mods rely on it: `mode: "radio"` means "not coming from the world".
-/// - On a **layer**, `pos` decides. A layer may therefore be positional *and*
-///   carry a chain, which is the whole unlock for the case nobody else does:
-///   the tinny earpiece leaking out of the phone at the speaker's own head,
-///   two metres away from you, while their real voice carries across the room.
-fn source_from(spec: &RenderSpec, base: bool, id: u32) -> Result<Option<Source>, String> {
-    let mode = spec.mode.as_deref();
-    if mode == Some("off") {
-        return Ok(None);
-    }
-    let fx = mode.map_or(Effect::None, effect_from_str);
-    let direct = if base {
-        fx != Effect::None || mode == Some("direct")
-    } else {
-        spec.pos.is_none() || mode == Some("direct")
-    };
-    let pos = spec.pos.unwrap_or([0.0; 3]);
-    if !pos.iter().all(|c| c.is_finite()) {
-        return Err(format!("position of player {id} must be finite"));
-    }
-    // Every float is checked: one NaN would make the gains NaN and, through
-    // the mixer's ramp state, silence that source for good.
-    let range = spec.range.filter(|r| r.is_finite()).unwrap_or(DEFAULT_RANGE);
-    let volume = spec.volume.filter(|v| v.is_finite()).unwrap_or(1.0);
-    let pan = spec.pan.filter(|p| p.is_finite()).unwrap_or(0.0);
-    Ok(Some(Source {
-        pos,
-        range: range.max(0.01),
-        volume: volume.clamp(0.0, 2.0),
-        muffle: spec.muffle.unwrap_or(0).min(MAX_MUFFLE),
-        direct,
-        fx,
-        pan: pan.clamp(-1.0, 1.0),
-        // Capped before it is divided, so `delay` cannot ask for a ring
-        delay_frames: (spec.delay.unwrap_or(0).min(MAX_DELAY_MS) / FRAME_MS) as u8,
-    }))
 }
 
 /// The game is gone: hand the mix back to the plain per-user volumes. Waits
@@ -1528,7 +1210,10 @@ async fn clear_sdk_positions(app: &tauri::AppHandle) {
         }
         clear_audio_filter(connection).await;
     }
-    let _ = app.emit("sdk-audible", serde_json::json!({ "ids": serde_json::Value::Null }));
+    let _ = app.emit(
+        "sdk-audible",
+        serde_json::json!({ "ids": serde_json::Value::Null }),
+    );
 }
 
 fn state_message(
@@ -1565,74 +1250,11 @@ fn state_message(
     msg
 }
 
-/// Unit forward vector from either form the mod may send.
-fn facing(fwd: Option<[f32; 2]>, yaw: Option<f32>) -> [f32; 2] {
-    if let Some(f) = fwd {
-        let len = (f[0] * f[0] + f[1] * f[1]).sqrt();
-        if len.is_finite() && len > 1e-6 {
-            return [f[0] / len, f[1] / len];
-        }
-    }
-    if let Some(deg) = yaw.filter(|d| d.is_finite()) {
-        // GTA heading: 0 faces +y, increasing counter-clockwise
-        let rad = deg.to_radians();
-        return [-rad.sin(), rad.cos()];
-    }
-    [0.0, 1.0]
-}
-
-/// Do two `host:port` strings name the same server? A missing port on either
-/// side means "any port", so a mod may just say the host.
-fn server_matches(expected: &str, actual: &str) -> bool {
-    let split = |s: &str| -> (String, Option<String>) {
-        match s.rsplit_once(':') {
-            Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => {
-                (h.to_ascii_lowercase(), Some(p.to_string()))
-            }
-            _ => (s.to_ascii_lowercase(), None),
-        }
-    };
-    let (eh, ep) = split(expected);
-    let (ah, ap) = split(actual);
-    eh == ah && (ep.is_none() || ap.is_none() || ep == ap)
-}
-
 // ── WebSocket (the subset a game's web view speaks) ──────────────────────
 
 // bernd: text frames, no fragmentation, no extensions — a NUI page sends
 // one small JSON object per frame. The framing is voipc_protocol::ws, which
 // the TCP fallback shares; tokio-tungstenite if a client ever needs more.
-
-#[derive(Debug)]
-enum Frame {
-    Text(String),
-    Ping(Vec<u8>),
-    Close,
-    Other,
-}
-
-/// One frame from the front of `buf`, and how many bytes it used; `None` while
-/// it is still incomplete.
-///
-/// Pure, which is what makes [`read_frame`] cancel-safe: nothing leaves `buf`
-/// until a whole frame is there, so a `select!` that drops the future mid-read
-/// loses nothing.
-fn parse_frame(buf: &[u8]) -> anyhow::Result<Option<(Frame, usize)>> {
-    // RFC 6455 §5.1: a client frame that is not masked fails the connection
-    let Some((frame, used)) = ws::parse_frame(buf, true, MAX_FRAME)? else {
-        return Ok(None);
-    };
-    if !frame.fin || frame.opcode == ws::OP_CONTINUATION {
-        anyhow::bail!("fragmented frames are not supported");
-    }
-    let frame = match frame.opcode {
-        ws::OP_TEXT => Frame::Text(String::from_utf8(frame.payload)?),
-        ws::OP_CLOSE => Frame::Close,
-        ws::OP_PING => Frame::Ping(frame.payload),
-        _ => Frame::Other,
-    };
-    Ok(Some((frame, used)))
-}
 
 /// Read and answer the upgrade request.
 ///
@@ -1679,7 +1301,10 @@ async fn handshake(
     if let Some(origin) = upgrade.origin.as_deref() {
         if !origin_allowed(origin, extra_origins) {
             reject(stream, "403 Forbidden").await;
-            warn!(origin, "game SDK rejected a connection from an unknown origin");
+            warn!(
+                origin,
+                "game SDK rejected a connection from an unknown origin"
+            );
             anyhow::bail!("origin not allowed: {origin}");
         }
     }
@@ -1719,19 +1344,6 @@ async fn reject(stream: &mut TcpStream, status: &str) {
         .await;
 }
 
-fn origin_allowed(origin: &str, extra: &[String]) -> bool {
-    let origin = origin.trim();
-    let host_match = |host: &str| {
-        // Exactly the host, or the host followed by a port — never a longer
-        // name that merely starts with it
-        origin == host || origin.strip_prefix(host).is_some_and(|rest| rest.starts_with(':'))
-    };
-    DEFAULT_ORIGIN_PREFIXES.iter().any(|p| origin.starts_with(p))
-        || DEFAULT_ORIGIN_HOSTS.iter().any(|h| host_match(h))
-        // What the user typed into Settings is matched exactly, for the same reason
-        || extra.iter().any(|p| p == origin)
-}
-
 /// Reads one frame. `Ok(None)` means the peer closed.
 async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
     rd: &mut R,
@@ -1755,6 +1367,13 @@ async fn read_frame<R: tokio::io::AsyncRead + Unpin>(
         }
         buf.extend_from_slice(&chunk[..n]);
     }
+}
+
+async fn send_json<W: tokio::io::AsyncWrite + Unpin>(
+    stream: &mut W,
+    msg: &serde_json::Value,
+) -> anyhow::Result<()> {
+    send_text(stream, &msg.to_string()).await
 }
 
 async fn send_text<W: tokio::io::AsyncWrite + Unpin>(
@@ -1781,18 +1400,47 @@ async fn write_frame<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
+/// Whether the user said yes to this server's 18+ channels (channel-ui.ts
+/// `hasNsfwConsent`: the server key is `host:port`, an IPv6 host unbracketed).
+fn nsfw_consented(ui_prefs: &serde_json::Value, server: &str) -> bool {
+    let key = server.replacen('[', "", 1).replacen("]:", ":", 1);
+    ui_prefs["nsfw_ok"]
+        .as_array()
+        .is_some_and(|ok| ok.iter().any(|v| v.as_str() == Some(key.as_str())))
+}
+
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn an_18_plus_channel_needs_the_users_own_yes() {
+        let prefs = serde_json::json!({ "nsfw_ok": ["a.example:9987", "::1:9987"] });
+        assert!(nsfw_consented(&prefs, "a.example:9987"));
+        assert!(
+            nsfw_consented(&prefs, "[::1]:9987"),
+            "the same key as the front end's"
+        );
+        assert!(!nsfw_consented(&prefs, "b.example:9987"));
+        assert!(!nsfw_consented(&serde_json::Value::Null, "a.example:9987"));
+    }
     use super::*;
+    use voipc_audio::game::*;
+    use voipc_audio::spatial::*;
 
     #[test]
     fn origins_are_limited_to_game_runtimes_unless_allowed() {
         assert!(origin_allowed("https://cfx-nui-my-voice", &[]));
-        assert!(origin_allowed("http://resource/voice", &[]));
+        assert!(origin_allowed("https://cfx-nui-voice_2", &[]));
+        // What alt:V and RAGE:MP actually send: an origin has no path
+        assert!(origin_allowed("http://resource", &[]));
+        assert!(origin_allowed("http://package", &[]));
         assert!(origin_allowed("http://localhost:3000", &[]));
         assert!(origin_allowed("http://localhost", &[]));
         assert!(origin_allowed("http://127.0.0.1:8080", &[]));
-        assert!(origin_allowed("http://mta", &[]), "MTA:SA's CEF was refused");
+        assert!(
+            origin_allowed("http://mta", &[]),
+            "MTA:SA's CEF was refused"
+        );
         // A page from the internet cannot drive the mix, even from loopback
         assert!(!origin_allowed("https://evil.example", &[]));
         assert!(!origin_allowed("null", &[]));
@@ -1815,6 +1463,17 @@ mod tests {
             // MTA's origin is a bare host, which makes it exactly the shape a
             // registrable domain can imitate
             "http://mta.attacker.example",
+            // A host name may start with cfx-nui- too (H4-01): only a single
+            // label is a FiveM runtime
+            "https://cfx-nui-x.evil.example",
+            "https://cfx-nui-voice.attacker.com:8443",
+            "https://cfx-nui-a:443",
+            "https://cfx-nui-a/b",
+            "https://cfx-nui-",
+            "http://cfx-nui-voice",
+            "http://resource.evil.example",
+            "http://package:80.evil.example",
+            "http://resource/voice",
         ] {
             assert!(!origin_allowed(origin, &[]), "{origin} must be refused");
         }
@@ -1829,7 +1488,10 @@ mod tests {
         assert!(server_matches("rp.example.com:9987", "rp.example.com:9987"));
         assert!(server_matches("rp.example.com", "rp.example.com:9987"));
         assert!(server_matches("RP.Example.com:9987", "rp.example.com:9987"));
-        assert!(!server_matches("rp.example.com:9988", "rp.example.com:9987"));
+        assert!(!server_matches(
+            "rp.example.com:9988",
+            "rp.example.com:9987"
+        ));
         assert!(!server_matches("other.example.com", "rp.example.com:9987"));
     }
 
@@ -1837,9 +1499,8 @@ mod tests {
     fn a_hello_picks_the_exact_server_then_the_one_in_voice() {
         let (a, b) = ("rp.example.com:9987", "rp.example.com:9988");
         let open = [a, b, "other.example:9987"];
-        let pick = |expected: &str, voice: Option<&str>| {
-            pick_server(expected, open.into_iter(), voice)
-        };
+        let pick =
+            |expected: &str, voice: Option<&str>| pick_server(expected, open.into_iter(), voice);
         // The port settles it whenever the mod names one
         assert_eq!(pick(b, Some(a)), Some(b));
         assert_eq!(pick("RP.Example.com:9987", None), Some(a));
@@ -1930,20 +1591,17 @@ mod tests {
 
     #[test]
     fn frames_are_written_with_the_right_length_form() {
-        let short = frame_bytes(0x1, &vec![b'x'; 10]);
+        let short = frame_bytes(0x1, &[b'x'; 10]);
         assert_eq!(short[0], 0x81);
         assert_eq!(short[1], 10);
 
-        let medium = frame_bytes(0x1, &vec![b'x'; 200]);
+        let medium = frame_bytes(0x1, &[b'x'; 200]);
         assert_eq!(medium[1], 126);
         assert_eq!(u16::from_be_bytes([medium[2], medium[3]]), 200);
 
         let long = frame_bytes(0x1, &vec![b'x'; 70_000]);
         assert_eq!(long[1], 127);
-        assert_eq!(
-            u64::from_be_bytes(long[2..10].try_into().unwrap()),
-            70_000
-        );
+        assert_eq!(u64::from_be_bytes(long[2..10].try_into().unwrap()), 70_000);
     }
 
     /// The framing half of `write_frame`, without a socket.
@@ -1956,7 +1614,12 @@ mod tests {
     /// A client frame, which unlike a server frame must be masked.
     fn masked_frame(opcode: u8, payload: &[u8]) -> Vec<u8> {
         let mut frame = Vec::new();
-        ws::encode_frame(&mut frame, opcode, &[payload], Some([0xA1, 0xB2, 0xC3, 0xD4]));
+        ws::encode_frame(
+            &mut frame,
+            opcode,
+            &[payload],
+            Some([0xA1, 0xB2, 0xC3, 0xD4]),
+        );
         frame
     }
 
@@ -1977,8 +1640,14 @@ mod tests {
                 .collect::<Vec<_>>()
                 .join("\r\n")
         };
-        assert_eq!(ws::parse_upgrade(&without("upgrade")), Err("400 Bad Request"));
-        assert_eq!(ws::parse_upgrade(&without("sec-websocket-key")), Err("400 Bad Request"));
+        assert_eq!(
+            ws::parse_upgrade(&without("upgrade")),
+            Err("400 Bad Request")
+        );
+        assert_eq!(
+            ws::parse_upgrade(&without("sec-websocket-key")),
+            Err("400 Bad Request")
+        );
         // A version we do not speak gets 426, and the reply names 13
         assert_eq!(
             ws::parse_upgrade(&UPGRADE.replace("Version: 13", "Version: 8")),
@@ -2002,7 +1671,10 @@ mod tests {
         assert!(parse_frame(&[]).unwrap().is_none());
 
         // RFC 6455: a client frame must be masked
-        assert!(parse_frame(&frame_bytes(0x1, b"hello")).is_err(), "unmasked frame accepted");
+        assert!(
+            parse_frame(&frame_bytes(0x1, b"hello")).is_err(),
+            "unmasked frame accepted"
+        );
         // Fragments are refused rather than half-read
         let mut fragment = masked_frame(0x1, b"x");
         fragment[0] &= 0x7f;
@@ -2037,7 +1709,10 @@ mod tests {
         let listed = placed(&[7]);
         // Somebody else: a plain talk message, our own state untouched
         let msg = event_message(
-            &SdkEvent::Talk { user_id: 7, speaking: true },
+            &SdkEvent::Talk {
+                user_id: 7,
+                speaking: true,
+            },
             Some(42),
             &mut own,
             &listed,
@@ -2049,9 +1724,20 @@ mod tests {
         assert!(!own.speaking);
 
         // Ourselves: a `self` message carrying every field
-        event_message(&SdkEvent::Muted { user_id: 42, muted: true }, Some(42), &mut own, &listed);
+        event_message(
+            &SdkEvent::Muted {
+                user_id: 42,
+                muted: true,
+            },
+            Some(42),
+            &mut own,
+            &listed,
+        );
         let msg = event_message(
-            &SdkEvent::Talk { user_id: 42, speaking: true },
+            &SdkEvent::Talk {
+                user_id: 42,
+                speaking: true,
+            },
             Some(42),
             &mut own,
             &listed,
@@ -2063,7 +1749,10 @@ mod tests {
 
         // A socket that never said hello, and events that are not the mod's
         assert!(event_message(
-            &SdkEvent::Talk { user_id: 7, speaking: true },
+            &SdkEvent::Talk {
+                user_id: 7,
+                speaking: true
+            },
             None,
             &mut own,
             &listed
@@ -2085,22 +1774,44 @@ mod tests {
         let mut own = Own::default();
         let listed = placed(&[7]);
         let talk = |id: u32, own: &mut Own| {
-            event_message(&SdkEvent::Talk { user_id: id, speaking: true }, Some(42), own, &listed)
+            event_message(
+                &SdkEvent::Talk {
+                    user_id: id,
+                    speaking: true,
+                },
+                Some(42),
+                own,
+                &listed,
+            )
         };
-        assert!(talk(7, &mut own).is_some(), "a placed player must be reported");
+        assert!(
+            talk(7, &mut own).is_some(),
+            "a placed player must be reported"
+        );
         assert!(talk(9, &mut own).is_none(), "an unplaced player leaked");
         // Ours always goes out: it is the user's own state, to the user's game
         assert!(talk(42, &mut own).is_some());
         assert!(
-            event_message(&SdkEvent::Muted { user_id: 9, muted: true }, Some(42), &mut own, &listed)
-                .is_none(),
+            event_message(
+                &SdkEvent::Muted {
+                    user_id: 9,
+                    muted: true
+                },
+                Some(42),
+                &mut own,
+                &listed
+            )
+            .is_none(),
             "an unplaced player's mute leaked"
         );
 
         // And with nothing placed yet, only our own state is pushed
         let empty = placed(&[]);
         assert!(event_message(
-            &SdkEvent::Talk { user_id: 7, speaking: true },
+            &SdkEvent::Talk {
+                user_id: 7,
+                speaking: true
+            },
             Some(42),
             &mut own,
             &empty
@@ -2112,7 +1823,9 @@ mod tests {
     fn a_proximity_change_is_pushed_as_a_partial_state() {
         let mut own = Own::default();
         let msg = event_message(
-            &SdkEvent::Proximity { mode: ProximityMode::Off },
+            &SdkEvent::Proximity {
+                mode: ProximityMode::Off,
+            },
             Some(42),
             &mut own,
             &placed(&[]),
@@ -2141,17 +1854,35 @@ mod tests {
         let nobody = Owner::default();
         let fivem = Some("https://cfx-nui-my-voice".to_string());
         let other = Some("https://cfx-nui-some-menu".to_string());
-        let held = Owner { generation: 7, origin: fivem.clone() };
+        let held = Owner {
+            generation: 7,
+            origin: fivem.clone(),
+        };
 
-        assert!(!owner_conflict(&nobody, 9, &fivem), "an idle mix was refused");
-        assert!(!owner_conflict(&held, 7, &fivem), "the owner was refused its own mix");
+        assert!(
+            !owner_conflict(&nobody, 9, &fivem),
+            "an idle mix was refused"
+        );
+        assert!(
+            !owner_conflict(&held, 7, &fivem),
+            "the owner was refused its own mix"
+        );
         // A resource restarting: same origin, newer socket, takes over
         assert!(!owner_conflict(&held, 9, &fivem));
         // Anybody else waits until that socket dies
-        assert!(owner_conflict(&held, 9, &other), "a second origin took the mix");
-        assert!(owner_conflict(&held, 9, &None), "a native client took the mix");
+        assert!(
+            owner_conflict(&held, 9, &other),
+            "a second origin took the mix"
+        );
+        assert!(
+            owner_conflict(&held, 9, &None),
+            "a native client took the mix"
+        );
         // Native clients have no Origin to tell apart, so they are one class
-        let native = Owner { generation: 7, origin: None };
+        let native = Owner {
+            generation: 7,
+            origin: None,
+        };
         assert!(!owner_conflict(&native, 9, &None));
         assert!(owner_conflict(&native, 9, &fivem));
     }
@@ -2206,7 +1937,10 @@ mod tests {
         );
 
         // A press that soon after a press is still a flood, and still refused
-        assert_eq!(transmit_step(true, false, Some(t0), soon), TxStep::RateLimited);
+        assert_eq!(
+            transmit_step(true, false, Some(t0), soon),
+            TxStep::RateLimited
+        );
         // …and once the window has passed it goes through
         assert_eq!(
             transmit_step(true, false, Some(t0), t0 + MIN_UPDATE_GAP),
@@ -2227,8 +1961,51 @@ mod tests {
         // release a hold the *new* socket has since taken, cutting a radio
         // transmission mid-sentence; `ptt_sdk` is one flag for the whole app.
         assert!(releases_transmit(7, 7), "the owner could not let go");
-        assert!(!releases_transmit(9, 7), "a replaced socket released the new owner's hold");
-        assert!(!releases_transmit(0, 7), "a socket released a mix nobody owns");
+        assert!(
+            !releases_transmit(9, 7),
+            "a replaced socket released the new owner's hold"
+        );
+        assert!(
+            !releases_transmit(0, 7),
+            "a socket released a mix nobody owns"
+        );
+    }
+
+    #[test]
+    fn the_players_own_move_wins_over_a_games_hello() {
+        // H4-03: the player leaves the game's channel (or voice, or takes the
+        // call to another server). The mod is told "say hello again" for the
+        // reconnect case and used to send it for this one too, which put the
+        // player straight back — microphone open, in VAD.
+        assert!(may_move(None, 5), "a socket's first hello may join");
+        assert!(may_move(Some(5), 5), "nothing moved since its hello");
+        assert!(!may_move(Some(5), 6), "a hello undid the player's own move");
+    }
+
+    #[test]
+    fn an_unknown_type_is_a_newer_mod_not_a_broken_one() {
+        assert_eq!(
+            unknown_type(r#"{"type":"whisper","to":7}"#).as_deref(),
+            Some("whisper")
+        );
+        // Known types that fail on their fields, and things that are not
+        // messages at all, still count toward the close
+        assert_eq!(unknown_type(r#"{"type":"update","players":5}"#), None);
+        assert_eq!(unknown_type(r#"{"to":7}"#), None);
+        assert_eq!(unknown_type("not json"), None);
+        // The name is echoed back, so it is cleaned like any other mod string
+        assert_eq!(
+            unknown_type("{\"type\":\"a\\u202eb\"}").as_deref(),
+            Some("ab")
+        );
+    }
+
+    #[test]
+    fn every_error_carries_a_code() {
+        let msg = error("rate_limited", "one hello per second");
+        assert_eq!(msg["type"], "error");
+        assert_eq!(msg["code"], "rate_limited");
+        assert_eq!(msg["reason"], "one hello per second");
     }
 
     #[test]
@@ -2254,8 +2031,18 @@ mod tests {
         // state, and let it find their server by guessing `server` until the
         // answer changed.
         let msg = state_message("wrong_server", None, None);
-        for field in ["user_id", "username", "muted", "deafened", "proximity", "channel"] {
-            assert!(msg.get(field).is_none(), "{field} leaked in a refusal: {msg}");
+        for field in [
+            "user_id",
+            "username",
+            "muted",
+            "deafened",
+            "proximity",
+            "channel",
+        ] {
+            assert!(
+                msg.get(field).is_none(),
+                "{field} leaked in a refusal: {msg}"
+            );
         }
         // What a mod legitimately needs to report the problem stays
         assert_eq!(msg["state"], "wrong_server");
@@ -2278,13 +2065,21 @@ mod tests {
     fn player(id: u32) -> PlayerState {
         PlayerState {
             id,
-            spec: RenderSpec { pos: Some([1.0, 2.0, 3.0]), ..RenderSpec::default() },
+            spec: RenderSpec {
+                pos: Some([1.0, 2.0, 3.0]),
+                ..RenderSpec::default()
+            },
             layers: Vec::new(),
         }
     }
 
     fn place(players: Vec<PlayerState>) -> Result<Placements, String> {
-        sources_from(players, &HashMap::new(), MIN_GLIDE, std::time::Instant::now())
+        sources_from(
+            players,
+            &HashMap::new(),
+            MIN_GLIDE,
+            std::time::Instant::now(),
+        )
     }
 
     #[test]
@@ -2301,7 +2096,10 @@ mod tests {
         assert_eq!(placed.motion.len(), 2);
         // …and a duplicate is caught even when neither has a base render
         let silent = |id| PlayerState {
-            spec: RenderSpec { mode: Some("off".into()), ..RenderSpec::default() },
+            spec: RenderSpec {
+                mode: Some("off".into()),
+                ..RenderSpec::default()
+            },
             ..player(id)
         };
         assert!(place(vec![silent(7), silent(7)]).is_err());
@@ -2310,10 +2108,12 @@ mod tests {
     #[test]
     fn a_placement_is_clamped_and_a_nan_is_refused() {
         let one = |spec: RenderSpec| {
-            place(vec![PlayerState { spec, ..player(1) }])
-                .map(|p| (p.sources[&1], p.motion.len()))
+            place(vec![PlayerState { spec, ..player(1) }]).map(|p| (p.sources[&1], p.motion.len()))
         };
-        let base = RenderSpec { pos: Some([0.0; 3]), ..RenderSpec::default() };
+        let base = RenderSpec {
+            pos: Some([0.0; 3]),
+            ..RenderSpec::default()
+        };
 
         let (src, glides) = one(base.clone()).unwrap();
         assert_eq!((src.range, src.volume, src.muffle), (DEFAULT_RANGE, 1.0, 0));
@@ -2340,17 +2140,29 @@ mod tests {
         );
 
         // A chain implies `direct` on the base, and a direct source gets no glide
-        let (src, glides) = one(RenderSpec { mode: Some("walkie".into()), ..base.clone() }).unwrap();
+        let (src, glides) = one(RenderSpec {
+            mode: Some("walkie".into()),
+            ..base.clone()
+        })
+        .unwrap();
         assert!(src.direct && src.fx == Effect::Walkie);
         assert_eq!(glides, 0);
         // An unknown mode stays positional, so a mod written against a later
         // VoIPC keeps working here
-        let (src, _) = one(RenderSpec { mode: Some("hologram".into()), ..base.clone() }).unwrap();
+        let (src, _) = one(RenderSpec {
+            mode: Some("hologram".into()),
+            ..base.clone()
+        })
+        .unwrap();
         assert!(!src.direct && src.fx == Effect::None);
 
         // NaN would make the gains NaN and, through the ramp, silence that
         // source for good — so it is refused rather than clamped
-        assert!(one(RenderSpec { pos: Some([f32::NAN, 0.0, 0.0]), ..base.clone() }).is_err());
+        assert!(one(RenderSpec {
+            pos: Some([f32::NAN, 0.0, 0.0]),
+            ..base.clone()
+        })
+        .is_err());
         // …while a NaN range, volume or pan falls back to the default
         let (src, _) = one(RenderSpec {
             range: Some(f32::NAN),
@@ -2368,9 +2180,16 @@ mod tests {
         // phone to you *and* standing across the room. Their voice arrives
         // twice — the earpiece in one ear, their real voice where they stand.
         let placed = place(vec![PlayerState {
-            spec: RenderSpec { pos: Some([10.0, 0.0, 0.0]), ..RenderSpec::default() },
+            spec: RenderSpec {
+                pos: Some([10.0, 0.0, 0.0]),
+                ..RenderSpec::default()
+            },
             layers: vec![
-                RenderSpec { mode: Some("mobile".into()), pan: Some(-0.9), ..RenderSpec::default() },
+                RenderSpec {
+                    mode: Some("mobile".into()),
+                    pan: Some(-0.9),
+                    ..RenderSpec::default()
+                },
                 RenderSpec {
                     mode: Some("badvoip".into()),
                     pos: Some([10.0, 0.0, 1.6]),
@@ -2384,14 +2203,20 @@ mod tests {
         .unwrap();
 
         let base = placed.sources[&7];
-        assert!(!base.direct && base.fx == Effect::None, "the base is still a person");
+        assert!(
+            !base.direct && base.fx == Effect::None,
+            "the base is still a person"
+        );
         let layers = &placed.layers[&7];
         assert_eq!(layers.len(), 2);
         // The phone: no position, so direct, and in the left ear
         assert!(layers[0].direct && layers[0].fx == Effect::Mobile && layers[0].pan == -0.9);
         // The earpiece leaking at their head: positional *and* effected, which
         // is the one rule a layer does not share with the base render
-        assert!(!layers[1].direct, "a layer with a position must stay positional");
+        assert!(
+            !layers[1].direct,
+            "a layer with a position must stay positional"
+        );
         assert_eq!(layers[1].fx, Effect::BadVoip);
         assert_eq!((layers[1].range, layers[1].volume), (2.5, 0.35));
         // Only the base glides
@@ -2406,12 +2231,21 @@ mod tests {
         // is not the way to say that: in a channel that is not positional the
         // gains never reach `volume`, and they would play at full level.
         let placed = place(vec![PlayerState {
-            spec: RenderSpec { mode: Some("off".into()), ..RenderSpec::default() },
-            layers: vec![RenderSpec { mode: Some("landline".into()), ..RenderSpec::default() }],
+            spec: RenderSpec {
+                mode: Some("off".into()),
+                ..RenderSpec::default()
+            },
+            layers: vec![RenderSpec {
+                mode: Some("landline".into()),
+                ..RenderSpec::default()
+            }],
             ..player(7)
         }])
         .unwrap();
-        assert!(placed.sources.is_empty(), "mode:off still placed the speaker");
+        assert!(
+            placed.sources.is_empty(),
+            "mode:off still placed the speaker"
+        );
         assert!(placed.motion.is_empty());
         assert_eq!(placed.layers[&7].len(), 1);
         // Heard, though — the member list must not grey them out
@@ -2423,7 +2257,13 @@ mod tests {
         // Refusing the tick would freeze the whole mix, which is much worse
         // than one missing render.
         let placed = place(vec![PlayerState {
-            layers: vec![RenderSpec { mode: Some("radio".into()), ..RenderSpec::default() }; 9],
+            layers: vec![
+                RenderSpec {
+                    mode: Some("radio".into()),
+                    ..RenderSpec::default()
+                };
+                9
+            ],
             ..player(7)
         }])
         .unwrap();
@@ -2471,6 +2311,9 @@ mod tests {
         let mut client = TcpStream::connect(addr).await.unwrap();
         client.write_all(UPGRADE.as_bytes()).await.unwrap();
         client.write_all(&frame_bytes(0x1, b"hi")).await.unwrap();
-        assert!(server.await.unwrap().is_err(), "an unmasked frame was accepted");
+        assert!(
+            server.await.unwrap().is_err(),
+            "an unmasked frame was accepted"
+        );
     }
 }

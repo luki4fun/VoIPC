@@ -5,13 +5,10 @@ use std::sync::Arc;
 #[cfg(not(target_os = "android"))]
 use std::time::{Duration, Instant};
 
-#[cfg(not(target_os = "android"))]
 use base64::Engine;
-#[cfg(not(target_os = "android"))]
 use tauri::Emitter;
 #[cfg(not(target_os = "android"))]
 use tokio::sync::mpsc;
-#[cfg(not(target_os = "android"))]
 use tracing::warn;
 
 #[cfg(not(target_os = "android"))]
@@ -27,14 +24,14 @@ use voipc_video::convert;
 mod linux;
 #[cfg(target_os = "linux")]
 pub use linux::{
-    CaptureSession, enumerate_displays, enumerate_windows, request_screencast, spawn_capture_task,
+    enumerate_displays, enumerate_windows, request_screencast, spawn_capture_task, CaptureSession,
 };
 
 #[cfg(target_os = "windows")]
 mod windows;
 #[cfg(target_os = "windows")]
 pub use windows::{
-    CaptureSession, enumerate_displays, enumerate_windows, request_screencast, spawn_capture_task,
+    enumerate_displays, enumerate_windows, request_screencast, spawn_capture_task, CaptureSession,
 };
 
 // ── Android stubs ────────────────────────────────────────────────────────
@@ -50,55 +47,6 @@ pub fn enumerate_displays() -> Vec<DisplayInfo> {
 #[cfg(target_os = "android")]
 pub fn enumerate_windows() -> Vec<WindowInfo> {
     Vec::new()
-}
-
-#[cfg(target_os = "android")]
-pub struct FrameDecodeBuffers {
-    jpeg_buf: Vec<u8>,
-}
-
-#[cfg(target_os = "android")]
-impl FrameDecodeBuffers {
-    pub fn new() -> anyhow::Result<Self> {
-        Ok(Self {
-            jpeg_buf: Vec::with_capacity(512 * 1024),
-        })
-    }
-}
-
-#[cfg(target_os = "android")]
-pub fn render_frame(
-    frame: &voipc_video::decoder::DecodedFrame,
-    app_handle: &tauri::AppHandle,
-    buffers: &mut FrameDecodeBuffers,
-) {
-    use base64::Engine;
-    use tauri::Emitter;
-
-    let w = frame.width as usize;
-    let h = frame.height as usize;
-
-    // I420 (YUV420P) → RGB using the pure-Rust converter from voipc-video.
-    // RGB, not RGBA: the `image` crate's JPEG encoder rejects an alpha channel
-    // ("does not support the color type Rgba8"), which silently dropped every
-    // frame and left the viewer on "Waiting for video stream...".
-    let rgb = voipc_video::convert::i420_to_rgb(&frame.i420_data, w, h);
-
-    // Encode RGB → JPEG using the `image` crate (pure Rust, no native deps)
-    buffers.jpeg_buf.clear();
-    let mut cursor = std::io::Cursor::new(&mut buffers.jpeg_buf);
-    let Some(img) = image::RgbImage::from_raw(frame.width, frame.height, rgb) else {
-        tracing::warn!("render_frame: invalid RGB buffer dimensions");
-        return;
-    };
-    if let Err(e) = img.write_to(&mut cursor, image::ImageFormat::Jpeg) {
-        tracing::warn!("JPEG encode error: {}", e);
-        return;
-    }
-
-    let b64 = base64::engine::general_purpose::STANDARD.encode(&buffers.jpeg_buf);
-    let data_url = format!("data:image/jpeg;base64,{}", b64);
-    let _ = app_handle.emit("screenshare-frame", &data_url);
 }
 
 // ── Source enumeration types (cross-platform) ─────────────────────────────
@@ -125,6 +73,8 @@ pub struct WindowInfo {
 
 #[cfg(not(target_os = "android"))]
 #[derive(Debug, Clone, Copy, PartialEq)]
+// Windows capture only ever delivers BGRA; PipeWire delivers the rest
+#[cfg_attr(windows, allow(dead_code))]
 pub(crate) enum PixFmt {
     Bgra,
     Bgrx,
@@ -240,7 +190,11 @@ const IDLE_TICK: Duration = Duration::from_millis(200);
 /// dropped.
 #[cfg(not(target_os = "android"))]
 fn encode_at(due: Instant, now: Instant, interval: Duration) -> Instant {
-    if now + interval / 4 >= due { now } else { due }
+    if now + interval / 4 >= due {
+        now
+    } else {
+        due
+    }
 }
 
 /// Whether the periodic IDR is due. Timed, not counted, since a still screen
@@ -406,7 +360,9 @@ mod ladder_tests {
     #[test]
     fn pacing_holds_the_rate_without_dropping_the_last_frame() {
         // Paired buffers (two process callbacks in one loop pass) at 60 fps
-        let paired: Vec<u64> = (0..60).map(|k| (k / 2) * 33_333 + (k % 2) * 1_000).collect();
+        let paired: Vec<u64> = (0..60)
+            .map(|k| (k / 2) * 33_333 + (k % 2) * 1_000)
+            .collect();
         assert_eq!(encoded(&paired, 60).len(), 60);
         // A 144 Hz compositor paced to 60 fps, ending on its last frame
         let fast: Vec<u64> = (0..144).map(|k| k * 6_944).collect();
@@ -496,7 +452,10 @@ impl FrameProcessor {
             self.preview_at = None;
             return;
         }
-        if self.preview_at.is_some_and(|t| t.elapsed() < PREVIEW_INTERVAL) {
+        if self
+            .preview_at
+            .is_some_and(|t| t.elapsed() < PREVIEW_INTERVAL)
+        {
             return;
         }
         let fmt = match frame.fmt {
@@ -515,15 +474,18 @@ impl FrameProcessor {
         let (tw, th) = (self.target_width, self.target_height);
         let conv = match &mut self.preview_conv {
             Some(c) => c,
-            None => match convert::FrameConverter::new(fmt, src_w, src_h, tw, th, convert::Pixel::RGB24) {
-                Ok(c) => self.preview_conv.insert(c),
-                Err(e) => {
-                    warn!("preview converter: {e}");
-                    // Retried at the preview's rate, not on every frame
-                    self.preview_at = Some(Instant::now());
-                    return;
+            None => {
+                match convert::FrameConverter::new(fmt, src_w, src_h, tw, th, convert::Pixel::RGB24)
+                {
+                    Ok(c) => self.preview_conv.insert(c),
+                    Err(e) => {
+                        warn!("preview converter: {e}");
+                        // Retried at the preview's rate, not on every frame
+                        self.preview_at = Some(Instant::now());
+                        return;
+                    }
                 }
-            },
+            }
         };
         self.preview_at = Some(Instant::now());
         let rgb = match conv.convert_strided(&frame.pixels, frame.stride) {
@@ -543,7 +505,9 @@ impl FrameProcessor {
                 }
             }
         }
-        let Some(jpeg) = self.preview_jpeg.as_mut() else { return };
+        let Some(jpeg) = self.preview_jpeg.as_mut() else {
+            return;
+        };
         let image = turbojpeg::Image {
             pixels: rgb.data(0),
             width: tw as usize,
@@ -576,6 +540,20 @@ impl FrameProcessor {
         let (scale, divisor) = LEVELS[next as usize];
         let kbps = ((self.base_bitrate_kbps as f32) * scale) as u32;
         let fps = (self.base_fps / divisor).max(1);
+        // In place where the encoder can, without the IDR a rebuild forces
+        // into the congested link (H3-08)
+        if self.encoder.set_rate(kbps, fps) {
+            info!(
+                from = self.level,
+                to = next,
+                kbps,
+                fps,
+                "screen share quality level changed in place"
+            );
+            self.level = next;
+            self.level_changed = Instant::now();
+            return;
+        }
         match voipc_video::encoder::Encoder::new(
             self.codec,
             self.target_width,
@@ -768,8 +746,12 @@ impl FrameProcessor {
                 PixFmt::Unknown => return,
             }
             convert::scale_i420_nearest(
-                &self.full_res_i420_buf, src_w, src_h,
-                &mut self.i420_buf, tw, th,
+                &self.full_res_i420_buf,
+                src_w,
+                src_h,
+                &mut self.i420_buf,
+                tw,
+                th,
             );
         } else {
             match fmt {
@@ -864,7 +846,9 @@ impl FrameProcessor {
                 } else {
                     warn!(
                         "video channel low ({} < {} fragments) — skipping delta frame {}",
-                        self.video_tx.capacity(), fragment_count, self.frame_id
+                        self.video_tx.capacity(),
+                        fragment_count,
+                        self.frame_id
                     );
                     self.keyframe_requested.store(true, Ordering::Relaxed);
                     // Our own uplink is the bottleneck: counts as loss for the ladder
@@ -879,7 +863,7 @@ impl FrameProcessor {
             for pkt in packets {
                 let ch_id = self.channel_id.load(Ordering::Relaxed);
                 let pkt_type = if ef.is_keyframe { 0x14u8 } else { 0x13u8 };
-                let aad = voipc_crypto::media_keys::build_aad(ch_id, pkt_type);
+                let aad = voipc_crypto::media_keys::build_aad(ch_id, pkt_type, self.session_id);
                 let final_pkt = match voipc_crypto::media_encrypt(
                     &key,
                     stream_id,
@@ -998,7 +982,7 @@ pub(crate) struct AudioProcessor {
     /// Device-rate → 48kHz resampler, lazily built when `sample_rate` isn't
     /// 48kHz (WASAPI loopback runs at the output device's rate). Keyed by the
     /// rate it was built for so a renegotiation rebuilds it.
-    pub resampler: Option<(u32, voipc_audio::resample::LinearResampler)>,
+    pub resampler: Option<(u32, voipc_audio::resample::Resampler)>,
     /// Scratch for the downmixed mono chunk before resampling.
     pub mono_buf: Vec<f32>,
     /// People watching; with none, capture runs for the video preview only
@@ -1010,7 +994,8 @@ pub(crate) struct AudioProcessor {
 impl AudioProcessor {
     /// Process raw f32 audio bytes: downmix to mono, accumulate, Opus-encode, send.
     pub fn process(&mut self, raw_data: &[u8]) {
-        if !self.audio_enabled.load(Ordering::Relaxed) || self.viewers.load(Ordering::Relaxed) == 0 {
+        if !self.audio_enabled.load(Ordering::Relaxed) || self.viewers.load(Ordering::Relaxed) == 0
+        {
             self.accumulator.clear();
             return;
         }
@@ -1026,8 +1011,10 @@ impl AudioProcessor {
         }
 
         let sample_count = raw_data.len() / 4;
-        let samples: &[f32] =
-            unsafe { std::slice::from_raw_parts(raw_data.as_ptr() as *const f32, sample_count) };
+        // Read, not cast: a PipeWire or WASAPI buffer need not be 4-aligned,
+        // and a `&[f32]` over one that is not is undefined behaviour (H3-17)
+        let sample =
+            |i: usize| f32::from_ne_bytes(raw_data[i * 4..i * 4 + 4].try_into().expect("4 bytes"));
 
         let frame_count = sample_count / channels;
         let rate = self.sample_rate;
@@ -1039,13 +1026,12 @@ impl AudioProcessor {
             for i in 0..frame_count {
                 let mut sum = 0.0f32;
                 for ch in 0..channels {
-                    sum += samples[i * channels + ch];
+                    sum += sample(i * channels + ch);
                 }
                 self.mono_buf.push(sum / channels as f32);
             }
             if self.resampler.as_ref().is_none_or(|(r, _)| *r != rate) {
-                self.resampler =
-                    Some((rate, voipc_audio::resample::LinearResampler::new(rate, 48_000)));
+                self.resampler = Some((rate, voipc_audio::resample::Resampler::new(rate, 48_000)));
             }
             let (_, resampler) = self.resampler.as_mut().expect("just set");
             resampler.process(&self.mono_buf, &mut self.accumulator);
@@ -1053,7 +1039,7 @@ impl AudioProcessor {
             for i in 0..frame_count {
                 let mut sum = 0.0f32;
                 for ch in 0..channels {
-                    sum += samples[i * channels + ch];
+                    sum += sample(i * channels + ch);
                 }
                 self.accumulator.push(sum / channels as f32);
             }
@@ -1086,7 +1072,7 @@ impl AudioProcessor {
 
             let packet = if let Some(key) = key_opt.as_ref() {
                 let ch_id = self.channel_id.load(Ordering::Relaxed);
-                let aad = voipc_crypto::media_keys::build_aad(ch_id, 0x15);
+                let aad = voipc_crypto::media_keys::build_aad(ch_id, 0x15, self.session_id);
                 match voipc_crypto::media_encrypt(
                     key,
                     stream_id,
@@ -1151,32 +1137,42 @@ pub(crate) fn strip_stride_padding(
 
 // ── Frame decoding (viewer side — cross-platform) ────────────────────────
 
-// Android uses the pure-Rust image-crate path further up (no turbojpeg on NDK).
-#[cfg(not(target_os = "android"))]
-/// Reusable state for frame decoding + JPEG encoding.
+/// Reusable state for frame decoding + JPEG encoding. Android too: its
+/// pure-Rust path (I420 → RGB → `image` JPEG) took 32 ms a 1080p frame on a
+/// desktop core, several times that on a phone; TurboJPEG from the YUV takes
+/// 2 (H3-07).
 pub struct FrameDecodeBuffers {
     pub compressor: turbojpeg::Compressor,
 }
 
-#[cfg(not(target_os = "android"))]
 impl FrameDecodeBuffers {
     pub fn new() -> anyhow::Result<Self> {
         let mut compressor = turbojpeg::Compressor::new()
             .map_err(|e| anyhow::anyhow!("Failed to create TurboJPEG compressor: {e}"))?;
+        // q90: at q70 the viewer's JPEG lost 15 dB more on text than the video
+        // codec did (H3-04). It costs about 75 % more IPC; binary frames to a
+        // WebGL viewer are the 1.x answer.
         compressor
-            .set_quality(70)
+            .set_quality(90)
             .map_err(|e| anyhow::anyhow!("Failed to set JPEG quality: {e}"))?;
         Ok(Self { compressor })
     }
 }
 
-#[cfg(not(target_os = "android"))]
-/// Render a decoded frame to the frontend as a base64 JPEG.
+/// Render a decoded frame to the frontend as a base64 JPEG, in JPEG's own
+/// YCbCr: only the frame shown pays for that conversion.
 pub fn render_frame(
-    frame: &voipc_video::decoder::DecodedFrame,
+    frame: &mut voipc_video::decoder::DecodedFrame,
     app_handle: &tauri::AppHandle,
     buffers: &mut FrameDecodeBuffers,
 ) {
+    voipc_video::to_jpeg_ycbcr(
+        &mut frame.i420_data,
+        frame.width as usize,
+        frame.height as usize,
+        frame.full_range,
+        frame.bt709,
+    );
     let yuv_image = turbojpeg::YuvImage {
         pixels: frame.i420_data.as_slice(),
         width: frame.width as usize,

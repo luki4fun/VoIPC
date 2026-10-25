@@ -1,0 +1,92 @@
+{
+  "input_device": "USB Mic",
+  "output_device": null,
+  "volume": 0.8,
+  "input_gain": 1.0,
+  "noise_suppression": true,
+  "voice_mode": "vad",
+  "vad_threshold_db": -42.5,
+  "ptt_key": "KeyV",
+  "ptt_hold_mode": true,
+  "mute_key": null,
+  "deafen_key": null,
+  "muted": false,
+  "deafened": false,
+  "remember_connection": false,
+  "last_host": "voice.example.org",
+  "last_port": 9987,
+  "last_username": "luki",
+  "last_accept_self_signed": null,
+  "saved_servers": [
+    {
+      "name": "Home",
+      "host": "voice.example.org",
+      "port": 9987,
+      "username": "luki",
+      "accept_self_signed": true,
+      "account": true
+    }
+  ],
+  "open_servers": [],
+  "screen_share_codec": "h264",
+  "spatial_audio": true,
+  "screen_audio_spatial": true,
+  "mic_effect": "none",
+  "mic_muffle": 0,
+  "mic_reverb": 0,
+  "mic_water": 0,
+  "audio_setup_version": 0,
+  "sdk_enabled": false,
+  "sdk_port": 39987,
+  "sdk_allowed_origins": [
+    "null"
+  ],
+  "mumblelink_enabled": false,
+  "sdk_beacon_allowed": false,
+  "sdk_transmit_allowed": false,
+  "sounds": {
+    "channel_switch": {
+      "enabled": true,
+      "path": null
+    },
+    "user_joined": {
+      "enabled": true,
+      "path": null
+    },
+    "user_left": {
+      "enabled": true,
+      "path": null
+    },
+    "disconnected": {
+      "enabled": true,
+      "path": null
+    },
+    "direct_message": {
+      "enabled": true,
+      "path": null
+    },
+    "channel_message": {
+      "enabled": true,
+      "path": null
+    },
+    "poke": {
+      "enabled": true,
+      "path": null
+    }
+  },
+  "auto_connect": false,
+  "share_channel_history": true,
+  "ui_prefs": {
+    "layout": "modern",
+    "panel": {
+      "left": 240
+    },
+    "zoom": 1.1
+  },
+  "chat_history_path": "/home/luki/voipc/chat_history.bin",
+  "chat_history_disabled": false,
+  "max_conversations": 1000,
+  "relay_ids": {
+    "voice.example.org:9987": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a"
+  }
+}

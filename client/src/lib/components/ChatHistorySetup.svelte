@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { dialog } from "../actions/dialog.js";
   import { invoke } from "@tauri-apps/api/core";
   import {
     chatUnlocked,
@@ -21,6 +22,7 @@
 
   type Mode =
     | "loading"
+    | "blocked"
     | "first_run"
     | "unlock"
     | "create_new"
@@ -39,6 +41,7 @@
   let error = $state("");
   let loading = $state(false);
   let previousMode = $state<Mode>("unlock");
+  let fileState = $state<ChatHistoryStatus["file_state"]>("none");
 
   $effect(() => {
     loadStatus();
@@ -51,8 +54,11 @@
       const status = await invoke<ChatHistoryStatus>("get_chat_history_status");
       chatHistoryStatus.set(status);
       currentPath = status.current_path;
+      fileState = status.file_state;
 
-      if (!status.path_configured && !status.file_exists) {
+      if (status.file_state === "newer" || status.file_state === "unreadable") {
+        mode = "blocked";
+      } else if (!status.path_configured && !status.file_exists) {
         mode = "first_run";
       } else if (status.file_exists) {
         mode = "unlock";
@@ -324,6 +330,20 @@
     }
   }
 
+  // Keeps the file (renamed) and makes room for a new history in its place.
+  async function moveAside() {
+    error = "";
+    loading = true;
+    try {
+      await invoke<string>("move_chat_history_aside");
+      resetFields();
+      await loadStatus();
+    } catch (e) {
+      error = String(e);
+      loading = false;
+    }
+  }
+
   function truncatePath(path: string, maxLen: number = 50): string {
     if (path.length <= maxLen) return path;
     return "..." + path.slice(-(maxLen - 3));
@@ -331,17 +351,43 @@
 </script>
 
 <div class="overlay">
-  <div class="dialog">
+  <div class="dialog" use:dialog>
     {#if mode === "loading"}
       <h2>Chat History</h2>
       <p class="hint">Loading...</p>
+
+    {:else if mode === "blocked"}
+      <h2>Chat History Can't Be Opened</h2>
+      <p class="hint">
+        {#if fileState === "newer"}
+          This history was saved by a newer version of VoIPC. Update VoIPC to open it — this version
+          leaves it as it is.
+        {:else}
+          The file at this location is damaged or is not a VoIPC chat history. It is left as it is.
+        {/if}
+      </p>
+      <p class="path-info" title={currentPath}>{truncatePath(currentPath)}</p>
+
+      {#if error}
+        <div class="error">{error}</div>
+      {/if}
+
+      <button class="submit-btn" onclick={moveAside} disabled={loading}>
+        {loading ? "Processing..." : "Keep it aside and start a new history"}
+      </button>
+      <div class="secondary-actions">
+        <button class="text-link" onclick={goToChangePath}>Change Storage Location</button>
+      </div>
+      <button class="text-link skip-link" onclick={skipVault} disabled={loading}>
+        Skip — don't save chat history (kept in memory only, lost on exit)
+      </button>
 
     {:else if mode === "first_run"}
       <h2>Set Up Chat History</h2>
       <p class="hint">Choose where to store your encrypted chat history.</p>
 
-      <div class="path-section">
-        <label>Storage Location</label>
+      <div class="path-section" role="group" aria-labelledby="storage-label">
+        <span class="label" id="storage-label">Storage Location</span>
         <div class="path-row">
           <span class="path-display" title={currentPath}>
             {truncatePath(selectedDirectory || currentPath)}
@@ -665,7 +711,8 @@
     gap: 4px;
   }
 
-  label {
+  label,
+  .label {
     font-size: 12px;
     color: var(--text-secondary);
     text-transform: uppercase;

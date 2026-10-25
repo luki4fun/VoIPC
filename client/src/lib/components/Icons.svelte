@@ -168,6 +168,16 @@
     <circle cx="12" cy="12" r="9"/>
     <polyline points="12 7 12 12 15.5 14"/>
 
+  {:else if name === "megaphone"}
+    <path d="M3 11l18-5v12L3 14v-3z"/>
+    <path d="M11.6 16.8a3 3 0 1 1-5.8-1.6"/>
+
+  {:else if name === "hourglass"}
+    <path d="M5 22h14"/>
+    <path d="M5 2h14"/>
+    <path d="M17 22v-4.17a2 2 0 0 0-.59-1.42L12 12l-4.41 4.41A2 2 0 0 0 7 17.83V22"/>
+    <path d="M7 2v4.17a2 2 0 0 0 .59 1.42L12 12l4.41-4.41A2 2 0 0 0 17 6.17V2"/>
+
   {:else if name === "history"}
     <path d="M3 12a9 9 0 1 0 3-6.7L3 8"/>
     <polyline points="3 3 3 8 8 8"/>

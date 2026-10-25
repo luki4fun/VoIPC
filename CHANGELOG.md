@@ -2,6 +2,700 @@
 
 All notable changes to VoIPC are documented here.
 
+## [1.0.0] - 2026-10-25
+
+Protocol version 12: a 0.12 app and a 1.0 relay do not talk to each other, so
+update both. A 0.12 app has no updater, so install 1.0 by hand once. From 1.0
+on, an app and a relay connect whenever they speak the same protocol version,
+whatever their version numbers; `docs/COMPATIBILITY.md` in the repository
+lists what every 1.x keeps.
+
+The first stable release: post-quantum end-to-end encryption, changing and
+resetting your password, bans that outlast a restart, deleting your account
+and its kept copies, echo cancellation on the desktop and on Android, a desktop
+app that updates itself, and release files anyone can check against this
+repository.
+
+### End-to-end encryption and protocol
+
+- **Post-quantum sessions.** libsignal moves from v0.67.2 to v0.105.4. Every
+  direct session now starts with PQXDH (X25519 plus Kyber1024) and runs the
+  Double Ratchet together with SPQR, Signal's post-quantum ratchet. Each
+  connection publishes a signed Kyber1024 last-resort pre-key, and a session
+  start that is replayed against it is refused
+- **Pre-keys are refilled.** When the relay has handed out most of a
+  member's one-time pre-keys it asks for more (`PreKeysLow`), and the app
+  uploads 50 new ones. Before, the 100 keys of a connection were never
+  replenished, although the README said they were
+- **Voice, video, screen audio and positions name their sender inside the
+  encryption.** The media AAD now carries the sender's session id, so a relay
+  that rewrites the header can no longer make one member's voice play as
+  another's
+- Private keys in PEM files are read with `rustls-pki-types`; the unmaintained
+  `rustls-pemfile` is gone. `rustls-webpki` 0.103.16 and `webpki-roots` 1.0.10
+  fix RUSTSEC-2026-0382 and RUSTSEC-2026-0381
+- Protocol version 12: a 0.12 client and a 1.0 relay do not talk to each other
+- Accounts made with 0.12 keep working: a test opens a vault, a log key, a
+  kept message and a safety number written by 0.12.0 with the new code
+
+### Passwords
+
+- **Change your password** under *Your account → Password: Change*. It needs
+  the current one, and a code when two-factor codes are on. The vault's
+  password slot is wrapped for the new one in the same step, and put back if
+  the change fails, so the vault always opens with the password that signs in
+- **Forgot your password?** in the connect dialog sets a new one with the
+  recovery key (and a code, when codes are on), then signs in with it. The
+  recovery key opens the vault on the device; the relay checks a signature by
+  the account's identity, which only the recovery key could have opened, and
+  hands out nothing a password could be guessed against. Accounts made with
+  0.12 can be reset too. Either way every other device is signed out and every
+  remembered device forgotten; this one is remembered again at once. Nothing
+  changes for the people who pinned your identity
+- **The browser checks the relay id too.** Like the app, it remembers which id
+  each server named and refuses a server that claims another's, before
+  anything of the password goes out. In the browser, a page also warns when
+  you sign in to an account on a server other than the one that served it:
+  that page handles both
+- The browser stretches passwords with WebCrypto: about eight times faster on a
+  phone (0.4 s instead of 3 s per sign-in). An account's identity key no
+  longer passes through the page's JavaScript
+- Account prompts for one server no longer replace another server's sign-in
+  waiting for its code, and each names the server it is for
+
+### Bans
+
+- **Bans outlast a restart.** With accounts they are kept in the database,
+  which holds a keyed hash of a banned address, never the address; without
+  accounts in `bans.json` (readable by the server's user only) next to
+  `channels.json`. "Ban until restart" is now "Ban for good"
+- **Account bans.** *Ban the account too* (on by default for someone signed in
+  to an account) keeps the account out from any address, and an admin can ban
+  an account by name, online or not, from *Active bans*
+- An address ban covers an IPv6 /64, not one address. Accounts holding a role
+  get past an address ban once they have signed in, so a moderator behind a
+  shared address is not locked out with whoever was banned there
+- The ban list shows each ban's name (the account's, or the name used from
+  that address), reason, who banned and how long it has left; never an
+  address. Unban lifts a ban by its entry
+- `voipc-server ban list | add --account NAME | add --ip ADDR | remove ID`
+  (`--reason`, `--days`); a running server reads changes within five minutes
+- **Channel passwords from `channels.json` are hashed with Argon2id**, salted,
+  instead of unsalted SHA-256. Existing `sha256:` hashes keep working (also
+  when written in upper case); put the password back as `"password"` to move a
+  channel to the new hash. The check runs outside the channel lock, two at a
+  time
+
+### Deleting, and leaving
+
+- **Leaving a text channel ends its stored log for you.** The relay takes you
+  out of it (a modified app cannot stay a reader), and every writer's next
+  message there is under a new key; what you already have stays. Moving
+  between voice channels keeps their logs, and *Stop keeping this channel's
+  messages for me* ends one there
+- **Delete what you kept.** In a conversation, the bin offers *Clear here, and
+  delete what I wrote from the server's copy*: your messages there go from the
+  server, and a signed tombstone asks the other readers' devices to drop their
+  copies. *Your account → Messages you kept here: Delete* removes them
+  everywhere
+- **Delete your account** under *Your account → Delete account…*, with the
+  name, the password and a code when codes are on. Its vault, kept messages,
+  keys, memberships, sessions and devices go; the name is free again, and
+  people who knew the old account are told the name is another account now.
+  The last admin is refused. The app forgets the account's remembered device
+  and the server's account id
+- A cleared direct conversation stays cleared when its stored log is fetched
+  again, as a channel already did, and entries already read are never
+  re-offered
+- *Settings → Remembered accounts* lists the accounts this device signs in to
+  without a password, to forget one or all
+- The accounts database (SQLite) overwrites deleted rows where that costs no
+  extra I/O (`secure_delete`), with l4f-accounts v0.10.0
+
+### Sound and picture
+
+- **Echo cancellation on the desktop.** The microphone now runs through WebRTC's
+  echo canceller (AEC3, in the pure-Rust `sonora` port) with automatic gain
+  control, fed with exactly what the app plays. On loudspeakers the others no
+  longer hear themselves: 47 dB of echo removed in the test scene, for 0.6 % of
+  one core. Android uses the phone's own canceller
+- **No more clipping in the mix.** A limiter replaces the hard clamp on the
+  output, in the app and in the browser: two loud talkers, or one at 200 %,
+  no longer buzz. The microphone's gain no longer clips before noise
+  suppression
+- Voice activation also asks RNNoise whether a frame is speech, so typing and
+  fans stop opening the microphone
+- Dropping a frame to catch up a late stream fades over 2.5 ms instead of
+  cutting, which clicked
+- Devices that do not run at 48 kHz (common on Windows) are resampled with a
+  windowed-sinc filter: a 10 kHz tone went from −20 dB to −119 dB of
+  distortion
+- **Shared screens show their true colours.** Black was grey (16) and white
+  dimmed (236) on every desktop viewer, and browsers shifted greens and reds of
+  shares from the app. Streams now say which colours they carry, and viewers
+  honour it. Only the frame that is shown is converted
+- A viewer whose decoder falls behind the stream still shows pictures: it
+  draws at least every 8 frames instead of decoding the whole queue first
+- The desktop viewer's picture is sharper on text (JPEG quality 90 instead of
+  70: +6 dB). Screens shared at a smaller size are scaled with a bicubic filter
+  (+12 dB on text)
+- NVIDIA encoders no longer pad a still screen to the full rate: a still
+  1080p screen at 5 Mbit/s now costs 1.4 Mbit/s, with no filler sent to every
+  viewer
+- The software encoder changes its rate without sending a keyframe into a
+  link that just lost packets, and is a little sharper at the lowest quality
+  (preset `superfast`). The browser sharer no longer sends a keyframe on a
+  quality change, and asks for detail over motion
+- Updated nnnoiseless (0.5) and ringbuf (0.5), which clears two advisories;
+  an unaligned screen-audio buffer is no longer read through a cast
+
+### Browser voice
+
+- **A lost packet no longer plays as silence in the browser.** The browser now
+  decodes voice inside its audio thread with a pure-Rust Opus decoder
+  (rusty-opus, as WebAssembly), packet by packet as they play: a lost frame is
+  rebuilt from the next packet's in-band FEC, or concealed, as the app does,
+  and a packet that arrives out of order no longer reaches the decoder out of
+  order. WebCodecs stays as the fallback. The decoder was fuzzed before it
+  shipped (`fuzz/`, target `opus_decode`)
+
+### Desktop updates
+
+- **The Windows installer and the Linux AppImage update themselves.** VoIPC
+  looks for a new release a little after it starts and once a day, says so
+  when there is one, and installs it from Settings, Updates, with one click
+  that restarts the app. Never during a call: the button waits until you
+  leave voice
+- An update is installed only if it is signed with the VoIPC release key
+  built into the app, for exactly the version the release says it is, and is
+  newer than the running one. The app's page cannot point the updater
+  anywhere else; only the app itself talks to it
+- A server that refuses this app for an older version makes it look for an
+  update at once, and the connect dialog offers "Update VoIPC" when the update
+  speaks that server's version
+- "Check for updates" in Settings, on by default: each check asks GitHub for
+  the newest release, so GitHub sees your address and this version. Release
+  candidates follow the release candidates, then the final release
+- The .deb (updated by its package manager), an AppImage in a folder you
+  cannot write to, Android and the browser keep the download page
+
+### Android
+
+- **The microphone keeps working with the screen locked.** The voice service
+  now runs as a microphone service, which Android 11 and later require; before,
+  a locked phone sent silence without any error
+- **No more echo from the loudspeaker.** The microphone uses Android's voice
+  call processing (echo canceller included), and the call stays in
+  communication mode with the speaker chosen as its device. Before, the app
+  never got that mode at all (a missing permission), and the raw microphone
+  sent the other speakers' voices back to them. The input gain slider now works
+  on Android
+- The microphone is asked for when you first join voice, not at every start, so
+  a refusal is shown where it matters
+- Capture and playback reopen by themselves when Android moves the audio route
+  (the call mode, a headset); before, both stayed silent
+- The app's data is no longer included in Android backups or device
+  transfers: the chat archive holds this device's account secrets
+- The voice service is not restarted on its own after the app was killed, and
+  it holds one wake lock rather than one per channel switch
+- The app's bridge to Android is installed before the page loads, not by a
+  timer that a slow start could beat
+- Shared screens are decoded for display with libjpeg-turbo straight from
+  YUV, as on the desktop, and the decoder is asked for low latency: a 1080p
+  share from a browser draws at about 14 frames a second on a Galaxy A12. The
+  unused file provider is gone
+
+### The game SDK and the desktop app
+
+- **Only real game runtimes may drive the game SDK.** `https://cfx-nui-` must
+  be followed by a resource name and nothing else. Before, any internet page on
+  a host named like `cfx-nui-x.example` counted as FiveM: it could move the
+  player into a voice channel and, where they had allowed it, hold their
+  push-to-talk down. alt:V (`http://resource`) and RAGE:MP (`http://package`)
+  are now matched by the origin their pages really send, so they work without
+  configuration
+- **The player's own move wins.** Once they leave the game's channel
+  themselves (another channel, *Leave voice*, or voice on another server), a
+  game can no longer pull them back by sending `hello` again. It is told
+  `player_left`, and `state: returned` when they go back by hand
+- **Every SDK error has a stable `code`**, listed in docs/SDK.md; mods should
+  match it, not the English. A message type VoIPC does not know is answered
+  with `unknown_type` and no longer counts toward closing the socket
+- **A `hello` that VoIPC will not act on gets one answer, `wrong_server`**,
+  whether the server, the channel or the 18+ consent was the reason. A page can
+  no longer map which servers and channels the player has. The player sees the
+  reason in a notification
+- The SDK's and MumbleLink's pure rules moved to `voipc-audio::game`, where
+  they can be fuzzed
+- **Settings that let others do more are confirmed in a window of the app's
+  own**, which a page can neither draw nor answer: a new SDK origin, letting a
+  game broadcast the position or press push-to-talk, a saved server switched to
+  self-signed, and forgetting a pinned certificate. On Linux that window needs
+  `zenity`; without it the change is refused. Paths on another computer
+  (`\\host\share`) are refused for the chat history and notification sounds
+- A server that sends more than 1000 control messages a second (5000 at once)
+  is disconnected with "This server is flooding the app", before the window
+  freezes
+- Stopping the microphone or a screen capture no longer holds every other
+  command, the game SDK and push-to-talk for up to 2 seconds while the device
+  closes
+- Linux push-to-talk: a key release lost with an unplugged keyboard, or during
+  the 30-second device re-scan, no longer leaves the microphone open. On Wayland
+  without access to the input devices, the app now says that push-to-talk works
+  only while its window has focus
+- Quitting, from the tray or by closing the window, saves the last seconds of
+  chat first
+- A message that waited a minute for an encryption session or a channel key
+  and was then dropped now says "Not delivered" in its conversation (desktop
+  and browser). It used to vanish after showing as sent
+- The screen-share pop-out is opened by the app; the page lost its permission
+  to create windows
+- MumbleLink follows a game that recreates its link file
+- A port typed into the host field (`example.com:1234`) is used as the port.
+  Before, it became part of the host name and failed as a DNS error. A bare
+  IPv6 address without brackets is refused instead of being split at a guess
+
+### The interface
+
+- **Usable from the keyboard and with a screen reader.** Every dialog is now a
+  real modal: it is announced by its title, focus moves into it, Tab stays
+  inside it, Escape closes it wherever cancelling is safe, and focus goes back
+  to what opened it. Toasts are read out, errors as alerts. Icon-only buttons
+  have names, and mute, deafen, noise suppression and the speaker say whether
+  they are on. A channel row's leave and settings controls are buttons of
+  their own that Tab reaches (they were unreachable spans inside the row's
+  button), and the share picker's labels belong to their selects
+- Toasts fit a phone screen: long text, such as a certificate warning, wraps
+  instead of running off the edge
+- The success and warning colours follow the palette, and the contrast test
+  covers them
+- The microphone test and the device lists each have one owner: the setup
+  wizard, Settings and the mixer no longer keep copies that could disagree
+- Chat history is not written out while it is turned off or locked
+- A direct conversation stays one conversation when the other person comes
+  back with a new session
+- A web client served on port 443 fills in 443, not 9987
+- Notification text is escaped only where the desktop shows markup (Linux).
+  The browser asks for permission from a click (Settings, "Allow
+  notifications") instead of on page load
+- For developers: `svelte-check` is pinned in `client/package.json` and
+  reports 0 errors and 0 warnings, so CI can hold both at zero. In runes mode
+  a `svelte-ignore` comment only reads codes separated by commas: most of the
+  old comments silenced only their first code, and the warnings they hid are
+  fixed now instead of ignored
+
+### Relay hardening
+
+- **Connections that never sign in can no longer lock people out.** Page
+  loads, handshakes and sign-ins in progress have a pool of their own: 16 per
+  address, 32 per IPv6 /48, 1024 in all. A signed-in session moves to the main
+  pool. Before, five addresses holding idle TLS connections filled every slot,
+  and nobody new could join. Page connections now close after 30 s
+- **Stalled sign-ins hold nothing.** A sign-in waiting for its client, or for
+  a person typing a code, no longer keeps one of the permits that pay for the
+  relay's own password and database work. Reconnects are spread out, so a
+  relay restart no longer brings every client back in the same second
+- **Kept messages cannot fill the database.** Account requests have their
+  own budget (10 a second), a writer starts at most 60 new keys per hour in a
+  conversation, the keys count against the quota, and each key handover is
+  one transaction. A reader's fetch gives every writer a fair share of the
+  newest keys, so one member can no longer push the others' out
+- **Tokens.** An admin or game token shorter than 16 characters stops the
+  start. Wrong tokens count against the address, across reconnects and on the
+  HTTP door as well (10, then one per 90 s). A guest on a relay with accounts
+  gets the same answer for a right and a wrong admin token
+- A password set at runtime on a channel from `channels.json` now lets in
+  whoever types it (it locked everybody out)
+- Numbers in `server.toml` that would leave the relay running but broken
+  (`quota_mb = 0`, `retention_days = 0`, `max_users = 0`) stop the start, and
+  so does a `channels.json` too big for one channel list. A sign-up whose vault
+  could not be stored fails instead of making an account that cannot be opened
+  elsewhere
+- The relay stops cleanly on SIGTERM too (`docker stop`, systemd), telling its
+  clients first
+- `voipc-server health` (for container health checks) and
+  `voipc-server cert fingerprint`. The start log prints the certificate's
+  fingerprint, and the app shows the fingerprint it pinned when it first meets
+  a self-signed server, to compare
+- **The relay's log keeps less.** Connection addresses and user names are only
+  logged at `debug`; refusals a stranger can repeat no longer write a warning
+  each. Admin bans keep their address in the log
+- A remembered device alone can no longer replace an account's identity key;
+  that needs the password. A panic in a connection's task cleans its session up
+  instead of leaving a ghost until restart. Two sign-ins of one account that
+  finish together no longer both stay connected. The server re-checks that it
+  has room after a long sign-in. Database backups and `channels.json` copies are
+  private from the moment they are made. The web page's CSP adds `base-uri` and
+  `form-action`
+
+### The 1.x rules: versions and data that is never overwritten
+
+- **Protocol match only.** A relay admits any app that speaks its protocol,
+  whatever the app's own version. A refusal now says which side has to
+  update, and the connect dialog shows it: in the browser with a reload (or the
+  other server's own page), in the app with the download address, and for an
+  older server with "tell its operator". A 0.12 app still gets a refusal it
+  can show
+- **The wire format is pinned.** A test records every message's layout per
+  protocol version and fails if it changes without a version bump. The bytes
+  that tell another version to update are fixed for ever
+- **`server.toml` refuses unknown keys**, so a typo stops the start instead of
+  quietly keeping a default. `web_port`, gone since 0.5.0, is still accepted.
+  Rewriting `channels.json` (when it hashes a password) keeps keys this
+  version does not know
+- **A chat history this version cannot open is never replaced.** A file saved
+  by a newer VoIPC, or a damaged one, used to look like "no history yet", and
+  the setup then offered to create a new one over it. Now the setup says what
+  it is and offers to keep it aside. The history format is version 5; the
+  first time 1.0 opens an older one it keeps a copy of it
+  (`chat_history.bin.v4`)
+- **Vault items name their format and count their saves.** A device that
+  cannot read an item — damaged, saved by a newer VoIPC, older than it saw
+  before, or missing after it saw one — leaves it alone and warns, instead of
+  saving an empty one over it. A server could otherwise wipe every pin of an
+  account this way
+- A name first met as an account that turns up as a guest is a warning, as a
+  changed key is. A pin that another device's copy changes is reported
+- A message or a history hand-off from a newer VoIPC shows as a placeholder
+  instead of raw JSON, and is never acted on
+- **The certificate pin file fails closed.** One that does not read is kept,
+  and self-signed servers are refused until "Forget pinned certificate"
+  starts the list over; the previous file is kept as `tofu_pins.json.bak` on
+  every save. When the QUIC and TCP attempts race, only the attempt that
+  carries the session is pinned
+- **Desktop files are private.** The data folder is made readable by its
+  user only, every file is written 0600, and there is no longer a fallback
+  into a shared temporary folder. A `settings.json` that does not read is kept
+  as `settings.json.unreadable-<time>`, unknown keys survive a save, a newer
+  format is not saved over, and settings that would not load again are not
+  written. The browser keeps unreadable settings the same way
+- Voice that cannot leave within about a second is dropped, oldest first,
+  instead of a backlog of up to 1 MiB bursting out after a stall
+
+### What 1.0 claims
+
+- README and docs/ACCOUNTS.md now say what the code holds: PQXDH and SPQR
+  instead of X3DH; pre-keys refilled; the sender inside the media AAD; a
+  sender stopping (not rotating) after 2³²−1000 packets; no media key on the
+  server; the vault guessable offline at 600,000 PBKDF2 rounds a guess, which
+  is what a long, unique password protects; most secrets, not all, wiped from
+  memory; the first contact with a self-signed server trusted blindly unless
+  the fingerprint is compared; what the relay logs at which level
+- **docs/THREAT-MODEL.md**: what a relay, a channel member, someone with the
+  disk and a hostile page can and cannot do, and the code and tests that hold
+  each part
+
+### Releases you can check
+
+- **Every release file can be checked.** A release carries `SHA256SUMS` and a
+  GitHub build attestation for every file, so `gh attestation verify` proves it
+  was built by this repository's workflow from the tagged commit. SECURITY.md
+  shows how
+- **The relay as a container image**, `ghcr.io/luki4fun/voipc-server`. It is
+  built from the release's own attested server binary, runs as a non-root
+  user, and checks itself with `voipc-server health`
+- **Release candidates** (`1.0.0-rc.1`, …) are pre-releases: never "latest",
+  so neither the stable updater nor the download links pick them up. They ship
+  no `.deb`, because dpkg would sort the final release below them
+- The Android APK is built without the signing key on the machine, then signed
+  in a separate step that needs a reviewer's approval and fails unless the
+  certificate is the one every earlier VoIPC APK had. The desktop updates are
+  signed in the same step
+- **Pinned supply chain.**
+  - Every CI action is pinned to a commit, and every build first checks the
+    lockfiles.
+  - The Windows FFmpeg is a fixed build checked against its SHA-256, instead
+    of whatever was newest that day.
+  - The Gradle download is checked against its checksum.
+  - The browser build no longer uses wasm-pack, which fetched binaries
+    unchecked; `npm audit` now reports nothing.
+- The release notes name the exact FFmpeg and libsignal builds in the
+  binaries, with links to their source
+- The static server, the web bundle and its WebAssembly build to the same
+  bytes from the same commit; a nightly job rebuilds them and compares
+- CI also compiles the Windows and Android apps on every pull request. It runs
+  the browser tests with UDP blocked, where both browsers must fall back to
+  TCP on their own, and on a lossy, jittery link (report only for now)
+- `npm run release` builds the web bundle and the server on this machine;
+  the Docker build it used to run was broken and is gone
+
+### Fuzzing and upgrade tests
+
+- **Fuzzing.** Every parser that takes bytes from the relay, another member,
+  a game mod or the network is fuzzed nightly, 13 targets in all:
+  - messages, media packets, video reassembly, the TCP fallback's WebSocket;
+  - kept messages, vaults, keys;
+  - the jitter buffer, both Opus decoders;
+  - the game SDK, the browser's media parsers.
+
+  An input that ever crashed one is kept and replayed by the normal tests
+- **What 0.12 left behind still opens.** Files written by 0.12.0's own code
+  are kept as test fixtures and checked on every build:
+  - a desktop chat history, settings and certificate pins;
+  - an accounts database: signed into, and its kept messages read;
+  - every channel preset;
+  - the documented `server.toml`;
+  - a browser's settings.
+
+  A shipped database migration can no longer be edited by mistake
+
+### Documents
+
+- `docs/COMPATIBILITY.md`: what every 1.x release keeps working (wire
+  protocol, game SDK, server configuration, stored data, security claims,
+  release files), and the test that catches a break
+- `SECURITY.md`: how to report a vulnerability, which versions get fixes (the
+  newest 1.x minor, and the one before it for 30 days), and how to verify a
+  download
+- `docs/OPERATING.md`: running a relay, covering:
+  - a hardened systemd unit;
+  - TLS renewal, backups (kept for at most 30 days) and upgrades with a
+    rollback;
+  - logs and the container image.
+
+### The quality bar
+
+- **One Rust for everyone.** `rust-toolchain.toml` pins 1.99.1, with clippy
+  and rustfmt; rustup installs it on the first build.
+- **CI now fails a change** that is not formatted, has a clippy warning, has a
+  TypeScript or Svelte error or warning, or brings in a crate whose licence or
+  source is not allowed. A new security advisory shows on every push and
+  blocks a release.
+- **The whole tree went through rustfmt once.** Apart from that, the clippy
+  fixes are small:
+  - a documentation comment had been attached to the wrong function;
+  - deprecated atomics calls replaced;
+  - long thread entry points allowed by name.
+- **Two advisories fixed in the lockfiles:**
+  - `ctutils` 0.4.5 (RUSTSEC-2026-0385, non-constant-time comparisons, under
+    libsignal);
+  - `tokio` 1.53.3 (RUSTSEC-2026-0386).
+
+## [0.12.0] - 2026-10-20
+
+Accounts, if a server wants them: a name that stays yours, an identity other
+people can check, and end-to-end-encrypted copies of your messages that wait
+for you while you are away. Plus eleven ready-made channel layouts, and
+announcement, slow-mode and 18+ channels. A server without `[accounts]` in its
+`server.toml` runs as before. Protocol version 11: a server still admits only a
+client of its own version, so update both together.
+
+### Added — accounts and kept messages (opt-in)
+
+- **Accounts, if the server wants them.** `[accounts] mode = "optional"` or
+  `"required"` in `server.toml` (default `off`, which opens no database at all).
+  SQLite or Postgres, picked by the `database` URL. An account's name is
+  reserved: guests keep their `#tag` and cannot take it. See
+  [docs/ACCOUNTS.md](docs/ACCOUNTS.md)
+- **Setting them up.** `[accounts]` also takes `registration`, `cloud` (on by
+  default: members may keep copies), `retention_days` (365), `quota_mb` (50)
+  and `key_file`. The key file is made at the first start and seals every
+  two-factor secret: back it up with the database, and give both full paths. A
+  server refuses to start with another key; `VOIPC_ACCOUNTS_KEY` stands in for
+  the file. `--accounts` and `--database` set the mode and the database on the
+  command line, and an unknown key in `[accounts]` stops the start
+- **One password and a recovery key.** The app derives the secret the server
+  checks and the key to the account's vault from the password, which never
+  leaves the device. A device signed in once with the password is remembered
+  and signs in without it after that. Signing in on another device ends the
+  older session
+- **Lasting identities.** An account keeps its identity key in its vault. Other
+  people pin it the first time, together with the account behind the name, and
+  are told when either changes — whether the key came in a bundle or in a
+  session the other side opened, and whether or not they are online. They can
+  compare a safety number under *Verify identity*. Between accounts this
+  narrows the gap the 0.5.0 review left open, a server swapping keys, to the
+  first meeting, and comparing safety numbers closes that too
+- **Roles with two-factor codes.** Admin and moderator are account roles, and
+  both need authenticator codes before their rights apply. The admin token
+  makes the first admin once, then is refused (and is no longer printed once
+  an admin exists). Moderators can kick, ban and change any channel's
+  settings; they cannot kick or ban an admin or another moderator (a channel's
+  creator still kicks anyone out of their own channel), and the ban list, with
+  its addresses, stays with admins
+- **Kept messages.** Each member chooses once, at their first connect, whether
+  to keep end-to-end-encrypted copies of their messages on the server. Kept
+  messages follow you to other devices, and what people wrote while you were
+  away waits for you: in direct messages, and in channels from `channels.json`
+  that are neither anonymous nor hide their members. The server learns who
+  wrote where, when, how long each message is and when its copy may go, never
+  the text and never a key. Copies are signed, so the people they are for can
+  prove who wrote them, and they have no forward secrecy: whoever later gets
+  into an account reads what that account could read. The same switch as
+  *Share recent channel chat with newcomers*, on by default, decides whether
+  people who join later read what you kept there before. Every account that
+  gets a key to your messages is named in the channel as it happens. A kept
+  copy follows the channel's rules as a post does: announce, slow mode, and
+  being in the channel
+- **Sign-up** is `open` (a proof-of-work puzzle in the app), `invite` (the
+  default) or `closed`. `voipc-server admin invite [--for <name>] [--days N]`
+  prints a code
+- **Server commands:** `admin grant <name> admin|moderator`,
+  `admin revoke <name> admin|moderator`, `admin reset-2fa <name>`,
+  `admin invite` and `db backup <path>`. Give them the server's own config,
+  before the command: `voipc-server -c server.toml admin invite`. A running
+  server picks up what they change within five minutes
+- **`uid` in `channels.json`** keeps a channel's log across a rename. Without
+  it, the log follows the channel's name
+- Protocol version 11; the desktop chat archive is version 4
+
+### Known limits — accounts
+
+- An account's password cannot be changed yet, and a forgotten one cannot be
+  reset. A remembered device still signs in; without one, a lost password
+  loses the account. The recovery key shown at sign-up is for the version that
+  adds the reset
+- Roles, invites and two-factor resets are on the server's command line only;
+  there is no admin dialog for them in the app yet
+- Bans still go by address and live in memory; there are no account bans
+- Copies already on the server cannot be deleted from the app yet: turning
+  copies off stops new ones, and the rest expire
+- Leaving a channel does not leave its kept copies: a reader stays one until
+  they are kicked from the channel or its password changes
+- A direct message to somebody away works only in a conversation the app
+  already has with them; one with an account that has not been online since
+  you connected cannot be started yet
+- The browser keeps no chat between visits beyond the server's copies
+- What a server that turns hostile can still do — drop or roll back what it
+  keeps, decide who is listed as a member, meet you first, and in the browser
+  serve a page that reads what you type and uses what the browser keeps for
+  your account — is listed in docs/ACCOUNTS.md. Use a password there that you
+  use on no other server; the desktop app refuses a server that claims another
+  server's account id
+
+### Added — channel presets and options
+
+- **Channel presets.** `voipc-server channels presets` lists eleven ready-made
+  layouts — starter, gaming, role-play with an in-game proximity channel, MMO
+  guild, shooter/MOBA, tabletop, study, LAN party, Slack-style project, family,
+  and creator community — and `voipc-server channels init <preset>` writes one
+  to `channels.json`. No preset ships a password: every locked channel gets a
+  fresh one, printed once, and the file keeps only its hash. A layout that
+  needs server settings (a `game_token` for role-play) gets a
+  `server_settings.json` when there is none; an existing one is left alone and
+  `init` prints what to put in it. `init --force` keeps every earlier file
+  (`channels.json.bak`, `.bak.2`, …, readable by the server's user only)
+- **Announcement channels** (`announce`, text channels only): only the
+  channel's managers — admins, moderators, and the creator of a user-made
+  channel — may post, and the server refuses everybody else's messages
+- **Slow mode** (`slow_mode_secs`, up to 6 hours): one post per interval per
+  member, held to by the server; managers are exempt. The chat shows the
+  countdown instead of letting a message be sent and refused
+- **18+ channels** (`nsfw`): the app asks once per server before joining or
+  showing one, and never joins one by itself — nor does a game through the
+  SDK's `hello`, or a reconnect, before that yes. The server only carries the
+  flag — a password is still what keeps people out
+- All three are in `channels.json` and in the channel's gear dialog. The
+  sidebars mark announcement and 18+ channels, and the chat header shows slow
+  mode. Protocol version 11
+
+### Changed
+
+- `channels.json` (password hashes) and a preset's `server_settings.json`
+  (game token) are written readable by the server's user only, through a new
+  temporary file each time
+
+### Fixed
+
+- Channel names made in the app are compared ignoring case, as `channels.json`
+  already was, so nobody can make an `Announcements` next to `announcements`
+- A channel-settings change the server refused partway — making a text channel
+  anonymous along with other options — no longer leaves the other options
+  changed with nobody told
+
+## [0.11.1] - 2026-10-17
+
+A review of the whole app, and what it found: a microphone that could stay on
+after a quick push-to-talk, a self-test anybody could start with a link, a
+certificate pin a stranger could plant, and a share size nobody checked.
+Protocol version 10, unchanged. A server still admits only a client of its own
+version, so update both together.
+
+### Fixed — the microphone
+
+- **A quick tap of push-to-talk could leave the microphone on.** The release
+  could arrive while the microphone was still opening, find nothing to close,
+  and the microphone opened afterwards with no key held. The window's keys and
+  the system-wide hotkeys now both close it the moment it is open
+- **In a browser, switching windows while holding push-to-talk left the
+  microphone on**: the release went to the other window. Leaving the window
+  now counts as letting go
+- **Voice activation and always-on stayed silent after unmuting** if you had
+  joined while muted
+- **"Hold modifier to talk" now works for the system-wide hotkeys too.**
+  Releasing the trigger key keeps you talking while the modifier is held, as
+  the setting says and the window's own keys already did
+- Closing the settings, the mixer or the audio setup while a microphone or
+  spatial test was still starting left the test running, with nothing on
+  screen to stop it
+
+### Fixed — everything else
+
+- **Stopping a screen share on Linux left the desktop's "sharing" indicator
+  on**: the portal session was never closed
+- **Disconnecting could hang for ever on a stuck audio or capture device**,
+  and every reconnect to that server with it
+- **The chat jumped to its newest message whenever anybody wrote, anywhere**,
+  on any server, pulling you out of the history you were reading. It follows
+  only the conversation on screen now, and only when you are at its end
+- A busy channel's chat was saved only once it went quiet for two seconds. It
+  is now saved at least every ten
+- A failed change to position sharing left its checkbox showing the wrong state
+- A restarted share no longer shows a negative frame rate or bitrate
+- At most eight notifications are shown, and a security warning that repeats
+  is shown once
+- In a browser: the output test could not be started again after one failed
+  attempt; a double click on Watch leaked a decoder and a timer; switching the
+  microphone while pressing push-to-talk could leave a second capture open; and
+  leaving a server could drop its goodbye
+
+### Security
+
+- **rustls 0.23.46.** Four advisories against 0.23.45 were published on
+  2026-10-14. The worst, rated medium, is TLS secrets in its debug output
+- **The browser client no longer ships its built-in self-test.** For a page
+  opened with `?selftest` it connects, joins a channel, writes in it and opens
+  the microphone, all with nothing on screen. A link to your own server could
+  do that to anybody who had allowed it the microphone. It is now in test
+  builds only: `VOIPC_SELFTEST=1 npm run web`
+- **A self-signed certificate is pinned only once the connection proves it.**
+  On a first connection the certificate was remembered before the handshake
+  had shown that the server holds its key. Anybody on the path could get theirs
+  pinned instead, and the real server was then refused as "fingerprint changed"
+- **A viewer decodes a share of at most 4096×4096.** The size came from the
+  sharer's own stream, and one crafted keyframe could make every viewer
+  allocate gigabytes
+- **Accepting an invite nobody sent no longer tells the channel's creator that
+  you accepted.** Any user could make any creator see it
+- **Invites cost what a poke costs.** Each one raises a popup, and a creator
+  could send fifty a second
+- **Watching somebody who is not sharing no longer stops the stream you are
+  watching.** Nor does it let you send that person keyframe requests and loss
+  reports any more
+- **The desktop mixer holds at most 256 voices.** The sender id in a media
+  header is not covered by the encryption, so a malicious server could turn one
+  packet into a new decoder per id, without end
+- **MumbleLink reads only a regular file of your own in `/dev/shm`.** Another
+  user of the same machine could leave a pipe there under your name, which
+  blocked the app, or a file of their own that fed it positions
+- **Android's hardware decoder checks the sizes and buffer bounds the codec
+  reports**, and passes its errors on, so the viewer asks for a keyframe
+  instead of staying blank
+- Guards against panics on odd frame sizes and strides, a zero jitter delay,
+  pre-key ids at the end of their range, and chat history that is not a list
+
+### Performance
+
+- A missing media key logged a line per packet: fifty a second per speaker,
+  after every join. Now at most one a second
+- Unlocking or creating the chat history no longer stalls the app for half a
+  second
+- Voice activation no longer redraws every member list fifteen times a second
+- A full chat no longer rebuilds all 500 rows for each new message
+- Fewer copies per packet in the media encryption, and one video scaler per
+  stream instead of one per frame
+- At most four notification sounds play at once
+
 ## [0.11.0] - 2026-10-11
 
 Whoever shares a screen now sees what they are sending, and a share no longer

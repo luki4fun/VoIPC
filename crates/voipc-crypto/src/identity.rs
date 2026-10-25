@@ -4,7 +4,6 @@
 //! generated on first launch and persisted across sessions.
 
 use libsignal_protocol::{IdentityKey, IdentityKeyPair, KeyPair};
-use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
@@ -39,7 +38,7 @@ impl SerializableIdentityKeyPair {
 
 /// Generate a fresh identity key pair.
 pub fn generate_identity_key_pair() -> IdentityKeyPair {
-    IdentityKeyPair::generate(&mut OsRng)
+    IdentityKeyPair::generate(&mut crate::rng())
 }
 
 /// Serialize an IdentityKey's public key to bytes (for protocol messages).

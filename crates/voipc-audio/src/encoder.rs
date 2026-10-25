@@ -11,11 +11,7 @@ pub struct Encoder {
 impl Encoder {
     /// Create a new Opus encoder configured for voice communication.
     pub fn new() -> Result<Self> {
-        let mut encoder = OpusEncoder::new(
-            SampleRate::Hz48000,
-            Channels::Mono,
-            Application::Voip,
-        )?;
+        let mut encoder = OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Voip)?;
 
         encoder.set_bitrate(audiopus::Bitrate::BitsPerSecond(OPUS_BITRATE))?;
         encoder.set_inband_fec(true)?;
@@ -31,11 +27,8 @@ impl Encoder {
     /// Uses `Application::Audio` mode (optimized for music and mixed content)
     /// rather than `Voip` mode. Mono 48kHz at the specified bitrate.
     pub fn new_screen_audio(bitrate: i32) -> Result<Self> {
-        let mut encoder = OpusEncoder::new(
-            SampleRate::Hz48000,
-            Channels::Mono,
-            Application::Audio,
-        )?;
+        let mut encoder =
+            OpusEncoder::new(SampleRate::Hz48000, Channels::Mono, Application::Audio)?;
 
         encoder.set_bitrate(audiopus::Bitrate::BitsPerSecond(bitrate))?;
 

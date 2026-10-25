@@ -1,44 +1,57 @@
 <script lang="ts">
-  // The three channel overlays: the password prompt on the way into a locked
-  // channel, the invite link when the clipboard is blocked, and the channel
-  // settings dialog.
+  // The channel overlays: the password prompt on the way into a locked
+  // channel, the 18+ question on the way into a marked one, the invite link
+  // when the clipboard is blocked, and the channel settings dialog.
   //
   // Mounted once by App.svelte, so both sidebars open the same dialogs. The
   // settings checkboxes carry `data-opt` because test-ui.mjs used to click them
   // by array index, and moving this markup is exactly the change that would
   // have silently set the wrong options.
 
+  import { backdrop, dialog } from "../actions/dialog.js";
   import {
     cancelChannelSettings,
+    cancelNsfwPrompt,
     cancelPasswordPrompt,
+    confirmNsfwPrompt,
     inviteLinkPopup,
+    nsfwPrompt,
     passwordEditChannelId,
     passwordEditHasPassword,
     passwordEditInput,
     passwordEditRemove,
     passwordPromptChannelId,
     passwordPromptInput,
+    settingsAnnounce,
     settingsAnonymous,
     settingsHidden,
     settingsHideMembers,
     settingsMessageTtl,
     settingsIsText,
+    settingsNsfw,
     settingsProximity,
     settingsRouted,
     settingsScreenShare,
+    settingsSlowMode,
     submitChannelSettings,
     submitPasswordJoin,
   } from "../stores/channel-ui.js";
+  import { SLOW_MODE_CHOICES, slowModeLabel } from "../channel-post-rules.js";
+
+  // A value from channels.json the list does not offer is still shown as it
+  // is, rather than as an empty select that would save as something else.
+  let slowChoices = $derived(
+    (SLOW_MODE_CHOICES as readonly number[]).includes($settingsSlowMode)
+      ? [...SLOW_MODE_CHOICES]
+      : [...SLOW_MODE_CHOICES, $settingsSlowMode].sort((a, b) => a - b),
+  );
 </script>
 
 {#if $passwordPromptChannelId !== null}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div class="overlay" onclick={cancelPasswordPrompt} role="presentation">
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_to_interactive_role a11y_no_noninteractive_element_interactions -->
+  <div class="overlay" onclick={backdrop(cancelPasswordPrompt)} role="presentation">
     <form
       class="password-dialog"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => { if (e.key === 'Escape') cancelPasswordPrompt(); }}
+      use:dialog={{ onclose: cancelPasswordPrompt }}
       onsubmit={(e) => { e.preventDefault(); submitPasswordJoin(); }}
     >
       <div class="dialog-title">Enter Password</div>
@@ -56,11 +69,32 @@
   </div>
 {/if}
 
+{#if $nsfwPrompt !== null}
+  <div class="overlay" onclick={backdrop(cancelNsfwPrompt)} role="presentation">
+    <form
+      class="password-dialog"
+      use:dialog={{ onclose: cancelNsfwPrompt }}
+      onsubmit={(e) => { e.preventDefault(); confirmNsfwPrompt(); }}
+    >
+      <div class="dialog-title">18+ channel</div>
+      <p class="dialog-note">
+        {$nsfwPrompt.name} is marked 18+. Only go in if you are 18 or older. This server's 18+
+        channels will not ask again.
+      </p>
+      <div class="dialog-actions">
+        <button class="create-btn" type="submit" data-opt="nsfw-confirm">I am 18 or older</button>
+        <button class="cancel-btn" type="button" onclick={cancelNsfwPrompt}>Go back</button>
+      </div>
+    </form>
+  </div>
+{/if}
+
 {#if $inviteLinkPopup !== null}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div class="overlay" onclick={() => inviteLinkPopup.set(null)} role="presentation">
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="password-dialog" onclick={(e) => e.stopPropagation()}>
+  <div class="overlay" onclick={backdrop(() => inviteLinkPopup.set(null))} role="presentation">
+    <div
+      class="password-dialog"
+      use:dialog={{ onclose: () => inviteLinkPopup.set(null) }}
+    >
       <div class="dialog-title">Invite link</div>
       <input class="dialog-input" readonly value={$inviteLinkPopup} onfocus={(e) => e.currentTarget.select()} />
       <div class="dialog-actions">
@@ -71,13 +105,10 @@
 {/if}
 
 {#if $passwordEditChannelId !== null}
-  <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <div class="overlay" onclick={cancelChannelSettings} role="presentation">
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_noninteractive_element_to_interactive_role a11y_no_noninteractive_element_interactions -->
+  <div class="overlay" onclick={backdrop(cancelChannelSettings)} role="presentation">
     <form
       class="password-dialog"
-      onclick={(e) => e.stopPropagation()}
-      onkeydown={(e) => { if (e.key === 'Escape') cancelChannelSettings(); }}
+      use:dialog={{ onclose: cancelChannelSettings }}
       onsubmit={(e) => { e.preventDefault(); submitChannelSettings(); }}
     >
       <div class="dialog-title">Channel Settings</div>
@@ -136,6 +167,31 @@
         from the copies members hand to people who join later. The timer travels inside the
         encryption, so the server can neither read it nor change it; it applies to what is
         written from now on, not to what people already have.
+      </p>
+      <label class="dialog-label">
+        Slow mode
+        <select class="dialog-input" data-opt="slow-mode" bind:value={$settingsSlowMode}>
+          {#each slowChoices as secs (secs)}
+            <option value={secs}>
+              {secs === 0 ? "Off — post as often as you like" : `One post every ${slowModeLabel(secs)}`}
+            </option>
+          {/each}
+        </select>
+      </label>
+      {#if $settingsIsText}
+        <label class="dialog-check">
+          <input type="checkbox" data-opt="announce" bind:checked={$settingsAnnounce} />
+          Announcements — only moderators post here
+        </label>
+      {/if}
+      <label class="dialog-check">
+        <input type="checkbox" data-opt="nsfw" bind:checked={$settingsNsfw} />
+        18+ — members confirm their age before it opens
+      </label>
+      <p class="dialog-note">
+        The server holds members to slow mode and announcements from who posts where and when; it
+        still reads nothing. The channel's creator, admins and moderators are exempt. 18+ is a
+        question each app asks, not an age check — a password is what keeps people out.
       </p>
       {#if !$settingsIsText}
       <label class="dialog-check">
@@ -209,7 +265,6 @@
     gap: 8px;
   }
 
-  .create-label,
   .dialog-label {
     display: flex;
     flex-direction: column;

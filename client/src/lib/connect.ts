@@ -10,6 +10,8 @@
 // Nothing here decides where voice is. The backend does, and channels.ts
 // mirrors it; closing the server that carries voice only lets go of the mirror.
 
+import { hasNsfwConsent } from "./stores/channel-ui.js";
+import { dropPrompts } from "./stores/account.js";
 import { derived, get, writable, type Readable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -30,6 +32,7 @@ import {
   unreadPerChannel,
 } from "./stores/chat.js";
 import { pendingInvites } from "./stores/invites.js";
+import { parseHostPort } from "./invite.js";
 import { addNotification } from "./stores/notifications.js";
 import { pendingPokes } from "./stores/pokes.js";
 import { splitName, withTag } from "./username.js";
@@ -51,10 +54,27 @@ import {
   savedServers,
   type SavedServer,
 } from "./stores/settings.js";
-import { resolveRejoin } from "./rejoin-rules.js";
+import { reconnectDelay, resolveRejoin } from "./rejoin-rules.js";
 import type { ChannelInfo } from "./types.js";
 
 export { serverId };
+
+// ── Another version ────────────────────────────────────────────────────────
+
+/** A server refused us for speaking another protocol (`update-needed`):
+ *  which side has to update, for ConnectDialog's panel. */
+export interface UpdateNeeded {
+  server: string;
+  server_protocol: number;
+  server_version: string;
+  our_protocol: number;
+  our_version: string;
+}
+
+export const updateNeeded = writable<UpdateNeeded | null>(null);
+
+/** Where updates come from: the app's own constant, never a server's word. */
+export const DOWNLOAD_PAGE = "https://github.com/luki4fun/voipc/releases/latest";
 
 // ── Events ─────────────────────────────────────────────────────────────────
 
@@ -104,6 +124,10 @@ export const serverEntries: Readable<ServerEntry[]> = derived(
 /** "+" in the rail asked for the connect dialog while servers are open. */
 export const showConnectDialog = writable(false);
 
+/** An account the connect dialog should open on, to sign in with the password
+ *  (a reconnect found this device no longer remembered there). */
+export const signInAgain = writable<{ host: string; port: number; name: string } | null>(null);
+
 /** How each open server was reached: what a reconnect retries, and what the
  *  open list is saved as. Not a scoped store: losing a connection forgets
  *  the scoped state, and this is what brings it back. */
@@ -117,16 +141,37 @@ interface OpenDetails {
    *  `username` when its tag was taken and a random one stood in. */
   asked: string;
   acceptSelfSigned: boolean;
+  /** Signed in to an account there: a reconnect signs in again with the key
+   *  this device was given, never with a password. */
+  account?: boolean;
 }
 const details = new Map<string, OpenDetails>();
 
 // ── Opening ────────────────────────────────────────────────────────────────
 
+/** How a connect signs in to a relay account (account.rs `AccountArgs`). */
+export interface AccountSignIn {
+  /** "device": with the key this device got at an earlier sign-in. "reset":
+   *  a new password with the recovery key, which ends in `RESET_DONE`. */
+  mode: "login" | "register" | "device" | "reset";
+  password?: string;
+  /** A sign-up invite code, where the relay wants one. */
+  invite?: string | null;
+  /** The recovery key as it was shown, for "reset". */
+  recovery?: string;
+}
+
+/** What a reset ends with (account.rs `RESET_DONE`): sign in with the new password. */
+export const RESET_DONE = "Your password was reset. Sign in with the new one.";
+
 export interface ConnectRequest {
   host: string;
   port: number;
+  /** For an account, its name (no #tag). */
   username: string;
   acceptSelfSigned: boolean;
+  /** Sign in to an account instead of coming as a guest. */
+  account?: AccountSignIn;
   /** Save these details for next time. Leave out to keep the current setting. */
   remember?: boolean;
 }
@@ -157,10 +202,14 @@ export async function connectTo(
   request: ConnectRequest,
   { manual = true, view = true }: ConnectOptions = {},
 ): Promise<ConnectResult> {
-  const { host, port, acceptSelfSigned: selfSigned } = request;
+  const { acceptSelfSigned: selfSigned, account } = request;
+  // A port typed into the host field ("example.com:1234") is the port: left
+  // there, it became the host "[example.com:1234]" and a DNS error (H5-09)
+  const { host, port } = parseHostPort(request.host.trim(), request.port) ?? request;
   // A name from before tags (a bookmark, the servers open at the last start)
-  // takes the tag last used, or a new one, and keeps it
-  const { name, tag } = splitName(request.username.trim());
+  // takes the tag last used, or a new one, and keeps it. An account's name
+  // has no tag: the account is what tells it apart.
+  const { name, tag } = account ? { name: request.username.trim(), tag: "" } : splitName(request.username.trim());
   if (!host.trim() || !name.trim()) return { ok: false, error: "Please fill in all fields" };
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     return { ok: false, error: "Port must be between 1 and 65535" };
@@ -170,12 +219,12 @@ export async function connectTo(
   if (get(openServers).includes(server)) {
     // One connection per server: this one is open, or on its way. Show it.
     if (view) serverAddress.set(server);
-    return { ok: true, server, userId: get(userId.of(server)) };
+    return { ok: true, server, userId: get(userId.peek(server)) };
   }
 
-  const asked = withTag(name, tag || splitName(get(lastUsername)).tag);
+  const asked = account ? name : withTag(name, tag || splitName(get(lastUsername)).tag);
   let actual = asked;
-  details.set(server, { host, port, username: actual, asked, acceptSelfSigned: selfSigned });
+  details.set(server, { host, port, username: actual, asked, acceptSelfSigned: selfSigned, account: !!account });
   // Open before the invoke, not after: the channel list arrives from the
   // reader task as soon as the server sends it, which can be before this call
   // returns, and `listenServer` drops events for servers that are not open.
@@ -189,6 +238,9 @@ export async function connectTo(
         address: server,
         username: actual,
         acceptInvalidCerts: selfSigned,
+        account: account
+          ? { kind: account.mode, password: account.password ?? "", invite: account.invite ?? null, recovery: account.recovery ?? null }
+          : null,
       });
       break;
     } catch (e) {
@@ -197,9 +249,9 @@ export async function connectTo(
       if (!get(openServers).includes(server)) return { ok: false, error };
       // Somebody there goes by this name and tag already. Another tag is
       // another name, and nobody's name is proof of who they are yet.
-      if (error.includes("username already taken") && tries < 3) {
+      if (!account && error.includes("username already taken") && tries < 3) {
         actual = withTag(name, "");
-        details.set(server, { host, port, username: actual, asked, acceptSelfSigned: selfSigned });
+        details.set(server, { host, port, username: actual, asked, acceptSelfSigned: selfSigned, account: false });
         continue;
       }
       if (manual) {
@@ -270,7 +322,13 @@ export async function connectTo(
 export function reconnectAll(list: SavedServer[]): void {
   for (const s of list) {
     void connectTo(
-      { host: s.host, port: s.port, username: s.username, acceptSelfSigned: s.accept_self_signed },
+      {
+        host: s.host,
+        port: s.port,
+        username: s.username,
+        acceptSelfSigned: s.accept_self_signed,
+        account: s.account ? { mode: "device" } : undefined,
+      },
       { manual: false, view: false },
     );
   }
@@ -301,6 +359,7 @@ export async function saveOpenServers(): Promise<void> {
             port: d.port,
             username: d.asked,
             accept_self_signed: d.acceptSelfSigned,
+            account: d.account ?? false,
           },
         ];
       })
@@ -325,6 +384,7 @@ export async function saveOpenServers(): Promise<void> {
 export function resetServer(server: string): void {
   clearRosters(server);
   dropServer(server);
+  dropPrompts(server);
   clearServerUnread(server);
   if (get(voice)?.server === server) voice.set(null);
 }
@@ -465,7 +525,7 @@ async function reconnectLoop(
 
   for (let attempt = 1; !run.cancelled; attempt++) {
     info.update((i) => ({ ...i, attempt }));
-    const delay = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
+    const delay = reconnectDelay(attempt);
 
     // Wait before retrying
     await new Promise((resolve) => setTimeout(resolve, delay));
@@ -499,6 +559,8 @@ async function reconnectLoop(
         address: server,
         username: d.username,
         acceptInvalidCerts: d.acceptSelfSigned,
+        // An account comes back with this device's key; there is no password to ask for here.
+        account: d.account ? { kind: "device" } : null,
       });
       if (run.cancelled) {
         // Cancelled while this attempt was in flight — don't adopt its result,
@@ -526,7 +588,8 @@ async function reconnectLoop(
       // else in the meantime. They took it there themselves, and pulling it
       // back here would end that call.
       const [room] = resolveRejoin(previous.voice ? [previous.voice] : [], list, "voice");
-      if (room && !run.voiceTaken) {
+      // A room that turned 18+ meanwhile waits for the user's own yes.
+      if (room && !run.voiceTaken && (!room.nsfw || hasNsfwConsent(server))) {
         try {
           // With the password, where this session knows one: a password room
           // is exactly the room a reconnect must not silently drop you out
@@ -551,6 +614,7 @@ async function reconnectLoop(
         // runs out of them is a text channel that silently never opens. A
         // password one the effect skips, so it stays ours.
         if (ch.auto_join && !ch.has_password) continue;
+        if (ch.nsfw && !hasNsfwConsent(server)) continue;
         // A password one comes back too, when this session knows the password
         const password = ch.has_password ? channelPassword(server, ch.name) : null;
         if (ch.has_password && password === null) continue;
@@ -565,8 +629,22 @@ async function reconnectLoop(
       if (errMsg.includes("username already taken")) {
         info.update((i) => ({ ...i, error: "Username still held by server, waiting..." }));
       } else if (errMsg.includes("version mismatch")) {
+        removeServer(server);
+        // The panel says which side has to update; a relay before 1.0 sends
+        // only the text, which the toast carries
+        if (get(updateNeeded)?.server === server) {
+          showConnectDialog.set(true);
+        } else {
+          addNotification(`${fromServer(server)}${errMsg}`, "error");
+        }
+        return;
+      } else if (d.account && (errMsg.includes("not remembered") || errMsg.includes("key is damaged"))) {
+        // Only the password signs this account in now, and a reconnect has
+        // none to give: asked for, instead of retried for five minutes.
         addNotification(`${fromServer(server)}${errMsg}`, "error");
         removeServer(server);
+        signInAgain.set({ host: d.host, port: d.port, name: d.username });
+        showConnectDialog.set(true);
         return;
       } else {
         info.update((i) => ({ ...i, error: errMsg }));

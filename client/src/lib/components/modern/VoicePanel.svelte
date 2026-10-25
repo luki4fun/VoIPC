@@ -32,7 +32,7 @@
         <Icon name="speaker" size={16} />
         <span>Voice connected</span>
       </span>
-      <button class="leave-btn" onclick={leaveVoice} title="Leave voice">
+      <button aria-label="Leave voice" class="leave-btn" onclick={leaveVoice} title="Leave voice">
         <Icon name="disconnect" size={16} />
       </button>
     </div>

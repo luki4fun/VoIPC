@@ -62,7 +62,7 @@
     <div class="activity-bar">
       <span class="activity-title">{title}</span>
       {#if !watching}
-        <button class="activity-close" onclick={close} title="Close (Esc)">
+        <button aria-label="Close (Esc)" class="activity-close" onclick={close} title="Close (Esc)">
           <Icon name="close" size={18} />
         </button>
       {/if}

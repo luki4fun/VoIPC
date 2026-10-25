@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { backdrop, dialog } from "../actions/dialog.js";
   import type { Snippet } from "svelte";
 
   interface Props {
@@ -13,12 +14,18 @@
   }
   let { headerExtra }: Props = $props();
   import { invoke } from "@tauri-apps/api/core";
-  import { tick } from "svelte";
+  import { tick, untrack } from "svelte";
   import { channels } from "../stores/channels.js";
   import { uiPrefs } from "../stores/ui-prefs.js";
   import { serverAddress, serverKey, userId } from "../stores/connection.js";
   import { addNotification } from "../stores/notifications.js";
+  import { get } from "svelte/store";
+  import { account, accountHex } from "../stores/account.js";
+  import { users } from "../stores/users.js";
+  import { expiryFor } from "../chat-rules.js";
   import {
+    addDmMessage,
+    dmConversations,
     activeDmUserId,
     activeDmUsername,
     closeDm,
@@ -32,11 +39,17 @@
     channelMessageTtl,
     dmMessageTtl,
     endPreview,
+    giveNsfwConsent,
     joinChannel,
     joinTextChannel,
+    lastPostAt,
     leftTextChannelNames,
+    me,
+    notePost,
+    nsfwConsented,
     setDmMessageTtl,
   } from "../stores/channel-ui.js";
+  import { canManage, needsNsfwConsent, postBlock, slowModeLabel } from "../channel-post-rules.js";
   import { displayChannelId, isPreviewing, shownMessages } from "../stores/roster.js";
   import { channelRosters } from "../stores/rosters.js";
   import Icon from "./Icons.svelte";
@@ -142,6 +155,30 @@
       (!effectiveChannel?.text || $joinedTextChannelIds.has($displayChannelId))
   );
 
+  // An announcement channel, or slow mode still counting down: the server
+  // would refuse the post, and the pane shows a sent message before it hears
+  // back — so the composer asks first (channel-post-rules.ts).
+  let isManager = $derived(effectiveChannel ? canManage(effectiveChannel, $me) : false);
+  let slowModeSecs = $derived(effectiveChannel?.slow_mode_secs ?? 0);
+  /** Ticks once a second while a slow-mode countdown is on screen. */
+  let now = $state(Date.now());
+  /** Bumped on every send, so the countdown starts without waiting for a tick. */
+  let sentCount = $state(0);
+  let block = $derived.by(() => {
+    void sentCount;
+    if (isDmMode || !effectiveChannel) return null;
+    return postBlock(effectiveChannel, isManager, lastPostAt($serverAddress, $displayChannelId), now);
+  });
+  $effect(() => {
+    if (slowModeSecs === 0 || isManager || isDmMode) return;
+    const timer = setInterval(() => (now = Date.now()), 1000);
+    return () => clearInterval(timer);
+  });
+
+  // A channel marked 18+ that this server has no consent for: its messages
+  // stay hidden behind the question until the user answers it.
+  let nsfwGated = $derived(!isDmMode && needsNsfwConsent(effectiveChannel, $nsfwConsented));
+
   // This server's channels: another server's unread is on its icon in the rail
   let totalUnreadChannels = $derived.by(() => {
     const prefix = `${serverKey($serverAddress)}/`;
@@ -200,10 +237,25 @@
     messageInput = "";
   });
 
-  // Auto-scroll when messages change
-  $effect(() => {
-    // Access displayMessages to track changes
-    displayMessages;
+  // Follow the conversation to its end — when it is another conversation, or
+  // when this one grew and the reader was already at the end. Not on every
+  // change of the list: it is rebuilt for a message on any channel of any
+  // server, and following each of those pulled a reader out of the history
+  // they were scrolled back into. Measured before the DOM update (`.pre`),
+  // which is the only moment "at the end" still describes what they saw.
+  let followedConversation = "";
+  let followedEnd = "";
+  $effect.pre(() => {
+    const conversation = `${$serverAddress}|${$displayChannelId}|${$activeDmUserId}`;
+    const last = displayMessages.at(-1);
+    const end = `${displayMessages.length}|${last?.id ?? last?.timestamp ?? ""}`;
+    const switched = conversation !== followedConversation;
+    if (!switched && end === followedEnd) return;
+    followedConversation = conversation;
+    followedEnd = end;
+    const el = untrack(() => messagesContainer);
+    const atEnd = !el || el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+    if (!switched && !atEnd) return;
     tick().then(() => {
       if (messagesContainer) {
         messagesContainer.scrollTop = messagesContainer.scrollHeight;
@@ -256,11 +308,13 @@
   let showTtlPicker = $state(false);
   // Re-read whenever the conversation changes, or the prefs do: `$uiPrefs` and
   // `$channels` are the two stores those answers live in.
-  const activeTtl = $derived(
-    isDmMode
-      ? ($uiPrefs, dmMessageTtl($serverAddress, $activeDmUsername))
-      : ($channels, channelMessageTtl($serverAddress, $displayChannelId)),
-  );
+  const activeTtl = $derived.by(() => {
+    void $uiPrefs;
+    void $channels;
+    return isDmMode
+      ? dmMessageTtl($serverAddress, $activeDmUsername)
+      : channelMessageTtl($serverAddress, $displayChannelId);
+  });
 
   function chooseTtl(secs: number) {
     showTtlPicker = false;
@@ -271,6 +325,8 @@
   async function sendMessage() {
     const content = messageInput.trim();
     if (!content) return;
+    // Kept in the input rather than sent to be refused
+    if (!isDmMode && block) return;
     const server = $serverAddress;
 
     messageInput = "";
@@ -281,18 +337,39 @@
       // channel's own, or for a direct message the one this user set for that
       // person. Zero is no timer, which the backend reads as none.
       if (isDmMode) {
-        await invoke("send_direct_message", {
-          server,
-          targetUserId: $activeDmUserId,
-          content,
-          ttlSecs: dmMessageTtl(server, $activeDmUsername) || null,
-        });
+        const ttlSecs = dmMessageTtl(server, $activeDmUsername) || null;
+        const away = ($activeDmUserId ?? 0) < 0 ? $dmConversations.find((c) => c.user_id === $activeDmUserId) : undefined;
+        if (away?.account) {
+          // They are away: the server's copy is the one way it reaches them,
+          // and this is our own copy of it.
+          const id = await invoke<string>("send_kept_dm", { server, account: away.account, content, ttlSecs });
+          const own = get(account.peek(server));
+          const myId = get(userId.peek(server));
+          const now = Date.now();
+          addDmMessage(server, myId, myId, own?.name ?? "", away.user_id, {
+            user_id: myId,
+            username: own?.name ?? "",
+            content,
+            timestamp: now,
+            id,
+            account: own ? accountHex(own.info.id) : undefined,
+            expires_at: expiryFor(now, ttlSecs, ttlSecs),
+          });
+        } else {
+          await invoke("send_direct_message", { server, targetUserId: $activeDmUserId, content, ttlSecs });
+        }
       } else {
+        const channelId = $displayChannelId;
+        if (slowModeSecs > 0) {
+          notePost(server, channelId);
+          now = Date.now();
+          sentCount++;
+        }
         await invoke("send_channel_message", {
           server,
           content,
-          channelId: $displayChannelId,
-          ttlSecs: channelMessageTtl(server, $displayChannelId) || null,
+          channelId,
+          ttlSecs: channelMessageTtl(server, channelId) || null,
         });
       }
     } catch (e) {
@@ -319,21 +396,80 @@
       clearChannelChat($serverAddress, channelName);
     }
   }
+
+  // The server's copy of this conversation, where this account keeps one:
+  // clearing can delete what we wrote there too (1.0, A6)
+  let showClearMenu = $state(false);
+  let keptConv = $derived.by(() => {
+    const me = $account;
+    if (!me?.cloud) return null;
+    if (!isDmMode) return effectiveChannel?.log || null;
+    const peer =
+      $dmConversations.find((c) => c.user_id === $activeDmUserId)?.account ??
+      ((a) => (a ? accountHex(a) : undefined))($users.find((u) => u.user_id === $activeDmUserId)?.account);
+    if (!peer) return null;
+    const [lo, hi] = [accountHex(me.info.id), peer].sort();
+    return `d:${lo}:${hi}`;
+  });
+
+  function clearAndPurge() {
+    const [server, conv] = [$serverAddress, keptConv];
+    clearCurrentChat();
+    if (conv) invoke("account_purge", { server, conv }).catch((e) => addNotification(`Could not delete the server's copy: ${e}`, "error"));
+  }
+
+  function stopKeeping() {
+    const [server, conv] = [$serverAddress, keptConv];
+    if (conv) invoke("account_leave", { server, conv }).then(
+      () => addNotification(`#${channelName} is no longer kept for you, until you come back to it`, "info"),
+      (e) => addNotification(String(e), "error"),
+    );
+  }
 </script>
 
-<svelte:window onclick={() => { if (showEmojiPicker) showEmojiPicker = false; }} onkeydown={showEmojiPicker ? handleEmojiKeydown : undefined} />
+<svelte:window onclick={() => { if (showEmojiPicker) showEmojiPicker = false; showClearMenu = false; }} onkeydown={showEmojiPicker ? handleEmojiKeydown : undefined} />
+
+<!-- One picker for both forms: the direct message one and the channel one -->
+{#snippet emojiPicker()}
+  <div class="emoji-wrapper">
+    <button class="emoji-btn" type="button" onclick={(e) => { e.stopPropagation(); toggleEmojiPicker(); }} title="Emoji">
+      <Icon name="smile" size={20} />
+    </button>
+    {#if showEmojiPicker}
+      <!-- svelte-ignore a11y_no_static_element_interactions -->
+      <div class="emoji-picker" onkeydown={handleEmojiKeydown} onclick={(e) => e.stopPropagation()}>
+        <div class="emoji-tabs">
+          {#each EMOJI_CATEGORIES as cat, idx}
+            <button
+              class="emoji-tab"
+              class:active={emojiCategory === idx}
+              type="button"
+              onclick={() => (emojiCategory = idx)}
+              title={cat.label}
+            >{cat.emojis[0]}</button>
+          {/each}
+        </div>
+        <div class="emoji-grid">
+          {#each EMOJI_CATEGORIES[emojiCategory].emojis as emoji}
+            <button class="emoji-item" type="button" onclick={() => insertEmoji(emoji)}>{emoji}</button>
+          {/each}
+        </div>
+      </div>
+    {/if}
+  </div>
+{/snippet}
 
 <div class="chat-panel">
   <div class="chat-header" class:custom={headerExtra}>
     {#if isDmMode}
-      <button class="back-btn" onclick={backToChannel} title="Back to channel chat"><Icon name="arrow-left" size={16} /></button>
+      <button aria-label="Back to channel chat" class="back-btn" onclick={backToChannel} title="Back to channel chat"><Icon name="arrow-left" size={16} /></button>
       <span class="chat-title" title={$activeDmUsername}>DM with {shortName($activeDmUsername)}</span>
       {#if totalUnreadChannels > 0}
         <span class="unread-badge" title="Unread channel messages">{totalUnreadChannels}</span>
       {/if}
     {:else}
       {#if $isPreviewing}
-        <button class="back-btn" onclick={endPreview} title="Stop previewing"><Icon name="arrow-left" size={16} /></button>
+        <button aria-label="Stop previewing" class="back-btn" onclick={endPreview} title="Stop previewing"><Icon name="arrow-left" size={16} /></button>
       {/if}
       {#if !isLobby}
         <!-- Channel 0 is "not in voice", not a channel: it has no name to show -->
@@ -355,6 +491,22 @@
       <span class="ttl-label" title="Every message written here is deleted for everyone once its timer runs out">
         <Icon name="clock" size={13} /> {ttlLabel(activeTtl)}
       </span>
+    {/if}
+    {#if !isDmMode && !isLobby && effectiveChannel?.text && effectiveChannel?.announce}
+      <span class="ttl-label" title="Only the channel's moderators post here">
+        <Icon name="megaphone" size={13} /> Announcements
+      </span>
+    {/if}
+    {#if !isDmMode && !isLobby && slowModeSecs > 0}
+      <span
+        class="ttl-label"
+        title="Slow mode: each member may post once every {slowModeLabel(slowModeSecs)}; moderators are exempt"
+      >
+        <Icon name="hourglass" size={13} /> {slowModeLabel(slowModeSecs)}
+      </span>
+    {/if}
+    {#if !isDmMode && !isLobby && effectiveChannel?.nsfw}
+      <span class="ttl-label nsfw-label" title="This channel is marked 18+">18+</span>
     {/if}
     {#if isDmMode}
       <button
@@ -379,7 +531,26 @@
       {/if}
     {/if}
     {#if displayMessages.length > 0 && !isLobby}
-      <button class="clear-chat-btn" onclick={clearCurrentChat} title="Clear chat history"><Icon name="trash" size={16} /></button>
+      <button
+        class="clear-chat-btn"
+        onclick={(e) => { if (keptConv) { e.stopPropagation(); showClearMenu = !showClearMenu; } else clearCurrentChat(); }}
+        title="Clear chat history"
+      ><Icon name="trash" size={16} /></button>
+      {#if showClearMenu && keptConv}
+        <div class="ttl-picker clear-menu" role="presentation" onclick={(e) => e.stopPropagation()}>
+          <button class="ttl-choice" onclick={() => { showClearMenu = false; clearCurrentChat(); }}>Clear here</button>
+          <button class="ttl-choice" onclick={() => { showClearMenu = false; clearAndPurge(); }}>
+            Clear here, and delete what I wrote from the server's copy
+          </button>
+          {#if !isDmMode && !effectiveChannel?.text}
+            <button class="ttl-choice" onclick={() => { showClearMenu = false; stopKeeping(); }}>Stop keeping this channel's messages for me</button>
+          {/if}
+          <p class="ttl-note">
+            Other people's devices are asked to drop their copies of what you wrote; one that already read them
+            may keep them.
+          </p>
+        </div>
+      {/if}
     {/if}
     {#if headerExtra}
       <span class="header-extra">{@render headerExtra()}</span>
@@ -389,6 +560,14 @@
   <div class="messages" bind:this={messagesContainer}>
     {#if !isDmMode && isLobby}
       <div class="empty-state">Open a text channel to chat</div>
+    {:else if nsfwGated}
+      <div class="empty-state nsfw-gate">
+        <p>#{channelName} is marked <strong>18+</strong>.</p>
+        <p>Only open it if you are 18 or older. You will not be asked again on this server.</p>
+        <button class="join-text-btn" onclick={() => giveNsfwConsent($serverAddress)}>
+          I am 18 or older — show it
+        </button>
+      </div>
     {:else if !isDmMode && $isPreviewing && isPasswordProtected && !effectiveChannel?.text}
       <div class="empty-state">This channel is password protected. Join to view messages.</div>
     {:else if displayMessages.length === 0}
@@ -400,7 +579,12 @@
         {/if}
       </div>
     {:else}
-      {#each displayMessages as msg, i (msg.timestamp + "-" + msg.user_id + "-" + i)}
+      <!-- Keyed by the message object, which the stores carry over from one
+           update to the next. The index used to be in the key, so once a
+           conversation was full every new message shifted every key and
+           rebuilt all 500 rows; the ids a sender mints are not unique enough
+           on their own — a peer can repeat one, and a duplicate key throws. -->
+      {#each displayMessages as msg, i (msg)}
         {#if msg.kind === "history-marker" || msg.kind === "notice"}
           <div class="history-marker"><span>{msg.content}</span></div>
         {:else}
@@ -445,34 +629,13 @@
         onkeydown={handleKeydown}
         maxlength="2000"
       />
-      <div class="emoji-wrapper">
-        <button class="emoji-btn" type="button" onclick={(e) => { e.stopPropagation(); toggleEmojiPicker(); }} title="Emoji">
-          <Icon name="smile" size={20} />
-        </button>
-        {#if showEmojiPicker}
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
-          <div class="emoji-picker" onkeydown={handleEmojiKeydown} onclick={(e) => e.stopPropagation()}>
-            <div class="emoji-tabs">
-              {#each EMOJI_CATEGORIES as cat, idx}
-                <button
-                  class="emoji-tab"
-                  class:active={emojiCategory === idx}
-                  type="button"
-                  onclick={() => (emojiCategory = idx)}
-                  title={cat.label}
-                >{cat.emojis[0]}</button>
-              {/each}
-            </div>
-            <div class="emoji-grid">
-              {#each EMOJI_CATEGORIES[emojiCategory].emojis as emoji}
-                <button class="emoji-item" type="button" onclick={() => insertEmoji(emoji)}>{emoji}</button>
-              {/each}
-            </div>
-          </div>
-        {/if}
-      </div>
+      {@render emojiPicker()}
       <button class="send-btn" type="submit" disabled={!messageInput.trim()}>Send</button>
     </form>
+  {:else if canSendChannelMessage && block?.kind === "announce"}
+    <div class="preview-footer post-block">
+      <Icon name="megaphone" size={14} /> Only moderators can post in #{channelName}
+    </div>
   {:else if canSendChannelMessage}
     <form class="input-bar" onsubmit={(e) => { e.preventDefault(); sendMessage(); }}>
       <input
@@ -484,33 +647,17 @@
         onkeydown={handleKeydown}
         maxlength="2000"
       />
-      <div class="emoji-wrapper">
-        <button class="emoji-btn" type="button" onclick={(e) => { e.stopPropagation(); toggleEmojiPicker(); }} title="Emoji">
-          <Icon name="smile" size={20} />
-        </button>
-        {#if showEmojiPicker}
-          <!-- svelte-ignore a11y_no_static_element_interactions -->
-          <div class="emoji-picker" onkeydown={handleEmojiKeydown} onclick={(e) => e.stopPropagation()}>
-            <div class="emoji-tabs">
-              {#each EMOJI_CATEGORIES as cat, idx}
-                <button
-                  class="emoji-tab"
-                  class:active={emojiCategory === idx}
-                  type="button"
-                  onclick={() => (emojiCategory = idx)}
-                  title={cat.label}
-                >{cat.emojis[0]}</button>
-              {/each}
-            </div>
-            <div class="emoji-grid">
-              {#each EMOJI_CATEGORIES[emojiCategory].emojis as emoji}
-                <button class="emoji-item" type="button" onclick={() => insertEmoji(emoji)}>{emoji}</button>
-              {/each}
-            </div>
-          </div>
-        {/if}
-      </div>
-      <button class="send-btn" type="submit" disabled={!messageInput.trim()}>Send</button>
+      {@render emojiPicker()}
+      {#if block?.kind === "slow"}
+        <button
+          class="send-btn"
+          type="submit"
+          disabled
+          title="Slow mode: one message every {slowModeLabel(slowModeSecs)}"
+        >{slowModeLabel(block.remainingSecs)}</button>
+      {:else}
+        <button class="send-btn" type="submit" disabled={!messageInput.trim()}>Send</button>
+      {/if}
     </form>
   {:else if effectiveChannel?.text}
     <div class="preview-footer">
@@ -537,9 +684,12 @@
 </div>
 
 {#if linkPopupUrl !== null}
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="link-overlay" onclick={() => (linkPopupUrl = null)}>
-    <div class="link-dialog" onclick={(e) => e.stopPropagation()}>
+  <div class="link-overlay" role="presentation" onclick={backdrop(() => (linkPopupUrl = null))}>
+    <div
+      class="link-dialog"
+      aria-label="Copy link"
+      use:dialog={{ onclose: () => (linkPopupUrl = null) }}
+    >
       <span class="link-title">Copy link</span>
       <input
         class="link-input"
@@ -945,6 +1095,23 @@
     text-align: center;
     border-top: 1px solid var(--border);
     font-style: italic;
+  }
+
+  .preview-footer.post-block {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+  }
+
+  .nsfw-label {
+    color: var(--danger);
+    font-weight: 600;
+  }
+
+  .nsfw-gate p {
+    margin: 0 0 10px;
+    font-style: normal;
   }
 
   .join-text-btn,

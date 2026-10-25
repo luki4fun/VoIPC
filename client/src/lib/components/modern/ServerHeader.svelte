@@ -8,6 +8,7 @@
   import { disconnectServer, serverEntries } from "../../connect.js";
   import { playDisconnectedSound } from "../../sounds.js";
   import { updateUiPrefs } from "../../stores/ui-prefs.js";
+  import { account, showPrompt } from "../../stores/account.js";
   import Icon from "../Icons.svelte";
 
   interface Props {
@@ -46,8 +47,7 @@
   </button>
 
   {#if open}
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="menu" onclick={(e) => e.stopPropagation()}>
+    <div class="menu" role="presentation" onclick={(e) => e.stopPropagation()}>
       {#if $currentChannelId !== 0}
         <button
           class="menu-item"
@@ -58,6 +58,18 @@
         >
           <Icon name="user-plus" size={16} />
           <span>Invite people</span>
+        </button>
+      {/if}
+      {#if $account}
+        <button
+          class="menu-item"
+          onclick={() => {
+            open = false;
+            showPrompt({ kind: "account", server: $serverAddress });
+          }}
+        >
+          <Icon name="lock" size={16} />
+          <span>Your account</span>
         </button>
       {/if}
       <button

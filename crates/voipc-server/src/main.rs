@@ -7,19 +7,25 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use clap::Parser;
 use dashmap::DashMap;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls::pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tracing::{debug, error, info, warn};
 
+mod accounts;
+mod bans;
 mod channels;
 mod config;
+mod fsutil;
 mod media;
+mod presets;
 mod routing;
 mod settings;
 mod state;
 mod tcp;
 mod tunnel;
+#[cfg(test)]
+mod upgrade_fixtures;
 mod web;
 
 use config::ServerConfig;
@@ -68,6 +74,211 @@ struct Args {
     /// Turn on the TCP fallback for clients that cannot reach UDP (tcp_fallback)
     #[arg(long)]
     tcp_fallback: bool,
+
+    /// Accounts: off, optional or required (overrides `[accounts] mode`)
+    #[arg(long, value_enum)]
+    accounts: Option<config::AccountsMode>,
+
+    /// Accounts database, sqlite://… or postgres://… (overrides `[accounts] database`)
+    #[arg(long)]
+    database: Option<String>,
+
+    #[command(subcommand)]
+    command: Option<Command>,
+}
+
+/// Jobs instead of serving.
+#[derive(clap::Subcommand)]
+enum Command {
+    /// Channel presets: list them, or write channels.json from one.
+    #[command(subcommand)]
+    Channels(presets::ChannelsCommand),
+    /// Account administration from the server's own shell.
+    #[command(subcommand)]
+    Admin(AdminCommand),
+    /// The accounts database.
+    #[command(subcommand)]
+    Db(DbCommand),
+    /// The TLS certificate.
+    #[command(subcommand)]
+    Cert(CertCommand),
+    /// Bans that outlive a restart: in the accounts database, or bans.json
+    /// without accounts. A running server reads them again within
+    /// REVALIDATE_MINUTES.
+    #[command(subcommand)]
+    Ban(BanCommand),
+    /// Exit 0 when this server answers on its TCP port (for container and
+    /// service health checks).
+    Health,
+}
+
+#[derive(clap::Subcommand)]
+enum BanCommand {
+    /// The bans in force.
+    List,
+    /// Ban an account by name, or an address (an IPv4 address, or the IPv6 /64
+    /// it is in).
+    Add {
+        #[arg(long, required_unless_present = "ip", conflicts_with = "ip")]
+        account: Option<String>,
+        #[arg(long)]
+        ip: Option<std::net::IpAddr>,
+        #[arg(long, default_value = "")]
+        reason: String,
+        /// Days it lasts; 0 = permanent.
+        #[arg(long, default_value_t = 0)]
+        days: u32,
+    },
+    /// Lift a ban by the id `ban list` shows.
+    Remove { id: u64 },
+}
+
+/// Where a relay without accounts keeps its bans (next to channels.json).
+const BANS_FILE: &str = "bans.json";
+
+async fn run_ban(config: &ServerConfig, command: BanCommand) -> Result<()> {
+    let mut state = ServerState::new(
+        config,
+        settings::ServerSettings::default(),
+        Vec::new(),
+        String::new(),
+    );
+    if config.accounts.mode == config::AccountsMode::Off {
+        state.bans_file = Some(std::path::PathBuf::from(BANS_FILE));
+    } else {
+        state.accounts = Some(Arc::new(
+            accounts::Relay::open(&config.accounts)
+                .await
+                .context("opening the accounts database")?,
+        ));
+    }
+    bans::load(&state).await.context("reading the bans")?;
+    match command {
+        BanCommand::List => {
+            let plain: std::collections::HashMap<u64, std::net::IpAddr> = state
+                .bans
+                .iter()
+                .filter_map(|e| Some((e.value().id, e.value().addr?)))
+                .collect();
+            for b in bans::list(&state) {
+                let what = match (b.account, plain.get(&b.id)) {
+                    (true, _) => "account".to_string(),
+                    (false, Some(ip)) => format!("address {ip}"),
+                    (false, None) => "address".to_string(),
+                };
+                let left = b.expires_in_secs.map_or("permanent".to_string(), |s| {
+                    format!("{} more hours", s.div_ceil(3600))
+                });
+                println!(
+                    "{}	{what}	{}	{left}	by {}	{}",
+                    b.id, b.label, b.by, b.reason
+                );
+            }
+        }
+        BanCommand::Add {
+            account,
+            ip,
+            reason,
+            days,
+        } => {
+            let duration = (days > 0).then(|| Duration::from_secs(u64::from(days) * 86_400));
+            let reason = if reason.trim().is_empty() {
+                "no reason given".to_string()
+            } else {
+                reason
+            };
+            let ban = match (account, ip) {
+                (Some(name), _) => {
+                    let relay = state
+                        .accounts
+                        .clone()
+                        .context("accounts are off: only addresses can be banned")?;
+                    let name = name.trim().to_ascii_lowercase();
+                    let user = relay
+                        .store()
+                        .user_by_username(&name)
+                        .await?
+                        .with_context(|| format!("no account named {name:?}"))?;
+                    bans::add(
+                        &state,
+                        bans::Target::Account(user.id.0),
+                        &user.username,
+                        &reason,
+                        "server shell",
+                        duration,
+                    )
+                    .await?
+                }
+                (None, Some(ip)) => {
+                    bans::add(
+                        &state,
+                        bans::Target::Addr(ip),
+                        "(from the server shell)",
+                        &reason,
+                        "server shell",
+                        duration,
+                    )
+                    .await?
+                }
+                (None, None) => unreachable!("clap requires one"),
+            };
+            println!(
+                "ban {} kept; a running server applies it within {} minutes",
+                ban.id,
+                accounts::REVALIDATE_MINUTES
+            );
+        }
+        BanCommand::Remove { id } => {
+            if bans::remove(&state, id).await? {
+                println!(
+                    "ban {id} lifted; a running server lets them in again within {} minutes",
+                    accounts::REVALIDATE_MINUTES
+                );
+            } else {
+                anyhow::bail!("no ban {id}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[derive(clap::Subcommand)]
+enum CertCommand {
+    /// Print the SHA-256 fingerprint of the certificate (`cert_path`): what an
+    /// app shows when it first meets a self-signed server, for users to
+    /// compare.
+    Fingerprint,
+}
+
+#[derive(clap::Subcommand)]
+enum AdminCommand {
+    /// Give an account a role (admin or moderator). It still needs
+    /// two-factor codes before the role's rights apply.
+    Grant { name: String, role: String },
+    /// Take a role away again; the account is signed out everywhere. The last
+    /// admin keeps the role.
+    Revoke { name: String, role: String },
+    /// Remove an account's two-factor and recovery codes, forget its devices
+    /// and sign it out everywhere — the way back in for an admin who lost
+    /// their phone.
+    #[command(name = "reset-2fa")]
+    Reset2fa { name: String },
+    /// Print a single-use sign-up code (registration = "invite" or "closed").
+    Invite {
+        /// Only this account name can use it.
+        #[arg(long = "for")]
+        name: Option<String>,
+        /// Days it stays valid (1 to 30).
+        #[arg(long, default_value_t = 7)]
+        days: i64,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum DbCommand {
+    /// Copy a SQLite accounts database while the server runs (VACUUM INTO).
+    /// For Postgres use pg_dump. Keep the key file with the copy.
+    Backup { path: String },
 }
 
 /// One IP's connect budget, and when we last saw it. The timestamp is only
@@ -79,7 +290,19 @@ struct ConnectRate {
 }
 
 /// Connection caps shared by the TCP (page) and QUIC accept loops.
+///
+/// Two pools. Every connection starts in the pre-authentication pool: page
+/// loads, TLS and QUIC handshakes, sign-ins in progress. It moves to the main
+/// pool when its session is authenticated (`promote`), and back when the
+/// session ends (`demote`), so the accept loop always hands a pre slot back.
+/// Idle page connections from a few addresses used to fill the one pool and
+/// lock everybody out (1.0 audit H1-01); now they cannot touch what signed-in
+/// sessions use, and filling the pre pool takes many addresses.
 pub struct ConnLimits {
+    pre_total: AtomicU32,
+    pre_per_ip: DashMap<IpAddr, u32>,
+    /// Per IPv6 /48 (one site), for the pre pool only: a /48 holds 65 536 /64s.
+    pre_per_site: DashMap<IpAddr, u32>,
     total: AtomicU32,
     /// Ceiling on concurrent connections, derived from `max_users` rather than
     /// fixed: a browser client holds two of these (page plus QUIC session or
@@ -103,6 +326,13 @@ pub struct ConnLimits {
 }
 
 impl ConnLimits {
+    /// Pre-authentication connections, per address (an office reconnecting
+    /// after a restart arrives from one), per IPv6 /48, and in all. Idle ones
+    /// cost a few kilobytes each.
+    const PRE_PER_IP: u32 = 16;
+    const PRE_PER_SITE: u32 = 32;
+    const PRE_TOTAL: u32 = 1024;
+
     /// Deliberately generous, because the thing this protects against is cheap
     /// to survive and the thing it can break is not.
     ///
@@ -140,6 +370,9 @@ impl ConnLimits {
 
     pub fn new(max_total: u32, max_per_ip: u32) -> Self {
         Self {
+            pre_total: AtomicU32::new(0),
+            pre_per_ip: DashMap::new(),
+            pre_per_site: DashMap::new(),
             total: AtomicU32::new(0),
             max_total,
             max_per_ip,
@@ -149,27 +382,74 @@ impl ConnLimits {
         }
     }
 
-    /// Take a slot for `ip`. On `Err` nothing was taken; the value is the
-    /// reason for the log line.
+    /// Take a pre-authentication slot for `ip`. On `Err` nothing was taken;
+    /// the value is the reason for the log line.
     pub fn acquire(&self, ip: IpAddr) -> Result<(), &'static str> {
-        let ip = limit_key(ip);
+        let key = limit_key(ip);
         // First, because it is the cheapest refusal and the one that protects
         // the most expensive work.
-        if !self.take_connect_token(ip) {
+        if !self.take_connect_token(key) {
             return Err("connect rate exceeded");
         }
-        if self.total.load(Ordering::Relaxed) >= self.max_total {
-            return Err("global limit reached");
+        if self.pre_total.load(Ordering::Relaxed) >= Self::PRE_TOTAL {
+            return Err("pre-authentication limit reached");
+        }
+        let site = site_key(ip);
+        if site.is_some_and(|s| {
+            self.pre_per_site
+                .get(&s)
+                .is_some_and(|c| *c >= Self::PRE_PER_SITE)
+        }) {
+            return Err("per-site limit reached");
         }
         {
-            let mut count = self.per_ip.entry(ip).or_insert(0);
-            if *count >= self.max_per_ip {
+            let mut count = self.pre_per_ip.entry(key).or_insert(0);
+            if *count >= Self::PRE_PER_IP {
                 return Err("per-IP limit reached");
             }
             *count += 1;
         }
-        self.total.fetch_add(1, Ordering::Relaxed);
+        if let Some(site) = site {
+            *self.pre_per_site.entry(site).or_insert(0) += 1;
+        }
+        self.pre_total.fetch_add(1, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// An authenticated session moves `ip`'s slot from the pre pool to the
+    /// main one. On `Err` it stays in the pre pool and the session is refused.
+    pub fn promote(&self, ip: IpAddr) -> Result<(), &'static str> {
+        let key = limit_key(ip);
+        if self.total.load(Ordering::Relaxed) >= self.max_total {
+            return Err("the server has no room for another connection");
+        }
+        {
+            let mut count = self.per_ip.entry(key).or_insert(0);
+            if *count >= self.max_per_ip {
+                return Err("too many connections from your address");
+            }
+            *count += 1;
+        }
+        self.total.fetch_add(1, Ordering::Relaxed);
+        self.release(ip);
+        Ok(())
+    }
+
+    /// An authenticated session ended: its slot goes back to the pre pool,
+    /// which the accept loop then releases.
+    pub fn demote(&self, ip: IpAddr) {
+        let key = limit_key(ip);
+        let _ = self
+            .total
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+        decrement(&self.per_ip, key);
+        *self.pre_per_ip.entry(key).or_insert(0) += 1;
+        if let Some(site) = site_key(ip) {
+            *self.pre_per_site.entry(site).or_insert(0) += 1;
+        }
+        self.pre_total.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Spend one of `ip`'s connect tokens. Deliberately not undone by
@@ -207,19 +487,39 @@ impl ConnLimits {
         entry.limiter.try_consume()
     }
 
+    /// Hand back a pre-authentication slot.
     pub fn release(&self, ip: IpAddr) {
-        let ip = limit_key(ip);
-        self.total.fetch_sub(1, Ordering::Relaxed);
-        if let Some(mut count) = self.per_ip.get_mut(&ip) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                drop(count);
-                self.per_ip.remove(&ip);
-            }
+        let _ = self
+            .pre_total
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+        decrement(&self.pre_per_ip, limit_key(ip));
+        if let Some(site) = site_key(ip) {
+            decrement(&self.pre_per_site, site);
         }
         // `connect_rate` is untouched on purpose. Evicting the entry here
         // would hand the whole burst back on every disconnect, which is
         // exactly the pattern the budget exists to bound.
+    }
+}
+
+fn decrement(map: &DashMap<IpAddr, u32>, key: IpAddr) {
+    if let Some(mut count) = map.get_mut(&key) {
+        *count = count.saturating_sub(1);
+        if *count == 0 {
+            drop(count);
+            map.remove(&key);
+        }
+    }
+}
+
+/// An IPv6 address's /48, the usual size of one site's allocation; `None` for
+/// IPv4, where a shared prefix is as often a carrier's NAT as one site.
+fn site_key(ip: IpAddr) -> Option<IpAddr> {
+    match ip.to_canonical() {
+        IpAddr::V6(v6) => Some(IpAddr::V6((u128::from(v6) & !((1u128 << 80) - 1)).into())),
+        IpAddr::V4(_) => None,
     }
 }
 
@@ -229,7 +529,7 @@ impl ConnLimits {
 /// address, the per-IP ceiling and the connect-rate bucket bounded nothing for
 /// anyone on IPv6. Canonical first: a dual-stack socket reports IPv4 peers as
 /// `::ffff:a.b.c.d`, and masking that would count every IPv4 client as one.
-fn limit_key(ip: IpAddr) -> IpAddr {
+pub(crate) fn limit_key(ip: IpAddr) -> IpAddr {
     match ip.to_canonical() {
         IpAddr::V6(v6) => {
             let prefix = u128::from(v6) & !((1u128 << 64) - 1);
@@ -237,6 +537,129 @@ fn limit_key(ip: IpAddr) -> IpAddr {
         }
         v4 => v4,
     }
+}
+
+async fn run_command(config: &ServerConfig, command: Command) -> Result<()> {
+    if config.accounts.mode == config::AccountsMode::Off {
+        anyhow::bail!("accounts are off: set [accounts] mode, or pass --accounts optional");
+    }
+    let relay = accounts::Relay::open(&config.accounts)
+        .await
+        .context("opening the accounts database")?;
+    let store = relay.store();
+    // The server's own shell: no signed-in admin acts, the audit rows say so.
+    let ctx = relay.ctx(
+        std::net::IpAddr::from([127, 0, 0, 1]),
+        voipc_protocol::codec::APP_VERSION,
+    );
+    let l4f = |e: l4f_accounts::service::Error| anyhow::anyhow!(e.message());
+    let user_named = |name: String| async move {
+        let name = name.trim().to_ascii_lowercase();
+        store
+            .user_by_username(&name)
+            .await?
+            .with_context(|| format!("no account named {name:?}"))
+    };
+    match command {
+        Command::Admin(AdminCommand::Grant { name, role }) => {
+            let user = user_named(name).await?;
+            if relay
+                .accounts
+                .grant_role_as_host(&ctx, user.id, &role)
+                .await
+                .map_err(l4f)?
+            {
+                println!(
+                    "{} now holds {role}; its rights apply once the account has two-factor codes.",
+                    user.username
+                );
+            } else {
+                println!("{} already holds {role}.", user.username);
+            }
+        }
+        Command::Admin(AdminCommand::Revoke { name, role }) => {
+            let user = user_named(name).await?;
+            if relay
+                .accounts
+                .revoke_role_as_host(&ctx, user.id, &role)
+                .await
+                .map_err(l4f)?
+            {
+                println!("{} no longer holds {role} and is signed out everywhere (a running server ends its connection within {} minutes).", user.username, accounts::REVALIDATE_MINUTES);
+            } else {
+                println!("{} does not hold {role}.", user.username);
+            }
+        }
+        Command::Admin(AdminCommand::Reset2fa { name }) => {
+            let user = user_named(name).await?;
+            if relay
+                .accounts
+                .reset_2fa_as_host(&ctx, user.id)
+                .await
+                .map_err(l4f)?
+            {
+                println!(
+                    "{}: second factors and recovery codes removed, devices forgotten, signed out everywhere (a running server ends its connection within {} minutes).",
+                    user.username,
+                    accounts::REVALIDATE_MINUTES
+                );
+            } else {
+                println!(
+                    "{} has no second factor, remembered device or session; nothing changed.",
+                    user.username
+                );
+            }
+        }
+        Command::Admin(AdminCommand::Invite { name, days }) => {
+            // Closed: only an admin makes accounts, each for a name it picked.
+            if config.accounts.registration == config::RegistrationMode::Closed
+                && name.as_deref().is_none_or(|n| n.trim().is_empty())
+            {
+                anyhow::bail!("registration is \"closed\": name the account the code is for with --for <name>");
+            }
+            let code = relay
+                .accounts
+                .invite_create_as_host(&ctx, name.as_deref(), days)
+                .await
+                .map_err(l4f)?;
+            // The code alone on stdout, for scripts; the rest is for whoever reads it.
+            println!("{code}");
+            let bound = name
+                .map(|n| format!(", only for the name {n:?}"))
+                .unwrap_or_default();
+            eprintln!(
+                "One sign-up, valid {} days{bound}: Create account, then this as the invite code.",
+                days.clamp(1, 30)
+            );
+        }
+        Command::Channels(_) | Command::Cert(_) | Command::Health | Command::Ban(_) => {
+            unreachable!("handled before the database is opened")
+        }
+        Command::Db(DbCommand::Backup { path }) => match store {
+            l4f_accounts::store::Store::Lite(b) => {
+                // Made empty and private first: SQLite copies into an empty file
+                fsutil::create_private(std::path::Path::new(&path), &[])
+                    .with_context(|| format!("creating {path}"))?;
+                sqlx::query(sqlx::AssertSqlSafe(format!(
+                    "VACUUM INTO '{}'",
+                    path.replace('\'', "''")
+                )))
+                .execute(&b.0)
+                .await
+                .with_context(|| format!("backing up to {path}"))?;
+                fsutil::owner_only(std::path::Path::new(&path))
+                    .with_context(|| format!("making {path} readable by this user only"))?;
+                println!(
+                    "copied to {path}; keep {} with it",
+                    config.accounts.key_file
+                );
+            }
+            l4f_accounts::store::Store::Pg(_) => {
+                anyhow::bail!("this is Postgres: back it up with pg_dump")
+            }
+        },
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -255,6 +678,12 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+
+    // Files only, and none of them server.toml: a broken config must not stop
+    // the tool that writes channels.json.
+    if let Some(Command::Channels(command)) = args.command {
+        return presets::run(command, args.channels.as_deref(), args.settings.as_deref());
+    }
 
     // Load config
     let mut config = if let Some(config_path) = &args.config {
@@ -283,6 +712,41 @@ async fn main() -> Result<()> {
     }
     if args.tcp_fallback {
         config.tcp_fallback = true;
+    }
+    if let Some(mode) = args.accounts {
+        config.accounts.mode = mode;
+    }
+    config.validate()?;
+    if let Some(url) = args.database {
+        config.accounts.database = url;
+    }
+    match args.command {
+        Some(Command::Cert(CertCommand::Fingerprint)) => {
+            println!("{}", fingerprint(&load_certs(&config.cert_path)?[0]));
+            return Ok(());
+        }
+        // shortcut: a TCP connect proves the listener is up, not that a whole
+        // request is served; a TLS h2 request if a hung server ever passes it
+        Some(Command::Health) => {
+            let port = config.tcp_port;
+            let host = if config.host == "::" || config.host == "0.0.0.0" {
+                "127.0.0.1"
+            } else {
+                config.host.as_str()
+            };
+            let up = tokio::time::timeout(
+                Duration::from_secs(3),
+                tokio::net::TcpStream::connect((host, port)),
+            )
+            .await;
+            if !matches!(up, Ok(Ok(_))) {
+                anyhow::bail!("nothing answers on TCP port {port}");
+            }
+            return Ok(());
+        }
+        Some(Command::Ban(command)) => return run_ban(&config, command).await,
+        Some(command) => return run_command(&config, command).await,
+        None => {}
     }
     // The v6 wildcard is dual-stack (IPV6_V6ONLY off for the TCP listener,
     // Ipv6DualStackConfig::Allow for QUIC), so one bind serves both families.
@@ -339,6 +803,12 @@ async fn main() -> Result<()> {
     // clients (by SNI), the TCP listener to browsers loading the page.
     let certs = load_certs(&config.cert_path)?;
     let key = load_key(&config.key_path)?;
+    // What an app pins when it first meets a self-signed server: users can
+    // compare it (`voipc-server cert fingerprint` prints it too)
+    info!(
+        "certificate fingerprint (SHA-256): {}",
+        fingerprint(&certs[0])
+    );
 
     let mut tls_config =
         rustls::ServerConfig::builder_with_protocol_versions(&[&rustls::version::TLS13])
@@ -353,22 +823,110 @@ async fn main() -> Result<()> {
 
     // Admin token: configured, or generated for this run and shown once
     // (like a TeamSpeak privilege key). Nothing is persisted.
-    let admin_token = match config.admin_token.clone().filter(|t| !t.is_empty()) {
-        Some(token) => token,
-        None => {
-            let token = hex::encode(rand::random::<[u8; 32]>());
-            info!("no admin_token configured — admin token for this run: {token}");
-            token
-        }
+    let configured_token = config.admin_token.clone().filter(|t| !t.is_empty());
+    if configured_token
+        .as_ref()
+        .is_some_and(|t| t.chars().count() < state::MIN_TOKEN_LEN)
+    {
+        anyhow::bail!(
+            "admin_token is shorter than {} characters, which can be guessed: set a long random one (`openssl rand -hex 32`), or none to get one for each run",
+            state::MIN_TOKEN_LEN
+        );
+    }
+    let generated_token = configured_token.is_none();
+    let admin_token = configured_token.unwrap_or_else(|| hex::encode(rand::random::<[u8; 32]>()));
+
+    // Opt-in accounts: the database is only ever opened (or made) when asked for.
+    let relay = if config.accounts.mode == config::AccountsMode::Off {
+        None
+    } else {
+        let relay = Arc::new(
+            accounts::Relay::open(&config.accounts)
+                .await
+                .context("opening the accounts database")?,
+        );
+        info!(
+            mode = ?config.accounts.mode,
+            registration = ?config.accounts.registration,
+            cloud = config.accounts.cloud,
+            relay_id = %hex::encode(relay.relay_id),
+            "accounts on"
+        );
+        // Expired sessions, invites, old audit rows and unused device keys.
+        let sweeper = relay.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(Duration::from_secs(3600));
+            loop {
+                every.tick().await;
+                if let Err(e) = sweeper.accounts.sweep(l4f_accounts::util::now()).await {
+                    warn!("accounts sweep: {e}");
+                }
+                match accounts::log::sweep(&sweeper).await {
+                    Ok(n) if n > 0 => info!(dropped = n, "stored messages past their time"),
+                    Ok(_) => {}
+                    Err(e) => warn!("stored-message sweep: {e}"),
+                }
+            }
+        });
+        Some(relay)
     };
 
+    // The token is shown only where it can still do something: with accounts
+    // it makes the first admin, for good, so a log reader must not get one
+    // once an admin exists — and the shell can grant the role instead.
+    if generated_token {
+        match &relay {
+            None => info!("no admin_token configured — admin token for this run: {admin_token}"),
+            Some(r) if r.store().holders_of_scope_star().await.context("counting admins")? > 0 => {
+                info!("this server has an admin account: the admin token is not used here (voipc-server admin grant gives roles)")
+            }
+            Some(_) => info!(
+                "no admin account yet — admin token for this run, which makes the account that enters it the first admin: {admin_token} \
+                 (or: voipc-server admin grant <name> admin)"
+            ),
+        }
+    }
+
     // Create shared state
-    let state = Arc::new(ServerState::new(
-        &config,
-        server_settings,
-        persistent_channels,
-        admin_token,
-    ));
+    let mut state = ServerState::new(&config, server_settings, persistent_channels, admin_token);
+    state.accounts = relay;
+    if state.accounts.is_none() {
+        state.bans_file = Some(std::path::PathBuf::from(BANS_FILE));
+    }
+    let state = Arc::new(state);
+    bans::load(&state).await.context("reading the bans")?;
+    // Every client gets the channel list in one frame. Too many channels with
+    // long descriptions and it cannot be sent, and clients see no channels at
+    // all: say so now instead (1.0 audit H1-06)
+    let list = voipc_protocol::codec::encode_server_msg(
+        &voipc_protocol::messages::ServerMessage::ChannelList {
+            channels: state.channel_list().await,
+        },
+    );
+    if list.as_ref().map_or(true, |b| b.len() > 60 * 1024) {
+        anyhow::bail!("channels.json describes more channels than fit in one channel list (60 KiB): shorten descriptions or remove channels");
+    }
+    if state.accounts.is_some() {
+        accounts::locked_logs_at_boot(&state)
+            .await
+            .context("checking the channel logs' passwords")?;
+    }
+    // What the server's shell changes (roles, codes, bans) reaches
+    // connections already open.
+    let watched = state.clone();
+    tokio::spawn(async move {
+        let mut every =
+            tokio::time::interval(Duration::from_secs(60 * accounts::REVALIDATE_MINUTES));
+        every.tick().await;
+        loop {
+            every.tick().await;
+            accounts::revalidate(&watched).await;
+            match bans::load(&watched).await {
+                Ok(()) => bans::enforce(&watched, None).await,
+                Err(e) => warn!("reading the bans: {e:#}"),
+            }
+        }
+    });
 
     // Bind TCP listener
     let tcp_addr = config.bind_addr(config.tcp_port)?;
@@ -378,7 +936,7 @@ async fn main() -> Result<()> {
 
     info!("TCP listener bound on {}:{}", config.host, config.tcp_port);
 
-    let limits = Arc::new(ConnLimits::from_config(&config));
+    let limits = state.limits.clone();
 
     // The QUIC endpoint every client connects to, plus the page's /wt.json data
     let web = web::WebTransport::bind(&config, certs, key)?;
@@ -398,7 +956,25 @@ async fn main() -> Result<()> {
     // TCP accept loop with connection limits
     info!("server ready, accepting connections");
 
-    let shutdown = tokio::signal::ctrl_c();
+    // SIGINT (Ctrl+C) or SIGTERM (`docker stop`, systemd): either one tells
+    // the clients the server is going down instead of being killed mid-call
+    let shutdown = async {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            match signal(SignalKind::terminate()) {
+                Ok(mut term) => tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {}
+                    _ = term.recv() => {}
+                },
+                Err(_) => {
+                    let _ = tokio::signal::ctrl_c().await;
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+    };
     tokio::pin!(shutdown);
 
     loop {
@@ -420,14 +996,14 @@ async fn main() -> Result<()> {
 
         let peer_ip = peer_addr.ip();
 
-        if state.is_banned(peer_ip) {
+        if bans::refused_at_accept(&state, peer_ip) {
             debug!(peer = %peer_addr, "rejecting connection: banned");
             drop(tcp_stream);
             continue;
         }
 
         if let Err(reason) = limits.acquire(peer_ip) {
-            warn!(peer = %peer_addr, "rejecting connection: {reason}");
+            debug!(peer = %peer_addr, "rejecting connection: {reason}");
             drop(tcp_stream);
             continue;
         }
@@ -474,11 +1050,11 @@ async fn main() -> Result<()> {
                     if e.kind() == std::io::ErrorKind::UnexpectedEof {
                         debug!(peer = %peer_addr, "TLS handshake aborted by peer");
                     } else {
-                        error!(peer = %peer_addr, "TLS handshake failed: {}", e);
+                        debug!(peer = %peer_addr, "TLS handshake failed: {}", e);
                     }
                 }
                 Err(_) => {
-                    warn!(peer = %peer_addr, "TLS handshake timed out");
+                    debug!(peer = %peer_addr, "TLS handshake timed out");
                 }
             }
 
@@ -514,8 +1090,7 @@ fn alpn_protocols(tcp_fallback: bool) -> Vec<Vec<u8>> {
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     let cert_data = fs::read(path).with_context(|| format!("failed to read cert: {}", path))?;
-    let mut reader = std::io::BufReader::new(cert_data.as_slice());
-    let certs: Vec<CertificateDer<'static>> = rustls_pemfile::certs(&mut reader)
+    let certs = CertificateDer::pem_slice_iter(&cert_data)
         .collect::<Result<Vec<_>, _>>()
         .context("failed to parse certificates")?;
 
@@ -526,19 +1101,23 @@ fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
     Ok(certs)
 }
 
+/// SHA-256 of a certificate, colon-separated hex: what the desktop app pins
+/// for a self-signed server (`transport.rs` `TofuCertVerifier`).
+fn fingerprint(cert: &CertificateDer<'_>) -> String {
+    let digest = ring::digest::digest(&ring::digest::SHA256, cert.as_ref());
+    digest
+        .as_ref()
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(":")
+}
+
+/// The first PKCS#1, PKCS#8 or SEC1 private key in the file.
 fn load_key(path: &str) -> Result<PrivateKeyDer<'static>> {
     let key_data = fs::read(path).with_context(|| format!("failed to read key: {}", path))?;
-    let mut reader = std::io::BufReader::new(key_data.as_slice());
-
-    loop {
-        match rustls_pemfile::read_one(&mut reader)? {
-            Some(rustls_pemfile::Item::Pkcs1Key(key)) => return Ok(PrivateKeyDer::Pkcs1(key)),
-            Some(rustls_pemfile::Item::Pkcs8Key(key)) => return Ok(PrivateKeyDer::Pkcs8(key)),
-            Some(rustls_pemfile::Item::Sec1Key(key)) => return Ok(PrivateKeyDer::Sec1(key)),
-            Some(_) => continue, // skip other items
-            None => anyhow::bail!("no private key found in {}", path),
-        }
-    }
+    PrivateKeyDer::from_pem_slice(&key_data)
+        .with_context(|| format!("no private key found in {}", path))
 }
 
 #[cfg(test)]
@@ -589,7 +1168,11 @@ mod tests {
         assert!(refused.contains("NoApplicationProtocol"), "{refused}");
         let past_alpn = handshake(true, b"http/1.1").await;
         assert!(!past_alpn.contains("NoApplicationProtocol"), "{past_alpn}");
-        assert_eq!(alpn_protocols(true)[0], b"h2", "page loads would get HTTP/1.1");
+        assert_eq!(
+            alpn_protocols(true)[0],
+            b"h2",
+            "page loads would get HTTP/1.1"
+        );
         assert_eq!(alpn_protocols(false), [b"h2".to_vec()]);
     }
 
@@ -601,14 +1184,24 @@ mod tests {
         let v6 = |s: &str| IpAddr::V6(s.parse().unwrap());
         let v4 = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7));
         assert_eq!(limit_key(v4), v4);
-        assert_eq!(limit_key(v6("::ffff:192.0.2.7")), v4, "a dual-stack socket's IPv4 peer");
+        assert_eq!(
+            limit_key(v6("::ffff:192.0.2.7")),
+            v4,
+            "a dual-stack socket's IPv4 peer"
+        );
         assert_ne!(
             limit_key(v6("::ffff:192.0.2.7")),
             limit_key(v6("::ffff:192.0.2.8")),
             "IPv4 peers must not share one key"
         );
-        assert_eq!(limit_key(v6("2001:db8:1:2::1")), limit_key(v6("2001:db8:1:2:ffff::9")));
-        assert_ne!(limit_key(v6("2001:db8:1:2::1")), limit_key(v6("2001:db8:1:3::1")));
+        assert_eq!(
+            limit_key(v6("2001:db8:1:2::1")),
+            limit_key(v6("2001:db8:1:2:ffff::9"))
+        );
+        assert_ne!(
+            limit_key(v6("2001:db8:1:2::1")),
+            limit_key(v6("2001:db8:1:3::1"))
+        );
     }
 
     /// Rotating through one /64 is the same subscriber dialling again.
@@ -620,12 +1213,56 @@ mod tests {
         };
         let limits = ConnLimits::from_config(&config);
         let v6 = |s: &str| IpAddr::V6(s.parse().unwrap());
-        limits.acquire(v6("2001:db8:1:2::1")).unwrap();
-        limits.acquire(v6("2001:db8:1:2::2")).unwrap();
-        assert_eq!(limits.acquire(v6("2001:db8:1:2::3")), Err("per-IP limit reached"));
-        assert!(limits.acquire(v6("2001:db8:1:3::1")).is_ok(), "the next /64 is somebody else");
+        let signed_in = |s: &str| limits.acquire(v6(s)).and_then(|()| limits.promote(v6(s)));
+        signed_in("2001:db8:1:2::1").unwrap();
+        signed_in("2001:db8:1:2::2").unwrap();
+        assert_eq!(
+            signed_in("2001:db8:1:2::3"),
+            Err("too many connections from your address")
+        );
+        assert!(
+            signed_in("2001:db8:1:3::1").is_ok(),
+            "the next /64 is somebody else"
+        );
+        limits.demote(v6("2001:db8:1:2::1"));
         limits.release(v6("2001:db8:1:2::1"));
-        assert!(limits.acquire(v6("2001:db8:1:2::4")).is_ok(), "released under the same key");
+        assert!(
+            signed_in("2001:db8:1:2::4").is_ok(),
+            "released under the same key"
+        );
+    }
+
+    /// H1-01: connections that never sign in (idle page loads, stalled
+    /// handshakes) fill only their own pool, per address and per IPv6 site,
+    /// and never the room signed-in sessions use.
+    #[test]
+    fn idle_connections_cannot_take_the_room_signed_in_sessions_use() {
+        let limits = ConnLimits::from_config(&ServerConfig::default());
+        let a = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7));
+        for _ in 0..ConnLimits::PRE_PER_IP {
+            limits.acquire(a).unwrap();
+        }
+        assert_eq!(limits.acquire(a), Err("per-IP limit reached"));
+        // Somebody else still gets in, and signs in
+        let b = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 8));
+        limits.acquire(b).unwrap();
+        limits.promote(b).unwrap();
+        assert_eq!(
+            limits.total.load(Ordering::Relaxed),
+            1,
+            "only the signed-in session takes main room"
+        );
+        // A whole IPv6 site cannot rotate through its /64s
+        let site = |n: u16| IpAddr::V6(std::net::Ipv6Addr::new(0x2001, 0xdb8, 7, n, 0, 0, 0, 1));
+        for n in 0..ConnLimits::PRE_PER_SITE as u16 {
+            limits.acquire(site(n)).unwrap();
+        }
+        assert_eq!(limits.acquire(site(999)), Err("per-site limit reached"));
+        // A signed-in session that ends hands its slot back through the pre pool
+        limits.demote(b);
+        limits.release(b);
+        assert_eq!(limits.total.load(Ordering::Relaxed), 0);
+        assert!(limits.pre_per_ip.get(&b).is_none());
     }
 
     #[test]
@@ -666,9 +1303,15 @@ mod tests {
         assert_eq!(limits.max_per_ip, 2);
 
         let ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
-        limits.acquire(ip).unwrap();
-        limits.acquire(ip).unwrap();
-        assert_eq!(limits.acquire(ip), Err("per-IP limit reached"));
+        for _ in 0..3 {
+            limits.acquire(ip).unwrap();
+        }
+        limits.promote(ip).unwrap();
+        limits.promote(ip).unwrap();
+        assert_eq!(
+            limits.promote(ip),
+            Err("too many connections from your address")
+        );
     }
 
     /// The connect-rate map is the one table a stranger can grow, and the

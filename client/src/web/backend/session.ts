@@ -11,9 +11,11 @@
 import { emit as emitEvent } from "./events";
 import { getConfig } from "./config";
 import { loadWasm, wasm, type MediaKeys, type PreKeyBundleData, type SignalClient } from "./wasm";
+import { AccountDriver, type AccountArgs, type AccountHost } from "./account";
 import { connect as openTransport, type Transport } from "./transport";
 import type { SessionContext } from "./types";
 import type { ChannelInfo } from "../../lib/types";
+import { parseHostPort } from "../../lib/invite";
 import type { ProximityMode } from "../../lib/spatial";
 import { audio } from "./audio";
 import { video } from "./video";
@@ -21,6 +23,8 @@ import { share } from "./share";
 
 /** Bound for the authentication response (network.rs CONNECT_TIMEOUT). */
 const AUTH_TIMEOUT_MS = 10_000;
+/** An account sign-in waits on a person typing a code (the relay allows two minutes). */
+const ACCOUNT_AUTH_TIMEOUT_MS = 150_000;
 /** Datagram keepalive period: measures RTT (a dead QUIC path closes the transport). */
 const KEEPALIVE_MS = 10_000;
 /** Queued chat messages older than this are dropped instead of sent. */
@@ -86,6 +90,15 @@ export function sessionFor(server: string): Session | null {
   return sessions.get(server) ?? null;
 }
 
+/** Sessions still signing in (not in `sessions` until Authenticated): an
+ *  account's code prompt answers to one of these. */
+const signingIn = new Map<string, Session>();
+
+/** The session that is listed, or still signing in, for `server`. */
+export function sessionOrSigningIn(server: string): Session | null {
+  return sessions.get(server) ?? signingIn.get(server) ?? null;
+}
+
 /** The session whose voice channel we are in, or null. */
 export function voiceSession(): Session | null {
   return voiceOwner;
@@ -95,9 +108,9 @@ export function allSessions(): Session[] {
   return [...sessions.values()];
 }
 
-/** Connect and authenticate. Resolves with our user id. */
-export function connect(address: string, username: string): Promise<number> {
-  const run = (connectQueues.get(address) ?? Promise.resolve()).then(() => doConnect(address, username));
+/** Connect and authenticate (as a guest, or to `account`). Resolves with our user id. */
+export function connect(address: string, username: string, account?: AccountArgs): Promise<number> {
+  const run = (connectQueues.get(address) ?? Promise.resolve()).then(() => doConnect(address, username, account));
   const tail = run.catch(() => {});
   connectQueues.set(address, tail);
   void tail.then(() => {
@@ -150,16 +163,20 @@ function takeVoice(s: Session): void {
   previous?.sendControl({ JoinChannel: { channel_id: 0, password: null } });
 }
 
-async function doConnect(address: string, username: string): Promise<number> {
+async function doConnect(address: string, username: string, account?: AccountArgs): Promise<number> {
   // Replaces only this server's connection (e.g. after a page reload race);
   // every other server stays as it is.
   await sessions.get(address)?.end(true);
 
   const { host, port } = parseAddress(address);
   const api = await loadWasm();
+  const driver = account ? await AccountDriver.create(address, username, account) : null;
   // Fresh Signal identity per connection: ephemeral by design, and the
-  // server reassigns user ids on restart (network.rs connect_to_server).
+  // server reassigns user ids on restart (network.rs connect_to_server). An
+  // account's identity replaces this one during its sign-in.
   const session = new Session(address, api.newSignalClient(), username);
+  session.account = driver;
+  signingIn.set(address, session);
   try {
     session.transport = await openTransport(host, port, {
       onControl: (payload) => session.onControl(payload),
@@ -167,57 +184,44 @@ async function doConnect(address: string, username: string): Promise<number> {
       onVideoPacket: (bytes) => session.onVideoPacket(bytes),
       onClosed: (reason) => session.onTransportClosed(reason),
     });
-    const authenticated = session.awaitAuthentication();
-    const { identity_key, prekey_bundle } = session.signal.bundle();
-    session.sendControl({
-      Authenticate: {
-        username,
-        protocol_version: api.protocolVersion(),
-        app_version: api.appVersion(),
-        identity_key,
-        prekey_bundle,
-      },
-    });
+    const authenticated = session.awaitAuthentication(driver ? ACCOUNT_AUTH_TIMEOUT_MS : AUTH_TIMEOUT_MS);
+    if (driver) {
+      session.sendRaw(driver.first());
+    } else {
+      const { identity_key, prekey_bundle } = session.signal.bundle();
+      session.sendControl({
+        Authenticate: {
+          username,
+          protocol_version: api.protocolVersion(),
+          app_version: api.appVersion(),
+          identity_key,
+          prekey_bundle,
+        },
+      });
+    }
     await authenticated;
     // The transport can close between Authenticated and this continuation
     if (session.isEnded) throw new Error("Server closed connection during authentication");
   } catch (e) {
     await session.end(false);
     throw e;
+  } finally {
+    if (signingIn.get(address) === session) signingIn.delete(address);
   }
   sessions.set(address, session);
   session.start();
+  session.account?.afterConnect(session);
   return session.userId;
 }
 
-/** Port of network.rs parse_address; the port defaults to 9987. */
+/** network.rs parse_address's rules: the port defaults to 9987. */
 function parseAddress(address: string): { host: string; port: number } {
-  let host: string;
-  let portStr: string | null;
-  if (address.startsWith("[")) {
-    // IPv6: [::1]:9987
-    const end = address.indexOf("]");
-    if (end < 0) throw new Error("Invalid IPv6 address format, expected [host]:port");
-    host = address.slice(1, end);
-    const rest = address.slice(end + 1);
-    if (rest === "") portStr = null;
-    else if (rest.startsWith(":")) portStr = rest.slice(1);
-    else throw new Error("Invalid IPv6 address format, expected [host]:port");
-  } else {
-    const colon = address.lastIndexOf(":");
-    host = colon < 0 ? address : address.slice(0, colon);
-    portStr = colon < 0 ? null : address.slice(colon + 1);
-  }
-  let port = 9987;
-  if (portStr !== null) {
-    if (!/^\d{1,5}$/.test(portStr) || Number(portStr) > 65535) throw new Error("Invalid port number");
-    port = Number(portStr);
-  }
-  if (host === "") throw new Error("Host cannot be empty");
-  return { host, port };
+  const parsed = parseHostPort(address);
+  if (!parsed) throw new Error("Invalid address, expected host:port or [IPv6]:port");
+  return parsed;
 }
 
-export class Session implements SessionContext {
+export class Session implements SessionContext, AccountHost {
   sessionId = 0;
   /** Current voice channel (0 = none: the server parks us there). Confirmed by UserList. */
   channelId = 0;
@@ -247,6 +251,21 @@ export class Session implements SessionContext {
   private videoFrameId = 0;
   private screenAudioSequence = 0;
   private auth: { resolve(): void; reject(e: Error): void } | null = null;
+  /** The account this connection signs in to; null for a guest. */
+  account: AccountDriver | null = null;
+  /** The safety number with `userId` (account_session.rs safety_number). */
+  safetyNumber(userId: number): string {
+    if (!this.account) throw new Error("Sign in to an account to verify people");
+    return this.account.safetyNumber(userId, this.signal.bundle().identity_key, this.signal.identityOf(userId));
+  }
+
+  /** The identities the Signal stores took in for the last message, against
+   *  the pins as a fetched bundle is (account.rs check_seen). Taken on every
+   *  connection, so a guest's list does not grow. */
+  private checkSeen(): void {
+    const seen = this.signal.takeSeen();
+    for (const { user_id, key } of seen) this.account?.checkIdentity(this, user_id, key);
+  }
   private keepalive: ReturnType<typeof setInterval> | undefined;
   /** Control messages waiting for the budget; see `drainControl`. */
   private readonly controlQueue: Uint8Array[] = [];
@@ -269,7 +288,7 @@ export class Session implements SessionContext {
   constructor(
     /** The server id: the address the UI connected with, verbatim. */
     readonly server: string,
-    readonly signal: SignalClient,
+    public signal: SignalClient,
     readonly username: string,
   ) {
     this.mediaKeys = wasm().newMediaKeys();
@@ -329,6 +348,22 @@ export class Session implements SessionContext {
     return this.transport?.videoBacklog() ?? 0;
   }
 
+  /** An already encoded control payload (the account sign-in makes its own). */
+  sendRaw(payload: Uint8Array): void {
+    if (!this.transport) return;
+    this.controlQueue.push(payload);
+    this.drainControl();
+  }
+
+  replaceSignal(client: SignalClient): void {
+    this.signal.free();
+    this.signal = client;
+  }
+
+  failAuth(e: Error): void {
+    this.auth?.reject(e);
+  }
+
   sendControl(msg: unknown): void {
     if (!this.transport) return;
     let payload: Uint8Array;
@@ -379,12 +414,13 @@ export class Session implements SessionContext {
 
   // ── lifecycle ──
 
-  awaitAuthentication(): Promise<void> {
+  awaitAuthentication(timeoutMs = AUTH_TIMEOUT_MS): Promise<void> {
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         this.auth = null;
+        this.account?.cancel();
         reject(new Error("Timed out waiting for the authentication response"));
-      }, AUTH_TIMEOUT_MS);
+      }, timeoutMs);
       this.auth = {
         resolve: () => {
           clearTimeout(timer);
@@ -432,11 +468,16 @@ export class Session implements SessionContext {
     if (sessions.get(this.server) === this) sessions.delete(this.server);
     clearInterval(this.keepalive);
     if (voiceOwner === this) detachVoice();
-    if (sendDisconnect) {
+    if (sendDisconnect && this.transport) {
       // Whatever was still waiting for the pacer is moot now, and the goodbye
-      // is not: it goes out ahead of the queue rather than behind it.
+      // is not: it goes out ahead of the queue, and past the pacer too — over
+      // budget it was queued, and the queue is cleared just below.
       this.controlQueue.length = 0;
-      this.sendControl("Disconnect");
+      try {
+        this.transport.sendControl(wasm().encodeClientMsg("Disconnect"));
+      } catch (e) {
+        console.warn("could not send the goodbye:", e);
+      }
     }
     // After the goodbye, so a queue that was over budget cannot leave a timer
     // running against a transport that is about to close.
@@ -446,6 +487,7 @@ export class Session implements SessionContext {
     if (this.transport) await this.transport.close();
     this.mediaKeys.free();
     this.signal.free();
+    this.account?.dispose();
   }
 
   onTransportClosed(reason: string): void {
@@ -462,6 +504,7 @@ export class Session implements SessionContext {
   // ── inbound ──
 
   onControl(payload: Uint8Array): void {
+    this.account?.onPayload(this, payload);
     let msg: unknown;
     try {
       msg = wasm().decodeServerMsg(payload);
@@ -474,6 +517,7 @@ export class Session implements SessionContext {
     } catch (e) {
       console.error("server message handler failed:", e);
     }
+    this.checkSeen();
   }
 
   onVideoPacket(bytes: Uint8Array): void {
@@ -544,20 +588,66 @@ export class Session implements SessionContext {
       case "Authenticated":
         this.userId = b.user_id;
         this.sessionId = b.session_id;
+        // libsignal binds both parties' ids into every pairwise message
+        this.signal.setOwnUserId(b.user_id);
+        if (b.accounts) this.emit("relay-accounts", b.accounts);
+        // An account sign-in ends signed in to that account, or not at all
+        // (account.rs sign_in waits for exactly this).
+        if (this.account) {
+          if (!b.account) {
+            this.failAuth(new Error("The server did not sign this account in."));
+            break;
+          }
+          try {
+            this.account.onAuthenticated(this, b.account);
+          } catch (e) {
+            this.failAuth(e instanceof Error ? e : new Error(String(e)));
+            break;
+          }
+        }
         this.auth?.resolve();
+        break;
+      case "AuthStep":
+        // The account sign-in reads these from the raw payload (onControl);
+        // a guest only ever gets this one. connect.ts looks for the words.
+        if (!this.account && typeof b === "object" && "AccountRequired" in b) {
+          this.failAuth(new Error("This server needs an account: sign in or create one."));
+        }
+        break;
+      case "Account":
+        this.account?.onReply(this, b);
         break;
       case "AuthError":
         this.auth?.reject(new Error(`Authentication failed: ${b.reason}`));
+        break;
+      case "Refused":
+        // Another protocol: the facts for the "update" panel, and the text,
+        // which says "version mismatch" (connect.ts stops reconnecting on it)
+        this.emit("update-needed", {
+          code: b.code,
+          server_protocol: b.server_protocol,
+          server_version: b.server_version,
+          our_protocol: wasm().protocolVersion(),
+          our_version: wasm().appVersion(),
+        });
+        this.auth?.reject(new Error(b.text));
         break;
       case "ChannelList":
         // Our own copy: the emitted array ends up in the UI's store
         this.channels = [...b.channels];
         this.emit("channel-list", b.channels);
         break;
-      case "UserList":
+      case "UserList": {
+        this.account?.noteRoster(this, b.users);
+        // In a channel with a log: keep it (with cloud copies on), and read
+        // what it kept since last time.
+        const log = this.channels.find((c) => c.channel_id === b.channel_id)?.log;
+        if (log) this.account?.enter(this, log);
         this.onUserList(b.channel_id, b.users);
         break;
+      }
       case "UserJoined": {
+        this.account?.noteRoster(this, [b.user]);
         // Pairwise sessions are needed in every channel (DMs, pokes)
         if (b.user.user_id !== this.userId) this.requestPrekeyBundlesForUsers([b.user]);
         // Somebody joined a channel we are in. Nobody else hands them our
@@ -590,6 +680,10 @@ export class Session implements SessionContext {
             // behind is what let a re-join write on the key every former
             // member still had.
             this.signal.forgetChannel(this.userId, b.channel_id);
+            // Out of the channel's log too: the relay took us out of it
+            // (1.0, D10), and a rejoin keeps it again
+            const log = this.channels.find((c) => c.channel_id === b.channel_id)?.log;
+            if (log) this.account?.leave(this, log, false);
           } else if (this.signal.isTextChannel(b.channel_id)) {
             // They keep the chain key they were given; our next message here
             // starts a fresh one they cannot read.
@@ -725,14 +819,25 @@ export class Session implements SessionContext {
         this.emit("screenshare-error", { reason: b.reason });
         break;
       case "PreKeyBundle":
+        // Their identity against the one first seen for their account.
+        this.account?.checkIdentity(this, b.user_id, b.bundle.identity_key);
         this.onPrekeyBundle(b.user_id, b.bundle);
+        break;
+      case "PreKeysLow":
+        // The relay has handed out most of our one-time pre-keys
+        this.sendControl({ UploadPreKeys: { prekeys: this.signal.morePrekeys() } });
         break;
       case "PreKeyBundleUnavailable":
         // Remove from pending so we don't loop
         this.pendingSessions.delete(b.user_id);
         break;
       case "DirectMessageUndelivered":
-        this.emit("dm-undelivered", { user_id: b.target_user_id });
+        // Between two accounts with cloud copies on, it went into the stored log
+        // as well (sendDirectMessage): they read it when they are back.
+        this.emit("dm-undelivered", {
+          user_id: b.target_user_id,
+          kept: this.account?.keptFor(b.target_user_id) ?? false,
+        });
         break;
       case "IdentityKeyChanged":
         this.emit("identity-key-changed", { user_id: b.user_id, new_identity_key: b.new_identity_key });
@@ -769,9 +874,25 @@ export class Session implements SessionContext {
         this.emit("admin-error", { reason: b.reason });
         break;
       case "AdminBans":
+        // u64s may arrive as BigInt: plain numbers for the UI (types.ts BanInfo)
         this.emit("admin-bans", {
-          bans: (b.bans as { ip: string; expires_in_secs?: bigint | number }[]).map((x) => ({
-            ip: x.ip,
+          bans: (
+            b.bans as {
+              id: bigint | number;
+              account: boolean;
+              label: string;
+              reason: string;
+              by: string;
+              created_at: bigint | number;
+              expires_in_secs?: bigint | number | null;
+            }[]
+          ).map((x) => ({
+            id: Number(x.id),
+            account: x.account,
+            label: x.label,
+            reason: x.reason,
+            by: x.by,
+            created_at: Number(x.created_at),
             expires_in_secs: x.expires_in_secs == null ? null : Number(x.expires_in_secs),
           })),
         });
@@ -1143,9 +1264,13 @@ export class Session implements SessionContext {
     this.pendingSessions.delete(userId);
   }
 
-  /** Take the queued messages for `matches`, dropping those older than the TTL. */
+  /**
+   * Take the queued messages for `matches`, dropping those older than the TTL.
+   * `undelivered` is the event that says so: they were shown as sent (H4-10).
+   */
   private takePending(
     matches: (t: PendingTarget) => boolean,
+    undelivered: [string, Record<string, number>],
   ): { id: string; content: string; ttlSecs?: number }[] {
     const now = Date.now();
     const send: { id: string; content: string; ttlSecs?: number }[] = [];
@@ -1156,13 +1281,19 @@ export class Session implements SessionContext {
       else if (now - m.queuedAt < PENDING_MESSAGE_TTL_MS) send.push({ id: m.id, content: m.content, ttlSecs: m.ttlSecs });
       else expired++;
     }
-    if (expired > 0) console.warn(`dropped ${expired} expired pending messages`);
+    if (expired > 0) {
+      console.warn(`dropped ${expired} expired pending messages`);
+      this.emit(undelivered[0], { ...undelivered[1], expired });
+    }
     this.pendingMessages = remaining;
     return send;
   }
 
   private drainPendingDms(targetUserId: number): void {
-    for (const { id, content, ttlSecs } of this.takePending((t) => t.kind === "direct" && t.targetUserId === targetUserId)) {
+    for (const { id, content, ttlSecs } of this.takePending((t) => t.kind === "direct" && t.targetUserId === targetUserId, [
+      "dm-undelivered",
+      { user_id: targetUserId },
+    ])) {
       try {
         const { ciphertext, message_type } = this.signal.encrypt(
           targetUserId,
@@ -1176,7 +1307,10 @@ export class Session implements SessionContext {
   }
 
   private drainPendingChannelMessages(channelId: number): void {
-    const pending = this.takePending((t) => t.kind === "channel" && t.channelId === channelId);
+    const pending = this.takePending((t) => t.kind === "channel" && t.channelId === channelId, [
+      "channel-undelivered",
+      { channel_id: channelId },
+    ]);
     if (pending.length === 0) return;
     // Written before we had anybody to send them to, and somebody may have
     // left the channel in between — in which case our chain is stale and the
@@ -1365,6 +1499,15 @@ export class Session implements SessionContext {
     }
   }
 
+  /** A direct message for an account that is away (hex id): kept in the
+   *  stored log only, which is the one way it reaches them. Returns its id. */
+  sendKeptDm(accountHex: string, content: string, ttlSecs?: number): string {
+    if (!this.account) throw new Error("Not signed in to an account on that server");
+    const messageId = wasm().newMessageId();
+    this.account.keptDm(this, accountHex, wasm().envelope(messageId, content, ttlSecs), ttlSecs);
+    return messageId;
+  }
+
   /** Sender-key encrypted channel message; queued until a sender key was distributed. */
   sendChannelMessage(content: string, channelId = this.channelId, ttlSecs?: number): void {
     if (channelId === 0) throw new Error("Chat is not available in the lobby");
@@ -1374,6 +1517,10 @@ export class Session implements SessionContext {
     // The id travels inside the ciphertext, so our own echo and every
     // receiver's copy file the message under the same one.
     const messageId = wasm().newMessageId();
+    // A channel with a log keeps it for its members too (cloud copies on),
+    // whether or not anybody is here to read it now.
+    const log = this.channels.find((c) => c.channel_id === channelId)?.log;
+    if (log) this.account?.outgoingChannel(this, log, wasm().envelope(messageId, content, ttlSecs), ttlSecs);
     let ciphertext: Uint8Array | null = null;
     if (this.signal.anyoneHoldsOurKey(channelId)) {
       try {
@@ -1430,6 +1577,8 @@ export class Session implements SessionContext {
     // id it never had. `openEnvelope` reads plain text as text, so a peer that
     // sends the old shape still arrives.
     const messageId = wasm().newMessageId();
+    // Between two accounts, and with cloud copies on, it is kept for them too.
+    this.account?.outgoingDm(this, targetUserId, wasm().envelope(messageId, content, ttlSecs), ttlSecs);
     let encrypted: { ciphertext: Uint8Array; message_type: number } | null = null;
     if (this.establishedSessions.has(targetUserId)) {
       try {

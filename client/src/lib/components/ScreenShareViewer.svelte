@@ -116,14 +116,10 @@
       return;
     }
 
-    const name = sharerName;
-    const win = new WebviewWindow("screenshare-popout", {
-      url: `index.html?popout=screenshare&sharer_name=${encodeURIComponent(name)}`,
-      title: `${name}'s Screen - VoIPC`,
-      width: 800,
-      height: 600,
-      center: true,
-    });
+    // The backend makes the window: the page may not create windows itself
+    await invoke("open_share_popout", { sharerName });
+    const win = await WebviewWindow.getByLabel("screenshare-popout");
+    if (!win) return;
 
     // Clean up store state and stop watching when the popout window is destroyed.
     win.once('tauri://destroyed', () => {
@@ -244,7 +240,7 @@
   }
 
   .audio-status.active {
-    color: #43b581;
+    color: var(--success);
     background: rgba(67, 181, 129, 0.1);
   }
 
@@ -294,7 +290,7 @@
   }
 
   .stat.dropped {
-    color: #faa61a;
+    color: var(--warning);
   }
 
   .popout-btn {

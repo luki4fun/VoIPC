@@ -167,7 +167,7 @@ pub fn pan_gains(g: Gains, pan: f32) -> Gains {
     if pan == 0.0 || !pan.is_finite() {
         return g;
     }
-    // The same constant-power law the world pan uses, at spatial.rs:263-268
+    // The same constant-power law the world pan uses (`gains`, below)
     let angle = (pan.clamp(-1.0, 1.0) + 1.0) * 0.5 * core::f32::consts::FRAC_PI_2;
     Gains {
         l: g.l * angle.cos() * core::f32::consts::SQRT_2,
@@ -349,11 +349,7 @@ pub fn test_source(mode: ProximityMode, t: f32) -> Source {
         0.0
     };
     Source {
-        pos: [
-            TEST_RADIUS * theta.sin(),
-            TEST_RADIUS * theta.cos(),
-            z,
-        ],
+        pos: [TEST_RADIUS * theta.sin(), TEST_RADIUS * theta.cos(), z],
         ..Source::default()
     }
 }
@@ -421,7 +417,11 @@ mod tests {
 
     #[test]
     fn centre_is_unity_on_both_channels() {
-        let g = gains(ProximityMode::TwoD, &Listener::default(), Some(&at(0.0, 0.0)));
+        let g = gains(
+            ProximityMode::TwoD,
+            &Listener::default(),
+            Some(&at(0.0, 0.0)),
+        );
         assert!(close(g.l, 1.0), "l = {}", g.l);
         assert!(close(g.r, 1.0), "r = {}", g.r);
         assert_eq!(g.lp_a, 1.0);
@@ -429,7 +429,11 @@ mod tests {
 
     #[test]
     fn five_metres_right_pans_right_and_attenuates() {
-        let g = gains(ProximityMode::TwoD, &Listener::default(), Some(&at(5.0, 0.0)));
+        let g = gains(
+            ProximityMode::TwoD,
+            &Listener::default(),
+            Some(&at(5.0, 0.0)),
+        );
         // inverse model at 5 m with ref 1.5: 1.5 / (1.5 + 3.5) = 0.3
         let power = (g.l * g.l + g.r * g.r).sqrt() / core::f32::consts::SQRT_2;
         assert!(close(power, 0.3), "power = {power}");
@@ -473,7 +477,11 @@ mod tests {
             last = power;
         }
         // Silent at and beyond the range, and already fading before it
-        let inside = gains(ProximityMode::TwoD, &lis, Some(&at(0.0, DEFAULT_RANGE - 1.0)));
+        let inside = gains(
+            ProximityMode::TwoD,
+            &lis,
+            Some(&at(0.0, DEFAULT_RANGE - 1.0)),
+        );
         assert!(inside.l > 0.0 && inside.l < 0.05);
         for d in [DEFAULT_RANGE, DEFAULT_RANGE + 10.0] {
             assert_eq!(gains(ProximityMode::TwoD, &lis, Some(&at(0.0, d))), SILENT);
@@ -486,7 +494,10 @@ mod tests {
         let far = gains(ProximityMode::TwoD, &lis, Some(&at(1.4, 0.0)));
         let near = gains(ProximityMode::TwoD, &lis, Some(&at(0.2, 0.0)));
         let spread = |g: Gains| (g.r - g.l).abs();
-        assert!(spread(near) < spread(far), "near source should be more centred");
+        assert!(
+            spread(near) < spread(far),
+            "near source should be more centred"
+        );
     }
 
     #[test]
@@ -513,12 +524,23 @@ mod tests {
                 ..Source::default()
             }),
         );
-        assert_eq!(g, Gains { l: 0.8, r: 0.8, lp_a: 1.0 });
+        assert_eq!(
+            g,
+            Gains {
+                l: 0.8,
+                r: 0.8,
+                lp_a: 1.0
+            }
+        );
     }
 
     #[test]
     fn an_ear_pan_is_applied_after_the_golden_table_and_keeps_its_power() {
-        let g = Gains { l: 0.8, r: 0.8, lp_a: 0.5 };
+        let g = Gains {
+            l: 0.8,
+            r: 0.8,
+            lp_a: 0.5,
+        };
         // Untouched at centre, and bit-exact: this is the case that must not
         // move the golden table, and `0.8 * SQRT_2 * cos(PI/4)` does not come
         // back as `0.8` in f32.
@@ -568,7 +590,10 @@ mod tests {
         let over = gains(
             ProximityMode::TwoD,
             &lis,
-            Some(&Source { muffle: 200, ..at(0.0, 0.0) }),
+            Some(&Source {
+                muffle: 200,
+                ..at(0.0, 0.0)
+            }),
         );
         assert_eq!(over, walled);
     }
@@ -582,7 +607,11 @@ mod tests {
         // rendered plainly rather than refused — that is what lets a mod written
         // against a later build keep working against this one.
         for name in ["none", "", "direct", "spatial", "Radio", "telepathy"] {
-            assert_eq!(effect_from_str(name), Effect::None, "{name} was not refused");
+            assert_eq!(
+                effect_from_str(name),
+                Effect::None,
+                "{name} was not refused"
+            );
         }
         // 0, 1 and 2 are pinned: they are stored in configs and in an atomic
         assert_eq!(Effect::from_u8(1), Effect::Phone);
@@ -593,7 +622,12 @@ mod tests {
         // Every chain round-trips through its byte and its id
         for (i, fx) in EFFECTS.into_iter().enumerate() {
             assert_eq!(Effect::from_u8(i as u8 + 1), fx);
-            assert_eq!(effect_from_str(fx.id()), fx, "{} did not round-trip", fx.id());
+            assert_eq!(
+                effect_from_str(fx.id()),
+                fx,
+                "{} did not round-trip",
+                fx.id()
+            );
         }
         assert_eq!(Effect::None.id(), "none");
     }
@@ -605,7 +639,10 @@ mod tests {
         let half = gains(
             ProximityMode::TwoD,
             &lis,
-            Some(&Source { volume: 0.5, ..at(3.0, 1.0) }),
+            Some(&Source {
+                volume: 0.5,
+                ..at(3.0, 1.0)
+            }),
         );
         assert!(close(half.l, unity.l * 0.5) && close(half.r, unity.r * 0.5));
     }
@@ -615,7 +652,10 @@ mod tests {
         let g = gains(
             ProximityMode::TwoD,
             &Listener::default(),
-            Some(&Source { range: 0.0, ..at(1.0, 0.0) }),
+            Some(&Source {
+                range: 0.0,
+                ..at(1.0, 0.0)
+            }),
         );
         assert_eq!(g, SILENT);
     }
@@ -644,7 +684,8 @@ mod tests {
                 }
                 // One mixer frame apart: no jump a listener could hear as a click
                 let q = test_source(mode, t + 0.02).pos;
-                let step_m = ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2)).sqrt();
+                let step_m =
+                    ((q[0] - p[0]).powi(2) + (q[1] - p[1]).powi(2) + (q[2] - p[2]).powi(2)).sqrt();
                 assert!(step_m < 0.1, "jump of {step_m} m at {t}");
                 // Both cycles close after TEST_HEIGHT_SECS
                 let r = test_source(mode, t + TEST_HEIGHT_SECS).pos;
@@ -655,7 +696,12 @@ mod tests {
 
     #[test]
     fn test_orbit_runs_front_right_behind_left() {
-        let quarters = [(0.0, 0.0, 3.0), (2.0, 3.0, 0.0), (4.0, 0.0, -3.0), (6.0, -3.0, 0.0)];
+        let quarters = [
+            (0.0, 0.0, 3.0),
+            (2.0, 3.0, 0.0),
+            (4.0, 0.0, -3.0),
+            (6.0, -3.0, 0.0),
+        ];
         for (t, x, y) in quarters {
             let p = test_source(ProximityMode::TwoD, t).pos;
             assert!(close(p[0], x) && close(p[1], y), "t = {t}: {p:?}");
@@ -667,7 +713,12 @@ mod tests {
 
     #[test]
     fn three_d_test_sweeps_height() {
-        for (t, z) in [(0.0, 0.0), (4.0, TEST_HEIGHT), (8.0, 0.0), (12.0, -TEST_HEIGHT)] {
+        for (t, z) in [
+            (0.0, 0.0),
+            (4.0, TEST_HEIGHT),
+            (8.0, 0.0),
+            (12.0, -TEST_HEIGHT),
+        ] {
             let p = test_source(ProximityMode::ThreeD, t).pos;
             assert!(close(p[2], z), "t = {t}: z = {}", p[2]);
         }
@@ -678,14 +729,21 @@ mod tests {
         for mode in [ProximityMode::TwoD, ProximityMode::ThreeD] {
             // In 3D the quarters are also 2.8 m up, i.e. 45° above the ear, so
             // the lateral share of the distance — and the pan with it — is smaller
-            let ratio = if mode == ProximityMode::ThreeD { 2.5 } else { 5.0 };
+            let ratio = if mode == ProximityMode::ThreeD {
+                2.5
+            } else {
+                5.0
+            };
             let right = test_gains(mode, 2.0);
             assert!(right.r > right.l * ratio, "{mode:?} at t=2: {right:?}");
             let left = test_gains(mode, 6.0);
             assert!(left.l > left.r * ratio, "{mode:?} at t=6: {left:?}");
             for t in [0.0, 4.0] {
                 let g = test_gains(mode, t);
-                assert!((g.l - g.r).abs() < 1e-3, "{mode:?} at t={t} not centred: {g:?}");
+                assert!(
+                    (g.l - g.r).abs() < 1e-3,
+                    "{mode:?} at t={t} not centred: {g:?}"
+                );
             }
             for step in 1..7 {
                 let t = 0.5 * step as f32;
@@ -702,13 +760,19 @@ mod tests {
         // 3 m with ref 1.5 → 0.5, and the pan law is constant-power
         for step in 0..=32 {
             let t = step as f32 * 0.25;
-            assert!(close(power(test_gains(ProximityMode::TwoD, t)), 0.5), "2d power at {t}");
+            assert!(
+                close(power(test_gains(ProximityMode::TwoD, t)), 0.5),
+                "2d power at {t}"
+            );
             let p3 = power(test_gains(ProximityMode::ThreeD, t));
             assert!(p3 <= 0.5 + 1e-3 && p3 > 0.25, "3d power {p3} at {t}");
         }
         // Quietest at the top and the bottom of the sweep: 5 m away
         for t in [4.0, 12.0] {
-            assert!(close(power(test_gains(ProximityMode::ThreeD, t)), 0.3), "3d power at {t}");
+            assert!(
+                close(power(test_gains(ProximityMode::ThreeD, t)), 0.3),
+                "3d power at {t}"
+            );
         }
         let mut last = f32::MAX;
         for step in 0..=8 {
@@ -762,7 +826,13 @@ mod tests {
         let mut out = vec![0.0f32; 1920];
         let mut st = SourceMixState::default();
         mix_source_stereo(&mut out, &pcm, &mut st, (g.l, g.r), g.lp_a);
-        let energy = |offset: usize| out.iter().skip(offset).step_by(2).map(|s| s * s).sum::<f32>();
+        let energy = |offset: usize| {
+            out.iter()
+                .skip(offset)
+                .step_by(2)
+                .map(|s| s * s)
+                .sum::<f32>()
+        };
         let (l, r) = (energy(0), energy(1));
         assert!(r > l * 25.0, "left {l}, right {r}");
     }

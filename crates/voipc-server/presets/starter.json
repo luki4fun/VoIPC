@@ -1,0 +1,40 @@
+{
+  "id": "starter",
+  "label": "Starter — a small all-round server",
+  "summary": "One chat everybody lands in, a couple of rooms to talk in, and somewhere to park.",
+  "notes": [
+    "Anyone can still open a room of their own with the + button; it goes away once it has been empty for a while."
+  ],
+  "channels": [
+    {
+      "name": "general",
+      "description": "Where everybody lands. Say hi.",
+      "text": true,
+      "auto_join": true
+    },
+    {
+      "name": "offtopic",
+      "description": "Anything else — open it from the sidebar if you want it.",
+      "text": true
+    },
+    {
+      "name": "Lounge",
+      "description": "Hang out and talk"
+    },
+    {
+      "name": "Gaming",
+      "description": "Playing something together"
+    },
+    {
+      "name": "Private",
+      "description": "A room with a password, for up to five",
+      "password": "<generate>",
+      "max_users": 5
+    },
+    {
+      "name": "AFK",
+      "description": "Away from keyboard",
+      "screen_share": false
+    }
+  ]
+}

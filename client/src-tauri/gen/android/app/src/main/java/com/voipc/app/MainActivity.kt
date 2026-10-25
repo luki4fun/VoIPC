@@ -7,11 +7,12 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.graphics.Color
+import android.media.AudioDeviceInfo
 import android.media.AudioManager
+import android.media.AudioPlaybackConfiguration
+import android.media.AudioRecordingConfiguration
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
@@ -35,6 +36,28 @@ class MainActivity : TauriActivity() {
     private var volumeKeyPttActive = false
     private var webViewRef: WebView? = null
     private var audioManager: AudioManager? = null
+    // The loudspeaker rather than the earpiece, the default for a VoIP app
+    private var speakerOn = true
+    // The channel the voice service is up for; null while not in a call
+    private var voiceChannel: String? = null
+
+    // Android 12+ drops MODE_IN_COMMUNICATION again while the app that set it
+    // has no call audio running — between talkers, with push-to-talk up. Set it
+    // again the moment ours starts, so the echo canceller has its mode.
+    private fun reassertCallMode() {
+        val am = audioManager ?: return
+        if (voiceChannel != null && am.mode != AudioManager.MODE_IN_COMMUNICATION) applyCallAudio()
+    }
+    private val playbackCallback = object : AudioManager.AudioPlaybackCallback() {
+        override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>) {
+            reassertCallMode()
+        }
+    }
+    private val recordingCallback = object : AudioManager.AudioRecordingCallback() {
+        override fun onRecordingConfigChanged(configs: MutableList<AudioRecordingConfiguration>) {
+            reassertCallMode()
+        }
+    }
 
     // JS interface exposed as window.__VoIPC in the WebView
     inner class VoIPCBridge {
@@ -73,10 +96,9 @@ class MainActivity : TauriActivity() {
 
         @JavascriptInterface
         fun setSpeakerphone(enabled: Boolean) {
-            this@MainActivity.audioManager?.let { am ->
-                @Suppress("DEPRECATION")
-                am.isSpeakerphoneOn = enabled
-                am.mode = if (enabled) AudioManager.MODE_NORMAL else AudioManager.MODE_IN_COMMUNICATION
+            this@MainActivity.runOnUiThread {
+                this@MainActivity.speakerOn = enabled
+                if (this@MainActivity.voiceChannel != null) this@MainActivity.applyCallAudio()
             }
         }
     }
@@ -116,23 +138,12 @@ class MainActivity : TauriActivity() {
         super.onCreate(savedInstanceState)
 
         audioManager = getSystemService(Context.AUDIO_SERVICE) as AudioManager
+        audioManager?.registerAudioPlaybackCallback(playbackCallback, null)
+        audioManager?.registerAudioRecordingCallback(recordingCallback, null)
 
-        // Enable speakerphone by default for VoIP use
-        audioManager?.let { am ->
-            @Suppress("DEPRECATION")
-            am.isSpeakerphoneOn = true
-            am.mode = AudioManager.MODE_NORMAL
-        }
-
-        // Request RECORD_AUDIO permission at startup (required for Oboe mic capture)
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
-            != PackageManager.PERMISSION_GRANTED) {
-            ActivityCompat.requestPermissions(
-                this,
-                arrayOf(Manifest.permission.RECORD_AUDIO),
-                REQUEST_RECORD_AUDIO
-            )
-        }
+        // The microphone is asked for on joining voice (startVoiceService),
+        // not at every cold start: a "don't ask again" answered here, before
+        // the page had loaded, reached no handler and was never shown (H4-18).
 
         // Request POST_NOTIFICATIONS permission (required on Android 13+ for foreground service notification)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
@@ -156,18 +167,53 @@ class MainActivity : TauriActivity() {
         // ContextCompat guards the old levels with a signature permission.
         ContextCompat.registerReceiver(this, actionReceiver, filter, ContextCompat.RECEIVER_NOT_EXPORTED)
 
-        // Add JS interface to WebView after Tauri creates it (delayed to ensure WebView exists)
-        Handler(Looper.getMainLooper()).postDelayed({
-            val wv = findWebView(window.decorView)
-            if (wv != null) {
-                webViewRef = wv
-                wv.addJavascriptInterface(VoIPCBridge(), "__VoIPC")
-                // Security hardening: disable unnecessary WebView features
-                wv.settings.setGeolocationEnabled(false)
-                wv.settings.mediaPlaybackRequiresUserGesture = true
-                wv.settings.javaScriptCanOpenWindowsAutomatically = false
+    }
+
+    // Called by wry as it creates the WebView, before the first page load: an
+    // interface added after a load only shows up on the next one. It was a
+    // 500 ms timer, which a slow cold start could beat, leaving the call with
+    // no foreground service and no speaker control (H4-15).
+    override fun onWebViewCreate(webView: WebView) {
+        webViewRef = webView
+        webView.addJavascriptInterface(VoIPCBridge(), "__VoIPC")
+        // Security hardening: disable unnecessary WebView features
+        webView.settings.setGeolocationEnabled(false)
+        webView.settings.mediaPlaybackRequiresUserGesture = true
+        webView.settings.javaScriptCanOpenWindowsAutomatically = false
+    }
+
+    /**
+     * The call's audio routing, for as long as the call lasts. The platform's
+     * echo cancellation only runs in MODE_IN_COMMUNICATION, so the loudspeaker
+     * is chosen as the communication device rather than by dropping to
+     * MODE_NORMAL, which played the speaker straight into the microphone (H3-01).
+     */
+    private fun applyCallAudio() {
+        val am = audioManager ?: return
+        am.mode = AudioManager.MODE_IN_COMMUNICATION
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (speakerOn) {
+                am.availableCommunicationDevices
+                    .firstOrNull { it.type == AudioDeviceInfo.TYPE_BUILTIN_SPEAKER }
+                    ?.let { am.setCommunicationDevice(it) }
+            } else {
+                am.clearCommunicationDevice()
             }
-        }, 500)
+        } else {
+            @Suppress("DEPRECATION")
+            am.isSpeakerphoneOn = speakerOn
+        }
+    }
+
+    private fun releaseCallAudio() {
+        val am = audioManager ?: return
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            am.clearCommunicationDevice()
+        } else {
+            @Suppress("DEPRECATION")
+            am.isSpeakerphoneOn = false
+        }
+        am.mode = AudioManager.MODE_NORMAL
     }
 
     override fun onRequestPermissionsResult(
@@ -181,6 +227,11 @@ class MainActivity : TauriActivity() {
             REQUEST_RECORD_AUDIO -> {
                 if (granted) {
                     android.util.Log.i("VoIPC", "RECORD_AUDIO permission granted")
+                    // Started before the answer, the service holds no
+                    // microphone type yet, and the capture the join opened
+                    // failed: restart both now.
+                    voiceChannel?.let { startVoiceService(it) }
+                    evaluateJs("window.__voipc_mic_granted && window.__voipc_mic_granted()")
                 } else {
                     android.util.Log.w("VoIPC", "RECORD_AUDIO permission denied — microphone will not work")
                     evaluateJs("window.__voipc_permission_denied && window.__voipc_permission_denied('RECORD_AUDIO')")
@@ -198,6 +249,8 @@ class MainActivity : TauriActivity() {
     }
 
     override fun onDestroy() {
+        audioManager?.unregisterAudioPlaybackCallback(playbackCallback)
+        audioManager?.unregisterAudioRecordingCallback(recordingCallback)
         unregisterReceiver(actionReceiver)
         super.onDestroy()
     }
@@ -241,16 +294,33 @@ class MainActivity : TauriActivity() {
         return null
     }
 
-    // Start the foreground voice service
+    // Start the foreground voice service, and ask for the microphone the
+    // first time a call needs it
     fun startVoiceService(channelName: String) {
-        val intent = Intent(this, VoiceService::class.java).apply {
-            putExtra(VoiceService.EXTRA_CHANNEL_NAME, channelName)
+        runOnUiThread {
+            voiceChannel = channelName
+            applyCallAudio()
+            val intent = Intent(this, VoiceService::class.java).apply {
+                putExtra(VoiceService.EXTRA_CHANNEL_NAME, channelName)
+            }
+            startForegroundService(intent)
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+                != PackageManager.PERMISSION_GRANTED) {
+                ActivityCompat.requestPermissions(
+                    this,
+                    arrayOf(Manifest.permission.RECORD_AUDIO),
+                    REQUEST_RECORD_AUDIO
+                )
+            }
         }
-        startForegroundService(intent)
     }
 
     // Stop the foreground voice service
     fun stopVoiceService() {
-        stopService(Intent(this, VoiceService::class.java))
+        runOnUiThread {
+            if (voiceChannel != null) releaseCallAudio()
+            voiceChannel = null
+            stopService(Intent(this, VoiceService::class.java))
+        }
     }
 }

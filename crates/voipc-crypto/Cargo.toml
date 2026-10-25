@@ -2,14 +2,20 @@
 name = "voipc-crypto"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
 
 [dependencies]
+# The account sign-in speaks the wire messages (account.rs)
+voipc-protocol = { workspace = true }
+
 # Signal Protocol — official Rust implementation (requires Rust >= 1.88)
-libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.67.2" }
+libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.105.4" }
 
 # Symmetric encryption for media (voice/video) and state persistence
 ring = "0.17"
-rand = "0.8"
+rand = "0.9"
 
 # Key derivation
 hkdf = "0.12"
@@ -20,6 +26,10 @@ sha2 = "0.10"
 serde = { workspace = true }
 serde_json = "1"
 postcard = { workspace = true }
+
+# The authenticator-app QR code, drawn here: an SVG the relay sent would be
+# markup a hostile relay wrote (account.rs `qr_svg`)
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }
 
 # Secret zeroization
 zeroize = { version = "1", features = ["derive", "serde"] }
@@ -36,3 +46,7 @@ tracing = { workspace = true }
 # wasm32 has no SystemTime::now(); read the JS clock instead (see time::now)
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 js-sys = "0.3"
+
+# fuzz/ builds this crate with --cfg fuzzing (src/fuzz.rs)
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

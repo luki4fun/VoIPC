@@ -1,0 +1,134 @@
+name: Release published
+
+# Runs when the owner publishes a draft that release.yml made. What may only
+# become public together with the release happens here: a draft's assets are
+# not public, so the tag run cannot do it.
+#
+# Publish through the web UI. A release published with GITHUB_TOKEN would not
+# start this workflow.
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-published-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  # ghcr.io/luki4fun/voipc-server:<version>, built from the released binary
+  # once it checks out against SHA256SUMS and its build attestation, so the
+  # image holds exactly the attested binary. A release candidate gets only its
+  # own tag; a final also moves <major>.<minor>, <major> and latest.
+  container:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with: { persist-credentials: false }
+
+      - name: The released server binary, verified
+        run: |
+          mkdir ctx
+          cd ctx
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+            -p voipc-server-linux-x86_64 -p SHA256SUMS
+          sha256sum -c SHA256SUMS --ignore-missing
+          gh attestation verify voipc-server-linux-x86_64 --repo "$GITHUB_REPOSITORY"
+          rm SHA256SUMS
+
+      - name: Image tags
+        id: tags
+        run: |
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/voipc-server"
+          v="${TAG#v}"
+          tags="$image:$v"
+          # From the tag, not the release's pre-release box: v1.0.0-rc.1 went
+          # out with the box unticked and moved :1.0.0-rc, :1.0 and :latest.
+          if [[ "$v" != *-rc.* ]]; then
+            minor="${v%.*}"
+            tags="$tags,$image:$minor,$image:${minor%.*},$image:latest"
+          fi
+          echo "image=$image" >> "$GITHUB_OUTPUT"
+          echo "tags=$tags" >> "$GITHUB_OUTPUT"
+          echo "$tags"
+
+      - uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ctx
+          file: Dockerfile.relay
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+
+      # `gh attestation verify oci://ghcr.io/luki4fun/voipc-server:<v> --repo
+      # luki4fun/voipc` (SECURITY.md)
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ steps.tags.outputs.image }}
+          subject-digest: ${{ steps.build.outputs.digest }}
+          push-to-registry: true
+
+  # The release-candidate updater feed: releases/download/updater-rc/latest.json,
+  # which client/src-tauri/src/updater.rs reads when its own version has an
+  # -rc suffix. It offers the newer of the newest rc and the newest final, so
+  # rc testers move on to the final. The stable feed needs nothing here:
+  # releases/latest/download/latest.json follows "latest", which an rc never is.
+  rc-feed:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.event.release.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Point the rc feed at this release if it is newer
+        run: |
+          repo="$GITHUB_REPOSITORY"
+          # Every release this pipeline makes has one: a miss is a broken
+          # release or a failed download, so it warns (the feed stays as it is).
+          if ! gh release download "$TAG" --repo "$repo" -p latest.json; then
+            echo "::warning::$TAG has no latest.json (or it did not download); the rc feed stays as it is"
+            exit 0
+          fi
+          new=$(jq -r .version latest.json)
+          # Version sort puts 1.0.0~rc.1 before 1.0.0, as SemVer orders
+          # 1.0.0-rc.1, and rc.10 after rc.9.
+          newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n' "${1/-rc./~rc.}" "${2/-rc./~rc.}" | sort -V | tail -1)" = "${1/-rc./~rc.}" ]; }
+          if gh release view updater-rc --repo "$repo" > /dev/null 2>&1; then
+            cur=$(gh release download updater-rc --repo "$repo" -p latest.json -O - | jq -r .version) || cur=0.0.0
+            # A feed that is not a version (null from a hand-edited file) must
+            # not hold the feed for good: anything is newer than it.
+            [[ $cur =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || cur=0.0.0
+            if ! newer "$new" "$cur"; then
+              echo "rc feed keeps $cur ($new is not newer)"
+              exit 0
+            fi
+            gh release upload updater-rc latest.json --repo "$repo" --clobber
+          else
+            gh release create updater-rc latest.json --repo "$repo" --prerelease \
+              --title "Updater feed for release candidates" \
+              --notes "Holds only latest.json, the update feed of VoIPC release candidates. Nothing to download here."
+          fi
+          echo "rc feed now offers $new"

@@ -44,6 +44,16 @@ test("two different messages that read alike both survive when they have ids", (
   assert.equal(added, 1);
 });
 
+test("between accounts the account is the author, not this connection's user id", () => {
+  // Read live as user 7, then again from the stored log after a reconnect,
+  // where the same person is user 12: one message.
+  const live = [msg({ timestamp: T, id: "a", user_id: 7, account: "aa" })];
+  const stored = [msg({ timestamp: T, id: "a", user_id: 12, account: "aa" })];
+  assert.equal(mergeHistory(live, stored, "").added, 0);
+  // Somebody else's account using that id is somebody else's message.
+  assert.equal(mergeHistory(live, [msg({ timestamp: T, id: "a", user_id: 7, account: "bb" })], "").added, 1);
+});
+
 test("without ids the old heuristic still catches a duplicate", () => {
   // Anything stored before this release has no id, and the first share after
   // upgrading must not double the whole conversation.
@@ -137,6 +147,12 @@ test("a peer cannot put anything it likes into our archive", () => {
   assert.equal(cleaned[0].kind, "shared", 'a claim of "text" is still second-hand');
   assert.equal(cleaned[1].kind, "shared", "and so is a claim of anything else");
   assert.equal(cleaned[1].id?.length, 64);
+});
+
+test("history that is not a list offers nothing instead of throwing", () => {
+  for (const offered of [{}, null, "x", 3, { length: 2 }]) {
+    assert.deepEqual(sanitizeHistory(offered), []);
+  }
 });
 
 test("shared history is marked second-hand and stays second-hand", () => {

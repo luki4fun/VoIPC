@@ -1,0 +1,116 @@
+{
+  "id": "community",
+  "label": "Community — creators, streamers, a game in the making",
+  "summary": "Announcements only moderators post in, feedback and bug reports, a stage for events, playtests, and a locked 18+ area.",
+  "settings": {
+    "max_channels": 10
+  },
+  "notes": [
+    "A big community needs room: raise max_users in server.toml (64 by default).",
+    "Posting in an announcement channel takes an admin (the admin token) or, on a server with accounts, a moderator.",
+    "The 18+ channels ask every member to confirm their age before opening them, but a click proves nothing: their password, handed out by moderators after an age check, is the real gate.",
+    "max_channels is 10 here, so rooms members open with + cannot flood the list."
+  ],
+  "channels": [
+    {
+      "name": "welcome",
+      "description": "Rules, and how this community works. Only moderators post here.",
+      "text": true,
+      "auto_join": true,
+      "announce": true
+    },
+    {
+      "name": "announcements",
+      "description": "News, releases and streams. Only moderators post here.",
+      "text": true,
+      "auto_join": true,
+      "announce": true
+    },
+    {
+      "name": "general",
+      "description": "Talk with the community — one post every 5 seconds",
+      "text": true,
+      "auto_join": true,
+      "slow_mode_secs": 5
+    },
+    {
+      "name": "feedback",
+      "description": "Ideas and wishes; one post a minute",
+      "text": true,
+      "slow_mode_secs": 60
+    },
+    {
+      "name": "bug-reports",
+      "description": "Found a bug? What happened, what you expected, and how to make it happen again",
+      "text": true,
+      "slow_mode_secs": 60
+    },
+    {
+      "name": "media",
+      "description": "Clips, fan art and screenshots",
+      "text": true,
+      "slow_mode_secs": 30
+    },
+    {
+      "name": "off-topic",
+      "description": "Anything else; posts go after a week",
+      "text": true,
+      "message_ttl_secs": 604800,
+      "slow_mode_secs": 5
+    },
+    {
+      "name": "nsfw",
+      "description": "18+ only. Moderators give out the password after an age check; posts go after a week.",
+      "text": true,
+      "nsfw": true,
+      "password": "<generate>",
+      "message_ttl_secs": 604800,
+      "slow_mode_secs": 10
+    },
+    {
+      "name": "mods",
+      "description": "Moderators only",
+      "text": true,
+      "hidden": true,
+      "password": "<generate>"
+    },
+    {
+      "name": "Stage",
+      "description": "Events, Q&As and streams with the community — listeners, please stay muted unless asked to speak"
+    },
+    {
+      "name": "Watch Party",
+      "description": "Watching streams, trailers or videos together"
+    },
+    {
+      "name": "Lounge 1",
+      "description": "Hang out with the community"
+    },
+    {
+      "name": "Lounge 2",
+      "description": "Hang out with the community"
+    },
+    {
+      "name": "Playtest",
+      "description": "Playtests and demos — share your screen to show what you see"
+    },
+    {
+      "name": "After Dark",
+      "description": "18+ voice. Moderators give out the password after an age check; no screen sharing",
+      "nsfw": true,
+      "password": "<generate>",
+      "screen_share": false
+    },
+    {
+      "name": "Mod Room",
+      "description": "Moderators only",
+      "hidden": true,
+      "password": "<generate>"
+    },
+    {
+      "name": "AFK",
+      "description": "Away from keyboard",
+      "screen_share": false
+    }
+  ]
+}

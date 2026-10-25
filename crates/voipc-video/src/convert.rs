@@ -3,15 +3,15 @@
 // f32 multiplies/divides on every pixel.
 
 use anyhow::{bail, Context as _, Result};
-use ffmpeg_next as ffmpeg;
 pub use ffmpeg::format::Pixel;
 use ffmpeg::software::scaling;
 use ffmpeg::util::frame::video::Video;
+use ffmpeg_next as ffmpeg;
 
 /// Clamp an i32 to u8 range.
 #[inline(always)]
 fn clamp_u8(v: i32) -> u8 {
-    v.max(0).min(255) as u8
+    v.clamp(0, 255) as u8
 }
 
 // ── SIMD-accelerated conversion via FFmpeg SwsContext ─────────────────────
@@ -49,6 +49,17 @@ impl FrameConverter {
         dst_height: u32,
         output_format: Pixel,
     ) -> Result<Self> {
+        // Bicubic where the share is scaled down: a 1440p or 4K screen shared
+        // at 1080p, or 1080p at 720p, keeps its text 12 dB sharper for under a
+        // millisecond more (H3-12). Not at the same size, where it only
+        // sharpens the chroma, which a low rung then pays for in luma; and not
+        // for the sharer's own preview, which stays cheap.
+        let scales = (src_width, src_height) != (dst_width, dst_height);
+        let flags = if scales && output_format != Pixel::RGB24 {
+            scaling::Flags::BICUBIC
+        } else {
+            scaling::Flags::FAST_BILINEAR
+        };
         let scaler = scaling::Context::get(
             input_format,
             src_width,
@@ -56,7 +67,7 @@ impl FrameConverter {
             output_format,
             dst_width,
             dst_height,
-            scaling::Flags::FAST_BILINEAR,
+            flags,
         )
         .context("failed to create SwsContext for color conversion")?;
 
@@ -129,6 +140,9 @@ impl FrameConverter {
         if stride == row_bytes {
             return self.convert(pixel_data);
         }
+        if stride < row_bytes {
+            bail!("FrameConverter: stride {stride} is shorter than a row ({row_bytes})");
+        }
 
         let expected = stride * h;
         if pixel_data.len() < expected {
@@ -162,8 +176,8 @@ impl FrameConverter {
 /// Uses integer BT.601: Y = (66*R + 129*G + 25*B + 128)>>8 + 16
 pub fn bgra_to_i420(bgra: &[u8], width: usize, height: usize, i420: &mut Vec<u8>) {
     let y_size = width * height;
-    let uv_width = (width + 1) / 2;
-    let uv_height = (height + 1) / 2;
+    let uv_width = width.div_ceil(2);
+    let uv_height = height.div_ceil(2);
     let total = y_size + 2 * uv_width * uv_height;
 
     i420.clear();
@@ -194,10 +208,14 @@ pub fn bgra_to_i420(bgra: &[u8], width: usize, height: usize, i420: &mut Vec<u8>
 
             for dy in 0..2u32 {
                 let py = row + dy as usize;
-                if py >= height { break; }
+                if py >= height {
+                    break;
+                }
                 for dx in 0..2u32 {
                     let px = col + dx as usize;
-                    if px >= width { break; }
+                    if px >= width {
+                        break;
+                    }
                     let idx = (py * width + px) * 4;
                     b_sum += bgra[idx] as i32;
                     g_sum += bgra[idx + 1] as i32;
@@ -221,8 +239,8 @@ pub fn bgra_to_i420(bgra: &[u8], width: usize, height: usize, i420: &mut Vec<u8>
 /// Uses integer BT.601: Y = (66*R + 129*G + 25*B + 128)>>8 + 16
 pub fn rgba_to_i420(rgba: &[u8], width: usize, height: usize, i420: &mut Vec<u8>) {
     let y_size = width * height;
-    let uv_width = (width + 1) / 2;
-    let uv_height = (height + 1) / 2;
+    let uv_width = width.div_ceil(2);
+    let uv_height = height.div_ceil(2);
     let total = y_size + 2 * uv_width * uv_height;
 
     i420.clear();
@@ -253,10 +271,14 @@ pub fn rgba_to_i420(rgba: &[u8], width: usize, height: usize, i420: &mut Vec<u8>
 
             for dy in 0..2u32 {
                 let py = row + dy as usize;
-                if py >= height { break; }
+                if py >= height {
+                    break;
+                }
                 for dx in 0..2u32 {
                     let px = col + dx as usize;
-                    if px >= width { break; }
+                    if px >= width {
+                        break;
+                    }
                     let idx = (py * width + px) * 4;
                     r_sum += rgba[idx] as i32;
                     g_sum += rgba[idx + 1] as i32;
@@ -288,12 +310,12 @@ pub fn scale_i420_nearest(
     dst_h: usize,
 ) {
     let src_y_size = src_w * src_h;
-    let src_uv_w = (src_w + 1) / 2;
-    let src_uv_h = (src_h + 1) / 2;
+    let src_uv_w = src_w.div_ceil(2);
+    let src_uv_h = src_h.div_ceil(2);
 
     let dst_y_size = dst_w * dst_h;
-    let dst_uv_w = (dst_w + 1) / 2;
-    let dst_uv_h = (dst_h + 1) / 2;
+    let dst_uv_w = dst_w.div_ceil(2);
+    let dst_uv_h = dst_h.div_ceil(2);
     let dst_total = dst_y_size + 2 * dst_uv_w * dst_uv_h;
 
     dst.clear();
@@ -336,15 +358,16 @@ pub fn scale_i420_nearest(
 ///   R = clip((298*C + 409*E + 128) >> 8)
 ///   G = clip((298*C - 100*D - 208*E + 128) >> 8)
 ///   B = clip((298*C + 516*D + 128) >> 8)
+#[cfg(test)] // no caller in the desktop build; lib.rs has the Android copy
 pub fn i420_to_rgb_into(i420: &[u8], width: usize, height: usize, rgb: &mut Vec<u8>) {
     let rgb_size = width * height * 3;
     rgb.clear();
     rgb.resize(rgb_size, 0);
 
     let y_plane = &i420[..width * height];
-    let uv_width = (width + 1) / 2;
+    let uv_width = width.div_ceil(2);
     let u_offset = width * height;
-    let v_offset = u_offset + uv_width * ((height + 1) / 2);
+    let v_offset = u_offset + uv_width * height.div_ceil(2);
 
     for row in 0..height {
         let row_off = row * width;
@@ -363,6 +386,7 @@ pub fn i420_to_rgb_into(i420: &[u8], width: usize, height: usize, rgb: &mut Vec<
 }
 
 /// Convert I420 (YUV420 planar) to RGBA pixels.
+#[cfg(test)] // no caller in the desktop build; lib.rs has the Android copy
 pub fn i420_to_rgba(i420: &[u8], width: usize, height: usize) -> Vec<u8> {
     let mut rgba = vec![0u8; width * height * 4];
     i420_to_rgba_into(i420, width, height, &mut rgba);
@@ -370,11 +394,12 @@ pub fn i420_to_rgba(i420: &[u8], width: usize, height: usize) -> Vec<u8> {
 }
 
 /// Convert I420 (YUV420 planar) to RGBA pixels, writing into an existing buffer.
+#[cfg(test)] // no caller in the desktop build; lib.rs has the Android copy
 pub fn i420_to_rgba_into(i420: &[u8], width: usize, height: usize, rgba: &mut [u8]) {
     let y_plane = &i420[..width * height];
-    let uv_width = (width + 1) / 2;
+    let uv_width = width.div_ceil(2);
     let u_offset = width * height;
-    let v_offset = u_offset + uv_width * ((height + 1) / 2);
+    let v_offset = u_offset + uv_width * height.div_ceil(2);
 
     for row in 0..height {
         let row_off = row * width;
@@ -461,8 +486,8 @@ mod tests {
         let bgra = vec![128u8; 3 * 3 * 4];
         let mut i420 = Vec::new();
         bgra_to_i420(&bgra, 3, 3, &mut i420);
-        let uv_w = (3 + 1) / 2; // 2
-        let uv_h = (3 + 1) / 2; // 2
+        let uv_w = 3_usize.div_ceil(2); // 2
+        let uv_h = 3_usize.div_ceil(2); // 2
         assert_eq!(i420.len(), 3 * 3 + 2 * uv_w * uv_h); // 9 + 8 = 17
     }
 
@@ -565,8 +590,8 @@ mod tests {
 
         // All Y values should be the same as source
         let y_val = src[0];
-        for i in 0..16 {
-            assert_eq!(dst[i], y_val, "Y[{}] mismatch", i);
+        for (i, y) in dst[..16].iter().enumerate() {
+            assert_eq!(*y, y_val, "Y[{}] mismatch", i);
         }
     }
 
@@ -575,8 +600,8 @@ mod tests {
         // QSV encoders open with NV12 — the converter must honor it. RGB24 is
         // the sharer's preview, handed to turbojpeg as one packed plane.
         for fmt in [Pixel::YUV420P, Pixel::NV12, Pixel::RGB24] {
-            let mut c = FrameConverter::new(Pixel::BGRA, 64, 64, 64, 64, fmt)
-                .expect("converter init");
+            let mut c =
+                FrameConverter::new(Pixel::BGRA, 64, 64, 64, 64, fmt).expect("converter init");
             let bgra = vec![128u8; 64 * 64 * 4];
             let frame = c.convert(&bgra).expect("convert");
             assert_eq!(frame.format(), fmt);
@@ -586,7 +611,9 @@ mod tests {
         let mut c = FrameConverter::new(Pixel::BGRA, 100, 60, 64, 36, Pixel::RGB24)
             .expect("converter init");
         let stride = 100 * 4 + 32;
-        let frame = c.convert_strided(&vec![200u8; stride * 60], stride).expect("convert");
+        let frame = c
+            .convert_strided(&vec![200u8; stride * 60], stride)
+            .expect("convert");
         assert!(frame.stride(0) >= 64 * 3);
         assert!(frame.data(0).len() >= frame.stride(0) * 35 + 64 * 3);
     }

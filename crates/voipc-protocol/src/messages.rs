@@ -1,3 +1,9 @@
+//! A note on `#[serde(default)]` in the wire types: it only helps JSON
+//! callers (the browser builds messages as JS objects and may leave a field
+//! out). On the wire, postcard is positional, so it never lets an older and a
+//! newer layout read each other: every layout change is a protocol bump, which
+//! `tests/golden.rs` enforces.
+
 use serde::{Deserialize, Serialize};
 
 use crate::types::*;
@@ -19,6 +25,11 @@ pub enum ClientMessage {
         /// Initial pre-key bundle for other users to establish sessions.
         #[serde(default)]
         prekey_bundle: Option<PreKeyBundleData>,
+        /// Sign in to a relay account (protocol v11); `None` is a guest. An
+        /// account's keys come later, in `AuthContinue::Keys`: a new device
+        /// only has its identity once it has opened the vault.
+        #[serde(default)]
+        account: Option<AccountStart>,
     },
 
     /// Request to join a specific channel (with optional password).
@@ -89,22 +100,7 @@ pub enum ClientMessage {
     /// ChannelUpdated or ChannelError.
     SetChannelOptions {
         channel_id: ChannelId,
-        #[serde(default)]
-        hidden: Option<bool>,
-        #[serde(default)]
-        anonymous: Option<bool>,
-        #[serde(default)]
-        screen_share: Option<bool>,
-        #[serde(default)]
-        hide_members: Option<bool>,
-        /// Have the relay forward voice only to whoever should hear it
-        /// (protocol v8). See `ChannelInfo::routed`.
-        #[serde(default)]
-        routed: Option<bool>,
-        /// Seconds a message written here is meant to live; 0 turns the timer
-        /// off (protocol v9). See `ChannelInfo::message_ttl_secs`.
-        #[serde(default)]
-        message_ttl_secs: Option<u32>,
+        options: ChannelOptions,
     },
 
     /// Kick a user from a channel (creator only).
@@ -122,14 +118,10 @@ pub enum ClientMessage {
     /// channel a game has spread over a map. It is **not** a security
     /// boundary — a patched client simply asks for everyone. The enforcing
     /// half is the game server's own `POST /game/v1/routes`.
-    SetAudioFilter {
-        allow: Option<Vec<UserId>>,
-    },
+    SetAudioFilter { allow: Option<Vec<UserId>> },
 
     /// Request the user list of a channel without joining it (preview).
-    RequestChannelUsers {
-        channel_id: ChannelId,
-    },
+    RequestChannelUsers { channel_id: ChannelId },
 
     /// Invite a user to your channel (creator only).
     SendInvite {
@@ -138,14 +130,10 @@ pub enum ClientMessage {
     },
 
     /// Accept a pending channel invite.
-    AcceptInvite {
-        channel_id: ChannelId,
-    },
+    AcceptInvite { channel_id: ChannelId },
 
     /// Decline a pending channel invite.
-    DeclineInvite {
-        channel_id: ChannelId,
-    },
+    DeclineInvite { channel_id: ChannelId },
 
     /// Start sharing screen. Server notifies channel but sharer waits for viewers.
     StartScreenShare {
@@ -172,7 +160,6 @@ pub enum ClientMessage {
     RequestKeyframe { sharer_user_id: UserId },
 
     // ── E2E Encryption messages ───────────────────────────────────────
-
     /// Request another user's pre-key bundle for session establishment.
     RequestPreKeyBundle { target_user_id: UserId },
 
@@ -229,29 +216,37 @@ pub enum ClientMessage {
     },
 
     // ── Moderation (admin token session) ─────────────────────────────
-
     /// Turn this session into a server admin with the server's admin token.
     AdminLogin { token: String },
 
     /// Disconnect a user from the server (admin only).
     AdminKick { user_id: UserId, reason: String },
 
-    /// Disconnect a user and ban their IP (admin only).
-    /// `duration_secs` 0 = until the server restarts.
+    /// Disconnect a user and ban their address; with `account`, their account
+    /// too, where they signed in with one (admin or moderator; a moderator
+    /// bans people without a role only). `duration_secs` 0 = permanent.
     AdminBan {
         user_id: UserId,
         reason: String,
         duration_secs: u32,
+        account: bool,
     },
 
-    /// Lift an IP ban (admin only).
-    AdminUnban { ip: String },
+    /// Lift a ban, by its `BanInfo.id` (admin only).
+    AdminUnban { id: u64 },
 
     /// Request the list of active bans (admin only).
     AdminListBans,
 
-    // ── Channel history hand-off (E2E) ───────────────────────────────
+    /// Ban an account by name, online or not (admin only). `duration_secs` 0
+    /// = permanent.
+    AdminBanAccount {
+        name: String,
+        reason: String,
+        duration_secs: u32,
+    },
 
+    // ── Channel history hand-off (E2E) ───────────────────────────────
     /// Ask a channel member to share recent channel chat with us.
     RequestChannelHistory {
         channel_id: ChannelId,
@@ -269,7 +264,6 @@ pub enum ClientMessage {
     },
 
     // ── Screen share congestion control ──────────────────────────────
-
     /// A viewer saw frame loss in the last reporting window (~2 s). Relayed
     /// to the sharer, which lowers bitrate/fps instead of storming keyframes.
     VideoLossReport {
@@ -277,6 +271,329 @@ pub enum ClientMessage {
         frames_dropped: u32,
         frames_received: u32,
     },
+
+    // ── Accounts (protocol v11) ──────────────────────────────────────
+    /// The client's next step of an account sign-in, answering an `AuthStep`.
+    AuthContinue(AuthContinue),
+
+    /// Managing the signed-in account: device keys, codes, the vault.
+    Account(AccountRequest),
+}
+
+/// The client's side of an account sign-in, between `Authenticate` and
+/// `Authenticated`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AuthContinue {
+    /// The secret derived from the password (32 bytes), never the password.
+    Secret {
+        auth_secret: Vec<u8>,
+    },
+    /// A new account: the secret, the solved proof of work (empty where an
+    /// invite stands in for it), and the vault the client just made.
+    Register {
+        auth_secret: Vec<u8>,
+        altcha: String,
+        ts: String,
+        vault: Vec<VaultBlob>,
+    },
+    /// The device key's signature over the challenge.
+    DeviceSig {
+        signature: Vec<u8>,
+    },
+    Totp {
+        code: String,
+    },
+    Recovery {
+        code: String,
+    },
+    /// The account's identity and this connection's pre-keys. A different
+    /// identity than the one on record is refused unless `reset_identity`:
+    /// then everyone who knew the old one is told it changed.
+    Keys {
+        identity_key: Vec<u8>,
+        prekey_bundle: PreKeyBundleData,
+        reset_identity: bool,
+    },
+    /// The answer to `ResetChallenge`: the identity's signature over the
+    /// challenge (`voipc-reset/v1|<relay>|<name>|<challenge>`), the new
+    /// password's secret and its `slot.pass` (the same vault key under the new
+    /// password), and the second factor when the account has one.
+    Reset {
+        signature: Vec<u8>,
+        auth_secret: Vec<u8>,
+        pass_slot: Vec<u8>,
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    },
+}
+
+/// Account management after sign-in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AccountRequest {
+    /// A challenge for remembering this device (needs a recent sign-in).
+    DeviceChallenge,
+    /// `public_key` is Ed25519; the signature is over the challenge.
+    DeviceAdd {
+        device_id: Vec<u8>,
+        public_key: Vec<u8>,
+        signature: Vec<u8>,
+    },
+    TotpSetup,
+    TotpEnable {
+        sealed: String,
+        code: String,
+    },
+    /// Write one vault item; `expect` is the version it replaces, 0 for new.
+    VaultPut {
+        k: String,
+        v: Vec<u8>,
+        expect: i64,
+    },
+
+    // ── The stored-message log (voipc_crypto::log) ──
+    /// This account's log key (33 bytes) and its identity's signature over it.
+    LogKeyPublish {
+        logkey: Vec<u8>,
+        sig: Vec<u8>,
+    },
+    /// Other accounts' identity and log keys (at most 64 at a time).
+    LogKeys {
+        accounts: Vec<[u8; 16]>,
+    },
+    /// One of our epoch keys for `conv`, wrapped to each member (and to us).
+    EpochPut {
+        conv: String,
+        epoch: u32,
+        wraps: Vec<WrapIn>,
+    },
+    /// Every wrap for us in `conv`.
+    WrapsFetch {
+        conv: String,
+    },
+    /// A sealed entry for `conv` under our epoch `epoch`. `ttl_secs` is the
+    /// message's own timer, for when the relay may drop it.
+    LogAppend {
+        conv: String,
+        epoch: u32,
+        ct: Vec<u8>,
+        ttl_secs: Option<u32>,
+    },
+    /// Entries of `conv` after sequence number `after`, a page at a time.
+    LogFetch {
+        conv: String,
+        after: i64,
+    },
+    /// The conversations with entries for us, and their newest entry.
+    LogIndex,
+    /// Become a stored member of a channel's log (`ChannelInfo::log`): the
+    /// accounts its writers wrap their keys to. Only while in the channel.
+    LogJoin {
+        conv: String,
+    },
+    /// Stop being one.
+    LogLeave {
+        conv: String,
+    },
+    /// The stored members of `conv` (we must be one), with their keys.
+    LogMembers {
+        conv: String,
+    },
+
+    // ── The account (1.0) ──
+    /// A new password: the old one's secret (the relay checks it), the new
+    /// one's, its `slot.pass` (the same vault key), and the second factor when
+    /// the account has one. Every other session and remembered device ends.
+    PasswordChange {
+        old_secret: Vec<u8>,
+        new_secret: Vec<u8>,
+        pass_slot: Vec<u8>,
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    },
+    /// Delete what this account wrote to the stored logs, in `conv` or (None)
+    /// everywhere, and the keys it handed out for it. What others wrote stays.
+    LogPurge {
+        conv: Option<String>,
+    },
+    /// Delete this account: the password's secret, and the second factor when
+    /// it has one. `AccountDeleted` answers, then the relay closes the
+    /// connection.
+    DeleteAccount {
+        secret: Vec<u8>,
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    },
+}
+
+/// The relay's side of an account sign-in.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AuthStep {
+    /// Derive the secret with this relay id (and solve `pow` to register).
+    Salt {
+        relay_id: [u8; 16],
+        pow: Option<PowChallenge>,
+    },
+    /// Sign this with the device key.
+    DeviceChallenge {
+        relay_id: [u8; 16],
+        challenge: String,
+    },
+    /// A code from the authenticator app, or a recovery code.
+    NeedTotp,
+    /// The account's vault, to open on this device; then send `Keys`.
+    Vault { blobs: Vec<VaultBlob> },
+    /// This relay takes no guests. Sent before the connection closes.
+    AccountRequired { registration: Registration },
+    /// A reset (`AccountStart::Reset`): sign this with the identity key. The
+    /// vault's recovery slot and identity item come with it, never the
+    /// password slot (which would let anyone guess the password offline).
+    /// `second_factor`: send a code or a recovery code with the answer.
+    ResetChallenge {
+        relay_id: [u8; 16],
+        challenge: Vec<u8>,
+        blobs: Vec<VaultBlob>,
+        second_factor: bool,
+    },
+    /// The password is reset; sign in with the new one. Every other device
+    /// and session of the account was signed out.
+    ResetDone,
+}
+
+/// Answers to `AccountRequest`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AccountReply {
+    DeviceChallenge {
+        challenge: String,
+    },
+    DeviceAdded,
+    TotpSetup {
+        secret: String,
+        uri: String,
+        sealed: String,
+    },
+    /// Codes are on; the recovery codes are shown once.
+    TotpEnabled {
+        recovery_codes: Vec<String>,
+    },
+    VaultStored {
+        k: String,
+        version: i64,
+    },
+    /// Someone wrote item `k` since `expect`: here it is now (`None`: gone).
+    VaultConflict {
+        k: String,
+        blob: Option<VaultBlob>,
+    },
+    /// The account changed (scopes, codes on).
+    Info(AccountInfo),
+    /// `request` names what was refused.
+    Error {
+        request: String,
+        reason: String,
+    },
+    LogKeyStored,
+    /// Accounts without a published log key are left out.
+    LogKeysFound {
+        keys: Vec<LogKeyInfo>,
+    },
+    EpochStored {
+        conv: String,
+        epoch: u32,
+    },
+    Wraps {
+        conv: String,
+        wraps: Vec<WrapOut>,
+    },
+    LogAppended {
+        conv: String,
+        seq: i64,
+        server_at: u64,
+    },
+    /// `more`: there is another page after the last of these. `owed`: the
+    /// writers here who have not yet answered our joining (their entries
+    /// we cannot open yet may still become readable).
+    LogPage {
+        conv: String,
+        entries: Vec<LogEntry>,
+        more: bool,
+        owed: Vec<[u8; 16]>,
+    },
+    LogConvs {
+        convs: Vec<(String, i64)>,
+    },
+    LogJoined {
+        conv: String,
+    },
+    LogLeft {
+        conv: String,
+    },
+    LogMembersFound {
+        conv: String,
+        members: Vec<LogKeyInfo>,
+    },
+    /// Not appended: our epoch for `conv` is not wrapped to exactly its
+    /// members any more (somebody joined or left). Mint another and resend.
+    LogRekey {
+        conv: String,
+    },
+    /// Accounts that joined `conv` since we last wrapped our keys there. They
+    /// wait for our answer: our older keys too, if we share with joiners.
+    LogPending {
+        conv: String,
+        joiners: Vec<[u8; 16]>,
+    },
+    /// Somebody wrapped a key to us in `conv`.
+    LogNews {
+        conv: String,
+    },
+    /// The password changed (`PasswordChange`). This device's key was
+    /// forgotten with every other: remember it again if it was remembered.
+    PasswordChanged,
+    /// `LogPurge` done: `entries` of ours deleted.
+    LogPurged {
+        conv: Option<String>,
+        entries: u64,
+    },
+    /// The account is gone; the connection closes.
+    AccountDeleted,
+}
+
+/// A wrapped epoch key for one member (`AccountRequest::EpochPut`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WrapIn {
+    pub recipient: [u8; 16],
+    pub wrapped: Vec<u8>,
+}
+
+/// A wrapped epoch key for us, from `owner`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WrapOut {
+    pub owner: [u8; 16],
+    pub epoch: u32,
+    pub wrapped: Vec<u8>,
+}
+
+/// An account's keys as the relay has them; the client checks the
+/// signature against the identity it pinned before using `logkey`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogKeyInfo {
+    pub account: [u8; 16],
+    /// The account's name, for filing what it wrote.
+    pub name: String,
+    pub identity: Vec<u8>,
+    pub logkey: Vec<u8>,
+    pub sig: Vec<u8>,
+}
+
+/// One stored message, still sealed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LogEntry {
+    pub seq: i64,
+    pub sender: [u8; 16],
+    pub epoch: u32,
+    /// When the relay filed it (Unix ms).
+    pub server_at: u64,
+    pub ct: Vec<u8>,
 }
 
 /// Messages sent from server to client over the control stream.
@@ -287,6 +604,12 @@ pub enum ServerMessage {
     Authenticated {
         user_id: UserId,
         session_id: SessionId,
+        /// The relay has accounts (protocol v11); `None` when it has none.
+        #[serde(default)]
+        accounts: Option<RelayAccounts>,
+        /// The account this connection signed in with.
+        #[serde(default)]
+        account: Option<AccountInfo>,
     },
 
     /// Authentication failed.
@@ -407,7 +730,6 @@ pub enum ServerMessage {
     ScreenShareError { reason: String },
 
     // ── E2E Encryption messages ───────────────────────────────────────
-
     /// Pre-key bundle response for session establishment.
     PreKeyBundle {
         user_id: UserId,
@@ -471,7 +793,6 @@ pub enum ServerMessage {
     },
 
     // ── Moderation ───────────────────────────────────────────────────
-
     /// A user's admin status changed (broadcast to everyone; the admin's own
     /// client sees its login confirmed this way).
     AdminStatus { user_id: UserId, is_admin: bool },
@@ -487,7 +808,6 @@ pub enum ServerMessage {
     Disconnected { reason: String },
 
     // ── Channel history hand-off ─────────────────────────────────────
-
     /// A newcomer asks you for recent chat of the channel you share.
     ChannelHistoryRequested {
         channel_id: ChannelId,
@@ -505,7 +825,6 @@ pub enum ServerMessage {
     },
 
     // ── Screen share congestion control ──────────────────────────────
-
     /// One of your viewers reported frame loss (sharer only).
     VideoLossReported {
         viewer_user_id: UserId,
@@ -514,9 +833,37 @@ pub enum ServerMessage {
     },
 
     // ── Direct messages ──────────────────────────────────────────────
-
     /// A direct message found nobody to deliver it to: that user has left the
     /// server (protocol v10). User ids are never handed out twice, so they are
     /// not coming back under this one.
     DirectMessageUndelivered { target_user_id: UserId },
+
+    // ── Accounts (protocol v11) ──────────────────────────────────────
+    /// The next step of an account sign-in.
+    AuthStep(AuthStep),
+
+    /// An answer to an `AccountRequest`, or news about the account.
+    Account(AccountReply),
+
+    // ── Pre-keys (protocol v12) ──────────────────────────────────────
+    /// The relay has handed out all but `remaining` of your one-time pre-keys:
+    /// send more with `UploadPreKeys`.
+    PreKeysLow { remaining: u32 },
+
+    /// The connection is refused, in a form every later version can read: this
+    /// variant's index and fields never change (protocol v12, frozen). `code`
+    /// is a number, not an enum, so a newer relay's new reason still decodes.
+    /// Sent only to clients of protocol 12 or later; older ones get `AuthError`.
+    Refused {
+        code: u16,
+        server_protocol: u32,
+        server_version: String,
+        text: String,
+    },
 }
+
+/// `Refused.code`: the client speaks another protocol version.
+/// `server_protocol` above the client's means the client must update.
+pub const REFUSED_VERSION: u16 = 1;
+/// The first protocol version that decodes `ServerMessage::Refused`.
+pub const FIRST_STRUCTURED_REFUSAL: u32 = 12;

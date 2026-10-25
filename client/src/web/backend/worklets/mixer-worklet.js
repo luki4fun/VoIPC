@@ -2,15 +2,15 @@
 // voice mixer (client/src-tauri/src/network.rs voice_mixer_task) and the
 // per-source jitter buffer (crates/voipc-audio/src/jitter.rs).
 //
-// The main thread decodes each Opus packet as it arrives and posts the PCM
-// with its sequence number; this worklet keeps one JitterBuffer of decoded
-// frames per source, pulls one 20 ms frame per source on the audio clock,
-// sums them with per-user gain, clamps, and honors deafen.
-//
-// bernd: a lost frame is 20 ms of silence, faded out and back in so its
-// edges do not click. The native client decodes the next packet's in-band FEC
-// or runs Opus PLC; WebCodecs exposes neither, so the upgrade path is a wasm
-// Opus decoder driven from inside this worklet.
+// The main thread posts each Opus packet with its sequence number; this
+// worklet keeps one JitterBuffer per source and decodes each packet the moment
+// it plays, in order, with the wasm Opus decoder (crates/voipc-opus-wasm). A
+// lost frame is rebuilt from the next packet's in-band FEC or concealed, as
+// the native mixer does (H3-05). Until that decoder is ready, or where it
+// cannot run, the main thread decodes with WebCodecs and posts PCM instead,
+// and a lost frame is 20 ms of silence, faded so its edges do not click.
+// It pulls one 20 ms frame per source on the audio clock, sums them with
+// per-user gain, limits, and honors deafen.
 
 // @ts-nocheck — AudioWorkletGlobalScope (currentTime, registerProcessor,
 // AudioWorkletProcessor) is not in the DOM lib, and this file only became
@@ -28,6 +28,12 @@ globalThis.currentTime ??= 0;
 
 const FRAME = 960;
 export const LOST = Symbol("lost");
+/** The largest Opus packet the decoder takes (voipc-opus-wasm MAX_PACKET). */
+const OPUS_MAX_PACKET = 1275;
+/** voipc-opus-wasm `opus_decode` modes. */
+const OPUS_PACKET = 0;
+const OPUS_FEC = 1;
+const OPUS_CONCEAL = 2;
 
 // ── The effect chain, mirrored from crates/voipc-audio/src/mixer.rs ──────
 //
@@ -503,7 +509,27 @@ function energy(pcm) {
   return e;
 }
 
-/** Port of jitter.rs `JitterBuffer` holding decoded PCM instead of Opus. */
+/** Samples over which a shed frame fades into the one kept (mixer.rs SHED_XFADE). */
+const SHED_XFADE = 120;
+
+/** Fade `from` into the start of `into`: a shed is a cut, and a cut clicks (H3-10). */
+function crossfadeInto(from, into) {
+  const n = Math.min(SHED_XFADE, from.length, into.length);
+  for (let i = 0; i < n; i++) {
+    const w = i / n;
+    into[i] = from[i] * (1 - w) + into[i] * w;
+  }
+}
+
+/** The output limiter's ceiling, release and hold: mixer.rs `Limiter` (H3-09). */
+const LIMIT_CEILING = 0.977;
+const LIMIT_RELEASE = 0.999583;
+const LIMIT_HOLD = 480;
+
+/**
+ * Port of jitter.rs `JitterBuffer`. An entry is an Opus packet (Uint8Array),
+ * decoded when it is popped, or PCM (Float32Array) the main thread decoded.
+ */
 export class JitterBuffer {
   constructor(targetDelay) {
     /** Sorted by sequence ascending (like the BTreeMap): [{seq, pcm}] */
@@ -629,7 +655,7 @@ export class JitterBuffer {
       // where it is, so a hiccup shorter than MAX_STALL_PLC is stretched over
       // instead of played as a hole with hard edges — and the late packet is
       // still played when it lands.
-      // bernd: silence stands in for Opus PLC (see the note at the top).
+      // The caller conceals it: Opus PLC, or silence without the wasm decoder.
       this.plcRun++;
       return LOST;
     }
@@ -644,6 +670,14 @@ export class JitterBuffer {
     this.buffering = true;
     this.maybeDecay();
     return null;
+  }
+
+  /** The entry for the frame after a lost one, if it is here (jitter.rs peek_next). */
+  peekNext() {
+    const n = this.nextSeq;
+    if (n === null) return null;
+    const e = this.entries.find((x) => x.seq === n);
+    return e ? e.pcm : null;
   }
 
   /**
@@ -701,6 +735,9 @@ class MixerProcessor extends AudioWorkletProcessor {
     this.mixPos = FRAME; // nothing buffered yet
     this.framesPlayed = 0;
     this.framesLost = 0;
+    // The output limiter's envelope and hold (see the end of `mix`)
+    this.limitEnv = 0;
+    this.limitHold = 0;
     this.lastReported = [0, 0];
     this.pullsSinceReport = 0;
     this.levelFrames = 0;
@@ -709,7 +746,8 @@ class MixerProcessor extends AudioWorkletProcessor {
 
   onMessage(m) {
     switch (m.type) {
-      case "frame": {
+      case "frame":
+      case "packet": {
         let src = this.sources.get(m.source);
         if (!src) {
           src = {
@@ -730,10 +768,12 @@ class MixerProcessor extends AudioWorkletProcessor {
             // frame: where a fade out starts, and whether a fade in is owed
             last: 0,
             gap: true,
+            // This voice's slot in the wasm decoder (0: none yet)
+            opus: 0,
           };
           this.sources.set(m.source, src);
         }
-        src.jitter.push(m.sequence, m.pcm);
+        src.jitter.push(m.sequence, m.type === "packet" ? m.opus : m.pcm);
         src.eotReceived = false;
         src.lastActivity = currentTime;
         break;
@@ -775,12 +815,22 @@ class MixerProcessor extends AudioWorkletProcessor {
       case "deafen":
         this.deafened = !!m.value;
         break;
+      // The Opus decoder's bytes, fetched on the main thread
+      case "opus":
+        WebAssembly.instantiate(m.bytes, {}).then(
+          ({ instance }) => {
+            this.opusWasm = instance.exports;
+            this.port.postMessage({ type: "opus-ready" });
+          },
+          (e) => this.port.postMessage({ type: "opus-failed", error: String(e) }),
+        );
+        break;
       case "clear":
-        this.sources.clear();
+        this.dropSources();
         this.spatial.clear();
         break;
       case "reset":
-        this.sources.clear();
+        this.dropSources();
         this.userVolumes.clear();
         this.userFx.clear();
         this.spatial.clear();
@@ -791,13 +841,73 @@ class MixerProcessor extends AudioWorkletProcessor {
     }
   }
 
+  /**
+   * A popped entry as PCM: a packet decoded now; a lost frame rebuilt from
+   * the next packet's FEC, or concealed (network.rs `decode`). LOST stays LOST
+   * when there is no decoder; a packet the decoder refuses is concealed.
+   */
+  decoded(src, r) {
+    if (r instanceof Uint8Array) {
+      return this.opusDecode(src, r, OPUS_PACKET) ?? this.opusDecode(src, null, OPUS_CONCEAL) ?? LOST;
+    }
+    if (r === LOST && this.opusWasm) {
+      const next = src.jitter.peekNext();
+      return (
+        (next instanceof Uint8Array ? this.opusDecode(src, next, OPUS_FEC) : null) ??
+        this.opusDecode(src, null, OPUS_CONCEAL) ??
+        LOST
+      );
+    }
+    return r;
+  }
+
+  /** One frame from the wasm decoder, or null. A trap ends the decoder for good. */
+  opusDecode(src, bytes, mode) {
+    const w = this.opusWasm;
+    if (!w) return null;
+    try {
+      if (!src.opus) {
+        src.opus = w.opus_new();
+        if (!src.opus) return null;
+      }
+      const len = bytes ? Math.min(bytes.length, OPUS_MAX_PACKET) : 0;
+      if (len > 0) {
+        new Uint8Array(w.memory.buffer, w.opus_input(src.opus), len).set(bytes.subarray(0, len));
+      }
+      if (w.opus_decode(src.opus, len, mode) !== FRAME) return null;
+      return new Float32Array(w.memory.buffer, w.opus_output(src.opus), FRAME).slice();
+    } catch (e) {
+      // A panic in the decoder is a trap, and its memory is not to be trusted
+      // after one: every voice falls back to the silence path.
+      this.opusWasm = null;
+      this.port.postMessage({ type: "opus-failed", error: String(e) });
+      return null;
+    }
+  }
+
+  freeOpus(src) {
+    if (src.opus && this.opusWasm) {
+      try {
+        this.opusWasm.opus_free(src.opus);
+      } catch {
+        this.opusWasm = null;
+      }
+    }
+    src.opus = 0;
+  }
+
+  dropSources() {
+    for (const src of this.sources.values()) this.freeOpus(src);
+    this.sources.clear();
+  }
+
   /** Pull one 20 ms frame from every source and mix into this.mixL/mixR. */
   pullFrame() {
     this.mixL.fill(0);
     this.mixR.fill(0);
-    let mixed = false;
     for (const [key, src] of this.sources) {
       if (currentTime - src.lastActivity >= SOURCE_IDLE_PRUNE) {
+        this.freeOpus(src);
         this.sources.delete(key);
         continue;
       }
@@ -820,9 +930,12 @@ class MixerProcessor extends AudioWorkletProcessor {
         src.jitter.reset();
         src.eotReceived = false;
       }
-      let r = drained ? null : src.jitter.pop();
+      const popped = drained ? null : src.jitter.pop();
+      const concealed = popped === LOST;
+      let r = this.decoded(src, popped);
       if (r === null || r === LOST) {
-        if (r === LOST) this.framesLost++; // bernd: silence instead of FEC/PLC
+        src.shed = null; // nothing it could fade into follows
+        if (r === LOST) this.framesLost++; // silence: no wasm decoder to conceal with
         const wasPlaying = !src.gap;
         src.gap = true;
         // A lost packet is not a pause: the speaker is still talking, we simply
@@ -844,7 +957,6 @@ class MixerProcessor extends AudioWorkletProcessor {
             this.mixL[i] += s * src.gainL;
             this.mixR[i] += s * src.gainR;
           }
-          mixed = true;
         }
         // A reverb tail outlives the voice that caused it, so the lane's room
         // keeps running here even with nothing left to play — the *tail*, never
@@ -863,21 +975,35 @@ class MixerProcessor extends AudioWorkletProcessor {
             this.mixL[i] += tail[i] * src.gainL;
             this.mixR[i] += tail[i] * src.gainR;
           }
-          mixed = true;
         }
         src.fx.level = 0;
         continue;
       }
-      this.framesPlayed++;
+      if (concealed) this.framesLost++;
+      else this.framesPlayed++;
+      if (src.shed) {
+        crossfadeInto(src.shed, r);
+        src.shed = null;
+      }
       // A cushion that stayed deep for a second: play the louder of this frame
       // and the next, so the one skipped is the one least missed (jitter.rs
-      // take_surplus).
+      // take_surplus). Faded from the frame that would have played, as the
+      // desktop mixer does: at once, or at the start of the frame after.
       if (src.jitter.takeSurplus()) {
-        const next = src.jitter.pop();
-        if (next === LOST) this.framesLost++;
-        else if (next) {
-          this.framesPlayed++;
-          if (energy(next) > energy(r)) r = next;
+        // Decoded even when dropped, so the Opus state runs on
+        const popNext = src.jitter.pop();
+        const next = this.decoded(src, popNext);
+        if (popNext === LOST) this.framesLost++;
+        if (next === LOST) {
+          // nothing to compare with
+        } else if (next) {
+          if (popNext !== LOST) this.framesPlayed++;
+          if (energy(next) > energy(r)) {
+            crossfadeInto(r, next);
+            r = next;
+          } else {
+            src.shed = next;
+          }
         }
       }
       if (this.deafened) {
@@ -935,15 +1061,24 @@ class MixerProcessor extends AudioWorkletProcessor {
       src.fx.level = Math.sqrt(sum / n) * makeup;
       src.gainL = targetL;
       src.gainR = targetR;
-      mixed = true;
     }
-    if (mixed) {
-      for (let i = 0; i < FRAME; i++) {
-        const l = this.mixL[i];
-        const r = this.mixR[i];
-        this.mixL[i] = l > 1 ? 1 : l < -1 ? -1 : l;
-        this.mixR[i] = r > 1 ? 1 : r < -1 ? -1 : r;
+    // A limiter, not a clamp, and on quiet frames too so its release
+    // carries on between bursts (mixer.rs `Limiter`).
+    for (let i = 0; i < FRAME; i++) {
+      const l = this.mixL[i];
+      const r = this.mixR[i];
+      const peak = Math.max(Math.abs(l), Math.abs(r));
+      if (peak >= this.limitEnv) {
+        this.limitEnv = peak;
+        this.limitHold = LIMIT_HOLD;
+      } else if (this.limitHold > 0) {
+        this.limitHold--;
+      } else {
+        this.limitEnv = peak + LIMIT_RELEASE * (this.limitEnv - peak);
       }
+      const g = this.limitEnv > LIMIT_CEILING ? LIMIT_CEILING / this.limitEnv : 1;
+      this.mixL[i] = l * g;
+      this.mixR[i] = r * g;
     }
     // Meters get their own cadence: the packet counters below are happy at
     // 500 ms, a meter at 500 ms looks broken.

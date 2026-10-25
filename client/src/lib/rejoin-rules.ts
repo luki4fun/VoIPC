@@ -43,3 +43,14 @@ export function resolveRejoin(
   }
   return found;
 }
+
+/**
+ * How long a reconnect waits before attempt `attempt` (1, 2, …): doubling to
+ * at most 10 s, then spread over half to one and a half times that. Without
+ * the spread, every client a relay restart dropped retried in the same second
+ * and met its sign-in and connection limits as one burst (1.0 audit H5-17).
+ */
+export function reconnectDelay(attempt: number, random: () => number = Math.random): number {
+  const base = Math.min(1000 * Math.pow(2, attempt - 1), 10000);
+  return base * (0.5 + random());
+}

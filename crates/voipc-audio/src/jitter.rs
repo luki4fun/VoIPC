@@ -77,6 +77,8 @@ impl JitterBuffer {
     /// begins (e.g. 3 = 60ms). A higher value absorbs more jitter but adds
     /// latency; it adapts upward under observed lateness (up to 160ms).
     pub fn new(target_delay: usize) -> Self {
+        // `max_buffer` comes from it, and 0 there evicts every packet on arrival
+        let target_delay = target_delay.clamp(1, MAX_TARGET_DELAY);
         Self {
             buffer: BTreeMap::new(),
             next_seq: None,
@@ -110,9 +112,7 @@ impl JitterBuffer {
         let spare = self.min_depth.take().is_some_and(|d| d >= 1);
         if spare
             && self.target_delay > MIN_TARGET_DELAY
-            && self
-                .last_change
-                .map_or(true, |t| t.elapsed() >= DECAY_QUIET)
+            && self.last_change.is_none_or(|t| t.elapsed() >= DECAY_QUIET)
         {
             self.target_delay -= 1;
             self.last_change = Some(Instant::now());

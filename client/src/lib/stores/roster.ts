@@ -90,6 +90,18 @@ export const displayChannelCreatorId: Readable<number | null> = derived(
   ($channel) => $channel?.created_by ?? null,
 );
 
+/**
+ * The channels a sidebar lists. A hidden one is not listed, unless you are an
+ * admin or standing in it. Nor is the lobby, channel 0: it is where the server
+ * keeps everyone who is in no voice channel, which is not a place anybody
+ * goes. Its people are the member list's "Online" group.
+ */
+export const visibleChannels: Readable<ChannelInfo[]> = derived(
+  [channels, isAdmin, currentChannelId],
+  ([$channels, $admin, $current]) =>
+    $channels.filter((c) => c.channel_id !== 0 && (!c.hidden || $admin || c.channel_id === $current)),
+);
+
 /** This channel hides its roster from us. Admins always see it. */
 export const hideMembers: Readable<boolean> = derived(
   [isAdmin, displayChannel],
@@ -227,11 +239,18 @@ export const isCurrentChannelCreator: Readable<boolean> = derived(
   ([$creator, $userId, $current]) => $creator === $userId && $current !== 0,
 );
 
-/** Channel kick: the creator in their own channel, an admin in any channel. */
+/** This user holds the moderator role on the server on screen. Read off our
+ *  own row in the roster, which is where the server says it. */
+export const isModerator: Readable<boolean> = derived([users, userId], ([$users, $id]) =>
+  $users.some((u) => u.user_id === $id && !!u.is_moderator),
+);
+
+/** Channel kick: the creator in their own channel, an admin or a moderator in
+ *  any channel. */
 export const canKick: Readable<boolean> = derived(
-  [displayChannelId, isPreviewing, displayChannelCreatorId, userId, isAdmin],
-  ([$id, $previewing, $creator, $userId, $admin]) =>
-    $id !== 0 && ((!$previewing && $creator === $userId) || $admin),
+  [displayChannelId, isPreviewing, displayChannelCreatorId, userId, isAdmin, isModerator],
+  ([$id, $previewing, $creator, $userId, $admin, $mod]) =>
+    $id !== 0 && ((!$previewing && $creator === $userId) || $admin || $mod),
 );
 
 /** Invite: while previewing another channel, if you own the one you are in. */

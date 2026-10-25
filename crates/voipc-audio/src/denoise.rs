@@ -7,12 +7,18 @@ use nnnoiseless::DenoiseState;
 const RNNOISE_FRAME_SIZE: usize = 480;
 
 pub struct Denoiser {
-    state: Box<DenoiseState>,
+    state: Box<DenoiseState<'static>>,
     enabled: bool,
     /// Input buffer scaled to i16 range for RNNoise.
     input_buf: [f32; RNNOISE_FRAME_SIZE],
     /// Output buffer from RNNoise.
     output_buf: [f32; RNNOISE_FRAME_SIZE],
+}
+
+impl Default for Denoiser {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Denoiser {
@@ -32,10 +38,14 @@ impl Denoiser {
     /// Process audio samples in-place. Samples are f32 in [-1.0, 1.0].
     /// Handles any buffer size by processing in 480-sample chunks.
     /// Leftover samples (< 480) are processed by zero-padding.
-    pub fn process(&mut self, samples: &mut [f32]) {
+    ///
+    /// Returns RNNoise's estimate that the buffer holds a voice (the highest
+    /// of its chunks), or `None` while suppression is off.
+    pub fn process(&mut self, samples: &mut [f32]) -> Option<f32> {
         if !self.enabled || samples.is_empty() {
-            return;
+            return None;
         }
+        let mut voice = 0.0f32;
 
         let mut offset = 0;
         while offset < samples.len() {
@@ -51,7 +61,10 @@ impl Denoiser {
                 self.input_buf[i] = 0.0;
             }
 
-            self.state.process_frame(&mut self.output_buf, &self.input_buf);
+            voice = voice.max(
+                self.state
+                    .process_frame(&mut self.output_buf, &self.input_buf),
+            );
 
             // Scale back to [-1.0, 1.0] range
             for i in 0..chunk_len {
@@ -60,6 +73,7 @@ impl Denoiser {
 
             offset += chunk_len;
         }
+        Some(voice)
     }
 }
 

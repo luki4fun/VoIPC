@@ -140,17 +140,23 @@ function resolveToolchain() {
 function build(args) {
   let buildType = 'debug';
   let target = 'aarch64';
+  // CI builds the release APK unsigned; a separate job signs it, so the key
+  // is never on a machine that runs npm, cargo or Gradle build code.
+  let unsigned = false;
+  // `check`: cargo check of the client for the target, no Gradle, no APK.
+  let check = false;
   for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === 'debug' || a === 'release') buildType = a;
     else if (a === '--target') target = args[++i] ?? fail('--target needs a value');
+    else if (a === '--unsigned') unsigned = true;
+    else if (a === 'check') check = true;
     else fail(`unknown argument: ${a}`);
   }
 
   const { sdk, ndk, javaHome, toolchain } = resolveToolchain();
-  // The APK carries APP_VERSION, and the server compares it for exact equality,
-  // so a stale version here ships an APK every server rejects.
-  const version = syncVersion();
+  // The APK carries APP_VERSION, which must be the release's.
+  const version = syncVersion({ check });
 
   console.log(`ANDROID_HOME:     ${sdk}`);
   console.log(`ANDROID_NDK_HOME: ${ndk}`);
@@ -186,7 +192,13 @@ function build(args) {
   if (!existsSync(libcxx)) fail(`the NDK has no libc++_shared.so at ${libcxx}`);
   copyFileSync(libcxx, join(jniLibs, 'libc++_shared.so'));
 
-  if (buildType === 'release' && !existsSync(join(ROOT, 'keystore.properties'))) {
+  if (check) {
+    head(`Checking the client for Android (${target})`);
+    run('cargo', ['check', '--locked', '--target', ABI_BY_TARGET[target], '-p', 'voipc-client'], { env });
+    return;
+  }
+
+  if (buildType === 'release' && !unsigned && !existsSync(join(ROOT, 'keystore.properties'))) {
     fail('keystore.properties not found at the repo root.\n'
       + '     Copy keystore.properties.example to keystore.properties and fill in your values.');
   }
@@ -219,7 +231,8 @@ function build(args) {
  * declares. That failure only shows up on a device, so check it at build time.
  */
 function verifyNativeLib(toolchain, target) {
-  const so = join(ROOT, 'target', target, 'release', 'libvoipc_client_lib.so');
+  // `--target all` has no single directory: no check, as for a debug build
+  const so = join(ROOT, 'target', ABI_BY_TARGET[target] ?? target, 'release', 'libvoipc_client_lib.so');
   if (!existsSync(so)) return; // debug build, or a layout we do not know
   const readelf = join(toolchain, 'bin', 'llvm-readelf');
   if (!existsSync(readelf)) return;

@@ -1,0 +1,16 @@
+Wrote channels.json from the "starter" preset: 2 text and 4 voice channels.
+
+  #general   text, auto-join
+  #offtopic  text
+  Lounge     voice
+  Gaming     voice
+  Private    voice, max 5, password
+  AFK        voice, no screen share
+
+Passwords — shown this once; channels.json keeps only their hashes:
+  Private  kwsy-fk3r-d7m4
+
+Restart the server to load it. To change a password for good, put
+"password": "…" in place of that channel's "password_hash".
+
+- Anyone can still open a room of their own with the + button; it goes away once it has been empty for a while.

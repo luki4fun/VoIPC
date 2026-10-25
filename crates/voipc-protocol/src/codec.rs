@@ -53,7 +53,15 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 ///     envelope, which the server never sees
 /// v10: DirectMessageUndelivered, the sender's answer when a direct message's
 ///      recipient has left
-pub const PROTOCOL_VERSION: u32 = 10;
+/// v11: relay accounts — Authenticate.account, AuthStep/AuthContinue,
+///      Authenticated.accounts/account, UserInfo.account/is_moderator,
+///      AccountRequest/AccountReply;
+///      channel options — ChannelInfo.announce/slow_mode_secs/nsfw and the
+///      same three in SetChannelOptions
+/// v12: libsignal with post-quantum sessions — PreKeyBundleData carries a
+///      signed Kyber1024 pre-key; PreKeysLow asks for more one-time pre-keys;
+///      the media AAD names the sender
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.
@@ -134,6 +142,7 @@ mod tests {
             app_version: APP_VERSION.to_string(),
             identity_key: None,
             prekey_bundle: None,
+            account: None,
         };
         let encoded = encode_client_msg(&msg).unwrap();
         // Skip the 4-byte length prefix
@@ -156,6 +165,8 @@ mod tests {
         let msg = ServerMessage::Authenticated {
             user_id: 1,
             session_id: 42,
+            accounts: None,
+            account: None,
         };
         let encoded = encode_server_msg(&msg).unwrap();
         let decoded = decode_server_msg(&encoded[4..]).unwrap();
@@ -163,6 +174,7 @@ mod tests {
             ServerMessage::Authenticated {
                 user_id,
                 session_id,
+                ..
             } => {
                 assert_eq!(user_id, 1);
                 assert_eq!(session_id, 42);
@@ -182,7 +194,11 @@ mod tests {
         let decoded = decode_client_msg(&encoded[4..]).unwrap();
         assert!(matches!(
             decoded,
-            ClientMessage::VideoLossReport { sharer_user_id: 7, frames_dropped: 3, frames_received: 40 }
+            ClientMessage::VideoLossReport {
+                sharer_user_id: 7,
+                frames_dropped: 3,
+                frames_received: 40
+            }
         ));
 
         let msg = ServerMessage::VideoLossReported {
@@ -194,7 +210,11 @@ mod tests {
         let decoded = decode_server_msg(&encoded[4..]).unwrap();
         assert!(matches!(
             decoded,
-            ServerMessage::VideoLossReported { viewer_user_id: 9, frames_dropped: 3, frames_received: 40 }
+            ServerMessage::VideoLossReported {
+                viewer_user_id: 9,
+                frames_dropped: 3,
+                frames_received: 40
+            }
         ));
     }
 
@@ -203,7 +223,10 @@ mod tests {
         let msg = ServerMessage::DirectMessageUndelivered { target_user_id: 7 };
         let encoded = encode_server_msg(&msg).unwrap();
         let decoded = decode_server_msg(&encoded[4..]).unwrap();
-        assert!(matches!(decoded, ServerMessage::DirectMessageUndelivered { target_user_id: 7 }));
+        assert!(matches!(
+            decoded,
+            ServerMessage::DirectMessageUndelivered { target_user_id: 7 }
+        ));
     }
 
     #[test]
@@ -239,7 +262,10 @@ mod tests {
         let encoded = encode_client_msg(&msg).unwrap();
         let decoded = decode_client_msg(&encoded[4..]).unwrap();
         match decoded {
-            ClientMessage::JoinChannel { channel_id, password } => {
+            ClientMessage::JoinChannel {
+                channel_id,
+                password,
+            } => {
                 assert_eq!(channel_id, 42);
                 assert_eq!(password, Some("secret".into()));
             }
@@ -296,33 +322,27 @@ mod tests {
     fn roundtrip_set_channel_options() {
         // None leaves an option alone; the server must be able to tell that
         // apart from "set it to false".
-        let msg = ClientMessage::SetChannelOptions {
-            channel_id: 3,
+        let options = crate::types::ChannelOptions {
             hidden: Some(true),
-            anonymous: None,
             screen_share: Some(false),
-            hide_members: None,
             routed: Some(true),
             message_ttl_secs: Some(3600),
+            announce: Some(true),
+            nsfw: Some(false),
+            ..Default::default()
+        };
+        let msg = ClientMessage::SetChannelOptions {
+            channel_id: 3,
+            options,
         };
         let encoded = encode_client_msg(&msg).unwrap();
         match decode_client_msg(&encoded[4..]).unwrap() {
             ClientMessage::SetChannelOptions {
                 channel_id,
-                hidden,
-                anonymous,
-                screen_share,
-                hide_members,
-                routed,
-                message_ttl_secs,
+                options: back,
             } => {
                 assert_eq!(channel_id, 3);
-                assert_eq!(hidden, Some(true));
-                assert_eq!(anonymous, None);
-                assert_eq!(screen_share, Some(false));
-                assert_eq!(hide_members, None);
-                assert_eq!(routed, Some(true));
-                assert_eq!(message_ttl_secs, Some(3600));
+                assert_eq!(back, options);
             }
             _ => panic!("wrong variant"),
         }
@@ -346,7 +366,11 @@ mod tests {
         let encoded = encode_client_msg(&msg).unwrap();
         let decoded = decode_client_msg(&encoded[4..]).unwrap();
         match decoded {
-            ClientMessage::StartScreenShare { source, resolution, codec } => {
+            ClientMessage::StartScreenShare {
+                source,
+                resolution,
+                codec,
+            } => {
                 assert_eq!(source, "screen:0");
                 assert_eq!(resolution, 1080);
                 assert_eq!(codec, crate::types::VideoCodec::Vp9);
@@ -357,7 +381,10 @@ mod tests {
         let msg = ClientMessage::WatchScreenShare { sharer_user_id: 7 };
         let encoded = encode_client_msg(&msg).unwrap();
         let decoded = decode_client_msg(&encoded[4..]).unwrap();
-        assert!(matches!(decoded, ClientMessage::WatchScreenShare { sharer_user_id: 7 }));
+        assert!(matches!(
+            decoded,
+            ClientMessage::WatchScreenShare { sharer_user_id: 7 }
+        ));
 
         // The viewer learns the codec here, not from ScreenShareStarted
         let msg = ServerMessage::WatchingScreenShare {
@@ -367,7 +394,10 @@ mod tests {
         let encoded = encode_server_msg(&msg).unwrap();
         let decoded = decode_server_msg(&encoded[4..]).unwrap();
         match decoded {
-            ServerMessage::WatchingScreenShare { sharer_user_id, codec } => {
+            ServerMessage::WatchingScreenShare {
+                sharer_user_id,
+                codec,
+            } => {
                 assert_eq!(sharer_user_id, 7);
                 assert_eq!(codec, crate::types::VideoCodec::H265);
             }
@@ -387,7 +417,13 @@ mod tests {
         let encoded = encode_server_msg(&msg).unwrap();
         let decoded = decode_server_msg(&encoded[4..]).unwrap();
         match decoded {
-            ServerMessage::EncryptedChannelChatMessage { channel_id, user_id, username, ciphertext, timestamp } => {
+            ServerMessage::EncryptedChannelChatMessage {
+                channel_id,
+                user_id,
+                username,
+                ciphertext,
+                timestamp,
+            } => {
                 assert_eq!(channel_id, 1);
                 assert_eq!(user_id, 5);
                 assert_eq!(username, "alice");
@@ -407,7 +443,10 @@ mod tests {
         };
         let encoded = encode_server_msg(&msg).unwrap();
         let decoded = decode_server_msg(&encoded[4..]).unwrap();
-        assert!(matches!(decoded, ServerMessage::EncryptedDirectChatMessage { .. }));
+        assert!(matches!(
+            decoded,
+            ServerMessage::EncryptedDirectChatMessage { .. }
+        ));
     }
 
     #[test]

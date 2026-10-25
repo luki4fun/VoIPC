@@ -1,0 +1,30 @@
+Wrote channels.json from the "mmo" preset: 7 text and 11 voice channels.
+
+  #announcements         text, auto-join, announcements
+  #guild-chat            text, auto-join
+  #raid-signups          text, auto-join, messages live 7 d
+  #lfg                   text, slow mode 60 s, messages live 1 d
+  #guides-and-builds     text
+  #trade-and-crafting    text, messages live 7 d
+  #officers              text, hidden, password
+  Guild Hall             voice
+  Raid                   voice
+  Raid Team 2            voice
+  Party 1                voice, max 8
+  Party 2                voice, max 8
+  Party 3                voice, max 8
+  PvP                    voice
+  Farming & Crafting     voice
+  Recruitment Interview  voice, max 3
+  Officer Room           voice, hidden, password
+  AFK                    voice, no screen share
+
+Passwords — shown this once; channels.json keeps only their hashes:
+  officers      dnt6-7f43-gzs8
+  Officer Room  63ks-a2r7-jje2
+
+Restart the server to load it. To change a password for good, put
+"password": "…" in place of that channel's "password_hash".
+
+- Posting in an announcement channel takes an admin (the admin token) or, on a server with accounts, a moderator.
+- Running more raid groups? Copy the Raid Team 2 entry and give it a new name.

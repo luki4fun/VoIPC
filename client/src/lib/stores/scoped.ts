@@ -30,6 +30,12 @@ export const serverAddress = writable<string>("");
 export interface Scoped<T> extends Readable<T> {
   /** That server's store. The only way to write. */
   of(server: string): Writable<T>;
+  /**
+   * That server's store to read, without making one: a server with none
+   * reads as the initial value. `get(x.peek(server))` left a ghost entry behind
+   * for "" or a dropped server, which `all()` then carried (H5-16).
+   */
+  peek(server: string): Readable<T>;
   /** Follows whichever server `server` names; the initial value while it names none. */
   at(server: Readable<string | null>): Readable<T>;
   /** Every server's value, for whatever draws all of them at once (the rail). */
@@ -97,6 +103,11 @@ export function scoped<T>(init: () => T): Scoped<T> {
     return store;
   }
 
+  function peek(server: string): Readable<T> {
+    // A fresh initial value, not `blank`'s: a caller may mutate what it read
+    return entries.get(server) ?? readable(init());
+  }
+
   function at(server: Readable<string | null>): Readable<T> {
     return follow(
       derived([server, version], ([$server]) => ($server ? entries.get($server) : undefined) ?? blank),
@@ -123,7 +134,7 @@ export function scoped<T>(init: () => T): Scoped<T> {
   }
 
   const view = at(serverAddress);
-  const store: Scoped<T> = { subscribe: view.subscribe, of, at, all, drop };
+  const store: Scoped<T> = { subscribe: view.subscribe, of, peek, at, all, drop };
   everyScoped.add(store as Scoped<unknown>);
   return store;
 }

@@ -1,0 +1,21 @@
+# Actions: weekly version updates, grouped into one PR. Every action is pinned
+# by commit SHA, and this is what moves the pins (and their `# vX.Y.Z` notes).
+#
+# Cargo, npm and Gradle: no version-update PRs (limit 0), only security updates,
+# which need "Dependabot security updates" switched on in the repository
+# settings. Their versions move with the releases, through the lockfiles.
+#
+# Docker: the two base images of Dockerfile.relay are pinned by digest, and
+# this is what moves those pins.
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule: { interval: weekly }
+    groups: { actions: { patterns: ['*'] } }
+  - { package-ecosystem: cargo, directory: /, schedule: { interval: weekly }, open-pull-requests-limit: 0 }
+  - { package-ecosystem: cargo, directory: /crates/voipc-web, schedule: { interval: weekly }, open-pull-requests-limit: 0 }
+  - { package-ecosystem: cargo, directory: /crates/voipc-opus-wasm, schedule: { interval: weekly }, open-pull-requests-limit: 0 }
+  - { package-ecosystem: npm, directory: /client, schedule: { interval: weekly }, open-pull-requests-limit: 0 }
+  - { package-ecosystem: gradle, directory: /client/src-tauri/gen/android, schedule: { interval: weekly }, open-pull-requests-limit: 0 }
+  - { package-ecosystem: docker, directory: /, schedule: { interval: weekly } }

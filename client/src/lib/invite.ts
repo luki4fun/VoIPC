@@ -48,10 +48,27 @@ export function parseInviteLink(
   };
 }
 
+/**
+ * "host", "host:port" or "[v6::addr]:port"; the port defaults to `port`. The
+ * one address parser of the front end and the browser backend: null for a
+ * bare IPv6 address without brackets, an empty host, or a junk port.
+ */
+export function parseHostPort(value: string, port = 9987): { host: string; port: number } | null {
+  const bracketed = value.match(/^\[([^\]]+)\](?::(\d+))?$/);
+  if (bracketed) return withPort(bracketed[1], bracketed[2] ?? null, port);
+  const parts = value.split(":");
+  if (parts.length === 1) return parts[0] ? { host: parts[0], port } : null;
+  if (parts.length === 2 && parts[0]) return withPort(parts[0], parts[1], port);
+  return null;
+}
+
+function withPort(host: string, typed: string | null, port: number): { host: string; port: number } | null {
+  if (typed === null) return { host, port };
+  const n = Number(typed);
+  return /^\d+$/.test(typed) && n >= 1 && n <= 65535 ? { host, port: n } : null;
+}
+
 /** "host:port" / "[v6]:port" as kept in the serverAddress store → parts. */
 export function splitAddress(address: string): { host: string; port: number } {
-  const colon = address.lastIndexOf(":");
-  const host = (colon < 0 ? address : address.slice(0, colon)).replace(/^\[|\]$/g, "");
-  const port = colon < 0 ? 9987 : Number(address.slice(colon + 1)) || 9987;
-  return { host, port };
+  return parseHostPort(address) ?? { host: address.replace(/^\[|\]$/g, ""), port: 9987 };
 }

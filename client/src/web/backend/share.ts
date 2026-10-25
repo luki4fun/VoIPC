@@ -533,6 +533,7 @@ export class ShareSender implements ShareApi {
       framerate: this.currentFps(),
       latencyMode: "realtime",
       ...(this.codec === "H264" ? { avc: { format: "annexb" as const } } : {}),
+      ...CONTENT_HINT,
     };
   }
 
@@ -586,12 +587,15 @@ export class ShareSender implements ShareApi {
     }
   }
 
-  /** Apply the current level to the running encoder (bitrate and frame rate). */
+  /**
+   * Apply the current level to the running encoder (bitrate and frame rate).
+   * No keyframe: Chromium changes the rate without one, and an IDR here would
+   * land in the link that just reported loss (H3-08).
+   */
   private reconfigure(): void {
     if (!this.encoder || this.encoder.state !== "configured") return;
     try {
       this.encoder.configure(this.encoderConfig());
-      this.keyframeRequested = true;
     } catch (e) {
       console.warn("could not apply the new quality level:", e);
     }
@@ -714,6 +718,13 @@ export class ShareSender implements ShareApi {
 }
 
 /** Configure, encode one frame, and see whether anything comes out. */
+/**
+ * A screen is text: keep detail over motion. +1.3 dB on text for H.264 in
+ * Chromium, fewer bits for VP9 (H3-16). Not in TypeScript's DOM types yet, and
+ * a browser that does not know it ignores it.
+ */
+const CONTENT_HINT = { contentHint: "detail" } as const;
+
 async function trialEncode(config: VideoEncoderConfig): Promise<boolean> {
   let chunks = 0;
   let failed = false;

@@ -61,3 +61,17 @@ test("a standing surplus is reported once a second", () => {
   assert.equal(jb.takeSurplus(), true);
   assert.equal(jb.takeSurplus(), false, "one shed per second, not one per frame");
 });
+
+test("a lost frame shows the packet after it, for its FEC (jitter.rs peek_next)", () => {
+  const jb = new JitterBuffer(2);
+  const opus = (v: number) => new Uint8Array([v]);
+  jb.push(0, opus(0));
+  jb.push(2, opus(2));
+  assert.deepEqual(jb.pop(), opus(0));
+  assert.equal(jb.pop(), LOST, "1 never arrived");
+  assert.deepEqual(jb.peekNext(), opus(2), "2 carries 1's in-band FEC");
+  assert.deepEqual(jb.pop(), opus(2));
+  // A stall, with nothing after it: concealment, no FEC to take
+  assert.equal(jb.pop(), LOST);
+  assert.equal(jb.peekNext(), null);
+});

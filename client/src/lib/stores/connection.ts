@@ -53,7 +53,7 @@ export function setSelfDeafened(deafened: boolean): void {
 /** Our own row on every open server: the flag went to all of them. */
 function patchSelf(patch: { is_muted?: boolean; is_deafened?: boolean }): void {
   for (const server of get(openServers)) {
-    const self = get(userId.of(server));
+    const self = get(userId.peek(server));
     users.of(server).update((all) => patchUser(all, self, patch));
   }
 }

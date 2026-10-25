@@ -15,10 +15,18 @@
 export interface SignalClient {
   /** { identity_key: number[], prekey_bundle: PreKeyBundleData } for Authenticate. */
   bundle(): { identity_key: number[]; prekey_bundle: PreKeyBundleData };
-  /** X3DH with a peer's bundle (as decoded from ServerMessage.PreKeyBundle.bundle). */
+  /** Our user id from Authenticated: every pairwise message is bound to it. */
+  setOwnUserId(userId: number): void;
+  /** More one-time pre-keys for UploadPreKeys, answering PreKeysLow. */
+  morePrekeys(): { id: number; public_key: number[] }[];
+  /** PQXDH with a peer's bundle (as decoded from ServerMessage.PreKeyBundle.bundle). */
   establishSession(userId: number, bundle: PreKeyBundleData): void;
   encrypt(userId: number, plaintext: Uint8Array): { ciphertext: Uint8Array; message_type: number };
   decrypt(userId: number, ciphertext: Uint8Array, messageType: number): Uint8Array;
+  /** Identities the stores took in since the last call (a session a peer opened among them). */
+  takeSeen(): { user_id: number; key: Uint8Array }[];
+  /** The identity key the session with `userId` runs on. */
+  identityOf(userId: number): Uint8Array | undefined;
   createSenderKeyDistribution(ownUserId: number, channelId: number): Uint8Array;
   processSenderKeyDistribution(fromUserId: number, channelId: number, bytes: Uint8Array): void;
   groupEncrypt(ownUserId: number, channelId: number, plaintext: Uint8Array): Uint8Array;
@@ -125,6 +133,10 @@ export interface PreKeyBundleData {
   signed_prekey: number[];
   signed_prekey_signature: number[];
   prekeys: { id: number; public_key: number[] }[];
+  /** The signed Kyber1024 last-resort pre-key (protocol 12). */
+  kyber_prekey_id: number;
+  kyber_prekey: number[];
+  kyber_prekey_signature: number[];
 }
 
 /** Header of an unencrypted voice-family packet: EOT 0x02, Ping 0x03, Pong 0x04. */
@@ -154,6 +166,96 @@ export interface ScreenAudioInfo {
   opus: Uint8Array;
 }
 
+/** How a connection signs in to a relay account (crates/voipc-web/src/account.rs). */
+export type AccountMethod =
+  | { kind: "login"; password: string }
+  | { kind: "register"; password: string; invite?: string | null }
+  | { kind: "device"; device_id: number[]; device_key: number[]; relay_id: number[]; dek: number[] }
+  | { kind: "reset"; recovery: string; password: string };
+
+/** One step of a sign-in: a payload to send, "build the keys now", "ask for
+ *  a code", "stretch the password with this salt", or "the reset went through". */
+export type SignInStep = { send?: Uint8Array; keys?: true; needTotp?: true; stretch?: string; resetDone?: true };
+
+/**
+ * An account sign-in: voipc_crypto::account::SignIn, the same steps the
+ * desktop client runs. Payloads are postcard bytes without the length prefix.
+ */
+export interface AccountSignIn {
+  /** The Authenticate payload to open with. */
+  first(): Uint8Array;
+  /** What this browser knows of relay ids: this address's (hex), and
+   *  `[hex, address]` of the others. */
+  expectRelay(here: string | undefined, elsewhere: [string, string][]): void;
+  /** One server payload in; throws the reason when the sign-in fails. */
+  step(payload: Uint8Array): SignInStep[];
+  /** PBKDF2 of the password with the salt a `stretch` step named. */
+  stretched(master: Uint8Array): SignInStep[];
+  /** The Signal client for the account's identity (which stays in wasm). */
+  signalClient(): SignalClient;
+  /** The Keys payload, from the new Signal client's prekey_bundle. */
+  keys(prekeyBundle: PreKeyBundleData): Uint8Array;
+  totp(code: string): Uint8Array;
+  recovery(code: string): Uint8Array;
+  /** After Authenticated: where this browser kept the log's read cursors. */
+  finish(): { relay_id: Uint8Array; name: string };
+  /** After finish: the account's session, from the AccountInfo in
+   *  Authenticated, what this browser kept of the log last time, whether
+   *  joiners of a channel's log get older keys, and whether this sign-in was
+   *  with the password. */
+  startSession(info: unknown, memory: string | null, share: boolean, passwordBased: boolean): { session: AccountSession; actions: AccountActions };
+  free(): void;
+}
+
+/** What the account session asks the page to do (voipc_crypto::account_session::Actions). */
+export interface AccountActions {
+  send: Uint8Array[];
+  /** Front-end events, to emit as they are. */
+  emit: { name: string; payload: unknown }[];
+  /** The relay remembers this browser now: keep its key (devices.ts). */
+  remember?: { relay_id: number[]; name: string; device_id: number[]; device_key: number[]; dek: number[] };
+  /** The log's read cursors moved: keep this JSON under `voipc.cursors.<key>`. */
+  memory?: { key: string; json: string };
+}
+
+/** What follows a sign-in — the stored log, the pins, remembering this
+ *  browser — as the desktop client runs it too (voipc_crypto::account_session). */
+export interface AccountSession {
+  /** Once the session is listed. */
+  afterConnect(): AccountActions;
+  /** A decoded AccountReply. */
+  onReply(reply: unknown): AccountActions;
+  /** The users of a UserList or UserJoined, for the pins. */
+  noteRoster(users: unknown): AccountActions;
+  /** An identity a user showed (a bundle, or a session they opened). */
+  checkIdentity(userId: number, key: Uint8Array): AccountActions;
+  outgoingDm(userId: number, envelope: Uint8Array, sentAt: number, ttlSecs?: number | null): AccountActions;
+  /** A direct message for an account that is away (its hex id); throws why not. */
+  keptDm(accountHex: string, envelope: Uint8Array, sentAt: number, ttlSecs?: number | null): AccountActions;
+  outgoingChannel(log: string, envelope: Uint8Array, sentAt: number, ttlSecs?: number | null): AccountActions;
+  /** In a channel with log `conv`: keep it, and read what it kept. */
+  enter(conv: string): AccountActions;
+  /** Out of channel log `conv`; with `tell`, asks the relay to take us out. */
+  leave(conv: string, tell: boolean): AccountActions;
+  /** Delete what this account wrote to the stored logs, in `conv` or (null) everywhere. */
+  purge(conv: string | null): AccountActions;
+  /** Delete this account, from its stretched password. */
+  deleteAccount(master: Uint8Array, totp?: string | null, recovery?: string | null): AccountActions;
+  /** Whether a DM to this user that did not arrive is kept for them all the same. */
+  keptFor(userId: number): boolean;
+  /** Throws why there is none. `live`: the key the session with them runs on. */
+  safetyNumber(userId: number, ownKey: Uint8Array, live?: Uint8Array): string;
+  cloud(): boolean;
+  asked(): boolean;
+  setPrefs(cloud: boolean, asked: boolean): AccountActions;
+  setShare(share: boolean): void;
+  /** The PBKDF2 salt for this account's passwords. */
+  kdfSalt(): string;
+  /** A new password, from the stretched old and new ones. */
+  passwordChange(oldMaster: Uint8Array, newMaster: Uint8Array, totp?: string | null, recovery?: string | null): AccountActions;
+  free(): void;
+}
+
 export interface WasmApi {
   protocolVersion(): number;
   appVersion(): string;
@@ -163,6 +265,14 @@ export interface WasmApi {
   decodeServerMsg(bytes: Uint8Array): unknown;
   /** Fresh ephemeral identity + registration id + signed pre-key 1 + 100 one-time pre-keys. */
   newSignalClient(): SignalClient;
+  /** The PBKDF2 rounds a password is stretched with. */
+  kdfRounds(): number;
+  /** Throws why the name cannot be an account name. */
+  newAccountSignIn(name: string, method: AccountMethod): AccountSignIn;
+  /** An account name as the relay stores it; throws why not. */
+  normalizeAccountName(raw: string): string;
+  /** An otpauth:// link as an SVG QR code, drawn locally. */
+  qrSvg(text: string): string | undefined;
   newMediaKeys(): MediaKeys;
   newVideoAssembler(): VideoAssembler;
   /** Largest opaque blob the relay will re-wrap and forward. */
@@ -252,6 +362,10 @@ export async function loadWasm(): Promise<WasmApi> {
     encodeClientMsg: (m) => mod.encodeClientMsg(m),
     decodeServerMsg: (b) => mod.decodeServerMsg(b),
     newSignalClient: () => new mod.SignalClient(),
+    kdfRounds: () => mod.kdfRounds(),
+    newAccountSignIn: (name, method) => new mod.AccountSignIn(name, method),
+    normalizeAccountName: (raw) => mod.normalizeAccountName(raw),
+    qrSvg: (text) => mod.qrSvg(text),
     newMediaKeys: () => new mod.MediaKeys(),
     newVideoAssembler: () => new mod.VideoAssembler(),
     maxRelayCiphertext: () => mod.maxRelayCiphertext(),

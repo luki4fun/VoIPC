@@ -64,6 +64,22 @@ impl ServerSettings {
         let content = std::fs::read_to_string(path)?;
         let mut settings: Self = serde_json::from_str(&content)?;
         settings.normalise();
+        // A preset's stand-in, copied by hand: as a token it would be the same
+        // published string on every server that did so.
+        crate::channels::refuse_placeholder("game_token", settings.game_token.as_deref())?;
+        if !(1..=64).contains(&settings.max_channel_name_len) {
+            anyhow::bail!("max_channel_name_len must be between 1 and 64");
+        }
+        if settings
+            .game_token
+            .as_ref()
+            .is_some_and(|t| t.chars().count() < crate::state::MIN_TOKEN_LEN)
+        {
+            anyhow::bail!(
+                "game_token is shorter than {} characters, which can be guessed: set a long random one (`openssl rand -hex 32`)",
+                crate::state::MIN_TOKEN_LEN
+            );
+        }
         Ok(settings)
     }
 
@@ -116,7 +132,10 @@ mod tests {
         let mut settings: ServerSettings =
             serde_json::from_str(r#"{"game_token": "   "}"#).unwrap();
         settings.normalise();
-        assert!(settings.game_token.is_none(), "an empty token stayed a token");
+        assert!(
+            settings.game_token.is_none(),
+            "an empty token stayed a token"
+        );
 
         let mut real: ServerSettings = serde_json::from_str(r#"{"game_token": "s3cret"}"#).unwrap();
         real.normalise();
@@ -134,5 +153,26 @@ mod tests {
         assert_eq!(settings.empty_channel_timeout_secs, 600);
         assert_eq!(settings.max_channels, 100);
         assert_eq!(settings.max_channel_name_len, 64);
+    }
+
+    #[test]
+    fn a_preset_placeholder_game_token_is_refused() {
+        let dir = std::env::temp_dir().join(format!("voipc-settings-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server_settings.json");
+        std::fs::write(&path, r#"{"game_token": "<generate>"}"#).unwrap();
+        let err = ServerSettings::load_from_file(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("channels init"), "{err}");
+        // H1-09: a short token is refused at the start, however real
+        std::fs::write(&path, r#"{"game_token": "a-real-token"}"#).unwrap();
+        assert!(ServerSettings::load_from_file(&path)
+            .unwrap_err()
+            .to_string()
+            .contains("shorter than 16"));
+        std::fs::write(&path, r#"{"game_token": "a-real-token-of-length"}"#).unwrap();
+        assert!(ServerSettings::load_from_file(&path).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

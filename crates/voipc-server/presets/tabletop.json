@@ -1,0 +1,63 @@
+{
+  "id": "tabletop",
+  "label": "Tabletop — pen & paper, D&D and co",
+  "summary": "A proximity table the game master can share a map at, a whisper corner, a tavern, and channels for lore and characters.",
+  "notes": [
+    "The Table is a proximity room: arrange the seats around a table in the room view, and the game master shares the map with a screen share."
+  ],
+  "channels": [
+    {
+      "name": "table-talk",
+      "description": "Chat between sessions",
+      "text": true,
+      "auto_join": true
+    },
+    {
+      "name": "sessions",
+      "description": "When we play next, and who can make it",
+      "text": true,
+      "auto_join": true
+    },
+    {
+      "name": "lore-and-handouts",
+      "description": "Maps, letters, lore and session recaps",
+      "text": true
+    },
+    {
+      "name": "characters",
+      "description": "Character sheets, backstories and portraits",
+      "text": true
+    },
+    {
+      "name": "rules-questions",
+      "description": "Rules, rulings and house rules",
+      "text": true
+    },
+    {
+      "name": "gm-notes",
+      "description": "For the game master only",
+      "text": true,
+      "hidden": true,
+      "password": "<generate>"
+    },
+    {
+      "name": "The Table",
+      "description": "The session itself. Everybody sits around the table; the game master can share the map",
+      "proximity": "2d"
+    },
+    {
+      "name": "Second Table",
+      "description": "A second group, or a one-shot",
+      "proximity": "2d"
+    },
+    {
+      "name": "GM Whisper",
+      "description": "Step aside with the game master for something the others must not hear",
+      "max_users": 2
+    },
+    {
+      "name": "Tavern",
+      "description": "Before and after the session, out of character"
+    }
+  ]
+}

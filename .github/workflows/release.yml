@@ -30,24 +30,43 @@ jobs:
   # disagree, and pull the release notes out of the changelog.
   meta:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     outputs:
       version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+      epoch: ${{ steps.v.outputs.epoch }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         # No token left in .git/config for build scripts to find
         with: { persist-credentials: false }
 
       - name: Resolve and verify the version
         id: v
+        env: { REF_TYPE: '${{ github.ref_type }}' }
         run: |
           version=$(grep -m1 '^version' Cargo.toml | sed 's/.*"\(.*\)"/\1/')
-          echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "Cargo.toml version: $version"
 
-          # The server compares client and server version strings for exact
-          # equality, so a release whose tag and tree disagree ships clients
-          # that every server rejects.
-          if [ "${{ github.ref_type }}" = "tag" ]; then
+          # A final release or a release candidate, nothing else: the notes
+          # fallback, the pre-release flag, the website sync and the updater
+          # feeds all read this shape.
+          if ! [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-rc\.[0-9]+)?$ ]]; then
+            echo "::error::version $version is neither X.Y.Z nor X.Y.Z-rc.N"
+            exit 1
+          fi
+          prerelease=false
+          [[ "$version" == *-rc.* ]] && prerelease=true
+          {
+            echo "version=$version"
+            echo "prerelease=$prerelease"
+            # SOURCE_DATE_EPOCH for the builds: the commit's time, so a rebuild
+            # of the same commit stamps the same time.
+            echo "epoch=$(git log -1 --format=%ct)"
+          } >> "$GITHUB_OUTPUT"
+
+          # A release whose tag and tree disagree ships apps that call
+          # themselves something else than the release page says.
+          if [ "$REF_TYPE" = "tag" ]; then
             tag="${GITHUB_REF_NAME#v}"
             if [ "$tag" != "$version" ]; then
               echo "::error::tag v$tag does not match Cargo.toml version $version"
@@ -59,22 +78,53 @@ jobs:
         run: node tools/voipc.mjs version --check
 
       - name: Extract the changelog section
+        env: { version: '${{ steps.v.outputs.version }}' }
         run: |
-          version="${{ steps.v.outputs.version }}"
           # The changelog is hand-written prose and is the release-notes source;
-          # do not generate notes from commit subjects.
-          awk -v v="$version" '
-            $0 ~ "^## \\[" v "\\]" { found=1; next }
-            found && /^## \[/ { exit }
-            found { print }
-          ' CHANGELOG.md > notes.md
+          # do not generate notes from commit subjects. A release candidate
+          # uses its own section if it has one, else the final's: 1.0.0-rc.2
+          # reads "## [1.0.0-rc.2]", then "## [1.0.0]".
+          section() {
+            awk -v v="$1" '
+              $0 ~ "^## \\[" v "\\]" { found=1; next }
+              found && /^## \[/ { exit }
+              found { print }
+            ' CHANGELOG.md
+          }
+          section "$version" > notes.md
+          [ -s notes.md ] || section "${version%%-*}" > notes.md
           if [ ! -s notes.md ]; then
-            echo "::error::no '## [$version]' section found in CHANGELOG.md"
+            echo "::error::no '## [$version]' or '## [${version%%-*}]' section in CHANGELOG.md"
             exit 1
           fi
+
+          # Where the third-party code in the binaries comes from, with its
+          # source (GPL FFmpeg, AGPL libsignal), read from the pins themselves.
+          release=$(sed -n "s/^const FFMPEG_RELEASE = '\(.*\)';/\1/p" tools/tasks/windows-cross.mjs)
+          asset=$(sed -n "s/^const DEFAULT_ASSET = '\(.*\)';/\1/p" tools/tasks/windows-cross.mjs)
+          ffmpeg=$(sed -n 's/^ffmpeg-\(n[^-]*-[0-9]*-g[0-9a-f]*\)-.*/\1/p' <<< "$asset")
+          signal=$(grep -m1 -o 'libsignal?tag=[^"]*' Cargo.lock | sed 's/.*tag=\([^#]*\)#\(.*\)/\1 \2/')
+          if [ -z "$release" ] || [ -z "$ffmpeg" ] || [ -z "$signal" ]; then
+            echo "::error::could not read the FFmpeg or libsignal pin for the notes"
+            exit 1
+          fi
+          read -r signal_tag signal_rev <<< "$signal"
+          cat >> notes.md <<EOF
+
+          ### Third-party code and its source
+          - **FFmpeg** (GPL), in the Windows installer: \`$asset\` from
+            [BtbN/FFmpeg-Builds $release](https://github.com/BtbN/FFmpeg-Builds/releases/tag/$release).
+            Source: [FFmpeg ${ffmpeg}](https://github.com/FFmpeg/FFmpeg/tree/${ffmpeg##*-g}), and the
+            [build scripts at $release](https://github.com/BtbN/FFmpeg-Builds/tree/$release), which pin
+            every library built into it (x264, x265 and the others).
+          - **FFmpeg, x264 and x265** (GPL), in the AppImage: Ubuntu 24.04's packages, whose source is
+            Ubuntu's (\`apt-get source ffmpeg x264 x265\`, or <https://launchpad.net/ubuntu/noble/+source/ffmpeg>).
+          - **libsignal** (AGPL-3.0-only), in every build:
+            [$signal_tag](https://github.com/signalapp/libsignal/tree/$signal_rev).
+          EOF
           cat notes.md
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-notes
           path: notes.md
@@ -85,9 +135,14 @@ jobs:
 
   linux:
     needs: [meta, test]
-    runs-on: ubuntu-24.04   # glibc 2.39, matching Dockerfile.release
+    runs-on: ubuntu-24.04   # glibc 2.39: the AppImage runs on that and newer
+    timeout-minutes: 45
+    env:
+      # The musl server, the web tarball and the wasm are reproducible: the
+      # same commit builds the same bytes (the nightly repro job checks it).
+      SOURCE_DATE_EPOCH: ${{ needs.meta.outputs.epoch }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         # No token left in .git/config for build scripts to find
         with: { persist-credentials: false }
 
@@ -103,19 +158,21 @@ jobs:
             libsoup-3.0-dev librsvg2-dev libayatana-appindicator3-dev \
             libssl-dev libclang-dev musl-tools file
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: client/package-lock.json
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl, wasm32-unknown-unknown
+      - name: Rust toolchain
+        run: rustup toolchain install && rustup target add x86_64-unknown-linux-musl wasm32-unknown-unknown
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: '. -> target'
+
+      - name: Lockfiles match the manifests
+        run: for d in . crates/voipc-web crates/voipc-opus-wasm; do (cd "$d" && cargo fetch --locked); done
 
       - run: npm ci
         working-directory: client
@@ -127,34 +184,53 @@ jobs:
       #
       # The server embeds client/dist-web at compile time, so the web bundle
       # has to exist before the server is built.
+      #
+      # A tag has no inputs, and an empty VITE_DEFAULT_SERVER is not an unset
+      # one: vite inlines the "", and the bundle (and the server embedding it)
+      # is then not what a rebuild makes (BUILDING, "Reproducible builds").
       - name: Build the web client
         env:
           VITE_DEFAULT_SERVER: ${{ inputs.default_server }}
-        run: bash ../tools/ci-run.sh "linux web client" npm run build:web
+        run: |
+          [ -n "$VITE_DEFAULT_SERVER" ] || unset VITE_DEFAULT_SERVER
+          bash ../tools/ci-run.sh "linux web client" npm run build:web
         working-directory: client
 
       - name: Build the server (static musl)
         run: >-
           bash tools/ci-run.sh "linux server"
-          cargo build -p voipc-server --release --target x86_64-unknown-linux-musl
+          cargo build -p voipc-server --release --locked --target x86_64-unknown-linux-musl
 
       - name: Build the desktop client (AppImage + deb)
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1   # appimagetool cannot use FUSE on a runner
           VITE_DEFAULT_SERVER: ${{ inputs.default_server }}
-        run: bash tools/ci-run.sh "linux desktop client" node tools/voipc.mjs build
+        run: |
+          [ -n "$VITE_DEFAULT_SERVER" ] || unset VITE_DEFAULT_SERVER
+          bash tools/ci-run.sh "linux desktop client" node tools/voipc.mjs build
 
       - name: Collect artifacts
+        env:
+          v: ${{ needs.meta.outputs.version }}
+          prerelease: ${{ needs.meta.outputs.prerelease }}
         run: |
-          v="${{ needs.meta.outputs.version }}"
           mkdir -p dist
           cp target/x86_64-unknown-linux-musl/release/voipc-server dist/voipc-server-linux-x86_64
+          # The server runs anywhere, the container image included, only if
+          # nothing is linked dynamically.
+          file dist/voipc-server-linux-x86_64 | tee /dev/stderr | grep -Eq 'statically linked|static-pie linked'
           cp target/release/bundle/appimage/*.AppImage dist/
-          cp target/release/bundle/deb/*.deb dist/
-          tar -czf "dist/VoIPC-web-$v.tar.gz" -C client dist-web
+          # No .deb for a release candidate: dpkg reads "-rc.1" as a Debian
+          # revision and sorts 1.0.0-rc.1 above 1.0.0, so the final would
+          # install as a downgrade. rc testers use the AppImage.
+          if [ "$prerelease" = false ]; then cp target/release/bundle/deb/*.deb dist/; fi
+          # Same bytes for the same commit: names sorted, mtimes, owners and
+          # gzip's own timestamp fixed.
+          tar --sort=name --mtime="@$SOURCE_DATE_EPOCH" --owner=0 --group=0 --numeric-owner \
+            -cf - -C client dist-web | gzip -9n > "dist/VoIPC-web-$v.tar.gz"
           ls -lh dist/
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: linux
           if-no-files-found: error
@@ -174,11 +250,13 @@ jobs:
   windows:
     needs: [meta, test]
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     env:
+      SOURCE_DATE_EPOCH: ${{ needs.meta.outputs.epoch }}
       # Pinned so releases are reproducible and the cache key means something.
       CARGO_XWIN_VERSION: '0.23.1'
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         # No token left in .git/config for build scripts to find
         with: { persist-credentials: false }
 
@@ -194,19 +272,21 @@ jobs:
             clang lld llvm ninja-build cmake nasm protobuf-compiler \
             nsis unzip curl pkg-config libayatana-appindicator3-dev
 
-      - uses: actions/setup-node@v5
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: client/package-lock.json
 
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
+      - name: Rust toolchain
+        run: rustup toolchain install && rustup target add x86_64-pc-windows-msvc
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: '. -> target'
+
+      - name: Lockfiles match the manifests
+        run: for d in . crates/voipc-web crates/voipc-opus-wasm; do (cd "$d" && cargo fetch --locked); done
 
       # restore/save rather than actions/cache, whose post step is
       # `post-if: success()` and therefore saves nothing when the job fails —
@@ -214,32 +294,33 @@ jobs:
       # every single retry.
       - name: Restore cargo-xwin
         id: xwin
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.cargo/bin/cargo-xwin
           key: cargo-xwin-${{ env.CARGO_XWIN_VERSION }}
 
       - name: Install cargo-xwin
         if: steps.xwin.outputs.cache-hit != 'true'
-        run: cargo install --locked cargo-xwin@${{ env.CARGO_XWIN_VERSION }}
+        run: cargo install --locked "cargo-xwin@$CARGO_XWIN_VERSION"
 
       - name: Save cargo-xwin
         if: always() && steps.xwin.outputs.cache-hit != 'true'
         continue-on-error: true
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.cargo/bin/cargo-xwin
           key: cargo-xwin-${{ env.CARGO_XWIN_VERSION }}
 
-      # The prebuilt Windows FFmpeg the task downloads. The key is the asset
-      # name, which is the version pin; setup:windows then checks that
-      # libavcodec really is major 62 before anything is compiled against it.
+      # The prebuilt Windows FFmpeg the task downloads. The task pins the asset
+      # and its SHA-256, so the key is the task file's hash: a new pin is a new
+      # key, and a cached copy is always the pinned one. setup:windows then
+      # checks that libavcodec really is the major ffmpeg-next expects.
       - name: Restore the pinned Windows FFmpeg
         id: ffmpeg
-        uses: actions/cache/restore@v5
+        uses: actions/cache/restore@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.local/share/voipc/ffmpeg-win64
-          key: voipc-ffmpeg-win64-n8.1-gpl-shared
+          key: voipc-ffmpeg-win64-${{ hashFiles('tools/tasks/windows-cross.mjs') }}
 
       - name: Windows toolchain and FFmpeg
         run: bash tools/ci-run.sh "windows setup" node tools/voipc.mjs setup:windows
@@ -247,10 +328,10 @@ jobs:
       - name: Save the pinned Windows FFmpeg
         if: always() && steps.ffmpeg.outputs.cache-hit != 'true'
         continue-on-error: true
-        uses: actions/cache/save@v5
+        uses: actions/cache/save@caa296126883cff596d87d8935842f9db880ef25 # v5.1.0
         with:
           path: ~/.local/share/voipc/ffmpeg-win64
-          key: voipc-ffmpeg-win64-n8.1-gpl-shared
+          key: voipc-ffmpeg-win64-${{ hashFiles('tools/tasks/windows-cross.mjs') }}
 
       # auditImports() fails the build if the exe imports ucrtbased.dll, or any
       # DLL that is neither part of Windows nor bundled beside it — what the old
@@ -258,7 +339,9 @@ jobs:
       - name: Build the client (NSIS)
         env:
           VITE_DEFAULT_SERVER: ${{ inputs.default_server }}
-        run: bash tools/ci-run.sh "windows build" node tools/voipc.mjs build:windows
+        run: |
+          [ -n "$VITE_DEFAULT_SERVER" ] || unset VITE_DEFAULT_SERVER
+          bash tools/ci-run.sh "windows build" node tools/voipc.mjs build:windows
 
       - name: Collect artifacts
         run: |
@@ -266,7 +349,7 @@ jobs:
           cp target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe dist/
           ls -lh dist/
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: windows
           if-no-files-found: error
@@ -275,16 +358,15 @@ jobs:
   # The one thing a Windows runner is still needed for: proving the installer
   # the cross build produced really installs and starts on real Windows.
   #
-  # It reports; it does not gate. Nothing in it has ever run green, and a check
-  # that has never passed should not be able to hold up a release whose
-  # artifacts built and uploaded. Once a run shows it passing, drop
-  # continue-on-error and put it back in publish's needs.
+  # It gates publish: it passed in v0.9.1, v0.10.1 and v0.11.0 with no
+  # annotations, so an installer that does not install or start holds up the
+  # release.
   windows-smoke:
     needs: windows
     runs-on: windows-2025
-    continue-on-error: true
+    timeout-minutes: 15
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           name: windows
           path: dist
@@ -362,133 +444,239 @@ jobs:
             Note 'warning' "could not launch $exe on this runner: $_"
           }
 
+  # Built unsigned: the signing key never sits on a machine that runs npm,
+  # cargo or Gradle build code. The sign job signs it.
   android:
     needs: [meta, test]
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      SOURCE_DATE_EPOCH: ${{ needs.meta.outputs.epoch }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         # No token left in .git/config for build scripts to find
         with: { persist-credentials: false }
 
-      - name: Check the signing secrets are configured
-        id: signing
-        env:
-          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-        run: |
-          if [ -n "$KEYSTORE" ]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-            echo "::warning::ANDROID_KEYSTORE_BASE64 is not set — skipping the Android build."
-          fi
-
-      - uses: actions/setup-java@v5
-        if: steps.signing.outputs.ready == 'true'
+      - uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
         with:
           distribution: temurin
           java-version: 21
 
-      - uses: actions/setup-node@v5
-        if: steps.signing.outputs.ready == 'true'
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
           node-version: 22
           cache: npm
           cache-dependency-path: client/package-lock.json
 
-      - uses: dtolnay/rust-toolchain@stable
-        if: steps.signing.outputs.ready == 'true'
-        with:
-          targets: aarch64-linux-android
+      - name: Rust toolchain
+        run: rustup toolchain install && rustup target add aarch64-linux-android
 
-      - uses: Swatinem/rust-cache@v2
-        if: steps.signing.outputs.ready == 'true'
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: '. -> target'
+
+      - name: Lockfiles match the manifests
+        run: for d in . crates/voipc-web crates/voipc-opus-wasm; do (cd "$d" && cargo fetch --locked); done
+
+      # The committed gradle-wrapper.jar runs first in the Gradle build; it
+      # must be one Gradle published.
+      - uses: gradle/actions/wrapper-validation@3f5f9adaf7d9fecd50b5935e54106014257a94e6 # v6.4.0
 
       # ANDROID_HOME is set on the runner machine, not in the workflow `env`
       # context, so the NDK path is exported through GITHUB_ENV for later steps.
       - name: Install the Android NDK
-        if: steps.signing.outputs.ready == 'true'
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y --no-install-recommends cmake protobuf-compiler
           "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;28.0.13004108"
           echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/28.0.13004108" >> "$GITHUB_ENV"
 
-      # build.gradle.kts reads keystore.properties from the repo root and
-      # resolves storeFile relative to that file, so both land side by side.
-      - name: Reconstruct the signing keystore
-        if: steps.signing.outputs.ready == 'true'
+      - name: Build the unsigned APK
+        env:
+          VITE_DEFAULT_SERVER: ${{ inputs.default_server }}
+        run: |
+          [ -n "$VITE_DEFAULT_SERVER" ] || unset VITE_DEFAULT_SERVER
+          bash tools/ci-run.sh "android build" node tools/voipc.mjs android release --unsigned --target aarch64
+
+      - name: Collect artifacts
+        env: { v: '${{ needs.meta.outputs.version }}' }
+        run: |
+          mkdir -p dist
+          cp release/VoIPC-android-release.apk "dist/VoIPC-android-$v-unsigned.apk"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: android
+          if-no-files-found: error
+          path: dist/*
+
+  # Signs what the build jobs made, in a job that runs none of their code: no
+  # npm, cargo or Gradle build script is on this machine while the keys are.
+  # The keys live in the `release` environment, which asks a reviewer first
+  # and deploys only from v* tags and main (repository settings). Tags only:
+  # a dispatch rehearses the builds, not the signing.
+  #
+  # - The APK: apksigner from the runner's build-tools, and its certificate
+  #   must be the one every earlier VoIPC APK carried, so a swapped secret
+  #   fails here instead of shipping an APK that cannot update the app.
+  # - The desktop updater: the AppImage and the NSIS installer themselves
+  #   (Tauri v2 updates from the bundle), signed for their version
+  #   (--app-version; the app sets requireSignedVersion), and latest.json, the
+  #   feed client/src-tauri/src/updater.rs reads.
+  sign:
+    needs: [meta, linux, windows, android]
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: release
+    env:
+      v: ${{ needs.meta.outputs.version }}
+      # apksigner verify --print-certs of v0.10.1 and v0.11.0
+      ANDROID_CERT_SHA256: 30d71722fe2bdd4bafc34fdaf5be34071f5dfaa399823237c7ae4ab7778a0fe9
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with: { persist-credentials: false }
+
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          path: artifacts
+
+      - name: The signing secrets are there
+        env:
+          KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          UPDATER_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+        run: |
+          [ -n "$KEYSTORE" ] || { echo "::error::ANDROID_KEYSTORE_BASE64 is not set in the release environment"; exit 1; }
+          [ -n "$UPDATER_KEY" ] || { echo "::error::TAURI_SIGNING_PRIVATE_KEY is not set in the release environment"; exit 1; }
+
+      - name: Sign the APK
         env:
           KEYSTORE: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           STORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          echo "$KEYSTORE" | base64 -d > voipc-release.jks
-          # A .properties file is read by java.util.Properties, which treats a
-          # backslash as an escape — an unescaped one in a password silently
-          # produces a different string and Gradle reports "keystore password
-          # was incorrect".
-          esc() { printf '%s' "$1" | sed 's/\\/\\\\/g'; }
-          {
-            echo "storeFile=voipc-release.jks"
-            echo "storePassword=$(esc "$STORE_PASSWORD")"
-            echo "keyAlias=$(esc "$KEY_ALIAS")"
-            echo "keyPassword=$(esc "$KEY_PASSWORD")"
-          } > keystore.properties
+          bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          ks="$RUNNER_TEMP/release.jks"
+          trap 'rm -f "$ks"' EXIT
+          echo "$KEYSTORE" | base64 -d > "$ks"
+          mkdir -p signed
+          # Gradle zip-aligns a release APK whether it signs it or not.
+          # apksigner re-aligns native libraries itself (--lib-page-alignment,
+          # 16 KB by default), so this checks what Gradle built.
+          "$bt/zipalign" -c -P 16 4 "artifacts/android/VoIPC-android-$v-unsigned.apk"
+          # No v4 signing: it writes a .idsig beside --out, which would ship.
+          "$bt/apksigner" sign --ks "$ks" --ks-pass env:STORE_PASSWORD \
+            --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASSWORD --v4-signing-enabled false \
+            --out "signed/VoIPC-android-$v.apk" "artifacts/android/VoIPC-android-$v-unsigned.apk"
+          "$bt/apksigner" verify --print-certs "signed/VoIPC-android-$v.apk" | tee certs.txt
+          # Label-free: build-tools 37 prints "V2 Signer: certificate …", older
+          # ones "Signer #1 certificate …". Exactly one certificate, the pin.
+          digests=$(sed -n 's/.*certificate SHA-256 digest: \([0-9a-f]\{64\}\)$/\1/p' certs.txt | sort -u)
+          if [ "$digests" != "$ANDROID_CERT_SHA256" ]; then
+            echo "::error::the APK is not signed with VoIPC's release certificate"
+            exit 1
+          fi
 
-      - name: Build the signed APK
-        if: steps.signing.outputs.ready == 'true'
-        env:
-          VITE_DEFAULT_SERVER: ${{ inputs.default_server }}
-        run: >-
-          bash tools/ci-run.sh "android build"
-          node tools/voipc.mjs android release --target aarch64
-
-      - name: Remove the signing material
-        if: always() && steps.signing.outputs.ready == 'true'
-        run: rm -f voipc-release.jks keystore.properties
-
-      - name: Collect artifacts
-        if: steps.signing.outputs.ready == 'true'
-        run: |
-          v="${{ needs.meta.outputs.version }}"
-          mkdir -p dist
-          cp release/VoIPC-android-release.apk "dist/VoIPC-android-$v.apk"
-
-      - uses: actions/upload-artifact@v7
-        if: steps.signing.outputs.ready == 'true'
+      - uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444 # v5.0.0
         with:
-          name: android
+          node-version: 22
+
+      # The Tauri CLI at the version the lockfile pins, with no install
+      # scripts run.
+      - run: npm ci --ignore-scripts
+        working-directory: client
+
+      - name: Sign the desktop updates and write latest.json
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+          EPOCH: ${{ needs.meta.outputs.epoch }}
+        run: |
+          appimage=$(cd artifacts/linux && ls *.AppImage)
+          setup=$(cd artifacts/windows && ls *-setup.exe)
+          # signer sign takes any key, but the app installs only what its own
+          # pubkey verifies: a wrong secret would ship a release that never
+          # updates. The key id, in the pubkey and in a .sig alike: decode the
+          # base64 file, then its second line; bytes 2..10, little-endian.
+          keyid() { python3 -c 'import base64,sys; print(base64.b64decode(base64.b64decode(sys.stdin.read()).splitlines()[1])[2:10][::-1].hex().upper())'; }
+          want=$(jq -r .plugins.updater.pubkey client/src-tauri/tauri.conf.json | keyid)
+          for f in "artifacts/linux/$appimage" "artifacts/windows/$setup"; do
+            (cd client && npx tauri signer sign --app-version "$v" "../$f")
+            got=$(keyid < "$f.sig")
+            if [ -z "$want" ] || [ "$got" != "$want" ]; then
+              echo "::error::$f is signed with updater key '$got', but the app trusts '$want' (tauri.conf.json): TAURI_SIGNING_PRIVATE_KEY is the wrong key"
+              exit 1
+            fi
+            cp "$f.sig" signed/
+          done
+          protocol=$(sed -n 's/^pub const PROTOCOL_VERSION: u32 = \([0-9]*\);/\1/p' crates/voipc-protocol/src/codec.rs)
+          [ -n "$protocol" ] || { echo "::error::PROTOCOL_VERSION not found"; exit 1; }
+          base="https://github.com/$GITHUB_REPOSITORY/releases/download/v$v"
+          # The keys the updater plugin looks up first: {os}-{arch}-{bundle}.
+          jq -n --arg version "$v" --rawfile notes artifacts/release-notes/notes.md \
+            --arg pub_date "$(date -u -d "@$EPOCH" +%Y-%m-%dT%H:%M:%SZ)" --argjson protocol "$protocol" \
+            --arg lurl "$base/$appimage" --rawfile lsig "artifacts/linux/$appimage.sig" \
+            --arg wurl "$base/$setup" --rawfile wsig "artifacts/windows/$setup.sig" \
+            '{version: $version, notes: $notes, pub_date: $pub_date, protocol: $protocol,
+              platforms: {"linux-x86_64-appimage": {url: $lurl, signature: $lsig},
+                          "windows-x86_64-nsis": {url: $wurl, signature: $wsig}}}' > signed/latest.json
+          cat signed/latest.json
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: signed
           if-no-files-found: error
-          path: dist/*
+          path: signed/*
 
   publish:
     # test too: a red gate skips the builds, which always() alone would
     # still turn into an empty draft
-    needs: [meta, test, linux, windows, android]
+    needs: [meta, test, linux, windows, windows-smoke, android, sign]
     # Publish whatever built, as long as nothing outright failed.
     if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # id-token and attestations only here, where nothing but pinned actions
+    # runs: in a build job a hostile dependency could attest anything.
     permissions:
       contents: write
+      id-token: write
+      attestations: write
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
 
-      - name: Flatten the artifacts
+      # The APK goes out signed or not at all: from `signed`, never the
+      # unsigned build. SHA256SUMS covers everything, the .sig files too.
+      - name: Collect and checksum the release files
         run: |
           mkdir -p dist
-          find artifacts -type f ! -name notes.md -exec cp {} dist/ \;
-          ls -lh dist/
+          for d in linux windows signed; do
+            if [ -d "artifacts/$d" ]; then cp "artifacts/$d"/* dist/; fi
+          done
+          cd dist
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
 
+      # Provenance for every file: `gh attestation verify <file> --repo
+      # luki4fun/voipc` proves it was built here, from this tag (SECURITY.md).
+      - name: Attest the release files
+        if: github.ref_type == 'tag'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
+      # A release candidate is a pre-release and never "latest": the stable
+      # updater feed and every /releases/latest link follow "latest".
       - name: Create the draft release
         if: github.ref_type == 'tag'
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           draft: true
+          prerelease: ${{ needs.meta.outputs.prerelease }}
+          make_latest: ${{ needs.meta.outputs.prerelease == 'false' }}
           name: v${{ needs.meta.outputs.version }}
           body_path: artifacts/release-notes/notes.md
           files: dist/*

@@ -32,6 +32,12 @@ use crate::app_state::{AppState, PttBinding, VoiceMode};
 #[cfg(not(target_os = "android"))]
 use crate::commands;
 
+/// Why global keys fail on Linux, as the player is told it.
+#[cfg(not(target_os = "android"))]
+const LINUX_KEYS_REASON: &str = "VoIPC cannot read the keyboard while it is in the background. \
+     On Wayland that needs read access to the input devices: \
+     `sudo usermod -aG input $USER`, then log out and back in.";
+
 #[cfg(not(target_os = "android"))]
 /// Spawn a background thread that monitors global keyboard events and triggers
 /// PTT start/stop. Keys are NOT consumed — they still propagate to all applications.
@@ -67,9 +73,24 @@ pub fn spawn_listener(
                 "Global PTT: evdev unavailable (tip: 'sudo usermod -aG input $USER' \
                  for Wayland support). Falling back to X11..."
             );
+            // Under XWayland the X11 fallback starts without an error, so the
+            // toast below never fires — yet it hears keys only while an X11
+            // window has focus, which on a Wayland desktop is almost never (H4-13).
+            if std::env::var_os("WAYLAND_DISPLAY").is_some() {
+                let _ = handle.emit(
+                    "global-keys-unavailable",
+                    serde_json::json!({ "reason": LINUX_KEYS_REASON }),
+                );
+            }
         }
 
-        run_rdev_loop(handle, ptt_binding, ptt_hold_mode, mute_binding, deafen_binding);
+        run_rdev_loop(
+            handle,
+            ptt_binding,
+            ptt_hold_mode,
+            mute_binding,
+            deafen_binding,
+        );
     });
 }
 
@@ -172,22 +193,55 @@ fn js_code_to_rdev_key(code: &str) -> Option<rdev::Key> {
     }
 }
 
+/// Opens and closes the microphone in the order the key moved.
+///
+/// The listener loops used to spawn a task per press and per release, and
+/// nothing ordered the two: on a quick tap the release could take the lock
+/// first, find nothing to stop, and the press would then open the mic with no
+/// key held. One worker draining one queue keeps them in order.
+#[cfg(not(target_os = "android"))]
+fn spawn_ptt_worker(handle: tauri::AppHandle) -> tokio::sync::mpsc::UnboundedSender<bool> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<bool>();
+    tauri::async_runtime::spawn(async move {
+        while let Some(pressed) = rx.recv().await {
+            let state = handle.state::<AppState>();
+            if pressed {
+                // Not in a call is not an error to log: the key is an
+                // ordinary key everywhere else on the desktop.
+                if VoiceMode::from_u8(state.voice_mode.load(Ordering::Relaxed)) != VoiceMode::Ptt
+                    || state.voice_id().is_none()
+                {
+                    continue;
+                }
+                match commands::do_start_transmit(&state, handle.clone()).await {
+                    Ok(()) => {
+                        let _ = handle.emit("ptt-global-pressed", ());
+                    }
+                    Err(e) => tracing::warn!("Global PTT start failed: {e}"),
+                }
+            } else {
+                match commands::do_stop_transmit(&state).await {
+                    Ok(()) => {
+                        let _ = handle.emit("ptt-global-released", ());
+                    }
+                    Err(e) => tracing::warn!("Global PTT stop failed: {e}"),
+                }
+            }
+        }
+    });
+    tx
+}
+
 #[cfg(not(target_os = "android"))]
 fn rdev_binding_matches(held: &HashSet<rdev::Key>, binding: &PttBinding) -> bool {
     use rdev::Key;
-    if binding.ctrl
-        && !held.contains(&Key::ControlLeft)
-        && !held.contains(&Key::ControlRight)
-    {
+    if binding.ctrl && !held.contains(&Key::ControlLeft) && !held.contains(&Key::ControlRight) {
         return false;
     }
     if binding.alt && !held.contains(&Key::Alt) && !held.contains(&Key::AltGr) {
         return false;
     }
-    if binding.shift
-        && !held.contains(&Key::ShiftLeft)
-        && !held.contains(&Key::ShiftRight)
-    {
+    if binding.shift && !held.contains(&Key::ShiftLeft) && !held.contains(&Key::ShiftRight) {
         return false;
     }
     if let Some(target) = js_code_to_rdev_key(&binding.code) {
@@ -203,23 +257,18 @@ fn rdev_binding_held(held: &HashSet<rdev::Key>, binding: &PttBinding) -> bool {
     if !binding.ctrl && !binding.alt && !binding.shift {
         return rdev_binding_matches(held, binding);
     }
-    if binding.ctrl
-        && !held.contains(&Key::ControlLeft)
-        && !held.contains(&Key::ControlRight)
-    {
+    if binding.ctrl && !held.contains(&Key::ControlLeft) && !held.contains(&Key::ControlRight) {
         return false;
     }
     if binding.alt && !held.contains(&Key::Alt) && !held.contains(&Key::AltGr) {
         return false;
     }
-    if binding.shift
-        && !held.contains(&Key::ShiftLeft)
-        && !held.contains(&Key::ShiftRight)
-    {
+    if binding.shift && !held.contains(&Key::ShiftLeft) && !held.contains(&Key::ShiftRight) {
         return false;
     }
-    // All required modifiers held — also verify the main key is still held
-    rdev_binding_matches(held, binding)
+    // Hold mode: the modifiers alone keep it open once the trigger started
+    // it, as the window's own keys do (VoiceKeys.svelte `shouldStopPtt`)
+    true
 }
 
 #[cfg(not(target_os = "android"))]
@@ -234,6 +283,7 @@ fn run_rdev_loop(
     let mut ptt_active = false;
     let mut mute_active = false;
     let mut deafen_active = false;
+    let ptt = spawn_ptt_worker(handle.clone());
     // The callback takes the handle; this copy is for the failure below.
     let on_failure = handle.clone();
 
@@ -263,23 +313,7 @@ fn run_rdev_loop(
 
                 if matches && !ptt_active {
                     ptt_active = true;
-                    let h = handle.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let state = h.state::<AppState>();
-                        // Not in a call is not an error to log: the key is
-                        // an ordinary key everywhere else on the desktop.
-                        if VoiceMode::from_u8(state.voice_mode.load(Ordering::Relaxed))
-                            != VoiceMode::Ptt
-                            || state.voice_id().is_none()
-                        {
-                            return;
-                        }
-                        if let Err(e) = commands::do_start_transmit(&state, h.clone()).await {
-                            tracing::warn!("Global PTT start failed: {e}");
-                        } else {
-                            let _ = h.emit("ptt-global-pressed", ());
-                        }
-                    });
+                    let _ = ptt.send(true);
                 }
             }
             rdev::EventType::KeyRelease(key) => {
@@ -296,15 +330,7 @@ fn run_rdev_loop(
 
                 if !still && ptt_active {
                     ptt_active = false;
-                    let h = handle.clone();
-                    tauri::async_runtime::spawn(async move {
-                        let state = h.state::<AppState>();
-                        if let Err(e) = commands::do_stop_transmit(&state).await {
-                            tracing::warn!("Global PTT stop failed: {e}");
-                        } else {
-                            let _ = h.emit("ptt-global-released", ());
-                        }
-                    });
+                    let _ = ptt.send(false);
                 }
             }
             _ => {} // Ignore mouse events, etc.
@@ -326,9 +352,7 @@ fn run_rdev_loop(
             "global-keys-unavailable",
             serde_json::json!({
                 "reason": if cfg!(target_os = "linux") {
-                    "VoIPC cannot read the keyboard while it is in the background. \
-                     On Wayland that needs read access to the input devices: \
-                     `sudo usermod -aG input $USER`, then log out and back in."
+                    LINUX_KEYS_REASON
                 } else {
                     "VoIPC cannot read the keyboard while it is in the background."
                 },
@@ -421,21 +445,13 @@ fn js_code_to_evdev_key(code: &str) -> Option<evdev::Key> {
 #[cfg(target_os = "linux")]
 fn evdev_binding_matches(held: &HashSet<evdev::Key>, binding: &PttBinding) -> bool {
     use evdev::Key;
-    if binding.ctrl
-        && !held.contains(&Key::KEY_LEFTCTRL)
-        && !held.contains(&Key::KEY_RIGHTCTRL)
-    {
+    if binding.ctrl && !held.contains(&Key::KEY_LEFTCTRL) && !held.contains(&Key::KEY_RIGHTCTRL) {
         return false;
     }
-    if binding.alt
-        && !held.contains(&Key::KEY_LEFTALT)
-        && !held.contains(&Key::KEY_RIGHTALT)
-    {
+    if binding.alt && !held.contains(&Key::KEY_LEFTALT) && !held.contains(&Key::KEY_RIGHTALT) {
         return false;
     }
-    if binding.shift
-        && !held.contains(&Key::KEY_LEFTSHIFT)
-        && !held.contains(&Key::KEY_RIGHTSHIFT)
+    if binding.shift && !held.contains(&Key::KEY_LEFTSHIFT) && !held.contains(&Key::KEY_RIGHTSHIFT)
     {
         return false;
     }
@@ -452,26 +468,19 @@ fn evdev_binding_held(held: &HashSet<evdev::Key>, binding: &PttBinding) -> bool 
     if !binding.ctrl && !binding.alt && !binding.shift {
         return evdev_binding_matches(held, binding);
     }
-    if binding.ctrl
-        && !held.contains(&Key::KEY_LEFTCTRL)
-        && !held.contains(&Key::KEY_RIGHTCTRL)
+    if binding.ctrl && !held.contains(&Key::KEY_LEFTCTRL) && !held.contains(&Key::KEY_RIGHTCTRL) {
+        return false;
+    }
+    if binding.alt && !held.contains(&Key::KEY_LEFTALT) && !held.contains(&Key::KEY_RIGHTALT) {
+        return false;
+    }
+    if binding.shift && !held.contains(&Key::KEY_LEFTSHIFT) && !held.contains(&Key::KEY_RIGHTSHIFT)
     {
         return false;
     }
-    if binding.alt
-        && !held.contains(&Key::KEY_LEFTALT)
-        && !held.contains(&Key::KEY_RIGHTALT)
-    {
-        return false;
-    }
-    if binding.shift
-        && !held.contains(&Key::KEY_LEFTSHIFT)
-        && !held.contains(&Key::KEY_RIGHTSHIFT)
-    {
-        return false;
-    }
-    // All required modifiers held — also verify the main key is still held
-    evdev_binding_matches(held, binding)
+    // Hold mode: the modifiers alone keep it open once the trigger started
+    // it, as the window's own keys do (VoiceKeys.svelte `shouldStopPtt`)
+    true
 }
 
 #[cfg(target_os = "linux")]
@@ -481,7 +490,7 @@ fn find_evdev_keyboards() -> Vec<evdev::Device> {
         .filter_map(|(path, dev)| {
             if dev
                 .supported_keys()
-                .map_or(false, |keys| keys.contains(Key::KEY_SPACE))
+                .is_some_and(|keys| keys.contains(Key::KEY_SPACE))
             {
                 tracing::debug!("Global PTT: found keyboard {:?}", path);
                 Some(dev)
@@ -506,9 +515,7 @@ fn run_evdev_loop(
 
     let mut mute_active = false;
     let mut deafen_active = false;
-    let update_toggles = |held: &HashSet<Key>,
-                          mute_active: &mut bool,
-                          deafen_active: &mut bool| {
+    let update_toggles = |held: &HashSet<Key>, mute_active: &mut bool, deafen_active: &mut bool| {
         let m = mute_binding.read().unwrap_or_else(|p| p.into_inner());
         let m_match = m.as_ref().is_some_and(|b| evdev_binding_matches(held, b));
         drop(m);
@@ -517,6 +524,16 @@ fn run_evdev_loop(
         let d_match = d.as_ref().is_some_and(|b| evdev_binding_matches(held, b));
         drop(d);
         check_toggle_hotkey(handle, d_match, deafen_active, "toggle-deafen-request");
+    };
+
+    // Is the PTT binding still down, by the rule of the current mode?
+    let ptt_still_held = |held: &HashSet<Key>| {
+        let b = ptt_binding.read().unwrap_or_else(|p| p.into_inner());
+        if ptt_hold_mode.load(Ordering::Relaxed) {
+            evdev_binding_held(held, &b)
+        } else {
+            evdev_binding_matches(held, &b)
+        }
     };
 
     // Set all devices to non-blocking mode via fcntl
@@ -528,6 +545,7 @@ fn run_evdev_loop(
 
     let mut held_keys: HashSet<Key> = HashSet::new();
     let mut ptt_active = false;
+    let ptt = spawn_ptt_worker(handle.clone());
     let mut last_enum = std::time::Instant::now();
     let mut needs_reenumerate = false;
     // fds that returned ENODEV this iteration (device unplugged)
@@ -559,80 +577,31 @@ fn run_evdev_loop(
                                 1 => {
                                     // Key press
                                     held_keys.insert(key);
-                                    update_toggles(&held_keys, &mut mute_active, &mut deafen_active);
+                                    update_toggles(
+                                        &held_keys,
+                                        &mut mute_active,
+                                        &mut deafen_active,
+                                    );
                                     let b = ptt_binding.read().unwrap_or_else(|p| p.into_inner());
-                                    let matches =
-                                        evdev_binding_matches(&held_keys, &b);
+                                    let matches = evdev_binding_matches(&held_keys, &b);
                                     drop(b);
 
                                     if matches && !ptt_active {
                                         ptt_active = true;
-                                        let h = handle.clone();
-                                        tauri::async_runtime::spawn(async move {
-                                            let state = h.state::<AppState>();
-                                            // As in the rdev loop: not in a
-                                            // call, the key is just a key
-                                            if VoiceMode::from_u8(
-                                                state.voice_mode.load(Ordering::Relaxed),
-                                            ) != VoiceMode::Ptt
-                                                || state.voice_id().is_none()
-                                            {
-                                                return;
-                                            }
-                                            if let Err(e) =
-                                                commands::do_start_transmit(
-                                                    &state,
-                                                    h.clone(),
-                                                )
-                                                .await
-                                            {
-                                                tracing::warn!(
-                                                    "Global PTT start failed: {e}"
-                                                );
-                                            } else {
-                                                let _ = h.emit(
-                                                    "ptt-global-pressed",
-                                                    (),
-                                                );
-                                            }
-                                        });
+                                        let _ = ptt.send(true);
                                     }
                                 }
                                 0 => {
                                     // Key release
                                     held_keys.remove(&key);
-                                    update_toggles(&held_keys, &mut mute_active, &mut deafen_active);
-                                    let b = ptt_binding.read().unwrap_or_else(|p| p.into_inner());
-                                    let hold =
-                                        ptt_hold_mode.load(Ordering::Relaxed);
-                                    let still = if hold {
-                                        evdev_binding_held(&held_keys, &b)
-                                    } else {
-                                        evdev_binding_matches(&held_keys, &b)
-                                    };
-                                    drop(b);
-
-                                    if !still && ptt_active {
+                                    update_toggles(
+                                        &held_keys,
+                                        &mut mute_active,
+                                        &mut deafen_active,
+                                    );
+                                    if !ptt_still_held(&held_keys) && ptt_active {
                                         ptt_active = false;
-                                        let h = handle.clone();
-                                        tauri::async_runtime::spawn(async move {
-                                            let state = h.state::<AppState>();
-                                            if let Err(e) =
-                                                commands::do_stop_transmit(
-                                                    &state,
-                                                )
-                                                .await
-                                            {
-                                                tracing::warn!(
-                                                    "Global PTT stop failed: {e}"
-                                                );
-                                            } else {
-                                                let _ = h.emit(
-                                                    "ptt-global-released",
-                                                    (),
-                                                );
-                                            }
-                                        });
+                                        let _ = ptt.send(false);
                                     }
                                 }
                                 _ => {} // Repeat (2), ignore
@@ -656,22 +625,10 @@ fn run_evdev_loop(
         // Drop unplugged devices now. Keeping a dead fd makes poll() return
         // immediately (POLLHUP) forever: 100% CPU and a log line per spin
         // until a replacement keyboard shows up.
+        let mut devices_changed = !dead_fds.is_empty();
         if !dead_fds.is_empty() {
             devices.retain(|d| !dead_fds.contains(&d.as_raw_fd()));
             dead_fds.clear();
-            if devices.is_empty() && ptt_active {
-                // The key can never be released now — don't leave the mic open
-                ptt_active = false;
-                let h = handle.clone();
-                tauri::async_runtime::spawn(async move {
-                    let state = h.state::<AppState>();
-                    if let Err(e) = commands::do_stop_transmit(&state).await {
-                        tracing::warn!("Global PTT stop after device loss failed: {e}");
-                    } else {
-                        let _ = h.emit("ptt-global-released", ());
-                    }
-                });
-            }
         }
 
         // Re-enumerate keyboards on device removal or every 30s (handles hotplug)
@@ -685,9 +642,28 @@ fn run_evdev_loop(
                     }
                 }
                 tracing::debug!("Re-enumerated {} keyboard devices", devices.len());
+                devices_changed = true;
             }
             needs_reenumerate = false;
             last_enum = std::time::Instant::now();
+        }
+
+        // A release can go missing with a device: a second keyboard unplugged
+        // while the key is down, or a release queued on an fd the re-scan just
+        // replaced. Either leaves the microphone open until the key is pressed
+        // again, so ask the kernel what is down now instead (H4-06). No
+        // keyboard left reads as nothing held, which lets go too.
+        if devices_changed {
+            held_keys = devices
+                .iter()
+                .filter_map(|d| d.get_key_state().ok())
+                .flat_map(|keys| keys.iter().collect::<Vec<_>>())
+                .collect();
+            update_toggles(&held_keys, &mut mute_active, &mut deafen_active);
+            if ptt_active && !ptt_still_held(&held_keys) {
+                ptt_active = false;
+                let _ = ptt.send(false);
+            }
         }
     }
 }
@@ -706,21 +682,24 @@ mod tests {
         }
     }
 
-    // ── rdev_binding_held must require main key, not just modifiers ──
+    // ── Hold mode: the modifiers keep it open, only the full combo opens it ──
 
     #[test]
-    fn rdev_held_requires_main_key() {
+    fn rdev_hold_mode_keeps_ptt_while_the_modifier_is_held() {
         use rdev::Key;
         // Binding: Ctrl+Space
         let b = binding("Space", true, false, false);
 
-        // Only Ctrl held (no Space) → must be false (was the ghost-PTT bug)
+        // Space released, Ctrl still down: still talking ("Hold modifier to
+        // talk" in the settings) — but Ctrl alone never starts it, because
+        // the press path asks `matches`, not `held`
         let held: HashSet<Key> = [Key::ControlLeft].into();
-        assert!(!rdev_binding_held(&held, &b));
-
-        // Ctrl + Space both held → true
-        let held: HashSet<Key> = [Key::ControlLeft, Key::Space].into();
         assert!(rdev_binding_held(&held, &b));
+        assert!(!rdev_binding_matches(&held, &b));
+
+        // Ctrl released: stop
+        let held: HashSet<Key> = [Key::Space].into();
+        assert!(!rdev_binding_held(&held, &b));
     }
 
     #[test]
@@ -751,16 +730,15 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn evdev_held_requires_main_key() {
+    fn evdev_hold_mode_keeps_ptt_while_the_modifier_is_held() {
         use evdev::Key;
         let b = binding("Space", true, false, false);
 
-        // Only Ctrl held → false
         let held: HashSet<Key> = [Key::KEY_LEFTCTRL].into();
-        assert!(!evdev_binding_held(&held, &b));
-
-        // Ctrl + Space → true
-        let held: HashSet<Key> = [Key::KEY_LEFTCTRL, Key::KEY_SPACE].into();
         assert!(evdev_binding_held(&held, &b));
+        assert!(!evdev_binding_matches(&held, &b));
+
+        let held: HashSet<Key> = [Key::KEY_SPACE].into();
+        assert!(!evdev_binding_held(&held, &b));
     }
 }

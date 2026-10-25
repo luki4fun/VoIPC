@@ -140,7 +140,7 @@
     <div class="divider"></div>
 
     <div class="control-group">
-      <button
+      <button aria-label="Mute" aria-pressed={$isMuted}
         class="icon-btn"
         class:active-danger={$isMuted}
         onclick={toggleMute}
@@ -149,7 +149,7 @@
         <Icon name={$isMuted ? "mic-off" : "mic-on"} size={18} />
       </button>
 
-      <button
+      <button aria-label="Deafen" aria-pressed={$isDeafened}
         class="icon-btn"
         class:active-danger={$isDeafened}
         onclick={toggleDeafen}
@@ -158,7 +158,7 @@
         <Icon name={$isDeafened ? "headphones-off" : "headphones-on"} size={18} />
       </button>
 
-      <button
+      <button aria-label="Noise suppression" aria-pressed={$noiseSuppression}
         class="icon-btn"
         class:active-success={$noiseSuppression}
         class:ns-off={!$noiseSuppression}
@@ -169,7 +169,7 @@
       </button>
 
       {#if $isMobile}
-        <button
+        <button aria-label="Speaker" aria-pressed={$speakerMode}
           class="icon-btn"
           class:active-success={$speakerMode}
           class:ns-off={!$speakerMode}
@@ -204,7 +204,7 @@
       </button>
 
       <!-- Out of the voice channel, still on the server: stores/voice.ts -->
-      <button class="icon-btn leave-voice-btn" onclick={leaveVoice} title="Leave voice">
+      <button aria-label="Leave voice" class="icon-btn leave-voice-btn" onclick={leaveVoice} title="Leave voice">
         <Icon name="disconnect" size={18} />
       </button>
     </div>

@@ -49,7 +49,10 @@ fn decodes(codec: VideoCodec, fixture: &[u8]) {
             decoded += 1;
         }
     }
-    assert!(decoded >= 5, "{codec:?}: only {decoded} of 6 frames came out");
+    assert!(
+        decoded >= 5,
+        "{codec:?}: only {decoded} of 6 frames came out"
+    );
 }
 
 #[test]

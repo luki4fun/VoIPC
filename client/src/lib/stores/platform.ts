@@ -82,6 +82,13 @@ if (typeof window !== 'undefined') {
       void toggleDeafen();
     };
 
+    // The microphone was granted on joining (MainActivity asks then, not at
+    // start). The capture the join opened before the answer failed; closing
+    // it lets voice activation open it again, now with the permission.
+    (window as any).__voipc_mic_granted = () => {
+      void stopTransmit();
+    };
+
     // Permission denial feedback from MainActivity
     (window as any).__voipc_permission_denied = (permission: string) => {
       if (permission === 'RECORD_AUDIO') {

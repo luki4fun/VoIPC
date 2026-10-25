@@ -40,8 +40,9 @@ async function startAppearance(loadOwnConfig = false) {
   }
 }
 
-if (__WEB__ && params.has("selftest")) {
-  // Headless end-to-end test of the web client (see test-web.sh); web build only
+if (__SELFTEST__ && params.has("selftest")) {
+  // Headless end-to-end test of the web client (see test-web.sh); test builds
+  // only — in a release a crafted link would otherwise drive a hidden session
   import("./web/selftest").then((m) => m.run(params));
 } else if (params.get("popout") === "screenshare") {
   startAppearance(true);

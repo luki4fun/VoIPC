@@ -4,10 +4,30 @@ use std::path::Path;
 use anyhow::{bail, Context};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 use tracing::info;
 use voipc_protocol::types::ProximityMode;
 
 const SHA256_PREFIX: &str = "sha256:";
+const ARGON2_PREFIX: &str = "$argon2id$";
+
+/// What a preset writes where a secret belongs. `voipc-server channels init`
+/// replaces it with a fresh one; a file that still carries it was copied by
+/// hand, and starting with it would hand every server that did so the same
+/// password — so it is refused instead.
+pub const PRESET_PLACEHOLDER: &str = "<generate>";
+
+/// Refuses a secret that is still the preset's placeholder; `what` names it.
+pub fn refuse_placeholder(what: &str, value: Option<&str>) -> anyhow::Result<()> {
+    if value == Some(PRESET_PLACEHOLDER) {
+        bail!("{what} is still the preset placeholder {PRESET_PLACEHOLDER:?}: set a real one, or write the file with `voipc-server channels init`");
+    }
+    Ok(())
+}
+
+/// The longest slow mode a channel may ask for (6 h). Past that it stops being
+/// a pace and becomes a ban on talking, which is what `announce` is for.
+pub const MAX_SLOW_MODE_SECS: u32 = 6 * 60 * 60;
 
 /// A single channel entry as read from channels.json.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,7 +41,8 @@ pub struct ChannelEntry {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
 
-    /// SHA-256 hash of the password: `"sha256:<64 hex chars>"`.
+    /// The password's hash (`hash_password`): Argon2id as a PHC string, or
+    /// `"sha256:<64 hex chars>"` as written before 1.0.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password_hash: Option<String>,
 
@@ -76,6 +97,49 @@ pub struct ChannelEntry {
     /// sends and applies it to what it keeps.
     #[serde(default)]
     pub message_ttl_secs: u32,
+
+    /// Only the channel's managers (admins and moderators, for a channel from
+    /// this file) may post; the relay refuses everybody else. Text channels
+    /// only.
+    #[serde(default)]
+    pub announce: bool,
+
+    /// A member may post once per this many seconds; 0 (the default) is off.
+    /// Admins and moderators are exempt. Up to six hours.
+    #[serde(default)]
+    pub slow_mode_secs: u32,
+
+    /// Marked 18+: clients ask for consent before joining or showing it.
+    #[serde(default)]
+    pub nsfw: bool,
+
+    /// What names this channel's stored-message log (relays with accounts).
+    /// Without one the log is named after the channel, so renaming the
+    /// channel starts a new log; set it (letters, digits, `-`, `_`) to keep
+    /// one log across renames.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<String>,
+
+    /// Keys this version does not know, kept as they are: the server rewrites
+    /// the file when it hashes a password, and must not delete what a newer
+    /// version wrote.
+    #[serde(flatten)]
+    pub extra: serde_json::Map<String, serde_json::Value>,
+}
+
+impl ChannelEntry {
+    /// The conversation id of this channel's stored-message log.
+    pub fn log_conv(&self) -> String {
+        match &self.uid {
+            Some(uid) => format!("c:{uid}"),
+            None => {
+                let digest = Sha256::digest(
+                    format!("voipc-channel/v1|{}", self.name.trim().to_lowercase()).as_bytes(),
+                );
+                format!("c:{}", hex::encode(&digest[..16]))
+            }
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -101,15 +165,46 @@ impl Default for ChannelEntry {
             text: false,
             auto_join: false,
             message_ttl_secs: 0,
+            announce: false,
+            slow_mode_secs: 0,
+            nsfw: false,
+            uid: None,
+            extra: serde_json::Map::new(),
         }
     }
 }
 
-/// Hash a plaintext password to `"sha256:<64 hex chars>"`.
-pub fn hash_password(plaintext: &str) -> String {
-    let digest = Sha256::digest(plaintext.as_bytes());
-    let hex: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
-    format!("{}{}", SHA256_PREFIX, hex)
+/// A channel password as `channels.json` keeps it: Argon2id, as a PHC string
+/// (`$argon2id$v=19$…`, l4f's parameters). Before 1.0 it was unsalted SHA-256
+/// (`sha256:<hex>`), which `verify_password` still reads (1.0 audit H1-16).
+pub fn hash_password(plaintext: &str) -> anyhow::Result<String> {
+    if plaintext.is_empty()
+        || plaintext
+            .chars()
+            .nth(l4f_accounts::password::MAX_LEN)
+            .is_some()
+    {
+        bail!(
+            "a channel password must be 1 to {} characters",
+            l4f_accounts::password::MAX_LEN
+        );
+    }
+    Ok(l4f_accounts::password::hash(plaintext))
+}
+
+/// Whether `attempt` is the password `stored` (`hash_password`'s, or a
+/// `sha256:` one from before 1.0). Argon2: tens of milliseconds, so never
+/// under the channel lock (`ServerState::channel_password_attempt`).
+pub fn verify_password(attempt: &str, stored: &str) -> bool {
+    if let Some(hex) = stored.strip_prefix(SHA256_PREFIX) {
+        let digest = Sha256::digest(attempt.as_bytes());
+        let mine: String = digest.iter().map(|b| format!("{:02x}", b)).collect();
+        return mine
+            .as_bytes()
+            .ct_eq(hex.to_ascii_lowercase().as_bytes())
+            .into();
+    }
+    stored.starts_with(ARGON2_PREFIX) && l4f_accounts::password::verify(attempt, stored).ok
 }
 
 /// Load, validate, and prepare persistent channel entries from a JSON file.
@@ -126,7 +221,7 @@ pub fn load_and_prepare_channels(path: &Path) -> anyhow::Result<Vec<ChannelEntry
 
     validate_entries(&entries)?;
 
-    let needs_rewrite = hash_plaintext_passwords(&mut entries);
+    let needs_rewrite = hash_plaintext_passwords(&mut entries)?;
 
     if needs_rewrite {
         atomic_rewrite(path, &entries)
@@ -137,8 +232,9 @@ pub fn load_and_prepare_channels(path: &Path) -> anyhow::Result<Vec<ChannelEntry
     Ok(entries)
 }
 
-fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
+pub(crate) fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
     let mut seen_names: HashSet<String> = HashSet::new();
+    let mut seen_logs: HashSet<String> = HashSet::new();
 
     for (i, entry) in entries.iter().enumerate() {
         let name = entry.name.trim();
@@ -154,7 +250,10 @@ fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
             bail!("channel entry {} uses reserved name 'General'", i);
         }
         if name.chars().any(crate::tcp::bad_name_char) {
-            bail!("channel {:?} contains control or invisible characters", name);
+            bail!(
+                "channel {:?} contains control or invisible characters",
+                name
+            );
         }
         if name.len() > 64 {
             bail!("channel '{}' name exceeds 64 characters", name);
@@ -181,9 +280,39 @@ fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
         if !seen_names.insert(lower) {
             bail!("duplicate channel name: '{}'", name);
         }
+        if let Some(uid) = &entry.uid {
+            if uid.is_empty()
+                || uid.len() > 64
+                || !uid
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+            {
+                bail!(
+                    "channel '{}' uid must be 1-64 letters, digits, '-' or '_'",
+                    name
+                );
+            }
+        }
+        if !seen_logs.insert(entry.log_conv()) {
+            bail!("channel '{}' has the same uid as another channel", name);
+        }
         if entry.auto_join && !entry.text {
             bail!("channel '{}' has 'auto_join' without 'text'", name);
         }
+        if entry.announce && !entry.text {
+            bail!("channel '{}' has 'announce' without 'text'", name);
+        }
+        if entry.slow_mode_secs > MAX_SLOW_MODE_SECS {
+            bail!(
+                "channel '{}' slow_mode_secs exceeds 6 hours ({})",
+                name,
+                entry.slow_mode_secs
+            );
+        }
+        refuse_placeholder(
+            &format!("channel '{name}' password"),
+            entry.password.as_deref(),
+        )?;
         if entry.text && entry.anonymous {
             // A pseudonym only hides someone who is nowhere else. A text
             // channel is one you are in besides the voice channel you stand
@@ -197,16 +326,17 @@ fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
             );
         }
         if let Some(ref hash) = entry.password_hash {
-            if !hash.starts_with(SHA256_PREFIX) {
+            if let Some(hex_part) = hash.strip_prefix(SHA256_PREFIX) {
+                if hex_part.len() != 64 || !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
+                    bail!("channel '{}' password_hash has invalid SHA-256 hex", name);
+                }
+            } else if !hash.starts_with(ARGON2_PREFIX) {
                 bail!(
-                    "channel '{}' password_hash must start with '{}'",
+                    "channel '{}' password_hash must start with '{}' (or '{}', before 1.0)",
                     name,
+                    ARGON2_PREFIX,
                     SHA256_PREFIX
                 );
-            }
-            let hex_part = &hash[SHA256_PREFIX.len()..];
-            if hex_part.len() != 64 || !hex_part.chars().all(|c| c.is_ascii_hexdigit()) {
-                bail!("channel '{}' password_hash has invalid SHA-256 hex", name);
             }
         }
     }
@@ -215,27 +345,24 @@ fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
 }
 
 /// Convert any plaintext passwords to hashed form. Returns `true` if any were converted.
-fn hash_plaintext_passwords(entries: &mut [ChannelEntry]) -> bool {
+fn hash_plaintext_passwords(entries: &mut [ChannelEntry]) -> anyhow::Result<bool> {
     let mut changed = false;
     for entry in entries.iter_mut() {
         if let Some(plaintext) = entry.password.take() {
-            entry.password_hash = Some(hash_password(&plaintext));
+            entry.password_hash = Some(hash_password(&plaintext)?);
             changed = true;
         }
     }
-    changed
+    Ok(changed)
 }
 
 /// Write entries to a temp file then atomically rename over the original.
-fn atomic_rewrite(path: &Path, entries: &[ChannelEntry]) -> anyhow::Result<()> {
+pub(crate) fn atomic_rewrite(path: &Path, entries: &[ChannelEntry]) -> anyhow::Result<()> {
     let json = serde_json::to_string_pretty(entries).context("failed to serialize channels")?;
 
-    let tmp_path = path.with_extension("json.tmp");
-    std::fs::write(&tmp_path, json.as_bytes())
-        .with_context(|| format!("failed to write temp file: {}", tmp_path.display()))?;
-    std::fs::rename(&tmp_path, path)
-        .with_context(|| format!("failed to rename temp file to {}", path.display()))?;
-
+    // Password hashes: for the server's own user only.
+    crate::fsutil::atomic_write(path, json.as_bytes(), true)
+        .with_context(|| format!("failed to write {}", path.display()))?;
     Ok(())
 }
 
@@ -243,16 +370,25 @@ fn atomic_rewrite(path: &Path, entries: &[ChannelEntry]) -> anyhow::Result<()> {
 mod tests {
     use super::*;
 
+    /// 1.0 audit H1-16: Argon2id and salted; a `sha256:` hash from before
+    /// 1.0 still lets its password in, whatever case its hex is in.
     #[test]
-    fn hash_password_produces_correct_format() {
-        let hash = hash_password("secretpass");
-        assert!(hash.starts_with("sha256:"));
-        assert_eq!(hash.len(), 7 + 64); // "sha256:" + 64 hex chars
-    }
-
-    #[test]
-    fn hash_password_is_deterministic() {
-        assert_eq!(hash_password("test"), hash_password("test"));
+    fn channel_passwords_are_argon2id_and_old_hashes_still_work() {
+        let hash = hash_password("secretpass").unwrap();
+        assert!(hash.starts_with("$argon2id$"), "{hash}");
+        assert_ne!(hash, hash_password("secretpass").unwrap(), "salted");
+        assert!(verify_password("secretpass", &hash));
+        assert!(!verify_password("secretpas", &hash));
+        let old = "sha256:2BB80D537B1DA3E38BD30361AA855686BDE0EACD7162FEF6A25FE97BF527A25B"; // "secret"
+        assert!(
+            verify_password("secret", old) && verify_password("secret", &old.to_ascii_lowercase())
+        );
+        assert!(!verify_password("secret2", old));
+        assert!(!verify_password(
+            "secret",
+            "md5:5ebe2294ecd0e0f08eab7690d2a6ee69"
+        ));
+        assert!(hash_password("").is_err());
     }
 
     #[test]
@@ -338,7 +474,7 @@ mod tests {
                 name: "AFK".into(),
                 description: String::new(),
                 password: None,
-                password_hash: Some(hash_password("test")),
+                password_hash: Some(hash_password("test").unwrap()),
                 max_users: 0,
                 proximity: ProximityMode::Off,
                 ..Default::default()
@@ -358,19 +494,19 @@ mod tests {
             proximity: ProximityMode::Off,
             ..Default::default()
         }];
-        let changed = hash_plaintext_passwords(&mut entries);
+        let changed = hash_plaintext_passwords(&mut entries).unwrap();
         assert!(changed);
         assert!(entries[0].password.is_none());
         assert!(entries[0]
             .password_hash
             .as_ref()
             .unwrap()
-            .starts_with("sha256:"));
+            .starts_with("$argon2id$"));
     }
 
     #[test]
     fn hash_plaintext_passwords_no_change_when_already_hashed() {
-        let hash = hash_password("test");
+        let hash = hash_password("test").unwrap();
         let mut entries = vec![ChannelEntry {
             name: "Test".into(),
             description: String::new(),
@@ -380,7 +516,7 @@ mod tests {
             proximity: ProximityMode::Off,
             ..Default::default()
         }];
-        let changed = hash_plaintext_passwords(&mut entries);
+        let changed = hash_plaintext_passwords(&mut entries).unwrap();
         assert!(!changed);
         assert_eq!(entries[0].password_hash.as_ref().unwrap(), &hash);
     }
@@ -406,14 +542,15 @@ mod tests {
 
     #[test]
     fn proximity_parses_and_defaults_to_off() {
-        let entries: Vec<ChannelEntry> = serde_json::from_str(
-            r#"[{"name":"Ingame","proximity":"3d"},{"name":"AFK"}]"#,
-        )
-        .unwrap();
+        let entries: Vec<ChannelEntry> =
+            serde_json::from_str(r#"[{"name":"Ingame","proximity":"3d"},{"name":"AFK"}]"#).unwrap();
         assert_eq!(entries[0].proximity, ProximityMode::ThreeD);
         assert_eq!(entries[1].proximity, ProximityMode::Off);
         // An unknown mode is a load error, not a silent Off
-        assert!(serde_json::from_str::<Vec<ChannelEntry>>(r#"[{"name":"X","proximity":"4d"}]"#).is_err());
+        assert!(
+            serde_json::from_str::<Vec<ChannelEntry>>(r#"[{"name":"X","proximity":"4d"}]"#)
+                .is_err()
+        );
     }
 
     #[test]
@@ -451,13 +588,51 @@ mod tests {
             text: false,
             auto_join: false,
             message_ttl_secs: 0,
+            announce: false,
+            slow_mode_secs: 45,
+            nsfw: true,
+            uid: Some("ingame-1".into()),
+            // What a newer version wrote, which this one must not delete
+            extra: serde_json::from_str(r#"{"later_option": {"x": 7}}"#).unwrap(),
         }];
-        assert!(hash_plaintext_passwords(&mut entries));
+        assert!(hash_plaintext_passwords(&mut entries).unwrap());
         let json = serde_json::to_string(&entries).unwrap();
         let back: Vec<ChannelEntry> = serde_json::from_str(&json).unwrap();
         assert_eq!(back[0].proximity, ProximityMode::TwoD);
         assert!(back[0].hidden && back[0].anonymous && back[0].hide_members && back[0].routed);
         assert!(!back[0].screen_share, "sharing must stay switched off");
+        assert!(back[0].nsfw && back[0].slow_mode_secs == 45);
+        assert_eq!(
+            back[0].extra["later_option"]["x"], 7,
+            "an unknown key was dropped"
+        );
+        assert_eq!(back[0].uid.as_deref(), Some("ingame-1"));
+    }
+
+    #[test]
+    fn a_log_is_named_by_uid_or_else_by_the_channel_name() {
+        let named = |json: &str| serde_json::from_str::<Vec<ChannelEntry>>(json).unwrap();
+        let a = named(r#"[{"name":"Lounge"}]"#);
+        let b = named(r#"[{"name":"lounge "}]"#);
+        assert_eq!(
+            a[0].log_conv(),
+            b[0].log_conv(),
+            "case and spaces do not make a new log"
+        );
+        assert!(a[0].log_conv().starts_with("c:") && a[0].log_conv().len() == 34);
+        let kept = named(r#"[{"name":"Renamed","uid":"lounge-1"}]"#);
+        assert_eq!(kept[0].log_conv(), "c:lounge-1");
+        assert!(
+            validate_entries(&named(r#"[{"name":"a","uid":"x y"}]"#)).is_err(),
+            "uid characters"
+        );
+        assert!(
+            validate_entries(&named(
+                r#"[{"name":"a","uid":"same"},{"name":"b","uid":"same"}]"#
+            ))
+            .is_err(),
+            "uid twice"
+        );
     }
 
     #[test]
@@ -490,5 +665,55 @@ mod tests {
             serde_json::from_str(r#"[{"name":"secrets","text":true,"anonymous":true}]"#).unwrap();
         let err = validate_entries(&bad).unwrap_err().to_string();
         assert!(err.contains("anonymous"), "{err}");
+    }
+
+    #[test]
+    fn announce_slow_mode_and_nsfw_load_and_validate() {
+        let entries: Vec<ChannelEntry> = serde_json::from_str(
+            r#"[{"name":"news","text":true,"announce":true,"auto_join":true},
+                {"name":"general","text":true,"slow_mode_secs":10},
+                {"name":"After Dark","nsfw":true},
+                {"name":"Music"}]"#,
+        )
+        .unwrap();
+        assert!(entries[0].announce && entries[1].slow_mode_secs == 10 && entries[2].nsfw);
+        assert!(!entries[3].announce && entries[3].slow_mode_secs == 0 && !entries[3].nsfw);
+        assert!(validate_entries(&entries).is_ok());
+
+        // A voice room has no posts of its own to keep for its managers
+        let bad: Vec<ChannelEntry> =
+            serde_json::from_str(r#"[{"name":"Stage","announce":true}]"#).unwrap();
+        let err = validate_entries(&bad).unwrap_err().to_string();
+        assert!(err.contains("announce"), "{err}");
+
+        let slow = ChannelEntry {
+            name: "x".into(),
+            text: true,
+            slow_mode_secs: MAX_SLOW_MODE_SECS + 1,
+            ..Default::default()
+        };
+        assert!(validate_entries(&[slow]).is_err());
+    }
+
+    #[test]
+    fn a_preset_placeholder_password_is_refused() {
+        // Somebody copied a preset by hand: starting would give every such
+        // server the same, published password.
+        let entries = vec![ChannelEntry {
+            name: "Staff".into(),
+            password: Some(PRESET_PLACEHOLDER.into()),
+            ..Default::default()
+        }];
+        let err = validate_entries(&entries).unwrap_err().to_string();
+        assert!(err.contains("channels init"), "{err}");
+    }
+
+    #[test]
+    fn the_example_file_loads() {
+        // The server once refused to start on its own example; keep it honest.
+        let entries: Vec<ChannelEntry> =
+            serde_json::from_str(include_str!("../../../channels.example.json")).unwrap();
+        validate_entries(&entries).unwrap();
+        assert!(entries.iter().any(|e| e.announce) && entries.iter().any(|e| e.slow_mode_secs > 0));
     }
 }

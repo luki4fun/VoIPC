@@ -45,6 +45,24 @@ const clamp10 = (v: number, max: number) => Math.min(Math.max(Math.round(v), 0),
 
 const SAMPLE_RATE = 48_000;
 const FRAME_US = 20_000;
+
+/**
+ * The worklet's Opus decoder (crates/voipc-opus-wasm), fetched once here: a
+ * worklet cannot fetch. The bytes go to the worklet, which compiles them —
+ * Chromium will not hand a compiled `WebAssembly.Module` to an AudioWorklet
+ * (the port fires `messageerror`). `null` when it cannot be had; WebCodecs
+ * then decodes as before.
+ */
+let opusBytes: Promise<ArrayBuffer | null> | null = null;
+function fetchOpus(): Promise<ArrayBuffer | null> {
+  opusBytes ??= fetch(new URL("../../lib/wasm/voipc_opus.wasm", import.meta.url))
+    .then((r) => (r.ok ? r.arrayBuffer() : Promise.reject(new Error(`HTTP ${r.status}`))))
+    .catch((e) => {
+      console.warn("no wasm Opus decoder for the worklet, using WebCodecs:", e);
+      return null;
+    });
+  return opusBytes;
+}
 /** Set on the mixer key of screen-share audio sources (network.rs SCREEN_AUDIO_FLAG). */
 const SCREEN_AUDIO_FLAG = 0x8000_0000;
 /** Decoders with no packets for this long are dropped (mirrors the mixer). */
@@ -247,6 +265,15 @@ export class AudioEngine implements AudioApi {
 
   // Transmit
   private transmitting = false;
+  /**
+   * Bumped by every start, stop and device switch of the voice capture (and
+   * `micTestGen` of the mic test). Opening a device takes a while, and a stop
+   * and a new start in that time used to let two opens land: the later one
+   * overwrote the earlier, which stayed live with nothing able to close it.
+   * An open whose generation has moved on closes itself instead.
+   */
+  private captureGen = 0;
+  private micTestGen = 0;
   private capture: Capture | null = null;
   private captureRestartTimer: ReturnType<typeof setTimeout> | null = null;
   private encoder: AudioEncoder | null = null;
@@ -310,6 +337,8 @@ export class AudioEngine implements AudioApi {
   private sidetoneRoom = new ReverbWater();
   private framesPlayed = 0;
   private framesLost = 0;
+  /** The mixer worklet decodes Opus itself: packets go to it undecoded. */
+  private opusInWorklet = false;
   private screenAudioRecv = 0;
   private screenAudioSent = 0;
   /** Desktop-audio capture while sharing our screen (share.ts drives it). */
@@ -482,6 +511,12 @@ export class AudioEngine implements AudioApi {
   }
 
   private feedSource(key: number, sequence: number, opus: Uint8Array): void {
+    // The worklet decodes it when it plays, in order, with FEC and PLC (H3-05)
+    if (this.opusInWorklet && this.mixer) {
+      const packet = opus.slice();
+      this.mixer.port.postMessage({ type: "packet", source: key, sequence, opus: packet }, [packet.buffer]);
+      return;
+    }
     if (typeof AudioDecoder === "undefined") {
       // Silence would look like everyone else being quiet: say why, once.
       if (!this.noDecoderEmitted) {
@@ -613,9 +648,20 @@ export class AudioEngine implements AudioApi {
             this.framesLost = e.data.lost;
           } else if (e.data?.type === "levels") {
             this.sourceLevels = e.data.levels;
+          } else if (e.data?.type === "opus-ready") {
+            this.opusInWorklet = this.mixer === mixer;
+          } else if (e.data?.type === "opus-failed") {
+            // WebCodecs again, which plays a lost frame as silence
+            console.warn("the worklet's Opus decoder failed:", (e.data as { error?: string }).error);
+            this.opusInWorklet = false;
           }
         };
         mixer.connect(master);
+        // A new worklet decodes nothing until its own decoder is ready
+        this.opusInWorklet = false;
+        void fetchOpus().then((bytes) => {
+          if (bytes) mixer.port.postMessage({ type: "opus", bytes });
+        });
         mixer.port.postMessage({ type: "deafen", value: this._deafened });
         for (const [userId, gain] of this.userVolumes) {
           mixer.port.postMessage({ type: "user-volume", userId, gain });
@@ -690,6 +736,7 @@ export class AudioEngine implements AudioApi {
     if (c.channelId === 0) throw new Error("Join a voice channel first");
     if (this._muted) return;
     this.transmitting = true;
+    const gen = ++this.captureGen;
     try {
       const ac = await this.ensureGraph();
       if (typeof AudioEncoder === "undefined") {
@@ -698,13 +745,14 @@ export class AudioEngine implements AudioApi {
         );
       }
       const cap = await this.openCapture(ac, (f) => this.onCaptureFrame(f));
-      if (!this.transmitting) {
-        cap.close(); // released while the device was opening
+      if (!this.transmitting || gen !== this.captureGen) {
+        cap.close(); // released, or started again, while the device was opening
         return;
       }
       cap.onended = () => this.onCaptureEnded();
       this.capture = cap;
     } catch (e) {
+      if (gen !== this.captureGen) return; // a later start owns the capture now
       // Like the native capture task: report and give up this transmission
       this.transmitting = false;
       this.stopCapture();
@@ -717,6 +765,7 @@ export class AudioEngine implements AudioApi {
     const c = this.ctx;
     if (!c || !this.transmitting) return;
     this.transmitting = false;
+    this.captureGen++;
     this.stopCapture();
     // Tell the others we stopped talking (clears their speaking indicator)
     c.sendDatagram(wasm().buildEotPacket(c.sessionId, c.nextVoiceSequence()));
@@ -1285,9 +1334,10 @@ export class AudioEngine implements AudioApi {
     if (this.transmitting && this.capture && this.audioContext) {
       this.capture.close();
       this.capture = null;
+      const gen = ++this.captureGen;
       try {
         const cap = await this.openCapture(this.audioContext, (f) => this.onCaptureFrame(f));
-        if (!this.transmitting) {
+        if (!this.transmitting || gen !== this.captureGen) {
           cap.close();
           return;
         }
@@ -1310,6 +1360,7 @@ export class AudioEngine implements AudioApi {
     if (this.transmitting) throw new Error("Cannot test microphone while transmitting");
     if (this.micTestActive) return;
     this.micTestActive = true;
+    const gen = ++this.micTestGen;
     // The sequence deliberately carries on from the last test rather than
     // restarting at 0: the worklet keeps a source for SOURCE_IDLE_PRUNE (60 s)
     // and discards frames that arrive before the one it is waiting for, so a
@@ -1346,12 +1397,13 @@ export class AudioEngine implements AudioApi {
           );
         }
       });
-      if (!this.micTestActive) {
+      if (!this.micTestActive || gen !== this.micTestGen) {
         cap.close();
         return;
       }
       this.micTest = cap;
     } catch (e) {
+      if (gen !== this.micTestGen) return;
       this.micTestActive = false;
       emit("mic-test-error", { error: describeError(e) });
     }
@@ -1359,6 +1411,7 @@ export class AudioEngine implements AudioApi {
 
   stopMicTest(): void {
     this.micTestActive = false;
+    this.micTestGen++;
     this.micTest?.close();
     this.micTest = null;
   }
@@ -1381,7 +1434,14 @@ export class AudioEngine implements AudioApi {
     // anybody has connected — and two clicks would otherwise start two looping
     // voices, of which Stop could only ever reach one.
     this.outputTestStarting = true;
-    const ac = await this.ensureGraph();
+    let ac: AudioContext;
+    try {
+      ac = await this.ensureGraph();
+    } catch (e) {
+      // Or the flag stays up and no later click can start the test again
+      this.outputTestStarting = false;
+      throw e;
+    }
     if (!this.outputTestStarting) return; // stopped while the graph came up
     this.outputTestStarting = false;
     // One second of the voice, looped: it is periodic per second by design,
@@ -1433,7 +1493,8 @@ export class AudioEngine implements AudioApi {
    */
   canPickOutput(): boolean {
     const ac = this.audioContext as (AudioContext & { setSinkId?: unknown }) | null;
-    return typeof (ac ?? AudioContext.prototype).setSinkId === "function";
+    const target = (ac ?? AudioContext.prototype) as { setSinkId?: unknown };
+    return typeof target.setSinkId === "function";
   }
 
   /**
@@ -1580,6 +1641,11 @@ export class AudioEngine implements AudioApi {
   }
 
   // ── Stats ────────────────────────────────────────────────────────────
+
+  /** Which decoder plays incoming voice: the worklet's wasm Opus, or WebCodecs. */
+  voiceDecoder(): "worklet" | "webcodecs" {
+    return this.opusInWorklet ? "worklet" : "webcodecs";
+  }
 
   getVoiceStats(): [number, number] {
     return [this.framesPlayed, this.framesLost];

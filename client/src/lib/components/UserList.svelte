@@ -260,7 +260,7 @@
   }
 
   .crown {
-    color: #ffc107;
+    color: var(--warning);
     margin-left: 1px;
     display: inline-flex;
     vertical-align: middle;
@@ -283,7 +283,7 @@
   }
 
   .status-icon.deafened {
-    color: #ffa726;
+    color: var(--warning);
   }
 
   .status-icon.sharing {

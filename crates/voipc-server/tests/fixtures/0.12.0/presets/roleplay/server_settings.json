@@ -1,0 +1,7 @@
+{
+  "empty_channel_timeout_secs": 300,
+  "max_channels": 50,
+  "max_channel_name_len": 32,
+  "proximity_enabled": true,
+  "game_token": "7abed082a215c3244f1072f30786e83e52a5d1170f89b6e95578f4eb5c7909f4"
+}

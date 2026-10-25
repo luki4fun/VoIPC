@@ -14,6 +14,7 @@
   // Panel widths are set on *this* element rather than on :root, which is what
   // makes a width dragged here independent of the one the classic layout uses.
 
+  import { backdrop } from "../../actions/dialog.js";
   import { resizeHandle } from "../../actions/resizable.js";
   import { swipeable, type Pane } from "../../actions/swipe.js";
   import { defaultPanels } from "../../ui-prefs.js";
@@ -197,10 +198,8 @@
 </div>
 
 {#if voiceOpen}
-  <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-  <div class="voice-overlay" onclick={() => (voiceOpen = false)}>
-    <!-- svelte-ignore a11y_click_events_have_key_events a11y_no_static_element_interactions -->
-    <div class="voice-popover" onclick={(e) => e.stopPropagation()}>
+  <div class="voice-overlay" role="presentation" onclick={backdrop(() => (voiceOpen = false))}>
+    <div class="voice-popover">
       <div class="popover-title">Voice</div>
       <!-- The real voice bar, restyled. Mode select, VAD meter, mic gain,
            output volume and the screen-share controls all come with it, so

@@ -118,7 +118,7 @@
     {#if unread}<span class="unread-dot"></span>{/if}
   </button>
   {#if prefs.open && !narrow}
-    <button
+    <button aria-label={split === "side" ? "Put the chat under the stream" : "Put the chat beside the stream"}
       class="stage-btn split-toggle"
       onclick={toggleSplit}
       title={split === "side" ? "Put the chat under the stream" : "Put the chat beside the stream"}

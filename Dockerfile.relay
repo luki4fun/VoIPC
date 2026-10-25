@@ -1,0 +1,36 @@
+# The relay as a container image: ghcr.io/luki4fun/voipc-server.
+#
+# Built by .github/workflows/release-published.yml when a release is
+# published, from that release's own voipc-server-linux-x86_64 after checking
+# it against SHA256SUMS and its build attestation: no second compile, so the
+# image holds exactly the attested binary. The build context is a directory
+# holding only that file.
+#
+# Run it with a volume for /data, which holds server.toml, the certificate and
+# key, and what the relay writes (voipc.db and its key file, channels.json,
+# server_settings.json, bans.json). Every path in server.toml is relative to
+# /data or absolute. The image cannot put the first three there itself (no
+# shell), and the relay exits until they are: docs/OPERATING.md §10 shows a
+# host directory owned by 65532, or filling a named volume.
+#
+#   docker run -v /srv/voipc:/data -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server
+
+# Only to make /data owned by the nonroot user: distroless has no shell to
+# mkdir with. A fresh named volume copies this ownership; without it /data is
+# root's and the relay cannot create its database, key file or temp files.
+FROM busybox:stable@sha256:73aaf090f3d85aa34ee199857f03fa3a95c8ede2ffd4cc2cdb5b94e566b11662 AS prep
+RUN mkdir /data
+
+# A static binary needs no libc. No /etc/ssl either: the relay's TLS roots
+# (webpki-roots) are compiled in.
+FROM gcr.io/distroless/static-debian13:nonroot@sha256:d62067879de890a1def9da0e7766b7d20810a5e5555cef8506b752437d7a3e88
+COPY --chmod=0755 voipc-server-linux-x86_64 /voipc-server
+COPY --from=prep --chown=65532:65532 /data /data
+WORKDIR /data
+EXPOSE 9987/tcp 9987/udp
+# A TCP connect to the configured port; the relay stops cleanly on the
+# SIGTERM `docker stop` sends.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s \
+  CMD ["/voipc-server", "--config", "/data/server.toml", "health"]
+ENTRYPOINT ["/voipc-server"]
+CMD ["--config", "/data/server.toml"]

@@ -8,8 +8,8 @@ use tokio::sync::{mpsc, RwLock};
 
 use voipc_audio::spatial::{Effect, Gains, Listener, Source};
 use voipc_crypto::media_keys::MediaKeyRing;
-use voipc_crypto::ChannelKeying;
 use voipc_crypto::stores::SignalStores;
+use voipc_crypto::ChannelKeying;
 use voipc_protocol::types::*;
 
 use crate::crypto::ChatArchive;
@@ -47,6 +47,18 @@ pub struct AppState {
     /// Keyed by the exact `address` the front end passed to `connect`, never
     /// re-normalised: later commands name the server by that same string.
     pub connections: RwLock<Connections>,
+    /// Held from a capture's start or stop until its thread has really
+    /// finished — the microphone's and the screen's, one each. A stop waits up
+    /// to 2 s for the device to close, and it waits on this, not on
+    /// `connections`: under that lock the wait stalled every command, the SDK
+    /// and the push-to-talk release behind it (H4-07). A start takes the same
+    /// gate, so it never reopens a device whose old thread is still closing.
+    /// Order: a gate first, then `connections`.
+    pub mic_gate: tokio::sync::Mutex<()>,
+    pub share_gate: tokio::sync::Mutex<()>,
+    /// What the voice mixer plays, for the microphone's echo canceller.
+    #[cfg(not(target_os = "android"))]
+    pub echo_reference: Arc<voipc_audio::echo::EchoReference>,
     /// The server whose voice channel we are in, if any.
     ///
     /// Stored, not derived from which connection has a channel other than 0:
@@ -61,6 +73,9 @@ pub struct AppState {
     /// another's. ponytail: entries are never removed; one per server id this
     /// session ever connected to.
     pub connect_locks: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Sign-ins waiting for the person to type a code, by server id.
+    pub totp_answers:
+        std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<crate::account::TotpAnswer>>>,
     pub settings: RwLock<UserSettings>,
     pub chat: RwLock<ChatState>,
     // ── Settings every connection shares ──
@@ -119,6 +134,10 @@ pub struct AppState {
     /// connection because the listener outlives connections: a socket
     /// subscribes once and keeps receiving across a reconnect.
     pub sdk_events: tokio::sync::broadcast::Sender<SdkEvent>,
+    /// Bumped by every voice move the user makes themselves (`join_channel`
+    /// outside text). A game socket notes it at its `hello`; once it moved,
+    /// that socket may no longer move the user back (docs/SDK.md, `player_left`).
+    pub user_moved: AtomicU64,
     /// Why the SDK listener could not bind, for Settings; None while it listens.
     pub sdk_listen_error: Arc<std::sync::Mutex<Option<String>>>,
 }
@@ -127,31 +146,53 @@ pub struct AppState {
 /// happens: the datagram receiver, the capture task, the mute toggles.
 #[derive(Debug, Clone)]
 pub enum SdkEvent {
-    Talk { user_id: UserId, speaking: bool },
-    Muted { user_id: UserId, muted: bool },
-    Deafened { user_id: UserId, deafened: bool },
+    Talk {
+        user_id: UserId,
+        speaking: bool,
+    },
+    Muted {
+        user_id: UserId,
+        muted: bool,
+    },
+    Deafened {
+        user_id: UserId,
+        deafened: bool,
+    },
     /// The server refused something (a channel join, most importantly), so a
     /// mod waiting for its `hello` to complete learns why. Names the server,
     /// because a refusal from any other connection is not about that join.
-    ChannelError { server: String, reason: String },
+    ChannelError {
+        server: String,
+        reason: String,
+    },
     /// How much of a placement the user will actually hear changed: the
     /// channel's mode, or their own *Hear people where they stand* setting.
     /// Sent as a partial `state` message, because it is the same field a
     /// `hello` reply carries and mods are told to read it there.
-    Proximity { mode: ProximityMode },
+    Proximity {
+        mode: ProximityMode,
+    },
     /// No game drives this channel any more — the user moved, or the
     /// integration was switched off. Every socket drops the user id it was
     /// pushing edges against, so a mod cannot go on watching who speaks in a
     /// channel the user walked into without it.
     Detached,
+    /// The user's channel changed while no game was driving it. A socket the
+    /// user walked away from checks whether they are back (`returned`).
+    Moved,
 }
 
 impl AppState {
     pub fn new() -> Self {
         let state = Self {
             connections: RwLock::new(HashMap::new()),
+            mic_gate: tokio::sync::Mutex::new(()),
+            share_gate: tokio::sync::Mutex::new(()),
+            #[cfg(not(target_os = "android"))]
+            echo_reference: Arc::default(),
             voice_server: std::sync::Mutex::new(None),
             connect_locks: std::sync::Mutex::new(HashMap::new()),
+            totp_answers: std::sync::Mutex::new(HashMap::new()),
             settings: RwLock::new(UserSettings::default()),
             chat: RwLock::new(ChatState::default()),
             is_muted: Arc::new(AtomicBool::new(false)),
@@ -174,6 +215,7 @@ impl AppState {
             sdk_game: Arc::new(std::sync::Mutex::new(None)),
             // Enough for a burst of talk edges; a lagging socket skips ahead
             sdk_events: tokio::sync::broadcast::channel(64).0,
+            user_moved: AtomicU64::new(0),
             sdk_listen_error: Arc::new(std::sync::Mutex::new(None)),
         };
         state.seed_shared(&UserSettings::default());
@@ -188,8 +230,10 @@ impl AppState {
         self.is_muted.store(s.muted, Relaxed);
         self.is_deafened.store(s.deafened, Relaxed);
         self.master_volume.store(s.volume.to_bits(), Relaxed);
-        self.voice_mode.store(VoiceMode::from_str(&s.voice_mode) as u8, Relaxed);
-        self.vad_threshold_db.store(s.vad_threshold_db as i32, Relaxed);
+        self.voice_mode
+            .store(VoiceMode::from_str(&s.voice_mode) as u8, Relaxed);
+        self.vad_threshold_db
+            .store(s.vad_threshold_db as i32, Relaxed);
         self.noise_suppression.store(s.noise_suppression, Relaxed);
     }
 
@@ -222,14 +266,16 @@ impl AppState {
 
 /// The connection to one server, for a command that names it.
 pub fn conn<'a>(map: &'a Connections, server: &str) -> Result<&'a ActiveConnection, String> {
-    map.get(server).ok_or_else(|| format!("Not connected to {server}"))
+    map.get(server)
+        .ok_or_else(|| format!("Not connected to {server}"))
 }
 
 pub fn conn_mut<'a>(
     map: &'a mut Connections,
     server: &str,
 ) -> Result<&'a mut ActiveConnection, String> {
-    map.get_mut(server).ok_or_else(|| format!("Not connected to {server}"))
+    map.get_mut(server)
+        .ok_or_else(|| format!("Not connected to {server}"))
 }
 
 /// The connection we are in voice on, for a command that acts on the call
@@ -280,6 +326,7 @@ pub enum PendingTarget {
 }
 
 /// E2E encryption state using Signal Protocol.
+#[derive(Default)]
 pub struct SignalState {
     /// Signal Protocol stores (identity, pre-keys, sessions, sender keys).
     pub stores: Option<SignalStores>,
@@ -298,20 +345,6 @@ pub struct SignalState {
     /// Shared with the browser build rather than written twice: see
     /// `voipc_crypto::ChannelKeying`.
     pub channels: ChannelKeying,
-}
-
-impl Default for SignalState {
-    fn default() -> Self {
-        Self {
-            stores: None,
-            initialized: false,
-            own_user_id: None,
-            pending_sessions: HashSet::new(),
-            established_sessions: HashSet::new(),
-            pending_messages: Vec::new(),
-            channels: ChannelKeying::default(),
-        }
-    }
 }
 
 /// Encrypted chat history state.
@@ -341,7 +374,6 @@ impl Default for ChatState {
 }
 
 /// State of an active server connection.
-#[allow(dead_code)]
 pub struct ActiveConnection {
     pub user_id: UserId,
     pub username: String,
@@ -368,6 +400,8 @@ pub struct ActiveConnection {
     pub voice_asked_at: Arc<AtomicU64>,
     /// Sender for control messages (framed, onto the control stream).
     pub tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
+    /// The relay account this connection signed in with; `None` for a guest.
+    pub account: Option<Arc<crate::account::AccountLink>>,
     /// Sender for voice packets (QUIC datagrams, or the TCP fallback's datagram lane).
     pub voice_tx: mpsc::Sender<Vec<u8>>,
     /// Sender for video fragments (one QUIC stream per frame, or the TCP fallback).
@@ -387,9 +421,6 @@ pub struct ActiveConnection {
     /// AES-GCM nonce (session_id ‖ sequence) is never reused under the
     /// channel key and receivers never see a backwards jump.
     pub voice_sequence: Arc<AtomicU32>,
-    /// Master output volume as f32 bits (applied by the voice mixer task).
-    /// Shared with `AppState`.
-    pub master_volume: Arc<AtomicU32>,
     /// Voice frames played / concealed (jitter-buffer loss) — for the quality indicator.
     pub voice_frames_played: Arc<AtomicU32>,
     pub voice_frames_lost: Arc<AtomicU32>,
@@ -489,100 +520,9 @@ pub struct ActiveConnection {
     /// channel's proximity mode (and, for the game SDK, a channel by name)
     /// without asking the UI.
     pub channels: Arc<std::sync::Mutex<Vec<ChannelInfo>>>,
-    /// Sequence counter for position beacons. Their own nonce domain, so it
-    /// must never share the voice counter.
-    pub position_sequence: Arc<AtomicU32>,
 }
 
-/// Longest glide between two SDK updates: later than this is a stall, not
-/// motion, so the source waits where it is instead of crawling.
-pub const MAX_GLIDE: std::time::Duration = std::time::Duration::from_millis(250);
-pub const MIN_GLIDE: std::time::Duration = std::time::Duration::from_millis(20);
-/// Further than this in one update is a teleport (respawn, warp), not a walk.
-/// A car at 50 m/s covers 12.5 m per 4 Hz tick, so the bar is deliberately high.
-pub const TELEPORT_M: f32 = 50.0;
-
-/// A placement on its way from where the game last had it to where it is now.
-///
-/// Updates arrive 4–10 times a second; rendered as they come, the pan and the
-/// volume step at that rate. The mixer reads the interpolated pose instead, so
-/// a 4 Hz mod sounds continuous. Room drags and position beacons do not use
-/// this — they snap, as they always did.
-#[derive(Debug, Clone, Copy)]
-pub struct Motion {
-    pub from: [f32; 3],
-    pub to: [f32; 3],
-    /// Facing at both ends; only the listener turns.
-    pub fwd: Option<([f32; 2], [f32; 2])>,
-    pub at: std::time::Instant,
-    pub over: std::time::Duration,
-}
-
-impl Motion {
-    pub fn snap(pos: [f32; 3], now: std::time::Instant) -> Self {
-        Self {
-            from: pos,
-            to: pos,
-            fwd: None,
-            at: now,
-            over: std::time::Duration::ZERO,
-        }
-    }
-
-    /// Glide on from wherever `prev` is right now: an update that arrives
-    /// mid-flight must not jump back to the previous start.
-    pub fn glide(
-        prev: &Motion,
-        to: [f32; 3],
-        over: std::time::Duration,
-        now: std::time::Instant,
-    ) -> Self {
-        let from = prev.pos_at(now);
-        let d = [to[0] - from[0], to[1] - from[1], to[2] - from[2]];
-        if (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt() > TELEPORT_M {
-            return Self::snap(to, now);
-        }
-        Self {
-            from,
-            to,
-            fwd: None,
-            at: now,
-            over,
-        }
-    }
-
-    fn t(&self, now: std::time::Instant) -> f32 {
-        if self.over.is_zero() {
-            return 1.0;
-        }
-        (now.saturating_duration_since(self.at).as_secs_f32() / self.over.as_secs_f32()).min(1.0)
-    }
-
-    pub fn pos_at(&self, now: std::time::Instant) -> [f32; 3] {
-        let t = self.t(now);
-        [
-            self.from[0] + (self.to[0] - self.from[0]) * t,
-            self.from[1] + (self.to[1] - self.from[1]) * t,
-            self.from[2] + (self.to[2] - self.from[2]) * t,
-        ]
-    }
-
-    /// Lerp and renormalise. An exact U-turn passes through zero length, which
-    /// has no direction, so it faces the new way instead.
-    pub fn fwd_at(&self, now: std::time::Instant) -> [f32; 2] {
-        let Some((a, b)) = self.fwd else {
-            return [0.0, 1.0];
-        };
-        let t = self.t(now);
-        let v = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
-        let len = (v[0] * v[0] + v[1] * v[1]).sqrt();
-        if len > 1e-3 {
-            [v[0] / len, v[1] / len]
-        } else {
-            b
-        }
-    }
-}
+pub use voipc_audio::game::{Motion, MAX_GLIDE, MIN_GLIDE};
 
 /// Everything the mixer needs to render voices positionally.
 ///
@@ -959,7 +899,6 @@ pub fn merge_source(
 }
 
 /// User settings (in-memory, initialized from config on startup).
-#[allow(dead_code)]
 pub struct UserSettings {
     pub input_device: Option<String>,
     pub output_device: Option<String>,
@@ -1007,7 +946,8 @@ impl Default for UserSettings {
 mod tests {
     use super::*;
     use std::time::{Duration, Instant};
-    use voipc_audio::spatial::{FLAT, MAX_MUFFLE, Source};
+    use voipc_audio::game::TELEPORT_M;
+    use voipc_audio::spatial::{Source, FLAT, MAX_MUFFLE};
 
     fn test_state(mode: ProximityMode, stopping: bool) -> SpatialTest {
         SpatialTest {
@@ -1071,10 +1011,22 @@ mod tests {
         );
         let voice = state.gains_for(7, false, Instant::now());
         assert!(voice.r > voice.l * 5.0);
-        assert_eq!(state.gains_for(7, true, Instant::now()), voice, "the share follows its sharer");
+        assert_eq!(
+            state.gains_for(7, true, Instant::now()),
+            voice,
+            "the share follows its sharer"
+        );
         state.screen_audio_spatial = false;
-        assert_eq!(state.gains_for(7, true, Instant::now()), FLAT, "…until the viewer centres it");
-        assert_eq!(state.gains_for(7, false, Instant::now()), voice, "which leaves the voice alone");
+        assert_eq!(
+            state.gains_for(7, true, Instant::now()),
+            FLAT,
+            "…until the viewer centres it"
+        );
+        assert_eq!(
+            state.gains_for(7, false, Instant::now()),
+            voice,
+            "which leaves the voice alone"
+        );
 
         // And that stays true with the placement switched off, where the voice
         // now keeps the game's volume and muffle: a centred share is centred,
@@ -1083,11 +1035,22 @@ mod tests {
         state.sdk_active = true;
         state.sources.insert(
             7,
-            Source { volume: 0.5, muffle: 5, ..Source::default() },
+            Source {
+                volume: 0.5,
+                muffle: 5,
+                ..Source::default()
+            },
         );
-        assert_eq!(state.gains_for(7, true, Instant::now()), FLAT, "the share stopped being flat");
+        assert_eq!(
+            state.gains_for(7, true, Instant::now()),
+            FLAT,
+            "the share stopped being flat"
+        );
         let voice = state.gains_for(7, false, Instant::now());
-        assert!(voice.l < 0.5 && voice.lp_a < 1.0, "the voice lost its muffle: {voice:?}");
+        assert!(
+            voice.l < 0.5 && voice.lp_a < 1.0,
+            "the voice lost its muffle: {voice:?}"
+        );
     }
 
     #[test]
@@ -1095,7 +1058,10 @@ mod tests {
         // Beacon mode is the one thing a game can ask for that puts something
         // on the wire, so when the game goes the user's own setting decides
         // again — never whatever the game left behind.
-        let mut state = SpatialState { user_sync: false, ..Default::default() };
+        let mut state = SpatialState {
+            user_sync: false,
+            ..Default::default()
+        };
         state.beacon = true;
         state.sync = true;
         state.clear_positions();
@@ -1103,10 +1069,17 @@ mod tests {
         assert!(!state.beacon);
 
         // And a user who was already sharing keeps sharing
-        let mut state = SpatialState { sync: true, user_sync: true, ..Default::default() };
+        let mut state = SpatialState {
+            sync: true,
+            user_sync: true,
+            ..Default::default()
+        };
         state.beacon = true;
         state.clear_positions();
-        assert!(state.sync, "the user's own sharing was switched off for them");
+        assert!(
+            state.sync,
+            "the user's own sharing was switched off for them"
+        );
     }
 
     #[test]
@@ -1127,7 +1100,12 @@ mod tests {
         };
         state.sources.insert(
             7,
-            Source { pos: [50.0, 0.0, 0.0], volume: 0.5, muffle: 10, ..Source::default() },
+            Source {
+                pos: [50.0, 0.0, 0.0],
+                volume: 0.5,
+                muffle: 10,
+                ..Source::default()
+            },
         );
 
         let heard = state.gains_for(7, false, Instant::now());
@@ -1135,10 +1113,16 @@ mod tests {
         // volume 0.5 and a full muffle's level cut, and the filter with it
         let want = 0.5 * voipc_audio::spatial::muffle_cut(10);
         assert!((heard.l - want).abs() < 1e-6, "{heard:?} is not {want}");
-        assert!(heard.lp_a < 0.1, "a full muffle must still be filtered: {heard:?}");
+        assert!(
+            heard.lp_a < 0.1,
+            "a full muffle must still be filtered: {heard:?}"
+        );
 
         // Someone the game did not list is out of earshot, here as anywhere
-        assert_eq!(state.gains_for(9, false, Instant::now()), voipc_audio::spatial::SILENT);
+        assert_eq!(
+            state.gains_for(9, false, Instant::now()),
+            voipc_audio::spatial::SILENT
+        );
         // …but with no game driving, an unplaced user is just a user
         state.sdk_active = false;
         assert_eq!(state.gains_for(9, false, Instant::now()), FLAT);
@@ -1175,7 +1159,11 @@ mod tests {
         };
         let halfway = t0 + Duration::from_millis(50);
         let second = Motion::glide(&first, [0.0; 3], Duration::from_millis(100), halfway);
-        assert!((second.from[0] - 5.0).abs() < 1e-3, "jumped back to {}", second.from[0]);
+        assert!(
+            (second.from[0] - 5.0).abs() < 1e-3,
+            "jumped back to {}",
+            second.from[0]
+        );
     }
 
     #[test]
@@ -1210,7 +1198,10 @@ mod tests {
             ..Motion::snap([0.0; 3], t0)
         };
         let mid = quarter.fwd_at(t0 + Duration::from_millis(50));
-        assert!((mid[0].hypot(mid[1]) - 1.0).abs() < 1e-3, "not a unit vector: {mid:?}");
+        assert!(
+            (mid[0].hypot(mid[1]) - 1.0).abs() < 1e-3,
+            "not a unit vector: {mid:?}"
+        );
         assert!((mid[0] - mid[1]).abs() < 1e-3, "not 45 degrees: {mid:?}");
 
         // An exact about-turn passes through zero length, which has no
@@ -1266,7 +1257,9 @@ mod tests {
     #[test]
     fn clearing_placements_drops_the_glides() {
         let mut state = SpatialState::default();
-        state.motion.insert(7, Motion::snap([1.0, 2.0, 3.0], Instant::now()));
+        state
+            .motion
+            .insert(7, Motion::snap([1.0, 2.0, 3.0], Instant::now()));
         state.listener_motion = Some(Motion::snap([0.0; 3], Instant::now()));
         state.last_update = Some(Instant::now());
         state.clear_positions();
@@ -1302,7 +1295,11 @@ mod tests {
         state.sdk_active = true;
         state.sdk_reverb = 10;
         state.sdk_underwater = 3;
-        assert_eq!(state.sdk_room(), Some((3, 10)), "the game did not take over");
+        assert_eq!(
+            state.sdk_room(),
+            Some((3, 10)),
+            "the game did not take over"
+        );
 
         // It leaves: the lanes go back to their own settings
         state.sdk_active = false;
@@ -1315,10 +1312,22 @@ mod tests {
     fn a_lane_with_nothing_on_is_plain() {
         assert!(LaneFx::default().is_plain());
         for lane in [
-            LaneFx { effect: Effect::Radio, ..Default::default() },
-            LaneFx { muffle: 1, ..Default::default() },
-            LaneFx { reverb: 1, ..Default::default() },
-            LaneFx { water: 1, ..Default::default() },
+            LaneFx {
+                effect: Effect::Radio,
+                ..Default::default()
+            },
+            LaneFx {
+                muffle: 1,
+                ..Default::default()
+            },
+            LaneFx {
+                reverb: 1,
+                ..Default::default()
+            },
+            LaneFx {
+                water: 1,
+                ..Default::default()
+            },
         ] {
             assert!(!lane.is_plain(), "{lane:?} should not count as plain");
         }
@@ -1327,12 +1336,18 @@ mod tests {
     #[test]
     fn a_placement_keeps_what_the_caller_left_out() {
         let placed = merge_source(None, [1.0, 2.0, 0.0], Some(40.0), None, Some(5), Some(true));
-        assert_eq!((placed.range, placed.volume, placed.muffle, placed.direct), (40.0, 1.0, 5, true));
+        assert_eq!(
+            (placed.range, placed.volume, placed.muffle, placed.direct),
+            (40.0, 1.0, 5, true)
+        );
 
         // A room drag knows only the position: everything else survives
         let dragged = merge_source(Some(placed), [3.0, 4.0, 0.0], None, None, None, None);
         assert_eq!(dragged.pos, [3.0, 4.0, 0.0]);
-        assert_eq!((dragged.range, dragged.muffle, dragged.direct), (40.0, 5, true));
+        assert_eq!(
+            (dragged.range, dragged.muffle, dragged.direct),
+            (40.0, 5, true)
+        );
 
         // A first placement takes the documented defaults, and clamps
         let fresh = merge_source(None, [0.0; 3], None, None, None, None);
@@ -1340,7 +1355,10 @@ mod tests {
         assert_eq!((fresh.volume, fresh.muffle, fresh.direct), (1.0, 0, false));
         let wild = merge_source(None, [0.0; 3], Some(0.0), Some(9.0), Some(250), None);
         assert_eq!(wild.range, 0.01);
-        assert_eq!((wild.volume, wild.muffle), (2.0, voipc_audio::spatial::MAX_MUFFLE));
+        assert_eq!(
+            (wild.volume, wild.muffle),
+            (2.0, voipc_audio::spatial::MAX_MUFFLE)
+        );
     }
 
     #[test]
@@ -1359,6 +1377,9 @@ mod tests {
         );
         state.clear_positions();
         assert!(state.sources.is_empty());
-        assert!(state.test.is_some(), "the settings-panel test is not a placement");
+        assert!(
+            state.test.is_some(),
+            "the settings-panel test is not a placement"
+        );
     }
 }

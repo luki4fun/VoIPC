@@ -9,7 +9,7 @@ use ringbuf::HeapRb;
 use tracing::{error, info, warn};
 
 use crate::device;
-use crate::resample::LinearResampler;
+use crate::resample::Resampler;
 
 /// The sample rate Opus expects. We prefer this on the capture device;
 /// if unsupported, samples are resampled to 48kHz before hitting the ring.
@@ -34,7 +34,7 @@ fn push_input(
     data: &[f32],
     channels: usize,
     gain: f32,
-    resampler: &mut Option<LinearResampler>,
+    resampler: &mut Option<Resampler>,
     mono: &mut Vec<f32>,
     resampled: &mut Vec<f32>,
 ) {
@@ -42,15 +42,12 @@ fn push_input(
         data
     } else if channels == 1 {
         mono.clear();
-        mono.extend(data.iter().map(|s| (s * gain).clamp(-1.0, 1.0)));
+        mono.extend(data.iter().map(|s| s * gain));
         mono
     } else {
         // If stereo or multi-channel, take only the first channel
         mono.clear();
-        mono.extend(
-            data.chunks(channels)
-                .map(|c| (c[0] * gain).clamp(-1.0, 1.0)),
-        );
+        mono.extend(data.chunks(channels).map(|c| c[0] * gain));
         mono
     };
     match resampler {
@@ -87,8 +84,12 @@ pub fn start_capture(
 
     let default_rate = config.sample_rate().0;
     let actual_rate = if default_rate == TARGET_SAMPLE_RATE
-        || device::input_supports_rate(&device, sample_format, config.channels(), TARGET_SAMPLE_RATE)
-    {
+        || device::input_supports_rate(
+            &device,
+            sample_format,
+            config.channels(),
+            TARGET_SAMPLE_RATE,
+        ) {
         TARGET_SAMPLE_RATE
     } else {
         warn!(
@@ -111,8 +112,8 @@ pub fn start_capture(
         "starting audio capture"
     );
 
-    let mut resampler =
-        (actual_rate != TARGET_SAMPLE_RATE).then(|| LinearResampler::new(actual_rate, TARGET_SAMPLE_RATE));
+    let mut resampler = (actual_rate != TARGET_SAMPLE_RATE)
+        .then(|| Resampler::new(actual_rate, TARGET_SAMPLE_RATE));
     let mut mono: Vec<f32> = Vec::new();
     let mut resampled: Vec<f32> = Vec::new();
 
@@ -129,7 +130,15 @@ pub fn start_capture(
             &stream_config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 let g = f32::from_bits(gain.load(Ordering::Relaxed));
-                push_input(&mut producer, data, channels, g, &mut resampler, &mut mono, &mut resampled);
+                push_input(
+                    &mut producer,
+                    data,
+                    channels,
+                    g,
+                    &mut resampler,
+                    &mut mono,
+                    &mut resampled,
+                );
             },
             error_cb,
             None,
@@ -147,7 +156,15 @@ pub fn start_capture(
                             .extend(data.chunks(channels).map(|c| c[0] as f32 / i16::MAX as f32));
                     }
                     let g = f32::from_bits(gain.load(Ordering::Relaxed));
-                    push_input(&mut producer, &converted, 1, g, &mut resampler, &mut mono, &mut resampled);
+                    push_input(
+                        &mut producer,
+                        &converted,
+                        1,
+                        g,
+                        &mut resampler,
+                        &mut mono,
+                        &mut resampled,
+                    );
                 },
                 error_cb,
                 None,

@@ -13,7 +13,9 @@
   // keeps them too, so the same checks can run against either layout.
 
   import { channels, currentChannelId, previewChannelId } from "../stores/channels.js";
+  import { visibleChannels } from "../stores/roster.js";
   import { isAdmin, serverAddress } from "../stores/connection.js";
+  import { account } from "../stores/account.js";
   import {
     activeTextChannelId,
     channelUnread,
@@ -37,19 +39,10 @@
   import { shortName } from "../username.js";
   import ChannelCreateForm from "./ChannelCreateForm.svelte";
   import Icon from "./Icons.svelte";
+  import ChannelTags from "./ChannelTags.svelte";
 
   let currentChannelName = $derived(
     $channels.find((c) => c.channel_id === $currentChannelId)?.name ?? ""
-  );
-
-  // A hidden channel is not listed, unless you are an admin or standing in it.
-  // Nor is the lobby, channel 0: it is where the server keeps everyone who is
-  // in no voice channel, which is not a place anybody goes. Its people are the
-  // member list's "Online" group.
-  let visibleChannels = $derived(
-    $channels.filter(
-      (c) => c.channel_id !== 0 && (!c.hidden || $isAdmin || c.channel_id === $currentChannelId),
-    ),
   );
 </script>
 
@@ -58,7 +51,7 @@
     <span>Channels</span>
     <span class="header-actions">
       {#if $currentChannelId !== 0}
-        <button class="add-btn" onclick={copyInviteLink} title="Copy invite link for #{currentChannelName}">
+        <button aria-label="Copy invite link for #{currentChannelName}" class="add-btn" onclick={copyInviteLink} title="Copy invite link for #{currentChannelName}">
           <Icon name="link" size={16} />
         </button>
       {/if}
@@ -71,12 +64,14 @@
 
 
   <div class="channels">
-    {#each visibleChannels as channel (channel.channel_id)}
+    {#each $visibleChannels as channel (channel.channel_id)}
       {@const subscribed = channel.text && $joinedTextChannelIds.has(channel.channel_id)}
       {@const left = channel.text && !subscribed && $leftTextChannelNames.has(channel.name)}
       {@const unread = channelUnread($unreadPerChannel, $serverAddress, channel.name)}
+      <div class="channel-row">
       <button
         class="channel"
+        class:has-actions={subscribed || canEditChannel(channel)}
         class:active={channel.text
           ? $activeTextChannelId === channel.channel_id
           : channel.channel_id === $currentChannelId}
@@ -112,49 +107,38 @@
             {channel.proximity.toUpperCase()}
           </span>
         {/if}
-        {#if channel.anonymous}
-          <span class="proximity-tag" title="Anonymous: members see each other under random names">?</span>
-        {/if}
-        {#if channel.hidden}
-          <span class="proximity-tag" title="Hidden: only admins see this channel in the list">H</span>
-        {/if}
         {#if left}
           <span class="proximity-tag" title="You left this channel — click to read, rejoin to write">left</span>
         {/if}
-        {#if channel.routed}
-          <span
-            class="proximity-tag"
-            title="Routed: the server is told which members you want to hear, and forwards only their voice"
-            >R</span
-          >
-        {/if}
+        <ChannelTags {channel} />
         {#if !(channel.hide_members && !$isAdmin)}
           <span class="user-count">({channel.user_count}{#if channel.max_users > 0}/{channel.max_users}{/if})</span>
         {/if}
         {#if unread > 0}
           <span class="channel-unread">{unread}</span>
         {/if}
-        {#if subscribed}
-          <!-- svelte-ignore a11y_click_events_have_key_events -->
-          <span
-            class="settings-icon"
-            title="Leave this channel"
-            role="button"
-            tabindex="-1"
-            onclick={(e) => { e.stopPropagation(); leaveTextChannel(channel.channel_id); }}
-          ><Icon name="close" size={14} /></span>
-        {/if}
-        {#if canEditChannel(channel)}
-          <!-- svelte-ignore a11y_click_events_have_key_events -->
-          <span
-            class="settings-icon"
-            title="Channel settings"
-            role="button"
-            tabindex="-1"
-            onclick={(e) => openChannelSettings(channel.channel_id, e)}
-          ><Icon name="channel-settings" size={14} /></span>
-        {/if}
       </button>
+      {#if subscribed || canEditChannel(channel)}
+        <span class="row-actions">
+          {#if subscribed}
+            <button
+              class="settings-icon"
+              title={channel.log && $account?.cloud ? "Leave this channel: its kept messages stop coming to you; what you have stays" : "Leave this channel"}
+              aria-label={channel.log && $account?.cloud ? "Leave this channel: its kept messages stop coming to you; what you have stays" : "Leave this channel"}
+              onclick={() => leaveTextChannel(channel.channel_id)}
+            ><Icon name="close" size={14} /></button>
+          {/if}
+          {#if canEditChannel(channel)}
+            <button
+              class="settings-icon"
+              title="Channel settings"
+              aria-label="Channel settings"
+              onclick={(e) => openChannelSettings(channel.channel_id, e)}
+            ><Icon name="channel-settings" size={14} /></button>
+          {/if}
+        </span>
+      {/if}
+      </div>
     {/each}
   </div>
 
@@ -255,7 +239,8 @@
     touch-action: manipulation;
   }
 
-  .channel:hover {
+  .channel:hover,
+  .channel-row:hover > .channel {
     background: var(--bg-hover);
     color: var(--text-primary);
   }
@@ -320,7 +305,8 @@
     color: var(--text-secondary);
   }
 
-  .proximity-tag {
+  .proximity-tag,
+  .channel :global(.proximity-tag) {
     font-size: 9px;
     font-weight: 600;
     letter-spacing: 0.05em;
@@ -341,15 +327,40 @@
     margin-left: auto;
   }
 
+  /* The row's own controls are buttons beside the row's button, not spans
+     inside it: a button in a button is invalid, and Tab never reached them
+     (H5-04). They sit over the row's right edge, as they did. */
+  .channel-row {
+    position: relative;
+  }
+
+  .row-actions {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    gap: 4px;
+  }
+
   .settings-icon {
     display: none;
     align-items: center;
+    padding: 2px;
+    background: none;
+    border: none;
     color: var(--text-secondary);
     cursor: pointer;
   }
 
-  .channel:hover .settings-icon {
+  .channel-row:hover .settings-icon,
+  .channel-row:focus-within .settings-icon {
     display: flex;
+  }
+
+  .channel-row:hover > .channel.has-actions,
+  .channel-row:focus-within > .channel.has-actions {
+    padding-right: 52px;
   }
 
   /* A touch screen has no hover: without this the leave ✕ and the settings
@@ -358,6 +369,9 @@
   @media (hover: none) {
     .settings-icon {
       display: flex;
+    }
+    .channel.has-actions {
+      padding-right: 52px;
     }
   }
 

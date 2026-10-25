@@ -43,8 +43,8 @@ function buildStamp() {
         .toString()
         .trim();
     } catch {
-      // No git binary, or no checkout to ask: the release image drops .git
-      // (see .dockerignore), so that build stamps VOIPC_BUILD_HASH or nothing.
+      // No git binary, or no checkout to ask (a git archive copy): that
+      // build stamps VOIPC_BUILD_HASH or nothing.
       return "";
     }
   };
@@ -55,7 +55,13 @@ function buildStamp() {
     !pinned && head && git("status", "--porcelain", "--untracked-files=no");
   return {
     hash: head ? `${head}${dirty ? "+" : ""}` : "no-git",
-    time: new Date().toISOString(),
+    // SOURCE_DATE_EPOCH (the commit's time in CI) keeps the bundle
+    // reproducible; a local build stamps its own time.
+    time: new Date(
+      process.env.SOURCE_DATE_EPOCH
+        ? Number(process.env.SOURCE_DATE_EPOCH) * 1000
+        : Date.now(),
+    ).toISOString(),
   };
 }
 
@@ -72,9 +78,15 @@ export default defineConfig(({ mode }) => {
       port: 1420,
       strictPort: true,
     },
-    envPrefix: ["VITE_", "TAURI_"],
+    // TAURI_ENV_*, not TAURI_*: TAURI_SIGNING_PRIVATE_KEY is a TAURI_ name
+    // too, and only tree-shaking would keep it out of the bundle.
+    envPrefix: ["VITE_", "TAURI_ENV_"],
     define: {
       __WEB__: web,
+      // The headless self-test (src/web/selftest.ts) connects, joins, writes
+      // and opens the microphone with nothing on screen, for any page loaded
+      // with `?selftest`. A test build only: `VOIPC_SELFTEST=1 npm run web`.
+      __SELFTEST__: web && process.env.VOIPC_SELFTEST === "1",
       __APP_VERSION__: JSON.stringify(pkg.version),
       __BUILD_HASH__: JSON.stringify(stamp.hash),
       __BUILD_TIME__: JSON.stringify(stamp.time),
@@ -82,8 +94,8 @@ export default defineConfig(({ mode }) => {
     resolve: web ? { alias: webAliases } : undefined,
     build: {
       target: "esnext",
-      minify: !process.env.TAURI_DEBUG ? "esbuild" : false,
-      sourcemap: !!process.env.TAURI_DEBUG,
+      minify: !process.env.TAURI_ENV_DEBUG ? "esbuild" : false,
+      sourcemap: !!process.env.TAURI_ENV_DEBUG,
       // assetsInlineLimit 0: an inlined `data:` URL cannot be passed to
       // audioWorklet.addModule (browsers and our CSP reject it), and the
       // capture worklet is small enough that Vite would inline it.

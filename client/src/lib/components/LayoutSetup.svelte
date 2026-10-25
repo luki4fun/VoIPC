@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { dialog } from "../actions/dialog.js";
   // "Which of these do you want?", once.
   //
   // Shown on the first connection, right after the audio setup and for the same
@@ -37,8 +38,8 @@
   }
 </script>
 
-<div class="overlay" role="dialog" aria-modal="true" aria-label="Choose a layout">
-  <div class="layout-setup">
+<div class="overlay">
+  <div class="layout-setup" aria-label="Choose a layout" use:dialog>
     <h3>How should VoIPC look?</h3>
     <p class="intro">
       Two layouts, the same app underneath. Pick whichever feels familiar — you can change it

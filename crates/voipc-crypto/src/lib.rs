@@ -7,17 +7,25 @@
 //! - Group encryption via Sender Keys
 //! - Symmetric AES-256-GCM encryption for voice/video media
 //!
-//! Signal state is deliberately not persisted: identities are ephemeral per
-//! launch (no accounts, nothing to fingerprint or link across sessions).
+//! Signal state is deliberately not persisted: a guest's identity is new on
+//! every connect (nothing to fingerprint or link across sessions). An
+//! account's identity lives in its vault (`account`), and peers pin it.
 
+pub mod account;
+pub mod account_session;
+mod aead;
 pub mod channel_state;
 pub mod envelope;
+#[cfg(any(test, fuzzing))]
+pub mod fuzz;
 pub mod group;
 pub mod identity;
+pub mod log;
 pub mod media_keys;
 pub mod prekey;
 pub mod session;
 pub mod stores;
+pub mod sync;
 pub mod time;
 
 // Re-export key types for convenience
@@ -27,6 +35,13 @@ pub use envelope::{
     MAX_MESSAGE_TTL_SECS,
 };
 pub use identity::{generate_identity_key_pair, SerializableIdentityKeyPair};
-pub use media_keys::{MediaKey, MediaKeyRing, build_aad, media_decrypt, media_encrypt, MAX_SEQUENCE_BEFORE_ROTATION};
-pub use prekey::PreKeySet;
+pub use media_keys::{
+    build_aad, media_decrypt, media_encrypt, MediaKey, MediaKeyRing, MAX_SEQUENCE_BEFORE_ROTATION,
+};
 pub use stores::SignalStores;
+
+/// The OS's randomness, in the form libsignal's APIs take.
+pub fn rng() -> impl rand::CryptoRng {
+    use rand::TryRngCore;
+    rand::rngs::OsRng.unwrap_err()
+}

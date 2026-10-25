@@ -195,7 +195,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let label = format!("tcp:{}", peer.ip());
-    info!(peer = %label, "session established over the TCP fallback");
+    // test-web.sh counts this line; the address only at debug
+    info!("session established over the TCP fallback");
+    debug!(peer = %label, "tunnel opened");
 
     let SessionStart {
         mut handler,
@@ -257,7 +259,7 @@ where
         warn!(peer = %label, "control handler did not exit after EOF, aborting");
         handler.abort();
     }
-    info!(peer = %label, "session ended");
+    debug!(peer = %label, "session ended");
 }
 
 /// Client → server: control chunks into the handler's duplex, media packets
@@ -390,8 +392,7 @@ mod tests {
     use bytes::BytesMut;
 
     use voipc_protocol::codec::{
-        decode_server_msg, encode_client_msg, encode_server_msg, try_decode_frame, APP_VERSION,
-        PROTOCOL_VERSION,
+        decode_server_msg, encode_client_msg, encode_server_msg, try_decode_frame, PROTOCOL_VERSION,
     };
     use voipc_protocol::messages::{ClientMessage, ServerMessage};
     use voipc_protocol::video::VideoPacket;
@@ -469,16 +470,18 @@ mod tests {
         }
 
         async fn send_control(&mut self, msg: &ClientMessage) {
-            self.send(&[&[0x00], &encode_client_msg(msg).unwrap()]).await;
+            self.send(&[&[0x00], &encode_client_msg(msg).unwrap()])
+                .await;
         }
 
-        async fn authenticate(&mut self, app_version: &str) {
+        async fn authenticate(&mut self, protocol_version: u32) {
             self.send_control(&ClientMessage::Authenticate {
                 username: "tunnel".into(),
-                protocol_version: PROTOCOL_VERSION,
-                app_version: app_version.into(),
+                protocol_version,
+                app_version: "1.0.0".into(),
                 identity_key: None,
                 prekey_bundle: None,
+                account: None,
             })
             .await;
         }
@@ -539,7 +542,7 @@ mod tests {
         let state = test_state();
         let mut client = Client::connect(&state).await;
 
-        client.authenticate(APP_VERSION).await;
+        client.authenticate(PROTOCOL_VERSION).await;
         let session_id = match client.next_control().await {
             ServerMessage::Authenticated { session_id, .. } => session_id,
             other => panic!("unexpected reply: {other:?}"),
@@ -547,31 +550,60 @@ mod tests {
         assert_eq!(state.sessions.len(), 1);
 
         // Media: a ping comes back as a pong
-        client.send(&[&VoicePacket::ping(session_id, 77).to_bytes()]).await;
-        let pong = client.next_media(Duration::from_secs(5)).await.expect("pong");
+        client
+            .send(&[&VoicePacket::ping(session_id, 77).to_bytes()])
+            .await;
+        let pong = client
+            .next_media(Duration::from_secs(5))
+            .await
+            .expect("pong");
         let pong = VoicePacket::from_bytes(&pong).unwrap();
         assert_eq!(pong.packet_type, VoicePacketType::Pong);
         assert_eq!(pong.sequence, 77);
 
         // A foreign session id in the header is dropped, not answered
-        client.send(&[&VoicePacket::ping(session_id + 1, 78).to_bytes()]).await;
-        assert!(client.next_media(Duration::from_millis(300)).await.is_none());
+        client
+            .send(&[&VoicePacket::ping(session_id + 1, 78).to_bytes()])
+            .await;
+        assert!(client
+            .next_media(Duration::from_millis(300))
+            .await
+            .is_none());
 
         // Video: fragments, one message each, are accepted (no viewers, so
         // they go nowhere) and the session stays healthy
         for index in 0..2u8 {
-            let packet =
-                VideoPacket::encrypted_fragment(true, session_id, 1, index, 2, 0, 1, 0x5EED, vec![7; 100])
-                    .to_bytes();
+            let packet = VideoPacket::encrypted_fragment(
+                true,
+                session_id,
+                1,
+                index,
+                2,
+                0,
+                1,
+                0x5EED,
+                vec![7; 100],
+            )
+            .to_bytes();
             client.send(&[&packet]).await;
         }
-        client.send(&[&VoicePacket::ping(session_id, 79).to_bytes()]).await;
-        let pong = client.next_media(Duration::from_secs(5)).await.expect("pong after video");
+        client
+            .send(&[&VoicePacket::ping(session_id, 79).to_bytes()])
+            .await;
+        let pong = client
+            .next_media(Duration::from_secs(5))
+            .await
+            .expect("pong after video");
         assert_eq!(VoicePacket::from_bytes(&pong).unwrap().sequence, 79);
 
         // Closing the tunnel cleans the session up
         let mut close = Vec::new();
-        ws::encode_frame(&mut close, ws::OP_CLOSE, &[&1000u16.to_be_bytes()], Some(KEY));
+        ws::encode_frame(
+            &mut close,
+            ws::OP_CLOSE,
+            &[&1000u16.to_be_bytes()],
+            Some(KEY),
+        );
         client.io.write_all(&close).await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
             while !state.sessions.is_empty() {
@@ -588,9 +620,11 @@ mod tests {
     async fn a_refused_login_hears_why_before_the_tunnel_closes() {
         let state = test_state();
         let mut client = Client::connect(&state).await;
-        client.authenticate("0.0.0").await;
+        client.authenticate(PROTOCOL_VERSION - 1).await;
         match client.next_control().await {
-            ServerMessage::AuthError { reason } => assert!(reason.contains("version mismatch"), "{reason}"),
+            ServerMessage::AuthError { reason } => {
+                assert!(reason.contains("version mismatch"), "{reason}")
+            }
             other => panic!("unexpected reply: {other:?}"),
         }
         assert_eq!(client.next().await, Some(Message::Close));
@@ -601,7 +635,7 @@ mod tests {
     async fn a_kick_reason_arrives_before_the_tunnel_closes() {
         let state = test_state();
         let mut client = Client::connect(&state).await;
-        client.authenticate(APP_VERSION).await;
+        client.authenticate(PROTOCOL_VERSION).await;
         let session_id = match client.next_control().await {
             ServerMessage::Authenticated { session_id, .. } => session_id,
             other => panic!("unexpected reply: {other:?}"),
@@ -610,8 +644,13 @@ mod tests {
         // What an admin kick does (tcp::force_disconnect)
         let close = {
             let session = state.sessions.get(&session_id).unwrap();
-            let reason = ServerMessage::Disconnected { reason: "bye".into() };
-            session.tcp_tx.try_send(encode_server_msg(&reason).unwrap()).unwrap();
+            let reason = ServerMessage::Disconnected {
+                reason: "bye".into(),
+            };
+            session
+                .tcp_tx
+                .try_send(encode_server_msg(&reason).unwrap())
+                .unwrap();
             session.close.clone()
         };
         close.notify_one();
@@ -631,13 +670,22 @@ mod tests {
         for (request, status) in [
             (UPGRADE.replacen("/voipc", "/other", 1), "404"),
             (UPGRADE.replacen("GET", "POST", 1), "405"),
-            (UPGRADE.replacen("Sec-WebSocket-Version: 13", "Sec-WebSocket-Version: 8", 1), "426"),
-            ("GET /voipc HTTP/1.1\r\nHost: test\r\n\r\n".to_string(), "400"),
+            (
+                UPGRADE.replacen("Sec-WebSocket-Version: 13", "Sec-WebSocket-Version: 8", 1),
+                "426",
+            ),
+            (
+                "GET /voipc HTTP/1.1\r\nHost: test\r\n\r\n".to_string(),
+                "400",
+            ),
         ] {
             let mut io = open(&state);
             io.write_all(request.as_bytes()).await.unwrap();
             let (head, _) = read_head(&mut io).await;
-            assert!(head.starts_with(&format!("HTTP/1.1 {status}")), "{request:?} got {head}");
+            assert!(
+                head.starts_with(&format!("HTTP/1.1 {status}")),
+                "{request:?} got {head}"
+            );
         }
         assert!(state.sessions.is_empty());
     }
@@ -666,7 +714,10 @@ mod tests {
             video_tx.send(Bytes::from(vec![0x13, i])).await.unwrap();
         }
         handler_write.write_all(b"ctl").await.unwrap();
-        datagram_tx.send(Bytes::from_static(&[0x05, 9])).await.unwrap();
+        datagram_tx
+            .send(Bytes::from_static(&[0x05, 9]))
+            .await
+            .unwrap();
 
         let (mut client, server) = tokio::io::duplex(1 << 16);
         let writer = tokio::spawn(write_side(server, bridge_read, datagram_rx, video_rx));

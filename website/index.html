@@ -4,14 +4,14 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>VoIPC — self-hosted encrypted voice, video &amp; chat</title>
-  <meta name="description" content="VoIPC is an open-source, self-hosted alternative to Discord and TeamSpeak. Signal Protocol chat, AES-256-GCM voice and screen sharing, and a relay server that stores nothing.">
+  <meta name="description" content="VoIPC is an open-source, self-hosted alternative to Discord and TeamSpeak. Signal Protocol chat, AES-256-GCM voice and screen sharing, and a relay server that stores nothing by default.">
   <meta name="theme-color" content="#1a1a2e">
   <meta name="color-scheme" content="dark">
   <link rel="icon" type="image/png" href="favicon.png">
   <link rel="apple-touch-icon" href="apple-touch-icon.png">
   <!-- TODO: replace og:url/og:image with the absolute deployed URL -->
   <meta property="og:title" content="VoIPC — self-hosted encrypted voice, video &amp; chat">
-  <meta property="og:description" content="Open-source Discord/TeamSpeak alternative. Signal Protocol chat, AES-256-GCM media, zero-persistence relay server.">
+  <meta property="og:description" content="Open-source Discord/TeamSpeak alternative. Signal Protocol chat, AES-256-GCM media, a relay server that stores nothing by default.">
   <meta property="og:type" content="website">
   <meta property="og:image" content="screenshots/og.png">
   <meta property="og:image:width" content="1200">
@@ -468,11 +468,11 @@
 <section id="top">
   <div class="container hero-grid">
     <div>
-      <p class="hero-meta"><a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">v0.11.0</a> · MIT · Linux / Windows / Android / Browser</p>
+      <p class="hero-meta"><a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">v1.0.0</a> · MIT · Linux / Windows / Android / Browser</p>
       <h1>Voice, screen sharing, and chat — on a server you run.</h1>
-      <p class="hero-sub">VoIPC is an open-source alternative to Discord and TeamSpeak. Messages are encrypted with the Signal Protocol, voice and video with AES-256-GCM, and the relay server keeps nothing: no accounts, no database, no logs.</p>
+      <p class="hero-sub">VoIPC is an open-source alternative to Discord and TeamSpeak. Messages are encrypted with the Signal Protocol, voice and video with AES-256-GCM, and by default the relay server keeps nothing: no accounts, no database, no logs. Turn on accounts and it keeps a database of them, and end-to-end-encrypted copies of messages for members who want them.</p>
       <div class="hero-buttons">
-        <a class="btn btn-primary" href="https://github.com/luki4fun/voipc/releases">Download</a>
+        <a class="btn btn-primary" href="https://github.com/luki4fun/voipc/releases/latest">Download</a>
         <a class="btn btn-outline" href="https://github.com/luki4fun/voipc">Source</a>
       </div>
     </div>
@@ -518,7 +518,7 @@
     <div class="feature-row">
       <div>
         <h3>Chat &amp; servers</h3>
-        <p>Channel messages and DMs ride the Signal Protocol — the server relays ciphertext it cannot read. History is optional and stays on your disk, encrypted.</p>
+        <p>Channel messages and DMs ride the Signal Protocol — the server relays ciphertext it cannot read. History is optional and kept on your disk, encrypted. A server with accounts can also hold end-to-end-encrypted copies for you, if you choose.</p>
         <ul>
           <li>Saved servers in the connect dialog; optional auto-connect</li>
           <li>Password-protected channels, invites, pokes (encrypted too)</li>
@@ -562,7 +562,7 @@
         <li>Screen share adapts bitrate and fps to what the link can carry</li>
         <li>Android client: voice and screen-share viewing on the go</li>
         <li>Invite links that open the browser client straight into a channel</li>
-        <li>Admin sessions via a server token: kick and IP-ban, no accounts needed</li>
+        <li>Admin sessions via a server token: kick and IP-ban, no accounts needed (with accounts: admin and moderator roles, behind two-factor codes)</li>
         <li>IPv6 dual-stack, TOFU certificate pinning for self-signed certs</li>
       </ul>
     </div>
@@ -638,7 +638,7 @@
           </div>
           <div class="demo-msg">
             <span class="demo-av" style="background:#f4a261">A</span>
-            <div><span class="demo-who">Ada</span><div class="demo-text">the server keeps none of this, by the way</div></div>
+            <div><span class="demo-who">Ada</span><div class="demo-text">the server can't read any of this, by the way</div></div>
           </div>
         </div>
         <div class="demo-input">Message #Lounge…</div>
@@ -715,10 +715,10 @@
       <div class="spec-card">
         <h3>Protocol</h3>
         <dl>
-          <dt>Version</dt><dd>v7, postcard binary serialization</dd>
+          <dt>Version</dt><dd>v12, postcard binary serialization</dd>
           <dt>Control</dt><dd>QUIC stream, TLS 1.3 (rustls), max 64 KiB/msg</dd>
           <dt>Media</dt><dd>QUIC datagrams (voice ≤ 512 B), one stream per video frame</dd>
-          <dt>Headers</dt><dd>9 B voice · 15 B video</dd>
+          <dt>Headers</dt><dd>15 B voice · 21 B video (encrypted)</dd>
           <dt>Port</dt><dd>9987 UDP (QUIC) + TCP (browser page, opt-in TCP fallback where UDP is blocked)</dd>
           <dt>Network</dt><dd>IPv6 dual-stack, QUIC connection migration</dd>
         </dl>
@@ -727,11 +727,11 @@
         <h3>Server</h3>
         <dl>
           <dt>Runtime</dt><dd>Tokio, single static binary, SFU relay</dd>
-          <dt>State</dt><dd>Memory only — restart wipes everything</dd>
+          <dt>State</dt><dd>Memory only by default — restart wipes everything; opt-in accounts keep a SQLite or Postgres database</dd>
           <dt>Defaults</dt><dd>64 users, 50 channels, auto-cleanup</dd>
-          <dt>Limits</dt><dd>256 connections, 5 per IP, token-bucket rates</dd>
+          <dt>Limits</dt><dd>144 connections by default (2 × max users + 16), 32 per IP, token-bucket rates</dd>
           <dt>Rooms</dt><dd>Optional persistent <code>channels.json</code></dd>
-          <dt>Secrets</dt><dd>Zeroized on drop, never on disk</dd>
+          <dt>Secrets</dt><dd>Channel passwords zeroized on drop; with accounts, a key file seals the two-factor secrets</dd>
         </dl>
       </div>
     </div>
@@ -759,7 +759,7 @@
       <div>
         <h3>Messages — Signal Protocol</h3>
         <ul>
-          <li>X3DH session setup, Double Ratchet, per-message keys, forward secrecy</li>
+          <li>X3DH session setup, Double Ratchet, per-message keys, forward secrecy, except for copies kept on a server with accounts</li>
           <li>Curve25519 identity keys, Ed25519-signed pre-keys, 100 one-time pre-keys auto-replenished</li>
           <li>Sender keys for channel messages; the official libsignal crate does the crypto</li>
         </ul>
@@ -784,7 +784,7 @@
         <h3>At rest — your vault, your password</h3>
         <ul>
           <li>Chat history: PBKDF2-HMAC-SHA256 at 600,000 iterations + AES-256-GCM, fresh salt and nonce per file</li>
-          <li>Signal state encrypted separately; every secret wrapped in <code>Zeroizing&lt;T&gt;</code>, wiped from memory on drop</li>
+          <li>No Signal session state is ever written to disk; key material is held in <code>Zeroizing&lt;T&gt;</code>, wiped from memory on drop</li>
         </ul>
       </div>
     </div>
@@ -794,8 +794,9 @@
       <div>
         <h3>Server — blind by design</h3>
         <ul>
-          <li>Never sees plaintext messages, never decodes media, never writes to disk</li>
-          <li>Restart equals clean slate: there is nothing to seize, leak, or subpoena</li>
+          <li>Never sees plaintext messages, never decodes media, and without accounts never writes to disk</li>
+          <li>Without accounts, restart equals clean slate: there is nothing to seize, leak, or subpoena</li>
+          <li>With accounts there is a database: names, sign-ins, who wrote where and when, and ciphertext it cannot open</li>
         </ul>
       </div>
     </div>
@@ -810,12 +811,22 @@
     <p class="section-sub">Exactly what is stored, and by whom. No fine print.</p>
     <div class="trans-grid">
       <div class="trans-card">
-        <h3 class="mid">Server keeps (RAM only)</h3>
+        <h3 class="mid">Server keeps (RAM only, without accounts)</h3>
         <ul>
           <li>Usernames &amp; channel membership while connected</li>
           <li>Channel names and hashed passwords</li>
           <li>Connection addresses during the session</li>
           <li>Encrypted media keys and pre-key bundles</li>
+        </ul>
+      </div>
+      <div class="trans-card">
+        <h3 class="mid">With accounts (opt-in), on disk</h3>
+        <ul>
+          <li>Account names and roles; a hash of a password-derived secret</li>
+          <li>Public identity and device keys; sealed two-factor secrets</li>
+          <li>Sign-in records, with addresses hashed</li>
+          <li>Vaults and kept messages it cannot open</li>
+          <li>Who wrote where, when and how much; which channels each account keeps</li>
         </ul>
       </div>
       <div class="trans-card">
@@ -831,18 +842,18 @@
         <h3>Your device stores</h3>
         <ul>
           <li>Encrypted chat history (optional)</li>
-          <li>Encrypted Signal Protocol state</li>
           <li>Audio/video settings, saved servers</li>
           <li>Max 500 messages per channel, rotated</li>
+          <li>With an account: a remembered device's key and your vault's key</li>
         </ul>
       </div>
       <div class="trans-card">
         <h3 class="ok">Nobody stores</h3>
         <ul>
           <li>Analytics or telemetry — there is none</li>
-          <li>Accounts or profiles — they don't exist</li>
-          <li>Server-side message logs</li>
-          <li>Anything after the server restarts</li>
+          <li>Accounts or profiles — unless the operator turns accounts on</li>
+          <li>Server-side message logs — only encrypted copies members choose</li>
+          <li>Anything after a restart, on a server without accounts</li>
         </ul>
       </div>
     </div>
@@ -892,8 +903,8 @@
           <tr><td>E2E voice &amp; video</td><td class="ok">Yes — AES-256-GCM</td><td class="mid">Partial — DAVE (voice/DM calls)</td><td class="no">No</td></tr>
           <tr><td>Self-hosted</td><td class="ok">Yes</td><td class="no">No</td><td class="ok">Yes</td></tr>
           <tr><td>Open source</td><td class="ok">Yes — MIT</td><td class="no">No</td><td class="no">No</td></tr>
-          <tr><td>Account required</td><td class="ok">No</td><td class="no">Yes</td><td class="ok">No</td></tr>
-          <tr><td>Server persistence</td><td class="ok">None — memory only</td><td class="no">Cloud, retained</td><td class="mid">Logs &amp; database</td></tr>
+          <tr><td>Account required</td><td class="ok">No — unless the server requires one</td><td class="no">Yes</td><td class="ok">No</td></tr>
+          <tr><td>Server persistence</td><td class="ok">None by default — opt-in accounts add a database</td><td class="no">Cloud, retained</td><td class="mid">Logs &amp; database</td></tr>
           <tr><td>Screen share</td><td class="ok">H.264 or H.265, GPU-encoded, 1080p60</td><td class="mid">H.264/VP8, higher tiers paid</td><td class="mid">Limited</td></tr>
           <tr><td>Runs in a browser</td><td class="ok">Yes — E2E encrypted, self-hosted</td><td class="ok">Yes</td><td class="no">No</td></tr>
           <tr><td>Cost</td><td class="ok">Free — your hardware</td><td class="mid">Free + paid tiers</td><td class="mid">Free tier, licensed beyond</td></tr>
@@ -932,9 +943,9 @@
     <div class="dl-grid">
       <div>
         <h3>Client</h3>
-        <p>Prebuilt packages on the <a href="https://github.com/luki4fun/voipc/releases">GitHub releases page</a>, or build from source — <code>setup.sh</code> / <code>setup.ps1</code> installs the dependencies, <code>npm run build</code> builds. See <a href="https://github.com/luki4fun/voipc/blob/main/BUILDING.md">BUILDING.md</a> for the per-platform details.</p>
+        <p>Prebuilt packages on the <a href="https://github.com/luki4fun/voipc/releases/latest">GitHub releases page</a>, or build from source — <code>setup.sh</code> / <code>setup.ps1</code> installs the dependencies, <code>npm run build</code> builds. See <a href="https://github.com/luki4fun/voipc/blob/main/BUILDING.md">BUILDING.md</a> for the per-platform details.</p>
         <p>Or install nothing: the server hosts a browser client at <code>https://your-server:9987</code>, with the same Signal and AES-256-GCM encryption compiled to WebAssembly.</p>
-        <a class="btn btn-primary" href="https://github.com/luki4fun/voipc/releases">Releases</a>
+        <a class="btn btn-primary" href="https://github.com/luki4fun/voipc/releases/latest">Releases</a>
       </div>
       <div>
         <h3>Server</h3>
@@ -953,7 +964,7 @@ openssl req -x509 -newkey ec \
 <span class="c"># run (UDP 9987 for QUIC — every client — and TCP 9987 for the browser page;</span>
 <span class="c"># add --tcp-fallback where UDP is blocked)</span>
 ./target/release/voipc-server</pre>
-        <p>Configure via <code>server.toml</code> or CLI flags; drop a <code>channels.json</code> next to the binary for persistent rooms; set <code>admin_token</code> (or take the one printed in the log) to moderate. The same binary serves the browser client over HTTP/2 on the TCP port, and browsers then join the same QUIC endpoint the desktop app uses. A Docker release build (<code>npm run release</code>) produces a static musl binary, an AppImage, and the web bundle.</p>
+        <p>Configure with CLI flags, or a <code>server.toml</code> passed with <code>-c</code>; a <code>channels.json</code> in the directory the server runs from adds persistent rooms; set <code>admin_token</code> (or take the one printed in the log) to moderate. With <a href="https://github.com/luki4fun/voipc/blob/main/docs/ACCOUNTS.md">accounts</a> on, the token only makes the first admin; after that, admin and moderator are account roles. The same binary serves the browser client over HTTP/2 on the TCP port, and browsers then join the same QUIC endpoint the desktop app uses. A Docker release build (<code>npm run release</code>) produces a static musl binary, an AppImage, and the web bundle.</p>
       </div>
     </div>
   </div>

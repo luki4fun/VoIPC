@@ -80,8 +80,7 @@ impl ChannelKeying {
     /// the member list shows them — which is the most an untrusted relay lets
     /// us ask for.
     pub fn shares_channel_with(&self, own_channel: u32, channel_id: u32, user_id: u32) -> bool {
-        self.in_channel(own_channel, channel_id)
-            && self.is_member(channel_id, user_id)
+        self.in_channel(own_channel, channel_id) && self.is_member(channel_id, user_id)
     }
 
     /// Whether `user_id` is in `channel_id`, as the last roster said.
@@ -152,7 +151,12 @@ impl ChannelKeying {
     /// on its own — which is what leaving, re-joining and deleting each did —
     /// cancelled a pending rotation and left us writing on the chain a
     /// departed member still had.
-    pub fn reset_channel(&mut self, stores: Option<&mut SignalStores>, own_user_id: u32, channel_id: u32) {
+    pub fn reset_channel(
+        &mut self,
+        stores: Option<&mut SignalStores>,
+        own_user_id: u32,
+        channel_id: u32,
+    ) {
         if let Some(stores) = stores {
             group::forget_own_sender_key(stores, own_user_id, channel_id);
         }
@@ -163,7 +167,12 @@ impl ChannelKeying {
 
     /// Leave a channel entirely: its keys, its roster and anything we still
     /// wanted from it.
-    pub fn forget_channel(&mut self, stores: Option<&mut SignalStores>, own_user_id: u32, channel_id: u32) {
+    pub fn forget_channel(
+        &mut self,
+        stores: Option<&mut SignalStores>,
+        own_user_id: u32,
+        channel_id: u32,
+    ) {
         self.reset_channel(stores, own_user_id, channel_id);
         self.text_channels.remove(&channel_id);
         self.members.remove(&channel_id);
@@ -206,7 +215,10 @@ impl ChannelKeying {
 
     /// Record that `user_id` now holds our sender key for `channel_id`.
     pub fn record_distributed(&mut self, channel_id: u32, user_id: u32) {
-        self.distributed.entry(channel_id).or_default().insert(user_id);
+        self.distributed
+            .entry(channel_id)
+            .or_default()
+            .insert(user_id);
     }
 
     /// Whether anybody at all holds our sender key for `channel_id` — i.e.
@@ -279,9 +291,9 @@ pub fn history_sources(candidates: &[(u32, bool)], own_user_id: u32) -> HashSet<
 /// each owe an encryption of up to 48 KiB per asker and have a budget for
 /// answering. Spread out, the same work lands on everybody who volunteered.
 pub fn pick_history_sources(sharers: &[u32]) -> HashSet<u32> {
-    use rand::seq::SliceRandom;
+    use rand::seq::IndexedRandom;
     sharers
-        .choose_multiple(&mut rand::rngs::OsRng, HISTORY_SOURCES)
+        .choose_multiple(&mut crate::rng(), HISTORY_SOURCES)
         .copied()
         .collect()
 }
@@ -301,10 +313,22 @@ mod tests {
     #[test]
     fn a_stranger_in_a_channel_we_are_in_is_not_one_of_its_members() {
         let k = keying();
-        assert!(k.shares_channel_with(5, 7, 2), "a member of a text channel we are in");
-        assert!(k.shares_channel_with(5, 5, 3), "a member of the room we stand in");
-        assert!(!k.shares_channel_with(5, 7, 9), "a stranger the relay names");
-        assert!(!k.shares_channel_with(5, 8, 1), "a channel we are not in at all");
+        assert!(
+            k.shares_channel_with(5, 7, 2),
+            "a member of a text channel we are in"
+        );
+        assert!(
+            k.shares_channel_with(5, 5, 3),
+            "a member of the room we stand in"
+        );
+        assert!(
+            !k.shares_channel_with(5, 7, 9),
+            "a stranger the relay names"
+        );
+        assert!(
+            !k.shares_channel_with(5, 8, 1),
+            "a channel we are not in at all"
+        );
     }
 
     #[test]
@@ -350,7 +374,10 @@ mod tests {
         assert!(!who.contains(&1), "never ourselves");
         assert!(!who.contains(&2), "never somebody who does not share");
         // Fewer sharers than the cap is the whole list, not an error
-        assert_eq!(history_sources(&[(1, true), (9, true)], 1), HashSet::from([9]));
+        assert_eq!(
+            history_sources(&[(1, true), (9, true)], 1),
+            HashSet::from([9])
+        );
         assert!(history_sources(&roster, 9).len() == HISTORY_SOURCES);
     }
 

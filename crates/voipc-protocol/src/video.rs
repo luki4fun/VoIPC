@@ -46,7 +46,6 @@ impl VideoPacketType {
                 | Self::EncryptedScreenShareAudio
         )
     }
-
 }
 
 /// Header size: 1 (type) + 4 (session_id) + 4 (frame_id)
@@ -126,6 +125,7 @@ impl VideoPacket {
     }
 
     /// Create an encrypted video fragment packet.
+    #[allow(clippy::too_many_arguments)]
     pub fn encrypted_fragment(
         is_keyframe: bool,
         session_id: u32,
@@ -157,8 +157,7 @@ impl VideoPacket {
     /// Serialize to bytes for transmission.
     pub fn to_bytes(&self) -> Vec<u8> {
         if self.packet_type.is_encrypted() {
-            let mut buf =
-                Vec::with_capacity(ENCRYPTED_VIDEO_HEADER_SIZE + self.payload.len());
+            let mut buf = Vec::with_capacity(ENCRYPTED_VIDEO_HEADER_SIZE + self.payload.len());
             buf.push(self.packet_type as u8);
             buf.extend_from_slice(&self.session_id.to_be_bytes());
             buf.extend_from_slice(&self.frame_id.to_be_bytes());
@@ -308,6 +307,12 @@ pub struct FrameAssembler {
     last_completed_frame_id: Option<u32>,
 }
 
+impl Default for FrameAssembler {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl FrameAssembler {
     pub fn new() -> Self {
         Self {
@@ -330,7 +335,10 @@ impl FrameAssembler {
 
         // Reject zero-fragment packets — they'd produce empty frames
         if packet.fragment_count == 0 {
-            return FragmentResult { frame: None, frame_dropped: false };
+            return FragmentResult {
+                frame: None,
+                frame_dropped: false,
+            };
         }
 
         // New frame arrived — discard any incomplete previous frame
@@ -340,7 +348,10 @@ impl FrameAssembler {
                 let behind = cur.wrapping_sub(frame_id);
                 if behind > 0 && behind < 1000 {
                     // Old/out-of-order frame, ignore
-                    return FragmentResult { frame: None, frame_dropped: false };
+                    return FragmentResult {
+                        frame: None,
+                        frame_dropped: false,
+                    };
                 }
                 // We were assembling a frame that never completed — signal loss
                 if self.received_count > 0 && self.received_count < self.fragment_count {
@@ -352,13 +363,15 @@ impl FrameAssembler {
             self.received_count = 0;
             self.is_keyframe = packet.packet_type.is_keyframe();
             self.fragments.clear();
-            self.fragments
-                .resize(packet.fragment_count as usize, None);
+            self.fragments.resize(packet.fragment_count as usize, None);
         }
 
         let idx = packet.fragment_index as usize;
         if idx >= self.fragments.len() {
-            return FragmentResult { frame: None, frame_dropped };
+            return FragmentResult {
+                frame: None,
+                frame_dropped,
+            };
         }
 
         // Don't double-count
@@ -375,10 +388,8 @@ impl FrameAssembler {
         // Check if frame is complete
         if self.received_count == self.fragment_count {
             let mut frame_data = Vec::new();
-            for frag in &self.fragments {
-                if let Some(data) = frag {
-                    frame_data.extend_from_slice(data);
-                }
+            for data in self.fragments.iter().flatten() {
+                frame_data.extend_from_slice(data);
             }
             let is_keyframe = self.is_keyframe;
             if is_keyframe {
@@ -406,7 +417,10 @@ impl FrameAssembler {
             }
         }
 
-        FragmentResult { frame: None, frame_dropped }
+        FragmentResult {
+            frame: None,
+            frame_dropped,
+        }
     }
 
     /// Whether a keyframe has completed since the last reset (no frame is emitted before one).
@@ -727,7 +741,10 @@ mod tests {
         assert_eq!(packets[0].fragment_count, packets.len() as u8);
 
         let mut assembler = FrameAssembler::new();
-        let mut result = FragmentResult { frame: None, frame_dropped: false };
+        let mut result = FragmentResult {
+            frame: None,
+            frame_dropped: false,
+        };
         for pkt in &packets {
             result = assembler.add_fragment(pkt);
         }
@@ -939,7 +956,10 @@ mod tests {
         let mut grouper = FrameGrouper::default();
         assert_eq!(
             grouper.place(&pkt.to_bytes()),
-            Some(Placement { new_frame: true, last: true })
+            Some(Placement {
+                new_frame: true,
+                last: true
+            })
         );
     }
 
@@ -948,16 +968,25 @@ mod tests {
         let mut grouper = FrameGrouper::default();
         assert_eq!(
             grouper.place(&grouper_fragment(1, 0, 2)),
-            Some(Placement { new_frame: true, last: false })
+            Some(Placement {
+                new_frame: true,
+                last: false
+            })
         );
         assert_eq!(
             grouper.place(&grouper_fragment(1, 1, 2)),
-            Some(Placement { new_frame: false, last: true })
+            Some(Placement {
+                new_frame: false,
+                last: true
+            })
         );
         // The frame is closed: a late duplicate opens a new stream
         assert_eq!(
             grouper.place(&grouper_fragment(1, 1, 2)),
-            Some(Placement { new_frame: true, last: false })
+            Some(Placement {
+                new_frame: true,
+                last: false
+            })
         );
     }
 
@@ -984,13 +1013,19 @@ mod tests {
         }
         assert_eq!(
             grouper.place(&grouper_fragment(7, 2, 3)),
-            Some(Placement { new_frame: true, last: false })
+            Some(Placement {
+                new_frame: true,
+                last: false
+            })
         );
     }
 
     #[test]
     fn grouper_short_packets_are_dropped() {
-        assert_eq!(FrameGrouper::default().place(&[0x13; VIDEO_HEADER_SIZE - 1]), None);
+        assert_eq!(
+            FrameGrouper::default().place(&[0x13; VIDEO_HEADER_SIZE - 1]),
+            None
+        );
     }
 
     #[test]
@@ -1030,10 +1065,7 @@ mod tests {
         let mut data = record(&[4, 5, 6, 7]);
         data.extend_from_slice(&record(&[8]));
         assert!(reader.push(&data[..4]).is_empty());
-        assert_eq!(
-            reader.push(&data[4..]),
-            vec![vec![4u8, 5, 6, 7], vec![8u8]]
-        );
+        assert_eq!(reader.push(&data[4..]), vec![vec![4u8, 5, 6, 7], vec![8u8]]);
 
         // Many records in one push
         let mut reader = RecordReader::default();
@@ -1097,7 +1129,8 @@ mod tests {
 
     #[test]
     fn roundtrip_encrypted_screen_audio_packet() {
-        let original = ScreenShareAudioPacket::new_encrypted(42, 100, 5000, 9, 0xFEED_F00D, vec![1, 2]);
+        let original =
+            ScreenShareAudioPacket::new_encrypted(42, 100, 5000, 9, 0xFEED_F00D, vec![1, 2]);
         let bytes = original.to_bytes();
         assert_eq!(bytes[0], 0x15);
         assert_eq!(bytes.len(), ENCRYPTED_SCREEN_AUDIO_HEADER_SIZE + 2);
@@ -1147,7 +1180,10 @@ mod tests {
         pkt.fragment_count = 3;
         let bytes = pkt.to_bytes();
         let err = VideoPacket::from_bytes(&bytes).unwrap_err();
-        assert!(matches!(err, ProtocolError::InvalidFragmentIndex { index: 5, count: 3 }));
+        assert!(matches!(
+            err,
+            ProtocolError::InvalidFragmentIndex { index: 5, count: 3 }
+        ));
     }
 
     #[test]

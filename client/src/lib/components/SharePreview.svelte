@@ -71,16 +71,16 @@
     <span class="audience">{audience}</span>
     {#if headerExtra}{@render headerExtra()}{/if}
     {#if stage}
-      <button class="bar-btn" onclick={shrink} title="Back to the small preview">
+      <button aria-label="Back to the small preview" class="bar-btn" onclick={shrink} title="Back to the small preview">
         <Icon name="minimize" size={14} />
       </button>
     {:else if $streamStage !== "watch"}
       <!-- While somebody else's share fills the view, ours stays small -->
-      <button class="bar-btn" onclick={enlarge} title="Enlarge the preview">
+      <button aria-label="Enlarge the preview" class="bar-btn" onclick={enlarge} title="Enlarge the preview">
         <Icon name="maximize" size={14} />
       </button>
     {/if}
-    <button class="bar-btn" onclick={hide} title="Hide the preview (the eye by Stop brings it back)">
+    <button aria-label="Hide the preview (the eye by Stop brings it back)" class="bar-btn" onclick={hide} title="Hide the preview (the eye by Stop brings it back)">
       <Icon name="close" size={14} />
     </button>
   </div>

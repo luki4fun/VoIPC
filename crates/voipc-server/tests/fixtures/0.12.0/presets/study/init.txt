@@ -1,0 +1,15 @@
+Wrote channels.json from the "study" preset: 4 text and 6 voice channels.
+
+  #general        text, auto-join
+  #daily-goals    text, auto-join, messages live 1 d
+  #homework-help  text
+  #resources      text
+  Silent Study    voice
+  Library         voice, 2d proximity
+  Group Study 1   voice, max 6
+  Group Study 2   voice, max 6
+  Tutoring        voice, max 2
+  Break Room      voice
+
+Restart the server to load it. To change a password for good, put
+"password": "…" in place of that channel's "password_hash".

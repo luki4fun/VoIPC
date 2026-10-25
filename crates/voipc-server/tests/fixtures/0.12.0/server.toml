@@ -1,0 +1,19 @@
+# Every key a 0.12.0 operator could have: README.md's sample and docs/ACCOUNTS.md's [accounts] block, verbatim from 0.12.0.
+host = "::"               # Bind address — "::" serves IPv6 and IPv4 from one listener; "0.0.0.0" for IPv4 only
+tcp_port = 9987           # HTTPS page for the browser client (and the TCP fallback)
+udp_port = 9987           # QUIC endpoint (all clients) — keep equal to tcp_port so one host:port reaches both
+tcp_fallback = false      # true: clients that cannot reach UDP carry everything over tcp_port (see below)
+max_users = 64
+max_connections_per_ip = 32   # A browser client holds two of these, a native client one — so 32 is sixteen browser users behind one NAT
+cert_path = "certs/server.crt"
+key_path = "certs/server.key"
+admin_token = "change-me"  # optional; unset = a random token is printed in the log at every start (with accounts, only while no account is admin)
+
+[accounts]
+mode = "optional"                 # off | optional | required
+database = "sqlite://voipc.db"    # or postgres://user:pass@host/db
+registration = "invite"           # open | invite | closed
+cloud = true                      # let members keep copies of their messages here
+retention_days = 365              # copies go after this, or sooner by their own timer
+quota_mb = 50                     # per account
+key_file = "voipc-accounts.key"   # made on first start; VOIPC_ACCOUNTS_KEY overrides it

@@ -102,7 +102,7 @@
         <span class="viewer-badge">{$viewerCount}</span>
       {/if}
     </button>
-    <button
+    <button aria-label={$previewShown ? "Hide the preview of your screen" : "Show what you are sharing"}
       class="icon-btn-sm preview-toggle"
       class:on={$previewShown}
       onclick={togglePreview}
@@ -111,7 +111,7 @@
       <Icon name={$previewShown ? "eye" : "eye-off"} size={16} />
     </button>
     {#if !isWeb}
-      <button class="icon-btn-sm" onclick={openSwitchPicker} title="Switch capture source">
+      <button aria-label="Switch capture source" class="icon-btn-sm" onclick={openSwitchPicker} title="Switch capture source">
         <Icon name="switch-source" size={16} />
       </button>
     {/if}
@@ -242,11 +242,11 @@
   }
 
   .audio-toggle.sending {
-    color: #43b581;
+    color: var(--success);
   }
 
   .audio-toggle.no-signal {
-    color: #faa61a;
+    color: var(--warning);
   }
 
   .status-dot {

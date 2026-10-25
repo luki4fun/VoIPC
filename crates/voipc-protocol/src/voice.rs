@@ -161,8 +161,7 @@ impl VoicePacket {
             VoicePacketType::EncryptedOpusVoice | VoicePacketType::Position
         ) {
             // Encrypted format: header + key_id(2) + stream_id(4) + encrypted data
-            let mut buf =
-                Vec::with_capacity(ENCRYPTED_VOICE_HEADER_SIZE + self.opus_data.len());
+            let mut buf = Vec::with_capacity(ENCRYPTED_VOICE_HEADER_SIZE + self.opus_data.len());
             buf.push(self.packet_type as u8);
             buf.extend_from_slice(&self.session_id.to_be_bytes());
             buf.extend_from_slice(&self.sequence.to_be_bytes());
@@ -349,12 +348,30 @@ mod tests {
 
     #[test]
     fn voice_packet_type_all_valid() {
-        assert_eq!(VoicePacketType::from_byte(0x01).unwrap(), VoicePacketType::OpusVoice);
-        assert_eq!(VoicePacketType::from_byte(0x02).unwrap(), VoicePacketType::EndOfTransmission);
-        assert_eq!(VoicePacketType::from_byte(0x03).unwrap(), VoicePacketType::Ping);
-        assert_eq!(VoicePacketType::from_byte(0x04).unwrap(), VoicePacketType::Pong);
-        assert_eq!(VoicePacketType::from_byte(0x05).unwrap(), VoicePacketType::EncryptedOpusVoice);
-        assert_eq!(VoicePacketType::from_byte(0x06).unwrap(), VoicePacketType::Position);
+        assert_eq!(
+            VoicePacketType::from_byte(0x01).unwrap(),
+            VoicePacketType::OpusVoice
+        );
+        assert_eq!(
+            VoicePacketType::from_byte(0x02).unwrap(),
+            VoicePacketType::EndOfTransmission
+        );
+        assert_eq!(
+            VoicePacketType::from_byte(0x03).unwrap(),
+            VoicePacketType::Ping
+        );
+        assert_eq!(
+            VoicePacketType::from_byte(0x04).unwrap(),
+            VoicePacketType::Pong
+        );
+        assert_eq!(
+            VoicePacketType::from_byte(0x05).unwrap(),
+            VoicePacketType::EncryptedOpusVoice
+        );
+        assert_eq!(
+            VoicePacketType::from_byte(0x06).unwrap(),
+            VoicePacketType::Position
+        );
     }
 
     #[test]
@@ -367,7 +384,11 @@ mod tests {
     #[test]
     fn roundtrip_position_packet() {
         // 12-byte payload + 16-byte GCM tag, as the sender produces
-        let payload = PositionPayload { x: 1.5, y: -2.25, z: 0.75 };
+        let payload = PositionPayload {
+            x: 1.5,
+            y: -2.25,
+            z: 0.75,
+        };
         let ciphertext = [payload.to_bytes().to_vec(), vec![0u8; 16]].concat();
         let bytes = VoicePacket::position(42, 9, 3, 0x1234_5678, ciphertext).to_bytes();
         assert_eq!(bytes.len(), POSITION_PACKET_SIZE);
@@ -386,7 +407,12 @@ mod tests {
     #[test]
     fn position_payload_rejects_short_and_non_finite() {
         assert!(PositionPayload::from_bytes(&[0u8; 11]).is_err());
-        let mut buf = PositionPayload { x: 0.0, y: 0.0, z: 0.0 }.to_bytes();
+        let mut buf = PositionPayload {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        }
+        .to_bytes();
         buf[0..4].copy_from_slice(&f32::NAN.to_le_bytes());
         assert!(PositionPayload::from_bytes(&buf).is_err());
         buf[0..4].copy_from_slice(&f32::INFINITY.to_le_bytes());

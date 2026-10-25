@@ -24,12 +24,12 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use bytes::Bytes;
+use http_body_util::BodyExt as _;
 use http_body_util::Full;
 use hyper::body::Incoming;
 use hyper::header::{self, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
-use http_body_util::BodyExt as _;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use rust_embed::Embed;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
@@ -38,18 +38,22 @@ use rustls::sign::CertifiedKey;
 use tokio::io::{AsyncWriteExt, DuplexStream};
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
-use voipc_protocol::types::UserId;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::server::TlsStream;
 use tracing::{debug, info, warn};
+use voipc_protocol::types::UserId;
 use wtransport::config::{Ipv6DualStackConfig, QuicTransportConfig};
 use wtransport::endpoint::endpoint_side::Server;
 use wtransport::error::SendDatagramError;
 use wtransport::tls::Sha256Digest;
-use wtransport::{Connection, Endpoint, Identity, SendStream, ServerConfig as WtServerConfig, VarInt};
+use wtransport::{
+    Connection, Endpoint, Identity, SendStream, ServerConfig as WtServerConfig, VarInt,
+};
 
 use voipc_protocol::types::SessionId;
-use voipc_protocol::video::{FrameGrouper, RecordReader, MAX_FRAGMENTS_PER_FRAME, VIDEO_HEADER_SIZE};
+use voipc_protocol::video::{
+    FrameGrouper, RecordReader, MAX_FRAGMENTS_PER_FRAME, VIDEO_HEADER_SIZE,
+};
 
 use crate::config::ServerConfig;
 use crate::media;
@@ -70,11 +74,12 @@ const MAX_FRAME_STREAM_BYTES: u64 = 8 * 1024 * 1024;
 /// server or another one the client has open), media comes from blob: URLs,
 /// and Svelte's component styles are inline. Nothing may frame the client: a
 /// page embedding it could lend it the microphone and screen capture and
-/// steer the clicks.
+/// steer the clicks. `base-uri` and `form-action` are not covered by
+/// `default-src`: no injected `<base>` or form may point anywhere.
 const CSP: &str = "default-src 'self'; connect-src 'self' https: wss:; \
     script-src 'self' 'wasm-unsafe-eval'; worker-src 'self' blob:; \
     img-src 'self' data: blob:; media-src blob:; style-src 'self' 'unsafe-inline'; \
-    frame-ancestors 'none'";
+    frame-ancestors 'none'; base-uri 'none'; form-action 'none'";
 
 /// The built web client (`./build-web.sh`), embedded at compile time.
 #[derive(Embed)]
@@ -100,10 +105,12 @@ pub struct WtInfo {
 /// connection is closed gracefully; browsers, and the game server's HTTP
 /// client on `/game/v1/routes`, simply open a new one for their next request.
 ///
-/// ponytail: a fixed lifetime, not an idle timer — re-dialling is bounded by
-/// the connect rate (`ConnLimits`). An idle timer if a real page load ever
-/// takes this long.
-const PAGE_CONN_LIFETIME: Duration = Duration::from_secs(60);
+/// shortcut: a fixed lifetime, not an idle timer — re-dialling is bounded by
+/// the connect rate, and these connections sit in the pre-authentication pool
+/// (`ConnLimits`). An idle timer if a real page load (a 2.4 MB wasm on a slow
+/// phone) ever takes longer than the lifetime plus the same again for the
+/// requests in flight.
+const PAGE_CONN_LIFETIME: Duration = Duration::from_secs(30);
 
 /// Serve the web client over HTTP/2 on a TLS stream that negotiated `h2`.
 pub async fn serve_h2(
@@ -115,7 +122,7 @@ pub async fn serve_h2(
     let service = service_fn(move |req: Request<Incoming>| {
         let wt = wt.clone();
         let state = state.clone();
-        async move { Ok::<_, Infallible>(handle_request(req, &wt, &state).await) }
+        async move { Ok::<_, Infallible>(handle_request(req, &wt, &state, peer.ip()).await) }
     });
     let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
         .serve_connection(TokioIo::new(tls), service);
@@ -139,12 +146,13 @@ async fn handle_request(
     req: Request<Incoming>,
     wt: &WtInfo,
     state: &ServerState,
+    peer_ip: std::net::IpAddr,
 ) -> Response<Full<Bytes>> {
     let head_only = req.method() == Method::HEAD;
     let mut resp = if req.method() == Method::GET || head_only {
         route(req.uri().path(), wt)
     } else if req.method() == Method::POST && req.uri().path() == GAME_ROUTES_PATH {
-        game_routes(req, state).await
+        game_routes(req, state, peer_ip).await
     } else {
         let mut resp = plain(StatusCode::METHOD_NOT_ALLOWED, "method not allowed");
         resp.headers_mut()
@@ -152,8 +160,14 @@ async fn handle_request(
         resp
     };
     let headers = resp.headers_mut();
-    headers.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(CSP));
-    headers.insert(header::X_CONTENT_TYPE_OPTIONS, HeaderValue::from_static("nosniff"));
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CSP),
+    );
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
     if head_only {
         *resp.body_mut() = Full::new(Bytes::new());
     }
@@ -220,10 +234,17 @@ fn default_ttl_ms() -> u64 {
     3_000
 }
 
-async fn game_routes(req: Request<Incoming>, state: &ServerState) -> Response<Full<Bytes>> {
+async fn game_routes(
+    req: Request<Incoming>,
+    state: &ServerState,
+    peer_ip: std::net::IpAddr,
+) -> Response<Full<Bytes>> {
     let Some(expected) = state.settings.game_token.as_deref() else {
         return plain(StatusCode::NOT_FOUND, "not found");
     };
+    if !state.token_guess_allowed(peer_ip) {
+        return plain(StatusCode::TOO_MANY_REQUESTS, "too many wrong tokens");
+    }
     let presented = req
         .headers()
         .get(header::AUTHORIZATION)
@@ -237,6 +258,7 @@ async fn game_routes(req: Request<Incoming>, state: &ServerState) -> Response<Fu
         presented.as_bytes().ct_eq(expected.as_bytes()).into()
     };
     if !ok {
+        state.token_guess_failed(peer_ip);
         return plain(StatusCode::UNAUTHORIZED, "bad token");
     }
 
@@ -250,7 +272,10 @@ async fn game_routes(req: Request<Incoming>, state: &ServerState) -> Response<Fu
     let parsed: RoutesBody = match serde_json::from_slice(&body) {
         Ok(p) => p,
         Err(e) => {
-            return owned(StatusCode::BAD_REQUEST, Bytes::from(format!("bad body: {e}")))
+            return owned(
+                StatusCode::BAD_REQUEST,
+                Bytes::from(format!("bad body: {e}")),
+            )
         }
     };
     if let Err(reason) = routes_within_bounds(parsed.players.len(), state.max_users) {
@@ -361,8 +386,14 @@ fn route(path: &str, wt: &WtInfo) -> Response<Full<Bytes>> {
         );
         let mut resp = Response::new(Full::new(Bytes::from(body)));
         let headers = resp.headers_mut();
-        headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        headers.insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
+        headers.insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/json"),
+        );
+        headers.insert(
+            header::ACCESS_CONTROL_ALLOW_ORIGIN,
+            HeaderValue::from_static("*"),
+        );
         headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
         return resp;
     }
@@ -470,8 +501,7 @@ impl ResolvesServerCert for CertPicker {
 /// for hash-pinned certificates — as a rustls key plus the hash `/wt.json`
 /// publishes.
 fn browser_key(sans: &[String]) -> Result<(Arc<CertifiedKey>, Sha256Digest)> {
-    let identity =
-        Identity::self_signed(sans).context("failed to generate browser certificate")?;
+    let identity = Identity::self_signed(sans).context("failed to generate browser certificate")?;
     let cert = identity
         .certificate_chain()
         .as_slice()
@@ -587,13 +617,13 @@ impl WebTransport {
                 incoming.retry();
                 continue;
             }
-            if state.is_banned(peer.ip()) {
+            if crate::bans::refused_at_accept(&state, peer.ip()) {
                 debug!(%peer, "refusing session: banned");
                 incoming.refuse();
                 continue;
             }
             if let Err(reason) = limits.acquire(peer.ip()) {
-                warn!(%peer, "rejecting session: {reason}");
+                debug!(%peer, "rejecting session: {reason}");
                 incoming.refuse();
                 continue;
             }
@@ -605,17 +635,17 @@ impl WebTransport {
                 match tokio::time::timeout(Duration::from_secs(10), incoming).await {
                     Ok(Ok(request)) => {
                         if request.path() != "/voipc" {
-                            warn!(%peer, path = request.path(), "rejecting session: unknown path");
+                            debug!(%peer, "rejecting session: unknown path");
                             request.not_found().await;
                         } else {
                             match request.accept().await {
                                 Ok(connection) => run_session(connection, state, peer).await,
-                                Err(e) => warn!(%peer, "session accept failed: {e}"),
+                                Err(e) => debug!(%peer, "session accept failed: {e}"),
                             }
                         }
                     }
-                    Ok(Err(e)) => warn!(%peer, "QUIC handshake failed: {e}"),
-                    Err(_) => warn!(%peer, "QUIC handshake timed out"),
+                    Ok(Err(e)) => debug!(%peer, "QUIC handshake failed: {e}"),
+                    Err(_) => debug!(%peer, "QUIC handshake timed out"),
                 }
                 limits.release(peer.ip());
             });
@@ -686,6 +716,10 @@ fn server_config(bind_addr: SocketAddr, picker: Arc<CertPicker>) -> WtServerConf
         .max_concurrent_uni_streams(24u32.into())
         .receive_window(RECEIVE_WINDOW.into())
         .datagram_receive_buffer_size(Some(256 * 1024))
+        // Voice that cannot go out within about a second is stale: quinn
+        // drops the oldest instead of bursting seconds of it after a stall
+        // (its default holds 1 MiB)
+        .datagram_send_buffer_size(64 * 1024)
         .send_window(512 * 1024)
         .send_fairness(false);
 
@@ -744,7 +778,9 @@ pub(crate) fn start_session(label: &str, peer: IpAddr, state: &Arc<ServerState>)
 /// until either side goes away.
 async fn run_session(connection: Connection, state: Arc<ServerState>, peer: SocketAddr) {
     let label = format!("quic:{}", peer.ip());
-    info!(peer = %label, "session established");
+    // Addresses and names only at debug: the default log keeps no record of
+    // who connected from where (the relay knows as little as it can)
+    debug!(peer = %label, "session established");
 
     let SessionStart {
         mut handler,
@@ -801,7 +837,7 @@ async fn run_session(connection: Connection, state: Arc<ServerState>, peer: Sock
         warn!(peer = %label, "control handler did not exit after EOF, aborting");
         handler.abort();
     }
-    info!(peer = %label, "session ended");
+    debug!(peer = %label, "session ended");
 }
 
 /// Control leg: the client's single bidirectional stream carries the native
@@ -934,7 +970,8 @@ pub(crate) async fn pump_media_out(
                     // The session id was checked against the sender on the
                     // way in (media::handle_packet).
                     if !dropping && admission.await_key {
-                        let sharer = u32::from_be_bytes([packet[1], packet[2], packet[3], packet[4]]);
+                        let sharer =
+                            u32::from_be_bytes([packet[1], packet[2], packet[3], packet[4]]);
                         crate::tcp::relay_keyframe_request(&state, sharer).await;
                     }
                     continue;
@@ -948,7 +985,10 @@ pub(crate) async fn pump_media_out(
                     let max = connection.max_datagram_size().unwrap_or(1200);
                     if packet.len() > max {
                         if !warned_oversize {
-                            warn!(len = packet.len(), max, "dropping media packet larger than the datagram limit");
+                            warn!(
+                                len = packet.len(),
+                                max, "dropping media packet larger than the datagram limit"
+                            );
                             warned_oversize = true;
                         }
                         continue;
@@ -1070,10 +1110,10 @@ mod tests {
 
     use bytes::BytesMut;
     use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-    use tokio::io::AsyncReadExt;
     use rustls::pki_types::{ServerName, UnixTime};
     use rustls::{DigitallySignedStruct, SignatureScheme};
     use sha2::{Digest, Sha256};
+    use tokio::io::AsyncReadExt;
     use wtransport::config::{DnsLookupFuture, DnsResolver};
     use wtransport::endpoint::endpoint_side::Client;
     use wtransport::ClientConfig;
@@ -1239,7 +1279,10 @@ mod tests {
         // of a second of a runtime worker and a gigabyte of sets, per POST.
         assert!(routes_within_bounds(64, 64).is_ok());
         assert!(routes_within_bounds(0, 64).is_ok());
-        assert!(routes_within_bounds(65, 64).is_err(), "an oversized table was accepted");
+        assert!(
+            routes_within_bounds(65, 64).is_err(),
+            "an oversized table was accepted"
+        );
         // A server with no configured limit still bounds the endpoint
         assert!(routes_within_bounds(2, 0).is_err());
     }
@@ -1258,7 +1301,10 @@ mod tests {
         let routes = resolve(body);
         assert_eq!(routes.hear[&1], [2].into_iter().collect());
         assert_eq!(routes.hear[&2], [1].into_iter().collect());
-        assert!(routes.hear[&3].is_empty(), "a player heard somebody off their buses");
+        assert!(
+            routes.hear[&3].is_empty(),
+            "a player heard somebody off their buses"
+        );
         // Nobody hears themselves through this table; that is the mixer's job
         assert!(!routes.hear[&1].contains(&1));
 
@@ -1275,7 +1321,10 @@ mod tests {
         let (web, state, native_hash) = test_server();
         let addr = web.local_addr().unwrap();
         let browser_hash: [u8; 32] = *web.info().cert_hash.read().unwrap().as_ref();
-        tokio::spawn(web.run(state, Arc::new(ConnLimits::from_config(&ServerConfig::default()))));
+        tokio::spawn(web.run(
+            state,
+            Arc::new(ConnLimits::from_config(&ServerConfig::default())),
+        ));
 
         let seen = Arc::new(Mutex::new(None));
         let (_endpoint, connection) = connect(addr, NATIVE_SNI, seen.clone()).await;
@@ -1293,7 +1342,10 @@ mod tests {
     async fn native_session_authenticates_and_relays_media() {
         let (web, state, _) = test_server();
         let addr = web.local_addr().unwrap();
-        tokio::spawn(web.run(state.clone(), Arc::new(ConnLimits::from_config(&ServerConfig::default()))));
+        tokio::spawn(web.run(
+            state.clone(),
+            Arc::new(ConnLimits::from_config(&ServerConfig::default())),
+        ));
         let (_endpoint, connection) = connect(addr, NATIVE_SNI, Arc::default()).await;
 
         // Control: Authenticate → Authenticated
@@ -1304,8 +1356,11 @@ mod tests {
             app_version: APP_VERSION.to_string(),
             identity_key: None,
             prekey_bundle: None,
+            account: None,
         };
-        send.write_all(&encode_client_msg(&auth).unwrap()).await.unwrap();
+        send.write_all(&encode_client_msg(&auth).unwrap())
+            .await
+            .unwrap();
         let mut buf = BytesMut::new();
         let session_id = tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -1315,7 +1370,10 @@ mod tests {
                         other => panic!("unexpected reply: {other:?}"),
                     }
                 }
-                assert!(recv.read_buf(&mut buf).await.unwrap() > 0, "control stream closed");
+                assert!(
+                    recv.read_buf(&mut buf).await.unwrap() > 0,
+                    "control stream closed"
+                );
             }
         })
         .await
@@ -1348,10 +1406,22 @@ mod tests {
         // viewers, so it goes nowhere) and the session stays healthy
         let mut frame = connection.open_uni().await.unwrap().await.unwrap();
         for index in 0..2u8 {
-            let packet =
-                VideoPacket::encrypted_fragment(true, session_id, 1, index, 2, 0, 1, 0x5EED, vec![7; 100])
-                    .to_bytes();
-            frame.write_all(&(packet.len() as u16).to_be_bytes()).await.unwrap();
+            let packet = VideoPacket::encrypted_fragment(
+                true,
+                session_id,
+                1,
+                index,
+                2,
+                0,
+                1,
+                0x5EED,
+                vec![7; 100],
+            )
+            .to_bytes();
+            frame
+                .write_all(&(packet.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
             frame.write_all(&packet).await.unwrap();
         }
         frame.shutdown().await.unwrap();
@@ -1374,5 +1444,4 @@ mod tests {
         .await
         .expect("session removed within 5 s");
     }
-
 }

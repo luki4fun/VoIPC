@@ -5,11 +5,9 @@
 
 use std::future::Future;
 
-use anyhow::Context;
 use futures_util::FutureExt;
-use libsignal_protocol::{GenericSignedPreKey, PreKeyRecord, SignedPreKeyId, SignedPreKeyStore};
 use serde::Serialize;
-use voipc_crypto::prekey::INITIAL_PREKEY_COUNT;
+use voipc_crypto::prekey::{self, PREKEY_REFILL_COUNT};
 use voipc_crypto::{group, session, ChannelKeying, SignalStores};
 use voipc_protocol::types::{OneTimePreKey, PreKeyBundleData};
 
@@ -35,85 +33,65 @@ pub struct SignalCore {
 }
 
 impl SignalCore {
-    /// Fresh identity, random registration id, signed pre-key 1 and
-    /// `INITIAL_PREKEY_COUNT` one-time pre-keys with ids starting at 1.
+    /// Fresh identity, random registration id and fresh pre-keys
+    /// (`voipc_crypto::prekey::generate_prekeys`).
     pub fn new() -> anyhow::Result<Self> {
-        let identity_key_pair = voipc_crypto::generate_identity_key_pair();
-        let registration_id: u32 = rand::Rng::gen(&mut rand::thread_rng());
-        let mut stores = SignalStores::new(&identity_key_pair, registration_id);
-        run(voipc_crypto::prekey::generate_prekeys(
-            &mut stores,
-            &identity_key_pair,
-            1,
-            INITIAL_PREKEY_COUNT,
-        ))
-        .context("failed to generate prekeys")?;
+        Self::with_identity(&voipc_crypto::generate_identity_key_pair())
+    }
+
+    /// The same, for an account's identity from its vault: only the identity
+    /// outlives the connection, the pre-keys and stores are new every time.
+    pub fn with_identity(
+        identity_key_pair: &libsignal_protocol::IdentityKeyPair,
+    ) -> anyhow::Result<Self> {
+        let registration_id: u32 = rand::random();
+        let mut stores = SignalStores::new(identity_key_pair, registration_id);
+        prekey::generate_prekeys(&mut stores, identity_key_pair)?;
         Ok(Self {
             stores,
             keying: ChannelKeying::default(),
         })
     }
 
-    /// Identity key and pre-key bundle, read back from the stores so one-time
-    /// pre-keys consumed by earlier sessions are not advertised again.
+    /// Identity key and pre-key bundle for Authenticate.
     pub fn bundle(&self) -> anyhow::Result<AuthBundle> {
-        let identity_key = self.stores.identity.key_pair.public_key.clone();
-
-        let signed = run(self
-            .stores
-            .signed_prekey
-            .get_signed_pre_key(SignedPreKeyId::from(1u32)))
-        .context("signed pre-key 1 missing")?;
-        let signed_prekey = signed.public_key()?.serialize().to_vec();
-        let signed_prekey_signature = signed.signature()?;
-
-        let mut prekeys = Vec::with_capacity(self.stores.prekey.prekeys.len());
-        for (&id, bytes) in &self.stores.prekey.prekeys {
-            let public_key = PreKeyRecord::deserialize(bytes)?
-                .public_key()?
-                .serialize()
-                .to_vec();
-            prekeys.push(OneTimePreKey { id, public_key });
-        }
-
+        let prekey_bundle = prekey::bundle(&self.stores)?;
         Ok(AuthBundle {
-            prekey_bundle: PreKeyBundleData {
-                registration_id: self.stores.identity.registration_id,
-                device_id: 1,
-                identity_key: identity_key.clone(),
-                signed_prekey_id: 1,
-                signed_prekey,
-                signed_prekey_signature,
-                prekeys,
-            },
-            identity_key,
+            identity_key: prekey_bundle.identity_key.clone(),
+            prekey_bundle,
         })
     }
 
-    /// X3DH with a peer's bundle, using its first one-time pre-key if any.
+    /// Our user id from `Authenticated`: every pairwise message is bound to it.
+    pub fn set_own_user_id(&mut self, user_id: u32) {
+        self.stores.own_user_id = user_id;
+    }
+
+    /// More one-time pre-keys for `UploadPreKeys`, when the relay runs low.
+    pub fn more_prekeys(&mut self) -> anyhow::Result<Vec<OneTimePreKey>> {
+        prekey::more_prekeys(&mut self.stores, PREKEY_REFILL_COUNT)
+    }
+
+    /// PQXDH with a peer's bundle, using its one-time pre-key if any.
     pub fn establish_session(
         &mut self,
         user_id: u32,
         bundle: &PreKeyBundleData,
     ) -> anyhow::Result<()> {
-        let one_time = bundle.prekeys.first();
         run(session::establish_session(
             &mut self.stores,
             user_id,
-            bundle.registration_id,
-            bundle.device_id,
-            &bundle.identity_key,
-            bundle.signed_prekey_id,
-            &bundle.signed_prekey,
-            &bundle.signed_prekey_signature,
-            one_time.map(|p| p.id),
-            one_time.map(|p| p.public_key.as_slice()),
+            bundle,
         ))
     }
 
     /// Returns (ciphertext, message_type) with 1 = PreKey, 2 = Whisper.
     pub fn encrypt(&mut self, user_id: u32, plaintext: &[u8]) -> anyhow::Result<(Vec<u8>, u8)> {
-        run(session::encrypt_message(&mut self.stores, user_id, plaintext))
+        run(session::encrypt_message(
+            &mut self.stores,
+            user_id,
+            plaintext,
+        ))
     }
 
     pub fn decrypt(
@@ -157,6 +135,20 @@ impl SignalCore {
     }
 
     /// Start a channel's group keying from nothing, chain included.
+    /// `(user id, identity key)` for each identity the stores took in since
+    /// the last call: a session a peer opened among them.
+    pub fn take_seen(&mut self) -> Vec<(u32, Vec<u8>)> {
+        self.stores.identity.take_seen()
+    }
+
+    /// The identity key the session with `user_id` runs on, if there is one.
+    pub fn identity_of(&self, user_id: u32) -> Option<Vec<u8>> {
+        self.stores
+            .identity
+            .identity_of(user_id)
+            .map(<[u8]>::to_vec)
+    }
+
     pub fn reset_channel(&mut self, own_user_id: u32, channel_id: u32) {
         self.keying
             .reset_channel(Some(&mut self.stores), own_user_id, channel_id);

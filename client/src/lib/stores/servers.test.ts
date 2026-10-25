@@ -75,3 +75,23 @@ test("unread is counted per server, channels and conversations together", () => 
   );
   assert.equal(entries[0].state, "disconnected", "a server without a state reads as disconnected");
 });
+
+test("parseHostPort: the one address parser (H5-09)", async () => {
+  const { parseHostPort, splitAddress } = await import("../invite.ts");
+  assert.deepEqual(parseHostPort("example.com"), { host: "example.com", port: 9987 });
+  assert.deepEqual(parseHostPort("example.com", 443), { host: "example.com", port: 443 });
+  // A port typed into the host field is the port, not part of the name
+  assert.deepEqual(parseHostPort("example.com:1234", 9987), { host: "example.com", port: 1234 });
+  assert.deepEqual(parseHostPort("[::1]:9000"), { host: "::1", port: 9000 });
+  assert.deepEqual(parseHostPort("[::1]", 443), { host: "::1", port: 443 });
+  // Ambiguous or broken: refused, never split at a guess
+  assert.equal(parseHostPort("::1"), null, "a bare IPv6 address split into host ':' and port 1");
+  assert.equal(parseHostPort("example.com:0"), null);
+  assert.equal(parseHostPort("example.com:99999"), null);
+  assert.equal(parseHostPort("example.com:12ab"), null);
+  assert.equal(parseHostPort(":9987"), null);
+  // Every id serverId makes comes back apart
+  for (const [host, port] of [["example.org", 9987], ["::1", 1], ["10.0.0.1", 65535]] as const) {
+    assert.deepEqual(splitAddress(serverId(host, port)), { host, port });
+  }
+});

@@ -2,18 +2,36 @@
 name = "voipc-audio"
 version.workspace = true
 edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
 
 [dependencies]
 voipc-protocol = { workspace = true }
 audiopus = { workspace = true }
 anyhow = { workspace = true }
+serde = { workspace = true }
+speexdsp-resampler = "0.1"
 tracing = { workspace = true }
 tokio = { workspace = true }
-ringbuf = "0.4"
-nnnoiseless = "0.1"
+ringbuf = "0.5"
+nnnoiseless = { version = "0.5", default-features = false }
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 cpal = { workspace = true }
+# Echo cancellation (AEC3 + AGC2); Android uses the platform's
+sonora = "=0.2.0"
 
 [target.'cfg(target_os = "android")'.dependencies]
 oboe = { version = "0.6", features = ["java-interface"] }
+
+# src/fuzz.rs parses an SDK message the way the app does
+[dev-dependencies]
+serde_json = "1"
+
+[target.'cfg(fuzzing)'.dependencies]
+serde_json = "1"
+
+# fuzz/ builds this crate with --cfg fuzzing (src/fuzz.rs)
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

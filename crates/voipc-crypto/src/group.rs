@@ -8,7 +8,6 @@ use libsignal_protocol::{
     create_sender_key_distribution_message, group_decrypt, group_encrypt,
     process_sender_key_distribution_message, SenderKeyDistributionMessage, SenderKeyMessage,
 };
-use rand::rngs::OsRng;
 use uuid::Uuid;
 
 use crate::session::user_address;
@@ -19,7 +18,10 @@ use crate::stores::SignalStores;
 pub fn channel_distribution_id(channel_id: u32) -> Uuid {
     // Use UUID v5 (SHA-1 namespace) with our own namespace
     let namespace = Uuid::NAMESPACE_OID;
-    Uuid::new_v5(&namespace, format!("voipc-channel-{}", channel_id).as_bytes())
+    Uuid::new_v5(
+        &namespace,
+        format!("voipc-channel-{}", channel_id).as_bytes(),
+    )
 }
 
 /// Create a sender key distribution message for a channel.
@@ -36,7 +38,7 @@ pub async fn create_distribution_message(
         &address,
         distribution_id,
         &mut stores.sender_key,
-        &mut OsRng,
+        &mut crate::rng(),
     )
     .await?;
 
@@ -63,12 +65,7 @@ pub async fn process_distribution_message(
         anyhow::bail!("sender key is for a different channel than the one it was sent in");
     }
 
-    process_sender_key_distribution_message(
-        &sender_address,
-        &msg,
-        &mut stores.sender_key,
-    )
-    .await?;
+    process_sender_key_distribution_message(&sender_address, &msg, &mut stores.sender_key).await?;
 
     Ok(())
 }
@@ -88,7 +85,7 @@ pub async fn encrypt_group_message(
         &address,
         distribution_id,
         plaintext,
-        &mut OsRng,
+        &mut crate::rng(),
     )
     .await?;
 
@@ -127,12 +124,7 @@ pub async fn decrypt_group_message(
         anyhow::bail!("message was encrypted for a different channel than it arrived in");
     }
 
-    let plaintext = group_decrypt(
-        ciphertext,
-        &mut stores.sender_key,
-        &sender_address,
-    )
-    .await?;
+    let plaintext = group_decrypt(ciphertext, &mut stores.sender_key, &sender_address).await?;
 
     Ok(plaintext)
 }
@@ -148,7 +140,10 @@ mod tests {
     /// it is ready on the first poll — the same assumption voipc-web makes,
     /// and cheaper than an async runtime this crate does not otherwise need.
     fn ready<T>(fut: impl Future<Output = T>) -> T {
-        match Box::pin(fut).as_mut().poll(&mut Context::from_waker(Waker::noop())) {
+        match Box::pin(fut)
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+        {
             Poll::Ready(v) => v,
             Poll::Pending => panic!("in-memory stores never pend"),
         }
@@ -168,7 +163,9 @@ mod tests {
         channel: u32,
     ) -> anyhow::Result<()> {
         let dist = ready(create_distribution_message(sender, sender_id, channel))?;
-        ready(process_distribution_message(receiver, sender_id, channel, &dist))
+        ready(process_distribution_message(
+            receiver, sender_id, channel, &dist,
+        ))
     }
 
     /// A relay that re-labels a message must not be believed: the channel is

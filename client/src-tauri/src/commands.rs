@@ -35,6 +35,8 @@ pub async fn connect(
     address: String,
     username: String,
     accept_invalid_certs: Option<bool>,
+    // Sign in to an account on this server; `None` is a guest.
+    account: Option<crate::account::AccountArgs>,
 ) -> Result<u32, String> {
     // Input validation
     if address.is_empty() || address.len() > 253 {
@@ -54,6 +56,7 @@ pub async fn connect(
         address,
         username,
         accept_invalid_certs.unwrap_or(false),
+        account,
     )
     .await
 }
@@ -115,6 +118,10 @@ pub async fn join_channel(
     if !is_text && channel_id != 0 {
         network::ask_voice(&connection.voice_asked_at);
     }
+    if !is_text {
+        // The user's own move: a game's next `hello` may not undo it
+        state.user_moved.fetch_add(1, Ordering::Relaxed);
+    }
     network::send_tcp_message(
         &connection.tcp_tx,
         &ClientMessage::JoinChannel {
@@ -148,14 +155,18 @@ fn end_share_for_move(
 ) -> Option<tokio::task::JoinHandle<()>> {
     let mut capture = None;
     if connection.is_screen_sharing {
-        connection.screen_share_active.store(false, Ordering::Relaxed);
+        connection
+            .screen_share_active
+            .store(false, Ordering::Relaxed);
         capture = connection.screen_capture_task.take();
         connection.capture_session = None;
         connection.is_screen_sharing = false;
         connection.share_viewers.store(0, Ordering::Relaxed);
     }
     connection.watching_user_id = None;
-    connection.watching_user_id_shared.store(0, Ordering::Relaxed);
+    connection
+        .watching_user_id_shared
+        .store(0, Ordering::Relaxed);
     capture
 }
 
@@ -215,8 +226,11 @@ pub async fn leave_channel(
 ) -> Result<(), String> {
     let conns = state.connections.read().await;
     let connection = conn(&conns, &server)?;
-    network::send_tcp_message(&connection.tcp_tx, &ClientMessage::LeaveChannel { channel_id })
-        .await
+    network::send_tcp_message(
+        &connection.tcp_tx,
+        &ClientMessage::LeaveChannel { channel_id },
+    )
+    .await
 }
 
 /// Tell the server whether we answer requests for recent channel chat, so a
@@ -233,6 +247,10 @@ pub async fn set_history_sharing(state: State<'_, AppState>, enabled: bool) -> R
             &ClientMessage::SetHistorySharing { enabled },
         )
         .await;
+        // The same consent hands our older keys to who joins a channel's log.
+        if let Some(link) = &connection.account {
+            link.session().set_share(enabled);
+        }
     }
     Ok(())
 }
@@ -291,12 +309,7 @@ pub async fn set_channel_options(
     state: State<'_, AppState>,
     server: String,
     channel_id: u32,
-    hidden: Option<bool>,
-    anonymous: Option<bool>,
-    screen_share: Option<bool>,
-    hide_members: Option<bool>,
-    routed: Option<bool>,
-    message_ttl_secs: Option<u32>,
+    options: voipc_protocol::types::ChannelOptions,
 ) -> Result<(), String> {
     let conns = state.connections.read().await;
     let connection = conn(&conns, &server)?;
@@ -304,12 +317,7 @@ pub async fn set_channel_options(
         &connection.tcp_tx,
         &ClientMessage::SetChannelOptions {
             channel_id,
-            hidden,
-            anonymous,
-            screen_share,
-            hide_members,
-            routed,
-            message_ttl_secs,
+            options,
         },
     )
     .await
@@ -505,10 +513,8 @@ pub async fn accept_invite(
 
     // Clean up screen share state before switching channels
     if connection.is_screen_sharing {
-        let _ = network::send_tcp_message(
-            &connection.tcp_tx,
-            &ClientMessage::StopScreenShare,
-        ).await;
+        let _ =
+            network::send_tcp_message(&connection.tcp_tx, &ClientMessage::StopScreenShare).await;
     }
     let capture = end_share_for_move(connection);
 
@@ -555,15 +561,19 @@ pub async fn send_channel_message(
     // inside the ciphertext, so the relay can neither read it nor change it.
     ttl_secs: Option<u32>,
 ) -> Result<(), String> {
-    let (user_id, username, current_channel_id, tcp_tx, signal) = {
+    let (user_id, username, current_channel_id, tcp_tx, signal, account, channels) = {
         let conns = state.connections.read().await;
         let connection = conn(&conns, &server)?;
         (
             connection.user_id,
             connection.username.clone(),
-            connection.current_channel_id.load(std::sync::atomic::Ordering::Relaxed),
+            connection
+                .current_channel_id
+                .load(std::sync::atomic::Ordering::Relaxed),
             connection.tcp_tx.clone(),
             connection.signal.clone(),
+            connection.account.clone(),
+            connection.channels.clone(),
         )
     };
     let channel_id = channel_id.unwrap_or(current_channel_id);
@@ -581,6 +591,24 @@ pub async fn send_channel_message(
     // receiver's copy file the message under the same one.
     let message_id = crypto::new_message_id();
     let payload = crypto::envelope(&message_id, &content, ttl_secs);
+
+    // A channel with a log keeps it for its members too (cloud copies on),
+    // whether or not anybody is here to read it now.
+    if let Some(link) = &account {
+        let log = channels
+            .lock()
+            .ok()
+            .and_then(|c| {
+                c.iter()
+                    .find(|ch| ch.channel_id == channel_id)
+                    .map(|ch| ch.log.clone())
+            })
+            .unwrap_or_default();
+        let a = link
+            .session()
+            .outgoing_channel(&log, payload.clone(), crypto::now_ms(), ttl_secs);
+        crate::account::run(&app_handle, &server, &tcp_tx, a).await;
+    }
 
     // Try encrypted channel message via Sender Keys
     let encrypted_result = tokio::task::block_in_place(|| {
@@ -601,10 +629,7 @@ pub async fn send_channel_message(
             .ok_or_else(|| "Signal not initialized".to_string())?;
         tokio::runtime::Handle::current()
             .block_on(voipc_crypto::group::encrypt_group_message(
-                stores,
-                user_id,
-                channel_id,
-                &payload,
+                stores, user_id, channel_id, &payload,
             ))
             .map_err(|e| format!("group encryption: {e}"))
     });
@@ -645,7 +670,11 @@ pub async fn send_channel_message(
             Ok(())
         }
         Err(reason) => {
-            tracing::info!(channel_id, "encryption not ready ({}), queueing message", reason);
+            tracing::info!(
+                channel_id,
+                "encryption not ready ({}), queueing message",
+                reason
+            );
             // Queue the message — it will be sent when sender key distribution completes
             {
                 let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
@@ -697,7 +726,7 @@ pub async fn send_direct_message(
     // conversation; it rides inside the envelope like a channel message's does.
     ttl_secs: Option<u32>,
 ) -> Result<(), String> {
-    let (tcp_tx, own_user_id, own_username, signal) = {
+    let (tcp_tx, own_user_id, own_username, signal, account) = {
         let conns = state.connections.read().await;
         let connection = conn(&conns, &server)?;
         (
@@ -705,6 +734,7 @@ pub async fn send_direct_message(
             connection.user_id,
             connection.username.clone(),
             connection.signal.clone(),
+            connection.account.clone(),
         )
     };
 
@@ -714,6 +744,15 @@ pub async fn send_direct_message(
     // costs nothing on the far side: `open_envelope` reads plain text as text.
     let message_id = crypto::new_message_id();
     let payload = crypto::envelope(&message_id, &content, ttl_secs);
+
+    // Between two accounts, and with cloud copies on, it is kept for them too:
+    // whether or not they are here to get it now.
+    if let Some(link) = &account {
+        let a =
+            link.session()
+                .outgoing_dm(target_user_id, payload.clone(), crypto::now_ms(), ttl_secs);
+        crate::account::run(&app_handle, &server, &tcp_tx, a).await;
+    }
 
     // Try encrypted direct message via pairwise Signal session
     let encrypted_result = tokio::task::block_in_place(|| {
@@ -774,7 +813,11 @@ pub async fn send_direct_message(
             Ok(())
         }
         Err(reason) => {
-            tracing::info!(target_user_id, "encryption not ready ({}), queueing DM", reason);
+            tracing::info!(
+                target_user_id,
+                "encryption not ready ({}), queueing DM",
+                reason
+            );
             // Queue the message — it will be sent when pairwise session is established
             {
                 let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
@@ -862,6 +905,7 @@ pub(crate) async fn sdk_set_transmit(
 }
 
 async fn start_capture(state: &AppState, app_handle: tauri::AppHandle) -> Result<(), String> {
+    let _gate = state.mic_gate.lock().await;
     let mut conns = state.connections.write().await;
     let connection = voice_mut(state, &mut conns)?;
 
@@ -910,25 +954,33 @@ async fn start_capture(state: &AppState, app_handle: tauri::AppHandle) -> Result
 /// Stop the microphone wherever it is open. Never an error: whatever is not
 /// transmitting is already stopped, and voice may have moved on since.
 async fn stop_capture(state: &AppState) -> Result<(), String> {
-    let mut conns = state.connections.write().await;
-    let Some(connection) = conns
-        .values_mut()
-        .find(|c| c.transmitting.load(Ordering::Relaxed))
-    else {
-        return Ok(()); // Not transmitting
+    let _gate = state.mic_gate.lock().await;
+    let (task, session_id, voice_tx) = {
+        let mut conns = state.connections.write().await;
+        let Some(connection) = conns
+            .values_mut()
+            .find(|c| c.transmitting.load(Ordering::Relaxed))
+        else {
+            return Ok(()); // Not transmitting
+        };
+        // Signal the capture task to stop
+        connection.transmitting.store(false, Ordering::Relaxed);
+        (
+            connection.capture_task.take(),
+            connection.session_id,
+            connection.voice_tx.clone(),
+        )
     };
 
-    // Signal the capture task to stop
-    connection.transmitting.store(false, Ordering::Relaxed);
-
-    // Wait for the capture task to finish
-    if let Some(task) = connection.capture_task.take() {
+    // Wait for the capture task to finish, with `connections` free
+    if let Some(task) = task {
         let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
     }
 
-    // Send EndOfTransmission so other clients know we stopped talking
-    let eot = VoicePacket::end_of_transmission(connection.session_id, 0);
-    let _ = connection.voice_tx.send(eot.to_bytes()).await;
+    // Send EndOfTransmission so other clients know we stopped talking. After
+    // the join, so it lands behind the last voice frame.
+    let eot = VoicePacket::end_of_transmission(session_id, 0);
+    let _ = voice_tx.send(eot.to_bytes()).await;
 
     tracing::info!("PTT released — capture stopped");
     Ok(())
@@ -1056,10 +1108,7 @@ pub(crate) fn parse_ptt_binding(binding_str: &str) -> Option<crate::app_state::P
 
 /// Change the PTT key binding. Updates both settings and the shared binding for the global key listener.
 #[tauri::command]
-pub async fn set_ptt_key(
-    state: State<'_, AppState>,
-    key_code: String,
-) -> Result<(), String> {
+pub async fn set_ptt_key(state: State<'_, AppState>, key_code: String) -> Result<(), String> {
     // Parse and validate the binding
     let binding = parse_ptt_binding(&key_code)
         .ok_or_else(|| format!("Unsupported key binding: {key_code}"))?;
@@ -1120,10 +1169,7 @@ pub fn set_mute_key(state: State<'_, AppState>, key_code: String) -> Result<(), 
 /// only (persistence already no-ops without an unlock key) and the first-run
 /// setup gate is skipped.
 #[tauri::command]
-pub fn set_chat_history_disabled(
-    state: State<'_, AppState>,
-    disabled: bool,
-) -> Result<(), String> {
+pub fn set_chat_history_disabled(state: State<'_, AppState>, disabled: bool) -> Result<(), String> {
     let mut config = state.config();
     config.chat_history_disabled = disabled;
     crate::config::save_config(&config)
@@ -1165,10 +1211,7 @@ pub fn set_deafen_key(state: State<'_, AppState>, key_code: String) -> Result<()
 /// keeps PTT active after releasing the trigger key. When false, releasing the trigger key
 /// immediately stops PTT.
 #[tauri::command]
-pub async fn set_ptt_hold_mode(
-    state: State<'_, AppState>,
-    hold_mode: bool,
-) -> Result<(), String> {
+pub async fn set_ptt_hold_mode(state: State<'_, AppState>, hold_mode: bool) -> Result<(), String> {
     state.ptt_hold_mode.store(hold_mode, Ordering::Relaxed);
     {
         let mut config = state.config();
@@ -1335,10 +1378,7 @@ pub async fn set_output_device(
 
 /// Set output volume (0.0 to 1.0).
 #[tauri::command]
-pub async fn set_volume(
-    state: State<'_, AppState>,
-    volume: f32,
-) -> Result<(), String> {
+pub async fn set_volume(state: State<'_, AppState>, volume: f32) -> Result<(), String> {
     let clamped = volume.clamp(0.0, 1.0);
     let mut settings = state.settings.write().await;
     settings.volume = clamped;
@@ -1351,7 +1391,9 @@ pub async fn set_volume(
         }
     }
     // Apply live — the mixer reads this every tick
-    state.master_volume.store(clamped.to_bits(), Ordering::Relaxed);
+    state
+        .master_volume
+        .store(clamped.to_bits(), Ordering::Relaxed);
     Ok(())
 }
 
@@ -1445,9 +1487,7 @@ pub async fn start_screen_share(
 
         // Fixed for the life of this share: viewers are told this codec when
         // they start watching, and a source switch keeps encoding in it.
-        let codec = crate::app_state::share_codec_from_str(
-            &state.config().screen_share_codec,
-        );
+        let codec = crate::app_state::share_codec_from_str(&state.config().screen_share_codec);
         connection.screen_share_codec = codec;
         // A new share starts unwatched; the server counts its viewers afresh
         connection.share_viewers.store(0, Ordering::Relaxed);
@@ -1470,25 +1510,31 @@ pub async fn start_screen_share(
 /// Stop screen sharing — stops capture, closes portal session, sends TCP stop.
 #[tauri::command]
 pub async fn stop_screen_share(state: State<'_, AppState>) -> Result<(), String> {
-    let mut conns = state.connections.write().await;
-    let connection = voice_mut(&state, &mut conns)?;
+    let _gate = state.share_gate.lock().await;
+    let (task, session) = {
+        let mut conns = state.connections.write().await;
+        let connection = voice_mut(&state, &mut conns)?;
 
-    if !connection.is_screen_sharing {
-        return Ok(());
-    }
+        if !connection.is_screen_sharing {
+            return Ok(());
+        }
 
-    // Stop the capture task
-    connection.screen_share_active.store(false, Ordering::Relaxed);
-    if let Some(task) = connection.screen_capture_task.take() {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
-    }
+        // Stop the capture task
+        connection
+            .screen_share_active
+            .store(false, Ordering::Relaxed);
+        connection.share_viewers.store(0, Ordering::Relaxed);
 
-    // Close the capture session (stops screen capture)
-    connection.capture_session = None;
-    connection.share_viewers.store(0, Ordering::Relaxed);
-
-    network::send_tcp_message(&connection.tcp_tx, &ClientMessage::StopScreenShare).await?;
-    connection.is_screen_sharing = false;
+        network::send_tcp_message(&connection.tcp_tx, &ClientMessage::StopScreenShare).await?;
+        connection.is_screen_sharing = false;
+        (
+            connection.screen_capture_task.take(),
+            connection.capture_session.take(),
+        )
+    };
+    wait_for_capture(task).await;
+    // Close the capture session (stops screen capture) once nothing reads it
+    drop(session);
     Ok(())
 }
 
@@ -1508,15 +1554,58 @@ pub async fn watch_screen_share(
     .await?;
 
     connection.watching_user_id = Some(sharer_user_id);
-    connection.watching_user_id_shared.store(sharer_user_id, Ordering::Relaxed);
+    connection
+        .watching_user_id_shared
+        .store(sharer_user_id, Ordering::Relaxed);
 
     // Reset receiver stats for this new viewing session
-    connection.screen_video_frames_received.store(0, Ordering::Relaxed);
-    connection.screen_video_frames_dropped.store(0, Ordering::Relaxed);
-    connection.screen_video_bytes_received.store(0, Ordering::Relaxed);
-    connection.screen_video_resolution.store(0, Ordering::Relaxed);
+    connection
+        .screen_video_frames_received
+        .store(0, Ordering::Relaxed);
+    connection
+        .screen_video_frames_dropped
+        .store(0, Ordering::Relaxed);
+    connection
+        .screen_video_bytes_received
+        .store(0, Ordering::Relaxed);
+    connection
+        .screen_video_resolution
+        .store(0, Ordering::Relaxed);
 
     Ok(())
+}
+
+/// Open the share viewer in its own window, or bring it to the front.
+///
+/// Made here rather than by the page: a webview allowed to create windows can
+/// open one on any URL, with VoIPC's own frame around it (H4-16).
+#[tauri::command]
+pub fn open_share_popout(app: tauri::AppHandle, sharer_name: String) -> Result<(), String> {
+    #[cfg(target_os = "android")]
+    {
+        let _ = (app, sharer_name);
+        Err("A second window is not available on Android".into())
+    }
+    #[cfg(not(target_os = "android"))]
+    {
+        use tauri::Manager;
+        const LABEL: &str = "screenshare-popout";
+        if let Some(win) = app.get_webview_window(LABEL) {
+            return win.set_focus().map_err(|e| e.to_string());
+        }
+        let mut url = tauri::Url::parse("app://localhost/index.html").map_err(|e| e.to_string())?;
+        url.query_pairs_mut()
+            .append_pair("popout", "screenshare")
+            .append_pair("sharer_name", &sharer_name);
+        let path = format!("index.html?{}", url.query().unwrap_or_default());
+        tauri::WebviewWindowBuilder::new(&app, LABEL, tauri::WebviewUrl::App(path.into()))
+            .title(format!("{sharer_name}'s Screen - VoIPC"))
+            .inner_size(800.0, 600.0)
+            .center()
+            .build()
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
 }
 
 /// Stop watching the current screen share.
@@ -1531,7 +1620,9 @@ pub async fn stop_watching_screen_share(state: State<'_, AppState>) -> Result<()
 
     network::send_tcp_message(&connection.tcp_tx, &ClientMessage::StopWatchingScreenShare).await?;
     connection.watching_user_id = None;
-    connection.watching_user_id_shared.store(0, Ordering::Relaxed);
+    connection
+        .watching_user_id_shared
+        .store(0, Ordering::Relaxed);
     Ok(())
 }
 
@@ -1544,24 +1635,21 @@ pub async fn toggle_screen_audio(state: State<'_, AppState>) -> Result<bool, Str
         .screen_audio_enabled
         .fetch_xor(true, Ordering::Relaxed);
     let now_enabled = !was_enabled;
-    tracing::info!("Screen audio toggled: {}", if now_enabled { "on" } else { "off" });
+    tracing::info!(
+        "Screen audio toggled: {}",
+        if now_enabled { "on" } else { "off" }
+    );
     Ok(now_enabled)
 }
 
 /// Returns (send_count, recv_count) for screen audio packet counters.
 /// Frontend polls this to determine if screen audio is actively flowing.
 #[tauri::command]
-pub async fn get_screen_audio_status(
-    state: State<'_, AppState>,
-) -> Result<(u32, u32), String> {
+pub async fn get_screen_audio_status(state: State<'_, AppState>) -> Result<(u32, u32), String> {
     let conns = state.connections.read().await;
     let connection = voice(&state, &conns)?;
-    let send = connection
-        .screen_audio_send_count
-        .load(Ordering::Relaxed);
-    let recv = connection
-        .screen_audio_recv_count
-        .load(Ordering::Relaxed);
+    let send = connection.screen_audio_send_count.load(Ordering::Relaxed);
+    let recv = connection.screen_audio_recv_count.load(Ordering::Relaxed);
     Ok((send, recv))
 }
 
@@ -1613,6 +1701,7 @@ pub async fn start_screen_capture(
 
     #[cfg(not(target_os = "android"))]
     {
+        let _gate = state.share_gate.lock().await;
         let mut conns = state.connections.write().await;
         let connection = voice_mut(&state, &mut conns)?;
 
@@ -1626,64 +1715,84 @@ pub async fn start_screen_capture(
             return Ok(());
         }
 
-        let session = connection
-            .capture_session
-            .as_ref()
-            .ok_or("No capture session — call start_screen_share first")?;
-
-        let res = voipc_video::Resolution::from_height(resolution)
-            .ok_or_else(|| format!("Unsupported resolution: {}", resolution))?;
-        // Guard against fps=0 (division by zero in pacing/keyframe interval).
-        let fps = fps.clamp(1, 60);
-
-        connection.screen_share_active.store(true, Ordering::Relaxed);
-
-        // Reset sender stats for this new capture session
-        connection.screen_video_frames_sent.store(0, Ordering::Relaxed);
-        connection.screen_video_bytes_sent.store(0, Ordering::Relaxed);
-        // A loss report from a previous share must not bump the new one
-        connection.share_loss_ms.store(0, Ordering::Relaxed);
-        clear_loss_tally(connection);
-
-        let task = screenshare::spawn_capture_task(
-            session,
-            res.width(),
-            res.height(),
-            fps,
-            res.bitrate_kbps_at(fps),
-            connection.screen_share_codec,
-            connection.session_id,
-            connection.screen_share_active.clone(),
-            connection.keyframe_requested.clone(),
-            connection.share_loss_ms.clone(),
-            connection.video_tx.clone(),
-            connection.screen_audio_tx.clone(),
-            connection.screen_audio_enabled.clone(),
-            connection.screen_audio_send_count.clone(),
-            connection.current_media_key.clone(),
-            connection.current_channel_id.clone(),
-            connection.screen_video_frames_sent.clone(),
-            connection.screen_video_bytes_sent.clone(),
-            app,
-            connection.share_preview.clone(),
-            connection.share_viewers.clone(),
-        )?;
-
-        connection.screen_capture_task = Some(task);
-        Ok(())
+        spawn_share_capture(connection, app, resolution, fps)
     }
+}
+
+/// Start capturing for this connection's share session at the given size.
+#[cfg(not(target_os = "android"))]
+fn spawn_share_capture(
+    connection: &mut crate::app_state::ActiveConnection,
+    app: tauri::AppHandle,
+    resolution: u16,
+    fps: u32,
+) -> Result<(), String> {
+    let session = connection
+        .capture_session
+        .as_ref()
+        .ok_or("No capture session — call start_screen_share first")?;
+
+    let res = voipc_video::Resolution::from_height(resolution)
+        .ok_or_else(|| format!("Unsupported resolution: {}", resolution))?;
+    // Guard against fps=0 (division by zero in pacing/keyframe interval).
+    let fps = fps.clamp(1, 60);
+
+    connection
+        .screen_share_active
+        .store(true, Ordering::Relaxed);
+
+    // Reset sender stats for this new capture session
+    connection
+        .screen_video_frames_sent
+        .store(0, Ordering::Relaxed);
+    connection
+        .screen_video_bytes_sent
+        .store(0, Ordering::Relaxed);
+    // A loss report from a previous share must not bump the new one
+    connection.share_loss_ms.store(0, Ordering::Relaxed);
+    clear_loss_tally(connection);
+
+    let task = screenshare::spawn_capture_task(
+        session,
+        res.width(),
+        res.height(),
+        fps,
+        res.bitrate_kbps_at(fps),
+        connection.screen_share_codec,
+        connection.session_id,
+        connection.screen_share_active.clone(),
+        connection.keyframe_requested.clone(),
+        connection.share_loss_ms.clone(),
+        connection.video_tx.clone(),
+        connection.screen_audio_tx.clone(),
+        connection.screen_audio_enabled.clone(),
+        connection.screen_audio_send_count.clone(),
+        connection.current_media_key.clone(),
+        connection.current_channel_id.clone(),
+        connection.screen_video_frames_sent.clone(),
+        connection.screen_video_bytes_sent.clone(),
+        app,
+        connection.share_preview.clone(),
+        connection.share_viewers.clone(),
+    )?;
+
+    connection.screen_capture_task = Some(task);
+    Ok(())
 }
 
 /// Stop the screen capture task — nobody watches and the preview is hidden.
 #[tauri::command]
 pub async fn stop_screen_capture(state: State<'_, AppState>) -> Result<(), String> {
-    let mut conns = state.connections.write().await;
-    let connection = voice_mut(&state, &mut conns)?;
-
-    connection.screen_share_active.store(false, Ordering::Relaxed);
-    if let Some(task) = connection.screen_capture_task.take() {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
-    }
+    let _gate = state.share_gate.lock().await;
+    let task = {
+        let mut conns = state.connections.write().await;
+        let connection = voice_mut(&state, &mut conns)?;
+        connection
+            .screen_share_active
+            .store(false, Ordering::Relaxed);
+        connection.screen_capture_task.take()
+    };
+    wait_for_capture(task).await;
     Ok(())
 }
 
@@ -1707,89 +1816,50 @@ pub async fn switch_screen_share_source(
 
     #[cfg(not(target_os = "android"))]
     {
-    // Acquire the new capture session BEFORE locking (may show portal on Linux).
-    let new_session = screenshare::request_screencast(&source_type, &source_id).await?;
+        // Acquire the new capture session BEFORE locking (may show portal on Linux).
+        let new_session = screenshare::request_screencast(&source_type, &source_id).await?;
 
-    let mut conns = state.connections.write().await;
-    let connection = voice_mut(&state, &mut conns)?;
+        let _gate = state.share_gate.lock().await;
+        // Stop the current capture, and swap the session, under the lock…
+        let (task, old_session) = {
+            let mut conns = state.connections.write().await;
+            let connection = voice_mut(&state, &mut conns)?;
 
-    if !connection.is_screen_sharing {
-        return Err("Not currently screen sharing".into());
-    }
+            if !connection.is_screen_sharing {
+                return Err("Not currently screen sharing".into());
+            }
+            connection
+                .screen_share_active
+                .store(false, Ordering::Relaxed);
+            let task = connection.screen_capture_task.take();
+            (task, connection.capture_session.replace(new_session))
+        };
+        // …wait for it with the lock free…
+        let had_active_capture = task.is_some();
+        wait_for_capture(task).await;
+        drop(old_session);
 
-    // Stop current capture if running
-    let had_active_capture = connection.screen_capture_task.is_some();
-    connection
-        .screen_share_active
-        .store(false, Ordering::Relaxed);
-    if let Some(task) = connection.screen_capture_task.take() {
-        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), task).await;
-    }
+        // …and restart capture if viewers were watching. The share may have
+        // ended while we waited; then there is nothing to restart.
+        if had_active_capture {
+            let mut conns = state.connections.write().await;
+            let connection = voice_mut(&state, &mut conns)?;
+            if connection.is_screen_sharing {
+                spawn_share_capture(connection, app, resolution, fps)?;
+            }
+        }
 
-    // Replace capture session
-    connection.capture_session = Some(new_session);
-
-    // Restart capture if viewers were watching
-    if had_active_capture {
-        let session = connection
-            .capture_session
-            .as_ref()
-            .ok_or("No capture session after switch")?;
-
-        let res = voipc_video::Resolution::from_height(resolution)
-            .ok_or_else(|| format!("Unsupported resolution: {}", resolution))?;
-        // Guard against fps=0 (division by zero in pacing/keyframe interval).
-        let fps = fps.clamp(1, 60);
-
-        connection
-            .screen_share_active
-            .store(true, Ordering::Relaxed);
-
-        // Reset sender stats for the new source
-        connection
-            .screen_video_frames_sent
-            .store(0, Ordering::Relaxed);
-        connection
-            .screen_video_bytes_sent
-            .store(0, Ordering::Relaxed);
-        connection.share_loss_ms.store(0, Ordering::Relaxed);
-        clear_loss_tally(connection);
-
-        let task = screenshare::spawn_capture_task(
-            session,
-            res.width(),
-            res.height(),
-            fps,
-            res.bitrate_kbps_at(fps),
-            connection.screen_share_codec,
-            connection.session_id,
-            connection.screen_share_active.clone(),
-            connection.keyframe_requested.clone(),
-            connection.share_loss_ms.clone(),
-            connection.video_tx.clone(),
-            connection.screen_audio_tx.clone(),
-            connection.screen_audio_enabled.clone(),
-            connection.screen_audio_send_count.clone(),
-            connection.current_media_key.clone(),
-            connection.current_channel_id.clone(),
-            connection.screen_video_frames_sent.clone(),
-            connection.screen_video_bytes_sent.clone(),
-            app,
-            connection.share_preview.clone(),
-            connection.share_viewers.clone(),
-        )?;
-
-        connection.screen_capture_task = Some(task);
-    }
-
-    Ok(())
+        Ok(())
     } // cfg(not(android))
 }
 
 /// Set the codec used for our own screen shares: "h264" or "h265".
 /// Applies to the next share — the codec of a running one is fixed.
 #[tauri::command]
-pub async fn set_screen_share_codec(state: State<'_, AppState>, codec: String) -> Result<(), String> {
+pub async fn set_screen_share_codec(
+    state: State<'_, AppState>,
+    codec: String,
+) -> Result<(), String> {
     if codec != "h264" && codec != "h265" {
         return Err(format!("unknown screen share codec: {codec}"));
     }
@@ -1847,7 +1917,14 @@ pub async fn set_voice_mode(state: State<'_, AppState>, mode: String) -> Result<
 
 /// Set the VAD threshold in dB (typically -60 to 0).
 #[tauri::command]
-pub async fn set_vad_threshold(state: State<'_, AppState>, threshold_db: f32) -> Result<(), String> {
+pub async fn set_vad_threshold(
+    state: State<'_, AppState>,
+    threshold_db: f32,
+) -> Result<(), String> {
+    if !threshold_db.is_finite() {
+        return Err("not a number".into());
+    }
+    let threshold_db = threshold_db.clamp(-100.0, 0.0);
     // Always persist
     {
         let mut settings = state.settings.write().await;
@@ -1970,18 +2047,19 @@ pub async fn start_mic_test(
             while active.load(Ordering::Relaxed) {
                 let read = ringbuf::traits::Consumer::pop_slice(&mut consumer, &mut buf);
                 if read > 0 {
-                    let rms = (buf[..read].iter().map(|s| s * s).sum::<f32>()
-                        / read as f32)
-                        .sqrt();
-                    let db = if rms > 0.0 { 20.0 * rms.log10() } else { -100.0 };
+                    let rms = (buf[..read].iter().map(|s| s * s).sum::<f32>() / read as f32).sqrt();
+                    let db = if rms > 0.0 {
+                        20.0 * rms.log10()
+                    } else {
+                        -100.0
+                    };
                     let _ = app.emit("mic-test-level", serde_json::json!({"db": db}));
 
                     if let Some((_, producer)) = monitoring.as_mut() {
                         // The same chain, in the same order, with the same four
                         // controls the capture task reads out of `sender_lane`
                         let packed = sender_lane.load(Ordering::Relaxed);
-                        let fx =
-                            voipc_audio::spatial::Effect::from_u8((packed & 0xff) as u8);
+                        let fx = voipc_audio::spatial::Effect::from_u8((packed & 0xff) as u8);
                         let muffle = ((packed >> 8) & 0xff) as u8;
                         mono.clear();
                         mono.extend_from_slice(&buf[..read]);
@@ -2202,10 +2280,7 @@ pub async fn set_user_volume(
 }
 
 #[tauri::command]
-pub async fn get_user_volume(
-    state: State<'_, AppState>,
-    user_id: u32,
-) -> Result<f32, String> {
+pub async fn get_user_volume(state: State<'_, AppState>, user_id: u32) -> Result<f32, String> {
     let conns = state.connections.read().await;
     let connection = voice(&state, &conns)?;
     let volumes = connection.user_volumes.lock().map_err(|e| e.to_string())?;
@@ -2410,10 +2485,7 @@ pub async fn set_own_position(
 
 /// Start or stop sharing our own position with the channel.
 #[tauri::command]
-pub async fn set_position_sync(
-    state: State<'_, AppState>,
-    enabled: bool,
-) -> Result<(), String> {
+pub async fn set_position_sync(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     let conns = state.connections.read().await;
     let connection = voice(&state, &conns)?;
     let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
@@ -2525,9 +2597,54 @@ pub async fn get_sdk_status(state: State<'_, AppState>) -> Result<serde_json::Va
     }))
 }
 
+/// Ask in a native dialog — one the page can neither draw nor answer — before
+/// saving a setting that lets others do more to the user. A compromised page
+/// has the session already; this keeps it from making that last (H4-11).
+///
+/// No dialog means no: on Linux rfd shows it with `zenity`, and without it the
+/// answer is Cancel, which the error says.
+async fn confirm_natively(title: &str, text: &str) -> Result<(), String> {
+    #[cfg(not(target_os = "android"))]
+    {
+        let answer = rfd::AsyncMessageDialog::new()
+            .set_level(rfd::MessageLevel::Warning)
+            .set_title(title)
+            .set_description(text)
+            .set_buttons(rfd::MessageButtons::OkCancel)
+            .show()
+            .await;
+        if answer == rfd::MessageDialogResult::Ok {
+            Ok(())
+        } else {
+            Err(
+                "Not changed: VoIPC asks in a window of its own first, and the answer was \
+                 no (on Linux that window needs zenity)"
+                    .into(),
+            )
+        }
+    }
+    #[cfg(target_os = "android")]
+    {
+        let _ = (title, text);
+        Ok(())
+    }
+}
+
+/// A path on another machine (`\\host\share`). On Windows merely looking at
+/// one hands the user's NTLM hash to that host, and these paths come from the
+/// page, so they are refused (H4-11).
+fn refuse_remote_path(path: &str) -> Result<(), String> {
+    let path = path.trim_start();
+    if path.starts_with(r"\\") || (cfg!(windows) && path.starts_with("//")) {
+        return Err("A folder on another computer cannot be used".into());
+    }
+    Ok(())
+}
+
 /// Turn the game SDK on or off and set its port and extra allowed origins.
 /// The listener picks the change up within a second.
 #[tauri::command]
+#[allow(clippy::too_many_arguments)]
 pub async fn set_sdk_config(
     state: State<'_, AppState>,
     app: tauri::AppHandle,
@@ -2543,6 +2660,49 @@ pub async fn set_sdk_config(
             return Err("port must be 1024 or above".into());
         }
     }
+    let origins: Option<Vec<String>> = origins.map(|list| {
+        list.into_iter()
+            .map(|o| o.trim().to_string())
+            .filter(|o| !o.is_empty())
+            .collect()
+    });
+    // What this change would allow that is not allowed now
+    let (new_origins, beacon_on, transmit_on) = {
+        let config = state.config();
+        let new_origins: Vec<String> = origins
+            .iter()
+            .flatten()
+            .filter(|o| !config.sdk_allowed_origins.contains(o))
+            .cloned()
+            .collect();
+        (
+            new_origins,
+            beacon_allowed == Some(true) && !config.sdk_beacon_allowed,
+            transmit_allowed == Some(true) && !config.sdk_transmit_allowed,
+        )
+    };
+    if !new_origins.is_empty() {
+        let text = format!(
+            "Let pages from {} place people in your voice mix, as a game would?\n\n\
+             Only add an origin your game or mod's own documentation names.",
+            new_origins.join(", ")
+        );
+        confirm_natively("VoIPC — game integration", &text).await?;
+    }
+    if beacon_on {
+        confirm_natively(
+            "VoIPC — game integration",
+            "Let a game broadcast your position to the channel?",
+        )
+        .await?;
+    }
+    if transmit_on {
+        confirm_natively(
+            "VoIPC — game integration",
+            "Let a game press your push-to-talk, opening your microphone?",
+        )
+        .await?;
+    }
     // The guard is dropped before the revocations below: they await, and the
     // config mutex is a std one that the SDK socket takes every frame.
     {
@@ -2554,11 +2714,7 @@ pub async fn set_sdk_config(
             config.sdk_port = port;
         }
         if let Some(origins) = origins {
-            config.sdk_allowed_origins = origins
-                .into_iter()
-                .map(|o| o.trim().to_string())
-                .filter(|o| !o.is_empty())
-                .collect();
+            config.sdk_allowed_origins = origins;
         }
         // The two things a game may do *to* the user rather than for them.
         // Both off by default.
@@ -2692,6 +2848,9 @@ pub struct ChatHistoryStatus {
     pub current_path: String,
     /// Whether a valid VoIPC chat history file exists at the resolved path.
     pub file_exists: bool,
+    /// "none", "ours", or a file this version must not open or replace:
+    /// "newer" (a newer VoIPC wrote it) or "unreadable".
+    pub file_state: &'static str,
 }
 
 /// Get the current chat history status (path configuration + file existence).
@@ -2709,19 +2868,18 @@ pub async fn get_chat_history_status(
         chat.file_path = file_path.clone();
     }
 
-    let file_exists = if file_path.exists() {
-        match std::fs::read(&file_path) {
-            Ok(data) => crypto::has_valid_header(&data),
-            Err(_) => false,
-        }
-    } else {
-        false
+    let file_state = match crypto::file_kind(&file_path) {
+        crypto::FileKind::Missing => "none",
+        crypto::FileKind::Ours(_) => "ours",
+        crypto::FileKind::Newer => "newer",
+        crypto::FileKind::Unreadable => "unreadable",
     };
 
     Ok(ChatHistoryStatus {
         path_configured,
         current_path: file_path.to_string_lossy().to_string(),
-        file_exists,
+        file_exists: file_state == "ours",
+        file_state,
     })
 }
 
@@ -2758,12 +2916,12 @@ pub async fn set_chat_history_path(
     state: State<'_, AppState>,
     directory: String,
 ) -> Result<SetPathResult, String> {
+    refuse_remote_path(&directory)?;
     let dir_path = std::path::PathBuf::from(&directory);
 
     // Create directory if it doesn't exist
     if !dir_path.exists() {
-        std::fs::create_dir_all(&dir_path)
-            .map_err(|e| format!("Cannot create directory: {e}"))?;
+        std::fs::create_dir_all(&dir_path).map_err(|e| format!("Cannot create directory: {e}"))?;
     }
     if !dir_path.is_dir() {
         return Err("Selected path is not a directory".into());
@@ -2771,36 +2929,20 @@ pub async fn set_chat_history_path(
 
     // Test write permission
     let test_file = dir_path.join(".voipc_write_test");
-    std::fs::write(&test_file, b"test")
-        .map_err(|e| format!("Directory is not writable: {e}"))?;
+    std::fs::write(&test_file, b"test").map_err(|e| format!("Directory is not writable: {e}"))?;
     let _ = std::fs::remove_file(&test_file);
 
     let full_path = dir_path.join("chat_history.bin");
     let full_path_str = full_path.to_string_lossy().to_string();
 
     // Check if a valid file already exists there
-    let file_exists = if full_path.exists() {
-        match std::fs::read(&full_path) {
-            Ok(data) => {
-                if !crypto::has_valid_header(&data) {
-                    return Err(
-                        "A file named chat_history.bin exists at this location but is not a valid VoIPC chat history file. Please choose a different directory.".into()
-                    );
-                }
-                true
-            }
-            Err(_) => false,
-        }
-    } else {
-        false
-    };
+    let file_exists = existing_history(&full_path)?;
 
     // Persist to config
     {
         let mut config = state.config();
         config.chat_history_path = Some(full_path_str.clone());
-        crate::config::save_config(&config)
-            .map_err(|e| format!("Failed to save config: {e}"))?;
+        crate::config::save_config(&config).map_err(|e| format!("Failed to save config: {e}"))?;
     }
 
     // Update ChatState
@@ -2817,15 +2959,12 @@ pub async fn set_chat_history_path(
 
 /// Delete the chat history file from disk and reset all in-memory state.
 #[tauri::command]
-pub async fn delete_chat_history(
-    state: State<'_, AppState>,
-) -> Result<String, String> {
+pub async fn delete_chat_history(state: State<'_, AppState>) -> Result<String, String> {
     let mut chat = state.chat.write().await;
     let path = chat.file_path.clone();
 
     if path.exists() {
-        std::fs::remove_file(&path)
-            .map_err(|e| format!("Failed to delete file: {e}"))?;
+        std::fs::remove_file(&path).map_err(|e| format!("Failed to delete file: {e}"))?;
     }
 
     // Reset in-memory state
@@ -2850,6 +2989,7 @@ pub async fn delete_chat_history(
 /// Does NOT modify any state.
 #[tauri::command]
 pub async fn check_path_status(directory: String) -> Result<SetPathResult, String> {
+    refuse_remote_path(&directory)?;
     let dir_path = std::path::PathBuf::from(&directory);
     if !dir_path.is_dir() {
         return Err("Not a valid directory".into());
@@ -2857,26 +2997,41 @@ pub async fn check_path_status(directory: String) -> Result<SetPathResult, Strin
     let full_path = dir_path.join("chat_history.bin");
     let full_path_str = full_path.to_string_lossy().to_string();
 
-    let file_exists = if full_path.exists() {
-        match std::fs::read(&full_path) {
-            Ok(data) => {
-                if !crypto::has_valid_header(&data) {
-                    return Err(
-                        "A file exists at this location but is not a valid VoIPC chat history file".into()
-                    );
-                }
-                true
-            }
-            Err(_) => false,
-        }
-    } else {
-        false
-    };
+    let file_exists = existing_history(&full_path)?;
 
     Ok(SetPathResult {
         full_path: full_path_str,
         file_exists,
     })
+}
+
+/// Whether a history this version opens is at `path`; a newer or unreadable
+/// one is an error, never taken for "nothing there".
+fn existing_history(path: &std::path::Path) -> Result<bool, String> {
+    match crypto::file_kind(path) {
+        crypto::FileKind::Missing => Ok(false),
+        crypto::FileKind::Ours(_) => Ok(true),
+        crypto::FileKind::Newer => Err("The chat history there was saved by a newer VoIPC. Update VoIPC, or choose a different directory.".into()),
+        crypto::FileKind::Unreadable => Err("A file named chat_history.bin exists at this location but is not a valid VoIPC chat history file. Please choose a different directory.".into()),
+    }
+}
+
+/// Rename the history file out of the way (`chat_history.bin.old-<unix>`),
+/// for one this version cannot open: it stays on disk, for a newer VoIPC or
+/// for the person to keep, and a new history can be made in its place.
+#[tauri::command]
+pub async fn move_chat_history_aside(state: State<'_, AppState>) -> Result<String, String> {
+    let chat = state.chat.read().await;
+    let path = chat.file_path.clone();
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut aside = path.clone().into_os_string();
+    aside.push(format!(".old-{secs}"));
+    std::fs::rename(&path, &aside).map_err(|e| format!("Could not move the file: {e}"))?;
+    Ok(std::path::PathBuf::from(aside)
+        .to_string_lossy()
+        .to_string())
 }
 
 /// Decrypt an existing chat history file with the given password.
@@ -2888,11 +3043,28 @@ pub async fn unlock_chat_history(
 ) -> Result<ChatArchivePayload, String> {
     let mut chat = state.chat.write().await;
 
-    let data =
-        std::fs::read(&chat.file_path).map_err(|e| format!("failed to read file: {e}"))?;
-
-    let (mut archive, salt, key) =
-        crypto::decrypt_archive(&data, &password).map_err(|e| e.to_string())?;
+    // Off the async runtime: the key derivation is 600k PBKDF2 rounds, about
+    // half a second of CPU that would stall everything else on that worker
+    let path = chat.file_path.clone();
+    let (mut archive, salt, key) = tokio::task::spawn_blocking(move || {
+        let data = std::fs::read(&path).map_err(|e| format!("failed to read file: {e}"))?;
+        let (archive, salt, key, version) =
+            crypto::decrypt_archive(&data, &password).map_err(|e| e.to_string())?;
+        // An older format is rewritten as this one on the next save. Once, a
+        // copy of the old file is kept beside it: an older VoIPC cannot read
+        // the new one (and before 1.0 would have offered to create over it).
+        if version < crypto::ARCHIVE_VERSION {
+            let mut copy = path.clone().into_os_string();
+            copy.push(format!(".v{version}"));
+            if !std::path::Path::new(&copy).exists() {
+                crate::config::write_atomic(std::path::Path::new(&copy), &data)
+                    .map_err(|e| format!("could not keep a copy of the older history file: {e}"))?;
+            }
+        }
+        Ok::<_, String>((archive, salt, key))
+    })
+    .await
+    .map_err(|e| e.to_string())??;
     // A message whose timer ran out while the app was closed is not shown and
     // not kept: the deadline was stamped when it arrived, so it does not matter
     // that nothing was running when it came due.
@@ -2905,10 +3077,20 @@ pub async fn unlock_chat_history(
 
     let payload = ChatArchivePayload::from(&archive);
 
+    // A device remembered before the vault was opened (this session) joins
+    // the ones on disk instead of being dropped.
+    let fresh = std::mem::take(&mut chat.archive.devices);
+    let added = !fresh.is_empty();
+    for d in fresh {
+        archive
+            .devices
+            .retain(|k| !(k.relay_id == d.relay_id && k.name == d.name));
+        archive.devices.push(d);
+    }
     chat.archive = archive;
     chat.salt = salt;
     chat.sealing_key = Some(key);
-    chat.dirty = false;
+    chat.dirty = added;
 
     Ok(payload)
 }
@@ -2920,18 +3102,30 @@ pub async fn create_chat_history(
     password: String,
 ) -> Result<(), String> {
     let mut chat = state.chat.write().await;
+    // Never over a file: one this version cannot open is moved aside first
+    // (`move_chat_history_aside`), one it can is unlocked or deleted.
+    if chat.file_path.exists() {
+        return Err(
+            "A chat history file is already there. Unlock it, or move it aside first.".into(),
+        );
+    }
 
     let salt = crypto::generate_salt();
-    let key = crypto::derive_key(&password, &salt);
-    let archive = ChatArchive::default();
+    // The same derivation as unlocking, and off the runtime for the same reason
+    let key = tokio::task::spawn_blocking(move || crypto::derive_key(&password, &salt))
+        .await
+        .map_err(|e| e.to_string())?;
+    // Devices remembered while the vault was off are kept from now on.
+    let archive = ChatArchive {
+        devices: std::mem::take(&mut chat.archive.devices),
+        ..ChatArchive::default()
+    };
 
     // Write the initial (empty) encrypted file
-    let file_data =
-        crypto::encrypt_archive(&archive, &key, &salt).map_err(|e| e.to_string())?;
+    let file_data = crypto::encrypt_archive(&archive, &key, &salt).map_err(|e| e.to_string())?;
 
     if let Some(parent) = chat.file_path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("failed to create data dir: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| format!("failed to create data dir: {e}"))?;
     }
     crate::config::write_atomic(&chat.file_path, &file_data)
         .map_err(|e| format!("failed to write file: {e}"))?;
@@ -2988,6 +3182,10 @@ pub async fn clear_chat_history(state: State<'_, AppState>) -> Result<(), String
     // save with the timestamps it just cleared.
     chat.archive = ChatArchive {
         cleared: std::mem::take(&mut chat.archive.cleared),
+        // Not chat: the devices relays remember are how this one signs in.
+        devices: std::mem::take(&mut chat.archive.devices),
+        // What was read stays read: cleared chat is not fetched back from the log.
+        cursors: std::mem::take(&mut chat.archive.cursors),
         ..ChatArchive::default()
     };
 
@@ -3031,9 +3229,16 @@ pub async fn send_channel_history(
     };
     let (ciphertext, message_type) = tokio::task::block_in_place(|| {
         let mut signal = signal.lock().map_err(|e| e.to_string())?;
-        let stores = signal.stores.as_mut().ok_or("E2E encryption not initialized".to_string())?;
+        let stores = signal
+            .stores
+            .as_mut()
+            .ok_or("E2E encryption not initialized".to_string())?;
         tokio::runtime::Handle::current()
-            .block_on(voipc_crypto::session::encrypt_message(stores, target_user_id, &payload))
+            .block_on(voipc_crypto::session::encrypt_message(
+                stores,
+                target_user_id,
+                &payload,
+            ))
             .map_err(|e| format!("encryption failed: {e}"))
     })?;
 
@@ -3080,10 +3285,16 @@ pub async fn admin_kick(
     user_id: u32,
     reason: String,
 ) -> Result<(), String> {
-    send_admin_message(&state, &server, ClientMessage::AdminKick { user_id, reason }).await
+    send_admin_message(
+        &state,
+        &server,
+        ClientMessage::AdminKick { user_id, reason },
+    )
+    .await
 }
 
-/// Disconnect a user and ban their IP (admin only). `duration_secs` 0 = until restart.
+/// Disconnect a user and ban their address, and with `account` their account
+/// too (admin or moderator). `duration_secs` 0 = permanent.
 #[tauri::command]
 pub async fn admin_ban(
     state: State<'_, AppState>,
@@ -3091,7 +3302,9 @@ pub async fn admin_ban(
     user_id: u32,
     reason: String,
     duration_secs: u32,
+    account: Option<bool>,
 ) -> Result<(), String> {
+    let account = account.unwrap_or(false);
     send_admin_message(
         &state,
         &server,
@@ -3099,19 +3312,41 @@ pub async fn admin_ban(
             user_id,
             reason,
             duration_secs,
+            account,
         },
     )
     .await
 }
 
-/// Lift an IP ban (admin only). The updated list arrives as `admin-bans`.
+/// Ban an account by name, online or not (admin only).
+#[tauri::command]
+pub async fn admin_ban_account(
+    state: State<'_, AppState>,
+    server: String,
+    name: String,
+    reason: String,
+    duration_secs: u32,
+) -> Result<(), String> {
+    send_admin_message(
+        &state,
+        &server,
+        ClientMessage::AdminBanAccount {
+            name,
+            reason,
+            duration_secs,
+        },
+    )
+    .await
+}
+
+/// Lift a ban by its id (admin only). The updated list arrives as `admin-bans`.
 #[tauri::command]
 pub async fn admin_unban(
     state: State<'_, AppState>,
     server: String,
-    ip: String,
+    id: u64,
 ) -> Result<(), String> {
-    send_admin_message(&state, &server, ClientMessage::AdminUnban { ip }).await
+    send_admin_message(&state, &server, ClientMessage::AdminUnban { id }).await
 }
 
 /// Request the ban list (admin only); delivered as the `admin-bans` event.
@@ -3123,8 +3358,14 @@ pub async fn admin_list_bans(state: State<'_, AppState>, server: String) -> Resu
 /// Forget the TOFU-pinned certificate of a server (after a legitimate
 /// certificate rotation). Returns whether a pin existed.
 #[tauri::command]
-pub fn forget_server_pin(host: String, port: u16) -> bool {
-    crate::transport::tofu_forget(&host, port)
+pub async fn forget_server_pin(host: String, port: u16) -> Result<bool, String> {
+    let text = format!(
+        "Forget the certificate VoIPC trusts for {host}:{port}?\n\n\
+         Do this only if the server's operator told you it changed: the next \
+         certificate it shows will be trusted instead, whoever's it is."
+    );
+    confirm_natively("VoIPC — server certificate", &text).await?;
+    Ok(crate::transport::tofu_forget(&host, port))
 }
 
 /// Flush dirty chat state to disk. Called by the background task and on exit.
@@ -3147,6 +3388,13 @@ pub async fn flush_chat_to_disk(state: &AppState) {
             }
         }
     }
+}
+
+/// The front end has saved its chat after `quit-requested` (lib.rs
+/// `request_quit`); the exit handler writes the archive.
+#[tauri::command]
+pub fn quit_app(app: tauri::AppHandle) {
+    app.exit(0);
 }
 
 // ---------------------------------------------------------------------------
@@ -3188,14 +3436,31 @@ pub fn save_connection_info(
 
 /// Add or update a saved server (keyed by host:port). Returns the new list.
 #[tauri::command]
-pub fn save_server(
+pub async fn save_server(
     state: State<'_, AppState>,
     name: String,
     host: String,
     port: u16,
     username: String,
     accept_self_signed: bool,
+    account: Option<bool>,
 ) -> Result<Vec<crate::config::SavedServer>, String> {
+    // A saved server that was checked against the public certificate roots
+    // and is now to take whatever certificate it is shown first
+    let widens = accept_self_signed
+        && state
+            .config()
+            .saved_servers
+            .iter()
+            .any(|s| s.host == host && s.port == port && !s.accept_self_signed);
+    if widens {
+        let text = format!(
+            "Accept a self-signed certificate from {host}:{port}?\n\n\
+             It was saved with a certificate the public roots vouch for. Only \
+             change this if its operator told you to."
+        );
+        confirm_natively("VoIPC — server certificate", &text).await?;
+    }
     let mut config = state.config();
     let entry = crate::config::SavedServer {
         name,
@@ -3203,6 +3468,7 @@ pub fn save_server(
         port,
         username,
         accept_self_signed,
+        account: account.unwrap_or(false),
     };
     if let Some(existing) = config
         .saved_servers
@@ -3248,10 +3514,7 @@ pub fn save_open_servers(
 
 /// Reset all settings to defaults and delete the config file.
 #[tauri::command]
-pub async fn reset_config(
-    state: State<'_, AppState>,
-    app: tauri::AppHandle,
-) -> Result<(), String> {
+pub async fn reset_config(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<(), String> {
     let default_config = crate::config::AppConfig::default();
 
     // The settings are shared with every connection, a call included, so the
@@ -3278,8 +3541,9 @@ pub async fn reset_config(
     );
     for connection in state.connections.read().await.values() {
         if muted != was_muted {
-            let _ = network::send_tcp_message(&connection.tcp_tx, &ClientMessage::SetMuted { muted })
-                .await;
+            let _ =
+                network::send_tcp_message(&connection.tcp_tx, &ClientMessage::SetMuted { muted })
+                    .await;
         }
         if deafened != was_deafened {
             let _ = network::send_tcp_message(
@@ -3317,6 +3581,7 @@ const ALLOWED_SOUND_EXTENSIONS: &[&str] = &["mp3", "wav", "ogg"];
 
 /// Validate a sound file path: must exist, have an allowed extension, and be a regular file.
 fn validate_sound_path(path_str: &str) -> Result<std::path::PathBuf, String> {
+    refuse_remote_path(path_str)?;
     let path = std::path::PathBuf::from(path_str);
 
     let ext = path
@@ -3337,10 +3602,31 @@ fn validate_sound_path(path_str: &str) -> Result<std::path::PathBuf, String> {
 }
 
 /// Play an audio file in a background thread via rodio.
+///
+/// At most [`MAX_SOUNDS`] at once: each one is a thread and an output stream,
+/// and a server can make the events behind them (joins, leaves, messages,
+/// pokes) arrive as fast as it likes. A sound over the limit is skipped —
+/// four already playing say the same thing.
 fn play_audio_file(path: std::path::PathBuf) {
     #[cfg(not(target_os = "android"))]
     {
+        use std::sync::atomic::AtomicUsize;
+        const MAX_SOUNDS: usize = 4;
+        static PLAYING: AtomicUsize = AtomicUsize::new(0);
+        if PLAYING.fetch_add(1, Ordering::Relaxed) >= MAX_SOUNDS {
+            PLAYING.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+        /// Gives the slot back however the thread ends.
+        struct Slot;
+        impl Drop for Slot {
+            fn drop(&mut self) {
+                PLAYING.fetch_sub(1, Ordering::Relaxed);
+            }
+        }
+        let slot = Slot;
         std::thread::spawn(move || {
+            let _slot = slot;
             let Ok((_stream, handle)) = rodio::OutputStream::try_default() else {
                 tracing::warn!("Failed to open audio output for notification sound");
                 return;
@@ -3371,10 +3657,7 @@ fn play_audio_file(path: std::path::PathBuf) {
 /// Play a notification sound for the given event name.
 /// Reads sound settings from AppConfig. Silently returns Ok if disabled or no file configured.
 #[tauri::command]
-pub fn play_notification_sound(
-    state: State<'_, AppState>,
-    name: String,
-) -> Result<(), String> {
+pub fn play_notification_sound(state: State<'_, AppState>, name: String) -> Result<(), String> {
     let config = state.config();
     let entry = match name.as_str() {
         "channel_switch" => &config.sounds.channel_switch,
@@ -3444,11 +3727,7 @@ pub fn preview_sound(path: String) -> Result<(), String> {
 
 /// Update a boolean config field from the frontend (for frontend-only settings).
 #[tauri::command]
-pub fn set_config_bool(
-    state: State<'_, AppState>,
-    key: String,
-    value: bool,
-) -> Result<(), String> {
+pub fn set_config_bool(state: State<'_, AppState>, key: String, value: bool) -> Result<(), String> {
     let mut config = state.config();
     match key.as_str() {
         "auto_connect" => config.auto_connect = value,
@@ -3461,11 +3740,7 @@ pub fn set_config_bool(
 
 /// The same for the settings that are a number.
 #[tauri::command]
-pub fn set_config_u32(
-    state: State<'_, AppState>,
-    key: String,
-    value: u32,
-) -> Result<(), String> {
+pub fn set_config_u32(state: State<'_, AppState>, key: String, value: u32) -> Result<(), String> {
     let mut config = state.config();
     match key.as_str() {
         // 0 is "keep every conversation", which is a real answer here rather
@@ -3474,4 +3749,19 @@ pub fn set_config_u32(
         _ => return Err(format!("Unknown config key: {key}")),
     }
     crate::config::save_config(&config)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_path_on_another_computer_is_refused() {
+        // On Windows each of these sends the user's NTLM hash to `attacker`
+        assert!(refuse_remote_path(r"\\attacker\share\ping.wav").is_err());
+        assert!(refuse_remote_path(r"\\?\UNC\attacker\share").is_err());
+        assert!(refuse_remote_path(r"  \\attacker\share").is_err());
+        assert!(refuse_remote_path("/home/me/sounds/ping.wav").is_ok());
+        assert!(refuse_remote_path(r"C:\Users\me\ping.wav").is_ok());
+    }
 }

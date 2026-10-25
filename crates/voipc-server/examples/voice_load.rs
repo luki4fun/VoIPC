@@ -53,9 +53,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let channel_tx = channel_tx.clone();
         let channel_rx = channel_rx.clone();
         tokio::spawn(async move {
-            if let Err(e) =
-                run_client(i, &server, sent, received, channel_tx, channel_rx).await
-            {
+            if let Err(e) = run_client(i, &server, sent, received, channel_tx, channel_rx).await {
                 eprintln!("client {i} failed: {e}");
             }
         });
@@ -124,6 +122,7 @@ async fn run_client(
         app_version: APP_VERSION.to_string(),
         identity_key: None,
         prekey_bundle: None,
+        account: None,
     };
     send.write_all(&encode_client_msg(&auth)?).await?;
 
@@ -211,7 +210,7 @@ async fn run_client(
     // Each simulated client is its own speaker, so each picks its own nonce
     // prefix exactly as a real one does.
     let stream_id = 0x5EED_0000u32 | index as u32;
-    let aad = voipc_crypto::build_aad(channel_id, 0x05);
+    let aad = voipc_crypto::build_aad(channel_id, 0x05, session_id);
     let mut encoder = voipc_audio::encoder::Encoder::new()?;
     let mut pcm = [0.0f32; OPUS_FRAME_SIZE];
     let freq = 220.0 + 20.0 * index as f32;

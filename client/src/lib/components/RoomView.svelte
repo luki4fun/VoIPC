@@ -155,6 +155,8 @@
   }
 
   async function toggleSync(e: Event): Promise<void> {
+    // Read now: an event's currentTarget is null once the handler has awaited
+    const box = e.currentTarget as HTMLInputElement | null;
     const next = !$syncing;
     try {
       await invoke("set_position_sync", { enabled: next });
@@ -171,7 +173,6 @@
     } catch (err) {
       addNotification(`Could not change position sharing: ${err}`, "error");
       // The click already flipped the box; put it back where the state is
-      const box = e.currentTarget as HTMLInputElement | null;
       if (box) box.checked = $syncing;
     }
   }

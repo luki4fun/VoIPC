@@ -11,7 +11,7 @@
 // and ChannelCreateForm.svelte (inline, because it belongs in the sidebar it
 // was opened from).
 
-import { derived, get, writable, type Readable } from "svelte/store";
+import { derived, get, writable, type Readable, type Writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 
 import { channels, currentChannelId, previewChannelId, previewUsers } from "./channels.js";
@@ -34,9 +34,11 @@ import {
   openTextChannel,
 } from "./chat.js";
 import { addNotification } from "./notifications.js";
+import { isModerator } from "./roster.js";
 import { showChatPane } from "./platform.js";
 import { updateUiPrefs, uiPrefs } from "./ui-prefs.js";
 import { buildInviteLink, splitAddress } from "../invite.js";
+import { canManage, needsNsfwConsent, type Me } from "../channel-post-rules.js";
 import type { ProximityMode } from "../spatial.js";
 import type { ChannelInfo } from "../types.js";
 
@@ -136,6 +138,9 @@ export async function joinChannel(channelId: number, hasPassword: boolean): Prom
   const server = get(serverAddress);
   const alreadyIn =
     channelId === get(currentChannelId) || get(joinedTextChannelIds).has(channelId);
+  if (!alreadyIn && !askNsfwConsent(server, channelId, () => void joinChannel(channelId, hasPassword))) {
+    return false;
+  }
   if (hasPassword && !alreadyIn) {
     promptServer = server;
     passwordPromptChannelId.set(channelId);
@@ -219,6 +224,8 @@ export async function selectChannel(channel: ChannelInfo): Promise<void> {
  */
 export async function joinTextChannel(channel: ChannelInfo): Promise<void> {
   const server = get(serverAddress);
+  // Asked here rather than only in joinChannel, so a yes goes on to open it
+  if (!askNsfwConsent(server, channel.channel_id, () => void joinTextChannel(channel))) return;
   // A password prompt opens instead of a join; the pane follows once the
   // password goes through, not while the dialog is still up.
   if (!(await joinChannel(channel.channel_id, channel.has_password))) return;
@@ -245,7 +252,7 @@ export async function leaveTextChannel(channelId: number): Promise<void> {
     // Stay on the channel rather than dropping the user somewhere else: the
     // pane turns read-only and offers the way back in, which is what tells
     // them the leave went through.
-    if (get(activeTextChannelId.of(server)) === channelId) {
+    if (get(activeTextChannelId.peek(server)) === channelId) {
       openTextChannel(server, null);
       if (get(serverAddress) === server) previewChannel(channelId);
     }
@@ -274,14 +281,17 @@ const autoJoinAsked = scoped<Set<number>>(() => new Set());
  *
  * Skipped for one the user left, and for a password-protected one — we hold no
  * password to offer, and a prompt nobody asked for on every connect is worse
- * than joining it by hand.
+ * than joining it by hand. Skipped, too, for one marked 18+ until the user has
+ * said they are: nobody is put in such a channel without having been asked.
  */
 export function autoJoinTextChannels(server: string, list: ChannelInfo[]): void {
-  const joined = get(joinedTextChannelIds.of(server));
-  const asked = get(autoJoinAsked.of(server));
+  const joined = get(joinedTextChannelIds.peek(server));
+  const asked = get(autoJoinAsked.peek(server));
+  const consented = hasNsfwConsent(server);
   for (const channel of list) {
     if (!channel.text || !channel.auto_join) continue;
     if (channel.has_password || joined.has(channel.channel_id)) continue;
+    if (needsNsfwConsent(channel, consented)) continue;
     if (asked.has(channel.channel_id) || isLeft(server, channel.name)) continue;
     asked.add(channel.channel_id);
     invoke("join_channel", { server, channelId: channel.channel_id, password: null }).catch(
@@ -327,7 +337,7 @@ export function isLeft(server: string, channelName: string): boolean {
  * arrives.
  */
 export function channelMessageTtl(server: string, channelId: number): number {
-  return get(channels.of(server)).find((c) => c.channel_id === channelId)?.message_ttl_secs ?? 0;
+  return get(channels.peek(server)).find((c) => c.channel_id === channelId)?.message_ttl_secs ?? 0;
 }
 
 /** The timer this user set for their messages to one person on a server; 0 is off. */
@@ -348,12 +358,12 @@ export function setDmMessageTtl(server: string, peerName: string, secs: number):
 }
 
 function channelName(server: string, channelId: number): string | undefined {
-  return get(channels.of(server)).find((c) => c.channel_id === channelId)?.name;
+  return get(channels.peek(server)).find((c) => c.channel_id === channelId)?.name;
 }
 
 /** Whether an id names a text channel, per the list that server sent. */
 export function isTextChannel(server: string, channelId: number): boolean {
-  return get(channels.of(server)).some((c) => c.channel_id === channelId && c.text);
+  return get(channels.peek(server)).some((c) => c.channel_id === channelId && c.text);
 }
 
 function rememberLeft(server: string, channelId: number): void {
@@ -379,6 +389,86 @@ function forgetLeft(server: string, channelId: number): void {
   });
 }
 
+// ── 18+ channels ───────────────────────────────────────────────────────────
+//
+// A channel marked 18+ (`nsfw`) asks before it is joined or shown, once per
+// server: the answer is remembered with the other per-server choices, and the
+// server is never told it. Joining is the gate that matters — a member is the
+// only one who receives the channel's messages — and the chat pane hides what
+// this client may already hold of one until the user has answered.
+
+/** Whether the user confirmed being 18+ for this server's channels. */
+export function hasNsfwConsent(server: string): boolean {
+  const key = serverKey(server);
+  return !!key && get(uiPrefs).nsfw_ok.includes(key);
+}
+
+/** `hasNsfwConsent` for the server on screen, as a store. */
+export const nsfwConsented: Readable<boolean> = derived(
+  [uiPrefs, serverAddress],
+  ([$prefs, $address]) => !!$address && $prefs.nsfw_ok.includes(serverKey($address)),
+);
+
+export function giveNsfwConsent(server: string): void {
+  const key = serverKey(server);
+  if (!key) return;
+  updateUiPrefs((p) => {
+    if (!p.nsfw_ok.includes(key)) p.nsfw_ok = [...p.nsfw_ok, key];
+  });
+}
+
+/** The open consent dialog: which channel, and what to do on a yes. */
+export const nsfwPrompt = writable<{ server: string; name: string; then: () => void } | null>(null);
+
+/**
+ * True if joining `channelId` may go ahead now. Otherwise the consent dialog
+ * opens and `then` runs if the user confirms.
+ */
+export function askNsfwConsent(server: string, channelId: number, then: () => void): boolean {
+  const channel = get(channels.peek(server)).find((c) => c.channel_id === channelId);
+  if (!needsNsfwConsent(channel, hasNsfwConsent(server))) return true;
+  // The join it leads to acts on the server on screen: if that changed while
+  // the dialog was up, the yes is kept for `server`, and nothing is joined.
+  nsfwPrompt.set({ server, name: channel?.name ?? "", then: () => get(serverAddress) === server && then() });
+  return false;
+}
+
+export function confirmNsfwPrompt(): void {
+  const prompt = get(nsfwPrompt);
+  nsfwPrompt.set(null);
+  if (!prompt) return;
+  giveNsfwConsent(prompt.server);
+  prompt.then();
+}
+
+export function cancelNsfwPrompt(): void {
+  nsfwPrompt.set(null);
+}
+
+// ── Who may post ───────────────────────────────────────────────────────────
+//
+// See channel-post-rules.ts: the server enforces announcement channels and
+// slow mode; the composer asks first so a refused post is never shown as sent.
+
+/** Who we are on the server on screen, for `canManage`. */
+export const me: Readable<Me> = derived([userId, isAdmin, isModerator], ([$id, $admin, $mod]) => ({
+  userId: $id,
+  isAdmin: $admin,
+  isModerator: $mod,
+}));
+
+/** When this client last posted in each channel, per server (ms). For slow
+ *  mode's countdown; the server keeps its own clock and has the last word. */
+const lastPosts = new Map<string, number>();
+
+export function notePost(server: string, channelId: number, at = Date.now()): void {
+  lastPosts.set(`${serverKey(server)}/${channelId}`, at);
+}
+
+export function lastPostAt(server: string, channelId: number): number | undefined {
+  return lastPosts.get(`${serverKey(server)}/${channelId}`);
+}
+
 // ── Password prompt (joining) ──────────────────────────────────────────────
 
 export const passwordPromptChannelId = writable<number | null>(null);
@@ -399,7 +489,7 @@ export async function submitPasswordJoin(): Promise<void> {
   const password = get(passwordPromptInput);
   try {
     await invoke("join_channel", { server, channelId, password: password || null });
-    const channel = get(channels.of(server)).find((c) => c.channel_id === channelId);
+    const channel = get(channels.peek(server)).find((c) => c.channel_id === channelId);
     if (channel && password) rememberChannelPassword(server, channel.name, password);
     if (channel?.text) forgetLeft(server, channelId);
     cancelPasswordPrompt();
@@ -460,6 +550,28 @@ export const settingsRouted = writable(false);
 export const settingsMessageTtl = writable(0);
 /** The edited channel is a text channel: the voice options do not apply. */
 export const settingsIsText = writable(false);
+/** Only the channel's managers may post (text channels only). */
+export const settingsAnnounce = writable(false);
+/** One post per this many seconds per member; 0 is off. */
+export const settingsSlowMode = writable(0);
+/** Marked 18+. */
+export const settingsNsfw = writable(false);
+
+/** Each option the settings dialog edits: its store, its name in the channel
+ *  and on the wire (voipc_protocol ChannelOptions), and what a channel that
+ *  never set it reads as. One row per option, from filling the dialog in to
+ *  sending what changed. */
+const OPTIONS: [Writable<any>, string, boolean | number][] = [
+  [settingsHidden, "hidden", false],
+  [settingsAnonymous, "anonymous", false],
+  [settingsScreenShare, "screen_share", true],
+  [settingsHideMembers, "hide_members", false],
+  [settingsRouted, "routed", false],
+  [settingsMessageTtl, "message_ttl_secs", 0],
+  [settingsAnnounce, "announce", false],
+  [settingsSlowMode, "slow_mode_secs", 0],
+  [settingsNsfw, "nsfw", false],
+];
 
 /** The channel as it was when the dialog opened, so only changes are sent. */
 let settingsBefore: ChannelInfo | null = null;
@@ -470,7 +582,8 @@ export function canEditChannel(channel: {
   channel_id: number;
   created_by: number | null;
 }): boolean {
-  return channel.channel_id !== 0 && (channel.created_by === get(userId) || get(isAdmin));
+  // Moderators too: the server has always let them, the gear did not show
+  return canManage(channel, get(me));
 }
 
 export function openChannelSettings(channelId: number, e?: Event): void {
@@ -483,13 +596,9 @@ export function openChannelSettings(channelId: number, e?: Event): void {
   passwordEditRemove.set(false);
   passwordEditHasPassword.set(channel?.has_password ?? false);
   settingsProximity.set(channel?.proximity ?? "off");
-  settingsHidden.set(channel?.hidden ?? false);
-  settingsAnonymous.set(channel?.anonymous ?? false);
-  settingsScreenShare.set(channel?.screen_share ?? true);
-  settingsHideMembers.set(channel?.hide_members ?? false);
-  settingsRouted.set(channel?.routed ?? false);
-  settingsMessageTtl.set(channel?.message_ttl_secs ?? 0);
   settingsIsText.set(channel?.text ?? false);
+  const now = (channel ?? {}) as Record<string, unknown>;
+  for (const [store, key, unset] of OPTIONS) store.set(now[key] ?? unset);
   settingsBefore = channel ?? null;
 }
 
@@ -504,7 +613,7 @@ export async function submitChannelSettings(): Promise<void> {
   if (channelId === null) return;
   const server = settingsServer;
   const before =
-    get(channels.of(server)).find((c) => c.channel_id === channelId)?.proximity ?? "off";
+    get(channels.peek(server)).find((c) => c.channel_id === channelId)?.proximity ?? "off";
   const remove = get(passwordEditRemove);
   const password = get(passwordEditInput);
   const proximity = get(settingsProximity);
@@ -517,7 +626,7 @@ export async function submitChannelSettings(): Promise<void> {
         channelId,
         password: remove ? null : password,
       });
-      const name = get(channels.of(server)).find((c) => c.channel_id === channelId)?.name;
+      const name = get(channels.peek(server)).find((c) => c.channel_id === channelId)?.name;
       if (name) {
         if (remove) forgetChannelPassword(server, name);
         else rememberChannelPassword(server, name, password);
@@ -526,37 +635,16 @@ export async function submitChannelSettings(): Promise<void> {
     if (proximity !== before) {
       await invoke("set_channel_proximity", { server, channelId, proximity });
     }
-    // Only what actually changed; null leaves an option alone
-    const was = settingsBefore;
-    const now = {
-      hidden: get(settingsHidden),
-      anonymous: get(settingsAnonymous),
-      screenShare: get(settingsScreenShare),
-      hideMembers: get(settingsHideMembers),
-      routed: get(settingsRouted),
-      messageTtlSecs: get(settingsMessageTtl),
-    };
-    const changed = <T>(value: T, then: T | undefined) => (value === then ? null : value);
-    if (
-      was &&
-      (now.hidden !== was.hidden ||
-        now.anonymous !== was.anonymous ||
-        now.screenShare !== was.screen_share ||
-        now.hideMembers !== was.hide_members ||
-        now.routed !== was.routed ||
-        now.messageTtlSecs !== was.message_ttl_secs)
-    ) {
-      await invoke("set_channel_options", {
-        server,
-        channelId,
-        hidden: changed(now.hidden, was.hidden),
-        anonymous: changed(now.anonymous, was.anonymous),
-        screenShare: changed(now.screenShare, was.screen_share),
-        hideMembers: changed(now.hideMembers, was.hide_members),
-        routed: changed(now.routed, was.routed),
-        messageTtlSecs: changed(now.messageTtlSecs, was.message_ttl_secs),
-      });
+    // Only what actually changed; an option left out is left alone
+    const was = settingsBefore as Record<string, unknown> | null;
+    const options: Record<string, unknown> = {};
+    if (was) {
+      for (const [store, key, unset] of OPTIONS) {
+        const value = get(store);
+        if (value !== (was[key] ?? unset)) options[key] = value;
+      }
     }
+    if (Object.keys(options).length > 0) await invoke("set_channel_options", { server, channelId, options });
     cancelChannelSettings();
   } catch (e) {
     console.error("Failed to change channel settings:", e);

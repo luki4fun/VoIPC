@@ -103,8 +103,8 @@ impl MediaKey {
     fn to_aead_key(&self) -> anyhow::Result<&LessSafeKey> {
         // 32 bytes is always a valid AES-256 key length, so init can't fail
         Ok(self.aead_cache.get_or_init(|| {
-            let unbound = UnboundKey::new(&AES_256_GCM, &self.key_bytes)
-                .expect("AES-256 key is 32 bytes");
+            let unbound =
+                UnboundKey::new(&AES_256_GCM, &self.key_bytes).expect("AES-256 key is 32 bytes");
             LessSafeKey::new(unbound)
         }))
     }
@@ -167,7 +167,7 @@ fn build_nonce(stream_id: u32, sequence: u32, extra: u32, aad_context: &[u8]) ->
 }
 
 /// Maximum sequence number before a key rotation MUST occur.
-/// At ~50 packets/sec (20ms voice frames), this is ~24 hours.
+/// At ~50 packets/sec (20ms voice frames), this is about 2.7 years.
 /// After this, nonce uniqueness cannot be guaranteed under the same key.
 pub const MAX_SEQUENCE_BEFORE_ROTATION: u32 = u32::MAX - 1000;
 
@@ -189,7 +189,7 @@ pub fn media_encrypt(
     plaintext: &[u8],
 ) -> anyhow::Result<Vec<u8>> {
     // bernd: refusing to encrypt is the whole answer here — reached only
-    // after ~24 h of continuous speech on one connection, where the fix is to
+    // after years of continuous speech on one connection, where the fix is to
     // rotate the key and re-roll the sender's `stream_id`. Do that if anybody
     // ever holds a call that long.
     if sequence >= MAX_SEQUENCE_BEFORE_ROTATION {
@@ -202,7 +202,9 @@ pub fn media_encrypt(
     let aead_key = key.to_aead_key()?;
     let nonce = build_nonce(stream_id, sequence, extra, aad_context);
 
-    let mut in_out = plaintext.to_vec();
+    // Room for the tag up front: it is appended to every packet
+    let mut in_out = Vec::with_capacity(plaintext.len() + GCM_TAG_SIZE);
+    in_out.extend_from_slice(plaintext);
     aead_key
         .seal_in_place_append_tag(nonce, Aad::from(aad_context), &mut in_out)
         .map_err(|_| anyhow::anyhow!("encryption failed"))?;
@@ -232,11 +234,13 @@ pub fn media_decrypt(
     let nonce = build_nonce(stream_id, sequence, extra, aad_context);
 
     let mut in_out = ciphertext.to_vec();
-    let plaintext = aead_key
+    let len = aead_key
         .open_in_place(nonce, Aad::from(aad_context), &mut in_out)
-        .map_err(|_| anyhow::anyhow!("decryption failed: invalid key or tampered data"))?;
-
-    Ok(plaintext.to_vec())
+        .map_err(|_| anyhow::anyhow!("decryption failed: invalid key or tampered data"))?
+        .len();
+    // The plaintext is the front of the buffer; drop the tag rather than copy
+    in_out.truncate(len);
+    Ok(in_out)
 }
 
 /// The media keys a client holds for the channel it is in: the one it encrypts
@@ -367,13 +371,13 @@ impl MediaKeyRing {
 }
 
 /// Build AAD context bytes for media encryption.
-/// Binds the channel_id and packet_type to the ciphertext, preventing
-/// cross-channel replay attacks and packet type confusion.
-pub fn build_aad(channel_id: u32, packet_type: u8) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(5);
-    aad.extend_from_slice(&channel_id.to_be_bytes());
-    aad.push(packet_type);
-    aad
+/// Binds the channel_id, the packet_type and the sender (the header's session
+/// id) to the ciphertext: no cross-channel replay, no packet type confusion,
+/// and a relay that rewrites the header's sender breaks the tag instead of
+/// making one member's voice play as another's (protocol v12).
+pub fn build_aad(channel_id: u32, packet_type: u8, sender: u32) -> [u8; 9] {
+    let (c, s) = (channel_id.to_be_bytes(), sender.to_be_bytes());
+    [c[0], c[1], c[2], c[3], packet_type, s[0], s[1], s[2], s[3]]
 }
 
 #[cfg(test)]
@@ -386,15 +390,13 @@ mod tests {
         let plaintext = b"hello voice data";
         let session_id = 42;
         let sequence = 100;
-        let aad = build_aad(1, 0x01);
+        let aad = build_aad(1, 0x01, 42);
 
-        let encrypted =
-            media_encrypt(&key, session_id, sequence, 0, &aad, plaintext).unwrap();
+        let encrypted = media_encrypt(&key, session_id, sequence, 0, &aad, plaintext).unwrap();
         assert_ne!(encrypted, plaintext);
         assert_eq!(encrypted.len(), plaintext.len() + GCM_TAG_SIZE);
 
-        let decrypted =
-            media_decrypt(&key, session_id, sequence, 0, &aad, &encrypted).unwrap();
+        let decrypted = media_decrypt(&key, session_id, sequence, 0, &aad, &encrypted).unwrap();
         assert_eq!(decrypted, plaintext);
     }
 
@@ -403,7 +405,7 @@ mod tests {
         let key1 = MediaKey::generate(1, 0, 1).unwrap();
         let key2 = MediaKey::generate(1, 1, 1).unwrap();
         let plaintext = b"secret";
-        let aad = build_aad(1, 0x01);
+        let aad = build_aad(1, 0x01, 42);
 
         let encrypted = media_encrypt(&key1, 1, 1, 0, &aad, plaintext).unwrap();
         let result = media_decrypt(&key2, 1, 1, 0, &aad, &encrypted);
@@ -414,7 +416,7 @@ mod tests {
     fn wrong_nonce_fails() {
         let key = MediaKey::generate(1, 0, 1).unwrap();
         let plaintext = b"secret";
-        let aad = build_aad(1, 0x01);
+        let aad = build_aad(1, 0x01, 42);
 
         let encrypted = media_encrypt(&key, 1, 1, 0, &aad, plaintext).unwrap();
         // Wrong sequence number
@@ -426,7 +428,7 @@ mod tests {
     fn tampered_data_fails() {
         let key = MediaKey::generate(1, 0, 1).unwrap();
         let plaintext = b"secret";
-        let aad = build_aad(1, 0x01);
+        let aad = build_aad(1, 0x01, 42);
 
         let mut encrypted = media_encrypt(&key, 1, 1, 0, &aad, plaintext).unwrap();
         encrypted[0] ^= 0xFF; // flip a byte
@@ -438,19 +440,30 @@ mod tests {
     fn wrong_aad_fails() {
         let key = MediaKey::generate(1, 0, 1).unwrap();
         let plaintext = b"secret";
-        let aad1 = build_aad(1, 0x01);
-        let aad2 = build_aad(2, 0x01); // different channel
+        let aad1 = build_aad(1, 0x01, 42);
+        let aad2 = build_aad(2, 0x01, 42); // different channel
 
         let encrypted = media_encrypt(&key, 1, 1, 0, &aad1, plaintext).unwrap();
         let result = media_decrypt(&key, 1, 1, 0, &aad2, &encrypted);
         assert!(result.is_err());
     }
 
+    /// A relay that rewrites the header's sender cannot make one member's
+    /// voice play as another's: the tag no longer verifies.
+    #[test]
+    fn a_rewritten_sender_fails() {
+        let key = MediaKey::generate(1, 0, 1).unwrap();
+        let encrypted =
+            media_encrypt(&key, 7, 1, 0, &build_aad(1, 0x05, 42), b"alice speaking").unwrap();
+        assert!(media_decrypt(&key, 7, 1, 0, &build_aad(1, 0x05, 43), &encrypted).is_err());
+        assert!(media_decrypt(&key, 7, 1, 0, &build_aad(1, 0x05, 42), &encrypted).is_ok());
+    }
+
     #[test]
     fn sequence_exceeds_rotation_threshold() {
         let key = MediaKey::generate(1, 0, 1).unwrap();
         let plaintext = b"secret";
-        let aad = build_aad(1, 0x01);
+        let aad = build_aad(1, 0x01, 42);
 
         let result = media_encrypt(&key, 1, MAX_SEQUENCE_BEFORE_ROTATION, 0, &aad, plaintext);
         assert!(result.is_err());
@@ -465,8 +478,8 @@ mod tests {
         // same keystream.
         let key = MediaKey::generate(1, 0, 1).unwrap();
         let plaintext = b"same plaintext";
-        let voice_aad = build_aad(1, 0x05);
-        let screen_aad = build_aad(1, 0x15);
+        let voice_aad = build_aad(1, 0x05, 42);
+        let screen_aad = build_aad(1, 0x15, 42);
 
         let voice_ct = media_encrypt(&key, 7, 42, 0, &voice_aad, plaintext).unwrap();
         let screen_ct = media_encrypt(&key, 7, 42, 0, &screen_aad, plaintext).unwrap();
@@ -490,7 +503,7 @@ mod tests {
     #[test]
     fn two_speakers_under_one_key_never_share_a_nonce() {
         let key = MediaKey::generate(1, 0, 1).unwrap();
-        let aad = build_aad(1, 0x05);
+        let aad = build_aad(1, 0x05, 42);
         // Same key, same sequence, same everything the server controls — the
         // only difference is the stream id each speaker picked for itself.
         let alice = media_encrypt(&key, 0xA1A1_A1A1, 42, 0, &aad, b"hello").unwrap();
@@ -524,7 +537,10 @@ mod tests {
         // And moving rooms is not blocked by what the old room left behind
         assert!(ring.install(MediaKey::generate(2, 0, 1).unwrap(), 2));
         assert!(ring.has_channel(2));
-        assert!(ring.get(1, 0).is_none(), "the room we left is not ours to decrypt");
+        assert!(
+            ring.get(1, 0).is_none(),
+            "the room we left is not ours to decrypt"
+        );
     }
 
     /// `key_id` is a counter, not a limit. If the last generation were really
@@ -549,10 +565,18 @@ mod tests {
     #[test]
     fn a_minter_with_no_key_starts_the_channel_rather_than_waiting() {
         let mut ring = MediaKeyRing::default();
-        assert_eq!(ring.next_generation(5), 0, "an empty ring starts at the first generation");
+        assert_eq!(
+            ring.next_generation(5),
+            0,
+            "an empty ring starts at the first generation"
+        );
 
         ring.install(MediaKey::new(5, 7, 1, [1u8; 32]), 5);
-        assert_eq!(ring.next_generation(5), 8, "with a key it is the one after ours");
+        assert_eq!(
+            ring.next_generation(5),
+            8,
+            "with a key it is the one after ours"
+        );
         // A key for a room we are not in is not ours to succeed; the ring is
         // cleared on the way out, and this is the same answer from what it holds.
         assert_eq!(ring.next_generation(6), 0);
@@ -595,5 +619,4 @@ mod tests {
         assert_eq!((back.channel_id, back.key_id, back.minter), (7, 3, 11));
         assert!(MediaKey::from_bytes(&key.to_bytes()[..41]).is_err());
     }
-
 }
