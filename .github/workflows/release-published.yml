@@ -105,8 +105,10 @@ jobs:
       - name: Point the rc feed at this release if it is newer
         run: |
           repo="$GITHUB_REPOSITORY"
+          # Every release this pipeline makes has one: a miss is a broken
+          # release or a failed download, so it warns (the feed stays as it is).
           if ! gh release download "$TAG" --repo "$repo" -p latest.json; then
-            echo "::notice::$TAG has no latest.json; the rc feed stays as it is"
+            echo "::warning::$TAG has no latest.json (or it did not download); the rc feed stays as it is"
             exit 0
           fi
           new=$(jq -r .version latest.json)
@@ -115,6 +117,9 @@ jobs:
           newer() { [ "$1" != "$2" ] && [ "$(printf '%s\n' "${1/-rc./~rc.}" "${2/-rc./~rc.}" | sort -V | tail -1)" = "${1/-rc./~rc.}" ]; }
           if gh release view updater-rc --repo "$repo" > /dev/null 2>&1; then
             cur=$(gh release download updater-rc --repo "$repo" -p latest.json -O - | jq -r .version) || cur=0.0.0
+            # A feed that is not a version (null from a hand-edited file) must
+            # not hold the feed for good: anything is newer than it.
+            [[ $cur =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]] || cur=0.0.0
             if ! newer "$new" "$cur"; then
               echo "rc feed keeps $cur ($new is not newer)"
               exit 0

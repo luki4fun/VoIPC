@@ -189,12 +189,24 @@ refuses a database that a newer one has migrated, by design. Release candidates
 does not. Use it from a monitoring check. The container image uses it as its HEALTHCHECK.
 
 The container image is static and runs as the non-root user 65532. Its working directory and
-volume is `/data`. Put `server.toml`, the certificate and the key there, with paths relative to
-`/data`:
+volume is `/data`. `/data` holds `server.toml`, the certificate and the key, with paths
+relative to `/data`, and what the relay writes there. The image has no shell, so put the three
+files in from outside before the first start. Until they are there, the relay exits at once
+with `failed to read config file`.
 
-    docker run -d --name voipc -v voipc:/data \
+The simplest way is a host directory that user 65532 owns:
+
+    install -d -o 65532 -g 65532 -m 0700 /srv/voipc
+    install -o 65532 -g 65532 -m 0600 server.toml cert.pem key.pem /srv/voipc/
+    docker run -d --name voipc -v /srv/voipc:/data \
       -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.0.0
     docker exec voipc /voipc-server --config /data/server.toml admin grant <name> admin
+
+With a named volume instead, copy the files in with a throwaway container first, then run the
+relay with `-v voipc:/data`:
+
+    docker run --rm -v voipc:/data -v "$PWD":/src:ro busybox \
+      sh -c 'cp /src/server.toml /src/cert.pem /src/key.pem /data/ && chown -R 65532:65532 /data'
 
 A release candidate only gets its own `:<version>` tag. A final release also moves `:1.0`, `:1`
 and `:latest`.

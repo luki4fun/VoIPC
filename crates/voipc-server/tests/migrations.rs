@@ -33,6 +33,15 @@ const SHIPPED: &[(&str, &str)] = &[
         "postgres/0003_members.sql",
         "bcacbee63b6ee6d98288e2d9226d9aa467df63b064d2a0d3e0b1c65efa5123eb",
     ),
+    // 1.0.0
+    (
+        "sqlite/0004_bans.sql",
+        "b0040fbcb16aa360e24c726104ecec7ec8ea297ea6685afcc0b03ef1d796ae14",
+    ),
+    (
+        "postgres/0004_bans.sql",
+        "60ddf372ad42d9f40c2f7ea58f1294ad147c77db1a500873f08ad01b3908e473",
+    ),
 ];
 
 #[test]

@@ -142,7 +142,9 @@ advisory and a "Security" entry in the CHANGELOG. It never happens silently.
 **1.x keeps:**
 - **Assets:** the release asset names (`voipc-server-linux-x86_64`, `VoIPC_<v>_amd64.AppImage`,
   `VoIPC_<v>_amd64.deb`, `VoIPC_<v>_x64-setup.exe`, `VoIPC-android-<v>.apk`,
-  `VoIPC-web-<v>.tar.gz`), plus `SHA256SUMS` and a build attestation for every file.
+  `VoIPC-web-<v>.tar.gz`), the updater's `latest.json`, `VoIPC_<v>_amd64.AppImage.sig` and
+  `VoIPC_<v>_x64-setup.exe.sig`, plus `SHA256SUMS` and a build attestation for every file.
+  `latest.json` is the name every 1.x client's stable feed URL ends in.
 - **Container:** the image `ghcr.io/luki4fun/voipc-server` with `:<version>`; a final release
   also moves `:<major>.<minor>`, `:<major>` and `:latest`.
 - **Updater feeds:** stable is `releases/latest/download/latest.json`; release candidates read

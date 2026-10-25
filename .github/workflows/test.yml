@@ -283,6 +283,12 @@ jobs:
       # `!cancelled()` so one red lane does not hide the other three: knowing
       # whether a failure is engine-specific is most of the diagnosis, and the
       # job still fails if any lane did.
+      #
+      # test-ui.mjs (about 7 minutes) drives its own Chromium and reads none of
+      # these settings, so it is the same test in every lane but where the
+      # network differs. It runs in the first lane (QUIC) and with UDP blocked
+      # (the TCP fallback); UI_TEST: '0' skips it in the others, which keeps
+      # the job well inside its timeout.
       - name: Chromium ↔ Chromium
         run: ./test-web.sh
         env: { BROWSER: chromium }
@@ -293,11 +299,11 @@ jobs:
       - name: Chromium shares, Firefox watches
         if: ${{ !cancelled() }}
         run: ./test-web.sh
-        env: { BROWSER_ALICE: chromium, BROWSER_BOB: firefox }
+        env: { BROWSER_ALICE: chromium, BROWSER_BOB: firefox, UI_TEST: '0' }
       - name: Firefox shares, Chromium watches
         if: ${{ !cancelled() }}
         run: ./test-web.sh
-        env: { BROWSER_ALICE: firefox, BROWSER_BOB: chromium }
+        env: { BROWSER_ALICE: firefox, BROWSER_BOB: chromium, UI_TEST: '0' }
       # The TCP fallback for servers whose UDP is blocked: the whole run over
       # the WebSocket tunnel, then a Firefox sharer on the tunnel (its
       # WebSocket must land on http/1.1, not the page's h2) against a
@@ -305,11 +311,11 @@ jobs:
       - name: Chromium ↔ Chromium over TCP
         if: ${{ !cancelled() }}
         run: ./test-web.sh
-        env: { BROWSER: chromium, TRANSPORT: tcp }
+        env: { BROWSER: chromium, TRANSPORT: tcp, UI_TEST: '0' }
       - name: Firefox over TCP shares, Chromium over QUIC watches
         if: ${{ !cancelled() }}
         run: ./test-web.sh
-        env: { BROWSER_ALICE: firefox, TRANSPORT_ALICE: tcp, BROWSER_BOB: chromium }
+        env: { BROWSER_ALICE: firefox, TRANSPORT_ALICE: tcp, BROWSER_BOB: chromium, UI_TEST: '0' }
       # A network that drops UDP: both browsers ask for QUIC and must race
       # over to the TCP fallback on their own. Only the first two test relays
       # are blocked; the accounts relay of test-ui.mjs keeps its UDP.
@@ -336,7 +342,7 @@ jobs:
           sudo tc qdisc add dev lo root netem delay 40ms 20ms loss 5%
           trap 'sudo tc qdisc del dev lo root' EXIT
           ./test-web.sh
-        env: { BROWSER: chromium }
+        env: { BROWSER: chromium, UI_TEST: '0' }
 
   # The Windows and Android builds compile on every pull request, not first
   # in a release run. cargo check only, with the caches release.yml uses.
@@ -390,7 +396,8 @@ jobs:
           key: voipc-ffmpeg-win64-${{ hashFiles('tools/tasks/windows-cross.mjs') }}
 
       # check:windows downloads FFmpeg only on a cache miss, checked against
-      # its pinned SHA-256; the release workflow saves the cache.
+      # its pinned SHA-256. A miss is the usual case: caches are scoped by ref,
+      # so what a release run saves stays with its tag and no PR sees it.
       - name: Windows
         run: bash tools/ci-run.sh "windows check" node tools/voipc.mjs check:windows
 

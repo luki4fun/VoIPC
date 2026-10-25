@@ -23,7 +23,7 @@ export default function wasm() {
 
   head('Building the wasm crate');
   // From inside the crate: its .cargo/config.toml sets the getrandom backend.
-  run('cargo', ['build', '--release', '--target', 'wasm32-unknown-unknown'], { cwd: crate });
+  run('cargo', ['build', '--release', '--locked', '--target', 'wasm32-unknown-unknown'], { cwd: crate });
   const target = resolve(crate, process.env.CARGO_TARGET_DIR || 'target');
   run('wasm-bindgen', ['--target', 'web', '--out-dir', join(CLIENT, 'src', 'lib', 'wasm'),
     '--out-name', 'voipc_web', join(target, 'wasm32-unknown-unknown', 'release', 'voipc_web.wasm')]);

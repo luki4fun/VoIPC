@@ -43,8 +43,8 @@ function buildStamp() {
         .toString()
         .trim();
     } catch {
-      // No git binary, or no checkout to ask: the release image drops .git
-      // (see .dockerignore), so that build stamps VOIPC_BUILD_HASH or nothing.
+      // No git binary, or no checkout to ask (a git archive copy): that
+      // build stamps VOIPC_BUILD_HASH or nothing.
       return "";
     }
   };
@@ -78,7 +78,9 @@ export default defineConfig(({ mode }) => {
       port: 1420,
       strictPort: true,
     },
-    envPrefix: ["VITE_", "TAURI_"],
+    // TAURI_ENV_*, not TAURI_*: TAURI_SIGNING_PRIVATE_KEY is a TAURI_ name
+    // too, and only tree-shaking would keep it out of the bundle.
+    envPrefix: ["VITE_", "TAURI_ENV_"],
     define: {
       __WEB__: web,
       // The headless self-test (src/web/selftest.ts) connects, joins, writes
@@ -92,8 +94,8 @@ export default defineConfig(({ mode }) => {
     resolve: web ? { alias: webAliases } : undefined,
     build: {
       target: "esnext",
-      minify: !process.env.TAURI_DEBUG ? "esbuild" : false,
-      sourcemap: !!process.env.TAURI_DEBUG,
+      minify: !process.env.TAURI_ENV_DEBUG ? "esbuild" : false,
+      sourcemap: !!process.env.TAURI_ENV_DEBUG,
       // assetsInlineLimit 0: an inlined `data:` URL cannot be passed to
       // audioWorklet.addModule (browsers and our CSP reject it), and the
       // capture worklet is small enough that Vite would inline it.

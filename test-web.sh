@@ -18,6 +18,9 @@
 # lane drops them with iptables): both browsers ask for QUIC as usual, and
 # both must have raced over to the TCP fallback on their own.
 #
+# UI_TEST=0 skips test-ui.mjs. It drives its own Chromium and reads none of the
+# settings above, so CI runs it only where the network differs.
+#
 # Prerequisites: VOIPC_SELFTEST=1 npm run web (a release bundle has no self-test),
 # openssl, curl with HTTP/2, and either chromium (CHROME=/path/to/chrome) or,
 # for the Firefox lane, firefox (FIREFOX=...) plus certutil to trust the test
@@ -27,6 +30,42 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
+# Reading a job's log needs admin rights on the repository, its annotations
+# need none: so under GitHub Actions every red exit leaves one, readable from
+# /repos/:owner/:repo/check-runs/:id/annotations without a token. die() for the
+# planned exits; the EXIT trap names the command for any other (set -e).
+annotated=0
+annotate() { # title detail
+  annotated=1
+  [ -n "${GITHUB_ACTIONS:-}" ] || return 0
+  printf '::error title=%s::%s\n' "$1" \
+    "$(printf '%s\n' "${2:0:3000}" | sed 's/\x1b\[[0-9;]*m//g' |
+      awk '{ gsub(/%/, "%25"); gsub(/\r/, "%0D"); printf "%s%%0A", $0 }')"
+}
+die() { echo "$*" >&2; annotate "test-web" "$*"; exit 1; }
+failed_at=""
+# `wait` before rm: Chromium is still writing its profile when SIGTERM lands,
+# and under `set -e` a failing rm inside the trap would turn a green run red.
+# (Run by the EXIT trap; $(jobs -p) splits into pids on purpose.)
+# shellcheck disable=SC2329,SC2046
+on_exit() {
+  local status=$?
+  kill $(jobs -p) 2>/dev/null || true
+  wait 2>/dev/null || true
+  if [ "$status" -ne 0 ] && [ "$annotated" = 0 ]; then
+    echo "test-web: exit $status${failed_at:+ at line $failed_at}" >&2
+    annotate "test-web ${BROWSER_ALICE:-} -> ${BROWSER_BOB:-}" "$(
+      echo "exit $status${failed_at:+ at line $failed_at}"
+      for f in fails.txt ui.txt server.log; do
+        if [ -n "${WORK:-}" ] && [ -s "$WORK/$f" ]; then echo "--- $f"; tail -n 15 "$WORK/$f"; fi
+      done)" || true
+  fi
+  if [ -n "${WORK:-}" ]; then rm -rf "$WORK" 2>/dev/null || true; fi
+}
+set -E
+trap 'failed_at="$LINENO: $BASH_COMMAND"' ERR
+trap on_exit EXIT
+
 BROWSER="${BROWSER:-chromium}"
 BROWSER_ALICE="${BROWSER_ALICE:-$BROWSER}"
 BROWSER_BOB="${BROWSER_BOB:-$BROWSER}"
@@ -34,12 +73,12 @@ for b in "$BROWSER_ALICE" "$BROWSER_BOB"; do
   case "$b" in
     chromium)
       CHROME="${CHROME:-$(command -v chromium || command -v chromium-browser || command -v google-chrome || true)}"
-      [ -n "$CHROME" ] || { echo "no chromium found (set CHROME=...)" >&2; exit 1; }
+      [ -n "$CHROME" ] || die "no chromium found (set CHROME=...)"
       ;;
     firefox)
       FIREFOX="${FIREFOX:-$(command -v firefox || true)}"
-      [ -n "$FIREFOX" ] || { echo "no firefox found (set FIREFOX=...)" >&2; exit 1; }
-      command -v certutil >/dev/null || { echo "certutil missing (Arch: nss, Debian: libnss3-tools)" >&2; exit 1; }
+      [ -n "$FIREFOX" ] || die "no firefox found (set FIREFOX=...)"
+      command -v certutil >/dev/null || die "certutil missing (Arch: nss, Debian: libnss3-tools)"
       # Chrome falls back to a fake audio device; Firefox does not. With no
       # sound server its AudioContext never starts, so it captures nothing and
       # plays nothing, and the two voice checks fail with played:0 on both
@@ -49,7 +88,7 @@ for b in "$BROWSER_ALICE" "$BROWSER_BOB"; do
         echo "         (start one with: pulseaudio --start --exit-idle-time=-1)" >&2
       fi
       ;;
-    *) echo "unknown browser '$b' (chromium or firefox)" >&2; exit 1 ;;
+    *) die "unknown browser '$b' (chromium or firefox)" ;;
   esac
 done
 TRANSPORT="${TRANSPORT:-quic}"
@@ -58,25 +97,20 @@ TRANSPORT_BOB="${TRANSPORT_BOB:-$TRANSPORT}"
 for t in "$TRANSPORT_ALICE" "$TRANSPORT_BOB"; do
   case "$t" in
     quic | tcp) ;;
-    *) echo "unknown transport '$t' (quic or tcp)" >&2; exit 1 ;;
+    *) die "unknown transport '$t' (quic or tcp)" ;;
   esac
 done
 # The query parameter that puts a side on the TCP fallback
 via() { [ "$1" = tcp ] && echo "&transport=tcp" || true; }
 echo "browsers: alice=$BROWSER_ALICE over $TRANSPORT_ALICE, bob=$BROWSER_BOB over $TRANSPORT_BOB"
 SERVER="${SERVER:-target/release/voipc-server}"
-[ -x "$SERVER" ] || { echo "$SERVER missing — run VOIPC_SELFTEST=1 npm run web first" >&2; exit 1; }
-grep -qs SELFTEST client/dist-web/assets/*.js || {
-  echo "client/dist-web has no self-test — rebuild with VOIPC_SELFTEST=1 npm run web" >&2
-  exit 1
-}
+[ -x "$SERVER" ] || die "$SERVER missing — run VOIPC_SELFTEST=1 npm run web first"
+grep -qs SELFTEST client/dist-web/assets/*.js ||
+  die "client/dist-web has no self-test — rebuild with VOIPC_SELFTEST=1 npm run web"
 
 TCP_PORT="${TCP_PORT:-19987}"
 DURATION="${DURATION:-15000}"
 WORK="$(mktemp -d)"
-# `wait` before rm: Chromium is still writing its profile when SIGTERM lands,
-# and under `set -e` a failing rm inside the trap would turn a green run red.
-trap 'kill $(jobs -p) 2>/dev/null || true; wait 2>/dev/null || true; rm -rf "$WORK" 2>/dev/null || true' EXIT
 
 # A throwaway CA signs the page certificate. Chromium would take a self-signed
 # one (it is started with --ignore-certificate-errors), but Firefox only trusts
@@ -116,7 +150,7 @@ for _ in $(seq 1 50); do
   curl -sk --http2-prior-knowledge "https://127.0.0.1:$TCP_PORT/wt.json" > "$WORK/wt.json" 2>/dev/null && break
   sleep 0.2
 done
-grep -q '"hash"' "$WORK/wt.json" || { echo "server did not come up:"; cat "$WORK/server.log"; exit 1; }
+grep -q '"hash"' "$WORK/wt.json" || die "server did not come up: $(cat "$WORK/server.log")"
 echo "server up: $(cat "$WORK/wt.json")"
 
 # A second, empty server for test-ui.mjs's multi-server lane: one client holding
@@ -302,7 +336,9 @@ fi
 # the same invoke()/listen() surface the UI uses. test-ui.mjs clicks the real
 # Svelte UI over the DevTools protocol, which is where a duplicate key in a
 # keyed {#each} throws and wedges the window. Chromium only — Firefox has no CDP.
-if [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
+if [ "${UI_TEST:-1}" = 0 ]; then
+  echo "--- UI regression skipped (UI_TEST=0)"
+elif [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
   echo "--- UI regression (test-ui.mjs)"
   UI_CDP="${UI_CDP:-9229}"
   "$CHROME" --headless=new --no-sandbox --disable-gpu --ignore-certificate-errors \
@@ -314,11 +350,12 @@ if [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
     curl -s "http://127.0.0.1:$UI_CDP/json/version" > /dev/null 2>&1 && break
     sleep 0.2
   done
-  if node "$SCRIPT_DIR/test-ui.mjs" "$TCP_PORT" "$UI_CDP" "$TCP_PORT2" "$TCP_PORT3" | tee "$WORK/ui.txt"; then
+  # 2>&1: a crash's stack trace goes to stderr, and it is the whole story
+  if node "$SCRIPT_DIR/test-ui.mjs" "$TCP_PORT" "$UI_CDP" "$TCP_PORT2" "$TCP_PORT3" 2>&1 | tee "$WORK/ui.txt"; then
     echo "PASS the UI survives creating and configuring a proximity channel"
   else
     echo "FAIL the UI regression test" | tee -a "$WORK/fails.txt"
-    grep '^FAIL' "$WORK/ui.txt" >> "$WORK/fails.txt" || true
+    { grep '^FAIL' "$WORK/ui.txt"; grep -v '^PASS\|^FAIL' "$WORK/ui.txt" | tail -n 15; } >> "$WORK/fails.txt" || true
     fail=1
   fi
   kill "$ui_browser" 2>/dev/null || true
@@ -328,17 +365,12 @@ fi
 
 echo "--- server log tail"; tail -20 "$WORK/server.log"
 
-# Everything above is in the job log, and reading that log needs admin rights on
-# the repository — a run's *annotations* need none. Repeat the failure into one
-# so it can be read back from
-# /repos/:owner/:repo/check-runs/:id/annotations without a token.
-if [ "$fail" -ne 0 ] && [ -n "${GITHUB_ACTIONS:-}" ]; then
-  {
+# Everything above is in the job log; the failure goes into an annotation too
+# (annotate, at the top).
+if [ "$fail" -ne 0 ]; then
+  annotate "test-web $BROWSER_ALICE -> $BROWSER_BOB" "$(
     cat "$WORK/fails.txt"
     echo "--- alice"; tail -20 "$WORK/alice.txt"
-    echo "--- bob";   tail -20 "$WORK/bob.txt"
-  } | head -c 3000 > "$WORK/detail.txt"
-  printf '::error title=test-web %s -> %s::%s\n' "$BROWSER_ALICE" "$BROWSER_BOB" \
-    "$(awk '{ gsub(/%/, "%25"); gsub(/\r/, "%0D"); printf "%s%%0A", $0 }' "$WORK/detail.txt")"
+    echo "--- bob";   tail -20 "$WORK/bob.txt")"
 fi
 exit $fail

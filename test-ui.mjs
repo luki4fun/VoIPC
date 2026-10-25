@@ -248,39 +248,64 @@ async function connect(name, tag = "") {
       .observe(document.body, { childList: true, subtree: true, characterData: true }); })()`);
   await tab.evaluate(click(".connect-btn"));
   await waitFor(tab, `document.querySelector(".channel-list")`);
-  // First run also offers the audio setup, a moment after the channel list
-  // arrives. Lane 8 drives it properly; every other lane wants it out of the
-  // way — and it is a real overlay, so leaving it up would swallow every
-  // click the rest of this file makes.
-  await sleep(800);
-  if (await tab.evaluate(`!!document.querySelector(".audio-setup .skip-link")`)) {
-    await realClick(tab, ".audio-setup .skip-link");
-    await waitFor(tab, `!document.querySelector(".audio-setup")`);
-  }
-  await dismissLayoutPicker(tab);
+  await answerFirstRun(tab, name);
   console.log(`${name}: connected`);
   return tab;
 }
 
 /**
- * The layout picker follows the audio setup on a fresh profile.
+ * Answers the first-run dialogs a connection brings up, however late they come:
+ * the audio setup is skipped (section 8 drives it properly), the layout picker
+ * is answered.
+ *
+ * App.svelte shows the audio setup once the connection is up, the picker only
+ * after the audio setup is gone, and neither again once answered. The shell,
+ * .channel-list included, is on screen before any of that, and over the TCP
+ * fallback or a lossy link the dialogs come seconds after it — fixed sleeps
+ * missed them there. So this waits for the connect dialog to close (it does
+ * once connected), answers whatever shows, and returns once the picker is
+ * answered and nothing has shown for a second.
  *
  * Conditional, because test-web.sh runs one Chromium with one profile: every
  * tab shares localStorage, so the first browser is asked and the second is not.
- * It ANSWERS the question rather than skipping it: the default is the modern
+ * It ANSWERS the picker rather than skipping it: the default is the modern
  * layout, and every selector below this point is the classic one's. Section 11
- * is where switching between them is exercised on purpose.
- * Leaving it up would be worse than a timeout — it is a real overlay, so every
- * realClick after it would land on its backdrop and read as "element not found".
+ * is where switching between them is exercised on purpose, through Settings,
+ * which this never undoes.
+ * Leaving either up would be worse than a timeout — it is a real overlay, so
+ * every realClick after it would land on its backdrop and read as "element not
+ * found". A timeout is a FAIL here, and the checks after it say what is wrong.
  */
-async function dismissLayoutPicker(tab) {
-  await sleep(300);
-  if (await tab.evaluate(`!!document.querySelector(".layout-setup")`)) {
-    await realClick(tab, '.layout-setup .layout-choice[data-layout="classic"]');
-    await sleep(200);
-    await realClick(tab, ".layout-setup .submit-btn");
-    await waitFor(tab, `!document.querySelector(".layout-setup")`);
+async function answerFirstRun(tab, who, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  let quietSince = 0;
+  let seen;
+  while (Date.now() < deadline) {
+    seen = await tab.evaluate(`({
+      connected: !document.querySelector(".connect-btn"),
+      audio: !!document.querySelector(".audio-setup .skip-link"),
+      layout: !!document.querySelector(".layout-setup"),
+      answered: JSON.parse(localStorage.getItem("voipc.settings") ?? "{}").ui_prefs?.layout_asked_version === 1,
+    })`);
+    if (seen.audio) {
+      await realClick(tab, ".audio-setup .skip-link");
+      await waitFor(tab, `!document.querySelector(".audio-setup")`);
+      quietSince = 0;
+    } else if (seen.layout) {
+      await realClick(tab, '.layout-setup .layout-choice[data-layout="classic"]');
+      await sleep(200);
+      await realClick(tab, ".layout-setup .submit-btn");
+      await waitFor(tab, `!document.querySelector(".layout-setup")`);
+      quietSince = 0;
+    } else if (seen.connected && seen.answered) {
+      quietSince ||= Date.now();
+      if (Date.now() - quietSince >= 1_000) return;
+    } else {
+      quietSince = 0;
+    }
+    await sleep(150);
   }
+  check(`${who}: the first-run dialogs are answered`, false, JSON.stringify(seen));
 }
 
 /**
@@ -320,7 +345,9 @@ async function connectRaw(name, asNewUser = false) {
   await tab.evaluate(setInput('input[placeholder="9987"]', PORT));
   await tab.evaluate(setInput('input[placeholder="Your name"]', name));
   await tab.evaluate(click(".connect-btn"));
-  await waitFor(tab, `document.querySelector(".channel-list")`);
+  // Connected, not just the shell: .channel-list is on screen before that, and
+  // the audio setup comes only with the connection (see answerFirstRun).
+  await waitFor(tab, `!document.querySelector(".connect-btn")`);
   return tab;
 }
 
@@ -329,7 +356,7 @@ const bob = await connect("ui-bob");
 check(
   "answering the layout question is remembered",
   (await alice.evaluate(
-    `JSON.parse(localStorage.getItem("voipc.settings")).ui_prefs?.layout_asked_version`,
+    `JSON.parse(localStorage.getItem("voipc.settings") ?? "{}").ui_prefs?.layout_asked_version`,
   )) === 1,
 );
 check(
@@ -683,13 +710,14 @@ check(
     (await fresh.evaluate(`document.querySelectorAll(".audio-setup select option").length`)) > 0,
   );
   // The meter is the whole point of the step: it is fed by mic-test-level,
-  // which only arrives if the wizard actually started a capture.
+  // which only arrives if the wizard actually started a capture. The fake
+  // microphone takes its time on a busy runner (8 s was not always enough).
   let meterMoved = true;
   try {
     await waitFor(
       fresh,
       `document.querySelector(".audio-setup .level-fill").style.width !== "0%"`,
-      8_000,
+      20_000,
     );
   } catch {
     meterMoved = false;
@@ -1892,12 +1920,7 @@ if (PORT3) {
       await realClick(tab, `${cloud} ${keep ? ".submit-btn" : ".secondary"}`);
       await waitFor(tab, `!document.querySelector('${cloud}')`);
     }
-    await sleep(800);
-    if (await tab.evaluate(`!!document.querySelector(".audio-setup .skip-link")`)) {
-      await realClick(tab, ".audio-setup .skip-link");
-      await waitFor(tab, `!document.querySelector(".audio-setup")`);
-    }
-    await dismissLayoutPicker(tab);
+    await answerFirstRun(tab, "accounts", 30_000);
   };
 
   const up = await openDialog();

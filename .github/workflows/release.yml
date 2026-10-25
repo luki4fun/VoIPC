@@ -184,10 +184,16 @@ jobs:
       #
       # The server embeds client/dist-web at compile time, so the web bundle
       # has to exist before the server is built.
+      #
+      # A tag has no inputs, and an empty VITE_DEFAULT_SERVER is not an unset
+      # one: vite inlines the "", and the bundle (and the server embedding it)
+      # is then not what a rebuild makes (BUILDING, "Reproducible builds").
       - name: Build the web client
         env:
           VITE_DEFAULT_SERVER: ${{ inputs.default_server }}
-        run: bash ../tools/ci-run.sh "linux web client" npm run build:web
+        run: |
+          [ -n "$VITE_DEFAULT_SERVER" ] || unset VITE_DEFAULT_SERVER
+          bash ../tools/ci-run.sh "linux web client" npm run build:web
         working-directory: client
 
       - name: Build the server (static musl)
@@ -199,7 +205,9 @@ jobs:
         env:
           APPIMAGE_EXTRACT_AND_RUN: 1   # appimagetool cannot use FUSE on a runner
           VITE_DEFAULT_SERVER: ${{ inputs.default_server }}
-        run: bash tools/ci-run.sh "linux desktop client" node tools/voipc.mjs build
+        run: |
+          [ -n "$VITE_DEFAULT_SERVER" ] || unset VITE_DEFAULT_SERVER
+          bash tools/ci-run.sh "linux desktop client" node tools/voipc.mjs build
 
       - name: Collect artifacts
         env:
@@ -331,7 +339,9 @@ jobs:
       - name: Build the client (NSIS)
         env:
           VITE_DEFAULT_SERVER: ${{ inputs.default_server }}
-        run: bash tools/ci-run.sh "windows build" node tools/voipc.mjs build:windows
+        run: |
+          [ -n "$VITE_DEFAULT_SERVER" ] || unset VITE_DEFAULT_SERVER
+          bash tools/ci-run.sh "windows build" node tools/voipc.mjs build:windows
 
       - name: Collect artifacts
         run: |
@@ -484,9 +494,9 @@ jobs:
       - name: Build the unsigned APK
         env:
           VITE_DEFAULT_SERVER: ${{ inputs.default_server }}
-        run: >-
-          bash tools/ci-run.sh "android build"
-          node tools/voipc.mjs android release --unsigned --target aarch64
+        run: |
+          [ -n "$VITE_DEFAULT_SERVER" ] || unset VITE_DEFAULT_SERVER
+          bash tools/ci-run.sh "android build" node tools/voipc.mjs android release --unsigned --target aarch64
 
       - name: Collect artifacts
         env: { v: '${{ needs.meta.outputs.version }}' }
@@ -551,14 +561,19 @@ jobs:
           trap 'rm -f "$ks"' EXIT
           echo "$KEYSTORE" | base64 -d > "$ks"
           mkdir -p signed
-          # Gradle zip-aligns a release APK whether it signs it or not;
-          # apksigner keeps that alignment.
+          # Gradle zip-aligns a release APK whether it signs it or not.
+          # apksigner re-aligns native libraries itself (--lib-page-alignment,
+          # 16 KB by default), so this checks what Gradle built.
           "$bt/zipalign" -c -P 16 4 "artifacts/android/VoIPC-android-$v-unsigned.apk"
+          # No v4 signing: it writes a .idsig beside --out, which would ship.
           "$bt/apksigner" sign --ks "$ks" --ks-pass env:STORE_PASSWORD \
-            --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASSWORD \
+            --ks-key-alias "$KEY_ALIAS" --key-pass env:KEY_PASSWORD --v4-signing-enabled false \
             --out "signed/VoIPC-android-$v.apk" "artifacts/android/VoIPC-android-$v-unsigned.apk"
           "$bt/apksigner" verify --print-certs "signed/VoIPC-android-$v.apk" | tee certs.txt
-          if ! grep -qx "Signer #1 certificate SHA-256 digest: $ANDROID_CERT_SHA256" certs.txt; then
+          # Label-free: build-tools 37 prints "V2 Signer: certificate …", older
+          # ones "Signer #1 certificate …". Exactly one certificate, the pin.
+          digests=$(sed -n 's/.*certificate SHA-256 digest: \([0-9a-f]\{64\}\)$/\1/p' certs.txt | sort -u)
+          if [ "$digests" != "$ANDROID_CERT_SHA256" ]; then
             echo "::error::the APK is not signed with VoIPC's release certificate"
             exit 1
           fi
@@ -580,8 +595,19 @@ jobs:
         run: |
           appimage=$(cd artifacts/linux && ls *.AppImage)
           setup=$(cd artifacts/windows && ls *-setup.exe)
+          # signer sign takes any key, but the app installs only what its own
+          # pubkey verifies: a wrong secret would ship a release that never
+          # updates. The key id, in the pubkey and in a .sig alike: decode the
+          # base64 file, then its second line; bytes 2..10, little-endian.
+          keyid() { python3 -c 'import base64,sys; print(base64.b64decode(base64.b64decode(sys.stdin.read()).splitlines()[1])[2:10][::-1].hex().upper())'; }
+          want=$(jq -r .plugins.updater.pubkey client/src-tauri/tauri.conf.json | keyid)
           for f in "artifacts/linux/$appimage" "artifacts/windows/$setup"; do
             (cd client && npx tauri signer sign --app-version "$v" "../$f")
+            got=$(keyid < "$f.sig")
+            if [ -z "$want" ] || [ "$got" != "$want" ]; then
+              echo "::error::$f is signed with updater key '$got', but the app trusts '$want' (tauri.conf.json): TAURI_SIGNING_PRIVATE_KEY is the wrong key"
+              exit 1
+            fi
             cp "$f.sig" signed/
           done
           protocol=$(sed -n 's/^pub const PROTOCOL_VERSION: u32 = \([0-9]*\);/\1/p' crates/voipc-protocol/src/codec.rs)

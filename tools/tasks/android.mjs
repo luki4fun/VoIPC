@@ -231,7 +231,8 @@ function build(args) {
  * declares. That failure only shows up on a device, so check it at build time.
  */
 function verifyNativeLib(toolchain, target) {
-  const so = join(ROOT, 'target', target, 'release', 'libvoipc_client_lib.so');
+  // `--target all` has no single directory: no check, as for a debug build
+  const so = join(ROOT, 'target', ABI_BY_TARGET[target] ?? target, 'release', 'libvoipc_client_lib.so');
   if (!existsSync(so)) return; // debug build, or a layout we do not know
   const readelf = join(toolchain, 'bin', 'llvm-readelf');
   if (!existsSync(readelf)) return;

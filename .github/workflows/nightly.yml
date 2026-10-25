@@ -153,7 +153,10 @@ jobs:
             (cd crates/voipc-web && cargo clean)
             rm -rf client/dist-web client/src/lib/wasm
           }
-          export SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          # Two lines: `export X="$(…)"` would hide a failed git log behind
+          # export's own success, and both builds would run with no epoch.
+          SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
+          export SOURCE_DATE_EPOCH
           build "$RUNNER_TEMP/a"
           clean
           build "$RUNNER_TEMP/b"

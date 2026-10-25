@@ -357,6 +357,22 @@ release candidate falls back to its final version's section. The workflow adds a
 Publishing the draft starts `release-published.yml`. That workflow pushes the relay's
 container image and updates the release-candidate updater feed.
 
+**Cutting a release**, in this order:
+1. Set `version` in `[workspace.package]` of the root `Cargo.toml`.
+2. `npm run version:sync` copies it to every other version site (`npm run version:check`
+   confirms).
+3. `cargo update --workspace` in `.`, `crates/voipc-web` and `fuzz`: only our own crates'
+   lock lines change. A stale root or voipc-web lock fails the tag run in its first minute; a
+   stale `fuzz/Cargo.lock` fails only the nightly fuzz job, after the merge.
+4. The `## [x.y.z]` section of `CHANGELOG.md`. One section serves every release candidate of
+   that version, because their notes fall back to it.
+5. The migrations the release ships, with their SHA-256, in `SHIPPED` in
+   `crates/voipc-server/tests/migrations.rs`, from the first release candidate on: a relay that
+   ran a release candidate has applied them.
+6. One green PR run, with no advisory annotation in its cargo-deny job: advisories block only a
+   tag.
+7. Tag and push.
+
 **Pins and checks.** Every action is pinned by commit, and Dependabot moves the pins.
 Every job first checks the lockfiles against the manifests (`cargo fetch --locked`).
 The Windows FFmpeg is a pinned month-end build, checked against its SHA-256. The Gradle
@@ -364,7 +380,10 @@ distribution is checked against its checksum, and the wrapper jar is validated.
 
 **Reproducible builds.** The static server, the web tarball and the wasm build to the
 same bytes from the same commit, given the same paths: `SOURCE_DATE_EPOCH` is the
-commit time, and `nightly.yml` builds them twice and compares. The AppImage, the
+commit time, and `nightly.yml` builds them twice and compares. To rebuild a release's
+bytes, build from a git checkout of its tag (the bundle carries
+`git rev-parse --short HEAD`; outside a checkout, set `VOIPC_BUILD_HASH` to it), and
+leave `VITE_DEFAULT_SERVER` unset, not empty. The AppImage, the
 `.deb` and the installer can be rebuilt but are not bit-identical: they bundle the
 runner's system libraries of that day.
 
