@@ -32,7 +32,6 @@ jobs:
       attestations: write
     env:
       TAG: ${{ github.event.release.tag_name }}
-      PRERELEASE: ${{ github.event.release.prerelease }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
@@ -54,7 +53,9 @@ jobs:
           image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/voipc-server"
           v="${TAG#v}"
           tags="$image:$v"
-          if [ "$PRERELEASE" != true ]; then
+          # From the tag, not the release's pre-release box: v1.0.0-rc.1 went
+          # out with the box unticked and moved :1.0.0-rc, :1.0 and :latest.
+          if [[ "$v" != *-rc.* ]]; then
             minor="${v%.*}"
             tags="$tags,$image:$minor,$image:${minor%.*},$image:latest"
           fi
