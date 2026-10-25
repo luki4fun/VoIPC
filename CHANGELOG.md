@@ -2,7 +2,7 @@
 
 All notable changes to VoIPC are documented here.
 
-## [1.0.0] - release candidate
+## [1.0.0] - 2026-10-25
 
 Protocol version 12: a 0.12 app and a 1.0 relay do not talk to each other, so
 update both. A 0.12 app has no updater, so install 1.0 by hand once. From 1.0
@@ -14,7 +14,7 @@ The first stable release: post-quantum end-to-end encryption, changing and
 resetting your password, bans that outlast a restart, deleting your account
 and its kept copies, echo cancellation on the desktop and on Android, a desktop
 app that updates itself, and release files anyone can check against this
-repository. Release candidates (`1.0.0-rc.N`) come first, as pre-releases.
+repository.
 
 ### End-to-end encryption and protocol
 
