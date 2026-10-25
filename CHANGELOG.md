@@ -2,9 +2,21 @@
 
 All notable changes to VoIPC are documented here.
 
-## [Unreleased]
+## [1.0.0] - release candidate
 
-### Track A — end-to-end encryption and protocol
+Protocol version 12: a 0.12 app and a 1.0 relay do not talk to each other, so
+update both. A 0.12 app has no updater, so install 1.0 by hand once. From 1.0
+on, an app and a relay connect whenever they speak the same protocol version,
+whatever their version numbers; `docs/COMPATIBILITY.md` in the repository
+lists what every 1.x keeps.
+
+The first stable release: post-quantum end-to-end encryption, changing and
+resetting your password, bans that outlast a restart, deleting your account
+and its kept copies, echo cancellation on the desktop and on Android, a desktop
+app that updates itself, and release files anyone can check against this
+repository. Release candidates (`1.0.0-rc.N`) come first, as pre-releases.
+
+### End-to-end encryption and protocol
 
 - **Post-quantum sessions.** libsignal moves from v0.67.2 to v0.105.4. Every
   direct session now starts with PQXDH (X25519 plus Kyber1024) and runs the
@@ -26,95 +38,7 @@ All notable changes to VoIPC are documented here.
 - Accounts made with 0.12 keep working: a test opens a vault, a log key, a
   kept message and a safety number written by 0.12.0 with the new code
 
-### Track A — the 1.x rules: versions and data that is never overwritten
-
-- **Protocol match only.** A relay admits any app that speaks its protocol,
-  whatever the app's own version. A refusal now says which side has to
-  update, and the connect dialog shows it: in the browser with a reload (or the
-  other server's own page), in the app with the download address, and for an
-  older server with "tell its operator". A 0.12 app still gets a refusal it
-  can show
-- **The wire format is pinned.** A test records every message's layout per
-  protocol version and fails if it changes without a version bump. The bytes
-  that tell another version to update are fixed for ever
-- **`server.toml` refuses unknown keys**, so a typo stops the start instead of
-  quietly keeping a default. `web_port`, gone since 0.5.0, is still accepted.
-  Rewriting `channels.json` (when it hashes a password) keeps keys this
-  version does not know
-- **A chat history this version cannot open is never replaced.** A file saved
-  by a newer VoIPC, or a damaged one, used to look like "no history yet", and
-  the setup then offered to create a new one over it. Now the setup says what
-  it is and offers to keep it aside. The history format is version 5; the
-  first time 1.0 opens an older one it keeps a copy of it
-  (`chat_history.bin.v4`)
-- **Vault items name their format and count their saves.** A device that
-  cannot read an item — damaged, saved by a newer VoIPC, older than it saw
-  before, or missing after it saw one — leaves it alone and warns, instead of
-  saving an empty one over it. A server could otherwise wipe every pin of an
-  account this way
-- A name first met as an account that turns up as a guest is a warning, as a
-  changed key is. A pin that another device's copy changes is reported
-- A message or a history hand-off from a newer VoIPC shows as a placeholder
-  instead of raw JSON, and is never acted on
-- **The certificate pin file fails closed.** One that does not read is kept,
-  and self-signed servers are refused until "Forget pinned certificate"
-  starts the list over; the previous file is kept as `tofu_pins.json.bak` on
-  every save. When the QUIC and TCP attempts race, only the attempt that
-  carries the session is pinned
-- **Desktop files are private.** The data folder is made readable by its
-  user only, every file is written 0600, and there is no longer a fallback
-  into a shared temporary folder. A `settings.json` that does not read is kept
-  as `settings.json.unreadable-<time>`, unknown keys survive a save, a newer
-  format is not saved over, and settings that would not load again are not
-  written. The browser keeps unreadable settings the same way
-- Voice that cannot leave within about a second is dropped, oldest first,
-  instead of a backlog of up to 1 MiB bursting out after a stall
-
-### Track A — relay hardening
-
-- **Connections that never sign in can no longer lock people out.** Page
-  loads, handshakes and sign-ins in progress have a pool of their own: 16 per
-  address, 32 per IPv6 /48, 1024 in all. A signed-in session moves to the main
-  pool. Before, five addresses holding idle TLS connections filled every slot,
-  and nobody new could join. Page connections now close after 30 s
-- **Stalled sign-ins hold nothing.** A sign-in waiting for its client, or for
-  a person typing a code, no longer keeps one of the permits that pay for the
-  relay's own password and database work. Reconnects are spread out, so a
-  relay restart no longer brings every client back in the same second
-- **Kept messages cannot fill the database.** Account requests have their
-  own budget (10 a second), a writer starts at most 60 new keys per hour in a
-  conversation, the keys count against the quota, and each key handover is
-  one transaction. A reader's fetch gives every writer a fair share of the
-  newest keys, so one member can no longer push the others' out
-- **Tokens.** An admin or game token shorter than 16 characters stops the
-  start. Wrong tokens count against the address, across reconnects and on the
-  HTTP door as well (10, then one per 90 s). A guest on a relay with accounts
-  gets the same answer for a right and a wrong admin token
-- A password set at runtime on a channel from `channels.json` now lets in
-  whoever types it (it locked everybody out)
-- Numbers in `server.toml` that would leave the relay running but broken
-  (`quota_mb = 0`, `retention_days = 0`, `max_users = 0`) stop the start, and
-  so does a `channels.json` too big for one channel list. A sign-up whose vault
-  could not be stored fails instead of making an account that cannot be opened
-  elsewhere
-- The relay stops cleanly on SIGTERM too (`docker stop`, systemd), telling its
-  clients first
-- `voipc-server health` (for container health checks) and
-  `voipc-server cert fingerprint`. The start log prints the certificate's
-  fingerprint, and the app shows the fingerprint it pinned when it first meets
-  a self-signed server, to compare
-- **The relay's log keeps less.** Connection addresses and user names are only
-  logged at `debug`; refusals a stranger can repeat no longer write a warning
-  each. Admin bans keep their address in the log
-- A remembered device alone can no longer replace an account's identity key;
-  that needs the password. A panic in a connection's task cleans its session up
-  instead of leaving a ghost until restart. Two sign-ins of one account that
-  finish together no longer both stay connected. The server re-checks that it
-  has room after a long sign-in. Database backups and `channels.json` copies are
-  private from the moment they are made. The web page's CSP adds `base-uri` and
-  `form-action`
-
-### Track A — passwords
+### Passwords
 
 - **Change your password** under *Your account → Password: Change*. It needs
   the current one, and a code when two-factor codes are on. The vault's
@@ -139,7 +63,7 @@ All notable changes to VoIPC are documented here.
 - Account prompts for one server no longer replace another server's sign-in
   waiting for its code, and each names the server it is for
 
-### Track A — bans
+### Bans
 
 - **Bans outlast a restart.** With accounts they are kept in the database,
   which holds a keyed hash of a banned address, never the address; without
@@ -162,7 +86,7 @@ All notable changes to VoIPC are documented here.
   channel to the new hash. The check runs outside the channel lock, two at a
   time
 
-### Track A — deleting, and leaving
+### Deleting, and leaving
 
 - **Leaving a text channel ends its stored log for you.** The relay takes you
   out of it (a modified app cannot stay a reader), and every writer's next
@@ -188,20 +112,100 @@ All notable changes to VoIPC are documented here.
 - The accounts database (SQLite) overwrites deleted rows where that costs no
   extra I/O (`secure_delete`), with l4f-accounts v0.10.0
 
-### Track A — what 1.0 claims
+### Sound and picture
 
-- README and docs/ACCOUNTS.md now say what the code holds: PQXDH and SPQR
-  instead of X3DH; pre-keys refilled; the sender inside the media AAD; a
-  sender stopping (not rotating) after 2³²−1000 packets; no media key on the
-  server; the vault guessable offline at 600,000 PBKDF2 rounds a guess, which
-  is what a long, unique password protects; most secrets, not all, wiped from
-  memory; the first contact with a self-signed server trusted blindly unless
-  the fingerprint is compared; what the relay logs at which level
-- **docs/THREAT-MODEL.md**: what a relay, a channel member, someone with the
-  disk and a hostile page can and cannot do, and the code and tests that hold
-  each part
+- **Echo cancellation on the desktop.** The microphone now runs through WebRTC's
+  echo canceller (AEC3, in the pure-Rust `sonora` port) with automatic gain
+  control, fed with exactly what the app plays. On loudspeakers the others no
+  longer hear themselves: 47 dB of echo removed in the test scene, for 0.6 % of
+  one core. Android uses the phone's own canceller
+- **No more clipping in the mix.** A limiter replaces the hard clamp on the
+  output, in the app and in the browser: two loud talkers, or one at 200 %,
+  no longer buzz. The microphone's gain no longer clips before noise
+  suppression
+- Voice activation also asks RNNoise whether a frame is speech, so typing and
+  fans stop opening the microphone
+- Dropping a frame to catch up a late stream fades over 2.5 ms instead of
+  cutting, which clicked
+- Devices that do not run at 48 kHz (common on Windows) are resampled with a
+  windowed-sinc filter: a 10 kHz tone went from −20 dB to −119 dB of
+  distortion
+- **Shared screens show their true colours.** Black was grey (16) and white
+  dimmed (236) on every desktop viewer, and browsers shifted greens and reds of
+  shares from the app. Streams now say which colours they carry, and viewers
+  honour it. Only the frame that is shown is converted
+- A viewer whose decoder falls behind the stream still shows pictures: it
+  draws at least every 8 frames instead of decoding the whole queue first
+- The desktop viewer's picture is sharper on text (JPEG quality 90 instead of
+  70: +6 dB). Screens shared at a smaller size are scaled with a bicubic filter
+  (+12 dB on text)
+- NVIDIA encoders no longer pad a still screen to the full rate: a still
+  1080p screen at 5 Mbit/s now costs 1.4 Mbit/s, with no filler sent to every
+  viewer
+- The software encoder changes its rate without sending a keyframe into a
+  link that just lost packets, and is a little sharper at the lowest quality
+  (preset `superfast`). The browser sharer no longer sends a keyframe on a
+  quality change, and asks for detail over motion
+- Updated nnnoiseless (0.5) and ringbuf (0.5), which clears two advisories;
+  an unaligned screen-audio buffer is no longer read through a cast
 
-### Track B — the game SDK and the desktop app
+### Browser voice
+
+- **A lost packet no longer plays as silence in the browser.** The browser now
+  decodes voice inside its audio thread with a pure-Rust Opus decoder
+  (rusty-opus, as WebAssembly), packet by packet as they play: a lost frame is
+  rebuilt from the next packet's in-band FEC, or concealed, as the app does,
+  and a packet that arrives out of order no longer reaches the decoder out of
+  order. WebCodecs stays as the fallback. The decoder was fuzzed before it
+  shipped (`fuzz/`, target `opus_decode`)
+
+### Desktop updates
+
+- **The Windows installer and the Linux AppImage update themselves.** VoIPC
+  looks for a new release a little after it starts and once a day, says so
+  when there is one, and installs it from Settings, Updates, with one click
+  that restarts the app. Never during a call: the button waits until you
+  leave voice
+- An update is installed only if it is signed with the VoIPC release key
+  built into the app, for exactly the version the release says it is, and is
+  newer than the running one. The app's page cannot point the updater
+  anywhere else; only the app itself talks to it
+- A server that refuses this app for an older version makes it look for an
+  update at once, and the connect dialog offers "Update VoIPC" when the update
+  speaks that server's version
+- "Check for updates" in Settings, on by default: each check asks GitHub for
+  the newest release, so GitHub sees your address and this version. Release
+  candidates follow the release candidates, then the final release
+- The .deb (updated by its package manager), an AppImage in a folder you
+  cannot write to, Android and the browser keep the download page
+
+### Android
+
+- **The microphone keeps working with the screen locked.** The voice service
+  now runs as a microphone service, which Android 11 and later require; before,
+  a locked phone sent silence without any error
+- **No more echo from the loudspeaker.** The microphone uses Android's voice
+  call processing (echo canceller included), and the call stays in
+  communication mode with the speaker chosen as its device. Before, the app
+  never got that mode at all (a missing permission), and the raw microphone
+  sent the other speakers' voices back to them. The input gain slider now works
+  on Android
+- The microphone is asked for when you first join voice, not at every start, so
+  a refusal is shown where it matters
+- Capture and playback reopen by themselves when Android moves the audio route
+  (the call mode, a headset); before, both stayed silent
+- The app's data is no longer included in Android backups or device
+  transfers: the chat archive holds this device's account secrets
+- The voice service is not restarted on its own after the app was killed, and
+  it holds one wake lock rather than one per channel switch
+- The app's bridge to Android is installed before the page loads, not by a
+  timer that a slow start could beat
+- Shared screens are decoded for display with libjpeg-turbo straight from
+  YUV, as on the desktop, and the decoder is asked for low latency: a 1080p
+  share from a browser draws at about 14 frames a second on a Galaxy A12. The
+  unused file provider is gone
+
+### The game SDK and the desktop app
 
 - **Only real game runtimes may drive the game SDK.** `https://cfx-nui-` must
   be followed by a resource name and nothing else. Before, any internet page on
@@ -251,80 +255,7 @@ All notable changes to VoIPC are documented here.
   Before, it became part of the host name and failed as a DNS error. A bare
   IPv6 address without brackets is refused instead of being split at a guess
 
-### Track B — Android
-
-- **The microphone keeps working with the screen locked.** The voice service
-  now runs as a microphone service, which Android 11 and later require; before,
-  a locked phone sent silence without any error
-- **No more echo from the loudspeaker.** The microphone uses Android's voice
-  call processing (echo canceller included), and the call stays in
-  communication mode with the speaker chosen as its device. Before, the app
-  never got that mode at all (a missing permission), and the raw microphone
-  sent the other speakers' voices back to them. The input gain slider now works
-  on Android
-- The microphone is asked for when you first join voice, not at every start, so
-  a refusal is shown where it matters
-- Capture and playback reopen by themselves when Android moves the audio route
-  (the call mode, a headset); before, both stayed silent
-- The app's data is no longer included in Android backups or device
-  transfers: the chat archive holds this device's account secrets
-- The voice service is not restarted on its own after the app was killed, and
-  it holds one wake lock rather than one per channel switch
-- The app's bridge to Android is installed before the page loads, not by a
-  timer that a slow start could beat
-- Shared screens are decoded for display with libjpeg-turbo straight from
-  YUV, as on the desktop, and the decoder is asked for low latency: a 1080p
-  share from a browser draws at about 14 frames a second on a Galaxy A12. The
-  unused file provider is gone
-
-### Track B — sound and picture
-
-- **Echo cancellation on the desktop.** The microphone now runs through WebRTC's
-  echo canceller (AEC3, in the pure-Rust `sonora` port) with automatic gain
-  control, fed with exactly what the app plays. On loudspeakers the others no
-  longer hear themselves: 47 dB of echo removed in the test scene, for 0.6 % of
-  one core. Android uses the phone's own canceller
-- **No more clipping in the mix.** A limiter replaces the hard clamp on the
-  output, in the app and in the browser: two loud talkers, or one at 200 %,
-  no longer buzz. The microphone's gain no longer clips before noise
-  suppression
-- Voice activation also asks RNNoise whether a frame is speech, so typing and
-  fans stop opening the microphone
-- Dropping a frame to catch up a late stream fades over 2.5 ms instead of
-  cutting, which clicked
-- Devices that do not run at 48 kHz (common on Windows) are resampled with a
-  windowed-sinc filter: a 10 kHz tone went from −20 dB to −119 dB of
-  distortion
-- **Shared screens show their true colours.** Black was grey (16) and white
-  dimmed (236) on every desktop viewer, and browsers shifted greens and reds of
-  shares from the app. Streams now say which colours they carry, and viewers
-  honour it. Only the frame that is shown is converted
-- A viewer whose decoder falls behind the stream still shows pictures: it
-  draws at least every 8 frames instead of decoding the whole queue first
-- The desktop viewer's picture is sharper on text (JPEG quality 90 instead of
-  70: +6 dB). Screens shared at a smaller size are scaled with a bicubic filter
-  (+12 dB on text)
-- NVIDIA encoders no longer pad a still screen to the full rate: a still
-  1080p screen at 5 Mbit/s now costs 1.4 Mbit/s, with no filler sent to every
-  viewer
-- The software encoder changes its rate without sending a keyframe into a
-  link that just lost packets, and is a little sharper at the lowest quality
-  (preset `superfast`). The browser sharer no longer sends a keyframe on a
-  quality change, and asks for detail over motion
-- Updated nnnoiseless (0.5) and ringbuf (0.5), which clears two advisories;
-  an unaligned screen-audio buffer is no longer read through a cast
-
-### Track B — browser voice
-
-- **A lost packet no longer plays as silence in the browser.** The browser now
-  decodes voice inside its audio thread with a pure-Rust Opus decoder
-  (rusty-opus, as WebAssembly), packet by packet as they play: a lost frame is
-  rebuilt from the next packet's in-band FEC, or concealed, as the app does,
-  and a packet that arrives out of order no longer reaches the decoder out of
-  order. WebCodecs stays as the fallback. The decoder was fuzzed before it
-  shipped (`fuzz/`, target `opus_decode`)
-
-### Track B — front end
+### The interface
 
 - **Usable from the keyboard and with a screen reader.** Every dialog is now a
   real modal: it is announced by its title, focus moves into it, Tab stays
@@ -353,27 +284,108 @@ All notable changes to VoIPC are documented here.
   old comments silenced only their first code, and the warnings they hid are
   fixed now instead of ignored
 
-### Track B — desktop updates
+### Relay hardening
 
-- **The Windows installer and the Linux AppImage update themselves.** VoIPC
-  looks for a new release a little after it starts and once a day, says so
-  when there is one, and installs it from Settings, Updates, with one click
-  that restarts the app. Never during a call: the button waits until you
-  leave voice
-- An update is installed only if it is signed with the VoIPC release key
-  built into the app, for exactly the version the release says it is, and is
-  newer than the running one. The app's page cannot point the updater
-  anywhere else; only the app itself talks to it
-- A server that refuses this app for an older version makes it look for an
-  update at once, and the connect dialog offers "Update VoIPC" when the update
-  speaks that server's version
-- "Check for updates" in Settings, on by default: each check asks GitHub for
-  the newest release, so GitHub sees your address and this version. Release
-  candidates follow the release candidates, then the final release
-- The .deb (updated by its package manager), an AppImage in a folder you
-  cannot write to, Android and the browser keep the download page
+- **Connections that never sign in can no longer lock people out.** Page
+  loads, handshakes and sign-ins in progress have a pool of their own: 16 per
+  address, 32 per IPv6 /48, 1024 in all. A signed-in session moves to the main
+  pool. Before, five addresses holding idle TLS connections filled every slot,
+  and nobody new could join. Page connections now close after 30 s
+- **Stalled sign-ins hold nothing.** A sign-in waiting for its client, or for
+  a person typing a code, no longer keeps one of the permits that pay for the
+  relay's own password and database work. Reconnects are spread out, so a
+  relay restart no longer brings every client back in the same second
+- **Kept messages cannot fill the database.** Account requests have their
+  own budget (10 a second), a writer starts at most 60 new keys per hour in a
+  conversation, the keys count against the quota, and each key handover is
+  one transaction. A reader's fetch gives every writer a fair share of the
+  newest keys, so one member can no longer push the others' out
+- **Tokens.** An admin or game token shorter than 16 characters stops the
+  start. Wrong tokens count against the address, across reconnects and on the
+  HTTP door as well (10, then one per 90 s). A guest on a relay with accounts
+  gets the same answer for a right and a wrong admin token
+- A password set at runtime on a channel from `channels.json` now lets in
+  whoever types it (it locked everybody out)
+- Numbers in `server.toml` that would leave the relay running but broken
+  (`quota_mb = 0`, `retention_days = 0`, `max_users = 0`) stop the start, and
+  so does a `channels.json` too big for one channel list. A sign-up whose vault
+  could not be stored fails instead of making an account that cannot be opened
+  elsewhere
+- The relay stops cleanly on SIGTERM too (`docker stop`, systemd), telling its
+  clients first
+- `voipc-server health` (for container health checks) and
+  `voipc-server cert fingerprint`. The start log prints the certificate's
+  fingerprint, and the app shows the fingerprint it pinned when it first meets
+  a self-signed server, to compare
+- **The relay's log keeps less.** Connection addresses and user names are only
+  logged at `debug`; refusals a stranger can repeat no longer write a warning
+  each. Admin bans keep their address in the log
+- A remembered device alone can no longer replace an account's identity key;
+  that needs the password. A panic in a connection's task cleans its session up
+  instead of leaving a ghost until restart. Two sign-ins of one account that
+  finish together no longer both stay connected. The server re-checks that it
+  has room after a long sign-in. Database backups and `channels.json` copies are
+  private from the moment they are made. The web page's CSP adds `base-uri` and
+  `form-action`
 
-### Track C — releases you can check
+### The 1.x rules: versions and data that is never overwritten
+
+- **Protocol match only.** A relay admits any app that speaks its protocol,
+  whatever the app's own version. A refusal now says which side has to
+  update, and the connect dialog shows it: in the browser with a reload (or the
+  other server's own page), in the app with the download address, and for an
+  older server with "tell its operator". A 0.12 app still gets a refusal it
+  can show
+- **The wire format is pinned.** A test records every message's layout per
+  protocol version and fails if it changes without a version bump. The bytes
+  that tell another version to update are fixed for ever
+- **`server.toml` refuses unknown keys**, so a typo stops the start instead of
+  quietly keeping a default. `web_port`, gone since 0.5.0, is still accepted.
+  Rewriting `channels.json` (when it hashes a password) keeps keys this
+  version does not know
+- **A chat history this version cannot open is never replaced.** A file saved
+  by a newer VoIPC, or a damaged one, used to look like "no history yet", and
+  the setup then offered to create a new one over it. Now the setup says what
+  it is and offers to keep it aside. The history format is version 5; the
+  first time 1.0 opens an older one it keeps a copy of it
+  (`chat_history.bin.v4`)
+- **Vault items name their format and count their saves.** A device that
+  cannot read an item — damaged, saved by a newer VoIPC, older than it saw
+  before, or missing after it saw one — leaves it alone and warns, instead of
+  saving an empty one over it. A server could otherwise wipe every pin of an
+  account this way
+- A name first met as an account that turns up as a guest is a warning, as a
+  changed key is. A pin that another device's copy changes is reported
+- A message or a history hand-off from a newer VoIPC shows as a placeholder
+  instead of raw JSON, and is never acted on
+- **The certificate pin file fails closed.** One that does not read is kept,
+  and self-signed servers are refused until "Forget pinned certificate"
+  starts the list over; the previous file is kept as `tofu_pins.json.bak` on
+  every save. When the QUIC and TCP attempts race, only the attempt that
+  carries the session is pinned
+- **Desktop files are private.** The data folder is made readable by its
+  user only, every file is written 0600, and there is no longer a fallback
+  into a shared temporary folder. A `settings.json` that does not read is kept
+  as `settings.json.unreadable-<time>`, unknown keys survive a save, a newer
+  format is not saved over, and settings that would not load again are not
+  written. The browser keeps unreadable settings the same way
+- Voice that cannot leave within about a second is dropped, oldest first,
+  instead of a backlog of up to 1 MiB bursting out after a stall
+
+### What 1.0 claims
+
+- README and docs/ACCOUNTS.md now say what the code holds: PQXDH and SPQR
+  instead of X3DH; pre-keys refilled; the sender inside the media AAD; a
+  sender stopping (not rotating) after 2³²−1000 packets; no media key on the
+  server; the vault guessable offline at 600,000 PBKDF2 rounds a guess, which
+  is what a long, unique password protects; most secrets, not all, wiped from
+  memory; the first contact with a self-signed server trusted blindly unless
+  the fingerprint is compared; what the relay logs at which level
+- **docs/THREAT-MODEL.md**: what a relay, a channel member, someone with the
+  disk and a hostile page can and cannot do, and the code and tests that hold
+  each part
+
+### Releases you can check
 
 - **Every release file can be checked.** A release carries `SHA256SUMS` and a
   GitHub build attestation for every file, so `gh attestation verify` proves it
@@ -407,7 +419,7 @@ All notable changes to VoIPC are documented here.
 - `npm run release` builds the web bundle and the server on this machine;
   the Docker build it used to run was broken and is gone
 
-### Track C — fuzzing and upgrade tests
+### Fuzzing and upgrade tests
 
 - **Fuzzing.** Every parser that takes bytes from the relay, another member,
   a game mod or the network is fuzzed nightly, 13 targets in all:
@@ -427,7 +439,7 @@ All notable changes to VoIPC are documented here.
 
   A shipped database migration can no longer be edited by mistake
 
-### Track C — documents
+### Documents
 
 - `docs/COMPATIBILITY.md`: what every 1.x release keeps working (wire
   protocol, game SDK, server configuration, stored data, security claims,
@@ -441,7 +453,7 @@ All notable changes to VoIPC are documented here.
     rollback;
   - logs and the container image.
 
-### Track C — the quality bar
+### The quality bar
 
 - **One Rust for everyone.** `rust-toolchain.toml` pins 1.99.1, with clippy
   and rustfmt; rustup installs it on the first build.
