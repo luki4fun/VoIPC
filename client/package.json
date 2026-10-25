@@ -23,6 +23,6 @@
     "svelte": "^5",
     "typescript": "^5",
     "vite": "^6",
-    "wasm-pack": "^0.13"
+    "wasm-pack": "^0.15"
   }
 }
