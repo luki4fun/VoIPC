@@ -153,10 +153,12 @@ test("the stream view's chat: off in modern, below in classic, until chosen", ()
   assert.equal(p.stream_chat.classic.open, true);
   assert.equal(p.stream_chat.classic.split, "below");
   assert.equal(p.share_preview, true);
+  assert.equal(p.group_threads, true, "busy replies gather into threads unless turned off");
 
   const saved = defaultUiPrefs();
   saved.stream_chat.modern = { open: true, split: "below", width: 500, height: 300 };
   saved.share_preview = false;
+  saved.group_threads = false;
   assert.deepEqual(sanitizeUiPrefs(structuredClone(saved)), saved);
 });
 
@@ -167,6 +169,7 @@ test("a stream chat size is clamped and a bad split falls back", () => {
       classic: "nonsense",
     },
     share_preview: "maybe",
+    group_threads: "maybe",
   });
   assert.equal(p.stream_chat.modern.open, false);
   assert.equal(p.stream_chat.modern.split, "side");
@@ -174,6 +177,7 @@ test("a stream chat size is clamped and a bad split falls back", () => {
   assert.equal(p.stream_chat.modern.height, STREAM_CHAT_HEIGHT_MIN);
   assert.deepEqual(p.stream_chat.classic, defaultStreamChat("classic"));
   assert.equal(p.share_preview, true);
+  assert.equal(p.group_threads, true);
 });
 
 test("a stored palette from before the flag existed stands as chosen", () => {

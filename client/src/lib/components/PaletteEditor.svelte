@@ -38,6 +38,11 @@
     "--text-muted": "Dimmed text",
     "--scrim": "Behind dialogs",
     "--focus-ring": "Keyboard focus",
+    "--code-keyword": "Code: keywords",
+    "--code-string": "Code: strings",
+    "--code-comment": "Code: comments",
+    "--code-number": "Code: numbers",
+    "--code-fn": "Code: names",
   };
 
   // A shadow is a CSS shadow, not a colour: `<input type="color">` cannot edit

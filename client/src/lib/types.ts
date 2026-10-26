@@ -158,6 +158,15 @@ export interface ChatMessage {
    * only ever bring its deadline forward — see `expiryFor` in chat-rules.ts.
    */
   expires_at?: number;
+  /**
+   * The message this one answers, by the `id` its sender minted, and the
+   * thread it belongs to (the id of the thread's first message). Both travel
+   * inside the end-to-end envelope; only the id, never a quote, so an answer
+   * never keeps the text it answers alive past that text's own timer. The
+   * message itself is looked up in the same conversation when shown.
+   */
+  reply_to?: string;
+  thread?: string;
 }
 
 /** A relay with accounts, as `Authenticated.accounts` describes it (protocol v11). */

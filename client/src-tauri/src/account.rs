@@ -411,6 +411,8 @@ pub async fn account_prefs(state: State<'_, AppState>, server: String) -> Result
 /// A direct message for an account that is away (`account`, hex): kept in the
 /// stored log only, which is the one way it reaches them. Returns its id, for
 /// the front end's own copy.
+// A command's arguments are the fields of its call from the front end
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn send_kept_dm(
     state: State<'_, AppState>,
@@ -419,11 +421,17 @@ pub async fn send_kept_dm(
     account: String,
     content: String,
     ttl_secs: Option<u32>,
+    reply_to: Option<String>,
+    thread: Option<String>,
 ) -> Result<String, String> {
     let connections = state.connections.read().await;
     let (connection, link) = signed_in(&connections, &server)?;
     let id = crate::crypto::new_message_id();
-    let payload = crate::crypto::envelope(&id, &content, ttl_secs);
+    let extras = crate::crypto::Extras {
+        reply: reply_to,
+        thread,
+    };
+    let payload = crate::crypto::envelope_with(&id, &content, ttl_secs, &extras);
     let a = link
         .session()
         .kept_dm(&account, payload, crate::crypto::now_ms(), ttl_secs)?;

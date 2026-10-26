@@ -59,6 +59,37 @@ fn a_0_12_chat_history_opens_and_keeps_everything_through_a_save() {
     );
 }
 
+/// 1.0 and 1.1 wrote archive v5; 1.2 reads it and saves v6, nothing lost
+#[test]
+fn a_1_1_chat_history_opens_and_keeps_everything_through_a_save() {
+    use crate::crypto::{decrypt_archive, encrypt_archive, file_kind, FileKind, ARCHIVE_VERSION};
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/1.1.0");
+    assert!(matches!(
+        file_kind(&path.join("chat_history.bin")),
+        FileKind::Ours(5)
+    ));
+    let want: Value =
+        serde_json::from_str(&std::fs::read_to_string(path.join("expected.json")).unwrap())
+            .unwrap();
+    let (archive, salt, key, version) = decrypt_archive(
+        &std::fs::read(path.join("chat_history.bin")).unwrap(),
+        PASSWORD,
+    )
+    .unwrap();
+    assert_eq!(version, 5);
+    assert!(
+        keeps(&json(&archive), &want),
+        "the 1.1 history lost something on opening"
+    );
+    let saved = encrypt_archive(&archive, &key, &salt).unwrap();
+    assert_eq!(saved[4], ARCHIVE_VERSION);
+    let (again, ..) = decrypt_archive(&saved, PASSWORD).unwrap();
+    assert!(
+        keeps(&json(&again), &want),
+        "the 1.1 history lost something on saving"
+    );
+}
+
 #[test]
 fn a_0_12_settings_file_loads_and_saves_every_key_back() {
     let text = std::fs::read_to_string(fixture("settings.json")).unwrap();

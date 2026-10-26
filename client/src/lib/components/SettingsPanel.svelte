@@ -99,6 +99,7 @@
       p.palette_overrides = {};
       p.density = d.density;
       p.chat_font_size = d.chat_font_size;
+      p.group_threads = d.group_threads;
       p.zoom = d.zoom;
       p.panels = d.panels;
     });
@@ -1178,6 +1179,21 @@
           <span class="toggle-label">Compact message list</span>
           <span class="toggle-hint">
             Takes the air out from between messages. The grouping is the same either way.
+          </span>
+        </label>
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={$uiPrefs.group_threads}
+            onchange={(e) =>
+              updateUiPrefs((p) => {
+                p.group_threads = (e.target as HTMLInputElement).checked;
+              })}
+          />
+          <span class="toggle-label">Group busy replies into threads</span>
+          <span class="toggle-hint">
+            When a message draws three replies from two people or more, they move under it into a thread.
+            Replies sent into a thread go there either way.
           </span>
         </label>
         <label class="slider-row">

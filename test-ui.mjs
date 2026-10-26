@@ -1781,6 +1781,213 @@ check(
   await useLayout(host, "classic");
 }
 
+// 19. Chat: markdown, replies and threads (1.2). The rules — what markdown may
+//     draw, what an answer finds, which answers fold into a thread — are unit-
+//     tested (markdown.test.ts, thread-rules.test.ts). What only a browser can
+//     show is that a peer's message arrives drawn, that the tools are reached
+//     with a real pointer, and that a quote leads somewhere. It runs here, before
+//     the lanes that leave other servers and accounts in the shared profile, where
+//     a fresh tab no longer opens on the connect dialog.
+{
+  const n = (process.pid + 7) % 10000;
+  const ROOM = `talk-${n}`;
+  const ann = await connect(`ui-ann-${n}`);
+  const ben = await connect(`ui-ben-${n}`);
+  await ann.evaluate(click('button[title="Create channel"]'));
+  await waitFor(ann, `document.querySelector(".create-form")`);
+  await ann.evaluate(setInput(".create-form input[type=text]", ROOM));
+  await ann.evaluate(click(".create-form .create-btn"));
+  await sleep(2000);
+  await ben.evaluate(
+    `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(ROOM)});
+       if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
+  );
+  await waitFor(ben, `document.querySelector(".input-bar .chat-input")`).catch(() => {});
+  await sleep(1500);
+
+  const say = (tab, text, where = ".chat-main") =>
+    tab.evaluate(`(() => { const input = document.querySelector(${JSON.stringify(`${where} .input-bar .chat-input`)}); if (!input) return false;
+      input.value = ${JSON.stringify(text)}; input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.closest("form").requestSubmit(); return true; })()`);
+  /** The main flow's row holding `text`. */
+  const rowWith = (text, where = ".chat-main") =>
+    `[...document.querySelectorAll(${JSON.stringify(`${where} .msg`)})].find((e) => e.querySelector(".msg-content")?.textContent.includes(${JSON.stringify(text)}))`;
+  const arrived = (tab, text, where) => waitFor(tab, rowWith(text, where), 10_000).then(() => true, () => false);
+  /** A real pointer: onto the row (its tools show on hover), then onto `button` inside it. */
+  const useTool = async (tab, text, label, where) => {
+    const at = (sel) => tab.evaluate(`(() => { const row = ${rowWith(text, where)}; const el = ${sel}; if (!el) return null;
+      el.scrollIntoView({ block: "center" }); const r = el.getBoundingClientRect(); if (r.width === 0) return null;
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })()`);
+    const move = (p) => tab.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y, buttons: 0 });
+    const rowAt = await at("row");
+    if (!rowAt) return false;
+    await move(rowAt);
+    await sleep(150);
+    const btn = await at(`row?.querySelector('.msg-tools button[aria-label=${JSON.stringify(label)}]')`);
+    if (!btn) return false;
+    await move(btn);
+    for (const type of ["mousePressed", "mouseReleased"]) {
+      await tab.send("Input.dispatchMouseEvent", { type, x: btn.x, y: btn.y, button: "left", clickCount: 1, buttons: 1 });
+    }
+    await sleep(300);
+    return true;
+  };
+
+  // ── Markdown arrives drawn, and HTML arrives as text ──
+  await say(ann, "**bold** move and <b>raw</b>");
+  await say(ann, "```rust\nfn main() { let x = 1; }\n```");
+  check("a peer's markdown arrives drawn", (await arrived(ben, "bold move")) &&
+    (await ben.evaluate(`${rowWith("bold move")}?.querySelector(".msg-content strong")?.textContent === "bold"`)));
+  check("their HTML arrives as the text it is", await ben.evaluate(
+    `${rowWith("bold move")}?.querySelector(".msg-content").textContent.includes("<b>raw</b>") && !${rowWith("bold move")}?.querySelector(".msg-content b")`));
+  let coloured = false;
+  try {
+    await waitFor(ben, `${rowWith("fn main")}?.querySelector(".code-block pre code .tok-keyword")`, 10_000);
+    coloured = true;
+  } catch {
+    // reported below
+  }
+  check("a fenced rust block is coloured", coloured, await ben.evaluate(`${rowWith("fn main")}?.innerHTML.slice(0, 300) ?? "no row"`));
+
+  // ── Shift+Enter is a new line, not a send ──
+  await ben.evaluate(`document.querySelector(".chat-main .input-bar .chat-input").focus()`);
+  await ben.send("Input.insertText", { text: "line one" });
+  // A key event carries its text, or the browser types nothing: "\r" is what Enter types
+  await ben.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, modifiers: 8, text: "\r" });
+  await ben.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, modifiers: 8 });
+  await ben.send("Input.insertText", { text: "line two" });
+  check("Shift+Enter keeps a new line in the box", await ben.evaluate(
+    `document.querySelector(".chat-main .input-bar .chat-input").value === "line one\\nline two"`));
+  await ben.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  await ben.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  check("and Enter sends both lines as one message", await arrived(ann, "line two") &&
+    (await ann.evaluate(`${rowWith("line two")}?.querySelector(".msg-content br") !== null`)));
+
+  // ── A reply, from the row's own tool ──
+  check("a message's Reply tool is reached with a real pointer", await useTool(ben, "bold move", "Reply"));
+  check("the box says what is being answered", await ben.evaluate(`/ui-ann/.test(document.querySelector(".chat-main .reply-bar")?.textContent ?? "")`));
+  await say(ben, "agreed on that");
+  check("the reply bar goes once it is sent", !(await ben.evaluate(`!!document.querySelector(".chat-main .reply-bar")`)));
+  check("the reply arrives quoting what it answers", (await arrived(ann, "agreed on that")) &&
+    (await ann.evaluate(`/bold move/.test(${rowWith("agreed on that")}?.querySelector(".quote-text")?.textContent ?? "")`)));
+  await ann.evaluate(`${rowWith("agreed on that")}?.querySelector("button.quote")?.click()`);
+  check("its quote leads to the message answered", await ann.evaluate(`${rowWith("bold move")}?.classList.contains("flash") ?? false`));
+
+  // ── Busy answers gather into a thread ──
+  await useTool(ann, "bold move", "Reply");
+  await say(ann, "second answer here");
+  await arrived(ben, "second answer here");
+  await useTool(ben, "second answer here", "Reply");
+  await say(ben, "third answer here");
+  let gathered = false;
+  try {
+    await waitFor(ann, `${rowWith("bold move")}?.querySelector(".thread-summary")?.textContent.includes("3 replies")`, 10_000);
+    gathered = true;
+  } catch {
+    // reported below
+  }
+  check("three answers from two people become a thread", gathered,
+    await ann.evaluate(`[...document.querySelectorAll(".chat-main .msg .msg-content")].map((e) => e.textContent).join(" | ").slice(0, 300)`));
+  check("and leave the main flow", !(await ann.evaluate(`!!${rowWith("third answer here")}`)));
+  await ann.evaluate(`${rowWith("bold move")}?.querySelector(".thread-summary")?.click()`);
+  check("the summary opens the thread", await ann.evaluate(
+    `[...document.querySelectorAll(".thread-pane .msg .msg-content")].some((e) => e.textContent.includes("third answer here"))`));
+  await ann.evaluate(`document.querySelector(".thread-pane .thread-close")?.click()`);
+  await sleep(300);
+
+  // ── An answer sent into a thread ──
+  await say(ann, "start a thread on me");
+  await arrived(ben, "start a thread on me");
+  await useTool(ben, "start a thread on me", "Reply in thread");
+  check("Reply in thread opens the thread", await ben.evaluate(`!!document.querySelector(".thread-pane")`));
+  await say(ben, "inside the thread", ".thread-pane");
+  let threaded = false;
+  try {
+    await waitFor(ann, `${rowWith("start a thread on me")}?.querySelector(".thread-summary")?.textContent.includes("1 reply")`, 10_000);
+    threaded = true;
+  } catch {
+    // reported below
+  }
+  check("an answer sent into a thread arrives in it", threaded);
+  check("and never in the main flow", !(await ann.evaluate(`!!${rowWith("inside the thread")}`)));
+
+  // ── The row's menu: a right click (a long press, on a touch screen) ──
+  const lineAt = await ann.evaluate(`(() => { const r = ${rowWith("line two")}?.getBoundingClientRect();
+    return r ? { x: Math.round(r.left + 40), y: Math.round(r.top + 10) } : null; })()`);
+  if (lineAt) {
+    for (const type of ["mousePressed", "mouseReleased"]) {
+      await ann.send("Input.dispatchMouseEvent", { type, x: lineAt.x, y: lineAt.y, button: "right", clickCount: 1, buttons: 2 });
+    }
+  }
+  await sleep(300);
+  check("a right click on a message opens its menu", await ann.evaluate(
+    `[...document.querySelectorAll(".msg-menu [role=menuitem]")].map((b) => b.textContent.trim()).join(",") === "Reply,Reply in thread,Copy text"`),
+    await ann.evaluate(`document.querySelector(".msg-menu")?.textContent ?? "no menu"`));
+  check("where the pointer is", !!lineAt && (await ann.evaluate(`(() => { const r = document.querySelector(".msg-menu")?.getBoundingClientRect();
+    return !!r && Math.abs(r.left - ${lineAt?.x ?? 0}) < 4 && Math.abs(r.top - ${lineAt?.y ?? 0}) < 4; })()`)),
+    await ann.evaluate(`JSON.stringify(document.querySelector(".msg-menu")?.getBoundingClientRect())`) + ` vs ${JSON.stringify(lineAt)}`);
+  await ann.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await ann.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await sleep(200);
+  check("and Escape closes it", !(await ann.evaluate(`!!document.querySelector(".msg-menu")`)));
+
+  // ── @ completes a name, and the person named sees it ──
+  await ben.evaluate(`document.querySelector(".chat-main .input-bar .chat-input").focus()`);
+  await ben.send("Input.insertText", { text: "@ui-a" });
+  await sleep(200);
+  check("@ offers the names that start so", await ben.evaluate(
+    `[...document.querySelectorAll(".chat-main .mention-option")].some((e) => e.textContent.includes("ui-ann-${n}"))`));
+  await ben.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  await ben.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  check("Enter takes the name instead of sending", await ben.evaluate(
+    `document.querySelector(".chat-main .input-bar .chat-input").value === "@ui-ann-${n} "`));
+  await ben.send("Input.insertText", { text: "look here" });
+  await ben.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  await ben.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  check("the person named sees their name marked", (await arrived(ann, "look here")) &&
+    (await ann.evaluate(`!!${rowWith("look here")}?.querySelector(".mention.me") && ${rowWith("look here")}.classList.contains("to-me")`)));
+
+  // ── "New" marks where the unread part begins ──
+  const openChannel = (tab, name) => tab.evaluate(
+    `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(name)});
+       if (!el) return false; el.dispatchEvent(new MouseEvent("click", { bubbles: true })); return true; })()`);
+  await openChannel(ann, "lobby-chat");
+  await sleep(600);
+  await say(ben, "while you were reading elsewhere");
+  await say(ben, "and one more");
+  await sleep(1200);
+  await openChannel(ann, ROOM);
+  await sleep(800);
+  check("the first unread message gets a New divider", await ann.evaluate(
+    `(() => { const d = document.querySelector(".chat-main .new-divider"); const next = d?.nextElementSibling;
+       return !!next && next.querySelector(".msg-content")?.textContent.includes("while you were reading elsewhere"); })()`));
+
+  // ── Search, here and everywhere ──
+  await ann.evaluate(`document.querySelector(".search-btn")?.click()`);
+  await waitFor(ann, `document.querySelector(".search-pane .search-input")`, 5_000).catch(() => {});
+  await ann.evaluate(setInput(".search-pane .search-input", "BOLD"));
+  await sleep(300);
+  check("search finds a message, whatever its case", await ann.evaluate(
+    `[...document.querySelectorAll(".search-pane .result")].some((e) => e.textContent.includes("bold move"))`));
+  await ann.evaluate(`[...document.querySelectorAll(".search-pane .result")].find((e) => e.textContent.includes("bold move"))?.click()`);
+  await sleep(500);
+  check("picking a result goes to the message", await ann.evaluate(
+    `!document.querySelector(".search-pane") && (${rowWith("bold move")}?.classList.contains("flash") ?? false)`));
+  await ann.evaluate(`document.querySelector(".search-btn")?.click()`);
+  await waitFor(ann, `document.querySelector(".search-pane .search-input")`, 5_000).catch(() => {});
+  await ann.evaluate(`[...document.querySelectorAll(".search-pane .scope")].find((b) => /everywhere/i.test(b.textContent))?.click()`);
+  await ann.evaluate(setInput(".search-pane .search-input", "inside the thread"));
+  await sleep(300);
+  check("everywhere names the conversation a result is in", await ann.evaluate(
+    `[...document.querySelectorAll(".search-pane .result")].some((e) => e.querySelector(".result-conv")?.textContent.includes(${JSON.stringify(ROOM)}))`));
+  await ann.evaluate(`document.querySelector(".search-pane .search-close")?.click()`);
+
+  for (const [who, tab] of [["writer", ann], ["reader", ben]]) {
+    const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));
+    check(`the chat's ${who} threw nothing`, fatal.length === 0, fatal.slice(0, 2).join(" | "));
+  }
+}
+
 // 14. Several servers at once. The rail's "+" used to disconnect you to bring
 //     up the connect dialog; now it adds a connection beside the others, a
 //     click on the rail only changes what is on screen, and voice follows the

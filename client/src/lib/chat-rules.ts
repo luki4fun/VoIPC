@@ -207,11 +207,71 @@ export function sanitizeHistory(
       // relayed on from here is offered as `shared` again, so passing it round
       // a second time can never launder it back into a first-hand account.
       kind: "shared",
-      id: typeof m.id === "string" && m.id !== "" ? m.id.slice(0, 64) : undefined,
+      id: keptId(m.id),
       expires_at,
+      // What it answers survives the hand-off: an id, which shows nothing a
+      // newcomer does not already hold, and points at nothing they cannot see
+      ...messageRefs(m),
     });
   }
   return valid;
+}
+
+/** Longest message id kept: `voipc_crypto::envelope::MAX_MESSAGE_ID`. */
+const MAX_MESSAGE_ID = 64;
+
+/** An id as we keep one: a non-empty string, cut to `MAX_MESSAGE_ID`. */
+function keptId(v: unknown): string | undefined {
+  return typeof v === "string" && v !== "" ? v.slice(0, MAX_MESSAGE_ID) : undefined;
+}
+
+/**
+ * What a message points at (the message it answers, its thread), as it may be
+ * kept: bounded like its own id, and only the keys that are there, so a plain
+ * message stays exactly the object it was.
+ */
+export function messageRefs(src: { reply_to?: unknown; thread?: unknown }): Pick<ChatMessage, "reply_to" | "thread"> {
+  const out: Pick<ChatMessage, "reply_to" | "thread"> = {};
+  const reply = keptId(src.reply_to);
+  const thread = keptId(src.thread);
+  if (reply) out.reply_to = reply;
+  if (thread) out.thread = thread;
+  return out;
+}
+
+/** The fields the archive has a place of its own for (crypto.rs `ChatMessage`). */
+const ARCHIVE_FIELDS = new Set(["user_id", "username", "content", "timestamp", "kind", "id", "expires_at", "account"]);
+
+/**
+ * A message as the desktop archive stores it: every field it has no place of
+ * its own for folded into one JSON string, `extra` (archive v6). The archive is
+ * positional, so a field of its own would be a new file format each time.
+ */
+export function toArchived(m: ChatMessage): ChatMessage & { extra?: string } {
+  const out: Record<string, unknown> = {};
+  const extra: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(m)) {
+    if (v === undefined) continue;
+    (ARCHIVE_FIELDS.has(k) ? out : extra)[k] = v;
+  }
+  if (Object.keys(extra).length > 0) out.extra = JSON.stringify(extra);
+  return out as unknown as ChatMessage & { extra?: string };
+}
+
+/**
+ * And back: only the fields this version knows, each checked as if it had just
+ * arrived. A damaged `extra` costs those fields, never the message.
+ */
+export function fromArchived(m: ChatMessage & { extra?: string | null }): ChatMessage {
+  const { extra, ...rest } = m;
+  // serde writes an absent field as null; the front end's shape has no nulls
+  for (const k of Object.keys(rest) as (keyof ChatMessage)[]) if (rest[k] === null) delete rest[k];
+  if (typeof extra !== "string") return rest;
+  try {
+    return { ...rest, ...messageRefs(JSON.parse(extra) ?? {}) };
+  } catch {
+    return rest;
+  }
 }
 
 /** Whether two messages are the same one, seen twice. */

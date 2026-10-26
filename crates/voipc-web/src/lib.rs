@@ -375,15 +375,22 @@ pub fn new_message_id() -> String {
     voipc_crypto::new_message_id()
 }
 
-/// Pack a message so it carries what the server never sees: the id, and the
-/// destruction timer in seconds (0 or absent for a message with no timer).
+/// Pack a message so it carries what the server never sees: the id, the
+/// destruction timer in seconds (0 or absent for a message with no timer), and
+/// the ids of the message it answers and of its thread.
 #[wasm_bindgen(js_name = envelope)]
-pub fn envelope(id: &str, text: &str, ttl_secs: Option<u32>) -> Vec<u8> {
-    voipc_crypto::envelope(id, text, ttl_secs)
+pub fn envelope(
+    id: &str,
+    text: &str,
+    ttl_secs: Option<u32>,
+    reply: Option<String>,
+    thread: Option<String>,
+) -> Vec<u8> {
+    voipc_crypto::envelope_with(id, text, ttl_secs, &voipc_crypto::Extras { reply, thread })
 }
 
-/// `{ id: string | null, text: string, ttl_secs: number | null }` from a
-/// received message.
+/// `{ id: string | null, text: string, ttl_secs: number | null,
+/// reply_to: string | null, thread: string | null }` from a received message.
 #[wasm_bindgen(js_name = openEnvelope)]
 pub fn open_envelope(plaintext: &[u8]) -> JsValue {
     let m = voipc_crypto::open_envelope(plaintext);
@@ -397,6 +404,20 @@ pub fn open_envelope(plaintext: &[u8]) -> JsValue {
             "ttl_secs",
             m.ttl_secs
                 .map(|t| JsValue::from_f64(t as f64))
+                .unwrap_or(JsValue::NULL),
+        ),
+        (
+            "reply_to",
+            m.extras
+                .reply
+                .map(|s| JsValue::from_str(&s))
+                .unwrap_or(JsValue::NULL),
+        ),
+        (
+            "thread",
+            m.extras
+                .thread
+                .map(|s| JsValue::from_str(&s))
                 .unwrap_or(JsValue::NULL),
         ),
     ])

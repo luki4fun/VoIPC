@@ -59,6 +59,21 @@ pub struct Message {
     /// A tombstone (`purge`): its writer deleted what they wrote in this
     /// conversation up to this moment (ms); readers drop their copies.
     pub purge_before: Option<u64>,
+    /// What else the message points at.
+    pub extras: Extras,
+}
+
+/// What a message may point at beside its text: the message it answers and
+/// the thread it belongs to, both ids its readers already hold.
+///
+/// They ride as plain keys without a `kind`, so a reader from before 1.2
+/// shows the text and nothing else. Only the id travels, never a quote of
+/// the message answered: a quote would keep that text alive in every reply
+/// after its own destruction timer had deleted it.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Extras {
+    pub reply: Option<String>,
+    pub thread: Option<String>,
 }
 
 /// What a tombstone shows where its kind is not known.
@@ -81,11 +96,27 @@ pub fn purge_envelope(id: &str, before: u64) -> Vec<u8> {
 /// own echo and every receiver's copy are recognised as one message, and the
 /// destruction timer, so that all of them delete it at the same moment.
 pub fn envelope(id: &str, text: &str, ttl_secs: Option<u32>) -> Vec<u8> {
+    envelope_with(id, text, ttl_secs, &Extras::default())
+}
+
+/// `envelope`, plus what the message points at.
+pub fn envelope_with(id: &str, text: &str, ttl_secs: Option<u32>, extras: &Extras) -> Vec<u8> {
     let mut obj = serde_json::json!({ "v": 2, "id": id, "text": text });
     if let Some(ttl) = ttl_secs.filter(|t| *t > 0) {
         obj["ttl"] = serde_json::json!(ttl.min(MAX_MESSAGE_TTL_SECS));
     }
+    for (key, value) in [("reply", &extras.reply), ("thread", &extras.thread)] {
+        if let Some(id) = bounded_id(value.as_deref()) {
+            obj[key] = serde_json::json!(id);
+        }
+    }
     obj.to_string().into_bytes()
+}
+
+/// A message id as we keep one: non-empty, at most `MAX_MESSAGE_ID` characters.
+fn bounded_id(id: Option<&str>) -> Option<String> {
+    id.filter(|i| !i.is_empty())
+        .map(|i| i.chars().take(MAX_MESSAGE_ID).collect())
 }
 
 /// Unpack a received message.
@@ -96,12 +127,7 @@ pub fn envelope(id: &str, text: &str, ttl_secs: Option<u32>) -> Vec<u8> {
 /// no id for it.
 pub fn open_envelope(plaintext: &[u8]) -> Message {
     if let Ok(serde_json::Value::Object(map)) = serde_json::from_slice(plaintext) {
-        let id = || {
-            map.get("id")
-                .and_then(|v| v.as_str())
-                .filter(|i| !i.is_empty())
-                .map(|i| i.chars().take(MAX_MESSAGE_ID).collect())
-        };
+        let id = || bounded_id(map.get("id").and_then(|v| v.as_str()));
         let newer = map
             .get("v")
             .and_then(|v| v.as_u64())
@@ -114,6 +140,7 @@ pub fn open_envelope(plaintext: &[u8]) -> Message {
                         text: PURGED.into(),
                         ttl_secs: None,
                         purge_before: Some(before),
+                        extras: Extras::default(),
                     };
                 }
             }
@@ -124,16 +151,12 @@ pub fn open_envelope(plaintext: &[u8]) -> Message {
                     text: NEWER_MESSAGE.into(),
                     ttl_secs: None,
                     purge_before: None,
+                    extras: Extras::default(),
                 }
             }
         }
         if let Some(serde_json::Value::String(text)) = map.get("text") {
-            let id = match map.get("id") {
-                Some(serde_json::Value::String(id)) if !id.is_empty() => {
-                    Some(id.chars().take(MAX_MESSAGE_ID).collect())
-                }
-                _ => None,
-            };
+            let id = id();
             // Bounded here, where it enters: what a sender claims decides when
             // this message is deleted, and the receiver then takes the shorter
             // of this and whatever the channel itself says.
@@ -142,11 +165,19 @@ pub fn open_envelope(plaintext: &[u8]) -> Message {
                 .and_then(|v| v.as_u64())
                 .filter(|t| *t > 0)
                 .map(|t| t.min(MAX_MESSAGE_TTL_SECS as u64) as u32);
+            // Bounded like the message's own id: each lands in the receiver's
+            // archive, and a reply to an id nobody holds is only shown as one
+            // to a message that is not here.
+            let extras = Extras {
+                reply: bounded_id(map.get("reply").and_then(|v| v.as_str())),
+                thread: bounded_id(map.get("thread").and_then(|v| v.as_str())),
+            };
             return Message {
                 id,
                 text: text.clone(),
                 ttl_secs,
                 purge_before: None,
+                extras,
             };
         }
     }
@@ -155,6 +186,7 @@ pub fn open_envelope(plaintext: &[u8]) -> Message {
         text: String::from_utf8_lossy(plaintext).into_owned(),
         ttl_secs: None,
         purge_before: None,
+        extras: Extras::default(),
     }
 }
 
@@ -216,7 +248,8 @@ mod tests {
                 id: Some("abc".into()),
                 text: NEWER_MESSAGE.into(),
                 ttl_secs: None,
-                purge_before: None
+                purge_before: None,
+                extras: Extras::default(),
             }
         );
         let tomb = open_envelope(&purge_envelope("t1", 1_700_000_000_000));
@@ -250,6 +283,45 @@ mod tests {
         assert_eq!(m.id, None);
         assert_eq!(m.text, "plain text from before v9");
         assert_eq!(m.ttl_secs, None);
+    }
+
+    #[test]
+    fn a_reply_and_its_thread_travel_as_ids_that_an_old_reader_ignores() {
+        let extras = Extras {
+            reply: Some("r1".into()),
+            thread: Some("t1".into()),
+        };
+        let packed = envelope_with("m1", "agreed", Some(60), &extras);
+        let m = open_envelope(&packed);
+        assert_eq!((m.text.as_str(), m.ttl_secs), ("agreed", Some(60)));
+        assert_eq!(m.extras, extras);
+
+        // What 1.0 and 1.1 do with it: their reader takes `id`, `text` and
+        // `ttl` and looks for a `kind`; there is none, so the text shows.
+        let map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&packed).unwrap();
+        assert_eq!(map["v"], 2, "still the version an old reader accepts");
+        assert!(
+            !map.contains_key("kind"),
+            "a kind would turn it into a placeholder"
+        );
+
+        // Empty ids are no ids, and a claimed one is cut down where it enters
+        let none = open_envelope(&envelope_with("m2", "hi", None, &Extras::default()));
+        assert_eq!(none.extras, Extras::default());
+        let empty = br#"{"v":2,"id":"m3","text":"hi","reply":"","thread":7}"#;
+        assert_eq!(open_envelope(empty).extras, Extras::default());
+        let huge = format!(
+            r#"{{"v":2,"id":"m4","text":"hi","reply":"{}"}}"#,
+            "a".repeat(60_000)
+        );
+        assert_eq!(
+            open_envelope(huge.as_bytes()).extras.reply.unwrap().len(),
+            MAX_MESSAGE_ID
+        );
+        // A newer kind still never carries what it points at into the archive
+        let later = br#"{"v":3,"id":"m5","text":"hi","reply":"r1"}"#;
+        assert_eq!(open_envelope(later).extras, Extras::default());
     }
 
     #[test]

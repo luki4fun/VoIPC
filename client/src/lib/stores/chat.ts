@@ -2,12 +2,15 @@ import { writable, get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import {
   dropExpired,
+  fromArchived,
   isLegacyDmKey,
   MAX_MESSAGES,
   mergeHistory,
   newestTimestamp,
   pruneConversations,
   sanitizeHistory,
+  messageRefs,
+  toArchived,
 } from "../chat-rules.js";
 import { previewChannelId, previewUsers } from "./channels.js";
 import { serverAddress, serverKey, userId } from "./connection.js";
@@ -244,11 +247,11 @@ async function saveNow() {
   // Convert Maps to plain objects for serde
   const channelObj: Record<string, ChatMessage[]> = {};
   chMap.forEach((msgs, name) => {
-    channelObj[name] = msgs;
+    channelObj[name] = msgs.map(toArchived);
   });
   const dmObj: Record<string, ChatMessage[]> = {};
   dmMap.forEach((msgs, key) => {
-    dmObj[key] = msgs;
+    dmObj[key] = msgs.map(toArchived);
   });
 
   const clearedObj: Record<string, number> = {};
@@ -282,7 +285,7 @@ export function populateFromArchive(archive: {
   const now = Date.now();
   const chMap = new Map<string, ChatMessage[]>();
   for (const [key, msgs] of Object.entries(archive.channels)) {
-    const live = dropExpired(msgs, now);
+    const live = dropExpired(msgs.map(fromArchived), now);
     if (live.length > 0) chMap.set(key, live);
   }
   channelMessages.set(chMap);
@@ -296,7 +299,7 @@ export function populateFromArchive(archive: {
       droppedLegacyDms++;
       continue;
     }
-    const live = dropExpired(msgs, now);
+    const live = dropExpired(msgs.map(fromArchived), now);
     if (live.length > 0) dmMap.set(key, live);
   }
   if (droppedLegacyDms > 0) {
@@ -498,11 +501,13 @@ export function addDmMessage(
       }
       if (!onScreen) {
         existing.unread++;
+        noteUnread(dmKey(server, existing.username), msg.timestamp);
       }
       return [...convos];
     } else {
       // New conversation: use sender name for incoming, active DM name for echo
       const peerName = isEcho ? activeName || "Unknown" : fromName;
+      if (!onScreen) noteUnread(dmKey(server, peerName), msg.timestamp);
       return [
         ...convos,
         {
@@ -530,6 +535,8 @@ export function fileStoredDm(
     message_id: string | null;
     content: string;
     timestamp: number;
+    reply_to?: string | null;
+    thread?: string | null;
   },
   own: { name: string; account: string },
   expires_at: number | undefined,
@@ -547,6 +554,7 @@ export function fileStoredDm(
     id: m.message_id ?? undefined,
     account: m.from_me ? own.account : m.peer_account,
     expires_at,
+    ...messageRefs(m),
   };
   if (expires_at !== undefined && expires_at <= Date.now()) return;
   if (purged(key, msg)) return;
@@ -569,11 +577,15 @@ export function fileStoredDm(
     const existing = convos.find((c) => c.username === peerName);
     if (existing) {
       existing.account = m.peer_account;
-      if (!m.from_me) existing.unread++;
+      if (!m.from_me) {
+        existing.unread++;
+        noteUnread(key, m.timestamp);
+      }
       return [...convos];
     }
     // Not here now: a negative id stands in until they are (addDmMessage).
     const id = peerUserId ?? -parseInt(m.peer_account.slice(0, 7), 16) - 1;
+    if (!m.from_me) noteUnread(key, m.timestamp);
     return [...convos, { user_id: id, username: peerName, unread: m.from_me ? 0 : 1, account: m.peer_account }];
   });
 }
@@ -604,6 +616,7 @@ export function openDm(server: string, userId: number, username: string) {
   // Clear unread for this conversation
   dmConversations.of(server).update((convos) => {
     const c = convos.find((x) => x.user_id === userId);
+    if (c?.unread) markRead(dmKey(server, c.username));
     if (c) c.unread = 0;
     return [...convos];
   });
@@ -614,8 +627,43 @@ export function closeDm(server: string) {
   activeDmUsername.of(server).set("");
 }
 
-export function incrementChannelUnread(server: string, channelName: string) {
+// ── Where "New" begins ──────────────────────────────────────────────────────
+//
+// The count of a conversation is cleared the moment it comes on screen, which
+// is also the moment the pane wants to know where the unread part began. So
+// the time its count left zero is kept, handed to `newMessagesAt` when the
+// count is cleared, and kept there until the reader moves on.
+
+/** When each conversation's first unread message arrived, by chat key. */
+const unreadSince = new Map<string, number>();
+/** Per chat key, where the conversation's "New" divider goes (a timestamp). */
+export const newMessagesAt = writable<Map<string, number>>(new Map());
+
+function noteUnread(key: string, at: number) {
+  if (!unreadSince.has(key)) unreadSince.set(key, at);
+}
+
+/** A conversation came on screen: what was unread there is now where "New" begins. */
+export function markRead(key: string) {
+  const at = unreadSince.get(key);
+  if (at === undefined) return;
+  unreadSince.delete(key);
+  newMessagesAt.update((map) => new Map(map).set(key, at));
+}
+
+/** The reader moved on: the conversation's divider has done its job. */
+export function forgetNewMessages(key: string) {
+  if (!get(newMessagesAt).has(key)) return;
+  newMessagesAt.update((map) => {
+    const next = new Map(map);
+    next.delete(key);
+    return next;
+  });
+}
+
+export function incrementChannelUnread(server: string, channelName: string, at = Date.now()) {
   const key = chatKey(server, channelName);
+  noteUnread(key, at);
   unreadPerChannel.update((map) => {
     map.set(key, (map.get(key) ?? 0) + 1);
     return new Map(map);
@@ -625,6 +673,7 @@ export function incrementChannelUnread(server: string, channelName: string) {
 export function clearChannelUnread(server: string, channelName: string) {
   const key = chatKey(server, channelName);
   if (!get(unreadPerChannel).has(key)) return;
+  markRead(key);
   unreadPerChannel.update((map) => {
     map.delete(key);
     return new Map(map);
@@ -755,6 +804,7 @@ export async function clearAllHistory(): Promise<string | null> {
  */
 export function clearServerUnread(server: string) {
   const prefix = `${serverKey(server)}/`;
+  for (const key of [...unreadSince.keys()]) if (key.startsWith(prefix)) unreadSince.delete(key);
   unreadPerChannel.update((map) => {
     const next = new Map([...map].filter(([key]) => !key.startsWith(prefix)));
     return next.size === map.size ? map : next;

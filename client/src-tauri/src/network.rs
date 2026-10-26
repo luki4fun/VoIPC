@@ -3078,7 +3078,7 @@ async fn drain_pending_dms(
 ) {
     // Extract pending DMs for this target, each with the id it was shown under
     // and the destruction timer it was written under
-    let pending: Vec<(String, String, Option<u32>)> = {
+    let pending: Vec<(String, String, Option<u32>, crate::crypto::Extras)> = {
         let mut sig = signal.lock().unwrap_or_else(|p| {
             warn!("mutex poisoned, recovering");
             p.into_inner()
@@ -3093,7 +3093,7 @@ async fn drain_pending_dms(
                 } if *tid == target_user_id => {
                     // Only send if queued less than 60 seconds ago
                     if msg.queued_at.elapsed().as_secs() < 60 {
-                        to_send.push((msg.id, msg.content, msg.ttl_secs));
+                        to_send.push((msg.id, msg.content, msg.ttl_secs, msg.extras));
                     } else {
                         expired += 1;
                     }
@@ -3115,8 +3115,8 @@ async fn drain_pending_dms(
         to_send
     };
 
-    for (id, content, ttl_secs) in pending {
-        let payload = crate::crypto::envelope(&id, &content, ttl_secs);
+    for (id, content, ttl_secs, extras) in pending {
+        let payload = crate::crypto::envelope_with(&id, &content, ttl_secs, &extras);
         let result = tokio::task::block_in_place(|| {
             let mut sig = signal.lock().map_err(|e| format!("lock: {e}"))?;
             let stores = sig.stores.as_mut().ok_or("not initialized")?;
@@ -3159,7 +3159,7 @@ async fn drain_pending_channel_messages(
 ) {
     // Extract pending channel messages, each with the id it was shown under and
     // the destruction timer it was written under
-    let pending: Vec<(String, String, Option<u32>)> = {
+    let pending: Vec<(String, String, Option<u32>, crate::crypto::Extras)> = {
         let mut sig = signal.lock().unwrap_or_else(|p| {
             warn!("mutex poisoned, recovering");
             p.into_inner()
@@ -3171,7 +3171,7 @@ async fn drain_pending_channel_messages(
             match &msg.target {
                 PendingTarget::Channel { channel_id: cid } if *cid == channel_id => {
                     if msg.queued_at.elapsed().as_secs() < 60 {
-                        to_send.push((msg.id, msg.content, msg.ttl_secs));
+                        to_send.push((msg.id, msg.content, msg.ttl_secs, msg.extras));
                     } else {
                         expired += 1;
                     }
@@ -3205,8 +3205,8 @@ async fn drain_pending_channel_messages(
     // thing for a message typed now.
     rotate_sender_key_if_stale(channel_id, own_user_id, signal, tcp_tx).await;
 
-    for (id, content, ttl_secs) in pending {
-        let payload = crate::crypto::envelope(&id, &content, ttl_secs);
+    for (id, content, ttl_secs, extras) in pending {
+        let payload = crate::crypto::envelope_with(&id, &content, ttl_secs, &extras);
         let result = tokio::task::block_in_place(|| {
             let mut sig = signal.lock().map_err(|e| format!("lock: {e}"))?;
             let stores = sig.stores.as_mut().ok_or("not initialized")?;
@@ -3307,6 +3307,8 @@ fn handle_encrypted_direct_message(
                     "timestamp": timestamp,
                     "message_id": msg.id,
                     "ttl_secs": msg.ttl_secs,
+                    "reply_to": msg.extras.reply,
+                    "thread": msg.extras.thread,
                     "encrypted": true,
                 }),
             );
@@ -3409,6 +3411,8 @@ fn handle_encrypted_channel_message(
                     // end takes the shorter of this and the channel's own
                     // timer — see expiryFor in chat-rules.ts.
                     "ttl_secs": msg.ttl_secs,
+                    "reply_to": msg.extras.reply,
+                    "thread": msg.extras.thread,
                     "encrypted": true,
                 }),
             );

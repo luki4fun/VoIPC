@@ -73,6 +73,11 @@ export interface UiPrefs {
   /** The floating preview of your own share. Off once you hide it. */
   share_preview: boolean;
   /**
+   * Busy answers to one message gather into a thread of their own
+   * (thread-rules.ts `threadView`). Answers sent into a thread go there either way.
+   */
+  group_threads: boolean;
+  /**
    * Text channels the user walked out of, per server (`"host:port"` → names).
    *
    * A server can ask every client to join a text channel on connect
@@ -160,6 +165,7 @@ export function defaultUiPrefs(): UiPrefs {
       stage: defaultStreamChat("stage"),
     },
     share_preview: true,
+    group_threads: true,
     left_text_channels: {},
     dm_timers: {},
     nsfw_ok: [],
@@ -330,6 +336,7 @@ export function sanitizeUiPrefs(raw: unknown): UiPrefs {
       stage: streamChat(sc.stage, "stage"),
     },
     share_preview: bool(r.share_preview, d.share_preview),
+    group_threads: bool(r.group_threads, d.group_threads),
     left_text_channels: leftTextChannels(r.left_text_channels),
     dm_timers: dmTimers(r.dm_timers),
     nsfw_ok: nsfwOk(r.nsfw_ok),

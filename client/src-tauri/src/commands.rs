@@ -547,6 +547,8 @@ pub async fn decline_invite(
 
 /// Send a chat message to the current channel.
 /// Tries Sender Key encryption if available, falls back to plaintext.
+// A command's arguments are the fields of its call from the front end
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn send_channel_message(
     state: State<'_, AppState>,
@@ -560,6 +562,10 @@ pub async fn send_channel_message(
     // timer. The front end passes what the channel advertises; it travels
     // inside the ciphertext, so the relay can neither read it nor change it.
     ttl_secs: Option<u32>,
+    // The message this answers and the thread it belongs to, by id; inside the
+    // ciphertext too.
+    reply_to: Option<String>,
+    thread: Option<String>,
 ) -> Result<(), String> {
     let (user_id, username, current_channel_id, tcp_tx, signal, account, channels) = {
         let conns = state.connections.read().await;
@@ -590,7 +596,11 @@ pub async fn send_channel_message(
     // The id travels inside the ciphertext, so our own echo below and every
     // receiver's copy file the message under the same one.
     let message_id = crypto::new_message_id();
-    let payload = crypto::envelope(&message_id, &content, ttl_secs);
+    let extras = crypto::Extras {
+        reply: reply_to,
+        thread,
+    };
+    let payload = crypto::envelope_with(&message_id, &content, ttl_secs, &extras);
 
     // A channel with a log keeps it for its members too (cloud copies on),
     // whether or not anybody is here to read it now.
@@ -664,6 +674,8 @@ pub async fn send_channel_message(
                     "timestamp": timestamp,
                     "message_id": message_id,
                     "ttl_secs": ttl_secs,
+                    "reply_to": extras.reply,
+                    "thread": extras.thread,
                     "encrypted": true,
                 }),
             );
@@ -683,6 +695,7 @@ pub async fn send_channel_message(
                     id: message_id.clone(),
                     content: content.clone(),
                     ttl_secs,
+                    extras: extras.clone(),
                     queued_at: std::time::Instant::now(),
                 });
             }
@@ -704,6 +717,8 @@ pub async fn send_channel_message(
                     "timestamp": timestamp,
                     "message_id": message_id,
                     "ttl_secs": ttl_secs,
+                    "reply_to": extras.reply,
+                    "thread": extras.thread,
                     "pending": true,
                 }),
             );
@@ -714,6 +729,8 @@ pub async fn send_channel_message(
 
 /// Send a direct message to another user.
 /// Tries pairwise Signal encryption if session exists, queues if not ready.
+// A command's arguments are the fields of its call from the front end
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn send_direct_message(
     state: State<'_, AppState>,
@@ -725,6 +742,8 @@ pub async fn send_direct_message(
     // take a policy from, so this is the sender's own timer for that
     // conversation; it rides inside the envelope like a channel message's does.
     ttl_secs: Option<u32>,
+    reply_to: Option<String>,
+    thread: Option<String>,
 ) -> Result<(), String> {
     let (tcp_tx, own_user_id, own_username, signal, account) = {
         let conns = state.connections.read().await;
@@ -743,7 +762,11 @@ pub async fn send_direct_message(
     // channel message uses now — which also gives a DM the id it never had, and
     // costs nothing on the far side: `open_envelope` reads plain text as text.
     let message_id = crypto::new_message_id();
-    let payload = crypto::envelope(&message_id, &content, ttl_secs);
+    let extras = crypto::Extras {
+        reply: reply_to,
+        thread,
+    };
+    let payload = crypto::envelope_with(&message_id, &content, ttl_secs, &extras);
 
     // Between two accounts, and with cloud copies on, it is kept for them too:
     // whether or not they are here to get it now.
@@ -807,6 +830,8 @@ pub async fn send_direct_message(
                     "timestamp": timestamp,
                     "message_id": message_id,
                     "ttl_secs": ttl_secs,
+                    "reply_to": extras.reply,
+                    "thread": extras.thread,
                     "encrypted": true,
                 }),
             );
@@ -826,6 +851,7 @@ pub async fn send_direct_message(
                     id: message_id.clone(),
                     content: content.clone(),
                     ttl_secs,
+                    extras: extras.clone(),
                     queued_at: std::time::Instant::now(),
                 });
             }
@@ -847,6 +873,8 @@ pub async fn send_direct_message(
                     "timestamp": timestamp,
                     "message_id": message_id,
                     "ttl_secs": ttl_secs,
+                    "reply_to": extras.reply,
+                    "thread": extras.thread,
                     "pending": true,
                 }),
             );

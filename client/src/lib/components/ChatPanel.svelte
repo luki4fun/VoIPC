@@ -17,14 +17,16 @@
   import { tick, untrack } from "svelte";
   import { channels } from "../stores/channels.js";
   import { uiPrefs } from "../stores/ui-prefs.js";
-  import { serverAddress, serverKey, userId } from "../stores/connection.js";
+  import { serverAddress, serverKey, userId, username } from "../stores/connection.js";
+  import { openServers } from "../stores/servers.js";
   import { addNotification } from "../stores/notifications.js";
   import { confirmAction } from "../stores/confirm.js";
-  import { dayKey, dayLabel, fullTime } from "../chat-time.js";
   import { get } from "svelte/store";
   import { account, accountHex } from "../stores/account.js";
   import { users } from "../stores/users.js";
-  import { expiryFor } from "../chat-rules.js";
+  import { expiryFor, messageRefs } from "../chat-rules.js";
+  import { threadView } from "../thread-rules.js";
+  import type { ChatMessage } from "../types.js";
   import {
     addDmMessage,
     dmConversations,
@@ -36,6 +38,13 @@
     unreadPerChannel,
     clearChannelChat,
     clearDmChat,
+    chatKey,
+    dmKey,
+    forgetNewMessages,
+    newMessagesAt,
+    channelMessages,
+    dmMessages,
+    openDm,
   } from "../stores/chat.js";
   import {
     channelMessageTtl,
@@ -48,6 +57,7 @@
     leftTextChannelNames,
     me,
     notePost,
+    selectChannel,
     nsfwConsented,
     setDmMessageTtl,
   } from "../stores/channel-ui.js";
@@ -55,23 +65,16 @@
   import { displayChannelId, isPreviewing, shownMessages } from "../stores/roster.js";
   import { channelRosters } from "../stores/rosters.js";
   import Icon from "./Icons.svelte";
+  import Composer from "./chat/Composer.svelte";
+  import MessageList from "./chat/MessageList.svelte";
+  import ThreadPane from "./chat/ThreadPane.svelte";
+  import SearchPane from "./chat/SearchPane.svelte";
+  import type { Hit } from "../search-rules.js";
   import { shortName } from "../username.js";
 
-  let messageInput = $state("");
   let messagesContainer = $state<HTMLDivElement | null>(null);
-  let chatInputEl = $state<HTMLInputElement | null>(null);
 
-  // ── Link handling: URLs become buttons that open a copy popup (never a
-  // browser). Rendering stays plain text nodes — no HTML injection surface.
-  const URL_RE = /(https?:\/\/[^\s]+)/g;
-
-  function splitSegments(text: string): Array<{ text: string; url: boolean }> {
-    return text
-      .split(URL_RE)
-      .filter((p) => p !== "")
-      .map((p) => ({ text: p, url: /^https?:\/\//.test(p) }));
-  }
-
+  // Links open a copy popup, never a browser (MessageList draws the buttons)
   let linkPopupUrl = $state<string | null>(null);
   let linkInputEl = $state<HTMLInputElement | null>(null);
 
@@ -98,35 +101,6 @@
       linkPopupUrl = null;
     }
     // Not copied: leave the popup open with the URL selected for manual Ctrl+C
-  }
-
-  // Emoji picker state
-  let showEmojiPicker = $state(false);
-  let emojiCategory = $state(0);
-
-  const EMOJI_CATEGORIES = [
-    { label: "Smileys", emojis: ["😀","😁","😂","🤣","😃","😄","😅","😆","😉","😊","😎","🤩","😏","😒","😞","😔","😟","😕","😣","😖","😫","😩","🥺","😢","😭","😤","😠","😡","🤬","😈","👿","💀","☠️","😱","😨","😰","😥","😓","🤗","🤔","🤭","🤫","🤥","😶","😐","😑","😬","🙄","😯","😧","😮","😲","🥱","😴","🤤","😷","🤒","🤕","🤢","🤮","🥴","😵","🤯","🥳","🥸","😇","🤠","🤡"] },
-    { label: "Gestures", emojis: ["👋","🤚","🖐️","✋","🖖","👌","🤌","🤏","✌️","🤞","🤟","🤘","🤙","👈","👉","👆","👇","☝️","👍","👎","✊","👊","🤛","🤜","👏","🙌","👐","🤲","🤝","🙏","💪","🦾","🖕"] },
-    { label: "Hearts", emojis: ["❤️","🧡","💛","💚","💙","💜","🖤","🤍","🤎","💔","❤️‍🔥","❤️‍🩹","💕","💞","💓","💗","💖","💘","💝","💟","♥️","😍","🥰","😘","😻"] },
-    { label: "Objects", emojis: ["🔥","⭐","🌟","✨","💫","🎉","🎊","🎈","🎁","🏆","🥇","🎯","💡","💎","🔔","🎵","🎶","🎤","🎧","🎮","🕹️","📱","💻","⌨️","🖥️","📷","📸","🔒","🔑","🗝️","🛠️","⚙️","💣","🧨"] },
-    { label: "Nature", emojis: ["🌈","☀️","🌤️","⛅","🌥️","☁️","🌧️","⛈️","🌩️","❄️","🌊","🌸","🌺","🌻","🌹","🌷","🌱","🌿","☘️","🍀","🍁","🍂","🌵","🌴","🐶","🐱","🐭","🐹","🐰","🦊","🐻","🐼","🐸","🐵"] },
-    { label: "Food", emojis: ["🍕","🍔","🍟","🌭","🍿","🧂","🥓","🍳","🥞","🧇","🧀","🍖","🍗","🥩","🌮","🌯","🍜","🍝","🍣","🍱","🍩","🍪","🎂","🍰","🧁","🍫","🍬","🍭","☕","🍵","🧃","🍺","🍻","🥂","🍷","🥃"] },
-  ];
-
-  function insertEmoji(emoji: string) {
-    messageInput += emoji;
-    showEmojiPicker = false;
-    // Re-focus the input
-    tick().then(() => chatInputEl?.focus());
-  }
-
-  function toggleEmojiPicker() {
-    showEmojiPicker = !showEmojiPicker;
-    if (showEmojiPicker) emojiCategory = 0;
-  }
-
-  function handleEmojiKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape") showEmojiPicker = false;
   }
 
   let isDmMode = $derived($activeDmUserId !== null);
@@ -197,6 +171,203 @@
   // and for the stream view's unread dot alike.
   let displayMessages = $derived($shownMessages);
 
+  // ── Replies and threads ──────────────────────────────────────────────────
+  //
+  // Answers carry the id of what they answer (thread-rules.ts); which of them
+  // fold into a thread is worked out here, from this copy of the conversation.
+  const view = $derived(threadView(displayMessages, { auto: $uiPrefs.group_threads }));
+  /** Slow mode still counting: a send waits, and the button says how long. */
+  let held = $derived(
+    block?.kind === "slow"
+      ? { label: slowModeLabel(block.remainingSecs), title: `Slow mode: one message every ${slowModeLabel(slowModeSecs)}` }
+      : null,
+  );
+  /** Whether this conversation can be written in, answers included. */
+  let canAnswer = $derived(isDmMode || (canSendChannelMessage && block?.kind !== "announce"));
+  // Raw: a $state proxy of a message is never === the message itself, and
+  // these are looked up in the conversation by identity
+  let replyingTo = $state.raw<ChatMessage | null>(null);
+  let threadRoot = $state.raw<ChatMessage | null>(null);
+  /** A thread's answers as last seen, by its first message's id, for its unread dot. */
+  let threadSeen = $state(new Map<string, number>());
+  let composer = $state<{ focus: () => void } | null>(null);
+  let mainList = $state<{ jumpTo: (m: ChatMessage) => boolean } | null>(null);
+  /** The thread on screen, while its first message is still here. */
+  const openThread = $derived.by(() => {
+    const root = threadRoot;
+    if (!root || !displayMessages.includes(root)) return null;
+    return { root, answers: view.threads.get(root) ?? [] };
+  });
+
+  // Both belong to the conversation they were opened in
+  $effect(() => {
+    void $serverAddress;
+    void $displayChannelId;
+    void $activeDmUserId;
+    replyingTo = null;
+    threadRoot = null;
+  });
+
+  // An open thread's answers count as read, new ones included
+  $effect(() => {
+    const t = openThread;
+    if (!t?.root.id) return;
+    void t.answers.length;
+    untrack(() => {
+      threadSeen.set(t.root.id!, Date.now());
+      threadSeen = new Map(threadSeen);
+    });
+  });
+
+  function replyTo(m: ChatMessage) {
+    replyingTo = m;
+    composer?.focus();
+  }
+
+  /** Open the thread on `m`; `write`: to answer in it, so the box gets the cursor. */
+  function openThreadOn(m: ChatMessage, write = false) {
+    replyingTo = null;
+    threadRoot = m;
+    threadWrite = write;
+  }
+  let threadWrite = $state(false);
+
+  // ── Mentions and "New" ───────────────────────────────────────────────────
+
+  /** The conversation's key in the chat stores. */
+  const currentKey = $derived(
+    isDmMode ? dmKey($serverAddress, $activeDmUsername) : chatKey($serverAddress, channelName),
+  );
+  /** Where the unread part of this conversation began, until the reader moves on. */
+  const newSince = $derived($newMessagesAt.get(currentKey));
+  $effect(() => {
+    const key = currentKey;
+    return () => forgetNewMessages(key);
+  });
+
+  /** Our own name here, with its tag, and without. */
+  const myNames = $derived($username ? [...new Set([$username, shortName($username)])] : []);
+  /**
+   * Who an `@` can name. In an anonymous channel every member sees others
+   * under pseudonyms of their own, so a name typed there means nothing to
+   * anyone else: no mentions at all.
+   */
+  // Keyed by the names themselves: the user list is rebuilt for every mute
+  // and join, and a new array here would parse every message on screen again
+  const mentionKey = $derived(
+    !isDmMode && effectiveChannel?.anonymous ? "" : $users.map((u) => u.username).join("\n"),
+  );
+  const mentionable = $derived(mentionKey ? mentionKey.split("\n") : []);
+  const mentionNames = $derived([...new Set(mentionable.flatMap((n) => [n, shortName(n)]))]);
+  /** Who the message box offers after an `@`: everybody but us. */
+  const mentionOthers = $derived(mentionable.filter((n) => !myNames.includes(n)));
+
+  // ── Search ───────────────────────────────────────────────────────────────
+
+  let searching = $state(false);
+  let panelEl = $state<HTMLDivElement | null>(null);
+  /** A result in another conversation: shown once that conversation is on screen. */
+  let pendingJump = $state.raw<ChatMessage | null>(null);
+
+  interface Conv {
+    kind: "channel" | "dm";
+    key: string;
+    /** `host:port`, as chat keys carry it. */
+    server: string;
+    name: string;
+  }
+  /** `host:port/name`; a channel name may hold a slash of its own. */
+  function splitChatKey(key: string): { server: string; name: string } | null {
+    const m = /^([^/]+:\d+)\/(.*)$/s.exec(key);
+    return m ? { server: m[1], name: m[2] } : null;
+  }
+  const everywhere = $derived.by(() => {
+    const out: { conv: Conv; messages: ChatMessage[] }[] = [];
+    for (const [kind, map] of [["channel", $channelMessages], ["dm", $dmMessages]] as const) {
+      for (const [key, messages] of map) {
+        const at = splitChatKey(key);
+        if (at) out.push({ conv: { kind, key, ...at }, messages });
+      }
+    }
+    return out;
+  });
+  function convLabel(c: Conv): string {
+    const name = c.kind === "dm" ? `@${shortName(c.name)}` : c.name;
+    return c.server === serverKey($serverAddress) ? name : `${name} · ${c.server}`;
+  }
+
+  function pickResult(hit: Hit<Conv | null>) {
+    searching = false;
+    if (hit.conv === null || hit.conv.key === currentKey) {
+      tick().then(() => {
+        if (!mainList?.jumpTo(hit.msg)) showElsewhere(hit.msg);
+      });
+      return;
+    }
+    const conv = hit.conv;
+    const server = $openServers.find((s) => serverKey(s) === conv.server);
+    if (!server) {
+      addNotification(`${conv.server} is not connected: connect to read that conversation`, "info");
+      return;
+    }
+    if (server !== $serverAddress) serverAddress.set(server);
+    if (conv.kind === "dm") {
+      const peer =
+        get(dmConversations.peek(server)).find((c) => c.username === conv.name) ??
+        get(users.peek(server)).find((u) => u.username === conv.name);
+      if (!peer) {
+        addNotification(`Your conversation with ${shortName(conv.name)} is not open now`, "info");
+        return;
+      }
+      openDm(server, peer.user_id, peer.username);
+    } else {
+      const channel = get(channels.peek(server)).find((c) => c.name === conv.name);
+      if (!channel) {
+        addNotification(`${conv.name} is not on that server any more`, "info");
+        return;
+      }
+      void selectChannel(channel);
+    }
+    pendingJump = hit.msg;
+    setTimeout(() => (pendingJump = null), 3000);
+  }
+
+  // The conversation a result was in came on screen: go to the result
+  $effect(() => {
+    const m = pendingJump;
+    if (!m || !displayMessages.includes(m)) return;
+    pendingJump = null;
+    tick().then(() => {
+      if (!mainList?.jumpTo(m)) showElsewhere(m);
+    });
+  });
+
+  /** Ctrl+F (⌘F) while the chat has the focus: the browser's own find knows nothing of threads. */
+  function onWindowKeydown(e: KeyboardEvent) {
+    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f" && panelEl?.contains(document.activeElement)) {
+      e.preventDefault();
+      searching = true;
+    }
+  }
+
+  /** A quote led to a message not drawn in the main flow: it is in a thread. */
+  function showElsewhere(m: ChatMessage) {
+    for (const [root, answers] of view.threads) {
+      if (answers.includes(m)) {
+        threadRoot = root;
+        return;
+      }
+    }
+  }
+
+  /** From the thread pane, to a message in the conversation itself. */
+  function showInMain(m: ChatMessage) {
+    threadRoot = null;
+    tick().then(() => {
+      if (!mainList?.jumpTo(m)) showElsewhere(m);
+    });
+  }
+
   // Who in this channel would answer a request for its recent chat. The
   // automatic ask happens once, when joining; this is what the user can do
   // afterwards — having cleared the channel by accident, or because somebody
@@ -226,21 +397,6 @@
     }
   }
 
-  // A draft belongs to the conversation it was typed in. This pane is mounted
-  // once and never keyed, so nothing remounts it when that conversation changes
-  // — or disappears under the user, which is the case this is here for: delete,
-  // leave or be kicked from the channel being typed in and the pane falls back
-  // to the voice room next door, with everybody in it. `sendMessage` reads the
-  // target at send time, so the next Enter would post half a private thought
-  // into a room it was never meant for — or, after a click in the rail, into
-  // another server's.
-  $effect(() => {
-    void $serverAddress;
-    void $displayChannelId;
-    void $activeDmUserId;
-    messageInput = "";
-  });
-
   // Follow the conversation to its end — when it is another conversation, or
   // when this one grew and the reader was already at the end. Not on every
   // change of the list: it is rebuilt for a message on any channel of any
@@ -267,18 +423,6 @@
     });
   });
 
-  /** A divider before the first message of every day (lib/chat-time.ts). */
-  function startsDay(index: number): boolean {
-    const curr = displayMessages[index];
-    if (curr.kind === "history-marker" || curr.kind === "notice") return false;
-    for (let j = index - 1; j >= 0; j--) {
-      const prev = displayMessages[j];
-      if (prev.kind === "history-marker" || prev.kind === "notice") continue;
-      return dayKey(prev.timestamp) !== dayKey(curr.timestamp);
-    }
-    return true;
-  }
-
   // Scrolled back into the conversation: a way back down that does not need
   // a long fling (and says when something new arrived meanwhile)
   let scrolledUp = $state(false);
@@ -289,28 +433,6 @@
   }
   function jumpToLatest() {
     messagesContainer?.scrollTo({ top: messagesContainer.scrollHeight, behavior: "smooth" });
-  }
-
-  function formatTime(timestamp: number): string {
-    const date = new Date(timestamp);
-    return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
-  }
-
-  function shouldShowHeader(index: number): boolean {
-    if (index === 0) return true;
-    const prev = displayMessages[index - 1];
-    const curr = displayMessages[index];
-    // Show header if different user, after a history divider, or more than 5 minutes apart
-    return (
-      prev.kind === "history-marker" ||
-      prev.kind === "notice" ||
-      prev.user_id !== curr.user_id ||
-      dayKey(prev.timestamp) !== dayKey(curr.timestamp) ||
-      // Where a name came from is part of what the header says, so a second-hand
-      // message never folds into a run of first-hand ones and inherits its badge.
-      (prev.kind === "shared") !== (curr.kind === "shared") ||
-      curr.timestamp - prev.timestamp > 5 * 60 * 1000
-    );
   }
 
   // ── Destruction timer ────────────────────────────────────────────────────
@@ -351,14 +473,17 @@
     setDmMessageTtl($serverAddress, $activeDmUsername, secs);
   }
 
-  async function sendMessage() {
-    const content = messageInput.trim();
-    if (!content) return;
-    // Kept in the input rather than sent to be refused
-    if (!isDmMode && block) return;
+  /**
+   * The composer hands over what to send; a held one never gets here. `refs`
+   * comes from the thread pane; the main composer's answer is `replyingTo`,
+   * which joins the thread of what it answers, if that is in one.
+   */
+  async function sendMessage(content: string, refs?: { replyTo: string; thread: string }) {
     const server = $serverAddress;
-
-    messageInput = "";
+    const answering = replyingTo;
+    replyingTo = null;
+    const replyTo = refs?.replyTo ?? answering?.id ?? null;
+    const thread = refs?.thread ?? answering?.thread ?? null;
 
     try {
       // The destruction timer this conversation carries, stamped inside the
@@ -371,7 +496,7 @@
         if (away?.account) {
           // They are away: the server's copy is the one way it reaches them,
           // and this is our own copy of it.
-          const id = await invoke<string>("send_kept_dm", { server, account: away.account, content, ttlSecs });
+          const id = await invoke<string>("send_kept_dm", { server, account: away.account, content, ttlSecs, replyTo, thread });
           const own = get(account.peek(server));
           const myId = get(userId.peek(server));
           const now = Date.now();
@@ -383,9 +508,10 @@
             id,
             account: own ? accountHex(own.info.id) : undefined,
             expires_at: expiryFor(now, ttlSecs, ttlSecs),
+            ...messageRefs({ reply_to: replyTo, thread }),
           });
         } else {
-          await invoke("send_direct_message", { server, targetUserId: $activeDmUserId, content, ttlSecs });
+          await invoke("send_direct_message", { server, targetUserId: $activeDmUserId, content, ttlSecs, replyTo, thread });
         }
       } else {
         const channelId = $displayChannelId;
@@ -399,18 +525,13 @@
           content,
           channelId,
           ttlSecs: channelMessageTtl(server, channelId) || null,
+          replyTo,
+          thread,
         });
       }
     } catch (e) {
       console.error("Failed to send message:", e);
       addNotification(`Failed to send message: ${e}`, "error");
-    }
-  }
-
-  function handleKeydown(e: KeyboardEvent) {
-    if (e.key === "Enter" && !e.shiftKey) {
-      e.preventDefault();
-      sendMessage();
     }
   }
 
@@ -470,9 +591,9 @@
 
 <!-- Any click elsewhere closes the header's pop-ups; Escape closes them too -->
 <svelte:window
-  onclick={() => { if (showEmojiPicker) showEmojiPicker = false; showClearMenu = false; showTtlPicker = false; }}
+  onclick={() => { showClearMenu = false; showTtlPicker = false; }}
   onkeydown={(e) => {
-    if (showEmojiPicker) handleEmojiKeydown(e);
+    onWindowKeydown(e);
     if (e.key === "Escape" && (showClearMenu || showTtlPicker)) {
       showClearMenu = false;
       showTtlPicker = false;
@@ -480,37 +601,7 @@
   }}
 />
 
-<!-- One picker for both forms: the direct message one and the channel one -->
-{#snippet emojiPicker()}
-  <div class="emoji-wrapper">
-    <button class="emoji-btn" type="button" onclick={(e) => { e.stopPropagation(); toggleEmojiPicker(); }} title="Emoji">
-      <Icon name="smile" size={20} />
-    </button>
-    {#if showEmojiPicker}
-      <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div class="emoji-picker" onkeydown={handleEmojiKeydown} onclick={(e) => e.stopPropagation()}>
-        <div class="emoji-tabs">
-          {#each EMOJI_CATEGORIES as cat, idx}
-            <button
-              class="emoji-tab"
-              class:active={emojiCategory === idx}
-              type="button"
-              onclick={() => (emojiCategory = idx)}
-              title={cat.label}
-            >{cat.emojis[0]}</button>
-          {/each}
-        </div>
-        <div class="emoji-grid">
-          {#each EMOJI_CATEGORIES[emojiCategory].emojis as emoji}
-            <button class="emoji-item" type="button" onclick={() => insertEmoji(emoji)}>{emoji}</button>
-          {/each}
-        </div>
-      </div>
-    {/if}
-  </div>
-{/snippet}
-
-<div class="chat-panel">
+<div class="chat-panel" bind:this={panelEl}>
   <div class="chat-header" class:custom={headerExtra}>
     {#if isDmMode}
       <button aria-label="Back to channel chat" class="back-btn" onclick={backToChannel} title="Back to channel chat"><Icon name="arrow-left" size={16} /></button>
@@ -587,6 +678,15 @@
         </div>
       {/if}
     {/if}
+    {#if !isLobby}
+      <button
+        class="clear-chat-btn search-btn"
+        onclick={() => (searching = !searching)}
+        title="Search messages (Ctrl+F)"
+        aria-label="Search messages"
+        aria-expanded={searching}
+      ><Icon name="search" size={16} /></button>
+    {/if}
     {#if displayMessages.length > 0 && !isLobby}
       <button
         class="clear-chat-btn"
@@ -616,6 +716,8 @@
     {/if}
   </div>
 
+  <div class="chat-body">
+  <div class="chat-main">
   <div class="messages" bind:this={messagesContainer} onscroll={onMessagesScroll}>
     {#if !isDmMode && isLobby}
       <div class="empty-state">Open a text channel to chat</div>
@@ -638,47 +740,22 @@
         {/if}
       </div>
     {:else}
-      <!-- Keyed by the message object, which the stores carry over from one
-           update to the next. The index used to be in the key, so once a
-           conversation was full every new message shifted every key and
-           rebuilt all 500 rows; the ids a sender mints are not unique enough
-           on their own — a peer can repeat one, and a duplicate key throws. -->
-      {#each displayMessages as msg, i (msg)}
-        {#if msg.kind === "history-marker" || msg.kind === "notice"}
-          <div class="history-marker"><span>{msg.content}</span></div>
-        {:else}
-          {#if startsDay(i)}
-            <div class="day-divider" role="separator"><span>{dayLabel(msg.timestamp)}</span></div>
-          {/if}
-          {#if shouldShowHeader(i)}
-            <div class="msg-header">
-              <span class="msg-username" class:self={msg.user_id === $userId} title={msg.username}>{shortName(msg.username)}</span>
-              <time class="msg-time" datetime={new Date(msg.timestamp).toISOString()} title={fullTime(msg.timestamp)}
-                >{formatTime(msg.timestamp)}</time
-              >
-              {#if msg.kind === "shared"}
-                <span
-                  class="shared-tag"
-                  title="From a member's copy of this channel's past. Who wrote it and when is their word for it — nothing signs a message, so there is nothing to check it against."
-                >shared</span>
-              {/if}
-            </div>
-          {/if}
-          <div class="msg-content" class:shared={msg.kind === "shared"}>
-            {#if msg.kind === "undecryptable"}
-              <span class="attachment-placeholder">{msg.content}</span>
-            {:else if msg.kind && msg.kind !== "text" && msg.kind !== "shared"}
-              <span class="attachment-placeholder">[attachment — not shared]</span>
-            {:else}
-              {#each splitSegments(msg.content) as seg}
-                {#if seg.url}
-                  <button class="msg-link" onclick={() => (linkPopupUrl = seg.text)} title="Copy link">{seg.text}</button>
-                {:else}{seg.text}{/if}
-              {/each}
-            {/if}
-          </div>
-        {/if}
-      {/each}
+      <MessageList
+        bind:this={mainList}
+        messages={view.main}
+        all={displayMessages}
+        threads={view.threads}
+        orphans={view.orphans}
+        onlink={(url) => (linkPopupUrl = url)}
+        onreply={canAnswer ? replyTo : undefined}
+        onthread={canAnswer ? (m) => openThreadOn(m, true) : undefined}
+        onopenthread={(m) => openThreadOn(m)}
+        threadSeen={(root) => (root.id ? threadSeen.get(root.id) : undefined) ?? 0}
+        onjumpelsewhere={showElsewhere}
+        names={mentionNames}
+        me={myNames}
+        {newSince}
+      />
       {#if scrolledUp}
         <button class="jump-latest" onclick={jumpToLatest}>
           <Icon name="chevron-down" size={14} /> Jump to latest
@@ -688,46 +765,30 @@
   </div>
 
   {#if isDmMode}
-    <form class="input-bar" onsubmit={(e) => { e.preventDefault(); sendMessage(); }}>
-      <input
-        class="chat-input"
-        type="text"
-        placeholder={`Message ${shortName($activeDmUsername)}...`}
-        bind:value={messageInput}
-        bind:this={chatInputEl}
-        onkeydown={handleKeydown}
-        maxlength="2000"
-      />
-      {@render emojiPicker()}
-      <button class="send-btn" type="submit" disabled={!messageInput.trim()}>Send</button>
-    </form>
+    <Composer
+      bind:this={composer}
+      placeholder={`Message ${shortName($activeDmUsername)}...`}
+      mentionables={mentionOthers}
+      conversation={`${$serverAddress}|dm|${$activeDmUserId}`}
+      onsend={sendMessage}
+      replying={replyingTo?.username ?? null}
+      oncancelreply={() => (replyingTo = null)}
+    />
   {:else if canSendChannelMessage && block?.kind === "announce"}
     <div class="preview-footer post-block">
       <Icon name="megaphone" size={14} /> Only moderators can post in #{channelName}
     </div>
   {:else if canSendChannelMessage}
-    <form class="input-bar" onsubmit={(e) => { e.preventDefault(); sendMessage(); }}>
-      <input
-        class="chat-input"
-        type="text"
-        placeholder={`Message ${channelLabel}…`}
-        bind:value={messageInput}
-        bind:this={chatInputEl}
-        onkeydown={handleKeydown}
-        maxlength="2000"
-      />
-      {@render emojiPicker()}
-      {#if block?.kind === "slow"}
-        <button
-          class="send-btn"
-          type="submit"
-          disabled
-          title="Slow mode: one message every {slowModeLabel(slowModeSecs)}"
-        >{slowModeLabel(block.remainingSecs)}</button>
-      {:else}
-        <button class="send-btn" type="submit" disabled={!messageInput.trim()}>Send</button>
-      {/if}
-    </form>
+    <Composer
+      bind:this={composer}
+      placeholder={`Message ${channelLabel}…`}
+      mentionables={mentionOthers}
+      conversation={`${$serverAddress}|${$displayChannelId}`}
+      {held}
+      onsend={sendMessage}
+      replying={replyingTo?.username ?? null}
+      oncancelreply={() => (replyingTo = null)}
+    />
   {:else if effectiveChannel?.text}
     <div class="preview-footer">
       <button class="join-text-btn" onclick={() => joinTextChannel(effectiveChannel!)}>
@@ -750,6 +811,32 @@
       >Join {channelName} to talk and chat</button>
     </div>
   {/if}
+  </div>
+  {#if searching}
+    <SearchPane
+      here={displayMessages}
+      {everywhere}
+      labelOf={convLabel}
+      onpick={pickResult}
+      onclose={() => (searching = false)}
+    />
+  {:else if openThread}
+    <ThreadPane
+      root={openThread.root}
+      focusComposer={threadWrite}
+      answers={openThread.answers}
+      all={displayMessages}
+      {held}
+      onsend={canAnswer ? sendMessage : undefined}
+      onlink={(url) => (linkPopupUrl = url)}
+      onclose={() => (threadRoot = null)}
+      onjumpelsewhere={showInMain}
+      names={mentionNames}
+      me={myNames}
+      mentionables={mentionOthers}
+    />
+  {/if}
+  </div>
 </div>
 
 {#if linkPopupUrl !== null}
@@ -782,42 +869,6 @@
     height: 100%;
     flex: 1;
     min-width: 0;
-  }
-
-  .history-marker {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin: 10px 0;
-    font-size: var(--fs-micro);
-    color: var(--text-secondary);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
-  }
-
-  .history-marker::before,
-  .history-marker::after {
-    content: "";
-    flex: 1;
-    border-top: 1px solid var(--border);
-  }
-
-  .attachment-placeholder {
-    color: var(--text-secondary);
-    font-style: italic;
-  }
-
-  /* Second-hand: a member's copy of what was said before we arrived. Drawn in
-     the divider's own language — the divider is what introduces it — so it
-     reads as a quieter kind of message rather than a broken one. */
-  .shared-tag {
-    font-size: var(--fs-micro);
-    color: var(--text-secondary);
-    border: 1px solid var(--border);
-    padding: 1px 5px;
-    border-radius: 3px;
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
   }
 
   .ttl-label {
@@ -986,27 +1037,44 @@
     font-weight: 600;
   }
 
+  /* The conversation, and beside it (or over it, where there is no room) an
+     open thread */
+  .chat-body {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    position: relative;
+    container-type: inline-size;
+  }
+
+  .chat-main {
+    flex: 1;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .chat-body > :global(.thread-pane),
+  .chat-body > :global(.search-pane) {
+    width: min(380px, 45%);
+    border-left: 1px solid var(--border);
+  }
+
+  @container (max-width: 700px) {
+    .chat-body > :global(.thread-pane),
+    .chat-body > :global(.search-pane) {
+      position: absolute;
+      inset: 0;
+      width: auto;
+      border-left: none;
+      z-index: var(--z-pane);
+    }
+  }
+
   .messages {
     flex: 1;
     overflow-y: auto;
     padding: 8px 16px;
-  }
-
-  .day-divider {
-    display: flex;
-    align-items: center;
-    gap: 12px;
-    margin: 16px 0 8px;
-    font-size: var(--fs-sm);
-    font-weight: 600;
-    color: var(--text-muted);
-  }
-
-  .day-divider::before,
-  .day-divider::after {
-    content: "";
-    flex: 1;
-    border-top: 1px solid var(--border);
   }
 
   /* Rides the bottom of the list while you read further up */
@@ -1037,57 +1105,6 @@
     text-align: center;
     padding: 32px 16px;
     font-style: italic;
-  }
-
-  .msg-header {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    margin-top: var(--msg-gap, 8px);
-    margin-bottom: 2px;
-  }
-
-  .msg-username {
-    font-size: var(--chat-font-size, 13px);
-    font-weight: 600;
-    color: var(--text-primary);
-  }
-
-  .msg-username.self {
-    color: var(--text-primary);
-  }
-
-  .msg-time {
-    font-size: var(--fs-micro);
-    color: var(--text-secondary);
-  }
-
-  .msg-content {
-    font-size: var(--chat-font-size, 13px);
-    color: var(--text-primary);
-    padding-left: 0;
-    line-height: 1.4;
-    word-break: break-word;
-  }
-
-  .msg-content.shared {
-    color: var(--text-secondary);
-  }
-
-  .msg-link {
-    background: none;
-    border: none;
-    padding: 0;
-    font-size: var(--chat-font-size, 13px);
-    line-height: 1.4;
-    color: var(--text-primary);
-    text-decoration: underline;
-    cursor: pointer;
-    word-break: break-all;
-  }
-
-  .msg-link:hover {
-    color: var(--accent-hover);
   }
 
   .link-overlay {
@@ -1154,55 +1171,6 @@
     border-radius: 4px;
   }
 
-  .input-bar {
-    display: flex;
-    gap: 8px;
-    padding: 8px 12px;
-    border-top: 1px solid var(--border);
-  }
-
-  .chat-input {
-    flex: 1;
-    /* An input's own width is ~20 characters: without this it would not
-       shrink, and at tablet width it pushed Send out over the member list */
-    min-width: 0;
-    padding: 8px 12px;
-    font-size: var(--fs-body);
-    background: var(--bg-primary);
-    color: var(--text-primary);
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    outline: none;
-  }
-
-  .chat-input:focus {
-    border-color: var(--focus-ring);
-  }
-
-  .send-btn {
-    flex-shrink: 0;
-    background: var(--accent);
-    color: var(--on-accent);
-    padding: 8px 16px;
-    font-size: var(--fs-sm);
-    border: none;
-    border-radius: 4px;
-    cursor: pointer;
-  }
-
-  .send-btn:hover:not(:disabled) {
-    opacity: 0.9;
-  }
-
-  /* Nothing to send: a quiet outline, not a half-faded primary that reads as
-     broken */
-  .send-btn:disabled {
-    background: transparent;
-    color: var(--text-muted);
-    box-shadow: inset 0 0 0 1px var(--border);
-    cursor: default;
-  }
-
   .preview-label {
     font-size: var(--fs-micro);
     color: var(--text-muted);
@@ -1248,104 +1216,5 @@
     border-radius: 4px;
     font-size: var(--fs-sm);
     font-style: normal;
-  }
-
-  .emoji-wrapper {
-    position: relative;
-    display: flex;
-    align-items: center;
-  }
-
-  .emoji-btn {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 34px;
-    height: 34px;
-    padding: 0;
-    background: transparent;
-    color: var(--text-secondary);
-    border: none;
-    border-radius: 4px;
-    cursor: pointer;
-  }
-
-  .emoji-btn:hover {
-    color: var(--text-primary);
-    background: var(--bg-hover);
-  }
-
-  .emoji-picker {
-    position: absolute;
-    bottom: calc(100% + 8px);
-    right: 0;
-    width: 320px;
-    max-height: 340px;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border);
-    border-radius: 8px;
-    box-shadow: var(--shadow-menu);
-    display: flex;
-    flex-direction: column;
-    z-index: var(--z-popover);
-  }
-
-  .emoji-tabs {
-    display: flex;
-    gap: 2px;
-    padding: 6px 6px 4px;
-    border-bottom: 1px solid var(--border);
-  }
-
-  .emoji-tab {
-    flex: 1;
-    padding: 4px 0;
-    font-size: var(--fs-lg);
-    background: transparent;
-    border: none;
-    border-radius: 4px;
-    cursor: pointer;
-    opacity: 0.5;
-    transition: opacity var(--dur-fast);
-    line-height: 1;
-  }
-
-  .emoji-tab:hover {
-    opacity: 0.8;
-    background: var(--bg-hover);
-  }
-
-  .emoji-tab.active {
-    opacity: 1;
-    background: var(--bg-tertiary);
-  }
-
-  .emoji-grid {
-    display: grid;
-    grid-template-columns: repeat(8, 1fr);
-    gap: 2px;
-    padding: 6px;
-    overflow-y: auto;
-    flex: 1;
-  }
-
-  .emoji-item {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 36px;
-    height: 36px;
-    font-size: var(--fs-2xl);
-    background: transparent;
-    border: none;
-    border-radius: 4px;
-    cursor: pointer;
-    line-height: 1;
-    padding: 0;
-  }
-
-  .emoji-item:hover {
-    background: var(--bg-hover);
-    transform: scale(1.15);
   }
 </style>

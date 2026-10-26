@@ -18,6 +18,9 @@ import {
   hasExpired,
   soonerExpiry,
   sanitizeHistory,
+  messageRefs,
+  toArchived,
+  fromArchived,
 } from "./chat-rules.ts";
 import type { ChatMessage } from "./types.ts";
 
@@ -147,6 +150,37 @@ test("a peer cannot put anything it likes into our archive", () => {
   assert.equal(cleaned[0].kind, "shared", 'a claim of "text" is still second-hand');
   assert.equal(cleaned[1].kind, "shared", "and so is a claim of anything else");
   assert.equal(cleaned[1].id?.length, 64);
+});
+
+test("what a shared message answers comes along, bounded like an id", () => {
+  const [kept] = sanitizeHistory([
+    { user_id: 1, username: "ann", content: "agreed", timestamp: T, id: "b", reply_to: "a", thread: "z".repeat(200) },
+  ]);
+  assert.equal(kept.reply_to, "a");
+  assert.equal(kept.thread?.length, 64);
+  const [plain] = sanitizeHistory([{ user_id: 1, username: "ann", content: "hi", timestamp: T, reply_to: "", thread: 7 }]);
+  assert.ok(!("reply_to" in plain) && !("thread" in plain), "nothing claimed, nothing kept");
+});
+
+test("a live message's refs are kept only where there are some", () => {
+  assert.deepEqual(messageRefs({ reply_to: "a", thread: null }), { reply_to: "a" });
+  assert.deepEqual(messageRefs({}), {});
+  assert.deepEqual(messageRefs({ reply_to: 5, thread: ["x"] }), {});
+});
+
+test("the archive keeps newer fields in extra and gives them back", () => {
+  const reply = msg({ timestamp: T, id: "b", reply_to: "a", thread: "a" });
+  const stored = toArchived(reply);
+  assert.equal(stored.extra, JSON.stringify({ reply_to: "a", thread: "a" }));
+  assert.ok(!("reply_to" in stored), "folded in, not written twice");
+  assert.deepEqual(fromArchived(stored), reply);
+  const plain = msg({ timestamp: T, id: "c" });
+  assert.ok(!("extra" in toArchived(plain)), "a plain message stays a plain one");
+  // serde's nulls, and an extra that is not ours to trust blindly
+  const back = fromArchived({ ...plain, kind: null as unknown as undefined, extra: '{"reply_to":"' + "x".repeat(99) + '"}' });
+  assert.equal(back.reply_to?.length, 64);
+  assert.ok(!("kind" in back));
+  assert.deepEqual(fromArchived({ ...plain, extra: "{not json" }), plain, "a damaged extra loses only itself");
 });
 
 test("history that is not a list offers nothing instead of throwing", () => {

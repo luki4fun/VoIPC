@@ -91,7 +91,9 @@ storage, the accounts database, the kept-message log and its crypto labels.
 **1.x keeps:**
 - Every 1.x opens everything any earlier 1.x, and 0.12, wrote.
 - An upgrade moves data forward and never loses any. The desktop history keeps a one-time
-  `chat_history.bin.v4` copy the first time 1.0 rewrites a 0.12 file.
+  copy of the older file, named after its format, the first time a newer version opens it:
+  `chat_history.bin.v4` when 1.0 opens a 0.12 file, `chat_history.bin.v5` when 1.2 opens a
+  1.0 or 1.1 one.
 - Shipped database migrations are append-only and never edited.
 - The crypto labels are frozen: `voipc-vault-item/v1|`, `voipc-log/v1|`, `voipc-wrap/v1|`,
   `voipc-channel/v1|`, the HKDF infos and the AADs. A new scheme gets a new label beside the
@@ -116,6 +118,8 @@ A downgrade is not supported, but it is safe: nothing is destroyed.
   - `crates/voipc-crypto/tests/fixtures/0.12.0/`: vault, log key, kept entry, safety number, log
     memory;
   - `client/src-tauri/tests/fixtures/0.12.0/`: chat history, settings, pins;
+  - `client/src-tauri/tests/fixtures/1.1.0/`: chat history (archive v5, the format 1.0 and 1.1
+    write);
   - `crates/voipc-server/tests/fixtures/0.12.0/`: the accounts database, which is opened,
     migrated and signed into, and the kept DM read;
   - `client/src/lib/__fixtures__/0.12.0/`: browser settings, checked by `test-ui.mjs`

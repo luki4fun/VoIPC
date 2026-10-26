@@ -128,7 +128,7 @@ impl Event {
         use voipc_protocol::conv::hex;
         let opened = |envelope: &[u8], sent_at: u64, server_at: u64| {
             let m = crate::envelope::open_envelope(envelope);
-            (m.id, m.text, m.ttl_secs, sent_at.min(server_at))
+            (m.id, m.text, m.ttl_secs, sent_at.min(server_at), m.extras)
         };
         // A tombstone: its writer's copies up to `before` go, wherever this
         // device keeps them. Never later than the relay filed it.
@@ -182,10 +182,11 @@ impl Event {
                 server_at,
                 seq,
             } => {
-                let (id, text, ttl, at) = opened(envelope, *sent_at, *server_at);
+                let (id, text, ttl, at, extras) = opened(envelope, *sent_at, *server_at);
                 let payload = serde_json::json!({
                     "conv": conv, "seq": seq, "peer_account": hex(peer), "peer_name": peer_name, "from_me": from_me,
                     "message_id": id, "content": text, "ttl_secs": ttl, "timestamp": at,
+                    "reply_to": extras.reply, "thread": extras.thread,
                 });
                 ("stored-dm", payload)
             }
@@ -199,10 +200,11 @@ impl Event {
                 server_at,
                 seq,
             } => {
-                let (id, text, ttl, at) = opened(envelope, *sent_at, *server_at);
+                let (id, text, ttl, at, extras) = opened(envelope, *sent_at, *server_at);
                 let payload = serde_json::json!({
                     "conv": conv, "seq": seq, "sender_account": hex(sender), "sender_name": sender_name, "from_me": from_me,
                     "message_id": id, "content": text, "ttl_secs": ttl, "timestamp": at,
+                    "reply_to": extras.reply, "thread": extras.thread,
                 });
                 ("stored-channel-message", payload)
             }
@@ -1418,6 +1420,43 @@ mod tests {
     use voipc_protocol::messages::WrapOut;
 
     const RELAY: [u8; 16] = [9; 16];
+
+    /// A stored reply reaches the front end as one: the cloud log is the
+    /// third way in, next to the live message and the history hand-off.
+    #[test]
+    fn a_stored_message_keeps_what_it_answers() {
+        let extras = crate::envelope::Extras {
+            reply: Some("r1".into()),
+            thread: Some("t1".into()),
+        };
+        let stored = Event::ChannelMessage {
+            conv: "c:1".into(),
+            sender: [1; 16],
+            sender_name: "ann".into(),
+            from_me: false,
+            envelope: crate::envelope::envelope_with("m1", "agreed", None, &extras),
+            sent_at: 10,
+            server_at: 20,
+            seq: 1,
+        };
+        let (name, payload) = stored.to_wire().unwrap();
+        assert_eq!(name, "stored-channel-message");
+        assert_eq!(
+            (payload["reply_to"].as_str(), payload["thread"].as_str()),
+            (Some("r1"), Some("t1"))
+        );
+        let plain = Event::Message {
+            conv: "d:1".into(),
+            peer: [1; 16],
+            peer_name: "ann".into(),
+            from_me: true,
+            envelope: envelope("m2", "hi", None),
+            sent_at: 10,
+            server_at: 20,
+            seq: 2,
+        };
+        assert!(plain.to_wire().unwrap().1["reply_to"].is_null());
+    }
 
     struct Account {
         id: [u8; 16],

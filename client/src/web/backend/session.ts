@@ -10,7 +10,7 @@
 
 import { emit as emitEvent } from "./events";
 import { getConfig } from "./config";
-import { loadWasm, wasm, type MediaKeys, type PreKeyBundleData, type SignalClient } from "./wasm";
+import { loadWasm, wasm, type MediaKeys, type MessageRefs, type PreKeyBundleData, type SignalClient } from "./wasm";
 import { AccountDriver, type AccountArgs, type AccountHost } from "./account";
 import { connect as openTransport, type Transport } from "./transport";
 import type { SessionContext } from "./types";
@@ -48,6 +48,8 @@ interface PendingMessage {
    * while their message sat here must not silently rewrite it.
    */
   ttlSecs?: number;
+  /** What it answers and the thread it belongs to; kept for the same reason. */
+  refs?: MessageRefs;
   queuedAt: number;
 }
 
@@ -1271,14 +1273,14 @@ export class Session implements SessionContext, AccountHost {
   private takePending(
     matches: (t: PendingTarget) => boolean,
     undelivered: [string, Record<string, number>],
-  ): { id: string; content: string; ttlSecs?: number }[] {
+  ): { id: string; content: string; ttlSecs?: number; refs?: MessageRefs }[] {
     const now = Date.now();
-    const send: { id: string; content: string; ttlSecs?: number }[] = [];
+    const send: { id: string; content: string; ttlSecs?: number; refs?: MessageRefs }[] = [];
     const remaining: PendingMessage[] = [];
     let expired = 0;
     for (const m of this.pendingMessages) {
       if (!matches(m.target)) remaining.push(m);
-      else if (now - m.queuedAt < PENDING_MESSAGE_TTL_MS) send.push({ id: m.id, content: m.content, ttlSecs: m.ttlSecs });
+      else if (now - m.queuedAt < PENDING_MESSAGE_TTL_MS) send.push({ id: m.id, content: m.content, ttlSecs: m.ttlSecs, refs: m.refs });
       else expired++;
     }
     if (expired > 0) {
@@ -1290,14 +1292,14 @@ export class Session implements SessionContext, AccountHost {
   }
 
   private drainPendingDms(targetUserId: number): void {
-    for (const { id, content, ttlSecs } of this.takePending((t) => t.kind === "direct" && t.targetUserId === targetUserId, [
+    for (const { id, content, ttlSecs, refs } of this.takePending((t) => t.kind === "direct" && t.targetUserId === targetUserId, [
       "dm-undelivered",
       { user_id: targetUserId },
     ])) {
       try {
         const { ciphertext, message_type } = this.signal.encrypt(
           targetUserId,
-          wasm().envelope(id, content, ttlSecs),
+          wasm().envelope(id, content, ttlSecs, refs),
         );
         this.sendControl({ SendEncryptedDirectMessage: { target_user_id: targetUserId, ciphertext, message_type } });
       } catch (e) {
@@ -1317,12 +1319,12 @@ export class Session implements SessionContext, AccountHost {
     // leaver can still read along it. Sending is what costs a rotation, and
     // this is a send (network.rs drain_pending_channel_messages).
     this.rotateSenderKeyIfStale(channelId);
-    for (const { id, content, ttlSecs } of pending) {
+    for (const { id, content, ttlSecs, refs } of pending) {
       try {
         const ciphertext = this.signal.groupEncrypt(
           this.userId,
           channelId,
-          wasm().envelope(id, content, ttlSecs),
+          wasm().envelope(id, content, ttlSecs, refs),
         );
         this.sendControl({ SendEncryptedChannelMessage: { channel_id: channelId, ciphertext } });
       } catch (e) {
@@ -1348,8 +1350,8 @@ export class Session implements SessionContext, AccountHost {
       if (messageType === 1) this.markEstablished(fromUserId);
       // A DM carries the same envelope a channel message does since 0.9.0;
       // anything else reads as the text itself.
-      const { id, text, ttl_secs } = wasm().openEnvelope(plaintext);
-      this.emit("direct-chat-message", { ...event, content: text, message_id: id, ttl_secs });
+      const { id, text, ttl_secs, reply_to, thread } = wasm().openEnvelope(plaintext);
+      this.emit("direct-chat-message", { ...event, content: text, message_id: id, ttl_secs, reply_to, thread });
     } catch (e) {
       console.warn(`failed to decrypt direct message from ${fromUserId}:`, e);
       this.emit("direct-chat-message", {
@@ -1380,10 +1382,10 @@ export class Session implements SessionContext, AccountHost {
     }
     try {
       const plaintext = this.signal.groupDecrypt(userId, channelId, ciphertext);
-      const { id, text, ttl_secs } = wasm().openEnvelope(plaintext);
+      const { id, text, ttl_secs, reply_to, thread } = wasm().openEnvelope(plaintext);
       // What the sender says this message's life is; the store takes the
       // shorter of it and the channel's own timer (expiryFor, chat-rules.ts).
-      this.emit("channel-chat-message", { ...event, content: text, message_id: id, ttl_secs });
+      this.emit("channel-chat-message", { ...event, content: text, message_id: id, ttl_secs, reply_to, thread });
     } catch (e) {
       console.warn(`failed to decrypt channel message from ${userId}:`, e);
       this.emit("channel-chat-message", {
@@ -1501,15 +1503,15 @@ export class Session implements SessionContext, AccountHost {
 
   /** A direct message for an account that is away (hex id): kept in the
    *  stored log only, which is the one way it reaches them. Returns its id. */
-  sendKeptDm(accountHex: string, content: string, ttlSecs?: number): string {
+  sendKeptDm(accountHex: string, content: string, ttlSecs?: number, refs?: MessageRefs): string {
     if (!this.account) throw new Error("Not signed in to an account on that server");
     const messageId = wasm().newMessageId();
-    this.account.keptDm(this, accountHex, wasm().envelope(messageId, content, ttlSecs), ttlSecs);
+    this.account.keptDm(this, accountHex, wasm().envelope(messageId, content, ttlSecs, refs), ttlSecs);
     return messageId;
   }
 
   /** Sender-key encrypted channel message; queued until a sender key was distributed. */
-  sendChannelMessage(content: string, channelId = this.channelId, ttlSecs?: number): void {
+  sendChannelMessage(content: string, channelId = this.channelId, ttlSecs?: number, refs?: MessageRefs): void {
     if (channelId === 0) throw new Error("Chat is not available in the lobby");
 
     this.rotateSenderKeyIfStale(channelId);
@@ -1520,14 +1522,14 @@ export class Session implements SessionContext, AccountHost {
     // A channel with a log keeps it for its members too (cloud copies on),
     // whether or not anybody is here to read it now.
     const log = this.channels.find((c) => c.channel_id === channelId)?.log;
-    if (log) this.account?.outgoingChannel(this, log, wasm().envelope(messageId, content, ttlSecs), ttlSecs);
+    if (log) this.account?.outgoingChannel(this, log, wasm().envelope(messageId, content, ttlSecs, refs), ttlSecs);
     let ciphertext: Uint8Array | null = null;
     if (this.signal.anyoneHoldsOurKey(channelId)) {
       try {
         ciphertext = this.signal.groupEncrypt(
           this.userId,
           channelId,
-          wasm().envelope(messageId, content, ttlSecs),
+          wasm().envelope(messageId, content, ttlSecs, refs),
         );
       } catch (e) {
         console.info("group encryption not ready, queueing message:", e);
@@ -1541,6 +1543,8 @@ export class Session implements SessionContext, AccountHost {
       timestamp: Date.now(),
       message_id: messageId,
       ttl_secs: ttlSecs ?? null,
+      reply_to: refs?.replyTo ?? null,
+      thread: refs?.thread ?? null,
     };
     if (ciphertext) {
       this.sendControl({ SendEncryptedChannelMessage: { channel_id: channelId, ciphertext } });
@@ -1548,7 +1552,7 @@ export class Session implements SessionContext, AccountHost {
       this.emit("channel-chat-message", { ...event, encrypted: true });
     } else {
       // Sent once sender key distribution completes; shown immediately as pending
-      this.pendingMessages.push({ target: { kind: "channel", channelId }, id: messageId, content, ttlSecs, queuedAt: Date.now() });
+      this.pendingMessages.push({ target: { kind: "channel", channelId }, id: messageId, content, ttlSecs, refs, queuedAt: Date.now() });
       this.emit("channel-chat-message", { ...event, pending: true });
     }
   }
@@ -1571,18 +1575,18 @@ export class Session implements SessionContext, AccountHost {
   }
 
   /** Pairwise-encrypted DM; queued until the Signal session exists. */
-  sendDirectMessage(targetUserId: number, content: string, ttlSecs?: number): void {
+  sendDirectMessage(targetUserId: number, content: string, ttlSecs?: number, refs?: MessageRefs): void {
     // The same envelope a channel message uses since 0.9.0: a DM had nowhere to
     // put a destruction timer while it was raw text, and this also gives it the
     // id it never had. `openEnvelope` reads plain text as text, so a peer that
     // sends the old shape still arrives.
     const messageId = wasm().newMessageId();
     // Between two accounts, and with cloud copies on, it is kept for them too.
-    this.account?.outgoingDm(this, targetUserId, wasm().envelope(messageId, content, ttlSecs), ttlSecs);
+    this.account?.outgoingDm(this, targetUserId, wasm().envelope(messageId, content, ttlSecs, refs), ttlSecs);
     let encrypted: { ciphertext: Uint8Array; message_type: number } | null = null;
     if (this.establishedSessions.has(targetUserId)) {
       try {
-        encrypted = this.signal.encrypt(targetUserId, wasm().envelope(messageId, content, ttlSecs));
+        encrypted = this.signal.encrypt(targetUserId, wasm().envelope(messageId, content, ttlSecs, refs));
       } catch (e) {
         console.info("pairwise encryption not ready, queueing DM:", e);
       }
@@ -1595,6 +1599,8 @@ export class Session implements SessionContext, AccountHost {
       timestamp: Date.now(),
       message_id: messageId,
       ttl_secs: ttlSecs ?? null,
+      reply_to: refs?.replyTo ?? null,
+      thread: refs?.thread ?? null,
     };
     if (encrypted) {
       this.sendControl({
@@ -1607,7 +1613,7 @@ export class Session implements SessionContext, AccountHost {
       // The server echo cannot be decrypted by the sender (ratchet advanced): show it locally
       this.emit("direct-chat-message", { ...event, encrypted: true });
     } else {
-      this.pendingMessages.push({ target: { kind: "direct", targetUserId }, id: messageId, content, ttlSecs, queuedAt: Date.now() });
+      this.pendingMessages.push({ target: { kind: "direct", targetUserId }, id: messageId, content, ttlSecs, refs, queuedAt: Date.now() });
       this.emit("direct-chat-message", { ...event, pending: true });
     }
   }

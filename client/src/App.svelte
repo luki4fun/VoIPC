@@ -26,6 +26,7 @@
     connectionState,
     serverAddress,
     userId,
+    username,
     latency,
     viaTcp,
     isMuted,
@@ -63,6 +64,8 @@
     dmConversations,
     incrementChannelUnread,
     clearChannelUnread,
+    markRead,
+    dmKey,
     chatKey,
     chatUnlocked,
     channelMessages,
@@ -141,7 +144,7 @@
     dmMessageTtl,
     isTextChannel,
   } from "./lib/stores/channel-ui.js";
-  import { expiryFor, HISTORY_MAX_MESSAGES, MAX_CONVERSATIONS } from "./lib/chat-rules.js";
+  import { expiryFor, HISTORY_MAX_MESSAGES, MAX_CONVERSATIONS, messageRefs } from "./lib/chat-rules.js";
   import { LAYOUT_PICKER_VERSION } from "./lib/ui-prefs.js";
   import { voiceMode, vadThreshold } from "./lib/stores/voice.js";
   import {
@@ -166,6 +169,8 @@
   } from "./lib/stores/room.js";
   import { upsertById } from "./lib/stores/upsert.js";
   import { shortName } from "./lib/username.js";
+  import { mentionsName, parse, plainText } from "./lib/markdown.js";
+  import { findTarget } from "./lib/thread-rules.js";
   import { cleanLane, micLane } from "./lib/stores/mixer.js";
   import {
     addScreenShare,
@@ -382,6 +387,23 @@
   // the desktop. The unread counts still say what arrived.
   let lastNotifyAt = -Infinity;
 
+  /** Our own account on `server` (hex), which names what we wrote across connects. */
+  function ownAccount(server: string): string | undefined {
+    const own = get(account.peek(server));
+    return own ? accountHex(own.info.id) : undefined;
+  }
+
+  /** Whether `content` names us with an `@`. Never in an anonymous channel, where names are pseudonyms. */
+  function mentionsUs(server: string, channelId: number, content: string): boolean {
+    if (!content.includes("@")) return false;
+    if (get(channels.peek(server)).find((c) => c.channel_id === channelId)?.anonymous) return false;
+    const own = get(username.peek(server));
+    if (!own) return false;
+    const names = [...new Set([own, shortName(own)])];
+    const tree = parse(content, { names });
+    return names.some((n) => mentionsName(tree, n));
+  }
+
   async function notifyUnfocused(title: string, body: string) {
     if (document.hasFocus()) return;
     const now = performance.now();
@@ -481,11 +503,13 @@
       // Back on a server whose DM was left open: what arrived there meanwhile
       // counted as unread (chat.ts addDmMessage), and it is on screen now.
       const peer = $activeDmUserId;
-      dmConversations.of($serverAddress).update((cs) =>
-        cs.some((c) => c.user_id === peer && c.unread > 0)
-          ? cs.map((c) => (c.user_id === peer ? { ...c, unread: 0 } : c))
-          : cs,
-      );
+      const server = $serverAddress;
+      dmConversations.of(server).update((cs) => {
+        const read = cs.find((c) => c.user_id === peer && c.unread > 0);
+        if (!read) return cs;
+        markRead(dmKey(server, read.username));
+        return cs.map((c) => (c === read ? { ...c, unread: 0 } : c));
+      });
     }
   });
 
@@ -1307,6 +1331,8 @@
         timestamp: number;
         message_id?: string | null;
         ttl_secs?: number | null;
+        reply_to?: string | null;
+        thread?: string | null;
         decryption_failed?: boolean;
       }>("channel-chat-message", (server, data) => {
         const { channel_id, user_id: uid, username, content, timestamp, message_id } = data;
@@ -1339,10 +1365,27 @@
             // join spreads one member's missing key to everybody after them.
             kind: data.decryption_failed ? "undecryptable" : undefined,
             account: writer ? accountHex(writer) : undefined,
+            ...messageRefs(data),
           });
           if (added && !viewingChannel(server, channel_id)) {
-            incrementChannelUnread(server, chName);
+            incrementChannelUnread(server, chName, timestamp);
             if (uid !== self) playChannelMessageSound();
+          }
+          // An answer to something we wrote, or our name after an @, reaches
+          // us like a direct message does
+          if (added && uid !== self) {
+            const target = data.reply_to
+              ? findTarget(get(channelMessages).get(chatKey(server, chName)) ?? [], data.reply_to)
+              : undefined;
+            const me = ownAccount(server);
+            const answered = !!target && (target.user_id === self || (me !== undefined && target.account === me));
+            const named = !answered && mentionsUs(server, channel_id, content);
+            if (answered || named) {
+              notifyUnfocused(
+                `${fromServer(server)}${shortName(uname)} ${answered ? "replied to you" : "mentioned you"}`,
+                plainText(content).slice(0, 140),
+              );
+            }
           }
         }
       }),
@@ -1358,6 +1401,8 @@
         content: string;
         ttl_secs: number | null;
         timestamp: number;
+        reply_to?: string | null;
+        thread?: string | null;
       }>("stored-channel-message", (server, m) => {
         const ch = get(channels.peek(server)).find((c) => c.log === m.conv);
         if (!ch) return;
@@ -1371,8 +1416,9 @@
           id: m.message_id ?? undefined,
           account: m.sender_account,
           expires_at: expiryFor(m.timestamp, m.ttl_secs, channelMessageTtl(server, ch.channel_id)),
+          ...messageRefs(m),
         });
-        if (added && !m.from_me && !viewingChannel(server, ch.channel_id)) incrementChannelUnread(server, ch.name);
+        if (added && !m.from_me && !viewingChannel(server, ch.channel_id)) incrementChannelUnread(server, ch.name, m.timestamp);
       }),
 
       // Who can read what we write in a channel's stored log, said where it
@@ -1400,6 +1446,8 @@
         timestamp: number;
         message_id?: string | null;
         ttl_secs?: number | null;
+        reply_to?: string | null;
+        thread?: string | null;
       }>("direct-chat-message", (server, data) => {
         const { from_user_id, to_user_id, content, timestamp } = data;
         const myId = get(userId.peek(server));
@@ -1423,10 +1471,11 @@
           id: data.message_id ?? undefined,
           expires_at,
           account: sender ? accountHex(sender) : undefined,
+          ...messageRefs(data),
         });
         if (from_user_id !== myId) {
           playDirectMessageSound();
-          notifyUnfocused(`${fromServer(server)}${shortName(from_username)}`, content.slice(0, 140));
+          notifyUnfocused(`${fromServer(server)}${shortName(from_username)}`, plainText(content).slice(0, 140));
         }
       }),
 

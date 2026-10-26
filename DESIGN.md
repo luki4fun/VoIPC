@@ -137,6 +137,8 @@ Charcoal with a little blue in it. The chat is the lighter surface (**Charcoal c
 
 **The Ink-on-Fill Rule.** Anything on a filled control takes its palette's on-colour (`--on-accent`, `--on-danger`, `--on-success`, `--on-warning`), never a hard-coded white. A palette that cannot clear 4.5:1 there does not ship.
 
+**The Code Colours Rule.** Code in a message is coloured from five palette tokens (`--code-keyword`, `--code-string`, `--code-comment`, `--code-number`, `--code-fn`) on `--bg-tertiary`, each at 4.5:1 or better (`theme.test.ts`). They are never the live mint and never danger red, so code never reads as live or as an error. Highlighting quotes, mentions and the jump to a message is ink too: a tint of `--text-primary`, never a colour.
+
 ## Typography
 
 One system face (`system-ui`): the desktop's own UI font on Linux and Windows, Roboto on Android. Product type, not display type — a tight rem scale (`--fs-micro` 11px through `--fs-2xl` 20px) that the whole-UI zoom scales with.
@@ -148,6 +150,7 @@ One system face (`system-ui`): the desktop's own UI font on Linux and Windows, R
 - **Body** (400, 13px; the chat itself follows the reader's chat size, 11–20px): messages, rows, descriptions.
 - **Small** (400, 12px): hints, timestamps, status.
 - **Micro** (600, 11px, uppercase, lightly tracked): sidebar group labels only.
+- **Code** (`ui-monospace, "Cascadia Mono", Consolas, monospace` at 0.92em): inline code and fenced blocks in messages. The app ships no font of its own for it.
 
 ### Named Rules
 

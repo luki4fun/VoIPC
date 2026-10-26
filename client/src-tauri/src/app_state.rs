@@ -313,6 +313,8 @@ pub struct PendingMessage {
     /// timer belongs to what the user wrote, and a channel whose policy changed
     /// while their message sat here must not silently rewrite it.
     pub ttl_secs: Option<u32>,
+    /// What it answers and the thread it belongs to; kept for the same reason.
+    pub extras: crate::crypto::Extras,
     /// When the message was queued (for timeout/cleanup).
     pub queued_at: std::time::Instant,
 }

@@ -34,6 +34,11 @@
   --text-muted: #8b939e;
   --scrim: rgba(0, 0, 0, 0.55);
   --focus-ring: #3ddbb0;
+  --code-keyword: #c4a7ff;
+  --code-string: #e5c07b;
+  --code-comment: #8b939e;
+  --code-number: #7fc8ff;
+  --code-fn: #ff9fcf;
 
   /* ── Scales. Not palette: these are the same in every theme. ──
      A component reaches for one of these before it writes a number. */

@@ -104,6 +104,9 @@ No accounts required. No telemetry. No compromises.
 
 **Text Chat**
 - Channel and direct messages, both end-to-end encrypted
+- Replies that jump to what they answer, and threads (opened by hand, or gathered when a message draws a conversation)
+- Markdown, with highlighted code blocks; HTML in a message is shown as text, never run
+- @mentions, a "New" line at the first unread message, and search across every conversation on the device (never sent to the relay)
 - Encrypted local chat history (password-protected, AES-256-GCM)
 - Encrypted poke notifications (like TeamSpeak pokes)
 - Configurable chat history storage location

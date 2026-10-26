@@ -125,6 +125,12 @@ export interface VideoAssembler {
   [Symbol.dispose](): void;
 }
 
+/** What a message points at: the message it answers and its thread, by id. */
+export interface MessageRefs {
+  replyTo?: string | null;
+  thread?: string | null;
+}
+
 export interface PreKeyBundleData {
   registration_id: number;
   device_id: number;
@@ -287,11 +293,16 @@ export interface WasmApi {
   controlMsgsPerSec(): number;
   /** A fresh message id: 16 random bytes, hex. */
   newMessageId(): string;
-  /** Packs a channel message so it carries an id the server never sees. */
-  /** Pack a message with its id and, where the conversation has one, its
-   * destruction timer in seconds — both inside the ciphertext. */
-  envelope(id: string, text: string, ttlSecs?: number): Uint8Array;
-  openEnvelope(plaintext: Uint8Array): { id: string | null; text: string; ttl_secs: number | null };
+  /** Pack a message with its id, its destruction timer in seconds where the
+   * conversation has one, and what it answers — all inside the ciphertext. */
+  envelope(id: string, text: string, ttlSecs?: number, refs?: MessageRefs): Uint8Array;
+  openEnvelope(plaintext: Uint8Array): {
+    id: string | null;
+    text: string;
+    ttl_secs: number | null;
+    reply_to: string | null;
+    thread: string | null;
+  };
   /**
    * Packs recent chat with the channel bound inside the ciphertext. The
    * messages travel as JSON text: a chat message has no fixed shape on this
@@ -372,7 +383,7 @@ export async function loadWasm(): Promise<WasmApi> {
     pickHistorySources: (s) => mod.pickHistorySources(s),
     controlMsgsPerSec: () => mod.controlMsgsPerSec(),
     newMessageId: () => mod.newMessageId(),
-    envelope: (id, text, ttlSecs) => mod.envelope(id, text, ttlSecs),
+    envelope: (id, text, ttlSecs, refs) => mod.envelope(id, text, ttlSecs, refs?.replyTo ?? undefined, refs?.thread ?? undefined),
     openEnvelope: (p) => mod.openEnvelope(p),
     historyPayload: (c, m) => mod.historyPayload(c, m),
     openHistoryPayload: (c, p) => mod.openHistoryPayload(c, p),

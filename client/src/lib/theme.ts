@@ -36,7 +36,12 @@ export type TokenName =
   | "--on-warning"
   | "--text-muted"
   | "--scrim"
-  | "--focus-ring";
+  | "--focus-ring"
+  | "--code-keyword"
+  | "--code-string"
+  | "--code-comment"
+  | "--code-number"
+  | "--code-fn";
 
 /** Every token a palette must define. A palette missing one is a type error. */
 export const TOKENS: readonly TokenName[] = [
@@ -64,6 +69,11 @@ export const TOKENS: readonly TokenName[] = [
   "--text-muted",
   "--scrim",
   "--focus-ring",
+  "--code-keyword",
+  "--code-string",
+  "--code-comment",
+  "--code-number",
+  "--code-fn",
 ];
 
 export interface Palette {
@@ -122,6 +132,12 @@ export const PALETTES: readonly Palette[] = [
       "--text-muted": "#8b939e",
       "--scrim": "rgba(0, 0, 0, 0.55)",
       "--focus-ring": "#3ddbb0",
+      // Code in a message, on --bg-tertiary: never the live mint, never danger red
+      "--code-keyword": "#c4a7ff",
+      "--code-string": "#e5c07b",
+      "--code-comment": "#8b939e",
+      "--code-number": "#7fc8ff",
+      "--code-fn": "#ff9fcf",
     },
   },
   {
@@ -155,6 +171,12 @@ export const PALETTES: readonly Palette[] = [
       "--text-muted": "#5f6873",
       "--scrim": "rgba(15, 20, 25, 0.4)",
       "--focus-ring": "#0b7a5f",
+      // Code in a message, on --bg-tertiary: never the live mint, never danger red
+      "--code-keyword": "#6f42c1",
+      "--code-string": "#8a5a00",
+      "--code-comment": "#5c6670",
+      "--code-number": "#005cc5",
+      "--code-fn": "#b4237a",
     },
   },
   {
@@ -188,6 +210,12 @@ export const PALETTES: readonly Palette[] = [
       "--text-muted": "#8a8a96",
       "--scrim": "rgba(0, 0, 0, 0.5)",
       "--focus-ring": "#4a9eff",
+      // Code in a message, on --bg-tertiary: never the live mint, never danger red
+      "--code-keyword": "#c4a7ff",
+      "--code-string": "#e5c07b",
+      "--code-comment": "#a3abba",
+      "--code-number": "#ffb86c",
+      "--code-fn": "#ff9fcf",
     },
   },
   {
@@ -231,6 +259,12 @@ export const PALETTES: readonly Palette[] = [
       "--text-muted": "#9ba1aa",
       "--scrim": "rgba(0, 0, 0, 0.5)",
       "--focus-ring": "#7983f5",
+      // Code in a message, on --bg-tertiary: never the live mint, never danger red
+      "--code-keyword": "#c4a7ff",
+      "--code-string": "#e5c07b",
+      "--code-comment": "#8b939e",
+      "--code-number": "#7fc8ff",
+      "--code-fn": "#ff9fcf",
     },
   },
   {
@@ -264,6 +298,12 @@ export const PALETTES: readonly Palette[] = [
       "--text-muted": "#686a72",
       "--scrim": "rgba(0, 0, 0, 0.32)",
       "--focus-ring": "#5865f2",
+      // Code in a message, on --bg-tertiary: never the live mint, never danger red
+      "--code-keyword": "#6f42c1",
+      "--code-string": "#8a5a00",
+      "--code-comment": "#5c6670",
+      "--code-number": "#005cc5",
+      "--code-fn": "#b4237a",
     },
   },
   {
@@ -298,6 +338,12 @@ export const PALETTES: readonly Palette[] = [
       "--text-muted": "#7c7c7c",
       "--scrim": "rgba(0, 0, 0, 0.6)",
       "--focus-ring": "#5865f2",
+      // Code in a message, on --bg-tertiary: never the live mint, never danger red
+      "--code-keyword": "#c4a7ff",
+      "--code-string": "#e5c07b",
+      "--code-comment": "#8b939e",
+      "--code-number": "#7fc8ff",
+      "--code-fn": "#ff9fcf",
     },
   },
 ];
@@ -508,6 +554,12 @@ export const CONTRAST_PAIRS: readonly {
   // A focus ring is a non-text indicator: 3:1 against what it sits on (WCAG 1.4.11)
   { fg: "--focus-ring", bg: "--bg-primary", min: 3.0, where: "keyboard focus in the chat" },
   { fg: "--focus-ring", bg: "--bg-secondary", min: 3.0, where: "keyboard focus in the sidebars" },
+  // Highlighted code in a message: text, so 4.5 like every other
+  { fg: "--code-keyword", bg: "--bg-tertiary", min: 4.5, where: "code: keywords" },
+  { fg: "--code-string", bg: "--bg-tertiary", min: 4.5, where: "code: strings" },
+  { fg: "--code-comment", bg: "--bg-tertiary", min: 4.5, where: "code: comments" },
+  { fg: "--code-number", bg: "--bg-tertiary", min: 4.5, where: "code: numbers" },
+  { fg: "--code-fn", bg: "--bg-tertiary", min: 4.5, where: "code: names of functions and types" },
   // Not a WCAG figure: a divider is not text. 1.1 is simply "visible at all",
   // and it is the floor today's dark palette sits just above (#2a2a4a on
   // #16213e is 1.15). It exists so a palette cannot ship with borders that

@@ -150,6 +150,8 @@
         content: string;
         ttl_secs: number | null;
         timestamp: number;
+        reply_to?: string | null;
+        thread?: string | null;
       }>("stored-dm", (server, m) => {
         const me = get(account.peek(server));
         if (!me) return;

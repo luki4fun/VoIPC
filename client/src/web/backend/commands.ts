@@ -52,6 +52,11 @@ function optStr(v: unknown, name: string): string | null {
   return v == null ? null : str(v, name);
 }
 
+/** What a message answers and its thread, as the front end names them. */
+function refs(replyTo: unknown, thread: unknown) {
+  return { replyTo: optStr(replyTo, "replyTo"), thread: optStr(thread, "thread") };
+}
+
 function num(v: unknown, name: string): number {
   return typeof v === "number" && Number.isFinite(v) ? v : fail(`invalid ${name}`);
 }
@@ -182,8 +187,13 @@ const handlers: Record<string, Handler> = {
     })),
   forget_device: ({ server, name }) => forgetDevice(str(server, "server"), str(name, "name")),
   account_prefs: ({ server }) => needAccount(server).account.prefs() ?? fail("Not signed in to an account on that server"),
-  send_kept_dm: ({ server, account, content, ttlSecs }) =>
-    need(server).sendKeptDm(str(account, "account"), str(content, "content"), ttlSecs == null ? undefined : u32(ttlSecs, "ttlSecs")),
+  send_kept_dm: ({ server, account, content, ttlSecs, replyTo, thread }) =>
+    need(server).sendKeptDm(
+      str(account, "account"),
+      str(content, "content"),
+      ttlSecs == null ? undefined : u32(ttlSecs, "ttlSecs"),
+      refs(replyTo, thread),
+    ),
   account_enter: ({ server, conv }) => {
     const { s, account } = needAccount(server);
     account.enter(s, str(conv, "conv"));
@@ -308,17 +318,19 @@ const handlers: Record<string, Handler> = {
   // ── chat ──
   send_poke: ({ server, targetUserId, message }) =>
     need(server).sendPoke(u32(targetUserId, "targetUserId"), str(message, "message")),
-  send_channel_message: ({ server, content, channelId, ttlSecs }) =>
+  send_channel_message: ({ server, content, channelId, ttlSecs, replyTo, thread }) =>
     need(server).sendChannelMessage(
       str(content, "content"),
       channelId == null ? undefined : u32(channelId, "channelId"),
       ttlSecs == null ? undefined : u32(ttlSecs, "ttlSecs"),
+      refs(replyTo, thread),
     ),
-  send_direct_message: ({ server, targetUserId, content, ttlSecs }) =>
+  send_direct_message: ({ server, targetUserId, content, ttlSecs, replyTo, thread }) =>
     need(server).sendDirectMessage(
       u32(targetUserId, "targetUserId"),
       str(content, "content"),
       ttlSecs == null ? undefined : u32(ttlSecs, "ttlSecs"),
+      refs(replyTo, thread),
     ),
   send_channel_history: ({ server, channelId, targetUserId, messages }) => {
     if (!Array.isArray(messages)) fail("invalid messages");

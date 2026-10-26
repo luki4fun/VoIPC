@@ -2,6 +2,57 @@
 
 All notable changes to VoIPC are documented here.
 
+## [Unreleased]
+
+Chat grows up: answers, threads, formatting, mentions and search. Nothing
+changes on the wire, so 1.2.0 talks to 1.0 and 1.1 apps and relays. What a 1.2
+app adds rides inside the end-to-end encryption, where a 1.0 or 1.1 app reads
+the plain text and ignores the rest. The relay sees none of it.
+
+The desktop chat history moves to a new format. When 1.2 first opens it, it
+keeps a copy of the old file beside it (`chat_history.bin.v5`): 1.1 cannot open
+the new file, but it can open that copy.
+
+### Replies and threads
+
+- **Reply to a message**: point at it, or long-press on a phone, and pick
+  Reply. Your message shows a line quoting what it answers; press the line and
+  the chat goes to that message and marks it for a moment. Only the message's
+  id travels, never a copy of its text, so a reply cannot keep a message alive
+  past its destruction timer. An answer to something you wrote is marked, and
+  tells you when the app is in the background.
+- **Threads**: "Reply in thread" opens a side pane (a full-width one on a phone)
+  for a conversation under one message, and the main chat shows only how many
+  replies it has. When a message draws three replies or more from at least two
+  people, the replies gather into a thread on their own. Settings → Appearance
+  turns that off.
+- Every message has its tools (Reply, Reply in thread, Copy text) on hover and
+  in its right-click or long-press menu. The keyboard moves between messages
+  with the arrow keys and reaches the same tools.
+
+### Formatting
+
+- Messages understand Markdown: **bold**, *italic*, ~~strikethrough~~, `code`,
+  quotes, lists, headings and `||spoilers||`. A fenced code block keeps its
+  lines, scrolls instead of wrapping, has a Copy button, and is coloured for
+  37 common languages (` ```rust `, ` ```python `, …). Every palette has its own
+  code colours, checked for contrast.
+- HTML in a message is shown as the text it is, never run, and an image in
+  Markdown is a link that never loads by itself. A link with other words on it
+  shows its real address before you copy it.
+- The message box grows as you type, and Shift+Enter starts a new line.
+
+### Mentions, unread and search
+
+- **@mentions**: type `@` for a list of the people in the channel. A message
+  that names you is marked and tells you when the app is in the background.
+  Anonymous channels have no mentions, because everyone there sees other names.
+- A **New** line marks where the unread messages begin when you open a
+  conversation, with a button to jump to it.
+- **Search** (the magnifier, or Ctrl+F in the chat) finds messages in the open
+  conversation or in every conversation on this device, without asking the
+  relay anything.
+
 ## [1.1.0] - 2026-10-26
 
 A design pass over every surface: the app on Linux, Windows, Android and in the
