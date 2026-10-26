@@ -80,17 +80,51 @@ export function resizeHandle(node: HTMLElement, options: ResizeOptions) {
     opts.onsettle(width);
   }
 
+  // The keyboard's way to do the same: the handle is a focusable separator
+  // that reports its size, and the arrows move it 16px at a time (64px with
+  // Shift), Home and End to the limits, Enter back to the default. A drag
+  // was the only way before, so a keyboard could not resize anything.
+  function describe(px: number) {
+    node.setAttribute("aria-valuenow", String(px));
+    node.setAttribute("aria-valuemin", String(opts.min));
+    node.setAttribute("aria-valuemax", String(opts.max));
+  }
+  node.tabIndex = 0;
+  node.setAttribute("aria-orientation", opts.axis === "y" ? "horizontal" : "vertical");
+  describe(opts.current());
+
+  function onKeyDown(e: KeyboardEvent) {
+    const step = e.shiftKey ? 64 : 16;
+    const grow = opts.axis === "y" ? (opts.invert ? "ArrowUp" : "ArrowDown") : opts.invert ? "ArrowLeft" : "ArrowRight";
+    const shrink = opts.axis === "y" ? (opts.invert ? "ArrowDown" : "ArrowUp") : opts.invert ? "ArrowRight" : "ArrowLeft";
+    let next: number | null = null;
+    if (e.key === grow) next = opts.current() + step;
+    else if (e.key === shrink) next = opts.current() - step;
+    else if (e.key === "Home") next = opts.min;
+    else if (e.key === "End") next = opts.max;
+    else if (e.key === "Enter") next = opts.defaultWidth;
+    if (next === null) return;
+    e.preventDefault();
+    width = clamp(next);
+    opts.target?.style.setProperty(opts.prop, `${width}px`);
+    describe(width);
+    opts.onsettle(width);
+  }
+
   node.addEventListener("pointerdown", onPointerDown);
   node.addEventListener("pointermove", onPointerMove);
   node.addEventListener("pointerup", onPointerUp);
   node.addEventListener("pointercancel", onPointerUp);
   node.addEventListener("dblclick", onDoubleClick);
+  node.addEventListener("keydown", onKeyDown);
 
   return {
     update(next: ResizeOptions) {
       opts = next;
+      describe(opts.current());
     },
     destroy() {
+      node.removeEventListener("keydown", onKeyDown);
       node.removeEventListener("pointerdown", onPointerDown);
       node.removeEventListener("pointermove", onPointerMove);
       node.removeEventListener("pointerup", onPointerUp);

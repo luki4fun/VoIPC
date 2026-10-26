@@ -6,6 +6,10 @@
 // the role, `aria-modal` and a name taken from its title; puts focus inside
 // (on what asks for it, else the first control); keeps Tab inside; closes on
 // Escape when it is given an `onclose`; and hands focus back on the way out.
+// It is also a layer on the back stack (stores/back-stack.ts), so Android's
+// Back closes it the way Escape does — or, with no `onclose`, does nothing.
+
+import { pushLayer } from "../stores/back-stack.js";
 
 export interface DialogOptions {
   /** What Escape does. Without it Escape is left alone: a step that must be answered. */
@@ -82,12 +86,15 @@ export function dialog(node: HTMLElement, opts: DialogOptions = {}) {
     }
   }
   node.addEventListener("keydown", onkeydown);
+  // Read through `options` at close time: `update` can hand it a new onclose
+  const offBack = pushLayer(() => options.onclose?.());
 
   return {
     update(next: DialogOptions) {
       options = next;
     },
     destroy() {
+      offBack();
       relabel?.disconnect();
       node.removeEventListener("keydown", onkeydown);
       if (before?.isConnected) before.focus();

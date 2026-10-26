@@ -9,7 +9,7 @@
 
   import { backdrop } from "../../actions/dialog.js";
   import { invoke } from "@tauri-apps/api/core";
-  import { avatarColor } from "../../avatar.js";
+  import { avatarStyle } from "../../avatar.js";
   import { serverAddress } from "../../stores/connection.js";
   import { addNotification } from "../../stores/notifications.js";
   import { savedServers, type SavedServer } from "../../stores/settings.js";
@@ -17,6 +17,7 @@
   import { connectTo, disconnectServer, serverEntries, serverId } from "../../connect.js";
   import { playDisconnectedSound } from "../../sounds.js";
   import Icon from "../Icons.svelte";
+  import { menu as menuAction } from "../../actions/menu.js";
 
   interface Props {
     onadd: () => void;
@@ -129,9 +130,11 @@
       onpointerleave={pressEnd}
       onpointercancel={pressEnd}
       title={stateLabel(entry)}
+      aria-label={stateLabel(entry)}
+      aria-current={entry.active ? "true" : undefined}
     >
       <span class="pill" class:show={entry.active || entry.unread > 0}></span>
-      <span class="badge" style="background: {avatarColor(entry.name)}">{initials(entry.name)}</span>
+      <span class="badge" style={avatarStyle(entry.name)}>{initials(entry.name)}</span>
       {#if entry.state === "connecting" || entry.state === "reconnecting"}
         <span class="rail-state" title={entry.state === "connecting" ? "Connecting" : "Reconnecting"}
           >…</span
@@ -160,7 +163,12 @@
       menu = null;
     }}
   >
-    <div class="rail-menu" style="left: {menu.x}px; top: {menu.y}px;">
+    <!-- Kept on screen: a long press near the bottom used to open it below the edge -->
+    <div
+      class="rail-menu"
+      style="left: min({menu.x}px, calc(100vw - 216px)); top: min({menu.y}px, calc(100dvh - 140px));"
+      use:menuAction={{ onclose: () => (menu = null), label: menu.entry.name }}
+    >
       <div class="rail-menu-title">{menu.entry.name}</div>
       {#if menu.entry.open}
         <button class="rail-menu-item danger" onclick={() => disconnect(menu!.entry)}>
@@ -204,6 +212,12 @@
     border: none;
   }
 
+  /* As wide as the scrolling rail, whose edges clipped a ring drawn outside
+     to its top line: drawn inside instead */
+  .rail-item:focus-visible {
+    outline-offset: -2px;
+  }
+
   .pill {
     position: absolute;
     left: 0;
@@ -212,7 +226,7 @@
     border-radius: 0 4px 4px 0;
     background: var(--text-primary);
     opacity: 0;
-    transition: height 0.15s, opacity 0.15s;
+    transition: height var(--dur-fast), opacity var(--dur-fast);
   }
 
   .pill.show {
@@ -230,11 +244,10 @@
     width: 48px;
     height: 48px;
     border-radius: 16px;
-    color: #fff;
     font-size: 15px;
     font-weight: 600;
     letter-spacing: 0.5px;
-    transition: border-radius 0.15s;
+    transition: border-radius var(--dur-fast);
   }
 
   .rail-item:hover .badge,
@@ -255,9 +268,10 @@
     opacity: 1;
   }
 
+  /* An action, not a state: ink. The voice mark below is live, so mint */
   .badge.plus {
     background: var(--bg-secondary);
-    color: var(--success);
+    color: var(--text-secondary);
   }
 
   .rail-unread {
@@ -268,8 +282,8 @@
     padding: 1px 5px;
     border-radius: 10px;
     background: var(--danger);
-    color: #fff;
-    font-size: 11px;
+    color: var(--on-danger);
+    font-size: var(--fs-micro);
     font-weight: 700;
     text-align: center;
     border: 3px solid var(--bg-tertiary);
@@ -290,7 +304,7 @@
     border-radius: 10px;
     background: var(--bg-secondary);
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-weight: 700;
     line-height: 1;
     border: 3px solid var(--bg-tertiary);
@@ -303,7 +317,7 @@
   .rail-menu-overlay {
     position: fixed;
     inset: 0;
-    z-index: 150;
+    z-index: var(--z-popover);
   }
 
   .rail-menu {
@@ -318,7 +332,7 @@
 
   .rail-menu-title {
     padding: 6px 10px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.02em;
@@ -335,7 +349,7 @@
     color: var(--text-primary);
     border: none;
     border-radius: 4px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     text-align: left;
   }
 

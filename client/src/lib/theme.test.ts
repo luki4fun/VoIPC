@@ -111,3 +111,65 @@ test("contrast is the WCAG ratio, and unparseable colours score zero", () => {
   // fail the assertion that uses it, not take the suite down.
   assert.equal(contrastRatio("0 8px 24px rgba(0,0,0,.4)", "#ffffff"), 0);
 });
+
+// MainActivity.kt opens the window in the stored palette's background, before
+// the page exists to say what that is, from its own copy of the table. A new
+// palette, or a changed background, has to reach that copy too.
+test("Android's launch colours match every palette's background", async () => {
+  const { readFileSync } = await import("node:fs");
+  const kt = readFileSync(
+    new URL("../../src-tauri/gen/android/app/src/main/java/com/voipc/app/MainActivity.kt", import.meta.url),
+    "utf8",
+  );
+  const table = new Map(
+    [...kt.matchAll(/"([a-z-]+)" to \("(#[0-9a-f]{6})" to (true|false)\)/g)].map((m) => [
+      m[1],
+      { bg: m[2], light: m[3] === "true" },
+    ]),
+  );
+  for (const p of PALETTES) {
+    const row = table.get(p.id);
+    assert.ok(row, `MainActivity.kt PALETTE_BACKGROUNDS has no ${p.id}`);
+    assert.equal(row.bg, p.tokens["--bg-primary"].toLowerCase(), `${p.id}: background`);
+    assert.equal(row.light, !p.dark, `${p.id}: light`);
+  }
+  for (const [id, row] of table) {
+    const p = paletteById(migratePaletteId(id));
+    assert.equal(p.id, migratePaletteId(id), `${id} is neither a palette nor a rename of one`);
+    assert.equal(row.bg, p.tokens["--bg-primary"].toLowerCase(), `${id}: background`);
+  }
+});
+
+// The splash of the next start (themes.xml Launch.*, picked by MainActivity):
+// one colour per palette in res/values/colors.xml, the palette's background.
+test("Android's splash colours match every palette's background", async () => {
+  const { readFileSync } = await import("node:fs");
+  const res = "../../src-tauri/gen/android/app/src/main/";
+  const colors = readFileSync(new URL(res + "res/values/colors.xml", import.meta.url), "utf8");
+  const themes = readFileSync(new URL(res + "res/values/themes.xml", import.meta.url), "utf8");
+  const kt = readFileSync(new URL(res + "java/com/voipc/app/MainActivity.kt", import.meta.url), "utf8");
+  for (const p of PALETTES) {
+    const name = p.id.replace(/-/g, "_");
+    const m = colors.match(new RegExp(`name="launch_${name}">#FF([0-9A-Fa-f]{6})<`));
+    assert.ok(m, `colors.xml has no launch_${name}`);
+    assert.equal(`#${m[1].toLowerCase()}`, p.tokens["--bg-primary"].toLowerCase(), `${p.id}: splash colour`);
+    assert.ok(themes.includes(`name="Theme.voipc_client.Launch.${name}"`), `themes.xml has no Launch.${name}`);
+    assert.ok(kt.includes(`"${p.id}" to R.style.Theme_voipc_client_Launch_${name}`), `MainActivity maps no ${p.id}`);
+  }
+});
+
+// XML forbids two hyphens in a row inside a comment, and Gradle's resource
+// merger stops the whole Android build on one: a comment naming a token such
+// as --bg-primary did exactly that (2026-10-26).
+test("the Android resource files' comments are valid XML", async () => {
+  const { readFileSync, readdirSync } = await import("node:fs");
+  const dir = new URL("../../src-tauri/gen/android/app/src/main/res/", import.meta.url);
+  for (const sub of readdirSync(dir).filter((d) => d.startsWith("values"))) {
+    for (const file of readdirSync(new URL(`${sub}/`, dir)).filter((f) => f.endsWith(".xml"))) {
+      const text = readFileSync(new URL(`${sub}/${file}`, dir), "utf8");
+      for (const m of text.matchAll(/<!--([\s\S]*?)-->/g)) {
+        assert.ok(!m[1].includes("--"), `${sub}/${file}: "--" inside a comment`);
+      }
+    }
+  }
+});

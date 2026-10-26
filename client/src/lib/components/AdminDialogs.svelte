@@ -112,11 +112,11 @@
   .admin-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.6);
+    background: var(--scrim);
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 120;
+    z-index: var(--z-dialog-over);
   }
 
   .admin-dialog {
@@ -128,17 +128,20 @@
     display: flex;
     flex-direction: column;
     gap: 10px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     color: var(--text-primary);
+    /* The window can be 640×480: the dialog scrolls, its buttons stay reachable */
+    max-height: calc(100dvh - 32px);
+    overflow-y: auto;
   }
 
   .admin-title {
     font-weight: 600;
-    color: var(--accent);
+    color: var(--text-primary);
   }
 
   .admin-hint {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     line-height: 1.4;
   }
@@ -159,12 +162,12 @@
     color: var(--text-secondary);
     border: 1px solid var(--border);
     padding: 4px 10px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
 
   .admin-ok {
     padding: 4px 12px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
 
   .ban-list {
@@ -186,7 +189,7 @@
 
   .ban-heading {
     font-weight: 600;
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
 
   .ban-add {
@@ -210,7 +213,7 @@
   }
 
   .ban-reason {
-    font-size: 11px;
+    font-size: var(--fs-micro);
     color: var(--text-secondary);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -220,6 +223,6 @@
   .ban-expiry {
     margin-left: auto;
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
 </style>

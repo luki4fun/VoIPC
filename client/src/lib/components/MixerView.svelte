@@ -277,7 +277,7 @@
           <div class="meter">
             <div
               class="fill"
-              style="height: {strip.own ? ownLevel : (meters[strip.id as number] ?? 0)}%"
+              style="transform: scaleY({(strip.own ? ownLevel : (meters[strip.id as number] ?? 0)) / 100})"
             ></div>
           </div>
           <input
@@ -298,6 +298,8 @@
           class="mute"
           class:muted
           title={muted ? "Unmute" : "Mute"}
+          aria-label="Mute {strip.name}"
+          aria-pressed={muted}
           onclick={() => toggleStripMute(strip)}
         >
           <Icon name={muted ? "volume-off" : "volume"} size={16} />
@@ -307,8 +309,10 @@
           class="params"
           class:open={$selectedStrip === strip.id}
           title="More of this lane"
+          aria-label="Effects for {strip.name}"
+          aria-expanded={$selectedStrip === strip.id}
           onclick={() => selectedStrip.set($selectedStrip === strip.id ? null : strip.id)}
-        >⋯</button>
+        ><Icon name="more-vertical" size={16} /></button>
       </div>
     {/each}
 
@@ -329,7 +333,7 @@
       {@const lane = laneFor(strip, $micLane, $userFx)}
       <div class="inspect-head">
         <span>{strip.name}{strip.own ? " — your voice going out" : ""}</span>
-        <button class="close" onclick={() => selectedStrip.set(null)} title="Close">
+        <button class="close" onclick={() => selectedStrip.set(null)} title="Close" aria-label="Close the effects">
           <Icon name="close" size={16} />
         </button>
       </div>
@@ -379,7 +383,7 @@
         </span>
       {/if}
     {:else}
-      <span class="tiny hint">Pick ⋯ on a strip for its muffle, reverb and water.</span>
+      <span class="tiny hint">Pick ⋮ under a strip for its muffle, reverb and water.</span>
     {/if}
   </div>
 </div>
@@ -396,7 +400,7 @@
 
   .banner {
     padding: 8px 12px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     background: var(--bg-hover);
     border-bottom: 1px solid var(--border);
@@ -428,11 +432,11 @@
   /* Ours is pinned and accented so it is easy to find — same controls, same
      order, same sizes. Only the border knows the difference. */
   .strip.own {
-    border-color: var(--accent);
+    border-color: var(--text-muted);
     background: var(--bg-tertiary);
     position: sticky;
     left: 0;
-    z-index: 1;
+    z-index: var(--z-raised);
   }
 
   .plate {
@@ -440,7 +444,7 @@
     align-items: center;
     gap: 5px;
     width: 100%;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-primary);
   }
 
@@ -459,10 +463,10 @@
 
   .tag {
     flex: none;
-    font-size: 9px;
+    font-size: var(--fs-micro);
     text-transform: uppercase;
     letter-spacing: 0.04em;
-    color: var(--accent);
+    color: var(--text-secondary);
   }
 
   /* The game is leaving this voice out of the mix. The strip stays usable —
@@ -478,7 +482,7 @@
   }
 
   .tiny {
-    font-size: 10px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
   }
 
@@ -497,9 +501,12 @@
   select {
     width: 100%;
     min-width: 0;
-    padding: 4px;
-    font-size: 11px;
-    background: var(--bg-primary);
+    padding: 4px 20px 4px 4px;
+    font-size: var(--fs-sm);
+    /* The colour only: the `background` shorthand reset the chevron app.css
+       draws, which a light palette's rule then tiled across the whole box */
+    background-color: var(--bg-primary);
+    background-position: right 6px center;
     color: var(--text-primary);
     border: 1px solid var(--border);
     border-radius: 4px;
@@ -527,10 +534,14 @@
     justify-content: flex-end;
   }
 
+  /* Full height, scaled from the bottom: a transform moves no layout, where
+     animating `height` fifteen times a second relaid every strip */
   .fill {
     width: 100%;
+    height: 100%;
     background: var(--accent);
-    transition: height 60ms linear;
+    transform-origin: bottom;
+    transition: transform 60ms linear;
   }
 
   /* A vertical range input. `direction: rtl` puts zero at the bottom, where a
@@ -549,14 +560,14 @@
     padding: 0;
     background: transparent;
     border: none;
-    accent-color: var(--accent);
+    accent-color: var(--control-fill);
     /* Or the rack's horizontal scroll eats the drag before the fader sees it */
     touch-action: none;
     cursor: pointer;
   }
 
   .readout {
-    font-size: 11px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     font-variant-numeric: tabular-nums;
   }
@@ -571,7 +582,7 @@
     min-width: 36px;
     min-height: 36px;
     padding: 0 8px;
-    font-size: 11px;
+    font-size: var(--fs-sm);
     background: var(--bg-primary);
     color: var(--text-secondary);
     border: 1px solid var(--border);
@@ -584,7 +595,7 @@
   .mic-test:hover,
   .close:hover {
     color: var(--text-primary);
-    border-color: var(--accent);
+    border-color: var(--text-muted);
   }
 
   .mute.muted {
@@ -592,7 +603,13 @@
     border-color: var(--danger);
   }
 
-  .params.open,
+  /* Open parameters are a setting (ink); a running mic test is your own
+     voice coming back to you now, which is live (mint) */
+  .params.open {
+    color: var(--text-primary);
+    border-color: var(--text-primary);
+  }
+
   .mic-test.on {
     color: var(--accent);
     border-color: var(--accent);
@@ -617,7 +634,7 @@
   .knob input[type="range"] {
     flex: 1;
     min-width: 0;
-    accent-color: var(--accent);
+    accent-color: var(--control-fill);
     height: 32px;
   }
 
@@ -630,7 +647,7 @@
   .empty {
     align-self: center;
     margin: auto;
-    font-size: 13px;
+    font-size: var(--fs-body);
     color: var(--text-secondary);
   }
 
@@ -648,7 +665,7 @@
     display: flex;
     align-items: center;
     justify-content: space-between;
-    font-size: 13px;
+    font-size: var(--fs-body);
     color: var(--text-primary);
   }
 

@@ -1,6 +1,7 @@
 import { writable } from 'svelte/store';
 import { addNotification } from './notifications';
 import { leaveVoice, startTransmit, stopTransmit, toggleDeafen, toggleMute } from './voice';
+import { back } from './back-stack';
 
 /** true in the browser build (web client), false in the Tauri app (desktop/Android). */
 export const isWeb: boolean = __WEB__;
@@ -50,6 +51,10 @@ if (typeof window !== 'undefined') {
   // These are called from MainActivity.kt via evaluateJavascript(). The web
   // client has no native side, so an Android browser gets none of them.
   if (isAndroid && !isWeb) {
+    // System Back (MainActivity.kt): close the topmost open layer. True when
+    // something took the press; false sends the app to the background.
+    (window as any).__voipc_back = () => back();
+
     // Volume key PTT press/release.
     //
     // Through the shared actions, which also set `isTransmitting` — invoking

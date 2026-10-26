@@ -412,10 +412,10 @@
         <button type="button" class="link" onclick={() => (useRecovery = !useRecovery)}>
           {useRecovery ? "Use a code from the app" : "Lost your phone? Use a recovery code"}
         </button>
-        {#if error}<div class="error">{error}</div>{/if}
+        {#if error}<div class="error" role="alert">{error}</div>{/if}
         <div class="buttons">
           <button type="button" class="secondary" onclick={cancelTotp} disabled={busy}>Cancel</button>
-          <button type="button" class="submit-btn" onclick={submitTotp} disabled={busy || !code.trim()}>Sign in</button>
+          <button type="button" class="submit-btn btn btn-primary" onclick={submitTotp} disabled={busy || !code.trim()}>Sign in</button>
         </div>
       {:else if p.kind === "recovery"}
         <h2>{fromServer(p.server)}Your recovery key</h2>
@@ -426,7 +426,7 @@
         </p>
         <code class="secret">{p.key}</code>
         <button type="button" class="secondary" onclick={() => copy(p.key)}>{copied ? "Copied" : "Copy"}</button>
-        <button type="button" class="submit-btn" onclick={closeRecovery}>I have written it down</button>
+        <button type="button" class="submit-btn btn btn-primary" onclick={closeRecovery}>I have written it down</button>
       {:else if p.kind === "totp-setup"}
         <h2>{fromServer(p.server)}Set up two-factor codes</h2>
         <p class="hint">
@@ -453,10 +453,10 @@
             onkeydown={(e) => e.key === "Enter" && submitSetup()}
           />
         </div>
-        {#if error}<div class="error">{error}</div>{/if}
+        {#if error}<div class="error" role="alert">{error}</div>{/if}
         <div class="buttons">
           <button type="button" class="secondary" onclick={() => closePrompt()} disabled={busy}>Later</button>
-          <button type="button" class="submit-btn" onclick={submitSetup} disabled={busy}>Turn on</button>
+          <button type="button" class="submit-btn btn btn-primary" onclick={submitSetup} disabled={busy}>Turn on</button>
         </div>
       {:else if p.kind === "safety"}
         <h2>{fromServer(p.server)}Verify {p.name}</h2>
@@ -465,7 +465,7 @@
           server — stands between your encrypted messages. It changes when either of you gets a new identity.
         </p>
         <code class="secret codes safety">{p.number}</code>
-        <button type="button" class="submit-btn" onclick={() => closePrompt()}>Done</button>
+        <button type="button" class="submit-btn btn btn-primary" onclick={() => closePrompt()}>Done</button>
       {:else if p.kind === "cloud"}
         <h2>Keep your messages here too?</h2>
         <p class="hint">
@@ -483,12 +483,12 @@
           <input type="checkbox" bind:checked={shareChoice} disabled={busy} />
           <span>Let people who join a channel later read what I wrote there before</span>
         </label>
-        {#if error}<div class="error">{error}</div>{/if}
+        {#if error}<div class="error" role="alert">{error}</div>{/if}
         <div class="buttons">
           <button type="button" class="secondary" onclick={() => submitCloud(p.server, false)} disabled={busy}>
             Only on this device
           </button>
-          <button type="button" class="submit-btn" onclick={() => submitCloud(p.server, true)} disabled={busy}>
+          <button type="button" class="submit-btn btn btn-primary" onclick={() => submitCloud(p.server, true)} disabled={busy}>
             Keep a copy here
           </button>
         </div>
@@ -535,7 +535,7 @@
         </div>
         <div class="buttons">
           <button type="button" class="secondary danger" onclick={() => { const server = p.server; closePrompt(); reset(); showPrompt({ kind: "delete", server, what: "account" }); }}>Delete account…</button>
-          <button type="button" class="submit-btn" onclick={() => closePrompt()}>Done</button>
+          <button type="button" class="submit-btn btn btn-primary" onclick={() => closePrompt()}>Done</button>
         </div>
       {:else if p.kind === "delete" && p.what === "kept"}
         <h2>{fromServer(p.server)}Delete your kept messages?</h2>
@@ -545,7 +545,7 @@
         </p>
         <div class="buttons">
           <button type="button" class="secondary" onclick={() => closePrompt()}>Cancel</button>
-          <button type="button" class="submit-btn danger" onclick={submitDelete}>Delete them</button>
+          <button type="button" class="submit-btn btn btn-danger" onclick={submitDelete}>Delete them</button>
         </div>
       {:else if p.kind === "delete"}
         {@const codes = $account?.info.totp_enabled ?? false}
@@ -574,10 +574,10 @@
             {useRecovery ? "Use a code from the app" : "Lost your phone? Use a recovery code"}
           </button>
         {/if}
-        {#if error}<div class="error">{error}</div>{/if}
+        {#if error}<div class="error" role="alert">{error}</div>{/if}
         <div class="buttons">
           <button type="button" class="secondary" onclick={() => closePrompt()} disabled={busy}>Cancel</button>
-          <button type="button" class="submit-btn danger" onclick={submitDelete} disabled={busy}>Delete account</button>
+          <button type="button" class="submit-btn btn btn-danger" onclick={submitDelete} disabled={busy}>Delete account</button>
         </div>
       {:else if p.kind === "password"}
         {@const codes = $account?.info.totp_enabled ?? false}
@@ -623,10 +623,10 @@
             {useRecovery ? "Use a code from the app" : "Lost your phone? Use a recovery code"}
           </button>
         {/if}
-        {#if error}<div class="error">{error}</div>{/if}
+        {#if error}<div class="error" role="alert">{error}</div>{/if}
         <div class="buttons">
           <button type="button" class="secondary" onclick={() => closePrompt()} disabled={busy}>Cancel</button>
-          <button type="button" class="submit-btn" onclick={submitPassword} disabled={busy}>Change password</button>
+          <button type="button" class="submit-btn btn btn-primary" onclick={submitPassword} disabled={busy}>Change password</button>
         </div>
       {:else if p.kind === "recovery-codes"}
         <h2>{fromServer(p.server)}Recovery codes</h2>
@@ -635,7 +635,7 @@
         </p>
         <code class="secret codes">{p.codes.join("\n")}</code>
         <button type="button" class="secondary" onclick={() => copy(p.codes.join("\n"))}>{copied ? "Copied" : "Copy"}</button>
-        <button type="button" class="submit-btn" onclick={() => closePrompt()}>Done</button>
+        <button type="button" class="submit-btn btn btn-primary" onclick={() => closePrompt()}>Done</button>
       {/if}
     </div>
   </div>
@@ -645,13 +645,13 @@
   .overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.7);
+    background: var(--scrim);
     display: flex;
     align-items: center;
     justify-content: center;
     /* Above the connect dialog (100) and the setup pop-ups (200/210): a
        sign-in waiting for a code must not sit behind them. */
-    z-index: 220;
+    z-index: var(--z-account);
   }
 
   .dialog {
@@ -664,17 +664,20 @@
     display: flex;
     flex-direction: column;
     gap: 14px;
+    /* The window can be 640×480: the dialog scrolls, its buttons stay reachable */
+    max-height: calc(100dvh - 32px);
+    overflow-y: auto;
   }
 
   h2 {
     text-align: center;
-    font-size: 20px;
-    color: var(--accent);
+    font-size: var(--fs-2xl);
+    color: var(--text-primary);
   }
 
   .hint {
     text-align: center;
-    font-size: 13px;
+    font-size: var(--fs-body);
     color: var(--text-secondary);
   }
 
@@ -685,7 +688,7 @@
   }
 
   label {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -698,7 +701,7 @@
     border: 1px solid var(--border);
     border-radius: 6px;
     font-family: monospace;
-    font-size: 14px;
+    font-size: var(--fs-md);
     word-break: break-all;
     text-align: center;
     user-select: all;
@@ -709,7 +712,7 @@
   }
 
   .small {
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
 
   .check {
@@ -718,7 +721,7 @@
     align-items: flex-start;
     text-transform: none;
     letter-spacing: normal;
-    font-size: 13px;
+    font-size: var(--fs-body);
     color: var(--text-primary);
   }
 
@@ -732,7 +735,7 @@
     display: flex;
     align-items: center;
     gap: 10px;
-    font-size: 13px;
+    font-size: var(--fs-body);
   }
 
   .row span {
@@ -756,15 +759,16 @@
   .link {
     background: none;
     border: none;
-    color: var(--accent);
-    font-size: 12px;
+    color: var(--text-primary);
+    text-decoration: underline;
+    font-size: var(--fs-sm);
     cursor: pointer;
     align-self: center;
   }
 
   .error {
     color: var(--danger);
-    font-size: 13px;
+    font-size: var(--fs-body);
     text-align: center;
   }
 
@@ -778,34 +782,30 @@
   }
 
   .submit-btn {
-    background: var(--accent);
-    color: white;
     padding: 10px;
-    font-size: 14px;
-    font-weight: 600;
+    font-size: var(--fs-md);
   }
 
-  .submit-btn:hover:not(:disabled) {
-    background: var(--accent-hover);
-  }
-
-  .submit-btn:disabled,
   .secondary:disabled {
     opacity: 0.6;
     cursor: not-allowed;
   }
 
+  /* The other way out of a step (Cancel, Later, Copy). It set no colours of
+     its own and so wore the browser's grey button on every dark palette. */
   .secondary {
     padding: 10px;
-    font-size: 14px;
+    font-size: var(--fs-md);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+  }
+
+  .secondary:hover:not(:disabled) {
+    background: var(--bg-hover);
   }
 
   .danger {
-    color: var(--danger, #e5534b);
-  }
-
-  .submit-btn.danger {
-    background: var(--danger, #e5534b);
-    color: white;
+    color: var(--danger);
   }
 </style>

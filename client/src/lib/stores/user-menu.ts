@@ -10,6 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { currentChannelId, voice } from "./channels.js";
 import { serverAddress, userId } from "./connection.js";
 import { addNotification } from "./notifications.js";
+import { confirmAction } from "./confirm.js";
 import { displayChannelId } from "./roster.js";
 import { currentFrame, previewStage, watchingUserId } from "./screenshare.js";
 import type { UserInfo } from "../types.js";
@@ -48,6 +49,10 @@ export function repositionUserMenu(width: number, height: number): void {
     let { x, y } = menu;
     if (x + width > window.innerWidth) x = window.innerWidth - width - 8;
     if (y + height > window.innerHeight) y = window.innerHeight - height - 8;
+    // And never off the top or the left: a menu taller than a short window
+    // (or a zoomed one) starts at the edge and scrolls (UserContextMenu)
+    x = Math.max(8, x);
+    y = Math.max(8, y);
     return x === menu.x && y === menu.y ? menu : { ...menu, x, y };
   });
 }
@@ -58,15 +63,22 @@ export function repositionUserMenu(width: number, height: number): void {
 // straight from its click — so "the server on screen" is the member's server.
 // The two dialogs below outlive the click and remember theirs.
 
-export async function kickUser(targetUserId: number): Promise<void> {
+/** Out of the channel on screen — asked first, as a kick from the server is. */
+export async function kickUser(targetUserId: number, name = "them"): Promise<void> {
+  const server = get(serverAddress);
+  const channelId = get(displayChannelId);
+  const ok = await confirmAction({
+    title: `Remove ${name} from this channel?`,
+    body: `${name} is moved out of the channel. They stay on the server and can come back unless the channel keeps them out.`,
+    confirm: "Remove",
+    danger: true,
+  });
+  if (!ok) return;
   try {
-    await invoke("kick_user", {
-      server: get(serverAddress),
-      channelId: get(displayChannelId),
-      userId: targetUserId,
-    });
+    await invoke("kick_user", { server, channelId, userId: targetUserId });
   } catch (e) {
     console.error("Failed to kick user:", e);
+    addNotification(`Could not remove ${name} from the channel: ${e}`, "error");
   }
 }
 
@@ -79,6 +91,7 @@ export async function inviteUser(targetUserId: number): Promise<void> {
     });
   } catch (e) {
     console.error("Failed to invite user:", e);
+    addNotification(`The invite was not sent: ${e}`, "error");
   }
 }
 

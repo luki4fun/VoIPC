@@ -1,24 +1,62 @@
 <script lang="ts">
   import { isMuted, isDeafened, isTransmitting } from '../stores/connection';
   import { startTransmit, stopTransmit, voiceMode } from '../stores/voice';
+  import Icon from './Icons.svelte';
 
   let pressing = $state(false);
+  /** A press that came with a pointer: its click is the end of a hold, not a toggle. */
+  let fromPointer = false;
+
+  const blocked = $derived($isMuted || $isDeafened);
 
   // Through the shared actions rather than invoking directly, which is also
   // what gives this button the guard it never had: outside a voice channel
   // holding it used to start a capture task that had nowhere to send. The
   // shells now mount it only in voice as well.
-  function onTouchStart(e: TouchEvent) {
-    e.preventDefault();
-    if ($isMuted || $isDeafened) return;
+  function press() {
+    if (blocked || pressing) return;
     pressing = true;
-    startTransmit();
+    void startTransmit();
   }
 
-  function onTouchEnd(e: TouchEvent) {
-    e.preventDefault();
+  function release() {
+    if (!pressing) return;
     pressing = false;
-    stopTransmit();
+    void stopTransmit();
+  }
+
+  // Any pointer — finger, stylus, mouse — held, and captured so a thumb that
+  // slides off the button still holds it. It was touch events only.
+  function onpointerdown(e: PointerEvent) {
+    e.preventDefault();
+    fromPointer = true;
+    (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+    press();
+  }
+
+  // A screen reader cannot hold: TalkBack's double tap arrives as a click with
+  // no press before it. That click toggles talking instead.
+  function onclick() {
+    if (fromPointer) {
+      fromPointer = false;
+      return;
+    }
+    if (pressing) release();
+    else press();
+  }
+
+  function onkeydown(e: KeyboardEvent) {
+    if ((e.key === ' ' || e.key === 'Enter') && !e.repeat) {
+      e.preventDefault();
+      press();
+    }
+  }
+
+  function onkeyup(e: KeyboardEvent) {
+    if (e.key === ' ' || e.key === 'Enter') {
+      e.preventDefault();
+      release();
+    }
   }
 </script>
 
@@ -27,18 +65,21 @@
     class="mobile-ptt"
     class:pressing
     class:transmitting={$isTransmitting}
-    class:disabled={$isMuted || $isDeafened}
-    ontouchstart={onTouchStart}
-    ontouchend={onTouchEnd}
-    ontouchcancel={onTouchEnd}
+    class:disabled={blocked}
+    aria-pressed={pressing}
+    aria-disabled={blocked}
+    aria-label={blocked ? 'Talk (unmute first)' : 'Talk'}
+    {onpointerdown}
+    onpointerup={release}
+    onpointercancel={release}
+    onlostpointercapture={release}
+    {onclick}
+    {onkeydown}
+    {onkeyup}
+    onblur={release}
   >
-    <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-      <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
-      <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
-      <line x1="12" y1="19" x2="12" y2="23"/>
-      <line x1="8" y1="23" x2="16" y2="23"/>
-    </svg>
-    <span>{pressing ? 'Release to stop' : 'Hold to talk'}</span>
+    <Icon name="mic-on" size={32} />
+    <span aria-hidden="true">{blocked ? 'Unmute to talk' : pressing ? 'Release to stop' : 'Hold to talk'}</span>
   </button>
 {/if}
 
@@ -56,18 +97,18 @@
     border-radius: 12px;
     background: var(--bg-secondary);
     color: var(--text-secondary);
-    font-size: 13px;
+    font-size: var(--fs-body);
     touch-action: none;
     user-select: none;
     -webkit-user-select: none;
-    transition: all 0.15s ease;
+    transition: background-color var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
   }
 
   .mobile-ptt.pressing,
   .mobile-ptt.transmitting {
     background: var(--speaking);
     border-color: var(--speaking);
-    color: white;
+    color: var(--on-success);
   }
 
   .mobile-ptt.disabled {

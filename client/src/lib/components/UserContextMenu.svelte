@@ -1,5 +1,6 @@
 <script lang="ts">
   import { backdrop, dialog } from "../actions/dialog.js";
+  import { menu as menuAction } from "../actions/menu.js";
   // The member context menu, the poke dialog and the admin kick/ban dialog.
   //
   // Mounted once in App.svelte, outside either layout. Both member lists open it
@@ -108,6 +109,7 @@
       class="ctx-menu"
       style="left: {menu.x}px; top: {menu.y}px;"
       bind:this={menuEl}
+      use:menuAction={{ onclose: closeUserMenu, label: shortName(menu.user.username) }}
     >
       <!-- Who exactly: the one place a name's tag is spelled out -->
       <div class="ctx-title">{who.name}{#if who.tag}<span class="ctx-tag">#{who.tag}</span>{/if}</div>
@@ -118,12 +120,12 @@
       {#if !$isPreviewing && $viewingVoice && menu.user.is_screen_sharing}
         <button class="ctx-item" onclick={() => { watchUser(menu.user.user_id); closeUserMenu(); }}>
           <Icon name="play" size={16} />
-          <span>Watch Screen</span>
+          <span>Watch screen</span>
         </button>
       {/if}
       <button class="ctx-item" onclick={() => { openDm($serverAddress, menu.user.user_id, menu.user.username); closeUserMenu(); }}>
         <Icon name="direct-message" size={16} />
-        <span>Direct Message</span>
+        <span>Direct message</span>
       </button>
       <button class="ctx-item" onclick={() => { openPokeDialog(menu.user.user_id, menu.user.username); closeUserMenu(); }}>
         <Icon name="poke" size={16} />
@@ -157,7 +159,7 @@
       {/if}
       {#if $canKick && !menu.idle && !(spared && !$isCurrentChannelCreator)}
         <div class="ctx-separator"></div>
-        <button class="ctx-item danger" onclick={() => { kickUser(menu.user.user_id); closeUserMenu(); }}>
+        <button class="ctx-item danger" onclick={() => { void kickUser(menu.user.user_id, shortName(menu.user.username)); closeUserMenu(); }}>
           <Icon name="kick" size={16} />
           <span>Kick from channel</span>
         </button>
@@ -211,12 +213,13 @@
 {#if $pokeTarget}
   <div class="poke-overlay" onclick={backdrop(cancelPoke)} role="presentation">
     <div class="poke-dialog" use:dialog={{ onclose: cancelPoke }}>
-      <div class="poke-dialog-header">Poke {shortName($pokeTarget.username)}</div>
+      <div class="poke-dialog-header dialog-title">Poke {shortName($pokeTarget.username)}</div>
       <!-- svelte-ignore a11y_autofocus -->
       <input
         class="poke-input"
         type="text"
         placeholder="Message (optional)"
+        aria-label="Poke message (optional)"
         bind:value={$pokeMessage}
         onkeydown={handlePokeKeydown}
         maxlength="200"
@@ -224,7 +227,7 @@
       />
       <div class="poke-dialog-actions">
         <button class="poke-cancel-btn" onclick={cancelPoke}>Cancel</button>
-        <button class="poke-send-btn" onclick={sendPoke}>Poke</button>
+        <button class="poke-send-btn btn btn-primary" onclick={sendPoke}>Poke</button>
       </div>
     </div>
   </div>
@@ -233,7 +236,7 @@
 {#if $adminAction}
   <div class="poke-overlay" onclick={backdrop(cancelAdminAction)} role="presentation">
     <div class="poke-dialog" use:dialog={{ onclose: cancelAdminAction }}>
-      <div class="poke-dialog-header">{$adminAction.label}: {$adminAction.username}</div>
+      <div class="poke-dialog-header dialog-title">{$adminAction.label}: {$adminAction.username}</div>
       {#if $adminAction.kind === "ban"}
         <div class="admin-hint">
           Bans the address they connect from, so everyone behind it is kept out too, except people who hold a
@@ -251,6 +254,7 @@
         class="poke-input"
         type="text"
         placeholder="Reason (shown to the user)"
+        aria-label="Reason, shown to the user"
         bind:value={$adminReason}
         onkeydown={handleAdminKeydown}
         maxlength="200"
@@ -258,7 +262,7 @@
       />
       <div class="poke-dialog-actions">
         <button class="poke-cancel-btn" onclick={cancelAdminAction}>Cancel</button>
-        <button class="poke-send-btn danger" onclick={confirmAdminAction}>{$adminAction.kind === "kick" ? "Kick" : "Ban"}</button>
+        <button class="poke-send-btn btn btn-danger" onclick={confirmAdminAction}>{$adminAction.kind === "kick" ? "Kick" : "Ban"}</button>
       </div>
     </div>
   </div>
@@ -266,7 +270,7 @@
 
 <style>
   .admin-hint {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     line-height: 1.4;
     margin-bottom: 8px;
@@ -276,18 +280,14 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     margin-bottom: 8px;
-  }
-
-  .poke-send-btn.danger {
-    background: var(--danger);
   }
 
   .ctx-overlay {
     position: fixed;
     inset: 0;
-    z-index: 200;
+    z-index: var(--z-modal);
   }
 
   .ctx-menu {
@@ -297,13 +297,15 @@
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 4px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
-    z-index: 201;
+    box-shadow: var(--shadow-menu);
+    z-index: var(--z-menu);
+    max-height: calc(100dvh - 16px);
+    overflow-y: auto;
   }
 
   .ctx-title {
     padding: 6px 12px 4px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     font-weight: 600;
     color: var(--text-primary);
     overflow-wrap: anywhere;
@@ -322,7 +324,7 @@
     padding: 8px 12px;
     background: transparent;
     color: var(--text-secondary);
-    font-size: 13px;
+    font-size: var(--fs-body);
     border: none;
     border-radius: 4px;
     cursor: pointer;
@@ -379,7 +381,7 @@
   .ctx-vol-slider {
     flex: 1;
     height: 4px;
-    accent-color: var(--accent);
+    accent-color: var(--control-fill);
     background: transparent;
     border: none;
     padding: 0;
@@ -390,11 +392,11 @@
   .poke-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--scrim);
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 100;
+    z-index: var(--z-dialog);
   }
 
   .poke-dialog {
@@ -403,11 +405,14 @@
     border-radius: 8px;
     padding: 16px;
     width: 300px;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    box-shadow: var(--shadow-menu);
+    /* The window can be 640×480: the dialog scrolls, its buttons stay reachable */
+    max-height: calc(100dvh - 32px);
+    overflow-y: auto;
   }
 
   .poke-dialog-header {
-    font-size: 14px;
+    font-size: var(--fs-md);
     font-weight: 600;
     color: var(--text-primary);
     margin-bottom: 12px;
@@ -420,13 +425,13 @@
     color: var(--text-primary);
     border: 1px solid var(--border);
     border-radius: 4px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     outline: none;
     box-sizing: border-box;
   }
 
   .poke-input:focus {
-    border-color: var(--accent);
+    border-color: var(--focus-ring);
   }
 
   .poke-dialog-actions {
@@ -441,7 +446,7 @@
     color: var(--text-secondary);
     border: 1px solid var(--border);
     padding: 6px 14px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     border-radius: 4px;
     cursor: pointer;
   }
@@ -452,16 +457,7 @@
   }
 
   .poke-send-btn {
-    background: var(--accent);
-    color: white;
-    border: none;
     padding: 6px 14px;
-    font-size: 12px;
-    border-radius: 4px;
-    cursor: pointer;
-  }
-
-  .poke-send-btn:hover {
-    opacity: 0.9;
+    font-size: var(--fs-sm);
   }
 </style>

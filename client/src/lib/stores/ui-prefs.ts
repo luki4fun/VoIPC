@@ -71,6 +71,15 @@ let lastSaved: string | null = null;
 let hydrated = false;
 
 /**
+ * Whether the store holds the stored preferences, set the moment before they
+ * go in: what `startTheming` waits for before it paints. The defaults the store
+ * starts with painted VoIPC night over the palette main.ts had already painted
+ * from the cache (theme-cache.ts) for the second until `load_config` answered,
+ * and wrote it into that cache too.
+ */
+let adopted = false;
+
+/**
  * Whether a layout may be painted yet.
  *
  * Deliberately not the same flag as `hydrated` above, which guards *writing*: a
@@ -88,13 +97,11 @@ export const uiPrefsReady = writable(false);
 export function hydrateUiPrefs(raw: unknown): void {
   const clean = sanitizeUiPrefs(raw);
   // Nobody has chosen a palette on this install, so the machine's own
-  // light/dark setting decides which of the two default palettes to open in.
-  // Once somebody picks one it is stored, and this never runs again — the OS
-  // switching to light at sunset must not repaint an app somebody set to dark.
-  const chosen = raw && typeof raw === "object" && !Array.isArray(raw)
-    ? (raw as Record<string, unknown>).palette
-    : undefined;
-  if (typeof chosen !== "string" || chosen === "") {
+  // light/dark setting decides which of the two default palettes to open in —
+  // at every start, until somebody picks one in Settings. Then it is theirs:
+  // the OS switching to light at sunset must not repaint an app somebody set
+  // to dark. (A file from before `palette_chosen` existed reads as chosen.)
+  if (!clean.palette_chosen) {
     clean.palette = systemDefaultPaletteId();
   }
   unknownKeys = {};
@@ -103,6 +110,7 @@ export function hydrateUiPrefs(raw: unknown): void {
       if (!(key in clean)) unknownKeys[key] = value;
     }
   }
+  adopted = true;
   uiPrefs.set(clean);
   lastSaved = serialize(clean);
   hydrated = true;
@@ -174,7 +182,7 @@ function scheduleSave(): void {
  * which renders no components at all.
  */
 export function startTheming(): void {
-  uiPrefs.subscribe((p) => {
+  const paint = (p: UiPrefs) => {
     const palette = paletteById(p.palette);
     applyTheme(resolveTokens(p.palette, p.palette_overrides), palette.dark);
 
@@ -186,8 +194,17 @@ export function startTheming(): void {
       root.style.setProperty("--chat-font-size", `${p.chat_font_size}px`);
       root.dataset.density = p.density;
     }
+  };
 
+  uiPrefs.subscribe((p) => {
+    // Not the store's starting defaults (see `adopted`)
+    if (!adopted && !get(uiPrefsReady)) return;
+    paint(p);
     scheduleSave();
+  });
+  // A config that would not load is known by this: the defaults it is, then
+  uiPrefsReady.subscribe((ready) => {
+    if (ready && !adopted) paint(get(uiPrefs));
   });
 
   if (typeof window !== "undefined") {

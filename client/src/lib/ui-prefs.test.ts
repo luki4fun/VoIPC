@@ -175,3 +175,30 @@ test("a stream chat size is clamped and a bad split falls back", () => {
   assert.deepEqual(p.stream_chat.classic, defaultStreamChat("classic"));
   assert.equal(p.share_preview, true);
 });
+
+test("a stored palette from before the flag existed stands as chosen", () => {
+  // 1.x rule: no upgrade repaints somebody's app. A file with a palette and no
+  // `palette_chosen` cannot say whether a person picked it, so it is theirs.
+  const p = sanitizeUiPrefs({ palette: "slate-dark" });
+  assert.equal(p.palette, "slate-dark");
+  assert.equal(p.palette_chosen, true);
+});
+
+test("a palette the app picked stays un-chosen until somebody picks one", () => {
+  assert.equal(sanitizeUiPrefs({ palette: "voipc-night", palette_chosen: false }).palette_chosen, false);
+  assert.equal(sanitizeUiPrefs({}).palette_chosen, false);
+  assert.equal(sanitizeUiPrefs({ palette: "voipc-day", palette_chosen: true }).palette_chosen, true);
+});
+
+test("the stage layout reads back, with its own panels and the chat shut", () => {
+  const p = sanitizeUiPrefs({ layout: "stage" });
+  assert.equal(p.layout, "stage");
+  assert.equal(p.panels.stage.members_open, false);
+  assert.equal(p.stream_chat.stage.split, "side");
+});
+
+test("a file from before Stage gets the stage panels it never had", () => {
+  const p = sanitizeUiPrefs({ layout: "modern", panels: { modern: { sidebar: 300 } } });
+  assert.equal(p.panels.modern.sidebar, 300);
+  assert.deepEqual(p.panels.stage, sanitizeUiPrefs({}).panels.stage);
+});

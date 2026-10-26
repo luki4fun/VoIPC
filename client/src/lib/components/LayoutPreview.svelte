@@ -14,12 +14,25 @@
   }
   let { layout, selected, onpick }: Props = $props();
 
-  const title = $derived(layout === "modern" ? "Modern" : "Classic");
-  const blurb = $derived(
-    layout === "modern"
-      ? "The default. Server rail, channels with the people in them, chat in the middle, members on the right. Click to look, join from the chat pane."
-      : "VoIPC's original arrangement. Channels on the left, members on the right, voice and status bars along the bottom. Click to look, join from the chat pane.",
-  );
+  const COPY: Record<LayoutId, { title: string; blurb: string }> = {
+    modern: {
+      title: "Modern",
+      blurb:
+        "The default. Server rail, channels with the people in them, chat in the middle, members on the right. Pick a channel to look in; join from the chat pane.",
+    },
+    classic: {
+      title: "Classic",
+      blurb:
+        "VoIPC's original arrangement. Channels on the left, members on the right, voice and status bars along the bottom. Pick a channel to look in; join from the chat pane.",
+    },
+    stage: {
+      title: "Stage",
+      blurb:
+        "Call first. The people in your voice channel fill the middle, with a ring around whoever talks, and a share takes the stage. Chat opens beside it when you want it.",
+    },
+  };
+  const title = $derived(COPY[layout].title);
+  const blurb = $derived(COPY[layout].blurb);
 </script>
 
 <!-- `data-layout` so test-ui.mjs can click a named layout rather than the
@@ -29,10 +42,23 @@
   class:selected
   data-layout={layout}
   onclick={onpick}
-  aria-pressed={selected}
+  role="radio"
+  aria-checked={selected}
 >
-  <span class="wire" class:modern={layout === "modern"} aria-hidden="true">
-    {#if layout === "modern"}
+  <span class="wire" class:modern={layout !== "classic"} aria-hidden="true">
+    {#if layout === "stage"}
+      <span class="w-rail"></span>
+      <span class="w-main">
+        <span class="w-bar"></span>
+        <span class="w-tiles">
+          <span class="w-tile talking"></span>
+          <span class="w-tile"></span>
+          <span class="w-tile"></span>
+          <span class="w-tile"></span>
+        </span>
+        <span class="w-dock"></span>
+      </span>
+    {:else if layout === "modern"}
       <span class="w-rail"></span>
       <span class="w-side">
         <span class="w-row"></span>
@@ -72,7 +98,7 @@
     flex-direction: column;
     gap: 8px;
     flex: 1;
-    min-width: 200px;
+    min-width: 150px;
     padding: 12px;
     background: var(--bg-tertiary);
     border: 2px solid transparent;
@@ -86,7 +112,7 @@
   }
 
   .layout-choice.selected {
-    border-color: var(--accent);
+    border-color: var(--text-primary);
     color: var(--text-primary);
   }
 
@@ -152,7 +178,7 @@
   .w-row.indent {
     margin-left: 6px;
     height: 4px;
-    background: var(--accent);
+    background: var(--text-muted);
     opacity: 0.5;
   }
 
@@ -199,13 +225,39 @@
   }
 
   .choice-title {
-    font-size: 14px;
+    font-size: var(--fs-md);
     font-weight: 600;
     color: var(--text-primary);
   }
 
+  .w-tiles {
+    flex: 1;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 3px;
+    min-height: 0;
+  }
+
+  .w-tile {
+    background: var(--bg-secondary);
+    border-radius: 3px;
+  }
+
+  /* Somebody talking: the one place the wireframe uses the live colour */
+  .w-tile.talking {
+    box-shadow: inset 0 0 0 2px var(--speaking);
+  }
+
+  .w-dock {
+    align-self: center;
+    width: 60%;
+    height: 7px;
+    background: var(--bg-tertiary);
+    border-radius: 4px;
+  }
+
   .choice-blurb {
-    font-size: 11px;
+    font-size: var(--fs-sm);
     line-height: 1.45;
   }
 </style>

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use base64::Engine;
-use tauri::Emitter;
+use tauri::{Emitter, Manager};
 #[cfg(not(target_os = "android"))]
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -1191,5 +1191,17 @@ pub fn render_frame(
 
     let b64 = base64::engine::general_purpose::STANDARD.encode(&jpeg_data);
     let data_url = format!("data:image/jpeg;base64,{}", b64);
-    let _ = app_handle.emit("screenshare-frame", &data_url);
+    // Only to the window that draws it: the pop-out while one is open, the
+    // main window otherwise. `emit` went to every window, so a popped-out
+    // share was serialised and delivered twice a frame — once to a main
+    // window that was showing "popped out" instead of the picture.
+    let target = if app_handle.get_webview_window(POPOUT_LABEL).is_some() {
+        POPOUT_LABEL
+    } else {
+        "main"
+    };
+    let _ = app_handle.emit_to(target, "screenshare-frame", &data_url);
 }
+
+/// The pop-out viewer's window label (commands.rs `open_share_popout`).
+pub const POPOUT_LABEL: &str = "screenshare-popout";

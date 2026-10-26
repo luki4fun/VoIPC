@@ -217,6 +217,22 @@ export const displayUsers: Readable<UserInfo[]> = derived(
 );
 
 /**
+ * The people in the call, for the Stage layout's speaker grid: the voice
+ * channel we stand in on the server on screen, whatever the chat pane shows —
+ * a preview or a text channel does not empty the call. The same hide-members
+ * rule as the member list, applied with *this* channel's flag. Empty while the
+ * call is on another server, or there is none.
+ */
+export const callMembers: Readable<UserInfo[]> = derived(
+  [viewingVoice, currentChannelId, channels, users, userId, recentSpeakers, isAdmin],
+  ([$viewingVoice, $current, $channels, $users, $userId, $recent, $admin]) => {
+    if (!$viewingVoice || $current === 0) return [];
+    const hide = !$admin && ($channels.find((c) => c.channel_id === $current)?.hide_members ?? false);
+    return visibleMembers($users, $userId, $recent, hide);
+  },
+);
+
+/**
  * Everyone on the server who is in no voice channel — the lobby's roster, which
  * the UI no longer lists as a channel. Still reachable for a direct message, a
  * poke or an admin action. Empty while the pane is showing the lobby itself:

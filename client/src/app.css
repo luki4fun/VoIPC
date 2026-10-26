@@ -1,25 +1,108 @@
 :root {
-  --bg-primary: #1a1a2e;
-  --bg-secondary: #16213e;
-  --bg-tertiary: #0f3460;
-  --bg-hover: #1a3a6e;
-  --text-primary: #e0e0e0;
-  --text-secondary: #a0a0a0;
-  --accent: #4a9eff;
-  --accent-hover: #3a8eef;
-  --success: #4caf50;
-  --danger: #e74c3c;
-  --warning: #f39c12;
-  --border: #2a2a4a;
-  --speaking: #4caf50;
+  /* The default palette (theme.ts `voipc-night`), so the window paints in it
+     before the palette module has run — and if it never runs at all. */
+  --bg-primary: #1c1f24;
+  --bg-secondary: #16181d;
+  --bg-tertiary: #0f1114;
+  --bg-hover: #262a31;
+  --text-primary: #e3e6ea;
+  --text-secondary: #a3aab4;
+  --accent: #3ddbb0;
+  --accent-hover: #5fe6c2;
+  --success: #3ddbb0;
+  --danger: #f2555a;
+  --warning: #f2b84b;
+  --border: #2a2e36;
+  --speaking: #3ddbb0;
 
   /* Recessed surfaces and floating ones. Not derivable from the colours above:
      on a light palette a well has to get lighter where a dark one gets darker,
-     and a shadow that reads on #1a1a2e is a bruise on #ffffff. */
-  --well: rgba(0, 0, 0, 0.15);
-  --scrollbar: #2a2a4a;
-  --shadow-menu: 0 8px 24px rgba(0, 0, 0, 0.4);
-  --shadow-dialog: 0 8px 32px rgba(0, 0, 0, 0.5);
+     and a shadow that reads on charcoal is a bruise on #ffffff. */
+  --well: rgba(0, 0, 0, 0.2);
+  --scrollbar: #2f343c;
+  --shadow-menu: 0 8px 24px rgba(0, 0, 0, 0.45);
+  --shadow-dialog: 0 12px 40px rgba(0, 0, 0, 0.55);
+
+  /* What sits on a filled control, dimmed text that still reads, the dark
+     layer behind a dialog, and the keyboard focus ring. Palette tokens like
+     the ones above (theme.ts writes them), so each palette can clear AA on its
+     own fills: white on light fills like this mint is under 4.5:1. */
+  --on-accent: #06231b;
+  --on-danger: #0b0d12;
+  --on-success: #06231b;
+  --on-warning: #0b0d12;
+  --text-muted: #8b939e;
+  --scrim: rgba(0, 0, 0, 0.55);
+  --focus-ring: #3ddbb0;
+
+  /* ── Scales. Not palette: these are the same in every theme. ──
+     A component reaches for one of these before it writes a number. */
+
+  /* Type. rem, so the root size (and the whole-UI zoom) scales them all; 11px
+     is for uppercase micro-labels only, 12px is the floor for anything read. */
+  --fs-micro: 0.6875rem; /* 11px */
+  --fs-sm: 0.75rem;      /* 12px */
+  --fs-body: 0.8125rem;  /* 13px */
+  --fs-md: 0.875rem;     /* 14px */
+  --fs-lg: 1rem;         /* 16px */
+  --fs-xl: 1.125rem;     /* 18px */
+  --fs-2xl: 1.25rem;     /* 20px */
+
+  /* Space, on a 4px base */
+  --sp-1: 4px;
+  --sp-2: 8px;
+  --sp-3: 12px;
+  --sp-4: 16px;
+  --sp-5: 20px;
+  --sp-6: 24px;
+  --sp-8: 32px;
+
+  /* Corners */
+  --r-sm: 4px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --r-pill: 999px;
+
+  /* Motion. Product UI: short, and only to show a state changing. Reduced
+     motion sets all three to zero (below). */
+  --dur-fast: 120ms;
+  --dur-base: 200ms;
+  --dur-slow: 300ms;
+  --ease-out: cubic-bezier(0.2, 0.8, 0.2, 1);
+
+  /* The smallest thing a pointer can be asked to hit: 36px for a mouse, 44px
+     for a finger (set under `pointer: coarse` below). */
+  --hit: 36px;
+
+  /* Layers, lowest first. One list, so "what draws over what" is decided here
+     and not by whichever component picked the bigger number:
+       raised .. pane    — inside a pane (a fader over its track, the reconnect
+                           cover over one server's columns)
+       dropdown          — a menu hanging off the shell (the server header)
+       activity          — the full-window room, mixer and stream view
+       floating          — the sharer's own preview
+       ptt               — the phone talk button: over activities, so you can
+                           talk while watching; under every dialog, so it never
+                           covers one you are filling in
+       settings .. picker — modal dialogs, in the order they can stack
+       toast             — over everything: a dialog's own errors must show */
+  --z-raised: 1;
+  --z-sticky: 20;
+  --z-pane: 30;
+  --z-dropdown: 60;
+  --z-activity: 70;
+  --z-floating: 75;
+  --z-ptt: 80;
+  --z-settings: 90;
+  --z-dialog: 100;
+  --z-dialog-over: 120;
+  --z-popover: 150;
+  --z-modal: 200;
+  --z-menu: 201;
+  --z-setup: 210;
+  --z-account: 220;
+  --z-picker: 230;
+  --z-toast: 1000;
 
   /* Panel widths. Variables so they can be dragged and remembered; the values
      are the ones that were hard-coded in ChannelList and UserList, so nothing
@@ -36,6 +119,45 @@
   /* Chat message size and spacing, driven by Settings → Appearance. */
   --chat-font-size: 13px;
   --msg-gap: 8px;
+
+  /* Native controls, scrollbars and select popups follow the palette */
+  color-scheme: dark;
+
+  /* The filled part of a slider and a ticked box: ink, not the accent. In
+     VoIPC night the accent is the mint that means live, and a setting being
+     on is not something happening now */
+  --control-fill: var(--text-secondary);
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}
+
+@media (pointer: coarse) {
+  :root {
+    --hit: 44px;
+    /* Every icon button a finger can reach, the small ones in list rows too */
+    --icon-btn-size: 44px;
+    --icon-btn-size-sm: 36px;
+  }
+}
+
+/* Reduced motion keeps every state change and drops the travel: durations
+   that come from the tokens go to zero, and anything that loops plays once
+   (a "live" dot stays lit instead of pulsing). */
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 0ms;
+    --dur-base: 0ms;
+    --dur-slow: 0ms;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-iteration-count: 1 !important;
+    scroll-behavior: auto !important;
+  }
 }
 
 /* Compact packs the message list the way Discord's compact mode does: the
@@ -51,12 +173,15 @@
 }
 
 body {
-  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+  /* system-ui first: on Linux that is the desktop's own UI font, where the
+     list below would otherwise land on Roboto or Arial */
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
     "Helvetica Neue", Arial, sans-serif;
   background-color: var(--bg-primary);
   color: var(--text-primary);
   overflow: hidden;
   height: 100vh;
+  height: 100dvh;
 }
 
 /* WebKitGTK paints native (white) selects unless appearance is disabled —
@@ -94,6 +219,7 @@ button, .channel-list .header, .user-list .header {
 
 #app {
   height: 100vh;
+  height: 100dvh;
   display: flex;
   flex-direction: column;
 }
@@ -104,11 +230,41 @@ button {
   border-radius: 6px;
   padding: 8px 16px;
   font-size: 13px;
-  transition: background-color 0.15s;
+  font-family: inherit;
+  transition: background-color var(--dur-fast);
 }
 
 button:active {
   transform: scale(0.98);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  button:active {
+    transform: none;
+  }
+}
+
+/* Keyboard focus, everywhere, the same way. Mouse clicks do not show it
+   (:focus-visible), keyboard and switch access always do. A component that
+   draws its own focus state turns this off for itself, never globally. */
+:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* A scrolling pane the keyboard can enter (Chromium makes scrollers focusable;
+   they carry no tabindex of their own): its own edges clip a ring drawn
+   outside, which showed as one stray line, so the ring goes inside */
+:focus-visible:not(a, button, input, select, textarea, summary, [tabindex], [contenteditable]) {
+  outline-offset: -2px;
+}
+
+/* A dialog holds focus itself only so Tab starts inside it (actions/dialog.ts
+   gives it tabindex -1); a tap on its title focuses it too, and the whole
+   dialog in a ring is no help to anybody. Its controls keep theirs. */
+[role="dialog"][tabindex="-1"]:focus-visible,
+[role="alertdialog"][tabindex="-1"]:focus-visible {
+  outline: none;
 }
 
 /* A row that opens a menu (actions/member-menu.ts): clickable like a button,
@@ -118,8 +274,14 @@ button:active {
 }
 
 .has-menu:focus-visible {
-  outline: 2px solid var(--accent);
+  outline: 2px solid var(--focus-ring);
   outline-offset: -2px;
+}
+
+input,
+textarea,
+select {
+  font-family: inherit;
 }
 
 input {
@@ -129,11 +291,92 @@ input {
   padding: 8px 12px;
   color: var(--text-primary);
   font-size: 14px;
+}
+
+/* Text fields show focus with their border, so the ring is theirs to drop.
+   Sliders, checkboxes and colour wells have no border to light up — they keep
+   the ring from :focus-visible above. */
+input:not([type="range"], [type="checkbox"], [type="radio"], [type="color"]) {
   outline: none;
 }
 
 input:focus {
-  border-color: var(--accent);
+  border-color: var(--focus-ring);
+}
+
+/* ── Buttons ──────────────────────────────────────────────────────────────
+   One vocabulary for every dialog and panel: primary (the action the dialog
+   is for), secondary (cancel, the other way out), danger (destroys something)
+   and ghost (a quiet extra). A component adds layout, never its own colours. */
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  min-height: var(--hit);
+  padding: 8px 16px;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  font-size: var(--fs-body);
+  font-weight: 600;
+  line-height: 1.2;
+  transition: background-color var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
+}
+
+.btn:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
+.btn-primary {
+  background: var(--accent);
+  color: var(--on-accent);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--accent-hover);
+}
+
+.btn-secondary {
+  background: var(--bg-tertiary);
+  color: var(--text-primary);
+  border-color: var(--border);
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background: var(--bg-hover);
+}
+
+.btn-danger {
+  background: var(--danger);
+  color: var(--on-danger);
+}
+
+.btn-danger:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+
+/* Destroys something, but is not the point of the dialog it sits in: an
+   outline, so it does not compete with the primary action. */
+.btn-danger-outline {
+  background: transparent;
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.btn-danger-outline:hover:not(:disabled) {
+  background: var(--danger);
+  color: var(--on-danger);
+}
+
+.btn-ghost {
+  background: transparent;
+  color: var(--text-secondary);
+}
+
+.btn-ghost:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
 }
 
 /* Icon button base — reusable across components */
@@ -149,27 +392,84 @@ input:focus {
   color: var(--text-secondary);
   border: none;
   cursor: pointer;
-  transition: background-color 0.15s, color 0.15s;
+  transition: background-color var(--dur-fast), color var(--dur-fast);
   flex-shrink: 0;
 }
 
-.icon-btn:hover {
-  background: var(--bg-hover);
-  color: var(--text-primary);
+/* Only where there is a hover: a finger leaves it on whatever it last tapped,
+   which then looked half on after Back had closed what it opened */
+@media (hover: hover) {
+  .icon-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
 }
 
 .icon-btn.active-danger {
   background: var(--danger);
-  color: white;
+  color: var(--on-danger);
 }
 
-.icon-btn.active-success {
-  background: var(--success);
-  color: white;
+/* A toggle that is on (noise suppression, speaker, the mixer): raised and
+   ringed in ink. Not mint: mint means live, and "on" is a setting. */
+.icon-btn.on {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+  box-shadow: inset 0 0 0 1px var(--text-muted);
+}
+
+/* ── Fields ── a label, the control, a hint, and an error tied to it with
+   aria-describedby. */
+.field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.field-label {
+  font-size: var(--fs-sm);
+  font-weight: 600;
+  color: var(--text-secondary);
+}
+
+.field-hint {
+  font-size: var(--fs-sm);
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.field-error {
+  font-size: var(--fs-sm);
+  color: var(--danger);
+  line-height: 1.4;
+}
+
+/* Numbers that update in place (ping, counts, bitrate, timers) keep their width */
+.num {
+  font-variant-numeric: tabular-nums;
+}
+
+/* For screen readers only: a label a sighted user gets from an icon or a colour */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
 }
 
 ::-webkit-scrollbar {
   width: 6px;
+  height: 6px;
+}
+
+/* Where a vertical and a horizontal bar meet: unstyled, it is a white square */
+::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 ::-webkit-scrollbar-track {
@@ -185,5 +485,5 @@ input:focus {
 
 /* ── Mobile overrides (non-scoped) ── */
 .app-layout.mobile {
-  --icon-btn-size: 40px;
+  --icon-btn-size: var(--hit);
 }

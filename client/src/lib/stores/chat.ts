@@ -716,7 +716,13 @@ export function clearDmChat(server: string, peerId: number, peerUsername: string
   scheduleSave();
 }
 
-export async function clearAllHistory() {
+/**
+ * Clear every channel's and every direct conversation's history, on every
+ * server. Resolves to null when it worked, or to why the saved copy on disk
+ * could not be removed — the screen is cleared either way, and the caller
+ * says which of the two happened instead of "cleared" for both.
+ */
+export async function clearAllHistory(): Promise<string | null> {
   // Same rule as one channel: what was deleted must not be handed back
   const marks = new Map(get(clearedBefore));
   for (const chats of [get(channelMessages), get(dmMessages)]) {
@@ -727,16 +733,19 @@ export async function clearAllHistory() {
   }
   clearedBefore.set(marks);
 
+  let failure: string | null = null;
   try {
     await invoke("clear_chat_history");
   } catch (e) {
     console.error("Failed to clear chat history:", e);
+    failure = String(e);
   }
   channelMessages.set(new Map());
   dmMessages.set(new Map());
   for (const server of get(dmConversations.all()).keys()) dmConversations.of(server).set([]);
   // The watermarks the backend kept are rewritten from what we just cleared
   scheduleSave();
+  return failure;
 }
 
 /**

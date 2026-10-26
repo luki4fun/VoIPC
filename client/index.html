@@ -2,7 +2,11 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+    <!-- resizes-content: in mobile Chrome the on-screen keyboard shrinks the
+         layout viewport (100dvh) instead of covering the message box -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover, interactive-widget=resizes-content" />
+    <!-- The browser's own chrome; theme.ts rewrites it with the palette -->
+    <meta name="theme-color" content="#1c1f24" />
     <title>VoIPC</title>
   </head>
   <body>

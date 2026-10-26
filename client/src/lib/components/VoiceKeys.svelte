@@ -19,6 +19,7 @@
   import { voice, voiceServer } from "../stores/channels.js";
   import { speakingUsers } from "../stores/users.js";
   import { audioSetupOpen, pttKey, pttHoldMode } from "../stores/settings.js";
+  import { keyOwner } from "../keybind.js";
   import {
     audioLevel,
     startTransmit,
@@ -154,12 +155,15 @@
 
   onMount(() => {
     keydownHandler = (e: KeyboardEvent) => {
-      // Don't trigger shortcuts when typing in input/textarea
-      const target = e.target as HTMLElement;
-      if (target.tagName === "INPUT" || target.tagName === "TEXTAREA") return;
+      // Typing is the field's; Space and Enter on a control the keyboard
+      // moved to are that control's (lib/keybind.ts keyOwner)
+      const owner = keyOwner(e.target instanceof HTMLElement ? e.target : null);
+      if (owner === "text") return;
+      const pressesControl = owner === "control" && (e.code === "Space" || e.key === "Enter");
 
-      // PTT key — only in PTT mode
-      if ($voiceMode === "ptt" && matchesPttBinding(e) && !e.repeat) {
+      // PTT key — only in PTT mode, and only in a call: outside one there is
+      // nothing to open, and the key goes back to being Space
+      if ($voiceMode === "ptt" && $voice !== null && !pressesControl && matchesPttBinding(e) && !e.repeat) {
         e.preventDefault();
         startTransmit();
         // Whatever else this key is bound to, it is the push-to-talk key
@@ -188,9 +192,12 @@
       // still opening the device is not transmitting yet, and has to be
       // told (stores/voice.ts).
 
-      // Stop transmit when the released key breaks the PTT binding
+      // Stop transmit when the released key breaks the PTT binding. A
+      // button activates on Space's *keyup*, so a control the keyboard is on
+      // keeps the event — stopping is still right either way.
       if ($voiceMode === "ptt" && shouldStopPtt(e)) {
-        e.preventDefault();
+        const owner = keyOwner(e.target instanceof HTMLElement ? e.target : null);
+        if (owner === "none") e.preventDefault();
         stopTransmit();
       }
     };

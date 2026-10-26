@@ -249,6 +249,16 @@
     <line x1="14" y1="10" x2="21" y2="3"/>
     <line x1="3" y1="21" x2="10" y2="14"/>
 
+  {:else if name === "popout"}
+    <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/>
+    <polyline points="15 3 21 3 21 9"/>
+    <line x1="10" y1="14" x2="21" y2="3"/>
+
+  {:else if name === "zoom-fit"}
+    <circle cx="11" cy="11" r="7"/>
+    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+    <line x1="8" y1="11" x2="14" y2="11"/>
+
   {/if}
 </svg>
 

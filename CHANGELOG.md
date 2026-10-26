@@ -2,6 +2,126 @@
 
 All notable changes to VoIPC are documented here.
 
+## [1.1.0] - 2026-10-26
+
+A design pass over every surface: the app on Linux, Windows, Android and in the
+browser, and the website. A new layout, Stage, is the headline, so this is a
+minor release; nothing changes on the wire, and 1.1.0 and 1.0.0 clients and
+relays talk to each other.
+
+### Stage: the call in the middle
+
+- **A third layout.** Modern and Classic put the chat in the centre. Stage puts
+  the call there: a tile for each person in your voice channel, a mint ring
+  around whoever is talking, the voice controls docked under it. Watching a
+  share puts the share on the stage, with the people in a strip under it.
+  The chat is a drawer beside it (a sheet from below on a phone), shut until
+  you ask for it. Out of a call, the stage lists the voice channels to go into.
+- Everyone is asked once more which layout they want, since there is a new one
+  to choose. Switch any time in Settings → Appearance.
+
+### VoIPC's own colours
+
+- **VoIPC night and VoIPC day** are the new defaults, taken from the logo:
+  charcoal, and one mint that means *live* — somebody talking, the talk button,
+  a live share, the connected state, and the action a dialog is for. A palette
+  you had already chosen stays as it is. Without a choice, the app follows the
+  system's light or dark setting at every start.
+- The original navy palette is called **Navy** now; Slate dark and Slate light
+  are unchanged.
+- Text on filled buttons and badges reads on every palette: the white on blue
+  and green fills was under the 4.5:1 contrast minimum. Every palette now has its
+  own colour for text on a fill, and the unit tests check it.
+- Initials on avatars read on every avatar colour (white on the old yellow was
+  1.3:1), and the avatar colours are VoIPC's own.
+- Selected tabs and cards, toggles that are on, ticked boxes and slider fills
+  are drawn in ink rather than the accent, which in VoIPC night is the mint that
+  means live; unread counts are ink badges.
+
+### Android
+
+- **Back closes what is open** — a menu, a dialog, the stream or mixer view, a
+  drawer — before it leaves, and leaving puts the app in the background with the
+  call still running instead of closing it.
+- The push-to-talk button stays on screen over the stream, room and mixer views,
+  so you can talk while watching a share.
+- The keyboard no longer covers the message box.
+- The window starts in the colour of the palette you chose, or of the system's
+  light or dark mode, instead of flashing white.
+- **Settings → Voice & video says how your microphone opens, and changes it, before you
+  join.** On a phone the only switch was in the voice bar, which exists only in a
+  call, so a stored "Always on" opened the microphone the moment you joined.
+- Changing the system's font or display size no longer reloads the app and takes
+  you out of the call view.
+- The keyboard no longer capitalises and spaces the server address or the invite
+  link, and the port and tag fields fit their digits at any text size.
+- On a touch screen the header buttons, row actions, member menus, panel buttons,
+  the voice bar's buttons, mode list and sliders, and the share viewer's controls
+  are at least 44 px, and channel and member rows grow to match.
+- A shared screen can be pinch-zoomed and panned, and fullscreen keeps the bar
+  with Stop on it.
+
+### Keyboard and screen readers
+
+- Push to talk in the browser kept stopping after you touched a slider or a
+  checkbox, until you clicked somewhere else. Fixed; and Space on a button you
+  reached with the keyboard presses that button again.
+- Keyboard focus is visible on every control; menus (the member menu, the server
+  header, the server rail) move with the arrow keys and give focus back when
+  they close; the room's people move with the arrow keys; panel edges resize with
+  them; key capture lets Escape cancel and Tab move on.
+- Sliders, toggles and the talk buttons say what they are and whether they are
+  on; errors in dialogs are read out.
+- Reduced motion is honoured everywhere.
+
+### Safer by default
+
+- Clearing all chat history, clearing a conversation, resetting all settings,
+  removing someone from a channel and trusting a server certificate that changed
+  each ask first, and say exactly what goes. A certificate prompt shows both
+  fingerprints, the remembered one and the one offered now.
+- Clearing all history says so when the saved copy could not be removed, instead
+  of reporting success either way.
+- Errors stay on screen until you close them; any toast waits while you point at it.
+
+### Fixed on Windows
+
+- **The screen-share pop-out froze VoIPC** (since 1.0.0): it opened a blank
+  window, and every control after it — mute, Stop watching, even Quit — hung
+  until the app was ended in Task Manager. The window is now made off the main
+  thread, as WebView2 requires.
+
+### Everything else
+
+- Settings is split into Voice & video, Appearance, Sounds & alerts, Privacy &
+  data, Games and About, with a list of keyboard shortcuts; the title and tabs
+  stay put while a tab scrolls, and the tabs take a second row rather than
+  hiding About past the edge of a narrow window.
+- Dialogs fit the smallest window (640×480) and scroll instead of hiding their
+  buttons.
+- A start shows your palette from the first frame, and the connect dialog and
+  the chat-history question wait for your settings, instead of flashing the
+  defaults, an empty address or "Set up chat history" first.
+- Chat shows a divider for each day, the full date on every time, and a "Jump to
+  latest" button when you have scrolled back.
+- Channel headers keep a channel's name as written and show a speaker for a
+  voice channel, not `#`.
+- The phone's Classic layout loses its title bar (the gear is in the status bar)
+  and its voice bar takes two rows instead of three.
+- Copy, paste and spelling suggestions are back in the message box's right-click
+  menu.
+- Share frames go only to the window that shows them, and the stream statistics
+  are polled only while a share is sent or watched.
+- The share viewer's header holds still: the statistics changing every second
+  no longer move Stop watching around. A share that was running before you
+  joined shows its sharer's name instead of "Unknown".
+- The website is redesigned around a server browser, with direct downloads for
+  each system, self-hosted fonts and current screenshots. `node
+  tools/screenshots.mjs` captures every layout and palette against a scratch
+  relay; `--website` writes the site's images.
+- `DESIGN.md` and `PRODUCT.md` record the design system and the product it
+  serves.
+
 ## [1.0.0] - 2026-10-25
 
 Protocol version 12: a 0.12 app and a 1.0 relay do not talk to each other, so

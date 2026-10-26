@@ -25,7 +25,7 @@
     defaultSoundSettings,
   } from "../stores/settings.js";
   import type { SoundSettings } from "../stores/settings.js";
-  import { voiceMode, vadThreshold } from "../stores/voice.js";
+  import { voiceMode, vadThreshold, setVoiceMode, type VoiceMode } from "../stores/voice.js";
   import {
     connectionState,
     isDeafened,
@@ -35,6 +35,7 @@
   } from "../stores/connection.js";
   import { testLabel, testSource } from "../spatial.js";
   import { clearAllHistory } from "../stores/chat.js";
+  import { confirmAction } from "../stores/confirm.js";
   import { addNotification } from "../stores/notifications.js";
   import { isMobile, isWeb, volumeKeyPtt } from "../stores/platform.js";
   import {
@@ -72,14 +73,17 @@
 
   let { onclose }: { onclose: () => void } = $props();
 
-  let activeTab = $state<"general" | "appearance" | "sounds">("general");
+  // What used to be one General tab of 25-30 controls and some twenty hints,
+  // split by what somebody comes to Settings to do
+  type Tab = "voice" | "appearance" | "sounds" | "privacy" | "games" | "about";
+  let activeTab = $state<Tab>("voice");
 
   // The accounts this device signs in to without a password (1.0 audit H5-12)
   let remembered = $state<{ server: string; name: string }[]>([]);
   const loadRemembered = () =>
     invoke<{ server: string; name: string }[]>("account_devices").then((list) => (remembered = list), () => (remembered = []));
   $effect(() => {
-    if (activeTab === "general") void loadRemembered();
+    if (activeTab === "privacy") void loadRemembered();
   });
   async function forgetRemembered(list: { server: string; name: string }[]) {
     for (const d of list) await invoke("forget_device", { server: d.server, name: d.name }).catch(() => {});
@@ -273,11 +277,14 @@
   }
 
   function handleCaptureKeyDown(e: KeyboardEvent) {
-    e.preventDefault();
-    e.stopPropagation();
     if (!capture) return;
     const step = capture.keydown(e);
-    if (step.kind === "hint") captureHint = step.hint;
+    // Tab moves on (the blur cancels); everything else is the capture's
+    if (step.kind === "pass") return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (step.kind === "cancel") cancelKeyCapture();
+    else if (step.kind === "hint") captureHint = step.hint;
     else finishCapture(step.binding);
   }
 
@@ -321,7 +328,38 @@
     });
   }
 
+  async function clearHistory() {
+    const ok = await confirmAction({
+      title: "Clear all chat history?",
+      body:
+        "Every channel and every direct conversation, on every server, is removed from this " +
+        "device. Copies a server keeps for your account are not touched. This cannot be undone.",
+      confirm: "Clear all history",
+      danger: true,
+    });
+    if (!ok) return;
+    const failure = await clearAllHistory();
+    if (failure) {
+      addNotification(
+        `The chat is cleared from this window, but the saved history on this device could not be removed: ${failure}`,
+        "error",
+      );
+    } else {
+      addNotification("Chat history cleared", "info");
+    }
+  }
+
   async function resetConfig() {
+    const ok = await confirmAction({
+      title: "Reset all settings?",
+      body:
+        "Every setting on this device goes back to its default: devices and volumes, push to " +
+        "talk and hotkeys, voice mode and noise suppression, sounds, and the remembered " +
+        "connection. Chat history is not touched.",
+      confirm: "Reset settings",
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await invoke("reset_config");
       pttKey.set("Space");
@@ -535,6 +573,17 @@
       addNotification(buildLine(), "info", 10000);
     }
   }
+
+  const tabs = $derived<{ id: Tab; label: string }[]>([
+    { id: "voice", label: "Voice & video" },
+    { id: "appearance", label: "Appearance" },
+    ...(!$isMobile || (isWeb && notifyPermission === "default")
+      ? [{ id: "sounds" as Tab, label: "Sounds & alerts" }]
+      : []),
+    { id: "privacy", label: "Privacy & data" },
+    ...(!isWeb && sdkAvailable ? [{ id: "games" as Tab, label: "Games" }] : []),
+    { id: "about", label: "About" },
+  ]);
 </script>
 
 <div class="overlay" role="presentation" onclick={backdrop(onclose)}>
@@ -544,30 +593,50 @@
       <button class="close-btn" onclick={onclose} title="Close" aria-label="Close settings"><Icon name="close" size={18} /></button>
     </div>
 
-    <div class="tabs">
-      <button
-        class="tab"
-        class:active={activeTab === "general"}
-        onclick={() => (activeTab = "general")}
-      >General</button>
-      <button
-        class="tab"
-        class:active={activeTab === "appearance"}
-        onclick={() => (activeTab = "appearance")}
-      >Appearance</button>
-      {#if !$isMobile}
+    <div class="tabs" role="tablist" aria-label="Settings">
+      {#each tabs as t (t.id)}
         <button
           class="tab"
-          class:active={activeTab === "sounds"}
-          onclick={() => (activeTab = "sounds")}
-        >Sounds</button>
-      {/if}
+          class:active={activeTab === t.id}
+          role="tab"
+          aria-selected={activeTab === t.id}
+          onclick={() => (activeTab = t.id)}
+        >{t.label}</button>
+      {/each}
     </div>
 
-    {#if activeTab === "general"}
+    <!-- Only this part scrolls: the title, the close button and the tabs stay
+         on screen however long a tab is -->
+    <div class="panel-body">
+    {#if activeTab === "voice"}
+      <!-- Before any call, on every platform: the voice bar's own copy of this
+           only exists in a call, so a phone joined with whatever mode it had
+           stored, an open microphone included, before it could be seen -->
+      <div class="section">
+        <h4 id="voice-mode-heading">How your microphone opens</h4>
+        <select
+          value={$voiceMode}
+          aria-labelledby="voice-mode-heading"
+          aria-describedby="voice-mode-hint"
+          onchange={(e) => setVoiceMode((e.currentTarget as HTMLSelectElement).value as VoiceMode)}
+        >
+          <option value="ptt">Push to talk</option>
+          <option value="vad">Voice activation</option>
+          <option value="always_on">Always on</option>
+        </select>
+        <span class="toggle-hint" id="voice-mode-hint">
+          From the moment you join a voice channel.
+          {$voiceMode === "ptt"
+            ? "Nothing is sent until you hold the talk key or button."
+            : $voiceMode === "vad"
+              ? "Sent whenever your voice is louder than the threshold."
+              : "Sent all the time you are in the channel, unless you mute."}
+        </span>
+      </div>
+
       {#if !$isMobile}
         <div class="section">
-          <h4>Audio Input</h4>
+          <h4>Audio input</h4>
           <!-- Bound to what is saved, not to `is_default`: a device somebody
                chose on purpose was shown as unselected, so the panel claimed
                they were on the system default when they were not. -->
@@ -606,7 +675,7 @@
         </div>
 
         <div class="section">
-          <h4>Audio Output</h4>
+          <h4>Audio output</h4>
           <select value={$outputDevice || defaultDeviceName($outputDevices)} onchange={changeOutputDevice}>
             {#each $outputDevices as device}
               <option value={device.name}>
@@ -623,7 +692,7 @@
         </div>
 
         <div class="section">
-          <h4>Push to Talk Key</h4>
+          <h4>Push-to-talk key</h4>
           <div class="ptt-config">
             {#if isCapturingKey && captureTarget === "ptt"}
               <span
@@ -661,7 +730,7 @@
 
         {#if !isWeb}
         <div class="section">
-          <h4>Global Hotkeys</h4>
+          <h4>Global hotkeys</h4>
           <div class="ptt-config">
             <span class="hotkey-label">Toggle mute</span>
             {#if isCapturingKey && captureTarget === "mute"}
@@ -707,10 +776,10 @@
         {/if}
       {:else}
         <div class="section">
-          <h4>Push to Talk</h4>
+          <h4>Push to talk</h4>
           <label class="toggle-row">
             <input type="checkbox" checked={$volumeKeyPtt} onchange={handleVolumeKeyPtt} />
-            <span class="toggle-label">Use volume button for PTT</span>
+            <span class="toggle-label">Use the volume button to talk</span>
             <span class="toggle-hint">Hold Volume Down to talk (overrides normal volume control)</span>
           </label>
         </div>
@@ -718,7 +787,7 @@
 
       {#if !isWeb}
       <div class="section">
-        <h4>Screen Share</h4>
+        <h4>Screen share</h4>
         <select value={$screenShareCodec} onchange={changeScreenShareCodec}>
           <option value="h264">H.264 — every viewer can watch</option>
           <option value="h265">H.265 — less bandwidth, desktop viewers only</option>
@@ -730,7 +799,7 @@
       {/if}
 
       <div class="section">
-        <h4>Spatial Audio</h4>
+        <h4>Spatial audio</h4>
         <label class="toggle-row">
           <input
             type="checkbox"
@@ -805,9 +874,24 @@
         </span>
       </div>
 
+      {#if !$isMobile}
+        <div class="section">
+          <h4>Keyboard shortcuts</h4>
+          <dl class="shortcuts">
+            <dt><kbd>{$pttKey}</kbd></dt><dd>Talk, while held (push to talk)</dd>
+            <dt><kbd>Ctrl</kbd> <kbd>M</kbd></dt><dd>Mute or unmute your microphone</dd>
+            <dt><kbd>Ctrl</kbd> <kbd>D</kbd></dt><dd>Deafen or undeafen{#if isWeb} (in a browser this replaces its bookmark key){/if}</dd>
+            <dt><kbd>Esc</kbd></dt><dd>Close a dialog, a menu or the room and mixer view</dd>
+            <dt><kbd>+</kbd> <kbd>−</kbd> <kbd>0</kbd></dt><dd>Zoom a shared screen in, out, or back to fit</dd>
+          </dl>
+        </div>
+      {/if}
+    {/if}
+
+    {#if activeTab === "games"}
       {#if !isWeb && sdkAvailable}
       <div class="section">
-        <h4>Game Integration</h4>
+        <h4>Game integration</h4>
         <label class="toggle-row">
           <input
             type="checkbox"
@@ -893,6 +977,9 @@
       </div>
       {/if}
 
+    {/if}
+
+    {#if activeTab === "about"}
       <div class="section">
         <h4>Connection</h4>
         <label class="toggle-row">
@@ -946,6 +1033,9 @@
         </div>
       {/if}
 
+    {/if}
+
+    {#if activeTab === "sounds"}
       {#if isWeb && notifyPermission === "default"}
         <div class="section">
           <h4>Notifications</h4>
@@ -957,6 +1047,9 @@
         </div>
       {/if}
 
+    {/if}
+
+    {#if activeTab === "privacy"}
       <div class="section">
         <h4>Remembered accounts</h4>
         {#if remembered.length === 0}
@@ -965,11 +1058,11 @@
           {#each remembered as d (`${d.server}|${d.name}`)}
             <div class="device-row">
               <span>{d.name} on {d.server}</span>
-              <button class="danger-btn" onclick={() => forgetRemembered([d])}>Forget</button>
+              <button class="danger-btn btn btn-danger-outline" onclick={() => forgetRemembered([d])}>Forget</button>
             </div>
           {/each}
           {#if remembered.length > 1}
-            <button class="danger-btn" onclick={() => forgetRemembered(remembered)}>Forget all</button>
+            <button class="danger-btn btn btn-danger-outline" onclick={() => forgetRemembered(remembered)}>Forget all</button>
           {/if}
           <span class="toggle-hint">Forgotten, an account needs its password again on this {isWeb ? "browser" : "device"}.</span>
         {/if}
@@ -994,7 +1087,7 @@
           <span class="toggle-hint">
             {$chatHistoryDisabled
               ? "Off — chat is kept in memory only and lost on exit"
-              : "Messages are stored in the encrypted vault"}
+              : "Saved on this device, encrypted with your password"}
           </span>
         </label>
         {/if}
@@ -1017,7 +1110,7 @@
           />
           <span class="toggle-label">Share recent channel chat with newcomers</span>
           <span class="toggle-hint">
-            When someone joins a channel you are in, your client may hand them the last 50 messages it has there — end-to-end encrypted to that person only, never through the server in the clear. While this is on, the other people there can see that you are one of the members worth asking
+            When someone joins a channel you are in, your client may hand them the last 50 messages it has there — end-to-end encrypted to that person only, never through the server in the clear. While this is on, the other people there can see that you are one of the members worth asking.
           </span>
         </label>
         <div class="ptt-config">
@@ -1046,12 +1139,8 @@
           any one conversation goes.
         </span>
         <div class="btn-row">
-          <button class="danger-btn" onclick={async () => { await clearAllHistory(); addNotification("Chat history cleared", "info"); }}>
-            Clear Chat History
-          </button>
-          <button class="danger-btn" onclick={resetConfig}>
-            Reset Config
-          </button>
+          <button class="danger-btn btn btn-danger-outline" onclick={clearHistory}>Clear all chat history…</button>
+          <button class="danger-btn btn btn-danger-outline" onclick={resetConfig}>Reset all settings…</button>
         </div>
       </div>
     {/if}
@@ -1059,17 +1148,14 @@
     {#if activeTab === "appearance"}
       <div class="section">
         <h4>Layout</h4>
-        <div class="layout-choices">
-          <LayoutPreview
-            layout="modern"
-            selected={$uiPrefs.layout === "modern"}
-            onpick={() => updateUiPrefs((p) => (p.layout = "modern"))}
-          />
-          <LayoutPreview
-            layout="classic"
-            selected={$uiPrefs.layout === "classic"}
-            onpick={() => updateUiPrefs((p) => (p.layout = "classic"))}
-          />
+        <div class="layout-choices" role="radiogroup" aria-label="Layout">
+          {#each ["modern", "classic", "stage"] as const as id (id)}
+            <LayoutPreview
+              layout={id}
+              selected={$uiPrefs.layout === id}
+              onpick={() => updateUiPrefs((p) => (p.layout = id))}
+            />
+          {/each}
         </div>
       </div>
 
@@ -1130,7 +1216,7 @@
 
       <div class="section">
         <h4>Reset</h4>
-        <button class="danger-btn" onclick={resetAppearance}>
+        <button class="danger-btn btn btn-danger-outline" onclick={resetAppearance}>
           Reset appearance to defaults
         </button>
         <span class="danger-hint">
@@ -1186,6 +1272,7 @@
       onclick={copyBuildLine}
       title={`Built from ${buildHash} at ${buildTime}. Click to copy.`}
     >{buildLine()}</button>
+    </div>
   </div>
 </div>
 
@@ -1193,21 +1280,57 @@
   .overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.5);
+    background: var(--scrim);
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 50;
+    z-index: var(--z-settings);
   }
 
   .panel {
+    display: flex;
+    flex-direction: column;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: 8px;
-    padding: 24px;
-    width: min(480px, 92vw);
-    max-height: 80vh;
+    padding: 24px 24px 0;
+    width: min(640px, 92vw);
+    max-height: min(80vh, calc(100dvh - 32px));
+    overflow: hidden;
+  }
+
+  .panel-body {
+    flex: 1;
+    min-height: 0;
     overflow-y: auto;
+    padding-bottom: 24px;
+  }
+
+  .shortcuts {
+    display: grid;
+    grid-template-columns: auto 1fr;
+    gap: 8px 16px;
+    align-items: baseline;
+    font-size: var(--fs-body);
+    color: var(--text-secondary);
+  }
+
+  .shortcuts dt {
+    white-space: nowrap;
+  }
+
+  kbd {
+    display: inline-block;
+    min-width: 22px;
+    padding: 1px 6px;
+    border: 1px solid var(--border);
+    border-bottom-width: 2px;
+    border-radius: var(--r-sm);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font: inherit;
+    font-size: var(--fs-sm);
+    text-align: center;
   }
 
   .panel-header {
@@ -1218,8 +1341,8 @@
   }
 
   h3 {
-    font-size: 18px;
-    color: var(--accent);
+    font-size: var(--fs-xl);
+    color: var(--text-primary);
   }
 
   .close-btn {
@@ -1237,22 +1360,30 @@
   }
 
   /* Tabs */
+  /* Six tabs do not fit a phone: the row scrolls sideways instead of wrapping */
+  /* Every tab on screen: a row that scrolled hid About (the version and the
+     updates) past the edge with nothing to say it was there. Where six do
+     not fit in one row they take two. */
   .tabs {
     display: flex;
+    flex-wrap: wrap;
     gap: 0;
     margin-bottom: 20px;
     border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
   }
 
   .tab {
     background: transparent;
     color: var(--text-secondary);
-    font-size: 13px;
-    padding: 8px 20px;
+    font-size: var(--fs-body);
+    padding: 8px 12px;
+    white-space: nowrap;
+    flex-shrink: 0;
     border: none;
     border-bottom: 2px solid transparent;
     cursor: pointer;
-    transition: color 0.15s, border-color 0.15s;
+    transition: color var(--dur-fast), border-color var(--dur-fast);
   }
 
   .tab:hover {
@@ -1260,8 +1391,8 @@
   }
 
   .tab.active {
-    color: var(--accent);
-    border-bottom-color: var(--accent);
+    color: var(--text-primary);
+    border-bottom-color: var(--text-primary);
   }
 
   .section {
@@ -1281,7 +1412,7 @@
     border: 1px solid var(--border);
     border-radius: 4px;
     padding: 4px 10px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     cursor: pointer;
     white-space: nowrap;
   }
@@ -1301,13 +1432,13 @@
 
   .level-fill {
     height: 100%;
-    background: #43b581;
+    background: var(--success);
     border-radius: 4px;
     transition: width 60ms linear;
   }
 
   h4 {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     text-transform: uppercase;
     letter-spacing: 0.5px;
     color: var(--text-secondary);
@@ -1321,12 +1452,11 @@
     color: var(--text-primary);
     border: 1px solid var(--border);
     border-radius: 4px;
-    font-size: 14px;
-    outline: none;
+    font-size: var(--fs-md);
   }
 
   select:focus {
-    border-color: var(--accent);
+    border-color: var(--focus-ring);
   }
 
   .toggle-row {
@@ -1340,19 +1470,23 @@
 
   .toggle-row input[type="checkbox"] {
     margin-top: 2px;
-    accent-color: var(--accent);
+    accent-color: var(--control-fill);
   }
 
   .toggle-label {
-    font-size: 13px;
+    font-size: var(--fs-body);
     color: var(--text-primary);
   }
 
+  /* Its own block, indented as a whole under the control it explains (a
+     margin on an inline span moved only the first line), at the 12 px floor */
   .toggle-hint {
+    display: block;
+    box-sizing: border-box;
     width: 100%;
-    font-size: 11px;
+    padding-left: 22px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
-    margin-left: 22px;
   }
 
   .ptt-config {
@@ -1366,7 +1500,7 @@
   }
 
   .hotkey-label {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     min-width: 90px;
   }
@@ -1375,7 +1509,7 @@
     display: flex;
     align-items: center;
     gap: 10px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
   }
 
@@ -1384,7 +1518,7 @@
   }
 
   .sdk-input {
-    font-size: 13px;
+    font-size: var(--fs-body);
     padding: 6px 8px;
     background: var(--bg-primary);
     color: var(--text-primary);
@@ -1396,12 +1530,16 @@
     resize: vertical;
   }
 
+  .sdk-input:focus {
+    border-color: var(--focus-ring);
+  }
+
   .current-key {
     background: var(--bg-primary);
     border: 1px solid var(--border);
     border-radius: 4px;
     padding: 8px 16px;
-    font-size: 14px;
+    font-size: var(--fs-md);
     font-family: monospace;
   }
 
@@ -1417,7 +1555,7 @@
     color: var(--text-secondary);
     border: 1px solid var(--border);
     padding: 8px 16px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     border-radius: 4px;
     cursor: pointer;
   }
@@ -1443,22 +1581,12 @@
     justify-content: space-between;
     gap: 8px;
     margin-bottom: 6px;
-    font-size: 13px;
+    font-size: var(--fs-body);
   }
 
   .danger-btn {
-    background: transparent;
-    color: var(--danger);
-    border: 1px solid var(--danger);
     padding: 8px 16px;
-    font-size: 13px;
-    border-radius: 4px;
-    cursor: pointer;
-  }
-
-  .danger-btn:hover {
-    background: var(--danger);
-    color: white;
+    font-size: var(--fs-body);
   }
 
   /* Appearance tab */
@@ -1479,7 +1607,7 @@
     background: none;
     color: var(--text-secondary);
     font-family: inherit;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     text-align: center;
     cursor: pointer;
   }
@@ -1491,7 +1619,7 @@
   .danger-hint {
     display: block;
     margin-top: 6px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     line-height: 1.4;
     color: var(--text-secondary);
   }
@@ -1501,13 +1629,13 @@
     flex-direction: column;
     gap: 4px;
     margin-top: 10px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     color: var(--text-secondary);
   }
 
   .slider-row input[type="range"] {
     width: 100%;
-    accent-color: var(--accent);
+    accent-color: var(--control-fill);
   }
 
   /* Sounds tab */
@@ -1538,18 +1666,18 @@
   }
 
   .sound-toggle input[type="checkbox"] {
-    accent-color: var(--accent);
+    accent-color: var(--control-fill);
   }
 
   .sound-label {
-    font-size: 14px;
+    font-size: var(--fs-md);
     font-weight: 500;
     color: var(--text-primary);
   }
 
   .sound-desc {
     display: block;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     color: var(--text-secondary);
     margin: 4px 0 8px 0;
   }
@@ -1562,7 +1690,7 @@
 
   .sound-path {
     flex: 1;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     background: var(--bg-secondary);
     border: 1px solid var(--border);
@@ -1578,7 +1706,7 @@
     color: var(--text-secondary);
     border: 1px solid var(--border);
     padding: 4px 10px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     border-radius: 3px;
     cursor: pointer;
     white-space: nowrap;
@@ -1597,6 +1725,6 @@
 
   .sound-btn.clear:hover {
     background: var(--danger);
-    color: white;
+    color: var(--on-danger);
   }
 </style>

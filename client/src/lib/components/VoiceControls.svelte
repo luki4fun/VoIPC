@@ -7,6 +7,7 @@
   // actions are reachable from, not their owner.
 
   import { invoke } from "@tauri-apps/api/core";
+  import { addNotification } from "../stores/notifications.js";
   import {
     isMuted,
     isDeafened,
@@ -47,6 +48,7 @@
       await invoke("set_input_gain", { gain });
     } catch (err) {
       console.error("Failed to set input gain:", err);
+      addNotification(`Could not change the microphone gain: ${err}`, "error");
     }
   }
 
@@ -58,6 +60,7 @@
       await invoke("set_volume", { volume: vol });
     } catch (err) {
       console.error("Failed to set volume:", err);
+      addNotification(`Could not change the volume: ${err}`, "error");
     }
   }
 
@@ -72,6 +75,7 @@
       await invoke("set_vad_threshold", { thresholdDb: db });
     } catch (err) {
       console.error("Failed to set VAD threshold:", err);
+      addNotification(`Could not change the voice activation threshold: ${err}`, "error");
     }
   }
 
@@ -79,7 +83,7 @@
   // sidebar then shows that server, and nothing else names the one this bar
   // (and its Leave button) acts on.
   const voiceWhere = $derived(
-    `#${$voiceChannel?.name ?? ""} · ${$serverEntries.find((e) => e.inVoice)?.name ?? ""}`,
+    `${$voiceChannel?.name ?? ""} · ${$serverEntries.find((e) => e.inVoice)?.name ?? ""}`,
   );
 
   // Audio level meter — clamp to -60..0 range for display
@@ -87,33 +91,55 @@
   let thresholdPercent = $derived(Math.max(0, Math.min(100, (($vadThreshold + 60) / 60) * 100)));
 </script>
 
-<div class="voice-controls">
+<div class="voice-controls" class:mobile={$isMobile}>
   {#if voiceDisabled}
     <span class="voice-disabled">Not in a voice channel</span>
   {:else}
     {#if !$viewingVoice}
       <span class="voice-where" title="In voice on another server">{voiceWhere}</span>
     {/if}
-    <select class="mode-select" value={$voiceMode} onchange={handleModeChange}>
-      <option value="ptt">PTT</option>
-      <option value="vad">Voice</option>
-      <option value="always_on">Open</option>
+    <select class="mode-select" value={$voiceMode} onchange={handleModeChange} aria-label="How your microphone opens">
+      <option value="ptt">Push to talk</option>
+      <option value="vad">Voice activation</option>
+      <option value="always_on">Always on</option>
     </select>
 
     {#if $voiceMode === "ptt"}
       {#if !$isMobile}
+        <!-- Held with any pointer (captured, so sliding off it does not drop
+             the hold) or with Space / Enter from the keyboard -->
         <button
           class="ptt-btn"
           class:active={$isTransmitting}
           class:by-game={$transmitHeldByGame}
-          onmousedown={startTransmit}
-          onmouseup={stopTransmit}
-          onmouseleave={stopTransmit}
+          aria-pressed={$isTransmitting}
+          onpointerdown={(e) => {
+            if (e.button !== 0) return;
+            (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
+            void startTransmit();
+          }}
+          onpointerup={() => void stopTransmit()}
+          onpointercancel={() => void stopTransmit()}
+          onkeydown={(e) => {
+            if ((e.key === " " || e.key === "Enter") && !e.repeat) {
+              e.preventDefault();
+              void startTransmit();
+            }
+          }}
+          onkeyup={(e) => {
+            if (e.key === " " || e.key === "Enter") {
+              e.preventDefault();
+              void stopTransmit();
+            }
+          }}
+          onblur={() => {
+            if ($isTransmitting && !$transmitHeldByGame) void stopTransmit();
+          }}
           title={$transmitHeldByGame
             ? "The game is holding your push-to-talk (Settings → Game Integration)"
             : undefined}
         >
-          {$transmitHeldByGame ? "Game is talking" : `PTT: ${$pttKey}`}
+          {$transmitHeldByGame ? "Game is talking" : `Talk: ${$pttKey}`}
         </button>
       {/if}
     {:else if $voiceMode === "vad"}
@@ -130,11 +156,13 @@
           step="1"
           value={$vadThreshold}
           oninput={handleThresholdChange}
-          title="VAD threshold: {$vadThreshold} dB"
+          title="Voice activation threshold: {$vadThreshold} dB"
+          aria-label="Voice activation threshold"
+          aria-valuetext="{$vadThreshold} dB"
         />
       </div>
     {:else}
-      <span class="mode-label">Always transmitting</span>
+      <span class="mode-label">Microphone always on</span>
     {/if}
 
     <div class="divider"></div>
@@ -160,7 +188,7 @@
 
       <button aria-label="Noise suppression" aria-pressed={$noiseSuppression}
         class="icon-btn"
-        class:active-success={$noiseSuppression}
+        class:on={$noiseSuppression}
         class:ns-off={!$noiseSuppression}
         onclick={toggleNoiseSuppression}
         title={$noiseSuppression ? "Disable noise suppression" : "Enable noise suppression"}
@@ -171,7 +199,7 @@
       {#if $isMobile}
         <button aria-label="Speaker" aria-pressed={$speakerMode}
           class="icon-btn"
-          class:active-success={$speakerMode}
+          class:on={$speakerMode}
           class:ns-off={!$speakerMode}
           onclick={toggleSpeaker}
           title={$speakerMode ? "Switch to earpiece" : "Switch to speaker"}
@@ -183,7 +211,7 @@
       {#if !$isMobile && $currentProximity !== "off"}
         <button
           class="icon-btn"
-          class:active-success={$centreView === "room"}
+          class:on={$centreView === "room"}
           onclick={() => centreView.set($centreView === "room" ? "chat" : "room")}
           title={$centreView === "room" ? "Back to chat" : "Show the virtual room"}
         >
@@ -193,7 +221,7 @@
 
       <button
         class="icon-btn"
-        class:active-success={$centreView === "mixer" && $micLane.effect === "none"}
+        class:on={$centreView === "mixer" && $micLane.effect === "none"}
         class:active-danger={$micLane.effect !== "none"}
         onclick={() => centreView.set($centreView === "mixer" ? "chat" : "mixer")}
         title={$micLane.effect !== "none"
@@ -225,6 +253,8 @@
       step="0.1"
       value={$inputGain}
       oninput={handleGainChange}
+      aria-label="Microphone gain"
+      aria-valuetext="{Math.round($inputGain * 100)}%"
     />
   </div>
 
@@ -237,6 +267,8 @@
       step="0.05"
       value={$volume}
       oninput={handleVolumeChange}
+      aria-label="Output volume"
+      aria-valuetext="{Math.round($volume * 100)}%"
     />
   </div>
 </div>
@@ -255,7 +287,7 @@
   }
 
   .voice-disabled {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     font-style: italic;
   }
@@ -266,7 +298,7 @@
     text-overflow: ellipsis;
     white-space: nowrap;
     color: var(--success);
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
 
   .leave-voice-btn:hover {
@@ -279,13 +311,12 @@
     border: 1px solid var(--border);
     border-radius: 6px;
     padding: 6px 28px 6px 8px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     cursor: pointer;
-    outline: none;
   }
 
   .mode-select:focus {
-    border-color: var(--accent);
+    border-color: var(--focus-ring);
   }
 
   .ptt-btn {
@@ -293,7 +324,7 @@
     color: var(--text-primary);
     padding: 8px 20px;
     font-weight: 600;
-    font-size: 13px;
+    font-size: var(--fs-body);
     min-width: 100px;
   }
 
@@ -303,7 +334,7 @@
 
   .ptt-btn.active {
     background: var(--success);
-    color: white;
+    color: var(--on-success);
   }
 
   /* Somebody else opened this microphone. It is still a microphone that is
@@ -311,11 +342,11 @@
      the key", because you did not. */
   .ptt-btn.by-game {
     background: var(--accent);
-    color: white;
+    color: var(--on-accent);
   }
 
   .mode-label {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     font-style: italic;
     padding: 0 8px;
@@ -338,7 +369,7 @@
 
   .meter-fill {
     height: 100%;
-    background: linear-gradient(90deg, #43b581, #faa61a 70%, #f04747 95%);
+    background: linear-gradient(90deg, var(--success), var(--warning) 70%, var(--danger) 95%);
     border-radius: 4px;
     transition: width 0.05s linear;
   }
@@ -355,7 +386,7 @@
   .threshold-slider {
     width: 100%;
     height: 10px;
-    accent-color: var(--accent);
+    accent-color: var(--control-fill);
     background: transparent;
     border: none;
     padding: 0;
@@ -391,9 +422,59 @@
 
   input[type="range"] {
     width: 100px;
-    accent-color: var(--accent);
+    accent-color: var(--control-fill);
     background: transparent;
     border: none;
     padding: 0;
+  }
+
+  /* A phone's voice bar in two rows, in every layout: the buttons first, the
+     whole width; the mode and both sliders sharing the row under them. With
+     the mode's name spelled out it took a row of its own otherwise. */
+  .voice-controls.mobile .control-group {
+    order: -1;
+    flex-basis: 100%;
+    justify-content: center;
+  }
+
+  .voice-controls.mobile .divider {
+    display: none;
+  }
+
+  /* A slider narrower than a thumb's travel is no slider: with "Microphone
+     always on" spelled out beside the mode, they take a row of their own */
+  .voice-controls.mobile .volume {
+    flex: 1 1 140px;
+    min-width: 0;
+    margin-left: 0;
+  }
+
+  .voice-controls.mobile .volume input {
+    width: 100%;
+    min-width: 0;
+  }
+
+  /* A phone on its side: one row. Three rows took the height a watched share
+     needs; the sliders are in the mixer, and in the bar in portrait. */
+  @media (max-height: 520px) and (pointer: coarse) {
+    .voice-controls.mobile .control-group {
+      order: 0;
+      flex-basis: auto;
+    }
+
+    .voice-controls.mobile .volume {
+      display: none;
+    }
+  }
+
+  /* A finger's worth of height, around the same thin track */
+  @media (pointer: coarse) {
+    .mode-select {
+      min-height: var(--hit);
+    }
+
+    input[type="range"] {
+      height: var(--hit);
+    }
   }
 </style>

@@ -3,7 +3,7 @@
   // most. Everything it does goes through stores/voice.ts, the same actions the
   // classic voice bar and the push-to-talk key use.
 
-  import { avatarColor } from "../../avatar.js";
+  import { avatarStyle } from "../../avatar.js";
   import { shortName } from "../../username.js";
   import {
     connectionState,
@@ -32,7 +32,7 @@
 
 <div class="user-panel">
   <button class="me" onclick={onopenvoice} title="Voice settings">
-    <span class="avatar" class:speaking={$isTransmitting} style="background: {avatarColor(displayName)}"
+    <span class="avatar" class:speaking={$isTransmitting} style={avatarStyle(displayName)}
       >{displayName.charAt(0).toUpperCase() || "?"}</span
     >
     <span class="who">
@@ -115,8 +115,7 @@
     width: 32px;
     height: 32px;
     border-radius: 50%;
-    color: #fff;
-    font-size: 13px;
+    font-size: var(--fs-body);
     font-weight: 600;
     flex-shrink: 0;
   }
@@ -132,7 +131,7 @@
   }
 
   .name {
-    font-size: 13px;
+    font-size: var(--fs-body);
     font-weight: 600;
     color: var(--text-primary);
     overflow: hidden;
@@ -140,9 +139,14 @@
     white-space: nowrap;
   }
 
+  /* "Disconnected", "Reconnecting…": cut short like the name, rather than
+     running under the buttons beside it (and at the 12 px floor) */
   .sub {
-    font-size: 11px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .panel-actions {
@@ -171,5 +175,12 @@
 
   .panel-btn.danger {
     color: var(--danger);
+  }
+
+  @media (pointer: coarse) {
+    .panel-btn {
+      width: var(--hit);
+      height: var(--hit);
+    }
   }
 </style>

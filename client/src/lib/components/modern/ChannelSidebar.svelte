@@ -51,7 +51,7 @@
   import { isCulled, visibleChannels } from "../../stores/roster.js";
   import { openShare } from "../../stores/user-menu.js";
   import { memberMenu } from "../../actions/member-menu.js";
-  import { avatarColor } from "../../avatar.js";
+  import { avatarStyle } from "../../avatar.js";
   import { shortName } from "../../username.js";
   import ChannelCreateForm from "../ChannelCreateForm.svelte";
   import Icon from "../Icons.svelte";
@@ -217,7 +217,7 @@
               class:culled={isCulled(member.user_id, $audibleIds, $userId, !joined || !$viewingVoice)}
               use:memberMenu={{ user: member, self: member.user_id === $userId }}
             >
-              <span class="nested-avatar" style="background: {avatarColor(member.username)}"
+              <span class="nested-avatar" style={avatarStyle(member.username)}
                 >{member.username.charAt(0).toUpperCase()}</span
               >
               <span class="nested-name" title={member.username}>{shortName(member.username)}</span>
@@ -252,7 +252,7 @@
   {#if $dmConversations.length > 0}
     <div class="dm-section">
       <div class="sidebar-head">
-        <span class="sidebar-title">Direct Messages</span>
+        <span class="sidebar-title">Direct messages</span>
       </div>
       <div class="dm-list">
         {#each $dmConversations as convo (convo.user_id)}
@@ -261,7 +261,7 @@
             class:active={$activeDmUserId === convo.user_id}
             onclick={() => openDm($serverAddress, convo.user_id, convo.username)}
           >
-            <span class="dm-avatar" style="background: {avatarColor(convo.username)}"
+            <span class="dm-avatar" style={avatarStyle(convo.username)}
               >{convo.username.charAt(0).toUpperCase()}</span
             >
             <span class="dm-name" title={convo.username}>{shortName(convo.username)}</span>
@@ -282,6 +282,8 @@
     width: 100%;
     background: var(--bg-secondary);
     overflow-y: auto;
+    /* overflow-y alone makes x scroll too: a long name is cut, not panned */
+    overflow-x: hidden;
     padding-bottom: 8px;
   }
 
@@ -293,7 +295,7 @@
   }
 
   .sidebar-title {
-    font-size: 11px;
+    font-size: var(--fs-micro);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.02em;
@@ -356,13 +358,13 @@
 
   /* A text channel you are not in: still listed, still readable once joined. */
   .channel.unjoined {
-    opacity: 0.6;
+    color: var(--text-muted);
   }
 
   /* One you walked out of, which the tag beside it says in words. Dimmer
      than merely unjoined, because the difference is a decision you made. */
   .channel.left {
-    opacity: 0.45;
+    color: var(--text-muted);
     font-style: italic;
   }
 
@@ -383,7 +385,7 @@
 
   .proximity-tag,
   .channel :global(.proximity-tag) {
-    font-size: 9px;
+    font-size: var(--fs-micro);
     font-weight: 700;
     letter-spacing: 0.05em;
     padding: 1px 4px;
@@ -394,7 +396,7 @@
   }
 
   .user-count {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     flex-shrink: 0;
   }
@@ -404,8 +406,8 @@
     padding: 0 5px;
     border-radius: 8px;
     background: var(--danger);
-    color: #fff;
-    font-size: 11px;
+    color: var(--on-danger);
+    font-size: var(--fs-micro);
     font-weight: 700;
     text-align: center;
     flex-shrink: 0;
@@ -475,7 +477,7 @@
     gap: 6px;
     padding: 3px 8px;
     border-radius: 4px;
-    font-size: 14px;
+    font-size: var(--fs-md);
     color: var(--text-secondary);
   }
 
@@ -487,7 +489,11 @@
   /* A game says who is in earshot by leaving everyone else out — shown rather
      than hidden, for the same reason as in the classic member list. */
   .nested-member.culled {
-    opacity: 0.45;
+    color: var(--text-muted);
+  }
+
+  .nested-member.culled .nested-avatar {
+    opacity: 0.5;
   }
 
   .nested-avatar {
@@ -497,11 +503,10 @@
     width: 22px;
     height: 22px;
     border-radius: 50%;
-    color: #fff;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     font-weight: 600;
     flex-shrink: 0;
-    transition: box-shadow 0.1s;
+    transition: box-shadow var(--dur-fast);
   }
 
   .nested-member.speaking .nested-avatar {
@@ -529,25 +534,27 @@
     color: var(--warning);
   }
 
+  /* A share going out is live, so mint, filled: the same pill as Stage's
+     Watch button, and the on-accent pair is the one tested at 4.5:1 on every
+     palette (accent as bare text is only held to 3:1) */
   .live-tag {
-    font-size: 9px;
+    font-size: var(--fs-micro);
     font-weight: 700;
     letter-spacing: 0.05em;
-    padding: 1px 4px;
+    padding: 1px 5px;
     border-radius: 4px;
-    border: 1px solid var(--danger);
-    color: var(--danger);
+    border: none;
+    background: var(--accent);
+    color: var(--on-accent);
     flex-shrink: 0;
   }
 
   button.live-tag {
-    background: transparent;
     line-height: inherit;
   }
 
   button.live-tag:hover {
-    background: var(--danger);
-    color: #fff;
+    background: var(--accent-hover);
   }
 
   .dm-section {
@@ -587,8 +594,7 @@
     width: 24px;
     height: 24px;
     border-radius: 50%;
-    color: #fff;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     font-weight: 600;
     flex-shrink: 0;
   }
@@ -606,9 +612,45 @@
     padding: 0 5px;
     border-radius: 8px;
     background: var(--danger);
-    color: #fff;
-    font-size: 11px;
+    color: var(--on-danger);
+    font-size: var(--fs-micro);
     font-weight: 700;
     text-align: center;
+  }
+
+  /* ── Touch ── 44px to aim at (--hit). The rows grow rather than their icons
+     growing over each other: a list row on a phone is 44-48px anyway, and a
+     taller row gives the leave and settings buttons its full height. */
+  @media (pointer: coarse) {
+    .add-btn {
+      width: var(--hit);
+      height: var(--hit);
+      margin: -8px -12px -8px 0;
+    }
+    .channel,
+    .dm-entry {
+      min-height: var(--hit);
+    }
+    .nested-member {
+      min-height: 40px;
+    }
+    .settings-icon {
+      min-width: 40px;
+      min-height: var(--hit);
+      justify-content: center;
+    }
+    .channel.has-actions {
+      padding-right: 92px;
+    }
+    button.live-tag {
+      position: relative;
+      padding: 4px 10px;
+    }
+    /* The pill stays small to look at; what a finger has to hit is larger */
+    button.live-tag::after {
+      content: "";
+      position: absolute;
+      inset: -10px -6px;
+    }
   }
 </style>

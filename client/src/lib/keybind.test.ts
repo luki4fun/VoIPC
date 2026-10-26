@@ -65,3 +65,37 @@ test("a push-to-talk key that also mutes you is named before it is chosen", () =
   assert.equal(shadows("Space"), null);
   assert.equal(shadows("Alt+KeyD"), null);
 });
+
+test("a field being typed in owns every key", async () => {
+  const { keyOwner } = await import("./keybind.ts");
+  assert.equal(keyOwner({ tagName: "INPUT", type: "text" }), "text");
+  assert.equal(keyOwner({ tagName: "INPUT" }), "text");
+  assert.equal(keyOwner({ tagName: "TEXTAREA" }), "text");
+  assert.equal(keyOwner({ tagName: "DIV", isContentEditable: true }), "text");
+});
+
+test("a slider is not a text field: push-to-talk survives dragging the mic gain", async () => {
+  const { keyOwner } = await import("./keybind.ts");
+  const mouseFocused = { tagName: "INPUT", type: "range", matches: () => false };
+  assert.equal(keyOwner(mouseFocused), "none");
+});
+
+test("a control reached by keyboard keeps Space; one a click left focused does not", async () => {
+  const { keyOwner } = await import("./keybind.ts");
+  const button = (keyboard: boolean) => ({ tagName: "BUTTON", matches: (s: string) => s === ":focus-visible" && keyboard });
+  assert.equal(keyOwner(button(true)), "control");
+  assert.equal(keyOwner(button(false)), "none");
+  const row = { tagName: "DIV", getAttribute: (n: string) => (n === "role" ? "button" : null), matches: () => true };
+  assert.equal(keyOwner(row), "control");
+  assert.equal(keyOwner({ tagName: "DIV", matches: () => true }), "none");
+  assert.equal(keyOwner(null), "none");
+});
+
+test("Escape cancels a capture and Tab passes through; with a modifier both still bind", () => {
+  const c = new KeyCapture();
+  assert.deepEqual(c.keydown(ev("Escape", "Escape") as never), { kind: "cancel" });
+  assert.deepEqual(c.keydown(ev("Tab", "Tab") as never), { kind: "pass" });
+  assert.deepEqual(c.keydown(ev("Tab", "Tab", { shift: true }) as never), { kind: "pass" });
+  const d = new KeyCapture();
+  assert.deepEqual(d.keydown(ev("Escape", "Escape", { ctrl: true }) as never), { kind: "binding", binding: "Ctrl+Escape" });
+});

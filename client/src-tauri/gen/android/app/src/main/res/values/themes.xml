@@ -15,9 +15,33 @@
     <style name="Theme.voipc_client" parent="Theme.MaterialComponents.DayNight.NoActionBar">
         <item name="android:statusBarColor">@android:color/transparent</item>
         <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowBackground">@color/window_background</item>
         <item name="android:windowLightStatusBar">false</item>
         <item name="android:windowLightNavigationBar">false</item>
         <item name="android:enforceStatusBarContrast" tools:targetApi="q">false</item>
         <item name="android:enforceNavigationBarContrast" tools:targetApi="q">false</item>
+    </style>
+
+    <!-- The splash Android shows before any app code runs, for the next start
+         (Android 13+): MainActivity picks the one for the palette in use, so a
+         dark palette on a phone in light mode no longer opens on white. One per
+         palette, the colour only. -->
+    <style name="Theme.voipc_client.Launch.voipc_night" parent="Theme.voipc_client">
+        <item name="android:windowBackground">@color/launch_voipc_night</item>
+    </style>
+    <style name="Theme.voipc_client.Launch.voipc_day" parent="Theme.voipc_client">
+        <item name="android:windowBackground">@color/launch_voipc_day</item>
+    </style>
+    <style name="Theme.voipc_client.Launch.voipc_dark" parent="Theme.voipc_client">
+        <item name="android:windowBackground">@color/launch_voipc_dark</item>
+    </style>
+    <style name="Theme.voipc_client.Launch.slate_dark" parent="Theme.voipc_client">
+        <item name="android:windowBackground">@color/launch_slate_dark</item>
+    </style>
+    <style name="Theme.voipc_client.Launch.slate_light" parent="Theme.voipc_client">
+        <item name="android:windowBackground">@color/launch_slate_light</item>
+    </style>
+    <style name="Theme.voipc_client.Launch.amoled" parent="Theme.voipc_client">
+        <item name="android:windowBackground">@color/launch_amoled</item>
     </style>
 </resources>

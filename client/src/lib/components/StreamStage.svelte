@@ -2,8 +2,8 @@
   // The stream view: a share we watch, or the preview of our own, with the
   // chat docked beside it or under it.
   //
-  // Shared by both layouts — the modern one shows it full-window
-  // (ActivityOverlay), the classic one in its centre column — and remembered
+  // Shared by all three layouts — Modern shows it full-window
+  // (ActivityOverlay), Classic in its centre column, Stage on the stage — and remembered
   // per layout in `ui_prefs.stream_chat`: whether the chat is open, where, and
   // how big. Under 600 px of its own width the chat always goes below, since
   // a phone has no room beside anything; the side width is kept for later.
@@ -25,6 +25,13 @@
   import ScreenShareViewer from "./ScreenShareViewer.svelte";
   import SharePreview from "./SharePreview.svelte";
   import Icon from "./Icons.svelte";
+
+  interface Props {
+    /** False where the layout has a chat of its own to open instead: Stage
+     *  on a phone, whose chat sheet this would only shrink the share for. */
+    dockChat?: boolean;
+  }
+  let { dockChat = true }: Props = $props();
 
   let root = $state<HTMLDivElement | undefined>(undefined);
   let width = $state(0);
@@ -65,21 +72,21 @@
 
 <div
   class="stream-stage"
-  class:side={prefs.open && split === "side"}
-  class:below={prefs.open && split === "below"}
+  class:side={dockChat && prefs.open && split === "side"}
+  class:below={dockChat && prefs.open && split === "below"}
   bind:this={root}
   bind:clientWidth={width}
   style="--stream-chat-size: {size}px;"
 >
   <div class="stream">
     {#if $streamStage === "watch"}
-      <ScreenShareViewer headerExtra={controls} />
+      <ScreenShareViewer headerExtra={dockChat ? controls : undefined} />
     {:else}
-      <SharePreview stage headerExtra={controls} />
+      <SharePreview stage headerExtra={dockChat ? controls : undefined} />
     {/if}
   </div>
 
-  {#if prefs.open}
+  {#if dockChat && prefs.open}
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <div
       class="split-handle"
@@ -111,6 +118,8 @@
   <button
     class="stage-btn chat-toggle"
     class:on={prefs.open}
+    aria-label={unread ? "Chat, new messages" : "Chat"}
+    aria-pressed={prefs.open}
     onclick={toggleChat}
     title={prefs.open ? "Hide the chat" : unread ? "Show the chat — new messages" : "Show the chat"}
   >
@@ -248,5 +257,13 @@
     border-radius: 50%;
     background: var(--danger);
     border: 1.5px solid var(--bg-secondary);
+  }
+
+  /* A finger needs 44px (--hit) */
+  @media (pointer: coarse) {
+    .stage-btn {
+      min-width: var(--hit);
+      min-height: var(--hit);
+    }
   }
 </style>

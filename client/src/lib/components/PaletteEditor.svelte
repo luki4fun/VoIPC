@@ -10,6 +10,7 @@
 
   import { PALETTES, TOKENS, paletteById, type TokenName } from "../theme.js";
   import { uiPrefs, updateUiPrefs } from "../stores/ui-prefs.js";
+  import Icon from "./Icons.svelte";
 
   /** The plain-English name of each token, for people who are not us. */
   const LABELS: Record<TokenName, string> = {
@@ -30,11 +31,19 @@
     "--scrollbar": "Scrollbar",
     "--shadow-menu": "Menu shadow",
     "--shadow-dialog": "Dialog shadow",
+    "--on-accent": "Text on accent",
+    "--on-danger": "Text on danger",
+    "--on-success": "Text on success",
+    "--on-warning": "Text on warning",
+    "--text-muted": "Dimmed text",
+    "--scrim": "Behind dialogs",
+    "--focus-ring": "Keyboard focus",
   };
 
   // A shadow is a CSS shadow, not a colour: `<input type="color">` cannot edit
-  // one, and pretending otherwise would quietly replace it with a hex.
-  const COLOUR_TOKENS = TOKENS.filter((t) => !t.startsWith("--shadow"));
+  // one, and pretending otherwise would quietly replace it with a hex. The
+  // scrim is a translucent black for the same reason.
+  const COLOUR_TOKENS = TOKENS.filter((t) => !t.startsWith("--shadow") && t !== "--scrim");
 
   let showColours = $state(false);
 
@@ -49,6 +58,7 @@
   function choose(id: string) {
     updateUiPrefs((p) => {
       p.palette = id;
+      p.palette_chosen = true;
     });
   }
 
@@ -81,6 +91,8 @@
     <button
       class="swatch"
       class:active={$uiPrefs.palette === p.id}
+      data-palette={p.id}
+      aria-pressed={$uiPrefs.palette === p.id}
       onclick={() => choose(p.id)}
       title={p.label}
     >
@@ -94,8 +106,9 @@
   {/each}
 </div>
 
-<button class="disclosure" onclick={() => (showColours = !showColours)}>
-  {showColours ? "▾" : "▸"} Custom colours
+<button class="disclosure" aria-expanded={showColours} onclick={() => (showColours = !showColours)}>
+  <span class="chevron" class:open={showColours} aria-hidden="true"><Icon name="chevron-down" size={14} /></span>
+  Custom colours
   {#if overriddenCount > 0}<span class="count">{overriddenCount} changed</span>{/if}
 </button>
 
@@ -139,11 +152,11 @@
     border: 2px solid transparent;
     border-radius: 8px;
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
 
   .swatch.active {
-    border-color: var(--accent);
+    border-color: var(--text-primary);
     color: var(--text-primary);
   }
 
@@ -160,7 +173,7 @@
   }
 
   .swatch-label {
-    font-size: 11px;
+    font-size: var(--fs-micro);
   }
 
   .disclosure {
@@ -169,7 +182,7 @@
     padding: 4px 0;
     background: transparent;
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
 
   .disclosure:hover {
@@ -178,7 +191,7 @@
 
   .count {
     margin-left: 6px;
-    color: var(--accent);
+    color: var(--text-secondary);
   }
 
   .colours {
@@ -192,7 +205,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
   }
 
@@ -212,7 +225,7 @@
 
   .revert {
     padding: 2px 8px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     background: var(--bg-tertiary);
     color: var(--text-secondary);
   }
@@ -225,12 +238,22 @@
     align-self: flex-start;
     margin-top: 8px;
     padding: 6px 12px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     background: var(--bg-tertiary);
     color: var(--text-secondary);
   }
 
   .reset-colours:hover {
     color: var(--text-primary);
+  }
+
+  .chevron {
+    display: inline-flex;
+    transform: rotate(-90deg);
+    transition: transform var(--dur-fast);
+  }
+
+  .chevron.open {
+    transform: none;
   }
 </style>

@@ -14,7 +14,7 @@
   // Panel widths are set on *this* element rather than on :root, which is what
   // makes a width dragged here independent of the one the classic layout uses.
 
-  import { backdrop } from "../../actions/dialog.js";
+  import { backdrop, dialog } from "../../actions/dialog.js";
   import { resizeHandle } from "../../actions/resizable.js";
   import { swipeable, type Pane } from "../../actions/swipe.js";
   import { defaultPanels } from "../../ui-prefs.js";
@@ -25,6 +25,8 @@
   import { micLane } from "../../stores/mixer.js";
   import { voice } from "../../stores/channels.js";
   import { showConnectDialog } from "../../connect.js";
+  import { pushLayer } from "../../stores/back-stack.js";
+  import { shellContextMenu } from "../../context-menu.js";
 
   import ChatPanel from "../ChatPanel.svelte";
   import MobilePTT from "../MobilePTT.svelte";
@@ -81,10 +83,23 @@
   // draggable underneath it.
   const activityOpen = $derived($centreView !== "chat" || $streamStage !== null);
 
-  /** Are the panes stacked? Read on demand rather than watched: a
-   *  ResizeObserver would be a second opinion on what the container query
-   *  already decides, and MixerView argues against exactly that. */
-  const isNarrow = () => (shell?.clientWidth ?? 9999) <= 720;
+  /** The shell's content box — what the container query below measures. Not
+   *  `clientWidth`: that includes the safe-area padding, so in landscape on a
+   *  phone with a notch the CSS stacked the panes while this still said
+   *  "wide", and the drawer button collapsed a sidebar nobody could see. */
+  let shellRect = $state<DOMRectReadOnly | undefined>(undefined);
+  /** Are the panes stacked? The same 720px the container query uses —
+   *  observed, for what the markup shows (inert panes, pressed buttons). */
+  const narrow = $derived((shellRect?.width ?? 9999) <= 720);
+  /** The same question, measured now, for a click or a touch to act on: a
+   *  resize observer only reports at the next frame, and a window in the
+   *  background has none — a click there read a stale "wide". */
+  function isNarrow(): boolean {
+    if (!shell) return narrow;
+    const cs = getComputedStyle(shell);
+    const width = shell.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+    return width <= 720;
+  }
 
   function toggleDrawer(which: Pane) {
     pane = pane === which ? 1 : which;
@@ -99,6 +114,21 @@
     if (isNarrow()) pane = 1;
   });
 
+  // An open drawer is a layer: Android's Back and Escape put the chat back
+  $effect(() => {
+    if (pane === 1) return;
+    return pushLayer(() => (pane = 1));
+  });
+
+  function onkeydown(e: KeyboardEvent) {
+    // A dialog's own Escape stops at the dialog (actions/dialog.ts), so this
+    // only sees one nothing else took
+    if (e.key === "Escape" && pane !== 1 && !e.defaultPrevented) {
+      e.preventDefault();
+      pane = 1;
+    }
+  }
+
   /** The full voice bar, on demand: mode, VAD meter, gain and output sliders. */
   let voiceOpen = $state(false);
 
@@ -110,14 +140,17 @@
   const showPtt = $derived($isMobile && $voice !== null);
 </script>
 
+<svelte:window {onkeydown} />
+
 <!-- svelte-ignore a11y_no_static_element_interactions -->
 <div
   class="modern-shell"
   class:mobile={$isMobile}
   class:ptt={showPtt}
   bind:this={shell}
+  bind:contentRect={shellRect}
   style="--sidebar-width: {panels.sidebar}px; --memberlist-width: {panels.members}px; --ptt-space: {pttHeight}px;"
-  oncontextmenu={(e) => e.preventDefault()}
+  oncontextmenu={shellContextMenu}
 >
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
@@ -128,10 +161,11 @@
       onmove: (px) => (dragOffset = px),
       onsettle: (next) => (pane = next),
       // Only where the panes are stacked, and never under an activity.
-      enabled: () => !activityOpen && (shell?.clientWidth ?? 9999) <= 720,
+      enabled: () => !activityOpen && isNarrow(),
     }}
   >
-  <div class="pane pane-left">
+  <!-- Off-screen panes leave the tab order and the accessibility tree -->
+  <div class="pane pane-left" inert={narrow && pane !== 0}>
   <ServerRail onadd={() => showConnectDialog.set(true)} />
 
   {#if panels.sidebar_open}
@@ -161,7 +195,7 @@
   </div>
 
   <div class="pane pane-main">
-  <main class="content">
+  <main class="content" inert={narrow && pane !== 1}>
     <ChatPanel headerExtra={headerControls} />
     <ReconnectOverlay />
   </main>
@@ -188,7 +222,7 @@
         onsettle: (px) => updateActivePanels((p) => (p.members = px)),
       }}
     ></div>
-    <div class="pane pane-members"><MemberList /></div>
+    <div class="pane pane-members" inert={narrow && pane !== 2}><MemberList /></div>
   {/if}
   </div>
 
@@ -199,7 +233,7 @@
 
 {#if voiceOpen}
   <div class="voice-overlay" role="presentation" onclick={backdrop(() => (voiceOpen = false))}>
-    <div class="voice-popover">
+    <div class="voice-popover" aria-label="Voice" use:dialog={{ onclose: () => (voiceOpen = false) }}>
       <div class="popover-title">Voice</div>
       <!-- The real voice bar, restyled. Mode select, VAD meter, mic gain,
            output volume and the screen-share controls all come with it, so
@@ -209,7 +243,8 @@
   </div>
 {/if}
 
-<ActivityOverlay />
+<!-- The talk button draws over an activity: it leaves that much room -->
+<ActivityOverlay pttSpace={showPtt ? pttHeight + 16 : 0} />
 
 {#snippet headerControls()}
   <button
@@ -219,6 +254,8 @@
       else updateActivePanels((p) => (p.sidebar_open = !p.sidebar_open));
     }}
     title="Channels"
+    aria-label="Channels"
+    aria-expanded={narrow ? pane === 0 : panels.sidebar_open}
   >
     <Icon name="hamburger" size={18} />
   </button>
@@ -228,6 +265,8 @@
       class:on={$centreView === "room"}
       onclick={() => centreView.set($centreView === "room" ? "chat" : "room")}
       title={$centreView === "room" ? "Close the virtual room" : "Show the virtual room"}
+      aria-label="Virtual room"
+      aria-pressed={$centreView === "room"}
     >
       <Icon name="room" size={18} />
     </button>
@@ -240,17 +279,23 @@
     title={$micLane.effect !== "none"
       ? `Mixer — your voice is going out as a ${$micLane.effect}`
       : "Mixing desk"}
+    aria-label={$micLane.effect !== "none"
+      ? `Mixing desk — your voice is going out as a ${$micLane.effect}`
+      : "Mixing desk"}
+    aria-pressed={$centreView === "mixer"}
   >
     <Icon name="music-note" size={18} />
   </button>
   <button
     class="header-btn"
-    class:on={panels.members_open && (!isNarrow() || pane === 2)}
+    class:on={narrow ? pane === 2 : panels.members_open}
     onclick={() => {
       if (isNarrow()) toggleDrawer(2);
       else updateActivePanels((p) => (p.members_open = !p.members_open));
     }}
     title={panels.members_open ? "Hide the member list" : "Show the member list"}
+    aria-label="Member list"
+    aria-pressed={narrow ? pane === 2 : panels.members_open}
   >
     <Icon name="members" size={18} />
   </button>
@@ -330,8 +375,24 @@
     touch-action: none;
   }
 
-  .resize-handle:hover {
+  .resize-handle:hover,
+  .resize-handle:focus-visible {
     background: var(--accent);
+  }
+
+  .resize-handle:focus-visible {
+    outline: none;
+  }
+
+  /* 4px to see, 12px to grab */
+  .resize-handle {
+    position: relative;
+  }
+
+  .resize-handle::before {
+    content: "";
+    position: absolute;
+    inset: 0 -4px;
   }
 
   /* Room for the push-to-talk button, which is `position: fixed` and so makes
@@ -352,24 +413,29 @@
 
   .mobile-ptt-bar {
     position: fixed;
-    left: 8px;
-    right: 8px;
+    /* A phone on its side has its navigation bar left or right */
+    left: calc(8px + env(safe-area-inset-left));
+    right: calc(8px + env(safe-area-inset-right));
     bottom: max(8px, env(safe-area-inset-bottom));
-    /* Above the panes, below every overlay: Settings is 50, and a talk button
-       drawn over a dialog is a dialog you cannot finish. */
-    z-index: 40;
+    /* Over the panes and over a full-window activity — you have to be able to
+       talk while watching a share — but under every dialog: a talk button
+       drawn over a dialog is a dialog you cannot finish (app.css, layers). */
+    z-index: var(--z-ptt);
   }
 
   /* ── The voice popover ── */
   .voice-overlay {
     position: fixed;
     inset: 0;
-    z-index: 120;
-    background: rgba(0, 0, 0, 0.5);
+    z-index: var(--z-dialog-over);
+    background: var(--scrim);
     display: flex;
     align-items: flex-end;
     justify-content: flex-start;
     padding: 16px;
+    /* Over the navigation bar and the notch, not under them */
+    padding-bottom: max(16px, env(safe-area-inset-bottom));
+    padding-left: max(16px, env(safe-area-inset-left));
   }
 
   .voice-popover {
@@ -382,7 +448,7 @@
   }
 
   .popover-title {
-    font-size: 11px;
+    font-size: var(--fs-micro);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.02em;
@@ -411,9 +477,12 @@
     border-radius: 4px;
   }
 
-  .header-btn:hover {
-    background: var(--bg-hover);
-    color: var(--text-primary);
+  /* Hover only where there is one: a finger leaves it stuck on (Stage too) */
+  @media (hover: hover) {
+    .header-btn:hover {
+      background: var(--bg-hover);
+      color: var(--text-primary);
+    }
   }
 
   .header-btn.on {
@@ -423,6 +492,14 @@
 
   .header-btn.warn {
     color: var(--danger);
+  }
+
+  /* A finger needs 44px; the 30px box stays for a mouse */
+  @media (pointer: coarse) {
+    .header-btn {
+      width: var(--hit);
+      height: var(--hit);
+    }
   }
 
   /* The drawer button is only useful where the panes are stacked; at desktop
@@ -436,6 +513,22 @@
     display: none;
   }
 
+  /* ── Medium: a tablet, a half-width window ──
+     Rail, sidebar and members at their desktop widths left the chat ~200px
+     at 768px, and dragged-out panels could take it to nothing. Between the
+     phone shape and a full desktop the two side panels give way to the chat. */
+  @container shell (min-width: 721px) and (max-width: 1100px) {
+    .sidebar {
+      width: min(var(--sidebar-width, 240px), 26cqw);
+    }
+
+    /* .modern too: it has to outweigh MemberList's own width rule */
+    .pane-members > :global(.user-list.modern) {
+      width: min(var(--memberlist-width, 240px), 22cqw);
+      min-width: 0;
+    }
+  }
+
   /* ── Narrow: the phone shape ────────────────────────────────────────────
      Three panes on a track, dragged with a thumb. A container query rather
      than a media query, for the reason MixerView already gives: it is the
@@ -446,7 +539,7 @@
       flex: none;
       width: auto;
       transform: translate3d(calc(var(--pane-offset, 0cqw) + var(--drag, 0px)), 0, 0);
-      transition: transform var(--drag-duration, 0.22s) cubic-bezier(0.2, 0.8, 0.2, 1);
+      transition: transform var(--drag-duration, var(--dur-base)) cubic-bezier(0.2, 0.8, 0.2, 1);
       /* Horizontal pans are ours, vertical ones stay with the scroller and
          stay at full speed. The same lever ChannelList pulls, and the reason
          this is not a pile of preventDefault(). */
@@ -502,7 +595,7 @@
       display: block;
       position: absolute;
       inset: 0;
-      background: rgba(0, 0, 0, 0.4);
+      background: var(--scrim);
     }
   }
 </style>

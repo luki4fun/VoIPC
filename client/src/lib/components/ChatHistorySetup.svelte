@@ -353,7 +353,7 @@
 <div class="overlay">
   <div class="dialog" use:dialog>
     {#if mode === "loading"}
-      <h2>Chat History</h2>
+      <h2>Chat history</h2>
       <p class="hint">Loading...</p>
 
     {:else if mode === "blocked"}
@@ -369,25 +369,25 @@
       <p class="path-info" title={currentPath}>{truncatePath(currentPath)}</p>
 
       {#if error}
-        <div class="error">{error}</div>
+        <div class="error" role="alert">{error}</div>
       {/if}
 
-      <button class="submit-btn" onclick={moveAside} disabled={loading}>
+      <button class="submit-btn btn btn-primary" onclick={moveAside} disabled={loading}>
         {loading ? "Processing..." : "Keep it aside and start a new history"}
       </button>
       <div class="secondary-actions">
-        <button class="text-link" onclick={goToChangePath}>Change Storage Location</button>
+        <button class="text-link" onclick={goToChangePath}>Change storage location</button>
       </div>
       <button class="text-link skip-link" onclick={skipVault} disabled={loading}>
         Skip — don't save chat history (kept in memory only, lost on exit)
       </button>
 
     {:else if mode === "first_run"}
-      <h2>Set Up Chat History</h2>
+      <h2>Set up chat history</h2>
       <p class="hint">Choose where to store your encrypted chat history.</p>
 
       <div class="path-section" role="group" aria-labelledby="storage-label">
-        <span class="label" id="storage-label">Storage Location</span>
+        <span class="label" id="storage-label">Storage location</span>
         <div class="path-row">
           <span class="path-display" title={currentPath}>
             {truncatePath(selectedDirectory || currentPath)}
@@ -414,7 +414,7 @@
       </div>
 
       <div class="field">
-        <label for="confirm">Confirm Password</label>
+        <label for="confirm">Confirm password</label>
         <input
           id="confirm"
           type="password"
@@ -426,10 +426,10 @@
       </div>
 
       {#if error}
-        <div class="error">{error}</div>
+        <div class="error" role="alert">{error}</div>
       {/if}
 
-      <button class="submit-btn" onclick={handleFirstRunCreate} disabled={loading}>
+      <button class="submit-btn btn btn-primary" onclick={handleFirstRunCreate} disabled={loading}>
         {loading ? "Processing..." : "Create"}
       </button>
       <button class="text-link skip-link" onclick={skipVault} disabled={loading}>
@@ -437,7 +437,7 @@
       </button>
 
     {:else if mode === "unlock"}
-      <h2>Unlock Chat History</h2>
+      <h2>Unlock chat history</h2>
       <p class="hint">Enter your password to decrypt chat history.</p>
       <p class="path-info" title={currentPath}>{truncatePath(currentPath)}</p>
 
@@ -454,20 +454,20 @@
       </div>
 
       {#if error}
-        <div class="error">{error}</div>
+        <div class="error" role="alert">{error}</div>
       {/if}
 
-      <button class="submit-btn" onclick={handleUnlock} disabled={loading}>
+      <button class="submit-btn btn btn-primary" onclick={handleUnlock} disabled={loading}>
         {loading ? "Processing..." : "Unlock"}
       </button>
 
       <div class="secondary-actions">
-        <button class="text-link danger-link" onclick={goToDeleteConfirm}>Delete History</button>
-        <button class="text-link" onclick={goToChangePath}>Change Storage Location</button>
+        <button class="text-link danger-link" onclick={goToDeleteConfirm}>Delete history</button>
+        <button class="text-link" onclick={goToChangePath}>Change storage location</button>
       </div>
 
     {:else if mode === "create_new"}
-      <h2>Chat History Not Found</h2>
+      <h2>Chat history not found</h2>
       <p class="hint">
         No chat history file found at the configured location. Create a new one?
       </p>
@@ -486,7 +486,7 @@
       </div>
 
       <div class="field">
-        <label for="confirm">Confirm Password</label>
+        <label for="confirm">Confirm password</label>
         <input
           id="confirm"
           type="password"
@@ -498,19 +498,19 @@
       </div>
 
       {#if error}
-        <div class="error">{error}</div>
+        <div class="error" role="alert">{error}</div>
       {/if}
 
-      <button class="submit-btn" onclick={handleCreateNew} disabled={loading}>
+      <button class="submit-btn btn btn-primary" onclick={handleCreateNew} disabled={loading}>
         {loading ? "Processing..." : "Create"}
       </button>
 
       <div class="secondary-actions">
-        <button class="text-link" onclick={goToChangePath}>Change Storage Location</button>
+        <button class="text-link" onclick={goToChangePath}>Change storage location</button>
       </div>
 
     {:else if mode === "delete_confirm"}
-      <h2>Delete Chat History</h2>
+      <h2>Delete chat history</h2>
       <p class="warning-text">
         This will permanently delete your chat history. This cannot be undone.
       </p>
@@ -529,13 +529,13 @@
       </div>
 
       {#if error}
-        <div class="error">{error}</div>
+        <div class="error" role="alert">{error}</div>
       {/if}
 
       <div class="button-row">
         <button class="cancel-btn" onclick={goBack} disabled={loading}>Cancel</button>
         <button
-          class="danger-btn"
+          class="danger-btn btn btn-danger"
           onclick={handleDelete}
           disabled={loading || deleteConfirmText !== "DELETE"}
         >
@@ -544,22 +544,22 @@
       </div>
 
     {:else if mode === "change_path"}
-      <h2>Change Storage Location</h2>
+      <h2>Change storage location</h2>
       <p class="hint">Select a new directory for your chat history.</p>
 
       {#if error}
-        <div class="error">{error}</div>
+        <div class="error" role="alert">{error}</div>
       {/if}
 
       <div class="button-row">
         <button class="cancel-btn" onclick={goBack} disabled={loading}>Cancel</button>
-        <button class="submit-btn" onclick={handleBrowseChangePath} disabled={loading}>
+        <button class="submit-btn btn btn-primary" onclick={handleBrowseChangePath} disabled={loading}>
           {loading ? "Checking..." : "Browse..."}
         </button>
       </div>
 
     {:else if mode === "change_path_unlock"}
-      <h2>Existing History Found</h2>
+      <h2>Existing history found</h2>
       <p class="hint">Found existing chat history at the selected location. Enter password to unlock.</p>
       <p class="path-info" title={newFullPath}>{truncatePath(newFullPath)}</p>
 
@@ -576,18 +576,18 @@
       </div>
 
       {#if error}
-        <div class="error">{error}</div>
+        <div class="error" role="alert">{error}</div>
       {/if}
 
       <div class="button-row">
         <button class="cancel-btn" onclick={goToChangePath} disabled={loading}>Back</button>
-        <button class="submit-btn" onclick={handleChangePathUnlock} disabled={loading}>
+        <button class="submit-btn btn btn-primary" onclick={handleChangePathUnlock} disabled={loading}>
           {loading ? "Processing..." : "Unlock"}
         </button>
       </div>
 
     {:else if mode === "change_path_create"}
-      <h2>Create New History</h2>
+      <h2>Create new history</h2>
       <p class="hint">No existing history at the selected location. Create a new encrypted history.</p>
       <p class="path-info" title={newFullPath}>{truncatePath(newFullPath)}</p>
 
@@ -604,7 +604,7 @@
       </div>
 
       <div class="field">
-        <label for="confirm">Confirm Password</label>
+        <label for="confirm">Confirm password</label>
         <input
           id="confirm"
           type="password"
@@ -616,12 +616,12 @@
       </div>
 
       {#if error}
-        <div class="error">{error}</div>
+        <div class="error" role="alert">{error}</div>
       {/if}
 
       <div class="button-row">
         <button class="cancel-btn" onclick={goToChangePath} disabled={loading}>Back</button>
-        <button class="submit-btn" onclick={handleChangePathCreate} disabled={loading}>
+        <button class="submit-btn btn btn-primary" onclick={handleChangePathCreate} disabled={loading}>
           {loading ? "Processing..." : "Create"}
         </button>
       </div>
@@ -633,11 +633,11 @@
   .overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.7);
+    background: var(--scrim);
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 200;
+    z-index: var(--z-modal);
   }
 
   .dialog {
@@ -649,23 +649,26 @@
     display: flex;
     flex-direction: column;
     gap: 16px;
+    /* The window can be 640×480: the dialog scrolls, its buttons stay reachable */
+    max-height: calc(100dvh - 32px);
+    overflow-y: auto;
   }
 
   h2 {
     text-align: center;
-    font-size: 20px;
-    color: var(--accent);
+    font-size: var(--fs-2xl);
+    color: var(--text-primary);
   }
 
   .hint {
     text-align: center;
-    font-size: 13px;
+    font-size: var(--fs-body);
     color: var(--text-secondary);
   }
 
   .path-info {
     text-align: center;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     color: var(--text-secondary);
     font-family: monospace;
     word-break: break-all;
@@ -674,7 +677,7 @@
 
   .warning-text {
     text-align: center;
-    font-size: 13px;
+    font-size: var(--fs-body);
     color: var(--danger);
     font-weight: 500;
   }
@@ -693,7 +696,7 @@
 
   .path-display {
     flex: 1;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     font-family: monospace;
     color: var(--text-secondary);
     background: var(--bg-primary);
@@ -713,7 +716,7 @@
 
   label,
   .label {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -721,26 +724,14 @@
 
   .error {
     color: var(--danger);
-    font-size: 13px;
+    font-size: var(--fs-body);
     text-align: center;
   }
 
   .submit-btn {
-    background: var(--accent);
-    color: white;
     padding: 10px;
-    font-size: 14px;
-    font-weight: 600;
+    font-size: var(--fs-md);
     margin-top: 4px;
-  }
-
-  .submit-btn:hover:not(:disabled) {
-    background: var(--accent-hover);
-  }
-
-  .submit-btn:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
   }
 
   .secondary-btn {
@@ -748,7 +739,7 @@
     color: var(--text-primary);
     border: 1px solid var(--border);
     padding: 6px 12px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     white-space: nowrap;
   }
 
@@ -761,7 +752,7 @@
     color: var(--text-primary);
     border: 1px solid var(--border);
     padding: 10px;
-    font-size: 14px;
+    font-size: var(--fs-md);
     flex: 1;
   }
 
@@ -770,21 +761,9 @@
   }
 
   .danger-btn {
-    background: var(--danger);
-    color: white;
     padding: 10px;
-    font-size: 14px;
-    font-weight: 600;
+    font-size: var(--fs-md);
     flex: 1;
-  }
-
-  .danger-btn:disabled {
-    opacity: 0.4;
-    cursor: not-allowed;
-  }
-
-  .danger-btn:hover:not(:disabled) {
-    filter: brightness(1.1);
   }
 
   .secondary-actions {
@@ -798,7 +777,7 @@
     background: none;
     border: none;
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     cursor: pointer;
     padding: 2px 0;
     text-decoration: underline;

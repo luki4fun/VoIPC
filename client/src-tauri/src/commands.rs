@@ -1579,8 +1579,14 @@ pub async fn watch_screen_share(
 ///
 /// Made here rather than by the page: a webview allowed to create windows can
 /// open one on any URL, with VoIPC's own frame around it (H4-16).
+///
+/// Async, and it must stay so: a synchronous command runs on the main thread,
+/// and building a webview window there deadlocks on Windows (Tauri's own
+/// warning on `WebviewWindowBuilder::build`). As a plain `fn` it did, from
+/// 1.0.0: a blank window, and every command after it hung, mute and Stop
+/// watching and Quit included, until the process was killed.
 #[tauri::command]
-pub fn open_share_popout(app: tauri::AppHandle, sharer_name: String) -> Result<(), String> {
+pub async fn open_share_popout(app: tauri::AppHandle, sharer_name: String) -> Result<(), String> {
     #[cfg(target_os = "android")]
     {
         let _ = (app, sharer_name);
@@ -1589,7 +1595,7 @@ pub fn open_share_popout(app: tauri::AppHandle, sharer_name: String) -> Result<(
     #[cfg(not(target_os = "android"))]
     {
         use tauri::Manager;
-        const LABEL: &str = "screenshare-popout";
+        const LABEL: &str = crate::screenshare::POPOUT_LABEL;
         if let Some(win) = app.get_webview_window(LABEL) {
             return win.set_focus().map_err(|e| e.to_string());
         }
@@ -1599,7 +1605,7 @@ pub fn open_share_popout(app: tauri::AppHandle, sharer_name: String) -> Result<(
             .append_pair("sharer_name", &sharer_name);
         let path = format!("index.html?{}", url.query().unwrap_or_default());
         tauri::WebviewWindowBuilder::new(&app, LABEL, tauri::WebviewUrl::App(path.into()))
-            .title(format!("{sharer_name}'s Screen - VoIPC"))
+            .title(format!("{sharer_name}'s screen - VoIPC"))
             .inner_size(800.0, 600.0)
             .center()
             .build()

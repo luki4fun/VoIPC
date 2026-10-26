@@ -1,4 +1,6 @@
+import { invoke } from "@tauri-apps/api/core";
 import { derived, writable } from "svelte/store";
+import { addNotification } from "./notifications.js";
 import { uiPrefs } from "./ui-prefs.js";
 
 export interface ScreenShareInfo {
@@ -140,4 +142,19 @@ export function resetScreenShareState() {
   receiverBitrate.set(0);
   receiverResolution.set("");
   receiverFramesDropped.set(0);
+}
+
+/**
+ * Stop watching the share on screen: the server first, so it stops sending,
+ * then the frame. The viewer's Stop button and Android's Back both end here.
+ */
+export async function stopWatching(): Promise<void> {
+  try {
+    await invoke("stop_watching_screen_share");
+    watchingUserId.set(null);
+    currentFrame.set(null);
+  } catch (e) {
+    console.error("Failed to stop watching:", e);
+    addNotification(`Failed to stop watching: ${e}`, "error");
+  }
 }

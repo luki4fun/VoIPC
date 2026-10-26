@@ -190,12 +190,15 @@
   }
 
   function onCaptureKeyDown(e: KeyboardEvent) {
-    e.preventDefault();
-    e.stopPropagation();
     const c = capture;
     if (!c) return;
     const step = c.keydown(e);
-    if (step.kind === "hint") captureHint = step.hint;
+    // Tab moves on; everything else is the capture's
+    if (step.kind === "pass") return;
+    e.preventDefault();
+    e.stopPropagation();
+    if (step.kind === "cancel") capture = null;
+    else if (step.kind === "hint") captureHint = step.hint;
     else commitBinding(step.binding);
   }
 
@@ -309,9 +312,9 @@
         channel, encrypted, and to nobody else — there is no server that can listen in.
       </p>
       {#if error}
-        <div class="error">{error}</div>
+        <div class="error" role="alert">{error}</div>
       {/if}
-      <button class="submit-btn" onclick={askForMicrophone} disabled={busy}>
+      <button class="submit-btn btn btn-primary" onclick={askForMicrophone} disabled={busy}>
         {busy ? "Asking…" : permissionAsked ? "Ask again" : "Ask for the microphone"}
       </button>
       <button class="text-link" onclick={next}>Continue without a microphone (listen only)</button>
@@ -406,7 +409,7 @@
           class:chosen={$voiceMode === "always_on"}
           onclick={() => pickMode("always_on")}
         >
-          <strong>Always open</strong>
+          <strong>Always on</strong>
           <span>Everything your microphone hears goes out, all the time.</span>
         </button>
       </div>
@@ -472,14 +475,14 @@
     {/if}
 
     {#if error && step !== "permission"}
-      <div class="error">{error}</div>
+      <div class="error" role="alert">{error}</div>
     {/if}
 
     <div class="button-row">
       {#if at > 0 && !only}
         <button class="cancel-btn" onclick={back}>Back</button>
       {/if}
-      <button class="submit-btn" onclick={next}>
+      <button class="submit-btn btn btn-primary" onclick={next}>
         {only ? "Done" : last ? "Finish" : "Next"}
       </button>
     </div>
@@ -495,11 +498,11 @@
   .overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.7);
+    background: var(--scrim);
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 200;
+    z-index: var(--z-modal);
   }
 
   .dialog {
@@ -511,17 +514,20 @@
     display: flex;
     flex-direction: column;
     gap: 16px;
+    /* The window can be 640×480: the dialog scrolls, its buttons stay reachable */
+    max-height: calc(100dvh - 32px);
+    overflow-y: auto;
   }
 
   h2 {
     text-align: center;
-    font-size: 20px;
-    color: var(--accent);
+    font-size: var(--fs-2xl);
+    color: var(--text-primary);
   }
 
   .hint {
     text-align: center;
-    font-size: 13px;
+    font-size: var(--fs-body);
     color: var(--text-secondary);
     line-height: 1.45;
   }
@@ -532,7 +538,7 @@
 
   .error {
     color: var(--danger);
-    font-size: 13px;
+    font-size: var(--fs-body);
     text-align: center;
   }
 
@@ -543,7 +549,7 @@
     color: var(--text-primary);
     border: 1px solid var(--border);
     border-radius: 4px;
-    font-size: 13px;
+    font-size: var(--fs-body);
   }
 
   .device:disabled {
@@ -562,7 +568,7 @@
 
   .level-fill {
     height: 100%;
-    background: #43b581;
+    background: var(--success);
     transition: width 60ms linear;
   }
 
@@ -580,7 +586,7 @@
 
   .verdict {
     text-align: center;
-    font-size: 13px;
+    font-size: var(--fs-body);
     min-height: 18px;
     color: var(--text-secondary);
   }
@@ -617,11 +623,11 @@
   }
 
   .choice.chosen {
-    border-color: var(--accent);
+    border-color: var(--text-primary);
   }
 
   .choice span {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
   }
 
@@ -632,7 +638,7 @@
   }
 
   .tiny {
-    font-size: 11px;
+    font-size: var(--fs-micro);
     color: var(--text-secondary);
   }
 
@@ -643,7 +649,7 @@
     border: 1px solid var(--border);
     border-radius: 4px;
     font-family: monospace;
-    font-size: 13px;
+    font-size: var(--fs-body);
     text-align: center;
   }
 
@@ -663,21 +669,9 @@
   }
 
   .submit-btn {
-    background: var(--accent);
-    color: white;
     padding: 10px;
-    font-size: 14px;
-    font-weight: 600;
+    font-size: var(--fs-md);
     flex: 1;
-  }
-
-  .submit-btn:hover:not(:disabled) {
-    background: var(--accent-hover);
-  }
-
-  .submit-btn:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
   }
 
   .secondary-btn {
@@ -685,7 +679,7 @@
     color: var(--text-primary);
     border: 1px solid var(--border);
     padding: 6px 12px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     white-space: nowrap;
   }
 
@@ -698,7 +692,7 @@
     color: var(--text-primary);
     border: 1px solid var(--border);
     padding: 10px;
-    font-size: 14px;
+    font-size: var(--fs-md);
     flex: 1;
   }
 
@@ -715,7 +709,7 @@
     background: none;
     border: none;
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     cursor: pointer;
     padding: 2px 0;
     text-decoration: underline;

@@ -1,6 +1,11 @@
 import { mount } from "svelte";
 import "./app.css";
 import { buildLine } from "./lib/build-info";
+import { paintRememberedTheme } from "./lib/theme-cache";
+
+// The palette this window last showed, before anything loads: the real one
+// follows with the config, and until then the page is not a different colour
+paintRememberedTheme();
 
 const params = new URLSearchParams(window.location.search);
 

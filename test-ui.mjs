@@ -285,7 +285,7 @@ async function answerFirstRun(tab, who, timeoutMs = 15_000) {
       connected: !document.querySelector(".connect-btn"),
       audio: !!document.querySelector(".audio-setup .skip-link"),
       layout: !!document.querySelector(".layout-setup"),
-      answered: JSON.parse(localStorage.getItem("voipc.settings") ?? "{}").ui_prefs?.layout_asked_version === 1,
+      answered: JSON.parse(localStorage.getItem("voipc.settings") ?? "{}").ui_prefs?.layout_asked_version === 2,
     })`);
     if (seen.audio) {
       await realClick(tab, ".audio-setup .skip-link");
@@ -357,7 +357,7 @@ check(
   "answering the layout question is remembered",
   (await alice.evaluate(
     `JSON.parse(localStorage.getItem("voipc.settings") ?? "{}").ui_prefs?.layout_asked_version`,
-  )) === 1,
+  )) === 2,
 );
 check(
   "and it put us in the layout that was picked",
@@ -774,8 +774,8 @@ check(
     await fresh.evaluate(`!!document.querySelector(".layout-setup")`),
   );
   check(
-    "it offers both layouts",
-    (await fresh.evaluate(`document.querySelectorAll(".layout-setup .layout-choice").length`)) === 2,
+    "it offers all three layouts",
+    (await fresh.evaluate(`[...document.querySelectorAll(".layout-setup .layout-choice")].map((b) => b.dataset.layout).join(",")`)) === "modern,classic,stage",
   );
   // The default, asserted where it is decided rather than in a unit test: this
   // client has no stored appearance at all, and it is in the modern shell.
@@ -898,18 +898,19 @@ check(
   await alice.evaluate(`(${appearanceTab}).click()`);
   await sleep(300);
 
-  const pickPalette = (label) =>
-    `[...document.querySelectorAll(".swatch")].find((b) => ${JSON.stringify(label)} === b.title)`;
-  check("the palettes are offered", await alice.evaluate(`!!(${pickPalette("Slate light")})`));
+  // By id, not by label: a label is copy and gets edited ("VoIPC dark" became
+  // "Navy" when VoIPC night became the default)
+  const pickPalette = (id) => `document.querySelector('.swatch[data-palette="${id}"]')`;
+  check("the palettes are offered", await alice.evaluate(`!!(${pickPalette("slate-light")})`));
 
   // Start from a dark palette on purpose. Which palette a fresh client opens in
   // follows the machine's light/dark setting now, so "switch to the light one
   // and watch it change" only means something from a known dark starting point
   // — and this headless browser reports a light preference.
-  await alice.evaluate(`(${pickPalette("VoIPC dark")}).click()`);
+  await alice.evaluate(`(${pickPalette("voipc-dark")}).click()`);
   await sleep(400);
   const before = await alice.evaluate(`getComputedStyle(document.body).backgroundColor`);
-  await alice.evaluate(`(${pickPalette("Slate light")}).click()`);
+  await alice.evaluate(`(${pickPalette("slate-light")}).click()`);
   await sleep(400);
 
   const after = await alice.evaluate(`getComputedStyle(document.body).backgroundColor`);
@@ -943,7 +944,7 @@ check(
 
   // Zoom is left at 1 deliberately: it shifts getBoundingClientRect, and the
   // mixer geometry audit above measures real pixels.
-  await alice.evaluate(`(${pickPalette("VoIPC dark")}).click()`);
+  await alice.evaluate(`(${pickPalette("voipc-dark")}).click()`);
   await sleep(400);
   check(
     "switching back restores the dark document",
@@ -1245,6 +1246,36 @@ check(
     `stored ${storedWidth}, on screen ${widthAfter}`,
   );
 
+  // The Stage layout (2026-10-26): the call in the middle. Switched the same
+  // way, from inside a call, so the grid has somebody to draw.
+  await openAppearance();
+  check("Appearance offers the stage layout", await alice.evaluate(`!!(${pickLayout("stage")})`));
+  await alice.evaluate(`(${pickLayout("stage")}).click()`);
+  await sleep(500);
+  await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
+  await sleep(500);
+  check("the stage shell replaces the modern one", await alice.evaluate(
+    `!!document.querySelector(".stage-shell") && !document.querySelector(".modern-shell") && !document.querySelector(".app-layout")`,
+  ));
+  check("the call fills the stage: there is a tile for each person in it", await alice.evaluate(
+    `document.querySelectorAll("[data-stage-grid] [data-stage-tile]").length >= 1`,
+  ));
+  check("the voice bar is the dock under it", await alice.evaluate(`!!document.querySelector(".dock .voice-controls")`));
+  check("the chat starts closed", await alice.evaluate(`!document.querySelector("[data-stage-chat]")`));
+  await realClick(alice, "[data-stage-chat-toggle]");
+  await sleep(400);
+  check("the chat button opens the chat beside the stage", await alice.evaluate(
+    `!!document.querySelector("[data-stage-chat] .chat-panel")`,
+  ));
+  await realClick(alice, "[data-stage-chat-toggle]");
+  await sleep(400);
+  check("and closes it again", await alice.evaluate(`!document.querySelector("[data-stage-chat]")`));
+  check("the stage layout is what is stored", await waitFor(
+    alice,
+    `JSON.parse(localStorage.getItem("voipc.settings") ?? "{}").ui_prefs?.layout === "stage"`,
+    5000,
+  ).catch(() => false));
+
   // Back to classic, in the same tab and with no reload.
   await openAppearance();
   await alice.evaluate(`(${pickLayout("classic")}).click()`);
@@ -1252,7 +1283,7 @@ check(
   await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
   await sleep(500);
   check("switching back restores the classic shell", await alice.evaluate(
-    `!!document.querySelector(".app-layout") && !document.querySelector(".modern-shell")`,
+    `!!document.querySelector(".app-layout") && !document.querySelector(".modern-shell") && !document.querySelector(".stage-shell")`,
   ));
   check("the connection survived both switches", await alice.evaluate(
     `!!document.querySelector(".status-bar") && /Connected/.test(document.querySelector(".status-bar").textContent)`,
@@ -1462,7 +1493,7 @@ check(
       (await first.evaluate(`document.querySelector(".ctx-tag")?.textContent ?? ""`)) === `#${tag}`,
   );
   await first.evaluate(
-    `(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => e.textContent.includes("Direct Message"));
+    `(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => /direct message/i.test(e.textContent));
        if (!b) return false; b.click(); return true; })()`,
   );
   await waitFor(first, `document.querySelector(".input-bar .chat-input")`).catch(() => {});
@@ -2018,7 +2049,7 @@ if (PORT3) {
   await back.evaluate(`(() => { const el = ${row}?.closest(".user"); if (!el) return false;
     el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 40 })); return true; })()`);
   await sleep(300);
-  await back.evaluate(`(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => e.textContent.includes("Direct Message"));
+  await back.evaluate(`(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => /direct message/i.test(e.textContent));
     if (!b) return false; b.click(); return true; })()`);
   await waitFor(back, `document.querySelector(".input-bar .chat-input")`, 10_000);
   await two.send("Page.close").catch(() => {});

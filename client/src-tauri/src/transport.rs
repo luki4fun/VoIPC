@@ -1029,13 +1029,18 @@ impl ServerCertVerifier for TofuCertVerifier {
                     "TOFU: certificate fingerprint changed for {}! Possible MITM attack.",
                     host_key
                 );
-                // The UI matches on "fingerprint changed" to offer forgetting the pin.
+                // The UI matches on "fingerprint changed" to offer forgetting the
+                // pin, and reads the two fingerprints out of the message to show
+                // them side by side before anyone trusts the new one.
                 return Err(rustls::Error::General(format!(
                     "Server certificate fingerprint changed for {}. \
                      This could indicate a man-in-the-middle attack. \
                      Only if you know the server's certificate was replaced, \
-                     use \"Forget pinned certificate\" and connect again.",
-                    host_key
+                     use \"Forget pinned certificate\" and connect again. \
+                     (remembered SHA-256 {}; offered SHA-256 {})",
+                    host_key,
+                    fingerprint_text(pinned),
+                    fingerprint_text(&fp_bytes)
                 )));
             }
             info!("TOFU: certificate fingerprint matches for {}", host_key);

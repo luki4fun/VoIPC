@@ -8,12 +8,14 @@
   import ScreenShareSourcePicker from "./lib/components/ScreenShareSourcePicker.svelte";
   import SettingsPanel from "./lib/components/SettingsPanel.svelte";
   import Toast from "./lib/components/Toast.svelte";
+  import ConfirmDialog from "./lib/components/ConfirmDialog.svelte";
   import InvitePopup from "./lib/components/InvitePopup.svelte";
   import PokePopup from "./lib/components/PokePopup.svelte";
   import VoiceKeys from "./lib/components/VoiceKeys.svelte";
   import LayoutSetup from "./lib/components/LayoutSetup.svelte";
   import ClassicShell from "./lib/components/shell/ClassicShell.svelte";
   import ModernShell from "./lib/components/modern/ModernShell.svelte";
+  import StageShell from "./lib/components/stage/StageShell.svelte";
   import UserContextMenu from "./lib/components/UserContextMenu.svelte";
   import SharePreview from "./lib/components/SharePreview.svelte";
   import ChannelDialogs from "./lib/components/ChannelDialogs.svelte";
@@ -1579,7 +1581,9 @@
       }
     }, 5000);
 
-    // Poll screen audio + video stats every 500ms, while there is a call
+    // Poll screen audio + video stats every 500ms, while a share is being
+    // sent or watched: four calls a second for the length of every call, with
+    // nothing to show for them, was battery on a phone for nothing
     let lastSendCount = 0;
     let lastRecvCount = 0;
     let lastFramesSent = 0;
@@ -1587,7 +1591,7 @@
     let lastFramesRecv = 0;
     let lastBytesRecv = 0;
     const statsInterval = setInterval(() => {
-      if ($voiceState === "connected") {
+      if ($voiceState === "connected" && ($isSharingScreen || $watchingUserId !== null)) {
         invoke<[number, number]>("get_screen_audio_status")
           .then(([sendCount, recvCount]) => {
             screenAudioSending.set(sendCount !== lastSendCount);
@@ -1627,6 +1631,11 @@
             receiverFramesDropped.set(framesDropped);
           })
           .catch(() => {});
+      } else {
+        // Nothing shared or watched: the audio flags must not stay lit from
+        // the share that just ended until the next one starts
+        screenAudioSending.set(false);
+        screenAudioReceiving.set(false);
       }
     }, 500);
 
@@ -1640,14 +1649,17 @@
   });
 </script>
 
-{#if !$chatUnlocked && !$chatHistoryDisabled}
+<!-- Both wait for the config, which says whether there is history to unlock
+     and what to fill in: before it, a start with history off flashed "Set up
+     chat history", and the connect dialog showed empty fields first -->
+{#if $uiPrefsReady && !$chatUnlocked && !$chatHistoryDisabled}
   <ChatHistorySetup />
 {/if}
 
 <!-- Up by itself while no server is on screen, and from the rail's "+". A
      server that is connecting or reconnecting says so in its own pane
      (ReconnectOverlay, mounted by each shell), not here. -->
-{#if $showConnectDialog || !$serverAddress}
+{#if $uiPrefsReady && ($showConnectDialog || !$serverAddress)}
   <ConnectDialog />
 {/if}
 
@@ -1671,11 +1683,13 @@
      copies racing each other. -->
 <VoiceKeys />
 
-<!-- The layout itself. Both shells read the same stores; App.svelte stays the
-     event bus and the modal stack above them. -->
+<!-- The layout itself. All three shells read the same stores; App.svelte
+     stays the event bus and the modal stack above them. -->
 {#if $uiPrefsReady}
   {#if $uiLayout === "modern"}
     <ModernShell onopensettings={() => (showSettings = true)} />
+  {:else if $uiLayout === "stage"}
+    <StageShell onopensettings={() => (showSettings = true)} />
   {:else}
     <ClassicShell onopensettings={() => (showSettings = true)} />
   {/if}
@@ -1701,6 +1715,7 @@
 <AccountPrompts />
 <AdminDialogs />
 
+<ConfirmDialog />
 <Toast />
 <InvitePopup />
 <PokePopup />

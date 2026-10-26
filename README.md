@@ -25,26 +25,26 @@
 No accounts required. No telemetry. No compromises.
 
 <p align="center">
-  <img src="website/screenshots/main-window.png" alt="VoIPC in the Modern layout — server rail, channels with the people in each of them, chat, and the member list" width="800">
+  <img src="website/screenshots/modern.png" alt="VoIPC in the Modern layout, VoIPC night palette: server rail, channels with the people in each of them, an encrypted conversation, and the member list" width="800">
 </p>
 
-<p align="center"><em>The Modern layout, which is what a new install starts in. Classic is one click away in Settings.</em></p>
+<p align="center"><em>The Modern layout, which is what a new install starts in. Classic and Stage are one click away in Settings.</em></p>
 
 <table>
   <tr>
-    <td><img src="website/screenshots/text-channels.png" alt="Text channels in the sidebar, an encrypted conversation, and the member list of the text channel"><br><sub>Text channels — a subscription, not a move</sub></td>
-    <td><img src="website/screenshots/modern-light.png" alt="The same window in the Slate light palette"><br><sub>Slate light, one of four palettes</sub></td>
-    <td><img src="website/screenshots/classic-layout.png" alt="The Classic layout: channels left, members right, voice and status bars along the bottom"><br><sub>Classic, the original arrangement</sub></td>
+    <td><img src="website/screenshots/stage.png" alt="The Stage layout: the people in the call as large tiles, a mint ring around whoever talks, the voice controls docked underneath"><br><sub>Stage: the call in the middle</sub></td>
+    <td><img src="website/screenshots/share.png" alt="Watching a shared screen on the Stage, the people in the call in a strip under it"><br><sub>Watching a screen share</sub></td>
+    <td><img src="website/screenshots/classic.png" alt="The Classic layout: channels left, members right, voice and status bars along the bottom"><br><sub>Classic, the original arrangement</sub></td>
   </tr>
   <tr>
-    <td><img src="website/screenshots/appearance.png" alt="Settings, Appearance tab: layout cards, palettes and the per-colour editor"><br><sub>Appearance: layout, palette, every colour</sub></td>
-    <td><img src="website/screenshots/screenshare.png" alt="Screen share viewer with stream stats and chat"><br><sub>Screen sharing</sub></td>
-    <td><img src="website/screenshots/connect.png" alt="Connect dialog with saved servers"><br><sub>Connecting</sub></td>
+    <td><img src="website/screenshots/day.png" alt="The Modern layout in the VoIPC day palette: a white chat, light grey sidebars and a deeper mint for whoever is talking"><br><sub>VoIPC day, for a light system</sub></td>
+    <td><img src="website/screenshots/appearance.png" alt="Settings, Appearance tab: three layout cards, the palettes and the per-colour editor"><br><sub>Appearance: layout, palette, every colour</sub></td>
+    <td><img src="website/screenshots/phone.png" alt="The Modern layout on a phone: the chat, with the talk button in reach of a thumb" width="118"> <img src="website/screenshots/phone-stage.png" alt="The Stage layout on a phone: two tiles per row and the call dock at the bottom" width="118"><br><sub>On a phone: Modern and Stage</sub></td>
   </tr>
 </table>
 
 <p align="center">
-  <em>The site in <a href="website/">website/</a> has the same two layouts and four palettes as a live preview you can switch, rather than pictures of them.</em>
+  <em>Every screenshot here comes from <code>node tools/screenshots.mjs --website</code>, against a scratch relay, so they are regenerated rather than retouched.</em>
 </p>
 
 ## Features

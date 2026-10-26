@@ -67,7 +67,7 @@
         </label>
       {/if}
       <div class="create-actions">
-        <button class="create-btn" type="submit">Create</button>
+        <button class="create-btn btn btn-primary" type="submit" disabled={!$newChannelName.trim()}>Create</button>
         <button class="cancel-btn" type="button" onclick={cancelCreate}>Cancel</button>
       </div>
     </form>
@@ -84,7 +84,7 @@
 
   .create-input {
     padding: 6px 8px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     background: var(--bg-primary);
     color: var(--text-primary);
     border: 1px solid var(--border);
@@ -93,7 +93,7 @@
   }
 
   .create-input:focus {
-    border-color: var(--accent);
+    border-color: var(--focus-ring);
   }
 
   .create-actions {
@@ -104,22 +104,13 @@
   .create-btn {
     flex: 1;
     padding: 4px 8px;
-    font-size: 12px;
-    background: var(--accent);
-    color: #fff;
-    border: none;
-    border-radius: 4px;
-    cursor: pointer;
-  }
-
-  .create-btn:hover {
-    opacity: 0.9;
+    font-size: var(--fs-sm);
   }
 
   .cancel-btn {
     flex: 1;
     padding: 4px 8px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     background: transparent;
     color: var(--text-secondary);
     border: 1px solid var(--border);
@@ -135,14 +126,14 @@
     display: flex;
     flex-direction: column;
     gap: 4px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
   }
 
   .create-kind {
     display: flex;
     gap: 12px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
   }
 
@@ -156,7 +147,7 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
   }
 </style>

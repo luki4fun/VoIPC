@@ -19,6 +19,8 @@
   import { uiPrefs } from "../stores/ui-prefs.js";
   import { serverAddress, serverKey, userId } from "../stores/connection.js";
   import { addNotification } from "../stores/notifications.js";
+  import { confirmAction } from "../stores/confirm.js";
+  import { dayKey, dayLabel, fullTime } from "../chat-time.js";
   import { get } from "svelte/store";
   import { account, accountHex } from "../stores/account.js";
   import { users } from "../stores/users.js";
@@ -139,6 +141,8 @@
     $channels.find((c) => c.channel_id === $displayChannelId)
   );
   let channelName = $derived(effectiveChannel?.name ?? "");
+  /** How prose names it: `#` belongs to a text channel, never to a voice one. */
+  let channelLabel = $derived(effectiveChannel && !effectiveChannel.text ? channelName : `#${channelName}`);
   let isPasswordProtected = $derived(effectiveChannel?.has_password ?? false);
 
   // The lobby: in no voice channel on this server, and no other channel open.
@@ -263,6 +267,30 @@
     });
   });
 
+  /** A divider before the first message of every day (lib/chat-time.ts). */
+  function startsDay(index: number): boolean {
+    const curr = displayMessages[index];
+    if (curr.kind === "history-marker" || curr.kind === "notice") return false;
+    for (let j = index - 1; j >= 0; j--) {
+      const prev = displayMessages[j];
+      if (prev.kind === "history-marker" || prev.kind === "notice") continue;
+      return dayKey(prev.timestamp) !== dayKey(curr.timestamp);
+    }
+    return true;
+  }
+
+  // Scrolled back into the conversation: a way back down that does not need
+  // a long fling (and says when something new arrived meanwhile)
+  let scrolledUp = $state(false);
+  function onMessagesScroll() {
+    const el = messagesContainer;
+    if (!el) return;
+    scrolledUp = el.scrollHeight - el.scrollTop - el.clientHeight > 200;
+  }
+  function jumpToLatest() {
+    messagesContainer?.scrollTo({ top: messagesContainer.scrollHeight, behavior: "smooth" });
+  }
+
   function formatTime(timestamp: number): string {
     const date = new Date(timestamp);
     return date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
@@ -277,6 +305,7 @@
       prev.kind === "history-marker" ||
       prev.kind === "notice" ||
       prev.user_id !== curr.user_id ||
+      dayKey(prev.timestamp) !== dayKey(curr.timestamp) ||
       // Where a name came from is part of what the header says, so a second-hand
       // message never folds into a run of first-hand ones and inherits its badge.
       (prev.kind === "shared") !== (curr.kind === "shared") ||
@@ -389,6 +418,18 @@
     closeDm($serverAddress);
   }
 
+  /** The trash button with no server copy to think about: asks, then clears. */
+  async function confirmClearHere() {
+    const where = isDmMode ? `your conversation with ${shortName($activeDmUsername ?? "")}` : channelLabel;
+    const ok = await confirmAction({
+      title: "Clear this conversation?",
+      body: `The messages in ${where} are removed from this device. Everyone else keeps theirs.`,
+      confirm: "Clear",
+      danger: true,
+    });
+    if (ok) clearCurrentChat();
+  }
+
   function clearCurrentChat() {
     if (isDmMode) {
       clearDmChat($serverAddress, $activeDmUserId!, $activeDmUsername);
@@ -421,13 +462,23 @@
   function stopKeeping() {
     const [server, conv] = [$serverAddress, keptConv];
     if (conv) invoke("account_leave", { server, conv }).then(
-      () => addNotification(`#${channelName} is no longer kept for you, until you come back to it`, "info"),
+      () => addNotification(`${channelLabel} is no longer kept for you, until you come back to it`, "info"),
       (e) => addNotification(String(e), "error"),
     );
   }
 </script>
 
-<svelte:window onclick={() => { if (showEmojiPicker) showEmojiPicker = false; showClearMenu = false; }} onkeydown={showEmojiPicker ? handleEmojiKeydown : undefined} />
+<!-- Any click elsewhere closes the header's pop-ups; Escape closes them too -->
+<svelte:window
+  onclick={() => { if (showEmojiPicker) showEmojiPicker = false; showClearMenu = false; showTtlPicker = false; }}
+  onkeydown={(e) => {
+    if (showEmojiPicker) handleEmojiKeydown(e);
+    if (e.key === "Escape" && (showClearMenu || showTtlPicker)) {
+      showClearMenu = false;
+      showTtlPicker = false;
+    }
+  }}
+/>
 
 <!-- One picker for both forms: the direct message one and the channel one -->
 {#snippet emojiPicker()}
@@ -473,7 +524,10 @@
       {/if}
       {#if !isLobby}
         <!-- Channel 0 is "not in voice", not a channel: it has no name to show -->
-        <span class="chat-title"><Icon name="hash" size={14} /> {channelName}</span>
+        <!-- The channel's own kind: a voice channel's chat is not a # channel -->
+        <span class="chat-title"
+          ><Icon name={effectiveChannel && !effectiveChannel.text ? "volume" : "hash"} size={14} /> {channelName}</span
+        >
       {/if}
       {#if $isPreviewing}
         <span class="preview-label">preview</span>
@@ -485,6 +539,7 @@
         class:first={displayMessages.length === 0 || isLobby}
         onclick={resyncHistory}
         title="Ask {historySharers.map((u) => shortName(u.username)).join(', ')} for recent messages"
+        aria-label="Ask for recent messages"
       ><Icon name="history" size={16} /></button>
     {/if}
     {#if activeTtl > 0}
@@ -513,6 +568,8 @@
         class="clear-chat-btn"
         onclick={(e) => { e.stopPropagation(); showTtlPicker = !showTtlPicker; }}
         title="Delete messages you send here after a while"
+        aria-label="Message timer"
+        aria-expanded={showTtlPicker}
       ><Icon name="clock" size={16} /></button>
       {#if showTtlPicker}
         <div class="ttl-picker">
@@ -533,8 +590,10 @@
     {#if displayMessages.length > 0 && !isLobby}
       <button
         class="clear-chat-btn"
-        onclick={(e) => { if (keptConv) { e.stopPropagation(); showClearMenu = !showClearMenu; } else clearCurrentChat(); }}
+        onclick={(e) => { if (keptConv) { e.stopPropagation(); showClearMenu = !showClearMenu; } else void confirmClearHere(); }}
         title="Clear chat history"
+        aria-label="Clear chat history"
+        aria-expanded={keptConv ? showClearMenu : undefined}
       ><Icon name="trash" size={16} /></button>
       {#if showClearMenu && keptConv}
         <div class="ttl-picker clear-menu" role="presentation" onclick={(e) => e.stopPropagation()}>
@@ -557,12 +616,12 @@
     {/if}
   </div>
 
-  <div class="messages" bind:this={messagesContainer}>
+  <div class="messages" bind:this={messagesContainer} onscroll={onMessagesScroll}>
     {#if !isDmMode && isLobby}
       <div class="empty-state">Open a text channel to chat</div>
     {:else if nsfwGated}
       <div class="empty-state nsfw-gate">
-        <p>#{channelName} is marked <strong>18+</strong>.</p>
+        <p>{channelLabel} is marked <strong>18+</strong>.</p>
         <p>Only open it if you are 18 or older. You will not be asked again on this server.</p>
         <button class="join-text-btn" onclick={() => giveNsfwConsent($serverAddress)}>
           I am 18 or older — show it
@@ -588,10 +647,15 @@
         {#if msg.kind === "history-marker" || msg.kind === "notice"}
           <div class="history-marker"><span>{msg.content}</span></div>
         {:else}
+          {#if startsDay(i)}
+            <div class="day-divider" role="separator"><span>{dayLabel(msg.timestamp)}</span></div>
+          {/if}
           {#if shouldShowHeader(i)}
             <div class="msg-header">
               <span class="msg-username" class:self={msg.user_id === $userId} title={msg.username}>{shortName(msg.username)}</span>
-              <span class="msg-time">{formatTime(msg.timestamp)}</span>
+              <time class="msg-time" datetime={new Date(msg.timestamp).toISOString()} title={fullTime(msg.timestamp)}
+                >{formatTime(msg.timestamp)}</time
+              >
               {#if msg.kind === "shared"}
                 <span
                   class="shared-tag"
@@ -615,6 +679,11 @@
           </div>
         {/if}
       {/each}
+      {#if scrolledUp}
+        <button class="jump-latest" onclick={jumpToLatest}>
+          <Icon name="chevron-down" size={14} /> Jump to latest
+        </button>
+      {/if}
     {/if}
   </div>
 
@@ -641,7 +710,7 @@
       <input
         class="chat-input"
         type="text"
-        placeholder={`Message #${channelName}...`}
+        placeholder={`Message ${channelLabel}…`}
         bind:value={messageInput}
         bind:this={chatInputEl}
         onkeydown={handleKeydown}
@@ -677,8 +746,8 @@
       <button
         class="join-voice-btn"
         onclick={() => joinChannel($displayChannelId, isPasswordProtected)}
-        title="Moves you into #{channelName}, and takes your voice with you"
-      >Join #{channelName} to talk and chat</button>
+        title="Moves you into {channelName}, and takes your voice with you"
+      >Join {channelName} to talk and chat</button>
     </div>
   {/if}
 </div>
@@ -720,7 +789,7 @@
     align-items: center;
     gap: 8px;
     margin: 10px 0;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     color: var(--text-secondary);
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -742,7 +811,7 @@
      the divider's own language — the divider is what introduces it — so it
      reads as a quieter kind of message rather than a broken one. */
   .shared-tag {
-    font-size: 9px;
+    font-size: var(--fs-micro);
     color: var(--text-secondary);
     border: 1px solid var(--border);
     padding: 1px 5px;
@@ -756,7 +825,7 @@
     align-items: center;
     gap: 4px;
     margin-left: 8px;
-    font-size: 11px;
+    font-size: var(--fs-sm);
     color: var(--text-muted);
     white-space: nowrap;
   }
@@ -765,20 +834,20 @@
     position: absolute;
     top: 100%;
     right: 8px;
-    z-index: 20;
+    z-index: var(--z-sticky);
     display: flex;
     flex-direction: column;
     min-width: 200px;
     padding: 6px;
     border: 1px solid var(--border);
     border-radius: 6px;
-    background: var(--bg-elevated, var(--bg-secondary));
-    box-shadow: 0 6px 18px rgba(0, 0, 0, 0.35);
+    background: var(--bg-secondary);
+    box-shadow: var(--shadow-menu);
   }
 
   .ttl-note {
     margin: 4px 6px 8px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     line-height: 1.4;
     color: var(--text-muted);
   }
@@ -789,7 +858,7 @@
     border-radius: 4px;
     background: none;
     color: var(--text-primary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     text-align: left;
     cursor: pointer;
   }
@@ -799,7 +868,7 @@
   }
 
   .ttl-choice.active {
-    color: var(--accent);
+    color: var(--text-primary);
     font-weight: 600;
   }
 
@@ -810,14 +879,15 @@
     position: relative;
     gap: 8px;
     padding: 12px 16px;
-    font-size: 11px;
-    text-transform: uppercase;
-    letter-spacing: 1px;
+    /* A channel's name as its owner wrote it: shouted in tracked capitals it
+       was neither (and "# LOUNGE" was a voice channel) */
+    font-size: var(--fs-md);
     color: var(--text-secondary);
     border-bottom: 1px solid var(--border);
   }
 
   .chat-title {
+    color: var(--text-primary);
     font-weight: 600;
     display: flex;
     align-items: center;
@@ -857,8 +927,9 @@
     border: none;
     border-radius: 4px;
     cursor: pointer;
-    opacity: 0.35;
-    transition: opacity 0.15s;
+    /* Quiet, not hidden: 0.35 left them invisible on a touch screen */
+    opacity: 0.7;
+    transition: opacity var(--dur-fast);
   }
 
   /* Takes the margin when it is the first of the two */
@@ -866,12 +937,13 @@
     margin-left: auto;
   }
 
-  .chat-header:hover .resync-btn {
-    opacity: 0.8;
+  .chat-header:hover .resync-btn,
+  .resync-btn:focus-visible {
+    opacity: 1;
   }
 
   .resync-btn:hover {
-    color: var(--accent);
+    color: var(--text-primary);
   }
 
   .header-extra {
@@ -891,12 +963,14 @@
     border: none;
     border-radius: 4px;
     cursor: pointer;
-    opacity: 0.35;
-    transition: opacity 0.15s;
+    /* Quiet, not hidden: 0.35 left them invisible on a touch screen */
+    opacity: 0.7;
+    transition: opacity var(--dur-fast);
   }
 
-  .chat-header:hover .clear-chat-btn {
-    opacity: 0.8;
+  .chat-header:hover .clear-chat-btn,
+  .clear-chat-btn:focus-visible {
+    opacity: 1;
   }
 
   .clear-chat-btn:hover {
@@ -904,9 +978,9 @@
   }
 
   .unread-badge {
-    background: var(--accent);
-    color: white;
-    font-size: 10px;
+    background: var(--text-primary);
+    color: var(--bg-primary);
+    font-size: var(--fs-micro);
     padding: 1px 6px;
     border-radius: 10px;
     font-weight: 600;
@@ -918,9 +992,48 @@
     padding: 8px 16px;
   }
 
+  .day-divider {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 16px 0 8px;
+    font-size: var(--fs-sm);
+    font-weight: 600;
+    color: var(--text-muted);
+  }
+
+  .day-divider::before,
+  .day-divider::after {
+    content: "";
+    flex: 1;
+    border-top: 1px solid var(--border);
+  }
+
+  /* Rides the bottom of the list while you read further up */
+  .jump-latest {
+    position: sticky;
+    bottom: 8px;
+    left: 100%;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin: 8px 0 0 auto;
+    padding: 6px 12px;
+    border-radius: var(--r-pill);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    box-shadow: var(--shadow-menu);
+    font-size: var(--fs-sm);
+  }
+
+  .jump-latest:hover {
+    background: var(--bg-hover);
+  }
+
   .empty-state {
     color: var(--text-secondary);
-    font-size: 13px;
+    font-size: var(--fs-body);
     text-align: center;
     padding: 32px 16px;
     font-style: italic;
@@ -941,11 +1054,11 @@
   }
 
   .msg-username.self {
-    color: var(--accent);
+    color: var(--text-primary);
   }
 
   .msg-time {
-    font-size: 10px;
+    font-size: var(--fs-micro);
     color: var(--text-secondary);
   }
 
@@ -967,7 +1080,7 @@
     padding: 0;
     font-size: var(--chat-font-size, 13px);
     line-height: 1.4;
-    color: var(--accent);
+    color: var(--text-primary);
     text-decoration: underline;
     cursor: pointer;
     word-break: break-all;
@@ -980,11 +1093,11 @@
   .link-overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.6);
+    background: var(--scrim);
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 150;
+    z-index: var(--z-popover);
   }
 
   .link-dialog {
@@ -997,17 +1110,20 @@
     display: flex;
     flex-direction: column;
     gap: 12px;
+    /* The window can be 640×480: the dialog scrolls, its buttons stay reachable */
+    max-height: calc(100dvh - 32px);
+    overflow-y: auto;
   }
 
   .link-title {
-    font-size: 14px;
+    font-size: var(--fs-md);
     font-weight: 600;
     color: var(--text-primary);
   }
 
   .link-input {
     width: 100%;
-    font-size: 13px;
+    font-size: var(--fs-body);
     padding: 8px;
     background: var(--bg-tertiary);
     border: 1px solid var(--border);
@@ -1023,9 +1139,9 @@
 
   .link-copy-btn {
     background: var(--accent);
-    color: white;
+    color: var(--on-accent);
     padding: 6px 16px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     border-radius: 4px;
   }
 
@@ -1034,7 +1150,7 @@
     color: var(--text-secondary);
     border: 1px solid var(--border);
     padding: 6px 16px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     border-radius: 4px;
   }
 
@@ -1047,8 +1163,11 @@
 
   .chat-input {
     flex: 1;
+    /* An input's own width is ~20 characters: without this it would not
+       shrink, and at tablet width it pushed Send out over the member list */
+    min-width: 0;
     padding: 8px 12px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     background: var(--bg-primary);
     color: var(--text-primary);
     border: 1px solid var(--border);
@@ -1057,14 +1176,15 @@
   }
 
   .chat-input:focus {
-    border-color: var(--accent);
+    border-color: var(--focus-ring);
   }
 
   .send-btn {
+    flex-shrink: 0;
     background: var(--accent);
-    color: white;
+    color: var(--on-accent);
     padding: 8px 16px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     border: none;
     border-radius: 4px;
     cursor: pointer;
@@ -1074,15 +1194,19 @@
     opacity: 0.9;
   }
 
+  /* Nothing to send: a quiet outline, not a half-faded primary that reads as
+     broken */
   .send-btn:disabled {
-    opacity: 0.5;
+    background: transparent;
+    color: var(--text-muted);
+    box-shadow: inset 0 0 0 1px var(--border);
     cursor: default;
   }
 
   .preview-label {
-    font-size: 9px;
-    color: var(--accent);
-    border: 1px solid var(--accent);
+    font-size: var(--fs-micro);
+    color: var(--text-muted);
+    border: 1px solid var(--text-muted);
     padding: 1px 5px;
     border-radius: 3px;
     text-transform: uppercase;
@@ -1090,7 +1214,7 @@
 
   .preview-footer {
     padding: 10px 16px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     text-align: center;
     border-top: 1px solid var(--border);
@@ -1116,12 +1240,13 @@
 
   .join-text-btn,
   .join-voice-btn {
+    min-height: var(--hit);
     padding: 4px 12px;
     background: var(--accent);
-    color: #fff;
+    color: var(--on-accent);
     border: none;
     border-radius: 4px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-style: normal;
   }
 
@@ -1159,10 +1284,10 @@
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: 8px;
-    box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
+    box-shadow: var(--shadow-menu);
     display: flex;
     flex-direction: column;
-    z-index: 150;
+    z-index: var(--z-popover);
   }
 
   .emoji-tabs {
@@ -1175,13 +1300,13 @@
   .emoji-tab {
     flex: 1;
     padding: 4px 0;
-    font-size: 16px;
+    font-size: var(--fs-lg);
     background: transparent;
     border: none;
     border-radius: 4px;
     cursor: pointer;
     opacity: 0.5;
-    transition: opacity 0.1s;
+    transition: opacity var(--dur-fast);
     line-height: 1;
   }
 
@@ -1210,7 +1335,7 @@
     justify-content: center;
     width: 36px;
     height: 36px;
-    font-size: 20px;
+    font-size: var(--fs-2xl);
     background: transparent;
     border: none;
     border-radius: 4px;
