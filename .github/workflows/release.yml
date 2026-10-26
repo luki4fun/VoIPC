@@ -556,6 +556,10 @@ jobs:
           KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
+          # Logs need admin rights, annotations do not: name the command that
+          # failed (unexpanded, so no secret value; v1.0.0-rc.1's first try
+          # failed here with nothing but "exit code 1").
+          trap 'echo "::error title=Sign the APK::failed (exit $?) at: $BASH_COMMAND"' ERR
           bt=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
           ks="$RUNNER_TEMP/release.jks"
           trap 'rm -f "$ks"' EXIT
@@ -593,6 +597,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           EPOCH: ${{ needs.meta.outputs.epoch }}
         run: |
+          trap 'echo "::error title=Sign the desktop updates::failed (exit $?) at: $BASH_COMMAND"' ERR
           appimage=$(cd artifacts/linux && ls *.AppImage)
           setup=$(cd artifacts/windows && ls *-setup.exe)
           # signer sign takes any key, but the app installs only what its own
