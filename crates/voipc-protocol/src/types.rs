@@ -76,6 +76,27 @@ pub struct RelayAccounts {
     pub relay_id: [u8; 16],
 }
 
+/// What a relay with a file cache tells every client in `Authenticated`
+/// (protocol v13). `None` there means the relay keeps no files.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileLimits {
+    /// Largest blob it takes, in bytes: the sealed file, not the file.
+    pub max_bytes: u64,
+}
+
+/// The conversation a file was posted in (protocol v13), named as the client
+/// sending the message sees it. The relay checks every upload and fetch
+/// against it, and asks that conversation's members when a blob has gone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FileConv {
+    /// A text channel.
+    Channel(ChannelId),
+    /// A direct conversation with this user, who is online.
+    Direct(UserId),
+    /// A kept direct conversation with this account, which may be away.
+    Account([u8; 16]),
+}
+
 /// How a client means to sign in, in `Authenticate.account`. The account name
 /// is `Authenticate.username`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

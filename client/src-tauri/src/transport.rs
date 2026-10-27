@@ -63,8 +63,9 @@ const TCP_HEAD_START: Duration = Duration::from_secs(2);
 /// Largest per-frame video stream we accept (a 1080p keyframe is well under 1 MiB).
 const MAX_FRAME_STREAM_BYTES: u64 = 8 * 1024 * 1024;
 
-/// What a server without the fallback answers the tunnel's TLS handshake with
-/// (it offers no `http/1.1`), in words.
+/// What a server without the fallback says to the tunnel, in words: 403 to
+/// `GET /voipc` since 1.3, which offers `http/1.1` for files anyway, and no
+/// `http/1.1` in the TLS handshake before that.
 const NO_FALLBACK: &str = "this server has no TCP fallback (if UDP to it is blocked, \
      its operator can turn on tcp_fallback)";
 
@@ -506,6 +507,7 @@ async fn open_tunnel(
     tune(&tcp);
     let mut tls = connector.connect(name, tcp).await.map_err(|e| {
         let e = e.to_string();
+        // A relay before 1.3 offered http/1.1 only with the fallback on
         if e.contains("NoApplicationProtocol") {
             NO_FALLBACK.to_string()
         } else {
@@ -546,6 +548,11 @@ async fn open_tunnel(
         }
     };
     let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+    // Since 1.3 the relay always offers http/1.1 (for files), and says
+    // "fallback off" with 403
+    if head.starts_with("HTTP/1.1 403") {
+        return Err(NO_FALLBACK.to_string());
+    }
     if !head.starts_with("HTTP/1.1 101") {
         let status = head.lines().next().unwrap_or_default();
         return Err(format!("the server refused the TCP fallback ({status})"));

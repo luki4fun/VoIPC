@@ -2,6 +2,7 @@
 //! layer is a thin wrapper over it). They also prove that the libsignal
 //! futures resolve on the first poll and that the Kyber stub is never reached.
 
+use voipc_crypto::file::{self, FileError, MAX_FILE_PLAIN};
 use voipc_crypto::{build_aad, media_encrypt, MediaKey, MediaKeyRing};
 use voipc_protocol::video::{
     fragment_frame, stream_records, ScreenShareAudioPacket, VideoPacket,
@@ -350,4 +351,41 @@ fn voice_interoperates_with_the_native_client() {
     let info = media::parse_voice_packet(Some(&keys), channel_id, &native).unwrap();
     assert_eq!(info.opus.as_deref(), Some(&opus[..]));
     assert_eq!(info.sequence, sequence);
+}
+
+/// A file sealed here opens from what JS hands back (`openFile`): the hash
+/// and key as hex, the size as a JS number. Anything else is refused before it
+/// reaches the blob, under the name JS will see.
+#[test]
+fn a_file_round_trips_through_what_js_hands_over() {
+    let plain = b"a line of a text file\n".repeat(400);
+    let (meta, blob) = file::seal(&plain, true).unwrap();
+    assert!(meta.deflated);
+    let (hash, key) = (meta.hash_hex(), meta.key_hex());
+    let back = voipc_web::file_meta(&hash, &key, meta.size as f64, meta.deflated).unwrap();
+    assert_eq!(back, meta);
+    assert_eq!(file::open(&back, &blob).unwrap(), plain);
+
+    let size = meta.size as f64;
+    let refused = |h: &str, k: &str, s: f64| voipc_web::file_meta(h, k, s, true).err();
+    for bad in [f64::NAN, -1.0, 0.5, -0.5] {
+        assert_eq!(
+            refused(&hash, &key, bad),
+            Some(FileError::Malformed),
+            "{bad}"
+        );
+    }
+    for big in [f64::INFINITY, MAX_FILE_PLAIN as f64 + 1.0, 2f64.powi(64)] {
+        assert_eq!(
+            refused(&hash, &key, big),
+            Some(FileError::TooLarge),
+            "{big}"
+        );
+    }
+    assert_eq!(refused(&hash, &key, -0.0), None, "minus zero is zero");
+    assert_eq!(
+        refused(&hash.to_uppercase(), &key, size),
+        Some(FileError::Malformed)
+    );
+    assert_eq!(refused(&hash, &key[2..], size), Some(FileError::Malformed));
 }

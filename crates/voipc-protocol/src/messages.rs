@@ -278,6 +278,30 @@ pub enum ClientMessage {
 
     /// Managing the signed-in account: device keys, codes, the vault.
     Account(AccountRequest),
+
+    // ── Files (protocol v13) ─────────────────────────────────────────
+    // Only the negotiation travels here; the bytes go over HTTPS
+    // (`PUT`/`GET /f/v1/<hash>` on the TLS port) with the ticket it hands out.
+    /// Store the `size`-byte blob of a sealed file under its id, `hash`, for a
+    /// message in `conv`. Answered with `FileUploadReady` (upload it),
+    /// `FileStored` (the relay has it already) or `FileRefused`; or, while
+    /// another member's upload of it is under way, with nothing yet:
+    /// `FileStored` when that lands, `FileUploadReady` if it passes to you. A
+    /// member answering `FileWanted` sends this too.
+    FileUpload {
+        conv: FileConv,
+        size: u64,
+        hash: [u8; 32],
+    },
+
+    /// Fetch the blob `hash` of a message in `conv`. Answered with
+    /// `FileReady`, with `FileSeeking` and later `FileReady` or
+    /// `FileUnavailable`, or with `FileRefused`.
+    FileFetch { conv: FileConv, hash: [u8; 32] },
+
+    /// Give up an upload or a fetch of `hash`: its ticket is spent, and an
+    /// upload slot passes to the next member waiting with the same file.
+    FileCancel { hash: [u8; 32] },
 }
 
 /// The client's side of an account sign-in, between `Authenticate` and
@@ -610,6 +634,9 @@ pub enum ServerMessage {
         /// The account this connection signed in with.
         #[serde(default)]
         account: Option<AccountInfo>,
+        /// The relay keeps files (protocol v13); `None` when it does not.
+        #[serde(default)]
+        files: Option<FileLimits>,
     },
 
     /// Authentication failed.
@@ -860,6 +887,42 @@ pub enum ServerMessage {
         server_version: String,
         text: String,
     },
+
+    // ── Files (protocol v13) ─────────────────────────────────────────
+    /// Upload the blob: `PUT /f/v1/<hash>?offset=N` in chunks of at most
+    /// 1 MiB, each with `Authorization: Bearer <ticket>`, each starting where
+    /// the last ended. The ticket lasts ten minutes, or until this connection
+    /// ends.
+    FileUploadReady { hash: [u8; 32], ticket: String },
+
+    /// The relay has the blob, checked against its id.
+    FileStored { hash: [u8; 32] },
+
+    /// Download the blob: `GET /f/v1/<hash>` with `Range` (at most 1 MiB per
+    /// request) and `Authorization: Bearer <ticket>`. `size` is the blob's.
+    FileReady {
+        hash: [u8; 32],
+        ticket: String,
+        size: u64,
+    },
+
+    /// An upload or a fetch is refused; `reason` is for people.
+    FileRefused { hash: [u8; 32], reason: String },
+
+    /// A member asked for a blob the relay no longer has. Upload it again
+    /// (`FileUpload`) if you hold it and a message in `conv`, as you name it,
+    /// refers to it. In a channel it names no one, so who asked stays
+    /// unknown; a direct conversation's `conv` names its other party.
+    FileWanted { conv: FileConv, hash: [u8; 32] },
+
+    /// The blob has gone; its conversations' members online are being asked
+    /// for it. `FileReady` follows once one has uploaded it, or
+    /// `FileUnavailable` when nobody started within a minute, or
+    /// `FileRefused` (a budget) when it lands.
+    FileSeeking { hash: [u8; 32] },
+
+    /// Nobody online had the blob in time.
+    FileUnavailable { hash: [u8; 32] },
 }
 
 /// `Refused.code`: the client speaks another protocol version.

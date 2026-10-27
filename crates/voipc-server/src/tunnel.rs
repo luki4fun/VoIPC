@@ -1,9 +1,10 @@
 //! The TCP fallback: a whole client session — control, voice, screen audio
 //! and video — tunnelled through one WebSocket on the page's TLS port, for
 //! clients that cannot reach the QUIC endpoint because something on the way
-//! drops UDP. Offered only with `tcp_fallback` (TLS ALPN `http/1.1`, see
-//! `alpn_protocols` in main.rs), at `GET /voipc`; browsers and the native
-//! client speak the same thing.
+//! drops UDP. Offered only with `tcp_fallback`, at `GET /voipc` on TLS ALPN
+//! `http/1.1` (which the relay always offers, for files on `/f/`: see
+//! `alpn_protocols` in main.rs); browsers and the native client speak the
+//! same thing.
 //!
 //! It is the QUIC session on another carrier (`web::run_session`): the same
 //! control handler behind an in-process duplex, the same relay, the same
@@ -53,8 +54,8 @@ use crate::web::{self, DatagramSink, SessionStart};
 const PATH: &str = "/voipc";
 /// Largest upgrade request read before giving up.
 const MAX_HEAD: usize = 8 * 1024;
-/// A connection has this long to send its upgrade request.
-const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
+/// A connection has this long to send a request head.
+pub(crate) const HEAD_TIMEOUT: Duration = Duration::from_secs(5);
 /// Largest message accepted: a 64 KiB control chunk plus its tag. Clients
 /// send smaller ones, and media packets are far smaller still
 /// (`media::MAX_PACKET_SIZE`).
@@ -97,56 +98,89 @@ pub fn tune(tcp: &TcpStream, peer: SocketAddr) {
     }
 }
 
-/// Serve one connection that negotiated `http/1.1`: the tunnel on
-/// `GET /voipc`, a short refusal for anything else.
+/// Serve one connection that negotiated `http/1.1`: files on `/f/`
+/// (`files::serve_http1`, always), the tunnel on `GET /voipc` (with
+/// `tcp_fallback` on), a short refusal for anything else.
 pub async fn serve<S>(mut stream: S, state: Arc<ServerState>, peer: SocketAddr)
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    let leftover = match tokio::time::timeout(HEAD_TIMEOUT, upgrade(&mut stream)).await {
-        Ok(Ok(leftover)) => leftover,
-        Ok(Err(e)) => {
-            debug!(%peer, "tunnel refused: {e}");
+    let mut buf = Vec::new();
+    let head = match tokio::time::timeout(HEAD_TIMEOUT, read_head(&mut stream, &mut buf)).await {
+        Ok(Head::Got(head)) => head,
+        Ok(Head::TooLarge) => {
+            refuse(&mut stream, "431 Request Header Fields Too Large").await;
+            debug!(%peer, "request head too large");
             return;
         }
+        Ok(Head::Closed) => return,
         Err(_) => {
-            debug!(%peer, "tunnel upgrade timed out");
+            debug!(%peer, "request head timed out");
             return;
         }
     };
-    run(stream, leftover, state, peer).await;
+    let target = head.lines().next().and_then(|l| l.split(' ').nth(1));
+    if target.is_some_and(crate::files::is_file_path) {
+        crate::files::serve_http1(stream, head, buf, state, peer).await;
+        return;
+    }
+    if let Err(e) = upgrade(&mut stream, &head, state.tcp_fallback).await {
+        debug!(%peer, "tunnel refused: {e}");
+        return;
+    }
+    run(stream, buf, state, peer).await;
 }
 
-/// Read the request head and answer it: 101 for the tunnel, a status line
-/// for anything else. Returns what arrived after the head — a client may
-/// send its first frame right behind the request.
-async fn upgrade<S>(stream: &mut S) -> anyhow::Result<Vec<u8>>
-where
-    S: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut buf = Vec::new();
+/// What `read_head` found.
+pub(crate) enum Head {
+    Got(String),
+    /// Over `MAX_HEAD` without its end.
+    TooLarge,
+    /// The connection ended (or failed) before a whole head.
+    Closed,
+}
+
+/// Read one request head into `buf` and take it out: what arrived after it
+/// stays in `buf`, since a client may send a body or its first frame right
+/// behind the request.
+pub(crate) async fn read_head<S: AsyncRead + Unpin>(stream: &mut S, buf: &mut Vec<u8>) -> Head {
     let mut chunk = [0u8; 1024];
     let end = loop {
-        let n = stream.read(&mut chunk).await?;
-        if n == 0 {
-            anyhow::bail!("closed before the request ended");
-        }
-        buf.extend_from_slice(&chunk[..n]);
-        if let Some(end) = ws::find_header_end(&buf) {
+        if let Some(end) = ws::find_header_end(buf) {
             break end;
         }
         if buf.len() > MAX_HEAD {
-            refuse(stream, "431 Request Header Fields Too Large").await;
-            anyhow::bail!("request head too large");
+            return Head::TooLarge;
+        }
+        match stream.read(&mut chunk).await {
+            Ok(0) | Err(_) => return Head::Closed,
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
         }
     };
-    let head = String::from_utf8_lossy(&buf[..end]);
-    let request = match ws::parse_upgrade(&head) {
-        Ok(request) if request.path == PATH => request,
-        Ok(_) => {
+    let rest = buf.split_off(end);
+    let head = String::from_utf8_lossy(buf).into_owned();
+    *buf = rest;
+    Head::Got(head)
+}
+
+/// Answer the request head: 101 for the tunnel, a status line for anything
+/// else. With the fallback off the path is refused with 403, which the
+/// native client reads as "this server has no TCP fallback" (since `http/1.1`
+/// is offered for files anyway, the TLS handshake no longer says it).
+async fn upgrade<S>(stream: &mut S, head: &str, enabled: bool) -> anyhow::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let request = match ws::parse_upgrade(head) {
+        Ok(request) if request.path != PATH => {
             refuse(stream, "404 Not Found").await;
             anyhow::bail!("not the tunnel's path");
         }
+        Ok(_) if !enabled => {
+            refuse(stream, "403 Forbidden").await;
+            anyhow::bail!("the TCP fallback is off");
+        }
+        Ok(request) => request,
         Err(status) => {
             refuse(stream, status).await;
             anyhow::bail!("bad upgrade request: {status}");
@@ -161,7 +195,7 @@ where
     );
     stream.write_all(response.as_bytes()).await?;
     stream.flush().await?;
-    Ok(buf.split_off(end))
+    Ok(())
 }
 
 /// Answer a request we will not upgrade, then let the caller hang up.
@@ -407,8 +441,12 @@ mod tests {
          Sec-WebSocket-Version: 13\r\n\r\n";
 
     fn test_state() -> Arc<ServerState> {
+        let config = ServerConfig {
+            tcp_fallback: true,
+            ..ServerConfig::default()
+        };
         Arc::new(ServerState::new(
-            &ServerConfig::default(),
+            &config,
             ServerSettings::default(),
             Vec::new(),
             "test-admin-token".into(),
@@ -622,8 +660,8 @@ mod tests {
         let mut client = Client::connect(&state).await;
         client.authenticate(PROTOCOL_VERSION - 1).await;
         match client.next_control().await {
-            ServerMessage::AuthError { reason } => {
-                assert!(reason.contains("version mismatch"), "{reason}")
+            ServerMessage::Refused { text, .. } => {
+                assert!(text.contains("version mismatch"), "{text}")
             }
             other => panic!("unexpected reply: {other:?}"),
         }
@@ -759,5 +797,157 @@ mod tests {
             }
         }
         writer.await.unwrap();
+    }
+
+    // ── Files on http/1.1 ────────────────────────────────────────────────
+
+    use crate::files::test_support::{blob, path_of, read_ticket, state_with_files, upload_ticket};
+
+    /// One answer: the head, and a body of its Content-Length.
+    async fn answer(io: &mut DuplexStream, rest: &mut Vec<u8>) -> (String, Vec<u8>) {
+        let mut chunk = [0u8; 4096];
+        let end = loop {
+            if let Some(end) = ws::find_header_end(rest) {
+                break end;
+            }
+            let n = io.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "closed before the answer");
+            rest.extend_from_slice(&chunk[..n]);
+        };
+        let after = rest.split_off(end);
+        let head = String::from_utf8(std::mem::replace(rest, after)).unwrap();
+        let len: usize = ws::header(&head, "content-length").map_or(0, |v| v.parse().unwrap());
+        while rest.len() < len {
+            let n = io.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "closed inside the body");
+            rest.extend_from_slice(&chunk[..n]);
+        }
+        let after = rest.split_off(len);
+        (head, std::mem::replace(rest, after))
+    }
+
+    /// A native client's file transfer: one connection, several requests,
+    /// whether or not the TCP fallback is on.
+    #[tokio::test]
+    async fn files_go_over_http1_with_the_fallback_off() {
+        let (state, _dir) = state_with_files(|_| {});
+        assert!(!state.tcp_fallback);
+        let (bytes, hash) = blob(1024 * 1024 + 500, 1);
+        let up = upload_ticket(&state, hash, bytes.len() as u64);
+        let mut io = open(&state);
+        let mut rest = Vec::new();
+        for (i, chunk) in bytes.chunks(1024 * 1024).enumerate() {
+            let head = format!(
+                "PUT {}?offset={} HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer {up}\r\n\
+                 Content-Length: {}\r\n\r\n",
+                path_of(&hash),
+                i * 1024 * 1024,
+                chunk.len()
+            );
+            io.write_all(head.as_bytes()).await.unwrap();
+            io.write_all(chunk).await.unwrap();
+            let (head, _) = answer(&mut io, &mut rest).await;
+            let want = if i == 0 {
+                "HTTP/1.1 204"
+            } else {
+                "HTTP/1.1 201"
+            };
+            assert!(head.starts_with(want), "{head}");
+            assert!(head.contains("connection: keep-alive"), "{head}");
+        }
+
+        let down = read_ticket(&state, hash);
+        let mut got = Vec::new();
+        while got.len() < bytes.len() {
+            let head = format!(
+                "GET {} HTTP/1.1\r\nHost: test\r\nAuthorization: Bearer {down}\r\n\
+                 Range: bytes={}-\r\n\r\n",
+                path_of(&hash),
+                got.len()
+            );
+            io.write_all(head.as_bytes()).await.unwrap();
+            let (head, body) = answer(&mut io, &mut rest).await;
+            assert!(head.starts_with("HTTP/1.1 206"), "{head}");
+            got.extend_from_slice(&body);
+        }
+        assert_eq!(got, bytes);
+        // Asked to close: answered, then closed
+        let head = format!(
+            "GET {} HTTP/1.1\r\nAuthorization: Bearer wrong\r\nConnection: close\r\n\r\n",
+            path_of(&hash)
+        );
+        io.write_all(head.as_bytes()).await.unwrap();
+        let (head, _) = answer(&mut io, &mut rest).await;
+        assert!(head.starts_with("HTTP/1.1 401"), "{head}");
+        let mut end = [0u8; 1];
+        assert_eq!(io.read(&mut end).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_file_request_must_be_plain_and_small() {
+        let (state, _dir) = state_with_files(|_| {});
+        let (_, hash) = blob(10, 2);
+        let up = upload_ticket(&state, hash, 10);
+        for (head, status) in [
+            (
+                format!(
+                    "PUT {} HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n",
+                    path_of(&hash)
+                ),
+                "501",
+            ),
+            // More than the upload has left: refused before a byte is read
+            (
+                format!(
+                    "PUT {}?offset=0 HTTP/1.1\r\nAuthorization: Bearer {up}\r\nContent-Length: 11\r\n\r\n",
+                    path_of(&hash)
+                ),
+                "413",
+            ),
+            // No ticket: refused before the body too, however large
+            (
+                format!(
+                    "PUT {}?offset=0 HTTP/1.1\r\nContent-Length: 1048577\r\n\r\n",
+                    path_of(&hash)
+                ),
+                "401",
+            ),
+            (
+                format!(
+                    "PUT {} HTTP/1.1\r\nContent-Length: ten\r\n\r\n",
+                    path_of(&hash)
+                ),
+                "400",
+            ),
+            (format!("GET {}\r\n\r\n", path_of(&hash)), "400"),
+            ("GET /f/v1/nothex HTTP/1.1\r\n\r\n".to_string(), "404"),
+            (format!("DELETE {} HTTP/1.1\r\n\r\n", path_of(&hash)), "405"),
+        ] {
+            let mut io = open(&state);
+            io.write_all(head.as_bytes()).await.unwrap();
+            let (answer, _) = answer(&mut io, &mut Vec::new()).await;
+            assert!(
+                answer.starts_with(&format!("HTTP/1.1 {status}")),
+                "{head:?} -> {answer}"
+            );
+        }
+    }
+
+    /// With the fallback off, the tunnel's path says so in a status the
+    /// native client reads as "this server has no TCP fallback".
+    #[tokio::test]
+    async fn the_tunnel_is_refused_with_403_when_the_fallback_is_off() {
+        let (state, _dir) = state_with_files(|_| {});
+        let mut io = open(&state);
+        io.write_all(UPGRADE.as_bytes()).await.unwrap();
+        let (head, _) = read_head(&mut io).await;
+        assert!(head.starts_with("HTTP/1.1 403"), "{head}");
+        // The other refusals keep their meaning
+        let mut io = open(&state);
+        io.write_all(UPGRADE.replacen("/voipc", "/other", 1).as_bytes())
+            .await
+            .unwrap();
+        let (head, _) = read_head(&mut io).await;
+        assert!(head.starts_with("HTTP/1.1 404"), "{head}");
     }
 }

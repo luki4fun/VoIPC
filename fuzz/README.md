@@ -19,6 +19,7 @@ that once crashed.
 | `envelope` | voipc-crypto | chat envelopes, history payloads, media keys |
 | `keys` | voipc-crypto | log keys, pins, recovery keys |
 | `log` | voipc-crypto | kept entries and epoch-key wraps |
+| `file` | voipc-crypto | file blobs, claimed sizes, the capped inflate |
 | `vault` | voipc-crypto | vault slots and items |
 | `jitter` | voipc-audio | sequence numbers in any order |
 | `opus` | voipc-audio | Opus packets into the native decoder |

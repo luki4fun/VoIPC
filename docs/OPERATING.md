@@ -24,13 +24,15 @@ Pick one:
 | Path | What |
 |---|---|
 | `/etc/voipc/server.toml` | the configuration |
-| `/var/lib/voipc/` | the working directory: `channels.json`, `server_settings.json`, `bans.json` (relays without accounts), `voipc.db` and its key file (relays with accounts) |
+| `/var/lib/voipc/` | the working directory: `channels.json`, `server_settings.json`, `bans.json` (relays without accounts), `voipc.db` and its key file (relays with accounts), `files/` (the file cache, §11) |
 
 Paths in `server.toml` that are not absolute are relative to the working directory. Give the
 certificate, the key and the database full paths, or start the relay in `/var/lib/voipc`, as
 the unit below does.
 
-A relay without accounts writes nothing but `bans.json`, the bans that outlast a restart.
+A relay without accounts writes `bans.json`, the bans that outlast a restart, and the file
+cache in `files/`: blobs of files posted in chat, which the clients encrypted before they sent
+them (§11). With `[files] enabled = false` it writes nothing else.
 
 ## 3. systemd
 
@@ -108,8 +110,8 @@ WantedBy=multi-user.target
 
 ## 5. Network
 
-- Open TCP **and** UDP on the port (9987 by default). TCP serves the page and the fallback;
-  UDP carries QUIC.
+- Open TCP **and** UDP on the port (9987 by default). TCP serves the page, the file transfers
+  (`/f/`, §11) and the fallback; UDP carries QUIC.
 - **If UDP is blocked** in front of the server, the page loads but nobody connects.
   `sudo tools/udp-diag.sh` shows where the packets are dropped. If you cannot open UDP, set
   `tcp_fallback = true`; clients then carry everything over the TCP port. Keep `tcp_port` equal
@@ -170,6 +172,11 @@ Create `/var/backups/voipc`, owned by `voipc` with mode 0700, and copy the key f
 3. **Back up** (section 7).
 4. **Stop, replace the binary, start.** Database migrations run at start.
 
+**From 1.2 to 1.3:** the file cache is on by default (§11). The relay makes `files/` in its
+working directory and offers TLS ALPN `http/1.1` with or without `tcp_fallback`. To keep a 1.3
+relay writing what 1.2 wrote, set `[files] enabled = false`. If it cannot make the directory, it
+starts without files and logs why.
+
 A rollback needs the old binary **and** the backup taken before the upgrade: an older relay
 refuses a database that a newer one has migrated, by design. Release candidates
 (`-rc.N`) are for testing on a relay you can roll back.
@@ -210,3 +217,49 @@ relay with `-v voipc:/data`:
 
 A release candidate only gets its own `:<version>` tag. A final release also moves `:1.0`, `:1`
 and `:latest`.
+
+## 11. The file cache
+
+Files posted in chat are encrypted by the sender's app, each under its own key, which travels
+only inside the end-to-end encrypted message. The relay keeps the encrypted blob for a while, so
+that members can load it later. It never downloads anything by itself: a member clicks Load.
+The bytes go over HTTPS on `tcp_port`, never over the QUIC connection that carries voice.
+
+```toml
+[files]
+enabled = true             # false: no cache, and the apps hide the attach button
+max_size_mb = 10           # largest blob: the file, deflated where that helps, plus 32 bytes and 16 per 64 KiB; at most 65
+cache_mins = 30            # a blob nobody fetched for this long is deleted
+max_age_hours = 24         # and every blob this long after it arrived, however often it is fetched
+max_total_mb = 1024        # all blobs together; when full, the least recently used goes
+upload_mb_per_hour = 200   # per connection and per address (an IPv6 /64)
+download_mb_per_hour = 2000
+dir = "files"              # relative to the working directory: /data/files in the container
+```
+
+- **Wiped at every start.** Only the blob files in `dir` are deleted: their names are 64 hex
+  digits, or that and `.<n>.part` while an upload runs. Nothing else in the directory is
+  touched, but give it a directory of its own anyway.
+- **When a blob has gone**, a member's Load asks the other members of that conversation who are
+  online. An app that has the file, and a message in that conversation that refers to it,
+  uploads it again without showing anything. After 60 seconds without one, the member sees
+  that nobody online has the file.
+- **Who may fetch.** Only members of a conversation the blob was posted in: a channel's current
+  members, or the two people of a direct conversation, by account or else by name. Everyone
+  else gets the same refusal as for a blob that does not exist.
+- **What the relay learns:** each blob's size, when it is uploaded and fetched and by which
+  connection, and which conversations it was posted or forwarded in, which links them. A
+  re-upload also shows which members still hold it. Not its name, type or contents.
+  [THREAT-MODEL.md](THREAT-MODEL.md) has the rest.
+- **Disk:** at most `max_total_mb`, uploads in progress included. A cached blob is evicted
+  only for bytes that arrive, never for an upload that has not sent any.
+- **Ports:** the desktop and Android apps fetch files from the port they connect to, over TCP,
+  as the fallback does. Keep `tcp_port` equal to `udp_port` (the default); the relay warns at
+  start when they differ.
+- **Off:** `enabled = false` leaves `dir` alone except that blob files from an earlier run are
+  still wiped at start.
+- **Whoever holds a file's id** (only its messages carry it) can file it under a conversation of
+  their own and fetch the blob. That reveals nothing without the key, which only the messages
+  carry, but it means the relay's check keeps out people who never had the message, not people
+  who did.
+

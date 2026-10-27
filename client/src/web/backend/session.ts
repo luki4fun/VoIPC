@@ -915,6 +915,15 @@ export class Session implements SessionContext, AccountHost {
           b.message_type,
         );
         break;
+      // Files (protocol 13) have no client here yet
+      case "FileUploadReady":
+      case "FileStored":
+      case "FileReady":
+      case "FileRefused":
+      case "FileWanted":
+      case "FileSeeking":
+      case "FileUnavailable":
+        break;
       default:
         console.warn("unhandled server message:", tag);
     }

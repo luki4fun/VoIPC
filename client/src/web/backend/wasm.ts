@@ -262,6 +262,30 @@ export interface AccountSession {
   free(): void;
 }
 
+/** A file sealed for sending (`sealFile`). */
+export interface SealedFile {
+  /** The blob id, 64 hex digits: all the relay learns of the file. */
+  hash: string;
+  /**
+   * 64 hex digits. `key`, `size` and `z` travel only inside the end-to-end
+   * message, in the same form `openFile` takes them back.
+   */
+  key: string;
+  /** The file's own length, before any deflate. */
+  size: number;
+  /** Whether the blob holds the file deflated. */
+  z: boolean;
+  /** What the relay keeps. */
+  blob: Uint8Array;
+}
+
+/**
+ * The `name` of an Error from `sealFile`/`openFile`. `NotThisFile` means the
+ * bytes in hand are not the blob the message names: fetch again. Every other
+ * means the sender's file itself will never open.
+ */
+export type FileErrorName = "TooLarge" | "NotThisFile" | "WrongKey" | "Sealed" | "Malformed";
+
 export interface WasmApi {
   protocolVersion(): number;
   appVersion(): string;
@@ -313,6 +337,20 @@ export interface WasmApi {
   /** The messages as JSON text. Throws when the payload names a different
    *  channel than the server said it arrived in. */
   openHistoryPayload(channelId: number, payload: Uint8Array): string;
+  /**
+   * Seals a file under a fresh key: a key commitment, then AES-256-GCM over
+   * 64 KiB chunks. With `compress`, it is deflated first where that saves a
+   * tenth or more. Throws (`TooLarge`) above 64 MiB.
+   */
+  sealFile(plain: Uint8Array, compress: boolean): SealedFile;
+  /**
+   * The file out of a blob, checked against what its message claims. Throws
+   * an Error named by `FileErrorName`: `NotThisFile` when the blob is not the
+   * one `hash` names; `WrongKey`, `Sealed` or `Malformed` when it is not
+   * sealed under `key`, was altered or cut short, or is not a file of `size`
+   * bytes.
+   */
+  openFile(hash: string, key: string, size: number, z: boolean, blob: Uint8Array): Uint8Array;
   /** Encrypted voice packet (0x05); AAD channel id comes from the key. */
   buildVoicePacket(keys: MediaKeys, sessionId: number, sequence: number, opus: Uint8Array): Uint8Array;
   buildEotPacket(sessionId: number, sequence: number): Uint8Array;
@@ -387,6 +425,8 @@ export async function loadWasm(): Promise<WasmApi> {
     openEnvelope: (p) => mod.openEnvelope(p),
     historyPayload: (c, m) => mod.historyPayload(c, m),
     openHistoryPayload: (c, p) => mod.openHistoryPayload(c, p),
+    sealFile: (p, c) => mod.sealFile(p, c),
+    openFile: (h, k, s, z, b) => mod.openFile(h, k, s, z, b),
     buildVoicePacket: (keys, s, q, o) => mod.buildVoicePacket(keys, s, q, o),
     buildEotPacket: (s, q) => mod.buildEotPacket(s, q),
     buildPingPacket: (s, q) => mod.buildPingPacket(s, q),

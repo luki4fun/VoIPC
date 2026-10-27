@@ -7675,6 +7675,7 @@ dependencies = [
  "hmac 0.12.1",
  "js-sys",
  "libsignal-protocol",
+ "miniz_oxide 0.9.1",
  "postcard",
  "qrcode",
  "rand 0.9.5",

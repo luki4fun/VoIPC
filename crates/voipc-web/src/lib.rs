@@ -13,6 +13,7 @@ pub mod media;
 pub mod signal;
 
 use serde::Serialize;
+use voipc_crypto::file::FileError;
 use voipc_protocol::codec::{APP_VERSION, PROTOCOL_VERSION};
 use voipc_protocol::messages::ClientMessage;
 use voipc_protocol::types::PreKeyBundleData;
@@ -446,6 +447,69 @@ pub fn history_payload(channel_id: u32, messages_json: &str) -> Result<Vec<u8>, 
 pub fn open_history_payload(channel_id: u32, payload: &[u8]) -> Result<String, JsError> {
     let messages = voipc_crypto::open_history_payload(channel_id, payload).map_err(js_err)?;
     Ok(serde_json::Value::Array(messages).to_string())
+}
+
+// ── Files ────────────────────────────────────────────────────────────────
+
+/// `{ hash, key, size, z, blob }`: `plain` sealed under a fresh key
+/// (`voipc_crypto::file`). `hash` is the blob id that the relay keeps `blob`
+/// under; `key`, `size` and `z` travel only inside the end-to-end message.
+/// The hash and the key are hex, the form the message carries them in. With
+/// `compress`, the file is deflated first where that saves a tenth or more.
+#[wasm_bindgen(js_name = sealFile)]
+pub fn seal_file(plain: &[u8], compress: bool) -> Result<JsValue, JsValue> {
+    let (meta, blob) = voipc_crypto::file::seal(plain, compress).map_err(file_error)?;
+    Ok(js_object(&[
+        ("hash", JsValue::from_str(&meta.hash_hex())),
+        ("key", JsValue::from_str(&meta.key_hex())),
+        ("size", JsValue::from_f64(meta.size as f64)),
+        ("z", JsValue::from_bool(meta.deflated)),
+        ("blob", uint8array(&blob)),
+    ]))
+}
+
+/// The file out of `blob`, checked against what its message claims. Throws
+/// an Error named after the `FileError`: `NotThisFile` when the blob is not
+/// the one `hash` names, and the others when the sender's file itself will
+/// never open.
+#[wasm_bindgen(js_name = openFile)]
+pub fn open_file(
+    hash: &str,
+    key: &str,
+    size: f64,
+    z: bool,
+    blob: &[u8],
+) -> Result<Vec<u8>, JsValue> {
+    let meta = file_meta(hash, key, size, z).map_err(file_error)?;
+    voipc_crypto::file::open(&meta, blob).map_err(file_error)
+}
+
+/// What a file message claims, as JS hands it over. The size arrives as a JS
+/// number and is checked to be a whole one in range here, because
+/// wasm-bindgen would wrap one too large for an integer parameter rather than
+/// refuse it; the rest is `FileMeta::from_parts`.
+pub fn file_meta(
+    hash: &str,
+    key: &str,
+    size: f64,
+    deflated: bool,
+) -> Result<voipc_crypto::file::FileMeta, FileError> {
+    if size > voipc_crypto::file::MAX_FILE_PLAIN as f64 {
+        return Err(FileError::TooLarge);
+    }
+    // NaN fails this too: its fraction is NaN.
+    if size.fract() != 0.0 || size < 0.0 {
+        return Err(FileError::Malformed);
+    }
+    voipc_crypto::file::FileMeta::from_parts(hash, key, size as u64, deflated)
+}
+
+/// A JS Error whose `name` is the `FileError`'s, so a caller can tell a fetch
+/// worth repeating from a file that will never open without reading the text.
+fn file_error(e: FileError) -> JsValue {
+    let err = js_sys::Error::new(&e.to_string());
+    err.set_name(e.name());
+    err.into()
 }
 
 // ── Media keys and packets ───────────────────────────────────────────────

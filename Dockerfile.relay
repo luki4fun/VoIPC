@@ -8,7 +8,8 @@
 #
 # Run it with a volume for /data, which holds server.toml, the certificate and
 # key, and what the relay writes (voipc.db and its key file, channels.json,
-# server_settings.json, bans.json). Every path in server.toml is relative to
+# server_settings.json, bans.json, and the file cache in files/, wiped at every
+# start). Every path in server.toml is relative to
 # /data or absolute. The image cannot put the first three there itself (no
 # shell), and the relay exits until they are: docs/OPERATING.md §10 shows a
 # host directory owned by 65532, or filling a named volume.

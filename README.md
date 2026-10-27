@@ -20,7 +20,7 @@
 
 ---
 
-**VoIPC** is an encrypted, self-hosted voice/video/chat application. Think Discord or TeamSpeak, but with end-to-end encryption, zero data collection, and a server that stores nothing on disk unless its operator turns on accounts.
+**VoIPC** is an encrypted, self-hosted voice/video/chat application. Think Discord or TeamSpeak, but with end-to-end encryption, zero data collection, and a server that keeps nothing it can read: only, for a day by default, the encrypted copies of files posted in chat, unless its operator also turns on accounts.
 
 No accounts required. No telemetry. No compromises.
 
@@ -312,8 +312,8 @@ Client-side data at rest:
 | Max voice packet | 512 bytes |
 | Max video packet | 1,280 bytes |
 | Max control message | 64 KiB |
-| Protocol version | v12 (client and relay must match; [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)) |
-| Default port | 9987 — UDP for QUIC (all clients), TCP for the browser page and the TCP fallback |
+| Protocol version | v13 (client and relay must match; [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)) |
+| Default port | 9987 — UDP for QUIC (all clients), TCP for the browser page, file transfers and the TCP fallback |
 
 ### Project Structure
 
@@ -376,7 +376,7 @@ started with `-c` (`voipc-server -c server.toml`; the `admin` and `db` commands 
 
 ```toml
 host = "::"               # Bind address — "::" serves IPv6 and IPv4 from one listener; "0.0.0.0" for IPv4 only
-tcp_port = 9987           # HTTPS page for the browser client (and the TCP fallback)
+tcp_port = 9987           # HTTPS: the browser page, file transfers (and the TCP fallback)
 udp_port = 9987           # QUIC endpoint (all clients) — keep equal to tcp_port so one host:port reaches both
 tcp_fallback = false      # true: clients that cannot reach UDP carry everything over tcp_port (see below)
 max_users = 64
@@ -384,6 +384,10 @@ max_connections_per_ip = 32   # A browser client holds two of these, a native cl
 cert_path = "certs/server.crt"
 key_path = "certs/server.key"
 admin_token = "change-me"  # optional; unset = a random token is printed in the log at every start (with accounts, only while no account is admin)
+
+[files]                    # the encrypted file cache, on by default (docs/OPERATING.md §11 has every key)
+max_size_mb = 10           # largest file blob
+max_age_hours = 24         # no blob stays longer; all of them go at every start
 ```
 
 > **IPv6:** `host = "::"` is the default and serves both families from one listener (a host with IPv6 disabled falls back to `0.0.0.0` automatically). Do not pin `host` to a concrete IPv4 address while your domain publishes an AAAA record: the browser client then fails while everything else looks healthy, because the page and `/wt.json` are TCP and Chrome quietly falls back to IPv4 after the refused IPv6 attempt, while the WebTransport session is UDP and has no such fallback — it dies with `ERR_QUIC_PROTOCOL_ERROR`.
@@ -557,7 +561,7 @@ npm --prefix client test   # browser-side unit tests (spatial maths, room preset
 
 The server never holds a media key: it relays the encrypted blobs members hand each other.
 
-**Without accounts, nothing is written to disk but `bans.json`, once an admin bans someone: a server restart is otherwise a clean slate.** Accounts are something a server's operator turns on; what such a server keeps is listed below.
+**Without accounts, nothing is written to disk but `bans.json`, once an admin bans someone, and the file cache: a server restart is otherwise a clean slate.** The file cache holds the files posted in chat as their senders' apps encrypted them, each under a key only the end-to-end message carries, for a day by default (`max_age_hours`), and is wiped at every start. Accounts are something a server's operator turns on; what such a server keeps is listed below.
 
 ### What the server never sees
 

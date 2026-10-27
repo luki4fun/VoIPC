@@ -41,6 +41,7 @@ fn traced_format() -> String {
         AccountStart,
         VideoCodec,
         ProximityMode,
+        FileConv,
     );
     let registry = tracer
         .registry()

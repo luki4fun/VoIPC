@@ -568,6 +568,11 @@ pub struct ServerState {
     /// Here rather than on the channel, so leaving and coming back does not
     /// reset the clock; an account's goes across its connections.
     pub post_marks: DashMap<(ChannelId, Poster, PostStamp), Instant>,
+    /// `tcp_fallback`: whether `GET /voipc` is served (`tunnel::serve`).
+    pub tcp_fallback: bool,
+    /// The encrypted file cache; `None` with `[files] enabled = false`, and
+    /// until main.rs has opened its directory (`files::FileStore::open`).
+    pub files: Option<Arc<crate::files::FileStore>>,
 }
 
 /// Which of a member's posts slow mode counts: the live message, or its copy
@@ -736,6 +741,8 @@ impl ServerState {
             accounts: None,
             account_sessions: DashMap::new(),
             post_marks: DashMap::new(),
+            tcp_fallback: config.tcp_fallback,
+            files: None,
         }
     }
 

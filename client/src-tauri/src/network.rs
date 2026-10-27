@@ -2327,6 +2327,14 @@ async fn handle_server_message(
         | ServerMessage::AuthError { .. }
         | ServerMessage::AuthStep(_)
         | ServerMessage::Refused { .. } => {}
+        // Files have no client here yet
+        ServerMessage::FileUploadReady { .. }
+        | ServerMessage::FileStored { .. }
+        | ServerMessage::FileReady { .. }
+        | ServerMessage::FileRefused { .. }
+        | ServerMessage::FileWanted { .. }
+        | ServerMessage::FileSeeking { .. }
+        | ServerMessage::FileUnavailable { .. } => {}
     }
 }
 

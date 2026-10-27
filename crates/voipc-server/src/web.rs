@@ -149,7 +149,9 @@ async fn handle_request(
     peer_ip: std::net::IpAddr,
 ) -> Response<Full<Bytes>> {
     let head_only = req.method() == Method::HEAD;
-    let mut resp = if req.method() == Method::GET || head_only {
+    let mut resp = if crate::files::is_file_path(req.uri().path()) {
+        files(req, state, peer_ip).await
+    } else if req.method() == Method::GET || head_only {
         route(req.uri().path(), wt)
     } else if req.method() == Method::POST && req.uri().path() == GAME_ROUTES_PATH {
         game_routes(req, state, peer_ip).await
@@ -170,6 +172,63 @@ async fn handle_request(
     );
     if head_only {
         *resp.body_mut() = Full::new(Bytes::new());
+    }
+    resp
+}
+
+// ── Files ───────────────────────────────────────────────────────────────
+
+/// `/f/` on h2, the browser's carrier: refused before its body is read
+/// wherever it can be (`files::prepare`), and a body read only up to what its
+/// upload has left.
+async fn files<B>(req: Request<B>, state: &ServerState, peer_ip: IpAddr) -> Response<Full<Bytes>>
+where
+    B: hyper::body::Body<Data = Bytes>,
+    B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    use crate::files::Prepared;
+    let (parts, body) = req.into_parts();
+    let header = |name: header::HeaderName| {
+        parts
+            .headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    let target = parts
+        .uri
+        .path_and_query()
+        .map_or(parts.uri.path(), |pq| pq.as_str());
+    let auth = header(header::AUTHORIZATION);
+    let reply = match crate::files::prepare(
+        state,
+        peer_ip,
+        parts.method.as_str(),
+        target,
+        auth.as_deref(),
+    ) {
+        Prepared::Reply(reply) => reply,
+        Prepared::Put(claim) => {
+            match http_body_util::Limited::new(body, claim.max_body)
+                .collect()
+                .await
+            {
+                Ok(b) => crate::files::finish_put(state, claim, b.to_bytes()).await,
+                Err(_) => crate::files::text(413, "more bytes than the upload has left"),
+            }
+        }
+        Prepared::Get { hash, ticket } => {
+            let range = header(header::RANGE);
+            crate::files::finish_get(state, peer_ip, hash, &ticket, range.as_deref()).await
+        }
+    };
+    let mut resp = Response::new(Full::new(reply.body));
+    *resp.status_mut() =
+        StatusCode::from_u16(reply.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    for (name, value) in reply.headers {
+        if let Ok(value) = HeaderValue::from_str(&value) {
+            resp.headers_mut().append(name, value);
+        }
     }
     resp
 }
@@ -1443,5 +1502,107 @@ mod tests {
         })
         .await
         .expect("session removed within 5 s");
+    }
+
+    // ── Files on h2 ──────────────────────────────────────────────────────
+
+    use crate::files::test_support::{blob, path_of, read_ticket, state_with_files, upload_ticket};
+
+    fn request(
+        method: Method,
+        uri: &str,
+        headers: &[(&str, String)],
+        body: Bytes,
+    ) -> Request<Full<Bytes>> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, value);
+        }
+        builder.body(Full::new(body)).unwrap()
+    }
+
+    /// A page from another relay may use the cache: the preflight for a
+    /// ticketed `PUT` is answered, and no answer ever allows credentials.
+    #[tokio::test]
+    async fn files_answer_a_cors_preflight_and_never_allow_credentials() {
+        let (state, _dir) = state_with_files(|_| {});
+        let (_, hash) = blob(10, 1);
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let resp = files(
+            request(Method::OPTIONS, &path_of(&hash), &[], Bytes::new()),
+            &state,
+            ip,
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+        let h = resp.headers();
+        assert_eq!(h["access-control-allow-origin"], "*");
+        assert!(h["access-control-allow-methods"]
+            .to_str()
+            .unwrap()
+            .contains("PUT"));
+        assert!(h["access-control-allow-headers"]
+            .to_str()
+            .unwrap()
+            .contains("authorization"));
+        assert!(h.get("access-control-allow-credentials").is_none());
+    }
+
+    #[tokio::test]
+    async fn files_go_up_and_down_over_h2() {
+        let (state, _dir) = state_with_files(|_| {});
+        let ip: IpAddr = "127.0.0.1".parse().unwrap();
+        let (bytes, hash) = blob(5000, 2);
+        let up = upload_ticket(&state, hash, 5000);
+        let auth = |t: &str| ("authorization", format!("Bearer {t}"));
+        let put = request(
+            Method::PUT,
+            &format!("{}?offset=0", path_of(&hash)),
+            &[auth(&up)],
+            Bytes::from(bytes.clone()),
+        );
+        assert_eq!(files(put, &state, ip).await.status(), StatusCode::CREATED);
+
+        let down = read_ticket(&state, hash);
+        let get = request(
+            Method::GET,
+            &path_of(&hash),
+            &[auth(&down), ("range", "bytes=100-".into())],
+            Bytes::new(),
+        );
+        let resp = files(get, &state, ip).await;
+        assert_eq!(resp.status(), StatusCode::PARTIAL_CONTENT);
+        assert_eq!(resp.headers()["content-range"], "bytes 100-4999/5000");
+        assert_eq!(
+            resp.headers()["access-control-expose-headers"],
+            "content-range, upload-offset"
+        );
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], &bytes[100..]);
+
+        // A body longer than its upload has left is refused, with the CORS
+        // headers a page from another relay needs to read why; one whose
+        // ticket is no upload's is refused before its body is read
+        let (_, small) = blob(10, 3);
+        let up = upload_ticket(&state, small, 10);
+        let big = request(
+            Method::PUT,
+            &format!("{}?offset=0", path_of(&small)),
+            &[auth(&up)],
+            Bytes::from(vec![0u8; 11]),
+        );
+        let resp = files(big, &state, ip).await;
+        assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(resp.headers()["access-control-allow-origin"], "*");
+        let spent = request(
+            Method::PUT,
+            &format!("{}?offset=0", path_of(&hash)),
+            &[auth(&down)],
+            Bytes::from(vec![0u8; crate::files::MAX_CHUNK + 1]),
+        );
+        assert_eq!(
+            files(spent, &state, ip).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
     }
 }

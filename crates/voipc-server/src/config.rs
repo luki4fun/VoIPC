@@ -54,7 +54,8 @@ pub struct ServerConfig {
     /// Let clients that cannot reach the QUIC endpoint — because something
     /// between them and this server drops UDP — tunnel the whole session,
     /// control, voice and video, through a WebSocket on `tcp_port`
-    /// (`GET /voipc`, offered as TLS ALPN `http/1.1` next to the page's `h2`).
+    /// (`GET /voipc` over TLS ALPN `http/1.1`, which the relay offers anyway
+    /// for files; with this off, that path answers 403).
     /// Clients try QUIC first and fall back by themselves. Off by default:
     /// TCP stalls on every lost packet, so it is for hosts whose UDP is blocked.
     /// Native clients dial the port they were given over TCP as well, so
@@ -78,6 +79,10 @@ pub struct ServerConfig {
     /// Opt-in accounts (`[accounts]`). Off by default: no database is made.
     #[serde(default)]
     pub accounts: AccountsConfig,
+
+    /// The encrypted file cache (`[files]`). On by default, with caps.
+    #[serde(default)]
+    pub files: FilesConfig,
 }
 
 /// Whether guests may stay when the relay has accounts.
@@ -141,6 +146,50 @@ impl Default for AccountsConfig {
     }
 }
 
+/// `[files]`: blobs of files posted in chat, which members' clients seal
+/// before they upload them, so the relay holds ciphertext it has no key for.
+/// A blob is kept while it is fetched, and never longer than `max_age_hours`
+/// after it arrived; a member who has the file uploads it again when someone
+/// asks after that. Everything here is wiped when the relay starts.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct FilesConfig {
+    pub enabled: bool,
+    /// Largest blob (MiB). A blob is the file, deflated where that helps,
+    /// plus 32 bytes and 16 more per 64 KiB. Files go up to 64 MiB, so this
+    /// goes up to 65, which carries every one of them.
+    pub max_size_mb: u32,
+    /// A blob nobody fetched for this long is deleted.
+    pub cache_mins: u32,
+    /// A blob is deleted this long after it arrived, however often it is
+    /// fetched: otherwise anyone holding its id could keep it here for ever.
+    pub max_age_hours: u32,
+    /// All blobs together (MiB). When full, the least recently used goes.
+    pub max_total_mb: u32,
+    /// Per connection and per address (an IPv6 /64): a guest can reconnect
+    /// for a fresh connection budget, not a fresh address.
+    pub upload_mb_per_hour: u32,
+    pub download_mb_per_hour: u32,
+    /// Relative to the working directory (`/data` in the container). Only
+    /// blob files are wiped from it at start, never anything else there.
+    pub dir: String,
+}
+
+impl Default for FilesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_size_mb: 10,
+            cache_mins: 30,
+            max_age_hours: 24,
+            max_total_mb: 1024,
+            upload_mb_per_hour: 200,
+            download_mb_per_hour: 2000,
+            dir: "files".into(),
+        }
+    }
+}
+
 impl ServerConfig {
     /// Numbers that would make the server look up but not work: refused at
     /// the start, where the operator sees why (1.0 audit H1-06).
@@ -159,6 +208,36 @@ impl ServerConfig {
             }
             if self.accounts.retention_days == 0 {
                 return Err(anyhow!("[accounts] retention_days must be at least 1: with 0, a kept message expires as it arrives"));
+            }
+        }
+        let f = &self.files;
+        if f.enabled {
+            if !(1..=65).contains(&f.max_size_mb) {
+                return Err(anyhow!(
+                    "[files] max_size_mb must be 1 to 65: files go up to 64 MiB, a little more sealed"
+                ));
+            }
+            if f.cache_mins == 0 {
+                return Err(anyhow!("[files] cache_mins must be at least 1"));
+            }
+            if (f.max_age_hours as u64) * 60 < f.cache_mins as u64 {
+                return Err(anyhow!(
+                    "[files] max_age_hours must be at least cache_mins: a blob would go before it could be fetched again"
+                ));
+            }
+            for (key, mb) in [
+                ("max_total_mb", f.max_total_mb),
+                ("upload_mb_per_hour", f.upload_mb_per_hour),
+                ("download_mb_per_hour", f.download_mb_per_hour),
+            ] {
+                if mb < f.max_size_mb {
+                    return Err(anyhow!(
+                        "[files] {key} must be at least max_size_mb: a file of the largest size would never fit"
+                    ));
+                }
+            }
+            if f.dir.trim().is_empty() {
+                return Err(anyhow!("[files] dir must name a directory"));
             }
         }
         Ok(())
@@ -212,6 +291,7 @@ impl Default for ServerConfig {
             key_path: "certs/server.key".into(),
             admin_token: None,
             accounts: AccountsConfig::default(),
+            files: FilesConfig::default(),
         }
     }
 }
@@ -306,6 +386,43 @@ mod tests {
         assert!(off.validate().is_ok(), "no accounts, no quota to mind");
         assert!(parse("max_users = 0").validate().is_err());
         assert!(parse("max_connections_per_ip = 1").validate().is_err());
+    }
+
+    #[test]
+    fn files_are_on_by_default_with_caps_and_refuse_typos() {
+        let config = ServerConfig::default();
+        assert!(config.files.enabled);
+        assert_eq!(config.files.max_size_mb, 10);
+        assert_eq!(config.files.cache_mins, 30);
+        assert_eq!(config.files.max_age_hours, 24);
+        assert_eq!(config.files.max_total_mb, 1024);
+        assert_eq!(config.files.dir, "files");
+        let parse = |extra: &str| {
+            toml::from_str::<ServerConfig>(&format!("cert_path = \"c\"\nkey_path = \"k\"\n{extra}"))
+        };
+        let off = parse("[files]\nenabled = false").unwrap();
+        assert!(!off.files.enabled);
+        assert_eq!(off.files.max_size_mb, 10, "the rest keep their defaults");
+        assert!(
+            parse("[files]\nmax_size = 5").is_err(),
+            "a typo fails the start"
+        );
+
+        let refused = |extra: &str| parse(extra).unwrap().validate().unwrap_err().to_string();
+        assert!(refused("[files]\nmax_size_mb = 0").contains("max_size_mb"));
+        assert!(refused("[files]\nmax_size_mb = 66").contains("max_size_mb"));
+        assert!(parse("[files]\nmax_size_mb = 65\nmax_total_mb = 65")
+            .unwrap()
+            .validate()
+            .is_ok());
+        assert!(refused("[files]\ncache_mins = 0").contains("cache_mins"));
+        assert!(refused("[files]\ncache_mins = 120\nmax_age_hours = 1").contains("max_age_hours"));
+        assert!(refused("[files]\nmax_total_mb = 5").contains("max_total_mb"));
+        assert!(refused("[files]\nupload_mb_per_hour = 5").contains("upload_mb_per_hour"));
+        assert!(refused("[files]\ndownload_mb_per_hour = 5").contains("download_mb_per_hour"));
+        assert!(refused("[files]\ndir = \" \"").contains("dir"));
+        let off = parse("[files]\nenabled = false\nmax_size_mb = 0").unwrap();
+        assert!(off.validate().is_ok(), "no cache, no caps to mind");
     }
 
     #[test]

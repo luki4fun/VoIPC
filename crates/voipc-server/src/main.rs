@@ -16,6 +16,7 @@ mod accounts;
 mod bans;
 mod channels;
 mod config;
+mod files;
 mod fsutil;
 mod media;
 mod presets;
@@ -817,7 +818,7 @@ async fn main() -> Result<()> {
             .context("invalid TLS configuration")?;
     // Browsers get the web client over HTTP/2 only. Pre-0.5 native clients
     // send no ALPN and are told to update (tcp::reject_legacy).
-    tls_config.alpn_protocols = alpn_protocols(config.tcp_fallback);
+    tls_config.alpn_protocols = alpn_protocols();
 
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
 
@@ -893,7 +894,48 @@ async fn main() -> Result<()> {
     if state.accounts.is_none() {
         state.bans_file = Some(std::path::PathBuf::from(BANS_FILE));
     }
+    if config.files.enabled {
+        // A relay that ran without writing anything (1.2 without accounts)
+        // may have a working directory it cannot write: it still starts,
+        // without files, and says why
+        match files::FileStore::open(&config.files) {
+            Ok(store) => {
+                info!(
+                    "files: cache in {}, blobs up to {} MiB, {} MiB in all",
+                    config.files.dir, config.files.max_size_mb, config.files.max_total_mb
+                );
+                if config.tcp_port != config.udp_port {
+                    warn!(
+                        "files: tcp_port ({}) is not udp_port ({}): the desktop and Android apps fetch files from the port they connect to, so theirs will fail",
+                        config.tcp_port, config.udp_port
+                    );
+                }
+                state.files = Some(Arc::new(store));
+            }
+            Err(e) => error!(
+                "files: cannot open the cache in {}: {e}; running without files (set [files] enabled = false to silence this)",
+                config.files.dir
+            ),
+        }
+    } else {
+        // Off now, maybe not before: no blob of an earlier run stays behind
+        match files::wipe(std::path::Path::new(&config.files.dir)) {
+            Ok(0) => {}
+            Ok(wiped) => info!(wiped, "files: off; wiped the blobs of an earlier run"),
+            Err(e) => warn!("files: off; could not wipe {}: {e}", config.files.dir),
+        }
+    }
     let state = Arc::new(state);
+    if state.files.is_some() {
+        let swept = state.clone();
+        tokio::spawn(async move {
+            let mut every = tokio::time::interval(files::SWEEP_EVERY);
+            loop {
+                every.tick().await;
+                files::sweep(&swept).await;
+            }
+        });
+    }
     bans::load(&state).await.context("reading the bans")?;
     // Every client gets the channel list in one frame. Too many channels with
     // long descriptions and it cannot be sent, and clients see no channels at
@@ -1034,7 +1076,7 @@ async fn main() -> Result<()> {
             {
                 Ok(Ok(tls_stream)) => match tls_stream.get_ref().1.alpn_protocol() {
                     Some(b"h2") => web::serve_h2(tls_stream, wt_info, http_state, peer_addr).await,
-                    // Only offered with tcp_fallback on
+                    // A native client's files, or the TCP fallback
                     Some(b"http/1.1") => {
                         tunnel::tune(tls_stream.get_ref().0, peer_addr);
                         tunnel::serve(tls_stream, http_state, peer_addr).await;
@@ -1077,15 +1119,11 @@ async fn main() -> Result<()> {
 
 /// What the TLS listener offers. `h2` comes first because rustls picks in the
 /// server's order: a browser loading the page offers both and gets HTTP/2.
-/// `http/1.1` is there for one thing only, the TCP fallback's WebSocket
-/// (tunnel.rs) — a new WebSocket connection offers nothing else — and without
-/// the fallback anything offering just http/1.1 fails the handshake, as before.
-fn alpn_protocols(tcp_fallback: bool) -> Vec<Vec<u8>> {
-    let mut alpn = vec![b"h2".to_vec()];
-    if tcp_fallback {
-        alpn.push(b"http/1.1".to_vec());
-    }
-    alpn
+/// `http/1.1` is for what offers nothing else: the native clients' file
+/// transfers (`/f/`, files.rs), always, and the TCP fallback's WebSocket
+/// (tunnel.rs), which refuses `GET /voipc` with 403 while the fallback is off.
+fn alpn_protocols() -> Vec<Vec<u8>> {
+    vec![b"h2".to_vec(), b"http/1.1".to_vec()]
 }
 
 fn load_certs(path: &str) -> Result<Vec<CertificateDer<'static>>> {
@@ -1125,13 +1163,11 @@ mod tests {
     use super::*;
     use std::net::Ipv4Addr;
 
-    /// A page load must keep getting HTTP/2, and only the fallback may offer
-    /// the WebSocket's http/1.1. Through a real handshake, because it is also
-    /// what a native client sees on a server with the fallback off: refused
-    /// on ALPN before any certificate is looked at, with the alert the client
-    /// turns into "this server has no TCP fallback" (transport.rs).
+    /// A page load must keep getting HTTP/2, and a native client's file
+    /// transfer must get http/1.1, whether or not the fallback is on: through
+    /// a real handshake.
     #[tokio::test]
-    async fn http1_is_offered_only_with_the_fallback() {
+    async fn http1_is_offered_next_to_h2() {
         use rustls::pki_types::{PrivatePkcs8KeyDer, ServerName};
 
         let provider = Arc::new(rustls::crypto::ring::default_provider());
@@ -1140,14 +1176,14 @@ mod tests {
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(
             operator.private_key().secret_der().to_vec(),
         ));
-        let handshake = |fallback: bool, offer: &'static [u8]| {
+        let handshake = |offer: &'static [u8]| {
             let mut server = rustls::ServerConfig::builder_with_provider(provider.clone())
                 .with_protocol_versions(&[&rustls::version::TLS13])
                 .unwrap()
                 .with_no_client_auth()
                 .with_single_cert(vec![cert.clone()], key.clone_key())
                 .unwrap();
-            server.alpn_protocols = alpn_protocols(fallback);
+            server.alpn_protocols = alpn_protocols();
             // No roots: a handshake that gets past ALPN fails on the certificate
             let mut client = rustls::ClientConfig::builder_with_provider(provider.clone())
                 .with_protocol_versions(&[&rustls::version::TLS13])
@@ -1164,16 +1200,11 @@ mod tests {
             }
         };
 
-        let refused = handshake(false, b"http/1.1").await;
-        assert!(refused.contains("NoApplicationProtocol"), "{refused}");
-        let past_alpn = handshake(true, b"http/1.1").await;
+        let past_alpn = handshake(b"http/1.1").await;
         assert!(!past_alpn.contains("NoApplicationProtocol"), "{past_alpn}");
-        assert_eq!(
-            alpn_protocols(true)[0],
-            b"h2",
-            "page loads would get HTTP/1.1"
-        );
-        assert_eq!(alpn_protocols(false), [b"h2".to_vec()]);
+        let refused = handshake(b"h3").await;
+        assert!(refused.contains("NoApplicationProtocol"), "{refused}");
+        assert_eq!(alpn_protocols()[0], b"h2", "page loads would get HTTP/1.1");
     }
 
     /// The connection *counts* are handed back when a connection ends, so on

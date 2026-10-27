@@ -25,8 +25,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        target: [codec, media_packets, video_assembly, ws, envelope, keys, log, vault,
-                 jitter, opus, game, web_media, opus_decode]
+        target: [codec, media_packets, video_assembly, ws, envelope, keys, log, file,
+                 vault, jitter, opus, game, web_media, opus_decode]
     env:
       NIGHTLY: nightly-2026-10-23
       CARGO_FUZZ_VERSION: '0.13.2'

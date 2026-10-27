@@ -194,6 +194,7 @@ pub async fn handle_connection<S>(
             session_id,
             accounts: state.accounts.as_ref().map(|r| r.info()),
             account,
+            files: state.files.as_ref().map(|f| f.limits()),
         },
     )
     .await;
@@ -1254,6 +1255,17 @@ async fn handle_message(
         }
         ClientMessage::Account(req) => {
             crate::accounts::handle_request(state, session_id, req, tx).await?;
+        }
+
+        // ── Files (protocol v13): negotiation only, bytes over HTTPS ─────
+        ClientMessage::FileUpload { conv, size, hash } => {
+            crate::files::handle_upload(state, session_id, conv, size, hash, tx).await;
+        }
+        ClientMessage::FileFetch { conv, hash } => {
+            crate::files::handle_fetch(state, session_id, conv, hash, tx).await;
+        }
+        ClientMessage::FileCancel { hash } => {
+            crate::files::handle_cancel(state, session_id, hash).await;
         }
 
         // ── E2E Encryption handlers ──────────────────────────────────────
@@ -3304,6 +3316,10 @@ async fn cleanup_session(state: &Arc<ServerState>, user_id: UserId, session_id: 
         }
     }
 
+    // Its file tickets, uploads and waits: the slot of an upload it held
+    // passes to the next member with the same file
+    crate::files::session_ended(state, session_id).await;
+
     let removed = state.remove_session(session_id).await;
     // The account's l4f session ends with the connection: rows for every
     // reconnect would otherwise wait for the sweep.
@@ -5270,6 +5286,15 @@ mod tests {
         mode: AccountsMode,
         registration: RegistrationMode,
     ) -> (Arc<ServerState>, TempDb) {
+        relay_state_then(mode, registration, |_| {}).await
+    }
+
+    /// `relay_state`, with `then` done to the state before it is shared.
+    async fn relay_state_then(
+        mode: AccountsMode,
+        registration: RegistrationMode,
+        then: impl FnOnce(&mut ServerState),
+    ) -> (Arc<ServerState>, TempDb) {
         let mut config = ServerConfig::default();
         config.accounts.mode = mode;
         config.accounts.registration = registration;
@@ -5290,6 +5315,7 @@ mod tests {
             "test-admin-token".into(),
         );
         state.accounts = Some(Arc::new(relay));
+        then(&mut state);
         (Arc::new(state), db)
     }
 
@@ -5884,8 +5910,10 @@ mod tests {
         assert!(reason.contains("password"), "{reason}");
     }
 
+    /// A 0.12 app (protocol 11) reads only `AuthError`, and stops
+    /// reconnecting on its words.
     #[tokio::test]
-    async fn a_client_one_protocol_behind_is_told_to_update() {
+    async fn a_pre_1_0_client_is_told_to_update() {
         #[derive(serde::Serialize)]
         enum Old {
             Authenticate {
@@ -5910,8 +5938,8 @@ mod tests {
         ));
         let payload = postcard::to_allocvec(&Old::Authenticate {
             username: "old".into(),
-            protocol_version: PROTOCOL_VERSION - 1,
-            app_version: "0.11.1".into(),
+            protocol_version: FIRST_STRUCTURED_REFUSAL - 1,
+            app_version: "0.12.0".into(),
             identity_key: None,
             prekey_bundle: None,
         })
@@ -5953,6 +5981,36 @@ mod tests {
             matches!(m, ServerMessage::Authenticated { .. })
         })
         .await;
+    }
+
+    /// A 1.x app one protocol behind (12, the first that reads `Refused`)
+    /// hears that it is the one to update.
+    #[tokio::test]
+    async fn a_client_one_protocol_behind_is_told_to_update() {
+        let state = admin_state();
+        let first = ClientMessage::Authenticate {
+            username: "older".into(),
+            protocol_version: PROTOCOL_VERSION - 1,
+            app_version: "1.2.0".into(),
+            identity_key: None,
+            prekey_bundle: None,
+            account: None,
+        };
+        let mut c = open_raw(&state, &first).await;
+        let Some(ServerMessage::Refused {
+            code,
+            server_protocol,
+            text,
+            ..
+        }) = c.next().await
+        else {
+            panic!("not refused")
+        };
+        assert_eq!((code, server_protocol), (REFUSED_VERSION, PROTOCOL_VERSION));
+        assert!(
+            text.contains("version mismatch") && text.contains("please update your app"),
+            "{text}"
+        );
     }
 
     /// A newer client hears, in a form it can read, that the server is the
@@ -8294,5 +8352,417 @@ mod tests {
         drop(bob);
         drop(state);
         let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // ── Files (protocol v13) ─────────────────────────────────────────────
+
+    use crate::files::test_support::{blob, path_of, state_with_files};
+
+    const HERE: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+
+    /// One whole-blob `PUT` through the HTTP handler both carriers share.
+    async fn put_blob(state: &ServerState, hash: &[u8; 32], ticket: &str, bytes: &[u8]) -> u16 {
+        let target = format!("{}?offset=0", path_of(hash));
+        let auth = format!("Bearer {ticket}");
+        let body = Bytes::copy_from_slice(bytes);
+        crate::files::http(state, HERE, "PUT", &target, Some(&auth), None, body)
+            .await
+            .status
+    }
+
+    async fn get_blob(state: &ServerState, hash: &[u8; 32], ticket: &str) -> (u16, Bytes) {
+        let auth = format!("Bearer {ticket}");
+        let reply = crate::files::http(
+            state,
+            HERE,
+            "GET",
+            &path_of(hash),
+            Some(&auth),
+            None,
+            Bytes::new(),
+        )
+        .await;
+        (reply.status, reply.body)
+    }
+
+    async fn upload_ready(client: &mut Client) -> String {
+        match client
+            .expect("FileUploadReady", |m| {
+                matches!(m, ServerMessage::FileUploadReady { .. })
+            })
+            .await
+        {
+            ServerMessage::FileUploadReady { ticket, .. } => ticket,
+            _ => unreachable!(),
+        }
+    }
+
+    async fn ready(client: &mut Client) -> (String, u64) {
+        match client
+            .expect("FileReady", |m| {
+                matches!(m, ServerMessage::FileReady { .. })
+            })
+            .await
+        {
+            ServerMessage::FileReady { ticket, size, .. } => (ticket, size),
+            _ => unreachable!(),
+        }
+    }
+
+    async fn refused(client: &mut Client) -> String {
+        match client
+            .expect("FileRefused", |m| {
+                matches!(m, ServerMessage::FileRefused { .. })
+            })
+            .await
+        {
+            ServerMessage::FileRefused { reason, .. } => reason,
+            _ => unreachable!(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_relay_with_files_says_so_and_one_without_refuses_them() {
+        let (state, _dir) = state_with_files(|c| c.max_size_mb = 3);
+        let mut alice = open(&state, "alice", HERE).await;
+        let ServerMessage::Authenticated { files, .. } = alice
+            .expect("Authenticated", |m| {
+                matches!(m, ServerMessage::Authenticated { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        assert_eq!(files.map(|f| f.max_bytes), Some(3 * 1024 * 1024));
+
+        let state = admin_state();
+        let mut bob = open(&state, "bob", HERE).await;
+        let ServerMessage::Authenticated { files, .. } = bob
+            .expect("Authenticated", |m| {
+                matches!(m, ServerMessage::Authenticated { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        assert!(files.is_none());
+        let (_, hash) = blob(10, 1);
+        bob.send(&ClientMessage::FileFetch {
+            conv: FileConv::Channel(1),
+            hash,
+        })
+        .await;
+        assert!(refused(&mut bob).await.contains("keeps no files"));
+    }
+
+    #[tokio::test]
+    async fn a_file_posted_in_a_channel_reaches_its_members_only() {
+        let (state, _dir) = state_with_files(|_| {});
+        let mut alice = connect(&state, "alice", HERE).await;
+        let mut bob = connect(&state, "bob", HERE).await;
+        let mut carol = connect(&state, "carol", HERE).await;
+        let channel = text_channel_with_two(&mut alice, &mut bob, "files").await;
+        let conv = FileConv::Channel(channel);
+        let (bytes, hash) = blob(3000, 2);
+
+        // Carol is not in it: she may neither post nor fetch there
+        carol
+            .send(&ClientMessage::FileUpload {
+                conv,
+                size: 3000,
+                hash,
+            })
+            .await;
+        refused(&mut carol).await;
+        alice
+            .send(&ClientMessage::FileUpload {
+                conv,
+                size: 3000,
+                hash,
+            })
+            .await;
+        let ticket = upload_ready(&mut alice).await;
+        assert_eq!(put_blob(&state, &hash, &ticket, &bytes).await, 201);
+        alice
+            .expect("FileStored", |m| {
+                matches!(m, ServerMessage::FileStored { .. })
+            })
+            .await;
+
+        bob.send(&ClientMessage::FileFetch { conv, hash }).await;
+        let (ticket, size) = ready(&mut bob).await;
+        assert_eq!(size, 3000);
+        assert_eq!(
+            get_blob(&state, &hash, &ticket).await,
+            (206, Bytes::from(bytes))
+        );
+        carol.send(&ClientMessage::FileFetch { conv, hash }).await;
+        refused(&mut carol).await;
+        assert_eq!(get_blob(&state, &hash, "not-a-ticket").await.0, 401);
+    }
+
+    #[tokio::test]
+    async fn a_file_in_a_direct_conversation_is_for_its_two_parties() {
+        let (state, _dir) = state_with_files(|_| {});
+        let mut alice = connect(&state, "alice", HERE).await;
+        let mut bob = connect(&state, "bob", HERE).await;
+        let mut carol = connect(&state, "carol", HERE).await;
+        let id = |name: &str| {
+            *state
+                .user_to_session
+                .get(&*state.username_to_session.get(name).unwrap())
+                .unwrap()
+        };
+        let (alice_id, bob_id) = (id("alice"), id("bob"));
+        let (bytes, hash) = blob(3000, 3);
+
+        alice
+            .send(&ClientMessage::FileUpload {
+                conv: FileConv::Direct(bob_id),
+                size: 3000,
+                hash,
+            })
+            .await;
+        let ticket = upload_ready(&mut alice).await;
+        assert_eq!(put_blob(&state, &hash, &ticket, &bytes).await, 201);
+
+        // Bob names the same conversation from his end
+        bob.send(&ClientMessage::FileFetch {
+            conv: FileConv::Direct(alice_id),
+            hash,
+        })
+        .await;
+        ready(&mut bob).await;
+        // Carol's conversation with Alice is another one
+        carol
+            .send(&ClientMessage::FileFetch {
+                conv: FileConv::Direct(alice_id),
+                hash,
+            })
+            .await;
+        refused(&mut carol).await;
+        // Nobody has a conversation with themselves
+        alice
+            .send(&ClientMessage::FileFetch {
+                conv: FileConv::Direct(alice_id),
+                hash,
+            })
+            .await;
+        refused(&mut alice).await;
+    }
+
+    /// The blob has gone: the channel's other members are asked, without a
+    /// word about who asked; the one who has it uploads it again, and the
+    /// asker is served.
+    #[tokio::test]
+    async fn a_member_who_has_the_file_brings_it_back() {
+        let (state, _dir) = state_with_files(|_| {});
+        let mut alice = connect(&state, "alice", HERE).await;
+        let mut bob = connect(&state, "bob", HERE).await;
+        let channel = text_channel_with_two(&mut alice, &mut bob, "files").await;
+        let conv = FileConv::Channel(channel);
+        let (bytes, hash) = blob(3000, 4);
+        alice
+            .send(&ClientMessage::FileUpload {
+                conv,
+                size: 3000,
+                hash,
+            })
+            .await;
+        let ticket = upload_ready(&mut alice).await;
+        put_blob(&state, &hash, &ticket, &bytes).await;
+        alice
+            .expect("FileStored", |m| {
+                matches!(m, ServerMessage::FileStored { .. })
+            })
+            .await;
+        // Long enough later for the blob to have gone
+        let store = state.files.clone().unwrap();
+        crate::files::deliver(
+            &state,
+            store.sweep(Instant::now() + Duration::from_secs(25 * 3600)),
+        )
+        .await;
+
+        bob.send(&ClientMessage::FileFetch { conv, hash }).await;
+        bob.expect("FileSeeking", |m| {
+            matches!(m, ServerMessage::FileSeeking { .. })
+        })
+        .await;
+        let wanted = alice
+            .expect("FileWanted", |m| {
+                matches!(m, ServerMessage::FileWanted { .. })
+            })
+            .await;
+        assert!(matches!(
+            wanted,
+            ServerMessage::FileWanted { conv: FileConv::Channel(c), hash: h } if c == channel && h == hash
+        ));
+        alice
+            .send(&ClientMessage::FileUpload {
+                conv,
+                size: 3000,
+                hash,
+            })
+            .await;
+        let ticket = upload_ready(&mut alice).await;
+        assert_eq!(put_blob(&state, &hash, &ticket, &bytes).await, 201);
+        let (ticket, _) = ready(&mut bob).await;
+        assert_eq!(get_blob(&state, &hash, &ticket).await.1, Bytes::from(bytes));
+    }
+
+    /// An uploader who leaves hands the upload to the next member with it.
+    #[tokio::test]
+    async fn an_upload_left_behind_passes_to_the_next_member() {
+        let (state, _dir) = state_with_files(|_| {});
+        let mut alice = connect(&state, "alice", HERE).await;
+        let mut bob = connect(&state, "bob", HERE).await;
+        let channel = text_channel_with_two(&mut alice, &mut bob, "files").await;
+        let conv = FileConv::Channel(channel);
+        let (bytes, hash) = blob(3000, 5);
+        alice
+            .send(&ClientMessage::FileUpload {
+                conv,
+                size: 3000,
+                hash,
+            })
+            .await;
+        upload_ready(&mut alice).await;
+        bob.send(&ClientMessage::FileUpload {
+            conv,
+            size: 3000,
+            hash,
+        })
+        .await;
+        // A session's messages are handled in order: past the Pong, Bob is
+        // queued behind Alice. Then Alice goes.
+        bob.send(&ClientMessage::Ping { timestamp: 7 }).await;
+        bob.expect("Pong", |m| {
+            matches!(m, ServerMessage::Pong { timestamp: 7 })
+        })
+        .await;
+        drop(alice);
+        let ticket = upload_ready(&mut bob).await;
+        assert_eq!(put_blob(&state, &hash, &ticket, &bytes).await, 201);
+        bob.expect("FileStored", |m| {
+            matches!(m, ServerMessage::FileStored { .. })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_cancel_spends_the_ticket() {
+        let (state, _dir) = state_with_files(|_| {});
+        let mut alice = connect(&state, "alice", HERE).await;
+        let mut bob = connect(&state, "bob", HERE).await;
+        let channel = text_channel_with_two(&mut alice, &mut bob, "files").await;
+        let conv = FileConv::Channel(channel);
+        let (bytes, hash) = blob(3000, 6);
+        alice
+            .send(&ClientMessage::FileUpload {
+                conv,
+                size: 3000,
+                hash,
+            })
+            .await;
+        let ticket = upload_ready(&mut alice).await;
+        alice.send(&ClientMessage::FileCancel { hash }).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while put_blob(&state, &hash, &ticket, &bytes).await != 401 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the ticket is spent");
+    }
+
+    /// A kept conversation is between two accounts that exist: a made-up
+    /// one is refused, and so is a guest naming one.
+    #[tokio::test]
+    async fn a_file_for_an_away_account_needs_a_real_account() {
+        let dir = crate::files::test_support::TempDir::new();
+        let files = crate::files::test_support::config_in(&dir);
+        let (state, _db) = relay_state_then(AccountsMode::Optional, RegistrationMode::Open, |s| {
+            s.files = Some(Arc::new(crate::files::FileStore::open(&files).unwrap()));
+        })
+        .await;
+        let (mut alice, _) = register(&state, "alice").await;
+        let (away, bob) = register(&state, "bob").await;
+        drop(away);
+        let (_, hash) = blob(3000, 8);
+        alice
+            .send(&ClientMessage::FileUpload {
+                conv: FileConv::Account([0x42; 16]),
+                size: 3000,
+                hash,
+            })
+            .await;
+        refused(&mut alice).await;
+        alice
+            .send(&ClientMessage::FileUpload {
+                conv: FileConv::Account(bob.id),
+                size: 3000,
+                hash,
+            })
+            .await;
+        upload_ready(&mut alice).await;
+
+        let mut guest = connect(&state, "dave#1234", HERE).await;
+        guest
+            .send(&ClientMessage::FileFetch {
+                conv: FileConv::Account(bob.id),
+                hash,
+            })
+            .await;
+        refused(&mut guest).await;
+    }
+
+    /// Asking for a blob that has gone reaches the channel's other members,
+    /// and nobody outside it.
+    #[tokio::test]
+    async fn only_members_are_asked_for_a_file() {
+        let (state, _dir) = state_with_files(|_| {});
+        let mut alice = connect(&state, "alice", HERE).await;
+        let mut bob = connect(&state, "bob", HERE).await;
+        let mut carol = connect(&state, "carol", HERE).await;
+        let channel = text_channel_with_two(&mut alice, &mut bob, "files").await;
+        let conv = FileConv::Channel(channel);
+        let (bytes, hash) = blob(3000, 9);
+        alice
+            .send(&ClientMessage::FileUpload {
+                conv,
+                size: 3000,
+                hash,
+            })
+            .await;
+        let ticket = upload_ready(&mut alice).await;
+        put_blob(&state, &hash, &ticket, &bytes).await;
+        let store = state.files.clone().unwrap();
+        crate::files::deliver(
+            &state,
+            store.sweep(Instant::now() + Duration::from_secs(25 * 3600)),
+        )
+        .await;
+        bob.send(&ClientMessage::FileFetch { conv, hash }).await;
+        bob.expect("FileSeeking", |m| {
+            matches!(m, ServerMessage::FileSeeking { .. })
+        })
+        .await;
+        alice
+            .expect("FileWanted", |m| {
+                matches!(m, ServerMessage::FileWanted { .. })
+            })
+            .await;
+        // Carol's connection is in order: past her Pong, any FileWanted for
+        // her would have arrived
+        carol.send(&ClientMessage::Ping { timestamp: 9 }).await;
+        loop {
+            match carol.next().await {
+                Some(ServerMessage::Pong { timestamp: 9 }) => break,
+                Some(ServerMessage::FileWanted { .. }) => panic!("a non-member was asked"),
+                Some(_) => {}
+                None => panic!("carol's connection closed"),
+            }
+        }
     }
 }

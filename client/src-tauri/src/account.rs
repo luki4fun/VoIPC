@@ -223,6 +223,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
             session_id,
             account: Some(info),
             accounts,
+            ..
         } = msg
         {
             if let Some(accounts) = accounts {

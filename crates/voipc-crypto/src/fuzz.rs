@@ -5,6 +5,7 @@
 //! a test. Keys are fixed, so a crash replays the same way.
 
 use crate::account::{self, Pins, Vault};
+use crate::file::{self, FileMeta};
 use crate::log::{self, LogKey};
 use crate::{envelope, MediaKey};
 use voipc_protocol::types::VaultBlob;
@@ -56,6 +57,33 @@ pub fn fuzz_vault(data: &[u8]) {
     let _ = Vault::from_dek(RELAY, "fuzz", [7; 32]).open_item(&blobs, "item.fuzz");
 }
 
+/// A file blob from the relay, and the claims its sender's message makes
+/// about it. The first byte says whether the body is deflated, the next two
+/// give the size (small, so each input inflates little). The rest goes three
+/// ways: as a whole blob, behind a valid commitment (the framing and the
+/// AEAD), and straight into the inflate, which only a sender reaches, since
+/// a fuzzer cannot forge a GCM tag. A seal of it must open again.
+pub fn fuzz_file(data: &[u8]) {
+    const KEY: [u8; 32] = [7; 32];
+    let (deflated, size, rest) = match data {
+        [flags, a, b, rest @ ..] => (flags & 1 == 1, u16::from_be_bytes([*a, *b]), rest),
+        _ => (false, 0, data),
+    };
+    let meta = |blob: &[u8]| FileMeta {
+        hash: file::blob_hash(blob),
+        key: KEY,
+        size: size as u64,
+        deflated,
+    };
+    let _ = file::open(&meta(rest), rest);
+    let committed = [&file::commitment(&KEY)[..], rest].concat();
+    let _ = file::open(&meta(&committed), &committed);
+    let _ = file::inflate(rest, size as usize);
+
+    let (meta, blob) = file::seal_with(KEY, rest, true).expect("small enough");
+    assert_eq!(file::open(&meta, &blob).as_deref(), Ok(rest));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,6 +111,7 @@ mod tests {
         );
         replay("keys", &[0x11; 32], fuzz_keys);
         replay("log", &[33; 64], fuzz_log);
+        replay("file", &[1, 0, 64, 0x63, 0x60, 0xa0, 0x0c, 0, 0], fuzz_file);
         replay(
             "vault",
             &vault.seal_item("item.fuzz", 1, b"payload").v,
