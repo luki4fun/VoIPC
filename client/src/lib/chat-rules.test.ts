@@ -33,6 +33,9 @@ import {
   sameRow,
   MAX_REACTION_EMOJI,
   MAX_REACTORS,
+  MAX_RECEIVED_BYTES,
+  notificationBody,
+  receivedText,
   type EventIn,
 } from "./chat-rules.ts";
 import type { ChatMessage } from "./types.ts";
@@ -631,4 +634,114 @@ test("a message a stored copy replaces keeps what this reader saw done to it", (
 
 test("every emoji the pickers offer is one a reader takes as a reaction", () => {
   for (const e of [...QUICK_REACTIONS, ...EMOJI_CATEGORIES.flatMap((c) => c.emojis)]) assert.ok(isOneEmoji(e), e);
+});
+
+// ── 1.3.1 audit (Track B2a) ─────────────────────────────────────────────────
+
+test("an id is cut by code points, as envelope.rs cuts it (R2-17)", () => {
+  const astral = "😀".repeat(70);
+  const [kept] = sanitizeHistory([{ user_id: 1, username: "a", content: "x", timestamp: T, id: astral, reply_to: astral }]);
+  assert.equal(kept.id, "😀".repeat(64));
+  assert.equal(kept.reply_to, "😀".repeat(64));
+  assert.equal(messageRefs({ thread: "a".repeat(80) }).thread, "a".repeat(64));
+});
+
+test("a message's text is cut to 16 KiB where it arrives, at a character's edge (D-7)", () => {
+  assert.equal(receivedText("hello"), "hello");
+  const plain = "a".repeat(40_000);
+  assert.equal(receivedText(plain).length, MAX_RECEIVED_BYTES);
+  const euro = receivedText("€".repeat(9000));
+  assert.equal(euro.length, Math.floor(MAX_RECEIVED_BYTES / 3));
+  const emoji = receivedText("😀".repeat(9000));
+  assert.equal(new TextEncoder().encode(emoji).length, MAX_RECEIVED_BYTES);
+  assert.ok(!/[\ud800-\udbff]$/.test(emoji), "no half of a pair left at the end");
+  const edge = "a".repeat(MAX_RECEIVED_BYTES - 1) + "😀";
+  assert.equal(receivedText(edge), "a".repeat(MAX_RECEIVED_BYTES - 1), "a character that does not fit goes whole");
+});
+
+test("a notification never carries the text of a message with a timer (R2-14)", () => {
+  const file = fileRef({ hash: "a".repeat(64), key: "b".repeat(64), size: 1, z: false, name: "cat.png" })!;
+  assert.equal(notificationBody({ content: "**hi** ||secret||" }), "hi ▒▒▒");
+  assert.equal(notificationBody({ content: "hi", expires_at: T }), "");
+  assert.equal(notificationBody({ content: "", file }), "Sent a file: cat.png", "a file without a caption");
+  assert.equal(notificationBody({ content: "", file, expires_at: T }), "");
+  assert.equal(notificationBody({ content: "x".repeat(500) }).length, 140);
+});
+
+test("a field a later version kept in the archive survives this one's save (R2-03)", () => {
+  const stored = {
+    ...msg({ timestamp: T, id: "f" }),
+    extra: JSON.stringify({ reply_to: "a", history: [{ at: 1, text: "old" }], reactions: "not a list" }),
+  };
+  const back = fromArchived(stored);
+  assert.equal(back.reply_to, "a");
+  assert.equal(back.reactions, undefined, "a known field that does not check is still dropped");
+  assert.deepEqual(JSON.parse(back.extra_kept!), { history: [{ at: 1, text: "old" }] });
+  // Saved again, after an edit made here: both there, ours over theirs
+  const edited = applyEvent([back], ev({ kind: "edit", target: "f" }, { user_id: 1, username: "alice" }, T + 5, "new"), { mayPin: false })[0];
+  const again = JSON.parse(toArchived(edited).extra!);
+  assert.deepEqual(again, { history: [{ at: 1, text: "old" }], reply_to: "a", edited_at: T + 5 });
+  assert.equal(fromArchived(toArchived(edited)).extra_kept, back.extra_kept, "and round again unchanged");
+  // Never handed to anyone
+  assert.equal(forHandOff(back).extra_kept, undefined);
+  assert.equal(sanitizeHistory([back])[0].extra_kept, undefined);
+  // A message with nothing unknown carries nothing
+  assert.ok(!("extra_kept" in fromArchived(toArchived(msg({ timestamp: T, reply_to: "a" })))));
+});
+
+test("one long message cannot push the rest out of a hand-off (R2-07)", () => {
+  const long = msg({ timestamp: T, id: "l", content: "x".repeat(40_000), reactions: [] });
+  const offered = forHandOff(long);
+  assert.equal(offered.content.length, 2000);
+  assert.equal(offered.reactions, undefined);
+  assert.equal(long.content.length, 40_000, "the message itself is untouched");
+  const plain = msg({ timestamp: T, id: "p" });
+  assert.equal(forHandOff(plain), plain, "a short plain one is offered as it is");
+  const fifty = [long, ...Array.from({ length: 49 }, (_, i) => msg({ timestamp: T + i, id: `m${i}` }))].map(forHandOff);
+  assert.ok(new TextEncoder().encode(JSON.stringify(fifty)).length < 48 * 1024);
+});
+
+test("a delete also takes hand-off copies that name its writer; an edit does not (D-13, R3-01)", () => {
+  // Bob joined later: Ann's message reached him only as a member's copy
+  const [shared] = sanitizeHistory([msg({ timestamp: T, id: "m1", ...ann, content: "my password is hunter2" })]);
+  assert.equal(shared.account, undefined);
+  const forger = { ...shared, username: "eve#0005" };
+  const later = { ...shared, timestamp: T + 100 };
+  const list = [shared, forger, later];
+  const gone = applyEvent(list, ev({ kind: "delete", target: "m1" }, ann, T + 50), { mayPin: false });
+  assert.equal(gone[0].kind, "deleted");
+  assert.equal(gone[0].content, "");
+  assert.equal(gone[1], forger, "a copy naming somebody else stays");
+  assert.equal(gone[2], later, "a copy claiming a time after the delete stays");
+  assert.equal(applyEvent(list, ev({ kind: "edit", target: "m1" }, ann, T + 50, "changed"), { mayPin: false }), list, "hearsay keeps what was handed on");
+  // Negative: somebody else's delete takes nothing
+  assert.equal(applyEvent(list, ev({ kind: "delete", target: "m1" }, ben, T + 50), { mayPin: false }), list);
+});
+
+test("a guest changes only what this connection received from them (R3-11)", () => {
+  const list = conv();
+  const notNow = { mayPin: false, current: () => false };
+  // After a relay restart a newcomer has the old guest's id and types the old name
+  assert.equal(applyEvent(list, ev({ kind: "edit", target: "m3" }, guest, T + 9, "x"), notNow), list);
+  assert.equal(applyEvent(list, ev({ kind: "delete", target: "m3" }, guest, T + 9), notNow), list);
+  // On the connection that received it: theirs
+  const now = { mayPin: false, current: (m: ChatMessage) => m === list[2] };
+  assert.equal(applyEvent(list, ev({ kind: "edit", target: "m3" }, guest, T + 9, "third!"), now)[2].content, "third!");
+  // An account holder's message is theirs on any connection
+  assert.equal(applyEvent(list, ev({ kind: "edit", target: "m1" }, ann, T + 9, "first!"), notNow)[0].content, "first!");
+});
+
+test("a full emoji lets go of those who took theirs off; look-alike emoji are refused (R3-12)", () => {
+  let list = conv();
+  const thumbs = (by: EventIn["by"], on: boolean, at: number) =>
+    (list = applyEvent(list, ev({ kind: "react", target: "m2", emoji: "👍", on }, by, at), { mayPin: false }));
+  for (let i = 0; i < MAX_REACTORS; i++) {
+    const g = { user_id: 100 + i, username: `g${i}` };
+    thumbs(g, true, T + i);
+    thumbs(g, false, T + 100 + i);
+  }
+  thumbs(ann, true, T + 500);
+  assert.deepEqual(reactionChips(list[1], (k) => k === "a:aa"), [{ emoji: "👍", count: 1, mine: true, names: ["ann#0001"] }]);
+  for (const look of ["👍\u200c", "👍\ufe0e", "\u200c👍"]) assert.ok(!isOneEmoji(look), JSON.stringify(look));
+  for (const one of ["❤️", "👩🏽‍👩🏽‍👧🏽", "🏴󠁧󠁢󠁳󠁣󠁴󠁿"]) assert.ok(isOneEmoji(one), one);
 });

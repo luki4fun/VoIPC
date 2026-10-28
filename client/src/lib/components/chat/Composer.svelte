@@ -6,6 +6,7 @@
   import { cancelFile, fileProgress, forgetProgress, newOp } from "../../files.js";
   import { formatSize } from "../../file-rules.js";
   import { CannotClean, isPhoto } from "../../image-prep.js";
+  import { isAnimated, sniff } from "../../file-sniff.js";
   import Icon from "../Icons.svelte";
   import { EMOJI_CATEGORIES } from "../../emoji.js";
 
@@ -115,6 +116,9 @@
     file: File;
     /** A still photo: the compressed / original choice is for it. */
     photo: boolean;
+    /** A video, a sound or a moving picture: it goes as it is, metadata and
+     *  all, and the chip says so (R3-10, D-16). */
+    asIs: boolean;
     original: boolean;
     /** Its upload under way. */
     op: string | null;
@@ -132,7 +136,7 @@
   export function addFiles(files: Iterable<File>) {
     if (!onsendfile) return;
     for (const file of files) {
-      const entry: Staged = { key: nextKey++, file, photo: false, original: false, op: null, error: null };
+      const entry: Staged = { key: nextKey++, file, photo: false, asIs: false, original: false, op: null, error: null };
       staged = [...staged, entry];
       // The first bytes say whether it is a photo, not the name or the type
       const key = entry.key;
@@ -140,8 +144,11 @@
         .slice(0, 64)
         .arrayBuffer()
         .then((head) => {
-          const photo = isPhoto(new Uint8Array(head), file.type);
-          staged = staged.map((f) => (f.key === key ? { ...f, photo } : f));
+          const bytes = new Uint8Array(head);
+          const photo = isPhoto(bytes, file.type);
+          const kind = sniff(bytes)?.kind;
+          const asIs = kind === "video" || kind === "audio" || (kind === "image" && isAnimated(bytes));
+          staged = staged.map((f) => (f.key === key ? { ...f, photo, asIs } : f));
         })
         .catch(() => {});
     }
@@ -328,6 +335,14 @@
     if (showEmojiPicker) return pushLayer(() => (showEmojiPicker = false));
   });
 
+  /** The picker hangs left from its button, and on a phone that runs off the
+   *  screen's left edge: moved back in, 8 px from either edge (D2-07). */
+  function onScreen(node: HTMLElement) {
+    const r = node.getBoundingClientRect();
+    const shift = r.left < 8 ? 8 - r.left : r.right > innerWidth - 8 ? innerWidth - 8 - r.right : 0;
+    if (shift !== 0) node.style.transform = `translateX(${Math.round(shift)}px)`;
+  }
+
   function toggleEmojiPicker() {
     showEmojiPicker = !showEmojiPicker;
     if (showEmojiPicker) emojiCategory = 0;
@@ -372,6 +387,9 @@
               : "Sent compressed: smaller, without its location and camera data. Press to send it as it is."}
             onclick={() => patch(f.key, { original: !f.original })}
           >Original (1:1)</button>
+        {/if}
+        {#if f.asIs && !f.op}
+          <span class="chip-note" title="Videos, sounds and moving pictures are sent exactly as they are, with any location and camera data in them">Sent as it is: may include location</span>
         {/if}
         {#if f.op}
           <span class="chip-bar" aria-hidden="true"
@@ -450,7 +468,7 @@
     </button>
     {#if showEmojiPicker}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div class="emoji-picker" onkeydown={handleEmojiKeydown} onclick={(e) => e.stopPropagation()}>
+      <div class="emoji-picker" use:onScreen onkeydown={handleEmojiKeydown} onclick={(e) => e.stopPropagation()}>
         <div class="emoji-tabs">
           {#each EMOJI_CATEGORIES as cat, idx}
             <button
@@ -531,6 +549,9 @@
     height: 100%;
     background: var(--text-secondary);
     transition: width 0.2s;
+  }
+  .chip-note {
+    font-size: 0.8rem;
   }
   .chip-error {
     flex-basis: 100%;
@@ -704,6 +725,7 @@
     bottom: calc(100% + 8px);
     right: 0;
     width: 320px;
+    max-width: calc(100vw - 16px);
     max-height: 340px;
     background: var(--bg-secondary);
     border: 1px solid var(--border);

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mentionsName, parse, plainText, shownHref, type Block, type Inline } from "./markdown.ts";
+import { linkFacts, mentionNames, mentionsName, parse, plainText, shownHref, type Block, type Inline } from "./markdown.ts";
 
 /** Every text a tree would put on screen, in order. */
 function texts(blocks: Block[]): string {
@@ -225,4 +225,31 @@ test("where a link goes is shown without what hides or turns it", () => {
   // The link itself keeps its real target, which is what gets copied
   const [p] = parse("[x](https://evil.com/‮moc)");
   assert.deepEqual(p, { t: "p", c: [{ t: "link", href: "https://evil.com/‮moc", c: [{ t: "text", v: "x" }] }] });
+});
+
+test("the link popup names a link's host, and says when it is no web address", () => {
+  assert.deepEqual(linkFacts("https://аpple.com/login"), {
+    shown: "https://xn--pple-43d.com/login",
+    host: "xn--pple-43d.com",
+    web: true,
+  });
+  const rlo = linkFacts("https://evil.com/\u202emoc.elgoog");
+  assert.equal(rlo.host, "evil.com");
+  assert.ok(!rlo.shown.includes("\u202e"), "nothing turns the tail around");
+  for (const not of ["javascript:alert(1)", "data:text/html,<b>x</b>", "mailto:a@b.c", "file:///etc/passwd", "no url at all"]) {
+    const f = linkFacts(not);
+    assert.equal(f.web, false, not);
+    assert.equal(f.host, "", not);
+  }
+  assert.equal(linkFacts("http://example.org:8080/x").host, "example.org:8080");
+});
+
+test("a short name is a mention only where one person goes by it (R2-11)", () => {
+  assert.deepEqual(mentionNames(["bob#0001", "ann#0002"]), ["bob#0001", "bob", "ann#0002", "ann"]);
+  const two = mentionNames(["alice#1234", "alice#5678", "bob#0001"]);
+  assert.deepEqual(two, ["alice#1234", "alice#5678", "bob#0001", "bob"]);
+  const tree = parse("hi @alice and @alice#5678", { names: two });
+  assert.equal(mentionsName(tree, "alice"), false, "@alice names neither alice");
+  assert.equal(mentionsName(tree, "alice#5678"), true);
+  assert.deepEqual(mentionNames(["ann#0002", "ann#0002"]), ["ann#0002", "ann"], "one person listed twice is one");
 });

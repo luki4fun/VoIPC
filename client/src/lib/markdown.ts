@@ -11,6 +11,7 @@
 // Pure, so markdown.test.ts runs it under Node's own test runner.
 
 import { Marked, type Token, type Tokens, type TokenizerExtension } from "marked";
+import { shortName } from "./username.ts";
 
 export type Inline =
   | { t: "text"; v: string }
@@ -293,6 +294,23 @@ export function shownHref(href: string): string {
 }
 
 /**
+ * What the link popup says of a link (R2-12): where it goes as `shownHref`
+ * writes it (which is also what is copied), the host on its own (a look-alike
+ * IDN host shows as the punycode it is), and whether it is a web address at
+ * all: a `javascript:` or `data:` link is not one.
+ */
+export function linkFacts(href: string): { shown: string; host: string; web: boolean } {
+  let url: URL | null = null;
+  try {
+    url = new URL(href);
+  } catch {
+    // Not a URL
+  }
+  const web = url !== null && (url.protocol === "http:" || url.protocol === "https:") && url.host !== "";
+  return { shown: shownHref(href), host: web ? url!.host : "", web };
+}
+
+/**
  * The text a message reads as, without its markup: for a notification, the
  * line that quotes it under a reply, and search. Spoilers stay hidden.
  */
@@ -329,6 +347,18 @@ export function plainText(text: string): string {
   };
   walk(parse(text));
   return parts.join(" ").replace(/\s+/g, " ").trim();
+}
+
+/**
+ * The names an `@` may use for `people` (full names, with their tags): each
+ * full name, and the short one where only one of them goes by it. Among two
+ * guests called alice, `@alice` names neither, so it tints and notifies
+ * neither (R2-11).
+ */
+export function mentionNames(people: readonly string[]): string[] {
+  const uses = new Map<string, number>();
+  for (const p of new Set(people)) uses.set(shortName(p), (uses.get(shortName(p)) ?? 0) + 1);
+  return [...new Set(people.flatMap((p) => (uses.get(shortName(p)) === 1 ? [p, shortName(p)] : [p])))];
 }
 
 /** Whether `blocks` mention `name` anywhere outside code. */

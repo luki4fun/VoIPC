@@ -30,21 +30,86 @@ export function indexById(list: readonly ChatMessage[]): Map<string, ChatMessage
 }
 
 /**
- * The message `id` points at. Ids are the sender's own, and any member can
- * repeat one, so where several carry it the first-hand copy wins over a
- * shared one, and then the earliest: a copy made to impersonate a message can
- * only come after it.
+ * How much later than the message pointing at it a target may claim to be.
+ * Our own messages carry this machine's clock and everybody else's the
+ * relay's: the same slack as chat-rules.ts `SAME_MESSAGE_WINDOW_MS`.
+ */
+const TARGET_SLACK_MS = 120_000;
+
+/** The copies of `id` a message written at `at` can have meant. */
+function candidates(
+  list: readonly ChatMessage[] | Map<string, ChatMessage[]>,
+  id: string | undefined,
+  at: number | undefined,
+): ChatMessage[] {
+  if (!id) return [];
+  const same = (list instanceof Map ? list.get(id) : indexById(list).get(id)) ?? [];
+  // Written after what points at it, so not what it meant: a later copy of
+  // an id never takes over the quotes of the first (R2-09)
+  return at === undefined ? same : same.filter((m) => m.timestamp <= at + TARGET_SLACK_MS);
+}
+
+/** Copies of one id from more than one writer, by name: nothing says which
+ *  of them a message pointing at the id meant (S-009). */
+function manyWriters(same: readonly ChatMessage[]): boolean {
+  return same.some((m) => m.username !== same[0].username);
+}
+
+/**
+ * The message `id` points at, for a message written at `at` (its timestamp;
+ * omitted, every copy counts).
+ *
+ * Ids are the sender's own, and any member can repeat one:
+ * - a copy that claims to be newer than what points at it came after it, and
+ *   is passed over;
+ * - copies from more than one writer leave the answer open: nothing (the
+ *   quote says so, `ambiguousTarget`), never a guess;
+ * - else the first-hand copy wins over a shared one, then the earliest.
  */
 export function findTarget(
   list: readonly ChatMessage[] | Map<string, ChatMessage[]>,
   id: string | undefined,
+  at?: number,
 ): ChatMessage | undefined {
-  if (!id) return undefined;
-  const same = list instanceof Map ? list.get(id) : indexById(list).get(id);
-  if (!same || same.length === 0) return undefined;
+  const same = candidates(list, id, at);
+  if (same.length === 0 || manyWriters(same)) return undefined;
   return [...same].sort(
     (a, b) => Number(a.kind === "shared") - Number(b.kind === "shared") || a.timestamp - b.timestamp,
   )[0];
+}
+
+/** Whether `findTarget` found nothing because more than one writer's message
+ *  carries the id. */
+export function ambiguousTarget(
+  list: readonly ChatMessage[] | Map<string, ChatMessage[]>,
+  id: string | undefined,
+  at?: number,
+): boolean {
+  return manyWriters(candidates(list, id, at));
+}
+
+/** Who we are on one connection to a server, for `isOwn`. */
+export interface Me {
+  /** Our account there (hex), when signed in. */
+  account?: string;
+  user_id: number;
+}
+
+/**
+ * Whether we wrote `m` ("mine": tinted answers, Edit and Delete, a reply's
+ * "replied to you").
+ *
+ * - By the account, where the message and we both have one.
+ * - Else by this connection's user id, and only for a message this
+ *   connection received (`current`): the relay hands ids out again after a
+ *   restart, so an archived message under our id now is somebody else's
+ *   (R2-10, R3-11).
+ * - Never for a copy a member handed over: who wrote it is their word.
+ */
+export function isOwn(m: ChatMessage, me: Me, current: (m: ChatMessage) => boolean): boolean {
+  if (m.kind === "shared") return false;
+  if (me.account && m.account) return m.account === me.account;
+  return me.user_id !== 0 && m.user_id === me.user_id && current(m);
 }
 
 /** Who wrote a message, as one key: the account where there is one. */
@@ -86,7 +151,7 @@ export function threadView(list: readonly ChatMessage[], opts: { auto: boolean }
   const orphans = new Set<ChatMessage>();
   for (const m of list) {
     if (!isMessage(m) || !m.thread) continue;
-    const root = findTarget(index, m.thread);
+    const root = findTarget(index, m.thread, m.timestamp);
     if (!root) orphans.add(m);
     else if (root !== m) explicitRoots.add(root);
   }
@@ -100,7 +165,11 @@ export function threadView(list: readonly ChatMessage[], opts: { auto: boolean }
     const seen = new Set<ChatMessage>([m]);
     for (let i = 0; i < MAX_CHAIN; i++) {
       if (at !== m && explicitRoots.has(at)) break;
-      const up = at.thread ? findTarget(index, at.thread) : at.reply_to ? findTarget(index, at.reply_to) : undefined;
+      const up = at.thread
+        ? findTarget(index, at.thread, at.timestamp)
+        : at.reply_to
+          ? findTarget(index, at.reply_to, at.timestamp)
+          : undefined;
       if (!up || seen.has(up) || !isMessage(up)) break;
       seen.add(up);
       at = up;

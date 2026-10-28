@@ -5,7 +5,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { get, writable } from "svelte/store";
-import { base64Chunks, referencedHashes, refersTo } from "./file-rules";
+import { base64Chunks, loadKey, referencedHashes, refersTo } from "./file-rules";
 import type { FileBlob, FileConv } from "./types";
 import type { ChatPlace } from "./chat-rules";
 import { accountHex } from "./stores/account";
@@ -97,14 +97,15 @@ function stageId(): string {
   return `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 }
 
-/** Loads under way, by server and blob: two messages with one file (or a
- *  second click) share one, rather than fetching and paying for it twice. */
+/** Loads under way, by server and file (`loadKey`): two messages with one
+ *  file (or a second click) share one, rather than fetching and paying for
+ *  it twice. */
 const loading = new Map<string, Promise<Uint8Array>>();
 
 /** The file a message in `conv` carries, opened: from this device's cache, or
  *  from the relay, which may first ask the conversation's members for it. */
 export function fetchFile(server: string, conv: FileConv, file: FileBlob, op?: string): Promise<Uint8Array> {
-  const key = `${server} ${file.hash}`;
+  const key = loadKey(server, file);
   let load = loading.get(key);
   if (!load) {
     load = invoke<ArrayBuffer>("fetch_file", { server, conv, file, op })

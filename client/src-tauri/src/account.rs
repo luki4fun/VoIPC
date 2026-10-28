@@ -654,6 +654,37 @@ pub async fn account_password_change(
     Ok(())
 }
 
+/// A new recovery key for the account signed in on `server`, confirmed by its
+/// password and a code where it has codes on; the old key stops working. It
+/// also gives an account made before 1.3 its reset key (S-006). Returns the
+/// key's text, which the page shows once the relay answers
+/// `RecoveryKeyChanged` (as `account-reply`; an `Error` for
+/// `RecoveryKeyNew` means it is not in force, and is never shown).
+#[tauri::command]
+pub async fn account_recovery_key_new(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    server: String,
+    password: String,
+    totp: Option<String>,
+    recovery: Option<String>,
+) -> Result<String, String> {
+    let salt = {
+        let connections = state.connections.read().await;
+        let (_, link) = signed_in(&connections, &server)?;
+        let salt = link.session().kdf_salt();
+        salt
+    };
+    let master = tokio::task::spawn_blocking(move || stretch_salted(&password, &salt))
+        .await
+        .map_err(|e| e.to_string())?;
+    let connections = state.connections.read().await;
+    let (connection, link) = signed_in(&connections, &server)?;
+    let (a, key) = link.session().recovery_key_new(&master, totp, recovery);
+    run(&app, &server, &connection.tcp_tx, a).await;
+    Ok(key)
+}
+
 /// An account request on a signed-in connection (codes, the vault).
 #[tauri::command]
 pub async fn account_request(

@@ -1,6 +1,21 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { base64Chunks, fitWithin, formatSize, sealedLen, previewOf, previewPixels, referencedHashes, refersTo, saveName, withExtension } from "./file-rules.ts";
+import {
+  Asks,
+  MAX_ASKS,
+  asksAgain,
+  base64Chunks,
+  fitWithin,
+  formatSize,
+  loadKey,
+  sealedLen,
+  previewOf,
+  previewPixels,
+  referencedHashes,
+  refersTo,
+  saveName,
+  withExtension,
+} from "./file-rules.ts";
 import type { ChatMessage } from "./types.ts";
 
 const T = 1_700_000_000_000;
@@ -94,4 +109,30 @@ test("staged chunks are base64 of at most the chunk size, and join back to the f
   const parts = base64Chunks(big);
   assert.equal(parts.length, 3);
   assert.equal(parts.reduce((n, c) => n + Buffer.from(c, "base64").length, 0), big.length);
+});
+
+test("a message that copies a file's id with another key loads on its own (R3-02)", () => {
+  const real = file(A);
+  assert.equal(loadKey("s", real), loadKey("s", { ...real }), "two cards of one file share a load");
+  for (const other of [{ ...real, key: "d".repeat(64) }, { ...real, size: 4 }, { ...real, z: true }]) {
+    assert.notEqual(loadKey("s", other), loadKey("s", real));
+  }
+  assert.notEqual(loadKey("t", real), loadKey("s", real), "another server");
+});
+
+test("refusals from 100 that may pass later are asked again; the rest end it (R3-04)", () => {
+  for (const code of [100, 102, 103, 104]) assert.equal(asksAgain(code), true, String(code));
+  for (const code of [1, 2, 3, 4, 5, 101, 105]) assert.equal(asksAgain(code), false, String(code));
+});
+
+test("a download whose tickets bring bytes never runs out of asks (R3-05)", () => {
+  const idle = new Asks();
+  let n = 0;
+  while (idle.next() && n < 10) n++;
+  assert.equal(n, MAX_ASKS);
+  const moving = new Asks();
+  for (let i = 0; i < 100; i++) {
+    assert.equal(moving.next(), true);
+    moving.moved();
+  }
 });

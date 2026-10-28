@@ -22,6 +22,7 @@ const TASKS = {
   'test:web': ['./tasks/test-web.mjs', 'Headless two-browser end-to-end test of the web client'],
   'bundle-libs': ['./tasks/bundle-libs.mjs', 'Stage shared libraries for AppImage bundling'],
   version: ['./tasks/version.mjs', 'Sync the workspace version into every file that repeats it'],
+  notices: ['./tasks/notices.mjs', 'Write client/public/THIRD-PARTY-NOTICES.txt (every build does it too)'],
 };
 
 function usage() {

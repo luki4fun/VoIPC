@@ -22,13 +22,18 @@ Tell us:
 
 | Version | Security fixes |
 |---|---|
-| the newest 1.x minor | yes |
-| the minor before it | for 30 days after the newer one ships |
+| the newest release | yes |
+| the newest release of the previous protocol (now 1.0.x, protocol 12) | for 90 days after the first release of the new protocol (1.3.1) |
+| an older minor on the same protocol | for 30 days after the newer one ships |
 | before 1.0 | no |
 
-A client and a relay must speak the same protocol version. A fix that changes the protocol
-therefore needs both updated, and its release notes say so in their first line
-([docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)).
+A client and a relay must speak the same protocol version, so a protocol change makes a whole
+server and its users move together, and that takes time. For 90 days after 1.3.1 ships, a fix
+that also concerns 1.0 comes as a 1.0.x release too, and its advisory names both. After that,
+1.0.x gets no fixes: update the relay and the apps to the newest release.
+
+A fix that itself changes the protocol needs both sides updated, and its release notes say so
+in their first line ([docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)).
 
 ## What is not a vulnerability
 

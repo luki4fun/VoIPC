@@ -4,14 +4,14 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>VoIPC — voice, screen sharing and chat on a server you run</title>
-  <meta name="description" content="VoIPC is an open-source, self-hosted alternative to Discord and TeamSpeak. Signal Protocol chat, AES-256-GCM voice and screen sharing, and a relay that stores nothing by default.">
+  <meta name="description" content="VoIPC is an open-source, self-hosted alternative to Discord and TeamSpeak. Signal Protocol chat, AES-256-GCM voice and screen sharing, and a relay that keeps no messages by default, and files only encrypted, for a day at most.">
   <meta name="theme-color" content="#0f1114">
   <meta name="color-scheme" content="dark">
   <link rel="icon" type="image/png" href="favicon.png">
   <link rel="apple-touch-icon" href="apple-touch-icon.png">
   <link rel="preload" href="fonts/barlow-semi-condensed-700.woff2" as="font" type="font/woff2" crossorigin>
   <meta property="og:title" content="VoIPC — voice, screen sharing and chat on a server you run">
-  <meta property="og:description" content="Open-source Discord/TeamSpeak alternative. Signal Protocol chat, AES-256-GCM media, a relay that stores nothing by default.">
+  <meta property="og:description" content="Open-source Discord/TeamSpeak alternative. Signal Protocol chat, AES-256-GCM media, a relay that keeps no messages by default, and files only encrypted, for a day at most.">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://voipc.l4f.cc/">
   <meta property="og:image" content="https://voipc.l4f.cc/screenshots/og.png">
@@ -406,6 +406,7 @@
                       <dt>android</dt><dd><a href="https://github.com/luki4fun/voipc/releases/download/v1.1.0/VoIPC-android-1.1.0.apk">APK</a></dd>
                       <dt>browser</dt><dd>nothing to install: <code>https://your-server:9987</code></dd>
                       <dt>version</dt><dd class="num">1.1.0 · <a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">changelog</a></dd>
+                      <dt>from 1.0</dt><dd><strong>update the server first.</strong> 1.3 apps and 1.0 servers do not connect, and the 1.0 desktop app offers the update everywhere: on a server still on 1.0, wait.</dd>
                     </dl>
                   </div>
                 </div>
@@ -515,6 +516,8 @@
             <li><svg aria-hidden="true"><use href="#i-check"/></svg>Several servers open at once; text channels are subscriptions, voice is one channel at a time</li>
             <li><svg aria-hidden="true"><use href="#i-check"/></svg>Password-protected channels, invites and pokes, encrypted too</li>
             <li><svg aria-hidden="true"><use href="#i-check"/></svg>Messages that delete themselves after a while, per channel or per conversation</li>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg>Files and pictures, sealed on your device; nothing downloads until you press Load</li>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg>Replies, threads, Markdown, reactions, and editing what you wrote</li>
             <li><svg aria-hidden="true"><use href="#i-check"/></svg>Persistent rooms from a <code>channels.json</code> on the server</li>
           </ul>
         </div>
@@ -582,7 +585,7 @@
         <tbody>
           <tr><td class="key">relay.reads_messages</td><td class="val off">0</td><td class="what">Messages ride the Signal Protocol (X3DH, Double Ratchet, sender keys) through the official libsignal crate. The relay forwards ciphertext.</td></tr>
           <tr><td class="key">relay.reads_media</td><td class="val off">0</td><td class="what">Voice, video and positions are AES-256-GCM per packet, with per-channel keys handed out over pairwise Signal sessions. The relay decodes nothing.</td></tr>
-          <tr><td class="key">relay.storage</td><td class="val">memory</td><td class="what">Without accounts it never writes to disk: a restart is a clean slate, and there is nothing to seize, leak or subpoena.</td></tr>
+          <tr><td class="key">relay.storage</td><td class="val">memory</td><td class="what">Without accounts it keeps nothing it can read. Messages, voice and positions pass through memory; files posted in chat sit on its disk only as ciphertext, for a day at most by default, and every restart wipes them. A restart is a clean slate, but for the bans an admin set.</td></tr>
           <tr><td class="key">accounts</td><td class="val">off · optional</td><td class="what">Turned on by the operator, it keeps a database: names, sign-ins, who wrote where and when, and ciphertext it cannot open.</td></tr>
           <tr><td class="key">transport</td><td class="val">tls 1.3</td><td class="what">Everything rides one QUIC connection; self-signed certificates are pinned on first connect, and a changed fingerprint stops the connection.</td></tr>
           <tr><td class="key">history</td><td class="val">local</td><td class="what">Optional, on your own disk: PBKDF2 at 600,000 iterations and AES-256-GCM, a fresh salt and nonce per file.</td></tr>
@@ -596,10 +599,11 @@
         <tbody>
           <tr><td class="key">messages</td><td>forwarded, never readable</td><td>encrypted copies members choose to keep</td><td>optional encrypted history, up to 500 per channel</td></tr>
           <tr><td class="key">voice · video · screens</td><td>forwarded, never readable</td><td>forwarded, never readable</td><td>not stored</td></tr>
+          <tr><td class="key">files</td><td>sealed copies it cannot open: 30 min after the last fetch, a day at most by default; wiped at every start</td><td>the same</td><td>the files you sent or loaded, still sealed: up to 1 GB by default (256 MB on Android; in the browser, in memory only)</td></tr>
           <tr><td class="key">who is where</td><td>names and channels, in memory, while connected</td><td>also who wrote where, when and how much</td><td>saved servers and settings</td></tr>
           <tr><td class="key">addresses</td><td>in memory, during the session</td><td>sign-ins, with addresses hashed</td><td>—</td></tr>
           <tr><td class="key">secrets</td><td>hashed channel passwords; encrypted media keys</td><td>a password-derived hash; sealed two-factor secrets</td><td>your private keys; with an account, the remembered device and vault keys</td></tr>
-          <tr><td class="key">after a restart</td><td>nothing</td><td>the database</td><td>as above</td></tr>
+          <tr><td class="key">after a restart</td><td>nothing but the bans an admin set</td><td>the database</td><td>as above</td></tr>
           <tr><td class="key">analytics</td><td>none</td><td>none</td><td>none</td></tr>
         </tbody>
       </table>
@@ -620,7 +624,7 @@
               <td><span class="verdict yes"><svg aria-hidden="true"><use href="#i-check"/></svg>Yes</span></td>
               <td><span class="verdict yes"><svg aria-hidden="true"><use href="#i-check"/></svg>MIT</span></td>
               <td><span class="verdict yes"><svg aria-hidden="true"><use href="#i-check"/></svg>No, unless the server asks</span></td>
-              <td><span class="verdict yes"><svg aria-hidden="true"><use href="#i-check"/></svg>Nothing by default</span></td>
+              <td><span class="verdict yes"><svg aria-hidden="true"><use href="#i-check"/></svg>No messages by default; files encrypted, a day at most</span></td>
               <td><span class="verdict yes"><svg aria-hidden="true"><use href="#i-check"/></svg>Yes, encrypted</span></td>
             </tr>
             <tr>
@@ -665,6 +669,7 @@
             <td><span class="cap">Not supported yet; the browser client works</span></td></tr>
         </tbody>
       </table>
+      <p class="note"><strong>Coming from 1.0?</strong> 1.3 speaks a new protocol: update your server first, then the apps. A 1.3 app cannot connect to a 1.0 server, and does not go back to 1.0 by itself. The browser needs nothing; Android and the .deb install over the old one.</p>
       <p class="note">Browsers need Chrome 97, Edge 98, Firefox 130 or Safari 26.4 (WebTransport and WebCodecs). Every release is signed and listed in <a href="https://github.com/luki4fun/voipc/releases/download/v1.1.0/SHA256SUMS">SHA256SUMS</a>; how to check one is in the <a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">changelog</a>.</p>
     </section>
 

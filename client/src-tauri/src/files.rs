@@ -15,8 +15,9 @@
 //!   and follows the relay's `upload-offset`. A download whose ticket has gone
 //!   (404) fetches again and goes on where it stopped. One request at a time
 //!   per ticket: the relay serves a ticket's requests one by one anyway. And
-//!   one connection per server, which every transfer takes turns on: each
-//!   holds one of the address's places on the relay while it lives.
+//!   one connection per server, which [`TRANSFERS_AT_ONCE`] transfers take
+//!   turns on (the rest wait before they ask): each connection holds one of
+//!   the address's places on the relay while it lives.
 //! - **In a call** (voice on any server) transfers yield to it: chunks of
 //!   [`CALL_CHUNK`], each followed by a pause as long as it took, so a file
 //!   takes half of what it measures at most. A FIFO-queued link a file fills
@@ -49,7 +50,9 @@ use tokio::sync::{mpsc, Notify};
 use tracing::{debug, warn};
 use voipc_crypto::file::{FileError, FileMeta, MAX_FILE_BLOB, MAX_FILE_PLAIN};
 use voipc_protocol::conv::{hex, unhex};
-use voipc_protocol::messages::{ClientMessage, ServerMessage, FILE_RATE};
+use voipc_protocol::messages::{
+    ClientMessage, ServerMessage, FILE_BUSY, FILE_EXPIRED, FILE_RATE, FILE_STALLED,
+};
 use voipc_protocol::types::{FileConv, FileLimits};
 use voipc_protocol::ws;
 
@@ -82,14 +85,21 @@ const STALL_TIME: Duration = Duration::from_secs(2 * 60);
 /// it waits 5 s for the next one.
 const IDLE_REUSE: Duration = Duration::from_secs(4);
 /// How many times one transfer asks the relay (a ticket that has gone, an
-/// upload that ended) before it gives up.
+/// upload that ended) before it gives up. A download's ask that brought bytes
+/// is not counted (`Asks`).
 const MAX_ASKS: u32 = 4;
+/// Transfers per server whose requests take turns on its connection at once;
+/// the others wait before they ask. So a new upload's first chunk waits
+/// behind one other chunk at most (~`CHUNK_TIME`), well inside the 30 s the
+/// relay gives it (R3-04).
+const TRANSFERS_AT_ONCE: usize = 2;
 /// Silence after a request before it is sent again.
 const REPLY_WAIT: Duration = Duration::from_secs(60);
 /// The same while the relay asks members for the file: each ask may reach
 /// them all again, so rarely.
 const SEEK_RESEND: Duration = Duration::from_secs(5 * 60);
-/// How long to wait before asking again after "too many at once".
+/// How long to wait before asking again after a refusal that may pass later
+/// (`asks_again`).
 const RATE_PAUSE: Duration = Duration::from_secs(5);
 /// How long an upload waits for its ticket: another member's upload of the
 /// same blob may go first, and the relay passes it on after 3 min of nothing.
@@ -168,6 +178,8 @@ pub struct Files {
     waits: Mutex<HashMap<[u8; 32], mpsc::UnboundedSender<ServerMessage>>>,
     /// A blob's transfer has ended.
     freed: Notify,
+    /// `TRANSFERS_AT_ONCE` places on `link`; closed with the connection.
+    slots: tokio::sync::Semaphore,
     closed: AtomicBool,
 }
 
@@ -255,6 +267,7 @@ impl Files {
             link: tokio::sync::Mutex::new(None),
             waits: Mutex::new(HashMap::new()),
             freed: Notify::new(),
+            slots: tokio::sync::Semaphore::new(TRANSFERS_AT_ONCE),
             closed: AtomicBool::new(false),
         }
     }
@@ -268,6 +281,7 @@ impl Files {
         self.closed.store(true, Ordering::Relaxed);
         lock(&self.waits).clear();
         self.freed.notify_waiters();
+        self.slots.close();
     }
 
     /// A file message from the relay (`is_file_message`).
@@ -320,6 +334,13 @@ impl Files {
         }
     }
 
+    /// A place among the transfers that take turns on `link`, after this
+    /// blob's turn (never the other way round: a slot is not held while
+    /// waiting for a turn).
+    async fn slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>, String> {
+        self.slots.acquire().await.map_err(|_| CLOSED.into())
+    }
+
     fn progress(&self, op: Option<&str>, stage: &str, done: u64, total: u64) {
         if let Some(op) = op {
             (self.emit)(
@@ -346,18 +367,22 @@ impl Files {
             return Err(too_large(limits.max_bytes));
         }
         let mut turn = self.turn(hash).await?;
+        // Before the ask: the relay's clock for the first chunk starts at its
+        // answer, so the chunk must not then queue behind every other transfer
+        let _slot = self.slot().await?;
         let ask = ClientMessage::FileUpload {
             conv,
             size: blob.len() as u64,
             hash,
         };
-        for _ in 0..MAX_ASKS {
+        let mut asks = Asks::default();
+        while asks.next() {
             self.send(&ask);
             let give_up = Instant::now() + UPLOAD_WAIT;
             loop {
                 match turn.next(&ask, REPLY_WAIT, give_up).await? {
                     ServerMessage::FileStored { .. } => return turn.done(()),
-                    ServerMessage::FileRefused { code, .. } if code == FILE_RATE => {
+                    ServerMessage::FileRefused { code, .. } if asks_again(code) => {
                         tokio::time::sleep(RATE_PAUSE).await;
                         break;
                     }
@@ -388,9 +413,14 @@ impl Files {
     ) -> Result<Vec<u8>, String> {
         self.limits()?;
         let mut turn = self.turn(hash).await?;
+        let mut slot = None;
         let mut have = Vec::new();
         let ask = ClientMessage::FileFetch { conv, hash };
-        for _ in 0..MAX_ASKS {
+        let mut asks = Asks::default();
+        while asks.next() {
+            if slot.is_none() {
+                slot = Some(self.slot().await?);
+            }
             self.send(&ask);
             let mut give_up = Instant::now() + FETCH_WAIT;
             let mut every = REPLY_WAIT;
@@ -403,19 +433,31 @@ impl Files {
                         if have.len() as u64 > size {
                             have.clear();
                         }
+                        // The one let go of while members were asked
+                        if slot.is_none() {
+                            slot = Some(self.slot().await?);
+                        }
+                        let before = have.len();
                         match self.get(&ticket, &hash, size, &mut have, op).await? {
                             Got::All => return turn.done(have),
-                            Got::Gone => break,
+                            Got::Gone => {
+                                if have.len() > before {
+                                    asks.moved();
+                                }
+                                break;
+                            }
                         }
                     }
                     ServerMessage::FileSeeking { .. } => {
                         self.progress(op, "seeking", 0, 0);
-                        // The relay ends this wait itself
+                        // The relay ends this wait itself, which can take an
+                        // hour: the link is the other transfers' meanwhile
+                        slot = None;
                         give_up = Instant::now() + SEEK_WAIT;
                         every = SEEK_RESEND;
                     }
                     ServerMessage::FileUnavailable { .. } => return Err(UNAVAILABLE.into()),
-                    ServerMessage::FileRefused { code, .. } if code == FILE_RATE => {
+                    ServerMessage::FileRefused { code, .. } if asks_again(code) => {
                         tokio::time::sleep(RATE_PAUSE).await;
                         break;
                     }
@@ -569,6 +611,33 @@ fn too_large(max: u64) -> String {
         "the file is larger than this server takes ({} MB at most)",
         max / 1_000_000
     )
+}
+
+/// A refusal after which the same ask may pass a little later: too many at
+/// once, the relay busy, or an upload it ended as stalled or too long (a
+/// first chunk that queued here can be that). The others are final for the
+/// file, or (the hourly budget) for longer than a transfer waits (R3-04).
+fn asks_again(code: u16) -> bool {
+    matches!(code, FILE_RATE | FILE_BUSY | FILE_STALLED | FILE_EXPIRED)
+}
+
+/// The asks one transfer has had of the relay: `MAX_ASKS` at most, and one
+/// whose ticket brought bytes before it went is not counted, so a slow
+/// download outlives any number of tickets while it moves on (R3-05).
+#[derive(Default)]
+struct Asks(u32);
+
+impl Asks {
+    /// Ask once more, if any ask is left.
+    fn next(&mut self) -> bool {
+        self.0 += 1;
+        self.0 <= MAX_ASKS
+    }
+
+    /// The last ask moved the transfer on.
+    fn moved(&mut self) {
+        self.0 = 0;
+    }
 }
 
 /// `FileRefused` in words. The relay's own are meant for people.
@@ -1062,6 +1131,29 @@ async fn blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'static) -> 
         .map_err(|e| e.to_string())
 }
 
+/// The file `meta` names, opened from the copy kept here; `None` without one.
+/// A copy that is not the blob `meta` names (cut short by a crash, say) goes,
+/// and a fetch brings the right one. Any other error is the message's: its
+/// key, size or deflate flag do not open the blob its id names, and never
+/// will. That copy stays, for the messages that name it rightly: a message
+/// that copies a real file's id must not make a reader drop it (R3-02).
+fn open_cached(meta: &FileMeta) -> Result<Option<Vec<u8>>, FileError> {
+    let Some(blob) = cache_read(&meta.hash) else {
+        return Ok(None);
+    };
+    match voipc_crypto::file::open(meta, &blob) {
+        Ok(plain) => Ok(Some(plain)),
+        // `open` looks at the shape before the id, so a copy cut short can
+        // fail as `Malformed`: the id is what tells the two apart
+        Err(_) if voipc_crypto::file::blob_hash(&blob) != meta.hash => {
+            debug!("a cached file is not the blob it is kept as: fetching it again");
+            cache_remove(&meta.hash);
+            Ok(None)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Keep `blob` in the cache, as far as the disk lets it.
 async fn keep(state: &AppState, hash: [u8; 32], blob: Vec<u8>) {
     let cap = state.config().file_cache_mb.saturating_mul(MIB);
@@ -1164,18 +1256,12 @@ pub async fn fetch_file(
     let meta = FileMeta::from_parts(&file.hash, &file.key, file.size, file.z)
         .map_err(|e| e.to_string())?;
     let hash = meta.hash;
-    if let Some(blob) = blocking(move || cache_read(&hash)).await? {
-        let m = meta.clone();
-        match blocking(move || voipc_crypto::file::open(&m, &blob)).await? {
-            Ok(plain) => return Ok(tauri::ipc::Response::new(plain)),
-            // A damaged copy (cut short by a crash, say), or a message that
-            // will not open whatever the bytes: fetching again tells them
-            // apart, and only a copy that opens is kept
-            Err(e) => {
-                debug!("a cached file did not open ({e}): fetching it again");
-                blocking(move || cache_remove(&hash)).await?;
-            }
-        }
+    let m = meta.clone();
+    if let Some(plain) = blocking(move || open_cached(&m))
+        .await?
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(tauri::ipc::Response::new(plain));
     }
     let files = files_of(&state, &server).await?;
     let op = op.as_deref();
@@ -1860,8 +1946,13 @@ mod tests {
         assert_eq!(content_range("5-9/20"), None);
     }
 
+    /// The tests that use the one cache directory, one at a time: this one
+    /// empties it.
+    static CACHE_DIR: Mutex<()> = Mutex::new(());
+
     #[test]
     fn the_cache_keeps_the_newest_within_its_cap_and_lets_go_of_the_rest() {
+        let _one = lock(&CACHE_DIR);
         let _ = std::fs::remove_dir_all(cache_dir());
         let (a, b, c) = ([1u8; 32], [2u8; 32], [3u8; 32]);
         cache_write(&a, &[0; 100], 1000).unwrap();
@@ -1906,5 +1997,77 @@ mod tests {
         assert_eq!(std::fs::read_dir(cache_dir()).unwrap().count(), 0);
         cache_wipe();
         assert!(!cache_dir().exists());
+    }
+
+    /// R3-02: a message that copies a real file's id with another key (or
+    /// size, or deflate flag) does not open, and the good copy stays for
+    /// the messages that name it rightly. Only bytes that are not the blob
+    /// go, and are fetched again.
+    #[test]
+    fn a_message_that_does_not_open_a_kept_blob_leaves_it_kept() {
+        let _one = lock(&CACHE_DIR);
+        let plain = b"the real file".to_vec();
+        let (meta, blob) = voipc_crypto::file::seal(&plain, false).unwrap();
+        cache_write(&meta.hash, &blob, u64::MAX).unwrap();
+        let forged = [
+            FileMeta {
+                key: [9; 32],
+                ..meta.clone()
+            },
+            FileMeta {
+                size: meta.size + 1,
+                ..meta.clone()
+            },
+            FileMeta {
+                deflated: !meta.deflated,
+                ..meta.clone()
+            },
+        ];
+        for (i, other) in forged.iter().enumerate() {
+            assert!(open_cached(other).is_err());
+            assert!(cached(&meta.hash), "forged meta {i} made the copy go");
+        }
+        assert_eq!(open_cached(&meta).unwrap(), Some(plain));
+        // A copy cut short is not the blob: it goes, and is fetched again
+        cache_write(&meta.hash, &blob[..blob.len() - 1], u64::MAX).unwrap();
+        assert_eq!(open_cached(&meta).unwrap(), None);
+        assert!(!cached(&meta.hash));
+        assert_eq!(open_cached(&meta).unwrap(), None, "nothing kept");
+    }
+
+    /// R3-04: a refusal that says a later try may pass is asked again; the
+    /// final ones and the hourly budget end the transfer.
+    #[test]
+    fn a_refusal_that_may_pass_later_is_asked_again() {
+        use voipc_protocol::messages::*;
+        for code in [FILE_RATE, FILE_BUSY, FILE_STALLED, FILE_EXPIRED] {
+            assert!(asks_again(code), "{code}");
+        }
+        for code in [
+            FILE_NOT_HERE,
+            FILE_OFF,
+            FILE_TOO_LARGE,
+            FILE_PLACES,
+            FILE_MISMATCH,
+            FILE_BUDGET,
+            FILE_FAILED,
+        ] {
+            assert!(!asks_again(code), "{code}");
+        }
+    }
+
+    /// R3-05: `MAX_ASKS` that brought nothing end a transfer; a ticket that
+    /// brought bytes before it went costs no ask, however many it takes.
+    #[test]
+    fn a_download_that_moves_on_never_runs_out_of_asks() {
+        let mut idle = Asks::default();
+        assert_eq!((0..10).filter(|_| idle.next()).count(), MAX_ASKS as usize);
+        let mut moving = Asks::default();
+        for _ in 0..100 {
+            assert!(moving.next());
+            moving.moved();
+        }
+        // ...and once it stops moving, the count starts again
+        assert_eq!((0..10).filter(|_| moving.next()).count(), MAX_ASKS as usize);
     }
 }

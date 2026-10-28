@@ -271,6 +271,18 @@ export class Session implements SessionContext, AccountHost {
     const seen = this.signal.takeSeen();
     for (const { user_id, key } of seen) this.account?.checkIdentity(this, user_id, key);
   }
+
+  /** A pairwise decrypt, with the identity it took in (a session the peer
+   *  opened, which no bundle check sees) checked against the pins before
+   *  anything it decrypted is shown: a changed key is warned of no later
+   *  than its first message (S-012; network.rs `check_seen_now`). */
+  private decrypt(fromUserId: number, ciphertext: Uint8Array, messageType: number): Uint8Array {
+    try {
+      return this.signal.decrypt(fromUserId, ciphertext, messageType);
+    } finally {
+      this.checkSeen();
+    }
+  }
   private keepalive: ReturnType<typeof setInterval> | undefined;
   /** Control messages waiting for the budget; see `drainControl`. */
   private readonly controlQueue: Uint8Array[] = [];
@@ -1185,7 +1197,7 @@ export class Session implements SessionContext, AccountHost {
     }
     let plaintext: Uint8Array;
     try {
-      plaintext = this.signal.decrypt(fromUserId, ciphertext, messageType);
+      plaintext = this.decrypt(fromUserId, ciphertext, messageType);
     } catch (e) {
       console.warn(`media key from ${fromUserId} rejected:`, e);
       return;
@@ -1217,7 +1229,7 @@ export class Session implements SessionContext, AccountHost {
       return;
     }
     try {
-      const plaintext = this.signal.decrypt(fromUserId, ciphertext, messageType);
+      const plaintext = this.decrypt(fromUserId, ciphertext, messageType);
       this.signal.processSenderKeyDistribution(fromUserId, channelId, plaintext);
     } catch (e) {
       console.warn(`failed to process sender key from ${fromUserId}:`, e);
@@ -1267,7 +1279,7 @@ export class Session implements SessionContext, AccountHost {
     }
     let messages: unknown[];
     try {
-      const plaintext = this.signal.decrypt(fromUserId, ciphertext, messageType);
+      const plaintext = this.decrypt(fromUserId, ciphertext, messageType);
       messages = JSON.parse(wasm().openHistoryPayload(channelId, plaintext));
     } catch (e) {
       console.warn(`channel history from ${fromUserId} rejected:`, e);
@@ -1367,7 +1379,7 @@ export class Session implements SessionContext, AccountHost {
     if (fromUserId === this.userId) return;
     const event = { from_user_id: fromUserId, from_username: fromUsername, to_user_id: toUserId, timestamp, encrypted: true };
     try {
-      const plaintext = this.signal.decrypt(fromUserId, ciphertext, messageType);
+      const plaintext = this.decrypt(fromUserId, ciphertext, messageType);
       if (messageType === 1) this.markEstablished(fromUserId);
       // A DM carries the same envelope a channel message does since 0.9.0;
       // anything else reads as the text itself.
@@ -1420,7 +1432,7 @@ export class Session implements SessionContext, AccountHost {
   private onPokeReceived(fromUserId: number, fromUsername: string, ciphertext: Uint8Array, messageType: number): void {
     let message = "";
     try {
-      const plaintext = this.signal.decrypt(fromUserId, ciphertext, messageType);
+      const plaintext = this.decrypt(fromUserId, ciphertext, messageType);
       if (messageType === 1) this.markEstablished(fromUserId);
       message = utf8Decoder.decode(plaintext);
     } catch (e) {

@@ -14,8 +14,12 @@
     me?: readonly string[];
     /** A link was pressed: the owner shows its copy popup (never a browser). */
     onlink: (url: string) => void;
+    /** Its links, spoilers and Copy buttons are Tab stops. A message list is
+     *  one Tab stop: only the row the keyboard is on gives its own (R2-06). */
+    tabbable?: boolean;
   }
-  let { text, names = [], me = [], onlink }: Props = $props();
+  let { text, names = [], me = [], onlink, tabbable = true }: Props = $props();
+  const tabindex = $derived(tabbable ? undefined : -1);
 
   const tree = $derived(parse(text, { names }));
   const isMe = (name: string) => me.some((m) => m.toLowerCase() === name.toLowerCase());
@@ -30,7 +34,7 @@
   }
 </script>
 
-{#snippet inline(nodes: Inline[])}{#each nodes as n}{#if n.t === "text"}{n.v}{:else if n.t === "strong"}<strong>{@render inline(n.c)}</strong>{:else if n.t === "em"}<em>{@render inline(n.c)}</em>{:else if n.t === "del"}<del>{@render inline(n.c)}</del>{:else if n.t === "code"}<code class="md-code">{n.v}</code>{:else if n.t === "spoiler"}<Spoiler>{@render inline(n.c)}</Spoiler>{:else if n.t === "link"}<button class="msg-link" type="button" onclick={() => onlink(n.href)} title={shownHref(n.href)}>{@render inline(n.c)}</button>{:else if n.t === "br"}<br />{:else if n.t === "mention"}<span class="mention" class:me={isMe(n.name)}>@{shortName(n.name)}</span>{/if}{/each}{/snippet}
+{#snippet inline(nodes: Inline[])}{#each nodes as n}{#if n.t === "text"}{n.v}{:else if n.t === "strong"}<strong>{@render inline(n.c)}</strong>{:else if n.t === "em"}<em>{@render inline(n.c)}</em>{:else if n.t === "del"}<del>{@render inline(n.c)}</del>{:else if n.t === "code"}<code class="md-code">{n.v}</code>{:else if n.t === "spoiler"}<Spoiler {tabbable}>{@render inline(n.c)}</Spoiler>{:else if n.t === "link"}<button class="msg-link" type="button" {tabindex} onclick={() => onlink(n.href)} title={shownHref(n.href)}>{@render inline(n.c)}</button>{:else if n.t === "br"}<br />{:else if n.t === "mention"}<span class="mention" class:me={isMe(n.name)}>@{shortName(n.name)}</span>{/if}{/each}{/snippet}
 
 {#snippet blocks(list: Block[])}
   {#each list as b}
@@ -39,7 +43,7 @@
     {:else if b.t === "h"}
       <p class="md-h md-h{b.level}">{@render inline(b.c)}</p>
     {:else if b.t === "pre"}
-      <CodeBlock lang={b.lang} code={b.v} />
+      <CodeBlock lang={b.lang} code={b.v} {tabbable} />
     {:else if b.t === "quote"}
       <blockquote class="md-quote">{@render blocks(b.c)}</blockquote>
     {:else if b.t === "list" && b.ordered}

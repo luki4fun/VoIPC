@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { tick, untrack } from "svelte";
+  import { onDestroy, tick } from "svelte";
   import type { ChatMessage, FileConv } from "../../types.js";
   import { pushLayer } from "../../stores/back-stack.js";
+  import { rowKey } from "../../chat-rules.js";
   import { shortName } from "../../username.js";
   import Icon from "../Icons.svelte";
   import Composer from "./Composer.svelte";
@@ -63,20 +64,34 @@
   // the composer's own layer on top of this one)
   $effect(() => pushLayer(() => onclose()));
 
-  // A thread opened to answer starts with the box ready; a new answer is
-  // followed when the reader was already at the end
+  // A thread opened to answer starts with the box ready; one opened to read,
+  // with the keyboard on its Close (at a phone's width the pane covers what
+  // opened it). On close the keyboard goes back where it was (R2-13).
+  let closeBtn = $state<HTMLButtonElement | null>(null);
+  const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+  // Another thread, not the same one remade by a reaction or an edit
+  const thread = $derived(rowKey(root));
   $effect(() => {
-    void root;
-    if (focusComposer) tick().then(() => composer?.focus());
+    void thread;
+    tick().then(() => (focusComposer ? composer?.focus() : closeBtn?.focus()));
   });
+  onDestroy(() => {
+    const active = document.activeElement;
+    if (opener?.isConnected && (!active || active === document.body || !active.isConnected)) opener.focus();
+  });
+
+  // A new answer is followed when the reader was at the end: kept from their
+  // own scrolling, since rows off screen are only estimated (MessageList)
+  let atEnd = true;
   let shown = 0;
   $effect.pre(() => {
     const count = rows.length;
-    const el = untrack(() => scroller);
-    const atEnd = !el || el.scrollHeight - el.scrollTop - el.clientHeight < 40;
     if (count !== shown && atEnd) tick().then(() => scroller && (scroller.scrollTop = scroller.scrollHeight));
     shown = count;
   });
+  function onScroll() {
+    if (scroller) atEnd = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight < 40;
+  }
 
   function send(content: string) {
     const target = replyingTo ?? root;
@@ -101,11 +116,11 @@
     <Icon name="thread" size={16} />
     <span class="thread-title">Thread</span>
     <span class="thread-count">{answers.length} {answers.length === 1 ? "reply" : "replies"}</span>
-    <button class="icon-btn thread-close" type="button" aria-label="Close thread" title="Close thread (Esc)" onclick={onclose}>
+    <button class="icon-btn thread-close" type="button" aria-label="Close thread" title="Close thread (Esc)" bind:this={closeBtn} onclick={onclose}>
       <Icon name="close" size={16} />
     </button>
   </header>
-  <div class="thread-messages" bind:this={scroller}>
+  <div class="thread-messages" bind:this={scroller} onscroll={onScroll}>
     <MessageList messages={rows} {all} {onlink} under={root} onreply={onsend ? reply : undefined} {onjumpelsewhere} {names} {me} {server} {fileConv} {actions} />
   </div>
   {#if onsend}

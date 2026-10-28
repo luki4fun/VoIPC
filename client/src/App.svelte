@@ -52,7 +52,7 @@
   import { account, accountHex } from "./lib/stores/account.js";
   import { addNotification, removeNotification } from "./lib/stores/notifications.js";
   import { availableUpdate, initUpdates } from "./lib/stores/updates.js";
-  import type { UpdateInfo } from "./lib/update-rules.js";
+  import { updateToast, type UpdateInfo } from "./lib/update-rules.js";
   import { pendingInvites } from "./lib/stores/invites.js";
   import { pendingPokes, createPoke, addPoke } from "./lib/stores/pokes.js";
   import {
@@ -77,6 +77,7 @@
     mergeChannelHistory,
     openTextChannel,
     flushChatSave,
+    receivedNow,
   } from "./lib/stores/chat.js";
   import ChatHistorySetup from "./lib/components/ChatHistorySetup.svelte";
   import AudioSetup from "./lib/components/AudioSetup.svelte";
@@ -141,6 +142,7 @@
     requestRoster,
     setRoster,
   } from "./lib/stores/rosters.js";
+  import { confirmAction } from "./lib/stores/confirm.js";
   import {
     askNsfwConsent,
     autoJoinTextChannels,
@@ -148,8 +150,18 @@
     dmMessageTtl,
     isTextChannel,
     managesChannel,
+    previewChannel,
   } from "./lib/stores/channel-ui.js";
-  import { chatEvent, expiryFor, forHandOff, HISTORY_MAX_MESSAGES, MAX_CONVERSATIONS, messageRefs } from "./lib/chat-rules.js";
+  import {
+    chatEvent,
+    expiryFor,
+    forHandOff,
+    HISTORY_MAX_MESSAGES,
+    MAX_CONVERSATIONS,
+    messageRefs,
+    notificationBody,
+    receivedText,
+  } from "./lib/chat-rules.js";
   import { LAYOUT_PICKER_VERSION } from "./lib/ui-prefs.js";
   import { voiceMode, vadThreshold } from "./lib/stores/voice.js";
   import {
@@ -174,8 +186,8 @@
   } from "./lib/stores/room.js";
   import { upsertById } from "./lib/stores/upsert.js";
   import { shortName } from "./lib/username.js";
-  import { mentionsName, parse, plainText } from "./lib/markdown.js";
-  import { findTarget } from "./lib/thread-rules.js";
+  import { mentionNames, mentionsName, parse } from "./lib/markdown.js";
+  import { findTarget, isOwn } from "./lib/thread-rules.js";
   import { cleanLane, micLane } from "./lib/stores/mixer.js";
   import {
     addScreenShare,
@@ -378,7 +390,25 @@
         },
       );
     // A link is somebody else's idea: an 18+ channel still asks first
-    if (askNsfwConsent(server, ch.channel_id, () => void join())) void join();
+    const joinAsked = () => {
+      if (askNsfwConsent(server, ch.channel_id, () => void join())) void join();
+    };
+    if (ch.text) {
+      // A text channel seats nobody: open it
+      joinAsked();
+      return;
+    }
+    // A voice channel is a seat with a microphone, and a seat needs an ask
+    // (0.10.0): the link shows the channel, then asks (S-048)
+    if (ch.channel_id === get(currentChannelId.peek(server))) return;
+    if (server === get(serverAddress)) previewChannel(ch.channel_id);
+    void confirmAction({
+      title: `Join voice in ${ch.name}?`,
+      body: "An invite link opened this channel. Joining puts you in its call, with your microphone as you have it set.",
+      confirm: "Join voice",
+    }).then((ok) => {
+      if (ok) joinAsked();
+    });
   });
 
   // What a connection held — admin, the channel list, rosters, the chat's
@@ -398,13 +428,15 @@
     return own ? accountHex(own.info.id) : undefined;
   }
 
-  /** Whether `content` names us with an `@`. Never in an anonymous channel, where names are pseudonyms. */
+  /** Whether `content` names us with an `@`. Never in an anonymous channel, where names are pseudonyms;
+   *  by our short name only where nobody else in the channel goes by it (R2-11). */
   function mentionsUs(server: string, channelId: number, content: string): boolean {
     if (!content.includes("@")) return false;
     if (get(channels.peek(server)).find((c) => c.channel_id === channelId)?.anonymous) return false;
     const own = get(username.peek(server));
     if (!own) return false;
-    const names = [...new Set([own, shortName(own)])];
+    const people = currentRosterOf(server, channelId).map((u) => u.username);
+    const names = mentionNames([...people, own]).filter((n) => n === own || n === shortName(own));
     const tree = parse(content, { names });
     return names.some((n) => mentionsName(tree, n));
   }
@@ -519,7 +551,12 @@
   });
 
   // Android: start/stop foreground voice service when joining/leaving voice,
-  // on whichever server — the service is the call's
+  // on whichever server — the service is the call's. Only when the call or
+  // its channel's name changes: the voice store changes with every roster
+  // and share update, and each start re-applies the call's audio route (D1-07).
+  const voiceServiceName = $derived(
+    $voiceState === "connected" && $voice !== null ? $voiceChannel?.name || "voice channel" : null,
+  );
   $effect(() => {
     if (!$isMobile) return;
     const bridge = (window as any).__VoIPC;
@@ -527,10 +564,10 @@
 
     let timer: ReturnType<typeof setTimeout> | null = null;
 
-    if ($voiceState === 'connected' && $voice !== null) {
-      const name = $voiceChannel?.name ?? "";
+    const name = voiceServiceName;
+    if (name !== null) {
       timer = setTimeout(() => {
-        bridge.startVoiceService(name || 'voice channel');
+        bridge.startVoiceService(name);
       }, 300);
     } else {
       bridge.stopVoiceService();
@@ -559,6 +596,18 @@
     const stopFileRetain = startFileRetain();
     // A reload, or a window closed under us: the debounced chat save goes now
     window.addEventListener("beforeunload", () => void flushChatSave());
+    // A file dropped where nothing takes it (the member list, a chat that
+    // cannot send files) must not open in the window in place of the app:
+    // the desktop page sees drops itself since 1.3 (R3-07). A chat that takes
+    // it has staged it already, below this.
+    window.addEventListener("dragover", (e) => {
+      if (!e.dataTransfer?.types.includes("Files")) return;
+      if (!e.defaultPrevented) e.dataTransfer.dropEffect = "none";
+      e.preventDefault();
+    });
+    window.addEventListener("drop", (e) => {
+      if (e.dataTransfer?.types.includes("Files")) e.preventDefault();
+    });
 
     // Invite link in the URL fragment (web client): keep it, then drop it from
     // the address bar so it is neither kept in history nor re-applied on reload
@@ -1030,9 +1079,9 @@
         void startReconnect(server, { voice: prevVoice, text: prevText }, reason);
       }),
 
-      listen<{ error: string }>("audio-device-error", (event) => {
+      listen<{ error: string; retrying?: boolean }>("audio-device-error", (event) => {
         addNotification(
-          `Audio device error: ${event.payload.error} — retrying…`,
+          `Audio device error: ${event.payload.error}${event.payload.retrying ? " — retrying…" : ""}`,
           "error",
         );
       }),
@@ -1062,9 +1111,12 @@
       // has the button
       listen<UpdateInfo>("update-available", (event) => {
         availableUpdate.set(event.payload);
-        if (announcedUpdate !== event.payload.version) {
+        // An update on another protocol gets no toast: Settings says what it
+        // would cost (design input 5)
+        const toast = updateToast(event.payload);
+        if (toast && announcedUpdate !== event.payload.version) {
           announcedUpdate = event.payload.version;
-          addNotification(`VoIPC ${event.payload.version} is available: Settings, Updates.`, "info", 10000);
+          addNotification(toast, "info", 10000);
         }
       }),
 
@@ -1348,7 +1400,9 @@
         event?: unknown;
         decryption_failed?: boolean;
       }>("channel-chat-message", (server, data) => {
-        const { channel_id, user_id: uid, username, content, timestamp, message_id } = data;
+        const { channel_id, user_id: uid, username, timestamp, message_id } = data;
+        // Cut where it arrives (D-7): what follows parses it, for a mention
+        const content = receivedText(data.content);
         const chName = channelNameById(server, channel_id);
         if (chName) {
           // The moment this message is to be deleted, worked out once, here:
@@ -1398,15 +1452,15 @@
           // us like a direct message does
           if (added && uid !== self) {
             const target = data.reply_to
-              ? findTarget(get(channelMessages).get(chatKey(server, chName)) ?? [], data.reply_to)
+              ? findTarget(get(channelMessages).get(chatKey(server, chName)) ?? [], data.reply_to, timestamp)
               : undefined;
-            const me = ownAccount(server);
-            const answered = !!target && (target.user_id === self || (me !== undefined && target.account === me));
+            const me = { account: ownAccount(server), user_id: self };
+            const answered = !!target && isOwn(target, me, (m) => receivedNow(server, m));
             const named = !answered && mentionsUs(server, channel_id, content);
             if (answered || named) {
               notifyUnfocused(
                 `${fromServer(server)}${shortName(uname)} ${answered ? "replied to you" : "mentioned you"}`,
-                plainText(content).slice(0, 140),
+                notificationBody({ content, file: messageRefs(data).file, expires_at }),
               );
             }
           }
@@ -1473,7 +1527,8 @@
         thread?: string | null;
         event?: unknown;
       }>("direct-chat-message", (server, data) => {
-        const { from_user_id, to_user_id, content, timestamp } = data;
+        const { from_user_id, to_user_id, timestamp } = data;
+        const content = receivedText(data.content);
         const myId = get(userId.peek(server));
         const from_username =
           from_user_id === myId ? ownDisplayName(server, data.from_username) : data.from_username;
@@ -1506,7 +1561,9 @@
         });
         if (from_user_id !== myId) {
           playDirectMessageSound();
-          notifyUnfocused(`${fromServer(server)}${shortName(from_username)}`, plainText(content).slice(0, 140));
+          // Never the text of a message with a timer (R2-14)
+          const body = notificationBody({ content, file: messageRefs(data).file, expires_at });
+          notifyUnfocused(`${fromServer(server)}${shortName(from_username)}`, body || "New message");
         }
       }),
 
@@ -1609,9 +1666,13 @@
 
       listenServer<{ reason: string }>("screenshare-error", (server, data) => {
         addNotification(`${fromServer(server)}Screen share error: ${data.reason}`, "error");
+        // A share we watch that this device cannot decode comes the same way
+        // (the browser's and the desktop's decoders say "cannot decode"), and
+        // is no reason to end a share of our own (B1-N1)
+        const watchedOne = $watchingUserId !== null && /cannot decode/i.test(data.reason);
         // The server refused or ended our share (a channel can switch sharing
         // off under us): stop capturing rather than sending into the void.
-        if (inVoice(server) && $isSharingScreen) {
+        if (inVoice(server) && $isSharingScreen && !watchedOne) {
           isSharingScreen.set(false);
           viewerCount.set(0);
           invoke("stop_screen_capture").catch(() => {});

@@ -347,6 +347,20 @@ export class AccountDriver {
     this.run(host, session.passwordChange(o, n, totp, recovery));
   }
 
+  /** A new recovery key (account.rs `account_recovery_key_new`): the
+   *  password, and a code where the account has codes on. Resolves to the
+   *  key's text, for the page to show once `RecoveryKeyChanged` answers as
+   *  `account-reply` (an Error for `RecoveryKeyNew` means it is not in force). */
+  async recoveryKeyNew(host: AccountHost, password: string, totp: string | null, recovery: string | null): Promise<string> {
+    const session = this.session;
+    if (!session) throw new Error("Not signed in to an account on that server");
+    const master = await stretch(password, session.kdfSalt());
+    if (this.session !== session) throw new Error("The connection ended.");
+    const out = session.recoveryKeyNew(master, totp, recovery);
+    this.run(host, out);
+    return out.key;
+  }
+
   setPrefs(host: AccountHost, cloud: boolean, asked: boolean): void {
     if (!this.session) throw new Error("Not signed in to an account on that server");
     this.run(host, this.session.setPrefs(cloud, asked));

@@ -331,8 +331,14 @@ pub fn default_max_conversations() -> u32 {
     1000
 }
 
+/// 1 GiB, and 256 MiB on Android: a phone has less room, and the cache is in
+/// app data, which the system never clears on its own (D2-15).
 pub fn default_file_cache_mb() -> u64 {
-    1024
+    if cfg!(target_os = "android") {
+        256
+    } else {
+        1024
+    }
 }
 
 pub fn default_chat_history_path() -> PathBuf {

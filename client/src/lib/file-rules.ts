@@ -6,7 +6,7 @@
 //
 // Pure, so file-rules.test.ts runs it under Node's own test runner.
 
-import type { ChatMessage } from "./types.ts";
+import type { ChatMessage, FileBlob } from "./types.ts";
 
 /** A message that is still here at `now`: its timer, if any, has not run out. */
 function live(m: ChatMessage, now: number): boolean {
@@ -30,6 +30,51 @@ export function referencedHashes(
     }
   }
   return [...out];
+}
+
+// ── Loading ─────────────────────────────────────────────────────────────
+
+/** What one load of a file is shared under: two cards of one file share it,
+ *  but a message that copies a file's id with another key, size or deflate
+ *  flag is a load of its own, so its error is never the real card's (R3-02). */
+export function loadKey(server: string, file: FileBlob): string {
+  return `${server} ${file.hash} ${file.key} ${file.size} ${file.z ? 1 : 0}`;
+}
+
+// ── Asking the relay (both clients' transfers) ─────────────────────────
+
+/** messages.rs `FILE_*`: from 100 on, a later try may pass. */
+export const FILE_RATE = 100;
+export const FILE_BUSY = 102;
+export const FILE_STALLED = 103;
+export const FILE_EXPIRED = 104;
+
+/** How many times one transfer asks the relay (files.rs `MAX_ASKS`). */
+export const MAX_ASKS = 4;
+
+/** A refusal after which the same ask may pass a little later: too many at
+ *  once, the relay busy, or an upload it ended as stalled or too long. The
+ *  others are final for the file, or (the hourly budget, 101; a failed
+ *  store, 105) for longer than a transfer waits (files.rs `asks_again`, R3-04). */
+export function asksAgain(code: number): boolean {
+  return code === FILE_RATE || code === FILE_BUSY || code === FILE_STALLED || code === FILE_EXPIRED;
+}
+
+/** The asks one transfer has had: `MAX_ASKS` at most, and one whose ticket
+ *  brought bytes before it went is not counted, so a slow download outlives
+ *  any number of tickets while it moves on (files.rs `Asks`, R3-05). */
+export class Asks {
+  private n = 0;
+
+  /** Ask once more, if any ask is left. */
+  next(): boolean {
+    return ++this.n <= MAX_ASKS;
+  }
+
+  /** The last ask moved the transfer on. */
+  moved(): void {
+    this.n = 0;
+  }
 }
 
 // ── The preview ─────────────────────────────────────────────────────────

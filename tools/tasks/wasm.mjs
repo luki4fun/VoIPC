@@ -9,6 +9,7 @@
 import { readFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { CLIENT, ROOT, capture, ensureRustTarget, fail, head, info, run } from '../lib.mjs';
+import { writeNotices } from './notices.mjs';
 
 export default function wasm() {
   const crate = join(ROOT, 'crates', 'voipc-web');
@@ -27,4 +28,9 @@ export default function wasm() {
   const target = resolve(crate, process.env.CARGO_TARGET_DIR || 'target');
   run('wasm-bindgen', ['--target', 'web', '--out-dir', join(CLIENT, 'src', 'lib', 'wasm'),
     '--out-name', 'voipc_web', join(target, 'wasm32-unknown-unknown', 'release', 'voipc_web.wasm')]);
+
+  // Every web build passes through here (`npm run build:web` runs this task
+  // before Vite), the release and nightly jobs included, so the notices land
+  // in client/public in time for Vite to copy them into dist-web.
+  writeNotices();
 }

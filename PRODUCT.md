@@ -22,8 +22,8 @@ insets, the keyboard (IME) inset, 48 dp touch targets.
 ## Product Purpose
 
 Voice, screen sharing and chat on a server the group runs itself, end-to-end encrypted, with a
-relay that by default stores nothing it can read: only, for a day, the encrypted copies of files
-posted in chat. Voice and screen share are the critical features and must
+relay that by default stores nothing it can read: only the encrypted copies of files posted in
+chat, for a day at most unless its operator sets longer. Voice and screen share are the critical features and must
 never break on Linux, Windows or Android; chat matters but is secondary. Success is a group that
 moves over and stops noticing the tool.
 

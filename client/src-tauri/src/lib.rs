@@ -28,6 +28,11 @@ use tauri::Manager;
 #[cfg(not(target_os = "android"))]
 static TRAY_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Whether a window of ours may go to `url`: never a file on this device.
+fn page_may_open(url: &tauri::Url) -> bool {
+    url.scheme() != "file"
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // WebKitGTK's DMA-BUF renderer crashes the Wayland connection on NVIDIA
@@ -99,7 +104,17 @@ pub fn run() {
          `npm run build` — otherwise the window will say \"Connection refused\"."
     );
 
-    let builder = tauri::Builder::default().plugin(tauri_plugin_notification::init());
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_notification::init())
+        // A file dropped where the page does not take it would have the
+        // WebView open it in place of the app, mid-call: since 1.3 drops go
+        // to the page (`dragDropEnabled: false`). Nothing of ours is a file
+        // page (R3-07).
+        .plugin(
+            tauri::plugin::Builder::<tauri::Wry>::new("no-file-pages")
+                .on_navigation(|_, url| page_may_open(url))
+                .build(),
+        );
     // No `updater:*` capability: the page reaches it only through updater.rs
     #[cfg(not(target_os = "android"))]
     let builder = builder.plugin(tauri_plugin_updater::Builder::new().build());
@@ -359,6 +374,7 @@ pub fn run() {
             commands::connect,
             account::account_totp,
             account::account_password_change,
+            account::account_recovery_key_new,
             account::account_leave,
             account::account_purge,
             account::account_delete,
@@ -507,6 +523,7 @@ pub fn run() {
             updater::updates_supported,
             updater::pending_update,
             updater::check_for_update,
+            updater::third_party_notices,
             updater::install_update,
             updater::set_check_updates,
         ])
@@ -539,4 +556,23 @@ fn request_quit(app: &tauri::AppHandle) {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         app.exit(0);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    /// R3-07: a dropped file is never opened in place of the app; the app's
+    /// own pages (and the dev server's) are.
+    #[test]
+    fn a_window_never_goes_to_a_file_on_this_device() {
+        let url = |u: &str| tauri::Url::parse(u).unwrap();
+        assert!(!super::page_may_open(&url("file:///home/me/photo.jpg")));
+        assert!(!super::page_may_open(&url("file:///C:/Users/me/a.pdf")));
+        for ours in [
+            "tauri://localhost/",
+            "http://tauri.localhost/",
+            "http://localhost:1420/",
+        ] {
+            assert!(super::page_may_open(&url(ours)), "{ours}");
+        }
+    }
 }

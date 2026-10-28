@@ -266,6 +266,9 @@ export interface AccountSession {
   kdfSalt(): string;
   /** A new password, from the stretched old and new ones. */
   passwordChange(oldMaster: Uint8Array, newMaster: Uint8Array, totp?: string | null, recovery?: string | null): AccountActions;
+  /** A new recovery key, from the stretched password: the actions, and the
+   *  key's text to show once `RecoveryKeyChanged` answers. */
+  recoveryKeyNew(master: Uint8Array, totp?: string | null, recovery?: string | null): AccountActions & { key: string };
   free(): void;
 }
 

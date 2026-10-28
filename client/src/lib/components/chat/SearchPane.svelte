@@ -1,5 +1,5 @@
 <script lang="ts" generics="C">
-  import { tick } from "svelte";
+  import { onDestroy, tick } from "svelte";
   import type { ChatMessage } from "../../types.js";
   import { pushLayer } from "../../stores/back-stack.js";
   import { excerpt, searchMessages, terms, type Hit } from "../../search-rules.js";
@@ -28,16 +28,31 @@
   let input = $state<HTMLInputElement | null>(null);
 
   $effect(() => pushLayer(() => onclose()));
+  // The keyboard goes back where it was when the pane closes (R2-13)
+  const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
   $effect(() => {
     tick().then(() => input?.focus());
   });
+  onDestroy(() => {
+    const active = document.activeElement;
+    if (opener?.isConnected && (!active || active === document.body || !active.isConnected)) opener.focus();
+  });
 
+  // Everywhere is every message on the device: searched once typing pauses,
+  // not on every key (R2-05)
+  let searched = $state("");
+  $effect(() => {
+    const q = query;
+    const t = setTimeout(() => (searched = q), 150);
+    return () => clearTimeout(t);
+  });
+  const asked = $derived(scope === "here" ? query : searched);
   const results = $derived<Hit<C | null>[]>(
     scope === "here"
       ? searchMessages([{ conv: null, messages: here }], query)
-      : searchMessages(everywhere, query),
+      : searchMessages(everywhere, searched),
   );
-  const want = $derived(terms(query));
+  const want = $derived(terms(asked));
 
   /** "Oct 27, 12:09": enough to tell results apart; the full date is its title */
   function shortTime(at: number): string {
@@ -75,7 +90,11 @@
     <button type="button" class="scope" aria-pressed={scope === "here"} onclick={() => (scope = "here")}>This conversation</button>
     <button type="button" class="scope" aria-pressed={scope === "everywhere"} onclick={() => (scope = "everywhere")}>Everywhere</button>
   </div>
-  <div class="search-results" aria-live="polite">
+  <!-- One line says how many, rather than the whole list read out on every key -->
+  <p class="sr-only" role="status">
+    {want.length === 0 ? "" : results.length === 0 ? "No messages found" : `${results.length} ${results.length === 1 ? "result" : "results"}`}
+  </p>
+  <div class="search-results">
     {#if want.length === 0}
       <p class="search-note">Searches the messages on this device. Nothing is sent anywhere.</p>
     {:else if results.length === 0}

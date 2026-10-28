@@ -1852,6 +1852,15 @@ check(
   }
   check("a fenced rust block is coloured", coloured, await ben.evaluate(`${rowWith("fn main")}?.innerHTML.slice(0, 300) ?? "no row"`));
 
+  // ── A quote nested 300 deep: it arrives, and the conversation goes on (R2-01) ──
+  // 605 characters, within what the box takes: it once overflowed every
+  // reader's renderer and took the whole conversation off the screen
+  await say(ann, "> ".repeat(300) + "deepx");
+  await say(ann, "after the deep one");
+  check("a quote nested 300 deep arrives, and so does the next message",
+    (await arrived(ben, "deepx")) && (await arrived(ben, "after the deep one")),
+    await ben.evaluate(`[...document.querySelectorAll(".chat-main .msg .msg-content")].map((e) => e.textContent.slice(-30)).slice(-3).join(" | ")`));
+
   // ── Shift+Enter is a new line, not a send ──
   await ben.evaluate(`document.querySelector(".chat-main .input-bar .chat-input").focus()`);
   await ben.send("Input.insertText", { text: "line one" });
@@ -1935,6 +1944,80 @@ check(
   await sleep(200);
   check("and Escape closes it", !(await ann.evaluate(`!!document.querySelector(".msg-menu")`)));
 
+  // ── The list is one Tab stop: its links, spoilers and Copy buttons too (R2-06) ──
+  await say(ann, "see [the site](https://\u0430pple.com/login) and ||hidden words||");
+  await arrived(ben, "see the site");
+  const stops = await ben.evaluate(`(() => {
+    const all = [...document.querySelectorAll(".chat-main .messages :is(button, a[href], [tabindex], video, audio)")]
+      .filter((e) => e.tabIndex >= 0 && !e.closest("[inert]") && e.checkVisibility());
+    return { stops: all.length, rows: new Set(all.map((e) => e.closest(".msg")).filter(Boolean)).size };
+  })()`);
+  check("the message list is one Tab stop: only the keyboard's row offers its links, spoilers and Copy", stops.rows === 1, JSON.stringify(stops));
+
+  // ── The link popup names where a look-alike host really goes (R2-12) ──
+  await ben.evaluate(`${rowWith("see the site")}?.querySelector(".msg-link")?.click()`);
+  await sleep(200);
+  check("the link popup shows a look-alike host as the punycode it is", await ben.evaluate(
+    `document.querySelector(".link-input")?.value === "https://xn--pple-43d.com/login" && /Goes to xn--pple-43d\\.com/.test(document.querySelector(".link-host")?.textContent ?? "")`),
+    await ben.evaluate(`(document.querySelector(".link-input")?.value ?? "no popup") + " / " + (document.querySelector(".link-host")?.textContent ?? "")`));
+  await ben.evaluate(`document.querySelector(".link-close-btn")?.click()`);
+  await sleep(200);
+
+  // ── A long press on a touch screen is the message menu, whatever it selected (D1-01) ──
+  // The phone's web view selects the word under the finger first, then asks
+  // for the menu: the native selection bar used to win
+  const pressed = await ben.evaluate(`(() => {
+    const row = ${rowWith("see the site")}; const p = row?.querySelector(".md-p"); if (!p) return false;
+    row.scrollIntoView({ block: "center" });
+    const word = document.createTreeWalker(p, NodeFilter.SHOW_TEXT).nextNode(); if (!word) return false;
+    const range = document.createRange(); range.setStart(word, 0); range.setEnd(word, 3);
+    getSelection().removeAllRanges(); getSelection().addRange(range);
+    const r = p.getBoundingClientRect();
+    const at = { bubbles: true, cancelable: true, pointerType: "touch", clientX: r.left + 5, clientY: r.top + 5 };
+    p.dispatchEvent(new PointerEvent("pointerdown", at));
+    p.dispatchEvent(new PointerEvent("contextmenu", at));
+    return true; })()`);
+  await sleep(200);
+  check("a long press opens the message menu, even over the word it selected", pressed &&
+    (await ben.evaluate(`!!document.querySelector(".msg-menu") && getSelection().toString() === ""`)),
+    await ben.evaluate(`(document.querySelector(".msg-menu") ? "menu" : "no menu") + ", selection: " + JSON.stringify(getSelection().toString())`));
+  for (const type of ["keyDown", "keyUp"]) {
+    await ben.send("Input.dispatchKeyEvent", { type, key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  }
+  await sleep(200);
+
+  // ── A tap leaves no tool bar over the text: a finger's hover sticks (D2-09) ──
+  const tapAt = await ben.evaluate(`(() => { const r = ${rowWith("after the deep one")}?.getBoundingClientRect();
+    return r ? { x: Math.round(r.left + 60), y: Math.round(r.top + r.height / 2) } : null; })()`);
+  if (tapAt) {
+    await ben.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [tapAt] });
+    await ben.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  }
+  await sleep(400);
+  // A phone keeps :hover on what the finger touched; this browser does not,
+  // so the row is held hovered the way the phone holds it
+  await ben.evaluate(`${rowWith("after the deep one")}?.setAttribute("data-tapped", "")`);
+  const root = (await ben.send("DOM.getDocument", { depth: 0 })).result?.root;
+  const nodeId = root && (await ben.send("DOM.querySelector", { nodeId: root.nodeId, selector: ".chat-main .msg[data-tapped]" })).result?.nodeId;
+  await ben.send("CSS.enable", {});
+  if (nodeId) await ben.send("CSS.forcePseudoState", { nodeId, forcedPseudoClasses: ["hover"] });
+  check("a tap on a message leaves no tool bar standing over it", !!tapAt && !!nodeId && (await ben.evaluate(
+    `(() => { const t = document.querySelector(".chat-main .msg[data-tapped] .msg-tools"); return !!t && getComputedStyle(t).display === "none"; })()`)),
+    await ben.evaluate(`document.querySelector(".chat-main .msg[data-tapped]")?.matches(":hover") ? "hovered" : "not hovered"`));
+  if (nodeId) await ben.send("CSS.forcePseudoState", { nodeId, forcedPseudoClasses: [] });
+  await ben.evaluate(`document.querySelector(".chat-main .msg[data-tapped]")?.removeAttribute("data-tapped")`);
+
+  // ── A reader at the end stays there as tall messages come (R2-05) ──
+  // Rows off screen are only estimated now (content-visibility): the end is
+  // followed by the reader's own scrolling, not by measuring
+  await ben.evaluate(`(() => { const el = document.querySelector(".chat-main .messages"); el.scrollTop = el.scrollHeight; })()`);
+  await sleep(300);
+  for (let i = 0; i < 20; i++) await say(ann, `tall ${i}\n- one\n- two\n- three\n\n\`\`\`\ncode ${i}\nmore code\n\`\`\``);
+  await arrived(ben, "code 19");
+  await sleep(800);
+  const below = await ben.evaluate(`(() => { const el = document.querySelector(".chat-main .messages"); return Math.round(el.scrollHeight - el.scrollTop - el.clientHeight); })()`);
+  check("a reader at the end stays at the end as tall messages arrive", below < 40, `${below} px above the end`);
+
   // ── @ completes a name, and the person named sees it ──
   await ben.evaluate(`document.querySelector(".chat-main .input-bar .chat-input").focus()`);
   await ben.send("Input.insertText", { text: "@ui-a" });
@@ -1985,6 +2068,16 @@ check(
   check("everywhere names the conversation a result is in", await ann.evaluate(
     `[...document.querySelectorAll(".search-pane .result")].some((e) => e.querySelector(".result-conv")?.textContent.includes(${JSON.stringify(ROOM)}))`));
   await ann.evaluate(`document.querySelector(".search-pane .search-close")?.click()`);
+
+  // ── A message far past what the box takes is cut where it arrives (D-7) ──
+  // Only a modified client sends one; the reader keeps 16 KiB of it. Last
+  // here: a row that long changes where the others sit
+  await openChannel(ann, ROOM);
+  await sleep(500);
+  await say(ann, `long${"z".repeat(20_000)}`);
+  check("a message past 16 KiB arrives cut to 16 KiB", (await arrived(ben, "longzzz")) &&
+    (await ben.evaluate(`${rowWith("longzzz")}?.querySelector(".msg-content")?.textContent.trim().length === 16 * 1024`)),
+    String(await ben.evaluate(`${rowWith("longzzz")}?.querySelector(".msg-content")?.textContent.trim().length`)));
 
   for (const [who, tab] of [["writer", ann], ["reader", ben]]) {
     const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));
@@ -2181,8 +2274,10 @@ check(
     await cat.evaluate(`${rowWith("look at this")}?.querySelector(".file-card")?.textContent ?? "no card"`));
   check("while nobody has answered, the card says it is asking", await cat.evaluate(
     `${rowWith("nobody else has this one")}?.querySelector(".file-card")?.textContent.includes("Asking members")`));
-  const unavailable = await waitFor(cat, `${rowWith("nobody else has this one")}?.querySelector(".file-error")?.textContent.includes("Nobody online has this file")`, 90_000).then(() => true, () => false);
-  check("and with its only holder gone, it says nobody online has it", unavailable,
+  // Inside the picture's box, where "Asking members…" was: under the card it
+  // sat out of view on a phone (D2-11)
+  const unavailable = await waitFor(cat, `${rowWith("nobody else has this one")}?.querySelector(".file-preview [role=alert]")?.textContent.includes("Nobody online has this file")`, 90_000).then(() => true, () => false);
+  check("and with its only holder gone, it says nobody online has it, where it was asking", unavailable,
     await cat.evaluate(`${rowWith("nobody else has this one")}?.querySelector(".file-card")?.textContent ?? "no card"`));
 
   for (const [who, tab] of [["sender", ann], ["receiver", ben], ["late joiner", cat]]) {
@@ -2340,6 +2435,15 @@ check(
   const handed = await waitFor(cy, `${rowWith("a typo here")}`, 30_000).then(() => true, () => false);
   check("history hands on the edited text, marked edited", handed && (await cy.evaluate(`!!${rowWith("a typo here")}?.querySelector(".edited")`)));
   check("and never a deleted message", handed && !(await cy.evaluate(`!!${rowWith("delete me soon")}`)));
+  // A member's copy is their word for who wrote it: forwarded, that would
+  // become a "Forwarded from" label with no mark of hearsay (D-15)
+  await useTool(cy, "a typo here", "More");
+  check("a message handed over in the history offers no Forward", handed && /Copy text/.test(await menuItems(cy)) && !/Forward/.test(await menuItems(cy)),
+    await menuItems(cy));
+  for (const type of ["keyDown", "keyUp"]) {
+    await cy.send("Input.dispatchKeyEvent", { type, key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  }
+  await sleep(200);
 
   // ── Forward: a file, as it is, to a conversation it was never in ──
   const dir = mkdtempSync(join(tmpdir(), "voipc-ui-fwd-"));

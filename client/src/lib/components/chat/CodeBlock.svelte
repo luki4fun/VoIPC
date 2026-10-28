@@ -3,7 +3,8 @@
 
   // A fenced block: the code exactly as sent, in the code face, coloured
   // where this build knows the language. The grammars load on first use.
-  let { lang, code }: { lang: string; code: string } = $props();
+  // `tabbable`: its Copy button is a Tab stop (Markdown's, R2-06).
+  let { lang, code, tabbable = true }: { lang: string; code: string; tabbable?: boolean } = $props();
 
   let segs = $state<CodeSeg[] | null>(null);
   $effect(() => {
@@ -51,7 +52,7 @@
 
 <div class="code-block">
   <pre><code bind:this={codeEl}>{#if segs}{@render run(segs)}{:else}{code}{/if}</code></pre>
-  <button class="btn btn-ghost copy" type="button" onclick={copy} aria-live="polite">
+  <button class="btn btn-ghost copy" type="button" tabindex={tabbable ? undefined : -1} onclick={copy} aria-live="polite">
     {copyState === "copied" ? "Copied" : copyState === "select" ? "Selected — press Ctrl+C" : "Copy"}
   </button>
 </div>

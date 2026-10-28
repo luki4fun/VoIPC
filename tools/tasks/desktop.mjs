@@ -8,6 +8,7 @@ import {
   CLIENT, ROOT, MAX_AVCODEC_MAJOR, IS_WINDOWS, avcodecMajor, capture, checkFfmpegAbi, checkTrayLib, fail,
   head, info, npmInstall, ok, run, syncVersion, writeTempConfig,
 } from '../lib.mjs';
+import { writeNotices } from './notices.mjs';
 
 /**
  * Refuse to start a Linux build against an FFmpeg the bindings cannot use.
@@ -263,6 +264,8 @@ export default function desktop(task, args) {
   }
 
   npmInstall();
+  // Before Tauri runs Vite, which copies client/public into the bundle
+  writeNotices();
 
   const cmd = ['tauri', isDev ? 'dev' : 'build'];
   const cfg = config ? writeTempConfig(config) : null;

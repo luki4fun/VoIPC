@@ -29,7 +29,11 @@ key_file = "voipc-accounts.key"   # made on first start; VOIPC_ACCOUNTS_KEY over
 
 - **`mode`**: `off` (the default) opens no database at all. `optional` lets guests
   in next to accounts: an account's name is reserved, so a guest cannot use it, and
-  guests keep their `#tag`. `required` refuses guests.
+  guests keep their `#tag`. Nor can a guest use a name that spells an account's once
+  its letters from other scripts are read as the Latin ones they look like (a
+  Cyrillic `а` for `a`): the server answers "that name looks like an account's on
+  this server". A name with a letter that looks like no Latin one (`ü`) passes,
+  and so do look-alikes made of Latin letters and digits (`a1ice`). `required` refuses guests.
 - **`database`**: SQLite suits a small server and needs nothing else. Use Postgres for
   a big one. Both are built into the same binary.
 - **`key_file`**: seals the two-factor secrets. It is made on first start with

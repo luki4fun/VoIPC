@@ -2,16 +2,253 @@
 
 All notable changes to VoIPC are documented here.
 
-## [Unreleased]
+## [1.3.1] - release candidate
 
-Chat grows up: answers, threads, formatting, mentions and search. Nothing
-changes on the wire, so 1.2.0 talks to 1.0 and 1.1 apps and relays. What a 1.2
-app adds rides inside the end-to-end encryption, where a 1.0 or 1.1 app reads
-the plain text and ignores the rest. The relay sees none of it.
+**Protocol 13: update relays and apps together.** A 1.3.1 app does not connect
+to a 1.0 relay, and a 1.0 app does not connect to a 1.3.1 relay. 1.3.1 is the
+oldest relay and the oldest app that speak protocol 13; every 1.0.x speaks
+protocol 12.
 
-The desktop chat history moves to a new format. When 1.2 first opens it, it
-keeps a copy of the old file beside it (`chat_history.bin.v5`): 1.1 cannot open
-the new file, but it can open that copy.
+**Relays first.** If you run a server, update it before your users update
+their apps. If you only use VoIPC, update the app once your server runs 1.3.1,
+not before: the 1.0 desktop app offers this update on every server, and once it
+is installed it cannot connect to a 1.0 server and does not go back by itself.
+
+- **Desktop (Windows installer, AppImage):** on a server that runs 1.3.1, the
+  1.0 app is refused, finds 1.3.1 in its update feed and offers to install it.
+- **Android and the `.deb`** have no updater: install the new APK over the old
+  one, or the new `.deb`.
+- **The browser** needs nothing: it loads the page its server serves.
+- **The container image:** a final release moves `:1` and `:latest`, so a relay
+  that follows either moves to protocol 13 the day 1.3.1 is published. Pin
+  `:1.0` until your users have updated.
+- **The way back to 1.0** loses nothing on disk, but it is done by hand on both
+  sides: `docs/OPERATING.md` §8 in the repository for the relay,
+  `docs/COMPATIBILITY.md` §4 for the app.
+
+1.1.0, 1.2.0 and 1.3.0 were never released on their own. 1.3.1 carries all
+three, and their sections below keep the detail.
+
+### What is new since 1.0.0
+
+**1.1: Stage, and VoIPC's own colours**
+- **Stage**, a third layout: the call in the middle, a tile for each person
+  with a mint ring around whoever talks, and the chat in a drawer.
+- **VoIPC night and VoIPC day**, the new default palettes; text on filled
+  buttons and badges now reads on every palette.
+- **Android:** Back closes what is open, then puts the app in the background
+  with the call running; the talk button stays over the stream, room and mixer
+  views; every touch target is at least 44 px.
+- Keyboard focus is visible everywhere, menus move with the arrow keys, and
+  reduced motion is honoured.
+- Clearing history, resetting settings, removing someone and trusting a
+  changed certificate each ask first.
+- **Windows:** the screen-share pop-out no longer freezes VoIPC.
+
+**1.2: chat**
+- **Replies**, and **threads** in a side pane, which also gather on their own
+  under a busy message (Settings → Appearance turns that off).
+- **Markdown**: bold, italic, code, quotes, lists and spoilers, with code
+  blocks coloured for 37 languages. HTML shows as text, and an image in
+  Markdown is a link that never loads by itself.
+- **@mentions**, which mark the message and notify you.
+- A **New** line where the unread messages begin.
+- **Search** in one conversation or in all of them, on the device: the relay is
+  asked nothing.
+
+**1.3: files, and changing what was said**
+- **Files and pictures**, sealed on your device under a key of their own. The
+  relay keeps the ciphertext so that members can load it later: by default 30
+  minutes after anyone last fetched it, a day at most, and nothing past a
+  restart.
+- Pictures are made smaller by default, which also drops their location and
+  camera data; *Original (1:1)* sends one as it is. Nothing downloads until you
+  press Load.
+- When the relay has let a file go, an app online that still has it sends it
+  again, without anything on its screen.
+- **Settings → Files** lists the files in your chats, shows which this device
+  keeps, and frees the space.
+- **Edit** and **delete** your own messages, **react** with an emoji, **pin** a
+  message in a channel you manage, and **forward** a message or a file to
+  another conversation.
+
+### Upgrade notes
+
+**For relays:**
+- **The file cache is on by default** (`[files]`): the relay keeps the
+  encrypted blobs in `files/` in its working directory, mode 0700, and wipes
+  them at every start. `[files] enabled = false` turns it off. The TLS port now
+  offers ALPN `http/1.1` with or without `tcp_fallback`, and the apps fetch
+  files from the port they connect to: keep `tcp_port` equal to `udp_port`.
+- **No database migration since 1.0.** Back up anyway (`docs/OPERATING.md` §7);
+  going back to 1.0 needs no restore. A 1.0 relay refuses a `server.toml` with a
+  `[files]` table, so going back means taking it out and deleting `files/`.
+- **Image tags:** `:1.3`, `:1` and `:latest` move to 1.3.1; `:1.0` stays on
+  1.0 and protocol 12.
+
+**For apps:**
+- **The desktop chat history moves to a new format** the first time 1.3.1
+  opens it, and the old file stays beside it as `chat_history.bin.v5`. 1.0
+  cannot read the new file; it reads the copy once that is renamed to
+  `chat_history.bin`. Clearing or deleting the history removes the copy too.
+- **Files you send or load are kept on the device** for when you open them
+  again, or a member asks for them: on the desktop in `files/` in VoIPC's
+  folder (`~/.config/VoIPC` on Linux, `%APPDATA%\VoIPC` on Windows), up to 1 GB
+  by default; on Android up to 256 MB; in the browser in memory, for as long as
+  the tab is open. Settings → Files changes the limit and removes copies.
+- **Accounts made before 1.3** can still have their password reset by any
+  device that holds their vault key, as in 1.0, until their owner makes a new
+  recovery key (*Your account → Recovery key: New*). From then on only the
+  recovery key resets it.
+- Everyone is asked once more which layout they want, since there is a new
+  one.
+
+### Fixed since 1.0.0
+
+Everything new since 1.0 was reviewed before this release (the relay, the
+chat, the files, the release and upgrade path, the new design) and run on Linux,
+Windows and Android. The fixes to code that 1.1–1.3 added are not listed
+separately, since none of it was released. These change what 1.0.0 did:
+
+- **Game SDK and the FiveM bridge:**
+  - a radio press from the FiveM bridge could keep the microphone open after
+    the key was let go: its page renewed the 60-second transmit by itself. Now
+    only a key still held renews it;
+  - your own move to another channel now wins over every game connection, not
+    only the one that placed you, and leaving a server counts as a move;
+  - the `null` origin is refused, even when it is in the list, so an existing
+    setting with it stops working: serve a test page from `localhost` instead
+    (`docs/SDK.md`). An origin taken off the list has its open connections
+    closed at their next message. Origins must be a plain
+    `scheme://host[:port]`, 16 at most, and the confirm dialog lists them one
+    per line;
+  - each connection may send 200 messages a second, the whole app takes one
+    hello a second, and a held transmit is let go when the app falls behind
+    with a game's events;
+  - the FiveM page connects only to the app on the same machine.
+- **Accounts:** a password reset proves the recovery key itself, through a key
+  derived from it, which the relay checks. Before, the vault key that every
+  remembered device keeps was enough to set a new password without two-factor
+  codes and sign every other device out (see the upgrade notes for older
+  accounts). A guest whose name looks like an account's, letter for look-alike
+  letter, is refused on a relay with accounts. A name the relay gives that no
+  account could have (a look-alike letter from another script, an invisible
+  character) is warned about like a name taken over. And when someone's key has
+  changed, the warning now comes before the first message under the new key,
+  not after it.
+- **Relay:**
+  - a kick that raced its target's own join could leave a member listed in two
+    voice rooms;
+  - a browser session that never finished setting up held its connection slot
+    with no deadline; now it has 10 seconds;
+  - a ban landing while someone signed in could miss them;
+  - connection limits could be passed by connections racing each other, or
+    lose a slot when a connection panicked;
+  - a stream of tiny video records took the relay seconds to read, where it
+    now takes milliseconds, and a record shorter than a video header ends the
+    stream.
+- **Apps:**
+  - the share decoders on the desktop, Android and in the browser take a
+    picture of at most 2048 × 2048 pixels' worth, which every share VoIPC sends
+    fits; the browser had no limit, and stops watching a larger one. The
+    desktop and Android viewers decode at most 90 frames a second and drop the
+    rest;
+  - a microphone that Windows blocks says where to allow it, and the app no
+    longer shows *Talking* when the microphone did not open;
+  - the browser's Opus decoder refuses a packet longer than the limit instead
+    of reading part of it as another;
+  - Windows: more spellings of a path on another computer are refused;
+  - saving the servers you have open, or the last connection, never makes a
+    server whose certificate was checked against the public authorities one
+    whose self-signed certificate is accepted; only saving that server, through
+    its confirm, does.
+  - an invite link to a voice channel, opened in the browser, shows the channel
+    and asks *Join voice in …?* before it seats you in the call;
+
+## [1.3.0] - not released on its own (in 1.3.1)
+
+Protocol 13. Files in chat, and changing what was said: edit, delete,
+reactions, pins and forward. Every app on a relay has to understand these, so
+they wait for a protocol bump: a 1.2 app would have shown an edit or a reaction
+as a message from a newer VoIPC, and a file as its caption alone.
+
+### Files and pictures
+
+- **Attach a file** with the paperclip, by pasting it, or by dropping it on the
+  chat. Your app seals it before it leaves the device, under a key of its own
+  that travels only inside the end-to-end encrypted message; the relay holds a
+  blob it cannot open. The relay sets the largest file (10 MB by default), and
+  the attach button is not there when a relay keeps no files.
+- **Pictures are made smaller by default**: a still photo is redrawn at most
+  2560 px on its long side, as WebP (JPEG where WebP cannot be written) or PNG
+  for a PNG, and keeps none of its location or camera data. *Original (1:1)* on
+  its chip sends it as it is. A photo that cannot be redrawn here (HEIC, mostly)
+  asks before it goes as it is. Moving pictures, video and sound go as they
+  are, and their chip says they may carry location data; any other file is
+  compressed before it is sealed, when that makes it smaller.
+- **Nothing downloads by itself.** A file shows as a card with its name, size
+  and, for a picture or a video, a blurred 16 × 16 preview that came inside the
+  message. *Load* fetches and opens it; *Download* saves it (a save dialog on the
+  desktop and Android, a download in the browser). Pictures show in the chat
+  and open large; video and sound play only when you press play. A file that
+  is not a picture, video or sound VoIPC can show (an SVG, a web page, a PDF) is
+  never opened, only saved.
+- **The relay keeps a file for a while**: by default 30 minutes after anyone
+  last fetched it, and a day after it arrived at most. Every restart wipes the
+  cache. When it has gone, *Load* asks the members of that conversation who are
+  online: an app that still has the file and its message sends it again, with
+  nothing on its screen, and the card loads. Otherwise it says that nobody
+  online has the file.
+- **In a voice call, files take their time**: uploads and downloads go in
+  small steps with pauses, so that your voice stays clean on a busy link. A
+  transfer takes two to five times as long as outside a call.
+- **Settings → Files** lists every file in your chats: sort, filter and group
+  them, see which this device keeps, open one, go to its message, or remove the
+  copy. On the desktop it also sets how much space the copies may take.
+- Search finds files by name, and a reply to a file shows its name.
+
+### Edit, delete, react, pin and forward
+
+- **Edit** your own message in place; it shows *(edited)*. An edit never changes
+  the message's destruction timer.
+- **Delete** your own message, after a confirm. Every app removes it, but a
+  member's device may already have shown or kept it.
+- **React** with an emoji from the tools, the menu or the picker. Reactions show
+  as chips under the message with a count; press one to add or take back yours,
+  and point at it for the names.
+- **Pin** a message in a channel you manage (its creator, an admin or a
+  moderator). The pin button in the channel header counts the pins and lists
+  them, newest first, and a pin leads to its message. A pin counts only from
+  someone the member list shows as a manager.
+- **Forward** a message, a file included, to another text channel you are in,
+  your voice channel or a direct conversation on the same server. It arrives
+  marked *Forwarded from* its author, and never outlives the original's
+  destruction timer.
+- A guest can edit and delete only what they wrote in the same session. In an
+  announcement channel or under slow mode, a reaction, an edit or a delete
+  counts as a post.
+
+### For relays
+
+- **`[files]`**, a new section that is on by default: the encrypted blobs in
+  `files/` in the working directory, wiped at every start, with limits on size,
+  age, total space and bytes per hour per connection and per address
+  (`docs/OPERATING.md` §11). `enabled = false` turns it off.
+- File bytes go over HTTPS on the TLS port (`/f/v1/`), never over the QUIC
+  connection that carries voice, so the port now also offers ALPN `http/1.1`.
+  The relay warns at start when `tcp_port` differs from `udp_port`.
+
+## [1.2.0] - not released on its own (in 1.3.1)
+
+Chat grows up: answers, threads, formatting, mentions and search. 1.2.0 itself
+changed nothing on the wire: what a 1.2 app adds rides inside the end-to-end
+encryption, where a 1.0 or 1.1 app would read the plain text and ignore the
+rest. The relay sees none of it. It ships in 1.3.1, which speaks protocol 13.
+
+The desktop chat history moves to a new format. When 1.3.1 first opens a 1.0
+or 1.1 history, it keeps a copy of the old file beside it
+(`chat_history.bin.v5`). 1.0 and 1.1 cannot open the new file; they open the
+copy once it is renamed to `chat_history.bin` (`docs/COMPATIBILITY.md` §4).
 
 ### Replies and threads
 
@@ -53,12 +290,12 @@ the new file, but it can open that copy.
   conversation or in every conversation on this device, without asking the
   relay anything.
 
-## [1.1.0] - 2026-10-26
+## [1.1.0] - not released on its own (in 1.3.1)
 
 A design pass over every surface: the app on Linux, Windows, Android and in the
 browser, and the website. A new layout, Stage, is the headline, so this is a
-minor release; nothing changes on the wire, and 1.1.0 and 1.0.0 clients and
-relays talk to each other.
+minor release. 1.1.0 itself changed nothing on the wire, so it would have
+talked to 1.0.0 apps and relays; it ships in 1.3.1, which speaks protocol 13.
 
 ### Stage: the call in the middle
 

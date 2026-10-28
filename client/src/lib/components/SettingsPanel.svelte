@@ -1,5 +1,6 @@
 <script lang="ts">
   import { backdrop, dialog } from "../actions/dialog.js";
+  import { roving } from "../actions/roving.js";
   import { invoke } from "@tauri-apps/api/core";
   import { listen } from "@tauri-apps/api/event";
   import { onDestroy } from "svelte";
@@ -23,6 +24,7 @@
     screenShareCodec,
     soundSettings,
     defaultSoundSettings,
+    savedServers,
   } from "../stores/settings.js";
   import type { SoundSettings } from "../stores/settings.js";
   import { voiceMode, vadThreshold, setVoiceMode, type VoiceMode } from "../stores/voice.js";
@@ -56,6 +58,8 @@
   } from "../stores/audio-devices.js";
   import { micTestLevel, micTesting, startMicTest, stopMicTest } from "../stores/mic-test.js";
   import { availableUpdate, checkForUpdate, checkUpdates, installUpdate, setCheckUpdates, updateBusy, updatesSupported } from "../stores/updates.js";
+  import { protocolWarning, updateOffer } from "../update-rules.js";
+  import { serverName } from "../stores/servers.js";
   import { voice } from "../stores/channels.js";
   import Icon from "./Icons.svelte";
   import PaletteEditor from "./PaletteEditor.svelte";
@@ -335,7 +339,8 @@
       title: "Clear all chat history?",
       body:
         "Every channel and every direct conversation, on every server, is removed from this " +
-        "device. Copies a server keeps for your account are not touched. This cannot be undone.",
+        "device, with the copy of the history an update kept for an older VoIPC. Copies a server " +
+        "keeps for your account are not touched. This cannot be undone.",
       confirm: "Clear all history",
       danger: true,
     });
@@ -465,6 +470,38 @@
   // Updates (B6): what the last "Check now" or install said
   let upToDate = $state(false);
   let updateError = $state("");
+  /** An update on another protocol takes a second press: the first one only
+   *  arms it (design input 5). Armed for that version only. */
+  let updateArmed = $state<string | null>(null);
+  const updateStates = connectionState.all();
+  /** What Settings says about an update on another protocol: the servers it
+   *  would lock this app out of are the ones it is connected to now. */
+  const updateWarning = $derived(
+    $availableUpdate && updateOffer($availableUpdate) === "protocol"
+      ? protocolWarning(
+          $availableUpdate,
+          [...$updateStates].filter(([, s]) => s === "connected").map(([id]) => serverName(id, $savedServers)),
+        )
+      : null,
+  );
+
+  async function pressUpdate(version: string) {
+    if (updateWarning && updateArmed !== version) {
+      updateArmed = version;
+      return;
+    }
+    updateArmed = null;
+    updateError = await installUpdate();
+  }
+
+  /** THIRD-PARTY-NOTICES.txt, which every bundle carries beside index.html
+   *  (tools/tasks/notices.mjs, R4-09): read when it is first opened.
+   *  undefined: not read yet; null: not in this build. */
+  let notices = $state<string | null | undefined>(undefined);
+  async function loadNotices() {
+    if (notices !== undefined) return;
+    notices = await invoke<string | null>("third_party_notices").catch(() => null);
+  }
 
   // A browser grants notifications only from a click (H5-13)
   let notifyPermission = $state(
@@ -596,7 +633,7 @@
       <button class="close-btn" onclick={onclose} title="Close" aria-label="Close settings"><Icon name="close" size={18} /></button>
     </div>
 
-    <div class="tabs" role="tablist" aria-label="Settings">
+    <div class="tabs" role="tablist" aria-label="Settings" use:roving>
       {#each tabs as t (t.id)}
         <button
           class="tab"
@@ -1007,17 +1044,25 @@
             <span class="toggle-hint">Each check asks GitHub for the newest release, so GitHub sees your address and this version.</span>
           </label>
           {#if $availableUpdate}
-            <span class="toggle-hint">VoIPC {$availableUpdate.version} is available. Installing it restarts VoIPC.</span>
+            {@const version = $availableUpdate.version}
+            {#if updateWarning}
+              <span class="toggle-hint update-warning" role="note">{updateWarning} Installing it restarts VoIPC.</span>
+            {:else}
+              <span class="toggle-hint">VoIPC {version} is available. Installing it restarts VoIPC.</span>
+            {/if}
             <button
               class="mic-test-btn"
-              onclick={async () => (updateError = await installUpdate())}
+              class:armed={updateArmed === version}
+              onclick={() => pressUpdate(version)}
               disabled={$updateBusy !== null || $voice !== null}
             >
               {$updateBusy === "installing"
                 ? "Updating…"
                 : $voice !== null
                   ? "Update after the call"
-                  : `Update to ${$availableUpdate.version}`}
+                  : updateArmed === version
+                    ? `Press again to update to ${version}`
+                    : `Update to ${version}`}
             </button>
           {:else if $checkUpdates}
             <button
@@ -1035,6 +1080,21 @@
           {#if updateError}<span class="toggle-hint">{updateError}</span>{/if}
         </div>
       {/if}
+
+      <div class="section">
+        <h4>Licences</h4>
+        <span class="toggle-hint">VoIPC's own code is MIT. What it is built from comes with its own licences.</span>
+        <details class="notices" ontoggle={(e) => e.currentTarget.open && loadNotices()}>
+          <summary>Third-party notices</summary>
+          {#if notices === undefined}
+            <span class="toggle-hint">Reading…</span>
+          {:else if notices === null}
+            <span class="toggle-hint">This build carries no notices file. The licences are listed in VoIPC's README, under "License".</span>
+          {:else}
+            <pre class="notices-text">{notices}</pre>
+          {/if}
+        </details>
+      </div>
 
     {/if}
 
@@ -1155,7 +1215,7 @@
     {#if activeTab === "appearance"}
       <div class="section">
         <h4>Layout</h4>
-        <div class="layout-choices" role="radiogroup" aria-label="Layout">
+        <div class="layout-choices" role="radiogroup" aria-label="Layout" use:roving>
           {#each ["modern", "classic", "stage"] as const as id (id)}
             <LayoutPreview
               layout={id}
@@ -1299,6 +1359,34 @@
 </div>
 
 <style>
+  .update-warning {
+    color: var(--warning);
+  }
+
+  .armed {
+    outline: 2px solid var(--warning);
+    outline-offset: 1px;
+  }
+
+  .notices summary {
+    cursor: pointer;
+    font-size: 13px;
+    color: var(--text-secondary);
+  }
+
+  .notices-text {
+    max-height: 320px;
+    overflow: auto;
+    margin: 8px 0 0;
+    padding: 8px;
+    font-size: 11px;
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    background: var(--bg-tertiary);
+    border-radius: 4px;
+    user-select: text;
+  }
+
   .overlay {
     position: fixed;
     inset: 0;

@@ -172,14 +172,41 @@ Create `/var/backups/voipc`, owned by `voipc` with mode 0700, and copy the key f
 3. **Back up** (section 7).
 4. **Stop, replace the binary, start.** Database migrations run at start.
 
-**From 1.2 to 1.3:** the file cache is on by default (§11). The relay makes `files/` in its
-working directory and offers TLS ALPN `http/1.1` with or without `tcp_fallback`. To keep a 1.3
-relay writing what 1.2 wrote, set `[files] enabled = false`. If it cannot make the directory, it
-starts without files and logs why.
+**When the protocol changes** (the first line says "Protocol N"), an app and a relay connect only
+if both speak N. No order keeps everyone connected, but this one strands the fewest:
+1. **Tell your users first,** while they can still connect: the day, and to update their apps
+   only after the relay. The desktop app offers a new version as soon as it is published, and
+   once installed it cannot connect until the relay has moved too. The browser needs nothing;
+   Android and the `.deb` are installed by hand.
+2. **Update the relay** to the published release, not to a release candidate. A desktop app it
+   then refuses finds the matching version in its update feed and offers it; a release
+   candidate is never in that feed. The browser gets the new page from the relay itself.
+3. **Then the apps.** An app updated before its relay cannot connect to it, and a desktop app
+   does not go back by itself (the way back: [COMPATIBILITY.md](COMPATIBILITY.md) §4).
 
-A rollback needs the old binary **and** the backup taken before the upgrade: an older relay
-refuses a database that a newer one has migrated, by design. Release candidates
-(`-rc.N`) are for testing on a relay you can roll back.
+**From 1.0 to 1.3** (protocol 12 to 13):
+- **The file cache is on by default** (§11). The relay makes `files/` in its working directory,
+  and offers TLS ALPN `http/1.1` with or without `tcp_fallback`, since the apps fetch files over
+  the TCP port. If it cannot make the directory, it starts without files and logs why. `[files]
+  enabled = false` turns the cache off, but a 1.0 relay refuses that table (below).
+- **No migration:** 1.3 adds none to 1.0's, and `channels.json`, `bans.json` and
+  `server_settings.json` keep their format.
+- **The container:** pin `:1.0` to stay on protocol 12 until your users have updated (§10).
+
+**Going back from 1.3 to 1.0** (checked with the released 1.0.0 binary):
+1. Stop the relay.
+2. Put the 1.0.0 binary back, or run the `:1.0` image.
+3. Delete the `[files]` table from `server.toml`, if you added one: 1.0 refuses to start with it
+   (``unknown field `files` ``).
+4. Delete `files/`: 1.0 neither uses nor wipes it, so its blobs would stay on disk for good.
+5. Start. No database restore is needed, since 1.3 migrated nothing. On a 1.0 relay a password
+   reset is checked the 1.0 way again: the reset key that 1.3 accounts carry is not looked at.
+
+The apps go back by hand too ([COMPATIBILITY.md](COMPATIBILITY.md) §4).
+
+**A later release that migrates the database** needs the old binary **and** the backup taken
+before the upgrade for a rollback: an older relay refuses a database that a newer one has
+migrated, by design. Release candidates (`-rc.N`) are for testing on a relay you can roll back.
 
 [COMPATIBILITY.md](COMPATIBILITY.md) lists what every 1.x keeps working.
 
@@ -215,8 +242,14 @@ relay with `-v voipc:/data`:
     docker run --rm -v voipc:/data -v "$PWD":/src:ro busybox \
       sh -c 'cp /src/server.toml /src/cert.pem /src/key.pem /data/ && chown -R 65532:65532 /data'
 
-A release candidate only gets its own `:<version>` tag. A final release also moves `:1.0`, `:1`
-and `:latest`.
+A release candidate only gets its own `:<version>` tag. A final release also moves
+`:<major>.<minor>`, `:<major>` and `:latest`: 1.3.1 moves `:1.3`, `:1` and `:latest`, and
+`:1.0` stays where 1.0 left it.
+
+`:1` and `:latest` follow protocol changes too. A relay that pulls either of them by itself
+(Watchtower and the like) moves to protocol 13 on the day 1.3.1 is published, and every 1.0 app
+on it is refused from then on. To keep 1.0 apps connecting, pin `:1.0` until your users have
+updated, then move to `:1.3` (§8).
 
 ## 11. The file cache
 
@@ -238,8 +271,12 @@ dir = "files"              # relative to the working directory: /data/files in t
 ```
 
 - **Wiped at every start.** Only the blob files in `dir` are deleted: their names are 64 hex
-  digits, or that and `.<n>.part` while an upload runs. Nothing else in the directory is
-  touched, but give it a directory of its own anyway.
+  digits, or that and `.<n>.part` (an upload under way, or a blob on its way out). A file that
+  cannot be deleted is logged, and the rest still go. Nothing else in the directory is touched,
+  but give it a directory of its own anyway.
+- **Private to the relay's user.** The relay makes `dir` with mode 0700, and narrows an existing
+  one to that (with a warning if it cannot); each blob is written with mode 0600. The names are
+  the blobs' hashes, and the sizes show.
 - **When a blob has gone**, a member's Load asks the other members of that conversation who are
   online, and of no other conversation the file was posted in. This includes a file posted before
   the relay last restarted, whose record went with the restart. An app that has the file, and a message in that conversation that refers to it,
@@ -250,9 +287,10 @@ dir = "files"              # relative to the working directory: /data/files in t
   connection (a guest who comes back, or another who takes the name, is someone new). A member who
   asks for a file their conversation never had is answered like one whose file has gone (their
   conversation is asked, and nobody there has it). Everyone else is refused.
-- **What the relay learns:** each blob's size, when it is uploaded and fetched and by which
-  connection, and which conversations it was posted or forwarded in, which links them. A
-  re-upload also shows which members still hold it. Not its name, type or contents.
+- **What the relay learns:** each blob's exact size (blobs are not padded, so a size can hint
+  at what kind of file it is), when it is uploaded and fetched and by which connection, and
+  which conversations it was posted or forwarded in, which links them. A re-upload also shows
+  which members still hold it. Not its name or its contents.
   [THREAT-MODEL.md](THREAT-MODEL.md) has the rest.
 - **Disk:** at most `max_total_mb`, uploads in progress included. A cached blob is evicted
   only for bytes that arrive, never for an upload that has not sent any.

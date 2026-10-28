@@ -181,6 +181,10 @@ export interface ChatMessage {
   reactions?: Reaction[];
   /** Pinned in its channel by a manager (`on`), or unpinned; latest wins. */
   pin?: { on: boolean; at: number; by: string };
+  /** What a later version kept in this message's archive entry that this one
+   *  does not know (JSON): written back on the next save, never read, never
+   *  handed to anyone (chat-rules.ts `fromArchived`). */
+  extra_kept?: string;
 }
 
 /** Where a forwarded message came from (envelope.rs `Forwarded`): the

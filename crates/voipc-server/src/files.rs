@@ -87,7 +87,9 @@ const KIB: usize = 1024;
 /// How long a fetch of a blob that has gone waits for a member to upload it.
 const SEEK_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a blob that was stored here stays registered, so a fetch after it
-/// has gone can still ask its conversations: the longest a message lives.
+/// has gone can still ask its conversations: the longest message *timer*. A
+/// message without one outlives it; a fetch then asks the asker's own
+/// conversation, as for a hash never registered (R1-02, R1-17).
 const REGISTRATION_LIFETIME: Duration = Duration::from_secs(30 * 24 * 60 * 60);
 /// Blobs the index knows at once, stored or not.
 const MAX_ENTRIES: usize = 50_000;

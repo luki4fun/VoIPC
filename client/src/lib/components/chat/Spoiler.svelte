@@ -1,29 +1,41 @@
 <script lang="ts">
   import type { Snippet } from "svelte";
 
-  // ||hidden|| text: covered until pressed. While covered it is `inert`, so a
-  // link inside cannot be reached or pressed through the cover, and hidden
-  // from screen readers, which hear "spoiler" instead.
-  let { children }: { children: Snippet } = $props();
+  // ||hidden|| text: covered until pressed, and covered again by a second
+  // press. While covered it is `inert`, so a link inside cannot be reached or
+  // pressed through the cover, and hidden from screen readers, which hear
+  // "spoiler" instead. One element in both states, so the keyboard stays on
+  // it and `aria-expanded` says which (R2-13). `tabbable`: a Tab stop
+  // (Markdown's, R2-06).
+  let { children, tabbable = true }: { children: Snippet; tabbable?: boolean } = $props();
   let open = $state(false);
 
   function onkeydown(e: KeyboardEvent) {
+    if (e.target !== e.currentTarget) return;
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      open = true;
+      open = !open;
     }
+  }
+
+  function onclick(e: MouseEvent) {
+    // A link inside an open spoiler is pressed, not the spoiler
+    const inner = (e.target as Element).closest?.("button, a");
+    if (open && inner && (e.currentTarget as Element).contains(inner)) return;
+    open = !open;
   }
 </script>
 
-{#if open}<span class="spoiler open">{@render children()}</span>{:else}<span
-    class="spoiler"
-    role="button"
-    tabindex="0"
-    aria-label="Spoiler, press to show"
-    aria-expanded="false"
-    onclick={() => (open = true)}
-    {onkeydown}><span class="cover" inert aria-hidden="true">{@render children()}</span></span
-  >{/if}
+<span
+  class="spoiler"
+  class:open
+  role="button"
+  tabindex={tabbable ? 0 : -1}
+  aria-label={open ? undefined : "Spoiler, press to show"}
+  aria-expanded={open}
+  {onclick}
+  {onkeydown}><span class="cover" inert={!open} aria-hidden={open ? undefined : "true"}>{@render children()}</span></span
+>
 
 <style>
   .spoiler {
@@ -36,7 +48,7 @@
     cursor: pointer;
   }
 
-  .cover {
+  .spoiler:not(.open) .cover {
     user-select: none;
   }
 

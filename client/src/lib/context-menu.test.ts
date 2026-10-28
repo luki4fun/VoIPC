@@ -15,3 +15,9 @@ test("in a text field it stays, for Paste and spelling", () => {
   const field = { closest: (sel: string) => (sel.includes("input") ? {} : null) };
   assert.equal(nativeMenuWanted(field as unknown as EventTarget, ""), true);
 });
+
+test("a long press on a touch screen opens the app's menu, whatever it selected (D1-01)", () => {
+  assert.equal(nativeMenuWanted(null, "word", true), false);
+  const field = { closest: (sel: string) => (sel.includes("textarea") ? {} : null) };
+  assert.equal(nativeMenuWanted(field as unknown as EventTarget, "word", true), true, "a text field keeps Paste");
+});

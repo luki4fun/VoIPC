@@ -68,6 +68,11 @@
     }
     fullHeight = Math.max(fullHeight, height);
     viewHeight = height;
+    // The keyboard may scroll the page up rather than only shrink it, which
+    // took the channel header under the status bar (D2-10): the page never
+    // scrolls here, and the shell is as tall as what is visible
+    const page = document.scrollingElement;
+    if (page && page.scrollTop !== 0) page.scrollTop = 0;
   }
 
   $effect(() => {
@@ -75,9 +80,11 @@
     measure();
     const vv = window.visualViewport;
     vv?.addEventListener("resize", measure);
+    vv?.addEventListener("scroll", measure);
     window.addEventListener("resize", measure);
     return () => {
       vv?.removeEventListener("resize", measure);
+      vv?.removeEventListener("scroll", measure);
       window.removeEventListener("resize", measure);
     };
   });
@@ -90,7 +97,13 @@
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="app-layout" class:mobile={$isMobile} class:typing={keyboardUp} oncontextmenu={shellContextMenu}>
+<div
+  class="app-layout"
+  class:mobile={$isMobile}
+  class:typing={keyboardUp}
+  style:height={$isMobile && viewHeight > 0 ? `${viewHeight}px` : undefined}
+  oncontextmenu={shellContextMenu}
+>
   <!-- The desktop's title row. A phone has no room to spare for a name the
        launcher already shows: its gear lives in the status bar instead. -->
   {#if !$isMobile}

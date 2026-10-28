@@ -9,6 +9,7 @@ import { join } from 'node:path';
 import {
   CLIENT, ROOT, capture, fail, head, info, npmInstall, ok, run, syncVersion, which,
 } from '../lib.mjs';
+import { writeNotices } from './notices.mjs';
 
 const home = () => process.env.HOME ?? '';
 const sdkRoot = () => process.env.ANDROID_HOME || join(home(), 'android-sdk');
@@ -205,6 +206,8 @@ function build(args) {
 
   head(`Building VoIPC ${version} for Android (${buildType}, ${target})`);
   npmInstall();
+  // Before Tauri runs Vite, which copies client/public into the bundle
+  writeNotices();
   const cmd = ['tauri', 'android', 'build', '--target', target];
   if (buildType === 'debug') cmd.push('--debug');
   run('npx', cmd, { cwd: CLIENT, env });

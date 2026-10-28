@@ -1013,6 +1013,7 @@ async fn start_capture(state: &AppState, app_handle: tauri::AppHandle) -> Result
 
     connection.transmitting.store(true, Ordering::Relaxed);
 
+    let (opened_tx, opened) = tokio::sync::oneshot::channel();
     let task = network::spawn_capture_encode_task(
         input_device,
         connection.session_id,
@@ -1030,9 +1031,17 @@ async fn start_capture(state: &AppState, app_handle: tauri::AppHandle) -> Result
         state.input_gain.clone(),
         app_handle,
         std::sync::Arc::from(connection.server_address.as_str()),
+        opened_tx,
     );
     connection.capture_task = Some(task);
+    drop(conns);
 
+    // A microphone that did not open is this press's error, so the page does
+    // not show "Talking" over it (D1-05). A device slow to open is let be
+    if let Ok(Ok(Err(why))) = tokio::time::timeout(std::time::Duration::from_secs(5), opened).await
+    {
+        return Err(why);
+    }
     tracing::info!("PTT pressed — capture started");
     Ok(())
 }
@@ -3098,15 +3107,48 @@ pub async fn set_chat_history_path(
     })
 }
 
+/// The copies of the history file that `unlock_chat_history` keeps for an
+/// older VoIPC (`<path>.v1` to the version before this one), on disk now.
+fn downgrade_copies(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    (1..crypto::ARCHIVE_VERSION)
+        .map(|v| {
+            let mut copy = path.as_os_str().to_owned();
+            copy.push(format!(".v{v}"));
+            std::path::PathBuf::from(copy)
+        })
+        .filter(|copy| copy.exists())
+        .collect()
+}
+
+/// Remove those copies: they hold every message from before the update, which
+/// a clear, a delete, a timer or a purge must not leave behind (R2-04).
+fn remove_downgrade_copies(path: &std::path::Path) -> Result<(), String> {
+    for copy in downgrade_copies(path) {
+        std::fs::remove_file(&copy).map_err(|e| {
+            format!(
+                "Failed to delete the copy kept for an older VoIPC ({}): {e}",
+                copy.display()
+            )
+        })?;
+    }
+    Ok(())
+}
+
+/// The history file and its copies for an older VoIPC, gone from disk.
+fn delete_history_files(path: &std::path::Path) -> Result<(), String> {
+    if path.exists() {
+        std::fs::remove_file(path).map_err(|e| format!("Failed to delete file: {e}"))?;
+    }
+    remove_downgrade_copies(path)
+}
+
 /// Delete the chat history file from disk and reset all in-memory state.
 #[tauri::command]
 pub async fn delete_chat_history(state: State<'_, AppState>) -> Result<String, String> {
     let mut chat = state.chat.write().await;
     let path = chat.file_path.clone();
 
-    if path.exists() {
-        std::fs::remove_file(&path).map_err(|e| format!("Failed to delete file: {e}"))?;
-    }
+    delete_history_files(&path)?;
 
     // Reset in-memory state
     chat.archive = ChatArchive::default();
@@ -3337,6 +3379,8 @@ pub async fn clear_chat_history(state: State<'_, AppState>) -> Result<(), String
         crate::config::write_atomic(&chat.file_path, &file_data)
             .map_err(|e| format!("failed to write file: {e}"))?;
     }
+    // The copy an update kept holds what was just cleared, under the old format
+    remove_downgrade_copies(&chat.file_path)?;
 
     chat.dirty = false;
     Ok(())
@@ -3925,6 +3969,42 @@ pub fn set_config_u32(state: State<'_, AppState>, key: String, value: u32) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// R2-04: deleting or clearing the history takes the copies an update
+    /// kept for an older VoIPC with it, and nothing else beside it.
+    #[test]
+    fn the_copies_kept_for_an_older_voipc_go_with_the_history() {
+        let dir = std::env::temp_dir().join(format!("voipc-r204-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chat_history.bin");
+        let named = |suffix: &str| dir.join(format!("chat_history.bin{suffix}"));
+        let copies = [".v1", ".v4", ".v5"].map(named);
+        // Not ours to remove: a file moved aside for a newer VoIPC, a
+        // version that is no older one's, and another name
+        let others = [".old-1700000000", ".v6", ".v0", ".v5.tmp"].map(named);
+        let write_all = || {
+            for f in copies.iter().chain(&others).chain([&path]) {
+                std::fs::write(f, b"x").unwrap();
+            }
+        };
+        write_all();
+        assert_eq!(downgrade_copies(&path).len(), copies.len());
+        // Clear: the file stays (rewritten empty), the copies go
+        remove_downgrade_copies(&path).unwrap();
+        assert!(path.exists());
+        assert!(copies.iter().all(|c| !c.exists()));
+        assert!(others.iter().all(|o| o.exists()));
+        // Delete: the file and the copies
+        write_all();
+        delete_history_files(&path).unwrap();
+        assert!(!path.exists());
+        assert!(copies.iter().all(|c| !c.exists()));
+        assert!(others.iter().all(|o| o.exists()));
+        // Nothing there: nothing to do
+        delete_history_files(&path).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn a_path_on_another_computer_is_refused() {

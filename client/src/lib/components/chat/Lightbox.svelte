@@ -61,11 +61,17 @@
     width: min(100%, 1400px);
     height: 100%;
   }
+  /* Solid: through the scrim, the chat's own header would show under the
+     name and the buttons (D2-12) */
   .lightbox-bar {
     display: flex;
     align-items: center;
     gap: 8px;
+    padding: 4px 4px 4px 12px;
     color: var(--text-primary);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
   }
   .lightbox-bar h2 {
     flex: 1;

@@ -25,8 +25,9 @@
   import { nativeMenuWanted } from "../../context-menu.js";
   import { dayKey, dayLabel, fullTime } from "../../chat-time.js";
   import { mentionsName, parse, plainText } from "../../markdown.js";
-  import { findTarget, indexById } from "../../thread-rules.js";
+  import { ambiguousTarget, findTarget, indexById, isOwn } from "../../thread-rules.js";
   import { reactionChips, rowKey, sameRow } from "../../chat-rules.js";
+  import { receivedNow } from "../../stores/chat.js";
   import { confirmAction } from "../../stores/confirm.js";
   import { EMOJI_CATEGORIES, QUICK_REACTIONS } from "../../emoji.js";
   import { shortName } from "../../username.js";
@@ -100,9 +101,10 @@
     return m.kind !== "history-marker" && m.kind !== "notice";
   }
 
-  /** Written by us: the account where there is one, else this connection. */
+  /** Written by us: the account where both have one, else this connection's
+   *  id on a message it received (thread-rules.ts `isOwn`). */
   function isMine(m: ChatMessage): boolean {
-    return (myAccount !== undefined && m.account === myAccount) || m.user_id === $userId;
+    return isOwn(m, { account: myAccount, user_id: $userId }, (x) => receivedNow(server, x));
   }
 
   /** The messages among the rows, without our own dividers. */
@@ -255,17 +257,45 @@
 
   let opened = $state.raw<{ m: ChatMessage; x: number; y: number; up: number } | null>(null);
 
-  /** A pop-up at `y` that would run off the bottom goes above `up` instead. */
+  /** The phone's gesture bar, which an edge-to-edge web view draws over. */
+  function safeBottom(): number {
+    const probe = document.createElement("div");
+    probe.style.cssText = "position:fixed;bottom:0;height:env(safe-area-inset-bottom,0px);visibility:hidden";
+    document.body.append(probe);
+    const h = probe.getBoundingClientRect().height;
+    probe.remove();
+    return h;
+  }
+
+  /** A pop-up at `y` that would run off the bottom (of what is visible: a
+   *  phone's keyboard and gesture bar take some, D2-13) goes above `up`. */
   function fit(node: HTMLElement, up: number) {
     const r = node.getBoundingClientRect();
-    if (r.bottom > innerHeight - 8) node.style.top = `${Math.max(8, up - r.height)}px`;
+    const vv = globalThis.visualViewport;
+    const floor = (vv ? vv.offsetTop + vv.height : innerHeight) - 8 - safeBottom();
+    if (r.bottom > floor) node.style.top = `${Math.max(8, up - r.height)}px`;
+  }
+
+  // ── Touch ───────────────────────────────────────────────────────────────
+  //
+  // The last pointer was a finger. Then a long press opens the message menu
+  // whatever it selected (D1-01), and no tool bar stands over the text (D2-09:
+  // a finger leaves :hover on what it last touched): the long-press menu holds
+  // every action. Told by the pointer event itself, never by `(hover: none)`
+  // alone, which a headless browser reports too.
+  let touch = $state(false);
+  function notePointer(e: PointerEvent) {
+    touch = e.pointerType === "touch";
   }
 
   /** Right click, a long press on a touch screen, or the menu key. */
   function onContextMenu(e: MouseEvent, m: ChatMessage) {
-    // Selected text keeps the native menu, with its Copy
-    if (nativeMenuWanted(e.target, globalThis.getSelection?.()?.toString() ?? "")) return;
+    const fromTouch = (e as PointerEvent).pointerType === "touch" || (touch && (e as PointerEvent).pointerType !== "mouse");
+    // Selected text keeps the native menu, with its Copy; on a touch screen
+    // the long press made that selection, and the app's menu has Copy text
+    if (nativeMenuWanted(e.target, globalThis.getSelection?.()?.toString() ?? "", fromTouch)) return;
     e.preventDefault();
+    if (fromTouch) globalThis.getSelection?.()?.removeAllRanges();
     let [x, y] = [e.clientX, e.clientY];
     if (x === 0 && y === 0) {
       const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
@@ -283,9 +313,10 @@
 
   // ── Reactions, edits, deletes, pins, forwards ───────────────────────────
 
-  /** Ours, as a reaction names its person (`authorKey`). */
+  /** Ours, as a reaction names its person (`authorKey`): our account's key
+   *  where we have one, else this connection's id. */
   function isMyKey(key: string): boolean {
-    return (myAccount !== undefined && key === `a:${myAccount}`) || key.startsWith(`u:${$userId}:`);
+    return myAccount !== undefined ? key === `a:${myAccount}` : key.startsWith(`u:${$userId}:`);
   }
 
   /** Written by us first-hand: what an edit or a delete can name. A copy a
@@ -326,8 +357,17 @@
     editing = m;
     draft = m.content;
     tick().then(() => {
-      editBox?.focus();
+      editBox?.focus({ preventScroll: true });
       editBox?.setSelectionRange(draft.length, draft.length);
+      // Save and Cancel in view, not under the composer; again once a phone's
+      // keyboard has come up and made the list shorter (D2-08)
+      const show = () => editBox?.closest(".edit-box")?.scrollIntoView({ block: "nearest" });
+      show();
+      const vv = globalThis.visualViewport;
+      if (vv) {
+        vv.addEventListener("resize", show, { once: true });
+        setTimeout(() => vv.removeEventListener("resize", show), 1000);
+      }
     });
   }
 
@@ -353,13 +393,15 @@
   }
 
   async function askDelete(m: ChatMessage) {
+    // As offered when asked: the conversation on screen may change meanwhile
+    const remove = actions.remove;
     const ok = await confirmAction({
       title: "Delete this message?",
       body: "It goes for everyone in this conversation, from the server's copy too. Someone who already read it may have kept a copy of their own.",
       confirm: "Delete",
       danger: true,
     });
-    if (ok) actions.remove?.(m);
+    if (ok) remove?.(m);
   }
 
   /** The menu, opened from the row's own "More" tool. */
@@ -380,6 +422,8 @@
 <svelte:window
   onclick={() => { opened = null; picking = null; }}
   onkeydown={(e) => { if (e.key === "Escape") { opened = null; picking = null; } }}
+  onpointerdowncapture={notePointer}
+  onpointermove={(e) => { if (touch && e.pointerType === "mouse") touch = false; }}
 />
 
 <!-- Keyed by the message object, which the stores carry over from one
@@ -405,7 +449,9 @@
     {#if msg === newFrom}
       <div class="new-divider" role="separator" bind:this={newEl}><span>New</span></div>
     {/if}
-    {@const target = msg.reply_to ? findTarget(index, msg.reply_to) : undefined}
+    {@const target = msg.reply_to ? findTarget(index, msg.reply_to, msg.timestamp) : undefined}
+    {@const tabbable = msg === current}
+    {@const isEditing = !!editing && sameRow(editing, msg)}
     <!-- A row the keyboard can stand on, with the arrows to move: one tab stop
          for the whole list (see "Rows, focus and jumping") -->
     <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
@@ -414,7 +460,8 @@
       class:to-me={(!!target && isMine(target) && !isMine(msg)) || mentionsMe(msg)}
       class:flash={flashing === msg}
       class:grouped={!shouldShowHeader(i)}
-      tabindex={msg === current ? 0 : -1}
+      class:touch
+      tabindex={tabbable ? 0 : -1}
       role="article"
       aria-label="{shortName(msg.username)}, {formatTime(msg.timestamp)}"
       use:row={msg}
@@ -435,6 +482,10 @@
             <span class="quote-name">{shortName(target.username)}</span>
             <span class="quote-text">{snippet(target)}</span>
           </button>
+        {:else if ambiguousTarget(index, msg.reply_to, msg.timestamp)}
+          <span class="quote missing" title="Ids are chosen by whoever writes, and more than one person's message here has this one"
+            ><Icon name="reply" size={12} /> Answers a message whose writer is unclear</span
+          >
         {:else}
           <span class="quote missing"><Icon name="reply" size={12} /> Original message is not here</span>
         {/if}
@@ -443,7 +494,7 @@
       {/if}
       {#if shouldShowHeader(i)}
         <div class="msg-header">
-          <span class="msg-username" class:self={msg.user_id === $userId} title={msg.username}>{shortName(msg.username)}</span>
+          <span class="msg-username" class:self={isMine(msg)} title={msg.username}>{shortName(msg.username)}</span>
           <time class="msg-time" datetime={new Date(msg.timestamp).toISOString()} title={fullTime(msg.timestamp)}
             >{formatTime(msg.timestamp)}</time
           >
@@ -466,7 +517,7 @@
         {:else if msg.kind && msg.kind !== "text" && msg.kind !== "shared"}
           <span class="attachment-placeholder">[attachment — not shared]</span>
         {:else}
-          {#if editing && sameRow(editing, msg)}
+          {#if isEditing}
             <form class="edit-box" onsubmit={(e) => { e.preventDefault(); finishEdit(true); }}>
               <textarea
                 class="edit-input"
@@ -484,9 +535,9 @@
               </div>
             </form>
           {:else if msg.content}
-            <Markdown text={msg.content} {onlink} {names} {me} />
+            <Markdown text={msg.content} {onlink} {names} {me} {tabbable} />
           {/if}
-          {#if msg.edited_at && !(editing && sameRow(editing, msg))}
+          {#if msg.edited_at && !isEditing}
             <span class="edited" title="Edited {fullTime(msg.edited_at)}">(edited)</span>
           {/if}
           {#if msg.pin?.on}
@@ -497,6 +548,7 @@
               file={msg.file}
               {server}
               conv={fileConv}
+              {tabbable}
               onopen={(p) => (picture = p)}
               ongone={(u) => {
                 if (picture?.url === u) picture = null;
@@ -537,6 +589,7 @@
           {#if unread}<span class="unread-dot" title="New replies"></span>{/if}
         </button>
       {/if}
+      {#if !isEditing}
       <div class="msg-tools" role="toolbar" aria-label="Message actions">
         {#if actions.react && answerable(msg)}
           <button
@@ -569,6 +622,7 @@
           <Icon name="more-vertical" size={16} />
         </button>
       </div>
+      {/if}
     </div>
   {/if}
 {/each}
@@ -595,7 +649,9 @@
     {#if onthread && answerable(m)}
       <button type="button" onclick={() => act(onthread)}><Icon name="thread" size={16} /> Reply in thread</button>
     {/if}
-    {#if actions.forward && answerable(m)}
+    <!-- Not a copy a member handed over: forwarded, its claimed writer would
+         become a "Forwarded from" label with no mark of hearsay (D-15) -->
+    {#if actions.forward && answerable(m) && m.kind !== "shared"}
       <button type="button" onclick={() => act(actions.forward!)}><Icon name="forward" size={16} /> Forward</button>
     {/if}
     {#if actions.edit && ownEditable(m)}
@@ -744,7 +800,11 @@
     transform: rotate(180deg);
   }
 
-  /* One message: what it answers, who wrote it, what they wrote, its tools */
+  /* One message: what it answers, who wrote it, what they wrote, its tools.
+     A row off screen is not laid out until it comes near (R2-05: a full
+     channel cost a phone about 160 ms per message); the list follows its end
+     by state, not by measured height (ChatPanel). Its paint is contained, so
+     the tools that sit over its top edge get room to show */
   .msg {
     position: relative;
     margin: 0 -8px;
@@ -752,6 +812,9 @@
     border-radius: var(--r-sm);
     outline: none;
     transition: background-color var(--dur-base);
+    content-visibility: auto;
+    contain-intrinsic-size: auto 48px;
+    overflow-clip-margin: 16px;
   }
 
   .msg:not(.grouped) {
@@ -888,11 +951,27 @@
   }
 
   /* Keyboard focus, not any focus: a quote's jump focuses its target, and a
-     mouse that clicked one should not leave tools standing over the row */
-  .msg:hover .msg-tools,
+     mouse that clicked one should not leave tools standing over the row.
+     Hover only after a mouse: a finger leaves hover on whatever it touched,
+     and the long press holds every action there (D2-09) */
+  .msg:not(.touch):hover .msg-tools,
   .msg:focus-visible .msg-tools,
   .msg:has(:focus-visible) .msg-tools {
     display: flex;
+  }
+
+  /* A long press on a touch screen is the message menu, not a word selected
+     (D1-01: the menu has Copy text). The edit box stays a text field */
+  @media (pointer: coarse) {
+    .msg {
+      -webkit-user-select: none;
+      user-select: none;
+      -webkit-touch-callout: none;
+    }
+    .msg textarea {
+      -webkit-user-select: text;
+      user-select: text;
+    }
   }
 
   /* A finger leaves hover on whatever it last touched: only a mouse tints */

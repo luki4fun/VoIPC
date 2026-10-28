@@ -190,6 +190,23 @@ const handlers: Record<string, Handler> = {
     const opt = (v: unknown, name: string) => (v == null ? null : str(v, name));
     return account.passwordChange(s, str(old, "old"), str(next, "new"), opt(totp, "totp"), opt(recovery, "recovery"));
   },
+  // updater.rs `third_party_notices`: the bundle carries it beside index.html
+  third_party_notices: async () => {
+    try {
+      const r = await fetch("/THIRD-PARTY-NOTICES.txt");
+      // A server that answers every path with the page is no notices file
+      if (!r.ok || (r.headers.get("content-type") ?? "").includes("html")) return null;
+      const text = await r.text();
+      return text.trim() ? text : null;
+    } catch {
+      return null;
+    }
+  },
+  account_recovery_key_new: ({ server, password, totp, recovery }) => {
+    const { s, account } = needAccount(server);
+    const opt = (v: unknown, name: string) => (v == null ? null : str(v, name));
+    return account.recoveryKeyNew(s, str(password, "password"), opt(totp, "totp"), opt(recovery, "recovery"));
+  },
   forget_relay_id: ({ server }) => forgetRelayId(str(server, "server")),
   account_devices: async () =>
     (await listDevices()).map((d) => ({

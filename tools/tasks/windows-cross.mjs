@@ -16,6 +16,7 @@ import {
   CLIENT, ROOT, capture, checkFfmpegAbi, checkTrayLib, err, fail, head, info, npmInstall, ok, run, syncVersion,
   which, writeTempConfig,
 } from '../lib.mjs';
+import { writeNotices } from './notices.mjs';
 
 const TARGET = 'x86_64-pc-windows-msvc';
 
@@ -358,6 +359,8 @@ function build(args) {
   }
 
   npmInstall();
+  // Before Tauri runs Vite, which copies client/public into the bundle
+  writeNotices();
   const cfg = writeTempConfig(config);
   const cmd = ['tauri', 'build', '--runner', 'cargo-xwin', '--target', TARGET,
     '--config', cfg.file];

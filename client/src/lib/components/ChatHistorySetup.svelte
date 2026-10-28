@@ -513,7 +513,8 @@
     {:else if mode === "delete_confirm"}
       <h2>Delete chat history</h2>
       <p class="warning-text">
-        This will permanently delete your chat history. This cannot be undone.
+        This will permanently delete your chat history, and the copy of it an update kept for an older VoIPC.
+        This cannot be undone.
       </p>
       <p class="path-info" title={currentPath}>{truncatePath(currentPath)}</p>
 

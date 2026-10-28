@@ -14,6 +14,7 @@
 // (file_cache_retain), as it does on the desktop.
 
 import { fileRef } from "../../lib/chat-rules";
+import { Asks, asksAgain } from "../../lib/file-rules";
 import { toHex } from "../../lib/hex";
 import { parseHostPort } from "../../lib/invite";
 import { wasmModule } from "./wasm";
@@ -36,16 +37,13 @@ const REQUEST_TIME_MS = 90_000;
 /** How long a transfer goes on trying with nothing moving before it gives
  *  up: past the 60 s the relay may still be reading a chunk whose sender left. */
 const STALL_TIME_MS = 2 * 60_000;
-const MAX_ASKS = 4;
 /** Silence after a request before it is sent again: the relay drops what a
  *  full queue cannot take, and answers a request sent again as it did the first. */
 const REPLY_WAIT_MS = 60_000;
 /** The same while the relay asks members for the file: each ask may reach them all again. */
 const SEEK_RESEND_MS = 5 * 60_000;
-/** After "too many at once" (FILE_RATE), before asking again. */
+/** After a refusal that may pass later (`asksAgain`), before asking again. */
 const RATE_PAUSE_MS = 5_000;
-/** messages.rs FILE_RATE */
-const FILE_RATE = 100;
 const UPLOAD_WAIT_MS = 10 * 60_000;
 const FETCH_WAIT_MS = 2 * 60_000;
 const SEEK_WAIT_MS = 65 * 60_000;
@@ -327,7 +325,7 @@ export class Files {
     try {
       const ask = () =>
         this.host.sendControl({ FileUpload: { conv: wireConv(conv), size: blob.length, hash: fromHex(hash, 32) } });
-      for (let asks = 0; asks < MAX_ASKS; asks++) {
+      for (const asks = new Asks(); asks.next(); ) {
         ask();
         const giveUp = Date.now() + UPLOAD_WAIT_MS;
         for (;;) {
@@ -336,7 +334,7 @@ export class Files {
             turn.armed = false;
             return;
           }
-          if (tag === "FileRefused" && Number(b.code) === FILE_RATE) {
+          if (tag === "FileRefused" && asksAgain(Number(b.code))) {
             await sleep(RATE_PAUSE_MS);
             break;
           }
@@ -367,7 +365,7 @@ export class Files {
     try {
       let have: { buf: Uint8Array; n: number } | null = null;
       const ask = () => this.host.sendControl({ FileFetch: { conv: wireConv(conv), hash: fromHex(hash, 32) } });
-      for (let asks = 0; asks < MAX_ASKS; asks++) {
+      for (const asks = new Asks(); asks.next(); ) {
         ask();
         let giveUp = Date.now() + FETCH_WAIT_MS;
         let every = REPLY_WAIT_MS;
@@ -379,10 +377,13 @@ export class Files {
               throw new Error("the server offers more bytes than any file has");
             }
             if (!have || have.buf.length !== size) have = { buf: new Uint8Array(size), n: 0 };
+            const before = have.n;
             if ((await this.get(String(b.ticket), hash, have, op, signal)) === "all") {
               turn.armed = false;
               return have.buf;
             }
+            // A ticket that brought bytes costs no ask
+            if (have.n > before) asks.moved();
             break;
           }
           if (tag === "FileSeeking") {
@@ -392,7 +393,7 @@ export class Files {
             every = SEEK_RESEND_MS;
           } else if (tag === "FileUnavailable") {
             throw new Error(UNAVAILABLE);
-          } else if (tag === "FileRefused" && Number(b.code) === FILE_RATE) {
+          } else if (tag === "FileRefused" && asksAgain(Number(b.code))) {
             await sleep(RATE_PAUSE_MS);
             break;
           } else if (tag === "FileRefused") {
@@ -702,9 +703,12 @@ export async function fetchFile(
     try {
       return whole((await openInWorker(file, kept)).plain);
     } catch (e) {
-      // Fetching again tells a damaged copy from a message that will not
-      // open whatever the bytes, and only a copy that opens is kept
-      console.debug("a cached file did not open, fetching it again:", message(e));
+      // Only bytes that are not the blob go, to be fetched again. Any other
+      // error is the message's (a key, size or deflate flag that do not open
+      // this blob): the copy stays for the messages that name it rightly,
+      // so one that copies a real file's id cannot make us drop it (R3-02)
+      if ((e as Error)?.name !== "NotThisFile") throw e;
+      console.debug("a cached file is not its blob, fetching it again:", message(e));
       cacheDelete(file.hash);
     }
   }

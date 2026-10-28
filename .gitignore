@@ -20,6 +20,10 @@ client/dist/
 client/dist-web/
 client/src/lib/wasm/
 
+# Written by every build (tools/tasks/notices.mjs); Vite copies it into the
+# bundles, where About links to it
+client/public/THIRD-PARTY-NOTICES.txt
+
 # Tauri rewrites its capability schemas on every build
 client/src-tauri/gen/schemas/
 

@@ -34,6 +34,18 @@
   let busy = $state(false);
   let qr = $state("");
   let copied = $state(false);
+  /** A new recovery key on its way: shown once the relay says it is in
+   *  force (`RecoveryKeyChanged`), never before, and dropped on an error. */
+  let pendingKey: { server: string; key: string } | null = null;
+  /** The relay's `RecoveryKeyChanged` came before the key was handed back. */
+  let keyChangedOn: string | null = null;
+
+  function showNewKey(server: string, key: string) {
+    pendingKey = null;
+    keyChangedOn = null;
+    reset();
+    showPrompt({ kind: "recovery", server, key, renewed: true });
+  }
 
   /** The servers whose question about copies waits for the dialogs that
    *  came first (recovery key, codes) to be out of the way. */
@@ -172,9 +184,11 @@
         const me = get(account.peek(server));
         if (!me) return;
         const writer = t.from_me ? accountHex(me.info.id) : t.account;
+        // Members' copies of what they wrote carry no account, only this name
+        const writerName = t.from_me ? me.name : t.name;
         const ch = get(channels.peek(server)).find((c) => c.log === t.conv);
-        if (ch) purgeWritten(server, "channel", ch.name, writer, t.before);
-        else if (t.conv.startsWith("d:")) purgeWritten(server, "dm", t.name, writer, t.before);
+        if (ch) purgeWritten(server, "channel", ch.name, writer, t.before, writerName);
+        else if (t.conv.startsWith("d:")) purgeWritten(server, "dm", t.name, writer, t.before, writerName);
       }),
       // An edit, delete, reaction or pin from a stored log, by its sender
       // (the other party of a direct one, or us). A pin counts only from a
@@ -277,12 +291,20 @@
       case "DeviceAdded":
         addNotification(`${fromServer(server)}this device is remembered — no password next time`, "info");
         break;
+      case "RecoveryKeyChanged":
+        // The old key stopped working: this one must be seen, whatever is on screen
+        if (pendingKey?.server === server) showNewKey(server, pendingKey.key);
+        else if (prompt?.kind === "recovery-new" && prompt.server === server) keyChangedOn = server;
+        break;
       case "Error":
+        if (body.request === "RecoveryKeyNew" && pendingKey?.server === server) pendingKey = null;
+        if (body.request === "RecoveryKeyNew" && keyChangedOn === server) keyChangedOn = null;
         if (
           prompt &&
           prompt.server === server &&
           (prompt.kind === "totp-setup" ||
             (prompt.kind === "password" && body.request === "PasswordChange") ||
+            (prompt.kind === "recovery-new" && body.request === "RecoveryKeyNew") ||
             (prompt.kind === "delete" && body.request === "DeleteAccount"))
         ) {
           error = body.reason;
@@ -394,6 +416,33 @@
     }
   }
 
+  async function submitRecoveryNew() {
+    const p = get(accountPrompt);
+    if (!p || p.kind !== "recovery-new") return;
+    const codes = get(account.peek(p.server))?.info.totp_enabled ?? false;
+    error =
+      !oldPassword ? "Enter your password."
+      : codes && !code.trim() ? (useRecovery ? "Enter a recovery code." : "Enter the code from your authenticator app.")
+      : "";
+    if (error) return;
+    busy = true;
+    keyChangedOn = null;
+    try {
+      // Held until the relay answers (onReply): a key it refused is no key
+      const key = await invoke<string>("account_recovery_key_new", {
+        server: p.server,
+        password: oldPassword.normalize("NFC"),
+        totp: codes && !useRecovery ? code.trim() : null,
+        recovery: codes && useRecovery ? code.trim() : null,
+      });
+      if (keyChangedOn === p.server) showNewKey(p.server, key);
+      else pendingKey = { server: p.server, key };
+    } catch (e) {
+      error = String(e);
+      busy = false;
+    }
+  }
+
   async function copy(text: string) {
     try {
       await navigator.clipboard.writeText(text);
@@ -415,7 +464,7 @@
   function escapeFor(kind: string): (() => void) | undefined {
     if (busy) return undefined;
     if (kind === "totp") return cancelTotp;
-    if (["totp-setup", "safety", "account", "delete", "password"].includes(kind)) return () => closePrompt();
+    if (["totp-setup", "safety", "account", "delete", "password", "recovery-new"].includes(kind)) return () => closePrompt();
     return undefined;
   }
 </script>
@@ -454,11 +503,11 @@
           <button type="button" class="submit-btn btn btn-primary" onclick={submitTotp} disabled={busy || !code.trim()}>Sign in</button>
         </div>
       {:else if p.kind === "recovery"}
-        <h2>{fromServer(p.server)}Your recovery key</h2>
+        <h2>{fromServer(p.server)}Your {p.renewed ? "new " : ""}recovery key</h2>
         <p class="hint">
-          Write it down and keep it somewhere safe: if you forget your password, it sets a new one ("Forgot your
-          password?" when you sign in) and opens your account's encrypted vault. VoIPC shows it only now, and the
-          server cannot recover it for you.
+          {#if p.renewed}Your old recovery key no longer works. {/if}Write it down and keep it somewhere safe: if
+          you forget your password, it sets a new one ("Forgot your password?" when you sign in) and opens your
+          account's encrypted vault. VoIPC shows it only now, and the server cannot recover it for you.
         </p>
         <code class="secret">{p.key}</code>
         <button type="button" class="secondary" onclick={() => copy(p.key)}>{copied ? "Copied" : "Copy"}</button>
@@ -543,6 +592,10 @@
           <div class="row">
             <span>Password</span>
             <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); reset(); showPrompt({ kind: "password", server }); }}>Change</button>
+          </div>
+          <div class="row">
+            <span>Recovery key</span>
+            <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); reset(); showPrompt({ kind: "recovery-new", server }); }}>New</button>
           </div>
           {#if !$account.info.totp_enabled}
             <div class="row">
@@ -663,6 +716,51 @@
         <div class="buttons">
           <button type="button" class="secondary" onclick={() => closePrompt()} disabled={busy}>Cancel</button>
           <button type="button" class="submit-btn btn btn-primary" onclick={submitPassword} disabled={busy}>Change password</button>
+        </div>
+      {:else if p.kind === "recovery-new"}
+        {@const codes = $account?.info.totp_enabled ?? false}
+        <h2>{fromServer(p.server)}New recovery key</h2>
+        <p class="hint">
+          The recovery key you have now stops working, and only the new one resets your password. An account made
+          before VoIPC 1.3 gets its reset key this way: until then, a device that remembers it could reset it too.
+        </p>
+        <div class="field">
+          <label for="acct-recovery-password">Password</label>
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            id="acct-recovery-password"
+            type="password"
+            autocomplete="current-password"
+            autofocus
+            bind:value={oldPassword}
+            disabled={busy}
+            onkeydown={(e) => e.key === "Enter" && !codes && submitRecoveryNew()}
+          />
+        </div>
+        {#if codes}
+          <div class="field">
+            <label for="acct-recovery-code">{useRecovery ? "Recovery code" : "Code from your authenticator app"}</label>
+            <input
+              id="acct-recovery-code"
+              type="text"
+              inputmode={useRecovery ? "text" : "numeric"}
+              autocomplete="one-time-code"
+              bind:value={code}
+              placeholder={useRecovery ? "abcd-efgh-jkmn" : "123456"}
+              disabled={busy}
+              onkeydown={(e) => e.key === "Enter" && submitRecoveryNew()}
+            />
+          </div>
+          <button type="button" class="link" onclick={() => (useRecovery = !useRecovery)}>
+            {useRecovery ? "Use a code from the app" : "Lost your phone? Use a recovery code"}
+          </button>
+        {/if}
+        {#if error}<div class="error" role="alert">{error}</div>{/if}
+        <div class="buttons">
+          <button type="button" class="secondary" onclick={() => closePrompt()} disabled={busy}>Cancel</button>
+          <button type="button" class="submit-btn btn btn-primary" onclick={submitRecoveryNew} disabled={busy}>
+            {busy ? "Making it…" : "Make a new key"}
+          </button>
         </div>
       {:else if p.kind === "recovery-codes"}
         <h2>{fromServer(p.server)}Recovery codes</h2>

@@ -415,6 +415,9 @@ impl Pins {
     /// `account`, going by `name` (empty: not known), with identity `key`.
     /// `Changed` when the key is not the one pinned for the account, or the
     /// name belonged to another account; what was met now is pinned either way.
+    /// A name no relay hands out (`normalize_name`: "аlice" with a Cyrillic
+    /// `а`) is no new contact but a relay passing someone off as one you may
+    /// know: `Replaced` too, once (S-013).
     pub fn check(&mut self, account: &[u8; 16], name: &str, key: &[u8]) -> PinCheck {
         let by_key = match self.keys.insert(*account, key.to_vec()) {
             None => PinCheck::New,
@@ -424,6 +427,7 @@ impl Pins {
         let name = name.trim().to_ascii_lowercase();
         let by_name = match (name.is_empty(), self.names.get(&name)) {
             (true, _) => PinCheck::Same,
+            (false, None) if normalize_name(&name).is_err() => PinCheck::Changed,
             (false, None) => PinCheck::New,
             (false, Some(a)) if a == account => PinCheck::Same,
             (false, Some(_)) => PinCheck::Changed,
@@ -1467,6 +1471,29 @@ mod tests {
             ),
             "the known id signs in"
         );
+    }
+
+    /// S-013: a name an honest relay never hands out is a warning, not a
+    /// new contact, however it looks; a name as relays write it is not.
+    #[test]
+    fn a_look_alike_name_from_the_relay_is_a_warning() {
+        let mut p = Pins::default();
+        let (alice, fake) = ([1u8; 16], [9u8; 16]);
+        assert_eq!(p.check(&alice, "alice", &[5; 33]), PinCheck::New);
+        // A Cyrillic а, a fresh id and a key of its own
+        assert_eq!(p.check(&fake, "\u{430}lice", &[6; 33]), PinCheck::Replaced);
+        assert_eq!(
+            p.check(&fake, "\u{430}lice", &[6; 33]),
+            PinCheck::Same,
+            "told once"
+        );
+        for bad in ["al ice", "a\u{200b}lice", "_alice", "12345", "al"] {
+            let mut p = Pins::default();
+            assert!(p.check(&fake, bad, &[6; 33]).warns(), "{bad:?}");
+        }
+        let mut p = Pins::default();
+        assert_eq!(p.check(&alice, " Alice_01 ", &[5; 33]), PinCheck::New);
+        assert_eq!(p.check(&[2; 16], "", &[7; 33]), PinCheck::New, "no name");
     }
 
     #[test]

@@ -50,6 +50,10 @@ pub struct UpdateInfo {
     /// The protocol the update speaks, when the feed says (`"protocol": N`):
     /// whether it would let us onto a server that refused us.
     pub protocol: Option<u32>,
+    /// The protocol this app speaks: an update on another one locks it out
+    /// of every server not yet updated, so the page warns instead of
+    /// offering it plainly (`update-rules.ts` `updateOffer`).
+    pub our_protocol: u32,
 }
 
 /// The feed's extra `protocol` field, if it carries a sane one.
@@ -98,6 +102,7 @@ mod desktop {
             version: update.version.clone(),
             notes: update.body.clone(),
             protocol: protocol_of(&update.raw_json),
+            our_protocol: voipc_protocol::codec::PROTOCOL_VERSION,
         }
     }
 
@@ -265,6 +270,26 @@ pub async fn install_update(app: tauri::AppHandle) -> Result<(), String> {
     }
 }
 
+/// The bundle's THIRD-PARTY-NOTICES.txt (tools/tasks/notices.mjs writes it
+/// beside index.html), for About (R4-09); None in a build without one. Read
+/// here because the page's CSP lets it fetch nothing of its own.
+#[tauri::command]
+pub fn third_party_notices(app: tauri::AppHandle) -> Option<String> {
+    let asset = app.asset_resolver().get("THIRD-PARTY-NOTICES.txt".into())?;
+    notices_text(&asset.mime_type, asset.bytes)
+}
+
+/// The notices as text. A missing asset comes back as index.html (the
+/// resolver's fallback), which is no notices file.
+fn notices_text(mime: &str, bytes: Vec<u8>) -> Option<String> {
+    if mime.contains("html") {
+        return None;
+    }
+    String::from_utf8(bytes)
+        .ok()
+        .filter(|text| !text.trim().is_empty())
+}
+
 /// The "Check for updates" setting (default on). Switching it on looks at once.
 #[tauri::command]
 pub async fn set_check_updates(app: tauri::AppHandle, enabled: bool) -> Result<(), String> {
@@ -292,6 +317,19 @@ mod tests {
         assert_eq!(feed("1.0.0-rc.1"), RC_FEED);
         assert_eq!(feed("1.0.0"), STABLE_FEED);
         assert_eq!(feed("1.2.3"), STABLE_FEED);
+    }
+
+    /// R4-09: About shows the notices file, never the page that stands in
+    /// for a missing one.
+    #[test]
+    fn a_missing_notices_file_is_not_the_page() {
+        assert_eq!(
+            notices_text("text/plain", b"MIT: foo".to_vec()).as_deref(),
+            Some("MIT: foo")
+        );
+        assert_eq!(notices_text("text/html", b"<!doctype html>".to_vec()), None);
+        assert_eq!(notices_text("text/plain", b" \n".to_vec()), None);
+        assert_eq!(notices_text("text/plain", vec![0xff, 0xfe]), None);
     }
 
     #[test]

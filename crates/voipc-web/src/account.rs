@@ -514,6 +514,26 @@ impl AccountSession {
             recovery_code,
         ))
     }
+
+    /// A new recovery key, from the stretched password (`kdfSalt`) and a code
+    /// where the account has codes on: the actions to run, and `key`, the
+    /// text to show once `RecoveryKeyChanged` answers (S-006).
+    #[wasm_bindgen(js_name = recoveryKeyNew)]
+    pub fn recovery_key_new(
+        &self,
+        master: &[u8],
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    ) -> Result<JsValue, JsError> {
+        let master: [u8; 32] = master
+            .try_into()
+            .map_err(|_| JsError::new("the stretched password is not 32 bytes"))?;
+        let (a, key) = self.session.recovery_key_new(&master, totp, recovery_code);
+        let out = actions(a)?;
+        js_sys::Reflect::set(&out, &JsValue::from_str("key"), &JsValue::from_str(&key))
+            .map_err(|_| JsError::new("could not hand the key over"))?;
+        Ok(out)
+    }
 }
 
 /// The authenticator app's QR code for an `otpauth://` link, drawn here.

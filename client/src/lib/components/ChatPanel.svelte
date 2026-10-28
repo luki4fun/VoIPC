@@ -27,7 +27,8 @@
   import { threadView } from "../thread-rules.js";
   import type { ChatEvent, ChatMessage, FileConv, FileRef, Forwarded } from "../types.js";
   import { fetchFile, fileLimits, sendFile } from "../files.js";
-  import { plainText } from "../markdown.js";
+  import { linkFacts, mentionNames as mentionNamesOf, plainText } from "../markdown.js";
+  import { rosterOf } from "../roster-rules.js";
   import { prepare } from "../image-prep.js";
   import { sealedLen } from "../file-rules.js";
   import {
@@ -79,9 +80,13 @@
 
   let messagesContainer = $state<HTMLDivElement | null>(null);
 
-  // Links open a copy popup, never a browser (MessageList draws the buttons)
+  // Links open a copy popup, never a browser (MessageList draws the buttons).
+  // It shows, and copies, where the link goes as a browser would read it,
+  // with its host on its own line and a word for what is no web address
+  // (R2-12).
   let linkPopupUrl = $state<string | null>(null);
   let linkInputEl = $state<HTMLInputElement | null>(null);
+  const link = $derived(linkPopupUrl === null ? null : linkFacts(linkPopupUrl));
 
   $effect(() => {
     if (linkPopupUrl !== null && linkInputEl) {
@@ -91,10 +96,10 @@
   });
 
   async function copyLink() {
-    if (linkPopupUrl === null) return;
+    if (link === null) return;
     let copied = false;
     try {
-      await navigator.clipboard.writeText(linkPopupUrl);
+      await navigator.clipboard.writeText(link.shown);
       copied = true;
     } catch {
       linkInputEl?.focus();
@@ -254,22 +259,35 @@
     return () => forgetNewMessages(key);
   });
 
-  /** Our own name here, with its tag, and without. */
-  const myNames = $derived($username ? [...new Set([$username, shortName($username)])] : []);
   /**
-   * Who an `@` can name. In an anonymous channel every member sees others
-   * under pseudonyms of their own, so a name typed there means nothing to
-   * anyone else: no mentions at all.
+   * Who an `@` can name: the people of the conversation on screen (the
+   * channel's roster, not the voice room's; the other person in a direct
+   * one). In an anonymous channel every member sees others under pseudonyms
+   * of their own, so a name typed there means nothing to anyone else: no
+   * mentions at all, ours included (R2-11).
    */
+  const anonymousHere = $derived(!isDmMode && !!effectiveChannel?.anonymous);
   // Keyed by the names themselves: the user list is rebuilt for every mute
   // and join, and a new array here would parse every message on screen again
   const mentionKey = $derived(
-    !isDmMode && effectiveChannel?.anonymous ? "" : $users.map((u) => u.username).join("\n"),
+    anonymousHere
+      ? ""
+      : (isDmMode
+          ? [$activeDmUsername]
+          : rosterOf($displayChannelId, $channelRosters, $currentChannelId, $users).map((u) => u.username)
+        ).join("\n"),
   );
   const mentionable = $derived(mentionKey ? mentionKey.split("\n") : []);
-  const mentionNames = $derived([...new Set(mentionable.flatMap((n) => [n, shortName(n)]))]);
+  /** Full names, and short ones only where one person here goes by it. */
+  const mentionNames = $derived(mentionNamesOf(mentionable));
+  /** Our own names here, with the tag, and without it where that is ours alone. */
+  const myNames = $derived(
+    !$username || anonymousHere
+      ? []
+      : mentionNamesOf([...mentionable, $username]).filter((n) => n === $username || n === shortName($username)),
+  );
   /** Who the message box offers after an `@`: everybody but us. */
-  const mentionOthers = $derived(mentionable.filter((n) => !myNames.includes(n)));
+  const mentionOthers = $derived(mentionable.filter((n) => n !== $username));
 
   // ── Search ───────────────────────────────────────────────────────────────
 
@@ -281,11 +299,24 @@
     for (const [kind, map] of [["channel", $channelMessages], ["dm", $dmMessages]] as const) {
       for (const [key, messages] of map) {
         const at = splitChatKey(key);
-        if (at) out.push({ conv: { kind, key, ...at }, messages });
+        if (!at || (kind === "channel" && behindNsfwGate(at.server, at.name))) continue;
+        out.push({ conv: { kind, key, ...at }, messages });
       }
     }
     return out;
   });
+  /** Every open server's channels, for which of them are 18+. */
+  const channelLists = channels.all();
+  /** A channel marked 18+ that its server has no consent for: its messages
+   *  are not shown, so they are not searched either (R2-15). `server` as chat
+   *  keys name it. */
+  function behindNsfwGate(server: string, name: string): boolean {
+    for (const [address, list] of $channelLists) {
+      if (serverKey(address) !== server) continue;
+      return needsNsfwConsent(list.find((c) => c.name === name), $uiPrefs.nsfw_ok.includes(server));
+    }
+    return false;
+  }
   function convLabel(c: Conv): string {
     const name = c.kind === "dm" ? `@${shortName(c.name)}` : c.name;
     return c.server === serverKey($serverAddress) ? name : `${name} · ${c.server}`;
@@ -316,12 +347,20 @@
     });
   });
 
-  /** Ctrl+F (⌘F) while the chat has the focus: the browser's own find knows nothing of threads. */
+  /** Ctrl+F (⌘F) while the chat has the focus, or nothing has (a click in
+   *  the list focuses nothing, and WebView2's own find bar would open, D1-03):
+   *  the browser's own find knows nothing of threads. With nothing focused,
+   *  the first chat on screen takes it, so two panes never both open. */
   function onWindowKeydown(e: KeyboardEvent) {
-    if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "f" && panelEl?.contains(document.activeElement)) {
-      e.preventDefault();
-      searching = true;
-    }
+    if (!(e.ctrlKey || e.metaKey) || e.key.toLowerCase() !== "f" || !panelEl) return;
+    const active = document.activeElement;
+    const ours =
+      panelEl.contains(active) ||
+      ((!active || active === document.body) &&
+        [...document.querySelectorAll<HTMLElement>(".chat-panel")].find((p) => p.getClientRects().length > 0) === panelEl);
+    if (!ours) return;
+    e.preventDefault();
+    searching = true;
   }
 
   /** A quote led to a message not drawn in the main flow: it is in a thread. */
@@ -375,10 +414,18 @@
   // when this one grew and the reader was already at the end. Not on every
   // change of the list: it is rebuilt for a message on any channel of any
   // server, and following each of those pulled a reader out of the history
-  // they were scrolled back into. Measured before the DOM update (`.pre`),
-  // which is the only moment "at the end" still describes what they saw.
+  // they were scrolled back into.
+  //
+  // "At the end" is kept from the reader's own scrolling, never measured when
+  // a message comes: rows off screen are only estimated (`content-visibility`,
+  // R2-05), so the height says little. And while they are at the end, the end
+  // is held there as rows settle into their real size (`followEnd`).
+  let atEnd = true;
   let followedConversation = "";
   let followedEnd = "";
+  function toEnd() {
+    if (messagesContainer) messagesContainer.scrollTop = messagesContainer.scrollHeight;
+  }
   $effect.pre(() => {
     const conversation = `${$serverAddress}|${$displayChannelId}|${$activeDmUserId}`;
     const last = displayMessages.at(-1);
@@ -387,15 +434,19 @@
     if (!switched && end === followedEnd) return;
     followedConversation = conversation;
     followedEnd = end;
-    const el = untrack(() => messagesContainer);
-    const atEnd = !el || el.scrollHeight - el.scrollTop - el.clientHeight < 40;
-    if (!switched && !atEnd) return;
-    tick().then(() => {
-      if (messagesContainer) {
-        messagesContainer.scrollTop = messagesContainer.scrollHeight;
-      }
-    });
+    if (switched) atEnd = true;
+    if (!atEnd) return;
+    tick().then(toEnd);
   });
+
+  /** Hold the end in view while the reader is there and the rows change size. */
+  function followEnd(node: HTMLElement) {
+    const ro = new ResizeObserver(() => {
+      if (atEnd) toEnd();
+    });
+    ro.observe(node);
+    return { destroy: () => ro.disconnect() };
+  }
 
   // Scrolled back into the conversation: a way back down that does not need
   // a long fling (and says when something new arrived meanwhile)
@@ -403,7 +454,9 @@
   function onMessagesScroll() {
     const el = messagesContainer;
     if (!el) return;
-    scrolledUp = el.scrollHeight - el.scrollTop - el.clientHeight > 200;
+    const below = el.scrollHeight - el.scrollTop - el.clientHeight;
+    atEnd = below < 40;
+    scrolledUp = below > 200;
   }
   function jumpToLatest() {
     messagesContainer?.scrollTo({ top: messagesContainer.scrollHeight, behavior: "smooth" });
@@ -545,7 +598,10 @@
         }
       } else {
         const channelId = t.channelId;
-        if (slowModeSecs > 0) {
+        // The countdown of the channel written in, which a forward may not
+        // be the one on screen
+        const slow = get(channels.peek(server)).find((c) => c.channel_id === channelId)?.slow_mode_secs ?? 0;
+        if (slow > 0) {
           notePost(server, channelId);
           now = Date.now();
           sentCount++;
@@ -603,23 +659,37 @@
   // counts it against slow mode and refuses it in an announcement channel.
   // Who may do what is every reader's to check (chat-rules.ts `applyEvent`).
 
-  /** Send `event` into the conversation on screen. */
-  function sendEvent(event: ChatEvent, content = "") {
-    void sendTo(targetNow(), content, null, null, undefined, { event });
+  /**
+   * Send `event` about `m` into `t`, the conversation `m` is in. It lives no
+   * longer than `m` does: in a stored log an edit's new text must not outlive
+   * the message it changes (R3-06), so it takes what is left of `m`'s timer,
+   * and goes not at all once that has run out.
+   */
+  function sendEvent(t: Target, event: ChatEvent, m: ChatMessage, content = "") {
+    const left = m.expires_at === undefined ? undefined : Math.floor((m.expires_at - Date.now()) / 1000);
+    if (left !== undefined && left < 1) return;
+    void sendTo(t, content, null, null, undefined, { event, ttlCap: left });
   }
 
   /** What the message tools offer here. Forward is not a post here, and
    *  goes wherever the person may post. */
   const actions = $derived.by((): MessageActions => {
-    const forward = (m: ChatMessage) => (forwarding = { m, from: fileConv, server: $serverAddress });
+    // Not a member's copy: forwarded, its claimed writer would become a
+    // "Forwarded from" label with no mark of hearsay (D-15)
+    const forward = (m: ChatMessage) => {
+      if (m.kind !== "shared") forwarding = { m, from: fileConv, server: $serverAddress };
+    };
     if (!canAnswer || held) return { forward };
+    // The conversation these messages are in, read now: a delete is sent
+    // after its question is answered, by when another one may be on screen
+    const t = targetNow();
     return {
       forward,
-      react: (m, emoji, on) => sendEvent({ kind: "react", target: m.id!, emoji, on }),
-      edit: (m, text) => sendEvent({ kind: "edit", target: m.id! }, text),
-      remove: (m) => sendEvent({ kind: "delete", target: m.id! }),
+      react: (m, emoji, on) => sendEvent(t, { kind: "react", target: m.id!, emoji, on }, m),
+      edit: (m, text) => sendEvent(t, { kind: "edit", target: m.id! }, m, text),
+      remove: (m) => sendEvent(t, { kind: "delete", target: m.id! }, m),
       // A pin counts only from a manager, which every reader checks
-      pin: !isDmMode && isManager ? (m, on) => sendEvent({ kind: "pin", target: m.id!, on }) : undefined,
+      pin: !isDmMode && isManager ? (m, on) => sendEvent(t, { kind: "pin", target: m.id!, on }, m) : undefined,
     };
   });
 
@@ -943,6 +1013,7 @@
         {/if}
       </div>
     {:else}
+      <div class="message-rows" use:followEnd>
       <MessageList
         bind:this={mainList}
         messages={view.main}
@@ -962,6 +1033,7 @@
         {fileConv}
         {actions}
       />
+      </div>
       {#if scrolledUp}
         <button class="jump-latest" onclick={jumpToLatest}>
           <Icon name="chevron-down" size={14} /> Jump to latest
@@ -1022,7 +1094,7 @@
   </div>
   {#if searching}
     <SearchPane
-      here={displayMessages}
+      here={gated ? [] : displayMessages}
       {everywhere}
       labelOf={convLabel}
       onpick={pickResult}
@@ -1087,10 +1159,16 @@
       <input
         class="link-input"
         readonly
+        aria-label="Where the link goes"
         bind:this={linkInputEl}
-        value={linkPopupUrl}
+        value={link?.shown ?? ""}
         onfocus={(e) => e.currentTarget.select()}
       />
+      {#if link?.web}
+        <p class="link-host">Goes to <strong>{link.host}</strong></p>
+      {:else}
+        <p class="link-host not-web">Not a web address: check it before you paste it anywhere</p>
+      {/if}
       <div class="link-actions">
         <button class="link-copy-btn" onclick={copyLink}>Copy</button>
         <button class="link-close-btn" onclick={() => (linkPopupUrl = null)}>Close</button>
@@ -1373,6 +1451,21 @@
     font-size: var(--fs-md);
     font-weight: 600;
     color: var(--text-primary);
+  }
+
+  .link-host {
+    margin: -4px 0 0;
+    font-size: var(--fs-sm);
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+  }
+
+  .link-host strong {
+    color: var(--text-primary);
+  }
+
+  .link-host.not-web {
+    color: var(--danger);
   }
 
   .link-input {
