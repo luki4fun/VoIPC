@@ -61,7 +61,7 @@ The relay's container image is attested the same way:
 The Android APK is signed with the same certificate as every earlier VoIPC APK. Its SHA-256 is
 `30d71722fe2bdd4bafc34fdaf5be34071f5dfaa399823237c7ae4ab7778a0fe9`. To check it:
 
-    apksigner verify --print-certs VoIPC-android-1.3.1-rc.1
+    apksigner verify --print-certs VoIPC-android-1.3.1-rc.1.apk
 
 The desktop app's own updater only installs an update signed for exactly the version it
 announces.

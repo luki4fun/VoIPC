@@ -403,7 +403,7 @@
                       <dt>keeps</dt><dd>nothing past a restart</dd>
                       <dt>linux</dt><dd><a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/VoIPC_1.3.1-rc.1_amd64.AppImage">AppImage</a> · <a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/VoIPC_1.3.1-rc.1_amd64.deb">.deb</a></dd>
                       <dt>windows</dt><dd><a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/VoIPC_1.3.1-rc.1_x64-setup.exe">installer</a></dd>
-                      <dt>android</dt><dd><a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/VoIPC-android-1.3.1-rc.1">APK</a></dd>
+                      <dt>android</dt><dd><a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/VoIPC-android-1.3.1-rc.1.apk">APK</a></dd>
                       <dt>browser</dt><dd>nothing to install: <code>https://your-server:9987</code></dd>
                       <dt>version</dt><dd class="num">1.3.1-rc.1 · <a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">changelog</a></dd>
                       <dt>from 1.0</dt><dd><strong>update the server first.</strong> 1.3 apps and 1.0 servers do not connect, and the 1.0 desktop app offers the update everywhere: on a server still on 1.0, wait.</dd>
@@ -662,7 +662,7 @@
           <tr><th scope="row">Windows</th><td class="cap" data-label="Voice &amp; chat">Yes</td><td class="cap" data-label="Share">Windows.Graphics.Capture</td><td class="cap" data-label="Watch">Yes</td><td class="cap" data-label="Desktop audio">WASAPI</td>
             <td class="dl"><a class="get" href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/VoIPC_1.3.1-rc.1_x64-setup.exe"><svg class="icon" aria-hidden="true"><use href="#i-down"/></svg>Installer</a></td></tr>
           <tr><th scope="row">Android</th><td class="cap" data-label="Voice &amp; chat">Yes</td><td class="cap" data-label="Share">—</td><td class="cap" data-label="Watch">Yes</td><td class="cap" data-label="Desktop audio">—</td>
-            <td class="dl"><a class="get" href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/VoIPC-android-1.3.1-rc.1"><svg class="icon" aria-hidden="true"><use href="#i-down"/></svg>APK</a></td></tr>
+            <td class="dl"><a class="get" href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/VoIPC-android-1.3.1-rc.1.apk"><svg class="icon" aria-hidden="true"><use href="#i-down"/></svg>APK</a></td></tr>
           <tr id="browser-client"><th scope="row">Browser</th><td class="cap" data-label="Voice &amp; chat">Yes</td><td class="cap" data-label="Share">getDisplayMedia</td><td class="cap" data-label="Watch">Yes</td><td class="cap" data-label="Desktop audio">where the browser offers it</td>
             <td><span class="cap">Nothing to install: open <code>https://your-server:9987</code></span></td></tr>
           <tr><th scope="row">macOS</th><td class="cap" data-label="Voice &amp; chat">—</td><td class="cap" data-label="Share">—</td><td class="cap" data-label="Watch">—</td><td class="cap" data-label="Desktop audio">—</td>
@@ -722,7 +722,7 @@
     var join = document.getElementById("join");
     var os = document.getElementById("join-os");
     var pick =
-      /Android/i.test(ua) ? ["Android", "VoIPC-android-1.3.1-rc.1"] :
+      /Android/i.test(ua) ? ["Android", "VoIPC-android-1.3.1-rc.1.apk"] :
       /Windows/i.test(ua) ? ["Windows", "VoIPC_1.3.1-rc.1_x64-setup.exe"] :
       /iPhone|iPad|Macintosh|Mac OS/i.test(ua) ? ["in the browser", null] :
       /Linux|X11/i.test(ua) ? ["Linux", "VoIPC_1.3.1-rc.1_amd64.AppImage"] :

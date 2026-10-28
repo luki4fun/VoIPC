@@ -146,9 +146,11 @@ const VERSION_SITES = [
     // their asset names, the Join button, the status bar. A version is the
     // only three-part number the page carries; the guards keep a four-part
     // one (the example IP in the console) whole. With an optional -rc.N, or
-    // after one rc sync the next sync would skip it silently.
+    // after one rc sync the next sync would skip it silently — and only that
+    // form: a general pre-release would take `.apk` for part of "-rc.1.apk"
+    // and drop it on the next sync (it did, at 1.3.1-rc.1).
     file: join(ROOT, 'website', 'index.html'),
-    re: /(?<![\d.])\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?(?![\d.]*\d)/g,
+    re: /(?<![\d.])\d+\.\d+\.\d+(?:-rc\.\d+)?(?![\d.]*\d)/g,
     make: (v) => v,
     optional: true,
   },
@@ -178,13 +180,13 @@ const VERSION_SITES = [
     // Commands people copy: verifying a release's files and running the
     // relay's image. Only the version after a release asset or image name.
     file: join(ROOT, 'SECURITY.md'),
-    re: /(?<=VoIPC_|voipc-server:|VoIPC-android-)\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?/g,
+    re: /(?<=VoIPC_|voipc-server:|VoIPC-android-)\d+\.\d+\.\d+(?:-rc\.\d+)?/g,
     make: (v) => v,
     optional: true,
   },
   {
     file: join(ROOT, 'docs', 'OPERATING.md'),
-    re: /(?<=ghcr\.io\/luki4fun\/voipc-server:)\d+\.\d+\.\d+(?:-[0-9A-Za-z]+(?:\.[0-9A-Za-z]+)*)?/g,
+    re: /(?<=ghcr\.io\/luki4fun\/voipc-server:)\d+\.\d+\.\d+(?:-rc\.\d+)?/g,
     make: (v) => v,
     optional: true,
   },
