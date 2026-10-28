@@ -300,7 +300,10 @@ Send this while the radio key is down and they only hold one:
   never cuts a press the player is making themselves.
 - It is let go automatically when your socket closes, when another game takes
   the mix, when the player leaves the channel, and after 60 seconds
-  (`transmit_expired`) — re-send `on: true` to keep a long transmission going.
+  (`transmit_expired`) — re-send `on: true` to keep a long transmission going,
+  but only from a fresh check that the player's key is still down. Never
+  re-send on the strength of a remembered press: a press whose release was lost
+  would keep the microphone open for ever.
 
 Other messages: `{"type":"ping"}` (answered with `{"type":"pong"}`) and
 `{"type":"bye"}`. Closing the socket does the same as `bye`: every placement is
@@ -481,7 +484,9 @@ change anything, at the price named above.
   because any web page a player has open can otherwise reach a local port — and
   a name like `localhost.example.com` is an ordinary internet host, not
   loopback. Settings → Game Integration takes extra origins, one per line, each
-  matched exactly — add `null` to test from a `file://` page.
+  matched exactly. `null` is refused: it is not one page but every sandboxed
+  frame, `data:` URL and `file://` page, so to test from a page, serve it from
+  `localhost` (allowed without configuration).
 - `hello.server` and `hello.channel` are both required: the first so a mod
   cannot place people using coordinates from a different session, the second so
   it cannot arm itself on whatever channel the player happens to be in.
@@ -560,7 +565,8 @@ channel and the consent switches are in the state you think they are.
 much space is around you and how submerged you are, and one other player, plus
 the channel to join, every mode the build reports in `modes`, a layer you can
 add with its own chain and ear, the build's `capabilities` and a live line of
-who is speaking. Open it in a browser, add `null` to the allowed origins, put
+who is speaking. Serve it from localhost (`python3 -m http.server -d sdk 8000`,
+then open `http://localhost:8000/test-page.html`; no origin to add), put
 the server you are connected to in its *VoIPC server* field, and drag: you
 should hear the other voice move, and hear the layer sit in one ear while it
 does.
@@ -585,7 +591,7 @@ end of a radio never is. It exposes:
 
 | side | export |
 |---|---|
-| client | `setRadioChannel(name)`, `setRadioTalking(bool)`, `setVoiceRange(m)`, `getVoipcId()` |
+| client | `setRadioChannel(name)`, `setRadioTalking(bool)` (push-to-talk power: with `Config.radioPressesPtt` it holds the player's microphone open; `true` lasts at most 60 seconds, so call it again while your key is still down), `setVoiceRange(m)`, `getVoipcId()` |
 | server | `setPlayerRadioChannel(src, name)`, `setPlayerCall(src, partner)`, `addChannelCheck(name, fn)`, `getPlayersInRadioChannel(name)`, `getVoipcId(src)` |
 
 `Config.canJoinRadio(src, channel)` and `addChannelCheck` are where a job check
@@ -654,7 +660,7 @@ which is stable from 1.0 on; `reason` is English for a log and may change.
 | `not_in_voice` | `update` while the player is in no voice channel | Wait |
 | `bad_update` | `update` with a non-finite position or a player listed twice | Fix the update; it was not applied |
 | `transmit_not_allowed` | `transmit` | Ask the player to allow it in Settings → Game Integration |
-| `transmit_expired` | pushed: a `transmit` held for 60 s was let go | Send `on: true` again if the key is still down |
+| `transmit_expired` | pushed: a `transmit` held for 60 s was let go | Send `on: true` again only if a fresh check finds the key still down |
 
 ## Protocol version
 

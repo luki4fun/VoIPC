@@ -9,23 +9,22 @@
   }
 </script>
 
-{#if $pendingPokes.length > 0}
-  <div class="poke-container">
-    {#each $pendingPokes as poke (poke.id)}
-      <div class="poke">
-        <div class="poke-content">
-          <span class="poke-text">
-            <strong title={poke.from_username}>{shortName(poke.from_username)}</strong> poked you{#if poke.server !== $serverAddress}&nbsp;on {$serverEntries.find((e) => e.id === poke.server)?.name ?? poke.server}{/if}
-          </span>
-          {#if poke.message}
-            <span class="poke-message">"{poke.message}"</span>
-          {/if}
-        </div>
-        <button class="dismiss-btn btn btn-primary" onclick={() => dismiss(poke.id)}>OK</button>
+<!-- Always there, like the toasts, so a poke is read out when it arrives -->
+<div class="poke-container" aria-live="polite">
+  {#each $pendingPokes as poke (poke.id)}
+    <div class="poke" role="status">
+      <div class="poke-content">
+        <span class="poke-text">
+          <strong title={poke.from_username}>{shortName(poke.from_username)}</strong> poked you{#if poke.server !== $serverAddress}&nbsp;on {$serverEntries.find((e) => e.id === poke.server)?.name ?? poke.server}{/if}
+        </span>
+        {#if poke.message}
+          <span class="poke-message">"{poke.message}"</span>
+        {/if}
       </div>
-    {/each}
-  </div>
-{/if}
+      <button class="dismiss-btn btn btn-primary" onclick={() => dismiss(poke.id)}>OK</button>
+    </div>
+  {/each}
+</div>
 
 <style>
   .poke-container {

@@ -351,7 +351,8 @@
 </script>
 
 <div class="overlay">
-  <div class="dialog" use:dialog>
+  <!-- A gate with nothing to go back to: Back puts the app away until later -->
+  <div class="dialog" use:dialog={{ back: "leave" }}>
     {#if mode === "loading"}
       <h2>Chat history</h2>
       <p class="hint">Loading...</p>

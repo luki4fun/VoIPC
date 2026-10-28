@@ -28,6 +28,7 @@
   import { rosterForRow } from "../../roster-rules.js";
   import { userId, isAdmin, serverAddress } from "../../stores/connection.js";
   import { account } from "../../stores/account.js";
+  import { showChatPane } from "../../stores/platform.js";
   import {
     activeDmUserId,
     activeTextChannelId,
@@ -259,7 +260,11 @@
           <button
             class="dm-entry"
             class:active={$activeDmUserId === convo.user_id}
-            onclick={() => openDm($serverAddress, convo.user_id, convo.username)}
+            onclick={() => {
+              openDm($serverAddress, convo.user_id, convo.username);
+              // On a phone this list is a drawer over the chat
+              showChatPane();
+            }}
           >
             <span class="dm-avatar" style={avatarStyle(convo.username)}
               >{convo.username.charAt(0).toUpperCase()}</span

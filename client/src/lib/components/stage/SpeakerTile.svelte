@@ -4,6 +4,10 @@
   // to their own audio. A click opens the same member menu as every list
   // (actions/member-menu.ts) — volume, poke, direct message — so nothing a
   // person can do to somebody here is new code.
+  //
+  // The menu's trigger is the person (`.who`), stretched over the whole tile,
+  // and Watch is a button beside it, not inside it: the children of a button
+  // are not there for a screen reader, so Watch could not be reached (R5-06).
 
   import { avatarStyle } from "../../avatar.js";
   import { shortName } from "../../username.js";
@@ -42,26 +46,24 @@
   );
 </script>
 
-<!-- svelte-ignore a11y_no_static_element_interactions -->
-<div
-  class="tile"
-  class:small
-  class:talking
-  class:culled
-  data-stage-tile={user.user_id}
-  aria-label="{shortName(user.username)}{self ? ' (you)' : ''}{state ? `, ${state}` : ''}"
-  use:memberMenu={{ user, idle: false, self }}
->
-  <span class="avatar" style={avatarStyle(user.username)} aria-hidden="true"
-    >{user.username.charAt(0).toUpperCase()}</span
+<div class="tile" class:small class:talking class:culled data-stage-tile={user.user_id}>
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div
+    class="who"
+    aria-label="{shortName(user.username)}{self ? ' (you)' : ''}{state ? `, ${state}` : ''}"
+    use:memberMenu={{ user, idle: false, self }}
   >
-  <span class="name" title={user.username}>
-    {shortName(user.username)}{#if self}<span class="you">(you)</span>{/if}
-  </span>
-  <span class="marks" aria-hidden="true">
-    {#if user.is_muted}<span class="mark" title="Muted"><Icon name="mic-off" size={small ? 12 : 14} /></span>{/if}
-    {#if user.is_deafened}<span class="mark" title="Deafened"><Icon name="headphones-off" size={small ? 12 : 14} /></span>{/if}
-  </span>
+    <span class="avatar" style={avatarStyle(user.username)} aria-hidden="true"
+      >{user.username.charAt(0).toUpperCase()}</span
+    >
+    <span class="name" title={user.username}>
+      {shortName(user.username)}{#if self}<span class="you">(you)</span>{/if}
+    </span>
+    <span class="marks" aria-hidden="true">
+      {#if user.is_muted}<span class="mark" title="Muted"><Icon name="mic-off" size={small ? 12 : 14} /></span>{/if}
+      {#if user.is_deafened}<span class="mark" title="Deafened"><Icon name="headphones-off" size={small ? 12 : 14} /></span>{/if}
+    </span>
+  </div>
   {#if user.is_screen_sharing && !watched}
     <button
       class="live"
@@ -93,13 +95,40 @@
     color: var(--text-primary);
     cursor: pointer;
     transition: border-color var(--dur-fast), background-color var(--dur-fast);
+    /* Its own stacking context, for the trigger's layer below */
+    isolation: isolate;
   }
 
   .tile:hover {
     background: var(--bg-hover);
   }
 
-  .tile:focus-visible {
+  .who {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: var(--sp-2);
+    min-width: 0;
+    max-width: 100%;
+  }
+
+  /* The whole tile is the trigger, as it was: a layer over the tile's own
+     background and under everything on it, so the name and the marks keep
+     their tooltips and Watch its own click */
+  .who::after {
+    content: "";
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+  }
+
+  /* Keyboard focus rings the tile, not the avatar and name inside it */
+  .who:focus-visible {
+    outline: none;
+  }
+
+  .tile:has(> .who:focus-visible) {
+    outline: 2px solid var(--focus-ring);
     outline-offset: 2px;
   }
 
@@ -193,6 +222,10 @@
     border-radius: var(--r-md);
   }
 
+  .tile.small .who {
+    flex-direction: row;
+  }
+
   .tile.small .avatar {
     width: 32px;
     height: 32px;
@@ -213,8 +246,11 @@
     min-height: 24px;
   }
 
+  /* A finger's size on a phone, the filmstrip's poster too (it is the
+     button for switching to another share while watching one) */
   @media (pointer: coarse) {
-    .live {
+    .live,
+    .tile.small .live {
       min-height: var(--hit);
     }
   }

@@ -3,6 +3,11 @@
   import { startTransmit, stopTransmit, voiceMode } from '../stores/voice';
   import Icon from './Icons.svelte';
 
+  /** One row instead of two, for when the screen is short of room: the
+   *  keyboard is up, or a sheet sits above it. A prop rather than a second
+   *  button, so a press held across the change is the same press. */
+  let { slim = false }: { slim?: boolean } = $props();
+
   let pressing = $state(false);
   /** A press that came with a pointer: its click is the end of a hold, not a toggle. */
   let fromPointer = false;
@@ -23,6 +28,15 @@
     if (!pressing) return;
     pressing = false;
     void stopTransmit();
+  }
+
+  // A press still held when the button goes away is let go (R5-08): the
+  // screen-reader toggle has no pointer release, and an unmount that never
+  // blurs the button (WebKitGTK, Android's WebView may not) left the
+  // microphone open until the next press. Also a switch away from push to
+  // talk mid-press, which removes the button and keeps this component.
+  function letGoOnRemove(_node: HTMLElement) {
+    return { destroy: release };
   }
 
   // Any pointer — finger, stylus, mouse — held, and captured so a thumb that
@@ -63,6 +77,7 @@
 {#if $voiceMode === 'ptt'}
   <button
     class="mobile-ptt"
+    class:slim
     class:pressing
     class:transmitting={$isTransmitting}
     class:disabled={blocked}
@@ -77,8 +92,9 @@
     {onkeydown}
     {onkeyup}
     onblur={release}
+    use:letGoOnRemove
   >
-    <Icon name="mic-on" size={32} />
+    <Icon name="mic-on" size={slim ? 20 : 32} />
     <span aria-hidden="true">{blocked ? 'Unmute to talk' : pressing ? 'Release to stop' : 'Hold to talk'}</span>
   </button>
 {/if}
@@ -102,6 +118,13 @@
     user-select: none;
     -webkit-user-select: none;
     transition: background-color var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
+  }
+
+  .mobile-ptt.slim {
+    flex-direction: row;
+    gap: 8px;
+    min-height: var(--hit);
+    padding: 4px 12px;
   }
 
   .mobile-ptt.pressing,

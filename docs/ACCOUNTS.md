@@ -113,6 +113,13 @@ connections that are already open within that time.
   forgets every remembered one; the device you did it on is remembered again. The
   vault, your identity (and what others pinned of it) and the recovery key stay as
   they were.
+- **Only the recovery key resets the password.** Since 1.3 the recovery key also
+  derives a reset key; the server keeps its public half and checks every reset
+  against it. A remembered device holds the key to your vault, but not this one, so
+  it cannot set a new password. An account made before 1.3 has no reset key until
+  you make a new recovery key (*Your account → Recovery key: New*, with your
+  password, and a code when codes are on; the old recovery key stops working). Until
+  then a device that holds the vault key could reset it, as before 1.3.
 - **A password for this server only.** What the app derives is salted with the id
   the server gives itself, and a server could give itself another server's id:
   with one password on both, it would get what signs you in there. The desktop app

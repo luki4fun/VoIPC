@@ -21,6 +21,9 @@
 // has no CDP, so test-web.sh only runs this in its Chromium lanes.
 
 import { createHmac } from "node:crypto";
+import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const PORT = process.argv[2] ?? "19987";
 const CDP = process.argv[3] ?? "9222";
@@ -1921,10 +1924,11 @@ check(
   }
   await sleep(300);
   check("a right click on a message opens its menu", await ann.evaluate(
-    `[...document.querySelectorAll(".msg-menu [role=menuitem]")].map((b) => b.textContent.trim()).join(",") === "Reply,Reply in thread,Copy text"`),
+    `[...document.querySelectorAll(".msg-menu [role=menuitem]")].map((b) => b.textContent.trim()).join(",") === "React,Reply,Reply in thread,Forward,Pin,Copy text"`),
     await ann.evaluate(`document.querySelector(".msg-menu")?.textContent ?? "no menu"`));
+  // At the pointer, or ending there where there is no room below it
   check("where the pointer is", !!lineAt && (await ann.evaluate(`(() => { const r = document.querySelector(".msg-menu")?.getBoundingClientRect();
-    return !!r && Math.abs(r.left - ${lineAt?.x ?? 0}) < 4 && Math.abs(r.top - ${lineAt?.y ?? 0}) < 4; })()`)),
+    return !!r && Math.abs(r.left - ${lineAt?.x ?? 0}) < 4 && (Math.abs(r.top - ${lineAt?.y ?? 0}) < 4 || Math.abs(r.bottom - ${lineAt?.y ?? 0}) < 4); })()`)),
     await ann.evaluate(`JSON.stringify(document.querySelector(".msg-menu")?.getBoundingClientRect())`) + ` vs ${JSON.stringify(lineAt)}`);
   await ann.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
   await ann.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
@@ -1988,6 +1992,397 @@ check(
   }
 }
 
+// 20. Files (1.3). The rules — the envelope's bounds, sniffing, the preview,
+//     save names, the cache — are unit-tested (envelope.rs, chat-rules,
+//     file-sniff, file-rules) and the transfer has its own lanes (files.rs live
+//     tests, the self-test's FILE_KIB). What only a browser shows is the card:
+//     a preview drawn with nothing fetched, Load drawing what the bytes are,
+//     the original sent as it is, a file that is only ever saved, and the relay
+//     letting go (test-web.sh runs it with cache_mins = 1) followed by a member
+//     sending it again, or by nobody. Before 14, 17 and 18, as 19 is.
+{
+  const n = (process.pid + 11) % 10000;
+  const ROOM = `files-${n}`;
+  const ann = await connect(`ui-fa-${n}`);
+  const ben = await connect(`ui-fb-${n}`);
+  await ann.evaluate(click('button[title="Create channel"]'));
+  await waitFor(ann, `document.querySelector(".create-form")`);
+  await ann.evaluate(setInput(".create-form input[type=text]", ROOM));
+  await ann.evaluate(click(".create-form .create-btn"));
+  await sleep(2000);
+  const enter = (tab) =>
+    tab.evaluate(
+      `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(ROOM)});
+         if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
+    );
+  await enter(ben);
+  await waitFor(ben, `document.querySelector(".chat-main .input-bar .chat-input")`).catch(() => {});
+  await sleep(1500);
+
+  const say = (tab, text) =>
+    tab.evaluate(`(() => { const input = document.querySelector(".chat-main .input-bar .chat-input"); if (!input) return false;
+      input.value = ${JSON.stringify(text)}; input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.closest("form").requestSubmit(); return true; })()`);
+  const rowWith = (text) =>
+    `[...document.querySelectorAll(".chat-main .msg")].find((e) => e.querySelector(".msg-content")?.textContent.includes(${JSON.stringify(text)}))`;
+  /** Stage `make` (code that puts a File in window.__f) through the hidden picker. */
+  const attach = (tab, make) =>
+    tab.evaluate(`(async () => { ${make}; const input = document.querySelector(".chat-main .input-bar .file-picker"); if (!input) return false;
+      const dt = new DataTransfer(); dt.items.add(window.__f); input.files = dt.files;
+      input.dispatchEvent(new Event("change", { bubbles: true })); return true; })()`);
+  const picture = (mime, name) => `const c = document.createElement("canvas"); c.width = 320; c.height = 200; const g = c.getContext("2d");
+    for (let x = 0; x < 320; x += 20) { g.fillStyle = "hsl(" + x + ",70%,50%)"; g.fillRect(x, 0, 20, 200); }
+    const blob = await new Promise((r) => c.toBlob(r, ${JSON.stringify(mime)}, 0.92));
+    window.__f = new File([blob], ${JSON.stringify(name)}, { type: blob.type });`;
+  const text = (name, body, type = "text/plain") =>
+    `window.__f = new File([${JSON.stringify(body)}], ${JSON.stringify(name)}, { type: ${JSON.stringify(type)} });`;
+  /** Press a card's button by its words. */
+  const press = (tab, rowText, words) =>
+    tab.evaluate(`(() => { const b = [...(${rowWith(rowText)})?.querySelectorAll(".file-card button") ?? []].find((e) => e.textContent.trim().startsWith(${JSON.stringify(words)}));
+      if (!b) return false; b.click(); return true; })()`);
+  const fetched = (tab) => tab.evaluate(`performance.getEntriesByType("resource").filter((e) => e.name.includes("/f/v1/")).length`);
+  /** A cheap hash of what an image shows, decoded where it is. */
+  const pixels = (source) => `(async () => { const src = ${source}; if (!src) return null;
+    const bmp = await createImageBitmap(src); const c = document.createElement("canvas"); c.width = bmp.width; c.height = bmp.height;
+    const g = c.getContext("2d"); g.drawImage(bmp, 0, 0); const d = g.getImageData(0, 0, c.width, c.height).data;
+    let h = 2166136261; for (let i = 0; i < d.length; i++) { h ^= d[i]; h = Math.imul(h, 16777619) >>> 0; } return c.width + "x" + c.height + ":" + h; })()`;
+
+  check("the composer offers attaching where the relay keeps files",
+    await ann.evaluate(`!!document.querySelector(".chat-main .input-bar .file-picker")`));
+
+  // ── A photo, compressed by default ──
+  await attach(ann, picture("image/jpeg", "photo.jpg"));
+  await waitFor(ann, `document.querySelector(".file-chip .chip-mode")`, 5_000).catch(() => {});
+  check("a photo is staged as a chip, compressed, with the original one press away", await ann.evaluate(
+    `(() => { const m = document.querySelector(".file-chip .chip-mode"); return !!m && m.textContent.trim() === "Original (1:1)" && m.getAttribute("aria-pressed") === "false"; })()`));
+  await say(ann, "look at this");
+  const arrived = await waitFor(ben, `${rowWith("look at this")}?.querySelector(".file-card")`, 20_000).then(() => true, () => false);
+  check("the file's message arrives with its card", arrived);
+  check("the card shows the preview's pixels, with nothing fetched", await ben.evaluate(
+    `!!${rowWith("look at this")}?.querySelector(".file-card canvas") && !${rowWith("look at this")}?.querySelector(".file-card img")`) &&
+    (await fetched(ben)) === 0);
+  check("a compressed photo goes as WebP", await ben.evaluate(`${rowWith("look at this")}?.querySelector(".file-name")?.textContent.endsWith(".webp")`));
+  await press(ben, "look at this", "Load");
+  const drawn = await waitFor(ben, `${rowWith("look at this")}?.querySelector(".file-card img")?.naturalWidth > 0`, 20_000).then(() => true, () => false);
+  check("Load fetches it and draws what its bytes are", drawn && (await fetched(ben)) > 0);
+  await ben.evaluate(`${rowWith("look at this")}?.querySelector(".file-card .file-media")?.click()`);
+  check("a loaded picture opens big", await waitFor(ben, `document.querySelector(".lightbox img")`, 5_000).then(() => true, () => false));
+  await ben.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await ben.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await sleep(300);
+  check("and Escape closes it", !(await ben.evaluate(`!!document.querySelector(".lightbox")`)));
+
+  // ── The original, exactly ──
+  await attach(ann, picture("image/jpeg", "orig.jpg"));
+  await waitFor(ann, `document.querySelector(".file-chip .chip-mode")`, 5_000).catch(() => {});
+  await ann.evaluate(`document.querySelector(".file-chip .chip-mode")?.click()`);
+  const sent = await ann.evaluate(pixels("window.__f"));
+  await say(ann, "the original");
+  await waitFor(ben, `${rowWith("the original")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  await press(ben, "the original", "Load");
+  await waitFor(ben, `${rowWith("the original")}?.querySelector(".file-card img")?.naturalWidth > 0`, 20_000).catch(() => {});
+  const got = await ben.evaluate(pixels(`${rowWith("the original")}?.querySelector(".file-card img")`));
+  check("the original goes as it is: its name, its size, its very pixels", sent !== null && got === sent &&
+    (await ben.evaluate(`${rowWith("the original")}?.querySelector(".file-name")?.textContent === "orig.jpg"`)), `${sent} vs ${got}`);
+
+  // ── A text file: deflated, saved byte for byte ──
+  const dir = mkdtempSync(join(tmpdir(), "voipc-ui-files-"));
+  await ann.send("Page.setDownloadBehavior", { behavior: "allow", downloadPath: dir });
+  const notes = "a line of somebody's notes, again and again\n".repeat(500);
+  await attach(ben, text("notes.txt", notes));
+  await say(ben, "my notes");
+  await waitFor(ann, `${rowWith("my notes")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  check("a file that is not a picture gets a plain card, with no Load", await ann.evaluate(
+    `(() => { const c = ${rowWith("my notes")}?.querySelector(".file-card"); return !!c && !c.classList.contains("media") &&
+       ![...c.querySelectorAll("button")].some((b) => b.textContent.includes("Load")); })()`));
+  await press(ann, "my notes", "Download");
+  let saved = null;
+  for (let i = 0; i < 60 && saved === null; i++) {
+    await sleep(250);
+    const done = readdirSync(dir).find((f) => f === "notes.txt");
+    if (done) saved = readFileSync(join(dir, done), "utf8");
+  }
+  check("a text file arrives byte for byte, under its own name", saved === notes, saved === null ? `nothing in ${dir}: ${readdirSync(dir)}` : `${saved.length} chars`);
+
+  // ── What its bytes are decides, never what it claims ──
+  // An SVG with a script, claimed as a PNG picture: it gets a picture's card
+  // and Load, and loaded, its bytes say it is no picture
+  await attach(ben, text("pic.png", "<svg xmlns='http://www.w3.org/2000/svg' onload='window.__ran=1'><script>window.__ran=1</script></svg>", "image/png"));
+  await say(ben, "a picture, it says");
+  await waitFor(ann, `${rowWith("a picture, it says")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  await press(ann, "a picture, it says", "Load");
+  const refused = await waitFor(ann, `${rowWith("a picture, it says")}?.querySelector(".file-note")`, 20_000).then(() => true, () => false);
+  check("a page claimed as a picture is loaded, then never shown, only offered to save", refused && (await ann.evaluate(
+    `(() => { const c = ${rowWith("a picture, it says")}?.querySelector(".file-card"); return !!c && !c.querySelector("img, iframe, object, embed, video, svg:not(.icon)") && !window.__ran; })()`)));
+
+  // ── Settings → Files: what the chat names, and what this tab keeps ──
+  const fmRow = (name) => `[...document.querySelectorAll(".fm-row")].find((r) => r.querySelector(".fm-name")?.textContent === ${JSON.stringify(name)})`;
+  const fmNames = (tab) => tab.evaluate(`[...document.querySelectorAll(".fm-row .fm-name")].map((e) => e.textContent).sort().join(",")`);
+  const fmShow = (tab, value) => tab.evaluate(`(() => { const s = document.querySelectorAll(".fm-controls select")[0]; s.value = ${JSON.stringify(value)};
+    s.dispatchEvent(new Event("change", { bubbles: true })); return true; })()`);
+  const fmPress = (tab, name, words) => tab.evaluate(`(() => { const b = [...(${fmRow(name)})?.querySelectorAll(".fm-actions button") ?? []].find((e) => e.textContent.trim() === ${JSON.stringify(words)});
+    if (!b) return false; b.click(); return true; })()`);
+  const usedNow = (tab) => tab.evaluate(`document.querySelector(".fm-usage .num")?.textContent ?? ""`);
+  // From another conversation, so going to a message has to open its own
+  await ann.evaluate(`[...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === "lobby-chat")
+    ?.dispatchEvent(new MouseEvent("click", { bubbles: true }))`);
+  await sleep(600);
+  const away = !(await ann.evaluate(`!!${rowWith("the original")}`));
+  await realClick(ann, ".settings-btn");
+  await waitFor(ann, `document.querySelector(".tab")`, 8_000);
+  await ann.evaluate(`[...document.querySelectorAll(".tab")].find((b) => b.textContent.trim() === "Files")?.click()`);
+  const listed = await waitFor(ann, `${fmRow("notes.txt")}`, 8_000).then(() => true, () => false);
+  const everything = await fmNames(ann);
+  check("Settings → Files lists every file the chat here names", listed && ["orig.jpg", "notes.txt", "pic.png"].every((f) => everything.includes(f)) &&
+    /\.webp/.test(everything), everything);
+  await sleep(1500);
+  const before = await usedNow(ann);
+  await fmShow(ann, "local");
+  await sleep(200);
+  check("with what this tab keeps of them: the files it sent and loaded", (await fmNames(ann)) === everything && !before.startsWith("0 B"), `${await fmNames(ann)} · ${before}`);
+  await fmShow(ann, "other");
+  await sleep(200);
+  check("filtered by type, from what the message says", (await fmNames(ann)) === "notes.txt", await fmNames(ann));
+  await fmShow(ann, "all");
+  await sleep(200);
+  await fmPress(ann, "notes.txt", "Remove copy");
+  const removed = await waitFor(ann, `!${fmRow("notes.txt")}?.querySelector(".fm-local")`, 5_000).then(() => true, () => false);
+  check("Remove copy takes a file off this tab, and the space it took", removed && (await usedNow(ann)) !== before, `${before} → ${await usedNow(ann)}`);
+  const fetchedBefore = await fetched(ann);
+  await fmPress(ann, "orig.jpg", "Show");
+  await waitFor(ann, `${fmRow("orig.jpg")}?.querySelector(".file-card")`, 5_000).catch(() => {});
+  await ann.evaluate(`[...(${fmRow("orig.jpg")})?.querySelectorAll(".file-card button") ?? []].find((b) => b.textContent.trim() === "Load")?.click()`);
+  const local = await waitFor(ann, `${fmRow("orig.jpg")}?.querySelector(".file-card img")?.naturalWidth > 0`, 10_000).then(() => true, () => false);
+  check("a row opens the chat's card, and Load draws it from this tab's copy", local && (await fetched(ann)) === fetchedBefore);
+  await fmPress(ann, "orig.jpg", "Go to message");
+  const closed = await waitFor(ann, `!document.querySelector(".fm-row")`, 5_000).then(() => true, () => false);
+  await sleep(800);
+  check("Go to message closes Settings, opens its conversation and brings the message into view", away && closed && (await ann.evaluate(
+    `(() => { const r = ${rowWith("the original")}; const a = document.activeElement; return !!r && !!a && (r === a || r.contains(a) || a.contains(r)); })()`)),
+    await ann.evaluate(`document.activeElement?.className ?? "nothing"`));
+
+  // ── The relay lets go; a member sends it again, or nobody can ──
+  await attach(ben, picture("image/png", "gone.png"));
+  await say(ben, "nobody else has this one");
+  await waitFor(ann, `${rowWith("nobody else has this one")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  // ben leaves, the only one holding gone.png; ann still holds her photo
+  await ben.send("Page.navigate", { url: "about:blank" });
+  console.log("waiting 70 s for the relay to let go of the files (cache_mins = 1)…");
+  await sleep(70_000);
+  const cat = await connect(`ui-fc-${n}`);
+  await enter(cat);
+  // The two messages come to cat as ann's copy of the channel's history
+  const history = await waitFor(cat, `${rowWith("look at this")}?.querySelector(".file-card") && ${rowWith("nobody else has this one")}?.querySelector(".file-card")`, 30_000).then(() => true, () => false);
+  check("files come with the channel's history to someone who joins later", history);
+  await press(cat, "look at this", "Load");
+  await press(cat, "nobody else has this one", "Load");
+  const reseeded = await waitFor(cat, `${rowWith("look at this")}?.querySelector(".file-card img")?.naturalWidth > 0`, 45_000).then(() => true, () => false);
+  check("once the relay let go of it, a member who holds it sends it again", reseeded,
+    await cat.evaluate(`${rowWith("look at this")}?.querySelector(".file-card")?.textContent ?? "no card"`));
+  check("while nobody has answered, the card says it is asking", await cat.evaluate(
+    `${rowWith("nobody else has this one")}?.querySelector(".file-card")?.textContent.includes("Asking members")`));
+  const unavailable = await waitFor(cat, `${rowWith("nobody else has this one")}?.querySelector(".file-error")?.textContent.includes("Nobody online has this file")`, 90_000).then(() => true, () => false);
+  check("and with its only holder gone, it says nobody online has it", unavailable,
+    await cat.evaluate(`${rowWith("nobody else has this one")}?.querySelector(".file-card")?.textContent ?? "no card"`));
+
+  for (const [who, tab] of [["sender", ann], ["receiver", ben], ["late joiner", cat]]) {
+    const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));
+    check(`the files lane's ${who} threw nothing`, fatal.length === 0, fatal.slice(0, 2).join(" | "));
+  }
+}
+
+// 21. Edit, delete, reactions, pins and forward (1.3). The rules — who may
+//     edit, delete or pin, latest-wins reactions, the tombstone a hand-off
+//     cannot undo — are unit-tested (chat-rules, channel-post-rules,
+//     envelope.rs, sync.rs). What only a browser shows is each one going round
+//     the relay and back, drawn where the other person reads, and a forwarded
+//     file loading in a conversation it was never sent to. Before 14, 17 and
+//     18, as 19 and 20 are.
+{
+  const n = (process.pid + 13) % 10000;
+  const ROOM = `events-${n}`;
+  // ann creates the channel, so she manages it; ben is a member
+  const ann = await connect(`ui-ea-${n}`);
+  const ben = await connect(`ui-eb-${n}`);
+  await ann.evaluate(click('button[title="Create channel"]'));
+  await waitFor(ann, `document.querySelector(".create-form")`);
+  await ann.evaluate(setInput(".create-form input[type=text]", ROOM));
+  await ann.evaluate(click(".create-form .create-btn"));
+  await sleep(2000);
+  const openChannel = (tab, name, how = "click") => tab.evaluate(
+    `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(name)});
+       if (!el) return false; el.dispatchEvent(new MouseEvent(${JSON.stringify(how)}, { bubbles: true })); return true; })()`);
+  await openChannel(ben, ROOM, "dblclick");
+  await waitFor(ben, `document.querySelector(".chat-main .input-bar .chat-input")`).catch(() => {});
+  await sleep(1500);
+
+  const say = (tab, text) =>
+    tab.evaluate(`(() => { const input = document.querySelector(".chat-main .input-bar .chat-input"); if (!input) return false;
+      input.value = ${JSON.stringify(text)}; input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.closest("form").requestSubmit(); return true; })()`);
+  const rowWith = (text) =>
+    `[...document.querySelectorAll(".chat-main .msg")].find((e) => e.querySelector(".msg-content")?.textContent.includes(${JSON.stringify(text)}))`;
+  const arrived = (tab, text) => waitFor(tab, rowWith(text), 10_000).then(() => true, () => false);
+  const gone = (tab, text) => waitFor(tab, `!${rowWith(text)}`, 10_000).then(() => true, () => false);
+  /** A real pointer onto the row, then onto its tool `label`. */
+  const useTool = async (tab, text, label) => {
+    const at = (sel) => tab.evaluate(`(() => { const row = ${rowWith(text)}; const el = ${sel}; if (!el) return null;
+      el.scrollIntoView({ block: "center" }); const r = el.getBoundingClientRect(); if (r.width === 0) return null;
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })()`);
+    const move = (p) => tab.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y, buttons: 0 });
+    const rowAt = await at("row");
+    if (!rowAt) return false;
+    await move(rowAt);
+    await sleep(150);
+    const btn = await at(`row?.querySelector('.msg-tools button[aria-label=${JSON.stringify(label)}]')`);
+    if (!btn) return false;
+    await move(btn);
+    for (const type of ["mousePressed", "mouseReleased"]) {
+      await tab.send("Input.dispatchMouseEvent", { type, x: btn.x, y: btn.y, button: "left", clickCount: 1, buttons: 1 });
+    }
+    await sleep(300);
+    return true;
+  };
+  const menuItems = (tab) => tab.evaluate(`[...document.querySelectorAll(".msg-menu [role=menuitem]")].map((b) => b.textContent.trim()).join(",")`);
+  const pressItem = (tab, words) => tab.evaluate(`(() => { const b = [...document.querySelectorAll(".msg-menu [role=menuitem]")].find((e) => e.textContent.trim() === ${JSON.stringify(words)});
+    if (!b) return false; b.click(); return true; })()`);
+  const enter = async (tab) => {
+    await tab.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" });
+    await tab.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  };
+
+  // ── A reaction, and taking it back ──
+  await say(ann, "react to this one");
+  await arrived(ben, "react to this one");
+  const picked = (await useTool(ben, "react to this one", "React")) &&
+    (await waitFor(ben, `document.querySelector(".react-picker")`, 3_000).then(() => true, () => false));
+  check("React opens the emoji picker, reached with a real pointer", picked);
+  await ben.evaluate(`document.querySelector('.react-picker button[aria-label="React with 👍"]')?.click()`);
+  const chip = (tab) => `${rowWith("react to this one")}?.querySelector(".reaction")`;
+  check("a reaction arrives as a chip under the message, with its count",
+    await waitFor(ann, `${chip(ann)}?.textContent === "👍1"`, 10_000).then(() => true, () => false),
+    await ann.evaluate(`${chip(ann)}?.outerHTML ?? "no chip"`));
+  check("and the reactor's own chip is pressed", await ben.evaluate(`${chip(ben)}?.getAttribute("aria-pressed") === "true"`));
+  check("which names who reacted", await ann.evaluate(`${chip(ann)}?.title === "ui-eb-${n}"`), await ann.evaluate(`${chip(ann)}?.title ?? ""`));
+  await ben.evaluate(`${chip(ben)}?.click()`);
+  check("pressing your own chip takes the reaction back, for everyone",
+    await waitFor(ann, `!${chip(ann)}`, 10_000).then(() => true, () => false));
+  // The menu's React too (a long press on a phone): it once read the message
+  // after the menu had let go of it, threw, and opened nothing
+  const before = ben.errors.length;
+  await useTool(ben, "react to this one", "More");
+  await pressItem(ben, "React");
+  check("React from the message menu opens the picker too",
+    (await waitFor(ben, `document.querySelector(".react-picker")`, 3_000).then(() => true, () => false)) && ben.errors.length === before,
+    ben.errors.slice(before, before + 2).join(" | "));
+  for (const type of ["keyDown", "keyUp"]) {
+    await ben.send("Input.dispatchKeyEvent", { type, key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  }
+  await sleep(300);
+
+  // Send with a real pointer leaves the focus in the box: on a phone a focus
+  // move dropped the keyboard, the shell reflowed, and the tap missed Send
+  await ben.evaluate(`(() => { const input = document.querySelector(".chat-main .input-bar .chat-input"); input.focus();
+    input.value = "sent by a tap"; input.dispatchEvent(new Event("input", { bubbles: true })); })()`);
+  await sleep(200);
+  const tapped = await realClick(ben, ".chat-main .input-bar .send-btn");
+  check("a tap on Send sends, and the text field keeps the focus",
+    tapped && (await arrived(ann, "sent by a tap")) &&
+      (await ben.evaluate(`document.activeElement?.classList.contains("chat-input") ?? false`)),
+    await ben.evaluate(`document.activeElement?.className ?? "none"`));
+
+  // ── An edit: only your own, marked as edited ──
+  await say(ann, "a typo hree");
+  await arrived(ben, "a typo hree");
+  check("someone else's message has no Edit", !(await useTool(ben, "a typo hree", "Edit")));
+  check("your own does, and it opens a box with the text", (await useTool(ann, "a typo hree", "Edit")) &&
+    (await ann.evaluate(`document.querySelector(".chat-main .edit-input")?.value === "a typo hree"`)));
+  await ann.evaluate(`(() => { const t = document.querySelector(".chat-main .edit-input"); t.value = "a typo here"; t.dispatchEvent(new Event("input", { bubbles: true })); t.focus(); })()`);
+  await enter(ann);
+  check("Enter saves the edit, and the box goes", await waitFor(ann, `!document.querySelector(".chat-main .edit-input") && !!${rowWith("a typo here")}`, 5_000).then(() => true, () => false));
+  check("the edit reaches the reader, marked (edited), in place of the old text",
+    (await waitFor(ben, `${rowWith("a typo here")}?.querySelector(".edited")`, 10_000).then(() => true, () => false)) && !(await ben.evaluate(`!!${rowWith("hree")}`)));
+
+  // ── A delete: confirmed first, then gone for everyone ──
+  await say(ann, "delete me soon");
+  await arrived(ben, "delete me soon");
+  await useTool(ben, "delete me soon", "More");
+  check("someone else's message offers no Delete, and a member no Pin", !/Delete|Pin/.test(await menuItems(ben)), await menuItems(ben));
+  await ben.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await ben.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await sleep(200);
+  await useTool(ann, "delete me soon", "More");
+  check("your own message's menu has Edit and Delete, and a manager's has Pin",
+    (await menuItems(ann)) === "React,Reply,Reply in thread,Forward,Edit,Pin,Copy text,Delete", await menuItems(ann));
+  await pressItem(ann, "Delete");
+  const asked = await waitFor(ann, `document.querySelector(".confirm .btn-danger")`, 3_000).then(() => true, () => false);
+  check("Delete asks first", asked);
+  await ann.evaluate(`document.querySelector(".confirm .btn-danger")?.click()`);
+  check("then the message goes, here and for the reader", (await gone(ann, "delete me soon")) && (await gone(ben, "delete me soon")));
+
+  // ── A pin, by the channel's manager, listed in the header ──
+  await useTool(ann, "react to this one", "More");
+  await pressItem(ann, "Pin");
+  check("a manager's pin reaches the reader: marked, and counted in the header",
+    await waitFor(ben, `!!${rowWith("react to this one")}?.querySelector(".pinned-tag") && document.querySelector(".chat-header .pins-btn")?.textContent.trim() === "1"`, 10_000)
+      .then(() => true, () => false));
+  await ben.evaluate(`document.querySelector(".chat-header .pins-btn")?.click()`);
+  await sleep(200);
+  check("the header lists what is pinned", await ben.evaluate(
+    `[...document.querySelectorAll(".pins-menu .pin-row")].some((b) => b.textContent.includes("react to this one"))`));
+  await ben.evaluate(`[...document.querySelectorAll(".pins-menu .pin-row")].find((b) => b.textContent.includes("react to this one"))?.click()`);
+  await sleep(500);
+  check("and a pin leads to its message", await ben.evaluate(`${rowWith("react to this one")}?.classList.contains("flash") ?? false`));
+
+  // ── Someone who joins later: the edit comes with the history, the delete never ──
+  const cy = await connect(`ui-ec-${n}`);
+  await openChannel(cy, ROOM, "dblclick");
+  const handed = await waitFor(cy, `${rowWith("a typo here")}`, 30_000).then(() => true, () => false);
+  check("history hands on the edited text, marked edited", handed && (await cy.evaluate(`!!${rowWith("a typo here")}?.querySelector(".edited")`)));
+  check("and never a deleted message", handed && !(await cy.evaluate(`!!${rowWith("delete me soon")}`)));
+
+  // ── Forward: a file, as it is, to a conversation it was never in ──
+  const dir = mkdtempSync(join(tmpdir(), "voipc-ui-fwd-"));
+  await cy.send("Page.setDownloadBehavior", { behavior: "allow", downloadPath: dir });
+  const body = "forwarded words, kept as they are\n".repeat(40);
+  await ann.evaluate(`(async () => { window.__f = new File([${JSON.stringify(body)}], "fwd.txt", { type: "text/plain" });
+    const input = document.querySelector(".chat-main .input-bar .file-picker"); if (!input) return false;
+    const dt = new DataTransfer(); dt.items.add(window.__f); input.files = dt.files;
+    input.dispatchEvent(new Event("change", { bubbles: true })); return true; })()`);
+  await say(ann, "pass this on");
+  await waitFor(ben, `${rowWith("pass this on")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  await useTool(ben, "pass this on", "More");
+  await pressItem(ben, "Forward");
+  const offered = await waitFor(ben, `[...document.querySelectorAll(".forward-dialog .forward-dest")].some((b) => b.textContent.includes("#lobby-chat"))`, 3_000)
+    .then(() => true, () => false);
+  check("Forward offers the conversations one may write in", offered);
+  await ben.evaluate(`[...document.querySelectorAll(".forward-dialog .forward-dest")].find((b) => b.textContent.includes("#lobby-chat"))?.click()`);
+  await openChannel(cy, "lobby-chat");
+  const there = await waitFor(cy, `${rowWith("pass this on")}?.querySelector(".file-card")`, 30_000).then(() => true, () => false);
+  check("the forward arrives as the forwarder's message, labelled with who wrote it first", there && (await cy.evaluate(
+    `${rowWith("pass this on")}?.querySelector(".fwd-label")?.textContent.includes("ui-ea-${n}") && ${rowWith("pass this on")}?.querySelector(".msg-username")?.textContent.startsWith("ui-eb-")`)),
+    await cy.evaluate(`${rowWith("pass this on")}?.textContent.slice(0, 200) ?? "no row"`));
+  // Nobody who holds it is left to send it again: the relay's own copy,
+  // posted for lobby-chat by the forward, is the only way it loads there
+  const fatalOf = (tab) => tab.errors.filter((e) => !/Failed to load resource/.test(e));
+  const [annFatal, benFatal] = [fatalOf(ann), fatalOf(ben)];
+  await ann.send("Page.navigate", { url: "about:blank" });
+  await ben.send("Page.navigate", { url: "about:blank" });
+  await sleep(1500);
+  await cy.evaluate(`[...(${rowWith("pass this on")})?.querySelectorAll(".file-card button") ?? []].find((b) => b.textContent.trim().startsWith("Download"))?.click()`);
+  let saved = null;
+  for (let i = 0; i < 80 && saved === null; i++) {
+    await sleep(250);
+    if (readdirSync(dir).includes("fwd.txt")) saved = readFileSync(join(dir, "fwd.txt"), "utf8");
+  }
+  check("its file loads there, byte for byte, with its senders gone: posted for that conversation too", saved === body,
+    saved === null ? await cy.evaluate(`${rowWith("pass this on")}?.querySelector(".file-card")?.textContent ?? "no card"`) : `${saved.length} chars`);
+
+  for (const [who, fatal] of [["writer", annFatal], ["reader", benFatal], ["late joiner", fatalOf(cy)]]) {
+    check(`the events lane's ${who} threw nothing`, fatal.length === 0, fatal.slice(0, 2).join(" | "));
+  }
+}
+
 // 14. Several servers at once. The rail's "+" used to disconnect you to bring
 //     up the connect dialog; now it adds a connection beside the others, a
 //     click on the rail only changes what is on screen, and voice follows the
@@ -2009,14 +2404,19 @@ if (PORT2) {
     const row = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(name)});
     return row ? row.classList.contains("active") : null; })()`);
 
-  // In a call on server 1 first, so there is something for server 2 to keep
-  await alice.evaluate(
-    `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(CHANNEL)});
-       if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
-  );
+  // In a call on server 1 first, so there is something for server 2 to keep.
+  // A room of its own: CHANNEL has stood empty since section 8, and the relay
+  // deletes an empty channel after 300 s, which the sections before this one
+  // now take longer than. The creator is seated in it at once.
+  const HOME = `home-${process.pid % 10000}`;
+  await alice.evaluate(click('button[title="Create channel"]'));
+  await waitFor(alice, `document.querySelector(".create-form")`);
+  await alice.evaluate(setInput(".create-form input[type=text]", HOME));
+  await alice.evaluate(click(".create-form .create-btn"));
+  await sleep(2500);
   // bob joins her there, so he can witness her leaving it
   await bob.evaluate(
-    `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(CHANNEL)});
+    `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(HOME)});
        if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
   );
   await sleep(1500);
@@ -2040,14 +2440,14 @@ if (PORT2) {
   await sleep(800);
   check("the second server opens beside the first", JSON.stringify(await openIds()) === JSON.stringify([S1, S2]), JSON.stringify(await openIds()));
   check("and it is the one on screen", (await onScreen()) === S2, await onScreen());
-  check("its channel list is its own", !(await alice.evaluate(channelNames)).includes(CHANNEL));
+  check("its channel list is its own", !(await alice.evaluate(channelNames)).includes(HOME));
   check("the call on server 1 carried on", /in voice/.test(await railTitle(S1)), await railTitle(S1));
   check("and the voice bar still offers to leave it", await alice.evaluate(`!!document.querySelector(".leave-voice-btn")`));
 
   await realClick(alice, railItem(S1));
   await sleep(800);
-  check("the rail brings server 1 back", (await onScreen()) === S1 && (await alice.evaluate(channelNames)).includes(CHANNEL));
-  check("still standing in the same channel", (await voiceRowActive(CHANNEL)) === true);
+  check("the rail brings server 1 back", (await onScreen()) === S1 && (await alice.evaluate(channelNames)).includes(HOME));
+  check("still standing in the same channel", (await voiceRowActive(HOME)) === true);
 
   // Voice follows the last join: a room on server 2 ends the call on server 1
   await realClick(alice, railItem(S2));
@@ -2115,7 +2515,7 @@ if (PORT2) {
     opened.length === 2 && opened.every(([, t]) => /connected/.test(t)),
     JSON.stringify(opened),
   );
-  check("and the one on screen shows its channels", (await boot.evaluate(channelNames)).includes(CHANNEL));
+  check("and the one on screen shows its channels", (await boot.evaluate(channelNames)).includes(HOME));
   const bootFatal = boot.errors.filter((e) => !/Failed to load resource/.test(e));
   check("with nothing thrown on the way", bootFatal.length === 0, bootFatal.slice(0, 2).join(" | "));
 } else {

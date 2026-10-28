@@ -55,3 +55,10 @@ test("an excerpt shows the text as written, with the matches marked", () => {
   assert.ok(cut.some((p) => p.hit && p.v === "needle"));
   assert.equal(cut.at(-1)?.v, "…");
 });
+
+test("a file is found by its name", () => {
+  const f = m("", 1, { file: { hash: "a".repeat(64), key: "b".repeat(64), size: 1, z: false, name: "Tax-Return_2026.pdf" } });
+  assert.equal(searchMessages([{ conv: 1, messages: [f] }], "tax return").length, 1);
+  assert.equal(searchMessages([{ conv: 1, messages: [f] }], "2026.pdf").length, 1);
+  assert.equal(searchMessages([{ conv: 1, messages: [f] }], "invoice").length, 0);
+});

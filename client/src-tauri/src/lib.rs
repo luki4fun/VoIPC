@@ -8,6 +8,7 @@ mod app_state;
 mod commands;
 mod config;
 mod crypto;
+mod files;
 mod global_keys;
 mod mumblelink;
 mod network;
@@ -121,6 +122,12 @@ pub fn run() {
 
             // Load persistent config
             let mut cfg = config::load_config();
+            // No archive keeps the keys to what the file cache holds
+            if cfg.chat_history_disabled {
+                files::cache_wipe();
+            }
+            #[cfg(target_os = "android")]
+            files::save_out_wipe();
 
             // Auto-migrate: if user has an existing file at the default path but no
             // chat_history_path configured, persist the default path into the config.
@@ -380,6 +387,17 @@ pub fn run() {
             commands::decline_invite,
             commands::send_channel_message,
             commands::send_direct_message,
+            files::send_file,
+            files::fetch_file,
+            files::cancel_file,
+            files::file_stage,
+            files::reseed_file,
+            files::forward_file,
+            files::file_cache_list,
+            files::file_cache_retain,
+            files::file_cache_remove,
+            files::set_file_cache_mb,
+            files::save_file,
             commands::set_history_sharing,
             commands::request_channel_history,
             commands::start_transmit,

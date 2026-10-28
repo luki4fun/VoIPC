@@ -306,6 +306,9 @@
       },
       "23": {
         "AccountDeleted": "UNIT"
+      },
+      "24": {
+        "RecoveryKeyChanged": "UNIT"
       }
     }
   },
@@ -553,6 +556,37 @@
             }
           ]
         }
+      },
+      "18": {
+        "RecoveryKeyNew": {
+          "STRUCT": [
+            {
+              "secret": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "recovery_slot": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "reset_key": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "totp": {
+                "OPTION": "STR"
+              }
+            },
+            {
+              "recovery_code": {
+                "OPTION": "STR"
+              }
+            }
+          ]
+        }
       }
     }
   },
@@ -678,6 +712,11 @@
           "STRUCT": [
             {
               "signature": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "key_signature": {
                 "SEQ": "U8"
               }
             },
@@ -2419,6 +2458,9 @@
                   "SIZE": 32
                 }
               }
+            },
+            {
+              "code": "U16"
             },
             {
               "reason": "STR"

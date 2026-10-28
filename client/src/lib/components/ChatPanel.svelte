@@ -18,17 +18,21 @@
   import { channels } from "../stores/channels.js";
   import { uiPrefs } from "../stores/ui-prefs.js";
   import { serverAddress, serverKey, userId, username } from "../stores/connection.js";
-  import { openServers } from "../stores/servers.js";
   import { addNotification } from "../stores/notifications.js";
   import { confirmAction } from "../stores/confirm.js";
   import { get } from "svelte/store";
   import { account, accountHex } from "../stores/account.js";
   import { users } from "../stores/users.js";
-  import { expiryFor, messageRefs } from "../chat-rules.js";
+  import { expiryFor, messageRefs, pinnedOf, rowKey, sameRow, splitChatKey, type ChatPlace } from "../chat-rules.js";
   import { threadView } from "../thread-rules.js";
-  import type { ChatMessage } from "../types.js";
+  import type { ChatEvent, ChatMessage, FileConv, FileRef, Forwarded } from "../types.js";
+  import { fetchFile, fileLimits, sendFile } from "../files.js";
+  import { plainText } from "../markdown.js";
+  import { prepare } from "../image-prep.js";
+  import { sealedLen } from "../file-rules.js";
   import {
     addDmMessage,
+    applyDmEvent,
     dmConversations,
     activeDmUserId,
     activeDmUsername,
@@ -44,7 +48,6 @@
     newMessagesAt,
     channelMessages,
     dmMessages,
-    openDm,
   } from "../stores/chat.js";
   import {
     channelMessageTtl,
@@ -57,16 +60,18 @@
     leftTextChannelNames,
     me,
     notePost,
-    selectChannel,
+    messageJump,
+    showMessage,
     nsfwConsented,
     setDmMessageTtl,
   } from "../stores/channel-ui.js";
   import { canManage, needsNsfwConsent, postBlock, slowModeLabel } from "../channel-post-rules.js";
+  import { currentChannelId } from "../stores/channels.js";
   import { displayChannelId, isPreviewing, shownMessages } from "../stores/roster.js";
   import { channelRosters } from "../stores/rosters.js";
   import Icon from "./Icons.svelte";
   import Composer from "./chat/Composer.svelte";
-  import MessageList from "./chat/MessageList.svelte";
+  import MessageList, { type MessageActions } from "./chat/MessageList.svelte";
   import ThreadPane from "./chat/ThreadPane.svelte";
   import SearchPane from "./chat/SearchPane.svelte";
   import type { Hit } from "../search-rules.js";
@@ -156,6 +161,8 @@
   // A channel marked 18+ that this server has no consent for: its messages
   // stay hidden behind the question until the user answers it.
   let nsfwGated = $derived(!isDmMode && needsNsfwConsent(effectiveChannel, $nsfwConsented));
+  /** The pane shows a gate, not the conversation: nothing of it opens, threads included. */
+  const gated = $derived(nsfwGated || (!isDmMode && $isPreviewing && isPasswordProtected && !effectiveChannel?.text));
 
   // This server's channels: another server's unread is on its icon in the rail
   let totalUnreadChannels = $derived.by(() => {
@@ -190,12 +197,14 @@
   let threadRoot = $state.raw<ChatMessage | null>(null);
   /** A thread's answers as last seen, by its first message's id, for its unread dot. */
   let threadSeen = $state(new Map<string, number>());
-  let composer = $state<{ focus: () => void } | null>(null);
+  let composer = $state<{ focus: () => void; addFiles: (files: Iterable<File>) => void } | null>(null);
   let mainList = $state<{ jumpTo: (m: ChatMessage) => boolean } | null>(null);
-  /** The thread on screen, while its first message is still here. */
+  /** The thread on screen, while its first message is still here: as it is
+   *  now, which a reaction or an edit may have made a new object of. */
   const openThread = $derived.by(() => {
-    const root = threadRoot;
-    if (!root || !displayMessages.includes(root)) return null;
+    const was = threadRoot;
+    const root = was && !gated ? displayMessages.find((m) => sameRow(m, was)) : undefined;
+    if (!root) return null;
     return { root, answers: view.threads.get(root) ?? [] };
   });
 
@@ -266,21 +275,7 @@
 
   let searching = $state(false);
   let panelEl = $state<HTMLDivElement | null>(null);
-  /** A result in another conversation: shown once that conversation is on screen. */
-  let pendingJump = $state.raw<ChatMessage | null>(null);
-
-  interface Conv {
-    kind: "channel" | "dm";
-    key: string;
-    /** `host:port`, as chat keys carry it. */
-    server: string;
-    name: string;
-  }
-  /** `host:port/name`; a channel name may hold a slash of its own. */
-  function splitChatKey(key: string): { server: string; name: string } | null {
-    const m = /^([^/]+:\d+)\/(.*)$/s.exec(key);
-    return m ? { server: m[1], name: m[2] } : null;
-  }
+  type Conv = ChatPlace;
   const everywhere = $derived.by(() => {
     const out: { conv: Conv; messages: ChatMessage[] }[] = [];
     for (const [kind, map] of [["channel", $channelMessages], ["dm", $dmMessages]] as const) {
@@ -304,41 +299,20 @@
       });
       return;
     }
-    const conv = hit.conv;
-    const server = $openServers.find((s) => serverKey(s) === conv.server);
-    if (!server) {
-      addNotification(`${conv.server} is not connected: connect to read that conversation`, "info");
-      return;
-    }
-    if (server !== $serverAddress) serverAddress.set(server);
-    if (conv.kind === "dm") {
-      const peer =
-        get(dmConversations.peek(server)).find((c) => c.username === conv.name) ??
-        get(users.peek(server)).find((u) => u.username === conv.name);
-      if (!peer) {
-        addNotification(`Your conversation with ${shortName(conv.name)} is not open now`, "info");
-        return;
-      }
-      openDm(server, peer.user_id, peer.username);
-    } else {
-      const channel = get(channels.peek(server)).find((c) => c.name === conv.name);
-      if (!channel) {
-        addNotification(`${conv.name} is not on that server any more`, "info");
-        return;
-      }
-      void selectChannel(channel);
-    }
-    pendingJump = hit.msg;
-    setTimeout(() => (pendingJump = null), 3000);
+    showMessage(hit.conv, hit.msg, thisPane);
   }
 
-  // The conversation a result was in came on screen: go to the result
+  // The conversation of a message to show came on screen (a search result
+  // here, a file in Settings): go to it, once, and only past its gate. A
+  // result found here is this pane's to show, not another one's on screen.
+  const thisPane = Symbol("chat pane");
+  let jumped: { msg: ChatMessage } | null = null;
   $effect(() => {
-    const m = pendingJump;
-    if (!m || !displayMessages.includes(m)) return;
-    pendingJump = null;
+    const jump = $messageJump;
+    if (!jump || jump === jumped || (jump.from && jump.from !== thisPane) || gated || !displayMessages.includes(jump.msg)) return;
+    jumped = jump;
     tick().then(() => {
-      if (!mainList?.jumpTo(m)) showElsewhere(m);
+      if (!mainList?.jumpTo(jump.msg)) showElsewhere(jump.msg);
     });
   });
 
@@ -474,33 +448,89 @@
   }
 
   /**
+   * Where what is written now goes: read once, when sending starts. A file
+   * takes a while to upload, and the conversation on screen may change
+   * meanwhile; its message must still go where its file went.
+   */
+  type Target =
+    | { server: string; dm: { peer: number; name: string; away?: string } }
+    | { server: string; channelId: number };
+  function targetNow(): Target {
+    const server = $serverAddress;
+    if (isDmMode) {
+      const peer = $activeDmUserId ?? 0;
+      const away = peer < 0 ? $dmConversations.find((c) => c.user_id === peer) : undefined;
+      return { server, dm: { peer, name: $activeDmUsername, away: away?.account } };
+    }
+    return { server, channelId: $displayChannelId };
+  }
+
+  /**
+   * The conversation a file is posted in and fetched from, as the relay names
+   * it: a channel by id; a direct one by the other's user id while they are
+   * here under it (ids are handed out again after a restart), else by their
+   * account; null where neither names them.
+   */
+  function fileConvOf(t: Target): FileConv | null {
+    if (!("dm" in t)) return t.channelId ? { channel: t.channelId } : null;
+    const peer = get(users.peek(t.server)).find((u) => u.user_id === t.dm.peer);
+    if (t.dm.peer > 0 && peer) return { direct: t.dm.peer };
+    const acct = t.dm.away ?? (peer?.account ? accountHex(peer.account) : undefined);
+    return acct ? { account: acct } : null;
+  }
+  const fileConv = $derived.by(() => {
+    // Who is here decides how a direct conversation is named
+    void $users;
+    return fileConvOf(targetNow());
+  });
+
+  /**
    * The composer hands over what to send; a held one never gets here. `refs`
    * comes from the thread pane; the main composer's answer is `replyingTo`,
    * which joins the thread of what it answers, if that is in one.
    */
-  async function sendMessage(content: string, refs?: { replyTo: string; thread: string }) {
-    const server = $serverAddress;
+  async function sendMessage(content: string, refs?: { replyTo: string; thread: string }, file?: FileRef) {
     const answering = replyingTo;
     replyingTo = null;
     const replyTo = refs?.replyTo ?? answering?.id ?? null;
     const thread = refs?.thread ?? answering?.thread ?? null;
+    await sendTo(targetNow(), content, replyTo, thread, file);
+  }
 
+  /** Send to `t`; false (and a notice) where it did not go. `more`: a
+   *  forwarded message's label, or the event it is instead of a message;
+   *  `ttlCap`, the most seconds it may live, whatever the conversation says. */
+  async function sendTo(
+    t: Target,
+    content: string,
+    replyTo: string | null,
+    thread: string | null,
+    file?: FileRef,
+    more: { fwd?: Forwarded; event?: ChatEvent; ttlCap?: number } = {},
+  ): Promise<boolean> {
+    const { fwd, event, ttlCap } = more;
+    const capped = (ttl: number) => (ttlCap === undefined ? ttl || null : Math.min(ttl || Infinity, ttlCap));
+    const server = t.server;
     try {
       // The destruction timer this conversation carries, stamped inside the
       // ciphertext so every copy of the message dies at the same moment: the
       // channel's own, or for a direct message the one this user set for that
       // person. Zero is no timer, which the backend reads as none.
-      if (isDmMode) {
-        const ttlSecs = dmMessageTtl(server, $activeDmUsername) || null;
-        const away = ($activeDmUserId ?? 0) < 0 ? $dmConversations.find((c) => c.user_id === $activeDmUserId) : undefined;
-        if (away?.account) {
+      if ("dm" in t) {
+        const ttlSecs = capped(dmMessageTtl(server, t.dm.name));
+        if (t.dm.away) {
           // They are away: the server's copy is the one way it reaches them,
           // and this is our own copy of it.
-          const id = await invoke<string>("send_kept_dm", { server, account: away.account, content, ttlSecs, replyTo, thread });
+          const id = await invoke<string>("send_kept_dm", { server, account: t.dm.away, content, ttlSecs, replyTo, thread, file, fwd, event });
           const own = get(account.peek(server));
           const myId = get(userId.peek(server));
           const now = Date.now();
-          addDmMessage(server, myId, myId, own?.name ?? "", away.user_id, {
+          const by = { user_id: myId, username: own?.name ?? "", account: own ? accountHex(own.info.id) : undefined };
+          if (event) {
+            applyDmEvent(server, myId, myId, by.username, t.dm.peer, { event, by, at: now, content });
+            return true;
+          }
+          addDmMessage(server, myId, myId, own?.name ?? "", t.dm.peer, {
             user_id: myId,
             username: own?.name ?? "",
             content,
@@ -508,13 +538,13 @@
             id,
             account: own ? accountHex(own.info.id) : undefined,
             expires_at: expiryFor(now, ttlSecs, ttlSecs),
-            ...messageRefs({ reply_to: replyTo, thread }),
+            ...messageRefs({ reply_to: replyTo, thread, file, fwd }),
           });
         } else {
-          await invoke("send_direct_message", { server, targetUserId: $activeDmUserId, content, ttlSecs, replyTo, thread });
+          await invoke("send_direct_message", { server, targetUserId: t.dm.peer, content, ttlSecs, replyTo, thread, file, fwd, event });
         }
       } else {
-        const channelId = $displayChannelId;
+        const channelId = t.channelId;
         if (slowModeSecs > 0) {
           notePost(server, channelId);
           now = Date.now();
@@ -524,16 +554,167 @@
           server,
           content,
           channelId,
-          ttlSecs: channelMessageTtl(server, channelId) || null,
+          ttlSecs: capped(channelMessageTtl(server, channelId)),
           replyTo,
           thread,
+          file,
+          fwd,
+          event,
         });
       }
     } catch (e) {
       console.error("Failed to send message:", e);
       addNotification(`Failed to send message: ${e}`, "error");
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * One file, as its own message with `caption`: made ready (a photo made
+   * smaller unless `original`), sealed and stored on the relay (progress under
+   * `op`), then the message, to where it was written. Throws for the composer
+   * to show; `CannotClean` asks the person about sending the original.
+   */
+  async function sendFileMessage(file: File, original: boolean, caption: string, op: string): Promise<void> {
+    const t = targetNow();
+    const conv = fileConvOf(t);
+    if (!conv) throw new Error("Files cannot be sent to them now");
+    const answering = replyingTo;
+    const ready = await prepare(file, original);
+    const max = get(fileLimits.peek(t.server))?.max_bytes;
+    // Deflate may shrink a file; what is compressed already will not
+    if (max && !ready.compress && sealedLen(ready.bytes.length) > max) {
+      throw new Error(`Larger than this server takes (${Math.floor(max / 1_000_000)} MB at most)`);
+    }
+    const blob = await sendFile(t.server, conv, ready.bytes, ready.compress, op);
+    // The answer goes with the first file that goes; a failure keeps it
+    if (replyingTo === answering) replyingTo = null;
+    const { bytes: _, compress: __, ...about } = ready;
+    if (!(await sendTo(t, caption, answering?.id ?? null, answering?.thread ?? null, { ...blob, ...about }))) {
+      throw new Error("Not sent");
     }
   }
+
+  // ── Reactions, edits, deletes, pins, forwards ────────────────────────────
+  //
+  // Each is an event sent into this conversation like a message (an envelope
+  // kind, protocol 13), so whatever stops a post stops it too: the relay
+  // counts it against slow mode and refuses it in an announcement channel.
+  // Who may do what is every reader's to check (chat-rules.ts `applyEvent`).
+
+  /** Send `event` into the conversation on screen. */
+  function sendEvent(event: ChatEvent, content = "") {
+    void sendTo(targetNow(), content, null, null, undefined, { event });
+  }
+
+  /** What the message tools offer here. Forward is not a post here, and
+   *  goes wherever the person may post. */
+  const actions = $derived.by((): MessageActions => {
+    const forward = (m: ChatMessage) => (forwarding = { m, from: fileConv, server: $serverAddress });
+    if (!canAnswer || held) return { forward };
+    return {
+      forward,
+      react: (m, emoji, on) => sendEvent({ kind: "react", target: m.id!, emoji, on }),
+      edit: (m, text) => sendEvent({ kind: "edit", target: m.id! }, text),
+      remove: (m) => sendEvent({ kind: "delete", target: m.id! }),
+      // A pin counts only from a manager, which every reader checks
+      pin: !isDmMode && isManager ? (m, on) => sendEvent({ kind: "pin", target: m.id!, on }) : undefined,
+    };
+  });
+
+  /** The message being forwarded, and where it is fetched from (its file). */
+  let forwarding = $state.raw<{ m: ChatMessage; from: FileConv | null; server: string } | null>(null);
+
+  interface Dest {
+    key: string;
+    label: string;
+    target: Target;
+    /** Why a post would be refused there now. */
+    blocked?: string;
+  }
+
+  /** Where a message can be forwarded on this server: the channels we may
+   *  write in, and our direct conversations. */
+  const destinations = $derived.by((): Dest[] => {
+    if (!forwarding) return [];
+    const server = forwarding.server;
+    const out: Dest[] = [];
+    for (const ch of $channels) {
+      const here = ch.text ? $joinedTextChannelIds.has(ch.channel_id) : ch.channel_id !== 0 && ch.channel_id === $currentChannelId;
+      if (!here) continue;
+      const b = postBlock(ch, canManage(ch, $me), lastPostAt(server, ch.channel_id), Date.now());
+      out.push({
+        key: `c${ch.channel_id}`,
+        label: ch.text ? `#${ch.name}` : ch.name,
+        target: { server, channelId: ch.channel_id },
+        blocked: b?.kind === "announce" ? "Only moderators post here" : b?.kind === "slow" ? `Slow mode: ${slowModeLabel(b.remainingSecs)}` : undefined,
+      });
+    }
+    for (const c of $dmConversations) {
+      const away = c.user_id < 0 ? c.account : undefined;
+      if (c.user_id < 0 && !away) continue;
+      out.push({ key: `d${c.user_id}`, label: `@${shortName(c.username)}`, target: { server, dm: { peer: c.user_id, name: c.username, away } } });
+    }
+    return out;
+  });
+
+  /**
+   * Forward the message as a new one of ours in `d`, labelled with who wrote it
+   * first and when. Its file goes as it is: the same blob and key, posted
+   * there too (`forward_file`), after loading it here if it is not.
+   */
+  async function forwardTo(d: Dest) {
+    const f = forwarding;
+    forwarding = null;
+    if (!f) return;
+    const { m } = f;
+    const fwd = m.fwd ?? { name: m.username, at: m.timestamp };
+    // A copy only ever dies sooner: a forward goes no later than the message
+    // it copies, whatever timer its new conversation has
+    const left = m.expires_at === undefined ? undefined : Math.floor((m.expires_at - Date.now()) / 1000);
+    if (left !== undefined && left < 1) {
+      addNotification("That message's timer has run out", "warning");
+      return;
+    }
+    if (m.file) {
+      try {
+        const to = fileConvOf(d.target);
+        if (!to) throw new Error("files cannot be sent to them now");
+        if (f.from) await fetchFile(f.server, f.from, m.file);
+        await invoke("forward_file", { server: d.target.server, conv: to, hash: m.file.hash });
+      } catch (e) {
+        addNotification(`Could not forward the file: ${e}`, "error");
+        return;
+      }
+    }
+    if (await sendTo(d.target, m.content, null, null, m.file, { fwd, ttlCap: left })) addNotification(`Forwarded to ${d.label}`, "info", 2500);
+  }
+
+  /** A message as one line: a pin's or a forward's. */
+  function oneLine(m: ChatMessage): string {
+    const text = plainText(m.content);
+    return (text.length > 80 ? `${text.slice(0, 80)}…` : text) || m.file?.name || "…";
+  }
+
+  /** The channel's pinned messages, newest pin first. */
+  const pinned = $derived(isDmMode || gated ? [] : pinnedOf(displayMessages));
+  let showPins = $state(false);
+
+  function goToPinned(m: ChatMessage) {
+    showPins = false;
+    tick().then(() => {
+      if (!mainList?.jumpTo(m)) showElsewhere(m);
+    });
+  }
+
+  /** Files dropped on the conversation go to its composer, which stages them. */
+  function dropFiles(e: DragEvent) {
+    if (!e.dataTransfer?.types.includes("Files") || !canSendFiles) return;
+    e.preventDefault();
+    if (e.type === "drop") composer?.addFiles(e.dataTransfer.files);
+  }
+  const canSendFiles = $derived(!!$fileLimits && fileConv !== null);
 
   function backToChannel() {
     closeDm($serverAddress);
@@ -591,12 +772,13 @@
 
 <!-- Any click elsewhere closes the header's pop-ups; Escape closes them too -->
 <svelte:window
-  onclick={() => { showClearMenu = false; showTtlPicker = false; }}
+  onclick={() => { showClearMenu = false; showTtlPicker = false; showPins = false; }}
   onkeydown={(e) => {
     onWindowKeydown(e);
-    if (e.key === "Escape" && (showClearMenu || showTtlPicker)) {
+    if (e.key === "Escape" && (showClearMenu || showTtlPicker || showPins)) {
       showClearMenu = false;
       showTtlPicker = false;
+      showPins = false;
     }
   }}
 />
@@ -678,6 +860,26 @@
         </div>
       {/if}
     {/if}
+    {#if pinned.length > 0}
+      <button
+        class="clear-chat-btn pins-btn"
+        onclick={(e) => { e.stopPropagation(); showPins = !showPins; }}
+        title="Pinned messages"
+        aria-label="Pinned messages ({pinned.length})"
+        aria-expanded={showPins}
+      ><Icon name="pin" size={16} /><span class="num">{pinned.length}</span></button>
+      {#if showPins}
+        <div class="ttl-picker pins-menu" role="presentation" onclick={(e) => e.stopPropagation()}>
+          <p class="ttl-note">Pinned by the channel's moderators</p>
+          {#each pinned as p (rowKey(p))}
+            <button class="ttl-choice pin-row" onclick={() => goToPinned(p)}>
+              <span class="pin-who">{shortName(p.username)}</span>
+              <span class="pin-text">{oneLine(p)}</span>
+            </button>
+          {/each}
+        </div>
+      {/if}
+    {/if}
     {#if !isLobby}
       <button
         class="clear-chat-btn search-btn"
@@ -717,7 +919,8 @@
   </div>
 
   <div class="chat-body">
-  <div class="chat-main">
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="chat-main" ondragover={dropFiles} ondrop={dropFiles}>
   <div class="messages" bind:this={messagesContainer} onscroll={onMessagesScroll}>
     {#if !isDmMode && isLobby}
       <div class="empty-state">Open a text channel to chat</div>
@@ -755,6 +958,9 @@
         names={mentionNames}
         me={myNames}
         {newSince}
+        server={$serverAddress}
+        {fileConv}
+        {actions}
       />
       {#if scrolledUp}
         <button class="jump-latest" onclick={jumpToLatest}>
@@ -771,6 +977,7 @@
       mentionables={mentionOthers}
       conversation={`${$serverAddress}|dm|${$activeDmUserId}`}
       onsend={sendMessage}
+      onsendfile={canSendFiles ? sendFileMessage : undefined}
       replying={replyingTo?.username ?? null}
       oncancelreply={() => (replyingTo = null)}
     />
@@ -786,6 +993,7 @@
       conversation={`${$serverAddress}|${$displayChannelId}`}
       {held}
       onsend={sendMessage}
+      onsendfile={canSendFiles ? sendFileMessage : undefined}
       replying={replyingTo?.username ?? null}
       oncancelreply={() => (replyingTo = null)}
     />
@@ -834,10 +1042,39 @@
       names={mentionNames}
       me={myNames}
       mentionables={mentionOthers}
+      server={$serverAddress}
+      {fileConv}
+      {actions}
     />
   {/if}
   </div>
 </div>
+
+{#if forwarding}
+  {@const m = forwarding.m}
+  <div class="link-overlay" role="presentation" onclick={backdrop(() => (forwarding = null))}>
+    <div class="link-dialog forward-dialog" aria-label="Forward message" use:dialog={{ onclose: () => (forwarding = null) }}>
+      <span class="link-title">Forward to…</span>
+      <p class="forward-quote"><strong>{shortName(m.fwd?.name ?? m.username)}</strong> {oneLine(m)}</p>
+      {#if destinations.length === 0}
+        <p class="ttl-note">Join a channel, or open a conversation with someone, to forward this there.</p>
+      {/if}
+      <ul class="forward-list">
+        {#each destinations as d (d.key)}
+          <li>
+            <button class="forward-dest" type="button" disabled={!!d.blocked} onclick={() => forwardTo(d)}>
+              <span>{d.label}</span>
+              {#if d.blocked}<span class="forward-why">{d.blocked}</span>{/if}
+            </button>
+          </li>
+        {/each}
+      </ul>
+      <div class="link-actions">
+        <button class="link-close-btn" onclick={() => (forwarding = null)}>Cancel</button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 {#if linkPopupUrl !== null}
   <div class="link-overlay" role="presentation" onclick={backdrop(() => (linkPopupUrl = null))}>
@@ -1169,6 +1406,92 @@
     padding: 6px 16px;
     font-size: var(--fs-body);
     border-radius: 4px;
+  }
+
+  .pins-btn {
+    gap: 2px;
+    font-size: var(--fs-sm);
+  }
+
+  .pins-btn:hover {
+    color: var(--text-primary);
+  }
+
+  .pins-menu {
+    max-width: min(360px, calc(100vw - 32px));
+    max-height: 320px;
+    overflow-y: auto;
+  }
+
+  .pin-row {
+    display: flex;
+    gap: 6px;
+    min-width: 0;
+  }
+
+  .pin-who {
+    flex-shrink: 0;
+    font-weight: 600;
+  }
+
+  .pin-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+  }
+
+  .forward-quote {
+    margin: 0;
+    padding-left: 8px;
+    border-left: 2px solid var(--border);
+    font-size: var(--fs-sm);
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+  }
+
+  .forward-list {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    max-height: 50vh;
+    overflow-y: auto;
+  }
+
+  .forward-dest {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    width: 100%;
+    min-height: var(--hit);
+    padding: 0 10px;
+    border: none;
+    border-radius: var(--r-sm);
+    background: none;
+    color: var(--text-primary);
+    font-size: var(--fs-body);
+    text-align: left;
+    cursor: pointer;
+  }
+
+  .forward-dest:hover:not(:disabled),
+  .forward-dest:focus-visible {
+    background: var(--bg-hover);
+  }
+
+  .forward-dest:disabled {
+    color: var(--text-muted);
+    cursor: default;
+  }
+
+  .forward-why {
+    font-size: var(--fs-micro);
+    color: var(--text-secondary);
   }
 
   .preview-label {

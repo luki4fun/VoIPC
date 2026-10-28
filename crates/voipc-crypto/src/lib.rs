@@ -34,7 +34,7 @@ pub mod time;
 pub use channel_state::{history_sources, pick_history_sources, ChannelKeying, HISTORY_SOURCES};
 pub use envelope::{
     envelope, envelope_with, history_payload, new_message_id, open_envelope, open_history_payload,
-    Extras, Message, MAX_MESSAGE_TTL_SECS,
+    ChatEvent, Extras, FileRef, Forwarded, Message, MAX_MESSAGE_TTL_SECS,
 };
 pub use identity::{generate_identity_key_pair, SerializableIdentityKeyPair};
 pub use media_keys::{

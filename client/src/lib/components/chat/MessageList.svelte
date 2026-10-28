@@ -1,5 +1,22 @@
+<script module lang="ts">
+  import type { ChatMessage as Message } from "../../types.js";
+
+  /** What can be done to a message here, beside answering it; each absent
+   *  where it cannot (ChatPanel decides: who may, and whether posting is). */
+  export interface MessageActions {
+    react?: (m: Message, emoji: string, on: boolean) => void;
+    /** Our own messages only. */
+    edit?: (m: Message, text: string) => void;
+    remove?: (m: Message) => void;
+    /** For the channel's managers. */
+    pin?: (m: Message, on: boolean) => void;
+    forward?: (m: Message) => void;
+  }
+</script>
+
 <script lang="ts">
-  import type { ChatMessage } from "../../types.js";
+  import { tick } from "svelte";
+  import type { ChatMessage, FileConv } from "../../types.js";
   import { userId } from "../../stores/connection.js";
   import { account, accountHex } from "../../stores/account.js";
   import { addNotification } from "../../stores/notifications.js";
@@ -9,9 +26,14 @@
   import { dayKey, dayLabel, fullTime } from "../../chat-time.js";
   import { mentionsName, parse, plainText } from "../../markdown.js";
   import { findTarget, indexById } from "../../thread-rules.js";
+  import { reactionChips, rowKey, sameRow } from "../../chat-rules.js";
+  import { confirmAction } from "../../stores/confirm.js";
+  import { EMOJI_CATEGORIES, QUICK_REACTIONS } from "../../emoji.js";
   import { shortName } from "../../username.js";
   import Icon from "../Icons.svelte";
   import Markdown from "./Markdown.svelte";
+  import FileCard from "./FileCard.svelte";
+  import Lightbox from "./Lightbox.svelte";
 
   interface Props {
     /** The rows to draw, oldest first. */
@@ -42,6 +64,11 @@
     me?: readonly string[];
     /** Where the unread part began: a "New" divider goes before the first message after it. */
     newSince?: number;
+    /** The server and conversation these rows are in, for their files. */
+    server?: string;
+    fileConv?: FileConv | null;
+    /** React, edit, delete, pin, forward. */
+    actions?: MessageActions;
   }
   let {
     messages,
@@ -58,7 +85,13 @@
     names = [],
     me = [],
     newSince,
+    server = "",
+    fileConv = null,
+    actions = {},
   }: Props = $props();
+
+  /** A loaded picture shown big. */
+  let picture = $state<{ url: string; name: string; save: () => void } | null>(null);
 
   const index = $derived(indexById(all ?? messages));
   const myAccount = $derived($account ? accountHex($account.info.id) : undefined);
@@ -146,7 +179,7 @@
   /** The line a quote shows of the message answered. */
   function snippet(m: ChatMessage): string {
     const text = m.kind === "undecryptable" ? m.content : plainText(m.content);
-    return text.length > 120 ? `${text.slice(0, 120)}…` : text || "…";
+    return text.length > 120 ? `${text.slice(0, 120)}…` : text || m.file?.name || "…";
   }
 
   // ── Rows, focus and jumping ─────────────────────────────────────────────
@@ -171,9 +204,10 @@
     };
   }
 
-  // Raw: a $state proxy of a message is never === the message itself
+  // Raw: a $state proxy of a message is never === the message itself. An
+  // event (a reaction, an edit) makes a new object of a message: still its row.
   let focused = $state.raw<ChatMessage | null>(null);
-  const current = $derived(focused && rows.includes(focused) ? focused : rows.at(-1));
+  const current = $derived((focused && rows.find((r) => sameRow(r, focused!))) ?? rows.at(-1));
 
   function onRowKeydown(e: KeyboardEvent, m: ChatMessage) {
     if (e.target !== e.currentTarget) return;
@@ -219,7 +253,13 @@
     }
   }
 
-  let opened = $state.raw<{ m: ChatMessage; x: number; y: number } | null>(null);
+  let opened = $state.raw<{ m: ChatMessage; x: number; y: number; up: number } | null>(null);
+
+  /** A pop-up at `y` that would run off the bottom goes above `up` instead. */
+  function fit(node: HTMLElement, up: number) {
+    const r = node.getBoundingClientRect();
+    if (r.bottom > innerHeight - 8) node.style.top = `${Math.max(8, up - r.height)}px`;
+  }
 
   /** Right click, a long press on a touch screen, or the menu key. */
   function onContextMenu(e: MouseEvent, m: ChatMessage) {
@@ -231,14 +271,102 @@
       const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
       [x, y] = [r.left + 24, r.top + 8];
     }
-    // Kept on screen; the menu is narrow and short
-    opened = { m, x: Math.min(x, innerWidth - 220), y: Math.min(y, innerHeight - 160) };
+    // Kept on screen: narrow, and above the pointer where there is no room below (`fit`)
+    opened = { m, x: Math.min(x, innerWidth - 220), y, up: y };
   }
 
   function act(fn: (m: ChatMessage) => void) {
     const m = opened?.m;
     opened = null;
     if (m) fn(m);
+  }
+
+  // ── Reactions, edits, deletes, pins, forwards ───────────────────────────
+
+  /** Ours, as a reaction names its person (`authorKey`). */
+  function isMyKey(key: string): boolean {
+    return (myAccount !== undefined && key === `a:${myAccount}`) || key.startsWith(`u:${$userId}:`);
+  }
+
+  /** Written by us first-hand: what an edit or a delete can name. A copy a
+   *  member handed over is theirs to keep. */
+  function ownEditable(m: ChatMessage): boolean {
+    return answerable(m) && m.kind !== "shared" && isMine(m);
+  }
+
+  /** The reaction picker, for `m`, where it was opened. */
+  let picking = $state.raw<{ m: ChatMessage; x: number; y: number; up: number } | null>(null);
+  let pickCategory = $state(0);
+
+  /** Open the picker under `from` (a tool), or at the menu's place. */
+  function openPicker(m: ChatMessage, from: { x: number; y: number; up: number } | Element) {
+    const r = from instanceof Element ? from.getBoundingClientRect() : null;
+    const at = r ? { x: r.right - 300, y: r.bottom + 4, up: r.top - 4 } : (from as { x: number; y: number; up: number });
+    pickCategory = 0;
+    // Kept on screen across; the picker is 300 wide (`fit` keeps it in down)
+    picking = { m, x: Math.max(8, Math.min(at.x, innerWidth - 308)), y: at.y, up: at.up };
+  }
+
+  function pick(emoji: string) {
+    const was = picking?.m;
+    picking = null;
+    if (!was || !actions.react) return;
+    // As it is now: another reaction may have come in while the picker was open
+    const m = rows.find((r) => sameRow(r, was)) ?? was;
+    const mine = reactionChips(m, isMyKey).some((c) => c.emoji === emoji && c.mine);
+    actions.react(m, emoji, !mine);
+  }
+
+  /** The message being edited here, and its new text. */
+  let editing = $state.raw<ChatMessage | null>(null);
+  let draft = $state("");
+  let editBox = $state<HTMLTextAreaElement | null>(null);
+
+  function startEdit(m: ChatMessage) {
+    editing = m;
+    draft = m.content;
+    tick().then(() => {
+      editBox?.focus();
+      editBox?.setSelectionRange(draft.length, draft.length);
+    });
+  }
+
+  function finishEdit(save: boolean) {
+    const m = editing;
+    editing = null;
+    const text = draft.trim();
+    if (save && m && text && text !== m.content.trim()) actions.edit?.(m, text);
+    // Back on the row, where the keyboard was
+    if (m) tick().then(() => rowEls.get(rows.find((r) => sameRow(r, m)) ?? m)?.focus());
+  }
+
+  function onEditKeydown(e: KeyboardEvent) {
+    if (e.key === "Escape") {
+      // Not the thread pane's Escape too
+      e.preventDefault();
+      e.stopPropagation();
+      finishEdit(false);
+    } else if (e.key === "Enter" && !e.shiftKey && !e.isComposing) {
+      e.preventDefault();
+      finishEdit(true);
+    }
+  }
+
+  async function askDelete(m: ChatMessage) {
+    const ok = await confirmAction({
+      title: "Delete this message?",
+      body: "It goes for everyone in this conversation, from the server's copy too. Someone who already read it may have kept a copy of their own.",
+      confirm: "Delete",
+      danger: true,
+    });
+    if (ok) actions.remove?.(m);
+  }
+
+  /** The menu, opened from the row's own "More" tool. */
+  function openMore(e: MouseEvent, m: ChatMessage) {
+    e.stopPropagation();
+    const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+    opened = { m, x: Math.max(8, Math.min(r.right - 220, innerWidth - 228)), y: r.bottom + 4, up: r.top - 4 };
   }
 
   function threadLine(answers: ChatMessage[]): string {
@@ -250,22 +378,24 @@
 </script>
 
 <svelte:window
-  onclick={() => (opened = null)}
-  onkeydown={(e) => { if (e.key === "Escape") opened = null; }}
+  onclick={() => { opened = null; picking = null; }}
+  onkeydown={(e) => { if (e.key === "Escape") { opened = null; picking = null; } }}
 />
 
 <!-- Keyed by the message object, which the stores carry over from one
      update to the next. The index used to be in the key, so once a
      conversation was full every new message shifted every key and
      rebuilt all 500 rows; the ids a sender mints are not unique enough
-     on their own — a peer can repeat one, and a duplicate key throws. -->
+     on their own — a peer can repeat one, and a duplicate key throws.
+     A message an event remade (a reaction, an edit) keeps its first
+     object's key (`rowKey`), so its row, and a picture loaded in it, stay. -->
 {#if newFrom && !newSeen}
   <button class="jump-new" type="button" onclick={() => newEl?.scrollIntoView({ block: "center" })}>
     New messages <Icon name="chevron-down" size={14} class="up" />
   </button>
 {/if}
 
-{#each messages as msg, i (msg)}
+{#each messages as msg, i (rowKey(msg))}
   {#if !isRow(msg)}
     <div class="history-marker"><span>{msg.content}</span></div>
   {:else}
@@ -325,15 +455,74 @@
           {/if}
         </div>
       {/if}
+      {#if msg.fwd}
+        <div class="fwd-label" title="Forwarded: first written {fullTime(msg.fwd.at)}">
+          <Icon name="forward" size={12} /> Forwarded from {shortName(msg.fwd.name)}
+        </div>
+      {/if}
       <div class="msg-content" class:shared={msg.kind === "shared"}>
         {#if msg.kind === "undecryptable"}
           <span class="attachment-placeholder">{msg.content}</span>
         {:else if msg.kind && msg.kind !== "text" && msg.kind !== "shared"}
           <span class="attachment-placeholder">[attachment — not shared]</span>
         {:else}
-          <Markdown text={msg.content} {onlink} {names} {me} />
+          {#if editing && sameRow(editing, msg)}
+            <form class="edit-box" onsubmit={(e) => { e.preventDefault(); finishEdit(true); }}>
+              <textarea
+                class="edit-input"
+                aria-label="Edit message"
+                bind:this={editBox}
+                bind:value={draft}
+                onkeydown={onEditKeydown}
+                maxlength="2000"
+                rows="2"
+              ></textarea>
+              <div class="edit-actions">
+                <span class="edit-hint">Enter to save · Escape to cancel</span>
+                <button class="btn-ghost" type="button" onclick={() => finishEdit(false)}>Cancel</button>
+                <button class="btn-secondary" type="submit" disabled={!draft.trim()}>Save</button>
+              </div>
+            </form>
+          {:else if msg.content}
+            <Markdown text={msg.content} {onlink} {names} {me} />
+          {/if}
+          {#if msg.edited_at && !(editing && sameRow(editing, msg))}
+            <span class="edited" title="Edited {fullTime(msg.edited_at)}">(edited)</span>
+          {/if}
+          {#if msg.pin?.on}
+            <span class="pinned-tag" title="Pinned by {shortName(msg.pin.by)}"><Icon name="pin" size={11} /> Pinned</span>
+          {/if}
+          {#if msg.file}
+            <FileCard
+              file={msg.file}
+              {server}
+              conv={fileConv}
+              onopen={(p) => (picture = p)}
+              ongone={(u) => {
+                if (picture?.url === u) picture = null;
+              }}
+            />
+          {/if}
         {/if}
       </div>
+      {#if msg.reactions?.length}
+        {@const chips = reactionChips(msg, isMyKey)}
+        <div class="reactions" role="group" aria-label="Reactions" hidden={chips.length === 0}>
+          {#each chips as c (c.emoji)}
+            <button
+              class="reaction"
+              class:mine={c.mine}
+              type="button"
+              tabindex={msg === current ? 0 : -1}
+              aria-pressed={c.mine}
+              aria-label="{c.emoji} {c.count}: {c.names.map((n) => shortName(n)).join(', ')}"
+              title={c.names.map((n) => shortName(n)).join(", ")}
+              disabled={!actions.react}
+              onclick={() => actions.react?.(msg, c.emoji, !c.mine)}
+            ><span class="reaction-emoji">{c.emoji}</span><span class="num">{c.count}</span></button>
+          {/each}
+        </div>
+      {/if}
       {#if threads?.get(msg)}
         {@const answers = threads.get(msg)!}
         {@const unread = answers.some((a) => a.timestamp > (threadSeen?.(msg) ?? 0) && !isMine(a))}
@@ -349,6 +538,18 @@
         </button>
       {/if}
       <div class="msg-tools" role="toolbar" aria-label="Message actions">
+        {#if actions.react && answerable(msg)}
+          <button
+            class="icon-btn tool"
+            type="button"
+            tabindex={msg === current ? 0 : -1}
+            title="React"
+            aria-label="React"
+            onclick={(e) => { e.stopPropagation(); openPicker(msg, e.currentTarget); }}
+          >
+            <Icon name="smile" size={16} />
+          </button>
+        {/if}
         {#if onreply && answerable(msg)}
           <button class="icon-btn tool" type="button" tabindex={msg === current ? 0 : -1} title="Reply" aria-label="Reply" onclick={() => onreply(msg)}>
             <Icon name="reply" size={16} />
@@ -359,8 +560,13 @@
             <Icon name="thread" size={16} />
           </button>
         {/if}
-        <button class="icon-btn tool" type="button" tabindex={msg === current ? 0 : -1} title="Copy text" aria-label="Copy text" onclick={() => copyText(msg)}>
-          <Icon name="copy" size={16} />
+        {#if actions.edit && ownEditable(msg)}
+          <button class="icon-btn tool" type="button" tabindex={msg === current ? 0 : -1} title="Edit" aria-label="Edit" onclick={() => startEdit(msg)}>
+            <Icon name="pencil" size={16} />
+          </button>
+        {/if}
+        <button class="icon-btn tool" type="button" tabindex={msg === current ? 0 : -1} title="More" aria-label="More" onclick={(e) => openMore(e, msg)}>
+          <Icon name="more-vertical" size={16} />
         </button>
       </div>
     </div>
@@ -374,17 +580,72 @@
     class="msg-menu"
     style="left: {opened.x}px; top: {opened.y}px"
     use:portal
+    use:fit={opened.up}
     use:menu={{ onclose: () => (opened = null), label: `Message from ${shortName(m.username)}` }}
     onclick={(e) => e.stopPropagation()}
   >
+    {#if actions.react && answerable(m)}
+      <button type="button" onclick={(e) => { e.stopPropagation(); const at = opened!; opened = null; openPicker(at.m, at); }}
+        ><Icon name="smile" size={16} /> React</button
+      >
+    {/if}
     {#if onreply && answerable(m)}
       <button type="button" onclick={() => act(onreply)}><Icon name="reply" size={16} /> Reply</button>
     {/if}
     {#if onthread && answerable(m)}
       <button type="button" onclick={() => act(onthread)}><Icon name="thread" size={16} /> Reply in thread</button>
     {/if}
+    {#if actions.forward && answerable(m)}
+      <button type="button" onclick={() => act(actions.forward!)}><Icon name="forward" size={16} /> Forward</button>
+    {/if}
+    {#if actions.edit && ownEditable(m)}
+      <button type="button" onclick={() => act(startEdit)}><Icon name="pencil" size={16} /> Edit</button>
+    {/if}
+    {#if actions.pin && answerable(m)}
+      <button type="button" onclick={() => act((x) => actions.pin!(x, !x.pin?.on))}
+        ><Icon name="pin" size={16} /> {m.pin?.on ? "Unpin" : "Pin"}</button
+      >
+    {/if}
     <button type="button" onclick={() => act(copyText)}><Icon name="copy" size={16} /> Copy text</button>
+    {#if actions.remove && ownEditable(m)}
+      <button class="danger" type="button" onclick={() => act(askDelete)}><Icon name="trash" size={16} /> Delete</button>
+    {/if}
   </div>
+{/if}
+
+{#if picking}
+  {@const m = picking.m}
+  <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+  <div
+    class="react-picker"
+    style="left: {picking.x}px; top: {picking.y}px"
+    use:portal
+    use:fit={picking.up}
+    use:menu={{ onclose: () => (picking = null), label: `React to ${shortName(m.username)}` }}
+    onclick={(e) => e.stopPropagation()}
+  >
+    <div class="react-quick">
+      {#each QUICK_REACTIONS as emoji (emoji)}
+        <button class="react-item" type="button" aria-label="React with {emoji}" onclick={() => pick(emoji)}>{emoji}</button>
+      {/each}
+    </div>
+    <div class="react-tabs">
+      {#each EMOJI_CATEGORIES as cat, idx (cat.label)}
+        <button class="react-tab" class:active={pickCategory === idx} type="button" title={cat.label} aria-label={cat.label} onclick={() => (pickCategory = idx)}
+          >{cat.emojis[0]}</button
+        >
+      {/each}
+    </div>
+    <div class="react-grid">
+      {#each EMOJI_CATEGORIES[pickCategory].emojis as emoji (emoji)}
+        <button class="react-item" type="button" aria-label="React with {emoji}" onclick={() => pick(emoji)}>{emoji}</button>
+      {/each}
+    </div>
+  </div>
+{/if}
+
+{#if picture}
+  <Lightbox url={picture.url} name={picture.name} onsave={picture.save} onclose={() => (picture = null)} />
 {/if}
 
 <style>
@@ -677,6 +938,165 @@
 
   .msg-menu button:hover,
   .msg-menu button:focus-visible {
+    background: var(--bg-hover);
+  }
+
+  .msg-menu button.danger {
+    color: var(--danger);
+  }
+
+  /* Forwarded: a quiet line above the text, like a quote's */
+  .fwd-label {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin: 2px 0 1px;
+    font-size: var(--fs-sm);
+    font-style: italic;
+    color: var(--text-secondary);
+  }
+
+  .edited,
+  .pinned-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 3px;
+    margin-right: 6px;
+    font-size: var(--fs-micro);
+    color: var(--text-secondary);
+  }
+
+  .edit-box {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 2px 0 4px;
+  }
+
+  .edit-input {
+    width: 100%;
+    min-height: 2.6em;
+    padding: 6px 8px;
+    resize: vertical;
+    font: inherit;
+    color: var(--text-primary);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+  }
+
+  .edit-actions {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .edit-hint {
+    margin-right: auto;
+    font-size: var(--fs-micro);
+    color: var(--text-secondary);
+  }
+
+  /* Reactions: ink chips under the message; ours outlined in the text colour */
+  .reactions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin: 4px 0 2px;
+  }
+
+  .reaction {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    min-height: 28px;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-pill);
+    background: var(--bg-secondary);
+    color: var(--text-secondary);
+    font-size: var(--fs-sm);
+    cursor: pointer;
+  }
+
+  .reaction.mine {
+    border-color: var(--text-secondary);
+    color: var(--text-primary);
+    background: color-mix(in srgb, var(--text-primary) 8%, var(--bg-secondary));
+  }
+
+  .reaction:hover:not(:disabled) {
+    background: var(--bg-hover);
+  }
+
+  .reaction:disabled {
+    cursor: default;
+  }
+
+  .reaction-emoji {
+    font-size: 1.1em;
+    line-height: 1;
+  }
+
+  .react-picker {
+    position: fixed;
+    z-index: var(--z-menu);
+    display: flex;
+    flex-direction: column;
+    width: 300px;
+    max-width: calc(100vw - 16px);
+    padding: 6px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    box-shadow: var(--shadow-menu);
+  }
+
+  .react-quick,
+  .react-tabs {
+    display: flex;
+    gap: 2px;
+    padding-bottom: 4px;
+    margin-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .react-grid {
+    display: grid;
+    grid-template-columns: repeat(8, 1fr);
+    gap: 2px;
+    max-height: 180px;
+    overflow-y: auto;
+  }
+
+  .react-item,
+  .react-tab {
+    min-width: 32px;
+    min-height: 32px;
+    padding: 0;
+    border: none;
+    border-radius: var(--r-sm);
+    background: none;
+    font-size: 18px;
+    line-height: 1;
+    cursor: pointer;
+  }
+
+  .react-tab {
+    opacity: 0.6;
+  }
+
+  .react-tab.active {
+    opacity: 1;
+    background: var(--bg-tertiary);
+  }
+
+  .react-item:hover,
+  .react-item:focus-visible,
+  .react-tab:hover,
+  .react-tab:focus-visible {
     background: var(--bg-hover);
   }
 </style>

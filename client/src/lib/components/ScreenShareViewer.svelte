@@ -153,16 +153,31 @@
   /** A double tap zooms; only a mouse's double click means fullscreen. */
   let lastPointer = "mouse";
 
+  // One build at a time: a quick second click raced the first ("label already
+  // exists") and failed with nothing on screen (R5-10)
+  let poppingOut = false;
+
   async function popOut() {
     const existing = getPopoutWindow();
     if (existing) {
       try { await existing.setFocus(); } catch {}
       return;
     }
+    if (poppingOut) return;
+    poppingOut = true;
 
     // The backend makes the window: the page may not create windows itself
-    await invoke("open_share_popout", { sharerName });
-    const win = await WebviewWindow.getByLabel("screenshare-popout");
+    let win: WebviewWindow | null;
+    try {
+      await invoke("open_share_popout", { sharerName });
+      win = await WebviewWindow.getByLabel("screenshare-popout");
+    } catch (e) {
+      console.error("Failed to pop out the share:", e);
+      addNotification(`Could not open the share in its own window: ${e}`, "error");
+      return;
+    } finally {
+      poppingOut = false;
+    }
     if (!win) return;
 
     // Clean up store state and stop watching when the popout window is destroyed.

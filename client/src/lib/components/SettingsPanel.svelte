@@ -59,6 +59,7 @@
   import { voice } from "../stores/channels.js";
   import Icon from "./Icons.svelte";
   import PaletteEditor from "./PaletteEditor.svelte";
+  import FileManager from "./FileManager.svelte";
   import LayoutPreview from "./LayoutPreview.svelte";
   import { uiPrefs, updateUiPrefs } from "../stores/ui-prefs.js";
   import { buildHash, buildLine, buildTime } from "../build-info.js";
@@ -75,7 +76,7 @@
 
   // What used to be one General tab of 25-30 controls and some twenty hints,
   // split by what somebody comes to Settings to do
-  type Tab = "voice" | "appearance" | "sounds" | "privacy" | "games" | "about";
+  type Tab = "voice" | "appearance" | "sounds" | "privacy" | "files" | "games" | "about";
   let activeTab = $state<Tab>("voice");
 
   // The accounts this device signs in to without a password (1.0 audit H5-12)
@@ -582,6 +583,7 @@
       ? [{ id: "sounds" as Tab, label: "Sounds & alerts" }]
       : []),
     { id: "privacy", label: "Privacy & data" },
+    { id: "files", label: "Files" },
     ...(!isWeb && sdkAvailable ? [{ id: "games" as Tab, label: "Games" }] : []),
     { id: "about", label: "About" },
   ]);
@@ -1144,6 +1146,10 @@
           <button class="danger-btn btn btn-danger-outline" onclick={resetConfig}>Reset all settings…</button>
         </div>
       </div>
+    {/if}
+
+    {#if activeTab === "files"}
+      <FileManager {onclose} />
     {/if}
 
     {#if activeTab === "appearance"}

@@ -112,6 +112,9 @@ pub struct WtInfo {
 /// requests in flight.
 const PAGE_CONN_LIFETIME: Duration = Duration::from_secs(30);
 
+/// Streams at once on one page connection (hyper's default is 200).
+const MAX_H2_STREAMS: u32 = 16;
+
 /// Serve the web client over HTTP/2 on a TLS stream that negotiated `h2`.
 pub async fn serve_h2(
     tls: TlsStream<TcpStream>,
@@ -124,7 +127,10 @@ pub async fn serve_h2(
         let state = state.clone();
         async move { Ok::<_, Infallible>(handle_request(req, &wt, &state, peer.ip()).await) }
     });
+    // A page load needs a handful of streams; each `/f/` download in flight
+    // may hold a chunk (files.rs `get`)
     let conn = hyper::server::conn::http2::Builder::new(TokioExecutor::new())
+        .max_concurrent_streams(MAX_H2_STREAMS)
         .serve_connection(TokioIo::new(tls), service);
     tokio::pin!(conn);
     let result = tokio::select! {
@@ -145,7 +151,7 @@ pub async fn serve_h2(
 async fn handle_request(
     req: Request<Incoming>,
     wt: &WtInfo,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     peer_ip: std::net::IpAddr,
 ) -> Response<Full<Bytes>> {
     let head_only = req.method() == Method::HEAD;
@@ -181,7 +187,11 @@ async fn handle_request(
 /// `/f/` on h2, the browser's carrier: refused before its body is read
 /// wherever it can be (`files::prepare`), and a body read only up to what its
 /// upload has left.
-async fn files<B>(req: Request<B>, state: &ServerState, peer_ip: IpAddr) -> Response<Full<Bytes>>
+async fn files<B>(
+    req: Request<B>,
+    state: &Arc<ServerState>,
+    peer_ip: IpAddr,
+) -> Response<Full<Bytes>>
 where
     B: hyper::body::Body<Data = Bytes>,
     B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
@@ -591,7 +601,14 @@ pub struct WebTransport {
     picker: Arc<CertPicker>,
     sans: Vec<String>,
     info: Arc<WtInfo>,
+    /// `SESSION_SETUP`; a test shortens it.
+    setup_time: Duration,
 }
+
+/// How long a QUIC session may take from its first packet to an answered
+/// session request, holding a pre-authentication slot: the same as the TLS
+/// handshake on the page port.
+const SESSION_SETUP: Duration = Duration::from_secs(10);
 
 impl WebTransport {
     /// Bind on `host:udp_port`. `certs`/`key` is the operator identity
@@ -631,6 +648,7 @@ impl WebTransport {
                 cert_hash: RwLock::new(cert_hash),
                 tcp: config.tcp_fallback,
             }),
+            setup_time: SESSION_SETUP,
         })
     }
 
@@ -681,32 +699,43 @@ impl WebTransport {
                 incoming.refuse();
                 continue;
             }
-            if let Err(reason) = limits.acquire(peer.ip()) {
-                debug!(%peer, "rejecting session: {reason}");
-                incoming.refuse();
-                continue;
-            }
+            let slot = match limits.acquire_slot(peer.ip()) {
+                Ok(slot) => slot,
+                Err(reason) => {
+                    debug!(%peer, "rejecting session: {reason}");
+                    incoming.refuse();
+                    continue;
+                }
+            };
 
             let state = state.clone();
-            let limits = limits.clone();
+            let setup_time = self.setup_time;
             tokio::spawn(async move {
-                // Same deadline as the TLS handshake on the page port.
-                match tokio::time::timeout(Duration::from_secs(10), incoming).await {
-                    Ok(Ok(request)) => {
-                        if request.path() != "/voipc" {
-                            debug!(%peer, "rejecting session: unknown path");
-                            request.not_found().await;
-                        } else {
-                            match request.accept().await {
-                                Ok(connection) => run_session(connection, state, peer).await,
-                                Err(e) => debug!(%peer, "session accept failed: {e}"),
-                            }
-                        }
+                let _slot = slot;
+                // One deadline for the whole setup, the QUIC handshake and then
+                // the answer to the session request: a peer that lets the
+                // answer stall (no flow-control credit) would otherwise keep
+                // its pre-authentication slot as long as it answers pings
+                // (S-003). Dropped on expiry, the request closes the connection.
+                let setup = async {
+                    let request = match incoming.await {
+                        Ok(request) => request,
+                        Err(e) => return Err(format!("QUIC handshake failed: {e}")),
+                    };
+                    if request.path() != "/voipc" {
+                        request.not_found().await;
+                        return Err("unknown path".to_string());
                     }
-                    Ok(Err(e)) => debug!(%peer, "QUIC handshake failed: {e}"),
-                    Err(_) => debug!(%peer, "QUIC handshake timed out"),
+                    request
+                        .accept()
+                        .await
+                        .map_err(|e| format!("session accept failed: {e}"))
+                };
+                match tokio::time::timeout(setup_time, setup).await {
+                    Ok(Ok(connection)) => run_session(connection, state, peer).await,
+                    Ok(Err(why)) => debug!(%peer, "rejecting session: {why}"),
+                    Err(_) => debug!(%peer, "session setup timed out"),
                 }
-                limits.release(peer.ip());
             });
         }
     }
@@ -1395,6 +1424,105 @@ mod tests {
         assert_eq!(seen.lock().unwrap().unwrap(), browser_hash);
         assert_ne!(browser_hash, native_hash);
         connection.close(VarInt::from_u32(0), b"");
+    }
+
+    /// A session request whose answer cannot be sent gives its
+    /// pre-authentication slot back at the setup deadline, and the connection
+    /// goes with it (S-003). The client is a bare QUIC one that grants the
+    /// relay just enough connection credit for its SETTINGS, so the answer to
+    /// the CONNECT never fits.
+    #[tokio::test]
+    async fn a_session_whose_answer_never_gets_through_gives_its_slot_back() {
+        use std::sync::atomic::Ordering;
+        use wtransport::proto::session::SessionRequest as Connect;
+        use wtransport::proto::settings::Settings;
+        use wtransport::proto::stream_header::StreamHeader;
+        use wtransport::quinn;
+
+        let (mut web, state, _) = test_server();
+        web.setup_time = Duration::from_millis(1500);
+        let addr = web.local_addr().unwrap();
+        let limits = Arc::new(ConnLimits::from_config(&ServerConfig::default()));
+        tokio::spawn(web.run(state, limits.clone()));
+
+        // What the relay writes first: its control stream with the SETTINGS
+        // of wtransport's `LocalSettingsStream`
+        let relay_first = StreamHeader::new_control().write_size()
+            + Settings::builder()
+                .qpack_max_table_capacity(VarInt::from_u32(0))
+                .qpack_blocked_streams(VarInt::from_u32(0))
+                .enable_connect_protocol()
+                .enable_webtransport()
+                .enable_h3_datagrams()
+                .webtransport_max_sessions(VarInt::from_u32(1))
+                .build()
+                .generate_frame()
+                .write_size();
+
+        let mut tls = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .unwrap()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(Capture(Arc::default())))
+        .with_no_client_auth();
+        tls.alpn_protocols = vec![b"h3".to_vec()];
+        let mut transport = quinn::TransportConfig::default();
+        transport
+            .receive_window(quinn::VarInt::from_u32(relay_first as u32))
+            .keep_alive_interval(Some(Duration::from_millis(300)));
+        let mut config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(tls).unwrap(),
+        ));
+        config.transport_config(Arc::new(transport));
+        let mut endpoint = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        endpoint.set_default_client_config(config);
+        let connection = tokio::time::timeout(
+            Duration::from_secs(5),
+            endpoint.connect(addr, "localhost").unwrap(),
+        )
+        .await
+        .expect("handshake within 5 s")
+        .unwrap();
+
+        let mut control = Vec::new();
+        StreamHeader::new_control().write(&mut control).unwrap();
+        Settings::builder()
+            .enable_connect_protocol()
+            .enable_webtransport()
+            .enable_h3_datagrams()
+            .build()
+            .generate_frame()
+            .write(&mut control)
+            .unwrap();
+        let mut uni = connection.open_uni().await.unwrap();
+        uni.write_all(&control).await.unwrap();
+        let mut connect = Vec::new();
+        Connect::new(format!("https://localhost:{}/voipc", addr.port()))
+            .unwrap()
+            .headers()
+            .generate_frame()
+            .write(&mut connect)
+            .unwrap();
+        let (mut send, _recv) = connection.open_bi().await.unwrap();
+        send.write_all(&connect).await.unwrap();
+
+        // The request is in and waiting on its answer, holding the slot
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(limits.pre_total.load(Ordering::Relaxed), 1);
+        assert!(connection.close_reason().is_none());
+
+        let released = tokio::time::timeout(Duration::from_secs(4), async {
+            while limits.pre_total.load(Ordering::Relaxed) != 0 {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        assert!(released.is_ok(), "the slot is still held");
+        tokio::time::timeout(Duration::from_secs(4), connection.closed())
+            .await
+            .expect("the relay closes the connection");
     }
 
     #[tokio::test]

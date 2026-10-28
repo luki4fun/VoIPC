@@ -44,10 +44,53 @@
     if ($watchingUserId !== null) return pushLayer(() => void stopWatching());
     if ($mobileTab !== "chat") return pushLayer(() => mobileTab.set("chat"));
   });
+
+  // With the keyboard up a phone has room for the message list and little
+  // else: the voice bar, the status bar and the tabs under it left about
+  // 30 px of messages (D1-02). While a text field in the view has focus and
+  // the window has shrunk for the keyboard, they step aside and the talk
+  // button is one slim row — the owner's call (2026-10-27). Both, because the
+  // keyboard can be put away with the field still focused.
+  let fieldFocused = $state(false);
+  let viewHeight = $state(0);
+  /** The window's height without the keyboard, at the current width. */
+  let fullHeight = $state(0);
+  let measuredWidth = 0;
+  const keyboardUp = $derived($isMobile && fieldFocused && viewHeight < fullHeight * 0.8);
+  /** A phone on its side: the talk button is one row there too. */
+  const short = $derived($isMobile && viewHeight > 0 && viewHeight <= 520);
+
+  function measure() {
+    const height = window.visualViewport?.height ?? window.innerHeight;
+    if (window.innerWidth !== measuredWidth) {
+      measuredWidth = window.innerWidth;
+      fullHeight = 0;
+    }
+    fullHeight = Math.max(fullHeight, height);
+    viewHeight = height;
+  }
+
+  $effect(() => {
+    if (!$isMobile) return;
+    measure();
+    const vv = window.visualViewport;
+    vv?.addEventListener("resize", measure);
+    window.addEventListener("resize", measure);
+    return () => {
+      vv?.removeEventListener("resize", measure);
+      window.removeEventListener("resize", measure);
+    };
+  });
+
+  const isTextField = (el: EventTarget | null) =>
+    el instanceof HTMLElement &&
+    (el instanceof HTMLTextAreaElement ||
+      el.isContentEditable ||
+      (el instanceof HTMLInputElement && !/^(checkbox|radio|range|button|submit|reset|file|color|image)$/.test(el.type)));
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="app-layout" class:mobile={$isMobile} oncontextmenu={shellContextMenu}>
+<div class="app-layout" class:mobile={$isMobile} class:typing={keyboardUp} oncontextmenu={shellContextMenu}>
   <!-- The desktop's title row. A phone has no room to spare for a name the
        launcher already shows: its gear lives in the status bar instead. -->
   {#if !$isMobile}
@@ -61,7 +104,11 @@
 
   {#if $isMobile}
     <!-- Mobile: single-column tabbed layout -->
-    <div class="main-content mobile-main">
+    <div
+      class="main-content mobile-main"
+      onfocusin={(e) => (fieldFocused = isTextField(e.target))}
+      onfocusout={() => (fieldFocused = false)}
+    >
       {#if $watchingUserId !== null}
         <ScreenShareViewer />
       {:else if $mobileTab === 'channels'}
@@ -88,7 +135,7 @@
     </div>
 
     {#if $voice !== null}
-      <MobilePTT />
+      <MobilePTT slim={keyboardUp || short} />
     {/if}
     <VoiceControls />
     <StatusBar compact onopensettings={onopensettings} />
@@ -338,5 +385,12 @@
 
   .app-layout.mobile :global(.status-bar) {
     padding: 4px 12px;
+  }
+
+  /* The keyboard is up: the messages and the talk button, nothing else */
+  .app-layout.mobile.typing > :global(.voice-controls),
+  .app-layout.mobile.typing > :global(.status-bar),
+  .app-layout.mobile.typing > .mobile-tabs {
+    display: none;
   }
 </style>

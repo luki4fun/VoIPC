@@ -10,34 +10,43 @@
 //! there would stall video and chat behind it.
 //!
 //! - **Who may.** A blob is registered under the conversations it was posted
-//!   in, and only a member of one of them may fetch it: a channel's current
-//!   members, a direct conversation's two parties (by account, else by name;
-//!   a kept one's account must exist). A hash that is not here at all gets
-//!   the same refusal as one of another conversation. Whoever holds a hash,
-//!   which only its messages carry, may post it again (a forward) and so
-//!   fetch it: the check keeps out who never had the message, and the key
-//!   was never the relay's to keep.
+//!   in, and is handed only to a member of one of them: a channel's current
+//!   members, a direct conversation's two parties (by account, else by the
+//!   guest's connection; a kept one's account must exist). Whoever holds a
+//!   hash, which only its messages carry, may post it again (a forward) and
+//!   so fetch it: the check keeps out who never had the message, and the key
+//!   was never the relay's to keep. Anyone else is refused before the store
+//!   is asked (`resolve`).
 //! - **How long.** A fetch keeps a blob for `cache_mins` more, but never past
 //!   `max_age_hours` after it arrived. All blobs together stay under
 //!   `max_total_mb`: the least recently used goes first. Nothing survives a
 //!   restart; blob files are wiped at start.
 //! - **When it has gone.** Its registration stays (`REGISTRATION_LIFETIME`).
-//!   A fetch then asks the conversations' other members online
-//!   (`FileWanted`, which names nobody); a client that holds the blob and a
-//!   message referring to it uploads it again, and whoever waited is served.
-//!   If nobody starts within `SEEK_TIMEOUT`: `FileUnavailable`.
+//!   A fetch then asks the other members online of the asker's conversation,
+//!   and of no other (`FileWanted`, which names nobody); a client that holds
+//!   the blob and a message referring to it uploads it again, and whoever
+//!   waited is served. A member's fetch of a hash not registered in their
+//!   conversation (posted before a restart, long ago, or never) asks it the
+//!   same way: unknown and elsewhere look alike, and a blob stored for other
+//!   conversations waits until a member of theirs posts it there. Each
+//!   conversation is asked at most once per `SEEK_TIMEOUT` for a hash. If
+//!   nobody starts within `SEEK_TIMEOUT` of a waiter's fetch:
+//!   `FileUnavailable`.
 //! - **Uploads.** One per blob at a time, one chunk at a time, each checked
 //!   before its body is read; another member with the same blob waits, and
-//!   hears `FileStored` when it lands. One that stalls (`UPLOAD_IDLE`) passes
-//!   on. A blob is visible only once its bytes, each chunk on disk before it
-//!   counts, hash to its id. Its reservation evicts nothing: cached blobs go
-//!   for bytes as they arrive.
+//!   hears `FileStored` when it lands. One that stalls passes on
+//!   (`UPLOAD_IDLE`; `QUEUED_IDLE` with somebody queued, `FIRST_BYTE` before
+//!   its first chunk), and a seek asks with an upload under way too, since
+//!   whoever uploads need not hold the blob. A blob is visible only once its
+//!   bytes, each chunk on disk before it counts, hash to its id. Its
+//!   reservation evicts nothing: cached blobs go for bytes as they arrive.
 //! - **Budgets.** Bytes per hour each way, per connection and per address
 //!   (`limit_key`), charged when a ticket is handed out; and the control
 //!   messages themselves, so a flood of uploads that never finish cannot
 //!   crowd out the index.
 //! - **Tickets.** 128 random bits, bound to the session, the blob and the
-//!   direction; ten minutes, or until the session ends; compared in constant
+//!   direction; ten minutes, or until the session ends (an upload's slides
+//!   with each chunk of `SLIDE_CHUNK` or more, up to `UPLOAD_MAX_LIFE`); compared in constant
 //!   time. One that matches nothing counts against the address (`GUESSES`);
 //!   one that was good a moment ago hears "gone" and counts for nothing.
 
@@ -51,10 +60,13 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 use voipc_protocol::conv::{hex, unhex};
-use voipc_protocol::messages::ServerMessage;
+use voipc_protocol::messages::{
+    ServerMessage, FILE_BUDGET, FILE_BUSY, FILE_EXPIRED, FILE_FAILED, FILE_MISMATCH, FILE_NOT_HERE,
+    FILE_OFF, FILE_PLACES, FILE_RATE, FILE_STALLED, FILE_TOO_LARGE,
+};
 use voipc_protocol::types::{ChannelId, FileConv, FileLimits, SessionId, UserId};
 
 use crate::config::FilesConfig;
@@ -66,6 +78,12 @@ const MIB: u64 = 1024 * 1024;
 pub const MAX_CHUNK: usize = 1024 * 1024;
 /// How long a ticket lasts, if its session does not end first.
 const TICKET_LIFETIME: Duration = Duration::from_secs(10 * 60);
+/// Most download bytes read and not yet sent, across every ticket: a reader
+/// that never takes them (an h2 window of zero) holds them until its
+/// connection ends.
+const GET_BYTES_IN_FLIGHT: usize = 64 * 1024 * 1024;
+/// The unit `GET_BYTES_IN_FLIGHT` is counted in.
+const KIB: usize = 1024;
 /// How long a fetch of a blob that has gone waits for a member to upload it.
 const SEEK_TIMEOUT: Duration = Duration::from_secs(60);
 /// How long a blob that was stored here stays registered, so a fetch after it
@@ -85,21 +103,39 @@ const MIN_CHARGE: u64 = 64 * 1024;
 /// passes to the next member with the file: about 50 kbit/s for a 1 MiB
 /// chunk. A client on a slower link sends smaller ones.
 const UPLOAD_IDLE: Duration = Duration::from_secs(3 * 60);
+/// An upload that has not sent its first byte this long after it began (or
+/// its last chunk started) ends: whoever claims a blob they do not hold need
+/// not even trickle to keep its holders out for minutes (R1-07).
+const FIRST_BYTE: Duration = Duration::from_secs(30);
+/// And with a member queued behind it, who has the blob as much as it does,
+/// an upload quiet this long passes on.
+const QUEUED_IDLE: Duration = Duration::from_secs(30);
+/// A chunk at least this long (or the last) moves its upload's ticket to
+/// `TICKET_LIFETIME` from now: a slow link that keeps sending gets the time it
+/// needs, a trickle of tiny chunks does not.
+const SLIDE_CHUNK: u64 = 64 * 1024;
+/// However it slides, an upload ends this long after it began.
+const UPLOAD_MAX_LIFE: Duration = Duration::from_secs(60 * 60);
 /// Tickets kept per blob, each way.
 const MAX_TICKETS: usize = 256;
 
 /// The answer to every fetch the asker may not make, and to a hash that is
 /// not here: the two must not be told apart.
-const NOT_HERE: &str = "this file is not in a conversation of yours";
-const NO_FILES: &str = "this relay keeps no files";
+/// A refusal: its `FileRefused.code`, and the words for people.
+type Why = (u16, &'static str);
+const NOT_HERE: Why = (FILE_NOT_HERE, "this file is not in a conversation of yours");
+const NO_FILES: Why = (FILE_OFF, "this relay keeps no files");
 
 // ── Conversations ─────────────────────────────────────────────────────────
 
-/// One side of a direct conversation: an account, else a guest's name.
+/// One side of a direct conversation: an account, else a guest's connection,
+/// by its user id (never handed out twice). Not the guest's name: a later
+/// guest who takes it would inherit the conversation's registrations and its
+/// `FileWanted` (R1-11, D-6). A guest's E2E identity is per connection anyway.
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub(crate) enum Party {
     Account([u8; 16]),
-    Name(String),
+    Guest(UserId),
 }
 
 /// A conversation as a blob is filed under it: the same for both ends of a
@@ -122,7 +158,7 @@ fn direct(a: Party, b: Party) -> Place {
 fn party_of(session: &UserSession) -> Party {
     match session.account_id() {
         Some(id) => Party::Account(id),
-        None => Party::Name(session.username.to_lowercase()),
+        None => Party::Guest(session.user_id),
     }
 }
 
@@ -132,7 +168,7 @@ async fn resolve(
     state: &ServerState,
     session_id: SessionId,
     conv: FileConv,
-) -> Result<(Place, IpAddr), &'static str> {
+) -> Result<(Place, IpAddr), Why> {
     let (me, ip, user_id) = state
         .sessions
         .get(&session_id)
@@ -140,7 +176,10 @@ async fn resolve(
         .ok_or(NOT_HERE)?;
     let place = match conv {
         FileConv::Channel(id) => {
-            // As for chat: no chat in the lobby, and only members post
+            // No files in the lobby, and only members. Not chat's announce
+            // rule: there, a member who holds a file answers a seek for it by
+            // uploading it again, and a blob registered without a message to
+            // carry it shows nobody anything (R1-15)
             if id == 0 || !state.is_member(id, user_id).await {
                 return Err(NOT_HERE);
             }
@@ -270,7 +309,16 @@ const GUESSES: (f64, f64) = (30.0, 0.1);
 struct Ticket {
     secret: String,
     session: SessionId,
+    /// The conversation a download ticket was handed out for: it ends when
+    /// its holder leaves that channel (S-021). An upload's names none.
+    place: Option<Place>,
     expires: Instant,
+    /// Download bytes the ticket may still read: the blob once, plus a
+    /// retry's worth. Its budget was charged once, for one read.
+    left: u64,
+    /// One download request at a time per ticket: the next waits until the
+    /// bytes of the one before have been sent or dropped.
+    gate: Arc<Semaphore>,
 }
 
 impl Ticket {
@@ -278,7 +326,10 @@ impl Ticket {
         Ticket {
             secret: hex(&rand::random::<[u8; 16]>()),
             session,
+            place: None,
             expires: now + TICKET_LIFETIME,
+            left: 0,
+            gate: Arc::new(Semaphore::new(1)),
         }
     }
 
@@ -288,12 +339,12 @@ impl Ticket {
     }
 }
 
-/// Push `ticket`, keeping at most `MAX_TICKETS`: the oldest goes first.
-fn keep(list: &mut Vec<Ticket>, ticket: Ticket) {
-    if list.len() >= MAX_TICKETS {
-        list.remove(0);
-    }
+/// Push `ticket`, keeping at most `MAX_TICKETS`: the oldest goes first, and
+/// is handed back.
+fn keep(list: &mut Vec<Ticket>, ticket: Ticket) -> Option<Ticket> {
+    let oldest = (list.len() >= MAX_TICKETS).then(|| list.remove(0));
     list.push(ticket);
+    oldest
 }
 
 // ── The store ─────────────────────────────────────────────────────────────
@@ -330,6 +381,7 @@ struct Upload {
     /// When a chunk last started or ended: an upload quiet for `UPLOAD_IDLE`
     /// ends, so a reservation cannot be held without sending.
     progress: Instant,
+    started: Instant,
     /// A chunk is on its way: one at a time, so an upload never has more
     /// than one body held in memory.
     busy: bool,
@@ -357,6 +409,9 @@ struct Waiter {
     session: SessionId,
     ip: IpAddr,
     place: Place,
+    /// When it began to wait: each waiter gets its own `SEEK_TIMEOUT`, so one
+    /// who asks late is not told "unavailable" with the first (R1-09).
+    since: Instant,
 }
 
 #[derive(Default)]
@@ -369,8 +424,9 @@ struct Entry {
     ever_stored: bool,
     upload: Option<Upload>,
     queued: Vec<Queued>,
-    /// When the conversations were asked for it, if they are being asked.
-    seeking: Option<Instant>,
+    /// Which conversation was last asked for it, and when: each at most once
+    /// per `SEEK_TIMEOUT`, however often its members fetch or cancel.
+    asked: Vec<(Place, Instant)>,
     waiters: Vec<Waiter>,
     /// Download tickets. They outlive the blob, so a download cut short by
     /// an eviction hears "gone, fetch again" instead of "bad ticket".
@@ -447,11 +503,38 @@ pub(crate) enum Out {
     },
 }
 
-fn refuse(out: &mut Vec<Out>, session: SessionId, hash: [u8; 32], reason: &str) {
+/// Ask `places`' members online, except `except`, for the blob: each place
+/// at most once per `SEEK_TIMEOUT`, however often its members fetch or cancel.
+fn ask(
+    entry: &mut Entry,
+    places: Vec<Place>,
+    hash: [u8; 32],
+    except: SessionId,
+    now: Instant,
+    out: &mut Vec<Out>,
+) {
+    entry
+        .asked
+        .retain(|(_, at)| now.saturating_duration_since(*at) < SEEK_TIMEOUT);
+    for place in places {
+        if entry.asked.iter().any(|(p, _)| *p == place) {
+            continue;
+        }
+        entry.asked.push((place.clone(), now));
+        out.push(Out::Want {
+            place,
+            hash,
+            except,
+        });
+    }
+}
+
+fn refuse(out: &mut Vec<Out>, session: SessionId, hash: [u8; 32], (code, reason): Why) {
     out.push(Out::To(
         session,
         ServerMessage::FileRefused {
             hash,
+            code,
             reason: reason.into(),
         },
     ));
@@ -479,10 +562,13 @@ pub struct FileStore {
     dir: PathBuf,
     limits: Limits,
     inner: Mutex<Inner>,
+    /// `GET_BYTES_IN_FLIGHT`, in KiB.
+    in_flight: Arc<Semaphore>,
 }
 
-/// A blob's file name: its hash in hex. An upload in progress adds
-/// `.<id>.part`. Nothing else in the directory is ours to delete.
+/// A blob's file name: its hash in hex. An upload in progress, or a blob on
+/// its way out, adds `.<id>.part`. Nothing else in the directory is ours to
+/// delete.
 fn is_ours(name: &str) -> bool {
     match name.split_once('.') {
         None => unhex::<32>(name).is_some(),
@@ -498,6 +584,9 @@ fn is_ours(name: &str) -> bool {
 /// Delete every blob file in `dir`, and nothing else: what a run before this
 /// one left. Done at every start, with the cache on or off, so turning it
 /// off leaves no blob behind.
+///
+/// One file that cannot be deleted is reported and the rest still go, rather
+/// than every old blob staying because of it (R1-12).
 pub fn wipe(dir: &Path) -> std::io::Result<usize> {
     let mut wiped = 0;
     let entries = match std::fs::read_dir(dir) {
@@ -506,10 +595,21 @@ pub fn wipe(dir: &Path) -> std::io::Result<usize> {
         Err(e) => return Err(e),
     };
     for entry in entries {
-        let entry = entry?;
-        if entry.file_type()?.is_file() && is_ours(&entry.file_name().to_string_lossy()) {
-            std::fs::remove_file(entry.path())?;
-            wiped += 1;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                warn!("files: listing {}: {e}", dir.display());
+                continue;
+            }
+        };
+        let ours = entry.file_type().is_ok_and(|t| t.is_file())
+            && is_ours(&entry.file_name().to_string_lossy());
+        if !ours {
+            continue;
+        }
+        match std::fs::remove_file(entry.path()) {
+            Ok(()) => wiped += 1,
+            Err(e) => warn!("files: deleting {}: {e}", entry.path().display()),
         }
     }
     Ok(wiped)
@@ -520,7 +620,21 @@ impl FileStore {
     /// there by an earlier run wiped, and nothing else touched.
     pub fn open(config: &FilesConfig) -> std::io::Result<FileStore> {
         let dir = PathBuf::from(&config.dir);
-        std::fs::create_dir_all(&dir)?;
+        // This user's only, like the database and its key: the names are the
+        // hashes, and the sizes show (R1-12)
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let narrowed = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            if let Err(e) = narrowed {
+                warn!("files: making {} this user's only: {e}", dir.display());
+            }
+        }
         let wiped = wipe(&dir)?;
         if wiped > 0 {
             info!(wiped, "files: wiped the blobs of the last run");
@@ -540,6 +654,7 @@ impl FileStore {
                 down_per_hour: (config.download_mb_per_hour as u64 * MIB) as f64,
             },
             inner: Mutex::new(Inner::default()),
+            in_flight: Arc::new(Semaphore::new(GET_BYTES_IN_FLIGHT / KIB)),
         }
     }
 
@@ -570,19 +685,18 @@ impl FileStore {
             .or_insert_with(|| Budget::new(&limits, ADDRESS_OPS, now))
     }
 
-    /// Whether `ip` may present a ticket: it has wrong ones left.
-    fn guess_allowed(&self, ip: IpAddr, now: Instant) -> bool {
-        let mut inner = self.lock();
-        self.address(&mut inner, ip, now).guesses.has(1.0, now)
-    }
-
-    /// A ticket from `ip` that matched nothing.
-    fn guess_failed(&self, ip: IpAddr, now: Instant) {
+    /// A ticket from `ip` that matched nothing: 401, and one of the address's
+    /// wrong tickets spent, or 429 once it has none left. Asked only after the
+    /// ticket, so a NAT's good tickets never wait on its wrong ones (S-022);
+    /// at 128 bits, testing a ticket past the budget gains a guesser nothing.
+    fn guess_failed(&self, ip: IpAddr, now: Instant) -> Reply {
         let mut inner = self.lock();
         let guesses = &mut self.address(&mut inner, ip, now).guesses;
-        if guesses.has(1.0, now) {
-            guesses.left -= 1.0;
+        if !guesses.has(1.0, now) {
+            return text(429, "too many wrong tickets");
         }
+        guesses.left -= 1.0;
+        text(401, "bad ticket")
     }
 
     /// Whether the session and its address may send one more file message.
@@ -648,12 +762,46 @@ impl FileStore {
         }
     }
 
+    /// Take a blob out of the index. Its file is renamed under the lock to a
+    /// name of its own (`is_ours` wipes those too) and deleted from there
+    /// after it: a later copy of the same blob, renamed into place meanwhile,
+    /// is then never the one deleted (R1-04).
     fn drop_blob(&self, inner: &mut Inner, hash: &[u8; 32], trash: &mut Trash) {
         let Some(blob) = inner.entries.get_mut(hash).and_then(|e| e.blob.take()) else {
             return;
         };
         inner.stored = inner.stored.saturating_sub(blob.size);
-        trash.0.push(self.blob_path(hash));
+        let doomed = self.part_path(hash, inner.next_id);
+        inner.next_id += 1;
+        match std::fs::rename(self.blob_path(hash), &doomed) {
+            Ok(()) => trash.0.push(doomed),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                // Deleted where it is, then, and still under the lock
+                warn!("files: moving a blob out: {e}");
+                if let Err(e) = std::fs::remove_file(self.blob_path(hash)) {
+                    warn!("files: deleting a blob: {e}");
+                }
+            }
+        }
+    }
+
+    /// A blob the index lists whose file is missing (removed by hand, a disk
+    /// fault): the index lets go of it, so the next fetch seeks it instead of
+    /// answering `FileReady` and then 404 until its age runs out (R1-04).
+    /// Checked under the lock, where a new copy is renamed into place.
+    fn forget_lost(&self, hash: &[u8; 32]) {
+        let mut inner = self.lock();
+        let listed = inner.entries.get(hash).is_some_and(|e| e.blob.is_some());
+        let lost = matches!(
+            std::fs::metadata(self.blob_path(hash)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        );
+        if listed && lost {
+            if let Some(blob) = inner.entries.get_mut(hash).and_then(|e| e.blob.take()) {
+                inner.stored = inner.stored.saturating_sub(blob.size);
+            }
+        }
     }
 
     /// Room on disk for `n` more bytes of an upload: the least recently used
@@ -677,9 +825,12 @@ impl FileStore {
         }
     }
 
-    /// Room in the index for one more blob: the idle entry registered
-    /// longest ago makes way when it is full.
-    fn room_for_entry(&self, inner: &mut Inner) -> bool {
+    /// Room in the index for one more blob: when it is full, the idle entry
+    /// registered longest ago makes way, else the stored blob used longest ago
+    /// that nobody is uploading, waiting for or holding a ticket to. Small
+    /// blobs fill the index long before they fill `max_total`, and would
+    /// otherwise refuse every new one until they aged out (S-004).
+    fn room_for_entry(&self, inner: &mut Inner, now: Instant, trash: &mut Trash) -> bool {
         if inner.entries.len() < MAX_ENTRIES {
             return true;
         }
@@ -689,8 +840,24 @@ impl FileStore {
             .filter(|(_, e)| e.idle())
             .map(|(h, e)| (e.places.iter().map(|(_, at)| *at).max(), *h))
             .min();
-        match oldest {
+        if let Some((_, h)) = oldest {
+            inner.entries.remove(&h);
+            return true;
+        }
+        let unused = inner
+            .entries
+            .iter()
+            .filter(|(_, e)| {
+                e.upload.is_none()
+                    && e.queued.is_empty()
+                    && e.waiters.is_empty()
+                    && e.readers.iter().all(|t| t.expires <= now)
+            })
+            .filter_map(|(h, e)| e.blob.as_ref().map(|b| (b.used, *h)))
+            .min();
+        match unused {
             Some((_, h)) => {
+                self.drop_blob(inner, &h, trash);
                 inner.entries.remove(&h);
                 true
             }
@@ -726,7 +893,7 @@ impl FileStore {
                 out,
                 session,
                 hash,
-                "you have sent a lot of files: try again later",
+                (FILE_BUDGET, "you have sent a lot of files: try again later"),
             );
             return false;
         }
@@ -735,7 +902,10 @@ impl FileStore {
                 out,
                 session,
                 hash,
-                "the relay is busy with other uploads: try again later",
+                (
+                    FILE_BUSY,
+                    "the relay is busy with other uploads: try again later",
+                ),
             );
             return false;
         }
@@ -756,6 +926,7 @@ impl FileStore {
             size,
             on_disk: 0,
             progress: now,
+            started: now,
             busy: false,
             io: Arc::new(tokio::sync::Mutex::new(io)),
         });
@@ -794,6 +965,24 @@ impl FileStore {
         if let Some(upload) = self.end_upload(inner, &hash) {
             trash.0.push(self.part_path(&hash, upload.id));
             self.next_uploader(inner, hash, now, out);
+            // Nobody took over, and members still wait: their conversations
+            // are asked again (as far as `asked` allows), and the seek starts
+            // over, so a holder gets as long to answer as at the first ask.
+            // Ended at its deadline, it would otherwise end the waits at once
+            // with no holder asked since (S-005).
+            let Some(entry) = inner.entries.get_mut(&hash) else {
+                return;
+            };
+            if entry.upload.is_none() && !entry.waiters.is_empty() {
+                let mut places: Vec<Place> = Vec::new();
+                for w in &mut entry.waiters {
+                    w.since = now;
+                    if !places.contains(&w.place) {
+                        places.push(w.place.clone());
+                    }
+                }
+                ask(entry, places, hash, upload.ticket.session, now, out);
+            }
         }
     }
 
@@ -818,12 +1007,13 @@ impl FileStore {
         }
     }
 
-    /// A download ticket for `session`, if its budget allows.
+    /// A download ticket for `session`, asking in `place`, if its budget
+    /// allows.
     fn ready(
         &self,
         inner: &mut Inner,
         hash: [u8; 32],
-        (session, ip): (SessionId, IpAddr),
+        (session, ip, place): (SessionId, IpAddr, &Place),
         size: u64,
         now: Instant,
         out: &mut Vec<Out>,
@@ -833,14 +1023,25 @@ impl FileStore {
                 out,
                 session,
                 hash,
-                "you have fetched a lot of files: try again later",
+                (
+                    FILE_BUDGET,
+                    "you have fetched a lot of files: try again later",
+                ),
             );
             return None;
         }
-        let ticket = Ticket::new(session, now);
+        let ticket = Ticket {
+            left: size.saturating_mul(2),
+            place: Some(place.clone()),
+            ..Ticket::new(session, now)
+        };
         if let Some(entry) = inner.entries.get_mut(&hash) {
             entry.readers.retain(|t| t.expires > now);
-            keep(&mut entry.readers, ticket.clone());
+            // One pushed out is spent, not unknown: a request still on its
+            // way hears "gone", and its address is not charged a guess (S-026)
+            if let Some(oldest) = keep(&mut entry.readers, ticket.clone()) {
+                keep(&mut entry.spent, oldest);
+            }
         }
         Some(ServerMessage::FileReady {
             hash,
@@ -890,19 +1091,29 @@ impl FileStore {
         trash: &mut Trash,
     ) {
         if !self.op_allowed(inner, session, ip, now) {
-            return refuse(out, session, hash, "too many files at once: slow down");
+            return refuse(
+                out,
+                session,
+                hash,
+                (FILE_RATE, "too many files at once: slow down"),
+            );
         }
         if size == 0 || size > self.limits.max_bytes {
             return refuse(
                 out,
                 session,
                 hash,
-                "the file is larger than this relay takes",
+                (FILE_TOO_LARGE, "the file is larger than this relay takes"),
             );
         }
         self.expire_if_dead(inner, &hash, now, trash);
-        if !inner.entries.contains_key(&hash) && !self.room_for_entry(inner) {
-            return refuse(out, session, hash, "the relay is busy: try again later");
+        if !inner.entries.contains_key(&hash) && !self.room_for_entry(inner, now, trash) {
+            return refuse(
+                out,
+                session,
+                hash,
+                (FILE_BUSY, "the relay is busy: try again later"),
+            );
         }
         let entry = inner.entries.entry(hash).or_default();
         if !entry.register(place, now) {
@@ -910,13 +1121,17 @@ impl FileStore {
                 out,
                 session,
                 hash,
-                "this file has been posted in too many places",
+                (FILE_PLACES, "this file has been posted in too many places"),
             );
         }
         if let Some(blob) = &mut entry.blob {
-            // Posted again (a forward): it is in use, within its age
+            // Posted again (a forward, or a member answering a seek in a
+            // conversation it was not registered in): it is in use, within its
+            // age, and that conversation's waiters may have it now
             blob.used = now;
-            return out.push(Out::To(session, ServerMessage::FileStored { hash }));
+            let size = blob.size;
+            out.push(Out::To(session, ServerMessage::FileStored { hash }));
+            return self.serve_waiters(inner, hash, size, now, out);
         }
         if let Some(upload) = &entry.upload {
             if upload.ticket.session == session {
@@ -976,43 +1191,57 @@ impl FileStore {
         trash: &mut Trash,
     ) {
         if !self.op_allowed(inner, session, ip, now) {
-            return refuse(out, session, hash, "too many files at once: slow down");
+            return refuse(
+                out,
+                session,
+                hash,
+                (FILE_RATE, "too many files at once: slow down"),
+            );
         }
+        // The asker is a member of `place` (`resolve`). A hash is sought in
+        // `place` alone, registered there or not (posted before a restart, or
+        // long ago, or never): only a member holding it and a message there
+        // that names it answers. A blob stored for other conversations is
+        // never served without that.
         let registered = inner
             .entries
             .get(&hash)
             .is_some_and(|e| e.places.iter().any(|(p, _)| *p == place));
-        if !registered {
-            return refuse(out, session, hash, NOT_HERE);
+        if !inner.entries.contains_key(&hash) && !self.room_for_entry(inner, now, trash) {
+            return refuse(
+                out,
+                session,
+                hash,
+                (FILE_BUSY, "the relay is busy: try again later"),
+            );
         }
         self.expire_if_dead(inner, &hash, now, trash);
-        let entry = inner.entries.get_mut(&hash).expect("registered");
-        if let Some(blob) = &mut entry.blob {
+        let entry = inner.entries.entry(hash).or_default();
+        if let Some(blob) = entry.blob.as_mut().filter(|_| registered) {
             // A fetch keeps it for another `cache_mins`, within its age
             blob.used = now;
             let size = blob.size;
-            if let Some(msg) = self.ready(inner, hash, (session, ip), size, now, out) {
+            if let Some(msg) = self.ready(inner, hash, (session, ip, &place), size, now, out) {
                 out.push(Out::To(session, msg));
             }
             return;
         }
         if !entry.waiters.iter().any(|w| w.session == session) {
-            entry.waiters.push(Waiter { session, ip, place });
+            entry.waiters.push(Waiter {
+                session,
+                ip,
+                place: place.clone(),
+                since: now,
+            });
         }
         out.push(Out::To(session, ServerMessage::FileSeeking { hash }));
-        if entry.seeking.is_none() {
-            entry.seeking = Some(now);
-            // An upload under way (a re-seed already) serves the waiters
-            if entry.upload.is_none() {
-                for (place, _) in &entry.places {
-                    out.push(Out::Want {
-                        place: place.clone(),
-                        hash,
-                        except: session,
-                    });
-                }
-            }
-        }
+        // The asker's conversation only, registered or not: the others'
+        // members would learn when somebody elsewhere opens the file, and in
+        // a direct conversation that is who opens it (R1-10, D-5). Asked with
+        // an upload under way too: it may be somebody's who never had the
+        // blob, and a holder who answers queues behind it and takes over when
+        // it stalls (R1-07).
+        ask(entry, vec![place], hash, session, now, out);
     }
 
     /// `FileCancel`.
@@ -1050,15 +1279,31 @@ impl FileStore {
         }
         entry.waiters.retain(|w| w.session != session);
         entry.queued.retain(|q| q.session != session);
-        if entry.waiters.is_empty() {
-            entry.seeking = None;
-        }
         if entry
             .upload
             .as_ref()
             .is_some_and(|u| u.ticket.session == session)
         {
             self.abort_upload(inner, hash, now, out, trash);
+        }
+    }
+
+    /// A member has left a channel (moved on, was kicked, or unsubscribed):
+    /// the download tickets it was handed there end, as spent, so a request
+    /// on its way hears "gone" (S-021). Its other tickets stay.
+    pub(crate) fn left(&self, session: SessionId, place: &Place) {
+        let mut inner = self.lock();
+        for entry in inner.entries.values_mut() {
+            if !entry.readers.iter().any(|t| t.session == session) {
+                continue;
+            }
+            let (gone, kept): (Vec<Ticket>, Vec<Ticket>) = std::mem::take(&mut entry.readers)
+                .into_iter()
+                .partition(|t| t.session == session && t.place.as_ref() == Some(place));
+            entry.readers = kept;
+            for ticket in gone {
+                keep(&mut entry.spent, ticket);
+            }
         }
     }
 
@@ -1120,11 +1365,17 @@ impl FileStore {
         let entry = inner.entries.get_mut(&hash).expect("listed");
         entry.readers.retain(|t| t.expires > now);
         entry.spent.retain(|t| t.expires > now);
+        let idle_for = if entry.queued.is_empty() {
+            UPLOAD_IDLE
+        } else {
+            QUEUED_IDLE
+        };
         let ended = entry.upload.as_ref().and_then(|u| {
+            let quiet = now.saturating_duration_since(u.progress);
             if u.ticket.expires <= now {
-                Some((u.ticket.session, "the upload took too long"))
-            } else if now.saturating_duration_since(u.progress) >= UPLOAD_IDLE && !u.busy {
-                Some((u.ticket.session, "the upload stalled"))
+                Some((u.ticket.session, (FILE_EXPIRED, "the upload took too long")))
+            } else if !u.busy && (quiet >= idle_for || (u.on_disk == 0 && quiet >= FIRST_BYTE)) {
+                Some((u.ticket.session, (FILE_STALLED, "the upload stalled")))
             } else {
                 None
             }
@@ -1136,17 +1387,18 @@ impl FileStore {
         let Some(entry) = inner.entries.get_mut(&hash) else {
             return;
         };
-        let timed_out = entry
-            .seeking
-            .is_some_and(|since| now.saturating_duration_since(since) >= SEEK_TIMEOUT);
-        if timed_out && entry.upload.is_none() {
-            for waiter in entry.waiters.drain(..) {
+        if entry.upload.is_none() {
+            let (timed_out, waiting): (Vec<Waiter>, Vec<Waiter>) =
+                std::mem::take(&mut entry.waiters)
+                    .into_iter()
+                    .partition(|w| now.saturating_duration_since(w.since) >= SEEK_TIMEOUT);
+            entry.waiters = waiting;
+            for waiter in timed_out {
                 out.push(Out::To(
                     waiter.session,
                     ServerMessage::FileUnavailable { hash },
                 ));
             }
-            entry.seeking = None;
         }
         entry
             .places
@@ -1241,7 +1493,12 @@ impl FileStore {
         }
         let written = async {
             if io.file.is_none() {
-                io.file = Some(tokio::fs::File::create(&io.path).await?);
+                let mut o = tokio::fs::OpenOptions::new();
+                o.write(true).create(true).truncate(true);
+                // Mode 0600 from the start, as `fsutil` writes secrets
+                #[cfg(unix)]
+                o.mode(0o600);
+                io.file = Some(o.open(&io.path).await?);
             }
             let file = io.file.as_mut().expect("opened");
             file.write_all(body).await?;
@@ -1276,7 +1533,7 @@ impl FileStore {
                 &mut out,
                 uploader,
                 hash,
-                "the relay could not store the file",
+                (FILE_FAILED, "the relay could not store the file"),
             );
             self.abort_upload(&mut inner, hash, now, &mut out, &mut trash);
             drop(inner);
@@ -1284,6 +1541,14 @@ impl FileStore {
             return (Put::Failed, out);
         }
         io.hasher.update(body);
+        if n >= SLIDE_CHUNK || on_disk == size {
+            let upload = inner
+                .entries
+                .get_mut(&hash)
+                .and_then(|e| e.upload.as_mut())
+                .expect("ours");
+            upload.ticket.expires = (now + TICKET_LIFETIME).min(upload.started + UPLOAD_MAX_LIFE);
+        }
         if on_disk < size {
             return (Put::Accepted(on_disk), out);
         }
@@ -1296,7 +1561,10 @@ impl FileStore {
                 &mut out,
                 uploader,
                 hash,
-                "the uploaded bytes are not the file it names",
+                (
+                    FILE_MISMATCH,
+                    "the uploaded bytes are not the file it names",
+                ),
             );
             self.abort_upload(&mut inner, hash, now, &mut out, &mut trash);
             drop(inner);
@@ -1311,7 +1579,7 @@ impl FileStore {
                 &mut out,
                 uploader,
                 hash,
-                "the relay could not store the file",
+                (FILE_FAILED, "the relay could not store the file"),
             );
             self.abort_upload(&mut inner, hash, now, &mut out, &mut trash);
             drop(inner);
@@ -1327,20 +1595,35 @@ impl FileStore {
             used: now,
         });
         entry.ever_stored = true;
-        entry.seeking = None;
         out.push(Out::To(uploader, ServerMessage::FileStored { hash }));
         for queued in entry.queued.drain(..) {
             out.push(Out::To(queued.session, ServerMessage::FileStored { hash }));
         }
-        for waiter in std::mem::take(&mut entry.waiters) {
-            if let Some(msg) = self.ready(
-                &mut inner,
-                hash,
-                (waiter.session, waiter.ip),
-                size,
-                now,
-                &mut out,
-            ) {
+        self.serve_waiters(&mut inner, hash, size, now, &mut out);
+        (Put::Stored, out)
+    }
+
+    /// Hand the stored blob to its waiters whose conversation it is
+    /// registered in. The others wait on for a member of theirs, and the
+    /// seek's clock runs on for them.
+    fn serve_waiters(
+        &self,
+        inner: &mut Inner,
+        hash: [u8; 32],
+        size: u64,
+        now: Instant,
+        out: &mut Vec<Out>,
+    ) {
+        let Some(entry) = inner.entries.get_mut(&hash) else {
+            return;
+        };
+        let (served, waiting): (Vec<Waiter>, Vec<Waiter>) = std::mem::take(&mut entry.waiters)
+            .into_iter()
+            .partition(|w| entry.places.iter().any(|(p, _)| *p == w.place));
+        entry.waiters = waiting;
+        for waiter in served {
+            let who = (waiter.session, waiter.ip, &waiter.place);
+            if let Some(msg) = self.ready(inner, hash, who, size, now, out) {
                 out.push(Out::Waited {
                     session: waiter.session,
                     place: waiter.place,
@@ -1349,10 +1632,14 @@ impl FileStore {
                 });
             }
         }
-        (Put::Stored, out)
     }
 
     /// `GET /f/v1/<hash>` with `Range`.
+    ///
+    /// The bytes it answers with hold their ticket's turn and their share of
+    /// `GET_BYTES_IN_FLIGHT` until they have been sent or dropped, so a reader
+    /// that never takes them holds one chunk per ticket, and a ticket reads
+    /// its blob at most twice.
     pub(crate) async fn get(
         &self,
         hash: [u8; 32],
@@ -1360,27 +1647,44 @@ impl FileStore {
         range: Option<&str>,
         now: Instant,
     ) -> Get {
-        let total = {
-            let inner = self.lock();
-            let Some(entry) = inner.entries.get(&hash) else {
-                return Get::Unauthorized;
-            };
-            if !entry.readers.iter().any(|t| t.matches(presented, now)) {
-                let spent = entry.spent.iter().any(|t| t.matches(presented, now));
-                return if spent { Get::Gone } else { Get::Unauthorized };
-            }
-            match &entry.blob {
-                Some(blob) => blob.size,
-                None => return Get::Gone,
-            }
+        let (total, gate) = match self.reader(hash, presented, now) {
+            Ok(Some(found)) => found,
+            Ok(None) => return Get::Gone,
+            Err(get) => return get,
         };
         let Some((start, end)) = byte_range(range, total) else {
             return Get::Unsatisfiable(total);
         };
+        let len = end - start + 1;
+        let Ok(turn) = gate.acquire_owned().await else {
+            return Get::Gone;
+        };
+        {
+            // Checked again after the wait: the ticket may have ended, or
+            // the blob gone, while an earlier request held the turn
+            let mut inner = self.lock();
+            let Some(entry) = inner.entries.get_mut(&hash) else {
+                return Get::Gone;
+            };
+            if entry.blob.is_none() {
+                return Get::Gone;
+            }
+            let Some(ticket) = entry.readers.iter_mut().find(|t| t.matches(presented, now)) else {
+                return Get::Gone;
+            };
+            if ticket.left < len {
+                return Get::Gone;
+            }
+            ticket.left -= len;
+        }
+        let kib = (len as usize).div_ceil(KIB) as u32;
+        let Ok(share) = self.in_flight.clone().acquire_many_owned(kib).await else {
+            return Get::Gone;
+        };
         let read = async {
             let mut file = tokio::fs::File::open(self.blob_path(&hash)).await?;
             file.seek(std::io::SeekFrom::Start(start)).await?;
-            let mut data = vec![0u8; (end - start + 1) as usize];
+            let mut data = vec![0u8; len as usize];
             file.read_exact(&mut data).await?;
             std::io::Result::Ok(data)
         };
@@ -1389,11 +1693,39 @@ impl FileStore {
                 start,
                 end,
                 total,
-                data,
+                data: Bytes::from_owner(Held {
+                    data,
+                    _permits: (turn, share),
+                }),
             },
             // Deleted since the ticket was checked: fetch again
-            Err(_) => Get::Gone,
+            Err(e) => {
+                if e.kind() == std::io::ErrorKind::NotFound {
+                    self.forget_lost(&hash);
+                }
+                Get::Gone
+            }
         }
+    }
+
+    /// The blob's size and the ticket's turn, for a download ticket that
+    /// matches; `None` when its blob has gone.
+    #[allow(clippy::type_complexity)]
+    fn reader(
+        &self,
+        hash: [u8; 32],
+        presented: &str,
+        now: Instant,
+    ) -> Result<Option<(u64, Arc<Semaphore>)>, Get> {
+        let inner = self.lock();
+        let Some(entry) = inner.entries.get(&hash) else {
+            return Err(Get::Unauthorized);
+        };
+        let Some(ticket) = entry.readers.iter().find(|t| t.matches(presented, now)) else {
+            let spent = entry.spent.iter().any(|t| t.matches(presented, now));
+            return Err(if spent { Get::Gone } else { Get::Unauthorized });
+        };
+        Ok(entry.blob.as_ref().map(|b| (b.size, ticket.gate.clone())))
     }
 }
 
@@ -1459,11 +1791,24 @@ pub(crate) enum Get {
         start: u64,
         end: u64,
         total: u64,
-        data: Vec<u8>,
+        data: Bytes,
     },
     Unsatisfiable(u64),
     Unauthorized,
     Gone,
+}
+
+/// A download chunk, with the ticket's turn and its share of the bytes in
+/// flight: both are given back when the last copy of the chunk is dropped.
+struct Held {
+    data: Vec<u8>,
+    _permits: (OwnedSemaphorePermit, OwnedSemaphorePermit),
+}
+
+impl AsRef<[u8]> for Held {
+    fn as_ref(&self) -> &[u8] {
+        &self.data
+    }
 }
 
 /// The bytes a `Range` header asks for (inclusive), at most `MAX_CHUNK` of
@@ -1541,9 +1886,9 @@ async fn still_in(state: &ServerState, session: SessionId, place: &Place) -> boo
 fn sessions_of(state: &ServerState, party: &Party) -> Vec<SessionId> {
     let sid = match party {
         Party::Account(id) => state.account_sessions.get(id).map(|s| *s),
-        Party::Name(name) => state
-            .username_to_session
-            .get(name)
+        Party::Guest(user_id) => state
+            .user_to_session
+            .get(user_id)
             .map(|s| *s)
             .filter(|sid| state.sessions.get(sid).is_some_and(|s| s.account.is_none())),
     };
@@ -1560,7 +1905,7 @@ fn conv_for(state: &ServerState, other: &Party) -> Option<FileConv> {
     match (online, other) {
         (Some(user_id), _) => Some(FileConv::Direct(user_id)),
         (None, Party::Account(id)) => Some(FileConv::Account(*id)),
-        (None, Party::Name(_)) => None,
+        (None, Party::Guest(_)) => None,
     }
 }
 
@@ -1607,11 +1952,12 @@ async fn want(state: &ServerState, place: &Place, hash: [u8; 32], except: Sessio
 
 // ── Control messages ──────────────────────────────────────────────────────
 
-async fn refuse_now(tx: &mpsc::Sender<Vec<u8>>, hash: [u8; 32], reason: &str) {
+async fn refuse_now(tx: &mpsc::Sender<Vec<u8>>, hash: [u8; 32], (code, reason): Why) {
     let _ = send_msg(
         tx,
         &ServerMessage::FileRefused {
             hash,
+            code,
             reason: reason.into(),
         },
     )
@@ -1664,6 +2010,13 @@ pub(crate) async fn handle_cancel(state: &Arc<ServerState>, session_id: SessionI
     if let Some(store) = state.files.clone() {
         let out = store.cancel(hash, session_id, Instant::now());
         deliver(state, out).await;
+    }
+}
+
+/// A member left channel `channel_id` (`FileStore::left`).
+pub(crate) fn left_channel(state: &ServerState, session_id: SessionId, channel_id: ChannelId) {
+    if let Some(store) = state.files.as_ref() {
+        store.left(session_id, &Place::Channel(channel_id));
     }
 }
 
@@ -1747,7 +2100,7 @@ pub(crate) fn prepare(
     authorization: Option<&str>,
 ) -> Prepared {
     let Some(store) = state.files.as_ref() else {
-        return Prepared::Reply(text(404, NO_FILES));
+        return Prepared::Reply(text(404, NO_FILES.1));
     };
     let (path, query) = target.split_once('?').unwrap_or((target, ""));
     let Some(hash) = path.strip_prefix("/f/v1/").and_then(unhex::<32>) else {
@@ -1778,9 +2131,6 @@ pub(crate) fn prepare(
         }
     }
     let now = Instant::now();
-    if !store.guess_allowed(ip, now) {
-        return Prepared::Reply(text(429, "too many wrong tickets"));
-    }
     let Some(ticket) = authorization.and_then(|v| v.strip_prefix("Bearer ")) else {
         return Prepared::Reply(text(401, "a ticket is needed"));
     };
@@ -1799,10 +2149,7 @@ pub(crate) fn prepare(
     };
     match store.claim(hash, ticket, offset, now) {
         Ok(claim) => Prepared::Put(claim),
-        Err(Put::Unauthorized) => {
-            store.guess_failed(ip, now);
-            Prepared::Reply(text(401, "bad ticket"))
-        }
+        Err(Put::Unauthorized) => Prepared::Reply(store.guess_failed(ip, now)),
         Err(Put::Conflict(n)) => {
             Prepared::Reply(at_offset(text(409, "the upload is elsewhere"), n))
         }
@@ -1811,12 +2158,22 @@ pub(crate) fn prepare(
 }
 
 /// A chunk's body is in: write it.
-pub(crate) async fn finish_put(state: &ServerState, claim: Claim, body: Bytes) -> Reply {
+pub(crate) async fn finish_put(state: &Arc<ServerState>, claim: Claim, body: Bytes) -> Reply {
     let Some(store) = state.files.clone() else {
-        return text(404, NO_FILES);
+        return text(404, NO_FILES.1);
     };
-    let (result, out) = store.put(claim, &body, Instant::now()).await;
-    deliver(state, out).await;
+    // In a task of its own, awaited: hyper drops a request on a reset stream
+    // or at its connection's deadline, and a chunk cut off mid-write had its
+    // bytes counted but not hashed, so the upload ended 422 (R1-05). The task
+    // writes the chunk and tells whom it concerns whatever becomes of the
+    // request; a retry then hears where the upload is.
+    let state = state.clone();
+    let task = tokio::spawn(async move {
+        let (result, out) = store.put(claim, &body, Instant::now()).await;
+        deliver(&state, out).await;
+        result
+    });
+    let result = task.await.unwrap_or(Put::Failed);
     match result {
         Put::Accepted(n) => at_offset(text(204, ""), n),
         Put::Stored => text(201, "stored"),
@@ -1838,7 +2195,7 @@ pub(crate) async fn finish_get(
     range: Option<&str>,
 ) -> Reply {
     let Some(store) = state.files.clone() else {
-        return text(404, NO_FILES);
+        return text(404, NO_FILES.1);
     };
     let now = Instant::now();
     match store.get(hash, ticket, range, now).await {
@@ -1853,7 +2210,7 @@ pub(crate) async fn finish_get(
                 ("content-type", "application/octet-stream".into()),
                 ("content-range", format!("bytes {start}-{end}/{total}")),
             ],
-            body: Bytes::from(data),
+            body: data,
         }),
         Get::Unsatisfiable(total) => {
             let mut reply = text(416, "outside the file");
@@ -1862,10 +2219,7 @@ pub(crate) async fn finish_get(
                 .push(("content-range", format!("bytes */{total}")));
             reply
         }
-        Get::Unauthorized => {
-            store.guess_failed(ip, now);
-            text(401, "bad ticket")
-        }
+        Get::Unauthorized => store.guess_failed(ip, now),
         Get::Gone => text(404, "the file has gone: fetch it again"),
     }
 }
@@ -1873,7 +2227,7 @@ pub(crate) async fn finish_get(
 /// One whole `/f/` request with its body in hand: what tests use.
 #[cfg(test)]
 pub(crate) async fn http(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     ip: IpAddr,
     method: &str,
     target: &str,
@@ -1908,8 +2262,15 @@ pub(crate) async fn serve_http1<S>(
     const CONN_LIFETIME: Duration = Duration::from_secs(60);
     const GRACE: Duration = Duration::from_secs(30);
     let deadline = Instant::now() + CONN_LIFETIME;
-    let served = serve_requests(&mut stream, head, buf, &state, peer, deadline);
-    if tokio::time::timeout(CONN_LIFETIME + GRACE, served)
+    let mut slot = FileSlot {
+        state: &state,
+        ip: peer.ip(),
+        held: false,
+    };
+    let served = serve_requests(&mut stream, head, buf, &state, peer, deadline, &mut slot);
+    // No request starts after `deadline`, and the one under way gets its own
+    // `BODY_TIME`
+    if tokio::time::timeout(CONN_LIFETIME + BODY_TIME + GRACE, served)
         .await
         .is_err()
     {
@@ -1919,13 +2280,34 @@ pub(crate) async fn serve_http1<S>(
     debug!(%peer, "file connection closed");
 }
 
+/// A file connection's place in the file pool (`ConnLimits::to_files`), given
+/// back to the pre pool when the connection ends, however it ends.
+struct FileSlot<'a> {
+    state: &'a ServerState,
+    ip: IpAddr,
+    held: bool,
+}
+
+impl Drop for FileSlot<'_> {
+    fn drop(&mut self) {
+        if self.held {
+            self.state.limits.from_files(self.ip);
+        }
+    }
+}
+
+/// How long one request's body may take on HTTP/1.1: a 1 MiB chunk needs
+/// about 140 kbit/s for it, and a slower link sends smaller chunks.
+const BODY_TIME: Duration = Duration::from_secs(60);
+
 async fn serve_requests<S>(
     stream: &mut S,
     head: String,
     mut buf: Vec<u8>,
-    state: &ServerState,
+    state: &Arc<ServerState>,
     peer: SocketAddr,
     deadline: Instant,
+    slot: &mut FileSlot<'_>,
 ) where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -1943,7 +2325,7 @@ async fn serve_requests<S>(
                 _ => return,
             },
         };
-        let Some((method, target)) = request_line(&head) else {
+        let Some((method, target)) = request_line(&head).filter(|_| crlf_only(&head)) else {
             let _ = write_reply(stream, &text(400, "bad request"), false, true).await;
             return;
         };
@@ -1958,13 +2340,9 @@ async fn serve_requests<S>(
             .await;
             return;
         }
-        let len = match header("content-length").map(|v| v.trim().parse::<usize>()) {
-            None => 0,
-            Some(Ok(n)) => n,
-            Some(Err(_)) => {
-                let _ = write_reply(stream, &text(400, "bad Content-Length"), false, true).await;
-                return;
-            }
+        let Some(len) = content_length(&head) else {
+            let _ = write_reply(stream, &text(400, "bad Content-Length"), false, true).await;
+            return;
         };
         let closing = header("connection").is_some_and(|v| v.trim().eq_ignore_ascii_case("close"))
             || Instant::now() >= deadline;
@@ -1973,6 +2351,9 @@ async fn serve_requests<S>(
             // connection cannot carry on past it
             Prepared::Reply(reply) => {
                 let _ = write_reply(stream, &reply, method == "HEAD", closing || len > 0).await;
+                if len > 0 {
+                    linger(stream, &buf, len).await;
+                }
                 if closing || len > 0 {
                     return;
                 }
@@ -1982,11 +2363,17 @@ async fn serve_requests<S>(
                 if len > claim.max_body {
                     let reply = text(413, "more bytes than the upload has left");
                     let _ = write_reply(stream, &reply, false, true).await;
+                    linger(stream, &buf, len).await;
                     return;
                 }
-                let left =
-                    deadline.saturating_duration_since(Instant::now()) + Duration::from_secs(5);
-                let body = match tokio::time::timeout(left, read_body(stream, &mut buf, len)).await
+                // Counted from this request's head, not the connection's
+                // start: a chunk on a reused connection gets as long as one on
+                // a fresh one
+                let body = match tokio::time::timeout(
+                    BODY_TIME,
+                    read_body(stream, &mut buf, len, BODY_IDLE),
+                )
+                .await
                 {
                     Ok(Ok(body)) => body,
                     _ => return,
@@ -2002,6 +2389,11 @@ async fn serve_requests<S>(
                 finish_get(state, peer.ip(), hash, &ticket, header("range")).await
             }
         };
+        // A good ticket: out of the pre-authentication pool, which voice
+        // joins from this address need, into the file one (`ConnLimits`)
+        if !slot.held && reply.status < 300 {
+            slot.held = state.limits.to_files(peer.ip());
+        }
         if write_reply(stream, &reply, method == "HEAD", closing)
             .await
             .is_err()
@@ -2012,6 +2404,61 @@ async fn serve_requests<S>(
     }
 }
 
+/// How long a refused request's body is read for before the close.
+const LINGER: Duration = Duration::from_secs(5);
+
+/// Before closing on a request whose body was refused unread: read and drop
+/// what is left of it, at most `MAX_CHUNK`, for at most `LINGER`. Closed with
+/// the body unread, the socket answers it with a reset, and a peer that has
+/// not read the answer yet loses it (Windows drops received data on a reset):
+/// a 409's `upload-offset` among them, which the resume path depends on
+/// (P9-01). `buf` holds what was read past the head already.
+async fn linger<S: AsyncRead + Unpin>(stream: &mut S, buf: &[u8], len: usize) {
+    let mut left = len.min(MAX_CHUNK).saturating_sub(buf.len());
+    let mut chunk = [0u8; 16 * 1024];
+    let _ = tokio::time::timeout(LINGER, async {
+        while left > 0 {
+            match stream.read(&mut chunk).await {
+                Ok(0) | Err(_) => return,
+                Ok(n) => left = left.saturating_sub(n),
+            }
+        }
+    })
+    .await;
+}
+
+/// Whether every line of a head ends in CRLF. A bare LF is a line break to
+/// this parser (`str::lines`) and not to every other one, so a proxy in front
+/// could read other headers than we do. There is none, so this is hardening
+/// (S-029).
+fn crlf_only(head: &str) -> bool {
+    let bytes = head.as_bytes();
+    bytes.iter().enumerate().all(|(i, &b)| match b {
+        b'\n' => i > 0 && bytes[i - 1] == b'\r',
+        b'\r' => bytes.get(i + 1) == Some(&b'\n'),
+        _ => true,
+    })
+}
+
+/// The body's length: 0 without a `Content-Length`, `None` for one that is
+/// repeated or not plain digits (`+5`, which `parse` takes), the other two
+/// ways a proxy and this parser could disagree about where a body ends.
+fn content_length(head: &str) -> Option<usize> {
+    let mut values = head.lines().skip(1).filter_map(|line| {
+        let (name, value) = line.split_once(':')?;
+        name.trim()
+            .eq_ignore_ascii_case("content-length")
+            .then(|| value.trim())
+    });
+    let Some(value) = values.next() else {
+        return Some(0);
+    };
+    if values.next().is_some() || value.is_empty() || !value.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    value.parse().ok()
+}
+
 /// `GET /f/v1/… HTTP/1.1` → the method and the target.
 fn request_line(head: &str) -> Option<(&str, &str)> {
     let mut parts = head.lines().next()?.split(' ');
@@ -2019,14 +2466,24 @@ fn request_line(head: &str) -> Option<(&str, &str)> {
     (version.starts_with("HTTP/1.") && parts.next().is_none()).then_some((method, target))
 }
 
+/// How long a body may go without a byte: a sender whose connection died (a
+/// phone changing networks) would otherwise keep its upload's one chunk slot,
+/// and every retry at that offset would hear 409, for all of `BODY_TIME`
+/// (P9-02).
+const BODY_IDLE: Duration = Duration::from_secs(15);
+
+/// `len` bytes of body, after what `buf` holds already; none for `idle` ends it.
 async fn read_body<S: AsyncRead + Unpin>(
     stream: &mut S,
     buf: &mut Vec<u8>,
     len: usize,
+    idle: Duration,
 ) -> std::io::Result<Bytes> {
     let mut chunk = [0u8; 16 * 1024];
     while buf.len() < len {
-        let n = stream.read(&mut chunk).await?;
+        let n = tokio::time::timeout(idle, stream.read(&mut chunk))
+            .await
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
         if n == 0 {
             return Err(std::io::ErrorKind::UnexpectedEof.into());
         }
@@ -2178,9 +2635,11 @@ mod tests {
     const A: SessionId = 1;
     const B: SessionId = 2;
     const C: SessionId = 3;
+    const D: SessionId = 4;
     const IP_A: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 1));
     const IP_B: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 2));
     const IP_C: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 3));
+    const IP_D: IpAddr = IpAddr::V4(std::net::Ipv4Addr::new(10, 0, 0, 4));
     const CH: Place = Place::Channel(7);
 
     fn store(tweak: impl FnOnce(&mut FilesConfig)) -> (Arc<FileStore>, TempDir) {
@@ -2223,10 +2682,14 @@ mod tests {
     }
 
     fn refusal(out: &[Out], session: SessionId) -> String {
+        refusal_with_code(out, session).1
+    }
+
+    fn refusal_with_code(out: &[Out], session: SessionId) -> (u16, String) {
         messages(out, session)
             .into_iter()
             .find_map(|m| match m {
-                ServerMessage::FileRefused { reason, .. } => Some(reason.clone()),
+                ServerMessage::FileRefused { code, reason, .. } => Some((*code, reason.clone())),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("no refusal for {session}"))
@@ -2554,6 +3017,99 @@ mod tests {
         ));
     }
 
+    /// R1-03: a slow link that keeps sending real chunks keeps its upload
+    /// (to `UPLOAD_MAX_LIFE`); a trickle of tiny chunks still ends at
+    /// `TICKET_LIFETIME`.
+    #[tokio::test]
+    async fn an_upload_that_keeps_sending_outlives_ten_minutes_and_a_trickle_does_not() {
+        let (store, _dir) = store(|_| {});
+        let t0 = Instant::now();
+        // The first chunk at once, then one every 2.5 min: never stalled,
+        // done after 12.5 min
+        let (bytes, hash) = blob(6 * SLIDE_CHUNK as usize, 21);
+        let ticket = upload_ticket(
+            &store.upload(hash, CH, bytes.len() as u64, (A, IP_A), t0),
+            A,
+        );
+        let mut at = t0;
+        for (i, chunk) in bytes.chunks(SLIDE_CHUNK as usize).enumerate() {
+            if i > 0 {
+                at += Duration::from_secs(150);
+            }
+            assert!(
+                messages(&store.sweep(at), A).is_empty(),
+                "ended before chunk {i}"
+            );
+            let off = (i as u64) * SLIDE_CHUNK;
+            let (put, out) = store.put_chunk(hash, &ticket, off, chunk, at).await;
+            assert!(matches!(put, Put::Accepted(_) | Put::Stored), "chunk {i}");
+            if i == 5 {
+                assert!(says(&out, A, |m| matches!(
+                    m,
+                    ServerMessage::FileStored { .. }
+                )));
+            }
+        }
+
+        let (bytes, hash) = blob(4096, 22);
+        let ticket = upload_ticket(
+            &store.upload(hash, CH, bytes.len() as u64, (B, IP_B), t0),
+            B,
+        );
+        for i in 0..9u64 {
+            let at = t0 + Duration::from_secs(60 * (i + 1));
+            let (put, _) = store
+                .put_chunk(hash, &ticket, i, &bytes[i as usize..][..1], at)
+                .await;
+            assert!(matches!(put, Put::Accepted(_)));
+        }
+        let out = store.sweep(t0 + TICKET_LIFETIME);
+        assert!(refusal(&out, B).contains("too long"));
+    }
+
+    /// S-001: a ticket's budget was charged for one read, so it reads its
+    /// blob once and a retry, then hears "gone, fetch it again".
+    #[tokio::test]
+    async fn a_ticket_reads_its_blob_at_most_twice() {
+        let (store, _dir) = store(|_| {});
+        let now = Instant::now();
+        let (bytes, hash) = blob(3000, 18);
+        upload_all(&store, hash, &bytes, CH, (A, IP_A), now).await;
+        let (ticket, size) = read_ticket(&store.fetch(hash, CH, (B, IP_B), now), B);
+        assert_eq!(download_all(&store, hash, &ticket, size, now).await, bytes);
+        assert_eq!(download_all(&store, hash, &ticket, size, now).await, bytes);
+        assert!(matches!(
+            store.get(hash, &ticket, Some("bytes=0-0"), now).await,
+            Get::Gone
+        ));
+        // A new fetch is a new ticket, charged again
+        let (ticket, _) = read_ticket(&store.fetch(hash, CH, (B, IP_B), now), B);
+        assert!(matches!(
+            store.get(hash, &ticket, None, now).await,
+            Get::Bytes { .. }
+        ));
+    }
+
+    /// S-001: bytes a reader never takes hold their ticket's turn, so one
+    /// ticket never has more than one chunk waiting in memory.
+    #[tokio::test]
+    async fn a_ticket_has_one_request_in_flight_until_its_bytes_are_dropped() {
+        let (store, _dir) = store(|_| {});
+        let now = Instant::now();
+        let (bytes, hash) = blob(3000, 19);
+        upload_all(&store, hash, &bytes, CH, (A, IP_A), now).await;
+        let (ticket, _) = read_ticket(&store.fetch(hash, CH, (B, IP_B), now), B);
+        let Get::Bytes { data: first, .. } = store.get(hash, &ticket, None, now).await else {
+            panic!("no bytes");
+        };
+        let second = store.get(hash, &ticket, None, now);
+        tokio::pin!(second);
+        let waited = tokio::time::timeout(Duration::from_millis(100), &mut second).await;
+        assert!(waited.is_err(), "the second request did not wait");
+        drop(first);
+        assert!(matches!(second.await, Get::Bytes { .. }));
+    }
+
     #[tokio::test]
     async fn a_blob_lives_while_fetched_but_never_past_its_age() {
         let (store, dir) = store(|c| {
@@ -2597,7 +3153,7 @@ mod tests {
         let (store, _dir) = store(|c| c.cache_mins = 30);
         let t0 = Instant::now();
         let (bytes, hash) = blob(3000, 13);
-        let dm = direct(Party::Name("alice".into()), Party::Name("bob".into()));
+        let dm = direct(Party::Guest(A), Party::Guest(B));
         upload_all(&store, hash, &bytes, CH, (A, IP_A), t0).await;
         store.upload(hash, dm.clone(), 3000, (A, IP_A), t0);
         let gone = t0 + Duration::from_secs(31 * 60);
@@ -2619,7 +3175,9 @@ mod tests {
             })
             .collect();
         asked.sort_by_key(|p| format!("{p:?}"));
-        assert_eq!(asked, vec![CH, dm], "every conversation it was posted in");
+        // D-5: the asker's conversation, not the direct one it was also
+        // posted in
+        assert_eq!(asked, vec![CH]);
         // A second fetch waits too, without asking again
         let again = store.fetch(hash, CH, (B, IP_B), gone);
         assert!(!again.iter().any(|o| matches!(o, Out::Want { .. })));
@@ -2629,6 +3187,130 @@ mod tests {
         let (ticket, size) = read_ticket(&out, C);
         read_ticket(&out, B);
         assert_eq!(download_all(&store, hash, &ticket, size, gone).await, bytes);
+    }
+
+    // R1-07: a member without the blob claims its re-seed and trickles. The
+    // holder is still asked, queues behind it, and takes over once it is
+    // quiet for `QUEUED_IDLE`; the waiter is served.
+    #[tokio::test]
+    async fn a_bogus_upload_does_not_keep_a_blob_from_its_holders() {
+        let (store, _dir) = store(|c| c.cache_mins = 30);
+        let t0 = Instant::now();
+        let (bytes, hash) = blob(3000, 44);
+        upload_all(&store, hash, &bytes, CH, (A, IP_A), t0).await;
+        let gone = t0 + Duration::from_secs(31 * 60);
+        store.sweep(gone);
+        let bogus = upload_ticket(&store.upload(hash, CH, 3000, (C, IP_C), gone), C);
+        store.put_chunk(hash, &bogus, 0, &[0], gone).await;
+
+        let out = store.fetch(hash, CH, (B, IP_B), gone);
+        assert!(
+            out.iter()
+                .any(|o| matches!(o, Out::Want { place, .. } if *place == CH)),
+            "asked with an upload under way"
+        );
+        assert!(messages(&store.upload(hash, CH, 3000, (A, IP_A), gone), A).is_empty());
+        let out = store.sweep(gone + QUEUED_IDLE);
+        assert!(refusal(&out, C).contains("stalled"));
+        let ticket = upload_ticket(&out, A);
+        let (put, out) = store
+            .put_chunk(hash, &ticket, 0, &bytes, gone + QUEUED_IDLE)
+            .await;
+        assert!(matches!(put, Put::Stored));
+        read_ticket(&out, B);
+    }
+
+    // R1-07: an upload that sends nothing ends after `FIRST_BYTE`.
+    #[tokio::test]
+    async fn an_upload_that_never_sends_a_byte_ends_soon() {
+        let (store, _dir) = store(|_| {});
+        let now = Instant::now();
+        let (_, hash) = blob(3000, 45);
+        upload_ticket(&store.upload(hash, CH, 3000, (C, IP_C), now), C);
+        let out = store.sweep(now + FIRST_BYTE - Duration::from_secs(1));
+        assert!(messages(&out, C).is_empty());
+        assert!(refusal(&store.sweep(now + FIRST_BYTE), C).contains("stalled"));
+    }
+
+    // S-005: an upload that stalls with members waiting and nobody behind it.
+    // Their conversation is asked again then, and the seek starts over, so
+    // nobody hears "unavailable" without a holder asked since.
+    #[tokio::test]
+    async fn a_stalled_re_seed_asks_again_before_anyone_hears_unavailable() {
+        let (store, _dir) = store(|c| c.cache_mins = 30);
+        let t0 = Instant::now();
+        let (bytes, hash) = blob(3000, 46);
+        upload_all(&store, hash, &bytes, CH, (A, IP_A), t0).await;
+        let gone = t0 + Duration::from_secs(31 * 60);
+        store.sweep(gone);
+        let ticket = upload_ticket(&store.upload(hash, CH, 3000, (C, IP_C), gone), C);
+        store.put_chunk(hash, &ticket, 0, &bytes[..10], gone).await;
+        store.fetch(hash, CH, (B, IP_B), gone);
+
+        let stalled = gone + UPLOAD_IDLE;
+        let out = store.sweep(stalled);
+        assert!(refusal(&out, C).contains("stalled"));
+        assert!(out.iter().any(|o| matches!(
+            o,
+            Out::Want { place, except, .. } if *place == CH && *except == C
+        )));
+        let unavailable = |m: &ServerMessage| matches!(m, ServerMessage::FileUnavailable { .. });
+        assert!(!says(&out, B, unavailable));
+        let out = store.sweep(stalled + SEEK_TIMEOUT - Duration::from_secs(1));
+        assert!(!says(&out, B, unavailable));
+        assert!(says(&store.sweep(stalled + SEEK_TIMEOUT), B, unavailable));
+    }
+
+    // R1-11 / S-020 (D-6): a guest's side of a direct conversation is their
+    // connection. A later guest who takes the same name is no party to it:
+    // not asked for its files, and their own conversation with the same
+    // person is another one.
+    #[tokio::test]
+    async fn a_later_guest_with_the_same_name_is_no_party_to_a_dm() {
+        use crate::state::test_support::add_user;
+        let (state, _dir) = state_with_files(|_| {});
+        let (_, alice) = add_user(&state, "alice#0001");
+        let (bob_uid, bob) = add_user(&state, "bob#0012");
+        let (dm, _) = resolve(&state, alice, FileConv::Direct(bob_uid))
+            .await
+            .unwrap();
+        let bob_side = Party::Guest(bob_uid);
+        assert_eq!(dm, direct(Party::Guest(alice), bob_side.clone()));
+        assert_eq!(sessions_of(&state, &bob_side), vec![bob]);
+
+        state.remove_session(bob).await;
+        let (later_uid, _) = add_user(&state, "bob#0012");
+        assert!(sessions_of(&state, &bob_side).is_empty());
+        assert_eq!(conv_for(&state, &bob_side), None);
+        let (theirs, _) = resolve(&state, alice, FileConv::Direct(later_uid))
+            .await
+            .unwrap();
+        assert_ne!(theirs, dm);
+    }
+
+    // R1-09: a waiter who asks late gets a whole `SEEK_TIMEOUT` of its own,
+    // not what is left of the first one's.
+    #[tokio::test]
+    async fn a_late_waiter_waits_as_long_as_the_first() {
+        let (store, _dir) = store(|c| c.cache_mins = 30);
+        let t0 = Instant::now();
+        let (bytes, hash) = blob(3000, 47);
+        upload_all(&store, hash, &bytes, CH, (A, IP_A), t0).await;
+        let gone = t0 + Duration::from_secs(31 * 60);
+        store.sweep(gone);
+        store.fetch(hash, CH, (B, IP_B), gone);
+        let late = gone + SEEK_TIMEOUT - Duration::from_secs(1);
+        store.fetch(hash, CH, (C, IP_C), late);
+        let unavailable = |m: &ServerMessage| matches!(m, ServerMessage::FileUnavailable { .. });
+        let out = store.sweep(gone + SEEK_TIMEOUT);
+        assert!(says(&out, B, unavailable));
+        assert!(!says(&out, C, unavailable));
+        assert!(!says(
+            &store.sweep(late + SEEK_TIMEOUT - Duration::from_secs(1)),
+            C,
+            unavailable
+        ));
+        assert!(says(&store.sweep(late + SEEK_TIMEOUT), C, unavailable));
     }
 
     #[tokio::test]
@@ -2653,17 +3335,229 @@ mod tests {
         assert!(out.iter().any(|o| matches!(o, Out::Want { .. })));
     }
 
+    /// R1-02: a hash not registered in the asker's conversation (posted
+    /// before a restart, long ago, elsewhere, or never) is sought there, and
+    /// only there; a blob stored for other conversations is never handed over
+    /// without a member of the asker's posting it there. Unknown and
+    /// elsewhere look the same.
     #[tokio::test]
-    async fn only_its_conversations_may_fetch_and_an_unknown_hash_looks_the_same() {
+    async fn an_unregistered_hash_is_sought_in_the_askers_conversation_only() {
         let (store, _dir) = store(|_| {});
         let now = Instant::now();
+        let nine = Place::Channel(9);
         let (bytes, hash) = blob(3000, 15);
         upload_all(&store, hash, &bytes, CH, (A, IP_A), now).await;
-        let other = refusal(&store.fetch(hash, Place::Channel(9), (B, IP_B), now), B);
         let (_, unknown) = blob(3000, 16);
-        let missing = refusal(&store.fetch(unknown, CH, (B, IP_B), now), B);
-        assert_eq!(other, NOT_HERE);
-        assert_eq!(missing, NOT_HERE);
+        for h in [hash, unknown] {
+            let out = store.fetch(h, nine.clone(), (B, IP_B), now);
+            assert!(says(&out, B, |m| matches!(
+                m,
+                ServerMessage::FileSeeking { .. }
+            )));
+            assert!(!says(&out, B, |m| matches!(
+                m,
+                ServerMessage::FileReady { .. }
+            )));
+            let asked: Vec<&Place> = out
+                .iter()
+                .filter_map(|o| match o {
+                    Out::Want { place, .. } => Some(place),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(asked, [&nine]);
+        }
+        // Asked once per `SEEK_TIMEOUT`, however often its members fetch
+        let again = store.fetch(hash, nine.clone(), (C, IP_C), now);
+        assert!(!again.iter().any(|o| matches!(o, Out::Want { .. })));
+
+        // A member of channel 9 who holds it posts it there: the waiters are served
+        let out = store.upload(hash, nine.clone(), bytes.len() as u64, (D, IP_D), now);
+        assert!(says(&out, D, |m| matches!(
+            m,
+            ServerMessage::FileStored { .. }
+        )));
+        for who in [B, C] {
+            assert!(out
+                .iter()
+                .any(|o| matches!(o, Out::Waited { session, .. } if *session == who)));
+        }
+
+        // Stored through channel 1 meanwhile: channel 9's waiter waits on
+        let (bytes, hash) = blob(3000, 23);
+        store.fetch(hash, nine.clone(), (B, IP_B), now);
+        let out = upload_all(&store, hash, &bytes, CH, (A, IP_A), now).await;
+        assert!(!out
+            .iter()
+            .any(|o| matches!(o, Out::Waited { session, .. } if *session == B)));
+        let out = store.sweep(now + SEEK_TIMEOUT);
+        assert!(says(&out, B, |m| matches!(
+            m,
+            ServerMessage::FileUnavailable { .. }
+        )));
+    }
+
+    /// A program reads the class from the code, never from the words: under
+    /// 100 the same request gets the same answer, from 100 a later one may not.
+    #[tokio::test]
+    async fn a_refusal_says_by_its_code_whether_to_try_again() {
+        let (store, _dir) = store(|_| {});
+        let now = Instant::now();
+        let (_, hash) = blob(3000, 17);
+        let (code, _) = refusal_with_code(&store.upload(hash, CH, 0, (A, IP_A), now), A);
+        assert_eq!(code, FILE_TOO_LARGE);
+        for _ in 0..SESSION_OPS.0 as usize {
+            store.fetch(hash, CH, (B, IP_B), now);
+        }
+        let (code, _) = refusal_with_code(&store.fetch(hash, CH, (B, IP_B), now), B);
+        assert_eq!(code, FILE_RATE);
+        let finals = [
+            FILE_NOT_HERE,
+            FILE_OFF,
+            FILE_TOO_LARGE,
+            FILE_PLACES,
+            FILE_MISMATCH,
+        ];
+        let later = [
+            FILE_RATE,
+            FILE_BUDGET,
+            FILE_BUSY,
+            FILE_STALLED,
+            FILE_EXPIRED,
+            FILE_FAILED,
+        ];
+        assert!(finals.iter().all(|c| *c < 100) && later.iter().all(|c| *c >= 100));
+    }
+
+    // S-004: an index full of small stored blobs still takes a new one. The
+    // blob used longest ago that nobody holds a ticket to makes way.
+    #[tokio::test]
+    async fn an_index_full_of_stored_blobs_still_takes_a_new_one() {
+        let (store, _dir) = store(|_| {});
+        let now = Instant::now();
+        let key = |i: u32| {
+            let mut hash = [0u8; 32];
+            hash[..4].copy_from_slice(&i.to_be_bytes());
+            hash
+        };
+        {
+            let mut inner = store.lock();
+            for i in 0..MAX_ENTRIES as u32 {
+                // 0 is being read; 1 is the least recently used of the rest
+                let used = now + Duration::from_secs(if i < 2 { 1 } else { 2 });
+                let mut entry = Entry {
+                    blob: Some(Blob {
+                        size: 10,
+                        stored: now,
+                        used: if i == 0 { now } else { used },
+                    }),
+                    ever_stored: true,
+                    ..Entry::default()
+                };
+                entry.places.push((CH, now));
+                if i == 0 {
+                    entry.readers.push(Ticket::new(B, now));
+                }
+                inner.entries.insert(key(i), entry);
+                inner.stored += 10;
+            }
+        }
+        let (_, hash) = blob(10, 40);
+        let later = now + Duration::from_secs(3);
+        upload_ticket(&store.upload(hash, CH, 10, (A, IP_A), later), A);
+        let inner = store.lock();
+        assert_eq!(inner.entries.len(), MAX_ENTRIES);
+        assert!(
+            inner.entries.contains_key(&key(0)),
+            "a blob being read stays"
+        );
+        assert!(!inner.entries.contains_key(&key(1)));
+        assert_eq!(inner.stored, (MAX_ENTRIES as u64 - 1) * 10);
+    }
+
+    // R1-04: a blob dropped while a new copy of it arrives. The unlink runs
+    // after the lock, by then the new copy is in place, and it must survive.
+    #[tokio::test]
+    async fn a_late_unlink_never_deletes_a_newer_copy() {
+        let (store, _dir) = store(|_| {});
+        let now = Instant::now();
+        let (bytes, hash) = blob(5000, 41);
+        upload_all(&store, hash, &bytes, CH, (A, IP_A), now).await;
+        let mut trash = Trash::default();
+        {
+            let mut inner = store.lock();
+            store.drop_blob(&mut inner, &hash, &mut trash);
+        }
+        // Uploaded again before the unlink of the old one runs
+        upload_all(&store, hash, &bytes, CH, (A, IP_A), now).await;
+        trash.empty();
+        let (ticket, size) = read_ticket(&store.fetch(hash, CH, (B, IP_B), now), B);
+        assert_eq!(download_all(&store, hash, &ticket, size, now).await, bytes);
+    }
+
+    // R1-04: a blob whose file has gone from the disk leaves the index at the
+    // first read that misses it, so the next fetch seeks it again.
+    #[tokio::test]
+    async fn a_blob_lost_from_the_disk_is_sought_again() {
+        let (store, dir) = store(|_| {});
+        let now = Instant::now();
+        let (bytes, hash) = blob(5000, 42);
+        upload_all(&store, hash, &bytes, CH, (A, IP_A), now).await;
+        std::fs::remove_file(dir.0.join(hex(&hash))).unwrap();
+        let (ticket, _) = read_ticket(&store.fetch(hash, CH, (B, IP_B), now), B);
+        assert!(matches!(
+            store.get(hash, &ticket, None, now).await,
+            Get::Gone
+        ));
+        let out = store.fetch(hash, CH, (B, IP_B), now);
+        assert!(says(&out, B, |m| matches!(
+            m,
+            ServerMessage::FileSeeking { .. }
+        )));
+        assert_eq!(store.lock().stored, 0);
+    }
+
+    // R1-05: a PUT dropped while its chunk is written (a reset stream, the
+    // connection's deadline). The chunk is finished anyway, so the upload
+    // goes on from where the relay has it and ends stored, not 422.
+    #[tokio::test]
+    async fn a_put_dropped_mid_write_does_not_poison_its_upload() {
+        let (state, _dir) = state_with_files(|_| {});
+        let (bytes, hash) = blob(MAX_CHUNK + 10, 43);
+        let ticket = super::test_support::upload_ticket(&state, hash, bytes.len() as u64);
+        let auth = format!("Bearer {ticket}");
+        let at = |offset: usize| format!("{}?offset={offset}", path_of(&hash));
+        {
+            let target = at(0);
+            let first = http(
+                &state,
+                IP_A,
+                "PUT",
+                &target,
+                Some(&auth),
+                None,
+                Bytes::copy_from_slice(&bytes[..MAX_CHUNK]),
+            );
+            tokio::pin!(first);
+            // One poll, which starts the write, and then the request is gone
+            tokio::select! {
+                biased;
+                _ = &mut first => panic!("the write took no time at all"),
+                _ = std::future::ready(()) => {}
+            }
+        }
+        let mut status = 0;
+        for _ in 0..200 {
+            let rest = Bytes::copy_from_slice(&bytes[MAX_CHUNK..]);
+            status = http(&state, IP_A, "PUT", &at(MAX_CHUNK), Some(&auth), None, rest)
+                .await
+                .status;
+            if status != 409 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(status, 201, "the upload ends stored");
     }
 
     #[tokio::test]
@@ -2719,7 +3613,7 @@ mod tests {
         let now = Instant::now();
         let (_, hash) = blob(10, 22);
         for _ in 0..SESSION_OPS.0 as usize {
-            refusal(&store.fetch(hash, CH, (A, IP_A), now), A);
+            store.fetch(hash, CH, (A, IP_A), now);
         }
         assert!(refusal(&store.fetch(hash, CH, (A, IP_A), now), A).contains("slow down"));
     }
@@ -2777,11 +3671,20 @@ mod tests {
     async fn a_stalled_upload_passes_to_the_next_member() {
         let (store, _dir) = store(|_| {});
         let now = Instant::now();
-        let (_, hash) = blob(3000, 29);
-        upload_ticket(&store.upload(hash, CH, 3000, (A, IP_A), now), A);
+        let (bytes, hash) = blob(3000, 29);
+        let ticket = upload_ticket(&store.upload(hash, CH, 3000, (A, IP_A), now), A);
+        store.put_chunk(hash, &ticket, 0, &bytes[..100], now).await;
+        // Alone, it may be quiet for `UPLOAD_IDLE`
+        let alone = now + UPLOAD_IDLE - Duration::from_secs(1);
+        assert!(messages(&store.sweep(alone), A).is_empty());
+        // With somebody queued behind it, for `QUEUED_IDLE`
+        let (bytes, hash) = blob(3000, 30);
+        let ticket = upload_ticket(&store.upload(hash, CH, 3000, (A, IP_A), now), A);
+        store.put_chunk(hash, &ticket, 0, &bytes[..100], now).await;
         store.upload(hash, CH, 3000, (B, IP_B), now);
-        assert!(messages(&store.sweep(now + UPLOAD_IDLE - Duration::from_secs(1)), A).is_empty());
-        let out = store.sweep(now + UPLOAD_IDLE);
+        let out = store.sweep(now + QUEUED_IDLE - Duration::from_secs(1));
+        assert!(messages(&out, A).is_empty());
+        let out = store.sweep(now + QUEUED_IDLE);
         assert!(refusal(&out, A).contains("stalled"));
         upload_ticket(&out, B);
     }
@@ -2869,8 +3772,113 @@ mod tests {
             assert_eq!(get("junk".into()).await, 401);
         }
         assert_eq!(get("junk".into()).await, 429);
+        // S-022: a good ticket from the same address is still served
+        let (good, _) = read_ticket(&store.fetch(hash, CH, (C, IP_C), now), C);
+        assert_eq!(get(good).await, 206);
         // The admin token's budget is untouched
         assert!(state.token_guess_allowed(ip));
+    }
+
+    // P9-02: a body that stops arriving ends the request after `BODY_IDLE`,
+    // well before `BODY_TIME`, and gives its upload's chunk slot back.
+    #[tokio::test]
+    async fn a_body_that_stops_arriving_ends_its_request_soon() {
+        use tokio::io::AsyncWriteExt as _;
+        assert!(BODY_IDLE < BODY_TIME / 2);
+        let idle = Duration::from_millis(100);
+        let (mut sender, mut relay) = tokio::io::duplex(1 << 16);
+        sender.write_all(&[7; 10]).await.unwrap();
+        let started = Instant::now();
+        let read = read_body(&mut relay, &mut Vec::new(), 100, idle).await;
+        assert_eq!(read.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert!(started.elapsed() >= idle);
+        // Bytes that keep coming, however slowly, do not trip it
+        let (mut sender, mut relay) = tokio::io::duplex(1 << 16);
+        let trickle = tokio::spawn(async move {
+            for _ in 0..5 {
+                sender.write_all(&[7; 20]).await.unwrap();
+                tokio::time::sleep(idle / 2).await;
+            }
+        });
+        let body = read_body(&mut relay, &mut Vec::new(), 100, idle).await;
+        assert_eq!(body.unwrap().len(), 100);
+        trickle.await.unwrap();
+    }
+
+    // S-026: a download ticket pushed out by newer ones is spent, not
+    // unknown: it hears "gone" (404) and costs its address no guess (401).
+    #[tokio::test]
+    async fn a_ticket_pushed_out_by_newer_ones_is_gone_not_a_guess() {
+        let (state, _dir) = state_with_files(|_| {});
+        let store = state.files.clone().unwrap();
+        let now = Instant::now();
+        let (bytes, hash) = blob(3000, 49);
+        upload_all(&store, hash, &bytes, CH, (A, IP_A), now).await;
+        let mut tickets = Vec::new();
+        for _ in 0..=MAX_TICKETS {
+            let mut inner = store.lock();
+            match store.ready(&mut inner, hash, (B, IP_B, &CH), 3000, now, &mut Vec::new()) {
+                Some(ServerMessage::FileReady { ticket, .. }) => tickets.push(ticket),
+                _ => panic!("no ticket"),
+            }
+        }
+        let status = |ticket: &str| {
+            let auth = format!("Bearer {ticket}");
+            let state = state.clone();
+            async move {
+                http(
+                    &state,
+                    IP_B,
+                    "GET",
+                    &path_of(&hash),
+                    Some(&auth),
+                    None,
+                    Bytes::new(),
+                )
+                .await
+                .status
+            }
+        };
+        assert_eq!(status(&tickets[0]).await, 404);
+        assert_eq!(status(&tickets[MAX_TICKETS]).await, 206);
+    }
+
+    // S-021: leaving a channel ends the download tickets handed out there; a
+    // request still on its way hears "gone". A ticket from elsewhere stays.
+    #[tokio::test]
+    async fn leaving_a_channel_ends_its_download_tickets() {
+        let (store, _dir) = store(|_| {});
+        let now = Instant::now();
+        let (bytes, hash) = blob(3000, 50);
+        let other = Place::Channel(8);
+        upload_all(&store, hash, &bytes, CH, (A, IP_A), now).await;
+        store.upload(hash, other.clone(), 3000, (A, IP_A), now);
+        let (here, _) = read_ticket(&store.fetch(hash, CH, (B, IP_B), now), B);
+        let (there, _) = read_ticket(&store.fetch(hash, other, (B, IP_B), now), B);
+        store.left(B, &CH);
+        assert!(matches!(store.get(hash, &here, None, now).await, Get::Gone));
+        assert!(matches!(
+            store.get(hash, &there, None, now).await,
+            Get::Bytes { .. }
+        ));
+    }
+
+    // R1-12: the cache directory and its blobs are this user's only.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_cache_is_readable_by_its_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let parent = TempDir::new();
+        let config = FilesConfig {
+            dir: parent.0.join("files").to_string_lossy().into_owned(),
+            ..FilesConfig::default()
+        };
+        let store = Arc::new(FileStore::open(&config).unwrap());
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&store.dir), 0o700);
+        let (bytes, hash) = blob(3000, 48);
+        upload_all(&store, hash, &bytes, CH, (A, IP_A), Instant::now()).await;
+        assert_eq!(mode(&store.blob_path(&hash)), 0o600);
     }
 
     #[test]

@@ -13,12 +13,13 @@
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { listenServer, fromServer } from "../connect.js";
   import { account, accountHex, accountPrompt, closePrompt, relayAccounts, showPrompt } from "../stores/account.js";
-  import { fileStoredDm, joinedTextChannelIds, purgeWritten } from "../stores/chat.js";
+  import { applyChannelEvent, applyStoredDmEvent, fileStoredDm, joinedTextChannelIds, purgeWritten } from "../stores/chat.js";
   import { channels, currentChannelId } from "../stores/channels.js";
   import { shareChannelHistory } from "../stores/settings.js";
   import { users } from "../stores/users.js";
-  import { expiryFor } from "../chat-rules.js";
-  import { dmMessageTtl } from "../stores/channel-ui.js";
+  import { chatEvent, expiryFor } from "../chat-rules.js";
+  import { dmMessageTtl, managesChannel } from "../stores/channel-ui.js";
+  import { userId } from "../stores/connection.js";
   import { addNotification } from "../stores/notifications.js";
   import type { AccountInfo, RelayAccounts } from "../types.js";
 
@@ -152,6 +153,8 @@
         timestamp: number;
         reply_to?: string | null;
         thread?: string | null;
+        file?: unknown;
+        fwd?: unknown;
       }>("stored-dm", (server, m) => {
         const me = get(account.peek(server));
         if (!me) return;
@@ -172,6 +175,37 @@
         const ch = get(channels.peek(server)).find((c) => c.log === t.conv);
         if (ch) purgeWritten(server, "channel", ch.name, writer, t.before);
         else if (t.conv.startsWith("d:")) purgeWritten(server, "dm", t.name, writer, t.before);
+      }),
+      // An edit, delete, reaction or pin from a stored log, by its sender
+      // (the other party of a direct one, or us). A pin counts only from a
+      // manager the roster lists now: one whose sender is away is let go.
+      listenServer<{
+        conv: string;
+        name: string;
+        account: string;
+        from_me: boolean;
+        content: string;
+        timestamp: number;
+        event: unknown;
+      }>("stored-event", (server, t) => {
+        const me = get(account.peek(server));
+        const event = chatEvent(t.event);
+        if (!me || !event) return;
+        const self = get(userId.peek(server));
+        const writer = t.from_me ? accountHex(me.info.id) : t.account;
+        // Theirs only where the name is theirs: the relay's name for an account
+        const online = t.from_me
+          ? undefined
+          : get(users.peek(server)).find((u) => u.username === t.name && !!u.account && accountHex(u.account) === t.account);
+        const by = { user_id: t.from_me ? self : (online?.user_id ?? 0), username: t.from_me ? me.name : t.name, account: writer };
+        const ev = { event, by, at: t.timestamp, content: t.content };
+        const ch = get(channels.peek(server)).find((c) => c.log === t.conv);
+        if (ch) {
+          const mayPin = event.kind === "pin" && (t.from_me || !!online) && managesChannel(server, ch.channel_id, by.user_id);
+          applyChannelEvent(server, ch.name, ev, mayPin);
+        } else if (t.conv.startsWith("d:")) {
+          applyStoredDmEvent(server, t.name || `account ${t.account.slice(0, 8)}`, ev);
+        }
       }),
       listenServer<{ reason: string }>("stored-not-kept", (server, d) =>
         addNotification(`${fromServer(server)}not kept on the server: ${d.reason}`, "warning"),

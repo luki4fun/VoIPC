@@ -1,8 +1,13 @@
 <script lang="ts">
   import { tick } from "svelte";
   import { pushLayer } from "../../stores/back-stack.js";
+  import { confirmAction } from "../../stores/confirm.js";
   import { shortName } from "../../username.js";
+  import { cancelFile, fileProgress, forgetProgress, newOp } from "../../files.js";
+  import { formatSize } from "../../file-rules.js";
+  import { CannotClean, isPhoto } from "../../image-prep.js";
   import Icon from "../Icons.svelte";
+  import { EMOJI_CATEGORIES } from "../../emoji.js";
 
   interface Props {
     placeholder: string;
@@ -25,6 +30,12 @@
     oncancelreply?: () => void;
     /** Names `@` offers to complete (full names, with their tags). */
     mentionables?: readonly string[];
+    /**
+     * Send one file as its own message with `caption`, a photo as it is if
+     * `original`, reporting under `op`. Absent where files cannot go (the
+     * relay keeps none, or nobody to name): there is no attach button then.
+     */
+    onsendfile?: (file: File, original: boolean, caption: string, op: string) => Promise<void>;
   }
   let {
     placeholder,
@@ -34,6 +45,7 @@
     replying = null,
     oncancelreply,
     mentionables = [],
+    onsendfile,
   }: Props = $props();
 
   /** Put the cursor in the message box (after Reply was pressed, say). */
@@ -54,6 +66,17 @@
   $effect(() => {
     void conversation;
     text = "";
+    staged = [];
+    // A batch under way stops at its next file: what was staged here is
+    // not for wherever the person went
+    epoch++;
+  });
+
+  // Files that can no longer go (the relay keeps none now, or nobody to name)
+  // are let go; one under way finishes. Written only when one goes: the
+  // effect reads `staged`, and a new array every run would run it forever
+  $effect(() => {
+    if (!onsendfile && staged.some((f) => !f.op)) staged = staged.filter((f) => f.op);
   });
 
   // Grows with what is typed, up to the cap in the stylesheet, then scrolls
@@ -68,11 +91,137 @@
 
   function send() {
     const content = text.trim();
-    if (!content) return;
     // Kept in the input rather than sent to be refused
     if (held) return;
+    if (staged.some((f) => !f.op) && onsendfile && !sending) {
+      text = "";
+      // Pressed again: what failed is tried again
+      staged = staged.map((f) => ({ ...f, error: null }));
+      void sendFiles(content);
+      return;
+    }
+    // Files on their way already take what is staged after them; words go
+    // as words
+    if (!content) return;
     text = "";
     onsend(content);
+  }
+
+  // ── Files ─────────────────────────────────────────────────────────────────
+
+  /** A file picked, pasted or dropped, until its message is sent. */
+  interface Staged {
+    key: number;
+    file: File;
+    /** A still photo: the compressed / original choice is for it. */
+    photo: boolean;
+    original: boolean;
+    /** Its upload under way. */
+    op: string | null;
+    error: string | null;
+  }
+  let staged = $state<Staged[]>([]);
+  let nextKey = 0;
+  /** A batch is going out. */
+  let sending = $state(false);
+  /** Bumped when the conversation changes, which ends a batch. */
+  let epoch = 0;
+  let picker = $state<HTMLInputElement | null>(null);
+
+  /** Stage files to go out, one message each (ChatPanel drops them here too). */
+  export function addFiles(files: Iterable<File>) {
+    if (!onsendfile) return;
+    for (const file of files) {
+      const entry: Staged = { key: nextKey++, file, photo: false, original: false, op: null, error: null };
+      staged = [...staged, entry];
+      // The first bytes say whether it is a photo, not the name or the type
+      const key = entry.key;
+      file
+        .slice(0, 64)
+        .arrayBuffer()
+        .then((head) => {
+          const photo = isPhoto(new Uint8Array(head), file.type);
+          staged = staged.map((f) => (f.key === key ? { ...f, photo } : f));
+        })
+        .catch(() => {});
+    }
+    tick().then(() => inputEl?.focus());
+  }
+
+  function unstage(key: number) {
+    staged = staged.filter((f) => f.key !== key);
+  }
+
+  function patch(key: number, change: Partial<Staged>) {
+    staged = staged.map((f) => (f.key === key ? { ...f, ...change } : f));
+  }
+
+  /**
+   * The staged files one by one, the caption with the first, each read as it
+   * is now: one taken off or switched to Original meanwhile is seen. One that
+   * fails stays, with why, to be sent again or taken off; if the first does,
+   * its caption comes back into the box. Stops at a conversation change, and
+   * when slow mode holds the next message.
+   */
+  async function sendFiles(caption: string) {
+    const send = onsendfile;
+    if (!send || sending) return;
+    sending = true;
+    const mine = epoch;
+    let words = caption;
+    try {
+      for (;;) {
+        const f = staged.find((s) => !s.op && !s.error);
+        if (!f || epoch !== mine || held) break;
+        let original = f.original;
+        for (;;) {
+          const op = newOp();
+          patch(f.key, { op, error: null });
+          try {
+            await send(f.file, original, words, op);
+            words = "";
+            unstage(f.key);
+            break;
+          } catch (e) {
+            if (e instanceof CannotClean && !original) {
+              forgetProgress(op);
+              const ok = await confirmAction({
+                title: "Send the original?",
+                body: `${f.file.name} cannot be made smaller here, so it would go exactly as it is, with any location and camera data in it.`,
+                confirm: "Send original",
+              });
+              if (ok && epoch === mine) {
+                original = true;
+                continue;
+              }
+              patch(f.key, { op: null, error: "Not sent" });
+            } else {
+              const why = String(e);
+              patch(f.key, { op: null, error: why === "cancelled" ? "Stopped" : why });
+            }
+            if (words && !text) text = words;
+            words = "";
+            break;
+          } finally {
+            forgetProgress(op);
+          }
+        }
+      }
+    } finally {
+      sending = false;
+    }
+  }
+
+  function cancelStaged(f: Staged) {
+    if (f.op) void cancelFile(f.op);
+    else unstage(f.key);
+  }
+
+  function onPaste(e: ClipboardEvent) {
+    const files = e.clipboardData?.files;
+    if (!onsendfile || !files || files.length === 0) return;
+    e.preventDefault();
+    addFiles(files);
   }
 
   // ── @ completion ──────────────────────────────────────────────────────────
@@ -160,14 +309,6 @@
   let showEmojiPicker = $state(false);
   let emojiCategory = $state(0);
 
-  const EMOJI_CATEGORIES = [
-    { label: "Smileys", emojis: ["😀","😁","😂","🤣","😃","😄","😅","😆","😉","😊","😎","🤩","😏","😒","😞","😔","😟","😕","😣","😖","😫","😩","🥺","😢","😭","😤","😠","😡","🤬","😈","👿","💀","☠️","😱","😨","😰","😥","😓","🤗","🤔","🤭","🤫","🤥","😶","😐","😑","😬","🙄","😯","😧","😮","😲","🥱","😴","🤤","😷","🤒","🤕","🤢","🤮","🥴","😵","🤯","🥳","🥸","😇","🤠","🤡"] },
-    { label: "Gestures", emojis: ["👋","🤚","🖐️","✋","🖖","👌","🤌","🤏","✌️","🤞","🤟","🤘","🤙","👈","👉","👆","👇","☝️","👍","👎","✊","👊","🤛","🤜","👏","🙌","👐","🤲","🤝","🙏","💪","🦾","🖕"] },
-    { label: "Hearts", emojis: ["❤️","🧡","💛","💚","💙","💜","🖤","🤍","🤎","💔","❤️‍🔥","❤️‍🩹","💕","💞","💓","💗","💖","💘","💝","💟","♥️","😍","🥰","😘","😻"] },
-    { label: "Objects", emojis: ["🔥","⭐","🌟","✨","💫","🎉","🎊","🎈","🎁","🏆","🥇","🎯","💡","💎","🔔","🎵","🎶","🎤","🎧","🎮","🕹️","📱","💻","⌨️","🖥️","📷","📸","🔒","🔑","🗝️","🛠️","⚙️","💣","🧨"] },
-    { label: "Nature", emojis: ["🌈","☀️","🌤️","⛅","🌥️","☁️","🌧️","⛈️","🌩️","❄️","🌊","🌸","🌺","🌻","🌹","🌷","🌱","🌿","☘️","🍀","🍁","🍂","🌵","🌴","🐶","🐱","🐭","🐹","🐰","🦊","🐻","🐼","🐸","🐵"] },
-    { label: "Food", emojis: ["🍕","🍔","🍟","🌭","🍿","🧂","🥓","🍳","🥞","🧇","🧀","🍖","🍗","🥩","🌮","🌯","🍜","🍝","🍣","🍱","🍩","🍪","🎂","🍰","🧁","🍫","🍬","🍭","☕","🍵","🧃","🍺","🍻","🥂","🍷","🥃"] },
-  ];
 
   function insertEmoji(emoji: string) {
     text += emoji;
@@ -175,6 +316,17 @@
     // Re-focus the input
     tick().then(() => inputEl?.focus());
   }
+
+  // A tap on the composer's own buttons never takes the focus from the text
+  // field: on a phone the keyboard would drop, the shell around it reflow, and
+  // the button move away before the finger lifts (D2: Send took two taps in
+  // mobile Classic). The click still comes, and the keyboard stays up.
+  const keepField = (e: PointerEvent) => e.preventDefault();
+
+  // Android Back closes the picker first, not the pane it sits in
+  $effect(() => {
+    if (showEmojiPicker) return pushLayer(() => (showEmojiPicker = false));
+  });
 
   function toggleEmojiPicker() {
     showEmojiPicker = !showEmojiPicker;
@@ -196,12 +348,66 @@
   <div class="reply-bar">
     <Icon name="reply" size={14} />
     <span class="reply-to">Replying to <strong>{shortName(replying)}</strong></span>
-    <button class="icon-btn reply-cancel" type="button" aria-label="Cancel reply" title="Cancel reply (Esc)" onclick={() => oncancelreply?.()}>
+    <button class="icon-btn reply-cancel" type="button" onpointerdown={keepField} aria-label="Cancel reply" title="Cancel reply (Esc)" onclick={() => oncancelreply?.()}>
       <Icon name="close" size={14} />
     </button>
   </div>
 {/if}
+{#if staged.length > 0}
+  <ul class="file-chips" aria-label="Files to send">
+    {#each staged as f (f.key)}
+      {@const p = f.op ? $fileProgress.get(f.op) : undefined}
+      <li class="file-chip">
+        <Icon name="file" size={16} />
+        <span class="chip-name" title={f.file.name}>{f.file.name}</span>
+        <span class="chip-size num">{formatSize(f.file.size)}</span>
+        {#if f.photo && !f.op}
+          <button
+            class="btn-ghost chip-mode"
+            type="button"
+            onpointerdown={keepField}
+            aria-pressed={f.original}
+            title={f.original
+              ? "Sent exactly as it is: includes any location and camera data. Press to send it compressed."
+              : "Sent compressed: smaller, without its location and camera data. Press to send it as it is."}
+            onclick={() => patch(f.key, { original: !f.original })}
+          >Original (1:1)</button>
+        {/if}
+        {#if f.op}
+          <span class="chip-bar" aria-hidden="true"
+            ><span style="width: {p && p.total > 0 ? Math.round((p.done / p.total) * 100) : 0}%"></span></span>
+        {/if}
+        <button
+          class="icon-btn"
+          type="button"
+          aria-label={f.op ? `Stop sending ${f.file.name}` : `Do not send ${f.file.name}`}
+          onpointerdown={keepField}
+          onclick={() => cancelStaged(f)}
+        >
+          <Icon name="close" size={14} />
+        </button>
+        {#if f.error}<span class="chip-error" role="alert">{f.error}</span>{/if}
+      </li>
+    {/each}
+  </ul>
+{/if}
 <form class="input-bar" class:replying={!!replying} onsubmit={(e) => { e.preventDefault(); send(); }}>
+  {#if onsendfile}
+    <button class="emoji-btn" type="button" onpointerdown={keepField} onclick={() => picker?.click()} title="Attach files" aria-label="Attach files">
+      <Icon name="paperclip" size={20} />
+    </button>
+    <input
+      class="file-picker"
+      type="file"
+      multiple
+      bind:this={picker}
+      onchange={(e) => {
+        const input = e.currentTarget;
+        if (input.files) addFiles(input.files);
+        input.value = "";
+      }}
+    />
+  {/if}
   {#if suggestions.length > 0}
     <div class="mention-pop" id={listId} role="listbox" aria-label="People to mention">
       {#each suggestions as n, i (n)}
@@ -232,13 +438,14 @@
     oninput={trackCaret}
     onkeyup={trackCaret}
     onclick={trackCaret}
+    onpaste={onPaste}
     aria-autocomplete="list"
     aria-controls={suggestions.length > 0 ? listId : undefined}
     aria-activedescendant={suggestions.length > 0 ? `${listId}-${active}` : undefined}
     maxlength="2000"
   ></textarea>
   <div class="emoji-wrapper">
-    <button class="emoji-btn" type="button" onclick={(e) => { e.stopPropagation(); toggleEmojiPicker(); }} title="Emoji">
+    <button class="emoji-btn" type="button" onpointerdown={keepField} onclick={(e) => { e.stopPropagation(); toggleEmojiPicker(); }} title="Emoji">
       <Icon name="smile" size={20} />
     </button>
     {#if showEmojiPicker}
@@ -248,6 +455,7 @@
           {#each EMOJI_CATEGORIES as cat, idx}
             <button
               class="emoji-tab"
+              onpointerdown={keepField}
               class:active={emojiCategory === idx}
               type="button"
               onclick={() => (emojiCategory = idx)}
@@ -257,20 +465,85 @@
         </div>
         <div class="emoji-grid">
           {#each EMOJI_CATEGORIES[emojiCategory].emojis as emoji}
-            <button class="emoji-item" type="button" onclick={() => insertEmoji(emoji)}>{emoji}</button>
+            <button class="emoji-item" type="button" onpointerdown={keepField} onclick={() => insertEmoji(emoji)}>{emoji}</button>
           {/each}
         </div>
       </div>
     {/if}
   </div>
   {#if held}
-    <button class="send-btn" type="submit" disabled title={held.title}>{held.label}</button>
+    <button class="send-btn" type="submit" onpointerdown={keepField} disabled title={held.title}>{held.label}</button>
   {:else}
-    <button class="send-btn" type="submit" disabled={!text.trim()}>Send</button>
+    <button class="send-btn" type="submit" onpointerdown={keepField} disabled={!text.trim() && (sending || !staged.some((f) => !f.op))}>Send</button>
   {/if}
 </form>
 
 <style>
+  .file-chips {
+    list-style: none;
+    margin: 0;
+    padding: 8px 12px 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    border-top: 1px solid var(--border);
+  }
+  .file-chip {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 4px 4px 10px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border);
+    border-radius: var(--r-md);
+    color: var(--text-secondary);
+    min-width: 0;
+  }
+  .chip-name {
+    flex: 1;
+    min-width: 0;
+    color: var(--text-primary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .chip-size {
+    font-size: 0.8rem;
+  }
+  .chip-mode {
+    font-size: 0.8rem;
+    padding: 2px 8px;
+  }
+  .chip-mode[aria-pressed="true"] {
+    color: var(--text-primary);
+    background: var(--bg-hover);
+  }
+  .chip-bar {
+    width: 80px;
+    height: 4px;
+    border-radius: 2px;
+    background: var(--border);
+    overflow: hidden;
+  }
+  .chip-bar span {
+    display: block;
+    height: 100%;
+    background: var(--text-secondary);
+    transition: width 0.2s;
+  }
+  .chip-error {
+    flex-basis: 100%;
+    font-size: 0.8rem;
+    color: var(--danger);
+  }
+  .file-picker {
+    display: none;
+  }
+  .file-chips + .input-bar {
+    border-top: none;
+  }
+
   .input-bar {
     position: relative;
     display: flex;

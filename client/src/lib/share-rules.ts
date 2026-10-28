@@ -1,5 +1,6 @@
-// Pure rules of the browser screen sharer (web/backend/share.ts), here so Node
-// can test them. Each mirrors client/src-tauri/src/screenshare/mod.rs.
+// Pure rules of the browser screen sharer (web/backend/share.ts) and viewer
+// (web/backend/video.ts), here so Node can test them. Each mirrors the native
+// side: client/src-tauri/src/screenshare/mod.rs, or voipc-video.
 
 /** voipc_video::KEYFRAME_INTERVAL_SECS, in ms: the periodic IDR, a safety net. */
 export const KEYFRAME_INTERVAL_MS = 4000;
@@ -34,4 +35,24 @@ export function shouldForceKey(
 ): boolean {
   if (!asked && sinceKeyMs < KEYFRAME_INTERVAL_MS) return false;
   return backlog === 0 || sinceForcedMs >= FORCED_KEY_SPACING_MS;
+}
+
+/**
+ * voipc_video::MAX_DECODE_PIXELS: the largest picture the desktop viewer
+ * decodes. Every share resolution (1080p at most) fits, either way up.
+ */
+export const MAX_DECODE_PIXELS = 2048 * 2048;
+
+/**
+ * Whether a decoded frame is larger than any VoIPC viewer shows, in the
+ * pixels it holds or in the size it asks to be drawn at (the canvas is sized
+ * to that). Only a modified sharer sends one (S-044).
+ */
+export function frameTooLarge(f: {
+  codedWidth: number;
+  codedHeight: number;
+  displayWidth: number;
+  displayHeight: number;
+}): boolean {
+  return f.codedWidth * f.codedHeight > MAX_DECODE_PIXELS || f.displayWidth * f.displayHeight > MAX_DECODE_PIXELS;
 }

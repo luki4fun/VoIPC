@@ -241,12 +241,15 @@ dir = "files"              # relative to the working directory: /data/files in t
   digits, or that and `.<n>.part` while an upload runs. Nothing else in the directory is
   touched, but give it a directory of its own anyway.
 - **When a blob has gone**, a member's Load asks the other members of that conversation who are
-  online. An app that has the file, and a message in that conversation that refers to it,
+  online, and of no other conversation the file was posted in. This includes a file posted before
+  the relay last restarted, whose record went with the restart. An app that has the file, and a message in that conversation that refers to it,
   uploads it again without showing anything. After 60 seconds without one, the member sees
-  that nobody online has the file.
+  that nobody online has the file. A conversation is asked at most once a minute for one file.
 - **Who may fetch.** Only members of a conversation the blob was posted in: a channel's current
-  members, or the two people of a direct conversation, by account or else by name. Everyone
-  else gets the same refusal as for a blob that does not exist.
+  members, or the two people of a direct conversation, by account or else by the guest's
+  connection (a guest who comes back, or another who takes the name, is someone new). A member who
+  asks for a file their conversation never had is answered like one whose file has gone (their
+  conversation is asked, and nobody there has it). Everyone else is refused.
 - **What the relay learns:** each blob's size, when it is uploaded and fetched and by which
   connection, and which conversations it was posted or forwarded in, which links them. A
   re-upload also shows which members still hold it. Not its name, type or contents.

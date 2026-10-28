@@ -389,3 +389,45 @@ fn a_file_round_trips_through_what_js_hands_over() {
     );
     assert_eq!(refused(&hash, &key[2..], size), Some(FileError::Malformed));
 }
+
+/// What JS hands `envelope` for a forward's label and for an event (JSON
+/// text) arrives as the same label and event: the page's own shapes are the
+/// ones a reader checks (`Forwarded::checked`, `ChatEvent::checked`).
+#[test]
+fn a_label_and_an_event_cross_from_js_as_json_text() {
+    let fwd = r#"{"name":"ann#0001","at":1700000000000}"#;
+    let packed =
+        voipc_web::envelope("m1", "look", None, None, None, None, Some(fwd.into()), None).unwrap();
+    let m = voipc_crypto::open_envelope(&packed);
+    assert_eq!(
+        m.extras.fwd,
+        Some(voipc_crypto::Forwarded {
+            name: "ann#0001".into(),
+            at: 1_700_000_000_000
+        })
+    );
+    let react = r#"{"kind":"react","target":"m1","emoji":"👍","on":true}"#;
+    let packed = voipc_web::envelope(
+        "e1",
+        "",
+        Some(60),
+        None,
+        None,
+        None,
+        None,
+        Some(react.into()),
+    )
+    .unwrap();
+    let m = voipc_crypto::open_envelope(&packed);
+    assert_eq!(
+        (m.ttl_secs, m.extras.event),
+        (
+            Some(60),
+            Some(voipc_crypto::ChatEvent::React {
+                target: "m1".into(),
+                emoji: "👍".into(),
+                on: true
+            })
+        )
+    );
+}

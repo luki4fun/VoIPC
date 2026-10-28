@@ -377,8 +377,14 @@ pub fn new_message_id() -> String {
 }
 
 /// Pack a message so it carries what the server never sees: the id, the
-/// destruction timer in seconds (0 or absent for a message with no timer), and
-/// the ids of the message it answers and of its thread.
+/// destruction timer in seconds (0 or absent for a message with no timer),
+/// the ids of the message it answers and of its thread, and the file it
+/// carries, as JSON text (`FileRef`); a forwarded message's label
+/// (`{name, at}`), or an event (`{kind, target, emoji?, on?}`), as JSON text
+/// too. Throws for any of them that does not check, rather than send what a
+/// reader would take for something else (the desktop's `checked_extras`).
+// One argument per part, as the JS side names them
+#[allow(clippy::too_many_arguments)]
 #[wasm_bindgen(js_name = envelope)]
 pub fn envelope(
     id: &str,
@@ -386,12 +392,53 @@ pub fn envelope(
     ttl_secs: Option<u32>,
     reply: Option<String>,
     thread: Option<String>,
-) -> Vec<u8> {
-    voipc_crypto::envelope_with(id, text, ttl_secs, &voipc_crypto::Extras { reply, thread })
+    file: Option<String>,
+    fwd: Option<String>,
+    event: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    fn parse<T>(
+        json: Option<String>,
+        check: impl Fn(&serde_json::Value) -> Option<T>,
+        what: &str,
+    ) -> Result<Option<T>, JsError> {
+        json.map(|j| {
+            serde_json::from_str::<serde_json::Value>(&j)
+                .ok()
+                .and_then(|v| check(&v))
+                .ok_or_else(|| JsError::new(&format!("invalid {what}")))
+        })
+        .transpose()
+    }
+    Ok(voipc_crypto::envelope_with(
+        id,
+        text,
+        ttl_secs,
+        &voipc_crypto::Extras {
+            reply,
+            thread,
+            file: parse(file, voipc_crypto::FileRef::checked, "file")?,
+            fwd: parse(fwd, voipc_crypto::Forwarded::checked, "fwd")?,
+            event: parse(
+                event,
+                |v| v.as_object().and_then(voipc_crypto::ChatEvent::checked),
+                "event",
+            )?,
+        },
+    ))
+}
+
+/// A value as JS has it, through JSON: a shape serde writes, read back by
+/// the page as a plain object.
+fn as_js<T: serde::Serialize>(v: Option<T>) -> JsValue {
+    v.and_then(|v| serde_json::to_string(&v).ok())
+        .and_then(|j| js_sys::JSON::parse(&j).ok())
+        .unwrap_or(JsValue::NULL)
 }
 
 /// `{ id: string | null, text: string, ttl_secs: number | null,
-/// reply_to: string | null, thread: string | null }` from a received message.
+/// reply_to: string | null, thread: string | null, file: FileRef | null,
+/// fwd: {name, at} | null, event: {kind, target, emoji?, on?} | null }` from a
+/// received message.
 #[wasm_bindgen(js_name = openEnvelope)]
 pub fn open_envelope(plaintext: &[u8]) -> JsValue {
     let m = voipc_crypto::open_envelope(plaintext);
@@ -421,6 +468,9 @@ pub fn open_envelope(plaintext: &[u8]) -> JsValue {
                 .map(|s| JsValue::from_str(&s))
                 .unwrap_or(JsValue::NULL),
         ),
+        ("file", as_js(m.extras.file)),
+        ("fwd", as_js(m.extras.fwd)),
+        ("event", as_js(m.extras.event)),
     ])
 }
 

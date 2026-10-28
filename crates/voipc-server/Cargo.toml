@@ -60,6 +60,7 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 
 # The recovery-key reset's proof: an identity signature (libsignal)
 voipc-crypto = { workspace = true }
+unicode-security = "0.1.2"
 
 [dev-dependencies]
 # For the voice_load example (Opus encoding + media encryption of the test tone)

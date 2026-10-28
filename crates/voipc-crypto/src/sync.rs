@@ -171,6 +171,42 @@ impl Event {
                 ));
             }
         }
+        // An edit, delete, reaction or pin: done to a message of the same
+        // conversation by whoever sent it, named like a tombstone's writer
+        // (the other party of a direct one, `from_me` for our own). Whether
+        // they may is the front end's to check (`chat-rules.ts`).
+        if let Event::Message {
+            conv,
+            peer: who,
+            peer_name: name,
+            from_me,
+            envelope,
+            sent_at,
+            server_at,
+            seq,
+        }
+        | Event::ChannelMessage {
+            conv,
+            sender: who,
+            sender_name: name,
+            from_me,
+            envelope,
+            sent_at,
+            server_at,
+            seq,
+        } = self
+        {
+            let (id, text, ttl, at, extras) = opened(envelope, *sent_at, *server_at);
+            if let Some(event) = extras.event {
+                return Some((
+                    "stored-event",
+                    serde_json::json!({
+                        "conv": conv, "seq": seq, "name": name, "account": hex(who), "from_me": from_me,
+                        "message_id": id, "content": text, "ttl_secs": ttl, "timestamp": at, "event": event,
+                    }),
+                ));
+            }
+        }
         Some(match self {
             Event::Message {
                 conv,
@@ -186,7 +222,7 @@ impl Event {
                 let payload = serde_json::json!({
                     "conv": conv, "seq": seq, "peer_account": hex(peer), "peer_name": peer_name, "from_me": from_me,
                     "message_id": id, "content": text, "ttl_secs": ttl, "timestamp": at,
-                    "reply_to": extras.reply, "thread": extras.thread,
+                    "reply_to": extras.reply, "thread": extras.thread, "file": extras.file, "fwd": extras.fwd,
                 });
                 ("stored-dm", payload)
             }
@@ -204,7 +240,7 @@ impl Event {
                 let payload = serde_json::json!({
                     "conv": conv, "seq": seq, "sender_account": hex(sender), "sender_name": sender_name, "from_me": from_me,
                     "message_id": id, "content": text, "ttl_secs": ttl, "timestamp": at,
-                    "reply_to": extras.reply, "thread": extras.thread,
+                    "reply_to": extras.reply, "thread": extras.thread, "file": extras.file, "fwd": extras.fwd,
                 });
                 ("stored-channel-message", payload)
             }
@@ -1424,10 +1460,24 @@ mod tests {
     /// A stored reply reaches the front end as one: the cloud log is the
     /// third way in, next to the live message and the history hand-off.
     #[test]
-    fn a_stored_message_keeps_what_it_answers() {
+    fn a_stored_message_keeps_what_it_answers_and_its_file() {
+        let file = crate::envelope::FileRef {
+            hash: "a".repeat(64),
+            key: "b".repeat(64),
+            size: 3,
+            z: false,
+            name: "a.txt".into(),
+            mime: None,
+            w: None,
+            h: None,
+            dur: None,
+            px: None,
+        };
         let extras = crate::envelope::Extras {
             reply: Some("r1".into()),
             thread: Some("t1".into()),
+            file: Some(file),
+            ..crate::envelope::Extras::default()
         };
         let stored = Event::ChannelMessage {
             conv: "c:1".into(),
@@ -1445,6 +1495,7 @@ mod tests {
             (payload["reply_to"].as_str(), payload["thread"].as_str()),
             (Some("r1"), Some("t1"))
         );
+        assert_eq!(payload["file"]["name"], "a.txt");
         let plain = Event::Message {
             conv: "d:1".into(),
             peer: [1; 16],
@@ -1455,7 +1506,115 @@ mod tests {
             server_at: 20,
             seq: 2,
         };
-        assert!(plain.to_wire().unwrap().1["reply_to"].is_null());
+        let (_, plain) = plain.to_wire().unwrap();
+        assert!(plain["reply_to"].is_null() && plain["file"].is_null() && plain["fwd"].is_null());
+    }
+
+    /// An edit, delete, reaction or pin from the stored log reaches the front
+    /// end as `stored-event`, never as a message: who sent it (to check they
+    /// may), the conversation's timer, and the earlier of the two stamps.
+    #[test]
+    fn a_stored_event_is_its_own_event_beside_stored_messages() {
+        use crate::envelope::{ChatEvent, Extras};
+        let ev = |event: ChatEvent, text: &str| {
+            let extras = Extras {
+                event: Some(event),
+                ..Extras::default()
+            };
+            crate::envelope::envelope_with("e1", text, Some(3600), &extras)
+        };
+        let stored = Event::ChannelMessage {
+            conv: "c:1".into(),
+            sender: [1; 16],
+            sender_name: "ann".into(),
+            from_me: false,
+            envelope: ev(
+                ChatEvent::React {
+                    target: "m1".into(),
+                    emoji: "🔥".into(),
+                    on: true,
+                },
+                "",
+            ),
+            sent_at: 30,
+            server_at: 20,
+            seq: 4,
+        };
+        let (name, p) = stored.to_wire().unwrap();
+        assert_eq!(name, "stored-event");
+        assert_eq!(
+            (
+                p["conv"].as_str(),
+                p["name"].as_str(),
+                p["from_me"].as_bool()
+            ),
+            (Some("c:1"), Some("ann"), Some(false))
+        );
+        assert_eq!(p["account"], voipc_protocol::conv::hex(&[1; 16]));
+        assert_eq!(
+            (p["timestamp"].as_u64(), p["ttl_secs"].as_u64()),
+            (Some(20), Some(3600))
+        );
+        assert_eq!(
+            p["event"],
+            serde_json::json!({ "kind": "react", "target": "m1", "emoji": "🔥", "on": true })
+        );
+        let dm = Event::Message {
+            conv: "d:1".into(),
+            peer: [2; 16],
+            peer_name: "bob".into(),
+            from_me: true,
+            envelope: ev(
+                ChatEvent::Edit {
+                    target: "m2".into(),
+                },
+                "better words",
+            ),
+            sent_at: 10,
+            server_at: 20,
+            seq: 5,
+        };
+        let (name, p) = dm.to_wire().unwrap();
+        assert_eq!(name, "stored-event");
+        assert_eq!(
+            (p["content"].as_str(), p["event"]["kind"].as_str()),
+            (Some("better words"), Some("edit"))
+        );
+        assert_eq!(
+            (
+                p["name"].as_str(),
+                p["from_me"].as_bool(),
+                p["timestamp"].as_u64()
+            ),
+            (Some("bob"), Some(true), Some(10))
+        );
+        // And a forwarded message is a message, with its label
+        let fwd = Event::ChannelMessage {
+            conv: "c:1".into(),
+            sender: [1; 16],
+            sender_name: "ann".into(),
+            from_me: false,
+            envelope: crate::envelope::envelope_with(
+                "m3",
+                "look",
+                None,
+                &Extras {
+                    fwd: Some(crate::envelope::Forwarded {
+                        name: "cy".into(),
+                        at: 7,
+                    }),
+                    ..Extras::default()
+                },
+            ),
+            sent_at: 10,
+            server_at: 20,
+            seq: 6,
+        };
+        let (name, p) = fwd.to_wire().unwrap();
+        assert_eq!(
+            (name, p["fwd"]["name"].as_str()),
+            ("stored-channel-message", Some("cy"))
+        );
     }
 
     struct Account {

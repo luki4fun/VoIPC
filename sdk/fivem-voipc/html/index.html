@@ -66,11 +66,11 @@
         if (msg.code === "rehello" || msg.code === "no_hello") sayHelloAgain();
         // VoIPC lets go of a held push-to-talk after 60 seconds, whatever the
         // mod believes, so that a crashed one cannot leave a microphone open.
-        // A radio key that is genuinely still down has to say so again, or a
-        // long transmission is cut in the middle and stays cut until the
-        // player releases the key and presses it a second time.
-        if (talking && msg.code === "transmit_expired") {
-          socket.send(JSON.stringify({ type: "transmit", on: true }));
+        // This page never renews it on its own (that kept a press without a
+        // release open for ever): Lua decides, from the key itself.
+        if (msg.code === "transmit_expired") {
+          talking = false;
+          post("transmitExpired", {});
         }
       }
     };
@@ -89,6 +89,12 @@
   window.addEventListener("message", (event) => {
     const data = event.data || {};
     if (data.type === "connect") {
+      // VoIPC listens on this machine only. Any other address would carry the
+      // hello, channel password included, off the player's machine (S-033).
+      if (!/^ws:\/\/(127\.0\.0\.1|localhost|\[::1\]):\d{1,5}\/?$/.test(String(data.url))) {
+        post("error", { reason: `refusing to connect to ${data.url}: VoIPC listens on 127.0.0.1` });
+        return;
+      }
       hello = data.hello;
       url = data.url;
       open();

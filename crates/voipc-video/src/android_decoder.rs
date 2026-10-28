@@ -116,6 +116,10 @@ mod ffi {
 
 /// Largest width or height believed, from a parameter set or from the codec.
 const MAX_DIMENSION: i32 = 8192;
+/// Largest picture a peer's parameter set may claim, as on the desktop
+/// (`decoder::MAX_DECODE_PIXELS`): per side alone, 8192×8192 is 67 million
+/// pixels (S-047).
+const MAX_SPS_PIXELS: u64 = 2048 * 2048;
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -809,7 +813,12 @@ fn parse_sps_nal(nal: &[u8]) -> Option<(u32, u32)> {
     let height = reader.read_ue()?;
 
     let max = MAX_DIMENSION as u32;
-    if width > 0 && height > 0 && width <= max && height <= max {
+    if width > 0
+        && height > 0
+        && width <= max
+        && height <= max
+        && width as u64 * height as u64 <= MAX_SPS_PIXELS
+    {
         Some((width, height))
     } else {
         None

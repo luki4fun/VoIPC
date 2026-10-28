@@ -18,6 +18,9 @@ import type { SavedServer, SoundSettings } from "../../lib/stores/settings";
 import type { ProximityMode } from "../../lib/spatial";
 import { FX_NONE, effectFromId } from "./worklets/mixer-worklet.js";
 import { toHex } from "../../lib/hex";
+import * as files from "./files";
+import { fileRef } from "../../lib/chat-rules";
+import type { ChatEvent, Forwarded } from "../../lib/types";
 
 type Args = Record<string, unknown>;
 type Handler = (args: Args) => unknown;
@@ -52,9 +55,18 @@ function optStr(v: unknown, name: string): string | null {
   return v == null ? null : str(v, name);
 }
 
-/** What a message answers and its thread, as the front end names them. */
-function refs(replyTo: unknown, thread: unknown) {
-  return { replyTo: optStr(replyTo, "replyTo"), thread: optStr(thread, "thread") };
+/** What a message answers, its thread, its file, where it was forwarded
+ *  from, or the event it is, as the front end names them. One that would
+ *  arrive as something else is refused (commands.rs `checked_extras`): the
+ *  wasm envelope checks a label and an event as a reader will, and throws. */
+function refs(replyTo: unknown, thread: unknown, file: unknown, fwd?: unknown, event?: unknown) {
+  return {
+    replyTo: optStr(replyTo, "replyTo"),
+    thread: optStr(thread, "thread"),
+    file: file == null ? null : (fileRef(file) ?? fail("invalid file")),
+    fwd: fwd == null ? null : (fwd as Forwarded),
+    event: event == null ? null : (event as ChatEvent),
+  };
 }
 
 function num(v: unknown, name: string): number {
@@ -187,12 +199,12 @@ const handlers: Record<string, Handler> = {
     })),
   forget_device: ({ server, name }) => forgetDevice(str(server, "server"), str(name, "name")),
   account_prefs: ({ server }) => needAccount(server).account.prefs() ?? fail("Not signed in to an account on that server"),
-  send_kept_dm: ({ server, account, content, ttlSecs, replyTo, thread }) =>
+  send_kept_dm: ({ server, account, content, ttlSecs, replyTo, thread, file, fwd, event }) =>
     need(server).sendKeptDm(
       str(account, "account"),
       str(content, "content"),
       ttlSecs == null ? undefined : u32(ttlSecs, "ttlSecs"),
-      refs(replyTo, thread),
+      refs(replyTo, thread, file, fwd, event),
     ),
   account_enter: ({ server, conv }) => {
     const { s, account } = needAccount(server);
@@ -318,20 +330,64 @@ const handlers: Record<string, Handler> = {
   // ── chat ──
   send_poke: ({ server, targetUserId, message }) =>
     need(server).sendPoke(u32(targetUserId, "targetUserId"), str(message, "message")),
-  send_channel_message: ({ server, content, channelId, ttlSecs, replyTo, thread }) =>
+  send_channel_message: ({ server, content, channelId, ttlSecs, replyTo, thread, file, fwd, event }) =>
     need(server).sendChannelMessage(
       str(content, "content"),
       channelId == null ? undefined : u32(channelId, "channelId"),
       ttlSecs == null ? undefined : u32(ttlSecs, "ttlSecs"),
-      refs(replyTo, thread),
+      refs(replyTo, thread, file, fwd, event),
     ),
-  send_direct_message: ({ server, targetUserId, content, ttlSecs, replyTo, thread }) =>
+  send_direct_message: ({ server, targetUserId, content, ttlSecs, replyTo, thread, file, fwd, event }) =>
     need(server).sendDirectMessage(
       u32(targetUserId, "targetUserId"),
       str(content, "content"),
       ttlSecs == null ? undefined : u32(ttlSecs, "ttlSecs"),
-      refs(replyTo, thread),
+      refs(replyTo, thread, file, fwd, event),
     ),
+  // ── Files (files.ts; client/src-tauri/src/files.rs) ──
+  send_file: ({ body, headers }) => {
+    const raw = (headers as Record<string, unknown> | undefined)?.["x-voipc-file"];
+    let meta: Args;
+    try {
+      meta = JSON.parse(str(raw, "x-voipc-file"));
+    } catch {
+      fail("send_file needs its x-voipc-file header");
+    }
+    if (!(body instanceof Uint8Array)) fail("send_file takes the file's bytes");
+    const s = need(meta.server);
+    if (!s.files) fail(`Not connected to ${meta.server}`);
+    return files.sendFile(s.files, files.parseConv(meta.conv), body, bool(meta.compress, "compress"), optStr(meta.op, "op") ?? undefined);
+  },
+  fetch_file: ({ server, conv, file, op }) =>
+    files.fetchFile(
+      session.sessionFor(str(server, "server"))?.files ?? null,
+      str(server, "server"),
+      files.parseConv(conv),
+      files.parseFileArg(file),
+      optStr(op, "op") ?? undefined,
+    ),
+  cancel_file: ({ op }) => files.cancel(str(op, "op")),
+  forward_file: ({ server, conv, hash, op }) => {
+    const s = need(server);
+    if (!s.files) fail("This server keeps no files");
+    return files.forwardFile(s.files, files.parseConv(conv), str(hash, "hash"), op == null ? undefined : str(op, "op"));
+  },
+  reseed_file: ({ server, conv, hash }) => {
+    const s = need(server);
+    const h = str(hash, "hash");
+    if (s.files && /^[0-9a-f]{64}$/.test(h)) files.reseedFile(s.files, files.parseConv(conv), h);
+  },
+  file_cache_list: () => files.cacheList(),
+  file_cache_retain: ({ hashes }) => {
+    if (!Array.isArray(hashes)) fail("invalid hashes");
+    files.cacheRetain(new Set(hashes.filter((h): h is string => typeof h === "string")));
+  },
+  file_cache_remove: ({ hashes }) => {
+    if (!Array.isArray(hashes)) fail("invalid hashes");
+    files.cacheRemove(hashes.filter((h): h is string => typeof h === "string"));
+  },
+  // The tab keeps files in its memory, at a size of its own (files.ts CACHE_CAP)
+  set_file_cache_mb: () => fail("The browser's file cache has a fixed size"),
   send_channel_history: ({ server, channelId, targetUserId, messages }) => {
     if (!Array.isArray(messages)) fail("invalid messages");
     need(server).sendChannelHistory(u32(channelId, "channelId"), u32(targetUserId, "targetUserId"), messages);

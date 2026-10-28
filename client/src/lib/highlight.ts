@@ -45,11 +45,32 @@ const KIND: Record<string, CodeKind> = {
 } as unknown as Record<string, CodeKind>;
 
 /**
+ * Code longer than this, or with a line longer than `MAX_LINE`, is not
+ * coloured. Some grammars take time that grows with the square of the text
+ * (60 KiB of `a` in `ini` took 7.5 s), and the colours are a nicety.
+ */
+export const MAX_CODE = 4000;
+export const MAX_LINE = 1000;
+
+/** Whether some line of `code` is longer than `MAX_LINE`. */
+function longLine(code: string): boolean {
+  let from = 0;
+  for (;;) {
+    const end = code.indexOf("\n", from);
+    if ((end < 0 ? code.length : end) - from > MAX_LINE) return true;
+    if (end < 0) return false;
+    from = end + 1;
+  }
+}
+
+/**
  * `code` in `lang`'s colours, or null for a language this build has no grammar
- * for (or none named): the block then shows as plain text, which is what it is.
+ * for (or none named), or for code too long to colour (`MAX_CODE`): the block
+ * then shows as plain text, which is what it is.
  */
 export function highlight(lang: string, code: string): CodeSeg[] | null {
   if (!lang || !lowlight.registered(lang)) return null;
+  if (code.length > MAX_CODE || longLine(code)) return null;
   try {
     return segs(lowlight.highlight(lang, code).children as ElementContent[]);
   } catch {

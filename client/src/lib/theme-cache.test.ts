@@ -63,3 +63,13 @@ test("only token names and plain colour values get through", () => {
   paintRememberedTheme();
   assert.deepEqual([...props.keys()], ["--bg-primary"]);
 });
+
+test("a name that is not a palette token is not painted, however plain", () => {
+  const { store, props } = fakePage();
+  store.set(
+    "voipc.theme-cache",
+    JSON.stringify({ tokens: { "--hit": "4px", "--z-modal": "1", "--bg-primary": "#123456", "--made-up": "#fff" }, dark: true }),
+  );
+  paintRememberedTheme();
+  assert.deepEqual([...props.keys()], ["--bg-primary"]);
+});

@@ -115,6 +115,21 @@ RegisterNUICallback("talk", function(data, cb)
   end
 end)
 
+-- VoIPC let go of the held push-to-talk after 60 seconds. Renew it only while
+-- the player's own radio key is still down; a press through the
+-- `setRadioTalking` export ends here, so a resource that never releases cannot
+-- keep a microphone open (it may call the export again to say it still holds).
+RegisterNUICallback("transmitExpired", function(_, cb)
+  cb({})
+  if not radioTalking then return end
+  if radioByKey and Config.radioPressesPtt then
+    SendNUIMessage({ type = "transmit", on = true })
+  else
+    radioTalking = false
+    TriggerServerEvent("voipc:radio:tx", false)
+  end
+end)
+
 RegisterNUICallback("error", function(data, cb)
   cb({})
   print("[voipc] " .. tostring(data.reason))
@@ -158,8 +173,14 @@ RegisterNetEvent("voipc:call", function(voipcIds)
   end
 end)
 
+--- Whether the press came from the player's own radio key (`+voipc_radio`),
+--- whose release (`-voipc_radio`) FiveM always delivers. Only such a press is
+--- renewed after VoIPC's 60-second cap; one set through the export is not.
+local radioByKey = false
+
 local function setRadioTalking(on)
   on = on and true or false
+  if not on then radioByKey = false end
   if on == radioTalking then return end
   radioTalking = on
   TriggerServerEvent("voipc:radio:tx", on)
@@ -171,7 +192,10 @@ local function setRadioTalking(on)
   end
 end
 
-RegisterCommand("+voipc_radio", function() setRadioTalking(true) end, false)
+RegisterCommand("+voipc_radio", function()
+  setRadioTalking(true)
+  radioByKey = radioTalking
+end, false)
 RegisterCommand("-voipc_radio", function() setRadioTalking(false) end, false)
 RegisterKeyMapping("+voipc_radio", "Talk on the radio", "keyboard", Config.radioKey)
 

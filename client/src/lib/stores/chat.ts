@@ -1,6 +1,7 @@
 import { writable, get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  applyEvent,
   dropExpired,
   fromArchived,
   isLegacyDmKey,
@@ -11,6 +12,7 @@ import {
   sanitizeHistory,
   messageRefs,
   toArchived,
+  type EventIn,
 } from "../chat-rules.js";
 import { previewChannelId, previewUsers } from "./channels.js";
 import { serverAddress, serverKey, userId } from "./connection.js";
@@ -450,6 +452,53 @@ export function mergeChannelHistory(
   if (added > 0) scheduleSave();
 }
 
+/**
+ * An edit, delete, reaction or pin, done to a message of a channel's chat
+ * (`applyEvent` in chat-rules.ts has the rules). `mayPin`: its sender is one
+ * of the channel's managers, by the roster's roles. Returns whether it
+ * changed anything.
+ */
+export function applyChannelEvent(server: string, channelName: string, ev: EventIn, mayPin: boolean): boolean {
+  return applyTo(channelMessages, chatKey(server, channelName), ev, mayPin);
+}
+
+/** `applyChannelEvent` for a direct conversation, filed as `addDmMessage`
+ *  files a message (`dmKeyOf`). There is nothing to pin in one. */
+export function applyDmEvent(server: string, myId: number, fromId: number, fromName: string, toId: number, ev: EventIn): boolean {
+  return applyTo(dmMessages, dmKeyOf(server, myId, fromId, fromName, toId), ev, false);
+}
+
+/** A stored log's event in a direct conversation, filed under the peer's name
+ *  as `fileStoredDm` files its messages. */
+export function applyStoredDmEvent(server: string, peerName: string, ev: EventIn): boolean {
+  return applyTo(dmMessages, dmKey(server, peerName), ev, false);
+}
+
+function applyTo(store: typeof channelMessages, key: string, ev: EventIn, mayPin: boolean): boolean {
+  let changed = false;
+  store.update((map) => {
+    const list = map.get(key);
+    if (!list) return map;
+    const next = applyEvent(list, ev, { mayPin });
+    if (next === list) return map;
+    changed = true;
+    return new Map(map).set(key, next);
+  });
+  if (changed) scheduleSave();
+  return changed;
+}
+
+/** The key a direct message is filed under: the peer's name, which for our
+ *  own echo is that server's open conversation, not the one on screen. */
+function dmKeyOf(server: string, myId: number, fromId: number, fromName: string, toId: number): string {
+  const isEcho = fromId === myId;
+  const peerId = isEcho ? toId : fromId;
+  const activeName = get(activeDmUsername.peek(server));
+  // Our own echo carries our name, not theirs; theirs is what the
+  // conversation is filed under.
+  return dmKey(server, isEcho ? peerName(server, peerId, activeName || "Unknown") : fromName);
+}
+
 export function addDmMessage(
   server: string,
   myId: number,
@@ -468,9 +517,7 @@ export function addDmMessage(
   // user has since switched away from is not being looked at, and its unread
   // count is the only thing that puts a badge on that server's rail icon.
   const onScreen = activeId === peerId && server === get(serverAddress);
-  // Our own echo carries our name, not theirs; theirs is what the
-  // conversation is filed under.
-  const key = dmKey(server, isEcho ? peerName(server, peerId, activeName || "Unknown") : fromName);
+  const key = dmKeyOf(server, myId, fromId, fromName, toId);
   if (held(get(dmMessages).get(key), msg)) return;
 
   dmMessages.update((map) => {
@@ -537,6 +584,8 @@ export function fileStoredDm(
     timestamp: number;
     reply_to?: string | null;
     thread?: string | null;
+    file?: unknown;
+    fwd?: unknown;
   },
   own: { name: string; account: string },
   expires_at: number | undefined,

@@ -11,9 +11,10 @@
 
 import type { ChatMessage } from "./types.ts";
 
-/** Whether a row is a message rather than one of our own dividers. */
+/** Whether a row is a message rather than one of our own dividers, or what
+ *  is left of one its writer deleted. */
 function isMessage(m: ChatMessage): boolean {
-  return m.kind !== "history-marker" && m.kind !== "notice";
+  return m.kind !== "history-marker" && m.kind !== "notice" && m.kind !== "deleted";
 }
 
 /** Messages by id, for the lookups below. */
@@ -47,7 +48,7 @@ export function findTarget(
 }
 
 /** Who wrote a message, as one key: the account where there is one. */
-export function authorKey(m: ChatMessage): string {
+export function authorKey(m: Pick<ChatMessage, "account" | "user_id" | "username">): string {
   return m.account ? `a:${m.account}` : `u:${m.user_id}:${m.username}`;
 }
 

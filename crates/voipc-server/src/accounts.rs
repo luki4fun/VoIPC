@@ -159,6 +159,9 @@ pub struct Relay {
 /// A key slot as `voipc_crypto::account::Vault` writes it: version byte,
 /// salt (32), DEK id (8), nonce (12), the wrapped DEK and its tag (48).
 const SLOT_LEN: usize = 1 + 32 + 8 + 12 + 48;
+/// `slot.reset`: the reset key's public half (Ed25519).
+const SLOT_RESET: &str = voipc_crypto::account::SLOT_RESET;
+const RESET_KEY_LEN: usize = 32;
 
 /// One sign-in in progress: a share of the relay's slots and of its
 /// address's, both given back when it ends.
@@ -780,6 +783,14 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             if let Some(reason) = vault.iter().find_map(|b| vault_item_ok(&b.k, &b.v).err()) {
                 return Err(reason.into());
             }
+            // The reset key, which only the recovery key derives: a reset is
+            // checked against it, never against what a device holds (S-006)
+            if !vault
+                .iter()
+                .any(|b| b.k == SLOT_RESET && b.v.len() == RESET_KEY_LEN)
+            {
+                return Err(unexpected());
+            }
             let pw = secret_text(&auth_secret)?;
             let _work = work()?;
             let s = match &invite {
@@ -922,6 +933,7 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
     .await?;
     let AuthContinue::Reset {
         signature,
+        key_signature,
         auth_secret,
         pass_slot,
         totp,
@@ -930,13 +942,25 @@ async fn reset<S: AsyncRead + AsyncWrite + Unpin>(
     else {
         return Err(unexpected());
     };
-    if !voipc_crypto::account::reset_proof_ok(
-        &identity,
-        &relay.relay_id,
-        &user.username,
-        &challenge,
-        &signature,
-    ) {
+    // An account with a reset key proves the recovery key itself; one made
+    // before 1.3 has only its identity, which the vault's DEK opens too
+    let proved = match vault.iter().find(|b| b.k == SLOT_RESET) {
+        Some(reset_key) => voipc_crypto::account::reset_key_proof_ok(
+            &reset_key.v,
+            &relay.relay_id,
+            &user.username,
+            &challenge,
+            &key_signature,
+        ),
+        None => voipc_crypto::account::reset_proof_ok(
+            &identity,
+            &relay.relay_id,
+            &user.username,
+            &challenge,
+            &signature,
+        ),
+    };
+    if !proved {
         return Err("That recovery key is not this account's.".into());
     }
     if pass_slot.len() != SLOT_LEN {
@@ -1178,6 +1202,66 @@ async fn password_change(
     })
     .await?;
     info!(user = %user.id.hex(), "account password changed");
+    Ok(())
+}
+
+/// `RecoveryKeyNew`: the password (and the second factor) again, then the
+/// new `slot.recovery` and `slot.reset` in place of the old. If the second
+/// write fails the first is put back, so the old recovery key keeps working
+/// until both are in. (A crash between the two leaves the new slot with the
+/// old reset key: the person still has the old key's text, so a reset needs
+/// a new key made again.)
+#[allow(clippy::too_many_arguments)]
+async fn recovery_key_new(
+    state: &ServerState,
+    relay: &Relay,
+    session_id: u32,
+    ctx: &Ctx,
+    user: &User,
+    info: &SessionInfo,
+    secret: &[u8],
+    (recovery_slot, reset_key): (&[u8], &[u8]),
+    (totp, recovery_code): (Option<String>, Option<String>),
+) -> Result<(), String> {
+    let password = secret_text(secret)?;
+    if recovery_slot.len() != SLOT_LEN || reset_key.len() != RESET_KEY_LEN {
+        return Err("malformed recovery key".into());
+    }
+    let (user, _) = confirm_again(
+        state,
+        relay,
+        session_id,
+        ctx,
+        user,
+        info,
+        &password,
+        (totp, recovery_code),
+    )
+    .await?;
+    let gone = || "Something went wrong. Please try again.".to_string();
+    let vault = relay.vault(user.id).await.map_err(|_| gone())?;
+    let version = |k: &str| vault.iter().find(|b| b.k == k).map_or(0, |b| b.version);
+    let put = |k: &'static str, v: &[u8], expect: i64| {
+        let v = v.to_vec();
+        async move {
+            match relay
+                .store()
+                .put_blob(user.id, VAULT_NS, k, &v, expect, relay.quota)
+                .await
+            {
+                Ok(PutBlob::Done(written)) => Ok(written),
+                _ => Err(gone()),
+            }
+        }
+    };
+    let written = put("slot.recovery", recovery_slot, version("slot.recovery")).await?;
+    if let Err(e) = put(SLOT_RESET, reset_key, version(SLOT_RESET)).await {
+        if let Some(old) = vault.iter().find(|b| b.k == "slot.recovery") {
+            let _ = put("slot.recovery", &old.v, written).await;
+        }
+        return Err(e);
+    }
+    info!(user = %user.id.hex(), "account recovery key replaced");
     Ok(())
 }
 
@@ -1487,6 +1571,30 @@ pub async fn handle_request(
                     return Ok(());
                 }
                 Err(reason) => refused("DeleteAccount", &reason),
+            }
+        }
+        AccountRequest::RecoveryKeyNew {
+            secret,
+            recovery_slot,
+            reset_key,
+            totp,
+            recovery_code,
+        } => {
+            match recovery_key_new(
+                state,
+                &relay,
+                session_id,
+                &ctx,
+                &user,
+                &info,
+                &secret,
+                (&recovery_slot, &reset_key),
+                (totp, recovery_code),
+            )
+            .await
+            {
+                Ok(()) => AccountReply::RecoveryKeyChanged,
+                Err(reason) => refused("RecoveryKeyNew", &reason),
             }
         }
         AccountRequest::PasswordChange {

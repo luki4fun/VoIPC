@@ -68,6 +68,9 @@ pub async fn disconnect(
     app_handle: tauri::AppHandle,
     server: String,
 ) -> Result<(), String> {
+    // The user's own leave: a game may not bring them back with a hello after
+    // a reconnect (S-030)
+    state.user_moved.fetch_add(1, Ordering::Relaxed);
     // Out of the map under the lock, torn down outside it (see `teardown`).
     // Its Signal state goes with it: it lived on the connection.
     let connection = state.connections.write().await.remove(&server);
@@ -562,10 +565,17 @@ pub async fn send_channel_message(
     // timer. The front end passes what the channel advertises; it travels
     // inside the ciphertext, so the relay can neither read it nor change it.
     ttl_secs: Option<u32>,
-    // The message this answers and the thread it belongs to, by id; inside the
+    // The message this answers and the thread it belongs to, by id, and the
+    // file it carries (`send_file`'s blob, its name and card): inside the
     // ciphertext too.
     reply_to: Option<String>,
     thread: Option<String>,
+    file: Option<serde_json::Value>,
+    // Where a forwarded message came from (`{name, at}`), or what this does
+    // to an earlier message (`{kind, target, emoji?, on?}`): an edit, a
+    // delete, a reaction or a pin, which then carries nothing else.
+    fwd: Option<serde_json::Value>,
+    event: Option<serde_json::Value>,
 ) -> Result<(), String> {
     let (user_id, username, current_channel_id, tcp_tx, signal, account, channels) = {
         let conns = state.connections.read().await;
@@ -596,10 +606,7 @@ pub async fn send_channel_message(
     // The id travels inside the ciphertext, so our own echo below and every
     // receiver's copy file the message under the same one.
     let message_id = crypto::new_message_id();
-    let extras = crypto::Extras {
-        reply: reply_to,
-        thread,
-    };
+    let extras = checked_extras(reply_to, thread, file, fwd, event)?;
     let payload = crypto::envelope_with(&message_id, &content, ttl_secs, &extras);
 
     // A channel with a log keeps it for its members too (cloud copies on),
@@ -676,6 +683,9 @@ pub async fn send_channel_message(
                     "ttl_secs": ttl_secs,
                     "reply_to": extras.reply,
                     "thread": extras.thread,
+                    "file": extras.file,
+                    "fwd": extras.fwd,
+                    "event": extras.event,
                     "encrypted": true,
                 }),
             );
@@ -719,12 +729,54 @@ pub async fn send_channel_message(
                     "ttl_secs": ttl_secs,
                     "reply_to": extras.reply,
                     "thread": extras.thread,
+                    "file": extras.file,
+                    "fwd": extras.fwd,
+                    "event": extras.event,
                     "pending": true,
                 }),
             );
             Ok(())
         }
     }
+}
+
+/// The file a message is to carry, as the front end hands it over, checked
+/// as a receiver will check it: one that would arrive as no file is refused
+/// here, rather than sent as a message with only its caption.
+pub(crate) fn checked_file(
+    file: Option<&serde_json::Value>,
+) -> Result<Option<voipc_crypto::FileRef>, String> {
+    file.map(|f| voipc_crypto::FileRef::checked(f).ok_or_else(|| "invalid file".to_string()))
+        .transpose()
+}
+
+/// Everything a message carries beside its text, checked as a receiver
+/// will check it (`checked_file`): a forwarded message's label, or an
+/// event, which would otherwise arrive as no label, or as a placeholder.
+pub(crate) fn checked_extras(
+    reply: Option<String>,
+    thread: Option<String>,
+    file: Option<serde_json::Value>,
+    fwd: Option<serde_json::Value>,
+    event: Option<serde_json::Value>,
+) -> Result<crypto::Extras, String> {
+    let fwd = fwd
+        .map(|f| voipc_crypto::Forwarded::checked(&f).ok_or("invalid fwd"))
+        .transpose()?;
+    let event = event
+        .map(|e| {
+            e.as_object()
+                .and_then(voipc_crypto::ChatEvent::checked)
+                .ok_or("invalid event")
+        })
+        .transpose()?;
+    Ok(crypto::Extras {
+        reply,
+        thread,
+        file: checked_file(file.as_ref())?,
+        fwd,
+        event,
+    })
 }
 
 /// Send a direct message to another user.
@@ -744,6 +796,9 @@ pub async fn send_direct_message(
     ttl_secs: Option<u32>,
     reply_to: Option<String>,
     thread: Option<String>,
+    file: Option<serde_json::Value>,
+    fwd: Option<serde_json::Value>,
+    event: Option<serde_json::Value>,
 ) -> Result<(), String> {
     let (tcp_tx, own_user_id, own_username, signal, account) = {
         let conns = state.connections.read().await;
@@ -762,10 +817,7 @@ pub async fn send_direct_message(
     // channel message uses now — which also gives a DM the id it never had, and
     // costs nothing on the far side: `open_envelope` reads plain text as text.
     let message_id = crypto::new_message_id();
-    let extras = crypto::Extras {
-        reply: reply_to,
-        thread,
-    };
+    let extras = checked_extras(reply_to, thread, file, fwd, event)?;
     let payload = crypto::envelope_with(&message_id, &content, ttl_secs, &extras);
 
     // Between two accounts, and with cloud copies on, it is kept for them too:
@@ -832,6 +884,9 @@ pub async fn send_direct_message(
                     "ttl_secs": ttl_secs,
                     "reply_to": extras.reply,
                     "thread": extras.thread,
+                    "file": extras.file,
+                    "fwd": extras.fwd,
+                    "event": extras.event,
                     "encrypted": true,
                 }),
             );
@@ -875,6 +930,9 @@ pub async fn send_direct_message(
                     "ttl_secs": ttl_secs,
                     "reply_to": extras.reply,
                     "thread": extras.thread,
+                    "file": extras.file,
+                    "fwd": extras.fwd,
+                    "event": extras.event,
                     "pending": true,
                 }),
             );
@@ -2668,11 +2726,27 @@ async fn confirm_natively(title: &str, text: &str) -> Result<(), String> {
 /// one hands the user's NTLM hash to that host, and these paths come from the
 /// page, so they are refused (H4-11).
 fn refuse_remote_path(path: &str) -> Result<(), String> {
-    let path = path.trim_start();
-    if path.starts_with(r"\\") || (cfg!(windows) && path.starts_with("//")) {
+    if is_remote_path(path, cfg!(windows)) {
         return Err("A folder on another computer cannot be used".into());
     }
     Ok(())
+}
+
+/// A path that would reach another machine. On Windows any two leading
+/// slashes of either kind are a network path (`\\`, `//`, `/\`, `\/`), and
+/// `\??\` hands the rest to the NT namespace, where a share is one more
+/// prefix away (S-038).
+fn is_remote_path(path: &str, windows: bool) -> bool {
+    let path = path.trim_start();
+    if path.starts_with(r"\\") {
+        return true;
+    }
+    if !windows {
+        return false;
+    }
+    let slash = |c: Option<char>| matches!(c, Some('\\' | '/'));
+    let mut chars = path.chars();
+    (slash(chars.next()) && slash(chars.next())) || path.starts_with(r"\??\")
 }
 
 /// Turn the game SDK on or off and set its port and extra allowed origins.
@@ -2700,6 +2774,34 @@ pub async fn set_sdk_config(
             .filter(|o| !o.is_empty())
             .collect()
     });
+    // `null` is every sandboxed frame, data: URL and file:// page at once,
+    // never one game: refused outright (S-011; serve a test page from localhost)
+    if origins
+        .iter()
+        .flatten()
+        .any(|o| o.eq_ignore_ascii_case("null"))
+    {
+        return Err("\"null\" cannot be allowed: it stands for every sandboxed or file:// page. Serve a test page from localhost instead.".into());
+    }
+    // Only plain origins, and few of them: what the native confirm shows is
+    // exactly what will be matched (S-040)
+    if let Some(list) = &origins {
+        if list.len() > 16 {
+            return Err("at most 16 extra origins".into());
+        }
+        if let Some(bad) = list
+            .iter()
+            .find(|o| !voipc_audio::game::origin_well_formed(o))
+        {
+            return Err(format!(
+                "not an origin (scheme://host[:port]): {}",
+                bad.chars()
+                    .filter(|c| !c.is_control())
+                    .take(60)
+                    .collect::<String>()
+            ));
+        }
+    }
     // What this change would allow that is not allowed now
     let (new_origins, beacon_on, transmit_on) = {
         let config = state.config();
@@ -2716,10 +2818,15 @@ pub async fn set_sdk_config(
         )
     };
     if !new_origins.is_empty() {
+        let list: Vec<String> = new_origins
+            .iter()
+            .enumerate()
+            .map(|(i, o)| format!("{}. {o}", i + 1))
+            .collect();
         let text = format!(
-            "Let pages from {} place people in your voice mix, as a game would?\n\n\
+            "Let pages from these origins place people in your voice mix, as a game would?\n\n{}\n\n\
              Only add an origin your game or mod's own documentation names.",
-            new_origins.join(", ")
+            list.join("\n")
         );
         confirm_natively("VoIPC — game integration", &text).await?;
     }
@@ -3441,6 +3548,27 @@ pub fn load_config(state: State<'_, AppState>) -> crate::config::AppConfig {
     state.config().clone()
 }
 
+/// Whether `host:port` may be stored as taking a self-signed certificate.
+/// Never wider than the config already holds for it: a server the user saved
+/// with the public roots stays that way unless `save_server` asked natively
+/// (S-039). A host the config does not know is stored as asked.
+fn self_signed_as_saved(
+    config: &crate::config::AppConfig,
+    host: &str,
+    port: u16,
+    wanted: bool,
+) -> bool {
+    let checked = config
+        .saved_servers
+        .iter()
+        .chain(&config.open_servers)
+        .any(|s| s.host == host && s.port == port && !s.accept_self_signed)
+        || (config.last_host.as_deref() == Some(host)
+            && config.last_port == Some(port)
+            && config.last_accept_self_signed == Some(false));
+    wanted && !checked
+}
+
 /// Save connection details for pre-filling on next launch.
 #[tauri::command]
 pub fn save_connection_info(
@@ -3454,6 +3582,7 @@ pub fn save_connection_info(
     let mut config = state.config();
     config.remember_connection = remember;
     if remember {
+        let accept_self_signed = self_signed_as_saved(&config, &host, port, accept_self_signed);
         config.last_host = Some(host);
         config.last_port = Some(port);
         config.last_username = Some(username);
@@ -3542,6 +3671,14 @@ pub fn save_open_servers(
     servers: Vec<crate::config::SavedServer>,
 ) -> Result<(), String> {
     let mut config = state.config();
+    let servers = servers
+        .into_iter()
+        .map(|mut s| {
+            s.accept_self_signed =
+                self_signed_as_saved(&config, &s.host, s.port, s.accept_self_signed);
+            s
+        })
+        .collect();
     config.open_servers = servers;
     crate::config::save_config(&config)
 }
@@ -3797,5 +3934,51 @@ mod tests {
         assert!(refuse_remote_path(r"  \\attacker\share").is_err());
         assert!(refuse_remote_path("/home/me/sounds/ping.wav").is_ok());
         assert!(refuse_remote_path(r"C:\Users\me\ping.wav").is_ok());
+        // Windows: every two-slash form, and the NT namespace (S-038)
+        for remote in [
+            r"//attacker/share",
+            r"/\attacker\share",
+            r"\/attacker/share",
+            r"\??\UNC\attacker\share",
+        ] {
+            assert!(is_remote_path(remote, true), "{remote}");
+        }
+        assert!(!is_remote_path(r"C:\Users\me\ping.wav", true));
+        assert!(!is_remote_path(r"\Users\me\ping.wav", true));
+        // Elsewhere `//` is a local path
+        assert!(!is_remote_path("//home/me/ping.wav", false));
+    }
+
+    /// S-039: a server stored as checked against the public roots is never
+    /// stored as taking a self-signed certificate by the connect or open-list
+    /// saves; only `save_server` widens it, after asking.
+    #[test]
+    fn trust_is_never_widened_behind_the_users_back() {
+        let server = |host: &str, self_signed: bool| crate::config::SavedServer {
+            name: host.into(),
+            host: host.into(),
+            port: 9987,
+            username: "me".into(),
+            accept_self_signed: self_signed,
+            account: false,
+        };
+        let config = crate::config::AppConfig {
+            saved_servers: vec![
+                server("checked.example", false),
+                server("pinned.example", true),
+            ],
+            ..Default::default()
+        };
+        assert!(!self_signed_as_saved(
+            &config,
+            "checked.example",
+            9987,
+            true
+        ));
+        assert!(self_signed_as_saved(&config, "pinned.example", 9987, true));
+        assert!(self_signed_as_saved(&config, "new.example", 9987, true));
+        assert!(!self_signed_as_saved(&config, "new.example", 9987, false));
+        // Another port is another server
+        assert!(self_signed_as_saved(&config, "checked.example", 9988, true));
     }
 }

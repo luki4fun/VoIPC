@@ -6,6 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   canManage,
+  canManageAs,
   needsNsfwConsent,
   postBlock,
   slowModeLabel,
@@ -23,6 +24,18 @@ test("a channel's managers are its creator, admins and moderators — never in t
   assert.equal(canManage({ channel_id: 0, created_by: null }, { ...member, isAdmin: true }), false);
   // Not connected yet: nobody's creator
   assert.equal(canManage({ channel_id: 3, created_by: null }, { ...member, userId: null }), false);
+});
+
+test("someone else manages a channel by their roles in the roster, as the user would", () => {
+  const ch = { channel_id: 3, created_by: 9 };
+  const ben = { user_id: 7, is_admin: false, is_moderator: false };
+  assert.equal(canManageAs(ch, ben), false, "a member pins nothing");
+  assert.equal(canManageAs(ch, { ...ben, is_admin: true }), true);
+  assert.equal(canManageAs(ch, { ...ben, is_moderator: true }), true);
+  assert.equal(canManageAs(ch, { ...ben, user_id: 9 }), true, "the creator");
+  assert.equal(canManageAs(ch, { user_id: 7, is_admin: false }), false, "no moderator flag on a server without accounts");
+  assert.equal(canManageAs(ch, null), false, "not in the roster: offline, or never here");
+  assert.equal(canManageAs({ channel_id: 0, created_by: null }, { ...ben, is_admin: true }), false, "not in the lobby");
 });
 
 test("an announcement channel blocks members and lets managers post", () => {

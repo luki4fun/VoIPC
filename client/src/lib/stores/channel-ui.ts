@@ -30,17 +30,24 @@ import {
   activeTextChannelId,
   clearChannelUnread,
   closeDm,
+  dmConversations,
   joinedTextChannelIds,
+  openDm,
   openTextChannel,
 } from "./chat.js";
+import { openServers } from "./servers.js";
+import { users } from "./users.js";
+import { shortName } from "../username.js";
+import type { ChatPlace } from "../chat-rules.js";
 import { addNotification } from "./notifications.js";
 import { isModerator } from "./roster.js";
 import { showChatPane } from "./platform.js";
-import { updateUiPrefs, uiPrefs } from "./ui-prefs.js";
+import { updateActiveStreamChat, updateUiPrefs, uiPrefs } from "./ui-prefs.js";
+import { streamStage } from "./screenshare.js";
 import { buildInviteLink, splitAddress } from "../invite.js";
-import { canManage, needsNsfwConsent, type Me } from "../channel-post-rules.js";
+import { canManage, canManageAs, needsNsfwConsent, type Me } from "../channel-post-rules.js";
 import type { ProximityMode } from "../spatial.js";
-import type { ChannelInfo } from "../types.js";
+import type { ChannelInfo, ChatMessage } from "../types.js";
 
 // ── Create ─────────────────────────────────────────────────────────────────
 
@@ -457,6 +464,20 @@ export const me: Readable<Me> = derived([userId, isAdmin, isModerator], ([$id, $
   isModerator: $mod,
 }));
 
+/**
+ * Whether `uid` is one of channel `channelId`'s managers on `server`, by the
+ * roster's roles now: what a pin is checked against. Ourselves as `me` is
+ * (an admin by token too); anyone else as the user list has them, and
+ * nobody it does not list.
+ */
+export function managesChannel(server: string, channelId: number, uid: number): boolean {
+  const ch = get(channels.peek(server)).find((c) => c.channel_id === channelId);
+  if (!ch) return false;
+  const entry = get(users.peek(server)).find((u) => u.user_id === uid);
+  if (uid !== get(userId.peek(server))) return canManageAs(ch, entry);
+  return canManage(ch, { userId: uid, isAdmin: get(isAdmin.peek(server)), isModerator: !!entry?.is_moderator });
+}
+
 /** When this client last posted in each channel, per server (ms). For slow
  *  mode's countdown; the server keeps its own clock and has the last word. */
 const lastPosts = new Map<string, number>();
@@ -650,4 +671,49 @@ export async function submitChannelSettings(): Promise<void> {
     console.error("Failed to change channel settings:", e);
     addNotification(`Failed to change channel settings: ${e}`, "error");
   }
+}
+
+// ── Going to a message ─────────────────────────────────────────────────────
+
+/** A message to bring into view once its conversation is on screen. Each chat
+ *  pane goes to it once (ChatPanel.svelte); it lapses after a few seconds, so
+ *  a later visit there does not jump. */
+export const messageJump = writable<{ msg: ChatMessage; from?: symbol } | null>(null);
+
+/**
+ * Open the conversation at `place`, on whichever open server it is, and go to
+ * `msg` in it: in the chat pane `from`, if given, else in any. False, with a
+ * word why, where it cannot be opened now.
+ */
+export function showMessage(place: ChatPlace, msg: ChatMessage, from?: symbol): boolean {
+  const server = get(openServers).find((s) => serverKey(s) === place.server);
+  if (!server) {
+    addNotification(`${place.server} is not connected: connect to read that conversation`, "info");
+    return false;
+  }
+  if (server !== get(serverAddress)) serverAddress.set(server);
+  if (place.kind === "dm") {
+    const peer =
+      get(dmConversations.peek(server)).find((c) => c.username === place.name) ??
+      get(users.peek(server)).find((u) => u.username === place.name);
+    if (!peer) {
+      addNotification(`Your conversation with ${shortName(place.name)} is not open now`, "info");
+      return false;
+    }
+    openDm(server, peer.user_id, peer.username);
+    showChatPane();
+  } else {
+    const channel = get(channels.peek(server)).find((c) => c.name === place.name);
+    if (!channel) {
+      addNotification(`${place.name} is not on that server any more`, "info");
+      return false;
+    }
+    void selectChannel(channel);
+  }
+  // A share on screen holds the chat beside it: open it, or nothing shows
+  if (get(streamStage) !== null) updateActiveStreamChat((c) => void (c.open = true));
+  const jump = { msg, from };
+  messageJump.set(jump);
+  setTimeout(() => messageJump.update((j) => (j === jump ? null : j)), 3000);
+  return true;
 }

@@ -7,9 +7,9 @@
 //!
 //! ```text
 //! blob    = commit (32) ‖ chunk 0 ‖ chunk 1 ‖ … ‖ chunk n-1
-//! commit  = HMAC-SHA256(key, "voipc-file/v1 commit")
+//! commit  = HMAC-SHA256(key, "voipc-file/v2 commit" ‖ deflated ‖ size as u64 BE)
 //! chunk i = AES-256-GCM(key, nonce = 0u32 ‖ i as u64 BE,
-//!                       aad = "voipc-file/v1" ‖ last, 64 KiB of the body) ‖ tag
+//!                       aad = "voipc-file/v2" ‖ last, 64 KiB of the body) ‖ tag
 //! last    = 1 on the final chunk, 0 on every other
 //! blob id = SHA-256(blob)
 //! ```
@@ -21,9 +21,15 @@
 //! - The key is fresh for every file and travels only inside the end-to-end
 //!   message, so the nonces may count from zero. A forward or a re-seed sends
 //!   the same blob again; nothing is ever sealed twice under one key.
-//! - The commitment binds a blob to one key. GCM alone does not: a sender can
-//!   build one ciphertext that opens under two keys, and show two readers two
+//! - The commitment binds a blob to one key, size and deflate flag. GCM alone
+//!   does not: a sender can build one ciphertext that opens under two keys,
+//!   and v1 opened one blob as its file or as raw deflate bytes, depending on
+//!   the flag a message claimed. Either way two messages could show two
 //!   different files under one blob id.
+//! - A body may run past the file: `size` bytes of it when stored, the end of
+//!   the deflate stream when deflated. What follows is padding, sealed and
+//!   ignored. Nothing writes it yet; readers take it from the start, so a
+//!   later sender can hide a file's exact size without a new format.
 //! - The last flag means a blob cut at a chunk boundary does not open, the
 //!   index in the nonce means chunks moved do not open, and the framing means
 //!   bytes added do not open.
@@ -52,8 +58,8 @@ pub const MAX_FILE_BLOB: u64 = sealed_len(MAX_FILE_PLAIN);
 const CHUNK: usize = 64 * 1024;
 const TAG: usize = 16;
 const COMMIT: usize = 32;
-const COMMIT_LABEL: &[u8] = b"voipc-file/v1 commit";
-const AAD_LABEL: &[u8; 13] = b"voipc-file/v1";
+const COMMIT_LABEL: &[u8] = b"voipc-file/v2 commit";
+const AAD_LABEL: &[u8; 13] = b"voipc-file/v2";
 /// miniz's default level.
 const LEVEL: u8 = 6;
 /// A file bigger than four of these has its first one deflated before the
@@ -123,7 +129,7 @@ pub enum FileError {
     TooLarge,
     /// The bytes are not the blob the message names.
     NotThisFile,
-    /// The blob is not sealed under this key.
+    /// The blob is not sealed under this key, size and deflate flag.
     WrongKey,
     /// Does not decrypt: altered, cut short, or chunks moved.
     Sealed,
@@ -152,7 +158,7 @@ impl std::fmt::Display for FileError {
         f.write_str(match self {
             FileError::TooLarge => "the file is larger than 64 MiB",
             FileError::NotThisFile => "the file's bytes are not the ones its message names",
-            FileError::WrongKey => "the file is not sealed under its message's key",
+            FileError::WrongKey => "the file is not sealed as its message describes",
             FileError::Sealed => "the file does not decrypt",
             FileError::Malformed => "the file is malformed",
         })
@@ -196,17 +202,18 @@ pub(crate) fn seal_with(
         return Err(FileError::TooLarge);
     }
     let deflated = if compress { deflate(plain) } else { None };
-    let blob = seal_body(&key, deflated.as_deref().unwrap_or(plain));
+    let (z, size) = (deflated.is_some(), plain.len() as u64);
+    let blob = seal_body(&key, z, size, deflated.as_deref().unwrap_or(plain));
     let meta = FileMeta {
         hash: blob_hash(&blob),
         key,
-        size: plain.len() as u64,
-        deflated: deflated.is_some(),
+        size,
+        deflated: z,
     };
     Ok((meta, blob))
 }
 
-pub(crate) fn seal_body(key: &[u8; 32], body: &[u8]) -> Vec<u8> {
+pub(crate) fn seal_body(key: &[u8; 32], deflated: bool, size: u64, body: &[u8]) -> Vec<u8> {
     let aead = aead_key(key);
     let pieces: Vec<&[u8]> = if body.is_empty() {
         vec![body]
@@ -214,7 +221,7 @@ pub(crate) fn seal_body(key: &[u8; 32], body: &[u8]) -> Vec<u8> {
         body.chunks(CHUNK).collect()
     };
     let mut blob = Vec::with_capacity(COMMIT + body.len() + pieces.len() * TAG);
-    blob.extend_from_slice(&commitment(key));
+    blob.extend_from_slice(&commitment(key, deflated, size));
     for (i, piece) in pieces.iter().enumerate() {
         let start = blob.len();
         blob.extend_from_slice(piece);
@@ -235,7 +242,8 @@ pub(crate) fn seal_body(key: &[u8; 32], body: &[u8]) -> Vec<u8> {
 /// The lengths are checked against `meta` before anything is hashed or
 /// decrypted, and the inflate stops one byte past the size the sender
 /// claimed, which is itself at most `MAX_FILE_PLAIN`: a small blob cannot
-/// make a reader write gigabytes.
+/// make a reader write gigabytes. Padding after the file, inside the body, is
+/// dropped.
 pub fn open(meta: &FileMeta, blob: &[u8]) -> Result<Vec<u8>, FileError> {
     if meta.size > MAX_FILE_PLAIN {
         return Err(FileError::TooLarge);
@@ -244,12 +252,9 @@ pub fn open(meta: &FileMeta, blob: &[u8]) -> Result<Vec<u8>, FileError> {
     let (commit, sealed) = blob.split_at_checked(COMMIT).ok_or(FileError::Malformed)?;
     let chunks = chunks_in(sealed.len()).ok_or(FileError::Malformed)?;
     let body_len = sealed.len() - chunks * TAG;
-    // As it is, the body is the file; deflated, it is never the longer.
-    let fits = if meta.deflated {
-        body_len <= size
-    } else {
-        body_len == size
-    };
+    // Stored, the body holds the file and maybe padding; deflated, the stream
+    // and maybe padding. Either way it stays within what a reader would hold.
+    let fits = body_len as u64 <= MAX_FILE_PLAIN && (meta.deflated || body_len >= size);
     if !fits {
         return Err(FileError::Malformed);
     }
@@ -258,7 +263,7 @@ pub fn open(meta: &FileMeta, blob: &[u8]) -> Result<Vec<u8>, FileError> {
     }
     hmac::verify(
         &hmac::Key::new(hmac::HMAC_SHA256, &meta.key),
-        COMMIT_LABEL,
+        &commit_input(meta.deflated, meta.size),
         commit,
     )
     .map_err(|_| FileError::WrongKey)?;
@@ -277,6 +282,7 @@ pub fn open(meta: &FileMeta, blob: &[u8]) -> Result<Vec<u8>, FileError> {
     if meta.deflated {
         inflate(&body, size)
     } else {
+        body.truncate(size);
         Ok(body)
     }
 }
@@ -293,9 +299,19 @@ fn chunks_in(sealed: usize) -> Option<usize> {
     (last > TAG || n == 1).then_some(n)
 }
 
-pub(crate) fn commitment(key: &[u8; 32]) -> [u8; COMMIT] {
-    let tag = hmac::sign(&hmac::Key::new(hmac::HMAC_SHA256, key), COMMIT_LABEL);
+pub(crate) fn commitment(key: &[u8; 32], deflated: bool, size: u64) -> [u8; COMMIT] {
+    let key = hmac::Key::new(hmac::HMAC_SHA256, key);
+    let tag = hmac::sign(&key, &commit_input(deflated, size));
     tag.as_ref().try_into().expect("HMAC-SHA256 is 32 bytes")
+}
+
+/// What the commitment signs: the label, the deflate flag and the size.
+fn commit_input(deflated: bool, size: u64) -> [u8; COMMIT_LABEL.len() + 9] {
+    let mut m = [0u8; COMMIT_LABEL.len() + 9];
+    m[..COMMIT_LABEL.len()].copy_from_slice(COMMIT_LABEL);
+    m[COMMIT_LABEL.len()] = deflated as u8;
+    m[COMMIT_LABEL.len() + 1..].copy_from_slice(&size.to_be_bytes());
+    m
 }
 
 fn aead_key(key: &[u8; 32]) -> LessSafeKey {
@@ -379,8 +395,8 @@ fn compressed_already(b: &[u8]) -> bool {
         || b.get(4..8) == Some(&b"ftyp"[..])
 }
 
-/// `body` inflated, if it is a raw deflate stream of exactly `size` bytes
-/// with nothing after it.
+/// `body` inflated, if it starts with a raw deflate stream of exactly `size`
+/// bytes. What follows the stream is padding.
 pub(crate) fn inflate(body: &[u8], size: usize) -> Result<Vec<u8>, FileError> {
     let mut out = Vec::new();
     inflate_into(body, size, &mut out)?;
@@ -424,7 +440,7 @@ fn inflate_into(body: &[u8], size: usize, out: &mut Vec<u8>) -> Result<(), FileE
         }
     }
     out.truncate(written);
-    if written != size || read != body.len() {
+    if written != size {
         return Err(FileError::Malformed);
     }
     Ok(())
@@ -435,9 +451,10 @@ mod tests {
     use super::*;
 
     // Known answers from Node's crypto (OpenSSL) and zlib, not from this code:
-    // createHmac("sha256", KEY), createCipheriv("aes-256-gcm", KEY, nonce)
-    // with setAAD per chunk, zlib.deflateRawSync(…, { level: 9 }), and
-    // createHash("sha256") over the blob. The key is 00 01 … 1f.
+    // createHmac("sha256", KEY) over the label, the flag byte and the size as
+    // a u64 BE, createCipheriv("aes-256-gcm", KEY, nonce) with setAAD per
+    // chunk, zlib.deflateRawSync(…, { level: 9 }), and createHash("sha256")
+    // over the blob. The key is 00 01 … 1f.
     const KEY: [u8; 32] = {
         let mut k = [0u8; 32];
         let mut i = 0;
@@ -447,19 +464,22 @@ mod tests {
         }
         k
     };
-    const KNOWN_COMMIT: &str = "d04eabaa6957913d2b90a16ec81776eb577170a55639b7d8890e333987b53698";
+    /// The commitment of an empty file, as it is.
+    const KNOWN_COMMIT: &str = "755af933bd3cc3260cf646d56d77afdbd9652c16444241a9679006728eff1282";
     /// 70 000 bytes of `(i * 31 + 7) % 251`, as they are: two chunks.
     const KNOWN_TWO_CHUNKS: &str =
-        "b0849f4194b546d61ddf6e963735d16b7eb8c9056165da314f91130d92f4e1ec";
+        "0d30a47e0925cb03dd53aec5f436c7dcf175a1c2601a20703265d249784af61a";
     /// The first 65 536 of those: one full chunk and no empty one after it.
-    const KNOWN_ONE_FULL: &str = "7612f42536594a6e0ccb38047d063bcd2428af712334829baefbafadc2d5e86a";
-    const KNOWN_EMPTY: &str = "d04eabaa6957913d2b90a16ec81776eb577170a55639b7d8890e333987b53698\
-                               2a504df50a189eca9185b5abb568aa7c";
+    const KNOWN_ONE_FULL: &str = "543ee21f93857d1d3341e387ea9197939111fa1287ea723cf1395a7e5ea8d2ba";
+    const KNOWN_EMPTY: &str = "755af933bd3cc3260cf646d56d77afdbd9652c16444241a9679006728eff1282\
+                               a29cbc62c81290fa5fd3994ed0f4b492";
     /// "voipc " 1000 times, deflated by zlib (level 9, raw).
-    const ZLIB_BLOB: &str = "d04eabaa6957913d2b90a16ec81776eb577170a55639b7d8890e333987b53698\
+    const ZLIB_BLOB: &str = "c8526e5373e4b6d852ecec171fc12b9ebb4f96111087be7c628dfd0f588f6ea9\
                              e37814dfb52c87bdb8ff5513510866a2909e94e543b3b699ed4505ee1e493069\
-                             70e9fc896b2ddf1fa40ca0b495b04f0a0c";
-    const ZLIB_HASH: &str = "198b8f517a185db4c6f608a63d78ee307704a2a56b48b5ae9bb95f5710820035";
+                             70387b2659dc986b164c13f5837769c3ab";
+    const ZLIB_HASH: &str = "09e4cc6c89bf8762356f8ae6270d1be70d77cab6db5949702d288f7b62c5ec8e";
+    /// `pattern(1000)` stored, with 100 zero bytes of padding after it.
+    const KNOWN_PADDED: &str = "b0b71c9708ae158382a91b022fdc56d8f35a8ea0c9a9ad6ecf75a26a77278906";
 
     fn pattern(len: usize) -> Vec<u8> {
         (0..len).map(|i| ((i * 31 + 7) % 251) as u8).collect()
@@ -506,7 +526,7 @@ mod tests {
 
     #[test]
     fn known_answers() {
-        assert_eq!(hex(&commitment(&KEY)), KNOWN_COMMIT);
+        assert_eq!(hex(&commitment(&KEY, false, 0)), KNOWN_COMMIT);
 
         let plain = pattern(70_000);
         let (meta, blob) = seal_with(KEY, &plain, false).unwrap();
@@ -586,7 +606,7 @@ mod tests {
         assert_eq!(open(&m, &b), Err(FileError::WrongKey));
         // A commitment to the other key does not make the chunks open under it.
         let (m, b) = rehashed(&wrong, &blob, |b| {
-            b[..32].copy_from_slice(&commitment(&[9; 32]))
+            b[..32].copy_from_slice(&commitment(&[9; 32], false, 1000))
         });
         assert_eq!(open(&m, &b), Err(FileError::Sealed));
     }
@@ -614,14 +634,21 @@ mod tests {
         let (meta, blob) = seal(&plain, false).unwrap();
         let piece = CHUNK + TAG;
 
-        // Cut at a chunk boundary, with a size that matches what is left: the
-        // chunk now last was not sealed as the last.
+        // Cut at a chunk boundary, with a size and a commitment that match
+        // what is left (only a sender with the key can make that): the chunk
+        // now last was not sealed as the last.
         let cut = FileMeta {
             size: 2 * CHUNK as u64,
             ..meta.clone()
         };
-        let (m, b) = rehashed(&cut, &blob, |b| b.truncate(32 + 2 * piece));
+        let (m, b) = rehashed(&cut, &blob, |b| {
+            b.truncate(32 + 2 * piece);
+            b[..32].copy_from_slice(&commitment(&meta.key, false, 2 * CHUNK as u64));
+        });
         assert_eq!(open(&m, &b), Err(FileError::Sealed));
+        // Without the new commitment it does not get that far.
+        let (m, b) = rehashed(&cut, &blob, |b| b.truncate(32 + 2 * piece));
+        assert_eq!(open(&m, &b), Err(FileError::WrongKey));
 
         // Cut inside a chunk.
         let (m, b) = rehashed(&meta, &blob, |b| b.truncate(b.len() - 1));
@@ -632,7 +659,10 @@ mod tests {
             size: 3 * CHUNK as u64 + 1,
             ..meta.clone()
         };
-        let (m, b) = rehashed(&longer, &blob, |b| b.extend_from_slice(&[0; TAG + 1]));
+        let (m, b) = rehashed(&longer, &blob, |b| {
+            b.extend_from_slice(&[0; TAG + 1]);
+            b[..32].copy_from_slice(&commitment(&meta.key, false, 3 * CHUNK as u64 + 1));
+        });
         assert_eq!(open(&m, &b), Err(FileError::Sealed));
 
         // An empty chunk after full ones: no seal writes it.
@@ -660,12 +690,19 @@ mod tests {
     #[test]
     fn the_size_a_message_claims_must_be_the_files() {
         let (meta, blob) = seal(&pattern(1000), false).unwrap();
-        for size in [999, 1001, 0] {
+        // Longer than the body: refused before the hash. Shorter: the body
+        // could hold padding, so it is the commitment to the size that refuses.
+        let m = FileMeta {
+            size: 1001,
+            ..meta.clone()
+        };
+        assert_eq!(open(&m, &blob), Err(FileError::Malformed));
+        for size in [999, 0] {
             let m = FileMeta {
                 size,
                 ..meta.clone()
             };
-            assert_eq!(open(&m, &blob), Err(FileError::Malformed), "{size}");
+            assert_eq!(open(&m, &blob), Err(FileError::WrongKey), "{size}");
         }
         let huge = FileMeta {
             size: MAX_FILE_PLAIN + 1,
@@ -680,7 +717,7 @@ mod tests {
                 size,
                 ..meta.clone()
             };
-            assert_eq!(open(&m, &blob), Err(FileError::Malformed), "{size}");
+            assert_eq!(open(&m, &blob), Err(FileError::WrongKey), "{size}");
         }
     }
 
@@ -691,20 +728,61 @@ mod tests {
     }
 
     #[test]
+    /// v1 opened a deflated blob as its raw deflate bytes when a message
+    /// claimed it stored, with the body's length as the size: one blob id, two
+    /// files (S-007). The commitment binds both now.
     fn the_deflate_flag_must_be_the_truth() {
         let (meta, blob) = seal(&pattern(1000), false).unwrap();
         let m = FileMeta {
             deflated: true,
             ..meta
         };
-        assert_eq!(open(&m, &blob), Err(FileError::Malformed));
+        assert_eq!(open(&m, &blob), Err(FileError::WrongKey));
 
         let (meta, blob) = seal(&text(10_000), true).unwrap();
+        // Claimed stored at the file's size: longer than the body.
+        let body_len = blob.len() - 32 - TAG;
         let m = FileMeta {
             deflated: false,
-            ..meta
+            ..meta.clone()
         };
         assert_eq!(open(&m, &blob), Err(FileError::Malformed));
+        // Claimed stored at the body's size: v1 handed out the deflate bytes.
+        let m = FileMeta {
+            deflated: false,
+            size: body_len as u64,
+            ..meta
+        };
+        assert_eq!(open(&m, &blob), Err(FileError::WrongKey));
+    }
+
+    /// Padding after the file, inside the sealed body, is dropped: a later
+    /// sender may hide a file's exact size, and this reader still opens it.
+    #[test]
+    fn padding_after_the_file_is_dropped() {
+        let file = pattern(1000);
+        let body = [&file[..], &[0u8; 100]].concat();
+        let blob = seal_body(&KEY, false, 1000, &body);
+        assert_eq!(hex(&blob_hash(&blob)), KNOWN_PADDED);
+        let meta = FileMeta {
+            hash: blob_hash(&blob),
+            key: KEY,
+            size: 1000,
+            deflated: false,
+        };
+        assert_eq!(open(&meta, &blob).unwrap(), file);
+
+        let text = text(10_000);
+        let z = miniz_oxide::deflate::compress_to_vec(&text, 6);
+        let body = [&z[..], &[0u8; 3 * CHUNK][..]].concat();
+        let blob = seal_body(&KEY, true, text.len() as u64, &body);
+        let meta = FileMeta {
+            hash: blob_hash(&blob),
+            key: KEY,
+            size: text.len() as u64,
+            deflated: true,
+        };
+        assert_eq!(open(&meta, &blob).unwrap(), text);
     }
 
     /// A few kilobytes that inflate to megabytes stop one byte past the size
@@ -735,26 +813,26 @@ mod tests {
             );
         }
 
-        // Through `open`, with a claim the body fits, so it is the inflate
-        // that refuses.
-        let blob = seal_body(&KEY, &bomb);
-        let meta = FileMeta {
-            hash: blob_hash(&blob),
-            key: KEY,
-            size: 4096,
-            deflated: true,
+        // Through `open`, sealed by a sender who claims 4096 bytes, so it is
+        // the inflate that refuses.
+        let sealed = |size: u64| {
+            let blob = seal_body(&KEY, true, size, &bomb);
+            let meta = FileMeta {
+                hash: blob_hash(&blob),
+                key: KEY,
+                size,
+                deflated: true,
+            };
+            (meta, blob)
         };
-        assert!(bomb.len() <= 4096);
+        let (meta, blob) = sealed(4096);
         assert_eq!(open(&meta, &blob), Err(FileError::Malformed));
-        let whole = FileMeta {
-            size: zeros.len() as u64,
-            ..meta
-        };
+        let (whole, blob) = sealed(zeros.len() as u64);
         assert_eq!(open(&whole, &blob).unwrap(), zeros);
     }
 
     #[test]
-    fn a_deflate_stream_must_be_the_whole_body() {
+    fn a_deflate_stream_must_be_whole() {
         let file = text(10_000);
         let mut body = miniz_oxide::deflate::compress_to_vec(&file, 6);
         assert_eq!(inflate(&body, file.len()).unwrap(), file);
@@ -763,9 +841,9 @@ mod tests {
             inflate(&body[..body.len() - 1], file.len()),
             Err(FileError::Malformed)
         );
-        // Something after it, sealed by the sender along with it.
+        // Something after it, sealed by the sender along with it: padding.
         body.push(0);
-        assert_eq!(inflate(&body, file.len()), Err(FileError::Malformed));
+        assert_eq!(inflate(&body, file.len()).unwrap(), file);
         // Not deflate at all.
         assert_eq!(inflate(&[0xff; 64], 64), Err(FileError::Malformed));
         assert_eq!(inflate(&[], 0), Err(FileError::Malformed));

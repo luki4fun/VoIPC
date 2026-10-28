@@ -6,6 +6,11 @@ import { back } from './back-stack';
 /** true in the browser build (web client), false in the Tauri app (desktop/Android). */
 export const isWeb: boolean = __WEB__;
 
+/** The Android app (not a browser on Android): its IPC carries no raw request
+ *  body, so file bytes are staged first (`lib/files.ts`, D2-03). */
+export const isAndroidApp: boolean =
+  !isWeb && typeof navigator !== "undefined" && /android/i.test(navigator.userAgent);
+
 /** true when running on Android (Tauri mobile) or, on the web client, in a
  *  mobile browser — both get the phone layout. */
 export const isMobile = writable(false);

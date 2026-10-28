@@ -883,6 +883,78 @@ mod tests {
         assert_eq!(io.read(&mut end).await.unwrap(), 0);
     }
 
+    /// A file connection leaves the pre-authentication pool, which voice joins
+    /// from its address need, once it has shown a good ticket, and its slot
+    /// is back there for the accept loop when it ends (R1-06).
+    #[tokio::test]
+    async fn a_file_connection_with_a_good_ticket_leaves_the_pre_pool() {
+        use std::sync::atomic::Ordering;
+        let (state, _dir) = state_with_files(|_| {});
+        let limits = state.limits.clone();
+        // What the accept loop took for this connection
+        limits.acquire("127.0.0.1".parse().unwrap()).unwrap();
+        let (bytes, hash) = blob(10, 3);
+        let up = upload_ticket(&state, hash, 10);
+        let mut io = open(&state);
+        let mut rest = Vec::new();
+        let wrong = format!(
+            "GET {} HTTP/1.1\r\nAuthorization: Bearer wrong\r\n\r\n",
+            path_of(&hash)
+        );
+        io.write_all(wrong.as_bytes()).await.unwrap();
+        let (head, _) = answer(&mut io, &mut rest).await;
+        assert!(head.starts_with("HTTP/1.1 401"), "{head}");
+        assert_eq!(limits.pre_total.load(Ordering::Relaxed), 1);
+
+        let put = format!(
+            "PUT {}?offset=0 HTTP/1.1\r\nAuthorization: Bearer {up}\r\nContent-Length: 10\r\n\r\n",
+            path_of(&hash)
+        );
+        io.write_all(put.as_bytes()).await.unwrap();
+        io.write_all(&bytes).await.unwrap();
+        let (head, _) = answer(&mut io, &mut rest).await;
+        assert!(head.starts_with("HTTP/1.1 201"), "{head}");
+        assert_eq!(limits.pre_total.load(Ordering::Relaxed), 0);
+        assert_eq!(limits.files_total.load(Ordering::Relaxed), 1);
+
+        drop(io);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while limits.files_total.load(Ordering::Relaxed) != 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the file slot is given back");
+        assert_eq!(limits.pre_total.load(Ordering::Relaxed), 1);
+    }
+
+    /// A PUT refused before its body (here a 409 at the wrong offset) is
+    /// answered, and then its body is read before the close: closed with it
+    /// unread, the socket would reset, and a Windows peer loses the answer
+    /// (P9-01).
+    #[tokio::test]
+    async fn a_refused_put_has_its_body_read_before_the_close() {
+        let (state, _dir) = state_with_files(|_| {});
+        let (bytes, hash) = blob(1000, 4);
+        let up = upload_ticket(&state, hash, 1000);
+        let mut io = open(&state);
+        let head = format!(
+            "PUT {}?offset=500 HTTP/1.1\r\nAuthorization: Bearer {up}\r\nContent-Length: 500\r\n\r\n",
+            path_of(&hash)
+        );
+        io.write_all(head.as_bytes()).await.unwrap();
+        let (answer, _) = answer(&mut io, &mut Vec::new()).await;
+        assert!(answer.starts_with("HTTP/1.1 409"), "{answer}");
+        assert!(answer.contains("upload-offset: 0"), "{answer}");
+        // Sent after the answer was read, as a peer slower than the relay
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        io.write_all(&bytes[500..])
+            .await
+            .expect("the relay still reads the body");
+        let mut end = [0u8; 1];
+        assert_eq!(io.read(&mut end).await.unwrap(), 0);
+    }
+
     #[tokio::test]
     async fn a_file_request_must_be_plain_and_small() {
         let (state, _dir) = state_with_files(|_| {});
@@ -920,6 +992,28 @@ mod tests {
                 "400",
             ),
             (format!("GET {}\r\n\r\n", path_of(&hash)), "400"),
+            // S-029: what a proxy in front might read otherwise
+            (
+                format!(
+                    "PUT {}?offset=0 HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n",
+                    path_of(&hash)
+                ),
+                "400",
+            ),
+            (
+                format!(
+                    "PUT {}?offset=0 HTTP/1.1\r\nContent-Length: +5\r\n\r\n",
+                    path_of(&hash)
+                ),
+                "400",
+            ),
+            (
+                format!(
+                    "GET {} HTTP/1.1\nAuthorization: Bearer {up}\r\n\r\n",
+                    path_of(&hash)
+                ),
+                "400",
+            ),
             ("GET /f/v1/nothex HTTP/1.1\r\n\r\n".to_string(), "404"),
             (format!("DELETE {} HTTP/1.1\r\n\r\n", path_of(&hash)), "405"),
         ] {

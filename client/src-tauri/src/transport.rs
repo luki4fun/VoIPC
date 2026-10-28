@@ -564,6 +564,50 @@ async fn open_tunnel(
     Ok(start_tunnel(tls, buf.split_off(end)))
 }
 
+/// A connection for file bytes (`files.rs`): TLS with `http/1.1` on the
+/// session's own port, checked as the session was. The session pinned a
+/// self-signed certificate when it connected, so a file connection only ever
+/// matches that pin, never makes one: a certificate first met here is
+/// refused.
+pub(crate) async fn connect_files(
+    host: &str,
+    port: u16,
+    accept_invalid_certs: bool,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+    if accept_invalid_certs
+        && !TOFU_STORE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&tofu_key(host, port))
+    {
+        return Err(format!("no certificate is pinned for {host}:{port}"));
+    }
+    let (tls, _) = tls_config(host, port, accept_invalid_certs, b"http/1.1")?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
+    let name = server_name(host)?;
+    let attempt = async {
+        let addrs = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| format!("Could not resolve {host}: {e}"))?;
+        let mut last_err = format!("No addresses found for {host}");
+        for addr in addrs {
+            match TcpStream::connect(addr).await {
+                Ok(tcp) => {
+                    return connector
+                        .connect(name.clone(), tcp)
+                        .await
+                        .map_err(|e| format!("TLS handshake with {addr} failed: {e}"))
+                }
+                Err(e) => last_err = format!("Could not connect to {addr}: {e}"),
+            }
+        }
+        Err(last_err)
+    };
+    tokio::time::timeout(CONNECT_TIMEOUT, attempt)
+        .await
+        .map_err(|_| format!("Timed out connecting to {host}:{port} for a file"))?
+}
+
 /// No Nagle delay on small voice packets; on Linux and Android, also a short
 /// unsent queue, so voice waits behind at most that much video in the kernel
 /// (the server's tunnel.rs explains). Best effort.

@@ -37,8 +37,17 @@
   }
 
   .cover {
-    color: transparent;
     user-select: none;
+  }
+
+  /* Everything inside too: a link or a mention sets a colour (and a line or
+     a chip) of its own, which would show through. `:not(.open)` outweighs
+     `.mention.me` */
+  .spoiler:not(.open) .cover,
+  .spoiler:not(.open) .cover :global(*) {
+    color: transparent;
+    text-decoration-color: transparent;
+    background: none;
   }
 
   .spoiler.open {

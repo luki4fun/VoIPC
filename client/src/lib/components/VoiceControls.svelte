@@ -41,6 +41,26 @@
   // In no voice channel on any server there is nothing to talk into
   let voiceDisabled = $derived($voice === null);
 
+  // Whether the talk button holds a press of its own (not the hotkey's or the
+  // game's): one still held when the button goes away without a blur is let
+  // go (R5-08), or the microphone stayed open until the next press.
+  let pttHeld = false;
+  function pttStart() {
+    pttHeld = true;
+    void startTransmit();
+  }
+  function pttStop() {
+    pttHeld = false;
+    void stopTransmit();
+  }
+  function letGoOnRemove(_node: HTMLElement) {
+    return {
+      destroy() {
+        if (pttHeld) pttStop();
+      },
+    };
+  }
+
   async function handleGainChange(e: Event) {
     const gain = parseFloat((e.target as HTMLInputElement).value);
     inputGain.set(gain);
@@ -116,25 +136,26 @@
           onpointerdown={(e) => {
             if (e.button !== 0) return;
             (e.currentTarget as HTMLElement).setPointerCapture?.(e.pointerId);
-            void startTransmit();
+            pttStart();
           }}
-          onpointerup={() => void stopTransmit()}
-          onpointercancel={() => void stopTransmit()}
+          onpointerup={pttStop}
+          onpointercancel={pttStop}
           onkeydown={(e) => {
             if ((e.key === " " || e.key === "Enter") && !e.repeat) {
               e.preventDefault();
-              void startTransmit();
+              pttStart();
             }
           }}
           onkeyup={(e) => {
             if (e.key === " " || e.key === "Enter") {
               e.preventDefault();
-              void stopTransmit();
+              pttStop();
             }
           }}
           onblur={() => {
-            if ($isTransmitting && !$transmitHeldByGame) void stopTransmit();
+            if ($isTransmitting && !$transmitHeldByGame) pttStop();
           }}
+          use:letGoOnRemove
           title={$transmitHeldByGame
             ? "The game is holding your push-to-talk (Settings → Game Integration)"
             : undefined}

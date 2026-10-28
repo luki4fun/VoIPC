@@ -1,5 +1,6 @@
 <script lang="ts">
   import { dialog } from "../actions/dialog.js";
+  import { roving } from "../actions/roving.js";
   // Opens a server. Up on its own while no server is on screen, and from the
   // rail's "+" while some are — then with a close button, and connecting here
   // leaves every open server as it is. It stays up until a connect succeeds,
@@ -297,7 +298,11 @@
   <div
     class="dialog"
     oninput={() => (touched = true)}
-    use:dialog={{ onclose: $serverAddress && !connecting ? () => showConnectDialog.set(false) : undefined }}
+    use:dialog={{
+      onclose: $serverAddress && !connecting ? () => showConnectDialog.set(false) : undefined,
+      // With no server it is the app's start screen: Back leaves, as from a home screen
+      back: $serverAddress ? undefined : "leave",
+    }}
   >
     <div class="title-row">
       <h2>Connect to a server</h2>
@@ -390,7 +395,7 @@
       </div>
     {/if}
 
-    <div class="mode-switch" role="tablist" aria-label="How to join">
+    <div class="mode-switch" role="tablist" aria-label="How to join" use:roving>
       <button type="button" role="tab" class:active={mode === "guest"} aria-selected={mode === "guest"} onclick={() => (mode = "guest")} disabled={connecting}>Guest</button>
       <button type="button" role="tab" class:active={mode === "account"} aria-selected={mode === "account"} onclick={() => (mode = "account")} disabled={connecting}>Account</button>
     </div>

@@ -37,22 +37,22 @@
   }
 </script>
 
-{#if $pendingInvites.length > 0}
-  <div class="invite-container">
-    {#each $pendingInvites as invite (invite.server + "/" + invite.channel_id)}
-      <div class="invite">
-        <span class="invite-text">
-          <strong title={invite.invited_by}>{shortName(invite.invited_by)}</strong> invited you to <strong>#{invite.channel_name}</strong
-          >{#if invite.server !== $serverAddress}&nbsp;on {$serverEntries.find((e) => e.id === invite.server)?.name ?? invite.server}{/if}
-        </span>
-        <div class="invite-actions">
-          <button class="accept-btn btn btn-primary" onclick={() => accept(invite)}>Accept</button>
-          <button class="decline-btn" onclick={() => decline(invite)}>Decline</button>
-        </div>
+<!-- Always there, like the toasts: an invite added to a region that already
+     exists is read out, one that appears with its region often is not -->
+<div class="invite-container">
+  {#each $pendingInvites as invite (invite.server + "/" + invite.channel_id)}
+    <div class="invite" role="alert">
+      <span class="invite-text">
+        <strong title={invite.invited_by}>{shortName(invite.invited_by)}</strong> invited you to <strong>#{invite.channel_name}</strong
+        >{#if invite.server !== $serverAddress}&nbsp;on {$serverEntries.find((e) => e.id === invite.server)?.name ?? invite.server}{/if}
+      </span>
+      <div class="invite-actions">
+        <button class="accept-btn btn btn-primary" onclick={() => accept(invite)}>Accept</button>
+        <button class="decline-btn" onclick={() => decline(invite)}>Decline</button>
       </div>
-    {/each}
-  </div>
-{/if}
+    </div>
+  {/each}
+</div>
 
 <style>
   .invite-container {

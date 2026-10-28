@@ -14,8 +14,10 @@ import android.media.AudioDeviceInfo
 import android.media.AudioManager
 import android.media.AudioPlaybackConfiguration
 import android.media.AudioRecordingConfiguration
+import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.provider.DocumentsContract
 import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
@@ -24,6 +26,7 @@ import android.webkit.WebView
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.SystemBarStyle
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import androidx.core.view.ViewCompat
@@ -140,8 +143,67 @@ class MainActivity : TauriActivity() {
         }
     }
 
+    // A file the page asked to save (VoIPCBridge.saveFile): it waits in
+    // `save-out` until the system's "save to" picker answers, is copied to
+    // where the person chose, and goes. One at a time: a second ask while the
+    // picker is open is refused, so no answer lands on the wrong file.
+    @Volatile private var pendingSave: File? = null
+    private var pendingSaveMime = "application/octet-stream"
+    private val saveDocument = registerForActivityResult(
+        object : ActivityResultContracts.CreateDocument("application/octet-stream") {
+            override fun createIntent(context: Context, input: String): Intent =
+                super.createIntent(context, input).setType(pendingSaveMime)
+        }
+    ) { uri -> finishSave(uri) }
+
+    private fun finishSave(uri: Uri?) {
+        val file = pendingSave ?: return
+        if (uri == null) {
+            // The person backed out of the picker
+            file.delete()
+            pendingSave = null
+            evaluateJs("window.__voipc_saved && window.__voipc_saved(null)")
+            return
+        }
+        // Off the UI thread: up to 64 MiB to a provider that may be slow
+        Thread {
+            val ok = runCatching {
+                contentResolver.openOutputStream(uri)?.use { out -> file.inputStream().use { it.copyTo(out) } } != null
+            }.getOrDefault(false)
+            // A document left half written is no copy of the file
+            if (!ok) runCatching { DocumentsContract.deleteDocument(contentResolver, uri) }
+            file.delete()
+            pendingSave = null
+            evaluateJs("window.__voipc_saved && window.__voipc_saved($ok)")
+        }.start()
+    }
+
     // JS interface exposed as window.__VoIPC in the WebView
     inner class VoIPCBridge {
+        /**
+         * Save a file the page has put in `save-out` (files.rs `save_file`),
+         * where the system's own picker lets the person choose. Only a path in
+         * there is taken, so the page can copy nothing else of the app's out.
+         * Never opened or run.
+         */
+        @JavascriptInterface
+        fun saveFile(path: String, name: String, mime: String) {
+            val file = File(path).canonicalFile
+            val home = File(applicationInfo.dataDir).canonicalPath + File.separator
+            val inSaveOut = file.parentFile?.name == "save-out" && file.path.startsWith(home) && file.isFile
+            if (!inSaveOut || pendingSave != null) {
+                if (inSaveOut) file.delete()
+                evaluateJs("window.__voipc_saved && window.__voipc_saved(false)")
+                return
+            }
+            this@MainActivity.runOnUiThread {
+                pendingSave = file
+                pendingSaveMime = mime.takeIf { Regex("""^[\w.+-]+/[\w.+-]+$""").matches(it) }
+                    ?: "application/octet-stream"
+                saveDocument.launch(name)
+            }
+        }
+
         @JavascriptInterface
         fun startVoiceService(channelName: String) {
             this@MainActivity.startVoiceService(channelName)

@@ -14,7 +14,7 @@
   import { openDm } from "../stores/chat.js";
   import { viewingVoice } from "../stores/channels.js";
   import { isAdmin, serverAddress } from "../stores/connection.js";
-  import { isMobile, mobileTab } from "../stores/platform.js";
+  import { isMobile, mobileTab, showChatPane } from "../stores/platform.js";
   import { centreView } from "../stores/room.js";
   import { canInvite, canKick, isCurrentChannelCreator, isModerator, isPreviewing } from "../stores/roster.js";
   import { selectedStrip, setUserVolume, toggleUserMute, userVolumes } from "../stores/mixer.js";
@@ -123,7 +123,9 @@
           <span>Watch screen</span>
         </button>
       {/if}
-      <button class="ctx-item" onclick={() => { openDm($serverAddress, menu.user.user_id, menu.user.username); closeUserMenu(); }}>
+      <!-- And show it: from a phone's Users tab or a Stage tile the chat is
+           not on screen, and a tap that changes nothing looks like it failed -->
+      <button class="ctx-item" onclick={() => { openDm($serverAddress, menu.user.user_id, menu.user.username); showChatPane(); closeUserMenu(); }}>
         <Icon name="direct-message" size={16} />
         <span>Direct message</span>
       </button>

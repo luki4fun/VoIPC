@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { parse, type Block, type Inline } from "../../markdown.js";
+  import { parse, plainText, shownHref, type Block, type Inline } from "../../markdown.js";
   import { shortName } from "../../username.js";
   import CodeBlock from "./CodeBlock.svelte";
   import Spoiler from "./Spoiler.svelte";
@@ -19,9 +19,18 @@
 
   const tree = $derived(parse(text, { names }));
   const isMe = (name: string) => me.some((m) => m.toLowerCase() === name.toLowerCase());
+
+  // What a message that could not be drawn shows instead: its words
+  function words(): string {
+    try {
+      return plainText(text);
+    } catch {
+      return text;
+    }
+  }
 </script>
 
-{#snippet inline(nodes: Inline[])}{#each nodes as n}{#if n.t === "text"}{n.v}{:else if n.t === "strong"}<strong>{@render inline(n.c)}</strong>{:else if n.t === "em"}<em>{@render inline(n.c)}</em>{:else if n.t === "del"}<del>{@render inline(n.c)}</del>{:else if n.t === "code"}<code class="md-code">{n.v}</code>{:else if n.t === "spoiler"}<Spoiler>{@render inline(n.c)}</Spoiler>{:else if n.t === "link"}<button class="msg-link" type="button" onclick={() => onlink(n.href)} title={n.href}>{@render inline(n.c)}</button>{:else if n.t === "br"}<br />{:else if n.t === "mention"}<span class="mention" class:me={isMe(n.name)}>@{shortName(n.name)}</span>{/if}{/each}{/snippet}
+{#snippet inline(nodes: Inline[])}{#each nodes as n}{#if n.t === "text"}{n.v}{:else if n.t === "strong"}<strong>{@render inline(n.c)}</strong>{:else if n.t === "em"}<em>{@render inline(n.c)}</em>{:else if n.t === "del"}<del>{@render inline(n.c)}</del>{:else if n.t === "code"}<code class="md-code">{n.v}</code>{:else if n.t === "spoiler"}<Spoiler>{@render inline(n.c)}</Spoiler>{:else if n.t === "link"}<button class="msg-link" type="button" onclick={() => onlink(n.href)} title={shownHref(n.href)}>{@render inline(n.c)}</button>{:else if n.t === "br"}<br />{:else if n.t === "mention"}<span class="mention" class:me={isMe(n.name)}>@{shortName(n.name)}</span>{/if}{/each}{/snippet}
 
 {#snippet blocks(list: Block[])}
   {#each list as b}
@@ -47,7 +56,12 @@
   {/each}
 {/snippet}
 
-{@render blocks(tree)}
+<!-- A message that fails to draw is its plain text, and the rest of the
+     conversation goes on drawing: one row must never take the list down -->
+<svelte:boundary>
+  {@render blocks(tree)}
+  {#snippet failed()}<p class="md-p">{words()}</p>{/snippet}
+</svelte:boundary>
 
 <style>
   .md-p,

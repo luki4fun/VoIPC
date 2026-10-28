@@ -6,7 +6,12 @@
 // nothing more — never a preference: the stored one replaces it moments later,
 // and a missing or damaged entry only means the defaults show, as before.
 
+import { TOKENS } from "./theme-tokens.ts";
+
 const KEY = "voipc.theme-cache";
+/** Only these are painted: a remembered `--hit` or `--z-modal` would outlive
+ *  the real palette, which rewrites only these, for the whole session. */
+const PALETTE: ReadonlySet<string> = new Set(TOKENS);
 
 interface Cached {
   tokens: Record<string, string>;
@@ -31,8 +36,8 @@ export function paintRememberedTheme(): void {
     if (!cached || typeof cached.tokens !== "object" || cached.tokens === null) return;
     const root = document.documentElement;
     for (const [name, value] of Object.entries(cached.tokens)) {
-      // Our own token names and plain colour values only: this came off disk
-      if (/^--[a-z-]+$/.test(name) && typeof value === "string" && /^[#(),.%\w\s-]+$/.test(value)) {
+      // Palette token names and plain colour values only: this came off disk
+      if (PALETTE.has(name) && typeof value === "string" && /^[#(),.%\w\s-]+$/.test(value)) {
         root.style.setProperty(name, value);
       }
     }

@@ -20,6 +20,7 @@ import type { ProximityMode } from "../../lib/spatial";
 import { audio } from "./audio";
 import { video } from "./video";
 import { share } from "./share";
+import { Files, originOf } from "./files";
 
 /** Bound for the authentication response (network.rs CONNECT_TIMEOUT). */
 const AUTH_TIMEOUT_MS = 10_000;
@@ -255,6 +256,8 @@ export class Session implements SessionContext, AccountHost {
   private auth: { resolve(): void; reject(e: Error): void } | null = null;
   /** The account this connection signs in to; null for a guest. */
   account: AccountDriver | null = null;
+  /** This connection's file transfers, from Authenticated on (files.ts). */
+  files: Files | null = null;
   /** The safety number with `userId` (account_session.rs safety_number). */
   safetyNumber(userId: number): string {
     if (!this.account) throw new Error("Sign in to an account to verify people");
@@ -298,6 +301,11 @@ export class Session implements SessionContext, AccountHost {
 
   get isEnded(): boolean {
     return this.ended;
+  }
+
+  /** Voice is on, on any server (files.ts paces transfers then). */
+  inCall(): boolean {
+    return voiceOwner !== null;
   }
 
   /** A per-connection event: the payload it always had, tagged with its server. */
@@ -469,6 +477,7 @@ export class Session implements SessionContext, AccountHost {
     this.ended = true;
     if (sessions.get(this.server) === this) sessions.delete(this.server);
     clearInterval(this.keepalive);
+    this.files?.close();
     if (voiceOwner === this) detachVoice();
     if (sendDisconnect && this.transport) {
       // Whatever was still waiting for the pacer is moot now, and the goodbye
@@ -592,6 +601,9 @@ export class Session implements SessionContext, AccountHost {
         this.sessionId = b.session_id;
         // libsignal binds both parties' ids into every pairwise message
         this.signal.setOwnUserId(b.user_id);
+        this.files = new Files(this, originOf(this.server), b.files ? Number(b.files.max_bytes) : null);
+        // network.rs emits the same, for the composer
+        this.emit("file-limits", b.files ? { max_bytes: Number(b.files.max_bytes) } : null);
         if (b.accounts) this.emit("relay-accounts", b.accounts);
         // An account sign-in ends signed in to that account, or not at all
         // (account.rs sign_in waits for exactly this).
@@ -915,7 +927,6 @@ export class Session implements SessionContext, AccountHost {
           b.message_type,
         );
         break;
-      // Files (protocol 13) have no client here yet
       case "FileUploadReady":
       case "FileStored":
       case "FileReady":
@@ -923,6 +934,7 @@ export class Session implements SessionContext, AccountHost {
       case "FileWanted":
       case "FileSeeking":
       case "FileUnavailable":
+        this.files?.onMessage(tag, b);
         break;
       default:
         console.warn("unhandled server message:", tag);
@@ -1359,8 +1371,8 @@ export class Session implements SessionContext, AccountHost {
       if (messageType === 1) this.markEstablished(fromUserId);
       // A DM carries the same envelope a channel message does since 0.9.0;
       // anything else reads as the text itself.
-      const { id, text, ttl_secs, reply_to, thread } = wasm().openEnvelope(plaintext);
-      this.emit("direct-chat-message", { ...event, content: text, message_id: id, ttl_secs, reply_to, thread });
+      const { id, text, ttl_secs, reply_to, thread, file, fwd, event: done } = wasm().openEnvelope(plaintext);
+      this.emit("direct-chat-message", { ...event, content: text, message_id: id, ttl_secs, reply_to, thread, file, fwd, event: done });
     } catch (e) {
       console.warn(`failed to decrypt direct message from ${fromUserId}:`, e);
       this.emit("direct-chat-message", {
@@ -1391,10 +1403,10 @@ export class Session implements SessionContext, AccountHost {
     }
     try {
       const plaintext = this.signal.groupDecrypt(userId, channelId, ciphertext);
-      const { id, text, ttl_secs, reply_to, thread } = wasm().openEnvelope(plaintext);
+      const { id, text, ttl_secs, reply_to, thread, file, fwd, event: done } = wasm().openEnvelope(plaintext);
       // What the sender says this message's life is; the store takes the
       // shorter of it and the channel's own timer (expiryFor, chat-rules.ts).
-      this.emit("channel-chat-message", { ...event, content: text, message_id: id, ttl_secs, reply_to, thread });
+      this.emit("channel-chat-message", { ...event, content: text, message_id: id, ttl_secs, reply_to, thread, file, fwd, event: done });
     } catch (e) {
       console.warn(`failed to decrypt channel message from ${userId}:`, e);
       this.emit("channel-chat-message", {
@@ -1554,6 +1566,9 @@ export class Session implements SessionContext, AccountHost {
       ttl_secs: ttlSecs ?? null,
       reply_to: refs?.replyTo ?? null,
       thread: refs?.thread ?? null,
+      file: refs?.file ?? null,
+      fwd: refs?.fwd ?? null,
+      event: refs?.event ?? null,
     };
     if (ciphertext) {
       this.sendControl({ SendEncryptedChannelMessage: { channel_id: channelId, ciphertext } });
@@ -1610,6 +1625,9 @@ export class Session implements SessionContext, AccountHost {
       ttl_secs: ttlSecs ?? null,
       reply_to: refs?.replyTo ?? null,
       thread: refs?.thread ?? null,
+      file: refs?.file ?? null,
+      fwd: refs?.fwd ?? null,
+      event: refs?.event ?? null,
     };
     if (encrypted) {
       this.sendControl({

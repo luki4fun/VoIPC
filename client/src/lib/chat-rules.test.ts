@@ -21,8 +21,22 @@ import {
   messageRefs,
   toArchived,
   fromArchived,
+  fileRef,
+  applyEvent,
+  chatEvent,
+  forHandOff,
+  forwarded,
+  isOneEmoji,
+  pinnedOf,
+  reactionChips,
+  rowKey,
+  sameRow,
+  MAX_REACTION_EMOJI,
+  MAX_REACTORS,
+  type EventIn,
 } from "./chat-rules.ts";
 import type { ChatMessage } from "./types.ts";
+import { EMOJI_CATEGORIES, QUICK_REACTIONS } from "./emoji.ts";
 
 const T = 1_700_000_000_000;
 
@@ -181,6 +195,41 @@ test("the archive keeps newer fields in extra and gives them back", () => {
   assert.equal(back.reply_to?.length, 64);
   assert.ok(!("kind" in back));
   assert.deepEqual(fromArchived({ ...plain, extra: "{not json" }), plain, "a damaged extra loses only itself");
+});
+
+test("a file comes back from the archive only as a file that can be fetched", () => {
+  const file = { hash: "a".repeat(64), key: "b".repeat(64), size: 3, z: false, name: "a.txt" };
+  const sent = msg({ timestamp: T, id: "f", file });
+  assert.deepEqual(fromArchived(toArchived(sent)), sent);
+  const plain = msg({ timestamp: T, id: "g" });
+  for (const bad of [{ ...file, hash: "A".repeat(64) }, { ...file, key: "b" }, { ...file, size: -1 }, { ...file, size: 2 ** 27 }, { ...file, z: 1 }, "x"]) {
+    assert.deepEqual(fromArchived({ ...plain, extra: JSON.stringify({ file: bad }) }), plain, JSON.stringify(bad));
+  }
+  const more = fromArchived({ ...plain, extra: JSON.stringify({ file: { ...file, evil: "<b>" } }) });
+  assert.deepEqual(more.file, file, "only the fields that are checked");
+});
+
+test("a file's claims are bounded as envelope.rs bounds them", () => {
+  const blob = { hash: "a".repeat(64), key: "b".repeat(64), size: 3, z: true };
+  // No name is "file"; a name is cleaned of control and direction characters
+  assert.equal(fileRef(blob)?.name, "file");
+  const name = fileRef({ ...blob, name: "\u202egpj.exe\n" + "x".repeat(300) })!.name;
+  assert.equal(Array.from(name).length, 255);
+  assert.ok(name.startsWith("gpj.exex"));
+  assert.equal(fileRef({ ...blob, name: " \u0007 " })?.name, "file");
+  // What is out of bounds goes; the file stays
+  const out = fileRef({ ...blob, mime: "text/html; x", w: 16_385, h: 0, dur: -1, px: "A".repeat(1023) })!;
+  assert.deepEqual(Object.keys(out).sort(), ["hash", "key", "name", "size", "z"]);
+  const kept = fileRef({ ...blob, mime: "Image/PNG", w: 640, h: 480, dur: 0, px: "A".repeat(1024) })!;
+  assert.deepEqual([kept.mime, kept.w, kept.h, kept.dur, kept.px?.length], ["image/png", 640, 480, 0, 1024]);
+});
+
+test("a file survives the history hand-off, checked", () => {
+  const file = { hash: "c".repeat(64), key: "d".repeat(64), size: 9, z: false, name: "pic.webp", w: 8, h: 8 };
+  const [shared] = sanitizeHistory([{ user_id: 1, username: "ann", content: "look", timestamp: T, file }], null, T);
+  assert.deepEqual(shared.file, file);
+  const [bad] = sanitizeHistory([{ user_id: 1, username: "ann", content: "x", timestamp: T, file: { ...file, key: "z" } }], null, T);
+  assert.ok(!("file" in bad));
 });
 
 test("history that is not a list offers nothing instead of throwing", () => {
@@ -398,4 +447,188 @@ test("a sweep drops what is due and leaves the rest alone", () => {
   // Nothing due: the same array back, so a sweep over a quiet app re-renders
   // nothing at all.
   assert.equal(dropExpired(swept, now), swept);
+});
+
+// ── Edit, delete, reactions, pins (1.3) ─────────────────────────────────────
+
+const ann = { user_id: 1, username: "ann#0001", account: "aa" };
+const ben = { user_id: 2, username: "ben#0002", account: "bb" };
+const guest = { user_id: 3, username: "cy#0003" };
+
+function ev(event: EventIn["event"], by: EventIn["by"], at: number, content = ""): EventIn {
+  return { event, by, at, content };
+}
+
+const conv = () => [
+  msg({ timestamp: T, id: "m1", ...ann, content: "first", expires_at: T + 3_600_000 }),
+  msg({ timestamp: T + 1, id: "m2", ...ben, content: "second" }),
+  msg({ timestamp: T + 2, id: "m3", ...guest, content: "third" }),
+];
+
+test("an edit applies only from the message's writer, and marks it edited", () => {
+  const list = conv();
+  const edited = applyEvent(list, ev({ kind: "edit", target: "m1" }, ann, T + 10, "first, fixed"), { mayPin: false });
+  assert.equal(edited[0].content, "first, fixed");
+  assert.equal(edited[0].edited_at, T + 10);
+  assert.equal(edited[0].expires_at, T + 3_600_000, "an edit never extends the timer");
+  assert.ok(sameRow(edited[0], list[0]), "the same row on screen");
+  assert.equal(edited[1], list[1], "the rest are the same objects");
+  // Somebody else's edit of it, with the same id: nothing
+  assert.equal(applyEvent(list, ev({ kind: "edit", target: "m1" }, ben, T + 10, "hijacked"), { mayPin: false }), list);
+  // The same name on another account is somebody else
+  assert.equal(applyEvent(list, ev({ kind: "edit", target: "m1" }, { ...ann, account: "zz" }, T + 10, "x"), { mayPin: false }), list);
+  // An older edit arriving late (the stored log after the live one) changes nothing
+  assert.equal(applyEvent(edited, ev({ kind: "edit", target: "m1" }, ann, T + 5, "older"), { mayPin: false }), edited);
+  assert.equal(applyEvent(list, ev({ kind: "edit", target: "nope" }, ann, T + 10, "x"), { mayPin: false }), list);
+});
+
+test("a guest edits by user id and name, so only within their session", () => {
+  const list = conv();
+  assert.equal(applyEvent(list, ev({ kind: "edit", target: "m3" }, guest, T + 9, "third!"), { mayPin: false })[2].content, "third!");
+  // Reconnected under a new id: their messages stay as sent
+  assert.equal(applyEvent(list, ev({ kind: "edit", target: "m3" }, { ...guest, user_id: 9 }, T + 9, "x"), { mayPin: false }), list);
+  // An account holder with the guest's id and name is not the guest
+  assert.equal(applyEvent(list, ev({ kind: "edit", target: "m3" }, { ...guest, account: "cc" }, T + 9, "x"), { mayPin: false }), list);
+});
+
+test("a delete leaves a tombstone that a hand-off or the stored log cannot bring back", () => {
+  const list = conv();
+  list[0] = { ...list[0], file: fileRef({ hash: "a".repeat(64), key: "b".repeat(64), size: 1, z: false, name: "x" })!, reply_to: "r" };
+  const gone = applyEvent(list, ev({ kind: "delete", target: "m1" }, ann, T + 10), { mayPin: false });
+  assert.deepEqual(gone[0], { user_id: 1, username: "ann#0001", account: "aa", content: "", timestamp: T, id: "m1", kind: "deleted", expires_at: T + 3_600_000 });
+  assert.equal(applyEvent(list, ev({ kind: "delete", target: "m1" }, ben, T + 10), { mayPin: false }), list, "only its writer");
+  // The same message offered again: by the stored log (first-hand), by a member (hearsay)
+  const again = mergeHistory(gone, [msg({ timestamp: T, id: "m1", ...ann, content: "first" })], "");
+  assert.equal(again.added, 0);
+  assert.equal(again.messages[0].kind, "deleted");
+  const shared = sanitizeHistory([{ ...list[0], user_id: 1, username: "ann#0001" }]);
+  assert.equal(mergeHistory(gone.map(({ account: _, ...m }) => m), shared, "ben").added, 0);
+  // Nothing more is done to what is gone
+  assert.equal(applyEvent(gone, ev({ kind: "edit", target: "m1" }, ann, T + 20, "back"), { mayPin: false }), gone);
+  assert.equal(applyEvent(gone, ev({ kind: "react", target: "m1", emoji: "👍", on: true }, ben, T + 20), { mayPin: false }), gone);
+  // And it survives the archive as what it is
+  assert.equal(fromArchived(toArchived(gone[0])).kind, "deleted");
+});
+
+test("reactions: the latest event per person and emoji wins", () => {
+  let list = conv();
+  const thumbs = (by: EventIn["by"], on: boolean, at: number) =>
+    (list = applyEvent(list, ev({ kind: "react", target: "m2", emoji: "👍", on }, by, at), { mayPin: false }));
+  thumbs(ann, true, T + 10);
+  thumbs(guest, true, T + 11);
+  assert.deepEqual(reactionChips(list[1], (k) => k === "a:aa"), [{ emoji: "👍", count: 2, mine: true, names: ["ann#0001", "cy#0003"] }]);
+  thumbs(ann, false, T + 12);
+  assert.deepEqual(reactionChips(list[1], (k) => k === "a:aa"), [{ emoji: "👍", count: 1, mine: false, names: ["cy#0003"] }]);
+  const before = list;
+  thumbs(ann, true, T + 11);
+  assert.equal(list, before, "an older 'on' after a newer 'off' changes nothing");
+  // A second person's off for a reaction they never made changes nothing
+  thumbs(ben, false, T + 13);
+  assert.equal(list, before);
+  // Reacting twice is still one
+  thumbs(guest, true, T + 14);
+  assert.equal(reactionChips(list[1], () => false)[0].count, 1);
+});
+
+test("reactions: at most twenty different emoji on a message, and a bounded record", () => {
+  let list = conv();
+  const pictures = [..."😀😁😂🤣😃😄😅😆😉😊😎🤩😏😒😞😔😟😕😣😖😫😩"];
+  pictures.forEach((emoji, i) => {
+    list = applyEvent(list, ev({ kind: "react", target: "m1", emoji, on: true }, ben, T + i), { mayPin: false });
+  });
+  assert.equal(reactionChips(list[0], () => false).length, MAX_REACTION_EMOJI);
+  // One taken off makes room for another
+  list = applyEvent(list, ev({ kind: "react", target: "m1", emoji: "😀", on: false }, ben, T + 50), { mayPin: false });
+  list = applyEvent(list, ev({ kind: "react", target: "m1", emoji: "🔥", on: true }, ann, T + 51), { mayPin: false });
+  assert.ok(reactionChips(list[0], () => false).some((c) => c.emoji === "🔥"));
+  // People per emoji are bounded
+  for (let i = 0; i < MAX_REACTORS + 5; i++) {
+    list = applyEvent(list, ev({ kind: "react", target: "m2", emoji: "👍", on: true }, { user_id: 100 + i, username: `g${i}` }, T + i), { mayPin: false });
+  }
+  assert.equal(reactionChips(list[1], () => false)[0].count, MAX_REACTORS);
+});
+
+test("a pin counts only from a manager, and the latest pin event wins", () => {
+  const list = conv();
+  const pin = (on: boolean, at: number, mayPin: boolean, l = list) =>
+    applyEvent(l, ev({ kind: "pin", target: "m2", on }, ann, at), { mayPin });
+  assert.equal(pin(true, T + 10, false), list, "a member's pin is nothing");
+  const pinned = pin(true, T + 10, true);
+  assert.deepEqual(pinned[1].pin, { on: true, at: T + 10, by: "ann#0001" });
+  assert.deepEqual(pinnedOf(pinned).map((m) => m.id), ["m2"]);
+  const unpinned = pin(false, T + 20, true, pinned);
+  assert.deepEqual(pinnedOf(unpinned), []);
+  assert.equal(pin(true, T + 15, true, unpinned), unpinned, "an older pin after a newer unpin");
+  // Pins and reactions survive a reload, checked; a hand-off carries neither
+  const back = fromArchived(toArchived(pinned[1]));
+  assert.deepEqual(back.pin, pinned[1].pin);
+  assert.equal(forHandOff(pinned[1]).pin, undefined);
+  assert.equal(sanitizeHistory([pinned[1]])[0].pin, undefined, "nor does a receiver take one");
+});
+
+test("what events did is checked again when the archive is read", () => {
+  const stored = toArchived(
+    msg({
+      timestamp: T,
+      id: "m",
+      edited_at: T + 5,
+      reactions: [
+        { emoji: "👍", by: [{ key: "a:aa", name: "ann", on: true, at: T + 1 }, { key: "a:aa", name: "dup", on: true, at: T + 2 }] },
+        { emoji: "not one", by: [{ key: "a:bb", name: "ben", on: true, at: T + 1 }] },
+        { emoji: "🔥", by: [{ key: 7, name: "x", on: true, at: T }] },
+      ] as never,
+      pin: { on: true, at: -1, by: "ann" },
+    }),
+  );
+  const back = fromArchived(stored);
+  assert.equal(back.edited_at, T + 5);
+  assert.deepEqual(back.reactions, [{ emoji: "👍", by: [{ key: "a:aa", name: "ann", on: true, at: T + 1 }] }]);
+  assert.equal(back.pin, undefined);
+  assert.equal(fromArchived(toArchived(msg({ timestamp: T, edited_at: T - 1 }))).edited_at, undefined, "edited before it was written");
+});
+
+test("an event is acted on only whole, and a reaction is one emoji", () => {
+  assert.deepEqual(chatEvent({ kind: "react", target: "m", emoji: "👍🏽", on: true }), { kind: "react", target: "m", emoji: "👍🏽", on: true });
+  assert.deepEqual(chatEvent({ kind: "edit", target: "x".repeat(100) }), { kind: "edit", target: "x".repeat(64) });
+  for (const bad of [
+    null,
+    { kind: "edit" },
+    { kind: "delete", target: "" },
+    { kind: "react", target: "m", emoji: "👍" },
+    { kind: "react", target: "m", emoji: "👍👍", on: true },
+    { kind: "pin", target: "m", on: 1 },
+    { kind: "purge", target: "m" },
+  ]) {
+    assert.equal(chatEvent(bad), undefined, JSON.stringify(bad));
+  }
+  for (const one of ["👍", "❤️", "👩🏽‍👩🏽‍👧🏽", "🇩🇪", "1️⃣", "❤️‍🔥"]) assert.ok(isOneEmoji(one), one);
+  for (const not of ["", "a", "﷽", "👍 ", "👍👍", "‮👍", "x".repeat(40), 7]) assert.ok(!isOneEmoji(not), String(not));
+});
+
+test("a forwarded message's label is checked where it enters", () => {
+  assert.deepEqual(forwarded({ name: "ann#0001", at: T }), { name: "ann#0001", at: T });
+  assert.deepEqual(forwarded({ name: "‮  ", at: 0 }), { name: "someone", at: 0 });
+  assert.equal(forwarded({ name: "ann", at: -1 }), undefined);
+  assert.equal(forwarded({ name: "ann", at: 1.5 }), undefined);
+  assert.equal(forwarded({ at: T }), undefined);
+  assert.equal(forwarded({ name: "n".repeat(200), at: T })!.name.length, 64);
+  assert.deepEqual(messageRefs({ fwd: { name: "ann", at: T } }), { fwd: { name: "ann", at: T } });
+  // Through a hand-off and the archive, as it came
+  const m = msg({ timestamp: T, id: "f", fwd: { name: "ann", at: T - 9 }, edited_at: T + 1 });
+  assert.deepEqual(sanitizeHistory([m])[0].fwd, m.fwd);
+  assert.equal(sanitizeHistory([m])[0].edited_at, T + 1);
+  assert.deepEqual(fromArchived(toArchived(m)).fwd, m.fwd);
+});
+
+test("a message a stored copy replaces keeps what this reader saw done to it", () => {
+  const shared = sanitizeHistory([msg({ timestamp: T, id: "s", ...ann })]);
+  const reacted = applyEvent(shared, ev({ kind: "react", target: "s", emoji: "🔥", on: true }, ben, T + 1), { mayPin: false });
+  const { messages } = mergeHistory(reacted, [msg({ timestamp: T, id: "s", user_id: 1, username: "ann#0001" })], "");
+  assert.notEqual(messages[0].kind, "shared");
+  assert.equal(reactionChips(messages[0], () => false)[0].emoji, "🔥");
+  assert.equal(rowKey(messages[0]), rowKey(shared[0]), "and is the same row");
+});
+
+test("every emoji the pickers offer is one a reader takes as a reaction", () => {
+  for (const e of [...QUICK_REACTIONS, ...EMOJI_CATEGORIES.flatMap((c) => c.emojis)]) assert.ok(isOneEmoji(e), e);
 });

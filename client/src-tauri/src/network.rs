@@ -117,9 +117,9 @@ pub async fn connect_to_server(
     // Guests get a fresh identity per connection (ephemeral by design); an
     // account's comes out of its vault during the sign-in, and its stores are
     // made then (`account::sign_in` calls `init_signal` itself).
-    let (user_id, session_id, account) = match account {
+    let (user_id, session_id, account, file_limits) = match account {
         Some(args) => {
-            let (user_id, session_id, link) = crate::account::sign_in(
+            let (user_id, session_id, link, files) = crate::account::sign_in(
                 state,
                 &app_handle,
                 &address,
@@ -131,7 +131,7 @@ pub async fn connect_to_server(
                 &mut buf,
             )
             .await?;
-            (user_id, session_id, Some(link))
+            (user_id, session_id, Some(link), files)
         }
         None => {
             let (identity_key, prekey_bundle) = {
@@ -154,7 +154,7 @@ pub async fn connect_to_server(
                 .map_err(|e| format!("Failed to send auth: {}", e))?;
 
             // Read until we get the Authenticated or AuthError response
-            let (user_id, session_id) = loop {
+            let (user_id, session_id, files) = loop {
                 let n = tokio::time::timeout(CONNECT_TIMEOUT, control_recv.read_buf(&mut buf))
                     .await
                     .map_err(|_| "Timed out waiting for the authentication response".to_string())?
@@ -175,13 +175,14 @@ pub async fn connect_to_server(
                             user_id,
                             session_id,
                             accounts,
+                            files,
                             ..
                         } => {
                             // A guest on a relay with accounts: the UI can offer one.
                             if let Some(accounts) = accounts {
                                 emit_server(&app_handle, &address, "relay-accounts", accounts);
                             }
-                            break (user_id, session_id);
+                            break (user_id, session_id, files);
                         }
                         ServerMessage::AuthError { reason } => {
                             return Err(format!("Authentication failed: {}", reason));
@@ -199,11 +200,13 @@ pub async fn connect_to_server(
                     }
                 }
             };
-            (user_id, session_id, None)
+            (user_id, session_id, None, files)
         }
     };
 
     info!(user_id, session_id, "authenticated with server");
+    // Whether this relay keeps files, and how large: the composer's to know
+    emit_server(&app_handle, &address, "file-limits", file_limits.clone());
 
     // The Signal state is this connection's own from birth, so all it needs
     // now is to know who we are here.
@@ -347,6 +350,27 @@ pub async fn connect_to_server(
                 VideoIn::Tunnel(lanes.video_in.take().expect("taken once")),
             ),
         };
+    let files = Arc::new(crate::files::Files::new(
+        Box::new({
+            let (app, server) = (app_handle.clone(), server.clone());
+            move |event, data| emit_server(&app, &server, event, data)
+        }),
+        Box::new({
+            let app = app_handle.clone();
+            move || {
+                app.state::<AppState>()
+                    .voice_server
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_some()
+            }
+        }),
+        host.clone(),
+        port,
+        accept_invalid_certs,
+        file_limits,
+        tcp_tx.clone(),
+    ));
     let writer_handle = tokio::spawn(control_writer_task(control_send, tcp_rx));
     let reader_handle = tokio::spawn(control_reader_task(
         control_recv,
@@ -370,6 +394,7 @@ pub async fn connect_to_server(
         voice_asked_at.clone(),
         transmitting.clone(),
         account.clone(),
+        files.clone(),
     ));
     if let Some(link) = &account {
         crate::account::after_connect(&app_handle, &address, link, &tcp_tx).await;
@@ -478,6 +503,7 @@ pub async fn connect_to_server(
     let tcp = tcp_tx.clone();
     let connection = ActiveConnection {
         account: account.clone(),
+        files,
         user_id,
         username,
         server_address: address.clone(),
@@ -614,6 +640,7 @@ pub async fn teardown(
     // Close capture session (stops screen capture)
     connection.capture_session = None;
 
+    connection.files.close();
     // Send graceful disconnect, then drop tcp_tx so writer can flush and exit
     let _ = send_tcp_message(&connection.tcp_tx, &ClientMessage::Disconnect).await;
     drop(connection.tcp_tx);
@@ -938,6 +965,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     voice_asked_at: Arc<AtomicU64>,
     transmitting: Arc<AtomicBool>,
     account: Option<Arc<crate::account::AccountLink>>,
+    files: Arc<crate::files::Files>,
 ) {
     let mut inbound = Inbound::new(std::time::Instant::now());
     'read: loop {
@@ -978,6 +1006,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
                         );
                         break 'read;
                     }
+                    Ok(msg) if crate::files::is_file_message(&msg) => files.on_message(msg),
                     Ok(msg) => {
                         handle_server_message(
                             msg,
@@ -1032,6 +1061,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     // A dead link is not a call: the UI stops treating this server as the
     // voice one on `connection-lost`, and so does everything here.
     leave_voice(&app_handle, &server, &is_voice, &transmitting).await;
+    files.close();
     info!("control reader task ended");
 }
 
@@ -2327,7 +2357,7 @@ async fn handle_server_message(
         | ServerMessage::AuthError { .. }
         | ServerMessage::AuthStep(_)
         | ServerMessage::Refused { .. } => {}
-        // Files have no client here yet
+        // files.rs takes them before they get here
         ServerMessage::FileUploadReady { .. }
         | ServerMessage::FileStored { .. }
         | ServerMessage::FileReady { .. }
@@ -3317,6 +3347,9 @@ fn handle_encrypted_direct_message(
                     "ttl_secs": msg.ttl_secs,
                     "reply_to": msg.extras.reply,
                     "thread": msg.extras.thread,
+                    "file": msg.extras.file,
+                    "fwd": msg.extras.fwd,
+                    "event": msg.extras.event,
                     "encrypted": true,
                 }),
             );
@@ -3421,6 +3454,9 @@ fn handle_encrypted_channel_message(
                     "ttl_secs": msg.ttl_secs,
                     "reply_to": msg.extras.reply,
                     "thread": msg.extras.thread,
+                    "file": msg.extras.file,
+                    "fwd": msg.extras.fwd,
+                    "event": msg.extras.event,
                     "encrypted": true,
                 }),
             );

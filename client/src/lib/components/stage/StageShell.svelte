@@ -28,6 +28,7 @@
   import { latency } from "../../stores/connection.js";
   import { quality } from "../../stores/connection-quality.js";
   import { callMembers } from "../../stores/roster.js";
+  import { voiceMode } from "../../stores/voice.js";
   import { pushLayer } from "../../stores/back-stack.js";
   import { serverEntries, showConnectDialog } from "../../connect.js";
   import { shellContextMenu } from "../../context-menu.js";
@@ -138,6 +139,15 @@
   const unread = $derived($serverEntries.find((e) => e.active)?.unread ?? 0);
   const showPtt = $derived($isMobile && $voice !== null);
 
+  // The chat sheet on a phone covers the stage, not the talk button: you can
+  // read and talk at once (R5-01). The sheet ends above the dock, which then
+  // holds only the button, in one row; the rest of the dock (mute, leave…)
+  // waits under the stage until the sheet is shut. Without a talk button to
+  // keep (voice activity) the sheet covers the dock as before.
+  const chatSheet = $derived(narrow && sheet === "chat");
+  const talkOverSheet = $derived(chatSheet && showPtt && $voiceMode === "ptt");
+  let dockHeight = $state(0);
+
   /** Columns for the grid: as square as the count allows. */
   const columns = $derived(Math.min(4, Math.max(1, Math.ceil(Math.sqrt($callMembers.length)))));
 </script>
@@ -189,8 +199,8 @@
     {/if}
   {/if}
 
-  <main class="stage" inert={narrow && sheet !== "none"}>
-    <header class="stage-top">
+  <main class="stage" inert={narrow && sheet === "channels"}>
+    <header class="stage-top" inert={chatSheet}>
       <button
         class="top-btn"
         onclick={toggleChannels}
@@ -246,8 +256,11 @@
       </button>
     </header>
 
-    <section class="stage-centre">
-      {#if callElsewhere}
+    <section class="stage-centre" inert={chatSheet}>
+      <!-- A share we watch is shown whichever server is on screen, as in the
+           other layouts: hidden, it went on being decoded with no Stop to
+           press (R5-02) -->
+      {#if callElsewhere && $streamStage === null}
         <div class="elsewhere">
           <p>Your call is on another server.</p>
           <p class="quiet">Pick it in the server rail to see who is talking there.</p>
@@ -281,8 +294,14 @@
     </section>
 
     {#if $voice !== null}
-      <footer class="dock" class:ptt={showPtt}>
-        {#if showPtt}<MobilePTT />{/if}
+      <footer
+        class="dock"
+        class:ptt={showPtt}
+        class:over-sheet={talkOverSheet}
+        inert={chatSheet && !talkOverSheet}
+        bind:clientHeight={dockHeight}
+      >
+        {#if showPtt}<MobilePTT slim={talkOverSheet} />{/if}
         <VoiceControls />
       </footer>
     {/if}
@@ -309,7 +328,14 @@
         }}
       ></div>
     {/if}
-    <aside class="chat" class:sheet={narrow} aria-label="Chat" data-stage-chat>
+    <aside
+      class="chat"
+      class:sheet={narrow}
+      class:above-dock={talkOverSheet}
+      style:--dock-space="{dockHeight}px"
+      aria-label="Chat"
+      data-stage-chat
+    >
       <ChatPanel />
     </aside>
   {/if}
@@ -558,6 +584,17 @@
     max-width: 480px;
   }
 
+  /* Over the scrim and beside the sheet: only the talk button is left */
+  .dock.over-sheet {
+    position: relative;
+    z-index: 3;
+    padding-block: var(--sp-2);
+  }
+
+  .dock.over-sheet > :global(.voice-controls) {
+    display: none;
+  }
+
   .chat {
     display: flex;
     width: var(--memberlist-width, 360px);
@@ -614,6 +651,15 @@
     border-radius: var(--r-lg) var(--r-lg) 0 0;
     box-shadow: var(--shadow-dialog);
     overflow: hidden;
+  }
+
+  /* Ends above the dock's talk button, which the shell's bottom padding
+     already keeps out of the navigation bar */
+  .stage-shell.narrow .chat.sheet.above-dock {
+    top: 25%;
+    bottom: calc(var(--dock-space) + env(safe-area-inset-bottom));
+    height: auto;
+    padding-bottom: 0;
   }
 
   .stage-shell.narrow .grid {

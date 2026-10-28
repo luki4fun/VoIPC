@@ -89,7 +89,7 @@
             <time class="result-time" title={fullTime(hit.msg.timestamp)}>{shortTime(hit.msg.timestamp)}</time>
           </span>
           <span class="result-text"
-            >{#each excerpt(plainText(hit.msg.content), want) as piece}{#if piece.hit}<mark>{piece.v}</mark>{:else}{piece.v}{/if}{/each}</span
+            >{#each excerpt(plainText(hit.msg.content) || (hit.msg.file?.name ?? ""), want) as piece}{#if piece.hit}<mark>{piece.v}</mark>{:else}{piece.v}{/if}{/each}</span
           >
         </button>
       {/each}

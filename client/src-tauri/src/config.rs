@@ -202,6 +202,10 @@ pub struct AppConfig {
     /// this drops is somebody's oldest conversations off their own disk.
     #[serde(default = "default_max_conversations")]
     pub max_conversations: u32,
+    /// Most the file cache (`files.rs`) holds, in MiB: the blobs of files
+    /// sent and loaded here, least recently used out first.
+    #[serde(default = "default_file_cache_mb")]
+    pub file_cache_mb: u64,
     /// The relay id each address said at its last account sign-in (address →
     /// hex). A server that names the id another address has here is refused
     /// before any password secret goes to it (`SignIn::expect_relay`).
@@ -271,6 +275,7 @@ impl Default for AppConfig {
             chat_history_path: None,
             chat_history_disabled: false,
             max_conversations: default_max_conversations(),
+            file_cache_mb: default_file_cache_mb(),
             relay_ids: Default::default(),
             check_updates: true,
             format: SETTINGS_FORMAT,
@@ -324,6 +329,10 @@ pub fn config_path() -> PathBuf {
 /// Returns the default path to `chat_history.bin` in the VoIPC data directory.
 pub fn default_max_conversations() -> u32 {
     1000
+}
+
+pub fn default_file_cache_mb() -> u64 {
+    1024
 }
 
 pub fn default_chat_history_path() -> PathBuf {

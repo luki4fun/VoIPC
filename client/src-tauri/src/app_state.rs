@@ -138,6 +138,15 @@ pub struct AppState {
     /// outside text). A game socket notes it at its `hello`; once it moved,
     /// that socket may no longer move the user back (docs/SDK.md, `player_left`).
     pub user_moved: AtomicU64,
+    /// Where a game last placed the user (server, channel) and `user_moved` at
+    /// that moment, from any socket's `hello`. Shared by every socket, so the
+    /// user's own move binds a game's new socket too, not only the one that
+    /// saw it (S-030).
+    pub sdk_placed: std::sync::Mutex<Option<(u64, (String, u32))>>,
+    /// The last game `hello` taken, from any socket: one a second for the
+    /// whole app, so a game cannot get round the limit with more sockets
+    /// (S-037).
+    pub sdk_last_hello: std::sync::Mutex<Option<tokio::time::Instant>>,
     /// Why the SDK listener could not bind, for Settings; None while it listens.
     pub sdk_listen_error: Arc<std::sync::Mutex<Option<String>>>,
 }
@@ -216,6 +225,8 @@ impl AppState {
             // Enough for a burst of talk edges; a lagging socket skips ahead
             sdk_events: tokio::sync::broadcast::channel(64).0,
             user_moved: AtomicU64::new(0),
+            sdk_placed: std::sync::Mutex::new(None),
+            sdk_last_hello: std::sync::Mutex::new(None),
             sdk_listen_error: Arc::new(std::sync::Mutex::new(None)),
         };
         state.seed_shared(&UserSettings::default());
@@ -404,6 +415,8 @@ pub struct ActiveConnection {
     pub tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
     /// The relay account this connection signed in with; `None` for a guest.
     pub account: Option<Arc<crate::account::AccountLink>>,
+    /// This connection's file transfers (`files.rs`).
+    pub files: Arc<crate::files::Files>,
     /// Sender for voice packets (QUIC datagrams, or the TCP fallback's datagram lane).
     pub voice_tx: mpsc::Sender<Vec<u8>>,
     /// Sender for video fragments (one QUIC stream per frame, or the TCP fallback).

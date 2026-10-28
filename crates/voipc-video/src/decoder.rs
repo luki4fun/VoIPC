@@ -15,12 +15,15 @@ fn init_ffmpeg() {
     });
 }
 
-/// Largest frame a viewer decodes: 4096×4096, which covers 4K and the widest
-/// ultrawide. The size comes from the sharer's own parameter sets, so without
-/// this FFmpeg allocates whatever a peer claims — up to its own limit of about
-/// 262 million pixels per reference frame — and one keyframe is an out of
-/// memory on every viewer.
-pub const MAX_DECODE_PIXELS: usize = 4096 * 4096;
+/// Largest frame a viewer decodes: 2048×2048, which holds every share VoIPC
+/// sends (1080p at most, `Resolution`) either way up, with room to spare. The
+/// size comes from the sharer's own parameter sets, so without this FFmpeg
+/// allocates whatever a peer claims — up to its own limit of about 262 million
+/// pixels per reference frame — and one keyframe is an out of memory on every
+/// viewer. The cap is per frame and a decoder keeps several reference frames,
+/// so it sits near the largest real share, not far above it (S-046). Raise it
+/// with any larger `Resolution`.
+pub const MAX_DECODE_PIXELS: usize = 2048 * 2048;
 
 /// A decoder for screen share frames, in whatever codec the sharer announced.
 pub struct Decoder {

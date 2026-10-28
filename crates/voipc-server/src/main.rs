@@ -299,11 +299,18 @@ struct ConnectRate {
 /// Idle page connections from a few addresses used to fill the one pool and
 /// lock everybody out (1.0 audit H1-01); now they cannot touch what signed-in
 /// sessions use, and filling the pre pool takes many addresses.
+///
+/// A file connection (HTTP/1.1 `/f/`) moves to a third, its own, once it has
+/// shown a good ticket (`to_files`): it may run for minutes, and sixteen of
+/// them behind one NAT held every pre slot voice joins from there need
+/// (R1-06). Signed-in sessions' pool stays theirs too.
 pub struct ConnLimits {
     pre_total: AtomicU32,
     pre_per_ip: DashMap<IpAddr, u32>,
     /// Per IPv6 /48 (one site), for the pre pool only: a /48 holds 65 536 /64s.
     pre_per_site: DashMap<IpAddr, u32>,
+    files_total: AtomicU32,
+    files_per_ip: DashMap<IpAddr, u32>,
     total: AtomicU32,
     /// Ceiling on concurrent connections, derived from `max_users` rather than
     /// fixed: a browser client holds two of these (page plus QUIC session or
@@ -333,6 +340,10 @@ impl ConnLimits {
     const PRE_PER_IP: u32 = 16;
     const PRE_PER_SITE: u32 = 32;
     const PRE_TOTAL: u32 = 1024;
+    /// File connections with a good ticket: as many per address as the pre
+    /// pool takes, and as many in all.
+    const FILES_PER_IP: u32 = 16;
+    const FILES_TOTAL: u32 = 1024;
 
     /// Deliberately generous, because the thing this protects against is cheap
     /// to survive and the thing it can break is not.
@@ -374,6 +385,8 @@ impl ConnLimits {
             pre_total: AtomicU32::new(0),
             pre_per_ip: DashMap::new(),
             pre_per_site: DashMap::new(),
+            files_total: AtomicU32::new(0),
+            files_per_ip: DashMap::new(),
             total: AtomicU32::new(0),
             max_total,
             max_per_ip,
@@ -392,28 +405,33 @@ impl ConnLimits {
         if !self.take_connect_token(key) {
             return Err("connect rate exceeded");
         }
-        if self.pre_total.load(Ordering::Relaxed) >= Self::PRE_TOTAL {
+        // Each count is checked and taken in one step (S-028): checked first
+        // and added after, two connects at once could both pass at the cap
+        if !reserve(&self.pre_total, Self::PRE_TOTAL) {
             return Err("pre-authentication limit reached");
         }
         let site = site_key(ip);
-        if site.is_some_and(|s| {
-            self.pre_per_site
-                .get(&s)
-                .is_some_and(|c| *c >= Self::PRE_PER_SITE)
-        }) {
-            return Err("per-site limit reached");
+        if let Some(site) = site {
+            let mut count = self.pre_per_site.entry(site).or_insert(0);
+            if *count >= Self::PRE_PER_SITE {
+                drop(count);
+                unreserve(&self.pre_total);
+                return Err("per-site limit reached");
+            }
+            *count += 1;
         }
         {
             let mut count = self.pre_per_ip.entry(key).or_insert(0);
             if *count >= Self::PRE_PER_IP {
+                drop(count);
+                if let Some(site) = site {
+                    decrement(&self.pre_per_site, site);
+                }
+                unreserve(&self.pre_total);
                 return Err("per-IP limit reached");
             }
             *count += 1;
         }
-        if let Some(site) = site {
-            *self.pre_per_site.entry(site).or_insert(0) += 1;
-        }
-        self.pre_total.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -421,17 +439,18 @@ impl ConnLimits {
     /// main one. On `Err` it stays in the pre pool and the session is refused.
     pub fn promote(&self, ip: IpAddr) -> Result<(), &'static str> {
         let key = limit_key(ip);
-        if self.total.load(Ordering::Relaxed) >= self.max_total {
+        if !reserve(&self.total, self.max_total) {
             return Err("the server has no room for another connection");
         }
         {
             let mut count = self.per_ip.entry(key).or_insert(0);
             if *count >= self.max_per_ip {
+                drop(count);
+                unreserve(&self.total);
                 return Err("too many connections from your address");
             }
             *count += 1;
         }
-        self.total.fetch_add(1, Ordering::Relaxed);
         self.release(ip);
         Ok(())
     }
@@ -446,6 +465,44 @@ impl ConnLimits {
                 Some(v.saturating_sub(1))
             });
         decrement(&self.per_ip, key);
+        *self.pre_per_ip.entry(key).or_insert(0) += 1;
+        if let Some(site) = site_key(ip) {
+            *self.pre_per_site.entry(site).or_insert(0) += 1;
+        }
+        self.pre_total.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// A file connection showed a good ticket: its slot moves from the pre
+    /// pool to the file one. `false` when that is full for `ip` or in all; it
+    /// then stays in the pre pool.
+    pub fn to_files(&self, ip: IpAddr) -> bool {
+        let key = limit_key(ip);
+        if !reserve(&self.files_total, Self::FILES_TOTAL) {
+            return false;
+        }
+        {
+            let mut count = self.files_per_ip.entry(key).or_insert(0);
+            if *count >= Self::FILES_PER_IP {
+                drop(count);
+                unreserve(&self.files_total);
+                return false;
+            }
+            *count += 1;
+        }
+        self.release(ip);
+        true
+    }
+
+    /// That file connection ended: its slot goes back to the pre pool, which
+    /// the accept loop then releases.
+    pub fn from_files(&self, ip: IpAddr) {
+        let key = limit_key(ip);
+        let _ = self
+            .files_total
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                Some(v.saturating_sub(1))
+            });
+        decrement(&self.files_per_ip, key);
         *self.pre_per_ip.entry(key).or_insert(0) += 1;
         if let Some(site) = site_key(ip) {
             *self.pre_per_site.entry(site).or_insert(0) += 1;
@@ -488,6 +545,15 @@ impl ConnLimits {
         entry.limiter.try_consume()
     }
 
+    /// `acquire`, as a slot that is handed back when it is dropped.
+    pub fn acquire_slot(self: &Arc<Self>, ip: IpAddr) -> Result<PreSlot, &'static str> {
+        self.acquire(ip)?;
+        Ok(PreSlot {
+            limits: self.clone(),
+            ip,
+        })
+    }
+
     /// Hand back a pre-authentication slot.
     pub fn release(&self, ip: IpAddr) {
         let _ = self
@@ -503,6 +569,36 @@ impl ConnLimits {
         // would hand the whole burst back on every disconnect, which is
         // exactly the pattern the budget exists to bound.
     }
+}
+
+/// A connection's pre-authentication slot, handed back when it is dropped: at
+/// the end of the connection's task however that ends, a panic included
+/// (S-025; `CleanupGuard` does the same for sessions, 1.0 audit H1-08).
+pub struct PreSlot {
+    limits: Arc<ConnLimits>,
+    ip: IpAddr,
+}
+
+impl Drop for PreSlot {
+    fn drop(&mut self) {
+        self.limits.release(self.ip);
+    }
+}
+
+/// One more on `counter`, unless it is at `cap`.
+fn reserve(counter: &AtomicU32, cap: u32) -> bool {
+    counter
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+            (v < cap).then_some(v + 1)
+        })
+        .is_ok()
+}
+
+/// Give back what `reserve` took.
+fn unreserve(counter: &AtomicU32) {
+    let _ = counter.try_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+        Some(v.saturating_sub(1))
+    });
 }
 
 fn decrement(map: &DashMap<IpAddr, u32>, key: IpAddr) {
@@ -904,12 +1000,6 @@ async fn main() -> Result<()> {
                     "files: cache in {}, blobs up to {} MiB, {} MiB in all",
                     config.files.dir, config.files.max_size_mb, config.files.max_total_mb
                 );
-                if config.tcp_port != config.udp_port {
-                    warn!(
-                        "files: tcp_port ({}) is not udp_port ({}): the desktop and Android apps fetch files from the port they connect to, so theirs will fail",
-                        config.tcp_port, config.udp_port
-                    );
-                }
                 state.files = Some(Arc::new(store));
             }
             Err(e) => error!(
@@ -924,6 +1014,9 @@ async fn main() -> Result<()> {
             Ok(wiped) => info!(wiped, "files: off; wiped the blobs of an earlier run"),
             Err(e) => warn!("files: off; could not wipe {}: {e}", config.files.dir),
         }
+    }
+    if let Some(why) = port_warning(&config, state.files.is_some()) {
+        warn!("{why}");
     }
     let state = Arc::new(state);
     if state.files.is_some() {
@@ -1044,11 +1137,14 @@ async fn main() -> Result<()> {
             continue;
         }
 
-        if let Err(reason) = limits.acquire(peer_ip) {
-            debug!(peer = %peer_addr, "rejecting connection: {reason}");
-            drop(tcp_stream);
-            continue;
-        }
+        let slot = match limits.acquire_slot(peer_ip) {
+            Ok(slot) => slot,
+            Err(reason) => {
+                debug!(peer = %peer_addr, "rejecting connection: {reason}");
+                drop(tcp_stream);
+                continue;
+            }
+        };
 
         // Set TCP keepalive to detect dead connections within ~25 seconds
         {
@@ -1063,11 +1159,11 @@ async fn main() -> Result<()> {
         }
 
         let tls_acceptor = tls_acceptor.clone();
-        let limits = limits.clone();
         let wt_info = wt_info.clone();
         let http_state = state.clone();
 
         tokio::spawn(async move {
+            let _slot = slot;
             // The 5 s auth timeout only starts after TLS completes; without a
             // deadline here an idle TCP socket (no ClientHello) holds one of
             // the 256 slots forever.
@@ -1099,8 +1195,6 @@ async fn main() -> Result<()> {
                     debug!(peer = %peer_addr, "TLS handshake timed out");
                 }
             }
-
-            limits.release(peer_ip);
         });
     }
 
@@ -1115,6 +1209,24 @@ async fn main() -> Result<()> {
     tokio::time::sleep(Duration::from_millis(500)).await;
     info!("server shut down");
     Ok(())
+}
+
+/// Why `tcp_port` should equal `udp_port`, when it does not and it matters:
+/// the desktop and Android apps reach files and the TCP fallback on the port
+/// they connect to. The fallback alone needs it too (R1-16).
+fn port_warning(config: &ServerConfig, files: bool) -> Option<String> {
+    let needs = match (files, config.tcp_fallback) {
+        (true, true) => "files and the TCP fallback",
+        (true, false) => "files",
+        (false, true) => "the TCP fallback",
+        (false, false) => return None,
+    };
+    (config.tcp_port != config.udp_port).then(|| {
+        format!(
+            "tcp_port ({}) is not udp_port ({}): the desktop and Android apps reach {needs} on the port they connect to, so theirs will fail",
+            config.tcp_port, config.udp_port
+        )
+    })
 }
 
 /// What the TLS listener offers. `h2` comes first because rustls picks in the
@@ -1233,6 +1345,73 @@ mod tests {
             limit_key(v6("2001:db8:1:2::1")),
             limit_key(v6("2001:db8:1:3::1"))
         );
+    }
+
+    /// S-028: connects racing for one site's last pre slots (different /64s
+    /// of one /48, so neither the address nor the connect rate stops them)
+    /// never take more than its cap, and a refused one leaves no count.
+    #[test]
+    fn racing_connects_never_pass_the_cap() {
+        let limits = ConnLimits::from_config(&ServerConfig::default());
+        let n = 4 * ConnLimits::PRE_PER_SITE as usize;
+        let start = std::sync::Barrier::new(n);
+        let taken: u32 = std::thread::scope(|scope| {
+            let runs: Vec<_> = (0..n)
+                .map(|i| {
+                    let (limits, start) = (&limits, &start);
+                    scope.spawn(move || {
+                        let ip: IpAddr = format!("2001:db8:7:{i:x}::1").parse().unwrap();
+                        start.wait();
+                        limits.acquire(ip).is_ok() as u32
+                    })
+                })
+                .collect();
+            runs.into_iter().map(|r| r.join().unwrap()).sum()
+        });
+        assert_eq!(taken, ConnLimits::PRE_PER_SITE);
+        assert_eq!(
+            limits.pre_total.load(Ordering::Relaxed),
+            ConnLimits::PRE_PER_SITE
+        );
+        let site: IpAddr = "2001:db8:7::".parse().unwrap();
+        assert_eq!(
+            *limits.pre_per_site.get(&site).unwrap(),
+            ConnLimits::PRE_PER_SITE
+        );
+    }
+
+    /// R1-16: unequal ports are worth a warning with files on, or with the
+    /// TCP fallback on and files off.
+    #[test]
+    fn unequal_ports_are_warned_about_for_the_fallback_too() {
+        let config = |tcp_port: u16, tcp_fallback: bool| ServerConfig {
+            tcp_port,
+            udp_port: 9987,
+            tcp_fallback,
+            ..ServerConfig::default()
+        };
+        let apart = config(9443, true);
+        assert!(port_warning(&apart, false).is_some_and(|w| w.contains("TCP fallback")));
+        assert!(port_warning(&apart, true).is_some_and(|w| w.contains("files and")));
+        assert!(port_warning(&config(9443, false), false).is_none());
+        assert!(port_warning(&config(9987, true), true).is_none());
+    }
+
+    /// S-025: a slot is handed back when its connection's task ends, a panic
+    /// included.
+    #[tokio::test]
+    async fn a_panicking_connection_still_hands_its_slot_back() {
+        let limits = Arc::new(ConnLimits::from_config(&ServerConfig::default()));
+        let ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 9));
+        let slot = limits.acquire_slot(ip).unwrap();
+        assert_eq!(limits.pre_total.load(Ordering::Relaxed), 1);
+        let task = tokio::spawn(async move {
+            let _slot = slot;
+            panic!("a bug in a connection's task");
+        });
+        assert!(task.await.is_err());
+        assert_eq!(limits.pre_total.load(Ordering::Relaxed), 0);
+        assert!(limits.pre_per_ip.get(&ip).is_none());
     }
 
     /// Rotating through one /64 is the same subscriber dialling again.

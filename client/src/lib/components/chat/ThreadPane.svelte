@@ -1,11 +1,11 @@
 <script lang="ts">
   import { tick, untrack } from "svelte";
-  import type { ChatMessage } from "../../types.js";
+  import type { ChatMessage, FileConv } from "../../types.js";
   import { pushLayer } from "../../stores/back-stack.js";
   import { shortName } from "../../username.js";
   import Icon from "../Icons.svelte";
   import Composer from "./Composer.svelte";
-  import MessageList from "./MessageList.svelte";
+  import MessageList, { type MessageActions } from "./MessageList.svelte";
 
   // One thread: its first message and the answers that belong to it, with a
   // message box that writes into it. Inside the chat panel, so every layout
@@ -30,6 +30,11 @@
     /** Opened to answer in it: the box gets the cursor. Not when opened to read,
      *  where on a phone it would bring the keyboard up over the thread. */
     focusComposer?: boolean;
+    /** Where the thread's files are fetched from (MessageList). */
+    server?: string;
+    fileConv?: FileConv | null;
+    /** React, edit, delete, pin, forward (MessageList). */
+    actions?: MessageActions;
   }
   let {
     root,
@@ -44,6 +49,9 @@
     me = [],
     mentionables = [],
     focusComposer = false,
+    server = "",
+    fileConv = null,
+    actions = {},
   }: Props = $props();
 
   const rows = $derived([root, ...answers]);
@@ -98,7 +106,7 @@
     </button>
   </header>
   <div class="thread-messages" bind:this={scroller}>
-    <MessageList messages={rows} {all} {onlink} under={root} onreply={onsend ? reply : undefined} {onjumpelsewhere} {names} {me} />
+    <MessageList messages={rows} {all} {onlink} under={root} onreply={onsend ? reply : undefined} {onjumpelsewhere} {names} {me} {server} {fileConv} {actions} />
   </div>
   {#if onsend}
     <Composer

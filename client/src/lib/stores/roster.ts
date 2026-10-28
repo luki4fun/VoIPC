@@ -79,10 +79,11 @@ export const displayChannelName: Readable<string> = derived(
  */
 export const shownMessages: Readable<ChatMessage[]> = derived(
   [activeDmUserId, activeDmUsername, serverAddress, displayChannelName, channelMessages, dmMessages],
-  ([$dm, $dmName, $server, $name, $channels, $dms]) => [
-    ...(($dm !== null ? $dms.get(dmKey($server, $dmName)) : $channels.get(chatKey($server, $name))) ??
-      []),
-  ],
+  // What a writer deleted stays only as a tombstone, which is never drawn
+  ([$dm, $dmName, $server, $name, $channels, $dms]) =>
+    (($dm !== null ? $dms.get(dmKey($server, $dmName)) : $channels.get(chatKey($server, $name))) ?? []).filter(
+      (m) => m.kind !== "deleted",
+    ),
 );
 
 export const displayChannelCreatorId: Readable<number | null> = derived(

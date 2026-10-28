@@ -28,7 +28,8 @@ function haystack(m: ChatMessage): string {
   if (h === undefined) {
     // The tag is not part of how anybody refers to a person
     const name = m.username.replace(/#\d{4}$/, "");
-    h = fold(`${plainText(m.content)}\n${name}`);
+    // A file's name too: what people remember a file by
+    h = fold(`${plainText(m.content)}\n${name}\n${m.file?.name ?? ""}`);
     haystacks.set(m, h);
   }
   return h;
@@ -36,7 +37,7 @@ function haystack(m: ChatMessage): string {
 
 /** A message with something worth finding in it: not one of our dividers, not a placeholder. */
 function searchable(m: ChatMessage): boolean {
-  return m.kind !== "history-marker" && m.kind !== "notice" && m.kind !== "undecryptable";
+  return m.kind !== "history-marker" && m.kind !== "notice" && m.kind !== "undecryptable" && m.kind !== "deleted";
 }
 
 export interface Hit<C> {

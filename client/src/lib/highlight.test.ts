@@ -21,3 +21,23 @@ test("a language without a grammar is plain text", () => {
   assert.equal(highlight("__proto__", "x"), null);
   assert.ok(highlight("ts", "const a: number = 1;"), "aliases count");
 });
+
+test("long code, or a long line, stays plain, and costs nothing", () => {
+  for (const [lang, code] of [
+    ["ini", "a".repeat(60000)],
+    ["c", "a ".repeat(30000)],
+    ["cpp", "a ".repeat(30000)],
+    ["typescript", "a ".repeat(30000)],
+  ]) {
+    const start = performance.now();
+    assert.equal(highlight(lang, code), null, lang);
+    const ms = performance.now() - start;
+    assert.ok(ms < 100, `${lang}: ${ms.toFixed(0)} ms`);
+  }
+  const line = "x".repeat(1000);
+  assert.ok(highlight("ini", `a = 1\n${line}`), "a line of 1000 is coloured");
+  assert.equal(highlight("ini", `a = 1\n${line}x\nb = 2`), null, "a line of 1001 is not");
+  const lines = "let a = 1;\n".repeat(400).slice(0, 4000);
+  assert.ok(highlight("js", lines), "4000 characters are coloured");
+  assert.equal(highlight("js", lines + "\n"), null, "4001 are not");
+});

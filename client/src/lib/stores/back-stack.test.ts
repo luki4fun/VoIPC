@@ -45,3 +45,21 @@ test("a layer closed some other way leaves the stack", () => {
   off(); // twice is harmless
   assert.equal(depth(), 0);
 });
+
+test("a layer that leaves sends back on to the app, and still closes nothing under it", () => {
+  const closed: string[] = [];
+  const offDrawer = pushLayer(() => closed.push("drawer"));
+  let leaving = true;
+  const offGate = pushLayer(null, () => leaving);
+  assert.equal(back(), false, "the app goes to the background");
+  assert.deepEqual(closed, []);
+  // Asked at each press: once it may no longer leave, it takes the press
+  leaving = false;
+  assert.equal(back(), true);
+  assert.deepEqual(closed, []);
+  offGate();
+  assert.equal(back(), true);
+  assert.deepEqual(closed, ["drawer"]);
+  offDrawer();
+  assert.equal(depth(), 0);
+});

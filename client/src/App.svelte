@@ -3,6 +3,8 @@
   import { listen } from "@tauri-apps/api/event";
   import { onMount, untrack } from "svelte";
   import { get } from "svelte/store";
+  import { answerFileWanted, fileLimits, noteProgress, startFileRetain, type FileProgress } from "./lib/files";
+  import type { FileConv } from "./lib/types";
 
   import ConnectDialog from "./lib/components/ConnectDialog.svelte";
   import ScreenShareSourcePicker from "./lib/components/ScreenShareSourcePicker.svelte";
@@ -56,6 +58,8 @@
   import {
     addChannelMessage,
     addDmMessage,
+    applyChannelEvent,
+    applyDmEvent,
     fileStoredChannelMessage,
     activeDmUsername,
     startExpirySweep,
@@ -143,8 +147,9 @@
     channelMessageTtl,
     dmMessageTtl,
     isTextChannel,
+    managesChannel,
   } from "./lib/stores/channel-ui.js";
-  import { expiryFor, HISTORY_MAX_MESSAGES, MAX_CONVERSATIONS, messageRefs } from "./lib/chat-rules.js";
+  import { chatEvent, expiryFor, forHandOff, HISTORY_MAX_MESSAGES, MAX_CONVERSATIONS, messageRefs } from "./lib/chat-rules.js";
   import { LAYOUT_PICKER_VERSION } from "./lib/ui-prefs.js";
   import { voiceMode, vadThreshold } from "./lib/stores/voice.js";
   import {
@@ -550,6 +555,8 @@
     // Messages with a destruction timer go when their moment comes, whether or
     // not anybody is looking at them. One sweep for the whole app.
     startExpirySweep();
+    // ...and the file cache follows what the chat still refers to
+    const stopFileRetain = startFileRetain();
     // A reload, or a window closed under us: the debounced chat save goes now
     window.addEventListener("beforeunload", () => void flushChatSave());
 
@@ -662,6 +669,10 @@
     const unlisteners = [
       // Refused for another protocol: ConnectDialog shows which side updates
       listenServer<Omit<UpdateNeeded, "server">>("update-needed", (server, d) => updateNeeded.set({ server, ...d })),
+      // The relay asks for a file this device holds (a re-seed): silent
+      listenServer<{ conv: FileConv; hash: string }>("file-wanted", (server, d) => answerFileWanted(server, d.conv, d.hash)),
+      listenServer<{ max_bytes: number } | null>("file-limits", (server, d) => fileLimits.of(server).set(d)),
+      listenServer<FileProgress>("file-progress", (_server, d) => noteProgress(d)),
       // First meeting with a self-signed server: what was pinned, to compare
       listenServer<{ fingerprint: string }>("tofu-pinned", (server, d) =>
         addNotification(
@@ -1170,7 +1181,8 @@
               // with a fresh copy of the same deadline.
               !(m.expires_at !== undefined && m.expires_at <= now),
           );
-          let msgs: ChatMessage[] = text.slice(-HISTORY_MAX_MESSAGES);
+          // Without what events did here (reactions, a pin): the reader's own record
+          let msgs: ChatMessage[] = text.slice(-HISTORY_MAX_MESSAGES).map(forHandOff);
           // Stay well under the 64 KiB control-message cap (Signal envelope + framing)
           const bytes = (list: ChatMessage[]) =>
             new TextEncoder().encode(JSON.stringify(list)).length;
@@ -1333,6 +1345,7 @@
         ttl_secs?: number | null;
         reply_to?: string | null;
         thread?: string | null;
+        event?: unknown;
         decryption_failed?: boolean;
       }>("channel-chat-message", (server, data) => {
         const { channel_id, user_id: uid, username, content, timestamp, message_id } = data;
@@ -1353,6 +1366,16 @@
           const writer = uid === self
             ? get(account.peek(server))?.info.id
             : get(users.peek(server)).find((u) => u.user_id === uid)?.account;
+          // An edit, delete, reaction or pin: done to an earlier message here,
+          // never a message itself. A pin counts only from one of the
+          // channel's managers, as the roster has the sender now.
+          if (data.event != null) {
+            const event = chatEvent(data.event);
+            const by = { user_id: uid, username: uname, account: writer ? accountHex(writer) : undefined };
+            const mayPin = event?.kind === "pin" && managesChannel(server, channel_id, uid);
+            if (event) applyChannelEvent(server, chName, { event, by, at: timestamp, content }, mayPin);
+            return;
+          }
           const added = addChannelMessage(server, chName, {
             user_id: uid,
             username: uname,
@@ -1448,6 +1471,7 @@
         ttl_secs?: number | null;
         reply_to?: string | null;
         thread?: string | null;
+        event?: unknown;
       }>("direct-chat-message", (server, data) => {
         const { from_user_id, to_user_id, content, timestamp } = data;
         const myId = get(userId.peek(server));
@@ -1463,6 +1487,13 @@
         const sender = from_user_id === myId
           ? get(account.peek(server))?.info.id
           : get(users.peek(server)).find((u) => u.user_id === from_user_id)?.account;
+        // Done to an earlier message of the conversation: no message, no sound
+        if (data.event != null) {
+          const event = chatEvent(data.event);
+          const by = { user_id: from_user_id, username: from_username, account: sender ? accountHex(sender) : undefined };
+          if (event) applyDmEvent(server, myId, from_user_id, from_username, to_user_id, { event, by, at: timestamp, content });
+          return;
+        }
         addDmMessage(server, myId, from_user_id, from_username, to_user_id, {
           user_id: from_user_id,
           username: from_username,
@@ -1691,6 +1722,7 @@
     return () => {
       clearInterval(pingInterval);
       clearInterval(statsInterval);
+      stopFileRetain();
       unlisteners.forEach((p) => p.then((unlisten) => unlisten()));
     };
     })();

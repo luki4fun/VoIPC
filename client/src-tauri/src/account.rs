@@ -27,6 +27,7 @@ use voipc_protocol::codec::{
 };
 use voipc_protocol::conv::{hex, unhex16};
 use voipc_protocol::messages::{AccountReply, AccountRequest, ClientMessage, ServerMessage};
+use voipc_protocol::types::FileLimits;
 
 use crate::app_state::{AppState, SignalState};
 use crate::crypto::DeviceRecord;
@@ -158,7 +159,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     send: &mut S,
     recv: &mut R,
     buf: &mut BytesMut,
-) -> Result<(u32, u32, Arc<AccountLink>), String> {
+) -> Result<(u32, u32, Arc<AccountLink>, Option<FileLimits>), String> {
     let name = normalize_name(username)?;
     let method = match args {
         AccountArgs::Login { password } => Method::Password {
@@ -216,20 +217,21 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     write(send, &first).await?;
 
     let mut asked = 0u32;
-    let (user_id, session_id, info) = loop {
+    let (user_id, session_id, info, files) = loop {
         let msg = read(recv, buf).await?;
         if let ServerMessage::Authenticated {
             user_id,
             session_id,
             account: Some(info),
             accounts,
+            files,
             ..
         } = msg
         {
             if let Some(accounts) = accounts {
                 emit_server(app, server, "relay-accounts", accounts);
             }
-            break (user_id, session_id, info);
+            break (user_id, session_id, info, files);
         }
         crate::network::note_refusal(app, server, &msg);
         // The password's stretching runs here: half a second of CPU, kept
@@ -298,6 +300,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         Arc::new(AccountLink {
             session: std::sync::Mutex::new(session),
         }),
+        files,
     ))
 }
 
@@ -424,14 +427,14 @@ pub async fn send_kept_dm(
     ttl_secs: Option<u32>,
     reply_to: Option<String>,
     thread: Option<String>,
+    file: Option<serde_json::Value>,
+    fwd: Option<serde_json::Value>,
+    event: Option<serde_json::Value>,
 ) -> Result<String, String> {
     let connections = state.connections.read().await;
     let (connection, link) = signed_in(&connections, &server)?;
     let id = crate::crypto::new_message_id();
-    let extras = crate::crypto::Extras {
-        reply: reply_to,
-        thread,
-    };
+    let extras = crate::commands::checked_extras(reply_to, thread, file, fwd, event)?;
     let payload = crate::crypto::envelope_with(&id, &content, ttl_secs, &extras);
     let a = link
         .session()

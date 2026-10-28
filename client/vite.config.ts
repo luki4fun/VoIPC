@@ -92,6 +92,8 @@ export default defineConfig(({ mode }) => {
       __BUILD_TIME__: JSON.stringify(stamp.time),
     },
     resolve: web ? { alias: webAliases } : undefined,
+    // The file worker imports the wasm glue: a module worker
+    worker: { format: "es" },
     build: {
       target: "esnext",
       minify: !process.env.TAURI_ENV_DEBUG ? "esbuild" : false,

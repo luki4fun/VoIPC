@@ -7,6 +7,9 @@
 //! other wrote `"v": 2`, and neither read the field at all.
 
 use ring::rand::{SecureRandom, SystemRandom};
+use serde::{Deserialize, Serialize};
+
+use crate::file::FileMeta;
 
 /// Longest message id we will keep.
 ///
@@ -64,7 +67,8 @@ pub struct Message {
 }
 
 /// What a message may point at beside its text: the message it answers and
-/// the thread it belongs to, both ids its readers already hold.
+/// the thread it belongs to, both ids its readers already hold, and the file
+/// it carries.
 ///
 /// They ride as plain keys without a `kind`, so a reader from before 1.2
 /// shows the text and nothing else. Only the id travels, never a quote of
@@ -74,6 +78,261 @@ pub struct Message {
 pub struct Extras {
     pub reply: Option<String>,
     pub thread: Option<String>,
+    /// A file message's file; its text is then the caption (protocol 13).
+    pub file: Option<FileRef>,
+    /// Passed on from another conversation (protocol 13).
+    pub fwd: Option<Forwarded>,
+    /// Not a message but something done to one (protocol 13). An envelope
+    /// with an event carries nothing else: no answer, thread, file or `fwd`.
+    pub event: Option<ChatEvent>,
+}
+
+/// Longest name a forwarded message may say it came from, in characters.
+pub const MAX_FWD_NAME: usize = 64;
+/// Longest reaction, in UTF-8 bytes: one emoji, however many code points it
+/// takes (a family of three with skin tones is 30). That it is one grapheme is
+/// checked where it is drawn (`chat-rules.ts`), which has the segmenter.
+pub const MAX_EMOJI_BYTES: usize = 32;
+/// The largest moment a reader can hold exactly: JavaScript's safe integer.
+const MAX_SAFE_MS: u64 = (1 << 53) - 1;
+
+/// A message forwarded from another conversation: who wrote it there, and
+/// when (ms). The forwarder's word for both, so it is a label and nothing
+/// more: the message is the forwarder's own, and shown under their name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Forwarded {
+    pub name: String,
+    pub at: u64,
+}
+
+impl Forwarded {
+    /// A sender's claim, bounded: the name cleaned like a file's and cut to
+    /// `MAX_FWD_NAME`, the moment one a reader can hold; else no label.
+    pub fn checked(v: &serde_json::Value) -> Option<Forwarded> {
+        let o = v.as_object()?;
+        let at = o.get("at")?.as_u64().filter(|a| *a <= MAX_SAFE_MS)?;
+        let name = clean(o.get("name")?.as_str()?, MAX_FWD_NAME);
+        Some(Forwarded {
+            name: if name.is_empty() {
+                "someone".into()
+            } else {
+                name
+            },
+            at,
+        })
+    }
+}
+
+/// The kinds an event envelope may have (`ChatEvent`).
+const EVENT_KINDS: [&str; 4] = ["edit", "delete", "react", "pin"];
+
+/// What an event does to an earlier message of the same conversation, which
+/// it names by id (`target`). Every reader on a protocol-13 relay knows these.
+///
+/// Who may do what is the reader's to check (`chat-rules.ts`), against who
+/// sent the event: an edit or a delete only from the message's own writer, a
+/// pin only from one of the channel's managers. An event carries the
+/// conversation's destruction timer like a message does, so its copy in a
+/// stored log never outlives what it points at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum ChatEvent {
+    /// Its writer changed it: the envelope's `text` is the new text.
+    Edit { target: String },
+    /// Its writer took it back, for everyone.
+    Delete { target: String },
+    /// The sender put a reaction on it (`on`), or took theirs off.
+    React {
+        target: String,
+        emoji: String,
+        on: bool,
+    },
+    /// The sender pinned it in the channel (`on`), or unpinned it.
+    Pin { target: String, on: bool },
+}
+
+impl ChatEvent {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            ChatEvent::Edit { .. } => "edit",
+            ChatEvent::Delete { .. } => "delete",
+            ChatEvent::React { .. } => "react",
+            ChatEvent::Pin { .. } => "pin",
+        }
+    }
+
+    pub fn target(&self) -> &str {
+        match self {
+            ChatEvent::Edit { target }
+            | ChatEvent::Delete { target }
+            | ChatEvent::React { target, .. }
+            | ChatEvent::Pin { target, .. } => target,
+        }
+    }
+
+    /// An event from its keys, bounded where it enters: `kind`, the `target`
+    /// cut like any id, a reaction's `emoji` (`MAX_EMOJI_BYTES`, nothing
+    /// invisible or direction-turning) and `on`. None when any is missing or
+    /// out of bounds. The same keys come from the front end (`{kind, target,
+    /// emoji?, on?}`) and sit at the top of an event envelope.
+    pub fn checked(o: &serde_json::Map<String, serde_json::Value>) -> Option<ChatEvent> {
+        let target = bounded_id(o.get("target")?.as_str())?;
+        let on = || o.get("on").and_then(|v| v.as_bool());
+        Some(match o.get("kind")?.as_str()? {
+            "edit" => ChatEvent::Edit { target },
+            "delete" => ChatEvent::Delete { target },
+            "react" => ChatEvent::React {
+                target,
+                emoji: checked_emoji(o.get("emoji")?.as_str()?)?,
+                on: on()?,
+            },
+            "pin" => ChatEvent::Pin { target, on: on()? },
+            _ => return None,
+        })
+    }
+}
+
+/// A reaction as it may be kept: one short run of visible characters.
+fn checked_emoji(e: &str) -> Option<String> {
+    let visible = e
+        .chars()
+        .all(|c| !c.is_control() && !c.is_whitespace() && !is_junk(c));
+    (!e.is_empty() && e.len() <= MAX_EMOJI_BYTES && visible).then(|| e.to_string())
+}
+
+/// Longest file name kept, in characters.
+pub const MAX_FILE_NAME: usize = 255;
+/// Largest picture side a file message may claim, in pixels.
+pub const MAX_FILE_SIDE: u32 = 16_384;
+/// Longest playing time a file message may claim, in seconds: a week.
+pub const MAX_FILE_DUR: u32 = 7 * 24 * 60 * 60;
+/// The preview a picture's message carries: 16×16 RGB pixels, drawn as they
+/// are, so no image decoder runs on anything before a click.
+pub const PREVIEW_BYTES: usize = 16 * 16 * 3;
+/// `PREVIEW_BYTES` as base64 (768 is a multiple of 3: no padding).
+const PREVIEW_B64: usize = PREVIEW_BYTES / 3 * 4;
+const MAX_MIME: usize = 127;
+
+/// The file a message carries, all of it end to end: the relay sees only the
+/// blob id, `hash`. The blob's part (`hash`, `key`, `size`, `z`) is
+/// `FileMeta`'s, as text; the rest describes the file for its card. None of
+/// it is believed for more than a card: the type that decides how a loaded
+/// file is shown comes from its bytes (`file-sniff.ts`), never from `mime`.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileRef {
+    pub hash: String,
+    pub key: String,
+    pub size: u64,
+    pub z: bool,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mime: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub w: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h: Option<u32>,
+    /// Seconds of audio or video.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dur: Option<u32>,
+    /// `PREVIEW_BYTES` as base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub px: Option<String>,
+}
+
+impl std::fmt::Debug for FileRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FileRef")
+            .field("hash", &self.hash)
+            .field("size", &self.size)
+            .field("name", &self.name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl FileRef {
+    /// A sender's claims, bounded where they enter: the blob's part as
+    /// `FileMeta::from_parts` takes it, or no file at all; the name cut to
+    /// `MAX_FILE_NAME` without control or direction-override characters; the
+    /// rest dropped where it is out of bounds.
+    pub fn checked(v: &serde_json::Value) -> Option<FileRef> {
+        let o = v.as_object()?;
+        let hash = o.get("hash")?.as_str()?;
+        let key = o.get("key")?.as_str()?;
+        let size = o.get("size")?.as_u64()?;
+        let z = o.get("z")?.as_bool()?;
+        FileMeta::from_parts(hash, key, size, z).ok()?;
+        let name = o
+            .get("name")
+            .and_then(|n| n.as_str())
+            .map(clean_name)
+            .filter(|n| !n.is_empty())
+            .unwrap_or_else(|| "file".into());
+        let mime = o
+            .get("mime")
+            .and_then(|m| m.as_str())
+            .filter(|m| m.len() <= MAX_MIME && is_mime(m))
+            .map(str::to_ascii_lowercase);
+        let within = |k: &str, max: u32, least: u64| {
+            o.get(k)
+                .and_then(|n| n.as_u64())
+                .filter(|n| (least..=max as u64).contains(n))
+                .map(|n| n as u32)
+        };
+        let px = o
+            .get("px")
+            .and_then(|p| p.as_str())
+            .filter(|p| {
+                p.len() == PREVIEW_B64
+                    && p.bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/')
+            })
+            .map(String::from);
+        Some(FileRef {
+            hash: hash.into(),
+            key: key.into(),
+            size,
+            z,
+            name,
+            mime,
+            w: within("w", MAX_FILE_SIDE, 1),
+            h: within("h", MAX_FILE_SIDE, 1),
+            dur: within("dur", MAX_FILE_DUR, 0),
+            px,
+        })
+    }
+}
+
+/// A file name as a card shows it: no control characters, none that turn
+/// the text's direction (an `exe.jpg` that reads `gpj.exe`), no byte-order
+/// mark (which JS's `trim` drops and Rust's does not), at most
+/// `MAX_FILE_NAME` characters. Saving cleans it further, per system.
+fn clean_name(name: &str) -> String {
+    clean(name, MAX_FILE_NAME)
+}
+
+/// `clean_name`, at most `max` characters.
+fn clean(text: &str, max: usize) -> String {
+    text.chars()
+        .filter(|c| !c.is_control() && !is_junk(*c))
+        .take(max)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+/// The characters that turn the text's direction, and the byte-order mark.
+fn is_junk(c: char) -> bool {
+    matches!(c, '\u{200e}' | '\u{200f}' | '\u{061c}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}' | '\u{feff}')
+}
+
+/// `type/subtype`, in the characters RFC 6838 allows.
+fn is_mime(m: &str) -> bool {
+    let token = |t: &str| {
+        !t.is_empty()
+            && t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$&^_.+-".contains(&b))
+    };
+    matches!(m.split_once('/'), Some((a, b)) if token(a) && token(b))
 }
 
 /// What a tombstone shows where its kind is not known.
@@ -100,17 +359,55 @@ pub fn envelope(id: &str, text: &str, ttl_secs: Option<u32>) -> Vec<u8> {
 }
 
 /// `envelope`, plus what the message points at.
+///
+/// With an event (`extras.event`) it is that event's envelope instead: its
+/// `kind` and keys, the text only for an edit (the new text), and nothing
+/// else of `extras`.
 pub fn envelope_with(id: &str, text: &str, ttl_secs: Option<u32>, extras: &Extras) -> Vec<u8> {
     let mut obj = serde_json::json!({ "v": 2, "id": id, "text": text });
     if let Some(ttl) = ttl_secs.filter(|t| *t > 0) {
         obj["ttl"] = serde_json::json!(ttl.min(MAX_MESSAGE_TTL_SECS));
+    }
+    if let Some(event) = &extras.event {
+        obj["kind"] = serde_json::json!(event.kind());
+        obj["target"] = serde_json::json!(event.target());
+        match event {
+            ChatEvent::Edit { .. } => {}
+            ChatEvent::Delete { .. } => obj["text"] = serde_json::json!(""),
+            ChatEvent::React { emoji, on, .. } => {
+                obj["text"] = serde_json::json!("");
+                obj["emoji"] = serde_json::json!(emoji);
+                obj["on"] = serde_json::json!(on);
+            }
+            ChatEvent::Pin { on, .. } => {
+                obj["text"] = serde_json::json!("");
+                obj["on"] = serde_json::json!(on);
+            }
+        }
+        return obj.to_string().into_bytes();
     }
     for (key, value) in [("reply", &extras.reply), ("thread", &extras.thread)] {
         if let Some(id) = bounded_id(value.as_deref()) {
             obj[key] = serde_json::json!(id);
         }
     }
+    if let Some(file) = &extras.file {
+        obj["file"] = serde_json::to_value(file).expect("a file serializes");
+    }
+    if let Some(fwd) = &extras.fwd {
+        obj["fwd"] = serde_json::to_value(fwd).expect("a label serializes");
+    }
     obj.to_string().into_bytes()
+}
+
+/// A claimed destruction timer, bounded where it enters: what a sender
+/// claims decides when this message is deleted, and the receiver then takes
+/// the shorter of this and whatever the conversation itself says.
+fn bounded_ttl(map: &serde_json::Map<String, serde_json::Value>) -> Option<u32> {
+    map.get("ttl")
+        .and_then(|v| v.as_u64())
+        .filter(|t| *t > 0)
+        .map(|t| t.min(MAX_MESSAGE_TTL_SECS as u64) as u32)
 }
 
 /// A message id as we keep one: non-empty, at most `MAX_MESSAGE_ID` characters.
@@ -132,6 +429,13 @@ pub fn open_envelope(plaintext: &[u8]) -> Message {
             .get("v")
             .and_then(|v| v.as_u64())
             .is_some_and(|v| v > ENVELOPE_V);
+        let placeholder = || Message {
+            id: id(),
+            text: NEWER_MESSAGE.into(),
+            ttl_secs: None,
+            purge_before: None,
+            extras: Extras::default(),
+        };
         match map.get("kind").and_then(|k| k.as_str()) {
             Some("purge") if !newer => {
                 if let Some(before) = map.get("before").and_then(|b| b.as_u64()) {
@@ -144,33 +448,49 @@ pub fn open_envelope(plaintext: &[u8]) -> Message {
                     };
                 }
             }
-            None if !newer => {}
-            _ => {
-                return Message {
-                    id: id(),
-                    text: NEWER_MESSAGE.into(),
-                    ttl_secs: None,
-                    purge_before: None,
-                    extras: Extras::default(),
-                }
+            // An event this build cannot read whole is never half done: it
+            // shows as a message from a newer VoIPC, like a kind not known.
+            Some(kind) if !newer && EVENT_KINDS.contains(&kind) => {
+                let text = map.get("text").and_then(|t| t.as_str());
+                return match ChatEvent::checked(&map) {
+                    Some(event @ ChatEvent::Edit { .. }) if text.is_some() => Message {
+                        id: id(),
+                        text: text.unwrap_or_default().into(),
+                        ttl_secs: bounded_ttl(&map),
+                        purge_before: None,
+                        extras: Extras {
+                            event: Some(event),
+                            ..Extras::default()
+                        },
+                    },
+                    Some(ChatEvent::Edit { .. }) | None => placeholder(),
+                    Some(event) => Message {
+                        id: id(),
+                        text: String::new(),
+                        ttl_secs: bounded_ttl(&map),
+                        purge_before: None,
+                        extras: Extras {
+                            event: Some(event),
+                            ..Extras::default()
+                        },
+                    },
+                };
             }
+            None if !newer => {}
+            _ => return placeholder(),
         }
         if let Some(serde_json::Value::String(text)) = map.get("text") {
             let id = id();
-            // Bounded here, where it enters: what a sender claims decides when
-            // this message is deleted, and the receiver then takes the shorter
-            // of this and whatever the channel itself says.
-            let ttl_secs = map
-                .get("ttl")
-                .and_then(|v| v.as_u64())
-                .filter(|t| *t > 0)
-                .map(|t| t.min(MAX_MESSAGE_TTL_SECS as u64) as u32);
+            let ttl_secs = bounded_ttl(&map);
             // Bounded like the message's own id: each lands in the receiver's
             // archive, and a reply to an id nobody holds is only shown as one
             // to a message that is not here.
             let extras = Extras {
                 reply: bounded_id(map.get("reply").and_then(|v| v.as_str())),
                 thread: bounded_id(map.get("thread").and_then(|v| v.as_str())),
+                file: map.get("file").and_then(FileRef::checked),
+                fwd: map.get("fwd").and_then(Forwarded::checked),
+                event: None,
             };
             return Message {
                 id,
@@ -290,6 +610,7 @@ mod tests {
         let extras = Extras {
             reply: Some("r1".into()),
             thread: Some("t1".into()),
+            ..Extras::default()
         };
         let packed = envelope_with("m1", "agreed", Some(60), &extras);
         let m = open_envelope(&packed);
@@ -322,6 +643,249 @@ mod tests {
         // A newer kind still never carries what it points at into the archive
         let later = br#"{"v":3,"id":"m5","text":"hi","reply":"r1"}"#;
         assert_eq!(open_envelope(later).extras, Extras::default());
+    }
+
+    fn a_file() -> FileRef {
+        FileRef {
+            hash: "a".repeat(64),
+            key: "b".repeat(64),
+            size: 1234,
+            z: true,
+            name: "notes.txt".into(),
+            mime: Some("text/plain".into()),
+            w: None,
+            h: None,
+            dur: None,
+            px: None,
+        }
+    }
+
+    #[test]
+    fn a_file_travels_with_its_caption_and_without_a_kind() {
+        let mut file = a_file();
+        file.w = Some(640);
+        file.h = Some(480);
+        file.px = Some("A".repeat(1024));
+        let extras = Extras {
+            file: Some(file.clone()),
+            ..Extras::default()
+        };
+        let packed = envelope_with("f1", "a caption", Some(60), &extras);
+        let m = open_envelope(&packed);
+        assert_eq!((m.text.as_str(), m.extras.file), ("a caption", Some(file)));
+        let map: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_slice(&packed).unwrap();
+        assert!(
+            !map.contains_key("kind"),
+            "every 1.3 reader knows the field"
+        );
+        assert!(
+            !format!("{:?}", a_file()).contains(&"b".repeat(64)),
+            "no key in logs"
+        );
+    }
+
+    #[test]
+    fn a_files_claims_are_bounded_where_they_enter() {
+        let with = |file: serde_json::Value| {
+            let packed = serde_json::json!({ "v": 2, "id": "x", "text": "", "file": file });
+            open_envelope(packed.to_string().as_bytes()).extras.file
+        };
+        let good = serde_json::to_value(a_file()).unwrap();
+        // The blob's part is FileMeta's or there is no file
+        for (k, bad) in [
+            ("hash", serde_json::json!("A".repeat(64))),
+            ("key", serde_json::json!("b")),
+            ("size", serde_json::json!(64 * 1024 * 1024 + 1)),
+            ("z", serde_json::json!(1)),
+        ] {
+            let mut f = good.clone();
+            f[k] = bad;
+            assert_eq!(with(f), None, "{k}");
+        }
+        // The rest is cut or dropped, and the file stays
+        let mut f = good.clone();
+        f["name"] = serde_json::json!(format!("\u{202e}gpj.exe\n{}", "x".repeat(300)));
+        f["mime"] = serde_json::json!("text/html; charset=x");
+        f["w"] = serde_json::json!(16_385);
+        f["h"] = serde_json::json!(0);
+        f["dur"] = serde_json::json!(-1);
+        f["px"] = serde_json::json!("A".repeat(1023));
+        let got = with(f).unwrap();
+        assert_eq!(got.name.chars().count(), MAX_FILE_NAME);
+        assert!(got.name.starts_with("gpj.exex"));
+        assert_eq!(
+            (got.mime, got.w, got.h, got.dur, got.px),
+            (None, None, None, None, None)
+        );
+        let mut f = good.clone();
+        f["name"] = serde_json::json!(" \u{7} ");
+        f["mime"] = serde_json::json!("Image/PNG");
+        assert_eq!(
+            with(f).map(|f| (f.name, f.mime)),
+            Some(("file".into(), Some("image/png".into())))
+        );
+    }
+
+    fn with_event(event: ChatEvent) -> Extras {
+        Extras {
+            event: Some(event),
+            ..Extras::default()
+        }
+    }
+
+    /// Edit, delete, react and pin are kinds every 1.3 reader acts on, each
+    /// carrying the conversation's timer and nothing a message carries.
+    #[test]
+    fn an_event_travels_as_its_kind_with_the_conversations_timer() {
+        let react = ChatEvent::React {
+            target: "m1".into(),
+            emoji: "👍🏽".into(),
+            on: true,
+        };
+        for (event, text) in [
+            (
+                ChatEvent::Edit {
+                    target: "m1".into(),
+                },
+                "fixed typo",
+            ),
+            (
+                ChatEvent::Delete {
+                    target: "m1".into(),
+                },
+                "",
+            ),
+            (react.clone(), ""),
+            (
+                ChatEvent::Pin {
+                    target: "m1".into(),
+                    on: false,
+                },
+                "",
+            ),
+        ] {
+            let kind = event.kind();
+            // A sender's extras beside the event never ride along
+            let mut extras = with_event(event.clone());
+            extras.reply = Some("r1".into());
+            extras.fwd = Some(Forwarded {
+                name: "ann".into(),
+                at: 5,
+            });
+            let packed = envelope_with("e1", "fixed typo", Some(60), &extras);
+            let map: serde_json::Map<String, serde_json::Value> =
+                serde_json::from_slice(&packed).unwrap();
+            assert_eq!(
+                (map["kind"].as_str(), map["v"].as_u64()),
+                (Some(kind), Some(2))
+            );
+            assert!(
+                !map.contains_key("reply") && !map.contains_key("fwd"),
+                "{kind}"
+            );
+            let m = open_envelope(&packed);
+            assert_eq!(m.id.as_deref(), Some("e1"));
+            assert_eq!(m.text, text, "{kind}: only an edit has a text");
+            assert_eq!(m.ttl_secs, Some(60), "{kind}: the conversation's timer");
+            assert_eq!(m.extras, with_event(event), "{kind}");
+        }
+    }
+
+    #[test]
+    fn an_events_claims_are_bounded_where_they_enter() {
+        let open = |v: serde_json::Value| open_envelope(v.to_string().as_bytes());
+        let ok = |v: serde_json::Value| open(v).extras.event;
+        // The target is cut like any id, and needed
+        let long = ok(
+            serde_json::json!({"v":2,"id":"e","kind":"delete","target":"a".repeat(500),"text":""}),
+        );
+        assert_eq!(long.unwrap().target().len(), MAX_MESSAGE_ID);
+        // Anything missing or out of bounds is not half done: a placeholder
+        for bad in [
+            serde_json::json!({"v":2,"id":"e","kind":"delete","text":""}),
+            serde_json::json!({"v":2,"id":"e","kind":"delete","target":"","text":""}),
+            serde_json::json!({"v":2,"id":"e","kind":"edit","target":"m"}),
+            serde_json::json!({"v":2,"id":"e","kind":"react","target":"m","emoji":"👍","text":""}),
+            serde_json::json!({"v":2,"id":"e","kind":"react","target":"m","emoji":"","on":true,"text":""}),
+            serde_json::json!({"v":2,"id":"e","kind":"react","target":"m","emoji":"x".repeat(33),"on":true,"text":""}),
+            serde_json::json!({"v":2,"id":"e","kind":"react","target":"m","emoji":"a b","on":true,"text":""}),
+            serde_json::json!({"v":2,"id":"e","kind":"react","target":"m","emoji":"\u{202e}x","on":true,"text":""}),
+            serde_json::json!({"v":2,"id":"e","kind":"react","target":"m","emoji":"\n","on":true,"text":""}),
+            serde_json::json!({"v":2,"id":"e","kind":"pin","target":"m","on":"yes","text":""}),
+            serde_json::json!({"v":2,"id":"e","kind":"pin","target":7,"on":true,"text":""}),
+        ] {
+            let m = open(bad.clone());
+            assert_eq!(
+                (m.text.as_str(), m.extras.event),
+                (NEWER_MESSAGE, None),
+                "{bad}"
+            );
+        }
+        // 32 bytes is the most: one emoji with its modifiers fits
+        let family = "👩🏽‍👩🏽‍👧🏽"; // 31 bytes
+        assert!(family.len() <= MAX_EMOJI_BYTES);
+        assert!(ok(serde_json::json!({"v":2,"id":"e","kind":"react","target":"m","emoji":family,"on":true,"text":""})).is_some());
+        // A react's text is not shown, whatever it says
+        let m = open(
+            serde_json::json!({"v":2,"id":"e","kind":"react","target":"m","emoji":"🔥","on":false,"text":"spam"}),
+        );
+        assert_eq!(m.text, "");
+        // The front end's own shape is the same keys
+        let mine = serde_json::json!({"kind":"pin","target":"m","on":true});
+        assert_eq!(
+            ChatEvent::checked(mine.as_object().unwrap()),
+            Some(ChatEvent::Pin {
+                target: "m".into(),
+                on: true
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ChatEvent::checked(mine.as_object().unwrap()).unwrap()).unwrap(),
+            mine,
+            "what a reader gets back is what was sent"
+        );
+    }
+
+    #[test]
+    fn a_forwarded_message_carries_its_label_bounded() {
+        let fwd = Forwarded {
+            name: "ann#0001".into(),
+            at: 1_700_000_000_000,
+        };
+        let extras = Extras {
+            fwd: Some(fwd.clone()),
+            file: Some(a_file()),
+            ..Extras::default()
+        };
+        let m = open_envelope(&envelope_with("f1", "look", None, &extras));
+        assert_eq!((m.extras.fwd, m.extras.file), (Some(fwd), Some(a_file())));
+        let with = |fwd: serde_json::Value| {
+            let packed = serde_json::json!({ "v": 2, "id": "x", "text": "t", "fwd": fwd });
+            open_envelope(packed.to_string().as_bytes()).extras.fwd
+        };
+        let cut =
+            with(serde_json::json!({"name": format!("\u{202e}{}", "n".repeat(100)), "at": 1}))
+                .unwrap();
+        assert_eq!(cut.name.chars().count(), MAX_FWD_NAME);
+        assert_eq!(
+            with(serde_json::json!({"name": " ", "at": 1}))
+                .unwrap()
+                .name,
+            "someone"
+        );
+        assert_eq!(
+            with(serde_json::json!({"name": "a", "at": 1u64 << 53})),
+            None
+        );
+        assert_eq!(with(serde_json::json!({"name": "a", "at": -1})), None);
+        assert_eq!(with(serde_json::json!({"at": 1})), None);
+        assert_eq!(with(serde_json::json!("ann")), None);
+        // The message stays, without its label
+        assert_eq!(
+            open_envelope(br#"{"v":2,"id":"x","text":"t","fwd":7}"#).text,
+            "t"
+        );
     }
 
     #[test]

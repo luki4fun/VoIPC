@@ -76,7 +76,7 @@ pub fn fuzz_file(data: &[u8]) {
         deflated,
     };
     let _ = file::open(&meta(rest), rest);
-    let committed = [&file::commitment(&KEY)[..], rest].concat();
+    let committed = [&file::commitment(&KEY, deflated, size as u64)[..], rest].concat();
     let _ = file::open(&meta(&committed), &committed);
     let _ = file::inflate(rest, size as usize);
 
