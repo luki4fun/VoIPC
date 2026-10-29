@@ -806,8 +806,8 @@
   /* One message: what it answers, who wrote it, what they wrote, its tools.
      A row off screen is not laid out until it comes near (R2-05: a full
      channel cost a phone about 160 ms per message); the list follows its end
-     by state, not by measured height (ChatPanel). Its paint is contained, so
-     the tools that sit over its top edge get room to show */
+     by state, not by measured height (ChatPanel). Its paint is contained,
+     with a margin; the row showing its tools drops that (below) */
   .msg {
     position: relative;
     margin: 0 -8px;
@@ -961,6 +961,15 @@
   .msg:focus-visible .msg-tools,
   .msg:has(:focus-visible) .msg-tools {
     display: flex;
+  }
+
+  /* The row showing them lets them out, above the rows around it: they are
+     taller than a one-line row, and contained paint cut them off at its edge */
+  .msg:not(.touch):hover,
+  .msg:focus-visible,
+  .msg:has(:focus-visible) {
+    content-visibility: visible;
+    z-index: var(--z-raised);
   }
 
   /* A long press on a touch screen is the message menu, not a word selected
