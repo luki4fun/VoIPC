@@ -14,8 +14,11 @@
   import { isWeb } from "../stores/platform.js";
   import { confirmAction } from "../stores/confirm.js";
   import { addNotification } from "../stores/notifications.js";
-  import { showMessage } from "../stores/channel-ui.js";
-  import { fileConvAt, fileProgress } from "../files.js";
+  import { settingsAsk, showMessage } from "../stores/channel-ui.js";
+  import { get } from "svelte/store";
+  import { fetchFile, fileConvAt, fileProgress, forgetProgress, newOp, saveFile } from "../files.js";
+  import { sniff } from "../file-sniff.js";
+  import { preview } from "../actions/preview.js";
   import {
     arrangeFiles,
     fileRows,
@@ -27,7 +30,7 @@
     type FileSection,
     type FileSort,
   } from "../file-index.js";
-  import { formatSize } from "../file-rules.js";
+  import { formatSize, PREVIEW_SIDE } from "../file-rules.js";
   import { needsNsfwConsent } from "../channel-post-rules.js";
   import type { ChatPlace } from "../chat-rules.js";
   import type { ChatMessage } from "../types.js";
@@ -47,12 +50,19 @@
   const PAGE = 100;
 
   let cache = $state.raw<{ cap: number; entries: CachedBlob[] } | null>(null);
+  let query = $state("");
+  /** One conversation only, as the chat's Files button asked; its chip clears it. */
+  let place = $state(get(settingsAsk)?.place ?? "");
+  settingsAsk.set(null);
   let filter = $state<FileFilter>("all");
   let sort = $state<FileSort>("date");
   let group = $state<FileGroup>("none");
   let limit = $state(PAGE);
   /** Rows whose card is open, by their message. Raw: looked up by identity. */
   let opened = $state.raw(new Set<ChatMessage>());
+  /** Copies picked to remove together, by blob: only while "On this device"
+   *  is shown, where every row has one. */
+  let picked = $state.raw(new Set<string>());
   let picture = $state.raw<{ url: string; name: string; save: () => void } | null>(null);
 
   async function reload() {
@@ -92,7 +102,7 @@
     return false;
   }
   const rows = $derived(fileRows($channelMessages, $dmMessages, cache?.entries ?? []).filter((r) => !behindGate(r)));
-  const sections = $derived(arrangeFiles(rows, { filter, sort, group }));
+  const sections = $derived(arrangeFiles(rows, { filter, sort, group, query, place }));
   const total = $derived(sections.reduce((n, s) => n + s.rows.length, 0));
   /** The sections as drawn: the first `limit` rows. */
   const drawn = $derived.by(() => {
@@ -108,11 +118,30 @@
   const used = $derived(cache?.entries.reduce((n, e) => n + e.bytes, 0) ?? 0);
   const usedShare = $derived(cache?.cap ? Math.min(1, used / cache.cap) : 0);
 
-  // A new view starts at its top
+  // A new view starts at its top, with nothing picked
   $effect(() => {
-    void [filter, sort, group];
+    void [filter, sort, group, query, place];
     limit = PAGE;
+    picked = new Set();
   });
+  /** The hashes of the copies shown now. */
+  const shownCopies = $derived([...new Set(sections.flatMap((s) => s.rows).flatMap((r) => (r.local === null ? [] : [r.file.hash])))]);
+  const allPicked = $derived(shownCopies.length > 0 && shownCopies.every((h) => picked.has(h)));
+
+  function pick(hash: string) {
+    const next = new Set(picked);
+    if (!next.delete(hash)) next.add(hash);
+    picked = next;
+  }
+
+  const FILTERS: [FileFilter, string][] = [
+    ["all", "All"],
+    ["image", "Pictures"],
+    ["video", "Videos"],
+    ["audio", "Sounds"],
+    ["other", "Other"],
+    ["local", `On this ${isWeb ? "tab" : "device"}`],
+  ];
 
   const KIND_LABEL: Record<FileKind, string> = { image: "Pictures", video: "Videos", audio: "Sounds", other: "Other files" };
 
@@ -150,6 +179,21 @@
     const next = new Set(opened);
     if (!next.delete(r.msg)) next.add(r.msg);
     opened = next;
+  }
+
+  /** Save the copy this device keeps; one it does not is saved from its card,
+   *  which shows the transfer. */
+  async function download(r: FileRow) {
+    const id = serverIdOf(r.place.server);
+    const op = newOp();
+    try {
+      const got = await fetchFile(id ?? r.place.server, { channel: 0 }, r.file, op);
+      await saveFile(got, r.file.name, sniff(got)?.mime);
+    } catch (e) {
+      addNotification(`The file could not be saved: ${e}`, "error");
+    } finally {
+      forgetProgress(op);
+    }
   }
 
   function go(r: FileRow) {
@@ -273,22 +317,27 @@
 
 <div class="section">
   <h4>Files in your chats</h4>
+  <div class="fm-search">
+    <Icon name="search" size={16} />
+    <input class="fm-query" type="search" placeholder="Name, sender, words or place" aria-label="Search files" bind:value={query} />
+  </div>
+  <div class="fm-chips" role="group" aria-label="Show">
+    {#if place}
+      {@const at = rows.find((r) => `${r.place.kind} ${r.place.key}` === place)?.place}
+      <button type="button" class="fm-chip" aria-pressed="true" onclick={() => (place = "")} title="Show every conversation's">
+        {at ? placeLabel(at) : "This conversation"} <Icon name="close" size={12} />
+      </button>
+    {/if}
+    {#each FILTERS as [id, label] (id)}
+      <button type="button" class="fm-chip" aria-pressed={filter === id} onclick={() => (filter = id)}>{label}</button>
+    {/each}
+  </div>
   <div class="fm-controls">
-    <label>
-      <span>Show</span>
-      <select bind:value={filter}>
-        <option value="all">All</option>
-        <option value="image">Pictures</option>
-        <option value="video">Videos</option>
-        <option value="audio">Sounds</option>
-        <option value="other">Other files</option>
-        <option value="local">On this {isWeb ? "tab" : "device"}</option>
-      </select>
-    </label>
     <label>
       <span>Sort by</span>
       <select bind:value={sort}>
         <option value="date">Date</option>
+        <option value="used">Recently used</option>
         <option value="size">Size</option>
         <option value="name">Name</option>
         <option value="sender">Sender</option>
@@ -303,7 +352,22 @@
         <option value="kind">Type</option>
       </select>
     </label>
+    <span class="fm-count num" role="status">{total === rows.length ? `${total} ${total === 1 ? "file" : "files"}` : `${total} of ${rows.length}`}</span>
   </div>
+
+  {#if filter === "local" && shownCopies.length > 0}
+    <div class="fm-bulk">
+      <label class="fm-pick-all">
+        <input type="checkbox" checked={allPicked} onchange={() => (picked = allPicked ? new Set() : new Set(shownCopies))} />
+        <span>All shown</span>
+      </label>
+      {#if picked.size > 0}
+        <button class="btn btn-danger-outline" type="button" onclick={(e) => remove([...picked], e.currentTarget.closest<HTMLElement>(".section"))}>
+          Remove {picked.size === 1 ? "1 copy" : `${picked.size} copies`}
+        </button>
+      {/if}
+    </div>
+  {/if}
 
   {#if total === 0}
     <p class="fm-hint">{rows.length === 0 ? "No message here carries a file." : "No file matches."}</p>
@@ -317,37 +381,55 @@
       {#each s.rows as r (r.msg)}
         {@const open = opened.has(r.msg)}
         <li class="fm-row">
-          <div class="fm-head">
-            <Icon name="file" size={16} />
-            <span class="fm-name" title={r.file.name}>{r.file.name}</span>
-            <span class="fm-size num">{formatSize(r.file.size)}</span>
-          </div>
-          <div class="fm-about">
-            {about(r)}{#if r.local !== null}<span class="fm-local"> · on this {isWeb ? "tab" : "device"}</span>{/if}
-          </div>
-          <div class="fm-actions">
-            <button class="btn-ghost" type="button" aria-expanded={open} onclick={() => toggle(r)} aria-label="{open ? 'Hide' : 'Show'} {r.file.name}">{open ? "Hide" : "Show"}</button>
-            <button class="btn-ghost" type="button" onclick={() => go(r)} aria-label="Go to the message with {r.file.name}">Go to message</button>
-            {#if r.local !== null}
-              <button
-                class="btn-ghost"
-                type="button"
-                onclick={(e) => remove([r.file.hash], e.currentTarget.closest("li"))}
-                aria-label="Remove {r.file.name} from this {isWeb ? 'tab' : 'device'}"
-              >Remove copy</button>
+          <div class="fm-line">
+            {#if filter === "local" && r.local !== null}
+              <input class="fm-pick" type="checkbox" checked={picked.has(r.file.hash)} onchange={() => pick(r.file.hash)} aria-label="Pick {r.file.name}" />
             {/if}
+            <span class="fm-thumb" aria-hidden="true">
+              {#if r.file.px}
+                <canvas width={PREVIEW_SIDE} height={PREVIEW_SIDE} use:preview={r.file.px}></canvas>
+              {:else}
+                <Icon name="file" size={16} />
+              {/if}
+            </span>
+            <button class="fm-main" type="button" aria-expanded={open} onclick={() => toggle(r)} title="{open ? 'Hide' : 'Show'} {r.file.name}">
+              <span class="fm-name">{r.file.name}</span>
+              <span class="fm-about">
+                {about(r)}{#if r.local !== null}<span class="fm-local"> · on this {isWeb ? "tab" : "device"}</span>{/if}
+              </span>
+            </button>
+            <span class="fm-size num">{formatSize(r.file.size)}</span>
+            <span class="fm-actions">
+              <button class="btn-ghost fm-go" type="button" onclick={() => go(r)} title="Go to message" aria-label="Go to the message with {r.file.name}">Go to</button>
+              {#if r.local !== null}
+                <button class="icon-btn" type="button" onclick={() => download(r)} title="Download" aria-label="Download {r.file.name}">
+                  <Icon name="download" size={16} />
+                </button>
+                <button
+                  class="icon-btn"
+                  type="button"
+                  onclick={(e) => remove([r.file.hash], e.currentTarget.closest("li"))}
+                  title="Remove copy"
+                  aria-label="Remove {r.file.name} from this {isWeb ? 'tab' : 'device'}"
+                >
+                  <Icon name="trash" size={16} />
+                </button>
+              {/if}
+            </span>
           </div>
           {#if open}
             {@const id = serverIdOf(r.place.server)}
-            <FileCard
-              file={r.file}
-              server={id ?? r.place.server}
-              conv={id && $openServers.includes(id) ? fileConvAt(id, r.place) : null}
-              onopen={(p) => (picture = p)}
-              ongone={(url) => {
-                if (picture?.url === url) picture = null;
-              }}
-            />
+            <div class="fm-card">
+              <FileCard
+                file={r.file}
+                server={id ?? r.place.server}
+                conv={id && $openServers.includes(id) ? fileConvAt(id, r.place) : null}
+                onopen={(p) => (picture = p)}
+                ongone={(url) => {
+                  if (picture?.url === url) picture = null;
+                }}
+              />
+            </div>
           {/if}
         </li>
       {/each}
@@ -413,11 +495,55 @@
     font-size: var(--fs-sm);
     color: var(--text-secondary);
   }
+  .fm-search {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    color: var(--text-secondary);
+  }
+  /* The look of Settings' selects (SettingsPanel), one row with them */
+  .fm-query {
+    flex: 1;
+    min-width: 0;
+    padding: 8px 12px;
+    font: inherit;
+    font-size: var(--fs-md);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+  }
+  .fm-query:focus {
+    outline: none;
+    border-color: var(--focus-ring);
+  }
+  .fm-chips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 8px;
+  }
+  /* SearchPane's scope buttons: on is ink, never the live mint */
+  .fm-chip {
+    padding: 4px 10px;
+    min-height: 28px;
+    border: 1px solid var(--border);
+    border-radius: var(--r-sm);
+    background: transparent;
+    color: var(--text-secondary);
+    font-size: var(--fs-sm);
+  }
+  .fm-chip[aria-pressed="true"] {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
   .fm-controls {
     display: flex;
     flex-wrap: wrap;
+    align-items: center;
     gap: 8px 16px;
-    margin-bottom: 12px;
+    margin-bottom: 8px;
   }
   .fm-controls label {
     display: flex;
@@ -426,8 +552,30 @@
     font-size: var(--fs-sm);
     color: var(--text-secondary);
   }
+  .fm-controls select {
+    width: auto;
+  }
+  .fm-count {
+    margin-left: auto;
+    font-size: var(--fs-sm);
+    color: var(--text-secondary);
+  }
+  .fm-bulk {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 16px;
+    margin-bottom: 4px;
+  }
+  .fm-pick-all {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--fs-sm);
+    color: var(--text-secondary);
+  }
   .fm-section {
-    margin: 12px 0 6px;
+    margin: 12px 0 4px;
     font-size: var(--fs-body);
     font-weight: 600;
     color: var(--text-primary);
@@ -442,41 +590,93 @@
     padding: 0;
   }
   .fm-row {
-    padding: 8px 0;
     border-bottom: 1px solid var(--border);
     min-width: 0;
   }
-  .fm-head {
+  /* One line of a row: preview, name over where it is from, size, actions.
+     On a narrow screen the actions go under it */
+  .fm-line {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 8px;
-    color: var(--text-secondary);
+    gap: 2px 8px;
+    padding: 2px 0;
     min-width: 0;
   }
-  .fm-name {
-    flex: 1;
+  .fm-thumb {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 24px;
+    height: 24px;
+    color: var(--text-secondary);
+  }
+  .fm-thumb canvas {
+    width: 24px;
+    height: 24px;
+    border-radius: 3px;
+  }
+  .fm-main {
+    flex: 1 1 180px;
     min-width: 0;
-    color: var(--text-primary);
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 1px;
+    padding: 4px 6px;
+    background: none;
+    border: none;
+    border-radius: var(--r-sm);
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+  }
+  .fm-main:hover {
+    background: var(--bg-hover);
+  }
+  .fm-name,
+  .fm-about {
+    max-width: 100%;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
+  }
+  .fm-name {
+    font-size: var(--fs-body);
+    color: var(--text-primary);
   }
   .fm-size,
   .fm-about {
     font-size: var(--fs-sm);
     color: var(--text-secondary);
   }
-  .fm-about {
-    margin: 2px 0 4px 24px;
-    overflow-wrap: anywhere;
+  .fm-size {
+    white-space: nowrap;
   }
   .fm-local {
     color: var(--text-primary);
   }
   .fm-actions {
     display: flex;
-    flex-wrap: wrap;
-    gap: 4px;
-    margin-left: 18px;
+    align-items: center;
+    gap: 2px;
+    margin-left: auto;
+  }
+  .fm-actions .icon-btn {
+    width: var(--icon-btn-size-sm);
+    height: var(--icon-btn-size-sm);
+    background: transparent;
+  }
+  .fm-actions .icon-btn:hover {
+    background: var(--bg-hover);
+    color: var(--text-primary);
+  }
+  .fm-go {
+    padding: 4px 8px;
+    font-size: var(--fs-sm);
+  }
+  .fm-card {
+    padding: 4px 0 8px 32px;
   }
 </style>

@@ -2389,9 +2389,11 @@ check(
   // ── Settings → Files: what the chat names, and what this tab keeps ──
   const fmRow = (name) => `[...document.querySelectorAll(".fm-row")].find((r) => r.querySelector(".fm-name")?.textContent === ${JSON.stringify(name)})`;
   const fmNames = (tab) => tab.evaluate(`[...document.querySelectorAll(".fm-row .fm-name")].map((e) => e.textContent).sort().join(",")`);
-  const fmShow = (tab, value) => tab.evaluate(`(() => { const s = document.querySelectorAll(".fm-controls select")[0]; s.value = ${JSON.stringify(value)};
-    s.dispatchEvent(new Event("change", { bubbles: true })); return true; })()`);
-  const fmPress = (tab, name, words) => tab.evaluate(`(() => { const b = [...(${fmRow(name)})?.querySelectorAll(".fm-actions button") ?? []].find((e) => e.textContent.trim() === ${JSON.stringify(words)});
+  const CHIP = { all: "All", local: "On this", other: "Other", image: "Pictures" };
+  const fmShow = (tab, value) => tab.evaluate(`[...document.querySelectorAll(".fm-chip")].find((b) => b.textContent.trim().startsWith(${JSON.stringify(CHIP[value])}))?.click() ?? false`);
+  // "Show" is the row's name; the rest are named by their title
+  const fmPress = (tab, name, words) => tab.evaluate(`(() => { const b = [...(${fmRow(name)})?.querySelectorAll("button") ?? []]
+    .find((e) => e.title === ${JSON.stringify(words)} || (${JSON.stringify(words)} === "Show" && e.classList.contains("fm-main")));
     if (!b) return false; b.click(); return true; })()`);
   const usedNow = (tab) => tab.evaluate(`document.querySelector(".fm-usage .num")?.textContent ?? ""`);
   // From another conversation, so going to a message has to open its own
@@ -2415,6 +2417,10 @@ check(
   await sleep(200);
   check("filtered by type, from what the message says", (await fmNames(ann)) === "notes.txt", await fmNames(ann));
   await fmShow(ann, "all");
+  await ann.evaluate(setInput(".fm-query", "ORIG"));
+  await sleep(200);
+  check("a search narrows the list to what it names, case aside", (await fmNames(ann)) === "orig.jpg", await fmNames(ann));
+  await ann.evaluate(setInput(".fm-query", ""));
   await sleep(200);
   await fmPress(ann, "notes.txt", "Remove copy");
   const removed = await waitFor(ann, `!${fmRow("notes.txt")}?.querySelector(".fm-local")`, 5_000).then(() => true, () => false);

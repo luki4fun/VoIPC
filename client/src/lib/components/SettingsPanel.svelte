@@ -64,6 +64,8 @@
   import Icon from "./Icons.svelte";
   import PaletteEditor from "./PaletteEditor.svelte";
   import FileManager from "./FileManager.svelte";
+  import { settingsAsk } from "../stores/channel-ui.js";
+  import { get } from "svelte/store";
   import LayoutPreview from "./LayoutPreview.svelte";
   import { uiPrefs, updateUiPrefs } from "../stores/ui-prefs.js";
   import { buildHash, buildLine, buildTime } from "../build-info.js";
@@ -81,7 +83,7 @@
   // What used to be one General tab of 25-30 controls and some twenty hints,
   // split by what somebody comes to Settings to do
   type Tab = "voice" | "appearance" | "sounds" | "privacy" | "files" | "games" | "about";
-  let activeTab = $state<Tab>("voice");
+  let activeTab = $state<Tab>(get(settingsAsk)?.tab ?? "voice");
 
   // The accounts this device signs in to without a password (1.0 audit H5-12)
   let remembered = $state<{ server: string; name: string }[]>([]);
@@ -1555,7 +1557,8 @@
     margin-bottom: 8px;
   }
 
-  select {
+  /* Every select in Settings, its tabs' own components' too (Files) */
+  .panel-body :global(select) {
     width: 100%;
     padding: 8px 28px 8px 12px;
     background-color: var(--bg-primary);
@@ -1565,7 +1568,7 @@
     font-size: var(--fs-md);
   }
 
-  select:focus {
+  .panel-body :global(select:focus) {
     border-color: var(--focus-ring);
   }
 

@@ -18,6 +18,8 @@
     all: ChatMessage[];
     /** Absent where nothing can be written here (a preview, an announcement channel). */
     onsend?: (content: string, refs: { replyTo: string; thread: string }) => void;
+    /** Absent where files cannot go here; as the composer's, with this thread's refs. */
+    onsendfile?: (file: File, original: boolean, caption: string, op: string, refs: { replyTo: string; thread: string }) => Promise<void>;
     onlink: (url: string) => void;
     onclose: () => void;
     /** A quoted message that is not in this thread: the conversation shows it. */
@@ -42,6 +44,7 @@
     answers,
     all,
     onsend,
+    onsendfile,
     onlink,
     onclose,
     onjumpelsewhere,
@@ -99,6 +102,13 @@
     onsend?.(content, { replyTo: target.id!, thread: root.id! });
   }
 
+  /** A file into the thread: the first one answers what was being answered. */
+  function sendFile(file: File, original: boolean, caption: string, op: string): Promise<void> {
+    const target = replyingTo ?? root;
+    replyingTo = null;
+    return onsendfile!(file, original, caption, op, { replyTo: target.id!, thread: root.id! });
+  }
+
   function reply(m: ChatMessage) {
     replyingTo = m === root ? null : m;
     composer?.focus();
@@ -131,6 +141,7 @@
       {held}
       {mentionables}
       onsend={send}
+      onsendfile={onsendfile ? sendFile : undefined}
       replying={replyingTo?.username ?? null}
       oncancelreply={() => (replyingTo = null)}
     />

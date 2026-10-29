@@ -153,6 +153,7 @@
     managesChannel,
     openJoinedTextChannel,
     previewChannel,
+    settingsAsk,
   } from "./lib/stores/channel-ui.js";
   import {
     chatEvent,
@@ -246,6 +247,9 @@
   }
 
   let showSettings = $state(false);
+  $effect(() => {
+    if ($settingsAsk) showSettings = true;
+  });
 
   // Deferred auto-connect: waits for chat history to be unlocked first
   let pendingAutoConnect = $state<SavedServer[] | null>(null);

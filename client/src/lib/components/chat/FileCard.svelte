@@ -8,7 +8,8 @@
   import { onDestroy, tick, untrack } from "svelte";
   import type { FileConv, FileRef } from "../../types.js";
   import { FILE_UNAVAILABLE, cancelFile, fetchFile, fileProgress, forgetProgress, newOp, saveFile } from "../../files.js";
-  import { formatSize, previewPixels, PREVIEW_SIDE } from "../../file-rules.js";
+  import { formatSize, PREVIEW_SIDE } from "../../file-rules.js";
+  import { preview } from "../../actions/preview.js";
   import { sniff, type Shown } from "../../file-sniff.js";
   import Icon from "../Icons.svelte";
 
@@ -49,16 +50,6 @@
   const progress = $derived(op ? $fileProgress.get(op) : undefined);
   const seeking = $derived(progress?.stage === "seeking");
   const percent = $derived(progress && progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0);
-
-  /** Draw the preview's raw pixels: an ImageData, no decoder. */
-  function paint(canvas: HTMLCanvasElement, px: string | undefined) {
-    const draw = (p: string | undefined) => {
-      const rgba = p ? previewPixels(p) : null;
-      if (rgba) canvas.getContext("2d")?.putImageData(new ImageData(rgba, PREVIEW_SIDE, PREVIEW_SIDE), 0, 0);
-    };
-    draw(px);
-    return { update: draw };
-  }
 
   /** Its buttons change under the pointer: keep the focus in the card. */
   async function keepFocus() {
@@ -161,7 +152,7 @@
   {:else if media && !bytes}
     <div class="file-media file-preview" class:sound style={sound ? undefined : `aspect-ratio: ${aspect}`}>
       {#if file.px}
-        <canvas width={PREVIEW_SIDE} height={PREVIEW_SIDE} use:paint={file.px} aria-hidden="true"></canvas>
+        <canvas width={PREVIEW_SIDE} height={PREVIEW_SIDE} use:preview={file.px} aria-hidden="true"></canvas>
       {/if}
       <div class="file-over">
         {#if op}

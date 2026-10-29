@@ -62,6 +62,7 @@
     me,
     notePost,
     messageJump,
+    settingsAsk,
     showMessage,
     nsfwConsented,
     setDmMessageTtl,
@@ -627,12 +628,13 @@
    * smaller unless `original`), sealed and stored on the relay (progress under
    * `op`), then the message, to where it was written. Throws for the composer
    * to show; `CannotClean` asks the person about sending the original.
+   * `refs` come from the thread pane, else the main composer's answer counts.
    */
-  async function sendFileMessage(file: File, original: boolean, caption: string, op: string): Promise<void> {
+  async function sendFileMessage(file: File, original: boolean, caption: string, op: string, refs?: { replyTo: string; thread: string }): Promise<void> {
     const t = targetNow();
     const conv = fileConvOf(t);
     if (!conv) throw new Error("Files cannot be sent to them now");
-    const answering = replyingTo;
+    const answering = refs ? null : replyingTo;
     const ready = await prepare(file, original);
     const max = get(fileLimits.peek(t.server))?.max_bytes;
     // Deflate may shrink a file; what is compressed already will not
@@ -641,9 +643,11 @@
     }
     const blob = await sendFile(t.server, conv, ready.bytes, ready.compress, op);
     // The answer goes with the first file that goes; a failure keeps it
-    if (replyingTo === answering) replyingTo = null;
+    if (answering && replyingTo === answering) replyingTo = null;
     const { bytes: _, compress: __, ...about } = ready;
-    if (!(await sendTo(t, caption, answering?.id ?? null, answering?.thread ?? null, { ...blob, ...about }))) {
+    const replyTo = refs?.replyTo ?? answering?.id ?? null;
+    const thread = refs?.thread ?? answering?.thread ?? null;
+    if (!(await sendTo(t, caption, replyTo, thread, { ...blob, ...about }))) {
       throw new Error("Not sent");
     }
   }
@@ -955,6 +959,14 @@
         aria-expanded={searching}
       ><Icon name="search" size={16} /></button>
     {/if}
+    {#if displayMessages.some((m) => m.file) && !gated}
+      <button
+        class="clear-chat-btn"
+        onclick={() => settingsAsk.set({ tab: "files", place: `${isDmMode ? "dm" : "channel"} ${currentKey}` })}
+        title="Files in this conversation"
+        aria-label="Files in this conversation"
+      ><Icon name="paperclip" size={16} /></button>
+    {/if}
     {#if displayMessages.length > 0 && !isLobby}
       <button
         class="clear-chat-btn"
@@ -1104,6 +1116,7 @@
       all={displayMessages}
       {held}
       onsend={canAnswer ? sendMessage : undefined}
+      onsendfile={canAnswer && canSendFiles ? sendFileMessage : undefined}
       onlink={(url) => (linkPopupUrl = url)}
       onclose={() => (threadRoot = null)}
       onjumpelsewhere={showInMain}
