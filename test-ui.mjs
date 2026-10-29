@@ -874,6 +874,23 @@ check(
     await alice.evaluate(`!!document.activeElement?.classList.contains("settings-btn")`),
   );
 
+  // Settings' tabs move with the arrow keys (R5-11), and About carries the
+  // third-party notices this build serves beside the page (R4-09)
+  const tab = (name) => `[...document.querySelectorAll('[role="tab"]')].find((e) => e.textContent.trim() === ${JSON.stringify(name)})`;
+  await realClick(alice, ".settings-btn");
+  await waitFor(alice, tab("About"));
+  await alice.evaluate(`${tab("About")}.click()`);
+  await waitFor(alice, `document.querySelector("details.notices summary")`, 5_000).catch(() => {});
+  await realClick(alice, "details.notices summary");
+  const notices = await waitFor(alice, `document.querySelector(".notices-text")?.textContent.length > 1000`, 10_000).then(() => true, () => false);
+  check("About shows the third-party notices", notices,
+    await alice.evaluate(`document.querySelector("details.notices")?.innerText.slice(0, 200) ?? "no notices section"`));
+  await alice.evaluate(`${tab("About")}.focus()`);
+  await press("ArrowLeft", "ArrowLeft", 37);
+  const moved = await alice.evaluate(`document.querySelector('[role="tab"][aria-selected="true"]')?.textContent.trim()`);
+  check("ArrowLeft moves to the tab before it", moved !== "About" && moved === (await alice.evaluate(`document.activeElement?.textContent.trim()`)), moved);
+  await press("Escape", "Escape", 27);
+
   const row = `document.querySelector(".channel-row:has(.settings-icon) > .channel")`;
   if (await alice.evaluate(`!!${row}`)) {
     await alice.evaluate(`${row}.focus()`);
@@ -1775,6 +1792,48 @@ check(
   check("stopping the share takes the preview away", !(await host.evaluate(`!!document.querySelector(".share-preview")`)));
   check("and the viewer's stream view closes", !(await guest.evaluate(`!!document.querySelector(".stream-stage")`)));
 
+  // ── A share this browser cannot decode, watched while sharing (B1-N1) ──
+  // It is said with the same event that a share of our own refused comes
+  // with, and it used to end ours too. The decoder probe saying no to every
+  // codec stands in for a browser without one (Firefox and H.265).
+  await guest.evaluate(`(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 320; canvas.height = 180;
+    const ctx = canvas.getContext("2d");
+    let f = 0;
+    setInterval(() => { f++; ctx.fillStyle = "hsl(" + (f * 13) % 360 + ", 60%, 40%)"; ctx.fillRect(0, 0, 320, 180); }, 66);
+    navigator.mediaDevices.getDisplayMedia = async () => canvas.captureStream(15);
+    return true; })()`);
+  // A fresh stream for the host's second share: the first one's track ended with it
+  await host.evaluate(`(() => { const canvas = document.createElement("canvas"); canvas.width = 320; canvas.height = 180;
+    const ctx = canvas.getContext("2d"); let f = 0;
+    setInterval(() => { f++; ctx.fillStyle = "hsl(" + (f * 7) % 360 + ", 60%, 40%)"; ctx.fillRect(0, 0, 320, 180); }, 66);
+    navigator.mediaDevices.getDisplayMedia = async () => canvas.captureStream(15); return true; })()`);
+  await realClick(guest, '.share-btn[title="Share your screen"]');
+  await waitFor(guest, `document.querySelector(".start-btn")`, 8_000).catch(() => {});
+  await realClick(guest, ".start-btn");
+  const ownShare = await waitFor(guest, `document.querySelector(".share-btn.active")`, 10_000).then(() => true, () => false);
+  await realClick(host, ".voice-panel .share-btn");
+  await waitFor(host, `document.querySelector(".start-btn")`, 8_000).catch(() => {});
+  await realClick(host, ".start-btn");
+  const hostWatch = `.users .user:has(.name[title^="ui-host-${n}"]) button.status-icon.watch`;
+  await waitFor(guest, `document.querySelector(${JSON.stringify(hostWatch)})`, 10_000).catch(() => {});
+  await guest.evaluate(`(() => { window.__probe = VideoDecoder.isConfigSupported;
+    VideoDecoder.isConfigSupported = async (config) => ({ supported: false, config }); return true; })()`);
+  await hover(guest, hostWatch);
+  await realClick(guest, hostWatch);
+  const told = await waitFor(guest, `(window.__toasts ?? []).some((t) => /cannot decode/.test(t))`, 10_000).then(() => true, () => false);
+  await sleep(1000);
+  check(
+    "a share this browser cannot decode is said so, and our own share goes on",
+    ownShare && told && (await guest.evaluate(`!!document.querySelector(".share-btn.active")`)),
+    await guest.evaluate(`JSON.stringify({ ownShare: ${ownShare}, sharing: !!document.querySelector(".share-btn.active"), toasts: window.__toasts?.slice(-3) })`),
+  );
+  await guest.evaluate(`(() => { if (window.__probe) VideoDecoder.isConfigSupported = window.__probe; return true; })()`);
+  await realClick(guest, ".share-btn.active");
+  await realClick(host, ".voice-panel .share-btn.active");
+  await sleep(1200);
+
   for (const [who, tab] of [["sharer", host], ["viewer", guest]]) {
     const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));
     check(`the ${who} threw nothing`, fatal.length === 0, fatal.slice(0, 2).join(" | "));
@@ -1782,6 +1841,63 @@ check(
   // The profile is shared by every tab: leave it in the layout the rest of
   // this file expects of a fresh connect.
   await useLayout(host, "classic");
+
+  // ── An invite link: a voice channel shows, then asks; a text one opens (S-048) ──
+  // The link is somebody else's idea, and a voice channel is a seat with a
+  // microphone: following it is no reason to be put in the call.
+  const NOTES = `notes-${n}`;
+  await host.evaluate(click('button[title="Create channel"]'));
+  await waitFor(host, `document.querySelector(".create-form")`);
+  await host.evaluate(setInput(".create-form input[type=text]", NOTES));
+  await host.evaluate(click('.create-form input[data-kind="text"]'));
+  await sleep(300);
+  await host.evaluate(click(".create-form .create-btn"));
+  await sleep(2000);
+  // Connected through the dialog of a page opened on the link. The first-run
+  // dialogs are answered after the question, which a new user gets on top
+  const byInvite = async (name, channel) => {
+    const tab = await newTab();
+    await tab.send("Page.navigate", { url: `${URL}#channel=${encodeURIComponent(channel)}` });
+    await waitFor(tab, `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`);
+    if (await tab.evaluate(`!!document.querySelector(".skip-link")`)) {
+      await tab.evaluate(click(".skip-link"));
+      await waitFor(tab, `document.querySelector(".connect-btn")`);
+    }
+    await tab.evaluate(setInput('input[placeholder="localhost"]', "127.0.0.1"));
+    await tab.evaluate(setInput('input[placeholder="9987"]', PORT));
+    await tab.evaluate(setInput('input[placeholder="Your name"]', name));
+    await tab.evaluate(click(".connect-btn"));
+    await waitFor(tab, `!document.querySelector(".connect-btn")`);
+    return tab;
+  };
+  const confirmTitle = `document.querySelector(".confirm .dialog-title")?.textContent ?? ""`;
+  const inVoice = `!!document.querySelector(".leave-voice-btn")`;
+  const no = await byInvite(`ui-inv-${n}`, SHOW);
+  const asked = await waitFor(no, `${confirmTitle} === ${JSON.stringify(`Join voice in ${SHOW}?`)}`, 10_000).then(() => true, () => false);
+  check("an invite link to a voice channel asks before it seats you", asked && !(await no.evaluate(inVoice)), await no.evaluate(confirmTitle));
+  check("and shows the channel meanwhile", await no.evaluate(`document.querySelector(".join-voice-btn")?.textContent.includes(${JSON.stringify(SHOW)}) ?? false`),
+    await no.evaluate(`document.querySelector(".chat-header")?.textContent.trim().slice(0, 120) ?? "no chat header"`));
+  await no.evaluate(`[...document.querySelectorAll(".confirm button")].find((b) => b.textContent.trim() === "Cancel")?.click()`);
+  await answerFirstRun(no, "invited");
+  await sleep(500);
+  check("Cancel leaves you out of voice", asked && !(await no.evaluate(`!!document.querySelector(".confirm")`)) && !(await no.evaluate(inVoice)));
+  const yes = await byInvite(`ui-inv2-${n}`, SHOW);
+  await waitFor(yes, `${confirmTitle}.startsWith("Join voice")`, 10_000).catch(() => {});
+  await yes.evaluate(`[...document.querySelectorAll(".confirm button")].find((b) => b.textContent.trim() === "Join voice")?.click()`);
+  await answerFirstRun(yes, "seated");
+  check("Join voice seats you in it", await waitFor(yes, `${inVoice} && [...document.querySelectorAll(".channel.active .channel-name")].some((e) => e.textContent === ${JSON.stringify(SHOW)})`, 10_000)
+    .then(() => true, () => false));
+  const text = await byInvite(`ui-inv3-${n}`, NOTES);
+  await answerFirstRun(text, "text-invited");
+  const opened = await waitFor(text, `document.querySelector(".chat-title")?.textContent.includes(${JSON.stringify(NOTES)}) && !!document.querySelector(".chat-main .input-bar .chat-input")`, 10_000)
+    .then(() => true, () => false);
+  check("an invite link to a text channel opens it, with nothing to ask", opened && !(await text.evaluate(`!!document.querySelector(".confirm")`)) && !(await text.evaluate(inVoice)),
+    await text.evaluate(`(document.querySelector(".chat-title")?.textContent ?? "no title") + " | " + ${confirmTitle}`));
+  for (const [who, tab] of [["invited", no], ["seated", yes], ["text-invited", text]]) {
+    const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));
+    check(`the ${who} tab threw nothing`, fatal.length === 0, fatal.slice(0, 2).join(" | "));
+    await tab.send("Page.close").catch(() => {});
+  }
 }
 
 // 19. Chat: markdown, replies and threads (1.2). The rules — what markdown may
@@ -2078,6 +2194,68 @@ check(
   check("a message past 16 KiB arrives cut to 16 KiB", (await arrived(ben, "longzzz")) &&
     (await ben.evaluate(`${rowWith("longzzz")}?.querySelector(".msg-content")?.textContent.trim().length === 16 * 1024`)),
     String(await ben.evaluate(`${rowWith("longzzz")}?.querySelector(".msg-content")?.textContent.trim().length`)));
+
+  // The channel's own settings, from its row's gear: `set` runs in the dialog
+  const settings = async (set) => {
+    await ann.evaluate(`(() => { const row = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(ROOM)});
+      row?.parentElement?.querySelector('[title="Channel settings"]')?.dispatchEvent(new MouseEvent("click", { bubbles: true })); return true; })()`);
+    await waitFor(ann, `document.querySelector('select[data-opt="message-ttl"]')`, 5_000).catch(() => {});
+    await ann.evaluate(set);
+    await ann.evaluate(`document.querySelector('select[data-opt="message-ttl"]')?.closest("form")?.querySelector(".create-btn")?.dispatchEvent(new MouseEvent("click", { bubbles: true }))`);
+    await sleep(1200);
+  };
+  const timer = (words) => `(() => { const el = document.querySelector('select[data-opt="message-ttl"]');
+    el.selectedIndex = [...el.options].findIndex((o) => o.textContent.includes(${JSON.stringify(words)}));
+    el.dispatchEvent(new Event("change", { bubbles: true })); })()`;
+  const timerShown = (words) => waitFor(ann, `document.querySelector(".chat-main .ttl-label")?.textContent.includes(${JSON.stringify(words)})`, 10_000).catch(() => {});
+
+  // ── An edit lives no longer than what is left of its message (R3-06) ──
+  // It carries the new text, and in a kept log it must not outlast the
+  // message it changes, however long the channel's timer is by then. Read in
+  // what the reader's page is handed for each event: the event bus copies
+  // every payload for its listeners (web/backend/events.ts `emit`), and the
+  // copy taken here changes nothing.
+  await settings(timer("5 minutes"));
+  await timerShown("5 minutes");
+  await say(ann, "short-lived words");
+  await arrived(ben, "short-lived words");
+  await settings(timer("1 hour"));
+  await timerShown("1 hour");
+  await ben.evaluate(`(() => { const copy = window.__clone = structuredClone; window.__events = [];
+    window.structuredClone = (v, o) => { const d = v?.data; if (d?.event != null) window.__events.push({ ttl: d.ttl_secs ?? null, event: d.event }); return copy(v, o); };
+    return true; })()`);
+  await useTool(ann, "short-lived words", "Edit");
+  await ann.evaluate(`(() => { const t = document.querySelector(".chat-main .edit-input"); if (!t) return false;
+    t.value = "short-lived words, edited"; t.dispatchEvent(new Event("input", { bubbles: true })); t.focus(); return true; })()`);
+  await ann.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" });
+  await ann.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  await waitFor(ben, `${rowWith("short-lived words, edited")}?.querySelector(".edited")`, 10_000).catch(() => {});
+  const edits = await ben.evaluate(`window.__events.filter((e) => e.event?.kind === "edit")`);
+  check("an edit's timer is what is left of its message's, not the channel's longer one",
+    edits.length === 1 && edits[0].ttl > 0 && edits[0].ttl <= 300, JSON.stringify(edits));
+  await ben.evaluate(`(() => { window.structuredClone = window.__clone; return true; })()`);
+
+  // ── Behind an 18+ gate, search finds nothing (R2-15) ──
+  // What the pane hides is not searched either: here, nor everywhere
+  const search = async (scope, words) => {
+    await ben.evaluate(`document.querySelector(".search-pane") || document.querySelector(".chat-main .search-btn, .search-btn")?.click()`);
+    await waitFor(ben, `document.querySelector(".search-pane .search-input")`, 5_000).catch(() => {});
+    await ben.evaluate(`[...document.querySelectorAll(".search-pane .scope")].find((b) => b.textContent.trim() === ${JSON.stringify(scope)})?.click()`);
+    await ben.evaluate(setInput(".search-pane .search-input", words));
+    await sleep(600);
+    const found = await ben.evaluate(`[...document.querySelectorAll(".search-pane .result")].map((e) => e.textContent.slice(0, 80))`);
+    await ben.evaluate(`document.querySelector(".search-pane .search-close")?.click()`);
+    await sleep(200);
+    return found;
+  };
+  const before18 = await search("Everywhere", "bold move");
+  await settings(`document.querySelector('.password-dialog input[data-opt="nsfw"]')?.click()`);
+  const gate = await waitFor(ben, `document.querySelector(".chat-main .nsfw-gate")`, 10_000).then(() => true, () => false);
+  const here = await search("This conversation", "bold move");
+  const everywhere = await search("Everywhere", "bold move");
+  check("an 18+ channel nobody here said yes to: This conversation finds nothing behind its gate",
+    gate && before18.length > 0 && here.length === 0, JSON.stringify({ gate, before18, here }));
+  check("and Everywhere leaves it out", gate && before18.length > 0 && everywhere.length === 0, JSON.stringify({ everywhere }));
 
   for (const [who, tab] of [["writer", ann], ["reader", ben]]) {
     const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));
@@ -2397,6 +2575,24 @@ check(
   check("Enter saves the edit, and the box goes", await waitFor(ann, `!document.querySelector(".chat-main .edit-input") && !!${rowWith("a typo here")}`, 5_000).then(() => true, () => false));
   check("the edit reaches the reader, marked (edited), in place of the old text",
     (await waitFor(ben, `${rowWith("a typo here")}?.querySelector(".edited")`, 10_000).then(() => true, () => false)) && !(await ben.evaluate(`!!${rowWith("hree")}`)));
+
+  // A press on Save leaves the focus in the box until it saves: on a phone the
+  // keyboard stays up, so Save does not move from under the finger (D3-01)
+  await say(ann, "press save here");
+  await arrived(ann, "press save here");
+  await useTool(ann, "press save here", "Edit");
+  await ann.evaluate(`(() => { const t = document.querySelector(".chat-main .edit-input"); t.value = "pressed save here"; t.dispatchEvent(new Event("input", { bubbles: true })); t.focus(); })()`);
+  const save = await ann.evaluate(`(() => { const b = [...document.querySelectorAll(".chat-main .edit-box button")].find((e) => e.textContent.trim() === "Save");
+    if (!b) return null; const r = b.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+  let keptFocus = false;
+  if (save) {
+    await ann.send("Input.dispatchMouseEvent", { type: "mousePressed", x: save.x, y: save.y, button: "left", clickCount: 1, buttons: 1 });
+    keptFocus = await ann.evaluate(`document.activeElement?.classList.contains("edit-input") ?? false`);
+    await ann.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: save.x, y: save.y, button: "left", clickCount: 1 });
+  }
+  check("pressing Save keeps the focus in the box, and the edit is saved",
+    keptFocus && (await waitFor(ann, `!document.querySelector(".chat-main .edit-input") && !!${rowWith("pressed save here")}`, 5_000).then(() => true, () => false)),
+    save ? `focus was on ${keptFocus ? "the box" : "something else"}` : "no Save button");
 
   // ── A delete: confirmed first, then gone for everyone ──
   await say(ann, "delete me soon");
@@ -3003,14 +3199,64 @@ if (PORT3) {
   );
   await clash.send("Page.close").catch(() => {});
 
-  // Forgot the password: the recovery key sets a new one, and the dialog
-  // signs in with it at once.
+  // A new recovery key, from the account panel (S-006): the password is asked
+  // for, the key is shown only once the relay took it, and the old one stops
+  // working.
+  const keyNew = await openDialog();
+  await keyNew.evaluate(setInput("#account-name", acctB));
+  await waitFor(keyNew, `document.querySelector("#account-password")?.placeholder?.includes("remembered")`);
+  await realClick(keyNew, ".connect-btn");
+  await settle(keyNew);
+  await waitFor(keyNew, `document.querySelector('${panel}')`, 10_000);
+  await realClick(keyNew, panel);
+  await waitFor(keyNew, `document.querySelector('.account-dialog[data-kind="account"]')`);
+  await keyNew.evaluate(`[...document.querySelectorAll('.account-dialog[data-kind="account"] .row')].find((r) => r.textContent.includes("Recovery key"))?.querySelector("button")?.click()`);
+  await waitFor(keyNew, `document.querySelector('.account-dialog[data-kind="recovery-new"] #acct-recovery-password')`, 10_000).catch(() => {});
+  await keyNew.evaluate(setInput("#acct-recovery-password", "not the password at all"));
+  await realClick(keyNew, '.account-dialog[data-kind="recovery-new"] .submit-btn');
+  const wrongNew = await waitFor(keyNew, `document.querySelector('.account-dialog[data-kind="recovery-new"] .error')`, 30_000).then(() => true, () => false);
+  check(
+    "a new recovery key asks for the password: a wrong one is refused there, and no key is shown",
+    wrongNew && !(await keyNew.evaluate(`!!document.querySelector('.account-dialog[data-kind="recovery"]')`)),
+    await keyNew.evaluate(`document.querySelector(".account-dialog")?.innerText.slice(0, 300) ?? "no dialog"`),
+  );
+  await keyNew.evaluate(setInput("#acct-recovery-password", pw));
+  await realClick(keyNew, '.account-dialog[data-kind="recovery-new"] .submit-btn');
+  await waitFor(keyNew, `document.querySelector('.account-dialog[data-kind="recovery"] .secret')`, 30_000).catch(() => {});
+  const keyB2 = await keyNew.evaluate(`document.querySelector('.account-dialog[data-kind="recovery"] .secret')?.textContent ?? ""`);
+  const keyHead = await keyNew.evaluate(`document.querySelector('.account-dialog[data-kind="recovery"] h2')?.textContent ?? ""`);
+  check(
+    "the right one shows the new key, and says it is the new one",
+    /^[A-Z2-7]{4}(-[A-Z2-7]{1,4}){12}$/.test(keyB2) && keyB2 !== keyB && /new recovery key/.test(keyHead),
+    `${keyHead} | ${keyB2}`,
+  );
+  await realClick(keyNew, '.account-dialog[data-kind="recovery"] .submit-btn');
+  await keyNew.send("Page.close").catch(() => {});
+  const stale = await openDialog();
+  await stale.evaluate(setInput("#account-name", acctB));
+  await realClick(stale, ".link-btn");
+  await waitFor(stale, `document.querySelector("#account-recovery")`);
+  await stale.evaluate(setInput("#account-recovery", keyB));
+  await stale.evaluate(setInput("#account-password", "reset with the old key"));
+  await stale.evaluate(setInput("#account-password2", "reset with the old key"));
+  await realClick(stale, ".connect-btn");
+  const staleOut = await waitFor(stale, `/does not open this account/.test(document.querySelector(".error")?.textContent ?? "") || !!document.querySelector('${panel}')`, 60_000)
+    .then(() => true, () => false);
+  check(
+    "and the old recovery key no longer resets the password",
+    staleOut && !(await stale.evaluate(`!!document.querySelector('${panel}')`)),
+    await stale.evaluate(`document.querySelector(".error")?.textContent ?? ""`),
+  );
+  await stale.send("Page.close").catch(() => {});
+
+  // Forgot the password: the recovery key (the new one) sets a new password,
+  // and the dialog signs in with it at once.
   const pw3 = "reset with the recovery key";
   const six = await openDialog();
   await six.evaluate(setInput("#account-name", acctB));
   await realClick(six, ".link-btn");
   await waitFor(six, `document.querySelector("#account-recovery")`);
-  await six.evaluate(setInput("#account-recovery", keyB));
+  await six.evaluate(setInput("#account-recovery", keyB2 || keyB));
   await six.evaluate(setInput("#account-password", pw3));
   await six.evaluate(setInput("#account-password2", pw3));
   await realClick(six, ".connect-btn");
@@ -3053,7 +3299,7 @@ if (PORT3) {
   await realClick(guest, ".connect-btn");
   await waitFor(guest, `/Wrong username or password/.test(document.querySelector(".error")?.textContent ?? "")`, 30_000);
   check("a wrong password is refused", true);
-  const fatal = [...up.errors, ...back.errors, ...two.errors, ...bobAgain.errors, ...aliceAgain.errors, ...three.errors, ...four.errors, ...five.errors, ...clash.errors, ...six.errors, ...guest.errors].filter(
+  const fatal = [...up.errors, ...back.errors, ...two.errors, ...bobAgain.errors, ...aliceAgain.errors, ...three.errors, ...four.errors, ...five.errors, ...clash.errors, ...keyNew.errors, ...stale.errors, ...six.errors, ...guest.errors].filter(
     (e) => !/Failed to load resource/.test(e),
   );
   check("the accounts lane threw nothing", fatal.length === 0, fatal.slice(0, 2).join(" | "));

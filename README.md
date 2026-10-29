@@ -194,7 +194,8 @@ of showing a black frame.
 
 **Web client (browser)**
 
-The server hosts the web client itself: open `https://your-server:9987` and you get the same
+The server hosts the web client itself: open its address on port 9987 in a browser (the public
+demo: <https://ivy.l4f.cc:9987>) and you get the same
 UI as the desktop app, with the Signal Protocol and AES-256-GCM media crypto compiled to
 WebAssembly. Needs Chrome 97+, Edge 98+, Firefox 130+, or Safari 26.4+ (WebTransport + WebCodecs);
 Chromium and Firefox are both covered by the end-to-end test, including sharing a screen and
@@ -367,14 +368,15 @@ VoIPC/
 # Build
 cargo build -p voipc-server --release
 
-# Generate self-signed TLS certificate (browsers check the subjectAltName —
-# put the host name / IP your users will type)
+# Generate self-signed TLS certificate for this machine's name and address
+# (browsers check them: set HOST and IP to the public ones if they differ)
+HOST=$(hostname -f) IP=$(ip route get 1 | grep -o 'src [0-9.]*' | cut -d' ' -f2)
 mkdir -p certs
 openssl req -x509 -newkey ec \
   -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout certs/server.key -out certs/server.crt \
   -days 365 -nodes -subj "/CN=voipc" \
-  -addext "subjectAltName=DNS:your-server.example,IP:203.0.113.5"
+  -addext "subjectAltName=DNS:$HOST,IP:$IP"
 
 # Run
 ./target/release/voipc-server
@@ -413,7 +415,7 @@ max_age_hours = 24         # no blob stays longer; all of them go at every start
 > it is in use. Desktop and Android clients dial the fallback on the port they were given,
 > so keep `tcp_port` equal to `udp_port`.
 
-> **VPN / multi-homed setups:** If clients connect via a domain name (e.g. `vpn.example.com`) that resolves to a specific IP, set `host` to that IP. Otherwise the server may send QUIC packets from the wrong interface and the handshake never completes. Some options can also be passed as CLI flags (`--host`, `--tcp-port`, `--udp-port`, etc.; `voipc-server --help` lists them).
+> **VPN / multi-homed setups:** If clients connect via a domain name that resolves to a specific IP, set `host` to that IP. Otherwise the server may send QUIC packets from the wrong interface and the handshake never completes. Some options can also be passed as CLI flags (`--host`, `--tcp-port`, `--udp-port`, etc.; `voipc-server --help` lists them).
 
 Runtime settings in `server_settings.json`:
 
@@ -528,11 +530,8 @@ See [BUILDING.md](BUILDING.md) for detailed platform-specific instructions and d
 
 ### Web client
 
-Nothing to install: point a browser at the server.
-
-```
-https://your-server:9987
-```
+Nothing to install: point a browser at the server's address on port 9987, as with the public
+demo, <https://ivy.l4f.cc:9987>.
 
 The server binary serves the web client over HTTP/2 and carries voice, video and control
 messages over WebTransport on the same UDP port the desktop app uses (**9987**) — no extra
@@ -678,7 +677,8 @@ does so under those terms as well:
 
 Every build carries `THIRD-PARTY-NOTICES.txt` beside its page: each Rust crate and npm package
 in it, the licence VoIPC uses it under, and the copyright and licence texts those licences ask
-a binary to carry. A relay serves it at `https://your-server:9987/THIRD-PARTY-NOTICES.txt`.
+a binary to carry. A relay serves it at `/THIRD-PARTY-NOTICES.txt` on its port (the demo's:
+<https://ivy.l4f.cc:9987/THIRD-PARTY-NOTICES.txt>).
 `node tools/voipc.mjs notices` writes it into `client/public/`, and every build does so before
 Vite copies it into the bundle.
 

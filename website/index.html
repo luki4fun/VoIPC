@@ -356,7 +356,7 @@
     <section id="top" aria-labelledby="hero-title">
       <div class="refresh">
         <table class="list">
-          <caption class="sr-only">Example servers; the first one is selected and opened</caption>
+          <caption class="sr-only">The public demo server, selected and opened</caption>
           <thead>
             <tr>
               <th class="flag sel" scope="col"><span class="sr-only">Selected</span></th>
@@ -372,12 +372,12 @@
           <tbody>
             <tr class="selected">
               <td class="flag sel"><svg class="caret" aria-hidden="true"><use href="#i-caret"/></svg></td>
-              <td class="flag"><svg class="icon" role="img" aria-label="Password"><use href="#i-lock"/></svg></td>
+              <td class="flag"></td>
               <td class="flag live"><svg class="icon" role="img" aria-label="End-to-end encrypted"><use href="#i-shield"/></svg></td>
-              <td class="name"><b>your-friends.example<span class="port">:9987</span></b><small>yours: one binary on a box at home</small></td>
-              <td class="mode">Voice · Share · Chat</td>
-              <td class="players num live">4/64</td>
-              <td class="ping num live" data-ping>12&nbsp;ms</td>
+              <td class="name"><b>ivy.l4f.cc<span class="port">:9987</span></b><small>the public demo, run by the VoIPC project: try it</small></td>
+              <td class="mode">Voice · Share · Chat · Files</td>
+              <td class="players num" title="A relay publishes no count of who is on it">—</td>
+              <td class="ping num live" data-ping="https://ivy.l4f.cc:9987/wt.json" title="Measured from your browser">—</td>
               <td class="go"><a class="row-join" id="join" href="https://github.com/luki4fun/voipc/releases/latest"><span id="join-label">Join</span><span class="join-os" id="join-os"></span></a></td>
             </tr>
             <!-- The selected server, opened: what it is, what it shows, how to get in -->
@@ -393,59 +393,28 @@
                         <source media="(max-width: 600px)" type="image/webp" srcset="screenshots/phone-stage-390.webp 390w, screenshots/phone-stage-780.webp 780w" sizes="100vw">
                         <source type="image/webp" srcset="screenshots/stage-960.webp 960w, screenshots/stage-1920.webp 1920w" sizes="(max-width: 900px) 100vw, 720px">
                         <img src="screenshots/stage.png" width="2560" height="1600" fetchpriority="high"
-                          alt="This server in the VoIPC app: Mira, Tom and Lena in the Lounge as large tiles, a mint ring around Tom who is talking, the voice controls docked underneath">
+                          alt="The VoIPC app's Stage layout: Mira, Tom and Lena in the Lounge as large tiles, a mint ring around Tom who is talking, the voice controls docked underneath">
                       </picture>
-                      <figcaption>This server, now: three in the Lounge, Tom talking.</figcaption>
+                      <figcaption>The Stage layout: three in the Lounge, Tom talking.</figcaption>
                     </figure>
                     <dl class="kv server-kv">
-                      <dt>players</dt><dd>Mira, Tom and Lena in Lounge; Ada in Gaming</dd>
+                      <dt>server</dt><dd>a public demo, open to anyone, for trying VoIPC; for your group, run your own (<a href="#host">Host one</a>)</dd>
                       <dt>encryption</dt><dd>Signal Protocol · AES-256-GCM</dd>
-                      <dt>keeps</dt><dd>nothing past a restart</dd>
-                      <dt>linux</dt><dd><a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/VoIPC_1.3.1-rc.1_amd64.AppImage">AppImage</a> · <a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/VoIPC_1.3.1-rc.1_amd64.deb">.deb</a></dd>
-                      <dt>windows</dt><dd><a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/VoIPC_1.3.1-rc.1_x64-setup.exe">installer</a></dd>
-                      <dt>android</dt><dd><a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/VoIPC-android-1.3.1-rc.1.apk">APK</a></dd>
-                      <dt>browser</dt><dd>nothing to install: <code>https://your-server:9987</code></dd>
-                      <dt>version</dt><dd class="num">1.3.1-rc.1 · <a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">changelog</a></dd>
+                      <dt>linux</dt><dd><a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.2/VoIPC_1.3.1-rc.2_amd64.AppImage">AppImage</a> · <a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.2/VoIPC_1.3.1-rc.2_amd64.deb">.deb</a></dd>
+                      <dt>windows</dt><dd><a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.2/VoIPC_1.3.1-rc.2_x64-setup.exe">installer</a></dd>
+                      <dt>android</dt><dd><a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.2/VoIPC-android-1.3.1-rc.2.apk">APK</a></dd>
+                      <dt>browser</dt><dd>nothing to install: <a href="https://ivy.l4f.cc:9987/">open the demo</a>; any VoIPC server opens the same way, on its port 9987</dd>
+                      <dt>version</dt><dd class="num">1.3.1-rc.2 · <a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">changelog</a></dd>
                       <dt>from 1.0</dt><dd><strong>update the server first.</strong> 1.3 apps and 1.0 servers do not connect, and the 1.0 desktop app offers the update everywhere: on a server still on 1.0, wait.</dd>
                     </dl>
                   </div>
                 </div>
               </td>
             </tr>
-            <tr>
-              <td class="flag sel"></td>
-              <td class="flag"></td>
-              <td class="flag"><svg class="icon" role="img" aria-label="End-to-end encrypted"><use href="#i-shield"/></svg></td>
-              <td class="name"><b>thursday-crew.example<span class="port">:9987</span></b><small>a raid group's voice and screens</small></td>
-              <td class="mode">Voice · Proximity 2D</td>
-              <td class="players num">6/16</td>
-              <td class="ping num">31&nbsp;ms</td>
-              <td class="go"></td>
-            </tr>
-            <tr>
-              <td class="flag sel"></td>
-              <td class="flag"><svg class="icon" role="img" aria-label="Password"><use href="#i-lock"/></svg></td>
-              <td class="flag"><svg class="icon" role="img" aria-label="End-to-end encrypted"><use href="#i-shield"/></svg></td>
-              <td class="name"><b>city-rp.example<span class="port">:9987</span></b><small>radio and phone calls driven by the game</small></td>
-              <td class="mode">Game SDK · Radio</td>
-              <td class="players num">48/64</td>
-              <td class="ping num">22&nbsp;ms</td>
-              <td class="go"></td>
-            </tr>
-            <tr>
-              <td class="flag sel"></td>
-              <td class="flag"></td>
-              <td class="flag"><svg class="icon" role="img" aria-label="End-to-end encrypted"><use href="#i-shield"/></svg></td>
-              <td class="name"><b>study-group.example<span class="port">:9987</span></b><small>text channels and a shared screen</small></td>
-              <td class="mode">Text · Share</td>
-              <td class="players num">3/12</td>
-              <td class="ping num">54&nbsp;ms</td>
-              <td class="go"></td>
-            </tr>
           </tbody>
         </table>
       </div>
-      <p class="list-note">Example servers. Every one of them is run by somebody in its group. There is no VoIPC server in the middle, and no list like this anywhere but here.</p>
+      <p class="list-note">One server here: the public demo, run by the VoIPC project for trying it out. Every other VoIPC server is run by its own group; there is no list of them, and no VoIPC server in the middle.</p>
     </section>
 
     <section id="info" aria-labelledby="info-title">
@@ -658,19 +627,19 @@
         <thead><tr><th scope="col">System</th><th scope="col">Voice &amp; chat</th><th scope="col">Share a screen</th><th scope="col">Watch a share</th><th scope="col">Desktop audio</th><th scope="col"><span class="sr-only">Download</span></th></tr></thead>
         <tbody>
           <tr><th scope="row">Linux</th><td class="cap" data-label="Voice &amp; chat">Yes</td><td class="cap" data-label="Share">PipeWire</td><td class="cap" data-label="Watch">Yes</td><td class="cap" data-label="Desktop audio">PipeWire</td>
-            <td class="dl"><a class="get" href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/VoIPC_1.3.1-rc.1_amd64.AppImage"><svg class="icon" aria-hidden="true"><use href="#i-down"/></svg>AppImage</a><a class="get" href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/VoIPC_1.3.1-rc.1_amd64.deb"><svg class="icon" aria-hidden="true"><use href="#i-down"/></svg>.deb</a></td></tr>
+            <td class="dl"><a class="get" href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.2/VoIPC_1.3.1-rc.2_amd64.AppImage"><svg class="icon" aria-hidden="true"><use href="#i-down"/></svg>AppImage</a><a class="get" href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.2/VoIPC_1.3.1-rc.2_amd64.deb"><svg class="icon" aria-hidden="true"><use href="#i-down"/></svg>.deb</a></td></tr>
           <tr><th scope="row">Windows</th><td class="cap" data-label="Voice &amp; chat">Yes</td><td class="cap" data-label="Share">Windows.Graphics.Capture</td><td class="cap" data-label="Watch">Yes</td><td class="cap" data-label="Desktop audio">WASAPI</td>
-            <td class="dl"><a class="get" href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/VoIPC_1.3.1-rc.1_x64-setup.exe"><svg class="icon" aria-hidden="true"><use href="#i-down"/></svg>Installer</a></td></tr>
+            <td class="dl"><a class="get" href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.2/VoIPC_1.3.1-rc.2_x64-setup.exe"><svg class="icon" aria-hidden="true"><use href="#i-down"/></svg>Installer</a></td></tr>
           <tr><th scope="row">Android</th><td class="cap" data-label="Voice &amp; chat">Yes</td><td class="cap" data-label="Share">—</td><td class="cap" data-label="Watch">Yes</td><td class="cap" data-label="Desktop audio">—</td>
-            <td class="dl"><a class="get" href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/VoIPC-android-1.3.1-rc.1.apk"><svg class="icon" aria-hidden="true"><use href="#i-down"/></svg>APK</a></td></tr>
+            <td class="dl"><a class="get" href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.2/VoIPC-android-1.3.1-rc.2.apk"><svg class="icon" aria-hidden="true"><use href="#i-down"/></svg>APK</a></td></tr>
           <tr id="browser-client"><th scope="row">Browser</th><td class="cap" data-label="Voice &amp; chat">Yes</td><td class="cap" data-label="Share">getDisplayMedia</td><td class="cap" data-label="Watch">Yes</td><td class="cap" data-label="Desktop audio">where the browser offers it</td>
-            <td><span class="cap">Nothing to install: open <code>https://your-server:9987</code></span></td></tr>
+            <td><span class="cap">Nothing to install: <a href="https://ivy.l4f.cc:9987/">try the demo</a>, or open any server's address</span></td></tr>
           <tr><th scope="row">macOS</th><td class="cap" data-label="Voice &amp; chat">—</td><td class="cap" data-label="Share">—</td><td class="cap" data-label="Watch">—</td><td class="cap" data-label="Desktop audio">—</td>
             <td><span class="cap">Not supported yet; the browser client works</span></td></tr>
         </tbody>
       </table>
       <p class="note"><strong>Coming from 1.0?</strong> 1.3 speaks a new protocol: update your server first, then the apps. A 1.3 app cannot connect to a 1.0 server, and does not go back to 1.0 by itself. The browser needs nothing; Android and the .deb install over the old one.</p>
-      <p class="note">Browsers need Chrome 97, Edge 98, Firefox 130 or Safari 26.4 (WebTransport and WebCodecs). Every release is signed and listed in <a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/SHA256SUMS">SHA256SUMS</a>; how to check one is in the <a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">changelog</a>.</p>
+      <p class="note">Browsers need Chrome 97, Edge 98, Firefox 130 or Safari 26.4 (WebTransport and WebCodecs). Every release is signed and listed in <a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.2/SHA256SUMS">SHA256SUMS</a>; how to check one is in the <a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">changelog</a>.</p>
     </section>
 
     <section id="host" aria-labelledby="host-title">
@@ -679,22 +648,24 @@
         <div class="console">
           <button class="copy" type="button" data-copy="server-cmds"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg><span>Copy</span></button>
 <pre id="server-cmds"><span class="c"># the relay, ready-built for Linux x86_64</span>
-<span class="p">$ </span>curl -LO https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/voipc-server-linux-x86_64
+<span class="p">$ </span>curl -LO https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.2/voipc-server-linux-x86_64
 <span class="p">$ </span>chmod +x voipc-server-linux-x86_64
 
-<span class="c"># a self-signed certificate (browsers check the name: use your host or IP)</span>
+<span class="c"># a self-signed certificate for this machine's name and address</span>
+<span class="c"># (browsers check them: set HOST and IP to the public ones if they differ)</span>
+<span class="p">$ </span>HOST=$(hostname -f) IP=$(ip route get 1 | grep -o 'src [0-9.]*' | cut -d' ' -f2)
 <span class="p">$ </span>mkdir -p certs && openssl req -x509 -newkey ec \
     -pkeyopt ec_paramgen_curve:prime256v1 \
     -keyout certs/server.key -out certs/server.crt \
     -days 365 -nodes -subj "/CN=voipc" \
-    -addext "subjectAltName=DNS:your-server.example,IP:203.0.113.5"
+    -addext "subjectAltName=DNS:$HOST,IP:$IP"
 
 <span class="c"># run: UDP 9987 for every client, TCP 9987 for the browser page</span>
 <span class="p">$ </span>./voipc-server-linux-x86_64</pre>
         </div>
         <div>
           <p>Configure it with flags or a <code>server.toml</code> passed with <code>-c</code>; a <code>channels.json</code> beside it adds rooms that stay. Set <code>admin_token</code>, or take the one printed in the log, to moderate.</p>
-          <p>The same binary serves the browser client over HTTPS on the TCP port, so a friend with nothing installed opens <code>https://your-server:9987</code> and joins. Where UDP is blocked, <code>--tcp-fallback</code> tunnels the call over TCP.</p>
+          <p>The same binary serves the browser client over HTTPS on the TCP port, so a friend with nothing installed opens the server's address on port 9987 in a browser and joins, as with <a href="https://ivy.l4f.cc:9987/">the demo</a>. Where UDP is blocked, <code>--tcp-fallback</code> tunnels the call over TCP.</p>
           <p>Building from source, Docker and accounts: <a href="https://github.com/luki4fun/voipc/blob/main/BUILDING.md">BUILDING.md</a> · <a href="https://github.com/luki4fun/voipc/blob/main/docs/OPERATING.md">OPERATING.md</a> · <a href="https://github.com/luki4fun/voipc/blob/main/docs/ACCOUNTS.md">ACCOUNTS.md</a></p>
         </div>
       </div>
@@ -702,8 +673,8 @@
   </main>
 
   <footer class="statusbar">
-    <span><span class="dot" aria-hidden="true"></span>VoIPC 1.3.1-rc.1</span>
-    <span class="num">4 example servers · 1 open</span>
+    <span><span class="dot" aria-hidden="true"></span>VoIPC 1.3.1-rc.2</span>
+    <span class="num">1 public demo server</span>
     <span>MIT · <a href="https://github.com/luki4fun/voipc/blob/main/LICENSE">licence</a></span>
     <span><a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">Changelog</a> · <a href="https://github.com/luki4fun/voipc">GitHub</a></span>
     <span>Built with Rust, Svelte, and paranoia. No analytics, no cookies.</span>
@@ -717,28 +688,56 @@
   // (macOS, iOS), it points at the browser client instead of a releases page
   // with nothing on it for them.
   (function () {
-    var base = "https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.1/";
+    var base = "https://github.com/luki4fun/voipc/releases/download/v1.3.1-rc.2/";
     var ua = navigator.userAgent;
     var join = document.getElementById("join");
     var os = document.getElementById("join-os");
     var pick =
-      /Android/i.test(ua) ? ["Android", "VoIPC-android-1.3.1-rc.1.apk"] :
-      /Windows/i.test(ua) ? ["Windows", "VoIPC_1.3.1-rc.1_x64-setup.exe"] :
+      /Android/i.test(ua) ? ["Android", "VoIPC-android-1.3.1-rc.2.apk"] :
+      /Windows/i.test(ua) ? ["Windows", "VoIPC_1.3.1-rc.2_x64-setup.exe"] :
       /iPhone|iPad|Macintosh|Mac OS/i.test(ua) ? ["in the browser", null] :
-      /Linux|X11/i.test(ua) ? ["Linux", "VoIPC_1.3.1-rc.1_amd64.AppImage"] :
+      /Linux|X11/i.test(ua) ? ["Linux", "VoIPC_1.3.1-rc.2_amd64.AppImage"] :
       null;
     if (!pick) return;
     join.href = pick[1] ? base + pick[1] : "#browser-client";
     os.textContent = "· " + pick[0];
   })();
 
-  // The selected server's ping, live — the page's one moving part
+  // The demo server's ping, measured from this browser. The best of a few
+  // small requests (the first also pays for TLS); again when the page comes
+  // back into view after a minute or more, never on a timer: each measurement
+  // holds one of the relay's connection slots for 30 s, the slots voice
+  // sessions need too. Unreachable: a dash.
   (function () {
     var cell = document.querySelector("[data-ping]");
-    if (!cell || matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-    setInterval(function () {
-      cell.textContent = (10 + Math.round(Math.random() * 4)) + " ms";
-    }, 1400);
+    if (!cell || !window.fetch || !window.performance) return;
+    var url = cell.getAttribute("data-ping");
+    var last = 0, busy = false;
+    function once() {
+      var t = performance.now();
+      var opts = { cache: "no-store", mode: "cors" };
+      if (window.AbortSignal && AbortSignal.timeout) opts.signal = AbortSignal.timeout(5000);
+      return fetch(url, opts).then(function (r) {
+        if (!r.ok) throw r.status;
+        return performance.now() - t;
+      });
+    }
+    function measure() {
+      if (busy) return;
+      busy = true;
+      last = performance.now();
+      var best = Infinity;
+      [0, 1, 2].reduce(function (p) {
+        return p.then(once).then(function (ms) { best = Math.min(best, ms); });
+      }, Promise.resolve()).catch(function () {}).then(function () {
+        cell.textContent = best < Infinity ? Math.round(best) + " ms" : "—";
+        busy = false;
+      });
+    }
+    measure();
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden && performance.now() - last > 60000) measure();
+    });
   })();
 
   // Server info tabs (without the script every panel is simply shown)

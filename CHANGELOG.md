@@ -161,9 +161,11 @@ separately, since none of it was released. These change what 1.0.0 did:
   - saving the servers you have open, or the last connection, never makes a
     server whose certificate was checked against the public authorities one
     whose self-signed certificate is accepted; only saving that server, through
-    its confirm, does.
+    its confirm, does;
   - an invite link to a voice channel, opened in the browser, shows the channel
     and asks *Join voice in …?* before it seats you in the call;
+  - an invite link to a text channel opens that channel; it used to leave you
+    where you were.
 
 ## [1.3.0] - not released on its own (in 1.3.1)
 

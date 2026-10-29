@@ -148,8 +148,10 @@
     autoJoinTextChannels,
     channelMessageTtl,
     dmMessageTtl,
+    forgetLeft,
     isTextChannel,
     managesChannel,
+    openJoinedTextChannel,
     previewChannel,
   } from "./lib/stores/channel-ui.js";
   import {
@@ -384,7 +386,14 @@
       rememberChannelPassword(server, ch.name, inv.password);
     }
     const join = () =>
-      invoke("join_channel", { server, channelId: ch.channel_id, password: inv.password }).catch(
+      invoke("join_channel", { server, channelId: ch.channel_id, password: inv.password }).then(
+        // A text channel the link names is the one to show (V-01), and
+        // following it undoes having left it, as Join does
+        () => {
+          if (!ch.text) return;
+          forgetLeft(server, ch.channel_id);
+          if (server === get(serverAddress)) openJoinedTextChannel(server, ch.channel_id, ch.name);
+        },
         (e: unknown) => {
           addNotification(`Could not join #${ch.name}: ${e}`, "error");
         },

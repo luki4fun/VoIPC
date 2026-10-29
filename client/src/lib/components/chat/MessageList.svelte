@@ -530,8 +530,11 @@
               ></textarea>
               <div class="edit-actions">
                 <span class="edit-hint">Enter to save · Escape to cancel</span>
-                <button class="btn-ghost" type="button" onclick={() => finishEdit(false)}>Cancel</button>
-                <button class="btn-secondary" type="submit" disabled={!draft.trim()}>Save</button>
+                <!-- A tap here never takes the focus from the box: on a phone the
+                     keyboard would drop, the shell reflow and Save move away before
+                     the finger lifts (D3-01, as the Composer's keepField) -->
+                <button class="btn-ghost" type="button" onpointerdown={(e) => e.preventDefault()} onclick={() => finishEdit(false)}>Cancel</button>
+                <button class="btn-secondary" type="submit" onpointerdown={(e) => e.preventDefault()} disabled={!draft.trim()}>Save</button>
               </div>
             </form>
           {:else if msg.content}

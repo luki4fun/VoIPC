@@ -241,7 +241,7 @@ export async function joinTextChannel(channel: ChannelInfo): Promise<void> {
 
 /** Show a text channel we have just entered; `openTextChannel` drops the
  *  preview of it. */
-function openJoinedTextChannel(server: string, channelId: number, name: string): void {
+export function openJoinedTextChannel(server: string, channelId: number, name: string): void {
   openTextChannel(server, channelId);
   clearChannelUnread(server, name);
   // Only where it is on screen: the user may have gone to look at another
@@ -383,7 +383,8 @@ function rememberLeft(server: string, channelId: number): void {
   });
 }
 
-function forgetLeft(server: string, channelId: number): void {
+/** Undo having walked out of a text channel: it auto-joins again. */
+export function forgetLeft(server: string, channelId: number): void {
   const key = serverKey(server);
   const name = channelName(server, channelId);
   if (!key || !name) return;
