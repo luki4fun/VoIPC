@@ -2432,6 +2432,74 @@ check(
     `(() => { const r = ${rowWith("the original")}; const a = document.activeElement; return !!r && !!a && (r === a || r.contains(a) || a.contains(r)); })()`)),
     await ann.evaluate(`document.activeElement?.className ?? "nothing"`));
 
+  // ── Files in a direct message, with the other in another room ──
+  // Its conversation used to be looked for among `users`, the room one stands
+  // in: someone talking elsewhere got no attach button, and what came could
+  // not be loaded, opened from Settings, forwarded in or sent again (1.3.1)
+  const dee = await connect(`ui-fd-${n}`);
+  await enter(dee);
+  const deeRow = `[...document.querySelectorAll(".user .name")].find((e) => e.title.startsWith(${JSON.stringify(`ui-fd-${n}#`)}))`;
+  await waitFor(ann, deeRow).catch(() => {});
+  await ann.evaluate(`(() => { const el = ${deeRow}?.closest(".user"); if (!el) return false;
+    el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 40 })); return true; })()`);
+  await sleep(300);
+  await ann.evaluate(`[...document.querySelectorAll(".ctx-item")].find((e) => /direct message/i.test(e.textContent))?.click()`);
+  await waitFor(ann, `document.querySelector(".chat-main .input-bar .chat-input")?.placeholder.includes("ui-fd-")`, 5_000).catch(() => {});
+  await say(ann, "hi dee");
+  const annEntry = `[...document.querySelectorAll(".dm-entry")].find((e) => e.textContent.includes("ui-fa-${n}"))`;
+  await waitFor(dee, annEntry, 15_000).catch(() => {});
+  // dee goes to a room of its own, then reads the conversation there
+  await dee.evaluate(click('button[title="Create channel"]'));
+  await waitFor(dee, `document.querySelector(".create-form")`).catch(() => {});
+  await dee.evaluate(setInput(".create-form input[type=text]", `elsewhere-${n}`));
+  await dee.evaluate(click(".create-form .create-btn"));
+  const parted = await waitFor(ann, `!${deeRow}`, 10_000).then(() => true, () => false);
+  await sleep(1000);
+  await dee.evaluate(`${annEntry}?.click()`);
+  check("a direct message to someone in another room offers attaching", parted &&
+    (await ann.evaluate(`!!document.querySelector(".chat-main .input-bar .file-picker")`)));
+  for (const [file, words] of [["dm.png", "for dee, elsewhere"], ["dm-row.png", "open me from Settings"], ["dm-later.png", "load me once the relay let go"]]) {
+    await attach(ann, picture("image/png", file));
+    await say(ann, words);
+    await waitFor(dee, `${rowWith(words)}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  }
+  await press(dee, "for dee, elsewhere", "Load");
+  check("and what comes loads on the other side", await waitFor(dee,
+    `${rowWith("for dee, elsewhere")}?.querySelector(".file-card img")?.naturalWidth > 0`, 20_000).then(() => true, () => false),
+    await dee.evaluate(`${rowWith("for dee, elsewhere")}?.querySelector(".file-card")?.textContent ?? "no card"`));
+  await realClick(dee, ".settings-btn");
+  await waitFor(dee, `document.querySelector(".tab")`, 8_000).catch(() => {});
+  await dee.evaluate(`[...document.querySelectorAll(".tab")].find((b) => b.textContent.trim() === "Files")?.click()`);
+  await waitFor(dee, fmRow("dm-row.png"), 8_000).catch(() => {});
+  await fmPress(dee, "dm-row.png", "Show");
+  await waitFor(dee, `${fmRow("dm-row.png")}?.querySelector(".file-card")`, 5_000).catch(() => {});
+  await dee.evaluate(`[...(${fmRow("dm-row.png")})?.querySelectorAll(".file-card button") ?? []].find((b) => b.textContent.trim() === "Load")?.click()`);
+  check("its row in Settings → Files loads it too", await waitFor(dee,
+    `${fmRow("dm-row.png")}?.querySelector(".file-card img")?.naturalWidth > 0`, 20_000).then(() => true, () => false));
+  await dee.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await dee.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await waitFor(dee, `!document.querySelector(".fm-row")`, 5_000).catch(() => {});
+  // A file from ann's room, forwarded into the conversation
+  await ann.evaluate(`[...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(ROOM)})
+    ?.dispatchEvent(new MouseEvent("click", { bubbles: true }))`);
+  await waitFor(ann, rowWith("the original"), 5_000).catch(() => {});
+  const origAt = await ann.evaluate(`(() => { const r = ${rowWith("the original")}; if (!r) return null; r.scrollIntoView({ block: "center" });
+    const b = r.getBoundingClientRect(); return { x: Math.round(b.left + 40), y: Math.round(b.top + 10) }; })()`);
+  if (origAt) {
+    for (const type of ["mousePressed", "mouseReleased"]) {
+      await ann.send("Input.dispatchMouseEvent", { type, x: origAt.x, y: origAt.y, button: "right", clickCount: 1, buttons: 2 });
+    }
+  }
+  await sleep(300);
+  await ann.evaluate(`[...document.querySelectorAll(".msg-menu [role=menuitem]")].find((e) => e.textContent.trim() === "Forward")?.click()`);
+  await waitFor(ann, `document.querySelector(".forward-dialog .forward-dest")`, 3_000).catch(() => {});
+  await ann.evaluate(`[...document.querySelectorAll(".forward-dialog .forward-dest")].find((b) => b.textContent.includes("@ui-fd-${n}"))?.click()`);
+  await waitFor(dee, `${rowWith("the original")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  await press(dee, "the original", "Load");
+  check("a file forwarded into it arrives and loads", await waitFor(dee,
+    `${rowWith("the original")}?.querySelector(".file-card img")?.naturalWidth > 0`, 20_000).then(() => true, () => false),
+    await ann.evaluate(`window.__toasts?.slice(-2).join(" | ") ?? ""`));
+
   // ── The relay lets go; a member sends it again, or nobody can ──
   await attach(ben, picture("image/png", "gone.png"));
   await say(ben, "nobody else has this one");
@@ -2457,8 +2525,13 @@ check(
   const unavailable = await waitFor(cat, `${rowWith("nobody else has this one")}?.querySelector(".file-preview [role=alert]")?.textContent.includes("Nobody online has this file")`, 90_000).then(() => true, () => false);
   check("and with its only holder gone, it says nobody online has it, where it was asking", unavailable,
     await cat.evaluate(`${rowWith("nobody else has this one")}?.querySelector(".file-card")?.textContent ?? "no card"`));
+  // Its only holder, ann, is asked through the direct conversation, from another room
+  await press(dee, "load me once the relay let go", "Load");
+  check("in a direct message too, its sender sends it again once the relay let go", await waitFor(dee,
+    `${rowWith("load me once the relay let go")}?.querySelector(".file-card img")?.naturalWidth > 0`, 45_000).then(() => true, () => false),
+    await dee.evaluate(`${rowWith("load me once the relay let go")}?.querySelector(".file-card")?.textContent ?? "no card"`));
 
-  for (const [who, tab] of [["sender", ann], ["receiver", ben], ["late joiner", cat]]) {
+  for (const [who, tab] of [["sender", ann], ["receiver", ben], ["late joiner", cat], ["direct partner", dee]]) {
     const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));
     check(`the files lane's ${who} threw nothing`, fatal.length === 0, fatal.slice(0, 2).join(" | "));
   }

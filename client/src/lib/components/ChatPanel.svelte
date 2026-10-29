@@ -520,22 +520,18 @@
 
   /**
    * The conversation a file is posted in and fetched from, as the relay names
-   * it: a channel by id; a direct one by the other's user id while they are
-   * here under it (ids are handed out again after a restart), else by their
-   * account; null where neither names them.
+   * it: a channel by id; a direct one by the other's user id, the one its
+   * words go to (a slot of this server run: a reconnect forgets it, see
+   * `resetServer`), else by their account while they are away; null where
+   * neither names them. Not `users`: that is our voice room, and the other
+   * may well be talking elsewhere.
    */
   function fileConvOf(t: Target): FileConv | null {
     if (!("dm" in t)) return t.channelId ? { channel: t.channelId } : null;
-    const peer = get(users.peek(t.server)).find((u) => u.user_id === t.dm.peer);
-    if (t.dm.peer > 0 && peer) return { direct: t.dm.peer };
-    const acct = t.dm.away ?? (peer?.account ? accountHex(peer.account) : undefined);
-    return acct ? { account: acct } : null;
+    if (t.dm.peer > 0) return { direct: t.dm.peer };
+    return t.dm.away ? { account: t.dm.away } : null;
   }
-  const fileConv = $derived.by(() => {
-    // Who is here decides how a direct conversation is named
-    void $users;
-    return fileConvOf(targetNow());
-  });
+  const fileConv = $derived.by(() => fileConvOf(targetNow()));
 
   /**
    * The composer hands over what to send; a held one never gets here. `refs`

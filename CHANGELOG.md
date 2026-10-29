@@ -177,7 +177,8 @@ as a message from a newer VoIPC, and a file as its caption alone.
 ### Files and pictures
 
 - **Attach a file** with the paperclip, by pasting it, or by dropping it on the
-  chat. Your app seals it before it leaves the device, under a key of its own
+  chat, in a channel or a direct message (whichever room the other person is
+  talking in). Your app seals it before it leaves the device, under a key of its own
   that travels only inside the end-to-end encrypted message; the relay holds a
   blob it cannot open. The relay sets the largest file (10 MB by default), and
   the attach button is not there when a relay keeps no files.

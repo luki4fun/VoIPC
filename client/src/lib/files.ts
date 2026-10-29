@@ -8,7 +8,6 @@ import { get, writable } from "svelte/store";
 import { base64Chunks, loadKey, referencedHashes, refersTo } from "./file-rules";
 import type { FileBlob, FileConv } from "./types";
 import type { ChatPlace } from "./chat-rules";
-import { accountHex } from "./stores/account";
 import { channelMessages, chatKey, chatUnlocked, dmConversations, dmKey, dmMessages } from "./stores/chat";
 import { channels } from "./stores/channels";
 import { chatHistoryDisabled } from "./stores/settings";
@@ -164,33 +163,36 @@ function messagesOf(server: string, conv: FileConv) {
     const name = get(channels.peek(server)).find((c) => c.channel_id === conv.channel)?.name;
     return name ? get(channelMessages).get(chatKey(server, name)) : undefined;
   }
-  // The relay names a direct conversation by user id only while that person
-  // is here, and ids are handed out again after a restart: who holds the id
-  // now is the online list's to say, never a conversation filed earlier
+  // The relay names a direct conversation by user id while that person is
+  // here: the id their words come from, which the conversation is filed
+  // under. Ids are handed out again only by a restarted server, and a
+  // reconnect forgets every conversation's (`resetServer`). Not `users`: that
+  // is our voice room, and the asker may be talking elsewhere.
   const name =
-    "direct" in conv
-      ? get(users.peek(server)).find((u) => u.user_id === conv.direct)?.username
-      : get(dmConversations.peek(server)).find((c) => c.account === conv.account)?.username;
+    get(dmConversations.peek(server)).find((c) =>
+      "direct" in conv ? c.user_id === conv.direct : c.account === conv.account,
+    )?.username ??
+    // One not written in since we connected: whoever has that id in our room
+    ("direct" in conv ? get(users.peek(server)).find((u) => u.user_id === conv.direct)?.username : undefined);
   return name ? get(dmMessages).get(dmKey(server, name)) : undefined;
 }
 
 /**
  * How the relay names the conversation at `place` on `server`, to fetch a
- * file of it: a channel by id; a person by user id while someone of that name
- * is here, else by their account (ChatPanel's `fileConvOf`); null where
- * nothing names it now.
+ * file of it: a channel by id; a person by the user id their conversation is
+ * filed under while they are here, else by their account (ChatPanel's
+ * `fileConvOf`); null where nothing names it now.
  */
 export function fileConvAt(server: string, place: ChatPlace): FileConv | null {
   if (place.kind === "channel") {
     const id = get(channels.peek(server)).find((c) => c.name === place.name)?.channel_id;
     return id ? { channel: id } : null;
   }
-  const here = get(users.peek(server)).find((u) => u.username === place.name);
-  if (here && here.user_id > 0) return { direct: here.user_id };
-  const account =
-    get(dmConversations.peek(server)).find((c) => c.username === place.name)?.account ??
-    (here?.account ? accountHex(here.account) : undefined);
-  return account ? { account } : null;
+  const dm = get(dmConversations.peek(server)).find((c) => c.username === place.name);
+  // One not written in since we connected: whoever of that name is in our room
+  const id = dm?.user_id ?? get(users.peek(server)).find((u) => u.username === place.name)?.user_id;
+  if (id && id > 0) return { direct: id };
+  return dm?.account ? { account: dm.account } : null;
 }
 
 /**
