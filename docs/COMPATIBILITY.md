@@ -11,8 +11,8 @@ nobody checks, so a new one comes with its test.
 ## 1. Wire protocol (client ↔ relay)
 
 **1.x keeps:**
-- A relay admits a client exactly when their `PROTOCOL_VERSION` is equal (12 in 1.0). The app
-  version is informational only.
+- A relay admits a client exactly when their `PROTOCOL_VERSION` is equal (12 in 1.0, 13 in
+  1.3). The app version is informational only.
 - A refused client is told why:
   - a client at protocol 12 or later gets `ServerMessage::Refused { code, server_protocol,
     server_version, text }`, with `code` 1 (`REFUSED_VERSION`) for a protocol mismatch. The app
@@ -20,6 +20,11 @@ nobody checks, so a new one comes with its test.
     matching version;
   - a client at protocol 11 or older (0.12 and before) gets the free-text `AuthError`
     containing "version mismatch", which those versions already show.
+  - **One case the relay cannot reach:** a 1.0 desktop or Android app whose UDP is blocked, on
+    a 1.3 relay with `tcp_fallback` off. Since 1.3 the relay answers HTTP/1.1 on its TLS port
+    (for files), so the old app reads "the server refused the TCP fallback (HTTP/1.1 403
+    Forbidden)" where it read "this server has no TCP fallback". It could not connect either
+    way, and it gets the refusal above as soon as UDP gets through or the fallback is on.
 - These bytes are frozen for good, so that any version can tell any other one to update:
   - the start of `Authenticate` (`username`, `protocol_version`);
   - `AuthError`;
@@ -75,6 +80,11 @@ its default. Relative paths resolve from the working directory, as before.
   with an error naming the key, where 0.12 ignored it; `[accounts]` was strict already.
   `web_port`, gone since 0.5, is still accepted.
 
+**What changed in 1.3:** `[files]` is a new section whose default is *on*: the relay keeps encrypted file blobs in `files/` under its working
+directory, and offers TLS ALPN `http/1.1` without `tcp_fallback` too. It is the one new key so
+far that does not keep the old behaviour by default: `[files] enabled = false` does. A relay
+that cannot make the directory starts without files instead of refusing to start.
+
 **An older relay on a newer config:** it refuses the unknown key, never ignores it, so a relay
 cannot silently run without a setting it was given. The JSON files stay lenient: a rewrite of
 `channels.json` keeps keys it does not know.
@@ -91,7 +101,10 @@ storage, the accounts database, the kept-message log and its crypto labels.
 **1.x keeps:**
 - Every 1.x opens everything any earlier 1.x, and 0.12, wrote.
 - An upgrade moves data forward and never loses any. The desktop history keeps a one-time
-  `chat_history.bin.v4` copy the first time 1.0 rewrites a 0.12 file.
+  copy of the older file, named after its format, the first time a newer version opens it:
+  `chat_history.bin.v4` when 1.0 opens a 0.12 file, `chat_history.bin.v5` when 1.3.1 opens a
+  1.0 one (1.1 and 1.2 wrote the same format as 1.0, and were never released on their own).
+  Clearing or deleting the history in the app removes these copies too.
 - Shipped database migrations are append-only and never edited.
 - The crypto labels are frozen: `voipc-vault-item/v1|`, `voipc-log/v1|`, `voipc-wrap/v1|`,
   `voipc-channel/v1|`, the HKDF infos and the AADs. A new scheme gets a new label beside the
@@ -110,12 +123,36 @@ storage, the accounts database, the kept-message log and its crypto labels.
 
 A downgrade is not supported, but it is safe: nothing is destroyed.
 
+**Going back from 1.3 to 1.0.** A 1.3 app does not connect to a 1.0 relay, and the desktop
+updater only ever moves forward, so a user whose server stays on 1.0 has to go back by hand:
+1. Close VoIPC and install 1.0.0 from its release page
+   (<https://github.com/luki4fun/voipc/releases/tag/v1.0.0>).
+2. In VoIPC's folder (`~/.config/VoIPC` on Linux, `%APPDATA%\VoIPC` on Windows, or wherever
+   you put the history), rename `chat_history.bin` to keep it for later (for example
+   `chat_history.bin.v6`), then rename `chat_history.bin.v5` to `chat_history.bin`. 1.0 opens
+   that copy with the password it had when you updated; left alone, it reads the 1.3 file as "written by a newer
+   VoIPC" and does not touch it.
+3. Delete the `files` folder in VoIPC's folder (it is there wherever the history is): the
+   copies of files you sent or loaded, sealed under keys that only the 1.3 history holds. 1.0
+   neither uses nor removes it.
+
+What 1.0 does not have: every message since the update (it stays in the file you renamed in
+step 2) and the copies of files. `settings.json` loads as it is; 1.0 drops the file
+cache's size from it on its next save. Vault items, the pinned certificates and the browser's
+storage are as 1.0 wrote them, so they need nothing.
+
+On Android, the system refuses to install 1.0.0 over 1.3.1 (a lower version code). Going back
+means uninstalling, which deletes the app's history on the phone. The browser needs nothing: it
+loads the page its relay serves. The relay's side is in [OPERATING.md](OPERATING.md) §8.
+
 **Break detection:**
 - the fixtures written by 0.12.0's own code, one directory per released version, never
   regenerated:
   - `crates/voipc-crypto/tests/fixtures/0.12.0/`: vault, log key, kept entry, safety number, log
     memory;
   - `client/src-tauri/tests/fixtures/0.12.0/`: chat history, settings, pins;
+  - `client/src-tauri/tests/fixtures/1.1.0/`: chat history (archive v5, the format 1.0 and 1.1
+    write);
   - `crates/voipc-server/tests/fixtures/0.12.0/`: the accounts database, which is opened,
     migrated and signed into, and the kept DM read;
   - `client/src/lib/__fixtures__/0.12.0/`: browser settings, checked by `test-ui.mjs`
@@ -146,7 +183,9 @@ advisory and a "Security" entry in the CHANGELOG. It never happens silently.
   `VoIPC_<v>_x64-setup.exe.sig`, plus `SHA256SUMS` and a build attestation for every file.
   `latest.json` is the name every 1.x client's stable feed URL ends in.
 - **Container:** the image `ghcr.io/luki4fun/voipc-server` with `:<version>`; a final release
-  also moves `:<major>.<minor>`, `:<major>` and `:latest`.
+  also moves `:<major>.<minor>`, `:<major>` and `:latest`. A minor may change the protocol, so
+  `:<major>` and `:latest` follow protocol changes; `:<major>.<minor>` is the tag that stays on
+  one ([OPERATING.md](OPERATING.md) §10).
 - **Updater feeds:** stable is `releases/latest/download/latest.json`; release candidates read
   `releases/download/updater-rc/latest.json`.
 - **Release candidates:** `v<x.y.z>-rc.<n>` releases are pre-releases. They never become

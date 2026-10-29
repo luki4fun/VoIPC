@@ -14,12 +14,21 @@
   // A share — watched, or the preview of our own — comes with its chat when
   // asked for (StreamStage), so this view no longer costs the conversation.
 
+  import { dialog } from "../../actions/dialog.js";
+  import { pushLayer } from "../../stores/back-stack.js";
   import { centreView, currentProximity } from "../../stores/room.js";
-  import { previewStage, streamStage } from "../../stores/screenshare.js";
+  import { previewStage, stopWatching, streamStage } from "../../stores/screenshare.js";
   import RoomView from "../RoomView.svelte";
   import MixerView from "../MixerView.svelte";
   import StreamStage from "../StreamStage.svelte";
   import Icon from "../Icons.svelte";
+
+  interface Props {
+    /** Height of the phone's talk button, which draws over this view: the
+     *  body leaves that much room so the bottom of the view stays usable. */
+    pttSpace?: number;
+  }
+  let { pttSpace = 0 }: Props = $props();
 
   const watching = $derived($streamStage === "watch");
   const showRoom = $derived($centreView === "room" && $currentProximity !== "off");
@@ -53,12 +62,26 @@
       close();
     }
   }
+
+  // Android's Back leaves a watched share the way its Stop button does — that
+  // is what Back means on a phone. Escape does not: on a desktop it is also
+  // the key that leaves fullscreen, and must never stop the stream with it.
+  // Pushed after the dialog's own layer, so it is the one Back reaches first.
+  $effect(() => {
+    if (!open || !watching) return;
+    return pushLayer(() => void stopWatching());
+  });
 </script>
 
 <svelte:window {onkeydown} />
 
 {#if open}
-  <div class="activity" role="dialog" aria-label={title}>
+  <div
+    class="activity"
+    aria-label={title}
+    style="--ptt-space: {pttSpace}px"
+    use:dialog={{ onclose: watching ? undefined : close }}
+  >
     <div class="activity-bar">
       <span class="activity-title">{title}</span>
       {#if !watching}
@@ -83,7 +106,7 @@
   .activity {
     position: fixed;
     inset: 0;
-    z-index: 90;
+    z-index: var(--z-activity);
     display: flex;
     flex-direction: column;
     background: var(--bg-primary);
@@ -106,7 +129,7 @@
   }
 
   .activity-title {
-    font-size: 13px;
+    font-size: var(--fs-body);
     font-weight: 600;
     color: var(--text-primary);
   }
@@ -134,11 +157,19 @@
     display: flex;
     min-height: 0;
     overflow: hidden;
+    padding-bottom: var(--ptt-space, 0px);
   }
 
   .activity-body > :global(*) {
     flex: 1;
     min-width: 0;
     min-height: 0;
+  }
+
+  @media (pointer: coarse) {
+    .activity-close {
+      width: var(--hit);
+      height: var(--hit);
+    }
   }
 </style>

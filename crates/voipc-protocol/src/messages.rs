@@ -278,6 +278,30 @@ pub enum ClientMessage {
 
     /// Managing the signed-in account: device keys, codes, the vault.
     Account(AccountRequest),
+
+    // ── Files (protocol v13) ─────────────────────────────────────────
+    // Only the negotiation travels here; the bytes go over HTTPS
+    // (`PUT`/`GET /f/v1/<hash>` on the TLS port) with the ticket it hands out.
+    /// Store the `size`-byte blob of a sealed file under its id, `hash`, for a
+    /// message in `conv`. Answered with `FileUploadReady` (upload it),
+    /// `FileStored` (the relay has it already) or `FileRefused`; or, while
+    /// another member's upload of it is under way, with nothing yet:
+    /// `FileStored` when that lands, `FileUploadReady` if it passes to you. A
+    /// member answering `FileWanted` sends this too.
+    FileUpload {
+        conv: FileConv,
+        size: u64,
+        hash: [u8; 32],
+    },
+
+    /// Fetch the blob `hash` of a message in `conv`. Answered with
+    /// `FileReady`, with `FileSeeking` and later `FileReady` or
+    /// `FileUnavailable`, or with `FileRefused`.
+    FileFetch { conv: FileConv, hash: [u8; 32] },
+
+    /// Give up an upload or a fetch of `hash`: its ticket is spent, and an
+    /// upload slot passes to the next member waiting with the same file.
+    FileCancel { hash: [u8; 32] },
 }
 
 /// The client's side of an account sign-in, between `Authenticate` and
@@ -315,11 +339,15 @@ pub enum AuthContinue {
         reset_identity: bool,
     },
     /// The answer to `ResetChallenge`: the identity's signature over the
-    /// challenge (`voipc-reset/v1|<relay>|<name>|<challenge>`), the new
-    /// password's secret and its `slot.pass` (the same vault key under the new
-    /// password), and the second factor when the account has one.
+    /// challenge (`voipc-reset/v1|<relay>|<name>|<challenge>`), the reset
+    /// key's (`voipc-reset/v2|…`, the key only the recovery key derives:
+    /// `voipc_crypto::account::reset_key`), the new password's secret and its
+    /// `slot.pass` (the same vault key under the new password), and the second
+    /// factor when the account has one. An account with a `slot.reset` is
+    /// checked by the reset key alone; one made before 1.3 by the identity.
     Reset {
         signature: Vec<u8>,
+        key_signature: Vec<u8>,
         auth_secret: Vec<u8>,
         pass_slot: Vec<u8>,
         totp: Option<String>,
@@ -420,6 +448,17 @@ pub enum AccountRequest {
     /// connection.
     DeleteAccount {
         secret: Vec<u8>,
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    },
+    /// A new recovery key: the password's secret, the vault key under the
+    /// new recovery key (`slot.recovery`), the new reset key (`slot.reset`),
+    /// and the second factor when the account has one. The old recovery key
+    /// stops working. `RecoveryKeyChanged` answers.
+    RecoveryKeyNew {
+        secret: Vec<u8>,
+        recovery_slot: Vec<u8>,
+        reset_key: Vec<u8>,
         totp: Option<String>,
         recovery_code: Option<String>,
     },
@@ -556,6 +595,8 @@ pub enum AccountReply {
     },
     /// The account is gone; the connection closes.
     AccountDeleted,
+    /// `RecoveryKeyNew` done: only the new recovery key resets the password.
+    RecoveryKeyChanged,
 }
 
 /// A wrapped epoch key for one member (`AccountRequest::EpochPut`).
@@ -610,6 +651,9 @@ pub enum ServerMessage {
         /// The account this connection signed in with.
         #[serde(default)]
         account: Option<AccountInfo>,
+        /// The relay keeps files (protocol v13); `None` when it does not.
+        #[serde(default)]
+        files: Option<FileLimits>,
     },
 
     /// Authentication failed.
@@ -860,7 +904,75 @@ pub enum ServerMessage {
         server_version: String,
         text: String,
     },
+
+    // ── Files (protocol v13) ─────────────────────────────────────────
+    /// Upload the blob: `PUT /f/v1/<hash>?offset=N` in chunks of at most
+    /// 1 MiB, each with `Authorization: Bearer <ticket>`, each starting where
+    /// the last ended. The ticket lasts ten minutes from the last chunk of
+    /// 64 KiB or more (an hour at most), or until this connection ends. Size
+    /// chunks to the link; a chunk cut off without an answer is sent again
+    /// from the same offset, smaller.
+    FileUploadReady { hash: [u8; 32], ticket: String },
+
+    /// The relay has the blob, checked against its id.
+    FileStored { hash: [u8; 32] },
+
+    /// Download the blob: `GET /f/v1/<hash>` with `Range` (at most 1 MiB per
+    /// request) and `Authorization: Bearer <ticket>`. `size` is the blob's.
+    FileReady {
+        hash: [u8; 32],
+        ticket: String,
+        size: u64,
+    },
+
+    /// An upload or a fetch is refused. `code` is for programs (`FILE_*`
+    /// below: under 100 the same request gets the same answer, from 100 a
+    /// later one may not); `reason` is for people.
+    FileRefused {
+        hash: [u8; 32],
+        code: u16,
+        reason: String,
+    },
+
+    /// A member asked for a blob the relay no longer has. Upload it again
+    /// (`FileUpload`) if you hold it and a message in `conv`, as you name it,
+    /// refers to it. In a channel it names no one, so who asked stays
+    /// unknown; a direct conversation's `conv` names its other party.
+    FileWanted { conv: FileConv, hash: [u8; 32] },
+
+    /// The blob has gone; its conversations' members online are being asked
+    /// for it. `FileReady` follows once one has uploaded it, or
+    /// `FileUnavailable` when nobody started within a minute, or
+    /// `FileRefused` (a budget) when it lands.
+    FileSeeking { hash: [u8; 32] },
+
+    /// Nobody online had the blob in time.
+    FileUnavailable { hash: [u8; 32] },
 }
+
+/// `FileRefused.code`, final for this hash: not in a conversation of the
+/// asker's (or no such conversation).
+pub const FILE_NOT_HERE: u16 = 1;
+/// The relay keeps no files.
+pub const FILE_OFF: u16 = 2;
+/// Larger than this relay takes.
+pub const FILE_TOO_LARGE: u16 = 3;
+/// Posted in too many places.
+pub const FILE_PLACES: u16 = 4;
+/// The uploaded bytes are not the blob the hash names.
+pub const FILE_MISMATCH: u16 = 5;
+/// From here on a later try may succeed. Too many at once: slow down.
+pub const FILE_RATE: u16 = 100;
+/// The asker's hourly upload or download budget is spent.
+pub const FILE_BUDGET: u16 = 101;
+/// The relay is busy: no space, or other uploads first.
+pub const FILE_BUSY: u16 = 102;
+/// The upload stalled.
+pub const FILE_STALLED: u16 = 103;
+/// The upload took too long.
+pub const FILE_EXPIRED: u16 = 104;
+/// The relay could not store the blob.
+pub const FILE_FAILED: u16 = 105;
 
 /// `Refused.code`: the client speaks another protocol version.
 /// `server_protocol` above the client's means the client must update.

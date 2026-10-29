@@ -3,6 +3,7 @@
   import { listen } from "@tauri-apps/api/event";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { onMount } from "svelte";
+  import Icon from "./Icons.svelte";
 
   let { sharerName = "Unknown" }: { sharerName: string } = $props();
 
@@ -50,6 +51,9 @@
     let lastRecvCount = 0;
     let lastFramesRecv = 0;
     let lastBytesRecv = 0;
+    // The counters run from when watching began, not from when this window
+    // opened: the first answer is the baseline, or it read as "442 fps"
+    let primed = false;
     const statsInterval = setInterval(() => {
       invoke<[number, number]>("get_screen_audio_status")
         .then(([, recvCount]) => {
@@ -61,6 +65,12 @@
       invoke<[number, number, number, number, number, number]>("get_screen_share_stats")
         .then(([, , framesRecv, framesDropped, bytesRecv, resPacked]) => {
           const dt = 0.5;
+          if (!primed) {
+            primed = true;
+            lastFramesRecv = framesRecv;
+            lastBytesRecv = bytesRecv;
+            return;
+          }
 
           // A restarted share resets the counters: never a negative rate
           const recvDelta = Math.max(0, framesRecv - lastFramesRecv);
@@ -108,7 +118,7 @@
   <div class="popout-header">
     <span class="sharer-name">{sharerName}'s screen</span>
     <span class="audio-status" class:active={audioReceiving}>
-      <span class="audio-icon">&#9835;</span>
+      <span class="audio-icon" aria-hidden="true"><Icon name="music-note" size={12} /></span>
       {#if audioReceiving}
         <span class="audio-label">Audio</span>
         <span class="audio-dot"></span>
@@ -129,8 +139,13 @@
         {/if}
       </span>
     {/if}
-    <button class="fullscreen-btn" onclick={toggleFullscreen} title="Fullscreen (double-click video)">&#x26F6;</button>
-    <button class="stop-btn" onclick={stopWatching}>Stop Watching</button>
+    <button
+      class="fullscreen-btn"
+      onclick={toggleFullscreen}
+      title="Fullscreen (double-click video)"
+      aria-label="Fullscreen"
+    ><Icon name="maximize" size={16} /></button>
+    <button class="stop-btn" onclick={stopWatching}>Stop watching</button>
   </div>
   <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
   <div
@@ -168,7 +183,7 @@
   }
 
   .sharer-name {
-    font-size: 13px;
+    font-size: var(--fs-body);
     font-weight: 600;
     color: var(--text-primary);
     white-space: nowrap;
@@ -182,7 +197,7 @@
     display: flex;
     align-items: center;
     gap: 4px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     color: var(--text-secondary);
     padding: 2px 8px;
     border-radius: 10px;
@@ -192,22 +207,22 @@
 
   .audio-status.active {
     color: var(--success);
-    background: rgba(67, 181, 129, 0.1);
+    background: color-mix(in srgb, var(--success) 12%, transparent);
   }
 
   .audio-icon {
-    font-size: 13px;
+    font-size: var(--fs-body);
   }
 
   .audio-label {
-    font-size: 11px;
+    font-size: var(--fs-micro);
   }
 
   .audio-dot {
     width: 6px;
     height: 6px;
     border-radius: 50%;
-    background: #43b581;
+    background: var(--success);
     animation: pulse 1s infinite;
   }
 
@@ -221,7 +236,7 @@
     align-items: center;
     gap: 6px;
     padding: 2px 8px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     color: var(--text-secondary);
     background: var(--bg-tertiary);
     border-radius: 10px;
@@ -250,7 +265,7 @@
     color: var(--text-secondary);
     border: 1px solid var(--border);
     padding: 4px 8px;
-    font-size: 14px;
+    font-size: var(--fs-md);
     line-height: 1;
     cursor: pointer;
     border-radius: 4px;
@@ -268,9 +283,9 @@
 
   .stop-btn {
     background: var(--danger);
-    color: white;
+    color: var(--on-danger);
     padding: 4px 12px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     border: none;
     border-radius: 6px;
     cursor: pointer;
@@ -298,7 +313,15 @@
 
   .waiting {
     color: var(--text-secondary);
-    font-size: 14px;
+    font-size: var(--fs-md);
     font-style: italic;
+  }
+
+  /* A finger needs 44px (--hit) */
+  @media (pointer: coarse) {
+    .stop-btn, .fullscreen-btn {
+      min-width: var(--hit);
+      min-height: var(--hit);
+    }
   }
 </style>

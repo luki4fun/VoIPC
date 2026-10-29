@@ -753,10 +753,12 @@ export class AudioEngine implements AudioApi {
       this.capture = cap;
     } catch (e) {
       if (gen !== this.captureGen) return; // a later start owns the capture now
-      // Like the native capture task: report and give up this transmission
+      // Like the native capture task: report and give up this transmission,
+      // as this start's error, so nothing shows "Talking" (D1-05)
       this.transmitting = false;
       this.stopCapture();
-      emit("audio-device-error", { error: describeError(e) });
+      emit("audio-device-error", { error: describeError(e), retrying: false });
+      throw e;
     }
   }
 
@@ -794,7 +796,7 @@ export class AudioEngine implements AudioApi {
   private onCaptureEnded(): void {
     if (!this.transmitting) return;
     console.warn("capture device error — attempting recovery");
-    emit("audio-device-error", { error: "capture device error" });
+    emit("audio-device-error", { error: "capture device error", retrying: true });
     this.capture?.close();
     this.capture = null;
     const retry = async () => {

@@ -26,6 +26,10 @@
 //                        channel, so peers receive a position beacon
 //   spatialtest=2d|3d    run the settings panel's spatial test (a synthetic
 //                        voice orbiting the listener) through the real mixer
+//   file=<KiB>           while talking, send the `dm` peer a file of that size
+//                        (1 MiB of text, which deflates, then random bytes);
+//                        the peer fetches it and checks it byte for byte. Both
+//                        report the main thread's long tasks meanwhile.
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
@@ -75,6 +79,11 @@ function log(line: string, data?: unknown) {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+async function sha256(bytes: Uint8Array): Promise<string> {
+  const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes as Uint8Array<ArrayBuffer>));
+  return Array.from(digest, (b) => b.toString(16).padStart(2, "0")).join("");
+}
+
 export async function run(params: URLSearchParams): Promise<void> {
   const name = params.get("name") ?? `web${Math.floor(Math.random() * 1000)}`;
   const invite = parseInviteFragment(window.location.hash);
@@ -91,6 +100,7 @@ export async function run(params: URLSearchParams): Promise<void> {
   const proximity = (params.get("proximity") ?? "off") as ProximityMode;
   const ownPosition = params.get("pos");
   const spatialTest = params.get("spatialtest") as "2d" | "3d" | null;
+  const fileKib = Number(params.get("file") ?? 0);
   // The server id every server-scoped command names: the address we connect with
   const server = window.location.host;
 
@@ -134,6 +144,54 @@ export async function run(params: URLSearchParams): Promise<void> {
     histories.set(channelId, fresh);
     return fresh;
   };
+
+  // A file sent or fetched while voice runs: how long it took, and how long
+  // the main thread was busy meanwhile (voice is built and sent there)
+  const longTasks: { start: number; ms: number }[] = [];
+  try {
+    new PerformanceObserver((list) => {
+      for (const t of list.getEntries()) longTasks.push({ start: t.startTime, ms: t.duration });
+    }).observe({ type: "longtask", buffered: true });
+  } catch {
+    // no long-task timing in this engine (Firefox): nothing to report
+  }
+  // Set in the closures below, so a plain `= null` would read as always null
+  let fileWindow = null as [number, number] | null;
+  /** The file this side sends or fetches, which the wrap-up waits for: in a
+   *  call a transfer yields to voice, and may outlast the main phase. */
+  let fileTransfer = null as Promise<void> | null;
+  async function sendOffered(to: number): Promise<void> {
+    const t0 = performance.now();
+    try {
+      const bytes = new Uint8Array(fileKib * 1024);
+      const text = new TextEncoder().encode("a line of the self-test's log file, again\n".repeat(25_600));
+      bytes.set(text.subarray(0, Math.min(text.length, bytes.length)));
+      for (let i = text.length; i < bytes.length; i += 65_536) {
+        crypto.getRandomValues(bytes.subarray(i, Math.min(i + 65_536, bytes.length)));
+      }
+      const sha = await sha256(bytes);
+      const file = await invoke("send_file", bytes, {
+        headers: { "x-voipc-file": JSON.stringify({ server, conv: { direct: to }, compress: true, op: "selftest" }) },
+      });
+      fileWindow = [t0, performance.now()];
+      log("file-sent", { bytes: bytes.length, ms: Math.round(performance.now() - t0) });
+      await invoke("send_direct_message", { server, targetUserId: to, content: `file:${JSON.stringify({ file, sha })}` });
+    } catch (e) {
+      log("error", { message: `file send: ${String(e)}` });
+    }
+  }
+  async function fetchOffered(from: number, offer: string): Promise<void> {
+    const t0 = performance.now();
+    try {
+      const { file, sha } = JSON.parse(offer);
+      const got = await invoke<ArrayBuffer>("fetch_file", { server, conv: { direct: from }, file, op: "selftest" });
+      const bytes = new Uint8Array(got);
+      fileWindow = [t0, performance.now()];
+      log("file-fetched", { ok: (await sha256(bytes)) === sha, bytes: bytes.length, ms: Math.round(performance.now() - t0) });
+    } catch (e) {
+      log("error", { message: `file fetch: ${String(e)}` });
+    }
+  }
 
   const watched = [
     "channel-list", "user-list", "user-joined", "user-left", "media-key-installed",
@@ -192,6 +250,12 @@ export async function run(params: URLSearchParams): Promise<void> {
         if (p.user_id !== myUserId) sharerUserId = p.user_id;
       }
       if (ev === "screenshare-frame") framesDrawn++;
+      if (ev === "direct-chat-message") {
+        const m = e.payload as { from_user_id: number; content: string };
+        if (m.from_user_id !== myUserId && m.content.startsWith("file:")) {
+          fileTransfer = fetchOffered(m.from_user_id, m.content.slice(5));
+        }
+      }
       // What App.svelte does for a sharer: encode only while someone watches,
       // and force a keyframe when a viewer asks for one.
       if (ev === "viewer-count-changed") {
@@ -501,6 +565,9 @@ export async function run(params: URLSearchParams): Promise<void> {
       try {
         await invoke("start_transmit");
         log("transmit-started");
+        // A file crosses while this side talks: what voice does then is the measure
+        const fileTo = fileKib > 0 ? [...users.values()].find((u) => u.username === dmTarget) : undefined;
+        if (fileTo) fileTransfer = sendOffered(fileTo.user_id);
         await sleep(4000);
         await invoke("stop_transmit");
         log("transmit-stopped");
@@ -519,6 +586,13 @@ export async function run(params: URLSearchParams): Promise<void> {
   if (spatialTest) {
     log("spatial-test", { where: testLabel(spatialTest, (Date.now() - started) / 1000) });
     await invoke("stop_spatial_test").catch(() => {});
+  }
+
+  if (fileTransfer) await Promise.race([fileTransfer, sleep(60_000)]);
+  if (fileWindow) {
+    const [from, to] = fileWindow;
+    const during = longTasks.filter((t) => t.start + t.ms > from && t.start < to);
+    log("file-longtasks", { count: during.length, max: Math.round(Math.max(0, ...during.map((t) => t.ms))) });
   }
 
   try {

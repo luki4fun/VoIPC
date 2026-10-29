@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- VoIPC night's background (client/src/lib/theme.ts) -->
+    <color name="window_background">#FF1C1F24</color>
+</resources>

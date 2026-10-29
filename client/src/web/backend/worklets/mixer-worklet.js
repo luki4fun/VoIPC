@@ -870,7 +870,10 @@ class MixerProcessor extends AudioWorkletProcessor {
         src.opus = w.opus_new();
         if (!src.opus) return null;
       }
-      const len = bytes ? Math.min(bytes.length, OPUS_MAX_PACKET) : 0;
+      // A packet over the limit is refused, never cut into a different one
+      // (S-050): the frame is lost, and concealment covers it
+      if (bytes && bytes.length > OPUS_MAX_PACKET) return null;
+      const len = bytes ? bytes.length : 0;
       if (len > 0) {
         new Uint8Array(w.memory.buffer, w.opus_input(src.opus), len).set(bytes.subarray(0, len));
       }

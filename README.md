@@ -20,31 +20,38 @@
 
 ---
 
-**VoIPC** is an encrypted, self-hosted voice/video/chat application. Think Discord or TeamSpeak, but with end-to-end encryption, zero data collection, and a server that stores nothing on disk unless its operator turns on accounts.
+**VoIPC** is an encrypted, self-hosted voice/video/chat application. Think Discord or TeamSpeak, but with end-to-end encryption, zero data collection, and a server that keeps nothing it can read: only, for a day by default, the encrypted copies of files posted in chat, unless its operator also turns on accounts.
 
 No accounts required. No telemetry. No compromises.
 
+> **Updating from 1.0? Update the server first, then the apps.** 1.3.1 speaks protocol 13 and
+> 1.0 speaks 12, and an app connects only to a server that speaks its protocol. The 1.0 desktop
+> app offers 1.3.1 on every server: on a server that still runs 1.0, wait, since an updated app
+> does not go back by itself. The browser needs nothing; Android and the `.deb` install over the
+> old version. Running a server: [docs/OPERATING.md §8](docs/OPERATING.md#8-upgrading). Going
+> back: [docs/COMPATIBILITY.md §4](docs/COMPATIBILITY.md#4-persisted-data).
+
 <p align="center">
-  <img src="website/screenshots/main-window.png" alt="VoIPC in the Modern layout — server rail, channels with the people in each of them, chat, and the member list" width="800">
+  <img src="website/screenshots/modern.png" alt="VoIPC in the Modern layout, VoIPC night palette: server rail, channels with the people in each of them, an encrypted conversation, and the member list" width="800">
 </p>
 
-<p align="center"><em>The Modern layout, which is what a new install starts in. Classic is one click away in Settings.</em></p>
+<p align="center"><em>The Modern layout, which is what a new install starts in. Classic and Stage are one click away in Settings.</em></p>
 
 <table>
   <tr>
-    <td><img src="website/screenshots/text-channels.png" alt="Text channels in the sidebar, an encrypted conversation, and the member list of the text channel"><br><sub>Text channels — a subscription, not a move</sub></td>
-    <td><img src="website/screenshots/modern-light.png" alt="The same window in the Slate light palette"><br><sub>Slate light, one of four palettes</sub></td>
-    <td><img src="website/screenshots/classic-layout.png" alt="The Classic layout: channels left, members right, voice and status bars along the bottom"><br><sub>Classic, the original arrangement</sub></td>
+    <td><img src="website/screenshots/stage.png" alt="The Stage layout: the people in the call as large tiles, a mint ring around whoever talks, the voice controls docked underneath"><br><sub>Stage: the call in the middle</sub></td>
+    <td><img src="website/screenshots/share.png" alt="Watching a shared screen on the Stage, the people in the call in a strip under it"><br><sub>Watching a screen share</sub></td>
+    <td><img src="website/screenshots/classic.png" alt="The Classic layout: channels left, members right, voice and status bars along the bottom"><br><sub>Classic, the original arrangement</sub></td>
   </tr>
   <tr>
-    <td><img src="website/screenshots/appearance.png" alt="Settings, Appearance tab: layout cards, palettes and the per-colour editor"><br><sub>Appearance: layout, palette, every colour</sub></td>
-    <td><img src="website/screenshots/screenshare.png" alt="Screen share viewer with stream stats and chat"><br><sub>Screen sharing</sub></td>
-    <td><img src="website/screenshots/connect.png" alt="Connect dialog with saved servers"><br><sub>Connecting</sub></td>
+    <td><img src="website/screenshots/day.png" alt="The Modern layout in the VoIPC day palette: a white chat, light grey sidebars and a deeper mint for whoever is talking"><br><sub>VoIPC day, for a light system</sub></td>
+    <td><img src="website/screenshots/appearance.png" alt="Settings, Appearance tab: three layout cards, the palettes and the per-colour editor"><br><sub>Appearance: layout, palette, every colour</sub></td>
+    <td><img src="website/screenshots/phone.png" alt="The Modern layout on a phone: the chat, with the talk button in reach of a thumb" width="118"> <img src="website/screenshots/phone-stage.png" alt="The Stage layout on a phone: two tiles per row and the call dock at the bottom" width="118"><br><sub>On a phone: Modern and Stage</sub></td>
   </tr>
 </table>
 
 <p align="center">
-  <em>The site in <a href="website/">website/</a> has the same two layouts and four palettes as a live preview you can switch, rather than pictures of them.</em>
+  <em>Every screenshot here comes from <code>node tools/screenshots.mjs --website</code>, against a scratch relay, so they are regenerated rather than retouched.</em>
 </p>
 
 ## Features
@@ -82,28 +89,35 @@ No accounts required. No telemetry. No compromises.
 - VPN-safe packet sizes (1280 bytes — fits inside WireGuard and OpenVPN tunnels)
 
 **Interface**
-- **Two layouts, switchable at any time.** **Modern** — server rail, channel sidebar showing who is
-  in every channel, chat in the middle, members on the right — and
-  **Classic**, the original: channels left, members right, voice and status bars along the bottom.
-  In both, a click on a channel previews it and the button under the chat joins it
+- **Three layouts, switchable at any time.** **Modern**: server rail, channel sidebar showing who is
+  in every channel, chat in the middle, members on the right. **Classic**, the original: channels
+  left, members right, voice and status bars along the bottom. **Stage**: the call in the middle,
+  a tile for each person with a ring around whoever talks, and the chat in a drawer.
+  In Modern and Classic, a click on a channel previews it and the button under the chat joins it
   (a double click on the row still works, where there is a mouse to do it with).
   Modern is the default, inspired by the chat apps most people arrive here from; you are asked
-  which you want on the first connection, a layout you picked is kept, and Classic is one click
-  away in Settings → Appearance
+  which you want on the first connection, a layout you picked is kept, and the others are one
+  click away in Settings → Appearance
 - Seeing who is in a channel you are not in respects the same rules as everything else: a channel
   that hides its members or has a password shows nobody, an anonymous one shows its pseudonyms, and
   the server decides — the client is told, it does not work it out
 - On a phone the modern layout is the phone shape you already know: channels swipe in from the left,
   members from the right, with buttons for both
-- **Four palettes** — Slate dark (the default), Slate light, VoIPC dark, AMOLED black — and every
-  colour in them can be changed individually. A fresh install follows your system's light/dark
-  setting and opens in Slate dark or Slate light; once you pick one it is yours and the system
-  stops deciding. Compact messages, chat text size and an interface zoom
+- **Six palettes** — VoIPC night and VoIPC day (the defaults), Navy, Slate dark, Slate light and
+  AMOLED black — and every colour in them can be changed individually. Until you pick one, the
+  app follows your system's light or dark setting with VoIPC day or night; once you pick one it
+  is yours and the system stops deciding. Compact messages, chat text size and an interface zoom
 - Drag the modern layout's sidebars to any width, double-click a divider to put it back, and fold
   the member list away; each layout remembers its own widths
 
 **Text Chat**
 - Channel and direct messages, both end-to-end encrypted
+- Replies that jump to what they answer, and threads (opened by hand, or gathered when a message draws a conversation)
+- Markdown, with highlighted code blocks; HTML in a message is shown as text, never run
+- @mentions, a "New" line at the first unread message, and search across every conversation on the device (never sent to the relay)
+- Files and pictures, sealed on your device under a key of their own; pictures are made smaller (and lose their location data) unless you send the original, and nothing downloads until you press Load. The relay keeps the ciphertext for a day at most by default, and members who still have a file send it again when the relay has let it go
+- Settings → Files: every file in your chats, which of them this device keeps, and the space they take
+- Edit and delete your own messages, react with emoji, pin messages in a channel you manage, forward a message or a file to another conversation
 - Encrypted local chat history (password-protected, AES-256-GCM)
 - Encrypted poke notifications (like TeamSpeak pokes)
 - Configurable chat history storage location
@@ -180,7 +194,8 @@ of showing a black frame.
 
 **Web client (browser)**
 
-The server hosts the web client itself: open `https://your-server:9987` and you get the same
+The server hosts the web client itself: open its address on port 9987 in a browser (the public
+demo: <https://ivy.l4f.cc:9987>) and you get the same
 UI as the desktop app, with the Signal Protocol and AES-256-GCM media crypto compiled to
 WebAssembly. Needs Chrome 97+, Edge 98+, Firefox 130+, or Safari 26.4+ (WebTransport + WebCodecs);
 Chromium and Firefox are both covered by the end-to-end test, including sharing a screen and
@@ -309,8 +324,8 @@ Client-side data at rest:
 | Max voice packet | 512 bytes |
 | Max video packet | 1,280 bytes |
 | Max control message | 64 KiB |
-| Protocol version | v12 (client and relay must match; [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)) |
-| Default port | 9987 — UDP for QUIC (all clients), TCP for the browser page and the TCP fallback |
+| Protocol version | v13 (client and relay must match; [docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)) |
+| Default port | 9987 — UDP for QUIC (all clients), TCP for the browser page, file transfers and the TCP fallback |
 
 ### Project Structure
 
@@ -353,14 +368,15 @@ VoIPC/
 # Build
 cargo build -p voipc-server --release
 
-# Generate self-signed TLS certificate (browsers check the subjectAltName —
-# put the host name / IP your users will type)
+# Generate self-signed TLS certificate for this machine's name and address
+# (browsers check them: set HOST and IP to the public ones if they differ)
+HOST=$(hostname -f) IP=$(ip route get 1 | grep -o 'src [0-9.]*' | cut -d' ' -f2)
 mkdir -p certs
 openssl req -x509 -newkey ec \
   -pkeyopt ec_paramgen_curve:prime256v1 \
   -keyout certs/server.key -out certs/server.crt \
   -days 365 -nodes -subj "/CN=voipc" \
-  -addext "subjectAltName=DNS:your-server.example,IP:203.0.113.5"
+  -addext "subjectAltName=DNS:$HOST,IP:$IP"
 
 # Run
 ./target/release/voipc-server
@@ -373,7 +389,7 @@ started with `-c` (`voipc-server -c server.toml`; the `admin` and `db` commands 
 
 ```toml
 host = "::"               # Bind address — "::" serves IPv6 and IPv4 from one listener; "0.0.0.0" for IPv4 only
-tcp_port = 9987           # HTTPS page for the browser client (and the TCP fallback)
+tcp_port = 9987           # HTTPS: the browser page, file transfers (and the TCP fallback)
 udp_port = 9987           # QUIC endpoint (all clients) — keep equal to tcp_port so one host:port reaches both
 tcp_fallback = false      # true: clients that cannot reach UDP carry everything over tcp_port (see below)
 max_users = 64
@@ -381,6 +397,10 @@ max_connections_per_ip = 32   # A browser client holds two of these, a native cl
 cert_path = "certs/server.crt"
 key_path = "certs/server.key"
 admin_token = "change-me"  # optional; unset = a random token is printed in the log at every start (with accounts, only while no account is admin)
+
+[files]                    # the encrypted file cache, on by default (docs/OPERATING.md §11 has every key)
+max_size_mb = 10           # largest file blob
+max_age_hours = 24         # no blob stays longer; all of them go at every start
 ```
 
 > **IPv6:** `host = "::"` is the default and serves both families from one listener (a host with IPv6 disabled falls back to `0.0.0.0` automatically). Do not pin `host` to a concrete IPv4 address while your domain publishes an AAAA record: the browser client then fails while everything else looks healthy, because the page and `/wt.json` are TCP and Chrome quietly falls back to IPv4 after the refused IPv6 attempt, while the WebTransport session is UDP and has no such fallback — it dies with `ERR_QUIC_PROTOCOL_ERROR`.
@@ -395,7 +415,7 @@ admin_token = "change-me"  # optional; unset = a random token is printed in the 
 > it is in use. Desktop and Android clients dial the fallback on the port they were given,
 > so keep `tcp_port` equal to `udp_port`.
 
-> **VPN / multi-homed setups:** If clients connect via a domain name (e.g. `vpn.example.com`) that resolves to a specific IP, set `host` to that IP. Otherwise the server may send QUIC packets from the wrong interface and the handshake never completes. Some options can also be passed as CLI flags (`--host`, `--tcp-port`, `--udp-port`, etc.; `voipc-server --help` lists them).
+> **VPN / multi-homed setups:** If clients connect via a domain name that resolves to a specific IP, set `host` to that IP. Otherwise the server may send QUIC packets from the wrong interface and the handshake never completes. Some options can also be passed as CLI flags (`--host`, `--tcp-port`, `--udp-port`, etc.; `voipc-server --help` lists them).
 
 Runtime settings in `server_settings.json`:
 
@@ -510,11 +530,8 @@ See [BUILDING.md](BUILDING.md) for detailed platform-specific instructions and d
 
 ### Web client
 
-Nothing to install: point a browser at the server.
-
-```
-https://your-server:9987
-```
+Nothing to install: point a browser at the server's address on port 9987, as with the public
+demo, <https://ivy.l4f.cc:9987>.
 
 The server binary serves the web client over HTTP/2 and carries voice, video and control
 messages over WebTransport on the same UDP port the desktop app uses (**9987**) — no extra
@@ -554,7 +571,7 @@ npm --prefix client test   # browser-side unit tests (spatial maths, room preset
 
 The server never holds a media key: it relays the encrypted blobs members hand each other.
 
-**Without accounts, nothing is written to disk but `bans.json`, once an admin bans someone: a server restart is otherwise a clean slate.** Accounts are something a server's operator turns on; what such a server keeps is listed below.
+**Without accounts, nothing is written to disk but `bans.json`, once an admin bans someone, and the file cache: a server restart is otherwise a clean slate.** The file cache holds the files posted in chat as their senders' apps encrypted them, each under a key only the end-to-end message carries, for a day by default (`max_age_hours`), and is wiped at every start. Accounts are something a server's operator turns on; what such a server keeps is listed below.
 
 ### What the server never sees
 
@@ -611,6 +628,7 @@ Off unless the operator sets `[accounts] mode`. Then the server keeps a database
 - Encrypted chat history (`VOIP` binary format, password-protected)
 - Audio/video settings and device preferences
 - Max 500 messages per channel, auto-rotated
+- Files you sent or loaded, still sealed under their keys: up to 1 GB by default on the desktop and 256 MB on Android (Settings → Files), in memory only in the browser
 - With an account: a remembered device's key and, with it, the key to your vault (desktop: inside the encrypted
   chat history, or only in memory while that is off; browser: IndexedDB, under a key the page cannot export),
   how far it has read the server's copies, and whom it has named as readers
@@ -656,6 +674,13 @@ does so under those terms as well:
 - **FFmpeg** is **GPL** in the builds VoIPC bundles: the Windows installer ships BtbN's
   `gpl-shared` build, and the AppImage carries FFmpeg with x264 and x265. The `.deb` uses the
   system's FFmpeg. Each release's notes name the exact FFmpeg build and link its source.
+
+Every build carries `THIRD-PARTY-NOTICES.txt` beside its page: each Rust crate and npm package
+in it, the licence VoIPC uses it under, and the copyright and licence texts those licences ask
+a binary to carry. A relay serves it at `/THIRD-PARTY-NOTICES.txt` on its port (the demo's:
+<https://ivy.l4f.cc:9987/THIRD-PARTY-NOTICES.txt>).
+`node tools/voipc.mjs notices` writes it into `client/public/`, and every build does so before
+Vite copies it into the bundle.
 
 ---
 

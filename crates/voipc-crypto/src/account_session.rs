@@ -13,7 +13,9 @@ use voipc_protocol::messages::{AccountReply, AccountRequest, ClientMessage};
 use voipc_protocol::types::{AccountInfo, UserInfo};
 use zeroize::Zeroizing;
 
-use crate::account::{derive_from_master, kdf_salt, DeviceEnrol, PinCheck, SignedIn, Vault};
+use crate::account::{
+    derive_from_master, kdf_salt, recovery_text, reset_key, DeviceEnrol, PinCheck, SignedIn, Vault,
+};
 use crate::sync::{AccountSync, Event, LogMemory, Prefs};
 
 /// A device the relay remembers now: what signs this account in there next
@@ -449,6 +451,36 @@ impl AccountSession {
                     .filter(|c| !c.is_empty()),
             },
         )])
+    }
+
+    /// A new recovery key, confirmed by the password (and the second factor
+    /// where the account has one), with the text to show once. It also gives
+    /// an account made before 1.3 its reset key (`slot.reset`), so only the
+    /// recovery key resets its password from then on (S-006).
+    pub fn recovery_key_new(
+        &self,
+        master: &[u8; 32],
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    ) -> (Actions, String) {
+        let secret = derive_from_master(master);
+        let recovery = Zeroizing::new(crate::aead::random::<32>());
+        let vault = Vault::from_dek(self.relay_id, &self.name, *self.dek);
+        let msg = AccountRequest::RecoveryKeyNew {
+            secret: secret.auth_secret.to_vec(),
+            recovery_slot: vault.recovery_slot(&recovery).v,
+            reset_key: reset_key(&recovery, &self.relay_id, &self.name).to_vec(),
+            totp: totp
+                .map(|c| c.trim().replace(' ', ""))
+                .filter(|c| !c.is_empty()),
+            recovery_code: recovery_code
+                .map(|c| c.trim().to_string())
+                .filter(|c| !c.is_empty()),
+        };
+        (
+            Actions::sending(vec![ClientMessage::Account(msg)]),
+            recovery_text(&recovery),
+        )
     }
 
     pub fn cloud(&self) -> bool {

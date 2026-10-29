@@ -6,16 +6,38 @@
 
   import { connectionState, serverAddress } from "../stores/connection.js";
   import { cancelReconnect, reconnectInfo } from "../connect.js";
+
+  // What it covers is out of reach while it is up, for the keyboard and a
+  // screen reader as for the mouse: Tab used to walk into the pane under it.
+  // Only what this made inert is given back; the shell's own `inert` stays.
+  function coverPane(node: HTMLElement) {
+    const covered = [...(node.parentElement?.children ?? [])].filter(
+      (el): el is HTMLElement =>
+        el !== node && el instanceof HTMLElement && !el.inert && !el.hasAttribute("data-reconnect-status"),
+    );
+    for (const el of covered) el.inert = true;
+    return {
+      destroy() {
+        for (const el of covered) el.inert = false;
+      },
+    };
+  }
 </script>
 
+<!-- Always there, so a screen reader hears the pane go away and come back;
+     without the attempt count, which would be read out at every retry -->
+<span class="sr-only" role="status" data-reconnect-status
+  >{#if $connectionState === "reconnecting"}Connection lost, reconnecting{:else if $connectionState === "connecting"}Connecting{/if}</span
+>
+
 {#if $connectionState === "reconnecting" || $connectionState === "connecting"}
-  <div class="overlay">
+  <div class="overlay" use:coverPane>
     <div class="dialog">
       <div class="spinner"></div>
       {#if $connectionState === "connecting"}
         <h2>Connecting</h2>
       {:else}
-        <h2>Connection Lost</h2>
+        <h2>Connection lost</h2>
         <p class="message">Reconnecting... attempt #{$reconnectInfo.attempt}</p>
       {/if}
       {#if $reconnectInfo.error}
@@ -30,11 +52,11 @@
   .overlay {
     position: absolute;
     inset: 0;
-    background: rgba(0, 0, 0, 0.7);
+    background: var(--scrim);
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 30;
+    z-index: var(--z-pane);
   }
 
   .dialog {
@@ -66,19 +88,19 @@
   }
 
   h2 {
-    font-size: 18px;
+    font-size: var(--fs-xl);
     color: var(--text-primary);
     margin: 0;
   }
 
   .message {
-    font-size: 14px;
+    font-size: var(--fs-md);
     color: var(--text-secondary);
     margin: 0;
   }
 
   .error-detail {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--danger);
     margin: 0;
     text-align: center;
@@ -88,7 +110,7 @@
     background: transparent;
     color: var(--danger);
     padding: 8px 24px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     border: 1px solid var(--danger);
     cursor: pointer;
     border-radius: 4px;
@@ -96,6 +118,6 @@
 
   .cancel-btn:hover {
     background: var(--danger);
-    color: white;
+    color: var(--on-danger);
   }
 </style>

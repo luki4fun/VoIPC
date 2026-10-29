@@ -6,6 +6,7 @@
 //! - Pairwise session establishment (X3DH + Double Ratchet)
 //! - Group encryption via Sender Keys
 //! - Symmetric AES-256-GCM encryption for voice/video media
+//! - Chat files: sealed, chunked and key-committed (`file`)
 //!
 //! Signal state is deliberately not persisted: a guest's identity is new on
 //! every connect (nothing to fingerprint or link across sessions). An
@@ -16,6 +17,7 @@ pub mod account_session;
 mod aead;
 pub mod channel_state;
 pub mod envelope;
+pub mod file;
 #[cfg(any(test, fuzzing))]
 pub mod fuzz;
 pub mod group;
@@ -31,8 +33,8 @@ pub mod time;
 // Re-export key types for convenience
 pub use channel_state::{history_sources, pick_history_sources, ChannelKeying, HISTORY_SOURCES};
 pub use envelope::{
-    envelope, history_payload, new_message_id, open_envelope, open_history_payload, Message,
-    MAX_MESSAGE_TTL_SECS,
+    envelope, envelope_with, history_payload, new_message_id, open_envelope, open_history_payload,
+    ChatEvent, Extras, FileRef, Forwarded, Message, MAX_MESSAGE_TTL_SECS,
 };
 pub use identity::{generate_identity_key_pair, SerializableIdentityKeyPair};
 pub use media_keys::{

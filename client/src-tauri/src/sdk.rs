@@ -20,7 +20,7 @@
 //! VoIPC → game
 //!   {"type":"state","state":"ingame","user_id":42,"username":"Luki#0420",
 //!    "channel":"Ingame","proximity":"3d","muted":false,"deafened":false,
-//!    "version":"1.0.0","sdk":1,
+//!    "version":"1.3.1","sdk":1,
 //!    "capabilities":["spatial","direct","volume","muffle","radio","phone","talk",
 //!                    "reverb","underwater"]}
 //!   {"type":"talk","user_id":42,"speaking":true}
@@ -79,6 +79,9 @@ const JOIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 /// the server, whose password limiter is 3 burst / 1 per second, and each
 /// refusal raises a toast — so a hello loop is a way to paper the UI.
 const MIN_HELLO_GAP: std::time::Duration = std::time::Duration::from_secs(1);
+/// Frames a socket may send in one second. A game sends a position update a
+/// tick and a ping now and then; far fewer than this.
+const MAX_FRAMES_PER_SEC: u32 = 200;
 /// Longest a game may hold the user's push-to-talk down before it has to ask
 /// again. A radio key nobody is pressing must not be able to leave a
 /// microphone open, whatever the mod believes about its own state.
@@ -380,13 +383,11 @@ async fn serve(
     // The server that id belongs to. Ids are per server as well as per
     // connection, so the same number on another server is somebody else.
     let mut hello_server: Option<String> = None;
-    // Where this socket's last `hello` put the player (server, channel id), and
-    // the user's move counter at that moment (`AppState::user_moved`). Once the
-    // user moves themselves, the game may not move them back; the socket is
-    // `parked` until they return to that channel on their own, and is then told
-    // so (`returned`).
+    // Where this socket's last `hello` put the player (server, channel id).
+    // Once the user moves themselves, no game socket may move them back
+    // (`AppState::sdk_placed`, shared); this one is `parked` until they return
+    // to that channel on their own, and is then told so (`returned`).
     let mut hello_target: Option<(String, u32)> = None;
-    let mut moved_at_hello: Option<u64> = None;
     let mut parked = false;
     // The ids this socket listed in its last update. A mod is told about the
     // players it placed, and about the user — not about everybody else in the
@@ -394,7 +395,8 @@ async fn serve(
     let mut listed: std::collections::HashSet<u32> = std::collections::HashSet::new();
     // Rate gates; see MIN_UPDATE_GAP / MIN_HELLO_GAP.
     let mut last_update: Option<tokio::time::Instant> = None;
-    let mut last_hello: Option<tokio::time::Instant> = None;
+    // Frames this second, for `MAX_FRAMES_PER_SEC` (S-036).
+    let mut frames = (tokio::time::Instant::now(), 0u32);
     // Consecutive `hello`s refused by the rate limit; see the arm below.
     let mut hello_floods = 0u8;
     // Is this socket holding the user's push-to-talk down, and since when?
@@ -421,6 +423,30 @@ async fn serve(
                     Ok(Ok(None)) => { close(&mut wr, 1000).await; return Ok(()); }
                     Ok(Ok(Some(f))) => f,
                 };
+                // A budget before any parse: a socket that floods frames at
+                // loopback speed goes (S-036)
+                let now = tokio::time::Instant::now();
+                if now.duration_since(frames.0) >= std::time::Duration::from_secs(1) {
+                    frames = (now, 0);
+                }
+                frames.1 += 1;
+                if frames.1 > MAX_FRAMES_PER_SEC {
+                    close(&mut wr, 1008).await;
+                    anyhow::bail!("more than {MAX_FRAMES_PER_SEC} frames a second");
+                }
+                // An origin the user has since taken off the list loses its
+                // socket at its next frame, not when it chooses to leave (S-031)
+                if let Some(o) = &origin {
+                    let still = {
+                        let state = app.state::<AppState>();
+                        let config = state.config();
+                        origin_allowed(o, &config.sdk_allowed_origins)
+                    };
+                    if !still {
+                        close(&mut wr, 1008).await;
+                        anyhow::bail!("origin {o} is no longer allowed");
+                    }
+                }
                 let text = match frame {
                     Frame::Text(text) => text,
                     Frame::Ping(payload) => { write_frame(&mut wr, 0xA, &payload).await?; continue; }
@@ -431,7 +457,16 @@ async fn serve(
                     Ok(GameMessage::Hello(hello)) => {
                         bad_messages = 0;
                         let now = tokio::time::Instant::now();
-                        if last_hello.is_some_and(|t| now.duration_since(t) < MIN_HELLO_GAP) {
+                        let too_soon = {
+                            let state = app.state::<AppState>();
+                            let mut last = state.sdk_last_hello.lock().unwrap_or_else(|p| p.into_inner());
+                            let soon = last.is_some_and(|t| now.duration_since(t) < MIN_HELLO_GAP);
+                            if !soon {
+                                *last = Some(now);
+                            }
+                            soon
+                        };
+                        if too_soon {
                             send_json(&mut wr, &error("rate_limited", "one hello per second"))
                                 .await?;
                             // A mod that answers the refusal with another hello
@@ -447,7 +482,6 @@ async fn serve(
                             continue;
                         }
                         hello_floods = 0;
-                        last_hello = Some(now);
                         // Another game already has the mix. Checked before the
                         // join, so a refused hello cannot move the user.
                         if owner_conflict(&owner_slot(owner), generation, &origin) {
@@ -461,7 +495,7 @@ async fn serve(
                         }
                         let game = short_name(&hello.game, "a game");
                         let resource = short_name(&hello.resource, "");
-                        let may = may_move(moved_at_hello, user_moved(app));
+                        let may = game_may_move(app);
                         let (reply, answered_for) = on_hello(app, &hello, may).await;
                         if reply.get("code").and_then(|c| c.as_str()) == Some("player_left") {
                             parked = true;
@@ -481,7 +515,10 @@ async fn serve(
                                 reply.get("user_id").and_then(|v| v.as_u64()).map(|v| v as u32);
                             hello_server = answered_for.as_ref().map(|(server, _)| server.clone());
                             hello_target = answered_for;
-                            moved_at_hello = Some(user_moved(app));
+                            if let Some(target) = hello_target.clone() {
+                                let at = user_moved(app);
+                                with_placed(app, |p| *p = Some((at, target)));
+                            }
                             parked = false;
                             listed.clear();
                             // Start listening from *now*. The join this hello
@@ -545,7 +582,7 @@ async fn serve(
                                     listed.clear();
                                     // …and if the user walked away themselves,
                                     // a hello will not bring them back.
-                                    if !may_move(moved_at_hello, user_moved(app)) {
+                                    if !game_may_move(app) {
                                         code = "player_left";
                                         parked = true;
                                     }
@@ -565,7 +602,7 @@ async fn serve(
                         if hello_user_id.is_none()
                             || owner_slot(owner).generation != generation
                         {
-                            let reply = if !may_move(moved_at_hello, user_moved(app)) {
+                            let reply = if !game_may_move(app) {
                                 parked = true;
                                 error("player_left", "the player left the channel this game joined")
                             } else {
@@ -648,7 +685,7 @@ async fn serve(
                 Ok(SdkEvent::Detached) => {
                     hello_user_id = None;
                     listed.clear();
-                    if !may_move(moved_at_hello, user_moved(app)) {
+                    if !game_may_move(app) {
                         parked = true;
                     }
                     if holding_tx {
@@ -667,7 +704,12 @@ async fn serve(
                         && matches!(ev, SdkEvent::Moved)
                         && owner_slot(owner).generation == generation
                     {
-                        if let Some(target) = &hello_target {
+                        // A socket that never placed the user watches where
+                        // another one did
+                        let target = hello_target
+                            .clone()
+                            .or_else(|| with_placed(app, |p| p.as_ref().map(|(_, t)| t.clone())));
+                        if let Some(target) = &target {
                             if back_in(app, target).await {
                                 parked = false;
                                 send_json(
@@ -691,8 +733,26 @@ async fn serve(
                         send_text(&mut wr, &msg).await?;
                     }
                 }
-                // Missed a burst of edges: the next one re-syncs the mod
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                // Missed a burst of edges: the next one re-syncs the mod. A
+                // missed `Detached` could have left a held microphone with no
+                // one to let go of it, so a hold ends here, and the mod is told
+                // as at the 60 s cap: a key still down says so again (S-035).
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                    if holding_tx {
+                        holding_tx = false;
+                        if releases_transmit(owner_slot(owner).generation, generation) {
+                            release_transmit(app).await;
+                        }
+                        send_json(
+                            &mut wr,
+                            &error(
+                                "transmit_expired",
+                                "push-to-talk released — send transmit again to keep talking",
+                            ),
+                        )
+                        .await?;
+                    }
+                }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
             },
 
@@ -1021,6 +1081,23 @@ fn unknown_type(text: &str) -> Option<String> {
 /// The user's voice-move counter (`AppState::user_moved`).
 fn user_moved(app: &tauri::AppHandle) -> u64 {
     app.state::<AppState>().user_moved.load(Ordering::Relaxed)
+}
+
+/// `AppState::sdk_placed`, under its lock.
+fn with_placed<R>(
+    app: &tauri::AppHandle,
+    f: impl FnOnce(&mut Option<(u64, (String, u32))>) -> R,
+) -> R {
+    let state = app.state::<AppState>();
+    let mut slot = state.sdk_placed.lock().unwrap_or_else(|p| p.into_inner());
+    f(&mut slot)
+}
+
+/// May a game move the user now? Not once they have moved themselves since a
+/// game last placed them, whichever socket that was (S-030).
+fn game_may_move(app: &tauri::AppHandle) -> bool {
+    let placed = with_placed(app, |p| p.as_ref().map(|(at, _)| *at));
+    may_move(placed, user_moved(app))
 }
 
 /// Is the user in this channel on this server, with voice there?
@@ -1428,6 +1505,32 @@ mod tests {
     use voipc_audio::spatial::*;
 
     #[test]
+    fn only_a_plain_origin_may_be_added() {
+        for ok in [
+            "http://localhost:8000",
+            "https://cfx-nui-voipc",
+            "http://resource",
+            "https://a.example",
+        ] {
+            assert!(origin_well_formed(ok), "{ok}");
+        }
+        for bad in [
+            "null",
+            "localhost",
+            "http://",
+            "http://a.example/path",
+            "http://a b",
+            "http://a.example:",
+            "http://a.example:123456",
+            "http://a\u{202e}b",
+            "http://a.example\nVoIPC: re-enter your password",
+        ] {
+            assert!(!origin_well_formed(bad), "{bad:?}");
+        }
+        assert!(!origin_well_formed(&format!("http://{}", "a".repeat(100))));
+    }
+
+    #[test]
     fn origins_are_limited_to_game_runtimes_unless_allowed() {
         assert!(origin_allowed("https://cfx-nui-my-voice", &[]));
         assert!(origin_allowed("https://cfx-nui-voice_2", &[]));
@@ -1444,8 +1547,9 @@ mod tests {
         // A page from the internet cannot drive the mix, even from loopback
         assert!(!origin_allowed("https://evil.example", &[]));
         assert!(!origin_allowed("null", &[]));
-        // …until the user allows it (a file:// test page sends "null")
-        assert!(origin_allowed("null", &["null".to_string()]));
+        // Not even when listed: `null` is every sandboxed and file:// page (S-011)
+        assert!(!origin_allowed("null", &["null".to_string()]));
+        // Other origins the user listed are allowed
         assert!(origin_allowed(
             "https://evil.example",
             &["https://evil.example".to_string()]

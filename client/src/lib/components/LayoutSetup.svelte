@@ -1,5 +1,6 @@
 <script lang="ts">
   import { dialog } from "../actions/dialog.js";
+  import { roving } from "../actions/roving.js";
   // "Which of these do you want?", once.
   //
   // Shown on the first connection, right after the audio setup and for the same
@@ -39,21 +40,23 @@
 </script>
 
 <div class="overlay">
-  <div class="layout-setup" aria-label="Choose a layout" use:dialog>
+  <!-- Escape and Android's Back are "Decide later" -->
+  <div class="layout-setup" aria-label="Choose a layout" use:dialog={{ onclose }}>
     <h3>How should VoIPC look?</h3>
     <p class="intro">
-      Two layouts, the same app underneath. Pick whichever feels familiar — you can change it
-      any time in Settings → Appearance.
+      Three layouts, the same app underneath. Pick whichever feels familiar — you can change
+      it any time in Settings → Appearance.
     </p>
 
-    <div class="choices">
+    <div class="choices" role="radiogroup" aria-label="Layout" use:roving>
       <LayoutPreview layout="modern" selected={picked === "modern"} onpick={() => (picked = "modern")} />
       <LayoutPreview layout="classic" selected={picked === "classic"} onpick={() => (picked = "classic")} />
+      <LayoutPreview layout="stage" selected={picked === "stage"} onpick={() => (picked = "stage")} />
     </div>
 
     <div class="actions">
       <button class="text-link skip-link" onclick={onclose}>Decide later</button>
-      <button class="submit-btn" onclick={confirm}>Use this layout</button>
+      <button class="submit-btn btn btn-primary" onclick={confirm}>Use this layout</button>
     </div>
   </div>
 </div>
@@ -62,12 +65,12 @@
   .overlay {
     position: fixed;
     inset: 0;
-    z-index: 210;
+    z-index: var(--z-setup);
     display: flex;
     align-items: center;
     justify-content: center;
     padding: 16px;
-    background: rgba(0, 0, 0, 0.6);
+    background: var(--scrim);
   }
 
   .layout-setup {
@@ -83,13 +86,13 @@
 
   h3 {
     margin-bottom: 6px;
-    font-size: 18px;
+    font-size: var(--fs-xl);
     color: var(--text-primary);
   }
 
   .intro {
     margin-bottom: 16px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     line-height: 1.5;
     color: var(--text-secondary);
   }
@@ -112,7 +115,7 @@
     background: transparent;
     color: var(--text-secondary);
     padding: 8px 0;
-    font-size: 13px;
+    font-size: var(--fs-body);
     text-decoration: underline;
   }
 
@@ -121,15 +124,7 @@
   }
 
   .submit-btn {
-    background: var(--accent);
-    color: #fff;
     padding: 10px 20px;
-    font-size: 14px;
-    font-weight: 600;
-    border-radius: 6px;
-  }
-
-  .submit-btn:hover {
-    background: var(--accent-hover);
+    font-size: var(--fs-md);
   }
 </style>

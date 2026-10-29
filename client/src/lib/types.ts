@@ -142,8 +142,10 @@ export interface ChatMessage {
    * ("Not delivered — bob left the server"); never sent to anybody. "undecryptable" = ciphertext we could not open, kept on screen but
    * never handed to anyone as history: a placeholder is not what was written,
    * and re-sharing it spreads one member's missing key to everyone who joins
-   * after them. Anything else (a future attachment type) renders as a
-   * placeholder and is never re-shared.
+   * after them. "deleted" = a message its writer deleted: a tombstone, never
+   * drawn and never re-shared, kept so that a copy of the message offered
+   * again (a hand-off, the stored log) finds it and stays out. Anything else
+   * (a future attachment type) renders as a placeholder and is never re-shared.
    */
   kind?: string;
   /**
@@ -158,7 +160,102 @@ export interface ChatMessage {
    * only ever bring its deadline forward — see `expiryFor` in chat-rules.ts.
    */
   expires_at?: number;
+  /**
+   * The message this one answers, by the `id` its sender minted, and the
+   * thread it belongs to (the id of the thread's first message). Both travel
+   * inside the end-to-end envelope; only the id, never a quote, so an answer
+   * never keeps the text it answers alive past that text's own timer. The
+   * message itself is looked up in the same conversation when shown.
+   */
+  reply_to?: string;
+  thread?: string;
+  /** The file this message carries (its text is then the caption). */
+  file?: FileRef;
+  /** Forwarded from another conversation: who wrote it there, and when. */
+  fwd?: Forwarded;
+  // ── What later events did to it (chat-rules.ts `applyEvent`): this
+  //    reader's own record, never handed to anyone with the message ──
+  /** When its writer last changed it (ms). Shown as "(edited)". */
+  edited_at?: number;
+  /** The reactions on it, by emoji, each with who reacted (latest wins). */
+  reactions?: Reaction[];
+  /** Pinned in its channel by a manager (`on`), or unpinned; latest wins. */
+  pin?: { on: boolean; at: number; by: string };
+  /** What a later version kept in this message's archive entry that this one
+   *  does not know (JSON): written back on the next save, never read, never
+   *  handed to anyone (chat-rules.ts `fromArchived`). */
+  extra_kept?: string;
 }
+
+/** Where a forwarded message came from (envelope.rs `Forwarded`): the
+ *  forwarder's word, shown as a label. */
+export interface Forwarded {
+  name: string;
+  /** When it was written there (ms). */
+  at: number;
+}
+
+/**
+ * Something done to an earlier message of the same conversation, named by id
+ * (envelope.rs `ChatEvent`). An edit's new text is the event's `content`.
+ */
+export type ChatEvent =
+  | { kind: "edit"; target: string }
+  | { kind: "delete"; target: string }
+  | { kind: "react"; target: string; emoji: string; on: boolean }
+  | { kind: "pin"; target: string; on: boolean };
+
+/** One emoji on a message, and everyone who put it there or took it off. */
+export interface Reaction {
+  emoji: string;
+  by: Reactor[];
+}
+
+export interface Reactor {
+  /** Who, as `authorKey` names a writer. */
+  key: string;
+  /** Their name then, for the chip's list. */
+  name: string;
+  on: boolean;
+  /** When (ms): an older event for the same person and emoji changes nothing. */
+  at: number;
+}
+
+/**
+ * A file's blob as the backends move it: what `send_file` returns and
+ * `fetch_file` takes, all of it end to end (the relay sees only `hash`).
+ */
+export interface FileBlob {
+  /** The blob id: SHA-256 of the blob, 64 hex digits. */
+  hash: string;
+  /** The file's key, 64 hex digits. */
+  key: string;
+  /** The file's own length, before any deflate. */
+  size: number;
+  /** The blob holds the file deflated. */
+  z: boolean;
+}
+
+/**
+ * The file a message carries (envelope.rs `FileRef`), checked where it
+ * enters (`fileRef` in chat-rules.ts). Only a card believes the rest: what a
+ * loaded file is shown as comes from its bytes (`file-sniff.ts`), never `mime`.
+ */
+export interface FileRef extends FileBlob {
+  /** As the sender named it: shown as text, cleaned again to save. */
+  name: string;
+  mime?: string;
+  /** A picture's or video's size in pixels. */
+  w?: number;
+  h?: number;
+  /** Seconds of audio or video. */
+  dur?: number;
+  /** 16×16 RGB pixels, base64 (1024 characters): drawn as they are. */
+  px?: string;
+}
+
+/** A conversation as the backends name it for files (files.rs `Conv`). */
+export type FileConv = { channel: number } | { direct: number } | { account: string };
 
 /** A relay with accounts, as `Authenticated.accounts` describes it (protocol v11). */
 export interface RelayAccounts {

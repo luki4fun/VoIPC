@@ -399,6 +399,20 @@ impl Resolution {
 
 #[cfg(test)]
 mod tests {
+    /// Every share VoIPC sends fits the viewer's decode cap, either way up
+    /// (S-046: the cap sits just above the largest one).
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn every_share_resolution_fits_the_decode_cap() {
+        for r in [Resolution::P480, Resolution::P720, Resolution::P1080] {
+            let (w, h) = (r.width() as usize, r.height() as usize);
+            // Aligned up to 16, as the codecs store them
+            let area = w.div_ceil(16) * 16 * h.div_ceil(16) * 16;
+            assert!(area <= crate::decoder::MAX_DECODE_PIXELS, "{w}x{h}");
+            assert!(w.max(h) <= 2048, "{w}x{h} on its side");
+        }
+    }
+
     use super::*;
 
     /// One 2×2 I420 frame of a single colour.

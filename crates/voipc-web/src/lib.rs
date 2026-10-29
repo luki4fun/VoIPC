@@ -13,6 +13,7 @@ pub mod media;
 pub mod signal;
 
 use serde::Serialize;
+use voipc_crypto::file::FileError;
 use voipc_protocol::codec::{APP_VERSION, PROTOCOL_VERSION};
 use voipc_protocol::messages::ClientMessage;
 use voipc_protocol::types::PreKeyBundleData;
@@ -375,14 +376,68 @@ pub fn new_message_id() -> String {
     voipc_crypto::new_message_id()
 }
 
-/// Pack a message so it carries what the server never sees: the id, and the
-/// destruction timer in seconds (0 or absent for a message with no timer).
+/// Pack a message so it carries what the server never sees: the id, the
+/// destruction timer in seconds (0 or absent for a message with no timer),
+/// the ids of the message it answers and of its thread, and the file it
+/// carries, as JSON text (`FileRef`); a forwarded message's label
+/// (`{name, at}`), or an event (`{kind, target, emoji?, on?}`), as JSON text
+/// too. Throws for any of them that does not check, rather than send what a
+/// reader would take for something else (the desktop's `checked_extras`).
+// One argument per part, as the JS side names them
+#[allow(clippy::too_many_arguments)]
 #[wasm_bindgen(js_name = envelope)]
-pub fn envelope(id: &str, text: &str, ttl_secs: Option<u32>) -> Vec<u8> {
-    voipc_crypto::envelope(id, text, ttl_secs)
+pub fn envelope(
+    id: &str,
+    text: &str,
+    ttl_secs: Option<u32>,
+    reply: Option<String>,
+    thread: Option<String>,
+    file: Option<String>,
+    fwd: Option<String>,
+    event: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    fn parse<T>(
+        json: Option<String>,
+        check: impl Fn(&serde_json::Value) -> Option<T>,
+        what: &str,
+    ) -> Result<Option<T>, JsError> {
+        json.map(|j| {
+            serde_json::from_str::<serde_json::Value>(&j)
+                .ok()
+                .and_then(|v| check(&v))
+                .ok_or_else(|| JsError::new(&format!("invalid {what}")))
+        })
+        .transpose()
+    }
+    Ok(voipc_crypto::envelope_with(
+        id,
+        text,
+        ttl_secs,
+        &voipc_crypto::Extras {
+            reply,
+            thread,
+            file: parse(file, voipc_crypto::FileRef::checked, "file")?,
+            fwd: parse(fwd, voipc_crypto::Forwarded::checked, "fwd")?,
+            event: parse(
+                event,
+                |v| v.as_object().and_then(voipc_crypto::ChatEvent::checked),
+                "event",
+            )?,
+        },
+    ))
 }
 
-/// `{ id: string | null, text: string, ttl_secs: number | null }` from a
+/// A value as JS has it, through JSON: a shape serde writes, read back by
+/// the page as a plain object.
+fn as_js<T: serde::Serialize>(v: Option<T>) -> JsValue {
+    v.and_then(|v| serde_json::to_string(&v).ok())
+        .and_then(|j| js_sys::JSON::parse(&j).ok())
+        .unwrap_or(JsValue::NULL)
+}
+
+/// `{ id: string | null, text: string, ttl_secs: number | null,
+/// reply_to: string | null, thread: string | null, file: FileRef | null,
+/// fwd: {name, at} | null, event: {kind, target, emoji?, on?} | null }` from a
 /// received message.
 #[wasm_bindgen(js_name = openEnvelope)]
 pub fn open_envelope(plaintext: &[u8]) -> JsValue {
@@ -399,6 +454,23 @@ pub fn open_envelope(plaintext: &[u8]) -> JsValue {
                 .map(|t| JsValue::from_f64(t as f64))
                 .unwrap_or(JsValue::NULL),
         ),
+        (
+            "reply_to",
+            m.extras
+                .reply
+                .map(|s| JsValue::from_str(&s))
+                .unwrap_or(JsValue::NULL),
+        ),
+        (
+            "thread",
+            m.extras
+                .thread
+                .map(|s| JsValue::from_str(&s))
+                .unwrap_or(JsValue::NULL),
+        ),
+        ("file", as_js(m.extras.file)),
+        ("fwd", as_js(m.extras.fwd)),
+        ("event", as_js(m.extras.event)),
     ])
 }
 
@@ -425,6 +497,69 @@ pub fn history_payload(channel_id: u32, messages_json: &str) -> Result<Vec<u8>, 
 pub fn open_history_payload(channel_id: u32, payload: &[u8]) -> Result<String, JsError> {
     let messages = voipc_crypto::open_history_payload(channel_id, payload).map_err(js_err)?;
     Ok(serde_json::Value::Array(messages).to_string())
+}
+
+// ── Files ────────────────────────────────────────────────────────────────
+
+/// `{ hash, key, size, z, blob }`: `plain` sealed under a fresh key
+/// (`voipc_crypto::file`). `hash` is the blob id that the relay keeps `blob`
+/// under; `key`, `size` and `z` travel only inside the end-to-end message.
+/// The hash and the key are hex, the form the message carries them in. With
+/// `compress`, the file is deflated first where that saves a tenth or more.
+#[wasm_bindgen(js_name = sealFile)]
+pub fn seal_file(plain: &[u8], compress: bool) -> Result<JsValue, JsValue> {
+    let (meta, blob) = voipc_crypto::file::seal(plain, compress).map_err(file_error)?;
+    Ok(js_object(&[
+        ("hash", JsValue::from_str(&meta.hash_hex())),
+        ("key", JsValue::from_str(&meta.key_hex())),
+        ("size", JsValue::from_f64(meta.size as f64)),
+        ("z", JsValue::from_bool(meta.deflated)),
+        ("blob", uint8array(&blob)),
+    ]))
+}
+
+/// The file out of `blob`, checked against what its message claims. Throws
+/// an Error named after the `FileError`: `NotThisFile` when the blob is not
+/// the one `hash` names, and the others when the sender's file itself will
+/// never open.
+#[wasm_bindgen(js_name = openFile)]
+pub fn open_file(
+    hash: &str,
+    key: &str,
+    size: f64,
+    z: bool,
+    blob: &[u8],
+) -> Result<Vec<u8>, JsValue> {
+    let meta = file_meta(hash, key, size, z).map_err(file_error)?;
+    voipc_crypto::file::open(&meta, blob).map_err(file_error)
+}
+
+/// What a file message claims, as JS hands it over. The size arrives as a JS
+/// number and is checked to be a whole one in range here, because
+/// wasm-bindgen would wrap one too large for an integer parameter rather than
+/// refuse it; the rest is `FileMeta::from_parts`.
+pub fn file_meta(
+    hash: &str,
+    key: &str,
+    size: f64,
+    deflated: bool,
+) -> Result<voipc_crypto::file::FileMeta, FileError> {
+    if size > voipc_crypto::file::MAX_FILE_PLAIN as f64 {
+        return Err(FileError::TooLarge);
+    }
+    // NaN fails this too: its fraction is NaN.
+    if size.fract() != 0.0 || size < 0.0 {
+        return Err(FileError::Malformed);
+    }
+    voipc_crypto::file::FileMeta::from_parts(hash, key, size as u64, deflated)
+}
+
+/// A JS Error whose `name` is the `FileError`'s, so a caller can tell a fetch
+/// worth repeating from a file that will never open without reading the text.
+fn file_error(e: FileError) -> JsValue {
+    let err = js_sys::Error::new(&e.to_string());
+    err.set_name(e.name());
+    err.into()
 }
 
 // ── Media keys and packets ───────────────────────────────────────────────

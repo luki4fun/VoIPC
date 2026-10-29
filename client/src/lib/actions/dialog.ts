@@ -6,10 +6,22 @@
 // the role, `aria-modal` and a name taken from its title; puts focus inside
 // (on what asks for it, else the first control); keeps Tab inside; closes on
 // Escape when it is given an `onclose`; and hands focus back on the way out.
+// It is also a layer on the back stack (stores/back-stack.ts), so Android's
+// Back closes it the way Escape does — or, with no `onclose`, does nothing,
+// unless it is given `back: "leave"`.
+
+import { pushLayer } from "../stores/back-stack.js";
 
 export interface DialogOptions {
   /** What Escape does. Without it Escape is left alone: a step that must be answered. */
   onclose?: () => void;
+  /**
+   * "leave": with no `onclose`, Android's Back puts the app in the background
+   * instead of doing nothing. For a dialog that is the app's own start (the
+   * connect screen with no server, the unlock gate), where staying put is a
+   * Back that seems broken.
+   */
+  back?: "leave";
 }
 
 const FOCUSABLE =
@@ -48,8 +60,10 @@ export function dialog(node: HTMLElement, opts: DialogOptions = {}) {
   // Focusable itself, for a dialog with nothing else to focus
   if (!node.hasAttribute("tabindex")) node.tabIndex = -1;
 
+  // What Tab stops on: not an item a group took out of the Tab order
+  // (actions/roving.ts), which is still a button
   const focusables = () =>
-    [...node.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((el) => el.getClientRects().length > 0);
+    [...node.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((el) => el.tabIndex >= 0 && el.getClientRects().length > 0);
 
   // After the content's own autofocus has had its turn
   queueMicrotask(() => {
@@ -82,12 +96,18 @@ export function dialog(node: HTMLElement, opts: DialogOptions = {}) {
     }
   }
   node.addEventListener("keydown", onkeydown);
+  // Read through `options` at close time: `update` can hand it a new onclose
+  const offBack = pushLayer(
+    () => options.onclose?.(),
+    () => options.back === "leave" && !options.onclose,
+  );
 
   return {
     update(next: DialogOptions) {
       options = next;
     },
     destroy() {
+      offBack();
       relabel?.disconnect();
       node.removeEventListener("keydown", onkeydown);
       if (before?.isConnected) before.focus();

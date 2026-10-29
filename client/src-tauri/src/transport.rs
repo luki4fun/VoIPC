@@ -63,8 +63,9 @@ const TCP_HEAD_START: Duration = Duration::from_secs(2);
 /// Largest per-frame video stream we accept (a 1080p keyframe is well under 1 MiB).
 const MAX_FRAME_STREAM_BYTES: u64 = 8 * 1024 * 1024;
 
-/// What a server without the fallback answers the tunnel's TLS handshake with
-/// (it offers no `http/1.1`), in words.
+/// What a server without the fallback says to the tunnel, in words: 403 to
+/// `GET /voipc` since 1.3, which offers `http/1.1` for files anyway, and no
+/// `http/1.1` in the TLS handshake before that.
 const NO_FALLBACK: &str = "this server has no TCP fallback (if UDP to it is blocked, \
      its operator can turn on tcp_fallback)";
 
@@ -506,6 +507,7 @@ async fn open_tunnel(
     tune(&tcp);
     let mut tls = connector.connect(name, tcp).await.map_err(|e| {
         let e = e.to_string();
+        // A relay before 1.3 offered http/1.1 only with the fallback on
         if e.contains("NoApplicationProtocol") {
             NO_FALLBACK.to_string()
         } else {
@@ -546,6 +548,11 @@ async fn open_tunnel(
         }
     };
     let head = String::from_utf8_lossy(&buf[..end]).into_owned();
+    // Since 1.3 the relay always offers http/1.1 (for files), and says
+    // "fallback off" with 403
+    if head.starts_with("HTTP/1.1 403") {
+        return Err(NO_FALLBACK.to_string());
+    }
     if !head.starts_with("HTTP/1.1 101") {
         let status = head.lines().next().unwrap_or_default();
         return Err(format!("the server refused the TCP fallback ({status})"));
@@ -555,6 +562,50 @@ async fn open_tunnel(
     }
     info!("connected to {addr} over the TCP fallback");
     Ok(start_tunnel(tls, buf.split_off(end)))
+}
+
+/// A connection for file bytes (`files.rs`): TLS with `http/1.1` on the
+/// session's own port, checked as the session was. The session pinned a
+/// self-signed certificate when it connected, so a file connection only ever
+/// matches that pin, never makes one: a certificate first met here is
+/// refused.
+pub(crate) async fn connect_files(
+    host: &str,
+    port: u16,
+    accept_invalid_certs: bool,
+) -> Result<tokio_rustls::client::TlsStream<TcpStream>, String> {
+    if accept_invalid_certs
+        && !TOFU_STORE
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&tofu_key(host, port))
+    {
+        return Err(format!("no certificate is pinned for {host}:{port}"));
+    }
+    let (tls, _) = tls_config(host, port, accept_invalid_certs, b"http/1.1")?;
+    let connector = tokio_rustls::TlsConnector::from(Arc::new(tls));
+    let name = server_name(host)?;
+    let attempt = async {
+        let addrs = tokio::net::lookup_host((host, port))
+            .await
+            .map_err(|e| format!("Could not resolve {host}: {e}"))?;
+        let mut last_err = format!("No addresses found for {host}");
+        for addr in addrs {
+            match TcpStream::connect(addr).await {
+                Ok(tcp) => {
+                    return connector
+                        .connect(name.clone(), tcp)
+                        .await
+                        .map_err(|e| format!("TLS handshake with {addr} failed: {e}"))
+                }
+                Err(e) => last_err = format!("Could not connect to {addr}: {e}"),
+            }
+        }
+        Err(last_err)
+    };
+    tokio::time::timeout(CONNECT_TIMEOUT, attempt)
+        .await
+        .map_err(|_| format!("Timed out connecting to {host}:{port} for a file"))?
 }
 
 /// No Nagle delay on small voice packets; on Linux and Android, also a short
@@ -1029,13 +1080,18 @@ impl ServerCertVerifier for TofuCertVerifier {
                     "TOFU: certificate fingerprint changed for {}! Possible MITM attack.",
                     host_key
                 );
-                // The UI matches on "fingerprint changed" to offer forgetting the pin.
+                // The UI matches on "fingerprint changed" to offer forgetting the
+                // pin, and reads the two fingerprints out of the message to show
+                // them side by side before anyone trusts the new one.
                 return Err(rustls::Error::General(format!(
                     "Server certificate fingerprint changed for {}. \
                      This could indicate a man-in-the-middle attack. \
                      Only if you know the server's certificate was replaced, \
-                     use \"Forget pinned certificate\" and connect again.",
-                    host_key
+                     use \"Forget pinned certificate\" and connect again. \
+                     (remembered SHA-256 {}; offered SHA-256 {})",
+                    host_key,
+                    fingerprint_text(pinned),
+                    fingerprint_text(&fp_bytes)
                 )));
             }
             info!("TOFU: certificate fingerprint matches for {}", host_key);

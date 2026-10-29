@@ -23,8 +23,11 @@ export const accountHex = (id: number[]) => toHex(id);
 export type AccountPrompt =
   /** A sign-in waits for a code; `retry` after a wrong one. */
   | { kind: "totp"; server: string; retry: boolean }
-  /** A new account's recovery key, shown once. */
-  | { kind: "recovery"; server: string; key: string }
+  /** A new account's recovery key, shown once; `renewed` for one that
+   *  replaced the account's old key (Recovery key: New). */
+  | { kind: "recovery"; server: string; key: string; renewed?: boolean }
+  /** A new recovery key: the password, a code where codes are on (S-006). */
+  | { kind: "recovery-new"; server: string }
   /** Setting up the authenticator app. */
   | { kind: "totp-setup"; server: string; secret: string; uri: string; sealed: string; why: "required" | "chosen" }
   /** Codes are on: the recovery codes, shown once. */

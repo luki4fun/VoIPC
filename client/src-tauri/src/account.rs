@@ -27,6 +27,7 @@ use voipc_protocol::codec::{
 };
 use voipc_protocol::conv::{hex, unhex16};
 use voipc_protocol::messages::{AccountReply, AccountRequest, ClientMessage, ServerMessage};
+use voipc_protocol::types::FileLimits;
 
 use crate::app_state::{AppState, SignalState};
 use crate::crypto::DeviceRecord;
@@ -158,7 +159,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     send: &mut S,
     recv: &mut R,
     buf: &mut BytesMut,
-) -> Result<(u32, u32, Arc<AccountLink>), String> {
+) -> Result<(u32, u32, Arc<AccountLink>, Option<FileLimits>), String> {
     let name = normalize_name(username)?;
     let method = match args {
         AccountArgs::Login { password } => Method::Password {
@@ -216,19 +217,21 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     write(send, &first).await?;
 
     let mut asked = 0u32;
-    let (user_id, session_id, info) = loop {
+    let (user_id, session_id, info, files) = loop {
         let msg = read(recv, buf).await?;
         if let ServerMessage::Authenticated {
             user_id,
             session_id,
             account: Some(info),
             accounts,
+            files,
+            ..
         } = msg
         {
             if let Some(accounts) = accounts {
                 emit_server(app, server, "relay-accounts", accounts);
             }
-            break (user_id, session_id, info);
+            break (user_id, session_id, info, files);
         }
         crate::network::note_refusal(app, server, &msg);
         // The password's stretching runs here: half a second of CPU, kept
@@ -297,6 +300,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         Arc::new(AccountLink {
             session: std::sync::Mutex::new(session),
         }),
+        files,
     ))
 }
 
@@ -411,6 +415,8 @@ pub async fn account_prefs(state: State<'_, AppState>, server: String) -> Result
 /// A direct message for an account that is away (`account`, hex): kept in the
 /// stored log only, which is the one way it reaches them. Returns its id, for
 /// the front end's own copy.
+// A command's arguments are the fields of its call from the front end
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn send_kept_dm(
     state: State<'_, AppState>,
@@ -419,11 +425,17 @@ pub async fn send_kept_dm(
     account: String,
     content: String,
     ttl_secs: Option<u32>,
+    reply_to: Option<String>,
+    thread: Option<String>,
+    file: Option<serde_json::Value>,
+    fwd: Option<serde_json::Value>,
+    event: Option<serde_json::Value>,
 ) -> Result<String, String> {
     let connections = state.connections.read().await;
     let (connection, link) = signed_in(&connections, &server)?;
     let id = crate::crypto::new_message_id();
-    let payload = crate::crypto::envelope(&id, &content, ttl_secs);
+    let extras = crate::commands::checked_extras(reply_to, thread, file, fwd, event)?;
+    let payload = crate::crypto::envelope_with(&id, &content, ttl_secs, &extras);
     let a = link
         .session()
         .kept_dm(&account, payload, crate::crypto::now_ms(), ttl_secs)?;
@@ -640,6 +652,37 @@ pub async fn account_password_change(
         .password_change(&old_m, &new_m, totp, recovery);
     run(&app, &server, &connection.tcp_tx, a).await;
     Ok(())
+}
+
+/// A new recovery key for the account signed in on `server`, confirmed by its
+/// password and a code where it has codes on; the old key stops working. It
+/// also gives an account made before 1.3 its reset key (S-006). Returns the
+/// key's text, which the page shows once the relay answers
+/// `RecoveryKeyChanged` (as `account-reply`; an `Error` for
+/// `RecoveryKeyNew` means it is not in force, and is never shown).
+#[tauri::command]
+pub async fn account_recovery_key_new(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    server: String,
+    password: String,
+    totp: Option<String>,
+    recovery: Option<String>,
+) -> Result<String, String> {
+    let salt = {
+        let connections = state.connections.read().await;
+        let (_, link) = signed_in(&connections, &server)?;
+        let salt = link.session().kdf_salt();
+        salt
+    };
+    let master = tokio::task::spawn_blocking(move || stretch_salted(&password, &salt))
+        .await
+        .map_err(|e| e.to_string())?;
+    let connections = state.connections.read().await;
+    let (connection, link) = signed_in(&connections, &server)?;
+    let (a, key) = link.session().recovery_key_new(&master, totp, recovery);
+    run(&app, &server, &connection.tcp_tx, a).await;
+    Ok(key)
 }
 
 /// An account request on a signed-in connection (codes, the vault).

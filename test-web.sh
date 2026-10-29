@@ -21,6 +21,10 @@
 # UI_TEST=0 skips test-ui.mjs. It drives its own Chromium and reads none of the
 # settings above, so CI runs it only where the network differs.
 #
+# FILE_KIB (default 10240) is the file alice sends bob while she talks, which
+# bob fetches and checks byte for byte; FILE_KIB=0 sends none, for comparing
+# voice with and without a transfer.
+#
 # Prerequisites: VOIPC_SELFTEST=1 npm run web (a release bundle has no self-test),
 # openssl, curl with HTTP/2, and either chromium (CHROME=/path/to/chrome) or,
 # for the Firefox lane, firefox (FIREFOX=...) plus certutil to trust the test
@@ -110,6 +114,8 @@ grep -qs SELFTEST client/dist-web/assets/*.js ||
 
 TCP_PORT="${TCP_PORT:-19987}"
 DURATION="${DURATION:-15000}"
+# alice sends bob a file this size (KiB) while she talks; 0 sends none
+FILE_KIB="${FILE_KIB:-10240}"
 WORK="$(mktemp -d)"
 
 # A throwaway CA signs the page certificate. Chromium would take a self-signed
@@ -142,7 +148,15 @@ CHANNELS
 # subshell and the server survives on the test ports
 # --tcp-fallback on both servers, whatever the transport: the QUIC runs then
 # also prove that offering the tunnel's http/1.1 leaves the h2 page alone.
-(cd "$WORK" && exec "$SCRIPT_DIR/$SERVER" --host 127.0.0.1 --tcp-port "$TCP_PORT" --udp-port "$TCP_PORT" \
+# Files leave the relay a minute after their last use, so test-ui.mjs can see
+# a member send one again, and nobody be able to
+cat > "$WORK/server.toml" <<'TOML'
+cert_path = "server.crt"
+key_path = "server.key"
+[files]
+cache_mins = 1
+TOML
+(cd "$WORK" && exec "$SCRIPT_DIR/$SERVER" --config server.toml --host 127.0.0.1 --tcp-port "$TCP_PORT" --udp-port "$TCP_PORT" \
   --cert server.crt --key server.key --admin-token e2e-admin-token-0001 --channels channels.json --tcp-fallback \
   > "$WORK/server.log" 2>&1) &
 
@@ -221,7 +235,7 @@ EOF
 # alice creates the channel, becomes admin at the end and kicks bob; bob joins
 # through an invite-link fragment (#channel=…) and expects the kick
 # alice also shares her (synthetic) screen; bob watches it
-run_browser alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admin-token-0001&kick=bob&share=1&proximity=2d&pos=3,0,0&spatialtest=3d$(via "$TRANSPORT_ALICE")" \
+run_browser alice talker "&channel=e2e&textchannel=e2e-text&dm=bob&admin=e2e-admin-token-0001&kick=bob&share=1&proximity=2d&pos=3,0,0&spatialtest=3d&file=$FILE_KIB$(via "$TRANSPORT_ALICE")" \
   "$WORK/alice.log" "$BROWSER_ALICE"
 # Not a fixed stagger: the run asserts that a message alice sent *before* bob
 # arrived reaches him as channel history, so the harness has to make "before"
@@ -281,6 +295,11 @@ check "bob read alice's channel message" "$WORK/bob.txt"  'channel-chat-message.
 check "alice read bob's channel message" "$WORK/alice.txt" 'channel-chat-message.*hello from bob'
 check "bob read alice's DM"             "$WORK/bob.txt"   'direct-chat-message.*dm from alice'
 check "alice read bob's DM"             "$WORK/alice.txt" 'direct-chat-message.*dm from bob'
+# Files (protocol 13): over HTTPS beside the session, sealed in a worker
+if [ "$FILE_KIB" != 0 ]; then
+  check "alice stored a file on the relay" "$WORK/alice.txt" 'SELFTEST file-sent'
+  check "bob fetched alice's file byte-exact" "$WORK/bob.txt" 'SELFTEST file-fetched.*"ok":true'
+fi
 # "existing":true is the half that matters: a bob who *created* the channel
 # because he beat alice to it also logs source":"invite", and then quietly fails
 # the history check three lines down instead of this one.

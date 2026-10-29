@@ -38,7 +38,7 @@
     </div>
     <div class="voice-meta">
       <span class="channel"
-        >#{channelName}{#if !$viewingVoice}&nbsp;· {serverName}{/if}</span
+        >{channelName}{#if !$viewingVoice}&nbsp;· {serverName}{/if}</span
       >
       <span
         class="ping quality-{$quality}"
@@ -75,7 +75,7 @@
     display: flex;
     align-items: center;
     gap: 6px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     font-weight: 600;
     color: var(--success);
   }
@@ -111,7 +111,7 @@
     align-items: center;
     justify-content: space-between;
     gap: 8px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     color: var(--text-secondary);
   }
 
@@ -154,5 +154,12 @@
 
   .share-row > :global(.stats-pill) {
     flex-basis: 100%;
+  }
+
+  @media (pointer: coarse) {
+    .leave-btn {
+      width: var(--hit);
+      height: var(--hit);
+    }
   }
 </style>

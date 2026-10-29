@@ -9,46 +9,11 @@
 // Pure module on purpose — no stores, no invoke, no Svelte. It is imported by
 // theme.test.ts under Node's own test runner, which has neither.
 
-/** A custom property this module owns. Sizing tokens are not palette. */
-export type TokenName =
-  | "--bg-primary"
-  | "--bg-secondary"
-  | "--bg-tertiary"
-  | "--bg-hover"
-  | "--text-primary"
-  | "--text-secondary"
-  | "--accent"
-  | "--accent-hover"
-  | "--success"
-  | "--danger"
-  | "--warning"
-  | "--border"
-  | "--speaking"
-  | "--well"
-  | "--scrollbar"
-  | "--shadow-menu"
-  | "--shadow-dialog";
+import { rememberTheme } from "./theme-cache.ts";
+import { TOKENS, type TokenName } from "./theme-tokens.ts";
 
-/** Every token a palette must define. A palette missing one is a type error. */
-export const TOKENS: readonly TokenName[] = [
-  "--bg-primary",
-  "--bg-secondary",
-  "--bg-tertiary",
-  "--bg-hover",
-  "--text-primary",
-  "--text-secondary",
-  "--accent",
-  "--accent-hover",
-  "--success",
-  "--danger",
-  "--warning",
-  "--border",
-  "--speaking",
-  "--well",
-  "--scrollbar",
-  "--shadow-menu",
-  "--shadow-dialog",
-];
+export { TOKENS };
+export type { TokenName };
 
 export interface Palette {
   id: string;
@@ -61,14 +26,101 @@ export interface Palette {
 /**
  * The palettes this build ships.
  *
- * `voipc-dark` is the app as it has always looked: these are the exact values
- * from app.css, and the first release to carry this module ships only this one,
- * so nothing anybody sees changes.
+ * `voipc-night` and `voipc-day` are VoIPC's own (2026-10-26), taken from the
+ * logo: a mint shield on charcoal. Mint means *live* — the speaking ring, the
+ * talk button, a live share, the connected state and the primary action — so
+ * a selected row is a raised neutral, never the accent, and a selected row
+ * never competes with a face that is talking. Flat mint: no glow, no neon edge.
+ *
+ * `voipc-dark` ("Navy") is the app as it looked before palettes existed; app.css
+ * carries `voipc-night`'s values as its fallbacks now. The Slate pair is the
+ * neutral-grey arrangement 0.8.0 made the default; installs that already have
+ * one of these stored keep it (the 1.x rule: a choice is never overwritten).
  */
 export const PALETTES: readonly Palette[] = [
   {
+    id: "voipc-night",
+    label: "VoIPC night",
+    dark: true,
+    tokens: {
+      // Charcoal with a little blue in it, the logo's ground. The chat is the
+      // lighter surface and the sidebars sit behind it.
+      "--bg-primary": "#1c1f24",
+      "--bg-secondary": "#16181d",
+      "--bg-tertiary": "#0f1114",
+      "--bg-hover": "#262a31",
+      "--text-primary": "#e3e6ea",
+      "--text-secondary": "#a3aab4",
+      "--accent": "#3ddbb0",
+      "--accent-hover": "#5fe6c2",
+      // Success is live too: connected, an active toggle, a share going out
+      "--success": "#3ddbb0",
+      "--danger": "#f2555a",
+      "--warning": "#f2b84b",
+      "--border": "#2a2e36",
+      "--speaking": "#3ddbb0",
+      "--well": "rgba(0, 0, 0, 0.2)",
+      "--scrollbar": "#2f343c",
+      "--shadow-menu": "0 8px 24px rgba(0, 0, 0, 0.45)",
+      "--shadow-dialog": "0 12px 40px rgba(0, 0, 0, 0.55)",
+      // Mint is light, so what sits on it is a deep green-black, not white
+      "--on-accent": "#06231b",
+      "--on-danger": "#0b0d12",
+      "--on-success": "#06231b",
+      "--on-warning": "#0b0d12",
+      "--text-muted": "#8b939e",
+      "--scrim": "rgba(0, 0, 0, 0.55)",
+      "--focus-ring": "#3ddbb0",
+      // Code in a message, on --bg-tertiary: never the live mint, never danger red
+      "--code-keyword": "#c4a7ff",
+      "--code-string": "#e5c07b",
+      "--code-comment": "#8b939e",
+      "--code-number": "#7fc8ff",
+      "--code-fn": "#ff9fcf",
+    },
+  },
+  {
+    id: "voipc-day",
+    label: "VoIPC day",
+    dark: false,
+    tokens: {
+      "--bg-primary": "#ffffff",
+      "--bg-secondary": "#f3f5f6",
+      "--bg-tertiary": "#e6eaec",
+      "--bg-hover": "#e9edef",
+      "--text-primary": "#0e1114",
+      "--text-secondary": "#4b5560",
+      // The logo's mint does not read on white (1.6:1); this is the same hue
+      // taken down until white text sits on it and it reads as text itself.
+      "--accent": "#0b7a5f",
+      "--accent-hover": "#096a52",
+      "--success": "#0b7a5f",
+      "--danger": "#c8323a",
+      "--warning": "#9a6200",
+      "--border": "#d9dee2",
+      "--speaking": "#0b7a5f",
+      "--well": "rgba(0, 0, 0, 0.05)",
+      "--scrollbar": "#c3cad0",
+      "--shadow-menu": "0 8px 16px rgba(0, 0, 0, 0.12)",
+      "--shadow-dialog": "0 12px 32px rgba(0, 0, 0, 0.18)",
+      "--on-accent": "#ffffff",
+      "--on-danger": "#ffffff",
+      "--on-success": "#ffffff",
+      "--on-warning": "#ffffff",
+      "--text-muted": "#5f6873",
+      "--scrim": "rgba(15, 20, 25, 0.4)",
+      "--focus-ring": "#0b7a5f",
+      // Code in a message, on --bg-tertiary: never the live mint, never danger red
+      "--code-keyword": "#6f42c1",
+      "--code-string": "#8a5a00",
+      "--code-comment": "#5c6670",
+      "--code-number": "#005cc5",
+      "--code-fn": "#b4237a",
+    },
+  },
+  {
     id: "voipc-dark",
-    label: "VoIPC dark",
+    label: "Navy",
     dark: true,
     tokens: {
       "--bg-primary": "#1a1a2e",
@@ -88,6 +140,21 @@ export const PALETTES: readonly Palette[] = [
       "--scrollbar": "#2a2a4a",
       "--shadow-menu": "0 8px 24px rgba(0, 0, 0, 0.4)",
       "--shadow-dialog": "0 8px 32px rgba(0, 0, 0, 0.5)",
+      // What sits on a filled control. White where it clears 4.5:1 on the fill,
+      // a near-black ink where it does not (theme.test.ts checks each pair).
+      "--on-accent": "#0b0d12",
+      "--on-danger": "#0b0d12",
+      "--on-success": "#0b0d12",
+      "--on-warning": "#0b0d12",
+      "--text-muted": "#8a8a96",
+      "--scrim": "rgba(0, 0, 0, 0.5)",
+      "--focus-ring": "#4a9eff",
+      // Code in a message, on --bg-tertiary: never the live mint, never danger red
+      "--code-keyword": "#c4a7ff",
+      "--code-string": "#e5c07b",
+      "--code-comment": "#a3abba",
+      "--code-number": "#ffb86c",
+      "--code-fn": "#ff9fcf",
     },
   },
   {
@@ -124,6 +191,19 @@ export const PALETTES: readonly Palette[] = [
       "--scrollbar": "#1a1b1e",
       "--shadow-menu": "0 8px 16px rgba(0, 0, 0, 0.24)",
       "--shadow-dialog": "0 8px 32px rgba(0, 0, 0, 0.32)",
+      "--on-accent": "#0b0d12",
+      "--on-danger": "#ffffff",
+      "--on-success": "#0b0d12",
+      "--on-warning": "#0b0d12",
+      "--text-muted": "#9ba1aa",
+      "--scrim": "rgba(0, 0, 0, 0.5)",
+      "--focus-ring": "#7983f5",
+      // Code in a message, on --bg-tertiary: never the live mint, never danger red
+      "--code-keyword": "#c4a7ff",
+      "--code-string": "#e5c07b",
+      "--code-comment": "#8b939e",
+      "--code-number": "#7fc8ff",
+      "--code-fn": "#ff9fcf",
     },
   },
   {
@@ -150,6 +230,19 @@ export const PALETTES: readonly Palette[] = [
       "--scrollbar": "#c4c9ce",
       "--shadow-menu": "0 8px 16px rgba(0, 0, 0, 0.1)",
       "--shadow-dialog": "0 8px 32px rgba(0, 0, 0, 0.16)",
+      "--on-accent": "#ffffff",
+      "--on-danger": "#ffffff",
+      "--on-success": "#ffffff",
+      "--on-warning": "#0b0d12",
+      "--text-muted": "#686a72",
+      "--scrim": "rgba(0, 0, 0, 0.32)",
+      "--focus-ring": "#5865f2",
+      // Code in a message, on --bg-tertiary: never the live mint, never danger red
+      "--code-keyword": "#6f42c1",
+      "--code-string": "#8a5a00",
+      "--code-comment": "#5c6670",
+      "--code-number": "#005cc5",
+      "--code-fn": "#b4237a",
     },
   },
   {
@@ -177,6 +270,19 @@ export const PALETTES: readonly Palette[] = [
       "--scrollbar": "#2e2e2e",
       "--shadow-menu": "0 8px 16px rgba(0, 0, 0, 0.7)",
       "--shadow-dialog": "0 8px 32px rgba(0, 0, 0, 0.8)",
+      "--on-accent": "#ffffff",
+      "--on-danger": "#ffffff",
+      "--on-success": "#0b0d12",
+      "--on-warning": "#0b0d12",
+      "--text-muted": "#7c7c7c",
+      "--scrim": "rgba(0, 0, 0, 0.6)",
+      "--focus-ring": "#5865f2",
+      // Code in a message, on --bg-tertiary: never the live mint, never danger red
+      "--code-keyword": "#c4a7ff",
+      "--code-string": "#e5c07b",
+      "--code-comment": "#8b939e",
+      "--code-number": "#7fc8ff",
+      "--code-fn": "#ff9fcf",
     },
   },
 ];
@@ -189,10 +295,10 @@ export const PALETTES: readonly Palette[] = [
  * machine says it prefers light; this is the answer where there is no machine
  * to ask, which includes the Node test runner.
  */
-export const DEFAULT_PALETTE_ID = "slate-dark";
+export const DEFAULT_PALETTE_ID = "voipc-night";
 
 /** The light palette that pairs with the default. */
-export const DEFAULT_LIGHT_PALETTE_ID = "slate-light";
+export const DEFAULT_LIGHT_PALETTE_ID = "voipc-day";
 
 /**
  * The palette to start in on this machine, before anybody has chosen.
@@ -282,6 +388,7 @@ export function applyTheme(tokens: Record<TokenName, string>, dark: boolean): vo
   const root = document.documentElement;
   for (const token of TOKENS) root.style.setProperty(token, tokens[token]);
   root.dataset.theme = dark ? "dark" : "light";
+  rememberTheme(tokens, dark);
 
   // What colours the Android status bar and the browser's own chrome. Harmless
   // where there is no such chrome.
@@ -371,6 +478,27 @@ export const CONTRAST_PAIRS: readonly {
   // Status words in colour: "Live", "Sharing", a reconnecting badge (H5-05)
   { fg: "--success", bg: "--bg-secondary", min: 3.0, where: "a live or sharing status" },
   { fg: "--warning", bg: "--bg-secondary", min: 3.0, where: "a warning status" },
+  // Text on a filled control: a primary button, a danger button, a badge, the
+  // talk button while it is held. Body-size text, so 4.5 — white on most of
+  // these fills does not make it, which is why the ink is a token at all.
+  { fg: "--on-accent", bg: "--accent", min: 4.5, where: "primary buttons" },
+  { fg: "--on-danger", bg: "--danger", min: 4.5, where: "danger buttons, unread badges" },
+  { fg: "--on-success", bg: "--success", min: 4.5, where: "an active toggle" },
+  { fg: "--on-success", bg: "--speaking", min: 4.5, where: "the talk button while held" },
+  { fg: "--on-warning", bg: "--warning", min: 4.5, where: "a warning badge" },
+  // The dimmed text that used to be secondary text at 45-70% opacity: a left
+  // channel, an out-of-earshot member. Dimmer, but still readable.
+  { fg: "--text-muted", bg: "--bg-primary", min: 4.5, where: "dimmed text in the chat" },
+  { fg: "--text-muted", bg: "--bg-secondary", min: 4.5, where: "dimmed rows in the sidebars" },
+  // A focus ring is a non-text indicator: 3:1 against what it sits on (WCAG 1.4.11)
+  { fg: "--focus-ring", bg: "--bg-primary", min: 3.0, where: "keyboard focus in the chat" },
+  { fg: "--focus-ring", bg: "--bg-secondary", min: 3.0, where: "keyboard focus in the sidebars" },
+  // Highlighted code in a message: text, so 4.5 like every other
+  { fg: "--code-keyword", bg: "--bg-tertiary", min: 4.5, where: "code: keywords" },
+  { fg: "--code-string", bg: "--bg-tertiary", min: 4.5, where: "code: strings" },
+  { fg: "--code-comment", bg: "--bg-tertiary", min: 4.5, where: "code: comments" },
+  { fg: "--code-number", bg: "--bg-tertiary", min: 4.5, where: "code: numbers" },
+  { fg: "--code-fn", bg: "--bg-tertiary", min: 4.5, where: "code: names of functions and types" },
   // Not a WCAG figure: a divider is not text. 1.1 is simply "visible at all",
   // and it is the floor today's dark palette sits just above (#2a2a4a on
   // #16213e is 1.15). It exists so a palette cannot ship with borders that

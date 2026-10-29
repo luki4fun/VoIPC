@@ -1,6 +1,6 @@
-# cargo-deny, for the root workspace and the two wasm workspaces (CI's `deny`
-# job runs it for each manifest). Advisories, licences, crate sources and
-# duplicate bans in one tool.
+# cargo-deny, for the root workspace, the two wasm workspaces and the fuzz
+# workspace (CI's `deny` job runs it for each manifest). Advisories, licences,
+# crate sources and duplicate bans in one tool.
 #
 # FFmpeg is GPL in the bundles, but it is not a crate, so it is not here: the
 # release notes and README carry it.
@@ -41,6 +41,9 @@ exceptions = [
     { allow = ["AGPL-3.0-only"], crate = "signal-crypto" },
     { allow = ["AGPL-3.0-only"], crate = "libsignal-debug" },
     { allow = ["AGPL-3.0-only"], crate = "spqr" },
+    # LLVM's libFuzzer, built into the fuzz targets only; nothing that ships
+    # links it.
+    { allow = ["NCSA"], crate = "libfuzzer-sys" },
 ]
 
 [licenses.private]

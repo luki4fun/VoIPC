@@ -117,9 +117,9 @@ pub async fn connect_to_server(
     // Guests get a fresh identity per connection (ephemeral by design); an
     // account's comes out of its vault during the sign-in, and its stores are
     // made then (`account::sign_in` calls `init_signal` itself).
-    let (user_id, session_id, account) = match account {
+    let (user_id, session_id, account, file_limits) = match account {
         Some(args) => {
-            let (user_id, session_id, link) = crate::account::sign_in(
+            let (user_id, session_id, link, files) = crate::account::sign_in(
                 state,
                 &app_handle,
                 &address,
@@ -131,7 +131,7 @@ pub async fn connect_to_server(
                 &mut buf,
             )
             .await?;
-            (user_id, session_id, Some(link))
+            (user_id, session_id, Some(link), files)
         }
         None => {
             let (identity_key, prekey_bundle) = {
@@ -154,7 +154,7 @@ pub async fn connect_to_server(
                 .map_err(|e| format!("Failed to send auth: {}", e))?;
 
             // Read until we get the Authenticated or AuthError response
-            let (user_id, session_id) = loop {
+            let (user_id, session_id, files) = loop {
                 let n = tokio::time::timeout(CONNECT_TIMEOUT, control_recv.read_buf(&mut buf))
                     .await
                     .map_err(|_| "Timed out waiting for the authentication response".to_string())?
@@ -175,13 +175,14 @@ pub async fn connect_to_server(
                             user_id,
                             session_id,
                             accounts,
+                            files,
                             ..
                         } => {
                             // A guest on a relay with accounts: the UI can offer one.
                             if let Some(accounts) = accounts {
                                 emit_server(&app_handle, &address, "relay-accounts", accounts);
                             }
-                            break (user_id, session_id);
+                            break (user_id, session_id, files);
                         }
                         ServerMessage::AuthError { reason } => {
                             return Err(format!("Authentication failed: {}", reason));
@@ -199,11 +200,13 @@ pub async fn connect_to_server(
                     }
                 }
             };
-            (user_id, session_id, None)
+            (user_id, session_id, None, files)
         }
     };
 
     info!(user_id, session_id, "authenticated with server");
+    // Whether this relay keeps files, and how large: the composer's to know
+    emit_server(&app_handle, &address, "file-limits", file_limits.clone());
 
     // The Signal state is this connection's own from birth, so all it needs
     // now is to know who we are here.
@@ -347,6 +350,27 @@ pub async fn connect_to_server(
                 VideoIn::Tunnel(lanes.video_in.take().expect("taken once")),
             ),
         };
+    let files = Arc::new(crate::files::Files::new(
+        Box::new({
+            let (app, server) = (app_handle.clone(), server.clone());
+            move |event, data| emit_server(&app, &server, event, data)
+        }),
+        Box::new({
+            let app = app_handle.clone();
+            move || {
+                app.state::<AppState>()
+                    .voice_server
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_some()
+            }
+        }),
+        host.clone(),
+        port,
+        accept_invalid_certs,
+        file_limits,
+        tcp_tx.clone(),
+    ));
     let writer_handle = tokio::spawn(control_writer_task(control_send, tcp_rx));
     let reader_handle = tokio::spawn(control_reader_task(
         control_recv,
@@ -370,6 +394,7 @@ pub async fn connect_to_server(
         voice_asked_at.clone(),
         transmitting.clone(),
         account.clone(),
+        files.clone(),
     ));
     if let Some(link) = &account {
         crate::account::after_connect(&app_handle, &address, link, &tcp_tx).await;
@@ -478,6 +503,7 @@ pub async fn connect_to_server(
     let tcp = tcp_tx.clone();
     let connection = ActiveConnection {
         account: account.clone(),
+        files,
         user_id,
         username,
         server_address: address.clone(),
@@ -614,6 +640,7 @@ pub async fn teardown(
     // Close capture session (stops screen capture)
     connection.capture_session = None;
 
+    connection.files.close();
     // Send graceful disconnect, then drop tcp_tx so writer can flush and exit
     let _ = send_tcp_message(&connection.tcp_tx, &ClientMessage::Disconnect).await;
     drop(connection.tcp_tx);
@@ -938,6 +965,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     voice_asked_at: Arc<AtomicU64>,
     transmitting: Arc<AtomicBool>,
     account: Option<Arc<crate::account::AccountLink>>,
+    files: Arc<crate::files::Files>,
 ) {
     let mut inbound = Inbound::new(std::time::Instant::now());
     'read: loop {
@@ -978,6 +1006,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
                         );
                         break 'read;
                     }
+                    Ok(msg) if crate::files::is_file_message(&msg) => files.on_message(msg),
                     Ok(msg) => {
                         handle_server_message(
                             msg,
@@ -1032,6 +1061,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     // A dead link is not a call: the UI stops treating this server as the
     // voice one on `connection-lost`, and so does everything here.
     leave_voice(&app_handle, &server, &is_voice, &transmitting).await;
+    files.close();
     info!("control reader task ended");
 }
 
@@ -1972,6 +2002,8 @@ async fn handle_server_message(
                         ))
                         .map_err(|e| format!("decrypt poke: {e}"))
                 });
+                // Its sender's identity against the pins before it is shown (S-012)
+                crate::account::check_seen(app_handle, server, account, signal, tcp_tx).await;
                 match result {
                     Ok(plaintext) => {
                         // If PreKeySignalMessage, mark session as established
@@ -2190,6 +2222,7 @@ async fn handle_server_message(
                 signal,
                 app_handle,
                 server,
+                (account, tcp_tx),
             );
         }
         // ── E2E: Encrypted channel message → decrypt and emit as plaintext ──
@@ -2317,6 +2350,7 @@ async fn handle_server_message(
                 signal,
                 app_handle,
                 server,
+                (account, tcp_tx),
             );
         }
         ServerMessage::Account(reply) => match account {
@@ -2327,7 +2361,38 @@ async fn handle_server_message(
         | ServerMessage::AuthError { .. }
         | ServerMessage::AuthStep(_)
         | ServerMessage::Refused { .. } => {}
+        // files.rs takes them before they get here
+        ServerMessage::FileUploadReady { .. }
+        | ServerMessage::FileStored { .. }
+        | ServerMessage::FileReady { .. }
+        | ServerMessage::FileRefused { .. }
+        | ServerMessage::FileWanted { .. }
+        | ServerMessage::FileSeeking { .. }
+        | ServerMessage::FileUnavailable { .. } => {}
     }
+}
+
+/// What `account::check_seen` needs, for a handler that shows what it decrypts.
+type SeenCheck<'a> = (
+    Option<&'a crate::account::AccountLink>,
+    &'a mpsc::UnboundedSender<Vec<u8>>,
+);
+
+/// The identity a decrypt just took in (a session the peer opened, which no
+/// bundle check sees) against the pins now, before what it decrypted is
+/// shown: a changed key is warned of no later than its first message (S-012).
+/// The message loop checks again after every message, for the rest.
+fn check_seen_now(
+    app_handle: &tauri::AppHandle,
+    server: &str,
+    signal: &Arc<std::sync::Mutex<SignalState>>,
+    (account, tcp_tx): SeenCheck<'_>,
+) {
+    tokio::task::block_in_place(|| {
+        tokio::runtime::Handle::current().block_on(crate::account::check_seen(
+            app_handle, server, account, signal, tcp_tx,
+        ))
+    });
 }
 
 /// Decrypt a member's channel-history blob (JSON `{ v, messages }`) and hand
@@ -2343,6 +2408,7 @@ fn handle_channel_history_received(
     signal: &Arc<std::sync::Mutex<SignalState>>,
     app_handle: &tauri::AppHandle,
     server: &str,
+    seen: SeenCheck<'_>,
 ) {
     // A conversation arriving from somebody the roster does not put in that
     // channel with us is not history, it is an injection: we file it, show it
@@ -2380,6 +2446,7 @@ fn handle_channel_history_received(
             ))
             .map_err(|e| format!("decrypt history: {e}"))
     });
+    check_seen_now(app_handle, server, signal, seen);
     let plaintext = match result {
         Ok(p) => p,
         Err(e) => {
@@ -3078,7 +3145,7 @@ async fn drain_pending_dms(
 ) {
     // Extract pending DMs for this target, each with the id it was shown under
     // and the destruction timer it was written under
-    let pending: Vec<(String, String, Option<u32>)> = {
+    let pending: Vec<(String, String, Option<u32>, crate::crypto::Extras)> = {
         let mut sig = signal.lock().unwrap_or_else(|p| {
             warn!("mutex poisoned, recovering");
             p.into_inner()
@@ -3093,7 +3160,7 @@ async fn drain_pending_dms(
                 } if *tid == target_user_id => {
                     // Only send if queued less than 60 seconds ago
                     if msg.queued_at.elapsed().as_secs() < 60 {
-                        to_send.push((msg.id, msg.content, msg.ttl_secs));
+                        to_send.push((msg.id, msg.content, msg.ttl_secs, msg.extras));
                     } else {
                         expired += 1;
                     }
@@ -3115,8 +3182,8 @@ async fn drain_pending_dms(
         to_send
     };
 
-    for (id, content, ttl_secs) in pending {
-        let payload = crate::crypto::envelope(&id, &content, ttl_secs);
+    for (id, content, ttl_secs, extras) in pending {
+        let payload = crate::crypto::envelope_with(&id, &content, ttl_secs, &extras);
         let result = tokio::task::block_in_place(|| {
             let mut sig = signal.lock().map_err(|e| format!("lock: {e}"))?;
             let stores = sig.stores.as_mut().ok_or("not initialized")?;
@@ -3159,7 +3226,7 @@ async fn drain_pending_channel_messages(
 ) {
     // Extract pending channel messages, each with the id it was shown under and
     // the destruction timer it was written under
-    let pending: Vec<(String, String, Option<u32>)> = {
+    let pending: Vec<(String, String, Option<u32>, crate::crypto::Extras)> = {
         let mut sig = signal.lock().unwrap_or_else(|p| {
             warn!("mutex poisoned, recovering");
             p.into_inner()
@@ -3171,7 +3238,7 @@ async fn drain_pending_channel_messages(
             match &msg.target {
                 PendingTarget::Channel { channel_id: cid } if *cid == channel_id => {
                     if msg.queued_at.elapsed().as_secs() < 60 {
-                        to_send.push((msg.id, msg.content, msg.ttl_secs));
+                        to_send.push((msg.id, msg.content, msg.ttl_secs, msg.extras));
                     } else {
                         expired += 1;
                     }
@@ -3205,8 +3272,8 @@ async fn drain_pending_channel_messages(
     // thing for a message typed now.
     rotate_sender_key_if_stale(channel_id, own_user_id, signal, tcp_tx).await;
 
-    for (id, content, ttl_secs) in pending {
-        let payload = crate::crypto::envelope(&id, &content, ttl_secs);
+    for (id, content, ttl_secs, extras) in pending {
+        let payload = crate::crypto::envelope_with(&id, &content, ttl_secs, &extras);
         let result = tokio::task::block_in_place(|| {
             let mut sig = signal.lock().map_err(|e| format!("lock: {e}"))?;
             let stores = sig.stores.as_mut().ok_or("not initialized")?;
@@ -3254,6 +3321,7 @@ fn handle_encrypted_direct_message(
     signal: &Arc<std::sync::Mutex<SignalState>>,
     app_handle: &tauri::AppHandle,
     server: &str,
+    seen: SeenCheck<'_>,
 ) {
     // Skip our own echoed messages — the sender emits locally in commands.rs.
     // Attempting to decrypt would corrupt the Signal ratchet state.
@@ -3277,6 +3345,7 @@ fn handle_encrypted_direct_message(
             ))
             .map_err(|e| format!("decrypt DM: {e}"))
     });
+    check_seen_now(app_handle, server, signal, seen);
 
     match result {
         Ok(plaintext) => {
@@ -3307,6 +3376,11 @@ fn handle_encrypted_direct_message(
                     "timestamp": timestamp,
                     "message_id": msg.id,
                     "ttl_secs": msg.ttl_secs,
+                    "reply_to": msg.extras.reply,
+                    "thread": msg.extras.thread,
+                    "file": msg.extras.file,
+                    "fwd": msg.extras.fwd,
+                    "event": msg.extras.event,
                     "encrypted": true,
                 }),
             );
@@ -3409,6 +3483,11 @@ fn handle_encrypted_channel_message(
                     // end takes the shorter of this and the channel's own
                     // timer — see expiryFor in chat-rules.ts.
                     "ttl_secs": msg.ttl_secs,
+                    "reply_to": msg.extras.reply,
+                    "thread": msg.extras.thread,
+                    "file": msg.extras.file,
+                    "fwd": msg.extras.fwd,
+                    "event": msg.extras.event,
                     "encrypted": true,
                 }),
             );
@@ -3811,7 +3890,7 @@ async fn voice_mixer_task(
                             error_emitted = true;
                             let _ = app_handle.emit(
                                 "audio-device-error",
-                                serde_json::json!({"error": e.to_string()}),
+                                serde_json::json!({"error": e.to_string(), "retrying": true}),
                             );
                         }
                         playback_restart.store(true, Ordering::Relaxed);
@@ -4830,13 +4909,14 @@ async fn video_stream_receiver_task(
 ) {
     let mut video_assembler = FrameAssembler::new();
     let mut current_video_session: Option<u32> = None;
-    let (mut key_log, mut decrypt_log) = (None, None);
+    let (mut key_log, mut decrypt_log, mut budget_log) = (None, None, None);
     let mut last_keyframe_request = std::time::Instant::now() - std::time::Duration::from_secs(10);
     // A frame went missing since the last one handed to the decode task
     let mut gap = false;
     let mut window_started = std::time::Instant::now();
     let mut window_dropped: u32 = 0;
     let mut window_received: u32 = 0;
+    let mut budget = FrameBudget::new(std::time::Instant::now());
     // At most once a second, which is also all the server relays: a request
     // that went unanswered (rate-limited, or its keyframe lost) is made again.
     let request_keyframe = |last: &mut std::time::Instant| {
@@ -4925,6 +5005,17 @@ async fn video_stream_receiver_task(
             if let Some((frame_data, is_keyframe)) = result.frame {
                 screen_video_frames_received.fetch_add(1, Ordering::Relaxed);
                 window_received += 1;
+                // Past what any share sends: lost like on the wire (S-045)
+                if !budget.take(std::time::Instant::now()) {
+                    gap = true;
+                    screen_video_frames_dropped.fetch_add(1, Ordering::Relaxed);
+                    window_dropped += 1;
+                    if log_due(&mut budget_log) {
+                        warn!("screen share sends more frames than any share does — dropping some");
+                    }
+                    request_keyframe(&mut last_keyframe_request);
+                    continue;
+                }
                 // Send to decode task — drop if full to avoid stalling voice.
                 // Lost here is lost like on the wire.
                 match video_decode_tx.try_send((frame_data, is_keyframe, gap)) {
@@ -4974,6 +5065,40 @@ async fn video_stream_receiver_task(
 
 /// The most frames decoded between two renders (about 130 ms at 60 fps).
 const MAX_DECODE_BATCH: usize = 8;
+
+/// The most frames a viewer hands its decoder in a second, on average and in
+/// one burst: past any share's 60 fps. A sharer that sends more (tiny frames,
+/// thousands a second) makes the viewer drop the rest and ask for a
+/// keyframe, never decode without end (S-045).
+const MAX_VIEW_FPS: f64 = 90.0;
+
+/// A token bucket of `MAX_VIEW_FPS` over the frames handed to the decoder.
+struct FrameBudget {
+    tokens: f64,
+    at: std::time::Instant,
+}
+
+impl FrameBudget {
+    fn new(now: std::time::Instant) -> Self {
+        FrameBudget {
+            tokens: MAX_VIEW_FPS,
+            at: now,
+        }
+    }
+
+    /// Whether one more frame may be decoded at `now`.
+    fn take(&mut self, now: std::time::Instant) -> bool {
+        let since = now.saturating_duration_since(self.at).as_secs_f64();
+        self.tokens = (self.tokens + since * MAX_VIEW_FPS).min(MAX_VIEW_FPS);
+        self.at = now;
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
 
 /// Video decode + render task: runs on a blocking thread to avoid stalling
 /// the media receivers. Decodes ALL frames to maintain codec state, but only
@@ -5104,9 +5229,32 @@ fn chain_intact(intact: bool, gap_before: bool, is_keyframe: bool, decoded: bool
     decoded && (is_keyframe || (intact && !gap_before))
 }
 
+/// What a failed microphone start says (D1-05): the system's words, except
+/// where the system refuses access, which says where to allow it. Windows
+/// words E_ACCESSDENIED in the user's language, so its code is what counts.
+pub(crate) fn mic_error_text(raw: &str) -> String {
+    let lower = raw.to_ascii_lowercase();
+    let denied = raw.contains("0x80070005")
+        || lower.contains("access is denied")
+        || lower.contains("permission denied");
+    if !denied {
+        raw.to_string()
+    } else if cfg!(windows) {
+        "Windows is blocking the microphone: Settings → Privacy & security → Microphone, \
+         and let desktop apps use it"
+            .into()
+    } else if cfg!(target_os = "android") {
+        "Android is blocking the microphone: allow VoIPC to use it in its app permissions".into()
+    } else {
+        format!("The system is blocking the microphone: {raw}")
+    }
+}
+
 /// Capture+encode task: reads from mic, encodes to Opus, encrypts with
 /// AES-256-GCM if a media key is available, then sends as datagrams.
-/// Runs on a blocking thread since it polls the ring buffer.
+/// Runs on a blocking thread since it polls the ring buffer. `opened` hears
+/// whether the microphone opened: a start that failed is the caller's error,
+/// so nothing claims "Talking" over a closed microphone (D1-05).
 #[allow(unused_assignments)] // capture_stream is a hold-to-keep-alive handle
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_capture_encode_task(
@@ -5126,31 +5274,42 @@ pub fn spawn_capture_encode_task(
     input_gain: Arc<AtomicU32>,
     app_handle: tauri::AppHandle,
     server: Arc<str>,
+    opened: tokio::sync::oneshot::Sender<Result<(), String>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_blocking(move || {
         // Whether voice was going out on the previous frame (talk edges)
         let mut was_on_air = false;
         let capture_error = Arc::new(AtomicBool::new(false));
-        let (mut _capture_stream, mut consumer) = match voipc_audio::capture::start_capture(
+        let started = voipc_audio::capture::start_capture(
             device_name.as_deref(),
             capture_error.clone(),
             input_gain.clone(),
-        ) {
-            Ok(result) => result,
-            Err(e) => {
-                error!("Failed to start audio capture: {}", e);
+        )
+        .map_err(|e| {
+            error!("Failed to start audio capture: {}", e);
+            mic_error_text(&e.to_string())
+        })
+        .and_then(|capture| {
+            let encoder = voipc_audio::encoder::Encoder::new().map_err(|e| {
+                error!("Failed to create Opus encoder: {}", e);
+                format!("could not start the voice encoder: {e}")
+            })?;
+            Ok((capture, encoder))
+        });
+        let ((mut _capture_stream, mut consumer), mut encoder) = match started {
+            Ok(started) => {
+                let _ = opened.send(Ok(()));
+                started
+            }
+            // Not retried here: the next press (or voice activation) asks
+            // again. Said as an error with nothing on its way.
+            Err(why) => {
                 transmitting.store(false, Ordering::Relaxed);
                 let _ = app_handle.emit(
                     "audio-device-error",
-                    serde_json::json!({"error": e.to_string()}),
+                    serde_json::json!({ "error": why, "retrying": false }),
                 );
-                return;
-            }
-        };
-        let mut encoder = match voipc_audio::encoder::Encoder::new() {
-            Ok(e) => e,
-            Err(e) => {
-                error!("Failed to create Opus encoder: {}", e);
+                let _ = opened.send(Err(why));
                 return;
             }
         };
@@ -5222,7 +5381,10 @@ pub fn spawn_capture_encode_task(
                             if !std::mem::replace(&mut capture_error_said, true) {
                                 let _ = app_handle.emit(
                                     "audio-device-error",
-                                    serde_json::json!({"error": "capture device error"}),
+                                    serde_json::json!({
+                                        "error": mic_error_text(&e.to_string()),
+                                        "retrying": true,
+                                    }),
                                 );
                             }
                         }
@@ -5417,6 +5579,41 @@ pub fn spawn_capture_encode_task(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// S-045: a share's 60 fps (with its bursts) always passes; a flood of
+    /// frames is held to `MAX_VIEW_FPS` a second.
+    #[test]
+    fn a_viewer_decodes_no_more_frames_than_any_share_sends() {
+        let t0 = std::time::Instant::now();
+        let mut steady = FrameBudget::new(t0);
+        for i in 0..600u64 {
+            let at = t0 + std::time::Duration::from_micros(i * 1_000_000 / 60);
+            assert!(steady.take(at), "frame {i} of a 60 fps share");
+        }
+        let mut flood = FrameBudget::new(t0);
+        let mut passed = 0;
+        for i in 0..10_000u64 {
+            // 10 000 frames a second, for a second
+            if flood.take(t0 + std::time::Duration::from_micros(i * 100)) {
+                passed += 1;
+            }
+        }
+        // One burst's worth plus a second's rate, give or take a frame
+        assert!(passed <= 2 * MAX_VIEW_FPS as usize + 1, "{passed}");
+        assert!(passed >= 2 * MAX_VIEW_FPS as usize - 1, "{passed}");
+    }
+
+    /// D1-05: a microphone the system refuses says where to allow it, in any
+    /// language Windows words E_ACCESSDENIED in; other errors stay as said.
+    #[test]
+    fn a_blocked_microphone_says_where_to_allow_it() {
+        let ru = "A backend-specific error has occurred: Отказано в доступе. (0x80070005)";
+        for raw in [ru, "Permission denied (os error 13)"] {
+            let said = mic_error_text(raw);
+            assert!(said.contains("blocking the microphone"), "{said}");
+        }
+        assert_eq!(mic_error_text("no input device"), "no input device");
+    }
 
     #[test]
     fn an_address_is_split_only_where_it_is_unambiguous() {

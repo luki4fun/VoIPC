@@ -200,21 +200,24 @@ jobs:
       # deny.toml at the root; cargo-deny finds it from each workspace
       - name: Licences, sources, bans
         run: |
-          for m in Cargo.toml crates/voipc-web/Cargo.toml crates/voipc-opus-wasm/Cargo.toml; do
+          for m in Cargo.toml crates/voipc-web/Cargo.toml crates/voipc-opus-wasm/Cargo.toml fuzz/Cargo.toml; do
             bash tools/ci-run.sh "cargo-deny $m" cargo deny --manifest-path "$m" check licenses sources bans
           done
 
       - name: Advisories
         continue-on-error: ${{ github.ref_type != 'tag' }}
         run: |
-          for m in Cargo.toml crates/voipc-web/Cargo.toml crates/voipc-opus-wasm/Cargo.toml; do
+          for m in Cargo.toml crates/voipc-web/Cargo.toml crates/voipc-opus-wasm/Cargo.toml fuzz/Cargo.toml; do
             bash tools/ci-run.sh "cargo-deny advisories $m" cargo deny --manifest-path "$m" check advisories
           done
 
   browser:
     name: Browser end-to-end
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    # The job took 22-39 min at 1.0 (18 of them apt, on a bad day), and the
+    # UI lane has grown since. Each lane also has its own cap below, so a hang
+    # names its lane instead of using up the job.
+    timeout-minutes: 90
     # The image has both, and test-web.sh would pick `chromium` first — but that
     # one is an unbranded snapshot build (no proprietary codecs), so the browser
     # sharer quietly falls back to VP9 and no lane exercises the H.264 path that
@@ -284,24 +287,30 @@ jobs:
       # whether a failure is engine-specific is most of the diagnosis, and the
       # job still fails if any lane did.
       #
-      # test-ui.mjs (about 7 minutes) drives its own Chromium and reads none of
-      # these settings, so it is the same test in every lane but where the
-      # network differs. It runs in the first lane (QUIC) and with UDP blocked
-      # (the TCP fallback); UI_TEST: '0' skips it in the others, which keeps
-      # the job well inside its timeout.
+      # test-ui.mjs (about 12 minutes since 1.3: its file section waits out
+      # the relay's one-minute file cache) drives its own Chromium and reads
+      # none of these settings, so it is the same test in every lane but where
+      # the network differs. It runs in the first lane (QUIC) and with UDP
+      # blocked (the TCP fallback); UI_TEST: '0' skips it in the others, and
+      # Firefox ↔ Firefox has no Chromium for it. Those two lanes get 25
+      # minutes, the others 10.
       - name: Chromium ↔ Chromium
+        timeout-minutes: 25
         run: ./test-web.sh
         env: { BROWSER: chromium }
       - name: Firefox ↔ Firefox
         if: ${{ !cancelled() }}
+        timeout-minutes: 10
         run: ./test-web.sh
         env: { BROWSER: firefox }
       - name: Chromium shares, Firefox watches
         if: ${{ !cancelled() }}
+        timeout-minutes: 10
         run: ./test-web.sh
         env: { BROWSER_ALICE: chromium, BROWSER_BOB: firefox, UI_TEST: '0' }
       - name: Firefox shares, Chromium watches
         if: ${{ !cancelled() }}
+        timeout-minutes: 10
         run: ./test-web.sh
         env: { BROWSER_ALICE: firefox, BROWSER_BOB: chromium, UI_TEST: '0' }
       # The TCP fallback for servers whose UDP is blocked: the whole run over
@@ -310,10 +319,12 @@ jobs:
       # Chromium viewer on QUIC — the relay is the same across the two.
       - name: Chromium ↔ Chromium over TCP
         if: ${{ !cancelled() }}
+        timeout-minutes: 10
         run: ./test-web.sh
         env: { BROWSER: chromium, TRANSPORT: tcp, UI_TEST: '0' }
       - name: Firefox over TCP shares, Chromium over QUIC watches
         if: ${{ !cancelled() }}
+        timeout-minutes: 10
         run: ./test-web.sh
         env: { BROWSER_ALICE: firefox, TRANSPORT_ALICE: tcp, BROWSER_BOB: chromium, UI_TEST: '0' }
       # A network that drops UDP: both browsers ask for QUIC and must race
@@ -321,6 +332,7 @@ jobs:
       # are blocked; the accounts relay of test-ui.mjs keeps its UDP.
       - name: UDP blocked — both fall back to TCP
         if: ${{ !cancelled() }}
+        timeout-minutes: 25
         run: |
           rule=(INPUT -i lo -p udp --dport 19987:19988 -j DROP)
           sudo iptables -I "${rule[@]}"
@@ -328,8 +340,14 @@ jobs:
           ./test-web.sh
         env: { BROWSER: chromium, EXPECT_FALLBACK: '1' }
       # Delay, jitter (which also reorders) and 5 % loss on loopback. It
-      # reports, it does not gate: it has never run, and the thresholds that
-      # will gate it come from its first runs.
+      # reports, it does not gate. It passed in CI at 1.0; make it gate
+      # (drop continue-on-error) once a run of the 1.3 tree passes here too.
+      # A report-only step that fails still shows as passed: only its
+      # annotation (test-web.sh's EXIT trap) tells.
+      #
+      # FILE_KIB '0': no file transfer. 10 MiB under 5 % loss outlasts the
+      # self-test's deadline, and the lane is about voice; the other lanes
+      # carry the file.
       - name: Lossy link (netem, report only)
         if: ${{ !cancelled() }}
         continue-on-error: true
@@ -342,7 +360,7 @@ jobs:
           sudo tc qdisc add dev lo root netem delay 40ms 20ms loss 5%
           trap 'sudo tc qdisc del dev lo root' EXIT
           ./test-web.sh
-        env: { BROWSER: chromium, UI_TEST: '0' }
+        env: { BROWSER: chromium, UI_TEST: '0', FILE_KIB: '0' }
 
   # The Windows and Android builds compile on every pull request, not first
   # in a release run. cargo check only, with the caches release.yml uses.

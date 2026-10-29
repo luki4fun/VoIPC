@@ -31,9 +31,17 @@
   // The loss is the call's; next to another server's ping it would be a number
   // about somewhere else.
   const loss = $derived($viewingVoice ? $lossPercent : 0);
+
+  interface Props {
+    /** The phone: the bar is also where Settings lives (there is no title
+     *  bar to carry the gear), and it says less so it fits on one line. */
+    compact?: boolean;
+    onopensettings?: () => void;
+  }
+  let { compact = false, onopensettings }: Props = $props();
 </script>
 
-<div class="status-bar">
+<div class="status-bar" class:compact>
   <div class="status">
     <div
       class="dot"
@@ -41,9 +49,9 @@
       class:connecting={$connectionState === "connecting"}
     ></div>
     {#if $connectionState === "connected"}
-      <span>Connected to {$serverAddress}</span>
+      <span>Connected{#if !compact}&nbsp;to {$serverAddress}{/if}</span>
     {:else if $connectionState === "connecting"}
-      <span>Connecting...</span>
+      <span>Connecting…</span>
     {:else}
       <span>Disconnected</span>
     {/if}
@@ -51,10 +59,10 @@
 
   {#if $connectionState === "connected"}
     <span
-      class="latency quality-{$viewingVoice ? $quality : 'good'}"
+      class="latency num quality-{$viewingVoice ? $quality : 'good'}"
       title={$viaTcp ? `${TCP_HINT} Voice packet loss (2s window)` : "Voice packet loss (2s window)"}
     >
-      Ping: {$latency}ms{#if $viaTcp}&nbsp;· TCP{/if}{#if loss > 0}&nbsp;· {loss}% loss{/if}
+      {#if !compact}Ping:&nbsp;{/if}{$latency}&nbsp;ms{#if $viaTcp}&nbsp;· TCP{/if}{#if loss > 0}&nbsp;· {loss}% loss{/if}
     </span>
     {#if $account}
       <button
@@ -75,9 +83,14 @@
       <Icon name="shield" size={14} />
       {#if $isAdmin}Admin{/if}
     </button>
-    <button class="disconnect-btn" onclick={disconnect}>
+    <button class="disconnect-btn" onclick={disconnect} aria-label="Disconnect from {$serverAddress}">
       <Icon name="disconnect" size={14} />
-      Disconnect
+      {#if !compact}Disconnect{/if}
+    </button>
+  {/if}
+  {#if onopensettings}
+    <button class="admin-btn settings-btn" onclick={onopensettings} title="Settings" aria-label="Settings">
+      <Icon name="settings" size={16} />
     </button>
   {/if}
 </div>
@@ -91,7 +104,7 @@
     padding: 4px 16px;
     background: var(--bg-primary);
     border-top: 1px solid var(--border);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
   }
 
@@ -142,13 +155,13 @@
     background: transparent;
     color: var(--danger);
     padding: 4px 10px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     border: 1px solid var(--danger);
   }
 
   .disconnect-btn:hover {
     background: var(--danger);
-    color: white;
+    color: var(--on-danger);
   }
 
   .admin-btn {
@@ -158,14 +171,22 @@
     background: transparent;
     color: var(--text-secondary);
     padding: 4px 8px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     border: 1px solid var(--border);
   }
 
   .admin-btn:hover,
   .admin-btn.active {
-    color: var(--accent);
-    border-color: var(--accent);
+    color: var(--text-primary);
+    border-color: var(--text-primary);
   }
 
+  /* On a phone these are Classic's only way to Settings and to disconnect */
+  @media (pointer: coarse) {
+    .admin-btn,
+    .disconnect-btn {
+      min-width: var(--hit);
+      min-height: var(--hit);
+    }
+  }
 </style>

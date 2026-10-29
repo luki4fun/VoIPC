@@ -52,10 +52,12 @@ pub fn fuzz_video_assembly(data: &[u8]) {
         for record in reader.push(part) {
             let _ = grouper.place(&record);
             if let Ok(packet) = video::VideoPacket::from_bytes(&record) {
+                // Records, not packets, bound a fragment here: a peer's may
+                // be up to 1500 bytes, past the 1280 a sharer sends (S-049)
                 if let Some((frame, _)) = assembler.add_fragment(&packet).frame {
                     assert!(
                         frame.len()
-                            <= video::MAX_FRAGMENTS_PER_FRAME * video::MAX_VIDEO_PACKET_SIZE
+                            <= video::MAX_FRAGMENTS_PER_FRAME * video::MAX_STREAM_RECORD_SIZE
                     );
                 }
             }
@@ -98,6 +100,31 @@ mod tests {
         for file in std::fs::read_dir(dir).into_iter().flatten().flatten() {
             f(&std::fs::read(file.path()).unwrap());
         }
+    }
+
+    /// S-049: 255 fragments in records of the largest size a stream takes
+    /// make a frame past 255 * 1280, and that is no bug.
+    #[test]
+    fn a_frame_of_the_largest_records_is_no_crash() {
+        let payload = video::MAX_STREAM_RECORD_SIZE - video::VIDEO_HEADER_SIZE;
+        let packets = video::fragment_frame(
+            &vec![7; video::MAX_FRAGMENTS_PER_FRAME * payload],
+            true,
+            1,
+            2,
+            3,
+            payload,
+        );
+        assert_eq!(packets.len(), video::MAX_FRAGMENTS_PER_FRAME);
+        let records: Vec<u8> = packets
+            .iter()
+            .flat_map(|p| {
+                let b = p.to_bytes();
+                assert_eq!(b.len(), video::MAX_STREAM_RECORD_SIZE);
+                [(b.len() as u16).to_be_bytes().to_vec(), b].concat()
+            })
+            .collect();
+        fuzz_video_assembly(&records);
     }
 
     #[test]

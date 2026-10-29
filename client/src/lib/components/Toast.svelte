@@ -1,5 +1,10 @@
 <script lang="ts">
-  import { notifications, removeNotification } from "../stores/notifications.js";
+  import {
+    notifications,
+    pauseNotification,
+    removeNotification,
+    resumeNotification,
+  } from "../stores/notifications.js";
   import Icon from "./Icons.svelte";
 </script>
 
@@ -7,7 +12,14 @@
      toast arrives: polite for news, an alert for an error (H5-04) -->
 <div class="toast-container" aria-live="polite">
   {#each $notifications as notification (notification.id)}
-    <div class="toast toast-{notification.type}" role={notification.type === "error" ? "alert" : "status"}>
+    <div
+      class="toast toast-{notification.type}"
+      role={notification.type === "error" ? "alert" : "status"}
+      onmouseenter={() => pauseNotification(notification.id)}
+      onmouseleave={() => resumeNotification(notification.id)}
+      onfocusin={() => pauseNotification(notification.id)}
+      onfocusout={() => resumeNotification(notification.id)}
+    >
       <span class="toast-message">{notification.message}</span>
       <button
         class="toast-close"
@@ -26,7 +38,7 @@
     display: flex;
     flex-direction: column-reverse;
     gap: 8px;
-    z-index: 200;
+    z-index: var(--z-toast);
     pointer-events: none;
   }
 
@@ -39,12 +51,12 @@
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     color: var(--text-primary);
-    font-size: 13px;
+    font-size: var(--fs-body);
     min-width: 240px;
     max-width: min(380px, calc(100vw - 32px));
-    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+    box-shadow: var(--shadow-menu);
     pointer-events: auto;
-    animation: slide-in 0.2s ease-out;
+    animation: slide-in var(--dur-base) var(--ease-out);
   }
 
   @keyframes slide-in {
@@ -58,16 +70,27 @@
     }
   }
 
+  /* What kind of news, as a dot before the words (the role says it to a
+     screen reader) */
+  .toast::before {
+    content: "";
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+    background: var(--toast-kind);
+  }
+
   .toast-info {
-    border-left: 3px solid var(--accent);
+    --toast-kind: var(--text-secondary);
   }
 
   .toast-warning {
-    border-left: 3px solid #ff9800;
+    --toast-kind: var(--warning);
   }
 
   .toast-error {
-    border-left: 3px solid var(--danger);
+    --toast-kind: var(--danger);
   }
 
   .toast-message {

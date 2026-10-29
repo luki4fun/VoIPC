@@ -12,7 +12,11 @@ export type CaptureStep =
   /** Nothing yet; show `hint` ("Ctrl+Alt+…") so the user sees it listening. */
   | { kind: "hint"; hint: string }
   /** Done: this is the binding. */
-  | { kind: "binding"; binding: string };
+  | { kind: "binding"; binding: string }
+  /** Escape: stop listening, keep the old binding. */
+  | { kind: "cancel" }
+  /** Tab: not a binding — let it move the focus on (which ends the capture). */
+  | { kind: "pass" };
 
 const MODIFIER_KEYS = ["Control", "Shift", "Alt", "Meta"];
 
@@ -47,6 +51,12 @@ export class KeyCapture {
   static readonly PROMPT = "Press any key or combo...";
 
   keydown(e: KeyboardEvent): CaptureStep {
+    // Escape and Tab are how a keyboard gets out of the field. Bound, they
+    // trapped it there: Escape became push-to-talk instead of cancelling, and
+    // Tab could never leave. With a modifier held they are still bindable.
+    const bare = !e.ctrlKey && !e.altKey && !e.metaKey;
+    if (bare && !e.shiftKey && e.key === "Escape") return { kind: "cancel" };
+    if (bare && e.key === "Tab") return { kind: "pass" };
     if (MODIFIER_KEYS.includes(e.key)) {
       // `e.ctrlKey` is already true for the modifier being pressed in most
       // browsers, but not all, so the key itself is checked as well.
@@ -86,4 +96,50 @@ export function shadows(binding: string): "mute" | "deafen" | null {
   if (code === "KeyM") return "mute";
   if (code === "KeyD") return "deafen";
   return null;
+}
+
+/** The part of an element `keyOwner` reads; a real element has all of it. */
+export interface KeyTarget {
+  tagName: string;
+  type?: string;
+  isContentEditable?: boolean;
+  getAttribute?(name: string): string | null;
+  matches?(selector: string): boolean;
+}
+
+/** Inputs that take a key for themselves rather than typing it. */
+const CONTROL_INPUTS = new Set(["range", "checkbox", "radio", "color", "button", "submit", "reset", "file"]);
+const CONTROL_ROLES = new Set(["button", "menuitem", "tab", "checkbox", "switch", "option", "radio"]);
+
+/**
+ * Who a key pressed on `target` belongs to, before the window-level shortcuts
+ * see it (VoiceKeys):
+ *
+ * - `"text"`: a field being typed in. Every key is the field's.
+ * - `"control"`: a button, select, checkbox, slider… that the keyboard moved
+ *   to (`:focus-visible`). Space and Enter are its, so it can be pressed.
+ * - `"none"`: anything else, including a control a mouse click left focused —
+ *   a click leaves focus on the button it pressed, and push-to-talk on Space
+ *   must not stop working because the last click was the mute button.
+ *
+ * A slider or checkbox used to count as a text field (it is an INPUT), so
+ * after dragging the mic gain push-to-talk did nothing until a click elsewhere.
+ */
+export function keyOwner(target: KeyTarget | null): "text" | "control" | "none" {
+  if (!target) return "none";
+  const tag = target.tagName;
+  if (target.isContentEditable || tag === "TEXTAREA") return "text";
+  if (tag === "INPUT" && !CONTROL_INPUTS.has((target.type ?? "text").toLowerCase())) return "text";
+  const role = target.getAttribute?.("role") ?? "";
+  const control =
+    tag === "INPUT" || tag === "BUTTON" || tag === "SELECT" || tag === "SUMMARY" ||
+    (tag === "A" && !!target.getAttribute?.("href")) || CONTROL_ROLES.has(role);
+  if (!control) return "none";
+  let keyboard = false;
+  try {
+    keyboard = target.matches?.(":focus-visible") ?? false;
+  } catch {
+    // An engine without :focus-visible: treat focus as the mouse's
+  }
+  return keyboard ? "control" : "none";
 }

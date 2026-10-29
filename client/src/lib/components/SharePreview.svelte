@@ -110,7 +110,7 @@
     box-shadow: var(--shadow-dialog);
     overflow: hidden;
     /* Above the stream view (90), below every dialog (100 and up) */
-    z-index: 95;
+    z-index: var(--z-floating);
   }
 
   .share-preview.stage {
@@ -131,7 +131,7 @@
     gap: 6px;
     padding: 4px 6px 4px 10px;
     background: var(--bg-secondary);
-    font-size: 11px;
+    font-size: var(--fs-micro);
     color: var(--text-secondary);
     min-width: 0;
   }
@@ -139,7 +139,7 @@
   .stage .bar {
     gap: 12px;
     padding: 8px 16px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     border-bottom: 1px solid var(--border);
   }
 
@@ -206,7 +206,15 @@
 
   .waiting {
     color: var(--text-secondary);
-    font-size: 12px;
+    font-size: var(--fs-sm);
     font-style: italic;
+  }
+
+  /* A finger needs 44px (--hit) */
+  @media (pointer: coarse) {
+    .bar-btn {
+      min-width: var(--hit);
+      min-height: var(--hit);
+    }
   }
 </style>

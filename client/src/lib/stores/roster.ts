@@ -79,10 +79,11 @@ export const displayChannelName: Readable<string> = derived(
  */
 export const shownMessages: Readable<ChatMessage[]> = derived(
   [activeDmUserId, activeDmUsername, serverAddress, displayChannelName, channelMessages, dmMessages],
-  ([$dm, $dmName, $server, $name, $channels, $dms]) => [
-    ...(($dm !== null ? $dms.get(dmKey($server, $dmName)) : $channels.get(chatKey($server, $name))) ??
-      []),
-  ],
+  // What a writer deleted stays only as a tombstone, which is never drawn
+  ([$dm, $dmName, $server, $name, $channels, $dms]) =>
+    (($dm !== null ? $dms.get(dmKey($server, $dmName)) : $channels.get(chatKey($server, $name))) ?? []).filter(
+      (m) => m.kind !== "deleted",
+    ),
 );
 
 export const displayChannelCreatorId: Readable<number | null> = derived(
@@ -214,6 +215,22 @@ export const displayUsers: Readable<UserInfo[]> = derived(
       // Never applied to a preview: the rule is about the channel you are in.
       $hide && !$previewing,
     ),
+);
+
+/**
+ * The people in the call, for the Stage layout's speaker grid: the voice
+ * channel we stand in on the server on screen, whatever the chat pane shows —
+ * a preview or a text channel does not empty the call. The same hide-members
+ * rule as the member list, applied with *this* channel's flag. Empty while the
+ * call is on another server, or there is none.
+ */
+export const callMembers: Readable<UserInfo[]> = derived(
+  [viewingVoice, currentChannelId, channels, users, userId, recentSpeakers, isAdmin],
+  ([$viewingVoice, $current, $channels, $users, $userId, $recent, $admin]) => {
+    if (!$viewingVoice || $current === 0) return [];
+    const hide = !$admin && ($channels.find((c) => c.channel_id === $current)?.hide_members ?? false);
+    return visibleMembers($users, $userId, $recent, hide);
+  },
 );
 
 /**

@@ -1,11 +1,14 @@
 <script lang="ts">
   import { dialog } from "../actions/dialog.js";
+  import { roving } from "../actions/roving.js";
   // Opens a server. Up on its own while no server is on screen, and from the
   // rail's "+" while some are — then with a close button, and connecting here
   // leaves every open server as it is. It stays up until a connect succeeds,
   // so the reason one failed stays on screen under the form.
 
   import { invoke } from "@tauri-apps/api/core";
+  import { confirmAction } from "../stores/confirm.js";
+  import Icon from "./Icons.svelte";
   import {
     rememberConnection,
     lastHost,
@@ -250,7 +253,25 @@
     }
   }
 
+  /** The two fingerprints transport.rs names in its refusal, when it does. */
+  let pinFingerprints = $derived(
+    error.match(/remembered SHA-256 ([0-9A-F:]+); offered SHA-256 ([0-9A-F:]+)/),
+  );
+
   async function forgetPin() {
+    const ok = await confirmAction({
+      title: "Trust the new certificate?",
+      body:
+        `VoIPC remembered a different certificate for ${host}:${port}. If the server's operator ` +
+        "replaced it, trusting the new one is safe. If nobody did, someone may be sitting between " +
+        "you and the server — ask the operator to compare the fingerprint before you go ahead.",
+      details: pinFingerprints
+        ? [`Remembered  ${pinFingerprints[1]}`, `Offered now ${pinFingerprints[2]}`]
+        : undefined,
+      confirm: "Forget the old certificate",
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await invoke("forget_server_pin", { host, port });
       error = "";
@@ -277,17 +298,21 @@
   <div
     class="dialog"
     oninput={() => (touched = true)}
-    use:dialog={{ onclose: $serverAddress && !connecting ? () => showConnectDialog.set(false) : undefined }}
+    use:dialog={{
+      onclose: $serverAddress && !connecting ? () => showConnectDialog.set(false) : undefined,
+      // With no server it is the app's start screen: Back leaves, as from a home screen
+      back: $serverAddress ? undefined : "leave",
+    }}
   >
     <div class="title-row">
-      <h2>Connect to Server</h2>
+      <h2>Connect to a server</h2>
       {#if $serverAddress}
         <button
           class="connect-close"
           onclick={() => showConnectDialog.set(false)}
           title="Back to the open servers"
           aria-label="Back to the open servers"
-          disabled={connecting}>&#x2715;</button
+          disabled={connecting}><Icon name="close" size={16} /></button
         >
       {/if}
     </div>
@@ -305,7 +330,8 @@
               onclick={(e) => removeSaved(s, e)}
               disabled={connecting}
               title="Remove server"
-            >&#x2715;</button>
+              aria-label="Remove {s.name}"
+            ><Icon name="close" size={14} /></button>
           </div>
         {/each}
       </div>
@@ -317,6 +343,10 @@
         <input
           id="host"
           type="text"
+          inputmode="url"
+          autocapitalize="off"
+          autocomplete="off"
+          spellcheck="false"
           bind:value={host}
           placeholder="localhost"
           disabled={connecting}
@@ -344,7 +374,7 @@
           Invited to <strong>#{$pendingInvite.channel}</strong>{#if $pendingInvite.password} (password included){/if}
           — you join it right after connecting.
         </span>
-        <button type="button" class="invite-dismiss" onclick={() => pendingInvite.set(null)} title="Discard invite">&#x2715;</button>
+        <button type="button" class="invite-dismiss" onclick={() => pendingInvite.set(null)} title="Discard invite" aria-label="Discard invite"><Icon name="close" size={14} /></button>
       </div>
     {:else}
       <div class="field">
@@ -352,6 +382,10 @@
         <input
           id="invite"
           type="text"
+          inputmode="url"
+          autocapitalize="off"
+          autocomplete="off"
+          spellcheck="false"
           bind:value={inviteLink}
           placeholder="https://server:9987/#channel=…"
           disabled={connecting}
@@ -361,7 +395,7 @@
       </div>
     {/if}
 
-    <div class="mode-switch" role="tablist" aria-label="How to join">
+    <div class="mode-switch" role="tablist" aria-label="How to join" use:roving>
       <button type="button" role="tab" class:active={mode === "guest"} aria-selected={mode === "guest"} onclick={() => (mode = "guest")} disabled={connecting}>Guest</button>
       <button type="button" role="tab" class:active={mode === "account"} aria-selected={mode === "account"} onclick={() => (mode = "account")} disabled={connecting}>Account</button>
     </div>
@@ -373,6 +407,9 @@
           <input
             id="username"
             type="text"
+            autocapitalize="off"
+            autocomplete="off"
+            spellcheck="false"
             bind:value={name}
             placeholder="Your name"
             disabled={connecting}
@@ -557,7 +594,7 @@
         {/if}
       </div>
     {:else if error}
-      <div class="error">{error}</div>
+      <div class="error" role="alert">{error}</div>
       {#if pinRejected && !isWeb}
         <button
           type="button"
@@ -586,9 +623,9 @@
         onclick={saveCurrentServer}
         disabled={connecting}
         title="Save this server to the list above"
-      >&#9733; Save</button>
-      <button class="connect-btn" onclick={handleConnect} disabled={connecting}>
-        {connecting ? "Connecting..." : "Connect"}
+      >Save server</button>
+      <button class="connect-btn btn btn-primary" onclick={handleConnect} disabled={connecting}>
+        {connecting ? "Connecting…" : "Connect"}
       </button>
     </div>
   </div>
@@ -606,23 +643,24 @@
   .mode-switch button {
     flex: 1;
     padding: 6px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     background: transparent;
     color: var(--text-secondary);
   }
 
   .mode-switch button.active {
-    background: var(--accent);
-    color: white;
+    background: var(--bg-hover);
+    color: var(--text-primary);
+    box-shadow: inset 0 0 0 1px var(--text-muted);
   }
 
   .mode-switch.small button {
     padding: 4px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
 
   .account-note {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
   }
 
@@ -631,8 +669,9 @@
     background: none;
     border: none;
     padding: 2px 0;
-    font-size: 12px;
-    color: var(--accent);
+    font-size: var(--fs-sm);
+    color: var(--text-primary);
+    text-decoration: underline;
     cursor: pointer;
   }
 
@@ -643,11 +682,11 @@
   .overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.7);
+    background: var(--scrim);
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 100;
+    z-index: var(--z-dialog);
   }
 
   .dialog {
@@ -659,6 +698,9 @@
     display: flex;
     flex-direction: column;
     gap: 16px;
+    /* The window can be 640×480: the dialog scrolls, its buttons stay reachable */
+    max-height: calc(100dvh - 32px);
+    overflow-y: auto;
   }
 
   .title-row {
@@ -677,7 +719,7 @@
     color: var(--text-secondary);
     border: none;
     padding: 4px 8px;
-    font-size: 14px;
+    font-size: var(--fs-md);
   }
 
   .connect-close:hover {
@@ -686,8 +728,8 @@
 
   h2 {
     text-align: center;
-    font-size: 20px;
-    color: var(--accent);
+    font-size: var(--fs-2xl);
+    color: var(--text-primary);
   }
 
   .address-row {
@@ -697,11 +739,24 @@
 
   .host-field {
     flex: 1;
+    /* An input's own minimum is about twenty characters: kept, it squeezed
+       the tag to three digits whenever the dialog had a scrollbar */
+    min-width: 0;
   }
 
+  /* Sized by what they hold, so a larger system font grows them too: five
+     digits and the spin buttons; "#" and four digits */
   .port-field,
   .tag-field {
-    width: 90px;
+    flex-shrink: 0;
+  }
+
+  .port-field {
+    width: calc(5ch + 52px);
+  }
+
+  .tag-field {
+    width: calc(4ch + 48px);
   }
 
   .port-field input {
@@ -727,17 +782,15 @@
   }
 
   label {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
-    text-transform: uppercase;
-    letter-spacing: 0.5px;
   }
 
   .checkbox-label {
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     color: var(--text-secondary);
     cursor: pointer;
     text-transform: none;
@@ -745,7 +798,7 @@
   }
 
   .checkbox-label input[type="checkbox"] {
-    accent-color: var(--accent);
+    accent-color: var(--control-fill);
   }
 
   .security-warning {
@@ -753,13 +806,13 @@
     border: 1px solid var(--warning);
     border-radius: 6px;
     padding: 10px 12px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--warning);
     line-height: 1.4;
   }
 
   .web-hint {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     line-height: 1.4;
   }
@@ -768,7 +821,7 @@
     display: flex;
     align-items: flex-start;
     gap: 8px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     line-height: 1.4;
     color: var(--text-primary);
     background: var(--bg-hover);
@@ -781,12 +834,12 @@
     background: transparent;
     color: var(--text-secondary);
     padding: 0 4px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
 
   .error {
     color: var(--danger);
-    font-size: 13px;
+    font-size: var(--fs-body);
     text-align: center;
   }
 
@@ -835,17 +888,17 @@
   }
 
   .saved-main:hover:not(:disabled) {
-    border-color: var(--accent);
+    border-color: var(--text-muted);
   }
 
   .saved-name {
-    font-size: 13px;
+    font-size: var(--fs-body);
     font-weight: 600;
     color: var(--text-primary);
   }
 
   .saved-detail {
-    font-size: 11px;
+    font-size: var(--fs-micro);
     color: var(--text-secondary);
     white-space: nowrap;
     overflow: hidden;
@@ -860,7 +913,7 @@
     border-radius: 6px;
     padding: 0 10px;
     cursor: pointer;
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
 
   .saved-remove:hover:not(:disabled) {
@@ -880,7 +933,7 @@
     border: 1px solid var(--border);
     border-radius: 6px;
     padding: 10px 14px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     cursor: pointer;
     white-space: nowrap;
   }
@@ -892,19 +945,7 @@
 
   .connect-btn {
     flex: 1;
-    background: var(--accent);
-    color: white;
     padding: 10px;
-    font-size: 14px;
-    font-weight: 600;
-  }
-
-  .connect-btn:hover:not(:disabled) {
-    background: var(--accent-hover);
-  }
-
-  .connect-btn:disabled {
-    opacity: 0.6;
-    cursor: not-allowed;
+    font-size: var(--fs-md);
   }
 </style>

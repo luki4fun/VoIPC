@@ -142,12 +142,16 @@ const VERSION_SITES = [
     make: (v) => `version = "${v}"`,
   },
   {
-    // The download blurb on the website; nothing else syncs it.
+    // The website: every release version on it — the download links and
+    // their asset names, the Join button, the status bar. A version is the
+    // only three-part number the page carries; the guards keep a four-part
+    // one (the example IP in the console) whole. With an optional -rc.N, or
+    // after one rc sync the next sync would skip it silently — and only that
+    // form: a general pre-release would take `.apk` for part of "-rc.1.apk"
+    // and drop it on the next sync (it did, at 1.3.1-rc.1).
     file: join(ROOT, 'website', 'index.html'),
-    // With an optional -rc.N: after one rc sync the site says v1.0.0-rc.1,
-    // and a regex without the suffix would skip it silently from then on.
-    re: /(<a href="[^"]*CHANGELOG\.md">)v\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?(<\/a>)/,
-    make: (v) => `$1v${v}$2`,
+    re: /(?<![\d.])\d+\.\d+\.\d+(?:-rc\.\d+)?(?![\d.]*\d)/g,
+    make: (v) => v,
     optional: true,
   },
   {
@@ -170,6 +174,20 @@ const VERSION_SITES = [
     file: join(CLIENT, 'src-tauri', 'src', 'sdk.rs'),
     re: /"version":"[^"]*","sdk":1/,
     make: (v) => `"version":"${v}","sdk":1`,
+    optional: true,
+  },
+  {
+    // Commands people copy: verifying a release's files and running the
+    // relay's image. Only the version after a release asset or image name.
+    file: join(ROOT, 'SECURITY.md'),
+    re: /(?<=VoIPC_|voipc-server:|VoIPC-android-)\d+\.\d+\.\d+(?:-rc\.\d+)?/g,
+    make: (v) => v,
+    optional: true,
+  },
+  {
+    file: join(ROOT, 'docs', 'OPERATING.md'),
+    re: /(?<=ghcr\.io\/luki4fun\/voipc-server:)\d+\.\d+\.\d+(?:-rc\.\d+)?/g,
+    make: (v) => v,
     optional: true,
   },
 ];

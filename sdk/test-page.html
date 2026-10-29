@@ -3,9 +3,11 @@
 <title>VoIPC Game SDK — test page</title>
 <!--
   Stands in for a game while you build against the VoIPC Game SDK
-  (docs/SDK.md). Open it in a browser, add "null" to Settings → Game
-  Integration → allowed origins (a file:// page has no real origin), connect,
-  and drag the sliders: the other user's voice should move.
+  (docs/SDK.md). Serve it from localhost, which is allowed without
+  configuration (`python3 -m http.server -d sdk 8000`, then open
+  http://localhost:8000/test-page.html; a file:// page's origin is "null",
+  which VoIPC refuses), connect, and drag the sliders: the other user's voice
+  should move.
 -->
 <style>
   body { font: 14px system-ui, sans-serif; margin: 24px; max-width: 640px; }

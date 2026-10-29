@@ -30,7 +30,9 @@
 // Pure, so chat-rules.test.ts can load it under Node's own test runner —
 // stores/chat.ts, which owns the state and reaches the backend, cannot.
 
-import type { ChatMessage } from "./types.ts";
+import type { ChatEvent, ChatMessage, FileRef, Forwarded, Reaction, Reactor } from "./types.ts";
+import { authorKey, findTarget } from "./thread-rules.ts";
+import { plainText } from "./markdown.ts";
 
 /** Per conversation, in the store and in the archive. */
 export const MAX_MESSAGES = 500;
@@ -207,11 +209,213 @@ export function sanitizeHistory(
       // relayed on from here is offered as `shared` again, so passing it round
       // a second time can never launder it back into a first-hand account.
       kind: "shared",
-      id: typeof m.id === "string" && m.id !== "" ? m.id.slice(0, 64) : undefined,
+      id: keptId(m.id),
       expires_at,
+      // What it answers survives the hand-off: an id, which shows nothing a
+      // newcomer does not already hold, and points at nothing they cannot see.
+      // Its file too, checked as if it had just arrived: its key is no more
+      // than the message itself gives a member.
+      ...messageRefs(m),
+      // That its writer changed it, which the text already shows: the
+      // sharer's word, like the rest. What else events did to it (reactions,
+      // a pin) is each reader's own record, and never taken from a peer.
+      ...editedAt(m.edited_at, m.timestamp, now),
     });
   }
   return valid;
+}
+
+/** Longest message id kept: `voipc_crypto::envelope::MAX_MESSAGE_ID`. */
+const MAX_MESSAGE_ID = 64;
+
+/** An id as we keep one: a non-empty string, cut to `MAX_MESSAGE_ID` code
+ *  points, as envelope.rs `bounded_id` cuts it, so a live copy and a kept one
+ *  of the same id agree (R2-17). */
+function keptId(v: unknown): string | undefined {
+  if (typeof v !== "string" || v === "") return undefined;
+  // No more units than the bound is no more code points either
+  return v.length <= MAX_MESSAGE_ID ? v : Array.from(v).slice(0, MAX_MESSAGE_ID).join("");
+}
+
+/**
+ * The most of a message's text kept where it arrives (D-7): 16 KiB of UTF-8.
+ * Twice that is about what a relay passes, and nothing the composer writes
+ * comes near it (2000 characters); past `MAX_MARKUP_CHARS` it is drawn as
+ * plain text anyway. Applied at every receive point: live, stored, and an
+ * edit's new text.
+ */
+export const MAX_RECEIVED_BYTES = 16 * 1024;
+const receivedBuf = new Uint8Array(MAX_RECEIVED_BYTES);
+
+/** `text`, cut to `MAX_RECEIVED_BYTES` at a character's edge. */
+export function receivedText(text: string): string {
+  // A UTF-16 unit is at most three bytes of UTF-8
+  if (text.length * 3 <= MAX_RECEIVED_BYTES) return text;
+  const { read } = new TextEncoder().encodeInto(text, receivedBuf);
+  return read >= text.length ? text : text.slice(0, read);
+}
+
+/**
+ * What a system notification says of a message (R2-14). Nothing of one with
+ * a destruction timer: the notification centre, or a phone's lock screen,
+ * would keep its text after the message is gone. A file without a caption
+ * by its name.
+ */
+export function notificationBody(m: Pick<ChatMessage, "content" | "file" | "expires_at">): string {
+  if (m.expires_at !== undefined) return "";
+  return plainText(m.content).slice(0, 140) || (m.file ? `Sent a file: ${m.file.name}` : "");
+}
+
+/**
+ * What a message points at (the message it answers, its thread), the file it
+ * carries and where it was forwarded from, as they may be kept: ids bounded
+ * like its own, a file checked (`fileRef`), a label checked (`forwarded`), and
+ * only the keys that are there, so a plain message stays exactly the object
+ * it was.
+ */
+export function messageRefs(src: {
+  reply_to?: unknown;
+  thread?: unknown;
+  file?: unknown;
+  fwd?: unknown;
+}): Pick<ChatMessage, "reply_to" | "thread" | "file" | "fwd"> {
+  const out: Pick<ChatMessage, "reply_to" | "thread" | "file" | "fwd"> = {};
+  const reply = keptId(src.reply_to);
+  const thread = keptId(src.thread);
+  const file = fileRef(src.file);
+  const fwd = forwarded(src.fwd);
+  if (reply) out.reply_to = reply;
+  if (thread) out.thread = thread;
+  if (file) out.file = file;
+  if (fwd) out.fwd = fwd;
+  return out;
+}
+
+/** envelope.rs `MAX_FWD_NAME`. */
+const MAX_FWD_NAME = 64;
+
+/** A forwarded message's label as it may be kept (envelope.rs
+ *  `Forwarded::checked`): a cleaned name, and a moment JS holds exactly. */
+export function forwarded(v: unknown): Forwarded | undefined {
+  const f = v as Record<string, unknown> | null;
+  if (typeof f?.name !== "string" || within(f.at, 0, Number.MAX_SAFE_INTEGER) === undefined) return undefined;
+  return { name: cleanText(f.name, MAX_FWD_NAME) || "someone", at: f.at as number };
+}
+
+/** voipc_crypto::file::MAX_FILE_PLAIN, and envelope.rs's bounds on a file. */
+const MAX_FILE_PLAIN = 64 * 1024 * 1024;
+const MAX_FILE_NAME = 255;
+const MAX_FILE_SIDE = 16_384;
+const MAX_FILE_DUR = 7 * 24 * 60 * 60;
+const HEX64 = /^[0-9a-f]{64}$/;
+const MIME = /^[a-z0-9!#$&^_.+-]+\/[a-z0-9!#$&^_.+-]+$/i;
+const PREVIEW_B64 = /^[A-Za-z0-9+/]{1024}$/;
+/** Control characters, and those that turn the text's direction (an
+ *  `exe.jpg` that reads `gpj.exe`). */
+const NAME_JUNK = /[\p{Cc}\u200e\u200f\u061c\u202a-\u202e\u2066-\u2069\ufeff]/gu;
+
+/** A file name as a card shows it (envelope.rs `clean_name`). */
+export function cleanFileName(name: string): string {
+  return cleanText(name, MAX_FILE_NAME);
+}
+
+/** `cleanFileName`, at most `max` characters (envelope.rs `clean`). */
+function cleanText(text: string, max: number): string {
+  return Array.from(text.replace(NAME_JUNK, "")).slice(0, max).join("").trim();
+}
+
+/** A whole number within bounds, else nothing. */
+function within(v: unknown, least: number, most: number): number | undefined {
+  return Number.isSafeInteger(v) && (v as number) >= least && (v as number) <= most ? (v as number) : undefined;
+}
+
+/**
+ * A message's file as it may be kept, bounded like envelope.rs `FileRef::checked`:
+ * the blob's part as `FileMeta::from_parts` takes it, or no file at all; the
+ * name cleaned; the rest dropped where it is out of bounds.
+ */
+export function fileRef(v: unknown): FileRef | undefined {
+  const f = v as Record<string, unknown> | null;
+  const blob =
+    typeof f?.hash === "string" &&
+    HEX64.test(f.hash) &&
+    typeof f.key === "string" &&
+    HEX64.test(f.key) &&
+    within(f.size, 0, MAX_FILE_PLAIN) !== undefined &&
+    typeof f.z === "boolean";
+  if (!blob) return undefined;
+  const out: FileRef = {
+    hash: f.hash as string,
+    key: f.key as string,
+    size: f.size as number,
+    z: f.z as boolean,
+    name: (typeof f.name === "string" && cleanFileName(f.name)) || "file",
+  };
+  if (typeof f.mime === "string" && f.mime.length <= 127 && MIME.test(f.mime)) out.mime = f.mime.toLowerCase();
+  const w = within(f.w, 1, MAX_FILE_SIDE);
+  const h = within(f.h, 1, MAX_FILE_SIDE);
+  const dur = within(f.dur, 0, MAX_FILE_DUR);
+  if (w !== undefined) out.w = w;
+  if (h !== undefined) out.h = h;
+  if (dur !== undefined) out.dur = dur;
+  if (typeof f.px === "string" && PREVIEW_B64.test(f.px)) out.px = f.px;
+  return out;
+}
+
+/** The fields the archive has a place of its own for (crypto.rs `ChatMessage`). */
+const ARCHIVE_FIELDS = new Set(["user_id", "username", "content", "timestamp", "kind", "id", "expires_at", "account"]);
+/** The fields `extra` holds that this version reads back (`fromArchived`). */
+const EXTRA_FIELDS = new Set(["reply_to", "thread", "file", "fwd", "edited_at", "reactions", "pin"]);
+
+/**
+ * A message as the desktop archive stores it: every field it has no place of
+ * its own for folded into one JSON string, `extra` (archive v6). The archive is
+ * positional, so a field of its own would be a new file format each time.
+ * What a later version kept there and this one does not know goes back as it
+ * came (`extra_kept`), under the fields this one wrote.
+ */
+export function toArchived(m: ChatMessage): ChatMessage & { extra?: string } {
+  const { extra_kept, ...known } = m;
+  const out: Record<string, unknown> = {};
+  let extra: Record<string, unknown> = {};
+  try {
+    const kept = extra_kept ? JSON.parse(extra_kept) : null;
+    if (kept && typeof kept === "object" && !Array.isArray(kept)) extra = kept;
+  } catch {
+    // Not ours to repair: what this version knows is written either way
+  }
+  for (const [k, v] of Object.entries(known)) {
+    if (v === undefined) continue;
+    (ARCHIVE_FIELDS.has(k) ? out : extra)[k] = v;
+  }
+  if (Object.keys(extra).length > 0) out.extra = JSON.stringify(extra);
+  return out as unknown as ChatMessage & { extra?: string };
+}
+
+/**
+ * And back: only the fields this version knows, each checked as if it had just
+ * arrived. A damaged `extra` costs those fields, never the message. The keys
+ * it does not know (a later 1.x wrote them) are kept, untouched and unread,
+ * for the next save (R2-03): a downgrade destroys nothing.
+ */
+export function fromArchived(m: ChatMessage & { extra?: string | null }): ChatMessage {
+  const { extra, ...rest } = m;
+  // serde writes an absent field as null; the front end's shape has no nulls
+  for (const k of Object.keys(rest) as (keyof ChatMessage)[]) if (rest[k] === null) delete rest[k];
+  if (typeof extra !== "string") return rest;
+  try {
+    const more = JSON.parse(extra) ?? {};
+    const unknown =
+      typeof more === "object" && !Array.isArray(more) ? Object.entries(more).filter(([k]) => !EXTRA_FIELDS.has(k)) : [];
+    return {
+      ...rest,
+      ...messageRefs(more),
+      ...eventState(more, rest.timestamp),
+      ...(unknown.length > 0 ? { extra_kept: JSON.stringify(Object.fromEntries(unknown)) } : {}),
+    };
+  } catch {
+    return rest;
+  }
 }
 
 /** Whether two messages are the same one, seen twice. */
@@ -293,6 +497,21 @@ export function isLegacyDmKey(key: string): boolean {
   return /^\d+-\d+$/.test(key);
 }
 
+/** A conversation as its chat key names it, across servers. */
+export interface ChatPlace {
+  kind: "channel" | "dm";
+  key: string;
+  /** `host:port`, as chat keys carry it. */
+  server: string;
+  name: string;
+}
+
+/** `host:port/name`; a channel name may hold a slash of its own. */
+export function splitChatKey(key: string): { server: string; name: string } | null {
+  const m = /^([^/]+:\d+)\/(.*)$/s.exec(key);
+  return m ? { server: m[1], name: m[2] } : null;
+}
+
 const byTimestamp = (a: ChatMessage, b: ChatMessage) => a.timestamp - b.timestamp;
 
 export interface MergeResult {
@@ -334,7 +553,15 @@ export function mergeHistory(
       // where all we had was a member's copy of a message and the message
       // itself turns up, we keep the one we witnessed.
       if (kept[seen].kind === "shared" && m.kind !== "shared") {
-        kept[seen] = { ...m, expires_at: soonerExpiry(kept[seen].expires_at, m.expires_at) };
+        // What this reader saw done to it stays: reactions and a pin are
+        // their own record, and the row on screen is the same row
+        const { reactions, pin } = kept[seen];
+        kept[seen] = succeed(kept[seen], {
+          ...m,
+          expires_at: soonerExpiry(kept[seen].expires_at, m.expires_at),
+          ...(reactions ? { reactions } : {}),
+          ...(pin ? { pin } : {}),
+        });
         replaced++;
       } else {
         // A copy of a message we already hold may bring its deletion forward
@@ -375,4 +602,280 @@ export function mergeHistory(
     messages.splice(0, messages.length - MAX_MESSAGES);
   }
   return { messages, added: fresh.length };
+}
+
+// ── Edit, delete, reactions, pins (1.3) ─────────────────────────────────────
+//
+// Each is an event that names an earlier message of the same conversation by
+// its id (envelope.rs `ChatEvent`), and each reader applies it to their own
+// copy. Nothing on the wire says who may do what, so the reader checks it
+// against who sent the event, as the relay named them:
+//
+//   - An edit or a delete only from the message's own writer: the same
+//     account where both have one, else the same user id and name
+//     (`authorKey`), on a message this connection received (`current`). So a
+//     guest can change what they wrote only while still connected under that
+//     id; after a reconnect, theirs or ours, their messages stay as sent, and
+//     a newcomer who is given the old id and types the old name changes none.
+//   - A delete also takes a copy a member handed over (`shared`) that names
+//     the writer and claims a time before the delete: removing what only
+//     claims to be someone's, at their own request, is always safe. An edit
+//     does not: a hearsay copy keeps what was handed on.
+//   - An edit sets `edited_at` and never touches `expires_at`: a message's
+//     moment of deletion is stamped once, on arrival, and nothing extends it.
+//   - A delete leaves a tombstone (kind "deleted"): never drawn, never handed
+//     on, and found by `mergeHistory` when a copy of the message is offered
+//     again, so a hand-off or the stored log cannot bring it back.
+//   - Reactions: per person and emoji, the latest event wins; at most
+//     `MAX_REACTION_EMOJI` different emoji on one message.
+//   - A pin only from one of the channel's managers by the roster's roles,
+//     which the caller asks (`canManageAs`, channel-post-rules.ts).
+
+/** Different emoji on one message, at most. */
+export const MAX_REACTION_EMOJI = 20;
+/** Emoji a message keeps a record of, shown or taken off again. */
+const MAX_REACTION_ENTRIES = 2 * MAX_REACTION_EMOJI;
+/** People one emoji keeps a record of. */
+export const MAX_REACTORS = 50;
+/** envelope.rs `MAX_EMOJI_BYTES`. */
+const MAX_EMOJI_BYTES = 32;
+/** Nothing a reader would see, so two chips that look the same: controls,
+ *  spaces, direction marks, U+200C and the text-style selector U+FE0E. The
+ *  joiner (U+200D), U+FE0F and the tag characters stay: emoji sequences and
+ *  flags are made of them. */
+const INVISIBLE = /[\p{Cc}\p{White_Space}‎‏؜‪-‮⁦-⁩﻿\u200c\ufe0e]/u;
+/** What makes a grapheme an emoji: a pictograph, a flag's letters, a keycap. */
+const EMOJI = /[\p{Extended_Pictographic}\p{Regional_Indicator}⃣]/u;
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+/** One emoji: a single grapheme, at most `MAX_EMOJI_BYTES`, nothing invisible. */
+export function isOneEmoji(v: unknown): v is string {
+  if (typeof v !== "string" || v === "" || INVISIBLE.test(v) || !EMOJI.test(v)) return false;
+  if (new TextEncoder().encode(v).length > MAX_EMOJI_BYTES) return false;
+  const it = graphemes.segment(v)[Symbol.iterator]();
+  return !it.next().done && it.next().done === true;
+}
+
+/** An event as it may be acted on (envelope.rs `ChatEvent::checked`, plus the
+ *  one-grapheme rule for an emoji), else nothing. */
+export function chatEvent(v: unknown): ChatEvent | undefined {
+  const e = v as Record<string, unknown> | null;
+  const target = keptId(e?.target);
+  if (!e || !target) return undefined;
+  switch (e.kind) {
+    case "edit":
+    case "delete":
+      return { kind: e.kind, target };
+    case "react":
+      return typeof e.on === "boolean" && isOneEmoji(e.emoji) ? { kind: "react", target, emoji: e.emoji, on: e.on } : undefined;
+    case "pin":
+      return typeof e.on === "boolean" ? { kind: "pin", target, on: e.on } : undefined;
+  }
+  return undefined;
+}
+
+/** Who did something, as the receive point names them. */
+export type Actor = Pick<ChatMessage, "user_id" | "username" | "account">;
+
+/** An event as it arrived: what, by whom, when, and an edit's new text. */
+export interface EventIn {
+  event: ChatEvent;
+  by: Actor;
+  at: number;
+  content: string;
+}
+
+// A message an event changed is a new object in place of the old one, and the
+// screen keys its rows by object: without this, a reaction would tear down
+// its row, a loaded picture and the keyboard's place with it. The new object
+// carries the first one's key.
+const lineage = new WeakMap<ChatMessage, ChatMessage>();
+
+function succeed(prev: ChatMessage, next: ChatMessage): ChatMessage {
+  lineage.set(next, lineage.get(prev) ?? prev);
+  return next;
+}
+
+/** A message's row on screen: the same for every version an event made of it. */
+export function rowKey(m: ChatMessage): ChatMessage {
+  return lineage.get(m) ?? m;
+}
+
+/** Whether `a` and `b` are versions of one message (`rowKey`). */
+export function sameRow(a: ChatMessage, b: ChatMessage): boolean {
+  return rowKey(a) === rowKey(b);
+}
+
+/** A message that is there to be drawn, answered or acted on. */
+function isLive(m: ChatMessage): boolean {
+  return !!m.id && m.kind !== "history-marker" && m.kind !== "notice" && m.kind !== "deleted" && m.kind !== "undecryptable";
+}
+
+/**
+ * `list` with `ev` applied, or `list` itself when it changes nothing: a
+ * target not here, a sender who may not, an event older than what it would
+ * replace. `mayPin`: the sender is one of the channel's managers.
+ */
+export function applyEvent(
+  list: ChatMessage[],
+  ev: EventIn,
+  opts: {
+    mayPin: boolean;
+    /** Whether this connection received `m` (a guest's edit or delete takes
+     *  only those); every message, where omitted. */
+    current?: (m: ChatMessage) => boolean;
+  },
+): ChatMessage[] {
+  const { event, by, at } = ev;
+  const current = opts.current ?? (() => true);
+  if (!Number.isFinite(at)) return list;
+  const replace = (pick: (m: ChatMessage) => boolean, change: (m: ChatMessage) => ChatMessage | null) => {
+    let changed = false;
+    const next = list.map((m) => {
+      if (!pick(m)) return m;
+      const made = change(m);
+      if (!made) return m;
+      changed = true;
+      return succeed(m, made);
+    });
+    return changed ? next : list;
+  };
+  if (event.kind === "edit" || event.kind === "delete") {
+    // Only its writer: every copy of the target they wrote, none of anyone
+    // else's; a guest's only from this connection
+    const writer = authorKey(by);
+    const theirs = (m: ChatMessage) =>
+      m.id === event.target && isLive(m) && m.kind !== "shared" && authorKey(m) === writer && (!!by.account || current(m));
+    if (event.kind === "delete") {
+      // And the hand-off copies that name them, as older than the delete (D-13)
+      const named = (m: ChatMessage) =>
+        m.id === event.target && m.kind === "shared" && m.username === by.username && m.timestamp <= at;
+      return replace((m) => theirs(m) || named(m), (m) => ({
+        user_id: m.user_id,
+        username: m.username,
+        content: "",
+        timestamp: m.timestamp,
+        id: m.id,
+        kind: "deleted",
+        ...(m.account ? { account: m.account } : {}),
+        ...(m.expires_at !== undefined ? { expires_at: m.expires_at } : {}),
+      }));
+    }
+    return replace(theirs, (m) =>
+      m.edited_at !== undefined && at < m.edited_at ? null : { ...m, content: ev.content, edited_at: at },
+    );
+  }
+  // A reaction or a pin goes on the message the id names, as a quote finds it
+  const target = findTarget(list.filter(isLive), event.target, at);
+  if (!target) return list;
+  const on = (m: ChatMessage) => m === target;
+  if (event.kind === "pin") {
+    if (!opts.mayPin) return list;
+    return replace(on, (m) =>
+      m.pin && at < m.pin.at ? null : { ...m, pin: { on: event.on, at, by: by.username.slice(0, 64) } },
+    );
+  }
+  const reactions = react(target.reactions ?? [], event.emoji, event.on, authorKey(by), by.username, at);
+  return reactions ? replace(on, (m) => ({ ...m, reactions })) : list;
+}
+
+/** `reactions` with one person's event for one emoji, or null for no change. */
+function react(reactions: Reaction[], emoji: string, on: boolean, key: string, name: string, at: number): Reaction[] | null {
+  const shown = (r: Reaction) => r.by.some((b) => b.on);
+  const entry = reactions.find((r) => r.emoji === emoji);
+  const mine = entry?.by.find((b) => b.key === key);
+  if (mine && at < mine.at) return null;
+  if (!mine && !on) return null;
+  // One more emoji shown: within the limit, and the record within its own
+  if (on && !(entry && shown(entry)) && reactions.filter(shown).length >= MAX_REACTION_EMOJI) return null;
+  let list = reactions;
+  if (!entry && list.length >= MAX_REACTION_ENTRIES) {
+    list = list.filter(shown);
+    if (list.length >= MAX_REACTION_ENTRIES) return null;
+  }
+  // One more person: within the limit, after letting go of those who took
+  // theirs off (one guest reconnecting under new keys would fill it for good)
+  let others = entry?.by ?? [];
+  if (!mine && others.length >= MAX_REACTORS) {
+    others = others.filter((b) => b.on);
+    if (others.length >= MAX_REACTORS) return null;
+  }
+  const me: Reactor = { key, name: name.slice(0, 64), on, at };
+  const by = mine ? others.map((b) => (b === mine ? me : b)) : [...others, me];
+  const next: Reaction = { emoji, by };
+  return entry ? list.map((r) => (r === entry ? next : r)) : [...list, next];
+}
+
+/** One chip under a message: an emoji, how many, whether one is ours, and who. */
+export interface ReactionChip {
+  emoji: string;
+  count: number;
+  mine: boolean;
+  names: string[];
+}
+
+/** The chips under `m`, in the order the emoji first came; `mine` tells our
+ *  own `authorKey`. */
+export function reactionChips(m: ChatMessage, mine: (key: string) => boolean): ReactionChip[] {
+  const out: ReactionChip[] = [];
+  for (const r of m.reactions ?? []) {
+    const by = r.by.filter((b) => b.on);
+    if (by.length > 0) out.push({ emoji: r.emoji, count: by.length, mine: by.some((b) => mine(b.key)), names: by.map((b) => b.name) });
+  }
+  return out;
+}
+
+/** A conversation's pinned messages, the latest pin first. */
+export function pinnedOf(list: readonly ChatMessage[]): ChatMessage[] {
+  return list.filter((m) => m.pin?.on && isLive(m)).sort((a, b) => b.pin!.at - a.pin!.at);
+}
+
+/**
+ * A message as a history hand-off offers it: without what events did to it
+ * here (reactions, a pin), which is this reader's own record and would only
+ * cost the hand-off's budget; the receiver drops them anyway (`sanitizeHistory`).
+ * Never with what a later version kept in its archive entry (`extra_kept`).
+ * Its text cut to what a receiver takes, before the budget is measured, so one
+ * long message cannot push the others out (R2-07).
+ */
+export function forHandOff(m: ChatMessage): ChatMessage {
+  const long = m.content.length > HISTORY_MAX_CONTENT;
+  if (!m.reactions && !m.pin && m.extra_kept === undefined && !long) return m;
+  const { reactions: _r, pin: _p, extra_kept: _k, ...rest } = m;
+  return long ? { ...rest, content: rest.content.slice(0, HISTORY_MAX_CONTENT) } : rest;
+}
+
+/** `edited_at` as it may be kept: a plausible moment, not before the message. */
+function editedAt(v: unknown, timestamp: number, now = Date.now()): Pick<ChatMessage, "edited_at"> {
+  return typeof v === "number" && Number.isFinite(v) && v >= timestamp && plausibleTimestamp(v, now) ? { edited_at: v } : {};
+}
+
+/**
+ * What events did to a message, as the archive's `extra` holds it, each part
+ * checked as if it had just arrived: the edit's moment, the reactions within
+ * their limits, the pin. A part that does not check is dropped, never the
+ * message.
+ */
+function eventState(more: Record<string, unknown>, timestamp: number): Pick<ChatMessage, "edited_at" | "reactions" | "pin"> {
+  const out: Pick<ChatMessage, "edited_at" | "reactions" | "pin"> = { ...editedAt(more.edited_at, timestamp) };
+  const moment = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v > 0;
+  if (Array.isArray(more.reactions)) {
+    const reactions: Reaction[] = [];
+    for (const r of more.reactions.slice(0, MAX_REACTION_ENTRIES)) {
+      if (!isOneEmoji(r?.emoji) || !Array.isArray(r.by) || reactions.some((x) => x.emoji === r.emoji)) continue;
+      const by: Reactor[] = [];
+      for (const b of r.by.slice(0, MAX_REACTORS)) {
+        if (typeof b?.key !== "string" || b.key.length > 200 || typeof b.name !== "string" || typeof b.on !== "boolean" || !moment(b.at)) continue;
+        if (by.some((x) => x.key === b.key)) continue;
+        by.push({ key: b.key, name: b.name.slice(0, 64), on: b.on, at: b.at });
+      }
+      if (by.length > 0) reactions.push({ emoji: r.emoji, by });
+    }
+    if (reactions.length > 0) out.reactions = reactions;
+  }
+  const p = more.pin as Record<string, unknown> | undefined;
+  if (p && typeof p.on === "boolean" && moment(p.at) && typeof p.by === "string") {
+    out.pin = { on: p.on, at: p.at as number, by: p.by.slice(0, 64) };
+  }
+  return out;
 }

@@ -16,7 +16,7 @@
   // channel: "Online". In its own box rather than as one more group in
   // `.users`, which test-ui.mjs counts as the channel's members.
 
-  import { avatarColor } from "../../avatar.js";
+  import { avatarStyle } from "../../avatar.js";
   import { shortName } from "../../username.js";
   import { userId } from "../../stores/connection.js";
   import { viewingVoice } from "../../stores/channels.js";
@@ -109,7 +109,7 @@
       : undefined}
     use:memberMenu={{ user, idle: !inChannel, self: user.user_id === $userId }}
   >
-    <span class="avatar" style="background: {avatarColor(user.username)}"
+    <span class="avatar" style={avatarStyle(user.username)}
       >{user.username.charAt(0).toUpperCase()}</span
     >
     <span class="name" title={user.username}>
@@ -167,7 +167,7 @@
 
   .hidden-note {
     padding: 12px 16px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     line-height: 1.4;
     color: var(--text-secondary);
   }
@@ -189,7 +189,7 @@
 
   .group-label {
     padding: 14px 8px 4px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.02em;
@@ -209,7 +209,12 @@
   }
 
   .user.culled {
-    opacity: 0.45;
+    color: var(--text-muted);
+  }
+
+  /* The picture fades; the name stays readable */
+  .user.culled .avatar {
+    opacity: 0.5;
   }
 
   .avatar {
@@ -219,11 +224,10 @@
     width: 32px;
     height: 32px;
     border-radius: 50%;
-    color: #fff;
-    font-size: 13px;
+    font-size: var(--fs-body);
     font-weight: 600;
     flex-shrink: 0;
-    transition: box-shadow 0.1s;
+    transition: box-shadow var(--dur-fast);
   }
 
   .user.speaking .avatar {
@@ -232,7 +236,7 @@
 
   .name {
     flex: 1;
-    font-size: 14px;
+    font-size: var(--fs-md);
     color: var(--text-secondary);
     overflow: hidden;
     text-overflow: ellipsis;
@@ -265,7 +269,7 @@
 
   .you {
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--fs-micro);
   }
 
   .status-icon {
@@ -311,8 +315,9 @@
     width: 24px;
     height: 24px;
     padding: 0;
-    background: var(--danger);
-    color: #fff;
+    /* Live: mint, like every other way into a share */
+    background: var(--accent);
+    color: var(--on-accent);
     border-radius: 4px;
     flex-shrink: 0;
   }
@@ -323,10 +328,34 @@
 
   .preview-hint {
     padding: 8px 16px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     color: var(--text-secondary);
     text-align: center;
     border-top: 1px solid var(--border);
     font-style: italic;
+  }
+
+  /* No hover on a touch screen, and keyboard focus is not hover either: the
+     ⋮ is there whenever the row could be acted on (as in ChannelSidebar) */
+  .user:focus-within .more-btn {
+    display: flex;
+  }
+
+  @media (hover: none) {
+    .more-btn {
+      display: flex;
+    }
+  }
+
+  /* Touch: 44px rows and 44px buttons in them (--hit) */
+  @media (pointer: coarse) {
+    .user {
+      min-height: var(--hit);
+    }
+    .more-btn,
+    .watch-btn {
+      width: var(--hit);
+      height: var(--hit);
+    }
   }
 </style>

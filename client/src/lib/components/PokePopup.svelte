@@ -9,23 +9,22 @@
   }
 </script>
 
-{#if $pendingPokes.length > 0}
-  <div class="poke-container">
-    {#each $pendingPokes as poke (poke.id)}
-      <div class="poke">
-        <div class="poke-content">
-          <span class="poke-text">
-            <strong title={poke.from_username}>{shortName(poke.from_username)}</strong> poked you{#if poke.server !== $serverAddress}&nbsp;on {$serverEntries.find((e) => e.id === poke.server)?.name ?? poke.server}{/if}
-          </span>
-          {#if poke.message}
-            <span class="poke-message">"{poke.message}"</span>
-          {/if}
-        </div>
-        <button class="dismiss-btn" onclick={() => dismiss(poke.id)}>OK</button>
+<!-- Always there, like the toasts, so a poke is read out when it arrives -->
+<div class="poke-container" aria-live="polite">
+  {#each $pendingPokes as poke (poke.id)}
+    <div class="poke" role="status">
+      <div class="poke-content">
+        <span class="poke-text">
+          <strong title={poke.from_username}>{shortName(poke.from_username)}</strong> poked you{#if poke.server !== $serverAddress}&nbsp;on {$serverEntries.find((e) => e.id === poke.server)?.name ?? poke.server}{/if}
+        </span>
+        {#if poke.message}
+          <span class="poke-message">"{poke.message}"</span>
+        {/if}
       </div>
-    {/each}
-  </div>
-{/if}
+      <button class="dismiss-btn btn btn-primary" onclick={() => dismiss(poke.id)}>OK</button>
+    </div>
+  {/each}
+</div>
 
 <style>
   .poke-container {
@@ -36,7 +35,7 @@
     display: flex;
     flex-direction: column;
     gap: 8px;
-    z-index: 200;
+    z-index: var(--z-modal);
   }
 
   .poke {
@@ -48,8 +47,8 @@
     background: var(--bg-secondary);
     border: 1px solid var(--accent);
     color: var(--text-primary);
-    font-size: 13px;
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.4);
+    font-size: var(--fs-body);
+    box-shadow: var(--shadow-menu);
     animation: poke-in 0.25s ease-out;
     min-width: 250px;
     max-width: 400px;
@@ -74,27 +73,18 @@
   }
 
   .poke-text {
-    font-size: 13px;
+    font-size: var(--fs-body);
   }
 
   .poke-message {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     font-style: italic;
   }
 
   .dismiss-btn {
-    background: var(--accent);
-    color: white;
-    border: none;
     padding: 4px 12px;
-    font-size: 12px;
-    border-radius: 4px;
-    cursor: pointer;
+    font-size: var(--fs-sm);
     flex-shrink: 0;
-  }
-
-  .dismiss-btn:hover {
-    opacity: 0.9;
   }
 </style>

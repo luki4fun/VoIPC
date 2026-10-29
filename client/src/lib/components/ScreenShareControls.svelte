@@ -115,10 +115,18 @@
         <Icon name="switch-source" size={16} />
       </button>
     {/if}
+    <!-- Its state in words as well as in colour: off, sending, or on with
+         nothing to send (a silent source) -->
     <button
       class="audio-toggle {audioStatus}"
       onclick={toggleAudio}
       title={$screenAudioEnabled ? "Disable screen audio" : "Enable screen audio"}
+      aria-pressed={$screenAudioEnabled}
+      aria-label={!$screenAudioEnabled
+        ? "Screen audio: off"
+        : audioStatus === "sending"
+          ? "Screen audio: on, sending"
+          : "Screen audio: on, nothing to send"}
     >
       <Icon name="music-note" size={14} />
       {#if audioStatus === "sending"}
@@ -128,7 +136,7 @@
       {/if}
     </button>
     {#if $senderFps > 0}
-      <span class="stats-pill">
+      <span class="stats-pill num">
         <span class="stat">{resLabel}</span>
         <span class="stat-sep"></span>
         <span class="stat">{$senderFps} fps</span>
@@ -155,7 +163,7 @@
     background: var(--bg-tertiary);
     color: var(--text-secondary);
     padding: 6px 12px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     display: flex;
     align-items: center;
     gap: 6px;
@@ -170,7 +178,7 @@
 
   .share-btn.active {
     background: var(--danger);
-    color: white;
+    color: var(--on-danger);
   }
 
   .share-btn.active:hover {
@@ -178,7 +186,7 @@
   }
 
   .btn-label {
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
 
   .icon-btn-sm {
@@ -193,7 +201,7 @@
     color: var(--text-secondary);
     border: none;
     cursor: pointer;
-    transition: background-color 0.15s, color 0.15s;
+    transition: background-color var(--dur-fast), color var(--dur-fast);
     flex-shrink: 0;
   }
 
@@ -208,7 +216,7 @@
 
   .viewer-badge {
     background: rgba(255, 255, 255, 0.25);
-    font-size: 10px;
+    font-size: var(--fs-micro);
     padding: 1px 5px;
     border-radius: 8px;
     font-weight: 600;
@@ -226,7 +234,7 @@
     color: var(--text-secondary);
     border: none;
     cursor: pointer;
-    transition: background-color 0.15s, color 0.15s;
+    transition: background-color var(--dur-fast), color var(--dur-fast);
     flex-shrink: 0;
     gap: 0;
     position: relative;
@@ -259,12 +267,12 @@
   }
 
   .status-dot.active {
-    background: #43b581;
+    background: var(--success);
     animation: pulse 1s infinite;
   }
 
   .status-dot.idle {
-    background: #faa61a;
+    background: var(--warning);
   }
 
   @keyframes pulse {
@@ -277,7 +285,7 @@
     align-items: center;
     gap: 6px;
     padding: 4px 10px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     color: var(--text-secondary);
     background: var(--bg-tertiary);
     border-radius: 10px;

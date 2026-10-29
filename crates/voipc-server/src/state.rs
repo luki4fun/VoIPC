@@ -568,6 +568,11 @@ pub struct ServerState {
     /// Here rather than on the channel, so leaving and coming back does not
     /// reset the clock; an account's goes across its connections.
     pub post_marks: DashMap<(ChannelId, Poster, PostStamp), Instant>,
+    /// `tcp_fallback`: whether `GET /voipc` is served (`tunnel::serve`).
+    pub tcp_fallback: bool,
+    /// The encrypted file cache; `None` with `[files] enabled = false`, and
+    /// until main.rs has opened its directory (`files::FileStore::open`).
+    pub files: Option<Arc<crate::files::FileStore>>,
 }
 
 /// Which of a member's posts slow mode counts: the live message, or its copy
@@ -736,6 +741,8 @@ impl ServerState {
             accounts: None,
             account_sessions: DashMap::new(),
             post_marks: DashMap::new(),
+            tcp_fallback: config.tcp_fallback,
+            files: None,
         }
     }
 
@@ -991,6 +998,16 @@ impl ServerState {
     ) -> anyhow::Result<Vec<SessionId>> {
         let mut channels = self.channels.write().await;
 
+        // Read under the lock, which is the only place `channel_id` changes.
+        // A session that has gone is refused: its cleanup has run, or runs
+        // next, against the channel it names, so a join now would leave an id
+        // behind that nothing removes (S-002).
+        let previous = self
+            .sessions
+            .get(&session_id)
+            .map(|s| s.channel_id)
+            .ok_or_else(|| anyhow::anyhow!("session {} has gone", session_id))?;
+
         let channel = channels
             .get_mut(&channel_id)
             .ok_or_else(|| anyhow::anyhow!("channel {} does not exist", channel_id))?;
@@ -1027,6 +1044,17 @@ impl ServerState {
         // Update the session's channel_id
         if let Some(mut session) = self.sessions.get_mut(&session_id) {
             session.channel_id = channel_id;
+        }
+        // A voice room is one at a time. The caller leaves the old one first
+        // (and tells its members); this is for a move that landed in between,
+        // a kick's to General, which would otherwise leave them in both.
+        if previous != channel_id {
+            if let Some(old) = channels.get_mut(&previous).filter(|c| !c.info.text) {
+                if old.members.remove(&user_id) {
+                    old.info.user_count = old.members.len() as u32;
+                    old.pseudonyms.remove(&user_id);
+                }
+            }
         }
         // Whatever they asked to hear belonged to the channel they were in.
         // Carrying it over would cull the new one by a list that means nothing
@@ -1145,12 +1173,10 @@ impl ServerState {
         user_id: UserId,
         session_id: SessionId,
     ) -> Option<(ChannelId, Vec<SessionId>, usize)> {
-        let channel_id = {
-            let session = self.sessions.get(&session_id)?;
-            session.channel_id
-        };
-
         let mut channels = self.channels.write().await;
+        // Under the lock: a kick moves the session to General under it, and a
+        // `channel_id` read before would leave the wrong room (S-002).
+        let channel_id = self.sessions.get(&session_id)?.channel_id;
         let channel = channels.get_mut(&channel_id)?;
 
         // If the user isn't actually in this channel's member set, nothing to leave
@@ -1624,7 +1650,8 @@ impl ServerState {
     }
 
     /// Remove a user from a channel (creator or admin kicks them).
-    /// Returns the kicked user's session_id and the channel's remaining member count.
+    /// Returns the kicked user's session_id, the channel's remaining member
+    /// count, and whether they were moved to General (a voice room's kick).
     pub async fn kick_user(
         &self,
         channel_id: ChannelId,
@@ -1632,7 +1659,7 @@ impl ServerState {
         target_id: UserId,
         requester_moderates: bool,
         target_spared: bool,
-    ) -> anyhow::Result<(SessionId, usize)> {
+    ) -> anyhow::Result<(SessionId, usize, bool)> {
         if channel_id == 0 {
             anyhow::bail!("cannot kick users from the General channel");
         }
@@ -1667,7 +1694,29 @@ impl ServerState {
             .ok_or_else(|| anyhow::anyhow!("user session not found"))?;
 
         let remaining = channel.members.len();
-        Ok((target_session_id, remaining))
+        // Into General under the same lock, and only while the session still
+        // names this room. Done later by the handler, the target's own join
+        // could land in between and leave them in two voice rooms (S-002).
+        // Out of a text channel they lose the subscription and nothing else.
+        let moved = !channel.info.text
+            && self
+                .sessions
+                .get_mut(&target_session_id)
+                .is_some_and(|mut s| {
+                    let here = s.channel_id == channel_id;
+                    if here {
+                        s.channel_id = 0;
+                    }
+                    here
+                });
+        if moved {
+            if let Some(general) = channels.get_mut(&0) {
+                general.members.insert(target_id);
+                general.info.user_count = general.members.len() as u32;
+            }
+            self.routing.clear_session(target_session_id);
+        }
+        Ok((target_session_id, remaining, moved))
     }
 
     /// Store a delete timer handle for a channel (replaces any existing one).
@@ -3836,12 +3885,95 @@ mod tests {
             .join_channel(uid2, sid2, ch.channel_id, None)
             .await
             .unwrap();
-        let (kicked_sid, remaining) = state
+        let (kicked_sid, remaining, moved) = state
             .kick_user(ch.channel_id, uid, uid2, false, false)
             .await
             .unwrap();
         assert_eq!(kicked_sid, sid2);
         assert_eq!(remaining, 1);
+        assert!(moved);
+    }
+
+    /// The voice rooms (not text subscriptions) whose member set holds `uid`.
+    async fn voice_rooms_of(state: &ServerState, uid: UserId) -> Vec<ChannelId> {
+        let channels = state.channels.read().await;
+        let mut rooms: Vec<ChannelId> = channels
+            .values()
+            .filter(|c| !c.info.text && c.members.contains(&uid))
+            .map(|c| c.info.channel_id)
+            .collect();
+        rooms.sort();
+        rooms
+    }
+
+    // S-002: a kick racing the target's own join. The join's leave read the
+    // room before the kick took the lock, so it found nothing to leave; the
+    // target must still end in exactly one voice room, the one it asked for.
+    #[tokio::test]
+    async fn a_kick_racing_the_targets_own_join_leaves_one_voice_room() {
+        let state = make_state();
+        let (alice, alice_sid) = add_user(&state, "alice");
+        let (bob, bob_sid) = add_user(&state, "bob");
+        let x = state
+            .create_channel("X".into(), None, ProximityMode::Off, false, false, alice)
+            .await
+            .unwrap();
+        let y = state
+            .create_channel("Y".into(), None, ProximityMode::Off, false, false, alice)
+            .await
+            .unwrap();
+        for (uid, sid) in [(alice, alice_sid), (bob, bob_sid)] {
+            state
+                .join_channel(uid, sid, x.channel_id, None)
+                .await
+                .unwrap();
+        }
+
+        let (_, _, moved) = state
+            .kick_user(x.channel_id, alice, bob, false, false)
+            .await
+            .unwrap();
+        assert!(moved);
+        // Moved under the kick's own lock, not by a later step of the handler
+        assert_eq!(voice_rooms_of(&state, bob).await, vec![0]);
+        assert_eq!(state.sessions.get(&bob_sid).unwrap().channel_id, 0);
+
+        // Bob's join, whose leave ran against X and found nothing
+        state
+            .join_channel(bob, bob_sid, y.channel_id, None)
+            .await
+            .unwrap();
+        assert_eq!(voice_rooms_of(&state, bob).await, vec![y.channel_id]);
+        assert_eq!(
+            state.sessions.get(&bob_sid).unwrap().channel_id,
+            y.channel_id
+        );
+
+        // And the other way round: once bob has left X, a kick from X is
+        // refused and moves nobody
+        let err = state
+            .kick_user(x.channel_id, alice, bob, false, false)
+            .await;
+        assert!(err.is_err());
+        assert_eq!(voice_rooms_of(&state, bob).await, vec![y.channel_id]);
+    }
+
+    // S-002: a join that lands after the session's cleanup would leave an id
+    // that nothing ever removes.
+    #[tokio::test]
+    async fn a_join_after_the_session_has_gone_is_refused() {
+        let state = make_state();
+        let (alice, alice_sid) = add_user(&state, "alice");
+        let x = state
+            .create_channel("X".into(), None, ProximityMode::Off, false, false, alice)
+            .await
+            .unwrap();
+        state.remove_session(alice_sid).await.unwrap();
+        assert!(state
+            .join_channel(alice, alice_sid, x.channel_id, None)
+            .await
+            .is_err());
+        assert!(voice_rooms_of(&state, alice).await.is_empty());
     }
 
     #[tokio::test]

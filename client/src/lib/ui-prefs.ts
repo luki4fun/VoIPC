@@ -11,7 +11,7 @@
 
 import { DEFAULT_PALETTE_ID, migratePaletteId, TOKENS, type TokenName } from "./theme.ts";
 
-export type LayoutId = "classic" | "modern";
+export type LayoutId = "classic" | "modern" | "stage";
 export type Density = "cosy" | "compact";
 
 /**
@@ -20,8 +20,9 @@ export type Density = "cosy" | "compact";
  * A version rather than a bool, for the same reason `audio_setup_version` is
  * one: a later release that adds a third layout can ask again, and it cannot be
  * derived from `layout`, which reads "modern" whether or not anybody chose it.
+ * 2: Stage arrived (2026-10-26), so everybody is offered the choice once more.
  */
-export const LAYOUT_PICKER_VERSION = 1;
+export const LAYOUT_PICKER_VERSION = 2;
 
 export interface PanelPrefs {
   /** Channel sidebar width in px. */
@@ -50,6 +51,15 @@ export interface UiPrefs {
   /** Which layout question this user has answered; 0 means never. */
   layout_asked_version: number;
   palette: string;
+  /**
+   * Whether somebody picked `palette` in Settings, rather than the app picking
+   * it for a new install. Recorded since 2026-10-26, when the default palette
+   * changed: a file written before then carries no flag and reads as chosen,
+   * because nobody can tell its stored palette from a default any more. What
+   * the flag buys is the next change of default — it can move the people who
+   * never chose, and only them.
+   */
+  palette_chosen: boolean;
   palette_overrides: Partial<Record<TokenName, string>>;
   density: Density;
   /** Chat message font size in px. */
@@ -62,6 +72,11 @@ export interface UiPrefs {
   stream_chat: Record<LayoutId, StreamChatPrefs>;
   /** The floating preview of your own share. Off once you hide it. */
   share_preview: boolean;
+  /**
+   * Busy answers to one message gather into a thread of their own
+   * (thread-rules.ts `threadView`). Answers sent into a thread go there either way.
+   */
+  group_threads: boolean;
   /**
    * Text channels the user walked out of, per server (`"host:port"` → names).
    *
@@ -112,6 +127,10 @@ export function defaultPanels(layout: LayoutId): PanelPrefs {
   // and UserList before they became variables, so nothing moves for anyone who
   // never touches this. The modern sidebars are wider because their rows carry
   // nested members and avatars.
+  // Stage's second panel is the chat drawer rather than a member list: the
+  // people are the centre of that layout. Closed until asked for, wide enough
+  // to read in when it is.
+  if (layout === "stage") return { sidebar: 240, members: 360, sidebar_open: true, members_open: false };
   return layout === "modern"
     ? { sidebar: 240, members: 240, sidebar_open: true, members_open: true }
     : { sidebar: 220, members: 180, sidebar_open: true, members_open: true };
@@ -120,7 +139,7 @@ export function defaultPanels(layout: LayoutId): PanelPrefs {
 export function defaultStreamChat(layout: LayoutId): StreamChatPrefs {
   // Modern opens a share full-window and the chat is asked for with a toggle;
   // classic has shown it under the viewer, 280 px tall, since before either.
-  return layout === "modern"
+  return layout === "modern" || layout === "stage"
     ? { open: false, split: "side", width: 360, height: 280 }
     : { open: true, split: "below", width: 360, height: 280 };
 }
@@ -130,13 +149,23 @@ export function defaultUiPrefs(): UiPrefs {
     layout: "modern",
     layout_asked_version: 0,
     palette: DEFAULT_PALETTE_ID,
+    palette_chosen: false,
     palette_overrides: {},
     density: "cosy",
     chat_font_size: 13,
     zoom: 1,
-    panels: { classic: defaultPanels("classic"), modern: defaultPanels("modern") },
-    stream_chat: { classic: defaultStreamChat("classic"), modern: defaultStreamChat("modern") },
+    panels: {
+      classic: defaultPanels("classic"),
+      modern: defaultPanels("modern"),
+      stage: defaultPanels("stage"),
+    },
+    stream_chat: {
+      classic: defaultStreamChat("classic"),
+      modern: defaultStreamChat("modern"),
+      stage: defaultStreamChat("stage"),
+    },
     share_preview: true,
+    group_threads: true,
     left_text_channels: {},
     dm_timers: {},
     nsfw_ok: [],
@@ -211,6 +240,7 @@ function bool(value: unknown, fallback: boolean): boolean {
 function layoutId(raw: unknown, fallback: LayoutId): LayoutId {
   if (raw === "modern" || raw === "discord") return "modern";
   if (raw === "classic" || raw === "legacy") return "classic";
+  if (raw === "stage") return "stage";
   return fallback;
 }
 
@@ -284,6 +314,10 @@ export function sanitizeUiPrefs(raw: unknown): UiPrefs {
       typeof r.palette === "string" && r.palette !== ""
         ? migratePaletteId(r.palette)
         : d.palette,
+    // Absent means a file from before the flag existed: its palette stands as
+    // chosen (the 1.x rule, a stored choice is never overwritten)
+    palette_chosen:
+      typeof r.palette === "string" && r.palette !== "" ? r.palette_chosen !== false : false,
     palette_overrides: overrides,
     density: r.density === "compact" ? "compact" : "cosy",
     chat_font_size: clamp(r.chat_font_size, CHAT_FONT_MIN, CHAT_FONT_MAX, d.chat_font_size),
@@ -294,12 +328,15 @@ export function sanitizeUiPrefs(raw: unknown): UiPrefs {
     panels: {
       classic: panels(p.classic ?? p.legacy, "classic"),
       modern: panels(p.modern ?? p.discord, "modern"),
+      stage: panels(p.stage, "stage"),
     },
     stream_chat: {
       classic: streamChat(sc.classic, "classic"),
       modern: streamChat(sc.modern, "modern"),
+      stage: streamChat(sc.stage, "stage"),
     },
     share_preview: bool(r.share_preview, d.share_preview),
+    group_threads: bool(r.group_threads, d.group_threads),
     left_text_channels: leftTextChannels(r.left_text_channels),
     dm_timers: dmTimers(r.dm_timers),
     nsfw_ok: nsfwOk(r.nsfw_ok),

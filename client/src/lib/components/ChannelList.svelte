@@ -16,6 +16,7 @@
   import { visibleChannels } from "../stores/roster.js";
   import { isAdmin, serverAddress } from "../stores/connection.js";
   import { account } from "../stores/account.js";
+  import { showChatPane } from "../stores/platform.js";
   import {
     activeTextChannelId,
     channelUnread,
@@ -35,7 +36,7 @@
     selectChannel,
     showCreateForm,
   } from "../stores/channel-ui.js";
-  import { avatarColor } from "../avatar.js";
+  import { avatarStyle } from "../avatar.js";
   import { shortName } from "../username.js";
   import ChannelCreateForm from "./ChannelCreateForm.svelte";
   import Icon from "./Icons.svelte";
@@ -146,16 +147,20 @@
     <div class="dm-section">
       <div class="header dm-header">
         <span class="dm-header-icon"><Icon name="direct-message" size={14} /></span>
-        <span>Direct Messages</span>
+        <span>Direct messages</span>
       </div>
       <div class="dm-list">
         {#each $dmConversations as convo (convo.user_id)}
           <button
             class="dm-entry"
             class:active={$activeDmUserId === convo.user_id}
-            onclick={() => openDm($serverAddress, convo.user_id, convo.username)}
+            onclick={() => {
+              openDm($serverAddress, convo.user_id, convo.username);
+              // On a phone this list is a tab or a drawer over the chat
+              showChatPane();
+            }}
           >
-            <span class="dm-avatar" style="background: {avatarColor(convo.username)}">
+            <span class="dm-avatar" style={avatarStyle(convo.username)}>
               {convo.username.charAt(0).toUpperCase()}
             </span>
             <span class="dm-name" title={convo.username}>{shortName(convo.username)}</span>
@@ -189,7 +194,7 @@
     align-items: center;
     justify-content: space-between;
     padding: 12px 16px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     text-transform: uppercase;
     letter-spacing: 1px;
     color: var(--text-secondary);
@@ -218,6 +223,7 @@
   .channels {
     flex: 1;
     overflow-y: auto;
+    overflow-x: hidden;
     padding: 4px;
   }
 
@@ -230,7 +236,7 @@
     background: transparent;
     color: var(--text-secondary);
     text-align: left;
-    font-size: 14px;
+    font-size: var(--fs-md);
     border-radius: 4px;
     /* Joining is a double click. Without this the page is zoomable, so a
        double tap on a touchscreen is double-tap-to-zoom and the browser never
@@ -253,18 +259,18 @@
   .channel.previewing {
     background: var(--bg-hover);
     color: var(--text-primary);
-    border: 1px dashed var(--accent);
+    border: 1px dashed var(--text-muted);
   }
 
   /* A text channel you are not in: still listed, still readable once joined. */
   .channel.unjoined {
-    opacity: 0.6;
+    color: var(--text-muted);
   }
 
   /* One you walked out of, which the tag beside it says in words. Dimmer
      than merely unjoined, because the difference is a decision you made. */
   .channel.left {
-    opacity: 0.45;
+    color: var(--text-muted);
     font-style: italic;
   }
 
@@ -292,22 +298,21 @@
   }
 
   .channel-desc {
-    font-size: 11px;
-    color: var(--text-secondary);
-    opacity: 0.7;
+    font-size: var(--fs-micro);
+    color: var(--text-muted);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
   }
 
   .user-count {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
   }
 
   .proximity-tag,
   .channel :global(.proximity-tag) {
-    font-size: 9px;
+    font-size: var(--fs-micro);
     font-weight: 600;
     letter-spacing: 0.05em;
     padding: 1px 4px;
@@ -318,9 +323,9 @@
   }
 
   .channel-unread {
-    background: var(--accent);
-    color: white;
-    font-size: 10px;
+    background: var(--text-primary);
+    color: var(--bg-primary);
+    font-size: var(--fs-micro);
     padding: 1px 6px;
     border-radius: 10px;
     font-weight: 600;
@@ -398,7 +403,7 @@
   .dm-header-icon {
     display: flex;
     align-items: center;
-    color: var(--accent);
+    color: var(--text-secondary);
     opacity: 0.7;
   }
 
@@ -415,7 +420,7 @@
     background: transparent;
     color: var(--text-secondary);
     text-align: left;
-    font-size: 13px;
+    font-size: var(--fs-body);
     border-radius: 4px;
   }
 
@@ -436,9 +441,8 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 13px;
+    font-size: var(--fs-body);
     font-weight: 600;
-    color: white;
     flex-shrink: 0;
   }
 
@@ -451,9 +455,9 @@
   }
 
   .dm-unread {
-    background: var(--accent);
-    color: white;
-    font-size: 10px;
+    background: var(--text-primary);
+    color: var(--bg-primary);
+    font-size: var(--fs-micro);
     padding: 1px 6px;
     border-radius: 10px;
     font-weight: 600;

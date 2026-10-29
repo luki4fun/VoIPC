@@ -10,7 +10,7 @@
 //
 // Pure, so channel-post-rules.test.ts can load it under Node's own test runner.
 
-import type { ChannelInfo } from "./types.ts";
+import type { ChannelInfo, UserInfo } from "./types.ts";
 
 /** Who the client is on this server, as far as these rules care. */
 export interface Me {
@@ -30,6 +30,20 @@ export function canManage(
 ): boolean {
   if (channel.channel_id === 0) return false;
   return me.isAdmin || me.isModerator || (me.userId !== null && channel.created_by === me.userId);
+}
+
+/**
+ * `canManage` for someone else: whether `sender`, as the roster lists them now,
+ * is one of the channel's managers. What a pin is checked against — a pin is
+ * an event any member could send, and only counts from a manager. Someone not
+ * in the roster (null) manages nothing.
+ */
+export function canManageAs(
+  channel: Pick<ChannelInfo, "channel_id" | "created_by">,
+  sender: Pick<UserInfo, "user_id" | "is_admin" | "is_moderator"> | null | undefined,
+): boolean {
+  if (!sender) return false;
+  return canManage(channel, { userId: sender.user_id, isAdmin: sender.is_admin, isModerator: !!sender.is_moderator });
 }
 
 export type PostBlock = { kind: "announce" } | { kind: "slow"; remainingSecs: number };

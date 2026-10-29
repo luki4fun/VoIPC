@@ -4,6 +4,7 @@
 // video_decode_render_task). Sharing our own screen lives in share.ts, which
 // fills in the sender half of getStats().
 
+import { frameTooLarge } from "../../lib/share-rules";
 import { emit } from "./events";
 import { share } from "./share";
 import { wasm } from "./wasm";
@@ -291,6 +292,17 @@ export class VideoViewer implements VideoApi {
   private onDecoded(frame: VideoFrame): void {
     if (!this.watching) {
       frame.close();
+      return;
+    }
+    // Over the desktop viewer's cap: stop, as nothing VoIPC sends is this big.
+    // Not "screenshare-error", which also ends a share of our own.
+    if (frameTooLarge(frame)) {
+      console.warn(`share frame ${frame.codedWidth}x${frame.codedHeight} (shown ${frame.displayWidth}x${frame.displayHeight}) is over the decode cap`);
+      frame.close();
+      const c = this.ctx;
+      c?.stopWatching();
+      c?.emit("stopped-watching-screenshare", { reason: "its picture is larger than VoIPC shows" });
+      this.stopWatching();
       return;
     }
     this.decodeFailures = 0;

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { backdrop, dialog } from "../actions/dialog.js";
   import { onMount } from "svelte";
+  import Icon from "./Icons.svelte";
   import { invoke } from "@tauri-apps/api/core";
   import { addNotification } from "../stores/notifications.js";
   import { canShareDisplayAudio } from "../display-capture.js";
@@ -153,8 +154,8 @@
         ? "Opening picker..."
         : "Starting..."
       : $pickerSwitchMode
-        ? "Switch Source"
-        : "Start Sharing"
+        ? "Switch source"
+        : "Start sharing"
   );
 </script>
 
@@ -165,7 +166,7 @@
     use:dialog={{ onclose: starting ? undefined : close }}
   >
     <div class="picker-header">
-      <span>{$pickerSwitchMode ? "Switch Source" : "Share Screen"}</span>
+      <span>{$pickerSwitchMode ? "Switch source" : "Share screen"}</span>
       <button class="close-btn" onclick={close} disabled={starting} aria-label="Close">&times;</button>
     </div>
 
@@ -197,7 +198,7 @@
         <!-- Linux portal and the browser enumerate sources themselves -->
         <div class="portal-hint">
           {#if activeTab === "displays"}
-            <div class="portal-icon">&#9638;</div>
+            <div class="portal-icon" aria-hidden="true"><Icon name="monitor" size={32} /></div>
             <p>Display capture</p>
             <p class="portal-sub">
               {platform === "web"
@@ -205,7 +206,7 @@
                 : "Your system's display picker will appear after clicking Start."}
             </p>
           {:else}
-            <div class="portal-icon">&#9645;</div>
+            <div class="portal-icon" aria-hidden="true"><Icon name="split-side" size={32} /></div>
             <p>Window capture</p>
             <p class="portal-sub">
               {platform === "web"
@@ -233,7 +234,7 @@
               onclick={() => selectSource(display.id)}
               disabled={starting}
             >
-              <div class="source-icon">&#9638;</div>
+              <div class="source-icon" aria-hidden="true"><Icon name="monitor" size={20} /></div>
               <div class="source-info">
                 <span class="source-title">
                   {display.name}
@@ -257,7 +258,7 @@
               onclick={() => selectSource(win.id)}
               disabled={starting}
             >
-              <div class="source-icon">&#9645;</div>
+              <div class="source-icon" aria-hidden="true"><Icon name="split-side" size={20} /></div>
               <div class="source-info">
                 <span class="source-title">{win.title}</span>
                 {#if win.app_name}
@@ -293,7 +294,7 @@
     <div class="picker-footer">
       <button class="cancel-btn" onclick={close} disabled={starting}>Cancel</button>
       <button
-        class="start-btn"
+        class="start-btn btn btn-primary"
         onclick={startOrSwitch}
         disabled={starting}
       >{buttonLabel}</button>
@@ -305,21 +306,22 @@
   .overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.6);
+    background: var(--scrim);
     display: flex;
     align-items: center;
     justify-content: center;
-    z-index: 1000;
+    z-index: var(--z-picker);
   }
 
   .picker {
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: 8px;
-    width: 480px;
-    max-height: 600px;
+    width: min(480px, calc(100vw - 32px));
+    max-height: min(600px, calc(100dvh - 32px));
     display: flex;
     flex-direction: column;
+    overflow-y: auto;
   }
 
   .picker-header {
@@ -329,13 +331,13 @@
     padding: 12px 16px;
     border-bottom: 1px solid var(--border);
     font-weight: 600;
-    font-size: 14px;
+    font-size: var(--fs-md);
   }
 
   .close-btn {
     background: transparent;
     color: var(--text-secondary);
-    font-size: 18px;
+    font-size: var(--fs-xl);
     border: none;
     cursor: pointer;
     padding: 0 4px;
@@ -355,14 +357,14 @@
   .tab {
     flex: 1;
     padding: 10px 16px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     font-weight: 500;
     background: transparent;
     color: var(--text-secondary);
     border: none;
     border-bottom: 2px solid transparent;
     cursor: pointer;
-    transition: all 0.15s;
+    transition: background-color var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
   }
 
   .tab:hover {
@@ -371,8 +373,8 @@
   }
 
   .tab.active {
-    color: var(--accent);
-    border-bottom-color: var(--accent);
+    color: var(--text-primary);
+    border-bottom-color: var(--text-primary);
   }
 
   /* ── Source list ─────────────────────────────────── */
@@ -395,7 +397,7 @@
     height: 100%;
     min-height: 120px;
     color: var(--text-secondary);
-    font-size: 13px;
+    font-size: var(--fs-body);
   }
 
   .portal-hint {
@@ -419,7 +421,7 @@
   .portal-hint p {
     margin: 0;
     color: var(--text-primary);
-    font-size: 13px;
+    font-size: var(--fs-body);
     font-weight: 500;
   }
 
@@ -448,7 +450,7 @@
     border-radius: 6px;
     cursor: pointer;
     text-align: left;
-    transition: all 0.15s;
+    transition: background-color var(--dur-fast), border-color var(--dur-fast), color var(--dur-fast);
     width: 100%;
   }
 
@@ -458,12 +460,12 @@
   }
 
   .source-card.selected {
-    border-color: var(--accent);
-    background: color-mix(in srgb, var(--accent) 8%, var(--bg-primary));
+    border-color: var(--text-primary);
+    background: var(--bg-hover);
   }
 
   .source-icon {
-    font-size: 20px;
+    font-size: var(--fs-2xl);
     color: var(--text-secondary);
     flex-shrink: 0;
     width: 28px;
@@ -479,7 +481,7 @@
   }
 
   .source-title {
-    font-size: 13px;
+    font-size: var(--fs-body);
     color: var(--text-primary);
     display: flex;
     align-items: center;
@@ -490,16 +492,16 @@
   }
 
   .primary-badge {
-    font-size: 10px;
-    background: var(--accent);
-    color: white;
+    font-size: var(--fs-micro);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
     padding: 1px 5px;
     border-radius: 3px;
     flex-shrink: 0;
   }
 
   .source-detail {
-    font-size: 11px;
+    font-size: var(--fs-micro);
     color: var(--text-secondary);
   }
 
@@ -516,7 +518,7 @@
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     flex: 1;
   }
 
@@ -530,7 +532,7 @@
     border: 1px solid var(--border);
     border-radius: 4px;
     padding: 4px 28px 4px 8px;
-    font-size: 13px;
+    font-size: var(--fs-body);
     flex: 1;
   }
 
@@ -548,7 +550,7 @@
     background: var(--bg-tertiary);
     color: var(--text-secondary);
     padding: 6px 14px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
 
   .cancel-btn:hover {
@@ -556,18 +558,15 @@
   }
 
   .start-btn {
-    background: var(--accent);
-    color: white;
     padding: 6px 14px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
 
-  .start-btn:hover:not(:disabled) {
-    background: var(--accent-hover);
-  }
-
-  .start-btn:disabled {
-    opacity: 0.5;
-    cursor: default;
+  /* A finger needs 44px (--hit) */
+  @media (pointer: coarse) {
+    .close-btn {
+      min-width: var(--hit);
+      min-height: var(--hit);
+    }
   }
 </style>

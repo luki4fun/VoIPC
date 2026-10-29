@@ -3,17 +3,21 @@
   import { listen } from "@tauri-apps/api/event";
   import { onMount, untrack } from "svelte";
   import { get } from "svelte/store";
+  import { answerFileWanted, fileLimits, noteProgress, startFileRetain, type FileProgress } from "./lib/files";
+  import type { FileConv } from "./lib/types";
 
   import ConnectDialog from "./lib/components/ConnectDialog.svelte";
   import ScreenShareSourcePicker from "./lib/components/ScreenShareSourcePicker.svelte";
   import SettingsPanel from "./lib/components/SettingsPanel.svelte";
   import Toast from "./lib/components/Toast.svelte";
+  import ConfirmDialog from "./lib/components/ConfirmDialog.svelte";
   import InvitePopup from "./lib/components/InvitePopup.svelte";
   import PokePopup from "./lib/components/PokePopup.svelte";
   import VoiceKeys from "./lib/components/VoiceKeys.svelte";
   import LayoutSetup from "./lib/components/LayoutSetup.svelte";
   import ClassicShell from "./lib/components/shell/ClassicShell.svelte";
   import ModernShell from "./lib/components/modern/ModernShell.svelte";
+  import StageShell from "./lib/components/stage/StageShell.svelte";
   import UserContextMenu from "./lib/components/UserContextMenu.svelte";
   import SharePreview from "./lib/components/SharePreview.svelte";
   import ChannelDialogs from "./lib/components/ChannelDialogs.svelte";
@@ -24,6 +28,7 @@
     connectionState,
     serverAddress,
     userId,
+    username,
     latency,
     viaTcp,
     isMuted,
@@ -47,12 +52,14 @@
   import { account, accountHex } from "./lib/stores/account.js";
   import { addNotification, removeNotification } from "./lib/stores/notifications.js";
   import { availableUpdate, initUpdates } from "./lib/stores/updates.js";
-  import type { UpdateInfo } from "./lib/update-rules.js";
+  import { updateToast, type UpdateInfo } from "./lib/update-rules.js";
   import { pendingInvites } from "./lib/stores/invites.js";
   import { pendingPokes, createPoke, addPoke } from "./lib/stores/pokes.js";
   import {
     addChannelMessage,
     addDmMessage,
+    applyChannelEvent,
+    applyDmEvent,
     fileStoredChannelMessage,
     activeDmUsername,
     startExpirySweep,
@@ -61,6 +68,8 @@
     dmConversations,
     incrementChannelUnread,
     clearChannelUnread,
+    markRead,
+    dmKey,
     chatKey,
     chatUnlocked,
     channelMessages,
@@ -68,6 +77,7 @@
     mergeChannelHistory,
     openTextChannel,
     flushChatSave,
+    receivedNow,
   } from "./lib/stores/chat.js";
   import ChatHistorySetup from "./lib/components/ChatHistorySetup.svelte";
   import AudioSetup from "./lib/components/AudioSetup.svelte";
@@ -132,14 +142,28 @@
     requestRoster,
     setRoster,
   } from "./lib/stores/rosters.js";
+  import { confirmAction } from "./lib/stores/confirm.js";
   import {
     askNsfwConsent,
     autoJoinTextChannels,
     channelMessageTtl,
     dmMessageTtl,
+    forgetLeft,
     isTextChannel,
+    managesChannel,
+    openJoinedTextChannel,
+    previewChannel,
   } from "./lib/stores/channel-ui.js";
-  import { expiryFor, HISTORY_MAX_MESSAGES, MAX_CONVERSATIONS } from "./lib/chat-rules.js";
+  import {
+    chatEvent,
+    expiryFor,
+    forHandOff,
+    HISTORY_MAX_MESSAGES,
+    MAX_CONVERSATIONS,
+    messageRefs,
+    notificationBody,
+    receivedText,
+  } from "./lib/chat-rules.js";
   import { LAYOUT_PICKER_VERSION } from "./lib/ui-prefs.js";
   import { voiceMode, vadThreshold } from "./lib/stores/voice.js";
   import {
@@ -164,6 +188,8 @@
   } from "./lib/stores/room.js";
   import { upsertById } from "./lib/stores/upsert.js";
   import { shortName } from "./lib/username.js";
+  import { mentionNames, mentionsName, parse } from "./lib/markdown.js";
+  import { findTarget, isOwn } from "./lib/thread-rules.js";
   import { cleanLane, micLane } from "./lib/stores/mixer.js";
   import {
     addScreenShare,
@@ -360,13 +386,38 @@
       rememberChannelPassword(server, ch.name, inv.password);
     }
     const join = () =>
-      invoke("join_channel", { server, channelId: ch.channel_id, password: inv.password }).catch(
+      invoke("join_channel", { server, channelId: ch.channel_id, password: inv.password }).then(
+        // A text channel the link names is the one to show (V-01), and
+        // following it undoes having left it, as Join does
+        () => {
+          if (!ch.text) return;
+          forgetLeft(server, ch.channel_id);
+          if (server === get(serverAddress)) openJoinedTextChannel(server, ch.channel_id, ch.name);
+        },
         (e: unknown) => {
           addNotification(`Could not join #${ch.name}: ${e}`, "error");
         },
       );
     // A link is somebody else's idea: an 18+ channel still asks first
-    if (askNsfwConsent(server, ch.channel_id, () => void join())) void join();
+    const joinAsked = () => {
+      if (askNsfwConsent(server, ch.channel_id, () => void join())) void join();
+    };
+    if (ch.text) {
+      // A text channel seats nobody: open it
+      joinAsked();
+      return;
+    }
+    // A voice channel is a seat with a microphone, and a seat needs an ask
+    // (0.10.0): the link shows the channel, then asks (S-048)
+    if (ch.channel_id === get(currentChannelId.peek(server))) return;
+    if (server === get(serverAddress)) previewChannel(ch.channel_id);
+    void confirmAction({
+      title: `Join voice in ${ch.name}?`,
+      body: "An invite link opened this channel. Joining puts you in its call, with your microphone as you have it set.",
+      confirm: "Join voice",
+    }).then((ok) => {
+      if (ok) joinAsked();
+    });
   });
 
   // What a connection held — admin, the channel list, rosters, the chat's
@@ -379,6 +430,25 @@
   // pokes at the relay's full rate would otherwise stack dozens a second on
   // the desktop. The unread counts still say what arrived.
   let lastNotifyAt = -Infinity;
+
+  /** Our own account on `server` (hex), which names what we wrote across connects. */
+  function ownAccount(server: string): string | undefined {
+    const own = get(account.peek(server));
+    return own ? accountHex(own.info.id) : undefined;
+  }
+
+  /** Whether `content` names us with an `@`. Never in an anonymous channel, where names are pseudonyms;
+   *  by our short name only where nobody else in the channel goes by it (R2-11). */
+  function mentionsUs(server: string, channelId: number, content: string): boolean {
+    if (!content.includes("@")) return false;
+    if (get(channels.peek(server)).find((c) => c.channel_id === channelId)?.anonymous) return false;
+    const own = get(username.peek(server));
+    if (!own) return false;
+    const people = currentRosterOf(server, channelId).map((u) => u.username);
+    const names = mentionNames([...people, own]).filter((n) => n === own || n === shortName(own));
+    const tree = parse(content, { names });
+    return names.some((n) => mentionsName(tree, n));
+  }
 
   async function notifyUnfocused(title: string, body: string) {
     if (document.hasFocus()) return;
@@ -479,16 +549,23 @@
       // Back on a server whose DM was left open: what arrived there meanwhile
       // counted as unread (chat.ts addDmMessage), and it is on screen now.
       const peer = $activeDmUserId;
-      dmConversations.of($serverAddress).update((cs) =>
-        cs.some((c) => c.user_id === peer && c.unread > 0)
-          ? cs.map((c) => (c.user_id === peer ? { ...c, unread: 0 } : c))
-          : cs,
-      );
+      const server = $serverAddress;
+      dmConversations.of(server).update((cs) => {
+        const read = cs.find((c) => c.user_id === peer && c.unread > 0);
+        if (!read) return cs;
+        markRead(dmKey(server, read.username));
+        return cs.map((c) => (c === read ? { ...c, unread: 0 } : c));
+      });
     }
   });
 
   // Android: start/stop foreground voice service when joining/leaving voice,
-  // on whichever server — the service is the call's
+  // on whichever server — the service is the call's. Only when the call or
+  // its channel's name changes: the voice store changes with every roster
+  // and share update, and each start re-applies the call's audio route (D1-07).
+  const voiceServiceName = $derived(
+    $voiceState === "connected" && $voice !== null ? $voiceChannel?.name || "voice channel" : null,
+  );
   $effect(() => {
     if (!$isMobile) return;
     const bridge = (window as any).__VoIPC;
@@ -496,10 +573,10 @@
 
     let timer: ReturnType<typeof setTimeout> | null = null;
 
-    if ($voiceState === 'connected' && $voice !== null) {
-      const name = $voiceChannel?.name ?? "";
+    const name = voiceServiceName;
+    if (name !== null) {
       timer = setTimeout(() => {
-        bridge.startVoiceService(name || 'voice channel');
+        bridge.startVoiceService(name);
       }, 300);
     } else {
       bridge.stopVoiceService();
@@ -524,8 +601,22 @@
     // Messages with a destruction timer go when their moment comes, whether or
     // not anybody is looking at them. One sweep for the whole app.
     startExpirySweep();
+    // ...and the file cache follows what the chat still refers to
+    const stopFileRetain = startFileRetain();
     // A reload, or a window closed under us: the debounced chat save goes now
     window.addEventListener("beforeunload", () => void flushChatSave());
+    // A file dropped where nothing takes it (the member list, a chat that
+    // cannot send files) must not open in the window in place of the app:
+    // the desktop page sees drops itself since 1.3 (R3-07). A chat that takes
+    // it has staged it already, below this.
+    window.addEventListener("dragover", (e) => {
+      if (!e.dataTransfer?.types.includes("Files")) return;
+      if (!e.defaultPrevented) e.dataTransfer.dropEffect = "none";
+      e.preventDefault();
+    });
+    window.addEventListener("drop", (e) => {
+      if (e.dataTransfer?.types.includes("Files")) e.preventDefault();
+    });
 
     // Invite link in the URL fragment (web client): keep it, then drop it from
     // the address bar so it is neither kept in history nor re-applied on reload
@@ -636,6 +727,10 @@
     const unlisteners = [
       // Refused for another protocol: ConnectDialog shows which side updates
       listenServer<Omit<UpdateNeeded, "server">>("update-needed", (server, d) => updateNeeded.set({ server, ...d })),
+      // The relay asks for a file this device holds (a re-seed): silent
+      listenServer<{ conv: FileConv; hash: string }>("file-wanted", (server, d) => answerFileWanted(server, d.conv, d.hash)),
+      listenServer<{ max_bytes: number } | null>("file-limits", (server, d) => fileLimits.of(server).set(d)),
+      listenServer<FileProgress>("file-progress", (_server, d) => noteProgress(d)),
       // First meeting with a self-signed server: what was pinned, to compare
       listenServer<{ fingerprint: string }>("tofu-pinned", (server, d) =>
         addNotification(
@@ -993,9 +1088,9 @@
         void startReconnect(server, { voice: prevVoice, text: prevText }, reason);
       }),
 
-      listen<{ error: string }>("audio-device-error", (event) => {
+      listen<{ error: string; retrying?: boolean }>("audio-device-error", (event) => {
         addNotification(
-          `Audio device error: ${event.payload.error} — retrying…`,
+          `Audio device error: ${event.payload.error}${event.payload.retrying ? " — retrying…" : ""}`,
           "error",
         );
       }),
@@ -1025,9 +1120,12 @@
       // has the button
       listen<UpdateInfo>("update-available", (event) => {
         availableUpdate.set(event.payload);
-        if (announcedUpdate !== event.payload.version) {
+        // An update on another protocol gets no toast: Settings says what it
+        // would cost (design input 5)
+        const toast = updateToast(event.payload);
+        if (toast && announcedUpdate !== event.payload.version) {
           announcedUpdate = event.payload.version;
-          addNotification(`VoIPC ${event.payload.version} is available: Settings, Updates.`, "info", 10000);
+          addNotification(toast, "info", 10000);
         }
       }),
 
@@ -1144,7 +1242,8 @@
               // with a fresh copy of the same deadline.
               !(m.expires_at !== undefined && m.expires_at <= now),
           );
-          let msgs: ChatMessage[] = text.slice(-HISTORY_MAX_MESSAGES);
+          // Without what events did here (reactions, a pin): the reader's own record
+          let msgs: ChatMessage[] = text.slice(-HISTORY_MAX_MESSAGES).map(forHandOff);
           // Stay well under the 64 KiB control-message cap (Signal envelope + framing)
           const bytes = (list: ChatMessage[]) =>
             new TextEncoder().encode(JSON.stringify(list)).length;
@@ -1305,9 +1404,14 @@
         timestamp: number;
         message_id?: string | null;
         ttl_secs?: number | null;
+        reply_to?: string | null;
+        thread?: string | null;
+        event?: unknown;
         decryption_failed?: boolean;
       }>("channel-chat-message", (server, data) => {
-        const { channel_id, user_id: uid, username, content, timestamp, message_id } = data;
+        const { channel_id, user_id: uid, username, timestamp, message_id } = data;
+        // Cut where it arrives (D-7): what follows parses it, for a mention
+        const content = receivedText(data.content);
         const chName = channelNameById(server, channel_id);
         if (chName) {
           // The moment this message is to be deleted, worked out once, here:
@@ -1325,6 +1429,16 @@
           const writer = uid === self
             ? get(account.peek(server))?.info.id
             : get(users.peek(server)).find((u) => u.user_id === uid)?.account;
+          // An edit, delete, reaction or pin: done to an earlier message here,
+          // never a message itself. A pin counts only from one of the
+          // channel's managers, as the roster has the sender now.
+          if (data.event != null) {
+            const event = chatEvent(data.event);
+            const by = { user_id: uid, username: uname, account: writer ? accountHex(writer) : undefined };
+            const mayPin = event?.kind === "pin" && managesChannel(server, channel_id, uid);
+            if (event) applyChannelEvent(server, chName, { event, by, at: timestamp, content }, mayPin);
+            return;
+          }
           const added = addChannelMessage(server, chName, {
             user_id: uid,
             username: uname,
@@ -1337,10 +1451,27 @@
             // join spreads one member's missing key to everybody after them.
             kind: data.decryption_failed ? "undecryptable" : undefined,
             account: writer ? accountHex(writer) : undefined,
+            ...messageRefs(data),
           });
           if (added && !viewingChannel(server, channel_id)) {
-            incrementChannelUnread(server, chName);
+            incrementChannelUnread(server, chName, timestamp);
             if (uid !== self) playChannelMessageSound();
+          }
+          // An answer to something we wrote, or our name after an @, reaches
+          // us like a direct message does
+          if (added && uid !== self) {
+            const target = data.reply_to
+              ? findTarget(get(channelMessages).get(chatKey(server, chName)) ?? [], data.reply_to, timestamp)
+              : undefined;
+            const me = { account: ownAccount(server), user_id: self };
+            const answered = !!target && isOwn(target, me, (m) => receivedNow(server, m));
+            const named = !answered && mentionsUs(server, channel_id, content);
+            if (answered || named) {
+              notifyUnfocused(
+                `${fromServer(server)}${shortName(uname)} ${answered ? "replied to you" : "mentioned you"}`,
+                notificationBody({ content, file: messageRefs(data).file, expires_at }),
+              );
+            }
           }
         }
       }),
@@ -1356,6 +1487,8 @@
         content: string;
         ttl_secs: number | null;
         timestamp: number;
+        reply_to?: string | null;
+        thread?: string | null;
       }>("stored-channel-message", (server, m) => {
         const ch = get(channels.peek(server)).find((c) => c.log === m.conv);
         if (!ch) return;
@@ -1369,8 +1502,9 @@
           id: m.message_id ?? undefined,
           account: m.sender_account,
           expires_at: expiryFor(m.timestamp, m.ttl_secs, channelMessageTtl(server, ch.channel_id)),
+          ...messageRefs(m),
         });
-        if (added && !m.from_me && !viewingChannel(server, ch.channel_id)) incrementChannelUnread(server, ch.name);
+        if (added && !m.from_me && !viewingChannel(server, ch.channel_id)) incrementChannelUnread(server, ch.name, m.timestamp);
       }),
 
       // Who can read what we write in a channel's stored log, said where it
@@ -1398,8 +1532,12 @@
         timestamp: number;
         message_id?: string | null;
         ttl_secs?: number | null;
+        reply_to?: string | null;
+        thread?: string | null;
+        event?: unknown;
       }>("direct-chat-message", (server, data) => {
-        const { from_user_id, to_user_id, content, timestamp } = data;
+        const { from_user_id, to_user_id, timestamp } = data;
+        const content = receivedText(data.content);
         const myId = get(userId.peek(server));
         const from_username =
           from_user_id === myId ? ownDisplayName(server, data.from_username) : data.from_username;
@@ -1413,6 +1551,13 @@
         const sender = from_user_id === myId
           ? get(account.peek(server))?.info.id
           : get(users.peek(server)).find((u) => u.user_id === from_user_id)?.account;
+        // Done to an earlier message of the conversation: no message, no sound
+        if (data.event != null) {
+          const event = chatEvent(data.event);
+          const by = { user_id: from_user_id, username: from_username, account: sender ? accountHex(sender) : undefined };
+          if (event) applyDmEvent(server, myId, from_user_id, from_username, to_user_id, { event, by, at: timestamp, content });
+          return;
+        }
         addDmMessage(server, myId, from_user_id, from_username, to_user_id, {
           user_id: from_user_id,
           username: from_username,
@@ -1421,10 +1566,13 @@
           id: data.message_id ?? undefined,
           expires_at,
           account: sender ? accountHex(sender) : undefined,
+          ...messageRefs(data),
         });
         if (from_user_id !== myId) {
           playDirectMessageSound();
-          notifyUnfocused(`${fromServer(server)}${shortName(from_username)}`, content.slice(0, 140));
+          // Never the text of a message with a timer (R2-14)
+          const body = notificationBody({ content, file: messageRefs(data).file, expires_at });
+          notifyUnfocused(`${fromServer(server)}${shortName(from_username)}`, body || "New message");
         }
       }),
 
@@ -1527,9 +1675,13 @@
 
       listenServer<{ reason: string }>("screenshare-error", (server, data) => {
         addNotification(`${fromServer(server)}Screen share error: ${data.reason}`, "error");
+        // A share we watch that this device cannot decode comes the same way
+        // (the browser's and the desktop's decoders say "cannot decode"), and
+        // is no reason to end a share of our own (B1-N1)
+        const watchedOne = $watchingUserId !== null && /cannot decode/i.test(data.reason);
         // The server refused or ended our share (a channel can switch sharing
         // off under us): stop capturing rather than sending into the void.
-        if (inVoice(server) && $isSharingScreen) {
+        if (inVoice(server) && $isSharingScreen && !watchedOne) {
           isSharingScreen.set(false);
           viewerCount.set(0);
           invoke("stop_screen_capture").catch(() => {});
@@ -1579,7 +1731,9 @@
       }
     }, 5000);
 
-    // Poll screen audio + video stats every 500ms, while there is a call
+    // Poll screen audio + video stats every 500ms, while a share is being
+    // sent or watched: four calls a second for the length of every call, with
+    // nothing to show for them, was battery on a phone for nothing
     let lastSendCount = 0;
     let lastRecvCount = 0;
     let lastFramesSent = 0;
@@ -1587,7 +1741,7 @@
     let lastFramesRecv = 0;
     let lastBytesRecv = 0;
     const statsInterval = setInterval(() => {
-      if ($voiceState === "connected") {
+      if ($voiceState === "connected" && ($isSharingScreen || $watchingUserId !== null)) {
         invoke<[number, number]>("get_screen_audio_status")
           .then(([sendCount, recvCount]) => {
             screenAudioSending.set(sendCount !== lastSendCount);
@@ -1627,12 +1781,18 @@
             receiverFramesDropped.set(framesDropped);
           })
           .catch(() => {});
+      } else {
+        // Nothing shared or watched: the audio flags must not stay lit from
+        // the share that just ended until the next one starts
+        screenAudioSending.set(false);
+        screenAudioReceiving.set(false);
       }
     }, 500);
 
     return () => {
       clearInterval(pingInterval);
       clearInterval(statsInterval);
+      stopFileRetain();
       unlisteners.forEach((p) => p.then((unlisten) => unlisten()));
     };
     })();
@@ -1640,14 +1800,17 @@
   });
 </script>
 
-{#if !$chatUnlocked && !$chatHistoryDisabled}
+<!-- Both wait for the config, which says whether there is history to unlock
+     and what to fill in: before it, a start with history off flashed "Set up
+     chat history", and the connect dialog showed empty fields first -->
+{#if $uiPrefsReady && !$chatUnlocked && !$chatHistoryDisabled}
   <ChatHistorySetup />
 {/if}
 
 <!-- Up by itself while no server is on screen, and from the rail's "+". A
      server that is connecting or reconnecting says so in its own pane
      (ReconnectOverlay, mounted by each shell), not here. -->
-{#if $showConnectDialog || !$serverAddress}
+{#if $uiPrefsReady && ($showConnectDialog || !$serverAddress)}
   <ConnectDialog />
 {/if}
 
@@ -1671,11 +1834,13 @@
      copies racing each other. -->
 <VoiceKeys />
 
-<!-- The layout itself. Both shells read the same stores; App.svelte stays the
-     event bus and the modal stack above them. -->
+<!-- The layout itself. All three shells read the same stores; App.svelte
+     stays the event bus and the modal stack above them. -->
 {#if $uiPrefsReady}
   {#if $uiLayout === "modern"}
     <ModernShell onopensettings={() => (showSettings = true)} />
+  {:else if $uiLayout === "stage"}
+    <StageShell onopensettings={() => (showSettings = true)} />
   {:else}
     <ClassicShell onopensettings={() => (showSettings = true)} />
   {/if}
@@ -1701,6 +1866,7 @@
 <AccountPrompts />
 <AdminDialogs />
 
+<ConfirmDialog />
 <Toast />
 <InvitePopup />
 <PokePopup />

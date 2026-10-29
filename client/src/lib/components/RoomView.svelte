@@ -12,7 +12,7 @@
   import { voiceIsAdmin as isAdmin, voiceUserId as userId } from "../stores/connection.js";
   import { voiceChannel, voiceUsers as users } from "../stores/channels.js";
   import { addNotification } from "../stores/notifications.js";
-  import { avatarColor } from "../avatar.js";
+  import { avatarColor, avatarInk } from "../avatar.js";
   import { shortName } from "../username.js";
   import {
     PRESETS,
@@ -115,12 +115,43 @@
 
   function onPointerUp(e: PointerEvent): void {
     if (dragging === null) return;
-    (e.currentTarget as Element).releasePointerCapture(e.pointerId);
+    // Also the end of a drag the system cancelled or took the capture from:
+    // left set, the avatar followed every later move of the pointer
+    try {
+      (e.target as Element).releasePointerCapture?.(e.pointerId);
+    } catch {
+      // Already released
+    }
     const id = dragging;
     dragging = null;
     // The drag was throttled; make sure the resting place is the one that
     // reaches the mixer and the channel
     apply(id, $positions.get(id) ?? null);
+  }
+
+  /** The keyboard's way to move an avatar: arrows by half a metre, with
+   *  Shift by two. The room is a picture otherwise, and a picture with no
+   *  keyboard path left the presets as the only way in. */
+  function onAvatarKey(e: KeyboardEvent, id: number): void {
+    const step = e.shiftKey ? 2 : 0.5;
+    const at = $positions.get(id);
+    if (!at || !canDrag(id)) return;
+    const move: Record<string, [number, number]> = {
+      ArrowLeft: [-step, 0],
+      ArrowRight: [step, 0],
+      ArrowUp: [0, step],
+      ArrowDown: [0, -step],
+    };
+    const d = move[e.key];
+    if (d) {
+      e.preventDefault();
+      selectedUserId.set(id);
+      place(id, { x: at.x + d[0], y: at.y + d[1], z: at.z });
+      apply(id, $positions.get(id) ?? null);
+    } else if (e.key === "Enter" || e.key === " ") {
+      e.preventDefault();
+      selectedUserId.set(id);
+    }
   }
 
   /** Click on an empty spot: place the selected (or your own) avatar there. */
@@ -240,6 +271,10 @@
     viewBox="{-ROOM_EXTENT} {-ROOM_EXTENT} {ROOM_EXTENT * 2} {ROOM_EXTENT * 2}"
     onpointermove={onPointerMove}
     onpointerup={onPointerUp}
+    onpointercancel={onPointerUp}
+    onlostpointercapture={onPointerUp}
+    role="group"
+    aria-label="Virtual room. Tab to a person, then the arrow keys move them; with Shift, further."
     onpointerdown={(e) => { if (e.target === svgEl) onCanvasClick(e); }}
   >
     <!-- grid every 2 m -->
@@ -259,6 +294,11 @@
       {@const id = entry.user.user_id}
       <!-- svelte-ignore a11y_no_static_element_interactions -->
       <g
+        tabindex={canDrag(id) ? 0 : -1}
+        role="button"
+        aria-pressed={$selectedUserId === id}
+        aria-label="{shortName(entry.user.username)}{id === $userId ? ' (you)' : ''}, {entry.at.x.toFixed(1)} m across, {entry.at.y.toFixed(1)} m ahead{$speakingUsers.has(id) ? ', speaking' : ''}"
+        onkeydown={(e) => onAvatarKey(e, id)}
         class="avatar"
         class:self={id === $userId}
         class:speaking={$speakingUsers.has(id)}
@@ -268,13 +308,17 @@
         data-no-swipe
         onpointerdown={(e) => onPointerDown(e, id)}
       >
+        <!-- What a finger has to hit: wider than the disc, invisible -->
+        <circle class="hit" r="1.3" />
         <circle class="halo" r="0.95" />
         <circle
           class="disc"
           r={0.6 + Math.max(-0.3, Math.min(0.3, entry.at.z * 0.06))}
           fill={avatarColor(entry.user.username)}
         />
-        <text class="initial" y="0.18">{entry.user.username.charAt(0).toUpperCase()}</text>
+        <text class="initial" y="0.18" fill={avatarInk(avatarColor(entry.user.username))}
+          >{entry.user.username.charAt(0).toUpperCase()}</text
+        >
         <text class="name" y="1.5">
           {shortName(entry.user.username)}{#if is3d && entry.at.z !== 0}&nbsp;({entry.at.z > 0 ? "+" : ""}{entry.at.z.toFixed(1)} m){/if}
         </text>
@@ -291,6 +335,8 @@
         max="5"
         step="0.25"
         value={selectedHeight}
+        aria-label="Height"
+        aria-valuetext="{selectedHeight.toFixed(2)} metres"
         oninput={(e) => setHeight($selectedUserId!, Number((e.currentTarget as HTMLInputElement).value))}
         disabled={!canDrag($selectedUserId)}
       />
@@ -339,13 +385,13 @@
     align-items: center;
     gap: 6px;
     font-weight: 600;
-    font-size: 14px;
+    font-size: var(--fs-md);
     color: var(--text-primary);
     margin-right: auto;
   }
 
   .mode-tag {
-    font-size: 9px;
+    font-size: var(--fs-micro);
     font-weight: 600;
     letter-spacing: 0.05em;
     padding: 1px 4px;
@@ -355,7 +401,7 @@
   }
 
   .control {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     padding: 4px 8px;
     background: var(--bg-secondary);
     color: var(--text-primary);
@@ -377,7 +423,7 @@
 
   .banner {
     padding: 6px 12px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     border-bottom: 1px solid var(--border);
   }
@@ -398,7 +444,7 @@
 
   .ring {
     fill: none;
-    stroke: var(--accent);
+    stroke: var(--text-muted);
     stroke-width: 0.04;
     stroke-dasharray: 0.3 0.25;
     opacity: 0.5;
@@ -428,7 +474,7 @@
   }
 
   .avatar.selected .halo {
-    stroke: var(--accent);
+    stroke: var(--text-primary);
     stroke-dasharray: 0.2 0.15;
   }
 
@@ -445,7 +491,6 @@
   .initial {
     font-size: 0.6px;
     text-anchor: middle;
-    fill: #fff;
     font-weight: 600;
     pointer-events: none;
   }
@@ -462,7 +507,7 @@
     align-items: center;
     gap: 8px;
     padding: 6px 12px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     border-top: 1px solid var(--border);
   }
@@ -487,7 +532,7 @@
   }
 
   .tray-label {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
   }
 
@@ -495,7 +540,7 @@
     display: flex;
     align-items: center;
     gap: 5px;
-    font-size: 12px;
+    font-size: var(--fs-sm);
     padding: 3px 8px;
     background: var(--bg-secondary);
     color: var(--text-primary);
@@ -513,5 +558,18 @@
     width: 8px;
     height: 8px;
     border-radius: 50%;
+  }
+
+  .hit {
+    fill: transparent;
+  }
+
+  .avatar:focus-visible {
+    outline: none;
+  }
+
+  .avatar:focus-visible .halo {
+    stroke: var(--focus-ring);
+    stroke-width: 0.12;
   }
 </style>

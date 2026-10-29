@@ -29,7 +29,11 @@ key_file = "voipc-accounts.key"   # made on first start; VOIPC_ACCOUNTS_KEY over
 
 - **`mode`**: `off` (the default) opens no database at all. `optional` lets guests
   in next to accounts: an account's name is reserved, so a guest cannot use it, and
-  guests keep their `#tag`. `required` refuses guests.
+  guests keep their `#tag`. Nor can a guest use a name that spells an account's once
+  its letters from other scripts are read as the Latin ones they look like (a
+  Cyrillic `а` for `a`): the server answers "that name looks like an account's on
+  this server". A name with a letter that looks like no Latin one (`ü`) passes,
+  and so do look-alikes made of Latin letters and digits (`a1ice`). `required` refuses guests.
 - **`database`**: SQLite suits a small server and needs nothing else. Use Postgres for
   a big one. Both are built into the same binary.
 - **`key_file`**: seals the two-factor secrets. It is made on first start with
@@ -113,6 +117,13 @@ connections that are already open within that time.
   forgets every remembered one; the device you did it on is remembered again. The
   vault, your identity (and what others pinned of it) and the recovery key stay as
   they were.
+- **Only the recovery key resets the password.** Since 1.3 the recovery key also
+  derives a reset key; the server keeps its public half and checks every reset
+  against it. A remembered device holds the key to your vault, but not this one, so
+  it cannot set a new password. An account made before 1.3 has no reset key until
+  you make a new recovery key (*Your account → Recovery key: New*, with your
+  password, and a code when codes are on; the old recovery key stops working). Until
+  then a device that holds the vault key could reset it, as before 1.3.
 - **A password for this server only.** What the app derives is salted with the id
   the server gives itself, and a server could give itself another server's id:
   with one password on both, it would get what signs you in there. The desktop app

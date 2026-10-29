@@ -7,4 +7,19 @@
     <color name="teal_700">#FF018786</color>
     <color name="black">#FF000000</color>
     <color name="white">#FFFFFFFF</color>
+    <!-- What the window shows before the page has painted: the default
+         palette for the system's mode (VoIPC day here, night in values-night),
+         so a cold start does not flash a colour the app then replaces. -->
+    <color name="window_background">#FFFFFFFF</color>
+    <!-- The splash of the next start, per palette (themes.xml Launch.*, chosen
+         by MainActivity.setSplashScreenTheme): each palette's bg-primary token in
+         client/src/lib/theme.ts, which theme.test.ts holds these to. No two
+         hyphens in a row in here: XML comments may not contain them, and the
+         Android build stops on it. -->
+    <color name="launch_voipc_night">#FF1C1F24</color>
+    <color name="launch_voipc_day">#FFFFFFFF</color>
+    <color name="launch_voipc_dark">#FF1A1A2E</color>
+    <color name="launch_slate_dark">#FF313338</color>
+    <color name="launch_slate_light">#FFFFFFFF</color>
+    <color name="launch_amoled">#FF000000</color>
 </resources>

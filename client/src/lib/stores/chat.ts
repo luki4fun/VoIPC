@@ -1,13 +1,20 @@
 import { writable, get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import {
+  applyEvent,
   dropExpired,
+  fromArchived,
   isLegacyDmKey,
   MAX_MESSAGES,
   mergeHistory,
   newestTimestamp,
   pruneConversations,
+  receivedText,
+  rowKey,
   sanitizeHistory,
+  messageRefs,
+  toArchived,
+  type EventIn,
 } from "../chat-rules.js";
 import { previewChannelId, previewUsers } from "./channels.js";
 import { serverAddress, serverKey, userId } from "./connection.js";
@@ -244,11 +251,11 @@ async function saveNow() {
   // Convert Maps to plain objects for serde
   const channelObj: Record<string, ChatMessage[]> = {};
   chMap.forEach((msgs, name) => {
-    channelObj[name] = msgs;
+    channelObj[name] = msgs.map(toArchived);
   });
   const dmObj: Record<string, ChatMessage[]> = {};
   dmMap.forEach((msgs, key) => {
-    dmObj[key] = msgs;
+    dmObj[key] = msgs.map(toArchived);
   });
 
   const clearedObj: Record<string, number> = {};
@@ -282,7 +289,7 @@ export function populateFromArchive(archive: {
   const now = Date.now();
   const chMap = new Map<string, ChatMessage[]>();
   for (const [key, msgs] of Object.entries(archive.channels)) {
-    const live = dropExpired(msgs, now);
+    const live = dropExpired(msgs.map(fromArchived), now);
     if (live.length > 0) chMap.set(key, live);
   }
   channelMessages.set(chMap);
@@ -296,7 +303,7 @@ export function populateFromArchive(archive: {
       droppedLegacyDms++;
       continue;
     }
-    const live = dropExpired(msgs, now);
+    const live = dropExpired(msgs.map(fromArchived), now);
     if (live.length > 0) dmMap.set(key, live);
   }
   if (droppedLegacyDms > 0) {
@@ -366,6 +373,32 @@ export function startExpirySweep(): void {
 // Message operations
 // ---------------------------------------------------------------------------
 
+/**
+ * The messages each server's connection received, by row (`rowKey`): what a
+ * guest's edit or delete may change, and what can be "ours" by user id alone
+ * (thread-rules.ts `isOwn`). The relay hands user ids out again after a
+ * restart, so an archived message under an id says nothing about who has it
+ * now. Forgotten with the connection (`clearServerUnread`).
+ */
+const thisConnection = new Map<string, WeakSet<ChatMessage>>();
+
+function noteReceived(server: string, m: ChatMessage): void {
+  let seen = thisConnection.get(server);
+  if (!seen) thisConnection.set(server, (seen = new WeakSet()));
+  seen.add(rowKey(m));
+}
+
+/** Whether `m` reached us on `server`'s current connection. */
+export function receivedNow(server: string, m: ChatMessage): boolean {
+  return !!thisConnection.get(server)?.has(rowKey(m));
+}
+
+/** A message as it is kept: its text cut where it arrives (D-7). */
+function bounded(m: ChatMessage): ChatMessage {
+  const content = receivedText(m.content);
+  return content === m.content ? m : { ...m, content };
+}
+
 /** Already here: the same message by its sender's account and id, read from
  *  the stored log before it came live (a message queued while its writer was
  *  alone goes out live later). */
@@ -377,6 +410,8 @@ function held(existing: ChatMessage[] | undefined, m: ChatMessage): boolean {
 export function addChannelMessage(server: string, channelName: string, msg: ChatMessage): boolean {
   const key = chatKey(server, channelName);
   if (held(get(channelMessages).get(key), msg)) return false;
+  msg = bounded(msg);
+  noteReceived(server, msg);
   channelMessages.update((map) => {
     const existing = map.get(key) ?? [];
     const msgs = [...existing, msg];
@@ -398,6 +433,7 @@ export function addChannelMessage(server: string, channelName: string, msg: Chat
  */
 export function fileStoredChannelMessage(server: string, channelName: string, msg: ChatMessage): boolean {
   if (msg.expires_at !== undefined && msg.expires_at <= Date.now()) return false;
+  msg = bounded(msg);
   const key = chatKey(server, channelName);
   if (purged(key, msg)) return false;
   const watermark = get(clearedBefore).get(key) ?? 0;
@@ -447,6 +483,56 @@ export function mergeChannelHistory(
   if (added > 0) scheduleSave();
 }
 
+/**
+ * An edit, delete, reaction or pin, done to a message of a channel's chat
+ * (`applyEvent` in chat-rules.ts has the rules). `mayPin`: its sender is one
+ * of the channel's managers, by the roster's roles. Returns whether it
+ * changed anything.
+ */
+export function applyChannelEvent(server: string, channelName: string, ev: EventIn, mayPin: boolean): boolean {
+  return applyTo(server, channelMessages, chatKey(server, channelName), ev, mayPin);
+}
+
+/** `applyChannelEvent` for a direct conversation, filed as `addDmMessage`
+ *  files a message (`dmKeyOf`). There is nothing to pin in one. */
+export function applyDmEvent(server: string, myId: number, fromId: number, fromName: string, toId: number, ev: EventIn): boolean {
+  return applyTo(server, dmMessages, dmKeyOf(server, myId, fromId, fromName, toId), ev, false);
+}
+
+/** A stored log's event in a direct conversation, filed under the peer's name
+ *  as `fileStoredDm` files its messages. */
+export function applyStoredDmEvent(server: string, peerName: string, ev: EventIn): boolean {
+  return applyTo(server, dmMessages, dmKey(server, peerName), ev, false);
+}
+
+function applyTo(server: string, store: typeof channelMessages, key: string, ev: EventIn, mayPin: boolean): boolean {
+  let changed = false;
+  // An edit's new text is a message's text: cut where it arrives too
+  const content = receivedText(ev.content);
+  const current = (m: ChatMessage) => receivedNow(server, m);
+  store.update((map) => {
+    const list = map.get(key);
+    if (!list) return map;
+    const next = applyEvent(list, content === ev.content ? ev : { ...ev, content }, { mayPin, current });
+    if (next === list) return map;
+    changed = true;
+    return new Map(map).set(key, next);
+  });
+  if (changed) scheduleSave();
+  return changed;
+}
+
+/** The key a direct message is filed under: the peer's name, which for our
+ *  own echo is that server's open conversation, not the one on screen. */
+function dmKeyOf(server: string, myId: number, fromId: number, fromName: string, toId: number): string {
+  const isEcho = fromId === myId;
+  const peerId = isEcho ? toId : fromId;
+  const activeName = get(activeDmUsername.peek(server));
+  // Our own echo carries our name, not theirs; theirs is what the
+  // conversation is filed under.
+  return dmKey(server, isEcho ? peerName(server, peerId, activeName || "Unknown") : fromName);
+}
+
 export function addDmMessage(
   server: string,
   myId: number,
@@ -465,10 +551,10 @@ export function addDmMessage(
   // user has since switched away from is not being looked at, and its unread
   // count is the only thing that puts a badge on that server's rail icon.
   const onScreen = activeId === peerId && server === get(serverAddress);
-  // Our own echo carries our name, not theirs; theirs is what the
-  // conversation is filed under.
-  const key = dmKey(server, isEcho ? peerName(server, peerId, activeName || "Unknown") : fromName);
+  const key = dmKeyOf(server, myId, fromId, fromName, toId);
   if (held(get(dmMessages).get(key), msg)) return;
+  msg = bounded(msg);
+  noteReceived(server, msg);
 
   dmMessages.update((map) => {
     const existing = map.get(key) ?? [];
@@ -498,11 +584,13 @@ export function addDmMessage(
       }
       if (!onScreen) {
         existing.unread++;
+        noteUnread(dmKey(server, existing.username), msg.timestamp);
       }
       return [...convos];
     } else {
       // New conversation: use sender name for incoming, active DM name for echo
       const peerName = isEcho ? activeName || "Unknown" : fromName;
+      if (!onScreen) noteUnread(dmKey(server, peerName), msg.timestamp);
       return [
         ...convos,
         {
@@ -530,6 +618,10 @@ export function fileStoredDm(
     message_id: string | null;
     content: string;
     timestamp: number;
+    reply_to?: string | null;
+    thread?: string | null;
+    file?: unknown;
+    fwd?: unknown;
   },
   own: { name: string; account: string },
   expires_at: number | undefined,
@@ -542,11 +634,12 @@ export function fileStoredDm(
   const msg: ChatMessage = {
     user_id: m.from_me ? get(userId.peek(server)) : (peerUserId ?? 0),
     username: m.from_me ? own.name : peerName,
-    content: m.content,
+    content: receivedText(m.content),
     timestamp: m.timestamp,
     id: m.message_id ?? undefined,
     account: m.from_me ? own.account : m.peer_account,
     expires_at,
+    ...messageRefs(m),
   };
   if (expires_at !== undefined && expires_at <= Date.now()) return;
   if (purged(key, msg)) return;
@@ -569,11 +662,15 @@ export function fileStoredDm(
     const existing = convos.find((c) => c.username === peerName);
     if (existing) {
       existing.account = m.peer_account;
-      if (!m.from_me) existing.unread++;
+      if (!m.from_me) {
+        existing.unread++;
+        noteUnread(key, m.timestamp);
+      }
       return [...convos];
     }
     // Not here now: a negative id stands in until they are (addDmMessage).
     const id = peerUserId ?? -parseInt(m.peer_account.slice(0, 7), 16) - 1;
+    if (!m.from_me) noteUnread(key, m.timestamp);
     return [...convos, { user_id: id, username: peerName, unread: m.from_me ? 0 : 1, account: m.peer_account }];
   });
 }
@@ -604,6 +701,7 @@ export function openDm(server: string, userId: number, username: string) {
   // Clear unread for this conversation
   dmConversations.of(server).update((convos) => {
     const c = convos.find((x) => x.user_id === userId);
+    if (c?.unread) markRead(dmKey(server, c.username));
     if (c) c.unread = 0;
     return [...convos];
   });
@@ -614,8 +712,43 @@ export function closeDm(server: string) {
   activeDmUsername.of(server).set("");
 }
 
-export function incrementChannelUnread(server: string, channelName: string) {
+// ── Where "New" begins ──────────────────────────────────────────────────────
+//
+// The count of a conversation is cleared the moment it comes on screen, which
+// is also the moment the pane wants to know where the unread part began. So
+// the time its count left zero is kept, handed to `newMessagesAt` when the
+// count is cleared, and kept there until the reader moves on.
+
+/** When each conversation's first unread message arrived, by chat key. */
+const unreadSince = new Map<string, number>();
+/** Per chat key, where the conversation's "New" divider goes (a timestamp). */
+export const newMessagesAt = writable<Map<string, number>>(new Map());
+
+function noteUnread(key: string, at: number) {
+  if (!unreadSince.has(key)) unreadSince.set(key, at);
+}
+
+/** A conversation came on screen: what was unread there is now where "New" begins. */
+export function markRead(key: string) {
+  const at = unreadSince.get(key);
+  if (at === undefined) return;
+  unreadSince.delete(key);
+  newMessagesAt.update((map) => new Map(map).set(key, at));
+}
+
+/** The reader moved on: the conversation's divider has done its job. */
+export function forgetNewMessages(key: string) {
+  if (!get(newMessagesAt).has(key)) return;
+  newMessagesAt.update((map) => {
+    const next = new Map(map);
+    next.delete(key);
+    return next;
+  });
+}
+
+export function incrementChannelUnread(server: string, channelName: string, at = Date.now()) {
   const key = chatKey(server, channelName);
+  noteUnread(key, at);
   unreadPerChannel.update((map) => {
     map.set(key, (map.get(key) ?? 0) + 1);
     return new Map(map);
@@ -625,6 +758,7 @@ export function incrementChannelUnread(server: string, channelName: string) {
 export function clearChannelUnread(server: string, channelName: string) {
   const key = chatKey(server, channelName);
   if (!get(unreadPerChannel).has(key)) return;
+  markRead(key);
   unreadPerChannel.update((map) => {
     map.delete(key);
     return new Map(map);
@@ -655,24 +789,54 @@ function purgeMarkKey(key: string, account: string): string {
   return `${key}\u0001${account}`;
 }
 
-/** Whether `msg`'s writer deleted it (`purgeWritten`). */
+/** The mark for hand-off copies that name a writer (`purgeWritten`): they
+ *  carry no account, only the name. */
+function namedMark(key: string, writerName: string): string {
+  return purgeMarkKey(key, `n:${writerName}`);
+}
+
+/** Whether `msg`'s writer deleted it (`purgeWritten`): by its account, or for
+ *  a member's copy, which carries none, by the name it gives. */
 function purged(key: string, msg: ChatMessage): boolean {
-  return !!msg.account && msg.timestamp <= (get(clearedBefore).get(purgeMarkKey(key, msg.account)) ?? 0);
+  const mark = msg.account
+    ? purgeMarkKey(key, msg.account)
+    : msg.kind === "shared"
+      ? namedMark(key, msg.username)
+      : undefined;
+  return mark !== undefined && msg.timestamp <= (get(clearedBefore).get(mark) ?? 0);
 }
 
 /**
  * A tombstone from a stored log: everything `account` wrote in this chat up to
- * `before` goes, and stays gone when copies of it are offered again.
+ * `before` goes, and stays gone when copies of it are offered again. So do the
+ * copies members handed over that name the writer (`writerName`, the relay's
+ * name for that account) as written by then (D-13, R3-01): what only claims
+ * to be theirs, taken away at their own request.
  */
-export function purgeWritten(server: string, kind: "channel" | "dm", name: string, account: string, before: number) {
+export function purgeWritten(
+  server: string,
+  kind: "channel" | "dm",
+  name: string,
+  account: string,
+  before: number,
+  writerName = "",
+) {
   const key = kind === "channel" ? chatKey(server, name) : dmKey(server, name);
-  const mark = purgeMarkKey(key, account);
-  clearedBefore.update((marks) => ((marks.get(mark) ?? 0) >= before ? marks : new Map(marks).set(mark, before)));
+  const marks = [purgeMarkKey(key, account), ...(writerName ? [namedMark(key, writerName)] : [])];
+  clearedBefore.update((all) => {
+    if (marks.every((mark) => (all.get(mark) ?? 0) >= before)) return all;
+    const next = new Map(all);
+    for (const mark of marks) if ((next.get(mark) ?? 0) < before) next.set(mark, before);
+    return next;
+  });
   const store = kind === "channel" ? channelMessages : dmMessages;
+  const theirs = (m: ChatMessage) =>
+    m.timestamp <= before &&
+    (m.account === account || (!!writerName && m.kind === "shared" && m.username === writerName));
   store.update((map) => {
     const msgs = map.get(key);
     if (!msgs) return map;
-    const kept = msgs.filter((m) => !(m.account === account && m.timestamp <= before));
+    const kept = msgs.filter((m) => !theirs(m));
     if (kept.length === msgs.length) return map;
     map.set(key, kept);
     return new Map(map);
@@ -716,7 +880,13 @@ export function clearDmChat(server: string, peerId: number, peerUsername: string
   scheduleSave();
 }
 
-export async function clearAllHistory() {
+/**
+ * Clear every channel's and every direct conversation's history, on every
+ * server. Resolves to null when it worked, or to why the saved copy on disk
+ * could not be removed — the screen is cleared either way, and the caller
+ * says which of the two happened instead of "cleared" for both.
+ */
+export async function clearAllHistory(): Promise<string | null> {
   // Same rule as one channel: what was deleted must not be handed back
   const marks = new Map(get(clearedBefore));
   for (const chats of [get(channelMessages), get(dmMessages)]) {
@@ -727,16 +897,19 @@ export async function clearAllHistory() {
   }
   clearedBefore.set(marks);
 
+  let failure: string | null = null;
   try {
     await invoke("clear_chat_history");
   } catch (e) {
     console.error("Failed to clear chat history:", e);
+    failure = String(e);
   }
   channelMessages.set(new Map());
   dmMessages.set(new Map());
   for (const server of get(dmConversations.all()).keys()) dmConversations.of(server).set([]);
   // The watermarks the backend kept are rewritten from what we just cleared
   scheduleSave();
+  return failure;
 }
 
 /**
@@ -745,7 +918,10 @@ export async function clearAllHistory() {
  * before the drop. The other servers' counts are theirs and stay.
  */
 export function clearServerUnread(server: string) {
+  // What this connection received goes with it too (`receivedNow`)
+  thisConnection.delete(server);
   const prefix = `${serverKey(server)}/`;
+  for (const key of [...unreadSince.keys()]) if (key.startsWith(prefix)) unreadSince.delete(key);
   unreadPerChannel.update((map) => {
     const next = new Map([...map].filter(([key]) => !key.startsWith(prefix)));
     return next.size === map.size ? map : next;

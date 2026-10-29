@@ -444,16 +444,22 @@ impl FrameAssembler {
 
 /// Largest `[u16 len][packet]` record on a per-frame stream.
 pub const MAX_STREAM_RECORD_SIZE: usize = 1500;
+/// And the smallest: a record carries a video packet, so one shorter than its
+/// header is not one, and a stream of them costs a parse and an allocation
+/// per handful of bytes (S-043).
+pub const MIN_STREAM_RECORD_SIZE: usize = VIDEO_HEADER_SIZE;
 
 /// Splits a per-frame stream (`[u16 BE len][packet]`, repeated) into its
-/// packets; stops at the first empty, oversized or truncated record.
+/// packets; stops at the first short, oversized or truncated record.
 pub fn stream_records(data: &[u8]) -> Vec<&[u8]> {
     let mut records = Vec::new();
     let mut off = 0;
     while off + 2 <= data.len() {
         let len = u16::from_be_bytes([data[off], data[off + 1]]) as usize;
         off += 2;
-        if len == 0 || len > MAX_STREAM_RECORD_SIZE || off + len > data.len() {
+        if !(MIN_STREAM_RECORD_SIZE..=MAX_STREAM_RECORD_SIZE).contains(&len)
+            || off + len > data.len()
+        {
             break;
         }
         records.push(&data[off..off + len]);
@@ -472,28 +478,32 @@ pub struct RecordReader {
 }
 
 impl RecordReader {
-    /// Feed the bytes just read and get every record completed by them. An
-    /// empty or oversized length prefix breaks the reader: the record boundaries
-    /// are lost, so nothing more comes out of it.
+    /// Feed the bytes just read and get every record completed by them. A
+    /// short or oversized length prefix breaks the reader: the record
+    /// boundaries are lost, so nothing more comes out of it.
     pub fn push(&mut self, data: &[u8]) -> Vec<Vec<u8>> {
         let mut records = Vec::new();
         if self.broken {
             return records;
         }
         self.buf.extend_from_slice(data);
-        while self.buf.len() >= 2 {
-            let len = u16::from_be_bytes([self.buf[0], self.buf[1]]) as usize;
-            if len == 0 || len > MAX_STREAM_RECORD_SIZE {
+        let mut off = 0;
+        while self.buf.len() - off >= 2 {
+            let len = u16::from_be_bytes([self.buf[off], self.buf[off + 1]]) as usize;
+            if !(MIN_STREAM_RECORD_SIZE..=MAX_STREAM_RECORD_SIZE).contains(&len) {
                 self.broken = true;
                 self.buf.clear();
-                break;
+                return records;
             }
-            if self.buf.len() < 2 + len {
+            if self.buf.len() - off < 2 + len {
                 break; // the rest of this record is still in flight
             }
-            records.push(self.buf[2..2 + len].to_vec());
-            self.buf.drain(..2 + len);
+            records.push(self.buf[off + 2..off + 2 + len].to_vec());
+            off += 2 + len;
         }
+        // Once per push: draining per record moved the rest of the buffer
+        // each time, quadratic in the records one read carries (S-043)
+        self.buf.drain(..off);
         records
     }
 
@@ -1028,14 +1038,18 @@ mod tests {
         );
     }
 
+    /// A record payload of `MIN_STREAM_RECORD_SIZE + extra` bytes of `fill`.
+    fn payload(fill: u8, extra: usize) -> Vec<u8> {
+        vec![fill; MIN_STREAM_RECORD_SIZE + extra]
+    }
+
     #[test]
     fn stream_records_stop_at_truncation_or_oversize() {
         let mut data = Vec::new();
-        data.extend_from_slice(&3u16.to_be_bytes());
-        data.extend_from_slice(&[1, 2, 3]);
-        data.extend_from_slice(&5u16.to_be_bytes());
+        data.extend_from_slice(&record(&payload(1, 3)));
+        data.extend_from_slice(&((MIN_STREAM_RECORD_SIZE + 5) as u16).to_be_bytes());
         data.extend_from_slice(&[4, 5]); // truncated
-        assert_eq!(stream_records(&data), vec![&[1u8, 2, 3][..]]);
+        assert_eq!(stream_records(&data), vec![&payload(1, 3)[..]]);
 
         let mut oversized = Vec::new();
         oversized.extend_from_slice(&((MAX_STREAM_RECORD_SIZE + 1) as u16).to_be_bytes());
@@ -1056,24 +1070,27 @@ mod tests {
     fn record_reader_handles_splits_anywhere() {
         // Length prefix split across two pushes
         let mut reader = RecordReader::default();
-        let data = record(&[1, 2, 3]);
+        let data = record(&payload(1, 3));
         assert!(reader.push(&data[..1]).is_empty());
-        assert_eq!(reader.push(&data[1..]), vec![vec![1u8, 2, 3]]);
+        assert_eq!(reader.push(&data[1..]), vec![payload(1, 3)]);
 
         // Record body split across pushes, second record arrives with the tail
         let mut reader = RecordReader::default();
-        let mut data = record(&[4, 5, 6, 7]);
-        data.extend_from_slice(&record(&[8]));
+        let mut data = record(&payload(4, 4));
+        data.extend_from_slice(&record(&payload(8, 0)));
         assert!(reader.push(&data[..4]).is_empty());
-        assert_eq!(reader.push(&data[4..]), vec![vec![4u8, 5, 6, 7], vec![8u8]]);
+        assert_eq!(reader.push(&data[4..]), vec![payload(4, 4), payload(8, 0)]);
 
-        // Many records in one push
+        // Many records in one push, and a partial one left for the next
         let mut reader = RecordReader::default();
         let mut data = Vec::new();
         for i in 0..5u8 {
-            data.extend_from_slice(&record(&[i; 3]));
+            data.extend_from_slice(&record(&payload(i, 3)));
         }
+        let next = record(&payload(9, 1));
+        data.extend_from_slice(&next[..3]);
         assert_eq!(reader.push(&data).len(), 5);
+        assert_eq!(reader.push(&next[3..]), vec![payload(9, 1)]);
     }
 
     #[test]
@@ -1084,30 +1101,64 @@ mod tests {
         data.extend_from_slice(&[0; 2000]);
         assert!(reader.push(&data).is_empty());
         assert!(reader.is_broken());
-        assert!(reader.push(&record(&[1, 2, 3])).is_empty());
+        assert!(reader.push(&record(&payload(1, 3))).is_empty());
 
         // Zero length, after a good record
         let mut reader = RecordReader::default();
-        let mut data = record(&[9]);
+        let mut data = record(&payload(9, 0));
         data.extend_from_slice(&0u16.to_be_bytes());
-        data.extend_from_slice(&record(&[10]));
-        assert_eq!(reader.push(&data), vec![vec![9u8]]);
+        data.extend_from_slice(&record(&payload(10, 0)));
+        assert_eq!(reader.push(&data), vec![payload(9, 0)]);
         assert!(reader.is_broken());
+    }
+
+    /// S-043: a record shorter than a video header is not a packet, and
+    /// breaks the stream like an empty one; both readers agree.
+    #[test]
+    fn a_record_shorter_than_a_header_breaks_the_stream() {
+        let mut data = record(&payload(1, 0));
+        data.extend_from_slice(&record(&[2; MIN_STREAM_RECORD_SIZE - 1]));
+        data.extend_from_slice(&record(&payload(3, 0)));
+        let mut reader = RecordReader::default();
+        assert_eq!(reader.push(&data), vec![payload(1, 0)]);
+        assert!(reader.is_broken());
+        assert_eq!(stream_records(&data), vec![&payload(1, 0)[..]]);
+    }
+
+    /// S-043: one read's records cost time in proportion to its bytes. The
+    /// reader drained its buffer once per record, which is quadratic: 8 MiB
+    /// (a frame stream's cap at the relay) of the smallest records took tens
+    /// of seconds.
+    #[test]
+    fn a_read_full_of_small_records_takes_linear_time() {
+        let one = record(&payload(7, 0));
+        let count = 8 * 1024 * 1024 / one.len();
+        let data = one.repeat(count);
+        let started = std::time::Instant::now();
+        let records = RecordReader::default().push(&data);
+        assert_eq!(records.len(), count);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "{:?}",
+            started.elapsed()
+        );
     }
 
     #[test]
     fn record_reader_matches_stream_records() {
         let mut data = Vec::new();
-        for payload in [&[1u8, 2, 3][..], &[4][..], &[5, 6][..]] {
-            data.extend_from_slice(&record(payload));
+        for (fill, extra) in [(1, 3), (4, 0), (5, 2)] {
+            data.extend_from_slice(&record(&payload(fill, extra)));
         }
-        data.extend_from_slice(&9u16.to_be_bytes()); // truncated tail: neither emits it
+        // A truncated tail: neither emits it
+        data.extend_from_slice(&((MIN_STREAM_RECORD_SIZE + 9) as u16).to_be_bytes());
         data.extend_from_slice(&[7, 8]);
 
         let expected: Vec<Vec<u8>> = stream_records(&data)
             .into_iter()
             .map(|r| r.to_vec())
             .collect();
+        assert_eq!(expected.len(), 3);
         assert_eq!(RecordReader::default().push(&data), expected);
     }
 

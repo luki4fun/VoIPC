@@ -3,1016 +3,802 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>VoIPC — self-hosted encrypted voice, video &amp; chat</title>
-  <meta name="description" content="VoIPC is an open-source, self-hosted alternative to Discord and TeamSpeak. Signal Protocol chat, AES-256-GCM voice and screen sharing, and a relay server that stores nothing by default.">
-  <meta name="theme-color" content="#1a1a2e">
+  <title>VoIPC — voice, screen sharing and chat on a server you run</title>
+  <meta name="description" content="VoIPC is an open-source, self-hosted alternative to Discord and TeamSpeak. Signal Protocol chat, AES-256-GCM voice and screen sharing, and a relay that keeps no messages by default, and files only encrypted, for a day at most.">
+  <meta name="theme-color" content="#0f1114">
   <meta name="color-scheme" content="dark">
   <link rel="icon" type="image/png" href="favicon.png">
   <link rel="apple-touch-icon" href="apple-touch-icon.png">
-  <!-- TODO: replace og:url/og:image with the absolute deployed URL -->
-  <meta property="og:title" content="VoIPC — self-hosted encrypted voice, video &amp; chat">
-  <meta property="og:description" content="Open-source Discord/TeamSpeak alternative. Signal Protocol chat, AES-256-GCM media, a relay server that stores nothing by default.">
+  <link rel="preload" href="fonts/barlow-semi-condensed-700.woff2" as="font" type="font/woff2" crossorigin>
+  <meta property="og:title" content="VoIPC — voice, screen sharing and chat on a server you run">
+  <meta property="og:description" content="Open-source Discord/TeamSpeak alternative. Signal Protocol chat, AES-256-GCM media, a relay that keeps no messages by default, and files only encrypted, for a day at most.">
   <meta property="og:type" content="website">
-  <meta property="og:image" content="screenshots/og.png">
+  <meta property="og:url" content="https://voipc.l4f.cc/">
+  <meta property="og:image" content="https://voipc.l4f.cc/screenshots/og.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
+  <meta property="og:image:alt" content="VoIPC: voice, screen sharing and chat on a server you run">
   <meta name="twitter:card" content="summary_large_image">
   <style>
+    /* Self-hosted, licences beside them (fonts/OFL-*.txt). No font host is
+       contacted: the page makes no request anywhere but here. */
+    @font-face { font-family: "Barlow Semi Condensed"; src: url("fonts/barlow-semi-condensed-500.woff2") format("woff2"); font-weight: 500; font-display: swap; }
+    @font-face { font-family: "Barlow Semi Condensed"; src: url("fonts/barlow-semi-condensed-600.woff2") format("woff2"); font-weight: 600; font-display: swap; }
+    @font-face { font-family: "Barlow Semi Condensed"; src: url("fonts/barlow-semi-condensed-700.woff2") format("woff2"); font-weight: 700; font-display: swap; }
+    @font-face { font-family: "JetBrains Mono"; src: url("fonts/jetbrains-mono.woff2") format("woff2"); font-weight: 400 700; font-display: swap; }
+
+    /* The app's own palette (client/src/lib/theme.ts, VoIPC night). Mint
+       means live: what is happening now, and Join. Nothing else wears it. */
     :root {
-      --bg-primary: #1a1a2e;
-      --bg-secondary: #16213e;
-      --bg-tertiary: #0f3460;
-      --bg-hover: #1a3a6e;
-      --text-primary: #e0e0e0;
-      --text-secondary: #a0a0a0;
-      --border: #2a2a4a;
-      --accent: #4a9eff;
-      --accent-hover: #3a8eef;
-      --success: #4caf50;
-      --danger: #e74c3c;
-      --warning: #f39c12;
-      --max-width: 1080px;
-      --radius: 8px;
-      --pad-section: clamp(56px, 8vw, 72px);
-      --mono: ui-monospace, "Cascadia Code", "JetBrains Mono", Consolas, "Liberation Mono", monospace;
+      --deep: #0f1114;
+      --panel: #16181d;
+      --surface: #1c1f24;
+      --raised: #262a31;
+      --line: #2a2e36;
+      --ink: #e3e6ea;
+      --ink-2: #a3aab4;
+      --ink-3: #8b939e;
+      --mint: #3ddbb0;
+      --mint-2: #5fe6c2;
+      --on-mint: #06231b;
+      --danger: #f2555a;
+      --warning: #f2b84b;
+      --display: "Barlow Semi Condensed", system-ui, sans-serif;
+      --body: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      --data: "JetBrains Mono", ui-monospace, Consolas, monospace;
+      --row: 52px;
+      --gutter: clamp(16px, 3vw, 28px);
+      color-scheme: dark;
     }
     * { margin: 0; padding: 0; box-sizing: border-box; }
-    @media (prefers-reduced-motion: no-preference) {
-      html { scroll-behavior: smooth; }
-    }
-    html { scroll-padding-top: 76px; }
+    html { scroll-padding-top: 64px; scrollbar-color: var(--raised) var(--deep); }
+    @media (prefers-reduced-motion: no-preference) { html { scroll-behavior: smooth; } }
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-      background: var(--bg-primary);
-      color: var(--text-primary);
-      line-height: 1.6;
+      background: var(--deep);
+      color: var(--ink);
+      font: 400 1rem/1.6 var(--body);
+      -webkit-font-smoothing: antialiased;
+      caret-color: var(--mint);
     }
-    img { max-width: 100%; height: auto; }
-    a { color: var(--accent); text-decoration: none; }
-    a:hover { color: var(--accent-hover); text-decoration: underline; }
-    code { font-family: var(--mono); font-size: 0.9em; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 4px; padding: 1px 5px; }
-    .container { max-width: var(--max-width); margin: 0 auto; padding: 0 20px; }
-    section { padding: var(--pad-section) 0; }
-    h1 { font-size: clamp(1.75rem, 4.5vw, 2.5rem); font-weight: 700; line-height: 1.2; }
-    h2 { font-size: clamp(1.4rem, 3vw, 1.75rem); font-weight: 700; margin-bottom: 8px; }
-    h3 { font-size: 1.0625rem; font-weight: 600; }
-    .section-sub { color: var(--text-secondary); margin-bottom: 36px; max-width: 640px; }
-    .screenshot {
-      display: block;
-      border: 1px solid var(--border);
-      border-radius: 10px;
-      background: var(--bg-primary);
-    }
+    ::selection { background: var(--mint); color: var(--on-mint); }
+    img { display: block; max-width: 100%; height: auto; }
+    a { color: var(--ink); text-decoration: underline; text-decoration-color: var(--ink-3); text-underline-offset: 3px; }
+    a:hover { text-decoration-color: var(--ink); }
+    :focus-visible { outline: 2px solid var(--mint); outline-offset: 2px; border-radius: 4px; }
+    code, kbd { font-family: var(--data); font-size: 0.88em; }
+    code { padding: 1px 6px; background: var(--raised); border-radius: 4px; }
+    .icon, .verdict svg, .panel li svg { fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; }
+    .icon { width: 18px; height: 18px; flex-shrink: 0; }
+    .sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+    .num { font-family: var(--data); font-variant-numeric: tabular-nums; }
 
-    /* ---------- nav ---------- */
-    nav {
-      position: sticky; top: 0; z-index: 100;
-      background: var(--bg-primary);
-      border-bottom: 1px solid var(--border);
+    /* ── The window: the page is one server browser, seen once ── */
+    .window {
+      max-width: 1240px;
+      margin: clamp(0px, 3vw, 40px) auto;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      overflow: clip;
     }
-    .nav-inner {
-      max-width: var(--max-width); margin: 0 auto; padding: 0 20px;
-      display: flex; align-items: center; justify-content: space-between;
-      min-height: 60px; flex-wrap: wrap;
-    }
-    .nav-logo { display: flex; align-items: center; gap: 10px; font-weight: 700; font-size: 1.125rem; color: var(--text-primary); padding: 8px 0; }
-    .nav-logo:hover { text-decoration: none; color: var(--text-primary); }
-    .nav-links { display: flex; align-items: center; gap: 4px; list-style: none; flex-wrap: wrap; }
-    .nav-links a {
-      display: inline-block; padding: 10px 12px;
-      color: var(--text-secondary); font-size: 0.9375rem;
-    }
-    .nav-links a:hover { color: var(--text-primary); text-decoration: none; }
-    .menu-btn { display: none; background: none; border: 1px solid var(--border); border-radius: 6px; color: var(--text-secondary); padding: 8px 12px; font: inherit; cursor: pointer; min-height: 44px; }
-    @media (max-width: 768px) {
-      .js .menu-btn { display: block; }
-      .js .nav-links { display: none; flex-basis: 100%; flex-direction: column; align-items: stretch; padding-bottom: 12px; }
-      .js .nav-links.open { display: flex; }
-      .js .nav-links a { padding: 12px; border-radius: 6px; }
-      .js .nav-links a:hover { background: var(--bg-secondary); }
-    }
+    @media (max-width: 720px) { .window { margin: 0; border: 0; border-radius: 0; } }
 
-    /* ---------- hero ---------- */
-    #top { padding: clamp(48px, 7vw, 80px) 0; }
-    .hero-grid { display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: 40px; align-items: center; }
-    @media (max-width: 860px) { .hero-grid { grid-template-columns: 1fr; } }
-    .hero-meta { color: var(--text-secondary); font-size: 0.875rem; margin-bottom: 16px; }
-    .hero-sub { color: var(--text-secondary); margin: 16px 0 28px; }
-    .btn {
-      display: inline-flex; align-items: center; justify-content: center; gap: 8px;
-      min-height: 44px; padding: 10px 22px; border-radius: 6px;
-      font-size: 0.9375rem; font-weight: 600; cursor: pointer; border: none;
+    .titlebar {
+      display: flex; align-items: center; gap: 12px;
+      padding: 12px var(--gutter);
+      background: var(--deep);
+      border-bottom: 1px solid var(--line);
     }
-    .btn-primary { background: var(--accent); color: #10101c; }
-    .btn-primary:hover { background: var(--accent-hover); color: #10101c; text-decoration: none; }
-    .btn-outline { border: 1px solid var(--border); color: var(--text-primary); background: transparent; }
-    .btn-outline:hover { border-color: var(--accent); color: var(--text-primary); text-decoration: none; }
-    .hero-buttons { display: flex; gap: 12px; flex-wrap: wrap; }
-
-    /* ---------- features ---------- */
-    .feature-row {
-      display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
-      gap: 36px; align-items: center; margin-bottom: 56px;
+    .titlebar img { width: 28px; height: 28px; }
+    .titlebar .title { font: 700 1.25rem/1 var(--display); letter-spacing: 0.01em; }
+    .titlebar .sub { font: 500 1rem/1 var(--display); color: var(--ink-3); }
+    .titlebar .spacer { flex: 1; }
+    .titlebar a.gh {
+      display: inline-flex; align-items: center; gap: 8px; min-height: 40px; padding: 0 12px;
+      font: 600 0.875rem/1 var(--display); color: var(--ink-2); text-decoration: none;
+      border: 1px solid var(--line); border-radius: 4px;
     }
-    .feature-row:last-of-type { margin-bottom: 0; }
-    @media (max-width: 860px) { .feature-row { grid-template-columns: 1fr; gap: 20px; } }
-    .feature-row h3 { font-size: 1.25rem; margin-bottom: 10px; }
-    .feature-row p { color: var(--text-secondary); margin-bottom: 10px; }
-    .feature-row ul { list-style: none; }
-    .feature-row li { color: var(--text-secondary); padding: 3px 0 3px 18px; position: relative; font-size: 0.9375rem; }
-    .feature-row li::before { content: "·"; position: absolute; left: 4px; color: var(--accent); font-weight: 700; }
-    .also { border-top: 1px solid var(--border); margin-top: 48px; padding-top: 24px; }
-    .also h3 { margin-bottom: 12px; }
-    .also ul { list-style: none; columns: 2; column-gap: 40px; }
-    @media (max-width: 640px) { .also ul { columns: 1; } }
-    .also li { color: var(--text-secondary); font-size: 0.9375rem; padding: 4px 0 4px 18px; position: relative; break-inside: avoid; }
-    .also li::before { content: "·"; position: absolute; left: 4px; color: var(--accent); font-weight: 700; }
+    .titlebar a.gh:hover { color: var(--ink); border-color: var(--ink-3); }
 
-    /* ---------- tech ---------- */
-    #tech { background: var(--bg-secondary); border-block: 1px solid var(--border); }
-    .spec-cards { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
-    @media (max-width: 720px) { .spec-cards { grid-template-columns: 1fr; } }
-    .spec-card { background: var(--bg-primary); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px; }
-    .spec-card h3 { margin-bottom: 14px; color: var(--accent); }
-    .spec-card dl { display: grid; grid-template-columns: auto 1fr; gap: 6px 16px; font-size: 0.9375rem; }
-    .spec-card dt { color: var(--text-secondary); white-space: nowrap; }
-    .spec-card dd { color: var(--text-primary); }
-
-    /* ---------- security ---------- */
-    .layer { display: flex; gap: 16px; padding: 20px 0; border-bottom: 1px solid var(--border); }
-    .layer:last-of-type { border-bottom: none; }
-    .layer-num {
-      flex-shrink: 0; width: 34px; height: 34px; border-radius: 6px;
-      background: var(--bg-tertiary); color: var(--accent);
-      display: flex; align-items: center; justify-content: center; font-weight: 700;
+    /* Filter tabs: the browser's own navigation, the page's too */
+    .tabs {
+      position: sticky; top: 0; z-index: 10;
+      display: flex; gap: 2px; overflow-x: auto; scrollbar-width: none;
+      padding: 0 var(--gutter);
+      background: var(--panel);
+      border-bottom: 1px solid var(--line);
     }
-    .layer h3 { margin-bottom: 6px; }
-    .layer ul { list-style: none; }
-    .layer li { color: var(--text-secondary); font-size: 0.9375rem; padding: 2px 0; }
-    .audit-note { color: var(--text-secondary); font-size: 0.875rem; margin-top: 20px; }
-
-    /* ---------- transparency ---------- */
-    #transparency { background: var(--bg-secondary); border-block: 1px solid var(--border); }
-    .trans-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 20px; }
-    .trans-card { background: var(--bg-primary); border: 1px solid var(--border); border-radius: var(--radius); padding: 22px; }
-    .trans-card h3 { margin-bottom: 12px; }
-    .trans-card ul { list-style: none; }
-    .trans-card li { color: var(--text-secondary); font-size: 0.9375rem; padding: 4px 0; }
-    .trans-card .yes h3, h3.ok { color: var(--success); }
-    h3.no { color: var(--danger); }
-
-    /* ---------- architecture ---------- */
-    .arch { display: flex; align-items: stretch; gap: 0; max-width: 860px; margin: 0 auto; }
-    .arch-node { flex: 1; background: var(--bg-secondary); border: 1px solid var(--border); border-radius: var(--radius); padding: 20px 16px; text-align: center; }
-    .arch-node h3 { margin-bottom: 4px; }
-    .arch-node p { font-size: 0.8125rem; color: var(--text-secondary); }
-    .arch-node.server { border-color: var(--accent); }
-    .arch-link { flex: 0 0 clamp(60px, 12vw, 140px); display: flex; flex-direction: column; justify-content: center; gap: 10px; padding: 0 6px; }
-    .arch-wire { border-top: 2px solid var(--border); position: relative; }
-    .arch-wire span {
-      position: absolute; top: -0.8em; left: 50%; transform: translateX(-50%);
-      background: var(--bg-primary); padding: 0 6px;
-      font-size: 0.6875rem; font-family: var(--mono); white-space: nowrap; color: var(--text-secondary);
+    .tabs a {
+      display: inline-flex; align-items: center; min-height: 48px; padding: 0 14px;
+      font: 600 1rem/1 var(--display); letter-spacing: 0.02em; white-space: nowrap;
+      color: var(--ink-2); text-decoration: none;
+      border-bottom: 2px solid transparent;
     }
-    .arch-wire.udp { border-top-color: var(--bg-tertiary); }
-    .arch-wire.udp span { color: var(--accent); }
+    .tabs a:hover { color: var(--ink); }
+    .tabs a[aria-current="true"] { color: var(--ink); border-bottom-color: var(--ink); background: var(--surface); }
+
+    /* Every section opens with one header row, the same measure as a server row */
+    .bumper {
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      min-height: var(--row); padding: 10px var(--gutter);
+      background: var(--deep);
+      border-block: 1px solid var(--line);
+    }
+    .bumper h2 { font: 700 1.5rem/1.1 var(--display); letter-spacing: 0.005em; }
+    .bumper p { color: var(--ink-3); font-size: 0.875rem; }
+    section { scroll-margin-top: 48px; }
+
+    /* ── The server list ── */
+    .list { width: 100%; border-collapse: collapse; }
+    .list th {
+      height: 36px; padding: 0 12px; text-align: left;
+      font: 600 0.8125rem/1 var(--display); letter-spacing: 0.08em; text-transform: uppercase;
+      color: var(--ink-3); background: var(--panel); border-bottom: 1px solid var(--line);
+    }
+    .list td { height: var(--row); padding: 0 12px; border-bottom: 1px solid var(--line); color: var(--ink-2); }
+    .list .flag { width: 36px; text-align: center; }
+    .list .flag svg { display: inline-block; vertical-align: middle; }
+    .list .players, .list .ping, .list .go { width: 1%; white-space: nowrap; text-align: right; }
+    .row-join {
+      display: inline-flex; align-items: baseline; gap: 6px; min-height: 40px; padding: 10px 16px;
+      font: 700 1rem/1 var(--display); letter-spacing: 0.03em;
+      background: var(--mint); color: var(--on-mint); text-decoration: none; border-radius: 4px;
+    }
+    .row-join:hover { background: var(--mint-2); }
+    .join-os { font-weight: 500; opacity: 0.85; }
+    .join-os:empty { display: none; }
+    .list .name { color: var(--ink); }
+    .list .name b { font-family: var(--data); font-weight: 500; font-size: 0.875rem; }
+    .list .name small { display: block; color: var(--ink-3); font-size: 0.875rem; line-height: 1.3; }
+    .list .mode { font: 500 1rem/1.2 var(--display); }
+    .list tbody tr:not(.selected) { opacity: 0.9; }
+    /* Selected: the row rises and its readouts flood mint, the one place the
+       list is coloured at all */
+    .list tr.selected td, .list tr.expansion > td { background: var(--surface); color: var(--ink); border-bottom-color: transparent; }
+    .list tr.expansion > td { height: auto; padding: 0; border-bottom: 1px solid var(--line); }
+    .list tr.selected .live { color: var(--mint); }
+    .caret { width: 14px; height: 14px; fill: var(--ink); stroke: none; }
+    .list-note { padding: 10px var(--gutter); font-size: 0.875rem; color: var(--ink-3); border-bottom: 1px solid var(--line); }
     @media (max-width: 720px) {
-      .arch { flex-direction: column; }
-      .arch-link { flex-direction: column; align-items: center; gap: 6px; padding: 10px 0; flex-basis: auto; }
-      .arch-wire { display: flex; align-items: center; border-top: none; }
-      .arch-wire::before { content: ""; width: 24px; border-top: 2px solid var(--border); margin-right: 8px; }
-      .arch-wire.udp::before { border-top-color: var(--bg-tertiary); }
-      .arch-wire span { position: static; transform: none; background: none; padding: 0; }
+      .list .mode, .list th.mode, .list .sel { display: none; }
+      .list td, .list th { padding: 0 6px; }
+      .list .name b { font-size: 0.875rem; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .list td.name { width: 100%; max-width: 0; }
+      .list .port, .list .players { display: none; }
+      .list .name small { font-size: 0.8125rem; }
+      .list tbody tr:not(.selected) .name small { display: none; }
+      .join-os { display: none; }
     }
 
-    /* ---------- compare + platforms ---------- */
-    .table-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius); }
-    table { width: 100%; border-collapse: collapse; min-width: 560px; font-size: 0.9375rem; }
-    th, td { padding: 12px 16px; text-align: left; border-bottom: 1px solid var(--border); }
-    tr:last-child td { border-bottom: none; }
-    thead th { background: var(--bg-secondary); font-weight: 600; }
-    thead th:nth-child(2) { color: var(--accent); }
-    td { color: var(--text-secondary); }
-    td:first-child { color: var(--text-primary); font-weight: 500; }
-    .ok { color: var(--success); }
-    .no { color: var(--danger); }
-    .mid { color: var(--warning); }
-    .muted { color: var(--text-secondary); }
-
-    /* ---------- download ---------- */
-    #download { background: var(--bg-secondary); border-top: 1px solid var(--border); }
-    .dl-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; align-items: start; }
-    @media (max-width: 768px) { .dl-grid { grid-template-columns: 1fr; } }
-    .dl-grid h3 { margin-bottom: 12px; }
-    .dl-grid p { color: var(--text-secondary); font-size: 0.9375rem; margin-bottom: 16px; }
-    pre {
-      background: var(--bg-primary); border: 1px solid var(--border); border-radius: var(--radius);
-      padding: 14px 16px; overflow-x: auto; font-family: var(--mono); font-size: 0.8125rem;
-      line-height: 1.7; color: var(--text-primary); margin-bottom: 16px;
-    }
-    pre .c { color: var(--text-secondary); }
-
-    /* ---------- footer ---------- */
-    footer { border-top: 1px solid var(--border); padding: 32px 20px; }
-    .footer-inner { max-width: var(--max-width); margin: 0 auto; display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; color: var(--text-secondary); font-size: 0.875rem; }
-
-    /* ── The live look: a small VoIPC drawn in CSS, painted with the app's own
-       palette tokens. Not a screenshot, so switching a palette or a layout
-       repaints it the way the real client does. ── */
-    .app-demo[data-palette="voipc-dark"] {
-      --bg-primary: #1a1a2e;
-      --bg-secondary: #16213e;
-      --bg-tertiary: #0f3460;
-      --bg-hover: #1a3a6e;
-      --text-primary: #e0e0e0;
-      --text-secondary: #a0a0a0;
-      --accent: #4a9eff;
-      --success: #4caf50;
-      --danger: #e74c3c;
-      --border: #2a2a4a;
-      --speaking: #4caf50;
-    }
-    .app-demo[data-palette="slate-dark"] {
-      --bg-primary: #313338;
-      --bg-secondary: #2b2d31;
-      --bg-tertiary: #1e1f22;
-      --bg-hover: #404249;
-      --text-primary: #dbdee1;
-      --text-secondary: #b5bac1;
-      --accent: #7983f5;
-      --success: #23a559;
-      --danger: #da373c;
-      --border: #3f4147;
-      --speaking: #23a559;
-    }
-    .app-demo[data-palette="slate-light"] {
-      --bg-primary: #ffffff;
-      --bg-secondary: #f2f3f5;
-      --bg-tertiary: #e3e5e8;
-      --bg-hover: #ebedef;
-      --text-primary: #060607;
-      --text-secondary: #4e5058;
-      --accent: #5865f2;
-      --success: #248046;
-      --danger: #d83c3e;
-      --border: #dcdee1;
-      --speaking: #248046;
-    }
-    .app-demo[data-palette="amoled"] {
-      --bg-primary: #000000;
-      --bg-secondary: #0a0a0a;
-      --bg-tertiary: #141414;
-      --bg-hover: #1f1f1f;
-      --text-primary: #e6e6e6;
-      --text-secondary: #9a9a9a;
-      --accent: #5865f2;
-      --success: #23a559;
-      --danger: #da373c;
-      --border: #262626;
-      --speaking: #23a559;
-    }
-
-    .look-controls {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 20px 32px;
-      align-items: flex-end;
-      margin-bottom: 20px;
-    }
-    .control-group { display: flex; flex-direction: column; gap: 8px; }
-    .control-label {
-      font-size: 11px;
-      letter-spacing: 0.08em;
-      text-transform: uppercase;
-      color: var(--text-secondary);
-    }
-    .control-row { display: flex; flex-wrap: wrap; gap: 8px; }
-    .seg, .swatch {
-      font: inherit;
-      font-size: 13px;
-      color: var(--text-secondary);
-      background: var(--bg-secondary);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 7px 12px;
-      cursor: pointer;
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-    }
-    .seg:hover, .swatch:hover { color: var(--text-primary); border-color: var(--accent); }
-    .seg[aria-pressed="true"], .swatch[aria-pressed="true"] {
-      color: var(--text-primary);
-      border-color: var(--accent);
-      box-shadow: inset 0 0 0 1px var(--accent);
-    }
-    .swatch-chip {
-      width: 26px;
-      height: 14px;
-      border-radius: 3px;
-      border: 1px solid rgba(128, 128, 128, 0.35);
-      background: linear-gradient(135deg, var(--sw-a) 0 45%, var(--sw-b) 45% 72%, var(--sw-c) 72% 100%);
-    }
-
-    .app-demo {
-      --demo-radius: 10px;
-      border: 1px solid var(--border);
-      border-radius: var(--demo-radius);
-      overflow: hidden;
-      background: var(--bg-primary);
-      color: var(--text-primary);
-      font-size: 12px;
-      line-height: 1.5;
-      display: grid;
-      min-height: 420px;
-    }
+    /* One sweep down the list when the page opens: the browser refreshing.
+       Rows are visible before and after; the line only crosses them. */
+    .refresh { position: relative; }
     @media (prefers-reduced-motion: no-preference) {
-      .app-demo, .app-demo * { transition: background-color 0.25s ease, color 0.25s ease, border-color 0.25s ease; }
+      .refresh::after {
+        content: ""; position: absolute; left: 0; right: 0; top: 0; height: 2px;
+        background: var(--mint);
+        opacity: 0; animation: sweep 1.1s cubic-bezier(0.2, 0.8, 0.2, 1) 0.25s 1;
+      }
+      @keyframes sweep { 0% { top: 0; opacity: 0.9; } 100% { top: 100%; opacity: 0; } }
     }
-    /* Modern: rail, sidebar, chat, members — with your own name under the
-       sidebar, which is where the mute and deafen buttons live. */
-    .app-demo[data-layout="modern"] {
-      grid-template-columns: 56px minmax(150px, 1.1fr) 3fr minmax(120px, 1fr);
-      grid-template-rows: 1fr auto;
-    }
-    .app-demo[data-layout="modern"] .demo-rail { grid-row: 1 / -1; }
-    .app-demo[data-layout="modern"] .demo-side { grid-row: 1; grid-column: 2; }
-    .app-demo[data-layout="modern"] .demo-user { grid-row: 2; grid-column: 2; }
-    .app-demo[data-layout="modern"] .demo-main { grid-row: 1 / -1; grid-column: 3; }
-    .app-demo[data-layout="modern"] .demo-members { grid-row: 1 / -1; grid-column: 4; }
-    /* Classic: sidebar, chat, members — with the voice and status bars along
-       the bottom, across the whole window. */
-    .app-demo[data-layout="classic"] {
-      grid-template-columns: minmax(150px, 1.1fr) 3fr minmax(120px, 1fr);
-      grid-template-rows: 1fr auto;
-    }
-    .app-demo[data-layout="classic"] .demo-side { grid-row: 1; grid-column: 1; }
-    .app-demo[data-layout="classic"] .demo-main { grid-row: 1; grid-column: 2; }
-    .app-demo[data-layout="classic"] .demo-members { grid-row: 1; grid-column: 3; }
-    .app-demo[data-layout="classic"] .demo-bars { grid-row: 2; grid-column: 1 / -1; }
-    .app-demo[data-layout="modern"] .demo-rail { display: flex; }
-    .app-demo[data-layout="classic"] .demo-rail { display: none; }
-    .app-demo[data-layout="classic"] .demo-bars { display: block; }
-    .app-demo[data-layout="modern"] .demo-bars { display: none; }
-    .app-demo[data-layout="classic"] .demo-nested { display: none; }
 
-    .demo-rail {
-      background: var(--bg-tertiary);
-      flex-direction: column;
-      align-items: center;
-      gap: 10px;
-      padding: 10px 0;
+    /* The selected server, opened in place: the claim across the pane, then
+       the server's own picture beside its details */
+    .detail { padding: clamp(18px, 3vw, 32px) var(--gutter) clamp(24px, 3.5vw, 40px) calc(var(--gutter) + 36px); }
+    h1 { font: 700 clamp(1.9rem, 3.4vw, 2.75rem)/1.05 var(--display); letter-spacing: -0.01em; text-wrap: balance; }
+    .lead { margin-top: 12px; max-width: 70ch; color: var(--ink-2); font-size: 1.125rem; }
+    .detail-body { margin-top: clamp(18px, 3vw, 28px); display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 4fr); gap: clamp(18px, 3vw, 36px); align-items: start; }
+    .server-kv { margin-top: 0; }
+    @media (max-width: 900px) {
+      .detail { padding-left: var(--gutter); }
+      .detail-body { grid-template-columns: minmax(0, 1fr); }
     }
-    .demo-server {
-      width: 34px; height: 34px; border-radius: 12px;
-      background: var(--accent); color: #fff;
-      display: grid; place-items: center; font-weight: 700; font-size: 13px;
+    .shot { border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--deep); }
+    .shot figcaption, figcaption { padding: 10px 12px; font-size: 0.875rem; color: var(--ink-3); border-top: 1px solid var(--line); background: var(--panel); }
+
+    /* ── Server info: a tab per thing it does ── */
+    .info-tabs { display: flex; gap: 2px; overflow-x: auto; scrollbar-width: none; padding: 0 var(--gutter); border-bottom: 1px solid var(--line); }
+    .info-tabs button {
+      display: inline-flex; align-items: center; gap: 8px; min-height: 48px; padding: 0 16px;
+      font: 600 1rem/1 var(--display); letter-spacing: 0.02em; white-space: nowrap;
+      color: var(--ink-2); background: none; border: 0; border-bottom: 2px solid transparent; cursor: pointer;
     }
-    .demo-server.ghost { background: transparent; border: 1px dashed var(--border); color: var(--text-secondary); font-weight: 400; }
-    .demo-side { background: var(--bg-secondary); border-right: 1px solid var(--border); padding: 10px 8px; }
-    .demo-side-title {
-      font-size: 10px; letter-spacing: 0.09em; text-transform: uppercase;
-      color: var(--text-secondary); padding: 8px 6px 4px;
+    .info-tabs button:hover { color: var(--ink); }
+    .info-tabs button[aria-selected="true"] { color: var(--ink); border-bottom-color: var(--ink); background: var(--surface); }
+    .panel {
+      display: grid; grid-template-columns: minmax(0, 5fr) minmax(0, 7fr); gap: clamp(20px, 4vw, 44px);
+      padding: clamp(24px, 4vw, 40px) var(--gutter);
+      background: var(--surface);
     }
-    .demo-row {
-      display: flex; align-items: center; gap: 7px;
-      padding: 5px 7px; border-radius: 5px; color: var(--text-secondary);
-    }
-    .demo-row.active { background: var(--bg-hover); color: var(--text-primary); }
-    .demo-row .count { margin-left: auto; font-size: 11px; opacity: 0.75; }
-    .demo-nested { display: flex; align-items: center; gap: 7px; padding: 3px 7px 3px 24px; color: var(--text-secondary); }
-    .demo-av {
-      width: 18px; height: 18px; border-radius: 50%; flex-shrink: 0;
-      display: grid; place-items: center; font-size: 10px; color: #12121c; font-weight: 700;
-    }
-    .demo-main { display: flex; flex-direction: column; background: var(--bg-primary); min-width: 0; }
-    .demo-head {
-      display: flex; align-items: center; gap: 8px;
-      padding: 10px 14px; border-bottom: 1px solid var(--border);
-      color: var(--text-primary); font-weight: 600;
-    }
-    .demo-msgs { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; flex: 1; }
-    .demo-msg { display: flex; gap: 9px; }
-    .demo-msg .demo-av { width: 22px; height: 22px; font-size: 11px; }
-    .demo-who { color: var(--accent); font-weight: 600; }
-    .demo-who.self { color: var(--text-primary); }
-    .demo-text { color: var(--text-primary); }
-    .demo-input {
-      margin: 0 14px 14px; padding: 9px 12px;
-      border: 1px solid var(--border); border-radius: 7px;
-      background: var(--bg-secondary); color: var(--text-secondary);
-    }
-    .demo-members { background: var(--bg-secondary); border-left: 1px solid var(--border); padding: 10px 8px; }
-    .demo-bars { grid-column: 1 / -1; }
-    .demo-bar {
-      display: flex; align-items: center; gap: 10px;
-      padding: 7px 12px; border-top: 1px solid var(--border);
-      background: var(--bg-secondary); color: var(--text-secondary);
-    }
-    .demo-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--speaking); flex-shrink: 0; }
-    .demo-pill {
-      margin-left: auto; padding: 2px 8px; border-radius: 999px;
-      background: var(--bg-tertiary); color: var(--text-secondary); font-size: 11px;
-    }
-    .demo-user {
-      grid-column: 2; display: flex; align-items: center; gap: 8px;
-      padding: 8px 10px; border-top: 1px solid var(--border); background: var(--bg-tertiary);
-    }
-    .app-demo[data-layout="classic"] .demo-user { display: none; }
-    .shot-grid {
-      margin-top: 28px;
-      display: grid;
-      gap: 26px;
-      grid-template-columns: repeat(auto-fit, minmax(340px, 1fr));
-    }
-    .shot-figure { margin-top: 0; }
-    .shot-figure figcaption {
-      margin-top: 10px;
-      color: var(--text-secondary);
-      font-size: 14px;
-    }
-    .demo-hint {
-      margin-top: 14px;
-      padding: 0 7px;
-      font-size: 11px;
-      line-height: 1.45;
-      color: var(--text-secondary);
-    }
-    .demo-caption { margin-top: 12px; color: var(--text-secondary); font-size: 14px; }
+    .panel + .panel { border-top: 1px solid var(--line); }
+    .js .panel[hidden] { display: none; }
+    @media (max-width: 900px) { .panel { grid-template-columns: minmax(0, 1fr); } }
+    .panel h3 { font: 700 1.75rem/1.1 var(--display); }
+    .panel p { margin-top: 12px; max-width: 60ch; color: var(--ink-2); }
+    p, li { text-wrap: pretty; }
+    .panel .shot { align-self: start; }
+    .panel ul { margin-top: 16px; list-style: none; display: grid; gap: 8px; }
+    .panel li { position: relative; padding-left: 22px; color: var(--ink-2); max-width: 62ch; }
+    .panel li svg { position: absolute; left: 0; top: 0.35em; width: 14px; height: 14px; color: var(--ink-3); }
+    .panel li strong { color: var(--ink); font-weight: 600; }
+
+    /* Key/value rows: a server's settings, read straight off it */
+    .kv { margin-top: 20px; display: grid; grid-template-columns: auto 1fr; border-top: 1px solid var(--line); }
+    .kv dt, .kv dd { padding: 8px 0; border-bottom: 1px solid var(--line); font-size: 0.875rem; }
+    .kv dt { padding-right: 16px; font-family: var(--data); color: var(--ink-3); white-space: nowrap; }
+    .kv dd { color: var(--ink); }
+
+    .layouts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    @media (max-width: 640px) { .layouts { grid-template-columns: 1fr; } }
+
+    /* ── Server rules ── */
+    .rules { width: 100%; border-collapse: collapse; }
+    .rules th { height: 36px; padding: 0 var(--gutter); text-align: left; font: 600 0.8125rem/1 var(--display); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); border-bottom: 1px solid var(--line); }
+    .rules td { padding: 14px var(--gutter); border-bottom: 1px solid var(--line); vertical-align: top; color: var(--ink-2); }
+    .rules td.key { width: 1%; white-space: nowrap; font-family: var(--data); font-size: 0.875rem; color: var(--ink); }
+    .rules td.val { width: 1%; white-space: nowrap; font-family: var(--data); font-size: 0.875rem; color: var(--ink); }
+    .rules td.val.off { color: var(--ink-2); }
     @media (max-width: 720px) {
-      .app-demo[data-layout="modern"] { grid-template-columns: 44px 1.2fr 2fr; }
-      .app-demo[data-layout="classic"] { grid-template-columns: 1.2fr 2fr; }
-      .demo-members { display: none; }
-      .demo-user { grid-column: 2; }
+      .rules thead { display: none; }
+      .rules tr { display: grid; grid-template-columns: 1fr auto; padding: 12px var(--gutter); border-bottom: 1px solid var(--line); }
+      .rules td { padding: 0; border: 0; }
+      .rules td.what { grid-column: 1 / -1; margin-top: 6px; }
     }
+    .rules.where { border-top: 1px solid var(--line); }
+    .rules.where td { width: auto; }
+    .rules.where td.key { width: 1%; }
+    @media (max-width: 720px) {
+      .rules.where tr { grid-template-columns: 1fr; gap: 4px; }
+      .rules.where td:not(.key)::before { color: var(--ink-3); }
+      .rules.where td:nth-child(2)::before { content: "Relay: "; }
+      .rules.where td:nth-child(3)::before { content: "With accounts: "; }
+      .rules.where td:nth-child(4)::before { content: "Your device: "; }
+    }
+    .note { padding: 16px var(--gutter); color: var(--ink-3); font-size: 0.875rem; border-bottom: 1px solid var(--line); }
+
+    /* ── Compared: three servers in the list ── */
+    .compare-wrap { overflow-x: auto; }
+    .scroll-cue { display: none; }
+    @media (max-width: 980px) { .scroll-cue { display: block; flex-basis: 100%; } }
+    .compare { width: 100%; min-width: 980px; border-collapse: collapse; }
+    .compare th, .compare td { height: var(--row); padding: 0 14px; border-bottom: 1px solid var(--line); text-align: left; font-size: 0.875rem; }
+    .compare thead th { font: 600 0.8125rem/1 var(--display); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); }
+    .compare tbody th { font: 700 1.125rem/1 var(--display); white-space: nowrap; position: sticky; left: 0; background: var(--panel); }
+    .compare th:first-child, .compare td:first-child, .clients th:first-child, .clients td:first-child { padding-left: var(--gutter); }
+    .compare th:last-child, .compare td:last-child, .clients th:last-child, .clients td:last-child { padding-right: var(--gutter); }
+    .compare .verdict { white-space: nowrap; }
+    .compare tr.ours th, .compare tr.ours td { background: var(--surface); }
+    .compare td { color: var(--ink-2); }
+    .verdict { display: inline-flex; align-items: center; gap: 6px; }
+    .verdict svg { width: 16px; height: 16px; flex-shrink: 0; stroke-width: 2.5; }
+    .yes svg { color: var(--ink); }
+    .no svg { color: var(--danger); }
+    .part svg { color: var(--warning); }
+
+    /* ── Clients ── */
+    .clients { width: 100%; border-collapse: collapse; }
+    .clients th, .clients td { height: var(--row); padding: 8px 14px; border-bottom: 1px solid var(--line); text-align: left; font-size: 0.875rem; }
+    .clients thead th { font: 600 0.8125rem/1 var(--display); letter-spacing: 0.08em; text-transform: uppercase; color: var(--ink-3); }
+    .clients tbody th { font: 700 1.125rem/1 var(--display); white-space: nowrap; }
+    .clients td { color: var(--ink-2); }
+    .clients td.dl { white-space: nowrap; }
+    .clients td.dl > a + a { margin-left: 6px; }
+    .clients a.get { vertical-align: middle; display: inline-flex; align-items: center; gap: 6px; min-height: 36px; padding: 0 12px; border: 1px solid var(--line); border-radius: 4px; text-decoration: none; font: 600 0.875rem/1 var(--display); color: var(--ink); white-space: nowrap; }
+    .clients a.get:hover { border-color: var(--ink-2); }
+    @media (max-width: 860px) {
+      .clients thead { display: none; }
+      .clients tr { display: grid; grid-template-columns: 1fr auto; gap: 6px 12px; padding: 14px var(--gutter); border-bottom: 1px solid var(--line); }
+      .clients th, .clients td, .clients th:first-child, .clients td:first-child, .clients th:last-child, .clients td:last-child { height: auto; padding: 0; border: 0; }
+      .clients td.cap { grid-column: 1 / -1; }
+      .clients td.cap::before { content: attr(data-label) ": "; color: var(--ink-3); }
+    }
+
+    /* ── Host one: the relay's console ── */
+    .host { display: grid; grid-template-columns: minmax(0, 7fr) minmax(0, 5fr); gap: clamp(20px, 4vw, 40px); padding: clamp(24px, 4vw, 40px) var(--gutter); background: var(--surface); }
+    @media (max-width: 900px) { .host { grid-template-columns: minmax(0, 1fr); } }
+    .console { position: relative; background: var(--deep); border: 1px solid var(--line); border-radius: 8px; }
+    .console pre { padding: 48px 18px 18px; font: 400 0.875rem/1.75 var(--data); color: var(--ink); white-space: pre-wrap; overflow-wrap: anywhere; }
+    .console .c { color: var(--ink-3); }
+    .console .p { color: var(--ink-3); user-select: none; }
+    .copy { position: absolute; top: 8px; right: 8px; display: inline-flex; align-items: center; gap: 6px; min-height: 32px; padding: 0 10px; font: 600 0.875rem/1 var(--display); color: var(--ink-2); background: var(--panel); border: 1px solid var(--line); border-radius: 4px; cursor: pointer; }
+    .copy:hover { color: var(--ink); }
+    .host p { color: var(--ink-2); max-width: 58ch; }
+    .host p + p { margin-top: 12px; }
+
+    /* ── The status bar ── */
+    .statusbar {
+      display: flex; flex-wrap: wrap; gap: 8px 24px; align-items: center;
+      padding: 12px var(--gutter); background: var(--deep); color: var(--ink-3); font-size: 0.875rem;
+    }
+    .statusbar .dot { display: inline-block; width: 8px; height: 8px; margin-right: 8px; border-radius: 50%; background: var(--mint); vertical-align: 1px; }
+    .statusbar a { color: var(--ink-2); }
   </style>
 </head>
 <body>
 
-<nav>
-  <div class="nav-inner">
-    <a class="nav-logo" href="#top"><img src="favicon.png" width="20" height="20" alt="">VoIPC</a>
-    <button class="menu-btn" id="menuBtn" aria-expanded="false" aria-controls="navLinks">Menu</button>
-    <ul class="nav-links" id="navLinks">
-      <li><a href="#features">Features</a></li>
-      <li><a href="#look">Look</a></li>
-      <li><a href="#tech">Tech</a></li>
-      <li><a href="#security">Security</a></li>
-      <li><a href="#compare">Compare</a></li>
-      <li><a href="#download">Download</a></li>
-      <li><a href="https://github.com/luki4fun/voipc">GitHub</a></li>
-    </ul>
-  </div>
-</nav>
+<!-- One icon set, drawn, in one stroke (no emoji, no glyph stand-ins) -->
+<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="i-lock" viewBox="0 0 24 24"><rect x="4" y="11" width="16" height="10" rx="2"/><path d="M8 11V7a4 4 0 0 1 8 0v4"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></symbol>
+  <symbol id="i-check" viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></symbol>
+  <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6 6 18M6 6l12 12"/></symbol>
+  <symbol id="i-part" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 3v18" /></symbol>
+  <symbol id="i-down" viewBox="0 0 24 24"><path d="M12 4v12m0 0-5-5m5 5 5-5M5 20h14"/></symbol>
+  <symbol id="i-gh" viewBox="0 0 24 24"><path d="M9 19c-4 1.5-4-2-6-2.5m12 5v-3.5a3 3 0 0 0-1-2.3c3.2-.4 6.5-1.6 6.5-7a5.4 5.4 0 0 0-1.5-3.8 5 5 0 0 0-.1-3.8s-1.2-.4-3.9 1.5a13.4 13.4 0 0 0-7 0C6.3 1.7 5.1 2.1 5.1 2.1a5 5 0 0 0-.1 3.8A5.4 5.4 0 0 0 3.5 9.7c0 5.4 3.3 6.6 6.5 7a3 3 0 0 0-1 2.3V22"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="12" height="12" rx="2"/><path d="M5 15V5a2 2 0 0 1 2-2h10"/></symbol>
+  <symbol id="i-mic" viewBox="0 0 24 24"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v3"/></symbol>
+  <symbol id="i-screen" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></symbol>
+  <symbol id="i-chat" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+  <symbol id="i-radar" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><circle cx="12" cy="12" r="5"/><circle cx="12" cy="12" r="1"/></symbol>
+  <symbol id="i-layout" viewBox="0 0 24 24"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18M3 9h6"/></symbol>
+  <symbol id="i-caret" viewBox="0 0 20 20"><path d="M6 3l8 7-8 7z"/></symbol>
+</svg>
 
-<section id="top">
-  <div class="container hero-grid">
-    <div>
-      <p class="hero-meta"><a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">v1.0.0</a> · MIT · Linux / Windows / Android / Browser</p>
-      <h1>Voice, screen sharing, and chat — on a server you run.</h1>
-      <p class="hero-sub">VoIPC is an open-source alternative to Discord and TeamSpeak. Messages are encrypted with the Signal Protocol, voice and video with AES-256-GCM, and by default the relay server keeps nothing: no accounts, no database, no logs. Turn on accounts and it keeps a database of them, and end-to-end-encrypted copies of messages for members who want them.</p>
-      <div class="hero-buttons">
-        <a class="btn btn-primary" href="https://github.com/luki4fun/voipc/releases/latest">Download</a>
-        <a class="btn btn-outline" href="https://github.com/luki4fun/voipc">Source</a>
+<div class="window">
+  <header class="titlebar">
+    <img src="favicon.png" width="28" height="28" alt="">
+    <span class="title">VoIPC</span>
+    <span class="sub">server browser</span>
+    <span class="spacer"></span>
+    <a class="gh" href="https://github.com/luki4fun/voipc"><svg class="icon"><use href="#i-gh"/></svg>Source</a>
+  </header>
+
+  <nav class="tabs" aria-label="Sections">
+    <a href="#top">Servers</a>
+    <a href="#info">Server info</a>
+    <a href="#rules">Rules</a>
+    <a href="#compare">Compared</a>
+    <a href="#clients">Clients</a>
+    <a href="#host">Host one</a>
+  </nav>
+
+  <main>
+    <section id="top" aria-labelledby="hero-title">
+      <div class="refresh">
+        <table class="list">
+          <caption class="sr-only">The public demo server, selected and opened</caption>
+          <thead>
+            <tr>
+              <th class="flag sel" scope="col"><span class="sr-only">Selected</span></th>
+              <th class="flag" scope="col"><svg class="icon" aria-hidden="true"><use href="#i-lock"/></svg><span class="sr-only">Password</span></th>
+              <th class="flag" scope="col"><svg class="icon" aria-hidden="true"><use href="#i-shield"/></svg><span class="sr-only">End-to-end encrypted</span></th>
+              <th scope="col">Server</th>
+              <th class="mode" scope="col">Running</th>
+              <th class="players" scope="col">Players</th>
+              <th class="ping" scope="col">Ping</th>
+              <th class="go" scope="col"><span class="sr-only">Join</span></th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr class="selected">
+              <td class="flag sel"><svg class="caret" aria-hidden="true"><use href="#i-caret"/></svg></td>
+              <td class="flag"></td>
+              <td class="flag live"><svg class="icon" role="img" aria-label="End-to-end encrypted"><use href="#i-shield"/></svg></td>
+              <td class="name"><b>ivy.l4f.cc<span class="port">:9987</span></b><small>the public demo, run by the VoIPC project: try it</small></td>
+              <td class="mode">Voice · Share · Chat · Files</td>
+              <td class="players num" title="A relay publishes no count of who is on it">—</td>
+              <td class="ping num live" data-ping="https://ivy.l4f.cc:9987/wt.json" title="Measured from your browser">—</td>
+              <td class="go"><a class="row-join" id="join" href="https://github.com/luki4fun/voipc/releases/latest"><span id="join-label">Join</span><span class="join-os" id="join-os"></span></a></td>
+            </tr>
+            <!-- The selected server, opened: what it is, what it shows, how to get in -->
+            <tr class="expansion">
+              <td colspan="8">
+                <div class="detail">
+                  <h1 id="hero-title">Voice, screen sharing and chat — on a server you run.</h1>
+                  <p class="lead">An open-source alternative to Discord and TeamSpeak. The relay forwards what it cannot read: Signal Protocol for messages, AES-256-GCM for voice and video. Without accounts it keeps nothing past a restart.</p>
+                  <div class="detail-body">
+                    <figure class="shot preview">
+                      <picture>
+                        <!-- On a phone, the app as a phone shows it -->
+                        <source media="(max-width: 600px)" type="image/webp" srcset="screenshots/phone-stage-390.webp 390w, screenshots/phone-stage-780.webp 780w" sizes="100vw">
+                        <source type="image/webp" srcset="screenshots/stage-960.webp 960w, screenshots/stage-1920.webp 1920w" sizes="(max-width: 900px) 100vw, 720px">
+                        <img src="screenshots/stage.png" width="2560" height="1600" fetchpriority="high"
+                          alt="The VoIPC app's Stage layout: Mira, Tom and Lena in the Lounge as large tiles, a mint ring around Tom who is talking, the voice controls docked underneath">
+                      </picture>
+                      <figcaption>The Stage layout: three in the Lounge, Tom talking.</figcaption>
+                    </figure>
+                    <dl class="kv server-kv">
+                      <dt>server</dt><dd>a public demo, open to anyone, for trying VoIPC; for your group, run your own (<a href="#host">Host one</a>)</dd>
+                      <dt>encryption</dt><dd>Signal Protocol · AES-256-GCM</dd>
+                      <dt>linux</dt><dd><a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1/VoIPC_1.3.1_amd64.AppImage">AppImage</a> · <a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1/VoIPC_1.3.1_amd64.deb">.deb</a></dd>
+                      <dt>windows</dt><dd><a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1/VoIPC_1.3.1_x64-setup.exe">installer</a></dd>
+                      <dt>android</dt><dd><a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1/VoIPC-android-1.3.1.apk">APK</a></dd>
+                      <dt>browser</dt><dd>nothing to install: <a href="https://ivy.l4f.cc:9987/">open the demo</a>; any VoIPC server opens the same way, on its port 9987</dd>
+                      <dt>version</dt><dd class="num">1.3.1 · <a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">changelog</a></dd>
+                      <dt>from 1.0</dt><dd><strong>update the server first.</strong> 1.3 apps and 1.0 servers do not connect, and the 1.0 desktop app offers the update everywhere: on a server still on 1.0, wait.</dd>
+                    </dl>
+                  </div>
+                </div>
+              </td>
+            </tr>
+          </tbody>
+        </table>
       </div>
-    </div>
-    <img class="screenshot" src="screenshots/main-window.png" width="1280" height="800" alt="VoIPC in the Modern layout: server rail, channels with the people in each of them, chat in the middle, members on the right" fetchpriority="high">
-  </div>
-</section>
+      <p class="list-note">One server here: the public demo, run by the VoIPC project for trying it out. Every other VoIPC server is run by its own group; there is no list of them, and no VoIPC server in the middle.</p>
+    </section>
 
-<section id="features">
-  <div class="container">
-    <h2>What it does</h2>
-    <p class="section-sub">Three things, done properly: talking, showing your screen, and writing — all encrypted end to end.</p>
-
-    <div class="feature-row">
-      <div>
-        <h3>Voice</h3>
-        <p>Opus at 48&nbsp;kHz in 20&nbsp;ms frames, tuned for speech. RNNoise machine-learning noise suppression runs on-device.</p>
-        <ul>
-          <li>Push-to-talk, voice activation, or always-on — with system-wide PTT and mute/deafen hotkeys</li>
-          <li>In-band FEC rebuilds a lost packet from the one that follows it</li>
-          <li>Adaptive jitter buffer grows 40 → 160 ms only when the network needs it</li>
-          <li>Per-user volume, 0–400% mic gain, mic test in settings</li>
-        </ul>
+    <section id="info" aria-labelledby="info-title">
+      <div class="bumper"><h2 id="info-title">Server info</h2><p>Three things, done properly: talking, showing your screen, writing.</p></div>
+      <div class="info-tabs" role="tablist" aria-label="What it does">
+        <button role="tab" id="t-voice" aria-controls="p-voice" aria-selected="true"><svg class="icon" aria-hidden="true"><use href="#i-mic"/></svg>Voice</button>
+        <button role="tab" id="t-share" aria-controls="p-share" aria-selected="false"><svg class="icon" aria-hidden="true"><use href="#i-screen"/></svg>Screen sharing</button>
+        <button role="tab" id="t-chat" aria-controls="p-chat" aria-selected="false"><svg class="icon" aria-hidden="true"><use href="#i-chat"/></svg>Chat &amp; servers</button>
+        <button role="tab" id="t-prox" aria-controls="p-prox" aria-selected="false"><svg class="icon" aria-hidden="true"><use href="#i-radar"/></svg>Proximity &amp; games</button>
+        <button role="tab" id="t-look" aria-controls="p-look" aria-selected="false"><svg class="icon" aria-hidden="true"><use href="#i-layout"/></svg>Three layouts</button>
       </div>
-      <img class="screenshot" src="screenshots/settings-audio.png" width="1280" height="800" alt="VoIPC settings: audio devices, mic test, push-to-talk and global hotkeys" loading="lazy">
-    </div>
 
-    <div class="feature-row">
-      <div>
-        <h3>Screen sharing</h3>
-        <p>H.264 encoded on your GPU — NVENC, QuickSync, or AMF, with software fallback. Every viewer can watch it, browsers included; H.265 is one setting away when everyone is on a desktop client. Windows builds ship the hardware encoders since 0.4.0.</p>
-        <ul>
-          <li>480p / 720p / 1080p at 30 or 60 fps, 1.5–7.5 Mbps</li>
-          <li>Share from a browser too — Chromium encodes H.264, Firefox VP9</li>
-          <li>Desktop audio comes along, as 64 kbps Opus</li>
-          <li>Watch fullscreen or in a pop-out window; chat stays visible</li>
-          <li>1280-byte packets — fits inside WireGuard and OpenVPN tunnels</li>
-          <li>Capture via PipeWire portal on Linux, Windows.Graphics.Capture on Windows</li>
-        </ul>
+      <div class="panel" id="p-voice" role="tabpanel" aria-labelledby="t-voice">
+        <div>
+          <h3>Voice</h3>
+          <p>Opus at 48&nbsp;kHz in 20&nbsp;ms frames, tuned for speech. RNNoise noise suppression runs on your device, and echo cancellation on the desktop and on Android.</p>
+          <ul>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg>Push to talk, voice activation or always on, with system-wide push-to-talk and mute/deafen hotkeys</li>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg>In-band FEC rebuilds a lost packet from the one that follows it</li>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg>An adaptive jitter buffer grows from 40 to 160&nbsp;ms only when the network needs it</li>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg>Per-person volume, 0–400% microphone gain, a mixing desk with effects per lane</li>
+          </ul>
+          <dl class="kv">
+            <dt>codec</dt><dd>Opus, 48&nbsp;kHz mono, 20&nbsp;ms, 48&nbsp;kbps, DTX</dd>
+            <dt>loss repair</dt><dd>in-band FEC, then concealment</dd>
+            <dt>audio i/o</dt><dd>ALSA · WASAPI · Oboe (Android)</dd>
+          </dl>
+        </div>
+        <figure class="shot">
+          <picture>
+            <source type="image/webp" srcset="screenshots/mixer-960.webp 960w, screenshots/mixer-1920.webp 1920w" sizes="(max-width: 900px) 100vw, 680px">
+            <img src="screenshots/mixer.png" width="2560" height="1600" loading="lazy" alt="The mixing desk during a call: a strip per person with a level meter and a fader, and effects per lane">
+          </picture>
+          <figcaption>The mixing desk: a strip per person, effects per lane.</figcaption>
+        </figure>
       </div>
-      <img class="screenshot" src="screenshots/screenshare.png" width="1280" height="800" alt="VoIPC screen share viewer with stream stats and chat below" loading="lazy">
-    </div>
 
-    <div class="feature-row">
-      <div>
-        <h3>Chat &amp; servers</h3>
-        <p>Channel messages and DMs ride the Signal Protocol — the server relays ciphertext it cannot read. History is optional and kept on your disk, encrypted. A server with accounts can also hold end-to-end-encrypted copies for you, if you choose.</p>
-        <ul>
-          <li>Saved servers in the connect dialog; optional auto-connect</li>
-          <li>Password-protected channels, invites, pokes (encrypted too)</li>
-          <li>Local history vault: PBKDF2 + AES-256-GCM, or skip it entirely</li>
-          <li>Persistent rooms via a <code>channels.json</code> on the server</li>
-          <li>System tray and desktop notifications for DMs and pokes</li>
-        </ul>
+      <div class="panel" id="p-share" role="tabpanel" aria-labelledby="t-share">
+        <div>
+          <h3>Screen sharing</h3>
+          <p>H.264 encoded on your graphics card (NVENC, QuickSync or AMF), with a software fallback. Every client can watch, browsers included; H.265 is one setting away when everyone is on a desktop client.</p>
+          <ul>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg>480p, 720p or 1080p at 30 or 60&nbsp;fps, 1.5–7.5&nbsp;Mbps, adapting to what the link carries</li>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg>Share from a browser too: Chromium encodes H.264, Firefox VP9</li>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg>Desktop audio comes along, as 64&nbsp;kbps Opus</li>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg>Watch it big with the chat beside it, pop it out, or pinch to zoom on a phone</li>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg>1280-byte packets: it fits inside WireGuard and OpenVPN tunnels</li>
+          </ul>
+          <dl class="kv">
+            <dt>capture</dt><dd>PipeWire portal · Windows.Graphics.Capture · getDisplayMedia</dd>
+            <dt>decode</dt><dd>FFmpeg · AMediaCodec (Android) · WebCodecs</dd>
+          </dl>
+        </div>
+        <figure class="shot">
+          <picture>
+            <source type="image/webp" srcset="screenshots/share-960.webp 960w, screenshots/share-1920.webp 1920w" sizes="(max-width: 900px) 100vw, 680px">
+            <img src="screenshots/share.png" width="2560" height="1600" loading="lazy" alt="Watching Tom's shared screen, a code editor, with the people in the call in a strip underneath">
+          </picture>
+          <figcaption>Watching a share: the people stay in a strip under it.</figcaption>
+        </figure>
       </div>
-      <img class="screenshot" src="screenshots/connect.png" width="1280" height="800" alt="VoIPC connect dialog with saved servers" loading="lazy">
-    </div>
 
-    <div class="feature-row">
-      <div>
-        <h3>Proximity chat</h3>
-        <p>A channel can place voices in space: 2D on a floor plan, or 3D with height. Distance makes a voice quieter, direction moves it left or right, and a wall muffles it — the same maths Mumble and TeamSpeak use, done on your own machine.</p>
-        <ul>
-          <li>Virtual room: arrange everyone yourself, or share your own position with the channel</li>
-          <li>Presets for a round table, a class room with a presenter, or a line</li>
-          <li>Positions are encrypted with the channel key like voice — the server relays them blind</li>
-          <li>Off, 2D or 3D per channel; operators can switch the feature off server-wide</li>
-          <li><strong>Game SDK</strong>: a game mod can drive the positions over a local socket — the open
-            alternative to the TeamSpeak plugins RP servers install today, with no plugin and no license server.
-            Thirteen radio and phone chains, a ready-made FiveM resource with radio and calls built in</li>
-          <li><strong>One speaker, heard several ways at once</strong>: a colleague two metres away who keys
-            their radio arrives twice — over the air and as themselves — because a player can carry extra
-            renders, each with its own placement, chain, ear and delay. No TeamSpeak plugin can do that</li>
-          <li>What a game may do <em>to</em> you is yours to allow: broadcasting your position and pressing
-            your push-to-talk are separate switches, both off by default, and a game leaving somebody out of
-            your mix greys them out in the member list rather than happening quietly</li>
-        </ul>
+      <div class="panel" id="p-chat" role="tabpanel" aria-labelledby="t-chat">
+        <div>
+          <h3>Chat &amp; servers</h3>
+          <p>Channel messages and direct messages ride the Signal Protocol: the relay passes on ciphertext it cannot read. History is optional and kept on your own disk, encrypted. A server with accounts can also keep end-to-end-encrypted copies for you, if you choose.</p>
+          <ul>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg>Several servers open at once; text channels are subscriptions, voice is one channel at a time</li>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg>Password-protected channels, invites and pokes, encrypted too</li>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg>Messages that delete themselves after a while, per channel or per conversation</li>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg>Files and pictures, sealed on your device; nothing downloads until you press Load</li>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg>Replies, threads, Markdown, reactions, and editing what you wrote</li>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg>Persistent rooms from a <code>channels.json</code> on the server</li>
+          </ul>
+        </div>
+        <figure class="shot">
+          <picture>
+            <source type="image/webp" srcset="screenshots/modern-960.webp 960w, screenshots/modern-1920.webp 1920w" sizes="(max-width: 900px) 100vw, 680px">
+            <img src="screenshots/modern.png" width="2560" height="1600" loading="lazy" alt="The Modern layout: servers on the left, channels with the people in them, an encrypted conversation, members on the right">
+          </picture>
+        </figure>
       </div>
-    </div>
 
-    <div class="also">
-      <h3>Also in the box</h3>
-      <ul>
-        <li>Voice quality indicator: live ping and packet-loss in the status bar</li>
-        <li>Audio device hot-recovery when a headset dies mid-call</li>
-        <li>One QUIC connection per client — migration survives NAT rebinds and Wi-Fi roams</li>
-        <li>Auto-reconnect keeps trying for 5 minutes after sleep or a server restart</li>
-        <li>Screen share adapts bitrate and fps to what the link can carry</li>
-        <li>Android client: voice and screen-share viewing on the go</li>
-        <li>Invite links that open the browser client straight into a channel</li>
-        <li>Admin sessions via a server token: kick and IP-ban, no accounts needed (with accounts: admin and moderator roles, behind two-factor codes)</li>
-        <li>IPv6 dual-stack, TOFU certificate pinning for self-signed certs</li>
-      </ul>
-    </div>
-  </div>
-</section>
+      <div class="panel" id="p-prox" role="tabpanel" aria-labelledby="t-prox">
+        <div>
+          <h3>Proximity &amp; games</h3>
+          <p>A channel can place voices in space: 2D on a floor plan, or 3D with height. Distance makes a voice quieter, direction moves it left or right, a wall muffles it: the same maths Mumble and TeamSpeak use, done on your own machine. Positions are encrypted with the channel key like voice, so the relay passes them on blind.</p>
+          <ul>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg><strong>A virtual room:</strong> arrange everyone yourself, or share your own position with the channel; presets for a round table, a class room, a line</li>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg><strong>A game SDK:</strong> a mod drives positions over a local socket, with thirteen radio and phone chains and a ready-made FiveM resource with radio and calls</li>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg><strong>One speaker, heard several ways:</strong> a colleague two metres away who keys a radio arrives twice, over the air and as themselves</li>
+            <li><svg aria-hidden="true"><use href="#i-check"/></svg><strong>Yours to allow:</strong> broadcasting your position and pressing your push to talk are separate switches, both off by default</li>
+          </ul>
+        </div>
+        <dl class="kv">
+          <dt>modes</dt><dd>off, 2D or 3D per channel; operators can switch it off server-wide</dd>
+          <dt>sdk</dt><dd>a local socket, no plugin and no licence server</dd>
+          <dt>docs</dt><dd><a href="https://github.com/luki4fun/voipc/blob/main/docs/SDK.md">docs/SDK.md</a> · <a href="https://github.com/luki4fun/voipc/blob/main/docs/GAMES.md">docs/GAMES.md</a></dd>
+        </dl>
+      </div>
 
-<section id="look">
-  <div class="container">
-    <h2>Two layouts, four palettes</h2>
-    <p class="section-sub">The same app underneath. Switch them here — this is a real, live preview drawn with the client's own colour tokens, not a picture of one.</p>
-
-    <div class="look-controls">
-      <div class="control-group">
-        <span class="control-label" id="layoutLabel">Layout</span>
-        <div class="control-row" role="group" aria-labelledby="layoutLabel">
-          <button class="seg" type="button" data-layout="modern" aria-pressed="true">Modern</button>
-          <button class="seg" type="button" data-layout="classic" aria-pressed="false">Classic</button>
+      <div class="panel" id="p-look" role="tabpanel" aria-labelledby="t-look">
+        <div>
+          <h3>Three layouts, one app</h3>
+          <p><strong>Modern</strong> is what a new install starts in. <strong>Classic</strong> is the arrangement VoIPC always had. <strong>Stage</strong> puts the call in the middle. Switch any time in Settings; every colour can be changed one by one, and a palette has to clear WCAG AA in the unit tests before it ships.</p>
+        </div>
+        <div class="layouts">
+          <figure class="shot">
+            <picture>
+              <source type="image/webp" srcset="screenshots/modern-960.webp 960w" sizes="320px">
+              <img src="screenshots/modern.png" width="2560" height="1600" loading="lazy" alt="Modern layout">
+            </picture>
+            <figcaption>Modern</figcaption>
+          </figure>
+          <figure class="shot">
+            <picture>
+              <source type="image/webp" srcset="screenshots/classic-960.webp 960w" sizes="320px">
+              <img src="screenshots/classic.png" width="2560" height="1600" loading="lazy" alt="Classic layout: channels left, members right, voice and status bars along the bottom">
+            </picture>
+            <figcaption>Classic</figcaption>
+          </figure>
+          <figure class="shot">
+            <picture>
+              <source type="image/webp" srcset="screenshots/stage-960.webp 960w" sizes="320px">
+              <img src="screenshots/stage.png" width="2560" height="1600" loading="lazy" alt="Stage layout: the call in the middle">
+            </picture>
+            <figcaption>Stage</figcaption>
+          </figure>
         </div>
       </div>
-      <div class="control-group">
-        <span class="control-label" id="paletteLabel">Palette</span>
-        <div class="control-row" role="group" aria-labelledby="paletteLabel">
-          <button class="swatch" type="button" data-palette="voipc-dark" aria-pressed="false"
-            style="--sw-a: #16213e; --sw-b: #1a1a2e; --sw-c: #4a9eff">
-            <span class="swatch-chip" aria-hidden="true"></span>VoIPC dark
-          </button>
-          <button class="swatch" type="button" data-palette="slate-dark" aria-pressed="true"
-            style="--sw-a: #2b2d31; --sw-b: #313338; --sw-c: #7983f5">
-            <span class="swatch-chip" aria-hidden="true"></span>Slate dark
-          </button>
-          <button class="swatch" type="button" data-palette="slate-light" aria-pressed="false"
-            style="--sw-a: #f2f3f5; --sw-b: #ffffff; --sw-c: #5865f2">
-            <span class="swatch-chip" aria-hidden="true"></span>Slate light
-          </button>
-          <button class="swatch" type="button" data-palette="amoled" aria-pressed="false"
-            style="--sw-a: #0a0a0a; --sw-b: #000000; --sw-c: #5865f2">
-            <span class="swatch-chip" aria-hidden="true"></span>AMOLED black
-          </button>
-        </div>
-      </div>
-    </div>
+    </section>
 
-    <div class="app-demo" id="appDemo" data-layout="modern" data-palette="slate-dark" role="img"
-         aria-label="A preview of the VoIPC client: channel sidebar, chat in the middle, member list on the right">
-      <div class="demo-rail" aria-hidden="true">
-        <span class="demo-server">V</span>
-        <span class="demo-server ghost">+</span>
-      </div>
-
-      <div class="demo-side">
-        <div class="demo-side-title">Text channels</div>
-        <div class="demo-row"># chat<span class="count">4</span></div>
-        <div class="demo-row"># offtopic<span class="count">2</span></div>
-        <div class="demo-side-title">Voice channels</div>
-        <div class="demo-row active">🔊 Lounge<span class="count">2</span></div>
-        <div class="demo-nested"><span class="demo-av" style="background:#ff5c8a">M</span>Mira</div>
-        <div class="demo-nested"><span class="demo-av" style="background:#ffd166">T</span>Tom</div>
-        <div class="demo-row">🔊 Gaming<span class="count">1</span></div>
-        <div class="demo-nested"><span class="demo-av" style="background:#f4a261">A</span>Ada</div>
-        <div class="demo-row">🔊 AFK<span class="count">0</span></div>
-      </div>
-
-      <div class="demo-main">
-        <div class="demo-head"># Lounge</div>
-        <div class="demo-msgs">
-          <div class="demo-msg">
-            <span class="demo-av" style="background:#ffd166">T</span>
-            <div><span class="demo-who">Tom</span><div class="demo-text">anyone up for a round after this?</div></div>
-          </div>
-          <div class="demo-msg">
-            <span class="demo-av" style="background:#ff5c8a">M</span>
-            <div><span class="demo-who self">Mira</span><div class="demo-text">give me ten minutes, finishing a build</div></div>
-          </div>
-          <div class="demo-msg">
-            <span class="demo-av" style="background:#f4a261">A</span>
-            <div><span class="demo-who">Ada</span><div class="demo-text">the server can't read any of this, by the way</div></div>
-          </div>
-        </div>
-        <div class="demo-input">Message #Lounge…</div>
-      </div>
-
-      <div class="demo-members">
-        <div class="demo-side-title">In voice — 2</div>
-        <div class="demo-row"><span class="demo-av" style="background:#ff5c8a">M</span>Mira</div>
-        <div class="demo-row"><span class="demo-av" style="background:#ffd166">T</span>Tom</div>
-        <p class="demo-hint">Click a channel to look, join from the chat pane. Both layouts.</p>
-      </div>
-
-      <div class="demo-user">
-        <span class="demo-av" style="background:#ff5c8a">M</span>
-        <span>Mira<br><span style="color:var(--text-secondary)">Connected</span></span>
-      </div>
-
-      <div class="demo-bars">
-        <div class="demo-bar"><span class="demo-dot"></span>Push to talk<span class="demo-pill">#Lounge</span></div>
-        <div class="demo-bar">Connected<span class="demo-pill">12 ms</span></div>
-      </div>
-    </div>
-
-    <p class="demo-caption">Modern is what a new install starts in. Classic is the arrangement VoIPC has always had, one click away in Settings. Every colour in either can be changed one by one, and a palette has to clear WCAG AA in the unit tests before it ships.</p>
-
-    <div class="shot-grid">
-      <figure class="shot-figure">
-        <img class="screenshot" src="screenshots/text-channels.png" width="1280" height="800" alt="VoIPC in the Modern layout: text channels in the sidebar, an encrypted conversation, and the member list of the text channel" loading="lazy">
-        <figcaption>Modern, VoIPC dark. Text channels are a subscription, not a move: you read and write in several while staying in the voice channel you are in.</figcaption>
-      </figure>
-      <figure class="shot-figure">
-        <img class="screenshot" src="screenshots/modern-light.png" width="1280" height="800" alt="The same window in the Slate light palette: a light interface with the same channels, conversation and member list" loading="lazy">
-        <figcaption>The same window in Slate light — one of four palettes, each of which has to clear WCAG AA before it ships.</figcaption>
-      </figure>
-      <figure class="shot-figure">
-        <img class="screenshot" src="screenshots/classic-layout.png" width="1280" height="800" alt="VoIPC in the Classic layout: channels on the left, members on the right, voice and status bars along the bottom" loading="lazy">
-        <figcaption>Classic: channels left, members right, voice and status bars along the bottom. The arrangement VoIPC has always had.</figcaption>
-      </figure>
-      <figure class="shot-figure">
-        <img class="screenshot" src="screenshots/appearance.png" width="1280" height="800" alt="Settings, Appearance tab: the two layout cards, the four palettes, and the per-colour editor" loading="lazy">
-        <figcaption>Settings → Appearance. Switch layout, switch palette, or change any of the seventeen colours one by one.</figcaption>
-      </figure>
-    </div>
-  </div>
-</section>
-
-<section id="tech">
-  <div class="container">
-    <h2>Under the hood</h2>
-    <p class="section-sub">Rust end to end: Tokio server, Tauri 2 client with a Svelte 5 frontend. Numbers below are from the code, not the brochure.</p>
-    <div class="spec-cards">
-      <div class="spec-card">
-        <h3>Audio</h3>
-        <dl>
-          <dt>Codec</dt><dd>Opus, 48 kHz mono, 20 ms frames, 48 kbps, DTX</dd>
-          <dt>Denoise</dt><dd>RNNoise (nnnoiseless), on-device</dd>
-          <dt>Loss repair</dt><dd>Opus in-band FEC, then concealment</dd>
-          <dt>Jitter buffer</dt><dd>Adaptive, 40–160 ms target delay</dd>
-          <dt>Mixing</dt><dd>Clocked 20 ms mixer, per-user gain</dd>
-          <dt>I/O</dt><dd>cpal: ALSA / WASAPI / Oboe (Android)</dd>
-        </dl>
-      </div>
-      <div class="spec-card">
-        <h3>Video</h3>
-        <dl>
-          <dt>Codec</dt><dd>H.264 by default, H.265 optional (FFmpeg); browsers also send VP9/VP8</dd>
-          <dt>Encoders</dt><dd>NVENC → QuickSync → AMF → libx264/libx265; WebCodecs in the browser</dd>
-          <dt>Modes</dt><dd>480p/720p/1080p · 30/60 fps · 1.5–7.5 Mbps</dd>
-          <dt>Keyframes</dt><dd>2 s GOP, VBV-capped; bitrate steps down on viewer loss</dd>
-          <dt>Capture</dt><dd>PipeWire + XDG portal · Windows.Graphics.Capture</dd>
-          <dt>Decode</dt><dd>FFmpeg desktop · AMediaCodec on Android · WebCodecs in the browser</dd>
-        </dl>
-      </div>
-      <div class="spec-card">
-        <h3>Protocol</h3>
-        <dl>
-          <dt>Version</dt><dd>v12, postcard binary serialization</dd>
-          <dt>Control</dt><dd>QUIC stream, TLS 1.3 (rustls), max 64 KiB/msg</dd>
-          <dt>Media</dt><dd>QUIC datagrams (voice ≤ 512 B), one stream per video frame</dd>
-          <dt>Headers</dt><dd>15 B voice · 21 B video (encrypted)</dd>
-          <dt>Port</dt><dd>9987 UDP (QUIC) + TCP (browser page, opt-in TCP fallback where UDP is blocked)</dd>
-          <dt>Network</dt><dd>IPv6 dual-stack, QUIC connection migration</dd>
-        </dl>
-      </div>
-      <div class="spec-card">
-        <h3>Server</h3>
-        <dl>
-          <dt>Runtime</dt><dd>Tokio, single static binary, SFU relay</dd>
-          <dt>State</dt><dd>Memory only by default — restart wipes everything; opt-in accounts keep a SQLite or Postgres database</dd>
-          <dt>Defaults</dt><dd>64 users, 50 channels, auto-cleanup</dd>
-          <dt>Limits</dt><dd>144 connections by default (2 × max users + 16), 32 per IP, token-bucket rates</dd>
-          <dt>Rooms</dt><dd>Optional persistent <code>channels.json</code></dd>
-          <dt>Secrets</dt><dd>Channel passwords zeroized on drop; with accounts, a key file seals the two-factor secrets</dd>
-        </dl>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section id="security">
-  <div class="container">
-    <h2>Security</h2>
-    <p class="section-sub">Five layers, from the TLS socket to the file on your disk. The server forwards ciphertext it cannot read.</p>
-
-    <div class="layer">
-      <div class="layer-num">1</div>
-      <div>
-        <h3>Transport — TLS everywhere</h3>
-        <ul>
-          <li>Everything rides one QUIC connection with TLS 1.3 via rustls; there is no plaintext transport</li>
-          <li>Self-signed certs are pinned on first connect (TOFU) — a changed fingerprint aborts the handshake</li>
-        </ul>
-      </div>
-    </div>
-
-    <div class="layer">
-      <div class="layer-num">2</div>
-      <div>
-        <h3>Messages — Signal Protocol</h3>
-        <ul>
-          <li>X3DH session setup, Double Ratchet, per-message keys, forward secrecy, except for copies kept on a server with accounts</li>
-          <li>Curve25519 identity keys, Ed25519-signed pre-keys, 100 one-time pre-keys auto-replenished</li>
-          <li>Sender keys for channel messages; the official libsignal crate does the crypto</li>
-        </ul>
-      </div>
-    </div>
-
-    <div class="layer">
-      <div class="layer-num">3</div>
-      <div>
-        <h3>Media — AES-256-GCM per packet</h3>
-        <ul>
-          <li>Random per-channel 256-bit keys, distributed through pairwise Signal sessions</li>
-          <li>Deterministic nonces, domain-separated per stream type — reuse is impossible by construction</li>
-          <li>AAD binds channel and packet type against cross-channel replay; keys rotate before counter exhaustion</li>
-        </ul>
-      </div>
-    </div>
-
-    <div class="layer">
-      <div class="layer-num">4</div>
-      <div>
-        <h3>At rest — your vault, your password</h3>
-        <ul>
-          <li>Chat history: PBKDF2-HMAC-SHA256 at 600,000 iterations + AES-256-GCM, fresh salt and nonce per file</li>
-          <li>No Signal session state is ever written to disk; key material is held in <code>Zeroizing&lt;T&gt;</code>, wiped from memory on drop</li>
-        </ul>
-      </div>
-    </div>
-
-    <div class="layer">
-      <div class="layer-num">5</div>
-      <div>
-        <h3>Server — blind by design</h3>
-        <ul>
-          <li>Never sees plaintext messages, never decodes media, and without accounts never writes to disk</li>
-          <li>Without accounts, restart equals clean slate: there is nothing to seize, leak, or subpoena</li>
-          <li>With accounts there is a database: names, sign-ins, who wrote where and when, and ciphertext it cannot open</li>
-        </ul>
-      </div>
-    </div>
-
-    <p class="audit-note">VoIPC has not had an independent security audit. The code is MIT-licensed and small enough to read — <a href="https://github.com/luki4fun/voipc">audit it yourself</a>.</p>
-  </div>
-</section>
-
-<section id="transparency">
-  <div class="container">
-    <h2>What lives where</h2>
-    <p class="section-sub">Exactly what is stored, and by whom. No fine print.</p>
-    <div class="trans-grid">
-      <div class="trans-card">
-        <h3 class="mid">Server keeps (RAM only, without accounts)</h3>
-        <ul>
-          <li>Usernames &amp; channel membership while connected</li>
-          <li>Channel names and hashed passwords</li>
-          <li>Connection addresses during the session</li>
-          <li>Encrypted media keys and pre-key bundles</li>
-        </ul>
-      </div>
-      <div class="trans-card">
-        <h3 class="mid">With accounts (opt-in), on disk</h3>
-        <ul>
-          <li>Account names and roles; a hash of a password-derived secret</li>
-          <li>Public identity and device keys; sealed two-factor secrets</li>
-          <li>Sign-in records, with addresses hashed</li>
-          <li>Vaults and kept messages it cannot open</li>
-          <li>Who wrote where, when and how much; which channels each account keeps</li>
-        </ul>
-      </div>
-      <div class="trans-card">
-        <h3 class="no">Server never sees</h3>
-        <ul>
-          <li>Message contents</li>
-          <li>Voice, video, or screen content</li>
-          <li>Chat history</li>
-          <li>Your private keys</li>
-        </ul>
-      </div>
-      <div class="trans-card">
-        <h3>Your device stores</h3>
-        <ul>
-          <li>Encrypted chat history (optional)</li>
-          <li>Audio/video settings, saved servers</li>
-          <li>Max 500 messages per channel, rotated</li>
-          <li>With an account: a remembered device's key and your vault's key</li>
-        </ul>
-      </div>
-      <div class="trans-card">
-        <h3 class="ok">Nobody stores</h3>
-        <ul>
-          <li>Analytics or telemetry — there is none</li>
-          <li>Accounts or profiles — unless the operator turns accounts on</li>
-          <li>Server-side message logs — only encrypted copies members choose</li>
-          <li>Anything after a restart, on a server without accounts</li>
-        </ul>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section id="architecture">
-  <div class="container">
-    <h2>Architecture</h2>
-    <p class="section-sub">One QUIC connection per client: a control stream, media datagrams, and a stream per video frame. The server is a selective forwarding unit — it routes packets, it doesn't read them.</p>
-    <div class="arch">
-      <div class="arch-node">
-        <h3>Client A</h3>
-        <p>Tauri 2 · Rust + Svelte 5</p>
-      </div>
-      <div class="arch-link">
-        <div class="arch-wire"><span>QUIC · TLS 1.3</span></div>
-        <div class="arch-wire udp"><span>datagrams · AES-256-GCM</span></div>
-      </div>
-      <div class="arch-node server">
-        <h3>Server</h3>
-        <p>Tokio SFU · single binary<br>relays ciphertext, decodes nothing</p>
-      </div>
-      <div class="arch-link">
-        <div class="arch-wire"><span>QUIC · TLS 1.3</span></div>
-        <div class="arch-wire udp"><span>datagrams · AES-256-GCM</span></div>
-      </div>
-      <div class="arch-node">
-        <h3>Client B</h3>
-        <p>Tauri 2 · Rust + Svelte 5</p>
-      </div>
-    </div>
-  </div>
-</section>
-
-<section id="compare">
-  <div class="container">
-    <h2>Compared</h2>
-    <p class="section-sub">Feature by feature, kept checkable.</p>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr><th>Feature</th><th>VoIPC</th><th>Discord</th><th>TeamSpeak</th></tr>
-        </thead>
+    <section id="rules" aria-labelledby="rules-title">
+      <div class="bumper"><h2 id="rules-title">Server rules</h2><p>What every VoIPC relay does, read straight off it.</p></div>
+      <table class="rules">
+        <thead><tr><th scope="col">Rule</th><th scope="col">Value</th><th scope="col">What it means</th></tr></thead>
         <tbody>
-          <tr><td>E2E text chat</td><td class="ok">Yes — Signal Protocol</td><td class="no">No</td><td class="no">No</td></tr>
-          <tr><td>E2E voice &amp; video</td><td class="ok">Yes — AES-256-GCM</td><td class="mid">Partial — DAVE (voice/DM calls)</td><td class="no">No</td></tr>
-          <tr><td>Self-hosted</td><td class="ok">Yes</td><td class="no">No</td><td class="ok">Yes</td></tr>
-          <tr><td>Open source</td><td class="ok">Yes — MIT</td><td class="no">No</td><td class="no">No</td></tr>
-          <tr><td>Account required</td><td class="ok">No — unless the server requires one</td><td class="no">Yes</td><td class="ok">No</td></tr>
-          <tr><td>Server persistence</td><td class="ok">None by default — opt-in accounts add a database</td><td class="no">Cloud, retained</td><td class="mid">Logs &amp; database</td></tr>
-          <tr><td>Screen share</td><td class="ok">H.264 or H.265, GPU-encoded, 1080p60</td><td class="mid">H.264/VP8, higher tiers paid</td><td class="mid">Limited</td></tr>
-          <tr><td>Runs in a browser</td><td class="ok">Yes — E2E encrypted, self-hosted</td><td class="ok">Yes</td><td class="no">No</td></tr>
-          <tr><td>Cost</td><td class="ok">Free — your hardware</td><td class="mid">Free + paid tiers</td><td class="mid">Free tier, licensed beyond</td></tr>
+          <tr><td class="key">relay.reads_messages</td><td class="val off">0</td><td class="what">Messages ride the Signal Protocol (X3DH, Double Ratchet, sender keys) through the official libsignal crate. The relay forwards ciphertext.</td></tr>
+          <tr><td class="key">relay.reads_media</td><td class="val off">0</td><td class="what">Voice, video and positions are AES-256-GCM per packet, with per-channel keys handed out over pairwise Signal sessions. The relay decodes nothing.</td></tr>
+          <tr><td class="key">relay.storage</td><td class="val">memory</td><td class="what">Without accounts it keeps nothing it can read. Messages, voice and positions pass through memory; files posted in chat sit on its disk only as ciphertext, for a day at most by default, and every restart wipes them. A restart is a clean slate, but for the bans an admin set.</td></tr>
+          <tr><td class="key">accounts</td><td class="val">off · optional</td><td class="what">Turned on by the operator, it keeps a database: names, sign-ins, who wrote where and when, and ciphertext it cannot open.</td></tr>
+          <tr><td class="key">transport</td><td class="val">tls 1.3</td><td class="what">Everything rides one QUIC connection; self-signed certificates are pinned on first connect, and a changed fingerprint stops the connection.</td></tr>
+          <tr><td class="key">history</td><td class="val">local</td><td class="what">Optional, on your own disk: PBKDF2 at 600,000 iterations and AES-256-GCM, a fresh salt and nonce per file.</td></tr>
+          <tr><td class="key">telemetry</td><td class="val off">0</td><td class="what">None, in the apps, the relay or on this page: no analytics, no cookies.</td></tr>
+          <tr><td class="key">audit</td><td class="val off">none</td><td class="what">VoIPC has not had an independent security audit. The code is MIT-licensed and small enough to read: <a href="https://github.com/luki4fun/voipc">audit it yourself</a>.</td></tr>
         </tbody>
       </table>
-    </div>
-  </div>
-</section>
-
-<section id="platforms">
-  <div class="container">
-    <h2>Platforms</h2>
-    <p class="section-sub">Honest support status — nothing listed that doesn't run today.</p>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr><th></th><th>Linux</th><th>Windows</th><th>Android</th><th>Browser</th><th>macOS</th></tr>
-        </thead>
+      <table class="rules where">
+        <caption class="sr-only">What lives where</caption>
+        <thead><tr><th scope="col">What</th><th scope="col">Relay, no accounts</th><th scope="col">Relay, accounts on</th><th scope="col">Your device</th></tr></thead>
         <tbody>
-          <tr><td>Voice</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="muted">—</td></tr>
-          <tr><td>Text chat (E2E)</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="muted">—</td></tr>
-          <tr><td>Screen share (send)</td><td class="ok">PipeWire</td><td class="ok">WGC</td><td class="muted">—</td><td class="ok">getDisplayMedia</td><td class="muted">—</td></tr>
-          <tr><td>Screen share (watch)</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="ok">Yes</td><td class="muted">—</td></tr>
-          <tr><td>Desktop audio</td><td class="ok">PipeWire</td><td class="ok">WASAPI</td><td class="muted">—</td><td class="mid">Where the browser offers a track</td><td class="muted">—</td></tr>
+          <tr><td class="key">messages</td><td>forwarded, never readable</td><td>encrypted copies members choose to keep</td><td>optional encrypted history, up to 500 per channel</td></tr>
+          <tr><td class="key">voice · video · screens</td><td>forwarded, never readable</td><td>forwarded, never readable</td><td>not stored</td></tr>
+          <tr><td class="key">files</td><td>sealed copies it cannot open: 30 min after the last fetch, a day at most by default; wiped at every start</td><td>the same</td><td>the files you sent or loaded, still sealed: up to 1 GB by default (256 MB on Android; in the browser, in memory only)</td></tr>
+          <tr><td class="key">who is where</td><td>names and channels, in memory, while connected</td><td>also who wrote where, when and how much</td><td>saved servers and settings</td></tr>
+          <tr><td class="key">addresses</td><td>in memory, during the session</td><td>sign-ins, with addresses hashed</td><td>—</td></tr>
+          <tr><td class="key">secrets</td><td>hashed channel passwords; encrypted media keys</td><td>a password-derived hash; sealed two-factor secrets</td><td>your private keys; with an account, the remembered device and vault keys</td></tr>
+          <tr><td class="key">after a restart</td><td>nothing but the bans an admin set</td><td>the database</td><td>as above</td></tr>
+          <tr><td class="key">analytics</td><td>none</td><td>none</td><td>none</td></tr>
         </tbody>
       </table>
-    </div>
-    <p class="audit-note">The browser client needs Chrome 97, Edge 98, Firefox 130 or Safari 26.4 (WebTransport and WebCodecs); voice, chat, sharing a screen and watching one are tested end to end on both Chromium and Firefox. Every client decodes H.264, VP8 and VP9, so any browser can watch a share in them — H.265 is the exception, since browsers expose an HEVC decoder only on Windows, macOS and Android, and Firefox nowhere. Desktop audio from a browser share depends on the browser offering an audio track: Chromium does for tabs and system audio, Firefox on Linux does not. macOS is not supported yet — there is no macOS-specific code in the tree, so it isn't listed as working.</p>
-  </div>
-</section>
+        </section>
 
-<section id="download">
-  <div class="container">
-    <h2>Download &amp; run</h2>
-    <p class="section-sub">Grab a client from the releases page, then give your group a server: one static binary, a self-signed cert, and port 9987.</p>
-    <div class="dl-grid">
-      <div>
-        <h3>Client</h3>
-        <p>Prebuilt packages on the <a href="https://github.com/luki4fun/voipc/releases/latest">GitHub releases page</a>, or build from source — <code>setup.sh</code> / <code>setup.ps1</code> installs the dependencies, <code>npm run build</code> builds. See <a href="https://github.com/luki4fun/voipc/blob/main/BUILDING.md">BUILDING.md</a> for the per-platform details.</p>
-        <p>Or install nothing: the server hosts a browser client at <code>https://your-server:9987</code>, with the same Signal and AES-256-GCM encryption compiled to WebAssembly.</p>
-        <a class="btn btn-primary" href="https://github.com/luki4fun/voipc/releases/latest">Releases</a>
+    <section id="compare" aria-labelledby="compare-title">
+      <div class="bumper"><h2 id="compare-title">Compared</h2><p>Feature by feature, kept checkable.</p><p class="scroll-cue">Eight columns: scroll sideways for all of them.</p></div>
+      <div class="compare-wrap">
+        <table class="compare">
+          <thead>
+            <tr><th scope="col">Server</th><th scope="col">E2E chat</th><th scope="col">E2E voice &amp; video</th><th scope="col">Self-hosted</th><th scope="col">Open source</th><th scope="col">Account needed</th><th scope="col">Keeps</th><th scope="col">In a browser</th></tr>
+          </thead>
+          <tbody>
+            <tr class="ours">
+              <th scope="row">VoIPC</th>
+              <td><span class="verdict yes"><svg aria-hidden="true"><use href="#i-check"/></svg>Signal Protocol</span></td>
+              <td><span class="verdict yes"><svg aria-hidden="true"><use href="#i-check"/></svg>AES-256-GCM</span></td>
+              <td><span class="verdict yes"><svg aria-hidden="true"><use href="#i-check"/></svg>Yes</span></td>
+              <td><span class="verdict yes"><svg aria-hidden="true"><use href="#i-check"/></svg>MIT</span></td>
+              <td><span class="verdict yes"><svg aria-hidden="true"><use href="#i-check"/></svg>No, unless the server asks</span></td>
+              <td><span class="verdict yes"><svg aria-hidden="true"><use href="#i-check"/></svg>No messages by default; files encrypted, a day at most</span></td>
+              <td><span class="verdict yes"><svg aria-hidden="true"><use href="#i-check"/></svg>Yes, encrypted</span></td>
+            </tr>
+            <tr>
+              <th scope="row">Discord</th>
+              <td><span class="verdict no"><svg aria-hidden="true"><use href="#i-x"/></svg>No</span></td>
+              <td><span class="verdict part"><svg aria-hidden="true"><use href="#i-part"/></svg>Partly (DAVE, calls)</span></td>
+              <td><span class="verdict no"><svg aria-hidden="true"><use href="#i-x"/></svg>No</span></td>
+              <td><span class="verdict no"><svg aria-hidden="true"><use href="#i-x"/></svg>No</span></td>
+              <td><span class="verdict no"><svg aria-hidden="true"><use href="#i-x"/></svg>Yes</span></td>
+              <td><span class="verdict no"><svg aria-hidden="true"><use href="#i-x"/></svg>Everything, in its cloud</span></td>
+              <td><span class="verdict yes"><svg aria-hidden="true"><use href="#i-check"/></svg>Yes</span></td>
+            </tr>
+            <tr>
+              <th scope="row">TeamSpeak</th>
+              <td><span class="verdict no"><svg aria-hidden="true"><use href="#i-x"/></svg>No</span></td>
+              <td><span class="verdict no"><svg aria-hidden="true"><use href="#i-x"/></svg>No</span></td>
+              <td><span class="verdict yes"><svg aria-hidden="true"><use href="#i-check"/></svg>Yes</span></td>
+              <td><span class="verdict no"><svg aria-hidden="true"><use href="#i-x"/></svg>No</span></td>
+              <td><span class="verdict yes"><svg aria-hidden="true"><use href="#i-check"/></svg>No</span></td>
+              <td><span class="verdict part"><svg aria-hidden="true"><use href="#i-part"/></svg>Logs and a database</span></td>
+              <td><span class="verdict no"><svg aria-hidden="true"><use href="#i-x"/></svg>No</span></td>
+            </tr>
+          </tbody>
+        </table>
       </div>
-      <div>
-        <h3>Server</h3>
-<pre><span class="c"># build</span>
-git clone https://github.com/luki4fun/voipc
-cd voipc &amp;&amp; cargo build -p voipc-server --release
+    </section>
 
-<span class="c"># self-signed cert (browsers check the subjectAltName: use your host name / IP)</span>
-mkdir -p certs
-openssl req -x509 -newkey ec \
-  -pkeyopt ec_paramgen_curve:prime256v1 \
-  -keyout certs/server.key -out certs/server.crt \
-  -days 365 -nodes -subj "/CN=voipc" \
-  -addext "subjectAltName=DNS:your-server.example,IP:203.0.113.5"
+    <section id="clients" aria-labelledby="clients-title">
+      <div class="bumper"><h2 id="clients-title">Clients</h2><p>Honest support status: nothing listed that does not run today.</p></div>
+      <table class="clients">
+        <thead><tr><th scope="col">System</th><th scope="col">Voice &amp; chat</th><th scope="col">Share a screen</th><th scope="col">Watch a share</th><th scope="col">Desktop audio</th><th scope="col"><span class="sr-only">Download</span></th></tr></thead>
+        <tbody>
+          <tr><th scope="row">Linux</th><td class="cap" data-label="Voice &amp; chat">Yes</td><td class="cap" data-label="Share">PipeWire</td><td class="cap" data-label="Watch">Yes</td><td class="cap" data-label="Desktop audio">PipeWire</td>
+            <td class="dl"><a class="get" href="https://github.com/luki4fun/voipc/releases/download/v1.3.1/VoIPC_1.3.1_amd64.AppImage"><svg class="icon" aria-hidden="true"><use href="#i-down"/></svg>AppImage</a><a class="get" href="https://github.com/luki4fun/voipc/releases/download/v1.3.1/VoIPC_1.3.1_amd64.deb"><svg class="icon" aria-hidden="true"><use href="#i-down"/></svg>.deb</a></td></tr>
+          <tr><th scope="row">Windows</th><td class="cap" data-label="Voice &amp; chat">Yes</td><td class="cap" data-label="Share">Windows.Graphics.Capture</td><td class="cap" data-label="Watch">Yes</td><td class="cap" data-label="Desktop audio">WASAPI</td>
+            <td class="dl"><a class="get" href="https://github.com/luki4fun/voipc/releases/download/v1.3.1/VoIPC_1.3.1_x64-setup.exe"><svg class="icon" aria-hidden="true"><use href="#i-down"/></svg>Installer</a></td></tr>
+          <tr><th scope="row">Android</th><td class="cap" data-label="Voice &amp; chat">Yes</td><td class="cap" data-label="Share">—</td><td class="cap" data-label="Watch">Yes</td><td class="cap" data-label="Desktop audio">—</td>
+            <td class="dl"><a class="get" href="https://github.com/luki4fun/voipc/releases/download/v1.3.1/VoIPC-android-1.3.1.apk"><svg class="icon" aria-hidden="true"><use href="#i-down"/></svg>APK</a></td></tr>
+          <tr id="browser-client"><th scope="row">Browser</th><td class="cap" data-label="Voice &amp; chat">Yes</td><td class="cap" data-label="Share">getDisplayMedia</td><td class="cap" data-label="Watch">Yes</td><td class="cap" data-label="Desktop audio">where the browser offers it</td>
+            <td><span class="cap">Nothing to install: <a href="https://ivy.l4f.cc:9987/">try the demo</a>, or open any server's address</span></td></tr>
+          <tr><th scope="row">macOS</th><td class="cap" data-label="Voice &amp; chat">—</td><td class="cap" data-label="Share">—</td><td class="cap" data-label="Watch">—</td><td class="cap" data-label="Desktop audio">—</td>
+            <td><span class="cap">Not supported yet; the browser client works</span></td></tr>
+        </tbody>
+      </table>
+      <p class="note"><strong>Coming from 1.0?</strong> 1.3 speaks a new protocol: update your server first, then the apps. A 1.3 app cannot connect to a 1.0 server, and does not go back to 1.0 by itself. The browser needs nothing; Android and the .deb install over the old one.</p>
+      <p class="note">Browsers need Chrome 97, Edge 98, Firefox 130 or Safari 26.4 (WebTransport and WebCodecs). Every release is signed and listed in <a href="https://github.com/luki4fun/voipc/releases/download/v1.3.1/SHA256SUMS">SHA256SUMS</a>; how to check one is in the <a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">changelog</a>.</p>
+    </section>
 
-<span class="c"># run (UDP 9987 for QUIC — every client — and TCP 9987 for the browser page;</span>
-<span class="c"># add --tcp-fallback where UDP is blocked)</span>
-./target/release/voipc-server</pre>
-        <p>Configure with CLI flags, or a <code>server.toml</code> passed with <code>-c</code>; a <code>channels.json</code> in the directory the server runs from adds persistent rooms; set <code>admin_token</code> (or take the one printed in the log) to moderate. With <a href="https://github.com/luki4fun/voipc/blob/main/docs/ACCOUNTS.md">accounts</a> on, the token only makes the first admin; after that, admin and moderator are account roles. The same binary serves the browser client over HTTP/2 on the TCP port, and browsers then join the same QUIC endpoint the desktop app uses. A Docker release build (<code>npm run release</code>) produces a static musl binary, an AppImage, and the web bundle.</p>
+    <section id="host" aria-labelledby="host-title">
+      <div class="bumper"><h2 id="host-title">Host one</h2><p>One static binary, a certificate, and port 9987.</p></div>
+      <div class="host">
+        <div class="console">
+          <button class="copy" type="button" data-copy="server-cmds"><svg class="icon" aria-hidden="true"><use href="#i-copy"/></svg><span>Copy</span></button>
+<pre id="server-cmds"><span class="c"># the relay, ready-built for Linux x86_64</span>
+<span class="p">$ </span>curl -LO https://github.com/luki4fun/voipc/releases/download/v1.3.1/voipc-server-linux-x86_64
+<span class="p">$ </span>chmod +x voipc-server-linux-x86_64
+
+<span class="c"># a self-signed certificate for this machine's name and address</span>
+<span class="c"># (browsers check them: set HOST and IP to the public ones if they differ)</span>
+<span class="p">$ </span>HOST=$(hostname -f) IP=$(ip route get 1 | grep -o 'src [0-9.]*' | cut -d' ' -f2)
+<span class="p">$ </span>mkdir -p certs && openssl req -x509 -newkey ec \
+    -pkeyopt ec_paramgen_curve:prime256v1 \
+    -keyout certs/server.key -out certs/server.crt \
+    -days 365 -nodes -subj "/CN=voipc" \
+    -addext "subjectAltName=DNS:$HOST,IP:$IP"
+
+<span class="c"># run: UDP 9987 for every client, TCP 9987 for the browser page</span>
+<span class="p">$ </span>./voipc-server-linux-x86_64</pre>
+        </div>
+        <div>
+          <p>Configure it with flags or a <code>server.toml</code> passed with <code>-c</code>; a <code>channels.json</code> beside it adds rooms that stay. Set <code>admin_token</code>, or take the one printed in the log, to moderate.</p>
+          <p>The same binary serves the browser client over HTTPS on the TCP port, so a friend with nothing installed opens the server's address on port 9987 in a browser and joins, as with <a href="https://ivy.l4f.cc:9987/">the demo</a>. Where UDP is blocked, <code>--tcp-fallback</code> tunnels the call over TCP.</p>
+          <p>Building from source, Docker and accounts: <a href="https://github.com/luki4fun/voipc/blob/main/BUILDING.md">BUILDING.md</a> · <a href="https://github.com/luki4fun/voipc/blob/main/docs/OPERATING.md">OPERATING.md</a> · <a href="https://github.com/luki4fun/voipc/blob/main/docs/ACCOUNTS.md">ACCOUNTS.md</a></p>
+        </div>
       </div>
-    </div>
-  </div>
-</section>
+    </section>
+  </main>
 
-<footer>
-  <div class="footer-inner">
-    <span>VoIPC · <a href="https://github.com/luki4fun/voipc/blob/main/LICENSE">MIT license</a></span>
-    <span><a href="https://github.com/luki4fun/voipc">GitHub</a> · <a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">Changelog</a></span>
+  <footer class="statusbar">
+    <span><span class="dot" aria-hidden="true"></span>VoIPC 1.3.1</span>
+    <span class="num">1 public demo server</span>
+    <span>MIT · <a href="https://github.com/luki4fun/voipc/blob/main/LICENSE">licence</a></span>
+    <span><a href="https://github.com/luki4fun/voipc/blob/main/CHANGELOG.md">Changelog</a> · <a href="https://github.com/luki4fun/voipc">GitHub</a></span>
     <span>Built with Rust, Svelte, and paranoia. No analytics, no cookies.</span>
-  </div>
-</footer>
+  </footer>
+</div>
 
 <script>
   document.documentElement.classList.add("js");
-  var btn = document.getElementById("menuBtn");
-  var links = document.getElementById("navLinks");
-  btn.addEventListener("click", function () {
-    var open = links.classList.toggle("open");
-    btn.setAttribute("aria-expanded", open ? "true" : "false");
-  });
-  links.addEventListener("click", function (e) {
-    if (e.target.tagName === "A") {
-      links.classList.remove("open");
-      btn.setAttribute("aria-expanded", "false");
-    }
-  });
-</script>
 
-
-<script>
-  // The live preview: two attributes on one element, everything else is CSS.
+  // Join is the download for this visitor's system. Where there is none
+  // (macOS, iOS), it points at the browser client instead of a releases page
+  // with nothing on it for them.
   (function () {
-    var demo = document.getElementById("appDemo");
-    if (!demo) return;
-    function pick(buttons, attr, value) {
-      buttons.forEach(function (b) { b.setAttribute("aria-pressed", String(b.dataset[attr] === value)); });
-      demo.dataset[attr] = value;
+    var base = "https://github.com/luki4fun/voipc/releases/download/v1.3.1/";
+    var ua = navigator.userAgent;
+    var join = document.getElementById("join");
+    var os = document.getElementById("join-os");
+    var pick =
+      /Android/i.test(ua) ? ["Android", "VoIPC-android-1.3.1.apk"] :
+      /Windows/i.test(ua) ? ["Windows", "VoIPC_1.3.1_x64-setup.exe"] :
+      /iPhone|iPad|Macintosh|Mac OS/i.test(ua) ? ["in the browser", null] :
+      /Linux|X11/i.test(ua) ? ["Linux", "VoIPC_1.3.1_amd64.AppImage"] :
+      null;
+    if (!pick) return;
+    join.href = pick[1] ? base + pick[1] : "#browser-client";
+    os.textContent = "· " + pick[0];
+  })();
+
+  // The demo server's ping, measured from this browser. The best of a few
+  // small requests (the first also pays for TLS); again when the page comes
+  // back into view after a minute or more, never on a timer: each measurement
+  // holds one of the relay's connection slots for 30 s, the slots voice
+  // sessions need too. Unreachable: a dash.
+  (function () {
+    var cell = document.querySelector("[data-ping]");
+    if (!cell || !window.fetch || !window.performance) return;
+    var url = cell.getAttribute("data-ping");
+    var last = 0, busy = false;
+    function once() {
+      var t = performance.now();
+      var opts = { cache: "no-store", mode: "cors" };
+      if (window.AbortSignal && AbortSignal.timeout) opts.signal = AbortSignal.timeout(5000);
+      return fetch(url, opts).then(function (r) {
+        if (!r.ok) throw r.status;
+        return performance.now() - t;
+      });
     }
-    var layouts = [].slice.call(document.querySelectorAll(".seg[data-layout]"));
-    var palettes = [].slice.call(document.querySelectorAll(".swatch[data-palette]"));
-    layouts.forEach(function (b) {
-      b.addEventListener("click", function () { pick(layouts, "layout", b.dataset.layout); });
-    });
-    palettes.forEach(function (b) {
-      b.addEventListener("click", function () { pick(palettes, "palette", b.dataset.palette); });
+    function measure() {
+      if (busy) return;
+      busy = true;
+      last = performance.now();
+      var best = Infinity;
+      [0, 1, 2].reduce(function (p) {
+        return p.then(once).then(function (ms) { best = Math.min(best, ms); });
+      }, Promise.resolve()).catch(function () {}).then(function () {
+        cell.textContent = best < Infinity ? Math.round(best) + " ms" : "—";
+        busy = false;
+      });
+    }
+    measure();
+    document.addEventListener("visibilitychange", function () {
+      if (!document.hidden && performance.now() - last > 60000) measure();
     });
   })();
+
+  // Server info tabs (without the script every panel is simply shown)
+  (function () {
+    var tabs = [].slice.call(document.querySelectorAll('.info-tabs [role="tab"]'));
+    function select(tab, focus) {
+      tabs.forEach(function (t) {
+        var on = t === tab;
+        t.setAttribute("aria-selected", String(on));
+        t.tabIndex = on ? 0 : -1;
+        document.getElementById(t.getAttribute("aria-controls")).hidden = !on;
+      });
+      if (focus) tab.focus();
+    }
+    tabs.forEach(function (t, i) {
+      t.addEventListener("click", function () { select(t); });
+      t.addEventListener("keydown", function (e) {
+        var n = e.key === "ArrowRight" ? i + 1 : e.key === "ArrowLeft" ? i - 1 : e.key === "Home" ? 0 : e.key === "End" ? tabs.length - 1 : null;
+        if (n === null) return;
+        e.preventDefault();
+        select(tabs[(n + tabs.length) % tabs.length], true);
+      });
+    });
+    if (tabs.length) select(tabs[0]);
+  })();
+
+  // The tab for the section on screen
+  (function () {
+    var links = [].slice.call(document.querySelectorAll(".tabs a"));
+    var byId = {};
+    links.forEach(function (a) { byId[a.getAttribute("href").slice(1)] = a; });
+    if (!("IntersectionObserver" in window)) return;
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (!e.isIntersecting) return;
+        links.forEach(function (a) { a.removeAttribute("aria-current"); });
+        var a = byId[e.target.id];
+        if (a) a.setAttribute("aria-current", "true");
+      });
+    }, { rootMargin: "-45% 0px -50% 0px" });
+    Object.keys(byId).forEach(function (id) { var s = document.getElementById(id); if (s) io.observe(s); });
+  })();
+
+  // Copy the relay commands, without the prompts and comments
+  document.querySelectorAll("[data-copy]").forEach(function (b) {
+    b.addEventListener("click", function () {
+      var text = document.getElementById(b.dataset.copy).innerText
+        .split("\n").filter(function (l) { return l.trim() && !/^\s*#/.test(l); })
+        .map(function (l) { return l.replace(/^\$ /, ""); }).join("\n");
+      var label = b.querySelector("span");
+      var say = function (t) {
+        label.textContent = t;
+        setTimeout(function () { label.textContent = "Copy"; }, 2400);
+      };
+      if (!navigator.clipboard) return say("Select and copy");
+      navigator.clipboard.writeText(text).then(
+        function () { say("Copied"); },
+        function () { say("Select and copy"); }
+      );
+    });
+  });
 </script>
 </body>
 </html>

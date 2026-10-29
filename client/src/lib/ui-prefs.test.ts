@@ -153,10 +153,12 @@ test("the stream view's chat: off in modern, below in classic, until chosen", ()
   assert.equal(p.stream_chat.classic.open, true);
   assert.equal(p.stream_chat.classic.split, "below");
   assert.equal(p.share_preview, true);
+  assert.equal(p.group_threads, true, "busy replies gather into threads unless turned off");
 
   const saved = defaultUiPrefs();
   saved.stream_chat.modern = { open: true, split: "below", width: 500, height: 300 };
   saved.share_preview = false;
+  saved.group_threads = false;
   assert.deepEqual(sanitizeUiPrefs(structuredClone(saved)), saved);
 });
 
@@ -167,6 +169,7 @@ test("a stream chat size is clamped and a bad split falls back", () => {
       classic: "nonsense",
     },
     share_preview: "maybe",
+    group_threads: "maybe",
   });
   assert.equal(p.stream_chat.modern.open, false);
   assert.equal(p.stream_chat.modern.split, "side");
@@ -174,4 +177,32 @@ test("a stream chat size is clamped and a bad split falls back", () => {
   assert.equal(p.stream_chat.modern.height, STREAM_CHAT_HEIGHT_MIN);
   assert.deepEqual(p.stream_chat.classic, defaultStreamChat("classic"));
   assert.equal(p.share_preview, true);
+  assert.equal(p.group_threads, true);
+});
+
+test("a stored palette from before the flag existed stands as chosen", () => {
+  // 1.x rule: no upgrade repaints somebody's app. A file with a palette and no
+  // `palette_chosen` cannot say whether a person picked it, so it is theirs.
+  const p = sanitizeUiPrefs({ palette: "slate-dark" });
+  assert.equal(p.palette, "slate-dark");
+  assert.equal(p.palette_chosen, true);
+});
+
+test("a palette the app picked stays un-chosen until somebody picks one", () => {
+  assert.equal(sanitizeUiPrefs({ palette: "voipc-night", palette_chosen: false }).palette_chosen, false);
+  assert.equal(sanitizeUiPrefs({}).palette_chosen, false);
+  assert.equal(sanitizeUiPrefs({ palette: "voipc-day", palette_chosen: true }).palette_chosen, true);
+});
+
+test("the stage layout reads back, with its own panels and the chat shut", () => {
+  const p = sanitizeUiPrefs({ layout: "stage" });
+  assert.equal(p.layout, "stage");
+  assert.equal(p.panels.stage.members_open, false);
+  assert.equal(p.stream_chat.stage.split, "side");
+});
+
+test("a file from before Stage gets the stage panels it never had", () => {
+  const p = sanitizeUiPrefs({ layout: "modern", panels: { modern: { sidebar: 300 } } });
+  assert.equal(p.panels.modern.sidebar, 300);
+  assert.deepEqual(p.panels.stage, sanitizeUiPrefs({}).panels.stage);
 });

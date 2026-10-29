@@ -98,6 +98,24 @@ jobs:
             exit 1
           fi
 
+          # Operators are told to read the notes' first line (COMPATIBILITY §1,
+          # OPERATING §8), so a release that changes the protocol says so
+          # there: "Protocol 13: …", bold or not. Compared with the protocol
+          # the stable feed offers now, i.e. the release before this one.
+          protocol=$(sed -n 's/^pub const PROTOCOL_VERSION: u32 = \([0-9]*\);/\1/p' crates/voipc-protocol/src/codec.rs)
+          [ -n "$protocol" ] || { echo "::error::PROTOCOL_VERSION not found"; exit 1; }
+          feed="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/latest.json"
+          if was=$(curl -fsSL --retry 3 "$feed" | jq -er .protocol); then
+            first=$(grep -m1 . notes.md)
+            re="^(\*\*)?Protocol ${protocol}[^0-9]"
+            if [ "$was" != "$protocol" ] && ! [[ "$first" =~ $re ]]; then
+              echo "::error::protocol $was → $protocol, but the notes do not start with \"Protocol $protocol\": $first"
+              exit 1
+            fi
+          else
+            echo "::warning::could not read the protocol of $feed; the notes' first line was not checked"
+          fi
+
           # Where the third-party code in the binaries comes from, with its
           # source (GPL FFmpeg, AGPL libsignal), read from the pins themselves.
           release=$(sed -n "s/^const FFMPEG_RELEASE = '\(.*\)';/\1/p" tools/tasks/windows-cross.mjs)
@@ -121,6 +139,9 @@ jobs:
             Ubuntu's (\`apt-get source ffmpeg x264 x265\`, or <https://launchpad.net/ubuntu/noble/+source/ffmpeg>).
           - **libsignal** (AGPL-3.0-only), in every build:
             [$signal_tag](https://github.com/signalapp/libsignal/tree/$signal_rev).
+          - **Every crate and npm package** in the builds, with its licence and the notices it asks
+            for: \`THIRD-PARTY-NOTICES.txt\`, which every build carries beside its page (a relay
+            serves it at \`/THIRD-PARTY-NOTICES.txt\`; \`tools/tasks/notices.mjs\` writes it).
           EOF
           cat notes.md
 

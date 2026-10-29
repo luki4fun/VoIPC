@@ -13,7 +13,7 @@ members = [
 exclude = ["crates/voipc-web", "crates/voipc-opus-wasm", "fuzz"]
 
 [workspace.package]
-version = "1.0.0"
+version = "1.3.1"
 edition = "2021"
 license = "MIT"
 # The toolchain CI tests with (rust-toolchain.toml)

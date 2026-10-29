@@ -13,12 +13,13 @@
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { listenServer, fromServer } from "../connect.js";
   import { account, accountHex, accountPrompt, closePrompt, relayAccounts, showPrompt } from "../stores/account.js";
-  import { fileStoredDm, joinedTextChannelIds, purgeWritten } from "../stores/chat.js";
+  import { applyChannelEvent, applyStoredDmEvent, fileStoredDm, joinedTextChannelIds, purgeWritten } from "../stores/chat.js";
   import { channels, currentChannelId } from "../stores/channels.js";
   import { shareChannelHistory } from "../stores/settings.js";
   import { users } from "../stores/users.js";
-  import { expiryFor } from "../chat-rules.js";
-  import { dmMessageTtl } from "../stores/channel-ui.js";
+  import { chatEvent, expiryFor } from "../chat-rules.js";
+  import { dmMessageTtl, managesChannel } from "../stores/channel-ui.js";
+  import { userId } from "../stores/connection.js";
   import { addNotification } from "../stores/notifications.js";
   import type { AccountInfo, RelayAccounts } from "../types.js";
 
@@ -33,6 +34,18 @@
   let busy = $state(false);
   let qr = $state("");
   let copied = $state(false);
+  /** A new recovery key on its way: shown once the relay says it is in
+   *  force (`RecoveryKeyChanged`), never before, and dropped on an error. */
+  let pendingKey: { server: string; key: string } | null = null;
+  /** The relay's `RecoveryKeyChanged` came before the key was handed back. */
+  let keyChangedOn: string | null = null;
+
+  function showNewKey(server: string, key: string) {
+    pendingKey = null;
+    keyChangedOn = null;
+    reset();
+    showPrompt({ kind: "recovery", server, key, renewed: true });
+  }
 
   /** The servers whose question about copies waits for the dialogs that
    *  came first (recovery key, codes) to be out of the way. */
@@ -150,6 +163,10 @@
         content: string;
         ttl_secs: number | null;
         timestamp: number;
+        reply_to?: string | null;
+        thread?: string | null;
+        file?: unknown;
+        fwd?: unknown;
       }>("stored-dm", (server, m) => {
         const me = get(account.peek(server));
         if (!me) return;
@@ -167,9 +184,42 @@
         const me = get(account.peek(server));
         if (!me) return;
         const writer = t.from_me ? accountHex(me.info.id) : t.account;
+        // Members' copies of what they wrote carry no account, only this name
+        const writerName = t.from_me ? me.name : t.name;
         const ch = get(channels.peek(server)).find((c) => c.log === t.conv);
-        if (ch) purgeWritten(server, "channel", ch.name, writer, t.before);
-        else if (t.conv.startsWith("d:")) purgeWritten(server, "dm", t.name, writer, t.before);
+        if (ch) purgeWritten(server, "channel", ch.name, writer, t.before, writerName);
+        else if (t.conv.startsWith("d:")) purgeWritten(server, "dm", t.name, writer, t.before, writerName);
+      }),
+      // An edit, delete, reaction or pin from a stored log, by its sender
+      // (the other party of a direct one, or us). A pin counts only from a
+      // manager the roster lists now: one whose sender is away is let go.
+      listenServer<{
+        conv: string;
+        name: string;
+        account: string;
+        from_me: boolean;
+        content: string;
+        timestamp: number;
+        event: unknown;
+      }>("stored-event", (server, t) => {
+        const me = get(account.peek(server));
+        const event = chatEvent(t.event);
+        if (!me || !event) return;
+        const self = get(userId.peek(server));
+        const writer = t.from_me ? accountHex(me.info.id) : t.account;
+        // Theirs only where the name is theirs: the relay's name for an account
+        const online = t.from_me
+          ? undefined
+          : get(users.peek(server)).find((u) => u.username === t.name && !!u.account && accountHex(u.account) === t.account);
+        const by = { user_id: t.from_me ? self : (online?.user_id ?? 0), username: t.from_me ? me.name : t.name, account: writer };
+        const ev = { event, by, at: t.timestamp, content: t.content };
+        const ch = get(channels.peek(server)).find((c) => c.log === t.conv);
+        if (ch) {
+          const mayPin = event.kind === "pin" && (t.from_me || !!online) && managesChannel(server, ch.channel_id, by.user_id);
+          applyChannelEvent(server, ch.name, ev, mayPin);
+        } else if (t.conv.startsWith("d:")) {
+          applyStoredDmEvent(server, t.name || `account ${t.account.slice(0, 8)}`, ev);
+        }
       }),
       listenServer<{ reason: string }>("stored-not-kept", (server, d) =>
         addNotification(`${fromServer(server)}not kept on the server: ${d.reason}`, "warning"),
@@ -241,12 +291,20 @@
       case "DeviceAdded":
         addNotification(`${fromServer(server)}this device is remembered — no password next time`, "info");
         break;
+      case "RecoveryKeyChanged":
+        // The old key stopped working: this one must be seen, whatever is on screen
+        if (pendingKey?.server === server) showNewKey(server, pendingKey.key);
+        else if (prompt?.kind === "recovery-new" && prompt.server === server) keyChangedOn = server;
+        break;
       case "Error":
+        if (body.request === "RecoveryKeyNew" && pendingKey?.server === server) pendingKey = null;
+        if (body.request === "RecoveryKeyNew" && keyChangedOn === server) keyChangedOn = null;
         if (
           prompt &&
           prompt.server === server &&
           (prompt.kind === "totp-setup" ||
             (prompt.kind === "password" && body.request === "PasswordChange") ||
+            (prompt.kind === "recovery-new" && body.request === "RecoveryKeyNew") ||
             (prompt.kind === "delete" && body.request === "DeleteAccount"))
         ) {
           error = body.reason;
@@ -358,6 +416,33 @@
     }
   }
 
+  async function submitRecoveryNew() {
+    const p = get(accountPrompt);
+    if (!p || p.kind !== "recovery-new") return;
+    const codes = get(account.peek(p.server))?.info.totp_enabled ?? false;
+    error =
+      !oldPassword ? "Enter your password."
+      : codes && !code.trim() ? (useRecovery ? "Enter a recovery code." : "Enter the code from your authenticator app.")
+      : "";
+    if (error) return;
+    busy = true;
+    keyChangedOn = null;
+    try {
+      // Held until the relay answers (onReply): a key it refused is no key
+      const key = await invoke<string>("account_recovery_key_new", {
+        server: p.server,
+        password: oldPassword.normalize("NFC"),
+        totp: codes && !useRecovery ? code.trim() : null,
+        recovery: codes && useRecovery ? code.trim() : null,
+      });
+      if (keyChangedOn === p.server) showNewKey(p.server, key);
+      else pendingKey = { server: p.server, key };
+    } catch (e) {
+      error = String(e);
+      busy = false;
+    }
+  }
+
   async function copy(text: string) {
     try {
       await navigator.clipboard.writeText(text);
@@ -379,7 +464,7 @@
   function escapeFor(kind: string): (() => void) | undefined {
     if (busy) return undefined;
     if (kind === "totp") return cancelTotp;
-    if (["totp-setup", "safety", "account", "delete", "password"].includes(kind)) return () => closePrompt();
+    if (["totp-setup", "safety", "account", "delete", "password", "recovery-new"].includes(kind)) return () => closePrompt();
     return undefined;
   }
 </script>
@@ -412,21 +497,21 @@
         <button type="button" class="link" onclick={() => (useRecovery = !useRecovery)}>
           {useRecovery ? "Use a code from the app" : "Lost your phone? Use a recovery code"}
         </button>
-        {#if error}<div class="error">{error}</div>{/if}
+        {#if error}<div class="error" role="alert">{error}</div>{/if}
         <div class="buttons">
           <button type="button" class="secondary" onclick={cancelTotp} disabled={busy}>Cancel</button>
-          <button type="button" class="submit-btn" onclick={submitTotp} disabled={busy || !code.trim()}>Sign in</button>
+          <button type="button" class="submit-btn btn btn-primary" onclick={submitTotp} disabled={busy || !code.trim()}>Sign in</button>
         </div>
       {:else if p.kind === "recovery"}
-        <h2>{fromServer(p.server)}Your recovery key</h2>
+        <h2>{fromServer(p.server)}Your {p.renewed ? "new " : ""}recovery key</h2>
         <p class="hint">
-          Write it down and keep it somewhere safe: if you forget your password, it sets a new one ("Forgot your
-          password?" when you sign in) and opens your account's encrypted vault. VoIPC shows it only now, and the
-          server cannot recover it for you.
+          {#if p.renewed}Your old recovery key no longer works. {/if}Write it down and keep it somewhere safe: if
+          you forget your password, it sets a new one ("Forgot your password?" when you sign in) and opens your
+          account's encrypted vault. VoIPC shows it only now, and the server cannot recover it for you.
         </p>
         <code class="secret">{p.key}</code>
         <button type="button" class="secondary" onclick={() => copy(p.key)}>{copied ? "Copied" : "Copy"}</button>
-        <button type="button" class="submit-btn" onclick={closeRecovery}>I have written it down</button>
+        <button type="button" class="submit-btn btn btn-primary" onclick={closeRecovery}>I have written it down</button>
       {:else if p.kind === "totp-setup"}
         <h2>{fromServer(p.server)}Set up two-factor codes</h2>
         <p class="hint">
@@ -453,10 +538,10 @@
             onkeydown={(e) => e.key === "Enter" && submitSetup()}
           />
         </div>
-        {#if error}<div class="error">{error}</div>{/if}
+        {#if error}<div class="error" role="alert">{error}</div>{/if}
         <div class="buttons">
           <button type="button" class="secondary" onclick={() => closePrompt()} disabled={busy}>Later</button>
-          <button type="button" class="submit-btn" onclick={submitSetup} disabled={busy}>Turn on</button>
+          <button type="button" class="submit-btn btn btn-primary" onclick={submitSetup} disabled={busy}>Turn on</button>
         </div>
       {:else if p.kind === "safety"}
         <h2>{fromServer(p.server)}Verify {p.name}</h2>
@@ -465,7 +550,7 @@
           server — stands between your encrypted messages. It changes when either of you gets a new identity.
         </p>
         <code class="secret codes safety">{p.number}</code>
-        <button type="button" class="submit-btn" onclick={() => closePrompt()}>Done</button>
+        <button type="button" class="submit-btn btn btn-primary" onclick={() => closePrompt()}>Done</button>
       {:else if p.kind === "cloud"}
         <h2>Keep your messages here too?</h2>
         <p class="hint">
@@ -483,12 +568,12 @@
           <input type="checkbox" bind:checked={shareChoice} disabled={busy} />
           <span>Let people who join a channel later read what I wrote there before</span>
         </label>
-        {#if error}<div class="error">{error}</div>{/if}
+        {#if error}<div class="error" role="alert">{error}</div>{/if}
         <div class="buttons">
           <button type="button" class="secondary" onclick={() => submitCloud(p.server, false)} disabled={busy}>
             Only on this device
           </button>
-          <button type="button" class="submit-btn" onclick={() => submitCloud(p.server, true)} disabled={busy}>
+          <button type="button" class="submit-btn btn btn-primary" onclick={() => submitCloud(p.server, true)} disabled={busy}>
             Keep a copy here
           </button>
         </div>
@@ -507,6 +592,10 @@
           <div class="row">
             <span>Password</span>
             <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); reset(); showPrompt({ kind: "password", server }); }}>Change</button>
+          </div>
+          <div class="row">
+            <span>Recovery key</span>
+            <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); reset(); showPrompt({ kind: "recovery-new", server }); }}>New</button>
           </div>
           {#if !$account.info.totp_enabled}
             <div class="row">
@@ -535,7 +624,7 @@
         </div>
         <div class="buttons">
           <button type="button" class="secondary danger" onclick={() => { const server = p.server; closePrompt(); reset(); showPrompt({ kind: "delete", server, what: "account" }); }}>Delete account…</button>
-          <button type="button" class="submit-btn" onclick={() => closePrompt()}>Done</button>
+          <button type="button" class="submit-btn btn btn-primary" onclick={() => closePrompt()}>Done</button>
         </div>
       {:else if p.kind === "delete" && p.what === "kept"}
         <h2>{fromServer(p.server)}Delete your kept messages?</h2>
@@ -545,7 +634,7 @@
         </p>
         <div class="buttons">
           <button type="button" class="secondary" onclick={() => closePrompt()}>Cancel</button>
-          <button type="button" class="submit-btn danger" onclick={submitDelete}>Delete them</button>
+          <button type="button" class="submit-btn btn btn-danger" onclick={submitDelete}>Delete them</button>
         </div>
       {:else if p.kind === "delete"}
         {@const codes = $account?.info.totp_enabled ?? false}
@@ -574,10 +663,10 @@
             {useRecovery ? "Use a code from the app" : "Lost your phone? Use a recovery code"}
           </button>
         {/if}
-        {#if error}<div class="error">{error}</div>{/if}
+        {#if error}<div class="error" role="alert">{error}</div>{/if}
         <div class="buttons">
           <button type="button" class="secondary" onclick={() => closePrompt()} disabled={busy}>Cancel</button>
-          <button type="button" class="submit-btn danger" onclick={submitDelete} disabled={busy}>Delete account</button>
+          <button type="button" class="submit-btn btn btn-danger" onclick={submitDelete} disabled={busy}>Delete account</button>
         </div>
       {:else if p.kind === "password"}
         {@const codes = $account?.info.totp_enabled ?? false}
@@ -623,10 +712,55 @@
             {useRecovery ? "Use a code from the app" : "Lost your phone? Use a recovery code"}
           </button>
         {/if}
-        {#if error}<div class="error">{error}</div>{/if}
+        {#if error}<div class="error" role="alert">{error}</div>{/if}
         <div class="buttons">
           <button type="button" class="secondary" onclick={() => closePrompt()} disabled={busy}>Cancel</button>
-          <button type="button" class="submit-btn" onclick={submitPassword} disabled={busy}>Change password</button>
+          <button type="button" class="submit-btn btn btn-primary" onclick={submitPassword} disabled={busy}>Change password</button>
+        </div>
+      {:else if p.kind === "recovery-new"}
+        {@const codes = $account?.info.totp_enabled ?? false}
+        <h2>{fromServer(p.server)}New recovery key</h2>
+        <p class="hint">
+          The recovery key you have now stops working, and only the new one resets your password. An account made
+          before VoIPC 1.3 gets its reset key this way: until then, a device that remembers it could reset it too.
+        </p>
+        <div class="field">
+          <label for="acct-recovery-password">Password</label>
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            id="acct-recovery-password"
+            type="password"
+            autocomplete="current-password"
+            autofocus
+            bind:value={oldPassword}
+            disabled={busy}
+            onkeydown={(e) => e.key === "Enter" && !codes && submitRecoveryNew()}
+          />
+        </div>
+        {#if codes}
+          <div class="field">
+            <label for="acct-recovery-code">{useRecovery ? "Recovery code" : "Code from your authenticator app"}</label>
+            <input
+              id="acct-recovery-code"
+              type="text"
+              inputmode={useRecovery ? "text" : "numeric"}
+              autocomplete="one-time-code"
+              bind:value={code}
+              placeholder={useRecovery ? "abcd-efgh-jkmn" : "123456"}
+              disabled={busy}
+              onkeydown={(e) => e.key === "Enter" && submitRecoveryNew()}
+            />
+          </div>
+          <button type="button" class="link" onclick={() => (useRecovery = !useRecovery)}>
+            {useRecovery ? "Use a code from the app" : "Lost your phone? Use a recovery code"}
+          </button>
+        {/if}
+        {#if error}<div class="error" role="alert">{error}</div>{/if}
+        <div class="buttons">
+          <button type="button" class="secondary" onclick={() => closePrompt()} disabled={busy}>Cancel</button>
+          <button type="button" class="submit-btn btn btn-primary" onclick={submitRecoveryNew} disabled={busy}>
+            {busy ? "Making it…" : "Make a new key"}
+          </button>
         </div>
       {:else if p.kind === "recovery-codes"}
         <h2>{fromServer(p.server)}Recovery codes</h2>
@@ -635,7 +769,7 @@
         </p>
         <code class="secret codes">{p.codes.join("\n")}</code>
         <button type="button" class="secondary" onclick={() => copy(p.codes.join("\n"))}>{copied ? "Copied" : "Copy"}</button>
-        <button type="button" class="submit-btn" onclick={() => closePrompt()}>Done</button>
+        <button type="button" class="submit-btn btn btn-primary" onclick={() => closePrompt()}>Done</button>
       {/if}
     </div>
   </div>
@@ -645,13 +779,13 @@
   .overlay {
     position: fixed;
     inset: 0;
-    background: rgba(0, 0, 0, 0.7);
+    background: var(--scrim);
     display: flex;
     align-items: center;
     justify-content: center;
     /* Above the connect dialog (100) and the setup pop-ups (200/210): a
        sign-in waiting for a code must not sit behind them. */
-    z-index: 220;
+    z-index: var(--z-account);
   }
 
   .dialog {
@@ -664,17 +798,20 @@
     display: flex;
     flex-direction: column;
     gap: 14px;
+    /* The window can be 640×480: the dialog scrolls, its buttons stay reachable */
+    max-height: calc(100dvh - 32px);
+    overflow-y: auto;
   }
 
   h2 {
     text-align: center;
-    font-size: 20px;
-    color: var(--accent);
+    font-size: var(--fs-2xl);
+    color: var(--text-primary);
   }
 
   .hint {
     text-align: center;
-    font-size: 13px;
+    font-size: var(--fs-body);
     color: var(--text-secondary);
   }
 
@@ -685,7 +822,7 @@
   }
 
   label {
-    font-size: 12px;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     text-transform: uppercase;
     letter-spacing: 0.5px;
@@ -698,7 +835,7 @@
     border: 1px solid var(--border);
     border-radius: 6px;
     font-family: monospace;
-    font-size: 14px;
+    font-size: var(--fs-md);
     word-break: break-all;
     text-align: center;
     user-select: all;
@@ -709,7 +846,7 @@
   }
 
   .small {
-    font-size: 12px;
+    font-size: var(--fs-sm);
   }
 
   .check {
@@ -718,7 +855,7 @@
     align-items: flex-start;
     text-transform: none;
     letter-spacing: normal;
-    font-size: 13px;
+    font-size: var(--fs-body);
     color: var(--text-primary);
   }
 
@@ -732,7 +869,7 @@
     display: flex;
     align-items: center;
     gap: 10px;
-    font-size: 13px;
+    font-size: var(--fs-body);
   }
 
   .row span {
@@ -756,15 +893,16 @@
   .link {
     background: none;
     border: none;
-    color: var(--accent);
-    font-size: 12px;
+    color: var(--text-primary);
+    text-decoration: underline;
+    font-size: var(--fs-sm);
     cursor: pointer;
     align-self: center;
   }
 
   .error {
     color: var(--danger);
-    font-size: 13px;
+    font-size: var(--fs-body);
     text-align: center;
   }
 
@@ -778,34 +916,30 @@
   }
 
   .submit-btn {
-    background: var(--accent);
-    color: white;
     padding: 10px;
-    font-size: 14px;
-    font-weight: 600;
+    font-size: var(--fs-md);
   }
 
-  .submit-btn:hover:not(:disabled) {
-    background: var(--accent-hover);
-  }
-
-  .submit-btn:disabled,
   .secondary:disabled {
     opacity: 0.6;
     cursor: not-allowed;
   }
 
+  /* The other way out of a step (Cancel, Later, Copy). It set no colours of
+     its own and so wore the browser's grey button on every dark palette. */
   .secondary {
     padding: 10px;
-    font-size: 14px;
+    font-size: var(--fs-md);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    border: 1px solid var(--border);
+  }
+
+  .secondary:hover:not(:disabled) {
+    background: var(--bg-hover);
   }
 
   .danger {
-    color: var(--danger, #e5534b);
-  }
-
-  .submit-btn.danger {
-    background: var(--danger, #e5534b);
-    color: white;
+    color: var(--danger);
   }
 </style>

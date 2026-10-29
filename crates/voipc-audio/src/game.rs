@@ -535,6 +535,29 @@ pub fn parse_frame(buf: &[u8]) -> anyhow::Result<Option<(Frame, usize)>> {
 }
 
 /// Is this browser `Origin` a game runtime's, or one the user allowed?
+/// Whether `raw` is an origin the user may add in Settings: `scheme://host`
+/// with an optional `:port`, nothing else. A scheme of letters, a host of
+/// ASCII letters, digits, dots and dashes, at most 100 characters; never
+/// `null` (S-011). What is shown in the native confirm is therefore exactly
+/// what will be matched, with nothing in it to dress up the dialog (S-040).
+pub fn origin_well_formed(raw: &str) -> bool {
+    let Some((scheme, rest)) = raw.split_once("://") else {
+        return false;
+    };
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (rest, None),
+    };
+    raw.len() <= 100
+        && !scheme.is_empty()
+        && scheme.bytes().all(|b| b.is_ascii_alphabetic())
+        && !host.is_empty()
+        && host
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && port.is_none_or(|p| (1..=5).contains(&p.len()) && p.bytes().all(|b| b.is_ascii_digit()))
+}
+
 pub fn origin_allowed(origin: &str, extra: &[String]) -> bool {
     let origin = origin.trim();
     let host_match = |host: &str| {
@@ -556,8 +579,10 @@ pub fn origin_allowed(origin: &str, extra: &[String]) -> bool {
         });
     fivem
         || DEFAULT_ORIGIN_HOSTS.iter().any(|h| host_match(h))
-        // What the user typed into Settings is matched exactly, for the same reason
-        || extra.iter().any(|p| p == origin)
+        // What the user typed into Settings is matched exactly, for the same
+        // reason. Never `null`: it is not one page but every sandboxed frame,
+        // data: URL and file:// page there is (S-011)
+        || (origin != "null" && extra.iter().any(|p| p == origin))
 }
 
 // ── MumbleLink ───────────────────────────────────────────────────────────

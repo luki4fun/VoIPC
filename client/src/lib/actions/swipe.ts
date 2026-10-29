@@ -113,8 +113,15 @@ export function swipeable(node: HTMLElement, options: SwipeOptions) {
     dragging = false;
     if (node.hasPointerCapture(e.pointerId)) node.releasePointerCapture(e.pointerId);
 
-    const dx = e.clientX - startX;
     opts.onmove(null);
+    // A cancel is the system taking the gesture (a Back swipe, a call coming
+    // in): the drawer goes back where it was rather than settling on wherever
+    // the finger happened to be.
+    if (e.type === "pointercancel") {
+      opts.onsettle(opts.pane());
+      return;
+    }
+    const dx = e.clientX - startX;
     opts.onsettle(settle(opts.pane(), dx, velocity, node.clientWidth || window.innerWidth));
   }
 

@@ -16,8 +16,11 @@ const MAGIC: &[u8; 4] = b"VOIP";
 /// so a v2 file read as v3 runs off the end of the first message and into the
 /// next one's bytes. v4 adds the sender's account to a message and the
 /// devices remembered by relays with accounts. v5 adds, per account, the
-/// newest generation of each vault item this device has seen (1.0).
-const VERSION: u8 = 0x05;
+/// newest generation of each vault item this device has seen (1.0). v6 adds
+/// `extra` to a message (1.2): one JSON string for every per-message field the
+/// chat has gained since, so a new one no longer needs a new version.
+const VERSION: u8 = 0x06;
+const VERSION_V5: u8 = 0x05;
 const VERSION_V4: u8 = 0x04;
 const VERSION_V3: u8 = 0x03;
 const VERSION_V2: u8 = 0x02;
@@ -59,6 +62,11 @@ pub struct ChatMessage {
     /// message id, what names a message across connects. `None` for a guest.
     #[serde(default)]
     pub account: Option<String>,
+    /// Every newer per-message field (what it answers, its thread, …) as the
+    /// front end's JSON: kept, never read here. Positional postcard made each
+    /// new field a new format; one string that holds them all ends that.
+    #[serde(default)]
+    pub extra: Option<String>,
 }
 
 /// A device a relay with accounts remembers: its key stands in for the
@@ -114,11 +122,50 @@ struct V4LogMemory {
 
 #[derive(Deserialize)]
 struct V4ChatArchive {
-    channels: HashMap<String, Vec<ChatMessage>>,
-    dms: HashMap<String, Vec<ChatMessage>>,
+    channels: HashMap<String, Vec<V4ChatMessage>>,
+    dms: HashMap<String, Vec<V4ChatMessage>>,
     cleared: HashMap<String, u64>,
     devices: Vec<DeviceRecord>,
     cursors: HashMap<String, V4LogMemory>,
+}
+
+/// v5: today's archive with v4's messages.
+#[derive(Deserialize)]
+struct V5ChatArchive {
+    channels: HashMap<String, Vec<V4ChatMessage>>,
+    dms: HashMap<String, Vec<V4ChatMessage>>,
+    cleared: HashMap<String, u64>,
+    devices: Vec<DeviceRecord>,
+    cursors: HashMap<String, voipc_crypto::sync::LogMemory>,
+}
+
+/// A v4 and v5 message: everything but `extra`.
+#[derive(Deserialize)]
+struct V4ChatMessage {
+    user_id: u32,
+    username: String,
+    content: String,
+    timestamp: u64,
+    kind: Option<String>,
+    id: Option<String>,
+    expires_at: Option<u64>,
+    account: Option<String>,
+}
+
+impl From<V4ChatMessage> for ChatMessage {
+    fn from(m: V4ChatMessage) -> Self {
+        Self {
+            user_id: m.user_id,
+            username: m.username,
+            content: m.content,
+            timestamp: m.timestamp,
+            kind: m.kind,
+            id: m.id,
+            expires_at: m.expires_at,
+            account: m.account,
+            extra: None,
+        }
+    }
 }
 
 /// A v3 message: everything but the sender's account.
@@ -151,6 +198,7 @@ impl From<V3ChatMessage> for ChatMessage {
             id: m.id,
             expires_at: m.expires_at,
             account: None,
+            extra: None,
         }
     }
 }
@@ -187,6 +235,7 @@ impl From<V2ChatMessage> for ChatMessage {
             // after it, not to this.
             expires_at: None,
             account: None,
+            extra: None,
         }
     }
 }
@@ -219,6 +268,7 @@ impl From<LegacyChatMessage> for ChatMessage {
             id: None,
             expires_at: None,
             account: None,
+            extra: None,
         }
     }
 }
@@ -334,7 +384,11 @@ pub fn decrypt_archive(
     if version > VERSION {
         anyhow::bail!("this chat history was saved by a newer VoIPC; update to open it");
     }
-    if ![VERSION, VERSION_V4, VERSION_V3, VERSION_V2, VERSION_V1].contains(&version) {
+    if ![
+        VERSION, VERSION_V5, VERSION_V4, VERSION_V3, VERSION_V2, VERSION_V1,
+    ]
+    .contains(&version)
+    {
         anyhow::bail!("unsupported file version");
     }
 
@@ -373,12 +427,22 @@ pub fn decrypt_archive(
 
     // Deserialize. An older file is read through the shape it was written with
     // and written back as the current version on the next save.
-    let archive = if version == VERSION_V4 {
+    let archive = if version == VERSION_V5 {
+        let v5: V5ChatArchive = postcard::from_bytes(plaintext)
+            .map_err(|e| anyhow::anyhow!("deserialization failed: {e}"))?;
+        ChatArchive {
+            channels: convert(v5.channels),
+            dms: convert(v5.dms),
+            cleared: v5.cleared,
+            devices: v5.devices,
+            cursors: v5.cursors,
+        }
+    } else if version == VERSION_V4 {
         let v4: V4ChatArchive = postcard::from_bytes(plaintext)
             .map_err(|e| anyhow::anyhow!("deserialization failed: {e}"))?;
         ChatArchive {
-            channels: v4.channels,
-            dms: v4.dms,
+            channels: convert(v4.channels),
+            dms: convert(v4.dms),
             cleared: v4.cleared,
             devices: v4.devices,
             cursors: v4
@@ -464,7 +528,11 @@ fn kind_of(data: &[u8]) -> FileKind {
         FileKind::Unreadable
     } else if data[4] > VERSION {
         FileKind::Newer
-    } else if [VERSION, VERSION_V4, VERSION_V3, VERSION_V2, VERSION_V1].contains(&data[4]) {
+    } else if [
+        VERSION, VERSION_V5, VERSION_V4, VERSION_V3, VERSION_V2, VERSION_V1,
+    ]
+    .contains(&data[4])
+    {
         FileKind::Ours(data[4])
     } else {
         FileKind::Unreadable
@@ -487,7 +555,7 @@ pub fn generate_salt() -> [u8; SALT_LEN] {
 // Lives in `voipc-crypto` so the browser build uses the same bytes: the two
 // implementations had already drifted on the version tag before anybody
 // noticed, because nothing read it.
-pub use voipc_crypto::envelope::{envelope, new_message_id, open_envelope};
+pub use voipc_crypto::envelope::{envelope_with, new_message_id, open_envelope, Extras};
 
 #[cfg(test)]
 mod tests {
@@ -503,6 +571,7 @@ mod tests {
             id: None,
             expires_at: None,
             account: None,
+            extra: None,
         }
     }
 
@@ -606,7 +675,11 @@ mod tests {
         assert_eq!(id.len(), 32);
         assert_ne!(id, new_message_id());
 
-        let m = open_envelope(&envelope(&id, "hello \u{1F600}", None));
+        let m = open_envelope(&voipc_crypto::envelope::envelope(
+            &id,
+            "hello \u{1F600}",
+            None,
+        ));
         assert_eq!(m.id.as_deref(), Some(id.as_str()));
         assert_eq!(m.text, "hello \u{1F600}");
 
@@ -792,6 +865,27 @@ mod tests {
         );
     }
 
+    /// v6: whatever the front end keeps in `extra` comes back as it went in.
+    #[test]
+    fn a_message_keeps_its_extra_fields() {
+        let salt = generate_salt();
+        let key = derive_key("pw", &salt);
+        let mut archive = ChatArchive::default();
+        let mut reply = msg("agreed", None);
+        reply.extra = Some(r#"{"reply_to":"m1","thread":"m1"}"#.into());
+        archive
+            .channels
+            .insert("k".into(), vec![msg("plain", None), reply]);
+        let file = encrypt_archive(&archive, &key, &salt).unwrap();
+        assert_eq!(file[4], 0x06);
+        let (back, ..) = decrypt_archive(&file, "pw").unwrap();
+        let extras: Vec<_> = back.channels["k"]
+            .iter()
+            .map(|m| m.extra.as_deref())
+            .collect();
+        assert_eq!(extras, [None, Some(r#"{"reply_to":"m1","thread":"m1"}"#)]);
+    }
+
     /// What 0.12 wrote (v4) opens, with no vault generations yet; a newer
     /// file is told apart from a damaged one and never opened as this one.
     #[test]
@@ -801,10 +895,22 @@ mod tests {
             cursors: HashMap<String, i64>,
             readers: HashMap<String, Vec<[u8; 16]>>,
         }
+        /// A message as v4 and v5 wrote it: no `extra`
+        #[derive(Serialize)]
+        struct V4Message {
+            user_id: u32,
+            username: String,
+            content: String,
+            timestamp: u64,
+            kind: Option<String>,
+            id: Option<String>,
+            expires_at: Option<u64>,
+            account: Option<String>,
+        }
         #[derive(Serialize)]
         struct V4 {
-            channels: HashMap<String, Vec<ChatMessage>>,
-            dms: HashMap<String, Vec<ChatMessage>>,
+            channels: HashMap<String, Vec<V4Message>>,
+            dms: HashMap<String, Vec<V4Message>>,
             cleared: HashMap<String, u64>,
             devices: Vec<DeviceRecord>,
             cursors: HashMap<String, V4Memory>,
@@ -813,9 +919,19 @@ mod tests {
             cursors: [("d:x".to_string(), 7)].into(),
             readers: HashMap::new(),
         };
+        let old = V4Message {
+            user_id: 1,
+            username: "alice".into(),
+            content: "from 0.12".into(),
+            timestamp: 1_700_000_000_000,
+            kind: None,
+            id: None,
+            expires_at: None,
+            account: None,
+        };
         let v4 = V4 {
             channels: HashMap::new(),
-            dms: [("k".to_string(), vec![msg("from 0.12", None)])].into(),
+            dms: [("k".to_string(), vec![old])].into(),
             cleared: HashMap::new(),
             devices: Vec::new(),
             cursors: [("r|luki".to_string(), memory)].into(),
@@ -873,6 +989,7 @@ mod tests {
             id: None,
             expires_at,
             account: None,
+            extra: None,
         };
         let mut map = HashMap::new();
         map.insert("a".to_string(), vec![msg(Some(now - 1)), msg(None)]);

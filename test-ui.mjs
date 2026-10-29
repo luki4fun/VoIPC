@@ -21,6 +21,9 @@
 // has no CDP, so test-web.sh only runs this in its Chromium lanes.
 
 import { createHmac } from "node:crypto";
+import { mkdtempSync, readFileSync, readdirSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 const PORT = process.argv[2] ?? "19987";
 const CDP = process.argv[3] ?? "9222";
@@ -285,7 +288,7 @@ async function answerFirstRun(tab, who, timeoutMs = 15_000) {
       connected: !document.querySelector(".connect-btn"),
       audio: !!document.querySelector(".audio-setup .skip-link"),
       layout: !!document.querySelector(".layout-setup"),
-      answered: JSON.parse(localStorage.getItem("voipc.settings") ?? "{}").ui_prefs?.layout_asked_version === 1,
+      answered: JSON.parse(localStorage.getItem("voipc.settings") ?? "{}").ui_prefs?.layout_asked_version === 2,
     })`);
     if (seen.audio) {
       await realClick(tab, ".audio-setup .skip-link");
@@ -357,7 +360,7 @@ check(
   "answering the layout question is remembered",
   (await alice.evaluate(
     `JSON.parse(localStorage.getItem("voipc.settings") ?? "{}").ui_prefs?.layout_asked_version`,
-  )) === 1,
+  )) === 2,
 );
 check(
   "and it put us in the layout that was picked",
@@ -774,8 +777,8 @@ check(
     await fresh.evaluate(`!!document.querySelector(".layout-setup")`),
   );
   check(
-    "it offers both layouts",
-    (await fresh.evaluate(`document.querySelectorAll(".layout-setup .layout-choice").length`)) === 2,
+    "it offers all three layouts",
+    (await fresh.evaluate(`[...document.querySelectorAll(".layout-setup .layout-choice")].map((b) => b.dataset.layout).join(",")`)) === "modern,classic,stage",
   );
   // The default, asserted where it is decided rather than in a unit test: this
   // client has no stored appearance at all, and it is in the modern shell.
@@ -871,6 +874,23 @@ check(
     await alice.evaluate(`!!document.activeElement?.classList.contains("settings-btn")`),
   );
 
+  // Settings' tabs move with the arrow keys (R5-11), and About carries the
+  // third-party notices this build serves beside the page (R4-09)
+  const tab = (name) => `[...document.querySelectorAll('[role="tab"]')].find((e) => e.textContent.trim() === ${JSON.stringify(name)})`;
+  await realClick(alice, ".settings-btn");
+  await waitFor(alice, tab("About"));
+  await alice.evaluate(`${tab("About")}.click()`);
+  await waitFor(alice, `document.querySelector("details.notices summary")`, 5_000).catch(() => {});
+  await realClick(alice, "details.notices summary");
+  const notices = await waitFor(alice, `document.querySelector(".notices-text")?.textContent.length > 1000`, 10_000).then(() => true, () => false);
+  check("About shows the third-party notices", notices,
+    await alice.evaluate(`document.querySelector("details.notices")?.innerText.slice(0, 200) ?? "no notices section"`));
+  await alice.evaluate(`${tab("About")}.focus()`);
+  await press("ArrowLeft", "ArrowLeft", 37);
+  const moved = await alice.evaluate(`document.querySelector('[role="tab"][aria-selected="true"]')?.textContent.trim()`);
+  check("ArrowLeft moves to the tab before it", moved !== "About" && moved === (await alice.evaluate(`document.activeElement?.textContent.trim()`)), moved);
+  await press("Escape", "Escape", 27);
+
   const row = `document.querySelector(".channel-row:has(.settings-icon) > .channel")`;
   if (await alice.evaluate(`!!${row}`)) {
     await alice.evaluate(`${row}.focus()`);
@@ -898,18 +918,19 @@ check(
   await alice.evaluate(`(${appearanceTab}).click()`);
   await sleep(300);
 
-  const pickPalette = (label) =>
-    `[...document.querySelectorAll(".swatch")].find((b) => ${JSON.stringify(label)} === b.title)`;
-  check("the palettes are offered", await alice.evaluate(`!!(${pickPalette("Slate light")})`));
+  // By id, not by label: a label is copy and gets edited ("VoIPC dark" became
+  // "Navy" when VoIPC night became the default)
+  const pickPalette = (id) => `document.querySelector('.swatch[data-palette="${id}"]')`;
+  check("the palettes are offered", await alice.evaluate(`!!(${pickPalette("slate-light")})`));
 
   // Start from a dark palette on purpose. Which palette a fresh client opens in
   // follows the machine's light/dark setting now, so "switch to the light one
   // and watch it change" only means something from a known dark starting point
   // — and this headless browser reports a light preference.
-  await alice.evaluate(`(${pickPalette("VoIPC dark")}).click()`);
+  await alice.evaluate(`(${pickPalette("voipc-dark")}).click()`);
   await sleep(400);
   const before = await alice.evaluate(`getComputedStyle(document.body).backgroundColor`);
-  await alice.evaluate(`(${pickPalette("Slate light")}).click()`);
+  await alice.evaluate(`(${pickPalette("slate-light")}).click()`);
   await sleep(400);
 
   const after = await alice.evaluate(`getComputedStyle(document.body).backgroundColor`);
@@ -943,7 +964,7 @@ check(
 
   // Zoom is left at 1 deliberately: it shifts getBoundingClientRect, and the
   // mixer geometry audit above measures real pixels.
-  await alice.evaluate(`(${pickPalette("VoIPC dark")}).click()`);
+  await alice.evaluate(`(${pickPalette("voipc-dark")}).click()`);
   await sleep(400);
   check(
     "switching back restores the dark document",
@@ -1245,6 +1266,36 @@ check(
     `stored ${storedWidth}, on screen ${widthAfter}`,
   );
 
+  // The Stage layout (2026-10-26): the call in the middle. Switched the same
+  // way, from inside a call, so the grid has somebody to draw.
+  await openAppearance();
+  check("Appearance offers the stage layout", await alice.evaluate(`!!(${pickLayout("stage")})`));
+  await alice.evaluate(`(${pickLayout("stage")}).click()`);
+  await sleep(500);
+  await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
+  await sleep(500);
+  check("the stage shell replaces the modern one", await alice.evaluate(
+    `!!document.querySelector(".stage-shell") && !document.querySelector(".modern-shell") && !document.querySelector(".app-layout")`,
+  ));
+  check("the call fills the stage: there is a tile for each person in it", await alice.evaluate(
+    `document.querySelectorAll("[data-stage-grid] [data-stage-tile]").length >= 1`,
+  ));
+  check("the voice bar is the dock under it", await alice.evaluate(`!!document.querySelector(".dock .voice-controls")`));
+  check("the chat starts closed", await alice.evaluate(`!document.querySelector("[data-stage-chat]")`));
+  await realClick(alice, "[data-stage-chat-toggle]");
+  await sleep(400);
+  check("the chat button opens the chat beside the stage", await alice.evaluate(
+    `!!document.querySelector("[data-stage-chat] .chat-panel")`,
+  ));
+  await realClick(alice, "[data-stage-chat-toggle]");
+  await sleep(400);
+  check("and closes it again", await alice.evaluate(`!document.querySelector("[data-stage-chat]")`));
+  check("the stage layout is what is stored", await waitFor(
+    alice,
+    `JSON.parse(localStorage.getItem("voipc.settings") ?? "{}").ui_prefs?.layout === "stage"`,
+    5000,
+  ).catch(() => false));
+
   // Back to classic, in the same tab and with no reload.
   await openAppearance();
   await alice.evaluate(`(${pickLayout("classic")}).click()`);
@@ -1252,7 +1303,7 @@ check(
   await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
   await sleep(500);
   check("switching back restores the classic shell", await alice.evaluate(
-    `!!document.querySelector(".app-layout") && !document.querySelector(".modern-shell")`,
+    `!!document.querySelector(".app-layout") && !document.querySelector(".modern-shell") && !document.querySelector(".stage-shell")`,
   ));
   check("the connection survived both switches", await alice.evaluate(
     `!!document.querySelector(".status-bar") && /Connected/.test(document.querySelector(".status-bar").textContent)`,
@@ -1462,7 +1513,7 @@ check(
       (await first.evaluate(`document.querySelector(".ctx-tag")?.textContent ?? ""`)) === `#${tag}`,
   );
   await first.evaluate(
-    `(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => e.textContent.includes("Direct Message"));
+    `(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => /direct message/i.test(e.textContent));
        if (!b) return false; b.click(); return true; })()`,
   );
   await waitFor(first, `document.querySelector(".input-bar .chat-input")`).catch(() => {});
@@ -1741,6 +1792,48 @@ check(
   check("stopping the share takes the preview away", !(await host.evaluate(`!!document.querySelector(".share-preview")`)));
   check("and the viewer's stream view closes", !(await guest.evaluate(`!!document.querySelector(".stream-stage")`)));
 
+  // ── A share this browser cannot decode, watched while sharing (B1-N1) ──
+  // It is said with the same event that a share of our own refused comes
+  // with, and it used to end ours too. The decoder probe saying no to every
+  // codec stands in for a browser without one (Firefox and H.265).
+  await guest.evaluate(`(() => {
+    const canvas = document.createElement("canvas");
+    canvas.width = 320; canvas.height = 180;
+    const ctx = canvas.getContext("2d");
+    let f = 0;
+    setInterval(() => { f++; ctx.fillStyle = "hsl(" + (f * 13) % 360 + ", 60%, 40%)"; ctx.fillRect(0, 0, 320, 180); }, 66);
+    navigator.mediaDevices.getDisplayMedia = async () => canvas.captureStream(15);
+    return true; })()`);
+  // A fresh stream for the host's second share: the first one's track ended with it
+  await host.evaluate(`(() => { const canvas = document.createElement("canvas"); canvas.width = 320; canvas.height = 180;
+    const ctx = canvas.getContext("2d"); let f = 0;
+    setInterval(() => { f++; ctx.fillStyle = "hsl(" + (f * 7) % 360 + ", 60%, 40%)"; ctx.fillRect(0, 0, 320, 180); }, 66);
+    navigator.mediaDevices.getDisplayMedia = async () => canvas.captureStream(15); return true; })()`);
+  await realClick(guest, '.share-btn[title="Share your screen"]');
+  await waitFor(guest, `document.querySelector(".start-btn")`, 8_000).catch(() => {});
+  await realClick(guest, ".start-btn");
+  const ownShare = await waitFor(guest, `document.querySelector(".share-btn.active")`, 10_000).then(() => true, () => false);
+  await realClick(host, ".voice-panel .share-btn");
+  await waitFor(host, `document.querySelector(".start-btn")`, 8_000).catch(() => {});
+  await realClick(host, ".start-btn");
+  const hostWatch = `.users .user:has(.name[title^="ui-host-${n}"]) button.status-icon.watch`;
+  await waitFor(guest, `document.querySelector(${JSON.stringify(hostWatch)})`, 10_000).catch(() => {});
+  await guest.evaluate(`(() => { window.__probe = VideoDecoder.isConfigSupported;
+    VideoDecoder.isConfigSupported = async (config) => ({ supported: false, config }); return true; })()`);
+  await hover(guest, hostWatch);
+  await realClick(guest, hostWatch);
+  const told = await waitFor(guest, `(window.__toasts ?? []).some((t) => /cannot decode/.test(t))`, 10_000).then(() => true, () => false);
+  await sleep(1000);
+  check(
+    "a share this browser cannot decode is said so, and our own share goes on",
+    ownShare && told && (await guest.evaluate(`!!document.querySelector(".share-btn.active")`)),
+    await guest.evaluate(`JSON.stringify({ ownShare: ${ownShare}, sharing: !!document.querySelector(".share-btn.active"), toasts: window.__toasts?.slice(-3) })`),
+  );
+  await guest.evaluate(`(() => { if (window.__probe) VideoDecoder.isConfigSupported = window.__probe; return true; })()`);
+  await realClick(guest, ".share-btn.active");
+  await realClick(host, ".voice-panel .share-btn.active");
+  await sleep(1200);
+
   for (const [who, tab] of [["sharer", host], ["viewer", guest]]) {
     const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));
     check(`the ${who} threw nothing`, fatal.length === 0, fatal.slice(0, 2).join(" | "));
@@ -1748,6 +1841,919 @@ check(
   // The profile is shared by every tab: leave it in the layout the rest of
   // this file expects of a fresh connect.
   await useLayout(host, "classic");
+
+  // ── An invite link: a voice channel shows, then asks; a text one opens (S-048) ──
+  // The link is somebody else's idea, and a voice channel is a seat with a
+  // microphone: following it is no reason to be put in the call.
+  const NOTES = `notes-${n}`;
+  await host.evaluate(click('button[title="Create channel"]'));
+  await waitFor(host, `document.querySelector(".create-form")`);
+  await host.evaluate(setInput(".create-form input[type=text]", NOTES));
+  await host.evaluate(click('.create-form input[data-kind="text"]'));
+  await sleep(300);
+  await host.evaluate(click(".create-form .create-btn"));
+  await sleep(2000);
+  // Connected through the dialog of a page opened on the link. The first-run
+  // dialogs are answered after the question, which a new user gets on top
+  const byInvite = async (name, channel) => {
+    const tab = await newTab();
+    await tab.send("Page.navigate", { url: `${URL}#channel=${encodeURIComponent(channel)}` });
+    await waitFor(tab, `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`);
+    if (await tab.evaluate(`!!document.querySelector(".skip-link")`)) {
+      await tab.evaluate(click(".skip-link"));
+      await waitFor(tab, `document.querySelector(".connect-btn")`);
+    }
+    await tab.evaluate(setInput('input[placeholder="localhost"]', "127.0.0.1"));
+    await tab.evaluate(setInput('input[placeholder="9987"]', PORT));
+    await tab.evaluate(setInput('input[placeholder="Your name"]', name));
+    await tab.evaluate(click(".connect-btn"));
+    await waitFor(tab, `!document.querySelector(".connect-btn")`);
+    return tab;
+  };
+  const confirmTitle = `document.querySelector(".confirm .dialog-title")?.textContent ?? ""`;
+  const inVoice = `!!document.querySelector(".leave-voice-btn")`;
+  const no = await byInvite(`ui-inv-${n}`, SHOW);
+  const asked = await waitFor(no, `${confirmTitle} === ${JSON.stringify(`Join voice in ${SHOW}?`)}`, 10_000).then(() => true, () => false);
+  check("an invite link to a voice channel asks before it seats you", asked && !(await no.evaluate(inVoice)), await no.evaluate(confirmTitle));
+  check("and shows the channel meanwhile", await no.evaluate(`document.querySelector(".join-voice-btn")?.textContent.includes(${JSON.stringify(SHOW)}) ?? false`),
+    await no.evaluate(`document.querySelector(".chat-header")?.textContent.trim().slice(0, 120) ?? "no chat header"`));
+  await no.evaluate(`[...document.querySelectorAll(".confirm button")].find((b) => b.textContent.trim() === "Cancel")?.click()`);
+  await answerFirstRun(no, "invited");
+  await sleep(500);
+  check("Cancel leaves you out of voice", asked && !(await no.evaluate(`!!document.querySelector(".confirm")`)) && !(await no.evaluate(inVoice)));
+  const yes = await byInvite(`ui-inv2-${n}`, SHOW);
+  await waitFor(yes, `${confirmTitle}.startsWith("Join voice")`, 10_000).catch(() => {});
+  await yes.evaluate(`[...document.querySelectorAll(".confirm button")].find((b) => b.textContent.trim() === "Join voice")?.click()`);
+  await answerFirstRun(yes, "seated");
+  check("Join voice seats you in it", await waitFor(yes, `${inVoice} && [...document.querySelectorAll(".channel.active .channel-name")].some((e) => e.textContent === ${JSON.stringify(SHOW)})`, 10_000)
+    .then(() => true, () => false));
+  const text = await byInvite(`ui-inv3-${n}`, NOTES);
+  await answerFirstRun(text, "text-invited");
+  const opened = await waitFor(text, `document.querySelector(".chat-title")?.textContent.includes(${JSON.stringify(NOTES)}) && !!document.querySelector(".chat-main .input-bar .chat-input")`, 10_000)
+    .then(() => true, () => false);
+  check("an invite link to a text channel opens it, with nothing to ask", opened && !(await text.evaluate(`!!document.querySelector(".confirm")`)) && !(await text.evaluate(inVoice)),
+    await text.evaluate(`(document.querySelector(".chat-title")?.textContent ?? "no title") + " | " + ${confirmTitle}`));
+  for (const [who, tab] of [["invited", no], ["seated", yes], ["text-invited", text]]) {
+    const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));
+    check(`the ${who} tab threw nothing`, fatal.length === 0, fatal.slice(0, 2).join(" | "));
+    await tab.send("Page.close").catch(() => {});
+  }
+}
+
+// 19. Chat: markdown, replies and threads (1.2). The rules — what markdown may
+//     draw, what an answer finds, which answers fold into a thread — are unit-
+//     tested (markdown.test.ts, thread-rules.test.ts). What only a browser can
+//     show is that a peer's message arrives drawn, that the tools are reached
+//     with a real pointer, and that a quote leads somewhere. It runs here, before
+//     the lanes that leave other servers and accounts in the shared profile, where
+//     a fresh tab no longer opens on the connect dialog.
+{
+  const n = (process.pid + 7) % 10000;
+  const ROOM = `talk-${n}`;
+  const ann = await connect(`ui-ann-${n}`);
+  const ben = await connect(`ui-ben-${n}`);
+  await ann.evaluate(click('button[title="Create channel"]'));
+  await waitFor(ann, `document.querySelector(".create-form")`);
+  await ann.evaluate(setInput(".create-form input[type=text]", ROOM));
+  await ann.evaluate(click(".create-form .create-btn"));
+  await sleep(2000);
+  await ben.evaluate(
+    `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(ROOM)});
+       if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
+  );
+  await waitFor(ben, `document.querySelector(".input-bar .chat-input")`).catch(() => {});
+  await sleep(1500);
+
+  const say = (tab, text, where = ".chat-main") =>
+    tab.evaluate(`(() => { const input = document.querySelector(${JSON.stringify(`${where} .input-bar .chat-input`)}); if (!input) return false;
+      input.value = ${JSON.stringify(text)}; input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.closest("form").requestSubmit(); return true; })()`);
+  /** The main flow's row holding `text`. */
+  const rowWith = (text, where = ".chat-main") =>
+    `[...document.querySelectorAll(${JSON.stringify(`${where} .msg`)})].find((e) => e.querySelector(".msg-content")?.textContent.includes(${JSON.stringify(text)}))`;
+  const arrived = (tab, text, where) => waitFor(tab, rowWith(text, where), 10_000).then(() => true, () => false);
+  /** A real pointer: onto the row (its tools show on hover), then onto `button` inside it. */
+  const useTool = async (tab, text, label, where) => {
+    const at = (sel) => tab.evaluate(`(() => { const row = ${rowWith(text, where)}; const el = ${sel}; if (!el) return null;
+      el.scrollIntoView({ block: "center" }); const r = el.getBoundingClientRect(); if (r.width === 0) return null;
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })()`);
+    const move = (p) => tab.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y, buttons: 0 });
+    const rowAt = await at("row");
+    if (!rowAt) return false;
+    await move(rowAt);
+    await sleep(150);
+    const btn = await at(`row?.querySelector('.msg-tools button[aria-label=${JSON.stringify(label)}]')`);
+    if (!btn) return false;
+    await move(btn);
+    for (const type of ["mousePressed", "mouseReleased"]) {
+      await tab.send("Input.dispatchMouseEvent", { type, x: btn.x, y: btn.y, button: "left", clickCount: 1, buttons: 1 });
+    }
+    await sleep(300);
+    return true;
+  };
+
+  // ── Markdown arrives drawn, and HTML arrives as text ──
+  await say(ann, "**bold** move and <b>raw</b>");
+  await say(ann, "```rust\nfn main() { let x = 1; }\n```");
+  check("a peer's markdown arrives drawn", (await arrived(ben, "bold move")) &&
+    (await ben.evaluate(`${rowWith("bold move")}?.querySelector(".msg-content strong")?.textContent === "bold"`)));
+  check("their HTML arrives as the text it is", await ben.evaluate(
+    `${rowWith("bold move")}?.querySelector(".msg-content").textContent.includes("<b>raw</b>") && !${rowWith("bold move")}?.querySelector(".msg-content b")`));
+  let coloured = false;
+  try {
+    await waitFor(ben, `${rowWith("fn main")}?.querySelector(".code-block pre code .tok-keyword")`, 10_000);
+    coloured = true;
+  } catch {
+    // reported below
+  }
+  check("a fenced rust block is coloured", coloured, await ben.evaluate(`${rowWith("fn main")}?.innerHTML.slice(0, 300) ?? "no row"`));
+
+  // ── A quote nested 300 deep: it arrives, and the conversation goes on (R2-01) ──
+  // 605 characters, within what the box takes: it once overflowed every
+  // reader's renderer and took the whole conversation off the screen
+  await say(ann, "> ".repeat(300) + "deepx");
+  await say(ann, "after the deep one");
+  check("a quote nested 300 deep arrives, and so does the next message",
+    (await arrived(ben, "deepx")) && (await arrived(ben, "after the deep one")),
+    await ben.evaluate(`[...document.querySelectorAll(".chat-main .msg .msg-content")].map((e) => e.textContent.slice(-30)).slice(-3).join(" | ")`));
+
+  // ── Shift+Enter is a new line, not a send ──
+  await ben.evaluate(`document.querySelector(".chat-main .input-bar .chat-input").focus()`);
+  await ben.send("Input.insertText", { text: "line one" });
+  // A key event carries its text, or the browser types nothing: "\r" is what Enter types
+  await ben.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, modifiers: 8, text: "\r" });
+  await ben.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, modifiers: 8 });
+  await ben.send("Input.insertText", { text: "line two" });
+  check("Shift+Enter keeps a new line in the box", await ben.evaluate(
+    `document.querySelector(".chat-main .input-bar .chat-input").value === "line one\\nline two"`));
+  await ben.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  await ben.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  check("and Enter sends both lines as one message", await arrived(ann, "line two") &&
+    (await ann.evaluate(`${rowWith("line two")}?.querySelector(".msg-content br") !== null`)));
+
+  // ── A reply, from the row's own tool ──
+  check("a message's Reply tool is reached with a real pointer", await useTool(ben, "bold move", "Reply"));
+  check("the box says what is being answered", await ben.evaluate(`/ui-ann/.test(document.querySelector(".chat-main .reply-bar")?.textContent ?? "")`));
+  await say(ben, "agreed on that");
+  check("the reply bar goes once it is sent", !(await ben.evaluate(`!!document.querySelector(".chat-main .reply-bar")`)));
+  check("the reply arrives quoting what it answers", (await arrived(ann, "agreed on that")) &&
+    (await ann.evaluate(`/bold move/.test(${rowWith("agreed on that")}?.querySelector(".quote-text")?.textContent ?? "")`)));
+  await ann.evaluate(`${rowWith("agreed on that")}?.querySelector("button.quote")?.click()`);
+  check("its quote leads to the message answered", await ann.evaluate(`${rowWith("bold move")}?.classList.contains("flash") ?? false`));
+
+  // ── Busy answers gather into a thread ──
+  await useTool(ann, "bold move", "Reply");
+  await say(ann, "second answer here");
+  await arrived(ben, "second answer here");
+  await useTool(ben, "second answer here", "Reply");
+  await say(ben, "third answer here");
+  let gathered = false;
+  try {
+    await waitFor(ann, `${rowWith("bold move")}?.querySelector(".thread-summary")?.textContent.includes("3 replies")`, 10_000);
+    gathered = true;
+  } catch {
+    // reported below
+  }
+  check("three answers from two people become a thread", gathered,
+    await ann.evaluate(`[...document.querySelectorAll(".chat-main .msg .msg-content")].map((e) => e.textContent).join(" | ").slice(0, 300)`));
+  check("and leave the main flow", !(await ann.evaluate(`!!${rowWith("third answer here")}`)));
+  await ann.evaluate(`${rowWith("bold move")}?.querySelector(".thread-summary")?.click()`);
+  check("the summary opens the thread", await ann.evaluate(
+    `[...document.querySelectorAll(".thread-pane .msg .msg-content")].some((e) => e.textContent.includes("third answer here"))`));
+  await ann.evaluate(`document.querySelector(".thread-pane .thread-close")?.click()`);
+  await sleep(300);
+
+  // ── An answer sent into a thread ──
+  await say(ann, "start a thread on me");
+  await arrived(ben, "start a thread on me");
+  await useTool(ben, "start a thread on me", "Reply in thread");
+  check("Reply in thread opens the thread", await ben.evaluate(`!!document.querySelector(".thread-pane")`));
+  await say(ben, "inside the thread", ".thread-pane");
+  let threaded = false;
+  try {
+    await waitFor(ann, `${rowWith("start a thread on me")}?.querySelector(".thread-summary")?.textContent.includes("1 reply")`, 10_000);
+    threaded = true;
+  } catch {
+    // reported below
+  }
+  check("an answer sent into a thread arrives in it", threaded);
+  check("and never in the main flow", !(await ann.evaluate(`!!${rowWith("inside the thread")}`)));
+
+  // ── The row's menu: a right click (a long press, on a touch screen) ──
+  const lineAt = await ann.evaluate(`(() => { const r = ${rowWith("line two")}?.getBoundingClientRect();
+    return r ? { x: Math.round(r.left + 40), y: Math.round(r.top + 10) } : null; })()`);
+  if (lineAt) {
+    for (const type of ["mousePressed", "mouseReleased"]) {
+      await ann.send("Input.dispatchMouseEvent", { type, x: lineAt.x, y: lineAt.y, button: "right", clickCount: 1, buttons: 2 });
+    }
+  }
+  await sleep(300);
+  check("a right click on a message opens its menu", await ann.evaluate(
+    `[...document.querySelectorAll(".msg-menu [role=menuitem]")].map((b) => b.textContent.trim()).join(",") === "React,Reply,Reply in thread,Forward,Pin,Copy text"`),
+    await ann.evaluate(`document.querySelector(".msg-menu")?.textContent ?? "no menu"`));
+  // At the pointer, or ending there where there is no room below it
+  check("where the pointer is", !!lineAt && (await ann.evaluate(`(() => { const r = document.querySelector(".msg-menu")?.getBoundingClientRect();
+    return !!r && Math.abs(r.left - ${lineAt?.x ?? 0}) < 4 && (Math.abs(r.top - ${lineAt?.y ?? 0}) < 4 || Math.abs(r.bottom - ${lineAt?.y ?? 0}) < 4); })()`)),
+    await ann.evaluate(`JSON.stringify(document.querySelector(".msg-menu")?.getBoundingClientRect())`) + ` vs ${JSON.stringify(lineAt)}`);
+  await ann.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await ann.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await sleep(200);
+  check("and Escape closes it", !(await ann.evaluate(`!!document.querySelector(".msg-menu")`)));
+
+  // ── The list is one Tab stop: its links, spoilers and Copy buttons too (R2-06) ──
+  await say(ann, "see [the site](https://\u0430pple.com/login) and ||hidden words||");
+  await arrived(ben, "see the site");
+  const stops = await ben.evaluate(`(() => {
+    const all = [...document.querySelectorAll(".chat-main .messages :is(button, a[href], [tabindex], video, audio)")]
+      .filter((e) => e.tabIndex >= 0 && !e.closest("[inert]") && e.checkVisibility());
+    return { stops: all.length, rows: new Set(all.map((e) => e.closest(".msg")).filter(Boolean)).size };
+  })()`);
+  check("the message list is one Tab stop: only the keyboard's row offers its links, spoilers and Copy", stops.rows === 1, JSON.stringify(stops));
+
+  // ── The link popup names where a look-alike host really goes (R2-12) ──
+  await ben.evaluate(`${rowWith("see the site")}?.querySelector(".msg-link")?.click()`);
+  await sleep(200);
+  check("the link popup shows a look-alike host as the punycode it is", await ben.evaluate(
+    `document.querySelector(".link-input")?.value === "https://xn--pple-43d.com/login" && /Goes to xn--pple-43d\\.com/.test(document.querySelector(".link-host")?.textContent ?? "")`),
+    await ben.evaluate(`(document.querySelector(".link-input")?.value ?? "no popup") + " / " + (document.querySelector(".link-host")?.textContent ?? "")`));
+  await ben.evaluate(`document.querySelector(".link-close-btn")?.click()`);
+  await sleep(200);
+
+  // ── A long press on a touch screen is the message menu, whatever it selected (D1-01) ──
+  // The phone's web view selects the word under the finger first, then asks
+  // for the menu: the native selection bar used to win
+  const pressed = await ben.evaluate(`(() => {
+    const row = ${rowWith("see the site")}; const p = row?.querySelector(".md-p"); if (!p) return false;
+    row.scrollIntoView({ block: "center" });
+    const word = document.createTreeWalker(p, NodeFilter.SHOW_TEXT).nextNode(); if (!word) return false;
+    const range = document.createRange(); range.setStart(word, 0); range.setEnd(word, 3);
+    getSelection().removeAllRanges(); getSelection().addRange(range);
+    const r = p.getBoundingClientRect();
+    const at = { bubbles: true, cancelable: true, pointerType: "touch", clientX: r.left + 5, clientY: r.top + 5 };
+    p.dispatchEvent(new PointerEvent("pointerdown", at));
+    p.dispatchEvent(new PointerEvent("contextmenu", at));
+    return true; })()`);
+  await sleep(200);
+  check("a long press opens the message menu, even over the word it selected", pressed &&
+    (await ben.evaluate(`!!document.querySelector(".msg-menu") && getSelection().toString() === ""`)),
+    await ben.evaluate(`(document.querySelector(".msg-menu") ? "menu" : "no menu") + ", selection: " + JSON.stringify(getSelection().toString())`));
+  for (const type of ["keyDown", "keyUp"]) {
+    await ben.send("Input.dispatchKeyEvent", { type, key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  }
+  await sleep(200);
+
+  // ── A tap leaves no tool bar over the text: a finger's hover sticks (D2-09) ──
+  const tapAt = await ben.evaluate(`(() => { const r = ${rowWith("after the deep one")}?.getBoundingClientRect();
+    return r ? { x: Math.round(r.left + 60), y: Math.round(r.top + r.height / 2) } : null; })()`);
+  if (tapAt) {
+    await ben.send("Input.dispatchTouchEvent", { type: "touchStart", touchPoints: [tapAt] });
+    await ben.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
+  }
+  await sleep(400);
+  // A phone keeps :hover on what the finger touched; this browser does not,
+  // so the row is held hovered the way the phone holds it
+  await ben.evaluate(`${rowWith("after the deep one")}?.setAttribute("data-tapped", "")`);
+  const root = (await ben.send("DOM.getDocument", { depth: 0 })).result?.root;
+  const nodeId = root && (await ben.send("DOM.querySelector", { nodeId: root.nodeId, selector: ".chat-main .msg[data-tapped]" })).result?.nodeId;
+  await ben.send("CSS.enable", {});
+  if (nodeId) await ben.send("CSS.forcePseudoState", { nodeId, forcedPseudoClasses: ["hover"] });
+  check("a tap on a message leaves no tool bar standing over it", !!tapAt && !!nodeId && (await ben.evaluate(
+    `(() => { const t = document.querySelector(".chat-main .msg[data-tapped] .msg-tools"); return !!t && getComputedStyle(t).display === "none"; })()`)),
+    await ben.evaluate(`document.querySelector(".chat-main .msg[data-tapped]")?.matches(":hover") ? "hovered" : "not hovered"`));
+  if (nodeId) await ben.send("CSS.forcePseudoState", { nodeId, forcedPseudoClasses: [] });
+  await ben.evaluate(`document.querySelector(".chat-main .msg[data-tapped]")?.removeAttribute("data-tapped")`);
+
+  // ── A reader at the end stays there as tall messages come (R2-05) ──
+  // Rows off screen are only estimated now (content-visibility): the end is
+  // followed by the reader's own scrolling, not by measuring
+  await ben.evaluate(`(() => { const el = document.querySelector(".chat-main .messages"); el.scrollTop = el.scrollHeight; })()`);
+  await sleep(300);
+  for (let i = 0; i < 20; i++) await say(ann, `tall ${i}\n- one\n- two\n- three\n\n\`\`\`\ncode ${i}\nmore code\n\`\`\``);
+  await arrived(ben, "code 19");
+  await sleep(800);
+  const below = await ben.evaluate(`(() => { const el = document.querySelector(".chat-main .messages"); return Math.round(el.scrollHeight - el.scrollTop - el.clientHeight); })()`);
+  check("a reader at the end stays at the end as tall messages arrive", below < 40, `${below} px above the end`);
+
+  // ── @ completes a name, and the person named sees it ──
+  await ben.evaluate(`document.querySelector(".chat-main .input-bar .chat-input").focus()`);
+  await ben.send("Input.insertText", { text: "@ui-a" });
+  await sleep(200);
+  check("@ offers the names that start so", await ben.evaluate(
+    `[...document.querySelectorAll(".chat-main .mention-option")].some((e) => e.textContent.includes("ui-ann-${n}"))`));
+  await ben.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  await ben.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  check("Enter takes the name instead of sending", await ben.evaluate(
+    `document.querySelector(".chat-main .input-bar .chat-input").value === "@ui-ann-${n} "`));
+  await ben.send("Input.insertText", { text: "look here" });
+  await ben.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  await ben.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  check("the person named sees their name marked", (await arrived(ann, "look here")) &&
+    (await ann.evaluate(`!!${rowWith("look here")}?.querySelector(".mention.me") && ${rowWith("look here")}.classList.contains("to-me")`)));
+
+  // ── "New" marks where the unread part begins ──
+  const openChannel = (tab, name) => tab.evaluate(
+    `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(name)});
+       if (!el) return false; el.dispatchEvent(new MouseEvent("click", { bubbles: true })); return true; })()`);
+  await openChannel(ann, "lobby-chat");
+  await sleep(600);
+  await say(ben, "while you were reading elsewhere");
+  await say(ben, "and one more");
+  await sleep(1200);
+  await openChannel(ann, ROOM);
+  await sleep(800);
+  check("the first unread message gets a New divider", await ann.evaluate(
+    `(() => { const d = document.querySelector(".chat-main .new-divider"); const next = d?.nextElementSibling;
+       return !!next && next.querySelector(".msg-content")?.textContent.includes("while you were reading elsewhere"); })()`));
+
+  // ── Search, here and everywhere ──
+  await ann.evaluate(`document.querySelector(".search-btn")?.click()`);
+  await waitFor(ann, `document.querySelector(".search-pane .search-input")`, 5_000).catch(() => {});
+  await ann.evaluate(setInput(".search-pane .search-input", "BOLD"));
+  await sleep(300);
+  check("search finds a message, whatever its case", await ann.evaluate(
+    `[...document.querySelectorAll(".search-pane .result")].some((e) => e.textContent.includes("bold move"))`));
+  await ann.evaluate(`[...document.querySelectorAll(".search-pane .result")].find((e) => e.textContent.includes("bold move"))?.click()`);
+  await sleep(500);
+  check("picking a result goes to the message", await ann.evaluate(
+    `!document.querySelector(".search-pane") && (${rowWith("bold move")}?.classList.contains("flash") ?? false)`));
+  await ann.evaluate(`document.querySelector(".search-btn")?.click()`);
+  await waitFor(ann, `document.querySelector(".search-pane .search-input")`, 5_000).catch(() => {});
+  await ann.evaluate(`[...document.querySelectorAll(".search-pane .scope")].find((b) => /everywhere/i.test(b.textContent))?.click()`);
+  await ann.evaluate(setInput(".search-pane .search-input", "inside the thread"));
+  await sleep(300);
+  check("everywhere names the conversation a result is in", await ann.evaluate(
+    `[...document.querySelectorAll(".search-pane .result")].some((e) => e.querySelector(".result-conv")?.textContent.includes(${JSON.stringify(ROOM)}))`));
+  await ann.evaluate(`document.querySelector(".search-pane .search-close")?.click()`);
+
+  // ── A message far past what the box takes is cut where it arrives (D-7) ──
+  // Only a modified client sends one; the reader keeps 16 KiB of it. Last
+  // here: a row that long changes where the others sit
+  await openChannel(ann, ROOM);
+  await sleep(500);
+  await say(ann, `long${"z".repeat(20_000)}`);
+  check("a message past 16 KiB arrives cut to 16 KiB", (await arrived(ben, "longzzz")) &&
+    (await ben.evaluate(`${rowWith("longzzz")}?.querySelector(".msg-content")?.textContent.trim().length === 16 * 1024`)),
+    String(await ben.evaluate(`${rowWith("longzzz")}?.querySelector(".msg-content")?.textContent.trim().length`)));
+
+  // The channel's own settings, from its row's gear: `set` runs in the dialog
+  const settings = async (set) => {
+    await ann.evaluate(`(() => { const row = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(ROOM)});
+      row?.parentElement?.querySelector('[title="Channel settings"]')?.dispatchEvent(new MouseEvent("click", { bubbles: true })); return true; })()`);
+    await waitFor(ann, `document.querySelector('select[data-opt="message-ttl"]')`, 5_000).catch(() => {});
+    await ann.evaluate(set);
+    await ann.evaluate(`document.querySelector('select[data-opt="message-ttl"]')?.closest("form")?.querySelector(".create-btn")?.dispatchEvent(new MouseEvent("click", { bubbles: true }))`);
+    await sleep(1200);
+  };
+  const timer = (words) => `(() => { const el = document.querySelector('select[data-opt="message-ttl"]');
+    el.selectedIndex = [...el.options].findIndex((o) => o.textContent.includes(${JSON.stringify(words)}));
+    el.dispatchEvent(new Event("change", { bubbles: true })); })()`;
+  const timerShown = (words) => waitFor(ann, `document.querySelector(".chat-main .ttl-label")?.textContent.includes(${JSON.stringify(words)})`, 10_000).catch(() => {});
+
+  // ── An edit lives no longer than what is left of its message (R3-06) ──
+  // It carries the new text, and in a kept log it must not outlast the
+  // message it changes, however long the channel's timer is by then. Read in
+  // what the reader's page is handed for each event: the event bus copies
+  // every payload for its listeners (web/backend/events.ts `emit`), and the
+  // copy taken here changes nothing.
+  await settings(timer("5 minutes"));
+  await timerShown("5 minutes");
+  await say(ann, "short-lived words");
+  await arrived(ben, "short-lived words");
+  await settings(timer("1 hour"));
+  await timerShown("1 hour");
+  await ben.evaluate(`(() => { const copy = window.__clone = structuredClone; window.__events = [];
+    window.structuredClone = (v, o) => { const d = v?.data; if (d?.event != null) window.__events.push({ ttl: d.ttl_secs ?? null, event: d.event }); return copy(v, o); };
+    return true; })()`);
+  await useTool(ann, "short-lived words", "Edit");
+  await ann.evaluate(`(() => { const t = document.querySelector(".chat-main .edit-input"); if (!t) return false;
+    t.value = "short-lived words, edited"; t.dispatchEvent(new Event("input", { bubbles: true })); t.focus(); return true; })()`);
+  await ann.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" });
+  await ann.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  await waitFor(ben, `${rowWith("short-lived words, edited")}?.querySelector(".edited")`, 10_000).catch(() => {});
+  const edits = await ben.evaluate(`window.__events.filter((e) => e.event?.kind === "edit")`);
+  check("an edit's timer is what is left of its message's, not the channel's longer one",
+    edits.length === 1 && edits[0].ttl > 0 && edits[0].ttl <= 300, JSON.stringify(edits));
+  await ben.evaluate(`(() => { window.structuredClone = window.__clone; return true; })()`);
+
+  // ── Behind an 18+ gate, search finds nothing (R2-15) ──
+  // What the pane hides is not searched either: here, nor everywhere
+  const search = async (scope, words) => {
+    await ben.evaluate(`document.querySelector(".search-pane") || document.querySelector(".chat-main .search-btn, .search-btn")?.click()`);
+    await waitFor(ben, `document.querySelector(".search-pane .search-input")`, 5_000).catch(() => {});
+    await ben.evaluate(`[...document.querySelectorAll(".search-pane .scope")].find((b) => b.textContent.trim() === ${JSON.stringify(scope)})?.click()`);
+    await ben.evaluate(setInput(".search-pane .search-input", words));
+    await sleep(600);
+    const found = await ben.evaluate(`[...document.querySelectorAll(".search-pane .result")].map((e) => e.textContent.slice(0, 80))`);
+    await ben.evaluate(`document.querySelector(".search-pane .search-close")?.click()`);
+    await sleep(200);
+    return found;
+  };
+  const before18 = await search("Everywhere", "bold move");
+  await settings(`document.querySelector('.password-dialog input[data-opt="nsfw"]')?.click()`);
+  const gate = await waitFor(ben, `document.querySelector(".chat-main .nsfw-gate")`, 10_000).then(() => true, () => false);
+  const here = await search("This conversation", "bold move");
+  const everywhere = await search("Everywhere", "bold move");
+  check("an 18+ channel nobody here said yes to: This conversation finds nothing behind its gate",
+    gate && before18.length > 0 && here.length === 0, JSON.stringify({ gate, before18, here }));
+  check("and Everywhere leaves it out", gate && before18.length > 0 && everywhere.length === 0, JSON.stringify({ everywhere }));
+
+  for (const [who, tab] of [["writer", ann], ["reader", ben]]) {
+    const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));
+    check(`the chat's ${who} threw nothing`, fatal.length === 0, fatal.slice(0, 2).join(" | "));
+  }
+}
+
+// 20. Files (1.3). The rules — the envelope's bounds, sniffing, the preview,
+//     save names, the cache — are unit-tested (envelope.rs, chat-rules,
+//     file-sniff, file-rules) and the transfer has its own lanes (files.rs live
+//     tests, the self-test's FILE_KIB). What only a browser shows is the card:
+//     a preview drawn with nothing fetched, Load drawing what the bytes are,
+//     the original sent as it is, a file that is only ever saved, and the relay
+//     letting go (test-web.sh runs it with cache_mins = 1) followed by a member
+//     sending it again, or by nobody. Before 14, 17 and 18, as 19 is.
+{
+  const n = (process.pid + 11) % 10000;
+  const ROOM = `files-${n}`;
+  const ann = await connect(`ui-fa-${n}`);
+  const ben = await connect(`ui-fb-${n}`);
+  await ann.evaluate(click('button[title="Create channel"]'));
+  await waitFor(ann, `document.querySelector(".create-form")`);
+  await ann.evaluate(setInput(".create-form input[type=text]", ROOM));
+  await ann.evaluate(click(".create-form .create-btn"));
+  await sleep(2000);
+  const enter = (tab) =>
+    tab.evaluate(
+      `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(ROOM)});
+         if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
+    );
+  await enter(ben);
+  await waitFor(ben, `document.querySelector(".chat-main .input-bar .chat-input")`).catch(() => {});
+  await sleep(1500);
+
+  const say = (tab, text) =>
+    tab.evaluate(`(() => { const input = document.querySelector(".chat-main .input-bar .chat-input"); if (!input) return false;
+      input.value = ${JSON.stringify(text)}; input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.closest("form").requestSubmit(); return true; })()`);
+  const rowWith = (text) =>
+    `[...document.querySelectorAll(".chat-main .msg")].find((e) => e.querySelector(".msg-content")?.textContent.includes(${JSON.stringify(text)}))`;
+  /** Stage `make` (code that puts a File in window.__f) through the hidden picker. */
+  const attach = (tab, make) =>
+    tab.evaluate(`(async () => { ${make}; const input = document.querySelector(".chat-main .input-bar .file-picker"); if (!input) return false;
+      const dt = new DataTransfer(); dt.items.add(window.__f); input.files = dt.files;
+      input.dispatchEvent(new Event("change", { bubbles: true })); return true; })()`);
+  const picture = (mime, name) => `const c = document.createElement("canvas"); c.width = 320; c.height = 200; const g = c.getContext("2d");
+    for (let x = 0; x < 320; x += 20) { g.fillStyle = "hsl(" + x + ",70%,50%)"; g.fillRect(x, 0, 20, 200); }
+    const blob = await new Promise((r) => c.toBlob(r, ${JSON.stringify(mime)}, 0.92));
+    window.__f = new File([blob], ${JSON.stringify(name)}, { type: blob.type });`;
+  const text = (name, body, type = "text/plain") =>
+    `window.__f = new File([${JSON.stringify(body)}], ${JSON.stringify(name)}, { type: ${JSON.stringify(type)} });`;
+  /** Press a card's button by its words. */
+  const press = (tab, rowText, words) =>
+    tab.evaluate(`(() => { const b = [...(${rowWith(rowText)})?.querySelectorAll(".file-card button") ?? []].find((e) => e.textContent.trim().startsWith(${JSON.stringify(words)}));
+      if (!b) return false; b.click(); return true; })()`);
+  const fetched = (tab) => tab.evaluate(`performance.getEntriesByType("resource").filter((e) => e.name.includes("/f/v1/")).length`);
+  /** A cheap hash of what an image shows, decoded where it is. */
+  const pixels = (source) => `(async () => { const src = ${source}; if (!src) return null;
+    const bmp = await createImageBitmap(src); const c = document.createElement("canvas"); c.width = bmp.width; c.height = bmp.height;
+    const g = c.getContext("2d"); g.drawImage(bmp, 0, 0); const d = g.getImageData(0, 0, c.width, c.height).data;
+    let h = 2166136261; for (let i = 0; i < d.length; i++) { h ^= d[i]; h = Math.imul(h, 16777619) >>> 0; } return c.width + "x" + c.height + ":" + h; })()`;
+
+  check("the composer offers attaching where the relay keeps files",
+    await ann.evaluate(`!!document.querySelector(".chat-main .input-bar .file-picker")`));
+
+  // ── A photo, compressed by default ──
+  await attach(ann, picture("image/jpeg", "photo.jpg"));
+  await waitFor(ann, `document.querySelector(".file-chip .chip-mode")`, 5_000).catch(() => {});
+  check("a photo is staged as a chip, compressed, with the original one press away", await ann.evaluate(
+    `(() => { const m = document.querySelector(".file-chip .chip-mode"); return !!m && m.textContent.trim() === "Original (1:1)" && m.getAttribute("aria-pressed") === "false"; })()`));
+  await say(ann, "look at this");
+  const arrived = await waitFor(ben, `${rowWith("look at this")}?.querySelector(".file-card")`, 20_000).then(() => true, () => false);
+  check("the file's message arrives with its card", arrived);
+  check("the card shows the preview's pixels, with nothing fetched", await ben.evaluate(
+    `!!${rowWith("look at this")}?.querySelector(".file-card canvas") && !${rowWith("look at this")}?.querySelector(".file-card img")`) &&
+    (await fetched(ben)) === 0);
+  check("a compressed photo goes as WebP", await ben.evaluate(`${rowWith("look at this")}?.querySelector(".file-name")?.textContent.endsWith(".webp")`));
+  await press(ben, "look at this", "Load");
+  const drawn = await waitFor(ben, `${rowWith("look at this")}?.querySelector(".file-card img")?.naturalWidth > 0`, 20_000).then(() => true, () => false);
+  check("Load fetches it and draws what its bytes are", drawn && (await fetched(ben)) > 0);
+  await ben.evaluate(`${rowWith("look at this")}?.querySelector(".file-card .file-media")?.click()`);
+  check("a loaded picture opens big", await waitFor(ben, `document.querySelector(".lightbox img")`, 5_000).then(() => true, () => false));
+  await ben.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await ben.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await sleep(300);
+  check("and Escape closes it", !(await ben.evaluate(`!!document.querySelector(".lightbox")`)));
+
+  // ── The original, exactly ──
+  await attach(ann, picture("image/jpeg", "orig.jpg"));
+  await waitFor(ann, `document.querySelector(".file-chip .chip-mode")`, 5_000).catch(() => {});
+  await ann.evaluate(`document.querySelector(".file-chip .chip-mode")?.click()`);
+  const sent = await ann.evaluate(pixels("window.__f"));
+  await say(ann, "the original");
+  await waitFor(ben, `${rowWith("the original")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  await press(ben, "the original", "Load");
+  await waitFor(ben, `${rowWith("the original")}?.querySelector(".file-card img")?.naturalWidth > 0`, 20_000).catch(() => {});
+  const got = await ben.evaluate(pixels(`${rowWith("the original")}?.querySelector(".file-card img")`));
+  check("the original goes as it is: its name, its size, its very pixels", sent !== null && got === sent &&
+    (await ben.evaluate(`${rowWith("the original")}?.querySelector(".file-name")?.textContent === "orig.jpg"`)), `${sent} vs ${got}`);
+
+  // ── A text file: deflated, saved byte for byte ──
+  const dir = mkdtempSync(join(tmpdir(), "voipc-ui-files-"));
+  await ann.send("Page.setDownloadBehavior", { behavior: "allow", downloadPath: dir });
+  const notes = "a line of somebody's notes, again and again\n".repeat(500);
+  await attach(ben, text("notes.txt", notes));
+  await say(ben, "my notes");
+  await waitFor(ann, `${rowWith("my notes")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  check("a file that is not a picture gets a plain card, with no Load", await ann.evaluate(
+    `(() => { const c = ${rowWith("my notes")}?.querySelector(".file-card"); return !!c && !c.classList.contains("media") &&
+       ![...c.querySelectorAll("button")].some((b) => b.textContent.includes("Load")); })()`));
+  await press(ann, "my notes", "Download");
+  let saved = null;
+  for (let i = 0; i < 60 && saved === null; i++) {
+    await sleep(250);
+    const done = readdirSync(dir).find((f) => f === "notes.txt");
+    if (done) saved = readFileSync(join(dir, done), "utf8");
+  }
+  check("a text file arrives byte for byte, under its own name", saved === notes, saved === null ? `nothing in ${dir}: ${readdirSync(dir)}` : `${saved.length} chars`);
+
+  // ── What its bytes are decides, never what it claims ──
+  // An SVG with a script, claimed as a PNG picture: it gets a picture's card
+  // and Load, and loaded, its bytes say it is no picture
+  await attach(ben, text("pic.png", "<svg xmlns='http://www.w3.org/2000/svg' onload='window.__ran=1'><script>window.__ran=1</script></svg>", "image/png"));
+  await say(ben, "a picture, it says");
+  await waitFor(ann, `${rowWith("a picture, it says")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  await press(ann, "a picture, it says", "Load");
+  const refused = await waitFor(ann, `${rowWith("a picture, it says")}?.querySelector(".file-note")`, 20_000).then(() => true, () => false);
+  check("a page claimed as a picture is loaded, then never shown, only offered to save", refused && (await ann.evaluate(
+    `(() => { const c = ${rowWith("a picture, it says")}?.querySelector(".file-card"); return !!c && !c.querySelector("img, iframe, object, embed, video, svg:not(.icon)") && !window.__ran; })()`)));
+
+  // ── Settings → Files: what the chat names, and what this tab keeps ──
+  const fmRow = (name) => `[...document.querySelectorAll(".fm-row")].find((r) => r.querySelector(".fm-name")?.textContent === ${JSON.stringify(name)})`;
+  const fmNames = (tab) => tab.evaluate(`[...document.querySelectorAll(".fm-row .fm-name")].map((e) => e.textContent).sort().join(",")`);
+  const fmShow = (tab, value) => tab.evaluate(`(() => { const s = document.querySelectorAll(".fm-controls select")[0]; s.value = ${JSON.stringify(value)};
+    s.dispatchEvent(new Event("change", { bubbles: true })); return true; })()`);
+  const fmPress = (tab, name, words) => tab.evaluate(`(() => { const b = [...(${fmRow(name)})?.querySelectorAll(".fm-actions button") ?? []].find((e) => e.textContent.trim() === ${JSON.stringify(words)});
+    if (!b) return false; b.click(); return true; })()`);
+  const usedNow = (tab) => tab.evaluate(`document.querySelector(".fm-usage .num")?.textContent ?? ""`);
+  // From another conversation, so going to a message has to open its own
+  await ann.evaluate(`[...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === "lobby-chat")
+    ?.dispatchEvent(new MouseEvent("click", { bubbles: true }))`);
+  await sleep(600);
+  const away = !(await ann.evaluate(`!!${rowWith("the original")}`));
+  await realClick(ann, ".settings-btn");
+  await waitFor(ann, `document.querySelector(".tab")`, 8_000);
+  await ann.evaluate(`[...document.querySelectorAll(".tab")].find((b) => b.textContent.trim() === "Files")?.click()`);
+  const listed = await waitFor(ann, `${fmRow("notes.txt")}`, 8_000).then(() => true, () => false);
+  const everything = await fmNames(ann);
+  check("Settings → Files lists every file the chat here names", listed && ["orig.jpg", "notes.txt", "pic.png"].every((f) => everything.includes(f)) &&
+    /\.webp/.test(everything), everything);
+  await sleep(1500);
+  const before = await usedNow(ann);
+  await fmShow(ann, "local");
+  await sleep(200);
+  check("with what this tab keeps of them: the files it sent and loaded", (await fmNames(ann)) === everything && !before.startsWith("0 B"), `${await fmNames(ann)} · ${before}`);
+  await fmShow(ann, "other");
+  await sleep(200);
+  check("filtered by type, from what the message says", (await fmNames(ann)) === "notes.txt", await fmNames(ann));
+  await fmShow(ann, "all");
+  await sleep(200);
+  await fmPress(ann, "notes.txt", "Remove copy");
+  const removed = await waitFor(ann, `!${fmRow("notes.txt")}?.querySelector(".fm-local")`, 5_000).then(() => true, () => false);
+  check("Remove copy takes a file off this tab, and the space it took", removed && (await usedNow(ann)) !== before, `${before} → ${await usedNow(ann)}`);
+  const fetchedBefore = await fetched(ann);
+  await fmPress(ann, "orig.jpg", "Show");
+  await waitFor(ann, `${fmRow("orig.jpg")}?.querySelector(".file-card")`, 5_000).catch(() => {});
+  await ann.evaluate(`[...(${fmRow("orig.jpg")})?.querySelectorAll(".file-card button") ?? []].find((b) => b.textContent.trim() === "Load")?.click()`);
+  const local = await waitFor(ann, `${fmRow("orig.jpg")}?.querySelector(".file-card img")?.naturalWidth > 0`, 10_000).then(() => true, () => false);
+  check("a row opens the chat's card, and Load draws it from this tab's copy", local && (await fetched(ann)) === fetchedBefore);
+  await fmPress(ann, "orig.jpg", "Go to message");
+  const closed = await waitFor(ann, `!document.querySelector(".fm-row")`, 5_000).then(() => true, () => false);
+  await sleep(800);
+  check("Go to message closes Settings, opens its conversation and brings the message into view", away && closed && (await ann.evaluate(
+    `(() => { const r = ${rowWith("the original")}; const a = document.activeElement; return !!r && !!a && (r === a || r.contains(a) || a.contains(r)); })()`)),
+    await ann.evaluate(`document.activeElement?.className ?? "nothing"`));
+
+  // ── Files in a direct message, with the other in another room ──
+  // Its conversation used to be looked for among `users`, the room one stands
+  // in: someone talking elsewhere got no attach button, and what came could
+  // not be loaded, opened from Settings, forwarded in or sent again (1.3.1)
+  const dee = await connect(`ui-fd-${n}`);
+  await enter(dee);
+  const deeRow = `[...document.querySelectorAll(".user .name")].find((e) => e.title.startsWith(${JSON.stringify(`ui-fd-${n}#`)}))`;
+  await waitFor(ann, deeRow).catch(() => {});
+  await ann.evaluate(`(() => { const el = ${deeRow}?.closest(".user"); if (!el) return false;
+    el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 40 })); return true; })()`);
+  await sleep(300);
+  await ann.evaluate(`[...document.querySelectorAll(".ctx-item")].find((e) => /direct message/i.test(e.textContent))?.click()`);
+  await waitFor(ann, `document.querySelector(".chat-main .input-bar .chat-input")?.placeholder.includes("ui-fd-")`, 5_000).catch(() => {});
+  await say(ann, "hi dee");
+  const annEntry = `[...document.querySelectorAll(".dm-entry")].find((e) => e.textContent.includes("ui-fa-${n}"))`;
+  await waitFor(dee, annEntry, 15_000).catch(() => {});
+  // dee goes to a room of its own, then reads the conversation there
+  await dee.evaluate(click('button[title="Create channel"]'));
+  await waitFor(dee, `document.querySelector(".create-form")`).catch(() => {});
+  await dee.evaluate(setInput(".create-form input[type=text]", `elsewhere-${n}`));
+  await dee.evaluate(click(".create-form .create-btn"));
+  const parted = await waitFor(ann, `!${deeRow}`, 10_000).then(() => true, () => false);
+  await sleep(1000);
+  await dee.evaluate(`${annEntry}?.click()`);
+  check("a direct message to someone in another room offers attaching", parted &&
+    (await ann.evaluate(`!!document.querySelector(".chat-main .input-bar .file-picker")`)));
+  for (const [file, words] of [["dm.png", "for dee, elsewhere"], ["dm-row.png", "open me from Settings"], ["dm-later.png", "load me once the relay let go"]]) {
+    await attach(ann, picture("image/png", file));
+    await say(ann, words);
+    await waitFor(dee, `${rowWith(words)}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  }
+  await press(dee, "for dee, elsewhere", "Load");
+  check("and what comes loads on the other side", await waitFor(dee,
+    `${rowWith("for dee, elsewhere")}?.querySelector(".file-card img")?.naturalWidth > 0`, 20_000).then(() => true, () => false),
+    await dee.evaluate(`${rowWith("for dee, elsewhere")}?.querySelector(".file-card")?.textContent ?? "no card"`));
+  await realClick(dee, ".settings-btn");
+  await waitFor(dee, `document.querySelector(".tab")`, 8_000).catch(() => {});
+  await dee.evaluate(`[...document.querySelectorAll(".tab")].find((b) => b.textContent.trim() === "Files")?.click()`);
+  await waitFor(dee, fmRow("dm-row.png"), 8_000).catch(() => {});
+  await fmPress(dee, "dm-row.png", "Show");
+  await waitFor(dee, `${fmRow("dm-row.png")}?.querySelector(".file-card")`, 5_000).catch(() => {});
+  await dee.evaluate(`[...(${fmRow("dm-row.png")})?.querySelectorAll(".file-card button") ?? []].find((b) => b.textContent.trim() === "Load")?.click()`);
+  check("its row in Settings → Files loads it too", await waitFor(dee,
+    `${fmRow("dm-row.png")}?.querySelector(".file-card img")?.naturalWidth > 0`, 20_000).then(() => true, () => false));
+  await dee.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await dee.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await waitFor(dee, `!document.querySelector(".fm-row")`, 5_000).catch(() => {});
+  // A file from ann's room, forwarded into the conversation
+  await ann.evaluate(`[...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(ROOM)})
+    ?.dispatchEvent(new MouseEvent("click", { bubbles: true }))`);
+  await waitFor(ann, rowWith("the original"), 5_000).catch(() => {});
+  const origAt = await ann.evaluate(`(() => { const r = ${rowWith("the original")}; if (!r) return null; r.scrollIntoView({ block: "center" });
+    const b = r.getBoundingClientRect(); return { x: Math.round(b.left + 40), y: Math.round(b.top + 10) }; })()`);
+  if (origAt) {
+    for (const type of ["mousePressed", "mouseReleased"]) {
+      await ann.send("Input.dispatchMouseEvent", { type, x: origAt.x, y: origAt.y, button: "right", clickCount: 1, buttons: 2 });
+    }
+  }
+  await sleep(300);
+  await ann.evaluate(`[...document.querySelectorAll(".msg-menu [role=menuitem]")].find((e) => e.textContent.trim() === "Forward")?.click()`);
+  await waitFor(ann, `document.querySelector(".forward-dialog .forward-dest")`, 3_000).catch(() => {});
+  await ann.evaluate(`[...document.querySelectorAll(".forward-dialog .forward-dest")].find((b) => b.textContent.includes("@ui-fd-${n}"))?.click()`);
+  await waitFor(dee, `${rowWith("the original")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  await press(dee, "the original", "Load");
+  check("a file forwarded into it arrives and loads", await waitFor(dee,
+    `${rowWith("the original")}?.querySelector(".file-card img")?.naturalWidth > 0`, 20_000).then(() => true, () => false),
+    await ann.evaluate(`window.__toasts?.slice(-2).join(" | ") ?? ""`));
+
+  // ── The relay lets go; a member sends it again, or nobody can ──
+  await attach(ben, picture("image/png", "gone.png"));
+  await say(ben, "nobody else has this one");
+  await waitFor(ann, `${rowWith("nobody else has this one")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  // ben leaves, the only one holding gone.png; ann still holds her photo
+  await ben.send("Page.navigate", { url: "about:blank" });
+  console.log("waiting 70 s for the relay to let go of the files (cache_mins = 1)…");
+  await sleep(70_000);
+  const cat = await connect(`ui-fc-${n}`);
+  await enter(cat);
+  // The two messages come to cat as ann's copy of the channel's history
+  const history = await waitFor(cat, `${rowWith("look at this")}?.querySelector(".file-card") && ${rowWith("nobody else has this one")}?.querySelector(".file-card")`, 30_000).then(() => true, () => false);
+  check("files come with the channel's history to someone who joins later", history);
+  await press(cat, "look at this", "Load");
+  await press(cat, "nobody else has this one", "Load");
+  const reseeded = await waitFor(cat, `${rowWith("look at this")}?.querySelector(".file-card img")?.naturalWidth > 0`, 45_000).then(() => true, () => false);
+  check("once the relay let go of it, a member who holds it sends it again", reseeded,
+    await cat.evaluate(`${rowWith("look at this")}?.querySelector(".file-card")?.textContent ?? "no card"`));
+  check("while nobody has answered, the card says it is asking", await cat.evaluate(
+    `${rowWith("nobody else has this one")}?.querySelector(".file-card")?.textContent.includes("Asking members")`));
+  // Inside the picture's box, where "Asking members…" was: under the card it
+  // sat out of view on a phone (D2-11)
+  const unavailable = await waitFor(cat, `${rowWith("nobody else has this one")}?.querySelector(".file-preview [role=alert]")?.textContent.includes("Nobody online has this file")`, 90_000).then(() => true, () => false);
+  check("and with its only holder gone, it says nobody online has it, where it was asking", unavailable,
+    await cat.evaluate(`${rowWith("nobody else has this one")}?.querySelector(".file-card")?.textContent ?? "no card"`));
+  // Its only holder, ann, is asked through the direct conversation, from another room
+  await press(dee, "load me once the relay let go", "Load");
+  check("in a direct message too, its sender sends it again once the relay let go", await waitFor(dee,
+    `${rowWith("load me once the relay let go")}?.querySelector(".file-card img")?.naturalWidth > 0`, 45_000).then(() => true, () => false),
+    await dee.evaluate(`${rowWith("load me once the relay let go")}?.querySelector(".file-card")?.textContent ?? "no card"`));
+
+  for (const [who, tab] of [["sender", ann], ["receiver", ben], ["late joiner", cat], ["direct partner", dee]]) {
+    const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));
+    check(`the files lane's ${who} threw nothing`, fatal.length === 0, fatal.slice(0, 2).join(" | "));
+  }
+}
+
+// 21. Edit, delete, reactions, pins and forward (1.3). The rules — who may
+//     edit, delete or pin, latest-wins reactions, the tombstone a hand-off
+//     cannot undo — are unit-tested (chat-rules, channel-post-rules,
+//     envelope.rs, sync.rs). What only a browser shows is each one going round
+//     the relay and back, drawn where the other person reads, and a forwarded
+//     file loading in a conversation it was never sent to. Before 14, 17 and
+//     18, as 19 and 20 are.
+{
+  const n = (process.pid + 13) % 10000;
+  const ROOM = `events-${n}`;
+  // ann creates the channel, so she manages it; ben is a member
+  const ann = await connect(`ui-ea-${n}`);
+  const ben = await connect(`ui-eb-${n}`);
+  await ann.evaluate(click('button[title="Create channel"]'));
+  await waitFor(ann, `document.querySelector(".create-form")`);
+  await ann.evaluate(setInput(".create-form input[type=text]", ROOM));
+  await ann.evaluate(click(".create-form .create-btn"));
+  await sleep(2000);
+  const openChannel = (tab, name, how = "click") => tab.evaluate(
+    `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(name)});
+       if (!el) return false; el.dispatchEvent(new MouseEvent(${JSON.stringify(how)}, { bubbles: true })); return true; })()`);
+  await openChannel(ben, ROOM, "dblclick");
+  await waitFor(ben, `document.querySelector(".chat-main .input-bar .chat-input")`).catch(() => {});
+  await sleep(1500);
+
+  const say = (tab, text) =>
+    tab.evaluate(`(() => { const input = document.querySelector(".chat-main .input-bar .chat-input"); if (!input) return false;
+      input.value = ${JSON.stringify(text)}; input.dispatchEvent(new Event("input", { bubbles: true }));
+      input.closest("form").requestSubmit(); return true; })()`);
+  const rowWith = (text) =>
+    `[...document.querySelectorAll(".chat-main .msg")].find((e) => e.querySelector(".msg-content")?.textContent.includes(${JSON.stringify(text)}))`;
+  const arrived = (tab, text) => waitFor(tab, rowWith(text), 10_000).then(() => true, () => false);
+  const gone = (tab, text) => waitFor(tab, `!${rowWith(text)}`, 10_000).then(() => true, () => false);
+  /** A real pointer onto the row, then onto its tool `label`. */
+  const useTool = async (tab, text, label) => {
+    const at = (sel) => tab.evaluate(`(() => { const row = ${rowWith(text)}; const el = ${sel}; if (!el) return null;
+      el.scrollIntoView({ block: "center" }); const r = el.getBoundingClientRect(); if (r.width === 0) return null;
+      return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; })()`);
+    const move = (p) => tab.send("Input.dispatchMouseEvent", { type: "mouseMoved", x: p.x, y: p.y, buttons: 0 });
+    const rowAt = await at("row");
+    if (!rowAt) return false;
+    await move(rowAt);
+    await sleep(150);
+    const btn = await at(`row?.querySelector('.msg-tools button[aria-label=${JSON.stringify(label)}]')`);
+    if (!btn) return false;
+    await move(btn);
+    for (const type of ["mousePressed", "mouseReleased"]) {
+      await tab.send("Input.dispatchMouseEvent", { type, x: btn.x, y: btn.y, button: "left", clickCount: 1, buttons: 1 });
+    }
+    await sleep(300);
+    return true;
+  };
+  const menuItems = (tab) => tab.evaluate(`[...document.querySelectorAll(".msg-menu [role=menuitem]")].map((b) => b.textContent.trim()).join(",")`);
+  const pressItem = (tab, words) => tab.evaluate(`(() => { const b = [...document.querySelectorAll(".msg-menu [role=menuitem]")].find((e) => e.textContent.trim() === ${JSON.stringify(words)});
+    if (!b) return false; b.click(); return true; })()`);
+  const enter = async (tab) => {
+    await tab.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13, text: "\r" });
+    await tab.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Enter", code: "Enter", windowsVirtualKeyCode: 13 });
+  };
+
+  // ── A reaction, and taking it back ──
+  await say(ann, "react to this one");
+  await arrived(ben, "react to this one");
+  const picked = (await useTool(ben, "react to this one", "React")) &&
+    (await waitFor(ben, `document.querySelector(".react-picker")`, 3_000).then(() => true, () => false));
+  check("React opens the emoji picker, reached with a real pointer", picked);
+  await ben.evaluate(`document.querySelector('.react-picker button[aria-label="React with 👍"]')?.click()`);
+  const chip = (tab) => `${rowWith("react to this one")}?.querySelector(".reaction")`;
+  check("a reaction arrives as a chip under the message, with its count",
+    await waitFor(ann, `${chip(ann)}?.textContent === "👍1"`, 10_000).then(() => true, () => false),
+    await ann.evaluate(`${chip(ann)}?.outerHTML ?? "no chip"`));
+  check("and the reactor's own chip is pressed", await ben.evaluate(`${chip(ben)}?.getAttribute("aria-pressed") === "true"`));
+  check("which names who reacted", await ann.evaluate(`${chip(ann)}?.title === "ui-eb-${n}"`), await ann.evaluate(`${chip(ann)}?.title ?? ""`));
+  await ben.evaluate(`${chip(ben)}?.click()`);
+  check("pressing your own chip takes the reaction back, for everyone",
+    await waitFor(ann, `!${chip(ann)}`, 10_000).then(() => true, () => false));
+  // The menu's React too (a long press on a phone): it once read the message
+  // after the menu had let go of it, threw, and opened nothing
+  const before = ben.errors.length;
+  await useTool(ben, "react to this one", "More");
+  await pressItem(ben, "React");
+  check("React from the message menu opens the picker too",
+    (await waitFor(ben, `document.querySelector(".react-picker")`, 3_000).then(() => true, () => false)) && ben.errors.length === before,
+    ben.errors.slice(before, before + 2).join(" | "));
+  for (const type of ["keyDown", "keyUp"]) {
+    await ben.send("Input.dispatchKeyEvent", { type, key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  }
+  await sleep(300);
+
+  // Send with a real pointer leaves the focus in the box: on a phone a focus
+  // move dropped the keyboard, the shell reflowed, and the tap missed Send
+  await ben.evaluate(`(() => { const input = document.querySelector(".chat-main .input-bar .chat-input"); input.focus();
+    input.value = "sent by a tap"; input.dispatchEvent(new Event("input", { bubbles: true })); })()`);
+  await sleep(200);
+  const tapped = await realClick(ben, ".chat-main .input-bar .send-btn");
+  check("a tap on Send sends, and the text field keeps the focus",
+    tapped && (await arrived(ann, "sent by a tap")) &&
+      (await ben.evaluate(`document.activeElement?.classList.contains("chat-input") ?? false`)),
+    await ben.evaluate(`document.activeElement?.className ?? "none"`));
+
+  // ── An edit: only your own, marked as edited ──
+  await say(ann, "a typo hree");
+  await arrived(ben, "a typo hree");
+  check("someone else's message has no Edit", !(await useTool(ben, "a typo hree", "Edit")));
+  check("your own does, and it opens a box with the text", (await useTool(ann, "a typo hree", "Edit")) &&
+    (await ann.evaluate(`document.querySelector(".chat-main .edit-input")?.value === "a typo hree"`)));
+  await ann.evaluate(`(() => { const t = document.querySelector(".chat-main .edit-input"); t.value = "a typo here"; t.dispatchEvent(new Event("input", { bubbles: true })); t.focus(); })()`);
+  await enter(ann);
+  check("Enter saves the edit, and the box goes", await waitFor(ann, `!document.querySelector(".chat-main .edit-input") && !!${rowWith("a typo here")}`, 5_000).then(() => true, () => false));
+  check("the edit reaches the reader, marked (edited), in place of the old text",
+    (await waitFor(ben, `${rowWith("a typo here")}?.querySelector(".edited")`, 10_000).then(() => true, () => false)) && !(await ben.evaluate(`!!${rowWith("hree")}`)));
+
+  // A press on Save leaves the focus in the box until it saves: on a phone the
+  // keyboard stays up, so Save does not move from under the finger (D3-01)
+  await say(ann, "press save here");
+  await arrived(ann, "press save here");
+  await useTool(ann, "press save here", "Edit");
+  await ann.evaluate(`(() => { const t = document.querySelector(".chat-main .edit-input"); t.value = "pressed save here"; t.dispatchEvent(new Event("input", { bubbles: true })); t.focus(); })()`);
+  const save = await ann.evaluate(`(() => { const b = [...document.querySelectorAll(".chat-main .edit-box button")].find((e) => e.textContent.trim() === "Save");
+    if (!b) return null; const r = b.getBoundingClientRect(); return { x: r.x + r.width / 2, y: r.y + r.height / 2 }; })()`);
+  let keptFocus = false;
+  if (save) {
+    await ann.send("Input.dispatchMouseEvent", { type: "mousePressed", x: save.x, y: save.y, button: "left", clickCount: 1, buttons: 1 });
+    keptFocus = await ann.evaluate(`document.activeElement?.classList.contains("edit-input") ?? false`);
+    await ann.send("Input.dispatchMouseEvent", { type: "mouseReleased", x: save.x, y: save.y, button: "left", clickCount: 1 });
+  }
+  check("pressing Save keeps the focus in the box, and the edit is saved",
+    keptFocus && (await waitFor(ann, `!document.querySelector(".chat-main .edit-input") && !!${rowWith("pressed save here")}`, 5_000).then(() => true, () => false)),
+    save ? `focus was on ${keptFocus ? "the box" : "something else"}` : "no Save button");
+
+  // ── A delete: confirmed first, then gone for everyone ──
+  await say(ann, "delete me soon");
+  await arrived(ben, "delete me soon");
+  await useTool(ben, "delete me soon", "More");
+  check("someone else's message offers no Delete, and a member no Pin", !/Delete|Pin/.test(await menuItems(ben)), await menuItems(ben));
+  await ben.send("Input.dispatchKeyEvent", { type: "keyDown", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await ben.send("Input.dispatchKeyEvent", { type: "keyUp", key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  await sleep(200);
+  await useTool(ann, "delete me soon", "More");
+  check("your own message's menu has Edit and Delete, and a manager's has Pin",
+    (await menuItems(ann)) === "React,Reply,Reply in thread,Forward,Edit,Pin,Copy text,Delete", await menuItems(ann));
+  await pressItem(ann, "Delete");
+  const asked = await waitFor(ann, `document.querySelector(".confirm .btn-danger")`, 3_000).then(() => true, () => false);
+  check("Delete asks first", asked);
+  await ann.evaluate(`document.querySelector(".confirm .btn-danger")?.click()`);
+  check("then the message goes, here and for the reader", (await gone(ann, "delete me soon")) && (await gone(ben, "delete me soon")));
+
+  // ── A pin, by the channel's manager, listed in the header ──
+  await useTool(ann, "react to this one", "More");
+  await pressItem(ann, "Pin");
+  check("a manager's pin reaches the reader: marked, and counted in the header",
+    await waitFor(ben, `!!${rowWith("react to this one")}?.querySelector(".pinned-tag") && document.querySelector(".chat-header .pins-btn")?.textContent.trim() === "1"`, 10_000)
+      .then(() => true, () => false));
+  await ben.evaluate(`document.querySelector(".chat-header .pins-btn")?.click()`);
+  await sleep(200);
+  check("the header lists what is pinned", await ben.evaluate(
+    `[...document.querySelectorAll(".pins-menu .pin-row")].some((b) => b.textContent.includes("react to this one"))`));
+  await ben.evaluate(`[...document.querySelectorAll(".pins-menu .pin-row")].find((b) => b.textContent.includes("react to this one"))?.click()`);
+  await sleep(500);
+  check("and a pin leads to its message", await ben.evaluate(`${rowWith("react to this one")}?.classList.contains("flash") ?? false`));
+
+  // ── Someone who joins later: the edit comes with the history, the delete never ──
+  const cy = await connect(`ui-ec-${n}`);
+  await openChannel(cy, ROOM, "dblclick");
+  const handed = await waitFor(cy, `${rowWith("a typo here")}`, 30_000).then(() => true, () => false);
+  check("history hands on the edited text, marked edited", handed && (await cy.evaluate(`!!${rowWith("a typo here")}?.querySelector(".edited")`)));
+  check("and never a deleted message", handed && !(await cy.evaluate(`!!${rowWith("delete me soon")}`)));
+  // A member's copy is their word for who wrote it: forwarded, that would
+  // become a "Forwarded from" label with no mark of hearsay (D-15)
+  await useTool(cy, "a typo here", "More");
+  check("a message handed over in the history offers no Forward", handed && /Copy text/.test(await menuItems(cy)) && !/Forward/.test(await menuItems(cy)),
+    await menuItems(cy));
+  for (const type of ["keyDown", "keyUp"]) {
+    await cy.send("Input.dispatchKeyEvent", { type, key: "Escape", code: "Escape", windowsVirtualKeyCode: 27 });
+  }
+  await sleep(200);
+
+  // ── Forward: a file, as it is, to a conversation it was never in ──
+  const dir = mkdtempSync(join(tmpdir(), "voipc-ui-fwd-"));
+  await cy.send("Page.setDownloadBehavior", { behavior: "allow", downloadPath: dir });
+  const body = "forwarded words, kept as they are\n".repeat(40);
+  await ann.evaluate(`(async () => { window.__f = new File([${JSON.stringify(body)}], "fwd.txt", { type: "text/plain" });
+    const input = document.querySelector(".chat-main .input-bar .file-picker"); if (!input) return false;
+    const dt = new DataTransfer(); dt.items.add(window.__f); input.files = dt.files;
+    input.dispatchEvent(new Event("change", { bubbles: true })); return true; })()`);
+  await say(ann, "pass this on");
+  await waitFor(ben, `${rowWith("pass this on")}?.querySelector(".file-card")`, 20_000).catch(() => {});
+  await useTool(ben, "pass this on", "More");
+  await pressItem(ben, "Forward");
+  const offered = await waitFor(ben, `[...document.querySelectorAll(".forward-dialog .forward-dest")].some((b) => b.textContent.includes("#lobby-chat"))`, 3_000)
+    .then(() => true, () => false);
+  check("Forward offers the conversations one may write in", offered);
+  await ben.evaluate(`[...document.querySelectorAll(".forward-dialog .forward-dest")].find((b) => b.textContent.includes("#lobby-chat"))?.click()`);
+  await openChannel(cy, "lobby-chat");
+  const there = await waitFor(cy, `${rowWith("pass this on")}?.querySelector(".file-card")`, 30_000).then(() => true, () => false);
+  check("the forward arrives as the forwarder's message, labelled with who wrote it first", there && (await cy.evaluate(
+    `${rowWith("pass this on")}?.querySelector(".fwd-label")?.textContent.includes("ui-ea-${n}") && ${rowWith("pass this on")}?.querySelector(".msg-username")?.textContent.startsWith("ui-eb-")`)),
+    await cy.evaluate(`${rowWith("pass this on")}?.textContent.slice(0, 200) ?? "no row"`));
+  // Nobody who holds it is left to send it again: the relay's own copy,
+  // posted for lobby-chat by the forward, is the only way it loads there
+  const fatalOf = (tab) => tab.errors.filter((e) => !/Failed to load resource/.test(e));
+  const [annFatal, benFatal] = [fatalOf(ann), fatalOf(ben)];
+  await ann.send("Page.navigate", { url: "about:blank" });
+  await ben.send("Page.navigate", { url: "about:blank" });
+  await sleep(1500);
+  await cy.evaluate(`[...(${rowWith("pass this on")})?.querySelectorAll(".file-card button") ?? []].find((b) => b.textContent.trim().startsWith("Download"))?.click()`);
+  let saved = null;
+  for (let i = 0; i < 80 && saved === null; i++) {
+    await sleep(250);
+    if (readdirSync(dir).includes("fwd.txt")) saved = readFileSync(join(dir, "fwd.txt"), "utf8");
+  }
+  check("its file loads there, byte for byte, with its senders gone: posted for that conversation too", saved === body,
+    saved === null ? await cy.evaluate(`${rowWith("pass this on")}?.querySelector(".file-card")?.textContent ?? "no card"`) : `${saved.length} chars`);
+
+  for (const [who, fatal] of [["writer", annFatal], ["reader", benFatal], ["late joiner", fatalOf(cy)]]) {
+    check(`the events lane's ${who} threw nothing`, fatal.length === 0, fatal.slice(0, 2).join(" | "));
+  }
 }
 
 // 14. Several servers at once. The rail's "+" used to disconnect you to bring
@@ -1771,14 +2777,19 @@ if (PORT2) {
     const row = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(name)});
     return row ? row.classList.contains("active") : null; })()`);
 
-  // In a call on server 1 first, so there is something for server 2 to keep
-  await alice.evaluate(
-    `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(CHANNEL)});
-       if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
-  );
+  // In a call on server 1 first, so there is something for server 2 to keep.
+  // A room of its own: CHANNEL has stood empty since section 8, and the relay
+  // deletes an empty channel after 300 s, which the sections before this one
+  // now take longer than. The creator is seated in it at once.
+  const HOME = `home-${process.pid % 10000}`;
+  await alice.evaluate(click('button[title="Create channel"]'));
+  await waitFor(alice, `document.querySelector(".create-form")`);
+  await alice.evaluate(setInput(".create-form input[type=text]", HOME));
+  await alice.evaluate(click(".create-form .create-btn"));
+  await sleep(2500);
   // bob joins her there, so he can witness her leaving it
   await bob.evaluate(
-    `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(CHANNEL)});
+    `(() => { const el = [...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(HOME)});
        if (!el) return false; el.dispatchEvent(new MouseEvent("dblclick", { bubbles: true })); return true; })()`,
   );
   await sleep(1500);
@@ -1802,14 +2813,14 @@ if (PORT2) {
   await sleep(800);
   check("the second server opens beside the first", JSON.stringify(await openIds()) === JSON.stringify([S1, S2]), JSON.stringify(await openIds()));
   check("and it is the one on screen", (await onScreen()) === S2, await onScreen());
-  check("its channel list is its own", !(await alice.evaluate(channelNames)).includes(CHANNEL));
+  check("its channel list is its own", !(await alice.evaluate(channelNames)).includes(HOME));
   check("the call on server 1 carried on", /in voice/.test(await railTitle(S1)), await railTitle(S1));
   check("and the voice bar still offers to leave it", await alice.evaluate(`!!document.querySelector(".leave-voice-btn")`));
 
   await realClick(alice, railItem(S1));
   await sleep(800);
-  check("the rail brings server 1 back", (await onScreen()) === S1 && (await alice.evaluate(channelNames)).includes(CHANNEL));
-  check("still standing in the same channel", (await voiceRowActive(CHANNEL)) === true);
+  check("the rail brings server 1 back", (await onScreen()) === S1 && (await alice.evaluate(channelNames)).includes(HOME));
+  check("still standing in the same channel", (await voiceRowActive(HOME)) === true);
 
   // Voice follows the last join: a room on server 2 ends the call on server 1
   await realClick(alice, railItem(S2));
@@ -1877,7 +2888,7 @@ if (PORT2) {
     opened.length === 2 && opened.every(([, t]) => /connected/.test(t)),
     JSON.stringify(opened),
   );
-  check("and the one on screen shows its channels", (await boot.evaluate(channelNames)).includes(CHANNEL));
+  check("and the one on screen shows its channels", (await boot.evaluate(channelNames)).includes(HOME));
   const bootFatal = boot.errors.filter((e) => !/Failed to load resource/.test(e));
   check("with nothing thrown on the way", bootFatal.length === 0, bootFatal.slice(0, 2).join(" | "));
 } else {
@@ -2018,7 +3029,7 @@ if (PORT3) {
   await back.evaluate(`(() => { const el = ${row}?.closest(".user"); if (!el) return false;
     el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 40 })); return true; })()`);
   await sleep(300);
-  await back.evaluate(`(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => e.textContent.includes("Direct Message"));
+  await back.evaluate(`(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => /direct message/i.test(e.textContent));
     if (!b) return false; b.click(); return true; })()`);
   await waitFor(back, `document.querySelector(".input-bar .chat-input")`, 10_000);
   await two.send("Page.close").catch(() => {});
@@ -2261,14 +3272,64 @@ if (PORT3) {
   );
   await clash.send("Page.close").catch(() => {});
 
-  // Forgot the password: the recovery key sets a new one, and the dialog
-  // signs in with it at once.
+  // A new recovery key, from the account panel (S-006): the password is asked
+  // for, the key is shown only once the relay took it, and the old one stops
+  // working.
+  const keyNew = await openDialog();
+  await keyNew.evaluate(setInput("#account-name", acctB));
+  await waitFor(keyNew, `document.querySelector("#account-password")?.placeholder?.includes("remembered")`);
+  await realClick(keyNew, ".connect-btn");
+  await settle(keyNew);
+  await waitFor(keyNew, `document.querySelector('${panel}')`, 10_000);
+  await realClick(keyNew, panel);
+  await waitFor(keyNew, `document.querySelector('.account-dialog[data-kind="account"]')`);
+  await keyNew.evaluate(`[...document.querySelectorAll('.account-dialog[data-kind="account"] .row')].find((r) => r.textContent.includes("Recovery key"))?.querySelector("button")?.click()`);
+  await waitFor(keyNew, `document.querySelector('.account-dialog[data-kind="recovery-new"] #acct-recovery-password')`, 10_000).catch(() => {});
+  await keyNew.evaluate(setInput("#acct-recovery-password", "not the password at all"));
+  await realClick(keyNew, '.account-dialog[data-kind="recovery-new"] .submit-btn');
+  const wrongNew = await waitFor(keyNew, `document.querySelector('.account-dialog[data-kind="recovery-new"] .error')`, 30_000).then(() => true, () => false);
+  check(
+    "a new recovery key asks for the password: a wrong one is refused there, and no key is shown",
+    wrongNew && !(await keyNew.evaluate(`!!document.querySelector('.account-dialog[data-kind="recovery"]')`)),
+    await keyNew.evaluate(`document.querySelector(".account-dialog")?.innerText.slice(0, 300) ?? "no dialog"`),
+  );
+  await keyNew.evaluate(setInput("#acct-recovery-password", pw));
+  await realClick(keyNew, '.account-dialog[data-kind="recovery-new"] .submit-btn');
+  await waitFor(keyNew, `document.querySelector('.account-dialog[data-kind="recovery"] .secret')`, 30_000).catch(() => {});
+  const keyB2 = await keyNew.evaluate(`document.querySelector('.account-dialog[data-kind="recovery"] .secret')?.textContent ?? ""`);
+  const keyHead = await keyNew.evaluate(`document.querySelector('.account-dialog[data-kind="recovery"] h2')?.textContent ?? ""`);
+  check(
+    "the right one shows the new key, and says it is the new one",
+    /^[A-Z2-7]{4}(-[A-Z2-7]{1,4}){12}$/.test(keyB2) && keyB2 !== keyB && /new recovery key/.test(keyHead),
+    `${keyHead} | ${keyB2}`,
+  );
+  await realClick(keyNew, '.account-dialog[data-kind="recovery"] .submit-btn');
+  await keyNew.send("Page.close").catch(() => {});
+  const stale = await openDialog();
+  await stale.evaluate(setInput("#account-name", acctB));
+  await realClick(stale, ".link-btn");
+  await waitFor(stale, `document.querySelector("#account-recovery")`);
+  await stale.evaluate(setInput("#account-recovery", keyB));
+  await stale.evaluate(setInput("#account-password", "reset with the old key"));
+  await stale.evaluate(setInput("#account-password2", "reset with the old key"));
+  await realClick(stale, ".connect-btn");
+  const staleOut = await waitFor(stale, `/does not open this account/.test(document.querySelector(".error")?.textContent ?? "") || !!document.querySelector('${panel}')`, 60_000)
+    .then(() => true, () => false);
+  check(
+    "and the old recovery key no longer resets the password",
+    staleOut && !(await stale.evaluate(`!!document.querySelector('${panel}')`)),
+    await stale.evaluate(`document.querySelector(".error")?.textContent ?? ""`),
+  );
+  await stale.send("Page.close").catch(() => {});
+
+  // Forgot the password: the recovery key (the new one) sets a new password,
+  // and the dialog signs in with it at once.
   const pw3 = "reset with the recovery key";
   const six = await openDialog();
   await six.evaluate(setInput("#account-name", acctB));
   await realClick(six, ".link-btn");
   await waitFor(six, `document.querySelector("#account-recovery")`);
-  await six.evaluate(setInput("#account-recovery", keyB));
+  await six.evaluate(setInput("#account-recovery", keyB2 || keyB));
   await six.evaluate(setInput("#account-password", pw3));
   await six.evaluate(setInput("#account-password2", pw3));
   await realClick(six, ".connect-btn");
@@ -2311,7 +3372,7 @@ if (PORT3) {
   await realClick(guest, ".connect-btn");
   await waitFor(guest, `/Wrong username or password/.test(document.querySelector(".error")?.textContent ?? "")`, 30_000);
   check("a wrong password is refused", true);
-  const fatal = [...up.errors, ...back.errors, ...two.errors, ...bobAgain.errors, ...aliceAgain.errors, ...three.errors, ...four.errors, ...five.errors, ...clash.errors, ...six.errors, ...guest.errors].filter(
+  const fatal = [...up.errors, ...back.errors, ...two.errors, ...bobAgain.errors, ...aliceAgain.errors, ...three.errors, ...four.errors, ...five.errors, ...clash.errors, ...keyNew.errors, ...stale.errors, ...six.errors, ...guest.errors].filter(
     (e) => !/Failed to load resource/.test(e),
   );
   check("the accounts lane threw nothing", fatal.length === 0, fatal.slice(0, 2).join(" | "));

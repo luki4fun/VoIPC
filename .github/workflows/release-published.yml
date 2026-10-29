@@ -55,6 +55,9 @@ jobs:
           tags="$image:$v"
           # From the tag, not the release's pre-release box: v1.0.0-rc.1 went
           # out with the box unticked and moved :1.0.0-rc, :1.0 and :latest.
+          # :<major> and :latest follow a minor that changes the protocol too
+          # (1.3.1 moves them from protocol 12 to 13); OPERATING §10 tells
+          # operators to pin :<major>.<minor> until their users have updated.
           if [[ "$v" != *-rc.* ]]; then
             minor="${v%.*}"
             tags="$tags,$image:$minor,$image:${minor%.*},$image:latest"

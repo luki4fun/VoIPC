@@ -12,6 +12,8 @@
 //    when building, a JS number or bigint is accepted.
 //  - All calls are synchronous. Failures throw an Error with a message.
 
+import type { ChatEvent, FileRef, Forwarded } from "../../lib/types";
+
 export interface SignalClient {
   /** { identity_key: number[], prekey_bundle: PreKeyBundleData } for Authenticate. */
   bundle(): { identity_key: number[]; prekey_bundle: PreKeyBundleData };
@@ -123,6 +125,17 @@ export interface VideoAssembler {
   reset(): void;
   free(): void;
   [Symbol.dispose](): void;
+}
+
+/** What a message points at: the message it answers and its thread, by id,
+ *  the file it carries, and where it was forwarded from; or, instead of all
+ *  of these, the event it is (an edit, a delete, a reaction, a pin). */
+export interface MessageRefs {
+  replyTo?: string | null;
+  thread?: string | null;
+  file?: FileRef | null;
+  fwd?: Forwarded | null;
+  event?: ChatEvent | null;
 }
 
 export interface PreKeyBundleData {
@@ -253,7 +266,70 @@ export interface AccountSession {
   kdfSalt(): string;
   /** A new password, from the stretched old and new ones. */
   passwordChange(oldMaster: Uint8Array, newMaster: Uint8Array, totp?: string | null, recovery?: string | null): AccountActions;
+  /** A new recovery key, from the stretched password: the actions, and the
+   *  key's text to show once `RecoveryKeyChanged` answers. */
+  recoveryKeyNew(master: Uint8Array, totp?: string | null, recovery?: string | null): AccountActions & { key: string };
   free(): void;
+}
+
+/** A file sealed for sending (`sealFile`). */
+export interface SealedFile {
+  /** The blob id, 64 hex digits: all the relay learns of the file. */
+  hash: string;
+  /**
+   * 64 hex digits. `key`, `size` and `z` travel only inside the end-to-end
+   * message, in the same form `openFile` takes them back.
+   */
+  key: string;
+  /** The file's own length, before any deflate. */
+  size: number;
+  /** Whether the blob holds the file deflated. */
+  z: boolean;
+  /** What the relay keeps. */
+  blob: Uint8Array;
+}
+
+/**
+ * The `name` of an Error from `sealFile`/`openFile`. `NotThisFile` means the
+ * bytes in hand are not the blob the message names: fetch again. Every other
+ * means the sender's file itself will never open.
+ */
+export type FileErrorName = "TooLarge" | "NotThisFile" | "WrongKey" | "Sealed" | "Malformed";
+
+// wasm-bindgen copies a byte argument into wasm memory before Rust sees it,
+// so `sealFile`'s and `openFile`'s own size checks came after an allocation
+// as large as whatever they were handed (S-024). The same limits, checked on
+// this side of the copy; every caller goes through these (file-worker.ts too).
+
+/** voipc_crypto::file::MAX_FILE_PLAIN */
+export const MAX_FILE_PLAIN = 64 * 1024 * 1024;
+
+/** voipc_crypto::file::sealed_len: the blob a body of `body` bytes seals
+ *  into (the commitment, the body, a tag per 64 KiB chunk). */
+export function sealedLen(body: number): number {
+  const chunks = body === 0 ? 1 : Math.ceil(body / (64 * 1024));
+  return 32 + body + chunks * 16;
+}
+
+/** voipc_crypto::file::MAX_FILE_BLOB: the longest blob that opens. */
+export const MAX_FILE_BLOB = sealedLen(MAX_FILE_PLAIN);
+
+function fileError(name: FileErrorName, message: string): Error {
+  const e = new Error(message);
+  e.name = name;
+  return e;
+}
+
+/** Throws what `sealFile` would for `plain`, before it is copied. */
+export function checkSealInput(plain: Uint8Array): void {
+  if (plain.length > MAX_FILE_PLAIN) throw fileError("TooLarge", "the file is larger than 64 MiB");
+}
+
+/** Throws what `openFile` would for a message's `size` and a `blob` longer
+ *  than any file seals into, before the blob is copied. */
+export function checkOpenInput(size: number, blob: Uint8Array): void {
+  if (size > MAX_FILE_PLAIN) throw fileError("TooLarge", "the file is larger than 64 MiB");
+  if (blob.length > MAX_FILE_BLOB) throw fileError("Malformed", "the file is malformed");
 }
 
 export interface WasmApi {
@@ -287,11 +363,19 @@ export interface WasmApi {
   controlMsgsPerSec(): number;
   /** A fresh message id: 16 random bytes, hex. */
   newMessageId(): string;
-  /** Packs a channel message so it carries an id the server never sees. */
-  /** Pack a message with its id and, where the conversation has one, its
-   * destruction timer in seconds — both inside the ciphertext. */
-  envelope(id: string, text: string, ttlSecs?: number): Uint8Array;
-  openEnvelope(plaintext: Uint8Array): { id: string | null; text: string; ttl_secs: number | null };
+  /** Pack a message with its id, its destruction timer in seconds where the
+   * conversation has one, and what it answers — all inside the ciphertext. */
+  envelope(id: string, text: string, ttlSecs?: number, refs?: MessageRefs): Uint8Array;
+  openEnvelope(plaintext: Uint8Array): {
+    id: string | null;
+    text: string;
+    ttl_secs: number | null;
+    reply_to: string | null;
+    thread: string | null;
+    file: FileRef | null;
+    fwd: Forwarded | null;
+    event: ChatEvent | null;
+  };
   /**
    * Packs recent chat with the channel bound inside the ciphertext. The
    * messages travel as JSON text: a chat message has no fixed shape on this
@@ -302,6 +386,20 @@ export interface WasmApi {
   /** The messages as JSON text. Throws when the payload names a different
    *  channel than the server said it arrived in. */
   openHistoryPayload(channelId: number, payload: Uint8Array): string;
+  /**
+   * Seals a file under a fresh key: a key commitment, then AES-256-GCM over
+   * 64 KiB chunks. With `compress`, it is deflated first where that saves a
+   * tenth or more. Throws (`TooLarge`) above 64 MiB.
+   */
+  sealFile(plain: Uint8Array, compress: boolean): SealedFile;
+  /**
+   * The file out of a blob, checked against what its message claims. Throws
+   * an Error named by `FileErrorName`: `NotThisFile` when the blob is not the
+   * one `hash` names; `WrongKey`, `Sealed` or `Malformed` when it is not
+   * sealed under `key`, was altered or cut short, or is not a file of `size`
+   * bytes.
+   */
+  openFile(hash: string, key: string, size: number, z: boolean, blob: Uint8Array): Uint8Array;
   /** Encrypted voice packet (0x05); AAD channel id comes from the key. */
   buildVoicePacket(keys: MediaKeys, sessionId: number, sequence: number, opus: Uint8Array): Uint8Array;
   buildEotPacket(sessionId: number, sequence: number): Uint8Array;
@@ -348,6 +446,13 @@ export interface WasmApi {
 }
 
 let api: WasmApi | null = null;
+/**
+ * The module, compiled once here: each file worker (files.ts) instantiates
+ * its own from it. Fetching it again there would download all 2.6 MB once
+ * more wherever the page's certificate was accepted by hand, since browsers
+ * cache nothing from such a page.
+ */
+let compiled: WebAssembly.Module | null = null;
 
 /** Loads and instantiates the wasm module once. */
 export async function loadWasm(): Promise<WasmApi> {
@@ -355,7 +460,14 @@ export async function loadWasm(): Promise<WasmApi> {
   // Generated by `npm run build:wasm` (wasm-pack --target web).
   // @ts-ignore — the package only exists after the wasm build
   const mod = await import("../../lib/wasm/voipc_web.js");
-  await mod.default();
+  const res = await fetch(new URL("../../lib/wasm/voipc_web_bg.wasm", import.meta.url));
+  if (!res.ok) throw new Error(`could not load the app's wasm (HTTP ${res.status})`);
+  // Streaming needs the wasm type; a host that labels it otherwise still works
+  const module = res.headers.get("content-type")?.startsWith("application/wasm")
+    ? await WebAssembly.compileStreaming(res)
+    : await WebAssembly.compile(await res.arrayBuffer());
+  await mod.default({ module_or_path: module });
+  compiled = module;
   api = {
     protocolVersion: () => mod.protocolVersion(),
     appVersion: () => mod.appVersion(),
@@ -372,10 +484,28 @@ export async function loadWasm(): Promise<WasmApi> {
     pickHistorySources: (s) => mod.pickHistorySources(s),
     controlMsgsPerSec: () => mod.controlMsgsPerSec(),
     newMessageId: () => mod.newMessageId(),
-    envelope: (id, text, ttlSecs) => mod.envelope(id, text, ttlSecs),
+    envelope: (id, text, ttlSecs, refs) =>
+      mod.envelope(
+        id,
+        text,
+        ttlSecs,
+        refs?.replyTo ?? undefined,
+        refs?.thread ?? undefined,
+        refs?.file ? JSON.stringify(refs.file) : undefined,
+        refs?.fwd ? JSON.stringify(refs.fwd) : undefined,
+        refs?.event ? JSON.stringify(refs.event) : undefined,
+      ),
     openEnvelope: (p) => mod.openEnvelope(p),
     historyPayload: (c, m) => mod.historyPayload(c, m),
     openHistoryPayload: (c, p) => mod.openHistoryPayload(c, p),
+    sealFile: (p, c) => {
+      checkSealInput(p);
+      return mod.sealFile(p, c);
+    },
+    openFile: (h, k, s, z, b) => {
+      checkOpenInput(s, b);
+      return mod.openFile(h, k, s, z, b);
+    },
     buildVoicePacket: (keys, s, q, o) => mod.buildVoicePacket(keys, s, q, o),
     buildEotPacket: (s, q) => mod.buildEotPacket(s, q),
     buildPingPacket: (s, q) => mod.buildPingPacket(s, q),
@@ -388,6 +518,13 @@ export async function loadWasm(): Promise<WasmApi> {
     buildVideoFrameStream: (keys, s, f, t, k, d) => mod.buildVideoFrameStream(keys, s, f, t, k, d),
   };
   return api;
+}
+
+/** The compiled module, for a worker to instantiate; throws if `loadWasm()`
+ *  has not completed. */
+export function wasmModule(): WebAssembly.Module {
+  if (!compiled) throw new Error("wasm not loaded");
+  return compiled;
 }
 
 /** The loaded API; throws if `loadWasm()` has not completed. */

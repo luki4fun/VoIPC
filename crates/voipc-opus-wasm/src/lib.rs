@@ -114,7 +114,10 @@ pub unsafe extern "C" fn opus_decode(slot: *mut Slot, len: usize, mode: u32) -> 
         1 => Mode::Fec,
         _ => Mode::Conceal,
     };
-    let len = len.min(MAX_PACKET);
+    // Refused, not cut: a cut packet is another, malformed one (S-050)
+    if len > MAX_PACKET {
+        return -1;
+    }
     match decode(
         &mut slot.decoder,
         &slot.input[..len],
@@ -210,8 +213,10 @@ mod tests {
                 let n = opus_decode(slot, MAX_PACKET, 0);
                 assert!(n == -1 || (0..=FRAME as i32).contains(&n));
             }
-            // An oversized length is cut to the buffer, never read past it
-            assert!(opus_decode(slot, usize::MAX, 0) <= FRAME as i32);
+            // An oversized length is refused, never cut into another packet
+            // or read past the buffer (S-050)
+            assert_eq!(opus_decode(slot, usize::MAX, 0), -1);
+            assert_eq!(opus_decode(slot, MAX_PACKET + 1, 0), -1);
             opus_free(slot);
         }
     }

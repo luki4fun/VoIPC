@@ -1,0 +1,2629 @@
+{
+  "AccountInfo": {
+    "STRUCT": [
+      {
+        "id": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 16
+          }
+        }
+      },
+      {
+        "name": "STR"
+      },
+      {
+        "scopes": {
+          "SEQ": "STR"
+        }
+      },
+      {
+        "needs_2fa": "BOOL"
+      },
+      {
+        "totp_enabled": "BOOL"
+      }
+    ]
+  },
+  "AccountReply": {
+    "ENUM": {
+      "0": {
+        "DeviceChallenge": {
+          "STRUCT": [
+            {
+              "challenge": "STR"
+            }
+          ]
+        }
+      },
+      "1": {
+        "DeviceAdded": "UNIT"
+      },
+      "2": {
+        "TotpSetup": {
+          "STRUCT": [
+            {
+              "secret": "STR"
+            },
+            {
+              "uri": "STR"
+            },
+            {
+              "sealed": "STR"
+            }
+          ]
+        }
+      },
+      "3": {
+        "TotpEnabled": {
+          "STRUCT": [
+            {
+              "recovery_codes": {
+                "SEQ": "STR"
+              }
+            }
+          ]
+        }
+      },
+      "4": {
+        "VaultStored": {
+          "STRUCT": [
+            {
+              "k": "STR"
+            },
+            {
+              "version": "I64"
+            }
+          ]
+        }
+      },
+      "5": {
+        "VaultConflict": {
+          "STRUCT": [
+            {
+              "k": "STR"
+            },
+            {
+              "blob": {
+                "OPTION": {
+                  "TYPENAME": "VaultBlob"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "6": {
+        "Info": {
+          "NEWTYPE": {
+            "TYPENAME": "AccountInfo"
+          }
+        }
+      },
+      "7": {
+        "Error": {
+          "STRUCT": [
+            {
+              "request": "STR"
+            },
+            {
+              "reason": "STR"
+            }
+          ]
+        }
+      },
+      "8": {
+        "LogKeyStored": "UNIT"
+      },
+      "9": {
+        "LogKeysFound": {
+          "STRUCT": [
+            {
+              "keys": {
+                "SEQ": {
+                  "TYPENAME": "LogKeyInfo"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "10": {
+        "EpochStored": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            },
+            {
+              "epoch": "U32"
+            }
+          ]
+        }
+      },
+      "11": {
+        "Wraps": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            },
+            {
+              "wraps": {
+                "SEQ": {
+                  "TYPENAME": "WrapOut"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "12": {
+        "LogAppended": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            },
+            {
+              "seq": "I64"
+            },
+            {
+              "server_at": "U64"
+            }
+          ]
+        }
+      },
+      "13": {
+        "LogPage": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            },
+            {
+              "entries": {
+                "SEQ": {
+                  "TYPENAME": "LogEntry"
+                }
+              }
+            },
+            {
+              "more": "BOOL"
+            },
+            {
+              "owed": {
+                "SEQ": {
+                  "TUPLEARRAY": {
+                    "CONTENT": "U8",
+                    "SIZE": 16
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "14": {
+        "LogConvs": {
+          "STRUCT": [
+            {
+              "convs": {
+                "SEQ": {
+                  "TUPLE": [
+                    "STR",
+                    "I64"
+                  ]
+                }
+              }
+            }
+          ]
+        }
+      },
+      "15": {
+        "LogJoined": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            }
+          ]
+        }
+      },
+      "16": {
+        "LogLeft": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            }
+          ]
+        }
+      },
+      "17": {
+        "LogMembersFound": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            },
+            {
+              "members": {
+                "SEQ": {
+                  "TYPENAME": "LogKeyInfo"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "18": {
+        "LogRekey": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            }
+          ]
+        }
+      },
+      "19": {
+        "LogPending": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            },
+            {
+              "joiners": {
+                "SEQ": {
+                  "TUPLEARRAY": {
+                    "CONTENT": "U8",
+                    "SIZE": 16
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "20": {
+        "LogNews": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            }
+          ]
+        }
+      },
+      "21": {
+        "PasswordChanged": "UNIT"
+      },
+      "22": {
+        "LogPurged": {
+          "STRUCT": [
+            {
+              "conv": {
+                "OPTION": "STR"
+              }
+            },
+            {
+              "entries": "U64"
+            }
+          ]
+        }
+      },
+      "23": {
+        "AccountDeleted": "UNIT"
+      },
+      "24": {
+        "RecoveryKeyChanged": "UNIT"
+      }
+    }
+  },
+  "AccountRequest": {
+    "ENUM": {
+      "0": {
+        "DeviceChallenge": "UNIT"
+      },
+      "1": {
+        "DeviceAdd": {
+          "STRUCT": [
+            {
+              "device_id": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "public_key": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "signature": {
+                "SEQ": "U8"
+              }
+            }
+          ]
+        }
+      },
+      "2": {
+        "TotpSetup": "UNIT"
+      },
+      "3": {
+        "TotpEnable": {
+          "STRUCT": [
+            {
+              "sealed": "STR"
+            },
+            {
+              "code": "STR"
+            }
+          ]
+        }
+      },
+      "4": {
+        "VaultPut": {
+          "STRUCT": [
+            {
+              "k": "STR"
+            },
+            {
+              "v": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "expect": "I64"
+            }
+          ]
+        }
+      },
+      "5": {
+        "LogKeyPublish": {
+          "STRUCT": [
+            {
+              "logkey": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "sig": {
+                "SEQ": "U8"
+              }
+            }
+          ]
+        }
+      },
+      "6": {
+        "LogKeys": {
+          "STRUCT": [
+            {
+              "accounts": {
+                "SEQ": {
+                  "TUPLEARRAY": {
+                    "CONTENT": "U8",
+                    "SIZE": 16
+                  }
+                }
+              }
+            }
+          ]
+        }
+      },
+      "7": {
+        "EpochPut": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            },
+            {
+              "epoch": "U32"
+            },
+            {
+              "wraps": {
+                "SEQ": {
+                  "TYPENAME": "WrapIn"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "8": {
+        "WrapsFetch": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            }
+          ]
+        }
+      },
+      "9": {
+        "LogAppend": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            },
+            {
+              "epoch": "U32"
+            },
+            {
+              "ct": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "ttl_secs": {
+                "OPTION": "U32"
+              }
+            }
+          ]
+        }
+      },
+      "10": {
+        "LogFetch": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            },
+            {
+              "after": "I64"
+            }
+          ]
+        }
+      },
+      "11": {
+        "LogIndex": "UNIT"
+      },
+      "12": {
+        "LogJoin": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            }
+          ]
+        }
+      },
+      "13": {
+        "LogLeave": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            }
+          ]
+        }
+      },
+      "14": {
+        "LogMembers": {
+          "STRUCT": [
+            {
+              "conv": "STR"
+            }
+          ]
+        }
+      },
+      "15": {
+        "PasswordChange": {
+          "STRUCT": [
+            {
+              "old_secret": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "new_secret": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "pass_slot": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "totp": {
+                "OPTION": "STR"
+              }
+            },
+            {
+              "recovery_code": {
+                "OPTION": "STR"
+              }
+            }
+          ]
+        }
+      },
+      "16": {
+        "LogPurge": {
+          "STRUCT": [
+            {
+              "conv": {
+                "OPTION": "STR"
+              }
+            }
+          ]
+        }
+      },
+      "17": {
+        "DeleteAccount": {
+          "STRUCT": [
+            {
+              "secret": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "totp": {
+                "OPTION": "STR"
+              }
+            },
+            {
+              "recovery_code": {
+                "OPTION": "STR"
+              }
+            }
+          ]
+        }
+      },
+      "18": {
+        "RecoveryKeyNew": {
+          "STRUCT": [
+            {
+              "secret": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "recovery_slot": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "reset_key": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "totp": {
+                "OPTION": "STR"
+              }
+            },
+            {
+              "recovery_code": {
+                "OPTION": "STR"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "AccountStart": {
+    "ENUM": {
+      "0": {
+        "Login": "UNIT"
+      },
+      "1": {
+        "Register": {
+          "STRUCT": [
+            {
+              "invite": {
+                "OPTION": "STR"
+              }
+            }
+          ]
+        }
+      },
+      "2": {
+        "DeviceKey": {
+          "STRUCT": [
+            {
+              "device_id": {
+                "SEQ": "U8"
+              }
+            }
+          ]
+        }
+      },
+      "3": {
+        "Reset": "UNIT"
+      }
+    }
+  },
+  "AuthContinue": {
+    "ENUM": {
+      "0": {
+        "Secret": {
+          "STRUCT": [
+            {
+              "auth_secret": {
+                "SEQ": "U8"
+              }
+            }
+          ]
+        }
+      },
+      "1": {
+        "Register": {
+          "STRUCT": [
+            {
+              "auth_secret": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "altcha": "STR"
+            },
+            {
+              "ts": "STR"
+            },
+            {
+              "vault": {
+                "SEQ": {
+                  "TYPENAME": "VaultBlob"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "2": {
+        "DeviceSig": {
+          "STRUCT": [
+            {
+              "signature": {
+                "SEQ": "U8"
+              }
+            }
+          ]
+        }
+      },
+      "3": {
+        "Totp": {
+          "STRUCT": [
+            {
+              "code": "STR"
+            }
+          ]
+        }
+      },
+      "4": {
+        "Recovery": {
+          "STRUCT": [
+            {
+              "code": "STR"
+            }
+          ]
+        }
+      },
+      "5": {
+        "Keys": {
+          "STRUCT": [
+            {
+              "identity_key": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "prekey_bundle": {
+                "TYPENAME": "PreKeyBundleData"
+              }
+            },
+            {
+              "reset_identity": "BOOL"
+            }
+          ]
+        }
+      },
+      "6": {
+        "Reset": {
+          "STRUCT": [
+            {
+              "signature": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "key_signature": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "auth_secret": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "pass_slot": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "totp": {
+                "OPTION": "STR"
+              }
+            },
+            {
+              "recovery_code": {
+                "OPTION": "STR"
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "AuthStep": {
+    "ENUM": {
+      "0": {
+        "Salt": {
+          "STRUCT": [
+            {
+              "relay_id": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 16
+                }
+              }
+            },
+            {
+              "pow": {
+                "OPTION": {
+                  "TYPENAME": "PowChallenge"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "1": {
+        "DeviceChallenge": {
+          "STRUCT": [
+            {
+              "relay_id": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 16
+                }
+              }
+            },
+            {
+              "challenge": "STR"
+            }
+          ]
+        }
+      },
+      "2": {
+        "NeedTotp": "UNIT"
+      },
+      "3": {
+        "Vault": {
+          "STRUCT": [
+            {
+              "blobs": {
+                "SEQ": {
+                  "TYPENAME": "VaultBlob"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "4": {
+        "AccountRequired": {
+          "STRUCT": [
+            {
+              "registration": {
+                "TYPENAME": "Registration"
+              }
+            }
+          ]
+        }
+      },
+      "5": {
+        "ResetChallenge": {
+          "STRUCT": [
+            {
+              "relay_id": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 16
+                }
+              }
+            },
+            {
+              "challenge": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "blobs": {
+                "SEQ": {
+                  "TYPENAME": "VaultBlob"
+                }
+              }
+            },
+            {
+              "second_factor": "BOOL"
+            }
+          ]
+        }
+      },
+      "6": {
+        "ResetDone": "UNIT"
+      }
+    }
+  },
+  "BanInfo": {
+    "STRUCT": [
+      {
+        "id": "U64"
+      },
+      {
+        "account": "BOOL"
+      },
+      {
+        "label": "STR"
+      },
+      {
+        "reason": "STR"
+      },
+      {
+        "by": "STR"
+      },
+      {
+        "created_at": "U64"
+      },
+      {
+        "expires_in_secs": {
+          "OPTION": "U64"
+        }
+      }
+    ]
+  },
+  "ChannelInfo": {
+    "STRUCT": [
+      {
+        "channel_id": "U32"
+      },
+      {
+        "name": "STR"
+      },
+      {
+        "description": "STR"
+      },
+      {
+        "max_users": "U32"
+      },
+      {
+        "user_count": "U32"
+      },
+      {
+        "has_password": "BOOL"
+      },
+      {
+        "created_by": {
+          "OPTION": "U32"
+        }
+      },
+      {
+        "proximity": {
+          "TYPENAME": "ProximityMode"
+        }
+      },
+      {
+        "hidden": "BOOL"
+      },
+      {
+        "anonymous": "BOOL"
+      },
+      {
+        "screen_share": "BOOL"
+      },
+      {
+        "hide_members": "BOOL"
+      },
+      {
+        "text": "BOOL"
+      },
+      {
+        "auto_join": "BOOL"
+      },
+      {
+        "message_ttl_secs": "U32"
+      },
+      {
+        "routed": "BOOL"
+      },
+      {
+        "announce": "BOOL"
+      },
+      {
+        "slow_mode_secs": "U32"
+      },
+      {
+        "nsfw": "BOOL"
+      },
+      {
+        "log": "STR"
+      }
+    ]
+  },
+  "ChannelOptions": {
+    "STRUCT": [
+      {
+        "hidden": {
+          "OPTION": "BOOL"
+        }
+      },
+      {
+        "anonymous": {
+          "OPTION": "BOOL"
+        }
+      },
+      {
+        "screen_share": {
+          "OPTION": "BOOL"
+        }
+      },
+      {
+        "hide_members": {
+          "OPTION": "BOOL"
+        }
+      },
+      {
+        "routed": {
+          "OPTION": "BOOL"
+        }
+      },
+      {
+        "message_ttl_secs": {
+          "OPTION": "U32"
+        }
+      },
+      {
+        "announce": {
+          "OPTION": "BOOL"
+        }
+      },
+      {
+        "slow_mode_secs": {
+          "OPTION": "U32"
+        }
+      },
+      {
+        "nsfw": {
+          "OPTION": "BOOL"
+        }
+      }
+    ]
+  },
+  "ClientMessage": {
+    "ENUM": {
+      "0": {
+        "Authenticate": {
+          "STRUCT": [
+            {
+              "username": "STR"
+            },
+            {
+              "protocol_version": "U32"
+            },
+            {
+              "app_version": "STR"
+            },
+            {
+              "identity_key": {
+                "OPTION": {
+                  "SEQ": "U8"
+                }
+              }
+            },
+            {
+              "prekey_bundle": {
+                "OPTION": {
+                  "TYPENAME": "PreKeyBundleData"
+                }
+              }
+            },
+            {
+              "account": {
+                "OPTION": {
+                  "TYPENAME": "AccountStart"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "1": {
+        "JoinChannel": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "password": {
+                "OPTION": "STR"
+              }
+            }
+          ]
+        }
+      },
+      "2": {
+        "LeaveChannel": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            }
+          ]
+        }
+      },
+      "3": {
+        "CreateChannel": {
+          "STRUCT": [
+            {
+              "name": "STR"
+            },
+            {
+              "password": {
+                "OPTION": "STR"
+              }
+            },
+            {
+              "proximity": {
+                "TYPENAME": "ProximityMode"
+              }
+            },
+            {
+              "anonymous": "BOOL"
+            },
+            {
+              "text": "BOOL"
+            }
+          ]
+        }
+      },
+      "4": {
+        "Disconnect": "UNIT"
+      },
+      "5": {
+        "SetMuted": {
+          "STRUCT": [
+            {
+              "muted": "BOOL"
+            }
+          ]
+        }
+      },
+      "6": {
+        "SetDeafened": {
+          "STRUCT": [
+            {
+              "deafened": "BOOL"
+            }
+          ]
+        }
+      },
+      "7": {
+        "SetHistorySharing": {
+          "STRUCT": [
+            {
+              "enabled": "BOOL"
+            }
+          ]
+        }
+      },
+      "8": {
+        "RequestChannelList": "UNIT"
+      },
+      "9": {
+        "Ping": {
+          "STRUCT": [
+            {
+              "timestamp": "U64"
+            }
+          ]
+        }
+      },
+      "10": {
+        "SetChannelPassword": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "password": {
+                "OPTION": "STR"
+              }
+            }
+          ]
+        }
+      },
+      "11": {
+        "SetChannelProximity": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "proximity": {
+                "TYPENAME": "ProximityMode"
+              }
+            }
+          ]
+        }
+      },
+      "12": {
+        "SetChannelOptions": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "options": {
+                "TYPENAME": "ChannelOptions"
+              }
+            }
+          ]
+        }
+      },
+      "13": {
+        "KickUser": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "user_id": "U32"
+            }
+          ]
+        }
+      },
+      "14": {
+        "SetAudioFilter": {
+          "STRUCT": [
+            {
+              "allow": {
+                "OPTION": {
+                  "SEQ": "U32"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "15": {
+        "RequestChannelUsers": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            }
+          ]
+        }
+      },
+      "16": {
+        "SendInvite": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "target_user_id": "U32"
+            }
+          ]
+        }
+      },
+      "17": {
+        "AcceptInvite": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            }
+          ]
+        }
+      },
+      "18": {
+        "DeclineInvite": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            }
+          ]
+        }
+      },
+      "19": {
+        "StartScreenShare": {
+          "STRUCT": [
+            {
+              "source": "STR"
+            },
+            {
+              "resolution": "U16"
+            },
+            {
+              "codec": {
+                "TYPENAME": "VideoCodec"
+              }
+            }
+          ]
+        }
+      },
+      "20": {
+        "StopScreenShare": "UNIT"
+      },
+      "21": {
+        "WatchScreenShare": {
+          "STRUCT": [
+            {
+              "sharer_user_id": "U32"
+            }
+          ]
+        }
+      },
+      "22": {
+        "StopWatchingScreenShare": "UNIT"
+      },
+      "23": {
+        "RequestKeyframe": {
+          "STRUCT": [
+            {
+              "sharer_user_id": "U32"
+            }
+          ]
+        }
+      },
+      "24": {
+        "RequestPreKeyBundle": {
+          "STRUCT": [
+            {
+              "target_user_id": "U32"
+            }
+          ]
+        }
+      },
+      "25": {
+        "UploadPreKeys": {
+          "STRUCT": [
+            {
+              "prekeys": {
+                "SEQ": {
+                  "TYPENAME": "OneTimePreKey"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "26": {
+        "SendEncryptedDirectMessage": {
+          "STRUCT": [
+            {
+              "target_user_id": "U32"
+            },
+            {
+              "ciphertext": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "message_type": "U8"
+            }
+          ]
+        }
+      },
+      "27": {
+        "SendEncryptedChannelMessage": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "ciphertext": {
+                "SEQ": "U8"
+              }
+            }
+          ]
+        }
+      },
+      "28": {
+        "DistributeSenderKey": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "target_user_id": "U32"
+            },
+            {
+              "distribution_message": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "message_type": "U8"
+            }
+          ]
+        }
+      },
+      "29": {
+        "DistributeMediaKey": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "target_user_id": "U32"
+            },
+            {
+              "encrypted_media_key": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "message_type": "U8"
+            }
+          ]
+        }
+      },
+      "30": {
+        "SendPoke": {
+          "STRUCT": [
+            {
+              "target_user_id": "U32"
+            },
+            {
+              "ciphertext": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "message_type": "U8"
+            }
+          ]
+        }
+      },
+      "31": {
+        "AdminLogin": {
+          "STRUCT": [
+            {
+              "token": "STR"
+            }
+          ]
+        }
+      },
+      "32": {
+        "AdminKick": {
+          "STRUCT": [
+            {
+              "user_id": "U32"
+            },
+            {
+              "reason": "STR"
+            }
+          ]
+        }
+      },
+      "33": {
+        "AdminBan": {
+          "STRUCT": [
+            {
+              "user_id": "U32"
+            },
+            {
+              "reason": "STR"
+            },
+            {
+              "duration_secs": "U32"
+            },
+            {
+              "account": "BOOL"
+            }
+          ]
+        }
+      },
+      "34": {
+        "AdminUnban": {
+          "STRUCT": [
+            {
+              "id": "U64"
+            }
+          ]
+        }
+      },
+      "35": {
+        "AdminListBans": "UNIT"
+      },
+      "36": {
+        "AdminBanAccount": {
+          "STRUCT": [
+            {
+              "name": "STR"
+            },
+            {
+              "reason": "STR"
+            },
+            {
+              "duration_secs": "U32"
+            }
+          ]
+        }
+      },
+      "37": {
+        "RequestChannelHistory": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "target_user_id": "U32"
+            }
+          ]
+        }
+      },
+      "38": {
+        "SendChannelHistory": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "target_user_id": "U32"
+            },
+            {
+              "ciphertext": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "message_type": "U8"
+            }
+          ]
+        }
+      },
+      "39": {
+        "VideoLossReport": {
+          "STRUCT": [
+            {
+              "sharer_user_id": "U32"
+            },
+            {
+              "frames_dropped": "U32"
+            },
+            {
+              "frames_received": "U32"
+            }
+          ]
+        }
+      },
+      "40": {
+        "AuthContinue": {
+          "NEWTYPE": {
+            "TYPENAME": "AuthContinue"
+          }
+        }
+      },
+      "41": {
+        "Account": {
+          "NEWTYPE": {
+            "TYPENAME": "AccountRequest"
+          }
+        }
+      },
+      "42": {
+        "FileUpload": {
+          "STRUCT": [
+            {
+              "conv": {
+                "TYPENAME": "FileConv"
+              }
+            },
+            {
+              "size": "U64"
+            },
+            {
+              "hash": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 32
+                }
+              }
+            }
+          ]
+        }
+      },
+      "43": {
+        "FileFetch": {
+          "STRUCT": [
+            {
+              "conv": {
+                "TYPENAME": "FileConv"
+              }
+            },
+            {
+              "hash": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 32
+                }
+              }
+            }
+          ]
+        }
+      },
+      "44": {
+        "FileCancel": {
+          "STRUCT": [
+            {
+              "hash": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 32
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "FileConv": {
+    "ENUM": {
+      "0": {
+        "Channel": {
+          "NEWTYPE": "U32"
+        }
+      },
+      "1": {
+        "Direct": {
+          "NEWTYPE": "U32"
+        }
+      },
+      "2": {
+        "Account": {
+          "NEWTYPE": {
+            "TUPLEARRAY": {
+              "CONTENT": "U8",
+              "SIZE": 16
+            }
+          }
+        }
+      }
+    }
+  },
+  "FileLimits": {
+    "STRUCT": [
+      {
+        "max_bytes": "U64"
+      }
+    ]
+  },
+  "LogEntry": {
+    "STRUCT": [
+      {
+        "seq": "I64"
+      },
+      {
+        "sender": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 16
+          }
+        }
+      },
+      {
+        "epoch": "U32"
+      },
+      {
+        "server_at": "U64"
+      },
+      {
+        "ct": {
+          "SEQ": "U8"
+        }
+      }
+    ]
+  },
+  "LogKeyInfo": {
+    "STRUCT": [
+      {
+        "account": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 16
+          }
+        }
+      },
+      {
+        "name": "STR"
+      },
+      {
+        "identity": {
+          "SEQ": "U8"
+        }
+      },
+      {
+        "logkey": {
+          "SEQ": "U8"
+        }
+      },
+      {
+        "sig": {
+          "SEQ": "U8"
+        }
+      }
+    ]
+  },
+  "OneTimePreKey": {
+    "STRUCT": [
+      {
+        "id": "U32"
+      },
+      {
+        "public_key": {
+          "SEQ": "U8"
+        }
+      }
+    ]
+  },
+  "PowChallenge": {
+    "STRUCT": [
+      {
+        "altcha": "STR"
+      },
+      {
+        "ts": "STR"
+      }
+    ]
+  },
+  "PreKeyBundleData": {
+    "STRUCT": [
+      {
+        "registration_id": "U32"
+      },
+      {
+        "device_id": "U32"
+      },
+      {
+        "identity_key": {
+          "SEQ": "U8"
+        }
+      },
+      {
+        "signed_prekey_id": "U32"
+      },
+      {
+        "signed_prekey": {
+          "SEQ": "U8"
+        }
+      },
+      {
+        "signed_prekey_signature": {
+          "SEQ": "U8"
+        }
+      },
+      {
+        "prekeys": {
+          "SEQ": {
+            "TYPENAME": "OneTimePreKey"
+          }
+        }
+      },
+      {
+        "kyber_prekey_id": "U32"
+      },
+      {
+        "kyber_prekey": {
+          "SEQ": "U8"
+        }
+      },
+      {
+        "kyber_prekey_signature": {
+          "SEQ": "U8"
+        }
+      }
+    ]
+  },
+  "ProximityMode": {
+    "ENUM": {
+      "0": {
+        "off": "UNIT"
+      },
+      "1": {
+        "2d": "UNIT"
+      },
+      "2": {
+        "3d": "UNIT"
+      }
+    }
+  },
+  "Registration": {
+    "ENUM": {
+      "0": {
+        "Open": "UNIT"
+      },
+      "1": {
+        "Invite": "UNIT"
+      },
+      "2": {
+        "Closed": "UNIT"
+      }
+    }
+  },
+  "RelayAccounts": {
+    "STRUCT": [
+      {
+        "required": "BOOL"
+      },
+      {
+        "registration": {
+          "TYPENAME": "Registration"
+        }
+      },
+      {
+        "cloud": "BOOL"
+      },
+      {
+        "relay_id": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 16
+          }
+        }
+      }
+    ]
+  },
+  "ServerMessage": {
+    "ENUM": {
+      "0": {
+        "Authenticated": {
+          "STRUCT": [
+            {
+              "user_id": "U32"
+            },
+            {
+              "session_id": "U32"
+            },
+            {
+              "accounts": {
+                "OPTION": {
+                  "TYPENAME": "RelayAccounts"
+                }
+              }
+            },
+            {
+              "account": {
+                "OPTION": {
+                  "TYPENAME": "AccountInfo"
+                }
+              }
+            },
+            {
+              "files": {
+                "OPTION": {
+                  "TYPENAME": "FileLimits"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "1": {
+        "AuthError": {
+          "STRUCT": [
+            {
+              "reason": "STR"
+            }
+          ]
+        }
+      },
+      "2": {
+        "ChannelList": {
+          "STRUCT": [
+            {
+              "channels": {
+                "SEQ": {
+                  "TYPENAME": "ChannelInfo"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "3": {
+        "UserJoined": {
+          "STRUCT": [
+            {
+              "user": {
+                "TYPENAME": "UserInfo"
+              }
+            }
+          ]
+        }
+      },
+      "4": {
+        "UserLeft": {
+          "STRUCT": [
+            {
+              "user_id": "U32"
+            },
+            {
+              "channel_id": "U32"
+            }
+          ]
+        }
+      },
+      "5": {
+        "UserList": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "users": {
+                "SEQ": {
+                  "TYPENAME": "UserInfo"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "6": {
+        "UserMuted": {
+          "STRUCT": [
+            {
+              "user_id": "U32"
+            },
+            {
+              "muted": "BOOL"
+            }
+          ]
+        }
+      },
+      "7": {
+        "UserDeafened": {
+          "STRUCT": [
+            {
+              "user_id": "U32"
+            },
+            {
+              "deafened": "BOOL"
+            }
+          ]
+        }
+      },
+      "8": {
+        "UserHistorySharing": {
+          "STRUCT": [
+            {
+              "user_id": "U32"
+            },
+            {
+              "enabled": "BOOL"
+            }
+          ]
+        }
+      },
+      "9": {
+        "Ping": {
+          "STRUCT": [
+            {
+              "timestamp": "U64"
+            }
+          ]
+        }
+      },
+      "10": {
+        "Pong": {
+          "STRUCT": [
+            {
+              "timestamp": "U64"
+            }
+          ]
+        }
+      },
+      "11": {
+        "ServerShutdown": {
+          "STRUCT": [
+            {
+              "reason": "STR"
+            }
+          ]
+        }
+      },
+      "12": {
+        "MovedToChannel": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            }
+          ]
+        }
+      },
+      "13": {
+        "ChannelCreated": {
+          "STRUCT": [
+            {
+              "channel": {
+                "TYPENAME": "ChannelInfo"
+              }
+            }
+          ]
+        }
+      },
+      "14": {
+        "ChannelDeleted": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            }
+          ]
+        }
+      },
+      "15": {
+        "ChannelError": {
+          "STRUCT": [
+            {
+              "reason": "STR"
+            }
+          ]
+        }
+      },
+      "16": {
+        "ChannelUpdated": {
+          "STRUCT": [
+            {
+              "channel": {
+                "TYPENAME": "ChannelInfo"
+              }
+            }
+          ]
+        }
+      },
+      "17": {
+        "Kicked": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "reason": "STR"
+            }
+          ]
+        }
+      },
+      "18": {
+        "ChannelUsers": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "users": {
+                "SEQ": {
+                  "TYPENAME": "UserInfo"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "19": {
+        "InviteReceived": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "channel_name": "STR"
+            },
+            {
+              "invited_by": "STR"
+            }
+          ]
+        }
+      },
+      "20": {
+        "InviteAccepted": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "user_id": "U32"
+            }
+          ]
+        }
+      },
+      "21": {
+        "InviteDeclined": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "user_id": "U32"
+            }
+          ]
+        }
+      },
+      "22": {
+        "ScreenShareStarted": {
+          "STRUCT": [
+            {
+              "user_id": "U32"
+            },
+            {
+              "username": "STR"
+            },
+            {
+              "resolution": "U16"
+            }
+          ]
+        }
+      },
+      "23": {
+        "ScreenShareStopped": {
+          "STRUCT": [
+            {
+              "user_id": "U32"
+            }
+          ]
+        }
+      },
+      "24": {
+        "WatchingScreenShare": {
+          "STRUCT": [
+            {
+              "sharer_user_id": "U32"
+            },
+            {
+              "codec": {
+                "TYPENAME": "VideoCodec"
+              }
+            }
+          ]
+        }
+      },
+      "25": {
+        "StoppedWatchingScreenShare": {
+          "STRUCT": [
+            {
+              "reason": "STR"
+            }
+          ]
+        }
+      },
+      "26": {
+        "ViewerCountChanged": {
+          "STRUCT": [
+            {
+              "viewer_count": "U32"
+            }
+          ]
+        }
+      },
+      "27": {
+        "KeyframeRequested": "UNIT"
+      },
+      "28": {
+        "ScreenShareError": {
+          "STRUCT": [
+            {
+              "reason": "STR"
+            }
+          ]
+        }
+      },
+      "29": {
+        "PreKeyBundle": {
+          "STRUCT": [
+            {
+              "user_id": "U32"
+            },
+            {
+              "bundle": {
+                "TYPENAME": "PreKeyBundleData"
+              }
+            }
+          ]
+        }
+      },
+      "30": {
+        "PreKeyBundleUnavailable": {
+          "STRUCT": [
+            {
+              "user_id": "U32"
+            }
+          ]
+        }
+      },
+      "31": {
+        "IdentityKeyChanged": {
+          "STRUCT": [
+            {
+              "user_id": "U32"
+            },
+            {
+              "new_identity_key": {
+                "SEQ": "U8"
+              }
+            }
+          ]
+        }
+      },
+      "32": {
+        "EncryptedDirectChatMessage": {
+          "STRUCT": [
+            {
+              "from_user_id": "U32"
+            },
+            {
+              "from_username": "STR"
+            },
+            {
+              "to_user_id": "U32"
+            },
+            {
+              "ciphertext": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "message_type": "U8"
+            },
+            {
+              "timestamp": "U64"
+            }
+          ]
+        }
+      },
+      "33": {
+        "EncryptedChannelChatMessage": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "user_id": "U32"
+            },
+            {
+              "username": "STR"
+            },
+            {
+              "ciphertext": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "timestamp": "U64"
+            }
+          ]
+        }
+      },
+      "34": {
+        "SenderKeyReceived": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "from_user_id": "U32"
+            },
+            {
+              "distribution_message": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "message_type": "U8"
+            }
+          ]
+        }
+      },
+      "35": {
+        "MediaKeyReceived": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "from_user_id": "U32"
+            },
+            {
+              "encrypted_media_key": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "message_type": "U8"
+            }
+          ]
+        }
+      },
+      "36": {
+        "PokeReceived": {
+          "STRUCT": [
+            {
+              "from_user_id": "U32"
+            },
+            {
+              "from_username": "STR"
+            },
+            {
+              "ciphertext": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "message_type": "U8"
+            }
+          ]
+        }
+      },
+      "37": {
+        "AdminStatus": {
+          "STRUCT": [
+            {
+              "user_id": "U32"
+            },
+            {
+              "is_admin": "BOOL"
+            }
+          ]
+        }
+      },
+      "38": {
+        "AdminError": {
+          "STRUCT": [
+            {
+              "reason": "STR"
+            }
+          ]
+        }
+      },
+      "39": {
+        "AdminBans": {
+          "STRUCT": [
+            {
+              "bans": {
+                "SEQ": {
+                  "TYPENAME": "BanInfo"
+                }
+              }
+            }
+          ]
+        }
+      },
+      "40": {
+        "Disconnected": {
+          "STRUCT": [
+            {
+              "reason": "STR"
+            }
+          ]
+        }
+      },
+      "41": {
+        "ChannelHistoryRequested": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "from_user_id": "U32"
+            }
+          ]
+        }
+      },
+      "42": {
+        "ChannelHistoryReceived": {
+          "STRUCT": [
+            {
+              "channel_id": "U32"
+            },
+            {
+              "from_user_id": "U32"
+            },
+            {
+              "from_username": "STR"
+            },
+            {
+              "ciphertext": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "message_type": "U8"
+            }
+          ]
+        }
+      },
+      "43": {
+        "VideoLossReported": {
+          "STRUCT": [
+            {
+              "viewer_user_id": "U32"
+            },
+            {
+              "frames_dropped": "U32"
+            },
+            {
+              "frames_received": "U32"
+            }
+          ]
+        }
+      },
+      "44": {
+        "DirectMessageUndelivered": {
+          "STRUCT": [
+            {
+              "target_user_id": "U32"
+            }
+          ]
+        }
+      },
+      "45": {
+        "AuthStep": {
+          "NEWTYPE": {
+            "TYPENAME": "AuthStep"
+          }
+        }
+      },
+      "46": {
+        "Account": {
+          "NEWTYPE": {
+            "TYPENAME": "AccountReply"
+          }
+        }
+      },
+      "47": {
+        "PreKeysLow": {
+          "STRUCT": [
+            {
+              "remaining": "U32"
+            }
+          ]
+        }
+      },
+      "48": {
+        "Refused": {
+          "STRUCT": [
+            {
+              "code": "U16"
+            },
+            {
+              "server_protocol": "U32"
+            },
+            {
+              "server_version": "STR"
+            },
+            {
+              "text": "STR"
+            }
+          ]
+        }
+      },
+      "49": {
+        "FileUploadReady": {
+          "STRUCT": [
+            {
+              "hash": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 32
+                }
+              }
+            },
+            {
+              "ticket": "STR"
+            }
+          ]
+        }
+      },
+      "50": {
+        "FileStored": {
+          "STRUCT": [
+            {
+              "hash": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 32
+                }
+              }
+            }
+          ]
+        }
+      },
+      "51": {
+        "FileReady": {
+          "STRUCT": [
+            {
+              "hash": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 32
+                }
+              }
+            },
+            {
+              "ticket": "STR"
+            },
+            {
+              "size": "U64"
+            }
+          ]
+        }
+      },
+      "52": {
+        "FileRefused": {
+          "STRUCT": [
+            {
+              "hash": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 32
+                }
+              }
+            },
+            {
+              "code": "U16"
+            },
+            {
+              "reason": "STR"
+            }
+          ]
+        }
+      },
+      "53": {
+        "FileWanted": {
+          "STRUCT": [
+            {
+              "conv": {
+                "TYPENAME": "FileConv"
+              }
+            },
+            {
+              "hash": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 32
+                }
+              }
+            }
+          ]
+        }
+      },
+      "54": {
+        "FileSeeking": {
+          "STRUCT": [
+            {
+              "hash": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 32
+                }
+              }
+            }
+          ]
+        }
+      },
+      "55": {
+        "FileUnavailable": {
+          "STRUCT": [
+            {
+              "hash": {
+                "TUPLEARRAY": {
+                  "CONTENT": "U8",
+                  "SIZE": 32
+                }
+              }
+            }
+          ]
+        }
+      }
+    }
+  },
+  "UserInfo": {
+    "STRUCT": [
+      {
+        "user_id": "U32"
+      },
+      {
+        "username": "STR"
+      },
+      {
+        "channel_id": "U32"
+      },
+      {
+        "is_muted": "BOOL"
+      },
+      {
+        "is_deafened": "BOOL"
+      },
+      {
+        "is_screen_sharing": "BOOL"
+      },
+      {
+        "is_admin": "BOOL"
+      },
+      {
+        "shares_history": "BOOL"
+      },
+      {
+        "account": {
+          "OPTION": {
+            "TUPLEARRAY": {
+              "CONTENT": "U8",
+              "SIZE": 16
+            }
+          }
+        }
+      },
+      {
+        "is_moderator": "BOOL"
+      }
+    ]
+  },
+  "VaultBlob": {
+    "STRUCT": [
+      {
+        "k": "STR"
+      },
+      {
+        "v": {
+          "SEQ": "U8"
+        }
+      },
+      {
+        "version": "I64"
+      }
+    ]
+  },
+  "VideoCodec": {
+    "ENUM": {
+      "0": {
+        "H264": "UNIT"
+      },
+      "1": {
+        "H265": "UNIT"
+      },
+      "2": {
+        "Vp8": "UNIT"
+      },
+      "3": {
+        "Vp9": "UNIT"
+      }
+    }
+  },
+  "WrapIn": {
+    "STRUCT": [
+      {
+        "recipient": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 16
+          }
+        }
+      },
+      {
+        "wrapped": {
+          "SEQ": "U8"
+        }
+      }
+    ]
+  },
+  "WrapOut": {
+    "STRUCT": [
+      {
+        "owner": {
+          "TUPLEARRAY": {
+            "CONTENT": "U8",
+            "SIZE": 16
+          }
+        }
+      },
+      {
+        "epoch": "U32"
+      },
+      {
+        "wrapped": {
+          "SEQ": "U8"
+        }
+      }
+    ]
+  }
+}

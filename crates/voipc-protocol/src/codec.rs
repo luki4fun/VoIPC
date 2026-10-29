@@ -61,7 +61,10 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 /// v12: libsignal with post-quantum sessions — PreKeyBundleData carries a
 ///      signed Kyber1024 pre-key; PreKeysLow asks for more one-time pre-keys;
 ///      the media AAD names the sender
-pub const PROTOCOL_VERSION: u32 = 12;
+/// v13: files — FileUpload/FileFetch/FileCancel, FileUploadReady/FileStored/
+///      FileReady/FileRefused/FileWanted/FileSeeking/FileUnavailable (the
+///      bytes go over HTTPS), Authenticated.files
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.
@@ -167,6 +170,7 @@ mod tests {
             session_id: 42,
             accounts: None,
             account: None,
+            files: None,
         };
         let encoded = encode_server_msg(&msg).unwrap();
         let decoded = decode_server_msg(&encoded[4..]).unwrap();

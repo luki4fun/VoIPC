@@ -10,6 +10,7 @@
   import { updateUiPrefs } from "../../stores/ui-prefs.js";
   import { account, showPrompt } from "../../stores/account.js";
   import Icon from "../Icons.svelte";
+  import { menu } from "../../actions/menu.js";
 
   interface Props {
     /** The shell's own way into Settings. The gear in the user panel is the
@@ -41,13 +42,23 @@
       open = !open;
     }}
     title={$serverAddress}
+    aria-haspopup="menu"
+    aria-expanded={open}
   >
     <span class="server-name">{name}</span>
     <Icon name="chevron-down" size={16} />
   </button>
 
   {#if open}
-    <div class="menu" role="presentation" onclick={(e) => e.stopPropagation()}>
+    <!-- The click only keeps the window's close-on-click from closing it;
+         the keys are use:menu's -->
+    <!-- svelte-ignore a11y_click_events_have_key_events, a11y_interactive_supports_focus -->
+    <div
+      class="menu"
+      role="menu"
+      onclick={(e) => e.stopPropagation()}
+      use:menu={{ onclose: () => (open = false), label: name }}
+    >
       {#if $currentChannelId !== 0}
         <button
           class="menu-item"
@@ -136,6 +147,12 @@
     font-weight: 600;
   }
 
+  /* Full width and flush with the sidebar's edges, which clip an outer ring
+     to its bottom line: drawn inside instead */
+  .header-btn:focus-visible {
+    outline-offset: -2px;
+  }
+
   .header-btn:hover {
     background: var(--bg-hover);
   }
@@ -151,7 +168,7 @@
     top: 100%;
     left: 8px;
     right: 8px;
-    z-index: 60;
+    z-index: var(--z-dropdown);
     margin-top: 4px;
     padding: 6px;
     background: var(--bg-tertiary);
@@ -169,13 +186,13 @@
     background: transparent;
     color: var(--text-secondary);
     text-align: left;
-    font-size: 13px;
+    font-size: var(--fs-body);
     border-radius: 4px;
   }
 
   .menu-item:hover {
-    background: var(--accent);
-    color: #fff;
+    background: var(--bg-hover);
+    color: var(--text-primary);
   }
 
   .menu-item.danger {
@@ -184,7 +201,7 @@
 
   .menu-item.danger:hover {
     background: var(--danger);
-    color: #fff;
+    color: var(--on-danger);
   }
 
   .menu-sep {

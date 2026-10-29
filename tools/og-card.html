@@ -1,0 +1,57 @@
+<!doctype html>
+<!-- The link preview card (website/screenshots/og.png), rendered by
+     tools/screenshots.mjs --website at 1200×630. In the site's own world: one
+     row of a server browser, the one that is yours. -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  @font-face { font-family: "Barlow Semi Condensed"; src: url("../website/fonts/barlow-semi-condensed-700.woff2") format("woff2"); font-weight: 700; }
+  @font-face { font-family: "Barlow Semi Condensed"; src: url("../website/fonts/barlow-semi-condensed-500.woff2") format("woff2"); font-weight: 500; }
+  @font-face { font-family: "JetBrains Mono"; src: url("../website/fonts/jetbrains-mono.woff2") format("woff2"); font-weight: 400 700; }
+  * { margin: 0; box-sizing: border-box; }
+  html, body { width: 1200px; height: 630px; }
+  body {
+    background: #0f1114;
+    color: #e3e6ea;
+    font-family: "Barlow Semi Condensed", sans-serif;
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    padding: 72px 80px;
+    gap: 40px;
+  }
+  .brand { display: flex; align-items: center; gap: 20px; }
+  .brand img { width: 72px; height: 72px; }
+  .brand span { font-size: 40px; font-weight: 700; letter-spacing: 0.01em; }
+  h1 { font-size: 68px; line-height: 1.02; font-weight: 700; letter-spacing: -0.01em; max-width: 960px; }
+  .row {
+    display: grid;
+    grid-template-columns: 28px 1fr auto auto auto;
+    align-items: center;
+    gap: 28px;
+    padding: 18px 24px;
+    background: #1c1f24;
+    border: 1px solid #2a2e36;
+    border-radius: 8px;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 24px;
+    color: #a3aab4;
+  }
+  .row .name { color: #e3e6ea; }
+  .row .live { color: #3ddbb0; }
+  .caret { width: 20px; height: 20px; }
+</style>
+</head>
+<body>
+  <div class="brand"><img src="../client/src-tauri/icons/128x128@2x.png" alt=""><span>VoIPC</span></div>
+  <h1>Voice, screen sharing and chat — on a server you run.</h1>
+  <div class="row">
+    <svg class="caret" viewBox="0 0 20 20"><path d="M6 3l8 7-8 7z" fill="#3ddbb0"/></svg>
+    <span class="name">your-friends.example:9987</span>
+    <span>4/64</span>
+    <span class="live">12 ms</span>
+    <span class="live">end-to-end</span>
+  </div>
+</body>
+</html>

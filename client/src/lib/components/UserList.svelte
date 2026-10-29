@@ -151,7 +151,7 @@
 
   .header {
     padding: 12px 16px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     text-transform: uppercase;
     letter-spacing: 1px;
     color: var(--text-secondary);
@@ -160,7 +160,7 @@
 
   .hidden-note {
     padding: 8px 16px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     line-height: 1.4;
     color: var(--text-secondary);
     border-bottom: 1px solid var(--border);
@@ -183,7 +183,7 @@
 
   .idle-header {
     padding: 8px 8px 4px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     text-transform: uppercase;
     letter-spacing: 1px;
     color: var(--text-secondary);
@@ -195,7 +195,7 @@
     gap: 6px;
     padding: 4px 8px;
     border-radius: 4px;
-    transition: background-color 0.15s;
+    transition: background-color var(--dur-fast);
     position: relative;
   }
 
@@ -207,7 +207,7 @@
      distance culling works, and also how a game could silence one person — so
      it is shown rather than left to be discovered. */
   .user.culled {
-    opacity: 0.45;
+    color: var(--text-muted);
   }
 
   .user.speaking {
@@ -247,12 +247,12 @@
   }
 
   .indicator.deafened {
-    background: #ffa726;
+    background: var(--warning);
   }
 
   .name {
     flex: 1;
-    font-size: 13px;
+    font-size: var(--fs-body);
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -268,7 +268,7 @@
 
   .you {
     color: var(--text-secondary);
-    font-size: 11px;
+    font-size: var(--fs-micro);
   }
 
   .status-icon {
@@ -315,8 +315,23 @@
     flex-shrink: 0;
   }
 
-  .user:hover .more-btn {
+  /* Hover is a mouse's; keyboard focus and a finger need the ⋮ too */
+  .user:hover .more-btn,
+  .user:focus-within .more-btn {
     display: flex;
+  }
+
+  @media (hover: none) {
+    .more-btn {
+      display: flex;
+    }
+  }
+
+  @media (pointer: coarse) {
+    .more-btn {
+      width: var(--hit);
+      height: var(--hit);
+    }
   }
 
   .more-btn:hover {
@@ -326,7 +341,7 @@
 
   .preview-hint {
     padding: 8px 16px;
-    font-size: 11px;
+    font-size: var(--fs-micro);
     color: var(--text-secondary);
     text-align: center;
     border-top: 1px solid var(--border);

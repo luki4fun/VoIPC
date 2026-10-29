@@ -415,6 +415,9 @@ impl Pins {
     /// `account`, going by `name` (empty: not known), with identity `key`.
     /// `Changed` when the key is not the one pinned for the account, or the
     /// name belonged to another account; what was met now is pinned either way.
+    /// A name no relay hands out (`normalize_name`: "аlice" with a Cyrillic
+    /// `а`) is no new contact but a relay passing someone off as one you may
+    /// know: `Replaced` too, once (S-013).
     pub fn check(&mut self, account: &[u8; 16], name: &str, key: &[u8]) -> PinCheck {
         let by_key = match self.keys.insert(*account, key.to_vec()) {
             None => PinCheck::New,
@@ -424,6 +427,7 @@ impl Pins {
         let name = name.trim().to_ascii_lowercase();
         let by_name = match (name.is_empty(), self.names.get(&name)) {
             (true, _) => PinCheck::Same,
+            (false, None) if normalize_name(&name).is_err() => PinCheck::Changed,
             (false, None) => PinCheck::New,
             (false, Some(a)) if a == account => PinCheck::Same,
             (false, Some(_)) => PinCheck::Changed,
@@ -528,10 +532,16 @@ pub fn safety_number(
 
 // ── Reset with the recovery key ──────────────────────────────────────────
 
-/// What a reset signs: this relay, this account and the relay's challenge.
-/// The identity key it is signed with opens only from the vault's recovery
-/// slot, so the signature is the proof of holding the recovery key, for
-/// accounts made before 1.0 as well.
+/// The vault item the relay checks a reset against: the public half of the
+/// reset key. A `slot.` item, so no vault write after sign-up replaces it;
+/// only `RecoveryKeyNew`, with the password, does.
+pub const SLOT_RESET: &str = "slot.reset";
+
+/// What a reset signs with the identity key: this relay, this account and the
+/// relay's challenge. The relay takes it only from an account made before 1.3
+/// (without `slot.reset`). The vault's DEK opens the identity, and a
+/// remembered device keeps the DEK, so it proves less than the recovery key
+/// (S-006).
 fn reset_message(relay_id: &[u8; 16], name: &str, challenge: &[u8]) -> Vec<u8> {
     let mut m = format!(
         "voipc-reset/v1|{}|{}|",
@@ -554,6 +564,62 @@ pub fn reset_proof(
         .calculate_signature(&reset_message(relay_id, name, challenge), &mut crate::rng())
         .expect("sign")
         .to_vec()
+}
+
+/// The reset key: Ed25519, derived from the recovery key alone, for this
+/// relay and account. Nothing on any device or the relay holds the recovery
+/// key, so nothing but the person who wrote it down can sign with this.
+fn reset_signing_key(recovery: &[u8; 32], relay_id: &[u8; 16], name: &str) -> Ed25519KeyPair {
+    let info = format!("voipc-reset-key/v1|{}", name.trim().to_ascii_lowercase());
+    let seed = Zeroizing::new(hkdf32(recovery, relay_id, &info));
+    Ed25519KeyPair::from_seed_unchecked(&seed[..]).expect("a 32-byte seed")
+}
+
+/// The reset key's public half, for `slot.reset`.
+pub fn reset_key(recovery: &[u8; 32], relay_id: &[u8; 16], name: &str) -> [u8; 32] {
+    reset_signing_key(recovery, relay_id, name)
+        .public_key()
+        .as_ref()
+        .try_into()
+        .expect("an Ed25519 public key is 32 bytes")
+}
+
+/// What a reset signs with the reset key.
+fn reset_key_message(relay_id: &[u8; 16], name: &str, challenge: &[u8]) -> Vec<u8> {
+    let mut m = format!(
+        "voipc-reset/v2|{}|{}|",
+        hex(relay_id),
+        name.trim().to_ascii_lowercase()
+    )
+    .into_bytes();
+    m.extend_from_slice(challenge);
+    m
+}
+
+pub fn reset_key_proof(
+    recovery: &[u8; 32],
+    relay_id: &[u8; 16],
+    name: &str,
+    challenge: &[u8],
+) -> Vec<u8> {
+    reset_signing_key(recovery, relay_id, name)
+        .sign(&reset_key_message(relay_id, name, challenge))
+        .as_ref()
+        .to_vec()
+}
+
+/// The relay's check of `reset_key_proof` against `slot.reset`.
+pub fn reset_key_proof_ok(
+    reset_key: &[u8],
+    relay_id: &[u8; 16],
+    name: &str,
+    challenge: &[u8],
+    signature: &[u8],
+) -> bool {
+    reset_key.len() == 32
+        && ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, reset_key)
+            .verify(&reset_key_message(relay_id, name, challenge), signature)
+            .is_ok()
 }
 
 /// The relay's check of `reset_proof` against the identity on record.
@@ -903,11 +969,13 @@ impl SignIn {
         match &self.reset {
             Some(AuthContinue::Reset {
                 signature,
+                key_signature,
                 auth_secret,
                 pass_slot,
                 ..
             }) => ClientMessage::AuthContinue(AuthContinue::Reset {
                 signature: signature.clone(),
+                key_signature: key_signature.clone(),
                 auth_secret: auth_secret.clone(),
                 pass_slot: pass_slot.clone(),
                 totp: Some(code),
@@ -922,11 +990,13 @@ impl SignIn {
         match &self.reset {
             Some(AuthContinue::Reset {
                 signature,
+                key_signature,
                 auth_secret,
                 pass_slot,
                 ..
             }) => ClientMessage::AuthContinue(AuthContinue::Reset {
                 signature: signature.clone(),
+                key_signature: key_signature.clone(),
                 auth_secret: auth_secret.clone(),
                 pass_slot: pass_slot.clone(),
                 totp: None,
@@ -966,6 +1036,11 @@ impl SignIn {
                 let blobs = vec![
                     vault.pass_slot(&d.vault_key),
                     vault.recovery_slot(&recovery),
+                    VaultBlob {
+                        k: SLOT_RESET.into(),
+                        v: reset_key(&recovery, &relay_id, &self.name).to_vec(),
+                        version: 0,
+                    },
                     vault.seal_item(ITEM_IDENTITY, 1, &identity.serialize()),
                 ];
                 self.recovery = Some(recovery_text(&recovery));
@@ -1007,6 +1082,7 @@ impl SignIn {
                     .map_err(|_| "The vault's identity key is damaged.".to_string())?;
                 let reset = AuthContinue::Reset {
                     signature: reset_proof(&identity, &relay_id, &self.name, &challenge),
+                    key_signature: reset_key_proof(recovery, &relay_id, &self.name, &challenge),
                     auth_secret: d.auth_secret.to_vec(),
                     pass_slot: vault.pass_slot(&d.vault_key).v,
                     totp: None,
@@ -1395,6 +1471,29 @@ mod tests {
             ),
             "the known id signs in"
         );
+    }
+
+    /// S-013: a name an honest relay never hands out is a warning, not a
+    /// new contact, however it looks; a name as relays write it is not.
+    #[test]
+    fn a_look_alike_name_from_the_relay_is_a_warning() {
+        let mut p = Pins::default();
+        let (alice, fake) = ([1u8; 16], [9u8; 16]);
+        assert_eq!(p.check(&alice, "alice", &[5; 33]), PinCheck::New);
+        // A Cyrillic а, a fresh id and a key of its own
+        assert_eq!(p.check(&fake, "\u{430}lice", &[6; 33]), PinCheck::Replaced);
+        assert_eq!(
+            p.check(&fake, "\u{430}lice", &[6; 33]),
+            PinCheck::Same,
+            "told once"
+        );
+        for bad in ["al ice", "a\u{200b}lice", "_alice", "12345", "al"] {
+            let mut p = Pins::default();
+            assert!(p.check(&fake, bad, &[6; 33]).warns(), "{bad:?}");
+        }
+        let mut p = Pins::default();
+        assert_eq!(p.check(&alice, " Alice_01 ", &[5; 33]), PinCheck::New);
+        assert_eq!(p.check(&[2; 16], "", &[7; 33]), PinCheck::New, "no name");
     }
 
     #[test]
