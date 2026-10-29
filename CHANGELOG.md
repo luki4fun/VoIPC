@@ -2,7 +2,7 @@
 
 All notable changes to VoIPC are documented here.
 
-## [1.3.1] - release candidate
+## [1.3.1] - 2026-10-30
 
 **Protocol 13: update relays and apps together.** A 1.3.1 app does not connect
 to a 1.0 relay, and a 1.0 app does not connect to a 1.3.1 relay. 1.3.1 is the
