@@ -32,15 +32,16 @@ test("every live message with a file is a row, beside what this device keeps of 
   );
 });
 
-function row(name: string, over: { size?: number; at?: number; who?: string; server?: string; kind?: "channel" | "dm"; mime?: string; local?: number } = {}): FileRow {
+function row(name: string, over: { size?: number; at?: number; who?: string; server?: string; kind?: "channel" | "dm"; mime?: string; local?: number; used?: number; says?: string; where?: string } = {}): FileRow {
   const server = over.server ?? "a:1";
   const f = file("a", { name, size: over.size ?? 1, mime: over.mime });
   return {
     file: f,
-    msg: m({ file: f, timestamp: over.at ?? T, username: over.who ?? "Zoë#1234" }),
-    place: { kind: over.kind ?? "channel", key: `${server}/x`, server, name: "x" },
+    msg: m({ file: f, timestamp: over.at ?? T, username: over.who ?? "Zoë#1234", content: over.says ?? "" }),
+    place: { kind: over.kind ?? "channel", key: `${server}/${over.where ?? "x"}`, server, name: over.where ?? "x" },
     kind: fileKind(f),
     local: over.local ?? null,
+    used: over.used ?? null,
   };
 }
 const names = (rows: FileRow[]) => rows.map((r) => r.file.name);
@@ -57,6 +58,30 @@ test("files are sorted by date, size, name or sender, newest first on a tie", ()
   assert.deepEqual(by("name"), ["a", "b9", "b10"], "numbers in names count as numbers");
   assert.deepEqual(by("sender"), ["b9", "a", "b10"], "case aside");
   assert.deepEqual(names(rows), ["b10", "b9", "a"], "the rows given are left as they were");
+});
+
+test("recently used: what this device used last first, then what it does not keep, newest first", () => {
+  const rows = [row("old", { at: T + 3 }), row("a", { local: 1, used: T + 1 }), row("b", { local: 1, used: T + 2 }), row("new", { at: T + 4 })];
+  assert.deepEqual(names(arrangeFiles(rows, { filter: "all", sort: "used", group: "none" })[0].rows), ["b", "a", "new", "old"]);
+  assert.equal(fileRows(new Map([["a:1/x", [m({ file: file("a") })]]]), new Map(), [{ hash: "a".repeat(64), bytes: 9, last_used: T + 7 }], T)[0].used, T + 7);
+});
+
+test("a search finds every word, case and accents aside, in a name, a sender, a caption or a place", () => {
+  const rows = [
+    row("Holiday.JPG", { who: "Zoë#1234", says: "beach day", where: "general" }),
+    row("report.pdf", { who: "carl#0001", where: "work" }),
+    row("notes.txt", { who: "bea#0002", server: "b.example:9987" }),
+  ];
+  const find = (query: string) => arrangeFiles(rows, { filter: "all", sort: "name", group: "none", query }).flatMap((s) => names(s.rows));
+  assert.deepEqual(find("holiday"), ["Holiday.JPG"]);
+  assert.deepEqual(find("zoe beach"), ["Holiday.JPG"], "every word, wherever each is");
+  assert.deepEqual(find("WORK"), ["report.pdf"]);
+  assert.deepEqual(find("b.example"), ["notes.txt"]);
+  assert.deepEqual(find("1234"), [], "not the tag");
+  assert.deepEqual(find("  "), ["Holiday.JPG", "notes.txt", "report.pdf"], "no words, no narrowing");
+  assert.deepEqual(find("zoe pdf"), []);
+  const only = arrangeFiles(rows, { filter: "all", sort: "name", group: "none", place: "channel a:1/work" }).flatMap((s) => names(s.rows));
+  assert.deepEqual(only, ["report.pdf"], "one conversation, by kind and key");
 });
 
 test("files are filtered by kind, or by what this device keeps", () => {

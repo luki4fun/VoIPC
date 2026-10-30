@@ -30,6 +30,7 @@ const WORKSPACES = [
   },
   { dir: join(ROOT, 'crates', 'voipc-web'), roots: ['voipc-web'], platforms: ['wasm32-unknown-unknown'] },
   { dir: join(ROOT, 'crates', 'voipc-opus-wasm'), roots: ['voipc-opus-wasm'], platforms: ['wasm32-unknown-unknown'] },
+  { dir: join(ROOT, 'crates', 'voipc-media-wasm'), roots: ['voipc-media-wasm'], platforms: ['wasm32-unknown-unknown'] },
 ];
 
 /** Packages the bundler copies code from although the lockfile lists them as

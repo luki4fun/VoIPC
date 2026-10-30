@@ -19,6 +19,7 @@ import type { ProximityMode } from "../../lib/spatial";
 import { FX_NONE, effectFromId } from "./worklets/mixer-worklet.js";
 import { toHex } from "../../lib/hex";
 import * as files from "./files";
+import * as emotes from "./emotes";
 import { fileRef } from "../../lib/chat-rules";
 import type { ChatEvent, Forwarded } from "../../lib/types";
 
@@ -383,6 +384,15 @@ const handlers: Record<string, Handler> = {
       files.parseFileArg(file),
       optStr(op, "op") ?? undefined,
     ),
+  file_image: ({ server, conv, file, profile, op }) =>
+    files.fileImage(
+      session.sessionFor(str(server, "server"))?.files ?? null,
+      str(server, "server"),
+      files.parseConv(conv),
+      files.parseFileArg(file),
+      num(profile, "profile"),
+      optStr(op, "op") ?? undefined,
+    ),
   cancel_file: ({ op }) => files.cancel(str(op, "op")),
   forward_file: ({ server, conv, hash, op }) => {
     const s = need(server);
@@ -399,6 +409,48 @@ const handlers: Record<string, Handler> = {
     if (!Array.isArray(hashes)) fail("invalid hashes");
     files.cacheRetain(new Set(hashes.filter((h): h is string => typeof h === "string")));
   },
+  // ── Emotes (emotes.ts; client/src-tauri/src/emotes.rs) ──
+  emote_image: ({ server, hash, sticker, still }) => {
+    const e = need(server).emotes;
+    if (!e) fail("this server has no emotes");
+    return e.image(str(hash, "hash"), bool(sticker, "sticker"), bool(still, "still"));
+  },
+  emote_file: async ({ server, hash }) => {
+    const e = need(server).emotes;
+    if (!e) fail("this server has no emotes");
+    return (await e.file(str(hash, "hash"))).buffer;
+  },
+  emote_cache_retain: ({ keep }) =>
+    emotes.retain(Array.isArray(keep) ? keep.filter((h): h is string => typeof h === "string") : []),
+  prepare_emote: ({ body, headers }) => {
+    let meta: Args;
+    try {
+      meta = JSON.parse(str((headers as Record<string, unknown> | undefined)?.["x-voipc-prepare"], "x-voipc-prepare"));
+    } catch {
+      fail("prepare_emote needs its x-voipc-prepare header");
+    }
+    if (!(body instanceof Uint8Array)) fail("prepare_emote takes the picture's bytes");
+    return emotes.prepareEmote(files.sanitizeImage, body, bool(meta.sticker, "sticker"), num(meta.max_bytes, "max_bytes"));
+  },
+  read_emote_pack: async ({ body }) => {
+    if (!(body instanceof Uint8Array)) fail("read_emote_pack takes the archive's bytes");
+    return emotes.packAnswer(await files.readPack(body));
+  },
+  emote_add: ({ body, headers }) => {
+    let meta: Args;
+    try {
+      meta = JSON.parse(str((headers as Record<string, unknown> | undefined)?.["x-voipc-emote"], "x-voipc-emote"));
+    } catch {
+      fail("emote_add needs its x-voipc-emote header");
+    }
+    if (!(body instanceof Uint8Array)) fail("emote_add takes the picture's bytes");
+    const e = need(meta.server).emotes;
+    if (!e) fail("this server has no emotes");
+    return e.add(str(meta.name, "name"), bool(meta.sticker, "sticker"), str(meta.pack, "pack"), body);
+  },
+  emote_remove: ({ server, name }) => need(server).emotes?.remove(str(name, "name")),
+  emote_rename: ({ server, from, to }) => need(server).emotes?.rename(str(from, "from"), str(to, "to")),
+  emote_stickers: ({ server, on }) => need(server).emotes?.setStickers(bool(on, "on")),
   file_cache_remove: ({ hashes }) => {
     if (!Array.isArray(hashes)) fail("invalid hashes");
     files.cacheRemove(hashes.filter((h): h is string => typeof h === "string"));

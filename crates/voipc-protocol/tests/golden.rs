@@ -42,6 +42,8 @@ fn traced_format() -> String {
         VideoCodec,
         ProximityMode,
         FileConv,
+        Emote,
+        EmoteAccess,
     );
     let registry = tracer
         .registry()
@@ -145,4 +147,51 @@ fn conversation_ids_keep_their_form() {
     let (a, b) = ([0x11; 16], [0x22; 16]);
     let conv = voipc_protocol::conv::dm_conv(&b, &a);
     assert_eq!(conv, format!("d:{}:{}", "11".repeat(16), "22".repeat(16)));
+}
+
+/// The emote list is one message: the most a server may have, each with the
+/// longest name and pack label there may be, fits.
+#[test]
+fn the_largest_emote_list_fits_one_message() {
+    let label = "é".repeat(EMOTE_PACK_MAX);
+    assert!(valid_emote_pack(&label));
+    assert!(
+        !valid_emote_pack(&"😀".repeat(EMOTE_PACK_MAX)),
+        "four bytes a character is over the bytes"
+    );
+    let emotes = (0..MAX_EMOTES)
+        .map(|i| Emote {
+            name: format!("{i:0>width$}", width = EMOTE_NAME_MAX),
+            hash: [0xff; 32],
+            sticker: true,
+            pack: label.clone(),
+        })
+        .collect();
+    let len = encode_server_msg(&ServerMessage::EmoteList {
+        stickers: true,
+        emotes,
+    })
+    .unwrap()
+    .len();
+    assert!(len <= MAX_MSG_SIZE as usize, "{len} bytes");
+}
+
+#[test]
+fn emote_names_and_pack_labels() {
+    assert!(valid_emote_name("pog_2") && valid_emote_name(&"x".repeat(EMOTE_NAME_MAX)));
+    for bad in ["a", "Pog", "a-b", "a b", "ä_b", ""] {
+        assert!(!valid_emote_name(bad), "{bad}");
+    }
+    assert!(!valid_emote_name(&"x".repeat(EMOTE_NAME_MAX + 1)));
+    assert!(valid_emote_pack("") && valid_emote_pack("Cats & dogs"));
+    for bad in [
+        " lead",
+        "trail ",
+        "two\nlines",
+        "rtl\u{202E}gnp",
+        "zero\u{200B}width",
+    ] {
+        assert!(!valid_emote_pack(bad), "{bad:?}");
+    }
+    assert_eq!(format!("{:?}", Secret("hunter2".into())), "Secret(…)");
 }

@@ -2,6 +2,9 @@ use std::net::{SocketAddr, ToSocketAddrs};
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+use voipc_protocol::types::{
+    ANIMATION_MB, ANIMATION_MB_DEFAULT, ANIMATION_SIDE, ANIMATION_SIDE_DEFAULT,
+};
 
 /// Server configuration, loaded from a TOML file. Unknown keys are refused, so
 /// a typo (`tcp_fallbak`) stops the start instead of quietly keeping a default,
@@ -83,6 +86,11 @@ pub struct ServerConfig {
     /// The encrypted file cache (`[files]`). On by default, with caps.
     #[serde(default)]
     pub files: FilesConfig,
+
+    /// The server's emotes and stickers (`[emotes]`). On by default, empty
+    /// until an admin adds some.
+    #[serde(default)]
+    pub emotes: EmotesConfig,
 }
 
 /// Whether guests may stay when the relay has accounts.
@@ -173,6 +181,11 @@ pub struct FilesConfig {
     /// Relative to the working directory (`/data` in the container). Only
     /// blob files are wiped from it at start, never anything else there.
     pub dir: String,
+    /// How members' apps keep a moving picture posted here: fitted into this
+    /// many pixels a side, and at most this many MiB of its frames (more:
+    /// choppier). Sent to the apps, which hold them to the same ranges.
+    pub animation_side: u32,
+    pub animation_mb: u32,
 }
 
 impl Default for FilesConfig {
@@ -186,8 +199,53 @@ impl Default for FilesConfig {
             upload_mb_per_hour: 200,
             download_mb_per_hour: 2000,
             dir: "files".into(),
+            animation_side: ANIMATION_SIDE_DEFAULT,
+            animation_mb: ANIMATION_MB_DEFAULT,
         }
     }
+}
+
+/// `[emotes]`: the server's emotes and stickers, which its admins add in the
+/// app. Kept in `dir` across restarts as the files came; the relay never
+/// decodes them (emotes.rs). Members' apps fetch every one, so the total is
+/// what each member downloads once.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct EmotesConfig {
+    pub enabled: bool,
+    /// Largest emote file (KiB), and largest sticker file.
+    pub max_emote_kb: u32,
+    pub max_sticker_kb: u32,
+    /// All of them together (MiB), held in memory.
+    pub max_total_mb: u32,
+    /// Relative to the working directory (`/data` in the container); never
+    /// `[files] dir` or inside it, which is wiped at every start.
+    pub dir: String,
+}
+
+impl Default for EmotesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            max_emote_kb: 256,
+            max_sticker_kb: 512,
+            max_total_mb: 32,
+            dir: "emotes".into(),
+        }
+    }
+}
+
+/// Whether two directories are one, or one is inside the other, by their
+/// names as given (`./a` is `a`).
+fn nested(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        std::path::Path::new(s.trim())
+            .components()
+            .filter(|c| !matches!(c, std::path::Component::CurDir))
+            .collect::<std::path::PathBuf>()
+    };
+    let (a, b) = (norm(a), norm(b));
+    a.starts_with(&b) || b.starts_with(&a)
 }
 
 impl ServerConfig {
@@ -238,6 +296,39 @@ impl ServerConfig {
             }
             if f.dir.trim().is_empty() {
                 return Err(anyhow!("[files] dir must name a directory"));
+            }
+            if !ANIMATION_SIDE.contains(&f.animation_side)
+                || !ANIMATION_MB.contains(&f.animation_mb)
+            {
+                return Err(anyhow!(
+                    "[files] animation_side must be {} to {}, and animation_mb {} to {}: the apps hold them to that",
+                    ANIMATION_SIDE.start(),
+                    ANIMATION_SIDE.end(),
+                    ANIMATION_MB.start(),
+                    ANIMATION_MB.end()
+                ));
+            }
+        }
+        let e = &self.emotes;
+        if e.enabled {
+            // The apps read an emote's file as one answer of at most 1 MiB
+            if !(1..=1024).contains(&e.max_emote_kb) || !(1..=1024).contains(&e.max_sticker_kb) {
+                return Err(anyhow!(
+                    "[emotes] max_emote_kb and max_sticker_kb must be 1 to 1024"
+                ));
+            }
+            if !(1..=1024).contains(&e.max_total_mb) {
+                return Err(anyhow!(
+                    "[emotes] max_total_mb must be 1 to 1024: they are held in memory"
+                ));
+            }
+            if e.dir.trim().is_empty() {
+                return Err(anyhow!("[emotes] dir must name a directory"));
+            }
+            if nested(&e.dir, &self.files.dir) {
+                return Err(anyhow!(
+                    "[emotes] dir must not be [files] dir, nor inside it or around it: that one is wiped at every start"
+                ));
             }
         }
         Ok(())
@@ -292,6 +383,7 @@ impl Default for ServerConfig {
             admin_token: None,
             accounts: AccountsConfig::default(),
             files: FilesConfig::default(),
+            emotes: EmotesConfig::default(),
         }
     }
 }
@@ -299,6 +391,44 @@ impl Default for ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moving_pictures_are_kept_within_the_ranges_the_apps_hold_them_to() {
+        let mut c = ServerConfig::default();
+        assert!(c.validate().is_ok());
+        c.files.animation_side = 100;
+        assert!(c.validate().is_err());
+        c.files.animation_side = 2560;
+        c.files.animation_mb = 513;
+        assert!(c.validate().is_err());
+        // What an app does with a relay's numbers, whatever they are
+        let sent = voipc_protocol::types::FileLimits {
+            max_bytes: 0,
+            animation_side: u32::MAX,
+            animation_mb: 0,
+        };
+        assert_eq!(sent.animation(), (2560, 16));
+    }
+
+    #[test]
+    fn the_emotes_dir_is_never_the_files_dir_nor_inside_or_around_it() {
+        let with = |files: &str, emotes: &str| {
+            let mut c = ServerConfig::default();
+            c.files.dir = files.into();
+            c.emotes.dir = emotes.into();
+            c.validate()
+        };
+        assert!(with("files", "emotes").is_ok());
+        assert!(with("files", "files2").is_ok());
+        for (files, emotes) in [
+            ("files", "files"),
+            ("files", "files/emotes"),
+            ("./files", "files"),
+            ("data/files", "data"),
+        ] {
+            assert!(with(files, emotes).is_err(), "{files} / {emotes}");
+        }
+    }
 
     #[test]
     fn default_config_values() {

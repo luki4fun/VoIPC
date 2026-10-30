@@ -64,7 +64,11 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 /// v13: files — FileUpload/FileFetch/FileCancel, FileUploadReady/FileStored/
 ///      FileReady/FileRefused/FileWanted/FileSeeking/FileUnavailable (the
 ///      bytes go over HTTPS), Authenticated.files
-pub const PROTOCOL_VERSION: u32 = 13;
+/// v14: emotes and stickers — EmoteAdd/EmoteRemove/EmoteStickers/EmoteRename,
+///      EmoteList/EmoteTicket/EmoteError, Authenticated.emotes (the files go
+///      over HTTPS, `/e/v1/<hash>`); inside the message envelope, which the
+///      relay never sees: `emotes` and `sticker`, and `:name:` reactions
+pub const PROTOCOL_VERSION: u32 = 14;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.
@@ -171,6 +175,7 @@ mod tests {
             accounts: None,
             account: None,
             files: None,
+            emotes: None,
         };
         let encoded = encode_server_msg(&msg).unwrap();
         let decoded = decode_server_msg(&encoded[4..]).unwrap();

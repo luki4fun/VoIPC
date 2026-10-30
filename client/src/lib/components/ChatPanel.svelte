@@ -23,6 +23,8 @@
   import { get } from "svelte/store";
   import { account, accountHex } from "../stores/account.js";
   import { users } from "../stores/users.js";
+  import { emoteSets, noteEmotes } from "../stores/emotes.js";
+  import { EMOTE_TOKEN, isEmoteReaction, stickerText, tokenize } from "../emote-rules.js";
   import { expiryFor, messageRefs, pinnedOf, rowKey, sameRow, splitChatKey, type ChatPlace } from "../chat-rules.js";
   import { threadView } from "../thread-rules.js";
   import type { ChatEvent, ChatMessage, FileConv, FileRef, Forwarded } from "../types.js";
@@ -62,6 +64,7 @@
     me,
     notePost,
     messageJump,
+    settingsAsk,
     showMessage,
     nsfwConsented,
     setDmMessageTtl,
@@ -560,6 +563,9 @@
     const { fwd, event, ttlCap } = more;
     const capped = (ttl: number) => (ttlCap === undefined ? ttl || null : Math.min(ttl || Infinity, ttlCap));
     const server = t.server;
+    // `:name:` of a server emote goes as its token (emote-rules.ts)
+    content = tokenize(content, get(emoteSets.peek(server)).emotes);
+    noteEmotes(server, [...content.matchAll(EMOTE_TOKEN)].map((m) => m[1]));
     try {
       // The destruction timer this conversation carries, stamped inside the
       // ciphertext so every copy of the message dies at the same moment: the
@@ -627,12 +633,13 @@
    * smaller unless `original`), sealed and stored on the relay (progress under
    * `op`), then the message, to where it was written. Throws for the composer
    * to show; `CannotClean` asks the person about sending the original.
+   * `refs` come from the thread pane, else the main composer's answer counts.
    */
-  async function sendFileMessage(file: File, original: boolean, caption: string, op: string): Promise<void> {
+  async function sendFileMessage(file: File, original: boolean, caption: string, op: string, refs?: { replyTo: string; thread: string }): Promise<void> {
     const t = targetNow();
     const conv = fileConvOf(t);
     if (!conv) throw new Error("Files cannot be sent to them now");
-    const answering = replyingTo;
+    const answering = refs ? null : replyingTo;
     const ready = await prepare(file, original);
     const max = get(fileLimits.peek(t.server))?.max_bytes;
     // Deflate may shrink a file; what is compressed already will not
@@ -641,9 +648,11 @@
     }
     const blob = await sendFile(t.server, conv, ready.bytes, ready.compress, op);
     // The answer goes with the first file that goes; a failure keeps it
-    if (replyingTo === answering) replyingTo = null;
+    if (answering && replyingTo === answering) replyingTo = null;
     const { bytes: _, compress: __, ...about } = ready;
-    if (!(await sendTo(t, caption, answering?.id ?? null, answering?.thread ?? null, { ...blob, ...about }))) {
+    const replyTo = refs?.replyTo ?? answering?.id ?? null;
+    const thread = refs?.thread ?? answering?.thread ?? null;
+    if (!(await sendTo(t, caption, replyTo, thread, { ...blob, ...about }))) {
       throw new Error("Not sent");
     }
   }
@@ -681,7 +690,10 @@
     const t = targetNow();
     return {
       forward,
-      react: (m, emoji, on) => sendEvent(t, { kind: "react", target: m.id!, emoji, on }, m),
+      react: (m, emoji, on) => {
+        if (on && isEmoteReaction(emoji)) noteEmotes(t.server, [emoji.slice(1, -1)]);
+        return sendEvent(t, { kind: "react", target: m.id!, emoji, on }, m);
+      },
       edit: (m, text) => sendEvent(t, { kind: "edit", target: m.id! }, m, text),
       remove: (m) => sendEvent(t, { kind: "delete", target: m.id! }, m),
       // A pin counts only from a manager, which every reader checks
@@ -955,6 +967,14 @@
         aria-expanded={searching}
       ><Icon name="search" size={16} /></button>
     {/if}
+    {#if displayMessages.some((m) => m.file) && !gated}
+      <button
+        class="clear-chat-btn"
+        onclick={() => settingsAsk.set({ tab: "files", place: `${isDmMode ? "dm" : "channel"} ${currentKey}` })}
+        title="Files in this conversation"
+        aria-label="Files in this conversation"
+      ><Icon name="paperclip" size={16} /></button>
+    {/if}
     {#if displayMessages.length > 0 && !isLobby}
       <button
         class="clear-chat-btn"
@@ -1046,6 +1066,7 @@
       conversation={`${$serverAddress}|dm|${$activeDmUserId}`}
       onsend={sendMessage}
       onsendfile={canSendFiles ? sendFileMessage : undefined}
+      onsticker={$emoteSets.stickers ? (e) => sendMessage(stickerText(e)) : undefined}
       replying={replyingTo?.username ?? null}
       oncancelreply={() => (replyingTo = null)}
     />
@@ -1062,6 +1083,7 @@
       {held}
       onsend={sendMessage}
       onsendfile={canSendFiles ? sendFileMessage : undefined}
+      onsticker={$emoteSets.stickers ? (e) => sendMessage(stickerText(e)) : undefined}
       replying={replyingTo?.username ?? null}
       oncancelreply={() => (replyingTo = null)}
     />
@@ -1104,6 +1126,7 @@
       all={displayMessages}
       {held}
       onsend={canAnswer ? sendMessage : undefined}
+      onsendfile={canAnswer && canSendFiles ? sendFileMessage : undefined}
       onlink={(url) => (linkPopupUrl = url)}
       onclose={() => (threadRoot = null)}
       onjumpelsewhere={showInMain}

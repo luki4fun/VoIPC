@@ -20,7 +20,9 @@ import type { ProximityMode } from "../../lib/spatial";
 import { audio } from "./audio";
 import { video } from "./video";
 import { share } from "./share";
-import { Files, originOf } from "./files";
+import { Files, originOf, sanitizeImage } from "./files";
+import { Emotes } from "./emotes";
+import { motionOf } from "./media";
 
 /** Bound for the authentication response (network.rs CONNECT_TIMEOUT). */
 const AUTH_TIMEOUT_MS = 10_000;
@@ -258,6 +260,7 @@ export class Session implements SessionContext, AccountHost {
   account: AccountDriver | null = null;
   /** This connection's file transfers, from Authenticated on (files.ts). */
   files: Files | null = null;
+  emotes: Emotes | null = null;
   /** The safety number with `userId` (account_session.rs safety_number). */
   safetyNumber(userId: number): string {
     if (!this.account) throw new Error("Sign in to an account to verify people");
@@ -490,6 +493,7 @@ export class Session implements SessionContext, AccountHost {
     if (sessions.get(this.server) === this) sessions.delete(this.server);
     clearInterval(this.keepalive);
     this.files?.close();
+    this.emotes?.close();
     if (voiceOwner === this) detachVoice();
     if (sendDisconnect && this.transport) {
       // Whatever was still waiting for the pacer is moot now, and the goodbye
@@ -613,9 +617,21 @@ export class Session implements SessionContext, AccountHost {
         this.sessionId = b.session_id;
         // libsignal binds both parties' ids into every pairwise message
         this.signal.setOwnUserId(b.user_id);
-        this.files = new Files(this, originOf(this.server), b.files ? Number(b.files.max_bytes) : null);
+        this.files = new Files(this, originOf(this.server), b.files ? Number(b.files.max_bytes) : null, b.files ? motionOf(b.files) : null);
+        this.emotes = new Emotes(
+          this,
+          originOf(this.server),
+          b.emotes
+            ? { token: String(b.emotes.token), max_emote_bytes: Number(b.emotes.max_emote_bytes), max_sticker_bytes: Number(b.emotes.max_sticker_bytes) }
+            : null,
+          sanitizeImage,
+        );
         // network.rs emits the same, for the composer
         this.emit("file-limits", b.files ? { max_bytes: Number(b.files.max_bytes) } : null);
+        this.emit(
+          "emote-limits",
+          b.emotes ? { max_emote_bytes: Number(b.emotes.max_emote_bytes), max_sticker_bytes: Number(b.emotes.max_sticker_bytes) } : null,
+        );
         if (b.accounts) this.emit("relay-accounts", b.accounts);
         // An account sign-in ends signed in to that account, or not at all
         // (account.rs sign_in waits for exactly this).
@@ -894,7 +910,7 @@ export class Session implements SessionContext, AccountHost {
         this.onMediaKeyReceived(b.channel_id, b.from_user_id, toBytes(b.encrypted_media_key), b.message_type);
         break;
       case "AdminStatus":
-        this.emit("admin-status", { user_id: b.user_id, is_admin: b.is_admin });
+        this.emit("admin-status", { user_id: b.user_id, is_admin: b.is_admin, own: b.user_id === this.userId });
         break;
       case "AdminError":
         this.emit("admin-error", { reason: b.reason });
@@ -947,6 +963,11 @@ export class Session implements SessionContext, AccountHost {
       case "FileSeeking":
       case "FileUnavailable":
         this.files?.onMessage(tag, b);
+        break;
+      case "EmoteList":
+      case "EmoteTicket":
+      case "EmoteError":
+        this.emotes?.onMessage(tag, b);
         break;
       default:
         console.warn("unhandled server message:", tag);

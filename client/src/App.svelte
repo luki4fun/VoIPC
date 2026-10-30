@@ -142,6 +142,7 @@
     requestRoster,
     setRoster,
   } from "./lib/stores/rosters.js";
+  import { emoteLimits, setEmotes, type EmoteSet } from "./lib/stores/emotes.js";
   import { confirmAction } from "./lib/stores/confirm.js";
   import {
     askNsfwConsent,
@@ -153,6 +154,7 @@
     managesChannel,
     openJoinedTextChannel,
     previewChannel,
+    settingsAsk,
   } from "./lib/stores/channel-ui.js";
   import {
     chatEvent,
@@ -246,6 +248,9 @@
   }
 
   let showSettings = $state(false);
+  $effect(() => {
+    if ($settingsAsk) showSettings = true;
+  });
 
   // Deferred auto-connect: waits for chat history to be unlocked first
   let pendingAutoConnect = $state<SavedServer[] | null>(null);
@@ -730,6 +735,11 @@
       // The relay asks for a file this device holds (a re-seed): silent
       listenServer<{ conv: FileConv; hash: string }>("file-wanted", (server, d) => answerFileWanted(server, d.conv, d.hash)),
       listenServer<{ max_bytes: number } | null>("file-limits", (server, d) => fileLimits.of(server).set(d)),
+      listenServer<EmoteSet>("emote-list", (server, d) => setEmotes(server, d)),
+      listenServer<{ max_emote_bytes: number; max_sticker_bytes: number } | null>("emote-limits", (server, d) => emoteLimits.of(server).set(d)),
+      listenServer<{ name: string; reason: string }>("emote-error", (server, d) =>
+        addNotification(`${fromServer(server)}${d.name ? `:${d.name}: — ` : ""}${d.reason}`, "error"),
+      ),
       listenServer<FileProgress>("file-progress", (_server, d) => noteProgress(d)),
       // First meeting with a self-signed server: what was pinned, to compare
       listenServer<{ fingerprint: string }>("tofu-pinned", (server, d) =>
@@ -1172,9 +1182,11 @@
       }),
 
       // ── Moderation ──
-      listenServer<{ user_id: number; is_admin: boolean }>("admin-status", (server, data) => {
+      listenServer<{ user_id: number; is_admin: boolean; own: boolean }>("admin-status", (server, data) => {
         const { user_id: uid, is_admin } = data;
-        if (uid === get(userId.peek(server))) {
+        // The backend says whether it is ours: a role admin's comes before
+        // `connect` has answered with our id here
+        if (data.own) {
           isAdmin.of(server).set(is_admin);
           if (is_admin) {
             addNotification(`${fromServer(server)}You are now a server admin`, "info");

@@ -21,6 +21,7 @@ voipc-protocol = { path = "../crates/voipc-protocol" }
 voipc-crypto = { path = "../crates/voipc-crypto" }
 voipc-audio = { path = "../crates/voipc-audio" }
 voipc-web = { path = "../crates/voipc-web" }
+voipc-media = { path = "../crates/voipc-media" }
 
 [[bin]]
 name = "opus_decode"
@@ -116,6 +117,13 @@ bench = false
 [[bin]]
 name = "web_media"
 path = "fuzz_targets/web_media.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "media"
+path = "fuzz_targets/media.rs"
 test = false
 doc = false
 bench = false

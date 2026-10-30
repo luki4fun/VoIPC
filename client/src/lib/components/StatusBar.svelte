@@ -16,6 +16,7 @@
   import { viewingVoice } from "../stores/channels.js";
   import { lossPercent, quality } from "../stores/connection-quality.js";
   import { openAdminPanel, showAdminLogin } from "../stores/admin-ui.js";
+  import { emoteLimits } from "../stores/emotes.js";
   import { account, showPrompt } from "../stores/account.js";
   import { disconnectServer } from "../connect.js";
   import { playDisconnectedSound } from "../sounds.js";
@@ -77,7 +78,7 @@
     <button
       class="admin-btn"
       class:active={$isAdmin}
-      title={$isAdmin ? "Server admin — active bans" : "Admin login (server token)"}
+      title={!$isAdmin ? "Admin login (server token)" : $emoteLimits ? "Server admin — bans, emotes and stickers" : "Server admin — active bans"}
       onclick={() => ($isAdmin ? openAdminPanel() : showAdminLogin.set(true))}
     >
       <Icon name="shield" size={14} />

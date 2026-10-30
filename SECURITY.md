@@ -52,16 +52,16 @@ Every release carries `SHA256SUMS`, and a build attestation for every file. The 
 proves the file was built by this repository's release workflow from the tagged commit.
 
     sha256sum -c SHA256SUMS --ignore-missing
-    gh attestation verify VoIPC_1.3.1_amd64.AppImage --repo luki4fun/voipc
+    gh attestation verify VoIPC_1.4.0_amd64.AppImage --repo luki4fun/voipc
 
 The relay's container image is attested the same way:
 
-    gh attestation verify oci://ghcr.io/luki4fun/voipc-server:1.3.1 --repo luki4fun/voipc
+    gh attestation verify oci://ghcr.io/luki4fun/voipc-server:1.4.0 --repo luki4fun/voipc
 
 The Android APK is signed with the same certificate as every earlier VoIPC APK. Its SHA-256 is
 `30d71722fe2bdd4bafc34fdaf5be34071f5dfaa399823237c7ae4ab7778a0fe9`. To check it:
 
-    apksigner verify --print-certs VoIPC-android-1.3.1.apk
+    apksigner verify --print-certs VoIPC-android-1.4.0.apk
 
 The desktop app's own updater only installs an update signed for exactly the version it
 announces.

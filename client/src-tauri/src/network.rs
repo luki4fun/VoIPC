@@ -117,9 +117,9 @@ pub async fn connect_to_server(
     // Guests get a fresh identity per connection (ephemeral by design); an
     // account's comes out of its vault during the sign-in, and its stores are
     // made then (`account::sign_in` calls `init_signal` itself).
-    let (user_id, session_id, account, file_limits) = match account {
+    let (user_id, session_id, account, file_limits, emote_access) = match account {
         Some(args) => {
-            let (user_id, session_id, link, files) = crate::account::sign_in(
+            let (user_id, session_id, link, files, emotes) = crate::account::sign_in(
                 state,
                 &app_handle,
                 &address,
@@ -131,7 +131,7 @@ pub async fn connect_to_server(
                 &mut buf,
             )
             .await?;
-            (user_id, session_id, Some(link), files)
+            (user_id, session_id, Some(link), files, emotes)
         }
         None => {
             let (identity_key, prekey_bundle) = {
@@ -154,7 +154,7 @@ pub async fn connect_to_server(
                 .map_err(|e| format!("Failed to send auth: {}", e))?;
 
             // Read until we get the Authenticated or AuthError response
-            let (user_id, session_id, files) = loop {
+            let (user_id, session_id, files, emotes) = loop {
                 let n = tokio::time::timeout(CONNECT_TIMEOUT, control_recv.read_buf(&mut buf))
                     .await
                     .map_err(|_| "Timed out waiting for the authentication response".to_string())?
@@ -176,13 +176,14 @@ pub async fn connect_to_server(
                             session_id,
                             accounts,
                             files,
+                            emotes,
                             ..
                         } => {
                             // A guest on a relay with accounts: the UI can offer one.
                             if let Some(accounts) = accounts {
                                 emit_server(&app_handle, &address, "relay-accounts", accounts);
                             }
-                            break (user_id, session_id, files);
+                            break (user_id, session_id, files, emotes);
                         }
                         ServerMessage::AuthError { reason } => {
                             return Err(format!("Authentication failed: {}", reason));
@@ -200,13 +201,22 @@ pub async fn connect_to_server(
                     }
                 }
             };
-            (user_id, session_id, None, files)
+            (user_id, session_id, None, files, emotes)
         }
     };
 
     info!(user_id, session_id, "authenticated with server");
     // Whether this relay keeps files, and how large: the composer's to know
     emit_server(&app_handle, &address, "file-limits", file_limits.clone());
+    // Whether this relay has emotes, and how large one may be (never the token)
+    emit_server(
+        &app_handle,
+        &address,
+        "emote-limits",
+        emote_access.as_ref().map(|a| {
+            serde_json::json!({ "max_emote_bytes": a.max_emote_bytes, "max_sticker_bytes": a.max_sticker_bytes })
+        }),
+    );
 
     // The Signal state is this connection's own from birth, so all it needs
     // now is to know who we are here.
@@ -369,6 +379,7 @@ pub async fn connect_to_server(
         port,
         accept_invalid_certs,
         file_limits,
+        emote_access,
         tcp_tx.clone(),
     ));
     let writer_handle = tokio::spawn(control_writer_task(control_send, tcp_rx));
@@ -2288,11 +2299,13 @@ async fn handle_server_message(
         }
         // ── Moderation ──
         ServerMessage::AdminStatus { user_id, is_admin } => {
+            // `own` decided here: a role admin's comes right after the
+            // sign-in, before the page may know its own id on this server
             emit_server(
                 app_handle,
                 server,
                 "admin-status",
-                serde_json::json!({"user_id": user_id, "is_admin": is_admin}),
+                serde_json::json!({"user_id": user_id, "is_admin": is_admin, "own": user_id == own_user_id}),
             );
         }
         ServerMessage::AdminError { reason } => {
@@ -2368,7 +2381,10 @@ async fn handle_server_message(
         | ServerMessage::FileRefused { .. }
         | ServerMessage::FileWanted { .. }
         | ServerMessage::FileSeeking { .. }
-        | ServerMessage::FileUnavailable { .. } => {}
+        | ServerMessage::FileUnavailable { .. }
+        | ServerMessage::EmoteList { .. }
+        | ServerMessage::EmoteTicket { .. }
+        | ServerMessage::EmoteError { .. } => {}
     }
 }
 

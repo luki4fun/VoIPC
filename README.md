@@ -401,6 +401,9 @@ admin_token = "change-me"  # optional; unset = a random token is printed in the 
 [files]                    # the encrypted file cache, on by default (docs/OPERATING.md §11 has every key)
 max_size_mb = 10           # largest file blob
 max_age_hours = 24         # no blob stays longer; all of them go at every start
+
+[emotes]                   # the server's emotes and stickers, on by default (docs/OPERATING.md §12)
+max_total_mb = 32          # all of them, held in memory; each member downloads each once
 ```
 
 > **IPv6:** `host = "::"` is the default and serves both families from one listener (a host with IPv6 disabled falls back to `0.0.0.0` automatically). Do not pin `host` to a concrete IPv4 address while your domain publishes an AAAA record: the browser client then fails while everything else looks healthy, because the page and `/wt.json` are TCP and Chrome quietly falls back to IPv4 after the refused IPv6 attempt, while the WebTransport session is UDP and has no such fallback — it dies with `ERR_QUIC_PROTOCOL_ERROR`.

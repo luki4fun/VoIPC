@@ -195,6 +195,7 @@ pub async fn handle_connection<S>(
             accounts: state.accounts.as_ref().map(|r| r.info()),
             account,
             files: state.files.as_ref().map(|f| f.limits()),
+            emotes: state.emotes.as_ref().map(|e| e.access(session_id)),
         },
     )
     .await;
@@ -208,6 +209,9 @@ pub async fn handle_connection<S>(
         },
     )
     .await;
+    if let Some(emotes) = &state.emotes {
+        let _ = send_msg(&tx, &emotes.list()).await;
+    }
 
     // Auto-join General (channel 0)
     if let Err(e) = handle_join_channel(&state, user_id, session_id, 0, None, &tx).await {
@@ -1308,6 +1312,19 @@ async fn handle_message(
         }
         ClientMessage::FileCancel { hash } => {
             crate::files::handle_cancel(state, session_id, hash).await;
+        }
+
+        ClientMessage::EmoteAdd { emote, len } => {
+            crate::emotes::handle_add(state, session_id, emote, len, tx).await;
+        }
+        ClientMessage::EmoteRemove { name } => {
+            crate::emotes::handle_remove(state, session_id, name, tx).await;
+        }
+        ClientMessage::EmoteStickers { on } => {
+            crate::emotes::handle_stickers(state, session_id, on, tx).await;
+        }
+        ClientMessage::EmoteRename { from, to } => {
+            crate::emotes::handle_rename(state, session_id, from, to, tx).await;
         }
 
         // ── E2E Encryption handlers ──────────────────────────────────────
@@ -3366,6 +3383,9 @@ async fn cleanup_session(state: &Arc<ServerState>, user_id: UserId, session_id: 
     // Its file tickets, uploads and waits: the slot of an upload it held
     // passes to the next member with the same file
     crate::files::session_ended(state, session_id).await;
+    if let Some(emotes) = &state.emotes {
+        emotes.forget(session_id);
+    }
 
     let removed = state.remove_session(session_id).await;
     // The account's l4f session ends with the connection: rows for every
@@ -8672,6 +8692,133 @@ mod tests {
         carol.send(&ClientMessage::FileFetch { conv, hash }).await;
         refused(&mut carol).await;
         assert_eq!(get_blob(&state, &hash, "not-a-ticket").await.0, 401);
+    }
+
+    /// Protocol 14: a member who is not an admin cannot add one; an admin adds
+    /// one and uploads its file, every member gets the new list, and fetches
+    /// the file with the bearer its `Authenticated` carried.
+    #[tokio::test]
+    async fn an_admin_adds_an_emote_and_every_member_gets_it() {
+        use sha2::{Digest, Sha256};
+        use voipc_protocol::conv::hex;
+        let dir = std::env::temp_dir().join(format!(
+            "voipc-emotes-tcp-{}",
+            hex(&rand::random::<[u8; 8]>())
+        ));
+        let mut s = ServerState::new(
+            &ServerConfig::default(),
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        );
+        let cfg = crate::config::EmotesConfig {
+            dir: dir.to_string_lossy().into_owned(),
+            ..Default::default()
+        };
+        s.emotes = Some(Arc::new(crate::emotes::EmoteStore::open(&cfg).unwrap()));
+        let state = Arc::new(s);
+        let mut admin = connect(&state, "admin", HERE).await;
+        let mut bob = open(&state, "bob", HERE).await;
+        let ServerMessage::Authenticated {
+            emotes: Some(access),
+            ..
+        } = bob
+            .expect("Authenticated", |m| {
+                matches!(m, ServerMessage::Authenticated { .. })
+            })
+            .await
+        else {
+            panic!("no emote access in Authenticated")
+        };
+        bob.expect(
+            "the list on join",
+            |m| matches!(m, ServerMessage::EmoteList { emotes, .. } if emotes.is_empty()),
+        )
+        .await;
+        let png = b"\x89PNG\r\n\x1a\nthe relay never decodes this".to_vec();
+        let emote = Emote {
+            name: "pog".into(),
+            hash: Sha256::digest(&png).into(),
+            sticker: false,
+            pack: String::new(),
+        };
+        let path = format!("/e/v1/{}", hex(&emote.hash));
+
+        bob.send(&ClientMessage::EmoteAdd {
+            emote: emote.clone(),
+            len: png.len() as u32,
+        })
+        .await;
+        bob.expect("EmoteError", |m| {
+            matches!(m, ServerMessage::EmoteError { .. })
+        })
+        .await;
+
+        admin
+            .send(&ClientMessage::AdminLogin {
+                token: "test-admin-token".into(),
+            })
+            .await;
+        admin
+            .expect("AdminStatus", |m| {
+                matches!(m, ServerMessage::AdminStatus { is_admin: true, .. })
+            })
+            .await;
+        admin
+            .send(&ClientMessage::EmoteAdd {
+                emote: emote.clone(),
+                len: png.len() as u32,
+            })
+            .await;
+        let ServerMessage::EmoteTicket { ticket, .. } = admin
+            .expect("EmoteTicket", |m| {
+                matches!(m, ServerMessage::EmoteTicket { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        let auth = format!("Bearer {ticket}");
+        let put = crate::files::http(
+            &state,
+            HERE,
+            "PUT",
+            &path,
+            Some(&auth),
+            None,
+            Bytes::from(png.clone()),
+        )
+        .await;
+        assert_eq!(put.status, 201);
+        let want = vec![emote.clone()];
+        bob.expect(
+            "the new list",
+            |m| matches!(m, ServerMessage::EmoteList { emotes, .. } if *emotes == want),
+        )
+        .await;
+        let auth = format!("Bearer {}", access.token.0);
+        let got =
+            crate::files::http(&state, HERE, "GET", &path, Some(&auth), None, Bytes::new()).await;
+        assert_eq!((got.status, &got.body[..]), (200, &png[..]));
+
+        // A rename: the same file under a new name, no upload
+        let renamed = Emote {
+            name: "poggers".into(),
+            ..emote.clone()
+        };
+        admin
+            .send(&ClientMessage::EmoteRename {
+                from: "pog".into(),
+                to: "poggers".into(),
+            })
+            .await;
+        let want = vec![renamed];
+        bob.expect(
+            "the renamed list",
+            |m| matches!(m, ServerMessage::EmoteList { emotes, .. } if *emotes == want),
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

@@ -18,6 +18,8 @@ voipc-protocol = { path = "../../crates/voipc-protocol" }
 voipc-audio = { path = "../../crates/voipc-audio" }
 voipc-video = { path = "../../crates/voipc-video" }
 voipc-crypto = { path = "../../crates/voipc-crypto" }
+# Pictures other people made, decoded here and shown only as PNG it wrote
+voipc-media = { path = "../../crates/voipc-media" }
 tauri = { version = "2", features = [] }
 tauri-plugin-notification = "2"
 tokio = { version = "1", features = ["full"] }
@@ -56,6 +58,9 @@ rfd = "0.15"
 # The NSIS and AppImage builds update themselves (updater.rs). Without `zip`:
 # the feed points at the installer and the AppImage themselves.
 tauri-plugin-updater = { version = "2.14", default-features = false, features = ["rustls-tls", "system-proxy"] }
+# The one-click emote imports (emote_sources.rs): the updater's own client,
+# with its TLS (ring, the system's roots), so no second stack comes in
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
 
 # TCP_NOTSENT_LOWAT for the TCP fallback, which only Linux and Android have
 [target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]

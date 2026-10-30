@@ -26,7 +26,7 @@ jobs:
       fail-fast: false
       matrix:
         target: [codec, media_packets, video_assembly, ws, envelope, keys, log, file,
-                 vault, jitter, opus, game, web_media, opus_decode]
+                 vault, jitter, opus, game, web_media, opus_decode, media]
     env:
       NIGHTLY: nightly-2026-10-23
       CARGO_FUZZ_VERSION: '0.13.2'
@@ -131,7 +131,7 @@ jobs:
         run: rustup toolchain install && rustup target add x86_64-unknown-linux-musl wasm32-unknown-unknown
 
       - name: Lockfiles match the manifests
-        run: for d in . crates/voipc-web crates/voipc-opus-wasm; do (cd "$d" && cargo fetch --locked); done
+        run: for d in . crates/voipc-web crates/voipc-opus-wasm crates/voipc-media-wasm; do (cd "$d" && cargo fetch --locked); done
 
       - run: npm ci
         working-directory: client
