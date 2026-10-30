@@ -147,6 +147,16 @@ const centre = (selector) =>
     return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2),
              w: Math.round(r.width), h: Math.round(r.height) }; })()`;
 
+/** A real key press on what has the focus: trusted, so a form's implicit
+ *  submission (Enter in a text field) happens as it would for a person. */
+async function realKey(tab, key) {
+  const code = { Enter: 13, Escape: 27 }[key];
+  const base = { key, code: key, windowsVirtualKeyCode: code, nativeVirtualKeyCode: code };
+  await tab.send("Input.dispatchKeyEvent", { type: "keyDown", ...base, ...(key === "Enter" ? { text: "\r" } : {}) });
+  await tab.send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+  await sleep(120);
+}
+
 /** A real mouse click: hit-tested, trusted, and subject to pointer capture. */
 async function realClick(tab, selector) {
   const at = await tab.evaluate(centre(selector));
@@ -2837,6 +2847,22 @@ check(
     await ben.evaluate(`${rowWith("look")}?.querySelector(".msg-content")?.innerHTML.slice(0, 200) ?? "no row"`));
   check("and the message reads as written, with no token in sight", await ben.evaluate(
     `(() => { const t = ${rowWith("look")}?.querySelector(".msg-content")?.textContent ?? ""; return !t.includes("<:") && t.trim().startsWith("look"); })()`));
+
+  // 1.5: the shared picker. Opened by a pointer, its search has the focus;
+  // Enter there takes the first match into the draft at the cursor and sends
+  // nothing (in 1.4 a real Enter submitted the message box's form)
+  await ann.evaluate(`(() => { const i = document.querySelector(".chat-main .input-bar .chat-input"); if (!i) return;
+    i.value = "draft"; i.dispatchEvent(new Event("input", { bubbles: true })); i.focus(); i.setSelectionRange(5, 5); })()`);
+  await realClick(ann, '.chat-main .input-bar button[aria-label="Emoji, emotes and stickers"]');
+  const searching = await waitFor(ann, `!!document.activeElement?.classList.contains("ep-search")`, 3_000).then(() => true, () => false);
+  await ann.send("Input.insertText", { text: name });
+  await sleep(200);
+  await realKey(ann, "Enter");
+  await sleep(500);
+  check("the picker's search takes its first match into the draft on Enter, and sends nothing",
+    searching && (await ann.evaluate(`(() => { const i = document.querySelector(".chat-main .input-bar .chat-input");
+      return i?.value === ${JSON.stringify(`draft :${name}: `)} && !document.querySelector(".chat-main .ep-search") && !${rowWith("draft")}; })()`)),
+    await ann.evaluate(`JSON.stringify([document.querySelector(".chat-main .input-bar .chat-input")?.value, !!document.querySelector(".chat-main .ep-search")])`));
 
   for (const [who, tab] of [["admin", ann], ["member", ben]]) {
     const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));

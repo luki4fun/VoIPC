@@ -8,12 +8,11 @@
   import { CannotClean, isPhoto } from "../../image-prep.js";
   import { isAnimated, sniff } from "../../file-sniff.js";
   import Icon from "../Icons.svelte";
-  import { EMOJI_CATEGORIES } from "../../emoji.js";
-  import { byRecent, completeEmote, type Emote as EmoteItem } from "../../emote-rules.js";
-  import { emoteSets, recentEmotes } from "../../stores/emotes.js";
+  import { completeEmoji, completeEmote, type Emote as EmoteItem } from "../../emote-rules.js";
+  import { emoteSets, favEmotes, recentEmotes } from "../../stores/emotes.js";
   import { serverAddress } from "../../stores/connection.js";
-  import { fold } from "../../search-rules.js";
   import Emote from "./Emote.svelte";
+  import EmotePicker from "./EmotePicker.svelte";
 
   interface Props {
     placeholder: string;
@@ -263,16 +262,24 @@
   });
   /** This device's recently used emotes here, newest first (stores/emotes.ts). */
   const recent = $derived($recentEmotes[$serverAddress] ?? []);
-  /** The `:word` being typed just before the cursor: a server emote to complete. */
+  /** The `:word` being typed just before the cursor: a server emote, or an
+   *  emoji by name, to complete. */
   const emoteQuery = $derived.by(() => {
-    if ($emoteSets.emotes.length === 0) return null;
     const before = text.slice(0, caret);
     const m = /(?:^|\s):([a-z0-9_]{2,30})$/.exec(before);
     return m ? { q: m[1], start: before.length - m[1].length - 1 } : null;
   });
-  const emoteOptions = $derived(
-    emoteQuery && emoteQuery.start !== dismissedAt && suggestions.length === 0 ? completeEmote(emoteQuery.q, $emoteSets.emotes, 8, recent) : [],
-  );
+  type Option = { kind: "emote"; e: EmoteItem } | { kind: "emoji"; name: string; emoji: string };
+  /** The server's emotes first, favourites and the recently used ahead, then
+   *  emoji by name. */
+  const emoteOptions = $derived.by((): Option[] => {
+    if (!emoteQuery || emoteQuery.start === dismissedAt || suggestions.length) return [];
+    const own = completeEmote(emoteQuery.q, $emoteSets.emotes, 8, [...($favEmotes[$serverAddress] ?? []), ...recent]);
+    return [
+      ...own.map((e): Option => ({ kind: "emote", e })),
+      ...completeEmoji(emoteQuery.q, 8 - own.length).map((o): Option => ({ kind: "emoji", ...o })),
+    ];
+  });
   const offered = $derived(suggestions.length || emoteOptions.length);
   $effect(() => {
     void suggestions;
@@ -280,9 +287,9 @@
     active = 0;
   });
 
-  function pickEmote(e: EmoteItem) {
+  function pickEmote(o: Option) {
     if (!emoteQuery) return;
-    const insert = `:${e.name}: `;
+    const insert = o.kind === "emote" ? `:${o.e.name}: ` : `${o.emoji} `;
     const at = emoteQuery.start + insert.length;
     text = text.slice(0, emoteQuery.start) + insert + text.slice(caret);
     caret = at;
@@ -315,6 +322,13 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    // The picker alone: never the thread or the pane around this box
+    if (e.key === "Escape" && showEmojiPicker) {
+      e.preventDefault();
+      e.stopPropagation();
+      showEmojiPicker = false;
+      return;
+    }
     if (offered > 0) {
       if (e.key === "ArrowDown" || e.key === "ArrowUp") {
         e.preventDefault();
@@ -348,38 +362,30 @@
     }
   }
 
-  // Emoji picker state: -1 is the server's emotes, -2 its stickers
   let showEmojiPicker = $state(false);
-  let emojiCategory = $state(0);
-  let emoteFilter = $state("");
-  const matching = (sticker: boolean) =>
-    $emoteSets.emotes.filter((e) => e.sticker === sticker && fold(`${e.name} ${e.pack}`).includes(fold(emoteFilter)));
-  /** `list` by pack, the packs by name: the one without a name first. */
-  function byPack(list: EmoteItem[]): { key: string; label: string; list: EmoteItem[] }[] {
-    const packs = new Map<string, EmoteItem[]>();
-    for (const e of list) {
-      const same = packs.get(e.pack);
-      if (same) same.push(e);
-      else packs.set(e.pack, [e]);
-    }
-    return [...packs].sort(([a], [b]) => a.localeCompare(b)).map(([pack, list]) => ({ key: `p:${pack}`, label: pack, list }));
+  /** Into the picker's search at once, unless a finger opened it (its
+   *  keyboard would come up over the picker). */
+  let pickerFocus = $state(false);
+
+  /** `piece` into the draft where the cursor is: an emote's `:name:` with a
+   *  space either side of it. `keep`: the picker stays open for another. */
+  function insertAtCaret(piece: string, keep: boolean) {
+    const from = inputEl?.selectionStart ?? text.length;
+    const to = inputEl?.selectionEnd ?? from;
+    const before = text.slice(0, from);
+    const insert = piece.startsWith(":") ? `${/\S$/.test(before) ? " " : ""}${piece} ` : piece;
+    text = before + insert + text.slice(to);
+    const at = from + insert.length;
+    caret = at;
+    if (!keep) showEmojiPicker = false;
+    tick().then(() => {
+      if (!keep) inputEl?.focus();
+      inputEl?.setSelectionRange(at, at);
+    });
   }
-  const emoteSections = $derived.by(() => {
-    const list = matching(false);
-    const used = emoteFilter ? [] : byRecent(list.filter((e) => recent.includes(e.name)), recent);
-    const sections = [...(used.length ? [{ key: "recent", label: "Recently used", list: used }] : []), ...byPack(list)];
-    // Among other sections, the emotes of no pack need a heading too
-    return sections.map((s) => (s.label || sections.length === 1 ? s : { ...s, label: "Emotes" }));
-  });
-  const stickerPacks = $derived(onsticker ? byPack(matching(true)) : []);
-  const hasEmotes = $derived($emoteSets.emotes.some((e) => !e.sticker));
-  const hasStickers = $derived(!!onsticker && $emoteSets.emotes.some((e) => e.sticker));
 
-
-  function insertEmoji(emoji: string) {
-    text += emoji;
+  function closePicker() {
     showEmojiPicker = false;
-    // Re-focus the input
     tick().then(() => inputEl?.focus());
   }
 
@@ -404,20 +410,12 @@
 
   function toggleEmojiPicker() {
     showEmojiPicker = !showEmojiPicker;
-    if (showEmojiPicker) emojiCategory = 0;
-    emoteFilter = "";
-  }
-
-  function handleEmojiKeydown(e: KeyboardEvent) {
-    if (e.key === "Escape") showEmojiPicker = false;
+    pickerFocus = showEmojiPicker && !matchMedia("(pointer: coarse)").matches;
   }
 </script>
 
-<!-- Any click elsewhere closes the picker; Escape closes it too -->
-<svelte:window
-  onclick={() => { if (showEmojiPicker) showEmojiPicker = false; }}
-  onkeydown={(e) => { if (showEmojiPicker) handleEmojiKeydown(e); }}
-/>
+<!-- Any click elsewhere closes the picker; Escape closes it too (its own, or the box's) -->
+<svelte:window onclick={() => { if (showEmojiPicker) showEmojiPicker = false; }} />
 
 {#if replying}
   <div class="reply-bar">
@@ -507,7 +505,7 @@
   {/if}
   {#if emoteOptions.length > 0}
     <div class="mention-pop" id={listId} role="listbox" aria-label="Emotes">
-      {#each emoteOptions as e, i (e.name)}
+      {#each emoteOptions as o, i (o.kind === "emote" ? `e:${o.e.name}` : o.name)}
         <div
           class="mention-option"
           class:active={i === active}
@@ -515,10 +513,10 @@
           role="option"
           aria-selected={i === active}
           tabindex="-1"
-          onpointerdown={(ev) => { ev.preventDefault(); pickEmote(e); }}
+          onpointerdown={(ev) => { ev.preventDefault(); pickEmote(o); }}
         >
-          <Emote name={e.name} hash={e.hash.slice(0, 20)} />
-          <span class="mention-name">:{e.name}:</span>
+          {#if o.kind === "emote"}<Emote name={o.e.name} hash={o.e.hash} />{:else}<span class="mention-emoji">{o.emoji}</span>{/if}
+          <span class="mention-name">:{o.kind === "emote" ? o.e.name : o.name}:</span>
         </div>
       {/each}
     </div>
@@ -541,63 +539,22 @@
     maxlength="2000"
   ></textarea>
   <div class="emoji-wrapper">
-    <button class="emoji-btn" type="button" onpointerdown={keepField} onclick={(e) => { e.stopPropagation(); toggleEmojiPicker(); }} title="Emoji">
+    <button
+      class="emoji-btn"
+      type="button"
+      onpointerdown={keepField}
+      onclick={(e) => { e.stopPropagation(); toggleEmojiPicker(); }}
+      title="Emoji, emotes and stickers"
+      aria-label="Emoji, emotes and stickers"
+      aria-haspopup="dialog"
+      aria-expanded={showEmojiPicker}
+    >
       <Icon name="smile" size={20} />
     </button>
     {#if showEmojiPicker}
-      <!-- svelte-ignore a11y_no_static_element_interactions -->
-      <div class="emoji-picker" use:onScreen onkeydown={handleEmojiKeydown} onclick={(e) => e.stopPropagation()}>
-        <div class="emoji-tabs">
-          {#if hasEmotes}
-            <button class="emoji-tab" onpointerdown={keepField} class:active={emojiCategory === -1} type="button" onclick={() => (emojiCategory = -1)} title="This server's emotes"
-              >{#if $emoteSets.emotes.find((e) => !e.sticker)}{@const e = $emoteSets.emotes.find((e) => !e.sticker)!}<Emote name={e.name} hash={e.hash.slice(0, 20)} />{/if}</button
-            >
-          {/if}
-          {#if hasStickers}
-            <button class="emoji-tab" onpointerdown={keepField} class:active={emojiCategory === -2} type="button" onclick={() => (emojiCategory = -2)} title="Stickers"
-              ><Icon name="smile" size={16} /></button
-            >
-          {/if}
-          {#each EMOJI_CATEGORIES as cat, idx}
-            <button
-              class="emoji-tab"
-              onpointerdown={keepField}
-              class:active={emojiCategory === idx}
-              type="button"
-              onclick={() => (emojiCategory = idx)}
-              title={cat.label}
-            >{cat.emojis[0]}</button>
-          {/each}
-        </div>
-        {#if emojiCategory < 0}
-          <input class="emoji-search" type="search" placeholder="Search" aria-label="Search this server's {emojiCategory === -1 ? 'emotes' : 'stickers'}" bind:value={emoteFilter} />
-        {/if}
-        <div class="emoji-grid" class:stickers={emojiCategory === -2}>
-          {#if emojiCategory === -1}
-            {#each emoteSections as s (s.key)}
-              {#if s.label}<div class="sticker-pack">{s.label}</div>{/if}
-              {#each s.list as e (e.name)}
-                <button class="emoji-item" type="button" title=":{e.name}:" aria-label=":{e.name}:" onpointerdown={keepField} onclick={() => insertEmoji(`${/\S$/.test(text) ? " " : ""}:${e.name}: `)}
-                  ><Emote name={e.name} hash={e.hash.slice(0, 20)} /></button
-                >
-              {/each}
-            {/each}
-          {:else if emojiCategory === -2}
-            {#each stickerPacks as s (s.key)}
-              {#if s.label}<div class="sticker-pack">{s.label}</div>{/if}
-              {#each s.list as e (e.name)}
-                <button class="emoji-item sticker-item" type="button" title=":{e.name}:" aria-label="Send the sticker :{e.name}:" onpointerdown={keepField}
-                  onclick={() => { showEmojiPicker = false; onsticker?.(e); }}
-                  ><Emote name={e.name} hash={e.hash.slice(0, 20)} size="jumbo" /></button
-                >
-              {/each}
-            {/each}
-          {:else}
-            {#each EMOJI_CATEGORIES[emojiCategory].emojis as emoji}
-              <button class="emoji-item" type="button" onpointerdown={keepField} onclick={() => insertEmoji(emoji)}>{emoji}</button>
-            {/each}
-          {/if}
-        </div>
+      <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
+      <div class="emoji-picker" use:onScreen onclick={(e) => e.stopPropagation()}>
+        <EmotePicker onpick={insertAtCaret} onsticker={onsticker ? (e) => onsticker(e) : undefined} {held} onclose={closePicker} autofocus={pickerFocus} />
       </div>
     {/if}
   </div>
@@ -754,6 +711,11 @@
     font-weight: 600;
   }
 
+  .mention-emoji {
+    font-size: var(--fs-lg);
+    line-height: 1;
+  }
+
   .mention-tag {
     color: var(--text-secondary);
     font-size: var(--fs-sm);
@@ -838,7 +800,8 @@
     right: 0;
     width: 320px;
     max-width: calc(100vw - 16px);
-    max-height: 340px;
+    /* One size whatever the tab, so it never jumps under the pointer */
+    height: min(380px, 60vh);
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -848,77 +811,4 @@
     z-index: var(--z-popover);
   }
 
-  .emoji-search {
-    width: 100%;
-    margin: 4px 0;
-    padding: 4px 8px;
-    font-size: var(--fs-sm);
-  }
-  .emoji-grid.stickers {
-    grid-template-columns: repeat(4, 1fr);
-  }
-  .sticker-pack {
-    grid-column: 1 / -1;
-    font-size: var(--fs-sm);
-    color: var(--text-secondary);
-    padding: 4px 2px 0;
-  }
-  .emoji-tabs {
-    display: flex;
-    gap: 2px;
-    padding: 6px 6px 4px;
-    border-bottom: 1px solid var(--border);
-  }
-
-  .emoji-tab {
-    flex: 1;
-    padding: 4px 0;
-    font-size: var(--fs-lg);
-    background: transparent;
-    border: none;
-    border-radius: 4px;
-    cursor: pointer;
-    opacity: 0.5;
-    transition: opacity var(--dur-fast);
-    line-height: 1;
-  }
-
-  .emoji-tab:hover {
-    opacity: 0.8;
-    background: var(--bg-hover);
-  }
-
-  .emoji-tab.active {
-    opacity: 1;
-    background: var(--bg-tertiary);
-  }
-
-  .emoji-grid {
-    display: grid;
-    grid-template-columns: repeat(8, 1fr);
-    gap: 2px;
-    padding: 6px;
-    overflow-y: auto;
-    flex: 1;
-  }
-
-  .emoji-item {
-    display: flex;
-    align-items: center;
-    justify-content: center;
-    width: 36px;
-    height: 36px;
-    font-size: var(--fs-2xl);
-    background: transparent;
-    border: none;
-    border-radius: 4px;
-    cursor: pointer;
-    line-height: 1;
-    padding: 0;
-  }
-
-  .emoji-item:hover {
-    background: var(--bg-hover);
-    transform: scale(1.15);
-  }
 </style>

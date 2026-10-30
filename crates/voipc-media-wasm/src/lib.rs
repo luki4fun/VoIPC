@@ -9,7 +9,7 @@
 
 use std::cell::RefCell;
 
-use voipc_media::{read_pack, sanitize_capped, Motion, Pack, Profile};
+use voipc_media::{read_pack, sanitize_capped, strip, Motion, Pack, Profile};
 
 #[derive(Default)]
 struct State {
@@ -82,6 +82,23 @@ pub extern "C" fn media_sanitize(profile: u32, max_out: u32, side: u32, keep_mb:
                 s.error = e.to_string();
                 1
             }
+        }
+    })
+}
+
+/// The input without its metadata (`voipc_media::strip`), read back at
+/// [`media_png`]. 0 when done, 1 when refused, with the reason at
+/// [`media_error`].
+#[no_mangle]
+pub extern "C" fn media_strip() -> u32 {
+    with(|s| match strip(&std::mem::take(&mut s.input)) {
+        Ok(bare) => {
+            s.png = bare;
+            0
+        }
+        Err(e) => {
+            s.error = e.to_string();
+            1
         }
     })
 }

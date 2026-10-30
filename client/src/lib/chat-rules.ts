@@ -204,7 +204,7 @@ export function sanitizeHistory(
       user_id: m.user_id,
       // A name and its "#0000" tag
       username: m.username.slice(0, 37),
-      content: m.content.slice(0, HISTORY_MAX_CONTENT),
+      content: cutText(m.content),
       timestamp: m.timestamp,
       // Whatever it claimed to be. Once hearsay, always hearsay: a message
       // relayed on from here is offered as `shared` again, so passing it round
@@ -848,7 +848,15 @@ export function forHandOff(m: ChatMessage): ChatMessage {
   const long = m.content.length > HISTORY_MAX_CONTENT;
   if (!m.reactions && !m.pin && m.extra_kept === undefined && !long) return m;
   const { reactions: _r, pin: _p, extra_kept: _k, ...rest } = m;
-  return long ? { ...rest, content: rest.content.slice(0, HISTORY_MAX_CONTENT) } : rest;
+  return long ? { ...rest, content: cutText(rest.content) } : rest;
+}
+
+/** A text cut to `HISTORY_MAX_CONTENT`, never inside an emote's token (which
+ *  would show as its raw start). */
+export function cutText(text: string): string {
+  const cut = text.slice(0, HISTORY_MAX_CONTENT);
+  const open = cut.lastIndexOf("<:");
+  return open >= 0 && cut.length < text.length && !cut.slice(open).includes(">") ? cut.slice(0, open) : cut;
 }
 
 /** `edited_at` as it may be kept: a plausible moment, not before the message. */

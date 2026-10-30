@@ -17,13 +17,14 @@
   import { tick, untrack } from "svelte";
   import { channels } from "../stores/channels.js";
   import { uiPrefs } from "../stores/ui-prefs.js";
-  import { serverAddress, serverKey, userId, username } from "../stores/connection.js";
+  import { isAdmin, serverAddress, serverKey, userId, username } from "../stores/connection.js";
   import { addNotification } from "../stores/notifications.js";
   import { confirmAction } from "../stores/confirm.js";
   import { get } from "svelte/store";
   import { account, accountHex } from "../stores/account.js";
   import { users } from "../stores/users.js";
-  import { emoteSets, noteEmotes } from "../stores/emotes.js";
+  import { emoteLimits, emoteSets, noteEmotes, pendingImport } from "../stores/emotes.js";
+  import { showAdminPanel } from "../stores/admin-ui.js";
   import { EMOTE_TOKEN, isEmoteReaction, stickerText, tokenize } from "../emote-rules.js";
   import { expiryFor, messageRefs, pinnedOf, rowKey, sameRow, splitChatKey, type ChatPlace } from "../chat-rules.js";
   import { threadView } from "../thread-rules.js";
@@ -684,7 +685,22 @@
     const forward = (m: ChatMessage) => {
       if (m.kind !== "shared") forwarding = { m, from: fileConv, server: $serverAddress };
     };
-    if (!canAnswer || held) return { forward };
+    // Its picture as the importer's first row: the file itself, which the
+    // importer sanitizes and shows before anything goes up
+    const makeEmote =
+      $isAdmin && $emoteLimits
+        ? async (m: ChatMessage) => {
+            const server = $serverAddress;
+            try {
+              const bytes = await fetchFile(server, fileConv ?? { channel: 0 }, m.file!);
+              pendingImport.set({ server, name: m.file!.name, bytes });
+              showAdminPanel.set(true);
+            } catch (e) {
+              addNotification(`The picture could not be loaded: ${String(e).replace(/^Error: /, "")}`, "error");
+            }
+          }
+        : undefined;
+    if (!canAnswer || held) return { forward, makeEmote };
     // The conversation these messages are in, read now: a delete is sent
     // after its question is answered, by when another one may be on screen
     const t = targetNow();
@@ -698,6 +714,7 @@
       remove: (m) => sendEvent(t, { kind: "delete", target: m.id! }, m),
       // A pin counts only from a manager, which every reader checks
       pin: !isDmMode && isManager ? (m, on) => sendEvent(t, { kind: "pin", target: m.id!, on }, m) : undefined,
+      makeEmote,
     };
   });
 

@@ -8,7 +8,7 @@
 // @ts-ignore — the package only exists after the wasm build
 import { initSync, openFile, sealFile } from "../../lib/wasm/voipc_web.js";
 import { checkOpenInput, checkSealInput } from "./wasm";
-import { readPackIn, sanitizeIn } from "./media";
+import { readPackIn, sanitizeIn, stripIn } from "./media";
 
 self.onmessage = (e: MessageEvent) => {
   const job = e.data;
@@ -16,6 +16,11 @@ self.onmessage = (e: MessageEvent) => {
     if (job.op === "sanitize") {
       const out = sanitizeIn(job.media, job.bytes, job.profile, job.maxOut);
       self.postMessage({ ok: out }, { transfer: out.still ? [out.png.buffer, out.still.buffer] : [out.png.buffer] });
+      return;
+    }
+    if (job.op === "strip") {
+      const out = stripIn(job.media, job.bytes);
+      self.postMessage({ ok: out }, { transfer: [out.buffer] });
       return;
     }
     if (job.op === "pack") {
@@ -30,7 +35,7 @@ self.onmessage = (e: MessageEvent) => {
       checkOpenInput(job.size, job.blob);
       const plain = openFile(job.hash, job.key, job.size, job.z, job.blob);
       const out = sanitizeIn(job.media, plain, job.profile, 0, job.motion);
-      self.postMessage({ ok: out.png }, { transfer: [out.png.buffer] });
+      self.postMessage({ ok: out }, { transfer: out.still ? [out.png.buffer, out.still.buffer] : [out.png.buffer] });
     } else if (job.op === "seal") {
       checkSealInput(job.plain);
       const sealed = sealFile(job.plain, job.compress);

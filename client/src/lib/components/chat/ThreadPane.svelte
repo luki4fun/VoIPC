@@ -3,6 +3,8 @@
   import type { ChatMessage, FileConv } from "../../types.js";
   import { pushLayer } from "../../stores/back-stack.js";
   import { rowKey } from "../../chat-rules.js";
+  import { stickerText } from "../../emote-rules.js";
+  import { emoteSets } from "../../stores/emotes.js";
   import { shortName } from "../../username.js";
   import Icon from "../Icons.svelte";
   import Composer from "./Composer.svelte";
@@ -142,6 +144,7 @@
       {held}
       {mentionables}
       onsend={send}
+      onsticker={$emoteSets.stickers ? (e) => send(stickerText(e)) : undefined}
       onsendfile={onsendfile ? sendFile : undefined}
       replying={replyingTo?.username ?? null}
       oncancelreply={() => (replyingTo = null)}

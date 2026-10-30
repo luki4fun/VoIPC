@@ -333,6 +333,31 @@ fn a_gif_frame_drawn_past_its_screen_is_cut_to_it() {
     );
 }
 
+/// A 1×1 GIF screen with `n` frames of `fw` × `fh`, each a few bytes of LZW:
+/// what a frame says it is, not what it holds, is what costs.
+fn gif_frames_past_screen(fw: u16, fh: u16, n: usize) -> Vec<u8> {
+    let mut g = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff".to_vec();
+    for _ in 0..n {
+        g.extend_from_slice(&[0x2C, 0, 0, 0, 0]);
+        g.extend_from_slice(&fw.to_le_bytes());
+        g.extend_from_slice(&fh.to_le_bytes());
+        g.extend_from_slice(&[0, 2, 2, 0x4C, 0x01, 0]);
+    }
+    g.push(0x3B);
+    g
+}
+
+#[test]
+fn a_gif_frame_is_charged_its_own_size_before_it_is_decoded() {
+    for (fw, fh) in [(65_535, 65_535), (4097, 4096)] {
+        assert_eq!(
+            sanitize(&gif_frames_past_screen(fw, fh, 1), Profile::Photo).unwrap_err(),
+            Error::TooLarge("the animation is too big to show"),
+            "{fw}×{fh} on a 1×1 screen"
+        );
+    }
+}
+
 #[test]
 fn webp_still_and_animated() {
     let mut still = Vec::new();
@@ -872,4 +897,199 @@ fn a_file_of_a_pack_that_lies_or_is_too_big_is_set_aside_and_the_rest_read() {
     let pack = read_pack(&locked).unwrap();
     assert!(pack.entries.is_empty());
     assert_eq!(pack.skipped, [("a.png".into(), "it is encrypted")]);
+}
+
+fn holds(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// `riff` (a WebP) with a chunk `kind` of `data` added, its size fixed.
+fn with_chunk(riff: &[u8], kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut out = [riff, kind, &(data.len() as u32).to_le_bytes(), data].concat();
+    if data.len() % 2 == 1 {
+        out.push(0);
+    }
+    let size = (out.len() - 8) as u32;
+    out[4..8].copy_from_slice(&size.to_le_bytes());
+    out
+}
+
+#[test]
+fn an_original_upload_loses_its_metadata_and_nothing_it_shows() {
+    let secret = b"secret location";
+    let png = png_of(
+        2,
+        1,
+        png::ColorType::Rgba,
+        png::BitDepth::Eight,
+        &[255, 0, 0, 255, 0, 0, 255, 128],
+        None,
+    );
+    let gif = {
+        let g = gif_of(
+            2,
+            1,
+            &[
+                (0, 0, 2, 1, vec![0, 1], gif::DisposalMethod::Keep, 10),
+                (0, 0, 2, 1, vec![1, 0], gif::DisposalMethod::Keep, 10),
+            ],
+        );
+        // A comment extension, just before the end
+        let comment = [&[0x21, 0xFE, secret.len() as u8][..], secret, &[0]].concat();
+        [&g[..g.len() - 1], &comment, &[0x3B]].concat()
+    };
+    let webp = {
+        let w = with_chunk(
+            include_bytes!("../tests/fixtures/anim3.webp"),
+            b"EXIF",
+            secret,
+        );
+        let mut w = with_chunk(&w, b"XMP ", secret);
+        // Its VP8X says so, as a real one would
+        w[20] |= 0x08 | 0x04;
+        w
+    };
+    let jpeg = {
+        let plain = include_bytes!("../tests/fixtures/red-blue.jpg");
+        let comment = [
+            &[0xFF, 0xFE][..],
+            &((secret.len() + 2) as u16).to_be_bytes(),
+            secret,
+        ]
+        .concat();
+        let j = with_orientation(plain, 1);
+        [&j[..2], &comment, &j[2..]].concat()
+    };
+    for (what, file, profile) in [
+        ("png", png, Profile::Emote),
+        ("gif", gif, Profile::Emote),
+        ("webp", webp, Profile::Sticker),
+        ("jpeg", jpeg, Profile::Photo),
+    ] {
+        assert!(holds(&file, secret), "{what}: the test file holds it");
+        let bare = strip(&file).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(!holds(&bare, secret), "{what}: gone");
+        assert!(bare.len() < file.len(), "{what}");
+        assert_eq!(
+            sanitize(&bare, profile).unwrap().png,
+            sanitize(&file, profile).unwrap().png,
+            "{what}: what it shows is the same"
+        );
+    }
+    assert!(!holds(
+        &strip(&with_orientation(
+            include_bytes!("../tests/fixtures/red-blue.jpg"),
+            1
+        ))
+        .unwrap(),
+        b"Exif"
+    ));
+}
+
+#[test]
+fn a_turned_jpeg_or_a_broken_file_is_not_stripped() {
+    let plain = include_bytes!("../tests/fixtures/red-blue.jpg");
+    assert!(
+        strip(&with_orientation(plain, 6)).is_err(),
+        "its turn would be lost"
+    );
+    let png = png_of(
+        1,
+        1,
+        png::ColorType::Rgba,
+        png::BitDepth::Eight,
+        &[1, 2, 3, 4],
+        None,
+    );
+    for cut in [9, 20, png.len() - 1] {
+        assert!(strip(&png[..cut]).is_err(), "cut at {cut}");
+    }
+    let gif = gif_of(
+        1,
+        1,
+        &[(0, 0, 1, 1, vec![0], gif::DisposalMethod::Keep, 10)],
+    );
+    for cut in 11..gif.len() {
+        let _ = strip(&gif[..cut]);
+    }
+}
+
+#[test]
+fn a_header_tells_a_pictures_size_and_nothing_is_decoded() {
+    let png = png_of(
+        3,
+        2,
+        png::ColorType::Rgba,
+        png::BitDepth::Eight,
+        &[0; 24],
+        None,
+    );
+    assert_eq!(probe(&png), Some((3, 2)));
+    assert_eq!(
+        probe(&gif_frames_past_screen(4096, 4096, 1)),
+        Some((1, 1)),
+        "a GIF's screen"
+    );
+    assert!(probe(include_bytes!("../tests/fixtures/anim3.webp")).is_some());
+    assert!(probe(include_bytes!("../tests/fixtures/red-blue.jpg")).is_some());
+    assert_eq!(probe(b"not a picture"), None);
+    assert_eq!(probe(&png[..20]), None, "cut short");
+}
+
+/// Every hard picture there is, done in time: what a budget missed would show
+/// here as a picture that takes long (the GIF whose frames are bigger than its
+/// screen took seconds per viewer in 1.4). Timed in a release build only,
+/// in test.yml; a debug build is too slow to say anything. shortcut: a
+/// generous bound, since CI machines vary; tighten it if a regression hides
+/// under it.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "timed in a release build (test.yml)")]
+fn every_hard_picture_is_done_in_time() {
+    use std::time::{Duration, Instant};
+    // 300 frames of 16 Mpx each on a 1×1 screen: one frame's block, again and again
+    let many_big_frames = {
+        let one = {
+            let mut out = Vec::new();
+            let mut e = gif::Encoder::new(&mut out, 1, 1, &[0, 0, 0, 255, 255, 255]).unwrap();
+            e.write_frame(&gif::Frame {
+                width: 4096,
+                height: 4096,
+                buffer: Cow::Owned(vec![0; 4096 * 4096]),
+                ..gif::Frame::default()
+            })
+            .unwrap();
+            drop(e);
+            out
+        };
+        let head = 13 + 6;
+        let block = &one[head..one.len() - 1];
+        [&one[..head], &block.repeat(300), &[0x3B]].concat()
+    };
+    let big_still = png_of(
+        7000,
+        7000,
+        png::ColorType::Grayscale,
+        png::BitDepth::Eight,
+        &vec![0; 7000 * 7000],
+        None,
+    );
+    let mut hard = vec![
+        ("gif frames past the screen", many_big_frames),
+        ("a 49 Mpx PNG", big_still),
+    ];
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/regressions/media");
+    for file in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        hard.push(("a fuzz regression", std::fs::read(file.path()).unwrap()));
+    }
+    for (what, bytes) in &hard {
+        for p in [Profile::Emote, Profile::Sticker, Profile::Photo] {
+            let start = Instant::now();
+            let _ = sanitize(bytes, p);
+            let took = start.elapsed();
+            assert!(
+                took < Duration::from_secs(5),
+                "{what} as {p:?} took {took:?}"
+            );
+        }
+    }
 }

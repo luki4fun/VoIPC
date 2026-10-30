@@ -13,8 +13,9 @@
   import { formatSize, PREVIEW_SIDE } from "../../file-rules.js";
   import { preview } from "../../actions/preview.js";
   import { sniff, type Shown } from "../../file-sniff.js";
-  import { fileImage, pictureUrl, playableUrl, playsMedia } from "../../media.js";
+  import { fileImage, knownPictures, pictureUrl, playableUrl, playsMedia } from "../../media.js";
   import { uiPrefs } from "../../stores/ui-prefs.js";
+  import { reducedMotion } from "../../stores/emotes.js";
   import Icon from "../Icons.svelte";
 
   interface Props {
@@ -68,6 +69,9 @@
     }
   });
 
+  /** A moving picture is shown still where the person wants nothing to move. */
+  const still = $derived($reducedMotion || $uiPrefs.animate_emotes === "never");
+
   const progress = $derived(op ? $fileProgress.get(op) : undefined);
   const seeking = $derived(progress?.stage === "seeking");
   const percent = $derived(progress && progress.total > 0 ? Math.round((progress.done / progress.total) * 100) : 0);
@@ -117,16 +121,25 @@
       // No conversation to name: only this device's copy can open it (channel
       // 0 is never one, so the relay refuses anything further)
       const at = conv ?? { channel: 0 };
+      const known = draw && !url ? knownPictures.get(file.hash) : undefined;
+      if (known) {
+        const png = await fileImage(server, at, file, mine, still);
+        if (destroyed || wanted !== loadedFor) return null;
+        url = pictureUrl(png);
+        shown = known;
+        return null;
+      }
       const got = await fetchFile(server, at, file, mine);
       if (destroyed || wanted !== loadedFor) return null;
       if (draw) {
         const is = sniff(got);
         if (is?.kind === "image") {
           try {
-            const png = await fileImage(server, at, file, mine);
+            const png = await fileImage(server, at, file, mine, still);
             if (destroyed || wanted !== loadedFor) return null;
             url = pictureUrl(png);
             shown = is;
+            knownPictures.set(file.hash, is);
           } catch (e) {
             if (destroyed || wanted !== loadedFor) return null;
             withheld = `${String(e).replace(/^Error: /, "")}.`;
@@ -154,7 +167,8 @@
 
   /** Download: a card with no Load is not drawn by it (R3-12). */
   async function save() {
-    const got = await fetchIt(media);
+    // A known picture is drawn without its file: fetched now, to be saved
+    const got = (await fetchIt(media)) ?? (url && !bytes ? await fetchIt(false) : null);
     if (got) await saveFile(got, file.name, (shown ?? sniff(got))?.mime).catch((e) => (error = String(e)));
   }
 
@@ -215,7 +229,7 @@
     {#if op && !media}
       <span class="file-state" role="status">{seeking ? "Asking members…" : `${percent}%`}</span>
       <button class="btn-ghost" type="button" {tabindex} onclick={cancel} aria-label="Stop loading {file.name}"><Icon name="close" size={14} /></button>
-    {:else if !media || bytes}
+    {:else if !media || bytes || url}
       <button class="btn-ghost" type="button" {tabindex} onclick={save} aria-label="Download {file.name}"><Icon name="download" size={14} /> Download</button>
     {/if}
   </div>

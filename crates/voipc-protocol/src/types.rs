@@ -126,14 +126,25 @@ pub struct Emote {
     /// What the picker groups it under; empty for none. A label an admin
     /// chose, at most `EMOTE_PACK_MAX` characters.
     pub pack: String,
+    /// The file's size in bytes (protocol v15): what the relay keeps of it.
+    pub len: u32,
+    /// Its shape as the adding admin's app made it, fitted into the emote or
+    /// sticker box; 0 where unknown. Only for the room a reader keeps for it
+    /// before it is drawn: a reader holds it to the box too.
+    pub w: u16,
+    pub h: u16,
 }
+
+/// The box an emote is fitted into, and a sticker (voipc-media's profiles).
+pub const EMOTE_BOX: u16 = 128;
+pub const STICKER_BOX: u16 = 320;
 
 /// The longest emote name: `:name:` fits a reaction (`MAX_EMOJI_BYTES`, 32).
 pub const EMOTE_NAME_MAX: usize = 30;
 /// The longest pack label: this many characters, and twice as many bytes.
 pub const EMOTE_PACK_MAX: usize = 32;
 /// The most emotes and stickers a server has: the list goes in one message,
-/// at most about 130 bytes each, under `MAX_MSG_SIZE` (golden.rs checks it).
+/// at most about 140 bytes each, under `MAX_MSG_SIZE` (golden.rs checks it).
 pub const MAX_EMOTES: usize = 400;
 
 /// What an emote may be called, on the relay and in every client.
@@ -176,6 +187,10 @@ pub struct EmoteAccess {
     /// The largest emote and sticker file an admin may add, in bytes.
     pub max_emote_bytes: u32,
     pub max_sticker_bytes: u32,
+    /// All of them together, in bytes, and how many there may be (v15):
+    /// what an admin's app shows as used of what.
+    pub max_total_bytes: u64,
+    pub max_items: u32,
 }
 
 /// The conversation a file was posted in (protocol v13), named as the client

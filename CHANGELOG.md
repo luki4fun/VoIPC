@@ -2,6 +2,87 @@
 
 All notable changes to VoIPC are documented here.
 
+## [1.5.0] - unreleased
+
+**Protocol 15: update relays and apps together.** A 1.5 app does not connect to a 1.4
+relay, and a 1.4 app does not connect to a 1.5 relay. Relays first: update the server,
+then the apps.
+
+### Emotes and stickers
+
+- **One picker for writing and for reactions:** one search finds emoji (by their
+  names, as `:joy:`), the server's emotes and its stickers; favourites and the
+  recently used come first, then each pack. The arrow keys walk it, Enter in the
+  search takes the first match, Escape closes only the picker, Shift+click keeps it
+  open, and what is picked goes where the cursor is. Reactions get the same search
+  and packs.
+- **`:joy:` and its kind:** typing `:` offers emoji by name after the server's emotes,
+  and a `:name:` of an emoji turns into it when sent.
+- **Favourites:** right-click or hold an emote in the picker, or press one in a
+  message, to keep it first. Pressing an emote in a message tells its name and pack
+  (a phone has no tooltips).
+- **A message of emoji alone is shown big,** as one of emotes already was.
+- **Admins:** a chat picture's menu has *Make an emote or sticker…*; the Emotes tab
+  copies another connected server's emotes, renames a pack, moves emotes into a
+  pack, and exports a pack as a `.zip` that it reads back; a 7TV profile's address
+  imports the set it uses; what was just added shows at once, without being
+  downloaded again.
+- **On mobile data the app asks first,** with the size, before it downloads a
+  server's emotes and stickers; otherwise they come on Wi-Fi. Settings → Files shows
+  what they take on this device, with *Clear*.
+- **The Emotes tab shows how much of the server's room they take** (size and count),
+  and an import marks what will not fit before it is sent.
+- **Removing a pack, or making emotes stickers, is one step** for the server: one
+  message, one write, one new list for everyone, not one per emote. Making an emote
+  a sticker (or back) no longer downloads it again.
+- **Emotes and stickers keep their room while they load,** so the chat does not jump.
+- An add whose answer came late can be tried again at once, instead of being "taken"
+  for ten minutes.
+- **For relays:** a member downloading emotes in a loop is stopped (`429`) before it
+  fills the uplink voice needs; `docs/OPERATING.md` §12.
+- **An emote or sticker added as its own file goes without its metadata** (EXIF with a
+  phone's place, XMP, comments, colour profiles): every member can read the server's
+  emotes. Its pictures and frames stay as they were.
+- **Pictures are made safe a few at a time, by their size:** two huge photos no
+  longer run at once on a phone. A test in CI times the hardest pictures there are.
+- Taking a server off the list forgets which of its emotes were used and liked.
+
+### Fixed
+
+- **A crafted GIF could keep every viewer's computer busy** and hold up all
+  pictures and emotes for a while. Each frame now counts with its full size,
+  before it is read.
+- **Emotes in messages bind 128 bits of their picture's hash** (80 in 1.4), so
+  nobody can swap the picture under old messages. 1.4's emotes still show.
+- **Emotes and stickers take far less memory:** each is made ready on this
+  device at connect as before, but only those on screen are loaded. A server
+  that is not connected keeps its emotes on this device for 30 days, and the
+  browser lets go of them after that too.
+- **Downloads of emotes give way to voice** during a call, as file transfers do.
+- **Chat pictures open at once when seen again,** without being decrypted and
+  made again, and moving ones stand still under reduced motion or "Never move".
+- A sticker's code inside text no longer shows the sticker there (the server's
+  sticker switch and "Show stickers" hold). A message shows at most 100 emotes.
+- An emote that cannot be shown says so (a dotted name with the reason, and a
+  "Not shown" mark in the admin list), and is tried once more first.
+- A server's list of emotes is checked before use: a bad or repeated name can
+  no longer break the pickers.
+- The browser app reads emotes and pictures under limits of size and time.
+- `:name:` stays as written inside `~~~` code, ``` `` ``` code and addresses.
+- Long shared history is never cut inside an emote.
+- **Emote import:** closing the panel asks first while an import is open;
+  an unreadable or huge file is set aside instead of stopping the import;
+  "Add" waits until every file is read, with a summary line; a pack's name
+  from a zip or 7TV is cleaned to fit; on Android, no folder button.
+- **Stickers:** no sticker while slow mode holds the channel; no Edit on a
+  sticker; stickers in threads too; the admin's sticker switch says when it
+  could not change.
+- **Settings → Files:** an open card stays open when its message gets a
+  reaction; removing several copies asks first.
+- Settings: the motion choice says when the system asks for less motion, and
+  has no "under the pointer" on touch screens. Larger touch targets in the
+  emote admin.
+
 ## [1.4.0] - 2026-10-30
 
 **Protocol 14: update relays and apps together.** A 1.4.0 app does not connect

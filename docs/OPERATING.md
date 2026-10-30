@@ -340,7 +340,12 @@ dir = "emotes"             # kept across restarts; never [files] dir, nor inside
   emote when the list comes, and `:name:` travels inside the end-to-end encrypted messages.
 - **Who may change them:** admins only (the token, or an account with the admin role).
 - **Memory and bandwidth:** all of `max_total_mb` is held in memory, and every member downloads
-  each emote once (the apps keep their copy).
+  each emote once (the apps keep their copy). Since 1.5 a connection may download twice
+  `max_total_mb` (plus one sticker) at once, and `max_total_mb` an hour after that; past it, the
+  relay answers 429, so one member fetching in a loop cannot fill the uplink voice needs.
+- **Changes are written once a second at most:** an import of hundreds, or removing a pack, is
+  one write of `manifest.json` and one new list for members. A new file is on disk before its
+  upload is answered.
 - **At start**, an entry whose file is missing or is not the file its hash names is dropped, and a
   file no entry names is deleted. Nothing else in `dir` is touched.
 

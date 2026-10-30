@@ -11,17 +11,20 @@
     /** For the channel's managers. */
     pin?: (m: Message, on: boolean) => void;
     forward?: (m: Message) => void;
+    /** Its picture into the server's emotes (admins). */
+    makeEmote?: (m: Message) => void;
   }
 </script>
 
 <script lang="ts">
   import { tick } from "svelte";
-  import { byRecent, isEmoteReaction, stickerOf, untokenize } from "../../emote-rules.js";
-  import { emoteSets, recentEmotes } from "../../stores/emotes.js";
+  import { isEmoteReaction, stickerOf, untokenize } from "../../emote-rules.js";
+  import { emoteSets } from "../../stores/emotes.js";
   import { uiPrefs as emotePrefs } from "../../stores/ui-prefs.js";
   import Emote from "./Emote.svelte";
+  import EmotePicker from "./EmotePicker.svelte";
   import type { ChatMessage, FileConv } from "../../types.js";
-  import { serverAddress, userId } from "../../stores/connection.js";
+  import { userId } from "../../stores/connection.js";
   import { account, accountHex } from "../../stores/account.js";
   import { addNotification } from "../../stores/notifications.js";
   import { menu } from "../../actions/menu.js";
@@ -33,7 +36,7 @@
   import { reactionChips, rowKey, sameRow } from "../../chat-rules.js";
   import { receivedNow } from "../../stores/chat.js";
   import { confirmAction } from "../../stores/confirm.js";
-  import { EMOJI_CATEGORIES, QUICK_REACTIONS } from "../../emoji.js";
+  import { QUICK_REACTIONS } from "../../emoji.js";
   import { shortName } from "../../username.js";
   import Icon from "../Icons.svelte";
   import Markdown from "./Markdown.svelte";
@@ -329,17 +332,18 @@
     return answerable(m) && m.kind !== "shared" && isMine(m);
   }
 
+  /** Ours and text: a sticker saved from the edit box would become its name. */
+  function textEditable(m: ChatMessage): boolean {
+    return ownEditable(m) && !stickerOf(m.content, $emoteSets.emotes);
+  }
+
   /** The reaction picker, for `m`, where it was opened. */
   let picking = $state.raw<{ m: ChatMessage; x: number; y: number; up: number } | null>(null);
-  let pickCategory = $state(0);
-  /** The server's emotes a reaction may be: not its stickers. */
-  const serverEmotes = $derived(byRecent($emoteSets.emotes.filter((e) => !e.sticker), $recentEmotes[$serverAddress] ?? []));
 
   /** Open the picker under `from` (a tool), or at the menu's place. */
   function openPicker(m: ChatMessage, from: { x: number; y: number; up: number } | Element) {
     const r = from instanceof Element ? from.getBoundingClientRect() : null;
     const at = r ? { x: r.right - 300, y: r.bottom + 4, up: r.top - 4 } : (from as { x: number; y: number; up: number });
-    pickCategory = 0;
     // Kept on screen across; the picker is 300 wide (`fit` keeps it in down)
     picking = { m, x: Math.max(8, Math.min(at.x, innerWidth - 308)), y: at.y, up: at.up };
   }
@@ -629,7 +633,7 @@
             <Icon name="thread" size={16} />
           </button>
         {/if}
-        {#if actions.edit && ownEditable(msg)}
+        {#if actions.edit && textEditable(msg)}
           <button class="icon-btn tool" type="button" tabindex={msg === current ? 0 : -1} title="Edit" aria-label="Edit" onclick={() => startEdit(msg)}>
             <Icon name="pencil" size={16} />
           </button>
@@ -670,8 +674,11 @@
     {#if actions.forward && answerable(m) && m.kind !== "shared"}
       <button type="button" onclick={() => act(actions.forward!)}><Icon name="forward" size={16} /> Forward</button>
     {/if}
-    {#if actions.edit && ownEditable(m)}
+    {#if actions.edit && textEditable(m)}
       <button type="button" onclick={() => act(startEdit)}><Icon name="pencil" size={16} /> Edit</button>
+    {/if}
+    {#if actions.makeEmote && m.file && /^image\//.test(m.file.mime ?? "")}
+      <button type="button" onclick={() => act(actions.makeEmote!)}><Icon name="sticker" size={16} /> Make an emote or sticker…</button>
     {/if}
     {#if actions.pin && answerable(m)}
       <button type="button" onclick={() => act((x) => actions.pin!(x, !x.pin?.on))}
@@ -701,31 +708,7 @@
         <button class="react-item" type="button" aria-label="React with {emoji}" onclick={() => pick(emoji)}>{emoji}</button>
       {/each}
     </div>
-    <div class="react-tabs">
-      {#if serverEmotes.length}
-        <button class="react-tab" class:active={pickCategory === -1} type="button" title="This server's" aria-label="This server's emotes" onclick={() => (pickCategory = -1)}
-          ><Emote name={serverEmotes[0].name} hash={serverEmotes[0].hash.slice(0, 20)} /></button
-        >
-      {/if}
-      {#each EMOJI_CATEGORIES as cat, idx (cat.label)}
-        <button class="react-tab" class:active={pickCategory === idx} type="button" title={cat.label} aria-label={cat.label} onclick={() => (pickCategory = idx)}
-          >{cat.emojis[0]}</button
-        >
-      {/each}
-    </div>
-    <div class="react-grid">
-      {#if pickCategory === -1}
-        {#each serverEmotes as e (e.name)}
-          <button class="react-item" type="button" aria-label="React with :{e.name}:" title=":{e.name}:" onclick={() => pick(`:${e.name}:`)}
-            ><Emote name={e.name} hash={e.hash.slice(0, 20)} /></button
-          >
-        {/each}
-      {:else}
-        {#each EMOJI_CATEGORIES[pickCategory].emojis as emoji (emoji)}
-          <button class="react-item" type="button" aria-label="React with {emoji}" onclick={() => pick(emoji)}>{emoji}</button>
-        {/each}
-      {/if}
-    </div>
+    <EmotePicker onpick={(text) => pick(text)} />
   </div>
 {/if}
 
@@ -1169,6 +1152,7 @@
     flex-direction: column;
     width: 300px;
     max-width: calc(100vw - 16px);
+    height: min(380px, 60vh);
     padding: 6px;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
@@ -1176,8 +1160,7 @@
     box-shadow: var(--shadow-menu);
   }
 
-  .react-quick,
-  .react-tabs {
+  .react-quick {
     display: flex;
     gap: 2px;
     padding-bottom: 4px;
@@ -1185,16 +1168,8 @@
     border-bottom: 1px solid var(--border);
   }
 
-  .react-grid {
-    display: grid;
-    grid-template-columns: repeat(8, 1fr);
-    gap: 2px;
-    max-height: 180px;
-    overflow-y: auto;
-  }
-
-  .react-item,
-  .react-tab {
+  .react-item {
+    flex: 1;
     min-width: 32px;
     min-height: 32px;
     padding: 0;
@@ -1206,19 +1181,8 @@
     cursor: pointer;
   }
 
-  .react-tab {
-    opacity: 0.6;
-  }
-
-  .react-tab.active {
-    opacity: 1;
-    background: var(--bg-tertiary);
-  }
-
   .react-item:hover,
-  .react-item:focus-visible,
-  .react-tab:hover,
-  .react-tab:focus-visible {
+  .react-item:focus-visible {
     background: var(--bg-hover);
   }
 </style>

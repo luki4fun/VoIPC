@@ -142,7 +142,7 @@
     requestRoster,
     setRoster,
   } from "./lib/stores/rosters.js";
-  import { emoteLimits, setEmotes, type EmoteSet } from "./lib/stores/emotes.js";
+  import { emoteLimits, setEmotes, type EmoteLimits, type EmoteSet } from "./lib/stores/emotes.js";
   import { confirmAction } from "./lib/stores/confirm.js";
   import {
     askNsfwConsent,
@@ -736,7 +736,7 @@
       listenServer<{ conv: FileConv; hash: string }>("file-wanted", (server, d) => answerFileWanted(server, d.conv, d.hash)),
       listenServer<{ max_bytes: number } | null>("file-limits", (server, d) => fileLimits.of(server).set(d)),
       listenServer<EmoteSet>("emote-list", (server, d) => setEmotes(server, d)),
-      listenServer<{ max_emote_bytes: number; max_sticker_bytes: number } | null>("emote-limits", (server, d) => emoteLimits.of(server).set(d)),
+      listenServer<EmoteLimits | null>("emote-limits", (server, d) => emoteLimits.of(server).set(d)),
       listenServer<{ name: string; reason: string }>("emote-error", (server, d) =>
         addNotification(`${fromServer(server)}${d.name ? `:${d.name}: — ` : ""}${d.reason}`, "error"),
       ),

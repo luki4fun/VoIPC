@@ -44,8 +44,9 @@ a click, where the person allows it: on by default except in the Linux desktop a
 web view runs outside any sandbox. Emotes are the server's own, kept readable on the
 relay like its channel names; the relay never decodes them, and an admin or a hostile
 relay can show members a picture, never make one run. A message binds the hash of the
-emote its sender saw, so an emote changed later shows as its name, not as another
-picture (`emote-rules.test.ts`). Every member's app fetches every emote, so fetches say
+emote its sender saw (128 bits of it since 1.5; 1.4's 80 left room for a planned
+collision), so an emote changed later shows as its name, not as another picture
+(`emote-rules.test.ts`). Every member's app fetches every emote, so fetches say
 nothing about who used which.
 
 The desktop keeps a one-time copy of a 1.0 history beside the new one

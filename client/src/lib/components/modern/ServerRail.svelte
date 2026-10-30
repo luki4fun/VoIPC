@@ -14,6 +14,7 @@
   import { addNotification } from "../../stores/notifications.js";
   import { savedServers, type SavedServer } from "../../stores/settings.js";
   import type { ServerEntry } from "../../stores/servers.js";
+  import { forgetEmotes } from "../../stores/emotes.js";
   import { connectTo, disconnectServer, serverEntries, serverId } from "../../connect.js";
   import { playDisconnectedSound } from "../../sounds.js";
   import Icon from "../Icons.svelte";
@@ -103,6 +104,7 @@
       savedServers.set(
         await invoke<SavedServer[]>("remove_server", { host: bookmark.host, port: bookmark.port }),
       );
+      forgetEmotes(entry.id);
     } catch (e) {
       addNotification(`Could not remove the bookmark: ${e}`, "error");
     }

@@ -16,11 +16,23 @@
     unban,
   } from "../stores/admin-ui.js";
   import { relayAccounts } from "../stores/account.js";
-  import { emoteLimits } from "../stores/emotes.js";
+  import { emoteLimits, pendingImport } from "../stores/emotes.js";
   import EmoteManager from "./EmoteManager.svelte";
   import type { BanInfo } from "../types.js";
 
   let tab = $state<"bans" | "emotes">("bans");
+  // A chat picture's "Make an emote or sticker…": straight to the importer
+  $effect(() => {
+    if ($pendingImport) tab = "emotes";
+  });
+  /** A server without emotes has the bans only, whatever was picked before. */
+  const shown = $derived($emoteLimits ? tab : "bans");
+  let emoteManager = $state<{ mayClose: () => Promise<boolean> } | null>(null);
+  /** Leave the emotes tab, after it asked about an import not added yet. */
+  async function leaveEmotes(then: () => void) {
+    if (shown !== "emotes" || !emoteManager || (await emoteManager.mayClose())) then();
+  }
+  const closePanel = () => leaveEmotes(() => showAdminPanel.set(false));
   let accountBans = $derived($bans.filter((b) => b.account));
   let addressBans = $derived($bans.filter((b) => !b.account));
   // Banning an account that is not here (admins only, as the list is)
@@ -68,21 +80,21 @@
 {/if}
 
 {#if $showAdminPanel}
-  <div class="admin-overlay" role="presentation" onclick={backdrop(() => showAdminPanel.set(false))}>
+  <div class="admin-overlay" role="presentation" onclick={backdrop(closePanel)}>
     <div
       class="admin-dialog"
-      class:wide={tab === "emotes"}
-      aria-label={tab === "emotes" ? "Emotes and stickers" : "Active bans"}
-      use:dialog={{ onclose: () => showAdminPanel.set(false) }}
+      class:wide={shown === "emotes"}
+      aria-label={shown === "emotes" ? "Emotes and stickers" : "Active bans"}
+      use:dialog={{ onclose: closePanel }}
     >
       {#if $emoteLimits}
         <div class="admin-tabs" role="tablist" aria-label="Admin">
-          <button type="button" role="tab" aria-selected={tab === "bans"} class:active={tab === "bans"} onclick={() => (tab = "bans")}>Bans</button>
-          <button type="button" role="tab" aria-selected={tab === "emotes"} class:active={tab === "emotes"} onclick={() => (tab = "emotes")}>Emotes</button>
+          <button type="button" role="tab" aria-selected={shown === "bans"} class:active={shown === "bans"} onclick={() => leaveEmotes(() => (tab = "bans"))}>Bans</button>
+          <button type="button" role="tab" aria-selected={shown === "emotes"} class:active={shown === "emotes"} onclick={() => (tab = "emotes")}>Emotes</button>
         </div>
       {/if}
-      {#if tab === "emotes" && $emoteLimits}
-        <EmoteManager />
+      {#if shown === "emotes"}
+        <EmoteManager bind:this={emoteManager} />
       {:else}
       <div class="admin-title">Active bans</div>
       {#if $relayAccounts}
@@ -116,7 +128,7 @@
       {/if}
       {/if}
       <div class="admin-actions">
-        <button type="button" class="admin-cancel" onclick={() => showAdminPanel.set(false)}>Close</button>
+        <button type="button" class="admin-cancel" onclick={closePanel}>Close</button>
       </div>
     </div>
   </div>

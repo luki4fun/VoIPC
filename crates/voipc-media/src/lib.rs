@@ -17,13 +17,16 @@ mod encode;
 mod exif;
 mod pack;
 mod resize;
+mod strip;
 
 #[cfg(any(test, fuzzing))]
 pub mod fuzz;
 #[cfg(test)]
 mod tests;
 
+pub use decode::probe;
 pub use pack::{read_pack, Entry, Pack};
+pub use strip::strip;
 
 /// Bumped whenever what `sanitize` writes may change: a copy cached under an
 /// older version is made again (a decoder fix reaches every cached picture).

@@ -316,9 +316,13 @@ impl Files {
         token: &str,
         body: &[u8],
     ) -> Result<(u16, Vec<u8>), String> {
+        let (call, started) = ((self.in_call)(), Instant::now());
         let reply = self
             .request(method, &format!("/e/v1/{}", hex(hash)), token, None, body)
             .await?;
+        // A server's emotes are many files at once: in a call they give way
+        // to voice as a file's chunks do
+        yield_to_voice(call, started).await;
         Ok((reply.status, reply.body))
     }
 
@@ -354,8 +358,11 @@ impl Files {
                     serde_json::json!({ "stickers": stickers, "emotes": list }),
                 );
             }
-            ServerMessage::EmoteTicket { hash, ticket } => {
-                answer(&|w: &EmoteWait| w.hash == hash, Ok(Some(ticket)));
+            ServerMessage::EmoteTicket { hash, name, ticket } => {
+                answer(
+                    &|w: &EmoteWait| w.hash == hash && w.name == name,
+                    Ok(Some(ticket)),
+                );
             }
             ServerMessage::EmoteError { name, reason }
                 if !answer(&|w: &EmoteWait| w.name == name, Err(reason.clone())) =>
@@ -732,7 +739,10 @@ pub fn is_file_message(msg: &ServerMessage) -> bool {
 
 /// An emote as the page reads it: its hash in hex.
 fn emote_json(e: &Emote) -> serde_json::Value {
-    serde_json::json!({ "name": e.name, "hash": hex(&e.hash), "sticker": e.sticker, "pack": e.pack })
+    serde_json::json!({
+        "name": e.name, "hash": hex(&e.hash), "sticker": e.sticker, "pack": e.pack,
+        "len": e.len, "w": e.w, "h": e.h,
+    })
 }
 
 fn too_large(max: u64) -> String {
@@ -1397,14 +1407,32 @@ pub async fn file_image(
     file: FileArg,
     profile: u32,
     op: Option<String>,
+    still: Option<bool>,
 ) -> Result<tauri::ipc::Response, String> {
     let profile = voipc_media::Profile::from_u32(profile).ok_or("no such picture profile")?;
     let motion = files_of(&state, &server)
         .await
         .map_or_else(|_| voipc_media::Motion::default(), |f| f.motion());
+    // The first frame alone where the person wants nothing to move
+    let pick = |(png, first): (Vec<u8>, Option<Vec<u8>>)| {
+        tauri::ipc::Response::new(if still == Some(true) {
+            first.unwrap_or(png)
+        } else {
+            png
+        })
+    };
+    // The key too: only a message that can open the file gets its picture
+    let key = format!(
+        "{}:{}-{profile:?}-{}-{}",
+        file.hash, file.key, motion.side, motion.keep
+    );
+    if let Some(hit) = crate::media::made(&key) {
+        return Ok(pick(hit));
+    }
     let plain = Box::pin(open_file(&state, &server, conv, file, op)).await?;
     let clean = crate::media::sanitize(plain, profile, profile.max_output(), motion).await?;
-    Ok(tauri::ipc::Response::new(clean.png))
+    crate::media::keep_made(key, clean.png.clone(), clean.still.clone());
+    Ok(pick((clean.png, clean.still)))
 }
 
 /// `fetch_file`'s work: the copy kept here, opened, else the relay's.
@@ -2022,8 +2050,10 @@ mod tests {
                 hash,
                 sticker: false,
                 pack: String::new(),
+                len: file.len() as u32,
+                w: 0,
+                h: 0,
             },
-            len: file.len() as u32,
         });
         let ticket = tokio::time::timeout(Duration::from_secs(10), answer)
             .await
@@ -2080,7 +2110,9 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(status, 401, "a member's bearer uploads nothing");
-        admin.files.send_msg(&ClientMessage::EmoteRemove { name });
+        admin
+            .files
+            .send_msg(&ClientMessage::EmoteRemove { names: vec![name] });
     }
 
     /// The whole path against a real relay: seal, `FileUpload`, chunked PUTs

@@ -165,6 +165,9 @@ fn the_largest_emote_list_fits_one_message() {
             hash: [0xff; 32],
             sticker: true,
             pack: label.clone(),
+            len: u32::MAX,
+            w: u16::MAX,
+            h: u16::MAX,
         })
         .collect();
     let len = encode_server_msg(&ServerMessage::EmoteList {

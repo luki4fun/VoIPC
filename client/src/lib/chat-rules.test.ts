@@ -25,6 +25,7 @@ import {
   applyEvent,
   chatEvent,
   forHandOff,
+  cutText,
   forwarded,
   isOneEmoji,
   pinnedOf,
@@ -744,4 +745,12 @@ test("a full emoji lets go of those who took theirs off; look-alike emoji are re
   assert.deepEqual(reactionChips(list[1], (k) => k === "a:aa"), [{ emoji: "👍", count: 1, mine: true, names: ["ann#0001"] }]);
   for (const look of ["👍\u200c", "👍\ufe0e", "\u200c👍"]) assert.ok(!isOneEmoji(look), JSON.stringify(look));
   for (const one of ["❤️", "👩🏽‍👩🏽‍👧🏽", "🏴󠁧󠁢󠁳󠁣󠁴󠁿"]) assert.ok(isOneEmoji(one), one);
+});
+
+test("history cuts a long text, never inside an emote's token", () => {
+  const tok = `<:pog:${"a".repeat(32)}>`;
+  const text = `${"x".repeat(1990)}${tok} tail`;
+  assert.equal(cutText(text), "x".repeat(1990));
+  assert.ok(cutText(`${"x".repeat(1900)}${tok}${"y".repeat(200)}`).includes(tok), "a whole token stays");
+  assert.equal(cutText("short <: not a token"), "short <: not a token");
 });

@@ -12,7 +12,7 @@
 
 import { Marked, type Token, type Tokens, type TokenizerExtension } from "marked";
 import { shortName } from "./username.ts";
-import { EMOTE_TOKEN } from "./emote-rules.ts";
+import { EMOTE_TOKEN, untokenize } from "./emote-rules.ts";
 
 export type Inline =
   | { t: "text"; v: string }
@@ -49,6 +49,10 @@ export interface ParseOptions {
  * the text does, on every reader's screen.
  */
 export const MAX_MARKUP_CHARS = 4000;
+/** Emotes drawn in one message, at most; the rest stay their `:name:`. A
+ *  message a modified client fills with tokens would mount thousands. */
+export const MAX_EMOTES_SHOWN = 100;
+let emotesLeft = MAX_EMOTES_SHOWN;
 /** Quotes and lists inside each other, at most; a deeper one is its plain text. */
 const MAX_BLOCK_DEPTH = 8;
 /**
@@ -95,7 +99,9 @@ const marked = new Marked({ gfm: true, breaks: true, extensions: [spoiler] });
 /** Parse a message's text. Never throws: a text marked cannot read is a paragraph of itself. */
 export function parse(text: string, opts: ParseOptions = {}): Block[] {
   const names = [...new Set((opts.names ?? []).filter((n) => n !== ""))].sort((a, b) => b.length - a.length);
-  if (text.length > MAX_MARKUP_CHARS) return plain(text, names);
+  emotesLeft = MAX_EMOTES_SHOWN;
+  // As typed: an emote's token is longer than its `:name:`
+  if (text.length > MAX_MARKUP_CHARS && untokenize(text).length > MAX_MARKUP_CHARS) return plain(text, names);
   let tokens: Token[];
   try {
     tokens = marked.lexer(text);
@@ -238,7 +244,8 @@ function words(text: string, names: string[]): Inline[] {
   let from = 0;
   for (const m of text.matchAll(EMOTE_TOKEN)) {
     if (m.index > from) out.push(...mentions(text.slice(from, m.index), names));
-    out.push({ t: "emote", name: m[1], hash: m[2] });
+    if (emotesLeft-- > 0) out.push({ t: "emote", name: m[1], hash: m[2] });
+    else out.push({ t: "text", v: `:${m[1]}:` });
     from = m.index + m[0].length;
   }
   if (from < text.length) out.push(...mentions(text.slice(from), names));

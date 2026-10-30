@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { linkFacts, mentionNames, mentionsName, parse, plainText, shownHref, type Block, type Inline } from "./markdown.ts";
+import { linkFacts, MAX_EMOTES_SHOWN, MAX_MARKUP_CHARS, mentionNames, mentionsName, parse, plainText, shownHref, type Block, type Inline } from "./markdown.ts";
 
 /** Every text a tree would put on screen, in order. */
 function texts(blocks: Block[]): string {
@@ -261,4 +261,15 @@ test("a server emote's token is its own node, outside code, and reads as :name:"
   assert.deepEqual(parse(`\`${tok}\``)[0], { t: "p", c: [{ t: "code", v: tok }] }, "never in code");
   assert.equal(plainText(`a ${tok} b`), "a :pog_2: b");
   assert.deepEqual(parse(`<:Bad:${"a".repeat(20)}>`)[0], { t: "p", c: [{ t: "text", v: `<:Bad:${"a".repeat(20)}>` }] }, "not a token: text");
+});
+
+test("a message draws at most MAX_EMOTES_SHOWN emotes, and emote tokens do not cost it its markup", () => {
+  const tok = `<:pog:${"a".repeat(32)}>`;
+  const c = (parse(Array(MAX_EMOTES_SHOWN + 50).fill(tok).join(" "))[0] as { c: Inline[] }).c;
+  assert.equal(c.filter((n) => n.t === "emote").length, MAX_EMOTES_SHOWN);
+  assert.ok(c.some((n) => n.t === "text" && n.v.includes(":pog:")), "the rest stay their names");
+  assert.equal((parse(tok)[0] as { c: Inline[] }).c[0].t, "emote", "the count starts again for each message");
+  const long = `**bold** ${Array(120).fill(tok).join(" ")}`;
+  assert.ok(long.length > MAX_MARKUP_CHARS);
+  assert.equal((parse(long)[0] as { c: Inline[] }).c[0].t, "strong", "measured as typed");
 });

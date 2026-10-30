@@ -32,7 +32,7 @@
   } from "../file-index.js";
   import { formatSize, PREVIEW_SIDE } from "../file-rules.js";
   import { needsNsfwConsent } from "../channel-post-rules.js";
-  import type { ChatPlace } from "../chat-rules.js";
+  import { rowKey, type ChatPlace } from "../chat-rules.js";
   import type { ChatMessage } from "../types.js";
   import { shortName } from "../username.js";
   import FileCard from "./chat/FileCard.svelte";
@@ -58,7 +58,8 @@
   let sort = $state<FileSort>("date");
   let group = $state<FileGroup>("none");
   let limit = $state(PAGE);
-  /** Rows whose card is open, by their message. Raw: looked up by identity. */
+  /** Rows whose card is open, by their message's `rowKey`: a reaction or an
+   *  edit keeps it open. Raw: looked up by identity. */
   let opened = $state.raw(new Set<ChatMessage>());
   /** Copies picked to remove together, by blob: only while "On this device"
    *  is shown, where every row has one. */
@@ -74,6 +75,19 @@
     }
   }
   void reload();
+
+  /** What this device keeps of the servers' emotes and stickers (made again
+   *  from their server when next shown, once cleared). */
+  let emoteBytes = $state<number | null>(null);
+  const emoteCache = () =>
+    invoke<number>("emote_cache_size")
+      .then((n) => (emoteBytes = n))
+      .catch(() => (emoteBytes = null));
+  void emoteCache();
+  async function clearEmotes() {
+    await invoke("emote_cache_clear").catch((e) => addNotification(String(e), "error"));
+    void emoteCache();
+  }
 
   // A load or a send changes what is kept: look again once the bars are
   // still, and at least every few seconds while one keeps moving
@@ -177,7 +191,7 @@
 
   function toggle(r: FileRow) {
     const next = new Set(opened);
-    if (!next.delete(r.msg)) next.add(r.msg);
+    if (!next.delete(rowKey(r.msg))) next.add(rowKey(r.msg));
     opened = next;
   }
 
@@ -232,6 +246,24 @@
       danger: true,
     });
     if (ok) await remove(all.map((e) => e.hash));
+  }
+
+  async function removePicked(from: HTMLElement | null) {
+    const hashes = [...picked];
+    if (hashes.length > 1) {
+      const size = cache?.entries.filter((e) => picked.has(e.hash)).reduce((n, e) => n + e.bytes, 0) ?? 0;
+      const ok = await confirmAction({
+        title: `Remove ${hashes.length} files from this ${isWeb ? "tab" : "device"}?`,
+        body:
+          `The ${hashes.length} files picked (${formatSize(size)}) are removed from this ${isWeb ? "tab" : "device"}. ` +
+          "The messages stay. A file loads again from its server while the server still has it, or " +
+          "from a member who does; nobody can load one from you any more.",
+        confirm: `Remove ${hashes.length}`,
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    await remove(hashes, from);
   }
 
   async function setCap(e: Event) {
@@ -314,6 +346,16 @@
   {#if cache && cache.entries.length > 0}
     <button class="btn btn-danger-outline" type="button" onclick={removeAll}>Remove all from this {isWeb ? "tab" : "device"}…</button>
   {/if}
+  {#if emoteBytes}
+    <div class="fm-usage">
+      <span>Emotes and stickers: <span class="num">{formatSize(emoteBytes)}</span></span>
+      <button class="btn btn-ghost" type="button" onclick={clearEmotes}>Clear</button>
+    </div>
+    <p class="fm-hint">
+      The servers' emotes and stickers as this {isWeb ? "browser" : "device"} made them safe to show. Cleared, each is fetched
+      and made again when it is next shown.
+    </p>
+  {/if}
 </div>
 
 <div class="section">
@@ -363,7 +405,7 @@
         <span>All shown</span>
       </label>
       {#if picked.size > 0}
-        <button class="btn btn-danger-outline" type="button" onclick={(e) => remove([...picked], e.currentTarget.closest<HTMLElement>(".section"))}>
+        <button class="btn btn-danger-outline" type="button" onclick={(e) => removePicked(e.currentTarget.closest<HTMLElement>(".section"))}>
           Remove {picked.size === 1 ? "1 copy" : `${picked.size} copies`}
         </button>
       {/if}
@@ -379,8 +421,8 @@
       <h5 class="fm-section">{sectionTitle(s)} <span class="num">{sections.find((x) => x.id === s.id)?.rows.length}</span></h5>
     {/if}
     <ul class="fm-list">
-      {#each s.rows as r (r.msg)}
-        {@const open = opened.has(r.msg)}
+      {#each s.rows as r (rowKey(r.msg))}
+        {@const open = opened.has(rowKey(r.msg))}
         <li class="fm-row">
           <div class="fm-line">
             {#if filter === "local" && r.local !== null}

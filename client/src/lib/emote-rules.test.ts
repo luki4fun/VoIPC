@@ -2,6 +2,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   byRecent,
+  cleanList,
+  completeEmoji,
   completeEmote,
   emoteOf,
   isEmoteReaction,
@@ -17,16 +19,18 @@ import {
 } from "./emote-rules.ts";
 
 const H = (c: string) => c.repeat(64);
-const pog: Emote = { name: "pog", hash: H("a"), sticker: false, pack: "" };
-const kekw: Emote = { name: "kekw_2", hash: H("b"), sticker: false, pack: "" };
-const cat: Emote = { name: "cat", hash: H("c"), sticker: true, pack: "Cats" };
+const pog: Emote = { name: "pog", hash: H("a"), sticker: false, pack: "", len: 100, w: 64, h: 32 };
+const kekw: Emote = { name: "kekw_2", hash: H("b"), sticker: false, pack: "", len: 100, w: 0, h: 0 };
+const cat: Emote = { name: "cat", hash: H("c"), sticker: true, pack: "Cats", len: 100, w: 320, h: 320 };
 const ALL = [pog, kekw, cat];
-const T = (e: Emote) => `<:${e.name}:${e.hash.slice(0, 20)}>`;
+const T = (e: Emote) => `<:${e.name}:${e.hash.slice(0, 32)}>`;
+/** A token as 1.4 sent it: 80 bits of the hash. */
+const OLD = (e: Emote) => `<:${e.name}:${e.hash.slice(0, 20)}>`;
 
 test(":name: of a listed emote becomes its token, and nothing else does", () => {
   assert.equal(tokenize("so :pog: wow :kekw_2:", ALL), `so ${T(pog)} wow ${T(kekw)}`);
   assert.equal(tokenize(":pog::pog:", ALL), ":pog::pog:", "glued together is not two emotes");
-  assert.equal(tokenize(":nope: and :cat:", ALL), ":nope: and :cat:", "unknown, and a sticker, stay text");
+  assert.equal(tokenize(":nope: and :cat:", ALL), ":nope: and 🐱", "unknown stays text; a sticker is not typed, :cat: is the emoji");
   assert.equal(tokenize("10:30:45 and a:pog:b", ALL), "10:30:45 and a:pog:b", "inside words and times");
   assert.equal(tokenize(":pog:", []), ":pog:");
   assert.equal(tokenize("(:pog:)", ALL), `(${T(pog)})`);
@@ -35,21 +39,29 @@ test(":name: of a listed emote becomes its token, and nothing else does", () => 
 test("code stays as it was written, and a token is never made twice", () => {
   assert.equal(tokenize("`:pog:` and :pog:", ALL), `\`:pog:\` and ${T(pog)}`);
   assert.equal(tokenize("```\n:pog:\n```\n:pog:", ALL), `\`\`\`\n:pog:\n\`\`\`\n${T(pog)}`);
+  assert.equal(tokenize("~~~\n:pog:\n~~~", ALL), "~~~\n:pog:\n~~~");
+  assert.equal(tokenize("``a :pog: b``", ALL), "``a :pog: b``");
+  assert.equal(tokenize("https://x.org/a/:pog:/b", ALL), "https://x.org/a/:pog:/b", "inside an address");
   const once = tokenize("hi :pog:", ALL);
   assert.equal(tokenize(once, ALL), once, "a forward or a resend comes out the same");
   assert.equal(untokenize(once), "hi :pog:");
 });
 
 test("a token shows only while the server lists a file of its hash", () => {
-  assert.equal(emoteOf(pog.hash.slice(0, 20), ALL), pog);
-  assert.equal(emoteOf("f".repeat(20), ALL), undefined, "another picture under the name is not this one");
-  assert.equal(emoteOf(pog.hash, ALL), undefined, "a token carries exactly 20");
+  assert.equal(emoteOf(pog.hash.slice(0, 32), ALL), pog);
+  assert.equal(emoteOf(pog.hash.slice(0, 20), ALL), pog, "a 1.4 token still shows");
+  assert.equal(emoteOf(pog.hash, ALL), pog, "a whole hash, from a list");
+  assert.equal(emoteOf("f".repeat(32), ALL), undefined, "another picture under the name is not this one");
+  assert.equal(emoteOf(`${pog.hash.slice(0, 20)}${"f".repeat(12)}`, ALL), undefined, "the 80 bits of 1.4 are not enough now");
+  assert.equal(emoteOf(pog.hash.slice(0, 25), ALL), undefined, "a token carries 20 or 32");
   const renamed = { ...pog, name: "poggers" };
   assert.equal(emoteOf(pog.hash.slice(0, 20), [renamed]), renamed, "a renamed emote still shows");
 });
 
 test("a sticker is a message that is one sticker's token and nothing else", () => {
   assert.equal(stickerOf(stickerText(cat), ALL), cat);
+  assert.equal(stickerOf(OLD(cat), ALL), cat, "a 1.4 sticker still shows");
+  assert.equal(emoteOf(cat.hash.slice(0, 32), ALL, "cat", false), undefined, "in text, a sticker's token is not drawn");
   assert.equal(stickerOf(` ${stickerText(cat)}\n`, ALL), cat);
   assert.equal(stickerOf(`look ${stickerText(cat)}`, ALL), undefined);
   assert.equal(stickerOf(T(pog), ALL), undefined, "an emote alone is not a sticker");
@@ -65,11 +77,28 @@ test("one file under several names: each token finds its own", () => {
   assert.equal(stickerOf(stickerText(big), list), big, "the sticker, though an emote has its file");
 });
 
-test("emotes alone, few enough, are shown big", () => {
+test("emotes and emoji alone, few enough, are shown big", () => {
   assert.equal(onlyEmotes(`${T(pog)} ${T(kekw)}`), true);
   assert.equal(onlyEmotes(`${T(pog)} hi`), false);
   assert.equal(onlyEmotes("hi"), false);
   assert.equal(onlyEmotes(T(pog).repeat(28)), false);
+  assert.equal(onlyEmotes("😂 👍🏽 ❤️‍🔥 🇩🇪 1️⃣"), true, "skin tones, sequences, flags, keycaps");
+  assert.equal(onlyEmotes(`😂 ${T(pog)}`), true, "the two mixed");
+  assert.equal(onlyEmotes("😂 lol"), false);
+  assert.equal(onlyEmotes("1 2"), false, "digits are not emoji");
+  assert.equal(onlyEmotes("😂".repeat(28)), false);
+  assert.equal(onlyEmotes("  "), false);
+});
+
+test(":joy: and its kind become their emoji when sent, never over a server's emote", () => {
+  assert.equal(tokenize("so :joy: :thumbsup:", ALL), "so 😂 👍");
+  assert.equal(tokenize("`:joy:`", ALL), "`:joy:`", "not in code");
+  const joy = { ...pog, name: "joy" };
+  assert.equal(tokenize(":joy:", [joy]), T(joy), "the server's own wins");
+  assert.equal(tokenize(":joyy:", ALL), ":joyy:");
+  assert.deepEqual(completeEmoji("thumbs").map((o) => o.name), ["thumbsup", "thumbsdown"]);
+  assert.deepEqual(completeEmoji("laugh").map((o) => o.emoji), ["😆"], "one per emoji");
+  assert.equal(completeEmoji("heart")[0].name, "heart", "what starts with it first");
 });
 
 test("a reaction is :name: of a listed emote", () => {
@@ -107,4 +136,26 @@ test("emote names from file names", () => {
   assert.equal(uniqueName("pog", taken), "pog_3");
   assert.equal(uniqueName("new", taken), "new");
   assert.equal(uniqueName("y".repeat(30), taken), `${"y".repeat(28)}_2`);
+});
+
+test("a relay's list is taken only as valid, once per name, and bounded", () => {
+  const bad = [
+    { ...pog, name: "Pog" },
+    { ...pog, name: "x y" },
+    { ...pog, hash: "zz" },
+    { ...pog, pack: "rtl\u202Egnp" },
+    { ...pog, pack: "two\nlines" },
+  ];
+  assert.deepEqual(cleanList([...bad, pog, { ...pog, hash: H("f") }, cat]), [pog, cat], "the first of a name wins");
+  const many = Array.from({ length: 450 }, (_, i) => ({ ...pog, name: `e${i}` }));
+  assert.equal(cleanList(many).length, 400);
+  const odd = cleanList([{ ...pog, w: 9999, h: -3, len: 1.5 }, { ...cat, w: 9999 }]);
+  assert.deepEqual(
+    odd.map((e) => [e.w, e.h, e.len]),
+    [
+      [128, 0, 0],
+      [320, 320, 100],
+    ],
+    "a shape held to its box",
+  );
 });

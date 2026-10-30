@@ -305,13 +305,15 @@ pub enum ClientMessage {
 
     // ── Emotes (protocol v14) ────────────────────────────────────────
     // Admins only; the files go over HTTPS (`PUT`/`GET /e/v1/<hash>`).
-    /// Add `emote`, whose file is `len` bytes. Answered with `EmoteTicket`
-    /// (upload it), or at once with the new `EmoteList` when the relay holds
+    /// Add `emote`, whose file is `emote.len` bytes. Answered with
+    /// `EmoteTicket` (upload it; the same add again while that ticket is open
+    /// gets it again), or at once with the new `EmoteList` when the relay holds
     /// that file already (a rename), or with `EmoteError`.
-    EmoteAdd { emote: Emote, len: u32 },
+    EmoteAdd { emote: Emote },
 
-    /// Remove the emote or sticker of this name.
-    EmoteRemove { name: String },
+    /// Remove the emotes and stickers of these names (v15: any number, one
+    /// list after). Names it does not have are named in one `EmoteError`.
+    EmoteRemove { names: Vec<String> },
 
     /// Whether members may send stickers.
     EmoteStickers { on: bool },
@@ -319,6 +321,14 @@ pub enum ClientMessage {
     /// Call the emote or sticker `from` by the name `to`: the same file, in
     /// the same place in the list.
     EmoteRename { from: String, to: String },
+
+    /// Put these emotes and stickers in `pack`, and/or make them stickers or
+    /// emotes (protocol v15): all of them or, with an `EmoteError`, none.
+    EmoteMove {
+        names: Vec<String>,
+        pack: Option<String>,
+        sticker: Option<bool>,
+    },
 }
 
 /// The client's side of an account sign-in, between `Authenticate` and
@@ -977,8 +987,12 @@ pub enum ServerMessage {
 
     /// Upload the emote's file: one `PUT /e/v1/<hash>` with the whole file
     /// and `Authorization: Bearer <ticket>`, within ten minutes. The list
-    /// follows.
-    EmoteTicket { hash: [u8; 32], ticket: String },
+    /// follows. `name` is the add's (v15).
+    EmoteTicket {
+        hash: [u8; 32],
+        name: String,
+        ticket: String,
+    },
 
     /// An emote change was refused, or its upload failed. `name` is the
     /// emote's, empty for the sticker switch.

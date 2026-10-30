@@ -37,12 +37,13 @@
   }
 </script>
 
-{#snippet inline(nodes: Inline[])}{#each nodes as n}{#if n.t === "text"}{n.v}{:else if n.t === "strong"}<strong>{@render inline(n.c)}</strong>{:else if n.t === "em"}<em>{@render inline(n.c)}</em>{:else if n.t === "del"}<del>{@render inline(n.c)}</del>{:else if n.t === "code"}<code class="md-code">{n.v}</code>{:else if n.t === "spoiler"}<Spoiler {tabbable}>{@render inline(n.c)}</Spoiler>{:else if n.t === "link"}<button class="msg-link" type="button" {tabindex} onclick={() => onlink(n.href)} title={shownHref(n.href)}>{@render inline(n.c)}</button>{:else if n.t === "br"}<br />{:else if n.t === "mention"}<span class="mention" class:me={isMe(n.name)}>@{shortName(n.name)}</span>{:else if n.t === "emote"}<Emote name={n.name} hash={n.hash} size={jumbo ? "jumbo" : "inline"} />{/if}{/each}{/snippet}
+{#snippet inline(nodes: Inline[])}{#each nodes as n}{#if n.t === "text"}{n.v}{:else if n.t === "strong"}<strong>{@render inline(n.c)}</strong>{:else if n.t === "em"}<em>{@render inline(n.c)}</em>{:else if n.t === "del"}<del>{@render inline(n.c)}</del>{:else if n.t === "code"}<code class="md-code">{n.v}</code>{:else if n.t === "spoiler"}<Spoiler {tabbable}>{@render inline(n.c)}</Spoiler>{:else if n.t === "link"}<button class="msg-link" type="button" {tabindex} onclick={() => onlink(n.href)} title={shownHref(n.href)}>{@render inline(n.c)}</button>{:else if n.t === "br"}<br />{:else if n.t === "mention"}<span class="mention" class:me={isMe(n.name)}>@{shortName(n.name)}</span>{:else if n.t === "emote"}<Emote name={n.name} hash={n.hash} inText />{/if}{/each}{/snippet}
 
 {#snippet blocks(list: Block[])}
   {#each list as b}
     {#if b.t === "p"}
-      <p class="md-p">{@render inline(b.c)}</p>
+      <!-- Emotes and emoji alone: big, the emotes with the text they stand in -->
+      <p class="md-p" class:md-jumbo={jumbo}>{@render inline(b.c)}</p>
     {:else if b.t === "h"}
       <p class="md-h md-h{b.level}">{@render inline(b.c)}</p>
     {:else if b.t === "pre"}
@@ -71,6 +72,10 @@
 </svelte:boundary>
 
 <style>
+  .md-jumbo {
+    font-size: 2.2em;
+    line-height: 1.25;
+  }
   .md-p,
   .md-h {
     margin: 0;

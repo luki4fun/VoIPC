@@ -75,6 +75,30 @@ pub fn sniff(b: &[u8]) -> std::result::Result<Format, &'static str> {
     }
 }
 
+/// `b`'s canvas from its header alone, nothing decoded; None where the header
+/// says nothing readable. (A GIF's frames may be larger than its screen: the
+/// decoder charges those as it meets them.)
+pub fn probe(b: &[u8]) -> Option<(u32, u32)> {
+    match sniff(b).ok()? {
+        Format::Png => {
+            let rd = png::Decoder::new(Cursor::new(b)).read_info().ok()?;
+            Some((rd.info().width, rd.info().height))
+        }
+        Format::Gif => {
+            let d = gif::DecodeOptions::new().read_info(Cursor::new(b)).ok()?;
+            Some((u32::from(d.width()), u32::from(d.height())))
+        }
+        Format::WebP => image_webp::WebPDecoder::new(Cursor::new(b))
+            .ok()
+            .map(|d| d.dimensions()),
+        Format::Jpeg => {
+            let mut d = zune_jpeg::JpegDecoder::new(zune_core::bytestream::ZCursor::new(b));
+            d.decode_headers().ok()?;
+            d.dimensions().map(|(w, h)| (w as u32, h as u32))
+        }
+    }
+}
+
 fn check(w: u32, h: u32) -> Result<()> {
     if w == 0 || h == 0 {
         return Err(Error::Corrupt("no size".into()));
@@ -100,8 +124,12 @@ struct Budget {
 
 impl Budget {
     fn take(&mut self, w: u32, h: u32) -> Result<()> {
+        self.take_px(u64::from(w) * u64::from(h))
+    }
+
+    fn take_px(&mut self, px: u64) -> Result<()> {
         self.frames += 1;
-        self.work += u64::from(w) * u64::from(h);
+        self.work += px;
         if self.frames > MAX_FRAMES {
             return Err(Error::TooLarge("the animation has too many frames"));
         }
@@ -278,33 +306,43 @@ fn gif_frames(b: &[u8], sink: &mut dyn Sink) -> Result<()> {
     sink.start(w, h)?;
     let mut canvas = vec![0u8; (w * h * 4) as usize];
     let mut budget = Budget { frames: 0, work: 0 };
-    while let Some(f) = d.read_next_frame().map_err(corrupt)? {
+    let mut buf = Vec::new();
+    while let Some(f) = d.next_frame_info().map_err(corrupt)? {
         let (fx, fy, fw, fh) = (
             u32::from(f.left),
             u32::from(f.top),
             u32::from(f.width),
             u32::from(f.height),
         );
-        budget.take(w, h)?;
+        let (dispose, delay) = (f.dispose, f.delay);
+        // A frame may reach past the screen and is decoded whole: its own
+        // size counts too, before a pixel of it is read
+        let own = u64::from(fw) * u64::from(fh);
+        if own > MAX_ANIMATION_PIXELS {
+            return Err(Error::TooLarge("the animation is too big to show"));
+        }
+        budget.take_px(own.max(u64::from(w) * u64::from(h)))?;
+        buf.resize(d.buffer_size(), 0);
+        d.read_into_buffer(&mut buf).map_err(corrupt)?;
         // What of the frame lies on the screen; a GIF may draw past it
         let (cw, ch) = (fw.min(w.saturating_sub(fx)), fh.min(h.saturating_sub(fy)));
-        let saved = (f.dispose == gif::DisposalMethod::Previous).then(|| canvas.clone());
+        let saved = (dispose == gif::DisposalMethod::Previous).then(|| canvas.clone());
         for y in 0..ch {
             for x in 0..cw {
                 let s = ((y * fw + x) * 4) as usize;
-                if f.buffer.get(s + 3).is_some_and(|&a| a > 0) {
+                if buf.get(s + 3).is_some_and(|&a| a > 0) {
                     let d = (((fy + y) * w + fx + x) * 4) as usize;
-                    canvas[d..d + 4].copy_from_slice(&f.buffer[s..s + 4]);
+                    canvas[d..d + 4].copy_from_slice(&buf[s..s + 4]);
                 }
             }
         }
         // 0 and 10 ms are what browsers draw at 100 ms: so do we
-        let delay = match u32::from(f.delay) * 10 {
+        let delay = match u32::from(delay) * 10 {
             d if d < 20 => 100,
             d => d.min(65_535),
         };
         sink.frame(&canvas, delay as u16)?;
-        match f.dispose {
+        match dispose {
             gif::DisposalMethod::Background => clear(&mut canvas, w, fx.min(w), fy.min(h), cw, ch),
             gif::DisposalMethod::Previous => canvas = saved.unwrap_or(canvas),
             _ => {}
@@ -331,10 +369,12 @@ fn webp_frames(b: &[u8], sink: &mut dyn Sink) -> Result<u8> {
         .output_buffer_size()
         .ok_or(Error::TooLarge("the picture is too big to show"))?;
     let channels = size / (w as usize * h as usize);
+    if d.is_animated() {
+        check_animation(w, h)?;
+    }
     let mut buf = vec![0u8; size];
     let mut budget = Budget { frames: 0, work: 0 };
     if d.is_animated() {
-        check_animation(w, h)?;
         sink.start(w, h)?;
         let n = d.num_frames() as usize;
         for _ in 0..n {

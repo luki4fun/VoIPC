@@ -69,6 +69,7 @@
   import { get } from "svelte/store";
   import LayoutPreview from "./LayoutPreview.svelte";
   import { uiPrefs, updateUiPrefs } from "../stores/ui-prefs.js";
+  import { reducedMotion } from "../stores/emotes.js";
   import { buildHash, buildLine, buildTime } from "../build-info.js";
   import {
     CHAT_FONT_MAX,
@@ -85,6 +86,9 @@
   // split by what somebody comes to Settings to do
   type Tab = "voice" | "appearance" | "sounds" | "privacy" | "files" | "games" | "about";
   let activeTab = $state<Tab>(get(settingsAsk)?.tab ?? "voice");
+
+  /** A touch screen: nothing is ever under its pointer. */
+  const coarsePointer = typeof matchMedia === "function" && matchMedia("(pointer: coarse)").matches;
 
   // The accounts this device signs in to without a password (1.0 audit H5-12)
   let remembered = $state<{ server: string; name: string }[]>([]);
@@ -1290,15 +1294,23 @@
           <span class="toggle-hint">Off, a sticker someone sends shows as its name.</span>
         </label>
         <h4>Moving emotes and stickers</h4>
+        <!-- The system's "less motion" wins (Emote.svelte); a touch screen has no pointer to hover -->
         <select
-          value={$uiPrefs.animate_emotes}
+          value={$reducedMotion ? "never" : $uiPrefs.animate_emotes}
           aria-label="Moving emotes and stickers"
+          aria-describedby={$reducedMotion ? "motion-hint" : undefined}
+          disabled={$reducedMotion}
           onchange={(e) => updateUiPrefs((p) => (p.animate_emotes = (e.target as HTMLSelectElement).value as "always" | "hover" | "never"))}
         >
           <option value="always">Always move</option>
-          <option value="hover">Move under the pointer</option>
+          {#if !coarsePointer || $uiPrefs.animate_emotes === "hover"}
+            <option value="hover">Move under the pointer</option>
+          {/if}
           <option value="never">Never move</option>
         </select>
+        {#if $reducedMotion}
+          <span class="toggle-hint" id="motion-hint">Your system asks for less motion, so none of them move.</span>
+        {/if}
         <label class="slider-row">
           <span>Chat text size: {$uiPrefs.chat_font_size}px</span>
           <input

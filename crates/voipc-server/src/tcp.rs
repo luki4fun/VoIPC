@@ -1314,11 +1314,18 @@ async fn handle_message(
             crate::files::handle_cancel(state, session_id, hash).await;
         }
 
-        ClientMessage::EmoteAdd { emote, len } => {
-            crate::emotes::handle_add(state, session_id, emote, len, tx).await;
+        ClientMessage::EmoteAdd { emote } => {
+            crate::emotes::handle_add(state, session_id, emote, tx).await;
         }
-        ClientMessage::EmoteRemove { name } => {
-            crate::emotes::handle_remove(state, session_id, name, tx).await;
+        ClientMessage::EmoteRemove { names } => {
+            crate::emotes::handle_remove(state, session_id, names, tx).await;
+        }
+        ClientMessage::EmoteMove {
+            names,
+            pack,
+            sticker,
+        } => {
+            crate::emotes::handle_move(state, session_id, names, pack, sticker, tx).await;
         }
         ClientMessage::EmoteStickers { on } => {
             crate::emotes::handle_stickers(state, session_id, on, tx).await;
@@ -8741,12 +8748,14 @@ mod tests {
             hash: Sha256::digest(&png).into(),
             sticker: false,
             pack: String::new(),
+            len: png.len() as u32,
+            w: 64,
+            h: 32,
         };
         let path = format!("/e/v1/{}", hex(&emote.hash));
 
         bob.send(&ClientMessage::EmoteAdd {
             emote: emote.clone(),
-            len: png.len() as u32,
         })
         .await;
         bob.expect("EmoteError", |m| {
@@ -8767,7 +8776,6 @@ mod tests {
         admin
             .send(&ClientMessage::EmoteAdd {
                 emote: emote.clone(),
-                len: png.len() as u32,
             })
             .await;
         let ServerMessage::EmoteTicket { ticket, .. } = admin
@@ -8812,10 +8820,45 @@ mod tests {
                 to: "poggers".into(),
             })
             .await;
-        let want = vec![renamed];
+        let want = vec![renamed.clone()];
         bob.expect(
             "the renamed list",
             |m| matches!(m, ServerMessage::EmoteList { emotes, .. } if *emotes == want),
+        )
+        .await;
+
+        // v15: many at once, one list each
+        admin
+            .send(&ClientMessage::EmoteMove {
+                names: vec!["poggers".into()],
+                pack: Some("Cats".into()),
+                sticker: Some(true),
+            })
+            .await;
+        let want = vec![Emote {
+            pack: "Cats".into(),
+            sticker: true,
+            ..renamed
+        }];
+        bob.expect(
+            "the moved list",
+            |m| matches!(m, ServerMessage::EmoteList { emotes, .. } if *emotes == want),
+        )
+        .await;
+        admin
+            .send(&ClientMessage::EmoteRemove {
+                names: vec!["poggers".into(), "nope".into()],
+            })
+            .await;
+        admin
+            .expect(
+                "the unknown name, said",
+                |m| matches!(m, ServerMessage::EmoteError { reason, .. } if reason.contains(":nope:")),
+            )
+            .await;
+        bob.expect(
+            "the emptied list",
+            |m| matches!(m, ServerMessage::EmoteList { emotes, .. } if emotes.is_empty()),
         )
         .await;
         let _ = std::fs::remove_dir_all(&dir);

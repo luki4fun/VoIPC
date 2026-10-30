@@ -5,6 +5,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { asciiJson, invokeWithBytes } from "./files";
+import { toHex } from "./hex";
 
 /** A body of a JSON head (its length first, 4 bytes little-endian) and the
  *  byte parts it gives the lengths of, in order. */
@@ -77,9 +78,22 @@ export async function prepareEmote(bytes: Uint8Array, sticker: boolean, maxBytes
   return { w: head.w, h: head.h, frames: head.frames, how: head.how, upload: parts[0], preview: parts[1], still: head.still ? parts[2] : null };
 }
 
-/** Add one (admins): done when the server has it. */
-export function addEmote(server: string, name: string, sticker: boolean, pack: string, upload: Uint8Array): Promise<void> {
-  return invokeWithBytes<void>("emote_add", upload, { "x-voipc-emote": asciiJson({ server, name, sticker, pack }) });
+/** Add one (admins): done when the server has it. `w` × `h`: its shape as
+ *  `prepareEmote` made it, the room readers keep for it. */
+export function addEmote(server: string, name: string, sticker: boolean, pack: string, upload: Uint8Array, w = 0, h = 0): Promise<void> {
+  return invokeWithBytes<void>("emote_add", upload, { "x-voipc-emote": asciiJson({ server, name, sticker, pack, w, h }) });
+}
+
+/** What `prepareEmote` showed for an upload just added, kept on this device as
+ *  if fetched (only where it is what a member makes of that upload: a clean
+ *  re-encoding, or the file as it was). */
+export async function seedEmote(p: Prepared, sticker: boolean): Promise<void> {
+  if (p.how !== "clean" && p.how !== "original") return;
+  const hash = toHex(new Uint8Array(await crypto.subtle.digest("SHA-256", p.upload as Uint8Array<ArrayBuffer>)));
+  const body = new Uint8Array(p.preview.length + (p.still?.length ?? 0));
+  body.set(p.preview);
+  if (p.still) body.set(p.still, p.preview.length);
+  await invokeWithBytes<void>("emote_seed", body, { "x-voipc-seed": asciiJson({ hash, sticker, preview: p.preview.length }) });
 }
 
 /** An emote's file as the server keeps it (admins), checked against its hash:
@@ -88,7 +102,12 @@ export async function emoteFile(server: string, hash: string): Promise<Uint8Arra
   return new Uint8Array(await invoke<ArrayBuffer>("emote_file", { server, hash }));
 }
 
-export const removeEmote = (server: string, name: string) => invoke("emote_remove", { server, name });
+/** Remove these (admins), in one message: the server's list follows. */
+export const removeEmotes = (server: string, names: string[]) => invoke("emote_remove", { server, names });
+/** Put these in `pack`, and/or make them stickers or emotes (admins): all of
+ *  them or none; the server's list follows. */
+export const moveEmotes = (server: string, names: string[], pack: string | null, sticker: boolean | null) =>
+  invoke("emote_move", { server, names, pack, sticker });
 export const renameEmote = (server: string, from: string, to: string) => invoke("emote_rename", { server, from, to });
 export const setStickers = (server: string, on: boolean) => invoke("emote_stickers", { server, on });
 

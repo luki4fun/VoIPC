@@ -71,6 +71,11 @@ jobs:
       # not, so this is the only part of a red run anyone can actually see.
       - run: bash tools/ci-run.sh "cargo test" cargo test --workspace --locked
 
+      # The picture sanitizer against the hardest pictures there are, timed:
+      # only a release build says anything about time (voipc-media tests.rs)
+      - name: Pictures are sanitized in time
+        run: bash tools/ci-run.sh "picture timing" cargo test --locked --release -p voipc-media every_hard_picture
+
       # The browser half of the spatial maths and the room presets, under
       # Node's own test runner. Needs Node 22 for --experimental-strip-types;
       # the runner's default may be older.

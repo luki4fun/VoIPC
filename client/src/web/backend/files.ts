@@ -167,7 +167,7 @@ export class Pace {
  * an upload 30 s idle to a member queued behind it. shortcut: the pacing
  * factor is a fixed ½; upgrade to delay-based if a measurement says so.
  */
-async function yieldToVoice(inCall: boolean, chunkStarted: number): Promise<void> {
+export async function yieldToVoice(inCall: boolean, chunkStarted: number): Promise<void> {
   if (inCall) await sleep(Math.min(performance.now() - chunkStarted, CALL_GAP_MAX_MS));
 }
 
@@ -624,6 +624,10 @@ function whole(bytes: Uint8Array): ArrayBuffer {
 
 /** Workers at once: each holds a wasm instance of some three times its file. */
 const MAX_WORKERS = 2;
+/** Jobs that read a picture (or a pack of them) somebody else made, and how
+ *  long one may take. */
+const PICTURE_JOBS = new Set(["image", "sanitize", "pack", "strip"]);
+const PICTURE_TIME_MS = 30_000;
 let workers = 0;
 const waitingForWorker: (() => void)[] = [];
 
@@ -637,8 +641,12 @@ async function inWorker<T>(job: Record<string, unknown>, give?: Uint8Array): Pro
   if (workers >= MAX_WORKERS) await new Promise<void>((r) => waitingForWorker.push(r));
   workers++;
   const worker = new Worker(new URL("./file-worker.ts", import.meta.url), { type: "module" });
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await new Promise<T>((resolve, reject) => {
+      // A picture's budgets bound its work, and this bounds whatever they
+      // miss: ended, the worker frees its place for the next job
+      if (PICTURE_JOBS.has(String(job.op))) timer = setTimeout(() => reject(new Error("the picture took too long to read")), PICTURE_TIME_MS);
       worker.onmessage = (e: MessageEvent) => {
         const { ok, error } = e.data ?? {};
         if (!error) return resolve(ok as T);
@@ -651,6 +659,7 @@ async function inWorker<T>(job: Record<string, unknown>, give?: Uint8Array): Pro
       worker.postMessage({ module: wasmModule(), ...job, give }, give ? [give.buffer] : []);
     });
   } finally {
+    clearTimeout(timer);
     worker.terminate();
     workers--;
     waitingForWorker.shift()?.();
@@ -732,7 +741,19 @@ export async function fileImage(
   file: FileArg,
   profile: number,
   op?: string,
+  still = false,
 ): Promise<ArrayBuffer> {
+  // The first frame alone where the person wants nothing to move
+  // A copy: what is kept here stays the cache's
+  const pick = (m: Sanitized) => ((still && m.still) || m.png).slice().buffer as ArrayBuffer;
+  const motion = files?.motion ?? null;
+  const key = `${file.hash}:${file.key}-${profile}-${motion?.side}-${motion?.keepMb}`;
+  const hit = made.get(key);
+  if (hit) {
+    made.delete(key);
+    made.set(key, hit);
+    return pick(hit);
+  }
   let blob = cacheGet(file.hash);
   if (!blob) {
     await fetchFile(files, server, conv, file, op);
@@ -740,13 +761,32 @@ export async function fileImage(
     if (!blob) throw new Error("The file is not on this device");
   }
   const media = await mediaModule();
-  return whole(await inWorker<Uint8Array>({ op: "image", ...file, blob, profile, media, motion: files?.motion ?? null }));
+  const out = await inWorker<Sanitized>({ op: "image", ...file, blob, profile, media, motion });
+  made.set(key, out);
+  let bytes = [...made.values()].reduce((n, m) => n + m.png.length + (m.still?.length ?? 0), 0);
+  for (const [k, m] of made) {
+    if (bytes <= MADE_BYTES || made.size <= 1) break;
+    made.delete(k);
+    bytes -= m.png.length + (m.still?.length ?? 0);
+  }
+  return pick(out);
 }
+
+/** Chat pictures made lately, by file and how (files.rs `file_image`'s
+ *  twin): cards come and go as a channel scrolls, and making one again is a
+ *  decrypt and a sanitize. Oldest first. */
+const made = new Map<string, Sanitized>();
+const MADE_BYTES = 64 << 20;
 
 /** Any picture `bytes` (one picked from this device, an emote's) as `profile`,
  *  sanitized in a worker. */
 export async function sanitizeImage(bytes: Uint8Array, profile: number, maxOut = 0): Promise<Sanitized> {
   return inWorker<Sanitized>({ op: "sanitize", bytes, profile, maxOut, media: await mediaModule() });
+}
+
+/** Any picture `bytes` without their metadata, in a worker (voipc-media `strip`). */
+export async function stripImage(bytes: Uint8Array): Promise<Uint8Array> {
+  return inWorker<Uint8Array>({ op: "strip", bytes, media: await mediaModule() });
 }
 
 /** The files of a .zip or .wastickers an admin picked, read in a worker. */

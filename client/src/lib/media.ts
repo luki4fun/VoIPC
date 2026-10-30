@@ -11,6 +11,7 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import type { FileBlob, FileConv } from "./types";
+import type { Shown } from "./file-sniff";
 import type { UiPrefs } from "./ui-prefs";
 import { isAndroidApp, isWeb } from "./stores/platform";
 
@@ -20,9 +21,14 @@ export const PROFILE = { emote: 0, sticker: 1, photo: 2 } as const;
 /** A file's picture as the PNG it may be shown as, from the file's own copy
  *  (desktop: `files.rs file_image`; browser: `web/backend/files.ts`). Throws
  *  why it is not shown. */
-export async function fileImage(server: string, conv: FileConv, file: FileBlob, op?: string): Promise<Uint8Array> {
-  return new Uint8Array(await invoke<ArrayBuffer>("file_image", { server, conv, file, profile: PROFILE.photo, op }));
+export async function fileImage(server: string, conv: FileConv, file: FileBlob, op?: string, still = false): Promise<Uint8Array> {
+  return new Uint8Array(await invoke<ArrayBuffer>("file_image", { server, conv, file, profile: PROFILE.photo, op, still }));
 }
+
+/** Files already loaded and found to be pictures, by hash: a card that comes
+ *  back asks for its PNG at once (kept where it was made), and the file
+ *  itself only to save it. */
+export const knownPictures = new Map<string, Shown>();
 
 /** An object URL for a PNG the sanitizer wrote; nothing else is drawn. */
 export function pictureUrl(png: Uint8Array): string {

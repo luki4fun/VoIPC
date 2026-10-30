@@ -68,7 +68,10 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 ///      EmoteList/EmoteTicket/EmoteError, Authenticated.emotes (the files go
 ///      over HTTPS, `/e/v1/<hash>`); inside the message envelope, which the
 ///      relay never sees: `emotes` and `sticker`, and `:name:` reactions
-pub const PROTOCOL_VERSION: u32 = 14;
+/// v15: Emote.len/w/h, EmoteAccess.max_total_bytes/max_items, EmoteRemove of
+///      many names, EmoteMove (pack and kind of many), EmoteTicket.name,
+///      EmoteAdd without its own len (the emote's)
+pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.
