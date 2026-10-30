@@ -16,6 +16,10 @@
 
 <script lang="ts">
   import { tick } from "svelte";
+  import { isEmoteReaction, stickerOf, untokenize } from "../../emote-rules.js";
+  import { emoteSets } from "../../stores/emotes.js";
+  import { uiPrefs as emotePrefs } from "../../stores/ui-prefs.js";
+  import Emote from "./Emote.svelte";
   import type { ChatMessage, FileConv } from "../../types.js";
   import { userId } from "../../stores/connection.js";
   import { account, accountHex } from "../../stores/account.js";
@@ -248,7 +252,7 @@
 
   async function copyText(m: ChatMessage) {
     try {
-      await navigator.clipboard.writeText(m.content);
+      await navigator.clipboard.writeText(untokenize(m.content));
       addNotification("Message copied", "info", 2000);
     } catch {
       addNotification("Could not copy: select the text and copy it yourself", "warning");
@@ -328,6 +332,8 @@
   /** The reaction picker, for `m`, where it was opened. */
   let picking = $state.raw<{ m: ChatMessage; x: number; y: number; up: number } | null>(null);
   let pickCategory = $state(0);
+  /** The server's emotes a reaction may be: not its stickers. */
+  const serverEmotes = $derived($emoteSets.emotes.filter((e) => !e.sticker));
 
   /** Open the picker under `from` (a tool), or at the menu's place. */
   function openPicker(m: ChatMessage, from: { x: number; y: number; up: number } | Element) {
@@ -355,7 +361,7 @@
 
   function startEdit(m: ChatMessage) {
     editing = m;
-    draft = m.content;
+    draft = untokenize(m.content);
     tick().then(() => {
       editBox?.focus({ preventScroll: true });
       editBox?.setSelectionRange(draft.length, draft.length);
@@ -375,7 +381,7 @@
     const m = editing;
     editing = null;
     const text = draft.trim();
-    if (save && m && text && text !== m.content.trim()) actions.edit?.(m, text);
+    if (save && m && text && text !== untokenize(m.content).trim()) actions.edit?.(m, text);
     // Back on the row, where the keyboard was
     if (m) tick().then(() => rowEls.get(rows.find((r) => sameRow(r, m)) ?? m)?.focus());
   }
@@ -538,7 +544,14 @@
               </div>
             </form>
           {:else if msg.content}
-            <Markdown text={msg.content} {onlink} {names} {me} {tabbable} />
+            {@const sticker = stickerOf(msg.content, $emoteSets.emotes)}
+            {#if sticker && $emoteSets.stickers && $emotePrefs.show_stickers}
+              <Emote name={sticker.name} hash={sticker.hash.slice(0, 20)} size="sticker" />
+            {:else if sticker}
+              <span class="sticker-off">Sticker :{sticker.name}:</span>
+            {:else}
+              <Markdown text={msg.content} {onlink} {names} {me} {tabbable} />
+            {/if}
           {/if}
           {#if msg.edited_at && !isEditing}
             <span class="edited" title="Edited {fullTime(msg.edited_at)}">(edited)</span>
@@ -574,7 +587,7 @@
               title={c.names.map((n) => shortName(n)).join(", ")}
               disabled={!actions.react}
               onclick={() => actions.react?.(msg, c.emoji, !c.mine)}
-            ><span class="reaction-emoji">{c.emoji}</span><span class="num">{c.count}</span></button>
+            ><span class="reaction-emoji">{#if isEmoteReaction(c.emoji)}<Emote name={c.emoji.slice(1, -1)} />{:else}{c.emoji}{/if}</span><span class="num">{c.count}</span></button>
           {/each}
         </div>
       {/if}
@@ -689,6 +702,11 @@
       {/each}
     </div>
     <div class="react-tabs">
+      {#if serverEmotes.length}
+        <button class="react-tab" class:active={pickCategory === -1} type="button" title="This server's" aria-label="This server's emotes" onclick={() => (pickCategory = -1)}
+          ><Emote name={serverEmotes[0].name} hash={serverEmotes[0].hash.slice(0, 20)} /></button
+        >
+      {/if}
       {#each EMOJI_CATEGORIES as cat, idx (cat.label)}
         <button class="react-tab" class:active={pickCategory === idx} type="button" title={cat.label} aria-label={cat.label} onclick={() => (pickCategory = idx)}
           >{cat.emojis[0]}</button
@@ -696,9 +714,17 @@
       {/each}
     </div>
     <div class="react-grid">
-      {#each EMOJI_CATEGORIES[pickCategory].emojis as emoji (emoji)}
-        <button class="react-item" type="button" aria-label="React with {emoji}" onclick={() => pick(emoji)}>{emoji}</button>
-      {/each}
+      {#if pickCategory === -1}
+        {#each serverEmotes as e (e.hash)}
+          <button class="react-item" type="button" aria-label="React with :{e.name}:" title=":{e.name}:" onclick={() => pick(`:${e.name}:`)}
+            ><Emote name={e.name} hash={e.hash.slice(0, 20)} /></button
+          >
+        {/each}
+      {:else}
+        {#each EMOJI_CATEGORIES[pickCategory].emojis as emoji (emoji)}
+          <button class="react-item" type="button" aria-label="React with {emoji}" onclick={() => pick(emoji)}>{emoji}</button>
+        {/each}
+      {/if}
     </div>
   </div>
 {/if}
@@ -1091,6 +1117,11 @@
   }
 
   /* Reactions: ink chips under the message; ours outlined in the text colour */
+  .sticker-off {
+    color: var(--text-secondary);
+    font-size: var(--fs-sm);
+  }
+
   .reactions {
     display: flex;
     flex-wrap: wrap;

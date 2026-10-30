@@ -1,0 +1,25 @@
+[package]
+name = "voipc-media-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.99"
+description = "The browser's picture sanitizer (voipc-media), run in the file worker"
+publish = false
+
+# Standalone workspace, like voipc-opus-wasm: built for wasm32 by
+# `npm run build:wasm`, never part of the native app.
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+voipc-media = { path = "../voipc-media" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+# A panic traps; the worker reports the picture as unreadable and is ended
+panic = "abort"

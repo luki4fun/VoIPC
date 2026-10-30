@@ -1,0 +1,2 @@
+# Standalone workspace: cargo builds here, not in the root target dir.
+/target

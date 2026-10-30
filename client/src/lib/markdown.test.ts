@@ -253,3 +253,12 @@ test("a short name is a mention only where one person goes by it (R2-11)", () =>
   assert.equal(mentionsName(tree, "alice#5678"), true);
   assert.deepEqual(mentionNames(["ann#0002", "ann#0002"]), ["ann#0002", "ann"], "one person listed twice is one");
 });
+
+test("a server emote's token is its own node, outside code, and reads as :name:", () => {
+  const tok = `<:pog_2:${"a".repeat(20)}>`;
+  assert.deepEqual(parse(`hi ${tok}!`)[0], { t: "p", c: [{ t: "text", v: "hi " }, { t: "emote", name: "pog_2", hash: "a".repeat(20) }, { t: "text", v: "!" }] });
+  assert.deepEqual(parse(`**${tok}**`)[0], { t: "p", c: [{ t: "strong", c: [{ t: "emote", name: "pog_2", hash: "a".repeat(20) }] }] });
+  assert.deepEqual(parse(`\`${tok}\``)[0], { t: "p", c: [{ t: "code", v: tok }] }, "never in code");
+  assert.equal(plainText(`a ${tok} b`), "a :pog_2: b");
+  assert.deepEqual(parse(`<:Bad:${"a".repeat(20)}>`)[0], { t: "p", c: [{ t: "text", v: `<:Bad:${"a".repeat(20)}>` }] }, "not a token: text");
+});

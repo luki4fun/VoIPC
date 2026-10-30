@@ -302,6 +302,23 @@ pub enum ClientMessage {
     /// Give up an upload or a fetch of `hash`: its ticket is spent, and an
     /// upload slot passes to the next member waiting with the same file.
     FileCancel { hash: [u8; 32] },
+
+    // ── Emotes (protocol v14) ────────────────────────────────────────
+    // Admins only; the files go over HTTPS (`PUT`/`GET /e/v1/<hash>`).
+    /// Add `emote`, whose file is `len` bytes. Answered with `EmoteTicket`
+    /// (upload it), or at once with the new `EmoteList` when the relay holds
+    /// that file already (a rename), or with `EmoteError`.
+    EmoteAdd { emote: Emote, len: u32 },
+
+    /// Remove the emote or sticker of this name.
+    EmoteRemove { name: String },
+
+    /// Whether members may send stickers.
+    EmoteStickers { on: bool },
+
+    /// Call the emote or sticker `from` by the name `to`: the same file, in
+    /// the same place in the list.
+    EmoteRename { from: String, to: String },
 }
 
 /// The client's side of an account sign-in, between `Authenticate` and
@@ -654,6 +671,9 @@ pub enum ServerMessage {
         /// The relay keeps files (protocol v13); `None` when it does not.
         #[serde(default)]
         files: Option<FileLimits>,
+        /// The relay has emotes (protocol v14); `None` when it has none.
+        #[serde(default)]
+        emotes: Option<EmoteAccess>,
     },
 
     /// Authentication failed.
@@ -948,6 +968,21 @@ pub enum ServerMessage {
 
     /// Nobody online had the blob in time.
     FileUnavailable { hash: [u8; 32] },
+
+    // ── Emotes (protocol v14) ────────────────────────────────────────
+    /// The server's emotes and stickers, and whether stickers may be sent:
+    /// after the channel list on join, and again whenever an admin changes
+    /// them (a second or so later, so an import is one list, not hundreds).
+    EmoteList { stickers: bool, emotes: Vec<Emote> },
+
+    /// Upload the emote's file: one `PUT /e/v1/<hash>` with the whole file
+    /// and `Authorization: Bearer <ticket>`, within ten minutes. The list
+    /// follows.
+    EmoteTicket { hash: [u8; 32], ticket: String },
+
+    /// An emote change was refused, or its upload failed. `name` is the
+    /// emote's, empty for the sticker switch.
+    EmoteError { name: String, reason: String },
 }
 
 /// `FileRefused.code`, final for this hash: not in a conversation of the

@@ -2352,9 +2352,20 @@ check(
   await waitFor(ben, `${rowWith("the original")}?.querySelector(".file-card")`, 20_000).catch(() => {});
   await press(ben, "the original", "Load");
   await waitFor(ben, `${rowWith("the original")}?.querySelector(".file-card img")?.naturalWidth > 0`, 20_000).catch(() => {});
-  const got = await ben.evaluate(pixels(`${rowWith("the original")}?.querySelector(".file-card img")`));
-  check("the original goes as it is: its name, its size, its very pixels", sent !== null && got === sent &&
-    (await ben.evaluate(`${rowWith("the original")}?.querySelector(".file-name")?.textContent === "orig.jpg"`)), `${sent} vs ${got}`);
+  // Shown, it is the sanitizer's PNG of it (a decoder of its own, so not the
+  // sender's very pixels); saved, it is the file itself, byte for byte
+  const shownSize = await ben.evaluate(`(() => { const i = ${rowWith("the original")}?.querySelector(".file-card img"); return i ? i.naturalWidth + "x" + i.naturalHeight : null; })()`);
+  const origDir = mkdtempSync(join(tmpdir(), "voipc-ui-orig-"));
+  await ben.send("Page.setDownloadBehavior", { behavior: "allow", downloadPath: origDir });
+  const sentBytes = await ann.evaluate(`(async () => { const b = new Uint8Array(await window.__f.arrayBuffer()); let s = ""; for (const x of b) s += String.fromCharCode(x); return btoa(s); })()`);
+  await press(ben, "the original", "Download");
+  let savedOrig = null;
+  for (let i = 0; i < 60 && savedOrig === null; i++) {
+    await sleep(250);
+    if (readdirSync(origDir).includes("orig.jpg")) savedOrig = readFileSync(join(origDir, "orig.jpg")).toString("base64");
+  }
+  check("the original goes as it is: its name, its size, its very bytes", sent !== null && shownSize === sent.split(":")[0] && savedOrig === sentBytes &&
+    (await ben.evaluate(`${rowWith("the original")}?.querySelector(".file-name")?.textContent === "orig.jpg"`)), `${sent} shown ${shownSize}, saved ${savedOrig?.length ?? "nothing"} vs ${sentBytes?.length}`);
 
   // ── A text file: deflated, saved byte for byte ──
   const dir = mkdtempSync(join(tmpdir(), "voipc-ui-files-"));
@@ -2759,6 +2770,77 @@ check(
 
   for (const [who, fatal] of [["writer", annFatal], ["reader", benFatal], ["late joiner", fatalOf(cy)]]) {
     check(`the events lane's ${who} threw nothing`, fatal.length === 0, fatal.slice(0, 2).join(" | "));
+  }
+}
+
+// 22. Emotes (1.4, protocol 14). The rules — the token, names, the sanitizer,
+//     the relay's checks — are unit-tested (emote-rules, voipc-media,
+//     emotes.rs). What only a browser shows: an admin adds one through the
+//     importer, which shows only the sanitizer's PNG and turns away what is no
+//     picture; `:name:` goes out as its token; and the other member's page
+//     draws it from the PNG its own worker wrote. Before 14, 17 and 18.
+{
+  const n = (process.pid + 17) % 10000;
+  const ROOM = `emotes-${n}`;
+  const ann = await connect(`ui-ma-${n}`);
+  const ben = await connect(`ui-mb-${n}`);
+  await ann.evaluate(click('button[title="Create channel"]'));
+  await waitFor(ann, `document.querySelector(".create-form")`);
+  await ann.evaluate(setInput(".create-form input[type=text]", ROOM));
+  await ann.evaluate(click(".create-form .create-btn"));
+  await sleep(2000);
+  await ben.evaluate(`[...document.querySelectorAll(".channel")].find((e) => e.querySelector(".channel-name")?.textContent === ${JSON.stringify(ROOM)})
+    ?.dispatchEvent(new MouseEvent("dblclick", { bubbles: true }))`);
+  await waitFor(ben, `document.querySelector(".chat-main .input-bar .chat-input")`).catch(() => {});
+  const rowWith = (text) =>
+    `[...document.querySelectorAll(".chat-main .msg")].find((e) => e.querySelector(".msg-content")?.textContent.includes(${JSON.stringify(text)}))`;
+
+  await ann.evaluate(click('button.admin-btn[title^="Admin login"]'));
+  await waitFor(ann, `document.querySelector(".admin-dialog .admin-input")`);
+  await ann.evaluate(setInput('.admin-dialog input[type="password"]', "e2e-admin-token-0001"));
+  await ann.evaluate(click(".admin-dialog .admin-ok"));
+  const admin = await waitFor(ann, `document.querySelector(".admin-btn.active")`, 15_000).then(() => true, () => false);
+  check("the admin token makes this tab the server's admin", admin);
+  await ann.evaluate(click("button.admin-btn.active"));
+  await waitFor(ann, `[...document.querySelectorAll(".admin-tabs button")].some((b) => b.textContent === "Emotes")`, 5_000).catch(() => {});
+  await ann.evaluate(`[...document.querySelectorAll(".admin-tabs button")].find((b) => b.textContent === "Emotes")?.click()`);
+  await waitFor(ann, `document.querySelector(".em-pick input[type=file][accept]")`, 5_000).catch(() => {});
+  const name = `party_parrot_${n}`;
+  await ann.evaluate(`(async () => {
+    const c = document.createElement("canvas"); c.width = 64; c.height = 64;
+    const g = c.getContext("2d"); g.fillStyle = "#e33"; g.fillRect(0, 0, 64, 64);
+    const png = await new Promise((r) => c.toBlob(r, "image/png"));
+    const svg = new Blob(["<svg xmlns='http://www.w3.org/2000/svg' onload='window.__ran=1'/>"], { type: "image/png" });
+    const dt = new DataTransfer();
+    dt.items.add(new File([png], "Party Parrot ${n}.png", { type: "image/png" }));
+    dt.items.add(new File([svg], "evil.png", { type: "image/png" }));
+    const input = document.querySelector(".em-pick input[type=file][accept]");
+    input.files = dt.files; input.dispatchEvent(new Event("change", { bubbles: true })); })()`);
+  const readied = await waitFor(ann, `[...document.querySelectorAll(".em-add .em-row input.em-name")].some((i) => i.value === ${JSON.stringify(name)})
+    && [...document.querySelectorAll(".em-add .em-row img")].every((i) => i.src.startsWith("blob:") && i.naturalWidth > 0)`, 20_000).then(() => true, () => false);
+  check("an imported picture is named from its file and previewed as the sanitizer's PNG", readied);
+  check("a page claiming to be a picture is turned away, saying why, and never runs", await ann.evaluate(
+    `(() => { const r = [...document.querySelectorAll(".em-add .em-row")].find((e) => e.textContent.includes("evil.png")); return !!r && r.textContent.includes("SVG") && !window.__ran; })()`),
+    await ann.evaluate(`[...document.querySelectorAll(".em-add .em-row")].map((e) => e.textContent.trim()).join(" | ")`));
+  await ann.evaluate(`[...document.querySelectorAll(".em-actions .btn-primary")].find((b) => b.textContent.trim().startsWith("Add"))?.click()`);
+  const listed = await waitFor(ann, `[...document.querySelectorAll(".em > .em-list .em-name")].some((e) => e.textContent === ${JSON.stringify(`:${name}:`)})`, 20_000)
+    .then(() => true, () => false);
+  check("added, it is in the server's list", listed, await ann.evaluate(`(window.__toasts ?? []).slice(-3).join(" | ")`));
+  await ann.evaluate(`document.querySelector(".admin-dialog .admin-cancel")?.click()`);
+  await sleep(300);
+  await ann.evaluate(`(() => { const input = document.querySelector(".chat-main .input-bar .chat-input"); if (!input) return false;
+    input.value = ${JSON.stringify(`look :${name}:`)}; input.dispatchEvent(new Event("input", { bubbles: true }));
+    input.closest("form").requestSubmit(); return true; })()`);
+  const drawn = await waitFor(ben, `(() => { const i = ${rowWith("look")}?.querySelector("img.emote"); return !!i && i.src.startsWith("blob:") && i.naturalWidth > 0; })()`, 30_000)
+    .then(() => true, () => false);
+  check("the other member's page draws it, from the PNG its own worker wrote", drawn,
+    await ben.evaluate(`${rowWith("look")}?.querySelector(".msg-content")?.innerHTML.slice(0, 200) ?? "no row"`));
+  check("and the message reads as written, with no token in sight", await ben.evaluate(
+    `(() => { const t = ${rowWith("look")}?.querySelector(".msg-content")?.textContent ?? ""; return !t.includes("<:") && t.trim().startsWith("look"); })()`));
+
+  for (const [who, tab] of [["admin", ann], ["member", ben]]) {
+    const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));
+    check(`the emotes lane's ${who} threw nothing`, fatal.length === 0, fatal.slice(0, 2).join(" | "));
   }
 }
 

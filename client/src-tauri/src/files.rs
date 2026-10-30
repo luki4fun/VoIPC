@@ -53,7 +53,7 @@ use voipc_protocol::conv::{hex, unhex};
 use voipc_protocol::messages::{
     ClientMessage, ServerMessage, FILE_BUSY, FILE_EXPIRED, FILE_RATE, FILE_STALLED,
 };
-use voipc_protocol::types::{FileConv, FileLimits};
+use voipc_protocol::types::{Emote, EmoteAccess, FileConv, FileLimits};
 use voipc_protocol::ws;
 
 use crate::app_state::{conn, AppState};
@@ -181,6 +181,18 @@ pub struct Files {
     /// `TRANSFERS_AT_ONCE` places on `link`; closed with the connection.
     slots: tokio::sync::Semaphore,
     closed: AtomicBool,
+    /// `Authenticated.emotes`: `None` when the relay has none (emotes.rs).
+    pub(crate) emotes: Option<EmoteAccess>,
+    /// Emote adds waiting for the relay's answer: by name and file.
+    emote_waits: Mutex<Vec<EmoteWait>>,
+}
+
+/// An `EmoteAdd` waiting: a ticket to upload with, `None` when the relay had
+/// the file and listed it at once, or why not.
+pub(crate) struct EmoteWait {
+    pub name: String,
+    pub hash: [u8; 32],
+    pub done: tokio::sync::oneshot::Sender<Result<Option<String>, String>>,
 }
 
 /// A blob's turn: its transfer's answers, until it is dropped.
@@ -247,6 +259,8 @@ enum Got {
 }
 
 impl Files {
+    // A connection's parts, each its own: a struct for them would only rename them
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         emit: Emit,
         in_call: Box<dyn Fn() -> bool + Send + Sync>,
@@ -254,6 +268,7 @@ impl Files {
         port: u16,
         accept_invalid_certs: bool,
         limits: Option<FileLimits>,
+        emotes: Option<EmoteAccess>,
         tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
     ) -> Files {
         Files {
@@ -269,6 +284,87 @@ impl Files {
             freed: Notify::new(),
             slots: tokio::sync::Semaphore::new(TRANSFERS_AT_ONCE),
             closed: AtomicBool::new(false),
+            emotes,
+            emote_waits: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub(crate) fn send_msg(&self, msg: &ClientMessage) {
+        self.send(msg);
+    }
+
+    /// Wait for the relay's answer to an `EmoteAdd` about to be sent.
+    pub(crate) fn wait_emote(
+        &self,
+        name: &str,
+        hash: [u8; 32],
+    ) -> tokio::sync::oneshot::Receiver<Result<Option<String>, String>> {
+        let (done, rx) = tokio::sync::oneshot::channel();
+        lock(&self.emote_waits).push(EmoteWait {
+            name: name.to_owned(),
+            hash,
+            done,
+        });
+        rx
+    }
+
+    /// One request about an emote's file on the connection to `/e/`.
+    pub(crate) async fn emote_request(
+        &self,
+        method: &str,
+        hash: &[u8; 32],
+        token: &str,
+        body: &[u8],
+    ) -> Result<(u16, Vec<u8>), String> {
+        let reply = self
+            .request(method, &format!("/e/v1/{}", hex(hash)), token, None, body)
+            .await?;
+        Ok((reply.status, reply.body))
+    }
+
+    /// An emote message from the relay: the list goes to the page, and
+    /// answers to the adds waiting here.
+    fn on_emote_message(&self, msg: ServerMessage) {
+        let mut waits = lock(&self.emote_waits);
+        let mut answer =
+            |pick: &dyn Fn(&EmoteWait) -> bool, out: Result<Option<String>, String>| -> bool {
+                match waits.iter().position(pick) {
+                    Some(at) => {
+                        let _ = waits.remove(at).done.send(out);
+                        true
+                    }
+                    None => false,
+                }
+            };
+        match msg {
+            ServerMessage::EmoteList { stickers, emotes } => {
+                // An add the relay answered with the list: it had the file
+                for e in &emotes {
+                    answer(
+                        &|w: &EmoteWait| w.name == e.name && w.hash == e.hash,
+                        Ok(None),
+                    );
+                }
+                drop(waits);
+                let list: Vec<_> = emotes.iter().map(emote_json).collect();
+                (self.emit)(
+                    "emote-list",
+                    serde_json::json!({ "stickers": stickers, "emotes": list }),
+                );
+            }
+            ServerMessage::EmoteTicket { hash, ticket } => {
+                answer(&|w: &EmoteWait| w.hash == hash, Ok(Some(ticket)));
+            }
+            ServerMessage::EmoteError { name, reason }
+                if !answer(&|w: &EmoteWait| w.name == name, Err(reason.clone())) =>
+            {
+                drop(waits);
+                (self.emit)(
+                    "emote-error",
+                    serde_json::json!({ "name": name, "reason": reason }),
+                );
+            }
+            _ => {}
         }
     }
 
@@ -280,12 +376,21 @@ impl Files {
     pub fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
         lock(&self.waits).clear();
+        lock(&self.emote_waits).clear();
         self.freed.notify_waiters();
         self.slots.close();
     }
 
     /// A file message from the relay (`is_file_message`).
     pub fn on_message(&self, msg: ServerMessage) {
+        if matches!(
+            msg,
+            ServerMessage::EmoteList { .. }
+                | ServerMessage::EmoteTicket { .. }
+                | ServerMessage::EmoteError { .. }
+        ) {
+            return self.on_emote_message(msg);
+        }
         let hash = match &msg {
             ServerMessage::FileWanted { conv, hash } => {
                 if cached(hash) {
@@ -603,7 +708,15 @@ pub fn is_file_message(msg: &ServerMessage) -> bool {
             | ServerMessage::FileWanted { .. }
             | ServerMessage::FileSeeking { .. }
             | ServerMessage::FileUnavailable { .. }
+            | ServerMessage::EmoteList { .. }
+            | ServerMessage::EmoteTicket { .. }
+            | ServerMessage::EmoteError { .. }
     )
+}
+
+/// An emote as the page reads it: its hash in hex.
+fn emote_json(e: &Emote) -> serde_json::Value {
+    serde_json::json!({ "name": e.name, "hash": hex(&e.hash), "sticker": e.sticker, "pack": e.pack })
 }
 
 fn too_large(max: u64) -> String {
@@ -954,7 +1067,7 @@ fn stage_take(id: &str) -> Option<Vec<u8>> {
 
 /// A command's bytes: its raw body (desktop), or what was staged under the id
 /// in `x-voipc-staged` (Android).
-fn body_bytes(request: &tauri::ipc::Request<'_>, what: &str) -> Result<Vec<u8>, String> {
+pub(crate) fn body_bytes(request: &tauri::ipc::Request<'_>, what: &str) -> Result<Vec<u8>, String> {
     if let tauri::ipc::InvokeBody::Raw(bytes) = request.body() {
         return Ok(bytes.clone());
     }
@@ -1000,7 +1113,7 @@ async fn cancellable<T>(
 
 // ── Cache ────────────────────────────────────────────────────────────────
 
-fn cache_dir() -> PathBuf {
+pub(crate) fn cache_dir() -> PathBuf {
     crate::config::data_dir().join("files")
 }
 
@@ -1166,7 +1279,7 @@ async fn keep(state: &AppState, hash: [u8; 32], blob: Vec<u8>) {
 
 // ── Commands ─────────────────────────────────────────────────────────────
 
-async fn files_of(state: &AppState, server: &str) -> Result<Arc<Files>, String> {
+pub(crate) async fn files_of(state: &AppState, server: &str) -> Result<Arc<Files>, String> {
     let conns = state.connections.read().await;
     Ok(conn(&conns, server)?.files.clone())
 }
@@ -1253,6 +1366,36 @@ pub async fn fetch_file(
     file: FileArg,
     op: Option<String>,
 ) -> Result<tauri::ipc::Response, String> {
+    let plain = Box::pin(open_file(&state, &server, conv, file, op)).await?;
+    Ok(tauri::ipc::Response::new(plain))
+}
+
+/// A picture file, as the PNG it may be shown as (`media::sanitize`): the
+/// file's own bytes never reach the page this way, and a picture the
+/// sanitizer will not read is an error to show, never a fallback.
+#[tauri::command]
+pub async fn file_image(
+    state: State<'_, AppState>,
+    server: String,
+    conv: Conv,
+    file: FileArg,
+    profile: u32,
+    op: Option<String>,
+) -> Result<tauri::ipc::Response, String> {
+    let profile = voipc_media::Profile::from_u32(profile).ok_or("no such picture profile")?;
+    let plain = Box::pin(open_file(&state, &server, conv, file, op)).await?;
+    let clean = crate::media::sanitize(plain, profile, profile.max_output()).await?;
+    Ok(tauri::ipc::Response::new(clean.png))
+}
+
+/// `fetch_file`'s work: the copy kept here, opened, else the relay's.
+async fn open_file(
+    state: &State<'_, AppState>,
+    server: &str,
+    conv: Conv,
+    file: FileArg,
+    op: Option<String>,
+) -> Result<Vec<u8>, String> {
     let meta = FileMeta::from_parts(&file.hash, &file.key, file.size, file.z)
         .map_err(|e| e.to_string())?;
     let hash = meta.hash;
@@ -1261,15 +1404,15 @@ pub async fn fetch_file(
         .await?
         .map_err(|e| e.to_string())?
     {
-        return Ok(tauri::ipc::Response::new(plain));
+        return Ok(plain);
     }
-    let files = files_of(&state, &server).await?;
+    let files = files_of(state, server).await?;
     let op = op.as_deref();
     let blob = cancellable(op, Box::pin(files.fetch(conv.wire()?, hash, op))).await?;
     let (opened, blob) = blocking(move || (voipc_crypto::file::open(&meta, &blob), blob)).await?;
     let plain = opened.map_err(|e| e.to_string())?;
-    keep(&state, hash, blob).await;
-    Ok(tauri::ipc::Response::new(plain))
+    keep(state, hash, blob).await;
+    Ok(plain)
 }
 
 /// Post the file this device holds as `hash` in `conv` too (a forward): the
@@ -1416,8 +1559,27 @@ pub async fn save_file(request: tauri::ipc::Request<'_>) -> Result<Option<String
         tokio::fs::write(target.path(), bytes)
             .await
             .map_err(|e| format!("could not save the file: {e}"))?;
+        #[cfg(windows)]
+        if let Err(e) = tokio::fs::write(zone_stream(target.path()), ZONE_INTERNET).await {
+            // FAT and exFAT drives keep no alternate streams, nor the mark
+            debug!("no mark of the web on {}: {e}", target.path().display());
+        }
         Ok(Some(target.path().to_string_lossy().into_owned()))
     }
+}
+
+/// What a browser writes beside a download (Windows' Mark of the Web): from
+/// the internet, zone 3. SmartScreen and Office then warn before running or
+/// opening the file, as they would for any download.
+#[cfg_attr(not(windows), allow(dead_code))]
+const ZONE_INTERNET: &[u8] = b"[ZoneTransfer]\r\nZoneId=3\r\n";
+
+/// The NTFS stream the mark goes in: `<file>:Zone.Identifier`.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn zone_stream(path: &std::path::Path) -> std::ffi::OsString {
+    let mut stream = path.as_os_str().to_owned();
+    stream.push(":Zone.Identifier");
+    stream
 }
 
 /// What a save on Android left behind when the app went before the picker
@@ -1486,6 +1648,16 @@ pub async fn file_cache_retain(hashes: Vec<String>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_saved_file_is_marked_as_from_the_internet_in_its_own_stream() {
+        let p = std::path::Path::new(r"C:\Users\a\Downloads\setup.exe");
+        assert_eq!(
+            zone_stream(p),
+            r"C:\Users\a\Downloads\setup.exe:Zone.Identifier"
+        );
+        assert_eq!(ZONE_INTERNET, b"[ZoneTransfer]\r\nZoneId=3\r\n");
+    }
 
     /// D2-03: Android's bytes come staged in chunks, by id, at most
     /// `MAX_FILE_PLAIN` each and `MAX_STAGED` at once; taking them empties the
@@ -1729,13 +1901,16 @@ mod tests {
             .await
             .unwrap();
         let mut buf = bytes::BytesMut::new();
-        let (user_id, limits) = 'auth: loop {
+        let (user_id, limits, emotes) = 'auth: loop {
             control_recv.read_buf(&mut buf).await.unwrap();
             while let Some(payload) = try_decode_frame(&mut buf).unwrap() {
                 match decode_server_msg(&payload).unwrap() {
-                    ServerMessage::Authenticated { user_id, files, .. } => {
-                        break 'auth (user_id, files)
-                    }
+                    ServerMessage::Authenticated {
+                        user_id,
+                        files,
+                        emotes,
+                        ..
+                    } => break 'auth (user_id, files, emotes),
                     other => assert!(
                         !matches!(other, ServerMessage::AuthError { .. }),
                         "{other:?}"
@@ -1756,6 +1931,7 @@ mod tests {
             port,
             true,
             limits,
+            emotes,
             tcp_tx,
         ));
         let writer = tokio::spawn(async move {
@@ -1791,6 +1967,101 @@ mod tests {
             tasks: vec![writer, reader],
         };
         (guest, events)
+    }
+
+    /// Protocol 14 over the native carrier against a real relay: a guest the
+    /// admin token made admin adds an emote (`EmoteAdd`, its ticket, one PUT
+    /// on `/e/v1` over HTTP/1.1 behind the pinned certificate); the list comes
+    /// to another guest, who fetches the file with its own bearer, checks it
+    /// against its hash and sanitizes it as `emote_image` does.
+    /// `VOIPC_FILES_RELAY=127.0.0.1:29987 VOIPC_ADMIN_TOKEN=… cargo test -p
+    /// voipc-client --lib an_emote_crosses -- --ignored`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "needs a relay: VOIPC_FILES_RELAY=host:port and VOIPC_ADMIN_TOKEN"]
+    async fn an_emote_crosses_a_live_relay() {
+        use crate::emotes::sha256;
+        use voipc_protocol::types::Emote;
+        let (host, port) = live_relay();
+        let token = std::env::var("VOIPC_ADMIN_TOKEN").expect("VOIPC_ADMIN_TOKEN");
+        let n = rand::random::<u16>();
+        let (admin, _) = guest(&host, port, &format!("emote-admin-{n}")).await;
+        let (member, mut member_events) = guest(&host, port, &format!("emote-member-{n}")).await;
+        assert!(
+            member.files.emotes.is_some(),
+            "the relay has emotes, and said so"
+        );
+        // A real moving picture; the relay handles one session's messages in
+        // order, so the login is done before the add
+        let file: &[u8] = include_bytes!("../../../crates/voipc-media/tests/fixtures/anim3.webp");
+        let hash = sha256(file);
+        let name = format!("live_{n}");
+        admin.files.send_msg(&ClientMessage::AdminLogin { token });
+        let answer = admin.files.wait_emote(&name, hash);
+        admin.files.send_msg(&ClientMessage::EmoteAdd {
+            emote: Emote {
+                name: name.clone(),
+                hash,
+                sticker: false,
+                pack: String::new(),
+            },
+            len: file.len() as u32,
+        });
+        let ticket = tokio::time::timeout(Duration::from_secs(10), answer)
+            .await
+            .expect("an answer")
+            .unwrap()
+            .expect("added")
+            .expect("a ticket: the relay did not have the file");
+        let (status, body) = admin
+            .files
+            .emote_request("PUT", &hash, &ticket, file)
+            .await
+            .unwrap();
+        assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+
+        let listed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let (event, data) = member_events.recv().await.expect("events");
+                if event == "emote-list"
+                    && data["emotes"]
+                        .as_array()
+                        .is_some_and(|l| l.iter().any(|e| e["name"] == name.as_str()))
+                {
+                    return data;
+                }
+            }
+        })
+        .await
+        .expect("the new list reaches the member");
+        assert!(listed["emotes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["hash"] == hex(&hash).as_str()));
+
+        let bearer = member.files.emotes.as_ref().unwrap().token.0.clone();
+        let (status, body) = member
+            .files
+            .emote_request("GET", &hash, &bearer, &[])
+            .await
+            .unwrap();
+        assert_eq!((status, sha256(&body)), (200, hash));
+        let p = voipc_media::Profile::Emote;
+        let clean = crate::media::sanitize(body, p, p.max_output())
+            .await
+            .unwrap();
+        assert!(
+            clean.frames > 1 && clean.still.is_some(),
+            "a moving emote, and its first frame"
+        );
+
+        let (status, _) = member
+            .files
+            .emote_request("PUT", &hash, &bearer, file)
+            .await
+            .unwrap();
+        assert_eq!(status, 401, "a member's bearer uploads nothing");
+        admin.files.send_msg(&ClientMessage::EmoteRemove { name });
     }
 
     /// The whole path against a real relay: seal, `FileUpload`, chunked PUTs

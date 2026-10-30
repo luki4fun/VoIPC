@@ -1,6 +1,6 @@
-# What each party can do (1.3)
+# What each party can do (1.4)
 
-Who can do what to a VoIPC user, as of 1.3, and what in the code holds each
+Who can do what to a VoIPC user, as of 1.4, and what in the code holds each
 "cannot". Tests are named so they can be found with a search; `test-ui` checks
 run in the browser lanes of `test-web.sh`.
 
@@ -28,6 +28,22 @@ or with the next restart. The blob's exact size shows; it is not padded (readers
 accept padding inside the sealed body, so a later version can add it). A guest's
 side of a direct conversation is that guest's connection: another guest who takes
 the same name later is not in it, and is not asked for its files.
+
+What changed for 1.4: pictures, and emotes. **No picture somebody else made reaches
+the app's or the browser's own image decoder** (a crafted one there, as libwebp's
+CVE-2023-4863 was, would run code in the app). Every chat picture, emote and sticker
+is decoded by memory-safe Rust (`crates/voipc-media`: pure-Rust decoders that forbid
+`unsafe`, under fixed budgets), and only a PNG it wrote is shown; a picture it will not
+read is offered to save, never shown (`what_is_too_big_is_refused_before_anything_is_allocated_for_it`,
+`a_damaged_picture_is_refused_at_every_length_and_never_panics`, the `media` fuzz target,
+`image-sinks.test.ts`). Video and sound still play through the system's decoders, after
+a click, where the person allows it: on by default except in the Linux desktop app, whose
+web view runs outside any sandbox. Emotes are the server's own, kept readable on the
+relay like its channel names; the relay never decodes them, and an admin or a hostile
+relay can show members a picture, never make one run. A message binds the hash of the
+emote its sender saw, so an emote changed later shows as its name, not as another
+picture (`emote-rules.test.ts`). Every member's app fetches every emote, so fetches say
+nothing about who used which.
 
 The desktop keeps a one-time copy of a 1.0 history beside the new one
 (`chat_history.bin.v5`, under the same password), so that 1.0 can be gone back to.

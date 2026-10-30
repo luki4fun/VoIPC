@@ -24,7 +24,7 @@ Pick one:
 | Path | What |
 |---|---|
 | `/etc/voipc/server.toml` | the configuration |
-| `/var/lib/voipc/` | the working directory: `channels.json`, `server_settings.json`, `bans.json` (relays without accounts), `voipc.db` and its key file (relays with accounts), `files/` (the file cache, §11) |
+| `/var/lib/voipc/` | the working directory: `channels.json`, `server_settings.json`, `bans.json` (relays without accounts), `voipc.db` and its key file (relays with accounts), `files/` (the file cache, §11), `emotes/` (the server's emotes and stickers, §12) |
 
 Paths in `server.toml` that are not absolute are relative to the working directory. Give the
 certificate, the key and the database full paths, or start the relay in `/var/lib/voipc`, as
@@ -233,7 +233,7 @@ The simplest way is a host directory that user 65532 owns:
     install -d -o 65532 -g 65532 -m 0700 /srv/voipc
     install -o 65532 -g 65532 -m 0600 server.toml cert.pem key.pem /srv/voipc/
     docker run -d --name voipc -v /srv/voipc:/data \
-      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.3.1-rc.3
+      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.4.0-rc.1
     docker exec voipc /voipc-server --config /data/server.toml admin grant <name> admin
 
 With a named volume instead, copy the files in with a throwaway container first, then run the
@@ -303,4 +303,35 @@ dir = "files"              # relative to the working directory: /data/files in t
   their own and fetch the blob. That reveals nothing without the key, which only the messages
   carry, but it means the relay's check keeps out people who never had the message, not people
   who did.
+
+## 12. Emotes and stickers
+
+Since 1.4, a server's admins add emotes and stickers in the app (the admin panel's Emotes tab):
+pictures, a folder, a `.zip` or a WhatsApp `.wastickers`, or in the desktop app a Discord
+server's, a 7TV set or a Twitch channel's BetterTTV emotes. Members use them as `:name:`;
+stickers, off until an admin turns them on there, go as messages of their own.
+
+```toml
+[emotes]
+enabled = true             # false: no emotes, and the apps show none
+max_emote_kb = 256         # the largest emote file an admin may add (1 to 1024)
+max_sticker_kb = 512       # and sticker file (1 to 2048)
+max_total_mb = 32          # all of them together, held in memory (1 to 1024)
+dir = "emotes"             # kept across restarts; never [files] dir, nor inside or around it
+```
+
+- **Kept, and readable.** Unlike the file cache, emotes are the server's own, like its channel
+  names: the relay keeps each file as it came, under its hash, in `dir` (with `manifest.json`,
+  the list), across restarts, and serves it to members. The list does not say who added what.
+- **The relay never decodes them.** It checks each file's hash, its size and its first bytes (a
+  PNG, GIF, WebP or JPEG) and nothing more. Every member's app decodes the file itself, with
+  memory-safe code under fixed limits, and shows only a PNG it wrote: whatever an admin or a
+  relay sent, no picture reaches the app's or the browser's own decoder.
+- **What the relay learns:** nothing about who uses which. Every member's app fetches every
+  emote when the list comes, and `:name:` travels inside the end-to-end encrypted messages.
+- **Who may change them:** admins only (the token, or an account with the admin role).
+- **Memory and bandwidth:** all of `max_total_mb` is held in memory, and every member downloads
+  each emote once (the apps keep their copy).
+- **At start**, an entry whose file is missing or is not the file its hash names is dropped, and a
+  file no entry names is deleted. Nothing else in `dir` is touched.
 

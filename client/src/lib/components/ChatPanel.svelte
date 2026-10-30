@@ -23,6 +23,8 @@
   import { get } from "svelte/store";
   import { account, accountHex } from "../stores/account.js";
   import { users } from "../stores/users.js";
+  import { emoteSets } from "../stores/emotes.js";
+  import { stickerText, tokenize } from "../emote-rules.js";
   import { expiryFor, messageRefs, pinnedOf, rowKey, sameRow, splitChatKey, type ChatPlace } from "../chat-rules.js";
   import { threadView } from "../thread-rules.js";
   import type { ChatEvent, ChatMessage, FileConv, FileRef, Forwarded } from "../types.js";
@@ -561,6 +563,8 @@
     const { fwd, event, ttlCap } = more;
     const capped = (ttl: number) => (ttlCap === undefined ? ttl || null : Math.min(ttl || Infinity, ttlCap));
     const server = t.server;
+    // `:name:` of a server emote goes as its token (emote-rules.ts)
+    content = tokenize(content, get(emoteSets.peek(server)).emotes);
     try {
       // The destruction timer this conversation carries, stamped inside the
       // ciphertext so every copy of the message dies at the same moment: the
@@ -1058,6 +1062,7 @@
       conversation={`${$serverAddress}|dm|${$activeDmUserId}`}
       onsend={sendMessage}
       onsendfile={canSendFiles ? sendFileMessage : undefined}
+      onsticker={$emoteSets.stickers ? (e) => sendMessage(stickerText(e)) : undefined}
       replying={replyingTo?.username ?? null}
       oncancelreply={() => (replyingTo = null)}
     />
@@ -1074,6 +1079,7 @@
       {held}
       onsend={sendMessage}
       onsendfile={canSendFiles ? sendFileMessage : undefined}
+      onsticker={$emoteSets.stickers ? (e) => sendMessage(stickerText(e)) : undefined}
       replying={replyingTo?.username ?? null}
       oncancelreply={() => (replyingTo = null)}
     />

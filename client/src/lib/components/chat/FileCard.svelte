@@ -3,14 +3,18 @@
   // before that a picture shows as its 16×16 preview, drawn from the raw
   // pixels its message carries (no decoder runs on anything a peer sent).
   // Loaded, what it is comes from its own bytes (file-sniff.ts), never from
-  // what its message claims: a picture is drawn, a video or a sound gets its
-  // controls and never starts by itself, anything else is only saved.
+  // what its message claims: a picture is drawn, but only as the PNG the
+  // sanitizer wrote for it (media.ts); a video or a sound gets its controls
+  // and never starts by itself, where playing it here is allowed; anything
+  // else is only saved.
   import { onDestroy, tick, untrack } from "svelte";
   import type { FileConv, FileRef } from "../../types.js";
   import { FILE_UNAVAILABLE, cancelFile, fetchFile, fileProgress, forgetProgress, newOp, saveFile } from "../../files.js";
   import { formatSize, PREVIEW_SIDE } from "../../file-rules.js";
   import { preview } from "../../actions/preview.js";
   import { sniff, type Shown } from "../../file-sniff.js";
+  import { fileImage, pictureUrl, playableUrl, playsMedia } from "../../media.js";
+  import { uiPrefs } from "../../stores/ui-prefs.js";
   import Icon from "../Icons.svelte";
 
   interface Props {
@@ -46,6 +50,9 @@
   let bytes = $state.raw<Uint8Array | null>(null);
   let shown = $state.raw<Shown | null>(null);
   let url = $state<string | null>(null);
+  /** Why what was loaded is not shown here, when it is a picture or a video
+   *  that is not. */
+  let withheld = $state<string | null>(null);
 
   const progress = $derived(op ? $fileProgress.get(op) : undefined);
   const seeking = $derived(progress?.stage === "seeking");
@@ -78,6 +85,7 @@
       url = null;
       bytes = null;
       shown = null;
+      withheld = null;
     });
   });
 
@@ -93,13 +101,28 @@
     try {
       // No conversation to name: only this device's copy can open it (channel
       // 0 is never one, so the relay refuses anything further)
-      const got = await fetchFile(server, conv ?? { channel: 0 }, file, mine);
+      const at = conv ?? { channel: 0 };
+      const got = await fetchFile(server, at, file, mine);
       if (destroyed || wanted !== loadedFor) return null;
-      bytes = got;
       if (draw) {
-        shown = sniff(got);
-        if (shown) url = URL.createObjectURL(new Blob([got as Uint8Array<ArrayBuffer>], { type: shown.mime }));
+        const is = sniff(got);
+        if (is?.kind === "image") {
+          try {
+            const png = await fileImage(server, at, file, mine);
+            if (destroyed || wanted !== loadedFor) return null;
+            url = pictureUrl(png);
+            shown = is;
+          } catch (e) {
+            withheld = `${String(e).replace(/^Error: /, "")}.`;
+          }
+        } else if (is && !playsMedia($uiPrefs)) {
+          withheld = "Videos and sounds play here once Settings → Files allows it.";
+        } else if (is) {
+          url = playableUrl(got, is.mime);
+          shown = is;
+        }
       }
+      bytes = got;
       return got;
     } catch (e) {
       const why = String(e);
@@ -180,7 +203,9 @@
     {/if}
   </div>
   {#if bytes && !shown}
-    <p class="file-note">This file is not shown here. Download it to open it with an app you trust.</p>
+    <p class="file-note">
+      {withheld ?? "This file is not shown here."} Download it to open it with an app you trust.
+    </p>
   {/if}
   {#if error && !(media && !bytes)}
     <p class="file-error" role="alert">{error}</p>

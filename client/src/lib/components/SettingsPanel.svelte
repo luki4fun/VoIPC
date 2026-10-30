@@ -64,6 +64,7 @@
   import Icon from "./Icons.svelte";
   import PaletteEditor from "./PaletteEditor.svelte";
   import FileManager from "./FileManager.svelte";
+  import { LINUX_APP, playsMedia } from "../media.js";
   import { settingsAsk } from "../stores/channel-ui.js";
   import { get } from "svelte/store";
   import LayoutPreview from "./LayoutPreview.svelte";
@@ -1211,6 +1212,21 @@
     {/if}
 
     {#if activeTab === "files"}
+      <div class="section">
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={playsMedia($uiPrefs)}
+            onchange={(e) => updateUiPrefs((p) => (p.play_media = (e.target as HTMLInputElement).checked))}
+          />
+          <span class="toggle-label">Play videos and sounds in VoIPC</span>
+          <span class="toggle-hint">
+            Through this system's own video and sound decoders, after you press Load.
+            {#if LINUX_APP}Off by default here: on Linux they run outside any sandbox.{/if}
+            Pictures are always made safe before they are shown.
+          </span>
+        </label>
+      </div>
       <FileManager {onclose} />
     {/if}
 
@@ -1264,6 +1280,25 @@
             Replies sent into a thread go there either way.
           </span>
         </label>
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={$uiPrefs.show_stickers}
+            onchange={(e) => updateUiPrefs((p) => (p.show_stickers = (e.target as HTMLInputElement).checked))}
+          />
+          <span class="toggle-label">Show stickers</span>
+          <span class="toggle-hint">Off, a sticker someone sends shows as its name.</span>
+        </label>
+        <h4>Moving emotes and stickers</h4>
+        <select
+          value={$uiPrefs.animate_emotes}
+          aria-label="Moving emotes and stickers"
+          onchange={(e) => updateUiPrefs((p) => (p.animate_emotes = (e.target as HTMLSelectElement).value as "always" | "hover" | "never"))}
+        >
+          <option value="always">Always move</option>
+          <option value="hover">Move under the pointer</option>
+          <option value="never">Never move</option>
+        </select>
         <label class="slider-row">
           <span>Chat text size: {$uiPrefs.chat_font_size}px</span>
           <input

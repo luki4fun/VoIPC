@@ -84,6 +84,74 @@ pub struct FileLimits {
     pub max_bytes: u64,
 }
 
+/// An emote or sticker of the server (protocol v14). Admins add them; every
+/// member gets the list and fetches each file by its hash. They are the
+/// server's own, like its channel names: the relay holds the files as they
+/// came, readable, and never decodes them. Members' clients show only what
+/// their own sanitizer writes from one (crates/voipc-media).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Emote {
+    /// `:name:` in a message: `^[a-z0-9_]{2,30}$`, one per server.
+    pub name: String,
+    /// SHA-256 of the file.
+    pub hash: [u8; 32],
+    /// A sticker, sent as a message of its own; else an emote, inline.
+    pub sticker: bool,
+    /// What the picker groups it under; empty for none. A label an admin
+    /// chose, at most `EMOTE_PACK_MAX` characters.
+    pub pack: String,
+}
+
+/// The longest emote name: `:name:` fits a reaction (`MAX_EMOJI_BYTES`, 32).
+pub const EMOTE_NAME_MAX: usize = 30;
+/// The longest pack label: this many characters, and twice as many bytes.
+pub const EMOTE_PACK_MAX: usize = 32;
+/// The most emotes and stickers a server has: the list goes in one message,
+/// at most about 130 bytes each, under `MAX_MSG_SIZE` (golden.rs checks it).
+pub const MAX_EMOTES: usize = 400;
+
+/// What an emote may be called, on the relay and in every client.
+pub fn valid_emote_name(s: &str) -> bool {
+    (2..=EMOTE_NAME_MAX).contains(&s.len())
+        && s.bytes()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
+}
+
+/// A pack label a person may see: one line, no control, invisible or
+/// direction characters, at most `EMOTE_PACK_MAX` characters.
+pub fn valid_emote_pack(s: &str) -> bool {
+    s.chars().count() <= EMOTE_PACK_MAX
+        && s.len() <= 2 * EMOTE_PACK_MAX
+        && s.trim() == s
+        && !s.chars().any(|c| {
+            c.is_control()
+                || matches!(c, '\u{200B}'..='\u{200F}' | '\u{061C}' | '\u{202A}'..='\u{202E}' | '\u{2060}'..='\u{2069}' | '\u{FEFF}')
+        })
+}
+
+/// A secret that must never reach a log: `Debug` prints only that it is one.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(…)")
+    }
+}
+
+/// What a relay with emotes tells every client in `Authenticated` (protocol
+/// v14). `None` there means it has none.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EmoteAccess {
+    /// `Authorization: Bearer <token>` for `GET /e/v1/<hash>`: this
+    /// connection's, and good while it lasts.
+    pub token: Secret,
+    /// The largest emote and sticker file an admin may add, in bytes.
+    pub max_emote_bytes: u32,
+    pub max_sticker_bytes: u32,
+}
+
 /// The conversation a file was posted in (protocol v13), named as the client
 /// sending the message sees it. The relay checks every upload and fetch
 /// against it, and asks that conversation's members when a blob has gone.

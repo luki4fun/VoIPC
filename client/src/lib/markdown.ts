@@ -12,6 +12,7 @@
 
 import { Marked, type Token, type Tokens, type TokenizerExtension } from "marked";
 import { shortName } from "./username.ts";
+import { EMOTE_TOKEN } from "./emote-rules.ts";
 
 export type Inline =
   | { t: "text"; v: string }
@@ -19,7 +20,9 @@ export type Inline =
   | { t: "code"; v: string }
   | { t: "link"; href: string; c: Inline[] }
   | { t: "br" }
-  | { t: "mention"; name: string };
+  | { t: "mention"; name: string }
+  // A server emote's token (emote-rules.ts): drawn only while its hash is listed
+  | { t: "emote"; name: string; hash: string };
 
 export type Block =
   | { t: "p"; c: Inline[] }
@@ -107,7 +110,7 @@ function plain(text: string, names: string[]): Block[] {
   const c: Inline[] = [];
   text.split("\n").forEach((line, i) => {
     if (i > 0) c.push({ t: "br" });
-    c.push(...mentions(line, names));
+    c.push(...words(line, names));
   });
   return [{ t: "p", c: merge(c) }];
 }
@@ -157,7 +160,7 @@ function blocks(tokens: Token[], names: string[], depth: number): Block[] {
       }
       case "blockquote":
       case "list":
-        if (depth >= MAX_BLOCK_DEPTH) out.push({ t: "p", c: mentions(flat(tok), names) });
+        if (depth >= MAX_BLOCK_DEPTH) out.push({ t: "p", c: words(flat(tok), names) });
         else if (tok.type === "blockquote") out.push({ t: "quote", c: blocks((tok as Tokens.Blockquote).tokens, names, depth + 1) });
         else {
           const l = tok as Tokens.List;
@@ -175,12 +178,12 @@ function blocks(tokens: Token[], names: string[], depth: number): Block[] {
       // A tight list item's text, which holds inline tokens of its own
       case "text": {
         const tt = tok as Tokens.Text;
-        out.push({ t: "p", c: tt.tokens ? inlines(tt.tokens, names, depth) : mentions(tt.text, names) });
+        out.push({ t: "p", c: tt.tokens ? inlines(tt.tokens, names, depth) : words(tt.text, names) });
         break;
       }
       // Raw HTML, and anything this version does not know: the text as typed
       default:
-        out.push({ t: "p", c: mentions(tok.raw.replace(/\n+$/, ""), names) });
+        out.push({ t: "p", c: words(tok.raw.replace(/\n+$/, ""), names) });
     }
   }
   return out;
@@ -194,7 +197,7 @@ function inlines(tokens: Token[] | undefined, names: string[], depth: number): I
       case "escape": {
         const tt = tok as Tokens.Text;
         if (tt.tokens) out.push(...inlines(tt.tokens, names, depth));
-        else out.push(...mentions(tt.text, names));
+        else out.push(...words(tt.text, names));
         break;
       }
       case "strong":
@@ -202,7 +205,7 @@ function inlines(tokens: Token[] | undefined, names: string[], depth: number): I
       case "del":
       case "spoiler":
       case "link":
-        if (depth >= MAX_DEPTH) out.push(...mentions(flat(tok), names));
+        if (depth >= MAX_DEPTH) out.push(...words(flat(tok), names));
         else if (tok.type === "link") {
           const l = tok as Tokens.Link;
           out.push({ t: "link", href: l.href, c: inlines(l.tokens, names, depth + 1) });
@@ -226,6 +229,20 @@ function inlines(tokens: Token[] | undefined, names: string[], depth: number): I
     }
   }
   return merge(out);
+}
+
+/** A text with its emote tokens cut out, and the rest as `mentions` reads it. */
+function words(text: string, names: string[]): Inline[] {
+  if (!text.includes("<:")) return mentions(text, names);
+  const out: Inline[] = [];
+  let from = 0;
+  for (const m of text.matchAll(EMOTE_TOKEN)) {
+    if (m.index > from) out.push(...mentions(text.slice(from, m.index), names));
+    out.push({ t: "emote", name: m[1], hash: m[2] });
+    from = m.index + m[0].length;
+  }
+  if (from < text.length) out.push(...mentions(text.slice(from), names));
+  return out;
 }
 
 /** A text with `@name` for any of `names` cut out as mentions. */
@@ -328,6 +345,8 @@ export function plainText(text: string): string {
             return " ";
           case "mention":
             return `@${n.name}`;
+          case "emote":
+            return `:${n.name}:`;
           case "spoiler":
             return "▒▒▒";
           case "link":

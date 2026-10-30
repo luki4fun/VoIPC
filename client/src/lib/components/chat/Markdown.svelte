@@ -3,6 +3,8 @@
   import { shortName } from "../../username.js";
   import CodeBlock from "./CodeBlock.svelte";
   import Spoiler from "./Spoiler.svelte";
+  import Emote from "./Emote.svelte";
+  import { onlyEmotes } from "../../emote-rules.js";
 
   // A message's text, drawn from lib/markdown.ts's tree: elements of our own
   // and text nodes, never the sender's HTML.
@@ -22,6 +24,7 @@
   const tabindex = $derived(tabbable ? undefined : -1);
 
   const tree = $derived(parse(text, { names }));
+  const jumbo = $derived(onlyEmotes(text));
   const isMe = (name: string) => me.some((m) => m.toLowerCase() === name.toLowerCase());
 
   // What a message that could not be drawn shows instead: its words
@@ -34,7 +37,7 @@
   }
 </script>
 
-{#snippet inline(nodes: Inline[])}{#each nodes as n}{#if n.t === "text"}{n.v}{:else if n.t === "strong"}<strong>{@render inline(n.c)}</strong>{:else if n.t === "em"}<em>{@render inline(n.c)}</em>{:else if n.t === "del"}<del>{@render inline(n.c)}</del>{:else if n.t === "code"}<code class="md-code">{n.v}</code>{:else if n.t === "spoiler"}<Spoiler {tabbable}>{@render inline(n.c)}</Spoiler>{:else if n.t === "link"}<button class="msg-link" type="button" {tabindex} onclick={() => onlink(n.href)} title={shownHref(n.href)}>{@render inline(n.c)}</button>{:else if n.t === "br"}<br />{:else if n.t === "mention"}<span class="mention" class:me={isMe(n.name)}>@{shortName(n.name)}</span>{/if}{/each}{/snippet}
+{#snippet inline(nodes: Inline[])}{#each nodes as n}{#if n.t === "text"}{n.v}{:else if n.t === "strong"}<strong>{@render inline(n.c)}</strong>{:else if n.t === "em"}<em>{@render inline(n.c)}</em>{:else if n.t === "del"}<del>{@render inline(n.c)}</del>{:else if n.t === "code"}<code class="md-code">{n.v}</code>{:else if n.t === "spoiler"}<Spoiler {tabbable}>{@render inline(n.c)}</Spoiler>{:else if n.t === "link"}<button class="msg-link" type="button" {tabindex} onclick={() => onlink(n.href)} title={shownHref(n.href)}>{@render inline(n.c)}</button>{:else if n.t === "br"}<br />{:else if n.t === "mention"}<span class="mention" class:me={isMe(n.name)}>@{shortName(n.name)}</span>{:else if n.t === "emote"}<Emote name={n.name} hash={n.hash} size={jumbo ? "jumbo" : "inline"} />{/if}{/each}{/snippet}
 
 {#snippet blocks(list: Block[])}
   {#each list as b}

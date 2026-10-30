@@ -15,7 +15,8 @@ import { users } from "./stores/users";
 import { scoped } from "./stores/scoped";
 import { isAndroidApp, isWeb } from "./stores/platform";
 import { addNotification } from "./stores/notifications";
-import { saveName } from "./file-rules";
+import { runsCode, saveName } from "./file-rules";
+import { confirmAction } from "./stores/confirm";
 
 /** What each relay takes (`Authenticated.files`), from `file-limits`; null
  *  for one that keeps no files, where the composer offers none. */
@@ -64,7 +65,7 @@ export function newOp(): string {
 }
 
 /** JSON with everything past ASCII escaped: a header carries ASCII only. */
-function asciiJson(v: unknown): string {
+export function asciiJson(v: unknown): string {
   return JSON.stringify(v).replace(/[\u007f-￿]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
 }
 
@@ -94,6 +95,13 @@ async function stage(bytes: Uint8Array, id: string): Promise<Record<string, stri
 
 function stageId(): string {
   return `s${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** `bytes` for a command that takes them as its body (`body_bytes` in
+ *  files.rs): as the body, or on Android staged first and named in a header. */
+export async function invokeWithBytes<T>(cmd: string, bytes: Uint8Array, headers: Record<string, string>): Promise<T> {
+  if (!isAndroidApp) return invoke<T>(cmd, bytes, { headers });
+  return invoke<T>(cmd, {}, { headers: { ...headers, ...(await stage(bytes, stageId())) } });
 }
 
 /** Loads under way, by server and file (`loadKey`): two messages with one
@@ -127,6 +135,17 @@ export function cancelFile(op: string): Promise<void> {
  */
 export async function saveFile(bytes: Uint8Array, name: string, mime = "application/octet-stream"): Promise<void> {
   const as = saveName(name);
+  if (runsCode(as)) {
+    const ok = await confirmAction({
+      title: "Save a program?",
+      body:
+        `"${as}" is a kind of file your system can run. Opened, it can do anything you can on this ` +
+        "device. Save it only if you trust whoever sent it, and know what it is.",
+      confirm: "Save anyway",
+      danger: true,
+    });
+    if (!ok) return;
+  }
   if (isWeb) {
     const url = URL.createObjectURL(new Blob([bytes as Uint8Array<ArrayBuffer>], { type: "application/octet-stream" }));
     const a = document.createElement("a");

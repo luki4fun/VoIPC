@@ -16,8 +16,11 @@
     unban,
   } from "../stores/admin-ui.js";
   import { relayAccounts } from "../stores/account.js";
+  import { emoteLimits } from "../stores/emotes.js";
+  import EmoteManager from "./EmoteManager.svelte";
   import type { BanInfo } from "../types.js";
 
+  let tab = $state<"bans" | "emotes">("bans");
   let accountBans = $derived($bans.filter((b) => b.account));
   let addressBans = $derived($bans.filter((b) => !b.account));
   // Banning an account that is not here (admins only, as the list is)
@@ -68,9 +71,19 @@
   <div class="admin-overlay" role="presentation" onclick={backdrop(() => showAdminPanel.set(false))}>
     <div
       class="admin-dialog"
-      aria-label="Active bans"
+      class:wide={tab === "emotes"}
+      aria-label={tab === "emotes" ? "Emotes and stickers" : "Active bans"}
       use:dialog={{ onclose: () => showAdminPanel.set(false) }}
     >
+      {#if $emoteLimits}
+        <div class="admin-tabs" role="tablist" aria-label="Admin">
+          <button type="button" role="tab" aria-selected={tab === "bans"} class:active={tab === "bans"} onclick={() => (tab = "bans")}>Bans</button>
+          <button type="button" role="tab" aria-selected={tab === "emotes"} class:active={tab === "emotes"} onclick={() => (tab = "emotes")}>Emotes</button>
+        </div>
+      {/if}
+      {#if tab === "emotes" && $emoteLimits}
+        <EmoteManager />
+      {:else}
       <div class="admin-title">Active bans</div>
       {#if $relayAccounts}
         <form class="ban-add" onsubmit={(e) => { e.preventDefault(); submitBan(); }}>
@@ -100,6 +113,7 @@
             {#each addressBans as ban (ban.id)}{@render banRow(ban)}{/each}
           </ul>
         {/if}
+      {/if}
       {/if}
       <div class="admin-actions">
         <button type="button" class="admin-cancel" onclick={() => showAdminPanel.set(false)}>Close</button>
@@ -133,6 +147,29 @@
     /* The window can be 640×480: the dialog scrolls, its buttons stay reachable */
     max-height: calc(100dvh - 32px);
     overflow-y: auto;
+  }
+
+  .admin-dialog.wide {
+    width: min(640px, 92vw);
+  }
+
+  .admin-tabs {
+    display: flex;
+    gap: 4px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .admin-tabs button {
+    padding: 6px 12px;
+    background: transparent;
+    border: none;
+    border-bottom: 2px solid transparent;
+    color: var(--text-secondary);
+  }
+
+  .admin-tabs button.active {
+    color: var(--text-primary);
+    border-bottom-color: var(--text-primary);
   }
 
   .admin-title {

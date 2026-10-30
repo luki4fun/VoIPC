@@ -13,6 +13,7 @@ import {
   previewPixels,
   referencedHashes,
   refersTo,
+  runsCode,
   saveName,
   withExtension,
 } from "./file-rules.ts";
@@ -134,5 +135,14 @@ test("a download whose tickets bring bytes never runs out of asks (R3-05)", () =
   for (let i = 0; i < 100; i++) {
     assert.equal(moving.next(), true);
     moving.moved();
+  }
+});
+
+test("a file a system can run is known by its extension, whatever its case", () => {
+  for (const name of ["setup.exe", "RUN.BAT", "x.ps1", "game.AppImage", "evil.desktop", "a.tar.lnk", "app.apk "]) {
+    assert.equal(runsCode(name), true, name);
+  }
+  for (const name of ["photo.jpg", "notes.txt", "exe", "archive.zip", "song.mp3", "README", ".bashrc.txt"]) {
+    assert.equal(runsCode(name), false, name);
   }
 });

@@ -2,7 +2,64 @@
 
 All notable changes to VoIPC are documented here.
 
-## [1.3.1] - release candidate
+## [1.4.0] - release candidate
+
+**Protocol 14: update relays and apps together.** A 1.4.0 app does not connect
+to a 1.3 relay, and a 1.3 app does not connect to a 1.4.0 relay. Relays first:
+update the server, then the apps.
+
+### Emotes and stickers
+
+- **A server's own emotes.** Its admins add them in the admin panel's new
+  Emotes tab, and everyone there writes them as `:name:`: a list of matches
+  comes up as you type, the emoji picker has a tab for them, and a message of
+  emotes alone shows them big. They work as reactions too.
+- **Stickers**, off on each server until an admin turns them on: a picture sent
+  as a message of its own, from the picker's Stickers tab. Settings →
+  Appearance can hide them, and stop moving emotes and stickers moving (always,
+  under the pointer, or never; a system that asks for reduced motion gets
+  never).
+- **Adding them takes one drop.** Pictures, a folder, a `.zip` or a WhatsApp
+  `.wastickers`: each is named after its file, made to fit, and shown before it
+  goes, with anything that cannot be used set aside and why (a Telegram
+  animated sticker, a video, a file that only claims to be a picture). The
+  desktop app also fetches a 7TV emote set, a Twitch channel's BetterTTV emotes,
+  or a Discord server's emojis or stickers (with a bot of yours in it; the token
+  is used once and kept nowhere).
+- **Messages keep the emote they were sent with.** If an admin later puts
+  another picture under the name, older messages show the name, not the new
+  picture. Renaming keeps them.
+- **For relays:** `[emotes]` is a new section, on by default, empty until an
+  admin adds some; they are kept in `emotes/` across restarts, readable, and the
+  relay never decodes them. `docs/OPERATING.md` §12 has every key.
+
+### Pictures are made safe before they are shown
+
+- **No picture somebody else made reaches your app's own image decoder any
+  more.** Chat pictures, emotes and stickers are decoded by VoIPC's own
+  memory-safe code under fixed limits and shown as a fresh copy it wrote, which
+  carries nothing of the file but its pixels. A crafted picture (the kind that
+  has broken browsers before) can at worst fail to show. *Download* still saves
+  the file exactly as it came. A phone photo is shown the right way up.
+- **AVIF pictures are saved, not shown.**
+- **Videos and sounds** still play through your system's decoders, after a
+  click. A new switch in Settings → Files turns that off; it starts off in the
+  Linux desktop app, whose window runs outside any sandbox.
+- **Saving a program asks first** (an `.exe`, a script, an installer, an
+  `.apk`…), and on Windows a saved file is marked as downloaded, so Windows warns
+  before running it.
+
+### Files
+
+- **Settings → Files** finds files by name, sender, the words with them or
+  where they were posted; filters by kind with one click; sorts by recently
+  used; shows each file on one line with its preview; saves straight from the
+  list; and removes several copies at once.
+- **A Files button** in a conversation's header opens that list for just that
+  conversation.
+- **Files in thread replies.** The composer of a thread takes attachments too.
+
+## [1.3.1] - 2026-10-30
 
 **Protocol 13: update relays and apps together.** A 1.3.1 app does not connect
 to a 1.0 relay, and a 1.0 app does not connect to a 1.3.1 relay. 1.3.1 is the

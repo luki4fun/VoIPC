@@ -30,6 +30,7 @@
 // Pure, so chat-rules.test.ts can load it under Node's own test runner —
 // stores/chat.ts, which owns the state and reaches the backend, cannot.
 
+import { isEmoteReaction } from "./emote-rules.ts";
 import type { ChatEvent, ChatMessage, FileRef, Forwarded, Reaction, Reactor } from "./types.ts";
 import { authorKey, findTarget } from "./thread-rules.ts";
 import { plainText } from "./markdown.ts";
@@ -649,6 +650,11 @@ const EMOJI = /[\p{Extended_Pictographic}\p{Regional_Indicator}⃣]/u;
 const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
 
 /** One emoji: a single grapheme, at most `MAX_EMOJI_BYTES`, nothing invisible. */
+/** What a reaction may be: one emoji, or a server emote's `:name:`. */
+export function isReaction(v: unknown): v is string {
+  return isOneEmoji(v) || (typeof v === "string" && isEmoteReaction(v));
+}
+
 export function isOneEmoji(v: unknown): v is string {
   if (typeof v !== "string" || v === "" || INVISIBLE.test(v) || !EMOJI.test(v)) return false;
   if (new TextEncoder().encode(v).length > MAX_EMOJI_BYTES) return false;
@@ -667,7 +673,7 @@ export function chatEvent(v: unknown): ChatEvent | undefined {
     case "delete":
       return { kind: e.kind, target };
     case "react":
-      return typeof e.on === "boolean" && isOneEmoji(e.emoji) ? { kind: "react", target, emoji: e.emoji, on: e.on } : undefined;
+      return typeof e.on === "boolean" && isReaction(e.emoji) ? { kind: "react", target, emoji: e.emoji, on: e.on } : undefined;
     case "pin":
       return typeof e.on === "boolean" ? { kind: "pin", target, on: e.on } : undefined;
   }
@@ -862,7 +868,7 @@ function eventState(more: Record<string, unknown>, timestamp: number): Pick<Chat
   if (Array.isArray(more.reactions)) {
     const reactions: Reaction[] = [];
     for (const r of more.reactions.slice(0, MAX_REACTION_ENTRIES)) {
-      if (!isOneEmoji(r?.emoji) || !Array.isArray(r.by) || reactions.some((x) => x.emoji === r.emoji)) continue;
+      if (!isReaction(r?.emoji) || !Array.isArray(r.by) || reactions.some((x) => x.emoji === r.emoji)) continue;
       const by: Reactor[] = [];
       for (const b of r.by.slice(0, MAX_REACTORS)) {
         if (typeof b?.key !== "string" || b.key.length > 200 || typeof b.name !== "string" || typeof b.on !== "boolean" || !moment(b.at)) continue;
