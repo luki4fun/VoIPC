@@ -70,7 +70,7 @@ VoIPC answers with a `state` message:
 ```json
 {"type":"state","state":"ingame","user_id":42,"username":"Luki#0420",
  "channel":"Ingame","proximity":"3d","muted":false,"deafened":false,
- "version":"1.4.0","sdk":1,
+ "version":"1.5.0","sdk":1,
  "capabilities":["spatial","direct","volume","muffle","talk","reverb","underwater",
                  "layers","pan","delay","beacon","transmit",
                  "phone","radio","cb","walkie","aviation","police","landline",
