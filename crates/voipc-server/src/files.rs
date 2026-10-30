@@ -359,6 +359,7 @@ struct Limits {
     max_total: u64,
     up_per_hour: f64,
     down_per_hour: f64,
+    animation: (u32, u32),
 }
 
 struct Blob {
@@ -654,6 +655,7 @@ impl FileStore {
                 max_total: config.max_total_mb as u64 * MIB,
                 up_per_hour: (config.upload_mb_per_hour as u64 * MIB) as f64,
                 down_per_hour: (config.download_mb_per_hour as u64 * MIB) as f64,
+                animation: (config.animation_side, config.animation_mb),
             },
             inner: Mutex::new(Inner::default()),
             in_flight: Arc::new(Semaphore::new(GET_BYTES_IN_FLIGHT / KIB)),
@@ -664,6 +666,8 @@ impl FileStore {
     pub fn limits(&self) -> FileLimits {
         FileLimits {
             max_bytes: self.limits.max_bytes,
+            animation_side: self.limits.animation.0,
+            animation_mb: self.limits.animation.1,
         }
     }
 
@@ -2075,9 +2079,10 @@ fn at_offset(mut reply: Reply, n: u64) -> Reply {
     reply
 }
 
-/// Whether a request belongs here rather than to the tunnel or the page.
+/// Whether a request belongs here rather than to the tunnel or the page:
+/// files, and the server's emotes (emotes.rs), on the same carriers.
 pub(crate) fn is_file_path(target: &str) -> bool {
-    target.starts_with("/f/")
+    target.starts_with("/f/") || target.starts_with("/e/")
 }
 
 /// A `/f/` request after its head, before its body.
@@ -2088,6 +2093,9 @@ pub(crate) enum Prepared {
     Put(Claim),
     /// A download: `finish_get`, no body.
     Get { hash: [u8; 32], ticket: String },
+    /// An emote's file to upload: read at most `len` bytes, then
+    /// `emotes::finish_put`.
+    EmotePut(crate::emotes::Upload),
 }
 
 /// Everything a `/f/` request can be refused for without its body: the
@@ -2101,6 +2109,9 @@ pub(crate) fn prepare(
     target: &str,
     authorization: Option<&str>,
 ) -> Prepared {
+    if target.starts_with("/e/") {
+        return crate::emotes::prepare(state, method, target, authorization);
+    }
     let Some(store) = state.files.as_ref() else {
         return Prepared::Reply(text(404, NO_FILES.1));
     };
@@ -2244,6 +2255,10 @@ pub(crate) async fn http(
         }
         Prepared::Put(claim) => finish_put(state, claim, body).await,
         Prepared::Get { hash, ticket } => finish_get(state, ip, hash, &ticket, range).await,
+        Prepared::EmotePut(upload) if body.len() != upload.len => {
+            text(400, "the file is not the size it was said to be")
+        }
+        Prepared::EmotePut(upload) => crate::emotes::finish_put(state, upload, body).await,
     }
 }
 
@@ -2389,6 +2404,24 @@ async fn serve_requests<S>(
                     return;
                 }
                 finish_get(state, peer.ip(), hash, &ticket, header("range")).await
+            }
+            Prepared::EmotePut(upload) => {
+                if len != upload.len {
+                    let reply = text(400, "the file is not the size it was said to be");
+                    let _ = write_reply(stream, &reply, false, true).await;
+                    linger(stream, &buf, len).await;
+                    return;
+                }
+                let body = match tokio::time::timeout(
+                    BODY_TIME,
+                    read_body(stream, &mut buf, len, BODY_IDLE),
+                )
+                .await
+                {
+                    Ok(Ok(body)) => body,
+                    _ => return,
+                };
+                crate::emotes::finish_put(state, upload, body).await
             }
         };
         // A good ticket: out of the pre-authentication pool, which voice

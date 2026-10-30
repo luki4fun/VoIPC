@@ -573,6 +573,9 @@ pub struct ServerState {
     /// The encrypted file cache; `None` with `[files] enabled = false`, and
     /// until main.rs has opened its directory (`files::FileStore::open`).
     pub files: Option<Arc<crate::files::FileStore>>,
+    /// The server's emotes; `None` with `[emotes] enabled = false`, and until
+    /// main.rs has opened their directory (`emotes::EmoteStore::open`).
+    pub emotes: Option<Arc<crate::emotes::EmoteStore>>,
 }
 
 /// Which of a member's posts slow mode counts: the live message, or its copy
@@ -743,7 +746,19 @@ impl ServerState {
             post_marks: DashMap::new(),
             tcp_fallback: config.tcp_fallback,
             files: None,
+            emotes: None,
         }
+    }
+
+    /// A state for tests, with the default settings.
+    #[cfg(test)]
+    pub fn for_tests() -> ServerState {
+        ServerState::new(
+            &crate::config::ServerConfig::default(),
+            crate::settings::ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        )
     }
 
     /// Whether this session may write in `channel_id` now, live or into the

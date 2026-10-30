@@ -676,6 +676,12 @@ export async function submitChannelSettings(): Promise<void> {
 
 // ── Going to a message ─────────────────────────────────────────────────────
 
+/** Settings asked for from elsewhere: the chat's Files button opens Files on
+ *  one conversation (`"<kind> <key>"`, as file-index.ts names a place). App
+ *  opens Settings, Settings picks the tab, and the list takes the place and
+ *  clears it. */
+export const settingsAsk = writable<{ tab: "files"; place: string } | null>(null);
+
 /** A message to bring into view once its conversation is on screen. Each chat
  *  pane goes to it once (ChatPanel.svelte); it lapses after a few seconds, so
  *  a later visit there does not jump. */

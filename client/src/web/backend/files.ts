@@ -13,6 +13,7 @@
 // as long as the tab. The front end drops what no message refers to any more
 // (file_cache_retain), as it does on the desktop.
 
+import { mediaModule, type Motion, type Pack, type Sanitized } from "./media";
 import { fileRef } from "../../lib/chat-rules";
 import { Asks, asksAgain } from "../../lib/file-rules";
 import { toHex } from "../../lib/hex";
@@ -258,6 +259,8 @@ export class Files {
     private readonly origin: string,
     /** Authenticated.files.max_bytes; null when the relay keeps no files. */
     private readonly maxBytes: number | null,
+    /** How a moving picture posted here is kept (`motionOf`). */
+    readonly motion: Motion | null = null,
   ) {}
 
   /** A file message from the relay. */
@@ -717,6 +720,38 @@ export async function fetchFile(
   const { plain, blob } = await openInWorker(file, fetched, true);
   cachePut(file.hash, blob);
   return whole(plain);
+}
+
+/** file_image: a picture file as the PNG it may be shown as, opened and
+ *  sanitized in one worker job (media.ts): its own bytes never reach the page.
+ *  Fetched first where this tab does not keep it. */
+export async function fileImage(
+  files: Files | null,
+  server: string,
+  conv: Conv,
+  file: FileArg,
+  profile: number,
+  op?: string,
+): Promise<ArrayBuffer> {
+  let blob = cacheGet(file.hash);
+  if (!blob) {
+    await fetchFile(files, server, conv, file, op);
+    blob = cacheGet(file.hash);
+    if (!blob) throw new Error("The file is not on this device");
+  }
+  const media = await mediaModule();
+  return whole(await inWorker<Uint8Array>({ op: "image", ...file, blob, profile, media, motion: files?.motion ?? null }));
+}
+
+/** Any picture `bytes` (one picked from this device, an emote's) as `profile`,
+ *  sanitized in a worker. */
+export async function sanitizeImage(bytes: Uint8Array, profile: number, maxOut = 0): Promise<Sanitized> {
+  return inWorker<Sanitized>({ op: "sanitize", bytes, profile, maxOut, media: await mediaModule() });
+}
+
+/** The files of a .zip or .wastickers an admin picked, read in a worker. */
+export async function readPack(bytes: Uint8Array): Promise<Pack> {
+  return inWorker({ op: "pack", bytes, media: await mediaModule() });
 }
 
 /** forward_file: post the file this tab holds as `hash` in `conv` too (a

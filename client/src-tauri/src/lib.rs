@@ -8,8 +8,11 @@ mod app_state;
 mod commands;
 mod config;
 mod crypto;
+mod emote_sources;
+mod emotes;
 mod files;
 mod global_keys;
+mod media;
 mod mumblelink;
 mod network;
 mod screenshare;
@@ -405,6 +408,17 @@ pub fn run() {
             commands::send_direct_message,
             files::send_file,
             files::fetch_file,
+            files::file_image,
+            emotes::emote_image,
+            emotes::emote_file,
+            emotes::emote_cache_retain,
+            emotes::prepare_emote,
+            emotes::read_emote_pack,
+            emotes::emote_add,
+            emotes::emote_remove,
+            emotes::emote_rename,
+            emote_sources::fetch_emote_source,
+            emotes::emote_stickers,
             files::cancel_file,
             files::file_stage,
             files::reseed_file,

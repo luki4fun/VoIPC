@@ -231,6 +231,15 @@ where
             let range = header(header::RANGE);
             crate::files::finish_get(state, peer_ip, hash, &ticket, range.as_deref()).await
         }
+        Prepared::EmotePut(upload) => {
+            match http_body_util::Limited::new(body, upload.len)
+                .collect()
+                .await
+            {
+                Ok(b) => crate::emotes::finish_put(state, upload, b.to_bytes()).await,
+                Err(_) => crate::files::text(413, "more bytes than the file was said to be"),
+            }
+        }
     };
     let mut resp = Response::new(Full::new(reply.body));
     *resp.status_mut() =

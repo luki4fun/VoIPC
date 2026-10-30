@@ -106,6 +106,16 @@ export interface UiPrefs {
    * The server is never told: the flag on a channel is all it carries.
    */
   nsfw_ok: string[];
+  /**
+   * Whether a loaded video or sound plays inside VoIPC, through the system's
+   * own decoders; null is this platform's default (media.ts `playsMedia`).
+   */
+  play_media: boolean | null;
+  /** Stickers others send are shown (else named only). */
+  show_stickers: boolean;
+  /** Moving emotes and stickers: always, on hover, or never (their first
+   *  frame). Reduced motion on the system means never, whatever this says. */
+  animate_emotes: "always" | "hover" | "never";
 }
 
 /** Bounds. A width outside these is a panel you cannot get back by dragging. */
@@ -169,6 +179,9 @@ export function defaultUiPrefs(): UiPrefs {
     left_text_channels: {},
     dm_timers: {},
     nsfw_ok: [],
+    play_media: null,
+    show_stickers: true,
+    animate_emotes: "always",
   };
 }
 
@@ -340,5 +353,8 @@ export function sanitizeUiPrefs(raw: unknown): UiPrefs {
     left_text_channels: leftTextChannels(r.left_text_channels),
     dm_timers: dmTimers(r.dm_timers),
     nsfw_ok: nsfwOk(r.nsfw_ok),
+    play_media: typeof r.play_media === "boolean" ? r.play_media : null,
+    show_stickers: bool(r.show_stickers, d.show_stickers),
+    animate_emotes: r.animate_emotes === "hover" || r.animate_emotes === "never" ? r.animate_emotes : "always",
   };
 }

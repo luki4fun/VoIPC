@@ -27,7 +27,7 @@ use voipc_protocol::codec::{
 };
 use voipc_protocol::conv::{hex, unhex16};
 use voipc_protocol::messages::{AccountReply, AccountRequest, ClientMessage, ServerMessage};
-use voipc_protocol::types::FileLimits;
+use voipc_protocol::types::{EmoteAccess, FileLimits};
 
 use crate::app_state::{AppState, SignalState};
 use crate::crypto::DeviceRecord;
@@ -159,7 +159,16 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     send: &mut S,
     recv: &mut R,
     buf: &mut BytesMut,
-) -> Result<(u32, u32, Arc<AccountLink>, Option<FileLimits>), String> {
+) -> Result<
+    (
+        u32,
+        u32,
+        Arc<AccountLink>,
+        Option<FileLimits>,
+        Option<EmoteAccess>,
+    ),
+    String,
+> {
     let name = normalize_name(username)?;
     let method = match args {
         AccountArgs::Login { password } => Method::Password {
@@ -217,7 +226,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     write(send, &first).await?;
 
     let mut asked = 0u32;
-    let (user_id, session_id, info, files) = loop {
+    let (user_id, session_id, info, files, emotes) = loop {
         let msg = read(recv, buf).await?;
         if let ServerMessage::Authenticated {
             user_id,
@@ -225,13 +234,13 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
             account: Some(info),
             accounts,
             files,
-            ..
+            emotes,
         } = msg
         {
             if let Some(accounts) = accounts {
                 emit_server(app, server, "relay-accounts", accounts);
             }
-            break (user_id, session_id, info, files);
+            break (user_id, session_id, info, files, emotes);
         }
         crate::network::note_refusal(app, server, &msg);
         // The password's stretching runs here: half a second of CPU, kept
@@ -301,6 +310,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
             session: std::sync::Mutex::new(session),
         }),
         files,
+        emotes,
     ))
 }
 

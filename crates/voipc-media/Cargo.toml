@@ -1,0 +1,24 @@
+[package]
+name = "voipc-media"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+publish = false
+
+# Pictures nobody here made: decoded only by memory-safe Rust, and shown only
+# as PNG this crate wrote. Every decoder below forbids unsafe code; zune-jpeg
+# only without its SIMD features, which must stay off (the CI checks it). The
+# relay never depends on this crate: it decodes nothing.
+[dependencies]
+png = "0.18"
+gif = { version = "0.14", default-features = false, features = ["std"] }
+image-webp = "0.2"
+zune-jpeg = { version = "0.5", default-features = false, features = ["std"] }
+zune-core = "0.5"
+# The pack reader's inflate, capped while it runs (pack.rs)
+miniz_oxide = { version = "0.9", default-features = false, features = ["with-alloc"] }
+
+# fuzz/ builds this crate with --cfg fuzzing (src/fuzz.rs)
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(fuzzing)'] }

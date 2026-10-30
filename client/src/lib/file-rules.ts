@@ -150,6 +150,22 @@ const NOT_IN_NAME = /[<>:"/\\|?*\p{Cc}\u200e\u200f\u061c\u202a-\u202e\u2066-\u20
 const RESERVED = /^(con|prn|aux|nul|conin\$|conout\$|com[0-9\u00b9\u00b2\u00b3]|lpt[0-9\u00b9\u00b2\u00b3])(\..*)?$/i;
 const MAX_SAVE_NAME = 120;
 
+/** Extensions a system runs, or opens as something that can run code: saving
+ *  one is asked about first (files.ts `saveFile`). */
+const RUNS_CODE = new Set([
+  "exe", "msi", "msix", "appx", "bat", "cmd", "com", "scr", "pif", "cpl", "ps1", "psm1", "vbs", "vbe", "js", "jse",
+  "wsf", "wsh", "hta", "lnk", "url", "reg", "jar", "apk", "appimage", "sh", "bash", "zsh", "desktop", "run", "bin",
+  "dmg", "pkg", "deb", "rpm", "command", "app", "py", "pyw", "pl", "rb", "ps1xml", "scf", "inf", "chm", "iso", "img",
+  "msp", "mst", "msc", "gadget", "application", "jnlp", "vb", "ws", "wsc", "sct", "xll",
+]);
+
+/** Whether a file of this name can run code once opened (by its extension,
+ *  as its system decides). */
+export function runsCode(name: string): boolean {
+  const ext = /\.([^.]+)$/.exec(name.trim().toLowerCase())?.[1];
+  return !!ext && RUNS_CODE.has(ext);
+}
+
 /**
  * A sender's file name as it may be saved on any system: no path in it, none
  * of Windows' reserved names or forbidden characters, no trailing dots or

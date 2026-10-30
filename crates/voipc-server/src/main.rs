@@ -16,6 +16,7 @@ mod accounts;
 mod bans;
 mod channels;
 mod config;
+mod emotes;
 mod files;
 mod fsutil;
 mod media;
@@ -1013,6 +1014,18 @@ async fn main() -> Result<()> {
             Ok(0) => {}
             Ok(wiped) => info!(wiped, "files: off; wiped the blobs of an earlier run"),
             Err(e) => warn!("files: off; could not wipe {}: {e}", config.files.dir),
+        }
+    }
+    if config.emotes.enabled {
+        match emotes::EmoteStore::open(&config.emotes) {
+            Ok(store) => {
+                info!("emotes: kept in {}", config.emotes.dir);
+                state.emotes = Some(Arc::new(store));
+            }
+            Err(e) => error!(
+                "emotes: cannot open {}: {e}; running without emotes (set [emotes] enabled = false to silence this)",
+                config.emotes.dir
+            ),
         }
     }
     if let Some(why) = port_warning(&config, state.files.is_some()) {
