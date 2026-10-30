@@ -16,12 +16,12 @@
 
 <script lang="ts">
   import { tick } from "svelte";
-  import { isEmoteReaction, stickerOf, untokenize } from "../../emote-rules.js";
-  import { emoteSets } from "../../stores/emotes.js";
+  import { byRecent, isEmoteReaction, stickerOf, untokenize } from "../../emote-rules.js";
+  import { emoteSets, recentEmotes } from "../../stores/emotes.js";
   import { uiPrefs as emotePrefs } from "../../stores/ui-prefs.js";
   import Emote from "./Emote.svelte";
   import type { ChatMessage, FileConv } from "../../types.js";
-  import { userId } from "../../stores/connection.js";
+  import { serverAddress, userId } from "../../stores/connection.js";
   import { account, accountHex } from "../../stores/account.js";
   import { addNotification } from "../../stores/notifications.js";
   import { menu } from "../../actions/menu.js";
@@ -333,7 +333,7 @@
   let picking = $state.raw<{ m: ChatMessage; x: number; y: number; up: number } | null>(null);
   let pickCategory = $state(0);
   /** The server's emotes a reaction may be: not its stickers. */
-  const serverEmotes = $derived($emoteSets.emotes.filter((e) => !e.sticker));
+  const serverEmotes = $derived(byRecent($emoteSets.emotes.filter((e) => !e.sticker), $recentEmotes[$serverAddress] ?? []));
 
   /** Open the picker under `from` (a tool), or at the menu's place. */
   function openPicker(m: ChatMessage, from: { x: number; y: number; up: number } | Element) {

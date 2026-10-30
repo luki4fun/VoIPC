@@ -167,11 +167,12 @@ pub(crate) fn bttv_listing(json: &Value) -> Listing {
     out
 }
 
-/// The id a 7TV set's address ends with, or the id itself.
-pub(crate) fn seventv_set_id(input: &str) -> Option<String> {
-    let path = input.trim().split(['?', '#']).next()?;
-    let id = path.trim_end_matches('/').rsplit('/').next()?;
-    plain_id(id).then(|| id.to_owned())
+/// The id a 7TV address ends with (or the id itself), and whether it names
+/// one emote (`7tv.app/emotes/<id>`) rather than a set.
+pub(crate) fn seventv_id(input: &str) -> Option<(String, bool)> {
+    let path = input.trim().split(['?', '#']).next()?.trim_end_matches('/');
+    let (rest, id) = path.rsplit_once('/').unwrap_or(("", path));
+    plain_id(id).then(|| (id.to_owned(), rest.ends_with("/emotes")))
 }
 
 /// Fetch `source`'s pictures: "discord" (`id` a server id, `token` its
@@ -286,16 +287,33 @@ mod desktop {
                 )
             }
             "7tv" => {
-                let set = seventv_set_id(id).ok_or("a 7TV emote set's address, or its id")?;
-                seventv_listing(&json(
-                    get(
-                        &c,
-                        &format!("https://7tv.io/v3/emote-sets/{set}"),
-                        None,
-                        MAX_JSON,
+                let (id, one) =
+                    seventv_id(id).ok_or("a 7TV emote's or emote set's address, or a set's id")?;
+                if one {
+                    let e = json(
+                        get(
+                            &c,
+                            &format!("https://7tv.io/v3/emotes/{id}"),
+                            None,
+                            MAX_JSON,
+                        )
+                        .await?,
+                    )?;
+                    // One emote reads as a set of one: a set holds each as `data`
+                    seventv_listing(
+                        &serde_json::json!({ "emotes": [{ "name": e["name"], "data": e }] }),
                     )
-                    .await?,
-                )?)
+                } else {
+                    seventv_listing(&json(
+                        get(
+                            &c,
+                            &format!("https://7tv.io/v3/emote-sets/{id}"),
+                            None,
+                            MAX_JSON,
+                        )
+                        .await?,
+                    )?)
+                }
             }
             "bttv" => {
                 let id = id.trim();
@@ -441,20 +459,38 @@ mod tests {
             ]
         );
         assert_eq!(l.skipped.len(), 1);
+        let set = |id: &str| Some((id.to_owned(), false));
         assert_eq!(
-            seventv_set_id("https://7tv.app/emote-sets/01HKQT8EWR000ESSWF3625XCS4/").as_deref(),
-            Some("01HKQT8EWR000ESSWF3625XCS4")
+            seventv_id("https://7tv.app/emote-sets/01HKQT8EWR000ESSWF3625XCS4/"),
+            set("01HKQT8EWR000ESSWF3625XCS4")
         );
         assert_eq!(
-            seventv_set_id("https://7tv.app/emote-sets/01ABC?x=../y").as_deref(),
-            Some("01ABC"),
+            seventv_id("https://7tv.app/emote-sets/01ABC?x=../y"),
+            set("01ABC"),
             "a query is no part of the id"
         );
-        assert_eq!(seventv_set_id("01ABC#frag").as_deref(), Some("01ABC"));
+        assert_eq!(seventv_id("01ABC#frag"), set("01ABC"));
         assert_eq!(
-            seventv_set_id("01 ABC"),
+            seventv_id("01 ABC"),
             None,
             "only letters and digits go into a path"
+        );
+        assert_eq!(
+            seventv_id("https://7tv.app/emotes/01F5VW2TKR0003RCV2Z6JBHCST"),
+            Some(("01F5VW2TKR0003RCV2Z6JBHCST".to_owned(), true)),
+            "one emote's address"
+        );
+        // One emote, as 7TV's /v3/emotes/<id> answers, reads as a set of one
+        let one = serde_json::json!({ "name": "catKISS", "host": { "url": "//cdn.7tv.app/emote/01F5VW2TKR0003RCV2Z6JBHCST", "files": [{ "name": "2x.webp" }, { "name": "2x.gif" }] } });
+        let l = seventv_listing(
+            &serde_json::json!({ "emotes": [{ "name": one["name"], "data": one }] }),
+        );
+        assert_eq!(
+            l.items,
+            [Item {
+                name: "catKISS.webp".into(),
+                url: "https://cdn.7tv.app/emote/01F5VW2TKR0003RCV2Z6JBHCST/2x.webp".into()
+            }]
         );
     }
 

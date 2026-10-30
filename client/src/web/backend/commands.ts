@@ -415,6 +415,11 @@ const handlers: Record<string, Handler> = {
     if (!e) fail("this server has no emotes");
     return e.image(str(hash, "hash"), bool(sticker, "sticker"), bool(still, "still"));
   },
+  emote_file: async ({ server, hash }) => {
+    const e = need(server).emotes;
+    if (!e) fail("this server has no emotes");
+    return (await e.file(str(hash, "hash"))).buffer;
+  },
   emote_cache_retain: ({ keep }) =>
     emotes.retain(Array.isArray(keep) ? keep.filter((h): h is string => typeof h === "string") : []),
   prepare_emote: ({ body, headers }) => {

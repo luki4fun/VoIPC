@@ -108,6 +108,43 @@ export function wantStill(server: string, e: Emote): void {
   ask(server, e, true);
 }
 
+/** The emotes used last, per server, newest first: what the picker and the
+ *  `:` completion offer first. Kept on this device only; the server learns
+ *  nothing of it. */
+const RECENT_KEY = "voipc.emotes.recent";
+const RECENT_MAX = 16;
+
+function loadRecent(): Record<string, string[]> {
+  try {
+    const raw: unknown = JSON.parse(localStorage.getItem(RECENT_KEY) ?? "{}");
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+    return Object.fromEntries(
+      Object.entries(raw).map(([server, names]) => [
+        server,
+        Array.isArray(names) ? names.filter((n): n is string => typeof n === "string").slice(0, RECENT_MAX) : [],
+      ]),
+    );
+  } catch {
+    return {};
+  }
+}
+
+export const recentEmotes = writable<Record<string, string[]>>(typeof localStorage === "undefined" ? {} : loadRecent());
+
+/** `names` were just used on `server`. */
+export function noteEmotes(server: string, names: string[]): void {
+  if (names.length === 0) return;
+  recentEmotes.update((all) => {
+    const next = { ...all, [server]: [...new Set([...names, ...(all[server] ?? [])])].slice(0, RECENT_MAX) };
+    try {
+      localStorage.setItem(RECENT_KEY, JSON.stringify(next));
+    } catch {
+      // Full, or none here: it is only an order
+    }
+    return next;
+  });
+}
+
 /** Whether the person's system asks for reduced motion (then nothing moves). */
 export const reducedMotion = writable(
   typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches,

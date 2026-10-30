@@ -1182,9 +1182,11 @@
       }),
 
       // ── Moderation ──
-      listenServer<{ user_id: number; is_admin: boolean }>("admin-status", (server, data) => {
+      listenServer<{ user_id: number; is_admin: boolean; own: boolean }>("admin-status", (server, data) => {
         const { user_id: uid, is_admin } = data;
-        if (uid === get(userId.peek(server))) {
+        // The backend says whether it is ours: a role admin's comes before
+        // `connect` has answered with our id here
+        if (data.own) {
           isAdmin.of(server).set(is_admin);
           if (is_admin) {
             addNotification(`${fromServer(server)}You are now a server admin`, "info");

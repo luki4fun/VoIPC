@@ -165,6 +165,17 @@ export class Emotes {
     const base = `${hash}-${await sanitizerVersion()}-${sticker ? "s" : "e"}`;
     const kept = (still ? await cacheGet(`${base}-still`) : null) ?? (await cacheGet(base));
     if (kept) return kept.slice().buffer as ArrayBuffer;
+    const out = await this.sanitize(await this.file(hash), sticker ? 1 : 0);
+    // The still first: a PNG kept means its still is too
+    if (out.still) await cachePut(`${base}-still`, out.still);
+    await cachePut(base, out.png);
+    return ((still && out.still) || out.png).slice().buffer as ArrayBuffer;
+  }
+
+  /** emote_file: an emote's file as the server keeps it, checked against its
+   *  hash. Never shown: sanitized first, or handed back to emote_add. */
+  async file(hash: string): Promise<Uint8Array> {
+    if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error("invalid hash");
     if (!this.access) throw new Error("this server has no emotes");
     // As long as the app's own request may take (files.rs REQUEST_TIME): a
     // stalled answer must not hold one of the few loading places for good
@@ -175,11 +186,7 @@ export class Emotes {
     if (!res.ok) throw new Error(`the server would not give the emote (${res.status})`);
     const body = new Uint8Array(await res.arrayBuffer());
     if ((await sha256(body)) !== hash) throw new Error("the server gave another file than the emote's");
-    const out = await this.sanitize(body, sticker ? 1 : 0);
-    // The still first: a PNG kept means its still is too
-    if (out.still) await cachePut(`${base}-still`, out.still);
-    await cachePut(base, out.png);
-    return ((still && out.still) || out.png).slice().buffer as ArrayBuffer;
+    return body;
   }
 
   /** emote_add: what prepare_emote said to upload, added as `name`. */

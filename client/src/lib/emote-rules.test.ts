@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  byRecent,
   completeEmote,
   emoteOf,
   isEmoteReaction,
@@ -84,6 +85,13 @@ test("the : completion: names that start with what is typed, then names that hol
   assert.deepEqual(completeEmote("po", list).map((e) => e.name), ["pog", "apog"]);
   assert.deepEqual(completeEmote("ca", list).map((e) => e.name), [], "stickers are not typed");
   assert.equal(completeEmote("", list, 2).length, 2);
+  const pogs = { ...pog, name: "pogs", hash: H("e") };
+  assert.deepEqual(
+    completeEmote("po", [pog, pogs, kekw], 8, ["pogs"]).map((e) => e.name),
+    ["pogs", "pog"],
+    "the recently used first",
+  );
+  assert.deepEqual(byRecent([pog, kekw, cat], ["cat", "nope", "pog"]).map((e) => e.name), ["cat", "pog", "kekw_2"]);
 });
 
 test("emote names from file names", () => {

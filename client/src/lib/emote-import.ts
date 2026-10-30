@@ -82,6 +82,12 @@ export function addEmote(server: string, name: string, sticker: boolean, pack: s
   return invokeWithBytes<void>("emote_add", upload, { "x-voipc-emote": asciiJson({ server, name, sticker, pack }) });
 }
 
+/** An emote's file as the server keeps it (admins), checked against its hash:
+ *  only ever handed back to `addEmote`, never shown. */
+export async function emoteFile(server: string, hash: string): Promise<Uint8Array> {
+  return new Uint8Array(await invoke<ArrayBuffer>("emote_file", { server, hash }));
+}
+
 export const removeEmote = (server: string, name: string) => invoke("emote_remove", { server, name });
 export const renameEmote = (server: string, from: string, to: string) => invoke("emote_rename", { server, from, to });
 export const setStickers = (server: string, on: boolean) => invoke("emote_stickers", { server, on });

@@ -2299,11 +2299,13 @@ async fn handle_server_message(
         }
         // ── Moderation ──
         ServerMessage::AdminStatus { user_id, is_admin } => {
+            // `own` decided here: a role admin's comes right after the
+            // sign-in, before the page may know its own id on this server
             emit_server(
                 app_handle,
                 server,
                 "admin-status",
-                serde_json::json!({"user_id": user_id, "is_admin": is_admin}),
+                serde_json::json!({"user_id": user_id, "is_admin": is_admin, "own": user_id == own_user_id}),
             );
         }
         ServerMessage::AdminError { reason } => {

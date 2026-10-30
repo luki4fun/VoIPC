@@ -109,14 +109,25 @@ export function reactionEmote(s: string, emotes: readonly Emote[]): Emote | unde
   return emotes.find((e) => e.name === name && !e.sticker);
 }
 
+/** `emotes` with those named in `recent` (newest first) ahead, in its
+ *  order, and the rest after them as they were. */
+export function byRecent<T extends { name: string }>(emotes: readonly T[], recent: readonly string[]): T[] {
+  const at = (e: T) => {
+    const i = recent.indexOf(e.name);
+    return i < 0 ? recent.length : i;
+  };
+  return [...emotes].sort((a, b) => at(a) - at(b));
+}
+
 /** The names the `:` completion offers for `typed`: those that start with
- *  it first, then those that hold it, at most `max`. */
-export function completeEmote(typed: string, emotes: readonly Emote[], max = 8): Emote[] {
+ *  it first, then those that hold it, each the recently used first, at most
+ *  `max`. */
+export function completeEmote(typed: string, emotes: readonly Emote[], max = 8, recent: readonly string[] = []): Emote[] {
   const t = typed.toLowerCase();
   const usable = emotes.filter((e) => !e.sticker);
   const starts = usable.filter((e) => e.name.startsWith(t));
   const holds = usable.filter((e) => !e.name.startsWith(t) && e.name.includes(t));
-  return [...starts, ...holds].slice(0, max);
+  return [...byRecent(starts, recent), ...byRecent(holds, recent)].slice(0, max);
 }
 
 /** An emote name from a file name: its stem in lower case, anything else as

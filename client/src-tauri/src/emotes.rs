@@ -87,21 +87,7 @@ pub async fn emote_image(
     if let Some(bytes) = kept {
         return Ok(tauri::ipc::Response::new(bytes));
     }
-    let files = files_of(&state, &server).await?;
-    let token = files
-        .emotes
-        .as_ref()
-        .ok_or("this server has no emotes")?
-        .token
-        .0
-        .clone();
-    let (status, body) = files.emote_request("GET", &hash, &token, &[]).await?;
-    if status != 200 {
-        return Err(format!("the server would not give the emote ({status})"));
-    }
-    if sha256(&body) != hash {
-        return Err("the server gave another file than the emote's".into());
-    }
+    let body = fetch_verified(&state, &server, &hash).await?;
     let p = profile(sticker);
     let clean = crate::media::sanitize(body, p, p.max_output(), Motion::default()).await?;
     let (png, first) = cached(&hash, sticker);
@@ -120,6 +106,44 @@ pub async fn emote_image(
     } else {
         clean.png
     }))
+}
+
+/// An emote's file as `server` keeps it, checked against its hash.
+async fn fetch_verified(
+    state: &State<'_, AppState>,
+    server: &str,
+    hash: &[u8; 32],
+) -> Result<Vec<u8>, String> {
+    let files = files_of(state, server).await?;
+    let token = files
+        .emotes
+        .as_ref()
+        .ok_or("this server has no emotes")?
+        .token
+        .0
+        .clone();
+    let (status, body) = files.emote_request("GET", hash, &token, &[]).await?;
+    if status != 200 {
+        return Err(format!("the server would not give the emote ({status})"));
+    }
+    if sha256(&body) != *hash {
+        return Err("the server gave another file than the emote's".into());
+    }
+    Ok(body)
+}
+
+/// An emote's file itself (admins), for adding it again as the other kind:
+/// the page hands it straight back to `emote_add` and never shows it.
+#[tauri::command]
+pub async fn emote_file(
+    state: State<'_, AppState>,
+    server: String,
+    hash: String,
+) -> Result<tauri::ipc::Response, String> {
+    let hash = unhex::<32>(&hash).ok_or("invalid hash")?;
+    Ok(tauri::ipc::Response::new(
+        fetch_verified(&state, &server, &hash).await?,
+    ))
 }
 
 /// Keep only the emotes of these hashes (every open server's): the rest of

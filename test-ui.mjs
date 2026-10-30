@@ -2804,7 +2804,7 @@ check(
   await ann.evaluate(click("button.admin-btn.active"));
   await waitFor(ann, `[...document.querySelectorAll(".admin-tabs button")].some((b) => b.textContent === "Emotes")`, 5_000).catch(() => {});
   await ann.evaluate(`[...document.querySelectorAll(".admin-tabs button")].find((b) => b.textContent === "Emotes")?.click()`);
-  await waitFor(ann, `document.querySelector(".em-pick input[type=file][accept]")`, 5_000).catch(() => {});
+  await waitFor(ann, `document.querySelector(".em-pick input[type=file][multiple]")`, 5_000).catch(() => {});
   const name = `party_parrot_${n}`;
   await ann.evaluate(`(async () => {
     const c = document.createElement("canvas"); c.width = 64; c.height = 64;
@@ -2814,7 +2814,7 @@ check(
     const dt = new DataTransfer();
     dt.items.add(new File([png], "Party Parrot ${n}.png", { type: "image/png" }));
     dt.items.add(new File([svg], "evil.png", { type: "image/png" }));
-    const input = document.querySelector(".em-pick input[type=file][accept]");
+    const input = document.querySelector(".em-pick input[type=file][multiple]");
     input.files = dt.files; input.dispatchEvent(new Event("change", { bubbles: true })); })()`);
   const readied = await waitFor(ann, `[...document.querySelectorAll(".em-add .em-row input.em-name")].some((i) => i.value === ${JSON.stringify(name)})
     && [...document.querySelectorAll(".em-add .em-row img")].every((i) => i.src.startsWith("blob:") && i.naturalWidth > 0)`, 20_000).then(() => true, () => false);

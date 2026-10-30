@@ -410,6 +410,7 @@ pub fn run() {
             files::fetch_file,
             files::file_image,
             emotes::emote_image,
+            emotes::emote_file,
             emotes::emote_cache_retain,
             emotes::prepare_emote,
             emotes::read_emote_pack,

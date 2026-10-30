@@ -23,8 +23,8 @@
   import { get } from "svelte/store";
   import { account, accountHex } from "../stores/account.js";
   import { users } from "../stores/users.js";
-  import { emoteSets } from "../stores/emotes.js";
-  import { stickerText, tokenize } from "../emote-rules.js";
+  import { emoteSets, noteEmotes } from "../stores/emotes.js";
+  import { EMOTE_TOKEN, isEmoteReaction, stickerText, tokenize } from "../emote-rules.js";
   import { expiryFor, messageRefs, pinnedOf, rowKey, sameRow, splitChatKey, type ChatPlace } from "../chat-rules.js";
   import { threadView } from "../thread-rules.js";
   import type { ChatEvent, ChatMessage, FileConv, FileRef, Forwarded } from "../types.js";
@@ -565,6 +565,7 @@
     const server = t.server;
     // `:name:` of a server emote goes as its token (emote-rules.ts)
     content = tokenize(content, get(emoteSets.peek(server)).emotes);
+    noteEmotes(server, [...content.matchAll(EMOTE_TOKEN)].map((m) => m[1]));
     try {
       // The destruction timer this conversation carries, stamped inside the
       // ciphertext so every copy of the message dies at the same moment: the
@@ -689,7 +690,10 @@
     const t = targetNow();
     return {
       forward,
-      react: (m, emoji, on) => sendEvent(t, { kind: "react", target: m.id!, emoji, on }, m),
+      react: (m, emoji, on) => {
+        if (on && isEmoteReaction(emoji)) noteEmotes(t.server, [emoji.slice(1, -1)]);
+        return sendEvent(t, { kind: "react", target: m.id!, emoji, on }, m);
+      },
       edit: (m, text) => sendEvent(t, { kind: "edit", target: m.id! }, m, text),
       remove: (m) => sendEvent(t, { kind: "delete", target: m.id! }, m),
       // A pin counts only from a manager, which every reader checks

@@ -9,8 +9,9 @@
   import { isAnimated, sniff } from "../../file-sniff.js";
   import Icon from "../Icons.svelte";
   import { EMOJI_CATEGORIES } from "../../emoji.js";
-  import { completeEmote, type Emote as EmoteItem } from "../../emote-rules.js";
-  import { emoteSets } from "../../stores/emotes.js";
+  import { byRecent, completeEmote, type Emote as EmoteItem } from "../../emote-rules.js";
+  import { emoteSets, recentEmotes } from "../../stores/emotes.js";
+  import { serverAddress } from "../../stores/connection.js";
   import { fold } from "../../search-rules.js";
   import Emote from "./Emote.svelte";
 
@@ -260,6 +261,8 @@
       .filter((n) => shortName(n).toLowerCase().startsWith(query.q) || n.toLowerCase().startsWith(query.q))
       .slice(0, 6);
   });
+  /** This device's recently used emotes here, newest first (stores/emotes.ts). */
+  const recent = $derived($recentEmotes[$serverAddress] ?? []);
   /** The `:word` being typed just before the cursor: a server emote to complete. */
   const emoteQuery = $derived.by(() => {
     if ($emoteSets.emotes.length === 0) return null;
@@ -268,7 +271,7 @@
     return m ? { q: m[1], start: before.length - m[1].length - 1 } : null;
   });
   const emoteOptions = $derived(
-    emoteQuery && emoteQuery.start !== dismissedAt && suggestions.length === 0 ? completeEmote(emoteQuery.q, $emoteSets.emotes) : [],
+    emoteQuery && emoteQuery.start !== dismissedAt && suggestions.length === 0 ? completeEmote(emoteQuery.q, $emoteSets.emotes, 8, recent) : [],
   );
   const offered = $derived(suggestions.length || emoteOptions.length);
   $effect(() => {
@@ -349,16 +352,26 @@
   let showEmojiPicker = $state(false);
   let emojiCategory = $state(0);
   let emoteFilter = $state("");
-  const serverEmotes = $derived($emoteSets.emotes.filter((e) => !e.sticker && fold(e.name).includes(fold(emoteFilter))));
-  const stickerPacks = $derived.by(() => {
-    if (!onsticker) return [];
+  const matching = (sticker: boolean) =>
+    $emoteSets.emotes.filter((e) => e.sticker === sticker && fold(`${e.name} ${e.pack}`).includes(fold(emoteFilter)));
+  /** `list` by pack, the packs by name: the one without a name first. */
+  function byPack(list: EmoteItem[]): { key: string; label: string; list: EmoteItem[] }[] {
     const packs = new Map<string, EmoteItem[]>();
-    for (const e of $emoteSets.emotes) {
-      if (!e.sticker || !fold(`${e.name} ${e.pack}`).includes(fold(emoteFilter))) continue;
-      packs.set(e.pack, [...(packs.get(e.pack) ?? []), e]);
+    for (const e of list) {
+      const same = packs.get(e.pack);
+      if (same) same.push(e);
+      else packs.set(e.pack, [e]);
     }
-    return [...packs];
+    return [...packs].sort(([a], [b]) => a.localeCompare(b)).map(([pack, list]) => ({ key: `p:${pack}`, label: pack, list }));
+  }
+  const emoteSections = $derived.by(() => {
+    const list = matching(false);
+    const used = emoteFilter ? [] : byRecent(list.filter((e) => recent.includes(e.name)), recent);
+    const sections = [...(used.length ? [{ key: "recent", label: "Recently used", list: used }] : []), ...byPack(list)];
+    // Among other sections, the emotes of no pack need a heading too
+    return sections.map((s) => (s.label || sections.length === 1 ? s : { ...s, label: "Emotes" }));
   });
+  const stickerPacks = $derived(onsticker ? byPack(matching(true)) : []);
   const hasEmotes = $derived($emoteSets.emotes.some((e) => !e.sticker));
   const hasStickers = $derived(!!onsticker && $emoteSets.emotes.some((e) => e.sticker));
 
@@ -561,15 +574,18 @@
         {/if}
         <div class="emoji-grid" class:stickers={emojiCategory === -2}>
           {#if emojiCategory === -1}
-            {#each serverEmotes as e (e.name)}
-              <button class="emoji-item" type="button" title=":{e.name}:" aria-label=":{e.name}:" onpointerdown={keepField} onclick={() => insertEmoji(`${/\S$/.test(text) ? " " : ""}:${e.name}: `)}
-                ><Emote name={e.name} hash={e.hash.slice(0, 20)} /></button
-              >
+            {#each emoteSections as s (s.key)}
+              {#if s.label}<div class="sticker-pack">{s.label}</div>{/if}
+              {#each s.list as e (e.name)}
+                <button class="emoji-item" type="button" title=":{e.name}:" aria-label=":{e.name}:" onpointerdown={keepField} onclick={() => insertEmoji(`${/\S$/.test(text) ? " " : ""}:${e.name}: `)}
+                  ><Emote name={e.name} hash={e.hash.slice(0, 20)} /></button
+                >
+              {/each}
             {/each}
           {:else if emojiCategory === -2}
-            {#each stickerPacks as [pack, list] (pack)}
-              {#if pack}<div class="sticker-pack">{pack}</div>{/if}
-              {#each list as e (e.name)}
+            {#each stickerPacks as s (s.key)}
+              {#if s.label}<div class="sticker-pack">{s.label}</div>{/if}
+              {#each s.list as e (e.name)}
                 <button class="emoji-item sticker-item" type="button" title=":{e.name}:" aria-label="Send the sticker :{e.name}:" onpointerdown={keepField}
                   onclick={() => { showEmojiPicker = false; onsticker?.(e); }}
                   ><Emote name={e.name} hash={e.hash.slice(0, 20)} size="jumbo" /></button

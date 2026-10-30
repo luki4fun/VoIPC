@@ -910,7 +910,7 @@ export class Session implements SessionContext, AccountHost {
         this.onMediaKeyReceived(b.channel_id, b.from_user_id, toBytes(b.encrypted_media_key), b.message_type);
         break;
       case "AdminStatus":
-        this.emit("admin-status", { user_id: b.user_id, is_admin: b.is_admin });
+        this.emit("admin-status", { user_id: b.user_id, is_admin: b.is_admin, own: b.user_id === this.userId });
         break;
       case "AdminError":
         this.emit("admin-error", { reason: b.reason });
