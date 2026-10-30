@@ -73,6 +73,8 @@
   let busy = $state(false);
   let over = $state(false);
   let nextKey = 0;
+  /** Bumped by Clear: an import still running adds nothing after it. */
+  let generation = 0;
 
   const NOTE: Record<Made, string> = {
     clean: "",
@@ -86,15 +88,19 @@
     $emoteSets.emotes.some((e) => e.name === name) || rows.some((r) => r.key !== key && r.include && r.name === name);
   const nameProblem = (r: Row) =>
     !NAME.test(r.name) ? "2 to 30 of a-z, 0-9 and _" : taken(r.name, r.key) ? "taken" : "";
-  const ready = $derived(rows.filter((r) => r.include && r.status === "ready" && !nameProblem(r)));
+  /** Ready to go, or failed and so to try again (under another name). */
+  const editable = (r: Row) => r.status === "ready" || r.status === "failed";
+  const ready = $derived(rows.filter((r) => r.include && editable(r) && !nameProblem(r)));
 
-  async function prepare(source: string, bytes: Uint8Array) {
+  async function prepare(source: string, bytes: Uint8Array, gen: number) {
+    if (gen !== generation) return;
     const key = nextKey++;
     rows = [...rows, { key, source, name: "", status: "reading", note: "", include: true }];
     const limits = get(emoteLimits.peek(server));
     if (!limits) return set(key, { status: "skipped", include: false, note: "This server keeps no emotes" });
     try {
       const p = await prepareEmote(bytes, asSticker, asSticker ? limits.max_sticker_bytes : limits.max_emote_bytes);
+      if (gen !== generation) return;
       const base = nameFrom(source) ?? "emote";
       set(key, { prepared: p, url: pictureUrl(p.preview), status: "ready", note: NOTE[p.how], name: uniqueName(base, (n) => taken(n, key)) ?? base });
     } catch (e) {
@@ -103,17 +109,21 @@
   }
 
   async function addFiles(files: Iterable<File>) {
+    const gen = generation;
     for (const f of files) {
       const bytes = new Uint8Array(await f.arrayBuffer());
       if (!isArchive(bytes)) {
-        await prepare(f.name, bytes);
+        await prepare(f.name, bytes, gen);
         continue;
       }
       try {
         const p = await readPack(bytes);
+        if (gen !== generation) return;
         if (!pack) pack = [...(p.title ?? f.name.replace(/\.(zip|wastickers)$/i, ""))].slice(0, 32).join("").trim();
-        for (const e of p.entries) await prepare(e.name, e.bytes);
+        for (const s of p.skipped) rows = [...rows, { key: nextKey++, source: s.name, name: "", status: "skipped", include: false, note: s.why }];
+        for (const e of p.entries) await prepare(e.name, e.bytes, gen);
       } catch (e) {
+        if (gen !== generation) return;
         rows = [...rows, { key: nextKey++, source: f.name, name: "", status: "skipped", include: false, note: String(e).replace(/^Error: /, "") }];
       }
     }
@@ -126,11 +136,13 @@
   let fetching = $state(false);
   async function fetchFrom() {
     fetching = true;
+    const gen = generation;
     try {
       const got = await fetchSource(source, sourceId.trim(), source === "discord" ? token : "", asSticker);
+      if (gen !== generation) return;
       if (!pack && got.title) pack = [...got.title].slice(0, 32).join("").trim();
       for (const s of got.skipped) rows = [...rows, { key: nextKey++, source: s.name, name: "", status: "skipped", include: false, note: s.why }];
-      for (const e of got.entries) await prepare(e.name, e.bytes);
+      for (const e of got.entries) await prepare(e.name, e.bytes, gen);
     } catch (e) {
       addNotification(String(e).replace(/^Error: /, ""), "error");
     } finally {
@@ -179,6 +191,7 @@
   }
 
   function clear() {
+    generation++;
     for (const r of rows) if (r.url) URL.revokeObjectURL(r.url);
     rows = [];
     pack = "";
@@ -274,16 +287,16 @@
         {#each rows as r (r.key)}
           <li class="em-row" class:skip={!r.include}>
             <span class="em-pic">{#if r.url}<img src={r.url} alt="" />{:else}<Icon name="file" size={16} />{/if}</span>
-            {#if r.status === "ready" || r.status === "failed"}
+            {#if editable(r)}
               <input class="em-input em-name" bind:value={r.name} aria-label="Name for {r.source}" aria-invalid={!!nameProblem(r)} />
             {:else}
               <span class="em-name" title={r.source}>{r.name ? `:${r.name}:` : r.source}</span>
             {/if}
             <span class="em-meta" role="status">
               {r.status === "reading" ? "Reading…" : r.status === "uploading" ? "Adding…" : r.status === "done" ? "Added" : ""}
-              {r.status === "ready" && nameProblem(r) ? `Name: ${nameProblem(r)}` : r.note}
+              {editable(r) && nameProblem(r) ? `Name: ${nameProblem(r)}` : r.note}
             </span>
-            {#if r.status === "ready"}
+            {#if editable(r)}
               <input type="checkbox" bind:checked={r.include} aria-label="Add {r.source}" />
             {/if}
           </li>

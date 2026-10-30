@@ -6,7 +6,7 @@
 
 import { toHex } from "../../lib/hex";
 import type { FileHost } from "./files";
-import { mediaModule, type Sanitized } from "./media";
+import { mediaModule, type Pack, type Sanitized } from "./media";
 
 // The worker runner and the sanitize job live with the file worker's (files.ts)
 type Sanitize = (bytes: Uint8Array, profile: number, maxOut?: number) => Promise<Sanitized>;
@@ -48,6 +48,7 @@ function sanitizerVersion(): Promise<number> {
     const x = new WebAssembly.Instance(m, {}).exports as { media_version(): number };
     return x.media_version();
   });
+  version.catch(() => (version = null));
   return version;
 }
 
@@ -89,11 +90,13 @@ async function cachePut(key: string, png: Uint8Array): Promise<void> {
   d?.transaction(PNGS, "readwrite").objectStore(PNGS).put(png, key);
 }
 
-/** emote_cache_retain: only these hashes' PNGs, of this sanitizer, stay. */
+/** emote_cache_retain, in the browser: this tab's hashes stay in memory,
+ *  and only an older sanitizer's PNGs leave IndexedDB. Other tabs of this
+ *  origin share it, with servers of their own; the browser evicts the rest. */
 export async function retain(keep: string[]): Promise<void> {
   const v = await sanitizerVersion();
-  const ok = (key: string) => keep.includes(key.split("-")[0]) && key.includes(`-${v}-`);
-  for (const k of [...memory.keys()]) if (!ok(k)) memory.delete(k);
+  for (const k of [...memory.keys()]) if (!keep.includes(k.split("-")[0])) memory.delete(k);
+  const ok = (key: string) => key.includes(`-${v}-`);
   const d = await store();
   if (!d) return;
   const os = d.transaction(PNGS, "readwrite").objectStore(PNGS);
@@ -163,7 +166,12 @@ export class Emotes {
     const kept = (still ? await cacheGet(`${base}-still`) : null) ?? (await cacheGet(base));
     if (kept) return kept.slice().buffer as ArrayBuffer;
     if (!this.access) throw new Error("this server has no emotes");
-    const res = await fetch(this.url(hash), { headers: { Authorization: `Bearer ${this.access.token}` } });
+    // As long as the app's own request may take (files.rs REQUEST_TIME): a
+    // stalled answer must not hold one of the few loading places for good
+    const res = await fetch(this.url(hash), {
+      headers: { Authorization: `Bearer ${this.access.token}` },
+      signal: AbortSignal.timeout(90_000),
+    });
     if (!res.ok) throw new Error(`the server would not give the emote (${res.status})`);
     const body = new Uint8Array(await res.arrayBuffer());
     if ((await sha256(body)) !== hash) throw new Error("the server gave another file than the emote's");
@@ -177,14 +185,14 @@ export class Emotes {
   /** emote_add: what prepare_emote said to upload, added as `name`. */
   async add(name: string, sticker: boolean, pack: string, bytes: Uint8Array): Promise<void> {
     const hash = await sha256(bytes);
-    const answer = new Promise<string | null>((done, fail) => {
-      this.waits.push({ name, hash, done, fail });
-      setTimeout(() => {
-        if (this.answer((w) => w.name === name && w.hash === hash, () => {})) fail(new Error("the server did not answer"));
-      }, ANSWER_MS);
-    });
     this.host.sendControl({ EmoteAdd: { emote: { name, hash: fromHex(hash), sticker, pack }, len: bytes.length } });
-    const ticket = await answer;
+    // Its answer comes as a later message, so waiting from here misses none
+    const ticket = await new Promise<string | null>((done, fail) => {
+      const wait = { name, hash, done, fail };
+      this.waits.push(wait);
+      // This add's own wait: a retry of the same name and file has its own
+      setTimeout(() => this.answer((w) => w === wait, () => fail(new Error("the server did not answer"))), ANSWER_MS);
+    });
     if (ticket === null) return;
     const res = await fetch(this.url(hash), {
       method: "PUT",
@@ -236,9 +244,9 @@ export async function prepareEmote(sanitize: Sanitize, src: Uint8Array, sticker:
 
 /** read_emote_pack's answer, as the desktop's: a JSON head (the title, and
  *  each file's name and length), then the files back to back. */
-export function packAnswer(pack: { title: string | null; entries: { name: string; bytes: Uint8Array }[] }): ArrayBuffer {
+export function packAnswer(pack: Pack): ArrayBuffer {
   const head = new TextEncoder().encode(
-    JSON.stringify({ title: pack.title, entries: pack.entries.map((e) => ({ name: e.name, len: e.bytes.length })) }),
+    JSON.stringify({ title: pack.title, entries: pack.entries.map((e) => ({ name: e.name, len: e.bytes.length })), skipped: pack.skipped }),
   );
   const out = new Uint8Array(4 + head.length + pack.entries.reduce((n, e) => n + e.bytes.length, 0));
   new DataView(out.buffer).setUint32(0, head.length, true);

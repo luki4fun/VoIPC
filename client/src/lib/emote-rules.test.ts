@@ -55,6 +55,15 @@ test("a sticker is a message that is one sticker's token and nothing else", () =
   assert.equal(stickerOf(stickerText(cat), [pog]), undefined, "a sticker the server no longer has");
 });
 
+test("one file under several names: each token finds its own", () => {
+  const lol = { ...pog, name: "lol" };
+  const big = { ...pog, name: "big", sticker: true };
+  const list = [lol, pog, big];
+  assert.equal(emoteOf(pog.hash.slice(0, 20), list, "pog"), pog);
+  assert.equal(emoteOf(pog.hash.slice(0, 20), list, "gone"), lol, "a renamed one still shows");
+  assert.equal(stickerOf(stickerText(big), list), big, "the sticker, though an emote has its file");
+});
+
 test("emotes alone, few enough, are shown big", () => {
   assert.equal(onlyEmotes(`${T(pog)} ${T(kekw)}`), true);
   assert.equal(onlyEmotes(`${T(pog)} hi`), false);
@@ -77,7 +86,7 @@ test("the : completion: names that start with what is typed, then names that hol
   assert.equal(completeEmote("", list, 2).length, 2);
 });
 
-test("emote names from file names: the same rules as crates/voipc-media name_from", () => {
+test("emote names from file names", () => {
   assert.equal(nameFrom("Pog Champ.png"), "pog_champ");
   assert.equal(nameFrom("KEKW.gif"), "kekw");
   assert.equal(nameFrom("icon_123"), "icon_123", "a TeamSpeak icon has no extension");

@@ -156,6 +156,7 @@ const RUNS_CODE = new Set([
   "exe", "msi", "msix", "appx", "bat", "cmd", "com", "scr", "pif", "cpl", "ps1", "psm1", "vbs", "vbe", "js", "jse",
   "wsf", "wsh", "hta", "lnk", "url", "reg", "jar", "apk", "appimage", "sh", "bash", "zsh", "desktop", "run", "bin",
   "dmg", "pkg", "deb", "rpm", "command", "app", "py", "pyw", "pl", "rb", "ps1xml", "scf", "inf", "chm", "iso", "img",
+  "msp", "mst", "msc", "gadget", "application", "jnlp", "vb", "ws", "wsc", "sct", "xll",
 ]);
 
 /** Whether a file of this name can run code once opened (by its extension,

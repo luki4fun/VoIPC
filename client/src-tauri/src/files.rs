@@ -326,6 +326,8 @@ impl Files {
     /// answers to the adds waiting here.
     fn on_emote_message(&self, msg: ServerMessage) {
         let mut waits = lock(&self.emote_waits);
+        // An add that gave up waiting (`emote_add`'s timeout) takes no answer
+        waits.retain(|w| !w.done.is_closed());
         let mut answer =
             |pick: &dyn Fn(&EmoteWait) -> bool, out: Result<Option<String>, String>| -> bool {
                 match waits.iter().position(pick) {
@@ -457,6 +459,20 @@ impl Files {
 
     fn limits(&self) -> Result<&FileLimits, String> {
         self.limits.as_ref().ok_or_else(|| FILES_OFF.into())
+    }
+
+    /// How a moving picture posted here is kept: the relay's numbers, held to
+    /// their ranges (`FileLimits::animation`).
+    pub(crate) fn motion(&self) -> voipc_media::Motion {
+        self.limits
+            .as_ref()
+            .map_or_else(voipc_media::Motion::default, |l| {
+                let (side, mb) = l.animation();
+                voipc_media::Motion {
+                    side,
+                    keep: (mb as usize) << 20,
+                }
+            })
     }
 
     /// Store `blob` on the relay for a message in `conv`.
@@ -1383,8 +1399,11 @@ pub async fn file_image(
     op: Option<String>,
 ) -> Result<tauri::ipc::Response, String> {
     let profile = voipc_media::Profile::from_u32(profile).ok_or("no such picture profile")?;
+    let motion = files_of(&state, &server)
+        .await
+        .map_or_else(|_| voipc_media::Motion::default(), |f| f.motion());
     let plain = Box::pin(open_file(&state, &server, conv, file, op)).await?;
-    let clean = crate::media::sanitize(plain, profile, profile.max_output()).await?;
+    let clean = crate::media::sanitize(plain, profile, profile.max_output(), motion).await?;
     Ok(tauri::ipc::Response::new(clean.png))
 }
 
@@ -2047,7 +2066,7 @@ mod tests {
             .unwrap();
         assert_eq!((status, sha256(&body)), (200, hash));
         let p = voipc_media::Profile::Emote;
-        let clean = crate::media::sanitize(body, p, p.max_output())
+        let clean = crate::media::sanitize(body, p, p.max_output(), voipc_media::Motion::default())
             .await
             .unwrap();
         assert!(

@@ -53,6 +53,20 @@
   /** Why what was loaded is not shown here, when it is a picture or a video
    *  that is not. */
   let withheld = $state<string | null>(null);
+  /** A video or sound loaded while Settings → Files kept them from playing:
+   *  it plays here as soon as they may. */
+  let held = $state.raw<Shown | null>(null);
+  $effect(() => {
+    if (held && bytes && playsMedia($uiPrefs)) {
+      const is = held;
+      untrack(() => {
+        url = playableUrl(bytes!, is.mime);
+        shown = is;
+        held = null;
+        withheld = null;
+      });
+    }
+  });
 
   const progress = $derived(op ? $fileProgress.get(op) : undefined);
   const seeking = $derived(progress?.stage === "seeking");
@@ -86,6 +100,7 @@
       bytes = null;
       shown = null;
       withheld = null;
+      held = null;
     });
   });
 
@@ -113,10 +128,12 @@
             url = pictureUrl(png);
             shown = is;
           } catch (e) {
+            if (destroyed || wanted !== loadedFor) return null;
             withheld = `${String(e).replace(/^Error: /, "")}.`;
           }
         } else if (is && !playsMedia($uiPrefs)) {
           withheld = "Videos and sounds play here once Settings → Files allows it.";
+          held = is;
         } else if (is) {
           url = playableUrl(got, is.mime);
           shown = is;

@@ -1,19 +1,16 @@
-//! Emote packs: the pictures in a .zip (a .wastickers is one) read in memory,
-//! and what an emote may be called.
+//! Emote packs: the pictures in a .zip (a .wastickers is one) read in memory.
 //!
 //! Only what this needs of zip is read: the central directory, and entries
 //! stored or deflated. A name in the archive only ever names an emote, never a
 //! path; nothing of an archive touches the disk. Every size is checked while
-//! inflating, since the sizes an archive states can lie.
+//! inflating, since the sizes an archive states can lie. A file that cannot be
+//! read is set aside with why, and the rest of the pack still is.
 
 use crate::{Error, Result};
 
 pub const MAX_PACK_ENTRIES: usize = 1000;
 pub const MAX_ENTRY_BYTES: usize = 16 << 20;
 pub const MAX_PACK_BYTES: usize = 200 << 20;
-
-/// The longest emote name: `:name:` must fit a reaction (`MAX_EMOJI_BYTES`, 32).
-pub const NAME_MAX: usize = 30;
 
 /// One file of a pack: its own name (the last part of its path) and bytes.
 #[derive(Debug, PartialEq, Eq)]
@@ -27,6 +24,8 @@ pub struct Pack {
     /// A WhatsApp pack's `title.txt`.
     pub title: Option<String>,
     pub entries: Vec<Entry>,
+    /// Files not read, by name, with why (for a person).
+    pub skipped: Vec<(String, &'static str)>,
 }
 
 fn bad(why: &str) -> Error {
@@ -91,46 +90,45 @@ pub fn read_pack(b: &[u8]) -> Result<Pack> {
             .chars()
             .take(255)
             .collect::<String>();
-        let skip = path.ends_with('/')
+        if path.ends_with('/')
             || path.starts_with("__MACOSX/")
             || name.starts_with('.')
-            || name.is_empty();
-        // Encrypted (bit 0), or packed in a way not read here
-        if skip || flags & 1 != 0 || (method != 0 && method != 8) {
+            || name.is_empty()
+        {
             continue;
         }
-        if size > MAX_ENTRY_BYTES {
-            return Err(Error::TooLarge("a file in the pack is too big"));
-        }
-        if u32_at(b, local) != Some(0x0403_4B50) {
-            return Err(bad("a broken entry"));
-        }
-        let start = local
-            + 30
-            + usize::from(u16_at(b, local + 26).unwrap_or(0))
-            + usize::from(u16_at(b, local + 28).unwrap_or(0));
-        let data = b
-            .get(start..start.saturating_add(packed))
-            .ok_or_else(|| bad("an entry past its end"))?;
-        let limit = size.min(MAX_PACK_BYTES - total);
-        let bytes = if method == 0 {
-            data.to_vec()
+        let why = if flags & 1 != 0 {
+            Some("it is encrypted")
+        } else if method != 0 && method != 8 {
+            Some("it is packed in a way not read here")
+        } else if size > MAX_ENTRY_BYTES {
+            Some("it is too big")
         } else {
-            miniz_oxide::inflate::decompress_to_vec_with_limit(data, limit)
-                .map_err(|_| Error::TooLarge("a file in the pack unpacks to more than it says"))?
+            None
         };
-        if bytes.len() != size {
-            return Err(bad("an entry of the wrong size"));
+        if let Some(why) = why {
+            pack.skipped.push((name, why));
+            continue;
         }
-        total += bytes.len();
+        // Counted whether it reads or not: a pack of lying files is bounded
+        // like a pack of honest ones
+        total += size;
         if total > MAX_PACK_BYTES {
             return Err(Error::TooLarge("the pack unpacks to too much"));
         }
+        let bytes = match entry_bytes(b, local, packed, method, size) {
+            Ok(bytes) => bytes,
+            Err(why) => {
+                pack.skipped.push((name, why));
+                continue;
+            }
+        };
         let lower = name.to_ascii_lowercase();
         if lower == "title.txt" {
             pack.title = Some(label(&bytes));
         } else if lower == "author.txt" {
-        } else if lower.starts_with("tray") {
+        } else if lower.starts_with("tray") && lower.ends_with(".png") {
+            // WhatsApp's stickers are WebP; its tray icon is a PNG
             tray.push(Entry { name, bytes });
         } else {
             pack.entries.push(Entry { name, bytes });
@@ -141,6 +139,42 @@ pub fn read_pack(b: &[u8]) -> Result<Pack> {
         pack.entries.extend(tray);
     }
     Ok(pack)
+}
+
+/// An entry's `size` bytes, from its local header, or why not.
+fn entry_bytes(
+    b: &[u8],
+    local: usize,
+    packed: usize,
+    method: u16,
+    size: usize,
+) -> std::result::Result<Vec<u8>, &'static str> {
+    use miniz_oxide::inflate::{decompress_to_vec_with_limit, TINFLStatus};
+    if u32_at(b, local) != Some(0x0403_4B50) {
+        return Err("it is damaged");
+    }
+    let start = local
+        + 30
+        + usize::from(u16_at(b, local + 26).unwrap_or(0))
+        + usize::from(u16_at(b, local + 28).unwrap_or(0));
+    let data = b
+        .get(start..start.saturating_add(packed))
+        .ok_or("it is damaged")?;
+    let bytes = if method == 0 {
+        data.to_vec()
+    } else {
+        decompress_to_vec_with_limit(data, size).map_err(|e| {
+            if e.status == TINFLStatus::HasMoreOutput {
+                "it unpacks to more than it says"
+            } else {
+                "it is damaged"
+            }
+        })?
+    };
+    if bytes.len() != size {
+        return Err("it is not the size it says");
+    }
+    Ok(bytes)
 }
 
 /// A pack's title as a person may see it: one line, no control or direction
@@ -156,48 +190,4 @@ fn label(bytes: &[u8]) -> String {
         .collect::<String>()
         .trim()
         .to_string()
-}
-
-/// `^[a-z0-9_]{2,30}$`: what an emote may be called, here and on the relay.
-pub fn valid_name(s: &str) -> bool {
-    (2..=NAME_MAX).contains(&s.len())
-        && s.bytes()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'_')
-}
-
-/// An emote name from a file name: its stem in lower case, anything else as
-/// `_` (once, not at either end), cut to 30. None if under two characters
-/// are left.
-pub fn name_from(file: &str) -> Option<String> {
-    let stem = match file.rsplit_once('.') {
-        Some((s, ext)) if !s.is_empty() && ext.len() <= 5 => s,
-        _ => file,
-    };
-    let mut out = String::new();
-    for c in stem.chars() {
-        let c = c.to_ascii_lowercase();
-        if c.is_ascii_lowercase() || c.is_ascii_digit() {
-            out.push(c);
-        } else if !out.is_empty() && !out.ends_with('_') {
-            out.push('_');
-        }
-    }
-    let mut out = out.trim_end_matches('_').to_string();
-    out.truncate(NAME_MAX);
-    let out = out.trim_end_matches('_').to_string();
-    valid_name(&out).then_some(out)
-}
-
-/// `base`, or `base_2`, `base_3`… cut to fit: the first `taken` says is free.
-pub fn unique_name(base: &str, taken: &dyn Fn(&str) -> bool) -> Option<String> {
-    if !taken(base) {
-        return Some(base.to_string());
-    }
-    (2..1000).find_map(|n| {
-        let tail = format!("_{n}");
-        let mut head = base.to_string();
-        head.truncate(NAME_MAX - tail.len());
-        let name = format!("{}{tail}", head.trim_end_matches('_'));
-        (valid_name(&name) && !taken(&name)).then_some(name)
-    })
 }

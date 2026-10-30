@@ -314,13 +314,25 @@ mod desktop {
             }
             _ => return Err("no such source".into()),
         };
-        // Four at a time: a CDN is quick, and nothing here is in a hurry
+        // Four at a time: a CDN is quick, and nothing here is in a hurry. At
+        // most as much as a .zip may unpack to; the rest is named, not fetched
+        const MAX_TOTAL: usize = 200 << 20;
+        const FULL: &str = "past what one import takes: fetch the rest again after adding these";
         let mut files: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut total = 0;
         for chunk in listing.items.chunks(4) {
-            let got = futures_join(&c, chunk).await;
+            let got = if total < MAX_TOTAL {
+                futures_join(&c, chunk).await
+            } else {
+                chunk.iter().map(|_| Err(FULL.to_string())).collect()
+            };
             for (item, r) in chunk.iter().zip(got) {
                 match r {
-                    Ok(b) => files.push((item.name.clone(), b)),
+                    Ok(b) if total + b.len() <= MAX_TOTAL => {
+                        total += b.len();
+                        files.push((item.name.clone(), b));
+                    }
+                    Ok(_) => listing.skipped.push((item.name.clone(), FULL.into())),
                     Err(e) => listing.skipped.push((item.name.clone(), e)),
                 }
             }
@@ -347,8 +359,11 @@ mod desktop {
         }
         let mut out: Vec<Result<Vec<u8>, String>> =
             items.iter().map(|_| Err("not fetched".into())).collect();
-        while let Some(Ok((i, r))) = set.join_next().await {
-            out[i] = r;
+        // A task that failed leaves its "not fetched"; the others still count
+        while let Some(done) = set.join_next().await {
+            if let Ok((i, r)) = done {
+                out[i] = r;
+            }
         }
         out
     }

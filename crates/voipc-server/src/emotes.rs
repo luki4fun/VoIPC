@@ -395,9 +395,11 @@ impl EmoteStore {
     /// file, then renamed over the old, so a crash leaves one or the other.
     async fn save(&self, new_file: Option<([u8; 32], Bytes)>, gone_file: Option<[u8; 32]>) {
         let _turn = self.writing.lock().await;
-        let manifest = {
+        let (manifest, gone_file) = {
             let inner = self.lock();
-            Manifest {
+            // The same picture may have come back under another name meanwhile
+            let gone_file = gone_file.filter(|h| !inner.files.contains_key(h));
+            let manifest = Manifest {
                 stickers: inner.stickers,
                 emotes: inner
                     .emotes
@@ -409,7 +411,8 @@ impl EmoteStore {
                         pack: e.pack.clone(),
                     })
                     .collect(),
-            }
+            };
+            (manifest, gone_file)
         };
         let dir = self.dir.clone();
         let written = tokio::task::spawn_blocking(move || -> std::io::Result<()> {

@@ -3,6 +3,7 @@
 //! before anything is allocated for it, and the work a file can ask for is
 //! bounded however it lies about itself.
 
+use std::borrow::Cow;
 use std::io::Cursor;
 
 use crate::{exif, Error, Result};
@@ -14,7 +15,9 @@ pub const MAX_FRAME_PIXELS: u64 = 50_000_000;
 /// A moving picture's canvas: 4096 × 4096. Composing frames holds two.
 pub const MAX_ANIMATION_PIXELS: u64 = 16_777_216;
 pub const MAX_FRAMES: usize = 300;
-/// Pixels decoded over all frames: what bounds the time a file takes.
+/// Canvas pixels over all frames: every frame goes to the sink as a whole
+/// canvas, however small its own rectangle, so this bounds both the time a
+/// file takes and the frames kept of it.
 pub const MAX_WORK_PIXELS: u64 = 100_000_000;
 
 /// Where frames go: told the canvas size once, then given each frame.
@@ -124,9 +127,9 @@ pub fn decode(b: &[u8], sink: &mut dyn Sink) -> Result<u8> {
 }
 
 /// Gray, gray with alpha, RGB or RGBA as RGBA.
-fn to_rgba(buf: &[u8], channels: usize) -> Vec<u8> {
-    match channels {
-        4 => buf.to_vec(),
+fn to_rgba(buf: &[u8], channels: usize) -> Cow<'_, [u8]> {
+    let rgba: Vec<u8> = match channels {
+        4 => return Cow::Borrowed(buf),
         3 => buf
             .as_chunks::<3>()
             .0
@@ -140,7 +143,8 @@ fn to_rgba(buf: &[u8], channels: usize) -> Vec<u8> {
             .flat_map(|p| [p[0], p[0], p[0], p[1]])
             .collect(),
         _ => buf.iter().flat_map(|&g| [g, g, g, 255]).collect(),
-    }
+    };
+    Cow::Owned(rgba)
 }
 
 /// `src` over `dst`, both straight (not premultiplied) RGBA.
@@ -225,7 +229,7 @@ fn png_frames(b: &[u8], sink: &mut dyn Sink) -> Result<u8> {
         if !fits || fw != out.width || fh != out.height {
             return Err(Error::Corrupt("a frame outside the picture".into()));
         }
-        budget.take(fw, fh)?;
+        budget.take(w, h)?;
         let px = to_rgba(&buf[..out.buffer_size()], out.color_type.samples());
         let saved = (fc.dispose_op == png::DisposeOp::Previous).then(|| canvas.clone());
         for y in 0..fh {
@@ -281,7 +285,7 @@ fn gif_frames(b: &[u8], sink: &mut dyn Sink) -> Result<()> {
             u32::from(f.width),
             u32::from(f.height),
         );
-        budget.take(fw.max(1), fh.max(1))?;
+        budget.take(w, h)?;
         // What of the frame lies on the screen; a GIF may draw past it
         let (cw, ch) = (fw.min(w.saturating_sub(fx)), fh.min(h.saturating_sub(fy)));
         let saved = (f.dispose == gif::DisposalMethod::Previous).then(|| canvas.clone());

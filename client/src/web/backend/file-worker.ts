@@ -29,7 +29,7 @@ self.onmessage = (e: MessageEvent) => {
       // Opened and sanitized here: the file's own bytes never leave the worker
       checkOpenInput(job.size, job.blob);
       const plain = openFile(job.hash, job.key, job.size, job.z, job.blob);
-      const out = sanitizeIn(job.media, plain, job.profile);
+      const out = sanitizeIn(job.media, plain, job.profile, 0, job.motion);
       self.postMessage({ ok: out.png }, { transfer: [out.png.buffer] });
     } else if (job.op === "seal") {
       checkSealInput(job.plain);

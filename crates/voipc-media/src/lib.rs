@@ -9,7 +9,6 @@
 //!
 //! - `sanitize`: any PNG/APNG, GIF, WebP or JPEG in, a fresh PNG out.
 //! - `read_pack`: the pictures in a .zip or .wastickers, in memory only.
-//! - `name_from`, `valid_name`: what an emote may be called.
 
 #![forbid(unsafe_code)]
 
@@ -24,7 +23,7 @@ pub mod fuzz;
 #[cfg(test)]
 mod tests;
 
-pub use pack::{name_from, read_pack, unique_name, valid_name, Entry, Pack, NAME_MAX};
+pub use pack::{read_pack, Entry, Pack};
 
 /// Bumped whenever what `sanitize` writes may change: a copy cached under an
 /// older version is made again (a decoder fix reaches every cached picture).
@@ -37,9 +36,29 @@ pub enum Profile {
     Emote,
     /// A message of its own: fits 320 × 320.
     Sticker,
-    /// A picture in the chat: at most 2560 on its long side. Saving it keeps
-    /// the original; this is only what is drawn.
+    /// A picture in the chat: at most 2560 on its long side, and a moving one
+    /// as its `Motion` says. Saving it keeps the original; this is only what
+    /// is drawn.
     Photo,
+}
+
+/// How much of a moving picture is kept: fitted into `side` × `side` (never
+/// past its profile's box), and at most `keep` bytes of frames, past which
+/// every other frame goes (it plays choppier, as long). A chat picture's come
+/// from its server (`FileLimits`); the default is any other's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Motion {
+    pub side: u32,
+    pub keep: usize,
+}
+
+impl Default for Motion {
+    fn default() -> Motion {
+        Motion {
+            side: 1024,
+            keep: 128 << 20,
+        }
+    }
 }
 
 impl Profile {
@@ -122,18 +141,24 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// output cap. Nothing of the input but its pixels and frame times survives:
 /// no metadata, no colour profile, no chunk this crate did not write.
 pub fn sanitize(bytes: &[u8], profile: Profile) -> Result<Clean> {
-    sanitize_capped(bytes, profile, profile.max_output())
+    sanitize_capped(bytes, profile, profile.max_output(), Motion::default())
 }
 
-/// `sanitize`, with at most `max_out` bytes of PNG: an animation over it
-/// loses every other frame until a few are left, then all but its first.
-pub fn sanitize_capped(bytes: &[u8], profile: Profile, max_out: usize) -> Result<Clean> {
+/// `sanitize`, with at most `max_out` bytes of PNG (an animation over it
+/// loses every other frame until a few are left, then all but its first),
+/// and a moving picture kept as `motion` says.
+pub fn sanitize_capped(
+    bytes: &[u8],
+    profile: Profile,
+    max_out: usize,
+    motion: Motion,
+) -> Result<Clean> {
     if bytes.len() > profile.max_input() {
         return Err(Error::TooLarge("the file is too big"));
     }
-    let mut sink = resize::Fit::new(profile.side());
+    let mut sink = resize::Fit::new(profile.side(), motion);
     let orientation = decode::decode(bytes, &mut sink)?;
-    let (mut frames, mut w, mut h) = sink.finish()?;
+    let (mut frames, mut w, mut h, thinned) = sink.finish()?;
     if orientation > 1 {
         let (mut ow, mut oh) = (w, h);
         for f in &mut frames {
@@ -146,7 +171,7 @@ pub fn sanitize_capped(bytes: &[u8], profile: Profile, max_out: usize) -> Result
     } else {
         png::Compression::Balanced
     };
-    let mut trimmed = false;
+    let mut trimmed = thinned;
     loop {
         let png = encode::write(&frames, w, h, compression)?;
         if png.len() <= max_out {

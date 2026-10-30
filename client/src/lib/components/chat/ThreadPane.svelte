@@ -102,11 +102,12 @@
     onsend?.(content, { replyTo: target.id!, thread: root.id! });
   }
 
-  /** A file into the thread: the first one answers what was being answered. */
-  function sendFile(file: File, original: boolean, caption: string, op: string): Promise<void> {
+  /** A file into the thread: the first one that goes answers what was being
+   *  answered; a failure keeps it, as the main composer does. */
+  async function sendFile(file: File, original: boolean, caption: string, op: string): Promise<void> {
     const target = replyingTo ?? root;
-    replyingTo = null;
-    return onsendfile!(file, original, caption, op, { replyTo: target.id!, thread: root.id! });
+    await onsendfile!(file, original, caption, op, { replyTo: target.id!, thread: root.id! });
+    if (replyingTo === target) replyingTo = null;
   }
 
   function reply(m: ChatMessage) {

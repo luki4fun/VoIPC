@@ -2,6 +2,9 @@ use std::net::{SocketAddr, ToSocketAddrs};
 
 use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
+use voipc_protocol::types::{
+    ANIMATION_MB, ANIMATION_MB_DEFAULT, ANIMATION_SIDE, ANIMATION_SIDE_DEFAULT,
+};
 
 /// Server configuration, loaded from a TOML file. Unknown keys are refused, so
 /// a typo (`tcp_fallbak`) stops the start instead of quietly keeping a default,
@@ -178,6 +181,11 @@ pub struct FilesConfig {
     /// Relative to the working directory (`/data` in the container). Only
     /// blob files are wiped from it at start, never anything else there.
     pub dir: String,
+    /// How members' apps keep a moving picture posted here: fitted into this
+    /// many pixels a side, and at most this many MiB of its frames (more:
+    /// choppier). Sent to the apps, which hold them to the same ranges.
+    pub animation_side: u32,
+    pub animation_mb: u32,
 }
 
 impl Default for FilesConfig {
@@ -191,6 +199,8 @@ impl Default for FilesConfig {
             upload_mb_per_hour: 200,
             download_mb_per_hour: 2000,
             dir: "files".into(),
+            animation_side: ANIMATION_SIDE_DEFAULT,
+            animation_mb: ANIMATION_MB_DEFAULT,
         }
     }
 }
@@ -287,12 +297,24 @@ impl ServerConfig {
             if f.dir.trim().is_empty() {
                 return Err(anyhow!("[files] dir must name a directory"));
             }
+            if !ANIMATION_SIDE.contains(&f.animation_side)
+                || !ANIMATION_MB.contains(&f.animation_mb)
+            {
+                return Err(anyhow!(
+                    "[files] animation_side must be {} to {}, and animation_mb {} to {}: the apps hold them to that",
+                    ANIMATION_SIDE.start(),
+                    ANIMATION_SIDE.end(),
+                    ANIMATION_MB.start(),
+                    ANIMATION_MB.end()
+                ));
+            }
         }
         let e = &self.emotes;
         if e.enabled {
-            if !(1..=1024).contains(&e.max_emote_kb) || !(1..=2048).contains(&e.max_sticker_kb) {
+            // The apps read an emote's file as one answer of at most 1 MiB
+            if !(1..=1024).contains(&e.max_emote_kb) || !(1..=1024).contains(&e.max_sticker_kb) {
                 return Err(anyhow!(
-                    "[emotes] max_emote_kb must be 1 to 1024, and max_sticker_kb 1 to 2048"
+                    "[emotes] max_emote_kb and max_sticker_kb must be 1 to 1024"
                 ));
             }
             if !(1..=1024).contains(&e.max_total_mb) {
@@ -369,6 +391,24 @@ impl Default for ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn moving_pictures_are_kept_within_the_ranges_the_apps_hold_them_to() {
+        let mut c = ServerConfig::default();
+        assert!(c.validate().is_ok());
+        c.files.animation_side = 100;
+        assert!(c.validate().is_err());
+        c.files.animation_side = 2560;
+        c.files.animation_mb = 513;
+        assert!(c.validate().is_err());
+        // What an app does with a relay's numbers, whatever they are
+        let sent = voipc_protocol::types::FileLimits {
+            max_bytes: 0,
+            animation_side: u32::MAX,
+            animation_mb: 0,
+        };
+        assert_eq!(sent.animation(), (2560, 16));
+    }
 
     #[test]
     fn the_emotes_dir_is_never_the_files_dir_nor_inside_or_around_it() {

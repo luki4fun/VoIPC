@@ -13,7 +13,7 @@
 // as long as the tab. The front end drops what no message refers to any more
 // (file_cache_retain), as it does on the desktop.
 
-import { mediaModule, type Sanitized } from "./media";
+import { mediaModule, type Motion, type Pack, type Sanitized } from "./media";
 import { fileRef } from "../../lib/chat-rules";
 import { Asks, asksAgain } from "../../lib/file-rules";
 import { toHex } from "../../lib/hex";
@@ -259,6 +259,8 @@ export class Files {
     private readonly origin: string,
     /** Authenticated.files.max_bytes; null when the relay keeps no files. */
     private readonly maxBytes: number | null,
+    /** How a moving picture posted here is kept (`motionOf`). */
+    readonly motion: Motion | null = null,
   ) {}
 
   /** A file message from the relay. */
@@ -738,7 +740,7 @@ export async function fileImage(
     if (!blob) throw new Error("The file is not on this device");
   }
   const media = await mediaModule();
-  return whole(await inWorker<Uint8Array>({ op: "image", ...file, blob, profile, media }));
+  return whole(await inWorker<Uint8Array>({ op: "image", ...file, blob, profile, media, motion: files?.motion ?? null }));
 }
 
 /** Any picture `bytes` (one picked from this device, an emote's) as `profile`,
@@ -748,7 +750,7 @@ export async function sanitizeImage(bytes: Uint8Array, profile: number, maxOut =
 }
 
 /** The files of a .zip or .wastickers an admin picked, read in a worker. */
-export async function readPack(bytes: Uint8Array): Promise<{ title: string | null; entries: { name: string; bytes: Uint8Array }[] }> {
+export async function readPack(bytes: Uint8Array): Promise<Pack> {
   return inWorker({ op: "pack", bytes, media: await mediaModule() });
 }
 

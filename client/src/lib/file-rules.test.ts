@@ -139,7 +139,7 @@ test("a download whose tickets bring bytes never runs out of asks (R3-05)", () =
 });
 
 test("a file a system can run is known by its extension, whatever its case", () => {
-  for (const name of ["setup.exe", "RUN.BAT", "x.ps1", "game.AppImage", "evil.desktop", "a.tar.lnk", "app.apk "]) {
+  for (const name of ["setup.exe", "RUN.BAT", "x.ps1", "game.AppImage", "evil.desktop", "a.tar.lnk", "app.apk ", "patch.msp", "launch.jnlp"]) {
     assert.equal(runsCode(name), true, name);
   }
   for (const name of ["photo.jpg", "notes.txt", "exe", "archive.zip", "song.mp3", "README", ".bashrc.txt"]) {

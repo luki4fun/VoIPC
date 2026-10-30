@@ -17,7 +17,7 @@
   let { name, hash, size = "inline" }: Props = $props();
 
   const e = $derived<Emote | undefined>(
-    hash ? emoteOf(hash, $emoteSets.emotes) : $emoteSets.emotes.find((x) => x.name === name && !x.sticker),
+    hash ? emoteOf(hash, $emoteSets.emotes, name) : $emoteSets.emotes.find((x) => x.name === name && !x.sticker),
   );
   const urls = $derived(e ? $emoteUrls.get(e.hash) : undefined);
   const mode = $derived($reducedMotion ? "never" : $uiPrefs.animate_emotes);

@@ -23,10 +23,15 @@ function unframe<H>(buf: ArrayBuffer, lengths: (head: H) => number[]): { head: H
 
 /** The files of a .zip or .wastickers, read in memory by the sanitizer's
  *  crate: names only ever name emotes, nothing touches the disk. */
-export async function readPack(bytes: Uint8Array): Promise<{ title: string | null; entries: { name: string; bytes: Uint8Array }[] }> {
+export async function readPack(
+  bytes: Uint8Array,
+): Promise<{ title: string | null; entries: { name: string; bytes: Uint8Array }[]; skipped: { name: string; why: string }[] }> {
   const buf = await invokeWithBytes<ArrayBuffer>("read_emote_pack", bytes, {});
-  const { head, parts } = unframe<{ title: string | null; entries: { name: string; len: number }[] }>(buf, (h) => h.entries.map((e) => e.len));
-  return { title: head.title, entries: head.entries.map((e, i) => ({ name: e.name, bytes: parts[i] })) };
+  const { head, parts } = unframe<{ title: string | null; entries: { name: string; len: number }[]; skipped?: { name: string; why: string }[] }>(
+    buf,
+    (h) => h.entries.map((e) => e.len),
+  );
+  return { title: head.title, entries: head.entries.map((e, i) => ({ name: e.name, bytes: parts[i] })), skipped: head.skipped ?? [] };
 }
 
 /** One-click import (desktop only, emote_sources.rs): a Discord server's

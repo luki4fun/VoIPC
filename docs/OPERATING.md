@@ -233,7 +233,7 @@ The simplest way is a host directory that user 65532 owns:
     install -d -o 65532 -g 65532 -m 0700 /srv/voipc
     install -o 65532 -g 65532 -m 0600 server.toml cert.pem key.pem /srv/voipc/
     docker run -d --name voipc -v /srv/voipc:/data \
-      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.4.0-rc.1
+      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.4.0-rc.2
     docker exec voipc /voipc-server --config /data/server.toml admin grant <name> admin
 
 With a named volume instead, copy the files in with a throwaway container first, then run the
@@ -268,7 +268,16 @@ max_total_mb = 1024        # all blobs together; when full, the least recently u
 upload_mb_per_hour = 200   # per connection and per address (an IPv6 /64)
 download_mb_per_hour = 2000
 dir = "files"              # relative to the working directory: /data/files in the container
+animation_side = 1024      # a moving picture posted here is drawn at most this many pixels a side (256 to 2560)
+animation_mb = 128         # and its frames take at most this many MiB in each app (16 to 512)
 ```
+
+- **Moving pictures (1.4).** Every member's app draws a GIF, APNG or animated WebP from the chat
+  itself, and keeps all its frames in memory while it is on screen. `animation_side` and
+  `animation_mb` say how much: a longer or larger one keeps every other frame, so it plays
+  choppier but as long, and is never refused for that. The relay tells the apps, which hold both
+  to the ranges above whatever a relay says. A still picture is always drawn up to 2560 pixels a
+  side.
 
 - **Wiped at every start.** Only the blob files in `dir` are deleted: their names are 64 hex
   digits, or that and `.<n>.part` (an upload under way, or a blob on its way out). A file that
@@ -315,7 +324,7 @@ stickers, off until an admin turns them on there, go as messages of their own.
 [emotes]
 enabled = true             # false: no emotes, and the apps show none
 max_emote_kb = 256         # the largest emote file an admin may add (1 to 1024)
-max_sticker_kb = 512       # and sticker file (1 to 2048)
+max_sticker_kb = 512       # and sticker file (1 to 1024)
 max_total_mb = 32          # all of them together, held in memory (1 to 1024)
 dir = "emotes"             # kept across restarts; never [files] dir, nor inside or around it
 ```

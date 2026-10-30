@@ -1,8 +1,8 @@
-//! Fuzz target: any bytes as a picture in every profile, as a pack, and as a
-//! name. `fuzz/fuzz_targets/media.rs` calls it under cargo-fuzz; the test
-//! below replays `fuzz/regressions/media/*` on stable.
+//! Fuzz target: any bytes as a picture in every profile, and as a pack.
+//! `fuzz/fuzz_targets/media.rs` calls it under cargo-fuzz; the test below
+//! replays `fuzz/regressions/media/*` on stable.
 
-use crate::{name_from, read_pack, sanitize, Profile};
+use crate::{read_pack, sanitize, Profile};
 
 pub fn fuzz_media(data: &[u8]) {
     for p in [Profile::Emote, Profile::Sticker, Profile::Photo] {
@@ -15,11 +15,6 @@ pub fn fuzz_media(data: &[u8]) {
     if let Ok(pack) = read_pack(data) {
         for e in pack.entries.iter().take(4) {
             let _ = sanitize(&e.bytes, Profile::Emote);
-        }
-    }
-    if let Ok(text) = std::str::from_utf8(data) {
-        if let Some(name) = name_from(text) {
-            assert!(crate::valid_name(&name));
         }
     }
 }

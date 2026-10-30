@@ -1665,6 +1665,12 @@
     "STRUCT": [
       {
         "max_bytes": "U64"
+      },
+      {
+        "animation_side": "U32"
+      },
+      {
+        "animation_mb": "U32"
       }
     ]
   },

@@ -63,7 +63,11 @@ function ask(server: string, e: Emote, still: boolean) {
       const url = pictureUrl(png);
       emoteUrls.of(server).update((m) => {
         const next = new Map(m);
-        next.set(e.hash, { ...next.get(e.hash), [still ? "still" : "url"]: url });
+        const had = next.get(e.hash);
+        // Two jobs for one picture (a sticker and an emote of one file): one URL
+        const old = had?.[still ? "still" : "url"];
+        if (old) URL.revokeObjectURL(old);
+        next.set(e.hash, { ...had, [still ? "still" : "url"]: url });
         return next;
       });
     } catch (err) {
@@ -90,6 +94,13 @@ export function setEmotes(server: string, set: EmoteSet): void {
   // What this device made for emotes no open server lists any more goes
   const all = [...get(emoteSets.all()).values()].flatMap((s) => s.emotes.map((e) => e.hash));
   invoke("emote_cache_retain", { keep: [...new Set(all)] }).catch(() => {});
+}
+
+/** A connection's end (connect.ts `resetServer`, before `dropServer`): its
+ *  pictures let go, and the next connection's list asks for them again. */
+export function dropEmotes(server: string): void {
+  for (const u of get(emoteUrls.peek(server)).values()) for (const url of [u.url, u.still]) if (url) URL.revokeObjectURL(url);
+  for (const k of [...asked]) if (k.startsWith(`${server}|`)) asked.delete(k);
 }
 
 /** The first frame of `e`, for a reader who animates only on hover. */

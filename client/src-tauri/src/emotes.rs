@@ -12,7 +12,7 @@ use std::time::Duration;
 use ring::digest::{digest, SHA256};
 use serde::Deserialize;
 use tauri::State;
-use voipc_media::{Profile, SANITIZER_VERSION};
+use voipc_media::{Motion, Profile, SANITIZER_VERSION};
 use voipc_protocol::conv::{hex, unhex};
 use voipc_protocol::messages::ClientMessage;
 use voipc_protocol::types::Emote;
@@ -103,7 +103,7 @@ pub async fn emote_image(
         return Err("the server gave another file than the emote's".into());
     }
     let p = profile(sticker);
-    let clean = crate::media::sanitize(body, p, p.max_output()).await?;
+    let clean = crate::media::sanitize(body, p, p.max_output(), Motion::default()).await?;
     let (png, first) = cached(&hash, sticker);
     let (out, still_png) = (clean.png.clone(), clean.still.clone());
     let _ = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
@@ -171,13 +171,13 @@ pub async fn prepare_emote(
         .ok_or("prepare_emote needs its x-voipc-prepare header")?;
     let src = body_bytes(&request, "prepare_emote")?;
     let p = profile(args.sticker);
-    let full = crate::media::sanitize(src.clone(), p, p.max_output()).await?;
+    let full = crate::media::sanitize(src.clone(), p, p.max_output(), Motion::default()).await?;
     let (upload, how) = if full.png.len() <= args.max_bytes && !full.trimmed {
         (full.png.clone(), "clean")
     } else if src.len() <= args.max_bytes {
         (src, "original")
     } else {
-        let fit = crate::media::sanitize(src, p, args.max_bytes).await?;
+        let fit = crate::media::sanitize(src, p, args.max_bytes, Motion::default()).await?;
         (fit.png, if fit.frames > 1 { "trimmed" } else { "still" })
     };
     let still = full.still.clone().unwrap_or_default();
@@ -212,6 +212,7 @@ pub async fn read_emote_pack(
     let head = serde_json::json!({
         "title": pack.title,
         "entries": pack.entries.iter().map(|e| serde_json::json!({ "name": e.name, "len": e.bytes.len() })).collect::<Vec<_>>(),
+        "skipped": pack.skipped.iter().map(|(name, why)| serde_json::json!({ "name": name, "why": why })).collect::<Vec<_>>(),
     })
     .to_string();
     let mut out = (head.len() as u32).to_le_bytes().to_vec();

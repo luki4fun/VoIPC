@@ -2,7 +2,7 @@
 //! holds more than one full-size canvas.
 
 use crate::decode::Sink;
-use crate::{Error, Result};
+use crate::{Error, Motion, Result};
 
 pub struct Frame {
     pub rgba: Vec<u8>,
@@ -10,29 +10,40 @@ pub struct Frame {
 }
 
 /// A `Sink` that keeps each frame fitted into `side` × `side` (never made
-/// bigger), and a frame just like the one before only as a longer one.
+/// bigger), and a frame just like the one before only as a longer one. Once a
+/// second frame comes, the picture moves: it is fitted into `motion.side`, and
+/// past `motion.keep` bytes of frames only one in `stride` is kept.
 pub struct Fit {
     side: u32,
+    motion: Motion,
     src: (u32, u32),
     dst: (u32, u32),
     frames: Vec<Frame>,
+    seen: usize,
+    stride: usize,
+    thinned: bool,
 }
 
 impl Fit {
-    pub fn new(side: u32) -> Fit {
+    pub fn new(side: u32, motion: Motion) -> Fit {
         Fit {
             side,
+            motion,
             src: (0, 0),
             dst: (0, 0),
             frames: Vec::new(),
+            seen: 0,
+            stride: 1,
+            thinned: false,
         }
     }
 
-    pub fn finish(self) -> Result<(Vec<Frame>, u32, u32)> {
+    /// The frames, their size, and whether frames were dropped to keep them.
+    pub fn finish(self) -> Result<(Vec<Frame>, u32, u32, bool)> {
         if self.frames.is_empty() {
             return Err(Error::Corrupt("no frame".into()));
         }
-        Ok((self.frames, self.dst.0, self.dst.1))
+        Ok((self.frames, self.dst.0, self.dst.1, self.thinned))
     }
 }
 
@@ -65,6 +76,26 @@ impl Sink for Fit {
         if canvas.len() != (w as usize) * (h as usize) * 4 {
             return Err(Error::Corrupt("a frame of the wrong size".into()));
         }
+        let n = self.seen;
+        self.seen += 1;
+        if n == 1 {
+            // It moves: what was kept of its first frame goes into the smaller box
+            let to = fit(w, h, self.side.min(self.motion.side));
+            if to != (tw, th) {
+                for f in &mut self.frames {
+                    f.rgba = shrink(&f.rgba, tw, th, to.0, to.1);
+                }
+                self.dst = to;
+            }
+        }
+        if !n.is_multiple_of(self.stride) {
+            // Thinned out: it lengthens the frame kept before it
+            if let Some(last) = self.frames.last_mut() {
+                last.delay_ms = last.delay_ms.saturating_add(delay_ms);
+            }
+            return Ok(());
+        }
+        let (tw, th) = self.dst;
         let rgba = if (tw, th) == (w, h) {
             canvas.to_vec()
         } else {
@@ -75,6 +106,12 @@ impl Sink for Fit {
                 last.delay_ms = last.delay_ms.saturating_add(delay_ms)
             }
             _ => self.frames.push(Frame { rgba, delay_ms }),
+        }
+        let frame_bytes = tw as usize * th as usize * 4;
+        while self.frames.len() > 1 && self.frames.len() * frame_bytes > self.motion.keep {
+            self.frames = every_other(std::mem::take(&mut self.frames));
+            self.stride *= 2;
+            self.thinned = true;
         }
         Ok(())
     }

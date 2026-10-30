@@ -715,7 +715,7 @@
     </div>
     <div class="react-grid">
       {#if pickCategory === -1}
-        {#each serverEmotes as e (e.hash)}
+        {#each serverEmotes as e (e.name)}
           <button class="react-item" type="button" aria-label="React with :{e.name}:" title=":{e.name}:" onclick={() => pick(`:${e.name}:`)}
             ><Emote name={e.name} hash={e.hash.slice(0, 20)} /></button
           >

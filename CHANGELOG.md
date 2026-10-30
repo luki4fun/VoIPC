@@ -22,7 +22,8 @@ update the server, then the apps.
 - **Adding them takes one drop.** Pictures, a folder, a `.zip` or a WhatsApp
   `.wastickers`: each is named after its file, made to fit, and shown before it
   goes, with anything that cannot be used set aside and why (a Telegram
-  animated sticker, a video, a file that only claims to be a picture). The
+  animated sticker, a video, a file that only claims to be a picture, a file of
+  a pack that is damaged, encrypted or too big, while the rest of it comes). The
   desktop app also fetches a 7TV emote set, a Twitch channel's BetterTTV emotes,
   or a Discord server's emojis or stickers (with a bot of yours in it; the token
   is used once and kept nowhere).
@@ -31,7 +32,8 @@ update the server, then the apps.
   picture. Renaming keeps them.
 - **For relays:** `[emotes]` is a new section, on by default, empty until an
   admin adds some; they are kept in `emotes/` across restarts, readable, and the
-  relay never decodes them. `docs/OPERATING.md` §12 has every key.
+  relay never decodes them. An emote or sticker file is at most 1 MiB.
+  `docs/OPERATING.md` §12 has every key.
 
 ### Pictures are made safe before they are shown
 
@@ -41,6 +43,11 @@ update the server, then the apps.
   carries nothing of the file but its pixels. A crafted picture (the kind that
   has broken browsers before) can at worst fail to show. *Download* still saves
   the file exactly as it came. A phone photo is shown the right way up.
+- **A moving picture in the chat is drawn at most 1024 pixels a side,** and a
+  long one with every other frame (as long, a little choppier): one picture's
+  frames take at most 128 MiB of memory. A server may set both, up to 2560
+  pixels and 512 MiB: `[files] animation_side` and `animation_mb`
+  (`docs/OPERATING.md` §11).
 - **AVIF pictures are saved, not shown.**
 - **Videos and sounds** still play through your system's decoders, after a
   click. A new switch in Settings → Files turns that off; it starts off in the

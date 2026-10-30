@@ -1,6 +1,6 @@
 [package]
 name = "voipc-web"
-version = "1.4.0-rc.1"
+version = "1.4.0-rc.2"
 edition = "2021"
 license = "MIT"
 rust-version = "1.99"

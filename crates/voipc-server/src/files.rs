@@ -359,6 +359,7 @@ struct Limits {
     max_total: u64,
     up_per_hour: f64,
     down_per_hour: f64,
+    animation: (u32, u32),
 }
 
 struct Blob {
@@ -654,6 +655,7 @@ impl FileStore {
                 max_total: config.max_total_mb as u64 * MIB,
                 up_per_hour: (config.upload_mb_per_hour as u64 * MIB) as f64,
                 down_per_hour: (config.download_mb_per_hour as u64 * MIB) as f64,
+                animation: (config.animation_side, config.animation_mb),
             },
             inner: Mutex::new(Inner::default()),
             in_flight: Arc::new(Semaphore::new(GET_BYTES_IN_FLIGHT / KIB)),
@@ -664,6 +666,8 @@ impl FileStore {
     pub fn limits(&self) -> FileLimits {
         FileLimits {
             max_bytes: self.limits.max_bytes,
+            animation_side: self.limits.animation.0,
+            animation_mb: self.limits.animation.1,
         }
     }
 

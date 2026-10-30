@@ -82,6 +82,32 @@ pub struct RelayAccounts {
 pub struct FileLimits {
     /// Largest blob it takes, in bytes: the sealed file, not the file.
     pub max_bytes: u64,
+    /// How the apps keep a moving picture posted here (protocol v14): fitted
+    /// into this many pixels a side, and at most this many MiB of its frames,
+    /// past which every other frame goes. An app holds both to
+    /// `ANIMATION_SIDE` and `ANIMATION_MB`, whatever a relay says.
+    pub animation_side: u32,
+    pub animation_mb: u32,
+}
+
+/// What `FileLimits.animation_side` may be, and its default.
+pub const ANIMATION_SIDE: std::ops::RangeInclusive<u32> = 256..=2560;
+pub const ANIMATION_SIDE_DEFAULT: u32 = 1024;
+/// What `FileLimits.animation_mb` may be, and its default.
+pub const ANIMATION_MB: std::ops::RangeInclusive<u32> = 16..=512;
+pub const ANIMATION_MB_DEFAULT: u32 = 128;
+
+impl FileLimits {
+    /// `animation_side` and `animation_mb` as an app keeps them: a relay's
+    /// numbers held to their ranges.
+    pub fn animation(&self) -> (u32, u32) {
+        (
+            self.animation_side
+                .clamp(*ANIMATION_SIDE.start(), *ANIMATION_SIDE.end()),
+            self.animation_mb
+                .clamp(*ANIMATION_MB.start(), *ANIMATION_MB.end()),
+        )
+    }
 }
 
 /// An emote or sticker of the server (protocol v14). Admins add them; every

@@ -88,6 +88,7 @@ that cannot make the directory starts without files instead of refusing to start
 **What changed in 1.4:** `[emotes]` is a new section, on by default: an empty list until an
 admin adds emotes, kept in `emotes/` under the working directory. `[emotes] enabled = false`
 keeps the old behaviour. Its `dir` must not be `[files] dir`, nor inside or around it.
+`[files]` has two new keys, `animation_side` and `animation_mb`, with defaults.
 
 **An older relay on a newer config:** it refuses the unknown key, never ignores it, so a relay
 cannot silently run without a setting it was given. The JSON files stay lenient: a rewrite of

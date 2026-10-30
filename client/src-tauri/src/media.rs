@@ -4,15 +4,21 @@
 //! budgets bound the time one takes, so no clock stops it.
 
 use tokio::sync::Semaphore;
-use voipc_media::{Clean, Profile};
+use voipc_media::{Clean, Motion, Profile};
 
 /// Pictures sanitized at once: each may hold a large canvas.
 static SLOTS: Semaphore = Semaphore::const_new(2);
 
-pub async fn sanitize(bytes: Vec<u8>, profile: Profile, max_out: usize) -> Result<Clean, String> {
+pub async fn sanitize(
+    bytes: Vec<u8>,
+    profile: Profile,
+    max_out: usize,
+    motion: Motion,
+) -> Result<Clean, String> {
     let _slot = SLOTS.acquire().await.map_err(|e| e.to_string())?;
-    let run =
-        move || std::panic::catch_unwind(|| voipc_media::sanitize_capped(&bytes, profile, max_out));
+    let run = move || {
+        std::panic::catch_unwind(|| voipc_media::sanitize_capped(&bytes, profile, max_out, motion))
+    };
     match tokio::task::spawn_blocking(run).await {
         Ok(Ok(Ok(clean))) => Ok(clean),
         Ok(Ok(Err(e))) => Err(e.to_string()),

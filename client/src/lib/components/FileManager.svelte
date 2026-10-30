@@ -212,6 +212,7 @@
       addNotification(`The files could not be removed: ${e}`, "error");
     }
     await reload();
+    picked = new Set([...picked].filter((h) => !hashes.includes(h)));
     await tick();
     if (root && !root.contains(document.activeElement)) {
       (from?.isConnected ? from.querySelector<HTMLElement>("button") : null)?.focus() ?? root.focus();

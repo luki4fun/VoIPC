@@ -498,6 +498,24 @@ fn what_is_too_big_is_refused_before_anything_is_allocated_for_it() {
         sanitize(&gif_of(1, 1, &many), Profile::Emote).unwrap_err(),
         Error::TooLarge("the animation has too many frames")
     );
+    // A few KB of one-pixel frames on a big screen: each frame is a whole canvas
+    let dots: Vec<_> = (0..100u16)
+        .map(|i| {
+            (
+                i,
+                i,
+                1,
+                1,
+                vec![(i % 2) as u8],
+                gif::DisposalMethod::Keep,
+                10,
+            )
+        })
+        .collect();
+    assert_eq!(
+        sanitize(&gif_of(2048, 2048, &dots), Profile::Photo).unwrap_err(),
+        Error::TooLarge("the animation is too long to show")
+    );
     assert!(matches!(
         sanitize(&vec![0u8; (16 << 20) + 1], Profile::Emote),
         Err(Error::TooLarge(_))
@@ -584,20 +602,77 @@ fn an_animation_over_its_cap_loses_frames_then_its_movement() {
         }
         wr.finish().unwrap();
     }
-    let all = sanitize_capped(&out, Profile::Emote, usize::MAX).unwrap();
+    let all = sanitize_capped(&out, Profile::Emote, usize::MAX, Motion::default()).unwrap();
     assert_eq!((all.frames, all.trimmed), (40, false));
-    let fewer = sanitize_capped(&out, Profile::Emote, all.png.len() / 3).unwrap();
+    let fewer =
+        sanitize_capped(&out, Profile::Emote, all.png.len() / 3, Motion::default()).unwrap();
     assert!(
         fewer.trimmed && fewer.frames < 40 && fewer.frames > 1,
         "{}",
         fewer.frames
     );
-    let still = sanitize_capped(&out, Profile::Emote, 64 * 64 * 5).unwrap();
+    let still = sanitize_capped(&out, Profile::Emote, 64 * 64 * 5, Motion::default()).unwrap();
     assert_eq!((still.frames, still.trimmed), (1, true));
     assert!(matches!(
-        sanitize_capped(&out, Profile::Emote, 100),
+        sanitize_capped(&out, Profile::Emote, 100, Motion::default()),
         Err(Error::TooLarge(_))
     ));
+}
+
+/// The time an APNG takes to play once, from its frames' own delays.
+fn total_ms(apng: &[u8]) -> u32 {
+    let mut d = png::Decoder::new(std::io::Cursor::new(apng))
+        .read_info()
+        .unwrap();
+    let mut buf = vec![0; d.output_buffer_size().unwrap()];
+    let mut ms = 0;
+    while d.next_frame(&mut buf).is_ok() {
+        if let Some(fc) = d.info().frame_control() {
+            ms += u32::from(fc.delay_num) * 1000 / u32::from(fc.delay_den.max(1));
+        }
+    }
+    ms
+}
+
+#[test]
+fn a_moving_chat_picture_is_kept_as_its_server_says() {
+    // Ten different frames on a 1600 × 1600 screen, a tenth of a second each
+    let frames: Vec<_> = (0..10u16)
+        .map(|i| {
+            let at = i * 100;
+            (
+                at,
+                at,
+                1,
+                1,
+                vec![(i % 2) as u8],
+                gif::DisposalMethod::Keep,
+                10,
+            )
+        })
+        .collect();
+    let g = gif_of(1600, 1600, &frames);
+    let all = sanitize(&g, Profile::Photo).unwrap();
+    assert_eq!(
+        (all.w, all.h, all.frames, all.trimmed),
+        (1024, 1024, 10, false)
+    );
+    // A tighter server: 16 MiB holds four frames of 1024 × 1024
+    let tight = Motion {
+        side: 1024,
+        keep: 16 << 20,
+    };
+    let thin = sanitize_capped(&g, Profile::Photo, usize::MAX, tight).unwrap();
+    assert!(
+        thin.trimmed && (2..=4).contains(&thin.frames),
+        "{}",
+        thin.frames
+    );
+    assert_eq!(total_ms(&thin.png), total_ms(&all.png), "as long as before");
+    assert_eq!(total_ms(&all.png), 1000);
+    // One frame is a photo, in a photo's own box
+    let still = sanitize(&gif_of(1600, 1600, &frames[..1]), Profile::Photo).unwrap();
+    assert_eq!((still.w, still.frames), (1600, 1));
 }
 
 /// A zip of `(path, bytes, deflate, declared size)`, the way any archiver
@@ -714,6 +789,12 @@ fn a_whatsapp_pack_has_a_title_and_its_tray_icon_is_no_sticker() {
             bytes: b"s".to_vec()
         }]
     );
+    // A sticker whose name starts with tray is still one
+    let z = zip_of(&[
+        ("title.txt", b"Cats", false, None),
+        ("tray_happy.webp", b"s", false, None),
+    ]);
+    assert_eq!(read_pack(&z).unwrap().entries.len(), 1);
     // Without a title, a file called tray is just a picture
     assert_eq!(
         read_pack(&zip_of(&[("tray.png", b"t", false, None)]))
@@ -725,26 +806,42 @@ fn a_whatsapp_pack_has_a_title_and_its_tray_icon_is_no_sticker() {
 }
 
 #[test]
-fn a_pack_that_lies_about_its_sizes_or_is_too_big_is_refused() {
+fn a_file_of_a_pack_that_lies_or_is_too_big_is_set_aside_and_the_rest_read() {
     let zeros = vec![0u8; 17 << 20];
-    assert!(
-        matches!(
-            read_pack(&zip_of(&[("big.png", &zeros, true, None)])),
-            Err(Error::TooLarge(_))
-        ),
-        "over the per-file cap"
+    let pack = read_pack(&zip_of(&[
+        ("big.png", &zeros, true, None),
+        ("bomb.png", &zeros[..1 << 20], true, Some(1000)),
+        ("short.png", b"abcdef", false, Some(3)),
+        ("ok.png", b"fine", true, None),
+    ]))
+    .unwrap();
+    assert_eq!(
+        pack.skipped,
+        [
+            ("big.png".into(), "it is too big"),
+            ("bomb.png".into(), "it unpacks to more than it says"),
+            ("short.png".into(), "it is not the size it says"),
+        ]
     );
-    assert!(
-        matches!(
-            read_pack(&zip_of(&[("bomb.png", &zeros, true, Some(1000))])),
-            Err(Error::TooLarge(_))
-        ),
-        "inflates past what it declares"
+    assert_eq!(
+        pack.entries,
+        [Entry {
+            name: "ok.png".into(),
+            bytes: b"fine".to_vec()
+        }]
     );
-    assert!(matches!(
-        read_pack(&zip_of(&[("short.png", b"abcdef", false, Some(3))])),
-        Err(Error::Corrupt(_))
-    ));
+    // What lying files claim counts: the pack as a whole stays bounded
+    let lies: Vec<(String, &[u8], bool, Option<u32>)> = (0..14)
+        .map(|i| (format!("{i}.png"), &zeros[..1024], true, Some(15 << 20)))
+        .collect();
+    let lies: Vec<(&str, &[u8], bool, Option<u32>)> = lies
+        .iter()
+        .map(|(n, b, d, s)| (n.as_str(), *b, *d, *s))
+        .collect();
+    assert_eq!(
+        read_pack(&zip_of(&lies)).unwrap_err(),
+        Error::TooLarge("the pack unpacks to too much")
+    );
     let many: Vec<(String, &[u8], bool, Option<u32>)> = (0..pack::MAX_PACK_ENTRIES + 1)
         .map(|i| (format!("{i}.png"), &b"x"[..], false, None))
         .collect();
@@ -768,45 +865,11 @@ fn a_pack_that_lies_about_its_sizes_or_is_too_big_is_refused() {
     for cut in 0..good.len() {
         let _ = read_pack(&good[..cut]);
     }
-    // An encrypted entry is passed over, not read as plain bytes
+    // An encrypted entry is set aside, not read as plain bytes
     let mut locked = zip_of(&[("a.png", b"x", false, None)]);
     let dir = locked.len() - 22 - (46 + 5);
     locked[dir + 8] |= 1;
-    assert!(read_pack(&locked).unwrap().entries.is_empty());
-}
-
-#[test]
-fn emote_names() {
-    assert_eq!(name_from("Pog Champ.png").as_deref(), Some("pog_champ"));
-    assert_eq!(name_from("KEKW.gif").as_deref(), Some("kekw"));
-    assert_eq!(
-        name_from("icon_123").as_deref(),
-        Some("icon_123"),
-        "a TeamSpeak icon has no extension"
-    );
-    assert_eq!(
-        name_from("--héllo--wörld--.webp").as_deref(),
-        Some("h_llo_w_rld")
-    );
-    assert_eq!(name_from("a.png"), None);
-    assert_eq!(name_from("日本.png"), None);
-    assert_eq!(
-        name_from(&format!("{}.png", "x".repeat(40))).unwrap().len(),
-        NAME_MAX
-    );
-    assert_eq!(name_from("v1.2.final.png").as_deref(), Some("v1_2_final"));
-    assert!(
-        valid_name("ok_2")
-            && !valid_name("Ok")
-            && !valid_name("a")
-            && !valid_name(&"x".repeat(31))
-            && !valid_name("a-b")
-    );
-    let taken = |n: &str| ["pog", "pog_2", &"y".repeat(30)].contains(&n);
-    assert_eq!(unique_name("pog", &taken).as_deref(), Some("pog_3"));
-    assert_eq!(unique_name("new", &taken).as_deref(), Some("new"));
-    assert_eq!(
-        unique_name(&"y".repeat(30), &taken).unwrap(),
-        format!("{}_2", "y".repeat(28))
-    );
+    let pack = read_pack(&locked).unwrap();
+    assert!(pack.entries.is_empty());
+    assert_eq!(pack.skipped, [("a.png".into(), "it is encrypted")]);
 }

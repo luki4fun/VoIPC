@@ -69,16 +69,18 @@ export function untokenize(text: string): string {
   return text.replace(EMOTE_TOKEN, (_, name: string) => `:${name}:`);
 }
 
-/** The emote or sticker a token's hash names, among what the server lists. */
-export function emoteOf(hash: string, emotes: readonly Emote[]): Emote | undefined {
-  return hash.length === TOKEN_HASH ? emotes.find((e) => e.hash.startsWith(hash)) : undefined;
+/** The emote or sticker a token's hash names, among what the server lists:
+ *  the one of the token's name where one file has several. */
+export function emoteOf(hash: string, emotes: readonly Emote[], name?: string): Emote | undefined {
+  if (hash.length !== TOKEN_HASH) return undefined;
+  const same = emotes.filter((e) => e.hash.startsWith(hash));
+  return same.find((e) => e.name === name) ?? same[0];
 }
 
 /** The sticker a message is: its whole text one token of a listed sticker. */
 export function stickerOf(content: string, emotes: readonly Emote[]): Emote | undefined {
   const m = /^<:([a-z0-9_]{2,30}):([0-9a-f]{20})>$/.exec(content.trim());
-  const e = m ? emoteOf(m[2], emotes) : undefined;
-  return e?.sticker ? e : undefined;
+  return m ? emoteOf(m[2], emotes.filter((e) => e.sticker), m[1]) : undefined;
 }
 
 /** A sticker as a message's text. */
@@ -117,9 +119,9 @@ export function completeEmote(typed: string, emotes: readonly Emote[], max = 8):
   return [...starts, ...holds].slice(0, max);
 }
 
-/** An emote name from a file name (crates/voipc-media `name_from`, the same
- *  rules): its stem in lower case, anything else as one `_` (not at either
- *  end), cut to 30; undefined if under two characters are left. */
+/** An emote name from a file name: its stem in lower case, anything else as
+ *  one `_` (not at either end), cut to 30; undefined if under two characters
+ *  are left. */
 export function nameFrom(file: string): string | undefined {
   const dot = file.lastIndexOf(".");
   const stem = dot > 0 && file.length - dot - 1 <= 5 ? file.slice(0, dot) : file;

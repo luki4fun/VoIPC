@@ -19,10 +19,27 @@ export function mediaModule(): Promise<WebAssembly.Module> {
   return compiled;
 }
 
+/** How a moving chat picture is kept (voipc-media `Motion`): a server's
+ *  `FileLimits.animation_side` and `animation_mb`. */
+export interface Motion {
+  side: number;
+  keepMb: number;
+}
+
+/** A relay's numbers held to voipc-protocol's `ANIMATION_SIDE` and
+ *  `ANIMATION_MB`, as the desktop app holds them: a relay cannot lift them. */
+export function motionOf(limits: { animation_side?: unknown; animation_mb?: unknown }): Motion {
+  const held = (v: unknown, lo: number, hi: number, d: number) => {
+    const n = Number(v);
+    return Number.isFinite(n) ? Math.min(hi, Math.max(lo, Math.floor(n))) : d;
+  };
+  return { side: held(limits.animation_side, 256, 2560, 1024), keepMb: held(limits.animation_mb, 16, 512, 128) };
+}
+
 interface Exports {
   memory: WebAssembly.Memory;
   media_input(len: number): number;
-  media_sanitize(profile: number, maxOut: number): number;
+  media_sanitize(profile: number, maxOut: number, side: number, keepMb: number): number;
   media_png(): number;
   media_png_len(): number;
   media_still(): number;
@@ -33,6 +50,11 @@ interface Exports {
   media_read_pack(): number;
   media_pack_title(): number;
   media_pack_title_len(): number;
+  media_skip_count(): number;
+  media_skip_name(i: number): number;
+  media_skip_name_len(i: number): number;
+  media_skip_why(i: number): number;
+  media_skip_why_len(i: number): number;
   media_entry_name(i: number): number;
   media_entry_name_len(i: number): number;
   media_entry_bytes(i: number): number;
@@ -63,9 +85,9 @@ const text = (x: Exports, at: number, len: number) => new TextDecoder().decode(c
 
 /** `bytes` as `profile` (0 emote, 1 sticker, 2 photo); `maxOut` 0 is the
  *  profile's own cap. Throws the reason it is not shown. */
-export function sanitizeIn(module: WebAssembly.Module, bytes: Uint8Array, profile: number, maxOut = 0): Sanitized {
+export function sanitizeIn(module: WebAssembly.Module, bytes: Uint8Array, profile: number, maxOut = 0, motion?: Motion | null): Sanitized {
   const x = instance(module, bytes);
-  if (x.media_sanitize(profile, maxOut) !== 0) throw new Error(text(x, x.media_error(), x.media_error_len()));
+  if (x.media_sanitize(profile, maxOut, motion?.side ?? 0, motion?.keepMb ?? 0) !== 0) throw new Error(text(x, x.media_error(), x.media_error_len()));
   const stillLen = x.media_still_len();
   return {
     png: copy(x, x.media_png(), x.media_png_len()),
@@ -77,8 +99,15 @@ export function sanitizeIn(module: WebAssembly.Module, bytes: Uint8Array, profil
   };
 }
 
+/** A .zip or .wastickers read: its pictures, and what was set aside with why. */
+export interface Pack {
+  title: string | null;
+  entries: { name: string; bytes: Uint8Array }[];
+  skipped: { name: string; why: string }[];
+}
+
 /** The files of a .zip or .wastickers, in memory. Throws why it is refused. */
-export function readPackIn(module: WebAssembly.Module, bytes: Uint8Array): { title: string | null; entries: { name: string; bytes: Uint8Array }[] } {
+export function readPackIn(module: WebAssembly.Module, bytes: Uint8Array): Pack {
   const x = instance(module, bytes);
   const n = x.media_read_pack();
   if (n === 0xffffffff) throw new Error(text(x, x.media_error(), x.media_error_len()));
@@ -90,5 +119,9 @@ export function readPackIn(module: WebAssembly.Module, bytes: Uint8Array): { tit
       bytes: copy(x, x.media_entry_bytes(i), x.media_entry_bytes_len(i)),
     });
   }
-  return { title: title || null, entries };
+  const skipped = [];
+  for (let i = 0; i < x.media_skip_count(); i++) {
+    skipped.push({ name: text(x, x.media_skip_name(i), x.media_skip_name_len(i)), why: text(x, x.media_skip_why(i), x.media_skip_why_len(i)) });
+  }
+  return { title: title || null, entries, skipped };
 }

@@ -22,6 +22,7 @@ import { video } from "./video";
 import { share } from "./share";
 import { Files, originOf, sanitizeImage } from "./files";
 import { Emotes } from "./emotes";
+import { motionOf } from "./media";
 
 /** Bound for the authentication response (network.rs CONNECT_TIMEOUT). */
 const AUTH_TIMEOUT_MS = 10_000;
@@ -616,7 +617,7 @@ export class Session implements SessionContext, AccountHost {
         this.sessionId = b.session_id;
         // libsignal binds both parties' ids into every pairwise message
         this.signal.setOwnUserId(b.user_id);
-        this.files = new Files(this, originOf(this.server), b.files ? Number(b.files.max_bytes) : null);
+        this.files = new Files(this, originOf(this.server), b.files ? Number(b.files.max_bytes) : null, b.files ? motionOf(b.files) : null);
         this.emotes = new Emotes(
           this,
           originOf(this.server),

@@ -494,7 +494,7 @@
   {/if}
   {#if emoteOptions.length > 0}
     <div class="mention-pop" id={listId} role="listbox" aria-label="Emotes">
-      {#each emoteOptions as e, i (e.hash)}
+      {#each emoteOptions as e, i (e.name)}
         <div
           class="mention-option"
           class:active={i === active}
@@ -561,15 +561,15 @@
         {/if}
         <div class="emoji-grid" class:stickers={emojiCategory === -2}>
           {#if emojiCategory === -1}
-            {#each serverEmotes as e (e.hash)}
-              <button class="emoji-item" type="button" title=":{e.name}:" aria-label=":{e.name}:" onpointerdown={keepField} onclick={() => insertEmoji(`:${e.name}: `)}
+            {#each serverEmotes as e (e.name)}
+              <button class="emoji-item" type="button" title=":{e.name}:" aria-label=":{e.name}:" onpointerdown={keepField} onclick={() => insertEmoji(`${/\S$/.test(text) ? " " : ""}:${e.name}: `)}
                 ><Emote name={e.name} hash={e.hash.slice(0, 20)} /></button
               >
             {/each}
           {:else if emojiCategory === -2}
             {#each stickerPacks as [pack, list] (pack)}
               {#if pack}<div class="sticker-pack">{pack}</div>{/if}
-              {#each list as e (e.hash)}
+              {#each list as e (e.name)}
                 <button class="emoji-item sticker-item" type="button" title=":{e.name}:" aria-label="Send the sticker :{e.name}:" onpointerdown={keepField}
                   onclick={() => { showEmojiPicker = false; onsticker?.(e); }}
                   ><Emote name={e.name} hash={e.hash.slice(0, 20)} size="jumbo" /></button
