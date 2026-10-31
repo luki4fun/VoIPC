@@ -1220,6 +1220,10 @@ async fn main() -> Result<()> {
         state.broadcast_raw_to_all(&data).await;
     }
     tokio::time::sleep(Duration::from_millis(500)).await;
+    // The emote list's last changes, written now rather than a moment later
+    if let Some(store) = &state.emotes {
+        store.flush().await;
+    }
     info!("server shut down");
     Ok(())
 }

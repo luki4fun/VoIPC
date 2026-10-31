@@ -147,6 +147,16 @@ const centre = (selector) =>
     return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2),
              w: Math.round(r.width), h: Math.round(r.height) }; })()`;
 
+/** A real key press on what has the focus: trusted, so a form's implicit
+ *  submission (Enter in a text field) happens as it would for a person. */
+async function realKey(tab, key) {
+  const code = { Enter: 13, Escape: 27 }[key];
+  const base = { key, code: key, windowsVirtualKeyCode: code, nativeVirtualKeyCode: code };
+  await tab.send("Input.dispatchKeyEvent", { type: "keyDown", ...base, ...(key === "Enter" ? { text: "\r" } : {}) });
+  await tab.send("Input.dispatchKeyEvent", { type: "keyUp", ...base });
+  await sleep(120);
+}
+
 /** A real mouse click: hit-tested, trusted, and subject to pointer capture. */
 async function realClick(tab, selector) {
   const at = await tab.evaluate(centre(selector));
@@ -2802,8 +2812,8 @@ check(
   const admin = await waitFor(ann, `document.querySelector(".admin-btn.active")`, 15_000).then(() => true, () => false);
   check("the admin token makes this tab the server's admin", admin);
   await ann.evaluate(click("button.admin-btn.active"));
-  await waitFor(ann, `[...document.querySelectorAll(".admin-tabs button")].some((b) => b.textContent === "Emotes")`, 5_000).catch(() => {});
-  await ann.evaluate(`[...document.querySelectorAll(".admin-tabs button")].find((b) => b.textContent === "Emotes")?.click()`);
+  await waitFor(ann, `[...document.querySelectorAll(".admin-tabs button")].some((b) => b.textContent === "Emotes and stickers")`, 5_000).catch(() => {});
+  await ann.evaluate(`[...document.querySelectorAll(".admin-tabs button")].find((b) => b.textContent === "Emotes and stickers")?.click()`);
   await waitFor(ann, `document.querySelector(".em-pick input[type=file][multiple]")`, 5_000).catch(() => {});
   const name = `party_parrot_${n}`;
   await ann.evaluate(`(async () => {
@@ -2837,6 +2847,22 @@ check(
     await ben.evaluate(`${rowWith("look")}?.querySelector(".msg-content")?.innerHTML.slice(0, 200) ?? "no row"`));
   check("and the message reads as written, with no token in sight", await ben.evaluate(
     `(() => { const t = ${rowWith("look")}?.querySelector(".msg-content")?.textContent ?? ""; return !t.includes("<:") && t.trim().startsWith("look"); })()`));
+
+  // 1.5: the shared picker. Opened by a pointer, its search has the focus;
+  // Enter there takes the first match into the draft at the cursor and sends
+  // nothing (in 1.4 a real Enter submitted the message box's form)
+  await ann.evaluate(`(() => { const i = document.querySelector(".chat-main .input-bar .chat-input"); if (!i) return;
+    i.value = "draft"; i.dispatchEvent(new Event("input", { bubbles: true })); i.focus(); i.setSelectionRange(5, 5); })()`);
+  await realClick(ann, '.chat-main .input-bar button[aria-label="Emoji, emotes and stickers"]');
+  const searching = await waitFor(ann, `!!document.activeElement?.classList.contains("ep-search")`, 3_000).then(() => true, () => false);
+  await ann.send("Input.insertText", { text: name });
+  await sleep(200);
+  await realKey(ann, "Enter");
+  await sleep(500);
+  check("the picker's search takes its first match into the draft on Enter, and sends nothing",
+    searching && (await ann.evaluate(`(() => { const i = document.querySelector(".chat-main .input-bar .chat-input");
+      return i?.value === ${JSON.stringify(`draft :${name}: `)} && !document.querySelector(".chat-main .ep-search") && !${rowWith("draft")}; })()`)),
+    await ann.evaluate(`JSON.stringify([document.querySelector(".chat-main .input-bar .chat-input")?.value, !!document.querySelector(".chat-main .ep-search")])`));
 
   for (const [who, tab] of [["admin", ann], ["member", ben]]) {
     const fatal = tab.errors.filter((e) => !/Failed to load resource/.test(e));
@@ -3168,6 +3194,14 @@ if (PORT3) {
     10_000,
   ).then(() => true, () => false));
   check("and so is the direct message", dmCaught, dmListed ? await texts(bobAgain) : "no conversation listed");
+  // 1.5: her row says she is away, and writing to her says where it goes
+  const awayTag = await bobAgain.evaluate(`${dmRow}?.closest(".dm-entry")?.querySelector(".proximity-tag")?.textContent === "away"`);
+  const keptHint = await bobAgain.evaluate(`!!document.querySelector(".input-bar .chat-input")?.placeholder?.includes("kept on the server")`);
+  check(
+    "somebody away is marked so, and writing to them says it is kept",
+    dmListed && awayTag && keptHint,
+    await bobAgain.evaluate(`document.querySelector(".input-bar .chat-input")?.placeholder ?? "no composer"`),
+  );
   // A reply while the writer is still away goes the same way, and is there
   // when they are back.
   const reply = `got it ${process.pid}`;
@@ -3179,6 +3213,11 @@ if (PORT3) {
       (await bobAgain.evaluate(`[...document.querySelectorAll(".msg-content")].some((e) => e.textContent.includes(${JSON.stringify(reply)}))`)),
     await bobAgain.evaluate(`(window.__toasts ?? []).join(" | ")`),
   );
+  // Close takes the conversation off the list; its messages stay (dm-rules.test.ts
+  // has it coming back with the next message)
+  await bobAgain.evaluate(`${dmRow}?.closest(".channel-row")?.querySelector('button[aria-label^="Close conversation"]')?.click()`);
+  const closedOff = await waitFor(bobAgain, `!(${dmRow}) && !document.querySelector(".input-bar .chat-input")?.placeholder?.includes("kept on the server")`, 5_000).then(() => true, () => false);
+  check("Close takes a conversation off the list", closedOff, await texts(bobAgain));
   await bobAgain.send("Page.close").catch(() => {});
   const aliceAgain = await openDialog();
   await aliceAgain.evaluate(setInput("#account-name", acct));

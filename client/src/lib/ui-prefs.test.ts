@@ -154,11 +154,13 @@ test("the stream view's chat: off in modern, below in classic, until chosen", ()
   assert.equal(p.stream_chat.classic.split, "below");
   assert.equal(p.share_preview, true);
   assert.equal(p.group_threads, true, "busy replies gather into threads unless turned off");
+  assert.equal(p.dm_previews, false, "a direct conversation's last message shows only when chosen");
 
   const saved = defaultUiPrefs();
   saved.stream_chat.modern = { open: true, split: "below", width: 500, height: 300 };
   saved.share_preview = false;
   saved.group_threads = false;
+  saved.dm_previews = true;
   assert.deepEqual(sanitizeUiPrefs(structuredClone(saved)), saved);
 });
 
@@ -205,4 +207,11 @@ test("a file from before Stage gets the stage panels it never had", () => {
   const p = sanitizeUiPrefs({ layout: "modern", panels: { modern: { sidebar: 300 } } });
   assert.equal(p.panels.modern.sidebar, 300);
   assert.deepEqual(p.panels.stage, sanitizeUiPrefs({}).panels.stage);
+});
+
+test("emotes on mobile data: the servers said yes to are kept, junk is dropped", () => {
+  assert.deepEqual(sanitizeUiPrefs({}).emotes_mobile_ok, [], "nobody has said always yet");
+  assert.deepEqual(sanitizeUiPrefs({ emotes_mobile_ok: ["a.example:9987"] }).emotes_mobile_ok, ["a.example:9987"]);
+  assert.deepEqual(sanitizeUiPrefs({ emotes_mobile_ok: ["a:1", 7, "", "a:1"] }).emotes_mobile_ok, ["a:1"]);
+  assert.deepEqual(sanitizeUiPrefs({ emotes_mobile_ok: true }).emotes_mobile_ok, []);
 });

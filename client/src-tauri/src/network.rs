@@ -214,7 +214,10 @@ pub async fn connect_to_server(
         &address,
         "emote-limits",
         emote_access.as_ref().map(|a| {
-            serde_json::json!({ "max_emote_bytes": a.max_emote_bytes, "max_sticker_bytes": a.max_sticker_bytes })
+            serde_json::json!({
+                "max_emote_bytes": a.max_emote_bytes, "max_sticker_bytes": a.max_sticker_bytes,
+                "max_total_bytes": a.max_total_bytes, "max_items": a.max_items,
+            })
         }),
     );
 

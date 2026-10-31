@@ -32,3 +32,11 @@ test("only media.ts, a download and one's own photo make object URLs", () => {
   assert.deepEqual(found.filter((f) => !ALLOWED.has(f)), []);
   assert.match(readFileSync(join(ROOT, "lib/files.ts"), "utf8"), /createObjectURL\(new Blob\(\[bytes[^\]]*\], \{ type: "application\/octet-stream" \}\)\)/);
 });
+
+test("no other way to have the browser decode a picture: only one's own photo is read", () => {
+  const found: string[] = [];
+  for (const path of sources(ROOT)) {
+    if (/createImageBitmap\(|readAsDataURL\(|new ImageDecoder\(|["'`]data:image\//.test(readFileSync(path, "utf8"))) found.push(relative(ROOT, path));
+  }
+  assert.deepEqual(found, ["lib/image-prep.ts"]);
+});

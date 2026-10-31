@@ -233,7 +233,7 @@ The simplest way is a host directory that user 65532 owns:
     install -d -o 65532 -g 65532 -m 0700 /srv/voipc
     install -o 65532 -g 65532 -m 0600 server.toml cert.pem key.pem /srv/voipc/
     docker run -d --name voipc -v /srv/voipc:/data \
-      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.4.0
+      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.5.0
     docker exec voipc /voipc-server --config /data/server.toml admin grant <name> admin
 
 With a named volume instead, copy the files in with a throwaway container first, then run the
@@ -340,7 +340,12 @@ dir = "emotes"             # kept across restarts; never [files] dir, nor inside
   emote when the list comes, and `:name:` travels inside the end-to-end encrypted messages.
 - **Who may change them:** admins only (the token, or an account with the admin role).
 - **Memory and bandwidth:** all of `max_total_mb` is held in memory, and every member downloads
-  each emote once (the apps keep their copy).
+  each emote once (the apps keep their copy). Since 1.5 a connection may download twice
+  `max_total_mb` (plus one sticker) at once, and `max_total_mb` an hour after that; past it, the
+  relay answers 429, so one member fetching in a loop cannot fill the uplink voice needs.
+- **Changes are written once a second at most:** an import of hundreds, or removing a pack, is
+  one write of `manifest.json` and one new list for members. A new file is on disk before its
+  upload is answered, and a stopping relay writes the manifest before it exits.
 - **At start**, an entry whose file is missing or is not the file its hash names is dropped, and a
   file no entry names is deleted. Nothing else in `dir` is touched.
 

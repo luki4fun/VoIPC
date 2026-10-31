@@ -25,6 +25,13 @@ export function dayLabel(timestamp: number, now = Date.now(), locale?: string): 
   });
 }
 
+/** How long from `now` until the next local midnight, in ms (at least 1). */
+export function msToMidnight(now: number): number {
+  const next = new Date(now);
+  next.setHours(24, 0, 0, 0);
+  return Math.max(1, next.getTime() - now);
+}
+
 /** The whole moment, for a title: date and time to the second. */
 export function fullTime(timestamp: number, locale?: string): string {
   return new Date(timestamp).toLocaleString(locale, { dateStyle: "full", timeStyle: "medium" });

@@ -75,6 +75,30 @@ pub fn sniff(b: &[u8]) -> std::result::Result<Format, &'static str> {
     }
 }
 
+/// `b`'s canvas from its header alone, nothing decoded; None where the header
+/// says nothing readable. (A GIF's frames may be larger than its screen: the
+/// decoder charges those as it meets them.)
+pub fn probe(b: &[u8]) -> Option<(u32, u32)> {
+    match sniff(b).ok()? {
+        Format::Png => {
+            let rd = png::Decoder::new(Cursor::new(b)).read_info().ok()?;
+            Some((rd.info().width, rd.info().height))
+        }
+        Format::Gif => {
+            let d = gif::DecodeOptions::new().read_info(Cursor::new(b)).ok()?;
+            Some((u32::from(d.width()), u32::from(d.height())))
+        }
+        Format::WebP => image_webp::WebPDecoder::new(Cursor::new(b))
+            .ok()
+            .map(|d| d.dimensions()),
+        Format::Jpeg => {
+            let mut d = zune_jpeg::JpegDecoder::new(zune_core::bytestream::ZCursor::new(b));
+            d.decode_headers().ok()?;
+            d.dimensions().map(|(w, h)| (w as u32, h as u32))
+        }
+    }
+}
+
 fn check(w: u32, h: u32) -> Result<()> {
     if w == 0 || h == 0 {
         return Err(Error::Corrupt("no size".into()));
@@ -92,6 +116,59 @@ fn check_animation(w: u32, h: u32) -> Result<()> {
     Ok(())
 }
 
+/// A budget a moving picture ran past. Once its first frame is read, it is
+/// read no further and stands as that frame alone (`Clean::stilled`): what
+/// it costs is what refusing it there cost, never a second pass. Over one
+/// before any frame, it is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Over {
+    /// More than `MAX_FRAMES` frames.
+    Frames,
+    /// More than `MAX_WORK_PIXELS` of canvas.
+    Work,
+    /// A frame past `MAX_ANIMATION_PIXELS` (a GIF's may reach past its screen).
+    Frame,
+}
+
+impl Over {
+    /// Why it is refused, when not even its first frame was read.
+    pub fn refusal(self) -> Error {
+        Error::TooLarge(match self {
+            Over::Frames => "the animation has too many frames",
+            Over::Work => "the animation is too long to show",
+            Over::Frame => "the animation is too big to show",
+        })
+    }
+
+    /// Why it is shown still: for a note under it.
+    pub fn stilled(self) -> &'static str {
+        match self {
+            Over::Frames => "the animation has too many frames to play here",
+            Over::Work => "the animation is too long to play here",
+            Over::Frame => "the animation is too big to play here",
+        }
+    }
+}
+
+/// What a read gives besides its frames.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Read {
+    /// The EXIF orientation asked for (1 = as is).
+    pub orientation: u8,
+    /// The budget it stopped at, after its first frame: only frames before it
+    /// reached the sink.
+    pub over: Option<Over>,
+}
+
+impl Read {
+    fn whole(orientation: u8) -> Read {
+        Read {
+            orientation,
+            over: None,
+        }
+    }
+}
+
 /// Counts frames and the pixels decoded so far, against the budgets.
 struct Budget {
     frames: usize,
@@ -99,16 +176,34 @@ struct Budget {
 }
 
 impl Budget {
-    fn take(&mut self, w: u32, h: u32) -> Result<()> {
+    /// One more frame of `px` canvas pixels; nothing is counted when it is
+    /// over a budget.
+    fn charge(&mut self, px: u64) -> std::result::Result<(), Over> {
+        if self.frames >= MAX_FRAMES {
+            return Err(Over::Frames);
+        }
+        if self.work + px > MAX_WORK_PIXELS {
+            return Err(Over::Work);
+        }
         self.frames += 1;
-        self.work += u64::from(w) * u64::from(h);
-        if self.frames > MAX_FRAMES {
-            return Err(Error::TooLarge("the animation has too many frames"));
-        }
-        if self.work > MAX_WORK_PIXELS {
-            return Err(Error::TooLarge("the animation is too long to show"));
-        }
+        self.work += px;
         Ok(())
+    }
+
+    /// A still picture's one frame.
+    fn take(&mut self, w: u32, h: u32) -> Result<()> {
+        self.charge(u64::from(w) * u64::from(h))
+            .map_err(Over::refusal)
+    }
+
+    /// Where an animation over a budget stops: after a frame, there; before
+    /// any, it is refused.
+    fn stop(&self, over: Over) -> Result<Over> {
+        if self.frames > 0 {
+            Ok(over)
+        } else {
+            Err(over.refusal())
+        }
     }
 }
 
@@ -116,13 +211,16 @@ fn corrupt(e: impl std::fmt::Display) -> Error {
     Error::Corrupt(e.to_string())
 }
 
-/// Read `b` into `sink`. Returns the EXIF orientation it asks for (1 = as is).
-pub fn decode(b: &[u8], sink: &mut dyn Sink) -> Result<u8> {
+/// Read `b` into `sink`: its orientation, and where it stopped short.
+pub fn decode(b: &[u8], sink: &mut dyn Sink) -> Result<Read> {
     match sniff(b).map_err(Error::Unsupported)? {
         Format::Png => png_frames(b, sink),
-        Format::Gif => gif_frames(b, sink).map(|()| 1),
+        Format::Gif => gif_frames(b, sink).map(|over| Read {
+            orientation: 1,
+            over,
+        }),
         Format::WebP => webp_frames(b, sink),
-        Format::Jpeg => jpeg_frame(b, sink),
+        Format::Jpeg => jpeg_frame(b, sink).map(Read::whole),
     }
 }
 
@@ -166,7 +264,7 @@ fn clear(canvas: &mut [u8], w: u32, x0: u32, y0: u32, rw: u32, rh: u32) {
     }
 }
 
-fn png_frames(b: &[u8], sink: &mut dyn Sink) -> Result<u8> {
+fn png_frames(b: &[u8], sink: &mut dyn Sink) -> Result<Read> {
     let limits = png::Limits {
         bytes: (MAX_FRAME_PIXELS * 4) as usize,
     };
@@ -202,11 +300,12 @@ fn png_frames(b: &[u8], sink: &mut dyn Sink) -> Result<u8> {
             &to_rgba(&buf[..out.buffer_size()], out.color_type.samples()),
             0,
         )?;
-        return Ok(orientation);
+        return Ok(Read::whole(orientation));
     };
     let mut canvas = vec![0u8; (w * h * 4) as usize];
     let mut shown = 0;
     let mut first = true;
+    let mut stopped = None;
     while shown < total {
         let out = match rd.next_frame(&mut buf) {
             Ok(o) => o,
@@ -229,7 +328,10 @@ fn png_frames(b: &[u8], sink: &mut dyn Sink) -> Result<u8> {
         if !fits || fw != out.width || fh != out.height {
             return Err(Error::Corrupt("a frame outside the picture".into()));
         }
-        budget.take(w, h)?;
+        if let Err(o) = budget.charge(u64::from(w) * u64::from(h)) {
+            stopped = Some(budget.stop(o)?);
+            break;
+        }
         let px = to_rgba(&buf[..out.buffer_size()], out.color_type.samples());
         let saved = (fc.dispose_op == png::DisposeOp::Previous).then(|| canvas.clone());
         for y in 0..fh {
@@ -262,10 +364,13 @@ fn png_frames(b: &[u8], sink: &mut dyn Sink) -> Result<u8> {
     if shown == 0 {
         return Err(Error::Corrupt("no frame".into()));
     }
-    Ok(orientation)
+    Ok(Read {
+        orientation,
+        over: stopped,
+    })
 }
 
-fn gif_frames(b: &[u8], sink: &mut dyn Sink) -> Result<()> {
+fn gif_frames(b: &[u8], sink: &mut dyn Sink) -> Result<Option<Over>> {
     let mut opts = gif::DecodeOptions::new();
     opts.set_color_output(gif::ColorOutput::RGBA);
     if let Some(limit) = std::num::NonZeroU64::new(MAX_ANIMATION_PIXELS * 4) {
@@ -278,33 +383,49 @@ fn gif_frames(b: &[u8], sink: &mut dyn Sink) -> Result<()> {
     sink.start(w, h)?;
     let mut canvas = vec![0u8; (w * h * 4) as usize];
     let mut budget = Budget { frames: 0, work: 0 };
-    while let Some(f) = d.read_next_frame().map_err(corrupt)? {
+    let mut buf = Vec::new();
+    let mut stopped = None;
+    while let Some(f) = d.next_frame_info().map_err(corrupt)? {
         let (fx, fy, fw, fh) = (
             u32::from(f.left),
             u32::from(f.top),
             u32::from(f.width),
             u32::from(f.height),
         );
-        budget.take(w, h)?;
+        let (dispose, delay) = (f.dispose, f.delay);
+        // A frame may reach past the screen and is decoded whole: its own
+        // size counts too, before a pixel of it is read
+        let own = u64::from(fw) * u64::from(fh);
+        let charged = if own > MAX_ANIMATION_PIXELS {
+            Err(Over::Frame)
+        } else {
+            budget.charge(own.max(u64::from(w) * u64::from(h)))
+        };
+        if let Err(o) = charged {
+            stopped = Some(budget.stop(o)?);
+            break;
+        }
+        buf.resize(d.buffer_size(), 0);
+        d.read_into_buffer(&mut buf).map_err(corrupt)?;
         // What of the frame lies on the screen; a GIF may draw past it
         let (cw, ch) = (fw.min(w.saturating_sub(fx)), fh.min(h.saturating_sub(fy)));
-        let saved = (f.dispose == gif::DisposalMethod::Previous).then(|| canvas.clone());
+        let saved = (dispose == gif::DisposalMethod::Previous).then(|| canvas.clone());
         for y in 0..ch {
             for x in 0..cw {
                 let s = ((y * fw + x) * 4) as usize;
-                if f.buffer.get(s + 3).is_some_and(|&a| a > 0) {
+                if buf.get(s + 3).is_some_and(|&a| a > 0) {
                     let d = (((fy + y) * w + fx + x) * 4) as usize;
-                    canvas[d..d + 4].copy_from_slice(&f.buffer[s..s + 4]);
+                    canvas[d..d + 4].copy_from_slice(&buf[s..s + 4]);
                 }
             }
         }
         // 0 and 10 ms are what browsers draw at 100 ms: so do we
-        let delay = match u32::from(f.delay) * 10 {
+        let delay = match u32::from(delay) * 10 {
             d if d < 20 => 100,
             d => d.min(65_535),
         };
         sink.frame(&canvas, delay as u16)?;
-        match f.dispose {
+        match dispose {
             gif::DisposalMethod::Background => clear(&mut canvas, w, fx.min(w), fy.min(h), cw, ch),
             gif::DisposalMethod::Previous => canvas = saved.unwrap_or(canvas),
             _ => {}
@@ -313,10 +434,10 @@ fn gif_frames(b: &[u8], sink: &mut dyn Sink) -> Result<()> {
     if budget.frames == 0 {
         return Err(Error::Corrupt("no frame".into()));
     }
-    Ok(())
+    Ok(stopped)
 }
 
-fn webp_frames(b: &[u8], sink: &mut dyn Sink) -> Result<u8> {
+fn webp_frames(b: &[u8], sink: &mut dyn Sink) -> Result<Read> {
     let mut d = image_webp::WebPDecoder::new(Cursor::new(b)).map_err(corrupt)?;
     let (w, h) = d.dimensions();
     check(w, h)?;
@@ -331,14 +452,20 @@ fn webp_frames(b: &[u8], sink: &mut dyn Sink) -> Result<u8> {
         .output_buffer_size()
         .ok_or(Error::TooLarge("the picture is too big to show"))?;
     let channels = size / (w as usize * h as usize);
-    let mut buf = vec![0u8; size];
-    let mut budget = Budget { frames: 0, work: 0 };
     if d.is_animated() {
         check_animation(w, h)?;
+    }
+    let mut buf = vec![0u8; size];
+    let mut budget = Budget { frames: 0, work: 0 };
+    let mut stopped = None;
+    if d.is_animated() {
         sink.start(w, h)?;
         let n = d.num_frames() as usize;
         for _ in 0..n {
-            budget.take(w, h)?;
+            if let Err(o) = budget.charge(u64::from(w) * u64::from(h)) {
+                stopped = Some(budget.stop(o)?);
+                break;
+            }
             let delay = match d.read_frame(&mut buf) {
                 Ok(delay) => delay,
                 Err(_) if budget.frames > 1 => break,
@@ -352,7 +479,10 @@ fn webp_frames(b: &[u8], sink: &mut dyn Sink) -> Result<u8> {
         d.read_image(&mut buf).map_err(corrupt)?;
         sink.frame(&to_rgba(&buf, channels), 0)?;
     }
-    Ok(orientation)
+    Ok(Read {
+        orientation,
+        over: stopped,
+    })
 }
 
 fn jpeg_frame(b: &[u8], sink: &mut dyn Sink) -> Result<u8> {

@@ -333,6 +333,37 @@ fn a_gif_frame_drawn_past_its_screen_is_cut_to_it() {
     );
 }
 
+/// A 1×1 GIF screen with `n` frames of `fw` × `fh`, each a few bytes of LZW:
+/// what a frame says it is, not what it holds, is what costs.
+fn gif_frames_past_screen(fw: u16, fh: u16, n: usize) -> Vec<u8> {
+    gif_frames_sized(&vec![(fw, fh); n])
+}
+
+/// `gif_frames_past_screen` with a frame of each size; each draws one white
+/// pixel at its corner.
+fn gif_frames_sized(sizes: &[(u16, u16)]) -> Vec<u8> {
+    let mut g = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff".to_vec();
+    for (fw, fh) in sizes {
+        g.extend_from_slice(&[0x2C, 0, 0, 0, 0]);
+        g.extend_from_slice(&fw.to_le_bytes());
+        g.extend_from_slice(&fh.to_le_bytes());
+        g.extend_from_slice(&[0, 2, 2, 0x4C, 0x01, 0]);
+    }
+    g.push(0x3B);
+    g
+}
+
+#[test]
+fn a_gif_frame_is_charged_its_own_size_before_it_is_decoded() {
+    for (fw, fh) in [(65_535, 65_535), (4097, 4096)] {
+        assert_eq!(
+            sanitize(&gif_frames_past_screen(fw, fh, 1), Profile::Photo).unwrap_err(),
+            Error::TooLarge("the animation is too big to show"),
+            "{fw}×{fh} on a 1×1 screen"
+        );
+    }
+}
+
 #[test]
 fn webp_still_and_animated() {
     let mut still = Vec::new();
@@ -359,9 +390,9 @@ fn webp_still_and_animated() {
     assert!(anim.still.is_some());
 }
 
-/// `jpeg` with an EXIF block saying orientation `o`, just after its start.
-fn with_orientation(jpeg: &[u8], o: u16) -> Vec<u8> {
-    let tiff = [
+/// An EXIF block (its TIFF data) saying orientation `o`, and nothing else.
+fn exif_tiff(o: u16) -> Vec<u8> {
+    [
         b"II*\0".as_slice(),
         &8u32.to_le_bytes(),
         &1u16.to_le_bytes(),
@@ -372,8 +403,12 @@ fn with_orientation(jpeg: &[u8], o: u16) -> Vec<u8> {
         &[0, 0],
         &0u32.to_le_bytes(),
     ]
-    .concat();
-    let payload = [b"Exif\0\0".as_slice(), &tiff].concat();
+    .concat()
+}
+
+/// `jpeg` with an EXIF block saying orientation `o`, just after its start.
+fn with_orientation(jpeg: &[u8], o: u16) -> Vec<u8> {
+    let payload = [b"Exif\0\0".as_slice(), &exif_tiff(o)].concat();
     let len = (payload.len() + 2) as u16;
     [
         &jpeg[..2],
@@ -481,41 +516,8 @@ fn what_is_too_big_is_refused_before_anything_is_allocated_for_it() {
         sanitize(&screen, Profile::Emote),
         Err(Error::TooLarge(_))
     ));
-    let many: Vec<_> = (0..decode::MAX_FRAMES as u16 + 5)
-        .map(|i| {
-            (
-                0,
-                0,
-                1,
-                1,
-                vec![(i % 2) as u8],
-                gif::DisposalMethod::Keep,
-                10,
-            )
-        })
-        .collect();
-    assert_eq!(
-        sanitize(&gif_of(1, 1, &many), Profile::Emote).unwrap_err(),
-        Error::TooLarge("the animation has too many frames")
-    );
-    // A few KB of one-pixel frames on a big screen: each frame is a whole canvas
-    let dots: Vec<_> = (0..100u16)
-        .map(|i| {
-            (
-                i,
-                i,
-                1,
-                1,
-                vec![(i % 2) as u8],
-                gif::DisposalMethod::Keep,
-                10,
-            )
-        })
-        .collect();
-    assert_eq!(
-        sanitize(&gif_of(2048, 2048, &dots), Profile::Photo).unwrap_err(),
-        Error::TooLarge("the animation is too long to show")
-    );
+    // (An animation over its frame or work budget stands as its first frame:
+    // `an_animation_over_a_budget_stands_as_its_first_frame_and_says_why`)
     assert!(matches!(
         sanitize(&vec![0u8; (16 << 20) + 1], Profile::Emote),
         Err(Error::TooLarge(_))
@@ -532,6 +534,158 @@ fn what_is_too_big_is_refused_before_anything_is_allocated_for_it() {
     ]
     .concat();
     assert!(sanitize(&vp8x, Profile::Photo).is_err());
+}
+
+/// `n` one-pixel GIF frames, red then blue, the `i`th at (`i`, `i`) when
+/// `walk`, else all at the corner.
+fn dots(n: u16, walk: bool) -> Vec<GifFrame> {
+    (0..n)
+        .map(|i| {
+            let at = if walk { i } else { 0 };
+            (
+                at,
+                at,
+                1,
+                1,
+                vec![(i % 2) as u8],
+                gif::DisposalMethod::Keep,
+                10,
+            )
+        })
+        .collect()
+}
+
+/// anim3.webp with its three frames `times` over: an animated WebP of
+/// `3 × times` frames.
+fn webp_frames_repeated(times: usize) -> Vec<u8> {
+    let src = include_bytes!("../tests/fixtures/anim3.webp");
+    let (mut before, mut anmf, mut after) = (Vec::new(), Vec::new(), Vec::new());
+    let mut at = 12;
+    while at + 8 <= src.len() {
+        let len = u32::from_le_bytes(src[at + 4..at + 8].try_into().unwrap()) as usize;
+        let end = (at + 8 + len + (len & 1)).min(src.len());
+        let chunk = &src[at..end];
+        if &chunk[..4] == b"ANMF" {
+            anmf.extend_from_slice(chunk);
+        } else if anmf.is_empty() {
+            before.extend_from_slice(chunk);
+        } else {
+            after.extend_from_slice(chunk);
+        }
+        at = end;
+    }
+    let body = [before, anmf.repeat(times), after].concat();
+    [
+        b"RIFF".as_slice(),
+        &(body.len() as u32 + 4).to_le_bytes(),
+        b"WEBP",
+        &body,
+    ]
+    .concat()
+}
+
+#[test]
+fn an_animation_over_a_budget_stands_as_its_first_frame_and_says_why() {
+    // Shown as one plain PNG, with nothing to animate on hover
+    let one = |c: &Clean| {
+        let (w, h, f) = frames_of(&c.png);
+        assert_eq!(
+            (c.frames, f.len(), c.still.is_none(), c.trimmed, (w, h)),
+            (1, 1, true, true, (c.w, c.h))
+        );
+        (w, f.into_iter().next().unwrap())
+    };
+    let gif = gif_of(1, 1, &dots(decode::MAX_FRAMES as u16 + 5, false));
+    let c = sanitize(&gif, Profile::Emote).unwrap();
+    assert_eq!(
+        c.stilled,
+        Some("the animation has too many frames to play here")
+    );
+    let (w, f) = one(&c);
+    assert_eq!(px(&f, w, 0, 0), [255, 0, 0, 255], "its first frame");
+
+    // A few KB of one-pixel frames on a big screen, each a whole canvas: the
+    // reading stops at the work budget (the 24th), in the moving box
+    let c = sanitize(&gif_of(2048, 2048, &dots(100, true)), Profile::Photo).unwrap();
+    assert_eq!(c.stilled, Some("the animation is too long to play here"));
+    let (w, f) = one(&c);
+    assert_eq!((c.w, c.h), (1024, 1024));
+    // Its first dot alone: the second, blue at (1,1), would share this pixel
+    assert_eq!(px(&f, w, 0, 0), [255, 0, 0, 63]);
+
+    // A later frame too big to read, after a first that was fine (S-1: it is
+    // charged its own size before a pixel of it is read)
+    let c = sanitize(&gif_frames_sized(&[(1, 1), (4097, 4096)]), Profile::Photo).unwrap();
+    assert_eq!(c.stilled, Some("the animation is too big to play here"));
+    let (w, f) = one(&c);
+    assert_eq!(px(&f, w, 0, 0), [255, 255, 255, 255]);
+
+    // An APNG of more frames than are read
+    let mut apng = Vec::new();
+    {
+        let mut e = png::Encoder::new(&mut apng, 1, 1);
+        e.set_color(png::ColorType::Rgba);
+        e.set_animated(decode::MAX_FRAMES as u32 + 5, 0).unwrap();
+        let mut wr = e.write_header().unwrap();
+        for i in 0..decode::MAX_FRAMES + 5 {
+            wr.write_image_data(&[0, 0, (i % 2) as u8 * 255, 255])
+                .unwrap();
+        }
+        wr.finish().unwrap();
+    }
+    let c = sanitize(&apng, Profile::Sticker).unwrap();
+    assert_eq!(
+        c.stilled,
+        Some("the animation has too many frames to play here")
+    );
+    let (w, f) = one(&c);
+    assert_eq!(px(&f, w, 0, 0), [0, 0, 0, 255]);
+
+    // An animated WebP of more frames than are read: its first frame, as the
+    // 3-frame one shows it
+    let short = sanitize(&webp_frames_repeated(1), Profile::Sticker).unwrap();
+    assert_eq!((short.frames, short.stilled), (3, None));
+    let c = sanitize(&webp_frames_repeated(101), Profile::Sticker).unwrap();
+    assert_eq!(
+        c.stilled,
+        Some("the animation has too many frames to play here")
+    );
+    let (_, f) = one(&c);
+    assert_eq!(f, frames_of(short.still.as_ref().unwrap()).2[0]);
+
+    // Within every budget it moves, and says nothing
+    let fine = sanitize(&gif_of(1, 1, &dots(20, false)), Profile::Emote).unwrap();
+    assert_eq!((fine.frames, fine.trimmed, fine.stilled), (20, false, None));
+}
+
+#[test]
+fn what_is_refused_for_anything_but_an_animation_budget_stays_refused() {
+    // Over a budget before its first frame (S-1): nothing to show
+    for n in [1, 2] {
+        assert_eq!(
+            sanitize(&gif_frames_past_screen(4097, 4096, n), Profile::Photo).unwrap_err(),
+            Error::TooLarge("the animation is too big to show")
+        );
+    }
+    // A screen too big to animate is refused before any frame is read
+    assert_eq!(
+        sanitize(&gif_of(4097, 4096, &dots(2, true)), Profile::Photo).unwrap_err(),
+        Error::TooLarge("the animation is too big to show")
+    );
+    // Damaged before its budget ran out: refused as damaged, as before
+    let long = gif_of(2048, 2048, &dots(100, true));
+    let cut = &long[..long.len() * 10 / 100];
+    assert!(
+        matches!(sanitize(cut, Profile::Photo), Err(Error::Corrupt(_))),
+        "{:?}",
+        sanitize(cut, Profile::Photo).map(|c| c.frames)
+    );
+    let mut first_broken = gif_frames_sized(&[(1, 1); 400]);
+    first_broken[19 + 10] = 12; // the first frame's LZW code size
+    assert!(matches!(
+        sanitize(&first_broken, Profile::Emote),
+        Err(Error::Corrupt(_))
+    ));
 }
 
 #[test]
@@ -872,4 +1026,276 @@ fn a_file_of_a_pack_that_lies_or_is_too_big_is_set_aside_and_the_rest_read() {
     let pack = read_pack(&locked).unwrap();
     assert!(pack.entries.is_empty());
     assert_eq!(pack.skipped, [("a.png".into(), "it is encrypted")]);
+}
+
+fn holds(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
+/// `riff` (a WebP) with a chunk `kind` of `data` added, its size fixed.
+fn with_chunk(riff: &[u8], kind: &[u8; 4], data: &[u8]) -> Vec<u8> {
+    let mut out = [riff, kind, &(data.len() as u32).to_le_bytes(), data].concat();
+    if data.len() % 2 == 1 {
+        out.push(0);
+    }
+    let size = (out.len() - 8) as u32;
+    out[4..8].copy_from_slice(&size.to_le_bytes());
+    out
+}
+
+#[test]
+fn an_original_upload_loses_its_metadata_and_nothing_it_shows() {
+    let secret = b"secret location";
+    let png = png_of(
+        2,
+        1,
+        png::ColorType::Rgba,
+        png::BitDepth::Eight,
+        &[255, 0, 0, 255, 0, 0, 255, 128],
+        None,
+    );
+    let gif = {
+        let g = gif_of(
+            2,
+            1,
+            &[
+                (0, 0, 2, 1, vec![0, 1], gif::DisposalMethod::Keep, 10),
+                (0, 0, 2, 1, vec![1, 0], gif::DisposalMethod::Keep, 10),
+            ],
+        );
+        // A comment extension, just before the end
+        let comment = [&[0x21, 0xFE, secret.len() as u8][..], secret, &[0]].concat();
+        [&g[..g.len() - 1], &comment, &[0x3B]].concat()
+    };
+    let webp = {
+        let w = with_chunk(
+            include_bytes!("../tests/fixtures/anim3.webp"),
+            b"EXIF",
+            secret,
+        );
+        let mut w = with_chunk(&w, b"XMP ", secret);
+        // Its VP8X says so, as a real one would
+        w[20] |= 0x08 | 0x04;
+        w
+    };
+    let jpeg = {
+        let plain = include_bytes!("../tests/fixtures/red-blue.jpg");
+        let comment = [
+            &[0xFF, 0xFE][..],
+            &((secret.len() + 2) as u16).to_be_bytes(),
+            secret,
+        ]
+        .concat();
+        let j = with_orientation(plain, 1);
+        [&j[..2], &comment, &j[2..]].concat()
+    };
+    for (what, file, profile) in [
+        ("png", png, Profile::Emote),
+        ("gif", gif, Profile::Emote),
+        ("webp", webp, Profile::Sticker),
+        ("jpeg", jpeg, Profile::Photo),
+    ] {
+        assert!(holds(&file, secret), "{what}: the test file holds it");
+        let bare = strip(&file).unwrap_or_else(|e| panic!("{what}: {e}"));
+        assert!(!holds(&bare, secret), "{what}: gone");
+        assert!(bare.len() < file.len(), "{what}");
+        assert_eq!(
+            sanitize(&bare, profile).unwrap().png,
+            sanitize(&file, profile).unwrap().png,
+            "{what}: what it shows is the same"
+        );
+    }
+    assert!(!holds(
+        &strip(&with_orientation(
+            include_bytes!("../tests/fixtures/red-blue.jpg"),
+            1
+        ))
+        .unwrap(),
+        b"Exif"
+    ));
+}
+
+/// `png` with an `eXIf` chunk of `data` just after its IHDR.
+fn with_exif_chunk(png: &[u8], data: &[u8]) -> Vec<u8> {
+    let body = [b"eXIf".as_slice(), data].concat();
+    let chunk = [
+        &(data.len() as u32).to_be_bytes()[..],
+        &body,
+        &crc32(&body).to_be_bytes(),
+    ]
+    .concat();
+    // The signature (8) and IHDR (4 + 4 + 13 + 4)
+    [&png[..33], &chunk, &png[33..]].concat()
+}
+
+#[test]
+fn a_turned_picture_or_a_broken_file_is_not_stripped() {
+    let plain = include_bytes!("../tests/fixtures/red-blue.jpg");
+    assert!(
+        strip(&with_orientation(plain, 6)).is_err(),
+        "its turn would be lost"
+    );
+    assert!(
+        strip(&plain[..plain.len() - 2]).is_err(),
+        "a JPEG with no end"
+    );
+    // PNG and WebP too: decode.rs turns them by their EXIF as it does a JPEG
+    let wide = png_of(
+        2,
+        1,
+        png::ColorType::Rgba,
+        png::BitDepth::Eight,
+        &[255, 0, 0, 255, 0, 0, 255, 255],
+        None,
+    );
+    let turned = with_exif_chunk(&wide, &exif_tiff(6));
+    let shown = sanitize(&turned, Profile::Emote).unwrap();
+    assert_eq!(
+        (shown.w, shown.h),
+        (1, 2),
+        "the test file is turned when shown"
+    );
+    assert!(strip(&turned).is_err(), "a turned PNG");
+    let upright = strip(&with_exif_chunk(&wide, &exif_tiff(1))).unwrap();
+    assert!(!holds(&upright, b"eXIf"), "an upright one loses its EXIF");
+    let webp = include_bytes!("../tests/fixtures/anim3.webp");
+    assert!(
+        strip(&with_chunk(webp, b"EXIF", &exif_tiff(6))).is_err(),
+        "a turned WebP"
+    );
+    let png = png_of(
+        1,
+        1,
+        png::ColorType::Rgba,
+        png::BitDepth::Eight,
+        &[1, 2, 3, 4],
+        None,
+    );
+    for cut in [9, 20, png.len() - 1] {
+        assert!(strip(&png[..cut]).is_err(), "cut at {cut}");
+    }
+    let gif = gif_of(
+        1,
+        1,
+        &[(0, 0, 1, 1, vec![0], gif::DisposalMethod::Keep, 10)],
+    );
+    for cut in 11..gif.len() {
+        let _ = strip(&gif[..cut]);
+    }
+}
+
+#[test]
+fn a_jpeg_ends_at_its_end_and_loses_what_is_between_its_scans() {
+    let secret = b"secret location";
+    let plain = include_bytes!("../tests/fixtures/red-blue.jpg");
+    let bare = strip(plain).unwrap();
+    // A phone's second image after the end (MPF), then a trailer
+    let trailed = [&plain[..], &plain[..], secret].concat();
+    let cut = strip(&trailed).unwrap();
+    assert_eq!(cut, bare, "nothing after FFD9");
+    assert!(!holds(&cut, secret));
+    // Progressive (jpegtran -progressive): ten scans, a comment between two
+    let prog = include_bytes!("../tests/fixtures/red-blue-progressive.jpg");
+    let second = prog
+        .windows(2)
+        .enumerate()
+        .filter(|(_, w)| *w == [0xFF, 0xDA])
+        .nth(1)
+        .unwrap()
+        .0;
+    let comment = [
+        &[0xFF, 0xFE][..],
+        &((secret.len() + 2) as u16).to_be_bytes(),
+        secret,
+    ]
+    .concat();
+    let file = [&prog[..second], &comment, &prog[second..], secret].concat();
+    let bare = strip(&file).unwrap();
+    assert!(!holds(&bare, secret), "between the scans and after the end");
+    assert_eq!(bare.last(), Some(&0xD9));
+    assert_eq!(
+        sanitize(&bare, Profile::Photo).unwrap().png,
+        sanitize(prog, Profile::Photo).unwrap().png,
+        "what it shows is the same"
+    );
+}
+
+#[test]
+fn a_header_tells_a_pictures_size_and_nothing_is_decoded() {
+    let png = png_of(
+        3,
+        2,
+        png::ColorType::Rgba,
+        png::BitDepth::Eight,
+        &[0; 24],
+        None,
+    );
+    assert_eq!(probe(&png), Some((3, 2)));
+    assert_eq!(
+        probe(&gif_frames_past_screen(4096, 4096, 1)),
+        Some((1, 1)),
+        "a GIF's screen"
+    );
+    assert!(probe(include_bytes!("../tests/fixtures/anim3.webp")).is_some());
+    assert!(probe(include_bytes!("../tests/fixtures/red-blue.jpg")).is_some());
+    assert_eq!(probe(b"not a picture"), None);
+    assert_eq!(probe(&png[..20]), None, "cut short");
+}
+
+/// Every hard picture there is, done in time: what a budget missed would show
+/// here as a picture that takes long (the GIF whose frames are bigger than its
+/// screen took seconds per viewer in 1.4). Timed in a release build only,
+/// in test.yml; a debug build is too slow to say anything. shortcut: a
+/// generous bound, since CI machines vary; tighten it if a regression hides
+/// under it.
+#[test]
+#[cfg_attr(debug_assertions, ignore = "timed in a release build (test.yml)")]
+fn every_hard_picture_is_done_in_time() {
+    use std::time::{Duration, Instant};
+    // 300 frames of 16 Mpx each on a 1×1 screen: one frame's block, again and again
+    let many_big_frames = {
+        let one = {
+            let mut out = Vec::new();
+            let mut e = gif::Encoder::new(&mut out, 1, 1, &[0, 0, 0, 255, 255, 255]).unwrap();
+            e.write_frame(&gif::Frame {
+                width: 4096,
+                height: 4096,
+                buffer: Cow::Owned(vec![0; 4096 * 4096]),
+                ..gif::Frame::default()
+            })
+            .unwrap();
+            drop(e);
+            out
+        };
+        let head = 13 + 6;
+        let block = &one[head..one.len() - 1];
+        [&one[..head], &block.repeat(300), &[0x3B]].concat()
+    };
+    let big_still = png_of(
+        7000,
+        7000,
+        png::ColorType::Grayscale,
+        png::BitDepth::Eight,
+        &vec![0; 7000 * 7000],
+        None,
+    );
+    let mut hard = vec![
+        ("gif frames past the screen", many_big_frames),
+        ("a 49 Mpx PNG", big_still),
+    ];
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/regressions/media");
+    for file in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        hard.push(("a fuzz regression", std::fs::read(file.path()).unwrap()));
+    }
+    for (what, bytes) in &hard {
+        for p in [Profile::Emote, Profile::Sticker, Profile::Photo] {
+            let start = Instant::now();
+            let _ = sanitize(bytes, p);
+            let took = start.elapsed();
+            assert!(
+                took < Duration::from_secs(5),
+                "{what} as {p:?} took {took:?}"
+            );
+        }
+    }
 }

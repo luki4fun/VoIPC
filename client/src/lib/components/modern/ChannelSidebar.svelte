@@ -31,13 +31,18 @@
   import { showChatPane } from "../../stores/platform.js";
   import {
     activeDmUserId,
+    activeDmUsername,
     activeTextChannelId,
     channelUnread,
-    dmConversations,
+    closeDmRow,
+    dmList,
     joinedTextChannelIds,
     openDm,
     unreadPerChannel,
   } from "../../stores/chat.js";
+  import { ago, awayHint, liveIdOf, reach } from "../../dm-rules.js";
+  import { notificationBody } from "../../chat-rules.js";
+  import { uiPrefs } from "../../stores/ui-prefs.js";
   import {
     canEditChannel,
     joinChannel,
@@ -52,6 +57,7 @@
   import { isCulled, visibleChannels } from "../../stores/roster.js";
   import { openShare } from "../../stores/user-menu.js";
   import { memberMenu } from "../../actions/member-menu.js";
+  import { closeRow } from "../../actions/focus.js";
   import { avatarStyle } from "../../avatar.js";
   import { shortName } from "../../username.js";
   import ChannelCreateForm from "../ChannelCreateForm.svelte";
@@ -66,6 +72,15 @@
   // Which channels are listed at all: stores/roster.ts `visibleChannels`
   const textChannels = $derived($visibleChannels.filter((c) => c.text));
   const voiceChannels = $derived($visibleChannels.filter((c) => !c.text));
+
+  // What a direct conversation's "3h" is counted from, while previews show it
+  let now = $state(Date.now());
+  $effect(() => {
+    if (!$uiPrefs.dm_previews) return;
+    now = Date.now();
+    const timer = setInterval(() => (now = Date.now()), 60_000);
+    return () => clearInterval(timer);
+  });
 
   /** The members this client is allowed to show under a row. */
   function membersOf(channel: ChannelInfo): UserInfo[] {
@@ -250,28 +265,54 @@
     {/each}
   </div>
 
-  {#if $dmConversations.length > 0}
+  {#if $dmList.length > 0}
     <div class="dm-section">
       <div class="sidebar-head">
         <span class="sidebar-title">Direct messages</span>
       </div>
-      <div class="dm-list">
-        {#each $dmConversations as convo (convo.user_id)}
-          <button
-            class="dm-entry"
-            class:active={$activeDmUserId === convo.user_id}
-            onclick={() => {
-              openDm($serverAddress, convo.user_id, convo.username);
-              // On a phone this list is a drawer over the chat
-              showChatPane();
-            }}
-          >
-            <span class="dm-avatar" style={avatarStyle(convo.username)}
-              >{convo.username.charAt(0).toUpperCase()}</span
+      <!-- Keyed by name: a person coming back gets a new id, and the row (and
+           the focus on it) must stay the same one -->
+      <div class="dm-list" role="group" aria-label="Direct messages">
+        {#each $dmList as { convo, last } (convo.username)}
+          {@const seen = convo.user_id > 0 ? convo.user_id : liveIdOf(convo.username, $users, $channelRosters)}
+          {@const r = reach(convo.user_id, seen, convo.account, !!$account?.cloud)}
+          {@const who = shortName(convo.username)}
+          {@const open = $activeDmUserId !== null && $activeDmUsername === convo.username}
+          {@const preview = $uiPrefs.dm_previews && last ? notificationBody(last) : ""}
+          <div class="channel-row">
+            <button
+              class="dm-entry"
+              class:active={open}
+              class:away={r !== "live"}
+              aria-current={open ? "true" : undefined}
+              aria-label={[who, r !== "live" && "away", convo.unread > 0 && `${convo.unread} unread`, preview].filter(Boolean).join(", ")}
+              title={r !== "live" ? awayHint(who, r) : undefined}
+              onclick={() => {
+                openDm($serverAddress, seen ?? convo.user_id, convo.username);
+                // On a phone this list is a drawer over the chat
+                showChatPane();
+              }}
             >
-            <span class="dm-name" title={convo.username}>{shortName(convo.username)}</span>
-            {#if convo.unread > 0}<span class="dm-unread">{convo.unread}</span>{/if}
-          </button>
+              <span class="dm-avatar" aria-hidden="true" style={avatarStyle(convo.username)}
+                >{convo.username.charAt(0).toUpperCase()}</span
+              >
+              <span class="dm-text">
+                <span class="dm-name" title={convo.username}>{who}</span>
+                {#if preview}<span class="dm-preview">{preview}</span>{/if}
+              </span>
+              {#if r !== "live"}<span class="proximity-tag">away</span>{/if}
+              {#if $uiPrefs.dm_previews && last}<span class="dm-ago">{ago(last.timestamp, now)}</span>{/if}
+              {#if convo.unread > 0}<span class="dm-unread">{convo.unread}</span>{/if}
+            </button>
+            <span class="row-actions">
+              <button
+                class="settings-icon"
+                title="Close — the messages are kept"
+                aria-label="Close conversation with {who}"
+                onclick={(e) => closeRow(e, () => closeDmRow($serverAddress, convo.username))}
+              ><Icon name="close" size={14} /></button>
+            </span>
+          </div>
         {/each}
       </div>
     </div>
@@ -464,6 +505,9 @@
     .channel.has-actions {
       padding-right: 52px;
     }
+    .dm-entry {
+      padding-right: 32px;
+    }
   }
 
   .settings-icon:hover {
@@ -587,6 +631,7 @@
   }
 
   .dm-entry:hover,
+  .channel-row:hover > .dm-entry,
   .dm-entry.active {
     background: var(--bg-hover);
     color: var(--text-primary);
@@ -604,12 +649,42 @@
     flex-shrink: 0;
   }
 
-  .dm-name {
+  .dm-text {
+    display: flex;
+    flex-direction: column;
     flex: 1;
+    min-width: 0;
+  }
+
+  .dm-name,
+  .dm-preview {
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    min-width: 0;
+  }
+
+  .dm-preview,
+  .dm-ago {
+    font-size: var(--fs-sm);
+    color: var(--text-muted);
+  }
+
+  .dm-ago {
+    flex-shrink: 0;
+  }
+
+  /* Archived, and their person is on no list we see: as "out of earshot" is */
+  .dm-entry.away .dm-name {
+    color: var(--text-muted);
+  }
+
+  .dm-entry.away .dm-avatar {
+    opacity: 0.5;
+  }
+
+  .channel-row:hover > .dm-entry,
+  .channel-row:focus-within > .dm-entry {
+    padding-right: 32px;
   }
 
   .dm-unread {
@@ -646,6 +721,10 @@
     }
     .channel.has-actions {
       padding-right: 92px;
+    }
+    .dm-entry,
+    .channel-row:hover > .dm-entry {
+      padding-right: 52px;
     }
     button.live-tag {
       position: relative;

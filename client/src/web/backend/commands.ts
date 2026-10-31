@@ -56,6 +56,10 @@ function optStr(v: unknown, name: string): string | null {
   return v == null ? null : str(v, name);
 }
 
+function strs(v: unknown, name: string): string[] {
+  return Array.isArray(v) && v.every((x) => typeof x === "string") ? v : fail(`invalid ${name}`);
+}
+
 /** What a message answers, its thread, its file, where it was forwarded
  *  from, or the event it is, as the front end names them. One that would
  *  arrive as something else is refused (commands.rs `checked_extras`): the
@@ -384,7 +388,7 @@ const handlers: Record<string, Handler> = {
       files.parseFileArg(file),
       optStr(op, "op") ?? undefined,
     ),
-  file_image: ({ server, conv, file, profile, op }) =>
+  file_image: ({ server, conv, file, profile, op, still }) =>
     files.fileImage(
       session.sessionFor(str(server, "server"))?.files ?? null,
       str(server, "server"),
@@ -392,6 +396,7 @@ const handlers: Record<string, Handler> = {
       files.parseFileArg(file),
       num(profile, "profile"),
       optStr(op, "op") ?? undefined,
+      still === true,
     ),
   cancel_file: ({ op }) => files.cancel(str(op, "op")),
   forward_file: ({ server, conv, hash, op }) => {
@@ -410,16 +415,34 @@ const handlers: Record<string, Handler> = {
     files.cacheRetain(new Set(hashes.filter((h): h is string => typeof h === "string")));
   },
   // ── Emotes (emotes.ts; client/src-tauri/src/emotes.rs) ──
-  emote_image: ({ server, hash, sticker, still }) => {
+  emote_image: ({ server, hash, sticker, still, fetchOnly, len }) => {
     const e = need(server).emotes;
     if (!e) fail("this server has no emotes");
-    return e.image(str(hash, "hash"), bool(sticker, "sticker"), bool(still, "still"));
+    return e.image(str(hash, "hash"), bool(sticker, "sticker"), bool(still, "still"), fetchOnly === true, Number.isInteger(len) ? Number(len) : 0);
   },
   emote_file: async ({ server, hash }) => {
     const e = need(server).emotes;
     if (!e) fail("this server has no emotes");
     return (await e.file(str(hash, "hash"))).buffer;
   },
+  emote_seed: ({ body, headers }) => {
+    let meta: Args;
+    try {
+      meta = JSON.parse(str((headers as Record<string, unknown> | undefined)?.["x-voipc-seed"], "x-voipc-seed"));
+    } catch {
+      fail("emote_seed needs its x-voipc-seed header");
+    }
+    if (!(body instanceof Uint8Array)) fail("emote_seed takes the pictures' bytes");
+    const n = num(meta.preview, "preview");
+    if (n <= 0 || n > body.length) fail("emote_seed: no preview");
+    return emotes.seed(str(meta.hash, "hash"), bool(meta.sticker, "sticker"), body.slice(0, n), n < body.length ? body.slice(n) : null);
+  },
+  emote_cache_size: () => emotes.cacheSize(),
+  emote_missing: ({ items }) =>
+    emotes.missing(
+      (Array.isArray(items) ? items : []).map((i: { hash?: unknown; sticker?: unknown }) => ({ hash: str(i?.hash, "hash"), sticker: i?.sticker === true })),
+    ),
+  emote_cache_clear: () => emotes.cacheClear(),
   emote_cache_retain: ({ keep }) =>
     emotes.retain(Array.isArray(keep) ? keep.filter((h): h is string => typeof h === "string") : []),
   prepare_emote: ({ body, headers }) => {
@@ -430,7 +453,7 @@ const handlers: Record<string, Handler> = {
       fail("prepare_emote needs its x-voipc-prepare header");
     }
     if (!(body instanceof Uint8Array)) fail("prepare_emote takes the picture's bytes");
-    return emotes.prepareEmote(files.sanitizeImage, body, bool(meta.sticker, "sticker"), num(meta.max_bytes, "max_bytes"));
+    return emotes.prepareEmote(files.sanitizeImage, files.stripImage, body, bool(meta.sticker, "sticker"), num(meta.max_bytes, "max_bytes"));
   },
   read_emote_pack: async ({ body }) => {
     if (!(body instanceof Uint8Array)) fail("read_emote_pack takes the archive's bytes");
@@ -446,9 +469,12 @@ const handlers: Record<string, Handler> = {
     if (!(body instanceof Uint8Array)) fail("emote_add takes the picture's bytes");
     const e = need(meta.server).emotes;
     if (!e) fail("this server has no emotes");
-    return e.add(str(meta.name, "name"), bool(meta.sticker, "sticker"), str(meta.pack, "pack"), body);
+    const side = (v: unknown) => (Number.isInteger(v) ? Math.min(Math.max(Number(v), 0), 65_535) : 0);
+    return e.add(str(meta.name, "name"), bool(meta.sticker, "sticker"), str(meta.pack, "pack"), body, side(meta.w), side(meta.h));
   },
-  emote_remove: ({ server, name }) => need(server).emotes?.remove(str(name, "name")),
+  emote_remove: ({ server, names }) => need(server).emotes?.remove(strs(names, "names")),
+  emote_move: ({ server, names, pack, sticker }) =>
+    need(server).emotes?.move(strs(names, "names"), optStr(pack, "pack"), sticker == null ? null : bool(sticker, "sticker")),
   emote_rename: ({ server, from, to }) => need(server).emotes?.rename(str(from, "from"), str(to, "to")),
   emote_stickers: ({ server, on }) => need(server).emotes?.setStickers(bool(on, "on")),
   file_cache_remove: ({ hashes }) => {

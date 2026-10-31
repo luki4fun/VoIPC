@@ -1,8 +1,9 @@
-//! Fuzz target: any bytes as a picture in every profile, and as a pack.
+//! Fuzz target: any bytes as a picture in every profile, as a pack, and
+//! stripped of their metadata.
 //! `fuzz/fuzz_targets/media.rs` calls it under cargo-fuzz; the test below
 //! replays `fuzz/regressions/media/*` on stable.
 
-use crate::{read_pack, sanitize, Profile};
+use crate::{read_pack, sanitize, strip, Profile};
 
 pub fn fuzz_media(data: &[u8]) {
     for p in [Profile::Emote, Profile::Sticker, Profile::Photo] {
@@ -10,6 +11,16 @@ pub fn fuzz_media(data: &[u8]) {
             // What this writes is read back the same
             let again = sanitize(&clean.png, p).expect("its own output reads");
             assert_eq!((again.w, again.h), (clean.w, clean.h));
+        }
+    }
+    // What stripping keeps reads as the file did
+    if let Ok(bare) = strip(data) {
+        if let Ok(clean) = sanitize(data, Profile::Emote) {
+            let again = sanitize(&bare, Profile::Emote).expect("a stripped picture reads");
+            assert_eq!(
+                (again.w, again.h, again.frames),
+                (clean.w, clean.h, clean.frames)
+            );
         }
     }
     if let Ok(pack) = read_pack(data) {

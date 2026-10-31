@@ -12,7 +12,7 @@ nobody checks, so a new one comes with its test.
 
 **1.x keeps:**
 - A relay admits a client exactly when their `PROTOCOL_VERSION` is equal (12 in 1.0, 13 in
-  1.3, 14 in 1.4). The app version is informational only.
+  1.3, 14 in 1.4, 15 in 1.5). The app version is informational only.
 - A refused client is told why:
   - a client at protocol 12 or later gets `ServerMessage::Refused { code, server_protocol,
     server_version, text }`, with `code` 1 (`REFUSED_VERSION`) for a protocol mismatch. The app
@@ -89,6 +89,9 @@ that cannot make the directory starts without files instead of refusing to start
 admin adds emotes, kept in `emotes/` under the working directory. `[emotes] enabled = false`
 keeps the old behaviour. Its `dir` must not be `[files] dir`, nor inside or around it.
 `[files]` has two new keys, `animation_side` and `animation_mb`, with defaults.
+
+**What changed in 1.5:** no new keys. The relay's `emotes/manifest.json` keeps each emote's
+shape (`w`, `h`); a 1.4 manifest reads as it was, with no shape.
 
 **An older relay on a newer config:** it refuses the unknown key, never ignores it, so a relay
 cannot silently run without a setting it was given. The JSON files stay lenient: a rewrite of

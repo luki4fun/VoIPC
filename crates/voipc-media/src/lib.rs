@@ -17,13 +17,16 @@ mod encode;
 mod exif;
 mod pack;
 mod resize;
+mod strip;
 
 #[cfg(any(test, fuzzing))]
 pub mod fuzz;
 #[cfg(test)]
 mod tests;
 
+pub use decode::probe;
 pub use pack::{read_pack, Entry, Pack};
+pub use strip::strip;
 
 /// Bumped whenever what `sanitize` writes may change: a copy cached under an
 /// older version is made again (a decoder fix reaches every cached picture).
@@ -107,8 +110,13 @@ pub struct Clean {
     pub w: u32,
     pub h: u32,
     pub frames: usize,
-    /// Frames were dropped, or only the first kept, to stay under the cap.
+    /// Frames were dropped, or only the first kept, to stay under the cap or
+    /// a decoding budget.
     pub trimmed: bool,
+    /// A moving picture shown as its first frame alone, and why (its reading
+    /// stopped at a budget, or its frames would not fit what is kept of it):
+    /// for a note under it. Set exactly when `trimmed` left one frame.
+    pub stilled: Option<&'static str>,
 }
 
 /// Why a picture is not shown. The text is for people (the importer's report,
@@ -146,7 +154,9 @@ pub fn sanitize(bytes: &[u8], profile: Profile) -> Result<Clean> {
 
 /// `sanitize`, with at most `max_out` bytes of PNG (an animation over it
 /// loses every other frame until a few are left, then all but its first),
-/// and a moving picture kept as `motion` says.
+/// and a moving picture kept as `motion` says. An animation over a decoding
+/// budget (too many frames, too long, a frame too big) after its first frame
+/// is read no further and kept as that frame (`Clean::stilled`).
 pub fn sanitize_capped(
     bytes: &[u8],
     profile: Profile,
@@ -157,8 +167,13 @@ pub fn sanitize_capped(
         return Err(Error::TooLarge("the file is too big"));
     }
     let mut sink = resize::Fit::new(profile.side(), motion);
-    let orientation = decode::decode(bytes, &mut sink)?;
+    let read = decode::decode(bytes, &mut sink)?;
     let (mut frames, mut w, mut h, thinned) = sink.finish()?;
+    if read.over.is_some() {
+        // Read no further than a budget: its first frame stands for it
+        frames.truncate(1);
+    }
+    let orientation = read.orientation;
     if orientation > 1 {
         let (mut ow, mut oh) = (w, h);
         for f in &mut frames {
@@ -171,7 +186,7 @@ pub fn sanitize_capped(
     } else {
         png::Compression::Balanced
     };
-    let mut trimmed = thinned;
+    let mut trimmed = thinned || read.over.is_some();
     loop {
         let png = encode::write(&frames, w, h, compression)?;
         if png.len() <= max_out {
@@ -180,6 +195,10 @@ pub fn sanitize_capped(
             } else {
                 None
             };
+            let stilled = (trimmed && frames.len() == 1).then(|| {
+                read.over
+                    .map_or(decode::Over::Frame.stilled(), decode::Over::stilled)
+            });
             return Ok(Clean {
                 png,
                 still,
@@ -187,6 +206,7 @@ pub fn sanitize_capped(
                 h,
                 frames: frames.len(),
                 trimmed,
+                stilled,
             });
         }
         trimmed = true;

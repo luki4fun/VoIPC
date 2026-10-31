@@ -282,6 +282,15 @@
     <polyline points="15 3 21 3 21 9"/>
     <line x1="10" y1="14" x2="21" y2="3"/>
 
+  {:else if name === "zoom-in"}
+    <circle cx="11" cy="11" r="7"/>
+    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+    <line x1="8" y1="11" x2="14" y2="11"/>
+    <line x1="11" y1="8" x2="11" y2="14"/>
+  {:else if name === "zoom-out"}
+    <circle cx="11" cy="11" r="7"/>
+    <line x1="21" y1="21" x2="16.65" y2="16.65"/>
+    <line x1="8" y1="11" x2="14" y2="11"/>
   {:else if name === "zoom-fit"}
     <circle cx="11" cy="11" r="7"/>
     <line x1="21" y1="21" x2="16.65" y2="16.65"/>
@@ -295,6 +304,13 @@
   {:else if name === "file"}
     <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8Z"/>
     <polyline points="14 2 14 8 20 8"/>
+
+  {:else if name === "sticker"}
+    <path d="M15.5 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h9.5L21 14.5V5a2 2 0 0 0-2-2Z"/>
+    <path d="M14 21v-5a2 2 0 0 1 2-2h5"/>
+
+  {:else if name === "star"}
+    <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/>
 
   {/if}
 </svg>

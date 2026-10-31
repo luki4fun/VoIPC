@@ -151,6 +151,7 @@ One system face (`system-ui`): the desktop's own UI font on Linux and Windows, R
 - **Small** (400, 12px): hints, timestamps, status.
 - **Micro** (600, 11px, uppercase, lightly tracked): sidebar group labels only.
 - **Code** (`ui-monospace, "Cascadia Mono", Consolas, monospace` at 0.92em): inline code and fenced blocks in messages. The app ships no font of its own for it.
+- **Emoji**: the system's own. Where the system has no picture for one the app offers, the body's last font, **VoIPC Emoji** (the app's ~230 emoji cut from Noto Color Emoji, COLRv1, OFL), draws it; it is never first, so emoji keep each platform's look. A joined emoji the system would split in two is left out of the picker (`emoji-support.ts`). Not Twemoji: that is Discord's look.
 
 ### Named Rules
 
@@ -197,6 +198,14 @@ The phone's push-to-talk: a wide button in the thumb zone, held with any pointer
 ### Confirmation
 
 One dialog for every destructive or trust-weakening action (`confirmAction`): it names exactly what goes and where, Cancel has the focus, the confirm button says the verb.
+
+### Pop-ups and the picker
+
+A pop-up (a message's menu, the reactions picker, an emote's card) opens at what opened it and is then placed by its measured size (`use:fit`, `place-rules.ts`): below if it fits, else above, else as low as it can be with its top on screen, always inside the visual viewport and the system bars. Never a guessed height. The emoji picker is one component for writing and for reactions: a tablist with one Tab stop (the arrows walk the tabs), a search, a grid the arrows walk; inside a `use:menu` it is marked `data-keys="own"` and the menu leaves its keys alone. What a greyed control means is said in text beside it, never only in a tooltip, because a phone shows none.
+
+### Pictures and files in chat
+
+A file card's controls on its blurred preview are solid (`.btn .btn-secondary`) and its words sit on the card's own surface, because nothing can be assumed about the colours under them. After an error the button says *Try again*. The picture viewer shows its zoom (out, the percentage that fits again, in) beside Download and Close; the stage has the focus when it opens, so + − 0 and the arrows work at once.
 
 ### Website (server browser)
 

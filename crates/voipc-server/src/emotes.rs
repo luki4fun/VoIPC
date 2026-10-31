@@ -28,18 +28,19 @@ use voipc_protocol::codec::encode_server_msg;
 use voipc_protocol::conv::{hex, unhex};
 use voipc_protocol::messages::ServerMessage;
 use voipc_protocol::types::{
-    valid_emote_name, valid_emote_pack, Emote, EmoteAccess, Secret, SessionId, MAX_EMOTES,
+    valid_emote_name, valid_emote_pack, Emote, EmoteAccess, Secret, SessionId, EMOTE_BOX,
+    MAX_EMOTES, STICKER_BOX,
 };
 
 use crate::config::EmotesConfig;
-use crate::files::{Prepared, Reply};
+use crate::files::{Bucket, Prepared, Reply};
 use crate::state::ServerState;
 
 /// How long an upload ticket lasts.
 const TICKET_LIFETIME: Duration = Duration::from_secs(600);
 /// Uploads one admin connection may have open at once.
 const TICKETS_PER_SESSION: usize = 64;
-/// Changes within this time go out as one list.
+/// Changes within this time go out as one list, and one manifest write.
 const BROADCAST_AFTER: Duration = Duration::from_secs(1);
 const MANIFEST: &str = "manifest.json";
 
@@ -57,12 +58,15 @@ struct Stored {
     sticker: bool,
     #[serde(default)]
     pack: String,
+    #[serde(default)]
+    w: u16,
+    #[serde(default)]
+    h: u16,
 }
 
 struct Pending {
     session: SessionId,
     emote: Emote,
-    len: u32,
     until: Instant,
 }
 
@@ -73,11 +77,15 @@ struct Inner {
     files: HashMap<[u8; 32], Bytes>,
     /// Upload tickets, by ticket.
     tickets: HashMap<String, Pending>,
-    /// Download bearers, by token: one per connection.
-    bearers: HashMap<String, SessionId>,
+    /// Download bearers, by token: one per connection, with what it may still
+    /// fetch (every member fetches every file once; a loop of fetches would
+    /// fill the uplink voice needs).
+    bearers: HashMap<String, (SessionId, Bucket)>,
     /// Bytes promised to open tickets, so uploads at once cannot pass the cap.
     reserved: u64,
     broadcast_due: bool,
+    /// Files no emote names now, deleted once the manifest says so.
+    gone: Vec<[u8; 32]>,
 }
 
 impl Inner {
@@ -94,7 +102,7 @@ impl Inner {
             .collect();
         for t in gone {
             if let Some(p) = self.tickets.remove(&t) {
-                self.reserved -= u64::from(p.len);
+                self.reserved -= u64::from(p.emote.len);
             }
         }
     }
@@ -105,6 +113,27 @@ impl Inner {
             emotes: self.emotes.clone(),
         }
     }
+}
+
+/// A shape held to its kind's box: only ever the room a reader keeps, both
+/// sides by one factor so it keeps its proportions (a sticker of 320×160 made
+/// an emote is 128×64, not 128×128).
+fn boxed(mut e: Emote) -> Emote {
+    let side = u64::from(if e.sticker { STICKER_BOX } else { EMOTE_BOX });
+    let (w, h) = (u64::from(e.w), u64::from(e.h));
+    let long = w.max(h);
+    if long > side {
+        // A side of 0 says "no shape": it stays 0
+        let fit = |n: u64| {
+            if n == 0 {
+                0
+            } else {
+                (n * side / long).max(1) as u16
+            }
+        };
+        (e.w, e.h) = (fit(w), fit(h));
+    }
+    e
 }
 
 pub struct EmoteStore {
@@ -174,12 +203,16 @@ impl EmoteStore {
                     }
                 }
             }
-            inner.emotes.push(Emote {
+            let len = inner.files[&hash].len() as u32;
+            inner.emotes.push(boxed(Emote {
                 name: s.name,
                 hash,
                 sticker: s.sticker,
                 pack: s.pack,
-            });
+                len,
+                w: s.w,
+                h: s.h,
+            }));
         }
         // Only what this store writes is touched: hex names, its temp files
         for entry in std::fs::read_dir(&dir)?.flatten() {
@@ -207,14 +240,24 @@ impl EmoteStore {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// What one connection may download: every file twice and the largest
+    /// once more at once, that much again an hour.
+    fn download_budget(&self, now: Instant) -> Bucket {
+        let cap = (2 * self.max_total + u64::from(self.max_sticker)) as f64;
+        Bucket::new(cap, self.max_total as f64 / 3600.0, now)
+    }
+
     /// `Authenticated.emotes` for a new connection: its own bearer.
     pub fn access(&self, session: SessionId) -> EmoteAccess {
         let token = hex(&rand::random::<[u8; 16]>());
-        self.lock().bearers.insert(token.clone(), session);
+        let budget = self.download_budget(Instant::now());
+        self.lock().bearers.insert(token.clone(), (session, budget));
         EmoteAccess {
             token: Secret(token),
             max_emote_bytes: self.max_emote,
             max_sticker_bytes: self.max_sticker,
+            max_total_bytes: self.max_total,
+            max_items: MAX_EMOTES as u32,
         }
     }
 
@@ -225,7 +268,7 @@ impl EmoteStore {
     /// A connection's end: its bearer and its open uploads go.
     pub fn forget(&self, session: SessionId) {
         let mut inner = self.lock();
-        inner.bearers.retain(|_, s| *s != session);
+        inner.bearers.retain(|_, (s, _)| *s != session);
         let gone: Vec<String> = inner
             .tickets
             .iter()
@@ -234,43 +277,49 @@ impl EmoteStore {
             .collect();
         for t in gone {
             if let Some(p) = inner.tickets.remove(&t) {
-                inner.reserved -= u64::from(p.len);
+                inner.reserved -= u64::from(p.emote.len);
             }
         }
     }
 
-    /// An admin adds `emote`, a file of `len` bytes.
-    pub fn add(
-        &self,
-        session: SessionId,
-        emote: Emote,
-        len: u32,
-        now: Instant,
-    ) -> Result<Added, String> {
+    fn cap(&self, sticker: bool) -> u32 {
+        if sticker {
+            self.max_sticker
+        } else {
+            self.max_emote
+        }
+    }
+
+    fn too_big(&self, sticker: bool) -> String {
+        format!(
+            "a{} file may be at most {} KiB here",
+            if sticker { " sticker's" } else { "n emote's" },
+            self.cap(sticker) / 1024
+        )
+    }
+
+    /// An admin adds `emote`, a file of `emote.len` bytes.
+    pub fn add(&self, session: SessionId, emote: Emote, now: Instant) -> Result<Added, String> {
         if !valid_emote_name(&emote.name) {
             return Err("an emote's name is 2 to 30 of a-z, 0-9 and _".into());
         }
         if !valid_emote_pack(&emote.pack) {
             return Err("a pack's name is one line of at most 32 characters".into());
         }
-        let cap = if emote.sticker {
-            self.max_sticker
-        } else {
-            self.max_emote
-        };
-        if len == 0 || len > cap {
-            return Err(format!(
-                "a{} file may be at most {} KiB here",
-                if emote.sticker {
-                    " sticker's"
-                } else {
-                    "n emote's"
-                },
-                cap / 1024
-            ));
+        let len = emote.len;
+        if len == 0 || len > self.cap(emote.sticker) {
+            return Err(self.too_big(emote.sticker));
         }
+        let emote = boxed(emote);
         let mut inner = self.lock();
         inner.sweep(now);
+        // The same add again (an answer that came too late): its own ticket
+        if let Some((t, p)) = inner.tickets.iter_mut().find(|(_, p)| {
+            p.session == session && p.emote.name == emote.name && p.emote.hash == emote.hash
+        }) {
+            p.until = now + TICKET_LIFETIME;
+            return Ok(Added::Ticket(t.clone()));
+        }
         if inner.emotes.iter().any(|e| e.name == emote.name)
             || inner.tickets.values().any(|p| p.emote.name == emote.name)
         {
@@ -312,28 +361,29 @@ impl EmoteStore {
             Pending {
                 session,
                 emote,
-                len,
                 until: now + TICKET_LIFETIME,
             },
         );
         Ok(Added::Ticket(ticket))
     }
 
-    /// Remove the emote called `name`; its file goes when no other names it.
-    /// The hash of a file that went, for the disk.
-    pub fn remove(&self, name: &str) -> Result<Option<[u8; 32]>, String> {
+    /// Remove the emotes called `names`; a file goes when no other names it.
+    /// The names it does not have.
+    pub fn remove(&self, names: &[String]) -> Vec<String> {
         let mut inner = self.lock();
-        let at = inner
-            .emotes
-            .iter()
-            .position(|e| e.name == name)
-            .ok_or_else(|| format!(":{name}: is not one of this server's"))?;
-        let gone = inner.emotes.remove(at);
-        if inner.emotes.iter().any(|e| e.hash == gone.hash) {
-            return Ok(None);
+        let mut unknown = Vec::new();
+        for name in names {
+            let Some(at) = inner.emotes.iter().position(|e| e.name == *name) else {
+                unknown.push(name.clone());
+                continue;
+            };
+            let gone = inner.emotes.remove(at);
+            if !inner.emotes.iter().any(|e| e.hash == gone.hash) {
+                inner.files.remove(&gone.hash);
+                inner.gone.push(gone.hash);
+            }
         }
-        inner.files.remove(&gone.hash);
-        Ok(Some(gone.hash))
+        unknown
     }
 
     /// Call `from` by `to`, where it stands in the list.
@@ -356,6 +406,43 @@ impl EmoteStore {
         Ok(())
     }
 
+    /// Put `names` in `pack`, and/or make them the kind `sticker`: all of
+    /// them, or none and why.
+    pub fn moved(
+        &self,
+        names: &[String],
+        pack: Option<&str>,
+        sticker: Option<bool>,
+    ) -> Result<(), String> {
+        if pack.is_some_and(|p| !valid_emote_pack(p)) {
+            return Err("a pack's name is one line of at most 32 characters".into());
+        }
+        let mut inner = self.lock();
+        for name in names {
+            let e = inner
+                .emotes
+                .iter()
+                .find(|e| e.name == *name)
+                .ok_or_else(|| format!(":{name}: is not one of this server's"))?;
+            if sticker.is_some_and(|k| e.len > self.cap(k)) {
+                return Err(format!(
+                    ":{name}: is too big: {}",
+                    self.too_big(sticker == Some(true))
+                ));
+            }
+        }
+        for e in inner.emotes.iter_mut().filter(|e| names.contains(&e.name)) {
+            if let Some(p) = pack {
+                p.clone_into(&mut e.pack);
+            }
+            if let Some(k) = sticker {
+                e.sticker = k;
+                *e = boxed(e.clone());
+            }
+        }
+        Ok(())
+    }
+
     pub fn set_stickers(&self, on: bool) {
         self.lock().stickers = on;
     }
@@ -370,11 +457,11 @@ impl EmoteStore {
         else {
             return Err((401, "no such upload"));
         };
-        inner.reserved -= u64::from(p.len);
+        inner.reserved -= u64::from(p.emote.len);
         if p.until <= Instant::now() {
             return Err((401, "the upload's ticket has run out"));
         }
-        if body.len() != p.len as usize {
+        if body.len() != p.emote.len as usize {
             return Err((400, "the file is not the size it was said to be"));
         }
         if <[u8; 32]>::from(Sha256::digest(body)) != hash {
@@ -391,14 +478,31 @@ impl EmoteStore {
         Ok(())
     }
 
-    /// Write the manifest as it is now (and a new file first): to a temp
-    /// file, then renamed over the old, so a crash leaves one or the other.
-    async fn save(&self, new_file: Option<([u8; 32], Bytes)>, gone_file: Option<[u8; 32]>) {
+    /// A new file, on disk before its upload is answered. In turn with the
+    /// manifest's writes: one that found this picture gone deletes its file
+    /// before this writes it again, never after.
+    async fn write_file(&self, hash: [u8; 32], bytes: Bytes) {
         let _turn = self.writing.lock().await;
-        let (manifest, gone_file) = {
-            let inner = self.lock();
+        let dir = self.dir.clone();
+        let written =
+            tokio::task::spawn_blocking(move || atomic_write(&dir, &hex(&hash), &bytes)).await;
+        if !matches!(written, Ok(Ok(()))) {
+            warn!(?written, "emotes: could not write {}", self.dir.display());
+        }
+    }
+
+    /// Write the manifest as it is now: to a temp file, then renamed over the
+    /// old, so a crash leaves one or the other. Then the files it no longer
+    /// names go.
+    async fn write_manifest(&self) {
+        let _turn = self.writing.lock().await;
+        let (manifest, gone) = {
+            let mut inner = self.lock();
             // The same picture may have come back under another name meanwhile
-            let gone_file = gone_file.filter(|h| !inner.files.contains_key(h));
+            let gone: Vec<[u8; 32]> = std::mem::take(&mut inner.gone)
+                .into_iter()
+                .filter(|h| !inner.files.contains_key(h))
+                .collect();
             let manifest = Manifest {
                 stickers: inner.stickers,
                 emotes: inner
@@ -409,18 +513,17 @@ impl EmoteStore {
                         hash: hex(&e.hash),
                         sticker: e.sticker,
                         pack: e.pack.clone(),
+                        w: e.w,
+                        h: e.h,
                     })
                     .collect(),
             };
-            (manifest, gone_file)
+            (manifest, gone)
         };
         let dir = self.dir.clone();
         let written = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            if let Some((hash, bytes)) = new_file {
-                atomic_write(&dir, &hex(&hash), &bytes)?;
-            }
             atomic_write(&dir, MANIFEST, &serde_json::to_vec_pretty(&manifest)?)?;
-            if let Some(hash) = gone_file {
+            for hash in gone {
                 let _ = std::fs::remove_file(dir.join(hex(&hash)));
             }
             Ok(())
@@ -431,15 +534,17 @@ impl EmoteStore {
         }
     }
 
-    /// A change is kept on disk, and goes out as the new list a moment later,
-    /// with any other change made meanwhile.
-    async fn changed(
-        self: &Arc<Self>,
-        state: &Arc<ServerState>,
-        new_file: Option<([u8; 32], Bytes)>,
-        gone_file: Option<[u8; 32]>,
-    ) {
-        self.save(new_file, gone_file).await;
+    /// The manifest as it is now, at once: the shutdown's, which cannot wait
+    /// for `changed`'s moment. A change answered just before the end is not
+    /// lost then, nor its file taken for an orphan at the next start.
+    pub async fn flush(&self) {
+        self.write_manifest().await;
+    }
+
+    /// A change: a moment later the manifest is written and the new list goes
+    /// out, with any other change made meanwhile (an import of hundreds is one
+    /// write and one list).
+    fn changed(self: &Arc<Self>, state: &Arc<ServerState>) {
         let due = std::mem::replace(&mut self.lock().broadcast_due, true);
         if due {
             return;
@@ -447,12 +552,9 @@ impl EmoteStore {
         let (store, state) = (self.clone(), state.clone());
         tokio::spawn(async move {
             tokio::time::sleep(BROADCAST_AFTER).await;
-            let list = {
-                let mut inner = store.lock();
-                inner.broadcast_due = false;
-                inner.list()
-            };
-            if let Ok(data) = encode_server_msg(&list) {
+            store.lock().broadcast_due = false;
+            store.write_manifest().await;
+            if let Ok(data) = encode_server_msg(&store.list()) {
                 state.broadcast_raw_to_all(&data).await;
             }
         });
@@ -504,7 +606,6 @@ pub(crate) async fn handle_add(
     state: &Arc<ServerState>,
     session: SessionId,
     emote: Emote,
-    len: u32,
     tx: &mpsc::Sender<Vec<u8>>,
 ) {
     let name = emote.name.clone();
@@ -512,13 +613,14 @@ pub(crate) async fn handle_add(
         return;
     };
     let hash = emote.hash;
-    match store.add(session, emote, len, Instant::now()) {
+    match store.add(session, emote, Instant::now()) {
         Ok(Added::Ticket(ticket)) => {
-            if let Ok(data) = encode_server_msg(&ServerMessage::EmoteTicket { hash, ticket }) {
+            if let Ok(data) = encode_server_msg(&ServerMessage::EmoteTicket { hash, name, ticket })
+            {
                 let _ = tx.send(data).await;
             }
         }
-        Ok(Added::Listed) => store.changed(state, None, None).await,
+        Ok(Added::Listed) => store.changed(state),
         Err(reason) => refuse(tx, name, reason).await,
     }
 }
@@ -527,15 +629,33 @@ pub(crate) async fn handle_add(
 pub(crate) async fn handle_remove(
     state: &Arc<ServerState>,
     session: SessionId,
-    name: String,
+    names: Vec<String>,
     tx: &mpsc::Sender<Vec<u8>>,
 ) {
-    let Some(store) = for_admin(state, session, tx, &name).await else {
+    let Some(store) = for_admin(state, session, tx, "").await else {
         return;
     };
-    match store.remove(&name) {
-        Ok(gone) => store.changed(state, None, gone).await,
-        Err(reason) => refuse(tx, name, reason).await,
+    if names.len() > MAX_EMOTES {
+        return refuse(tx, String::new(), format!("at most {MAX_EMOTES} at once")).await;
+    }
+    let unknown = store.remove(&names);
+    if unknown.len() < names.len() {
+        store.changed(state);
+    }
+    if let Some(first) = unknown.first() {
+        let list = unknown
+            .iter()
+            .take(5)
+            .map(|n| format!(":{n}:"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let more = unknown.len().saturating_sub(5);
+        let reason = if more > 0 {
+            format!("not this server's: {list} and {more} more")
+        } else {
+            format!("not this server's: {list}")
+        };
+        refuse(tx, first.clone(), reason).await;
     }
 }
 
@@ -551,8 +671,30 @@ pub(crate) async fn handle_rename(
         return;
     };
     match store.rename(&from, &to) {
-        Ok(()) => store.changed(state, None, None).await,
+        Ok(()) => store.changed(state),
         Err(reason) => refuse(tx, from, reason).await,
+    }
+}
+
+/// `ClientMessage::EmoteMove`.
+pub(crate) async fn handle_move(
+    state: &Arc<ServerState>,
+    session: SessionId,
+    names: Vec<String>,
+    pack: Option<String>,
+    sticker: Option<bool>,
+    tx: &mpsc::Sender<Vec<u8>>,
+) {
+    let first = names.first().cloned().unwrap_or_default();
+    let Some(store) = for_admin(state, session, tx, &first).await else {
+        return;
+    };
+    if names.len() > MAX_EMOTES {
+        return refuse(tx, first, format!("at most {MAX_EMOTES} at once")).await;
+    }
+    match store.moved(&names, pack.as_deref(), sticker) {
+        Ok(()) => store.changed(state),
+        Err(reason) => refuse(tx, first, reason).await,
     }
 }
 
@@ -567,7 +709,7 @@ pub(crate) async fn handle_stickers(
         return;
     };
     store.set_stickers(on);
-    store.changed(state, None, None).await;
+    store.changed(state);
 }
 
 // ── HTTP: `/e/v1/<hash>` ──────────────────────────────────────────────────
@@ -632,23 +774,32 @@ pub(crate) fn prepare(
             Prepared::Reply(reply)
         }
         "GET" | "HEAD" => {
-            let inner = store.lock();
-            if !token.is_some_and(|t| inner.bearers.contains_key(t)) {
-                return Prepared::Reply(say(401, "a member's token is needed"));
-            }
+            let mut inner = store.lock();
             let Some(body) = inner
                 .files
                 .get(&hash)
                 .filter(|_| inner.emotes.iter().any(|e| e.hash == hash))
+                .cloned()
             else {
-                return Prepared::Reply(say(404, "no such emote"));
+                let member = token.is_some_and(|t| inner.bearers.contains_key(t));
+                return Prepared::Reply(if member {
+                    say(404, "no such emote")
+                } else {
+                    say(401, "a member's token is needed")
+                });
             };
+            let Some((_, budget)) = token.and_then(|t| inner.bearers.get_mut(t)) else {
+                return Prepared::Reply(say(401, "a member's token is needed"));
+            };
+            if !budget.take(body.len() as f64, Instant::now()) {
+                return Prepared::Reply(say(429, "too many downloads: try again later"));
+            }
             // Its hash is its name: the same address is always the same file
             Prepared::Reply(cors(
                 Reply {
                     status: 200,
                     headers: vec![("content-type", "application/octet-stream".into())],
-                    body: body.clone(),
+                    body,
                 },
                 "private, max-age=31536000, immutable",
             ))
@@ -657,7 +808,7 @@ pub(crate) fn prepare(
             let inner = store.lock();
             match token.and_then(|t| inner.tickets.get(t).map(|p| (t, p))) {
                 Some((t, p)) if p.emote.hash == hash => Prepared::EmotePut(Upload {
-                    len: p.len as usize,
+                    len: p.emote.len as usize,
                     ticket: t.to_owned(),
                     hash,
                 }),
@@ -679,7 +830,14 @@ pub(crate) async fn finish_put(state: &Arc<ServerState>, upload: Upload, body: B
     };
     match store.store(&upload.ticket, upload.hash, &body) {
         Ok(()) => {
-            store.changed(state, Some((upload.hash, body)), None).await;
+            // One task, awaited: a request dropped meanwhile (a closed tab, a
+            // reset stream) still gets its file written and listed
+            let state = state.clone();
+            let _ = tokio::spawn(async move {
+                store.write_file(upload.hash, body).await;
+                store.changed(&state);
+            })
+            .await;
             say(201, "stored")
         }
         Err((status, why)) => {
@@ -710,7 +868,15 @@ mod tests {
             hash: Sha256::digest(body).into(),
             sticker: false,
             pack: String::new(),
+            len: body.len() as u32,
+            w: 0,
+            h: 0,
         }
+    }
+
+    /// `e`, said to be `len` bytes.
+    fn sized(e: Emote, len: u32) -> Emote {
+        Emote { len, ..e }
     }
 
     const PNG: &[u8] = b"\x89PNG\r\n\x1a\nfake but shaped like one";
@@ -722,24 +888,28 @@ mod tests {
         d
     }
 
+    fn names(s: &EmoteStore) -> Vec<String> {
+        s.lock().emotes.iter().map(|e| e.name.clone()).collect()
+    }
+
     #[test]
     fn an_upload_needs_its_ticket_its_size_its_hash_and_a_picture() {
         let dir = temp();
         let s = store(&dir);
         let now = Instant::now();
         let e = emote("pog", PNG);
-        let Ok(Added::Ticket(t)) = s.add(7, e.clone(), PNG.len() as u32, now) else {
+        let Ok(Added::Ticket(t)) = s.add(7, e.clone(), now) else {
             panic!()
         };
         assert_eq!(s.store("guess", e.hash, PNG), Err((401, "no such upload")));
-        let Ok(Added::Ticket(t2)) = s.add(7, emote("pog2", PNG), PNG.len() as u32, now) else {
+        let Ok(Added::Ticket(t2)) = s.add(7, emote("pog2", PNG), now) else {
             panic!()
         };
         assert_eq!(
             s.store(&t2, e.hash, &PNG[1..]),
             Err((400, "the file is not the size it was said to be"))
         );
-        let Ok(Added::Ticket(t3)) = s.add(7, emote("pog3", PNG), PNG.len() as u32, now) else {
+        let Ok(Added::Ticket(t3)) = s.add(7, emote("pog3", PNG), now) else {
             panic!()
         };
         let mut other = PNG.to_vec();
@@ -749,7 +919,7 @@ mod tests {
             Err((422, "the file is not the one its hash names"))
         );
         let text = b"<svg onload=alert(1)>....";
-        let Ok(Added::Ticket(t4)) = s.add(7, emote("svg", text), text.len() as u32, now) else {
+        let Ok(Added::Ticket(t4)) = s.add(7, emote("svg", text), now) else {
             panic!()
         };
         assert_eq!(
@@ -770,11 +940,43 @@ mod tests {
     }
 
     #[test]
+    fn the_same_add_again_gets_its_open_ticket_and_a_shape_is_held_to_its_box() {
+        let dir = temp();
+        let s = store(&dir);
+        let now = Instant::now();
+        let e = Emote {
+            w: 4000,
+            h: 64,
+            ..emote("pog", PNG)
+        };
+        let Ok(Added::Ticket(t)) = s.add(7, e.clone(), now) else {
+            panic!()
+        };
+        assert_eq!(
+            s.add(7, e.clone(), now + Duration::from_secs(30)),
+            Ok(Added::Ticket(t.clone())),
+            "an answer that came too late: the add again"
+        );
+        assert!(
+            s.add(8, e.clone(), now).unwrap_err().contains("taken"),
+            "another connection's is taken"
+        );
+        assert_eq!(s.lock().reserved, PNG.len() as u64, "reserved once");
+        s.store(&t, e.hash, PNG).unwrap();
+        let kept = s.lock().emotes[0].clone();
+        assert_eq!(
+            (kept.w, kept.h),
+            (EMOTE_BOX, 2),
+            "one factor for both sides"
+        );
+    }
+
+    #[test]
     fn names_caps_and_a_rename_without_an_upload() {
         let dir = temp();
         let s = store(&dir);
         let now = Instant::now();
-        assert!(s.add(1, emote("Bad", PNG), 10, now).is_err());
+        assert!(s.add(1, emote("Bad", PNG), now).is_err());
         assert!(s
             .add(
                 1,
@@ -782,12 +984,11 @@ mod tests {
                     pack: "two\nlines".into(),
                     ..emote("ok", PNG)
                 },
-                10,
                 now
             )
             .is_err());
         assert!(s
-            .add(1, emote("big", PNG), 1025, now)
+            .add(1, sized(emote("big", PNG), 1025), now)
             .unwrap_err()
             .contains("1 KiB"));
         assert!(
@@ -795,29 +996,25 @@ mod tests {
                 1,
                 Emote {
                     sticker: true,
-                    ..emote("big", PNG)
+                    ..sized(emote("big", PNG), 1025)
                 },
-                1025,
                 now
             )
             .is_ok(),
             "a sticker may be bigger"
         );
         let e = emote("pog", PNG);
-        let Ok(Added::Ticket(t)) = s.add(1, e.clone(), PNG.len() as u32, now) else {
+        let Ok(Added::Ticket(t)) = s.add(1, e.clone(), now) else {
             panic!()
         };
         assert!(
-            s.add(1, emote("pog", b"x"), 1, now)
+            s.add(1, emote("pog", b"x"), now)
                 .unwrap_err()
                 .contains("taken"),
             "a name being uploaded is taken"
         );
         s.store(&t, e.hash, PNG).unwrap();
-        assert_eq!(
-            s.add(1, emote("pog_renamed", PNG), PNG.len() as u32, now),
-            Ok(Added::Listed)
-        );
+        assert_eq!(s.add(1, emote("pog_renamed", PNG), now), Ok(Added::Listed));
         assert!(s
             .rename("pog_renamed", "pog")
             .unwrap_err()
@@ -826,13 +1023,59 @@ mod tests {
         assert!(s.rename("pog_renamed", "Bad").is_err());
         s.rename("pog_renamed", "pog_new").unwrap();
         s.rename("pog_new", "pog_renamed").unwrap();
-        assert_eq!(
-            s.remove("pog"),
-            Ok(None),
+        assert!(s.remove(&["pog".into()]).is_empty());
+        assert!(
+            s.lock().files.contains_key(&e.hash),
             "the file stays: another emote names it"
         );
-        assert_eq!(s.remove("pog_renamed"), Ok(Some(e.hash)));
-        assert!(s.lock().files.is_empty());
+        assert_eq!(
+            s.remove(&["pog_renamed".into(), "nope".into()]),
+            ["nope"],
+            "what it does not have is said"
+        );
+        let inner = s.lock();
+        assert!(inner.files.is_empty());
+        assert_eq!(inner.gone, [e.hash], "deleted with the next manifest");
+    }
+
+    #[test]
+    fn a_move_is_all_or_nothing_and_a_sticker_too_big_for_an_emote_stays() {
+        let dir = temp();
+        let s = store(&dir);
+        let now = Instant::now();
+        let small = emote("small", PNG);
+        let big_body = [PNG, &[0u8; 1100][..]].concat();
+        let big = Emote {
+            sticker: true,
+            ..emote("big", &big_body)
+        };
+        for (e, body) in [(&small, PNG), (&big, &big_body[..])] {
+            let Ok(Added::Ticket(t)) = s.add(1, e.clone(), now) else {
+                panic!()
+            };
+            s.store(&t, e.hash, body).unwrap();
+        }
+        let both = ["small".to_string(), "big".to_string()];
+        assert!(s
+            .moved(&both, Some("Cats"), Some(false))
+            .unwrap_err()
+            .contains(":big: is too big"));
+        assert!(
+            s.lock().emotes.iter().all(|e| e.pack.is_empty()),
+            "none moved"
+        );
+        assert!(s
+            .moved(&["small".into(), "gone".into()], Some("Cats"), None)
+            .unwrap_err()
+            .contains(":gone:"));
+        assert!(s.moved(&both, Some("bad\npack"), None).is_err());
+        s.moved(&both, Some("Cats"), Some(true)).unwrap();
+        assert!(s
+            .lock()
+            .emotes
+            .iter()
+            .all(|e| e.pack == "Cats" && e.sticker));
+        assert_eq!(names(&s), both, "in their places");
     }
 
     #[test]
@@ -846,9 +1089,8 @@ mod tests {
                 9,
                 Emote {
                     sticker: true,
-                    ..emote(&format!("s{i}"), &[i as u8])
+                    ..sized(emote(&format!("s{i}"), &[i as u8]), 2048)
                 },
-                2048,
                 now,
             );
             if i < TICKETS_PER_SESSION {
@@ -864,7 +1106,7 @@ mod tests {
         };
         s.forget(9);
         assert_eq!(open(&s), (0, 0));
-        let Ok(Added::Ticket(_)) = s.add(3, emote("late", PNG), 10, now) else {
+        let Ok(Added::Ticket(_)) = s.add(3, sized(emote("late", PNG), 10), now) else {
             panic!()
         };
         s.lock().sweep(now + TICKET_LIFETIME);
@@ -875,13 +1117,18 @@ mod tests {
     async fn what_was_kept_comes_back_after_a_restart_and_nothing_else_does() {
         let dir = temp();
         let s = Arc::new(store(&dir));
-        let e = emote("pog", PNG);
-        let Ok(Added::Ticket(t)) = s.add(1, e.clone(), PNG.len() as u32, Instant::now()) else {
+        let e = Emote {
+            w: 100,
+            h: 50,
+            ..emote("pog", PNG)
+        };
+        let Ok(Added::Ticket(t)) = s.add(1, e.clone(), Instant::now()) else {
             panic!()
         };
         s.store(&t, e.hash, PNG).unwrap();
         s.set_stickers(true);
-        s.save(Some((e.hash, Bytes::from_static(PNG))), None).await;
+        s.write_file(e.hash, Bytes::from_static(PNG)).await;
+        s.write_manifest().await;
         std::fs::write(dir.join(hex(&[7; 32])), b"orphan").unwrap();
         std::fs::write(dir.join("keep-me.txt"), b"not ours").unwrap();
         let again = store(&dir);
@@ -889,9 +1136,14 @@ mod tests {
             panic!()
         };
         assert!(stickers);
-        assert_eq!(emotes, std::slice::from_ref(&e));
+        assert_eq!(emotes, std::slice::from_ref(&e), "its size and shape too");
         assert!(!dir.join(hex(&[7; 32])).exists(), "an orphan file goes");
         assert!(dir.join("keep-me.txt").exists(), "what is not ours stays");
+        // Removed: its file goes once the manifest says so
+        assert!(s.remove(&["pog".into()]).is_empty());
+        assert!(dir.join(hex(&e.hash)).exists());
+        s.write_manifest().await;
+        assert!(!dir.join(hex(&e.hash)).exists());
         // A damaged file drops its emote
         std::fs::write(dir.join(hex(&e.hash)), b"changed").unwrap();
         let ServerMessage::EmoteList { emotes, .. } = store(&dir).list() else {
@@ -901,12 +1153,63 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn an_answered_upload_survives_a_shutdown_right_after_it() {
+        // The shutdown comes before `changed`'s moment: without `flush` the
+        // manifest would not name the file, and the next start would delete
+        // it as an orphan (`open`)
+        let dir = temp();
+        let s = Arc::new(store(&dir));
+        let e = emote("pog", PNG);
+        let Ok(Added::Ticket(t)) = s.add(1, e.clone(), Instant::now()) else {
+            panic!()
+        };
+        s.store(&t, e.hash, PNG).unwrap();
+        s.write_file(e.hash, Bytes::from_static(PNG)).await;
+        s.flush().await;
+        let ServerMessage::EmoteList { emotes, .. } = store(&dir).list() else {
+            panic!()
+        };
+        assert_eq!(emotes, [e]);
+        assert!(dir.join(hex(&emotes[0].hash)).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_kind_changed_keeps_its_shape_in_the_new_box() {
+        let dir = temp();
+        let s = store(&dir);
+        let e = Emote {
+            sticker: true,
+            w: 320,
+            h: 160,
+            ..emote("wide", PNG)
+        };
+        let Ok(Added::Ticket(t)) = s.add(1, e.clone(), Instant::now()) else {
+            panic!()
+        };
+        s.store(&t, e.hash, PNG).unwrap();
+        s.moved(&["wide".into()], None, Some(false)).unwrap();
+        let kept = s.lock().emotes[0].clone();
+        assert_eq!((kept.w, kept.h), (EMOTE_BOX, EMOTE_BOX / 2));
+        let shapeless = boxed(Emote {
+            w: 0,
+            h: 4000,
+            ..emote("tall", PNG)
+        });
+        assert_eq!(
+            (shapeless.w, shapeless.h),
+            (0, EMOTE_BOX),
+            "no shape stays none"
+        );
+    }
+
     #[test]
     fn only_a_member_downloads_and_only_with_a_ticket_uploads() {
         let dir = temp();
         let s = store(&dir);
         let e = emote("pog", PNG);
-        let Ok(Added::Ticket(t)) = s.add(1, e.clone(), PNG.len() as u32, Instant::now()) else {
+        let Ok(Added::Ticket(t)) = s.add(1, e.clone(), Instant::now()) else {
             panic!()
         };
         s.store(&t, e.hash, PNG).unwrap();
@@ -916,6 +1219,7 @@ mod tests {
             0,
             "the token is never in a log"
         );
+        assert_eq!((access.max_total_bytes, access.max_items), (1 << 20, 400));
         let mut state = ServerState::for_tests();
         state.emotes = Some(Arc::new(s));
         let path = format!("/e/v1/{}", hex(&e.hash));
@@ -968,6 +1272,39 @@ mod tests {
             401,
             "a bearer goes with its connection"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_member_fetching_in_a_loop_is_told_to_wait() {
+        let dir = temp();
+        let s = store(&dir);
+        let e = emote("pog", PNG);
+        let Ok(Added::Ticket(t)) = s.add(1, e.clone(), Instant::now()) else {
+            panic!()
+        };
+        s.store(&t, e.hash, PNG).unwrap();
+        let access = s.access(5);
+        let mut state = ServerState::for_tests();
+        state.emotes = Some(Arc::new(s));
+        let (path, bearer) = (
+            format!("/e/v1/{}", hex(&e.hash)),
+            format!("Bearer {}", access.token.0),
+        );
+        // 2 MiB + 2 KiB of budget: about 70 000 fetches of this small file
+        let mut fetched = 0u64;
+        loop {
+            let Prepared::Reply(r) = prepare(&state, "GET", &path, Some(&bearer)) else {
+                panic!()
+            };
+            if r.status == 429 {
+                break;
+            }
+            assert_eq!(r.status, 200);
+            fetched += PNG.len() as u64;
+            assert!(fetched < 3 << 20, "never stopped");
+        }
+        assert!(fetched >= 2 << 20, "every file twice is fine");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

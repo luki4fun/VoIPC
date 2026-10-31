@@ -9,7 +9,7 @@
 
 use std::cell::RefCell;
 
-use voipc_media::{read_pack, sanitize_capped, Motion, Pack, Profile};
+use voipc_media::{read_pack, sanitize_capped, strip, Motion, Pack, Profile};
 
 #[derive(Default)]
 struct State {
@@ -18,6 +18,8 @@ struct State {
     still: Vec<u8>,
     /// width, height, frames, trimmed (0/1)
     meta: [u32; 4],
+    /// Why a moving picture stands still, when it does; else empty
+    stilled: &'static str,
     error: String,
     pack: Pack,
 }
@@ -74,6 +76,7 @@ pub extern "C" fn media_sanitize(profile: u32, max_out: u32, side: u32, keep_mb:
         match sanitize_capped(&std::mem::take(&mut s.input), p, cap, motion) {
             Ok(c) => {
                 s.meta = [c.w, c.h, c.frames as u32, u32::from(c.trimmed)];
+                s.stilled = c.stilled.unwrap_or_default();
                 s.still = c.still.unwrap_or_default();
                 s.png = c.png;
                 0
@@ -82,6 +85,23 @@ pub extern "C" fn media_sanitize(profile: u32, max_out: u32, side: u32, keep_mb:
                 s.error = e.to_string();
                 1
             }
+        }
+    })
+}
+
+/// The input without its metadata (`voipc_media::strip`), read back at
+/// [`media_png`]. 0 when done, 1 when refused, with the reason at
+/// [`media_error`].
+#[no_mangle]
+pub extern "C" fn media_strip() -> u32 {
+    with(|s| match strip(&std::mem::take(&mut s.input)) {
+        Ok(bare) => {
+            s.png = bare;
+            0
+        }
+        Err(e) => {
+            s.error = e.to_string();
+            1
         }
     })
 }
@@ -105,6 +125,18 @@ pub extern "C" fn media_still() -> *const u8 {
 #[no_mangle]
 pub extern "C" fn media_still_len() -> usize {
     with(|s| s.still.len())
+}
+
+/// Why a moving picture is shown as its first frame alone (UTF-8;
+/// `voipc_media::Clean::stilled`), empty when it is not.
+#[no_mangle]
+pub extern "C" fn media_stilled() -> *const u8 {
+    with(|s| s.stilled.as_ptr())
+}
+
+#[no_mangle]
+pub extern "C" fn media_stilled_len() -> usize {
+    with(|s| s.stilled.len())
 }
 
 #[no_mangle]

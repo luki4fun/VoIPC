@@ -231,7 +231,7 @@ async fn resolve(
 // ── Budgets and tickets ───────────────────────────────────────────────────
 
 /// A token bucket over an explicit clock.
-struct Bucket {
+pub(crate) struct Bucket {
     left: f64,
     cap: f64,
     per_sec: f64,
@@ -239,7 +239,7 @@ struct Bucket {
 }
 
 impl Bucket {
-    fn new(cap: f64, per_sec: f64, now: Instant) -> Bucket {
+    pub(crate) fn new(cap: f64, per_sec: f64, now: Instant) -> Bucket {
         Bucket {
             left: cap,
             cap,
@@ -257,6 +257,15 @@ impl Bucket {
 
     fn full(&mut self, now: Instant) -> bool {
         self.has(self.cap, now)
+    }
+
+    /// Spend `n` if there is that much.
+    pub(crate) fn take(&mut self, n: f64, now: Instant) -> bool {
+        let ok = self.has(n, now);
+        if ok {
+            self.left -= n;
+        }
+        ok
     }
 }
 

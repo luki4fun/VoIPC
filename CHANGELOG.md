@@ -2,6 +2,189 @@
 
 All notable changes to VoIPC are documented here.
 
+## [1.5.0] - 2026-10-31
+
+**Protocol 15: update relays and apps together.** A 1.5 app does not connect to a 1.4
+relay, and a 1.4 app does not connect to a 1.5 relay. Relays first: update the server,
+then the apps.
+
+### Emotes and stickers
+
+- **One picker for writing and for reactions:** one search finds emoji (by their
+  names, as `:joy:`), the server's emotes and its stickers; favourites and the
+  recently used come first, then each pack. The arrow keys walk it, Enter in the
+  search takes the first match, Escape closes only the picker, Shift+click keeps it
+  open, and what is picked goes where the cursor is. Reactions get the same search
+  and packs.
+- **`:joy:` and its kind:** typing `:` offers emoji by name after the server's emotes,
+  and a `:name:` of an emoji turns into it when sent.
+- **Favourites:** right-click or hold an emote in the picker, or press one in a
+  message, to keep it first. Pressing an emote in a message tells its name and pack
+  (a phone has no tooltips).
+- **A message of emoji alone is shown big,** as one of emotes already was.
+- **Admins:** a chat picture's menu has *Make an emote or sticker…*; the Emotes tab
+  copies another connected server's emotes, renames a pack, moves emotes into a
+  pack, and exports a pack as a `.zip` that it reads back; a 7TV profile's address
+  imports the set it uses; what was just added shows at once, without being
+  downloaded again.
+- **On mobile data the app asks first,** with the size, before it downloads a
+  server's emotes and stickers; otherwise they come on Wi-Fi. *Always download them
+  on this server* answers it for good; Settings → Files lists those servers, each
+  with *Ask again*, and shows what emotes take on this device, with *Clear*.
+- **The Emotes tab shows how much of the server's room they take** (size and count),
+  and an import marks what will not fit before it is sent.
+- **Removing a pack, or making emotes stickers, is one step** for the server: one
+  message, one write, one new list for everyone, not one per emote. Making an emote
+  a sticker (or back) no longer downloads it again.
+- **Emotes and stickers keep their room while they load,** so the chat does not jump.
+- An add whose answer came late can be tried again at once, instead of being "taken"
+  for ten minutes.
+- **For relays:** a member downloading emotes in a loop is stopped (`429`) before it
+  fills the uplink voice needs; `docs/OPERATING.md` §12.
+- **An emote or sticker added as its own file goes without its metadata** (EXIF with a
+  phone's place, XMP, comments, colour profiles): every member can read the server's
+  emotes. Its pictures and frames stay as they were.
+- **Pictures are made safe a few at a time, by their size:** two huge photos no
+  longer run at once on a phone. A test in CI times the hardest pictures there are.
+- Taking a server off the list forgets which of its emotes were used and liked.
+
+### Direct messages
+
+- **Old conversations are listed again.** After a restart or a reconnect, every
+  direct conversation this device keeps for the server is back in the sidebar,
+  newest first, and opens at once. It no longer waits until the other person writes,
+  and a search result in one opens it.
+- **Someone who is not here is marked "away".** If you both have accounts and your
+  cloud copies are on, you can still write; the server keeps it until they are back.
+  A guest who is away can be read but not written to, and the chat says why.
+- **Close** (✕ on a row) takes a conversation off the list and keeps its messages. It
+  comes back with the next message, or when you open it again.
+- **Settings → Appearance** can show the last message and how long ago it was written
+  under each conversation. It is off by default, because anyone who sees your screen
+  reads it too. A message with a timer is never shown there.
+- An open conversation keeps its draft, its reply and its scroll position when its
+  person comes back.
+
+### Fixed
+
+- **A crafted GIF could keep every viewer's computer busy** and hold up all
+  pictures and emotes for a while. Each frame now counts with its full size,
+  before it is read.
+- **Emotes in messages bind 128 bits of their picture's hash** (80 in 1.4), so
+  nobody can swap the picture under old messages. 1.4's emotes still show.
+- **Emotes and stickers take far less memory:** each is made ready on this
+  device at connect as before, but only those on screen are loaded. A server
+  that is not connected keeps its emotes on this device for 30 days, and the
+  browser lets go of them after that too.
+- **Downloads of emotes give way to voice** during a call, as file transfers do.
+- **Chat pictures open at once when seen again,** without being decrypted and
+  made again, and moving ones stand still under reduced motion or "Never move".
+- A sticker's code inside text no longer shows the sticker there (the server's
+  sticker switch and "Show stickers" hold). A message shows at most 100 emotes.
+- An emote that cannot be shown says so (a dotted name with the reason, and a
+  "Not shown" mark in the admin list), and is tried once more first.
+- A server's list of emotes is checked before use: a bad or repeated name can
+  no longer break the pickers.
+- The browser app reads emotes and pictures under limits of size and time.
+- `:name:` stays as written inside `~~~` code, ``` `` ``` code and addresses.
+- Long shared history is never cut inside an emote.
+- **Emote import:** closing the panel asks first while an import is open;
+  an unreadable or huge file is set aside instead of stopping the import;
+  "Add" waits until every file is read, with a summary line; a pack's name
+  from a zip or 7TV is cleaned to fit; on Android, no folder button.
+- **Stickers:** no sticker while slow mode holds the channel; no Edit on a
+  sticker; stickers in threads too; the admin's sticker switch says when it
+  could not change.
+- **Settings → Files:** an open card stays open when its message gets a
+  reaction; removing several copies asks first.
+- Settings: the motion choice says when the system asks for less motion, and
+  has no "under the pointer" on touch screens. Larger touch targets in the
+  emote admin.
+- **For relays: an emote added just before the relay stops is kept.** The list
+  of emotes is written a moment after a change, and at shutdown too; a restart
+  within a second of an upload lost the emote and deleted its file.
+- **A turned PNG or WebP no longer goes up sideways** as an emote's original: it
+  goes up as the picture made of it, as a turned JPEG already did.
+- **An emote's original JPEG ends where its picture ends:** a phone's second
+  picture, a motion photo's video and anything else after it are left out with
+  the metadata.
+- **Rename, Remove pack and Export take the whole pack,** also while the search
+  shows only part of it.
+- **A link with an emote in its text opens** when the emote is pressed.
+- **On mobile data, emotes come only after a yes:** a server with nothing to
+  fetch, or a moment back on Wi-Fi, no longer counts as one. The question waits
+  while another one you have open is answered.
+- An emote whose download failed during a reconnect is fetched again, instead of
+  staying empty for the whole connection; so is a first frame that had worked.
+- A long message passed on in shared history is no longer cut back to its first
+  words by a `<:` written in it.
+- The browser app reads an emote of at most 1 MiB, whatever the relay claims, and
+  no longer writes every kept emote again at each new list.
+- A picture removed from this device in Settings → Files no longer goes on
+  showing from memory.
+- An emote made a sticker, or back, keeps its proportions.
+- *Download* on a picture already shown no longer draws it again.
+
+### Polish from the device run
+
+- **Android: stopping a file while it is still being prepared stops it.** Until
+  now × at that moment let a cut-off copy go out anyway.
+- **Android with an older system WebView (before Chrome 111):** photos are made
+  smaller again instead of asking to send the original every time.
+- **Emoji everywhere:** where the system has no picture for one of the app's emoji
+  (Windows 10 showed boxes for newer ones), VoIPC draws it with its own copy of
+  Noto Color Emoji (150 KB, SIL OFL). Elsewhere emoji keep the system's look, and a
+  joined emoji the system would draw as two is left out of the picker.
+- **The reactions picker works from the keyboard:** the arrows move one step,
+  ArrowUp stays in the search and Tab no longer closes the menu. The picker's
+  kinds are one tab stop, walked with the arrow keys.
+- **The picker stays on a phone's screen** when it opens while the panes are
+  still sliding; on a touch screen its tabs, search and cells are a finger's size,
+  a tap does not bring the keyboard up, and the hint says *hold*, not *right-click*.
+- **A file's Load and Download can be read on any picture:** solid buttons, and
+  the words on the card's own colour. After an error the button says *Try again*.
+- **The picture viewer has zoom buttons** (out, back to fit, in) and takes the
+  keys as soon as it opens; it covers the chat behind it.
+- **Your own pictures show at once** after you send them, and *Show* in
+  Settings → Files loads the picture. What others send still waits for *Load*.
+- **A moving picture too long or too big to play is shown as its first frame**
+  instead of not at all, with a note saying why. It is read no further than
+  before, so it costs no more. An emote like that goes up as that frame.
+- Pictures that were moving stop when reduced motion or "Never move" is turned on.
+- *Original (1:1)* says what it means next to it, and shows when it is on; a
+  file over the server's size says so before *Send*; sending shows a percentage.
+- Dragging files over the chat shows where they go. The same file is not
+  attached twice.
+- Your own message is scrolled into view when you send it.
+- An emote in a message is a button: Tab reaches it with the message's links,
+  and its card opens in the screen. A sticker held by slow mode says so in words.
+- On mobile data, the question about downloading emotes waits for the first-run
+  questions, and emotes waiting for Wi-Fi show their names.
+- `:` offers emoji right after another emoji; a search shows the exact name first.
+- **Emote admin on a phone:** the tools wrap, a pack's buttons say which pack,
+  rename fields take the cursor, and the size bar follows the palette. One import
+  of the same picture twice adds it once; the summary counts what *Add* sends;
+  stickers numbered 01, 02… are named after their pack; a copy from another
+  server keeps its packs. The tab is called *Emotes and stickers*. On a phone the list
+  wraps instead of cutting names, an import says why a row is left out, and
+  *Make an emote or sticker…* goes straight to the picture.
+- Settings → Files says while it reads and when it cannot, keeps the emote row
+  at zero, and *Clear* tells what it freed.
+- Placeholders and drop-down menus read clearly in every palette.
+- **Joining a voice channel from its preview shows its chat,** not the text
+  channel that was open before.
+- The *Today* and *Yesterday* dividers move on at midnight.
+- A zoomed picture pans as far as its own edges, not into the empty bands beside
+  it. Its zoom buttons keep the keyboard: Escape and + − 0 work after *Fit*.
+- At a large font size the chat header shortens the channel's name instead of
+  pushing its buttons off a phone's screen.
+- On a touch screen your own name and status in the drawer can be read: the
+  buttons take a row of their own where there is no room.
+- Two servers on one address are told apart in the server rail, by their port
+  and their colour.
+- Closing a conversation with ✕ leaves the keyboard on the next one.
+- Dropping files over the chat shows its backdrop on an older Android WebView too.
+
 ## [1.4.0] - 2026-10-30
 
 **Protocol 14: update relays and apps together.** A 1.4.0 app does not connect

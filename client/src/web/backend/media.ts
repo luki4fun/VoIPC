@@ -40,11 +40,14 @@ interface Exports {
   memory: WebAssembly.Memory;
   media_input(len: number): number;
   media_sanitize(profile: number, maxOut: number, side: number, keepMb: number): number;
+  media_strip(): number;
   media_png(): number;
   media_png_len(): number;
   media_still(): number;
   media_still_len(): number;
   media_meta(i: number): number;
+  media_stilled(): number;
+  media_stilled_len(): number;
   media_error(): number;
   media_error_len(): number;
   media_read_pack(): number;
@@ -70,6 +73,8 @@ export interface Sanitized {
   h: number;
   frames: number;
   trimmed: boolean;
+  /** Shown as its first frame alone, and why (voipc-media `Clean::stilled`). */
+  stilled: string | null;
 }
 
 function instance(module: WebAssembly.Module, input: Uint8Array): Exports {
@@ -96,7 +101,16 @@ export function sanitizeIn(module: WebAssembly.Module, bytes: Uint8Array, profil
     h: x.media_meta(1),
     frames: x.media_meta(2),
     trimmed: x.media_meta(3) === 1,
+    stilled: x.media_stilled_len() ? text(x, x.media_stilled(), x.media_stilled_len()) : null,
   };
+}
+
+/** `bytes` without their metadata (voipc-media `strip`), in a worker's
+ *  instance; throws why not (a turned JPEG, a file not as its format says). */
+export function stripIn(module: WebAssembly.Module, bytes: Uint8Array): Uint8Array {
+  const x = instance(module, bytes);
+  if (x.media_strip() !== 0) throw new Error(text(x, x.media_error(), x.media_error_len()));
+  return copy(x, x.media_png(), x.media_png_len());
 }
 
 /** A .zip or .wastickers read: its pictures, and what was set aside with why. */

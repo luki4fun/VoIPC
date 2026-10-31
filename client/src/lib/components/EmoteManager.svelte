@@ -6,21 +6,26 @@
   // sanitizer wrote (emote-import.ts), never a picked file's own bytes. The
   // panel closes on a server switch (admin-ui.ts), so the server it opened on
   // is the one it changes.
-  import { onDestroy } from "svelte";
+  import { onDestroy, tick } from "svelte";
+  import { focusNow } from "../actions/focus.js";
   import { get } from "svelte/store";
   import { serverAddress } from "../stores/connection.js";
-  import { emoteLimits, emoteSets } from "../stores/emotes.js";
+  import { emoteLimits, emoteSets, emoteUrls, pendingImport, urlKey } from "../stores/emotes.js";
+  import { savedServers } from "../stores/settings.js";
+  import { serverId } from "../stores/servers.js";
   import { addNotification } from "../stores/notifications.js";
   import { confirmAction } from "../stores/confirm.js";
-  import { nameFrom, uniqueName, type Emote as Item } from "../emote-rules.js";
+  import { countKinds, nameFrom, uniqueName, type Emote as Item } from "../emote-rules.js";
   import {
     addEmote,
-    emoteFile,
     fetchSource,
     isArchive,
     prepareEmote,
     readPack,
-    removeEmote,
+    moveEmotes,
+    removeEmotes,
+    seedEmote,
+    emoteFile,
     renameEmote,
     setStickers,
     type Made,
@@ -30,20 +35,48 @@
   import { pictureUrl } from "../media.js";
   import { fold } from "../search-rules.js";
   import { toHex } from "../hex.js";
+  import { formatSize } from "../file-rules.js";
+  import { saveFile } from "../files.js";
+  import { storedZip } from "../zip.js";
   import Emote from "./chat/Emote.svelte";
   import Icon from "./Icons.svelte";
 
   const server = get(serverAddress);
   const NAME = /^[a-z0-9_]{2,30}$/;
+  const HIDDEN = /[\p{Cc}\u200B-\u200F\u061C\u202A-\u202E\u2060-\u2069\uFEFF]/u;
+  const byteLength = (s: string) => new TextEncoder().encode(s).length;
   /** voipc-protocol `valid_emote_pack`: one line, no control, invisible or
-   *  direction characters, 32 characters and 64 bytes at most. */
-  const validPack = (p: string) =>
-    p.trim() === p && [...p].length <= 32 && new TextEncoder().encode(p).length <= 64 && !/[\p{Cc}\u200B-\u200F\u061C\u202A-\u202E\u2060-\u2069\uFEFF]/u.test(p);
+   *  direction characters, 32 characters and 64 bytes at most. Why not, or "". */
+  const packProblem = (p: string) =>
+    HIDDEN.test(p)
+      ? "A pack's name cannot hold control, invisible or text-direction characters"
+      : [...p].length > 32
+        ? "A pack's name is 32 characters at most"
+        : byteLength(p) > 64
+          ? "A pack's name is 64 bytes at most: fewer letters from outside a-z"
+          : p.trim() !== p
+            ? "A pack's name cannot start or end with a space"
+            : "";
+  /** A 7TV set's or a zip's title made a name `packProblem` takes. */
+  function packFrom(title: string): string {
+    let out = "";
+    let count = 0;
+    for (const c of [...title].filter((c) => !HIDDEN.test(c)).join("").trim()) {
+      if (count === 32 || byteLength(out + c) > 64) break;
+      out += c;
+      count++;
+    }
+    return out.trim();
+  }
   const taken = (name: string) => $emoteSets.emotes.some((e) => e.name === name);
-  const why = (e: unknown) => String(e).replace(/^Error: /, "");
+  /** A reason as shown: the backends' start in lower case. */
+  const why = (e: unknown) => {
+    const t = String(e).replace(/^Error: /, "");
+    return t.charAt(0).toUpperCase() + t.slice(1);
+  };
 
   let filter = $state("");
-  const shown = $derived($emoteSets.emotes.filter((e) => fold(`${e.name} ${e.pack}`).includes(fold(filter))));
+  const shown = $derived($emoteSets.emotes.filter((e) => !removing.has(e.name) && fold(`${e.name} ${e.pack}`).includes(fold(filter))));
   const stickerCount = $derived($emoteSets.emotes.filter((e) => e.sticker).length);
   /** What is shown, by kind and pack: emotes first, then stickers; no pack first. */
   const sections = $derived.by(() => {
@@ -55,8 +88,20 @@
     }
     return [...by.values()].sort((a, b) => Number(a.sticker) - Number(b.sticker) || a.pack.localeCompare(b.pack));
   });
+  /** A section's whole pack, not only what the search shows: Rename, Remove
+   *  and Export under a search split a pack. */
+  const wholePack = (s: { sticker: boolean; pack: string }) =>
+    $emoteSets.emotes.filter((e) => e.sticker === s.sticker && e.pack === s.pack && !removing.has(e.name));
 
   // ── What there is ─────────────────────────────────────────────────────────
+
+  function switchStickers(e: Event) {
+    const box = e.target as HTMLInputElement;
+    setStickers(server, box.checked).catch((err) => {
+      addNotification(`Stickers stay ${$emoteSets.stickers ? "on" : "off"}: ${why(err)}`, "error");
+      box.checked = $emoteSets.stickers;
+    });
+  }
 
   let renaming = $state<string | null>(null);
   let newName = $state("");
@@ -69,6 +114,63 @@
     if (!save || to === e.name) return;
     if (!NAME.test(to)) return addNotification("A name is 2 to 30 of a-z, 0-9 and _", "error");
     await renameEmote(server, e.name, to).catch((err) => addNotification(why(err), "error"));
+  }
+
+  // ── Packs ─────────────────────────────────────────────────────────────────
+
+  /** The section whose pack is being renamed, and the new name. */
+  let renamingPack = $state<string | null>(null);
+  let newPack = $state("");
+
+  async function finishPackRename(from: string, names: string[], save: boolean) {
+    // Once: the box's blur, as it goes, comes after Enter or Escape finished it
+    if (renamingPack === null) return;
+    renamingPack = null;
+    const to = newPack.trim();
+    if (!save || to === from) return;
+    const problem = packProblem(to);
+    if (problem) return addNotification(problem, "error");
+    await moveEmotes(server, names, to, null).catch((err) => addNotification(why(err), "error"));
+  }
+
+  let moveTo = $state("");
+  /** What is picked, into the pack `moveTo` (none, if it is empty). */
+  async function movePicked() {
+    const to = moveTo.trim();
+    const problem = packProblem(to);
+    if (problem) return addNotification(problem, "error");
+    await moveEmotes(server, pickedShown, to, null)
+      .then(() => {
+        picked = new Set();
+        moveTo = "";
+      })
+      .catch((err) => addNotification(why(err), "error"));
+  }
+
+  /** A file's kind by its first bytes, for its name in an export. */
+  const extOf = (b: Uint8Array) => (b[0] === 0x89 ? "png" : b[0] === 0x47 ? "gif" : b[0] === 0x52 ? "webp" : "jpg");
+
+  let exporting = $state<string | null>(null);
+  /** A section's files as the server keeps them, as one .zip: a backup, or
+   *  the way to another server (this importer reads it back, pack name and all). */
+  async function exportPack(key: string, label: string, list: Item[]) {
+    exporting = key;
+    try {
+      const files: { name: string; bytes: Uint8Array }[] = [];
+      for (const e of list) {
+        // The panel closed meanwhile: no Save dialog for a panel that is gone
+        if (gone) return;
+        const bytes = await emoteFile(server, e.hash);
+        files.push({ name: `${e.name}.${extOf(bytes)}`, bytes });
+      }
+      if (gone) return;
+      if (label) files.push({ name: "title.txt", bytes: new TextEncoder().encode(label) });
+      await saveFile(storedZip(files), `${label || (list[0]?.sticker ? "stickers" : "emotes")}.zip`, "application/zip");
+    } catch (err) {
+      addNotification(`The pack could not be exported: ${why(err)}`, "error");
+    } finally {
+      exporting = null;
+    }
   }
 
   /** Picked to remove together, by name; only what is shown counts. */
@@ -92,29 +194,33 @@
       danger: true,
     });
     if (!ok) return;
-    for (const n of names) await removeEmote(server, n).catch((err) => addNotification(why(err), "error"));
+    // Gone from here at once: the server's list follows a moment later
+    removing = new Set([...removing, ...names]);
     picked = new Set([...picked].filter((n) => !names.includes(n)));
+    await removeEmotes(server, names).catch((err) => {
+      removing = new Set([...removing].filter((n) => !names.includes(n)));
+      addNotification(why(err), "error");
+    });
   }
 
-  /** Being made the other kind: one at a time each. */
+  /** Removed or being made the other kind, until the server's next list. */
+  let removing = $state.raw(new Set<string>());
   let switching = $state.raw(new Set<string>());
+  $effect(() => {
+    void $emoteSets;
+    removing = new Set();
+    switching = new Set();
+  });
 
-  /** An emote made a sticker, or back: added again under a passing name as
-   *  the other kind (the server has its file, so nothing goes up), the old one
-   *  removed, and the new one called by the old name. */
+  /** An emote made a sticker, or back: the server has its file, so only the
+   *  list changes. */
   async function switchKind(e: Item) {
-    const passing = uniqueName(`${e.name.slice(0, 25)}_swap`, taken);
-    if (!passing || switching.has(e.name)) return;
+    if (switching.has(e.name)) return;
     switching = new Set([...switching, e.name]);
-    try {
-      await addEmote(server, passing, !e.sticker, e.pack, await emoteFile(server, e.hash));
-      await removeEmote(server, e.name);
-      await renameEmote(server, passing, e.name);
-    } catch (err) {
-      addNotification(`:${e.name}: stays ${e.sticker ? "a sticker" : "an emote"}: ${why(err)}`, "error");
-    } finally {
+    await moveEmotes(server, [e.name], null, !e.sticker).catch((err) => {
       switching = new Set([...switching].filter((n) => n !== e.name));
-    }
+      addNotification(`:${e.name}: stays ${e.sticker ? "a sticker" : "an emote"}: ${why(err)}`, "error");
+    });
   }
 
   // ── Adding ────────────────────────────────────────────────────────────────
@@ -130,8 +236,13 @@
     include: boolean;
     /** The picked file, kept to make it again as the other kind. */
     bytes?: Uint8Array;
+    /** What goes up, by its SHA-256: two rows of one picture are one emote. */
+    hash?: string;
+    /** Its own pack (a copy from a server with several); else the Pack field's. */
+    pack?: string;
   }
   let rows = $state<Row[]>([]);
+  let addBox = $state<HTMLElement | null>(null);
   let asSticker = $state(false);
   let pack = $state("");
   let busy = $state(false);
@@ -148,47 +259,124 @@
   };
 
   const set = (key: number, change: Partial<Row>) => (rows = rows.map((r) => (r.key === key ? { ...r, ...change } : r)));
+  /** Set aside, saying why; its file is not kept. */
+  const aside = (key: number, note: string) => set(key, { status: "skipped", include: false, note, bytes: undefined });
+  const skippedRow = (source: string, note: string): Row => ({ key: nextKey++, source, name: "", status: "skipped", include: false, note });
   const takenFor = (name: string, key: number) => taken(name) || rows.some((r) => r.key !== key && r.include && r.name === name);
   const nameProblem = (r: Row) =>
     !NAME.test(r.name) ? "2 to 30 of a-z, 0-9 and _" : takenFor(r.name, r.key) ? "This name is taken" : "";
   /** Ready to go, or failed and so to try again (under another name). */
   const editable = (r: Row) => r.status === "ready" || r.status === "failed";
   const ready = $derived(rows.filter((r) => r.include && editable(r) && !nameProblem(r)));
+  /** What the server's emotes take of what it allows. */
+  const used = $derived($emoteSets.emotes.reduce((n, e) => n + e.len, 0));
+  /** Of what is ready, in order, what still fits the server's total and its
+   *  count; the rest is marked and not sent. */
+  const fitting = $derived.by(() => {
+    const limits = $emoteLimits;
+    if (!limits) return new Set<number>();
+    let [bytes, items] = [limits.max_total_bytes - used, limits.max_items - $emoteSets.emotes.length];
+    const ok = new Set<number>();
+    for (const r of ready) {
+      const n = r.prepared!.upload.length;
+      if (n > bytes || items < 1) continue;
+      ok.add(r.key);
+      bytes -= n;
+      items--;
+    }
+    return ok;
+  });
   const allIn = $derived(rows.filter(editable).every((r) => r.include));
+  const reading = $derived(rows.filter((r) => r.status === "reading").length);
+  /** "Reading 37 of 300 · 28 to add · 2 not ticked · 7 set aside": "to add"
+   *  is what Add sends, the rest says why the others are not in it. */
+  const summary = $derived.by(() => {
+    const count = (s: Row["status"]) => rows.filter((r) => r.status === s).length;
+    const waiting = rows.filter((r) => editable(r));
+    const parts: [number, string][] = [
+      [fitting.size, "to add"],
+      [waiting.filter((r) => !r.include).length, "not ticked"],
+      [waiting.filter((r) => r.include && nameProblem(r)).length, "need another name"],
+      [ready.length - fitting.size, "will not fit"],
+      [count("uploading"), "being added"],
+      [count("done"), "added"],
+      [count("failed"), "not added"],
+      [count("skipped"), "set aside"],
+    ];
+    return [...(reading ? [`Reading ${rows.length - reading} of ${rows.length}`] : []), ...parts.filter(([n]) => n).map(([n, what]) => `${n} ${what}`)].join(" · ");
+  });
+
+  /** Whether the panel may close: asked first while what is listed is not
+   *  all added or set aside, since closing drops it and stops adding. */
+  export async function mayClose(): Promise<boolean> {
+    const left = rows.filter((r) => r.status !== "done" && r.status !== "skipped").length;
+    if (!left) return true;
+    return confirmAction({
+      title: "Close without adding?",
+      body: busy
+        ? `Adding is not finished: ${left} not added yet. Closing stops it; what the server has already stays.`
+        : `${left} listed here ${left === 1 ? "is" : "are"} not added to the server. Closing drops the list.`,
+      confirm: "Close",
+      danger: true,
+    });
+  }
 
   /** `key`'s upload and preview, for the kind chosen now. */
   async function make(key: number, bytes: Uint8Array, gen: number) {
     const limits = get(emoteLimits.peek(server));
-    if (!limits) return set(key, { status: "skipped", include: false, note: "This server keeps no emotes" });
+    if (!limits) return aside(key, "This server keeps no emotes");
     const sticker = asSticker;
     try {
       const p = await prepareEmote(bytes, sticker, sticker ? limits.max_sticker_bytes : limits.max_emote_bytes);
       const hash = toHex(new Uint8Array(await crypto.subtle.digest("SHA-256", p.upload as Uint8Array<ArrayBuffer>)));
-      // Cleared, or switched to the other kind meanwhile: that run makes it again
       const row = rows.find((r) => r.key === key);
-      if (gen !== generation || sticker !== asSticker || !row) return;
+      if (gen !== generation || !row) return;
+      // Switched to the other kind meanwhile: made again for that one
+      if (sticker !== asSticker) return make(key, bytes, gen);
       if (row.url) URL.revokeObjectURL(row.url);
       const same = $emoteSets.emotes.find((e) => e.hash === hash);
-      const base = nameFrom(row.source) ?? "emote";
+      // The same picture twice in one import (a pack's copies): the first goes
+      const twin = rows.find((r) => r.key !== key && r.hash === hash && r.include && r.status !== "skipped");
+      // A sticker pack numbers its files (01.webp…): its name says whose they are
+      const stem = nameFrom(row.source);
+      const base = (stem && /^\d+$/.test(stem) && pack.trim() ? nameFrom(`${pack.trim()}_${stem}`) : stem) ?? "emote";
       set(key, {
         prepared: p,
         url: pictureUrl(p.preview),
+        hash,
         status: "ready",
-        note: same ? `Already here as :${same.name}:` : NOTE[p.how],
+        note: same
+          ? `Already here as :${same.name}:`
+          : twin
+            ? `The same picture as :${twin.name}:`
+            : p.stilled
+              ? `Only its first frame goes up: ${p.stilled}`
+              : NOTE[p.how] || (!row.name && stem !== row.source.replace(/\.[^.]*$/, "") ? `Named from “${row.source}”` : ""),
         name: row.name || (uniqueName(base, (n) => takenFor(n, key)) ?? base),
         // A row made again (the other kind) keeps its tick; a new one starts off if a copy is here
-        include: row.name ? row.include : !same,
+        include: row.name ? row.include : !same && !twin,
       });
     } catch (e) {
-      if (gen === generation && sticker === asSticker) set(key, { status: "skipped", include: false, note: why(e) });
+      if (gen !== generation) return;
+      if (sticker !== asSticker) return make(key, bytes, gen);
+      aside(key, why(e));
     }
   }
 
-  async function prepare(source: string, bytes: Uint8Array, gen: number) {
+  /** A pack's pictures, listed in place of `key` (else at the end) as
+   *  "Reading…" all at once, so Add waits for every one; then made in turn. */
+  async function addPack(got: { skipped: { name: string; why: string }[]; entries: { name: string; bytes: Uint8Array; pack?: string }[] }, gen: number, key?: number) {
     if (gen !== generation) return;
-    const key = nextKey++;
-    rows = [...rows, { key, source, name: "", status: "reading", note: "", include: true, bytes }];
-    await make(key, bytes, gen);
+    const keys = got.entries.map(() => nextKey++);
+    const added: Row[] = [
+      ...got.skipped.map((s) => skippedRow(s.name, s.why)),
+      ...got.entries.map((e, i): Row => ({ key: keys[i], source: e.name, name: "", status: "reading", note: "", include: true, bytes: e.bytes, pack: e.pack })),
+    ];
+    rows = key === undefined ? [...rows, ...added] : rows.flatMap((r) => (r.key === key ? added : [r]));
+    for (const [i, e] of got.entries.entries()) {
+      if (gen !== generation) return;
+      await make(keys[i], e.bytes, gen);
+    }
   }
 
   /** Emotes or stickers: what is listed is made again for that kind. */
@@ -196,10 +384,14 @@
     if (sticker === asSticker || busy) return;
     asSticker = sticker;
     const gen = generation;
-    for (const r of rows.filter((r) => r.bytes && r.status !== "done" && r.status !== "uploading")) {
-      if (gen !== generation || sticker !== asSticker) return;
-      set(r.key, { status: "reading", note: "" });
-      await make(r.key, r.bytes!, gen);
+    // What is still reading comes out as the kind chosen by then (`make`); the
+    // rest is all "Reading…" at once, so none goes up as the kind it was before
+    const again = new Set(rows.filter((r) => r.bytes && editable(r)).map((r) => r.key));
+    rows = rows.map((r) => (again.has(r.key) ? { ...r, status: "reading", note: "" } : r));
+    for (const key of again) {
+      if (gen !== generation) return;
+      const bytes = rows.find((r) => r.key === key)?.bytes;
+      if (bytes) await make(key, bytes, gen);
     }
   }
 
@@ -207,25 +399,80 @@
     rows = rows.map((r) => (editable(r) ? { ...r, include: on } : r));
   }
 
+  /** voipc-media: the most a picture (`max_input`) and a pack (`MAX_PACK_BYTES`) may be. */
+  const MAX_PICTURE = 16 << 20;
+  const MAX_PACK = 200 << 20;
+
   async function addFiles(files: Iterable<File>) {
     const gen = generation;
-    for (const f of files) {
-      const bytes = new Uint8Array(await f.arrayBuffer());
+    // Listed at once, as the rest of the import is: Add waits for them
+    const list = [...files].map((f) => ({ f, key: nextKey++ }));
+    rows = [...rows, ...list.map(({ f, key }): Row => ({ key, source: f.name, name: "", status: "reading", note: "", include: true }))];
+    for (const { f, key } of list) {
+      if (gen !== generation) return;
+      let bytes: Uint8Array;
+      try {
+        // Its first bytes say whether it is a pack; what is too big is never read whole
+        const zip = isArchive(new Uint8Array(await f.slice(0, 5).arrayBuffer()));
+        if (f.size > (zip ? MAX_PACK : MAX_PICTURE)) {
+          aside(key, zip ? "Too big for a pack: 200 MiB at most" : "Too big to be an emote or sticker: 16 MiB at most");
+          continue;
+        }
+        bytes = new Uint8Array(await f.arrayBuffer());
+      } catch (e) {
+        aside(key, `Could not be read: ${why(e)}`);
+        continue;
+      }
       if (!isArchive(bytes)) {
-        await prepare(f.name, bytes, gen);
+        set(key, { bytes });
+        await make(key, bytes, gen);
         continue;
       }
       try {
         const p = await readPack(bytes);
         if (gen !== generation) return;
-        if (!pack) pack = [...(p.title ?? f.name.replace(/\.(zip|wastickers)$/i, ""))].slice(0, 32).join("").trim();
-        for (const s of p.skipped) rows = [...rows, { key: nextKey++, source: s.name, name: "", status: "skipped", include: false, note: s.why }];
-        for (const e of p.entries) await prepare(e.name, e.bytes, gen);
+        if (!pack) pack = packFrom(p.title ?? f.name.replace(/\.(zip|wastickers)$/i, ""));
+        await addPack(p, gen, key);
       } catch (e) {
-        if (gen !== generation) return;
-        rows = [...rows, { key: nextKey++, source: f.name, name: "", status: "skipped", include: false, note: why(e) }];
+        aside(key, why(e));
       }
     }
+  }
+
+  // Another server this app is connected to: its emotes (or stickers) as
+  // they are there, fetched like any member fetches them, into the importer
+  const allSets = emoteSets.all();
+  const otherServers = $derived(
+    [...$allSets]
+      .filter(([id, set]) => id !== server && set.emotes.some((e) => e.sticker === asSticker))
+      .map(([id, set]) => ({
+        id,
+        name: $savedServers.find((b) => serverId(b.host, b.port) === id)?.name ?? id,
+        count: set.emotes.filter((e) => e.sticker === asSticker).length,
+      })),
+  );
+  let copyFrom = $state("");
+  let copying = $state(false);
+  async function copyServer() {
+    const from = copyFrom;
+    const gen = generation;
+    copying = true;
+    const got: { skipped: { name: string; why: string }[]; entries: { name: string; bytes: Uint8Array; pack?: string }[] } = { skipped: [], entries: [] };
+    const theirs = get(emoteSets.peek(from)).emotes.filter((e) => e.sticker === asSticker);
+    // One pack there, the same pack here (the field); several: each its own
+    const packs = new Set(theirs.map((e) => e.pack));
+    for (const e of theirs) {
+      if (gen !== generation) break;
+      try {
+        got.entries.push({ name: e.name, bytes: await emoteFile(from, e.hash), pack: packs.size > 1 && e.pack && !packProblem(e.pack) ? e.pack : undefined });
+      } catch (err) {
+        got.skipped.push({ name: e.name, why: why(err) });
+      }
+    }
+    copying = false;
+    const only = packs.size === 1 ? [...packs][0] : "";
+    if (!pack && only && !packProblem(only)) pack = only;
+    await addPack(got, gen);
   }
 
   // One click, from elsewhere (desktop only: emote_sources.rs)
@@ -239,9 +486,8 @@
     try {
       const got = await fetchSource(source, sourceId.trim(), source === "discord" ? token : "", asSticker);
       if (gen !== generation) return;
-      if (!pack && got.title) pack = [...got.title].slice(0, 32).join("").trim();
-      for (const s of got.skipped) rows = [...rows, { key: nextKey++, source: s.name, name: "", status: "skipped", include: false, note: s.why }];
-      for (const e of got.entries) await prepare(e.name, e.bytes, gen);
+      if (!pack && got.title) pack = packFrom(got.title);
+      await addPack(got, gen);
     } catch (e) {
       addNotification(why(e), "error");
     } finally {
@@ -250,6 +496,16 @@
       fetching = false;
     }
   }
+
+  // A chat picture an admin chose to make an emote or sticker of
+  $effect(() => {
+    const p = $pendingImport;
+    if (!p || p.server !== server) return;
+    pendingImport.set(null);
+    void addFiles([new File([p.bytes as Uint8Array<ArrayBuffer>], p.name)]);
+    // Where it is, not three screens down under the server's whole list
+    tick().then(() => addBox?.scrollIntoView({ block: "start", behavior: "smooth" }));
+  });
 
   function drop(e: DragEvent) {
     e.preventDefault();
@@ -267,16 +523,21 @@
   }
 
   async function upload() {
-    if (!validPack(pack.trim())) return addNotification("A pack's name is one line of at most 32 characters", "error");
+    const problem = packProblem(pack.trim());
+    if (problem) return addNotification(problem, "error");
     busy = true;
-    const todo = [...ready];
+    const gen = generation;
+    const todo = ready.filter((r) => fitting.has(r.key));
     let next = 0;
     const one = async () => {
-      while (next < todo.length) {
+      // Closed (or cleared): what is not on its way yet stays here
+      while (next < todo.length && gen === generation) {
         const r = todo[next++];
         set(r.key, { status: "uploading" });
         try {
-          await addEmote(server, r.name, asSticker, pack.trim(), r.prepared!.upload);
+          await addEmote(server, r.name, asSticker, (r.pack || pack).trim(), r.prepared!.upload, r.prepared!.w, r.prepared!.h);
+          // Shown here at once, from what was just made of it
+          void seedEmote(r.prepared!, asSticker).catch(() => {});
           set(r.key, { status: "done", note: "", bytes: undefined });
         } catch (e) {
           set(r.key, { status: "failed", note: why(e) });
@@ -295,23 +556,48 @@
     rows = [];
     pack = "";
   }
-  onDestroy(clear);
+  let gone = false;
+  onDestroy(() => {
+    gone = true;
+    clear();
+  });
 </script>
 
 <div class="em">
   <label class="em-switch">
-    <input type="checkbox" checked={$emoteSets.stickers} onchange={(e) => setStickers(server, (e.target as HTMLInputElement).checked)} />
+    <input type="checkbox" checked={$emoteSets.stickers} onchange={switchStickers} />
     <span>Members may send stickers</span>
   </label>
   <p class="em-hint">
-    {$emoteSets.emotes.length - stickerCount} emotes, {stickerCount} stickers. They are stored on this server unencrypted, visible
+    This server has {countKinds($emoteSets.emotes.length - stickerCount, stickerCount)}. They are stored on it unencrypted, visible
     to everyone who joins; every member's app makes its own safe copy of each before showing it.
   </p>
+  {#if $emoteLimits}
+    <div class="em-quota">
+      <!-- Drawn as Settings → Files draws its own: a native meter ignores the palette -->
+      <div
+        class="em-bar"
+        role="meter"
+        aria-label="Space the server's emotes take"
+        aria-valuemin="0"
+        aria-valuemax={$emoteLimits.max_total_bytes}
+        aria-valuenow={used}
+        aria-valuetext="{formatSize(used)} of {formatSize($emoteLimits.max_total_bytes)}"
+      >
+        <div style="width: {Math.min(100, (used / Math.max(1, $emoteLimits.max_total_bytes)) * 100)}%"></div>
+      </div>
+      <span>
+        {formatSize(used)} of {formatSize($emoteLimits.max_total_bytes)} · {$emoteSets.emotes.length} of {$emoteLimits.max_items}
+      </span>
+    </div>
+  {/if}
 
   {#if $emoteSets.emotes.length}
     <div class="em-tools">
       <input class="em-input" type="search" placeholder="Search" aria-label="Search this server's emotes" bind:value={filter} />
       {#if pickedShown.length}
+        <input class="em-input em-move" placeholder="A pack (empty: none)" aria-label="Pack to move the picked ones to" bind:value={moveTo} />
+        <button class="btn btn-secondary" type="button" onclick={movePicked}>Move {pickedShown.length} to it</button>
         <button class="btn btn-danger-outline" type="button" onclick={() => removeAll(pickedShown, pickedShown.length === 1 ? `:${pickedShown[0]}:` : `${pickedShown.length} emotes and stickers`)}>
           Remove {pickedShown.length}
         </button>
@@ -319,24 +605,47 @@
     </div>
     <div class="em-list">
       {#each sections as s (s.key)}
+        {@const what = `${s.sticker ? "stickers" : "emotes"}${s.pack ? ` of the pack ${s.pack}` : " in no pack"}`}
         <div class="em-section">
-          <span>{s.sticker ? "Stickers" : "Emotes"}{s.pack ? ` · ${s.pack}` : ""}</span>
-          <span class="em-count num">{s.list.length}</span>
-          {#if s.pack}
-            <button class="btn btn-ghost em-small" type="button" onclick={() => removeAll(s.list.map((e) => e.name), `the pack "${s.pack}"`)}>Remove pack</button>
+          {#if renamingPack === s.key}
+            <input
+              class="em-input em-name"
+              bind:value={newPack}
+              use:focusNow
+              aria-label="New name for the pack {s.pack}"
+              onkeydown={(ev) => {
+                if (ev.key === "Enter") finishPackRename(s.pack, wholePack(s).map((e) => e.name), true);
+                if (ev.key === "Escape") { ev.stopPropagation(); finishPackRename(s.pack, [], false); }
+              }}
+              onblur={() => finishPackRename(s.pack, wholePack(s).map((e) => e.name), true)}
+            />
+          {:else}
+            <span>{s.sticker ? "Stickers" : "Emotes"}{s.pack ? ` · ${s.pack}` : ""}</span>
           {/if}
+          <span class="em-count num">{s.list.length}</span>
+          <span class="em-section-tools">
+            {#if s.pack}
+              <button class="btn btn-ghost em-small" type="button" aria-label="Rename the pack {s.pack}" onclick={() => { renamingPack = s.key; newPack = s.pack; }}>Rename</button>
+            {/if}
+            <button class="btn btn-ghost em-small" type="button" aria-label="Export the {what} as a .zip" disabled={exporting !== null} onclick={() => exportPack(s.key, s.pack, wholePack(s))}
+              >{exporting === s.key ? "Exporting…" : "Export"}</button
+            >
+            {#if s.pack}
+              <button class="btn btn-ghost em-small" type="button" aria-label="Remove the pack {s.pack}" onclick={() => removeAll(wholePack(s).map((e) => e.name), `the pack "${s.pack}"`)}>Remove pack</button>
+            {/if}
+          </span>
         </div>
         <ul>
           {#each s.list as e (e.name)}
+            {@const failed = $emoteUrls.get(urlKey(e.hash, e.sticker))?.error}
             <li class="em-row">
               <input type="checkbox" checked={picked.has(e.name)} onchange={() => pick(e.name)} aria-label="Pick :{e.name}:" />
-              <span class="em-pic"><Emote name={e.name} hash={e.hash.slice(0, 20)} size="jumbo" /></span>
+              <span class="em-pic"><Emote name={e.name} hash={e.hash} size="jumbo" /></span>
               {#if renaming === e.name}
-                <!-- svelte-ignore a11y_autofocus -->
                 <input
                   class="em-input em-name"
                   bind:value={newName}
-                  autofocus
+                  use:focusNow
                   aria-label="New name for :{e.name}:"
                   onkeydown={(ev) => {
                     if (ev.key === "Enter") finishRename(e, true);
@@ -347,6 +656,7 @@
               {:else}
                 <span class="em-name" title=":{e.name}:">:{e.name}:</span>
               {/if}
+              {#if failed}<span class="em-bad" title="This device could not make it: {failed}">Not shown</span>{/if}
               <span class="em-meta">{switching.has(e.name) ? (e.sticker ? "Making it an emote…" : "Making it a sticker…") : ""}</span>
               <button
                 class="icon-btn"
@@ -366,7 +676,7 @@
   {/if}
 
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="em-add" class:over ondragover={(e) => { e.preventDefault(); over = true; }} ondragleave={() => (over = false)} ondrop={drop}>
+  <div class="em-add" bind:this={addBox} class:over ondragover={(e) => { e.preventDefault(); over = true; }} ondragleave={() => (over = false)} ondrop={drop}>
     <div class="em-heading">Add</div>
     <div class="em-kind" role="group" aria-label="Add as">
       <button type="button" class="em-chip" aria-pressed={!asSticker} disabled={busy} onclick={() => setKind(false)}>Emotes</button>
@@ -380,12 +690,29 @@
         Pictures or a .zip…
         <input type="file" multiple hidden onchange={pickedFiles} />
       </label>
-      <label class="btn btn-secondary">
-        A folder…
-        <input type="file" hidden webkitdirectory onchange={pickedFiles} />
-      </label>
+      <!-- Android picks no folder and takes no drop -->
+      {#if !isAndroidApp}
+        <label class="btn btn-secondary">
+          A folder…
+          <input type="file" hidden webkitdirectory onchange={pickedFiles} />
+        </label>
+      {/if}
     </div>
-    <p class="em-hint">Or drop them here. A Discord, Slack or TeamSpeak folder, a WhatsApp .wastickers, a Telegram pack a bot saved as a .zip: names come from the files.</p>
+    {#if isAndroidApp}
+      <p class="em-hint">A folder of them (Discord, Slack, TeamSpeak) goes as a .zip of it; a WhatsApp .wastickers or a Telegram pack a bot saved as a .zip, as it is: names come from the files.</p>
+    {:else}
+      <p class="em-hint">Or drop them here. A Discord, Slack or TeamSpeak folder, a WhatsApp .wastickers, a Telegram pack a bot saved as a .zip: names come from the files.</p>
+    {/if}
+    {#if otherServers.length}
+      <div class="em-heading">Or copy them from another server</div>
+      <div class="em-actions">
+        <select bind:value={copyFrom} aria-label="The server to copy from">
+          <option value="">Choose a server…</option>
+          {#each otherServers as o (o.id)}<option value={o.id}>{o.name} ({o.count} {asSticker ? "stickers" : "emotes"})</option>{/each}
+        </select>
+        <button class="btn btn-secondary" type="button" disabled={copying || !copyFrom} onclick={copyServer}>{copying ? "Copying…" : "Copy"}</button>
+      </div>
+    {/if}
     {#if !isWeb && !isAndroidApp}
       <div class="em-heading">Or fetch them</div>
       <div class="em-kind" role="group" aria-label="From">
@@ -397,7 +724,7 @@
         class="em-input"
         aria-label="Where from"
         bind:value={sourceId}
-        placeholder={source === "7tv" ? "An emote's or a set's address (7tv.app/emotes/… or 7tv.app/emote-sets/…)" : source === "bttv" ? "The Twitch user id (a number)" : "The Discord server's id (a number)"}
+        placeholder={source === "7tv" ? "A 7TV profile's, set's or emote's address (7tv.app/users/…, /emote-sets/…, /emotes/…)" : source === "bttv" ? "The Twitch user id (a number)" : "The Discord server's id (a number)"}
       />
       {#if source === "discord"}
         <input class="em-input" type="password" autocomplete="off" aria-label="Bot token" placeholder="A bot's token (the bot must be in that server)" bind:value={token} />
@@ -429,17 +756,20 @@
             {:else}
               <span class="em-name" title={r.source}>{r.name ? `:${r.name}:` : r.source}</span>
             {/if}
-            <span class="em-meta" role="status">
+            <span class="em-meta">
               {r.status === "reading" ? "Reading…" : r.status === "uploading" ? "Adding…" : r.status === "done" ? "Added" : ""}
               {r.note}
+              {#if r.pack && editable(r)}Into “{r.pack}”.{/if}
+              {#if ready.includes(r) && !fitting.has(r.key)}Will not fit: the server's emotes are full.{/if}
             </span>
           </li>
         {/each}
       </ul>
+      <p class="em-hint" role="status">{summary}</p>
       <div class="em-actions">
         <button class="btn btn-ghost" type="button" disabled={busy} onclick={clear}>Clear</button>
-        <button class="btn btn-primary" type="button" disabled={busy || ready.length === 0} onclick={upload}>
-          {busy ? "Adding…" : `Add ${ready.length}`}
+        <button class="btn btn-primary" type="button" disabled={busy || reading > 0 || fitting.size === 0} onclick={upload}>
+          {busy ? "Adding…" : `Add ${fitting.size}`}
         </button>
       </div>
     {/if}
@@ -471,14 +801,21 @@
     background: var(--bg-primary);
     color: var(--text-primary);
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--r-sm);
   }
   .em-input[aria-invalid="true"] {
-    border-color: var(--danger, #e5484d);
+    border-color: var(--danger);
   }
+  /* A phone's width: the search and the pack field take a line each before
+     either is squeezed to a few letters */
   .em-tools {
     display: flex;
+    flex-wrap: wrap;
     gap: 6px;
+  }
+  .em-tools .em-input {
+    flex: 1 1 160px;
+    width: auto;
   }
   .em-tools .btn {
     flex-shrink: 0;
@@ -497,6 +834,7 @@
   }
   .em-section {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 8px;
     padding: 8px 0 2px;
@@ -507,14 +845,22 @@
   .em-count {
     font-weight: 400;
   }
-  .em-small {
+  /* The section's own buttons, together at its end */
+  .em-section-tools {
+    display: flex;
+    gap: 2px;
     margin-left: auto;
+  }
+  .em-small {
     padding: 0 8px;
-    min-height: 24px;
+    min-height: var(--hit);
     font-size: var(--fs-sm);
   }
+  /* Wraps rather than squeezes: on a phone the name keeps its room and the
+     buttons, or the note, go to the next line */
   .em-row {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 8px;
     padding: 2px 0;
@@ -537,8 +883,8 @@
     max-height: 40px;
   }
   .em-name {
-    flex: 0 1 160px;
-    min-width: 0;
+    flex: 1 1 8em;
+    min-width: 6em;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -554,20 +900,72 @@
   }
   .em-problem {
     font-size: var(--fs-sm);
-    color: var(--danger, #e5484d);
+    color: var(--danger);
+  }
+  .em-bad {
+    flex-shrink: 0;
+    padding: 1px 5px;
+    border: 1px solid var(--warning);
+    border-radius: var(--r-sm);
+    font-size: var(--fs-micro);
+    color: var(--warning);
+  }
+
+  .em-quota {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: var(--fs-sm);
+    color: var(--text-secondary);
+  }
+  .em-bar {
+    flex: 1;
+    max-width: 200px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--border);
+    overflow: hidden;
+  }
+  .em-bar div {
+    height: 100%;
+    background: var(--text-secondary);
+  }
+  .em input[type="checkbox"] {
+    accent-color: var(--control-fill);
   }
   .em-meta {
-    flex: 1;
+    flex: 1 1 0;
     min-width: 0;
     font-size: var(--fs-sm);
     color: var(--text-secondary);
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  /* In the review, why a row is set aside or unticked is the point: a line of
+     its own, never cut */
+  .em-add .em-meta {
+    flex: 1 1 12em;
+    white-space: normal;
+  }
   .em-row .icon-btn {
     width: var(--icon-btn-size-sm);
     height: var(--icon-btn-size-sm);
     background: transparent;
+  }
+  /* A finger's size for the row's own controls, the tick box too */
+  @media (pointer: coarse) {
+    .em-row .icon-btn {
+      width: var(--hit);
+      height: var(--hit);
+    }
+    .em-row input[type="checkbox"],
+    .em-all input[type="checkbox"],
+    .em-switch input[type="checkbox"] {
+      flex-shrink: 0;
+      width: 20px;
+      height: 20px;
+      margin: 12px;
+    }
   }
   .em-add {
     display: flex;
@@ -595,7 +993,7 @@
   }
   .em-chip {
     padding: 4px 10px;
-    min-height: 28px;
+    min-height: var(--hit);
     border: 1px solid var(--border);
     border-radius: var(--r-sm);
     background: transparent;

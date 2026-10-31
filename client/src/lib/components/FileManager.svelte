@@ -31,8 +31,9 @@
     type FileSort,
   } from "../file-index.js";
   import { formatSize, PREVIEW_SIDE } from "../file-rules.js";
+  import { mobileOk } from "../stores/emotes.js";
   import { needsNsfwConsent } from "../channel-post-rules.js";
-  import type { ChatPlace } from "../chat-rules.js";
+  import { rowKey, type ChatPlace } from "../chat-rules.js";
   import type { ChatMessage } from "../types.js";
   import { shortName } from "../username.js";
   import FileCard from "./chat/FileCard.svelte";
@@ -58,22 +59,46 @@
   let sort = $state<FileSort>("date");
   let group = $state<FileGroup>("none");
   let limit = $state(PAGE);
-  /** Rows whose card is open, by their message. Raw: looked up by identity. */
+  /** Rows whose card is open, by their message's `rowKey`: a reaction or an
+   *  edit keeps it open. Raw: looked up by identity. */
   let opened = $state.raw(new Set<ChatMessage>());
   /** Copies picked to remove together, by blob: only while "On this device"
    *  is shown, where every row has one. */
   let picked = $state.raw(new Set<string>());
   let picture = $state.raw<{ url: string; name: string; save: () => void } | null>(null);
 
+  /** Why the list could not be read: said, with a way to try again, never
+   *  shown as an empty cache. */
+  let loadError = $state<string | null>(null);
   async function reload() {
     try {
       cache = await invoke<{ cap: number; entries: CachedBlob[] }>("file_cache_list");
+      loadError = null;
     } catch (e) {
       console.warn("file cache:", e);
-      cache = { cap: 0, entries: [] };
+      loadError = String(e).replace(/^Error: /, "");
     }
   }
   void reload();
+
+  /** What this device keeps of the servers' emotes and stickers (made again
+   *  from their server when next shown, once cleared). */
+  let emoteBytes = $state<number | null>(null);
+  const emoteCache = () =>
+    invoke<number>("emote_cache_size")
+      .then((n) => (emoteBytes = n))
+      .catch(() => (emoteBytes = null));
+  void emoteCache();
+  async function clearEmotes() {
+    const was = emoteBytes ?? 0;
+    try {
+      await invoke("emote_cache_clear");
+      addNotification(`Cleared ${formatSize(was)} of emotes and stickers from this ${isWeb ? "browser" : "device"}`);
+    } catch (e) {
+      addNotification(String(e), "error");
+    }
+    void emoteCache();
+  }
 
   // A load or a send changes what is kept: look again once the bars are
   // still, and at least every few seconds while one keeps moving
@@ -177,7 +202,7 @@
 
   function toggle(r: FileRow) {
     const next = new Set(opened);
-    if (!next.delete(r.msg)) next.add(r.msg);
+    if (!next.delete(rowKey(r.msg))) next.add(rowKey(r.msg));
     opened = next;
   }
 
@@ -234,6 +259,24 @@
     if (ok) await remove(all.map((e) => e.hash));
   }
 
+  async function removePicked(from: HTMLElement | null) {
+    const hashes = [...picked];
+    if (hashes.length > 1) {
+      const size = cache?.entries.filter((e) => picked.has(e.hash)).reduce((n, e) => n + e.bytes, 0) ?? 0;
+      const ok = await confirmAction({
+        title: `Remove ${hashes.length} files from this ${isWeb ? "tab" : "device"}?`,
+        body:
+          `The ${hashes.length} files picked (${formatSize(size)}) are removed from this ${isWeb ? "tab" : "device"}. ` +
+          "The messages stay. A file loads again from its server while the server still has it, or " +
+          "from a member who does; nobody can load one from you any more.",
+        confirm: `Remove ${hashes.length}`,
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    await remove(hashes, from);
+  }
+
   async function setCap(e: Event) {
     const input = e.target as HTMLInputElement;
     const was = Math.round((cache?.cap ?? 0) / MIB);
@@ -245,6 +288,8 @@
     }
     const mb = Math.max(CAP_MIN_MB, Math.min(CAP_MAX_MB, raw));
     input.value = String(mb);
+    // Said, not silently changed: the field shows another number than typed
+    if (mb !== raw) addNotification(`Files kept: ${CAP_MIN_MB} MB at least and 1 TB at most, so ${mb} MB`, "warning");
     if (mb === was) return;
     // Smaller than what is kept: the least recently used go now, so ask
     if (mb * MIB < used) {
@@ -286,7 +331,14 @@
     <div style="width: {usedShare * 100}%"></div>
   </div>
   <div class="fm-usage">
-    <span class="num">{formatSize(used)} of {formatSize(cache?.cap ?? 0)}</span>
+    {#if loadError}
+      <span class="fm-error" role="alert">Could not read what this {isWeb ? "tab" : "device"} keeps: {loadError}</span>
+      <button class="btn btn-ghost" type="button" onclick={() => void reload()}>Try again</button>
+    {:else if cache}
+      <span class="num">{formatSize(used)} of {formatSize(cache.cap)}</span>
+    {:else}
+      <span role="status">Reading what this {isWeb ? "tab" : "device"} keeps…</span>
+    {/if}
     {#if !isWeb && cache}
       <label class="fm-cap">
         <span>Keep at most</span>
@@ -313,6 +365,30 @@
   </p>
   {#if cache && cache.entries.length > 0}
     <button class="btn btn-danger-outline" type="button" onclick={removeAll}>Remove all from this {isWeb ? "tab" : "device"}…</button>
+  {/if}
+  {#if emoteBytes !== null}
+    <div class="fm-usage">
+      <span>Emotes and stickers: <span class="num">{emoteBytes ? formatSize(emoteBytes) : "none kept"}</span></span>
+      <button class="btn btn-ghost" type="button" disabled={!emoteBytes} onclick={clearEmotes}>Clear</button>
+    </div>
+    <p class="fm-hint">
+      The servers' emotes and stickers as this {isWeb ? "browser" : "device"} made them safe to show. Cleared, each is fetched
+      and made again when it is next shown.
+    </p>
+  {/if}
+  {#if $uiPrefs.emotes_mobile_ok.length}
+    <!-- "Always on this server", said in the mobile-data question: here it is undone -->
+    <p class="fm-hint">On mobile data, these servers' emotes and stickers download without asking:</p>
+    <ul class="fm-mobile">
+      {#each $uiPrefs.emotes_mobile_ok as server (server)}
+        <li>
+          <span>{serverName(server, $savedServers)}</span>
+          <button class="btn btn-ghost fm-go" type="button" aria-label="Ask again before downloading {serverName(server, $savedServers)}'s emotes on mobile data" onclick={() => mobileOk(server, false)}
+            >Ask again</button
+          >
+        </li>
+      {/each}
+    </ul>
   {/if}
 </div>
 
@@ -363,7 +439,7 @@
         <span>All shown</span>
       </label>
       {#if picked.size > 0}
-        <button class="btn btn-danger-outline" type="button" onclick={(e) => remove([...picked], e.currentTarget.closest<HTMLElement>(".section"))}>
+        <button class="btn btn-danger-outline" type="button" onclick={(e) => removePicked(e.currentTarget.closest<HTMLElement>(".section"))}>
           Remove {picked.size === 1 ? "1 copy" : `${picked.size} copies`}
         </button>
       {/if}
@@ -379,8 +455,8 @@
       <h5 class="fm-section">{sectionTitle(s)} <span class="num">{sections.find((x) => x.id === s.id)?.rows.length}</span></h5>
     {/if}
     <ul class="fm-list">
-      {#each s.rows as r (r.msg)}
-        {@const open = opened.has(r.msg)}
+      {#each s.rows as r (rowKey(r.msg))}
+        {@const open = opened.has(rowKey(r.msg))}
         <li class="fm-row">
           <div class="fm-line">
             {#if filter === "local" && r.local !== null}
@@ -396,12 +472,12 @@
             <button class="fm-main" type="button" aria-expanded={open} onclick={() => toggle(r)} title="{open ? 'Hide' : 'Show'} {r.file.name}">
               <span class="fm-name">{r.file.name}</span>
               <span class="fm-about">
-                {about(r)}{#if r.local !== null}<span class="fm-local"> · on this {isWeb ? "tab" : "device"}</span>{/if}
+                {about(r)}{#if r.local !== null}<span class="fm-local">{` · on this ${isWeb ? "tab" : "device"}`}</span>{/if}
               </span>
             </button>
             <span class="fm-size num">{formatSize(r.file.size)}</span>
             <span class="fm-actions">
-              <button class="btn-ghost fm-go" type="button" onclick={() => go(r)} title="Go to message" aria-label="Go to the message with {r.file.name}">Go to</button>
+              <button class="btn btn-ghost fm-go" type="button" onclick={() => go(r)} title="Go to message" aria-label="Go to the message with {r.file.name}">Go to</button>
               {#if r.local !== null}
                 <button class="icon-btn" type="button" onclick={() => download(r)} title="Download" aria-label="Download {r.file.name}">
                   <Icon name="download" size={16} />
@@ -425,6 +501,7 @@
                 file={r.file}
                 server={id ?? r.place.server}
                 conv={id && $openServers.includes(id) ? fileConvAt(id, r.place) : null}
+                auto
                 onopen={(p) => (picture = p)}
                 ongone={(url) => {
                   if (picture?.url === url) picture = null;
@@ -488,8 +565,10 @@
     font-size: var(--fs-sm);
     color: var(--text-secondary);
   }
+  /* Seven digits (1 TB in MB) and the field's own padding */
   .fm-cap input {
-    width: 9ch;
+    width: 12ch;
+    padding: 6px 8px;
   }
   .fm-hint {
     margin: 0 0 8px;
@@ -513,7 +592,7 @@
     background: var(--bg-primary);
     color: var(--text-primary);
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--r-sm);
   }
   .fm-query:focus {
     outline: none;
@@ -528,12 +607,36 @@
   /* SearchPane's scope buttons: on is ink, never the live mint */
   .fm-chip {
     padding: 4px 10px;
-    min-height: 28px;
+    min-height: 32px;
     border: 1px solid var(--border);
     border-radius: var(--r-sm);
     background: transparent;
     color: var(--text-secondary);
     font-size: var(--fs-sm);
+  }
+  @media (pointer: coarse) {
+    .fm-chip,
+    .fm-query,
+    .fm-controls select,
+    .fm-cap input,
+    .fm-main {
+      min-height: var(--hit);
+    }
+  }
+  .fm-error {
+    color: var(--danger);
+  }
+  .fm-mobile {
+    list-style: none;
+    margin: 0 0 8px;
+    padding: 0;
+  }
+  .fm-mobile li {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    font-size: var(--fs-body);
   }
   .fm-chip[aria-pressed="true"] {
     background: var(--bg-hover);
@@ -616,7 +719,7 @@
   .fm-thumb canvas {
     width: 24px;
     height: 24px;
-    border-radius: 3px;
+    border-radius: var(--r-sm);
   }
   .fm-main {
     flex: 1 1 180px;
@@ -676,6 +779,13 @@
   .fm-go {
     padding: 4px 8px;
     font-size: var(--fs-sm);
+    font-weight: 400;
+  }
+  @media (pointer: coarse) {
+    .fm-actions .icon-btn {
+      width: var(--hit);
+      height: var(--hit);
+    }
   }
   .fm-card {
     padding: 4px 0 8px 32px;

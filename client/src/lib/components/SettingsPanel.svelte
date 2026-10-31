@@ -69,6 +69,7 @@
   import { get } from "svelte/store";
   import LayoutPreview from "./LayoutPreview.svelte";
   import { uiPrefs, updateUiPrefs } from "../stores/ui-prefs.js";
+  import { reducedMotion } from "../stores/emotes.js";
   import { buildHash, buildLine, buildTime } from "../build-info.js";
   import {
     CHAT_FONT_MAX,
@@ -85,6 +86,10 @@
   // split by what somebody comes to Settings to do
   type Tab = "voice" | "appearance" | "sounds" | "privacy" | "files" | "games" | "about";
   let activeTab = $state<Tab>(get(settingsAsk)?.tab ?? "voice");
+  let panelBody = $state<HTMLElement | null>(null);
+
+  /** A touch screen: nothing is ever under its pointer. */
+  const coarsePointer = typeof matchMedia === "function" && matchMedia("(pointer: coarse)").matches;
 
   // The accounts this device signs in to without a password (1.0 audit H5-12)
   let remembered = $state<{ server: string; name: string }[]>([]);
@@ -108,6 +113,7 @@
       p.density = d.density;
       p.chat_font_size = d.chat_font_size;
       p.group_threads = d.group_threads;
+      p.dm_previews = d.dm_previews;
       p.zoom = d.zoom;
       p.panels = d.panels;
     });
@@ -643,14 +649,18 @@
           class:active={activeTab === t.id}
           role="tab"
           aria-selected={activeTab === t.id}
-          onclick={() => (activeTab = t.id)}
+          onclick={() => {
+            activeTab = t.id;
+            // Each tab from its top, not where the last one was scrolled to
+            panelBody?.scrollTo({ top: 0 });
+          }}
         >{t.label}</button>
       {/each}
     </div>
 
     <!-- Only this part scrolls: the title, the close button and the tabs stay
          on screen however long a tab is -->
-    <div class="panel-body">
+    <div class="panel-body" bind:this={panelBody}>
     {#if activeTab === "voice"}
       <!-- Before any call, on every platform: the voice bar's own copy of this
            only exists in a call, so a phone joined with whatever mode it had
@@ -1283,22 +1293,47 @@
         <label class="toggle-row">
           <input
             type="checkbox"
+            checked={$uiPrefs.dm_previews}
+            onchange={(e) =>
+              updateUiPrefs((p) => {
+                p.dm_previews = (e.target as HTMLInputElement).checked;
+              })}
+          />
+          <span class="toggle-label">Show the last message under each direct conversation</span>
+          <span class="toggle-hint">
+            With how long ago it was written. Anyone who sees your screen sees it too. A message with a timer
+            never shows there.
+          </span>
+        </label>
+        <label class="toggle-row">
+          <input
+            type="checkbox"
             checked={$uiPrefs.show_stickers}
             onchange={(e) => updateUiPrefs((p) => (p.show_stickers = (e.target as HTMLInputElement).checked))}
           />
           <span class="toggle-label">Show stickers</span>
           <span class="toggle-hint">Off, a sticker someone sends shows as its name.</span>
         </label>
-        <h4>Moving emotes and stickers</h4>
+        <h4 class="sub-heading">Moving emotes and stickers</h4>
+        <!-- The system's "less motion" wins (Emote.svelte); a touch screen has no pointer to hover -->
         <select
-          value={$uiPrefs.animate_emotes}
+          value={$reducedMotion ? "never" : $uiPrefs.animate_emotes}
           aria-label="Moving emotes and stickers"
+          aria-describedby={$reducedMotion ? "motion-hint" : undefined}
+          disabled={$reducedMotion}
           onchange={(e) => updateUiPrefs((p) => (p.animate_emotes = (e.target as HTMLSelectElement).value as "always" | "hover" | "never"))}
         >
           <option value="always">Always move</option>
-          <option value="hover">Move under the pointer</option>
+          {#if !coarsePointer || $uiPrefs.animate_emotes === "hover"}
+            <option value="hover">Move under the pointer</option>
+          {/if}
           <option value="never">Never move</option>
         </select>
+        {#if $reducedMotion}
+          <span class="toggle-hint" id="motion-hint">Your system asks for less motion, so none of them move.</span>
+        {:else}
+          <span class="toggle-hint">Pictures posted in chat follow this too: "Never" shows their first frame.</span>
+        {/if}
         <label class="slider-row">
           <span>Chat text size: {$uiPrefs.chat_font_size}px</span>
           <input
@@ -1590,6 +1625,21 @@
     letter-spacing: 0.5px;
     color: var(--text-secondary);
     margin-bottom: 8px;
+  }
+  /* A second heading inside one section: room above it, so the hint before
+     does not read as part of it */
+  h4.sub-heading {
+    margin-top: var(--sp-4);
+  }
+  /* A finger's size for the panel's own controls (its close, its tabs) */
+  @media (pointer: coarse) {
+    .close-btn {
+      min-width: var(--hit);
+      min-height: var(--hit);
+    }
+    .tab {
+      min-height: var(--hit);
+    }
   }
 
   /* Every select in Settings, its tabs' own components' too (Files) */

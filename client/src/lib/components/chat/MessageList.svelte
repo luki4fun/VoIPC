@@ -11,29 +11,33 @@
     /** For the channel's managers. */
     pin?: (m: Message, on: boolean) => void;
     forward?: (m: Message) => void;
+    /** Its picture into the server's emotes (admins). */
+    makeEmote?: (m: Message) => void;
   }
 </script>
 
 <script lang="ts">
   import { tick } from "svelte";
-  import { byRecent, isEmoteReaction, stickerOf, untokenize } from "../../emote-rules.js";
-  import { emoteSets, recentEmotes } from "../../stores/emotes.js";
+  import { isEmoteReaction, stickerOf, untokenize } from "../../emote-rules.js";
+  import { emoteSets } from "../../stores/emotes.js";
   import { uiPrefs as emotePrefs } from "../../stores/ui-prefs.js";
   import Emote from "./Emote.svelte";
+  import EmotePicker from "./EmotePicker.svelte";
   import type { ChatMessage, FileConv } from "../../types.js";
-  import { serverAddress, userId } from "../../stores/connection.js";
+  import { userId } from "../../stores/connection.js";
   import { account, accountHex } from "../../stores/account.js";
   import { addNotification } from "../../stores/notifications.js";
   import { menu } from "../../actions/menu.js";
   import { portal } from "../../actions/portal.js";
+  import { fit } from "../../actions/fit.js";
   import { nativeMenuWanted } from "../../context-menu.js";
-  import { dayKey, dayLabel, fullTime } from "../../chat-time.js";
+  import { dayKey, dayLabel, fullTime, msToMidnight } from "../../chat-time.js";
   import { mentionsName, parse, plainText } from "../../markdown.js";
   import { ambiguousTarget, findTarget, indexById, isOwn } from "../../thread-rules.js";
   import { reactionChips, rowKey, sameRow } from "../../chat-rules.js";
   import { receivedNow } from "../../stores/chat.js";
   import { confirmAction } from "../../stores/confirm.js";
-  import { EMOJI_CATEGORIES, QUICK_REACTIONS } from "../../emoji.js";
+  import { QUICK_REACTIONS } from "../../emoji.js";
   import { shortName } from "../../username.js";
   import Icon from "../Icons.svelte";
   import Markdown from "./Markdown.svelte";
@@ -94,6 +98,15 @@
     fileConv = null,
     actions = {},
   }: Props = $props();
+
+  /** "Now" for the day dividers, moved on at each midnight: an open
+   *  conversation said "Today" over yesterday's messages until redrawn. */
+  let today = $state(Date.now());
+  $effect(() => {
+    // A second late: a timer may fire a moment early
+    const timer = setTimeout(() => (today = Date.now()), msToMidnight(today) + 1000);
+    return () => clearTimeout(timer);
+  });
 
   /** A loaded picture shown big. */
   let picture = $state<{ url: string; name: string; save: () => void } | null>(null);
@@ -261,25 +274,6 @@
 
   let opened = $state.raw<{ m: ChatMessage; x: number; y: number; up: number } | null>(null);
 
-  /** The phone's gesture bar, which an edge-to-edge web view draws over. */
-  function safeBottom(): number {
-    const probe = document.createElement("div");
-    probe.style.cssText = "position:fixed;bottom:0;height:env(safe-area-inset-bottom,0px);visibility:hidden";
-    document.body.append(probe);
-    const h = probe.getBoundingClientRect().height;
-    probe.remove();
-    return h;
-  }
-
-  /** A pop-up at `y` that would run off the bottom (of what is visible: a
-   *  phone's keyboard and gesture bar take some, D2-13) goes above `up`. */
-  function fit(node: HTMLElement, up: number) {
-    const r = node.getBoundingClientRect();
-    const vv = globalThis.visualViewport;
-    const floor = (vv ? vv.offsetTop + vv.height : innerHeight) - 8 - safeBottom();
-    if (r.bottom > floor) node.style.top = `${Math.max(8, up - r.height)}px`;
-  }
-
   // ── Touch ───────────────────────────────────────────────────────────────
   //
   // The last pointer was a finger. Then a long press opens the message menu
@@ -329,17 +323,18 @@
     return answerable(m) && m.kind !== "shared" && isMine(m);
   }
 
+  /** Ours and text: a sticker saved from the edit box would become its name. */
+  function textEditable(m: ChatMessage): boolean {
+    return ownEditable(m) && !stickerOf(m.content, $emoteSets.emotes);
+  }
+
   /** The reaction picker, for `m`, where it was opened. */
   let picking = $state.raw<{ m: ChatMessage; x: number; y: number; up: number } | null>(null);
-  let pickCategory = $state(0);
-  /** The server's emotes a reaction may be: not its stickers. */
-  const serverEmotes = $derived(byRecent($emoteSets.emotes.filter((e) => !e.sticker), $recentEmotes[$serverAddress] ?? []));
 
   /** Open the picker under `from` (a tool), or at the menu's place. */
   function openPicker(m: ChatMessage, from: { x: number; y: number; up: number } | Element) {
     const r = from instanceof Element ? from.getBoundingClientRect() : null;
     const at = r ? { x: r.right - 300, y: r.bottom + 4, up: r.top - 4 } : (from as { x: number; y: number; up: number });
-    pickCategory = 0;
     // Kept on screen across; the picker is 300 wide (`fit` keeps it in down)
     picking = { m, x: Math.max(8, Math.min(at.x, innerWidth - 308)), y: at.y, up: at.up };
   }
@@ -450,7 +445,7 @@
     <div class="history-marker"><span>{msg.content}</span></div>
   {:else}
     {#if startsDay(i)}
-      <div class="day-divider" role="separator"><span>{dayLabel(msg.timestamp)}</span></div>
+      <div class="day-divider" role="separator"><span>{dayLabel(msg.timestamp, today)}</span></div>
     {/if}
     {#if msg === newFrom}
       <div class="new-divider" role="separator" bind:this={newEl}><span>New</span></div>
@@ -546,7 +541,7 @@
           {:else if msg.content}
             {@const sticker = stickerOf(msg.content, $emoteSets.emotes)}
             {#if sticker && $emoteSets.stickers && $emotePrefs.show_stickers}
-              <Emote name={sticker.name} hash={sticker.hash.slice(0, 20)} size="sticker" />
+              <Emote name={sticker.name} hash={sticker.hash} size="sticker" {tabbable} />
             {:else if sticker}
               <span class="sticker-off">Sticker :{sticker.name}:</span>
             {:else}
@@ -565,6 +560,7 @@
               {server}
               conv={fileConv}
               {tabbable}
+              auto={isMine(msg) && Date.now() - msg.timestamp < 10 * 60_000}
               onopen={(p) => (picture = p)}
               ongone={(u) => {
                 if (picture?.url === u) picture = null;
@@ -629,7 +625,7 @@
             <Icon name="thread" size={16} />
           </button>
         {/if}
-        {#if actions.edit && ownEditable(msg)}
+        {#if actions.edit && textEditable(msg)}
           <button class="icon-btn tool" type="button" tabindex={msg === current ? 0 : -1} title="Edit" aria-label="Edit" onclick={() => startEdit(msg)}>
             <Icon name="pencil" size={16} />
           </button>
@@ -670,8 +666,11 @@
     {#if actions.forward && answerable(m) && m.kind !== "shared"}
       <button type="button" onclick={() => act(actions.forward!)}><Icon name="forward" size={16} /> Forward</button>
     {/if}
-    {#if actions.edit && ownEditable(m)}
+    {#if actions.edit && textEditable(m)}
       <button type="button" onclick={() => act(startEdit)}><Icon name="pencil" size={16} /> Edit</button>
+    {/if}
+    {#if actions.makeEmote && m.file && /^image\//.test(m.file.mime ?? "")}
+      <button type="button" onclick={() => act(actions.makeEmote!)}><Icon name="sticker" size={16} /> Make an emote or sticker…</button>
     {/if}
     {#if actions.pin && answerable(m)}
       <button type="button" onclick={() => act((x) => actions.pin!(x, !x.pin?.on))}
@@ -701,31 +700,7 @@
         <button class="react-item" type="button" aria-label="React with {emoji}" onclick={() => pick(emoji)}>{emoji}</button>
       {/each}
     </div>
-    <div class="react-tabs">
-      {#if serverEmotes.length}
-        <button class="react-tab" class:active={pickCategory === -1} type="button" title="This server's" aria-label="This server's emotes" onclick={() => (pickCategory = -1)}
-          ><Emote name={serverEmotes[0].name} hash={serverEmotes[0].hash.slice(0, 20)} /></button
-        >
-      {/if}
-      {#each EMOJI_CATEGORIES as cat, idx (cat.label)}
-        <button class="react-tab" class:active={pickCategory === idx} type="button" title={cat.label} aria-label={cat.label} onclick={() => (pickCategory = idx)}
-          >{cat.emojis[0]}</button
-        >
-      {/each}
-    </div>
-    <div class="react-grid">
-      {#if pickCategory === -1}
-        {#each serverEmotes as e (e.name)}
-          <button class="react-item" type="button" aria-label="React with :{e.name}:" title=":{e.name}:" onclick={() => pick(`:${e.name}:`)}
-            ><Emote name={e.name} hash={e.hash.slice(0, 20)} /></button
-          >
-        {/each}
-      {:else}
-        {#each EMOJI_CATEGORIES[pickCategory].emojis as emoji (emoji)}
-          <button class="react-item" type="button" aria-label="React with {emoji}" onclick={() => pick(emoji)}>{emoji}</button>
-        {/each}
-      {/if}
-    </div>
+    <EmotePicker onpick={(text) => pick(text)} />
   </div>
 {/if}
 
@@ -1169,6 +1144,7 @@
     flex-direction: column;
     width: 300px;
     max-width: calc(100vw - 16px);
+    height: min(380px, 60vh);
     padding: 6px;
     background: var(--bg-secondary);
     border: 1px solid var(--border);
@@ -1176,8 +1152,7 @@
     box-shadow: var(--shadow-menu);
   }
 
-  .react-quick,
-  .react-tabs {
+  .react-quick {
     display: flex;
     gap: 2px;
     padding-bottom: 4px;
@@ -1185,16 +1160,8 @@
     border-bottom: 1px solid var(--border);
   }
 
-  .react-grid {
-    display: grid;
-    grid-template-columns: repeat(8, 1fr);
-    gap: 2px;
-    max-height: 180px;
-    overflow-y: auto;
-  }
-
-  .react-item,
-  .react-tab {
+  .react-item {
+    flex: 1;
     min-width: 32px;
     min-height: 32px;
     padding: 0;
@@ -1206,19 +1173,8 @@
     cursor: pointer;
   }
 
-  .react-tab {
-    opacity: 0.6;
-  }
-
-  .react-tab.active {
-    opacity: 1;
-    background: var(--bg-tertiary);
-  }
-
   .react-item:hover,
-  .react-item:focus-visible,
-  .react-tab:hover,
-  .react-tab:focus-visible {
+  .react-item:focus-visible {
     background: var(--bg-hover);
   }
 </style>

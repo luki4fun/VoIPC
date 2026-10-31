@@ -17,13 +17,14 @@
   import { tick, untrack } from "svelte";
   import { channels } from "../stores/channels.js";
   import { uiPrefs } from "../stores/ui-prefs.js";
-  import { serverAddress, serverKey, userId, username } from "../stores/connection.js";
+  import { isAdmin, serverAddress, serverKey, userId, username } from "../stores/connection.js";
   import { addNotification } from "../stores/notifications.js";
   import { confirmAction } from "../stores/confirm.js";
   import { get } from "svelte/store";
   import { account, accountHex } from "../stores/account.js";
   import { users } from "../stores/users.js";
-  import { emoteSets, noteEmotes } from "../stores/emotes.js";
+  import { emoteLimits, emoteSets, noteEmotes, pendingImport } from "../stores/emotes.js";
+  import { showAdminPanel } from "../stores/admin-ui.js";
   import { EMOTE_TOKEN, isEmoteReaction, stickerText, tokenize } from "../emote-rules.js";
   import { expiryFor, messageRefs, pinnedOf, rowKey, sameRow, splitChatKey, type ChatPlace } from "../chat-rules.js";
   import { threadView } from "../thread-rules.js";
@@ -31,11 +32,13 @@
   import { fetchFile, fileLimits, sendFile } from "../files.js";
   import { linkFacts, mentionNames as mentionNamesOf, plainText } from "../markdown.js";
   import { rosterOf } from "../roster-rules.js";
+  import { awayHint, liveIdOf, reach } from "../dm-rules.js";
   import { prepare } from "../image-prep.js";
   import { sealedLen } from "../file-rules.js";
   import {
     addDmMessage,
     applyDmEvent,
+    attachDm,
     dmConversations,
     activeDmUserId,
     activeDmUsername,
@@ -117,6 +120,18 @@
   }
 
   let isDmMode = $derived($activeDmUserId !== null);
+  /** The direct conversation on screen, by the name it is filed under: what
+   *  stays the same when its person comes back under a new id. */
+  const dmName = $derived(isDmMode ? $activeDmUsername : null);
+  const dmRow = $derived(dmName === null ? undefined : $dmConversations.find((c) => c.username === dmName));
+  /** Their id now, when they are on a list we see (dm-rules.ts). */
+  const dmSeenId = $derived(dmName === null ? undefined : liveIdOf(dmName, $users, $channelRosters));
+  const dmReach = $derived(isDmMode ? reach($activeDmUserId ?? 0, dmSeenId, dmRow?.account, !!$account?.cloud) : "live");
+  // An archived conversation's person is here: theirs from now on
+  $effect(() => {
+    const [server, name, id] = [$serverAddress, dmName, dmSeenId];
+    if (name !== null && id !== undefined && ($activeDmUserId ?? 0) < 0) untrack(() => attachDm(server, name, id));
+  });
 
   // The channel whose chat is on screen: a preview, then the text channel the
   // user opened, then the channel they stand in. `displayChannelId` and
@@ -198,7 +213,7 @@
       : null,
   );
   /** Whether this conversation can be written in, answers included. */
-  let canAnswer = $derived(isDmMode || (canSendChannelMessage && block?.kind !== "announce"));
+  let canAnswer = $derived(isDmMode ? dmReach !== "readonly" : canSendChannelMessage && block?.kind !== "announce");
   // Raw: a $state proxy of a message is never === the message itself, and
   // these are looked up in the conversation by identity
   let replyingTo = $state.raw<ChatMessage | null>(null);
@@ -220,7 +235,7 @@
   $effect(() => {
     void $serverAddress;
     void $displayChannelId;
-    void $activeDmUserId;
+    void dmName;
     replyingTo = null;
     threadRoot = null;
   });
@@ -430,7 +445,7 @@
     if (messagesContainer) messagesContainer.scrollTop = messagesContainer.scrollHeight;
   }
   $effect.pre(() => {
-    const conversation = `${$serverAddress}|${$displayChannelId}|${$activeDmUserId}`;
+    const conversation = `${$serverAddress}|${$displayChannelId}|${dmName}`;
     const last = displayMessages.at(-1);
     const end = `${displayMessages.length}|${last?.id ?? last?.timestamp ?? ""}`;
     const switched = conversation !== followedConversation;
@@ -515,8 +530,7 @@
     const server = $serverAddress;
     if (isDmMode) {
       const peer = $activeDmUserId ?? 0;
-      const away = peer < 0 ? $dmConversations.find((c) => c.user_id === peer) : undefined;
-      return { server, dm: { peer, name: $activeDmUsername, away: away?.account } };
+      return { server, dm: { peer, name: $activeDmUsername, away: peer < 0 ? dmRow?.account : undefined } };
     }
     return { server, channelId: $displayChannelId };
   }
@@ -542,6 +556,9 @@
    * which joins the thread of what it answers, if that is in one.
    */
   async function sendMessage(content: string, refs?: { replyTo: string; thread: string }, file?: FileRef) {
+    // Your own message is followed to, from wherever you had scrolled (not
+    // one into a thread: the list under the pane stays where it was)
+    if (!refs) atEnd = true;
     const answering = replyingTo;
     replyingTo = null;
     const replyTo = refs?.replyTo ?? answering?.id ?? null;
@@ -572,6 +589,8 @@
       // channel's own, or for a direct message the one this user set for that
       // person. Zero is no timer, which the backend reads as none.
       if ("dm" in t) {
+        // Their row stands under the id this goes to, so our echo is filed there
+        if (t.dm.peer > 0) attachDm(server, t.dm.name, t.dm.peer);
         const ttlSecs = capped(dmMessageTtl(server, t.dm.name));
         if (t.dm.away) {
           // They are away: the server's copy is the one way it reaches them,
@@ -639,6 +658,7 @@
     const t = targetNow();
     const conv = fileConvOf(t);
     if (!conv) throw new Error("Files cannot be sent to them now");
+    if (!refs) atEnd = true;
     const answering = refs ? null : replyingTo;
     const ready = await prepare(file, original);
     const max = get(fileLimits.peek(t.server))?.max_bytes;
@@ -684,7 +704,22 @@
     const forward = (m: ChatMessage) => {
       if (m.kind !== "shared") forwarding = { m, from: fileConv, server: $serverAddress };
     };
-    if (!canAnswer || held) return { forward };
+    // Its picture as the importer's first row: the file itself, which the
+    // importer sanitizes and shows before anything goes up
+    const makeEmote =
+      $isAdmin && $emoteLimits
+        ? async (m: ChatMessage) => {
+            const server = $serverAddress;
+            try {
+              const bytes = await fetchFile(server, fileConv ?? { channel: 0 }, m.file!);
+              pendingImport.set({ server, name: m.file!.name, bytes });
+              showAdminPanel.set(true);
+            } catch (e) {
+              addNotification(`The picture could not be loaded: ${String(e).replace(/^Error: /, "")}`, "error");
+            }
+          }
+        : undefined;
+    if (!canAnswer || held) return { forward, makeEmote };
     // The conversation these messages are in, read now: a delete is sent
     // after its question is answered, by when another one may be on screen
     const t = targetNow();
@@ -698,6 +733,7 @@
       remove: (m) => sendEvent(t, { kind: "delete", target: m.id! }, m),
       // A pin counts only from a manager, which every reader checks
       pin: !isDmMode && isManager ? (m, on) => sendEvent(t, { kind: "pin", target: m.id!, on }, m) : undefined,
+      makeEmote,
     };
   });
 
@@ -730,9 +766,13 @@
       });
     }
     for (const c of $dmConversations) {
-      const away = c.user_id < 0 ? c.account : undefined;
-      if (c.user_id < 0 && !away) continue;
-      out.push({ key: `d${c.user_id}`, label: `@${shortName(c.username)}`, target: { server, dm: { peer: c.user_id, name: c.username, away } } });
+      // Keyed by name, as the sidebar's rows (dm-rules `listRows`)
+      if (out.some((d) => d.key === `d${c.username}`)) continue;
+      const seen = c.user_id > 0 ? undefined : liveIdOf(c.username, $users, $channelRosters);
+      const r = reach(c.user_id, seen, c.account, !!$account?.cloud);
+      if (r === "readonly") continue;
+      const dm = { peer: seen ?? c.user_id, name: c.username, away: r === "kept" ? c.account : undefined };
+      out.push({ key: `d${c.username}`, label: `@${shortName(c.username)}`, target: { server, dm } });
     }
     return out;
   });
@@ -787,10 +827,17 @@
   }
 
   /** Files dropped on the conversation go to its composer, which stages them. */
+  /** Files held over the chat: it says it takes them before they are let go. */
+  let dragging = $state(false);
   function dropFiles(e: DragEvent) {
     if (!e.dataTransfer?.types.includes("Files") || !canSendFiles) return;
     e.preventDefault();
+    dragging = e.type === "dragover";
     if (e.type === "drop") composer?.addFiles(e.dataTransfer.files);
+  }
+  function leaveDrag(e: DragEvent) {
+    const into = e.relatedTarget as Node | null;
+    if (!into || !(e.currentTarget as HTMLElement).contains(into)) dragging = false;
   }
   const canSendFiles = $derived(!!$fileLimits && fileConv !== null);
 
@@ -818,6 +865,19 @@
     }
   }
 
+  /** What "away" means for this conversation, on the header's tag. */
+  const awayTitle = $derived(awayHint(shortName($activeDmUsername), dmReach));
+
+  /** Why nothing can be written to them now (`dmReach` "readonly"). */
+  const readOnlyWhy = $derived.by(() => {
+    const why = !dmRow?.account
+      ? "they have no account here"
+      : !$account
+        ? "you're not signed in here"
+        : "your cloud copies are off here";
+    return `You can write to ${shortName($activeDmUsername)} when they're back — ${why}, so nothing can be kept for them.`;
+  });
+
   // The server's copy of this conversation, where this account keeps one:
   // clearing can delete what we wrote there too (1.0, A6)
   let showClearMenu = $state(false);
@@ -826,8 +886,7 @@
     if (!me?.cloud) return null;
     if (!isDmMode) return effectiveChannel?.log || null;
     const peer =
-      $dmConversations.find((c) => c.user_id === $activeDmUserId)?.account ??
-      ((a) => (a ? accountHex(a) : undefined))($users.find((u) => u.user_id === $activeDmUserId)?.account);
+      dmRow?.account ?? ((a) => (a ? accountHex(a) : undefined))($users.find((u) => u.user_id === $activeDmUserId)?.account);
     if (!peer) return null;
     const [lo, hi] = [accountHex(me.info.id), peer].sort();
     return `d:${lo}:${hi}`;
@@ -865,7 +924,10 @@
   <div class="chat-header" class:custom={headerExtra}>
     {#if isDmMode}
       <button aria-label="Back to channel chat" class="back-btn" onclick={backToChannel} title="Back to channel chat"><Icon name="arrow-left" size={16} /></button>
-      <span class="chat-title" title={$activeDmUsername}>DM with {shortName($activeDmUsername)}</span>
+      <span class="chat-title" title={$activeDmUsername}><span class="chat-title-text">DM with {shortName($activeDmUsername)}</span></span>
+      {#if dmReach !== "live"}
+        <span class="ttl-label" title={awayTitle}>away</span>
+      {/if}
       {#if totalUnreadChannels > 0}
         <span class="unread-badge" title="Unread channel messages">{totalUnreadChannels}</span>
       {/if}
@@ -877,7 +939,8 @@
         <!-- Channel 0 is "not in voice", not a channel: it has no name to show -->
         <!-- The channel's own kind: a voice channel's chat is not a # channel -->
         <span class="chat-title"
-          ><Icon name={effectiveChannel && !effectiveChannel.text ? "volume" : "hash"} size={14} /> {channelName}</span
+          ><Icon name={effectiveChannel && !effectiveChannel.text ? "volume" : "hash"} size={14} />
+          <span class="chat-title-text" title={channelName}>{channelName}</span></span
         >
       {/if}
       {#if $isPreviewing}
@@ -1006,7 +1069,10 @@
 
   <div class="chat-body">
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="chat-main" ondragover={dropFiles} ondrop={dropFiles}>
+  <div class="chat-main" ondragover={dropFiles} ondrop={dropFiles} ondragleave={leaveDrag}>
+  {#if dragging}
+    <div class="drop-zone" aria-hidden="true"><Icon name="paperclip" size={20} /> Drop to attach</div>
+  {/if}
   <div class="messages" bind:this={messagesContainer} onscroll={onMessagesScroll}>
     {#if !isDmMode && isLobby}
       <div class="empty-state">Open a text channel to chat</div>
@@ -1058,14 +1124,21 @@
     {/if}
   </div>
 
-  {#if isDmMode}
+  {#if isDmMode && dmReach === "readonly"}
+    <div class="preview-footer post-block">
+      <Icon name="lock" size={14} /> {readOnlyWhy}
+    </div>
+  {:else if isDmMode}
     <Composer
       bind:this={composer}
-      placeholder={`Message ${shortName($activeDmUsername)}...`}
+      placeholder={dmReach === "kept"
+        ? `Message ${shortName($activeDmUsername)} — kept on the server for them`
+        : `Message ${shortName($activeDmUsername)}…`}
       mentionables={mentionOthers}
-      conversation={`${$serverAddress}|dm|${$activeDmUserId}`}
+      conversation={`${$serverAddress}|dm|${dmName}`}
       onsend={sendMessage}
       onsendfile={canSendFiles ? sendFileMessage : undefined}
+      maxBytes={$fileLimits?.max_bytes}
       onsticker={$emoteSets.stickers ? (e) => sendMessage(stickerText(e)) : undefined}
       replying={replyingTo?.username ?? null}
       oncancelreply={() => (replyingTo = null)}
@@ -1083,6 +1156,7 @@
       {held}
       onsend={sendMessage}
       onsendfile={canSendFiles ? sendFileMessage : undefined}
+      maxBytes={$fileLimits?.max_bytes}
       onsticker={$emoteSets.stickers ? (e) => sendMessage(stickerText(e)) : undefined}
       replying={replyingTo?.username ?? null}
       oncancelreply={() => (replyingTo = null)}
@@ -1270,6 +1344,11 @@
     color: var(--text-secondary);
     border-bottom: 1px solid var(--border);
   }
+  /* Only the name gives way: at a large font scale the tools at the end were
+     pushed off a phone's screen */
+  .chat-header > * {
+    flex-shrink: 0;
+  }
 
   .chat-title {
     color: var(--text-primary);
@@ -1277,6 +1356,16 @@
     display: flex;
     align-items: center;
     gap: 4px;
+  }
+  .chat-header > .chat-title {
+    flex-shrink: 1;
+    min-width: 0;
+  }
+  .chat-title-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .back-btn {
@@ -1382,10 +1471,35 @@
   }
 
   .chat-main {
+    position: relative;
     flex: 1;
     min-width: 0;
     display: flex;
     flex-direction: column;
+  }
+  /* Ink, not mint: a place to put something is not something live */
+  .drop-zone {
+    position: absolute;
+    inset: 8px;
+    z-index: var(--z-raised);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--sp-2);
+    font-size: var(--fs-md);
+    font-weight: 600;
+    color: var(--text-primary);
+    background: color-mix(in srgb, var(--bg-primary) 88%, transparent);
+    border: 2px dashed var(--text-muted);
+    border-radius: var(--r-md);
+    pointer-events: none;
+  }
+  /* Before Chrome 111 (no color-mix): solid. After the rule, as in
+     Lightbox.svelte: with var() inside, color-mix parses and would win */
+  @supports not (background: color-mix(in srgb, red 50%, blue)) {
+    .drop-zone {
+      background: var(--bg-primary);
+    }
   }
 
   .chat-body > :global(.thread-pane),

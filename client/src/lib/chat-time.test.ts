@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { dayKey, dayLabel } from "./chat-time.ts";
+import { dayKey, dayLabel, msToMidnight } from "./chat-time.ts";
 
 const NOON = new Date(2026, 9, 26, 12, 0, 0).getTime();
 const HOUR = 3_600_000;
@@ -20,4 +20,11 @@ test("older days get their date, and a year only when it is another one", () => 
   assert.ok(!/2026/.test(lastWeek), lastWeek);
   const lastYear = dayLabel(new Date(2025, 0, 3, 10).getTime(), NOON, "en-GB");
   assert.ok(/2025/.test(lastYear), lastYear);
+});
+
+test("midnight is counted from now in local time", () => {
+  const evening = new Date(2026, 9, 31, 23, 59, 0).getTime();
+  assert.equal(msToMidnight(evening), 60_000);
+  const midnight = new Date(2026, 5, 10, 0, 0, 0).getTime(); // no clock change that day
+  assert.equal(msToMidnight(midnight), 24 * 3600_000);
 });

@@ -26,6 +26,7 @@
   import { availableUpdate, checkForUpdate, checkUpdates, installUpdate, updateBusy, updatesSupported } from "../stores/updates.js";
   import { updateFits } from "../update-rules.js";
   import { voice } from "../stores/channels.js";
+  import { forgetEmotes } from "../stores/emotes.js";
 
   // Invite link pasted here: takes host/port from it and joins the channel
   // right after connecting (App.svelte watches pendingInvite)
@@ -288,6 +289,7 @@
         port: s.port,
       });
       savedServers.set(list);
+      forgetEmotes(serverId(s.host, s.port));
     } catch (err) {
       error = String(err);
     }

@@ -167,12 +167,43 @@ pub(crate) fn bttv_listing(json: &Value) -> Listing {
     out
 }
 
-/// The id a 7TV address ends with (or the id itself), and whether it names
-/// one emote (`7tv.app/emotes/<id>`) rather than a set.
-pub(crate) fn seventv_id(input: &str) -> Option<(String, bool)> {
+/// What a 7TV address names.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum SevenTv {
+    /// An emote set (`7tv.app/emote-sets/<id>`, or the id alone).
+    Set,
+    /// One emote (`7tv.app/emotes/<id>`).
+    Emote,
+    /// A user (`7tv.app/users/<id>`): their set in use.
+    User,
+}
+
+/// The id a 7TV address ends with (or the id itself), and what it names.
+pub(crate) fn seventv_id(input: &str) -> Option<(String, SevenTv)> {
     let path = input.trim().split(['?', '#']).next()?.trim_end_matches('/');
     let (rest, id) = path.rsplit_once('/').unwrap_or(("", path));
-    plain_id(id).then(|| (id.to_owned(), rest.ends_with("/emotes")))
+    let what = if rest.ends_with("/emotes") {
+        SevenTv::Emote
+    } else if rest.ends_with("/users") {
+        SevenTv::User
+    } else {
+        SevenTv::Set
+    };
+    plain_id(id).then(|| (id.to_owned(), what))
+}
+
+/// The set a 7TV user (`/v3/users/<id>`) has in use: their Twitch one, else
+/// any platform's.
+pub(crate) fn seventv_user_set(json: &Value) -> Option<String> {
+    let sets = json["connections"].as_array()?;
+    fn of(c: &Value) -> Option<&str> {
+        c["emote_set_id"].as_str().filter(|id| plain_id(id))
+    }
+    sets.iter()
+        .find(|c| c["platform"] == "TWITCH")
+        .and_then(of)
+        .or_else(|| sets.iter().find_map(of))
+        .map(str::to_owned)
 }
 
 /// Fetch `source`'s pictures: "discord" (`id` a server id, `token` its
@@ -231,7 +262,11 @@ mod desktop {
         }
         let mut req = c.get(u);
         if let Some(a) = auth {
-            req = req.header(reqwest::header::AUTHORIZATION, a);
+            // Sensitive: never printed by reqwest's or hyper's own logging
+            let mut value = reqwest::header::HeaderValue::from_str(a)
+                .map_err(|_| "a token is one line of plain characters".to_string())?;
+            value.set_sensitive(true);
+            req = req.header(reqwest::header::AUTHORIZATION, value);
         }
         let mut res = req.send().await.map_err(|e| e.without_url().to_string())?;
         let status = res.status();
@@ -287,9 +322,18 @@ mod desktop {
                 )
             }
             "7tv" => {
-                let (id, one) =
-                    seventv_id(id).ok_or("a 7TV emote's or emote set's address, or a set's id")?;
-                if one {
+                let (id, what) = seventv_id(id)
+                    .ok_or("a 7TV emote's, emote set's or user's address, or a set's id")?;
+                // A user's address: the set they use
+                let id = if what == SevenTv::User {
+                    let user = json(
+                        get(&c, &format!("https://7tv.io/v3/users/{id}"), None, MAX_JSON).await?,
+                    )?;
+                    seventv_user_set(&user).ok_or("that 7TV user has no emote set in use")?
+                } else {
+                    id
+                };
+                if what == SevenTv::Emote {
                     let e = json(
                         get(
                             &c,
@@ -361,10 +405,12 @@ mod desktop {
             "skipped": listing.skipped.iter().map(|(n, w)| serde_json::json!({ "name": n, "why": w })).collect::<Vec<_>>(),
         })
         .to_string();
-        let mut out = (head.len() as u32).to_le_bytes().to_vec();
+        // Each file let go once it is in the answer: one copy at a time, not two
+        let mut out = Vec::with_capacity(4 + head.len() + total);
+        out.extend_from_slice(&(head.len() as u32).to_le_bytes());
         out.extend_from_slice(head.as_bytes());
-        for (_, b) in &files {
-            out.extend_from_slice(b);
+        for (_, b) in files {
+            out.extend_from_slice(&b);
         }
         Ok(out)
     }
@@ -459,7 +505,7 @@ mod tests {
             ]
         );
         assert_eq!(l.skipped.len(), 1);
-        let set = |id: &str| Some((id.to_owned(), false));
+        let set = |id: &str| Some((id.to_owned(), SevenTv::Set));
         assert_eq!(
             seventv_id("https://7tv.app/emote-sets/01HKQT8EWR000ESSWF3625XCS4/"),
             set("01HKQT8EWR000ESSWF3625XCS4")
@@ -477,9 +523,30 @@ mod tests {
         );
         assert_eq!(
             seventv_id("https://7tv.app/emotes/01F5VW2TKR0003RCV2Z6JBHCST"),
-            Some(("01F5VW2TKR0003RCV2Z6JBHCST".to_owned(), true)),
+            Some(("01F5VW2TKR0003RCV2Z6JBHCST".to_owned(), SevenTv::Emote)),
             "one emote's address"
         );
+        assert_eq!(
+            seventv_id("https://7tv.app/users/01FE9DRF000009TR6M9N941CYW"),
+            Some(("01FE9DRF000009TR6M9N941CYW".to_owned(), SevenTv::User)),
+            "a user's address"
+        );
+        // A user, as /v3/users/<id> answered (2026-10-30, trimmed): the Twitch set
+        let user = serde_json::json!({
+            "id": "01FE9DRF000009TR6M9N941CYW",
+            "connections": [
+                { "platform": "KICK", "emote_set_id": "01KICKSET" },
+                { "platform": "TWITCH", "emote_set_id": "01J9MMS2R800036CR40E1041ED" },
+            ],
+        });
+        assert_eq!(
+            seventv_user_set(&user).as_deref(),
+            Some("01J9MMS2R800036CR40E1041ED")
+        );
+        let kick_only = serde_json::json!({ "connections": [{ "platform": "KICK", "emote_set_id": "01KICKSET" }] });
+        assert_eq!(seventv_user_set(&kick_only).as_deref(), Some("01KICKSET"));
+        let bad = serde_json::json!({ "connections": [{ "platform": "TWITCH", "emote_set_id": "../x" }] });
+        assert_eq!(seventv_user_set(&bad), None, "only an id goes into a path");
         // One emote, as 7TV's /v3/emotes/<id> answers, reads as a set of one
         let one = serde_json::json!({ "name": "catKISS", "host": { "url": "//cdn.7tv.app/emote/01F5VW2TKR0003RCV2Z6JBHCST", "files": [{ "name": "2x.webp" }, { "name": "2x.gif" }] } });
         let l = seventv_listing(

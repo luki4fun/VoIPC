@@ -167,7 +167,7 @@ export class Pace {
  * an upload 30 s idle to a member queued behind it. shortcut: the pacing
  * factor is a fixed ½; upgrade to delay-based if a measurement says so.
  */
-async function yieldToVoice(inCall: boolean, chunkStarted: number): Promise<void> {
+export async function yieldToVoice(inCall: boolean, chunkStarted: number): Promise<void> {
   if (inCall) await sleep(Math.min(performance.now() - chunkStarted, CALL_GAP_MAX_MS));
 }
 
@@ -603,14 +603,21 @@ export function cacheList(): { cap: number; entries: { hash: string; bytes: numb
 
 /** Let go of these blobs now: the media manager's "remove". */
 export function cacheRemove(hashes: readonly string[]): void {
-  for (const h of hashes) cacheDelete(h);
+  for (const h of hashes) forget(h);
+}
+
+/** A blob let go of on purpose, and what was made of it: a removed picture
+ *  must not go on showing from memory. */
+function forget(hash: string): void {
+  cacheDelete(hash);
+  for (const k of made.keys()) if (k.startsWith(`${hash}:`)) made.delete(k);
 }
 
 /** Let go of every blob but `keep` that has not been used for a while. */
 export function cacheRetain(keep: Set<string>): void {
   const now = Date.now();
   for (const [hash, k] of [...cache]) {
-    if (!keep.has(hash) && now - k.lastUsed >= RETAIN_GRACE_MS) cacheDelete(hash);
+    if (!keep.has(hash) && now - k.lastUsed >= RETAIN_GRACE_MS) forget(hash);
   }
 }
 
@@ -624,6 +631,10 @@ function whole(bytes: Uint8Array): ArrayBuffer {
 
 /** Workers at once: each holds a wasm instance of some three times its file. */
 const MAX_WORKERS = 2;
+/** Jobs that read a picture (or a pack of them) somebody else made, and how
+ *  long one may take. */
+const PICTURE_JOBS = new Set(["image", "sanitize", "pack", "strip"]);
+const PICTURE_TIME_MS = 30_000;
 let workers = 0;
 const waitingForWorker: (() => void)[] = [];
 
@@ -637,8 +648,12 @@ async function inWorker<T>(job: Record<string, unknown>, give?: Uint8Array): Pro
   if (workers >= MAX_WORKERS) await new Promise<void>((r) => waitingForWorker.push(r));
   workers++;
   const worker = new Worker(new URL("./file-worker.ts", import.meta.url), { type: "module" });
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
     return await new Promise<T>((resolve, reject) => {
+      // A picture's budgets bound its work, and this bounds whatever they
+      // miss: ended, the worker frees its place for the next job
+      if (PICTURE_JOBS.has(String(job.op))) timer = setTimeout(() => reject(new Error("the picture took too long to read")), PICTURE_TIME_MS);
       worker.onmessage = (e: MessageEvent) => {
         const { ok, error } = e.data ?? {};
         if (!error) return resolve(ok as T);
@@ -651,6 +666,7 @@ async function inWorker<T>(job: Record<string, unknown>, give?: Uint8Array): Pro
       worker.postMessage({ module: wasmModule(), ...job, give }, give ? [give.buffer] : []);
     });
   } finally {
+    clearTimeout(timer);
     worker.terminate();
     workers--;
     waitingForWorker.shift()?.();
@@ -724,7 +740,9 @@ export async function fetchFile(
 
 /** file_image: a picture file as the PNG it may be shown as, opened and
  *  sanitized in one worker job (media.ts): its own bytes never reach the page.
- *  Fetched first where this tab does not keep it. */
+ *  Fetched first where this tab does not keep it. Framed as the desktop
+ *  app's (files.rs `file_image`): a JSON head saying why a moving picture
+ *  stands still when it does, its length first, then the PNG. */
 export async function fileImage(
   files: Files | null,
   server: string,
@@ -732,7 +750,19 @@ export async function fileImage(
   file: FileArg,
   profile: number,
   op?: string,
+  still = false,
 ): Promise<ArrayBuffer> {
+  // The first frame alone where the person wants nothing to move
+  // A copy: what is kept here stays the cache's
+  const pick = (m: Sanitized) => framePicture((still && m.still) || m.png, stilledOf(m));
+  const motion = files?.motion ?? null;
+  const key = `${file.hash}:${file.key}-${profile}-${motion?.side}-${motion?.keepMb}`;
+  const hit = made.get(key);
+  if (hit) {
+    made.delete(key);
+    made.set(key, hit);
+    return pick(hit);
+  }
   let blob = cacheGet(file.hash);
   if (!blob) {
     await fetchFile(files, server, conv, file, op);
@@ -740,13 +770,51 @@ export async function fileImage(
     if (!blob) throw new Error("The file is not on this device");
   }
   const media = await mediaModule();
-  return whole(await inWorker<Uint8Array>({ op: "image", ...file, blob, profile, media, motion: files?.motion ?? null }));
+  const out = await inWorker<Sanitized>({ op: "image", ...file, blob, profile, media, motion });
+  made.set(key, out);
+  let bytes = [...made.values()].reduce((n, m) => n + m.png.length + (m.still?.length ?? 0), 0);
+  for (const [k, m] of made) {
+    if (bytes <= MADE_BYTES || made.size <= 1) break;
+    made.delete(k);
+    bytes -= m.png.length + (m.still?.length ?? 0);
+  }
+  return pick(out);
 }
+
+/** Why a moving picture stands still, when it does (voipc-media
+ *  `Clean::stilled`, set exactly when `trimmed` left it one frame): the
+ *  crate's own words where the worker hands them on, else its words for a
+ *  frame too big. */
+function stilledOf(m: Sanitized & { stilled?: string | null }): string | null {
+  return m.stilled || (m.frames === 1 && m.trimmed ? "the animation is too big to play here" : null);
+}
+
+/** `png` behind a JSON head of `{ stilled }`, its length first (4 bytes
+ *  little-endian): what `file_image` answers, here as in the desktop app. */
+function framePicture(png: Uint8Array, stilled: string | null): ArrayBuffer {
+  const head = new TextEncoder().encode(JSON.stringify({ stilled }));
+  const out = new Uint8Array(4 + head.length + png.length);
+  new DataView(out.buffer).setUint32(0, head.length, true);
+  out.set(head, 4);
+  out.set(png, 4 + head.length);
+  return out.buffer;
+}
+
+/** Chat pictures made lately, by file and how (files.rs `file_image`'s
+ *  twin): cards come and go as a channel scrolls, and making one again is a
+ *  decrypt and a sanitize. Oldest first. */
+const made = new Map<string, Sanitized>();
+const MADE_BYTES = 64 << 20;
 
 /** Any picture `bytes` (one picked from this device, an emote's) as `profile`,
  *  sanitized in a worker. */
 export async function sanitizeImage(bytes: Uint8Array, profile: number, maxOut = 0): Promise<Sanitized> {
   return inWorker<Sanitized>({ op: "sanitize", bytes, profile, maxOut, media: await mediaModule() });
+}
+
+/** Any picture `bytes` without their metadata, in a worker (voipc-media `strip`). */
+export async function stripImage(bytes: Uint8Array): Promise<Uint8Array> {
+  return inWorker<Uint8Array>({ op: "strip", bytes, media: await mediaModule() });
 }
 
 /** The files of a .zip or .wastickers an admin picked, read in a worker. */

@@ -21,7 +21,7 @@ import { audio } from "./audio";
 import { video } from "./video";
 import { share } from "./share";
 import { Files, originOf, sanitizeImage } from "./files";
-import { Emotes } from "./emotes";
+import { Emotes, emoteLimitsOf } from "./emotes";
 import { motionOf } from "./media";
 
 /** Bound for the authentication response (network.rs CONNECT_TIMEOUT). */
@@ -621,16 +621,14 @@ export class Session implements SessionContext, AccountHost {
         this.emotes = new Emotes(
           this,
           originOf(this.server),
-          b.emotes
-            ? { token: String(b.emotes.token), max_emote_bytes: Number(b.emotes.max_emote_bytes), max_sticker_bytes: Number(b.emotes.max_sticker_bytes) }
-            : null,
+          b.emotes ? { token: String(b.emotes.token), ...emoteLimitsOf(b.emotes) } : null,
           sanitizeImage,
         );
         // network.rs emits the same, for the composer
         this.emit("file-limits", b.files ? { max_bytes: Number(b.files.max_bytes) } : null);
         this.emit(
           "emote-limits",
-          b.emotes ? { max_emote_bytes: Number(b.emotes.max_emote_bytes), max_sticker_bytes: Number(b.emotes.max_sticker_bytes) } : null,
+          b.emotes ? emoteLimitsOf(b.emotes) : null,
         );
         if (b.accounts) this.emit("relay-accounts", b.accounts);
         // An account sign-in ends signed in to that account, or not at all

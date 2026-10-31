@@ -20,10 +20,13 @@ export interface ConfirmRequest {
   cancel?: string;
   /** Red for destroying; the accent for a risky-but-not-destructive yes. */
   danger?: boolean;
+  /** A box to tick with the answer ("Don't ask again for this server"),
+   *  unticked at first; `confirmChoice` hands back how it was left. */
+  option?: string;
 }
 
 interface Pending extends ConfirmRequest {
-  resolve: (ok: boolean) => void;
+  resolve: (ok: boolean, option: boolean) => void;
 }
 
 export const pendingConfirm = writable<Pending | null>(null);
@@ -33,16 +36,27 @@ export const pendingConfirm = writable<Pending | null>(null);
 export function confirmAction(request: ConfirmRequest): Promise<boolean> {
   return new Promise((resolve) => {
     pendingConfirm.update((open) => {
-      open?.resolve(false);
-      return { ...request, resolve };
+      open?.resolve(false, false);
+      return { ...request, resolve: (ok) => resolve(ok) };
     });
   });
 }
 
-/** The dialog's answer. */
-export function answerConfirm(ok: boolean): void {
+/** `confirmAction` with its `option` box: the answer, and whether the box
+ *  was ticked. */
+export function confirmChoice(request: ConfirmRequest & { option: string }): Promise<{ ok: boolean; option: boolean }> {
+  return new Promise((resolve) => {
+    pendingConfirm.update((open) => {
+      open?.resolve(false, false);
+      return { ...request, resolve: (ok, option) => resolve({ ok, option }) };
+    });
+  });
+}
+
+/** The dialog's answer, and its box where it has one. */
+export function answerConfirm(ok: boolean, option = false): void {
   pendingConfirm.update((open) => {
-    open?.resolve(ok);
+    open?.resolve(ok, option);
     return null;
   });
 }

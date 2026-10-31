@@ -177,11 +177,45 @@
   box-sizing: border-box;
 }
 
+/* The emoji the app offers (the picker, `:name:`, quick reactions), drawn
+   where the system has no picture for one: Windows 10 has none for anything
+   newer than its font (🤌 was a box). Last in the body's list, after the
+   systems' own emoji fonts, so everywhere else emoji keep the system's look;
+   unicode-range keeps it from loading until a page needs one of these.
+   A subset of Noto Color Emoji 2.055 (COLRv1, SIL OFL 1.1, Google;
+   fonts/OFL-NotoColorEmoji.txt) from google/fonts ofl/notocoloremoji, made with
+     pyftsubset NotoColorEmoji-Regular.ttf --text-file=<the app's emoji>
+       --unicodes=U+FE0F,U+200D,U+20E3 --layout-features='*'
+       --drop-tables+=SVG,vhea,vmtx --no-hinting --flavor=woff2
+   An emoji added to emoji.ts needs the font made again: emoji-font.test.ts
+   fails until its code points are in the range below. */
+@font-face {
+  font-family: "VoIPC Emoji";
+  src: url("/fonts/voipc-emoji.woff2") format("woff2");
+  font-display: swap;
+  unicode-range:
+    U+200D,U+20E3,U+2328,U+2600-2601,U+2615,U+2618,U+261D,U+2620,U+2665,U+2699,U+26C5,
+    U+26C8,U+270A-270C,U+2728,U+2744,U+2764,U+2B50,U+1F308,U+1F30A,U+1F31F,U+1F324-1F325,
+    U+1F327,U+1F329,U+1F32D-1F32F,U+1F331,U+1F334-1F335,U+1F337-1F33B,U+1F33F-1F342,
+    U+1F354-1F357,U+1F35C-1F35D,U+1F35F,U+1F363,U+1F369-1F36D,U+1F370-1F371,U+1F373,U+1F375,
+    U+1F377,U+1F37A-1F37B,U+1F37F,U+1F381-1F382,U+1F388-1F38A,U+1F3A4,U+1F3A7,U+1F3AE-1F3AF,
+    U+1F3B5-1F3B6,U+1F3C6,U+1F42D,U+1F430-1F431,U+1F435-1F436,U+1F438-1F439,U+1F43B-1F43C,
+    U+1F446-1F450,U+1F47F-1F480,U+1F48E,U+1F493-1F49F,U+1F4A1,U+1F4A3,U+1F4AA-1F4AB,U+1F4BB,
+    U+1F4F1,U+1F4F7-1F4F8,U+1F511-1F512,U+1F514,U+1F525,U+1F579,U+1F590,U+1F595-1F596,
+    U+1F5A4-1F5A5,U+1F5DD,U+1F600-1F60A,U+1F60D-1F616,U+1F618,U+1F61E-1F625,U+1F627-1F629,
+    U+1F62B-1F632,U+1F634-1F637,U+1F63B,U+1F644,U+1F64C,U+1F64F,U+1F6E0,U+1F90C-1F90F,
+    U+1F912,U+1F914-1F915,U+1F917-1F925,U+1F929,U+1F92B-1F92F,U+1F932,U+1F942-1F943,U+1F947,
+    U+1F953,U+1F95E,U+1F969,U+1F970-1F971,U+1F973-1F974,U+1F978,U+1F97A,U+1F98A,U+1F9BE,
+    U+1F9C0-1F9C3,U+1F9C7,U+1F9E1,U+1F9E8,U+1FA79;
+}
+
 body {
   /* system-ui first: on Linux that is the desktop's own UI font, where the
-     list below would otherwise land on Roboto or Arial */
+     list below would otherwise land on Roboto or Arial. The emoji fonts
+     close it, VoIPC's own last (above) */
   font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
-    "Helvetica Neue", Arial, sans-serif;
+    "Helvetica Neue", Arial, sans-serif, "Apple Color Emoji", "Segoe UI Emoji",
+    "Noto Color Emoji", "VoIPC Emoji";
   background-color: var(--bg-primary);
   color: var(--text-primary);
   overflow: hidden;
@@ -201,6 +235,8 @@ select {
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23a0a0a0' stroke-width='1.5'/%3E%3C/svg%3E");
   background-repeat: no-repeat;
   background-position: right 10px center;
+  /* Room for that chevron: the text stops before it (a component may set its own) */
+  padding: 8px 28px 8px 12px;
 }
 
 /* The one rule a palette cannot express: the chevron above is an inlined SVG
@@ -287,6 +323,13 @@ input,
 textarea,
 select {
   font-family: inherit;
+}
+
+/* The browser's own grey is 3.6:1 on the night chat; a placeholder often
+   carries the instruction ("A pack (empty: none)"), so it reads at 4.5:1 */
+::placeholder {
+  color: var(--text-muted);
+  opacity: 1;
 }
 
 input {
