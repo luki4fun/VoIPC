@@ -2,7 +2,7 @@
 
 All notable changes to VoIPC are documented here.
 
-## [1.5.0] - release candidate
+## [1.5.0] - 2026-10-31
 
 **Protocol 15: update relays and apps together.** A 1.5 app does not connect to a 1.4
 relay, and a 1.4 app does not connect to a 1.5 relay. Relays first: update the server,
