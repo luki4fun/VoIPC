@@ -852,12 +852,16 @@ export function forHandOff(m: ChatMessage): ChatMessage {
 }
 
 /** A text cut to `HISTORY_MAX_CONTENT`, never inside an emote's token (which
- *  would show as its raw start). */
+ *  would show as its raw start). Only a token's length from the end counts: a
+ *  stray "<:(" further back is text. */
 export function cutText(text: string): string {
   const cut = text.slice(0, HISTORY_MAX_CONTENT);
   const open = cut.lastIndexOf("<:");
-  return open >= 0 && cut.length < text.length && !cut.slice(open).includes(">") ? cut.slice(0, open) : cut;
+  const partial = open >= 0 && cut.length - open < TOKEN_MAX && !cut.slice(open).includes(">");
+  return partial && cut.length < text.length ? cut.slice(0, open) : cut;
 }
+/** The longest emote token: "<:", a 30-letter name, ":", 32 hex, ">" (emote-rules.ts). */
+const TOKEN_MAX = 66;
 
 /** `edited_at` as it may be kept: a plausible moment, not before the message. */
 function editedAt(v: unknown, timestamp: number, now = Date.now()): Pick<ChatMessage, "edited_at"> {

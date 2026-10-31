@@ -31,7 +31,7 @@
   import { portal } from "../../actions/portal.js";
   import { fit } from "../../actions/fit.js";
   import { nativeMenuWanted } from "../../context-menu.js";
-  import { dayKey, dayLabel, fullTime } from "../../chat-time.js";
+  import { dayKey, dayLabel, fullTime, msToMidnight } from "../../chat-time.js";
   import { mentionsName, parse, plainText } from "../../markdown.js";
   import { ambiguousTarget, findTarget, indexById, isOwn } from "../../thread-rules.js";
   import { reactionChips, rowKey, sameRow } from "../../chat-rules.js";
@@ -98,6 +98,15 @@
     fileConv = null,
     actions = {},
   }: Props = $props();
+
+  /** "Now" for the day dividers, moved on at each midnight: an open
+   *  conversation said "Today" over yesterday's messages until redrawn. */
+  let today = $state(Date.now());
+  $effect(() => {
+    // A second late: a timer may fire a moment early
+    const timer = setTimeout(() => (today = Date.now()), msToMidnight(today) + 1000);
+    return () => clearTimeout(timer);
+  });
 
   /** A loaded picture shown big. */
   let picture = $state<{ url: string; name: string; save: () => void } | null>(null);
@@ -436,7 +445,7 @@
     <div class="history-marker"><span>{msg.content}</span></div>
   {:else}
     {#if startsDay(i)}
-      <div class="day-divider" role="separator"><span>{dayLabel(msg.timestamp)}</span></div>
+      <div class="day-divider" role="separator"><span>{dayLabel(msg.timestamp, today)}</span></div>
     {/if}
     {#if msg === newFrom}
       <div class="new-divider" role="separator" bind:this={newEl}><span>New</span></div>

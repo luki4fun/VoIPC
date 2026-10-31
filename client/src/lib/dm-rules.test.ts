@@ -82,6 +82,11 @@ test("a closed row with unread messages still shows", () => {
   assert.equal(listRows([{ username: "a", unread: 0 }], dms, S, marks, null).length, 0);
 });
 
+test("two rows under one name list once", () => {
+  const rows = [{ username: "a", unread: 0 }, { username: "a", unread: 2 }];
+  assert.equal(listRows(rows, new Map(), S, new Map(), null).length, 1);
+});
+
 test("ago is short at every boundary", () => {
   const now = 1_000_000_000_000;
   assert.equal(ago(now - 59_000, now), "now");

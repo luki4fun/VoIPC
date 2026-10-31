@@ -25,6 +25,9 @@ const ANSWER_MS = 30_000;
 const REQUEST_MS = 90_000;
 /** How long a picture no open server lists stays in IndexedDB. */
 const UNLISTED_KEPT_MS = 30 * 24 * 3600 * 1000;
+const DAY_MS = 24 * 3600 * 1000;
+/** The most an emote or sticker file may be on any relay (config.rs: 1024 KB). */
+const MAX_FILE = 1024 * 1024;
 
 export interface EmoteLimits {
   max_emote_bytes: number;
@@ -136,7 +139,11 @@ export async function retain(keep: string[]): Promise<void> {
     const png = pngOf(c.value);
     const at = (c.value as Partial<Kept>)?.at ?? 0;
     if (!key.includes(`-${v}-`) || !png) c.delete();
-    else if (listed.has(key.split("-")[0])) c.update({ png, at: now } satisfies Kept);
+    // Refreshed a day at a time: every list of every server came here, and
+    // rewrote each picture to move its date
+    else if (listed.has(key.split("-")[0])) {
+      if (now - at > DAY_MS) c.update({ png, at: now } satisfies Kept);
+    }
     else if (now - at > UNLISTED_KEPT_MS) c.delete();
     c.continue();
   };
@@ -262,8 +269,9 @@ export class Emotes {
     if (!/^[0-9a-f]{64}$/.test(hash)) throw new Error("invalid hash");
     if (!this.access) throw new Error("this server has no emotes");
     const { max_emote_bytes: emote, max_sticker_bytes: stickers } = this.access;
-    // Its size where the list said it, else the most its kind may be
-    const cap = len > 0 ? len : sticker === false ? emote : sticker ? stickers : Math.max(emote, stickers);
+    // Its size where the list said it, else the most its kind may be; never
+    // past what any relay may keep (1024 KB), whatever this one says
+    const cap = Math.min(len > 0 ? len : sticker === false ? emote : sticker ? stickers : Math.max(emote, stickers), MAX_FILE);
     const [call, started] = [this.host.inCall(), performance.now()];
     // As long as the app's own request may take (files.rs REQUEST_TIME): a
     // stalled answer must not hold one of the few loading places for good

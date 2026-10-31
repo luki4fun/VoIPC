@@ -150,12 +150,13 @@ test("a relay's list is taken only as valid, once per name, and bounded", () => 
   assert.deepEqual(cleanList([...bad, pog, { ...pog, hash: H("f") }, cat]), [pog, cat], "the first of a name wins");
   const many = Array.from({ length: 450 }, (_, i) => ({ ...pog, name: `e${i}` }));
   assert.equal(cleanList(many).length, 400);
-  const odd = cleanList([{ ...pog, w: 9999, h: -3, len: 1.5 }, { ...cat, w: 9999 }]);
+  const odd = cleanList([{ ...pog, w: 9999, h: -3, len: 1.5 }, { ...cat, w: 9999 }, { ...pog, name: "wide", w: 320, h: 160 }]);
   assert.deepEqual(
     odd.map((e) => [e.w, e.h, e.len]),
     [
       [128, 0, 0],
-      [320, 320, 100],
+      [320, 10, 100],
+      [128, 64, 100],
     ],
     "a shape held to its box",
   );

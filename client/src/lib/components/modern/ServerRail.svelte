@@ -54,6 +54,10 @@
     if (!result.ok) addNotification(`${entry.name}: ${result.error}`, "error");
   }
 
+  /** Another server here goes by the same name (two ports of one host): the
+   *  two are told apart by their address, and their badges by colour. */
+  const twin = (entry: ServerEntry) => $serverEntries.some((o) => o.id !== entry.id && o.name === entry.name);
+
   function stateLabel(entry: ServerEntry): string {
     if (!entry.open) return `${entry.name} (${entry.host}:${entry.port}) — connect`;
     const state =
@@ -64,7 +68,7 @@
           : entry.inVoice
             ? "connected, in voice"
             : "connected";
-    return `${entry.name} — ${state}`;
+    return `${twin(entry) ? `${entry.name} (${entry.host}:${entry.port})` : entry.name} — ${state}`;
   }
 
   // ── Context menu ──
@@ -136,7 +140,7 @@
       aria-current={entry.active ? "true" : undefined}
     >
       <span class="pill" class:show={entry.active || entry.unread > 0}></span>
-      <span class="badge" style={avatarStyle(entry.name)}>{initials(entry.name)}</span>
+      <span class="badge" style={avatarStyle(twin(entry) ? entry.id : entry.name)}>{initials(entry.name)}</span>
       {#if entry.state === "connecting" || entry.state === "reconnecting"}
         <span class="rail-state" title={entry.state === "connecting" ? "Connecting" : "Reconnecting"}
           >…</span

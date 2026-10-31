@@ -120,7 +120,12 @@ export function listRows<T extends { username: string; unread: number }>(
   activeName: string | null,
 ): ListedRow<T>[] {
   const out: ListedRow<T>[] = [];
+  // Rows are keyed by name: a second row under a name (a relay that reused an
+  // id renamed one into it) would throw the whole list away
+  const seen = new Set<string>();
   for (const convo of rows) {
+    if (seen.has(convo.username)) continue;
+    seen.add(convo.username);
     const key = dmKeyIn(serverKey, convo.username);
     const last = lastSaid(dms.get(key) ?? []);
     const closedAt = marks.get(closeMarkKey(key));

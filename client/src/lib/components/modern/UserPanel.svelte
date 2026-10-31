@@ -182,5 +182,16 @@
       width: var(--hit);
       height: var(--hit);
     }
+    /* A finger's three buttons left a phone's drawer one letter of the name:
+       where the name has less than this, the buttons go on a row of their own */
+    .user-panel {
+      flex-wrap: wrap;
+    }
+    .me {
+      flex: 1 1 120px;
+    }
+    .panel-actions {
+      margin-left: auto;
+    }
   }
 </style>

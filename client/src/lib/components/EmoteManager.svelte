@@ -88,6 +88,10 @@
     }
     return [...by.values()].sort((a, b) => Number(a.sticker) - Number(b.sticker) || a.pack.localeCompare(b.pack));
   });
+  /** A section's whole pack, not only what the search shows: Rename, Remove
+   *  and Export under a search split a pack. */
+  const wholePack = (s: { sticker: boolean; pack: string }) =>
+    $emoteSets.emotes.filter((e) => e.sticker === s.sticker && e.pack === s.pack && !removing.has(e.name));
 
   // ── What there is ─────────────────────────────────────────────────────────
 
@@ -154,9 +158,12 @@
     try {
       const files: { name: string; bytes: Uint8Array }[] = [];
       for (const e of list) {
+        // The panel closed meanwhile: no Save dialog for a panel that is gone
+        if (gone) return;
         const bytes = await emoteFile(server, e.hash);
         files.push({ name: `${e.name}.${extOf(bytes)}`, bytes });
       }
+      if (gone) return;
       if (label) files.push({ name: "title.txt", bytes: new TextEncoder().encode(label) });
       await saveFile(storedZip(files), `${label || (list[0]?.sticker ? "stickers" : "emotes")}.zip`, "application/zip");
     } catch (err) {
@@ -231,6 +238,8 @@
     bytes?: Uint8Array;
     /** What goes up, by its SHA-256: two rows of one picture are one emote. */
     hash?: string;
+    /** Its own pack (a copy from a server with several); else the Pack field's. */
+    pack?: string;
   }
   let rows = $state<Row[]>([]);
   let addBox = $state<HTMLElement | null>(null);
@@ -356,12 +365,12 @@
 
   /** A pack's pictures, listed in place of `key` (else at the end) as
    *  "Reading…" all at once, so Add waits for every one; then made in turn. */
-  async function addPack(got: { skipped: { name: string; why: string }[]; entries: { name: string; bytes: Uint8Array }[] }, gen: number, key?: number) {
+  async function addPack(got: { skipped: { name: string; why: string }[]; entries: { name: string; bytes: Uint8Array; pack?: string }[] }, gen: number, key?: number) {
     if (gen !== generation) return;
     const keys = got.entries.map(() => nextKey++);
     const added: Row[] = [
       ...got.skipped.map((s) => skippedRow(s.name, s.why)),
-      ...got.entries.map((e, i): Row => ({ key: keys[i], source: e.name, name: "", status: "reading", note: "", include: true, bytes: e.bytes })),
+      ...got.entries.map((e, i): Row => ({ key: keys[i], source: e.name, name: "", status: "reading", note: "", include: true, bytes: e.bytes, pack: e.pack })),
     ];
     rows = key === undefined ? [...rows, ...added] : rows.flatMap((r) => (r.key === key ? added : [r]));
     for (const [i, e] of got.entries.entries()) {
@@ -448,18 +457,19 @@
     const from = copyFrom;
     const gen = generation;
     copying = true;
-    const got: { skipped: { name: string; why: string }[]; entries: { name: string; bytes: Uint8Array }[] } = { skipped: [], entries: [] };
-    for (const e of get(emoteSets.peek(from)).emotes.filter((e) => e.sticker === asSticker)) {
+    const got: { skipped: { name: string; why: string }[]; entries: { name: string; bytes: Uint8Array; pack?: string }[] } = { skipped: [], entries: [] };
+    const theirs = get(emoteSets.peek(from)).emotes.filter((e) => e.sticker === asSticker);
+    // One pack there, the same pack here (the field); several: each its own
+    const packs = new Set(theirs.map((e) => e.pack));
+    for (const e of theirs) {
       if (gen !== generation) break;
       try {
-        got.entries.push({ name: e.name, bytes: await emoteFile(from, e.hash) });
+        got.entries.push({ name: e.name, bytes: await emoteFile(from, e.hash), pack: packs.size > 1 && e.pack && !packProblem(e.pack) ? e.pack : undefined });
       } catch (err) {
         got.skipped.push({ name: e.name, why: why(err) });
       }
     }
     copying = false;
-    // One pack there, the same pack here (more than one: the field says which)
-    const packs = new Set(get(emoteSets.peek(from)).emotes.filter((e) => e.sticker === asSticker).map((e) => e.pack));
     const only = packs.size === 1 ? [...packs][0] : "";
     if (!pack && only && !packProblem(only)) pack = only;
     await addPack(got, gen);
@@ -525,7 +535,7 @@
         const r = todo[next++];
         set(r.key, { status: "uploading" });
         try {
-          await addEmote(server, r.name, asSticker, pack.trim(), r.prepared!.upload, r.prepared!.w, r.prepared!.h);
+          await addEmote(server, r.name, asSticker, (r.pack || pack).trim(), r.prepared!.upload, r.prepared!.w, r.prepared!.h);
           // Shown here at once, from what was just made of it
           void seedEmote(r.prepared!, asSticker).catch(() => {});
           set(r.key, { status: "done", note: "", bytes: undefined });
@@ -546,7 +556,11 @@
     rows = [];
     pack = "";
   }
-  onDestroy(clear);
+  let gone = false;
+  onDestroy(() => {
+    gone = true;
+    clear();
+  });
 </script>
 
 <div class="em">
@@ -600,10 +614,10 @@
               use:focusNow
               aria-label="New name for the pack {s.pack}"
               onkeydown={(ev) => {
-                if (ev.key === "Enter") finishPackRename(s.pack, s.list.map((e) => e.name), true);
+                if (ev.key === "Enter") finishPackRename(s.pack, wholePack(s).map((e) => e.name), true);
                 if (ev.key === "Escape") { ev.stopPropagation(); finishPackRename(s.pack, [], false); }
               }}
-              onblur={() => finishPackRename(s.pack, s.list.map((e) => e.name), true)}
+              onblur={() => finishPackRename(s.pack, wholePack(s).map((e) => e.name), true)}
             />
           {:else}
             <span>{s.sticker ? "Stickers" : "Emotes"}{s.pack ? ` · ${s.pack}` : ""}</span>
@@ -613,11 +627,11 @@
             {#if s.pack}
               <button class="btn btn-ghost em-small" type="button" aria-label="Rename the pack {s.pack}" onclick={() => { renamingPack = s.key; newPack = s.pack; }}>Rename</button>
             {/if}
-            <button class="btn btn-ghost em-small" type="button" aria-label="Export the {what} as a .zip" disabled={exporting !== null} onclick={() => exportPack(s.key, s.pack, s.list)}
+            <button class="btn btn-ghost em-small" type="button" aria-label="Export the {what} as a .zip" disabled={exporting !== null} onclick={() => exportPack(s.key, s.pack, wholePack(s))}
               >{exporting === s.key ? "Exporting…" : "Export"}</button
             >
             {#if s.pack}
-              <button class="btn btn-ghost em-small" type="button" aria-label="Remove the pack {s.pack}" onclick={() => removeAll(s.list.map((e) => e.name), `the pack "${s.pack}"`)}>Remove pack</button>
+              <button class="btn btn-ghost em-small" type="button" aria-label="Remove the pack {s.pack}" onclick={() => removeAll(wholePack(s).map((e) => e.name), `the pack "${s.pack}"`)}>Remove pack</button>
             {/if}
           </span>
         </div>
@@ -745,6 +759,7 @@
             <span class="em-meta">
               {r.status === "reading" ? "Reading…" : r.status === "uploading" ? "Adding…" : r.status === "done" ? "Added" : ""}
               {r.note}
+              {#if r.pack && editable(r)}Into “{r.pack}”.{/if}
               {#if ready.includes(r) && !fitting.has(r.key)}Will not fit: the server's emotes are full.{/if}
             </span>
           </li>

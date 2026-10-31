@@ -162,6 +162,9 @@ export async function joinChannel(channelId: number, hasPassword: boolean): Prom
     // Asking to be in a text channel undoes having walked out of it. Only a
     // text channel: the list is of names, and a voice room may share one.
     if (isTextChannel(server, channelId)) forgetLeft(server, channelId);
+    // Into a voice room: its chat, not a text channel left open before
+    // (`displayChannelId` prefers that one once the preview ends)
+    else activeTextChannelId.of(server).set(null);
     return true;
   } catch (e) {
     console.error("Failed to join channel:", e);

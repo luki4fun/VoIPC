@@ -753,4 +753,7 @@ test("history cuts a long text, never inside an emote's token", () => {
   assert.equal(cutText(text), "x".repeat(1990));
   assert.ok(cutText(`${"x".repeat(1900)}${tok}${"y".repeat(200)}`).includes(tok), "a whole token stays");
   assert.equal(cutText("short <: not a token"), "short <: not a token");
+  // A stray "<:(" far from the end is text: the cut keeps the whole length
+  const stray = `see <:( ${"x".repeat(3000)}`;
+  assert.equal(cutText(stray), stray.slice(0, 2000), "not cut back to the stray <:");
 });

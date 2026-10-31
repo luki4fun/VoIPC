@@ -9,7 +9,7 @@ import { get, writable } from "svelte/store";
 import { scoped } from "./scoped";
 import { cleanList, countKinds, type Emote } from "../emote-rules";
 import { pictureUrl } from "../media";
-import { confirmChoice } from "./confirm";
+import { confirmChoice, pendingConfirm } from "./confirm";
 import { uiPrefs, updateUiPrefs } from "./ui-prefs";
 import { formatSize } from "../file-rules";
 import { savedServers } from "./settings";
@@ -84,7 +84,8 @@ function ask(server: string, e: Emote, want: Want, retried = false) {
   if (wait && (!wait.missing || wait.missing.has(urlKey(e.hash, e.sticker)))) return;
   asked.add(key);
   later(async () => {
-    if (!listed(server, e)) return;
+    // Not listed (a retry after the connection went): asked again by the next list
+    if (!listed(server, e)) return void asked.delete(key);
     try {
       const png = new Uint8Array(
         await invoke<ArrayBuffer>("emote_image", {
@@ -97,7 +98,8 @@ function ask(server: string, e: Emote, want: Want, retried = false) {
         }),
       );
       // The server's list may have moved on meanwhile: kept only if still listed
-      if (want === "fetch" || !listed(server, e)) return;
+      if (want === "fetch") return;
+      if (!listed(server, e)) return void asked.delete(key);
       const url = pictureUrl(png);
       emoteUrls.of(server).update((m) => {
         const next = new Map(m);
@@ -127,19 +129,24 @@ export function setEmotes(server: string, set: EmoteSet): void {
   const emotes = cleanList(set.emotes);
   emoteSets.of(server).set({ stickers: set.stickers, emotes });
   const keep = new Set(emotes.map((e) => urlKey(e.hash, e.sticker)));
+  const dropped = new Set<string>();
   emoteUrls.of(server).update((m) => {
     const next = new Map<string, EmoteUrls>();
     for (const [k, u] of m) {
       if (keep.has(k) && !u.error) next.set(k, u);
-      else for (const url of [u.url, u.still]) if (url) URL.revokeObjectURL(url);
+      else {
+        dropped.add(k);
+        for (const url of [u.url, u.still]) if (url) URL.revokeObjectURL(url);
+      }
     }
     return next;
   });
-  // Asked again: what failed, which the new list may have mended
+  // Asked again: what failed, which the new list may have mended, and every
+  // other way a dropped picture was asked for (its still that had worked)
   for (const k of [...asked]) {
     if (!k.startsWith(`${server}|`)) continue;
     const [, hash, kind] = k.split("|");
-    if (!keep.has(`${hash}|${kind}`) || failed.has(k)) {
+    if (!keep.has(`${hash}|${kind}`) || failed.has(k) || dropped.has(`${hash}|${kind}`)) {
       asked.delete(k);
       failed.delete(k);
     }
@@ -201,9 +208,11 @@ function hold(server: string, wait: { bytes: number; missing: Set<string> | null
 }
 
 /** `server`'s emotes now, over whatever network: what waited is fetched,
- *  and what is on screen asks again (Emote.svelte reads `emoteWait`). */
-export function downloadEmotes(server: string): void {
-  onMobileData.add(server);
+ *  and what is on screen asks again (Emote.svelte reads `emoteWait`).
+ *  `allow`: the person said yes, so later lists come over mobile data too;
+ *  not when nothing was waiting, or Wi-Fi came back. */
+export function downloadEmotes(server: string, allow = true): void {
+  if (allow) onMobileData.add(server);
   hold(server, null);
   for (const e of get(emoteSets.peek(server)).emotes) ask(server, e, "fetch");
 }
@@ -213,7 +222,9 @@ export function downloadEmotes(server: string): void {
  *  shortcut: those dialogs keep no store of their own, so their boxes are
  *  looked for; at most ten minutes, then it asks anyway. */
 async function afterFirstRun(): Promise<void> {
-  const open = () => typeof document !== "undefined" && !!document.querySelector(".audio-setup, .layout-setup");
+  // A question the person has open is theirs: this one would answer it "no"
+  const open = () =>
+    (typeof document !== "undefined" && !!document.querySelector(".audio-setup, .layout-setup")) || get(pendingConfirm) !== null;
   // The setup comes up as the connection does, a moment after the list may
   await new Promise((r) => setTimeout(r, 1500));
   for (let i = 0; open() && i < 1200; i++) await new Promise((r) => setTimeout(r, 500));
@@ -227,7 +238,7 @@ async function askMobileData(server: string, emotes: Emote[]) {
     await invoke<string[]>("emote_missing", { items: emotes.map((e) => ({ hash: e.hash, sticker: e.sticker })) }).catch(() => []),
   );
   const bytes = emotes.filter((e) => missing.has(urlKey(e.hash, e.sticker))).reduce((n, e) => n + e.len, 0);
-  if (!bytes) return downloadEmotes(server);
+  if (!bytes) return downloadEmotes(server, false);
   hold(server, { bytes, missing });
   if (askedMobile.has(server)) return;
   askedMobile.add(server);
@@ -260,7 +271,7 @@ export function mobileOk(server: string, on: boolean): void {
 
 const connection = (globalThis.navigator as { connection?: EventTarget } | undefined)?.connection;
 connection?.addEventListener?.("change", () => {
-  if (!metered()) for (const server of get(emoteWait).keys()) downloadEmotes(server);
+  if (!metered()) for (const server of get(emoteWait).keys()) downloadEmotes(server, false);
 });
 
 /** `e` is on screen: its picture, or its first frame (for a reader who

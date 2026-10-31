@@ -57,6 +57,7 @@
   import { isCulled, visibleChannels } from "../../stores/roster.js";
   import { openShare } from "../../stores/user-menu.js";
   import { memberMenu } from "../../actions/member-menu.js";
+  import { closeRow } from "../../actions/focus.js";
   import { avatarStyle } from "../../avatar.js";
   import { shortName } from "../../username.js";
   import ChannelCreateForm from "../ChannelCreateForm.svelte";
@@ -308,7 +309,7 @@
                 class="settings-icon"
                 title="Close — the messages are kept"
                 aria-label="Close conversation with {who}"
-                onclick={() => closeDmRow($serverAddress, convo.username)}
+                onclick={(e) => closeRow(e, () => closeDmRow($serverAddress, convo.username))}
               ><Icon name="close" size={14} /></button>
             </span>
           </div>

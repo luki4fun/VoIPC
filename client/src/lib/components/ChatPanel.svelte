@@ -766,6 +766,8 @@
       });
     }
     for (const c of $dmConversations) {
+      // Keyed by name, as the sidebar's rows (dm-rules `listRows`)
+      if (out.some((d) => d.key === `d${c.username}`)) continue;
       const seen = c.user_id > 0 ? undefined : liveIdOf(c.username, $users, $channelRosters);
       const r = reach(c.user_id, seen, c.account, !!$account?.cloud);
       if (r === "readonly") continue;
@@ -922,7 +924,7 @@
   <div class="chat-header" class:custom={headerExtra}>
     {#if isDmMode}
       <button aria-label="Back to channel chat" class="back-btn" onclick={backToChannel} title="Back to channel chat"><Icon name="arrow-left" size={16} /></button>
-      <span class="chat-title" title={$activeDmUsername}>DM with {shortName($activeDmUsername)}</span>
+      <span class="chat-title" title={$activeDmUsername}><span class="chat-title-text">DM with {shortName($activeDmUsername)}</span></span>
       {#if dmReach !== "live"}
         <span class="ttl-label" title={awayTitle}>away</span>
       {/if}
@@ -937,7 +939,8 @@
         <!-- Channel 0 is "not in voice", not a channel: it has no name to show -->
         <!-- The channel's own kind: a voice channel's chat is not a # channel -->
         <span class="chat-title"
-          ><Icon name={effectiveChannel && !effectiveChannel.text ? "volume" : "hash"} size={14} /> {channelName}</span
+          ><Icon name={effectiveChannel && !effectiveChannel.text ? "volume" : "hash"} size={14} />
+          <span class="chat-title-text" title={channelName}>{channelName}</span></span
         >
       {/if}
       {#if $isPreviewing}
@@ -1341,6 +1344,11 @@
     color: var(--text-secondary);
     border-bottom: 1px solid var(--border);
   }
+  /* Only the name gives way: at a large font scale the tools at the end were
+     pushed off a phone's screen */
+  .chat-header > * {
+    flex-shrink: 0;
+  }
 
   .chat-title {
     color: var(--text-primary);
@@ -1348,6 +1356,16 @@
     display: flex;
     align-items: center;
     gap: 4px;
+  }
+  .chat-header > .chat-title {
+    flex-shrink: 1;
+    min-width: 0;
+  }
+  .chat-title-text {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
 
   .back-btn {
@@ -1459,12 +1477,6 @@
     display: flex;
     flex-direction: column;
   }
-  /* Before Chrome 111 (no color-mix): solid (see Lightbox.svelte) */
-  @supports not (background: color-mix(in srgb, red 50%, blue)) {
-    .drop-zone {
-      background: var(--bg-primary);
-    }
-  }
   /* Ink, not mint: a place to put something is not something live */
   .drop-zone {
     position: absolute;
@@ -1481,6 +1493,13 @@
     border: 2px dashed var(--text-muted);
     border-radius: var(--r-md);
     pointer-events: none;
+  }
+  /* Before Chrome 111 (no color-mix): solid. After the rule, as in
+     Lightbox.svelte: with var() inside, color-mix parses and would win */
+  @supports not (background: color-mix(in srgb, red 50%, blue)) {
+    .drop-zone {
+      background: var(--bg-primary);
+    }
   }
 
   .chat-body > :global(.thread-pane),

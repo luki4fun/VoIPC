@@ -216,7 +216,8 @@
   /** Download: a card with no Load is not drawn by it (R3-12). */
   async function save() {
     // A known picture is drawn without its file: fetched now, to be saved
-    const got = (await fetchIt(media)) ?? (url && !bytes ? await fetchIt(false) : null);
+    // Drawn already: fetched, not drawn again over its own object URL
+    const got = (await fetchIt(media && !url)) ?? (url && !bytes ? await fetchIt(false) : null);
     if (got) await saveFile(got, file.name, (shown ?? sniff(got))?.mime).catch((e) => (error = String(e)));
   }
 

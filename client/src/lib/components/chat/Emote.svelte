@@ -25,8 +25,10 @@
     /** In the message the keyboard is on (MessageList's roving focus): a Tab
      *  stop, as the message's links are. */
     tabbable?: boolean;
+    /** Inside a link's text: a picture only, so a press opens the link. */
+    inLink?: boolean;
   }
-  let { name, hash, size = "inline", inText = false, tabbable = false }: Props = $props();
+  let { name, hash, size = "inline", inText = false, tabbable = false, inLink = false }: Props = $props();
 
   const e = $derived<Emote | undefined>(
     hash
@@ -58,7 +60,7 @@
 
   // In a message, a press tells what it is: its name (a phone has no
   // tooltips to learn it from), its pack, why it is not shown, and a star
-  const interactive = $derived(inText || size === "sticker");
+  const interactive = $derived((inText || size === "sticker") && !inLink);
   let info = $state<{ x: number; y: number; up: number } | null>(null);
   const faved = $derived(!!e && ($favEmotes[$serverAddress] ?? []).includes(e.name));
   /** Under the emote, or above it where there is no room (actions/fit.ts

@@ -10,8 +10,9 @@
 use crate::decode::{sniff, Format};
 use crate::{exif, Error, Result};
 
-/// `b` with its metadata dropped, else why not: a JPEG its EXIF turns (the
-/// turn would be lost with it), or a file not laid out as its format says.
+/// `b` with its metadata dropped, else why not: a picture its EXIF turns (the
+/// turn would be lost with it, and decode.rs honours it in a JPEG, PNG and
+/// WebP alike), or a file not laid out as its format says.
 pub fn strip(b: &[u8]) -> Result<Vec<u8>> {
     match sniff(b).map_err(Error::Unsupported)? {
         Format::Png => png(b),
@@ -47,6 +48,9 @@ fn png(b: &[u8]) -> Result<Vec<u8>> {
         let end = be32(b, i)?.checked_add(i + 12).ok_or_else(bad)?;
         let chunk = b.get(i..end).ok_or_else(bad)?;
         let kind = &chunk[4..8];
+        if kind == b"eXIf" && exif::orientation(&chunk[8..chunk.len() - 4]) > 1 {
+            return Err(Error::Unsupported("a turned picture kept as it is"));
+        }
         if KEEP.contains(&kind) {
             out.extend_from_slice(chunk);
         }
@@ -124,6 +128,9 @@ fn webp(b: &[u8]) -> Result<Vec<u8>> {
             .ok_or_else(bad)?;
         let chunk = &b[i..data_end];
         match kind {
+            b"EXIF" if exif::orientation(&chunk[8..]) > 1 => {
+                return Err(Error::Unsupported("a turned picture kept as it is"));
+            }
             b"EXIF" | b"XMP " | b"ICCP" => {}
             b"VP8X" if len >= 1 => {
                 out.extend_from_slice(chunk);
@@ -144,10 +151,11 @@ fn webp(b: &[u8]) -> Result<Vec<u8>> {
 }
 
 /// Every segment but APP1–APP13 and APP15 (EXIF, XMP, ICC, Photoshop's IPTC)
-/// and comments, up to the first scan; from there, as it is. APP14 stays: it
-/// says how Adobe's colours are to be read. shortcut: a comment
-/// between the scans of a progressive JPEG stays; drop it there too if one
-/// ever matters.
+/// and comments, before the first scan and between the scans of a progressive
+/// one; each scan's data as it is; nothing after the end (FFD9). APP14 stays:
+/// it says how Adobe's colours are to be read. What follows the end is not
+/// this picture: a phone's second image (MPF, with an EXIF of its own), a
+/// motion photo's video, a maker's trailer.
 fn jpeg(b: &[u8]) -> Result<Vec<u8>> {
     use zune_core::{bytestream::ZCursor, options::DecoderOptions};
     let mut d =
@@ -159,6 +167,7 @@ fn jpeg(b: &[u8]) -> Result<Vec<u8>> {
     }
     let mut out = vec![0xFF, 0xD8];
     let mut i = 2;
+    let mut scanned = false;
     loop {
         if b.get(i) != Some(&0xFF) {
             return Err(bad());
@@ -167,11 +176,12 @@ fn jpeg(b: &[u8]) -> Result<Vec<u8>> {
         match marker {
             // A fill byte before a marker
             0xFF => i += 1,
-            // The first scan: the picture's data, and what follows it
-            0xDA => {
-                out.extend_from_slice(&b[i..]);
+            // The end: the picture is whole, and what follows is not it
+            0xD9 if scanned => {
+                out.extend_from_slice(&[0xFF, 0xD9]);
                 return Ok(out);
             }
+            0xD9 => return Err(bad()),
             _ => {
                 let len = usize::from(u16::from_be_bytes([
                     *b.get(i + 2).ok_or_else(bad)?,
@@ -183,6 +193,28 @@ fn jpeg(b: &[u8]) -> Result<Vec<u8>> {
                     out.extend_from_slice(segment);
                 }
                 i = end;
+                if marker == 0xDA {
+                    // A scan's data runs to the next marker: an FF in it is
+                    // stuffed (FF00) or a restart (FFD0–FFD7)
+                    scanned = true;
+                    let mut k = i;
+                    loop {
+                        let at = k + b
+                            .get(k..)
+                            .ok_or_else(bad)?
+                            .iter()
+                            .position(|&x| x == 0xFF)
+                            .ok_or_else(bad)?;
+                        match *b.get(at + 1).ok_or_else(bad)? {
+                            0x00 | 0xD0..=0xD7 => k = at + 2,
+                            _ => {
+                                out.extend_from_slice(&b[i..at]);
+                                i = at;
+                                break;
+                            }
+                        }
+                    }
+                }
             }
         }
     }

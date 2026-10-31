@@ -2,7 +2,7 @@
 
 All notable changes to VoIPC are documented here.
 
-## [1.5.0] - unreleased
+## [1.5.0] - release candidate
 
 **Protocol 15: update relays and apps together.** A 1.5 app does not connect to a 1.4
 relay, and a 1.4 app does not connect to a 1.5 relay. Relays first: update the server,
@@ -100,6 +100,30 @@ then the apps.
 - Settings: the motion choice says when the system asks for less motion, and
   has no "under the pointer" on touch screens. Larger touch targets in the
   emote admin.
+- **For relays: an emote added just before the relay stops is kept.** The list
+  of emotes is written a moment after a change, and at shutdown too; a restart
+  within a second of an upload lost the emote and deleted its file.
+- **A turned PNG or WebP no longer goes up sideways** as an emote's original: it
+  goes up as the picture made of it, as a turned JPEG already did.
+- **An emote's original JPEG ends where its picture ends:** a phone's second
+  picture, a motion photo's video and anything else after it are left out with
+  the metadata.
+- **Rename, Remove pack and Export take the whole pack,** also while the search
+  shows only part of it.
+- **A link with an emote in its text opens** when the emote is pressed.
+- **On mobile data, emotes come only after a yes:** a server with nothing to
+  fetch, or a moment back on Wi-Fi, no longer counts as one. The question waits
+  while another one you have open is answered.
+- An emote whose download failed during a reconnect is fetched again, instead of
+  staying empty for the whole connection; so is a first frame that had worked.
+- A long message passed on in shared history is no longer cut back to its first
+  words by a `<:` written in it.
+- The browser app reads an emote of at most 1 MiB, whatever the relay claims, and
+  no longer writes every kept emote again at each new list.
+- A picture removed from this device in Settings → Files no longer goes on
+  showing from memory.
+- An emote made a sticker, or back, keeps its proportions.
+- *Download* on a picture already shown no longer draws it again.
 
 ### Polish from the device run
 
@@ -140,13 +164,26 @@ then the apps.
 - **Emote admin on a phone:** the tools wrap, a pack's buttons say which pack,
   rename fields take the cursor, and the size bar follows the palette. One import
   of the same picture twice adds it once; the summary counts what *Add* sends;
-  stickers numbered 01, 02… are named after their pack; a copy from a server with
-  one pack keeps it. The tab is called *Emotes and stickers*. On a phone the list
+  stickers numbered 01, 02… are named after their pack; a copy from another
+  server keeps its packs. The tab is called *Emotes and stickers*. On a phone the list
   wraps instead of cutting names, an import says why a row is left out, and
   *Make an emote or sticker…* goes straight to the picture.
 - Settings → Files says while it reads and when it cannot, keeps the emote row
   at zero, and *Clear* tells what it freed.
 - Placeholders and drop-down menus read clearly in every palette.
+- **Joining a voice channel from its preview shows its chat,** not the text
+  channel that was open before.
+- The *Today* and *Yesterday* dividers move on at midnight.
+- A zoomed picture pans as far as its own edges, not into the empty bands beside
+  it. Its zoom buttons keep the keyboard: Escape and + − 0 work after *Fit*.
+- At a large font size the chat header shortens the channel's name instead of
+  pushing its buttons off a phone's screen.
+- On a touch screen your own name and status in the drawer can be read: the
+  buttons take a row of their own where there is no room.
+- Two servers on one address are told apart in the server rail, by their port
+  and their colour.
+- Closing a conversation with ✕ leaves the keyboard on the next one.
+- Dropping files over the chat shows its backdrop on an older Android WebView too.
 
 ## [1.4.0] - 2026-10-30
 

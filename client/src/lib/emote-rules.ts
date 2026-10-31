@@ -265,7 +265,17 @@ export function cleanList(emotes: readonly Emote[]): Emote[] {
   return emotes
     .filter((e) => NAME.test(e.name) && /^[0-9a-f]{64}$/.test(e.hash) && validPack(e.pack) && !seen.has(e.name) && !!seen.add(e.name))
     .slice(0, MAX_EMOTES)
-    .map((e) => ({ ...e, len: whole(e.len, 2 ** 32 - 1), w: whole(e.w, BOX[e.sticker ? 1 : 0]), h: whole(e.h, BOX[e.sticker ? 1 : 0]) }));
+    .map((e) => ({ ...e, len: whole(e.len, 2 ** 32 - 1), ...boxed(e.w, e.h, BOX[e.sticker ? 1 : 0]) }));
+}
+
+/** A shape held to its box by one factor, so it keeps its proportions (an
+ *  emote made a sticker, or back, is listed with its old shape). */
+function boxed(w: unknown, h: unknown, side: number): { w: number; h: number } {
+  const [x, y] = [whole(w, Infinity), whole(h, Infinity)];
+  // A side missing: no shape to keep, each held on its own
+  if (!x || !y) return { w: Math.min(x, side), h: Math.min(y, side) };
+  const k = Math.min(1, side / Math.max(x, y));
+  return { w: Math.max(1, Math.round(x * k)), h: Math.max(1, Math.round(y * k)) };
 }
 
 /** voipc-media's emote and sticker boxes. */

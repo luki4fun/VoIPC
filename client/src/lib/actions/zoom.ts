@@ -11,7 +11,7 @@
 // The box needs `touch-action: none`, or the browser takes the pinch for page
 // zoom before any of this sees it.
 
-import { FIT, clampView, panBy, toggleAt, zoomAt, type View } from "../zoom-rules.js";
+import { FIT, clampView, containRect, panBy, toggleAt, zoomAt, type Rect, type View } from "../zoom-rules.js";
 
 export interface ZoomOptions {
   /** Changes when a different picture is shown: the view goes back to fit. */
@@ -20,6 +20,9 @@ export interface ZoomOptions {
   /** Handed the box's own zoom, for buttons beside it: zoom about its middle
    *  by a factor, or fit it again. */
   controls?: (c: ZoomControls) => void;
+  /** The picture's own size, where it is drawn fitted inside the box
+   *  (`object-fit: contain`): panning stops at its edges, not the box's. */
+  content?: () => { w: number; h: number } | null;
 }
 
 export interface ZoomControls {
@@ -42,6 +45,11 @@ export function zoomable(node: HTMLElement, opts: ZoomOptions) {
   let lastTap = { t: 0, x: 0, y: 0 };
 
   const rect = () => node.getBoundingClientRect();
+  /** Where the picture is in a box of `r`'s size; undefined: the whole box. */
+  const inside = (r: DOMRect): Rect | undefined => {
+    const n = options.content?.();
+    return n && n.w > 0 && n.h > 0 ? containRect(n.w, n.h, r.width, r.height) : undefined;
+  };
   const set = (v: View) => {
     view = v;
     options.onchange(v);
@@ -69,8 +77,8 @@ export function zoomable(node: HTMLElement, opts: ZoomOptions) {
       const [c, d] = [...pointers.values()];
       const after = { d: Math.hypot(c.x - d.x, c.y - d.y), mx: (c.x + d.x) / 2, my: (c.y + d.y) / 2 };
       if (before.d > 0) {
-        const zoomed = zoomAt(view, after.d / before.d, after.mx - r.left, after.my - r.top, r.width, r.height);
-        set(panBy(zoomed, after.mx - before.mx, after.my - before.my, r.width, r.height));
+        const zoomed = zoomAt(view, after.d / before.d, after.mx - r.left, after.my - r.top, r.width, r.height, inside(r));
+        set(panBy(zoomed, after.mx - before.mx, after.my - before.my, r.width, r.height, inside(r)));
       }
       moved = true;
       return;
@@ -80,7 +88,7 @@ export function zoomable(node: HTMLElement, opts: ZoomOptions) {
     pointers.set(e.pointerId, { x: e.clientX, y: e.clientY });
     if (Math.abs(dx) + Math.abs(dy) > MOVE_SLOP) moved = true;
     if (view.scale > 1 && (e.pointerType !== "mouse" || (e.buttons & 1) === 1)) {
-      set(panBy(view, dx, dy, r.width, r.height));
+      set(panBy(view, dx, dy, r.width, r.height, inside(r)));
     }
   }
 
@@ -92,7 +100,7 @@ export function zoomable(node: HTMLElement, opts: ZoomOptions) {
     const now = e.timeStamp;
     if (now - lastTap.t < DOUBLE_TAP_MS && Math.hypot(e.clientX - lastTap.x, e.clientY - lastTap.y) < DOUBLE_TAP_SLOP) {
       const r = rect();
-      set(toggleAt(view, e.clientX - r.left, e.clientY - r.top, r.width, r.height));
+      set(toggleAt(view, e.clientX - r.left, e.clientY - r.top, r.width, r.height, inside(r)));
       lastTap = { t: 0, x: 0, y: 0 };
     } else {
       lastTap = { t: now, x: e.clientX, y: e.clientY };
@@ -102,12 +110,12 @@ export function zoomable(node: HTMLElement, opts: ZoomOptions) {
   function wheel(e: WheelEvent) {
     e.preventDefault();
     const r = rect();
-    set(zoomAt(view, Math.exp(-e.deltaY * 0.0015), e.clientX - r.left, e.clientY - r.top, r.width, r.height));
+    set(zoomAt(view, Math.exp(-e.deltaY * 0.0015), e.clientX - r.left, e.clientY - r.top, r.width, r.height, inside(r)));
   }
 
   const zoomMiddle = (factor: number) => {
     const r = rect();
-    set(zoomAt(view, factor, r.width / 2, r.height / 2, r.width, r.height));
+    set(zoomAt(view, factor, r.width / 2, r.height / 2, r.width, r.height, inside(r)));
   };
   opts.controls?.({ zoom: zoomMiddle, fit: () => set(FIT) });
 
@@ -116,14 +124,14 @@ export function zoomable(node: HTMLElement, opts: ZoomOptions) {
     const cx = r.width / 2;
     const cy = r.height / 2;
     let next: View | null = null;
-    if (e.key === "+" || e.key === "=") next = zoomAt(view, ZOOM_STEP, cx, cy, r.width, r.height);
-    else if (e.key === "-" || e.key === "_") next = zoomAt(view, 1 / ZOOM_STEP, cx, cy, r.width, r.height);
+    if (e.key === "+" || e.key === "=") next = zoomAt(view, ZOOM_STEP, cx, cy, r.width, r.height, inside(r));
+    else if (e.key === "-" || e.key === "_") next = zoomAt(view, 1 / ZOOM_STEP, cx, cy, r.width, r.height, inside(r));
     else if (e.key === "0") next = FIT;
     else if (view.scale > 1 && e.key.startsWith("Arrow")) {
       const step = 48;
       const dx = e.key === "ArrowLeft" ? step : e.key === "ArrowRight" ? -step : 0;
       const dy = e.key === "ArrowUp" ? step : e.key === "ArrowDown" ? -step : 0;
-      next = panBy(view, dx, dy, r.width, r.height);
+      next = panBy(view, dx, dy, r.width, r.height, inside(r));
     }
     if (next) {
       e.preventDefault();
@@ -135,7 +143,7 @@ export function zoomable(node: HTMLElement, opts: ZoomOptions) {
   // keeps a view that still covers it
   const resize = new ResizeObserver(() => {
     const r = rect();
-    const fitted = clampView(view, r.width, r.height);
+    const fitted = clampView(view, r.width, r.height, inside(r));
     if (fitted.x !== view.x || fitted.y !== view.y || fitted.scale !== view.scale) set(fitted);
   });
   resize.observe(node);

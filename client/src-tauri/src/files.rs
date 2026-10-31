@@ -1164,6 +1164,7 @@ fn cache_read(hash: &[u8; 32]) -> Option<Vec<u8>> {
 
 fn cache_remove(hash: &[u8; 32]) {
     let _ = std::fs::remove_file(blob_path(hash));
+    crate::media::forget_made(&hex(hash));
 }
 
 /// Keep `blob`, then let the least recently used go until the cache is
@@ -1251,12 +1252,14 @@ fn cache_retain(keep: &HashSet<String>, grace: Duration) {
             .is_ok_and(|t| now.duration_since(t).unwrap_or_default() >= grace);
         if old && !keep.contains(&name) {
             let _ = std::fs::remove_file(entry.path());
+            crate::media::forget_made(&name);
         }
     }
 }
 
 /// With no chat archive, nothing refers to a blob from an earlier run.
 pub fn cache_wipe() {
+    crate::media::forget_all_made();
     match std::fs::remove_dir_all(cache_dir()) {
         Ok(()) => debug!("file cache wiped: no chat archive"),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}

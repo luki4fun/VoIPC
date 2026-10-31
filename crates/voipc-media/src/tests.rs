@@ -390,9 +390,9 @@ fn webp_still_and_animated() {
     assert!(anim.still.is_some());
 }
 
-/// `jpeg` with an EXIF block saying orientation `o`, just after its start.
-fn with_orientation(jpeg: &[u8], o: u16) -> Vec<u8> {
-    let tiff = [
+/// An EXIF block (its TIFF data) saying orientation `o`, and nothing else.
+fn exif_tiff(o: u16) -> Vec<u8> {
+    [
         b"II*\0".as_slice(),
         &8u32.to_le_bytes(),
         &1u16.to_le_bytes(),
@@ -403,8 +403,12 @@ fn with_orientation(jpeg: &[u8], o: u16) -> Vec<u8> {
         &[0, 0],
         &0u32.to_le_bytes(),
     ]
-    .concat();
-    let payload = [b"Exif\0\0".as_slice(), &tiff].concat();
+    .concat()
+}
+
+/// `jpeg` with an EXIF block saying orientation `o`, just after its start.
+fn with_orientation(jpeg: &[u8], o: u16) -> Vec<u8> {
+    let payload = [b"Exif\0\0".as_slice(), &exif_tiff(o)].concat();
     let len = (payload.len() + 2) as u16;
     [
         &jpeg[..2],
@@ -1111,12 +1115,53 @@ fn an_original_upload_loses_its_metadata_and_nothing_it_shows() {
     ));
 }
 
+/// `png` with an `eXIf` chunk of `data` just after its IHDR.
+fn with_exif_chunk(png: &[u8], data: &[u8]) -> Vec<u8> {
+    let body = [b"eXIf".as_slice(), data].concat();
+    let chunk = [
+        &(data.len() as u32).to_be_bytes()[..],
+        &body,
+        &crc32(&body).to_be_bytes(),
+    ]
+    .concat();
+    // The signature (8) and IHDR (4 + 4 + 13 + 4)
+    [&png[..33], &chunk, &png[33..]].concat()
+}
+
 #[test]
-fn a_turned_jpeg_or_a_broken_file_is_not_stripped() {
+fn a_turned_picture_or_a_broken_file_is_not_stripped() {
     let plain = include_bytes!("../tests/fixtures/red-blue.jpg");
     assert!(
         strip(&with_orientation(plain, 6)).is_err(),
         "its turn would be lost"
+    );
+    assert!(
+        strip(&plain[..plain.len() - 2]).is_err(),
+        "a JPEG with no end"
+    );
+    // PNG and WebP too: decode.rs turns them by their EXIF as it does a JPEG
+    let wide = png_of(
+        2,
+        1,
+        png::ColorType::Rgba,
+        png::BitDepth::Eight,
+        &[255, 0, 0, 255, 0, 0, 255, 255],
+        None,
+    );
+    let turned = with_exif_chunk(&wide, &exif_tiff(6));
+    let shown = sanitize(&turned, Profile::Emote).unwrap();
+    assert_eq!(
+        (shown.w, shown.h),
+        (1, 2),
+        "the test file is turned when shown"
+    );
+    assert!(strip(&turned).is_err(), "a turned PNG");
+    let upright = strip(&with_exif_chunk(&wide, &exif_tiff(1))).unwrap();
+    assert!(!holds(&upright, b"eXIf"), "an upright one loses its EXIF");
+    let webp = include_bytes!("../tests/fixtures/anim3.webp");
+    assert!(
+        strip(&with_chunk(webp, b"EXIF", &exif_tiff(6))).is_err(),
+        "a turned WebP"
     );
     let png = png_of(
         1,
@@ -1137,6 +1182,42 @@ fn a_turned_jpeg_or_a_broken_file_is_not_stripped() {
     for cut in 11..gif.len() {
         let _ = strip(&gif[..cut]);
     }
+}
+
+#[test]
+fn a_jpeg_ends_at_its_end_and_loses_what_is_between_its_scans() {
+    let secret = b"secret location";
+    let plain = include_bytes!("../tests/fixtures/red-blue.jpg");
+    let bare = strip(plain).unwrap();
+    // A phone's second image after the end (MPF), then a trailer
+    let trailed = [&plain[..], &plain[..], secret].concat();
+    let cut = strip(&trailed).unwrap();
+    assert_eq!(cut, bare, "nothing after FFD9");
+    assert!(!holds(&cut, secret));
+    // Progressive (jpegtran -progressive): ten scans, a comment between two
+    let prog = include_bytes!("../tests/fixtures/red-blue-progressive.jpg");
+    let second = prog
+        .windows(2)
+        .enumerate()
+        .filter(|(_, w)| *w == [0xFF, 0xDA])
+        .nth(1)
+        .unwrap()
+        .0;
+    let comment = [
+        &[0xFF, 0xFE][..],
+        &((secret.len() + 2) as u16).to_be_bytes(),
+        secret,
+    ]
+    .concat();
+    let file = [&prog[..second], &comment, &prog[second..], secret].concat();
+    let bare = strip(&file).unwrap();
+    assert!(!holds(&bare, secret), "between the scans and after the end");
+    assert_eq!(bare.last(), Some(&0xD9));
+    assert_eq!(
+        sanitize(&bare, Profile::Photo).unwrap().png,
+        sanitize(prog, Profile::Photo).unwrap().png,
+        "what it shows is the same"
+    );
 }
 
 #[test]

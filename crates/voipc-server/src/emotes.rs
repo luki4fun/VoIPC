@@ -115,10 +115,24 @@ impl Inner {
     }
 }
 
-/// A shape held to its kind's box: only ever the room a reader keeps.
+/// A shape held to its kind's box: only ever the room a reader keeps, both
+/// sides by one factor so it keeps its proportions (a sticker of 320×160 made
+/// an emote is 128×64, not 128×128).
 fn boxed(mut e: Emote) -> Emote {
-    let side = if e.sticker { STICKER_BOX } else { EMOTE_BOX };
-    (e.w, e.h) = (e.w.min(side), e.h.min(side));
+    let side = u64::from(if e.sticker { STICKER_BOX } else { EMOTE_BOX });
+    let (w, h) = (u64::from(e.w), u64::from(e.h));
+    let long = w.max(h);
+    if long > side {
+        // A side of 0 says "no shape": it stays 0
+        let fit = |n: u64| {
+            if n == 0 {
+                0
+            } else {
+                (n * side / long).max(1) as u16
+            }
+        };
+        (e.w, e.h) = (fit(w), fit(h));
+    }
     e
 }
 
@@ -423,6 +437,7 @@ impl EmoteStore {
             }
             if let Some(k) = sticker {
                 e.sticker = k;
+                *e = boxed(e.clone());
             }
         }
         Ok(())
@@ -463,8 +478,11 @@ impl EmoteStore {
         Ok(())
     }
 
-    /// A new file, on disk before its upload is answered.
+    /// A new file, on disk before its upload is answered. In turn with the
+    /// manifest's writes: one that found this picture gone deletes its file
+    /// before this writes it again, never after.
     async fn write_file(&self, hash: [u8; 32], bytes: Bytes) {
+        let _turn = self.writing.lock().await;
         let dir = self.dir.clone();
         let written =
             tokio::task::spawn_blocking(move || atomic_write(&dir, &hex(&hash), &bytes)).await;
@@ -514,6 +532,13 @@ impl EmoteStore {
         if !matches!(written, Ok(Ok(()))) {
             warn!(?written, "emotes: could not write {}", self.dir.display());
         }
+    }
+
+    /// The manifest as it is now, at once: the shutdown's, which cannot wait
+    /// for `changed`'s moment. A change answered just before the end is not
+    /// lost then, nor its file taken for an orphan at the next start.
+    pub async fn flush(&self) {
+        self.write_manifest().await;
     }
 
     /// A change: a moment later the manifest is written and the new list goes
@@ -805,8 +830,14 @@ pub(crate) async fn finish_put(state: &Arc<ServerState>, upload: Upload, body: B
     };
     match store.store(&upload.ticket, upload.hash, &body) {
         Ok(()) => {
-            store.write_file(upload.hash, body).await;
-            store.changed(state);
+            // One task, awaited: a request dropped meanwhile (a closed tab, a
+            // reset stream) still gets its file written and listed
+            let state = state.clone();
+            let _ = tokio::spawn(async move {
+                store.write_file(upload.hash, body).await;
+                store.changed(&state);
+            })
+            .await;
             say(201, "stored")
         }
         Err((status, why)) => {
@@ -933,7 +964,11 @@ mod tests {
         assert_eq!(s.lock().reserved, PNG.len() as u64, "reserved once");
         s.store(&t, e.hash, PNG).unwrap();
         let kept = s.lock().emotes[0].clone();
-        assert_eq!((kept.w, kept.h), (EMOTE_BOX, 64));
+        assert_eq!(
+            (kept.w, kept.h),
+            (EMOTE_BOX, 2),
+            "one factor for both sides"
+        );
     }
 
     #[test]
@@ -1116,6 +1151,57 @@ mod tests {
         };
         assert!(emotes.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn an_answered_upload_survives_a_shutdown_right_after_it() {
+        // The shutdown comes before `changed`'s moment: without `flush` the
+        // manifest would not name the file, and the next start would delete
+        // it as an orphan (`open`)
+        let dir = temp();
+        let s = Arc::new(store(&dir));
+        let e = emote("pog", PNG);
+        let Ok(Added::Ticket(t)) = s.add(1, e.clone(), Instant::now()) else {
+            panic!()
+        };
+        s.store(&t, e.hash, PNG).unwrap();
+        s.write_file(e.hash, Bytes::from_static(PNG)).await;
+        s.flush().await;
+        let ServerMessage::EmoteList { emotes, .. } = store(&dir).list() else {
+            panic!()
+        };
+        assert_eq!(emotes, [e]);
+        assert!(dir.join(hex(&emotes[0].hash)).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_kind_changed_keeps_its_shape_in_the_new_box() {
+        let dir = temp();
+        let s = store(&dir);
+        let e = Emote {
+            sticker: true,
+            w: 320,
+            h: 160,
+            ..emote("wide", PNG)
+        };
+        let Ok(Added::Ticket(t)) = s.add(1, e.clone(), Instant::now()) else {
+            panic!()
+        };
+        s.store(&t, e.hash, PNG).unwrap();
+        s.moved(&["wide".into()], None, Some(false)).unwrap();
+        let kept = s.lock().emotes[0].clone();
+        assert_eq!((kept.w, kept.h), (EMOTE_BOX, EMOTE_BOX / 2));
+        let shapeless = boxed(Emote {
+            w: 0,
+            h: 4000,
+            ..emote("tall", PNG)
+        });
+        assert_eq!(
+            (shapeless.w, shapeless.h),
+            (0, EMOTE_BOX),
+            "no shape stays none"
+        );
     }
 
     #[test]

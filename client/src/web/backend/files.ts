@@ -603,14 +603,21 @@ export function cacheList(): { cap: number; entries: { hash: string; bytes: numb
 
 /** Let go of these blobs now: the media manager's "remove". */
 export function cacheRemove(hashes: readonly string[]): void {
-  for (const h of hashes) cacheDelete(h);
+  for (const h of hashes) forget(h);
+}
+
+/** A blob let go of on purpose, and what was made of it: a removed picture
+ *  must not go on showing from memory. */
+function forget(hash: string): void {
+  cacheDelete(hash);
+  for (const k of made.keys()) if (k.startsWith(`${hash}:`)) made.delete(k);
 }
 
 /** Let go of every blob but `keep` that has not been used for a while. */
 export function cacheRetain(keep: Set<string>): void {
   const now = Date.now();
   for (const [hash, k] of [...cache]) {
-    if (!keep.has(hash) && now - k.lastUsed >= RETAIN_GRACE_MS) cacheDelete(hash);
+    if (!keep.has(hash) && now - k.lastUsed >= RETAIN_GRACE_MS) forget(hash);
   }
 }
 

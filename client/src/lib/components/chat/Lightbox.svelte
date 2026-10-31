@@ -20,6 +20,7 @@
   /** The gestures and keys, as buttons too: a mouse without a wheel, a
    *  finger that does not know to pinch, a reader who never sees the label. */
   let zoom = $state<ZoomControls | null>(null);
+  let img = $state<HTMLImageElement>();
 </script>
 
 <!-- To the end of <body>: the chat's container query would hold a fixed box -->
@@ -28,15 +29,15 @@
     <div class="lightbox-bar">
       <h2 class="dialog-title" title={name}>{name}</h2>
       <div class="lightbox-zoom" role="group" aria-label="Zoom">
-        <button class="icon-btn" type="button" title="Zoom out (−)" aria-label="Zoom out" disabled={view.scale <= 1} onclick={() => zoom?.zoom(1 / ZOOM_STEP)}
+        <button class="icon-btn" type="button" title="Zoom out (−)" aria-label="Zoom out" aria-disabled={view.scale <= 1} onclick={() => view.scale > 1 && zoom?.zoom(1 / ZOOM_STEP)}
           ><Icon name="zoom-out" size={18} /></button
         >
         <!-- "Fit", not a percentage: the scale counts from the fitted picture,
              which is not its own size, and 100% would claim one-to-one -->
-        <button class="btn btn-ghost lightbox-fit" type="button" title="Fit (0)" aria-label="Fit to the window" disabled={view.scale <= 1} onclick={() => zoom?.fit()}
+        <button class="btn btn-ghost lightbox-fit" type="button" title="Fit (0)" aria-label="Fit to the window" aria-disabled={view.scale <= 1} onclick={() => zoom?.fit()}
           >Fit</button
         >
-        <button class="icon-btn" type="button" title="Zoom in (+)" aria-label="Zoom in" disabled={view.scale >= MAX_SCALE} onclick={() => zoom?.zoom(ZOOM_STEP)}
+        <button class="icon-btn" type="button" title="Zoom in (+)" aria-label="Zoom in" aria-disabled={view.scale >= MAX_SCALE} onclick={() => zoom?.zoom(ZOOM_STEP)}
           ><Icon name="zoom-in" size={18} /></button
         >
       </div>
@@ -53,9 +54,14 @@
       tabindex="0"
       role="img"
       aria-label="{name}. Plus and minus zoom, arrows move, 0 fits."
-      use:zoomable={{ key: url, onchange: (v) => (view = v), controls: (c) => (zoom = c) }}
+      use:zoomable={{
+        key: url,
+        onchange: (v) => (view = v),
+        controls: (c) => (zoom = c),
+        content: () => (img?.naturalWidth ? { w: img.naturalWidth, h: img.naturalHeight } : null),
+      }}
     >
-      <img src={url} alt="" draggable="false" style="transform: translate({view.x}px, {view.y}px) scale({view.scale})" />
+      <img bind:this={img} src={url} alt="" draggable="false" style="transform: translate({view.x}px, {view.y}px) scale({view.scale})" />
     </div>
   </div>
 </div>
@@ -114,7 +120,9 @@
     align-items: center;
     gap: 2px;
   }
-  .lightbox-zoom .icon-btn:disabled {
+  /* aria-disabled, not disabled: a button that disables itself under the
+     focus drops it to <body>, and Esc and the zoom keys went dead */
+  .lightbox-zoom [aria-disabled="true"] {
     opacity: 0.4;
     cursor: default;
   }

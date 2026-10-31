@@ -47,6 +47,7 @@
   import { shortName } from "../username.js";
   import ChannelCreateForm from "./ChannelCreateForm.svelte";
   import Icon from "./Icons.svelte";
+  import { closeRow } from "../actions/focus.js";
   import ChannelTags from "./ChannelTags.svelte";
 
   let currentChannelName = $derived(
@@ -206,7 +207,7 @@
                 class="settings-icon"
                 title="Close — the messages are kept"
                 aria-label="Close conversation with {who}"
-                onclick={() => closeDmRow($serverAddress, convo.username)}
+                onclick={(e) => closeRow(e, () => closeDmRow($serverAddress, convo.username))}
               ><Icon name="close" size={14} /></button>
             </span>
           </div>
