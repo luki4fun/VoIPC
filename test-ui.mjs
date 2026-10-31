@@ -2812,8 +2812,8 @@ check(
   const admin = await waitFor(ann, `document.querySelector(".admin-btn.active")`, 15_000).then(() => true, () => false);
   check("the admin token makes this tab the server's admin", admin);
   await ann.evaluate(click("button.admin-btn.active"));
-  await waitFor(ann, `[...document.querySelectorAll(".admin-tabs button")].some((b) => b.textContent === "Emotes")`, 5_000).catch(() => {});
-  await ann.evaluate(`[...document.querySelectorAll(".admin-tabs button")].find((b) => b.textContent === "Emotes")?.click()`);
+  await waitFor(ann, `[...document.querySelectorAll(".admin-tabs button")].some((b) => b.textContent === "Emotes and stickers")`, 5_000).catch(() => {});
+  await ann.evaluate(`[...document.querySelectorAll(".admin-tabs button")].find((b) => b.textContent === "Emotes and stickers")?.click()`);
   await waitFor(ann, `document.querySelector(".em-pick input[type=file][multiple]")`, 5_000).catch(() => {});
   const name = `party_parrot_${n}`;
   await ann.evaluate(`(async () => {

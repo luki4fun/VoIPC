@@ -29,6 +29,7 @@
   import { addNotification } from "../../stores/notifications.js";
   import { menu } from "../../actions/menu.js";
   import { portal } from "../../actions/portal.js";
+  import { fit } from "../../actions/fit.js";
   import { nativeMenuWanted } from "../../context-menu.js";
   import { dayKey, dayLabel, fullTime } from "../../chat-time.js";
   import { mentionsName, parse, plainText } from "../../markdown.js";
@@ -263,25 +264,6 @@
   }
 
   let opened = $state.raw<{ m: ChatMessage; x: number; y: number; up: number } | null>(null);
-
-  /** The phone's gesture bar, which an edge-to-edge web view draws over. */
-  function safeBottom(): number {
-    const probe = document.createElement("div");
-    probe.style.cssText = "position:fixed;bottom:0;height:env(safe-area-inset-bottom,0px);visibility:hidden";
-    document.body.append(probe);
-    const h = probe.getBoundingClientRect().height;
-    probe.remove();
-    return h;
-  }
-
-  /** A pop-up at `y` that would run off the bottom (of what is visible: a
-   *  phone's keyboard and gesture bar take some, D2-13) goes above `up`. */
-  function fit(node: HTMLElement, up: number) {
-    const r = node.getBoundingClientRect();
-    const vv = globalThis.visualViewport;
-    const floor = (vv ? vv.offsetTop + vv.height : innerHeight) - 8 - safeBottom();
-    if (r.bottom > floor) node.style.top = `${Math.max(8, up - r.height)}px`;
-  }
 
   // ── Touch ───────────────────────────────────────────────────────────────
   //
@@ -550,7 +532,7 @@
           {:else if msg.content}
             {@const sticker = stickerOf(msg.content, $emoteSets.emotes)}
             {#if sticker && $emoteSets.stickers && $emotePrefs.show_stickers}
-              <Emote name={sticker.name} hash={sticker.hash.slice(0, 20)} size="sticker" />
+              <Emote name={sticker.name} hash={sticker.hash} size="sticker" {tabbable} />
             {:else if sticker}
               <span class="sticker-off">Sticker :{sticker.name}:</span>
             {:else}
@@ -569,6 +551,7 @@
               {server}
               conv={fileConv}
               {tabbable}
+              auto={isMine(msg) && Date.now() - msg.timestamp < 10 * 60_000}
               onopen={(p) => (picture = p)}
               ongone={(u) => {
                 if (picture?.url === u) picture = null;

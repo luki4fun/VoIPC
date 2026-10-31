@@ -125,6 +125,16 @@ export function stickerText(e: Emote): string {
   return `<:${e.name}:${e.hash.slice(0, TOKEN_HASH)}>`;
 }
 
+/** "1 emote", "3 emotes and 1 sticker", "no emotes or stickers": counts in
+ *  words, for the lines that tell what a server has or what is missing. */
+export function countKinds(emotes: number, stickers: number): string {
+  const n = (k: number, word: string) => `${k} ${word}${k === 1 ? "" : "s"}`;
+  if (!emotes && !stickers) return "no emotes or stickers";
+  if (!stickers) return n(emotes, "emote");
+  if (!emotes) return n(stickers, "sticker");
+  return `${n(emotes, "emote")} and ${n(stickers, "sticker")}`;
+}
+
 /** At most this many emotes alone make a message show them big. */
 export const JUMBO_MAX = 27;
 
@@ -168,13 +178,18 @@ export function byRecent<T extends { name: string }>(emotes: readonly T[], recen
 
 /** The emoji the `:` completion offers for `typed` after the server's
  *  emotes: names that start with it, then names that hold it, one per emoji. */
-export function completeEmoji(typed: string, max = 8): { name: string; emoji: string }[] {
+export function completeEmoji(
+  typed: string,
+  max = 8,
+  shown: (emoji: string) => boolean = () => true,
+): { name: string; emoji: string }[] {
   const t = typed.toLowerCase();
   const names = Object.keys(EMOJI_NAMES);
   const seen = new Set<string>();
   return [...names.filter((n) => n.startsWith(t)), ...names.filter((n) => !n.startsWith(t) && n.includes(t))]
     .map((name) => ({ name, emoji: EMOJI_NAMES[name] }))
-    .filter((o) => !seen.has(o.emoji) && !!seen.add(o.emoji))
+    // `shown`: what this system draws (emoji-support.ts `drawsAsOne`)
+    .filter((o) => shown(o.emoji) && !seen.has(o.emoji) && !!seen.add(o.emoji))
     .slice(0, max);
 }
 

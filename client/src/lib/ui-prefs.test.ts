@@ -206,3 +206,10 @@ test("a file from before Stage gets the stage panels it never had", () => {
   assert.equal(p.panels.modern.sidebar, 300);
   assert.deepEqual(p.panels.stage, sanitizeUiPrefs({}).panels.stage);
 });
+
+test("emotes on mobile data: the servers said yes to are kept, junk is dropped", () => {
+  assert.deepEqual(sanitizeUiPrefs({}).emotes_mobile_ok, [], "nobody has said always yet");
+  assert.deepEqual(sanitizeUiPrefs({ emotes_mobile_ok: ["a.example:9987"] }).emotes_mobile_ok, ["a.example:9987"]);
+  assert.deepEqual(sanitizeUiPrefs({ emotes_mobile_ok: ["a:1", 7, "", "a:1"] }).emotes_mobile_ok, ["a:1"]);
+  assert.deepEqual(sanitizeUiPrefs({ emotes_mobile_ok: true }).emotes_mobile_ok, []);
+});

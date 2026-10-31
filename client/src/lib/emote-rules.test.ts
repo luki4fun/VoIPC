@@ -5,6 +5,7 @@ import {
   cleanList,
   completeEmoji,
   completeEmote,
+  countKinds,
   emoteOf,
   isEmoteReaction,
   nameFrom,
@@ -158,4 +159,18 @@ test("a relay's list is taken only as valid, once per name, and bounded", () => 
     ],
     "a shape held to its box",
   );
+});
+
+test("counts read as words, one or many, of either kind", () => {
+  assert.equal(countKinds(1, 0), "1 emote");
+  assert.equal(countKinds(3, 1), "3 emotes and 1 sticker");
+  assert.equal(countKinds(0, 2), "2 stickers");
+  assert.equal(countKinds(0, 0), "no emotes or stickers");
+});
+
+test("emoji completion leaves out what this system cannot draw", () => {
+  const all = completeEmoji("heart", 8).map((o) => o.emoji);
+  assert.ok(all.includes("❤️‍🔥"), "offered where it is drawn");
+  const shown = completeEmoji("heart", 8, (e) => !e.includes("‍")).map((o) => o.emoji);
+  assert.ok(!shown.includes("❤️‍🔥") && shown.length > 0, "left out where it would come apart");
 });

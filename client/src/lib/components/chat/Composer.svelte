@@ -13,6 +13,7 @@
   import { serverAddress } from "../../stores/connection.js";
   import Emote from "./Emote.svelte";
   import EmotePicker from "./EmotePicker.svelte";
+  import { drawsAsOne } from "../../emoji-support.js";
 
   interface Props {
     placeholder: string;
@@ -41,6 +42,8 @@
      * relay keeps none, or nobody to name): there is no attach button then.
      */
     onsendfile?: (file: File, original: boolean, caption: string, op: string) => Promise<void>;
+    /** The largest file this server takes, said on a chip before Send is pressed. */
+    maxBytes?: number | null;
     /** A sticker was picked: it goes as a message of its own. Absent where
      *  stickers cannot be sent here (the server's switch). */
     onsticker?: (e: EmoteItem) => void;
@@ -54,6 +57,7 @@
     oncancelreply,
     mentionables = [],
     onsendfile,
+    maxBytes = null,
     onsticker,
   }: Props = $props();
 
@@ -144,6 +148,8 @@
   export function addFiles(files: Iterable<File>) {
     if (!onsendfile) return;
     for (const file of files) {
+      // Dropped and then pasted, or picked twice: one chip for one file
+      if (staged.some((s) => s.file.name === file.name && s.file.size === file.size && s.file.lastModified === file.lastModified && !s.op)) continue;
       const entry: Staged = { key: nextKey++, file, photo: false, asIs: false, original: false, op: null, error: null };
       staged = [...staged, entry];
       // The first bytes say whether it is a photo, not the name or the type
@@ -211,8 +217,9 @@
               }
               patch(f.key, { op: null, error: "Not sent" });
             } else {
-              const why = String(e);
-              patch(f.key, { op: null, error: why === "cancelled" ? "Stopped" : why });
+              // As a sentence: the backends' reasons start in lower case
+              const why = String(e).replace(/^Error: /, "");
+              patch(f.key, { op: null, error: why === "cancelled" ? STOPPED : why.charAt(0).toUpperCase() + why.slice(1) });
             }
             if (words && !text) text = words;
             words = "";
@@ -266,7 +273,9 @@
    *  emoji by name, to complete. */
   const emoteQuery = $derived.by(() => {
     const before = text.slice(0, caret);
-    const m = /(?:^|\s):([a-z0-9_]{2,30})$/.exec(before);
+    // Where `tokenize` reads a `:name:` (emote-rules.ts): after a space, an
+    // emoji or a bracket too, never inside a word or an address
+    const m = /(?:^|[^a-z0-9_:<\/]):([a-z0-9_]{2,30})$/.exec(before);
     return m ? { q: m[1], start: before.length - m[1].length - 1 } : null;
   });
   type Option = { kind: "emote"; e: EmoteItem } | { kind: "emoji"; name: string; emoji: string };
@@ -277,7 +286,7 @@
     const own = completeEmote(emoteQuery.q, $emoteSets.emotes, 8, [...($favEmotes[$serverAddress] ?? []), ...recent]);
     return [
       ...own.map((e): Option => ({ kind: "emote", e })),
-      ...completeEmoji(emoteQuery.q, 8 - own.length).map((o): Option => ({ kind: "emoji", ...o })),
+      ...completeEmoji(emoteQuery.q, 8 - own.length, drawsAsOne).map((o): Option => ({ kind: "emoji", ...o })),
     ];
   });
   const offered = $derived(suggestions.length || emoteOptions.length);
@@ -386,7 +395,9 @@
 
   function closePicker() {
     showEmojiPicker = false;
-    tick().then(() => inputEl?.focus());
+    // Back to the message box for a mouse or the keyboard; a finger's sticker
+    // is sent, and the phone's keyboard coming up for nothing hides the chat
+    if (pickerFocus) tick().then(() => inputEl?.focus());
   }
 
   // A tap on the composer's own buttons never takes the focus from the text
@@ -394,23 +405,20 @@
   // the button move away before the finger lifts (D2: Send took two taps in
   // mobile Classic). The click still comes, and the keyboard stays up.
   const keepField = (e: PointerEvent) => e.preventDefault();
+  const STOPPED = "Stopped";
 
   // Android Back closes the picker first, not the pane it sits in
   $effect(() => {
     if (showEmojiPicker) return pushLayer(() => (showEmojiPicker = false));
   });
 
-  /** The picker hangs left from its button, and on a phone that runs off the
-   *  screen's left edge: moved back in, 8 px from either edge (D2-07). */
-  function onScreen(node: HTMLElement) {
-    const r = node.getBoundingClientRect();
-    const shift = r.left < 8 ? 8 - r.left : r.right > innerWidth - 8 ? innerWidth - 8 - r.right : 0;
-    if (shift !== 0) node.style.transform = `translateX(${Math.round(shift)}px)`;
-  }
-
-  function toggleEmojiPicker() {
+  /** Into the search only for a mouse or the keyboard: a finger's tap would
+   *  bring the phone's keyboard up over the picker. Told by the tap itself,
+   *  since some touch screens (an emulator, some tablets) report a fine pointer. */
+  function toggleEmojiPicker(e: MouseEvent) {
     showEmojiPicker = !showEmojiPicker;
-    pickerFocus = showEmojiPicker && !matchMedia("(pointer: coarse)").matches;
+    const finger = (e as PointerEvent).pointerType === "touch" || (e as PointerEvent).pointerType === "pen";
+    pickerFocus = showEmojiPicker && !finger && !matchMedia("(pointer: coarse)").matches;
   }
 </script>
 
@@ -436,22 +444,31 @@
         <span class="chip-size num">{formatSize(f.file.size)}</span>
         {#if f.photo && !f.op}
           <button
-            class="btn-ghost chip-mode"
+            class="btn btn-ghost chip-mode"
             type="button"
             onpointerdown={keepField}
             aria-pressed={f.original}
+            aria-describedby="{listId}-mode-{f.key}"
             title={f.original
               ? "Sent exactly as it is: includes any location and camera data. Press to send it compressed."
               : "Sent compressed: smaller, without its location and camera data. Press to send it as it is."}
             onclick={() => patch(f.key, { original: !f.original })}
           >Original (1:1)</button>
+          <!-- What the toggle means, in words a phone can see (it has no tooltips) -->
+          <span class="chip-note" id="{listId}-mode-{f.key}">{f.original ? "as it is, with location and camera data" : "compressed, without location data"}</span>
+        {/if}
+        {#if maxBytes && f.file.size > maxBytes && !(f.photo && !f.original) && !f.op && !f.error}
+          <!-- A file packed down before it goes may still fit: said, not refused -->
+          <span class="chip-note chip-warn">Over this server's {Math.floor(maxBytes / 1_000_000)} MB: it goes only if it packs down that far</span>
         {/if}
         {#if f.asIs && !f.op}
           <span class="chip-note" title="Videos, sounds and moving pictures are sent exactly as they are, with any location and camera data in them">Sent as it is: may include location</span>
         {/if}
         {#if f.op}
-          <span class="chip-bar" aria-hidden="true"
-            ><span style="width: {p && p.total > 0 ? Math.round((p.done / p.total) * 100) : 0}%"></span></span>
+          {@const pct = p && p.total > 0 ? Math.round((p.done / p.total) * 100) : 0}
+          <span class="chip-bar" role="progressbar" aria-label="Sending {f.file.name}" aria-valuemin={0} aria-valuemax={100} aria-valuenow={pct}
+            ><span style="width: {pct}%"></span></span>
+          <span class="chip-size num" aria-hidden="true">{pct}%</span>
         {/if}
         <button
           class="icon-btn"
@@ -462,7 +479,7 @@
         >
           <Icon name="close" size={14} />
         </button>
-        {#if f.error}<span class="chip-error" role="alert">{f.error}</span>{/if}
+        {#if f.error}<span class="chip-error" class:stopped={f.error === STOPPED} role="alert">{f.error}</span>{/if}
       </li>
     {/each}
   </ul>
@@ -543,7 +560,7 @@
       class="emoji-btn"
       type="button"
       onpointerdown={keepField}
-      onclick={(e) => { e.stopPropagation(); toggleEmojiPicker(); }}
+      onclick={(e) => { e.stopPropagation(); toggleEmojiPicker(e); }}
       title="Emoji, emotes and stickers"
       aria-label="Emoji, emotes and stickers"
       aria-haspopup="dialog"
@@ -553,7 +570,7 @@
     </button>
     {#if showEmojiPicker}
       <!-- svelte-ignore a11y_click_events_have_key_events, a11y_no_static_element_interactions -->
-      <div class="emoji-picker" use:onScreen onclick={(e) => e.stopPropagation()}>
+      <div class="emoji-picker" onclick={(e) => e.stopPropagation()}>
         <EmotePicker onpick={insertAtCaret} onsticker={onsticker ? (e) => onsticker(e) : undefined} {held} onclose={closePicker} autofocus={pickerFocus} />
       </div>
     {/if}
@@ -596,15 +613,18 @@
     white-space: nowrap;
   }
   .chip-size {
-    font-size: 0.8rem;
+    font-size: var(--fs-sm);
   }
   .chip-mode {
-    font-size: 0.8rem;
+    font-size: var(--fs-sm);
+    font-weight: 400;
     padding: 2px 8px;
   }
+  /* On, as every toggle here is (DESIGN.md): raised and ringed, never just hovered */
   .chip-mode[aria-pressed="true"] {
     color: var(--text-primary);
     background: var(--bg-hover);
+    box-shadow: inset 0 0 0 1px var(--text-muted);
   }
   .chip-bar {
     width: 80px;
@@ -620,11 +640,18 @@
     transition: width 0.2s;
   }
   .chip-note {
-    font-size: 0.8rem;
+    font-size: var(--fs-sm);
+  }
+  .chip-warn {
+    color: var(--warning);
+  }
+  /* Stopped by the person: not an error, so not in red */
+  .chip-error.stopped {
+    color: var(--text-secondary);
   }
   .chip-error {
     flex-basis: 100%;
-    font-size: 0.8rem;
+    font-size: var(--fs-sm);
     color: var(--danger);
   }
   .file-picker {
@@ -769,8 +796,11 @@
     cursor: default;
   }
 
+  /* Not the picker's box: it hangs from the whole message row (as the @ list
+     does), so it is inside the pane at any width without being measured.
+     Measured and shifted, it went off a phone's edge when it opened while the
+     panes were still sliding (B-01, D2-07). */
   .emoji-wrapper {
-    position: relative;
     display: flex;
     align-items: center;
   }
@@ -779,13 +809,13 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    width: 34px;
-    height: 34px;
+    width: var(--hit);
+    height: var(--hit);
     padding: 0;
     background: transparent;
     color: var(--text-secondary);
     border: none;
-    border-radius: 4px;
+    border-radius: var(--r-sm);
     cursor: pointer;
   }
 
@@ -797,14 +827,14 @@
   .emoji-picker {
     position: absolute;
     bottom: calc(100% + 8px);
-    right: 0;
+    right: 12px;
     width: 320px;
-    max-width: calc(100vw - 16px);
+    max-width: calc(100% - 24px);
     /* One size whatever the tab, so it never jumps under the pointer */
     height: min(380px, 60vh);
     background: var(--bg-secondary);
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: var(--r-md);
     box-shadow: var(--shadow-menu);
     display: flex;
     flex-direction: column;

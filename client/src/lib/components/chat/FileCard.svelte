@@ -15,6 +15,7 @@
   import { sniff, type Shown } from "../../file-sniff.js";
   import { fileImage, knownPictures, pictureUrl, playableUrl, playsMedia } from "../../media.js";
   import { uiPrefs } from "../../stores/ui-prefs.js";
+  import { settingsAsk } from "../../stores/channel-ui.js";
   import { reducedMotion } from "../../stores/emotes.js";
   import Icon from "../Icons.svelte";
 
@@ -31,8 +32,13 @@
     /** Its buttons and player are Tab stops: in a message list, only on the
      *  row the keyboard is on (R2-06). */
     tabbable?: boolean;
+    /** Shown without a press: a picture the person has just sent (their device
+     *  has it, and they chose it), or one they asked to see (Settings → Files'
+     *  Show). Never on its own for what a member sent: no decoder runs on that
+     *  before it is asked for. */
+    auto?: boolean;
   }
-  let { file, server, conv, onopen, ongone, tabbable = true }: Props = $props();
+  let { file, server, conv, onopen, ongone, tabbable = true, auto = false }: Props = $props();
   const tabindex = $derived(tabbable ? undefined : -1);
 
   let card = $state<HTMLElement | null>(null);
@@ -54,9 +60,17 @@
   /** Why what was loaded is not shown here, when it is a picture or a video
    *  that is not. */
   let withheld = $state<string | null>(null);
+  /** Why a moving picture is shown as its first frame alone (too long or too
+   *  big to play here), when it is. */
+  let stilled = $state<string | null>(null);
   /** A video or sound loaded while Settings → Files kept them from playing:
    *  it plays here as soon as they may. */
   let held = $state.raw<Shown | null>(null);
+  /** A reason as a sentence: the media crate's start in lower case. */
+  const sentence = (e: unknown) => {
+    const t = String(e).replace(/^Error: /, "").trim();
+    return t.charAt(0).toUpperCase() + t.slice(1) + (/[.!?]$/.test(t) ? "" : ".");
+  };
   $effect(() => {
     if (held && bytes && playsMedia($uiPrefs)) {
       const is = held;
@@ -69,8 +83,37 @@
     }
   });
 
+  let autoTried = false;
+  $effect(() => {
+    if (auto && !autoTried && /^image\//.test(file.mime ?? "") && !bytes && !url && !op) {
+      autoTried = true;
+      void fetchIt();
+    }
+  });
+
   /** A moving picture is shown still where the person wants nothing to move. */
   const still = $derived($reducedMotion || $uiPrefs.animate_emotes === "never");
+  // Asked for after it was drawn (reduced motion turned on, or "never"): the
+  // picture is made again the way it is wanted now, from what is already here
+  let drawnStill: boolean | null = null;
+  $effect(() => {
+    const want = still;
+    untrack(() => {
+      if (drawnStill === null || want === drawnStill || shown?.kind !== "image" || !url || op) return;
+      drawnStill = want;
+      const at = conv ?? { channel: 0 };
+      const was = loadedFor;
+      void fileImage(server, at, file, undefined, want)
+        .then((pic) => {
+          if (destroyed || was !== loadedFor || !url) return;
+          ongone?.(url);
+          URL.revokeObjectURL(url);
+          url = pictureUrl(pic.png);
+          stilled = pic.stilled;
+        })
+        .catch(() => {});
+    });
+  });
 
   const progress = $derived(op ? $fileProgress.get(op) : undefined);
   const seeking = $derived(progress?.stage === "seeking");
@@ -104,6 +147,7 @@
       bytes = null;
       shown = null;
       withheld = null;
+      stilled = null;
       held = null;
     });
   });
@@ -123,9 +167,11 @@
       const at = conv ?? { channel: 0 };
       const known = draw && !url ? knownPictures.get(file.hash) : undefined;
       if (known) {
-        const png = await fileImage(server, at, file, mine, still);
+        const pic = await fileImage(server, at, file, mine, still);
         if (destroyed || wanted !== loadedFor) return null;
-        url = pictureUrl(png);
+        url = pictureUrl(pic.png);
+        stilled = pic.stilled;
+        drawnStill = still;
         shown = known;
         return null;
       }
@@ -135,14 +181,16 @@
         const is = sniff(got);
         if (is?.kind === "image") {
           try {
-            const png = await fileImage(server, at, file, mine, still);
+            const pic = await fileImage(server, at, file, mine, still);
             if (destroyed || wanted !== loadedFor) return null;
-            url = pictureUrl(png);
+            url = pictureUrl(pic.png);
+            stilled = pic.stilled;
+            drawnStill = still;
             shown = is;
             knownPictures.set(file.hash, is);
           } catch (e) {
             if (destroyed || wanted !== loadedFor) return null;
-            withheld = `${String(e).replace(/^Error: /, "")}.`;
+            withheld = sentence(e);
           }
         } else if (is && !playsMedia($uiPrefs)) {
           withheld = "Videos and sounds play here once Settings → Files allows it.";
@@ -212,12 +260,18 @@
         {#if op}
           <span class="file-state" role="status">{seeking ? "Asking members…" : `Loading… ${percent}%`}</span>
           <div class="file-bar" aria-hidden="true"><div style="width: {seeking ? 0 : percent}%"></div></div>
-          <button class="btn-ghost" type="button" {tabindex} onclick={cancel} aria-label="Stop loading {file.name}">Cancel</button>
+          <div class="file-over-row">
+            <button class="btn btn-secondary" type="button" {tabindex} onclick={cancel} aria-label="Stop loading {file.name}">Cancel</button>
+          </div>
         {:else}
           <!-- Where "Asking members…" was, so it is seen where the eyes are (D2-11) -->
           {#if error}<span class="file-state file-error-over" role="alert">{error}</span>{/if}
-          <button class="btn-secondary" type="button" {tabindex} onclick={() => fetchIt()} aria-label="Load {file.name}">Load</button>
-          <button class="btn-ghost" type="button" {tabindex} onclick={save} aria-label="Download {file.name}"><Icon name="download" size={14} /> Download</button>
+          <div class="file-over-row">
+            <button class="btn btn-secondary" type="button" {tabindex} onclick={() => fetchIt()} aria-label="{error ? 'Try loading' : 'Load'} {file.name}{error ? ' again' : ''}"
+              >{error ? "Try again" : "Load"}</button
+            >
+            <button class="btn btn-secondary" type="button" {tabindex} onclick={save} aria-label="Download {file.name}"><Icon name="download" size={14} /> Download</button>
+          </div>
         {/if}
       </div>
     </div>
@@ -228,14 +282,24 @@
     <span class="file-size num">{formatSize(file.size)}</span>
     {#if op && !media}
       <span class="file-state" role="status">{seeking ? "Asking members…" : `${percent}%`}</span>
-      <button class="btn-ghost" type="button" {tabindex} onclick={cancel} aria-label="Stop loading {file.name}"><Icon name="close" size={14} /></button>
+      <button class="icon-btn" type="button" {tabindex} onclick={cancel} aria-label="Stop loading {file.name}"><Icon name="close" size={14} /></button>
     {:else if !media || bytes || url}
-      <button class="btn-ghost" type="button" {tabindex} onclick={save} aria-label="Download {file.name}"><Icon name="download" size={14} /> Download</button>
+      <button class="btn btn-ghost file-dl" type="button" {tabindex} onclick={save} aria-label="Download {file.name}"><Icon name="download" size={14} /> Download</button>
     {/if}
   </div>
+  {#if url && shown?.kind === "image" && stilled}
+    <!-- Whatever the person's motion setting: it would not move here either -->
+    <p class="file-note">{sentence(`Shown still: ${stilled}`)}</p>
+  {/if}
   {#if bytes && !shown}
     <p class="file-note">
       {withheld ?? "This file is not shown here."} Download it to open it with an app you trust.
+      {#if held}
+        <!-- Where the switch is, one press away (Settings → Files) -->
+        <button class="btn btn-ghost file-dl" type="button" {tabindex} onclick={() => settingsAsk.set({ tab: "files", place: "" })}
+          >Open Settings → Files</button
+        >
+      {/if}
     </p>
   {/if}
   {#if error && !(media && !bytes)}
@@ -291,21 +355,34 @@
     position: absolute;
     inset: 0;
     display: flex;
-    flex-wrap: wrap;
+    flex-direction: column;
     align-items: center;
     justify-content: center;
-    align-content: center;
     gap: 8px;
     padding: 12px;
   }
   /* A sound before it loads: one row the height of its player, so the list
      does not jump when it comes */
+  /* On the card's own surface, so its solid buttons stand out from it */
   .file-preview.sound {
     min-height: 64px;
+    background: transparent;
+  }
+  .file-preview.sound .file-over .btn {
+    box-shadow: none;
   }
   .file-preview.sound .file-over {
     position: static;
+    flex-direction: row;
+    flex-wrap: wrap;
     min-height: 64px;
+  }
+  /* On the smeared picture nothing can count on what is under it: the words
+     sit on the card's own surface, the buttons are solid (.btn-secondary) */
+  .file-over .file-state {
+    padding: 2px 8px;
+    border-radius: var(--r-sm);
+    background: var(--bg-secondary);
   }
   .file-over .file-state.file-error-over {
     color: var(--danger);
@@ -334,17 +411,36 @@
   }
   .file-size,
   .file-state {
-    font-size: 0.8rem;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
     white-space: nowrap;
   }
   .file-over .file-state {
-    flex-basis: 100%;
+    max-width: 100%;
+    white-space: normal;
     text-align: center;
     color: var(--text-primary);
   }
+  /* They float over a picture: lifted off it, so a dark preview cannot swallow them */
+  .file-over .btn {
+    background: var(--bg-secondary);
+    box-shadow: var(--shadow-menu);
+  }
+  .file-over .btn:hover:not(:disabled) {
+    background: var(--bg-hover);
+  }
+  .file-over-row {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 8px;
+  }
+  .file-dl {
+    padding: 4px 8px;
+    font-weight: 400;
+  }
   .file-bar {
-    flex-basis: 70%;
+    width: 70%;
     height: 4px;
     border-radius: 2px;
     background: var(--border);
@@ -359,7 +455,7 @@
   .file-error {
     margin: 0;
     padding: 0 10px 8px;
-    font-size: 0.8rem;
+    font-size: var(--fs-sm);
     color: var(--text-secondary);
   }
   .file-error {

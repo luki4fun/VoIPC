@@ -46,6 +46,8 @@ interface Exports {
   media_still(): number;
   media_still_len(): number;
   media_meta(i: number): number;
+  media_stilled(): number;
+  media_stilled_len(): number;
   media_error(): number;
   media_error_len(): number;
   media_read_pack(): number;
@@ -71,6 +73,8 @@ export interface Sanitized {
   h: number;
   frames: number;
   trimmed: boolean;
+  /** Shown as its first frame alone, and why (voipc-media `Clean::stilled`). */
+  stilled: string | null;
 }
 
 function instance(module: WebAssembly.Module, input: Uint8Array): Exports {
@@ -97,6 +101,7 @@ export function sanitizeIn(module: WebAssembly.Module, bytes: Uint8Array, profil
     h: x.media_meta(1),
     frames: x.media_meta(2),
     trimmed: x.media_meta(3) === 1,
+    stilled: x.media_stilled_len() ? text(x, x.media_stilled(), x.media_stilled_len()) : null,
   };
 }
 

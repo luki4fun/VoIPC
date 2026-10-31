@@ -84,13 +84,13 @@
     <div
       class="admin-dialog"
       class:wide={shown === "emotes"}
-      aria-label={shown === "emotes" ? "Emotes and stickers" : "Active bans"}
+      aria-label={shown === "emotes" ? "Server admin: emotes and stickers" : "Server admin: bans"}
       use:dialog={{ onclose: closePanel }}
     >
       {#if $emoteLimits}
         <div class="admin-tabs" role="tablist" aria-label="Admin">
           <button type="button" role="tab" aria-selected={shown === "bans"} class:active={shown === "bans"} onclick={() => leaveEmotes(() => (tab = "bans"))}>Bans</button>
-          <button type="button" role="tab" aria-selected={shown === "emotes"} class:active={shown === "emotes"} onclick={() => (tab = "emotes")}>Emotes</button>
+          <button type="button" role="tab" aria-selected={shown === "emotes"} class:active={shown === "emotes"} onclick={() => (tab = "emotes")}>Emotes and stickers</button>
         </div>
       {/if}
       {#if shown === "emotes"}
@@ -172,6 +172,7 @@
   }
 
   .admin-tabs button {
+    min-height: var(--hit);
     padding: 6px 12px;
     background: transparent;
     border: none;
@@ -204,6 +205,11 @@
     display: flex;
     justify-content: flex-end;
     gap: 8px;
+  }
+
+  .admin-cancel,
+  .admin-ok {
+    min-height: var(--hit);
   }
 
   .admin-cancel {

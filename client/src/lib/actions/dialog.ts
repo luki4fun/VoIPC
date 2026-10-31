@@ -65,10 +65,13 @@ export function dialog(node: HTMLElement, opts: DialogOptions = {}) {
   const focusables = () =>
     [...node.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((el) => el.tabIndex >= 0 && el.getClientRects().length > 0);
 
-  // After the content's own autofocus has had its turn
+  // After the content's own autofocus has had its turn. Svelte's `autofocus`
+  // only acts while nothing else has the focus, and a dialog opened by a click
+  // finds the clicked button focused: `data-autofocus` names where to start
+  // whatever had it (the picture's stage, so + − 0 zoom at once).
   queueMicrotask(() => {
     if (node.contains(document.activeElement)) return;
-    (node.querySelector<HTMLElement>("[autofocus]") ?? focusables()[0] ?? node).focus();
+    (node.querySelector<HTMLElement>("[data-autofocus], [autofocus]") ?? focusables()[0] ?? node).focus();
   });
 
   function onkeydown(e: KeyboardEvent) {

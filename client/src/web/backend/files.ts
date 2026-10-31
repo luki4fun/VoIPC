@@ -733,7 +733,9 @@ export async function fetchFile(
 
 /** file_image: a picture file as the PNG it may be shown as, opened and
  *  sanitized in one worker job (media.ts): its own bytes never reach the page.
- *  Fetched first where this tab does not keep it. */
+ *  Fetched first where this tab does not keep it. Framed as the desktop
+ *  app's (files.rs `file_image`): a JSON head saying why a moving picture
+ *  stands still when it does, its length first, then the PNG. */
 export async function fileImage(
   files: Files | null,
   server: string,
@@ -745,7 +747,7 @@ export async function fileImage(
 ): Promise<ArrayBuffer> {
   // The first frame alone where the person wants nothing to move
   // A copy: what is kept here stays the cache's
-  const pick = (m: Sanitized) => ((still && m.still) || m.png).slice().buffer as ArrayBuffer;
+  const pick = (m: Sanitized) => framePicture((still && m.still) || m.png, stilledOf(m));
   const motion = files?.motion ?? null;
   const key = `${file.hash}:${file.key}-${profile}-${motion?.side}-${motion?.keepMb}`;
   const hit = made.get(key);
@@ -770,6 +772,25 @@ export async function fileImage(
     bytes -= m.png.length + (m.still?.length ?? 0);
   }
   return pick(out);
+}
+
+/** Why a moving picture stands still, when it does (voipc-media
+ *  `Clean::stilled`, set exactly when `trimmed` left it one frame): the
+ *  crate's own words where the worker hands them on, else its words for a
+ *  frame too big. */
+function stilledOf(m: Sanitized & { stilled?: string | null }): string | null {
+  return m.stilled || (m.frames === 1 && m.trimmed ? "the animation is too big to play here" : null);
+}
+
+/** `png` behind a JSON head of `{ stilled }`, its length first (4 bytes
+ *  little-endian): what `file_image` answers, here as in the desktop app. */
+function framePicture(png: Uint8Array, stilled: string | null): ArrayBuffer {
+  const head = new TextEncoder().encode(JSON.stringify({ stilled }));
+  const out = new Uint8Array(4 + head.length + png.length);
+  new DataView(out.buffer).setUint32(0, head.length, true);
+  out.set(head, 4);
+  out.set(png, 4 + head.length);
+  return out.buffer;
 }
 
 /** Chat pictures made lately, by file and how (files.rs `file_image`'s

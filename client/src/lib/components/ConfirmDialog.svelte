@@ -5,6 +5,13 @@
 
   import { backdrop, dialog } from "../actions/dialog.js";
   import { answerConfirm, pendingConfirm } from "../stores/confirm.js";
+
+  /** The question's own box, unticked for every new question. */
+  let ticked = $state(false);
+  $effect(() => {
+    void $pendingConfirm;
+    ticked = false;
+  });
 </script>
 
 {#if $pendingConfirm}
@@ -18,11 +25,14 @@
           {#each q.details as line, i (i)}<li>{line}</li>{/each}
         </ul>
       {/if}
+      {#if q.option}
+        <label class="option"><input type="checkbox" bind:checked={ticked} /> {q.option}</label>
+      {/if}
       <div class="actions">
         <button class="btn btn-secondary" onclick={() => answerConfirm(false)}>
           {q.cancel ?? "Cancel"}
         </button>
-        <button class="btn {q.danger ? 'btn-danger' : 'btn-primary'}" onclick={() => answerConfirm(true)}>
+        <button class="btn {q.danger ? 'btn-danger' : 'btn-primary'}" onclick={() => answerConfirm(true, ticked)}>
           {q.confirm}
         </button>
       </div>
@@ -79,6 +89,22 @@
     font-size: var(--fs-sm);
     color: var(--text-secondary);
     word-break: break-all;
+  }
+
+  .option {
+    display: flex;
+    align-items: center;
+    gap: var(--sp-2);
+    min-height: var(--hit);
+    font-size: var(--fs-md);
+    color: var(--text-primary);
+  }
+
+  .option input {
+    flex-shrink: 0;
+    width: 18px;
+    height: 18px;
+    accent-color: var(--control-fill);
   }
 
   .actions {

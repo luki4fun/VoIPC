@@ -336,8 +336,14 @@ fn a_gif_frame_drawn_past_its_screen_is_cut_to_it() {
 /// A 1×1 GIF screen with `n` frames of `fw` × `fh`, each a few bytes of LZW:
 /// what a frame says it is, not what it holds, is what costs.
 fn gif_frames_past_screen(fw: u16, fh: u16, n: usize) -> Vec<u8> {
+    gif_frames_sized(&vec![(fw, fh); n])
+}
+
+/// `gif_frames_past_screen` with a frame of each size; each draws one white
+/// pixel at its corner.
+fn gif_frames_sized(sizes: &[(u16, u16)]) -> Vec<u8> {
     let mut g = b"GIF89a\x01\x00\x01\x00\x80\x00\x00\x00\x00\x00\xff\xff\xff".to_vec();
-    for _ in 0..n {
+    for (fw, fh) in sizes {
         g.extend_from_slice(&[0x2C, 0, 0, 0, 0]);
         g.extend_from_slice(&fw.to_le_bytes());
         g.extend_from_slice(&fh.to_le_bytes());
@@ -506,41 +512,8 @@ fn what_is_too_big_is_refused_before_anything_is_allocated_for_it() {
         sanitize(&screen, Profile::Emote),
         Err(Error::TooLarge(_))
     ));
-    let many: Vec<_> = (0..decode::MAX_FRAMES as u16 + 5)
-        .map(|i| {
-            (
-                0,
-                0,
-                1,
-                1,
-                vec![(i % 2) as u8],
-                gif::DisposalMethod::Keep,
-                10,
-            )
-        })
-        .collect();
-    assert_eq!(
-        sanitize(&gif_of(1, 1, &many), Profile::Emote).unwrap_err(),
-        Error::TooLarge("the animation has too many frames")
-    );
-    // A few KB of one-pixel frames on a big screen: each frame is a whole canvas
-    let dots: Vec<_> = (0..100u16)
-        .map(|i| {
-            (
-                i,
-                i,
-                1,
-                1,
-                vec![(i % 2) as u8],
-                gif::DisposalMethod::Keep,
-                10,
-            )
-        })
-        .collect();
-    assert_eq!(
-        sanitize(&gif_of(2048, 2048, &dots), Profile::Photo).unwrap_err(),
-        Error::TooLarge("the animation is too long to show")
-    );
+    // (An animation over its frame or work budget stands as its first frame:
+    // `an_animation_over_a_budget_stands_as_its_first_frame_and_says_why`)
     assert!(matches!(
         sanitize(&vec![0u8; (16 << 20) + 1], Profile::Emote),
         Err(Error::TooLarge(_))
@@ -557,6 +530,158 @@ fn what_is_too_big_is_refused_before_anything_is_allocated_for_it() {
     ]
     .concat();
     assert!(sanitize(&vp8x, Profile::Photo).is_err());
+}
+
+/// `n` one-pixel GIF frames, red then blue, the `i`th at (`i`, `i`) when
+/// `walk`, else all at the corner.
+fn dots(n: u16, walk: bool) -> Vec<GifFrame> {
+    (0..n)
+        .map(|i| {
+            let at = if walk { i } else { 0 };
+            (
+                at,
+                at,
+                1,
+                1,
+                vec![(i % 2) as u8],
+                gif::DisposalMethod::Keep,
+                10,
+            )
+        })
+        .collect()
+}
+
+/// anim3.webp with its three frames `times` over: an animated WebP of
+/// `3 × times` frames.
+fn webp_frames_repeated(times: usize) -> Vec<u8> {
+    let src = include_bytes!("../tests/fixtures/anim3.webp");
+    let (mut before, mut anmf, mut after) = (Vec::new(), Vec::new(), Vec::new());
+    let mut at = 12;
+    while at + 8 <= src.len() {
+        let len = u32::from_le_bytes(src[at + 4..at + 8].try_into().unwrap()) as usize;
+        let end = (at + 8 + len + (len & 1)).min(src.len());
+        let chunk = &src[at..end];
+        if &chunk[..4] == b"ANMF" {
+            anmf.extend_from_slice(chunk);
+        } else if anmf.is_empty() {
+            before.extend_from_slice(chunk);
+        } else {
+            after.extend_from_slice(chunk);
+        }
+        at = end;
+    }
+    let body = [before, anmf.repeat(times), after].concat();
+    [
+        b"RIFF".as_slice(),
+        &(body.len() as u32 + 4).to_le_bytes(),
+        b"WEBP",
+        &body,
+    ]
+    .concat()
+}
+
+#[test]
+fn an_animation_over_a_budget_stands_as_its_first_frame_and_says_why() {
+    // Shown as one plain PNG, with nothing to animate on hover
+    let one = |c: &Clean| {
+        let (w, h, f) = frames_of(&c.png);
+        assert_eq!(
+            (c.frames, f.len(), c.still.is_none(), c.trimmed, (w, h)),
+            (1, 1, true, true, (c.w, c.h))
+        );
+        (w, f.into_iter().next().unwrap())
+    };
+    let gif = gif_of(1, 1, &dots(decode::MAX_FRAMES as u16 + 5, false));
+    let c = sanitize(&gif, Profile::Emote).unwrap();
+    assert_eq!(
+        c.stilled,
+        Some("the animation has too many frames to play here")
+    );
+    let (w, f) = one(&c);
+    assert_eq!(px(&f, w, 0, 0), [255, 0, 0, 255], "its first frame");
+
+    // A few KB of one-pixel frames on a big screen, each a whole canvas: the
+    // reading stops at the work budget (the 24th), in the moving box
+    let c = sanitize(&gif_of(2048, 2048, &dots(100, true)), Profile::Photo).unwrap();
+    assert_eq!(c.stilled, Some("the animation is too long to play here"));
+    let (w, f) = one(&c);
+    assert_eq!((c.w, c.h), (1024, 1024));
+    // Its first dot alone: the second, blue at (1,1), would share this pixel
+    assert_eq!(px(&f, w, 0, 0), [255, 0, 0, 63]);
+
+    // A later frame too big to read, after a first that was fine (S-1: it is
+    // charged its own size before a pixel of it is read)
+    let c = sanitize(&gif_frames_sized(&[(1, 1), (4097, 4096)]), Profile::Photo).unwrap();
+    assert_eq!(c.stilled, Some("the animation is too big to play here"));
+    let (w, f) = one(&c);
+    assert_eq!(px(&f, w, 0, 0), [255, 255, 255, 255]);
+
+    // An APNG of more frames than are read
+    let mut apng = Vec::new();
+    {
+        let mut e = png::Encoder::new(&mut apng, 1, 1);
+        e.set_color(png::ColorType::Rgba);
+        e.set_animated(decode::MAX_FRAMES as u32 + 5, 0).unwrap();
+        let mut wr = e.write_header().unwrap();
+        for i in 0..decode::MAX_FRAMES + 5 {
+            wr.write_image_data(&[0, 0, (i % 2) as u8 * 255, 255])
+                .unwrap();
+        }
+        wr.finish().unwrap();
+    }
+    let c = sanitize(&apng, Profile::Sticker).unwrap();
+    assert_eq!(
+        c.stilled,
+        Some("the animation has too many frames to play here")
+    );
+    let (w, f) = one(&c);
+    assert_eq!(px(&f, w, 0, 0), [0, 0, 0, 255]);
+
+    // An animated WebP of more frames than are read: its first frame, as the
+    // 3-frame one shows it
+    let short = sanitize(&webp_frames_repeated(1), Profile::Sticker).unwrap();
+    assert_eq!((short.frames, short.stilled), (3, None));
+    let c = sanitize(&webp_frames_repeated(101), Profile::Sticker).unwrap();
+    assert_eq!(
+        c.stilled,
+        Some("the animation has too many frames to play here")
+    );
+    let (_, f) = one(&c);
+    assert_eq!(f, frames_of(short.still.as_ref().unwrap()).2[0]);
+
+    // Within every budget it moves, and says nothing
+    let fine = sanitize(&gif_of(1, 1, &dots(20, false)), Profile::Emote).unwrap();
+    assert_eq!((fine.frames, fine.trimmed, fine.stilled), (20, false, None));
+}
+
+#[test]
+fn what_is_refused_for_anything_but_an_animation_budget_stays_refused() {
+    // Over a budget before its first frame (S-1): nothing to show
+    for n in [1, 2] {
+        assert_eq!(
+            sanitize(&gif_frames_past_screen(4097, 4096, n), Profile::Photo).unwrap_err(),
+            Error::TooLarge("the animation is too big to show")
+        );
+    }
+    // A screen too big to animate is refused before any frame is read
+    assert_eq!(
+        sanitize(&gif_of(4097, 4096, &dots(2, true)), Profile::Photo).unwrap_err(),
+        Error::TooLarge("the animation is too big to show")
+    );
+    // Damaged before its budget ran out: refused as damaged, as before
+    let long = gif_of(2048, 2048, &dots(100, true));
+    let cut = &long[..long.len() * 10 / 100];
+    assert!(
+        matches!(sanitize(cut, Profile::Photo), Err(Error::Corrupt(_))),
+        "{:?}",
+        sanitize(cut, Profile::Photo).map(|c| c.frames)
+    );
+    let mut first_broken = gif_frames_sized(&[(1, 1); 400]);
+    first_broken[19 + 10] = 12; // the first frame's LZW code size
+    assert!(matches!(
+        sanitize(&first_broken, Profile::Emote),
+        Err(Error::Corrupt(_))
+    ));
 }
 
 #[test]

@@ -8,6 +8,12 @@
 // role="menuitem"; puts focus on the first item; moves with the arrow keys,
 // Home and End; closes on Escape or Tab and hands focus back to what opened
 // it; and is a layer on the back stack, so Android's Back closes it too.
+//
+// A part of the menu marked `data-keys="own"` (the emoji picker inside the
+// reactions menu) walks its own grid: the menu leaves its arrows, Home, End
+// and Tab alone, and only closes once the focus has left the menu. This
+// listener runs before the part's own Svelte handlers (those are delegated to
+// the document), so stopping the event there would come too late.
 
 import { pushLayer } from "../stores/back-stack.js";
 
@@ -26,8 +32,12 @@ export function menu(node: HTMLElement, opts: MenuOptions) {
 
   node.setAttribute("role", "menu");
   if (opts.label) node.setAttribute("aria-label", opts.label);
+  // Inside an own-keys part only its Tab stops count (the picker's selected
+  // kind, its search, its first cell): the arrows step into it there
   const items = () =>
-    [...node.querySelectorAll<HTMLElement>(ITEMS)].filter((el) => el.getClientRects().length > 0);
+    [...node.querySelectorAll<HTMLElement>(ITEMS)].filter(
+      (el) => el.getClientRects().length > 0 && !(el.tabIndex < 0 && el.closest('[data-keys="own"]')),
+    );
   for (const b of node.querySelectorAll<HTMLElement>("button")) {
     if (!b.hasAttribute("role")) b.setAttribute("role", "menuitem");
   }
@@ -37,6 +47,16 @@ export function menu(node: HTMLElement, opts: MenuOptions) {
   });
 
   function onkeydown(e: KeyboardEvent) {
+    const own = (e.target as HTMLElement | null)?.closest?.('[data-keys="own"]');
+    if (own && node.contains(own) && e.key !== "Escape") {
+      // After the browser has moved the focus, which it does once this returns
+      if (e.key === "Tab") {
+        setTimeout(() => {
+          if (!node.contains(document.activeElement)) options.onclose();
+        });
+      }
+      return;
+    }
     const list = items();
     const at = list.indexOf(document.activeElement as HTMLElement);
     const go = (i: number) => {

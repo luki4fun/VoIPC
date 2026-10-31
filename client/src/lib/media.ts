@@ -18,11 +18,26 @@ import { isAndroidApp, isWeb } from "./stores/platform";
 /** crates/voipc-media `Profile`. */
 export const PROFILE = { emote: 0, sticker: 1, photo: 2 } as const;
 
-/** A file's picture as the PNG it may be shown as, from the file's own copy
- *  (desktop: `files.rs file_image`; browser: `web/backend/files.ts`). Throws
- *  why it is not shown. */
-export async function fileImage(server: string, conv: FileConv, file: FileBlob, op?: string, still = false): Promise<Uint8Array> {
-  return new Uint8Array(await invoke<ArrayBuffer>("file_image", { server, conv, file, profile: PROFILE.photo, op, still }));
+/** A file's picture: the PNG it may be shown as, and why it stands still
+ *  when a moving one does (voipc-media `Clean::stilled`: it ran past a budget
+ *  and is shown as its first frame alone). */
+export interface FilePicture {
+  png: Uint8Array;
+  stilled: string | null;
+}
+
+/** A file's picture, from the file's own copy (desktop: `files.rs
+ *  file_image`; browser: `web/backend/files.ts`). Throws why it is not shown. */
+export async function fileImage(server: string, conv: FileConv, file: FileBlob, op?: string, still = false): Promise<FilePicture> {
+  return unframePicture(await invoke<ArrayBuffer>("file_image", { server, conv, file, profile: PROFILE.photo, op, still }));
+}
+
+/** `file_image`'s answer: a JSON head (its length first, 4 bytes
+ *  little-endian), then the PNG. */
+export function unframePicture(buf: ArrayBuffer): FilePicture {
+  const len = new DataView(buf).getUint32(0, true);
+  const head = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, len))) as { stilled?: unknown };
+  return { png: new Uint8Array(buf, 4 + len), stilled: typeof head.stilled === "string" && head.stilled ? head.stilled : null };
 }
 
 /** Files already loaded and found to be pictures, by hash: a card that comes

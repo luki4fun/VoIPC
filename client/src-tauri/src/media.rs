@@ -51,28 +51,45 @@ pub async fn sanitize(
 /// Chat pictures made lately, by file and how (`file_image`): a channel's
 /// cards come and go as it scrolls or is switched to, and making one again is
 /// a decrypt and hundreds of ms of sanitizing. The newest last.
-static MADE: Mutex<Vec<Made>> = Mutex::new(Vec::new());
-/// A picture's key, its PNG, and its first frame when it moves.
-type Made = (String, Vec<u8>, Option<Vec<u8>>);
+static MADE: Mutex<Vec<(String, Made)>> = Mutex::new(Vec::new());
 /// What `MADE` may hold, in bytes.
 const MADE_BYTES: usize = 64 << 20;
 
-/// A picture made as `key` before: its PNG, and its first frame when it moves.
-pub fn made(key: &str) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
+/// A chat picture as made: its PNG, its first frame when it moves, and why it
+/// stands still when a moving one does (`Clean::stilled`).
+#[derive(Clone)]
+pub struct Made {
+    pub png: Vec<u8>,
+    pub first: Option<Vec<u8>>,
+    pub stilled: Option<&'static str>,
+}
+
+impl From<Clean> for Made {
+    fn from(c: Clean) -> Made {
+        Made {
+            png: c.png,
+            first: c.still,
+            stilled: c.stilled,
+        }
+    }
+}
+
+/// A picture made as `key` before.
+pub fn made(key: &str) -> Option<Made> {
     let mut all = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    let at = all.iter().position(|(k, ..)| k == key)?;
+    let at = all.iter().position(|(k, _)| k == key)?;
     let hit = all.remove(at);
-    let out = (hit.1.clone(), hit.2.clone());
+    let out = hit.1.clone();
     all.push(hit);
     Some(out)
 }
 
 /// Keep what was made as `key`; the least recently asked for go past the cap.
-pub fn keep_made(key: String, png: Vec<u8>, still: Option<Vec<u8>>) {
-    let size = |e: &Made| e.1.len() + e.2.as_ref().map_or(0, Vec::len);
+pub fn keep_made(key: String, made: Made) {
+    let size = |e: &(String, Made)| e.1.png.len() + e.1.first.as_ref().map_or(0, Vec::len);
     let mut all = MADE.lock().unwrap_or_else(|e| e.into_inner());
-    all.retain(|(k, ..)| *k != key);
-    all.push((key, png, still));
+    all.retain(|(k, _)| *k != key);
+    all.push((key, made));
     let mut total: usize = all.iter().map(size).sum();
     while total > MADE_BYTES && all.len() > 1 {
         total -= size(&all.remove(0));

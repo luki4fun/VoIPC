@@ -7,9 +7,10 @@
 import { invoke } from "@tauri-apps/api/core";
 import { get, writable } from "svelte/store";
 import { scoped } from "./scoped";
-import { cleanList, type Emote } from "../emote-rules";
+import { cleanList, countKinds, type Emote } from "../emote-rules";
 import { pictureUrl } from "../media";
-import { confirmAction } from "./confirm";
+import { confirmChoice } from "./confirm";
+import { uiPrefs, updateUiPrefs } from "./ui-prefs";
 import { formatSize } from "../file-rules";
 import { savedServers } from "./settings";
 import { serverName } from "./servers";
@@ -207,7 +208,20 @@ export function downloadEmotes(server: string): void {
   for (const e of get(emoteSets.peek(server)).emotes) ask(server, e, "fetch");
 }
 
+/** Once the first-run questions (microphone, layout) are answered: a question
+ *  about emotes stacked on "Let VoIPC hear you" was answered by a stray click.
+ *  shortcut: those dialogs keep no store of their own, so their boxes are
+ *  looked for; at most ten minutes, then it asks anyway. */
+async function afterFirstRun(): Promise<void> {
+  const open = () => typeof document !== "undefined" && !!document.querySelector(".audio-setup, .layout-setup");
+  // The setup comes up as the connection does, a moment after the list may
+  await new Promise((r) => setTimeout(r, 1500));
+  for (let i = 0; open() && i < 1200; i++) await new Promise((r) => setTimeout(r, 500));
+}
+
 async function askMobileData(server: string, emotes: Emote[]) {
+  // "Always on this server", said before: no question, as on Wi-Fi
+  if (get(uiPrefs).emotes_mobile_ok.includes(server)) return downloadEmotes(server);
   hold(server, { bytes: 0, missing: null });
   const missing = new Set(
     await invoke<string[]>("emote_missing", { items: emotes.map((e) => ({ hash: e.hash, sticker: e.sticker })) }).catch(() => []),
@@ -217,15 +231,31 @@ async function askMobileData(server: string, emotes: Emote[]) {
   hold(server, { bytes, missing });
   if (askedMobile.has(server)) return;
   askedMobile.add(server);
-  const ok = await confirmAction({
+  await afterFirstRun();
+  // Downloaded meanwhile (back on Wi-Fi, or "Download now" in the picker)
+  if (!get(emoteWait).has(server)) return;
+  const want = emotes.filter((e) => missing.has(urlKey(e.hash, e.sticker)));
+  const stickers = want.filter((e) => e.sticker).length;
+  const { ok, option } = await confirmChoice({
     title: "Download emotes on mobile data?",
     body:
-      `${serverName(server, get(savedServers))} has ${missing.size} emotes and stickers this device does not have yet: ` +
+      `${serverName(server, get(savedServers))} has ${countKinds(want.length - stickers, stickers)} this device does not have yet: ` +
       `${formatSize(bytes)}. Until they are downloaded they show as their names; on Wi-Fi they come by themselves.`,
     confirm: `Download ${formatSize(bytes)}`,
     cancel: "Wait for Wi-Fi",
+    // Kept only with Download: "always wait" is what not ticking it already is
+    option: "Always download them on this server, without asking",
   });
+  if (ok && option) mobileOk(server, true);
   if (ok) downloadEmotes(server);
+}
+
+/** `server` in or out of "Always on this server" (Settings → Files undoes it). */
+export function mobileOk(server: string, on: boolean): void {
+  updateUiPrefs((p) => {
+    const rest = p.emotes_mobile_ok.filter((s) => s !== server);
+    p.emotes_mobile_ok = on ? [...rest, server] : rest;
+  });
 }
 
 const connection = (globalThis.navigator as { connection?: EventTarget } | undefined)?.connection;
@@ -289,6 +319,7 @@ export function noteEmotes(server: string, names: string[]): void {
 /** A server taken off this device's list: what was kept here of how its
  *  emotes are used goes too, as the rest of it does. */
 export function forgetEmotes(server: string): void {
+  if (get(uiPrefs).emotes_mobile_ok.includes(server)) mobileOk(server, false);
   for (const [store, key] of [
     [recentEmotes, RECENT_KEY],
     [favEmotes, FAV_KEY],

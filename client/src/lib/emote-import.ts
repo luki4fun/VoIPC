@@ -65,17 +65,28 @@ export interface Prepared {
   /** The sanitizer's PNG: what the importer shows. */
   preview: Uint8Array;
   still: Uint8Array | null;
+  /** Too long or too big to move: shown as its first frame, and why. */
+  stilled: string | null;
 }
 
 export async function prepareEmote(bytes: Uint8Array, sticker: boolean, maxBytes: number): Promise<Prepared> {
   const buf = await invokeWithBytes<ArrayBuffer>("prepare_emote", bytes, {
     "x-voipc-prepare": asciiJson({ sticker, max_bytes: maxBytes }),
   });
-  const { head, parts } = unframe<{ w: number; h: number; frames: number; how: Made; upload: number; preview: number; still: number }>(
+  const { head, parts } = unframe<{ w: number; h: number; frames: number; how: Made; upload: number; preview: number; still: number; stilled?: string | null }>(
     buf,
     (h) => [h.upload, h.preview, h.still],
   );
-  return { w: head.w, h: head.h, frames: head.frames, how: head.how, upload: parts[0], preview: parts[1], still: head.still ? parts[2] : null };
+  return {
+    w: head.w,
+    h: head.h,
+    frames: head.frames,
+    how: head.how,
+    upload: parts[0],
+    preview: parts[1],
+    still: head.still ? parts[2] : null,
+    stilled: head.stilled ?? null,
+  };
 }
 
 /** Add one (admins): done when the server has it. `w` × `h`: its shape as

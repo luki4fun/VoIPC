@@ -80,8 +80,20 @@ export async function sendFile(server: string, conv: FileConv, bytes: Uint8Array
   if (!isAndroidApp) return invoke<FileBlob>("send_file", bytes, { headers });
   // Under the op, so a cancel while it stages lets the bytes go too
   const id = op ?? stageId();
-  return invoke<FileBlob>("send_file", {}, { headers: { ...headers, ...(await stage(bytes, id)) } });
+  try {
+    const staged = await stage(bytes, id);
+    // Stopped after the last piece went over, before the send itself
+    if (op && stopped.has(op)) throw "cancelled";
+    return await invoke<FileBlob>("send_file", {}, { headers: { ...headers, ...staged } });
+  } finally {
+    if (op) stopped.delete(op);
+  }
 }
+
+/** Sends stopped while their bytes were still being staged (Android): the
+ *  backend lets go of what it has, and the next piece must not start a new
+ *  stage under the same name, which went out as a cut-off file. */
+const stopped = new Set<string>();
 
 /**
  * Android's IPC carries no raw request body (Tauri reads one only through a
@@ -89,7 +101,14 @@ export async function sendFile(server: string, conv: FileConv, bytes: Uint8Array
  * base64 chunks (`file_stage`), and the command names the stage (D2-03).
  */
 async function stage(bytes: Uint8Array, id: string): Promise<Record<string, string>> {
-  for (const chunk of base64Chunks(bytes)) await invoke("file_stage", { id, chunk });
+  for (const chunk of base64Chunks(bytes)) {
+    if (stopped.has(id)) {
+      // A piece already on its way may have started a stage again: let it go
+      await invoke("cancel_file", { op: id }).catch(() => {});
+      throw "cancelled";
+    }
+    await invoke("file_stage", { id, chunk });
+  }
   return { "x-voipc-staged": id };
 }
 
@@ -124,6 +143,11 @@ export function fetchFile(server: string, conv: FileConv, file: FileBlob, op?: s
 }
 
 export function cancelFile(op: string): Promise<void> {
+  if (isAndroidApp) {
+    stopped.add(op);
+    // A load's op never stages: not kept past any staging there could be
+    setTimeout(() => stopped.delete(op), 60_000);
+  }
   return invoke("cancel_file", { op });
 }
 

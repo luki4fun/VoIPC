@@ -14,6 +14,7 @@
   import Icon from "../Icons.svelte";
   import Emote from "./Emote.svelte";
   import { EMOJI_CATEGORIES, EMOJI_NAMES, NAME_OF } from "../../emoji.js";
+  import { drawsAsOne } from "../../emoji-support.js";
   import { byPack, byRecent, type Emote as Item } from "../../emote-rules.js";
   import { downloadEmotes, emoteSets, emoteWait, favEmotes, recentEmotes, toggleFav } from "../../stores/emotes.js";
   import { formatSize } from "../../file-rules.js";
@@ -27,7 +28,7 @@
     /** A sticker, sent at once; absent where none may be sent here. */
     onsticker?: (e: Item) => void;
     /** Slow mode holds a sticker as it holds the draft. */
-    held?: { title: string } | null;
+    held?: { title: string; label?: string } | null;
     /** Escape: the picker alone closes. Absent where its owner closes it on
      *  Escape (the reactions' menu). */
     onclose?: () => void;
@@ -63,6 +64,10 @@
   let query = $state("");
   const q = $derived(fold(query.trim()));
   const matches = (e: Item) => fold(`${e.name} ${e.pack}`).includes(q);
+  /** The name typed first, then names that start so, then a word of one
+   *  (`fire` before `heart_on_fire`); the sort keeps each group's order. */
+  const rank = (name: string) =>
+    name === q ? 0 : name.startsWith(q) ? 1 : name.split("_").some((w) => w.startsWith(q)) ? 2 : 3;
   const emote = (e: Item): Cell => ({ kind: "emote", e });
   const sticker = (e: Item): Cell => ({ kind: "sticker", e });
 
@@ -90,9 +95,11 @@
       }
       const seen = new Set<string>();
       const emoji = Object.entries(EMOJI_NAMES)
-        .filter(([name, e]) => name.includes(q) && !seen.has(e) && !!seen.add(e))
+        .filter(([name, e]) => name.includes(q) && drawsAsOne(e))
+        .sort(([a], [b]) => rank(a) - rank(b))
+        .filter(([, e]) => !seen.has(e) && !!seen.add(e))
         .map(([name, e]): Cell => ({ kind: "emoji", emoji: e, name }));
-      const found = emotes.filter(matches);
+      const found = emotes.filter(matches).sort((a, b) => rank(a.name) - rank(b.name));
       return [
         ...(found.length ? [{ key: "found", label: "This server's", cells: found.map(emote) }] : []),
         ...(emoji.length ? [{ key: "emoji", label: "Emoji", cells: emoji }] : []),
@@ -101,7 +108,13 @@
     if (current === "emotes") return grouped(emotes, emote, "Emotes");
     if (current === "stickers") return grouped(stickers, sticker, "Stickers");
     const cat = EMOJI_CATEGORIES[current];
-    return [{ key: cat.label, label: "", cells: cat.emojis.map((emoji): Cell => ({ kind: "emoji", emoji, name: NAME_OF.get(emoji) })) }];
+    return [
+      {
+        key: cat.label,
+        label: "",
+        cells: cat.emojis.filter(drawsAsOne).map((emoji): Cell => ({ kind: "emoji", emoji, name: NAME_OF.get(emoji) })),
+      },
+    ];
   });
   const first = $derived(sections.find((s) => s.cells.length)?.cells[0]);
   const cellKey = (c: Cell) => (c.kind === "emoji" ? c.emoji : `${c.kind}:${c.e.name}`);
@@ -116,10 +129,17 @@
     onpick(c.kind === "emoji" ? c.emoji : `:${c.e.name}:`, keep);
   }
 
-  /** Right click, or a long press on a touch screen: a favourite, or no longer. */
+  /** Right click, or a long press on a touch screen: a favourite, or no longer.
+   *  Said, since the emote moves away from under the pointer as it does. */
+  let favSaid = $state("");
+  let favTimer: ReturnType<typeof setTimeout> | undefined;
   function fav(ev: MouseEvent, e: Item) {
     ev.preventDefault();
+    const was = favs.includes(e.name);
     toggleFav(server, e.name);
+    favSaid = was ? `:${e.name}: is no longer a favourite` : `:${e.name}: is a favourite now`;
+    clearTimeout(favTimer);
+    favTimer = setTimeout(() => (favSaid = ""), 3000);
   }
 
   // A press never takes the focus from where it is: the message box keeps its
@@ -188,18 +208,54 @@
       onclose();
     }
   }
+
+  /** The tabs, in their order on screen: one Tab stop, the arrows walk them. */
+  const tabs = $derived<Tab[]>([
+    ...(emotes.length ? (["emotes"] as Tab[]) : []),
+    ...(stickers.length ? (["stickers"] as Tab[]) : []),
+    ...EMOJI_CATEGORIES.map((_, i) => i),
+  ]);
+  let tabRow = $state<HTMLElement | null>(null);
+  function onTabKey(e: KeyboardEvent) {
+    if (e.key === "ArrowDown") {
+      e.preventDefault();
+      e.stopPropagation();
+      search?.focus();
+      return;
+    }
+    const at = tabs.indexOf(current);
+    const to =
+      e.key === "ArrowRight" ? at + 1 : e.key === "ArrowLeft" ? at - 1 : e.key === "Home" ? 0 : e.key === "End" ? tabs.length - 1 : null;
+    if (to === null) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const next = (to + tabs.length) % tabs.length;
+    choose(tabs[next]);
+    tabRow?.querySelectorAll<HTMLElement>('[role="tab"]')[next]?.focus();
+  }
+
+  const uid = $props.id();
+  /** A screen with no hover is held, not right-clicked (an emulator's touch
+   *  screen says "fine pointer" but still has no hover). */
+  const touchHint = typeof matchMedia === "function" && matchMedia("(hover: none)").matches;
+  const searchLabel = $derived(current === "stickers" ? "Search stickers" : emotes.length ? "Search emoji and emotes" : "Search emoji");
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
-<div class="ep" onkeydown={onKey}>
-  <div class="ep-tabs" role="tablist" aria-label="Kinds of emoji">
+<div class="ep" data-keys="own" onkeydown={onKey}>
+  <!-- The selected tab is the row's one Tab stop (roving), so the row takes none -->
+  <!-- svelte-ignore a11y_interactive_supports_focus -->
+  <div class="ep-tabs" role="tablist" aria-label="Kinds of emoji" bind:this={tabRow} onkeydown={onTabKey}>
     {#if emotes.length}
       <button
         class="ep-tab"
         class:active={current === "emotes"}
         type="button"
         role="tab"
+        id="{uid}-tab-emotes"
         aria-selected={current === "emotes"}
+        aria-controls="{uid}-panel"
+        tabindex={current === "emotes" ? 0 : -1}
         title="This server's emotes"
         aria-label="This server's emotes"
         onpointerdown={keep}
@@ -212,7 +268,10 @@
         class:active={current === "stickers"}
         type="button"
         role="tab"
+        id="{uid}-tab-stickers"
         aria-selected={current === "stickers"}
+        aria-controls="{uid}-panel"
+        tabindex={current === "stickers" ? 0 : -1}
         title="Stickers"
         aria-label="Stickers"
         onpointerdown={keep}
@@ -225,7 +284,10 @@
         class:active={current === idx}
         type="button"
         role="tab"
+        id="{uid}-tab-{idx}"
         aria-selected={current === idx}
+        aria-controls="{uid}-panel"
+        tabindex={current === idx ? 0 : -1}
         title={cat.label}
         aria-label={cat.label}
         onpointerdown={keep}
@@ -236,14 +298,22 @@
   <input
     class="ep-search"
     type="search"
-    placeholder={current === "stickers" ? "Search stickers" : "Search emoji and emotes"}
-    aria-label={current === "stickers" ? "Search stickers" : "Search emoji and emotes"}
+    placeholder={searchLabel}
+    aria-label={searchLabel}
     bind:value={query}
     bind:this={search}
     onkeydown={onSearchKey}
   />
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="ep-body" bind:this={body} onkeydown={onGridKey}>
+  <!-- Its first cell is the Tab stop into the grid, so the panel itself takes none -->
+  <!-- svelte-ignore a11y_no_static_element_interactions, a11y_interactive_supports_focus -->
+  <div
+    class="ep-body"
+    id="{uid}-panel"
+    role="tabpanel"
+    aria-labelledby="{uid}-tab-{current}"
+    bind:this={body}
+    onkeydown={onGridKey}
+  >
     {#each sections as s, si (s.key)}
       {#if s.label}<div class="ep-head">{s.label}</div>{/if}
       <div class="ep-grid" class:stickers={s.cells[0]?.kind === "sticker"}>
@@ -290,13 +360,18 @@
       <p class="ep-none">Nothing is called “{query.trim()}”.</p>
     {/each}
   </div>
-  {#if wait?.bytes && (current === "emotes" || current === "stickers")}
+  {#if favSaid}
+    <p class="ep-hint" role="status">{favSaid}</p>
+  {:else if held && current === "stickers"}
+    <!-- Said where the stickers are: a greyed one has no tooltip on a phone -->
+    <p class="ep-hint" role="status">{held.title}{held.label ? `; the next in ${held.label}` : ""}.</p>
+  {:else if wait?.bytes && (current === "emotes" || current === "stickers")}
     <p class="ep-hint">
       They wait for Wi-Fi.
-      <button class="btn-ghost" type="button" onpointerdown={keep} onclick={() => downloadEmotes(server)}>Download {formatSize(wait.bytes)} now</button>
+      <button class="btn btn-ghost ep-dl" type="button" onpointerdown={keep} onclick={() => downloadEmotes(server)}>Download {formatSize(wait.bytes)} now</button>
     </p>
   {:else if current === "emotes" || current === "stickers"}
-    <p class="ep-hint">Right-click or hold one to make it a favourite.</p>
+    <p class="ep-hint">{touchHint ? "Hold one to make it a favourite." : "Right-click one to make it a favourite."}</p>
   {/if}
 </div>
 
@@ -318,17 +393,22 @@
     display: flex;
     align-items: center;
     justify-content: center;
-    min-height: 30px;
+    min-width: 0;
+    min-height: 32px;
     padding: 2px 0;
     font-size: var(--fs-lg);
     color: var(--text-secondary);
     background: transparent;
     border: none;
-    border-radius: 4px;
+    border-radius: var(--r-sm);
     cursor: pointer;
-    opacity: 0.55;
+    opacity: 0.75;
     line-height: 1;
     overflow: hidden;
+  }
+  /* Inside: the row's own edge would clip a ring drawn outside */
+  .ep-tab:focus-visible {
+    outline-offset: -2px;
   }
   .ep-tab:hover,
   .ep-tab:focus-visible {
@@ -379,10 +459,13 @@
     font-size: var(--fs-2xl);
     background: transparent;
     border: none;
-    border-radius: 4px;
+    border-radius: var(--r-sm);
     cursor: pointer;
     line-height: 1;
     overflow: hidden;
+  }
+  .ep-cell:focus-visible {
+    outline-offset: -2px;
   }
   .ep-cell.ep-sticker {
     height: 72px;
@@ -409,6 +492,9 @@
     height: 64px;
     max-height: 64px;
   }
+  .ep-dl {
+    padding: 4px 8px;
+  }
   .ep-none,
   .ep-hint {
     margin: 0;
@@ -417,6 +503,21 @@
     color: var(--text-secondary);
   }
   @media (pointer: coarse) {
+    /* A finger's size: the row scrolls sideways rather than shrink a tab */
+    .ep-tabs {
+      overflow-x: auto;
+      scrollbar-width: none;
+    }
+    .ep-tabs::-webkit-scrollbar {
+      display: none;
+    }
+    .ep-tab {
+      flex: 1 0 var(--hit);
+      min-height: var(--hit);
+    }
+    .ep-search {
+      min-height: var(--hit);
+    }
     .ep-grid {
       grid-template-columns: repeat(auto-fill, minmax(44px, 1fr));
     }

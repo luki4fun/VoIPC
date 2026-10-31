@@ -543,6 +543,9 @@
    * which joins the thread of what it answers, if that is in one.
    */
   async function sendMessage(content: string, refs?: { replyTo: string; thread: string }, file?: FileRef) {
+    // Your own message is followed to, from wherever you had scrolled (not
+    // one into a thread: the list under the pane stays where it was)
+    if (!refs) atEnd = true;
     const answering = replyingTo;
     replyingTo = null;
     const replyTo = refs?.replyTo ?? answering?.id ?? null;
@@ -640,6 +643,7 @@
     const t = targetNow();
     const conv = fileConvOf(t);
     if (!conv) throw new Error("Files cannot be sent to them now");
+    if (!refs) atEnd = true;
     const answering = refs ? null : replyingTo;
     const ready = await prepare(file, original);
     const max = get(fileLimits.peek(t.server))?.max_bytes;
@@ -804,10 +808,17 @@
   }
 
   /** Files dropped on the conversation go to its composer, which stages them. */
+  /** Files held over the chat: it says it takes them before they are let go. */
+  let dragging = $state(false);
   function dropFiles(e: DragEvent) {
     if (!e.dataTransfer?.types.includes("Files") || !canSendFiles) return;
     e.preventDefault();
+    dragging = e.type === "dragover";
     if (e.type === "drop") composer?.addFiles(e.dataTransfer.files);
+  }
+  function leaveDrag(e: DragEvent) {
+    const into = e.relatedTarget as Node | null;
+    if (!into || !(e.currentTarget as HTMLElement).contains(into)) dragging = false;
   }
   const canSendFiles = $derived(!!$fileLimits && fileConv !== null);
 
@@ -1023,7 +1034,10 @@
 
   <div class="chat-body">
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="chat-main" ondragover={dropFiles} ondrop={dropFiles}>
+  <div class="chat-main" ondragover={dropFiles} ondrop={dropFiles} ondragleave={leaveDrag}>
+  {#if dragging}
+    <div class="drop-zone" aria-hidden="true"><Icon name="paperclip" size={20} /> Drop to attach</div>
+  {/if}
   <div class="messages" bind:this={messagesContainer} onscroll={onMessagesScroll}>
     {#if !isDmMode && isLobby}
       <div class="empty-state">Open a text channel to chat</div>
@@ -1083,6 +1097,7 @@
       conversation={`${$serverAddress}|dm|${$activeDmUserId}`}
       onsend={sendMessage}
       onsendfile={canSendFiles ? sendFileMessage : undefined}
+      maxBytes={$fileLimits?.max_bytes}
       onsticker={$emoteSets.stickers ? (e) => sendMessage(stickerText(e)) : undefined}
       replying={replyingTo?.username ?? null}
       oncancelreply={() => (replyingTo = null)}
@@ -1100,6 +1115,7 @@
       {held}
       onsend={sendMessage}
       onsendfile={canSendFiles ? sendFileMessage : undefined}
+      maxBytes={$fileLimits?.max_bytes}
       onsticker={$emoteSets.stickers ? (e) => sendMessage(stickerText(e)) : undefined}
       replying={replyingTo?.username ?? null}
       oncancelreply={() => (replyingTo = null)}
@@ -1399,10 +1415,34 @@
   }
 
   .chat-main {
+    position: relative;
     flex: 1;
     min-width: 0;
     display: flex;
     flex-direction: column;
+  }
+  /* Before Chrome 111 (no color-mix): solid (see Lightbox.svelte) */
+  @supports not (background: color-mix(in srgb, red 50%, blue)) {
+    .drop-zone {
+      background: var(--bg-primary);
+    }
+  }
+  /* Ink, not mint: a place to put something is not something live */
+  .drop-zone {
+    position: absolute;
+    inset: 8px;
+    z-index: var(--z-raised);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: var(--sp-2);
+    font-size: var(--fs-md);
+    font-weight: 600;
+    color: var(--text-primary);
+    background: color-mix(in srgb, var(--bg-primary) 88%, transparent);
+    border: 2px dashed var(--text-muted);
+    border-radius: var(--r-md);
+    pointer-events: none;
   }
 
   .chat-body > :global(.thread-pane),

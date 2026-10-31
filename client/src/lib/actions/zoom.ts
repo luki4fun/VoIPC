@@ -17,8 +17,18 @@ export interface ZoomOptions {
   /** Changes when a different picture is shown: the view goes back to fit. */
   key?: unknown;
   onchange: (view: View) => void;
+  /** Handed the box's own zoom, for buttons beside it: zoom about its middle
+   *  by a factor, or fit it again. */
+  controls?: (c: ZoomControls) => void;
 }
 
+export interface ZoomControls {
+  zoom: (factor: number) => void;
+  fit: () => void;
+}
+
+/** One press of + or −, or of a zoom button. */
+export const ZOOM_STEP = 1.25;
 const DOUBLE_TAP_MS = 300;
 const DOUBLE_TAP_SLOP = 24;
 const MOVE_SLOP = 4;
@@ -95,13 +105,19 @@ export function zoomable(node: HTMLElement, opts: ZoomOptions) {
     set(zoomAt(view, Math.exp(-e.deltaY * 0.0015), e.clientX - r.left, e.clientY - r.top, r.width, r.height));
   }
 
+  const zoomMiddle = (factor: number) => {
+    const r = rect();
+    set(zoomAt(view, factor, r.width / 2, r.height / 2, r.width, r.height));
+  };
+  opts.controls?.({ zoom: zoomMiddle, fit: () => set(FIT) });
+
   function keydown(e: KeyboardEvent) {
     const r = rect();
     const cx = r.width / 2;
     const cy = r.height / 2;
     let next: View | null = null;
-    if (e.key === "+" || e.key === "=") next = zoomAt(view, 1.25, cx, cy, r.width, r.height);
-    else if (e.key === "-" || e.key === "_") next = zoomAt(view, 0.8, cx, cy, r.width, r.height);
+    if (e.key === "+" || e.key === "=") next = zoomAt(view, ZOOM_STEP, cx, cy, r.width, r.height);
+    else if (e.key === "-" || e.key === "_") next = zoomAt(view, 1 / ZOOM_STEP, cx, cy, r.width, r.height);
     else if (e.key === "0") next = FIT;
     else if (view.scale > 1 && e.key.startsWith("Arrow")) {
       const step = 48;

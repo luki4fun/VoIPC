@@ -250,7 +250,16 @@ pub async fn prepare_emote(
     let bare = voipc_media::strip(&src)
         .ok()
         .filter(|b| b.len() <= args.max_bytes);
-    let (upload, how) = if full.png.len() <= args.max_bytes && !full.trimmed {
+    // Too long to move (shown as its first frame, `Clean::stilled`): that
+    // frame goes up, never the whole animation every member would stop too
+    let (upload, how) = if full.stilled.is_some() {
+        if full.png.len() <= args.max_bytes {
+            (full.png.clone(), "still")
+        } else {
+            let fit = crate::media::sanitize(src, p, args.max_bytes, Motion::default()).await?;
+            (fit.png, "still")
+        }
+    } else if full.png.len() <= args.max_bytes && !full.trimmed {
         (full.png.clone(), "clean")
     } else if let Some(bare) = bare {
         (bare, "original")
@@ -262,6 +271,7 @@ pub async fn prepare_emote(
     let head = serde_json::json!({
         "w": full.w, "h": full.h, "frames": full.frames, "how": how,
         "upload": upload.len(), "preview": full.png.len(), "still": still.len(),
+        "stilled": full.stilled,
     })
     .to_string();
     let mut out = (head.len() as u32).to_le_bytes().to_vec();

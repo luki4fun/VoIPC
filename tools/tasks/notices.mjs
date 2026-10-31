@@ -454,7 +454,11 @@ the browser client, and the relay that serves it.
 
 Where a package offers a choice of licences, VoIPC uses it under the one named
 first in its line; "offered" shows the package's own expression.`, '='));
-  out.push(section('Not packages: what some builds also carry', `- The Windows installer carries FFmpeg (GPL), BtbN's gpl-shared build, with
+  out.push(section('Not packages: what some builds also carry', `- Every front end carries the font "VoIPC Emoji" (fonts/voipc-emoji.woff2):
+  the app's emoji cut from Noto Color Emoji 2.055, Copyright 2021-2022
+  Google Inc., under the SIL Open Font License 1.1. The licence text goes
+  beside it, at fonts/OFL-NotoColorEmoji.txt.
+- The Windows installer carries FFmpeg (GPL), BtbN's gpl-shared build, with
   x264 and x265 built in.
 - The AppImage carries the shared libraries the app links from Ubuntu 24.04:
   FFmpeg, x264 and x265 (GPL), GTK, WebKitGTK and GLib (LGPL), PipeWire, ALSA

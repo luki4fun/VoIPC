@@ -1398,7 +1398,9 @@ pub async fn fetch_file(
 
 /// A picture file, as the PNG it may be shown as (`media::sanitize`): the
 /// file's own bytes never reach the page this way, and a picture the
-/// sanitizer will not read is an error to show, never a fallback.
+/// sanitizer will not read is an error to show, never a fallback. Framed: a
+/// JSON head (its length first, 4 bytes little-endian) saying why a moving
+/// picture stands still when it does (`{"stilled": …}`), then the PNG.
 #[tauri::command]
 pub async fn file_image(
     state: State<'_, AppState>,
@@ -1414,12 +1416,18 @@ pub async fn file_image(
         .await
         .map_or_else(|_| voipc_media::Motion::default(), |f| f.motion());
     // The first frame alone where the person wants nothing to move
-    let pick = |(png, first): (Vec<u8>, Option<Vec<u8>>)| {
-        tauri::ipc::Response::new(if still == Some(true) {
-            first.unwrap_or(png)
+    let pick = |m: crate::media::Made| {
+        let png = if still == Some(true) {
+            m.first.unwrap_or(m.png)
         } else {
-            png
-        })
+            m.png
+        };
+        let head = serde_json::json!({ "stilled": m.stilled }).to_string();
+        let mut out = Vec::with_capacity(4 + head.len() + png.len());
+        out.extend_from_slice(&(head.len() as u32).to_le_bytes());
+        out.extend_from_slice(head.as_bytes());
+        out.extend_from_slice(&png);
+        tauri::ipc::Response::new(out)
     };
     // The key too: only a message that can open the file gets its picture
     let key = format!(
@@ -1430,9 +1438,11 @@ pub async fn file_image(
         return Ok(pick(hit));
     }
     let plain = Box::pin(open_file(&state, &server, conv, file, op)).await?;
-    let clean = crate::media::sanitize(plain, profile, profile.max_output(), motion).await?;
-    crate::media::keep_made(key, clean.png.clone(), clean.still.clone());
-    Ok(pick((clean.png, clean.still)))
+    let made = crate::media::Made::from(
+        crate::media::sanitize(plain, profile, profile.max_output(), motion).await?,
+    );
+    crate::media::keep_made(key, made.clone());
+    Ok(pick(made))
 }
 
 /// `fetch_file`'s work: the copy kept here, opened, else the relay's.

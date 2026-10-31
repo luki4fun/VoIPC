@@ -6,7 +6,8 @@
   // sanitizer wrote (emote-import.ts), never a picked file's own bytes. The
   // panel closes on a server switch (admin-ui.ts), so the server it opened on
   // is the one it changes.
-  import { onDestroy } from "svelte";
+  import { onDestroy, tick } from "svelte";
+  import { focusNow } from "../actions/focus.js";
   import { get } from "svelte/store";
   import { serverAddress } from "../stores/connection.js";
   import { emoteLimits, emoteSets, emoteUrls, pendingImport, urlKey } from "../stores/emotes.js";
@@ -14,7 +15,7 @@
   import { serverId } from "../stores/servers.js";
   import { addNotification } from "../stores/notifications.js";
   import { confirmAction } from "../stores/confirm.js";
-  import { nameFrom, uniqueName, type Emote as Item } from "../emote-rules.js";
+  import { countKinds, nameFrom, uniqueName, type Emote as Item } from "../emote-rules.js";
   import {
     addEmote,
     fetchSource,
@@ -68,7 +69,11 @@
     return out.trim();
   }
   const taken = (name: string) => $emoteSets.emotes.some((e) => e.name === name);
-  const why = (e: unknown) => String(e).replace(/^Error: /, "");
+  /** A reason as shown: the backends' start in lower case. */
+  const why = (e: unknown) => {
+    const t = String(e).replace(/^Error: /, "");
+    return t.charAt(0).toUpperCase() + t.slice(1);
+  };
 
   let filter = $state("");
   const shown = $derived($emoteSets.emotes.filter((e) => !removing.has(e.name) && fold(`${e.name} ${e.pack}`).includes(fold(filter))));
@@ -224,8 +229,11 @@
     include: boolean;
     /** The picked file, kept to make it again as the other kind. */
     bytes?: Uint8Array;
+    /** What goes up, by its SHA-256: two rows of one picture are one emote. */
+    hash?: string;
   }
   let rows = $state<Row[]>([]);
+  let addBox = $state<HTMLElement | null>(null);
   let asSticker = $state(false);
   let pack = $state("");
   let busy = $state(false);
@@ -271,11 +279,16 @@
   });
   const allIn = $derived(rows.filter(editable).every((r) => r.include));
   const reading = $derived(rows.filter((r) => r.status === "reading").length);
-  /** "Reading 37 of 300 · 30 ready · 7 set aside". */
+  /** "Reading 37 of 300 · 28 to add · 2 not ticked · 7 set aside": "to add"
+   *  is what Add sends, the rest says why the others are not in it. */
   const summary = $derived.by(() => {
     const count = (s: Row["status"]) => rows.filter((r) => r.status === s).length;
+    const waiting = rows.filter((r) => editable(r));
     const parts: [number, string][] = [
-      [count("ready"), "ready"],
+      [fitting.size, "to add"],
+      [waiting.filter((r) => !r.include).length, "not ticked"],
+      [waiting.filter((r) => r.include && nameProblem(r)).length, "need another name"],
+      [ready.length - fitting.size, "will not fit"],
       [count("uploading"), "being added"],
       [count("done"), "added"],
       [count("failed"), "not added"],
@@ -313,15 +326,26 @@
       if (sticker !== asSticker) return make(key, bytes, gen);
       if (row.url) URL.revokeObjectURL(row.url);
       const same = $emoteSets.emotes.find((e) => e.hash === hash);
-      const base = nameFrom(row.source) ?? "emote";
+      // The same picture twice in one import (a pack's copies): the first goes
+      const twin = rows.find((r) => r.key !== key && r.hash === hash && r.include && r.status !== "skipped");
+      // A sticker pack numbers its files (01.webp…): its name says whose they are
+      const stem = nameFrom(row.source);
+      const base = (stem && /^\d+$/.test(stem) && pack.trim() ? nameFrom(`${pack.trim()}_${stem}`) : stem) ?? "emote";
       set(key, {
         prepared: p,
         url: pictureUrl(p.preview),
+        hash,
         status: "ready",
-        note: same ? `Already here as :${same.name}:` : NOTE[p.how],
+        note: same
+          ? `Already here as :${same.name}:`
+          : twin
+            ? `The same picture as :${twin.name}:`
+            : p.stilled
+              ? `Only its first frame goes up: ${p.stilled}`
+              : NOTE[p.how] || (!row.name && stem !== row.source.replace(/\.[^.]*$/, "") ? `Named from “${row.source}”` : ""),
         name: row.name || (uniqueName(base, (n) => takenFor(n, key)) ?? base),
         // A row made again (the other kind) keeps its tick; a new one starts off if a copy is here
-        include: row.name ? row.include : !same,
+        include: row.name ? row.include : !same && !twin,
       });
     } catch (e) {
       if (gen !== generation) return;
@@ -434,6 +458,10 @@
       }
     }
     copying = false;
+    // One pack there, the same pack here (more than one: the field says which)
+    const packs = new Set(get(emoteSets.peek(from)).emotes.filter((e) => e.sticker === asSticker).map((e) => e.pack));
+    const only = packs.size === 1 ? [...packs][0] : "";
+    if (!pack && only && !packProblem(only)) pack = only;
     await addPack(got, gen);
   }
 
@@ -465,6 +493,8 @@
     if (!p || p.server !== server) return;
     pendingImport.set(null);
     void addFiles([new File([p.bytes as Uint8Array<ArrayBuffer>], p.name)]);
+    // Where it is, not three screens down under the server's whole list
+    tick().then(() => addBox?.scrollIntoView({ block: "start", behavior: "smooth" }));
   });
 
   function drop(e: DragEvent) {
@@ -525,12 +555,23 @@
     <span>Members may send stickers</span>
   </label>
   <p class="em-hint">
-    {$emoteSets.emotes.length - stickerCount} emotes, {stickerCount} stickers. They are stored on this server unencrypted, visible
+    This server has {countKinds($emoteSets.emotes.length - stickerCount, stickerCount)}. They are stored on it unencrypted, visible
     to everyone who joins; every member's app makes its own safe copy of each before showing it.
   </p>
   {#if $emoteLimits}
     <div class="em-quota">
-      <meter min="0" max={$emoteLimits.max_total_bytes} value={used} aria-label="Space the server's emotes take"></meter>
+      <!-- Drawn as Settings → Files draws its own: a native meter ignores the palette -->
+      <div
+        class="em-bar"
+        role="meter"
+        aria-label="Space the server's emotes take"
+        aria-valuemin="0"
+        aria-valuemax={$emoteLimits.max_total_bytes}
+        aria-valuenow={used}
+        aria-valuetext="{formatSize(used)} of {formatSize($emoteLimits.max_total_bytes)}"
+      >
+        <div style="width: {Math.min(100, (used / Math.max(1, $emoteLimits.max_total_bytes)) * 100)}%"></div>
+      </div>
       <span>
         {formatSize(used)} of {formatSize($emoteLimits.max_total_bytes)} · {$emoteSets.emotes.length} of {$emoteLimits.max_items}
       </span>
@@ -550,13 +591,13 @@
     </div>
     <div class="em-list">
       {#each sections as s (s.key)}
+        {@const what = `${s.sticker ? "stickers" : "emotes"}${s.pack ? ` of the pack ${s.pack}` : " in no pack"}`}
         <div class="em-section">
           {#if renamingPack === s.key}
-            <!-- svelte-ignore a11y_autofocus -->
             <input
               class="em-input em-name"
               bind:value={newPack}
-              autofocus
+              use:focusNow
               aria-label="New name for the pack {s.pack}"
               onkeydown={(ev) => {
                 if (ev.key === "Enter") finishPackRename(s.pack, s.list.map((e) => e.name), true);
@@ -568,28 +609,29 @@
             <span>{s.sticker ? "Stickers" : "Emotes"}{s.pack ? ` · ${s.pack}` : ""}</span>
           {/if}
           <span class="em-count num">{s.list.length}</span>
-          {#if s.pack}
-            <button class="btn btn-ghost em-small" type="button" onclick={() => { renamingPack = s.key; newPack = s.pack; }}>Rename</button>
-          {/if}
-          <button class="btn btn-ghost em-small" type="button" disabled={exporting !== null} onclick={() => exportPack(s.key, s.pack, s.list)}
-            >{exporting === s.key ? "Exporting…" : "Export"}</button
-          >
-          {#if s.pack}
-            <button class="btn btn-ghost em-small" type="button" onclick={() => removeAll(s.list.map((e) => e.name), `the pack "${s.pack}"`)}>Remove pack</button>
-          {/if}
+          <span class="em-section-tools">
+            {#if s.pack}
+              <button class="btn btn-ghost em-small" type="button" aria-label="Rename the pack {s.pack}" onclick={() => { renamingPack = s.key; newPack = s.pack; }}>Rename</button>
+            {/if}
+            <button class="btn btn-ghost em-small" type="button" aria-label="Export the {what} as a .zip" disabled={exporting !== null} onclick={() => exportPack(s.key, s.pack, s.list)}
+              >{exporting === s.key ? "Exporting…" : "Export"}</button
+            >
+            {#if s.pack}
+              <button class="btn btn-ghost em-small" type="button" aria-label="Remove the pack {s.pack}" onclick={() => removeAll(s.list.map((e) => e.name), `the pack "${s.pack}"`)}>Remove pack</button>
+            {/if}
+          </span>
         </div>
         <ul>
           {#each s.list as e (e.name)}
             {@const failed = $emoteUrls.get(urlKey(e.hash, e.sticker))?.error}
             <li class="em-row">
               <input type="checkbox" checked={picked.has(e.name)} onchange={() => pick(e.name)} aria-label="Pick :{e.name}:" />
-              <span class="em-pic"><Emote name={e.name} hash={e.hash.slice(0, 20)} size="jumbo" /></span>
+              <span class="em-pic"><Emote name={e.name} hash={e.hash} size="jumbo" /></span>
               {#if renaming === e.name}
-                <!-- svelte-ignore a11y_autofocus -->
                 <input
                   class="em-input em-name"
                   bind:value={newName}
-                  autofocus
+                  use:focusNow
                   aria-label="New name for :{e.name}:"
                   onkeydown={(ev) => {
                     if (ev.key === "Enter") finishRename(e, true);
@@ -620,7 +662,7 @@
   {/if}
 
   <!-- svelte-ignore a11y_no_static_element_interactions -->
-  <div class="em-add" class:over ondragover={(e) => { e.preventDefault(); over = true; }} ondragleave={() => (over = false)} ondrop={drop}>
+  <div class="em-add" bind:this={addBox} class:over ondragover={(e) => { e.preventDefault(); over = true; }} ondragleave={() => (over = false)} ondrop={drop}>
     <div class="em-heading">Add</div>
     <div class="em-kind" role="group" aria-label="Add as">
       <button type="button" class="em-chip" aria-pressed={!asSticker} disabled={busy} onclick={() => setKind(false)}>Emotes</button>
@@ -744,14 +786,21 @@
     background: var(--bg-primary);
     color: var(--text-primary);
     border: 1px solid var(--border);
-    border-radius: 4px;
+    border-radius: var(--r-sm);
   }
   .em-input[aria-invalid="true"] {
-    border-color: var(--danger, #e5484d);
+    border-color: var(--danger);
   }
+  /* A phone's width: the search and the pack field take a line each before
+     either is squeezed to a few letters */
   .em-tools {
     display: flex;
+    flex-wrap: wrap;
     gap: 6px;
+  }
+  .em-tools .em-input {
+    flex: 1 1 160px;
+    width: auto;
   }
   .em-tools .btn {
     flex-shrink: 0;
@@ -770,6 +819,7 @@
   }
   .em-section {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 8px;
     padding: 8px 0 2px;
@@ -780,14 +830,22 @@
   .em-count {
     font-weight: 400;
   }
-  .em-small {
+  /* The section's own buttons, together at its end */
+  .em-section-tools {
+    display: flex;
+    gap: 2px;
     margin-left: auto;
+  }
+  .em-small {
     padding: 0 8px;
     min-height: var(--hit);
     font-size: var(--fs-sm);
   }
+  /* Wraps rather than squeezes: on a phone the name keeps its room and the
+     buttons, or the note, go to the next line */
   .em-row {
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 8px;
     padding: 2px 0;
@@ -810,8 +868,8 @@
     max-height: 40px;
   }
   .em-name {
-    flex: 0 1 160px;
-    min-width: 0;
+    flex: 1 1 8em;
+    min-width: 6em;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -827,19 +885,17 @@
   }
   .em-problem {
     font-size: var(--fs-sm);
-    color: var(--danger, #e5484d);
+    color: var(--danger);
   }
   .em-bad {
     flex-shrink: 0;
     padding: 1px 5px;
     border: 1px solid var(--warning);
-    border-radius: 3px;
+    border-radius: var(--r-sm);
     font-size: var(--fs-micro);
     color: var(--warning);
   }
-  .em-move {
-    flex: 0 1 180px;
-  }
+
   .em-quota {
     display: flex;
     align-items: center;
@@ -847,22 +903,54 @@
     font-size: var(--fs-sm);
     color: var(--text-secondary);
   }
-  .em-quota meter {
+  .em-bar {
     flex: 1;
     max-width: 200px;
+    height: 6px;
+    border-radius: 3px;
+    background: var(--border);
+    overflow: hidden;
+  }
+  .em-bar div {
+    height: 100%;
+    background: var(--text-secondary);
+  }
+  .em input[type="checkbox"] {
+    accent-color: var(--control-fill);
   }
   .em-meta {
-    flex: 1;
+    flex: 1 1 0;
     min-width: 0;
     font-size: var(--fs-sm);
     color: var(--text-secondary);
     overflow: hidden;
     text-overflow: ellipsis;
   }
+  /* In the review, why a row is set aside or unticked is the point: a line of
+     its own, never cut */
+  .em-add .em-meta {
+    flex: 1 1 12em;
+    white-space: normal;
+  }
   .em-row .icon-btn {
     width: var(--icon-btn-size-sm);
     height: var(--icon-btn-size-sm);
     background: transparent;
+  }
+  /* A finger's size for the row's own controls, the tick box too */
+  @media (pointer: coarse) {
+    .em-row .icon-btn {
+      width: var(--hit);
+      height: var(--hit);
+    }
+    .em-row input[type="checkbox"],
+    .em-all input[type="checkbox"],
+    .em-switch input[type="checkbox"] {
+      flex-shrink: 0;
+      width: 20px;
+      height: 20px;
+      margin: 12px;
+    }
   }
   .em-add {
     display: flex;

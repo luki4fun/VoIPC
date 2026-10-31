@@ -115,6 +115,18 @@ function mediaMeta(bytes: Uint8Array, kind: "video" | "audio", mime: string): Pr
  * other moving pictures, videos and sounds go as they are; any other file is
  * deflated while sealing where that helps.
  */
+/** The picture turned as its EXIF says. `"from-image"` is Chrome 111's name
+ *  for that; an older engine (Android WebView 109 has been seen) refuses the
+ *  value with a TypeError, and its default already reads the EXIF. */
+async function decodeOriented(blob: Blob): Promise<ImageBitmap> {
+  try {
+    return await createImageBitmap(blob, { imageOrientation: "from-image" });
+  } catch (e) {
+    if (!(e instanceof TypeError)) throw e;
+    return createImageBitmap(blob);
+  }
+}
+
 export async function prepare(file: File, original: boolean): Promise<Prepared> {
   // Before reading any of it: a file this large is not read into the page
   if (file.size > MAX_FILE_PLAIN) throw new Error("Larger than 64 MB, the most a file can be");
@@ -124,7 +136,7 @@ export async function prepare(file: File, original: boolean): Promise<Prepared> 
   if (shown?.kind === "image") {
     let bitmap: ImageBitmap;
     try {
-      bitmap = await createImageBitmap(new Blob([bytes], { type: shown.mime }), { imageOrientation: "from-image" });
+      bitmap = await decodeOriented(new Blob([bytes], { type: shown.mime }));
     } catch {
       if (!original && STILL.has(shown.mime)) throw new CannotClean();
       return { bytes, name, mime: shown.mime, compress: false };

@@ -28,8 +28,9 @@ then the apps.
   imports the set it uses; what was just added shows at once, without being
   downloaded again.
 - **On mobile data the app asks first,** with the size, before it downloads a
-  server's emotes and stickers; otherwise they come on Wi-Fi. Settings → Files shows
-  what they take on this device, with *Clear*.
+  server's emotes and stickers; otherwise they come on Wi-Fi. *Always download them
+  on this server* answers it for good; Settings → Files lists those servers, each
+  with *Ask again*, and shows what emotes take on this device, with *Clear*.
 - **The Emotes tab shows how much of the server's room they take** (size and count),
   and an import marks what will not fit before it is sent.
 - **Removing a pack, or making emotes stickers, is one step** for the server: one
@@ -82,6 +83,53 @@ then the apps.
 - Settings: the motion choice says when the system asks for less motion, and
   has no "under the pointer" on touch screens. Larger touch targets in the
   emote admin.
+
+### Polish from the device run
+
+- **Android: stopping a file while it is still being prepared stops it.** Until
+  now × at that moment let a cut-off copy go out anyway.
+- **Android with an older system WebView (before Chrome 111):** photos are made
+  smaller again instead of asking to send the original every time.
+- **Emoji everywhere:** where the system has no picture for one of the app's emoji
+  (Windows 10 showed boxes for newer ones), VoIPC draws it with its own copy of
+  Noto Color Emoji (150 KB, SIL OFL). Elsewhere emoji keep the system's look, and a
+  joined emoji the system would draw as two is left out of the picker.
+- **The reactions picker works from the keyboard:** the arrows move one step,
+  ArrowUp stays in the search and Tab no longer closes the menu. The picker's
+  kinds are one tab stop, walked with the arrow keys.
+- **The picker stays on a phone's screen** when it opens while the panes are
+  still sliding; on a touch screen its tabs, search and cells are a finger's size,
+  a tap does not bring the keyboard up, and the hint says *hold*, not *right-click*.
+- **A file's Load and Download can be read on any picture:** solid buttons, and
+  the words on the card's own colour. After an error the button says *Try again*.
+- **The picture viewer has zoom buttons** (out, back to fit, in) and takes the
+  keys as soon as it opens; it covers the chat behind it.
+- **Your own pictures show at once** after you send them, and *Show* in
+  Settings → Files loads the picture. What others send still waits for *Load*.
+- **A moving picture too long or too big to play is shown as its first frame**
+  instead of not at all, with a note saying why. It is read no further than
+  before, so it costs no more. An emote like that goes up as that frame.
+- Pictures that were moving stop when reduced motion or "Never move" is turned on.
+- *Original (1:1)* says what it means next to it, and shows when it is on; a
+  file over the server's size says so before *Send*; sending shows a percentage.
+- Dragging files over the chat shows where they go. The same file is not
+  attached twice.
+- Your own message is scrolled into view when you send it.
+- An emote in a message is a button: Tab reaches it with the message's links,
+  and its card opens in the screen. A sticker held by slow mode says so in words.
+- On mobile data, the question about downloading emotes waits for the first-run
+  questions, and emotes waiting for Wi-Fi show their names.
+- `:` offers emoji right after another emoji; a search shows the exact name first.
+- **Emote admin on a phone:** the tools wrap, a pack's buttons say which pack,
+  rename fields take the cursor, and the size bar follows the palette. One import
+  of the same picture twice adds it once; the summary counts what *Add* sends;
+  stickers numbered 01, 02… are named after their pack; a copy from a server with
+  one pack keeps it. The tab is called *Emotes and stickers*. On a phone the list
+  wraps instead of cutting names, an import says why a row is left out, and
+  *Make an emote or sticker…* goes straight to the picture.
+- Settings → Files says while it reads and when it cannot, keeps the emote row
+  at zero, and *Clear* tells what it freed.
+- Placeholders and drop-down menus read clearly in every palette.
 
 ## [1.4.0] - 2026-10-30
 

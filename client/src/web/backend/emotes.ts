@@ -361,10 +361,13 @@ export async function prepareEmote(
   const full = await sanitize(src, profile);
   // The file as it is goes without its metadata: emotes are readable by every
   // member. Where that cannot be (a turned JPEG), it is made again
-  const bare = full.png.length <= maxBytes && !full.trimmed ? null : await strip(src).catch(() => null);
+  const bare = full.stilled || (full.png.length <= maxBytes && !full.trimmed) ? null : await strip(src).catch(() => null);
   let upload: Uint8Array;
   let how: string;
-  if (full.png.length <= maxBytes && !full.trimmed) [upload, how] = [full.png, "clean"];
+  // Too long to move (shown as its first frame): that frame goes up, never the
+  // whole animation every member would stop too
+  if (full.stilled) [upload, how] = full.png.length <= maxBytes ? [full.png, "still"] : [(await sanitize(src, profile, maxBytes)).png, "still"];
+  else if (full.png.length <= maxBytes && !full.trimmed) [upload, how] = [full.png, "clean"];
   else if (bare && bare.length <= maxBytes) [upload, how] = [bare, "original"];
   else {
     const fit = await sanitize(src, profile, maxBytes);
@@ -372,7 +375,7 @@ export async function prepareEmote(
   }
   const still = full.still ?? new Uint8Array();
   const head = new TextEncoder().encode(
-    JSON.stringify({ w: full.w, h: full.h, frames: full.frames, how, upload: upload.length, preview: full.png.length, still: still.length }),
+    JSON.stringify({ w: full.w, h: full.h, frames: full.frames, how, upload: upload.length, preview: full.png.length, still: still.length, stilled: full.stilled }),
   );
   const out = new Uint8Array(4 + head.length + upload.length + full.png.length + still.length);
   new DataView(out.buffer).setUint32(0, head.length, true);

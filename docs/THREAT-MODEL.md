@@ -36,7 +36,10 @@ is decoded by memory-safe Rust (`crates/voipc-media`: pure-Rust decoders that fo
 `unsafe`, under fixed budgets), and only a PNG it wrote is shown; a picture it will not
 read is offered to save, never shown (`what_is_too_big_is_refused_before_anything_is_allocated_for_it`,
 `a_damaged_picture_is_refused_at_every_length_and_never_panics`, the `media` fuzz target,
-`image-sinks.test.ts`). A relay sets how much of a moving picture its members' apps keep
+`image-sinks.test.ts`); an animation that runs past a budget after its first frame is read no
+further and shown as that frame, with a note saying why
+(`an_animation_over_a_budget_stands_as_its_first_frame_and_says_why`). A relay sets how much
+of a moving picture its members' apps keep
 (`[files] animation_side`, `animation_mb`), within bounds each app holds it to
 (`FileLimits::animation`), so a relay cannot make one picture take more than 512 MiB. Video
 and sound still play through the system's decoders, after

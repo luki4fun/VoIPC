@@ -116,6 +116,12 @@ export interface UiPrefs {
   /** Moving emotes and stickers: always, on hover, or never (their first
    *  frame). Reduced motion on the system means never, whatever this says. */
   animate_emotes: "always" | "hover" | "never";
+  /**
+   * Servers (`"host:port"`) whose emotes and stickers download on mobile data
+   * without asking ("Always on this server" in that question). Settings →
+   * Files lists them, each with "Ask again".
+   */
+  emotes_mobile_ok: string[];
 }
 
 /** Bounds. A width outside these is a panel you cannot get back by dragging. */
@@ -182,6 +188,7 @@ export function defaultUiPrefs(): UiPrefs {
     play_media: null,
     show_stickers: true,
     animate_emotes: "always",
+    emotes_mobile_ok: [],
   };
 }
 
@@ -224,6 +231,8 @@ function dmTimers(raw: unknown): Record<string, number> {
 /** How many servers' 18+ consent this remembers, newest kept. */
 const NSFW_OK_MAX = 200;
 
+/** A list of servers (`"host:port"`), as `nsfw_ok` and `emotes_mobile_ok` keep
+ *  them: strings only, no blanks, no repeats, the newest few hundred. */
 function nsfwOk(raw: unknown): string[] {
   if (!Array.isArray(raw)) return [];
   const list = raw.filter((k): k is string => typeof k === "string" && k !== "");
@@ -356,5 +365,6 @@ export function sanitizeUiPrefs(raw: unknown): UiPrefs {
     play_media: typeof r.play_media === "boolean" ? r.play_media : null,
     show_stickers: bool(r.show_stickers, d.show_stickers),
     animate_emotes: r.animate_emotes === "hover" || r.animate_emotes === "never" ? r.animate_emotes : "always",
+    emotes_mobile_ok: nsfwOk(r.emotes_mobile_ok),
   };
 }
