@@ -32,11 +32,13 @@
   import { fetchFile, fileLimits, sendFile } from "../files.js";
   import { linkFacts, mentionNames as mentionNamesOf, plainText } from "../markdown.js";
   import { rosterOf } from "../roster-rules.js";
+  import { awayHint, liveIdOf, reach } from "../dm-rules.js";
   import { prepare } from "../image-prep.js";
   import { sealedLen } from "../file-rules.js";
   import {
     addDmMessage,
     applyDmEvent,
+    attachDm,
     dmConversations,
     activeDmUserId,
     activeDmUsername,
@@ -118,6 +120,18 @@
   }
 
   let isDmMode = $derived($activeDmUserId !== null);
+  /** The direct conversation on screen, by the name it is filed under: what
+   *  stays the same when its person comes back under a new id. */
+  const dmName = $derived(isDmMode ? $activeDmUsername : null);
+  const dmRow = $derived(dmName === null ? undefined : $dmConversations.find((c) => c.username === dmName));
+  /** Their id now, when they are on a list we see (dm-rules.ts). */
+  const dmSeenId = $derived(dmName === null ? undefined : liveIdOf(dmName, $users, $channelRosters));
+  const dmReach = $derived(isDmMode ? reach($activeDmUserId ?? 0, dmSeenId, dmRow?.account, !!$account?.cloud) : "live");
+  // An archived conversation's person is here: theirs from now on
+  $effect(() => {
+    const [server, name, id] = [$serverAddress, dmName, dmSeenId];
+    if (name !== null && id !== undefined && ($activeDmUserId ?? 0) < 0) untrack(() => attachDm(server, name, id));
+  });
 
   // The channel whose chat is on screen: a preview, then the text channel the
   // user opened, then the channel they stand in. `displayChannelId` and
@@ -199,7 +213,7 @@
       : null,
   );
   /** Whether this conversation can be written in, answers included. */
-  let canAnswer = $derived(isDmMode || (canSendChannelMessage && block?.kind !== "announce"));
+  let canAnswer = $derived(isDmMode ? dmReach !== "readonly" : canSendChannelMessage && block?.kind !== "announce");
   // Raw: a $state proxy of a message is never === the message itself, and
   // these are looked up in the conversation by identity
   let replyingTo = $state.raw<ChatMessage | null>(null);
@@ -221,7 +235,7 @@
   $effect(() => {
     void $serverAddress;
     void $displayChannelId;
-    void $activeDmUserId;
+    void dmName;
     replyingTo = null;
     threadRoot = null;
   });
@@ -431,7 +445,7 @@
     if (messagesContainer) messagesContainer.scrollTop = messagesContainer.scrollHeight;
   }
   $effect.pre(() => {
-    const conversation = `${$serverAddress}|${$displayChannelId}|${$activeDmUserId}`;
+    const conversation = `${$serverAddress}|${$displayChannelId}|${dmName}`;
     const last = displayMessages.at(-1);
     const end = `${displayMessages.length}|${last?.id ?? last?.timestamp ?? ""}`;
     const switched = conversation !== followedConversation;
@@ -516,8 +530,7 @@
     const server = $serverAddress;
     if (isDmMode) {
       const peer = $activeDmUserId ?? 0;
-      const away = peer < 0 ? $dmConversations.find((c) => c.user_id === peer) : undefined;
-      return { server, dm: { peer, name: $activeDmUsername, away: away?.account } };
+      return { server, dm: { peer, name: $activeDmUsername, away: peer < 0 ? dmRow?.account : undefined } };
     }
     return { server, channelId: $displayChannelId };
   }
@@ -576,6 +589,8 @@
       // channel's own, or for a direct message the one this user set for that
       // person. Zero is no timer, which the backend reads as none.
       if ("dm" in t) {
+        // Their row stands under the id this goes to, so our echo is filed there
+        if (t.dm.peer > 0) attachDm(server, t.dm.name, t.dm.peer);
         const ttlSecs = capped(dmMessageTtl(server, t.dm.name));
         if (t.dm.away) {
           // They are away: the server's copy is the one way it reaches them,
@@ -751,9 +766,11 @@
       });
     }
     for (const c of $dmConversations) {
-      const away = c.user_id < 0 ? c.account : undefined;
-      if (c.user_id < 0 && !away) continue;
-      out.push({ key: `d${c.user_id}`, label: `@${shortName(c.username)}`, target: { server, dm: { peer: c.user_id, name: c.username, away } } });
+      const seen = c.user_id > 0 ? undefined : liveIdOf(c.username, $users, $channelRosters);
+      const r = reach(c.user_id, seen, c.account, !!$account?.cloud);
+      if (r === "readonly") continue;
+      const dm = { peer: seen ?? c.user_id, name: c.username, away: r === "kept" ? c.account : undefined };
+      out.push({ key: `d${c.username}`, label: `@${shortName(c.username)}`, target: { server, dm } });
     }
     return out;
   });
@@ -846,6 +863,19 @@
     }
   }
 
+  /** What "away" means for this conversation, on the header's tag. */
+  const awayTitle = $derived(awayHint(shortName($activeDmUsername), dmReach));
+
+  /** Why nothing can be written to them now (`dmReach` "readonly"). */
+  const readOnlyWhy = $derived.by(() => {
+    const why = !dmRow?.account
+      ? "they have no account here"
+      : !$account
+        ? "you're not signed in here"
+        : "your cloud copies are off here";
+    return `You can write to ${shortName($activeDmUsername)} when they're back — ${why}, so nothing can be kept for them.`;
+  });
+
   // The server's copy of this conversation, where this account keeps one:
   // clearing can delete what we wrote there too (1.0, A6)
   let showClearMenu = $state(false);
@@ -854,8 +884,7 @@
     if (!me?.cloud) return null;
     if (!isDmMode) return effectiveChannel?.log || null;
     const peer =
-      $dmConversations.find((c) => c.user_id === $activeDmUserId)?.account ??
-      ((a) => (a ? accountHex(a) : undefined))($users.find((u) => u.user_id === $activeDmUserId)?.account);
+      dmRow?.account ?? ((a) => (a ? accountHex(a) : undefined))($users.find((u) => u.user_id === $activeDmUserId)?.account);
     if (!peer) return null;
     const [lo, hi] = [accountHex(me.info.id), peer].sort();
     return `d:${lo}:${hi}`;
@@ -894,6 +923,9 @@
     {#if isDmMode}
       <button aria-label="Back to channel chat" class="back-btn" onclick={backToChannel} title="Back to channel chat"><Icon name="arrow-left" size={16} /></button>
       <span class="chat-title" title={$activeDmUsername}>DM with {shortName($activeDmUsername)}</span>
+      {#if dmReach !== "live"}
+        <span class="ttl-label" title={awayTitle}>away</span>
+      {/if}
       {#if totalUnreadChannels > 0}
         <span class="unread-badge" title="Unread channel messages">{totalUnreadChannels}</span>
       {/if}
@@ -1089,12 +1121,18 @@
     {/if}
   </div>
 
-  {#if isDmMode}
+  {#if isDmMode && dmReach === "readonly"}
+    <div class="preview-footer post-block">
+      <Icon name="lock" size={14} /> {readOnlyWhy}
+    </div>
+  {:else if isDmMode}
     <Composer
       bind:this={composer}
-      placeholder={`Message ${shortName($activeDmUsername)}...`}
+      placeholder={dmReach === "kept"
+        ? `Message ${shortName($activeDmUsername)} — kept on the server for them`
+        : `Message ${shortName($activeDmUsername)}…`}
       mentionables={mentionOthers}
-      conversation={`${$serverAddress}|dm|${$activeDmUserId}`}
+      conversation={`${$serverAddress}|dm|${dmName}`}
       onsend={sendMessage}
       onsendfile={canSendFiles ? sendFileMessage : undefined}
       maxBytes={$fileLimits?.max_bytes}

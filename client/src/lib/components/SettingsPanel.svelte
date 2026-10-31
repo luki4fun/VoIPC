@@ -113,6 +113,7 @@
       p.density = d.density;
       p.chat_font_size = d.chat_font_size;
       p.group_threads = d.group_threads;
+      p.dm_previews = d.dm_previews;
       p.zoom = d.zoom;
       p.panels = d.panels;
     });
@@ -1287,6 +1288,21 @@
           <span class="toggle-hint">
             When a message draws three replies from two people or more, they move under it into a thread.
             Replies sent into a thread go there either way.
+          </span>
+        </label>
+        <label class="toggle-row">
+          <input
+            type="checkbox"
+            checked={$uiPrefs.dm_previews}
+            onchange={(e) =>
+              updateUiPrefs((p) => {
+                p.dm_previews = (e.target as HTMLInputElement).checked;
+              })}
+          />
+          <span class="toggle-label">Show the last message under each direct conversation</span>
+          <span class="toggle-hint">
+            With how long ago it was written. Anyone who sees your screen sees it too. A message with a timer
+            never shows there.
           </span>
         </label>
         <label class="toggle-row">

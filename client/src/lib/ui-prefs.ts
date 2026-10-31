@@ -78,6 +78,12 @@ export interface UiPrefs {
    */
   group_threads: boolean;
   /**
+   * The start of the last message under each direct conversation in the
+   * sidebar, with how long ago. Off unless chosen: anyone who sees the screen
+   * (a screen share) reads it too. A message with a timer never shows.
+   */
+  dm_previews: boolean;
+  /**
    * Text channels the user walked out of, per server (`"host:port"` → names).
    *
    * A server can ask every client to join a text channel on connect
@@ -182,6 +188,7 @@ export function defaultUiPrefs(): UiPrefs {
     },
     share_preview: true,
     group_threads: true,
+    dm_previews: false,
     left_text_channels: {},
     dm_timers: {},
     nsfw_ok: [],
@@ -359,6 +366,7 @@ export function sanitizeUiPrefs(raw: unknown): UiPrefs {
     },
     share_preview: bool(r.share_preview, d.share_preview),
     group_threads: bool(r.group_threads, d.group_threads),
+    dm_previews: bool(r.dm_previews, d.dm_previews),
     left_text_channels: leftTextChannels(r.left_text_channels),
     dm_timers: dmTimers(r.dm_timers),
     nsfw_ok: nsfwOk(r.nsfw_ok),

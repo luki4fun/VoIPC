@@ -48,6 +48,23 @@ then the apps.
   longer run at once on a phone. A test in CI times the hardest pictures there are.
 - Taking a server off the list forgets which of its emotes were used and liked.
 
+### Direct messages
+
+- **Old conversations are listed again.** After a restart or a reconnect, every
+  direct conversation this device keeps for the server is back in the sidebar,
+  newest first, and opens at once. It no longer waits until the other person writes,
+  and a search result in one opens it.
+- **Someone who is not here is marked "away".** If you both have accounts and your
+  cloud copies are on, you can still write; the server keeps it until they are back.
+  A guest who is away can be read but not written to, and the chat says why.
+- **Close** (✕ on a row) takes a conversation off the list and keeps its messages. It
+  comes back with the next message, or when you open it again.
+- **Settings → Appearance** can show the last message and how long ago it was written
+  under each conversation. It is off by default, because anyone who sees your screen
+  reads it too. A message with a timer is never shown there.
+- An open conversation keeps its draft, its reply and its scroll position when its
+  person comes back.
+
 ### Fixed
 
 - **A crafted GIF could keep every viewer's computer busy** and hold up all

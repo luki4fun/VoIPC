@@ -154,11 +154,13 @@ test("the stream view's chat: off in modern, below in classic, until chosen", ()
   assert.equal(p.stream_chat.classic.split, "below");
   assert.equal(p.share_preview, true);
   assert.equal(p.group_threads, true, "busy replies gather into threads unless turned off");
+  assert.equal(p.dm_previews, false, "a direct conversation's last message shows only when chosen");
 
   const saved = defaultUiPrefs();
   saved.stream_chat.modern = { open: true, split: "below", width: 500, height: 300 };
   saved.share_preview = false;
   saved.group_threads = false;
+  saved.dm_previews = true;
   assert.deepEqual(sanitizeUiPrefs(structuredClone(saved)), saved);
 });
 

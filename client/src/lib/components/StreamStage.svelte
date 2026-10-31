@@ -19,7 +19,7 @@
   import { activeStreamChat, uiLayout, updateActiveStreamChat } from "../stores/ui-prefs.js";
   import { streamStage } from "../stores/screenshare.js";
   import { displayChannelId, shownMessages } from "../stores/roster.js";
-  import { activeDmUserId } from "../stores/chat.js";
+  import { activeDmUserId, activeDmUsername } from "../stores/chat.js";
   import { serverAddress } from "../stores/connection.js";
   import ChatPanel from "./ChatPanel.svelte";
   import ScreenShareViewer from "./ScreenShareViewer.svelte";
@@ -49,7 +49,10 @@
   // or when the conversation itself changed — opening another channel is not
   // news from this one. Newer, not just different: a message expiring under
   // its timer is no news either.
-  const conversation = $derived(`${$serverAddress}/${$activeDmUserId ?? `#${$displayChannelId}`}`);
+  // A direct one by its person's name, which outlives their id (they came back)
+  const conversation = $derived(
+    `${$serverAddress}/${$activeDmUserId === null ? `#${$displayChannelId}` : `@${$activeDmUsername}`}`,
+  );
   const newest = $derived($shownMessages.at(-1)?.timestamp ?? 0);
   let seen = $state(0);
   let seenIn = "";

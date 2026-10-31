@@ -3194,6 +3194,14 @@ if (PORT3) {
     10_000,
   ).then(() => true, () => false));
   check("and so is the direct message", dmCaught, dmListed ? await texts(bobAgain) : "no conversation listed");
+  // 1.5: her row says she is away, and writing to her says where it goes
+  const awayTag = await bobAgain.evaluate(`${dmRow}?.closest(".dm-entry")?.querySelector(".proximity-tag")?.textContent === "away"`);
+  const keptHint = await bobAgain.evaluate(`!!document.querySelector(".input-bar .chat-input")?.placeholder?.includes("kept on the server")`);
+  check(
+    "somebody away is marked so, and writing to them says it is kept",
+    dmListed && awayTag && keptHint,
+    await bobAgain.evaluate(`document.querySelector(".input-bar .chat-input")?.placeholder ?? "no composer"`),
+  );
   // A reply while the writer is still away goes the same way, and is there
   // when they are back.
   const reply = `got it ${process.pid}`;
@@ -3205,6 +3213,11 @@ if (PORT3) {
       (await bobAgain.evaluate(`[...document.querySelectorAll(".msg-content")].some((e) => e.textContent.includes(${JSON.stringify(reply)}))`)),
     await bobAgain.evaluate(`(window.__toasts ?? []).join(" | ")`),
   );
+  // Close takes the conversation off the list; its messages stay (dm-rules.test.ts
+  // has it coming back with the next message)
+  await bobAgain.evaluate(`${dmRow}?.closest(".channel-row")?.querySelector('button[aria-label^="Close conversation"]')?.click()`);
+  const closedOff = await waitFor(bobAgain, `!(${dmRow}) && !document.querySelector(".input-bar .chat-input")?.placeholder?.includes("kept on the server")`, 5_000).then(() => true, () => false);
+  check("Close takes a conversation off the list", closedOff, await texts(bobAgain));
   await bobAgain.send("Page.close").catch(() => {});
   const aliceAgain = await openDialog();
   await aliceAgain.evaluate(setInput("#account-name", acct));

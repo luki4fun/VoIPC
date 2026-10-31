@@ -1,4 +1,4 @@
-import { writable, get } from "svelte/store";
+import { derived, writable, get } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import {
   applyEvent,
@@ -16,9 +16,11 @@ import {
   toArchived,
   type EventIn,
 } from "../chat-rules.js";
+import { archivedPeers, closeMarkKey, listRows } from "../dm-rules.js";
 import { previewChannelId, previewUsers } from "./channels.js";
 import { serverAddress, serverKey, userId } from "./connection.js";
 import { scoped } from "./scoped.js";
+import { openServers } from "./servers.js";
 import { chatHistoryDisabled, maxConversations } from "./settings.js";
 import type { ChatMessage } from "../types.js";
 
@@ -87,6 +89,14 @@ export const joinedTextChannelIds = scoped<Set<number>>(() => new Set());
 // List of DM conversations for the sidebar, keyed by that server's user ids
 export const dmConversations = scoped<DmConversation[]>(() => []);
 
+/** The direct conversations both sidebars list on the server on screen:
+ *  newest first, closed ones left out (dm-rules.ts `listRows`). */
+export const dmList = derived(
+  [dmConversations, dmMessages, clearedBefore, activeDmUserId, activeDmUsername, serverAddress],
+  ([$rows, $dms, $marks, $id, $name, $server]) =>
+    listRows($rows, $dms, serverKey($server), $marks, $id === null ? null : $name),
+);
+
 /**
  * Unread message counts, chat key -> count.
  *
@@ -139,10 +149,30 @@ export function dmKey(server: string, peerName: string): string {
   return chatKey(server, peerName);
 }
 
+/**
+ * Who each user id we opened a conversation with is, per server. An echo of
+ * our own message carries our name, not theirs, and comes back after the
+ * screen may have moved to somebody else: this, not what is open by then,
+ * says whose conversation it is. Ids are the connection's, so this goes
+ * with it (`clearServerUnread`).
+ */
+const openedIds = new Map<string, Map<number, string>>();
+
+function noteOpened(server: string, id: number, name: string): void {
+  if (id <= 0 || !name) return;
+  let ids = openedIds.get(server);
+  if (!ids) openedIds.set(server, (ids = new Map()));
+  ids.set(id, name);
+}
+
 /** What we call the person behind an id: what their conversation is filed
- *  under already, or the name we were given. */
+ *  under already, whom we opened it with, or the name we were given. */
 function peerName(server: string, peerId: number, fallback: string): string {
-  return get(dmConversations.peek(server)).find((c) => c.user_id === peerId)?.username || fallback;
+  return (
+    get(dmConversations.peek(server)).find((c) => c.user_id === peerId)?.username ||
+    openedIds.get(server)?.get(peerId) ||
+    fallback
+  );
 }
 
 /** The shape of a scoped key. A channel name may itself contain a slash. */
@@ -192,6 +222,55 @@ export function adoptLegacyKeys(): void {
 export function claimLegacyKeys(server: string): void {
   if (legacyOwner === null) legacyOwner = server;
   adoptLegacyKeys();
+  seedArchivedDms(server);
+}
+
+/** The next id an archived conversation stands under: below the ones a
+ *  stored-log row takes from its account (`fileStoredDm`), so never the same. */
+let archivedId = -(2 ** 30);
+
+/**
+ * List the archive's conversations on `server` again. The list belongs to a
+ * connection and starts empty, while the messages are kept: without this an
+ * old conversation could only be read once its person wrote again. Each
+ * stands under a made-up negative id until they are here (`attachDm`).
+ *
+ * Runs where a server's list is new (connecting, `claimLegacyKeys`) and where
+ * the archive is (unlocking, `populateFromArchive`).
+ */
+export function seedArchivedDms(server: string): void {
+  const key = serverKey(server);
+  if (!key) return;
+  const peers = archivedPeers(get(dmMessages), key);
+  if (peers.length === 0) return;
+  dmConversations.of(server).update((convos) => {
+    const fresh = peers.filter((p) => !convos.some((c) => c.username === p.name));
+    if (fresh.length === 0) return convos;
+    return [
+      ...convos,
+      ...fresh.map((p) => ({ user_id: archivedId--, username: p.name, unread: 0, ...(p.account ? { account: p.account } : {}) })),
+    ];
+  });
+}
+
+/**
+ * Their conversation stands under `id` now: the one by that name, and the open
+ * one with it if it is that. Without the second, the conversation on screen
+ * kept an id nobody had, counted its own messages as unread, and lost where
+ * writing to them goes.
+ */
+export function attachDm(server: string, name: string, id: number): void {
+  noteOpened(server, id, name);
+  // Asked first: an update that changes nothing still wakes every list
+  const row = get(dmConversations.peek(server)).find((x) => x.username === name);
+  if (!row || row.user_id === id) return;
+  const moved = row.user_id;
+  dmConversations.of(server).update((convos) => {
+    const c = convos.find((x) => x.username === name);
+    if (c) c.user_id = id;
+    return [...convos];
+  });
+  if (get(activeDmUserId.peek(server)) === moved) activeDmUserId.of(server).set(id);
 }
 
 // ---------------------------------------------------------------------------
@@ -315,6 +394,7 @@ export function populateFromArchive(archive: {
 
   // Unlocking while already connected is the other moment a bare key appears
   adoptLegacyKeys();
+  for (const server of get(openServers)) seedArchivedDms(server);
 }
 
 // ---------------------------------------------------------------------------
@@ -550,7 +630,8 @@ export function addDmMessage(
   // Read only if it is on screen: a conversation left open on a server the
   // user has since switched away from is not being looked at, and its unread
   // count is the only thing that puts a badge on that server's rail icon.
-  const onScreen = activeId === peerId && server === get(serverAddress);
+  const onScreen =
+    server === get(serverAddress) && (activeId === peerId || (!isEcho && activeId !== null && activeName === fromName));
   const key = dmKeyOf(server, myId, fromId, fromName, toId);
   if (held(get(dmMessages).get(key), msg)) return;
   msg = bounded(msg);
@@ -568,15 +649,19 @@ export function addDmMessage(
   scheduleSave();
 
   // Update DM conversations list
+  let moved: number | undefined;
   dmConversations.of(server).update((convos) => {
     // A conversation filed under the same name becomes theirs: one from the
-    // stored log, before its peer was here (a made-up negative id), or one
-    // from before they reconnected under a new id (H5-07). Names carry their
-    // tag, so a name is one person on a server.
-    const existing =
-      convos.find((c) => c.user_id === peerId) ??
-      convos.find((c) => !isEcho && c.username === fromName);
-    if (existing) existing.user_id = peerId;
+    // stored log or the archive, before its peer was here (a made-up negative
+    // id), or one from before they reconnected under a new id (H5-07). Names
+    // carry their tag, so a name is one person on a server, and one row.
+    // The name it is filed under (`dmKeyOf`); for our echo, whom we opened it with
+    const name = isEcho ? peerName(server, peerId, activeName || "Unknown") : fromName;
+    const existing = convos.find((c) => c.user_id === peerId) ?? convos.find((c) => c.username === name);
+    if (existing && existing.user_id !== peerId) {
+      moved = existing.user_id;
+      existing.user_id = peerId;
+    }
     if (existing) {
       // Only update peer name from incoming messages, not our own echo
       if (!isEcho) {
@@ -588,19 +673,19 @@ export function addDmMessage(
       }
       return [...convos];
     } else {
-      // New conversation: use sender name for incoming, active DM name for echo
-      const peerName = isEcho ? activeName || "Unknown" : fromName;
-      if (!onScreen) noteUnread(dmKey(server, peerName), msg.timestamp);
+      if (!onScreen) noteUnread(dmKey(server, name), msg.timestamp);
       return [
         ...convos,
         {
           user_id: peerId,
-          username: peerName,
+          username: name,
           unread: onScreen ? 0 : 1,
         },
       ];
     }
   });
+  // The open conversation goes with its row (`attachDm`)
+  if (moved !== undefined && activeId === moved) activeDmUserId.of(server).set(peerId);
 }
 
 /**
@@ -695,8 +780,11 @@ export function openTextChannel(server: string, channelId: number | null) {
 }
 
 export function openDm(server: string, userId: number, username: string) {
+  attachDm(server, username, userId);
   activeDmUserId.of(server).set(userId);
   activeDmUsername.of(server).set(username);
+  // Opened on purpose (a row, search, a user's menu): a closed one is listed again
+  forgetMark(closeMarkKey(dmKey(server, username)));
 
   // Clear unread for this conversation
   dmConversations.of(server).update((convos) => {
@@ -710,6 +798,38 @@ export function openDm(server: string, userId: number, username: string) {
 export function closeDm(server: string) {
   activeDmUserId.of(server).set(null);
   activeDmUsername.of(server).set("");
+}
+
+/**
+ * Take a conversation off the list, keeping every message: it comes back when
+ * something newer is written there, or when it is opened again. The mark is
+ * kept with the deletion watermarks, in the encrypted archive, so it goes
+ * where the conversation goes. At least its newest message's time, so a
+ * sender's clock ahead of ours does not bring it straight back.
+ */
+export function closeDmRow(server: string, name: string): void {
+  const key = dmKey(server, name);
+  const at = Math.max(Date.now(), newestTimestamp(get(dmMessages).get(key) ?? []));
+  clearedBefore.update((marks) => new Map(marks).set(closeMarkKey(key), at));
+  unreadSince.delete(key);
+  dmConversations.of(server).update((convos) => {
+    const c = convos.find((x) => x.username === name);
+    if (!c?.unread) return convos;
+    c.unread = 0;
+    return [...convos];
+  });
+  if (get(activeDmUserId.peek(server)) !== null && get(activeDmUsername.peek(server)) === name) closeDm(server);
+  scheduleSave();
+}
+
+function forgetMark(mark: string): void {
+  if (!get(clearedBefore).has(mark)) return;
+  clearedBefore.update((marks) => {
+    const next = new Map(marks);
+    next.delete(mark);
+    return next;
+  });
+  scheduleSave();
 }
 
 // ── Where "New" begins ──────────────────────────────────────────────────────
@@ -867,6 +987,7 @@ export function clearDmChat(server: string, peerId: number, peerUsername: string
     // Remembered, so the conversation's stored log does not hand it back
     const newest = newestTimestamp(map.get(key) ?? []);
     if (newest > 0) clearedBefore.update((marks) => new Map(marks).set(key, newest));
+    forgetMark(closeMarkKey(key));
     map.delete(key);
     return new Map(map);
   });
@@ -918,8 +1039,10 @@ export async function clearAllHistory(): Promise<string | null> {
  * before the drop. The other servers' counts are theirs and stay.
  */
 export function clearServerUnread(server: string) {
-  // What this connection received goes with it too (`receivedNow`)
+  // What this connection received goes with it too (`receivedNow`), and whom
+  // its ids were (`peerName`)
   thisConnection.delete(server);
+  openedIds.delete(server);
   const prefix = `${serverKey(server)}/`;
   for (const key of [...unreadSince.keys()]) if (key.startsWith(prefix)) unreadSince.delete(key);
   unreadPerChannel.update((map) => {
