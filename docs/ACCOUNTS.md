@@ -191,15 +191,20 @@ counts at once.
   the desktop the device is kept in the encrypted chat history: it signs in alone
   once that history is unlocked, and with chat history switched off only until
   the app closes. In the browser, the device key is kept under a key the browser
-  will not export. *Your account → Forget* drops it on this device.
+  will not export, and reloading a tab signs a remembered account back in by
+  itself, without voice; a new tab, or a tab you disconnected or that another
+  device took over, shows the connect dialog. *Your account → Forget* drops it on
+  this device.
 - **One device at a time.** Signing in somewhere else ends the older session; it
   does not reconnect by itself.
 - **Copies on the server** are asked about once, the first time you connect, and
   can be changed under *Your account*. On the desktop your messages are also kept
   in its encrypted archive, unless you switched that off; the browser keeps none
-  between visits, so there the server's copy is the only one. With it you can
+  between visits, so there the server's copy is the only one, and a reload reads
+  the newest 500 entries of each conversation back from it. With it you can
   read your channels on another device, and catch up on what people wrote while
-  you were away. It works
+  you were away; somebody online gets a direct message kept for them at once. It
+  works
   in channels from the server's `channels.json` and in direct messages. Temporary
   channels, and channels that are anonymous or hide their members, keep nothing.
 - **People who join later.** What you kept in a channel before somebody joined is
@@ -328,4 +333,13 @@ in [THREAT-MODEL.md](THREAT-MODEL.md)):
 - Starting a direct conversation with an account that has not been online since
   you connected.
 - Keeping chat in the browser between visits. The browser keeps the server's copies
-  only; the desktop app keeps its own encrypted archive.
+  only; the desktop app keeps its own encrypted archive. So after a reload the
+  browser shows only what has a copy: whoever writes a message decides that, so
+  messages from a guest, or from somebody with copies off, are gone. It also
+  forgets what you had not opened yet (a read conversation and an unread one look
+  the same), and a pin by a manager who is away.
+- A kept copy of a direct message you write from an anonymous channel: the copy
+  carries your account and the message your pseudonym, so nothing is kept there,
+  edits and deletions included, and the app says so. A key for that conversation
+  may still be filed the first time, which a modified client of the other party
+  could notice; the same user id on another roster tells them as much.

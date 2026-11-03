@@ -36,6 +36,32 @@ panel shows bans and emotes only, and no badges. Needs l4f-accounts v0.11.0.
 - Turning a channel's anonymity off, which shows everyone's real name there, is an admin's or
   the channel creator's: holders of *Channels* (moderators) no longer can.
 
+### Fixed
+- **Reloading the browser kept nothing.** With an account and copies on the server, a reload lost
+  the conversation: the browser remembered how far it had read but keeps no messages, so it never
+  read them back. It reads the newest 500 of each conversation back now, without counting them as
+  new, and what you cleared or closed stays that way. A remembered account signs back in by itself
+  on a reload (not into voice). Messages with no server copy still go: a guest's, or those of
+  somebody with copies off.
+- **Direct messages to somebody who had just reconnected went nowhere.** A conversation kept the
+  id they had before, so you read "left the server" while they were online, until they wrote first.
+  It follows them now. A message kept on the server reaches somebody online at once, instead of at
+  their next sign-in, so one that missed them live still arrives.
+- **Direct messages that never left.** Writing to somebody in another room with no secure session
+  yet queued the message and never asked for one; it waited for good, shown as sent. Now it asks, a
+  session they open sends what waited, and the conversation says so when none comes up.
+- **Copies silently not kept** for somebody only known from another channel's member list.
+- **The same message twice**, its live copy and its stored one, when its writer stood in another room
+  or had reconnected. The copy its writer signed wins.
+- **Clear and Search were missing** in a direct message opened while in no voice channel.
+- **A sign-in with many conversations** could stop reading them for the session, and said "not kept".
+  It reads one at a time now and goes on when the relay asks it to wait; reading has its own budget
+  on the relay, so it no longer refuses what you write meanwhile.
+
+### Security
+- A direct message written from an anonymous channel keeps no server copy: the copy carries your
+  account and the live message your pseudonym, so its reader could tie the two.
+
 ## [1.6.0] - 2026-11-03
 
 No protocol change: a 1.5 app and relay connect as before. New: this app also talks to relays

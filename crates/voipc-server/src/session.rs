@@ -2592,7 +2592,11 @@ async fn handle_admin_kick(
             .get(&target_sid)
             .is_some_and(|s| s.is_admin || s.is_moderator)
     {
-        admin_error(tx, "only an admin can kick or ban an admin or someone with privileges").await;
+        admin_error(
+            tx,
+            "only an admin can kick or ban an admin or someone with privileges",
+        )
+        .await;
         return;
     }
     let reason = ban_reason(reason);

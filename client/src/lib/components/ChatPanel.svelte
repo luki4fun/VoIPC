@@ -35,7 +35,7 @@
   import { fetchFile, fileLimits, sendFile } from "../files.js";
   import { linkFacts, mentionNames as mentionNamesOf, plainText } from "../markdown.js";
   import { rosterOf } from "../roster-rules.js";
-  import { awayHint, liveIdOf, reach } from "../dm-rules.js";
+  import { awayHint, liveIdOf, reach, writeToId } from "../dm-rules.js";
   import { prepare } from "../image-prep.js";
   import { sealedLen } from "../file-rules.js";
   import {
@@ -131,10 +131,12 @@
   /** Their id now, when they are on a list we see (dm-rules.ts). */
   const dmSeenId = $derived(dmName === null ? undefined : liveIdOf(dmName, $users, $channelRosters));
   const dmReach = $derived(isDmMode ? reach($activeDmUserId ?? 0, dmSeenId, dmRow?.account, !!$account?.cloud) : "live");
-  // An archived conversation's person is here: theirs from now on
+  // Their person is here, under a newer id: an archived conversation's, or one
+  // who came back after a reload. Theirs from now on. Never an older id: a
+  // roster can hold the one they had before a message moved the row.
   $effect(() => {
     const [server, name, id] = [$serverAddress, dmName, dmSeenId];
-    if (name !== null && id !== undefined && ($activeDmUserId ?? 0) < 0) untrack(() => attachDm(server, name, id));
+    if (name !== null && id !== undefined && id > ($activeDmUserId ?? 0)) untrack(() => attachDm(server, name, id));
   });
 
   // The channel whose chat is on screen: a preview, then the text channel the
@@ -786,7 +788,7 @@
     for (const c of $dmConversations) {
       // Keyed by name, as the sidebar's rows (dm-rules `listRows`)
       if (out.some((d) => d.key === `d${c.username}`)) continue;
-      const seen = c.user_id > 0 ? undefined : liveIdOf(c.username, $users, $channelRosters);
+      const seen = writeToId(c.user_id, liveIdOf(c.username, $users, $channelRosters));
       const r = reach(c.user_id, seen, c.account, !!$account?.cloud);
       if (r === "readonly") continue;
       const dm = { peer: seen ?? c.user_id, name: c.username, away: r === "kept" ? c.account : undefined };
@@ -1039,7 +1041,7 @@
         </div>
       {/if}
     {/if}
-    {#if !isLobby}
+    {#if isDmMode || !isLobby}
       <button
         class="clear-chat-btn search-btn"
         onclick={() => (searching = !searching)}
@@ -1056,7 +1058,7 @@
         aria-label="Files in this conversation"
       ><Icon name="paperclip" size={16} /></button>
     {/if}
-    {#if displayMessages.length > 0 && !isLobby}
+    {#if displayMessages.length > 0 && (isDmMode || !isLobby)}
       <button
         class="clear-chat-btn"
         onclick={(e) => { if (keptConv) { e.stopPropagation(); showClearMenu = !showClearMenu; } else void confirmClearHere(); }}

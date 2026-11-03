@@ -433,7 +433,10 @@ pub enum AccountRequest {
         ct: Vec<u8>,
         ttl_secs: Option<u32>,
     },
-    /// Entries of `conv` after sequence number `after`, a page at a time.
+    /// Entries of `conv` after sequence number `after`, a page at a time. A
+    /// negative `after` starts at the newest `|after|` entries, then `more`
+    /// pages on from the last one as usual. A relay before 1.7 reads it as
+    /// "all of them", which is only slower.
     LogFetch {
         conv: String,
         after: i64,
@@ -675,7 +678,8 @@ pub enum AccountReply {
         conv: String,
         joiners: Vec<[u8; 16]>,
     },
-    /// Somebody wrapped a key to us in `conv`.
+    /// Somebody wrapped a key to us in `conv`, or (since 1.7) wrote to us
+    /// there: read it again.
     LogNews {
         conv: String,
     },

@@ -381,6 +381,26 @@ pub async fn after_connect(
     run(app, server, tcp_tx, a).await;
 }
 
+/// `AccountSession::tick` every couple of seconds, for as long as the
+/// connection lasts.
+pub async fn tick_task(
+    app: tauri::AppHandle,
+    server: String,
+    link: std::sync::Arc<AccountLink>,
+    tcp_tx: crate::network::ControlTx,
+) {
+    let mut interval = tokio::time::interval(std::time::Duration::from_secs(2));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        if tcp_tx.is_closed() {
+            return;
+        }
+        let a = link.session().tick();
+        run(&app, &server, &tcp_tx, a).await;
+    }
+}
+
 /// The identities the Signal stores took in while one server message was
 /// handled — a session a peer opened among them, which no bundle check sees —
 /// against the pins, as a fetched bundle's is. Taken on every connection, so

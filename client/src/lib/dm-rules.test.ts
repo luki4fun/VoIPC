@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { ago, archivedPeers, closeMarkKey, lastSaid, listRows, liveIdOf, reach } from "./dm-rules.ts";
+import { ago, archivedPeers, closeMarkKey, lastSaid, listRows, liveIdOf, reach, writeToId } from "./dm-rules.ts";
 import type { ChatMessage, UserInfo } from "./types.ts";
 
 const S = "h.example:9987";
@@ -39,10 +39,28 @@ test("lastSaid skips our own notices", () => {
   assert.equal(lastSaid([msg("", 1, { kind: "notice" })]), undefined);
 });
 
+test("writing goes to the newest id anybody knows, and never back to an older one", () => {
+  assert.equal(writeToId(9, 5), 9, "a roster older than the row");
+  assert.equal(writeToId(5, 9), 9, "they came back");
+  assert.equal(writeToId(-3, 9), 9);
+  assert.equal(writeToId(9, undefined), 9);
+  assert.equal(writeToId(-3, undefined), undefined, "a made-up id goes nowhere");
+});
+
+test("liveIdOf takes the newest id, and is not fooled by a pseudonym", () => {
+  const stale = new Map([[7, [user(5, "bob#0001")]]]);
+  assert.equal(liveIdOf("bob#0001", [user(9, "bob#0001")], stale), 9, "a roster that went stale");
+  assert.equal(liveIdOf("bob#0001", [user(5, "bob#0001"), user(9, "bob#0001")], new Map()), 9, "both sides of a reconnect");
+  const anon = new Map([[7, [user(5, "Guest-1234")]]]);
+  assert.equal(liveIdOf("Guest-1234", [], anon), undefined);
+  const account = new Map([[7, [{ ...user(5, "bob"), account: [1, 2] } as unknown as UserInfo]]]);
+  assert.equal(liveIdOf("bob", [], account), 5);
+});
+
 test("liveIdOf finds an exact name in our room or any roster", () => {
   const rosters = new Map([[7, [user(42, "bob#0001")]]]);
   assert.equal(liveIdOf("bob#0001", [user(3, "eve")], rosters), 42);
-  assert.equal(liveIdOf("eve", [user(3, "eve")], rosters), 3);
+  assert.equal(liveIdOf("eve#0002", [user(3, "eve#0002")], rosters), 3);
   assert.equal(liveIdOf("bob", [], rosters), undefined);
   assert.equal(liveIdOf("", [user(3, "")], rosters), undefined);
 });

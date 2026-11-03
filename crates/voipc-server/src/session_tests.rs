@@ -3900,6 +3900,189 @@ async fn a_dm_written_while_they_were_away_is_read_on_every_device_once() {
     );
 }
 
+/// Somebody online reads a kept message at once. It is what repairs a live
+/// copy that missed them: they had just reloaded, or sit on no list the
+/// writer sees.
+#[tokio::test]
+async fn a_message_kept_for_somebody_online_reaches_them_at_once() {
+    use voipc_crypto::sync::{AccountSync, Event, Prefs};
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (mut alice, a, alice_signed) = register_with(&state, "alice").await;
+    let (mut bob, b, bob_signed) = register_with(&state, "bob").await;
+    let (mut sa, first) = AccountSync::start(&alice_signed, a.id, Default::default(), true);
+    pump(&mut alice, &mut sa, first).await;
+    let (mut sb, first) = AccountSync::start(&bob_signed, b.id, Default::default(), true);
+    pump(&mut bob, &mut sb, first).await;
+    let save = sa.set_prefs(Prefs {
+        cloud: true,
+        asked: true,
+    });
+    pump(&mut alice, &mut sa, save).await;
+
+    for text in ["one", "two"] {
+        let env = voipc_crypto::envelope::envelope(text, text, None);
+        let out = sa.send_dm(b.id, env, 1_700_000_000_000, None);
+        pump(&mut alice, &mut sa, out).await;
+        let events = pump(&mut bob, &mut sb, Vec::new()).await;
+        let got: Vec<String> = events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Message { envelope, .. } => {
+                    Some(voipc_crypto::envelope::open_envelope(envelope).text)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got, vec![text.to_string()], "{events:?}");
+    }
+}
+
+/// Appends an entry whose bytes the relay cannot read anyway.
+async fn append_raw(c: &mut Client, conv: &str, size: usize) -> AccountReply {
+    c.send(&ClientMessage::Account(AccountRequest::LogAppend {
+        conv: conv.to_string(),
+        epoch: 1,
+        ct: vec![7; size],
+        ttl_secs: None,
+    }))
+    .await;
+    let ServerMessage::Account(r) = c.expect("answer", |m| reply(m).is_some()).await else {
+        panic!()
+    };
+    r
+}
+
+async fn fetch_raw(c: &mut Client, conv: &str, after: i64) -> (Vec<i64>, bool) {
+    c.send(&ClientMessage::Account(AccountRequest::LogFetch {
+        conv: conv.to_string(),
+        after,
+    }))
+    .await;
+    let ServerMessage::Account(AccountReply::LogPage { entries, more, .. }) = c
+        .expect("page", |m| {
+            matches!(m, ServerMessage::Account(AccountReply::LogPage { .. }))
+        })
+        .await
+    else {
+        panic!()
+    };
+    (entries.iter().map(|e| e.seq).collect(), more)
+}
+
+/// A browser reads back what it holds after every reload, not a year's log.
+#[tokio::test]
+async fn a_negative_fetch_starts_at_the_newest_entries_and_pages_on() {
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (mut alice, a, _) = register_with(&state, "alice").await;
+    let conv = voipc_protocol::conv::dm_conv(&a.id, &[0xee; 16]);
+    let mut seqs = Vec::new();
+    for _ in 0..5 {
+        // Big enough that a page holds two
+        let AccountReply::LogAppended { seq, .. } = append_raw(&mut alice, &conv, 16 * 1024).await
+        else {
+            panic!("appended")
+        };
+        seqs.push(seq);
+    }
+    let (first, more) = fetch_raw(&mut alice, &conv, -4).await;
+    assert_eq!(first, seqs[1..3], "the oldest of the newest four, in order");
+    assert!(more);
+    let (rest, more) = fetch_raw(&mut alice, &conv, *first.last().unwrap()).await;
+    assert_eq!(rest, seqs[3..5]);
+    assert!(!more);
+    // Fewer than asked for, or the most anybody could ask for: from the start
+    for after in [-100, i64::MIN, 0] {
+        assert_eq!(
+            fetch_raw(&mut alice, &conv, after).await.0,
+            seqs[..2],
+            "{after}"
+        );
+    }
+}
+
+/// A kept copy carries the writer's account, and the live message goes out
+/// under the alias: together they would tie the two for its reader.
+#[tokio::test]
+async fn nothing_is_kept_for_a_direct_message_written_under_a_pseudonym() {
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (mut alice, a, _) = register_with(&state, "alice").await;
+    let conv = voipc_protocol::conv::dm_conv(&a.id, &[0xee; 16]);
+    assert!(matches!(
+        append_raw(&mut alice, &conv, 8).await,
+        AccountReply::LogAppended { .. }
+    ));
+    alice
+        .send(&ClientMessage::CreateChannel {
+            name: "masks".into(),
+            password: None,
+            proximity: ProximityMode::Off,
+            anonymous: true,
+            text: false,
+        })
+        .await;
+    let ServerMessage::ChannelCreated { channel } = alice
+        .expect("ChannelCreated", |m| {
+            matches!(m, ServerMessage::ChannelCreated { .. })
+        })
+        .await
+    else {
+        unreachable!()
+    };
+    alice
+        .send(&ClientMessage::JoinChannel {
+            channel_id: channel.channel_id,
+            password: None,
+        })
+        .await;
+    alice
+        .expect("in the channel", |m| {
+            matches!(m, ServerMessage::UserList { channel_id, .. } if *channel_id == channel.channel_id)
+        })
+        .await;
+    assert!(matches!(
+        append_raw(&mut alice, &conv, 8).await,
+        AccountReply::Error { request, reason } if request == "LogAppend" && reason.contains("pseudonym")
+    ));
+}
+
+/// Reading a long log back must not refuse a message being written, nor the
+/// other way round.
+#[tokio::test]
+async fn reading_the_log_has_its_own_budget() {
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    let (mut alice, a, _) = register_with(&state, "alice").await;
+    let conv = voipc_protocol::conv::dm_conv(&a.id, &[0xee; 16]);
+    let limiter = || crate::state::RateLimiter::new(0.0, 0.0);
+    for mut s in state.sessions.iter_mut() {
+        s.account_rate = limiter();
+    }
+    assert!(
+        matches!(append_raw(&mut alice, &conv, 8).await, AccountReply::Error { request, reason } if request == "LogAppend" && reason.contains("slow down"))
+    );
+    assert!(
+        fetch_raw(&mut alice, &conv, 0).await.0.is_empty(),
+        "still read"
+    );
+    for mut s in state.sessions.iter_mut() {
+        s.account_rate = crate::state::RateLimiter::new(30.0, 10.0);
+        s.log_read_rate = limiter();
+    }
+    assert!(matches!(
+        append_raw(&mut alice, &conv, 8).await,
+        AccountReply::LogAppended { .. }
+    ));
+    alice
+        .send(&ClientMessage::Account(AccountRequest::LogFetch {
+            conv: conv.clone(),
+            after: 0,
+        }))
+        .await;
+    assert!(matches!(
+        alice.expect("refused", |m| reply(m).is_some()).await,
+        ServerMessage::Account(AccountReply::Error { request, reason }) if request == "LogFetch" && reason.contains("slow down")
+    ));
+}
+
 // ── channel logs ──
 
 /// A relay with accounts and one persistent text channel (id 1), which

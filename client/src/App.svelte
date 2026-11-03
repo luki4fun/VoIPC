@@ -57,6 +57,8 @@
   import {
     addChannelMessage,
     addDmMessage,
+    detachDm,
+    peerName,
     applyChannelEvent,
     applyDmEvent,
     fileStoredChannelMessage,
@@ -88,6 +90,7 @@
     fromServer,
     listenServer,
     reconnectAll,
+    withReloadServers,
     serverId,
     resetServer,
     showConnectDialog,
@@ -139,6 +142,8 @@
     patchRosters,
     requestAllRosters,
     requestRoster,
+    forgetUser,
+    rosterAccount,
     setRoster,
   } from "./lib/stores/rosters.js";
   import { emoteLimits, setEmotes, type EmoteLimits, type EmoteSet } from "./lib/stores/emotes.js";
@@ -694,9 +699,10 @@
       // Schedule auto-connect — will trigger after chat history is unlocked.
       // Every server that was open, or, in a config written before there was
       // a list, the one server it remembered.
+      let list: SavedServer[] = [];
       if (config.auto_connect) {
         const open = config.open_servers ?? [];
-        const list: SavedServer[] =
+        list =
           open.length > 0
             ? open
             : config.last_host && config.last_username
@@ -710,8 +716,9 @@
                   },
                 ]
               : [];
-        if (list.length > 0) pendingAutoConnect = list;
       }
+      list = withReloadServers(list);
+      if (list.length > 0) pendingAutoConnect = list;
     } catch (e) {
       console.error("Failed to load config:", e);
     } finally {
@@ -1536,6 +1543,7 @@
         timestamp: number;
         reply_to?: string | null;
         thread?: string | null;
+        replay?: boolean;
       }>("stored-channel-message", (server, m) => {
         const ch = get(channels.peek(server)).find((c) => c.log === m.conv);
         if (!ch) return;
@@ -1551,7 +1559,7 @@
           expires_at: expiryFor(m.timestamp, m.ttl_secs, channelMessageTtl(server, ch.channel_id)),
           ...messageRefs(m),
         });
-        if (added && !m.from_me && !viewingChannel(server, ch.channel_id)) incrementChannelUnread(server, ch.name, m.timestamp);
+        if (added && !m.from_me && !m.replay && !viewingChannel(server, ch.channel_id)) incrementChannelUnread(server, ch.name, m.timestamp);
       }),
 
       // Who can read what we write in a channel's stored log, said where it
@@ -1597,7 +1605,7 @@
         // the stored log later is recognised (sameMessage).
         const sender = from_user_id === myId
           ? get(account.peek(server))?.info.id
-          : get(users.peek(server)).find((u) => u.user_id === from_user_id)?.account;
+          : (get(users.peek(server)).find((u) => u.user_id === from_user_id)?.account ?? rosterAccount(server, from_user_id));
         // Done to an earlier message of the conversation: no message, no sound
         if (data.event != null) {
           const event = chatEvent(data.event);
@@ -1625,25 +1633,32 @@
 
       // A direct message found nobody: the person it was for has left. Said
       // in the conversation, under the message, which is where it was missed.
-      // `expired`: it waited a minute for a secure session with them and none
-      // came up, so it was never sent at all.
+      // `expired`: it waited for a secure session with them and none came up,
+      // so it was never sent at all. That says nothing about where they are;
+      // the rest says their id is gone, which is what ends writing to it.
       listenServer<{ user_id: number; kept?: boolean; expired?: number }>(
         "dm-undelivered",
         (server, { user_id, kept, expired }) => {
           const myId = get(userId.peek(server));
-          const peer = get(dmConversations.peek(server)).find((c) => c.user_id === user_id)?.username;
+          const peer = peerName(server, user_id, "");
           const who = peer ? shortName(peer) : "they";
           addDmMessage(server, myId, myId, "", user_id, {
             user_id: 0,
             username: "",
             content: expired
-              ? `Not delivered — no secure session with ${peer ? who : "them"} within a minute`
+              ? kept
+                ? `No secure session with ${peer ? who : "them"} — kept on the server for them`
+                : `Not delivered — no secure session with ${peer ? who : "them"}`
               : kept
                 ? `${who} left the server — kept there for when they are back`
                 : `Not delivered — ${who} left the server`,
             timestamp: Date.now(),
             kind: "notice",
           });
+          if (!expired) {
+            detachDm(server, user_id);
+            forgetUser(server, user_id);
+          }
         },
       ),
 

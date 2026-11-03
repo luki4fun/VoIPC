@@ -17,6 +17,8 @@ const MAX_ENTRY: usize = 16 * 1024;
 /// A page of entries, under the 64 KiB frame it travels in.
 const PAGE_BYTES: usize = 44 * 1024;
 const PAGE_ROWS: i64 = 200;
+/// Most entries a first read may ask to start back from (`fetch`).
+const MAX_TAIL: u64 = 5000;
 const MAX_LOGKEY_LOOKUPS: usize = 64;
 /// Most stored members a channel's log takes: a key goes to each of them in
 /// one frame (`EpochPut`), and their keys come back in one (`LogMembersFound`).
@@ -369,6 +371,24 @@ pub(super) async fn fetch(
         return Ok(refused("LogFetch", "not a conversation of yours"));
     }
     let now_ms = now_ms();
+    // Negative: start at the newest `|after|` entries, then page as usual. A
+    // client holds a few hundred per conversation, and a browser reads them
+    // back after every reload, so a year's log is not sent to be thrown away.
+    let after = if after < 0 {
+        let first: Option<i64> = db!(relay.store(), pool => {
+            sqlx::query_scalar(
+                "SELECT seq FROM voipc_log WHERE conv = $1 AND keep_until > $2 ORDER BY seq DESC LIMIT 1 OFFSET $3",
+            )
+            .bind(conv)
+            .bind(now_ms)
+            .bind(after.unsigned_abs().min(MAX_TAIL) as i64 - 1)
+            .fetch_optional(pool)
+            .await?
+        });
+        first.map_or(0, |seq| seq - 1)
+    } else {
+        after
+    };
     let rows: Vec<EntryRow> = db!(relay.store(), pool => {
         sqlx::query_as(
             "SELECT seq, sender, epoch, server_at, ct FROM voipc_log WHERE conv = $1 AND seq > $2 AND keep_until > $3

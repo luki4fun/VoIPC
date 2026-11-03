@@ -3112,13 +3112,101 @@ if (PORT3) {
       input.closest("form").requestSubmit(); return true; })()`);
   const markers = (tab) => tab.evaluate(`[...document.querySelectorAll(".history-marker")].map((e) => e.textContent).join(" | ")`);
   const texts = (tab) => tab.evaluate(`[...document.querySelectorAll(".msg-content")].map((e) => e.textContent).join(" | ").slice(0, 300)`);
+  const openKept = async (tab) => {
+    await waitFor(tab, `[...document.querySelectorAll(".channel-list .channel .channel-name")].some((e) => e.textContent === "kept")`, 10_000);
+    await tab.evaluate(`[...document.querySelectorAll(".channel-list .channel")].find((e) => e.querySelector(".channel-name")?.textContent === "kept").click()`);
+    await waitFor(tab, `document.querySelector(".input-bar .chat-input")`, 10_000);
+  };
   const row = `[...document.querySelectorAll(".user .name")].find((e) => e.title === ${JSON.stringify(acctB)})`;
-  await back.evaluate(`(() => { const el = ${row}?.closest(".user"); if (!el) return false;
-    el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 40 })); return true; })()`);
-  await sleep(300);
-  await back.evaluate(`(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => /direct message/i.test(e.textContent));
-    if (!b) return false; b.click(); return true; })()`);
-  await waitFor(back, `document.querySelector(".input-bar .chat-input")`, 10_000);
+  const dmWith = async (tab, other) => {
+    const them = `[...document.querySelectorAll(".user .name")].find((e) => e.title === ${JSON.stringify(other)})`;
+    await waitFor(tab, them, 15_000);
+    await tab.evaluate(`(() => { const el = ${them}?.closest(".user"); if (!el) return false;
+      el.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, clientX: 40, clientY: 40 })); return true; })()`);
+    await sleep(300);
+    await tab.evaluate(`(() => { const b = [...document.querySelectorAll(".ctx-item")].find((e) => /direct message/i.test(e.textContent));
+      if (!b) return false; b.click(); return true; })()`);
+    await waitFor(tab, `document.querySelector(".input-bar .chat-input")`, 10_000);
+  };
+  // A reload, 1.7. The browser keeps no chat of its own, so what comes back is
+  // the server's copies. A remembered account signs in by itself, and the
+  // other side's open conversation follows it to its new id.
+  const dmRowOf = (other) => `[...document.querySelectorAll(".dm-name")].find((e) => e.title === ${JSON.stringify(other)})`;
+  const openDmRow = async (tab, other) => {
+    await waitFor(tab, dmRowOf(other), 15_000);
+    await tab.evaluate(`${dmRowOf(other)}.closest(".dm-entry").click()`);
+    await waitFor(tab, `document.querySelector(".input-bar .chat-input")`, 10_000);
+  };
+  const reads = (tab, text, timeoutMs = 15_000) =>
+    waitFor(tab, `[...document.querySelectorAll(".msg-content")].some((e) => e.textContent.includes(${JSON.stringify(text)}))`, timeoutMs).then(() => true, () => false);
+  // After a reload: signed back in, not at the dialog (which has a channel
+  // list behind it)
+  const reload = async (tab) => {
+    await tab.send("Page.reload");
+    await sleep(1000);
+    const signedIn = await waitFor(tab, `document.querySelector(".channel-list") && !document.querySelector(".connect-btn")`, 30_000).then(() => true, () => false);
+    if (signedIn) await answerFirstRun(tab, "accounts", 15_000);
+    return signedIn;
+  };
+  await dmWith(back, acctB);
+  await dmWith(two, acct);
+  const toB = `before the reload ${process.pid}`;
+  const toA = `and an answer ${process.pid}`;
+  await sayIn(back, toB);
+  const toBSeen = await reads(two, toB);
+  await sayIn(two, toA);
+  check("two accounts write to each other", toBSeen && (await reads(back, toA)), await texts(back));
+  const inKept = `said in the kept channel ${process.pid}`;
+  await openKept(back);
+  await sayIn(back, inKept);
+  await reads(two, inKept, 3_000);
+  const told = await waitFor(
+    back,
+    `[...document.querySelectorAll(".history-marker")].some((e) => e.textContent.includes("can be read by") && e.textContent.includes(${JSON.stringify(acctB)}))`,
+    15_000,
+  ).then(() => true, () => false);
+  check("the writer is told who can read what it keeps", told, await markers(back));
+  await sleep(1500); // their copies are filed
+  check("a reload of a remembered account signs back in by itself", await reload(back), await back.evaluate(`document.body.innerText.slice(0, 200)`));
+  const listedAgain = await waitFor(back, dmRowOf(acctB), 15_000).then(() => true, () => false);
+  const noUnread = listedAgain && !(await back.evaluate(`!!${dmRowOf(acctB)}.closest(".dm-entry").querySelector(".dm-unread")`));
+  if (listedAgain) await openDmRow(back, acctB);
+  const bothBack = listedAgain && (await reads(back, toB)) && (await reads(back, toA));
+  check("and both sides of the conversation are back", bothBack, listedAgain ? await texts(back) : "no conversation listed");
+  check("none of it counted as new", noUnread);
+  await openKept(back);
+  const keptBack = await reads(back, inKept);
+  await sleep(2500); // a member's hand-off offers it again meanwhile, under the id it had
+  const copies = await back.evaluate(`[...document.querySelectorAll(".msg-content")].filter((e) => e.textContent.includes(${JSON.stringify(inKept)})).length`);
+  check("a channel's message comes back once, whoever else offers it", keptBack && copies === 1, `${copies} of: ${await texts(back)}`);
+  check("and a second reload finds the same", await reload(back));
+  await openDmRow(back, acctB).catch(() => {});
+  check("all of it", (await reads(back, toB)) && (await reads(back, toA)), await texts(back));
+  // Their turn, with the conversation open here: the next message goes to who
+  // they are now, not who they were.
+  await reload(two);
+  await sleep(1500); // the roster that says who they are now
+  const afterReload = `after your reload ${process.pid}`;
+  await sayIn(back, afterReload);
+  await sleep(1000);
+  const leftNotice = async () => (await markers(back)).includes("left the server");
+  check("somebody who just reloaded is not said to have left", !(await leftNotice()), await markers(back));
+  await openDmRow(two, acct).catch(() => {});
+  check("and what is written to them arrives", await reads(two, afterReload), await texts(two));
+  const answered = `I am back ${process.pid}`;
+  await sayIn(two, answered);
+  check("and they can answer", await reads(back, answered), await texts(back));
+  // What was cleared stays gone: the server's copies are all still there
+  await back.evaluate(click('button.clear-chat-btn[title="Clear chat history"]'));
+  await waitFor(back, `document.querySelector(".clear-menu")`, 5_000).catch(() => {});
+  await back.evaluate(`[...document.querySelectorAll(".clear-menu .ttl-choice")].find((b) => b.textContent.trim() === "Clear here")?.click()`);
+  await sleep(2500); // the save is debounced by two seconds
+  await reload(back);
+  await sleep(2500);
+  const clearedRow = await back.evaluate(`!!${dmRowOf(acctB)}`);
+  if (clearedRow) await openDmRow(back, acctB);
+  check("what was cleared does not come back with a reload", !clearedRow || !(await reads(back, toB, 2_000)), await texts(back));
+  await dmWith(back, acctB);
   await two.send("Page.close").catch(() => {});
   await sleep(1000);
   const dmNote = `a word for later ${process.pid}`;
@@ -3129,20 +3217,9 @@ if (PORT3) {
     15_000,
   ).then(() => true, () => false);
   check("a message to somebody who left is kept for them, and says so", dmKept, await markers(back));
-  const openKept = async (tab) => {
-    await waitFor(tab, `[...document.querySelectorAll(".channel-list .channel .channel-name")].some((e) => e.textContent === "kept")`, 10_000);
-    await tab.evaluate(`[...document.querySelectorAll(".channel-list .channel")].find((e) => e.querySelector(".channel-name")?.textContent === "kept").click()`);
-    await waitFor(tab, `document.querySelector(".input-bar .chat-input")`, 10_000);
-  };
   await openKept(back);
   const note = `while you were away ${process.pid}`;
   await sayIn(back, note);
-  const told = await waitFor(
-    back,
-    `[...document.querySelectorAll(".history-marker")].some((e) => e.textContent.includes("can be read by") && e.textContent.includes(${JSON.stringify(acctB)}))`,
-    15_000,
-  ).then(() => true, () => false);
-  check("the writer is told who can read what it keeps", told, await markers(back));
   await sleep(1000);
   await back.send("Page.close").catch(() => {});
 
@@ -3216,7 +3293,30 @@ if (PORT3) {
   const purgedToast = await waitFor(aliceAgain, `(window.__toasts ?? []).some((t) => /[1-9]\d* kept messages? deleted/.test(t))`, 15_000).then(() => true, () => false);
   check("a writer deletes what she kept in a channel from the server", menu && purgedToast, await aliceAgain.evaluate(`(window.__toasts ?? []).join(" | ")`));
   await sleep(1500); // the tombstone goes out
+  // Who chose to leave stays out over a reload; a guest always starts over
+  await serverMenu(aliceAgain, "Disconnect");
+  await sleep(300);
+  await aliceAgain.send("Page.reload");
+  await sleep(1000);
+  check(
+    "a Disconnect followed by a reload stays disconnected",
+    await waitFor(aliceAgain, `document.querySelector(".connect-btn")`, 10_000).then(() => true, () => false),
+  );
   await aliceAgain.send("Page.close").catch(() => {});
+  const guestTab = await openDialog();
+  await realClick(guestTab, ".mode-switch button:nth-child(1)");
+  await waitFor(guestTab, `document.querySelector('input[placeholder="Your name"]')`);
+  await guestTab.evaluate(setInput('input[placeholder="Your name"]', `guest${process.pid % 10000}`));
+  await realClick(guestTab, ".connect-btn");
+  await waitFor(guestTab, `document.querySelector(".channel-list") && !document.querySelector(".connect-btn")`, 20_000).catch(() => {});
+  await answerFirstRun(guestTab, "accounts guest", 10_000).catch(() => {});
+  await guestTab.send("Page.reload");
+  await sleep(1000);
+  check(
+    "a guest's reload starts over at the dialog",
+    await waitFor(guestTab, `document.querySelector(".connect-btn")`, 10_000).then(() => true, () => false),
+  );
+  await guestTab.send("Page.close").catch(() => {});
 
   // Two-factor codes, set up from the account panel, then a sign-in on a
   // browser that types the password: the code prompt comes mid-sign-in, before

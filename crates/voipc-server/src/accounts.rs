@@ -31,6 +31,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{mpsc, Semaphore};
 use tracing::{info, warn};
 use voipc_protocol::codec::{decode_client_msg, encode_server_msg};
+use voipc_protocol::conv::dm_parties;
 use voipc_protocol::messages::{
     AccountReply, AccountRequest, AuthContinue, AuthStep, ClientMessage, ServerMessage,
 };
@@ -742,6 +743,17 @@ fn refused(request: &str, reason: &str) -> AccountReply {
         request: request.into(),
         reason: reason.into(),
     }
+}
+
+/// A database error reading the log: answered, since the client waits for
+/// this reply before it reads its next conversation, and in the words that
+/// make it try again (`voipc_crypto::sync`).
+fn read_failed(request: &str, e: anyhow::Error) -> AccountReply {
+    warn!("{request}: {e:#}");
+    refused(
+        request,
+        "The stored messages could not be read just now; slow down.",
+    )
 }
 
 /// The derived secret as l4f's password field: base64url, 43 characters.
@@ -1562,10 +1574,20 @@ pub async fn handle_request(
     // Database work, so budgeted on its own beside the 50 messages a second
     // every message shares (1.0 audit H1-03). The variant's name is what a
     // client's error handling goes by.
-    let allowed = state
-        .sessions
-        .get_mut(&session_id)
-        .is_some_and(|mut s| s.account_rate.try_consume());
+    let reads_log = matches!(
+        req,
+        AccountRequest::WrapsFetch { .. }
+            | AccountRequest::LogFetch { .. }
+            | AccountRequest::LogKeys { .. }
+            | AccountRequest::LogIndex
+    );
+    let allowed = state.sessions.get_mut(&session_id).is_some_and(|mut s| {
+        if reads_log {
+            s.log_read_rate.try_consume()
+        } else {
+            s.account_rate.try_consume()
+        }
+    });
     if !allowed {
         let name = format!("{req:?}");
         let name = name.split([' ', '{', '(']).next().unwrap_or("Account");
@@ -1755,7 +1777,9 @@ pub async fn handle_request(
         AccountRequest::LogKeyPublish { logkey, sig } => {
             log::publish(&relay, user.id, &logkey, &sig).await?
         }
-        AccountRequest::LogKeys { accounts } => log::keys(&relay, &accounts).await?,
+        AccountRequest::LogKeys { accounts } => log::keys(&relay, &accounts)
+            .await
+            .unwrap_or_else(|e| read_failed("LogKeys", e)),
         AccountRequest::EpochPut { conv, epoch, wraps } => {
             let (out, told) = log::epoch_put(&relay, user.id, &conv, epoch, &wraps).await?;
             for r in told {
@@ -1763,7 +1787,9 @@ pub async fn handle_request(
             }
             out
         }
-        AccountRequest::WrapsFetch { conv } => log::wraps(&relay, user.id, &conv).await?,
+        AccountRequest::WrapsFetch { conv } => log::wraps(&relay, user.id, &conv)
+            .await
+            .unwrap_or_else(|e| read_failed("WrapsFetch", e)),
         AccountRequest::LogAppend {
             conv,
             epoch,
@@ -1771,11 +1797,23 @@ pub async fn handle_request(
             ttl_secs,
         } => match kept_post_ok(state, session_id, &conv).await {
             Err(reason) => refused("LogAppend", &reason),
-            Ok(()) => log::append(&relay, user.id, &conv, epoch, &ct, ttl_secs).await?,
+            Ok(()) => {
+                let out = log::append(&relay, user.id, &conv, epoch, &ct, ttl_secs).await?;
+                // The other party, if online, reads it now: a live copy that
+                // missed them (they just reloaded, or sit on no list the
+                // writer sees) has nothing else to bring it before their next
+                // sign-in. A channel's members read it on entering instead.
+                if let (AccountReply::LogAppended { .. }, Some((a, b))) = (&out, dm_parties(&conv))
+                {
+                    let other = if a == user.id.0 { b } else { a };
+                    tell(state, &other, AccountReply::LogNews { conv: conv.clone() }).await;
+                }
+                out
+            }
         },
-        AccountRequest::LogFetch { conv, after } => {
-            log::fetch(&relay, user.id, &conv, after).await?
-        }
+        AccountRequest::LogFetch { conv, after } => log::fetch(&relay, user.id, &conv, after)
+            .await
+            .unwrap_or_else(|e| read_failed("LogFetch", e)),
         AccountRequest::LogIndex => {
             let (convs, pending) = log::index(&relay, user.id).await?;
             for p in pending {
@@ -1806,7 +1844,9 @@ pub async fn handle_request(
             out
         }
         AccountRequest::LogLeave { conv } => log::leave(&relay, user.id, &conv).await?,
-        AccountRequest::LogMembers { conv } => log::members_of(&relay, user.id, &conv).await?,
+        AccountRequest::LogMembers { conv } => log::members_of(&relay, user.id, &conv)
+            .await
+            .unwrap_or_else(|e| read_failed("LogMembers", e)),
         AccountRequest::Admin { op, code } => {
             admin::handle(state, &relay, session_id, &user, &ctx, op, code).await?
         }
@@ -1817,16 +1857,21 @@ pub async fn handle_request(
 /// A channel's stored copy is held to the channel's own rules, as the live
 /// post is (`ServerState::post_rules`): written from inside the channel, by a
 /// manager in an announcement channel, at slow mode's pace. A direct
-/// conversation has its two parties, which `log::append` checks.
+/// conversation has its two parties, which `log::append` checks; a copy there
+/// carries the writer's account, so none is kept behind a pseudonym, where the
+/// live message goes out under the alias and the copy would tie the two.
 async fn kept_post_ok(state: &ServerState, session_id: u32, conv: &str) -> Result<(), String> {
-    if !conv.starts_with("c:") {
-        return Ok(());
-    }
     let user_id = state
         .sessions
         .get(&session_id)
         .map(|s| s.user_id)
         .ok_or("Sign in with an account first.")?;
+    if !conv.starts_with("c:") {
+        if state.names_of(user_id).await.1.is_some() {
+            return Err("nothing is kept while you write under a pseudonym.".into());
+        }
+        return Ok(());
+    }
     let channel_id = {
         let channels = state.channels.read().await;
         channels

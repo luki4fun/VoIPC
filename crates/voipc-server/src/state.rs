@@ -112,6 +112,10 @@ pub struct UserSession {
     /// Account requests (the database work behind kept messages and the
     /// vault): 10 a second, 30 at once.
     pub account_rate: RateLimiter,
+    /// Reads of the stored log: a browser reads its conversations back after
+    /// every reload, and that must not refuse the writes (or uploads) sharing
+    /// `account_rate` meanwhile. Bounded queries, so a larger budget.
+    pub log_read_rate: RateLimiter,
     /// Rate limiter for keyframe requests relayed *to* this user as a sharer
     /// (each one forces an IDR); per share, so many viewers losing the same
     /// frames cannot storm the sharer.
@@ -304,6 +308,7 @@ impl UserSession {
             password_attempt_rate: RateLimiter::new(3.0, 1.0),
             chat_rate: RateLimiter::new(5.0, 5.0),
             account_rate: RateLimiter::new(30.0, 10.0),
+            log_read_rate: RateLimiter::new(60.0, 20.0),
             keyframe_relay_rate: RateLimiter::new(2.0, 1.0),
             loss_report_rate: RateLimiter::new(2.0, 1.0),
             // Everything a client says about itself — muted, deafened, sharing

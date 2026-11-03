@@ -38,6 +38,14 @@ pub const ITEM_PREFS: &str = "item.prefs";
 const KEYS_PER_ASK: usize = 64;
 /// Rekeys in a row for one log before giving up on what waits for it.
 const MAX_REKEYS: u32 = 2;
+/// A first read starts this many entries back (`LogFetch`): what a client holds
+/// of a conversation (`MAX_MESSAGES` in chat-rules.ts). A browser reads its
+/// conversations back after every reload.
+const READ_BACK: i64 = 500;
+/// `AccountSync::tick`s without an answer before a read counts as lost.
+const LOST_AFTER_TICKS: u32 = 3;
+/// How the relay says its budget ran out for now (`accounts.rs`).
+const SLOW_DOWN: &str = "slow down";
 
 /// What the person chose about their account, kept in its vault so every
 /// device follows it.
@@ -101,6 +109,8 @@ pub enum Event {
     Kept { conv: String, seq: i64 },
     /// The relay refused to keep something (over quota, no storage).
     NotKept { reason: String },
+    /// A conversation could not be read from the log, other than for now.
+    NotRead { reason: String },
     /// These accounts can read what we write in channel log `conv` from now
     /// on (`history`: what we wrote there before, too). Shown to the user, so
     /// nobody — a member the relay made up included — gets our keys unseen.
@@ -261,6 +271,9 @@ impl Event {
             Event::NotKept { reason } => {
                 ("stored-not-kept", serde_json::json!({ "reason": reason }))
             }
+            Event::NotRead { reason } => {
+                ("stored-not-read", serde_json::json!({ "reason": reason }))
+            }
             Event::VaultProblem { item, problem } => (
                 "vault-problem",
                 serde_json::json!({ "item": item, "problem": problem }),
@@ -371,6 +384,25 @@ pub struct AccountSync {
     fetching: HashMap<String, Fetch>,
     /// Conversations whose entries are to be fetched once their keys are in.
     target: HashSet<String>,
+    /// Conversations waiting their turn: one read at a time, so a sign-in with
+    /// many of them stays within the relay's budget.
+    queue: VecDeque<String>,
+    /// The read from `queue` now running.
+    reading: Option<String>,
+    /// Each `WrapsFetch` and `LogFetch` not answered yet, in order: a refusal
+    /// names no conversation, so this says whose it is.
+    fetch_asks: VecDeque<String>,
+    /// News of a conversation being read: read it again when that ends.
+    again: HashSet<String>,
+    /// Refused for now: the queue waits for the next `tick`.
+    held: bool,
+    /// `tick`s since a read last got an answer.
+    idle: u32,
+    /// `LogIndex` asked and not answered yet, and asked again at the next `tick`.
+    index_asked: bool,
+    index_due: bool,
+    /// The relay refused to keep the last copy we sent.
+    copy_refused: bool,
     /// Entries waiting for a key (a wrap or a log key not yet in).
     waiting: Vec<(String, LogEntry)>,
     /// Entries opened this run: a fetch again (a key came in) hands them over once.
@@ -484,6 +516,15 @@ impl AccountSync {
             fetched: HashMap::new(),
             fetching: HashMap::new(),
             target: HashSet::new(),
+            queue: VecDeque::new(),
+            reading: None,
+            fetch_asks: VecDeque::new(),
+            again: HashSet::new(),
+            held: false,
+            idle: 0,
+            index_asked: true,
+            index_due: false,
+            copy_refused: false,
             waiting: Vec::new(),
             opened: HashSet::new(),
             later: problems,
@@ -542,6 +583,12 @@ impl AccountSync {
     /// warning: `AccountSession::note_roster`).
     pub fn knows_name(&self, name: &str) -> bool {
         self.pins.knows_name(name)
+    }
+
+    /// The relay refused to keep the last copy we sent (over quota, or
+    /// written under a pseudonym): nobody is to be told it was kept.
+    pub fn copy_refused(&self) -> bool {
+        self.copy_refused
     }
 
     /// The key pinned for `account`, if any (for safety numbers).
@@ -858,6 +905,7 @@ impl AccountSync {
         self.asked_members.remove(conv);
         self.own_epochs.remove(conv);
         self.target.remove(conv);
+        self.again.remove(conv);
         self.owed.remove(conv);
         self.joiners.remove(conv);
         self.readers.remove(conv);
@@ -871,16 +919,160 @@ impl AccountSync {
         }
     }
 
-    /// Starts reading `conv` from our cursor: its wraps first, then entries.
+    /// Reads `conv` from our cursor, in its turn: its wraps first, then entries.
     fn fetch(&mut self, conv: &str) -> Vec<ClientMessage> {
         self.target.insert(conv.to_string());
-        if self.fetching.contains_key(conv) {
+        if self.fetching.contains_key(conv) || self.queue.iter().any(|c| c == conv) {
             return Vec::new();
         }
-        self.fetching.insert(conv.to_string(), Fetch::Wraps);
-        vec![ask(AccountRequest::WrapsFetch {
+        self.queue.push_back(conv.to_string());
+        self.next_read()
+    }
+
+    /// The next read waiting, unless one runs or the relay asked us to wait.
+    fn next_read(&mut self) -> Vec<ClientMessage> {
+        if self.held || self.reading.is_some() {
+            return Vec::new();
+        }
+        while let Some(conv) = self.queue.pop_front() {
+            // Left since, or a send started on it meanwhile
+            if !self.target.contains(&conv) || self.fetching.contains_key(&conv) {
+                continue;
+            }
+            self.reading = Some(conv.clone());
+            self.fetching.insert(conv.clone(), Fetch::Wraps);
+            return vec![self.ask_wraps(&conv)];
+        }
+        Vec::new()
+    }
+
+    /// A read of `conv` is over, however it went: the news that came during
+    /// it, then the next one waiting.
+    fn fetch_done(&mut self, conv: &str) -> Vec<ClientMessage> {
+        self.fetching.remove(conv);
+        if self.reading.as_deref() == Some(conv) {
+            self.reading = None;
+        }
+        let mut out = Vec::new();
+        if self.again.remove(conv) {
+            out.extend(self.fetch(conv));
+        }
+        out.extend(self.next_read());
+        out
+    }
+
+    /// An answer that will not come (refused for now, or lost): `conv` gets
+    /// its turn again.
+    fn ask_again(&mut self, conv: &str) {
+        self.fetching.remove(conv);
+        if self.reading.as_deref() == Some(conv) {
+            self.reading = None;
+        }
+        if self.target.contains(conv) && !self.queue.iter().any(|c| c == conv) {
+            self.queue.push_front(conv.to_string());
+        }
+    }
+
+    fn ask_wraps(&mut self, conv: &str) -> ClientMessage {
+        self.fetch_asks.push_back(conv.to_string());
+        ask(AccountRequest::WrapsFetch {
             conv: conv.to_string(),
-        })]
+        })
+    }
+
+    fn ask_page(&mut self, conv: &str, after: i64) -> ClientMessage {
+        self.fetch_asks.push_back(conv.to_string());
+        ask(AccountRequest::LogFetch {
+            conv: conv.to_string(),
+            after,
+        })
+    }
+
+    /// The `LogFetch` that starts a read of `conv`: past our cursor, or with
+    /// none the newest entries.
+    fn first_page(&mut self, conv: &str) -> ClientMessage {
+        let after = match self.cursors.get(conv) {
+            Some(c) if *c > 0 => *c,
+            _ => -READ_BACK,
+        };
+        self.ask_page(conv, after)
+    }
+
+    /// `conv`'s read got its answer. Answers come in order, so an ask ahead of
+    /// it never will.
+    fn answered(&mut self, conv: &str) {
+        self.idle = 0;
+        let Some(at) = self.fetch_asks.iter().position(|c| c == conv) else {
+            return;
+        };
+        let lost: Vec<String> = self.fetch_asks.drain(..=at).take(at).collect();
+        for c in lost {
+            self.ask_again(&c);
+        }
+    }
+
+    /// What waited for log keys goes on to its entries.
+    fn keys_in(&mut self) -> Vec<ClientMessage> {
+        let ready: Vec<String> = self
+            .fetching
+            .iter()
+            .filter(|(_, f)| **f == Fetch::Keys)
+            .map(|(c, _)| c.clone())
+            .collect();
+        let mut out = Vec::new();
+        for conv in ready {
+            if self.target.contains(&conv) {
+                self.fetching.insert(conv.clone(), Fetch::Entries);
+                out.push(self.first_page(&conv));
+            } else {
+                out.extend(self.fetch_done(&conv));
+            }
+        }
+        out
+    }
+
+    /// Every couple of seconds while connected, from the host: goes on after
+    /// the relay asked us to wait, and after an answer that never came (the
+    /// relay drops a reply on a full queue). Nothing else ever would.
+    pub fn tick(&mut self) -> (Vec<ClientMessage>, Vec<Event>) {
+        self.held = false;
+        let waiting = !self.fetch_asks.is_empty() || !self.key_asks.is_empty() || self.index_asked;
+        self.idle = if waiting { self.idle + 1 } else { 0 };
+        if self.idle >= LOST_AFTER_TICKS {
+            self.idle = 0;
+            for conv in std::mem::take(&mut self.fetch_asks) {
+                self.ask_again(&conv);
+            }
+            for a in std::mem::take(&mut self.key_asks).into_iter().flatten() {
+                self.asked_keys.remove(&a);
+            }
+            self.index_due |= std::mem::take(&mut self.index_asked);
+        }
+        let mut out = Vec::new();
+        if std::mem::take(&mut self.index_due) {
+            self.index_asked = true;
+            out.push(ask(AccountRequest::LogIndex));
+        }
+        // The keys conversations wait for, if that ask was refused or lost
+        let want: Vec<[u8; 16]> = self
+            .fetching
+            .iter()
+            .filter(|(_, f)| **f == Fetch::Keys)
+            .filter_map(|(c, _)| self.other_party(c))
+            .collect();
+        out.extend(self.ask_keys(want));
+        // Nothing asked, because they came in some other way meanwhile
+        if self.key_asks.is_empty() {
+            out.extend(self.keys_in());
+        }
+        out.extend(self.next_read());
+        let mut events = Vec::new();
+        self.drain(&mut out, &mut events);
+        out.extend(self.flush());
+        out.extend(self.answer());
+        let mut all = std::mem::take(&mut self.later);
+        all.extend(events);
+        (out, all)
     }
 
     fn flush(&mut self) -> Vec<ClientMessage> {
@@ -912,7 +1104,7 @@ impl AccountSync {
                 // First our own wraps, in case another device already holds an epoch here.
                 if !self.wraps_known.contains(&conv) {
                     if !self.fetching.contains_key(&conv) {
-                        out.push(ask(AccountRequest::WrapsFetch { conv: conv.clone() }));
+                        out.push(self.ask_wraps(&conv));
                         self.fetching.insert(conv.clone(), Fetch::Wraps);
                     }
                     keep.push(o);
@@ -1068,7 +1260,7 @@ impl AccountSync {
             if !self.wraps_known.contains(&conv) {
                 if !self.fetching.contains_key(&conv) {
                     self.fetching.insert(conv.clone(), Fetch::Wraps);
-                    out.push(ask(AccountRequest::WrapsFetch { conv: conv.clone() }));
+                    out.push(self.ask_wraps(&conv));
                 }
                 continue;
             }
@@ -1137,8 +1329,11 @@ impl AccountSync {
                 continue;
             }
             let Some(key) = self.keys.get(&(conv.clone(), e.sender, e.epoch)) else {
-                // Not ours to read, unless its writer still owes us an answer.
-                if self.owed.get(&conv).is_some_and(|o| o.contains(&e.sender)) {
+                // Not ours to read, unless its writer still owes us an answer,
+                // or told us of a key after we asked for the wraps.
+                if self.owed.get(&conv).is_some_and(|o| o.contains(&e.sender))
+                    || self.again.contains(&conv)
+                {
                     still.push((conv, e));
                 }
                 continue;
@@ -1234,15 +1429,63 @@ impl AccountSync {
                     || request.starts_with("Epoch")
                     || request.starts_with("Wraps") =>
             {
-                if request == "LogAppend" {
-                    self.in_flight.pop_front();
+                let for_now = reason.contains(SLOW_DOWN);
+                match request.as_str() {
+                    "WrapsFetch" | "LogFetch" => {
+                        self.idle = 0;
+                        if let Some(conv) = self.fetch_asks.pop_front() {
+                            if for_now {
+                                self.held = true;
+                                self.ask_again(&conv);
+                            } else {
+                                // Not ours, then: what waits for it would ask
+                                // again at every tick.
+                                self.target.remove(&conv);
+                                self.joiners.remove(&conv);
+                                self.outbox.retain(|o| o.conv != conv);
+                                out.extend(self.fetch_done(&conv));
+                                events.push(Event::NotRead {
+                                    reason: reason.clone(),
+                                });
+                            }
+                        }
+                    }
+                    "LogKeys" => {
+                        self.idle = 0;
+                        for a in self.key_asks.pop_front().unwrap_or_default() {
+                            self.asked_keys.remove(&a);
+                        }
+                        if for_now {
+                            self.held = true;
+                        } else {
+                            out.extend(self.keys_in());
+                        }
+                    }
+                    "LogIndex" => {
+                        self.index_asked = false;
+                        if for_now {
+                            self.held = true;
+                            self.index_due = true;
+                        } else {
+                            events.push(Event::NotRead {
+                                reason: reason.clone(),
+                            });
+                        }
+                    }
+                    "LogMembers" if for_now => {
+                        self.held = true;
+                        self.asked_members.clear();
+                    }
+                    _ => {
+                        if request == "LogAppend" {
+                            self.in_flight.pop_front();
+                            self.copy_refused = true;
+                        }
+                        events.push(Event::NotKept {
+                            reason: reason.clone(),
+                        });
+                    }
                 }
-                if request == "LogKeys" {
-                    self.key_asks.pop_front();
-                }
-                events.push(Event::NotKept {
-                    reason: reason.clone(),
-                });
             }
             AccountReply::LogKeyStored
             | AccountReply::EpochStored { .. }
@@ -1260,16 +1503,28 @@ impl AccountSync {
                 return None;
             }
             AccountReply::LogConvs { convs } => {
-                for (conv, last) in convs {
-                    if *last > self.cursors.get(conv).copied().unwrap_or(0)
-                        && (dm_parties(conv).is_some() || is_channel(conv))
-                    {
-                        out.extend(self.fetch(conv));
-                    }
+                self.index_asked = false;
+                let unread: Vec<&String> = convs
+                    .iter()
+                    .filter(|(conv, last)| {
+                        *last > self.cursors.get(conv).copied().unwrap_or(0)
+                            && (dm_parties(conv).is_some() || is_channel(conv))
+                    })
+                    .map(|(conv, _)| conv)
+                    .collect();
+                // The other parties' keys in one ask, not one per conversation
+                let peers: Vec<[u8; 16]> = unread
+                    .iter()
+                    .filter_map(|conv| self.other_party(conv))
+                    .collect();
+                out.extend(self.ask_keys(peers));
+                for conv in unread {
+                    out.extend(self.fetch(conv));
                 }
             }
             AccountReply::LogJoined { conv } => out.extend(self.fetch(conv)),
             AccountReply::Wraps { conv, wraps } => {
+                self.answered(conv);
                 self.wraps_known.insert(conv.clone());
                 // Newest first: the first of ours is the epoch to go on with.
                 // Ours open only as self-wraps, which only our own devices can
@@ -1298,42 +1553,38 @@ impl AccountSync {
                     self.fetching.insert(conv.clone(), Fetch::Keys);
                 } else if target {
                     self.fetching.insert(conv.clone(), Fetch::Entries);
-                    out.push(ask(AccountRequest::LogFetch {
-                        conv: conv.clone(),
-                        after: self.cursors.get(conv).copied().unwrap_or(0),
-                    }));
+                    out.push(self.first_page(conv));
                 } else {
-                    self.fetching.remove(conv);
+                    out.extend(self.fetch_done(conv));
                 }
                 self.drain(&mut out, &mut events);
                 out.extend(self.flush());
                 out.extend(self.answer());
             }
             AccountReply::LogKeysFound { keys } => {
+                self.idle = 0;
                 self.learn(keys, &mut out, &mut events);
+                // Answers come in order, so an ask ahead of the one this answers
+                // was lost, which says nothing about the accounts it named.
+                let at = self
+                    .key_asks
+                    .iter()
+                    .position(|asked| keys.iter().any(|k| asked.contains(&k.account)));
+                for a in self.key_asks.drain(..at.unwrap_or(0)).flatten() {
+                    self.asked_keys.remove(&a);
+                }
+                let answered = if at.is_some() || keys.is_empty() {
+                    self.key_asks.pop_front()
+                } else {
+                    None
+                };
                 // Asked, and the relay had nothing for some: they cannot be written to.
-                for a in self.key_asks.pop_front().unwrap_or_default() {
+                for a in answered.unwrap_or_default() {
                     if !self.peers.contains_key(&a) && !keys.iter().any(|k| k.account == a) {
                         self.distrusted.insert(a);
                     }
                 }
-                let ready: Vec<String> = self
-                    .fetching
-                    .iter()
-                    .filter(|(_, f)| **f == Fetch::Keys)
-                    .map(|(c, _)| c.clone())
-                    .collect();
-                for conv in ready {
-                    if self.target.contains(&conv) {
-                        self.fetching.insert(conv.clone(), Fetch::Entries);
-                        out.push(ask(AccountRequest::LogFetch {
-                            conv: conv.clone(),
-                            after: self.cursors.get(&conv).copied().unwrap_or(0),
-                        }));
-                    } else {
-                        self.fetching.remove(&conv);
-                    }
-                }
+                out.extend(self.keys_in());
                 self.drain(&mut out, &mut events);
                 out.extend(self.flush());
                 out.extend(self.answer());
@@ -1344,6 +1595,7 @@ impl AccountSync {
                 more,
                 owed,
             } => {
+                self.answered(conv);
                 self.owed
                     .insert(conv.clone(), owed.iter().copied().collect());
                 for e in entries {
@@ -1361,17 +1613,17 @@ impl AccountSync {
                     *f = (*f).max(last.seq);
                 }
                 self.drain(&mut out, &mut events);
-                if *more {
-                    out.push(ask(AccountRequest::LogFetch {
-                        conv: conv.clone(),
-                        after: self.fetched.get(conv).copied().unwrap_or(0),
-                    }));
+                // Not a page more of a channel we left since: it would be refused
+                if *more && self.target.contains(conv) {
+                    let after = self.fetched.get(conv).copied().unwrap_or(0);
+                    out.push(self.ask_page(conv, after));
                 } else {
-                    self.fetching.remove(conv);
                     self.target.remove(conv);
+                    out.extend(self.fetch_done(conv));
                 }
             }
             AccountReply::LogAppended { conv, seq, .. } => {
+                self.copy_refused = false;
                 self.in_flight.pop_front();
                 self.rekeys.remove(conv);
                 // Ours: nothing to fetch back up to here.
@@ -1434,10 +1686,15 @@ impl AccountSync {
                 out.extend(self.answer());
             }
             AccountReply::LogNews { conv } => {
-                // A key for us: what waited for it, and what came after.
+                // A key for us, or a message: what waited for it, and what came
+                // after. A burst of them while it is being read is one more read.
                 self.wraps_known.remove(conv);
-                self.fetching.remove(conv);
-                out.extend(self.fetch(conv));
+                if self.fetching.contains_key(conv) {
+                    self.target.insert(conv.clone());
+                    self.again.insert(conv.clone());
+                } else {
+                    out.extend(self.fetch(conv));
+                }
             }
             _ => return None,
         }
@@ -1838,6 +2095,465 @@ mod tests {
             1,
             "and the waiting message goes on"
         );
+    }
+
+    /// Whichever conversations `out` asks the wraps of.
+    fn wraps_asked(out: &[ClientMessage]) -> Vec<String> {
+        sent(out, "WrapsFetch")
+            .iter()
+            .filter_map(|r| match r {
+                AccountRequest::WrapsFetch { conv } => Some(conv.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn slow_down(request: &str) -> AccountReply {
+        AccountReply::Error {
+            request: request.into(),
+            reason: "Too many requests at once; slow down.".into(),
+        }
+    }
+
+    /// A sign-in with `n` conversations to read, the keys of their other
+    /// parties in: returns the conversations in the order the relay listed them.
+    fn with_convs(s: &mut AccountSync, me: &Account, n: u8) -> (Vec<String>, Vec<ClientMessage>) {
+        let peers: Vec<Account> = (0..n).map(|i| account(10 + i)).collect();
+        let convs: Vec<String> = peers.iter().map(|p| dm_conv(&me.id, &p.id)).collect();
+        let (out, _) = s
+            .on_reply(&AccountReply::LogConvs {
+                convs: convs.iter().map(|c| (c.clone(), 9)).collect(),
+            })
+            .unwrap();
+        assert_eq!(
+            sent(&out, "LogKeys").len(),
+            1,
+            "one ask for every peer: {out:?}"
+        );
+        s.on_reply(&AccountReply::LogKeysFound {
+            keys: peers.iter().map(|p| p.info("peer")).collect(),
+        })
+        .unwrap();
+        (convs, out)
+    }
+
+    fn empty_wraps(conv: &str) -> AccountReply {
+        AccountReply::Wraps {
+            conv: conv.into(),
+            wraps: Vec::new(),
+        }
+    }
+
+    fn empty_page(conv: &str) -> AccountReply {
+        AccountReply::LogPage {
+            conv: conv.into(),
+            entries: Vec::new(),
+            more: false,
+            owed: Vec::new(),
+        }
+    }
+
+    /// A reload forgets the cursors in the browser: the conversation comes back
+    /// from the newest entries, not from a year ago and not from nowhere.
+    #[test]
+    fn a_first_read_starts_at_the_newest_entries_and_a_cursor_past_itself() {
+        let (me, bob) = (account(1), account(2));
+        let mut s = sync_for(&me);
+        let conv = dm_conv(&me.id, &bob.id);
+        s.on_reply(&AccountReply::LogKeysFound {
+            keys: vec![bob.info("bob")],
+        })
+        .unwrap();
+        let (out, _) = s
+            .on_reply(&AccountReply::LogConvs {
+                convs: vec![(conv.clone(), 9)],
+            })
+            .unwrap();
+        assert_eq!(wraps_asked(&out), vec![conv.clone()]);
+        let (out, _) = s.on_reply(&empty_wraps(&conv)).unwrap();
+        assert!(
+            matches!(
+                sent(&out, "LogFetch")[..],
+                [AccountRequest::LogFetch { after: -500, .. }]
+            ),
+            "{out:?}"
+        );
+        s.on_reply(&empty_page(&conv)).unwrap();
+        s.cursors.insert(conv.clone(), 7);
+        s.wraps_known.remove(&conv);
+        let (out, _) = s
+            .on_reply(&AccountReply::LogNews { conv: conv.clone() })
+            .unwrap();
+        assert_eq!(wraps_asked(&out), vec![conv.clone()]);
+        let (out, _) = s.on_reply(&empty_wraps(&conv)).unwrap();
+        assert!(
+            matches!(
+                sent(&out, "LogFetch")[..],
+                [AccountRequest::LogFetch { after: 7, .. }]
+            ),
+            "{out:?}"
+        );
+    }
+
+    #[test]
+    fn conversations_are_read_one_at_a_time() {
+        let me = account(1);
+        let mut s = sync_for(&me);
+        let (convs, out) = with_convs(&mut s, &me, 3);
+        assert_eq!(wraps_asked(&out), vec![convs[0].clone()]);
+        s.on_reply(&empty_wraps(&convs[0])).unwrap();
+        let (out, _) = s.on_reply(&empty_page(&convs[0])).unwrap();
+        assert_eq!(
+            wraps_asked(&out),
+            vec![convs[1].clone()],
+            "the next one, once"
+        );
+    }
+
+    /// Over the relay's budget: no "not kept" toast, and the read goes on.
+    #[test]
+    fn a_read_refused_for_now_goes_on_at_the_next_tick() {
+        let me = account(1);
+        let mut s = sync_for(&me);
+        let (convs, _) = with_convs(&mut s, &me, 2);
+        let (out, events) = s.on_reply(&slow_down("WrapsFetch")).unwrap();
+        assert!(out.is_empty(), "the queue waits: {out:?}");
+        assert!(events.is_empty(), "nothing to tell anybody: {events:?}");
+        let (out, _) = s.tick();
+        assert_eq!(
+            wraps_asked(&out),
+            vec![convs[0].clone()],
+            "from the same one"
+        );
+    }
+
+    #[test]
+    fn a_refused_index_is_asked_again() {
+        let me = account(1);
+        let mut s = sync_for(&me);
+        s.on_reply(&slow_down("LogIndex")).unwrap();
+        assert_eq!(sent(&s.tick().0, "LogIndex").len(), 1);
+    }
+
+    #[test]
+    fn refused_keys_are_asked_again() {
+        let (me, bob) = (account(1), account(2));
+        let mut s = sync_for(&me);
+        let conv = dm_conv(&me.id, &bob.id);
+        let (out, _) = s
+            .on_reply(&AccountReply::LogConvs {
+                convs: vec![(conv.clone(), 9)],
+            })
+            .unwrap();
+        assert_eq!(sent(&out, "LogKeys").len(), 1);
+        s.on_reply(&slow_down("LogKeys")).unwrap();
+        // The read reaches its wraps, asks once more, and now waits on the keys
+        let (out, _) = s.on_reply(&empty_wraps(&conv)).unwrap();
+        assert_eq!(sent(&out, "LogKeys").len(), 1);
+        s.on_reply(&slow_down("LogKeys")).unwrap();
+        let (out, _) = s.tick();
+        assert_eq!(sent(&out, "LogKeys").len(), 1, "{out:?}");
+    }
+
+    /// The relay drops a reply on a full queue, and logs a database error:
+    /// neither may stop every read after it for the rest of the session.
+    #[test]
+    fn a_reply_that_never_comes_does_not_stop_the_reads() {
+        let me = account(1);
+        let mut s = sync_for(&me);
+        let (convs, _) = with_convs(&mut s, &me, 2);
+        s.on_reply(&AccountReply::LogConvs { convs: Vec::new() })
+            .unwrap();
+        assert!(wraps_asked(&s.tick().0).is_empty());
+        assert!(wraps_asked(&s.tick().0).is_empty());
+        assert_eq!(wraps_asked(&s.tick().0), vec![convs[0].clone()]);
+    }
+
+    #[test]
+    fn a_read_refused_for_good_moves_on_and_says_so() {
+        let me = account(1);
+        let mut s = sync_for(&me);
+        let (convs, _) = with_convs(&mut s, &me, 2);
+        let (out, events) = s
+            .on_reply(&AccountReply::Error {
+                request: "WrapsFetch".into(),
+                reason: "not a conversation of yours".into(),
+            })
+            .unwrap();
+        assert_eq!(wraps_asked(&out), vec![convs[1].clone()]);
+        assert!(
+            events.iter().any(|e| matches!(e, Event::NotRead { .. })),
+            "{events:?}"
+        );
+    }
+
+    /// A pseudonym's refusal of a kept copy has nothing to do with a read.
+    #[test]
+    fn a_refused_append_ends_no_read() {
+        let me = account(1);
+        let mut s = sync_for(&me);
+        let (convs, _) = with_convs(&mut s, &me, 2);
+        let (out, events) = s
+            .on_reply(&AccountReply::Error {
+                request: "LogAppend".into(),
+                reason: "nothing is kept while you write under a pseudonym.".into(),
+            })
+            .unwrap();
+        assert!(wraps_asked(&out).is_empty(), "{out:?}");
+        assert!(
+            events.iter().any(|e| matches!(e, Event::NotKept { .. })),
+            "{events:?}"
+        );
+        let (out, _) = s.on_reply(&empty_wraps(&convs[0])).unwrap();
+        assert_eq!(
+            sent(&out, "LogFetch").len(),
+            1,
+            "the read still runs: {out:?}"
+        );
+    }
+
+    /// A message is news now, and a burst of them is one more read.
+    #[test]
+    fn news_during_a_read_reads_again_once() {
+        let (me, bob) = (account(1), account(2));
+        let mut s = sync_for(&me);
+        let conv = dm_conv(&me.id, &bob.id);
+        s.on_reply(&AccountReply::LogKeysFound {
+            keys: vec![bob.info("bob")],
+        })
+        .unwrap();
+        let news = AccountReply::LogNews { conv: conv.clone() };
+        assert_eq!(
+            wraps_asked(&s.on_reply(&news).unwrap().0),
+            vec![conv.clone()]
+        );
+        assert!(wraps_asked(&s.on_reply(&news).unwrap().0).is_empty());
+        assert!(wraps_asked(&s.on_reply(&news).unwrap().0).is_empty());
+        s.on_reply(&empty_wraps(&conv)).unwrap();
+        let (out, _) = s.on_reply(&empty_page(&conv)).unwrap();
+        assert_eq!(wraps_asked(&out), vec![conv.clone()]);
+        s.on_reply(&empty_wraps(&conv)).unwrap();
+        let (out, _) = s.on_reply(&empty_page(&conv)).unwrap();
+        assert!(
+            wraps_asked(&out).is_empty(),
+            "and that is the end of it: {out:?}"
+        );
+    }
+
+    /// Reading a long history back must not hold up what is written meanwhile.
+    #[test]
+    fn a_message_sent_during_a_read_is_kept() {
+        let (me, bob) = (account(1), account(2));
+        let mut s = sync_for(&me);
+        let (convs, _) = with_convs(&mut s, &me, 2);
+        let mine = dm_conv(&me.id, &bob.id);
+        let out = s.send_dm(bob.id, envelope("m1", "hello", None), 1, None);
+        assert_eq!(sent(&out, "LogKeys").len(), 1);
+        let (out, _) = s
+            .on_reply(&AccountReply::LogKeysFound {
+                keys: vec![bob.info("bob")],
+            })
+            .unwrap();
+        assert_eq!(
+            wraps_asked(&out),
+            vec![mine.clone()],
+            "its own, past the queue"
+        );
+        // Answers come in order: the running read's first
+        s.on_reply(&empty_wraps(&convs[0])).unwrap();
+        let (out, _) = s.on_reply(&empty_wraps(&mine)).unwrap();
+        assert_eq!(sent(&out, "LogAppend").len(), 1, "{out:?}");
+    }
+
+    /// A key they told us of while the read was on its way: its entry waits
+    /// for the second read instead of being passed over for good.
+    #[test]
+    fn an_entry_under_a_key_that_is_on_its_way_waits_for_it() {
+        let (me, bob) = (account(1), account(2));
+        let mut s = sync_for(&me);
+        let conv = dm_conv(&me.id, &bob.id);
+        s.on_reply(&AccountReply::LogKeysFound {
+            keys: vec![bob.info("bob")],
+        })
+        .unwrap();
+        let news = AccountReply::LogNews { conv: conv.clone() };
+        s.on_reply(&news).unwrap();
+        s.on_reply(&empty_wraps(&conv)).unwrap();
+        s.on_reply(&news).unwrap();
+        let k = epoch_key();
+        let ct = seal_entry(
+            &k,
+            &conv,
+            &bob.id,
+            5,
+            &bob.logkey,
+            &envelope("m", "first words", None),
+            1,
+        );
+        let (_, events) = s
+            .on_reply(&AccountReply::LogPage {
+                conv: conv.clone(),
+                entries: vec![LogEntry {
+                    seq: 8,
+                    sender: bob.id,
+                    epoch: 5,
+                    server_at: 1,
+                    ct,
+                }],
+                more: false,
+                owed: Vec::new(),
+            })
+            .unwrap();
+        assert!(events.is_empty(), "{events:?}");
+        let wrapped = wrap(&me.logkey.public(), &k, &conv, &bob.id, 5, &me.id).unwrap();
+        let (_, events) = s
+            .on_reply(&AccountReply::Wraps {
+                conv: conv.clone(),
+                wraps: vec![WrapOut {
+                    owner: bob.id,
+                    epoch: 5,
+                    wrapped,
+                }],
+            })
+            .unwrap();
+        assert!(
+            events.iter().any(|e| matches!(e, Event::Message { .. })),
+            "{events:?}"
+        );
+    }
+
+    /// The keys a read waits for arrive some other way while their own ask
+    /// was refused: no answer is coming, and the queue must not wait for one.
+    #[test]
+    fn keys_learned_another_way_do_not_stop_the_reads() {
+        let (me, bob) = (account(1), account(2));
+        let mut s = sync_for(&me);
+        let conv = dm_conv(&me.id, &bob.id);
+        s.on_reply(&AccountReply::LogConvs {
+            convs: vec![(conv.clone(), 9)],
+        })
+        .unwrap();
+        s.on_reply(&slow_down("LogKeys")).unwrap();
+        s.on_reply(&empty_wraps(&conv)).unwrap();
+        s.on_reply(&slow_down("LogKeys")).unwrap();
+        s.on_reply(&AccountReply::LogMembersFound {
+            conv: "c:1".into(),
+            members: vec![bob.info("bob")],
+        })
+        .unwrap();
+        let (out, _) = s.tick();
+        assert_eq!(sent(&out, "LogFetch").len(), 1, "{out:?}");
+    }
+
+    /// A reply the relay dropped says nothing about the accounts it named.
+    #[test]
+    fn a_lost_answer_about_keys_distrusts_nobody() {
+        let me = account(1);
+        let mut s = sync_for(&me);
+        let peers: Vec<Account> = (0..70).map(|i| account(10 + i)).collect();
+        let (first, second) = peers.split_at(64);
+        s.ask_keys(peers.iter().map(|p| p.id));
+        // The first ask's answer never comes
+        s.on_reply(&AccountReply::LogKeysFound {
+            keys: second.iter().map(|p| p.info("peer")).collect(),
+        })
+        .unwrap();
+        assert!(first.iter().all(|p| !s.distrusted.contains(&p.id)));
+        assert_eq!(
+            sent(&s.ask_keys(first.iter().map(|p| p.id)), "LogKeys").len(),
+            1,
+            "and they can be asked again"
+        );
+        // Whereas an answer that lacks one means the relay has none for it
+        s.on_reply(&AccountReply::LogKeysFound {
+            keys: first[1..].iter().map(|p| p.info("peer")).collect(),
+        })
+        .unwrap();
+        assert!(s.distrusted.contains(&first[0].id));
+    }
+
+    /// Refused for good: what waits for that conversation is let go, so it is
+    /// not asked for and told about again every couple of seconds.
+    #[test]
+    fn what_waits_for_a_refused_conversation_does_not_ask_again() {
+        let (me, bob) = (account(1), account(2));
+        let mut s = sync_for(&me);
+        let conv = "c:gone".to_string();
+        s.on_reply(&AccountReply::LogPending {
+            conv: conv.clone(),
+            joiners: vec![bob.id],
+        })
+        .unwrap();
+        s.on_reply(&AccountReply::LogKeysFound {
+            keys: vec![bob.info("bob")],
+        })
+        .unwrap();
+        assert_eq!(s.fetch_asks.len(), 1, "the wraps its answer needs");
+        s.on_reply(&AccountReply::Error {
+            request: "WrapsFetch".into(),
+            reason: "not a conversation of yours".into(),
+        })
+        .unwrap();
+        s.on_reply(&AccountReply::LogConvs { convs: Vec::new() })
+            .unwrap();
+        for _ in 0..4 {
+            let (out, events) = s.tick();
+            assert!(out.is_empty() && events.is_empty(), "{out:?} {events:?}");
+        }
+    }
+
+    #[test]
+    fn a_channel_left_during_a_read_is_asked_for_no_more() {
+        let me = account(1);
+        let mut s = sync_for(&me);
+        let conv = "c:1".to_string();
+        s.on_reply(&AccountReply::LogJoined { conv: conv.clone() })
+            .unwrap();
+        s.on_reply(&empty_wraps(&conv)).unwrap();
+        s.leave(&conv, false);
+        let (out, _) = s
+            .on_reply(&AccountReply::LogPage {
+                conv: conv.clone(),
+                entries: Vec::new(),
+                more: true,
+                owed: Vec::new(),
+            })
+            .unwrap();
+        assert!(sent(&out, "LogFetch").is_empty(), "{out:?}");
+    }
+
+    /// A refused copy must not be reported as kept (`AccountSession::kept_for`).
+    #[test]
+    fn a_refused_copy_is_remembered_until_one_is_kept() {
+        let me = account(1);
+        let mut s = sync_for(&me);
+        assert!(!s.copy_refused());
+        s.on_reply(&AccountReply::Error {
+            request: "LogAppend".into(),
+            reason: "nothing is kept while you write under a pseudonym.".into(),
+        })
+        .unwrap();
+        assert!(s.copy_refused());
+        s.on_reply(&AccountReply::LogAppended {
+            conv: "d:1".into(),
+            seq: 3,
+            server_at: 1,
+        })
+        .unwrap();
+        assert!(!s.copy_refused());
+    }
+
+    #[test]
+    fn refused_members_are_asked_again() {
+        let me = account(1);
+        let mut s = sync_for(&me);
+        s.prefs.cloud = true;
+        s.joined.insert("c:1".into());
+        let out = s.send_channel("c:1", envelope("m", "hello", None), 1, None);
+        assert_eq!(sent(&out, "LogMembers").len(), 1);
+        let (_, events) = s.on_reply(&slow_down("LogMembers")).unwrap();
+        assert!(events.is_empty(), "{events:?}");
+        assert_eq!(sent(&s.tick().0, "LogMembers").len(), 1);
     }
 
     /// `me` signed in with `pins` as the vault holds them, and this device's memory.

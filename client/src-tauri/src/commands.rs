@@ -873,7 +873,7 @@ pub async fn send_direct_message(
                 reason
             );
             // Queue the message — it will be sent when pairwise session is established
-            {
+            let ask_session = {
                 let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                 sig.pending_messages.push(PendingMessage {
                     target: PendingTarget::Direct { target_user_id },
@@ -883,6 +883,16 @@ pub async fn send_direct_message(
                     extras: extras.clone(),
                     queued_at: std::time::Instant::now(),
                 });
+                !sig.established_sessions.contains(&target_user_id)
+                    && sig.pending_sessions.insert(target_user_id)
+            };
+            // Rosters only start one with people our rooms told us of
+            if ask_session {
+                network::send_tcp_message(
+                    &tcp_tx,
+                    &ClientMessage::RequestPreKeyBundle { target_user_id },
+                )
+                .await?;
             }
 
             // Show the message locally immediately (optimistic display)

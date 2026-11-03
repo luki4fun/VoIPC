@@ -9,6 +9,7 @@
 import { toHex } from "../../lib/hex";
 import { getConfig } from "./config";
 import { cursorStorageKey, findDevice, saveDevice } from "./devices";
+import { freshPage, keepMemory, markReplay, type PageMemory } from "./log-memory";
 import { wasm, type AccountActions, type AccountMethod, type AccountSession, type AccountSignIn, type SignInStep, type SignalClient } from "./wasm";
 
 /** How the front end wants a connection to sign in. */
@@ -95,10 +96,16 @@ function writeCursors(key: string, json: string): void {
   }
 }
 
+/** Each account's log as this page holds it: a reconnect goes on from here, a
+ *  reload starts over (log-memory.ts). Survives the driver, not the page. */
+const pageMemory = new Map<string, PageMemory>();
+
 type TotpAnswer = { code: string; recovery: boolean } | null;
 type Body = Record<string, unknown>;
 
 const TOTP_WAIT_MS = 115_000;
+/** `AccountSession.tick`. */
+const TICK_MS = 2_000;
 
 export class AccountDriver {
   private signIn: AccountSignIn | null;
@@ -106,6 +113,8 @@ export class AccountDriver {
   private asked = 0;
   /** What follows the sign-in (voipc_crypto::account_session, as on the desktop). */
   private session: AccountSession | null = null;
+  private memory: PageMemory | null = null;
+  private ticker: ReturnType<typeof setInterval> | null = null;
 
   private constructor(
     signIn: AccountSignIn,
@@ -221,8 +230,11 @@ export class AccountDriver {
     const signIn = this.signIn;
     const done = signIn.finish();
     if (relayIds()[host.server] !== toHex(done.relay_id)) setRelayId(host.server, toHex(done.relay_id));
-    const memory = readCursors(cursorStorageKey(done.relay_id, done.name));
-    const { session, actions } = signIn.startSession(info, memory, getConfig().share_channel_history, this.passwordBased);
+    const key = cursorStorageKey(done.relay_id, done.name);
+    const memory = pageMemory.get(key) ?? freshPage(readCursors(key));
+    pageMemory.set(key, memory);
+    this.memory = memory;
+    const { session, actions } = signIn.startSession(info, memory.json, getConfig().share_channel_history, this.passwordBased);
     signIn.free();
     this.signIn = null;
     this.session = session;
@@ -232,11 +244,17 @@ export class AccountDriver {
   /** Once the session is listed (commands find it): the sync's first asks,
    *  and the second-factor setup a role waits for, or remembering this browser. */
   afterConnect(host: AccountHost): void {
-    if (this.session) this.run(host, this.session.afterConnect());
+    if (!this.session) return;
+    this.run(host, this.session.afterConnect());
+    this.ticker = setInterval(() => {
+      if (this.session) this.run(host, this.session.tick());
+    }, TICK_MS);
   }
 
   /** The session is over: the wasm objects go, and a prompt waiting for a code ends. */
   dispose(): void {
+    if (this.ticker !== null) clearInterval(this.ticker);
+    this.ticker = null;
     this.totpWaiter?.(null);
     this.signIn?.free();
     this.signIn = null;
@@ -248,11 +266,14 @@ export class AccountDriver {
    *  what this browser keeps (the device key, the log's read cursors). */
   private run(host: AccountHost, a: AccountActions): void {
     for (const p of a.send) host.sendRaw(p);
-    for (const e of a.emit) host.emit(e.name, e.payload);
+    for (const e of a.emit) host.emit(e.name, markReplay(e.name, e.payload, this.memory?.seen ?? {}));
     if (a.remember) {
       void saveDevice({ server: host.server, ...a.remember }).catch((err) => console.warn("could not remember this browser:", err));
     }
-    if (a.memory) writeCursors(`voipc.cursors.${a.memory.key}`, a.memory.json);
+    if (a.memory && this.memory) {
+      this.memory.json = a.memory.json;
+      writeCursors(`voipc.cursors.${a.memory.key}`, keepMemory(a.memory.json, this.memory.seen));
+    }
   }
 
   /** A decoded AccountReply. */

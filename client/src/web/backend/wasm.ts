@@ -227,7 +227,7 @@ export interface AccountActions {
   emit: { name: string; payload: unknown }[];
   /** The relay remembers this browser now: keep its key (devices.ts). */
   remember?: { relay_id: number[]; name: string; device_id: number[]; device_key: number[]; dek: number[] };
-  /** The log's read cursors moved: keep this JSON under `voipc.cursors.<key>`. */
+  /** The log's read cursors moved: `voipc.cursors.<key>` keeps this JSON (log-memory.ts). */
   memory?: { key: string; json: string };
 }
 
@@ -236,9 +236,11 @@ export interface AccountActions {
 export interface AccountSession {
   /** Once the session is listed. */
   afterConnect(): AccountActions;
+  /** Every couple of seconds while connected: reads refused for now go on. */
+  tick(): AccountActions;
   /** A decoded AccountReply. */
   onReply(reply: unknown): AccountActions;
-  /** The users of a UserList or UserJoined, for the pins. */
+  /** The users of a UserList, UserJoined or ChannelUsers, for the pins. */
   noteRoster(users: unknown): AccountActions;
   /** An identity a user showed (a bundle, or a session they opened). */
   checkIdentity(userId: number, key: Uint8Array): AccountActions;
