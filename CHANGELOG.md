@@ -2,7 +2,7 @@
 
 All notable changes to VoIPC are documented here.
 
-## [Unreleased]
+## [1.6.0] - release candidate
 
 No protocol change: a 1.5 app and relay connect as before. New: this app also talks to relays
 back to 1.0 (protocol 12).
