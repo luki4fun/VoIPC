@@ -15,7 +15,6 @@
   import PokePopup from "./lib/components/PokePopup.svelte";
   import VoiceKeys from "./lib/components/VoiceKeys.svelte";
   import LayoutSetup from "./lib/components/LayoutSetup.svelte";
-  import ClassicShell from "./lib/components/shell/ClassicShell.svelte";
   import ModernShell from "./lib/components/modern/ModernShell.svelte";
   import StageShell from "./lib/components/stage/StageShell.svelte";
   import UserContextMenu from "./lib/components/UserContextMenu.svelte";
@@ -143,6 +142,7 @@
     setRoster,
   } from "./lib/stores/rosters.js";
   import { emoteLimits, setEmotes, type EmoteLimits, type EmoteSet } from "./lib/stores/emotes.js";
+  import { olderRelay } from "./lib/stores/relay.js";
   import { confirmAction } from "./lib/stores/confirm.js";
   import {
     askNsfwConsent,
@@ -177,7 +177,7 @@
     playChannelMessageSound,
     playPokeSound,
   } from "./lib/sounds.js";
-  import { isMobile, isWeb, mobileTab } from "./lib/stores/platform.js";
+  import { isMobile, isWeb } from "./lib/stores/platform.js";
   import {
     audibleIds,
     centreView,
@@ -536,7 +536,6 @@
     if ($currentProximity === "off") {
       // Only the room is proximity-gated; the mixer works in any channel
       if ($centreView === "room") centreView.set("chat");
-      if ($mobileTab === "room") mobileTab.set("chat");
       if ($positions.size > 0 || $syncing) clearRoom();
     }
   });
@@ -694,7 +693,7 @@
       // Schedule auto-connect — will trigger after chat history is unlocked.
       // Every server that was open, or, in a config written before there was
       // a list, the one server it remembered.
-      if (config.auto_connect && config.remember_connection) {
+      if (config.auto_connect) {
         const open = config.open_servers ?? [];
         const list: SavedServer[] =
           open.length > 0
@@ -737,6 +736,10 @@
       listenServer<{ max_bytes: number } | null>("file-limits", (server, d) => fileLimits.of(server).set(d)),
       listenServer<EmoteSet>("emote-list", (server, d) => setEmotes(server, d)),
       listenServer<EmoteLimits | null>("emote-limits", (server, d) => emoteLimits.of(server).set(d)),
+      // An older relay's protocol and version: the banner, and what the app holds back there
+      listenServer<{ protocol: number; version: string | null }>("relay-version", (server, d) =>
+        olderRelay.of(server).set(d.version === null ? null : { protocol: d.protocol, version: d.version }),
+      ),
       listenServer<{ name: string; reason: string }>("emote-error", (server, d) =>
         addNotification(`${fromServer(server)}${d.name ? `:${d.name}: — ` : ""}${d.reason}`, "error"),
       ),
@@ -1132,7 +1135,10 @@
         availableUpdate.set(event.payload);
         // An update on another protocol gets no toast: Settings says what it
         // would cost (design input 5)
-        const toast = updateToast(event.payload);
+        const connected = [...get(connectionStates)]
+          .filter(([, s]) => s === "connected")
+          .map(([id]) => ({ name: id, protocol: get(olderRelay.peek(id))?.protocol ?? null }));
+        const toast = updateToast(event.payload, connected);
         if (toast && announcedUpdate !== event.payload.version) {
           announcedUpdate = event.payload.version;
           addNotification(toast, "info", 10000);
@@ -1680,11 +1686,6 @@
         viewerCount.set(data.viewer_count);
       }),
 
-      listenServer("keyframe-requested", (server) => {
-        if (!inVoice(server)) return;
-        invoke("set_keyframe_requested").catch(() => {});
-      }),
-
       listenServer<{ reason: string }>("screenshare-error", (server, data) => {
         addNotification(`${fromServer(server)}Screen share error: ${data.reason}`, "error");
         // A share we watch that this device cannot decode comes the same way
@@ -1846,15 +1847,13 @@
      copies racing each other. -->
 <VoiceKeys />
 
-<!-- The layout itself. All three shells read the same stores; App.svelte
-     stays the event bus and the modal stack above them. -->
+<!-- The layout itself. Both shells read the same stores; App.svelte stays
+     the event bus and the modal stack above them. -->
 {#if $uiPrefsReady}
-  {#if $uiLayout === "modern"}
-    <ModernShell onopensettings={() => (showSettings = true)} />
-  {:else if $uiLayout === "stage"}
+  {#if $uiLayout === "stage"}
     <StageShell onopensettings={() => (showSettings = true)} />
   {:else}
-    <ClassicShell onopensettings={() => (showSettings = true)} />
+    <ModernShell onopensettings={() => (showSettings = true)} />
   {/if}
 {/if}
 

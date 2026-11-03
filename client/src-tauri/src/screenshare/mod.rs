@@ -1,7 +1,7 @@
 #[cfg(not(target_os = "android"))]
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 #[cfg(not(target_os = "android"))]
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 #[cfg(not(target_os = "android"))]
 use std::time::{Duration, Instant};
 
@@ -129,7 +129,7 @@ impl FrameSlot {
     /// Return a consumed frame's buffer to the capture thread (capped at 2).
     pub fn recycle(&self, mut buf: Vec<u8>) {
         buf.clear();
-        let mut spares = self.spare.lock().unwrap_or_else(|p| p.into_inner());
+        let mut spares = self.spare.lock().unwrap_or_else(PoisonError::into_inner);
         if spares.len() < 2 {
             spares.push(buf);
         }
@@ -137,12 +137,15 @@ impl FrameSlot {
 
     /// Grab a recycled buffer, if one is available.
     pub fn take_spare(&self) -> Option<Vec<u8>> {
-        self.spare.lock().unwrap_or_else(|p| p.into_inner()).pop()
+        self.spare
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop()
     }
 
     /// Store a new frame, returning the old one (if any) for buffer reuse.
     pub fn put(&self, frame: CapturedFrame) -> Option<CapturedFrame> {
-        let mut slot = self.frame.lock().unwrap_or_else(|p| p.into_inner());
+        let mut slot = self.frame.lock().unwrap_or_else(PoisonError::into_inner);
         let old = slot.replace(frame);
         self.notify.notify_one();
         old
@@ -153,7 +156,7 @@ impl FrameSlot {
     /// cleared.
     pub fn take_timeout(&self, timeout: Duration) -> Option<CapturedFrame> {
         let deadline = Instant::now() + timeout;
-        let mut slot = self.frame.lock().unwrap_or_else(|p| p.into_inner());
+        let mut slot = self.frame.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if !self.active.load(Ordering::Relaxed) {
                 return None;
@@ -620,7 +623,7 @@ impl FrameProcessor {
         if self
             .media_key
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .current()
             .is_none()
         {
@@ -811,10 +814,10 @@ impl FrameProcessor {
         // Clone the key (small: id + 32B) instead of holding the mutex across
         // fragmenting/encrypting/sending — voice paths share this mutex.
         let (key, stream_id) = {
-            let guard = self.media_key.lock().unwrap_or_else(|poisoned| {
-                warn!("media key mutex poisoned — recovering");
-                poisoned.into_inner()
-            });
+            let guard = self
+                .media_key
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             (guard.current().cloned(), guard.stream_id())
         };
         // Never send plaintext: no key means we are still waiting for the
@@ -1063,10 +1066,10 @@ impl AudioProcessor {
 
             // Clone instead of holding the shared mutex across encrypt+send.
             let (key_opt, stream_id) = {
-                let guard = self.media_key.lock().unwrap_or_else(|poisoned| {
-                    warn!("media key mutex poisoned — recovering");
-                    poisoned.into_inner()
-                });
+                let guard = self
+                    .media_key
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
                 (guard.current().cloned(), guard.stream_id())
             };
 

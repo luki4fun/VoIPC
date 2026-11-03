@@ -2734,15 +2734,6 @@ checksum = "7f24254aa9a54b5c858eaee2f5bccdb46aaf0e486a595ed5fd8f86ba55232a70"
 
 [[package]]
 name = "hkdf"
-version = "0.12.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
-dependencies = [
- "hmac 0.12.1",
-]
-
-[[package]]
-name = "hkdf"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4aaa26c720c68b866f2c96ef5c1264b3e6f473fe5d4ce61cd44bbe913e553018"
@@ -3629,7 +3620,7 @@ dependencies = [
  "derive_more",
  "displaydoc",
  "hex",
- "hkdf 0.13.0",
+ "hkdf",
  "hmac 0.13.0",
  "indexmap 2.14.2",
  "itertools 0.15.0",
@@ -5921,7 +5912,7 @@ dependencies = [
  "derive_more",
  "displaydoc",
  "ghash",
- "hkdf 0.13.0",
+ "hkdf",
  "hmac 0.13.0",
  "hpke-rs",
  "hpke-rs-crypto",
@@ -6148,7 +6139,7 @@ source = "git+https://github.com/signalapp/SparsePostQuantumRatchet.git?tag=v1.6
 dependencies = [
  "cpufeatures 0.3.1",
  "hax-lib",
- "hkdf 0.13.0",
+ "hkdf",
  "libcrux-hmac",
  "libcrux-ml-kem",
  "log",
@@ -6292,7 +6283,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "hex",
- "hkdf 0.13.0",
+ "hkdf",
  "hmac 0.13.0",
  "itoa",
  "log",
@@ -7645,7 +7636,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voipc-audio"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "audiopus",
@@ -7664,7 +7655,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-client"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "ashpd 0.9.3",
@@ -7710,12 +7701,11 @@ dependencies = [
 
 [[package]]
 name = "voipc-crypto"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "async-trait",
- "hkdf 0.12.4",
- "hmac 0.12.1",
+ "hkdf",
  "js-sys",
  "libsignal-protocol",
  "miniz_oxide 0.9.1",
@@ -7725,7 +7715,7 @@ dependencies = [
  "ring",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "thiserror 2.0.21",
  "tracing",
  "uuid",
@@ -7735,7 +7725,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-media"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "gif",
  "image-webp",
@@ -7747,7 +7737,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-protocol"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "bytes",
  "postcard",
@@ -7760,7 +7750,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-server"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7772,14 +7762,17 @@ dependencies = [
  "hyper",
  "hyper-util",
  "l4f-accounts",
+ "minisign-verify",
  "postcard",
  "rand 0.8.8",
+ "reqwest",
  "ring",
  "rust-embed",
  "rustls",
+ "semver",
  "serde",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "socket2",
  "sqlx",
  "subtle",
@@ -7789,16 +7782,16 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-security",
- "voipc-audio",
  "voipc-crypto",
  "voipc-protocol",
+ "webpki-roots 1.0.10",
  "wtransport",
  "zeroize",
 ]
 
 [[package]]
 name = "voipc-video"
-version = "1.5.0"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "ffmpeg-next",

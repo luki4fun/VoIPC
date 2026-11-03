@@ -71,6 +71,9 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 /// v15: Emote.len/w/h, EmoteAccess.max_total_bytes/max_items, EmoteRemove of
 ///      many names, EmoteMove (pack and kind of many), EmoteTicket.name,
 ///      EmoteAdd without its own len (the emote's)
+///
+/// A relay admits only its own protocol; an app speaks its own down to
+/// `compat::OLDEST_RELAY_PROTOCOL` (1.6).
 pub const PROTOCOL_VERSION: u32 = 15;
 
 /// Application version, read from Cargo.toml at compile time.
@@ -79,11 +82,15 @@ pub const APP_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Encode a `ClientMessage` into a length-prefixed byte buffer for TCP transmission.
 pub fn encode_client_msg(msg: &ClientMessage) -> Result<Vec<u8>, ProtocolError> {
-    let payload = postcard::to_allocvec(msg)?;
+    Ok(frame(postcard::to_allocvec(msg)?))
+}
+
+/// A payload behind its big-endian length.
+pub(crate) fn frame(payload: Vec<u8>) -> Vec<u8> {
     let mut buf = Vec::with_capacity(4 + payload.len());
     buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
     buf.extend_from_slice(&payload);
-    Ok(buf)
+    buf
 }
 
 /// Decode a `ClientMessage` from a postcard-encoded payload (without length prefix).
@@ -103,10 +110,7 @@ pub fn encode_server_msg(msg: &ServerMessage) -> Result<Vec<u8>, ProtocolError> 
     if payload.len() > MAX_MSG_SIZE as usize {
         return Err(ProtocolError::MessageTooLarge(payload.len()));
     }
-    let mut buf = Vec::with_capacity(4 + payload.len());
-    buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    buf.extend_from_slice(&payload);
-    Ok(buf)
+    Ok(frame(payload))
 }
 
 /// Decode a `ServerMessage` from a postcard-encoded payload (without length prefix).

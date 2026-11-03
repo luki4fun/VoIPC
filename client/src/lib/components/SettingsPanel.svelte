@@ -59,7 +59,9 @@
   import { micTestLevel, micTesting, startMicTest, stopMicTest } from "../stores/mic-test.js";
   import { availableUpdate, checkForUpdate, checkUpdates, installUpdate, setCheckUpdates, updateBusy, updatesSupported } from "../stores/updates.js";
   import { protocolWarning, updateOffer } from "../update-rules.js";
+  import { olderRelay } from "../stores/relay.js";
   import { serverName } from "../stores/servers.js";
+  import { saveOpenServers } from "../connect.js";
   import { voice } from "../stores/channels.js";
   import Icon from "./Icons.svelte";
   import PaletteEditor from "./PaletteEditor.svelte";
@@ -341,6 +343,8 @@
     invoke("set_config_bool", { key: "auto_connect", value: checked }).catch((err: any) => {
       console.error("Failed to save auto-connect setting:", err);
     });
+    // The list it reopens: written now, or dropped when nothing else keeps it
+    void saveOpenServers();
   }
 
   async function clearHistory() {
@@ -483,14 +487,17 @@
    *  arms it (design input 5). Armed for that version only. */
   let updateArmed = $state<string | null>(null);
   const updateStates = connectionState.all();
-  /** What Settings says about an update on another protocol: the servers it
-   *  would lock this app out of are the ones it is connected to now. */
+  const olderRelays = olderRelay.all();
+  /** The servers connected now, each with its protocol (null: ours). */
+  const connectedNow = $derived(
+    [...$updateStates]
+      .filter(([, s]) => s === "connected")
+      .map(([id]) => ({ name: serverName(id, $savedServers), protocol: $olderRelays.get(id)?.protocol ?? null })),
+  );
+  /** What Settings says about an update some of them would refuse. */
   const updateWarning = $derived(
-    $availableUpdate && updateOffer($availableUpdate) === "protocol"
-      ? protocolWarning(
-          $availableUpdate,
-          [...$updateStates].filter(([, s]) => s === "connected").map(([id]) => serverName(id, $savedServers)),
-        )
+    $availableUpdate && updateOffer($availableUpdate, connectedNow) === "protocol"
+      ? protocolWarning($availableUpdate, connectedNow)
       : null,
   );
 
@@ -1036,10 +1043,10 @@
       <div class="section">
         <h4>Connection</h4>
         <label class="toggle-row">
-          <input type="checkbox" checked={$autoConnect} onchange={handleAutoConnectChange} disabled={!$rememberConnection} />
+          <input type="checkbox" checked={$autoConnect} onchange={handleAutoConnectChange} />
           <span class="toggle-label">Auto-connect to last server on startup</span>
           {#if !$rememberConnection}
-            <span class="toggle-hint">Enable "Remember connection details" in the connect dialog first</span>
+            <span class="toggle-hint">Keeps the list of servers you have open, to reopen them.</span>
           {/if}
         </label>
       </div>
@@ -1244,7 +1251,7 @@
       <div class="section">
         <h4>Layout</h4>
         <div class="layout-choices" role="radiogroup" aria-label="Layout" use:roving>
-          {#each ["modern", "classic", "stage"] as const as id (id)}
+          {#each ["modern", "stage"] as const as id (id)}
             <LayoutPreview
               layout={id}
               selected={$uiPrefs.layout === id}

@@ -2,6 +2,67 @@
 
 All notable changes to VoIPC are documented here.
 
+## [1.6.0] - 2026-11-03
+
+No protocol change: a 1.5 app and relay connect as before. New: this app also talks to relays
+back to 1.0 (protocol 12).
+
+### Added
+- **Older servers keep working.** The app talks to relays up to three protocols older than its
+  own: today every 1.x relay, from 1.0 on. It asks in its own protocol, and when a relay
+  answers with an older one, it connects again speaking that one. A banner under the server
+  name says which VoIPC the server runs and what is off there until it updates:
+  - on 1.4, moving emotes between packs;
+  - on 1.3, emotes and stickers;
+  - on 1.0, files, emotes, edits, reactions, pins, forwards and a new recovery key.
+
+  What 1.0 apps could not read, the app does not send there. On a 1.4 relay it writes emote
+  tokens in the form 1.4 reads ([docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) §1). The
+  desktop updater no longer warns about an update that still reaches every server you use.
+- **Relays can update themselves** (`[update]`, off by default,
+  [docs/OPERATING.md](docs/OPERATING.md) §14):
+  - a newer signed release of the same major version is taken `delay_minutes` (default 5)
+    after the relay first sees it, and release candidates with `release_candidates = true`;
+  - the relay checks the signature against the desktop updater's key, keeps the old binary and
+    a copy of a SQLite accounts database, and restarts into the new one;
+  - a release that never gets ready is rolled back at the next start and not taken again.
+
+  It needs the binary somewhere the relay's user can write, and is refused in the container.
+- `voipc-server --version`, and the version in the start-up line.
+- Releases carry `voipc-server-linux-x86_64.sig`, and `latest.json` names the relay build and
+  the oldest relay protocol its apps talk to.
+
+### Removed
+- **The Classic layout.** Modern and Stage stay. Whoever chose Classic opens in Modern, and
+  is not asked to choose again.
+- **Chat histories from before 0.12** (file formats 1 to 3) no longer open. The app shows such
+  a file as unreadable and leaves it on disk. Every 1.x still opens what 0.12 and later wrote
+  ([docs/COMPATIBILITY.md](docs/COMPATIBILITY.md) §4).
+- Moving `settings.json` and `chat_history.bin` from next to the program (0.2 and before)
+  into the config folder.
+- The relay's update notice for clients from before 0.5 (no ALPN): it closes the connection.
+
+### Fixed
+- On a phone in Modern, *Mixer* in a member's menu did nothing. It opens the mixer.
+- A viewer's keyframe request reaches the sharer's encoder directly, not through the UI, and
+  the browser no longer asks its encoder twice.
+
+### Changed
+- **Auto-connect no longer needs *Remember connection details*.** On its own it keeps only the
+  list of servers you have open. The connect dialog's fields are remembered only with Remember on.
+- **Security fixes go to the newest release only** ([SECURITY.md](SECURITY.md)). The promise
+  of 90 days of fixes for the previous protocol is gone. Image tags are unchanged.
+- **Windows, building on Windows:** the first build downloads the same pinned FFmpeg the
+  releases use. `setup.ps1` no longer builds FFmpeg through vcpkg.
+- The server configuration reference moved from the README to
+  [docs/OPERATING.md](docs/OPERATING.md) §13.
+- CI: the browser end-to-end job runs as three parallel parts, and the lossy-link (netem)
+  lane now fails the run. Changes to docs only skip the tests. A nightly job builds the
+  Windows client on Windows.
+- Internal: the relay's control handler is `session.rs` (it was `tcp.rs`, and served every
+  transport); its tests live in `session_tests.rs`. The browser build carries one copy of
+  sha2, hkdf and hmac instead of two.
+
 ## [1.5.0] - 2026-10-31
 
 **Protocol 15: update relays and apps together.** A 1.5 app does not connect to a 1.4

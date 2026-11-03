@@ -9,6 +9,7 @@ import {
   head, info, npmInstall, ok, run, syncVersion, writeTempConfig,
 } from '../lib.mjs';
 import { writeNotices } from './notices.mjs';
+import { downloadFfmpeg } from './windows-cross.mjs';
 
 /**
  * Refuse to start a Linux build against an FFmpeg the bindings cannot use.
@@ -68,20 +69,16 @@ function windowsMsvcEnv() {
   const pf86 = process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)';
   const pf = process.env['ProgramFiles'] ?? 'C:\\Program Files';
 
-  const vcpkgRoot = process.env.VCPKG_ROOT || join(pf, 'vcpkg');
-  const vcpkgInstalled = join(vcpkgRoot, 'installed', 'x64-windows');
-  // vcpkg follows FFmpeg head — its port moved to 9.0 in August 2026 — and
-  // ffmpeg-next 8.1 does not build against that. So an explicit FFMPEG_DIR (a
-  // prebuilt 8.x tree, the same kind the cross build downloads) wins over the
-  // vcpkg one, and either way the ABI is checked before anything is compiled
-  // against it rather than ten minutes later inside the bindings.
-  const ffmpegRoot = process.env.FFMPEG_DIR || vcpkgInstalled;
+  // The same pinned FFmpeg the cross build and the releases use, downloaded on
+  // first use: a minute, where vcpkg compiled for half an hour and followed
+  // FFmpeg head past what ffmpeg-next supports. An explicit FFMPEG_DIR wins,
+  // and its ABI is checked before anything is compiled against it rather than
+  // ten minutes later inside the bindings.
+  const ffmpegRoot = process.env.FFMPEG_DIR || downloadFfmpeg();
   checkFfmpegAbi(ffmpegRoot,
     'Point FFMPEG_DIR at an FFmpeg 8.x tree — an "n8.x-win64-gpl-shared" build from\n'
     + '     https://github.com/BtbN/FFmpeg-Builds/releases has the headers and .lib files.');
-  env.VCPKG_ROOT = vcpkgRoot;
   env.FFMPEG_DIR = ffmpegRoot;
-  env.PKG_CONFIG_PATH = join(vcpkgInstalled, 'lib', 'pkgconfig');
   // Only point bindgen at a libclang that is actually there. Setting this to a
   // path that does not exist is worse than leaving it unset, because bindgen
   // can otherwise find libclang through PATH.
@@ -113,10 +110,8 @@ function windowsMsvcEnv() {
     info('vswhere found no Visual Studio C++ toolset — relying on an already-configured shell');
   }
 
-  // FFmpeg first, so an explicit tree shadows a stale vcpkg one rather than
-  // compiling against one set of headers and linking the other.
-  const includes = [...new Set([join(ffmpegRoot, 'include'), join(vcpkgInstalled, 'include')])];
-  const libs = [...new Set([join(ffmpegRoot, 'lib'), join(vcpkgInstalled, 'lib')])];
+  const includes = [join(ffmpegRoot, 'include')];
+  const libs = [join(ffmpegRoot, 'lib')];
 
   if (vsPath && msvcVer) {
     const msvcRoot = join(vsPath, 'VC', 'Tools', 'MSVC', msvcVer);
@@ -147,7 +142,7 @@ function windowsMsvcEnv() {
 
   // bindgen's clang needs the MSVC/SDK headers spelled out; the paths contain
   // spaces, so each -I is quoted.
-  const clangArgs = [...new Set([join(ffmpegRoot, 'include'), join(vcpkgInstalled, 'include')])];
+  const clangArgs = [join(ffmpegRoot, 'include')];
   if (vsPath && msvcVer) clangArgs.push(join(vsPath, 'VC', 'Tools', 'MSVC', msvcVer, 'include'));
   if (sdkVer) clangArgs.push(join(sdkRoot, 'Include', sdkVer, 'ucrt'));
   env.BINDGEN_EXTRA_CLANG_ARGS = clangArgs.map((p) => `"-I${p}"`).join(' ');
@@ -158,6 +153,13 @@ function windowsMsvcEnv() {
   if (!process.env.CMAKE_GENERATOR && vsMajor === 17) {
     env.CMAKE_GENERATOR = 'Visual Studio 17 2022';
   }
+
+  // ffmpeg-sys-next's build script runs bindgen over the FFmpeg headers on its
+  // main thread, which overflows Windows' 1 MiB default stack there (nightly
+  // windows-native, 2026-11-03). link.exe reads LINK as extra options for every
+  // binary of this build, build scripts included: Linux's 8 MiB. The releases
+  // are cross-built on Linux and never see it.
+  env.LINK = [process.env.LINK, '/STACK:8388608'].filter(Boolean).join(' ');
 
   // The FFmpeg DLLs must be findable at runtime when the app is started here.
   const ffmpegBin = join(ffmpegRoot, 'bin');
@@ -174,12 +176,12 @@ function stageWindowsDlls(ffmpegBin) {
   mkdirSync(staging, { recursive: true });
 
   if (!existsSync(ffmpegBin)) {
-    fail(`FFmpeg binaries not found at ${ffmpegBin} — run .\\setup.ps1,`,
-      'or set FFMPEG_DIR to a prebuilt FFmpeg 8.x tree.');
+    fail(`FFmpeg binaries not found at ${ffmpegBin}`,
+      'Set FFMPEG_DIR to a prebuilt FFmpeg 8.x tree, or unset it to use the pinned download.');
   }
 
-  // FFmpeg, x264/x265 and the Intel oneVPL dispatcher that ffmpeg[qsv] pulls
-  // in. NVENC and AMF need no DLLs; they load from the GPU driver at runtime.
+  // FFmpeg, and x264/x265 and the Intel oneVPL dispatcher where a build ships
+  // them as DLLs. NVENC and AMF need none; they load from the GPU driver.
   const patterns = [/^av.*\.dll$/i, /^sw.*\.dll$/i, /^(lib)?x26[45].*\.dll$/i,
     /^postproc.*\.dll$/i, /^(lib)?vpl.*\.dll$/i];
   let staged = 0;

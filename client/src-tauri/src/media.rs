@@ -5,7 +5,7 @@
 //! that one picture, nothing more. Its budgets bound the time one takes, so
 //! no clock stops it.
 
-use std::sync::Mutex;
+use std::sync::{Mutex, PoisonError};
 
 use tokio::sync::Semaphore;
 use voipc_media::{Clean, Motion, Profile};
@@ -84,7 +84,7 @@ impl From<Clean> for Made {
 
 /// A picture made as `key` before.
 pub fn made(key: &str) -> Option<Made> {
-    let mut all = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut all = MADE.lock().unwrap_or_else(PoisonError::into_inner);
     let at = all.iter().position(|(k, _)| k == key)?;
     let hit = all.remove(at);
     let out = hit.1.clone();
@@ -96,7 +96,7 @@ pub fn made(key: &str) -> Option<Made> {
 /// `<hash>:`): its copy left this device, so its picture must not go on
 /// showing from memory.
 pub fn forget_made(hash: &str) {
-    let mut all = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut all = MADE.lock().unwrap_or_else(PoisonError::into_inner);
     all.retain(|(k, _)| {
         !k.split_once(':')
             .is_some_and(|(h, _)| h.eq_ignore_ascii_case(hash))
@@ -105,13 +105,13 @@ pub fn forget_made(hash: &str) {
 
 /// Let go of everything made: the file cache is wiped.
 pub fn forget_all_made() {
-    MADE.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    MADE.lock().unwrap_or_else(PoisonError::into_inner).clear();
 }
 
 /// Keep what was made as `key`; the least recently asked for go past the cap.
 pub fn keep_made(key: String, made: Made) {
     let size = |e: &(String, Made)| e.1.png.len() + e.1.first.as_ref().map_or(0, Vec::len);
-    let mut all = MADE.lock().unwrap_or_else(|e| e.into_inner());
+    let mut all = MADE.lock().unwrap_or_else(PoisonError::into_inner);
     all.retain(|(k, _)| *k != key);
     all.push((key, made));
     let mut total: usize = all.iter().map(size).sum();

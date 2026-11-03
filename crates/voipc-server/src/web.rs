@@ -5,7 +5,7 @@
 //! and the media relay below.
 //!
 //! One session maps onto the native paths: control bytes go through an
-//! in-process duplex into `tcp::handle_connection`, media packets go
+//! in-process duplex into `session::handle_connection`, media packets go
 //! straight to `media::handle_packet` and come back through the session's
 //! `media_tx` queue. The bridge never parses control messages and reads only
 //! the frame header of video fragments; all crypto happens in the client.
@@ -58,7 +58,7 @@ use voipc_protocol::video::{
 use crate::config::ServerConfig;
 use crate::media;
 use crate::state::ServerState;
-use crate::{tcp, ConnLimits};
+use crate::{session, ConnLimits};
 
 /// TLS server name native clients send to receive the operator certificate
 /// instead of the browser-pinned one.
@@ -855,7 +855,7 @@ pub(crate) fn start_session(label: &str, peer: IpAddr, state: &Arc<ServerState>)
     let (handler_end, bridge) = tokio::io::duplex(65536);
     let (media_tx, media_rx) = mpsc::channel::<Bytes>(512);
     let (sid_tx, sid_rx) = oneshot::channel::<SessionId>();
-    let handler = tokio::spawn(tcp::handle_connection(
+    let handler = tokio::spawn(session::handle_connection(
         handler_end,
         label.to_string(),
         peer,
@@ -1069,7 +1069,7 @@ pub(crate) async fn pump_media_out(
                     if !dropping && admission.await_key {
                         let sharer =
                             u32::from_be_bytes([packet[1], packet[2], packet[3], packet[4]]);
-                        crate::tcp::relay_keyframe_request(&state, sharer).await;
+                        crate::session::relay_keyframe_request(&state, sharer).await;
                     }
                     continue;
                 }

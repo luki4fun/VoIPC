@@ -1,7 +1,8 @@
 # VoIPC Windows development environment setup
 # Run as Administrator (elevated) for winget installs.
 #
-# Installs: Rust (MSVC), Node.js, CMake, NASM, LLVM, Visual Studio Build Tools, vcpkg + FFmpeg.
+# Installs: Rust (MSVC), Node.js, CMake, NASM, LLVM, protoc; checks for Visual Studio Build Tools.
+# FFmpeg comes with the first build (tools/tasks/desktop.mjs).
 # Then runs npm ci in the client directory.
 
 $ErrorActionPreference = "Stop"
@@ -84,80 +85,9 @@ if (Test-Path $vsWhere) {
     Write-Host "     Select the 'Desktop development with C++' workload" -ForegroundColor Yellow
 }
 
-# --- vcpkg + FFmpeg ---
-$vcpkgRoot = "C:\Program Files\vcpkg"
-if (Test-Path "$vcpkgRoot\vcpkg.exe") {
-    Write-Host "[ok] vcpkg already installed at $vcpkgRoot" -ForegroundColor Green
-} else {
-    Write-Host "[..] Cloning vcpkg..." -ForegroundColor Yellow
-    git clone https://github.com/Microsoft/vcpkg.git $vcpkgRoot
-    & "$vcpkgRoot\bootstrap-vcpkg.bat"
-    Write-Host "[ok] vcpkg installed" -ForegroundColor Green
-}
-$ffmpegHeader = "$vcpkgRoot\installed\x64-windows\include\libavcodec\avcodec.h"
-$ffmpegLib = "$vcpkgRoot\installed\x64-windows\lib\avcodec.lib"
-$x265Lib = "$vcpkgRoot\installed\x64-windows\lib\x265.lib"
-$x264Lib = "$vcpkgRoot\installed\x64-windows\lib\libx264.lib"
-$nvHeaders = "$vcpkgRoot\installed\x64-windows\include\ffnvcodec"
-# x264 is the default screen-share codec (every viewer decodes H.264),
-# x265 the opt-in one; the three HW encoders cover both.
-$ffmpegFeatures = "ffmpeg[x264,x265,nvcodec,amf,qsv]:x64-windows"
-# Ask vcpkg which features the installed ffmpeg was actually built with. File
-# markers alone would lie: x265.lib and the ffnvcodec headers belong to separate
-# ports and survive a plain `vcpkg install ffmpeg` in a shared vcpkg tree.
-# Falls back to the file markers if the listing is unavailable.
-$ffmpegListing = (& "$vcpkgRoot\vcpkg.exe" list ffmpeg 2>$null | Out-String)
-function Test-FFmpegFeature($feature) {
-    # Rows are one per feature per triplet: "ffmpeg[nvcodec]:x64-windows".
-    # The trailing boundary matters - without it an x64-windows-static row from
-    # another project satisfies the check for the dynamic tree we link against.
-    return $ffmpegListing -match "ffmpeg\[[^\]]*$feature[^\]]*\]:x64-windows(\s|`$)"
-}
-if ($ffmpegListing) {
-    $hasX265 = (Test-FFmpegFeature 'x265') -and (Test-FFmpegFeature 'x264')
-    # All three HW encoders are separately selectable, so nvcodec alone is not
-    # evidence that amf and qsv are present.
-    $hasHwEncoders = (Test-FFmpegFeature 'nvcodec') -and (Test-FFmpegFeature 'amf') -and (Test-FFmpegFeature 'qsv')
-} else {
-    $hasX265 = (Test-Path $x265Lib) -and (Test-Path $x264Lib)
-    $hasHwEncoders = Test-Path $nvHeaders
-}
-if ((Test-Path $ffmpegHeader) -and (Test-Path $ffmpegLib) -and $hasX265 -and $hasHwEncoders) {
-    Write-Host "[ok] FFmpeg + x264/x265 + HW encoders already installed via vcpkg" -ForegroundColor Green
-} else {
-    if ((Test-Path $ffmpegLib) -and -not $hasX265) {
-        Write-Host "[!!] FFmpeg installed but WITHOUT x264/x265 - reinstalling..." -ForegroundColor Yellow
-        & "$vcpkgRoot\vcpkg.exe" remove ffmpeg:x64-windows
-    } elseif ((Test-Path $ffmpegLib) -and -not $hasHwEncoders) {
-        Write-Host "[!!] FFmpeg installed but WITHOUT HW encoders (NVENC/AMF/QSV) - reinstalling..." -ForegroundColor Yellow
-        & "$vcpkgRoot\vcpkg.exe" remove ffmpeg:x64-windows
-    } elseif (Test-Path $ffmpegLib) {
-        Write-Host "[!!] FFmpeg libs found but headers missing - reinstalling..." -ForegroundColor Yellow
-        & "$vcpkgRoot\vcpkg.exe" remove ffmpeg:x64-windows
-    }
-    Write-Host "[..] Installing FFmpeg with x264/x265 + HW encoders via vcpkg (this may take 15-30 minutes)..." -ForegroundColor Yellow
-    & "$vcpkgRoot\vcpkg.exe" install $ffmpegFeatures --recurse
-    # Re-read the listing so the post-install check asserts the same feature set
-    # the staleness check gates on.
-    $ffmpegListing = (& "$vcpkgRoot\vcpkg.exe" list ffmpeg 2>$null | Out-String)
-    $missingFeatures = if ($ffmpegListing) {
-        @('x264', 'x265', 'nvcodec', 'amf', 'qsv') | Where-Object { -not (Test-FFmpegFeature $_) }
-    } else { @() }
-    if (-not (Test-Path $ffmpegHeader)) {
-        Write-Host "[!!] FFmpeg headers still missing after install!" -ForegroundColor Red
-        Write-Host "     Expected: $ffmpegHeader" -ForegroundColor Yellow
-        Write-Host "     Try: vcpkg remove ffmpeg:x64-windows; vcpkg install `"$ffmpegFeatures`"" -ForegroundColor Yellow
-    } elseif ($missingFeatures) {
-        Write-Host "[!!] FFmpeg installed but missing features: $($missingFeatures -join ', ')" -ForegroundColor Red
-        Write-Host "     Screen share will fall back to CPU encoding for the affected GPUs." -ForegroundColor Yellow
-        Write-Host "     Try: vcpkg remove ffmpeg:x64-windows; vcpkg install `"$ffmpegFeatures`"" -ForegroundColor Yellow
-    } elseif (-not (Test-Path $x265Lib)) {
-        Write-Host "[!!] x264/x265 still missing after install!" -ForegroundColor Red
-        Write-Host "     Try: vcpkg remove ffmpeg:x64-windows; vcpkg install `"$ffmpegFeatures`"" -ForegroundColor Yellow
-    } else {
-        Write-Host "[ok] FFmpeg + x264/x265 + HW encoders installed" -ForegroundColor Green
-    }
-}
+# --- FFmpeg ---
+# Nothing to install: the first build downloads the pinned FFmpeg 8.x the
+# releases use (SHA-256 checked), unless FFMPEG_DIR points at one already.
 
 # --- npm ci ---
 if (Test-Command "npm") {

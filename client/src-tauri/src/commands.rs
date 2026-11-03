@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
+use std::sync::PoisonError;
 
 use serde::Serialize;
 use tauri::{Emitter, State};
@@ -9,7 +10,10 @@ use voipc_protocol::messages::ClientMessage;
 use voipc_protocol::types::ProximityMode;
 use voipc_protocol::voice::VoicePacket;
 
-use crate::app_state::{conn, conn_mut, voice, voice_mut, AppState, PendingMessage, PendingTarget};
+use crate::app_state::{
+    conn, conn_mut, encrypt_group, encrypt_pairwise, voice, voice_mut, AppState, PendingMessage,
+    PendingTarget,
+};
 use crate::crypto::{self, ChatArchive, ChatMessage};
 use crate::network;
 use crate::screenshare;
@@ -456,20 +460,8 @@ pub async fn send_poke(
     };
 
     // Encrypt the poke message with Signal Protocol pairwise session
-    let (ciphertext, message_type) = tokio::task::block_in_place(|| {
-        let mut signal = signal.lock().map_err(|e| e.to_string())?;
-        let stores = signal
-            .stores
-            .as_mut()
-            .ok_or_else(|| "E2E encryption not initialized".to_string())?;
-        tokio::runtime::Handle::current()
-            .block_on(voipc_crypto::session::encrypt_message(
-                stores,
-                target_user_id,
-                message.as_bytes(),
-            ))
-            .map_err(|e| format!("poke encryption failed: {e}"))
-    })?;
+    let (ciphertext, message_type) = encrypt_pairwise(&signal, target_user_id, message.as_bytes())
+        .map_err(|e| format!("poke encryption failed: {e}"))?;
 
     network::send_tcp_message(
         &tcp_tx,
@@ -628,26 +620,18 @@ pub async fn send_channel_message(
     }
 
     // Try encrypted channel message via Sender Keys
-    let encrypted_result = tokio::task::block_in_place(|| {
-        let sig = signal.lock().map_err(|e| e.to_string())?;
-        if !sig.initialized {
-            return Err("not initialized".to_string());
+    // Only once we have handed our sender key to somebody in this channel. The
+    // guard drops at the end of this statement, before the encrypt locks again.
+    let ready = match signal.lock() {
+        Ok(sig) if !sig.initialized => Err("not initialized"),
+        Ok(sig) if !sig.channels.anyone_holds_our_key(channel_id) => {
+            Err("no sender keys distributed")
         }
-        // Check if we have distributed sender keys to anyone in this channel
-        if !sig.channels.anyone_holds_our_key(channel_id) {
-            return Err("no sender keys distributed".to_string());
-        }
-        drop(sig);
-
-        let mut sig = signal.lock().map_err(|e| e.to_string())?;
-        let stores = sig
-            .stores
-            .as_mut()
-            .ok_or_else(|| "Signal not initialized".to_string())?;
-        tokio::runtime::Handle::current()
-            .block_on(voipc_crypto::group::encrypt_group_message(
-                stores, user_id, channel_id, &payload,
-            ))
+        Ok(_) => Ok(()),
+        Err(_) => Err("signal lock poisoned"),
+    };
+    let encrypted_result = ready.map_err(String::from).and_then(|()| {
+        encrypt_group(&signal, user_id, channel_id, &payload)
             .map_err(|e| format!("group encryption: {e}"))
     });
 
@@ -699,7 +683,7 @@ pub async fn send_channel_message(
             );
             // Queue the message — it will be sent when sender key distribution completes
             {
-                let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
+                let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                 sig.pending_messages.push(PendingMessage {
                     target: PendingTarget::Channel { channel_id },
                     id: message_id.clone(),
@@ -830,24 +814,14 @@ pub async fn send_direct_message(
     }
 
     // Try encrypted direct message via pairwise Signal session
-    let encrypted_result = tokio::task::block_in_place(|| {
-        let sig = signal.lock().map_err(|e| e.to_string())?;
-        if !sig.initialized || !sig.established_sessions.contains(&target_user_id) {
-            return Err("no session".to_string());
-        }
-        drop(sig);
-
-        let mut sig = signal.lock().map_err(|e| e.to_string())?;
-        let stores = sig
-            .stores
-            .as_mut()
-            .ok_or_else(|| "Signal not initialized".to_string())?;
-        tokio::runtime::Handle::current()
-            .block_on(voipc_crypto::session::encrypt_message(
-                stores,
-                target_user_id,
-                &payload,
-            ))
+    // The guard drops at the end of this statement, before the encrypt locks again
+    let ready = match signal.lock() {
+        Ok(sig) if sig.initialized && sig.established_sessions.contains(&target_user_id) => Ok(()),
+        Ok(_) => Err("no session"),
+        Err(_) => Err("signal lock poisoned"),
+    };
+    let encrypted_result = ready.map_err(String::from).and_then(|()| {
+        encrypt_pairwise(&signal, target_user_id, &payload)
             .map_err(|e| format!("pairwise encryption: {e}"))
     });
 
@@ -900,7 +874,7 @@ pub async fn send_direct_message(
             );
             // Queue the message — it will be sent when pairwise session is established
             {
-                let mut sig = signal.lock().unwrap_or_else(|p| p.into_inner());
+                let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                 sig.pending_messages.push(PendingMessage {
                     target: PendingTarget::Direct { target_user_id },
                     id: message_id.clone(),
@@ -1007,9 +981,7 @@ async fn start_capture(state: &AppState, app_handle: tauri::AppHandle) -> Result
         return Ok(()); // Don't transmit while muted
     }
 
-    let settings = state.settings.read().await;
-    let input_device = settings.input_device.clone();
-    drop(settings);
+    let input_device = state.config().input_device.clone();
 
     connection.transmitting.store(true, Ordering::Relaxed);
 
@@ -1207,12 +1179,6 @@ pub async fn set_ptt_key(state: State<'_, AppState>, key_code: String) -> Result
     // Parse and validate the binding
     let binding = parse_ptt_binding(&key_code)
         .ok_or_else(|| format!("Unsupported key binding: {key_code}"))?;
-
-    // Update stored settings
-    {
-        let mut settings = state.settings.write().await;
-        settings.ptt_key = key_code.clone();
-    }
 
     // Update the shared PttBinding for the global key listener
     {
@@ -1430,9 +1396,6 @@ pub async fn set_input_device(
     state: State<'_, AppState>,
     device_name: String,
 ) -> Result<(), String> {
-    let mut settings = state.settings.write().await;
-    settings.input_device = Some(device_name.clone());
-    drop(settings);
     {
         let mut config = state.config();
         config.input_device = Some(device_name);
@@ -1450,9 +1413,6 @@ pub async fn set_output_device(
     state: State<'_, AppState>,
     device_name: String,
 ) -> Result<(), String> {
-    let mut settings = state.settings.write().await;
-    settings.output_device = Some(device_name.clone());
-    drop(settings);
     {
         let mut config = state.config();
         config.output_device = Some(device_name.clone());
@@ -1475,9 +1435,6 @@ pub async fn set_output_device(
 #[tauri::command]
 pub async fn set_volume(state: State<'_, AppState>, volume: f32) -> Result<(), String> {
     let clamped = volume.clamp(0.0, 1.0);
-    let mut settings = state.settings.write().await;
-    settings.volume = clamped;
-    drop(settings);
     {
         let mut config = state.config();
         config.volume = clamped;
@@ -1781,7 +1738,7 @@ fn clear_loss_tally(connection: &crate::app_state::ActiveConnection) {
     let mut tally = connection
         .share_loss_tally
         .lock()
-        .unwrap_or_else(|p| p.into_inner());
+        .unwrap_or_else(PoisonError::into_inner);
     *tally = crate::app_state::LossTally::default();
 }
 
@@ -1982,15 +1939,6 @@ pub async fn set_share_preview(state: State<'_, AppState>, on: bool) -> Result<(
     Ok(())
 }
 
-/// Set the keyframe_requested flag — called from frontend on KeyframeRequested event.
-#[tauri::command]
-pub async fn set_keyframe_requested(state: State<'_, AppState>) -> Result<(), String> {
-    let conns = state.connections.read().await;
-    let connection = voice(&state, &conns)?;
-    connection.keyframe_requested.store(true, Ordering::Relaxed);
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Voice activation (VAD) commands
 // ---------------------------------------------------------------------------
@@ -1998,11 +1946,7 @@ pub async fn set_keyframe_requested(state: State<'_, AppState>) -> Result<(), St
 /// Set voice mode: "ptt", "vad", or "always_on".
 #[tauri::command]
 pub async fn set_voice_mode(state: State<'_, AppState>, mode: String) -> Result<(), String> {
-    // Always persist to settings + config (even when disconnected)
-    {
-        let mut settings = state.settings.write().await;
-        settings.voice_mode = mode.clone();
-    }
+    // Always persist (even when disconnected)
     {
         let mut config = state.config();
         config.voice_mode = mode.clone();
@@ -2027,10 +1971,6 @@ pub async fn set_vad_threshold(
     }
     let threshold_db = threshold_db.clamp(-100.0, 0.0);
     // Always persist
-    {
-        let mut settings = state.settings.write().await;
-        settings.vad_threshold_db = threshold_db;
-    }
     {
         let mut config = state.config();
         config.vad_threshold_db = threshold_db;
@@ -2085,8 +2025,10 @@ pub async fn start_mic_test(
         let active = state.mic_test_active.clone();
         let gain = state.input_gain.clone();
         let sender_lane = state.sender_lane.clone();
-        let device = state.settings.read().await.input_device.clone();
-        let output_device = state.settings.read().await.output_device.clone();
+        let (device, output_device) = {
+            let config = state.config();
+            (config.input_device.clone(), config.output_device.clone())
+        };
         let monitor = monitor.unwrap_or(false);
         tokio::task::spawn_blocking(move || {
             use ringbuf::traits::Producer as _;
@@ -2233,7 +2175,7 @@ pub async fn start_output_test(
             return Ok(()); // already running
         }
         let active = state.output_test_active.clone();
-        let device = state.settings.read().await.output_device.clone();
+        let device = state.config().output_device.clone();
         tokio::task::spawn_blocking(move || {
             use ringbuf::traits::{Observer as _, Producer as _};
             use tauri::Emitter as _;
@@ -2333,18 +2275,9 @@ pub async fn set_audio_setup_version(
 
 #[tauri::command]
 pub async fn toggle_noise_suppression(state: State<'_, AppState>) -> Result<bool, String> {
-    // Read current value from settings (works even when disconnected)
-    let prev = {
-        let settings = state.settings.read().await;
-        settings.noise_suppression
-    };
-    let new_val = !prev;
+    // From the config, which holds it even when disconnected
+    let new_val = !state.config().noise_suppression;
 
-    // Update settings + config
-    {
-        let mut settings = state.settings.write().await;
-        settings.noise_suppression = new_val;
-    }
     {
         let mut config = state.config();
         config.noise_suppression = new_val;
@@ -2465,13 +2398,6 @@ pub async fn set_mic_fx(
     state
         .sender_lane
         .store(pack_lane(lane), std::sync::atomic::Ordering::Relaxed);
-    {
-        let mut settings = state.settings.write().await;
-        settings.mic_effect = effect.clone();
-        settings.mic_muffle = lane.muffle;
-        settings.mic_reverb = lane.reverb;
-        settings.mic_water = lane.water;
-    }
     let mut config = state.config();
     config.mic_effect = effect;
     config.mic_muffle = lane.muffle;
@@ -2531,7 +2457,10 @@ pub async fn set_user_position(
 ) -> Result<(), String> {
     let conns = state.connections.read().await;
     let connection = voice(&state, &conns)?;
-    let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+    let mut spatial = connection
+        .spatial
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     match pos {
         None => {
             spatial.sources.remove(&user_id);
@@ -2575,7 +2504,10 @@ pub async fn set_own_position(
 
     let conns = state.connections.read().await;
     let connection = voice(&state, &conns)?;
-    let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+    let mut spatial = connection
+        .spatial
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     spatial.listener = Listener { pos, fwd };
     // The beacon task picks this up within 100 ms. Sending here instead would
     // put one datagram on the wire per pointer event, ten times the budget the
@@ -2589,7 +2521,10 @@ pub async fn set_own_position(
 pub async fn set_position_sync(state: State<'_, AppState>, enabled: bool) -> Result<(), String> {
     let conns = state.connections.read().await;
     let connection = voice(&state, &conns)?;
-    let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+    let mut spatial = connection
+        .spatial
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     // The room view disables its checkbox while a game drives, but the command
     // is the boundary, not the checkbox: turning sync on here would clear the
     // game's placements (silencing everyone until its next update) and start
@@ -2627,16 +2562,12 @@ pub async fn set_spatial_setting(
     }
 
     {
-        let mut settings = state.settings.write().await;
-        match key.as_str() {
-            "spatial_audio" => settings.spatial_audio = value,
-            _ => settings.screen_audio_spatial = value,
-        }
-    }
-    {
         let conns = state.connections.read().await;
         for connection in conns.values() {
-            let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+            let mut spatial = connection
+                .spatial
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             match key.as_str() {
                 "spatial_audio" => spatial.enabled = value,
                 _ => spatial.screen_audio_spatial = value,
@@ -2650,7 +2581,7 @@ pub async fn set_spatial_setting(
                 let mode = v
                     .spatial
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner())
+                    .unwrap_or_else(PoisonError::into_inner)
                     .proximity_for_sdk();
                 state.sdk_event(crate::app_state::SdkEvent::Proximity { mode });
             }
@@ -2673,14 +2604,14 @@ pub async fn get_sdk_status(state: State<'_, AppState>) -> Result<serde_json::Va
     let game = state
         .sdk_game
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .clone();
     // Why the port could not be taken, if that is the case: otherwise the
     // panel shows the integration as on and simply never connects.
     let error = state
         .sdk_listen_error
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .clone();
     let config = state.config();
     Ok(serde_json::json!({
@@ -2892,7 +2823,10 @@ pub async fn set_sdk_config(
         // Wherever a game armed it: the beacon belongs to the connection it
         // said hello on, which need not be the voice one any more.
         for connection in state.connections.read().await.values() {
-            let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+            let mut spatial = connection
+                .spatial
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             if spatial.beacon {
                 // The game keeps placing the listener locally; nothing leaves
                 // the machine any more. Their own switch decides again, which
@@ -2909,7 +2843,10 @@ pub async fn set_sdk_config(
 pub async fn clear_positions(state: State<'_, AppState>) -> Result<(), String> {
     let conns = state.connections.read().await;
     let connection = voice(&state, &conns)?;
-    let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+    let mut spatial = connection
+        .spatial
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     spatial.clear_positions();
     Ok(())
 }
@@ -2937,12 +2874,15 @@ pub async fn start_spatial_test(state: State<'_, AppState>, mode: String) -> Res
         let taken = other
             .spatial
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .test
             .take();
         previous = previous.or(taken);
     }
-    let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+    let mut spatial = connection
+        .spatial
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     spatial.test = Some(crate::app_state::SpatialTest {
         mode,
         started: std::time::Instant::now(),
@@ -2959,7 +2899,10 @@ pub async fn start_spatial_test(state: State<'_, AppState>, mode: String) -> Res
 pub async fn stop_spatial_test(state: State<'_, AppState>) -> Result<(), String> {
     // Wherever it runs: it may have started before voice moved
     for connection in state.connections.read().await.values() {
-        let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+        let mut spatial = connection
+            .spatial
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if let Some(test) = spatial.test.as_mut() {
             test.stopping = true;
         }
@@ -3412,20 +3355,8 @@ pub async fn send_channel_history(
         let connection = conn(&conns, &server)?;
         (connection.tcp_tx.clone(), connection.signal.clone())
     };
-    let (ciphertext, message_type) = tokio::task::block_in_place(|| {
-        let mut signal = signal.lock().map_err(|e| e.to_string())?;
-        let stores = signal
-            .stores
-            .as_mut()
-            .ok_or("E2E encryption not initialized".to_string())?;
-        tokio::runtime::Handle::current()
-            .block_on(voipc_crypto::session::encrypt_message(
-                stores,
-                target_user_id,
-                &payload,
-            ))
-            .map_err(|e| format!("encryption failed: {e}"))
-    })?;
+    let (ciphertext, message_type) = encrypt_pairwise(&signal, target_user_id, &payload)
+        .map_err(|e| format!("encryption failed: {e}"))?;
 
     network::send_tcp_message(
         &tcp_tx,
@@ -3636,7 +3567,6 @@ pub fn save_connection_info(
         config.last_port = None;
         config.last_username = None;
         config.last_accept_self_signed = None;
-        config.auto_connect = false;
     }
     crate::config::save_config(&config)
 }
@@ -3743,11 +3673,7 @@ pub async fn reset_config(state: State<'_, AppState>, app: tauri::AppHandle) -> 
         state.is_muted.load(Ordering::Relaxed),
         state.is_deafened.load(Ordering::Relaxed),
     );
-    {
-        let mut settings = state.settings.write().await;
-        *settings = crate::app_state::UserSettings::default();
-        state.seed_shared(&settings);
-    }
+    state.seed_shared(&default_config);
     // ...and every server hears about the mute and deafen that just changed,
     // or its members go on seeing a muted icon on somebody they can hear.
     let (muted, deafened) = (

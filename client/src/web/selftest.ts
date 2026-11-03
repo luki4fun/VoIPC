@@ -201,7 +201,7 @@ export async function run(params: URLSearchParams): Promise<void> {
     "server-disconnected", "channel-history-requested", "channel-history-received",
     "screenshare-started", "screenshare-stopped", "watching-screenshare",
     "stopped-watching-screenshare", "screenshare-error", "screenshare-frame",
-    "viewer-count-changed", "keyframe-requested",
+    "viewer-count-changed",
     "user-position", "proximity-mode", "channel-created", "channel-updated",
   ];
   // Every other event comes as {server, data}; the lines below log and read
@@ -256,17 +256,14 @@ export async function run(params: URLSearchParams): Promise<void> {
           fileTransfer = fetchOffered(m.from_user_id, m.content.slice(5));
         }
       }
-      // What App.svelte does for a sharer: encode only while someone watches,
-      // and force a keyframe when a viewer asks for one.
+      // What App.svelte does for a sharer: encode only while someone watches.
+      // A viewer's keyframe request the session handles itself.
       if (ev === "viewer-count-changed") {
         const p = e.payload as { viewer_count: number };
         const cmd = p.viewer_count > 0 ? "start_screen_capture" : "stop_screen_capture";
         invoke(cmd, { resolution: 480, fps: 15 }).catch((err) =>
           log("error", { message: `${cmd}: ${String(err)}` }),
         );
-      }
-      if (ev === "keyframe-requested") {
-        invoke("set_keyframe_requested").catch(() => {});
       }
       if (ev === "channel-chat-message") {
         const m = e.payload as SeenMessage & { channel_id: number; decryption_failed?: boolean };

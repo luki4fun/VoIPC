@@ -40,7 +40,7 @@ use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant, SystemTime};
 
 use serde::{Deserialize, Serialize};
@@ -151,7 +151,7 @@ impl Conv {
 }
 
 fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|p| p.into_inner())
+    m.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
 // ── One connection's transfers ───────────────────────────────────────────
@@ -169,7 +169,7 @@ pub struct Files {
     accept_invalid_certs: bool,
     /// `Authenticated.files`: `None` when the relay keeps no files.
     limits: Option<FileLimits>,
-    tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: crate::network::ControlTx,
     /// The one connection to `/f/`, opened when first needed and again
     /// whenever the relay closes it (it serves one for a minute).
     link: tokio::sync::Mutex<Option<Http<tokio_rustls::client::TlsStream<tokio::net::TcpStream>>>>,
@@ -269,7 +269,7 @@ impl Files {
         accept_invalid_certs: bool,
         limits: Option<FileLimits>,
         emotes: Option<EmoteAccess>,
-        tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
+        tcp_tx: crate::network::ControlTx,
     ) -> Files {
         Files {
             emit,
@@ -289,8 +289,9 @@ impl Files {
         }
     }
 
-    pub(crate) fn send_msg(&self, msg: &ClientMessage) {
-        self.send(msg);
+    /// For a command: a message the relay's protocol lacks is its error.
+    pub(crate) fn send_msg(&self, msg: &ClientMessage) -> Result<(), String> {
+        self.tcp_tx.send(msg)
     }
 
     /// Wait for the relay's answer to an `EmoteAdd` about to be sent.
@@ -359,8 +360,9 @@ impl Files {
                 );
             }
             ServerMessage::EmoteTicket { hash, name, ticket } => {
+                // A 1.4 relay names no emote: its hash alone
                 answer(
-                    &|w: &EmoteWait| w.hash == hash && w.name == name,
+                    &|w: &EmoteWait| w.hash == hash && (name.is_empty() || w.name == name),
                     Ok(Some(ticket)),
                 );
             }
@@ -1979,6 +1981,7 @@ mod tests {
             }
         };
         let (tcp_tx, mut tcp_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let tcp_tx = crate::network::ControlTx::new(tcp_tx, PROTOCOL_VERSION);
         let (events_tx, events) = mpsc::unbounded_channel();
         // VOIPC_FILES_IN_CALL=1: as if voice were on
         let in_call = std::env::var("VOIPC_FILES_IN_CALL").is_ok_and(|v| v == "1");
@@ -2055,19 +2058,25 @@ mod tests {
         let file: &[u8] = include_bytes!("../../../crates/voipc-media/tests/fixtures/anim3.webp");
         let hash = sha256(file);
         let name = format!("live_{n}");
-        admin.files.send_msg(&ClientMessage::AdminLogin { token });
+        admin
+            .files
+            .send_msg(&ClientMessage::AdminLogin { token })
+            .unwrap();
         let answer = admin.files.wait_emote(&name, hash);
-        admin.files.send_msg(&ClientMessage::EmoteAdd {
-            emote: Emote {
-                name: name.clone(),
-                hash,
-                sticker: false,
-                pack: String::new(),
-                len: file.len() as u32,
-                w: 0,
-                h: 0,
-            },
-        });
+        admin
+            .files
+            .send_msg(&ClientMessage::EmoteAdd {
+                emote: Emote {
+                    name: name.clone(),
+                    hash,
+                    sticker: false,
+                    pack: String::new(),
+                    len: file.len() as u32,
+                    w: 0,
+                    h: 0,
+                },
+            })
+            .unwrap();
         let ticket = tokio::time::timeout(Duration::from_secs(10), answer)
             .await
             .expect("an answer")
@@ -2125,7 +2134,8 @@ mod tests {
         assert_eq!(status, 401, "a member's bearer uploads nothing");
         admin
             .files
-            .send_msg(&ClientMessage::EmoteRemove { names: vec![name] });
+            .send_msg(&ClientMessage::EmoteRemove { names: vec![name] })
+            .unwrap();
     }
 
     /// The whole path against a real relay: seal, `FileUpload`, chunked PUTs

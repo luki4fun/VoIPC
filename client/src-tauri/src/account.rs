@@ -8,13 +8,13 @@
 //! file only moves their messages, asks the person, and keeps what they hand
 //! over in the local archive.
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
 use tauri::{Manager, State};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::oneshot;
 use tracing::{info, warn};
 use voipc_crypto::account::{
     normalize_name, password_ok, recovery_parse, stretch_salted, DeviceKey, Method, SignIn, Step,
@@ -22,9 +22,8 @@ use voipc_crypto::account::{
 };
 use voipc_crypto::account_session::{memory_key, AccountSession, Actions};
 use voipc_crypto::sync::Prefs;
-use voipc_protocol::codec::{
-    decode_server_msg, encode_client_msg, try_decode_frame, APP_VERSION, PROTOCOL_VERSION,
-};
+use voipc_protocol::codec::{try_decode_frame, APP_VERSION};
+use voipc_protocol::compat::{decode_server_msg_from, encode_client_msg_for};
 use voipc_protocol::conv::{hex, unhex16};
 use voipc_protocol::messages::{AccountReply, AccountRequest, ClientMessage, ServerMessage};
 use voipc_protocol::types::{EmoteAccess, FileLimits};
@@ -55,6 +54,22 @@ pub enum AccountArgs {
     Reset { recovery: String, password: String },
 }
 
+impl AccountArgs {
+    /// Wipes the secrets it holds: a connect keeps them for a second try at
+    /// an older relay's protocol, and lets go of them with this.
+    pub fn wipe(self) {
+        match self {
+            AccountArgs::Login { password } | AccountArgs::Register { password, .. } => {
+                drop(Zeroizing::new(password))
+            }
+            AccountArgs::Reset { recovery, password } => {
+                drop((Zeroizing::new(recovery), Zeroizing::new(password)))
+            }
+            AccountArgs::Device => {}
+        }
+    }
+}
+
 /// What a reset ends with: the relay closes that connection, and the front
 /// end signs in with the new password (connect.ts `RESET_DONE`).
 pub const RESET_DONE: &str = "Your password was reset. Sign in with the new one.";
@@ -68,7 +83,7 @@ pub struct AccountLink {
 impl AccountLink {
     /// The session, for one call; what it returns goes to `run`.
     pub fn session(&self) -> std::sync::MutexGuard<'_, AccountSession> {
-        self.session.lock().unwrap_or_else(|p| p.into_inner())
+        self.session.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -78,7 +93,7 @@ impl AccountLink {
 pub async fn run(
     app: &tauri::AppHandle,
     server: &str,
-    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: &crate::network::ControlTx,
     a: Actions,
 ) {
     for m in &a.send {
@@ -118,22 +133,29 @@ pub struct TotpAnswer {
     pub recovery: bool,
 }
 
-async fn write<S: AsyncWrite + Unpin>(send: &mut S, msg: &ClientMessage) -> Result<(), String> {
-    let data = encode_client_msg(msg).map_err(|e| format!("encode: {e}"))?;
-    send.write_all(&data)
-        .await
-        .map_err(|e| format!("Connection lost during sign-in: {e}"))
+async fn write<S: AsyncWrite + Unpin>(
+    send: &mut S,
+    msg: &ClientMessage,
+    proto: u32,
+) -> Result<(), String> {
+    for data in encode_client_msg_for(msg, proto).map_err(|e| format!("encode: {e}"))? {
+        send.write_all(&data)
+            .await
+            .map_err(|e| format!("Connection lost during sign-in: {e}"))?;
+    }
+    Ok(())
 }
 
 async fn read<R: AsyncRead + Unpin>(
     recv: &mut R,
     buf: &mut BytesMut,
+    proto: u32,
 ) -> Result<ServerMessage, String> {
     loop {
         if let Some(payload) =
             try_decode_frame(buf).map_err(|e| format!("Frame decode error: {e}"))?
         {
-            return decode_server_msg(&payload)
+            return decode_server_msg_from(&payload, proto)
                 .map_err(|e| format!("Failed to decode response: {e}"));
         }
         let n = tokio::time::timeout(CONNECT_TIMEOUT, recv.read_buf(buf))
@@ -159,6 +181,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
     send: &mut S,
     recv: &mut R,
     buf: &mut BytesMut,
+    proto: u32,
 ) -> Result<
     (
         u32,
@@ -167,7 +190,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         Option<FileLimits>,
         Option<EmoteAccess>,
     ),
-    String,
+    crate::network::Refusal,
 > {
     let name = normalize_name(username)?;
     let method = match args {
@@ -210,7 +233,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         }
     };
     let password_based = !matches!(method, Method::Device { .. });
-    let (mut machine, first) = SignIn::start(&name, method, PROTOCOL_VERSION, APP_VERSION);
+    let (mut machine, first) = SignIn::start(&name, method, proto, APP_VERSION);
     let known_here = {
         let cfg = state.config();
         let here = cfg.relay_ids.get(server).and_then(|h| unhex16(h));
@@ -223,11 +246,11 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         machine.expect_relay(here, elsewhere);
         here
     };
-    write(send, &first).await?;
+    write(send, &first, proto).await?;
 
     let mut asked = 0u32;
     let (user_id, session_id, info, files, emotes) = loop {
-        let msg = read(recv, buf).await?;
+        let msg = read(recv, buf, proto).await?;
         if let ServerMessage::Authenticated {
             user_id,
             session_id,
@@ -242,17 +265,21 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
             }
             break (user_id, session_id, info, files, emotes);
         }
+        // Before `note_refusal`: an older relay is no reason to offer an update
+        if let Some(older) = crate::network::older_relay(&msg, proto) {
+            return Err(older);
+        }
         crate::network::note_refusal(app, server, &msg);
         // The password's stretching runs here: half a second of CPU, kept
         // off the other tasks on this worker.
         let steps = tokio::task::block_in_place(|| machine.on_message(&msg))?;
         for step in steps {
             match step {
-                Step::Send(out) => write(send, &out).await?,
+                Step::Send(out) => write(send, &out, proto).await?,
                 Step::Keys => {
                     let identity = *machine.identity().ok_or("no identity")?;
                     let bundle = crate::network::init_signal(signal, &identity)?;
-                    write(send, &machine.keys(bundle)).await?;
+                    write(send, &machine.keys(bundle), proto).await?;
                 }
                 Step::NeedTotp => {
                     let answer = ask_totp(state, app, server, asked > 0).await?;
@@ -262,7 +289,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                     } else {
                         machine.totp(&answer.code)
                     };
-                    write(send, &out).await?;
+                    write(send, &out, proto).await?;
                 }
                 Step::ResetDone => {
                     info!(server, "account password reset with the recovery key");
@@ -326,14 +353,14 @@ async fn ask_totp(
     state
         .totp_answers
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .insert(server.to_string(), tx);
     emit_server(app, server, "account-need-totp", retry);
     let answer = tokio::time::timeout(std::time::Duration::from_secs(115), rx).await;
     state
         .totp_answers
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .remove(server);
     match answer {
         Ok(Ok(a)) => Ok(a),
@@ -348,7 +375,7 @@ pub async fn after_connect(
     app: &tauri::AppHandle,
     server: &str,
     link: &AccountLink,
-    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: &crate::network::ControlTx,
 ) {
     let a = link.session().after_connect();
     run(app, server, tcp_tx, a).await;
@@ -363,11 +390,11 @@ pub async fn check_seen(
     server: &str,
     link: Option<&AccountLink>,
     signal: &std::sync::Mutex<SignalState>,
-    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: &crate::network::ControlTx,
 ) {
     let seen = signal
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .stores
         .as_mut()
         .map(|s| s.identity.take_seen())
@@ -384,7 +411,7 @@ pub async fn on_reply(
     app: &tauri::AppHandle,
     server: &str,
     link: &AccountLink,
-    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: &crate::network::ControlTx,
     reply: AccountReply,
 ) {
     if let AccountReply::Error { request, reason } = &reply {
@@ -411,15 +438,6 @@ fn signed_in<'a>(
         .as_ref()
         .ok_or("Not signed in to an account on that server")?;
     Ok((connection, link))
-}
-
-/// This account's choices (cloud copies), as its vault has them.
-#[tauri::command]
-pub async fn account_prefs(state: State<'_, AppState>, server: String) -> Result<Prefs, String> {
-    let connections = state.connections.read().await;
-    let (_, link) = signed_in(&connections, &server)?;
-    let prefs = link.session().prefs();
-    Ok(prefs)
 }
 
 /// A direct message for an account that is away (`account`, hex): kept in the
@@ -605,7 +623,7 @@ pub async fn account_totp(
     let waiting = state
         .totp_answers
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .remove(&server);
     match waiting {
         Some(tx) => tx
@@ -624,7 +642,7 @@ pub async fn account_cancel(state: State<'_, AppState>, server: String) -> Resul
     state
         .totp_answers
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .remove(&server);
     Ok(())
 }
@@ -691,6 +709,10 @@ pub async fn account_recovery_key_new(
     let connections = state.connections.read().await;
     let (connection, link) = signed_in(&connections, &server)?;
     let (a, key) = link.session().recovery_key_new(&master, totp, recovery);
+    // A relay before 1.3 has no such request and would never answer
+    for m in &a.send {
+        encode_client_msg_for(m, connection.tcp_tx.proto()).map_err(|e| e.to_string())?;
+    }
     run(&app, &server, &connection.tcp_tx, a).await;
     Ok(key)
 }

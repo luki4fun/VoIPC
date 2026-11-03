@@ -365,10 +365,11 @@
   {:else if held && current === "stickers"}
     <!-- Said where the stickers are: a greyed one has no tooltip on a phone -->
     <p class="ep-hint" role="status">{held.title}{held.label ? `; the next in ${held.label}` : ""}.</p>
-  {:else if wait?.bytes && (current === "emotes" || current === "stickers")}
+  {:else if (wait?.bytes || wait?.missing?.size) && (current === "emotes" || current === "stickers")}
+    <!-- No size from a 1.4 relay: still waiting, without a number -->
     <p class="ep-hint">
       They wait for Wi-Fi.
-      <button class="btn btn-ghost ep-dl" type="button" onpointerdown={keep} onclick={() => downloadEmotes(server)}>Download {formatSize(wait.bytes)} now</button>
+      <button class="btn btn-ghost ep-dl" type="button" onpointerdown={keep} onclick={() => downloadEmotes(server)}>Download {wait?.bytes ? `${formatSize(wait.bytes)} ` : ""}now</button>
     </p>
   {:else if current === "emotes" || current === "stickers"}
     <p class="ep-hint">{touchHint ? "Hold one to make it a favourite." : "Right-click one to make it a favourite."}</p>

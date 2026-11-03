@@ -330,10 +330,6 @@ export class AccountDriver {
     this.session?.setShare(on);
   }
 
-  prefs(): { cloud: boolean; asked: boolean } | null {
-    return this.session ? { cloud: this.session.cloud(), asked: this.session.asked() } : null;
-  }
-
   /** A new password: the current one, and a code where the account has codes
    *  on. The answer comes as `account-reply` (`PasswordChanged`, or an Error
    *  for `PasswordChange`). */

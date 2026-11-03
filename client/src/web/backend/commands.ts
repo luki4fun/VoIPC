@@ -220,7 +220,6 @@ const handlers: Record<string, Handler> = {
       relay_id: toHex(d.relay_id),
     })),
   forget_device: ({ server, name }) => forgetDevice(str(server, "server"), str(name, "name")),
-  account_prefs: ({ server }) => needAccount(server).account.prefs() ?? fail("Not signed in to an account on that server"),
   send_kept_dm: ({ server, account, content, ttlSecs, replyTo, thread, file, fwd, event }) =>
     need(server).sendKeptDm(
       str(account, "account"),
@@ -760,7 +759,6 @@ const handlers: Record<string, Handler> = {
   start_screen_capture: ({ resolution, fps }) =>
     share.startEncoding(u32(resolution, "resolution"), u32(fps, "fps")),
   stop_screen_capture: () => share.stopEncoding(),
-  set_keyframe_requested: () => share.requestKeyframe(),
   toggle_screen_audio: () => share.toggleAudio(),
   // Browsers pick their own codec (H.264 where they can encode it, else VP9)
   set_screen_share_codec: () => {},
@@ -816,7 +814,6 @@ const handlers: Record<string, Handler> = {
       c.last_port = entry?.port ?? null;
       c.last_username = entry?.username ?? null;
       c.last_accept_self_signed = entry?.accept_self_signed ?? null;
-      if (!keep) c.auto_connect = false;
     });
   },
   save_server: ({ name, host, port, username, acceptSelfSigned, account }) => {

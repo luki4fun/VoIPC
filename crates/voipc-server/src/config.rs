@@ -91,6 +91,11 @@ pub struct ServerConfig {
     /// until an admin adds some.
     #[serde(default)]
     pub emotes: EmotesConfig,
+
+    /// The relay updating itself from the GitHub releases (`[update]`, 1.6).
+    /// Off by default.
+    #[serde(default)]
+    pub update: UpdateConfig,
 }
 
 /// Whether guests may stay when the relay has accounts.
@@ -235,6 +240,28 @@ impl Default for EmotesConfig {
     }
 }
 
+/// `[update]`: the relay replaces its own binary with a newer signed release
+/// of the same major version, and restarts into it (update.rs).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UpdateConfig {
+    pub enabled: bool,
+    /// Minutes between this relay first seeing a release and taking it.
+    pub delay_minutes: u32,
+    /// Follow the release candidates' feed, which carries the finals too.
+    pub release_candidates: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            delay_minutes: 5,
+            release_candidates: false,
+        }
+    }
+}
+
 /// Whether two directories are one, or one is inside the other, by their
 /// names as given (`./a` is `a`).
 fn nested(a: &str, b: &str) -> bool {
@@ -331,6 +358,11 @@ impl ServerConfig {
                 ));
             }
         }
+        if self.update.enabled && !crate::update::SUPPORTED {
+            return Err(anyhow!(
+                "[update] enabled needs the linux-x86_64 build: there is no official build of this one to update to"
+            ));
+        }
         Ok(())
     }
 
@@ -384,6 +416,7 @@ impl Default for ServerConfig {
             accounts: AccountsConfig::default(),
             files: FilesConfig::default(),
             emotes: EmotesConfig::default(),
+            update: UpdateConfig::default(),
         }
     }
 }
@@ -553,6 +586,30 @@ mod tests {
         assert!(refused("[files]\ndir = \" \"").contains("dir"));
         let off = parse("[files]\nenabled = false\nmax_size_mb = 0").unwrap();
         assert!(off.validate().is_ok(), "no cache, no caps to mind");
+    }
+
+    #[test]
+    fn self_update_is_off_by_default_and_refuses_typos() {
+        let config = ServerConfig::default();
+        assert!(!config.update.enabled);
+        assert_eq!(config.update.delay_minutes, 5);
+        assert!(!config.update.release_candidates);
+        let parse = |extra: &str| {
+            toml::from_str::<ServerConfig>(&format!("cert_path = \"c\"\nkey_path = \"k\"\n{extra}"))
+        };
+        let on = parse("[update]\nenabled = true\ndelay_minutes = 30\nrelease_candidates = true")
+            .unwrap();
+        assert!(on.update.enabled && on.update.release_candidates);
+        assert_eq!(on.update.delay_minutes, 30);
+        assert!(
+            parse("[update]\ndelay = 5").is_err(),
+            "a typo fails the start"
+        );
+        assert_eq!(
+            on.validate().is_ok(),
+            crate::update::SUPPORTED,
+            "only the linux-x86_64 build has an official build to update to"
+        );
     }
 
     #[test]

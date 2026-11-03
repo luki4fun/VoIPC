@@ -1,5 +1,5 @@
 <script lang="ts">
-  // The voice bar along the bottom of the classic layout.
+  // The voice bar.
   //
   // Chrome only. What actually opens the microphone lives in stores/voice.ts,
   // and the key handling and polling that go with it in VoiceKeys.svelte, which

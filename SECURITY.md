@@ -20,20 +20,17 @@ Tell us:
 
 ## Supported versions
 
-| Version | Security fixes |
-|---|---|
-| the newest release | yes |
-| the newest release of the previous protocol (now 1.0.x, protocol 12) | for 90 days after the first release of the new protocol (1.3.1) |
-| an older minor on the same protocol | for 30 days after the newer one ships |
-| before 1.0 | no |
+Only the newest release gets security fixes. To get a fix, update the relay and the apps to
+it.
 
-A client and a relay must speak the same protocol version, so a protocol change makes a whole
-server and its users move together, and that takes time. For 90 days after 1.3.1 ships, a fix
-that also concerns 1.0 comes as a 1.0.x release too, and its advisory names both. After that,
-1.0.x gets no fixes: update the relay and the apps to the newest release.
+A relay admits only apps of its own protocol version, and a release that changes it says so in
+its notes' first line. Since 1.6 an app also talks to relays up to three protocols older, so
+the apps can take a fix before their relay does ([docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)
+§1).
 
-A fix that itself changes the protocol needs both sides updated, and its release notes say so
-in their first line ([docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)).
+A relay can update itself (`[update]`, [docs/OPERATING.md](docs/OPERATING.md) §14). It installs
+only a release signed with the key the desktop updater trusts, for the version and the file
+the feed names, and it is off unless the operator turns it on.
 
 ## What is not a vulnerability
 
@@ -52,16 +49,16 @@ Every release carries `SHA256SUMS`, and a build attestation for every file. The 
 proves the file was built by this repository's release workflow from the tagged commit.
 
     sha256sum -c SHA256SUMS --ignore-missing
-    gh attestation verify VoIPC_1.5.0_amd64.AppImage --repo luki4fun/voipc
+    gh attestation verify VoIPC_1.6.0_amd64.AppImage --repo luki4fun/voipc
 
 The relay's container image is attested the same way:
 
-    gh attestation verify oci://ghcr.io/luki4fun/voipc-server:1.5.0 --repo luki4fun/voipc
+    gh attestation verify oci://ghcr.io/luki4fun/voipc-server:1.6.0 --repo luki4fun/voipc
 
 The Android APK is signed with the same certificate as every earlier VoIPC APK. Its SHA-256 is
 `30d71722fe2bdd4bafc34fdaf5be34071f5dfaa399823237c7ae4ab7778a0fe9`. To check it:
 
-    apksigner verify --print-certs VoIPC-android-1.5.0.apk
+    apksigner verify --print-certs VoIPC-android-1.6.0.apk
 
 The desktop app's own updater only installs an update signed for exactly the version it
 announces.

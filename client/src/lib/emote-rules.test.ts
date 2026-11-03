@@ -15,6 +15,7 @@ import {
   stickerOf,
   stickerText,
   tokenize,
+  tokensFor,
   untokenize,
   type Emote,
 } from "./emote-rules.ts";
@@ -35,6 +36,15 @@ test(":name: of a listed emote becomes its token, and nothing else does", () => 
   assert.equal(tokenize("10:30:45 and a:pog:b", ALL), "10:30:45 and a:pog:b", "inside words and times");
   assert.equal(tokenize(":pog:", []), ":pog:");
   assert.equal(tokenize("(:pog:)", ALL), `(${T(pog)})`);
+});
+
+test("a 1.4 relay's readers get 20-digit tokens, which still resolve", () => {
+  const text = `hi ${T(pog)} and ${stickerText(cat)}`;
+  assert.equal(tokensFor(text, 32), text);
+  const old = tokensFor(text, 20);
+  assert.equal(old, `hi ${OLD(pog)} and ${OLD(cat)}`);
+  assert.equal(tokensFor(old, 20), old);
+  assert.equal(stickerOf(OLD(cat), ALL), cat);
 });
 
 test("code stays as it was written, and a token is never made twice", () => {

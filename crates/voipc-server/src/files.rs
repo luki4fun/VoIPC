@@ -70,8 +70,8 @@ use voipc_protocol::messages::{
 use voipc_protocol::types::{ChannelId, FileConv, FileLimits, SessionId, UserId};
 
 use crate::config::FilesConfig;
+use crate::session::send_msg;
 use crate::state::{ServerState, UserSession};
-use crate::tcp::send_msg;
 
 const MIB: u64 = 1024 * 1024;
 /// Largest body of one request, either way.
@@ -188,7 +188,7 @@ async fn resolve(
             Place::Channel(id)
         }
         FileConv::Direct(uid) => {
-            let sid = state.user_to_session.get(&uid).map(|s| *s);
+            let sid = state.sessions.contains_key(&uid).then_some(uid);
             let other = sid
                 .filter(|sid| *sid != session_id)
                 .and_then(|sid| state.sessions.get(&sid).map(|s| party_of(&s)))
@@ -1856,9 +1856,9 @@ pub(crate) async fn deliver(state: &ServerState, out: Vec<Out>) {
     for item in out {
         match item {
             Out::To(session, msg) => {
-                let tx = state.sessions.get(&session).map(|s| s.tcp_tx.clone());
+                let tx = state.sessions.get(&session).map(|s| s.control_tx.clone());
                 if let Some(tx) = tx {
-                    let _ = send_msg(&tx, &msg).await;
+                    let _ = send_msg(&tx, &msg);
                 }
             }
             Out::Waited {
@@ -1868,9 +1868,9 @@ pub(crate) async fn deliver(state: &ServerState, out: Vec<Out>) {
                 msg,
             } => {
                 if still_in(state, session, &place).await {
-                    let tx = state.sessions.get(&session).map(|s| s.tcp_tx.clone());
+                    let tx = state.sessions.get(&session).map(|s| s.control_tx.clone());
                     if let Some(tx) = tx {
-                        let _ = send_msg(&tx, &msg).await;
+                        let _ = send_msg(&tx, &msg);
                     }
                 } else if let Some(store) = &state.files {
                     store.withdraw(hash, session);
@@ -1902,9 +1902,9 @@ fn sessions_of(state: &ServerState, party: &Party) -> Vec<SessionId> {
     let sid = match party {
         Party::Account(id) => state.account_sessions.get(id).map(|s| *s),
         Party::Guest(user_id) => state
-            .user_to_session
-            .get(user_id)
-            .map(|s| *s)
+            .sessions
+            .contains_key(user_id)
+            .then_some(*user_id)
             .filter(|sid| state.sessions.get(sid).is_some_and(|s| s.account.is_none())),
     };
     sid.into_iter().collect()
@@ -1929,7 +1929,7 @@ async fn want(state: &ServerState, place: &Place, hash: [u8; 32], except: Sessio
     let mut sends: Vec<(mpsc::Sender<Vec<u8>>, FileConv)> = Vec::new();
     let mut add = |sid: SessionId, conv: FileConv| {
         if sid != except {
-            if let Some(tx) = state.sessions.get(&sid).map(|s| s.tcp_tx.clone()) {
+            if let Some(tx) = state.sessions.get(&sid).map(|s| s.control_tx.clone()) {
                 sends.push((tx, conv));
             }
         }
@@ -1944,7 +1944,7 @@ async fn want(state: &ServerState, place: &Place, hash: [u8; 32], except: Sessio
                 .map(|c| c.members.iter().copied().collect())
                 .unwrap_or_default();
             for user_id in members {
-                if let Some(sid) = state.user_to_session.get(&user_id).map(|s| *s) {
+                if let Some(sid) = state.sessions.contains_key(&user_id).then_some(user_id) {
                     add(sid, FileConv::Channel(*id));
                 }
             }
@@ -1961,7 +1961,7 @@ async fn want(state: &ServerState, place: &Place, hash: [u8; 32], except: Sessio
         }
     }
     for (tx, conv) in sends {
-        let _ = send_msg(&tx, &ServerMessage::FileWanted { conv, hash }).await;
+        let _ = send_msg(&tx, &ServerMessage::FileWanted { conv, hash });
     }
 }
 
@@ -1975,8 +1975,7 @@ async fn refuse_now(tx: &mpsc::Sender<Vec<u8>>, hash: [u8; 32], (code, reason): 
             code,
             reason: reason.into(),
         },
-    )
-    .await;
+    );
 }
 
 /// `ClientMessage::FileUpload`.

@@ -8,7 +8,6 @@
   import { currentChannelId } from "../../stores/channels.js";
   import { disconnectServer, serverEntries } from "../../connect.js";
   import { playDisconnectedSound } from "../../sounds.js";
-  import { updateUiPrefs } from "../../stores/ui-prefs.js";
   import { account, showPrompt } from "../../stores/account.js";
   import Icon from "../Icons.svelte";
   import { menu } from "../../actions/menu.js";
@@ -35,7 +34,9 @@
 
 <svelte:window onclick={() => (open = false)} />
 
-<div class="server-header">
+<!-- `data-account` so test-ui.mjs can see a signed-in account; the menu that
+     says so stays closed -->
+<div class="server-header" data-account={$account ? "" : undefined}>
   <button
     class="header-btn"
     onclick={(e) => {
@@ -107,16 +108,6 @@
           <span>Settings</span>
         </button>
       {/if}
-      <button
-        class="menu-item"
-        onclick={() => {
-          open = false;
-          updateUiPrefs((p) => (p.layout = "classic"));
-        }}
-      >
-        <Icon name="hamburger" size={16} />
-        <span>Switch to the classic layout</span>
-      </button>
       <div class="menu-sep"></div>
       <button class="menu-item danger" onclick={disconnect}>
         <Icon name="disconnect" size={16} />

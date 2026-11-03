@@ -1,4 +1,5 @@
 pub mod codec;
+pub mod compat;
 pub mod conv;
 pub mod error;
 #[cfg(any(test, fuzzing))]

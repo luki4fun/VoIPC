@@ -133,11 +133,6 @@ pub fn run() {
                 config::init_data_dir(data_dir);
             }
 
-            // Migrate legacy files from next-to-executable to ~/.config/VoIPC/
-            // (desktop only — no legacy paths on Android)
-            #[cfg(not(target_os = "android"))]
-            config::migrate_legacy_paths();
-
             // Load persistent config
             let mut cfg = config::load_config();
             // No archive keeps the keys to what the file cache holds
@@ -179,27 +174,8 @@ pub fn run() {
             {
                 let state = app.state::<AppState>();
 
-                // Apply to UserSettings
-                {
-                    let mut s = state.settings.blocking_write();
-                    s.input_device = cfg.input_device.clone();
-                    s.output_device = cfg.output_device.clone();
-                    s.volume = cfg.volume;
-                    s.ptt_key = cfg.ptt_key.clone();
-                    s.voice_mode = cfg.voice_mode.clone();
-                    s.vad_threshold_db = cfg.vad_threshold_db;
-                    s.noise_suppression = cfg.noise_suppression;
-                    s.muted = cfg.muted;
-                    s.deafened = cfg.deafened;
-                    s.spatial_audio = cfg.spatial_audio;
-                    s.screen_audio_spatial = cfg.screen_audio_spatial;
-                    s.mic_effect = cfg.mic_effect.clone();
-                    s.mic_muffle = cfg.mic_muffle;
-                    s.mic_reverb = cfg.mic_reverb;
-                    s.mic_water = cfg.mic_water;
-                    // ...and what every connection reads live
-                    state.seed_shared(&s);
-                }
+                // What every connection reads live
+                state.seed_shared(&cfg);
                 state.input_gain.store(
                     cfg.input_gain.clamp(0.0, 4.0).to_bits(),
                     std::sync::atomic::Ordering::Relaxed,
@@ -384,7 +360,6 @@ pub fn run() {
             account::qr_svg,
             account::safety_number,
             account::forget_relay_id,
-            account::account_prefs,
             account::account_set_prefs,
             account::account_enter,
             account::send_kept_dm,
@@ -473,7 +448,6 @@ pub fn run() {
             commands::stop_watching_screen_share,
             commands::start_screen_capture,
             commands::stop_screen_capture,
-            commands::set_keyframe_requested,
             commands::set_share_preview,
             commands::set_screen_share_codec,
             commands::toggle_screen_audio,

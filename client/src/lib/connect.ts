@@ -47,6 +47,7 @@ import {
   type ServerEntry,
 } from "./stores/servers.js";
 import {
+  autoConnect,
   lastAcceptSelfSigned,
   lastHost,
   lastPort,
@@ -344,12 +345,12 @@ export function reconnectAll(list: SavedServer[]): void {
  *
  * After a connect or a Disconnect the user chose, never when a connection
  * drops: a server that went away is still one they meant to be on. With
- * "remember connection details" off nothing about where they connect is kept,
- * this list included.
+ * "remember connection details" and auto-connect both off nothing about where
+ * they connect is kept, this list included.
  */
 export async function saveOpenServers(): Promise<void> {
   const saved = get(savedServers);
-  const servers: SavedServer[] = get(rememberConnection)
+  const servers: SavedServer[] = get(rememberConnection) || get(autoConnect)
     ? get(openServers).flatMap((id) => {
         const d = details.get(id);
         if (!d) return [];

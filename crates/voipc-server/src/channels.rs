@@ -249,7 +249,7 @@ pub(crate) fn validate_entries(entries: &[ChannelEntry]) -> anyhow::Result<()> {
         if !entry.text && name.to_lowercase() == "general" {
             bail!("channel entry {} uses reserved name 'General'", i);
         }
-        if name.chars().any(crate::tcp::bad_name_char) {
+        if name.chars().any(crate::session::bad_name_char) {
             bail!(
                 "channel {:?} contains control or invisible characters",
                 name

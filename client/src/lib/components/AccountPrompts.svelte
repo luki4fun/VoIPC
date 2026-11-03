@@ -21,6 +21,8 @@
   import { dmMessageTtl, managesChannel } from "../stores/channel-ui.js";
   import { userId } from "../stores/connection.js";
   import { addNotification } from "../stores/notifications.js";
+  import { newRecoveryKey } from "../relay-rules.js";
+  import { olderRelay } from "../stores/relay.js";
   import type { AccountInfo, RelayAccounts } from "../types.js";
 
   let code = $state("");
@@ -593,10 +595,12 @@
             <span>Password</span>
             <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); reset(); showPrompt({ kind: "password", server }); }}>Change</button>
           </div>
-          <div class="row">
-            <span>Recovery key</span>
-            <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); reset(); showPrompt({ kind: "recovery-new", server }); }}>New</button>
-          </div>
+          {#if newRecoveryKey(get(olderRelay.peek(p.server))?.protocol ?? null)}
+            <div class="row">
+              <span>Recovery key</span>
+              <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); reset(); showPrompt({ kind: "recovery-new", server }); }}>New</button>
+            </div>
+          {/if}
           {#if !$account.info.totp_enabled}
             <div class="row">
               <span>Two-factor codes protect the account on new devices.</span>

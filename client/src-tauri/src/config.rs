@@ -354,36 +354,6 @@ pub fn resolve_chat_history_path(config: &AppConfig) -> PathBuf {
     }
 }
 
-/// Migrate settings.json and chat_history.bin from the old location (next to executable)
-/// to the new XDG-compliant directory. Only runs once — skips if files already exist
-/// at the new location or if old files don't exist.
-pub fn migrate_legacy_paths() {
-    let Ok(exe) = std::env::current_exe() else {
-        return;
-    };
-    let Some(exe_dir) = exe.parent() else { return };
-
-    let new_dir = data_dir();
-    for filename in &["settings.json", "chat_history.bin"] {
-        let old = exe_dir.join(filename);
-        let new = new_dir.join(filename);
-        if old.exists() && !new.exists() {
-            match std::fs::rename(&old, &new) {
-                Ok(()) => tracing::info!("Migrated {filename} → {}", new.display()),
-                Err(_) => {
-                    // rename fails across filesystems, fall back to copy+delete
-                    if let Ok(data) = std::fs::read(&old) {
-                        if std::fs::write(&new, &data).is_ok() {
-                            let _ = std::fs::remove_file(&old);
-                            tracing::info!("Migrated {filename} → {}", new.display());
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 /// Load config from disk. Returns defaults on any error (missing file, parse
 /// error). A file that does not parse is kept aside first
 /// (`settings.json.unreadable-<unix>`): the next save would otherwise replace

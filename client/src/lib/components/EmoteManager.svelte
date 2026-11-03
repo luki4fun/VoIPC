@@ -36,12 +36,16 @@
   import { fold } from "../search-rules.js";
   import { toHex } from "../hex.js";
   import { formatSize } from "../file-rules.js";
+  import { packMoves } from "../relay-rules.js";
+  import { olderRelay } from "../stores/relay.js";
   import { saveFile } from "../files.js";
   import { storedZip } from "../zip.js";
   import Emote from "./chat/Emote.svelte";
   import Icon from "./Icons.svelte";
 
   const server = get(serverAddress);
+  // A 1.4 relay cannot move emotes between packs or kinds (relay-rules.ts)
+  const moves = packMoves(get(olderRelay.peek(server))?.protocol ?? null);
   const NAME = /^[a-z0-9_]{2,30}$/;
   const HIDDEN = /[\p{Cc}\u200B-\u200F\u061C\u202A-\u202E\u2060-\u2069\uFEFF]/u;
   const byteLength = (s: string) => new TextEncoder().encode(s).length;
@@ -596,8 +600,10 @@
     <div class="em-tools">
       <input class="em-input" type="search" placeholder="Search" aria-label="Search this server's emotes" bind:value={filter} />
       {#if pickedShown.length}
-        <input class="em-input em-move" placeholder="A pack (empty: none)" aria-label="Pack to move the picked ones to" bind:value={moveTo} />
-        <button class="btn btn-secondary" type="button" onclick={movePicked}>Move {pickedShown.length} to it</button>
+        {#if moves}
+          <input class="em-input em-move" placeholder="A pack (empty: none)" aria-label="Pack to move the picked ones to" bind:value={moveTo} />
+          <button class="btn btn-secondary" type="button" onclick={movePicked}>Move {pickedShown.length} to it</button>
+        {/if}
         <button class="btn btn-danger-outline" type="button" onclick={() => removeAll(pickedShown, pickedShown.length === 1 ? `:${pickedShown[0]}:` : `${pickedShown.length} emotes and stickers`)}>
           Remove {pickedShown.length}
         </button>
@@ -624,7 +630,7 @@
           {/if}
           <span class="em-count num">{s.list.length}</span>
           <span class="em-section-tools">
-            {#if s.pack}
+            {#if s.pack && moves}
               <button class="btn btn-ghost em-small" type="button" aria-label="Rename the pack {s.pack}" onclick={() => { renamingPack = s.key; newPack = s.pack; }}>Rename</button>
             {/if}
             <button class="btn btn-ghost em-small" type="button" aria-label="Export the {what} as a .zip" disabled={exporting !== null} onclick={() => exportPack(s.key, s.pack, wholePack(s))}
@@ -658,14 +664,16 @@
               {/if}
               {#if failed}<span class="em-bad" title="This device could not make it: {failed}">Not shown</span>{/if}
               <span class="em-meta">{switching.has(e.name) ? (e.sticker ? "Making it an emote…" : "Making it a sticker…") : ""}</span>
-              <button
-                class="icon-btn"
-                type="button"
-                title={e.sticker ? "Make it an emote" : "Make it a sticker"}
-                aria-label="{e.sticker ? 'Make it an emote' : 'Make it a sticker'}: :{e.name}:"
-                disabled={switching.has(e.name)}
-                onclick={() => switchKind(e)}><Icon name="switch-source" size={14} /></button
-              >
+              {#if moves}
+                <button
+                  class="icon-btn"
+                  type="button"
+                  title={e.sticker ? "Make it an emote" : "Make it a sticker"}
+                  aria-label="{e.sticker ? 'Make it an emote' : 'Make it a sticker'}: :{e.name}:"
+                  disabled={switching.has(e.name)}
+                  onclick={() => switchKind(e)}><Icon name="switch-source" size={14} /></button
+                >
+              {/if}
               <button class="icon-btn" type="button" title="Rename" aria-label="Rename :{e.name}:" onclick={() => { renaming = e.name; newName = e.name; }}><Icon name="pencil" size={14} /></button>
               <button class="icon-btn" type="button" title="Remove" aria-label="Remove :{e.name}:" onclick={() => removeAll([e.name], `:${e.name}:`)}><Icon name="trash" size={14} /></button>
             </li>

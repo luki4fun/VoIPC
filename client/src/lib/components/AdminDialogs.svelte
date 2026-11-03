@@ -2,8 +2,8 @@
   import { backdrop, dialog } from "../actions/dialog.js";
   // Admin token login, and the list of active bans.
   //
-  // Mounted once by App.svelte. Both layouts have a shield button somewhere —
-  // the classic status bar, the modern layout's voice panel — and both open these.
+  // Mounted once by App.svelte. Each layout has its way in (the modern one's
+  // server menu, for one), and all of them open these.
 
   import {
     adminToken,

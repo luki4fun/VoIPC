@@ -15,7 +15,7 @@
 //! so what is fetched says nothing about who uses which.
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -34,6 +34,7 @@ use voipc_protocol::types::{
 
 use crate::config::EmotesConfig;
 use crate::files::{Bucket, Prepared, Reply};
+use crate::session::send_msg;
 use crate::state::ServerState;
 
 /// How long an upload ticket lasts.
@@ -219,9 +220,14 @@ impl EmoteStore {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             let orphan = unhex::<32>(name).is_some_and(|h| !inner.files.contains_key(&h));
-            let temp = name
-                .strip_suffix(".tmp")
-                .is_some_and(|n| unhex::<32>(n).is_some() || n == MANIFEST);
+            let temp = name.strip_suffix(".tmp").is_some_and(|n| {
+                // fsutil::atomic_write's `<name>.<8 hex>.tmp`, or 1.5's `<name>.tmp`
+                let n = n
+                    .rsplit_once('.')
+                    .filter(|(_, r)| r.len() == 8 && r.bytes().all(|b| b.is_ascii_hexdigit()))
+                    .map_or(n, |(base, _)| base);
+                unhex::<32>(n).is_some() || n == MANIFEST
+            });
             if orphan || temp {
                 let _ = std::fs::remove_file(entry.path());
             }
@@ -484,8 +490,10 @@ impl EmoteStore {
     async fn write_file(&self, hash: [u8; 32], bytes: Bytes) {
         let _turn = self.writing.lock().await;
         let dir = self.dir.clone();
-        let written =
-            tokio::task::spawn_blocking(move || atomic_write(&dir, &hex(&hash), &bytes)).await;
+        let written = tokio::task::spawn_blocking(move || {
+            crate::fsutil::atomic_write(&dir.join(hex(&hash)), &bytes, false)
+        })
+        .await;
         if !matches!(written, Ok(Ok(()))) {
             warn!(?written, "emotes: could not write {}", self.dir.display());
         }
@@ -522,7 +530,11 @@ impl EmoteStore {
         };
         let dir = self.dir.clone();
         let written = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-            atomic_write(&dir, MANIFEST, &serde_json::to_vec_pretty(&manifest)?)?;
+            crate::fsutil::atomic_write(
+                &dir.join(MANIFEST),
+                &serde_json::to_vec_pretty(&manifest)?,
+                false,
+            )?;
             for hash in gone {
                 let _ = std::fs::remove_file(dir.join(hex(&hash)));
             }
@@ -561,32 +573,21 @@ impl EmoteStore {
     }
 }
 
-fn atomic_write(dir: &Path, name: &str, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write;
-    let tmp = dir.join(format!("{name}.tmp"));
-    let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    std::fs::rename(&tmp, dir.join(name))
-}
-
 // ── Control messages ──────────────────────────────────────────────────────
 
-async fn refuse(tx: &mpsc::Sender<Vec<u8>>, name: String, reason: String) {
-    if let Ok(data) = encode_server_msg(&ServerMessage::EmoteError { name, reason }) {
-        let _ = tx.send(data).await;
-    }
+fn refuse(tx: &mpsc::Sender<Vec<u8>>, name: String, reason: String) {
+    let _ = send_msg(tx, &ServerMessage::EmoteError { name, reason });
 }
 
 /// The store, for an admin; else why not, said to the asker.
-async fn for_admin(
+fn for_admin(
     state: &ServerState,
     session: SessionId,
     tx: &mpsc::Sender<Vec<u8>>,
     name: &str,
 ) -> Option<Arc<EmoteStore>> {
     let Some(store) = state.emotes.clone() else {
-        refuse(tx, name.into(), "this server keeps no emotes".into()).await;
+        refuse(tx, name.into(), "this server keeps no emotes".into());
         return None;
     };
     if !state.is_admin(session) {
@@ -594,8 +595,7 @@ async fn for_admin(
             tx,
             name.into(),
             "only an admin can change the server's emotes".into(),
-        )
-        .await;
+        );
         return None;
     }
     Some(store)
@@ -609,19 +609,16 @@ pub(crate) async fn handle_add(
     tx: &mpsc::Sender<Vec<u8>>,
 ) {
     let name = emote.name.clone();
-    let Some(store) = for_admin(state, session, tx, &name).await else {
+    let Some(store) = for_admin(state, session, tx, &name) else {
         return;
     };
     let hash = emote.hash;
     match store.add(session, emote, Instant::now()) {
         Ok(Added::Ticket(ticket)) => {
-            if let Ok(data) = encode_server_msg(&ServerMessage::EmoteTicket { hash, name, ticket })
-            {
-                let _ = tx.send(data).await;
-            }
+            let _ = send_msg(tx, &ServerMessage::EmoteTicket { hash, name, ticket });
         }
         Ok(Added::Listed) => store.changed(state),
-        Err(reason) => refuse(tx, name, reason).await,
+        Err(reason) => refuse(tx, name, reason),
     }
 }
 
@@ -632,11 +629,11 @@ pub(crate) async fn handle_remove(
     names: Vec<String>,
     tx: &mpsc::Sender<Vec<u8>>,
 ) {
-    let Some(store) = for_admin(state, session, tx, "").await else {
+    let Some(store) = for_admin(state, session, tx, "") else {
         return;
     };
     if names.len() > MAX_EMOTES {
-        return refuse(tx, String::new(), format!("at most {MAX_EMOTES} at once")).await;
+        return refuse(tx, String::new(), format!("at most {MAX_EMOTES} at once"));
     }
     let unknown = store.remove(&names);
     if unknown.len() < names.len() {
@@ -655,7 +652,7 @@ pub(crate) async fn handle_remove(
         } else {
             format!("not this server's: {list}")
         };
-        refuse(tx, first.clone(), reason).await;
+        refuse(tx, first.clone(), reason);
     }
 }
 
@@ -667,12 +664,12 @@ pub(crate) async fn handle_rename(
     to: String,
     tx: &mpsc::Sender<Vec<u8>>,
 ) {
-    let Some(store) = for_admin(state, session, tx, &from).await else {
+    let Some(store) = for_admin(state, session, tx, &from) else {
         return;
     };
     match store.rename(&from, &to) {
         Ok(()) => store.changed(state),
-        Err(reason) => refuse(tx, from, reason).await,
+        Err(reason) => refuse(tx, from, reason),
     }
 }
 
@@ -686,15 +683,15 @@ pub(crate) async fn handle_move(
     tx: &mpsc::Sender<Vec<u8>>,
 ) {
     let first = names.first().cloned().unwrap_or_default();
-    let Some(store) = for_admin(state, session, tx, &first).await else {
+    let Some(store) = for_admin(state, session, tx, &first) else {
         return;
     };
     if names.len() > MAX_EMOTES {
-        return refuse(tx, first, format!("at most {MAX_EMOTES} at once")).await;
+        return refuse(tx, first, format!("at most {MAX_EMOTES} at once"));
     }
     match store.moved(&names, pack.as_deref(), sticker) {
         Ok(()) => store.changed(state),
-        Err(reason) => refuse(tx, first, reason).await,
+        Err(reason) => refuse(tx, first, reason),
     }
 }
 
@@ -705,7 +702,7 @@ pub(crate) async fn handle_stickers(
     on: bool,
     tx: &mpsc::Sender<Vec<u8>>,
 ) {
-    let Some(store) = for_admin(state, session, tx, "").await else {
+    let Some(store) = for_admin(state, session, tx, "") else {
         return;
     };
     store.set_stickers(on);
@@ -850,6 +847,7 @@ pub(crate) async fn finish_put(state: &Arc<ServerState>, upload: Upload, body: B
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn store(dir: &Path) -> EmoteStore {
         EmoteStore::open(&EmotesConfig {

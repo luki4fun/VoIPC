@@ -11,10 +11,10 @@ members = [
 ]
 # The wasm crates are their own workspaces: they enable wasm-only features that
 # must never leak into the native build. fuzz/ runs on nightly.
-exclude = ["crates/voipc-web", "crates/voipc-opus-wasm", "fuzz"]
+exclude = ["crates/voipc-web", "crates/voipc-opus-wasm", "crates/voipc-media-wasm", "fuzz"]
 
 [workspace.package]
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 license = "MIT"
 # The toolchain CI tests with (rust-toolchain.toml)

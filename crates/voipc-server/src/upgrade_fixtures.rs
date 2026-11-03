@@ -2,7 +2,7 @@
 //! every preset's channels.json and server_settings.json, written by 0.12.0's
 //! own `channels init`, and its documented server.toml. The files in
 //! tests/fixtures/0.12.0/ were written once and are never regenerated (see the
-//! README there). The accounts database is checked in tcp.rs
+//! README there). The accounts database is checked in session_tests.rs
 //! (`a_0_12_accounts_database_opens_signs_in_and_keeps_its_messages`).
 
 use crate::channels::{load_and_prepare_channels, verify_password};

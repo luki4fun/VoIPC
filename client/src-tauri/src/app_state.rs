@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use ring::aead::LessSafeKey;
 use tokio::sync::{mpsc, RwLock};
@@ -76,7 +76,6 @@ pub struct AppState {
     /// Sign-ins waiting for the person to type a code, by server id.
     pub totp_answers:
         std::sync::Mutex<HashMap<String, tokio::sync::oneshot::Sender<crate::account::TotpAnswer>>>,
-    pub settings: RwLock<UserSettings>,
     pub chat: RwLock<ChatState>,
     // ── Settings every connection shares ──
     // One user, one microphone, one pair of ears: each connection holds a
@@ -202,7 +201,6 @@ impl AppState {
             voice_server: std::sync::Mutex::new(None),
             connect_locks: std::sync::Mutex::new(HashMap::new()),
             totp_answers: std::sync::Mutex::new(HashMap::new()),
-            settings: RwLock::new(UserSettings::default()),
             chat: RwLock::new(ChatState::default()),
             is_muted: Arc::new(AtomicBool::new(false)),
             is_deafened: Arc::new(AtomicBool::new(false)),
@@ -229,14 +227,14 @@ impl AppState {
             sdk_last_hello: std::sync::Mutex::new(None),
             sdk_listen_error: Arc::new(std::sync::Mutex::new(None)),
         };
-        state.seed_shared(&UserSettings::default());
+        state.seed_shared(&crate::config::AppConfig::default());
         state
     }
 
     /// Point the settings every connection shares at `s`: at startup from the
     /// config, and again when the user resets it. They used to be seeded per
     /// connect; nothing re-reads them there any more.
-    pub fn seed_shared(&self, s: &UserSettings) {
+    pub fn seed_shared(&self, s: &crate::config::AppConfig) {
         use std::sync::atomic::Ordering::Relaxed;
         self.is_muted.store(s.muted, Relaxed);
         self.is_deafened.store(s.deafened, Relaxed);
@@ -257,7 +255,7 @@ impl AppState {
     pub fn voice_id(&self) -> Option<String> {
         self.voice_server
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .clone()
     }
 
@@ -271,7 +269,7 @@ impl AppState {
     /// half-broken, so recovering is the right answer, and it is the one every
     /// other mutex in this crate already gives.
     pub fn config(&self) -> std::sync::MutexGuard<'_, crate::config::AppConfig> {
-        self.config.lock().unwrap_or_else(|p| p.into_inner())
+        self.config.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -360,6 +358,49 @@ pub struct SignalState {
     pub channels: ChannelKeying,
 }
 
+/// `plaintext` for `to` over our pairwise session, under one lock: the
+/// ciphertext and its Signal message type. libsignal's stores are async, so
+/// this blocks the worker thread it runs on.
+pub fn encrypt_pairwise(
+    signal: &std::sync::Mutex<SignalState>,
+    to: UserId,
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, u8), String> {
+    tokio::task::block_in_place(|| {
+        let mut sig = signal.lock().map_err(|e| e.to_string())?;
+        let stores = sig
+            .stores
+            .as_mut()
+            .ok_or("E2E encryption not initialized")?;
+        tokio::runtime::Handle::current()
+            .block_on(voipc_crypto::session::encrypt_message(
+                stores, to, plaintext,
+            ))
+            .map_err(|e| e.to_string())
+    })
+}
+
+/// `plaintext` for `channel_id` under our sender key, the same way.
+pub fn encrypt_group(
+    signal: &std::sync::Mutex<SignalState>,
+    own: UserId,
+    channel_id: ChannelId,
+    plaintext: &[u8],
+) -> Result<Vec<u8>, String> {
+    tokio::task::block_in_place(|| {
+        let mut sig = signal.lock().map_err(|e| e.to_string())?;
+        let stores = sig
+            .stores
+            .as_mut()
+            .ok_or("E2E encryption not initialized")?;
+        tokio::runtime::Handle::current()
+            .block_on(voipc_crypto::group::encrypt_group_message(
+                stores, own, channel_id, plaintext,
+            ))
+            .map_err(|e| e.to_string())
+    })
+}
+
 /// Encrypted chat history state.
 pub struct ChatState {
     /// In-memory chat data (authoritative during session).
@@ -412,7 +453,7 @@ pub struct ActiveConnection {
     /// `take_voice_ask`).
     pub voice_asked_at: Arc<AtomicU64>,
     /// Sender for control messages (framed, onto the control stream).
-    pub tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
+    pub tcp_tx: crate::network::ControlTx,
     /// The relay account this connection signed in with; `None` for a guest.
     pub account: Option<Arc<crate::account::AccountLink>>,
     /// This connection's file transfers (`files.rs`).
@@ -910,50 +951,6 @@ pub fn merge_source(
         // exist for a game, which builds its `Source` from scratch each tick.
         pan: 0.0,
         delay_frames: 0,
-    }
-}
-
-/// User settings (in-memory, initialized from config on startup).
-pub struct UserSettings {
-    pub input_device: Option<String>,
-    pub output_device: Option<String>,
-    pub volume: f32,
-    pub ptt_key: String,
-    pub voice_mode: String,
-    pub vad_threshold_db: f32,
-    pub noise_suppression: bool,
-    pub muted: bool,
-    pub deafened: bool,
-    /// Render proximity channels positionally (see `AppConfig::spatial_audio`).
-    pub spatial_audio: bool,
-    /// Place a screen share's audio at its sharer's position.
-    pub screen_audio_spatial: bool,
-    /// Our own microphone's lane: effect id plus three 0–10 levels.
-    pub mic_effect: String,
-    pub mic_muffle: u8,
-    pub mic_reverb: u8,
-    pub mic_water: u8,
-}
-
-impl Default for UserSettings {
-    fn default() -> Self {
-        Self {
-            input_device: None,
-            output_device: None,
-            volume: 1.0,
-            ptt_key: "Space".into(),
-            voice_mode: "ptt".into(),
-            vad_threshold_db: -40.0,
-            noise_suppression: true,
-            muted: false,
-            deafened: false,
-            spatial_audio: true,
-            screen_audio_spatial: true,
-            mic_effect: "none".into(),
-            mic_muffle: 0,
-            mic_reverb: 0,
-            mic_water: 0,
-        }
     }
 }
 

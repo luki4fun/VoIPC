@@ -16,6 +16,8 @@ updates:
   - { package-ecosystem: cargo, directory: /, schedule: { interval: weekly }, open-pull-requests-limit: 0 }
   - { package-ecosystem: cargo, directory: /crates/voipc-web, schedule: { interval: weekly }, open-pull-requests-limit: 0 }
   - { package-ecosystem: cargo, directory: /crates/voipc-opus-wasm, schedule: { interval: weekly }, open-pull-requests-limit: 0 }
+  - { package-ecosystem: cargo, directory: /crates/voipc-media-wasm, schedule: { interval: weekly }, open-pull-requests-limit: 0 }
+  - { package-ecosystem: cargo, directory: /fuzz, schedule: { interval: weekly }, open-pull-requests-limit: 0 }
   - { package-ecosystem: npm, directory: /client, schedule: { interval: weekly }, open-pull-requests-limit: 0 }
   - { package-ecosystem: gradle, directory: /client/src-tauri/gen/android, schedule: { interval: weekly }, open-pull-requests-limit: 0 }
   - { package-ecosystem: docker, directory: /, schedule: { interval: weekly } }

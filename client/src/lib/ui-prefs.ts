@@ -11,7 +11,7 @@
 
 import { DEFAULT_PALETTE_ID, migratePaletteId, TOKENS, type TokenName } from "./theme.ts";
 
-export type LayoutId = "classic" | "modern" | "stage";
+export type LayoutId = "modern" | "stage";
 export type Density = "cosy" | "compact";
 
 /**
@@ -68,7 +68,7 @@ export interface UiPrefs {
   zoom: number;
   /** Remembered per layout: the two shells want very different widths. */
   panels: Record<LayoutId, PanelPrefs>;
-  /** Per layout too: the classic one has always shown it, below. */
+  /** Per layout too. */
   stream_chat: Record<LayoutId, StreamChatPrefs>;
   /** The floating preview of your own share. Off once you hide it. */
   share_preview: boolean;
@@ -145,25 +145,16 @@ export const STREAM_CHAT_HEIGHT_MIN = 120;
 export const STREAM_CHAT_HEIGHT_MAX = 720;
 
 export function defaultPanels(layout: LayoutId): PanelPrefs {
-  // The classic defaults are the widths that were hard-coded in ChannelList
-  // and UserList before they became variables, so nothing moves for anyone who
-  // never touches this. The modern sidebars are wider because their rows carry
-  // nested members and avatars.
   // Stage's second panel is the chat drawer rather than a member list: the
   // people are the centre of that layout. Closed until asked for, wide enough
   // to read in when it is.
   if (layout === "stage") return { sidebar: 240, members: 360, sidebar_open: true, members_open: false };
-  return layout === "modern"
-    ? { sidebar: 240, members: 240, sidebar_open: true, members_open: true }
-    : { sidebar: 220, members: 180, sidebar_open: true, members_open: true };
+  return { sidebar: 240, members: 240, sidebar_open: true, members_open: true };
 }
 
-export function defaultStreamChat(layout: LayoutId): StreamChatPrefs {
-  // Modern opens a share full-window and the chat is asked for with a toggle;
-  // classic has shown it under the viewer, 280 px tall, since before either.
-  return layout === "modern" || layout === "stage"
-    ? { open: false, split: "side", width: 360, height: 280 }
-    : { open: true, split: "below", width: 360, height: 280 };
+export function defaultStreamChat(_layout: LayoutId): StreamChatPrefs {
+  // A share opens full-window, and the chat is asked for with a toggle
+  return { open: false, split: "side", width: 360, height: 280 };
 }
 
 export function defaultUiPrefs(): UiPrefs {
@@ -177,12 +168,10 @@ export function defaultUiPrefs(): UiPrefs {
     chat_font_size: 13,
     zoom: 1,
     panels: {
-      classic: defaultPanels("classic"),
       modern: defaultPanels("modern"),
       stage: defaultPanels("stage"),
     },
     stream_chat: {
-      classic: defaultStreamChat("classic"),
       modern: defaultStreamChat("modern"),
       stage: defaultStreamChat("stage"),
     },
@@ -257,20 +246,13 @@ function bool(value: unknown, fallback: boolean): boolean {
 }
 
 /**
- * A stored layout id, including the names these layouts used to have.
- *
- * The modern one was `discord` until 0.9.0, and a rename must not cost anybody
- * the layout they chose — so the old spelling still reads, and only the new one
- * is ever written. `legacy` is read for the same reason: it is what this branch
- * briefly called the classic layout before the name went back. Anything else
- * falls back rather than throwing: the file is hand-editable, and in the
- * browser it is localStorage.
+ * A stored layout id. Everything but `stage` is the modern one: `modern`
+ * itself, `classic` (and `legacy`, its old name), a layout that is gone, and
+ * anything unknown — the file is hand-editable, and in the browser it is
+ * localStorage.
  */
-function layoutId(raw: unknown, fallback: LayoutId): LayoutId {
-  if (raw === "modern" || raw === "discord") return "modern";
-  if (raw === "classic" || raw === "legacy") return "classic";
-  if (raw === "stage") return "stage";
-  return fallback;
+function layoutId(raw: unknown): LayoutId {
+  return raw === "stage" ? "stage" : "modern";
 }
 
 function panels(raw: unknown, layout: LayoutId): PanelPrefs {
@@ -334,7 +316,7 @@ export function sanitizeUiPrefs(raw: unknown): UiPrefs {
       : {};
 
   return {
-    layout: layoutId(r.layout, d.layout),
+    layout: layoutId(r.layout),
     layout_asked_version: clamp(r.layout_asked_version, 0, 1e6, 0),
     // A palette id from a newer build resolves to the default at render time
     // (paletteById), but keep the id: downgrading and upgrading again should
@@ -351,16 +333,13 @@ export function sanitizeUiPrefs(raw: unknown): UiPrefs {
     density: r.density === "compact" ? "compact" : "cosy",
     chat_font_size: clamp(r.chat_font_size, CHAT_FONT_MIN, CHAT_FONT_MAX, d.chat_font_size),
     zoom: clamp(r.zoom, ZOOM_MIN, ZOOM_MAX, d.zoom),
-    // `p.discord` is what a pre-0.9.0 file calls the modern one, and `p.legacy`
-    // what this branch called the classic one for an afternoon; a sidebar
-    // somebody dragged keeps its width across both renames.
+    // `p.discord` is what a pre-0.9.0 file calls the modern one; a sidebar
+    // somebody dragged keeps its width across the rename.
     panels: {
-      classic: panels(p.classic ?? p.legacy, "classic"),
       modern: panels(p.modern ?? p.discord, "modern"),
       stage: panels(p.stage, "stage"),
     },
     stream_chat: {
-      classic: streamChat(sc.classic, "classic"),
       modern: streamChat(sc.modern, "modern"),
       stage: streamChat(sc.stage, "stage"),
     },

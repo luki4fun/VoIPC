@@ -5,7 +5,7 @@
 // `UserJoined` broadcast reaches every session, because it doubles as the
 // user-count update, but it carries an empty username for anyone outside the
 // channel it names. That blanking is deliberate — see `broadcast_user_joined`
-// in crates/voipc-server/src/tcp.rs — so the names have to be *asked* for.
+// in crates/voipc-server/src/session.rs — so the names have to be *asked* for.
 //
 // `RequestChannelUsers` is that question, and it is the one the server already
 // answers carefully: `is_channel_public_or_member` refuses a channel that hides
