@@ -1,6 +1,7 @@
-//! The wire format, pinned. Client and relay must speak the same
-//! `PROTOCOL_VERSION` (1.0's rule), so any change to what goes over the wire
-//! has to bump it. This test is what makes that a rule instead of a hope:
+//! The wire format, pinned. A relay admits only its own `PROTOCOL_VERSION`
+//! (1.0's rule), so any change to what goes over the wire has to bump it, and
+//! `compat.rs` keeps the older shapes the apps still speak (1.6). This test is
+//! what makes that a rule instead of a hope:
 //!
 //! - the traced format of every message and every type inside one is kept per
 //!   protocol version in `golden/v<N>.json`. A change with the same version

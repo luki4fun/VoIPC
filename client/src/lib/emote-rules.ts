@@ -79,6 +79,12 @@ export function tokenize(text: string, emotes: readonly Emote[]): string {
     .join("");
 }
 
+/** Tokens as a relay's readers read them: a 1.4 app knows only 20 hex
+ *  digits (relay-rules.ts `emoteTokenHex`). */
+export function tokensFor(text: string, hex: number): string {
+  return hex >= TOKEN_HASH ? text : text.replace(EMOTE_TOKEN, (_, name: string, hash: string) => `<:${name}:${hash.slice(0, hex)}>`);
+}
+
 /** The same tokens, as one capture each, for `split`. */
 const EMOTE_TOKEN_SPLIT = /(<:[a-z0-9_]{2,30}:(?:[0-9a-f]{32}|[0-9a-f]{20})>)/;
 

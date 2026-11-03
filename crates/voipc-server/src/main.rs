@@ -26,6 +26,7 @@ mod session;
 mod settings;
 mod state;
 mod tunnel;
+mod update;
 #[cfg(test)]
 mod upgrade_fixtures;
 mod web;
@@ -35,7 +36,11 @@ use state::{RateLimiter, ServerState};
 use voipc_protocol::messages::ServerMessage;
 
 #[derive(Parser)]
-#[command(name = "voipc-server", about = "VoIPC voice communication server")]
+#[command(
+    name = "voipc-server",
+    version,
+    about = "VoIPC voice communication server"
+)]
 struct Args {
     /// Path to configuration file (TOML)
     #[arg(short, long)]
@@ -733,29 +738,13 @@ async fn run_command(config: &ServerConfig, command: Command) -> Result<()> {
         Command::Channels(_) | Command::Cert(_) | Command::Health | Command::Ban(_) => {
             unreachable!("handled before the database is opened")
         }
-        Command::Db(DbCommand::Backup { path }) => match store {
-            l4f_accounts::store::Store::Lite(b) => {
-                // Made empty and private first: SQLite copies into an empty file
-                fsutil::create_private(std::path::Path::new(&path), &[])
-                    .with_context(|| format!("creating {path}"))?;
-                sqlx::query(sqlx::AssertSqlSafe(format!(
-                    "VACUUM INTO '{}'",
-                    path.replace('\'', "''")
-                )))
-                .execute(&b.0)
-                .await
-                .with_context(|| format!("backing up to {path}"))?;
-                fsutil::owner_only(std::path::Path::new(&path))
-                    .with_context(|| format!("making {path} readable by this user only"))?;
-                println!(
-                    "copied to {path}; keep {} with it",
-                    config.accounts.key_file
-                );
-            }
-            l4f_accounts::store::Store::Pg(_) => {
-                anyhow::bail!("this is Postgres: back it up with pg_dump")
-            }
-        },
+        Command::Db(DbCommand::Backup { path }) => {
+            accounts::sqlite_backup(store, std::path::Path::new(&path)).await?;
+            println!(
+                "copied to {path}; keep {} with it",
+                config.accounts.key_file
+            );
+        }
     }
     Ok(())
 }
@@ -781,6 +770,11 @@ async fn main() -> Result<()> {
     // the tool that writes channels.json.
     if let Some(Command::Channels(command)) = args.command {
         return presets::run(command, args.channels.as_deref(), args.settings.as_deref());
+    }
+    // The first start after a self-update, or back from one that never got
+    // ready: before the config, which a broken binary may fail to read
+    if args.command.is_none() {
+        update::after_restart();
     }
 
     // Load config
@@ -884,7 +878,14 @@ async fn main() -> Result<()> {
         Vec::new()
     };
 
-    info!("VoIPC Server starting");
+    // Self-update needs to replace this binary: refused now if it cannot
+    let update_paths = if config.update.enabled {
+        Some(update::Paths::writable()?)
+    } else {
+        None
+    };
+
+    info!("VoIPC Server {} starting", env!("CARGO_PKG_VERSION"));
     info!(
         host = %config.host,
         tcp_port = config.tcp_port,
@@ -1103,6 +1104,20 @@ async fn main() -> Result<()> {
 
     // TCP accept loop with connection limits
     info!("server ready, accepting connections");
+    update::ready();
+    // A newer release, staged and in place: the version to restart into
+    let (update_tx, mut update_rx) = tokio::sync::mpsc::channel::<String>(1);
+    if let Some(paths) = &update_paths {
+        update::spawn(
+            config.update.clone(),
+            paths.clone(),
+            state.clone(),
+            update_tx,
+        );
+    } else {
+        drop(update_tx);
+    }
+    let mut updating_to = None;
 
     // SIGINT (Ctrl+C) or SIGTERM (`docker stop`, systemd): either one tells
     // the clients the server is going down instead of being killed mid-call
@@ -1130,6 +1145,10 @@ async fn main() -> Result<()> {
             result = tcp_listener.accept() => result,
             _ = &mut shutdown => {
                 info!("shutdown signal received, stopping accept loop");
+                break;
+            }
+            Some(version) = update_rx.recv() => {
+                updating_to = Some(version);
                 break;
             }
         };
@@ -1211,7 +1230,10 @@ async fn main() -> Result<()> {
     // Graceful shutdown: notify all connected clients
     info!("broadcasting shutdown to all connected clients");
     let shutdown_msg = ServerMessage::ServerShutdown {
-        reason: "server shutting down".into(),
+        reason: match &updating_to {
+            Some(v) => format!("updating to VoIPC {v}"),
+            None => "server shutting down".into(),
+        },
     };
     if let Ok(data) = voipc_protocol::codec::encode_server_msg(&shutdown_msg) {
         state.broadcast_raw_to_all(&data).await;
@@ -1220,6 +1242,14 @@ async fn main() -> Result<()> {
     // The emote list's last changes, written now rather than a moment later
     if let Some(store) = &state.emotes {
         store.flush().await;
+    }
+    if let (Some(version), Some(paths)) = (updating_to, &update_paths) {
+        // Its locks go with the pool, not with the exec
+        if let Some(relay) = &state.accounts {
+            relay.store().close().await;
+        }
+        info!(%version, "restarting into the update");
+        update::restart(paths, &version);
     }
     info!("server shut down");
     Ok(())

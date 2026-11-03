@@ -24,9 +24,11 @@
 
 No accounts required. No telemetry. No compromises.
 
-> **Updating? Update the server first, then the apps.** An app connects only to a server that
-> speaks its protocol version ([docs/COMPATIBILITY.md §1](docs/COMPATIBILITY.md#1-wire-protocol-client--relay)).
-> Running a server: [docs/OPERATING.md §8](docs/OPERATING.md#8-upgrading).
+> **Updating? The apps can go first.** Since 1.6 an app still talks to servers up to three
+> protocol versions older, with a banner saying what is off there. A server admits only apps
+> of its own protocol ([docs/COMPATIBILITY.md §1](docs/COMPATIBILITY.md#1-wire-protocol-client--relay)).
+> Running a server: [docs/OPERATING.md §8](docs/OPERATING.md#8-upgrading), and §14 for one that
+> updates itself.
 
 <p align="center">
   <img src="website/screenshots/modern.png" alt="VoIPC in the Modern layout, VoIPC night palette: server rail, channels with the people in each of them, an encrypted conversation, and the member list" width="800">
@@ -321,7 +323,7 @@ Client-side data at rest:
 | Max voice packet | 512 bytes |
 | Max video packet | 1,280 bytes |
 | Max control message | 64 KiB |
-| Protocol version | client and relay must match; which release speaks which: [docs/COMPATIBILITY.md §1](docs/COMPATIBILITY.md#1-wire-protocol-client--relay) |
+| Protocol version | a relay admits its own; an app also talks to relays up to three older; which release speaks which: [docs/COMPATIBILITY.md §1](docs/COMPATIBILITY.md#1-wire-protocol-client--relay) |
 | Default port | 9987 — UDP for QUIC (all clients), TCP for the browser page, file transfers and the TCP fallback |
 
 ### Project Structure

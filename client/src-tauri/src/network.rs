@@ -18,10 +18,11 @@ use wtransport::{Connection, SendStream};
 use crate::transport::{Conn, DatagramIn, VideoIn};
 
 use voipc_crypto::media_keys::{MediaKey, MediaKeyRing};
-use voipc_protocol::codec::{
-    decode_server_msg, encode_client_msg, try_decode_frame, APP_VERSION, PROTOCOL_VERSION,
+use voipc_protocol::codec::{encode_client_msg, try_decode_frame, APP_VERSION, PROTOCOL_VERSION};
+use voipc_protocol::compat::{
+    decode_server_msg_from, encode_client_msg_for, OLDEST_RELAY_PROTOCOL,
 };
-use voipc_protocol::messages::{AuthStep, ClientMessage, ServerMessage};
+use voipc_protocol::messages::{AuthStep, ClientMessage, ServerMessage, REFUSED_VERSION};
 use voipc_protocol::types::*;
 use voipc_protocol::video::{
     FrameAssembler, FrameGrouper, ScreenShareAudioPacket, VideoPacket, SCREEN_AUDIO_HEADER_SIZE,
@@ -91,36 +92,50 @@ pub async fn connect_to_server(
 
     let (host, port) = parse_address(&address)?;
 
-    // QUIC and its control stream, or the TCP fallback when UDP does not get
-    // through (every phase bounded, see transport.rs)
-    let (
-        crate::transport::Link {
-            mut conn,
-            mut control_send,
-            mut control_recv,
-        },
-        first_pin,
-    ) = crate::transport::connect(&host, port, accept_invalid_certs).await?;
-    // A self-signed server met for the first time: what was pinned, for the
-    // person to compare with the operator's `voipc-server cert fingerprint`
-    if let Some(fingerprint) = first_pin {
-        emit_server(
-            &app_handle,
-            &address,
-            "tofu-pinned",
-            serde_json::json!({ "fingerprint": fingerprint }),
-        );
+    // A relay of an older protocol refuses the first try and names its own;
+    // the second try speaks that one (`voipc_protocol::compat`, 1.6). The
+    // account's secrets serve both tries, and are wiped however this ends.
+    struct Wipe(Option<crate::account::AccountArgs>);
+    impl Drop for Wipe {
+        fn drop(&mut self) {
+            if let Some(args) = self.0.take() {
+                args.wipe();
+            }
+        }
     }
+    let secrets = Wipe(account);
+    let mut proto = PROTOCOL_VERSION;
+    let mut relay_version = None;
+    let (mut conn, control_send, control_recv, buf, session) = loop {
+        // QUIC and its control stream, or the TCP fallback when UDP does not
+        // get through (every phase bounded, see transport.rs)
+        let (
+            crate::transport::Link {
+                conn,
+                mut control_send,
+                mut control_recv,
+            },
+            first_pin,
+        ) = crate::transport::connect(&host, port, accept_invalid_certs).await?;
+        // A self-signed server met for the first time: what was pinned, for the
+        // person to compare with the operator's `voipc-server cert fingerprint`
+        if let Some(fingerprint) = first_pin {
+            emit_server(
+                &app_handle,
+                &address,
+                "tofu-pinned",
+                serde_json::json!({ "fingerprint": fingerprint }),
+            );
+        }
 
-    // Whatever arrives after the sign-in in the same read goes on to the
-    // reader with the rest.
-    let mut buf = BytesMut::with_capacity(4096);
-    // Guests get a fresh identity per connection (ephemeral by design); an
-    // account's comes out of its vault during the sign-in, and its stores are
-    // made then (`account::sign_in` calls `init_signal` itself).
-    let (user_id, session_id, account, file_limits, emote_access) = match account {
-        Some(args) => {
-            let (user_id, session_id, link, files, emotes) = crate::account::sign_in(
+        // Whatever arrives after the sign-in in the same read goes on to the
+        // reader with the rest.
+        let mut buf = BytesMut::with_capacity(4096);
+        // Guests get a fresh identity per connection (ephemeral by design); an
+        // account's comes out of its vault during the sign-in, and its stores
+        // are made then (`account::sign_in` calls `init_signal` itself).
+        let attempt = match secrets.0.clone() {
+            Some(args) => crate::account::sign_in(
                 state,
                 &app_handle,
                 &address,
@@ -130,81 +145,36 @@ pub async fn connect_to_server(
                 &mut control_send,
                 &mut control_recv,
                 &mut buf,
+                proto,
             )
-            .await?;
-            (user_id, session_id, Some(link), files, emotes)
-        }
-        None => {
-            let (identity_key, prekey_bundle) = {
-                let bundle = init_signal(&signal, &voipc_crypto::generate_identity_key_pair())?;
-                (Some(bundle.identity_key.clone()), Some(bundle))
-            };
-            let auth_msg = ClientMessage::Authenticate {
-                username: username.clone(),
-                protocol_version: PROTOCOL_VERSION,
-                app_version: APP_VERSION.to_string(),
-                identity_key,
-                prekey_bundle,
-                account: None,
-            };
-            let data = encode_client_msg(&auth_msg)
-                .map_err(|e| format!("Failed to encode auth: {}", e))?;
-            control_send
-                .write_all(&data)
-                .await
-                .map_err(|e| format!("Failed to send auth: {}", e))?;
-
-            // Read until we get the Authenticated or AuthError response
-            let (user_id, session_id, files, emotes) = loop {
-                let n = tokio::time::timeout(CONNECT_TIMEOUT, control_recv.read_buf(&mut buf))
-                    .await
-                    .map_err(|_| "Timed out waiting for the authentication response".to_string())?
-                    .map_err(|e| format!("Failed to read auth response: {}", e))?;
-
-                if n == 0 {
-                    return Err("Server closed connection during authentication".into());
-                }
-
-                if let Some(payload) =
-                    try_decode_frame(&mut buf).map_err(|e| format!("Frame decode error: {}", e))?
-                {
-                    let msg = decode_server_msg(&payload)
-                        .map_err(|e| format!("Failed to decode response: {}", e))?;
-
-                    match msg {
-                        ServerMessage::Authenticated {
-                            user_id,
-                            session_id,
-                            accounts,
-                            files,
-                            emotes,
-                            ..
-                        } => {
-                            // A guest on a relay with accounts: the UI can offer one.
-                            if let Some(accounts) = accounts {
-                                emit_server(&app_handle, &address, "relay-accounts", accounts);
-                            }
-                            break (user_id, session_id, files, emotes);
-                        }
-                        ServerMessage::AuthError { reason } => {
-                            return Err(format!("Authentication failed: {}", reason));
-                        }
-                        ServerMessage::Refused { ref text, .. } => {
-                            note_refusal(&app_handle, &address, &msg);
-                            return Err(text.clone());
-                        }
-                        ServerMessage::AuthStep(AuthStep::AccountRequired { .. }) => {
-                            return Err(crate::account::ACCOUNT_REQUIRED.into());
-                        }
-                        other => {
-                            warn!("unexpected message during auth: {:?}", other);
-                        }
-                    }
-                }
-            };
-            (user_id, session_id, None, files, emotes)
+            .await
+            .map(|(user_id, session_id, link, files, emotes)| {
+                (user_id, session_id, Some(link), files, emotes)
+            }),
+            None => guest_sign_in(
+                &app_handle,
+                &address,
+                &username,
+                &signal,
+                &mut control_send,
+                &mut control_recv,
+                &mut buf,
+                proto,
+            )
+            .await
+            .map(|(user_id, session_id, files, emotes)| (user_id, session_id, None, files, emotes)),
+        };
+        match attempt {
+            Ok(session) => break (conn, control_send, control_recv, buf, session),
+            Err(Refusal::Older { protocol, version }) => {
+                info!(server = %address, protocol, %version, "an older relay: connecting again at its protocol");
+                proto = protocol;
+                relay_version = Some(version);
+            }
+            Err(Refusal::Failed(e)) => return Err(e),
         }
     };
+    let (user_id, session_id, account, file_limits, emote_access) = session;
 
     info!(user_id, session_id, "authenticated with server");
     // Whether this relay keeps files, and how large: the composer's to know
@@ -220,6 +190,14 @@ pub async fn connect_to_server(
                 "max_total_bytes": a.max_total_bytes, "max_items": a.max_items,
             })
         }),
+    );
+    // The relay's protocol, and its version when it is older than ours: the
+    // banner, and what the app holds back there (relay-rules.ts)
+    emit_server(
+        &app_handle,
+        &address,
+        "relay-version",
+        serde_json::json!({ "protocol": proto, "version": relay_version }),
     );
 
     // The Signal state is this connection's own from birth, so all it needs
@@ -259,6 +237,7 @@ pub async fn connect_to_server(
     // drops the keys arriving for us. What bounds it is the other end: every
     // message in here answers something the server sent.
     let (tcp_tx, tcp_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let tcp_tx = ControlTx::new(tcp_tx, proto);
     // Voice datagram channel
     let (voice_tx, voice_rx) = mpsc::channel::<Vec<u8>>(256);
     // Video channel (separate from voice to avoid blocking).
@@ -832,25 +811,175 @@ fn voice_ask_fresh(asked_at: u64, now: u64) -> bool {
 }
 
 /// Send a client message over the control stream.
-/// `send_tcp_message` for a caller that is not async; a failure is a closed
-/// connection, which its reader reports.
-pub fn send_tcp_message_sync(tcp_tx: &mpsc::UnboundedSender<Vec<u8>>, msg: &ClientMessage) {
-    if let Ok(data) = encode_client_msg(msg) {
-        let _ = tcp_tx.send(data);
+/// Why a connect attempt ended without a session: a relay of an older
+/// protocol that named the one to speak instead (1.6), or anything else.
+pub(crate) enum Refusal {
+    Older { protocol: u32, version: String },
+    Failed(String),
+}
+
+impl From<String> for Refusal {
+    fn from(e: String) -> Self {
+        Refusal::Failed(e)
     }
 }
 
-pub async fn send_tcp_message(
-    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
-    msg: &ClientMessage,
-) -> Result<(), String> {
-    let data = encode_client_msg(msg).map_err(|e| format!("Failed to encode message: {}", e))?;
+impl From<&str> for Refusal {
+    fn from(e: &str) -> Self {
+        Refusal::Failed(e.into())
+    }
+}
+
+/// A refusal on the first try (at our own protocol) by a relay whose
+/// protocol this app still speaks.
+pub(crate) fn older_relay(msg: &ServerMessage, proto: u32) -> Option<Refusal> {
+    match msg {
+        ServerMessage::Refused {
+            code: REFUSED_VERSION,
+            server_protocol,
+            server_version,
+            ..
+        } if proto == PROTOCOL_VERSION
+            && (OLDEST_RELAY_PROTOCOL..PROTOCOL_VERSION).contains(server_protocol) =>
+        {
+            Some(Refusal::Older {
+                protocol: *server_protocol,
+                version: server_version.clone(),
+            })
+        }
+        _ => None,
+    }
+}
+
+/// A guest's `Authenticate`, and the relay's answer.
+#[allow(clippy::too_many_arguments)]
+async fn guest_sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
+    app_handle: &tauri::AppHandle,
+    address: &str,
+    username: &str,
+    signal: &Arc<std::sync::Mutex<SignalState>>,
+    control_send: &mut S,
+    control_recv: &mut R,
+    buf: &mut BytesMut,
+    proto: u32,
+) -> Result<(u32, u32, Option<FileLimits>, Option<EmoteAccess>), Refusal> {
+    let (identity_key, prekey_bundle) = {
+        let bundle = init_signal(signal, &voipc_crypto::generate_identity_key_pair())?;
+        (Some(bundle.identity_key.clone()), Some(bundle))
+    };
+    let auth_msg = ClientMessage::Authenticate {
+        username: username.to_string(),
+        protocol_version: proto,
+        app_version: APP_VERSION.to_string(),
+        identity_key,
+        prekey_bundle,
+        account: None,
+    };
+    // Authenticate has one shape at every protocol (COMPATIBILITY.md §1)
+    let data = encode_client_msg(&auth_msg).map_err(|e| format!("Failed to encode auth: {}", e))?;
+    control_send
+        .write_all(&data)
+        .await
+        .map_err(|e| format!("Failed to send auth: {}", e))?;
+
+    // Read until we get the Authenticated or AuthError response
+    loop {
+        let n = tokio::time::timeout(CONNECT_TIMEOUT, control_recv.read_buf(buf))
+            .await
+            .map_err(|_| "Timed out waiting for the authentication response".to_string())?
+            .map_err(|e| format!("Failed to read auth response: {}", e))?;
+
+        if n == 0 {
+            return Err("Server closed connection during authentication".into());
+        }
+
+        // Every frame that has arrived, not just the first
+        while let Some(payload) =
+            try_decode_frame(buf).map_err(|e| format!("Frame decode error: {}", e))?
+        {
+            let msg = decode_server_msg_from(&payload, proto)
+                .map_err(|e| format!("Failed to decode response: {}", e))?;
+
+            match msg {
+                ServerMessage::Authenticated {
+                    user_id,
+                    session_id,
+                    accounts,
+                    files,
+                    emotes,
+                    ..
+                } => {
+                    // A guest on a relay with accounts: the UI can offer one.
+                    if let Some(accounts) = accounts {
+                        emit_server(app_handle, address, "relay-accounts", accounts);
+                    }
+                    return Ok((user_id, session_id, files, emotes));
+                }
+                ServerMessage::AuthError { reason } => {
+                    return Err(format!("Authentication failed: {}", reason).into());
+                }
+                ServerMessage::Refused { ref text, .. } => {
+                    if let Some(older) = older_relay(&msg, proto) {
+                        return Err(older);
+                    }
+                    note_refusal(app_handle, address, &msg);
+                    return Err(text.clone().into());
+                }
+                ServerMessage::AuthStep(AuthStep::AccountRequired { .. }) => {
+                    return Err(crate::account::ACCOUNT_REQUIRED.into());
+                }
+                other => {
+                    warn!("unexpected message during auth: {:?}", other);
+                }
+            }
+        }
+    }
+}
+
+/// The control stream's queue, and the protocol the relay at its end speaks:
+/// an older relay gets its own shapes (`voipc_protocol::compat`, 1.6).
+#[derive(Clone)]
+pub struct ControlTx {
+    tx: mpsc::UnboundedSender<Vec<u8>>,
+    proto: u32,
+}
+
+impl ControlTx {
+    pub fn new(tx: mpsc::UnboundedSender<Vec<u8>>, proto: u32) -> Self {
+        Self { tx, proto }
+    }
+
+    pub fn proto(&self) -> u32 {
+        self.proto
+    }
+
+    /// Queues `msg`, one entry per frame so the pacer counts what the relay
+    /// does. A message the relay's protocol lacks is refused here.
+    pub fn send(&self, msg: &ClientMessage) -> Result<(), String> {
+        let frames = encode_client_msg_for(msg, self.proto).map_err(|e| {
+            warn!("not sent: {e}");
+            format!("Failed to encode message: {e}")
+        })?;
+        for frame in frames {
+            self.tx
+                .send(frame)
+                .map_err(|_| "TCP send channel closed".to_string())?;
+        }
+        Ok(())
+    }
+}
+
+/// `send_tcp_message` for a caller that is not async; a failure is a closed
+/// connection, which its reader reports.
+pub fn send_tcp_message_sync(tcp_tx: &ControlTx, msg: &ClientMessage) {
+    let _ = tcp_tx.send(msg);
+}
+
+pub async fn send_tcp_message(tcp_tx: &ControlTx, msg: &ClientMessage) -> Result<(), String> {
     // Never waits: the queue is unbounded and the pacer downstream is what
     // decides when this actually goes out. Still `async` because every caller
     // is, and because what it does is send a message over a network.
-    tcp_tx
-        .send(data)
-        .map_err(|_| "TCP send channel closed".to_string())
+    tcp_tx.send(msg)
 }
 
 fn parse_address(address: &str) -> Result<(String, u16), String> {
@@ -968,7 +1097,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
     media_key: Arc<std::sync::Mutex<MediaKeyRing>>,
     channel_id: Arc<AtomicU32>,
     signal: Arc<std::sync::Mutex<SignalState>>,
-    tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: ControlTx,
     own_user_id: u32,
     screen_share_active: Arc<AtomicBool>,
     watching_user_id_shared: Arc<AtomicU32>,
@@ -1013,7 +1142,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
 
         loop {
             match try_decode_frame(&mut buf) {
-                Ok(Some(payload)) => match decode_server_msg(&payload) {
+                Ok(Some(payload)) => match decode_server_msg_from(&payload, tcp_tx.proto()) {
                     Ok(_) if !inbound.take(std::time::Instant::now()) => {
                         warn!("server sent more than the inbound budget; disconnecting");
                         emit_server(
@@ -1322,7 +1451,7 @@ async fn handle_server_message(
     media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
     channel_id_store: &Arc<AtomicU32>,
     signal: &Arc<std::sync::Mutex<SignalState>>,
-    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: &ControlTx,
     own_user_id: u32,
     screen_share_active: &Arc<AtomicBool>,
     watching_user_id_shared: &Arc<AtomicU32>,
@@ -2156,12 +2285,7 @@ async fn handle_server_message(
             };
             match more {
                 Some(Ok(prekeys)) => {
-                    match encode_client_msg(&ClientMessage::UploadPreKeys { prekeys }) {
-                        Ok(data) => {
-                            let _ = tcp_tx.send(data);
-                        }
-                        Err(e) => warn!("could not encode the pre-key refill: {e}"),
-                    }
+                    let _ = tcp_tx.send(&ClientMessage::UploadPreKeys { prekeys });
                 }
                 Some(Err(e)) => warn!("could not make more pre-keys: {e}"),
                 None => {}
@@ -2365,10 +2489,7 @@ async fn handle_server_message(
 }
 
 /// What `account::check_seen` needs, for a handler that shows what it decrypts.
-type SeenCheck<'a> = (
-    Option<&'a crate::account::AccountLink>,
-    &'a mpsc::UnboundedSender<Vec<u8>>,
-);
+type SeenCheck<'a> = (Option<&'a crate::account::AccountLink>, &'a ControlTx);
 
 /// The identity a decrypt just took in (a session the peer opened, which no
 /// bundle check sees) against the pins now, before what it decrypted is
@@ -2475,7 +2596,7 @@ async fn request_prekey_bundles_for_users(
     users: &[UserInfo],
     own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
-    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: &ControlTx,
 ) {
     let mut to_request = Vec::new();
 
@@ -2524,7 +2645,7 @@ async fn handle_prekey_bundle(
     own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
     media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
-    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: &ControlTx,
     channel_id_store: &Arc<AtomicU32>,
     ui: (&tauri::AppHandle, &str),
 ) {
@@ -2597,7 +2718,7 @@ async fn distribute_sender_key_to_user(
     own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
     media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
-    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: &ControlTx,
 ) {
     if send_sender_key(channel_id, target_user_id, own_user_id, signal, tcp_tx).await {
         distribute_media_key_to_user(channel_id, target_user_id, signal, media_key, tcp_tx).await;
@@ -2613,7 +2734,7 @@ pub async fn rotate_sender_key_if_stale(
     channel_id: u32,
     own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
-    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: &ControlTx,
 ) {
     let targets: Vec<u32> = {
         let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2641,7 +2762,7 @@ async fn send_sender_key(
     target_user_id: u32,
     own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
-    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: &ControlTx,
 ) -> bool {
     // The server relays a distribution only between two members of the channel
     // it names, and drops the rest without a word. Recording one of those as
@@ -2733,7 +2854,7 @@ async fn rotate_media_key_if_minter(
     own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
     media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
-    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: &ControlTx,
     app_handle: &tauri::AppHandle,
     server: &str,
 ) {
@@ -2808,7 +2929,7 @@ async fn distribute_media_key_to_user(
     target_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
     media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
-    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: &ControlTx,
 ) {
     let key_bytes = {
         let guard = media_key.lock().unwrap_or_else(PoisonError::into_inner);
@@ -2935,7 +3056,7 @@ async fn handle_sender_key_received(
     own_channel_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
     media_key: &Arc<std::sync::Mutex<MediaKeyRing>>,
-    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: &ControlTx,
     ui: (&tauri::AppHandle, &str),
 ) {
     // The mirror of the check `send_sender_key` makes outbound. The server
@@ -3060,7 +3181,7 @@ async fn handle_sender_key_received(
 async fn drain_pending_dms(
     target_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
-    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: &ControlTx,
     (app_handle, server): (&tauri::AppHandle, &str),
 ) {
     // Extract pending DMs for this target, each with the id it was shown under
@@ -3129,7 +3250,7 @@ async fn drain_pending_channel_messages(
     channel_id: u32,
     own_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,
-    tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: &ControlTx,
     (app_handle, server): (&tauri::AppHandle, &str),
 ) {
     // Extract pending channel messages, each with the id it was shown under and
@@ -4783,7 +4904,7 @@ async fn video_stream_receiver_task(
     screen_video_frames_received: Arc<AtomicU32>,
     screen_video_frames_dropped: Arc<AtomicU32>,
     screen_video_bytes_received: Arc<AtomicU64>,
-    tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
+    tcp_tx: ControlTx,
     watching_user_id: Arc<AtomicU32>,
     needs_keyframe: Arc<AtomicBool>,
 ) {
@@ -4807,8 +4928,7 @@ async fn video_stream_receiver_task(
         let msg = ClientMessage::RequestKeyframe {
             sharer_user_id: sharer_id,
         };
-        if let Ok(data) = encode_client_msg(&msg) {
-            let _ = tcp_tx.send(data);
+        if tcp_tx.send(&msg).is_ok() {
             info!("requested a keyframe from sharer {}", sharer_id);
         }
         *last = std::time::Instant::now();
@@ -4924,9 +5044,7 @@ async fn video_stream_receiver_task(
                     frames_dropped: window_dropped,
                     frames_received: window_received,
                 };
-                if let Ok(data) = encode_client_msg(&msg) {
-                    let _ = tcp_tx.send(data);
-                }
+                let _ = tcp_tx.send(&msg);
                 info!(
                     dropped = window_dropped,
                     received = window_received,

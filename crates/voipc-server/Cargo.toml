@@ -58,6 +58,15 @@ hex = "0.4"
 l4f-accounts = { git = "https://github.com/luki4fun/l4f-accounts.git", tag = "v0.10.0", features = ["postgres", "sqlite"] }
 sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "sqlite", "migrate", "macros"] }
 
+# The self-update (`[update]`, update.rs), all already in the lock through the
+# client: the release feed over HTTPS on ring with the bundled roots (a static
+# binary may find no CA store), the updater key's minisign signature, and the
+# release versions.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+webpki-roots = "1"
+minisign-verify = "0.3"
+semver = "1"
+
 # The recovery-key reset's proof: an identity signature (libsignal)
 voipc-crypto = { workspace = true }
 unicode-security = "0.1.2"

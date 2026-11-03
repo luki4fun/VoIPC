@@ -23,9 +23,14 @@ Tell us:
 Only the newest release gets security fixes. To get a fix, update the relay and the apps to
 it.
 
-A client and a relay must speak the same protocol version. A fix that changes the protocol
-needs both sides updated, and its release notes say so in their first line
-([docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)).
+A relay admits only apps of its own protocol version, and a release that changes it says so in
+its notes' first line. Since 1.6 an app also talks to relays up to three protocols older, so
+the apps can take a fix before their relay does ([docs/COMPATIBILITY.md](docs/COMPATIBILITY.md)
+§1).
+
+A relay can update itself (`[update]`, [docs/OPERATING.md](docs/OPERATING.md) §14). It installs
+only a release signed with the key the desktop updater trusts, for the version and the file
+the feed names, and it is off unless the operator turns it on.
 
 ## What is not a vulnerability
 

@@ -53,18 +53,20 @@ pub struct UpdateInfo {
     /// The protocol the update speaks, when the feed says (`"protocol": N`):
     /// whether it would let us onto a server that refused us.
     pub protocol: Option<u32>,
+    /// The oldest relay protocol it still talks to (`"oldest_protocol"`,
+    /// since 1.6); none from an older feed, whose release talks only to its own.
+    pub oldest_protocol: Option<u32>,
     /// The protocol this app speaks: an update on another one locks it out
     /// of every server not yet updated, so the page warns instead of
     /// offering it plainly (`update-rules.ts` `updateOffer`).
     pub our_protocol: u32,
 }
 
-/// The feed's extra `protocol` field, if it carries a sane one.
+/// One of the feed's extra protocol fields (`protocol`, `oldest_protocol`),
+/// if it carries a sane one.
 #[cfg(any(not(target_os = "android"), test))]
-fn protocol_of(raw: &serde_json::Value) -> Option<u32> {
-    raw.get("protocol")?
-        .as_u64()
-        .and_then(|p| u32::try_from(p).ok())
+fn protocol_of(raw: &serde_json::Value, key: &str) -> Option<u32> {
+    raw.get(key)?.as_u64().and_then(|p| u32::try_from(p).ok())
 }
 
 #[cfg(not(target_os = "android"))]
@@ -104,7 +106,8 @@ mod desktop {
         UpdateInfo {
             version: update.version.clone(),
             notes: update.body.clone(),
-            protocol: protocol_of(&update.raw_json),
+            protocol: protocol_of(&update.raw_json, "protocol"),
+            oldest_protocol: protocol_of(&update.raw_json, "oldest_protocol"),
             our_protocol: voipc_protocol::codec::PROTOCOL_VERSION,
         }
     }
@@ -337,17 +340,17 @@ mod tests {
 
     #[test]
     fn the_feed_may_say_which_protocol_an_update_speaks() {
+        let p = |v: serde_json::Value| protocol_of(&v, "protocol");
         assert_eq!(
-            protocol_of(&serde_json::json!({"version": "1.0.0", "protocol": 12})),
+            p(serde_json::json!({"version": "1.0.0", "protocol": 12})),
             Some(12)
         );
-        assert_eq!(protocol_of(&serde_json::json!({"version": "1.0.0"})), None);
-        assert_eq!(protocol_of(&serde_json::json!({"protocol": "12"})), None);
-        assert_eq!(protocol_of(&serde_json::json!({"protocol": -1})), None);
-        assert_eq!(
-            protocol_of(&serde_json::json!({"protocol": 1u64 << 40})),
-            None
-        );
+        assert_eq!(p(serde_json::json!({"version": "1.0.0"})), None);
+        assert_eq!(p(serde_json::json!({"protocol": "12"})), None);
+        assert_eq!(p(serde_json::json!({"protocol": -1})), None);
+        assert_eq!(p(serde_json::json!({"protocol": 1u64 << 40})), None);
+        let feed = serde_json::json!({"protocol": 16, "oldest_protocol": 13});
+        assert_eq!(protocol_of(&feed, "oldest_protocol"), Some(13));
     }
 
     /// The key every update must be signed with, and the version binding, are

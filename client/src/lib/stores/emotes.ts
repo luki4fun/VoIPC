@@ -237,22 +237,23 @@ async function askMobileData(server: string, emotes: Emote[]) {
   const missing = new Set(
     await invoke<string[]>("emote_missing", { items: emotes.map((e) => ({ hash: e.hash, sticker: e.sticker })) }).catch(() => []),
   );
-  const bytes = emotes.filter((e) => missing.has(urlKey(e.hash, e.sticker))).reduce((n, e) => n + e.len, 0);
-  if (!bytes) return downloadEmotes(server, false);
+  const want = emotes.filter((e) => missing.has(urlKey(e.hash, e.sticker)));
+  const bytes = want.reduce((n, e) => n + e.len, 0);
+  // Nothing to fetch. A size of 0 is a 1.4 relay's "unknown", still a question.
+  if (!want.length) return downloadEmotes(server, false);
   hold(server, { bytes, missing });
   if (askedMobile.has(server)) return;
   askedMobile.add(server);
   await afterFirstRun();
   // Downloaded meanwhile (back on Wi-Fi, or "Download now" in the picker)
   if (!get(emoteWait).has(server)) return;
-  const want = emotes.filter((e) => missing.has(urlKey(e.hash, e.sticker)));
   const stickers = want.filter((e) => e.sticker).length;
   const { ok, option } = await confirmChoice({
     title: "Download emotes on mobile data?",
     body:
-      `${serverName(server, get(savedServers))} has ${countKinds(want.length - stickers, stickers)} this device does not have yet: ` +
-      `${formatSize(bytes)}. Until they are downloaded they show as their names; on Wi-Fi they come by themselves.`,
-    confirm: `Download ${formatSize(bytes)}`,
+      `${serverName(server, get(savedServers))} has ${countKinds(want.length - stickers, stickers)} this device does not have yet` +
+      `${bytes ? `: ${formatSize(bytes)}` : ""}. Until they are downloaded they show as their names; on Wi-Fi they come by themselves.`,
+    confirm: bytes ? `Download ${formatSize(bytes)}` : "Download",
     cancel: "Wait for Wi-Fi",
     // Kept only with Download: "always wait" is what not ticking it already is
     option: "Always download them on this server, without asking",

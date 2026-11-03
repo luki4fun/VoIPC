@@ -142,6 +142,7 @@
     setRoster,
   } from "./lib/stores/rosters.js";
   import { emoteLimits, setEmotes, type EmoteLimits, type EmoteSet } from "./lib/stores/emotes.js";
+  import { olderRelay } from "./lib/stores/relay.js";
   import { confirmAction } from "./lib/stores/confirm.js";
   import {
     askNsfwConsent,
@@ -735,6 +736,10 @@
       listenServer<{ max_bytes: number } | null>("file-limits", (server, d) => fileLimits.of(server).set(d)),
       listenServer<EmoteSet>("emote-list", (server, d) => setEmotes(server, d)),
       listenServer<EmoteLimits | null>("emote-limits", (server, d) => emoteLimits.of(server).set(d)),
+      // An older relay's protocol and version: the banner, and what the app holds back there
+      listenServer<{ protocol: number; version: string | null }>("relay-version", (server, d) =>
+        olderRelay.of(server).set(d.version === null ? null : { protocol: d.protocol, version: d.version }),
+      ),
       listenServer<{ name: string; reason: string }>("emote-error", (server, d) =>
         addNotification(`${fromServer(server)}${d.name ? `:${d.name}: — ` : ""}${d.reason}`, "error"),
       ),
@@ -1130,7 +1135,10 @@
         availableUpdate.set(event.payload);
         // An update on another protocol gets no toast: Settings says what it
         // would cost (design input 5)
-        const toast = updateToast(event.payload);
+        const connected = [...get(connectionStates)]
+          .filter(([, s]) => s === "connected")
+          .map(([id]) => ({ name: id, protocol: get(olderRelay.peek(id))?.protocol ?? null }));
+        const toast = updateToast(event.payload, connected);
         if (toast && announcedUpdate !== event.payload.version) {
           announcedUpdate = event.payload.version;
           addNotification(toast, "info", 10000);

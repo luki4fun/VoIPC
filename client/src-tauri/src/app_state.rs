@@ -453,7 +453,7 @@ pub struct ActiveConnection {
     /// `take_voice_ask`).
     pub voice_asked_at: Arc<AtomicU64>,
     /// Sender for control messages (framed, onto the control stream).
-    pub tcp_tx: mpsc::UnboundedSender<Vec<u8>>,
+    pub tcp_tx: crate::network::ControlTx,
     /// The relay account this connection signed in with; `None` for a guest.
     pub account: Option<Arc<crate::account::AccountLink>>,
     /// This connection's file transfers (`files.rs`).

@@ -104,6 +104,9 @@ jobs:
           # the stable feed offers now, i.e. the release before this one.
           protocol=$(sed -n 's/^pub const PROTOCOL_VERSION: u32 = \([0-9]*\);/\1/p' crates/voipc-protocol/src/codec.rs)
           [ -n "$protocol" ] || { echo "::error::PROTOCOL_VERSION not found"; exit 1; }
+          # The oldest relay protocol this release's apps still talk to
+          oldest=$(sed -n 's/^pub const OLDEST_RELAY_PROTOCOL: u32 = \([0-9]*\);/\1/p' crates/voipc-protocol/src/compat.rs)
+          [ -n "$oldest" ] || { echo "::error::OLDEST_RELAY_PROTOCOL not found"; exit 1; }
           feed="https://github.com/$GITHUB_REPOSITORY/releases/latest/download/latest.json"
           if was=$(curl -fsSL --retry 3 "$feed" | jq -er .protocol); then
             first=$(grep -m1 . notes.md)
@@ -544,6 +547,9 @@ jobs:
   #   (Tauri v2 updates from the bundle), signed for their version
   #   (--app-version; the app sets requireSignedVersion), and latest.json, the
   #   feed client/src-tauri/src/updater.rs reads.
+  # - The relay's self-update (1.6): the server binary, signed the same way
+  #   with the same key, under "linux-x86_64-server" in the same feed
+  #   (crates/voipc-server/src/update.rs).
   sign:
     needs: [meta, linux, windows, android]
     if: github.ref_type == 'tag'
@@ -612,13 +618,13 @@ jobs:
       - run: npm ci --ignore-scripts
         working-directory: client
 
-      - name: Sign the desktop updates and write latest.json
+      - name: Sign the desktop and relay updates and write latest.json
         env:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
           EPOCH: ${{ needs.meta.outputs.epoch }}
         run: |
-          trap 'echo "::error title=Sign the desktop updates::failed (exit $?) at: $BASH_COMMAND"' ERR
+          trap 'echo "::error title=Sign the desktop and relay updates::failed (exit $?) at: $BASH_COMMAND"' ERR
           appimage=$(cd artifacts/linux && ls *.AppImage)
           setup=$(cd artifacts/windows && ls *-setup.exe)
           # signer sign takes any key, but the app installs only what its own
@@ -627,7 +633,8 @@ jobs:
           # base64 file, then its second line; bytes 2..10, little-endian.
           keyid() { python3 -c 'import base64,sys; print(base64.b64decode(base64.b64decode(sys.stdin.read()).splitlines()[1])[2:10][::-1].hex().upper())'; }
           want=$(jq -r .plugins.updater.pubkey client/src-tauri/tauri.conf.json | keyid)
-          for f in "artifacts/linux/$appimage" "artifacts/windows/$setup"; do
+          server=voipc-server-linux-x86_64
+          for f in "artifacts/linux/$appimage" "artifacts/windows/$setup" "artifacts/linux/$server"; do
             (cd client && npx tauri signer sign --app-version "$v" "../$f")
             got=$(keyid < "$f.sig")
             if [ -z "$want" ] || [ "$got" != "$want" ]; then
@@ -638,15 +645,22 @@ jobs:
           done
           protocol=$(sed -n 's/^pub const PROTOCOL_VERSION: u32 = \([0-9]*\);/\1/p' crates/voipc-protocol/src/codec.rs)
           [ -n "$protocol" ] || { echo "::error::PROTOCOL_VERSION not found"; exit 1; }
+          # The oldest relay protocol this release's apps still talk to
+          oldest=$(sed -n 's/^pub const OLDEST_RELAY_PROTOCOL: u32 = \([0-9]*\);/\1/p' crates/voipc-protocol/src/compat.rs)
+          [ -n "$oldest" ] || { echo "::error::OLDEST_RELAY_PROTOCOL not found"; exit 1; }
           base="https://github.com/$GITHUB_REPOSITORY/releases/download/v$v"
-          # The keys the updater plugin looks up first: {os}-{arch}-{bundle}.
+          # The keys the updater plugin looks up first: {os}-{arch}-{bundle};
+          # the apps never look up the relay's.
           jq -n --arg version "$v" --rawfile notes artifacts/release-notes/notes.md \
             --arg pub_date "$(date -u -d "@$EPOCH" +%Y-%m-%dT%H:%M:%SZ)" --argjson protocol "$protocol" \
+            --argjson oldest "$oldest" \
             --arg lurl "$base/$appimage" --rawfile lsig "artifacts/linux/$appimage.sig" \
             --arg wurl "$base/$setup" --rawfile wsig "artifacts/windows/$setup.sig" \
-            '{version: $version, notes: $notes, pub_date: $pub_date, protocol: $protocol,
+            --arg surl "$base/$server" --rawfile ssig "artifacts/linux/$server.sig" \
+            '{version: $version, notes: $notes, pub_date: $pub_date, protocol: $protocol, oldest_protocol: $oldest,
               platforms: {"linux-x86_64-appimage": {url: $lurl, signature: $lsig},
-                          "windows-x86_64-nsis": {url: $wurl, signature: $wsig}}}' > signed/latest.json
+                          "windows-x86_64-nsis": {url: $wurl, signature: $wsig},
+                          "linux-x86_64-server": {url: $surl, signature: $ssig}}}' > signed/latest.json
           cat signed/latest.json
 
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2

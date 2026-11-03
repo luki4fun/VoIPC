@@ -24,6 +24,10 @@ pub enum ProtocolError {
     #[error("websocket: {0}")]
     WebSocket(&'static str),
 
+    /// A message the relay's older protocol does not have (`compat.rs`).
+    #[error("this server runs protocol {0}, which does not have this")]
+    NotOnThisRelay(u32),
+
     #[error("serialization error: {0}")]
     Serialization(#[from] postcard::Error),
 

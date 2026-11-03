@@ -515,8 +515,9 @@ where
         anyhow::bail!("expected Authenticate message, got unexpected message type");
     };
 
-    // Protocol match only (1.0): any app version that speaks this protocol is
-    // in. `app_version` still names the client to l4f (accounts.rs).
+    // A relay admits only its own protocol (1.0); any app version that speaks
+    // it is in, and since 1.6 a newer app comes back speaking this one
+    // (voipc_protocol::compat). `app_version` still names the client to l4f.
     if protocol_version != PROTOCOL_VERSION {
         refuse_version(stream, protocol_version).await?;
         anyhow::bail!("protocol version mismatch");

@@ -444,7 +444,7 @@ pub async fn emote_add(
             w: args.w,
             h: args.h,
         },
-    });
+    })?;
     let ticket = match tokio::time::timeout(ANSWER_TIME, answer).await {
         Ok(Ok(answer)) => answer?,
         _ => return Err("the server did not answer".into()),
@@ -468,8 +468,7 @@ pub async fn emote_remove(
 ) -> Result<(), String> {
     files_of(&state, &server)
         .await?
-        .send_msg(&ClientMessage::EmoteRemove { names });
-    Ok(())
+        .send_msg(&ClientMessage::EmoteRemove { names })
 }
 
 /// Put emotes in a pack and/or make them stickers or emotes (admins): all of
@@ -488,8 +487,7 @@ pub async fn emote_move(
             names,
             pack,
             sticker,
-        });
-    Ok(())
+        })
 }
 
 /// Call an emote by another name (admins); a refusal comes as an
@@ -503,8 +501,7 @@ pub async fn emote_rename(
 ) -> Result<(), String> {
     files_of(&state, &server)
         .await?
-        .send_msg(&ClientMessage::EmoteRename { from, to });
-    Ok(())
+        .send_msg(&ClientMessage::EmoteRename { from, to })
 }
 
 /// Let members send stickers, or not (admins).
@@ -516,8 +513,7 @@ pub async fn emote_stickers(
 ) -> Result<(), String> {
     files_of(&state, &server)
         .await?
-        .send_msg(&ClientMessage::EmoteStickers { on });
-    Ok(())
+        .send_msg(&ClientMessage::EmoteStickers { on })
 }
 
 #[cfg(test)]

@@ -27,6 +27,8 @@
   import { showConnectDialog } from "../../connect.js";
   import { pushLayer } from "../../stores/back-stack.js";
   import { shellContextMenu } from "../../context-menu.js";
+  import { olderRelay, type OlderRelay } from "../../stores/relay.js";
+  import { relayBanner } from "../../relay-rules.js";
 
   import ChatPanel from "../ChatPanel.svelte";
   import MobilePTT from "../MobilePTT.svelte";
@@ -41,6 +43,11 @@
   import UserPanel from "./UserPanel.svelte";
   import MemberList from "./MemberList.svelte";
   import ActivityOverlay from "./ActivityOverlay.svelte";
+
+  // An older relay's banner, closed until that server connects again (each
+  // connect brings a new `olderRelay` value)
+  let closedBanners = $state.raw(new Set<OlderRelay>());
+  const relayNote = $derived($olderRelay && !closedBanners.has($olderRelay) ? relayBanner($olderRelay) : null);
 
   interface Props {
     onopensettings: () => void;
@@ -171,6 +178,15 @@
   {#if panels.sidebar_open}
     <div class="sidebar">
       <ServerHeader onopensettings={onopensettings} />
+      {#if relayNote && $olderRelay}
+        {@const shown = $olderRelay}
+        <div class="relay-banner" role="status" title="Protocol {shown.protocol}; this app talks to it in that one">
+          <span><strong>{relayNote.head}</strong>{#if relayNote.off}<br /><small>{relayNote.off}</small>{/if}</span>
+          <button class="icon-btn" type="button" title="Close" aria-label="Close this note" onclick={() => (closedBanners = new Set([...closedBanners, shown]))}
+            ><Icon name="close" size={12} /></button
+          >
+        </div>
+      {/if}
       <ChannelSidebar />
       <VoicePanel />
       <UserPanel {onopensettings} onopenvoice={() => (voiceOpen = !voiceOpen)} />
@@ -331,6 +347,31 @@
      before there were panes. */
   .pane {
     display: contents;
+  }
+
+  .relay-banner {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 6px 8px 6px 12px;
+    font-size: var(--fs-sm);
+    color: var(--text-secondary);
+    border-bottom: 1px solid var(--border);
+    border-left: 3px solid var(--warning);
+  }
+
+  .relay-banner span {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .relay-banner strong {
+    font-weight: 600;
+    color: var(--text-primary);
+  }
+
+  .relay-banner small {
+    font-size: var(--fs-micro);
   }
 
   .sidebar {

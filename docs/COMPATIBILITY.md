@@ -1,9 +1,9 @@
 # Compatibility
 
 From 1.0, VoIPC keeps the contracts below for every 1.x release. A change that breaks one
-waits for 2.0. The one exception, by design, is the wire protocol: client and relay must speak
-the same protocol version, a 1.x release may bump it, and its release notes say so in their
-first line.
+waits for 2.0. The one exception, by design, is the wire protocol: a 1.x release may bump it,
+and its release notes say so in their first line. A relay admits only apps of its own
+protocol; since 1.6 an app also talks to relays up to three protocols older (§1).
 
 Each contract names the test that catches a break. A contract without a test is a promise
 nobody checks, so a new one comes with its test.
@@ -13,6 +13,19 @@ nobody checks, so a new one comes with its test.
 **1.x keeps:**
 - A relay admits a client exactly when their `PROTOCOL_VERSION` is equal (12 in 1.0, 13 in
   1.3, 14 in 1.4, 15 in 1.5). The app version is informational only.
+- **Since 1.6, an app talks to relays from its own protocol down to `OLDEST_RELAY_PROTOCOL`**
+  (`crates/voipc-protocol/src/compat.rs`; 12 in 1.6), never fewer than three protocols back.
+  It asks with its own; a relay of an older protocol refuses with its own (below), and the app
+  connects again speaking that one. It shows a banner there, and holds back what that relay's
+  other apps could not read:
+
+  | Relay | What a 1.6 app does not offer there |
+  |---|---|
+  | 1.4 (14) | moving emotes between packs; its emote tokens use 1.4's 20 hex digits |
+  | 1.3 (13) | emotes and stickers |
+  | 1.0 (12) | files, emotes and stickers, edits, reactions, pins, forwards, a new recovery key |
+
+  The browser always loads the page of the relay it connects to, so it always matches.
 - A refused client is told why:
   - a client at protocol 12 or later gets `ServerMessage::Refused { code, server_protocol,
     server_version, text }`, with `code` 1 (`REFUSED_VERSION`) for a protocol mismatch. The app
@@ -31,7 +44,8 @@ nobody checks, so a new one comes with its test.
   - `Refused`, its variant index and its `u16` code.
 
 **May change:** any other layout, but only together with a protocol bump, and only in a minor or
-major release, never in a patch. The release notes name the oldest relay and app that speak
+major release, never in a patch. A bump adds the older shape of every message it changes to
+`compat.rs`, so the apps keep talking to the relays it leaves behind. The release notes name the oldest relay and app that speak
 it. A patch release never bumps the protocol, because auto-updates would otherwise lock users
 out of servers that have not upgraded yet.
 
@@ -40,6 +54,10 @@ out of servers that have not upgraded yet.
   `golden/v<N>.json`, and the frozen messages and the media packet headers against bytes
   written out in the test.
 - Any change with the same `PROTOCOL_VERSION` fails it.
+- `compat.rs`'s tests fail when a message's layout at an older protocol differs from today's
+  and `RESHAPED` does not name it, and when an old shape there differs from its golden file.
+- The nightly `old-relays` job runs the released 1.0, 1.3 and 1.4 relays and speaks to each
+  in its own protocol (`voice_load`).
 
 ## 2. Game SDK (`docs/SDK.md`)
 
@@ -93,6 +111,10 @@ keeps the old behaviour. Its `dir` must not be `[files] dir`, nor inside or arou
 **What changed in 1.5:** no new keys. The relay's `emotes/manifest.json` keeps each emote's
 shape (`w`, `h`); a 1.4 manifest reads as it was, with no shape.
 
+**What changed in 1.6:** `[update]` is a new section, off by default: the relay updating
+itself ([OPERATING.md](OPERATING.md) §14). With it on, the relay refuses to start where it
+cannot replace its own binary.
+
 **An older relay on a newer config:** it refuses the unknown key, never ignores it, so a relay
 cannot silently run without a setting it was given. The JSON files stay lenient: a rewrite of
 `channels.json` keeps keys it does not know.
@@ -132,7 +154,8 @@ storage, the accounts database, the kept-message log and its crypto labels.
 A downgrade is not supported, but it is safe: nothing is destroyed.
 
 **Going back from 1.3 to 1.0.** A 1.3 app does not connect to a 1.0 relay, and the desktop
-updater only ever moves forward, so a user whose server stays on 1.0 has to go back by hand:
+updater only ever moves forward, so a user whose server stays on 1.0 had to go back by hand.
+Since 1.6 the app talks to a 1.0 relay itself (§1); the way back, for 1.3 to 1.5:
 1. Close VoIPC and install 1.0.0 from its release page
    (<https://github.com/luki4fun/voipc/releases/tag/v1.0.0>).
 2. In VoIPC's folder (`~/.config/VoIPC` on Linux, `%APPDATA%\VoIPC` on Windows, or wherever
@@ -190,6 +213,9 @@ advisory and a "Security" entry in the CHANGELOG. It never happens silently.
   `VoIPC-web-<v>.tar.gz`), the updater's `latest.json`, `VoIPC_<v>_amd64.AppImage.sig` and
   `VoIPC_<v>_x64-setup.exe.sig`, plus `SHA256SUMS` and a build attestation for every file.
   `latest.json` is the name every 1.x client's stable feed URL ends in.
+- **Since 1.6:** `voipc-server-linux-x86_64.sig`, the relay's signature for its self-update.
+  `latest.json` carries `oldest_protocol` (the oldest relay protocol that release's apps talk
+  to) and the platform `linux-x86_64-server` (what a self-updating relay takes).
 - **Container:** the image `ghcr.io/luki4fun/voipc-server` with `:<version>`; a final release
   also moves `:<major>.<minor>`, `:<major>` and `:latest`. A minor may change the protocol, so
   `:<major>` and `:latest` follow protocol changes; `:<major>.<minor>` is the tag that stays on

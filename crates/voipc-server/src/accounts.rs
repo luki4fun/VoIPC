@@ -246,7 +246,30 @@ impl Relay {
     pub fn store(&self) -> &Store {
         &self.accounts.store
     }
+}
 
+/// A copy of a SQLite accounts database at `path`, a new file private from
+/// the start; safe while the relay runs (`VACUUM INTO`). Postgres has pg_dump.
+pub async fn sqlite_backup(store: &Store, path: &std::path::Path) -> Result<()> {
+    let Store::Lite(b) = store else {
+        bail!("this is Postgres: back it up with pg_dump");
+    };
+    // Made empty and private first: SQLite copies into an empty file
+    crate::fsutil::create_private(path, &[])
+        .with_context(|| format!("creating {}", path.display()))?;
+    let to = path.to_string_lossy();
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "VACUUM INTO '{}'",
+        to.replace('\'', "''")
+    )))
+    .execute(&b.0)
+    .await
+    .with_context(|| format!("backing up to {to}"))?;
+    crate::fsutil::owner_only(path)
+        .with_context(|| format!("making {to} readable by this user only"))
+}
+
+impl Relay {
     /// A slot for a sign-in from `ip`, or `None` while the relay, or that
     /// address, has as many open as it takes.
     pub fn pending_slot(&self, ip: IpAddr) -> Option<PendingSlot> {

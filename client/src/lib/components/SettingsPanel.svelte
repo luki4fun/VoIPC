@@ -59,6 +59,7 @@
   import { micTestLevel, micTesting, startMicTest, stopMicTest } from "../stores/mic-test.js";
   import { availableUpdate, checkForUpdate, checkUpdates, installUpdate, setCheckUpdates, updateBusy, updatesSupported } from "../stores/updates.js";
   import { protocolWarning, updateOffer } from "../update-rules.js";
+  import { olderRelay } from "../stores/relay.js";
   import { serverName } from "../stores/servers.js";
   import { saveOpenServers } from "../connect.js";
   import { voice } from "../stores/channels.js";
@@ -486,14 +487,17 @@
    *  arms it (design input 5). Armed for that version only. */
   let updateArmed = $state<string | null>(null);
   const updateStates = connectionState.all();
-  /** What Settings says about an update on another protocol: the servers it
-   *  would lock this app out of are the ones it is connected to now. */
+  const olderRelays = olderRelay.all();
+  /** The servers connected now, each with its protocol (null: ours). */
+  const connectedNow = $derived(
+    [...$updateStates]
+      .filter(([, s]) => s === "connected")
+      .map(([id]) => ({ name: serverName(id, $savedServers), protocol: $olderRelays.get(id)?.protocol ?? null })),
+  );
+  /** What Settings says about an update some of them would refuse. */
   const updateWarning = $derived(
-    $availableUpdate && updateOffer($availableUpdate) === "protocol"
-      ? protocolWarning(
-          $availableUpdate,
-          [...$updateStates].filter(([, s]) => s === "connected").map(([id]) => serverName(id, $savedServers)),
-        )
+    $availableUpdate && updateOffer($availableUpdate, connectedNow) === "protocol"
+      ? protocolWarning($availableUpdate, connectedNow)
       : null,
   );
 

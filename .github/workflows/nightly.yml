@@ -168,6 +168,59 @@ jobs:
             exit 1
           fi
 
+  # Since 1.6 the apps talk to relays up to three protocols older
+  # (voipc_protocol::compat). The released relay of each, spoken to in its own
+  # protocol: sign-in, a channel, and voice relayed back (voice_load). A
+  # protocol bump adds its last release here, and a raised
+  # OLDEST_RELAY_PROTOCOL drops the oldest.
+  old-relays:
+    name: Older relays
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+
+      - name: System dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config cmake protobuf-compiler
+
+      - name: Rust toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+
+      - run: cargo build -p voipc-server --example voice_load --locked
+
+      - name: Each older relay
+        run: |
+          openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
+            -keyout "$RUNNER_TEMP/key.pem" -out "$RUNNER_TEMP/cert.pem" \
+            -subj /CN=localhost -addext subjectAltName=IP:127.0.0.1 2>/dev/null
+          port=49987
+          for v in 1.0.0 1.3.1 1.4.0; do
+            d="$RUNNER_TEMP/v$v"
+            mkdir -p "$d/run"
+            (cd "$d" && gh release download "v$v" --repo "$GITHUB_REPOSITORY" \
+              -p voipc-server-linux-x86_64 -p SHA256SUMS && sha256sum -c --ignore-missing SHA256SUMS)
+            chmod +x "$d/voipc-server-linux-x86_64"
+            (cd "$d/run" && exec "$d/voipc-server-linux-x86_64" --host 127.0.0.1 --tcp-port "$port" \
+              --udp-port "$port" --cert "$RUNNER_TEMP/cert.pem" --key "$RUNNER_TEMP/key.pem") >"$d/relay.log" 2>&1 &
+            pid=$!
+            sleep 2
+            if ! timeout 60 target/debug/examples/voice_load 3 "127.0.0.1:$port" 8; then
+              tail -20 "$d/relay.log"
+              echo "::error title=older relay::this app cannot talk to the $v relay"
+              exit 1
+            fi
+            kill "$pid"
+            port=$((port + 1))
+          done
+
   # The native Windows build: setup.ps1, then the desktop task's Windows branch
   # (MSVC environment, the pinned FFmpeg, DLL staging). Releases are
   # cross-built on Linux, so nothing else runs this path, and a failure here is

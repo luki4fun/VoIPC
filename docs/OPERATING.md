@@ -172,17 +172,19 @@ Create `/var/backups/voipc`, owned by `voipc` with mode 0700, and copy the key f
 3. **Back up** (section 7).
 4. **Stop, replace the binary, start.** Database migrations run at start.
 
-**When the protocol changes** (the first line says "Protocol N"), an app and a relay connect only
-if both speak N. No order keeps everyone connected, but this one strands the fewest:
-1. **Tell your users first,** while they can still connect: the day, and to update their apps
-   only after the relay. The desktop app offers a new version as soon as it is published, and
-   once installed it cannot connect until the relay has moved too. The browser needs nothing;
+**When the protocol changes** (the first line says "Protocol N"), the relay admits only apps
+that speak N. Since 1.6 an app also talks to relays up to three protocols older, so the apps go
+first:
+1. **Tell your users to update their apps.** A 1.6 or later app keeps talking to your relay
+   meanwhile, with a banner saying what is off until it updates. The browser needs nothing;
    Android and the `.deb` are installed by hand.
-2. **Update the relay** to the published release, not to a release candidate. A desktop app it
-   then refuses finds the matching version in its update feed and offers it; a release
-   candidate is never in that feed. The browser gets the new page from the relay itself.
-3. **Then the apps.** An app updated before its relay cannot connect to it, and a desktop app
-   does not go back by itself (the way back: [COMPATIBILITY.md](COMPATIBILITY.md) §4).
+2. **Then update the relay** to the published release, not to a release candidate (unless it
+   updates itself with `release_candidates = true`, §14). An app it then refuses for being
+   older finds the matching version in its update feed and offers it; a release candidate is
+   never in that feed. The browser gets the new page from the relay itself.
+
+Apps before 1.6 talk only to a relay of their own protocol: for those, update the relay first
+and the apps right after (the way back: [COMPATIBILITY.md](COMPATIBILITY.md) §4).
 
 **From 1.0 to 1.3** (protocol 12 to 13):
 - **The file cache is on by default** (§11). The relay makes `files/` in its working directory,
@@ -251,6 +253,10 @@ A release candidate only gets its own `:<version>` tag. A final release also mov
 published, and every app on the old protocol is refused from then on. To keep those apps
 connecting, pin `:<major>.<minor>` until your users have updated, then move on (§8). Which
 release speaks which protocol: [COMPATIBILITY.md](COMPATIBILITY.md) §1.
+
+`[update]` (§14) refuses to start in the container: its binary is part of the image. Pull a new
+tag instead, by hand or with `podman auto-update` and the `io.containers.autoupdate=registry`
+label.
 
 ## 11. The file cache
 
@@ -375,6 +381,11 @@ max_age_hours = 24         # no blob stays longer; all of them go at every start
 
 [emotes]                   # the server's emotes and stickers, on by default (§12)
 max_total_mb = 32          # all of them, held in memory; each member downloads each once
+
+[update]                   # the relay updating itself, off by default (§14)
+enabled = false
+delay_minutes = 5          # after it first sees a release
+release_candidates = false # also take release candidates
 ```
 
 > **IPv6:** `host = "::"` is the default and serves both families from one listener (a host with IPv6 disabled falls back to `0.0.0.0` automatically). Do not pin `host` to a concrete IPv4 address while your domain publishes an AAAA record: the browser client then fails while everything else looks healthy, because the page and `/wt.json` are TCP and Chrome quietly falls back to IPv4 after the refused IPv6 attempt, while the WebTransport session is UDP and has no such fallback — it dies with `ERR_QUIC_PROTOCOL_ERROR`.
@@ -449,3 +460,64 @@ The creator of a channel, or any admin or moderator, can change these at runtime
 | `community` | Creators and communities: moderator-only announcements, slow mode, feedback and bug reports, a stage, playtests, and a locked 18+ area |
 
 No preset ships a password: one in a preset would be the same on every server that used it. Every locked channel is given a fresh random one instead, printed once when `init` runs; the file keeps only its hash. Where a layout needs server settings — `roleplay` a `game_token`, `family` and `community` a lower `max_channels` — `init` writes `server_settings.json` if there is none, and otherwise leaves yours alone and prints what to put in it. An existing `channels.json` is only replaced with `--force`, which keeps the old one as `channels.json.bak` (`.bak.2` and so on after that). `--out` writes it elsewhere; `--channels` and `--settings` choose other paths too, but go before the command: `voipc-server --settings path/server_settings.json channels init roleplay`. What comes out is an ordinary `channels.json`: restart the server to load it. A preset copied by hand still says `"<generate>"` where a secret belongs, and the server refuses to start on it rather than lock a channel with a password everybody can read.
+
+## 14. Self-update
+
+With `[update] enabled = true`, the relay keeps itself on the newest release of its major
+version. Off by default.
+
+```toml
+[update]
+enabled = true
+delay_minutes = 5          # wait this long after first seeing a release
+release_candidates = false # true: also take release candidates (rc.N), and their finals
+```
+
+**What it does.**
+1. Every 5 minutes it reads the same feed as the desktop apps: the stable one, or with
+   `release_candidates = true` the release candidates' one, which carries the finals too.
+2. A newer release of the same major version is taken `delay_minutes` after the relay first
+   saw it. Releases are published by hand, so the clock starts at the relay, within 5 minutes
+   of publishing. A new major version (2.0) is never taken on its own.
+3. It downloads `voipc-server-linux-x86_64` and checks its signature: the key the desktop
+   updater trusts, for that version and that file. Anything else is refused.
+4. It runs the new binary once (`--version`), and copies a SQLite accounts database beside
+   the binary as `voipc-server.accounts-before-<version>.db` (the newest two stay; Postgres
+   is yours to back up).
+5. It keeps the running binary as `voipc-server.previous`, puts the new one in its place,
+   tells every client "updating to VoIPC X", and restarts into it in the same process. Calls
+   drop; the apps reconnect within seconds.
+
+A release that changes the protocol is taken like any other: apps older than the new protocol
+are refused until they update (§8). A step that fails is logged, that version is listed in
+`voipc-server.failed` and not tried again, and the relay keeps running.
+
+**What it needs.**
+- The linux-x86_64 build (the release binary), not the container (§10).
+- A binary the relay's own user can replace: the relay refuses to start with `enabled = true`
+  otherwise. The unit of §3 keeps the binary in `/usr/local/bin`, which it cannot write. For
+  self-update, keep it in the state directory instead:
+
+      install -d -o voipc -g voipc -m 0700 /var/lib/voipc/bin
+      install -o voipc -g voipc -m 0755 voipc-server-linux-x86_64 /var/lib/voipc/bin/voipc-server
+      ln -sf /var/lib/voipc/bin/voipc-server /usr/local/bin/voipc-server
+
+  and in the unit, `ExecStart=/var/lib/voipc/bin/voipc-server --config …`. The rest of §3
+  stays as it is; `StateDirectory=voipc` keeps that directory writable for the relay under
+  `ProtectSystem=strict`. The symlink makes the admin commands run the updated binary too.
+- Outbound HTTPS to github.com.
+
+**The trade-off.** With self-update on, the relay's user can replace the binary it runs.
+Someone who already runs code as that user could keep it there across restarts. Run the admin
+commands as that user (`sudo -u voipc voipc-server …`, as §3 says), never as root.
+
+**When an update does not start.** The new binary marks its first start, and clears the mark
+once it serves. A start that finds the mark still set, because the one before it never got
+ready, puts `voipc-server.previous` back, lists that version in `voipc-server.failed`, and
+starts the previous binary. `Restart=on-failure` (§3) is what starts it again. If the new
+binary had already migrated the accounts database, the previous one refuses it: stop the
+service, delete `voipc.db-wal` and `voipc.db-shm`, copy
+`voipc-server.accounts-before-<version>.db` over `voipc.db`, and start it.
+
+**By hand:** `enabled = false` stops the checks. The binary in place stays whatever it is; put
+another one there to go back (§8).

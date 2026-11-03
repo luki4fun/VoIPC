@@ -25,7 +25,9 @@
   import { users } from "../stores/users.js";
   import { emoteLimits, emoteSets, noteEmotes, pendingImport } from "../stores/emotes.js";
   import { showAdminPanel } from "../stores/admin-ui.js";
-  import { EMOTE_TOKEN, isEmoteReaction, stickerText, tokenize } from "../emote-rules.js";
+  import { EMOTE_TOKEN, isEmoteReaction, stickerText, tokenize, tokensFor } from "../emote-rules.js";
+  import { chatEvents, emoteTokenHex } from "../relay-rules.js";
+  import { olderRelay } from "../stores/relay.js";
   import { expiryFor, messageRefs, pinnedOf, rowKey, sameRow, splitChatKey, type ChatPlace } from "../chat-rules.js";
   import { threadView } from "../thread-rules.js";
   import type { ChatEvent, ChatMessage, FileConv, FileRef, Forwarded } from "../types.js";
@@ -580,8 +582,10 @@
     const { fwd, event, ttlCap } = more;
     const capped = (ttl: number) => (ttlCap === undefined ? ttl || null : Math.min(ttl || Infinity, ttlCap));
     const server = t.server;
-    // `:name:` of a server emote goes as its token (emote-rules.ts)
-    content = tokenize(content, get(emoteSets.peek(server)).emotes);
+    // `:name:` of a server emote goes as its token (emote-rules.ts), as long
+    // as the relay's readers read it
+    const hex = emoteTokenHex(get(olderRelay.peek(server))?.protocol ?? null);
+    content = tokensFor(tokenize(content, get(emoteSets.peek(server)).emotes), hex);
     noteEmotes(server, [...content.matchAll(EMOTE_TOKEN)].map((m) => m[1]));
     try {
       // The destruction timer this conversation carries, stamped inside the
@@ -719,6 +723,8 @@
             }
           }
         : undefined;
+    // A relay of 1.0's protocol: its apps show none of these (relay-rules.ts)
+    if (!chatEvents($olderRelay?.protocol ?? null)) return { makeEmote };
     if (!canAnswer || held) return { forward, makeEmote };
     // The conversation these messages are in, read now: a delete is sent
     // after its question is answered, by when another one may be on screen
