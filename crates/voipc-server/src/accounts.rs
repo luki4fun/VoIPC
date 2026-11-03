@@ -42,12 +42,89 @@ use voipc_protocol::types::{
 use crate::config::{AccountsConfig, AccountsMode, RegistrationMode};
 use crate::state::ServerState;
 
-/// Kick, ban, and every channel's settings.
-pub const MODERATE: &str = "voipc:moderate";
-const APP_SCOPES: &[ScopeDef] = &[ScopeDef {
-    name: MODERATE,
-    description: "Kick, ban and change any channel's settings",
-}];
+/// The privileges this relay checks (1.7). Each is a scope a group (an l4f
+/// role) can hand out; `*` holds them all and alone sees behind anonymity.
+pub const KICK: &str = "voipc:kick";
+pub const BAN: &str = "voipc:ban";
+pub const BANS: &str = "voipc:bans";
+pub const CHANNELS: &str = "voipc:channels";
+pub const EMOTES: &str = "voipc:emotes";
+const APP_SCOPES: &[ScopeDef] = &[
+    ScopeDef {
+        name: KICK,
+        description: "Kick people from the server and from any channel",
+    },
+    ScopeDef {
+        name: BAN,
+        description: "Ban people, by address and account",
+    },
+    ScopeDef {
+        name: BANS,
+        description: "See the ban list, lift bans, ban an account by name",
+    },
+    ScopeDef {
+        name: CHANNELS,
+        description: "Change the settings and gates of the channels you can see",
+    },
+    ScopeDef {
+        name: EMOTES,
+        description: "Add, rename and remove the server's emotes and stickers",
+    },
+];
+/// Before 1.7, the moderator's one scope: what it became.
+const MODERATE_WAS: &str = "voipc:moderate";
+const MODERATOR: [&str; 3] = [BAN, CHANNELS, KICK];
+
+/// What a session may do, one bit per privilege (`UserSession::can`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Powers(u8);
+
+impl Powers {
+    pub const KICK: Powers = Powers(1);
+    pub const BAN: Powers = Powers(1 << 1);
+    pub const BANS: Powers = Powers(1 << 2);
+    pub const CHANNELS: Powers = Powers(1 << 3);
+    pub const EMOTES: Powers = Powers(1 << 4);
+    pub const USERS_READ: Powers = Powers(1 << 5);
+    pub const USERS_ADMIN: Powers = Powers(1 << 6);
+    pub const ROLES_ADMIN: Powers = Powers(1 << 7);
+
+    pub fn of(scopes: &[String]) -> Powers {
+        [
+            (KICK, Powers::KICK),
+            (BAN, Powers::BAN),
+            (BANS, Powers::BANS),
+            (CHANNELS, Powers::CHANNELS),
+            (EMOTES, Powers::EMOTES),
+            ("users:read", Powers::USERS_READ),
+            ("users:admin", Powers::USERS_ADMIN),
+            ("roles:admin", Powers::ROLES_ADMIN),
+        ]
+        .into_iter()
+        .filter(|(s, _)| scope::allowed(scopes, s))
+        .fold(Powers::default(), |a, (_, p)| Powers(a.0 | p.0))
+    }
+
+    pub fn has(self, p: Powers) -> bool {
+        self.0 & p.0 == p.0
+    }
+}
+
+/// The groups an account counts in, and the badges they show (1.7). A group
+/// counts only once its privileges apply (`scope::covers` by the effective
+/// scopes), so one waiting for codes neither opens a gated channel nor shows
+/// its badge; a group with no privileges always counts.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Standing {
+    pub groups: Vec<String>,
+    pub badges: Vec<String>,
+}
+
+/// `*`: every privilege. `allowed` never answers for it (a wildcard is no
+/// requirement); `covers` does.
+pub fn is_star(scopes: &[String]) -> bool {
+    scope::covers(scopes, &["*".to_string()])
+}
 
 /// The vault's blobs, in l4f's storage under this namespace.
 const VAULT_NS: &str = "voipc";
@@ -103,7 +180,9 @@ macro_rules! db {
     };
 }
 
+mod admin;
 pub mod bans;
+pub mod gates;
 pub mod log;
 
 /// What l4f calls back into.
@@ -419,6 +498,23 @@ impl Relay {
     }
 
     /// The account as the client is told about it.
+    /// The account's `Standing`: one read of its roles.
+    pub async fn standing(&self, user: &User, scopes: &[String]) -> Result<Standing> {
+        let mut standing = Standing::default();
+        for role in self.store().user_roles(user.id).await? {
+            if !scope::covers(scopes, &role.scopes) {
+                continue;
+            }
+            if let Some(b) = role.badge.filter(|b| !b.is_empty()) {
+                if standing.badges.len() < voipc_protocol::types::MAX_BADGES {
+                    standing.badges.push(b);
+                }
+            }
+            standing.groups.push(role.name);
+        }
+        Ok(standing)
+    }
+
     pub async fn info_of(&self, user: &User, scopes: &[String]) -> Result<AccountInfo> {
         Ok(AccountInfo {
             id: user.id.0,
@@ -496,17 +592,36 @@ async fn relay_id(store: &Store) -> Result<[u8; 16]> {
 }
 
 async fn ensure_moderator(store: &Store) -> Result<()> {
+    // Every boot: a role given `voipc:moderate` before 1.7 keeps what it
+    // granted, under the scopes that replaced it. Writes nothing once done.
+    for role in store.roles().await? {
+        if role.scopes.iter().any(|s| s == MODERATE_WAS) {
+            let mut scopes: Vec<String> = role
+                .scopes
+                .iter()
+                .filter(|s| *s != MODERATE_WAS)
+                .cloned()
+                .chain(MODERATOR.iter().map(|s| s.to_string()))
+                .collect();
+            scopes.sort();
+            scopes.dedup();
+            store
+                .set_role_scopes(role.id, &scopes)
+                .await
+                .map_err(|e| anyhow!("moving {} off voipc:moderate: {e:?}", role.name))?;
+        }
+    }
     if store.role_by_name("moderator").await?.is_some() {
         return Ok(());
     }
-    // None: another boot made it first. The scope comes in the same
+    // None: another boot made it first. The scopes come in the same
     // transaction, so a crash never leaves a moderator role that grants nothing.
     store
         .create_role_with_scopes(
             "moderator",
-            "Kick, ban and change any channel's settings",
+            "Kick, ban and change the channels' settings",
             Some("mod"),
-            &[MODERATE.to_string()],
+            &MODERATOR.map(String::from),
         )
         .await?;
     Ok(())
@@ -645,6 +760,7 @@ pub struct SignedIn {
     pub token: String,
     pub info: SessionInfo,
     pub scopes: Vec<String>,
+    pub standing: Standing,
     pub account: AccountInfo,
     pub identity_key: Vec<u8>,
     pub prekey_bundle: PreKeyBundleData,
@@ -1173,12 +1289,14 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
             .map_err(|_| gone())?,
     }
     let account = relay.info_of(&user, &scopes).await.map_err(|_| gone())?;
+    let standing = relay.standing(&user, &scopes).await.map_err(|_| gone())?;
     info!(user = %user.id.hex(), method = %info.method, "account signed in");
     Ok(SignedIn {
         user,
         token: session.token,
         info,
         scopes,
+        standing,
         account,
         identity_key,
         prekey_bundle,
@@ -1417,18 +1535,9 @@ async fn sign_out_account(state: &ServerState, user: AccountId) {
     }
 }
 
-/// `is_admin` / `is_moderator` as the scopes say.
-pub fn powers(scopes: &[String]) -> (bool, bool) {
-    // `allowed` never answers for `*` (a wildcard is no requirement); `covers` does.
-    (
-        scope::covers(scopes, &["*".to_string()]),
-        scope::allowed(scopes, MODERATE),
-    )
-}
-
 /// One `AccountRequest` from a signed-in connection.
 pub async fn handle_request(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     session_id: u32,
     req: AccountRequest,
     tx: &mpsc::Sender<Vec<u8>>,
@@ -1698,6 +1807,9 @@ pub async fn handle_request(
         }
         AccountRequest::LogLeave { conv } => log::leave(&relay, user.id, &conv).await?,
         AccountRequest::LogMembers { conv } => log::members_of(&relay, user.id, &conv).await?,
+        AccountRequest::Admin { op, code } => {
+            admin::handle(state, &relay, session_id, &user, &ctx, op, code).await?
+        }
     };
     crate::session::send_msg(tx, &reply(out))
 }
@@ -1868,7 +1980,7 @@ async fn tell(state: &ServerState, account: &[u8; 16], r: AccountReply) {
 /// Re-reads the account after a change (codes on, a role granted) and tells
 /// the client; an admin it became is announced to everyone as before.
 pub async fn refresh(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     relay: &Relay,
     session_id: u32,
     user: AccountId,
@@ -1888,17 +2000,22 @@ pub async fn revalidate(state: &Arc<ServerState>) {
     let Some(relay) = state.accounts.clone() else {
         return;
     };
-    let live: Vec<(u32, String, Vec<String>, bool)> = state
+    let live: Vec<(u32, String, Vec<String>, bool, Standing)> = state
         .sessions
         .iter()
         .filter_map(|e| {
-            e.value()
-                .account
-                .as_ref()
-                .map(|a| (*e.key(), a.token.clone(), a.scopes.clone(), a.needs_2fa))
+            e.value().account.as_ref().map(|a| {
+                (
+                    *e.key(),
+                    a.token.clone(),
+                    a.scopes.clone(),
+                    a.needs_2fa,
+                    a.standing.clone(),
+                )
+            })
         })
         .collect();
-    for (session_id, token, scopes, needs_2fa) in live {
+    for (session_id, token, scopes, needs_2fa, standing) in live {
         match relay.accounts.session_from_token(&token, util::now()).await {
             Ok(None) => {
                 // The token may have been rotated while this pass ran (turning
@@ -1920,12 +2037,17 @@ pub async fn revalidate(state: &Arc<ServerState>) {
             Ok(Some((user, _, now))) => {
                 // A role given to an account without codes changes no scope
                 // (its rights wait for them), only what the account is asked.
+                // A group without privileges changes standing alone
                 let changed = now != scopes
                     || relay
                         .accounts
                         .needs_2fa(&user)
                         .await
-                        .is_ok_and(|n| n != needs_2fa);
+                        .is_ok_and(|n| n != needs_2fa)
+                    || relay
+                        .standing(&user, &now)
+                        .await
+                        .is_ok_and(|s| s != standing);
                 if changed {
                     if let Err(e) = apply_scopes(state, &relay, session_id, user, now).await {
                         warn!("a change from the server's shell: {e}");
@@ -1937,35 +2059,52 @@ pub async fn revalidate(state: &Arc<ServerState>) {
     }
 }
 
-/// The session's powers as `scopes` say, and the account told.
+/// The session's powers as `scopes` say, and the account told. A change of
+/// groups reaches what they see and where they may be (`gates`), one of
+/// badges or privileges the rosters showing them.
 async fn apply_scopes(
-    state: &ServerState,
+    state: &Arc<ServerState>,
     relay: &Relay,
     session_id: u32,
     user: User,
     scopes: Vec<String>,
 ) -> Result<()> {
     let info = relay.info_of(&user, &scopes).await?;
-    let (tx, user_id, is_admin, became_admin) = {
+    let standing = relay.standing(&user, &scopes).await?;
+    let (tx, user_id, channel_id, is_admin, became_admin, regated, shown) = {
         let Some(mut s) = state.sessions.get_mut(&session_id) else {
             return Ok(());
         };
-        let was_admin = s.is_admin;
+        let (was_admin, was_editor) = (s.is_admin, s.powers.has(Powers::CHANNELS));
         s.set_scopes(user, scopes);
+        let mut old = Standing::default();
         if let Some(a) = s.account.as_mut() {
             a.needs_2fa = info.needs_2fa;
+            old = std::mem::replace(&mut a.standing, standing);
         }
+        let new = s.account.as_ref().map(|a| &a.standing);
         (
             s.control_tx.clone(),
             s.user_id,
+            s.channel_id,
             s.is_admin,
             s.is_admin != was_admin,
+            s.is_admin != was_admin || new.is_some_and(|n| n.groups != old.groups),
+            s.powers.has(Powers::CHANNELS) != was_editor
+                || new.is_some_and(|n| n.badges != old.badges),
         )
     };
     crate::session::send_msg(&tx, &ServerMessage::Account(AccountReply::Info(info)))?;
     if became_admin {
         let data = encode_server_msg(&ServerMessage::AdminStatus { user_id, is_admin })?;
         state.broadcast_raw_to_all(&data).await;
+    }
+    if regated {
+        crate::gates::standing_changed(state, session_id).await;
+    }
+    if shown {
+        let info = crate::session::user_info_for(state, user_id, session_id, channel_id);
+        crate::session::broadcast_user_updated(state, info).await;
     }
     Ok(())
 }
@@ -2028,5 +2167,66 @@ mod tests {
         for suffix in ["", "-wal", "-shm", ".lock"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
         }
+    }
+
+    #[tokio::test]
+    async fn a_role_made_before_fine_scopes_keeps_what_it_granted() {
+        let db =
+            std::env::temp_dir().join(format!("voipc-moderate-{:08x}.db", rand::random::<u32>()));
+        let url = format!("sqlite://{}?mode=rwc", db.display());
+        let cfg = AccountsConfig {
+            mode: AccountsMode::Optional,
+            ..Default::default()
+        };
+        let store = Store::connect(&url).await.unwrap();
+        Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+            .await
+            .unwrap();
+        // As a 1.6 relay left them: its moderator, and a role of the owner's
+        let moderator = store.role_by_name("moderator").await.unwrap().unwrap();
+        store
+            .set_role_scopes(moderator.id, &[MODERATE_WAS.to_string()])
+            .await
+            .unwrap();
+        store
+            .create_role_with_scopes(
+                "helpers",
+                "",
+                None,
+                &[MODERATE_WAS.to_string(), "users:read".to_string()],
+            )
+            .await
+            .unwrap();
+        Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+            .await
+            .unwrap();
+        let scopes = |name: &'static str| {
+            let store = store.clone();
+            async move { store.role_by_name(name).await.unwrap().unwrap().scopes }
+        };
+        assert_eq!(
+            scopes("moderator").await,
+            ["voipc:ban", "voipc:channels", "voipc:kick"]
+        );
+        assert_eq!(
+            scopes("helpers").await,
+            ["users:read", "voipc:ban", "voipc:channels", "voipc:kick"]
+        );
+        let p = Powers::of(&scopes("moderator").await);
+        assert!(p.has(Powers::KICK) && p.has(Powers::BAN) && p.has(Powers::CHANNELS));
+        assert!(!p.has(Powers::BANS) && !p.has(Powers::EMOTES));
+        for suffix in ["", "-wal", "-shm", ".lock"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", db.display()));
+        }
+    }
+
+    #[test]
+    fn powers_follow_wildcards_and_nothing_else() {
+        let p = |s: &[&str]| Powers::of(&s.iter().map(|s| s.to_string()).collect::<Vec<_>>());
+        assert!(p(&["voipc:*"]).has(Powers::EMOTES));
+        assert!(!p(&["voipc:*"]).has(Powers::USERS_READ));
+        assert!(p(&["*"]).has(Powers::ROLES_ADMIN));
+        assert_eq!(p(&["voipc:kickx", "voipcx:kick"]), Powers::default());
+        assert!(is_star(&["*".into()]) && !is_star(&["voipc:*".into()]));
     }
 }

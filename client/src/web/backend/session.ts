@@ -709,6 +709,13 @@ export class Session implements SessionContext, AccountHost {
         this.emit("user-joined", b.user);
         break;
       }
+      case "UserUpdated":
+        this.account?.noteRoster(this, [b.user]);
+        this.emit("user-updated", b.user);
+        break;
+      case "ListenOnly":
+        this.emit("listen-only", { channel_id: b.channel_id, on: b.on });
+        break;
       case "UserLeft": {
         const uid: number = b.user_id;
         // Leaving a text channel is not leaving the server: the person is

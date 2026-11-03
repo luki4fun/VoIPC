@@ -489,6 +489,73 @@ pub enum AccountRequest {
         totp: Option<String>,
         recovery_code: Option<String>,
     },
+
+    // ── Server administration (protocol v16) ──
+    /// One admin step; each needs its privilege. `code` is a fresh code from
+    /// the authenticator app for a step that hands out power, when
+    /// `AdminReply::StepUp` asked for one; it is good for ten minutes.
+    Admin {
+        op: AdminOp,
+        code: Option<String>,
+    },
+}
+
+/// What an admin asks for (`AccountRequest::Admin`). A step that changes
+/// something is answered with the fresh state it changed.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AdminOp {
+    /// Accounts whose name contains `search`, newest first, a page at a time.
+    Users {
+        search: String,
+        offset: u32,
+    },
+    /// One account, its groups and its history.
+    User {
+        id: [u8; 16],
+    },
+    Grant {
+        id: [u8; 16],
+        group: String,
+    },
+    /// Taking away a group with privileges signs the account out.
+    Revoke {
+        id: [u8; 16],
+        group: String,
+    },
+    /// Removes the account's codes and remembered devices; it signs in with
+    /// its password next.
+    Reset2fa {
+        id: [u8; 16],
+    },
+    Groups,
+    /// Create (`create`) or change a group.
+    GroupSave {
+        create: bool,
+        group: GroupInfo,
+    },
+    GroupDelete {
+        name: String,
+    },
+    GroupMembers {
+        name: String,
+        offset: u32,
+    },
+    Invites,
+    /// `days` 1 to 30; `name`: only that name may sign up with it.
+    InviteNew {
+        name: Option<String>,
+        days: u8,
+    },
+    InviteRevoke {
+        id: String,
+    },
+    GateGet {
+        channel_id: ChannelId,
+    },
+    GateSet {
+        channel_id: ChannelId,
+        gate: ChannelGate,
+    },
 }
 
 /// The relay's side of an account sign-in.
@@ -624,6 +691,46 @@ pub enum AccountReply {
     AccountDeleted,
     /// `RecoveryKeyNew` done: only the new recovery key resets the password.
     RecoveryKeyChanged,
+    /// An answer to `AccountRequest::Admin` (protocol v16); a refusal is
+    /// `Error` with `request` "Admin".
+    Admin(AdminReply),
+}
+
+/// Answers to `AdminOp`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum AdminReply {
+    Users {
+        search: String,
+        offset: u32,
+        total: u32,
+        users: Vec<AdminUser>,
+    },
+    /// Also after `Grant`, `Revoke` and `Reset2fa`.
+    User {
+        user: AdminUser,
+        groups: Vec<String>,
+        audit: Vec<AuditRow>,
+    },
+    /// Also after `GroupSave` and `GroupDelete`.
+    Groups { groups: Vec<GroupInfo> },
+    Members {
+        name: String,
+        offset: u32,
+        total: u32,
+        users: Vec<AdminUser>,
+    },
+    /// Also after `InviteRevoke`.
+    Invites { invites: Vec<InviteInfo> },
+    /// The new code, shown once.
+    InviteCode { code: String },
+    /// Also after `GateSet`. `groups`: every group's name, to pick from.
+    Gate {
+        channel_id: ChannelId,
+        gate: ChannelGate,
+        groups: Vec<String>,
+    },
+    /// This step hands out power: send it again with a code.
+    StepUp,
 }
 
 /// A wrapped epoch key for one member (`AccountRequest::EpochPut`).
@@ -997,6 +1104,15 @@ pub enum ServerMessage {
     /// An emote change was refused, or its upload failed. `name` is the
     /// emote's, empty for the sticker switch.
     EmoteError { name: String, reason: String },
+
+    // ── Groups (protocol v16) ────────────────────────────────────────
+    /// A member's badges or privileges changed: replace them in the roster.
+    /// Sent to the people the roster already shows them to.
+    UserUpdated { user: UserInfo },
+
+    /// In this channel you may only listen and read (its gate names who may
+    /// speak, and you are not in those groups), or (`on: false`) speak again.
+    ListenOnly { channel_id: ChannelId, on: bool },
 }
 
 /// `FileRefused.code`, final for this hash: not in a conversation of the

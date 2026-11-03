@@ -11,8 +11,8 @@ export interface UserInfo {
   is_screen_sharing: boolean;
   /** Logged in with the server's admin token. */
   is_admin: boolean;
-  /** Holds the moderator role (servers with accounts): kicks, bans, and every
-   *  channel's settings. */
+  /** Manages every channel (servers with accounts: `voipc:channels`, the
+   *  moderator role before 1.7); their pins count anywhere. */
   is_moderator?: boolean;
   /**
    * This user answers a newcomer's request for recent channel chat.
@@ -24,6 +24,8 @@ export interface UserInfo {
   /** The relay account they signed in with (16 bytes); absent for a guest,
    *  and never shown behind a pseudonym. */
   account?: number[] | null;
+  /** Their groups' badges (1.7), at most three; empty where `account` is. */
+  badges?: string[];
 }
 
 /** An active ban (admin view). An address ban shows the name it was given
@@ -271,9 +273,80 @@ export interface RelayAccounts {
 export interface AccountInfo {
   id: number[];
   name: string;
-  /** What it may do now: "*", "voipc:moderate", … */
+  /** What it may do now: "*", "voipc:kick", … (scopes.ts) */
   scopes: string[];
   /** It holds a role whose rights wait for a second factor. */
   needs_2fa: boolean;
   totp_enabled: boolean;
 }
+
+// ── Server administration (protocol 16) ─────────────────────────────────
+
+export interface AdminUser {
+  id: number[];
+  name: string;
+  totp: boolean;
+  /** Unix seconds. */
+  created_at: number;
+}
+
+/** A group: an account role, and the privileges (scopes) it hands out. */
+export interface GroupInfo {
+  name: string;
+  description: string;
+  /** Shown next to members' names; "" for none. */
+  badge: string;
+  scopes: string[];
+  /** `admin` and `user` (every account): never deleted. */
+  builtin: boolean;
+}
+
+export interface AuditRow {
+  event: string;
+  actor: string | null;
+  detail: string;
+  at: number;
+}
+
+export interface InviteInfo {
+  id: string;
+  name: string | null;
+  created_by: string | null;
+  expires_at: number;
+  used_by: string | null;
+}
+
+/** Who may see and join a channel, and who may speak there (group names).
+ *  Empty means everyone. */
+export interface ChannelGate {
+  groups: string[];
+  speakers: string[];
+}
+
+/** `AdminOp` as serde writes it. */
+export type AdminOp =
+  | { Users: { search: string; offset: number } }
+  | { User: { id: number[] } }
+  | { Grant: { id: number[]; group: string } }
+  | { Revoke: { id: number[]; group: string } }
+  | { Reset2fa: { id: number[] } }
+  | "Groups"
+  | { GroupSave: { create: boolean; group: GroupInfo } }
+  | { GroupDelete: { name: string } }
+  | { GroupMembers: { name: string; offset: number } }
+  | "Invites"
+  | { InviteNew: { name: string | null; days: number } }
+  | { InviteRevoke: { id: string } }
+  | { GateGet: { channel_id: number } }
+  | { GateSet: { channel_id: number; gate: ChannelGate } };
+
+/** `AdminReply` as serde writes it. */
+export type AdminReply =
+  | { Users: { search: string; offset: number; total: number; users: AdminUser[] } }
+  | { User: { user: AdminUser; groups: string[]; audit: AuditRow[] } }
+  | { Groups: { groups: GroupInfo[] } }
+  | { Members: { name: string; offset: number; total: number; users: AdminUser[] } }
+  | { Invites: { invites: InviteInfo[] } }
+  | { InviteCode: { code: string } }
+  | { Gate: { channel_id: number; gate: ChannelGate; groups: string[] } }
+  | "StepUp";

@@ -590,11 +590,11 @@ fn for_admin(
         refuse(tx, name.into(), "this server keeps no emotes".into());
         return None;
     };
-    if !state.is_admin(session) {
+    if !state.can(session, crate::accounts::Powers::EMOTES) {
         refuse(
             tx,
             name.into(),
-            "only an admin can change the server's emotes".into(),
+            "you may not change the server's emotes".into(),
         );
         return None;
     }

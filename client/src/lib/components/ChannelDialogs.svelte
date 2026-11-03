@@ -33,9 +33,12 @@
     settingsRouted,
     settingsScreenShare,
     settingsSlowMode,
+    settingsGate,
     submitChannelSettings,
     submitPasswordJoin,
+    toggleGate,
   } from "../stores/channel-ui.js";
+  import { adminGate } from "../stores/admin-ops.js";
   import { SLOW_MODE_CHOICES, slowModeLabel } from "../channel-post-rules.js";
 
   // A value from channels.json the list does not offer is still shown as it
@@ -141,6 +144,36 @@
         <input type="checkbox" data-opt="hidden" bind:checked={$settingsHidden} />
         Hidden — not listed for anyone but admins
       </label>
+      {#if $settingsGate && $adminGate}
+        {@const gate = $settingsGate}
+        {@const groups = [...$adminGate.groups].sort((a, b) => (a === "user" ? -1 : b === "user" ? 1 : a.localeCompare(b)))}
+        <div class="dialog-label">Who can see and join</div>
+        <div class="gate-groups" data-gate="groups">
+          {#each groups as g (g)}
+            <label class="dialog-check">
+              <input type="checkbox" checked={gate.groups.includes(g)} onchange={(e) => toggleGate("groups", g, e.currentTarget.checked)} />
+              {g === "user" ? "Every account" : g}
+            </label>
+          {/each}
+        </div>
+        <p class="dialog-note">
+          None ticked: everyone, guests too. Whoever is in none of the ticked groups does not see the
+          channel at all; admins always do. Losing the group moves its members out.
+        </p>
+        <div class="dialog-label">Who can speak</div>
+        <div class="gate-groups" data-gate="speakers">
+          {#each groups as g (g)}
+            <label class="dialog-check">
+              <input type="checkbox" checked={gate.speakers.includes(g)} onchange={(e) => toggleGate("speakers", g, e.currentTarget.checked)} />
+              {g === "user" ? "Every account" : g}
+            </label>
+          {/each}
+        </div>
+        <p class="dialog-note">
+          None ticked: everyone who can join. The others listen and read, and are told so; the server
+          drops what they say, post or share here.
+        </p>
+      {/if}
       {#if !$settingsIsText}
         <label class="dialog-check">
           <input type="checkbox" data-opt="anonymous" bind:checked={$settingsAnonymous} />
@@ -229,12 +262,20 @@
     z-index: var(--z-dialog);
   }
 
+  .gate-groups {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0 14px;
+  }
+
   .password-dialog {
     background: var(--bg-secondary);
     border: 1px solid var(--border);
     border-radius: 8px;
     padding: 20px;
     min-width: 280px;
+    /* Its notes are long: without a cap they stretched it across the window */
+    max-width: min(520px, calc(100vw - 32px));
     display: flex;
     flex-direction: column;
     gap: 12px;
@@ -252,7 +293,9 @@
   .dialog-input {
     padding: 8px 10px;
     font-size: var(--fs-md);
-    background: var(--bg-primary);
+    /* Colour only: on a select, app.css draws the chevron as the background
+       image, and the shorthand's repeat tiled it across the field */
+    background-color: var(--bg-primary);
     color: var(--text-primary);
     border: 1px solid var(--border);
     border-radius: 4px;

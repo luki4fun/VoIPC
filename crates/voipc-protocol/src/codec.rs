@@ -71,10 +71,13 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 /// v15: Emote.len/w/h, EmoteAccess.max_total_bytes/max_items, EmoteRemove of
 ///      many names, EmoteMove (pack and kind of many), EmoteTicket.name,
 ///      EmoteAdd without its own len (the emote's)
+/// v16: groups — UserInfo.badges, AccountRequest::Admin/AdminOp,
+///      AccountReply::Admin/AdminReply (users, groups and their privileges,
+///      invites, channel gates), UserUpdated, ListenOnly
 ///
 /// A relay admits only its own protocol; an app speaks its own down to
 /// `compat::OLDEST_RELAY_PROTOCOL` (1.6).
-pub const PROTOCOL_VERSION: u32 = 15;
+pub const PROTOCOL_VERSION: u32 = 16;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.

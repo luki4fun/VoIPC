@@ -19,6 +19,7 @@ mod config;
 mod emotes;
 mod files;
 mod fsutil;
+mod gates;
 mod media;
 mod presets;
 mod routing;
@@ -1059,6 +1060,10 @@ async fn main() -> Result<()> {
         accounts::locked_logs_at_boot(&state)
             .await
             .context("checking the channel logs' passwords")?;
+        gates::load(&state)
+            .await
+            .context("reading the channel gates")?;
+        gates::prune_logs(&state).await;
     }
     // What the server's shell changes (roles, codes, bans) reaches
     // connections already open.
@@ -1070,6 +1075,7 @@ async fn main() -> Result<()> {
         loop {
             every.tick().await;
             accounts::revalidate(&watched).await;
+            gates::prune_logs(&watched).await;
             match bans::load(&watched).await {
                 Ok(()) => bans::enforce(&watched, None).await,
                 Err(e) => warn!("reading the bans: {e:#}"),

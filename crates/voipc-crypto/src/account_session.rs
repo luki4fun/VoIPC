@@ -568,6 +568,7 @@ mod tests {
             shares_history: false,
             account: Some(account),
             is_moderator: false,
+            badges: vec![],
         }
     }
 

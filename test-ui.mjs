@@ -2785,7 +2785,7 @@ check(
   await ann.evaluate(setInput('.admin-dialog input[type="password"]', "e2e-admin-token-0001"));
   await ann.evaluate(click(".admin-dialog .admin-ok"));
   // The server menu's shield item says "Admin login" until the token is taken
-  const admin = await serverMenu(ann, /^(Bans and emotes|Active bans)/, { real: false, timeoutMs: 15_000 });
+  const admin = await serverMenu(ann, /^Server admin/, { real: false, timeoutMs: 15_000 });
   check("the admin token makes this tab the server's admin", admin);
   await waitFor(ann, `[...document.querySelectorAll(".admin-tabs button")].some((b) => b.textContent === "Emotes and stickers")`, 5_000).catch(() => {});
   await ann.evaluate(`[...document.querySelectorAll(".admin-tabs button")].find((b) => b.textContent === "Emotes and stickers")?.click()`);
@@ -2811,7 +2811,7 @@ check(
   const listed = await waitFor(ann, `[...document.querySelectorAll(".em > .em-list .em-name")].some((e) => e.textContent === ${JSON.stringify(`:${name}:`)})`, 20_000)
     .then(() => true, () => false);
   check("added, it is in the server's list", listed, await ann.evaluate(`(window.__toasts ?? []).slice(-3).join(" | ")`));
-  await ann.evaluate(`document.querySelector(".admin-dialog .admin-cancel")?.click()`);
+  await ann.evaluate(`document.querySelector(".admin-dialog .admin-close")?.click()`);
   await sleep(300);
   await ann.evaluate(`(() => { const input = document.querySelector(".chat-main .input-bar .chat-input"); if (!input) return false;
     input.value = ${JSON.stringify(`look :${name}:`)}; input.dispatchEvent(new Event("input", { bubbles: true }));
@@ -3295,7 +3295,7 @@ if (PORT3) {
     await four.evaluate(setInput('.admin-dialog input[type="password"]', "e2e-admin-token-0001"));
     await four.evaluate(click(".admin-dialog .admin-ok"));
     // The shield item stops saying "Admin login"; choosing it opens the panel
-    const madeAdmin = await serverMenu(four, /^(Bans and emotes|Active bans)/, { real: false, timeoutMs: 15_000 });
+    const madeAdmin = await serverMenu(four, /^Server admin/, { real: false, timeoutMs: 15_000 });
     check("the admin token makes an account with codes the first admin", madeAdmin, await four.evaluate(`(window.__toasts ?? []).join(" | ")`));
     if (madeAdmin) {
       await waitFor(four, `document.querySelector(".ban-add")`);
@@ -3315,6 +3315,36 @@ if (PORT3) {
       await four.evaluate(`${banRow}?.querySelector("button")?.click()`);
       const lifted = await waitFor(four, `!(${banRow})`, 10_000).then(() => true, () => false);
       check("Unban lifts it", listed && lifted);
+
+      // 1.7: a group, made with a fresh code, and given to that account
+      const byText = (sel, text) =>
+        `[...document.querySelectorAll(${JSON.stringify(sel)})].find((e) => e.textContent.trim() === ${JSON.stringify(text)})`;
+      await four.evaluate(`${byText(".admin-tabs button", "Groups")}?.click()`);
+      await waitFor(four, `!!${byText(".admin-dialog button", "New group")}`, 10_000);
+      await four.evaluate(`${byText(".admin-dialog button", "New group")}.click()`);
+      await waitFor(four, `document.querySelector('.admin-dialog input[aria-label="Group name"]')`);
+      await four.evaluate(setInput('.admin-dialog input[aria-label="Group name"]', "vip"));
+      await four.evaluate(setInput('.admin-dialog input[aria-label="Badge"]', "VIP"));
+      await four.evaluate(click('.group-form button[type="submit"]'));
+      const asksCode = await waitFor(four, `document.querySelector('.admin-dialog input[aria-label="Two-factor code"]')`, 10_000).then(() => true, () => false);
+      check("making a group asks for a fresh code", asksCode, await four.evaluate(`document.querySelector(".admin-dialog")?.innerText ?? ""`));
+      // One step past the sign-in's code: a code is good once
+      await four.evaluate(setInput('.admin-dialog input[aria-label="Two-factor code"]', totpAt(secret, Math.floor(Date.now() / 30_000) + 1)));
+      await four.evaluate(`${byText(".admin-dialog button", "Confirm")}.click()`);
+      const made = await waitFor(four, `[...document.querySelectorAll(".admin-dialog .list-row .row-name")].some((e) => e.textContent.trim().startsWith("vip"))`, 15_000).then(() => true, () => false);
+      check("and the code makes it", made, await four.evaluate(`(document.querySelector(".admin-error")?.textContent ?? "") + " | " + (document.querySelector(".admin-dialog")?.innerText ?? "")`));
+      await four.evaluate(`${byText(".admin-tabs button", "Users")}?.click()`);
+      await waitFor(four, `document.querySelector('.admin-dialog input[aria-label="Search accounts"]')`, 10_000);
+      await four.evaluate(setInput('.admin-dialog input[aria-label="Search accounts"]', acctB));
+      await four.evaluate(click('.admin-dialog form[role="search"] button[type="submit"]'));
+      const row = `[...document.querySelectorAll(".admin-dialog .list-row")].find((r) => r.querySelector(".row-name")?.textContent === ${JSON.stringify(acctB)})`;
+      await waitFor(four, `!!(${row})`, 10_000);
+      await four.evaluate(`${row}.click()`);
+      const vipBox = `document.querySelector('.admin-dialog input[data-group="vip"]')`;
+      await waitFor(four, `!!(${vipBox})`, 10_000);
+      await four.evaluate(`${vipBox}.click()`);
+      const given = await waitFor(four, `(${vipBox})?.checked === true && [...document.querySelectorAll(".admin-dialog .history li")].some((e) => /Given group: vip/.test(e.textContent))`, 15_000).then(() => true, () => false);
+      check("an admin gives the group, and the account's history says so", given, await four.evaluate(`(document.querySelector(".admin-error")?.textContent ?? "") + " | " + (document.querySelector(".admin-dialog")?.innerText ?? "")`));
     }
   }
   await four.send("Page.close").catch(() => {});

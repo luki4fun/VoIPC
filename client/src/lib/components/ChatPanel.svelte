@@ -17,11 +17,12 @@
   import { tick, untrack } from "svelte";
   import { channels } from "../stores/channels.js";
   import { uiPrefs } from "../stores/ui-prefs.js";
-  import { isAdmin, serverAddress, serverKey, userId, username } from "../stores/connection.js";
+  import { serverAddress, serverKey, userId, username } from "../stores/connection.js";
   import { addNotification } from "../stores/notifications.js";
   import { confirmAction } from "../stores/confirm.js";
   import { get } from "svelte/store";
   import { account, accountHex } from "../stores/account.js";
+  import { can } from "../stores/powers.js";
   import { users } from "../stores/users.js";
   import { emoteLimits, emoteSets, noteEmotes, pendingImport } from "../stores/emotes.js";
   import { showAdminPanel } from "../stores/admin-ui.js";
@@ -73,6 +74,7 @@
     showMessage,
     nsfwConsented,
     setDmMessageTtl,
+    listenOnly,
   } from "../stores/channel-ui.js";
   import { canManage, needsNsfwConsent, postBlock, slowModeLabel } from "../channel-post-rules.js";
   import { currentChannelId } from "../stores/channels.js";
@@ -172,6 +174,8 @@
   let now = $state(Date.now());
   /** Bumped on every send, so the countdown starts without waiting for a tick. */
   let sentCount = $state(0);
+  /** The channel's gate lets us only read here (`ListenOnly`). */
+  let listening = $derived(!isDmMode && !!effectiveChannel && $listenOnly.has(effectiveChannel.channel_id));
   let block = $derived.by(() => {
     void sentCount;
     if (isDmMode || !effectiveChannel) return null;
@@ -215,7 +219,9 @@
       : null,
   );
   /** Whether this conversation can be written in, answers included. */
-  let canAnswer = $derived(isDmMode ? dmReach !== "readonly" : canSendChannelMessage && block?.kind !== "announce");
+  let canAnswer = $derived(
+    isDmMode ? dmReach !== "readonly" : canSendChannelMessage && !listening && block?.kind !== "announce",
+  );
   // Raw: a $state proxy of a message is never === the message itself, and
   // these are looked up in the conversation by identity
   let replyingTo = $state.raw<ChatMessage | null>(null);
@@ -711,7 +717,7 @@
     // Its picture as the importer's first row: the file itself, which the
     // importer sanitizes and shows before anything goes up
     const makeEmote =
-      $isAdmin && $emoteLimits
+      $can("voipc:emotes") && $emoteLimits
         ? async (m: ChatMessage) => {
             const server = $serverAddress;
             try {
@@ -768,7 +774,13 @@
         key: `c${ch.channel_id}`,
         label: ch.text ? `#${ch.name}` : ch.name,
         target: { server, channelId: ch.channel_id },
-        blocked: b?.kind === "announce" ? "Only moderators post here" : b?.kind === "slow" ? `Slow mode: ${slowModeLabel(b.remainingSecs)}` : undefined,
+        blocked: $listenOnly.has(ch.channel_id)
+          ? "You can only read here"
+          : b?.kind === "announce"
+            ? "Only moderators post here"
+            : b?.kind === "slow"
+              ? `Slow mode: ${slowModeLabel(b.remainingSecs)}`
+              : undefined,
       });
     }
     for (const c of $dmConversations) {
@@ -1149,6 +1161,10 @@
       replying={replyingTo?.username ?? null}
       oncancelreply={() => (replyingTo = null)}
     />
+  {:else if canSendChannelMessage && listening}
+    <div class="preview-footer post-block" role="status">
+      <Icon name="lock" size={14} /> You can only read and listen in {channelLabel}: its groups say who speaks
+    </div>
   {:else if canSendChannelMessage && block?.kind === "announce"}
     <div class="preview-footer post-block">
       <Icon name="megaphone" size={14} /> Only moderators can post in #{channelName}

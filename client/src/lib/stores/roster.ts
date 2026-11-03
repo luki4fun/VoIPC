@@ -34,6 +34,7 @@ import {
   joinedTextChannelIds,
 } from "./chat.js";
 import { isAdmin, serverAddress, userId, voiceIsAdmin } from "./connection.js";
+import { can } from "./powers.js";
 import { channelRosters } from "./rosters.js";
 import { speakingUsers, users, visibleMembers } from "./users.js";
 import { rosterOf } from "../roster-rules.js";
@@ -92,15 +93,15 @@ export const displayChannelCreatorId: Readable<number | null> = derived(
 );
 
 /**
- * The channels a sidebar lists. A hidden one is not listed, unless you are an
- * admin or standing in it. Nor is the lobby, channel 0: it is where the server
+ * The channels a sidebar lists. A hidden one is not listed, unless you manage
+ * channels (`voipc:channels`, an admin) or stand in it. Nor is the lobby, channel 0: it is where the server
  * keeps everyone who is in no voice channel, which is not a place anybody
  * goes. Its people are the member list's "Online" group.
  */
 export const visibleChannels: Readable<ChannelInfo[]> = derived(
-  [channels, isAdmin, currentChannelId],
-  ([$channels, $admin, $current]) =>
-    $channels.filter((c) => c.channel_id !== 0 && (!c.hidden || $admin || c.channel_id === $current)),
+  [channels, can, currentChannelId],
+  ([$channels, $can, $current]) =>
+    $channels.filter((c) => c.channel_id !== 0 && (!c.hidden || $can("voipc:channels") || c.channel_id === $current)),
 );
 
 /** This channel hides its roster from us. Admins always see it. */
@@ -256,18 +257,12 @@ export const isCurrentChannelCreator: Readable<boolean> = derived(
   ([$creator, $userId, $current]) => $creator === $userId && $current !== 0,
 );
 
-/** This user holds the moderator role on the server on screen. Read off our
- *  own row in the roster, which is where the server says it. */
-export const isModerator: Readable<boolean> = derived([users, userId], ([$users, $id]) =>
-  $users.some((u) => u.user_id === $id && !!u.is_moderator),
-);
-
-/** Channel kick: the creator in their own channel, an admin or a moderator in
- *  any channel. */
+/** Channel kick: the creator in their own channel, anyone with `voipc:kick`
+ *  in any channel. */
 export const canKick: Readable<boolean> = derived(
-  [displayChannelId, isPreviewing, displayChannelCreatorId, userId, isAdmin, isModerator],
-  ([$id, $previewing, $creator, $userId, $admin, $mod]) =>
-    $id !== 0 && ((!$previewing && $creator === $userId) || $admin || $mod),
+  [displayChannelId, isPreviewing, displayChannelCreatorId, userId, can],
+  ([$id, $previewing, $creator, $userId, $can]) =>
+    $id !== 0 && ((!$previewing && $creator === $userId) || $can("voipc:kick")),
 );
 
 /** Invite: while previewing another channel, if you own the one you are in. */

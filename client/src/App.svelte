@@ -47,7 +47,7 @@
     voiceChannel,
     voiceServer,
   } from "./lib/stores/channels.js";
-  import { users, speakingUsers } from "./lib/stores/users.js";
+  import { patchUser, users, speakingUsers } from "./lib/stores/users.js";
   import { account, accountHex } from "./lib/stores/account.js";
   import { addNotification, removeNotification } from "./lib/stores/notifications.js";
   import { availableUpdate, initUpdates } from "./lib/stores/updates.js";
@@ -151,6 +151,7 @@
     dmMessageTtl,
     forgetLeft,
     isTextChannel,
+    listenOnly,
     managesChannel,
     openJoinedTextChannel,
     previewChannel,
@@ -767,6 +768,13 @@
       listenServer<{ channel_id: number; users: UserInfo[] }>("user-list", (server, data) => {
         const oldChannelId = get(currentChannelId.peek(server));
         const newChannelId = data.channel_id;
+        // A join: whether we may only listen there comes right after
+        listenOnly.of(server).update((s) => {
+          if (!s.has(newChannelId)) return s;
+          const next = new Set(s);
+          next.delete(newChannelId);
+          return next;
+        });
 
         // A text channel is a subscription: we did not move, so none of the
         // channel-switch work below applies, and the chat pane stays where the
@@ -856,6 +864,27 @@
         // Clear preview when we actually join a channel
         previewChannelId.of(server).set(null);
         previewUsers.of(server).set([]);
+      }),
+
+      // Badges or the channel-manager mark changed (1.7): in place, no count
+      listenServer<UserInfo>("user-updated", (server, u) => {
+        const patch = { badges: u.badges ?? [], is_moderator: u.is_moderator };
+        users.of(server).update((all) => patchUser(all, u.user_id, patch));
+        patchRosters(server, u.user_id, patch);
+      }),
+
+      listenServer<{ channel_id: number; on: boolean }>("listen-only", (server, d) => {
+        listenOnly.of(server).update((s) => {
+          const next = new Set(s);
+          if (d.on) next.add(d.channel_id);
+          else next.delete(d.channel_id);
+          return next;
+        });
+        const name = channelNameById(server, d.channel_id);
+        addNotification(
+          `${fromServer(server)}${d.on ? `You can only listen and read in ${name}` : `You may speak in ${name} again`}`,
+          "info",
+        );
       }),
 
       listenServer<UserInfo>("user-joined", (server, joiner) => {

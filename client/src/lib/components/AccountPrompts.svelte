@@ -13,6 +13,7 @@
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { listenServer, fromServer } from "../connect.js";
   import { account, accountHex, accountPrompt, closePrompt, relayAccounts, showPrompt } from "../stores/account.js";
+  import { privilegeLabel } from "../scopes.js";
   import { applyChannelEvent, applyStoredDmEvent, fileStoredDm, joinedTextChannelIds, purgeWritten } from "../stores/chat.js";
   import { channels, currentChannelId } from "../stores/channels.js";
   import { shareChannelHistory } from "../stores/settings.js";
@@ -299,6 +300,8 @@
         else if (prompt?.kind === "recovery-new" && prompt.server === server) keyChangedOn = server;
         break;
       case "Error":
+        // The admin panel's own (admin-ui.ts)
+        if (body.request === "Admin") break;
         if (body.request === "RecoveryKeyNew" && pendingKey?.server === server) pendingKey = null;
         if (body.request === "RecoveryKeyNew" && keyChangedOn === server) keyChangedOn = null;
         if (
@@ -469,6 +472,10 @@
     if (["totp-setup", "safety", "account", "delete", "password", "recovery-new"].includes(kind)) return () => closePrompt();
     return undefined;
   }
+
+  /** The privileges an account holds, by the names the group editor uses. */
+  const privilegeNames = (scopes: string[]) =>
+    scopes.map(privilegeLabel).join(", ");
 </script>
 
 {#if $accountPrompt}
@@ -583,7 +590,7 @@
         <!-- `p` follows the store: a handler reads p.server before closePrompt(). -->
         <h2>{$account.name}</h2>
         <p class="hint">
-          {$account.info.scopes.includes("*") ? "Admin" : $account.info.scopes.includes("voipc:moderate") ? "Moderator" : "Member"}
+          {$account.info.scopes.includes("*") ? "Admin" : $account.info.scopes.length ? privilegeNames($account.info.scopes) : "Member"}
           · two-factor codes {$account.info.totp_enabled ? "on" : "off"}
         </p>
         <div class="rows">

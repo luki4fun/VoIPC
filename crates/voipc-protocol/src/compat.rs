@@ -49,7 +49,7 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
         12,
         Side::Client,
         41,
-        "AccountRequest::RecoveryKeyNew is refused",
+        "AccountRequest::RecoveryKeyNew and Admin are refused",
     ),
     (
         12,
@@ -61,7 +61,7 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
         12,
         Side::Server,
         46,
-        "AccountReply::RecoveryKeyChanged never comes",
+        "AccountReply::RecoveryKeyChanged and Admin never come",
     ),
     (
         13,
@@ -79,6 +79,24 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
     (14, Side::Server, 0, "Authenticated with 1.4's EmoteAccess"),
     (14, Side::Server, 56, "EmoteList of 1.4's Emote"),
     (14, Side::Server, 57, "EmoteTicket without the name"),
+    (12, Side::Server, 3, "UserJoined without badges"),
+    (12, Side::Server, 5, "UserList without badges"),
+    (12, Side::Server, 18, "ChannelUsers without badges"),
+    (13, Side::Client, 41, "AccountRequest::Admin is refused"),
+    (13, Side::Server, 3, "UserJoined without badges"),
+    (13, Side::Server, 5, "UserList without badges"),
+    (13, Side::Server, 18, "ChannelUsers without badges"),
+    (13, Side::Server, 46, "AccountReply::Admin never comes"),
+    (14, Side::Client, 41, "AccountRequest::Admin is refused"),
+    (14, Side::Server, 3, "UserJoined without badges"),
+    (14, Side::Server, 5, "UserList without badges"),
+    (14, Side::Server, 18, "ChannelUsers without badges"),
+    (14, Side::Server, 46, "AccountReply::Admin never comes"),
+    (15, Side::Client, 41, "AccountRequest::Admin is refused"),
+    (15, Side::Server, 3, "UserJoined without badges"),
+    (15, Side::Server, 5, "UserList without badges"),
+    (15, Side::Server, 18, "ChannelUsers without badges"),
+    (15, Side::Server, 46, "AccountReply::Admin never comes"),
 ];
 
 /// How many messages each side had at a protocol: an index at or past it is
@@ -88,6 +106,7 @@ fn client_messages(proto: u32) -> u32 {
         ..=12 => 42,
         13 => 45,
         14 => 49,
+        15 => 50,
         _ => u32::MAX,
     }
 }
@@ -97,6 +116,9 @@ const AUTH_CONTINUE_RESET: u32 = 6;
 const EMOTE_ADD: u32 = 45;
 const EMOTE_REMOVE: u32 = 46;
 const AUTHENTICATED: u32 = 0;
+const USER_JOINED: u32 = 3;
+const USER_LIST: u32 = 5;
+const CHANNEL_USERS: u32 = 18;
 const EMOTE_LIST: u32 = 56;
 const EMOTE_TICKET: u32 = 57;
 
@@ -135,6 +157,9 @@ pub fn encode_client_msg_for(
         ClientMessage::Account(AccountRequest::RecoveryKeyNew { .. }) if proto < 13 => {
             Err(ProtocolError::NotOnThisRelay(proto))
         }
+        ClientMessage::Account(AccountRequest::Admin { .. }) if proto < 16 => {
+            Err(ProtocolError::NotOnThisRelay(proto))
+        }
         ClientMessage::EmoteAdd { emote } if proto == 14 => old(postcard::to_allocvec(&(
             EMOTE_ADD,
             EmoteAdd14 {
@@ -168,6 +193,23 @@ pub fn decode_server_msg_from(payload: &[u8], proto: u32) -> Result<ServerMessag
         (AUTHENTICATED, ..=12) => postcard::from_bytes::<Authenticated12>(rest)?.into(),
         (AUTHENTICATED, 13) => postcard::from_bytes::<Authenticated13>(rest)?.into(),
         (AUTHENTICATED, 14) => postcard::from_bytes::<Authenticated14>(rest)?.into(),
+        (USER_JOINED, _) => ServerMessage::UserJoined {
+            user: postcard::from_bytes::<UserJoined15>(rest)?.user.into(),
+        },
+        (USER_LIST, _) => {
+            let l: UserList15 = postcard::from_bytes(rest)?;
+            ServerMessage::UserList {
+                channel_id: l.channel_id,
+                users: l.users.into_iter().map(UserInfo::from).collect(),
+            }
+        }
+        (CHANNEL_USERS, _) => {
+            let l: ChannelUsers15 = postcard::from_bytes(rest)?;
+            ServerMessage::ChannelUsers {
+                channel_id: l.channel_id,
+                users: l.users.into_iter().map(UserInfo::from).collect(),
+            }
+        }
         (EMOTE_LIST, 14) => {
             let list: EmoteList14 = postcard::from_bytes(rest)?;
             ServerMessage::EmoteList {
@@ -275,6 +317,60 @@ struct EmoteTicket14 {
     ticket: String,
 }
 
+/// `UserInfo` from 1.0 to 1.6: no badges.
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "UserInfo")]
+struct UserInfo15 {
+    user_id: UserId,
+    username: String,
+    channel_id: ChannelId,
+    is_muted: bool,
+    is_deafened: bool,
+    is_screen_sharing: bool,
+    is_admin: bool,
+    shares_history: bool,
+    account: Option<[u8; 16]>,
+    is_moderator: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "UserJoined")]
+struct UserJoined15 {
+    user: UserInfo15,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "UserList")]
+struct UserList15 {
+    channel_id: ChannelId,
+    users: Vec<UserInfo15>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(rename = "ChannelUsers")]
+struct ChannelUsers15 {
+    channel_id: ChannelId,
+    users: Vec<UserInfo15>,
+}
+
+impl From<UserInfo15> for UserInfo {
+    fn from(u: UserInfo15) -> Self {
+        UserInfo {
+            user_id: u.user_id,
+            username: u.username,
+            channel_id: u.channel_id,
+            is_muted: u.is_muted,
+            is_deafened: u.is_deafened,
+            is_screen_sharing: u.is_screen_sharing,
+            is_admin: u.is_admin,
+            shares_history: u.shares_history,
+            account: u.account,
+            is_moderator: u.is_moderator,
+            badges: Vec::new(),
+        }
+    }
+}
+
 impl From<Authenticated12> for ServerMessage {
     fn from(a: Authenticated12) -> Self {
         ServerMessage::Authenticated {
@@ -356,6 +452,7 @@ impl From<&Emote> for Emote14 {
 mod tests {
     use super::*;
     use crate::codec::{encode_server_msg, try_decode_frame};
+    use crate::messages::AdminOp;
     use bytes::BytesMut;
     use serde_json::Value;
     use serde_reflection::{Tracer, TracerConfig};
@@ -475,6 +572,27 @@ mod tests {
                 variant(14, &["ServerMessage", "ENUM", "57", "EmoteTicket"]),
             ),
         ];
+        let cases = cases
+            .into_iter()
+            .chain((OLDEST_RELAY_PROTOCOL..16).flat_map(|v| {
+                [
+                    (
+                        traced::<UserJoined15>(),
+                        "UserJoined",
+                        variant(v, &["ServerMessage", "ENUM", "3", "UserJoined"]),
+                    ),
+                    (
+                        traced::<UserList15>(),
+                        "UserList",
+                        variant(v, &["ServerMessage", "ENUM", "5", "UserList"]),
+                    ),
+                    (
+                        traced::<ChannelUsers15>(),
+                        "ChannelUsers",
+                        variant(v, &["ServerMessage", "ENUM", "18", "ChannelUsers"]),
+                    ),
+                ]
+            }));
         for (reg, name, want) in cases {
             assert_eq!(shape(reg, name), want, "{name}");
         }
@@ -575,6 +693,13 @@ mod tests {
                 }),
                 12,
             ),
+            (
+                ClientMessage::Account(AccountRequest::Admin {
+                    op: AdminOp::Groups,
+                    code: None,
+                }),
+                15,
+            ),
         ];
         for (msg, v) in cases {
             assert!(
@@ -585,6 +710,50 @@ mod tests {
         // ... and the same messages are fine where they exist
         assert!(encode_client_msg_for(&ClientMessage::FileCancel { hash: [0; 32] }, 13).is_ok());
         assert!(encode_client_msg_for(&ClientMessage::EmoteStickers { on: true }, 14).is_ok());
+    }
+
+    #[test]
+    fn rosters_from_an_older_relay_come_without_badges() {
+        let old = UserInfo15 {
+            user_id: 7,
+            username: "ann".into(),
+            channel_id: 2,
+            is_muted: true,
+            is_deafened: false,
+            is_screen_sharing: false,
+            is_admin: false,
+            shares_history: true,
+            account: Some([5; 16]),
+            is_moderator: true,
+        };
+        let bytes = postcard::to_allocvec(&(USER_JOINED, UserJoined15 { user: old })).unwrap();
+        for v in OLDEST_RELAY_PROTOCOL..16 {
+            let ServerMessage::UserJoined { user } = decode_server_msg_from(&bytes, v).unwrap()
+            else {
+                panic!("UserJoined at {v}");
+            };
+            assert_eq!(
+                (
+                    user.username.as_str(),
+                    user.account,
+                    user.is_moderator,
+                    user.badges.len()
+                ),
+                ("ann", Some([5; 16]), true, 0)
+            );
+        }
+        let list = postcard::to_allocvec(&(
+            USER_LIST,
+            UserList15 {
+                channel_id: 2,
+                users: vec![],
+            },
+        ))
+        .unwrap();
+        assert!(matches!(
+            decode_server_msg_from(&list, 15).unwrap(),
+            ServerMessage::UserList { channel_id: 2, .. }
+        ));
     }
 
     #[test]
@@ -733,7 +902,8 @@ mod tests {
             }
             .unwrap()
         };
-        for v in OLDEST_RELAY_PROTOCOL..PROTOCOL_VERSION {
+        // 15's Authenticated is today's
+        for v in OLDEST_RELAY_PROTOCOL..15 {
             let ServerMessage::Authenticated {
                 user_id,
                 session_id,

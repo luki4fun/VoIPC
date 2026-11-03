@@ -2,6 +2,40 @@
 
 All notable changes to VoIPC are documented here.
 
+## [1.7.0] - release candidate
+
+Protocol 16. A 1.7 app still talks to relays back to 1.0 (protocol 12); there the admin
+panel shows bans and emotes only, and no badges. Needs l4f-accounts v0.11.0.
+
+### Added
+- **Users, groups and privileges in the app** (server menu → *Server admin*), on relays with
+  accounts ([docs/ACCOUNTS.md](docs/ACCOUNTS.md)):
+  - *Users*: search the accounts, see one's groups and history (what was done to its access,
+    by whom, never an address), give and take groups, reset two-factor codes, ban, and make
+    or revoke sign-up invites;
+  - *Groups*: make, change and delete groups, with a badge and the privileges they hand out,
+    and see who is in each.
+- **Fine privileges** instead of one moderator role: kick, ban, the ban list, channels, emotes,
+  see accounts, manage accounts, manage groups, and everything (admin). The moderator group
+  keeps kick, ban and channels; one made before 1.7 is moved over at the first start. Nobody
+  hands out more than they hold, and only an admin kicks or bans someone with a privilege.
+- **A fresh two-factor code** for steps that hand out power: giving or taking a group with
+  privileges, editing or deleting a group, resetting someone's codes. It holds ten minutes.
+- **Channel gates**: a channel's settings name the groups that may see and join it, and those
+  that may speak there. Outside the first the channel is not there at all; outside the second
+  you listen and read, the relay drops what you say, post or share, and the app says
+  *Listening only*. Losing the group moves you out, and out of its kept messages. A gate on a
+  channel from `channels.json` is kept in the accounts database.
+- **Group badges** next to names in the member list, where the account mark shows.
+
+### Changed
+- The server menu's shield item reads *Server admin*, and opens the tabs your privileges
+  allow.
+- Taking away a group without privileges no longer signs the account out (l4f-accounts
+  v0.11.0); a group with privileges still does.
+- Turning a channel's anonymity off, which shows everyone's real name there, is an admin's or
+  the channel creator's: holders of *Channels* (moderators) no longer can.
+
 ## [1.6.0] - 2026-11-03
 
 No protocol change: a 1.5 app and relay connect as before. New: this app also talks to relays

@@ -14,7 +14,7 @@
 import { derived, get, writable, type Readable, type Writable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 
-import { channels, currentChannelId, previewChannelId, previewUsers } from "./channels.js";
+import { channels, currentChannelId, previewChannelId, previewUsers, voiceServer } from "./channels.js";
 import {
   channelPassword,
   forgetChannelPassword,
@@ -40,14 +40,17 @@ import { users } from "./users.js";
 import { shortName } from "../username.js";
 import type { ChatPlace } from "../chat-rules.js";
 import { addNotification } from "./notifications.js";
-import { isModerator } from "./roster.js";
+import { relayAccounts } from "./account.js";
+import { can, canOn } from "./powers.js";
+import { adminGate, adminOp } from "./admin-ops.js";
+import { olderRelay } from "./relay.js";
 import { showChatPane } from "./platform.js";
 import { updateActiveStreamChat, updateUiPrefs, uiPrefs } from "./ui-prefs.js";
 import { streamStage } from "./screenshare.js";
 import { buildInviteLink, splitAddress } from "../invite.js";
 import { canManage, canManageAs, needsNsfwConsent, type Me } from "../channel-post-rules.js";
 import type { ProximityMode } from "../spatial.js";
-import type { ChannelInfo, ChatMessage } from "../types.js";
+import type { ChannelGate, ChannelInfo, ChatMessage } from "../types.js";
 
 // ── Create ─────────────────────────────────────────────────────────────────
 
@@ -461,11 +464,17 @@ export function cancelNsfwPrompt(): void {
 // See channel-post-rules.ts: the server enforces announcement channels and
 // slow mode; the composer asks first so a refused post is never shown as sent.
 
+/** The channels where a gate lets us only listen and read (`ListenOnly`,
+ *  1.7): the relay drops what we say there, and the app says so. */
+export const listenOnly = scoped<Set<number>>(() => new Set());
+/** `listenOnly` of the server carrying the call. */
+export const voiceListenOnly = listenOnly.at(voiceServer);
+
 /** Who we are on the server on screen, for `canManage`. */
-export const me: Readable<Me> = derived([userId, isAdmin, isModerator], ([$id, $admin, $mod]) => ({
+export const me: Readable<Me> = derived([userId, isAdmin, can], ([$id, $admin, $can]) => ({
   userId: $id,
   isAdmin: $admin,
-  isModerator: $mod,
+  isModerator: $can("voipc:channels"),
 }));
 
 /**
@@ -479,7 +488,7 @@ export function managesChannel(server: string, channelId: number, uid: number): 
   if (!ch) return false;
   const entry = get(users.peek(server)).find((u) => u.user_id === uid);
   if (uid !== get(userId.peek(server))) return canManageAs(ch, entry);
-  return canManage(ch, { userId: uid, isAdmin: get(isAdmin.peek(server)), isModerator: !!entry?.is_moderator });
+  return canManage(ch, { userId: uid, isAdmin: get(isAdmin.peek(server)), isModerator: canOn(server, "voipc:channels") });
 }
 
 /** When this client last posted in each channel, per server (ms). For slow
@@ -603,6 +612,32 @@ let settingsBefore: ChannelInfo | null = null;
 /** The server it was opened on — see `promptServer`. */
 let settingsServer = "";
 
+/** The channel's gate as the settings dialog edits it (1.7), once the relay
+ *  sent it; null where it is not ours to change. */
+export const settingsGate = writable<ChannelGate | null>(null);
+let gateBefore: ChannelGate | null = null;
+
+adminGate.all().subscribe(() => {
+  const id = get(passwordEditChannelId);
+  const g = get(adminGate.peek(settingsServer));
+  if (id === null || !g || g.channel_id !== id || get(settingsGate)) return;
+  gateBefore = { groups: [...g.gate.groups], speakers: [...g.gate.speakers] };
+  settingsGate.set({ groups: [...g.gate.groups], speakers: [...g.gate.speakers] });
+});
+
+/** Tick or untick a group in one of the gate's two lists. */
+export function toggleGate(list: keyof ChannelGate, group: string, on: boolean): void {
+  settingsGate.update((g) => {
+    if (!g) return g;
+    const rest = g[list].filter((x) => x !== group);
+    return { ...g, [list]: on ? [...rest, group].sort() : rest };
+  });
+}
+
+const sameGate = (a: ChannelGate, b: ChannelGate) =>
+  [...a.groups].sort().join(" ") === [...b.groups].sort().join(" ") &&
+  [...a.speakers].sort().join(" ") === [...b.speakers].sort().join(" ");
+
 export function canEditChannel(channel: {
   channel_id: number;
   created_by: number | null;
@@ -625,6 +660,12 @@ export function openChannelSettings(channelId: number, e?: Event): void {
   const now = (channel ?? {}) as Record<string, unknown>;
   for (const [store, key, unset] of OPTIONS) store.set(now[key] ?? unset);
   settingsBefore = channel ?? null;
+  settingsGate.set(null);
+  gateBefore = null;
+  const server = settingsServer;
+  if (canOn(server, "voipc:channels") && get(relayAccounts.peek(server)) && !get(olderRelay.peek(server))) {
+    void adminOp({ GateGet: { channel_id: channelId } }, null, server);
+  }
 }
 
 export function cancelChannelSettings(): void {
@@ -670,6 +711,10 @@ export async function submitChannelSettings(): Promise<void> {
       }
     }
     if (Object.keys(options).length > 0) await invoke("set_channel_options", { server, channelId, options });
+    const gate = get(settingsGate);
+    if (gate && gateBefore && !sameGate(gate, gateBefore)) {
+      await adminOp({ GateSet: { channel_id: channelId, gate } }, null, server);
+    }
     cancelChannelSettings();
   } catch (e) {
     console.error("Failed to change channel settings:", e);

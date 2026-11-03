@@ -38,6 +38,8 @@ fn traced_format() -> String {
         AccountRequest,
         AuthStep,
         AccountReply,
+        AdminOp,
+        AdminReply,
         Registration,
         AccountStart,
         VideoCodec,

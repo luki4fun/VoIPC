@@ -1474,7 +1474,9 @@ async fn handle_server_message(
     // behind a pseudonym, so an anonymous channel adds nothing here.
     let seen: &[UserInfo] = match &msg {
         ServerMessage::UserList { users, .. } => users,
-        ServerMessage::UserJoined { user } => std::slice::from_ref(user),
+        ServerMessage::UserJoined { user } | ServerMessage::UserUpdated { user } => {
+            std::slice::from_ref(user)
+        }
         _ => &[],
     };
     if let Some(link) = account {
@@ -1996,6 +1998,17 @@ async fn handle_server_message(
         ServerMessage::ChannelCreated { channel } => {
             upsert_channel(channels_snapshot, channel.clone());
             emit_server(app_handle, server, "channel-created", &channel);
+        }
+        ServerMessage::UserUpdated { user } => {
+            emit_server(app_handle, server, "user-updated", user);
+        }
+        ServerMessage::ListenOnly { channel_id, on } => {
+            emit_server(
+                app_handle,
+                server,
+                "listen-only",
+                serde_json::json!({"channel_id": channel_id, "on": on}),
+            );
         }
         ServerMessage::ChannelDeleted { channel_id } => {
             if let Ok(mut list) = channels_snapshot.lock() {

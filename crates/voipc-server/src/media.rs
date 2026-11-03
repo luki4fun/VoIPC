@@ -93,14 +93,24 @@ async fn handle_voice_packet(session_id: SessionId, data: Bytes, state: &ServerS
         return;
     }
 
-    // One lookup for both: this runs per voice packet per speaker.
-    let (channel_id, speaker_uid) = match state.sessions.get(&session_id) {
-        Some(session) => (session.channel_id, session.user_id),
+    // One lookup for all three: this runs per voice packet per speaker.
+    let (channel_id, speaker_uid, listen_only) = match state.sessions.get(&session_id) {
+        Some(session) => (
+            session.channel_id,
+            session.user_id,
+            session.listen_only.contains(&session.channel_id),
+        ),
         None => {
             warn!(session_id, "voice forward: session not found in state");
             return;
         }
     };
+    // The gate names who speaks here, and they are told they are not one
+    // (`ListenOnly`). A position is no speech: proximity still places them.
+    if listen_only && !is_position {
+        trace!(session_id, "voice forward: dropping (listen only)");
+        return;
+    }
 
     // Voice is disabled in the General channel (channel 0)
     if channel_id == 0 {
@@ -224,6 +234,35 @@ mod tests {
         assert_eq!(bob_media.try_recv().unwrap(), packet);
         assert!(alice_media.try_recv().is_err());
         assert!(carol_media.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_listen_only_member_is_not_heard() {
+        let state = make_state();
+        let (alice_uid, alice_sid, _) = add_user_with_media(&state, "alice");
+        let (bob_uid, bob_sid, mut bob_media) = add_user_with_media(&state, "bob");
+        put_in_channel(&state, 5, &[(alice_uid, alice_sid), (bob_uid, bob_sid)]).await;
+        state
+            .sessions
+            .get_mut(&alice_sid)
+            .unwrap()
+            .listen_only
+            .insert(5);
+        handle_packet(alice_sid, encrypted_voice(alice_sid), &state).await;
+        assert!(
+            bob_media.try_recv().is_err(),
+            "the gate's listener is dropped"
+        );
+        // ... in that channel only
+        state
+            .sessions
+            .get_mut(&alice_sid)
+            .unwrap()
+            .listen_only
+            .remove(&5);
+        let packet = encrypted_voice(alice_sid);
+        handle_packet(alice_sid, packet.clone(), &state).await;
+        assert_eq!(bob_media.try_recv().unwrap(), packet);
     }
 
     #[tokio::test]
