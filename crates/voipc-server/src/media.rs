@@ -73,7 +73,7 @@ async fn handle_voice_packet(session_id: SessionId, data: Bytes, state: &ServerS
             if is_position {
                 s.position_rate.try_consume()
             } else {
-                s.udp_voice_rate.try_consume()
+                s.voice_rate.try_consume()
             }
         })
         .unwrap_or(false);
@@ -131,23 +131,19 @@ async fn handle_voice_packet(session_id: SessionId, data: Bytes, state: &ServerS
         channel
             .members
             .iter()
-            .filter_map(|member_uid| {
-                let member_sid = *state.user_to_session.get(member_uid)?;
-                if member_sid == session_id {
+            .filter_map(|&member_uid| {
+                // A user's session id is their user id
+                if member_uid == session_id {
                     return None;
                 }
                 if routed
-                    && !state.routing.may_hear(
-                        channel_id,
-                        *member_uid,
-                        member_sid,
-                        speaker_uid,
-                        now,
-                    )
+                    && !state
+                        .routing
+                        .may_hear(channel_id, member_uid, member_uid, speaker_uid, now)
                 {
                     return None;
                 }
-                Some(state.sessions.get(&member_sid)?.media_tx.clone())
+                Some(state.sessions.get(&member_uid)?.media_tx.clone())
             })
             .collect()
     };
@@ -160,11 +156,7 @@ async fn handle_voice_packet(session_id: SessionId, data: Bytes, state: &ServerS
 
 /// Video / screen audio: forward ONLY to viewers of this sharer.
 async fn handle_video_packet(session_id: SessionId, data: Bytes, state: &ServerState) {
-    let allowed = state
-        .sessions
-        .get_mut(&session_id)
-        .map(|mut s| s.udp_video_rate.try_consume())
-        .unwrap_or(false);
+    let allowed = state.spend(session_id, |s| &mut s.video_rate);
     if !allowed {
         trace!(session_id, "video rate limit exceeded, dropping packet");
         return;

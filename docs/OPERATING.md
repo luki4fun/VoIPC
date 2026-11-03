@@ -116,7 +116,7 @@ WantedBy=multi-user.target
   `sudo tools/udp-diag.sh` shows where the packets are dropped. If you cannot open UDP, set
   `tcp_fallback = true`; clients then carry everything over the TCP port. Keep `tcp_port` equal
   to `udp_port`.
-- IPv6 and hosts with several addresses: see the notes under the config sample in the README.
+- IPv6 and hosts with several addresses: see the notes under the config sample in §13.
 
 ## 6. Accounts
 
@@ -247,9 +247,10 @@ A release candidate only gets its own `:<version>` tag. A final release also mov
 `:1.0` stays where 1.0 left it.
 
 `:1` and `:latest` follow protocol changes too. A relay that pulls either of them by itself
-(Watchtower and the like) moves to protocol 13 on the day 1.3.1 is published, and every 1.0 app
-on it is refused from then on. To keep 1.0 apps connecting, pin `:1.0` until your users have
-updated, then move to `:1.3` (§8).
+(Watchtower and the like) moves to a new protocol on the day a release that changes it is
+published, and every app on the old protocol is refused from then on. To keep those apps
+connecting, pin `:<major>.<minor>` until your users have updated, then move on (§8). Which
+release speaks which protocol: [COMPATIBILITY.md](COMPATIBILITY.md) §1.
 
 ## 11. The file cache
 
@@ -349,3 +350,102 @@ dir = "emotes"             # kept across restarts; never [files] dir, nor inside
 - **At start**, an entry whose file is missing or is not the file its hash names is dropped, and a
   file no entry names is deleted. Nothing else in `dir` is touched.
 
+
+## 13. Configuration files
+
+The server listens on port **9987** by default: UDP for the QUIC endpoint every client
+connects to, TCP for the browser page. Configure it with a TOML file, which it reads only when
+started with `-c` (`voipc-server -c server.toml`; the `admin` and `db` commands need the same
+`-c server.toml`, before the command):
+
+```toml
+host = "::"               # Bind address — "::" serves IPv6 and IPv4 from one listener; "0.0.0.0" for IPv4 only
+tcp_port = 9987           # HTTPS: the browser page, file transfers (and the TCP fallback)
+udp_port = 9987           # QUIC endpoint (all clients) — keep equal to tcp_port so one host:port reaches both
+tcp_fallback = false      # true: clients that cannot reach UDP carry everything over tcp_port (see below)
+max_users = 64
+max_connections_per_ip = 32   # A browser client holds two of these, a native client one — so 32 is sixteen browser users behind one NAT
+cert_path = "certs/server.crt"
+key_path = "certs/server.key"
+admin_token = "change-me"  # optional; unset = a random token is printed in the log at every start (with accounts, only while no account is admin)
+
+[files]                    # the encrypted file cache, on by default (§11 has every key)
+max_size_mb = 10           # largest file blob
+max_age_hours = 24         # no blob stays longer; all of them go at every start
+
+[emotes]                   # the server's emotes and stickers, on by default (§12)
+max_total_mb = 32          # all of them, held in memory; each member downloads each once
+```
+
+> **IPv6:** `host = "::"` is the default and serves both families from one listener (a host with IPv6 disabled falls back to `0.0.0.0` automatically). Do not pin `host` to a concrete IPv4 address while your domain publishes an AAAA record: the browser client then fails while everything else looks healthy, because the page and `/wt.json` are TCP and Chrome quietly falls back to IPv4 after the refused IPv6 attempt, while the WebTransport session is UDP and has no such fallback — it dies with `ERR_QUIC_PROTOCOL_ERROR`.
+
+> **UDP blocked?** Some hosts drop UDP in front of the server (a provider firewall, an
+> anti-DDoS filter): the page loads, but every client times out connecting over QUIC.
+> `sudo tools/udp-diag.sh` finds where the packets die. Where UDP cannot be opened, set
+> `tcp_fallback = true` (or pass `--tcp-fallback`): a client that does not get through over
+> QUIC within two seconds then carries the whole session — control, voice, video — through
+> a WebSocket on `tcp_port`, the port the page already uses. TCP waits for every lost packet,
+> so on a lossy network voice lags more than over QUIC; the status bar says **· TCP** while
+> it is in use. Desktop and Android clients dial the fallback on the port they were given,
+> so keep `tcp_port` equal to `udp_port`.
+
+> **VPN / multi-homed setups:** If clients connect via a domain name that resolves to a specific IP, set `host` to that IP. Otherwise the server may send QUIC packets from the wrong interface and the handshake never completes. Some options can also be passed as CLI flags (`--host`, `--tcp-port`, `--udp-port`, etc.; `voipc-server --help` lists them).
+
+Runtime settings in `server_settings.json`:
+
+```json
+{
+  "empty_channel_timeout_secs": 300,
+  "max_channels": 50,
+  "max_channel_name_len": 32,
+  "proximity_enabled": true,
+  "game_token": null
+}
+```
+
+`proximity_enabled: false` switches proximity chat off for the whole server: every channel is served as non-positional, requests to enable it are refused, and position beacons are not relayed.
+
+`game_token` (unset by default) is a bearer token a **game server** may present to `POST /game/v1/routes`, which narrows who hears whom inside a channel whose `routed` flag is on. Unset, that endpoint answers 404 and this server has no idea games exist. It is not the admin token and is deliberately much weaker: no session list, no names, no kick, no bans — only "these players may hear each other, for the next few seconds", as opaque ids it forgets.
+
+**Persistent channels** (optional): drop a `channels.json` in the directory the server runs from (or pass `--channels <path>`) to pre-create long-lived rooms that survive restarts. See [channels.example.json](../channels.example.json) — plaintext `password` fields are hashed to SHA-256 on first load and the file is rewritten atomically. Per channel:
+
+| Option | Default | Effect |
+|---|---|---|
+| `proximity` | `"off"` | `"2d"` or `"3d"` makes it a proximity room |
+| `hidden` | `false` | Not listed in the sidebar for non-admins. It can still be joined — by an invite link, by the game SDK, or by anyone who knows it is there — so it is out of the way, not locked. Give a channel a `password` if you need it shut, and both if it is the one your game drives |
+| `anonymous` | `false` | Members see each other as `Guest-1234`, a fresh name per visit. The server substitutes it everywhere, so no client ever learns the real one; admins see the real names, and no chat history is handed over in such a channel. Voice channels only, and it hides a name rather than a person: user ids are the same everywhere, so somebody who is also in a channel where you can see them can be matched up by id — which is why a text channel, one you are in *besides* the voice channel you stand in, may not be anonymous at all |
+| `screen_share` | `true` | `false` refuses screen sharing there |
+| `hide_members` | `false` | Non-admins see no member list, only whoever is speaking (and can still adjust their volume). Nobody outside is told who joins or leaves either — only that the count changed — which is the same rule a password channel follows |
+| `routed` | `false` | The server forwards each voice only to whoever should hear it, instead of to every member. For a channel a game drives, where "every member" can be a whole map. **The one option that tells this server anything about who hears whom** — members in such a channel say which of the others they want to hear, and a game server with `game_token` may narrow that further. Positions, names and audio stay as unreadable to it as ever. Everyone joining is told, and the channel is marked **R** |
+| `text` | `false` | Makes it a **text channel**: no voice, no screen share, no proximity. Joining one is a subscription rather than a move, so any number can be open at once and none of them costs the voice channel you stand in |
+| `message_ttl_secs` | `0` | A **message destruction timer**: seconds a message written here lives before every client deletes it, `0` for none. Up to 30 days. Without accounts the server stores no chat and deletes nothing — this is what the channel tells its members, and each client stamps it on what it sends, inside the encryption where the relay cannot reach it. With accounts, the server also deletes the copies members keep there when their timer runs out. It applies to what is written from then on, not to what people already have |
+| `auto_join` | `false` | Only with `text`. Clients join this channel on connect. A user who leaves it is not brought back — the client remembers that, which is why the server joins nobody by itself. There is no limit on how many a client holds: the budgets that pay for joining them are sized from how many channels this server has |
+| `announce` | `false` | Only with `text`. An **announcement channel**: only its managers — admins and moderators, and for a channel somebody created, its creator — may post, and the server refuses everybody else's messages. It reads none of them; who posts where is all it checks. A member's shared history from such a channel is still shown as second-hand, as everywhere |
+| `slow_mode_secs` | `0` | **Slow mode**: each member may post once per this many seconds, up to 6 hours; `0` is off. The server holds them to it, the channel's managers are exempt, and the chat shows the countdown rather than letting a message be sent and refused |
+| `nsfw` | `false` | Marks the channel **18+**. Each app asks its user, once per server, to confirm being 18 or older before joining or showing such a channel, and never joins one by itself (`auto_join` waits for that answer). The server only carries the flag. It is a question, not an age check: give the channel a `password` too if it has to stay shut |
+
+The creator of a channel, or any admin or moderator, can change these at runtime through the channel's gear icon. Channels from `channels.json` have no creator, so only admins and moderators can change those.
+
+**Channel presets.** Rather than writing `channels.json` by hand, start from one of the built-in layouts and edit from there:
+
+```bash
+./voipc-server channels presets                   # list them
+./voipc-server channels init community            # write channels.json from one
+./voipc-server channels init roleplay --dry-run   # look first; writes nothing
+```
+
+| Preset | For |
+|---|---|
+| `starter` | A small all-round server: one chat everybody lands in, a few rooms, AFK |
+| `gaming` | A friend group or multi-game community: game rooms, a stream room, a proximity campfire, a looking-for-group board with slow mode |
+| `roleplay` | A role-play game server: a hidden, locked, routed `Ingame` channel the game drives ([SDK.md](SDK.md)), out-of-character rooms, support and whitelist rooms, staff-only announcements |
+| `mmo` | A guild or clan (WoW, FFXIV and co): guild hall, raid comms, party rooms capped at eight, raid sign-ups that expire with the weekly lockout, officers' rooms |
+| `competitive` | Shooters and MOBAs: duo, trio, squad and five-stack rooms capped at their size, an in-house lobby with two team rooms, VOD review |
+| `tabletop` | Pen & paper: a proximity table the game master shares a map at, a whisper corner, a tavern, lore and character channels |
+| `study` | A study group or co-working: a silent room, a proximity library, small group rooms, one-to-one tutoring |
+| `lan` | A LAN party or tournament: info and brackets only the orga posts in, match rooms per team, a locked casters' room, a help desk |
+| `project` | A team, Slack-style: announcements, team channels, written stand-ups, meeting rooms, a proximity virtual office |
+| `family` | Family and friends: a chat everyone lands in, a living room, movie and game nights, a locked corner for the grown-ups |
+| `community` | Creators and communities: moderator-only announcements, slow mode, feedback and bug reports, a stage, playtests, and a locked 18+ area |
+
+No preset ships a password: one in a preset would be the same on every server that used it. Every locked channel is given a fresh random one instead, printed once when `init` runs; the file keeps only its hash. Where a layout needs server settings — `roleplay` a `game_token`, `family` and `community` a lower `max_channels` — `init` writes `server_settings.json` if there is none, and otherwise leaves yours alone and prints what to put in it. An existing `channels.json` is only replaced with `--force`, which keeps the old one as `channels.json.bak` (`.bak.2` and so on after that). `--out` writes it elsewhere; `--channels` and `--settings` choose other paths too, but go before the command: `voipc-server --settings path/server_settings.json channels init roleplay`. What comes out is an ordinary `channels.json`: restart the server to load it. A preset copied by hand still says `"<generate>"` where a secret belongs, and the server refuses to start on it rather than lock a channel with a password everybody can read.

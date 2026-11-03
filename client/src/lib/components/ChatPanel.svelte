@@ -6,8 +6,8 @@
     /**
      * Extra controls for the right-hand end of the header.
      *
-     * The classic layout has a voice bar to put its room and mixer buttons in;
-     * the modern one does not, so they live here. A snippet rather than a
+     * The room and mixer buttons, where a shell has no voice bar to put them
+     * in. A snippet rather than a
      * `variant` string: one prop, and the shell keeps its own markup.
      */
     headerExtra?: Snippet;

@@ -20,6 +20,9 @@
 //! Never mid-call: installing restarts the app, so it is refused while this
 //! app is in voice anywhere.
 
+#[cfg(not(target_os = "android"))]
+use std::sync::PoisonError;
+
 use serde::Serialize;
 
 /// Release candidates read a fixed release, which the publish job keeps
@@ -89,11 +92,11 @@ mod desktop {
         pub fn pending(&self) -> Option<Update> {
             self.pending
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
+                .unwrap_or_else(PoisonError::into_inner)
                 .clone()
         }
         fn set(&self, update: Option<Update>) {
-            *self.pending.lock().unwrap_or_else(|p| p.into_inner()) = update;
+            *self.pending.lock().unwrap_or_else(PoisonError::into_inner) = update;
         }
     }
 

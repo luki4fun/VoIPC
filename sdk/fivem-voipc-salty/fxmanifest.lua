@@ -3,7 +3,6 @@ game 'gta5'
 
 name 'fivem-voipc-salty'
 description 'SaltyChat exports, answered by VoIPC — no TeamSpeak, no plugin, no licence server'
-version '0.8.0'
 
 -- Independently written. This resource answers the export *names* SaltyChat's
 -- FiveM resource answers — an interface, which is not a work of authorship —

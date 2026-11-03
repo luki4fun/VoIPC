@@ -167,3 +167,42 @@ jobs:
             echo "::error title=not reproducible::two clean builds of $GITHUB_SHA differ in: $differ"
             exit 1
           fi
+
+  # The native Windows build: setup.ps1, then the desktop task's Windows branch
+  # (MSVC environment, the pinned FFmpeg, DLL staging). Releases are
+  # cross-built on Linux, so nothing else runs this path, and a failure here is
+  # a Windows developer's `npm run dev` that no longer works.
+  windows-native:
+    name: Windows native build
+    runs-on: windows-2025
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with: { persist-credentials: false }
+
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      # The image has Rust, CMake, LLVM and Visual Studio. NASM and protoc come
+      # from Chocolatey: what setup.ps1 installs with winget reaches PATH only
+      # in a new terminal, which a job never opens.
+      - name: NASM and protoc
+        run: |
+          choco install nasm protoc -y --no-progress
+          Add-Content $env:GITHUB_PATH "C:\Program Files\NASM"
+
+      - name: Rust toolchain
+        run: rustup toolchain install
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: '. -> target'
+
+      - name: setup.ps1
+        run: .\setup.ps1
+
+      - name: Debug build, no installer
+        run: node tools/voipc.mjs build --debug --no-bundle

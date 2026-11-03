@@ -20,11 +20,6 @@
       blurb:
         "The default. Server rail, channels with the people in them, chat in the middle, members on the right. Pick a channel to look in; join from the chat pane.",
     },
-    classic: {
-      title: "Classic",
-      blurb:
-        "VoIPC's original arrangement. Channels on the left, members on the right, voice and status bars along the bottom. Pick a channel to look in; join from the chat pane.",
-    },
     stage: {
       title: "Stage",
       blurb:
@@ -45,7 +40,7 @@
   role="radio"
   aria-checked={selected}
 >
-  <span class="wire" class:modern={layout !== "classic"} aria-hidden="true">
+  <span class="wire" aria-hidden="true">
     {#if layout === "stage"}
       <span class="w-rail"></span>
       <span class="w-main">
@@ -58,7 +53,7 @@
         </span>
         <span class="w-dock"></span>
       </span>
-    {:else if layout === "modern"}
+    {:else}
       <span class="w-rail"></span>
       <span class="w-side">
         <span class="w-row"></span>
@@ -73,19 +68,6 @@
         <span class="w-input"></span>
       </span>
       <span class="w-members"></span>
-    {:else}
-      <span class="w-top"></span>
-      <span class="w-cols">
-        <span class="w-side">
-          <span class="w-row"></span>
-          <span class="w-row"></span>
-          <span class="w-row"></span>
-        </span>
-        <span class="w-main"><span class="w-body"></span></span>
-        <span class="w-members"></span>
-      </span>
-      <span class="w-bottom"></span>
-      <span class="w-bottom thin"></span>
     {/if}
   </span>
   <span class="choice-title">{title}</span>
@@ -118,7 +100,6 @@
 
   .wire {
     display: flex;
-    flex-direction: column;
     gap: 2px;
     height: 104px;
     padding: 4px;
@@ -126,29 +107,6 @@
     border: 1px solid var(--border);
     border-radius: 6px;
     overflow: hidden;
-  }
-
-  .wire.modern {
-    flex-direction: row;
-  }
-
-  .w-top,
-  .w-bottom {
-    height: 8px;
-    background: var(--bg-secondary);
-    border-radius: 2px;
-    flex-shrink: 0;
-  }
-
-  .w-bottom.thin {
-    height: 5px;
-  }
-
-  .w-cols {
-    display: flex;
-    gap: 2px;
-    flex: 1;
-    min-height: 0;
   }
 
   .w-rail {

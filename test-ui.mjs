@@ -193,6 +193,38 @@ async function hover(tab, selector) {
   return true;
 }
 
+/**
+ * Opens the server menu (the modern layout's header) and clicks the item whose
+ * label starts with `label` (or matches it, a RegExp), waiting up to `timeoutMs`
+ * for it to be there. `real: false` clicks through the DOM instead, for a
+ * moment when a toast may lie over the header.
+ */
+async function serverMenu(tab, label, { real = true, timeoutMs = 5_000 } = {}) {
+  const items = `[...document.querySelectorAll(".server-header .menu > button")]`;
+  const pick = label instanceof RegExp ? `(l) => ${label}.test(l)` : `(l) => l.startsWith(${JSON.stringify(label)})`;
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (!(await tab.evaluate(`!!document.querySelector(".server-header .menu")`))) {
+      await tab.evaluate(click(".server-header .header-btn"));
+      await waitFor(tab, `document.querySelector(".server-header .menu")`, 5_000).catch(() => {});
+    }
+    const k = await tab.evaluate(`${items}.map((e) => e.textContent.trim()).findIndex(${pick}) + 1`);
+    if (k > 0) {
+      const item = `.server-header .menu > button:nth-of-type(${k})`;
+      return real ? realClick(tab, item) : tab.evaluate(`(() => { document.querySelector(${JSON.stringify(item)}).click(); return true; })()`);
+    }
+    await tab.evaluate(click(".server-header .header-btn"));
+    if (Date.now() > deadline) return false;
+    await sleep(500);
+  }
+}
+
+/** Signed in to an account on the server on screen (ServerHeader's data-account). */
+const accountIn = ".server-header[data-account]";
+
+/** Whether this tab reads as connected: the line under your name in the user panel. */
+const connectedHere = `!/Connecting|Reconnecting|Disconnected/.test(document.querySelector(".user-panel .sub")?.textContent ?? "Disconnected")`;
+
 /** A real drag along an element, `dy` pixels vertically. */
 async function realDrag(tab, selector, dy) {
   const at = await tab.evaluate(centre(selector));
@@ -281,10 +313,10 @@ async function connect(name, tag = "") {
  *
  * Conditional, because test-web.sh runs one Chromium with one profile: every
  * tab shares localStorage, so the first browser is asked and the second is not.
- * It ANSWERS the picker rather than skipping it: the default is the modern
- * layout, and every selector below this point is the classic one's. Section 11
- * is where switching between them is exercised on purpose, through Settings,
- * which this never undoes.
+ * It ANSWERS the picker rather than skipping it, with the default (modern),
+ * which every selector below this point is written for. Section 11 is where
+ * switching layouts is exercised on purpose, through Settings, and it switches
+ * back.
  * Leaving either up would be worse than a timeout — it is a real overlay, so
  * every realClick after it would land on its backdrop and read as "element not
  * found". A timeout is a FAIL here, and the checks after it say what is wrong.
@@ -305,7 +337,7 @@ async function answerFirstRun(tab, who, timeoutMs = 15_000) {
       await waitFor(tab, `!document.querySelector(".audio-setup")`);
       quietSince = 0;
     } else if (seen.layout) {
-      await realClick(tab, '.layout-setup .layout-choice[data-layout="classic"]');
+      await realClick(tab, '.layout-setup .layout-choice[data-layout="modern"]');
       await sleep(200);
       await realClick(tab, ".layout-setup .submit-btn");
       await waitFor(tab, `!document.querySelector(".layout-setup")`);
@@ -326,9 +358,8 @@ async function answerFirstRun(tab, who, timeoutMs = 15_000) {
  *
  * `asNewUser` is what makes "a new user" true: every tab here shares one
  * Chromium profile, so the questions another tab has already ANSWERED would
- * not be asked again. It puts back the one answer that is not a skip — the
- * layout, which the shared lane has to answer to land in the classic shell —
- * and reloads so the app reads it from scratch. Nothing else is touched.
+ * not be asked again. It clears the stored appearance, the layout answer with
+ * it, and reloads so the app reads it from scratch. Nothing else is touched.
  */
 async function connectRaw(name, asNewUser = false) {
   const tab = await newTab();
@@ -374,17 +405,17 @@ check(
 );
 check(
   "and it put us in the layout that was picked",
-  await alice.evaluate(`!!document.querySelector(".app-layout") && !document.querySelector(".modern-shell")`),
+  await alice.evaluate(`!!document.querySelector(".modern-shell")`),
 );
 await sleep(800);
 
 // 0. Arriving on a server is not walking into a voice channel. The server still
 //    parks every session in its lobby, channel 0, but that is "not in voice"
-//    and the UI must say so: no General row to be standing in, a voice bar with
-//    nothing to leave, and the other people on the server listed as online.
+//    and the UI must say so: no General row to be standing in, no call to
+//    leave, and the other people on the server listed as online.
 check(
   "connecting puts you in no voice channel",
-  await alice.evaluate(`!!document.querySelector(".voice-controls .voice-disabled") && !document.querySelector(".leave-voice-btn")`),
+  await alice.evaluate(`!document.querySelector(".voice-panel .leave-btn")`),
 );
 check("the lobby is not drawn as a channel", !(await alice.evaluate(channelNames)).includes("General"));
 check(
@@ -420,6 +451,9 @@ await sleep(600);
 await alice.evaluate(setSelect(".room select.control", "round"));
 await sleep(300);
 check("an avatar is drawn in the room", await alice.evaluate(`document.querySelectorAll(".avatar").length >= 1`));
+// The room is a full-window activity, over the header the mixer button is in
+await alice.evaluate(click('button[title="Close the virtual room"]'));
+await waitFor(alice, `!document.querySelector(".room")`, 5_000).catch(() => {});
 
 // 3. The second client joins the same channel (double click, as a user would)
 await bob.evaluate(
@@ -451,13 +485,13 @@ check(
 //      swallowed — and a test that called el.click() never saw it.
 check(
   "the mixer button is in the toolbar",
-  await alice.evaluate(`!!document.querySelector('button[title^="Mixer"]')`),
+  await alice.evaluate(`!!document.querySelector('button[aria-label^="Mixing desk"]')`),
 );
-check("a real click reaches the mixer button", await realClick(alice, 'button[title^="Mixer"]'));
+check("a real click reaches the mixer button", await realClick(alice, 'button[aria-label^="Mixing desk"]'));
 await waitFor(alice, `document.querySelector(".mixer")`);
 check(
-  "the mixer owns the centre column",
-  await alice.evaluate(`!!document.querySelector(".main-content .mixer")`),
+  "the mixer opens over the chat",
+  await alice.evaluate(`!!document.querySelector(".activity .mixer")`),
 );
 check(
   "there is a master strip and one per member",
@@ -573,19 +607,10 @@ for (const width of [1280, 900, 700, 600]) {
 await alice.send("Emulation.setDeviceMetricsOverride", { width: 1280, height: 800, deviceScaleFactor: 1, mobile: false });
 await sleep(500);
 
-// Room and mixer are radio buttons, not checkboxes: opening one hands the
-// column over, so neither button can end up looking dead.
-check(
-  "the room button hands the column back",
-  await realClick(alice, 'button[title="Show the virtual room"]'),
-);
-await sleep(400);
-check(
-  "the mixer is gone while the room owns the column",
-  await alice.evaluate(`!document.querySelector(".mixer")`),
-);
-await realClick(alice, 'button[title^="Back to chat"]');
-await sleep(400);
+// The mixer is a full-window activity, and Escape is the way out of one
+await realKey(alice, "Escape");
+await sleep(500);
+check("Escape closes the mixer", await alice.evaluate(`!document.querySelector(".mixer")`));
 
 // 3b. Muting yourself has to show on your own row straight away. The server
 //     never sends UserMuted back to the session that caused it, so only the
@@ -787,14 +812,14 @@ check(
     await fresh.evaluate(`!!document.querySelector(".layout-setup")`),
   );
   check(
-    "it offers all three layouts",
-    (await fresh.evaluate(`[...document.querySelectorAll(".layout-setup .layout-choice")].map((b) => b.dataset.layout).join(",")`)) === "modern,classic,stage",
+    "it offers both layouts",
+    (await fresh.evaluate(`[...document.querySelectorAll(".layout-setup .layout-choice")].map((b) => b.dataset.layout).join(",")`)) === "modern,stage",
   );
   // The default, asserted where it is decided rather than in a unit test: this
   // client has no stored appearance at all, and it is in the modern shell.
   check(
     "a new user starts in the modern layout",
-    await fresh.evaluate(`!!document.querySelector(".modern-shell") && !document.querySelector(".app-layout")`),
+    await fresh.evaluate(`!!document.querySelector(".modern-shell")`),
   );
   await realClick(fresh, ".layout-setup .skip-link");
   await waitFor(fresh, `!document.querySelector(".layout-setup")`);
@@ -1017,16 +1042,14 @@ check(
   check(
     "Appearance offers both layouts",
     (await alice.evaluate(`!!(${pickLayout("modern")})`)) &&
-      (await alice.evaluate(`!!(${pickLayout("classic")})`)),
+      (await alice.evaluate(`!!(${pickLayout("stage")})`)),
   );
   await alice.evaluate(`(${pickLayout("modern")}).click()`);
   await sleep(500);
   await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
   await sleep(500);
 
-  check("the modern shell replaces the classic one", await alice.evaluate(
-    `!!document.querySelector(".modern-shell") && !document.querySelector(".app-layout")`,
-  ));
+  check("the modern shell is on screen", await alice.evaluate(`!!document.querySelector(".modern-shell")`));
   check("it has a server rail", await alice.evaluate(`!!document.querySelector(".server-rail")`));
   check("it has a user panel", await alice.evaluate(`!!document.querySelector(".user-panel")`));
   check("the voice bar is gone", !(await alice.evaluate(`!!document.querySelector(".voice-controls")`)));
@@ -1285,7 +1308,7 @@ check(
   await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
   await sleep(500);
   check("the stage shell replaces the modern one", await alice.evaluate(
-    `!!document.querySelector(".stage-shell") && !document.querySelector(".modern-shell") && !document.querySelector(".app-layout")`,
+    `!!document.querySelector(".stage-shell") && !document.querySelector(".modern-shell")`,
   ));
   check("the call fills the stage: there is a tile for each person in it", await alice.evaluate(
     `document.querySelectorAll("[data-stage-grid] [data-stage-tile]").length >= 1`,
@@ -1306,18 +1329,16 @@ check(
     5000,
   ).catch(() => false));
 
-  // Back to classic, in the same tab and with no reload.
+  // Back to modern, in the same tab and with no reload.
   await openAppearance();
-  await alice.evaluate(`(${pickLayout("classic")}).click()`);
+  await alice.evaluate(`(${pickLayout("modern")}).click()`);
   await sleep(500);
   await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
   await sleep(500);
-  check("switching back restores the classic shell", await alice.evaluate(
-    `!!document.querySelector(".app-layout") && !document.querySelector(".modern-shell") && !document.querySelector(".stage-shell")`,
+  check("switching back restores the modern shell", await alice.evaluate(
+    `!!document.querySelector(".modern-shell") && !document.querySelector(".stage-shell")`,
   ));
-  check("the connection survived both switches", await alice.evaluate(
-    `!!document.querySelector(".status-bar") && /Connected/.test(document.querySelector(".status-bar").textContent)`,
-  ));
+  check("the connection survived both switches", await alice.evaluate(connectedHere));
 
   // Push-to-talk lives outside the shells precisely so a switch cannot drop it.
   await alice.evaluate(click('button[title^="Mute"]'));
@@ -1327,16 +1348,14 @@ check(
   await sleep(600);
   check("and unmute too", await alice.evaluate(rowMuted(null)) === false);
 
-  // Out of the voice channel without leaving the server. A real click: this
-  // button sits in the voice bar, the bar that grew pointer behaviour before.
-  check("a real click reaches Leave voice", await realClick(alice, ".voice-controls .leave-voice-btn"));
+  // Out of the voice channel without leaving the server. A real click: the
+  // voice bar this used to sit in grew pointer behaviour once.
+  check("a real click reaches Leave voice", await realClick(alice, ".voice-panel .leave-btn"));
   await sleep(1200);
   check("Leave voice takes you out of the channel", await alice.evaluate(
-    `!!document.querySelector(".voice-controls .voice-disabled") && !document.querySelector(".leave-voice-btn")`,
+    `!document.querySelector(".voice-panel .leave-btn")`,
   ));
-  check("and keeps you on the server", await alice.evaluate(
-    `/Connected/.test(document.querySelector(".status-bar")?.textContent ?? "")`,
-  ));
+  check("and keeps you on the server", await alice.evaluate(connectedHere));
 }
 
 // 12. The phone shape. Driven at 390px with real touch events, because none of
@@ -1344,34 +1363,11 @@ check(
 //     pointer (there are buttons for that), and a drag's velocity — which is
 //     half the settle rule — is something only a finger has.
 {
-  const setLayout = async (title) => {
-    // At phone width the settings gear lives in the user panel, which is inside
-    // the channel drawer — so it has to be opened first, exactly as a person
-    // would. The apps this layout borrows from put it in the same place.
-    if (await alice.evaluate(`getComputedStyle(document.querySelector(".drawer-btn") ?? document.body).display !== "none"`)) {
-      if (!(await alice.evaluate(`document.querySelector(".pane-left")?.getBoundingClientRect().right > 8`))) {
-        await realClick(alice, ".drawer-btn");
-        await sleep(500);
-      }
-    }
-    await realClick(alice, ".settings-btn");
-    await waitFor(alice, `document.querySelector(".tab")`, 8_000);
-    await alice.evaluate(
-      `[...document.querySelectorAll(".tab")].find((b) => /appearance/i.test(b.textContent)).click()`,
-    );
-    await sleep(300);
-    await alice.evaluate(`document.querySelector('.layout-choice[data-layout="${title}"]').click()`);
-    await sleep(400);
-    await alice.evaluate(`document.querySelector(".close-btn")?.click()`);
-    await sleep(500);
-  };
-
   await alice.send("Emulation.setDeviceMetricsOverride", {
     width: 390, height: 844, deviceScaleFactor: 1, mobile: true,
   });
   await alice.send("Emulation.setTouchEmulationEnabled", { enabled: true, maxTouchPoints: 1 });
   await sleep(400);
-  await setLayout("modern");
 
   // The panes stack on the container's width, not the device's — which is why
   // this also appears in a narrow desktop window.
@@ -1431,12 +1427,11 @@ check(
   // has to work anyway for anyone who would rather not swipe. The swipe wiring
   // between the two is what needs a real device, and has not had one.
 
-  await setLayout("classic");
   await alice.send("Emulation.clearDeviceMetricsOverride");
   await alice.send("Emulation.setTouchEmulationEnabled", { enabled: false });
   await sleep(400);
-  check("the classic layout comes back at desktop width", await alice.evaluate(
-    `!!document.querySelector(".app-layout .main-content")`,
+  check("the desktop layout comes back at desktop width", await alice.evaluate(
+    `!!document.querySelector(".modern-shell") && getComputedStyle(document.querySelector(".drawer-btn") ?? document.body).display === "none"`,
   ));
 }
 
@@ -1546,7 +1541,7 @@ check(
   check("a direct message to a twin arrives", delivered);
   check("with no complaint", !(await first.evaluate(notDelivered)));
 
-  await realClick(second, ".status-bar .disconnect-btn");
+  await serverMenu(second, "Disconnect");
   await waitFor(first, `!${row}`).catch(() => {});
   await say("are you still there?");
   let told = false;
@@ -1765,26 +1760,6 @@ check(
   await realClick(guest, ".stream-stage .chat-toggle");
   check("opening the chat clears it", !(await guest.evaluate(`!!document.querySelector(".chat-toggle .unread-dot")`)));
 
-  // ── The classic layout gets the same view, chat below by default ──
-  // The modern stream view covers the whole window, Settings included, so
-  // out of it first — and back in from the classic list's own one click.
-  await realClick(guest, ".stream-stage .stop-btn");
-  await waitFor(guest, `!document.querySelector(".activity")`, 5_000).catch(() => {});
-  await useLayout(guest, "classic");
-  // Hover first: the row shows its ⋮ on hover, which moves the icon over by
-  // one button — a hand is on the row before it aims, a synthetic click is not.
-  await hover(guest, ".users .user button.status-icon.watch");
-  await realClick(guest, ".users .user button.status-icon.watch");
-  await waitFor(guest, `document.querySelector(".app-layout .stream-stage")`, 8_000).catch(() => {});
-  check(
-    "classic shows the share with its chat below",
-    await guest.evaluate(`!!document.querySelector(".app-layout .stream-stage.below .stream-chat .chat-panel")`),
-    await guest.evaluate(`JSON.stringify({
-      classic: !!document.querySelector(".app-layout"),
-      watchButton: !!document.querySelector(".users .user button.status-icon.watch"),
-      stage: document.querySelector(".stream-stage")?.className ?? null })`),
-  );
-
   // ── The sharer's preview, big ──
   await realClick(host, '.share-preview .bar-btn[title^="Enlarge"]');
   check(
@@ -1826,12 +1801,12 @@ check(
   await realClick(host, ".voice-panel .share-btn");
   await waitFor(host, `document.querySelector(".start-btn")`, 8_000).catch(() => {});
   await realClick(host, ".start-btn");
-  const hostWatch = `.users .user:has(.name[title^="ui-host-${n}"]) button.status-icon.watch`;
+  const hostWatch = `.users .user:has(.name[title^="ui-host-${n}"]) button.watch-btn`;
   await waitFor(guest, `document.querySelector(${JSON.stringify(hostWatch)})`, 10_000).catch(() => {});
   await guest.evaluate(`(() => { window.__probe = VideoDecoder.isConfigSupported;
     VideoDecoder.isConfigSupported = async (config) => ({ supported: false, config }); return true; })()`);
-  await hover(guest, hostWatch);
-  await realClick(guest, hostWatch);
+  // A DOM click: our own share's preview floats over the member list's corner
+  await guest.evaluate(click(hostWatch));
   const told = await waitFor(guest, `(window.__toasts ?? []).some((t) => /cannot decode/.test(t))`, 10_000).then(() => true, () => false);
   await sleep(1000);
   check(
@@ -1850,7 +1825,7 @@ check(
   }
   // The profile is shared by every tab: leave it in the layout the rest of
   // this file expects of a fresh connect.
-  await useLayout(host, "classic");
+  await useLayout(host, "modern");
 
   // ── An invite link: a voice channel shows, then asks; a text one opens (S-048) ──
   // The link is somebody else's idea, and a voice channel is a seat with a
@@ -1881,7 +1856,7 @@ check(
     return tab;
   };
   const confirmTitle = `document.querySelector(".confirm .dialog-title")?.textContent ?? ""`;
-  const inVoice = `!!document.querySelector(".leave-voice-btn")`;
+  const inVoice = `!!document.querySelector(".voice-panel .leave-btn")`;
   const no = await byInvite(`ui-inv-${n}`, SHOW);
   const asked = await waitFor(no, `${confirmTitle} === ${JSON.stringify(`Join voice in ${SHOW}?`)}`, 10_000).then(() => true, () => false);
   check("an invite link to a voice channel asks before it seats you", asked && !(await no.evaluate(inVoice)), await no.evaluate(confirmTitle));
@@ -2805,13 +2780,13 @@ check(
   const rowWith = (text) =>
     `[...document.querySelectorAll(".chat-main .msg")].find((e) => e.querySelector(".msg-content")?.textContent.includes(${JSON.stringify(text)}))`;
 
-  await ann.evaluate(click('button.admin-btn[title^="Admin login"]'));
+  await serverMenu(ann, "Admin login", { real: false });
   await waitFor(ann, `document.querySelector(".admin-dialog .admin-input")`);
   await ann.evaluate(setInput('.admin-dialog input[type="password"]', "e2e-admin-token-0001"));
   await ann.evaluate(click(".admin-dialog .admin-ok"));
-  const admin = await waitFor(ann, `document.querySelector(".admin-btn.active")`, 15_000).then(() => true, () => false);
+  // The server menu's shield item says "Admin login" until the token is taken
+  const admin = await serverMenu(ann, /^(Bans and emotes|Active bans)/, { real: false, timeoutMs: 15_000 });
   check("the admin token makes this tab the server's admin", admin);
-  await ann.evaluate(click("button.admin-btn.active"));
   await waitFor(ann, `[...document.querySelectorAll(".admin-tabs button")].some((b) => b.textContent === "Emotes and stickers")`, 5_000).catch(() => {});
   await ann.evaluate(`[...document.querySelectorAll(".admin-tabs button")].find((b) => b.textContent === "Emotes and stickers")?.click()`);
   await waitFor(ann, `document.querySelector(".em-pick input[type=file][multiple]")`, 5_000).catch(() => {});
@@ -2929,7 +2904,7 @@ if (PORT2) {
   check("and it is the one on screen", (await onScreen()) === S2, await onScreen());
   check("its channel list is its own", !(await alice.evaluate(channelNames)).includes(HOME));
   check("the call on server 1 carried on", /in voice/.test(await railTitle(S1)), await railTitle(S1));
-  check("and the voice bar still offers to leave it", await alice.evaluate(`!!document.querySelector(".leave-voice-btn")`));
+  check("and the voice panel still offers to leave it", await alice.evaluate(`!!document.querySelector(".voice-panel .leave-btn")`));
 
   await realClick(alice, railItem(S1));
   await sleep(800);
@@ -2962,12 +2937,10 @@ if (PORT2) {
   await sleep(600);
 
   // Disconnect is per server
-  check("a real click reaches server 2's disconnect", await realClick(alice, ".status-bar .disconnect-btn"));
+  check("a real click reaches server 2's disconnect", await serverMenu(alice, "Disconnect"));
   await sleep(1200);
   check("disconnecting server 2 closes only that one", JSON.stringify(await openIds()) === JSON.stringify([S1]), JSON.stringify(await openIds()));
-  check("server 1 is on screen and connected", (await onScreen()) === S1 && await alice.evaluate(
-    `/Connected/.test(document.querySelector(".status-bar")?.textContent ?? "")`,
-  ));
+  check("server 1 is on screen and connected", (await onScreen()) === S1 && await alice.evaluate(connectedHere));
   check("and no connect dialog came up", !(await alice.evaluate(`!!document.querySelector(".connect-btn")`)));
 
   // Starting up with both servers remembered and auto-connect on: every one of
@@ -3270,11 +3243,8 @@ if (PORT3) {
   await waitFor(three, `document.querySelector('.account-dialog[data-kind="recovery"]')`, 60_000);
   await realClick(three, '.account-dialog[data-kind="recovery"] .submit-btn');
   await settle(three, false);
-  // The account panel: the status bar's button in the classic layout this lane
-  // picks (the modern one has it in the server menu).
-  const panel = 'button[title="Your account on this server"]';
-  await waitFor(three, `document.querySelector('${panel}')`, 10_000);
-  await realClick(three, panel);
+  // The account panel: in the server menu, once the account is this connection's
+  await serverMenu(three, "Your account", { timeoutMs: 10_000 });
   await waitFor(three, `document.querySelector('.account-dialog[data-kind="account"]')`);
   await three.evaluate(`[...document.querySelectorAll('.account-dialog[data-kind="account"] .secondary')].find((e) => e.textContent.includes("Set up")).click()`);
   await waitFor(three, `document.querySelector('.account-dialog[data-kind="totp-setup"] .secret')`, 10_000);
@@ -3302,8 +3272,13 @@ if (PORT3) {
   }
   // In: the code prompt is gone and the account is this connection's (the
   // channel list alone proves nothing: the shell renders one behind the dialog).
-  const signedIn = `!document.querySelector('.account-dialog[data-kind="totp"]') && !!document.querySelector('button[title="Your account on this server"]')`;
-  const inWithCode = asked && (await waitFor(four, signedIn, 20_000).then(() => true, () => false));
+  const promptGone = `!document.querySelector('.account-dialog[data-kind="totp"]') && !document.querySelector(".connect-btn")`;
+  const inWithCode =
+    asked &&
+    (await waitFor(four, promptGone, 20_000).then(() => true, () => false)) &&
+    (await serverMenu(four, "Your account", { real: false, timeoutMs: 10_000 }));
+  // That opened the account panel; this check only wanted to see it offered
+  if (inWithCode) await realKey(four, "Escape");
   check(
     "and the code signs it in",
     inWithCode,
@@ -3314,16 +3289,15 @@ if (PORT3) {
   // (codes on) the first admin; it bans the second account by name from
   // Active bans, which then cannot sign in, and lifting it lets it back.
   if (inWithCode) {
-    // DOM clicks: a toast from the sign-in may cover the status bar. (The
-    // account's own button there is an .admin-btn too.)
-    await four.evaluate(click('button.admin-btn[title^="Admin login"]'));
+    // DOM clicks: a toast from the sign-in may cover the header
+    await serverMenu(four, "Admin login", { real: false });
     await waitFor(four, `document.querySelector(".admin-dialog .admin-input")`);
     await four.evaluate(setInput('.admin-dialog input[type="password"]', "e2e-admin-token-0001"));
     await four.evaluate(click(".admin-dialog .admin-ok"));
-    const madeAdmin = await waitFor(four, `document.querySelector(".admin-btn.active")`, 15_000).then(() => true, () => false);
+    // The shield item stops saying "Admin login"; choosing it opens the panel
+    const madeAdmin = await serverMenu(four, /^(Bans and emotes|Active bans)/, { real: false, timeoutMs: 15_000 });
     check("the admin token makes an account with codes the first admin", madeAdmin, await four.evaluate(`(window.__toasts ?? []).join(" | ")`));
     if (madeAdmin) {
-      await four.evaluate(click("button.admin-btn.active"));
       await waitFor(four, `document.querySelector(".ban-add")`);
       await four.evaluate(setInput('.ban-add input[aria-label="Account to ban"]', acctB));
       await four.evaluate(setInput('.ban-add input[aria-label="Reason"]', "e2e ban"));
@@ -3355,8 +3329,8 @@ if (PORT3) {
   await waitFor(five, `document.querySelector("#account-password")?.placeholder?.includes("remembered")`);
   await realClick(five, ".connect-btn");
   await settle(five);
-  await waitFor(five, `document.querySelector('${panel}')`, 10_000);
-  await realClick(five, panel);
+  await waitFor(five, `document.querySelector('${accountIn}')`, 10_000);
+  await serverMenu(five, "Your account");
   await waitFor(five, `document.querySelector('.account-dialog[data-kind="account"]')`);
   await five.evaluate(`[...document.querySelectorAll('.account-dialog[data-kind="account"] .row')].find((r) => r.querySelector("span")?.textContent === "Password").querySelector("button").click()`);
   await waitFor(five, `document.querySelector("#acct-old-password")`);
@@ -3391,7 +3365,7 @@ if (PORT3) {
   await clash.evaluate(`[...document.querySelectorAll(".save-server-btn")].find((b) => b.textContent.includes("Forget the account id"))?.click()`);
   await clash.evaluate(setInput("#account-password", pw2));
   await realClick(clash, ".connect-btn");
-  const newIn = await waitFor(clash, `!!document.querySelector('${panel}')`, 60_000).then(() => true, () => false);
+  const newIn = await waitFor(clash, `!!document.querySelector('${accountIn}')`, 60_000).then(() => true, () => false);
   check(
     "and once it is forgotten, the new password signs in",
     newIn,
@@ -3407,8 +3381,8 @@ if (PORT3) {
   await waitFor(keyNew, `document.querySelector("#account-password")?.placeholder?.includes("remembered")`);
   await realClick(keyNew, ".connect-btn");
   await settle(keyNew);
-  await waitFor(keyNew, `document.querySelector('${panel}')`, 10_000);
-  await realClick(keyNew, panel);
+  await waitFor(keyNew, `document.querySelector('${accountIn}')`, 10_000);
+  await serverMenu(keyNew, "Your account");
   await waitFor(keyNew, `document.querySelector('.account-dialog[data-kind="account"]')`);
   await keyNew.evaluate(`[...document.querySelectorAll('.account-dialog[data-kind="account"] .row')].find((r) => r.textContent.includes("Recovery key"))?.querySelector("button")?.click()`);
   await waitFor(keyNew, `document.querySelector('.account-dialog[data-kind="recovery-new"] #acct-recovery-password')`, 10_000).catch(() => {});
@@ -3440,11 +3414,11 @@ if (PORT3) {
   await stale.evaluate(setInput("#account-password", "reset with the old key"));
   await stale.evaluate(setInput("#account-password2", "reset with the old key"));
   await realClick(stale, ".connect-btn");
-  const staleOut = await waitFor(stale, `/does not open this account/.test(document.querySelector(".error")?.textContent ?? "") || !!document.querySelector('${panel}')`, 60_000)
+  const staleOut = await waitFor(stale, `/does not open this account/.test(document.querySelector(".error")?.textContent ?? "") || !!document.querySelector('${accountIn}')`, 60_000)
     .then(() => true, () => false);
   check(
     "and the old recovery key no longer resets the password",
-    staleOut && !(await stale.evaluate(`!!document.querySelector('${panel}')`)),
+    staleOut && !(await stale.evaluate(`!!document.querySelector('${accountIn}')`)),
     await stale.evaluate(`document.querySelector(".error")?.textContent ?? ""`),
   );
   await stale.send("Page.close").catch(() => {});
@@ -3460,7 +3434,7 @@ if (PORT3) {
   await six.evaluate(setInput("#account-password", pw3));
   await six.evaluate(setInput("#account-password2", pw3));
   await realClick(six, ".connect-btn");
-  const resetIn = await waitFor(six, `!!document.querySelector('${panel}')`, 60_000).then(() => true, () => false);
+  const resetIn = await waitFor(six, `!!document.querySelector('${accountIn}')`, 60_000).then(() => true, () => false);
   check(
     "the recovery key sets a new password and signs in with it",
     resetIn,

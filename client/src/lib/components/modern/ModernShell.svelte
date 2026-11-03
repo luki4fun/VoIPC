@@ -4,15 +4,15 @@
   // Named for what it is rather than what it borrows from. The shape is the one
   // most people arriving here have spent years in, and the pieces under
   // components/modern/ exist only for it; everything with behaviour in it is
-  // shared with the classic layout.
+  // shared with the stage layout.
   //
-  // Every behaviour-carrying piece under it is shared with the classic layout —
+  // Every behaviour-carrying piece under it is shared with the stage layout —
   // the channel dialogs, the member menu, the push-to-talk keys. What is here is
   // arrangement, plus the chrome Discord has and VoIPC did not: the rail, the
   // server header, the user panel.
   //
   // Panel widths are set on *this* element rather than on :root, which is what
-  // makes a width dragged here independent of the one the classic layout uses.
+  // makes a width dragged here independent of the one the stage layout uses.
 
   import { backdrop, dialog } from "../../actions/dialog.js";
   import { resizeHandle } from "../../actions/resizable.js";

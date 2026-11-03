@@ -14,7 +14,7 @@
   import { openDm } from "../stores/chat.js";
   import { viewingVoice } from "../stores/channels.js";
   import { isAdmin, serverAddress } from "../stores/connection.js";
-  import { isMobile, mobileTab, showChatPane } from "../stores/platform.js";
+  import { showChatPane } from "../stores/platform.js";
   import { centreView } from "../stores/room.js";
   import { canInvite, canKick, isCurrentChannelCreator, isModerator, isPreviewing } from "../stores/roster.js";
   import { selectedStrip, setUserVolume, toggleUserMute, userVolumes } from "../stores/mixer.js";
@@ -144,8 +144,7 @@
           class="ctx-item"
           onclick={() => {
             selectedStrip.set(menu.user.user_id);
-            if ($isMobile) mobileTab.set("mixer");
-            else centreView.set("mixer");
+            centreView.set("mixer");
             closeUserMenu();
           }}
         >

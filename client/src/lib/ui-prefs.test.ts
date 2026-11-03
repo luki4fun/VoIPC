@@ -30,7 +30,7 @@ test("nothing saved yet means the modern layout, never asked", () => {
 
 test("a full round trip keeps what was chosen", () => {
   const saved = defaultUiPrefs();
-  saved.layout = "classic";
+  saved.layout = "stage";
   saved.layout_asked_version = 1;
   saved.density = "compact";
   saved.panels.modern.members = 300;
@@ -39,18 +39,18 @@ test("a full round trip keeps what was chosen", () => {
 });
 
 test("panel widths are clamped to something you can drag back", () => {
-  const p = sanitizeUiPrefs({ panels: { classic: { sidebar: 5000, members: -20 } } });
-  assert.equal(p.panels.classic.sidebar, SIDEBAR_MAX);
+  const p = sanitizeUiPrefs({ panels: { modern: { sidebar: 5000, members: -20 } } });
+  assert.equal(p.panels.modern.sidebar, SIDEBAR_MAX);
   // Not 0: a member list dragged to nothing is one you cannot get hold of again
-  assert.ok(p.panels.classic.members >= 140);
+  assert.ok(p.panels.modern.members >= 140);
 });
 
 test("a width that is not a number falls back instead of becoming NaN", () => {
   // NaN reaches CSS as `width: NaNpx`, which is ignored — so the panel silently
   // takes its content width and the drag handle ends up somewhere unrelated.
-  const p = sanitizeUiPrefs({ panels: { classic: { sidebar: "wide" } } });
-  assert.equal(p.panels.classic.sidebar, defaultPanels("classic").sidebar);
-  assert.ok(Number.isFinite(p.panels.classic.sidebar));
+  const p = sanitizeUiPrefs({ panels: { modern: { sidebar: "wide" } } });
+  assert.equal(p.panels.modern.sidebar, defaultPanels("modern").sidebar);
+  assert.ok(Number.isFinite(p.panels.modern.sidebar));
 });
 
 test("zoom is clamped, because there is no UI left to undo it with", () => {
@@ -71,21 +71,18 @@ test("an unknown layout is not a third layout", () => {
   assert.equal(sanitizeUiPrefs({ layout: 7 }).layout, "modern");
 });
 
-test("a layout chosen under an old name is still that layout", () => {
-  // The modern one was `discord` before 0.9.0, and the classic one was briefly
-  // `legacy` while this release was being written. Reading both is the whole of
-  // the migration: nobody who chose one loses it, and the name this build uses
-  // is what gets written back.
+test("a layout chosen under an old name, or one that is gone, opens modern", () => {
+  // The modern one was `discord` before 0.9.0. Classic (briefly `legacy`) is
+  // gone: whoever chose it lands in modern, and is not asked again.
   assert.equal(sanitizeUiPrefs({ layout: "discord" }).layout, "modern");
-  assert.equal(sanitizeUiPrefs({ layout: "legacy" }).layout, "classic");
-  assert.equal(sanitizeUiPrefs({ layout: "classic" }).layout, "classic");
+  assert.equal(sanitizeUiPrefs({ layout: "legacy" }).layout, "modern");
+  assert.equal(sanitizeUiPrefs({ layout: "classic", layout_asked_version: 2 }).layout, "modern");
+  assert.equal(sanitizeUiPrefs({ layout: "classic", layout_asked_version: 2 }).layout_asked_version, 2);
+  assert.equal(sanitizeUiPrefs({ layout: "stage" }).layout, "stage");
 });
 
 test("panel widths dragged under an old name carry over", () => {
-  const p = sanitizeUiPrefs({
-    panels: { legacy: { sidebar: 300 }, discord: { members: 400 } },
-  });
-  assert.equal(p.panels.classic.sidebar, 300);
+  const p = sanitizeUiPrefs({ panels: { discord: { members: 400 } } });
   assert.equal(p.panels.modern.members, 400);
 });
 
@@ -102,12 +99,11 @@ test("an unknown palette id is kept, not rewritten", () => {
   assert.equal(sanitizeUiPrefs({ palette: "from-a-newer-build" }).palette, "from-a-newer-build");
 });
 
-test("the two layouts start at different widths", () => {
-  // The modern rows carry nested members and avatars; 220px is too narrow for
-  // them and 240px is wasteful for the classic list.
-  assert.notEqual(defaultPanels("classic").sidebar, defaultPanels("modern").sidebar);
-  assert.ok(defaultPanels("classic").sidebar >= SIDEBAR_MIN);
-  assert.ok(defaultPanels("modern").sidebar <= SIDEBAR_MAX);
+test("the default widths are within what a drag allows", () => {
+  for (const layout of ["modern", "stage"] as const) {
+    assert.ok(defaultPanels(layout).sidebar >= SIDEBAR_MIN);
+    assert.ok(defaultPanels(layout).sidebar <= SIDEBAR_MAX);
+  }
 });
 
 test("the left-text-channel list survives a round trip, per server", () => {
@@ -146,12 +142,10 @@ test("18+ consent is remembered per server, and junk in it is dropped", () => {
   assert.deepEqual(sanitizeUiPrefs({ nsfw_ok: { "a:1": true } }).nsfw_ok, []);
 });
 
-test("the stream view's chat: off in modern, below in classic, until chosen", () => {
+test("the stream view's chat: off until chosen", () => {
   const p = sanitizeUiPrefs({});
   assert.deepEqual(p.stream_chat.modern, defaultStreamChat("modern"));
   assert.equal(p.stream_chat.modern.open, false);
-  assert.equal(p.stream_chat.classic.open, true);
-  assert.equal(p.stream_chat.classic.split, "below");
   assert.equal(p.share_preview, true);
   assert.equal(p.group_threads, true, "busy replies gather into threads unless turned off");
   assert.equal(p.dm_previews, false, "a direct conversation's last message shows only when chosen");
@@ -168,7 +162,7 @@ test("a stream chat size is clamped and a bad split falls back", () => {
   const p = sanitizeUiPrefs({
     stream_chat: {
       modern: { open: "yes", split: "diagonal", width: 9000, height: 3 },
-      classic: "nonsense",
+      stage: "nonsense",
     },
     share_preview: "maybe",
     group_threads: "maybe",
@@ -177,7 +171,7 @@ test("a stream chat size is clamped and a bad split falls back", () => {
   assert.equal(p.stream_chat.modern.split, "side");
   assert.equal(p.stream_chat.modern.width, STREAM_CHAT_WIDTH_MAX);
   assert.equal(p.stream_chat.modern.height, STREAM_CHAT_HEIGHT_MIN);
-  assert.deepEqual(p.stream_chat.classic, defaultStreamChat("classic"));
+  assert.deepEqual(p.stream_chat.stage, defaultStreamChat("stage"));
   assert.equal(p.share_preview, true);
   assert.equal(p.group_threads, true);
 });

@@ -18,23 +18,15 @@ export const isMobile = writable(false);
 /** Whether volume key PTT is enabled */
 export const volumeKeyPtt = writable(false);
 
-/** The currently active mobile tab */
-export type MobileTab = 'channels' | 'chat' | 'mixer' | 'room' | 'users';
-export const mobileTab = writable<MobileTab>('chat');
-
 /**
- * "Show the chat", for whichever shell is on screen.
- *
- * The two say it differently — the classic layout has tabs and the modern one a
- * drawer over the chat — and picking a channel has to do it in both: on a phone
- * the channel list covers what you just asked to read, so a tap that changes
- * nothing visible reads as a tap that did nothing. A counter rather than a flag
- * because it is an event: asking twice has to arrive twice.
+ * "Show the chat", for whichever shell is on screen. Picking a channel has to
+ * do it: on a phone the channel list covers what you just asked to read, so a
+ * tap that changes nothing visible reads as a tap that did nothing. A counter
+ * rather than a flag because it is an event: asking twice has to arrive twice.
  */
 export const showChatRequested = writable(0);
 
 export function showChatPane(): void {
-  mobileTab.set('chat');
   showChatRequested.update((n) => n + 1);
 }
 

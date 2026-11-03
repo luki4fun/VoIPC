@@ -358,7 +358,7 @@ pub fn scale_i420_nearest(
 ///   R = clip((298*C + 409*E + 128) >> 8)
 ///   G = clip((298*C - 100*D - 208*E + 128) >> 8)
 ///   B = clip((298*C + 516*D + 128) >> 8)
-#[cfg(test)] // no caller in the desktop build; lib.rs has the Android copy
+#[cfg(test)] // the inverse of bgra_to_i420, for its roundtrip tests
 pub fn i420_to_rgb_into(i420: &[u8], width: usize, height: usize, rgb: &mut Vec<u8>) {
     let rgb_size = width * height * 3;
     rgb.clear();
@@ -386,7 +386,7 @@ pub fn i420_to_rgb_into(i420: &[u8], width: usize, height: usize, rgb: &mut Vec<
 }
 
 /// Convert I420 (YUV420 planar) to RGBA pixels.
-#[cfg(test)] // no caller in the desktop build; lib.rs has the Android copy
+#[cfg(test)] // the inverse of bgra_to_i420, for its roundtrip tests
 pub fn i420_to_rgba(i420: &[u8], width: usize, height: usize) -> Vec<u8> {
     let mut rgba = vec![0u8; width * height * 4];
     i420_to_rgba_into(i420, width, height, &mut rgba);
@@ -394,7 +394,7 @@ pub fn i420_to_rgba(i420: &[u8], width: usize, height: usize) -> Vec<u8> {
 }
 
 /// Convert I420 (YUV420 planar) to RGBA pixels, writing into an existing buffer.
-#[cfg(test)] // no caller in the desktop build; lib.rs has the Android copy
+#[cfg(test)] // the inverse of bgra_to_i420, for its roundtrip tests
 pub fn i420_to_rgba_into(i420: &[u8], width: usize, height: usize, rgba: &mut [u8]) {
     let y_plane = &i420[..width * height];
     let uv_width = width.div_ceil(2);

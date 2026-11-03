@@ -3,7 +3,6 @@ game 'gta5'
 
 name 'fivem-voipc-pma'
 description 'pma-voice exports, answered by VoIPC — drop in beside fivem-voipc and your framework keeps working'
-version '0.8.0'
 
 -- Independently written: this resource answers the export *names* pma-voice
 -- answers, which is an interface, and contains none of its code. pma-voice

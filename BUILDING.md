@@ -214,28 +214,23 @@ export BINDGEN_EXTRA_CLANG_ARGS="-I$(gcc -print-file-name=include)"
 5. **NASM** — required for SIMD optimizations in libjpeg-turbo and x265 ([nasm.us](https://www.nasm.us/))
 6. **LLVM** — required by bindgen to generate FFmpeg Rust bindings (`winget install LLVM.LLVM`)
 7. **protoc** — required by the `libsignal-protocol` build (`winget install Google.Protobuf`)
-8. **FFmpeg** — installed via vcpkg (run `.\setup.ps1` to install automatically). Installed as `ffmpeg[x264,x265,nvcodec,amf,qsv]` so both software encoders and the hardware ones (NVIDIA NVENC, AMD AMF, Intel QuickSync) are compiled in for H.264 and H.265. NVENC and AMF load from the GPU driver at runtime (no extra installs for users); QSV ships the Intel oneVPL dispatcher DLL with the app.
+8. **FFmpeg** — nothing to install: the first build downloads the same pinned, SHA-256-checked FFmpeg 8.x build the releases ship (from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases), into `%USERPROFILE%\.local\share\voipc\ffmpeg-win64`). It has the software encoders and the hardware ones (NVIDIA NVENC, AMD AMF, Intel QuickSync) for H.264 and H.265; NVENC and AMF load from the GPU driver at runtime.
 
 Make sure `cmake`, `nasm`, `protoc`, and LLVM are on your `PATH`. Or just run `.\setup.ps1` which handles all of the above.
 
-The build defaults `VCPKG_ROOT` to `C:\Program Files\vcpkg`, but honours a pre-set
-value. The CMake generator is detected through vswhere rather than hardcoded, so a
+The CMake generator is detected through vswhere rather than hardcoded, so a
 machine on a newer Visual Studio than 2022 still builds.
 
 **Mind the FFmpeg version.** `ffmpeg-next` 9.0 builds against FFmpeg 9.x
 (libavcodec 63) and anything older, so an Ubuntu runner on 6.1, this project's
 Windows prebuilt on 8.1 and a rolling distribution on 9.0 all work from one pin.
 Only a *newer* FFmpeg breaks it, because the crate's exhaustive matches do not
-know the enum variants a new major adds — and vcpkg tracks FFmpeg head. Every
-build path checks the major before compiling anything and stops with a message
-instead of a screenful of C errors ten minutes in. If your vcpkg runs ahead of
-the crate, either pin the port or skip vcpkg for FFmpeg and point `FFMPEG_DIR`
-at an `n8.x`- or `n9.x-win64-gpl-shared` build from
-[BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) — that is the
-same tree the Linux cross build and CI use, and `FFMPEG_DIR` wins over vcpkg for
-headers, import libraries and the DLLs bundled with the app.
-
-If you set up FFmpeg with an older version of `setup.ps1` (without the HW encoder features), re-run `.\setup.ps1` — it detects the missing features and reinstalls FFmpeg.
+know the enum variants a new major adds. Every build path checks the major
+before compiling anything and stops with a message instead of a screenful of C
+errors ten minutes in. To build against another tree, point `FFMPEG_DIR` at an
+`n8.x`- or `n9.x-win64-gpl-shared` build: it wins over the pinned download for
+headers, import libraries and the DLLs bundled with the app. An FFmpeg from vcpkg,
+which older versions of `setup.ps1` installed, is no longer used.
 
 ### Screen sharing
 
@@ -306,8 +301,7 @@ that cache is **not redistributable**, so never commit or ship it.
 The FFmpeg build must be a **`-shared`** one (those ship `include/` and the MSVC
 `lib/*.lib` import libraries) and must not be newer than the FFmpeg major
 `ffmpeg-next` knows — currently FFmpeg 9.x / libavcodec 63. The GPL variant is required for
-`libx264` and `libx265`; like the vcpkg build it also has NVENC, AMF and QSV
-compiled in.
+`libx264` and `libx265`; it also has NVENC, AMF and QSV compiled in.
 
 ### Differences from a native Windows build
 

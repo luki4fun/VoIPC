@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicU8, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use bytes::BytesMut;
 use ringbuf::traits::Producer;
@@ -30,7 +30,8 @@ use voipc_protocol::video::{
 use voipc_protocol::voice::{PositionPayload, VoicePacket, VoicePacketType};
 
 use crate::app_state::{
-    ActiveConnection, AppState, LossTally, PendingTarget, SdkEvent, SignalState,
+    encrypt_group, encrypt_pairwise, ActiveConnection, AppState, LossTally, PendingTarget,
+    SdkEvent, SignalState,
 };
 use crate::screenshare;
 use crate::transport::CONNECT_TIMEOUT;
@@ -68,7 +69,7 @@ pub async fn connect_to_server(
     let connect_lock = state
         .connect_locks
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .entry(address.clone())
         .or_default()
         .clone();
@@ -234,7 +235,7 @@ pub async fn connect_to_server(
 
     // No playback stream yet: the mixer opens one when this connection takes
     // voice, and nothing here is audible before that.
-    let output_device = state.settings.read().await.output_device.clone();
+    let output_device = state.config().output_device.clone();
     let playback_restart = Arc::new(AtomicBool::new(false));
     // The device tells the mixer it took a frame, so the mixer refills on the
     // device's clock instead of on a timer that drifts against it.
@@ -324,10 +325,10 @@ pub async fn connect_to_server(
     // the persisted client settings; the channel's mode arrives with the
     // channel list.
     let spatial = {
-        let s = state.settings.read().await;
+        let config = state.config();
         Arc::new(std::sync::Mutex::new(crate::app_state::SpatialState {
-            enabled: s.spatial_audio,
-            screen_audio_spatial: s.screen_audio_spatial,
+            enabled: config.spatial_audio,
+            screen_audio_spatial: config.screen_audio_spatial,
             ..Default::default()
         }))
     };
@@ -374,7 +375,7 @@ pub async fn connect_to_server(
                 app.state::<AppState>()
                     .voice_server
                     .lock()
-                    .unwrap_or_else(|p| p.into_inner())
+                    .unwrap_or_else(PoisonError::into_inner)
                     .is_some()
             }
         }),
@@ -680,7 +681,10 @@ pub async fn teardown(
 
 /// Forget that `server` holds voice, if it does. Returns whether it did.
 fn clear_voice(state: &AppState, server: &str) -> bool {
-    let mut voice = state.voice_server.lock().unwrap_or_else(|p| p.into_inner());
+    let mut voice = state
+        .voice_server
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     if voice.as_deref() == Some(server) {
         *voice = None;
         true
@@ -734,7 +738,7 @@ async fn claim_voice(app: &tauri::AppHandle, server: &str, is_voice: &Arc<Atomic
     let previous = state
         .voice_server
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .replace(server.to_string());
     let moved = previous.filter(|p| p != server);
     if let Some(other) = moved.as_deref().and_then(|p| conns.get_mut(p)) {
@@ -1359,10 +1363,9 @@ async fn handle_server_message(
             // viewer on a bad link is that viewer's problem, not the share's.
             if frames_dropped > 0 {
                 let now = screenshare::epoch_ms();
-                let mut tally = share_loss_tally.lock().unwrap_or_else(|p| {
-                    warn!("mutex poisoned, recovering");
-                    p.into_inner()
-                });
+                let mut tally = share_loss_tally
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner);
                 tally.reports.insert(viewer_user_id, now);
                 tally
                     .reports
@@ -1418,10 +1421,7 @@ async fn handle_server_message(
             // room, no screen share, and the channel we stand in is untouched.
             if is_text_channel(channels_snapshot, channel_id) {
                 let newly = {
-                    let mut sig = signal.lock().unwrap_or_else(|p| {
-                        warn!("mutex poisoned, recovering");
-                        p.into_inner()
-                    });
+                    let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                     let newly = sig.channels.join_text(channel_id);
                     // Who a sender key may go to here, and who one may come
                     // from (send_sender_key and handle_sender_key_received
@@ -1449,10 +1449,7 @@ async fn handle_server_message(
                 // arrives. Here nobody moved, so the subscriber keys up with
                 // the members it already holds a session with.
                 let established: Vec<u32> = {
-                    let sig = signal.lock().unwrap_or_else(|p| {
-                        warn!("mutex poisoned, recovering");
-                        p.into_inner()
-                    });
+                    let sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                     users
                         .iter()
                         .map(|u| u.user_id)
@@ -1519,10 +1516,7 @@ async fn handle_server_message(
             // (create_channel auto-join, kicks, invites, etc.)
             let old_ch = channel_id_store.swap(channel_id, Ordering::Relaxed);
             {
-                let mut sig = signal.lock().unwrap_or_else(|p| {
-                    warn!("mutex poisoned, recovering");
-                    p.into_inner()
-                });
+                let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                 // The room we left is not ours to key any more: its roster,
                 // the record of who holds our chain there and the chain itself
                 // all go, exactly as walking out of a text channel does. (The
@@ -1542,18 +1536,12 @@ async fn handle_server_message(
                 // existing member over Signal, or we generate one if alone
                 // (see below, after the user list is known)
                 {
-                    let mut mk = media_key.lock().unwrap_or_else(|p| {
-                        warn!("mutex poisoned, recovering");
-                        p.into_inner()
-                    });
+                    let mut mk = media_key.lock().unwrap_or_else(PoisonError::into_inner);
                     mk.clear();
                 }
                 // Reset sender key state for the new channel
                 {
-                    let mut sig = signal.lock().unwrap_or_else(|p| {
-                        warn!("mutex poisoned, recovering");
-                        p.into_inner()
-                    });
+                    let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                     let SignalState {
                         stores, channels, ..
                     } = &mut *sig;
@@ -1639,10 +1627,7 @@ async fn handle_server_message(
                 .map(|g| g.has_channel(channel_id))
                 .unwrap_or(false);
             let we_mint = {
-                let sig = signal.lock().unwrap_or_else(|p| {
-                    warn!("mutex poisoned, recovering");
-                    p.into_inner()
-                });
+                let sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                 sig.channels.media_key_minter(channel_id) == Some(own_user_id)
             };
             if channel_id != 0 && !have_key && we_mint {
@@ -1681,10 +1666,7 @@ async fn handle_server_message(
             // member does it, here, for voice and text alike.
             let keyed_up = {
                 let own_channel = channel_id_store.load(Ordering::Relaxed);
-                let mut sig = signal.lock().unwrap_or_else(|p| {
-                    warn!("mutex poisoned, recovering");
-                    p.into_inner()
-                });
+                let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                 // The same question the browser asks, in the same words: is
                 // this a channel we are in? (It used to be "do we hold a
                 // roster for it", which is the same answer by a different
@@ -1723,10 +1705,7 @@ async fn handle_server_message(
             // perhaps. Only that channel's group keys go.
             if is_text_channel(channels_snapshot, channel_id) {
                 {
-                    let mut sig = signal.lock().unwrap_or_else(|p| {
-                        warn!("mutex poisoned, recovering");
-                        p.into_inner()
-                    });
+                    let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                     sig.channels.drop_member(channel_id, user_id);
                     if user_id == own_user_id {
                         // Our own chain there goes with the subscription. It
@@ -1774,10 +1753,7 @@ async fn handle_server_message(
             // Clean up E2E state for departing user
             let left_our_room;
             {
-                let mut sig = signal.lock().unwrap_or_else(|p| {
-                    warn!("mutex poisoned, recovering");
-                    p.into_inner()
-                });
+                let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                 // The pairwise session stays. It is per person and per
                 // connection, not per room: they are still someone we DM, and
                 // now they may be in text channels with us that a voice leave
@@ -1897,10 +1873,7 @@ async fn handle_server_message(
                 list.retain(|c| c.channel_id != channel_id);
             }
             {
-                let mut sig = signal.lock().unwrap_or_else(|p| {
-                    warn!("mutex poisoned, recovering");
-                    p.into_inner()
-                });
+                let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                 let own = sig.own_user_id.unwrap_or(0);
                 let SignalState {
                     stores, channels, ..
@@ -2022,10 +1995,7 @@ async fn handle_server_message(
                     Ok(plaintext) => {
                         // If PreKeySignalMessage, mark session as established
                         if message_type == 1 {
-                            let mut sig = signal.lock().unwrap_or_else(|p| {
-                                warn!("mutex poisoned, recovering");
-                                p.into_inner()
-                            });
+                            let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                             sig.established_sessions.insert(from_user_id);
                             sig.pending_sessions.remove(&from_user_id);
                         }
@@ -2129,7 +2099,16 @@ async fn handle_server_message(
             );
         }
         ServerMessage::KeyframeRequested => {
-            emit_server(app_handle, server, "keyframe-requested", ());
+            // A viewer needs an IDR now: the capture loop reads the flag
+            if let Some(c) = app_handle
+                .state::<AppState>()
+                .connections
+                .read()
+                .await
+                .get(server)
+            {
+                c.keyframe_requested.store(true, Ordering::Relaxed);
+            }
         }
         ServerMessage::ScreenShareError { reason } => {
             emit_server(
@@ -2164,19 +2143,13 @@ async fn handle_server_message(
                 "prekey bundle unavailable — cannot establish E2E session"
             );
             // Remove from pending so we don't loop
-            let mut sig = signal.lock().unwrap_or_else(|p| {
-                warn!("mutex poisoned, recovering");
-                p.into_inner()
-            });
+            let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
             sig.pending_sessions.remove(&user_id);
         }
         ServerMessage::PreKeysLow { .. } => {
             // The relay has handed out most of our one-time pre-keys
             let more = {
-                let mut sig = signal.lock().unwrap_or_else(|p| {
-                    warn!("mutex poisoned, recovering");
-                    p.into_inner()
-                });
+                let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                 sig.stores.as_mut().map(|s| {
                     voipc_crypto::prekey::more_prekeys(s, voipc_crypto::prekey::PREKEY_REFILL_COUNT)
                 })
@@ -2434,10 +2407,7 @@ fn handle_channel_history_received(
     // and hand it on to the next newcomer as `shared`. The two other pairwise
     // paths ask the same question.
     {
-        let sig = signal.lock().unwrap_or_else(|p| {
-            warn!("mutex poisoned, recovering");
-            p.into_inner()
-        });
+        let sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
         if !sig
             .channels
             .shares_channel_with(own_channel_id, channel_id, from_user_id)
@@ -2474,10 +2444,7 @@ fn handle_channel_history_received(
         }
     };
     if message_type == 1 {
-        let mut sig = signal.lock().unwrap_or_else(|p| {
-            warn!("mutex poisoned, recovering");
-            p.into_inner()
-        });
+        let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
         sig.established_sessions.insert(from_user_id);
         sig.pending_sessions.remove(&from_user_id);
     }
@@ -2513,10 +2480,7 @@ async fn request_prekey_bundles_for_users(
     let mut to_request = Vec::new();
 
     {
-        let mut sig = signal.lock().unwrap_or_else(|p| {
-            warn!("mutex poisoned, recovering");
-            p.into_inner()
-        });
+        let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
         if !sig.initialized {
             return;
         }
@@ -2585,10 +2549,7 @@ async fn handle_prekey_bundle(
         Ok(()) => {
             info!(remote_user_id, "E2E session established");
             {
-                let mut sig = signal.lock().unwrap_or_else(|p| {
-                    warn!("mutex poisoned, recovering");
-                    p.into_inner()
-                });
+                let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                 sig.pending_sessions.remove(&remote_user_id);
                 sig.established_sessions.insert(remote_user_id);
             }
@@ -2601,10 +2562,7 @@ async fn handle_prekey_bundle(
             // server drops a distribution for a channel either of us is not in.
             let mut channels = vec![channel_id_store.load(Ordering::Relaxed)];
             {
-                let sig = signal.lock().unwrap_or_else(|p| {
-                    warn!("mutex poisoned, recovering");
-                    p.into_inner()
-                });
+                let sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                 channels.extend(sig.channels.text_channels());
             }
             for channel in channels {
@@ -2624,10 +2582,7 @@ async fn handle_prekey_bundle(
         }
         Err(e) => {
             warn!(remote_user_id, "failed to establish E2E session: {}", e);
-            let mut sig = signal.lock().unwrap_or_else(|p| {
-                warn!("mutex poisoned, recovering");
-                p.into_inner()
-            });
+            let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
             sig.pending_sessions.remove(&remote_user_id);
         }
     }
@@ -2661,10 +2616,7 @@ pub async fn rotate_sender_key_if_stale(
     tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
 ) {
     let targets: Vec<u32> = {
-        let mut sig = signal.lock().unwrap_or_else(|p| {
-            warn!("mutex poisoned, recovering");
-            p.into_inner()
-        });
+        let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
         let SignalState {
             stores, channels, ..
         } = &mut *sig;
@@ -2696,10 +2648,7 @@ async fn send_sender_key(
     // distributed is what makes reciprocation skip a member who never received
     // anything — so membership is checked here, once, for every caller.
     {
-        let sig = signal.lock().unwrap_or_else(|p| {
-            warn!("mutex poisoned, recovering");
-            p.into_inner()
-        });
+        let sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
         if !sig.channels.is_member(channel_id, target_user_id) {
             debug!(
                 target_user_id,
@@ -2751,10 +2700,7 @@ async fn send_sender_key(
                 false
             } else {
                 info!(target_user_id, channel_id, "sender key distributed");
-                let mut sig = signal.lock().unwrap_or_else(|p| {
-                    warn!("mutex poisoned, recovering");
-                    p.into_inner()
-                });
+                let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                 sig.channels.record_distributed(channel_id, target_user_id);
                 true
             }
@@ -2792,10 +2738,7 @@ async fn rotate_media_key_if_minter(
     server: &str,
 ) {
     let remaining: Vec<u32> = {
-        let sig = signal.lock().unwrap_or_else(|p| {
-            warn!("mutex poisoned, recovering");
-            p.into_inner()
-        });
+        let sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
         if sig.channels.media_key_minter(channel_id) != Some(own_user_id) {
             return;
         }
@@ -2806,10 +2749,7 @@ async fn rotate_media_key_if_minter(
     // member who held it has left and nobody else is going to send one. The
     // rule lives in `MediaKeyRing` because the browser needs the same answer.
     let next_id = {
-        let guard = media_key.lock().unwrap_or_else(|p| {
-            warn!("mutex poisoned, recovering");
-            p.into_inner()
-        });
+        let guard = media_key.lock().unwrap_or_else(PoisonError::into_inner);
         guard.next_generation(channel_id)
     };
 
@@ -2846,10 +2786,7 @@ fn install_media_key(
 ) {
     let (channel_id, key_id) = (key.channel_id, key.key_id);
     let installed = {
-        let mut guard = media_key.lock().unwrap_or_else(|p| {
-            warn!("media key mutex poisoned — recovering");
-            p.into_inner()
-        });
+        let mut guard = media_key.lock().unwrap_or_else(PoisonError::into_inner);
         guard.install(key, own_channel)
     };
     if !installed {
@@ -2874,30 +2811,15 @@ async fn distribute_media_key_to_user(
     tcp_tx: &mpsc::UnboundedSender<Vec<u8>>,
 ) {
     let key_bytes = {
-        let guard = media_key.lock().unwrap_or_else(|p| {
-            warn!("media key mutex poisoned — recovering");
-            p.into_inner()
-        });
+        let guard = media_key.lock().unwrap_or_else(PoisonError::into_inner);
         match guard.current() {
             Some(k) if k.channel_id == channel_id => k.to_bytes(),
             _ => return,
         }
     };
 
-    let result = tokio::task::block_in_place(|| {
-        let mut sig = signal.lock().map_err(|e| format!("signal lock: {e}"))?;
-        let stores = sig
-            .stores
-            .as_mut()
-            .ok_or_else(|| "Signal not initialized".to_string())?;
-        tokio::runtime::Handle::current()
-            .block_on(voipc_crypto::session::encrypt_message(
-                stores,
-                target_user_id,
-                &key_bytes,
-            ))
-            .map_err(|e| format!("encrypt media key: {e}"))
-    });
+    let result = encrypt_pairwise(signal, target_user_id, &key_bytes)
+        .map_err(|e| format!("encrypt media key: {e}"));
 
     match result {
         Ok((encrypted_media_key, message_type)) => {
@@ -2941,10 +2863,7 @@ async fn handle_media_key_received(
     // with us (which is anybody on the server) hands us the key we then speak
     // under, and the relay forwards our packets to them.
     {
-        let sig = signal.lock().unwrap_or_else(|p| {
-            warn!("mutex poisoned, recovering");
-            p.into_inner()
-        });
+        let sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
         if !sig
             .channels
             .shares_channel_with(current, channel_id, from_user_id)
@@ -2984,10 +2903,7 @@ async fn handle_media_key_received(
 
     // A PreKeySignalMessage establishes the session on our side as well
     if message_type == 1 {
-        let mut sig = signal.lock().unwrap_or_else(|p| {
-            warn!("mutex poisoned, recovering");
-            p.into_inner()
-        });
+        let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
         sig.established_sessions.insert(from_user_id);
         sig.pending_sessions.remove(&from_user_id);
     }
@@ -3027,10 +2943,7 @@ async fn handle_sender_key_received(
     // adversary here, and without this a stranger with a colluding relay
     // installs a key for a channel they were never in and then writes to it.
     {
-        let sig = signal.lock().unwrap_or_else(|p| {
-            warn!("mutex poisoned, recovering");
-            p.into_inner()
-        });
+        let sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
         if !sig
             .channels
             .shares_channel_with(own_channel_id, channel_id, from_user_id)
@@ -3083,29 +2996,20 @@ async fn handle_sender_key_received(
 
             // If PreKeySignalMessage, session was auto-established on our side
             if message_type == 1 {
-                let mut sig = signal.lock().unwrap_or_else(|p| {
-                    warn!("mutex poisoned, recovering");
-                    p.into_inner()
-                });
+                let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                 sig.established_sessions.insert(from_user_id);
                 sig.pending_sessions.remove(&from_user_id);
             }
 
             // Track the received sender key
             {
-                let mut sig = signal.lock().unwrap_or_else(|p| {
-                    warn!("mutex poisoned, recovering");
-                    p.into_inner()
-                });
+                let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                 sig.channels.record_received(channel_id, from_user_id);
             }
 
             // Reciprocate: send our sender key if we haven't already
             let need_reciprocate = {
-                let sig = signal.lock().unwrap_or_else(|p| {
-                    warn!("mutex poisoned, recovering");
-                    p.into_inner()
-                });
+                let sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                 !sig.channels.has_distributed(channel_id, from_user_id)
             };
 
@@ -3128,10 +3032,7 @@ async fn handle_sender_key_received(
             // us (they just used it), so this is the moment to ask them for
             // recent chat — once each, for as many sharers as we lined up.
             let ask = {
-                let mut sig = signal.lock().unwrap_or_else(|p| {
-                    warn!("mutex poisoned, recovering");
-                    p.into_inner()
-                });
+                let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                 let asked = sig.channels.take_history_wanted(channel_id, from_user_id);
                 channel_id != 0 && asked
             };
@@ -3165,10 +3066,7 @@ async fn drain_pending_dms(
     // Extract pending DMs for this target, each with the id it was shown under
     // and the destruction timer it was written under
     let pending: Vec<(String, String, Option<u32>, crate::crypto::Extras)> = {
-        let mut sig = signal.lock().unwrap_or_else(|p| {
-            warn!("mutex poisoned, recovering");
-            p.into_inner()
-        });
+        let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
         let mut remaining = Vec::new();
         let mut to_send = Vec::new();
         let mut expired = 0u32;
@@ -3203,17 +3101,8 @@ async fn drain_pending_dms(
 
     for (id, content, ttl_secs, extras) in pending {
         let payload = crate::crypto::envelope_with(&id, &content, ttl_secs, &extras);
-        let result = tokio::task::block_in_place(|| {
-            let mut sig = signal.lock().map_err(|e| format!("lock: {e}"))?;
-            let stores = sig.stores.as_mut().ok_or("not initialized")?;
-            tokio::runtime::Handle::current()
-                .block_on(voipc_crypto::session::encrypt_message(
-                    stores,
-                    target_user_id,
-                    &payload,
-                ))
-                .map_err(|e| format!("encrypt: {e}"))
-        });
+        let result =
+            encrypt_pairwise(signal, target_user_id, &payload).map_err(|e| format!("encrypt: {e}"));
 
         match result {
             Ok((ciphertext, message_type)) => {
@@ -3246,10 +3135,7 @@ async fn drain_pending_channel_messages(
     // Extract pending channel messages, each with the id it was shown under and
     // the destruction timer it was written under
     let pending: Vec<(String, String, Option<u32>, crate::crypto::Extras)> = {
-        let mut sig = signal.lock().unwrap_or_else(|p| {
-            warn!("mutex poisoned, recovering");
-            p.into_inner()
-        });
+        let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
         let mut remaining = Vec::new();
         let mut to_send = Vec::new();
         let mut expired = 0u32;
@@ -3293,18 +3179,8 @@ async fn drain_pending_channel_messages(
 
     for (id, content, ttl_secs, extras) in pending {
         let payload = crate::crypto::envelope_with(&id, &content, ttl_secs, &extras);
-        let result = tokio::task::block_in_place(|| {
-            let mut sig = signal.lock().map_err(|e| format!("lock: {e}"))?;
-            let stores = sig.stores.as_mut().ok_or("not initialized")?;
-            tokio::runtime::Handle::current()
-                .block_on(voipc_crypto::group::encrypt_group_message(
-                    stores,
-                    own_user_id,
-                    channel_id,
-                    &payload,
-                ))
-                .map_err(|e| format!("group encrypt: {e}"))
-        });
+        let result = encrypt_group(signal, own_user_id, channel_id, &payload)
+            .map_err(|e| format!("group encrypt: {e}"));
 
         match result {
             Ok(ciphertext) => {
@@ -3374,10 +3250,7 @@ fn handle_encrypted_direct_message(
 
             // If this was a PreKeySignalMessage, mark session as established
             if message_type == 1 {
-                let mut sig = signal.lock().unwrap_or_else(|p| {
-                    warn!("mutex poisoned, recovering");
-                    p.into_inner()
-                });
+                let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
                 sig.established_sessions.insert(from_user_id);
                 sig.pending_sessions.remove(&from_user_id);
             }
@@ -3458,10 +3331,7 @@ fn handle_encrypted_channel_message(
     // "[encrypted message — decryption failed]" line in the user's archive,
     // with an unread badge and a sound to go with it.
     {
-        let sig = signal.lock().unwrap_or_else(|p| {
-            warn!("mutex poisoned, recovering");
-            p.into_inner()
-        });
+        let sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
         if !sig.channels.in_channel(own_channel_id, channel_id) {
             debug!(channel_id, "dropped a message for a channel we are not in");
             return;
@@ -4584,10 +4454,7 @@ async fn datagram_receiver_task(
                         let opus_data: Vec<u8> = {
                             let raw_encrypted = &buf[header_size..n];
                             let ch_id = channel_id.load(Ordering::Relaxed);
-                            let key_guard = media_key.lock().unwrap_or_else(|poisoned| {
-                                warn!("media key mutex poisoned — recovering");
-                                poisoned.into_inner()
-                            });
+                            let key_guard = media_key.lock().unwrap_or_else(PoisonError::into_inner);
                             if let Some(key) = key_guard.get(ch_id, key_id) {
                                 let aad = voipc_crypto::build_aad(ch_id, 0x05, session_id);
                                 match voipc_crypto::media_decrypt(
@@ -4693,10 +4560,7 @@ async fn datagram_receiver_task(
 
                         let plaintext = {
                             let ch_id = channel_id.load(Ordering::Relaxed);
-                            let key_guard = media_key.lock().unwrap_or_else(|poisoned| {
-                                warn!("media key mutex poisoned — recovering");
-                                poisoned.into_inner()
-                            });
+                            let key_guard = media_key.lock().unwrap_or_else(PoisonError::into_inner);
                             let Some(key) = key_guard.get(ch_id, key_id) else { continue };
                             let aad = voipc_crypto::build_aad(
                                 ch_id,
@@ -4798,10 +4662,7 @@ async fn datagram_receiver_task(
 
                         // Decrypt encrypted screen audio
                         let opus_data = if packet.encrypted {
-                            let key_guard = media_key.lock().unwrap_or_else(|poisoned| {
-                                warn!("media key mutex poisoned — recovering");
-                                poisoned.into_inner()
-                            });
+                            let key_guard = media_key.lock().unwrap_or_else(PoisonError::into_inner);
                             let ch_id = channel_id.load(Ordering::Relaxed);
                             if let Some(key) = key_guard.get(ch_id, packet.key_id) {
                                 let aad = voipc_crypto::build_aad(ch_id, 0x15, packet.session_id);
@@ -4972,10 +4833,7 @@ async fn video_stream_receiver_task(
 
             // Decrypt (plaintext video is never relayed)
             {
-                let key_guard = media_key.lock().unwrap_or_else(|poisoned| {
-                    warn!("media key mutex poisoned — recovering");
-                    poisoned.into_inner()
-                });
+                let key_guard = media_key.lock().unwrap_or_else(PoisonError::into_inner);
                 let ch_id = channel_id.load(Ordering::Relaxed);
                 if let Some(key) = key_guard.get(ch_id, packet.key_id) {
                     let aad = voipc_crypto::build_aad(ch_id, packet_type, packet.session_id);
@@ -5527,10 +5385,7 @@ pub fn spawn_capture_encode_task(
             match encoder.encode(&pcm_buf) {
                 Ok(opus_data) => {
                     let packet = {
-                        let key_guard = media_key.lock().unwrap_or_else(|poisoned| {
-                            warn!("media key mutex poisoned — recovering");
-                            poisoned.into_inner()
-                        });
+                        let key_guard = media_key.lock().unwrap_or_else(PoisonError::into_inner);
                         let stream_id = key_guard.stream_id();
                         if let Some(key) = key_guard.current() {
                             key_missing_since = None;

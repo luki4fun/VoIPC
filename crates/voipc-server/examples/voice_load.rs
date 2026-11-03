@@ -1,15 +1,16 @@
 // Headless voice load generator: N clients connect over QUIC, join one
-// channel, and each streams a real Opus-encoded tone at 50 packets/sec as
-// media datagrams while counting the packets fanned back out to them.
+// channel, and each streams voice-sized packets at 50 packets/sec as media
+// datagrams while counting the packets fanned back out to them.
 //
 // Run against a local server:
 //   cargo run -p voipc-server --release --example voice_load -- 30 127.0.0.1:9987
 //
 // Expected at N=30: aggregate send ~1500 pkt/s, aggregate recv ~43500 pkt/s
-// (each of the 30 clients receives the other 29 streams). The tone is
+// (each of the 30 clients receives the other 29 streams). The payload is
 // encrypted under a random media key the server never sees (it relays
 // encrypted voice verbatim), so a real client in the channel receives
-// packets it cannot decode — this measures relay throughput only.
+// packets it cannot decode — this measures relay throughput only, and no
+// Opus encoder is needed to make them.
 
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -25,7 +26,7 @@ use voipc_protocol::codec::{
     decode_server_msg, encode_client_msg, try_decode_frame, APP_VERSION, PROTOCOL_VERSION,
 };
 use voipc_protocol::messages::{ClientMessage, ServerMessage};
-use voipc_protocol::voice::{VoicePacket, OPUS_FRAME_SIZE, OPUS_SAMPLE_RATE};
+use voipc_protocol::voice::VoicePacket;
 
 /// Server name that makes the server present its operator certificate
 /// (`crates/voipc-server/src/web.rs::NATIVE_SNI`).
@@ -205,28 +206,19 @@ async fn run_client(
         });
     }
 
-    // ── Voice: 440Hz + per-client offset tone, Opus-encoded, encrypted, 50 pkt/s ──
+    // ── Voice: one 20 ms Opus frame's worth of bytes, encrypted, 50 pkt/s ──
     let key = voipc_crypto::MediaKey::generate(channel_id, 1, index as u32)?;
     // Each simulated client is its own speaker, so each picks its own nonce
     // prefix exactly as a real one does.
     let stream_id = 0x5EED_0000u32 | index as u32;
     let aad = voipc_crypto::build_aad(channel_id, 0x05, session_id);
-    let mut encoder = voipc_audio::encoder::Encoder::new()?;
-    let mut pcm = [0.0f32; OPUS_FRAME_SIZE];
-    let freq = 220.0 + 20.0 * index as f32;
-    let mut phase = 0.0f32;
-    let step = 2.0 * std::f32::consts::PI * freq / OPUS_SAMPLE_RATE as f32;
+    // 120 bytes: a 20 ms frame at the client's 48 kbps
+    let opus = [index as u8; 120];
     let mut sequence: u32 = 0;
     let mut interval = tokio::time::interval(Duration::from_millis(20));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
-        for s in pcm.iter_mut() {
-            *s = 0.2 * phase.sin();
-            phase += step;
-        }
-        phase %= 2.0 * std::f32::consts::PI;
-        let opus = encoder.encode(&pcm)?;
         let encrypted = voipc_crypto::media_encrypt(&key, stream_id, sequence, 0, &aad, &opus)?;
         let packet =
             VoicePacket::encrypted_voice(session_id, sequence, key.key_id, stream_id, encrypted);

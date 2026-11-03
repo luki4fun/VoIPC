@@ -2,7 +2,7 @@
 //
 // This one stays a bash script. Unlike the build scripts it has no PowerShell
 // twin and duplicates nothing, so there is no consolidation to win here — and
-// it is 140 lines of openssl certificate minting, NSS profile setup via
+// it is a few hundred lines of openssl certificate minting, NSS profile setup via
 // certutil and headless browser wrangling that would only get longer, not
 // clearer, in Node.
 import { fail, run, which } from '../lib.mjs';

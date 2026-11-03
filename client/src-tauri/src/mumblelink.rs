@@ -33,6 +33,7 @@
 //!   the channel for as long as the app runs — so it stops the feed instead.
 
 use std::sync::atomic::Ordering;
+use std::sync::PoisonError;
 
 use tauri::{Emitter, Manager};
 use tracing::{info, warn};
@@ -278,7 +279,10 @@ async fn start_driving(app: &tauri::AppHandle) -> bool {
         return false;
     };
     {
-        let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+        let mut spatial = connection
+            .spatial
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         if spatial.sdk_active {
             return false; // a game with the whole picture is already driving
         }
@@ -338,7 +342,10 @@ async fn stop_driving(app: &tauri::AppHandle) {
     {
         let conns = state.connections.read().await;
         if let Ok(connection) = crate::app_state::voice(&state, &conns) {
-            let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+            let mut spatial = connection
+                .spatial
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             spatial.clear_positions();
         }
     }
@@ -362,7 +369,10 @@ async fn apply(app: &tauri::AppHandle, link: Link) -> bool {
     let Ok(connection) = crate::app_state::voice(&state, &conns) else {
         return false;
     };
-    let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+    let mut spatial = connection
+        .spatial
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     if spatial.sdk_active {
         return false;
     }

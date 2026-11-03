@@ -109,10 +109,9 @@
   --z-picker: 230;
   --z-toast: 1000;
 
-  /* Panel widths. Variables so they can be dragged and remembered; the values
-     are the ones that were hard-coded in ChannelList and UserList, so nothing
-     moves for anyone who never touches them. Each shell overrides these on its
-     own root element, which is what makes the sizes per-layout for free. */
+  /* Panel widths. Variables so they can be dragged and remembered. Each shell
+     overrides these on its own root element, which is what makes the sizes
+     per-layout for free. */
   --sidebar-width: 220px;
   --memberlist-width: 180px;
 
@@ -253,7 +252,7 @@ select option {
 }
 
 /* Apply user-select: none to UI chrome, not globally */
-.titlebar, .voice-controls, .status-bar,
+.voice-controls,
 button, .channel-list .header, .user-list .header {
   user-select: none;
 }
@@ -531,7 +530,3 @@ input:focus {
   border-radius: 3px;
 }
 
-/* ── Mobile overrides (non-scoped) ── */
-.app-layout.mobile {
-  --icon-btn-size: var(--hit);
-}

@@ -843,10 +843,8 @@ export class Session implements SessionContext, AccountHost {
         this.emit("viewer-count-changed", { viewer_count: b.viewer_count });
         break;
       case "KeyframeRequested":
-        // A viewer needs an IDR now. The event exists for parity with the
-        // native client, whose UI relays it back through set_keyframe_requested.
+        // A viewer needs an IDR now
         if (this === voiceOwner) share.requestKeyframe();
-        this.emit("keyframe-requested");
         break;
       case "VideoLossReported":
         // A viewer of our share lost frames: step the encoder down

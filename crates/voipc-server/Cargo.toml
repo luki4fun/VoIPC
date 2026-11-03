@@ -29,7 +29,7 @@ serde_json = "1.0"
 zeroize = { version = "1", features = ["derive"] }
 socket2 = { version = "0.6.2", features = ["all"] }
 subtle = "2"
-sha2 = "0.10"
+sha2 = "0.11"
 # The TCP fallback's WebSocket handshake (Sec-WebSocket-Accept is base64 of a
 # SHA-1); both already come in through rustls and the client.
 ring = "0.17"
@@ -61,7 +61,3 @@ sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio",
 # The recovery-key reset's proof: an identity signature (libsignal)
 voipc-crypto = { workspace = true }
 unicode-security = "0.1.2"
-
-[dev-dependencies]
-# For the voice_load example (Opus encoding + media encryption of the test tone)
-voipc-audio = { workspace = true }

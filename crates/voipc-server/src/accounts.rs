@@ -628,7 +628,7 @@ pub struct SignedIn {
 }
 
 async fn send<S: AsyncWrite + Unpin>(stream: &mut S, msg: &ServerMessage) -> Result<(), String> {
-    crate::tcp::write_msg(stream, msg)
+    crate::session::write_msg(stream, msg)
         .await
         .map_err(|_| "connection lost during sign-in".to_string())
 }
@@ -648,12 +648,12 @@ async fn next<S: AsyncRead + Unpin>(
     if *answers > MAX_CONTINUES {
         return Err("Too many sign-in attempts on one connection.".into());
     }
-    let payload = crate::tcp::read_frame(stream, buf, wait)
+    let payload = crate::session::read_frame(stream, buf, wait)
         .await
         .map_err(|e| match e {
-            crate::tcp::NoFrame::TimedOut => "Sign-in timed out.".to_string(),
-            crate::tcp::NoFrame::Malformed => "malformed frame".to_string(),
-            crate::tcp::NoFrame::Closed => "connection closed during sign-in".to_string(),
+            crate::session::NoFrame::TimedOut => "Sign-in timed out.".to_string(),
+            crate::session::NoFrame::Malformed => "malformed frame".to_string(),
+            crate::session::NoFrame::Closed => "connection closed during sign-in".to_string(),
         })?;
     match decode_client_msg(&payload) {
         Ok(ClientMessage::AuthContinue(c)) => Ok(c),
@@ -1385,7 +1385,7 @@ async fn sign_out_account(state: &ServerState, user: AccountId) {
         .map(|e| *e.key())
         .collect();
     for id in ids {
-        crate::tcp::force_disconnect(
+        crate::session::force_disconnect(
             state,
             id,
             "Your password was changed. Sign in with the new one.",
@@ -1412,22 +1412,20 @@ pub async fn handle_request(
 ) -> Result<()> {
     let reply = |r: AccountReply| ServerMessage::Account(r);
     let Some(relay) = state.accounts.clone() else {
-        return crate::tcp::send_msg(
+        return crate::session::send_msg(
             tx,
             &reply(refused("Account", "This relay has no accounts.")),
-        )
-        .await;
+        );
     };
     let Some((user, info, peer_ip)) = state.sessions.get(&session_id).and_then(|s| {
         s.account
             .as_ref()
             .map(|a| (a.user.clone(), a.info.clone(), s.peer_ip))
     }) else {
-        return crate::tcp::send_msg(
+        return crate::session::send_msg(
             tx,
             &reply(refused("Account", "Sign in with an account first.")),
-        )
-        .await;
+        );
     };
     // Database work, so budgeted on its own beside the 50 messages a second
     // every message shares (1.0 audit H1-03). The variant's name is what a
@@ -1439,11 +1437,10 @@ pub async fn handle_request(
     if !allowed {
         let name = format!("{req:?}");
         let name = name.split([' ', '{', '(']).next().unwrap_or("Account");
-        return crate::tcp::send_msg(
+        return crate::session::send_msg(
             tx,
             &reply(refused(name, "Too many requests at once; slow down.")),
-        )
-        .await;
+        );
     }
     let ctx = relay.ctx(peer_ip, voipc_protocol::codec::APP_VERSION);
     let now = util::now();
@@ -1531,11 +1528,10 @@ pub async fn handle_request(
                                 a.info = new.info;
                             }
                         }
-                        crate::tcp::send_msg(
+                        crate::session::send_msg(
                             tx,
                             &reply(AccountReply::TotpEnabled { recovery_codes }),
-                        )
-                        .await?;
+                        )?;
                         refresh(state, &relay, session_id, user.id).await?;
                         return Ok(());
                     }
@@ -1565,9 +1561,13 @@ pub async fn handle_request(
             .await
             {
                 Ok(()) => {
-                    crate::tcp::send_msg(tx, &reply(AccountReply::AccountDeleted)).await?;
-                    crate::tcp::force_disconnect(state, session_id, "Your account was deleted.")
-                        .await;
+                    crate::session::send_msg(tx, &reply(AccountReply::AccountDeleted))?;
+                    crate::session::force_disconnect(
+                        state,
+                        session_id,
+                        "Your account was deleted.",
+                    )
+                    .await;
                     return Ok(());
                 }
                 Err(reason) => refused("DeleteAccount", &reason),
@@ -1647,7 +1647,7 @@ pub async fn handle_request(
         AccountRequest::LogIndex => {
             let (convs, pending) = log::index(&relay, user.id).await?;
             for p in pending {
-                crate::tcp::send_msg(tx, &reply(p)).await?;
+                crate::session::send_msg(tx, &reply(p))?;
             }
             convs
         }
@@ -1676,7 +1676,7 @@ pub async fn handle_request(
         AccountRequest::LogLeave { conv } => log::leave(&relay, user.id, &conv).await?,
         AccountRequest::LogMembers { conv } => log::members_of(&relay, user.id, &conv).await?,
     };
-    crate::tcp::send_msg(tx, &reply(out)).await
+    crate::session::send_msg(tx, &reply(out))
 }
 
 /// A channel's stored copy is held to the channel's own rules, as the live
@@ -1808,7 +1808,7 @@ pub async fn locked_log(state: &ServerState, channel_id: u32) {
     }
     let keep: Vec<[u8; 16]> = users
         .iter()
-        .filter_map(|u| state.user_to_session.get(u).map(|sid| *sid))
+        .filter_map(|u| state.sessions.contains_key(u).then_some(*u))
         .filter_map(|sid| {
             state
                 .sessions
@@ -1836,9 +1836,9 @@ async fn tell(state: &ServerState, account: &[u8; 16], r: AccountReply) {
     let tx = state
         .account_sessions
         .get(account)
-        .and_then(|sid| state.sessions.get(&*sid).map(|s| s.tcp_tx.clone()));
+        .and_then(|sid| state.sessions.get(&*sid).map(|s| s.control_tx.clone()));
     if let Some(tx) = tx {
-        let _ = crate::tcp::send_msg(&tx, &ServerMessage::Account(r)).await;
+        let _ = crate::session::send_msg(&tx, &ServerMessage::Account(r));
     }
 }
 
@@ -1886,7 +1886,7 @@ pub async fn revalidate(state: &Arc<ServerState>) {
                     .get(&session_id)
                     .and_then(|s| s.account.as_ref().map(|a| a.token.clone()));
                 if current.as_deref() == Some(token.as_str()) {
-                    crate::tcp::force_disconnect(
+                    crate::session::force_disconnect(
                         state,
                         session_id,
                         "You were signed out of this server.",
@@ -1933,13 +1933,13 @@ async fn apply_scopes(
             a.needs_2fa = info.needs_2fa;
         }
         (
-            s.tcp_tx.clone(),
+            s.control_tx.clone(),
             s.user_id,
             s.is_admin,
             s.is_admin != was_admin,
         )
     };
-    crate::tcp::send_msg(&tx, &ServerMessage::Account(AccountReply::Info(info))).await?;
+    crate::session::send_msg(&tx, &ServerMessage::Account(AccountReply::Info(info)))?;
     if became_admin {
         let data = encode_server_msg(&ServerMessage::AdminStatus { user_id, is_admin })?;
         state.broadcast_raw_to_all(&data).await;

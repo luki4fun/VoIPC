@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
@@ -577,7 +577,7 @@ pub(crate) async fn connect_files(
     if accept_invalid_certs
         && !TOFU_STORE
             .lock()
-            .unwrap_or_else(|p| p.into_inner())
+            .unwrap_or_else(PoisonError::into_inner)
             .contains_key(&tofu_key(host, port))
     {
         return Err(format!("no certificate is pinned for {host}:{port}"));
@@ -920,8 +920,8 @@ static TOFU_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// certificate — with no key behind it — pin theirs, and lock the real server
 /// out as "fingerprint changed".
 fn tofu_pin(key: &str, seen: &FirstSight) -> Option<String> {
-    let fingerprint = seen.lock().unwrap_or_else(|p| p.into_inner()).take()?;
-    let mut store = TOFU_STORE.lock().unwrap_or_else(|p| p.into_inner());
+    let fingerprint = seen.lock().unwrap_or_else(PoisonError::into_inner).take()?;
+    let mut store = TOFU_STORE.lock().unwrap_or_else(PoisonError::into_inner);
     if store.contains_key(key) {
         return None;
     }
@@ -1004,10 +1004,7 @@ fn tofu_key(host: &str, port: u16) -> String {
 /// Forget the pinned certificate for a server (after a legitimate cert
 /// rotation). The next connect pins the new certificate.
 pub fn tofu_forget(host: &str, port: u16) -> bool {
-    let mut store = TOFU_STORE.lock().unwrap_or_else(|p| {
-        warn!("mutex poisoned, recovering");
-        p.into_inner()
-    });
+    let mut store = TOFU_STORE.lock().unwrap_or_else(PoisonError::into_inner);
     // A pin list that did not read starts over here, by the person's choice:
     // the old file is kept beside it.
     if TOFU_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1058,10 +1055,7 @@ impl ServerCertVerifier for TofuCertVerifier {
         let fp_bytes = fingerprint.as_ref().to_vec();
         let host_key = &self.key;
 
-        let store = TOFU_STORE.lock().unwrap_or_else(|p| {
-            warn!("mutex poisoned, recovering");
-            p.into_inner()
-        });
+        let store = TOFU_STORE.lock().unwrap_or_else(PoisonError::into_inner);
         // The UI matches on "fingerprint changed" to offer forgetting the
         // pin, which is also what starts an unreadable pin list over.
         if TOFU_BROKEN.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1098,7 +1092,7 @@ impl ServerCertVerifier for TofuCertVerifier {
         } else {
             // First connection: pinned by `connect` once the handshake has
             // proved the key, and only for the attempt that won (`tofu_pin`)
-            *self.seen.lock().unwrap_or_else(|p| p.into_inner()) = Some(fp_bytes);
+            *self.seen.lock().unwrap_or_else(PoisonError::into_inner) = Some(fp_bytes);
         }
 
         Ok(ServerCertVerified::assertion())

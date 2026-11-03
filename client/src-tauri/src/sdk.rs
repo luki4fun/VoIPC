@@ -37,7 +37,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use tauri::{Emitter, Manager};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -221,7 +221,7 @@ fn publish_listening(app: &tauri::AppHandle, error: Option<String>) {
 type OwnerSlot = Arc<std::sync::Mutex<Owner>>;
 
 fn owner_slot(owner: &OwnerSlot) -> Owner {
-    owner.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    owner.lock().unwrap_or_else(PoisonError::into_inner).clone()
 }
 
 /// How many live sockets each origin holds. A native client sends no `Origin`,
@@ -245,7 +245,7 @@ struct OriginSlot {
 
 /// Claim a slot for this origin, or `None` if it already holds its share.
 fn take_origin_slot(counts: &OriginCounts, origin: &Option<String>) -> Option<OriginSlot> {
-    let mut map = counts.lock().unwrap_or_else(|p| p.into_inner());
+    let mut map = counts.lock().unwrap_or_else(PoisonError::into_inner);
     if origin_slots_full(&map, origin) {
         return None;
     }
@@ -258,7 +258,7 @@ fn take_origin_slot(counts: &OriginCounts, origin: &Option<String>) -> Option<Or
 
 impl Drop for OriginSlot {
     fn drop(&mut self) {
-        let mut map = self.counts.lock().unwrap_or_else(|p| p.into_inner());
+        let mut map = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
         if let Some(n) = map.get_mut(&self.origin) {
             *n -= 1;
             // Dropped at zero rather than left at zero: `cfx-nui-<anything>` is
@@ -322,7 +322,7 @@ async fn accept_loop(listener: TcpListener, app: tauri::AppHandle) {
             // Only the owner hands the mix back; a socket that was replaced by
             // a newer one, or never said hello, leaves the state alone.
             let was_owner = {
-                let mut slot = owner.lock().unwrap_or_else(|p| p.into_inner());
+                let mut slot = owner.lock().unwrap_or_else(PoisonError::into_inner);
                 if slot.generation == my_generation {
                     *slot = Owner::default();
                     true
@@ -459,7 +459,7 @@ async fn serve(
                         let now = tokio::time::Instant::now();
                         let too_soon = {
                             let state = app.state::<AppState>();
-                            let mut last = state.sdk_last_hello.lock().unwrap_or_else(|p| p.into_inner());
+                            let mut last = state.sdk_last_hello.lock().unwrap_or_else(PoisonError::into_inner);
                             let soon = last.is_some_and(|t| now.duration_since(t) < MIN_HELLO_GAP);
                             if !soon {
                                 *last = Some(now);
@@ -507,7 +507,7 @@ async fn serve(
                             // whoever was holding it before.
                             release_transmit(app).await;
                             holding_tx = false;
-                            *owner.lock().unwrap_or_else(|p| p.into_inner()) = Owner {
+                            *owner.lock().unwrap_or_else(PoisonError::into_inner) = Owner {
                                 generation,
                                 origin: origin.clone(),
                             };
@@ -1089,7 +1089,10 @@ fn with_placed<R>(
     f: impl FnOnce(&mut Option<(u64, (String, u32))>) -> R,
 ) -> R {
     let state = app.state::<AppState>();
-    let mut slot = state.sdk_placed.lock().unwrap_or_else(|p| p.into_inner());
+    let mut slot = state
+        .sdk_placed
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
     f(&mut slot)
 }
 
@@ -1151,7 +1154,10 @@ async fn apply_update(
     // The lock is held for exactly this block: everything below it talks to
     // the network, and the mixer needs this mutex every 20 ms.
     let (audible, changed) = {
-        let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+        let mut spatial = connection
+            .spatial
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
 
         // We left the channel the game said hello for (the user switched, or an
         // admin moved us). Its player ids mean nothing here, and applying them
@@ -1281,7 +1287,10 @@ async fn clear_sdk_positions(app: &tauri::AppHandle) {
     let conns = state.connections.read().await;
     if let Ok(connection) = crate::app_state::voice(&state, &conns) {
         {
-            let mut spatial = connection.spatial.lock().unwrap_or_else(|p| p.into_inner());
+            let mut spatial = connection
+                .spatial
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
             spatial.sdk_active = false;
             spatial.clear_positions();
         }

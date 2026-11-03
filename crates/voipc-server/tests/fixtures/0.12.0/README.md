@@ -5,7 +5,7 @@ later version. They are never regenerated.
 
 | File | Written by (0.12.0) | Checked in |
 |---|---|---|
-| `voipc.db`, `accounts.key`, `accounts.json` | the test below: `Relay::open` makes the key file; alice and bob sign up with real vaults through the client's `SignIn`; log keys; a DM alice keeps for bob; then `VACUUM INTO` | `src/tcp.rs` `a_0_12_accounts_database_opens_signs_in_and_keeps_its_messages` |
+| `voipc.db`, `accounts.key`, `accounts.json` | the test below: `Relay::open` makes the key file; alice and bob sign up with real vaults through the client's `SignIn`; log keys; a DM alice keeps for bob; then `VACUUM INTO` | `src/session_tests.rs` `a_0_12_accounts_database_opens_signs_in_and_keeps_its_messages` |
 | `presets/<name>/channels.json`, `server_settings.json` | `voipc-server channels init <name> --out channels.json` (the 0.12.0 binary) | `src/upgrade_fixtures.rs` |
 | `presets/<name>/init.txt` | what that command printed, including the generated channel passwords | `src/upgrade_fixtures.rs` (the 0.12 `sha256:` hashes still verify) |
 | `server.toml` | 0.12.0's README sample and `docs/ACCOUNTS.md` `[accounts]` block, verbatim | `src/upgrade_fixtures.rs` |

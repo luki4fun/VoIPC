@@ -193,7 +193,7 @@ jobs:
           workspaces: '. -> target'
 
       - name: Lockfiles match the manifests
-        run: for d in . crates/voipc-web crates/voipc-opus-wasm; do (cd "$d" && cargo fetch --locked); done
+        run: for d in . crates/voipc-web crates/voipc-opus-wasm crates/voipc-media-wasm; do (cd "$d" && cargo fetch --locked); done
 
       - run: npm ci
         working-directory: client
@@ -307,7 +307,7 @@ jobs:
           workspaces: '. -> target'
 
       - name: Lockfiles match the manifests
-        run: for d in . crates/voipc-web crates/voipc-opus-wasm; do (cd "$d" && cargo fetch --locked); done
+        run: for d in . crates/voipc-web crates/voipc-opus-wasm crates/voipc-media-wasm; do (cd "$d" && cargo fetch --locked); done
 
       # restore/save rather than actions/cache, whose post step is
       # `post-if: success()` and therefore saves nothing when the job fails —
@@ -497,7 +497,7 @@ jobs:
           workspaces: '. -> target'
 
       - name: Lockfiles match the manifests
-        run: for d in . crates/voipc-web crates/voipc-opus-wasm; do (cd "$d" && cargo fetch --locked); done
+        run: for d in . crates/voipc-web crates/voipc-opus-wasm crates/voipc-media-wasm; do (cd "$d" && cargo fetch --locked); done
 
       # The committed gradle-wrapper.jar runs first in the Gradle build; it
       # must be one Gradle published.

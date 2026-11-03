@@ -679,14 +679,14 @@ mod tests {
             other => panic!("unexpected reply: {other:?}"),
         };
 
-        // What an admin kick does (tcp::force_disconnect)
+        // What an admin kick does (session::force_disconnect)
         let close = {
             let session = state.sessions.get(&session_id).unwrap();
             let reason = ServerMessage::Disconnected {
                 reason: "bye".into(),
             };
             session
-                .tcp_tx
+                .control_tx
                 .try_send(encode_server_msg(&reason).unwrap())
                 .unwrap();
             session.close.clone()

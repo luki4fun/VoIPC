@@ -44,13 +44,12 @@
   <div class="layout-setup" aria-label="Choose a layout" use:dialog={{ onclose }}>
     <h3>How should VoIPC look?</h3>
     <p class="intro">
-      Three layouts, the same app underneath. Pick whichever feels familiar — you can change
+      Two layouts, the same app underneath. Pick whichever feels familiar — you can change
       it any time in Settings → Appearance.
     </p>
 
     <div class="choices" role="radiogroup" aria-label="Layout" use:roving>
       <LayoutPreview layout="modern" selected={picked === "modern"} onpick={() => (picked = "modern")} />
-      <LayoutPreview layout="classic" selected={picked === "classic"} onpick={() => (picked = "classic")} />
       <LayoutPreview layout="stage" selected={picked === "stage"} onpick={() => (picked = "stage")} />
     </div>
 

@@ -15,7 +15,6 @@
   import PokePopup from "./lib/components/PokePopup.svelte";
   import VoiceKeys from "./lib/components/VoiceKeys.svelte";
   import LayoutSetup from "./lib/components/LayoutSetup.svelte";
-  import ClassicShell from "./lib/components/shell/ClassicShell.svelte";
   import ModernShell from "./lib/components/modern/ModernShell.svelte";
   import StageShell from "./lib/components/stage/StageShell.svelte";
   import UserContextMenu from "./lib/components/UserContextMenu.svelte";
@@ -177,7 +176,7 @@
     playChannelMessageSound,
     playPokeSound,
   } from "./lib/sounds.js";
-  import { isMobile, isWeb, mobileTab } from "./lib/stores/platform.js";
+  import { isMobile, isWeb } from "./lib/stores/platform.js";
   import {
     audibleIds,
     centreView,
@@ -536,7 +535,6 @@
     if ($currentProximity === "off") {
       // Only the room is proximity-gated; the mixer works in any channel
       if ($centreView === "room") centreView.set("chat");
-      if ($mobileTab === "room") mobileTab.set("chat");
       if ($positions.size > 0 || $syncing) clearRoom();
     }
   });
@@ -694,7 +692,7 @@
       // Schedule auto-connect — will trigger after chat history is unlocked.
       // Every server that was open, or, in a config written before there was
       // a list, the one server it remembered.
-      if (config.auto_connect && config.remember_connection) {
+      if (config.auto_connect) {
         const open = config.open_servers ?? [];
         const list: SavedServer[] =
           open.length > 0
@@ -1680,11 +1678,6 @@
         viewerCount.set(data.viewer_count);
       }),
 
-      listenServer("keyframe-requested", (server) => {
-        if (!inVoice(server)) return;
-        invoke("set_keyframe_requested").catch(() => {});
-      }),
-
       listenServer<{ reason: string }>("screenshare-error", (server, data) => {
         addNotification(`${fromServer(server)}Screen share error: ${data.reason}`, "error");
         // A share we watch that this device cannot decode comes the same way
@@ -1846,15 +1839,13 @@
      copies racing each other. -->
 <VoiceKeys />
 
-<!-- The layout itself. All three shells read the same stores; App.svelte
-     stays the event bus and the modal stack above them. -->
+<!-- The layout itself. Both shells read the same stores; App.svelte stays
+     the event bus and the modal stack above them. -->
 {#if $uiPrefsReady}
-  {#if $uiLayout === "modern"}
-    <ModernShell onopensettings={() => (showSettings = true)} />
-  {:else if $uiLayout === "stage"}
+  {#if $uiLayout === "stage"}
     <StageShell onopensettings={() => (showSettings = true)} />
   {:else}
-    <ClassicShell onopensettings={() => (showSettings = true)} />
+    <ModernShell onopensettings={() => (showSettings = true)} />
   {/if}
 {/if}
 

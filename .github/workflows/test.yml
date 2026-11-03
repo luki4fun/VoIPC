@@ -2,12 +2,17 @@ name: Tests
 
 # Runs on pushes to main and on pull requests, and as the gate the release
 # workflow calls before it builds anything. Not on every branch push: a branch
-# with a pull request would run twice.
+# with a pull request would run twice. Not for a change that only touches docs,
+# the website or the relay's Dockerfile: of those, only the version check reads
+# a few, and the release gate (a workflow_call, which ignores the filter) still
+# runs it.
 
 on:
   push:
     branches: [main]
+    paths-ignore: ['**/*.md', 'docs/**', 'website/**', '.impeccable/**', 'Dockerfile.relay']
   pull_request:
+    paths-ignore: ['**/*.md', 'docs/**', 'website/**', '.impeccable/**', 'Dockerfile.relay']
   workflow_call:
 
 # Nothing here writes. Without this a push event's token gets the repository's
@@ -230,12 +235,17 @@ jobs:
           done
 
   browser:
-    name: Browser end-to-end
+    name: Browser end-to-end (${{ matrix.part }})
     runs-on: ubuntu-24.04
-    # The job took 22-39 min at 1.0 (18 of them apt, on a bad day), and the
-    # UI lane has grown since. Each lane also has its own cap below, so a hang
-    # names its lane instead of using up the job.
-    timeout-minutes: 90
+    # Three parts side by side: the two lanes that run test-ui.mjs (about 15
+    # minutes each at 1.5) and the quick lanes (under a minute each). One job
+    # ran them in a row for 35 minutes. Each lane also has its own cap below,
+    # so a hang names its lane instead of using up the job.
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [quic, udp-blocked, lanes]
     # The image has both, and test-web.sh would pick `chromium` first — but that
     # one is an unbranded snapshot build (no proprietary codecs), so the browser
     # sharer quietly falls back to VP9 and no lane exercises the H.264 path that
@@ -301,33 +311,33 @@ jobs:
 
       # Both engines, and both mixed pairings: a Chromium sharer feeds a Firefox
       # viewer H.264, a Firefox sharer feeds a Chromium viewer VP9.
-      # `!cancelled()` so one red lane does not hide the other three: knowing
+      # `!cancelled()` so one red lane does not hide the others: knowing
       # whether a failure is engine-specific is most of the diagnosis, and the
       # job still fails if any lane did.
       #
-      # test-ui.mjs (about 12 minutes since 1.3: its file section waits out
-      # the relay's one-minute file cache) drives its own Chromium and reads
-      # none of these settings, so it is the same test in every lane but where
-      # the network differs. It runs in the first lane (QUIC) and with UDP
-      # blocked (the TCP fallback); UI_TEST: '0' skips it in the others, and
-      # Firefox ↔ Firefox has no Chromium for it. Those two lanes get 25
-      # minutes, the others 10.
+      # test-ui.mjs (its file section waits out the relay's one-minute file
+      # cache) drives its own Chromium and reads none of these settings, so it
+      # is the same test in every lane but where the network differs. It runs
+      # in the `quic` part and with UDP blocked (the TCP fallback); UI_TEST:
+      # '0' skips it in the others, and Firefox ↔ Firefox has no Chromium for
+      # it. Those two lanes get 25 minutes, the others 10.
       - name: Chromium ↔ Chromium
+        if: matrix.part == 'quic'
         timeout-minutes: 25
         run: ./test-web.sh
         env: { BROWSER: chromium }
       - name: Firefox ↔ Firefox
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'lanes' }}
         timeout-minutes: 10
         run: ./test-web.sh
         env: { BROWSER: firefox }
       - name: Chromium shares, Firefox watches
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'lanes' }}
         timeout-minutes: 10
         run: ./test-web.sh
         env: { BROWSER_ALICE: chromium, BROWSER_BOB: firefox, UI_TEST: '0' }
       - name: Firefox shares, Chromium watches
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'lanes' }}
         timeout-minutes: 10
         run: ./test-web.sh
         env: { BROWSER_ALICE: firefox, BROWSER_BOB: chromium, UI_TEST: '0' }
@@ -336,12 +346,12 @@ jobs:
       # WebSocket must land on http/1.1, not the page's h2) against a
       # Chromium viewer on QUIC — the relay is the same across the two.
       - name: Chromium ↔ Chromium over TCP
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'lanes' }}
         timeout-minutes: 10
         run: ./test-web.sh
         env: { BROWSER: chromium, TRANSPORT: tcp, UI_TEST: '0' }
       - name: Firefox over TCP shares, Chromium over QUIC watches
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && matrix.part == 'lanes' }}
         timeout-minutes: 10
         run: ./test-web.sh
         env: { BROWSER_ALICE: firefox, TRANSPORT_ALICE: tcp, BROWSER_BOB: chromium, UI_TEST: '0' }
@@ -349,7 +359,7 @@ jobs:
       # over to the TCP fallback on their own. Only the first two test relays
       # are blocked; the accounts relay of test-ui.mjs keeps its UDP.
       - name: UDP blocked — both fall back to TCP
-        if: ${{ !cancelled() }}
+        if: matrix.part == 'udp-blocked'
         timeout-minutes: 25
         run: |
           rule=(INPUT -i lo -p udp --dport 19987:19988 -j DROP)
@@ -357,18 +367,16 @@ jobs:
           trap 'sudo iptables -D "${rule[@]}"' EXIT
           ./test-web.sh
         env: { BROWSER: chromium, EXPECT_FALLBACK: '1' }
-      # Delay, jitter (which also reorders) and 5 % loss on loopback. It
-      # reports, it does not gate. It passed in CI at 1.0; make it gate
-      # (drop continue-on-error) once a run of the 1.3 tree passes here too.
-      # A report-only step that fails still shows as passed: only its
-      # annotation (test-web.sh's EXIT trap) tells.
+      # Delay, jitter (which also reorders) and 5 % loss on loopback. It gates
+      # since 1.5: as report-only it had passed for a while, and its one
+      # failure (voice decoded by WebCodecs instead of the worklet's Opus) went
+      # unseen, because a report-only step that fails still shows as passed.
       #
       # FILE_KIB '0': no file transfer. 10 MiB under 5 % loss outlasts the
       # self-test's deadline, and the lane is about voice; the other lanes
       # carry the file.
-      - name: Lossy link (netem, report only)
-        if: ${{ !cancelled() }}
-        continue-on-error: true
+      - name: Lossy link (netem)
+        if: ${{ !cancelled() && matrix.part == 'lanes' }}
         timeout-minutes: 15
         run: |
           if ! sudo modprobe sch_netem; then

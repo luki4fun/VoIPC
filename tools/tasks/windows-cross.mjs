@@ -13,8 +13,8 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  CLIENT, ROOT, capture, checkFfmpegAbi, checkTrayLib, err, fail, head, info, npmInstall, ok, run, syncVersion,
-  which, writeTempConfig,
+  CLIENT, IS_WINDOWS, ROOT, capture, checkFfmpegAbi, checkTrayLib, err, fail, head, info, npmInstall, ok, run,
+  syncVersion, which, writeTempConfig,
 } from '../lib.mjs';
 import { writeNotices } from './notices.mjs';
 
@@ -30,7 +30,7 @@ const FFMPEG_RELEASE = 'autobuild-2026-09-30-13-08';
 const DEFAULT_ASSET = 'ffmpeg-n8.1.3-9-g29e619e767-win64-gpl-shared-8.1.zip';
 const DEFAULT_SHA256 = 'dfe81c3aa0a546ee81980b1b824486dd0fe0a1d452f00cb55135379a74be7bcf';
 const FFMPEG_HINT = 'Set VOIPC_FFMPEG_ASSET (a release/asset path under BtbN/FFmpeg-Builds) and '
-  + 'VOIPC_FFMPEG_SHA256 to an n8.x or n9.x "-shared" build and re-run setup:windows.';
+  + 'VOIPC_FFMPEG_SHA256 to an n8.x or n9.x "-shared" build and run the task again.';
 
 const home = () => process.env.HOME ?? process.env.USERPROFILE ?? '';
 const ffmpegDir = () =>
@@ -78,12 +78,13 @@ function installNsis() {
     + '     Debian: sudo apt install nsis');
 }
 
-function downloadFfmpeg() {
+/** The pinned Windows FFmpeg, downloaded once. The native Windows build uses it too. */
+export function downloadFfmpeg() {
   const dir = ffmpegDir();
   if (haveFfmpeg(dir)) {
     ok(`Windows FFmpeg already present at ${dir}`);
     checkFfmpegAbi(dir, FFMPEG_HINT);
-    return;
+    return dir;
   }
   // An override names its own release and must bring its own hash.
   const override = process.env.VOIPC_FFMPEG_ASSET;
@@ -105,7 +106,10 @@ function downloadFfmpeg() {
     }
     ok('FFmpeg download matches its pinned SHA-256');
     info('extracting...');
-    run('unzip', ['-q', zip, '-d', join(tmp, 'x')]);
+    mkdirSync(join(tmp, 'x'));
+    // Windows has no unzip, but its tar (bsdtar) reads zip files.
+    if (IS_WINDOWS) run('tar', ['-xf', zip, '-C', join(tmp, 'x')]);
+    else run('unzip', ['-q', zip, '-d', join(tmp, 'x')]);
 
     const inner = readdirSync(join(tmp, 'x'), { withFileTypes: true })
       .filter((e) => e.isDirectory())
@@ -125,6 +129,7 @@ function downloadFfmpeg() {
   }
   ok(`Windows FFmpeg installed to ${dir}`);
   checkFfmpegAbi(dir, FFMPEG_HINT);
+  return dir;
 }
 
 function reportEncoders() {

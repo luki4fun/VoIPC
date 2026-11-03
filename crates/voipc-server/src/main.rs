@@ -22,9 +22,9 @@ mod fsutil;
 mod media;
 mod presets;
 mod routing;
+mod session;
 mod settings;
 mod state;
-mod tcp;
 mod tunnel;
 #[cfg(test)]
 mod upgrade_fixtures;
@@ -913,8 +913,8 @@ async fn main() -> Result<()> {
             .with_no_client_auth()
             .with_single_cert(certs.clone(), key.clone_key())
             .context("invalid TLS configuration")?;
-    // Browsers get the web client over HTTP/2 only. Pre-0.5 native clients
-    // send no ALPN and are told to update (tcp::reject_legacy).
+    // Browsers get the web client over HTTP/2 only. A connection without
+    // ALPN (a pre-0.5 native client) is closed.
     tls_config.alpn_protocols = alpn_protocols();
 
     let tls_acceptor = TlsAcceptor::from(Arc::new(tls_config));
@@ -1190,10 +1190,7 @@ async fn main() -> Result<()> {
                         tunnel::tune(tls_stream.get_ref().0, peer_addr);
                         tunnel::serve(tls_stream, http_state, peer_addr).await;
                     }
-                    _ => {
-                        debug!(peer = %peer_addr, "legacy (pre-0.5) client, telling it to update");
-                        tcp::reject_legacy(tls_stream).await;
-                    }
+                    _ => debug!(peer = %peer_addr, "no ALPN (a pre-0.5 client?), closing"),
                 },
                 Ok(Err(e)) => {
                     // Browsers open speculative connections and drop them

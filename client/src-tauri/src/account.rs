@@ -8,7 +8,7 @@
 //! file only moves their messages, asks the person, and keeps what they hand
 //! over in the local archive.
 
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 
 use bytes::BytesMut;
 use serde::{Deserialize, Serialize};
@@ -68,7 +68,7 @@ pub struct AccountLink {
 impl AccountLink {
     /// The session, for one call; what it returns goes to `run`.
     pub fn session(&self) -> std::sync::MutexGuard<'_, AccountSession> {
-        self.session.lock().unwrap_or_else(|p| p.into_inner())
+        self.session.lock().unwrap_or_else(PoisonError::into_inner)
     }
 }
 
@@ -326,14 +326,14 @@ async fn ask_totp(
     state
         .totp_answers
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .insert(server.to_string(), tx);
     emit_server(app, server, "account-need-totp", retry);
     let answer = tokio::time::timeout(std::time::Duration::from_secs(115), rx).await;
     state
         .totp_answers
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .remove(server);
     match answer {
         Ok(Ok(a)) => Ok(a),
@@ -367,7 +367,7 @@ pub async fn check_seen(
 ) {
     let seen = signal
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .stores
         .as_mut()
         .map(|s| s.identity.take_seen())
@@ -411,15 +411,6 @@ fn signed_in<'a>(
         .as_ref()
         .ok_or("Not signed in to an account on that server")?;
     Ok((connection, link))
-}
-
-/// This account's choices (cloud copies), as its vault has them.
-#[tauri::command]
-pub async fn account_prefs(state: State<'_, AppState>, server: String) -> Result<Prefs, String> {
-    let connections = state.connections.read().await;
-    let (_, link) = signed_in(&connections, &server)?;
-    let prefs = link.session().prefs();
-    Ok(prefs)
 }
 
 /// A direct message for an account that is away (`account`, hex): kept in the
@@ -605,7 +596,7 @@ pub async fn account_totp(
     let waiting = state
         .totp_answers
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .remove(&server);
     match waiting {
         Some(tx) => tx
@@ -624,7 +615,7 @@ pub async fn account_cancel(state: State<'_, AppState>, server: String) -> Resul
     state
         .totp_answers
         .lock()
-        .unwrap_or_else(|p| p.into_inner())
+        .unwrap_or_else(PoisonError::into_inner)
         .remove(&server);
     Ok(())
 }

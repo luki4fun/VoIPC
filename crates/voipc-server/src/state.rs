@@ -52,17 +52,11 @@ impl RateLimiter {
 
     /// Try to consume one token. Returns true if allowed, false if rate-limited.
     pub fn try_consume(&mut self) -> bool {
-        let now = Instant::now();
-        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
-        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.max_tokens);
-        self.last_refill = now;
-
-        if self.tokens >= 1.0 {
+        let allowed = self.has_token();
+        if allowed {
             self.tokens -= 1.0;
-            true
-        } else {
-            false
         }
+        allowed
     }
 }
 
@@ -74,7 +68,7 @@ pub struct UserSession {
     pub is_muted: bool,
     pub is_deafened: bool,
     /// Sender for pushing control messages to this user's writer task.
-    pub tcp_tx: mpsc::Sender<Vec<u8>>,
+    pub control_tx: mpsc::Sender<Vec<u8>>,
     /// Media packets (voice, video, screen audio) queued for this user's
     /// QUIC session. A full queue drops the packet, like UDP would.
     pub media_tx: mpsc::Sender<Bytes>,
@@ -100,12 +94,12 @@ pub struct UserSession {
     /// sharers — so it is sized from the channel budget, not a fixed number.
     pub history_request_rate: RateLimiter,
     /// Rate limiter for UDP voice packets (55 pkt/s — 50fps + margin).
-    pub udp_voice_rate: RateLimiter,
+    pub voice_rate: RateLimiter,
     /// Rate limiter for position beacons (12 pkt/s — senders coalesce to 10 Hz).
     /// Separate from voice so positions cannot eat the voice budget.
     pub position_rate: RateLimiter,
     /// Rate limiter for UDP video packets (120 pkt/s — 60fps × 2 fragments avg).
-    pub udp_video_rate: RateLimiter,
+    pub video_rate: RateLimiter,
     /// Global rate limiter for all TCP messages (50 msg/s burst).
     pub global_rate: RateLimiter,
     /// Rate limiter for channel password attempts (3 burst, 1/s refill).
@@ -233,7 +227,7 @@ impl UserSession {
     pub fn new(
         user_id: UserId,
         username: String,
-        tcp_tx: mpsc::Sender<Vec<u8>>,
+        control_tx: mpsc::Sender<Vec<u8>>,
         media_tx: mpsc::Sender<Bytes>,
         peer_ip: IpAddr,
         max_users: u32,
@@ -245,7 +239,7 @@ impl UserSession {
             channel_id: 0,
             is_muted: false,
             is_deafened: false,
-            tcp_tx,
+            control_tx,
             media_tx,
             peer_ip,
             is_admin: false,
@@ -261,15 +255,18 @@ impl UserSession {
             // `HISTORY_SOURCES` members per channel, every channel this server
             // can hold: a client is not limited in how many text channels it
             // subscribes to, so neither is the budget that pays for them.
-            history_request_rate: RateLimiter::new(3.0 * (channel_budget as f64 + 1.0), 2.0),
-            udp_voice_rate: RateLimiter::new(55.0, 55.0),
+            history_request_rate: RateLimiter::new(
+                voipc_crypto::HISTORY_SOURCES as f64 * (channel_budget as f64 + 1.0),
+                2.0,
+            ),
+            voice_rate: RateLimiter::new(55.0, 55.0),
             // Position beacons: senders coalesce to 10 Hz, so 12/s with a
             // matching burst is plenty and keeps them off the voice budget.
             position_rate: RateLimiter::new(12.0, 12.0),
             // 1200 pkt/s ≈ 12 Mbps at 1280B packets: covers 1080p60 video
             // (~7.5 Mbps) + screen audio with headroom; burst 400 absorbs a
             // full keyframe (up to 255 fragments).
-            udp_video_rate: RateLimiter::new(400.0, 1200.0),
+            video_rate: RateLimiter::new(400.0, 1200.0),
             // The one budget both ends know about: clients pace themselves
             // just under it (codec.rs CONTROL_MSGS_PER_SEC).
             global_rate: RateLimiter::new(
@@ -331,15 +328,6 @@ impl UserSession {
             .or_insert_with(|| RateLimiter::new(burst, KEY_RELAY_REFILL))
             .try_consume()
     }
-}
-
-/// The longest message destruction timer a channel may advertise: 30 days.
-///
-/// The same number `voipc_crypto::MAX_MESSAGE_TTL_SECS` bounds a timer inside a
-/// message. Written out rather than depended on, because the server has no
-/// business linking against the crypto crate — it never reads a message.
-fn voipc_crypto_max_ttl() -> u32 {
-    30 * 24 * 60 * 60
 }
 
 /// How many key distributions one member may aim at one other member a second.
@@ -519,10 +507,10 @@ pub struct ServerState {
     /// The connection slots (`ConnLimits`): authentication moves a session
     /// into the main pool, its cleanup back.
     pub limits: Arc<crate::ConnLimits>,
-    /// All active sessions, keyed by session_id.
+    /// All active sessions, keyed by session_id — which is the user's
+    /// user_id too (session.rs `authenticate`), so a user's session is
+    /// `sessions.get(&user_id)`.
     pub sessions: DashMap<SessionId, UserSession>,
-    /// Reverse lookup: user_id -> session_id.
-    pub user_to_session: DashMap<UserId, SessionId>,
     /// Atomic username reservation: lowercase username -> session_id.
     pub username_to_session: DashMap<String, SessionId>,
     /// All channels, keyed by channel_id.
@@ -596,6 +584,18 @@ pub enum Poster {
 }
 
 impl ServerState {
+    /// Take one token from one of a session's limiters: false when it is empty,
+    /// or the session is gone.
+    pub fn spend(
+        &self,
+        session_id: SessionId,
+        limiter: impl FnOnce(&mut UserSession) -> &mut RateLimiter,
+    ) -> bool {
+        self.sessions
+            .get_mut(&session_id)
+            .is_some_and(|mut s| limiter(&mut s).try_consume())
+    }
+
     /// Whether `ip` may present a token at all: it has wrong guesses left.
     pub fn token_guess_allowed(&self, ip: IpAddr) -> bool {
         self.token_failures
@@ -721,7 +721,6 @@ impl ServerState {
 
         Self {
             sessions: DashMap::new(),
-            user_to_session: DashMap::new(),
             username_to_session: DashMap::new(),
             channels: RwLock::new(channels),
             limits: Arc::new(crate::ConnLimits::from_config(config)),
@@ -832,7 +831,7 @@ impl ServerState {
     pub fn clear_routing(&self, channel_id: ChannelId, members: impl IntoIterator<Item = UserId>) {
         let sessions = members
             .into_iter()
-            .filter_map(|uid| self.user_to_session.get(&uid).map(|s| *s));
+            .filter(|uid| self.sessions.contains_key(uid));
         self.routing.clear_channel(channel_id, sessions);
     }
 
@@ -884,7 +883,7 @@ impl ServerState {
     /// Broadcast a raw serialized message to all connected sessions.
     pub async fn broadcast_raw_to_all(&self, data: &[u8]) {
         for entry in self.sessions.iter() {
-            let _ = entry.value().tcp_tx.try_send(data.to_vec());
+            let _ = entry.value().control_tx.try_send(data.to_vec());
         }
     }
 
@@ -913,8 +912,7 @@ impl ServerState {
             .members
             .iter()
             .filter_map(|&uid| {
-                let sid = self.user_to_session.get(&uid)?;
-                let session = self.sessions.get(&*sid)?;
+                let session = self.sessions.get(&uid)?;
                 let username = match anonymous.then(|| channel.pseudonyms.get(&uid)).flatten() {
                     Some(alias) => alias.clone(),
                     None => session.username.clone(),
@@ -1043,7 +1041,7 @@ impl ServerState {
         let others: Vec<SessionId> = channel
             .members
             .iter()
-            .filter_map(|&uid| self.user_to_session.get(&uid).map(|s| *s))
+            .filter_map(|&uid| self.sessions.contains_key(&uid).then_some(uid))
             .collect();
 
         channel.members.insert(user_id);
@@ -1210,7 +1208,7 @@ impl ServerState {
         let remaining: Vec<SessionId> = channel
             .members
             .iter()
-            .filter_map(|&uid| self.user_to_session.get(&uid).map(|s| *s))
+            .filter_map(|&uid| self.sessions.contains_key(&uid).then_some(uid))
             .collect();
 
         let count = channel.members.len();
@@ -1222,7 +1220,6 @@ impl ServerState {
         let (_, session) = self.sessions.remove(&session_id)?;
 
         self.routing.clear_session(session_id);
-        self.user_to_session.remove(&session.user_id);
         // Only if it is still ours: an account signing in again elsewhere
         // took the name over, and this cleanup runs after that.
         self.username_to_session
@@ -1567,7 +1564,7 @@ impl ServerState {
             // reason: this number decides when somebody's chat is deleted, and
             // a channel advertising a year is advertising "never" in a way that
             // reads like a setting.
-            let v = v.min(voipc_crypto_max_ttl());
+            let v = v.min(voipc_crypto::MAX_MESSAGE_TTL_SECS);
             changed.any |= channel.info.message_ttl_secs != v;
             channel.info.message_ttl_secs = v;
         }
@@ -1648,9 +1645,9 @@ impl ServerState {
     }
 
     fn real_name_of(&self, subject: UserId) -> String {
-        self.user_to_session
+        self.sessions
             .get(&subject)
-            .and_then(|sid| self.sessions.get(&*sid).map(|s| s.username.clone()))
+            .map(|s| s.username.clone())
             .unwrap_or_default()
     }
 
@@ -1703,9 +1700,9 @@ impl ServerState {
         channel.pseudonyms.remove(&target_id);
 
         let target_session_id = self
-            .user_to_session
-            .get(&target_id)
-            .map(|s| *s)
+            .sessions
+            .contains_key(&target_id)
+            .then_some(target_id)
             .ok_or_else(|| anyhow::anyhow!("user session not found"))?;
 
         let remaining = channel.members.len();
@@ -1790,9 +1787,9 @@ impl ServerState {
 
         // Look up inviter's username
         let inviter_name = self
-            .user_to_session
+            .sessions
             .get(&requester_id)
-            .and_then(|sid| self.sessions.get(&*sid).map(|s| s.username.clone()))
+            .map(|s| s.username.clone())
             .unwrap_or_else(|| "Unknown".into());
 
         Ok((channel_name, inviter_name))
@@ -1879,7 +1876,7 @@ impl ServerState {
             .members
             .iter()
             .filter(|&&uid| uid != user_id)
-            .filter_map(|&uid| self.user_to_session.get(&uid).map(|s| *s))
+            .filter_map(|&uid| self.sessions.contains_key(&uid).then_some(uid))
             .collect();
 
         Ok(others)
@@ -1912,11 +1909,8 @@ impl ServerState {
             .viewers
             .iter()
             .filter_map(|&vid| {
-                let sid = *self.user_to_session.get(&vid)?;
-                if let Some(mut vs) = self.sessions.get_mut(&sid) {
-                    vs.watching_screenshare = None;
-                }
-                Some((vid, sid))
+                self.sessions.get_mut(&vid)?.watching_screenshare = None;
+                Some((vid, vid))
             })
             .collect();
 
@@ -1925,7 +1919,7 @@ impl ServerState {
             .members
             .iter()
             .filter(|&&uid| uid != user_id)
-            .filter_map(|&uid| self.user_to_session.get(&uid).map(|s| *s))
+            .filter_map(|&uid| self.sessions.contains_key(&uid).then_some(uid))
             .collect();
 
         Ok((viewer_sessions, member_sessions))
@@ -2062,11 +2056,7 @@ impl ServerState {
         share
             .viewers
             .iter()
-            .filter_map(|&vid| {
-                let sid = *self.user_to_session.get(&vid)?;
-                let session = self.sessions.get(&sid)?;
-                Some(session.media_tx.clone())
-            })
+            .filter_map(|vid| Some(self.sessions.get(vid)?.media_tx.clone()))
             .collect()
     }
 
@@ -2088,11 +2078,9 @@ impl ServerState {
         // If the user was screen sharing, remove their share and notify viewers
         if let Some(share) = channel.screen_shares.remove(&user_id) {
             for &viewer_id in &share.viewers {
-                if let Some(viewer_sid) = self.user_to_session.get(&viewer_id).map(|s| *s) {
-                    if let Some(mut vs) = self.sessions.get_mut(&viewer_sid) {
-                        vs.watching_screenshare = None;
-                    }
-                    cleanup.viewers_to_notify_stopped.push(viewer_sid);
+                if let Some(mut vs) = self.sessions.get_mut(&viewer_id) {
+                    vs.watching_screenshare = None;
+                    cleanup.viewers_to_notify_stopped.push(viewer_id);
                 }
             }
             cleanup.stopped_sharer_user_id = Some(user_id);
@@ -2125,7 +2113,7 @@ impl ServerState {
             .members
             .iter()
             .filter(|&&uid| uid != user_id)
-            .filter_map(|&uid| self.user_to_session.get(&uid).map(|s| *s))
+            .filter_map(|&uid| self.sessions.contains_key(&uid).then_some(uid))
             .collect();
 
         cleanup
@@ -2190,7 +2178,6 @@ pub(crate) mod test_support {
             state.channel_budget,
         );
         state.sessions.insert(session_id, session);
-        state.user_to_session.insert(user_id, session_id);
         state
             .username_to_session
             .insert(username.to_lowercase(), session_id);
@@ -3261,7 +3248,7 @@ mod tests {
 
     #[tokio::test]
     async fn switching_sharing_off_leaves_a_running_share_to_be_stopped() {
-        // The option flip does not itself end the share; tcp.rs stops the
+        // The option flip does not itself end the share; session.rs stops the
         // sharers it finds here, so the list must still be readable.
         let state = make_state();
         let (alice, alice_sid) = add_user(&state, "alice");
@@ -3594,20 +3581,12 @@ mod tests {
                 "the key-relay budget for one peer ran out"
             );
         }
-        for _ in 0..channels.len() * voipc_crypto_history_sources() {
+        for _ in 0..channels.len() * voipc_crypto::HISTORY_SOURCES {
             assert!(
                 session.history_request_rate.try_consume(),
                 "the history budget ran out"
             );
         }
-    }
-
-    /// The clients ask this many members per channel for its recent chat
-    /// (`voipc_crypto::HISTORY_SOURCES`), which is what the server's budget for
-    /// it is sized from. Written out rather than depended on: the server does
-    /// not otherwise link against the crypto crate.
-    fn voipc_crypto_history_sources() -> usize {
-        3
     }
 
     #[tokio::test]

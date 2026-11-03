@@ -17,10 +17,10 @@ libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0
 ring = "0.17"
 rand = "0.9"
 
-# Key derivation
-hkdf = "0.12"
-hmac = "0.12"
-sha2 = "0.10"
+# Key derivation (the versions libsignal uses, so the browser build carries one
+# copy of each)
+hkdf = "0.13"
+sha2 = "0.11"
 
 # Raw deflate for files before they are sealed, and the capped inflate on
 # the way out (file.rs); pure Rust, so the browser build has it too
