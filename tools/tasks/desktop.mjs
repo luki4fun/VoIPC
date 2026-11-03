@@ -154,6 +154,13 @@ function windowsMsvcEnv() {
     env.CMAKE_GENERATOR = 'Visual Studio 17 2022';
   }
 
+  // ffmpeg-sys-next's build script runs bindgen over the FFmpeg headers on its
+  // main thread, which overflows Windows' 1 MiB default stack there (nightly
+  // windows-native, 2026-11-03). link.exe reads LINK as extra options for every
+  // binary of this build, build scripts included: Linux's 8 MiB. The releases
+  // are cross-built on Linux and never see it.
+  env.LINK = [process.env.LINK, '/STACK:8388608'].filter(Boolean).join(' ');
+
   // The FFmpeg DLLs must be findable at runtime when the app is started here.
   const ffmpegBin = join(ffmpegRoot, 'bin');
   if (!(process.env.PATH ?? '').includes(ffmpegBin)) {
