@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# apt on a runner, with a limit. A mirror that hung once sat on this step until the job's
-# own 40 minutes ran out, with no test run and nothing in the log. Well, it takes 3 minutes.
+# apt on a runner, with a limit. The runner's first mirror can crawl (11 MB in 108 s on one
+# runner while the others were fine), and a step that takes 3 minutes then outlasts the job's
+# own 40, with no test run. Trying it again does not help, so a retry goes to the next mirror.
 #
 # Usage:  tools/ci-apt.sh <package>...
 set -u
@@ -14,6 +15,8 @@ for try in 1 2 3; do
     exit 0
   fi
   echo "::warning::apt: attempt $try of 3 did not finish"
+  # What was fetched stays in apt's cache, and the rest comes from the next on the list
+  sudo sed -i '/azure\.archive\.ubuntu\.com/d' /etc/apt/apt-mirrors.txt
   sleep 20
 done
 echo "::error::apt did not finish in 3 attempts"

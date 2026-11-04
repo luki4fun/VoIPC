@@ -433,6 +433,9 @@ elif [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
     for lane in "${lanes[@]}"; do
       run_lane "$lane" > "$WORK/$lane.txt" 2>&1 &
       lane_pid[$lane]=$!
+      # Their relays and browsers come up hardest: all at once on 4 cores, one lost its
+      # first connection. A lane takes minutes, so this costs next to nothing.
+      sleep 5
     done
     lanes_running=("${lanes[@]}")
     while [ "${#lanes_running[@]}" -gt 0 ]; do
