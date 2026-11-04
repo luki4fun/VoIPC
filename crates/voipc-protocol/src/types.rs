@@ -240,12 +240,10 @@ pub enum AccountStart {
     ProviderResume { ticket: Vec<u8> },
     /// Whether the browser is through (`AuthStep::ProviderReady`, or
     /// `ProviderPending`), without spending the ticket; the connection ends there.
-    ProviderStatus { ticket: Vec<u8> },    /// `ProviderResume` from someone holding an invite code or link (protocol v18): a
+    ProviderStatus { ticket: Vec<u8> },
+    /// `ProviderResume` from someone holding an invite code or link (protocol v18): a
     /// person nobody knows may then make an account, where sign-up alone would not let them.
-    ProviderResumeInvited {
-        ticket: Vec<u8>,
-        invite: String,
-    },
+    ProviderResumeInvited { ticket: Vec<u8>, invite: String },
 }
 
 /// Who can vouch for an account at sign-in. Never for its vault: the relay sees

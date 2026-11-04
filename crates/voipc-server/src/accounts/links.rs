@@ -291,8 +291,8 @@ pub async fn register(
     let turn = relay.link_lock.lock().await;
     let no_js = gate.precheck(proof, true).map_err(|d| the_end(d.message))?;
     let reserved: Vec<&str> = cfg.reserved_usernames.iter().map(String::as_str).collect();
-    let username = scope::normalize_username(name, &reserved)
-        .map_err(|e| Refused::Name(e.to_string()))?;
+    let username =
+        scope::normalize_username(name, &reserved).map_err(|e| Refused::Name(e.to_string()))?;
     let taken = relay.store().user_by_username(&username).await;
     if !matches!(taken, Ok(None)) {
         return Err(Refused::Name("That name is taken.".into()));

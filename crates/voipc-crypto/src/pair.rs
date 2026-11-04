@@ -134,7 +134,13 @@ impl PairRequest {
             return None;
         }
         let them = PublicKey::deserialize(&wrapped[..33]).ok()?;
-        let shared = Zeroizing::new(self.pair.private_key.calculate_agreement(&them).ok()?.to_vec());
+        let shared = Zeroizing::new(
+            self.pair
+                .private_key
+                .calculate_agreement(&them)
+                .ok()?
+                .to_vec(),
+        );
         let salt = [&wrapped[..33], &self.pair.public_key.serialize()[..]].concat();
         let ctx = context(relay_id, name, &self.commitment);
         let k = kek(&shared, &salt, &ctx)?;

@@ -55,9 +55,9 @@ use voipc_protocol::video::{
     FrameGrouper, RecordReader, MAX_FRAGMENTS_PER_FRAME, VIDEO_HEADER_SIZE,
 };
 
+use crate::accounts::provider;
 use crate::config::ServerConfig;
 use crate::media;
-use crate::accounts::provider;
 use crate::state::ServerState;
 use crate::{session, ConnLimits};
 

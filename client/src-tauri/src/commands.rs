@@ -441,7 +441,11 @@ pub async fn profile_picture_get(
 ) -> Result<(), String> {
     let conns = state.connections.read().await;
     let connection = conn(&conns, &server)?;
-    network::send_tcp_message(&connection.tcp_tx, &ClientMessage::ProfilePictureGet { hash }).await
+    network::send_tcp_message(
+        &connection.tcp_tx,
+        &ClientMessage::ProfilePictureGet { hash },
+    )
+    .await
 }
 
 /// Invite a user to your channel (creator only).

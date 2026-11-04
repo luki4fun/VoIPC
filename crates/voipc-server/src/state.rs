@@ -2350,7 +2350,9 @@ pub(crate) mod test_support {
             media_tx,
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             state.max_users,
-            state.channel_budget.load(std::sync::atomic::Ordering::Relaxed),
+            state
+                .channel_budget
+                .load(std::sync::atomic::Ordering::Relaxed),
         );
         state.sessions.insert(session_id, session);
         state

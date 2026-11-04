@@ -1225,7 +1225,10 @@ mod tests {
         let refused = verifier
             .verify_server_cert(stranger.der(), &[], &name, &[], UnixTime::now())
             .unwrap_err();
-        assert!(refused.to_string().contains("fingerprint changed"), "{refused}");
+        assert!(
+            refused.to_string().contains("fingerprint changed"),
+            "{refused}"
+        );
         assert_eq!(
             TOFU_STORE.lock().unwrap().get(&key),
             Some(&vec![9; 32]),

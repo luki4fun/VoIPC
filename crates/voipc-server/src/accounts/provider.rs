@@ -46,11 +46,11 @@ use tracing::{info, warn};
 use voipc_protocol::messages::{AccountReply, AuthContinue, AuthStep, ServerMessage};
 use voipc_protocol::types::{LinkedProvider, PowChallenge, ProviderKind, VaultBlob};
 
+use super::links;
 use super::{
     next, refused, second_factor, step, unexpected, vault_item_ok, Relay, SignedIn, BUSY,
     RESET_KEY_LEN, SLOT_RESET, STEP_WAIT, VAULT_MAX_ITEMS, VAULT_NS, VAULT_TOTAL_BYTES,
 };
-use super::links;
 use crate::state::{RateLimiter, ServerState};
 
 /// Where a provider sends the browser back (l4f's own path) and where the
@@ -118,7 +118,10 @@ pub(super) fn from_env() -> anyhow::Result<Option<OAuth>> {
             return Ok(Some(OAuth::new(http, providers)));
         }
     }
-    Ok(Some(OAuth::new(l4f_accounts::oauth::client(None)?, providers)))
+    Ok(Some(OAuth::new(
+        l4f_accounts::oauth::client(None)?,
+        providers,
+    )))
 }
 
 /// What a flow is for: a sign-in, or a signed-in connection linking a provider
@@ -131,9 +134,13 @@ enum Purpose {
 
 enum Outcome {
     Signed(LoginStep),
-    Signup { cookie: String },
+    Signup {
+        cookie: String,
+    },
     /// Sign-up is closed: only with an invite (`resume`).
-    NoAccount { cookie: String },
+    NoAccount {
+        cookie: String,
+    },
     Failed(String),
 }
 
@@ -141,7 +148,9 @@ enum Stage {
     /// The browser is at the provider.
     Open,
     /// The provider sent it back with this; waiting for the person to tap.
-    Back { provider_code: String },
+    Back {
+        provider_code: String,
+    },
     /// Tapped; the provider is being asked. A second tap ends here.
     Asking,
     Done(Outcome),
@@ -216,7 +225,11 @@ fn code_and_choices() -> (String, [String; 3]) {
 impl Relay {
     /// The providers people can sign in with here, or none without a web address.
     pub fn provider_kinds(&self) -> Vec<ProviderKind> {
-        self.accounts.oauth_kinds().into_iter().map(kind_from).collect()
+        self.accounts
+            .oauth_kinds()
+            .into_iter()
+            .map(kind_from)
+            .collect()
     }
 
     /// A new flow: where to send the browser, the code to show, and the ticket.
@@ -277,7 +290,8 @@ impl Relay {
         kind: ProviderKind,
         ip: IpAddr,
     ) -> Result<(), String> {
-        let (url, code, ticket) = self.flow_begin(kind, Purpose::SignIn, Intent::Login, None, ip)?;
+        let (url, code, ticket) =
+            self.flow_begin(kind, Purpose::SignIn, Intent::Login, None, ip)?;
         step(
             stream,
             AuthStep::OpenBrowser {
@@ -311,20 +325,35 @@ fn page(status: StatusCode, title: &str, body: &str) -> Response<Full<Bytes>> {
     let mut resp = Response::new(Full::new(Bytes::from(html)));
     *resp.status_mut() = status;
     let h = resp.headers_mut();
-    h.insert(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
-    h.insert(header::CONTENT_SECURITY_POLICY, HeaderValue::from_static(PAGE_CSP));
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(PAGE_CSP),
+    );
     // The address holds the provider's code
-    h.insert(header::REFERRER_POLICY, HeaderValue::from_static("no-referrer"));
+    h.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
     h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     resp
 }
 
 fn ended_page() -> Response<Full<Bytes>> {
-    page(StatusCode::GONE, "This sign-in has ended", &format!("<p>{ENDED}</p>"))
+    page(
+        StatusCode::GONE,
+        "This sign-in has ended",
+        &format!("<p>{ENDED}</p>"),
+    )
 }
 
 fn query_param<'a>(query: &'a str, key: &str) -> Option<&'a str> {
-    query.split('&').find_map(|p| p.strip_prefix(key)?.strip_prefix('='))
+    query
+        .split('&')
+        .find_map(|p| p.strip_prefix(key)?.strip_prefix('='))
 }
 
 /// `state`, `code` and `error` as a provider sends them: URL-safe, or escaped by
@@ -462,7 +491,13 @@ pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Respo
             );
         }
         flow.stage = Stage::Asking;
-        (flow.kind, flow.cookie.clone(), flow.state.clone(), provider_code, flow.purpose)
+        (
+            flow.kind,
+            flow.cookie.clone(),
+            flow.state.clone(),
+            provider_code,
+            flow.purpose,
+        )
     };
     let (kind, cookie, oauth_state, provider_code, purpose) = taken;
     let ctx = relay.ctx(ip, "web");
@@ -498,7 +533,14 @@ pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Respo
         Purpose::Account { session_id } => {
             relay.providers.remove(&ticket);
             finish_for_account(
-                state, &relay, session_id, kind, &cookie, &oauth_state, &provider_code, ip,
+                state,
+                &relay,
+                session_id,
+                kind,
+                &cookie,
+                &oauth_state,
+                &provider_code,
+                ip,
             )
             .await;
             back_to_the_app()
@@ -507,7 +549,9 @@ pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Respo
 }
 
 fn html_text(s: &str) -> String {
-    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 fn back_to_the_app() -> Response<Full<Bytes>> {
@@ -611,9 +655,11 @@ pub(super) async fn resume<S: AsyncRead + AsyncWrite + Unpin>(
     answers: &mut u32,
 ) -> Result<SignedIn, String> {
     let ticket: [u8; 32] = ticket.try_into().map_err(|_| ENDED.to_string())?;
-    let not_yet = relay.providers.by_ticket.get(&ticket).map(|f| {
-        f.started.elapsed() <= FLOW_LIFE && !matches!(f.stage, Stage::Done(_))
-    });
+    let not_yet = relay
+        .providers
+        .by_ticket
+        .get(&ticket)
+        .map(|f| f.started.elapsed() <= FLOW_LIFE && !matches!(f.stage, Stage::Done(_)));
     match not_yet {
         None => return Err(ENDED.into()),
         Some(true) => {
@@ -778,7 +824,11 @@ pub(crate) async fn claim(
         return Err("This account was opened just now, somewhere else.".into());
     }
     // What a claim that died halfway left, which nobody could open
-    relay.store().delete_blobs(user, VAULT_NS).await.map_err(|_| gone())?;
+    relay
+        .store()
+        .delete_blobs(user, VAULT_NS)
+        .await
+        .map_err(|_| gone())?;
     for b in vault {
         match relay
             .store()
@@ -793,7 +843,10 @@ pub(crate) async fn claim(
             }
         }
     }
-    relay.set_identity(user, identity_key).await.map_err(|_| gone())
+    relay
+        .set_identity(user, identity_key)
+        .await
+        .map_err(|_| gone())
 }
 
 /// From a provider's sign-in to the keys: the same end as `super::finish`, except
@@ -840,7 +893,10 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
 
     let identity_key = loop {
         match next(stream, buf, CHOICE_WAIT, answers).await? {
-            AuthContinue::Claim { identity_key, vault } if claim_it => {
+            AuthContinue::Claim {
+                identity_key,
+                vault,
+            } if claim_it => {
                 let _work = work()?;
                 claim(relay, user.id, &identity_key, &vault).await?;
                 info!(user = %user.id.hex(), "account claimed through a provider");
@@ -927,10 +983,15 @@ async fn pair<S: AsyncRead + AsyncWrite + Unpin>(
     // Each ask puts a question on the person's other device: a stranger holding
     // their provider account must not be able to wear them down.
     if !relay.spend_pair_ask(user) {
-        return refuse_pair(stream, "Too many requests to your other device. Try again later.").await;
+        return refuse_pair(
+            stream,
+            "Too many requests to your other device. Try again later.",
+        )
+        .await;
     }
     let other = state.account_sessions.get(&user.0).map(|s| *s);
-    let Some(tx) = other.and_then(|id| state.sessions.get(&id).map(|s| s.control_tx.clone())) else {
+    let Some(tx) = other.and_then(|id| state.sessions.get(&id).map(|s| s.control_tx.clone()))
+    else {
         return refuse_pair(stream, "No other device of yours is online here.").await;
     };
     // In 32 bits: the apps' front ends hold it as a JS number
@@ -954,12 +1015,22 @@ async fn pair<S: AsyncRead + AsyncWrite + Unpin>(
         else {
             return Err(unexpected());
         };
-        if told(AccountReply::PairRevealed { pair, ephemeral, blind }).is_err() {
+        if told(AccountReply::PairRevealed {
+            pair,
+            ephemeral,
+            blind,
+        })
+        .is_err()
+        {
             return refuse_pair(stream, "Your other device did not answer.").await;
         }
         match tokio::time::timeout(PAIR_WAIT, events.recv()).await {
-            Ok(Some(PairEvent::Wrapped(wrapped))) => step(stream, AuthStep::PairWrapped { wrapped }).await,
-            Ok(Some(PairEvent::Declined)) => refuse_pair(stream, "Your other device said no.").await,
+            Ok(Some(PairEvent::Wrapped(wrapped))) => {
+                step(stream, AuthStep::PairWrapped { wrapped }).await
+            }
+            Ok(Some(PairEvent::Declined)) => {
+                refuse_pair(stream, "Your other device said no.").await
+            }
             _ => refuse_pair(stream, "Your other device did not answer in time.").await,
         }
     }
@@ -970,14 +1041,24 @@ async fn pair<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 async fn refuse_pair<S: AsyncWrite + Unpin>(stream: &mut S, reason: &str) -> Result<(), String> {
-    step(stream, AuthStep::PairRefused { reason: reason.into() }).await
+    step(
+        stream,
+        AuthStep::PairRefused {
+            reason: reason.into(),
+        },
+    )
+    .await
 }
 
 impl Relay {
     /// `voipc-server admin reclaim`: an account back to unopened, for someone who
     /// lost every device and the recovery key. Only without a password: with one,
     /// a sign-in or a reset is the way back, and this would lock it out instead.
-    pub async fn reclaim(&self, ctx: &l4f_accounts::service::Ctx, user: &User) -> Result<(), String> {
+    pub async fn reclaim(
+        &self,
+        ctx: &l4f_accounts::service::Ctx,
+        user: &User,
+    ) -> Result<(), String> {
         let failed = |e: sqlx::Error| e.to_string();
         if user.has_password {
             return Err(format!(
@@ -989,7 +1070,10 @@ impl Relay {
             .reset_2fa_as_host(ctx, user.id)
             .await
             .map_err(|e| e.message().to_string())?;
-        self.store().delete_blobs(user.id, VAULT_NS).await.map_err(failed)?;
+        self.store()
+            .delete_blobs(user.id, VAULT_NS)
+            .await
+            .map_err(failed)?;
         let id = &user.id.0[..];
         db!(self.store(), pool => {
             // Its log key went with the vault: nobody can wrap to it any more, and
@@ -1087,7 +1171,10 @@ pub(super) async fn unlink(
     let kind_l4f = kind_of(kind);
     let linked = relay.accounts.oauth_linked(user.id).await?;
     let Some((_, cred)) = linked.into_iter().find(|(k, _)| *k == kind_l4f) else {
-        return Ok(refused("ProviderUnlink", "That provider is not linked here."));
+        return Ok(refused(
+            "ProviderUnlink",
+            "That provider is not linked here.",
+        ));
     };
     Ok(
         match relay

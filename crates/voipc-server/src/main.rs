@@ -722,7 +722,10 @@ async fn run_command(config: &ServerConfig, command: Command) -> Result<()> {
         }
         Command::Admin(AdminCommand::Reclaim { name }) => {
             let user = user_named(name).await?;
-            relay.reclaim(&ctx, &user).await.map_err(|e| anyhow::anyhow!(e))?;
+            relay
+                .reclaim(&ctx, &user)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?;
             println!(
                 "{}: vault and identity wiped, signed out everywhere. The next sign-in through a provider opens it anew, and whoever knew this account is warned.",
                 user.username

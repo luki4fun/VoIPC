@@ -25,8 +25,8 @@ use voipc_crypto::sync::Prefs;
 use voipc_protocol::codec::{try_decode_frame, APP_VERSION};
 use voipc_protocol::compat::{decode_server_msg_from, encode_client_msg_for};
 use voipc_protocol::conv::{hex, unhex16};
-use voipc_protocol::messages::{AccountReply, AccountRequest, ClientMessage, ServerMessage};
 use voipc_protocol::messages::AuthStep;
+use voipc_protocol::messages::{AccountReply, AccountRequest, ClientMessage, ServerMessage};
 use voipc_protocol::types::{AccountStart, EmoteAccess, FileLimits, ProviderKind};
 
 use crate::app_state::{AppState, SignalState};
@@ -119,7 +119,12 @@ pub async fn account_provider_ask(
         ProviderAsk::Status { ticket } => AccountStart::ProviderStatus { ticket },
     };
     let proto = voipc_protocol::codec::PROTOCOL_VERSION;
-    write(&mut link.control_send, &provider_ask(start, proto, APP_VERSION), proto).await?;
+    write(
+        &mut link.control_send,
+        &provider_ask(start, proto, APP_VERSION),
+        proto,
+    )
+    .await?;
     let mut buf = BytesMut::with_capacity(1024);
     loop {
         let msg = read(&mut link.control_recv, &mut buf, proto).await?;
@@ -160,7 +165,9 @@ pub async fn account_provider_answer(
         .unwrap_or_else(PoisonError::into_inner)
         .remove(&server);
     match waiting {
-        Some(tx) => tx.send(answer).map_err(|_| "That sign-in is over.".to_string()),
+        Some(tx) => tx
+            .send(answer)
+            .map_err(|_| "That sign-in is over.".to_string()),
         None => Err("No sign-in is waiting for that.".into()),
     }
 }
@@ -475,21 +482,32 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                 Step::Stretch { .. } => return Err("unexpected sign-in step".into()),
                 // The front end asked `account_provider_ask` before coming here
                 Step::ProviderPending => return Err("Not finished in the browser yet.".into()),
-                Step::ProviderSignup { suggestion, problem } => {
-                    let payload = serde_json::json!({ "suggestion": suggestion, "problem": problem });
+                Step::ProviderSignup {
+                    suggestion,
+                    problem,
+                } => {
+                    let payload =
+                        serde_json::json!({ "suggestion": suggestion, "problem": problem });
                     let ProviderAnswer::Name { name } =
-                        ask_provider(state, app, server, "account-provider-signup", payload).await?
+                        ask_provider(state, app, server, "account-provider-signup", payload)
+                            .await?
                     else {
                         return Err("unexpected sign-in step".into());
                     };
                     let out = tokio::task::block_in_place(|| machine.provider_signup(&name))?;
                     write(send, &out, proto).await?;
                 }
-                Step::ProviderChoice { name, claim, has_password } => {
+                Step::ProviderChoice {
+                    name,
+                    claim,
+                    has_password,
+                } => {
                     choice = Some(serde_json::json!({
                         "name": name, "claim": claim, "has_password": has_password, "problem": "",
                     }));
-                    steps.extend(choose(state, app, server, &mut machine, send, proto, &mut choice).await?);
+                    steps.extend(
+                        choose(state, app, server, &mut machine, send, proto, &mut choice).await?,
+                    );
                 }
                 Step::PairCode { code } => {
                     emit_server(app, server, "account-pair-code", code);
@@ -498,7 +516,9 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
                     if let Some(c) = choice.as_mut() {
                         c["problem"] = reason.into();
                     }
-                    steps.extend(choose(state, app, server, &mut machine, send, proto, &mut choice).await?);
+                    steps.extend(
+                        choose(state, app, server, &mut machine, send, proto, &mut choice).await?,
+                    );
                 }
                 Step::Ignore => {}
             }
@@ -564,13 +584,17 @@ async fn choose<S: AsyncWrite + Unpin>(
                 return Ok(Vec::new());
             }
             ProviderAnswer::Password => {
-                let name = choice.as_ref().and_then(|c| c["name"].as_str()).unwrap_or_default();
+                let name = choice
+                    .as_ref()
+                    .and_then(|c| c["name"].as_str())
+                    .unwrap_or_default();
                 return Err(format!("{USE_PASSWORD}{name}"));
             }
             ProviderAnswer::Recovery { key } => {
                 let opened = recovery_parse(&key)
                     .ok_or_else(|| {
-                        "That is not a recovery key: 52 letters and digits, as it was shown.".to_string()
+                        "That is not a recovery key: 52 letters and digits, as it was shown."
+                            .to_string()
                     })
                     .and_then(|key| machine.provider_recovery(&Zeroizing::new(key)));
                 match opened {
@@ -853,7 +877,9 @@ pub async fn account_delete(
     let master = stretched(&state, &server, password).await?;
     let connections = state.connections.read().await;
     let (connection, link) = signed_in(&connections, &server)?;
-    let a = link.session().delete_account(master.as_deref(), totp, recovery);
+    let a = link
+        .session()
+        .delete_account(master.as_deref(), totp, recovery);
     run(&app, &server, &connection.tcp_tx, a).await;
     Ok(())
 }
@@ -1031,7 +1057,9 @@ pub async fn account_recovery_key_new(
     let master = stretched(&state, &server, password).await?;
     let connections = state.connections.read().await;
     let (connection, link) = signed_in(&connections, &server)?;
-    let (a, key) = link.session().recovery_key_new(master.as_deref(), totp, recovery);
+    let (a, key) = link
+        .session()
+        .recovery_key_new(master.as_deref(), totp, recovery);
     // A relay before 1.3 has no such request and would never answer
     for m in &a.send {
         encode_client_msg_for(m, connection.tcp_tx.proto()).map_err(|e| e.to_string())?;

@@ -6751,7 +6751,11 @@ mod providers {
     /// The browser: back from the provider, and `pick` tapped.
     async fn browser(state: &Arc<ServerState>, url: &str, pick: &str) -> StatusCode {
         let s = state_in(url);
-        let back = provider::callback(state, "/account/oauth/discord/cb", &format!("state={s}&code=abc"));
+        let back = provider::callback(
+            state,
+            "/account/oauth/discord/cb",
+            &format!("state={s}&code=abc"),
+        );
         assert_eq!(back.status(), StatusCode::OK);
         provider::confirm(state, format!("state={s}&pick={pick}").as_bytes(), LO)
             .await
@@ -6794,7 +6798,13 @@ mod providers {
         let mut c = open_raw(state, &first).await;
         loop {
             let msg = c.next().await.ok_or("closed")?;
-            if matches!(msg, ServerMessage::Authenticated { account: Some(_), .. }) {
+            if matches!(
+                msg,
+                ServerMessage::Authenticated {
+                    account: Some(_),
+                    ..
+                }
+            ) {
                 return Ok((c, m.finish()?));
             }
             let mut steps = m.on_message(&msg)?;
@@ -6830,7 +6840,9 @@ mod providers {
 
     /// A first sign-in on an open relay: the provider's person takes a name and
     /// claims. Returns the connection, what it signed in with, and the recovery key.
-    async fn claimed(state: &Arc<ServerState>) -> (Client, voipc_crypto::account::SignedIn, [u8; 32]) {
+    async fn claimed(
+        state: &Arc<ServerState>,
+    ) -> (Client, voipc_crypto::account::SignedIn, [u8; 32]) {
         let (url, code, ticket) = open_page(state).await;
         assert_eq!(browser(state, &url, &code).await, StatusCode::OK);
         let (c, signed) = sign_in(state, ticket, Choice::Claim).await.unwrap();
@@ -6847,12 +6859,10 @@ mod providers {
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let first = provider_ask(AccountStart::Providers, PROTOCOL_VERSION, APP_VERSION);
         let mut c = open_raw(&state, &first).await;
-        assert!(
-            matches!(
-                c.next().await,
-                Some(ServerMessage::AuthStep(AuthStep::Providers { ref kinds })) if kinds.is_empty()
-            ),
-        );
+        assert!(matches!(
+            c.next().await,
+            Some(ServerMessage::AuthStep(AuthStep::Providers { ref kinds })) if kinds.is_empty()
+        ),);
         let first = provider_ask(
             AccountStart::Provider {
                 kind: ProviderKind::Discord,
@@ -6861,7 +6871,10 @@ mod providers {
             APP_VERSION,
         );
         let mut c = open_raw(&state, &first).await;
-        assert!(matches!(c.next().await, Some(ServerMessage::AuthError { .. })));
+        assert!(matches!(
+            c.next().await,
+            Some(ServerMessage::AuthError { .. })
+        ));
     }
 
     /// Nothing is asked of the provider before the tap, and a wrong tap ends it:
@@ -6873,12 +6886,22 @@ mod providers {
 
         let not_yet = sign_in(&state, ticket.clone(), Choice::Claim).await;
         assert_eq!(not_yet.err().as_deref(), Some(NOT_YET));
-        assert!(!status(&state, &ticket).await, "asking does not end the flow");
+        assert!(
+            !status(&state, &ticket).await,
+            "asking does not end the flow"
+        );
 
         let s = state_in(&url).to_string();
-        let page = provider::callback(&state, "/account/oauth/discord/cb", &format!("state={s}&code=abc"));
+        let page = provider::callback(
+            &state,
+            "/account/oauth/discord/cb",
+            &format!("state={s}&code=abc"),
+        );
         assert_eq!(page.status(), StatusCode::OK);
-        let csp = page.headers().get(hyper::header::CONTENT_SECURITY_POLICY).unwrap();
+        let csp = page
+            .headers()
+            .get(hyper::header::CONTENT_SECURITY_POLICY)
+            .unwrap();
         assert!(csp.to_str().unwrap().contains("form-action 'self'"));
         let not_yet = sign_in(&state, ticket.clone(), Choice::Claim).await;
         assert_eq!(
@@ -6888,10 +6911,12 @@ mod providers {
         );
 
         let wrong = if code == "100" { "101" } else { "100" };
-        let tapped = provider::confirm(&state, format!("state={s}&pick={wrong}").as_bytes(), LO).await;
+        let tapped =
+            provider::confirm(&state, format!("state={s}&pick={wrong}").as_bytes(), LO).await;
         assert_eq!(tapped.status(), StatusCode::FORBIDDEN);
         // A second tap, now with the right code, changes nothing
-        let again = provider::confirm(&state, format!("state={s}&pick={code}").as_bytes(), LO).await;
+        let again =
+            provider::confirm(&state, format!("state={s}&pick={code}").as_bytes(), LO).await;
         assert_eq!(again.status(), StatusCode::GONE);
         assert!(status(&state, &ticket).await, "through, if not well");
         let ended = sign_in(&state, ticket, Choice::Claim).await;
@@ -6901,7 +6926,11 @@ mod providers {
     #[tokio::test]
     async fn a_callback_for_no_flow_or_another_provider_ends_there() {
         let (state, _db, _) = relay(RegistrationMode::Open).await;
-        let gone = provider::callback(&state, "/account/oauth/discord/cb", "state=nothing&code=abc");
+        let gone = provider::callback(
+            &state,
+            "/account/oauth/discord/cb",
+            "state=nothing&code=abc",
+        );
         assert_eq!(gone.status(), StatusCode::GONE);
         let (url, _, _) = open_page(&state).await;
         let other = provider::callback(
@@ -6918,12 +6947,20 @@ mod providers {
         let (_c, signed, _) = claimed(&state).await;
         assert_eq!(signed.name, "deedee");
         let relay = relay_of(&state);
-        let user = relay.store().user_by_username("deedee").await.unwrap().unwrap();
+        let user = relay
+            .store()
+            .user_by_username("deedee")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!user.has_password);
         let stored = relay.vault(user.id).await.unwrap();
         let keys = stored_keys(&stored);
         assert!(!keys.contains(&"slot.pass"), "{keys:?}");
-        assert!(keys.contains(&"slot.recovery") && keys.contains(&"slot.reset"), "{keys:?}");
+        assert!(
+            keys.contains(&"slot.recovery") && keys.contains(&"slot.reset"),
+            "{keys:?}"
+        );
         assert_eq!(
             relay.identity(user.id).await.unwrap().unwrap(),
             signed.identity.public_key().serialize().to_vec()
@@ -6938,7 +6975,9 @@ mod providers {
         let (old, signed, key) = claimed(&state).await;
         let (url, code, ticket) = open_page(&state).await;
         browser(&state, &url, &code).await;
-        let (_c, again) = sign_in(&state, ticket, Choice::Recovery(key)).await.unwrap();
+        let (_c, again) = sign_in(&state, ticket, Choice::Recovery(key))
+            .await
+            .unwrap();
         assert_eq!(
             again.identity.public_key().serialize(),
             signed.identity.public_key().serialize()
@@ -7014,10 +7053,15 @@ mod providers {
         let stranger = voipc_crypto::generate_identity_key_pair();
         let relay_id = relay_of(&state).relay_id;
         c.send(&ClientMessage::AuthContinue(AuthContinue::ProviderProof {
-            signature: voipc_crypto::account::provider_proof(&stranger, &relay_id, "deedee", &challenge),
+            signature: voipc_crypto::account::provider_proof(
+                &stranger, &relay_id, "deedee", &challenge,
+            ),
         }))
         .await;
-        assert!(matches!(c.next().await, Some(ServerMessage::AuthError { .. })));
+        assert!(matches!(
+            c.next().await,
+            Some(ServerMessage::AuthError { .. })
+        ));
 
         real.send(&ClientMessage::Ping { timestamp: 7 }).await;
         real.expect("the real connection lives on", |m| {
@@ -7031,9 +7075,19 @@ mod providers {
         let (state, _db, subject) = relay(RegistrationMode::Open).await;
         let (_c, _, _) = register_with(&state, "wendy").await;
         let relay = relay_of(&state);
-        let wendy = relay.store().user_by_username("wendy").await.unwrap().unwrap();
+        let wendy = relay
+            .store()
+            .user_by_username("wendy")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
-            relay.vault(wendy.id).await.unwrap().iter().any(|b| b.k == "slot.pass"),
+            relay
+                .vault(wendy.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|b| b.k == "slot.pass"),
             "the control: this vault has one"
         );
         *subject.lock().unwrap() = "2002".into();
@@ -7059,7 +7113,11 @@ mod providers {
         };
         assert_eq!(name, "wendy");
         assert!(has_password && !claim);
-        assert!(!stored_keys(&blobs).contains(&"slot.pass"), "{:?}", stored_keys(&blobs));
+        assert!(
+            !stored_keys(&blobs).contains(&"slot.pass"),
+            "{:?}",
+            stored_keys(&blobs)
+        );
     }
 
     /// An identity on record for `user`'s account: what a provider's `credential`
@@ -7106,11 +7164,15 @@ mod providers {
             "{:06}",
             l4f_accounts::totp::code_at(&secret, l4f_accounts::util::now() / 30 + 1)
         );
-        c.send(&ClientMessage::AuthContinue(AuthContinue::Totp { code })).await;
+        c.send(&ClientMessage::AuthContinue(AuthContinue::Totp { code }))
+            .await;
         let msg = c.next().await.unwrap();
         let (mut m, _) = SignIn::start(
             "",
-            Method::Provider { ticket: vec![], invite: None },
+            Method::Provider {
+                ticket: vec![],
+                invite: None,
+            },
             PROTOCOL_VERSION,
             APP_VERSION,
         );
@@ -7126,7 +7188,15 @@ mod providers {
         };
         assert!(reason.contains("not your account's"), "{reason}");
         let on_record = relay_of(&state)
-            .identity(relay_of(&state).store().user_by_username("deedee").await.unwrap().unwrap().id)
+            .identity(
+                relay_of(&state)
+                    .store()
+                    .user_by_username("deedee")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .id,
+            )
             .await
             .unwrap()
             .unwrap();
@@ -7145,15 +7215,28 @@ mod providers {
             vault: vec![reset_slot()],
         }))
         .await;
-        assert!(matches!(c.next().await, Some(ServerMessage::AuthError { .. })));
+        assert!(matches!(
+            c.next().await,
+            Some(ServerMessage::AuthError { .. })
+        ));
         let relay = relay_of(&state);
-        let user = relay.store().user_by_username("deedee").await.unwrap().unwrap();
+        let user = relay
+            .store()
+            .user_by_username("deedee")
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             relay.identity(user.id).await.unwrap().unwrap(),
             signed.identity.public_key().serialize().to_vec()
         );
         assert!(
-            relay.vault(user.id).await.unwrap().iter().any(|b| b.k == "slot.recovery"),
+            relay
+                .vault(user.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|b| b.k == "slot.recovery"),
             "the vault is still there"
         );
     }
@@ -7165,7 +7248,12 @@ mod providers {
         let (state, _db, _) = relay(RegistrationMode::Open).await;
         let (_c, signed, _) = claimed(&state).await;
         let relay = relay_of(&state);
-        let user = relay.store().user_by_username("deedee").await.unwrap().unwrap();
+        let user = relay
+            .store()
+            .user_by_username("deedee")
+            .await
+            .unwrap()
+            .unwrap();
         let before = relay.vault(user.id).await.unwrap();
         let err = provider::claim(relay, user.id, &IDENTITY_OTHER, &[reset_slot()])
             .await
@@ -7184,12 +7272,23 @@ mod providers {
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let (_c, _) = register(&state, "gwen").await;
         let relay = relay_of(&state);
-        let user = relay.store().user_by_username("gwen").await.unwrap().unwrap();
+        let user = relay
+            .store()
+            .user_by_username("gwen")
+            .await
+            .unwrap()
+            .unwrap();
         db_forget_identity(relay, user.id).await;
         provider::claim(relay, user.id, &IDENTITY_OTHER, &[reset_slot()])
             .await
             .unwrap();
-        let keys: Vec<String> = relay.vault(user.id).await.unwrap().into_iter().map(|b| b.k).collect();
+        let keys: Vec<String> = relay
+            .vault(user.id)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|b| b.k)
+            .collect();
         assert_eq!(keys, ["slot.reset"], "only what this claim wrote");
     }
 
@@ -7213,7 +7312,12 @@ mod providers {
         drop(c);
         let relay = relay_of(&state);
         let ctx = relay.ctx(LO, "test");
-        let user = relay.store().user_by_username("deedee").await.unwrap().unwrap();
+        let user = relay
+            .store()
+            .user_by_username("deedee")
+            .await
+            .unwrap()
+            .unwrap();
         relay.reclaim(&ctx, &user).await.unwrap();
         assert!(relay.identity(user.id).await.unwrap().is_none());
         assert!(relay.vault(user.id).await.unwrap().is_empty());
@@ -7230,7 +7334,12 @@ mod providers {
 
         *subject.lock().unwrap() = "5005".into();
         let (_w, _, _) = register_with(&state, "wendy").await;
-        let wendy = relay.store().user_by_username("wendy").await.unwrap().unwrap();
+        let wendy = relay
+            .store()
+            .user_by_username("wendy")
+            .await
+            .unwrap()
+            .unwrap();
         let err = relay.reclaim(&ctx, &wendy).await.unwrap_err();
         assert!(err.contains("has a password"), "{err}");
         assert!(relay.identity(wendy.id).await.unwrap().is_some());
@@ -7245,11 +7354,22 @@ mod providers {
         let (c, signed, key) = claimed(&state).await;
         drop(c);
         tokio::time::sleep(Duration::from_millis(100)).await;
-        reset_with(&state, "deedee", &recovery_text(&key), "a brand new password", None)
-            .await
-            .unwrap();
+        reset_with(
+            &state,
+            "deedee",
+            &recovery_text(&key),
+            "a brand new password",
+            None,
+        )
+        .await
+        .unwrap();
         let relay = relay_of(&state);
-        let user = relay.store().user_by_username("deedee").await.unwrap().unwrap();
+        let user = relay
+            .store()
+            .user_by_username("deedee")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(user.has_password);
 
         let (mut m, first) = SignIn::start(
@@ -7279,7 +7399,15 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
-        let (mut m, _) = SignIn::start("", Method::Provider { ticket: vec![], invite: None }, PROTOCOL_VERSION, APP_VERSION);
+        let (mut m, _) = SignIn::start(
+            "",
+            Method::Provider {
+                ticket: vec![],
+                invite: None,
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
         let mut c = open_raw(&state, &first).await;
         let msg = c.next().await.unwrap();
         for s in m.on_message(&msg).unwrap() {
@@ -7288,17 +7416,31 @@ mod providers {
         c.send(&m.provider_signup("deedee").unwrap()).await;
         assert!(matches!(
             c.next().await,
-            Some(ServerMessage::AuthStep(AuthStep::ProviderSigned { claim: true, .. }))
+            Some(ServerMessage::AuthStep(AuthStep::ProviderSigned {
+                claim: true,
+                ..
+            }))
         ));
         c.send(&ClientMessage::AuthContinue(AuthContinue::Claim {
             identity_key: IDENTITY_OTHER.to_vec(),
             vault: vec![],
         }))
         .await;
-        assert!(matches!(c.next().await, Some(ServerMessage::AuthError { .. })));
+        assert!(matches!(
+            c.next().await,
+            Some(ServerMessage::AuthError { .. })
+        ));
         let relay = relay_of(&state);
-        let user = relay.store().user_by_username("deedee").await.unwrap().unwrap();
-        assert!(relay.identity(user.id).await.unwrap().is_none(), "still unclaimed");
+        let user = relay
+            .store()
+            .user_by_username("deedee")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            relay.identity(user.id).await.unwrap().is_none(),
+            "still unclaimed"
+        );
     }
 
     /// A link's maker, on any relay: someone with an account, made from the shell.
@@ -7318,7 +7460,13 @@ mod providers {
             email: None,
             display_name: None,
         };
-        relay.accounts.register_invite(&ctx, form).await.unwrap().info.user_id
+        relay
+            .accounts
+            .register_invite(&ctx, form)
+            .await
+            .unwrap()
+            .info
+            .user_id
     }
 
     async fn in_group(state: &ServerState, name: &str, group: &str) -> bool {
@@ -7341,20 +7489,47 @@ mod providers {
         group(&state, "crew", Some("Crew"), &[]).await;
         let relay = state.accounts.clone().unwrap();
         let maker = link_maker(&state).await;
-        let (code, _) = relay.link_new(1, 7, Some("crew"), maker).await.unwrap().unwrap();
+        let (code, _) = relay
+            .link_new(1, 7, Some("crew"), maker)
+            .await
+            .unwrap()
+            .unwrap();
 
         // A name that is taken asks again, and costs no use
         let (url, shown, ticket) = open_page(&state).await;
         browser(&state, &url, &shown).await;
-        let taken = relay.store().user_by_id(maker).await.unwrap().unwrap().username;
-        sign_in_with(&state, ticket, Some(&code), Choice::Claim, &[&taken, "deedee"])
+        let taken = relay
+            .store()
+            .user_by_id(maker)
             .await
-            .expect("signed up under the second name");
-        assert!(in_group(&state, "deedee", "crew").await, "its starting group");
+            .unwrap()
+            .unwrap()
+            .username;
+        sign_in_with(
+            &state,
+            ticket,
+            Some(&code),
+            Choice::Claim,
+            &[&taken, "deedee"],
+        )
+        .await
+        .expect("signed up under the second name");
+        assert!(
+            in_group(&state, "deedee", "crew").await,
+            "its starting group"
+        );
         assert_eq!(relay.links().await.unwrap()[0].uses, 1);
-        let dee = relay.store().user_by_username("deedee").await.unwrap().unwrap();
+        let dee = relay
+            .store()
+            .user_by_username("deedee")
+            .await
+            .unwrap()
+            .unwrap();
         let audit = relay.store().audit_of(dee.id, 50).await.unwrap();
-        let used = audit.iter().find(|e| e.event == "invite_link_used").unwrap();
+        let used = audit
+            .iter()
+            .find(|e| e.event == "invite_link_used")
+            .unwrap();
         assert_eq!(used.actor_id, Some(maker), "by whose link");
 
         // Used up: nobody else gets in on it
@@ -7374,7 +7549,11 @@ mod providers {
         let (state, _db, subject) = relay(RegistrationMode::Invite).await;
         let relay = state.accounts.clone().unwrap();
         let ctx = relay.ctx(LO, "test");
-        let code = relay.accounts.invite_create_as_host(&ctx, None, 1).await.unwrap();
+        let code = relay
+            .accounts
+            .invite_create_as_host(&ctx, None, 1)
+            .await
+            .unwrap();
         let (url, shown, ticket) = open_page(&state).await;
         browser(&state, &url, &shown).await;
         sign_in_with(&state, ticket, Some(&code), Choice::Claim, &["deedee"])
@@ -7396,7 +7575,11 @@ mod providers {
         group(&state, "crew", Some("Crew"), &[]).await;
         let relay = state.accounts.clone().unwrap();
         let maker = link_maker(&state).await;
-        let (code, _) = relay.link_new(1, 7, Some("crew"), maker).await.unwrap().unwrap();
+        let (code, _) = relay
+            .link_new(1, 7, Some("crew"), maker)
+            .await
+            .unwrap()
+            .unwrap();
         let (url, shown, ticket) = open_page(&state).await;
         browser(&state, &url, &shown).await;
         sign_in_with(&state, ticket, Some(&code), Choice::Claim, &["deedee"])
@@ -7410,7 +7593,10 @@ mod providers {
         sign_in_with(&state, ticket, Some(&code), Choice::Claim, &["other"])
             .await
             .expect("anyone may sign up here");
-        assert!(!in_group(&state, "other", "crew").await, "the link had run out");
+        assert!(
+            !in_group(&state, "other", "crew").await,
+            "the link had run out"
+        );
     }
 
     /// Sign-up closed means closed: a link is no way round it.
@@ -7473,7 +7659,8 @@ mod providers {
         );
         let mut c = open_raw(&state, &first).await;
         drive(&mut c, &mut m).await.unwrap();
-        c.send(&ClientMessage::Account(AccountRequest::DeviceChallenge)).await;
+        c.send(&ClientMessage::Account(AccountRequest::DeviceChallenge))
+            .await;
         let ServerMessage::Account(AccountReply::Error { request, .. }) =
             c.expect("refused", |m| reply(m).is_some()).await
         else {
@@ -7499,7 +7686,9 @@ mod providers {
     /// The old device hears the ask and answers with a nonce.
     async fn pair_asked(old: &mut Client) -> (u64, Vec<u8>, Vec<u8>) {
         let ServerMessage::Account(AccountReply::PairAsked { pair, commitment }) = old
-            .expect("asked", |m| matches!(reply(m), Some(AccountReply::PairAsked { .. })))
+            .expect("asked", |m| {
+                matches!(reply(m), Some(AccountReply::PairAsked { .. }))
+            })
             .await
         else {
             unreachable!()
@@ -7539,7 +7728,9 @@ mod providers {
         else {
             unreachable!()
         };
-        assert!(voipc_crypto::pair::reveal_ok(commitment, &ephemeral, &blind));
+        assert!(voipc_crypto::pair::reveal_ok(
+            commitment, &ephemeral, &blind
+        ));
         let code = voipc_crypto::pair::code(commitment, nonce, &ephemeral);
         (ephemeral, code)
     }
@@ -7561,7 +7752,13 @@ mod providers {
             }
         }
         c.expect("Authenticated", |m| {
-            matches!(m, ServerMessage::Authenticated { account: Some(_), .. })
+            matches!(
+                m,
+                ServerMessage::Authenticated {
+                    account: Some(_),
+                    ..
+                }
+            )
         })
         .await;
     }
@@ -7572,14 +7769,20 @@ mod providers {
         browser(state, &url, &code).await;
         let (mut m, first) = SignIn::start(
             "",
-            Method::Provider { ticket, invite: None },
+            Method::Provider {
+                ticket,
+                invite: None,
+            },
             PROTOCOL_VERSION,
             APP_VERSION,
         );
         let mut c = open_raw(state, &first).await;
         let msg = c.next().await.unwrap();
         let steps = m.on_message(&msg).unwrap();
-        assert!(matches!(steps[0], Step::ProviderChoice { claim: false, .. }));
+        assert!(matches!(
+            steps[0],
+            Step::ProviderChoice { claim: false, .. }
+        ));
         (m, c)
     }
 
@@ -7602,8 +7805,11 @@ mod providers {
             &commitment,
         )
         .unwrap();
-        old.send(&ClientMessage::Account(AccountRequest::PairApprove { pair, wrapped }))
-            .await;
+        old.send(&ClientMessage::Account(AccountRequest::PairApprove {
+            pair,
+            wrapped,
+        }))
+        .await;
         let msg = c.next().await.unwrap();
         let steps = m.on_message(&msg).unwrap();
         run_to_authenticated(&mut m, &mut c, steps).await;
@@ -7622,7 +7828,10 @@ mod providers {
         let (pair, commitment, nonce) = pair_asked(&mut old).await;
         pair_reveal(&mut m, &mut c).await;
         pair_revealed(&mut old, &commitment, &nonce).await;
-        old.send(&ClientMessage::Account(AccountRequest::PairDecline { pair })).await;
+        old.send(&ClientMessage::Account(AccountRequest::PairDecline {
+            pair,
+        }))
+        .await;
         let msg = c.next().await.unwrap();
         let steps = m.on_message(&msg).unwrap();
         assert!(matches!(steps[0], Step::PairRefused { .. }));
@@ -7639,7 +7848,12 @@ mod providers {
         let (_old, _, _) = claimed(&state).await;
         let (mut m, mut c) = new_device(&state).await;
         let relay = relay_of(&state);
-        let user = relay.store().user_by_username("deedee").await.unwrap().unwrap();
+        let user = relay
+            .store()
+            .user_by_username("deedee")
+            .await
+            .unwrap()
+            .unwrap();
         for _ in 0..3 {
             assert!(relay.spend_pair_ask(user.id));
         }
@@ -7660,7 +7874,9 @@ mod providers {
         let (mut mallory, _) = register(&state, "mallory").await;
         c.send(&m.pair_start().unwrap()).await;
         let ServerMessage::Account(AccountReply::PairAsked { pair, .. }) = old
-            .expect("asked", |m| matches!(reply(m), Some(AccountReply::PairAsked { .. })))
+            .expect("asked", |m| {
+                matches!(reply(m), Some(AccountReply::PairAsked { .. }))
+            })
             .await
         else {
             unreachable!()
@@ -7700,10 +7916,12 @@ mod providers {
         let (state, _db, subject) = relay(RegistrationMode::Open).await;
         *subject.lock().unwrap() = "3003".into();
         let (mut c, _, signed) = register_with(&state, "wendy").await;
-        let secret = voipc_crypto::account::derive("correct horse battery", &signed.relay_id, "wendy")
-            .auth_secret
-            .to_vec();
-        c.send(&ClientMessage::Account(AccountRequest::ProviderList)).await;
+        let secret =
+            voipc_crypto::account::derive("correct horse battery", &signed.relay_id, "wendy")
+                .auth_secret
+                .to_vec();
+        c.send(&ClientMessage::Account(AccountRequest::ProviderList))
+            .await;
         let ServerMessage::Account(AccountReply::Providers {
             offered,
             linked,
@@ -7747,7 +7965,8 @@ mod providers {
             c.expect("done", |m| reply(m).is_some()).await,
             ServerMessage::Account(AccountReply::ProviderDone { link: true, .. })
         ));
-        c.send(&ClientMessage::Account(AccountRequest::ProviderList)).await;
+        c.send(&ClientMessage::Account(AccountRequest::ProviderList))
+            .await;
         let ServerMessage::Account(AccountReply::Providers { linked, .. }) =
             c.expect("list", |m| reply(m).is_some()).await
         else {
@@ -8307,7 +8526,10 @@ mod layouts {
         .await
         .unwrap();
         let again = restart(&db, Vec::new()).await;
-        assert!(named(&again, "news").await.is_some_and(|c| c.3), "it came back, as the app's");
+        assert!(
+            named(&again, "news").await.is_some_and(|c| c.3),
+            "it came back, as the app's"
+        );
         let n = crate::accounts::raw(
             again.accounts.as_deref().unwrap(),
             &format!("SELECT COUNT(*) FROM voipc_members WHERE conv = '{conv}'"),
@@ -8482,7 +8704,11 @@ mod group_styles {
         let mut guest = connect(&state, "guest#1234", lo).await;
         assert_eq!(
             styles(&mut guest).await,
-            [styled("mod", None), styled("Crew", None), styled("Lead", None)],
+            [
+                styled("mod", None),
+                styled("Crew", None),
+                styled("Lead", None)
+            ],
             "those with privileges first, then by name, and a group with no badge is not told"
         );
 
@@ -8497,7 +8723,11 @@ mod group_styles {
         .await;
         assert_eq!(
             styles(&mut guest).await,
-            [styled("mod", None), styled("Crew", None), styled("Lead", Some(0xff8800))]
+            [
+                styled("mod", None),
+                styled("Crew", None),
+                styled("Lead", Some(0xff8800))
+            ]
         );
 
         let names = ["lead", "admin", "crew", "moderator", "quiet", "user"]
@@ -8666,7 +8896,10 @@ mod group_styles {
             .map(|(r, _)| r.name)
             .collect();
         let at = |name: &str| now.iter().position(|n| n == name).unwrap();
-        assert!(at("mods") < at("crew") && at("mods") < at("team"), "{now:?}");
+        assert!(
+            at("mods") < at("crew") && at("mods") < at("team"),
+            "{now:?}"
+        );
         assert!(at("keepers") < at("moderator"), "{now:?}");
         let swapped = |a: &str, b: &str| {
             let mut names = now.clone();
@@ -8676,9 +8909,15 @@ mod group_styles {
         let order = |names: Vec<String>| AdminOp::GroupOrder { names };
 
         let r = answer(&mut kim, order(swapped("admin", "keepers"))).await;
-        assert!(matches!(r, AccountReply::Error { .. }), "moves the admins: {r:?}");
+        assert!(
+            matches!(r, AccountReply::Error { .. }),
+            "moves the admins: {r:?}"
+        );
         let r = answer(&mut kim, order(swapped("team", "keepers"))).await;
-        assert!(matches!(r, AccountReply::Error { .. }), "team past mods: {r:?}");
+        assert!(
+            matches!(r, AccountReply::Error { .. }),
+            "team past mods: {r:?}"
+        );
         let mut short = now.clone();
         short.pop();
         let r = answer(&mut kim, order(short.clone())).await;
@@ -8689,7 +8928,10 @@ mod group_styles {
 
         let wanted = swapped("crew", "team");
         let r = answer(&mut kim, order(wanted.clone())).await;
-        assert!(matches!(r, AccountReply::Admin(AdminReply::Groups { .. })), "{r:?}");
+        assert!(
+            matches!(r, AccountReply::Admin(AdminReply::Groups { .. })),
+            "{r:?}"
+        );
         let shown: Vec<String> = relay
             .groups_in_order()
             .await
@@ -8715,14 +8957,22 @@ mod group_styles {
             .map(|(r, _)| r.name)
             .collect();
         let at = |name: &str| names.iter().position(|n| n == name).unwrap();
-        assert!(at("admin") < at("00-mine") && at("moderator") < at("00-mine"), "{names:?}");
+        assert!(
+            at("admin") < at("00-mine") && at("moderator") < at("00-mine"),
+            "{names:?}"
+        );
 
         // A row draws its badges keyed by their text, so a repeat would stop every
         // client showing this member
         let (_bob, bi) = register(&state, "bob").await;
         give(&state, bi.id, "staff-a", true).await;
         give(&state, bi.id, "staff-b", true).await;
-        let bob = relay.store().user_by_id(AccountId(bi.id)).await.unwrap().unwrap();
+        let bob = relay
+            .store()
+            .user_by_id(AccountId(bi.id))
+            .await
+            .unwrap()
+            .unwrap();
         let standing = relay.standing(&bob, &[]).await.unwrap();
         assert_eq!(standing.badges, ["Staff"]);
         assert_eq!(standing.my_badges, ["Staff"]);
@@ -8738,7 +8988,10 @@ mod group_styles {
         let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let mut guest = connect(&state, "guest#1234", lo).await;
         let crew_of = |list: Vec<GroupStyle>| list.into_iter().find(|s| s.badge == "Crew").unwrap();
-        assert!(crew_of(styles(&mut guest).await).section, "on until someone turns it off");
+        assert!(
+            crew_of(styles(&mut guest).await).section,
+            "on until someone turns it off"
+        );
 
         let r = answer(
             &mut ann,
@@ -8749,7 +9002,10 @@ mod group_styles {
             },
         )
         .await;
-        assert!(matches!(r, AccountReply::Admin(AdminReply::Groups { .. })), "{r:?}");
+        assert!(
+            matches!(r, AccountReply::Admin(AdminReply::Groups { .. })),
+            "{r:?}"
+        );
         let crew = crew_of(styles(&mut guest).await);
         assert_eq!((crew.color, crew.section), (Some(7), false));
 
@@ -8955,14 +9211,20 @@ mod profiles {
         let relay = state.accounts.clone().unwrap();
         let sid = *state.account_sessions.get(&ai.id).unwrap();
         // Its budget at nothing: a repeat needs none of it
-        state
-            .sessions
-            .get_mut(&sid)
-            .unwrap()
-            .state_change_rate = crate::state::RateLimiter::new(1.0, 0.0);
-        assert!(matches!(name_is(&mut ann, "Same").await, AccountReply::ProfileDone));
-        assert!(matches!(name_is(&mut ann, "Other").await, AccountReply::ProfileDone));
-        assert!(matches!(name_is(&mut ann, "Third").await, AccountReply::Error { .. }));
+        state.sessions.get_mut(&sid).unwrap().state_change_rate =
+            crate::state::RateLimiter::new(1.0, 0.0);
+        assert!(matches!(
+            name_is(&mut ann, "Same").await,
+            AccountReply::ProfileDone
+        ));
+        assert!(matches!(
+            name_is(&mut ann, "Other").await,
+            AccountReply::ProfileDone
+        ));
+        assert!(matches!(
+            name_is(&mut ann, "Third").await,
+            AccountReply::Error { .. }
+        ));
         assert_eq!(
             relay.profiles(&[ai.id]).await.unwrap()[0].name.as_deref(),
             Some("Other")
@@ -9360,7 +9622,15 @@ mod layout_limits {
     async fn hidden_channel(state: &Arc<ServerState>, sid: SessionId) -> (ChannelId, u32) {
         grant(state, sid, &["*"]);
         let id = crate::layout::channel_save(
-            state, sid, None, "board-room", "", true, false, None, None,
+            state,
+            sid,
+            None,
+            "board-room",
+            "",
+            true,
+            false,
+            None,
+            None,
         )
         .await
         .unwrap();
@@ -9385,11 +9655,16 @@ mod layout_limits {
         let (_kim, ki) = register(&state, "kim").await;
         let sid = sid_of(&state, ki.id);
         grant(&state, sid, &["voipc:channels"]);
-        let a = crate::layout::category_save(&state, sid, None, "A").await.unwrap();
-        let b = crate::layout::category_save(&state, sid, None, "B").await.unwrap();
-        let id = crate::layout::channel_save(&state, sid, None, "news", "", true, false, None, None)
+        let a = crate::layout::category_save(&state, sid, None, "A")
             .await
             .unwrap();
+        let b = crate::layout::category_save(&state, sid, None, "B")
+            .await
+            .unwrap();
+        let id =
+            crate::layout::channel_save(&state, sid, None, "news", "", true, false, None, None)
+                .await
+                .unwrap();
         crate::layout::layout_set(&state, sid, &[b, b, a, b], &[(id, Some(b)), (id, Some(a))])
             .await
             .unwrap();
@@ -9408,14 +9683,19 @@ mod layout_limits {
         grant(&state, sid, &["voipc:channels"]);
         let name = |i: usize| format!("{i:0>64}");
         for i in 0..200 {
-            crate::layout::category_save(&state, sid, None, &name(i)).await.unwrap();
+            crate::layout::category_save(&state, sid, None, &name(i))
+                .await
+                .unwrap();
         }
         let e = crate::layout::category_save(&state, sid, None, "one more")
             .await
             .unwrap_err();
         assert!(e.contains("200"), "{e}");
         let msg = crate::layout::for_session(&state, sid).await;
-        assert!(encode_server_msg(&msg).is_ok(), "or nobody could see them to delete one");
+        assert!(
+            encode_server_msg(&msg).is_ok(),
+            "or nobody could see them to delete one"
+        );
     }
 
     #[tokio::test]
@@ -9424,29 +9704,55 @@ mod layout_limits {
         let (_kim, ki) = register(&state, "kim").await;
         let sid = sid_of(&state, ki.id);
         let (_, hidden) = hidden_channel(&state, sid).await;
-        let open = crate::layout::category_save(&state, sid, None, "Open").await.unwrap();
-        let empty = crate::layout::category_save(&state, sid, None, "Empty").await.unwrap();
+        let open = crate::layout::category_save(&state, sid, None, "Open")
+            .await
+            .unwrap();
+        let empty = crate::layout::category_save(&state, sid, None, "Empty")
+            .await
+            .unwrap();
 
         let (categories, _) = layout_of(&state, sid).await;
         let ids: Vec<u32> = categories.iter().map(|c| c.id).collect();
-        assert!(!ids.contains(&hidden), "its name says what the gate hides: {ids:?}");
-        assert!(ids.contains(&open) && ids.contains(&empty), "the really empty ones show: {ids:?}");
+        assert!(
+            !ids.contains(&hidden),
+            "its name says what the gate hides: {ids:?}"
+        );
+        assert!(
+            ids.contains(&open) && ids.contains(&empty),
+            "the really empty ones show: {ids:?}"
+        );
 
         let no_such = "There is no such category.";
         assert_eq!(
-            crate::layout::category_save(&state, sid, Some(hidden), "Mine").await.unwrap_err(),
+            crate::layout::category_save(&state, sid, Some(hidden), "Mine")
+                .await
+                .unwrap_err(),
             no_such
         );
         assert_eq!(
-            crate::layout::category_delete(&state, sid, hidden).await.unwrap_err(),
+            crate::layout::category_delete(&state, sid, hidden)
+                .await
+                .unwrap_err(),
             no_such
         );
         // Its slot stays its own, whatever they do to the others
-        let before = state.layout.read().await.categories.iter().position(|c| c.id == hidden);
-        crate::layout::layout_set(&state, sid, &[empty, open], &[]).await.unwrap();
+        let before = state
+            .layout
+            .read()
+            .await
+            .categories
+            .iter()
+            .position(|c| c.id == hidden);
+        crate::layout::layout_set(&state, sid, &[empty, open], &[])
+            .await
+            .unwrap();
         let after = state.layout.read().await.categories.clone();
         assert_eq!(after.iter().position(|c| c.id == hidden), before);
-        let others: Vec<u32> = after.iter().map(|c| c.id).filter(|id| *id != hidden).collect();
+        let others: Vec<u32> = after
+            .iter()
+            .map(|c| c.id)
+            .filter(|id| *id != hidden)
+            .collect();
         assert_eq!(others, [empty, open]);
     }
 
@@ -9458,12 +9764,17 @@ mod layout_limits {
         let (hidden_id, category) = hidden_channel(&state, sid).await;
         // Someone who sees everything put a channel the editor sees in there too
         grant(&state, sid, &["*"]);
-        let seen = crate::layout::channel_save(&state, sid, None, "open-one", "", true, false, None, None)
+        let seen =
+            crate::layout::channel_save(&state, sid, None, "open-one", "", true, false, None, None)
+                .await
+                .unwrap();
+        crate::layout::layout_set(&state, sid, &[], &[(seen, Some(category))])
             .await
             .unwrap();
-        crate::layout::layout_set(&state, sid, &[], &[(seen, Some(category))]).await.unwrap();
         grant(&state, sid, &["voipc:channels"]);
-        assert!(crate::layout::category_delete(&state, sid, category).await.is_err());
+        assert!(crate::layout::category_delete(&state, sid, category)
+            .await
+            .is_err());
         let conv = state.channels.read().await[&hidden_id].gate_key.clone();
         assert_eq!(
             state.layout.read().await.places[&conv].category,
@@ -9478,9 +9789,10 @@ mod layout_limits {
         let (_kim, ki) = register(&state, "kim").await;
         let sid = sid_of(&state, ki.id);
         let (_, hidden) = hidden_channel(&state, sid).await;
-        let mine = crate::layout::channel_save(&state, sid, None, "mine", "", true, false, None, None)
-            .await
-            .unwrap();
+        let mine =
+            crate::layout::channel_save(&state, sid, None, "mine", "", true, false, None, None)
+                .await
+                .unwrap();
         let no_such = "There is no such category.";
         assert_eq!(
             crate::layout::layout_set(&state, sid, &[], &[(mine, Some(hidden))])
@@ -9489,9 +9801,19 @@ mod layout_limits {
             no_such
         );
         assert_eq!(
-            crate::layout::channel_save(&state, sid, Some(mine), "mine", "", true, false, Some(hidden), None)
-                .await
-                .unwrap_err(),
+            crate::layout::channel_save(
+                &state,
+                sid,
+                Some(mine),
+                "mine",
+                "",
+                true,
+                false,
+                Some(hidden),
+                None
+            )
+            .await
+            .unwrap_err(),
             no_such
         );
         assert_eq!(
@@ -9502,7 +9824,9 @@ mod layout_limits {
             "the same as for one that does not exist"
         );
         assert_eq!(
-            crate::layout::category_delete(&state, sid, 9999).await.unwrap_err(),
+            crate::layout::category_delete(&state, sid, 9999)
+                .await
+                .unwrap_err(),
             no_such
         );
     }
@@ -9513,7 +9837,9 @@ mod layout_limits {
         let (_kim, ki) = register(&state, "kim").await;
         let sid = sid_of(&state, ki.id);
         grant(&state, sid, &["voipc:channels"]);
-        let id = crate::layout::category_save(&state, sid, None, "Info").await.unwrap();
+        let id = crate::layout::category_save(&state, sid, None, "Info")
+            .await
+            .unwrap();
         // A row left behind: a file channel renamed, removed, or a kept one left out
         state.layout.write().await.places.insert(
             "c:gone".into(),
@@ -9527,7 +9853,9 @@ mod layout_limits {
             categories.iter().any(|c| c.id == id),
             "or nobody could ever see it, to delete it"
         );
-        crate::layout::category_delete(&state, sid, id).await.unwrap();
+        crate::layout::category_delete(&state, sid, id)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -9536,13 +9864,22 @@ mod layout_limits {
         let (_kim, ki) = register(&state, "kim").await;
         let sid = sid_of(&state, ki.id);
         grant(&state, sid, &["voipc:channels"]);
-        let id = crate::layout::channel_save(&state, sid, None, "going", "", true, false, None, None)
+        let id =
+            crate::layout::channel_save(&state, sid, None, "going", "", true, false, None, None)
+                .await
+                .unwrap();
+        let conv = state.channels.read().await[&id].gate_key.clone();
+        crate::layout::channel_delete(&state, sid, id)
             .await
             .unwrap();
-        let conv = state.channels.read().await[&id].gate_key.clone();
-        crate::layout::channel_delete(&state, sid, id).await.unwrap();
         assert!(!state.channels.read().await.contains_key(&id));
-        let rows = state.accounts.as_ref().unwrap().layout_rows().await.unwrap();
+        let rows = state
+            .accounts
+            .as_ref()
+            .unwrap()
+            .layout_rows()
+            .await
+            .unwrap();
         assert!(!rows.rows.iter().any(|r| r.conv == conv));
     }
 
@@ -9552,11 +9889,20 @@ mod layout_limits {
         let (mut kim, ki) = register(&state, "kim").await;
         let sid = sid_of(&state, ki.id);
         let (id, _) = hidden_channel(&state, sid).await;
-        state.channels.write().await.get_mut(&id).unwrap().info.anonymous = true;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&id)
+            .unwrap()
+            .info
+            .anonymous = true;
         let answers = async |c: &mut Client, m: ClientMessage| {
             c.send(&m).await;
             let ServerMessage::ChannelError { reason } = c
-                .expect("refused", |m| matches!(m, ServerMessage::ChannelError { .. }))
+                .expect("refused", |m| {
+                    matches!(m, ServerMessage::ChannelError { .. })
+                })
                 .await
             else {
                 unreachable!()
@@ -9591,12 +9937,17 @@ mod layout_limits {
         })
         .await;
         let ServerMessage::ChannelError { reason } = kim
-            .expect("refused", |m| matches!(m, ServerMessage::ChannelError { .. }))
+            .expect("refused", |m| {
+                matches!(m, ServerMessage::ChannelError { .. })
+            })
             .await
         else {
             unreachable!()
         };
-        assert_eq!(reason, "channel does not exist", "the same as for no channel at all");
+        assert_eq!(
+            reason, "channel does not exist",
+            "the same as for no channel at all"
+        );
         assert!(!state.channels.read().await[&id].info.has_password);
     }
 
@@ -9613,9 +9964,19 @@ mod layout_limits {
             groups: vec!["no-such-group".into()],
             speakers: vec![],
         };
-        crate::layout::channel_save(&state, sid, Some(id), "new", "", true, false, None, Some(bad))
-            .await
-            .unwrap_err();
+        crate::layout::channel_save(
+            &state,
+            sid,
+            Some(id),
+            "new",
+            "",
+            true,
+            false,
+            None,
+            Some(bad),
+        )
+        .await
+        .unwrap_err();
         assert_eq!(state.channels.read().await[&id].info.name, "old");
     }
 
@@ -9625,13 +9986,20 @@ mod layout_limits {
         let (_kim, ki) = register(&state, "kim").await;
         let sid = sid_of(&state, ki.id);
         grant(&state, sid, &["voipc:channels"]);
-        let budget = || state.channel_budget.load(std::sync::atomic::Ordering::Relaxed);
+        let budget = || {
+            state
+                .channel_budget
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
         let before = budget();
-        let id = crate::layout::channel_save(&state, sid, None, "news", "", true, false, None, None)
+        let id =
+            crate::layout::channel_save(&state, sid, None, "news", "", true, false, None, None)
+                .await
+                .unwrap();
+        assert_eq!(budget(), before + 1);
+        crate::layout::channel_delete(&state, sid, id)
             .await
             .unwrap();
-        assert_eq!(budget(), before + 1);
-        crate::layout::channel_delete(&state, sid, id).await.unwrap();
         assert_eq!(budget(), before);
     }
 
@@ -9649,7 +10017,9 @@ mod layout_limits {
         give(&state, ki.id, "editors", true).await;
         loop {
             let ServerMessage::ChannelLayout { categories, .. } = kim
-                .expect("the layout", |m| matches!(m, ServerMessage::ChannelLayout { .. }))
+                .expect("the layout", |m| {
+                    matches!(m, ServerMessage::ChannelLayout { .. })
+                })
                 .await
             else {
                 unreachable!()
@@ -9679,7 +10049,12 @@ async fn a_slower_read_of_an_accounts_scopes_does_not_undo_a_newer_one() {
             .and_then(|s| s.account.as_ref().map(|a| a.scopes.clone()))
             .unwrap()
     };
-    let kim_user = relay.store().user_by_id(AccountId(ki.id)).await.unwrap().unwrap();
+    let kim_user = relay
+        .store()
+        .user_by_id(AccountId(ki.id))
+        .await
+        .unwrap()
+        .unwrap();
 
     // Started first, and it read before the grant
     let slow = crate::accounts::scope_read(&state, sid);
@@ -9687,7 +10062,10 @@ async fn a_slower_read_of_an_accounts_scopes_does_not_undo_a_newer_one() {
     assert!(!stale.contains(&"roles:admin".to_string()));
 
     give(&state, ki.id, "keepers", true).await;
-    assert!(scopes_now().contains(&"roles:admin".to_string()), "the grant");
+    assert!(
+        scopes_now().contains(&"roles:admin".to_string()),
+        "the grant"
+    );
 
     // Finishes last
     crate::accounts::apply_scopes(&state, &relay, sid, kim_user.clone(), stale.clone(), slow)
@@ -9858,7 +10236,11 @@ mod invite_links {
     }
 
     /// Signs up with a link, as `register` does; what the relay said if not.
-    async fn sign_up(state: &Arc<ServerState>, name: &str, code: &str) -> Result<(Client, AccountInfo), String> {
+    async fn sign_up(
+        state: &Arc<ServerState>,
+        name: &str,
+        code: &str,
+    ) -> Result<(Client, AccountInfo), String> {
         let mut c = open_account(
             state,
             name,
@@ -9909,7 +10291,15 @@ mod invite_links {
         let (mut ann, _, _) = admin_on_invite_relay(&state, "ann").await;
         let code = new_link(&mut ann, 2, 7, Some("crew")).await;
         assert_eq!(code.len(), 43);
-        let codes = state.accounts.as_ref().unwrap().store().invites(l4f_accounts::util::now()).await.unwrap().len();
+        let codes = state
+            .accounts
+            .as_ref()
+            .unwrap()
+            .store()
+            .invites(l4f_accounts::util::now())
+            .await
+            .unwrap()
+            .len();
 
         let (_bob, bi) = sign_up(&state, "bob", &code).await.unwrap();
         let (_cat, _) = sign_up(&state, "cat", &code).await.unwrap();
@@ -9917,13 +10307,29 @@ mod invite_links {
         assert!(e.contains("not valid"), "used up: {e}");
 
         let relay = state.accounts.clone().unwrap();
-        let bob = relay.store().user_by_id(AccountId(bi.id)).await.unwrap().unwrap();
+        let bob = relay
+            .store()
+            .user_by_id(AccountId(bi.id))
+            .await
+            .unwrap()
+            .unwrap();
         assert!(
-            relay.store().user_roles(bob.id).await.unwrap().iter().any(|r| r.name == "crew"),
+            relay
+                .store()
+                .user_roles(bob.id)
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.name == "crew"),
             "in its starting group"
         );
         assert_eq!(
-            relay.store().invites(l4f_accounts::util::now()).await.unwrap().len(),
+            relay
+                .store()
+                .invites(l4f_accounts::util::now())
+                .await
+                .unwrap()
+                .len(),
             codes,
             "no row left behind per sign-up"
         );
@@ -9943,7 +10349,9 @@ mod invite_links {
         let code = new_link(&mut ann, 1, 7, None).await;
         let e = sign_up(&state, "ann", &code).await.err().unwrap();
         assert!(!e.contains("not valid"), "the name was taken: {e}");
-        sign_up(&state, "bob", &code).await.expect("its one use is still there");
+        sign_up(&state, "bob", &code)
+            .await
+            .expect("its one use is still there");
     }
 
     #[tokio::test]
@@ -9980,12 +10388,18 @@ mod invite_links {
         };
         let ann_did = of(ai.id).await;
         for event in ["invite_link_new", "invite_link_revoke"] {
-            let row = ann_did.iter().find(|e| e.event == event).unwrap_or_else(|| panic!("{event}"));
+            let row = ann_did
+                .iter()
+                .find(|e| e.event == event)
+                .unwrap_or_else(|| panic!("{event}"));
             assert_eq!(row.actor_id, Some(AccountId(ai.id)), "{event}");
             assert!(row.detail.contains(&id), "{event}: {}", row.detail);
         }
         let bob_came = of(bi.id).await;
-        let row = bob_came.iter().find(|e| e.event == "invite_link_used").unwrap();
+        let row = bob_came
+            .iter()
+            .find(|e| e.event == "invite_link_used")
+            .unwrap();
         assert_eq!(row.actor_id, Some(AccountId(ai.id)), "by whose link");
         assert_eq!(row.detail, id);
     }
@@ -9995,15 +10409,10 @@ mod invite_links {
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Invite).await;
         let (mut ann, _, _) = admin_on_invite_relay(&state, "ann").await;
         let code = new_link(&mut ann, 5, 7, None).await;
-        let mut c = open_account(
-            &state,
-            "bob",
-            AccountStart::Register {
-                invite: Some(code),
-            },
-        )
-        .await;
-        let Some(ServerMessage::AuthStep(AuthStep::Salt { pow: Some(pow), .. })) = c.next().await else {
+        let mut c =
+            open_account(&state, "bob", AccountStart::Register { invite: Some(code) }).await;
+        let Some(ServerMessage::AuthStep(AuthStep::Salt { pow: Some(pow), .. })) = c.next().await
+        else {
             panic!("a link is asked for the work too");
         };
         c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
@@ -10020,7 +10429,10 @@ mod invite_links {
             ],
         }))
         .await;
-        assert!(matches!(c.next().await, Some(ServerMessage::AuthError { .. }) | None));
+        assert!(matches!(
+            c.next().await,
+            Some(ServerMessage::AuthError { .. }) | None
+        ));
     }
 
     #[tokio::test]
@@ -10029,12 +10441,18 @@ mod invite_links {
         let (mut ann, _, _) = admin_on_invite_relay(&state, "ann").await;
         let relay = state.accounts.clone().unwrap();
 
-        assert!(sign_up(&state, "bob", &"A".repeat(43)).await.is_err(), "made up");
+        assert!(
+            sign_up(&state, "bob", &"A".repeat(43)).await.is_err(),
+            "made up"
+        );
 
         let gone = new_link(&mut ann, 5, 7, None).await;
         let id = relay.links().await.unwrap()[0].id.clone();
         let reply = answer(&mut ann, AdminOp::InviteLinkRevoke { id }).await;
-        assert!(matches!(reply, AccountReply::Admin(AdminReply::InviteLinks { .. })), "{reply:?}");
+        assert!(
+            matches!(reply, AccountReply::Admin(AdminReply::InviteLinks { .. })),
+            "{reply:?}"
+        );
         assert!(sign_up(&state, "bob", &gone).await.is_err(), "revoked");
 
         let late = new_link(&mut ann, 5, 7, None).await;
@@ -10055,12 +10473,26 @@ mod invite_links {
             days: 7,
             group: Some("mods".into()),
         };
-        assert!(matches!(answer(&mut ann, op).await, AccountReply::Error { .. }));
+        assert!(matches!(
+            answer(&mut ann, op).await,
+            AccountReply::Error { .. }
+        ));
         for bad in [
-            AdminOp::InviteLinkNew { max_uses: 0, days: 7, group: None },
-            AdminOp::InviteLinkNew { max_uses: 5, days: 366, group: None },
+            AdminOp::InviteLinkNew {
+                max_uses: 0,
+                days: 7,
+                group: None,
+            },
+            AdminOp::InviteLinkNew {
+                max_uses: 5,
+                days: 366,
+                group: None,
+            },
         ] {
-            assert!(matches!(answer(&mut ann, bad).await, AccountReply::Error { .. }));
+            assert!(matches!(
+                answer(&mut ann, bad).await,
+                AccountReply::Error { .. }
+            ));
         }
 
         let code = new_link(&mut ann, 5, 0, Some("crew")).await;
@@ -10072,7 +10504,13 @@ mod invite_links {
             .unwrap();
         let (_bob, bi) = sign_up(&state, "bob", &code).await.unwrap();
         assert!(
-            !relay.store().user_roles(AccountId(bi.id)).await.unwrap().iter().any(|r| r.name == "crew"),
+            !relay
+                .store()
+                .user_roles(AccountId(bi.id))
+                .await
+                .unwrap()
+                .iter()
+                .any(|r| r.name == "crew"),
             "the group was given power since: the link no longer hands it out"
         );
     }
@@ -10081,13 +10519,26 @@ mod invite_links {
     async fn only_who_manages_accounts_makes_links_and_a_closed_relay_has_none() {
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         let (mut bob, _) = register(&state, "bob").await;
-        let op = AdminOp::InviteLinkNew { max_uses: 5, days: 7, group: None };
-        assert!(matches!(answer(&mut bob, op.clone()).await, AccountReply::Error { .. }));
-        assert!(matches!(answer(&mut bob, AdminOp::InviteLinks).await, AccountReply::Error { .. }));
+        let op = AdminOp::InviteLinkNew {
+            max_uses: 5,
+            days: 7,
+            group: None,
+        };
+        assert!(matches!(
+            answer(&mut bob, op.clone()).await,
+            AccountReply::Error { .. }
+        ));
+        assert!(matches!(
+            answer(&mut bob, AdminOp::InviteLinks).await,
+            AccountReply::Error { .. }
+        ));
 
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Closed).await;
         let (mut ann, _, _) = admin_on_invite_relay(&state, "ann").await;
-        assert!(matches!(answer(&mut ann, op).await, AccountReply::Error { .. }));
+        assert!(matches!(
+            answer(&mut ann, op).await,
+            AccountReply::Error { .. }
+        ));
     }
 
     /// `admin_account` on a relay where nobody signs up without a code.
@@ -10097,7 +10548,11 @@ mod invite_links {
     ) -> (Client, AccountInfo, Vec<u8>) {
         let relay = state.accounts.clone().unwrap();
         let ctx = relay.ctx(IpAddr::V4(Ipv4Addr::LOCALHOST), "test");
-        let code = relay.accounts.invite_create_as_host(&ctx, Some(name), 1).await.unwrap();
+        let code = relay
+            .accounts
+            .invite_create_as_host(&ctx, Some(name), 1)
+            .await
+            .unwrap();
         let mut c = open_account(state, name, AccountStart::Register { invite: Some(code) }).await;
         let Some(ServerMessage::AuthStep(AuthStep::Salt { .. })) = c.next().await else {
             panic!("a code opens the door");
@@ -10121,7 +10576,9 @@ mod invite_links {
             account: Some(info),
             ..
         } = c
-            .expect("Authenticated", |m| matches!(m, ServerMessage::Authenticated { .. }))
+            .expect("Authenticated", |m| {
+                matches!(m, ServerMessage::Authenticated { .. })
+            })
             .await
         else {
             panic!("signed in");

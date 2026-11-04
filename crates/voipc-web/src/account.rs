@@ -231,21 +231,33 @@ impl AccountSignIn {
     /// The name for `{ providerSignup }`. The proof of work runs here.
     #[wasm_bindgen(js_name = providerSignup)]
     pub fn provider_signup(&mut self, name: &str) -> Result<Vec<u8>, JsError> {
-        let out = self.m_mut()?.provider_signup(name).map_err(|e| JsError::new(&e))?;
+        let out = self
+            .m_mut()?
+            .provider_signup(name)
+            .map_err(|e| JsError::new(&e))?;
         Ok(bytes(&out))
     }
 
     /// "First time here", for `{ providerChoice }` with `claim`.
     #[wasm_bindgen(js_name = providerClaim)]
     pub fn provider_claim(&mut self) -> Result<js_sys::Array, JsError> {
-        Ok(steps(self.m_mut()?.provider_claim().map_err(|e| JsError::new(&e))?))
+        Ok(steps(
+            self.m_mut()?
+                .provider_claim()
+                .map_err(|e| JsError::new(&e))?,
+        ))
     }
 
     /// The recovery key as it was shown. Throws why not; the choice stays open.
     #[wasm_bindgen(js_name = providerRecovery)]
     pub fn provider_recovery(&mut self, key: &str) -> Result<js_sys::Array, JsError> {
-        let key = Zeroizing::new(recovery_parse(key).ok_or_else(|| JsError::new(NOT_A_RECOVERY_KEY))?);
-        Ok(steps(self.m_mut()?.provider_recovery(&key).map_err(|e| JsError::new(&e))?))
+        let key =
+            Zeroizing::new(recovery_parse(key).ok_or_else(|| JsError::new(NOT_A_RECOVERY_KEY))?);
+        Ok(steps(
+            self.m_mut()?
+                .provider_recovery(&key)
+                .map_err(|e| JsError::new(&e))?,
+        ))
     }
 
     /// Ask another device of this account: the payload to send.
@@ -371,13 +383,20 @@ fn steps(steps: Vec<Step>) -> js_sys::Array {
             Step::ProviderPending => {
                 out.push(&obj("providerPending", JsValue::TRUE));
             }
-            Step::ProviderSignup { suggestion, problem } => {
+            Step::ProviderSignup {
+                suggestion,
+                problem,
+            } => {
                 let o = js_sys::Object::new();
                 let _ = js_sys::Reflect::set(&o, &"suggestion".into(), &suggestion.into());
                 let _ = js_sys::Reflect::set(&o, &"problem".into(), &problem.into());
                 out.push(&obj("providerSignup", o.into()));
             }
-            Step::ProviderChoice { name, claim, has_password } => {
+            Step::ProviderChoice {
+                name,
+                claim,
+                has_password,
+            } => {
                 let o = js_sys::Object::new();
                 let _ = js_sys::Reflect::set(&o, &"name".into(), &name.into());
                 let _ = js_sys::Reflect::set(&o, &"claim".into(), &claim.into());
@@ -559,7 +578,10 @@ impl AccountSession {
         recovery_code: Option<String>,
     ) -> Result<JsValue, JsError> {
         let master = master32(master)?;
-        actions(self.session.delete_account(master.as_ref(), totp, recovery_code))
+        actions(
+            self.session
+                .delete_account(master.as_ref(), totp, recovery_code),
+        )
     }
 
     /// `AccountSession::provider_start`. `kind`: "Discord", "Google", "Facebook".
@@ -574,7 +596,10 @@ impl AccountSession {
     ) -> Result<JsValue, JsError> {
         let kind = serde_wasm_bindgen::from_value(kind)?;
         let master = master32(master)?;
-        actions(self.session.provider_start(kind, link, master.as_ref(), totp, recovery_code))
+        actions(
+            self.session
+                .provider_start(kind, link, master.as_ref(), totp, recovery_code),
+        )
     }
 
     #[wasm_bindgen(js_name = providerUnlink)]
@@ -587,7 +612,10 @@ impl AccountSession {
     ) -> Result<JsValue, JsError> {
         let kind = serde_wasm_bindgen::from_value(kind)?;
         let master = master32(master)?;
-        actions(self.session.provider_unlink(kind, master.as_ref(), totp, recovery_code))
+        actions(
+            self.session
+                .provider_unlink(kind, master.as_ref(), totp, recovery_code),
+        )
     }
 
     /// Out of channel log `conv`; with `tell`, asks the relay to take us out.
@@ -670,7 +698,9 @@ impl AccountSession {
         recovery_code: Option<String>,
     ) -> Result<JsValue, JsError> {
         let master = master32(master)?;
-        let (a, key) = self.session.recovery_key_new(master.as_ref(), totp, recovery_code);
+        let (a, key) = self
+            .session
+            .recovery_key_new(master.as_ref(), totp, recovery_code);
         let out = actions(a)?;
         js_sys::Reflect::set(&out, &JsValue::from_str("key"), &JsValue::from_str(&key))
             .map_err(|_| JsError::new("could not hand the key over"))?;

@@ -966,17 +966,11 @@ pub enum AdminReply {
     /// This step hands out power: send it again with a code.
     StepUp,
     /// A channel or layout step went through. `channel_id`: the channel it made.
-    ChannelDone {
-        channel_id: Option<ChannelId>,
-    },
+    ChannelDone { channel_id: Option<ChannelId> },
     /// Also after `InviteLinkRevoke`.
-    InviteLinks {
-        links: Vec<InviteLinkInfo>,
-    },
+    InviteLinks { links: Vec<InviteLinkInfo> },
     /// Shown once: only its hash is kept.
-    InviteLinkCode {
-        code: String,
-    },
+    InviteLinkCode { code: String },
 }
 
 /// A wrapped epoch key for one member (`AccountRequest::EpochPut`).

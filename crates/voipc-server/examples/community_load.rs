@@ -52,7 +52,9 @@ async fn main() -> Result<(), Error> {
             let server = args.get(2).map_or("127.0.0.1:9987", String::as_str);
             run(number(args.get(1), 100)?, server, pid).await
         }
-        _ => Err("usage: community_load frames | crypto [N] | run [N] [host:port] [relay-pid]".into()),
+        _ => Err(
+            "usage: community_load frames | crypto [N] | run [N] [host:port] [relay-pid]".into(),
+        ),
     }
 }
 
@@ -71,7 +73,10 @@ fn percentile(values: &mut [u64], p: usize) -> u64 {
 // ── frames ───────────────────────────────────────────────────────────────
 
 /// The largest count of `make`'s items whose message still frames.
-fn largest_that_frames<T>(make: impl Fn(usize) -> T, wrap: impl Fn(Vec<T>) -> ServerMessage) -> usize {
+fn largest_that_frames<T>(
+    make: impl Fn(usize) -> T,
+    wrap: impl Fn(Vec<T>) -> ServerMessage,
+) -> usize {
     let (mut fits, mut over) = (0usize, MAX_MSG_SIZE as usize);
     while over - fits > 1 {
         let mid = (fits + over) / 2;
@@ -133,7 +138,10 @@ fn frames() -> Result<(), Error> {
     ] {
         let n = largest_that_frames(
             |i| member(i, account, badges),
-            |users| ServerMessage::UserList { channel_id: 0, users },
+            |users| ServerMessage::UserList {
+                channel_id: 0,
+                users,
+            },
         );
         println!("UserList: {n} {what}");
     }
@@ -158,7 +166,11 @@ fn signal_stores(user_id: u32) -> Result<SignalStores, Error> {
 }
 
 fn stored_bytes(stores: &SignalStores) -> usize {
-    let values = stores.session.sessions.values().chain(stores.sender_key.keys.values());
+    let values = stores
+        .session
+        .sessions
+        .values()
+        .chain(stores.sender_key.keys.values());
     values.map(Vec::len).sum()
 }
 
@@ -415,7 +427,11 @@ async fn client(
 ) -> Result<(), Error> {
     let started = Instant::now();
     let c = connect(index, server).await?;
-    tally.connect_ms.lock().unwrap().push(started.elapsed().as_millis() as u64);
+    tally
+        .connect_ms
+        .lock()
+        .unwrap()
+        .push(started.elapsed().as_millis() as u64);
     tally.roster.lock().unwrap()[index] = Some(0);
     tally.up.fetch_add(1, Ordering::Relaxed);
     let (user_id, proto) = (c.user_id, c.proto);
@@ -455,7 +471,10 @@ async fn client(
             }
             let channel_id = *channel_rx.borrow();
             *joined_at.lock().unwrap() = Some(Instant::now());
-            let join = ClientMessage::JoinChannel { channel_id, password: None };
+            let join = ClientMessage::JoinChannel {
+                channel_id,
+                password: None,
+            };
             let Ok(data) = enc(&join, proto) else { return };
             if out.send(data).is_err() {
                 return;
@@ -469,7 +488,10 @@ async fn client(
                 let sent_at = clock.elapsed().as_micros() as u64;
                 let mut ciphertext = sent_at.to_le_bytes().to_vec();
                 ciphertext.resize(CHAT_BYTES, 0);
-                let say = ClientMessage::SendEncryptedChannelMessage { channel_id, ciphertext };
+                let say = ClientMessage::SendEncryptedChannelMessage {
+                    channel_id,
+                    ciphertext,
+                };
                 let Ok(data) = enc(&say, proto) else { return };
                 if out.send(data).is_err() {
                     return;
@@ -498,15 +520,24 @@ async fn client(
             ServerMessage::UserList { channel_id: 0, .. } => {
                 tally.general_lists.fetch_add(1, Ordering::Relaxed);
             }
-            ServerMessage::UserList { channel_id: id, users } if id == channel_id => {
+            ServerMessage::UserList {
+                channel_id: id,
+                users,
+            } if id == channel_id => {
                 if let Some(at) = joined_at.lock().unwrap().take() {
-                    tally.join_ms.lock().unwrap().push(at.elapsed().as_millis() as u64);
+                    tally
+                        .join_ms
+                        .lock()
+                        .unwrap()
+                        .push(at.elapsed().as_millis() as u64);
                 }
                 for user in users {
                     note(&mut known, tally, user.user_id);
                 }
             }
-            ServerMessage::UserJoined { user } if user.channel_id == channel_id && channel_id != 0 => {
+            ServerMessage::UserJoined { user }
+                if user.channel_id == channel_id && channel_id != 0 =>
+            {
                 note(&mut known, tally, user.user_id);
             }
             ServerMessage::EncryptedChannelChatMessage { ciphertext, .. } => {

@@ -168,7 +168,13 @@ impl AccountSession {
             return Actions::default();
         };
         let wrapped = p.ephemeral.as_ref().filter(|_| yes).and_then(|ephemeral| {
-            crate::pair::wrap_dek(ephemeral, &self.dek, &self.relay_id, &self.name, &p.commitment)
+            crate::pair::wrap_dek(
+                ephemeral,
+                &self.dek,
+                &self.relay_id,
+                &self.name,
+                &p.commitment,
+            )
         });
         Actions::sending(vec![ClientMessage::Account(match wrapped {
             Some(wrapped) => AccountRequest::PairApprove { pair, wrapped },
@@ -242,13 +248,15 @@ impl AccountSession {
         totp: Option<String>,
         recovery_code: Option<String>,
     ) -> Actions {
-        Actions::sending(vec![ClientMessage::Account(AccountRequest::ProviderStart {
-            kind,
-            link,
-            secret: secret_of(master),
-            totp,
-            recovery_code,
-        })])
+        Actions::sending(vec![ClientMessage::Account(
+            AccountRequest::ProviderStart {
+                kind,
+                link,
+                secret: secret_of(master),
+                totp,
+                recovery_code,
+            },
+        )])
     }
 
     /// As for a link. `ProviderUnlinked` answers as `account-reply`.
@@ -259,12 +267,14 @@ impl AccountSession {
         totp: Option<String>,
         recovery_code: Option<String>,
     ) -> Actions {
-        Actions::sending(vec![ClientMessage::Account(AccountRequest::ProviderUnlink {
-            kind,
-            secret: secret_of(master),
-            totp,
-            recovery_code,
-        })])
+        Actions::sending(vec![ClientMessage::Account(
+            AccountRequest::ProviderUnlink {
+                kind,
+                secret: secret_of(master),
+                totp,
+                recovery_code,
+            },
+        )])
     }
 
     /// The account's name here.
@@ -713,13 +723,21 @@ mod tests {
             ephemeral,
             blind,
         });
-        assert!(a.send.is_empty(), "nothing leaves before the person says so");
+        assert!(
+            a.send.is_empty(),
+            "nothing leaves before the person says so"
+        );
         let (name, payload) = &a.emit[0];
         assert_eq!(*name, "account-pair-ask");
-        assert_eq!(payload["code"], new.code(&nonce), "both devices show the same");
+        assert_eq!(
+            payload["code"],
+            new.code(&nonce),
+            "both devices show the same"
+        );
 
         let a = s.pair_answer(5, true);
-        let [ClientMessage::Account(AccountRequest::PairApprove { pair: 5, wrapped })] = &a.send[..]
+        let [ClientMessage::Account(AccountRequest::PairApprove { pair: 5, wrapped })] =
+            &a.send[..]
         else {
             panic!("no key: {:?}", a.send)
         };
@@ -741,7 +759,9 @@ mod tests {
         let a = s.pair_answer(5, false);
         assert!(matches!(
             &a.send[..],
-            [ClientMessage::Account(AccountRequest::PairDecline { pair: 5 })]
+            [ClientMessage::Account(AccountRequest::PairDecline {
+                pair: 5
+            })]
         ));
 
         // A relay revealing a key of its own under the commitment it was shown
@@ -755,7 +775,9 @@ mod tests {
         assert!(a.emit.is_empty(), "the person is not even asked");
         assert!(matches!(
             &a.send[..],
-            [ClientMessage::Account(AccountRequest::PairDecline { pair: 5 })]
+            [ClientMessage::Account(AccountRequest::PairDecline {
+                pair: 5
+            })]
         ));
         assert!(s.pair_answer(5, true).send.is_empty());
     }
@@ -771,7 +793,9 @@ mod tests {
         });
         assert!(matches!(
             &a.send[..],
-            [ClientMessage::Account(AccountRequest::PairDecline { pair: 6 })]
+            [ClientMessage::Account(AccountRequest::PairDecline {
+                pair: 6
+            })]
         ));
         let a = s.on_reply(&AccountReply::PairEnded { pair: 5 });
         assert_eq!(a.emit[0].0, "account-pair-ended");

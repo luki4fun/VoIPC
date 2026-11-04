@@ -185,7 +185,11 @@ impl Relay {
         // It stands next to the real `@name`, and these would pass for one
         let bare: String = name.chars().filter(|c| !draws_nothing(*c)).collect();
         let bare = bare.trim();
-        if bare.chars().any(|c| matches!(c, '@' | '\u{ff20}' | '\u{fe6b}')) || has_tag_tail(bare) {
+        if bare
+            .chars()
+            .any(|c| matches!(c, '@' | '\u{ff20}' | '\u{fe6b}'))
+            || has_tag_tail(bare)
+        {
             return Err("A display name cannot hold an @ or end in a #tag.".into());
         }
         let like = ascii_look_alike(bare);
@@ -248,7 +252,10 @@ pub async fn set_name(
     user: &User,
     name: Option<String>,
 ) -> Result<AccountReply> {
-    let name = match relay.display_name_ok(user, name.as_deref().unwrap_or("")).await {
+    let name = match relay
+        .display_name_ok(user, name.as_deref().unwrap_or(""))
+        .await
+    {
         Ok(name) => name,
         Err(reason) => return Ok(refused("ProfileSet", &reason)),
     };

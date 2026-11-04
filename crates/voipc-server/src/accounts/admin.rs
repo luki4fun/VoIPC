@@ -320,11 +320,17 @@ pub(super) async fn handle(
                     ));
                 }
             }
-            match relay.link_new(max_uses, days, group.as_deref(), user.id).await? {
+            match relay
+                .link_new(max_uses, days, group.as_deref(), user.id)
+                .await?
+            {
                 Some((code, id)) => {
                     let what = format!(
                         "{id}: {max_uses} people{}",
-                        group.as_deref().map(|g| format!(", starting in {g}")).unwrap_or_default()
+                        group
+                            .as_deref()
+                            .map(|g| format!(", starting in {g}"))
+                            .unwrap_or_default()
                     );
                     relay
                         .store()

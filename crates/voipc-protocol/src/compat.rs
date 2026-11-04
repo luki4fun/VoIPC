@@ -193,8 +193,18 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
         46,
         "AccountReply: the provider replies never come from it",
     ),
-    (17, Side::Client, 41, "AdminOp: the channel steps are refused"),
-    (17, Side::Server, 46, "AccountReply: AdminReply::ChannelDone never comes from it"),
+    (
+        17,
+        Side::Client,
+        41,
+        "AdminOp: the channel steps are refused",
+    ),
+    (
+        17,
+        Side::Server,
+        46,
+        "AccountReply: AdminReply::ChannelDone never comes from it",
+    ),
 ];
 
 /// How many messages each side had at a protocol: an index at or past it is

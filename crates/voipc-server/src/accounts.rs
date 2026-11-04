@@ -952,7 +952,15 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
         }
         AccountStart::ProviderResume { ticket } => {
             return provider::resume(
-                state, relay, stream, buf, &ticket, None, &ctx, ip, &mut answers,
+                state,
+                relay,
+                stream,
+                buf,
+                &ticket,
+                None,
+                &ctx,
+                ip,
+                &mut answers,
             )
             .await;
         }
@@ -1042,9 +1050,17 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             let pw = secret_text(&auth_secret)?;
             let _work = work()?;
             let s = if let Some(code) = invite.as_deref().filter(|c| links::is_link_code(c)) {
-                links::register(relay, &ctx, code, name, links::How::Password(&pw), &altcha, &ts)
-                    .await
-                    .map_err(links::Refused::text)?
+                links::register(
+                    relay,
+                    &ctx,
+                    code,
+                    name,
+                    links::How::Password(&pw),
+                    &altcha,
+                    &ts,
+                )
+                .await
+                .map_err(links::Refused::text)?
             } else {
                 match &invite {
                     Some(code) => {
@@ -1666,8 +1682,18 @@ async fn prove_recent(
     }
     if l4f_accounts::service::has_second_factor(&now_user) {
         let fresh = match (&totp, &recovery_code) {
-            (Some(code), _) => relay.accounts.step_up_totp(ctx, &now_user, info, code).await,
-            (None, Some(code)) => relay.accounts.step_up_recovery(ctx, &now_user, info, code).await,
+            (Some(code), _) => {
+                relay
+                    .accounts
+                    .step_up_totp(ctx, &now_user, info, code)
+                    .await
+            }
+            (None, Some(code)) => {
+                relay
+                    .accounts
+                    .step_up_recovery(ctx, &now_user, info, code)
+                    .await
+            }
             (None, None) => {
                 return Err(
                     "This account needs a code from the authenticator app, or a recovery code."

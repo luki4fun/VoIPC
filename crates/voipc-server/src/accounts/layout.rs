@@ -32,6 +32,8 @@ pub struct KeptRows {
 /// One frame holds this many, at the largest a badge can be (32 characters).
 const MAX_STYLED_GROUPS: usize = 400;
 
+type StyleColumns = (Vec<u8>, Option<i64>, Option<i64>, bool);
+
 struct StyleRow {
     color: Option<u32>,
     position: Option<i64>,
@@ -59,7 +61,7 @@ fn rank(rows: &HashMap<Vec<u8>, StyleRow>, role: &Role) -> (i64, bool, bool, Str
 
 impl Relay {
     async fn style_rows(&self) -> Result<HashMap<Vec<u8>, StyleRow>> {
-        let rows: Vec<(Vec<u8>, Option<i64>, Option<i64>, bool)> = db!(self.store(), pool => {
+        let rows: Vec<StyleColumns> = db!(self.store(), pool => {
             sqlx::query_as("SELECT role, CAST(color AS BIGINT), CAST(position AS BIGINT), no_section FROM voipc_group_style")
                 .fetch_all(pool)
                 .await?

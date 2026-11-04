@@ -33,7 +33,9 @@ pub enum ControlError {
 impl std::fmt::Display for ControlError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
-            ControlError::Overflow => "control queue full (client not reading): ending its connection",
+            ControlError::Overflow => {
+                "control queue full (client not reading): ending its connection"
+            }
             ControlError::Closed => "control queue closed",
         })
     }
@@ -122,7 +124,11 @@ mod tests {
             tx.try_send(i.to_le_bytes().to_vec()).unwrap();
         }
         for i in 0..100_000u32 {
-            assert_eq!(rx.recv().await.unwrap(), i.to_le_bytes(), "in order, none lost");
+            assert_eq!(
+                rx.recv().await.unwrap(),
+                i.to_le_bytes(),
+                "in order, none lost"
+            );
         }
         assert_eq!(tx.queued.load(Ordering::Relaxed), 0);
     }
@@ -148,7 +154,11 @@ mod tests {
         for _ in 0..256 {
             assert_eq!(rx.recv().await.unwrap().len(), frame.len());
         }
-        assert_eq!(tx.queued.load(Ordering::Relaxed), 0, "a refused message is not counted");
+        assert_eq!(
+            tx.queued.load(Ordering::Relaxed),
+            0,
+            "a refused message is not counted"
+        );
     }
 
     #[tokio::test]

@@ -691,7 +691,9 @@ where
         media_tx,
         peer_ip,
         state.max_users,
-        state.channel_budget.load(std::sync::atomic::Ordering::Relaxed),
+        state
+            .channel_budget
+            .load(std::sync::atomic::Ordering::Relaxed),
     );
     // What this particular client brought with it; the budgets
     // and the rest are the same for everybody (state.rs).

@@ -658,7 +658,10 @@ pub fn provider_proof(
 ) -> Vec<u8> {
     identity
         .private_key()
-        .calculate_signature(&provider_message(relay_id, name, challenge), &mut crate::rng())
+        .calculate_signature(
+            &provider_message(relay_id, name, challenge),
+            &mut crate::rng(),
+        )
         .expect("sign")
         .to_vec()
 }
@@ -866,7 +869,11 @@ pub fn provider_page_ok(url: &str) -> bool {
 /// What `Authenticate` asks for a provider's sign-in, before there is a
 /// sign-in: which ones there are (`AccountStart::Providers`), or the page to
 /// open (`AccountStart::Provider`). The relay answers, then ends the connection.
-pub fn provider_ask(start: AccountStart, protocol_version: u32, app_version: &str) -> ClientMessage {
+pub fn provider_ask(
+    start: AccountStart,
+    protocol_version: u32,
+    app_version: &str,
+) -> ClientMessage {
     ClientMessage::Authenticate {
         username: String::new(),
         protocol_version,
@@ -929,9 +936,13 @@ pub enum Step {
         has_password: bool,
     },
     /// Show this and ask the person to compare it on their other device.
-    PairCode { code: String },
+    PairCode {
+        code: String,
+    },
     /// The other device did not hand the key over: ask again.
-    PairRefused { reason: String },
+    PairRefused {
+        reason: String,
+    },
     /// Nothing to do with that message.
     Ignore,
 }
@@ -997,15 +1008,17 @@ impl SignIn {
             },
             Method::Reset { .. } => AccountStart::Reset,
             // An older relay has no use for one
-            Method::Provider { ticket, invite } => match invite.clone().filter(|_| protocol_version >= 18) {
-                Some(invite) => AccountStart::ProviderResumeInvited {
-                    ticket: ticket.clone(),
-                    invite,
-                },
-                None => AccountStart::ProviderResume {
-                    ticket: ticket.clone(),
-                },
-            },
+            Method::Provider { ticket, invite } => {
+                match invite.clone().filter(|_| protocol_version >= 18) {
+                    Some(invite) => AccountStart::ProviderResumeInvited {
+                        ticket: ticket.clone(),
+                        invite,
+                    },
+                    None => AccountStart::ProviderResume {
+                        ticket: ticket.clone(),
+                    },
+                }
+            }
         };
         let relay_id = match &method {
             Method::Device { relay_id, .. } => Some(*relay_id),
@@ -1244,8 +1257,7 @@ impl SignIn {
     /// of work: seconds of CPU, so off the async workers.
     pub fn provider_signup(&mut self, name: &str) -> Result<ClientMessage, String> {
         let pow = self.signup_pow.as_ref().ok_or("unexpected sign-in step")?;
-        let altcha =
-            solve_pow(&pow.altcha).ok_or("The server's sign-up puzzle did not solve.")?;
+        let altcha = solve_pow(&pow.altcha).ok_or("The server's sign-up puzzle did not solve.")?;
         Ok(ClientMessage::AuthContinue(AuthContinue::ProviderSignup {
             name: normalize_name(name)?,
             altcha,
@@ -1312,9 +1324,7 @@ impl SignIn {
         let signed = self.provider.as_ref().ok_or("unexpected sign-in step")?;
         let vault = Vault::open_with_recovery(relay_id, &self.name, &signed.blobs, recovery)
             .map_err(|e| match e {
-                VaultError::WrongKey => {
-                    "That recovery key does not open this account.".to_string()
-                }
+                VaultError::WrongKey => "That recovery key does not open this account.".to_string(),
                 e => e.to_string(),
             })?;
         self.provider_opened(vault)
@@ -1628,7 +1638,15 @@ mod tests {
             })
         };
         let machine = || {
-            let (mut m, _) = SignIn::start("", Method::Provider { ticket: vec![], invite: None }, 17, "test");
+            let (mut m, _) = SignIn::start(
+                "",
+                Method::Provider {
+                    ticket: vec![],
+                    invite: None,
+                },
+                17,
+                "test",
+            );
             m.remembered_here(vec!["luki".into()]);
             m
         };

@@ -549,7 +549,12 @@ async fn channel_edit(
         .layout_put(&conv, Some(&entry), place.position, place.category)
         .await
         .map_err(|_| GONE.to_string())?;
-    state.layout.write().await.places.insert(conv.clone(), place);
+    state
+        .layout
+        .write()
+        .await
+        .places
+        .insert(conv.clone(), place);
     let changed = {
         let mut channels = state.channels.write().await;
         // Someone else may have taken the name during that write: a start would then
