@@ -27,8 +27,7 @@
 #
 # SIDE_BY_SIDE=1 runs test-ui.mjs and the other browser lanes at the same time,
 # SIDE_BY_SIDE=0 one after another. Unset, it is 1 with 8 or more cores (nproc):
-# each lane brings its own relay and browsers, and CI's 4-core runners, slower
-# than any desk, stay on the path that cannot crowd them.
+# each lane brings its own relay and browsers. CI sets it itself on its 4 cores.
 #
 # Prerequisites: VOIPC_SELFTEST=1 npm run web (a release bundle has no self-test),
 # openssl, curl with HTTP/2, and either chromium (CHROME=/path/to/chrome) or,
