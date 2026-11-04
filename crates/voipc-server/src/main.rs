@@ -21,6 +21,7 @@ mod emotes;
 mod files;
 mod fsutil;
 mod gates;
+mod layout;
 mod media;
 mod presets;
 mod routing;
@@ -1000,9 +1001,18 @@ async fn main() -> Result<()> {
         }
     }
 
+    // The channels made in the app join the file's before the state is built
+    let kept = match &relay {
+        Some(relay) => relay.layout_rows().await.context("reading the channels")?,
+        None => Default::default(),
+    };
+    let mut persistent_channels = persistent_channels;
+    let apps = layout::merge_kept(&kept, &mut persistent_channels);
+
     // Create shared state
     let mut state = ServerState::new(&config, server_settings, persistent_channels, admin_token);
     state.accounts = relay;
+    layout::load(&state, kept, &apps).await;
     if state.accounts.is_none() {
         state.bans_file = Some(std::path::PathBuf::from(BANS_FILE));
     }

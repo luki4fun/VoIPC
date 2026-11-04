@@ -82,6 +82,10 @@ pub struct UserSession {
     pub is_moderator: bool,
     /// The privileges the account's scopes grant (`can`).
     pub powers: crate::accounts::Powers,
+    /// Which read of the account's scopes is the latest one started (`refresh`),
+    /// and which is the latest one written.
+    pub scope_read: u64,
+    pub scope_written: u64,
     /// The relay account this connection signed in with; `None` for a guest.
     pub account: Option<AccountSession>,
     /// This user answers requests for recent channel chat. Told to the server
@@ -117,6 +121,9 @@ pub struct UserSession {
     /// every reload, and that must not refuse the writes (or uploads) sharing
     /// `account_rate` meanwhile. Bounded queries, so a larger budget.
     pub log_read_rate: RateLimiter,
+    /// Display names and pictures asked for. A member list asks for all it shows,
+    /// and pictures are the larger part: its own budget, not `account_rate`.
+    pub profile_rate: RateLimiter,
     /// Rate limiter for keyframe requests relayed *to* this user as a sharer
     /// (each one forces an IDR); per share, so many viewers losing the same
     /// frames cannot storm the sharer.
@@ -245,7 +252,7 @@ impl UserSession {
     /// are set, at sign-in and after a change alike.
     pub fn set_scopes(&mut self, user: l4f_accounts::model::User, scopes: Vec<String>) {
         self.is_admin = crate::accounts::is_star(&scopes);
-        self.is_moderator = !scopes.is_empty();
+        self.is_moderator = crate::accounts::holds_power(&scopes);
         self.powers = crate::accounts::Powers::of(&scopes);
         if let Some(a) = self.account.as_mut() {
             a.user = user;
@@ -282,6 +289,8 @@ impl UserSession {
             is_admin: false,
             is_moderator: false,
             powers: Default::default(),
+            scope_read: 0,
+            scope_written: 0,
             account: None,
             shares_history: false,
             admin_login_failures: 0,
@@ -315,6 +324,7 @@ impl UserSession {
             chat_rate: RateLimiter::new(5.0, 5.0),
             account_rate: RateLimiter::new(30.0, 10.0),
             log_read_rate: RateLimiter::new(60.0, 20.0),
+            profile_rate: RateLimiter::new(40.0, 10.0),
             keyframe_relay_rate: RateLimiter::new(2.0, 1.0),
             loss_report_rate: RateLimiter::new(2.0, 1.0),
             // Everything a client says about itself — muted, deafened, sharing
@@ -412,12 +422,105 @@ pub struct Channel {
     pub log_conv: String,
     /// Who may see, join and speak here (`gates`).
     pub gate: ChannelGate,
-    /// What the gate of a channel from channels.json is kept under in the
-    /// database (`ChannelEntry::log_conv`); empty for the ones people make.
+    /// What the gate of a persistent channel is kept under in the database
+    /// (`ChannelEntry::log_conv`); empty for the temporary ones people make.
     pub gate_key: String,
+    /// Made in the app (`crate::layout`): a row of `voipc_channels`, not of the file.
+    pub kept: bool,
 }
 
 impl Channel {
+    /// A persistent channel, as an entry says. `logs`: this relay keeps messages.
+    pub fn from_entry(
+        entry: &ChannelEntry,
+        channel_id: ChannelId,
+        logs: bool,
+        proximity_enabled: bool,
+    ) -> Channel {
+        // A server with proximity chat switched off serves every channel
+        // as `off`, so clients never see a mode they may not use.
+        let proximity = if proximity_enabled {
+            entry.proximity
+        } else {
+            if entry.proximity != ProximityMode::Off {
+                warn!(
+                    channel = %entry.name,
+                    "proximity chat is disabled on this server; channel served as off"
+                );
+            }
+            ProximityMode::Off
+        };
+        let mut channel = Channel {
+            info: ChannelInfo {
+                channel_id,
+                name: entry.name.clone(),
+                description: entry.description.clone(),
+                max_users: entry.max_users,
+                has_password: entry.password_hash.is_some(),
+                // A text channel has no voice, so no mode to serve.
+                proximity: if entry.text {
+                    ProximityMode::Off
+                } else {
+                    proximity
+                },
+                routed: entry.routed,
+                hidden: entry.hidden,
+                anonymous: entry.anonymous,
+                screen_share: entry.screen_share && !entry.text,
+                hide_members: entry.hide_members,
+                text: entry.text,
+                auto_join: entry.auto_join,
+                message_ttl_secs: entry.message_ttl_secs,
+                announce: entry.announce && entry.text,
+                slow_mode_secs: entry.slow_mode_secs.min(MAX_SLOW_MODE_SECS),
+                nsfw: entry.nsfw,
+                ..Default::default()
+            },
+            members: HashSet::new(),
+            password: entry.password_hash.clone().map(Zeroizing::new),
+            delete_timer: None,
+            invited_users: HashSet::new(),
+            screen_shares: HashMap::new(),
+            persistent: true,
+            pseudonyms: HashMap::new(),
+            log_conv: if logs {
+                entry.log_conv()
+            } else {
+                String::new()
+            },
+            gate: ChannelGate::default(),
+            gate_key: entry.log_conv(),
+            kept: false,
+        };
+        channel.refresh_log();
+        channel
+    }
+
+    /// The entry a channel made in the app is kept as, its options as they are now.
+    pub fn to_entry(&self) -> ChannelEntry {
+        let i = &self.info;
+        ChannelEntry {
+            name: i.name.clone(),
+            description: i.description.clone(),
+            password_hash: self.password.as_ref().map(|p| p.to_string()),
+            max_users: i.max_users,
+            proximity: i.proximity,
+            hidden: i.hidden,
+            anonymous: i.anonymous,
+            screen_share: i.screen_share,
+            hide_members: i.hide_members,
+            routed: i.routed,
+            text: i.text,
+            auto_join: i.auto_join,
+            message_ttl_secs: i.message_ttl_secs,
+            announce: i.announce,
+            slow_mode_secs: i.slow_mode_secs,
+            nsfw: i.nsfw,
+            uid: self.gate_key.strip_prefix("c:").map(String::from),
+            ..ChannelEntry::default()
+        }
+    }
+
     /// Offers the log in `info.log` unless an option rules it out: in an
     /// anonymous channel, or one hiding its members, a log would show who is
     /// there (its members wrap keys to each other by account).
@@ -566,6 +669,8 @@ pub struct ServerState {
     pub username_to_session: DashMap<String, SessionId>,
     /// All channels, keyed by channel_id.
     pub channels: RwLock<HashMap<ChannelId, Channel>>,
+    /// Where persistent channels sit (`crate::layout`).
+    pub layout: RwLock<crate::layout::Layout>,
     /// Maximum concurrent users.
     pub max_users: u32,
     /// How many channels can exist here at once: the lobby, every channel from
@@ -576,7 +681,7 @@ pub struct ServerState {
     /// server, so the budgets that pay for joining them, for handing each one a
     /// sender key and for asking each one's members for its history all have to
     /// be able to cover doing it once, on a server of any size.
-    pub channel_budget: u32,
+    pub channel_budget: AtomicU32,
     /// Runtime settings.
     pub settings: ServerSettings,
     /// Admin token (from config, or generated at startup).
@@ -694,6 +799,7 @@ impl ServerState {
                 log_conv: String::new(),
                 gate: ChannelGate::default(),
                 gate_key: String::new(),
+                kept: false,
             },
         );
 
@@ -708,66 +814,9 @@ impl ServerState {
             let channel_id = next_id;
             next_id += 1;
 
-            let has_password = entry.password_hash.is_some();
-            let password = entry.password_hash.clone().map(Zeroizing::new);
-
-            // A server with proximity chat switched off serves every channel
-            // as `off`, so clients never see a mode they may not use.
-            let proximity = if settings.proximity_enabled {
-                entry.proximity
-            } else {
-                if entry.proximity != ProximityMode::Off {
-                    warn!(
-                        channel = %entry.name,
-                        "proximity chat is disabled on this server; channel served as off"
-                    );
-                }
-                ProximityMode::Off
-            };
-
             channels.insert(
                 channel_id,
-                Channel {
-                    info: ChannelInfo {
-                        channel_id,
-                        name: entry.name.clone(),
-                        description: entry.description.clone(),
-                        max_users: entry.max_users,
-                        has_password,
-                        // A text channel has no voice, so no mode to serve.
-                        proximity: if entry.text {
-                            ProximityMode::Off
-                        } else {
-                            proximity
-                        },
-                        routed: entry.routed,
-                        hidden: entry.hidden,
-                        anonymous: entry.anonymous,
-                        screen_share: entry.screen_share && !entry.text,
-                        hide_members: entry.hide_members,
-                        text: entry.text,
-                        auto_join: entry.auto_join,
-                        message_ttl_secs: entry.message_ttl_secs,
-                        announce: entry.announce && entry.text,
-                        slow_mode_secs: entry.slow_mode_secs.min(MAX_SLOW_MODE_SECS),
-                        nsfw: entry.nsfw,
-                        ..Default::default()
-                    },
-                    members: HashSet::new(),
-                    password,
-                    delete_timer: None,
-                    invited_users: HashSet::new(),
-                    screen_shares: HashMap::new(),
-                    persistent: true,
-                    pseudonyms: HashMap::new(),
-                    log_conv: if logs {
-                        entry.log_conv()
-                    } else {
-                        String::new()
-                    },
-                    gate: ChannelGate::default(),
-                    gate_key: entry.log_conv(),
-                },
+                Channel::from_entry(entry, channel_id, logs, settings.proximity_enabled),
             );
             if let Some(ch) = channels.get_mut(&channel_id) {
                 ch.refresh_log();
@@ -778,13 +827,16 @@ impl ServerState {
             sessions: DashMap::new(),
             username_to_session: DashMap::new(),
             channels: RwLock::new(channels),
+            layout: RwLock::default(),
             limits: Arc::new(crate::ConnLimits::from_config(config)),
             token_failures: DashMap::new(),
             max_users: config.max_users,
-            channel_budget: settings
-                .max_channels
-                .saturating_add(persistent_channels.len() as u32)
-                .saturating_add(1),
+            channel_budget: AtomicU32::new(
+                settings
+                    .max_channels
+                    .saturating_add(persistent_channels.len() as u32)
+                    .saturating_add(1),
+            ),
             settings,
             admin_token,
             channel_kdf: tokio::sync::Semaphore::new(2),
@@ -967,6 +1019,16 @@ impl ServerState {
                 .sessions
                 .get(&user_id)
                 .is_some_and(|s| crate::gates::passes(&s, groups))
+    }
+
+    /// False for a channel whose gate this session is outside, and for none at all:
+    /// one answer for both, or the answer says which channels exist.
+    pub async fn may_reach(&self, session_id: SessionId, channel_id: ChannelId) -> bool {
+        self.channels
+            .read()
+            .await
+            .get(&channel_id)
+            .is_some_and(|c| self.passes(session_id, &c.gate.groups))
     }
 
     /// Get a snapshot of all channel info (for sending to clients).
@@ -1445,6 +1507,7 @@ impl ServerState {
                 log_conv: String::new(),
                 gate: ChannelGate::default(),
                 gate_key: String::new(),
+                kept: false,
             },
         );
 
@@ -2287,7 +2350,7 @@ pub(crate) mod test_support {
             media_tx,
             std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
             state.max_users,
-            state.channel_budget,
+            state.channel_budget.load(std::sync::atomic::Ordering::Relaxed),
         );
         state.sessions.insert(session_id, session);
         state
@@ -2320,6 +2383,7 @@ pub(crate) mod test_support {
             log_conv: String::new(),
             gate: ChannelGate::default(),
             gate_key: String::new(),
+            kept: false,
         });
         for &(user_id, session_id) in users {
             channel.members.insert(user_id);

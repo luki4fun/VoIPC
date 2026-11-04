@@ -329,6 +329,11 @@ pub enum ClientMessage {
         pack: Option<String>,
         sticker: Option<bool>,
     },
+    /// Display names and pictures of these accounts, at most `MAX_PROFILES_ASKED`
+    /// (protocol v18). `ServerMessage::Profiles` answers.
+    ProfilesGet { accounts: Vec<[u8; 16]> },
+    /// `ServerMessage::ProfilePicture` answers (protocol v18).
+    ProfilePictureGet { hash: [u8; 32] },
 }
 
 /// The client's side of an account sign-in, between `Authenticate` and
@@ -567,6 +572,14 @@ pub enum AccountRequest {
     PairDecline {
         pair: u64,
     },
+    /// Shown beside the `@name`; `None` clears it (protocol v18).
+    ProfileSet {
+        name: Option<String>,
+    },
+    /// A PNG or WebP of at most `MAX_PROFILE_PICTURE` bytes; `None` clears it.
+    ProfilePictureSet {
+        image: Option<Vec<u8>>,
+    },
 }
 
 /// What an admin asks for (`AccountRequest::Admin`). A step that changes
@@ -624,6 +637,76 @@ pub enum AdminOp {
     GateSet {
         channel_id: ChannelId,
         gate: ChannelGate,
+    },
+    // ── Channels and categories (protocol v18) ──
+    /// A new persistent channel (`id` none), or changes to one made in the app.
+    ChannelSave {
+        id: Option<ChannelId>,
+        name: String,
+        description: String,
+        text: bool,
+        auto_join: bool,
+        category: Option<u32>,
+        /// `None`: open, for a new one; as it is, for one that exists.
+        gate: Option<ChannelGate>,
+    },
+    /// A channel made in the app goes, with everything kept in it. Takes a fresh code.
+    ChannelDelete {
+        id: ChannelId,
+    },
+    CategorySave {
+        id: Option<u32>,
+        name: String,
+    },
+    /// The category goes; its channels stay, outside any.
+    CategoryDelete {
+        id: u32,
+    },
+    /// A new order, of what the editor can see: the categories, and the channels
+    /// with the category each is in.
+    LayoutSet {
+        categories: Vec<u32>,
+        channels: Vec<(ChannelId, Option<u32>)>,
+    },
+    /// The channel opened the first time someone comes here, or none.
+    WelcomeSet {
+        channel_id: Option<ChannelId>,
+    },
+    /// A group's colour, `0xRRGGBB`, or none. Hands out nothing, so no fresh code.
+    GroupStyle {
+        name: String,
+        color: Option<u32>,
+    },
+    /// Every group, in the order they should show. A group the editor could not
+    /// change stays where it is.
+    GroupOrder {
+        names: Vec<String>,
+    },
+    /// Clears this account's display name and/or picture.
+    ProfileReset {
+        id: [u8; 16],
+        name: bool,
+        picture: bool,
+    },
+    /// The server's name and description. Admins only, with a fresh code.
+    ServerProfileSet {
+        name: String,
+        description: String,
+    },
+    /// The server's icon (as a profile picture), or none.
+    ServerIconSet {
+        image: Option<Vec<u8>>,
+    },
+    InviteLinks,
+    /// A code many people can sign up with: `InviteLinkCode` answers, once.
+    /// `days` 0: it does not run out by time. `group`: one holding no privilege.
+    InviteLinkNew {
+        max_uses: u32,
+        days: u32,
+        group: Option<String>,
+    },
+    InviteLinkRevoke {
+        id: String,
     },
 }
 
@@ -841,6 +924,8 @@ pub enum AccountReply {
     PairEnded {
         pair: u64,
     },
+    /// `ProfileSet`, `ProfilePictureSet`, or an admin's `ProfileReset`.
+    ProfileDone,
 }
 
 /// Answers to `AdminOp`.
@@ -878,6 +963,18 @@ pub enum AdminReply {
     },
     /// This step hands out power: send it again with a code.
     StepUp,
+    /// A channel or layout step went through. `channel_id`: the channel it made.
+    ChannelDone {
+        channel_id: Option<ChannelId>,
+    },
+    /// Also after `InviteLinkRevoke`.
+    InviteLinks {
+        links: Vec<InviteLinkInfo>,
+    },
+    /// Shown once: only its hash is kept.
+    InviteLinkCode {
+        code: String,
+    },
 }
 
 /// A wrapped epoch key for one member (`AccountRequest::EpochPut`).
@@ -1260,6 +1357,45 @@ pub enum ServerMessage {
     /// In this channel you may only listen and read (its gate names who may
     /// speak, and you are not in those groups), or (`on: false`) speak again.
     ListenOnly { channel_id: ChannelId, on: bool },
+
+    /// Where channels sit (protocol v18), on a relay with accounts: the persistent
+    /// channels this member sees, in order, and their categories, in order.
+    ChannelLayout {
+        categories: Vec<ChannelCategory>,
+        channels: Vec<ChannelPlace>,
+    },
+
+    /// The badged groups in the server's order (protocol v18), on a relay with
+    /// accounts: at connect and when one changes. Every badge, whoever holds it: a
+    /// badge is a public label. What a group is called stays with who manages groups.
+    GroupStyles { groups: Vec<GroupStyle> },
+
+    /// What `ClientMessage::ProfilesGet` asked, or a change (protocol v18).
+    Profiles { profiles: Vec<ProfileInfo> },
+
+    /// What `ClientMessage::ProfilePictureGet` asked (protocol v18). Empty: there
+    /// is no such picture. Sanitized by the client before it is shown.
+    ProfilePicture { hash: [u8; 32], image: Vec<u8> },
+
+    /// What this server calls itself (protocol v18): at connect when it says
+    /// anything, and when it changes. Its address stays what identifies it: a client
+    /// shows this beside the address and keeps it out of its bookmarks. The icon
+    /// is fetched as `ClientMessage::ProfilePictureGet`.
+    ServerProfile {
+        name: String,
+        description: String,
+        icon: Option<[u8; 32]>,
+    },
+
+    /// These members may (or from now on may not) call on everybody with
+    /// `@everyone`, `@here` or `@&badge` (protocol v18). Only the holders: the first
+    /// one after connecting is all of them. Advisory, as a pin's right is: the text
+    /// is end-to-end, and only clients act on it.
+    MentionPower { user_ids: Vec<UserId>, on: bool },
+
+    /// Every badge of our own groups (protocol v18), so `@&badge` reaches us even
+    /// where our row shows only the top ones (`MAX_BADGES`). Told to us alone.
+    MyBadges { badges: Vec<String> },
 }
 
 /// `FileRefused.code`, final for this hash: not in a conversation of the

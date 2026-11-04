@@ -270,7 +270,7 @@ pub async fn enforce(state: &Arc<ServerState>, skip: Option<u32>) {
             let account = s
                 .account
                 .as_ref()
-                .map(|a| (a.user.id.0, !a.scopes.is_empty()));
+                .map(|a| (a.user.id.0, crate::accounts::holds_power(&a.scopes)));
             refusal(state, s.peer_ip, account).map(|why| (*e.key(), why))
         })
         .collect();

@@ -1,10 +1,18 @@
 import { derived, writable, type Readable } from "svelte/store";
 import type { ChannelInfo, UserInfo } from "../types.js";
+import type { ChannelLayout } from "../channel-groups.ts";
+import type { GroupStyle } from "../member-sections.ts";
 // Explicit extensions so Node's test runner can load this file as-is
 import { scoped, serverAddress } from "./scoped.ts";
 import { users } from "./users.ts";
 
 export const channels = scoped<ChannelInfo[]>(() => []);
+/** The badged groups in the server's order, and their colours. */
+export const groupStyles = scoped<GroupStyle[]>(() => []);
+/** This server has told us where its channels sit; one without accounts never does. */
+export const layoutArrived = scoped<boolean>(() => false);
+/** Where channels sit. Empty on a relay without accounts, or an older one. */
+export const channelLayout = scoped<ChannelLayout>(() => ({ categories: [], channels: [] }));
 /**
  * The voice channel we stand in on each server. 0 is "not in voice": the server
  * parks every session in its lobby, channel 0, and the UI never shows it.

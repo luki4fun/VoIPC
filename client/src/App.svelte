@@ -36,9 +36,13 @@
     transmitHeldByGame,
     isAdmin,
     pendingInvite,
+    pendingJoin,
     rememberChannelPassword,
   } from "./lib/stores/connection.js";
   import {
+    channelLayout,
+    groupStyles,
+    layoutArrived,
     channels,
     currentChannelId,
     previewChannelId,
@@ -68,6 +72,7 @@
     activeTextChannelId,
     dmConversations,
     incrementChannelUnread,
+    noteChannelUnseen,
     clearChannelUnread,
     markRead,
     dmKey,
@@ -83,7 +88,7 @@
   import ChatHistorySetup from "./lib/components/ChatHistorySetup.svelte";
   import AudioSetup from "./lib/components/AudioSetup.svelte";
   import type { ChannelInfo, ChatMessage, UserInfo } from "./lib/types.js";
-  import { parseInviteFragment } from "./lib/invite.js";
+  import { parseInviteFragment, parseJoinFragment } from "./lib/invite.js";
   import {
     channelListArrived,
     disconnectServer,
@@ -148,6 +153,7 @@
   } from "./lib/stores/rosters.js";
   import { emoteLimits, setEmotes, type EmoteLimits, type EmoteSet } from "./lib/stores/emotes.js";
   import { olderRelay } from "./lib/stores/relay.js";
+  import { community } from "./lib/relay-rules.js";
   import { confirmAction } from "./lib/stores/confirm.js";
   import {
     askNsfwConsent,
@@ -161,7 +167,19 @@
     openJoinedTextChannel,
     previewChannel,
     settingsAsk,
+    channelNotify,
+    channelRenamed,
+    firstVisit,
+    selectChannel,
   } from "./lib/stores/channel-ui.js";
+  import { arrival } from "./lib/notify-rules.js";
+  import { cleanLayout, type ChannelLayout } from "./lib/channel-groups.js";
+  import type { GroupStyle } from "./lib/member-sections.js";
+  import type { WireProfile } from "./lib/profile-rules.js";
+  import { callsOn, hasPower, powerTokens, tokensForMe } from "./lib/mention-rules.js";
+  import { mentionPower, myBadges, onMentionPower } from "./lib/stores/powers.js";
+  import { onPicture, onProfiles, onServerProfile } from "./lib/stores/profiles.js";
+  type ServerProfileEvent = Parameters<typeof onServerProfile>[1];
   import {
     chatEvent,
     expiryFor,
@@ -356,6 +374,24 @@
     }
   });
 
+  // Only once the layout that names it has come, which is a frame of its own behind
+  // the sign-in: deciding earlier would use up this device's one welcome on nothing.
+  // And only for the server on screen: one coming up in the background must not
+  // pull the view to it.
+  $effect(() => {
+    const server = $serverAddress;
+    if (!server || !$layoutArrived || $connectionStates.get(server) !== "connected") return;
+    if (($channelLists.get(server) ?? []).length > 0) untrack(() => welcomeOnce(server));
+  });
+
+  /** The first time on this server on this device, with nothing else open: its
+   *  welcome channel, if it has one. */
+  function welcomeOnce(server: string) {
+    if (server !== get(serverAddress) || get(activeTextChannelId) !== null || get(activeDmUserId) !== null) return;
+    const channel = firstVisit(server);
+    if (channel) selectChannel(channel);
+  }
+
   // A saved device that is no longer plugged in: the name is all we store
   // (cpal has no stable id, and a browser's deviceId is wiped with site data),
   // so a name that is not in the list is a device that went away.
@@ -459,6 +495,19 @@
     const names = mentionNames([...people, own]).filter((n) => n === own || n === shortName(own));
     const tree = parse(content, { names });
     return names.some((n) => mentionsName(tree, n));
+  }
+
+  /** Whether this message came with its sender's power to call on everybody. */
+  function arrivedWithPower(server: string, channelId: number, uid: number, content: string): boolean {
+    if (!community(get(olderRelay.peek(server))?.protocol ?? null)) return false;
+    const channel = get(channels.peek(server)).find((c) => c.channel_id === channelId);
+    const row = currentRosterOf(server, channelId).find((u) => u.user_id === uid);
+    return hasPower(
+      content,
+      { holder: get(mentionPower.peek(server)).has(uid), isAdmin: !!row?.is_admin },
+      { anonymous: !!channel?.anonymous },
+      powerTokens(get(groupStyles.peek(server))),
+    );
   }
 
   async function notifyUnfocused(title: string, body: string) {
@@ -634,6 +683,14 @@
       // For the server that served this page, which is the one the link names:
       // with several open, "whichever is on screen" could be another one.
       const inv = parseInviteFragment(window.location.hash);
+      const join = parseJoinFragment(window.location.hash);
+      if (join) {
+        pendingJoin.set({
+          code: join.code,
+          host: window.location.hostname.replace(/^\[|\]$/g, ""),
+          port: Number(window.location.port) || 443,
+        });
+      }
       if (inv) {
         pendingInvite.set({
           ...inv,
@@ -1378,7 +1435,34 @@
         addNotification(`${fromServer(server)}${data.reason}`, "error");
       }),
 
+      listenServer<ChannelLayout>("channel-layout", (server, layout) => {
+        channelLayout.of(server).set(cleanLayout(layout));
+        layoutArrived.of(server).set(true);
+      }),
+
+      listenServer<WireProfile[]>("profiles", (server, list) => onProfiles(server, list)),
+
+      listenServer<{ hash: number[]; image: number[] }>("profile-picture", (server, p) => {
+        void onPicture(server, p.hash, p.image);
+      }),
+
+      listenServer<ServerProfileEvent>("server-profile", (server, p) => onServerProfile(server, p)),
+
+      listenServer<{ user_ids: number[]; on: boolean }>("mention-power", (server, p) =>
+        onMentionPower(server, p.user_ids, p.on),
+      ),
+
+      listenServer<string[]>("my-badges", (server, badges) => {
+        myBadges.of(server).set(badges);
+      }),
+
+      listenServer<GroupStyle[]>("group-styles", (server, styles) => {
+        groupStyles.of(server).set(styles);
+      }),
+
       listenServer<ChannelInfo>("channel-updated", (server, updated) => {
+        const before = get(channels.peek(server)).find((c) => c.channel_id === updated.channel_id);
+        if (before && before.name !== updated.name) channelRenamed(server, before.name, updated.name);
         channels.of(server).update((chs) =>
           chs.map((ch) => (ch.channel_id === updated.channel_id ? updated : ch)),
         );
@@ -1482,7 +1566,8 @@
           // the channel's stored log is recognised (sameMessage).
           const writer = uid === self
             ? get(account.peek(server))?.info.id
-            : get(users.peek(server)).find((u) => u.user_id === uid)?.account;
+            : (currentRosterOf(server, channel_id).find((u) => u.user_id === uid)?.account ??
+              get(users.peek(server)).find((u) => u.user_id === uid)?.account);
           // An edit, delete, reaction or pin: done to an earlier message here,
           // never a message itself. A pin counts only from one of the
           // channel's managers, as the roster has the sender now.
@@ -1493,11 +1578,14 @@
             if (event) applyChannelEvent(server, chName, { event, by, at: timestamp, content }, mayPin);
             return;
           }
+          // A forward only repeats what somebody else said, as a quote does
+          const power = !messageRefs(data).fwd && arrivedWithPower(server, channel_id, uid, content);
           const added = addChannelMessage(server, chName, {
             user_id: uid,
             username: uname,
             content,
             timestamp,
+            ...(power ? { power: true } : {}),
             id: message_id ?? undefined,
             expires_at,
             // Marked, so it is never handed on as history: a placeholder is
@@ -1507,20 +1595,25 @@
             account: writer ? accountHex(writer) : undefined,
             ...messageRefs(data),
           });
-          if (added && !viewingChannel(server, channel_id)) {
-            incrementChannelUnread(server, chName, timestamp);
-            if (uid !== self) playChannelMessageSound();
-          }
-          // An answer to something we wrote, or our name after an @, reaches
-          // us like a direct message does
-          if (added && uid !== self) {
-            const target = data.reply_to
-              ? findTarget(get(channelMessages).get(chatKey(server, chName)) ?? [], data.reply_to, timestamp)
-              : undefined;
+          if (added) {
+            // An answer to something we wrote, or our name after an @, reaches
+            // us like a direct message does
+            const mine = uid === self;
+            const target =
+              !mine && data.reply_to
+                ? findTarget(get(channelMessages).get(chatKey(server, chName)) ?? [], data.reply_to, timestamp)
+                : undefined;
             const me = { account: ownAccount(server), user_id: self };
             const answered = !!target && isOwn(target, me, (m) => receivedNow(server, m));
-            const named = !answered && mentionsUs(server, channel_id, content);
-            if (answered || named) {
+            const called = power && callsOn(content, tokensForMe(get(myBadges.peek(server))), powerTokens(get(groupStyles.peek(server))));
+            const named = !mine && !answered && (called || mentionsUs(server, channel_id, content));
+            const onScreen = viewingChannel(server, channel_id);
+            const members = get(channels.peek(server)).find((c) => c.channel_id === channel_id)?.user_count ?? 0;
+            const does = arrival(channelNotify(server, chName, members), { mine, onScreen, forMe: answered || named });
+            if (does.count) incrementChannelUnread(server, chName, timestamp);
+            else if (!onScreen) noteChannelUnseen(server, chName, timestamp);
+            if (does.sound) playChannelMessageSound();
+            if (does.os) {
               notifyUnfocused(
                 `${fromServer(server)}${shortName(uname)} ${answered ? "replied to you" : "mentioned you"}`,
                 notificationBody({ content, file: messageRefs(data).file, expires_at }),
@@ -1559,7 +1652,12 @@
           expires_at: expiryFor(m.timestamp, m.ttl_secs, channelMessageTtl(server, ch.channel_id)),
           ...messageRefs(m),
         });
-        if (added && !m.from_me && !m.replay && !viewingChannel(server, ch.channel_id)) incrementChannelUnread(server, ch.name, m.timestamp);
+        if (added && !m.from_me && !m.replay && !viewingChannel(server, ch.channel_id)) {
+          const forMe = mentionsUs(server, ch.channel_id, m.content);
+          const does = arrival(channelNotify(server, ch.name, ch.user_count), { mine: false, onScreen: false, forMe });
+          if (does.count) incrementChannelUnread(server, ch.name, m.timestamp);
+          else noteChannelUnseen(server, ch.name, m.timestamp);
+        }
       }),
 
       // Who can read what we write in a channel's stored log, said where it

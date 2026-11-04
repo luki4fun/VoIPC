@@ -369,6 +369,10 @@ const handlers: Record<string, Handler> = {
   },
   kick_user: ({ server, channelId, userId }) =>
     need(server).sendControl({ KickUser: { channel_id: u32(channelId, "channelId"), user_id: u32(userId, "userId") } }),
+  profiles_get: ({ server, accounts }) =>
+    need(server).sendControl({ ProfilesGet: { accounts } }),
+  profile_picture_get: ({ server, hash }) =>
+    need(server).sendControl({ ProfilePictureGet: { hash } }),
   request_channel_users: ({ server, channelId }) =>
     need(server).sendControl({ RequestChannelUsers: { channel_id: u32(channelId, "channelId") } }),
   send_invite: ({ server, channelId, targetUserId }) =>

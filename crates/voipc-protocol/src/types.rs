@@ -252,6 +252,67 @@ pub enum ProviderKind {
     Facebook,
 }
 
+/// How a member chose to be shown (`ServerMessage::Profiles`; protocol v18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProfileInfo {
+    pub account: [u8; 16],
+    /// Shown beside the `@name`, never instead of it.
+    pub name: Option<String>,
+    /// `ClientMessage::ProfilePictureGet` fetches it.
+    pub picture: Option<[u8; 32]>,
+}
+
+/// A reusable invite link (protocol v18). Its code was shown once and is not here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteLinkInfo {
+    /// Names it for `AdminOp::InviteLinkRevoke`; not the code.
+    pub id: String,
+    pub max_uses: u32,
+    pub uses: u32,
+    /// Unix seconds; `None`: it does not run out by time.
+    pub expires_at: Option<i64>,
+    /// The group a new account starts in.
+    pub group: Option<String>,
+}
+
+/// Characters of a server's name (`ServerMessage::ServerProfile`).
+pub const MAX_SERVER_NAME_CHARS: usize = 32;
+/// Characters of a server's description.
+pub const MAX_SERVER_DESCRIPTION_CHARS: usize = 256;
+
+/// Characters of a display name.
+pub const MAX_DISPLAY_NAME_CHARS: usize = 32;
+/// Bytes of a profile picture, as it is stored.
+pub const MAX_PROFILE_PICTURE: usize = 32 * 1024;
+/// Accounts asked about in one `ClientMessage::ProfilesGet`.
+pub const MAX_PROFILES_ASKED: usize = 64;
+
+/// How a badged group shows (`ServerMessage::GroupStyles`; protocol v18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupStyle {
+    pub badge: String,
+    /// `0xRRGGBB`. A number, so no client ever has a relay's string in its CSS.
+    pub color: Option<u32>,
+}
+
+/// A category of channels (protocol v18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelCategory {
+    pub id: u32,
+    pub name: String,
+}
+
+/// Where a channel sits (`ServerMessage::ChannelLayout`; protocol v18).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelPlace {
+    pub channel_id: ChannelId,
+    pub category: Option<u32>,
+    /// Made in the app, so it can be renamed and deleted there.
+    pub kept: bool,
+    /// Opened the first time someone comes to this server.
+    pub welcome: bool,
+}
+
 /// A provider linked to an account, as the account panel lists it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LinkedProvider {

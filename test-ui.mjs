@@ -625,7 +625,7 @@ await sleep(800);
 check("unmuting clears your own row again", (await alice.evaluate(rowMuted(null))) === false);
 
 // 4. Channel settings: change the proximity mode (and leave the password alone)
-await alice.evaluate(`(() => { const el = document.querySelector(".channel-row:has(> .channel.active) .settings-icon"); if (!el) return false; el.click(); return true; })()`);
+await alice.evaluate(`(() => { const el = document.querySelector('.channel-row:has(> .channel.active) .settings-icon[title="Channel settings"]'); if (!el) return false; el.click(); return true; })()`);
 await sleep(400);
 if (await alice.evaluate(`!!document.querySelector(".password-dialog select")`)) {
   await alice.evaluate(setSelect(".password-dialog select", "3d"));
@@ -638,7 +638,7 @@ if (await alice.evaluate(`!!document.querySelector(".password-dialog select")`))
 }
 
 // 5. Switching the channel off closes the room again
-await alice.evaluate(`(() => { const el = document.querySelector(".channel-row:has(> .channel.active) .settings-icon"); if (!el) return false; el.click(); return true; })()`);
+await alice.evaluate(`(() => { const el = document.querySelector('.channel-row:has(> .channel.active) .settings-icon[title="Channel settings"]'); if (!el) return false; el.click(); return true; })()`);
 await sleep(400);
 await alice.evaluate(setSelect(".password-dialog select", "off"));
 await alice.evaluate(click(".password-dialog .create-btn"));
@@ -684,7 +684,7 @@ const wireNames = await bob.evaluate(
 check("no real name reached the observer's client", !wireNames.includes("ui-alice"), wireNames);
 
 // Hidden + no sharing + hidden members, set through the settings dialog
-await alice.evaluate(`(() => { const el = document.querySelector(".channel-row:has(> .channel.active) .settings-icon"); if (!el) return false; el.click(); return true; })()`);
+await alice.evaluate(`(() => { const el = document.querySelector('.channel-row:has(> .channel.active) .settings-icon[title="Channel settings"]'); if (!el) return false; el.click(); return true; })()`);
 await sleep(400);
 // By data-opt, not by position: these used to be b[0], b[2] and b[3] of the
 // checkbox list, so inserting an option — or moving this dialog into its own

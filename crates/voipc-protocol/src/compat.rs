@@ -17,7 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::codec::{decode_server_msg, encode_client_msg, frame, PROTOCOL_VERSION};
 use crate::error::ProtocolError;
-use crate::messages::{AccountRequest, AuthContinue, ClientMessage, ServerMessage};
+use crate::messages::{AccountRequest, AdminOp, AuthContinue, ClientMessage, ServerMessage};
 use crate::types::*;
 
 /// The oldest relay protocol an app still speaks: 1.0's. At least three
@@ -193,6 +193,8 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
         46,
         "AccountReply: the provider replies never come from it",
     ),
+    (17, Side::Client, 41, "AdminOp: the channel steps are refused"),
+    (17, Side::Server, 46, "AccountReply: AdminReply::ChannelDone never comes from it"),
 ];
 
 /// How many messages each side had at a protocol: an index at or past it is
@@ -202,7 +204,7 @@ fn client_messages(proto: u32) -> u32 {
         ..=12 => 42,
         13 => 45,
         14 => 49,
-        15..=16 => 50,
+        15..=17 => 50,
         _ => u32::MAX,
     }
 }
@@ -283,6 +285,27 @@ pub fn encode_client_msg_for(
             | AccountRequest::PairApprove { .. }
             | AccountRequest::PairDecline { .. },
         ) if proto < 17 => Err(ProtocolError::NotOnThisRelay(proto)),
+        ClientMessage::Account(AccountRequest::Admin {
+            op:
+                AdminOp::ChannelSave { .. }
+                | AdminOp::ChannelDelete { .. }
+                | AdminOp::CategorySave { .. }
+                | AdminOp::CategoryDelete { .. }
+                | AdminOp::LayoutSet { .. }
+                | AdminOp::WelcomeSet { .. }
+                | AdminOp::GroupStyle { .. }
+                | AdminOp::GroupOrder { .. }
+                | AdminOp::ProfileReset { .. }
+                | AdminOp::ServerProfileSet { .. }
+                | AdminOp::ServerIconSet { .. }
+                | AdminOp::InviteLinks
+                | AdminOp::InviteLinkNew { .. }
+                | AdminOp::InviteLinkRevoke { .. },
+            ..
+        })
+        | ClientMessage::Account(
+            AccountRequest::ProfileSet { .. } | AccountRequest::ProfilePictureSet { .. },
+        ) if proto < 18 => Err(ProtocolError::NotOnThisRelay(proto)),
         ClientMessage::EmoteAdd { emote } if proto == 14 => old(postcard::to_allocvec(&(
             EMOTE_ADD,
             EmoteAdd14 {

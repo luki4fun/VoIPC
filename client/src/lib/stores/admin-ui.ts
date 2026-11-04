@@ -12,6 +12,9 @@ import { invoke } from "@tauri-apps/api/core";
 import { fromServer, listenServer } from "../connect.js";
 import { serverAddress } from "./connection.js";
 import { can } from "./powers.js";
+import { relayAccounts } from "./account.js";
+import { olderRelay } from "./relay.js";
+import { community } from "../relay-rules.js";
 import { addNotification } from "./notifications.js";
 import { scoped } from "./scoped.js";
 import { PANEL_SCOPES } from "../scopes.js";
@@ -23,6 +26,8 @@ import {
   adminInvites,
   adminMembers,
   adminOp,
+  adminInviteLinks,
+  inviteLinkCode,
   adminUser,
   adminUsers,
   inviteCode,
@@ -37,7 +42,14 @@ export const adminToken = writable("");
 export const bans = scoped<BanInfo[]>(() => []);
 
 /** Whoever holds one of the panel's privileges (or is admin) opens it. */
-export const panelAllowed = derived(can, ($can) => PANEL_SCOPES.some((s) => $can(s)));
+export const panelAllowed = derived(
+  [can, relayAccounts, olderRelay],
+  ([$can, $accounts, $older]) =>
+    PANEL_SCOPES.some((s) => $can(s)) ||
+    // The Channels tab, which an older relay has not got: without it a moderator
+    // would open a panel with nothing in it
+    (!!$accounts && community($older?.protocol ?? null) && $can("voipc:channels")),
+);
 
 // A login that succeeds arrives back as `admin-status`, which App.svelte routes
 // into `isAdmin`; losing the privileges closes the panel with them — and so
@@ -144,5 +156,7 @@ listenServer<unknown>("account-reply", (server, raw) => {
   else if ("Members" in a) adminMembers.of(server).set(a.Members);
   else if ("Invites" in a) adminInvites.of(server).set(a.Invites.invites);
   else if ("InviteCode" in a) inviteCode.of(server).set(a.InviteCode.code);
+  else if ("InviteLinks" in a) adminInviteLinks.of(server).set(a.InviteLinks.links);
+  else if ("InviteLinkCode" in a) inviteLinkCode.of(server).set(a.InviteLinkCode.code);
   else if ("Gate" in a) adminGate.of(server).set(a.Gate);
 });

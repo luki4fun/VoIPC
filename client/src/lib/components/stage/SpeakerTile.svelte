@@ -19,6 +19,8 @@
   import { watchingUserId } from "../../stores/screenshare.js";
   import { memberMenu } from "../../actions/member-menu.js";
   import Icon from "../Icons.svelte";
+  import MemberName from "../MemberName.svelte";
+  import AvatarPicture from "../AvatarPicture.svelte";
   import type { UserInfo } from "../../types.js";
 
   interface Props {
@@ -54,10 +56,10 @@
     use:memberMenu={{ user, idle: false, self }}
   >
     <span class="avatar" style={avatarStyle(user.username)} aria-hidden="true"
-      >{user.username.charAt(0).toUpperCase()}</span
+      >{user.username.charAt(0).toUpperCase()}<AvatarPicture account={user.account} /></span
     >
     <span class="name" title={user.username}>
-      {shortName(user.username)}{#if self}<span class="you">(you)</span>{/if}
+      <MemberName username={user.username} account={user.account} />{#if self}<span class="you">(you)</span>{/if}
     </span>
     <span class="marks" aria-hidden="true">
       {#if user.is_muted}<span class="mark" title="Muted"><Icon name="mic-off" size={small ? 12 : 14} /></span>{/if}
@@ -133,6 +135,7 @@
   }
 
   .avatar {
+    position: relative;
     display: grid;
     place-items: center;
     width: 72px;

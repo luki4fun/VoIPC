@@ -33,6 +33,11 @@
   import { nativeMenuWanted } from "../../context-menu.js";
   import { dayKey, dayLabel, fullTime, msToMidnight } from "../../chat-time.js";
   import { mentionsName, parse, plainText } from "../../markdown.js";
+  import { callsOn, powerTokens, tokensForMe } from "../../mention-rules.js";
+  import { community } from "../../relay-rules.js";
+  import { olderRelay } from "../../stores/relay.js";
+  import { groupStyles } from "../../stores/channels.js";
+  import { can, myBadges } from "../../stores/powers.js";
   import { ambiguousTarget, findTarget, indexById, isOwn } from "../../thread-rules.js";
   import { reactionChips, rowKey, sameRow } from "../../chat-rules.js";
   import { receivedNow } from "../../stores/chat.js";
@@ -40,6 +45,7 @@
   import { QUICK_REACTIONS } from "../../emoji.js";
   import { shortName } from "../../username.js";
   import Icon from "../Icons.svelte";
+  import MemberName from "../MemberName.svelte";
   import Markdown from "./Markdown.svelte";
   import FileCard from "./FileCard.svelte";
   import Lightbox from "./Lightbox.svelte";
@@ -129,10 +135,19 @@
 
   /** Whether `m` names us with an `@` (outside code). */
   function mentionsMe(m: ChatMessage): boolean {
-    if (me.length === 0 || !m.content.includes("@") || isMine(m)) return false;
+    if (!m.content.includes("@") || isMine(m)) return false;
+    if (m.power && callsOn(m.content, tokensForMe($myBadges), powerTokens($groupStyles))) return true;
+    if (me.length === 0) return false;
     const tree = parse(m.content, { names: me });
     return me.some((n) => mentionsName(tree, n));
   }
+
+  /** What an `@` may name in this message: the tokens too, where it had the power. */
+  function namesFor(m: ChatMessage): readonly string[] {
+    const own = isMine(m) && $can("voipc:mention_all") && community($olderRelay?.protocol ?? null);
+    return m.power || own ? [...names, ...powerTokens($groupStyles)] : names;
+  }
+  const meHere = (m: ChatMessage) => (m.power ? [...me, ...tokensForMe($myBadges)] : me);
 
   /** The first message after `newSince` that somebody else wrote. */
   const newFrom = $derived(
@@ -495,7 +510,7 @@
       {/if}
       {#if shouldShowHeader(i)}
         <div class="msg-header">
-          <span class="msg-username" class:self={isMine(msg)} title={msg.username}>{shortName(msg.username)}</span>
+          <span class="msg-username" class:self={isMine(msg)} title={msg.username}><MemberName username={msg.username} account={msg.kind === "shared" ? null : msg.account} /></span>
           <time class="msg-time" datetime={new Date(msg.timestamp).toISOString()} title={fullTime(msg.timestamp)}
             >{formatTime(msg.timestamp)}</time
           >
@@ -545,7 +560,7 @@
             {:else if sticker}
               <span class="sticker-off">Sticker :{sticker.name}:</span>
             {:else}
-              <Markdown text={msg.content} {onlink} {names} {me} {tabbable} />
+              <Markdown text={msg.content} {onlink} names={namesFor(msg)} me={meHere(msg)} {tabbable} />
             {/if}
           {/if}
           {#if msg.edited_at && !isEditing}

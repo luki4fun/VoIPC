@@ -75,6 +75,46 @@ pub async fn set(
     if channel_id == 0 {
         return Err("The General channel is open to everyone.".into());
     }
+    let (old, key) = {
+        let channels = state.channels.read().await;
+        let Some(c) = channels.get(&channel_id) else {
+            return Err("channel does not exist".into());
+        };
+        (c.gate.clone(), c.gate_key.clone())
+    };
+    let gate = checked(state, session_id, &old.groups, gate).await?;
+    if old == gate {
+        return Ok(gate);
+    }
+    if !key.is_empty() {
+        relay
+            .gate_put(&key, &gate)
+            .await
+            .map_err(|_| "Something went wrong. Please try again.".to_string())?;
+    }
+    {
+        let mut channels = state.channels.write().await;
+        match channels.get_mut(&channel_id) {
+            Some(c) => c.gate = gate.clone(),
+            None => return Err("channel does not exist".into()),
+        }
+    }
+    gate_changed(state, channel_id, &old).await;
+    prune_logs(state).await;
+    Ok(gate)
+}
+
+/// A gate as an editor may set it, in place of one with `old` as its groups: its
+/// lists tidied and short enough, its groups real, and the editor passing both.
+pub async fn checked(
+    state: &ServerState,
+    session_id: SessionId,
+    old: &[String],
+    gate: ChannelGate,
+) -> Result<ChannelGate, String> {
+    let Some(relay) = state.accounts.clone() else {
+        return Err("This relay has no accounts, so no groups.".into());
+    };
     let clean = |list: Vec<String>| -> Vec<String> {
         let mut l: Vec<String> = list.into_iter().map(|g| g.trim().to_string()).collect();
         l.retain(|g| !g.is_empty());
@@ -105,14 +145,7 @@ pub async fn set(
     {
         return Err(format!("There is no group named {g}."));
     }
-    let (old, key) = {
-        let channels = state.channels.read().await;
-        let Some(c) = channels.get(&channel_id) else {
-            return Err("channel does not exist".into());
-        };
-        (c.gate.clone(), c.gate_key.clone())
-    };
-    if !state.passes(session_id, &old.groups) {
+    if !state.passes(session_id, old) {
         return Err("channel does not exist".into());
     }
     if !state.passes(session_id, &gate.groups) {
@@ -120,24 +153,6 @@ pub async fn set(
             "This would shut you out of the channel. Keep one of your groups in it.".into(),
         );
     }
-    if old == gate {
-        return Ok(gate);
-    }
-    if !key.is_empty() {
-        relay
-            .gate_put(&key, &gate)
-            .await
-            .map_err(|_| "Something went wrong. Please try again.".to_string())?;
-    }
-    {
-        let mut channels = state.channels.write().await;
-        match channels.get_mut(&channel_id) {
-            Some(c) => c.gate = gate.clone(),
-            None => return Err("channel does not exist".into()),
-        }
-    }
-    gate_changed(state, channel_id, &old).await;
-    prune_logs(state).await;
     Ok(gate)
 }
 
@@ -180,6 +195,8 @@ async fn gate_changed(state: &Arc<ServerState>, channel_id: ChannelId, old: &Cha
             } else if let Some(s) = state.sessions.get(&uid) {
                 let _ = send_msg(&s.control_tx, &ServerMessage::ChannelDeleted { channel_id });
             }
+            // A category holding only that channel is not theirs to see any more
+            crate::layout::send(state, uid).await;
             continue;
         }
         if !was && now {
@@ -191,6 +208,9 @@ async fn gate_changed(state: &Arc<ServerState>, channel_id: ChannelId, old: &Cha
                     },
                 );
             }
+        }
+        if was != now {
+            crate::layout::send(state, uid).await;
         }
         if now && members.contains(&uid) {
             speech(state, uid, channel_id).await;
@@ -205,6 +225,7 @@ pub async fn standing_changed(state: &Arc<ServerState>, session_id: SessionId) {
     if let Some(s) = state.sessions.get(&session_id) {
         let _ = send_msg(&s.control_tx, &ServerMessage::ChannelList { channels });
     }
+    crate::layout::send(state, session_id).await;
     let theirs: Vec<(ChannelId, Vec<String>)> = state
         .channels
         .read()

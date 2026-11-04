@@ -17,9 +17,8 @@
   // `.users`, which test-ui.mjs counts as the channel's members.
 
   import { avatarStyle } from "../../avatar.js";
-  import { shortName } from "../../username.js";
   import { userId } from "../../stores/connection.js";
-  import { viewingVoice } from "../../stores/channels.js";
+  import { groupStyles, viewingVoice } from "../../stores/channels.js";
   import { speakingUsers } from "../../stores/users.js";
   import { audibleIds } from "../../stores/room.js";
   import {
@@ -35,30 +34,31 @@
   } from "../../stores/roster.js";
   import { openShare, openUserMenu } from "../../stores/user-menu.js";
   import { memberMenu } from "../../actions/member-menu.js";
+  import { badgeStyle, badgesInOrder, sectionsOf } from "../../member-sections.js";
   import Icon from "../Icons.svelte";
+  import AvatarPicture from "../AvatarPicture.svelte";
+  import MemberName from "../MemberName.svelte";
   import type { UserInfo } from "../../types.js";
 
   const live = $derived($displayUsers.filter((u) => u.is_screen_sharing));
   const rest = $derived($displayUsers.filter((u) => !u.is_screen_sharing));
 
-  const groups = $derived(
-    [
-      { label: "Live", members: live },
-      {
-        // "In voice" only when that is what the list is: a text channel's
-        // members are subscribers, each standing in a voice channel of their
-        // own, and the lobby's are in none — the pane shows it when we are in
-        // no voice channel here and have no other channel open.
-        label:
-          $displayChannelId === 0
-            ? "Online"
-            : $isPreviewing || $displayChannel?.text
-              ? `In #${$displayChannelName}`
-              : "In voice",
-        members: rest,
-      },
-    ].filter((g) => g.members.length > 0),
+  // "In voice" only when that is what the list is: a text channel's members are
+  // subscribers, each standing in a voice channel of their own, and the lobby's
+  // are in none — the pane shows it when we are in no voice channel here and
+  // have no other channel open.
+  const restLabel = $derived(
+    $displayChannelId === 0
+      ? "Online"
+      : $isPreviewing || $displayChannel?.text
+        ? `In #${$displayChannelName}`
+        : "In voice",
   );
+  const groups = $derived([
+    ...(live.length > 0 ? [{ key: "live", label: "Live", members: live }] : []),
+    ...sectionsOf(rest, $groupStyles, restLabel),
+  ]);
+  const idleGroups = $derived(sectionsOf($idleUsers, $groupStyles, "Online"));
 
   function menu(user: UserInfo, e: MouseEvent, idle: boolean) {
     e.preventDefault();
@@ -73,7 +73,7 @@
   {/if}
 
   <div class="users">
-    {#each groups as group (group.label)}
+    {#each groups as group (group.key)}
       <div class="group-label">{group.label} — {group.members.length}</div>
       {#each group.members as user (user.user_id)}
         {@render member(user, !$isPreviewing && $viewingVoice, true)}
@@ -83,9 +83,11 @@
 
   {#if $idleUsers.length > 0}
     <div class="idle-users">
-      <div class="group-label">Online — {$idleUsers.length}</div>
-      {#each $idleUsers as user (user.user_id)}
-        {@render member(user, false, false)}
+      {#each idleGroups as group (group.key)}
+        <div class="group-label">{group.label} — {group.members.length}</div>
+        {#each group.members as user (user.user_id)}
+          {@render member(user, false, false)}
+        {/each}
       {/each}
     </div>
   {/if}
@@ -110,18 +112,20 @@
     use:memberMenu={{ user, idle: !inChannel, self: user.user_id === $userId }}
   >
     <span class="avatar" style={avatarStyle(user.username)}
-      >{user.username.charAt(0).toUpperCase()}</span
+      >{user.username.charAt(0).toUpperCase()}<AvatarPicture account={user.account} /></span
     >
     <span class="name" title={user.username}>
-      {shortName(user.username)}
+      <MemberName username={user.username} account={user.account} />
       {#if inChannel && user.user_id === $displayChannelCreatorId && $displayChannelId !== 0}
         <span class="crown" title="Channel creator"><Icon name="crown" size={12} /></span>
       {/if}
       {#if user.is_admin}
         <span class="shield" title="Server admin"><Icon name="shield" size={12} /></span>
       {/if}
-      {#each user.badges ?? [] as badge (badge)}
-        <span class="badge" title="A group badge on this server">{badge}</span>
+      {#each badgesInOrder(user.badges ?? [], $groupStyles) as badge (badge)}
+        <span class="badge" style={badgeStyle(badge, $groupStyles)} title="A group badge on this server"
+          >{badge}</span
+        >
       {/each}
       {#if user.shares_history}
         <span class="sharing-history" title="Shares recent chat with newcomers"><Icon name="history" size={12} /></span>
@@ -221,6 +225,7 @@
   }
 
   .avatar {
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: center;

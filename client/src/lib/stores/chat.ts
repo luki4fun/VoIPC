@@ -988,10 +988,50 @@ export function incrementChannelUnread(server: string, channelName: string, at =
   });
 }
 
+/** A channel has a new name: what is filed under the old one moves. */
+export function renameChannelChat(server: string, from: string, to: string) {
+  const [old, next] = [chatKey(server, from), chatKey(server, to)];
+  const move = <T>(map: Map<string, T>) => {
+    if (!map.has(old)) return map;
+    const out = new Map(map);
+    out.set(next, out.get(old) as T);
+    out.delete(old);
+    return out;
+  };
+  channelMessages.update(move);
+  unreadPerChannel.update(move);
+  // With what its writers deleted, kept beside it: without those their messages
+  // would be taken back from a member's copy
+  clearedBefore.update((map) => {
+    const out = move(map);
+    const marks = `${old}\u0001`;
+    const moved = new Map(out);
+    for (const [k, v] of out) {
+      if (k.startsWith(marks)) {
+        moved.delete(k);
+        moved.set(`${next}\u0001${k.slice(marks.length)}`, v);
+      }
+    }
+    return moved;
+  });
+  newMessagesAt.update(move);
+  scheduleSave();
+  const since = unreadSince.get(old);
+  if (since !== undefined) {
+    unreadSince.set(next, since);
+    unreadSince.delete(old);
+  }
+}
+
+/** Not counted (`notify-rules.ts`), though "New" still begins here. */
+export function noteChannelUnseen(server: string, channelName: string, at = Date.now()) {
+  noteUnread(chatKey(server, channelName), at);
+}
+
 export function clearChannelUnread(server: string, channelName: string) {
   const key = chatKey(server, channelName);
-  if (!get(unreadPerChannel).has(key)) return;
   markRead(key);
+  if (!get(unreadPerChannel).has(key)) return;
   unreadPerChannel.update((map) => {
     map.delete(key);
     return new Map(map);

@@ -376,6 +376,12 @@ elif [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
   else
     echo "FAIL the provider sign-in lane" | tee -a "$WORK/fails.txt"
   fi
+  echo "--- Community basics (test-community.mjs)"
+  if CHROME="$CHROME" TMPDIR="$WORK" node "$SCRIPT_DIR/test-community.mjs" "$((TCP_PORT + 8))" 2>&1 | tee "$WORK/community.txt"; then
+    echo "PASS community basics, in real browsers"
+  else
+    echo "FAIL the community lane" | tee -a "$WORK/fails.txt"
+  fi
   if node "$SCRIPT_DIR/test-ui.mjs" "$TCP_PORT" "$UI_CDP" "$TCP_PORT2" "$TCP_PORT3" 2>&1 | tee "$WORK/ui.txt"; then
     echo "PASS the UI survives creating and configuring a proximity channel"
   else

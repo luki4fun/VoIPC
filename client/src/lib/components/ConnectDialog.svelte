@@ -19,8 +19,8 @@
     type SavedServer,
   } from "../stores/settings.js";
   import { isWeb } from "../stores/platform.js";
-  import { pendingInvite, serverAddress } from "../stores/connection.js";
-  import { parseInviteLink } from "../invite.js";
+  import { pendingInvite, pendingJoin, serverAddress } from "../stores/connection.js";
+  import { parseInviteLink, parseJoinLink } from "../invite.js";
   import { DOWNLOAD_PAGE, RESET_DONE, USE_PASSWORD, connectTo, serverId, showConnectDialog, signInAgain, updateNeeded, type AccountSignIn } from "../connect.js";
   import { randomTag, splitName, withTag } from "../username.js";
   import { availableUpdate, checkForUpdate, checkUpdates, installUpdate, updateBusy, updatesSupported } from "../stores/updates.js";
@@ -33,6 +33,16 @@
   let inviteLink = $state("");
 
   function applyInviteLink() {
+    const join = parseJoinLink(inviteLink);
+    if (join) {
+      pendingJoin.set({ code: join.code, host: join.host, port: join.port });
+      if (join.channel) {
+        pendingInvite.set({ channel: join.channel, password: null, server: serverId(join.host, join.port) });
+      }
+      inviteLink = "";
+      error = "";
+      return;
+    }
     const parsed = parseInviteLink(inviteLink);
     if (!parsed) {
       if (inviteLink.trim()) error = "Not a VoIPC invite link (expected https://host:port/#channel=…)";
@@ -81,6 +91,32 @@
     mode = "account";
     accountAction = "signin";
     signInAgain.set(null);
+  });
+
+  // A link to sign up with: "Create account" with its code in place
+  $effect(() => {
+    const join = $pendingJoin;
+    if (!join) return;
+    if (join.host && join.port) {
+      host = join.host;
+      port = join.port;
+      touched = true;
+    }
+    mode = "account";
+    accountAction = "create";
+    signupInvite = join.code;
+    codeIsFor = { host: join.host ?? host, port: join.port ?? port };
+    pendingJoin.set(null);
+  });
+
+  // A link's code is for its own server: pointed at another, the form forgets it
+  // rather than hand it over
+  let codeIsFor = $state<{ host: string; port: number } | null>(null);
+  $effect(() => {
+    if (codeIsFor && (host !== codeIsFor.host || port !== codeIsFor.port)) {
+      codeIsFor = null;
+      signupInvite = "";
+    }
   });
 
   $effect(() => {
@@ -618,7 +654,7 @@
           />
         </div>
         <div class="field">
-          <label for="signup-invite">Invite code (if the server asks for one)</label>
+          <label for="signup-invite">Invite code or link's code (if the server asks for one)</label>
           <input id="signup-invite" type="text" bind:value={signupInvite} disabled={connecting} />
         </div>
         <p class="account-note">

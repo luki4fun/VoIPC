@@ -12,15 +12,16 @@ nobody checks, so a new one comes with its test.
 
 **1.x keeps:**
 - A relay admits a client exactly when their `PROTOCOL_VERSION` is equal (12 in 1.0, 13 in
-  1.3, 14 in 1.4, 15 in 1.5, 16 in 1.7, 17 in 1.8). The app version is informational only.
+  1.3, 14 in 1.4, 15 in 1.5, 16 in 1.7, 17 in 1.8, 18 in 1.9). The app version is informational only.
 - **Since 1.6, an app talks to relays from its own protocol down to `OLDEST_RELAY_PROTOCOL`**
-  (`crates/voipc-protocol/src/compat.rs`; 12 in 1.6 to 1.8), never fewer than three protocols back.
+  (`crates/voipc-protocol/src/compat.rs`; 12 in 1.6 to 1.9), never fewer than three protocols back.
   It asks with its own; a relay of an older protocol refuses with its own (below), and the app
   connects again speaking that one. It shows a banner there, and holds back what that relay's
   other apps could not read:
 
-  | Relay | What a 1.8 app does not offer there |
+  | Relay | What a 1.9 app does not offer there |
   |---|---|
+  | 1.8 (17) | channels made in the app, categories, a welcome channel, group colours and order, display names, profile pictures, a server's name and icon, invite links, `@everyone`, `@here` and `@&badge` |
   | 1.7 (16) | sign-in with a provider, linking one, and approving a new device from another |
   | 1.5, 1.6 (15) | users, groups, privileges and channel gates in the admin panel (and below); group badges are not shown |
   | 1.4 (14) | moving emotes between packs; its emote tokens use 1.4's 20 hex digits |

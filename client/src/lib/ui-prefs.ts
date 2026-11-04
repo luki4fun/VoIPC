@@ -105,6 +105,16 @@ export interface UiPrefs {
    */
   dm_timers: Record<string, number>;
   /**
+   * What a channel's messages may do to this person, by `"host:port/name"`: every
+   * message, only what is for them, or nothing. By name, as the channel's id
+   * moves between restarts. No entry follows the channel's size (`notify-rules.ts`).
+   */
+  channel_notify: Record<string, "all" | "mentions" | "nothing">;
+  /** Categories folded in the sidebar, by `"host:port"`. */
+  folded_categories: Record<string, number[]>;
+  /** Servers whose welcome channel, if any, was offered on this device. */
+  welcomed: string[];
+  /**
    * Servers (`"host:port"`) on which the user confirmed being 18 or older, so
    * their channels marked 18+ join and show without asking again.
    *
@@ -180,6 +190,9 @@ export function defaultUiPrefs(): UiPrefs {
     dm_previews: false,
     left_text_channels: {},
     dm_timers: {},
+    channel_notify: {},
+    folded_categories: {},
+    welcomed: [],
     nsfw_ok: [],
     play_media: null,
     show_stickers: true,
@@ -213,6 +226,26 @@ function leftTextChannels(raw: unknown): Record<string, string[]> {
 const DM_TIMER_MAX = 500;
 /** The same 30 days a message's own timer is bounded to (chat-rules.ts). */
 const DM_TIMER_MAX_SECS = 30 * 24 * 60 * 60;
+
+function foldedCategories(raw: unknown): Record<string, number[]> {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: Record<string, number[]> = {};
+  for (const [server, ids] of Object.entries(raw as Record<string, unknown>)) {
+    if (!Array.isArray(ids)) continue;
+    const list = ids.filter((i): i is number => Number.isInteger(i));
+    if (list.length > 0) out[server] = [...new Set(list)];
+  }
+  return out;
+}
+
+function channelNotify(raw: unknown): UiPrefs["channel_notify"] {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: UiPrefs["channel_notify"] = {};
+  for (const [channel, level] of Object.entries(raw as Record<string, unknown>)) {
+    if (level === "all" || level === "mentions" || level === "nothing") out[channel] = level;
+  }
+  return out;
+}
 
 function dmTimers(raw: unknown): Record<string, number> {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
@@ -348,6 +381,9 @@ export function sanitizeUiPrefs(raw: unknown): UiPrefs {
     dm_previews: bool(r.dm_previews, d.dm_previews),
     left_text_channels: leftTextChannels(r.left_text_channels),
     dm_timers: dmTimers(r.dm_timers),
+    channel_notify: channelNotify(r.channel_notify),
+    folded_categories: foldedCategories(r.folded_categories),
+    welcomed: nsfwOk(r.welcomed),
     nsfw_ok: nsfwOk(r.nsfw_ok),
     play_media: typeof r.play_media === "boolean" ? r.play_media : null,
     show_stickers: bool(r.show_stickers, d.show_stickers),

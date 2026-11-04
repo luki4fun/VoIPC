@@ -50,8 +50,18 @@ pub const KICK: &str = "voipc:kick";
 pub const BAN: &str = "voipc:ban";
 pub const BANS: &str = "voipc:bans";
 pub const CHANNELS: &str = "voipc:channels";
+pub const PROFILES: &str = "voipc:profiles";
+pub const MENTION_ALL: &str = "voipc:mention_all";
 pub const EMOTES: &str = "voipc:emotes";
 const APP_SCOPES: &[ScopeDef] = &[
+    ScopeDef {
+        name: MENTION_ALL,
+        description: "Call on everybody with @everyone, @here and a group's @&badge",
+    },
+    ScopeDef {
+        name: PROFILES,
+        description: "Clear display names and profile pictures of accounts holding no more",
+    },
     ScopeDef {
         name: KICK,
         description: "Kick people from the server and from any channel",
@@ -120,6 +130,8 @@ impl Powers {
 pub struct Standing {
     pub groups: Vec<String>,
     pub badges: Vec<String>,
+    /// All of them; `badges` is what a row shows. Told only to the account.
+    pub my_badges: Vec<String>,
 }
 
 /// `*`: every privilege. `allowed` never answers for it (a wildcard is no
@@ -188,7 +200,10 @@ macro_rules! db {
 mod admin;
 pub mod bans;
 pub mod gates;
+pub mod layout;
+pub mod links;
 pub mod log;
+pub mod profile;
 pub mod provider;
 
 /// What l4f calls back into.
@@ -234,6 +249,8 @@ pub struct Relay {
     pending: Arc<Semaphore>,
     pending_by_address: Arc<DashMap<String, usize>>,
     pow_key: Vec<u8>,
+    /// One sign-up with a link at a time, from the gate's peek to its commit.
+    link_lock: tokio::sync::Mutex<()>,
     /// What address bans are hashed with (`crate::bans`).
     ban_key: Vec<u8>,
     /// Recovery-key resets per address (`ConnLimits` key): each fetches a
@@ -339,6 +356,7 @@ impl Relay {
             pending: Arc::new(Semaphore::new(PENDING_SIGN_INS)),
             pending_by_address: Arc::default(),
             pow_key,
+            link_lock: tokio::sync::Mutex::new(()),
             ban_key,
             resets: DashMap::new(),
             providers: provider::Flows::default(),
@@ -527,17 +545,16 @@ impl Relay {
     /// The account's `Standing`: one read of its roles.
     pub async fn standing(&self, user: &User, scopes: &[String]) -> Result<Standing> {
         let mut standing = Standing::default();
-        for role in self.store().user_roles(user.id).await? {
-            if !scope::covers(scopes, &role.scopes) {
-                continue;
-            }
-            if let Some(b) = role.badge.filter(|b| !b.is_empty()) {
-                if standing.badges.len() < voipc_protocol::types::MAX_BADGES {
-                    standing.badges.push(b);
-                }
-            }
-            standing.groups.push(role.name);
-        }
+        let roles = self.store().user_roles(user.id).await?;
+        let counted: Vec<_> = roles
+            .iter()
+            .filter(|r| scope::covers(scopes, &r.scopes))
+            .collect();
+        standing.groups = counted.iter().map(|r| r.name.clone()).collect();
+        standing.my_badges = self.badges_in_order(counted).await?;
+        // The top ones, when there are more than a row shows
+        standing.badges = standing.my_badges.clone();
+        standing.badges.truncate(voipc_protocol::types::MAX_BADGES);
         Ok(standing)
     }
 
@@ -654,7 +671,7 @@ async fn ensure_moderator(store: &Store) -> Result<()> {
 }
 
 /// l4f's settings as a relay needs them.
-fn l4f_config(cfg: &AccountsConfig, relay_id: [u8; 16]) -> Config {
+pub(crate) fn l4f_config(cfg: &AccountsConfig, relay_id: [u8; 16]) -> Config {
     // The client solves the proof of work; there is no form to fill slowly.
     // People behind one address sign up together on a voice relay (a
     // household, a LAN party): more than l4f's two a day, still bounded.
@@ -662,6 +679,9 @@ fn l4f_config(cfg: &AccountsConfig, relay_id: [u8; 16]) -> Config {
         min_form_seconds: 0,
         max_accounts_per_ip_day: 20,
         max_accounts_per_hour: cfg.signups_per_hour as usize,
+        // Each sign-up is an attempt too, so never fewer of those: at l4f's 60 a
+        // move past that stops at "Too many attempts" whatever the setting says.
+        max_attempts_per_hour: (cfg.signups_per_hour as usize).max(60),
         ..Default::default()
     };
     Config {
@@ -684,6 +704,9 @@ fn l4f_config(cfg: &AccountsConfig, relay_id: [u8; 16]) -> Config {
             "guest".into(),
             "moderator".into(),
             "general".into(),
+            // What `@everyone` and `@here` mean
+            "everyone".into(),
+            "here".into(),
         ],
         storage_quota_bytes: i64::from(cfg.quota_mb) * 1024 * 1024,
         totp_issuer: "VoIPC".into(),
@@ -945,7 +968,15 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             if invite.is_none() && relay.registration != RegistrationMode::Open {
                 return Err("Making an account here needs an invite.".into());
             }
-            let pow = if invite.is_none() {
+            // A link is told from a code by its length. Many people use one, so
+            // unlike a code it does not stand in for the proof of work
+            let linked = invite.as_deref().filter(|c| links::is_link_code(c));
+            if let Some(code) = linked {
+                if !relay.link_usable(code).await.unwrap_or(false) {
+                    return Err(links::GONE.into());
+                }
+            }
+            let pow = if invite.is_none() || linked.is_some() {
                 let cfg = relay.accounts.host.config();
                 let ch = pow::issue(
                     &relay.pow_key,
@@ -994,39 +1025,43 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             }
             let pw = secret_text(&auth_secret)?;
             let _work = work()?;
-            let s = match &invite {
-                Some(code) => {
-                    let form = InviteForm {
-                        code,
-                        username: name,
-                        password: &pw,
-                        email: None,
-                        display_name: None,
-                    };
-                    relay.accounts.register_invite(&ctx, form).await
-                }
-                None => {
-                    // l4f takes an empty one as a browser without JavaScript;
-                    // every VoIPC client solves the puzzle.
-                    if altcha.is_empty() {
-                        return Err("The sign-up puzzle was not solved.".into());
+            let s = if let Some(code) = invite.as_deref().filter(|c| links::is_link_code(c)) {
+                links::register(relay, &ctx, code, name, &pw, &altcha, &ts).await?
+            } else {
+                match &invite {
+                    Some(code) => {
+                        let form = InviteForm {
+                            code,
+                            username: name,
+                            password: &pw,
+                            email: None,
+                            display_name: None,
+                        };
+                        relay.accounts.register_invite(&ctx, form).await
                     }
-                    let proof = pow::Proof {
-                        altcha: &altcha,
-                        ts: &ts,
-                        ..Default::default()
-                    };
-                    let form = RegisterForm {
-                        username: name,
-                        password: &pw,
-                        email: None,
-                        display_name: None,
-                        proof,
-                    };
-                    relay.accounts.register(&ctx, form).await
+                    None => {
+                        // l4f takes an empty one as a browser without JavaScript;
+                        // every VoIPC client solves the puzzle.
+                        if altcha.is_empty() {
+                            return Err("The sign-up puzzle was not solved.".into());
+                        }
+                        let proof = pow::Proof {
+                            altcha: &altcha,
+                            ts: &ts,
+                            ..Default::default()
+                        };
+                        let form = RegisterForm {
+                            username: name,
+                            password: &pw,
+                            email: None,
+                            display_name: None,
+                            proof,
+                        };
+                        relay.accounts.register(&ctx, form).await
+                    }
                 }
-            }
-            .map_err(|e| e.message().to_string())?;
+                .map_err(|e| e.message().to_string())?
+            };
             for b in &vault {
                 // Anything but a write (over quota, a conflict) is a failure
                 // too: an account without its vault cannot be opened on
@@ -2052,6 +2087,12 @@ pub async fn handle_request(
         AccountRequest::Admin { op, code } => {
             admin::handle(state, &relay, session_id, &user, &ctx, op, code).await?
         }
+        AccountRequest::ProfileSet { name } => {
+            profile::set_name(state, &relay, session_id, &user, name).await?
+        }
+        AccountRequest::ProfilePictureSet { image } => {
+            profile::set_picture(state, &relay, session_id, &user, image).await?
+        }
     };
     crate::session::send_msg(tx, &reply(out))
 }
@@ -2137,7 +2178,9 @@ pub async fn locked_logs_at_boot(state: &ServerState) -> Result<()> {
         let channels = state.channels.read().await;
         channels
             .values()
-            .filter(|c| c.persistent && !c.log_conv.is_empty())
+            // One made in the app changes its password only while running, where
+            // `locked_log` has already done this: its fingerprint is never written.
+            .filter(|c| c.persistent && !c.kept && !c.log_conv.is_empty())
             .map(|c| {
                 (
                     c.log_conv.clone(),
@@ -2232,11 +2275,24 @@ pub async fn refresh(
     session_id: u32,
     user: AccountId,
 ) -> Result<()> {
+    let read = scope_read(state, session_id);
     let Some(user) = relay.store().user_by_id(user).await? else {
         return Ok(());
     };
     let scopes = relay.accounts.effective_scopes(&user).await?;
-    apply_scopes(state, relay, session_id, user, scopes).await
+    apply_scopes(state, relay, session_id, user, scopes, read).await
+}
+
+/// A read of an account's scopes is about to start. Between it and the write there
+/// are more reads, and two at once on one session must not finish in the wrong
+/// order: a grant would be undone by the older answer until the next pass of
+/// `revalidate`. So a read older than the last one written is dropped. Whatever
+/// changed a role starts a read after changing it, so that one has seen the change.
+pub(crate) fn scope_read(state: &ServerState, session_id: u32) -> u64 {
+    state.sessions.get_mut(&session_id).map_or(0, |mut s| {
+        s.scope_read += 1;
+        s.scope_read
+    })
 }
 
 /// Every signed-in connection against the database, each
@@ -2263,6 +2319,7 @@ pub async fn revalidate(state: &Arc<ServerState>) {
         })
         .collect();
     for (session_id, token, scopes, needs_2fa, standing) in live {
+        let read = scope_read(state, session_id);
         match relay.accounts.session_from_token(&token, util::now()).await {
             Ok(None) => {
                 // The token may have been rotated while this pass ran (turning
@@ -2296,7 +2353,7 @@ pub async fn revalidate(state: &Arc<ServerState>) {
                         .await
                         .is_ok_and(|s| s != standing);
                 if changed {
-                    if let Err(e) = apply_scopes(state, &relay, session_id, user, now).await {
+                    if let Err(e) = apply_scopes(state, &relay, session_id, user, now, read).await {
                         warn!("a change from the server's shell: {e}");
                     }
                 }
@@ -2309,20 +2366,82 @@ pub async fn revalidate(state: &Arc<ServerState>) {
 /// The session's powers as `scopes` say, and the account told. A change of
 /// groups reaches what they see and where they may be (`gates`), one of
 /// badges or privileges the rosters showing them.
-async fn apply_scopes(
+/// Holds power over others, which spares it from a kick and an address ban. Calling
+/// on everybody is none.
+pub fn holds_power(scopes: &[String]) -> bool {
+    scopes.iter().any(|s| s != MENTION_ALL)
+}
+
+/// Whether this session's account may call on everybody.
+pub fn holds_mention_power(s: &crate::state::UserSession) -> bool {
+    s.account
+        .as_ref()
+        .is_some_and(|a| scope::allowed(&a.scopes, MENTION_ALL))
+}
+
+/// A client that just connected: who may call on everybody, its own badges, and
+/// to everybody else, itself if it may.
+pub async fn mention_power_at_connect(
+    state: &ServerState,
+    session_id: u32,
+    user_id: u32,
+    tx: &crate::control::ControlTx,
+) {
+    let holders: Vec<u32> = state
+        .sessions
+        .iter()
+        .filter(|s| holds_mention_power(s))
+        .map(|s| s.user_id)
+        .collect();
+    if holders.contains(&user_id) {
+        if let Ok(data) = encode_server_msg(&ServerMessage::MentionPower {
+            user_ids: vec![user_id],
+            on: true,
+        }) {
+            state.broadcast_raw_to_all(&data).await;
+        }
+    }
+    if !holders.is_empty() {
+        let _ = crate::session::send_msg(
+            tx,
+            &ServerMessage::MentionPower {
+                user_ids: holders,
+                on: true,
+            },
+        );
+    }
+    let badges = state.sessions.get(&session_id).and_then(|s| {
+        s.account
+            .as_ref()
+            .map(|a| a.standing.my_badges.clone())
+            .filter(|b| !b.is_empty())
+    });
+    if let Some(badges) = badges {
+        let _ = crate::session::send_msg(tx, &ServerMessage::MyBadges { badges });
+    }
+}
+
+pub(crate) async fn apply_scopes(
     state: &Arc<ServerState>,
     relay: &Relay,
     session_id: u32,
     user: User,
     scopes: Vec<String>,
+    read: u64,
 ) -> Result<()> {
     let info = relay.info_of(&user, &scopes).await?;
     let standing = relay.standing(&user, &scopes).await?;
+    let (my_badges, calls, called_before, editor_changed);
     let (tx, user_id, channel_id, is_admin, became_admin, regated, shown) = {
         let Some(mut s) = state.sessions.get_mut(&session_id) else {
             return Ok(());
         };
+        if read < s.scope_written {
+            return Ok(());
+        }
+        s.scope_written = read;
         let (was_admin, was_editor) = (s.is_admin, s.powers.has(Powers::CHANNELS));
+        let could_call = holds_mention_power(&s);
         s.set_scopes(user, scopes);
         let mut old = Standing::default();
         if let Some(a) = s.account.as_mut() {
@@ -2330,6 +2449,12 @@ async fn apply_scopes(
             old = std::mem::replace(&mut a.standing, standing);
         }
         let new = s.account.as_ref().map(|a| &a.standing);
+        my_badges = new
+            .filter(|n| n.my_badges != old.my_badges)
+            .map(|n| n.my_badges.clone());
+        calls = holds_mention_power(&s);
+        called_before = could_call;
+        editor_changed = s.powers.has(Powers::CHANNELS) != was_editor;
         (
             s.control_tx.clone(),
             s.user_id,
@@ -2342,12 +2467,26 @@ async fn apply_scopes(
         )
     };
     crate::session::send_msg(&tx, &ServerMessage::Account(AccountReply::Info(info)))?;
+    if let Some(badges) = my_badges {
+        crate::session::send_msg(&tx, &ServerMessage::MyBadges { badges })?;
+    }
+    if calls != called_before {
+        let data = encode_server_msg(&ServerMessage::MentionPower {
+            user_ids: vec![user_id],
+            on: calls,
+        })?;
+        state.broadcast_raw_to_all(&data).await;
+    }
     if became_admin {
         let data = encode_server_msg(&ServerMessage::AdminStatus { user_id, is_admin })?;
         state.broadcast_raw_to_all(&data).await;
     }
     if regated {
         crate::gates::standing_changed(state, session_id).await;
+    }
+    // Who manages channels also sees the empty categories
+    if editor_changed {
+        crate::layout::send(state, session_id).await;
     }
     if shown {
         let info = crate::session::user_info_for(state, user_id, session_id, channel_id);

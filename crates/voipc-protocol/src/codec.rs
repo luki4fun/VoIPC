@@ -82,10 +82,12 @@ pub const CONTROL_MSGS_PER_SEC: u32 = 50;
 ///      AccountRequest::ProviderList/ProviderStart/ProviderUnlink/PairNonce/
 ///      PairApprove/PairDecline, AccountReply::Providers/ProviderBrowser/
 ///      ProviderDone/ProviderUnlinked/PairAsked/PairRevealed/PairEnded
+/// v18: community basics — AdminOp::ChannelSave/ChannelDelete/CategorySave/
+///      CategoryDelete/LayoutSet/WelcomeSet, AdminReply::ChannelDone, ChannelLayout
 ///
 /// A relay admits only its own protocol; an app speaks its own down to
 /// `compat::OLDEST_RELAY_PROTOCOL` (1.6).
-pub const PROTOCOL_VERSION: u32 = 17;
+pub const PROTOCOL_VERSION: u32 = 18;
 
 /// Application version, read from Cargo.toml at compile time.
 /// Single source of truth: workspace root `Cargo.toml` `[workspace.package] version`.

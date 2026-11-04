@@ -25,6 +25,17 @@ export function newRecoveryKey(p: number | null): boolean {
   return p === null || p >= 13;
 }
 
+/** Users, groups and channel gates in the admin panel (protocol 16). */
+export function adminOps(p: number | null): boolean {
+  return p === null || p >= 16;
+}
+
+/** What 1.9 brought (protocol 18): channels made in the app, categories, a welcome
+ *  channel, group colours, display names and pictures, a server's name, invite links. */
+export function community(p: number | null): boolean {
+  return p === null || p >= 18;
+}
+
 /** What the banner names as off on a relay of protocol `p`. */
 export function missing(p: number | null): string[] {
   if (p === null) return [];
@@ -33,6 +44,9 @@ export function missing(p: number | null): string[] {
   if (p < 14) off.push("emotes");
   if (p < 13) off.push("edits, reactions, pins, forwards", "a new recovery key");
   if (p === 14) off.push("moving emotes between packs");
+  if (p < 16) off.push("users, groups and channel gates");
+  if (p < 17) off.push("sign-in with a provider");
+  if (p < 18) off.push("channels made in the app, display names and pictures, invite links, @everyone");
   return off;
 }
 

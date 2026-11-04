@@ -32,6 +32,13 @@ pub struct ServerSettings {
     /// list, no names, no kick, no bans.
     #[serde(default)]
     pub game_token: Option<String>,
+
+    /// What this server calls itself, on a relay without accounts. On one with
+    /// them an admin sets it in the app, and that goes first.
+    #[serde(default)]
+    pub server_name: Option<String>,
+    #[serde(default)]
+    pub server_description: Option<String>,
 }
 
 fn default_empty_channel_timeout() -> u64 {
@@ -55,6 +62,8 @@ impl Default for ServerSettings {
             max_channel_name_len: default_max_channel_name_len(),
             proximity_enabled: default_proximity_enabled(),
             game_token: None,
+            server_name: None,
+            server_description: None,
         }
     }
 }

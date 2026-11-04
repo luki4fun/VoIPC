@@ -420,6 +420,30 @@ pub async fn request_channel_users(
     .await
 }
 
+/// Display names and pictures of these accounts (`ServerMessage::Profiles`).
+#[tauri::command]
+pub async fn profiles_get(
+    state: State<'_, AppState>,
+    server: String,
+    accounts: Vec<[u8; 16]>,
+) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
+    network::send_tcp_message(&connection.tcp_tx, &ClientMessage::ProfilesGet { accounts }).await
+}
+
+/// A profile picture's file (`ServerMessage::ProfilePicture`), for the sanitizer.
+#[tauri::command]
+pub async fn profile_picture_get(
+    state: State<'_, AppState>,
+    server: String,
+    hash: [u8; 32],
+) -> Result<(), String> {
+    let conns = state.connections.read().await;
+    let connection = conn(&conns, &server)?;
+    network::send_tcp_message(&connection.tcp_tx, &ClientMessage::ProfilePictureGet { hash }).await
+}
+
 /// Invite a user to your channel (creator only).
 #[tauri::command]
 pub async fn send_invite(

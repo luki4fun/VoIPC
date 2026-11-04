@@ -133,6 +133,7 @@ WantedBy=multi-user.target
 - **Sign-in with a provider** (`public_url`, `VOIPC_OAUTH_<PROVIDER>_ID` and `_SECRET`) needs a public
   certificate on this port. Apps that pinned the old self-signed one accept it, since the public CAs do, and
   go on doing so at each renewal. `signups_per_hour` (60) bounds new accounts: raise it for a move.
+- **In the app** (*Server admin*): channels and categories, the server's name and icon, invite links.
 
 ## 7. Backups
 
@@ -276,6 +277,16 @@ Measured with `community_load` (below) on one relay and one 32-thread machine wi
 | 500 | 2 | 0.2 | 145 | 0 | 3 | all | 97 |
 | 1000 | 2 | 0.8 | 426 | 0 | 8 | all | 198 |
 | 2000 | 2 | 3.4 | 1990 | 0 | 12 | all | 532 |
+
+On a relay with accounts (1.9), where each connection also reads the groups' colours, the server's name
+and who may call on everybody:
+
+| Clients | Cores | Join, s | Join p95, ms | Short rosters | Chat p95, ms | Delivered | Relay MiB |
+|---|---|---|---|---|---|---|---|
+| 500 | all | 0.2 | 84 | 0 | 3 | all | 114 |
+| 1000 | all | 0.6 | 269 | 0 | 5 | all | 246 |
+| 2000 | all | 3.2 | 1595 | 0 | 10 | all | 561 |
+| 2000 | 2 | 3.0 | 2022 | 0 | 24 | all | 739 |
 
 So the relay itself carries 2000 connections. What a connection may have waiting is bounded at 16 MiB
 of messages. Past that its client has stopped reading, and the relay ends the connection (the log says so)
@@ -453,9 +464,13 @@ Runtime settings in `server_settings.json`:
   "max_channels": 50,
   "max_channel_name_len": 32,
   "proximity_enabled": true,
-  "game_token": null
+  "game_token": null,
+  "server_name": null,
+  "server_description": null
 }
 ```
+
+`server_name` and `server_description` are what the server calls itself on a relay without accounts (on one with them, an admin sets these in the app, which goes first). Shown above the address, never instead of it. A name over 32 characters or shaped like an address reads as none.
 
 `proximity_enabled: false` switches proximity chat off for the whole server: every channel is served as non-positional, requests to enable it are refused, and position beacons are not relayed.
 

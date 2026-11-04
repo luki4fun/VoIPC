@@ -8,6 +8,8 @@
   import {
     adminGroups,
     adminInvites,
+    adminInviteLinks,
+    inviteLinkCode,
     adminOp,
     adminUser,
     adminUsers,
@@ -18,6 +20,10 @@
   import { relayAccounts } from "../stores/account.js";
   import { can } from "../stores/powers.js";
   import { confirmAction } from "../stores/confirm.js";
+  import { olderRelay } from "../stores/relay.js";
+  import { serverAddress } from "../stores/scoped.js";
+  import { community } from "../relay-rules.js";
+  import { buildJoinLink, splitAddress } from "../invite.js";
   import { addNotification } from "../stores/notifications.js";
   import Icon from "./Icons.svelte";
   import type { AdminUser } from "../types.js";
@@ -114,6 +120,25 @@
   /** Every group but `user`, which every account is in. */
   const groups = $derived(($adminGroups ?? []).filter((g) => g.name !== "user"));
   const closed = $derived($relayAccounts?.registration === "Closed");
+
+  /** How a new link is made. Its group holds no privileges: the relay checks. */
+  let linkUses = $state(1000);
+  let linkDays = $state(30);
+  let linkGroup = $state<string | null>(null);
+  const showsLinks = $derived(community($olderRelay?.protocol ?? null) && !closed);
+  const startGroups = $derived(groups.filter((g) => g.scopes.length === 0));
+  const linkShown = $derived.by(() => {
+    const at = splitAddress($serverAddress);
+    return $inviteLinkCode && at ? buildJoinLink(at.host, at.port, $inviteLinkCode) : null;
+  });
+
+  $effect(() => {
+    if (showsLinks && $can("users:admin")) void adminOp("InviteLinks");
+  });
+  // A new code also changes the list
+  $effect(() => {
+    if ($inviteLinkCode) void adminOp("InviteLinks");
+  });
 </script>
 
 {#if $adminUser}
@@ -277,6 +302,64 @@
         </ul>
       {/if}
     </section>
+    {#if showsLinks}
+      <section class="section">
+        <div class="section-title">Invite links</div>
+        <p class="admin-hint">
+          One link for many people, for a post or a website. Each sign-up with it still solves the proof of work and counts against the sign-up limits. Revoke it the moment it leaks.
+        </p>
+        <form class="inline-form" onsubmit={(e) => { e.preventDefault(); void adminOp({ InviteLinkNew: { max_uses: linkUses, days: linkDays, group: linkGroup } }); }}>
+          <select class="admin-select" aria-label="How many people" bind:value={linkUses}>
+            <option value={10}>10 people</option>
+            <option value={100}>100 people</option>
+            <option value={1000}>1,000 people</option>
+            <option value={100000}>100,000 people</option>
+          </select>
+          <select class="admin-select" aria-label="Link valid for" bind:value={linkDays}>
+            <option value={1}>1 day</option>
+            <option value={7}>7 days</option>
+            <option value={30}>30 days</option>
+            <option value={365}>A year</option>
+            <option value={0}>Until revoked</option>
+          </select>
+          <select class="admin-select" aria-label="Starting group" bind:value={linkGroup}>
+            <option value={null}>No starting group</option>
+            {#each startGroups as g (g.name)}
+              <option value={g.name}>{g.name}</option>
+            {/each}
+          </select>
+          <button type="submit" class="btn btn-secondary">Make link</button>
+        </form>
+        {#if linkShown}
+          {@const link = linkShown}
+          <div class="code-box" role="status">
+            <span class="admin-hint">New invite link, shown once:</span>
+            <code class="code">{link}</code>
+            <div class="form-actions">
+              <button type="button" class="btn btn-ghost" onclick={() => clearShown(inviteLinkCode)}>Done</button>
+              <button type="button" class="btn btn-secondary" onclick={() => copyCode(link)}>
+                <Icon name="copy" size={16} /> Copy
+              </button>
+            </div>
+          </div>
+        {/if}
+        {#if $adminInviteLinks?.length}
+          <ul class="list">
+            {#each $adminInviteLinks as link (link.id)}
+              <li class="list-item">
+                <span class="row-text">
+                  <span class="row-name">{link.uses} of {link.max_uses} used</span>
+                  <span class="row-meta">
+                    {link.expires_at ? `until ${when(link.expires_at)}` : "until revoked"}{link.group ? ` · starts in ${link.group}` : ""}
+                  </span>
+                </span>
+                <button type="button" class="btn btn-secondary" onclick={() => adminOp({ InviteLinkRevoke: { id: link.id } })}>Revoke</button>
+              </li>
+            {/each}
+          </ul>
+        {/if}
+      </section>
+    {/if}
   {/if}
 {/if}
 

@@ -39,6 +39,12 @@
     watchUser,
   } from "../stores/user-menu.js";
   import Icon from "./Icons.svelte";
+  import MemberName from "./MemberName.svelte";
+  import { adminOp } from "../stores/admin-ops.js";
+  import { account } from "../stores/account.js";
+  import { olderRelay } from "../stores/relay.js";
+  import { community } from "../relay-rules.js";
+  import { confirmAction } from "../stores/confirm.js";
   import { splitName, shortName } from "../username.js";
   import { invoke } from "@tauri-apps/api/core";
   import { account as ownAccount, showPrompt } from "../stores/account.js";
@@ -99,6 +105,19 @@
       confirmAdminAction();
     }
   }
+
+  /** Cleared, the person may pick another: there is nothing to take back. */
+  async function clearProfile(id: number[]) {
+    // The server on screen now: the view may move while the question is up
+    const server = $serverAddress;
+    const yes = await confirmAction({
+      title: "Clear this person's display name and picture?",
+      body: "They can pick others.",
+      confirm: "Clear them",
+      danger: true,
+    });
+    if (yes) void adminOp({ ProfileReset: { id, name: true, picture: true } }, null, server);
+  }
 </script>
 
 <svelte:window onkeydown={menu ? handleContextMenuKeydown : undefined} />
@@ -114,7 +133,7 @@
       use:menuAction={{ onclose: closeUserMenu, label: shortName(menu.user.username) }}
     >
       <!-- Who exactly: the one place a name's tag is spelled out -->
-      <div class="ctx-title">{who.name}{#if who.tag}<span class="ctx-tag">#{who.tag}</span>{/if}</div>
+      <div class="ctx-title"><MemberName username={menu.user.username} account={menu.user.account} />{#if who.tag}<span class="ctx-tag">#{who.tag}</span>{/if}</div>
       <div class="ctx-separator"></div>
       <!-- Watching, the mixer and the volume are the call's, so only for
            somebody on the server carrying it: an id on another server is a
@@ -165,6 +184,12 @@
         <button class="ctx-item danger" onclick={() => { void kickUser(menu.user.user_id, shortName(menu.user.username)); closeUserMenu(); }}>
           <Icon name="kick" size={16} />
           <span>Kick from channel</span>
+        </button>
+      {/if}
+      {#if $can("voipc:profiles") && $account && community($olderRelay?.protocol ?? null) && menu.user.account && !spared}
+        <button class="ctx-item danger" onclick={() => { const id = menu.user.account!; closeUserMenu(); void clearProfile(id); }}>
+          <Icon name="close" size={16} />
+          <span>Clear display name and picture</span>
         </button>
       {/if}
       {#if ($can("voipc:kick") || $can("voipc:ban")) && !spared}

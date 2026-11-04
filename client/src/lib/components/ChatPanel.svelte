@@ -34,6 +34,9 @@
   import type { ChatEvent, ChatMessage, FileConv, FileRef, Forwarded } from "../types.js";
   import { fetchFile, fileLimits, sendFile } from "../files.js";
   import { linkFacts, mentionNames as mentionNamesOf, plainText } from "../markdown.js";
+  import { powerTokens } from "../mention-rules.js";
+  import { community } from "../relay-rules.js";
+  import { groupStyles } from "../stores/channels.js";
   import { rosterOf } from "../roster-rules.js";
   import { awayHint, liveIdOf, reach, writeToId } from "../dm-rules.js";
   import { prepare } from "../image-prep.js";
@@ -315,7 +318,16 @@
       : mentionNamesOf([...mentionable, $username]).filter((n) => n === $username || n === shortName($username)),
   );
   /** Who the message box offers after an `@`: everybody but us. */
-  const mentionOthers = $derived(mentionable.filter((n) => n !== $username));
+  // Once each: an account from before `here` was reserved would otherwise be offered
+  // twice, and a keyed list stops the page at a repeat
+  const mentionOthers = $derived([
+    ...new Set([
+      ...mentionable.filter((n) => n !== $username),
+      ...(!isDmMode && !anonymousHere && $can("voipc:mention_all") && community($olderRelay?.protocol ?? null)
+        ? powerTokens($groupStyles)
+        : []),
+    ]),
+  ]);
 
   // ── Search ───────────────────────────────────────────────────────────────
 

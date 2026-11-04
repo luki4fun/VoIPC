@@ -382,6 +382,8 @@ pub fn run() {
             commands::set_channel_password,
             commands::kick_user,
             commands::request_channel_users,
+            commands::profiles_get,
+            commands::profile_picture_get,
             commands::send_invite,
             commands::send_poke,
             commands::accept_invite,

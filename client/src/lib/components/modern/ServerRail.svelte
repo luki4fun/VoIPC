@@ -17,6 +17,8 @@
   import { forgetEmotes } from "../../stores/emotes.js";
   import { connectTo, disconnectServer, serverEntries, serverId } from "../../connect.js";
   import { playDisconnectedSound } from "../../sounds.js";
+  import { pictureKey, pictures, serverProfile } from "../../stores/profiles.js";
+  import { cleanServerName } from "../../profile-rules.js";
   import Icon from "../Icons.svelte";
   import { menu as menuAction } from "../../actions/menu.js";
 
@@ -58,8 +60,25 @@
    *  two are told apart by their address, and their badges by colour. */
   const twin = (entry: ServerEntry) => $serverEntries.some((o) => o.id !== entry.id && o.name === entry.name);
 
+  const relayProfiles = serverProfile.all();
+  /** What the server calls itself, unless that would pass for one of the others. */
+  function relayNameOf(entry: ServerEntry): string | null {
+    const others = $serverEntries.filter((o) => o.id !== entry.id).flatMap((o) => [o.name, o.host]);
+    return cleanServerName($relayProfiles.get(entry.id)?.name, others);
+  }
+  function iconOf(entry: ServerEntry): string | null {
+    const icon = $relayProfiles.get(entry.id)?.icon;
+    return icon ? ($pictures.get(pictureKey(entry.id, icon)) ?? null) : null;
+  }
+
   function stateLabel(entry: ServerEntry): string {
+    const relayName = relayNameOf(entry);
+    if (relayName) return `${relayName} (${entry.host}:${entry.port}) — ${entry.open ? stateOf(entry) : "connect"}`;
     if (!entry.open) return `${entry.name} (${entry.host}:${entry.port}) — connect`;
+    return `${twin(entry) ? `${entry.name} (${entry.host}:${entry.port})` : entry.name} — ${stateOf(entry)}`;
+  }
+
+  function stateOf(entry: ServerEntry): string {
     const state =
       entry.state === "connecting"
         ? "connecting…"
@@ -68,7 +87,7 @@
           : entry.inVoice
             ? "connected, in voice"
             : "connected";
-    return `${twin(entry) ? `${entry.name} (${entry.host}:${entry.port})` : entry.name} — ${state}`;
+    return state;
   }
 
   // ── Context menu ──
@@ -140,7 +159,9 @@
       aria-current={entry.active ? "true" : undefined}
     >
       <span class="pill" class:show={entry.active || entry.unread > 0}></span>
-      <span class="badge" style={avatarStyle(twin(entry) ? entry.id : entry.name)}>{initials(entry.name)}</span>
+      <span class="badge" style={avatarStyle(twin(entry) ? entry.id : entry.name)}
+        >{initials(entry.name)}{#if iconOf(entry)}<img class="badge-icon" src={iconOf(entry)} alt="" />{/if}</span
+      >
       {#if entry.state === "connecting" || entry.state === "reconnecting"}
         <span class="rail-state" title={entry.state === "connecting" ? "Connecting" : "Reconnecting"}
           >…</span
@@ -244,6 +265,7 @@
   }
 
   .badge {
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -259,6 +281,15 @@
   .rail-item:hover .badge,
   .rail-item.active .badge {
     border-radius: 14px;
+  }
+
+  .badge-icon {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    border-radius: inherit;
   }
 
   .rail-item:not(.active) .badge {

@@ -25,7 +25,7 @@
   } from "../stores/chat.js";
   import { channels, currentChannelId } from "../stores/channels.js";
   import { shareChannelHistory } from "../stores/settings.js";
-  import { channelRosters } from "../stores/rosters.js";
+  import { channelRosters, currentRosterOf } from "../stores/rosters.js";
   import { users } from "../stores/users.js";
   import { isWeb } from "../stores/platform.js";
   import { chatEvent, expiryFor } from "../chat-rules.js";
@@ -33,7 +33,10 @@
   import { dmMessageTtl, managesChannel } from "../stores/channel-ui.js";
   import { userId } from "../stores/connection.js";
   import { addNotification } from "../stores/notifications.js";
-  import { newRecoveryKey } from "../relay-rules.js";
+  import { community, newRecoveryKey } from "../relay-rules.js";
+  import { makeProfilePicture } from "../image-prep.js";
+  import { askProfile, profiles, setDisplayName, setProfilePicture } from "../stores/profiles.js";
+  import { shortName } from "../username.js";
   import { olderRelay } from "../stores/relay.js";
   import type { AccountInfo, RelayAccounts } from "../types.js";
 
@@ -260,12 +263,13 @@
         const self = get(userId.peek(server));
         const writer = t.from_me ? accountHex(me.info.id) : t.account;
         // Theirs only where the name is theirs: the relay's name for an account
+        const ch = get(channels.peek(server)).find((c) => c.log === t.conv);
+        const people = [...(ch ? currentRosterOf(server, ch.channel_id) : []), ...get(users.peek(server))];
         const online = t.from_me
           ? undefined
-          : get(users.peek(server)).find((u) => u.username === t.name && !!u.account && accountHex(u.account) === t.account);
+          : people.find((u) => u.username === t.name && !!u.account && accountHex(u.account) === t.account);
         const by = { user_id: t.from_me ? self : (online?.user_id ?? 0), username: t.from_me ? me.name : t.name, account: writer };
         const ev = { event, by, at: t.timestamp, content: t.content };
-        const ch = get(channels.peek(server)).find((c) => c.log === t.conv);
         if (ch) {
           const mayPin = event.kind === "pin" && (t.from_me || !!online) && managesChannel(server, ch.channel_id, by.user_id);
           applyChannelEvent(server, ch.name, ev, mayPin);
@@ -397,6 +401,34 @@
           addNotification(`${fromServer(server)}${body.reason}`, "warning");
         }
         break;
+    }
+  }
+
+  /** The account panel's fields, from what the relay last said about us. */
+  let displayName = $state("");
+  const ownProfile = $derived($account ? $profiles.get(accountHex($account.info.id)) : undefined);
+  const profilePicture = $derived(ownProfile?.picture ?? null);
+  $effect(() => {
+    const p = $accountPrompt;
+    const me = p?.kind === "account" ? get(account.peek(p.server)) : null;
+    if (p && me) askProfile(p.server, accountHex(me.info.id));
+  });
+  $effect(() => {
+    displayName = ownProfile?.name ?? "";
+  });
+
+  function saveDisplayName(server: string) {
+    setDisplayName(server, displayName.trim() || null).catch((e) => addNotification(String(e), "warning"));
+  }
+
+  async function pickPicture(server: string, input: HTMLInputElement) {
+    const file = input.files?.[0];
+    input.value = "";
+    if (!file) return;
+    try {
+      await setProfilePicture(server, await makeProfilePicture(new Uint8Array(await file.arrayBuffer())));
+    } catch (e) {
+      addNotification(`Could not use that picture: ${e instanceof Error ? e.message : e}`, "warning");
     }
   }
 
@@ -890,6 +922,27 @@
           · two-factor codes {$account.info.totp_enabled ? "on" : "off"}
         </p>
         <div class="rows">
+          {#if community(get(olderRelay.peek(p.server))?.protocol ?? null)}
+            <form class="row" onsubmit={(e) => { e.preventDefault(); saveDisplayName(p.server); }}>
+              <input
+                aria-label="Display name"
+                placeholder="Display name (beside @{shortName($account.name)})"
+                maxlength="32"
+                bind:value={displayName}
+              />
+              <button type="submit" class="secondary">Save</button>
+            </form>
+            <div class="row">
+              <span>Profile picture{#if profilePicture}: <strong>set</strong>{/if}. Anyone on this server can see it, and the server knows who fetched it.</span>
+              <label class="secondary file-pick">
+                Choose…
+                <input type="file" accept="image/*" hidden onchange={(e) => pickPicture(p.server, e.currentTarget)} />
+              </label>
+              {#if profilePicture}
+                <button type="button" class="secondary" onclick={() => setProfilePicture(p.server, null).catch((e) => addNotification(String(e), "warning"))}>Remove</button>
+              {/if}
+            </div>
+          {/if}
           <div class="row">
             <span>Messages kept on this server: <strong>{$account.cloud ? "yes" : "no"}</strong></span>
             <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); askCloud(server); }}>Change</button>

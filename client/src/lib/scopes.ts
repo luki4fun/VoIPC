@@ -45,6 +45,8 @@ export const PRIVILEGES: readonly { scope: string; label: string; hint: string }
   { scope: "voipc:ban", label: "Ban", hint: "Ban people, by address and account" },
   { scope: "voipc:bans", label: "Ban list", hint: "See the ban list, lift bans, ban an account by name" },
   { scope: "voipc:channels", label: "Channels", hint: "Change the settings and gates of the channels they can see; post in announcement channels" },
+  { scope: "voipc:profiles", label: "Profiles", hint: "Clear the display name and picture of someone holding no more than they do" },
+  { scope: "voipc:mention_all", label: "Call on everybody", hint: "Use @everyone, @here and a group's @&badge" },
   { scope: "voipc:emotes", label: "Emotes", hint: "Add, rename and remove the server's emotes and stickers" },
   { scope: "users:read", label: "See accounts", hint: "The account list, an account's groups and history" },
   { scope: "users:admin", label: "Manage accounts", hint: "Give and take groups, reset two-factor codes, make invites" },

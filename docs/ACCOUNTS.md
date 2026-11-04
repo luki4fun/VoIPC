@@ -67,6 +67,16 @@ token.
   mode `admin invite` refuses to print a code without `--for`. Codes printed
   before the switch to `closed` stay valid until they expire.
 
+**Invite links** (*Server admin → Users → Invite links*, for `users:admin`) let many
+people in with one link, for a post or a website: with a limit of people, an expiry
+if you want one, and optionally a group they start in. A link is public by nature,
+so each sign-up still solves the proof of work and counts against the sign-up limits,
+and it is shown once and revocable. Its starting group must hold no privileges, then
+and at each use: give that group power later and the link stops handing it out. On
+`closed` there are none. A link works for sign-up with a password. Someone new signing
+in through a provider gets no starting group, and on `invite` is offered no sign-up:
+they make the account with the link, then link the provider.
+
 ## Groups, privileges and two-factor codes
 
 A **group** is a set of accounts with a name, an optional badge shown next to their
@@ -84,7 +94,9 @@ server menu → *Server admin* → *Users* and *Groups*.
 | Emotes (`voipc:emotes`) | add, rename and remove the server's emotes and stickers |
 | See accounts (`users:read`) | see the account list, an account's groups and its history, and who is in a group |
 | Manage accounts (`users:admin`) | give and take groups, reset two-factor codes, make and revoke invites |
-| Manage groups (`roles:admin`) | make, change and delete groups |
+| Manage groups (`roles:admin`) | make, change and delete groups; a group's colour and its place in the order |
+| Profiles (`voipc:profiles`) | clear the display name and picture of someone holding no more than they do |
+| Call on everybody (`voipc:mention_all`) | use `@everyone`, `@here` and a group's `@&badge`. Spares nobody from a kick |
 
 Two groups are built in: **admin** (everything) and **user** (every account, no
 privileges). The server also makes a **moderator** group (badge *mod*: kick, ban,
@@ -108,6 +120,13 @@ granted.
   that holds any privilege; in a channel they made, a creator still kicks.
 - An account's history in the app lists what was done to its access, by whom and
   when: groups, codes, passwords, devices, invites. It never shows an address.
+
+**A group's colour and order** decide how its badge looks and where its people stand
+in the member list: under their top group, top groups first. A row shows its top
+three badges. Holding `roles:admin`, you can recolour only groups you could have made,
+and a group you could not stays exactly where it is in the order, with nothing moving
+past it. **A badge is public**: everyone on the server is told every badge, guests too,
+whoever holds it. What the group behind it is called is not.
 
 ## Channel gates
 
@@ -247,6 +266,14 @@ counts at once.
   While the conversation runs on another key than the one pinned, there is no
   number to compare: reconnect to them first.
 
+### Display names and pictures
+
+In the account panel you can set a display name and a picture. People see
+`Robert Example @bobby`: the chosen name beside the account's, never instead of it.
+A display name cannot hold an `@`, end in a `#tag`, or be (or look like) another
+account's name. In an anonymous channel, or one hiding its members, people see
+neither. Holders of `voipc:profiles` who hold no less than you can clear them, and you can pick others.
+
 ## Signing in with Discord, Google or Facebook
 
 Optional, and only where the relay has a web address with a certificate browsers accept, because the
@@ -309,6 +336,8 @@ is what can.
 From accounts:
 
 - account names
+- your display name and profile picture, which it can read and hands to anyone who
+  asks, guests too. It also sees whose picture each person fetches
 - for a linked provider, the provider's id for you and the name it gives. Never your email, and no provider
   token is kept
 - an Argon2id hash of a secret derived from each password
@@ -366,6 +395,11 @@ in [THREAT-MODEL.md](THREAT-MODEL.md)):
   the key over;
 - **keep a writer on an older key of their own** that still reaches somebody who
   left, which helps it only together with that person;
+- **show display names, pictures and a server name as it likes**: they are its word,
+  so they are no proof of who someone is. That is why your app always shows the
+  `@name` and the address beside them. Pictures are sanitized on your device first;
+- **hand out `@everyone`**: it says who may use it, and the text is hidden from it,
+  so it can make your app ring for a named member's message, not write that message;
 - **name accounts as it likes**: names are bound to people only through what
   your app pinned when it first met them, which is why a known name under a new
   account is reported;

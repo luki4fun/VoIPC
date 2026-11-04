@@ -72,7 +72,8 @@ pub async fn connect(index: usize, server: &str) -> Result<Connected, Error> {
             .await?;
         let (mut send, mut recv) = connection.open_bi().await?.await?;
         let auth = ClientMessage::Authenticate {
-            username: format!("load{index}"),
+            // With a tag: a relay with accounts wants one on a guest's name
+            username: format!("load{index}#0001"),
             protocol_version: proto,
             app_version: APP_VERSION.to_string(),
             identity_key: None,

@@ -183,6 +183,8 @@ export interface ChatMessage {
   reactions?: Reaction[];
   /** Pinned in its channel by a manager (`on`), or unpinned; latest wins. */
   pin?: { on: boolean; at: number; by: string };
+  /** It arrived from a member allowed to call on everybody (mention-rules.ts). */
+  power?: boolean;
   /** What a later version kept in this message's archive entry that this one
    *  does not know (JSON): written back on the next save, never read, never
    *  handed to anyone (chat-rules.ts `fromArchived`). */
@@ -308,6 +310,14 @@ export interface AuditRow {
   at: number;
 }
 
+export interface InviteLinkInfo {
+  id: string;
+  max_uses: number;
+  uses: number;
+  expires_at: number | null;
+  group: string | null;
+}
+
 export interface InviteInfo {
   id: string;
   name: string | null;
@@ -338,7 +348,31 @@ export type AdminOp =
   | { InviteNew: { name: string | null; days: number } }
   | { InviteRevoke: { id: string } }
   | { GateGet: { channel_id: number } }
-  | { GateSet: { channel_id: number; gate: ChannelGate } };
+  | { GateSet: { channel_id: number; gate: ChannelGate } }
+  | {
+      ChannelSave: {
+        id: number | null;
+        name: string;
+        description: string;
+        text: boolean;
+        auto_join: boolean;
+        category: number | null;
+        gate: ChannelGate | null;
+      };
+    }
+  | { ChannelDelete: { id: number } }
+  | { CategorySave: { id: number | null; name: string } }
+  | { CategoryDelete: { id: number } }
+  | { LayoutSet: { categories: number[]; channels: [number, number | null][] } }
+  | { WelcomeSet: { channel_id: number | null } }
+  | { GroupStyle: { name: string; color: number | null } }
+  | { GroupOrder: { names: string[] } }
+  | { ProfileReset: { id: number[]; name: boolean; picture: boolean } }
+  | { ServerProfileSet: { name: string; description: string } }
+  | { ServerIconSet: { image: number[] | null } }
+  | "InviteLinks"
+  | { InviteLinkNew: { max_uses: number; days: number; group: string | null } }
+  | { InviteLinkRevoke: { id: string } };
 
 /** `AdminReply` as serde writes it. */
 export type AdminReply =
@@ -348,5 +382,24 @@ export type AdminReply =
   | { Members: { name: string; offset: number; total: number; users: AdminUser[] } }
   | { Invites: { invites: InviteInfo[] } }
   | { InviteCode: { code: string } }
+  | { InviteLinks: { links: InviteLinkInfo[] } }
+  | { InviteLinkCode: { code: string } }
   | { Gate: { channel_id: number; gate: ChannelGate; groups: string[] } }
+  | { ChannelDone: { channel_id: number | null } }
   | "StepUp";
+
+/** A category of channels (protocol 18). */
+export interface ChannelCategory {
+  id: number;
+  name: string;
+}
+
+/** Where a channel sits (`ServerMessage::ChannelLayout`). */
+export interface ChannelPlace {
+  channel_id: number;
+  category: number | null;
+  /** Made in the app, so it can be renamed and deleted there. */
+  kept: boolean;
+  /** Opened the first time someone comes to this server. */
+  welcome: boolean;
+}

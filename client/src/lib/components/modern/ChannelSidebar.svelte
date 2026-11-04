@@ -20,13 +20,14 @@
   // the two layouts cannot drift on what a click does.
 
   import {
+    channelLayout,
     currentChannelId,
     previewChannelId,
     viewingVoice,
   } from "../../stores/channels.js";
   import { channelRosters } from "../../stores/rosters.js";
   import { rosterForRow } from "../../roster-rules.js";
-  import { userId, isAdmin, serverAddress } from "../../stores/connection.js";
+  import { userId, isAdmin, serverAddress, serverKey } from "../../stores/connection.js";
   import { account } from "../../stores/account.js";
   import { showChatPane } from "../../stores/platform.js";
   import {
@@ -42,9 +43,14 @@
   } from "../../stores/chat.js";
   import { ago, awayHint, liveIdOf, reach, writeToId } from "../../dm-rules.js";
   import { notificationBody } from "../../chat-rules.js";
+  import { levelTitle } from "../../notify-rules.js";
+  import { groupChannels, shownOf, type ChannelGroup } from "../../channel-groups.js";
   import { uiPrefs } from "../../stores/ui-prefs.js";
   import {
     canEditChannel,
+    channelNotify,
+    cycleChannelNotify,
+    toggleCategory,
     joinChannel,
     leaveTextChannel,
     leftTextChannelNames,
@@ -62,6 +68,8 @@
   import { shortName } from "../../username.js";
   import ChannelCreateForm from "../ChannelCreateForm.svelte";
   import Icon from "../Icons.svelte";
+  import MemberName from "../MemberName.svelte";
+  import AvatarPicture from "../AvatarPicture.svelte";
   import ChannelTags from "../ChannelTags.svelte";
   import type { ChannelInfo, UserInfo } from "../../types.js";
 
@@ -70,8 +78,11 @@
   // members nested under it: its subscribers are in voice channels of their
   // own, and listing them twice would say they are in two places at once.
   // Which channels are listed at all: stores/roster.ts `visibleChannels`
-  const textChannels = $derived($visibleChannels.filter((c) => c.text));
-  const voiceChannels = $derived($visibleChannels.filter((c) => !c.text));
+  const groups = $derived(groupChannels($visibleChannels, $channelLayout));
+  const foldedIds = $derived($uiPrefs.folded_categories[serverKey($serverAddress)] ?? []);
+  /** What a folded category's heading says is waiting in it. */
+  const unreadIn = (g: ChannelGroup) =>
+    [...g.text, ...g.voice].reduce((n, c) => n + channelUnread($unreadPerChannel, $serverAddress, c.name), 0);
 
   // What a direct conversation's "3h" is counted from, while previews show it
   let now = $state(Date.now());
@@ -92,28 +103,18 @@
   }
 </script>
 
-<div class="channel-list modern">
-  <div class="sidebar-head">
-    <span class="sidebar-title">Channels</span>
-    <button
-      class="add-btn"
-      onclick={() => showCreateForm.update((v) => !v)}
-      title="Create channel"
-    >
-      <Icon name="plus" size={18} />
-    </button>
-  </div>
+{#snippet notifyButton(channel: { name: string; user_count: number })}
+  <!-- `$uiPrefs` first: the store it reads does not make this reactive by itself. -->
+  {@const level = $uiPrefs && channelNotify($serverAddress, channel.name, channel.user_count)}
+  <button
+    class="settings-icon"
+    title={levelTitle(level)}
+    aria-label={levelTitle(level)}
+    onclick={() => cycleChannelNotify($serverAddress, channel.name, channel.user_count)}
+  ><Icon name={level === "nothing" ? "bell-off" : "bell"} size={14} /></button>
+{/snippet}
 
-  <ChannelCreateForm />
-
-  {#if textChannels.length > 0}
-    <div class="sidebar-head">
-      <span class="sidebar-title">Text channels</span>
-    </div>
-    <!-- `text`/`voice` name the two groups for test-ui.mjs, which has to click
-         a voice row and a text row and mean different things by each. -->
-    <div class="channels text">
-      {#each textChannels as channel (channel.channel_id)}
+{#snippet textRow(channel: ChannelInfo)}
         {@const subscribed = $joinedTextChannelIds.has(channel.channel_id)}
         {@const left = !subscribed && $leftTextChannelNames.has(channel.name)}
         {@const unread = channelUnread($unreadPerChannel, $serverAddress, channel.name)}
@@ -147,6 +148,7 @@
         {#if subscribed || canEditChannel(channel)}
           <span class="row-actions">
             {#if subscribed}
+              {@render notifyButton(channel)}
               <button
                 class="settings-icon"
                 title={channel.log && $account?.cloud ? "Leave this channel: its kept messages stop coming to you; what you have stays" : "Leave this channel"}
@@ -165,23 +167,16 @@
           </span>
         {/if}
         </div>
-      {/each}
-    </div>
+      {/snippet}
 
-    <div class="sidebar-head">
-      <span class="sidebar-title">Voice channels</span>
-    </div>
-  {/if}
-
-  <div class="channels voice">
-    {#each voiceChannels as channel (channel.channel_id)}
+{#snippet voiceRow(channel: ChannelInfo)}
       {@const joined = channel.channel_id === $currentChannelId}
       {@const members = membersOf(channel)}
       {@const unread = channelUnread($unreadPerChannel, $serverAddress, channel.name)}
       <div class="channel-row">
       <button
         class="channel"
-        class:has-actions={canEditChannel(channel)}
+        class:has-actions={joined || canEditChannel(channel)}
         class:active={joined}
         class:previewing={channel.channel_id === $previewChannelId && !joined}
         onclick={() => selectChannel(channel)}
@@ -211,14 +206,19 @@
           <span class="user-count">{channel.user_count}</span>
         {/if}
       </button>
-      {#if canEditChannel(channel)}
+      {#if joined || canEditChannel(channel)}
         <span class="row-actions">
+          {#if joined}
+            {@render notifyButton(channel)}
+          {/if}
+          {#if canEditChannel(channel)}
           <button
             class="settings-icon"
             title="Channel settings"
             aria-label="Channel settings"
             onclick={(e) => openChannelSettings(channel.channel_id, e)}
           ><Icon name="channel-settings" size={14} /></button>
+          {/if}
         </span>
       {/if}
       </div>
@@ -234,9 +234,9 @@
               use:memberMenu={{ user: member, self: member.user_id === $userId }}
             >
               <span class="nested-avatar" style={avatarStyle(member.username)}
-                >{member.username.charAt(0).toUpperCase()}</span
+                >{member.username.charAt(0).toUpperCase()}<AvatarPicture account={member.account} /></span
               >
-              <span class="nested-name" title={member.username}>{shortName(member.username)}</span>
+              <span class="nested-name" title={member.username}><MemberName username={member.username} account={member.account} /></span>
               {#if member.is_muted}
                 <span class="status-icon muted" title="Muted"><Icon name="mic-off" size={12} /></span>
               {/if}
@@ -262,8 +262,70 @@
           {/each}
         </div>
       {/if}
-    {/each}
+    {/snippet}
+
+
+<div class="channel-list modern">
+  <div class="sidebar-head">
+    <span class="sidebar-title">Channels</span>
+    <button
+      class="add-btn"
+      onclick={() => showCreateForm.update((v) => !v)}
+      title="Create channel"
+    >
+      <Icon name="plus" size={18} />
+    </button>
   </div>
+
+  <ChannelCreateForm />
+
+  {#each groups as group, g (group.category?.id ?? "top")}
+    {@const folded = !!group.category && foldedIds.includes(group.category.id)}
+    {#if group.category}
+      {@const id = group.category.id}
+      <button
+        class="category-head"
+        aria-expanded={!folded}
+        onclick={() => toggleCategory($serverAddress, id)}
+      >
+        <span class="category-arrow" class:folded><Icon name="chevron-down" size={12} /></span>
+        <span class="sidebar-title">{group.category.name}</span>
+        {#if folded && unreadIn(group) > 0}
+          <span class="channel-unread">{unreadIn(group)}</span>
+        {/if}
+      </button>
+    {/if}
+    {@const text = shownOf(group.text, folded, (c) => $activeTextChannelId === c.channel_id)}
+    {@const voice = shownOf(group.voice, folded, (c) => c.channel_id === $currentChannelId)}
+    <!-- The headings tell text from voice where it is not a category's own business. -->
+    {#if text.length > 0}
+      {#if !group.category}
+        <div class="sidebar-head">
+          <span class="sidebar-title">Text channels</span>
+        </div>
+      {/if}
+      <!-- `text`/`voice` name the two groups for test-ui.mjs, which has to click
+           a voice row and a text row and mean different things by each. -->
+      <div class="channels text">
+        {#each text as channel (channel.channel_id)}
+          {@render textRow(channel)}
+        {/each}
+      </div>
+    {/if}
+    {#if !group.category && text.length > 0}
+      <div class="sidebar-head">
+        <span class="sidebar-title">Voice channels</span>
+      </div>
+    {/if}
+    {#if voice.length > 0 || (g === 0 && !group.category)}
+      <div class="channels voice">
+        {#each voice as channel (channel.channel_id)}
+          {@render voiceRow(channel)}
+        {/each}
+      </div>
+    {/if}
+  {/each}
+
 
   {#if $dmList.length > 0}
     <div class="dm-section">
@@ -447,6 +509,25 @@
     flex-shrink: 0;
   }
 
+  .category-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 12px 8px 4px;
+    background: none;
+    border: none;
+    color: inherit;
+    cursor: pointer;
+    text-align: left;
+  }
+  .category-arrow {
+    display: inline-flex;
+    transition: transform 0.1s;
+  }
+  .category-arrow.folded {
+    transform: rotate(-90deg);
+  }
   .channel-unread {
     min-width: 16px;
     padding: 0 5px;
@@ -546,6 +627,7 @@
   }
 
   .nested-avatar {
+    position: relative;
     display: flex;
     align-items: center;
     justify-content: center;

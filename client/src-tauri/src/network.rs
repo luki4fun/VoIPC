@@ -1534,6 +1534,54 @@ async fn handle_server_message(
                 );
             }
         }
+        ServerMessage::ChannelLayout {
+            categories,
+            channels,
+        } => {
+            emit_server(
+                app_handle,
+                server,
+                "channel-layout",
+                serde_json::json!({ "categories": categories, "channels": channels }),
+            );
+        }
+        ServerMessage::Profiles { profiles } => {
+            emit_server(app_handle, server, "profiles", &profiles);
+        }
+        ServerMessage::ProfilePicture { hash, image } => {
+            emit_server(
+                app_handle,
+                server,
+                "profile-picture",
+                serde_json::json!({ "hash": hash, "image": image }),
+            );
+        }
+        ServerMessage::ServerProfile {
+            name,
+            description,
+            icon,
+        } => {
+            emit_server(
+                app_handle,
+                server,
+                "server-profile",
+                serde_json::json!({ "name": name, "description": description, "icon": icon }),
+            );
+        }
+        ServerMessage::MentionPower { user_ids, on } => {
+            emit_server(
+                app_handle,
+                server,
+                "mention-power",
+                serde_json::json!({ "user_ids": user_ids, "on": on }),
+            );
+        }
+        ServerMessage::MyBadges { badges } => {
+            emit_server(app_handle, server, "my-badges", &badges);
+        }
+        ServerMessage::GroupStyles { groups } => {
+            emit_server(app_handle, server, "group-styles", &groups);
+        }
         ServerMessage::ChannelList { channels } => {
             set_channels(channels_snapshot, channels.clone());
             apply_channel_proximity(

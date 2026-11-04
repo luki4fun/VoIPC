@@ -2,6 +2,43 @@
 
 All notable changes to VoIPC are documented here.
 
+## [Unreleased]
+
+Protocol 18. The app still talks to relays back to 1.0 (protocol 12), and on an older relay holds back what its
+other apps could not read.
+
+### Added
+- **Channels made in the app** that stay until someone deletes them, with **categories** and an order, by anyone
+  holding `voipc:channels`, on a relay with accounts. Those from `channels.json` stay the file's, and can be placed
+  and ordered too. A **welcome channel** opens the first time someone comes to a server.
+- **A group's colour and place**: its badge in that colour, and the member list sections people by their top group.
+  Nobody climbs over a group they could not have made.
+- **Display names and profile pictures**, shown beside the `@name` and never instead of it. A name cannot pass for
+  another account's. Other people's pictures reach the screen only through the picture sanitizer, like any file.
+  `voipc:profiles` clears those of someone holding no more than its holder.
+- **What a server calls itself**: a name, description and icon, set by an admin (or `server_name` and
+  `server_description` in `server_settings.json`, without accounts). Always shown above the address, and never kept
+  in a bookmark.
+- **Invite links**: one link for many people, with a limit, an expiry and a starting group, on a relay of any sign-up
+  mode but `closed`. Each sign-up still solves the proof of work. Password sign-up only so far: someone new signing
+  in with a provider gets no starting group, and an invite-only relay offers them no sign-up yet.
+- **`@everyone`, `@here` and `@&badge`**, from members holding `voipc:mention_all`. Every client decides for itself
+  and only for a message arriving live: nothing rings later for what happened while away, and a stored copy or
+  history handed over never has that power.
+- **Channel notifications**: all, mentions or nothing, per channel. Channels over 50 people start on mentions.
+
+### Fixed
+- `signups_per_hour` raised one of l4f's two sign-up limits, so a move could still be refused at the lower one.
+- A pin from a moderator outside your voice room was dropped: their rights were looked up among the people in that
+  room rather than in the channel.
+- Someone holding `voipc:channels` but outside a channel's gate could change that channel's password and options by
+  its id, though it was hidden from them.
+- A privilege given at the moment another check of that account was under way could be undone by the older answer,
+  until the next periodic check.
+- Two groups with the same badge stopped the member list for everyone showing someone in both.
+- A 1.8 app asked a 1.5 or 1.6 relay for a channel's gate, which it could not answer.
+- On Postgres, a channel with a very long uid could not have its gate kept.
+
 ## [1.8.0] - release candidate
 
 Protocol 17. A 1.8 app still talks to relays back to 1.0 (protocol 12); there it offers no sign-in with a

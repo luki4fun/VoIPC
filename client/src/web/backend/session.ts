@@ -717,6 +717,27 @@ export class Session implements SessionContext, AccountHost {
         });
         this.auth?.reject(new Error(b.text));
         break;
+      case "Profiles":
+        this.emit("profiles", b.profiles);
+        break;
+      case "ProfilePicture":
+        this.emit("profile-picture", { hash: b.hash, image: b.image });
+        break;
+      case "ServerProfile":
+        this.emit("server-profile", { name: b.name, description: b.description, icon: b.icon });
+        break;
+      case "MentionPower":
+        this.emit("mention-power", { user_ids: b.user_ids, on: b.on });
+        break;
+      case "MyBadges":
+        this.emit("my-badges", b.badges);
+        break;
+      case "GroupStyles":
+        this.emit("group-styles", b.groups);
+        break;
+      case "ChannelLayout":
+        this.emit("channel-layout", { categories: b.categories, channels: b.channels });
+        break;
       case "ChannelList":
         // Our own copy: the emitted array ends up in the UI's store
         this.channels = [...b.channels];

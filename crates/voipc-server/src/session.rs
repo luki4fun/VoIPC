@@ -187,9 +187,13 @@ pub async fn handle_connection<S>(
             channels: channel_list,
         },
     );
+    crate::layout::send(&state, session_id).await;
     if let Some(emotes) = &state.emotes {
         let _ = send_msg(&tx, &emotes.list());
     }
+    crate::layout::send_styles(&state, &tx).await;
+    crate::accounts::profile::send_server_profile(&state, &tx).await;
+    crate::accounts::mention_power_at_connect(&state, session_id, user_id, &tx).await;
 
     // Auto-join General (channel 0)
     if let Err(e) = handle_join_channel(&state, user_id, session_id, 0, None, &tx).await {
@@ -360,7 +364,7 @@ struct Admitted {
 /// replaced by its look-alike (UTS #39 confusables), or `None` when `name` is
 /// ASCII already or holds a character with no ASCII look-alike (`ü` stays
 /// `ü`, so "Jürgen" passes for nobody's account).
-fn ascii_look_alike(name: &str) -> Option<String> {
+pub(crate) fn ascii_look_alike(name: &str) -> Option<String> {
     if name.is_ascii() {
         return None;
     }
@@ -632,7 +636,7 @@ where
         peer_ip,
         signed_in
             .as_ref()
-            .map(|s| (s.user.id.0, !s.scopes.is_empty())),
+            .map(|s| (s.user.id.0, crate::accounts::holds_power(&s.scopes))),
     ) {
         end_unused_sign_in(state, signed_in.as_ref().map(|s| s.token.as_str())).await;
         refuse(stream, &why).await?;
@@ -687,7 +691,7 @@ where
         media_tx,
         peer_ip,
         state.max_users,
-        state.channel_budget,
+        state.channel_budget.load(std::sync::atomic::Ordering::Relaxed),
     );
     // What this particular client brought with it; the budgets
     // and the rest are the same for everybody (state.rs).
@@ -760,7 +764,7 @@ where
     let held = state.sessions.get(&session_id).and_then(|s| {
         s.account
             .as_ref()
-            .map(|a| (a.user.id.0, !a.scopes.is_empty()))
+            .map(|a| (a.user.id.0, crate::accounts::holds_power(&a.scopes)))
     });
     if let Some(why) = crate::bans::refusal(state, peer_ip, held) {
         force_disconnect(state, session_id, &why).await;
@@ -991,6 +995,7 @@ async fn handle_message(
         ClientMessage::RequestChannelList => {
             let channels = state.channel_list_for(session_id).await;
             let _ = send_msg(tx, &ServerMessage::ChannelList { channels });
+            crate::layout::send(state, session_id).await;
         }
         ClientMessage::Ping { timestamp } => {
             let _ = send_msg(tx, &ServerMessage::Pong { timestamp });
@@ -1070,6 +1075,12 @@ async fn handle_message(
             } else {
                 state.routing.clear_session(session_id);
             }
+        }
+        ClientMessage::ProfilesGet { accounts } => {
+            crate::accounts::profile::answer_profiles(state, session_id, &accounts, tx).await;
+        }
+        ClientMessage::ProfilePictureGet { hash } => {
+            crate::accounts::profile::answer_picture(state, session_id, hash, tx).await;
         }
         ClientMessage::RequestChannelUsers { channel_id } => {
             let allowed = state.is_channel_public_or_member(channel_id, user_id).await
@@ -1967,6 +1978,11 @@ async fn handle_set_channel_password(
     password: Option<String>,
     tx: &ControlTx,
 ) -> Result<()> {
+    // Nobody reaches into a channel they cannot see, by id either
+    if !state.may_reach(session_id, channel_id).await {
+        channel_error(tx, "channel does not exist").await;
+        return Ok(());
+    }
     let overrides = state.can(session_id, Powers::CHANNELS);
     let locks = password.is_some();
     match state
@@ -1999,6 +2015,11 @@ async fn handle_set_channel_proximity(
     proximity: ProximityMode,
     tx: &ControlTx,
 ) -> Result<()> {
+    // Nobody reaches into a channel they cannot see, by id either
+    if !state.may_reach(session_id, channel_id).await {
+        channel_error(tx, "channel does not exist").await;
+        return Ok(());
+    }
     let overrides = state.can(session_id, Powers::CHANNELS);
     match state
         .set_channel_proximity(channel_id, user_id, proximity, overrides)
@@ -2025,6 +2046,11 @@ async fn handle_set_channel_options(
     request: ChannelOptions,
     tx: &ControlTx,
 ) -> Result<()> {
+    // Nobody reaches into a channel they cannot see, by id either
+    if !state.may_reach(session_id, channel_id).await {
+        channel_error(tx, "channel does not exist").await;
+        return Ok(());
+    }
     // Turning anonymity off shows everyone in there by their real name: an
     // unmasking, so an admin's or the channel creator's alone.
     if request.anonymous == Some(false) && !state.is_admin(session_id) {
@@ -2391,7 +2417,8 @@ async fn handle_decline_invite(
 
 /// A channel change that went through: every session that sees the channel
 /// hears of it.
-async fn channel_updated(state: &Arc<ServerState>, channel: ChannelInfo) {
+pub(crate) async fn channel_updated(state: &Arc<ServerState>, channel: ChannelInfo) {
+    crate::layout::keep_through(state, channel.channel_id).await;
     let gate = {
         let channels = state.channels.read().await;
         channels

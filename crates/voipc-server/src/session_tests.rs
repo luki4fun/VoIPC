@@ -7663,6 +7663,20 @@ mod providers {
         assert!(reason.contains("leave no"), "{reason}");
     }
 
+    /// A move signs up far more than an ordinary hour does, and raising the
+    /// setting has to raise both of l4f's limits it passes through.
+    #[test]
+    fn signups_per_hour_raises_the_attempts_limit_too() {
+        let mut cfg = ServerConfig::default().accounts;
+        cfg.signups_per_hour = 2000;
+        let limits = crate::accounts::l4f_config(&cfg, [0; 16]).signup;
+        assert_eq!(limits.max_accounts_per_hour, 2000);
+        assert_eq!(limits.max_attempts_per_hour, 2000);
+        cfg.signups_per_hour = 5;
+        let limits = crate::accounts::l4f_config(&cfg, [0; 16]).signup;
+        assert_eq!(limits.max_attempts_per_hour, 60, "never below l4f's own");
+    }
+
     #[test]
     fn public_url_is_checked() {
         let with = |url: &str| {
@@ -7677,5 +7691,2259 @@ mod providers {
         assert!(!with("https://voice.example.org/"));
         assert!(!with("https://voice.example.org/x"));
         assert!(!with("https://"));
+    }
+}
+
+// ── Channels made in the app, and where channels sit ─────────────────────
+
+mod layouts {
+    use super::*;
+    use crate::channels::ChannelEntry;
+    use voipc_protocol::messages::{AdminOp, AdminReply};
+    use voipc_protocol::types::{ChannelCategory, ChannelGate, ChannelPlace};
+
+    /// A manager of channels: an account holding `voipc:channels`.
+    async fn manager(state: &Arc<ServerState>, name: &str) -> Client {
+        let (c, _) = register(state, name).await;
+        let sid = state
+            .account_sessions
+            .iter()
+            .max_by_key(|e| *e.value())
+            .map(|e| *e.value())
+            .unwrap();
+        grant(state, sid, &["voipc:channels"]);
+        c
+    }
+
+    /// What the layout says to this account's connection right now.
+    async fn layout_of(
+        state: &Arc<ServerState>,
+        name: &str,
+    ) -> (Vec<ChannelCategory>, Vec<ChannelPlace>) {
+        let sid = state
+            .sessions
+            .iter()
+            .find(|s| s.value().username == name)
+            .map(|s| *s.key())
+            .unwrap();
+        let ServerMessage::ChannelLayout {
+            categories,
+            channels,
+        } = crate::layout::for_session(state, sid).await
+        else {
+            unreachable!()
+        };
+        (categories, channels)
+    }
+
+    async fn relay_op(c: &mut Client, op: AdminOp, code: Option<String>) -> AccountReply {
+        c.send(&ClientMessage::Account(AccountRequest::Admin { op, code }))
+            .await;
+        let ServerMessage::Account(r) = c
+            .expect("the answer", |m| {
+                matches!(
+                    m,
+                    ServerMessage::Account(AccountReply::Admin(_))
+                        | ServerMessage::Account(AccountReply::Error { .. })
+                )
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        r
+    }
+
+    fn save(id: Option<u32>, name: &str, text: bool, category: Option<u32>) -> AdminOp {
+        AdminOp::ChannelSave {
+            id,
+            name: name.into(),
+            description: String::new(),
+            text,
+            auto_join: false,
+            category,
+            gate: None,
+        }
+    }
+
+    async fn made(c: &mut Client, op: AdminOp) -> u32 {
+        match relay_op(c, op, None).await {
+            AccountReply::Admin(AdminReply::ChannelDone {
+                channel_id: Some(id),
+            }) => id,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    async fn ok(c: &mut Client, op: AdminOp) {
+        let r = relay_op(c, op, None).await;
+        assert!(
+            matches!(r, AccountReply::Admin(AdminReply::ChannelDone { .. })),
+            "{r:?}"
+        );
+    }
+
+    async fn refused(c: &mut Client, op: AdminOp) -> String {
+        match relay_op(c, op, None).await {
+            AccountReply::Error { reason, .. } => reason,
+            other => panic!("not refused: {other:?}"),
+        }
+    }
+
+    /// The next layout this client hears.
+    async fn layout(c: &mut Client) -> (Vec<ChannelCategory>, Vec<ChannelPlace>) {
+        let ServerMessage::ChannelLayout {
+            categories,
+            channels,
+        } = c
+            .expect("the layout", |m| {
+                matches!(m, ServerMessage::ChannelLayout { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        (categories, channels)
+    }
+
+    /// What a start does, on the same database, with `file` as channels.json.
+    async fn restart(db: &TempDb, file: Vec<ChannelEntry>) -> Arc<ServerState> {
+        let mut config = ServerConfig::default();
+        config.accounts.mode = AccountsMode::Optional;
+        config.accounts.registration = RegistrationMode::Open;
+        let store = l4f_accounts::store::Store::connect(&format!("sqlite://{}", db.0.display()))
+            .await
+            .unwrap();
+        let relay = crate::accounts::Relay::open_with(&config.accounts, store, &[9u8; 32])
+            .await
+            .unwrap();
+        let kept = relay.layout_rows().await.unwrap();
+        let mut entries = file;
+        let apps = crate::layout::merge_kept(&kept, &mut entries);
+        let mut state = ServerState::new(
+            &config,
+            ServerSettings::default(),
+            entries,
+            "test-admin-token".into(),
+        );
+        state.accounts = Some(Arc::new(relay));
+        crate::layout::load(&state, kept, &apps).await;
+        crate::accounts::locked_logs_at_boot(&state).await.unwrap();
+        crate::gates::load(&state).await.unwrap();
+        Arc::new(state)
+    }
+
+    async fn named(state: &ServerState, name: &str) -> Option<(u32, String, ChannelGate, bool)> {
+        let channels = state.channels.read().await;
+        channels.values().find(|c| c.info.name == name).map(|c| {
+            (
+                c.info.channel_id,
+                c.gate_key.clone(),
+                c.gate.clone(),
+                c.kept,
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn a_channel_made_in_the_app_survives_a_restart_with_its_place_and_its_log() {
+        let (state, db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let mut m = manager(&state, "mona").await;
+        ok(
+            &mut m,
+            AdminOp::CategorySave {
+                id: None,
+                name: "Games".into(),
+            },
+        )
+        .await;
+        let id = made(&mut m, save(None, "news", true, Some(1))).await;
+        let (_, conv, _, kept) = named(&state, "news").await.unwrap();
+        assert!(kept);
+        assert!(
+            conv.starts_with("c:") && conv.len() == 34,
+            "its own uid, not its name's hash: {conv}"
+        );
+
+        let (categories, places) = layout_of(&state, "mona").await;
+        assert_eq!(categories[0].name, "Games");
+        let place = places.iter().find(|p| p.channel_id == id).unwrap();
+        assert_eq!((place.category, place.kept), (Some(1), true));
+
+        let again = restart(&db, Vec::new()).await;
+        let (_, conv2, _, kept2) = named(&again, "news").await.expect("back after a restart");
+        assert_eq!(conv2, conv, "the same log");
+        assert!(kept2);
+        let l = again.layout.read().await;
+        assert_eq!(l.categories[0].name, "Games");
+        assert_eq!(l.places.get(&conv).unwrap().category, Some(1));
+    }
+
+    /// A rename keeps the channel's log and gate: they go by its uid.
+    #[tokio::test]
+    async fn a_rename_keeps_the_log_and_reaches_the_row() {
+        let (state, db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let mut m = manager(&state, "mona").await;
+        let id = made(&mut m, save(None, "news", true, None)).await;
+        let (_, conv, _, _) = named(&state, "news").await.unwrap();
+        ok(&mut m, save(Some(id), "headlines", true, None)).await;
+        assert!(named(&state, "news").await.is_none());
+        let (_, renamed, _, _) = named(&state, "headlines").await.unwrap();
+        assert_eq!(renamed, conv);
+        let again = restart(&db, Vec::new()).await;
+        assert_eq!(named(&again, "headlines").await.unwrap().1, conv);
+    }
+
+    /// `SetChannelOptions` was written with the file's channels in mind, which
+    /// forget at a restart: a channel made in the app must not.
+    #[tokio::test]
+    async fn an_option_changed_in_the_ordinary_way_survives_a_restart() {
+        let (state, db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let mut m = manager(&state, "mona").await;
+        let id = made(&mut m, save(None, "news", true, None)).await;
+        crate::session::channel_updated(&state, {
+            let mut channels = state.channels.write().await;
+            let c = channels.get_mut(&id).unwrap();
+            c.info.slow_mode_secs = 30;
+            c.info.clone()
+        })
+        .await;
+        let again = restart(&db, Vec::new()).await;
+        let (id2, ..) = named(&again, "news").await.unwrap();
+        assert_eq!(again.channels.read().await[&id2].info.slow_mode_secs, 30);
+    }
+
+    #[tokio::test]
+    async fn only_who_manages_channels_may_change_them() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut plain, _) = register(&state, "pete").await;
+        for op in [
+            save(None, "news", true, None),
+            AdminOp::CategorySave {
+                id: None,
+                name: "x".into(),
+            },
+            AdminOp::LayoutSet {
+                categories: vec![],
+                channels: vec![],
+            },
+            AdminOp::WelcomeSet { channel_id: None },
+        ] {
+            let why = refused(&mut plain, op).await;
+            assert!(why.contains("may not"), "{why}");
+        }
+    }
+
+    /// Telling people first and gating after would say the channel exists, and a
+    /// category named after what is gated says it just the same.
+    #[tokio::test]
+    async fn a_gated_channel_and_its_category_stay_hidden() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let mut m = manager(&state, "mona").await;
+        let (mut outsider, _) = register(&state, "pete").await;
+        ok(
+            &mut m,
+            AdminOp::CategorySave {
+                id: None,
+                name: "Staff".into(),
+            },
+        )
+        .await;
+        // The manager has to pass the gate it sets
+        grant(
+            &state,
+            state
+                .account_sessions
+                .iter()
+                .min_by_key(|e| *e.value())
+                .map(|e| *e.value())
+                .unwrap(),
+            &["*"],
+        );
+        let id = made(
+            &mut m,
+            AdminOp::ChannelSave {
+                id: None,
+                name: "secret".into(),
+                description: String::new(),
+                text: true,
+                auto_join: false,
+                category: Some(1),
+                gate: Some(ChannelGate {
+                    groups: vec!["moderator".into()],
+                    speakers: vec![],
+                }),
+            },
+        )
+        .await;
+        let (categories, places) = layout(&mut outsider).await;
+        let (categories2, places2) = layout(&mut outsider).await;
+        for (cats, seen) in [(&categories, &places), (&categories2, &places2)] {
+            assert!(cats.is_empty(), "a category says what is hidden: {cats:?}");
+            assert!(!seen.iter().any(|p| p.channel_id == id));
+        }
+        // And nothing else has told it
+        outsider.send(&ClientMessage::Ping { timestamp: 5 }).await;
+        loop {
+            match outsider.next().await.unwrap() {
+                ServerMessage::ChannelCreated { channel } => {
+                    assert_ne!(channel.name, "secret", "told an outsider")
+                }
+                ServerMessage::Pong { timestamp: 5 } => break,
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn the_files_channels_are_placed_but_not_renamed_or_removed() {
+        let (state, _db) = relay_state_then(AccountsMode::Optional, RegistrationMode::Open, |s| {
+            let entry = ChannelEntry {
+                name: "lobby".into(),
+                text: true,
+                ..ChannelEntry::default()
+            };
+            let mut c = crate::state::Channel::from_entry(&entry, 7, true, true);
+            c.kept = false;
+            s.channels.get_mut().insert(7, c);
+        })
+        .await;
+        let mut m = manager(&state, "mona").await;
+        let why = refused(&mut m, save(Some(7), "renamed", true, None)).await;
+        assert!(why.contains("channels.json"), "{why}");
+        ok(
+            &mut m,
+            AdminOp::CategorySave {
+                id: None,
+                name: "Cat".into(),
+            },
+        )
+        .await;
+        ok(
+            &mut m,
+            AdminOp::LayoutSet {
+                categories: vec![1],
+                channels: vec![(7, Some(1))],
+            },
+        )
+        .await;
+        let conv = state.channels.read().await[&7].gate_key.clone();
+        assert_eq!(state.layout.read().await.places[&conv].category, Some(1));
+    }
+
+    /// Everything kept in it goes, and it takes a fresh code.
+    #[tokio::test]
+    async fn deleting_takes_a_code_and_everything_kept_goes_with_it() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut m, _) = register(&state, "mona").await;
+        // Before the grant: turning codes on reads the account's roles again
+        let secret = totp_on(&mut m).await;
+        m.send(&ClientMessage::Ping { timestamp: 1 }).await;
+        m.expect("that done", |r| {
+            matches!(r, ServerMessage::Pong { timestamp: 1 })
+        })
+        .await;
+        let sid = state
+            .account_sessions
+            .iter()
+            .next()
+            .map(|e| *e.value())
+            .unwrap();
+        grant(&state, sid, &["voipc:channels"]);
+        let id = made(&mut m, save(None, "news", true, None)).await;
+        let (_, conv, _, _) = named(&state, "news").await.unwrap();
+        let relay = state.accounts.as_deref().unwrap();
+        crate::accounts::raw(
+            relay,
+            &format!("INSERT INTO voipc_gates (conv, may_join, may_speak) VALUES ('{conv}', 'crew', '') RETURNING 1"),
+        )
+        .await
+        .unwrap();
+
+        let asked = relay_op(&mut m, AdminOp::ChannelDelete { id }, None).await;
+        assert!(
+            matches!(asked, AccountReply::Admin(AdminReply::StepUp)),
+            "{asked:?}"
+        );
+        assert!(
+            named(&state, "news").await.is_some(),
+            "nothing happened yet"
+        );
+
+        let code = format!(
+            "{:06}",
+            l4f_accounts::totp::code_at(&secret, l4f_accounts::util::now() / 30 + 1)
+        );
+        let r = relay_op(&mut m, AdminOp::ChannelDelete { id }, Some(code)).await;
+        assert!(
+            matches!(r, AccountReply::Admin(AdminReply::ChannelDone { .. })),
+            "{r:?}"
+        );
+        assert!(named(&state, "news").await.is_none());
+        for table in ["voipc_channels", "voipc_gates"] {
+            let n = crate::accounts::raw(
+                relay,
+                &format!("SELECT COUNT(*) FROM {table} WHERE conv = '{conv}'"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(n, 0, "{table}");
+        }
+    }
+
+    /// A file edited since must not stop the relay, and its row is not thrown away:
+    /// take the clash out of the file and the channel is back.
+    #[tokio::test]
+    async fn a_kept_channel_that_clashes_with_the_file_waits_and_stops_nothing() {
+        let (state, db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let mut m = manager(&state, "mona").await;
+        made(&mut m, save(None, "news", true, None)).await;
+        let (_, conv, ..) = named(&state, "news").await.unwrap();
+        let file = vec![ChannelEntry {
+            name: "NEWS".into(),
+            text: true,
+            ..ChannelEntry::default()
+        }];
+        let clashed = restart(&db, file).await;
+        let (_, theirs, _, kept) = named(&clashed, "NEWS").await.unwrap();
+        assert!(!kept && theirs != conv, "the file's own");
+        assert!(named(&clashed, "news").await.is_none());
+        let back = restart(&db, Vec::new()).await;
+        assert!(named(&back, "news").await.is_some());
+    }
+
+    /// A row that does not read is the same: left out, and the start goes on.
+    #[tokio::test]
+    async fn a_row_that_does_not_read_stops_nothing() {
+        let (state, db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let relay = state.accounts.as_deref().unwrap();
+        crate::accounts::raw(
+            relay,
+            "INSERT INTO voipc_channels (conv, entry, position) VALUES ('c:x', 'not json', 1) RETURNING 1",
+        )
+        .await
+        .unwrap();
+        let again = restart(&db, Vec::new()).await;
+        assert_eq!(again.channels.read().await.len(), 1, "General alone");
+    }
+
+    /// The fingerprint at a start compares what only a start writes: a password set
+    /// in the app would look changed, and every stored member would be dropped.
+    #[tokio::test]
+    async fn a_restart_keeps_the_members_of_a_kept_channel_with_a_password() {
+        let (state, db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let mut m = manager(&state, "mona").await;
+        let id = made(&mut m, save(None, "news", true, None)).await;
+        let (_, conv, ..) = named(&state, "news").await.unwrap();
+        crate::session::channel_updated(&state, {
+            let mut channels = state.channels.write().await;
+            let c = channels.get_mut(&id).unwrap();
+            // A hash a start accepts: an invalid one leaves the channel out, and then
+            // nothing here would be testing the rule
+            let hash = format!("sha256:{}", "ab".repeat(32));
+            c.password = Some(zeroize::Zeroizing::new(hash));
+            c.info.has_password = true;
+            c.info.clone()
+        })
+        .await;
+        let relay = state.accounts.as_deref().unwrap();
+        let account = state
+            .account_sessions
+            .iter()
+            .next()
+            .map(|e| hex::encode(e.key()))
+            .unwrap();
+        crate::accounts::raw(
+            relay,
+            &format!(
+                "INSERT INTO voipc_members (conv, account, joined_at) VALUES ('{conv}', X'{account}', 1) RETURNING 1"
+            ),
+        )
+        .await
+        .unwrap();
+        let again = restart(&db, Vec::new()).await;
+        assert!(named(&again, "news").await.is_some_and(|c| c.3), "it came back, as the app's");
+        let n = crate::accounts::raw(
+            again.accounts.as_deref().unwrap(),
+            &format!("SELECT COUNT(*) FROM voipc_members WHERE conv = '{conv}'"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 1);
+    }
+
+    /// One who cannot see a gated channel cannot move it, and reordering what they
+    /// can see leaves it where it was.
+    #[tokio::test]
+    async fn a_reorder_leaves_what_the_editor_cannot_see_in_place() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let mut m = manager(&state, "mona").await;
+        let a = made(&mut m, save(None, "aa", true, None)).await;
+        let hidden = made(&mut m, save(None, "hidden", true, None)).await;
+        let b = made(&mut m, save(None, "bb", true, None)).await;
+        let (_, hidden_conv, ..) = named(&state, "hidden").await.unwrap();
+        let before = state.layout.read().await.places[&hidden_conv].position;
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&hidden)
+            .unwrap()
+            .gate
+            .groups = vec!["crew".into()];
+        ok(
+            &mut m,
+            AdminOp::LayoutSet {
+                categories: vec![],
+                channels: vec![(b, None), (a, None), (hidden, None)],
+            },
+        )
+        .await;
+        let l = state.layout.read().await;
+        assert_eq!(l.places[&hidden_conv].position, before, "not touched");
+        let channels = state.channels.read().await;
+        let pos = |id: u32| l.places[&channels[&id].gate_key].position;
+        assert!(pos(b) < pos(a), "swapped");
+    }
+
+    #[tokio::test]
+    async fn the_welcome_channel_is_a_kept_text_channel_anyone_can_open() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let mut m = manager(&state, "mona").await;
+        let voice = made(&mut m, save(None, "talk", false, None)).await;
+        let text = made(&mut m, save(None, "rules", true, None)).await;
+        let why = refused(
+            &mut m,
+            AdminOp::WelcomeSet {
+                channel_id: Some(voice),
+            },
+        )
+        .await;
+        assert!(why.contains("text channel"), "{why}");
+        ok(
+            &mut m,
+            AdminOp::WelcomeSet {
+                channel_id: Some(text),
+            },
+        )
+        .await;
+        let (_, places) = layout_of(&state, "mona").await;
+        assert_eq!(places.iter().find(|p| p.welcome).unwrap().channel_id, text);
+    }
+
+    #[tokio::test]
+    async fn a_list_that_would_not_fit_is_refused_when_it_is_asked_for() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let mut m = manager(&state, "mona").await;
+        // Past the 60 KiB one list holds: full descriptions, directly
+        {
+            let mut channels = state.channels.write().await;
+            for i in 0..250u32 {
+                let entry = ChannelEntry {
+                    name: format!("filler-{i}"),
+                    description: "d".repeat(256),
+                    ..ChannelEntry::default()
+                };
+                channels.insert(
+                    1000 + i,
+                    crate::state::Channel::from_entry(&entry, 1000 + i, true, true),
+                );
+            }
+        }
+        let why = refused(&mut m, save(None, "one-more", true, None)).await;
+        assert!(why.contains("One channel list"), "{why}");
+    }
+
+    /// With too many at a start, the newest made in the app wait; the rest serve.
+    #[tokio::test]
+    async fn a_start_past_what_one_list_holds_leaves_out_the_newest_made_here() {
+        let (state, db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let relay = state.accounts.as_deref().unwrap();
+        for i in 0..250i64 {
+            let entry = ChannelEntry {
+                name: format!("kept-{i}"),
+                description: "d".repeat(256),
+                uid: Some(format!("u{i}")),
+                ..ChannelEntry::default()
+            };
+            relay
+                .layout_put(&entry.log_conv(), Some(&entry), i, None)
+                .await
+                .unwrap();
+        }
+        let again = restart(&db, Vec::new()).await;
+        let list = again.channel_list().await;
+        assert!(list.len() < 251, "some wait: {}", list.len());
+        assert!(list.iter().any(|c| c.name == "kept-0"), "the oldest stay");
+        assert!(
+            !list.iter().any(|c| c.name == "kept-249"),
+            "the newest wait"
+        );
+        let framed = encode_server_msg(&ServerMessage::ChannelList { channels: list }).unwrap();
+        assert!(framed.len() <= 60 * 1024);
+    }
+}
+
+/// Group colours and order (1.9).
+mod group_styles {
+    use super::*;
+    use voipc_protocol::types::GroupStyle;
+
+    fn styled(badge: &str, color: Option<u32>) -> GroupStyle {
+        GroupStyle {
+            badge: badge.into(),
+            color,
+        }
+    }
+
+    async fn answer(c: &mut Client, op: AdminOp) -> AccountReply {
+        c.send(&admin_op(op, None)).await;
+        let ServerMessage::Account(r) = c.expect("the answer", admin_answer).await else {
+            unreachable!()
+        };
+        r
+    }
+
+    async fn styles(c: &mut Client) -> Vec<GroupStyle> {
+        let ServerMessage::GroupStyles { groups } = c
+            .expect("the styles", |m| {
+                matches!(m, ServerMessage::GroupStyles { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        groups
+    }
+
+    /// An account holding `roles:admin` and nothing more, with codes on.
+    async fn group_keeper(state: &Arc<ServerState>, name: &str) -> (Client, AccountInfo) {
+        group(state, "keepers", None, &["roles:admin"]).await;
+        let (mut c, info) = register(state, name).await;
+        totp_on(&mut c).await;
+        give(state, info.id, "keepers", true).await;
+        (c, info)
+    }
+
+    #[tokio::test]
+    async fn colour_and_order_reach_everybody_and_outlast_a_connection() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "crew", Some("Crew"), &[]).await;
+        group(&state, "lead", Some("Lead"), &[]).await;
+        group(&state, "quiet", None, &[]).await;
+        let (mut ann, _, _) = admin_account(&state, "ann").await;
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut guest = connect(&state, "guest#1234", lo).await;
+        assert_eq!(
+            styles(&mut guest).await,
+            [styled("mod", None), styled("Crew", None), styled("Lead", None)],
+            "those with privileges first, then by name, and a group with no badge is not told"
+        );
+
+        answer(
+            &mut ann,
+            AdminOp::GroupStyle {
+                name: "lead".into(),
+                color: Some(0xff8800),
+            },
+        )
+        .await;
+        assert_eq!(
+            styles(&mut guest).await,
+            [styled("mod", None), styled("Crew", None), styled("Lead", Some(0xff8800))]
+        );
+
+        let names = ["lead", "admin", "crew", "moderator", "quiet", "user"]
+            .map(String::from)
+            .to_vec();
+        let reply = answer(
+            &mut ann,
+            AdminOp::GroupOrder {
+                names: names.clone(),
+            },
+        )
+        .await;
+        let AccountReply::Admin(AdminReply::Groups { groups }) = reply else {
+            panic!("{reply:?}");
+        };
+        assert_eq!(
+            groups.iter().map(|g| g.name.clone()).collect::<Vec<_>>(),
+            names,
+            "the panel lists them as the server shows them"
+        );
+        assert_eq!(
+            styles(&mut guest).await,
+            [
+                styled("Lead", Some(0xff8800)),
+                styled("Crew", None),
+                styled("mod", None)
+            ]
+        );
+
+        // A colour later keeps the place, and a place the colour
+        answer(
+            &mut ann,
+            AdminOp::GroupStyle {
+                name: "crew".into(),
+                color: Some(1),
+            },
+        )
+        .await;
+        assert_eq!(
+            styles(&mut guest).await,
+            [
+                styled("Lead", Some(0xff8800)),
+                styled("Crew", Some(1)),
+                styled("mod", None)
+            ]
+        );
+
+        let mut late = connect(&state, "late#1234", lo).await;
+        assert_eq!(
+            styles(&mut late).await,
+            [
+                styled("Lead", Some(0xff8800)),
+                styled("Crew", Some(1)),
+                styled("mod", None)
+            ],
+            "told at connect"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_top_badges_are_the_ones_a_row_keeps() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        for (name, badge) in [("a1", "A"), ("b2", "B"), ("c3", "C"), ("d4", "D")] {
+            group(&state, name, Some(badge), &[]).await;
+        }
+        let (mut ann, _, _) = admin_account(&state, "ann").await;
+        let (_bob, bi) = register(&state, "bob").await;
+        for g in ["a1", "b2", "c3", "d4"] {
+            give(&state, bi.id, g, true).await;
+        }
+        let relay = state.accounts.clone().unwrap();
+        let bob = relay
+            .store()
+            .user_by_id(AccountId(bi.id))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            relay.standing(&bob, &[]).await.unwrap().badges,
+            ["A", "B", "C"]
+        );
+
+        let names = ["d4", "c3", "admin", "b2", "a1", "moderator", "user"]
+            .map(String::from)
+            .to_vec();
+        answer(&mut ann, AdminOp::GroupOrder { names }).await;
+        let standing = relay.standing(&bob, &[]).await.unwrap();
+        assert_eq!(standing.badges, ["D", "C", "B"]);
+        assert_eq!(
+            standing.groups.len(),
+            5,
+            "the order cuts badges, never groups"
+        );
+    }
+
+    #[tokio::test]
+    async fn nobody_styles_or_climbs_over_a_group_they_could_not_make() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "crew", Some("Crew"), &[]).await;
+        group(&state, "mods", Some("Mod"), &["voipc:kick"]).await;
+        group(&state, "team", Some("Team"), &[]).await;
+        let (mut kim, _) = group_keeper(&state, "kim").await;
+        let (mut bob, _) = register(&state, "bob").await;
+
+        // Holding nothing: not even a colour
+        let r = answer(
+            &mut bob,
+            AdminOp::GroupStyle {
+                name: "crew".into(),
+                color: Some(1),
+            },
+        )
+        .await;
+        assert!(matches!(r, AccountReply::Error { .. }), "{r:?}");
+        let r = answer(&mut bob, AdminOp::GroupOrder { names: vec![] }).await;
+        assert!(matches!(r, AccountReply::Error { .. }), "{r:?}");
+
+        // Holding `roles:admin`: not a group with more in it than they hold
+        let r = answer(
+            &mut kim,
+            AdminOp::GroupStyle {
+                name: "mods".into(),
+                color: Some(1),
+            },
+        )
+        .await;
+        assert!(matches!(r, AccountReply::Error { .. }), "{r:?}");
+        let r = answer(
+            &mut kim,
+            AdminOp::GroupStyle {
+                name: "crew".into(),
+                color: Some(0x100_0000),
+            },
+        )
+        .await;
+        assert!(
+            matches!(r, AccountReply::Error { .. }),
+            "not a colour: {r:?}"
+        );
+        let r = answer(
+            &mut kim,
+            AdminOp::GroupStyle {
+                name: "crew".into(),
+                color: Some(1),
+            },
+        )
+        .await;
+        assert!(
+            matches!(r, AccountReply::Admin(AdminReply::Groups { .. })),
+            "{r:?}"
+        );
+
+        // `admin`, `moderator` and `mods` are out of kim's reach: each stays where it
+        // is, and nothing crosses one. Between them she moves what she likes.
+        let relay = state.accounts.clone().unwrap();
+        let now: Vec<String> = relay
+            .groups_in_order()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(r, _)| r.name)
+            .collect();
+        let at = |name: &str| now.iter().position(|n| n == name).unwrap();
+        assert!(at("mods") < at("crew") && at("mods") < at("team"), "{now:?}");
+        assert!(at("keepers") < at("moderator"), "{now:?}");
+        let swapped = |a: &str, b: &str| {
+            let mut names = now.clone();
+            names.swap(at(a), at(b));
+            names
+        };
+        let order = |names: Vec<String>| AdminOp::GroupOrder { names };
+
+        let r = answer(&mut kim, order(swapped("admin", "keepers"))).await;
+        assert!(matches!(r, AccountReply::Error { .. }), "moves the admins: {r:?}");
+        let r = answer(&mut kim, order(swapped("team", "keepers"))).await;
+        assert!(matches!(r, AccountReply::Error { .. }), "team past mods: {r:?}");
+        let mut short = now.clone();
+        short.pop();
+        let r = answer(&mut kim, order(short.clone())).await;
+        assert!(matches!(r, AccountReply::Error { .. }), "one short: {r:?}");
+        short.push(short[0].clone());
+        let r = answer(&mut kim, order(short)).await;
+        assert!(matches!(r, AccountReply::Error { .. }), "one twice: {r:?}");
+
+        let wanted = swapped("crew", "team");
+        let r = answer(&mut kim, order(wanted.clone())).await;
+        assert!(matches!(r, AccountReply::Admin(AdminReply::Groups { .. })), "{r:?}");
+        let shown: Vec<String> = relay
+            .groups_in_order()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(r, _)| r.name)
+            .collect();
+        assert_eq!(shown, wanted);
+    }
+
+    #[tokio::test]
+    async fn a_name_is_no_way_to_climb_and_one_badge_on_two_groups_is_one_badge() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "00-mine", Some("Mine"), &[]).await;
+        group(&state, "staff-a", Some("Staff"), &[]).await;
+        group(&state, "staff-b", Some("Staff"), &[]).await;
+        let relay = state.accounts.clone().unwrap();
+        let names: Vec<String> = relay
+            .groups_in_order()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(r, _)| r.name)
+            .collect();
+        let at = |name: &str| names.iter().position(|n| n == name).unwrap();
+        assert!(at("admin") < at("00-mine") && at("moderator") < at("00-mine"), "{names:?}");
+
+        // A row draws its badges keyed by their text, so a repeat would stop every
+        // client showing this member
+        let (_bob, bi) = register(&state, "bob").await;
+        give(&state, bi.id, "staff-a", true).await;
+        give(&state, bi.id, "staff-b", true).await;
+        let bob = relay.store().user_by_id(AccountId(bi.id)).await.unwrap().unwrap();
+        let standing = relay.standing(&bob, &[]).await.unwrap();
+        assert_eq!(standing.badges, ["Staff"]);
+        assert_eq!(standing.my_badges, ["Staff"]);
+        let styles = relay.group_styles().await.unwrap();
+        assert_eq!(styles.iter().filter(|s| s.badge == "Staff").count(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_deleted_group_takes_its_style_along() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "crew", Some("Crew"), &[]).await;
+        let (mut ann, _, _) = admin_account(&state, "ann").await;
+        let relay = state.accounts.clone().unwrap();
+        answer(
+            &mut ann,
+            AdminOp::GroupStyle {
+                name: "crew".into(),
+                color: Some(7),
+            },
+        )
+        .await;
+        let crew = relay.store().role_by_name("crew").await.unwrap().unwrap();
+        relay.store().delete_role(crew.id).await.unwrap();
+        group(&state, "crew", Some("Crew"), &[]).await;
+        assert_eq!(
+            relay.group_styles().await.unwrap(),
+            [styled("mod", None), styled("Crew", None)]
+        );
+    }
+}
+
+/// Display names and pictures (1.9).
+mod profiles {
+    use super::*;
+    use sha2::Digest;
+    use voipc_protocol::types::{ProfileInfo, MAX_PROFILE_PICTURE};
+
+    const PNG: &[u8] = b"\x89PNG\r\n\x1a\nnot really";
+
+    async fn answer(c: &mut Client, request: AccountRequest) -> AccountReply {
+        c.send(&ClientMessage::Account(request)).await;
+        let ServerMessage::Account(r) = c
+            .expect("the answer", |m| {
+                matches!(
+                    m,
+                    ServerMessage::Account(AccountReply::ProfileDone)
+                        | ServerMessage::Account(AccountReply::Error { .. })
+                )
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        r
+    }
+
+    async fn name_is(c: &mut Client, name: &str) -> AccountReply {
+        answer(
+            c,
+            AccountRequest::ProfileSet {
+                name: Some(name.into()),
+            },
+        )
+        .await
+    }
+
+    async fn profiles(c: &mut Client) -> Vec<ProfileInfo> {
+        let ServerMessage::Profiles { profiles } = c
+            .expect("profiles", |m| matches!(m, ServerMessage::Profiles { .. }))
+            .await
+        else {
+            unreachable!()
+        };
+        profiles
+    }
+
+    async fn asked(c: &mut Client, accounts: &[[u8; 16]]) -> Vec<ProfileInfo> {
+        c.send(&ClientMessage::ProfilesGet {
+            accounts: accounts.to_vec(),
+        })
+        .await;
+        profiles(c).await
+    }
+
+    async fn picture(c: &mut Client, hash: [u8; 32]) -> Vec<u8> {
+        c.send(&ClientMessage::ProfilePictureGet { hash }).await;
+        let ServerMessage::ProfilePicture { image, .. } = c
+            .expect("the picture", |m| {
+                matches!(m, ServerMessage::ProfilePicture { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        image
+    }
+
+    #[tokio::test]
+    async fn anyone_may_read_online_or_not_and_no_account_reads_as_no_profile() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut ann, ai) = register(&state, "ann").await;
+        assert!(matches!(
+            name_is(&mut ann, "Ann Example").await,
+            AccountReply::ProfileDone
+        ));
+        drop(ann);
+        while state.account_sessions.contains_key(&ai.id) {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let mut guest = connect(&state, "guest#1234", IpAddr::V4(Ipv4Addr::LOCALHOST)).await;
+        let got = asked(&mut guest, &[ai.id, [7; 16]]).await;
+        assert_eq!(got[0].name.as_deref(), Some("Ann Example"), "ann has left");
+        assert_eq!(got[1].account, [7; 16]);
+        assert_eq!(got[1].name, None);
+    }
+
+    #[tokio::test]
+    async fn too_many_at_once_are_not_read() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut ann, ai) = register(&state, "ann").await;
+        ann.send(&ClientMessage::ProfilesGet {
+            accounts: vec![[1; 16]; 65],
+        })
+        .await;
+        assert_eq!(asked(&mut ann, &[ai.id]).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_name_cannot_pass_for_someone_elses() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (_bob, _) = register(&state, "bobby").await;
+        let (mut ann, ai) = register(&state, "ann").await;
+        // This is about the names, not how many are tried
+        let sid = *state.account_sessions.get(&ai.id).unwrap();
+        state.sessions.get_mut(&sid).unwrap().state_change_rate =
+            crate::state::RateLimiter::new(100.0, 100.0);
+        for bad in [
+            "@bobby",
+            "bobby",
+            "BOBBY",
+            "bobby\u{2800}",
+            "bobby\u{E0061}",
+            "bobby#1234 \u{2800}",
+            "bobby\u{1BCA0}",
+            "b\u{34F}obby",
+            "bobby\u{FE0F}",
+            "\u{FF20}bobby",
+            "\u{FE6B}bobby",
+            "bobby\u{FF03}1234",
+            "Bobby @bobby",
+            "Support @alice",
+            "\u{2800}",
+            "b\u{043E}bby", // a Cyrillic o
+            "bobby#1234",
+            "Admin\u{202E}nimdA",
+            "a\u{200B}b",
+            &"x".repeat(33),
+        ] {
+            let r = name_is(&mut ann, bad).await;
+            assert!(matches!(r, AccountReply::Error { .. }), "{bad:?}: {r:?}");
+        }
+        for fine in [
+            "\u{2764}\u{FE0F} Ann",
+            "\u{1F469}\u{200D}\u{1F4BB} Ann",
+            "\u{0645}\u{06CC}\u{200C}\u{062E}\u{0648}\u{0627}\u{0647}\u{0645}",
+            "ann",
+            "ANN",
+            "Jürgen",
+            "Ann Example",
+            "Bob the builder",
+            "日本語の名前",
+        ] {
+            let r = name_is(&mut ann, fine).await;
+            assert!(matches!(r, AccountReply::ProfileDone), "{fine:?}: {r:?}");
+        }
+        name_is(&mut ann, "  ").await;
+        assert_eq!(
+            asked(&mut ann, &[ai.id]).await[0].name,
+            None,
+            "blank clears"
+        );
+    }
+
+    #[tokio::test]
+    async fn saying_the_same_again_tells_nobody_and_changing_it_over_and_over_is_stopped() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut ann, ai) = register(&state, "ann").await;
+        name_is(&mut ann, "Same").await;
+        let relay = state.accounts.clone().unwrap();
+        let sid = *state.account_sessions.get(&ai.id).unwrap();
+        // Its budget at nothing: a repeat needs none of it
+        state
+            .sessions
+            .get_mut(&sid)
+            .unwrap()
+            .state_change_rate = crate::state::RateLimiter::new(1.0, 0.0);
+        assert!(matches!(name_is(&mut ann, "Same").await, AccountReply::ProfileDone));
+        assert!(matches!(name_is(&mut ann, "Other").await, AccountReply::ProfileDone));
+        assert!(matches!(name_is(&mut ann, "Third").await, AccountReply::Error { .. }));
+        assert_eq!(
+            relay.profiles(&[ai.id]).await.unwrap()[0].name.as_deref(),
+            Some("Other")
+        );
+    }
+
+    #[test]
+    fn a_servers_name_may_not_read_as_an_address_in_any_of_its_words() {
+        use crate::accounts::profile::server_name_ok as ok;
+        for bad in [
+            "ivy.l4f.cc",
+            "10.0.0.1:9987",
+            "10.0.0.1",
+            "chat.example.org (official)",
+            "voipc.example.com :443",
+            "[::1]:9987",
+            "the real ivy.l4f.cc",
+        ] {
+            assert!(ok(bad).is_err(), "{bad}");
+        }
+        for fine in ["Night Owls", "v1.2 Night Owls", "St. Pauli", "Dr. Who & co"] {
+            assert!(ok(fine).is_ok(), "{fine}");
+        }
+    }
+
+    #[test]
+    fn the_address_test_agrees_with_the_clients_on_one_list() {
+        // The same list is in client/src/lib/profile-rules.test.ts
+        let text = include_str!("../../../client/src/lib/address-shapes.json");
+        let shapes: serde_json::Value = serde_json::from_str(text).unwrap();
+        for (want, list) in [(false, "fine"), (true, "address")] {
+            for name in shapes[list].as_array().unwrap() {
+                let name = name.as_str().unwrap();
+                assert_eq!(
+                    crate::accounts::profile::server_name_ok(name).is_err(),
+                    want,
+                    "{name}"
+                );
+            }
+        }
+    }
+
+    /// Sets a name, and what the account itself heard before the answer.
+    async fn told_itself(c: &mut Client, name: &str) -> Option<String> {
+        c.send(&ClientMessage::Account(AccountRequest::ProfileSet {
+            name: Some(name.into()),
+        }))
+        .await;
+        let mut told = None;
+        loop {
+            match c.next().await.expect("connected") {
+                ServerMessage::Profiles { profiles } => told = profiles[0].name.clone(),
+                ServerMessage::Account(AccountReply::ProfileDone) => return told,
+                _ => {}
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_change_goes_to_the_people_who_see_the_row_and_to_nobody_else() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut ann, ai) = register(&state, "ann").await;
+        let (mut bob, _) = register(&state, "bob").await;
+        // Signing in is told before the join: who hears a change is who is there
+        while state.channels.read().await[&0].members.len() < 2 {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(matches!(
+            name_is(&mut ann, "Annie").await,
+            AccountReply::ProfileDone
+        ));
+        assert_eq!(profiles(&mut bob).await[0].name.as_deref(), Some("Annie"));
+
+        // Both are in General, which from here on hides its people
+        state
+            .channels
+            .write()
+            .await
+            .get_mut(&0)
+            .unwrap()
+            .info
+            .hide_members = true;
+        assert_eq!(
+            told_itself(&mut ann, "Annie 2").await.as_deref(),
+            Some("Annie 2"),
+            "its own other tabs and panels hear it all the same"
+        );
+        bob.send(&ClientMessage::ProfilesGet {
+            accounts: vec![ai.id],
+        })
+        .await;
+        assert_eq!(
+            profiles(&mut bob).await[0].name.as_deref(),
+            Some("Annie 2"),
+            "what it asked for, and not a change pushed before that"
+        );
+        // Under an alias, the same
+        {
+            let mut channels = state.channels.write().await;
+            let general = channels.get_mut(&0).unwrap();
+            general.info.hide_members = false;
+            general.info.anonymous = true;
+        }
+        assert!(matches!(
+            name_is(&mut ann, "Annie 3").await,
+            AccountReply::ProfileDone
+        ));
+        bob.send(&ClientMessage::ProfilesGet {
+            accounts: vec![[9; 16]],
+        })
+        .await;
+        assert_eq!(
+            profiles(&mut bob).await[0].account,
+            [9; 16],
+            "no push came first"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_picture_is_a_small_png_or_webp_and_is_fetched_by_its_hash() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut ann, ai) = register(&state, "ann").await;
+        let set = |image: Option<Vec<u8>>| AccountRequest::ProfilePictureSet { image };
+
+        for bad in [
+            b"GIF89a.....".to_vec(),
+            b"<svg onload=x>".to_vec(),
+            Vec::new(),
+            [PNG, &vec![0; MAX_PROFILE_PICTURE]].concat(),
+        ] {
+            let r = answer(&mut ann, set(Some(bad))).await;
+            assert!(matches!(r, AccountReply::Error { .. }), "{r:?}");
+        }
+        let webp = b"RIFF\0\0\0\0WEBPrest".to_vec();
+        assert!(matches!(
+            answer(&mut ann, set(Some(webp))).await,
+            AccountReply::ProfileDone
+        ));
+        assert!(matches!(
+            answer(&mut ann, set(Some(PNG.to_vec()))).await,
+            AccountReply::ProfileDone
+        ));
+        let hash = asked(&mut ann, &[ai.id]).await[0].picture.unwrap();
+        assert_eq!(hash, <[u8; 32]>::from(sha2::Sha256::digest(PNG)));
+        assert_eq!(picture(&mut ann, hash).await, PNG);
+        assert!(
+            picture(&mut ann, [3; 32]).await.is_empty(),
+            "no such picture"
+        );
+
+        assert!(matches!(
+            answer(&mut ann, set(None)).await,
+            AccountReply::ProfileDone
+        ));
+        assert_eq!(asked(&mut ann, &[ai.id]).await[0].picture, None);
+        assert!(picture(&mut ann, hash).await.is_empty(), "gone, not hidden");
+    }
+
+    async fn op(c: &mut Client, id: [u8; 16]) -> ServerMessage {
+        c.send(&admin_op(
+            AdminOp::ProfileReset {
+                id,
+                name: true,
+                picture: true,
+            },
+            None,
+        ))
+        .await;
+        c.expect("the answer", |m| {
+            matches!(
+                m,
+                ServerMessage::Account(AccountReply::ProfileDone)
+                    | ServerMessage::Account(AccountReply::Error { .. })
+            )
+        })
+        .await
+    }
+
+    fn code(secret: &[u8], ahead: i64) -> String {
+        format!(
+            "{:06}",
+            l4f_accounts::totp::code_at(secret, l4f_accounts::util::now() / 30 + ahead)
+        )
+    }
+
+    async fn server_op(c: &mut Client, op: AdminOp, code: Option<String>) -> ServerMessage {
+        c.send(&admin_op(op, code)).await;
+        c.expect("the answer", |m| {
+            matches!(
+                m,
+                ServerMessage::Account(AccountReply::ProfileDone)
+                    | ServerMessage::Account(AccountReply::Admin(AdminReply::StepUp))
+                    | ServerMessage::Account(AccountReply::Error { .. })
+            )
+        })
+        .await
+    }
+
+    async fn told(c: &mut Client) -> (String, String, Option<[u8; 32]>) {
+        let ServerMessage::ServerProfile {
+            name,
+            description,
+            icon,
+        } = c
+            .expect("the server profile", |m| {
+                matches!(m, ServerMessage::ServerProfile { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        (name, description, icon)
+    }
+
+    #[tokio::test]
+    async fn an_admin_names_the_server_with_a_fresh_code_and_everybody_hears() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut ann, _, secret) = admin_account(&state, "ann").await;
+        let (mut bob, _) = register(&state, "bob").await;
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut guest = connect(&state, "guest#1234", lo).await;
+        let set = || AdminOp::ServerProfileSet {
+            name: "Night Owls".into(),
+            description: "Second home.\nBe kind.".into(),
+        };
+
+        let r = server_op(&mut bob, set(), None).await;
+        assert!(
+            matches!(r, ServerMessage::Account(AccountReply::Error { .. })),
+            "{r:?}"
+        );
+        let r = server_op(&mut ann, set(), None).await;
+        assert!(
+            matches!(
+                r,
+                ServerMessage::Account(AccountReply::Admin(AdminReply::StepUp))
+            ),
+            "{r:?}"
+        );
+        for bad in [
+            "ivy.l4f.cc",
+            "10.0.0.1:9987",
+            "evil\u{202E}",
+            &"x".repeat(33),
+        ] {
+            let op = AdminOp::ServerProfileSet {
+                name: bad.into(),
+                description: String::new(),
+            };
+            let r = server_op(&mut ann, op, Some(code(&secret, 1))).await;
+            assert!(
+                matches!(r, ServerMessage::Account(AccountReply::Error { .. })),
+                "{bad:?}: {r:?}"
+            );
+        }
+        let r = server_op(&mut ann, set(), Some(code(&secret, 1))).await;
+        assert!(
+            matches!(r, ServerMessage::Account(AccountReply::ProfileDone)),
+            "{r:?}"
+        );
+        assert_eq!(told(&mut guest).await.0, "Night Owls");
+
+        // Within the code's ten minutes: no second one
+        let icon = PNG.to_vec();
+        let r = server_op(&mut ann, AdminOp::ServerIconSet { image: Some(icon) }, None).await;
+        assert!(
+            matches!(r, ServerMessage::Account(AccountReply::ProfileDone)),
+            "{r:?}"
+        );
+        let (_, _, hash) = told(&mut guest).await;
+        let hash = hash.expect("an icon");
+        assert_eq!(
+            picture(&mut guest, hash).await,
+            PNG,
+            "fetched as a picture is"
+        );
+
+        let mut late = connect(&state, "late#1234", lo).await;
+        let (name, description, icon) = told(&mut late).await;
+        assert_eq!(name, "Night Owls");
+        assert_eq!(description, "Second home.\nBe kind.");
+        assert_eq!(icon, Some(hash));
+
+        let r = server_op(&mut ann, AdminOp::ServerIconSet { image: None }, None).await;
+        assert!(
+            matches!(r, ServerMessage::Account(AccountReply::ProfileDone)),
+            "{r:?}"
+        );
+        assert_eq!(told(&mut guest).await.2, None);
+        assert!(picture(&mut guest, hash).await.is_empty(), "gone");
+    }
+
+    #[tokio::test]
+    async fn a_relay_without_accounts_names_itself_in_its_settings_held_to_the_same_rules() {
+        let mut state = ServerState::new(
+            &ServerConfig::default(),
+            ServerSettings {
+                server_name: Some("Night Owls".into()),
+                server_description: Some("Be kind.".into()),
+                ..Default::default()
+            },
+            Vec::new(),
+            "test-admin-token".into(),
+        );
+        let ServerMessage::ServerProfile {
+            name,
+            description,
+            icon,
+        } = crate::accounts::profile::server_profile(&state).await
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (name.as_str(), description.as_str(), icon),
+            ("Night Owls", "Be kind.", None)
+        );
+
+        state.settings.server_name = Some("ivy.l4f.cc".into());
+        let ServerMessage::ServerProfile { name, .. } =
+            crate::accounts::profile::server_profile(&state).await
+        else {
+            unreachable!()
+        };
+        assert_eq!(name, "", "a bad one reads as none");
+    }
+
+    #[tokio::test]
+    async fn a_reset_needs_the_privilege_spares_who_holds_more_and_is_written_down() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "wardens", None, &["voipc:profiles"]).await;
+        let (mut kim, ki) = register(&state, "kim").await;
+        totp_on(&mut kim).await;
+        let (mut bob, bi) = register(&state, "bob").await;
+        name_is(&mut bob, "Rude Name").await;
+        let (mut ann, ai, _) = admin_account(&state, "ann").await;
+        name_is(&mut ann, "The Owner").await;
+
+        let refused =
+            |m: &ServerMessage| matches!(m, ServerMessage::Account(AccountReply::Error { .. }));
+
+        assert!(refused(&op(&mut kim, bi.id).await), "holds nothing yet");
+        give(&state, ki.id, "wardens", true).await;
+        assert!(!refused(&op(&mut kim, bi.id).await));
+        assert_eq!(asked(&mut kim, &[bi.id]).await[0].name, None);
+        assert!(refused(&op(&mut kim, ai.id).await), "the owner holds more");
+        assert_eq!(
+            asked(&mut kim, &[ai.id]).await[0].name.as_deref(),
+            Some("The Owner")
+        );
+
+        // Clearing nothing is refused, and writes nothing
+        let nothing = AdminOp::ProfileReset {
+            id: bi.id,
+            name: false,
+            picture: false,
+        };
+        kim.send(&admin_op(nothing, None)).await;
+        assert!(refused(&kim.expect("the answer", admin_answer).await));
+
+        let relay = state.accounts.clone().unwrap();
+        let audit = relay.store().audit_of(AccountId(bi.id), 50).await.unwrap();
+        assert!(
+            audit
+                .iter()
+                .any(|e| e.event == "profile_reset" && e.ip.is_empty()),
+            "written down, without the mod's address"
+        );
+    }
+}
+
+/// What the review of 1.9's layouts found.
+mod layout_limits {
+    use super::*;
+    use voipc_protocol::types::{ChannelCategory, ChannelGate, ChannelPlace};
+
+    fn sid_of(state: &ServerState, account: [u8; 16]) -> SessionId {
+        *state.account_sessions.get(&account).unwrap()
+    }
+
+    async fn layout_of(
+        state: &ServerState,
+        sid: SessionId,
+    ) -> (Vec<ChannelCategory>, Vec<ChannelPlace>) {
+        let ServerMessage::ChannelLayout {
+            categories,
+            channels,
+        } = crate::layout::for_session(state, sid).await
+        else {
+            unreachable!()
+        };
+        (categories, channels)
+    }
+
+    /// A kept channel gated to `board`, in a category of its own, and that category.
+    async fn hidden_channel(state: &Arc<ServerState>, sid: SessionId) -> (ChannelId, u32) {
+        grant(state, sid, &["*"]);
+        let id = crate::layout::channel_save(
+            state, sid, None, "board-room", "", true, false, None, None,
+        )
+        .await
+        .unwrap();
+        let category = crate::layout::category_save(state, sid, None, "Board talks")
+            .await
+            .unwrap();
+        crate::layout::layout_set(state, sid, &[], &[(id, Some(category))])
+            .await
+            .unwrap();
+        group(state, "board", None, &[]).await;
+        state.channels.write().await.get_mut(&id).unwrap().gate = ChannelGate {
+            groups: vec!["board".into()],
+            speakers: vec![],
+        };
+        grant(state, sid, &["voipc:channels"]);
+        (id, category)
+    }
+
+    #[tokio::test]
+    async fn one_layout_message_cannot_repeat_itself_into_the_list() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (_kim, ki) = register(&state, "kim").await;
+        let sid = sid_of(&state, ki.id);
+        grant(&state, sid, &["voipc:channels"]);
+        let a = crate::layout::category_save(&state, sid, None, "A").await.unwrap();
+        let b = crate::layout::category_save(&state, sid, None, "B").await.unwrap();
+        let id = crate::layout::channel_save(&state, sid, None, "news", "", true, false, None, None)
+            .await
+            .unwrap();
+        crate::layout::layout_set(&state, sid, &[b, b, a, b], &[(id, Some(b)), (id, Some(a))])
+            .await
+            .unwrap();
+        let (categories, channels) = layout_of(&state, sid).await;
+        assert_eq!(categories.iter().map(|c| c.id).collect::<Vec<_>>(), [b, a]);
+        let news: Vec<_> = channels.iter().filter(|p| p.channel_id == id).collect();
+        assert_eq!(news.len(), 1);
+        assert_eq!(news[0].category, Some(b), "the first naming counts");
+    }
+
+    #[tokio::test]
+    async fn categories_stop_where_one_message_still_holds_them() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (_kim, ki) = register(&state, "kim").await;
+        let sid = sid_of(&state, ki.id);
+        grant(&state, sid, &["voipc:channels"]);
+        let name = |i: usize| format!("{i:0>64}");
+        for i in 0..200 {
+            crate::layout::category_save(&state, sid, None, &name(i)).await.unwrap();
+        }
+        let e = crate::layout::category_save(&state, sid, None, "one more")
+            .await
+            .unwrap_err();
+        assert!(e.contains("200"), "{e}");
+        let msg = crate::layout::for_session(&state, sid).await;
+        assert!(encode_server_msg(&msg).is_ok(), "or nobody could see them to delete one");
+    }
+
+    #[tokio::test]
+    async fn a_category_of_hidden_channels_does_not_exist_for_a_manager_outside_the_gate() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (_kim, ki) = register(&state, "kim").await;
+        let sid = sid_of(&state, ki.id);
+        let (_, hidden) = hidden_channel(&state, sid).await;
+        let open = crate::layout::category_save(&state, sid, None, "Open").await.unwrap();
+        let empty = crate::layout::category_save(&state, sid, None, "Empty").await.unwrap();
+
+        let (categories, _) = layout_of(&state, sid).await;
+        let ids: Vec<u32> = categories.iter().map(|c| c.id).collect();
+        assert!(!ids.contains(&hidden), "its name says what the gate hides: {ids:?}");
+        assert!(ids.contains(&open) && ids.contains(&empty), "the really empty ones show: {ids:?}");
+
+        let no_such = "There is no such category.";
+        assert_eq!(
+            crate::layout::category_save(&state, sid, Some(hidden), "Mine").await.unwrap_err(),
+            no_such
+        );
+        assert_eq!(
+            crate::layout::category_delete(&state, sid, hidden).await.unwrap_err(),
+            no_such
+        );
+        // Its slot stays its own, whatever they do to the others
+        let before = state.layout.read().await.categories.iter().position(|c| c.id == hidden);
+        crate::layout::layout_set(&state, sid, &[empty, open], &[]).await.unwrap();
+        let after = state.layout.read().await.categories.clone();
+        assert_eq!(after.iter().position(|c| c.id == hidden), before);
+        let others: Vec<u32> = after.iter().map(|c| c.id).filter(|id| *id != hidden).collect();
+        assert_eq!(others, [empty, open]);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_category_does_not_move_a_channel_the_editor_cannot_see() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (_kim, ki) = register(&state, "kim").await;
+        let sid = sid_of(&state, ki.id);
+        let (hidden_id, category) = hidden_channel(&state, sid).await;
+        // Someone who sees everything put a channel the editor sees in there too
+        grant(&state, sid, &["*"]);
+        let seen = crate::layout::channel_save(&state, sid, None, "open-one", "", true, false, None, None)
+            .await
+            .unwrap();
+        crate::layout::layout_set(&state, sid, &[], &[(seen, Some(category))]).await.unwrap();
+        grant(&state, sid, &["voipc:channels"]);
+        assert!(crate::layout::category_delete(&state, sid, category).await.is_err());
+        let conv = state.channels.read().await[&hidden_id].gate_key.clone();
+        assert_eq!(
+            state.layout.read().await.places[&conv].category,
+            Some(category),
+            "still in it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hidden_categorys_name_cannot_be_read_by_moving_something_into_it() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (_kim, ki) = register(&state, "kim").await;
+        let sid = sid_of(&state, ki.id);
+        let (_, hidden) = hidden_channel(&state, sid).await;
+        let mine = crate::layout::channel_save(&state, sid, None, "mine", "", true, false, None, None)
+            .await
+            .unwrap();
+        let no_such = "There is no such category.";
+        assert_eq!(
+            crate::layout::layout_set(&state, sid, &[], &[(mine, Some(hidden))])
+                .await
+                .unwrap_err(),
+            no_such
+        );
+        assert_eq!(
+            crate::layout::channel_save(&state, sid, Some(mine), "mine", "", true, false, Some(hidden), None)
+                .await
+                .unwrap_err(),
+            no_such
+        );
+        assert_eq!(
+            crate::layout::layout_set(&state, sid, &[], &[(mine, Some(9999))])
+                .await
+                .unwrap_err(),
+            no_such,
+            "the same as for one that does not exist"
+        );
+        assert_eq!(
+            crate::layout::category_delete(&state, sid, 9999).await.unwrap_err(),
+            no_such
+        );
+    }
+
+    #[tokio::test]
+    async fn a_category_whose_channel_went_from_the_file_can_still_be_deleted() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (_kim, ki) = register(&state, "kim").await;
+        let sid = sid_of(&state, ki.id);
+        grant(&state, sid, &["voipc:channels"]);
+        let id = crate::layout::category_save(&state, sid, None, "Info").await.unwrap();
+        // A row left behind: a file channel renamed, removed, or a kept one left out
+        state.layout.write().await.places.insert(
+            "c:gone".into(),
+            crate::layout::Place {
+                position: 1,
+                category: Some(id),
+            },
+        );
+        let (categories, _) = layout_of(&state, sid).await;
+        assert!(
+            categories.iter().any(|c| c.id == id),
+            "or nobody could ever see it, to delete it"
+        );
+        crate::layout::category_delete(&state, sid, id).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_channel_being_deleted_cannot_be_written_back_or_entered() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (_kim, ki) = register(&state, "kim").await;
+        let sid = sid_of(&state, ki.id);
+        grant(&state, sid, &["voipc:channels"]);
+        let id = crate::layout::channel_save(&state, sid, None, "going", "", true, false, None, None)
+            .await
+            .unwrap();
+        let conv = state.channels.read().await[&id].gate_key.clone();
+        crate::layout::channel_delete(&state, sid, id).await.unwrap();
+        assert!(!state.channels.read().await.contains_key(&id));
+        let rows = state.accounts.as_ref().unwrap().layout_rows().await.unwrap();
+        assert!(!rows.rows.iter().any(|r| r.conv == conv));
+    }
+
+    #[tokio::test]
+    async fn a_channels_id_says_nothing_about_a_gate_or_whether_it_exists() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut kim, ki) = register(&state, "kim").await;
+        let sid = sid_of(&state, ki.id);
+        let (id, _) = hidden_channel(&state, sid).await;
+        state.channels.write().await.get_mut(&id).unwrap().info.anonymous = true;
+        let answers = async |c: &mut Client, m: ClientMessage| {
+            c.send(&m).await;
+            let ServerMessage::ChannelError { reason } = c
+                .expect("refused", |m| matches!(m, ServerMessage::ChannelError { .. }))
+                .await
+            else {
+                unreachable!()
+            };
+            reason
+        };
+        for channel_id in [id, 99_999] {
+            let reason = answers(
+                &mut kim,
+                ClientMessage::SetChannelOptions {
+                    channel_id,
+                    options: ChannelOptions {
+                        anonymous: Some(false),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await;
+            assert_eq!(reason, "channel does not exist", "{channel_id}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_gate_holds_for_a_channels_password_and_options_too() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut kim, ki) = register(&state, "kim").await;
+        let sid = sid_of(&state, ki.id);
+        let (id, _) = hidden_channel(&state, sid).await;
+        kim.send(&ClientMessage::SetChannelPassword {
+            channel_id: id,
+            password: Some("mine".into()),
+        })
+        .await;
+        let ServerMessage::ChannelError { reason } = kim
+            .expect("refused", |m| matches!(m, ServerMessage::ChannelError { .. }))
+            .await
+        else {
+            unreachable!()
+        };
+        assert_eq!(reason, "channel does not exist", "the same as for no channel at all");
+        assert!(!state.channels.read().await[&id].info.has_password);
+    }
+
+    #[tokio::test]
+    async fn a_refused_edit_changes_nothing() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (_kim, ki) = register(&state, "kim").await;
+        let sid = sid_of(&state, ki.id);
+        grant(&state, sid, &["voipc:channels"]);
+        let id = crate::layout::channel_save(&state, sid, None, "old", "", true, false, None, None)
+            .await
+            .unwrap();
+        let bad = ChannelGate {
+            groups: vec!["no-such-group".into()],
+            speakers: vec![],
+        };
+        crate::layout::channel_save(&state, sid, Some(id), "new", "", true, false, None, Some(bad))
+            .await
+            .unwrap_err();
+        assert_eq!(state.channels.read().await[&id].info.name, "old");
+    }
+
+    #[tokio::test]
+    async fn a_channel_made_here_counts_towards_the_join_burst_of_who_comes_next() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (_kim, ki) = register(&state, "kim").await;
+        let sid = sid_of(&state, ki.id);
+        grant(&state, sid, &["voipc:channels"]);
+        let budget = || state.channel_budget.load(std::sync::atomic::Ordering::Relaxed);
+        let before = budget();
+        let id = crate::layout::channel_save(&state, sid, None, "news", "", true, false, None, None)
+            .await
+            .unwrap();
+        assert_eq!(budget(), before + 1);
+        crate::layout::channel_delete(&state, sid, id).await.unwrap();
+        assert_eq!(budget(), before);
+    }
+
+    #[tokio::test]
+    async fn who_comes_to_manage_channels_is_told_the_empty_categories() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "editors", None, &["voipc:channels"]).await;
+        let (_ann, ai) = register(&state, "ann").await;
+        let (mut kim, ki) = register(&state, "kim").await;
+        totp_on(&mut kim).await;
+        grant(&state, sid_of(&state, ai.id), &["voipc:channels"]);
+        crate::layout::category_save(&state, sid_of(&state, ai.id), None, "Empty")
+            .await
+            .unwrap();
+        give(&state, ki.id, "editors", true).await;
+        loop {
+            let ServerMessage::ChannelLayout { categories, .. } = kim
+                .expect("the layout", |m| matches!(m, ServerMessage::ChannelLayout { .. }))
+                .await
+            else {
+                unreachable!()
+            };
+            if categories.iter().any(|c| c.name == "Empty") {
+                break;
+            }
+        }
+    }
+}
+
+/// The slower of two reads of an account's scopes must not undo the newer one: a
+/// grant at the moment codes go on came out with no privilege at all, until the next
+/// pass of `revalidate`.
+#[tokio::test]
+async fn a_slower_read_of_an_accounts_scopes_does_not_undo_a_newer_one() {
+    let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+    group(&state, "keepers", None, &["roles:admin"]).await;
+    let (mut kim, ki) = register(&state, "kim").await;
+    totp_on(&mut kim).await;
+    let relay = state.accounts.clone().unwrap();
+    let sid = *state.account_sessions.get(&ki.id).unwrap();
+    let scopes_now = || {
+        state
+            .sessions
+            .get(&sid)
+            .and_then(|s| s.account.as_ref().map(|a| a.scopes.clone()))
+            .unwrap()
+    };
+    let kim_user = relay.store().user_by_id(AccountId(ki.id)).await.unwrap().unwrap();
+
+    // Started first, and it read before the grant
+    let slow = crate::accounts::scope_read(&state, sid);
+    let stale = relay.accounts.effective_scopes(&kim_user).await.unwrap();
+    assert!(!stale.contains(&"roles:admin".to_string()));
+
+    give(&state, ki.id, "keepers", true).await;
+    assert!(scopes_now().contains(&"roles:admin".to_string()), "the grant");
+
+    // Finishes last
+    crate::accounts::apply_scopes(&state, &relay, sid, kim_user.clone(), stale.clone(), slow)
+        .await
+        .unwrap();
+    assert!(
+        scopes_now().contains(&"roles:admin".to_string()),
+        "the older answer is dropped"
+    );
+
+    // A read that wrote nothing cancels nothing: `revalidate` starts one for every
+    // session on its round, and most find nothing to do
+    let quiet = crate::accounts::scope_read(&state, sid);
+    let _ = crate::accounts::scope_read(&state, sid);
+    crate::accounts::apply_scopes(&state, &relay, sid, kim_user.clone(), scopes_now(), quiet)
+        .await
+        .unwrap();
+    assert!(scopes_now().contains(&"roles:admin".to_string()));
+
+    // The latest read does count, whatever it says
+    let last = crate::accounts::scope_read(&state, sid);
+    crate::accounts::apply_scopes(&state, &relay, sid, kim_user, stale, last)
+        .await
+        .unwrap();
+    assert!(!scopes_now().contains(&"roles:admin".to_string()));
+}
+
+/// `@everyone`, `@here`, `@&badge`: who the relay says may use them (1.9).
+mod mention_power {
+    use super::*;
+
+    async fn holders(c: &mut Client) -> (Vec<UserId>, bool) {
+        let ServerMessage::MentionPower { user_ids, on } = c
+            .expect("the holders", |m| {
+                matches!(m, ServerMessage::MentionPower { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        (user_ids, on)
+    }
+
+    async fn badges(c: &mut Client) -> Vec<String> {
+        let ServerMessage::MyBadges { badges } = c
+            .expect("our badges", |m| {
+                matches!(m, ServerMessage::MyBadges { .. })
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        badges
+    }
+
+    fn uid_of(state: &ServerState, account: [u8; 16]) -> UserId {
+        let sid = *state.account_sessions.get(&account).unwrap();
+        state.sessions.get(&sid).unwrap().user_id
+    }
+
+    #[tokio::test]
+    async fn holders_are_told_on_change_and_to_whoever_arrives() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "callers", None, &["voipc:mention_all"]).await;
+        let (mut kim, ki) = register(&state, "kim").await;
+        totp_on(&mut kim).await;
+        let (mut bob, _) = register(&state, "bob").await;
+        give(&state, ki.id, "callers", true).await;
+        let kim_id = uid_of(&state, ki.id);
+        assert_eq!(holders(&mut bob).await, (vec![kim_id], true));
+
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut late = connect(&state, "late#1234", lo).await;
+        assert_eq!(
+            holders(&mut late).await,
+            (vec![kim_id], true),
+            "a guest hears too"
+        );
+
+        // Bob may have heard it twice, as a change and on connecting: it adds nothing
+        give(&state, ki.id, "callers", false).await;
+        while holders(&mut bob).await.1 {}
+    }
+
+    #[test]
+    fn calling_on_everybody_is_no_role_for_an_address_ban_either() {
+        let only = ["voipc:mention_all".to_string()];
+        assert!(!crate::accounts::holds_power(&only));
+        assert!(!crate::accounts::holds_power(&[]));
+        assert!(crate::accounts::holds_power(&["voipc:kick".to_string()]));
+        assert!(crate::accounts::holds_power(&[
+            "voipc:mention_all".to_string(),
+            "voipc:profiles".to_string()
+        ]));
+    }
+
+    #[tokio::test]
+    async fn calling_on_everybody_spares_nobody_from_a_kick() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "callers", None, &["voipc:mention_all"]).await;
+        group(&state, "kickers", None, &["voipc:kick"]).await;
+        let (mut kim, ki) = register(&state, "kim").await;
+        totp_on(&mut kim).await;
+        let sid = *state.account_sessions.get(&ki.id).unwrap();
+        give(&state, ki.id, "callers", true).await;
+        assert!(!state.sessions.get(&sid).unwrap().is_moderator);
+        give(&state, ki.id, "kickers", true).await;
+        assert!(state.sessions.get(&sid).unwrap().is_moderator);
+    }
+
+    #[tokio::test]
+    async fn every_own_badge_reaches_the_account_though_a_row_shows_three() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        for (name, badge) in [("a1", "A"), ("b2", "B"), ("c3", "C"), ("d4", "D")] {
+            group(&state, name, Some(badge), &[]).await;
+        }
+        let (mut bob, bi) = register(&state, "bob").await;
+        for g in ["a1", "b2", "c3", "d4"] {
+            give(&state, bi.id, g, true).await;
+        }
+        // One at a time, and one of them may also have been told on connecting
+        while badges(&mut bob).await != ["A", "B", "C", "D"] {}
+        let sid = *state.account_sessions.get(&bi.id).unwrap();
+        let shown = state
+            .sessions
+            .get(&sid)
+            .unwrap()
+            .account
+            .as_ref()
+            .unwrap()
+            .standing
+            .badges
+            .clone();
+        assert_eq!(shown, ["A", "B", "C"]);
+    }
+
+    #[test]
+    fn the_names_it_means_cannot_be_taken() {
+        let cfg = crate::accounts::l4f_config(&crate::config::AccountsConfig::default(), [0; 16]);
+        for name in ["everyone", "here"] {
+            assert!(cfg.reserved_usernames.iter().any(|r| r == name), "{name}");
+        }
+    }
+}
+
+/// Reusable invite links (1.9).
+mod invite_links {
+    use super::*;
+
+    async fn answer(c: &mut Client, op: AdminOp) -> AccountReply {
+        c.send(&admin_op(op, None)).await;
+        let ServerMessage::Account(r) = c.expect("the answer", admin_answer).await else {
+            unreachable!()
+        };
+        r
+    }
+
+    async fn new_link(ann: &mut Client, max_uses: u32, days: u32, group: Option<&str>) -> String {
+        let op = AdminOp::InviteLinkNew {
+            max_uses,
+            days,
+            group: group.map(String::from),
+        };
+        match answer(ann, op).await {
+            AccountReply::Admin(AdminReply::InviteLinkCode { code }) => code,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Signs up with a link, as `register` does; what the relay said if not.
+    async fn sign_up(state: &Arc<ServerState>, name: &str, code: &str) -> Result<(Client, AccountInfo), String> {
+        let mut c = open_account(
+            state,
+            name,
+            AccountStart::Register {
+                invite: Some(code.into()),
+            },
+        )
+        .await;
+        let pow = match c.next().await {
+            Some(ServerMessage::AuthStep(AuthStep::Salt { pow: Some(pow), .. })) => pow,
+            Some(ServerMessage::AuthError { reason }) => return Err(reason),
+            other => panic!("{other:?}"),
+        };
+        let vault = vec![
+            VaultBlob {
+                k: "slot.hkdf".into(),
+                v: vec![1, 2, 3],
+                version: 0,
+            },
+            reset_slot(),
+        ];
+        let altcha = solve(&pow.altcha);
+        c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
+            auth_secret: SECRET.to_vec(),
+            altcha,
+            ts: pow.ts,
+            vault,
+        }))
+        .await;
+        c.send(&keys(&IDENTITY, false)).await;
+        loop {
+            match c.next().await {
+                Some(ServerMessage::Authenticated {
+                    account: Some(info),
+                    ..
+                }) => return Ok((c, info)),
+                Some(ServerMessage::AuthError { reason }) => return Err(reason),
+                Some(_) => {}
+                None => return Err("closed".into()),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn many_people_sign_up_with_one_link_where_sign_up_is_by_invite() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Invite).await;
+        group(&state, "crew", Some("Crew"), &[]).await;
+        let (mut ann, _, _) = admin_on_invite_relay(&state, "ann").await;
+        let code = new_link(&mut ann, 2, 7, Some("crew")).await;
+        assert_eq!(code.len(), 43);
+        let codes = state.accounts.as_ref().unwrap().store().invites(l4f_accounts::util::now()).await.unwrap().len();
+
+        let (_bob, bi) = sign_up(&state, "bob", &code).await.unwrap();
+        let (_cat, _) = sign_up(&state, "cat", &code).await.unwrap();
+        let e = sign_up(&state, "dan", &code).await.err().unwrap();
+        assert!(e.contains("not valid"), "used up: {e}");
+
+        let relay = state.accounts.clone().unwrap();
+        let bob = relay.store().user_by_id(AccountId(bi.id)).await.unwrap().unwrap();
+        assert!(
+            relay.store().user_roles(bob.id).await.unwrap().iter().any(|r| r.name == "crew"),
+            "in its starting group"
+        );
+        assert_eq!(
+            relay.store().invites(l4f_accounts::util::now()).await.unwrap().len(),
+            codes,
+            "no row left behind per sign-up"
+        );
+        let reply = answer(&mut ann, AdminOp::InviteLinks).await;
+        let AccountReply::Admin(AdminReply::InviteLinks { links }) = reply else {
+            panic!("{reply:?}");
+        };
+        assert_eq!((links[0].uses, links[0].max_uses), (2, 2));
+        assert_eq!(links[0].group.as_deref(), Some("crew"));
+        assert_ne!(links[0].id, code, "the list never holds the code");
+    }
+
+    #[tokio::test]
+    async fn a_refused_sign_up_gives_its_use_back() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Invite).await;
+        let (mut ann, _, _) = admin_on_invite_relay(&state, "ann").await;
+        let code = new_link(&mut ann, 1, 7, None).await;
+        let e = sign_up(&state, "ann", &code).await.err().unwrap();
+        assert!(!e.contains("not valid"), "the name was taken: {e}");
+        sign_up(&state, "bob", &code).await.expect("its one use is still there");
+    }
+
+    #[tokio::test]
+    async fn a_taken_name_costs_neither_a_use_nor_the_limits_all_sign_up_shares() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Invite).await;
+        let (mut ann, _, _) = admin_on_invite_relay(&state, "ann").await;
+        let code = new_link(&mut ann, 5, 7, None).await;
+        let relay = state.accounts.clone().unwrap();
+        let hour = Duration::from_secs(3600);
+        assert!(relay.accounts.limiter.peek("acct-reg:try:global", hour, 1));
+        for name in ["ann", "general"] {
+            assert!(sign_up(&state, name, &code).await.is_err(), "{name}");
+        }
+        assert!(
+            relay.accounts.limiter.peek("acct-reg:try:global", hour, 1),
+            "someone with the link could otherwise shut sign-up for everybody"
+        );
+        assert_eq!(relay.links().await.unwrap()[0].uses, 0);
+    }
+
+    #[tokio::test]
+    async fn who_made_a_link_and_who_came_through_it_is_written_down() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Invite).await;
+        let (mut ann, ai, _) = admin_on_invite_relay(&state, "ann").await;
+        let relay = state.accounts.clone().unwrap();
+        let code = new_link(&mut ann, 5, 7, None).await;
+        let (_bob, bi) = sign_up(&state, "bob", &code).await.unwrap();
+        let id = relay.links().await.unwrap()[0].id.clone();
+        answer(&mut ann, AdminOp::InviteLinkRevoke { id: id.clone() }).await;
+
+        let of = |a: [u8; 16]| {
+            let relay = relay.clone();
+            async move { relay.store().audit_of(AccountId(a), 50).await.unwrap() }
+        };
+        let ann_did = of(ai.id).await;
+        for event in ["invite_link_new", "invite_link_revoke"] {
+            let row = ann_did.iter().find(|e| e.event == event).unwrap_or_else(|| panic!("{event}"));
+            assert_eq!(row.actor_id, Some(AccountId(ai.id)), "{event}");
+            assert!(row.detail.contains(&id), "{event}: {}", row.detail);
+        }
+        let bob_came = of(bi.id).await;
+        let row = bob_came.iter().find(|e| e.event == "invite_link_used").unwrap();
+        assert_eq!(row.actor_id, Some(AccountId(ai.id)), "by whose link");
+        assert_eq!(row.detail, id);
+    }
+
+    #[tokio::test]
+    async fn a_link_does_not_stand_in_for_the_proof_of_work() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Invite).await;
+        let (mut ann, _, _) = admin_on_invite_relay(&state, "ann").await;
+        let code = new_link(&mut ann, 5, 7, None).await;
+        let mut c = open_account(
+            &state,
+            "bob",
+            AccountStart::Register {
+                invite: Some(code),
+            },
+        )
+        .await;
+        let Some(ServerMessage::AuthStep(AuthStep::Salt { pow: Some(pow), .. })) = c.next().await else {
+            panic!("a link is asked for the work too");
+        };
+        c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
+            auth_secret: SECRET.to_vec(),
+            altcha: String::new(),
+            ts: pow.ts,
+            vault: vec![
+                VaultBlob {
+                    k: "slot.hkdf".into(),
+                    v: vec![1, 2, 3],
+                    version: 0,
+                },
+                reset_slot(),
+            ],
+        }))
+        .await;
+        assert!(matches!(c.next().await, Some(ServerMessage::AuthError { .. }) | None));
+    }
+
+    #[tokio::test]
+    async fn a_revoked_or_expired_link_or_a_made_up_one_lets_nobody_in() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Invite).await;
+        let (mut ann, _, _) = admin_on_invite_relay(&state, "ann").await;
+        let relay = state.accounts.clone().unwrap();
+
+        assert!(sign_up(&state, "bob", &"A".repeat(43)).await.is_err(), "made up");
+
+        let gone = new_link(&mut ann, 5, 7, None).await;
+        let id = relay.links().await.unwrap()[0].id.clone();
+        let reply = answer(&mut ann, AdminOp::InviteLinkRevoke { id }).await;
+        assert!(matches!(reply, AccountReply::Admin(AdminReply::InviteLinks { .. })), "{reply:?}");
+        assert!(sign_up(&state, "bob", &gone).await.is_err(), "revoked");
+
+        let late = new_link(&mut ann, 5, 7, None).await;
+        relay.links_all_expired().await.unwrap();
+        assert!(sign_up(&state, "bob", &late).await.is_err(), "expired");
+    }
+
+    #[tokio::test]
+    async fn a_starting_group_holds_nothing_when_made_and_when_used() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Invite).await;
+        group(&state, "crew", Some("Crew"), &[]).await;
+        group(&state, "mods", None, &["voipc:kick"]).await;
+        let (mut ann, _, _) = admin_on_invite_relay(&state, "ann").await;
+        let relay = state.accounts.clone().unwrap();
+
+        let op = AdminOp::InviteLinkNew {
+            max_uses: 5,
+            days: 7,
+            group: Some("mods".into()),
+        };
+        assert!(matches!(answer(&mut ann, op).await, AccountReply::Error { .. }));
+        for bad in [
+            AdminOp::InviteLinkNew { max_uses: 0, days: 7, group: None },
+            AdminOp::InviteLinkNew { max_uses: 5, days: 366, group: None },
+        ] {
+            assert!(matches!(answer(&mut ann, bad).await, AccountReply::Error { .. }));
+        }
+
+        let code = new_link(&mut ann, 5, 0, Some("crew")).await;
+        let crew = relay.store().role_by_name("crew").await.unwrap().unwrap();
+        relay
+            .store()
+            .set_role_scopes(crew.id, &["voipc:kick".to_string()])
+            .await
+            .unwrap();
+        let (_bob, bi) = sign_up(&state, "bob", &code).await.unwrap();
+        assert!(
+            !relay.store().user_roles(AccountId(bi.id)).await.unwrap().iter().any(|r| r.name == "crew"),
+            "the group was given power since: the link no longer hands it out"
+        );
+    }
+
+    #[tokio::test]
+    async fn only_who_manages_accounts_makes_links_and_a_closed_relay_has_none() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (mut bob, _) = register(&state, "bob").await;
+        let op = AdminOp::InviteLinkNew { max_uses: 5, days: 7, group: None };
+        assert!(matches!(answer(&mut bob, op.clone()).await, AccountReply::Error { .. }));
+        assert!(matches!(answer(&mut bob, AdminOp::InviteLinks).await, AccountReply::Error { .. }));
+
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Closed).await;
+        let (mut ann, _, _) = admin_on_invite_relay(&state, "ann").await;
+        assert!(matches!(answer(&mut ann, op).await, AccountReply::Error { .. }));
+    }
+
+    /// `admin_account` on a relay where nobody signs up without a code.
+    async fn admin_on_invite_relay(
+        state: &Arc<ServerState>,
+        name: &str,
+    ) -> (Client, AccountInfo, Vec<u8>) {
+        let relay = state.accounts.clone().unwrap();
+        let ctx = relay.ctx(IpAddr::V4(Ipv4Addr::LOCALHOST), "test");
+        let code = relay.accounts.invite_create_as_host(&ctx, Some(name), 1).await.unwrap();
+        let mut c = open_account(state, name, AccountStart::Register { invite: Some(code) }).await;
+        let Some(ServerMessage::AuthStep(AuthStep::Salt { .. })) = c.next().await else {
+            panic!("a code opens the door");
+        };
+        c.send(&ClientMessage::AuthContinue(AuthContinue::Register {
+            auth_secret: SECRET.to_vec(),
+            altcha: String::new(),
+            ts: String::new(),
+            vault: vec![
+                VaultBlob {
+                    k: "slot.hkdf".into(),
+                    v: vec![1, 2, 3],
+                    version: 0,
+                },
+                reset_slot(),
+            ],
+        }))
+        .await;
+        c.send(&keys(&IDENTITY, false)).await;
+        let ServerMessage::Authenticated {
+            account: Some(info),
+            ..
+        } = c
+            .expect("Authenticated", |m| matches!(m, ServerMessage::Authenticated { .. }))
+            .await
+        else {
+            panic!("signed in");
+        };
+        relay
+            .accounts
+            .grant_role_as_host(&ctx, AccountId(info.id), "admin")
+            .await
+            .unwrap();
+        let secret = totp_on(&mut c).await;
+        c.expect("AdminStatus", |m| {
+            matches!(m, ServerMessage::AdminStatus { is_admin: true, .. })
+        })
+        .await;
+        (c, info, secret)
     }
 }

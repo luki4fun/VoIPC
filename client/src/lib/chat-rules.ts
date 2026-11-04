@@ -366,7 +366,7 @@ export function fileRef(v: unknown): FileRef | undefined {
 /** The fields the archive has a place of its own for (crypto.rs `ChatMessage`). */
 const ARCHIVE_FIELDS = new Set(["user_id", "username", "content", "timestamp", "kind", "id", "expires_at", "account"]);
 /** The fields `extra` holds that this version reads back (`fromArchived`). */
-const EXTRA_FIELDS = new Set(["reply_to", "thread", "file", "fwd", "edited_at", "reactions", "pin"]);
+const EXTRA_FIELDS = new Set(["reply_to", "thread", "file", "fwd", "edited_at", "reactions", "pin", "power"]);
 
 /**
  * A message as the desktop archive stores it: every field it has no place of
@@ -412,6 +412,7 @@ export function fromArchived(m: ChatMessage & { extra?: string | null }): ChatMe
       ...rest,
       ...messageRefs(more),
       ...eventState(more, rest.timestamp),
+      ...(more.power === true ? { power: true } : {}),
       ...(unknown.length > 0 ? { extra_kept: JSON.stringify(Object.fromEntries(unknown)) } : {}),
     };
   } catch {
@@ -564,12 +565,14 @@ export function mergeHistory(
       if ((kept[seen].kind === "shared" && m.kind !== "shared") || (!kept[seen].account && m.account)) {
         // What this reader saw done to it stays: reactions and a pin are
         // their own record, and the row on screen is the same row
-        const { reactions, pin } = kept[seen];
+        const { reactions, pin, power } = kept[seen];
         kept[seen] = succeed(kept[seen], {
           ...m,
           expires_at: soonerExpiry(kept[seen].expires_at, m.expires_at),
           ...(reactions ? { reactions } : {}),
           ...(pin ? { pin } : {}),
+          // Who held what when it arrived is known only here, and only then
+          ...(power ? { power } : {}),
         });
         replaced++;
       } else {

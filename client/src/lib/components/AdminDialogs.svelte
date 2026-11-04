@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { adminOps, community } from "../relay-rules.js";
   import { backdrop, dialog } from "../actions/dialog.js";
   import { roving } from "../actions/roving.js";
   // Admin token login, and the server admin panel: bans, emotes, and on a
@@ -31,13 +32,16 @@
   import { can } from "../stores/powers.js";
   import { emoteLimits, pendingImport } from "../stores/emotes.js";
   import { olderRelay } from "../stores/relay.js";
+  import { serverAddress } from "../stores/connection.js";
   import EmoteManager from "./EmoteManager.svelte";
   import AdminUsers from "./AdminUsers.svelte";
   import AdminGroups from "./AdminGroups.svelte";
+  import AdminServer from "./AdminServer.svelte";
+  import AdminChannels from "./AdminChannels.svelte";
   import Icon from "./Icons.svelte";
   import type { BanInfo } from "../types.js";
 
-  type Tab = "bans" | "emotes" | "users" | "groups";
+  type Tab = "bans" | "emotes" | "users" | "groups" | "channels" | "server";
   let tab = $state<Tab>("bans");
   // A chat picture's "Make an emote or sticker…": straight to the importer
   $effect(() => {
@@ -46,12 +50,14 @@
   /** The tabs this account's privileges open; users and groups need a relay
    *  with accounts of 1.7 or later. */
   const tabs = $derived.by(() => {
-    const groups = !!$relayAccounts && !$olderRelay;
+    const groups = !!$relayAccounts && adminOps($olderRelay?.protocol ?? null);
     const t: [Tab, string][] = [];
     if ($can("voipc:bans")) t.push(["bans", "Bans"]);
     if ($emoteLimits && $can("voipc:emotes")) t.push(["emotes", "Emotes and stickers"]);
     if (groups && $can("users:read")) t.push(["users", "Users"]);
     if (groups && ($can("roles:admin") || $can("users:read"))) t.push(["groups", "Groups"]);
+    if ($relayAccounts && community($olderRelay?.protocol ?? null) && $can("voipc:channels")) t.push(["channels", "Channels"]);
+    if ($relayAccounts && community($olderRelay?.protocol ?? null) && $can("*")) t.push(["server", "Server"]);
     return t;
   });
   /** What was picked, or the first tab still open to us. */
@@ -148,7 +154,7 @@
             <div class="inline-form">
               <!-- svelte-ignore a11y_autofocus -->
               <input class="admin-input code-input" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" aria-label="Two-factor code" bind:value={stepCode} autofocus />
-              <button type="button" class="btn btn-secondary admin-cancel" onclick={() => { clearShown(stepUp); stepCode = ""; }}>Cancel</button>
+              <button type="button" class="btn btn-secondary admin-cancel" onclick={() => { clearShown(stepUp); adminError.of($serverAddress).set("Not done: that takes a code."); stepCode = ""; }}>Cancel</button>
               <button type="submit" class="btn btn-primary admin-ok" disabled={!stepCode.trim()}>Confirm</button>
             </div>
           </form>
@@ -162,6 +168,10 @@
           <AdminUsers />
         {:else if shown === "groups"}
           <AdminGroups />
+        {:else if shown === "channels"}
+          <AdminChannels />
+        {:else if shown === "server"}
+          <AdminServer />
         {:else}
           {#if $relayAccounts}
             <section class="section">

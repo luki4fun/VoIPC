@@ -10,7 +10,7 @@ import { invoke } from "@tauri-apps/api/core";
 
 import { serverAddress } from "./connection.js";
 import { scoped } from "./scoped.js";
-import type { AdminOp, AdminUser, AuditRow, ChannelGate, GroupInfo, InviteInfo } from "../types.js";
+import type { AdminOp, AdminUser, AuditRow, ChannelGate, GroupInfo, InviteInfo, InviteLinkInfo } from "../types.js";
 
 export interface UserPage {
   search: string;
@@ -42,6 +42,9 @@ export const adminMembers = scoped<MemberPage | null>(() => null);
 export const adminInvites = scoped<InviteInfo[] | null>(() => null);
 /** A new invite's code, shown once. */
 export const inviteCode = scoped<string | null>(() => null);
+/** Reusable invite links, and a new one's code: shown once. */
+export const adminInviteLinks = scoped<InviteLinkInfo[] | null>(() => null);
+export const inviteLinkCode = scoped<string | null>(() => null);
 export const adminGate = scoped<GateView | null>(() => null);
 /** The last refusal, shown in the panel rather than as a toast. */
 export const adminError = scoped<string | null>(() => null);

@@ -39,6 +39,7 @@ import { addNotification } from "./stores/notifications.js";
 import { pendingPokes } from "./stores/pokes.js";
 import { splitName, withTag } from "./username.js";
 import { clearRosters } from "./stores/rosters.js";
+import { clearProfiles } from "./stores/profiles.js";
 import { dropEmotes } from "./stores/emotes.js";
 import { dropServer, scoped } from "./stores/scoped.js";
 import {
@@ -455,6 +456,7 @@ export async function saveOpenServers(): Promise<void> {
  */
 export function resetServer(server: string): void {
   clearRosters(server);
+  clearProfiles(server);
   dropEmotes(server);
   dropServer(server);
   dropPrompts(server);
