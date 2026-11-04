@@ -11752,11 +11752,10 @@ mod moderation {
 
         let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
         let mut guest = connect(&state, "late#1234", lo).await;
-        assert_eq!(
-            mod_lists(&sent_by_now(&mut guest).await),
-            [want.clone()],
-            "a guest hears too"
-        );
+        // Once at connect, and maybe again if a holder's last change was still going
+        // out as they arrived: a client simply takes the list again.
+        let lists = mod_lists(&sent_by_now(&mut guest).await);
+        assert_eq!(lists.last(), Some(&want), "a guest hears too");
 
         // A pass finding nothing new tells nobody
         crate::accounts::revalidate(&state).await;
