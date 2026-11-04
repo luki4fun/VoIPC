@@ -219,6 +219,49 @@ async function doConnect(address: string, username: string, account?: AccountArg
   return session.userId;
 }
 
+/** A question for the relay at `address` that ends with its answer, on a
+ *  connection of its own (account.rs `account_provider_ask`). */
+export async function askRelay(address: string, ask: unknown): Promise<unknown> {
+  const { host, port } = parseAddress(address);
+  const api = await loadWasm();
+  return new Promise((resolve, reject) => {
+    let transport: Transport | undefined;
+    let over = false;
+    const end = (go: () => void) => {
+      if (over) return;
+      over = true;
+      clearTimeout(timer);
+      transport?.close();
+      go();
+    };
+    const timer = setTimeout(() => end(() => reject(new Error("The server did not answer."))), AUTH_TIMEOUT_MS);
+    openTransport(host, port, {
+      onControl: (payload) => {
+        const [tag, body] = Object.entries(api.decodeServerMsg(payload) as Record<string, any>)[0] ?? ["", null];
+        if (tag === "AuthError") return end(() => reject(new Error(body.reason)));
+        // Another protocol: an older relay has no providers
+        if (tag === "Refused") return end(() => resolve({ providers: [] }));
+        if (tag !== "AuthStep") return;
+        const [step, b] = typeof body === "string" ? [body, null] : (Object.entries(body)[0] as [string, any]);
+        if (step === "Providers") end(() => resolve({ providers: b.kinds }));
+        else if (step === "OpenBrowser") end(() => resolve({ url: b.url, code: b.code, ticket: Array.from(b.ticket as number[]) }));
+        else if (step === "ProviderReady") end(() => resolve({ ready: true }));
+        else if (step === "ProviderPending") end(() => resolve({ ready: false }));
+      },
+      onDatagram: () => {},
+      onVideoPacket: () => {},
+      onClosed: (reason) => end(() => reject(new Error(reason))),
+    }).then(
+      (t) => {
+        if (over) return t.close();
+        transport = t;
+        t.sendControl(api.providerAsk(ask));
+      },
+      (e) => end(() => reject(e)),
+    );
+  });
+}
+
 /** network.rs parse_address's rules: the port defaults to 9987. */
 function parseAddress(address: string): { host: string; port: number } {
   const parsed = parseHostPort(address);
@@ -309,7 +352,7 @@ export class Session implements SessionContext, AccountHost {
     /** The server id: the address the UI connected with, verbatim. */
     readonly server: string,
     public signal: SignalClient,
-    readonly username: string,
+    public username: string,
   ) {
     this.mediaKeys = wasm().newMediaKeys();
   }
@@ -640,6 +683,8 @@ export class Session implements SessionContext, AccountHost {
           }
           try {
             this.account.onAuthenticated(this, b.account);
+            // A provider's sign-in only knows now who it is
+            this.username = b.account.name;
           } catch (e) {
             this.failAuth(e instanceof Error ? e : new Error(String(e)));
             break;

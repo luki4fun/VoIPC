@@ -42,6 +42,7 @@ fn traced_format() -> String {
         AdminReply,
         Registration,
         AccountStart,
+        ProviderKind,
         VideoCodec,
         ProximityMode,
         FileConv,

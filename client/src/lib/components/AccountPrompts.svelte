@@ -46,6 +46,14 @@
   let useRecovery = $state(false);
   let error = $state("");
   let busy = $state(false);
+  /** The name to take, at a provider's first sign-in. */
+  let providerName = $state("");
+  /** The recovery key, typed at a provider's sign-in. */
+  let recoveryText = $state("");
+  /** "First time here" was asked for, and the warning under it is on screen. */
+  let claimAsked = $state(false);
+  /** What the relay offers and this account has linked (`ProviderList`). */
+  let providers = $state<{ offered: string[]; linked: { kind: string; name: string }[]; hasPassword: boolean } | null>(null);
   let qr = $state("");
   let copied = $state(false);
   /** A new recovery key on its way: shown once the relay says it is in
@@ -151,6 +159,8 @@
         "account-signed-in",
         (server, d) => {
           account.of(server).set({ name: d.name, relayId: d.relay_id, info: d.info, cloud: d.prefs.cloud });
+          const waiting = get(accountPrompt);
+          if (waiting?.kind === "pair-wait" && waiting.server === server) closePrompt(waiting);
           // Before the log is read: what was cleared must not come back with it
           loadBrowserMarks(server, d.name);
           // The second factor a role needs is asked for by the backend once the
@@ -168,6 +178,32 @@
       listenServer<boolean>("account-need-totp", (server, retry) => {
         reset();
         showPrompt({ kind: "totp", server, retry });
+      }),
+      listenServer<{ suggestion: string; problem: string }>("account-provider-signup", (server, d) => {
+        reset();
+        providerName = d.suggestion;
+        showPrompt({ kind: "provider-name", server, suggestion: d.suggestion, problem: d.problem });
+      }),
+      listenServer<{ name: string; claim: boolean; has_password: boolean; problem: string }>("account-provider-choice", (server, d) => {
+        const now = get(accountPrompt);
+        if (now?.kind === "pair-wait" && now.server === server) closePrompt(now);
+        reset();
+        recoveryText = "";
+        claimAsked = false;
+        showPrompt({ kind: "provider-choice", server, name: d.name, claim: d.claim, hasPassword: d.has_password, problem: d.problem });
+      }),
+      // This device, which asked: the code to compare on the other one.
+      listenServer<string>("account-pair-code", (server, code) => {
+        const now = get(accountPrompt);
+        if (now?.kind === "pair-wait" && now.server === server) accountPrompt.set({ ...now, code });
+      }),
+      // Another device asks this one, and the person must compare before anything leaves.
+      listenServer<{ pair: number; code: string }>("account-pair-ask", (server, d) => {
+        showPrompt({ kind: "pair-ask", server, pair: d.pair, code: d.code });
+      }),
+      listenServer<{ pair: number }>("account-pair-ended", (server, d) => {
+        const now = get(accountPrompt);
+        if (now?.kind === "pair-ask" && now.server === server && now.pair === d.pair) closePrompt(now);
       }),
       listenServer<unknown>("account-reply", (server, reply) => onReply(server, reply)),
       // The stored log of a direct conversation: what was written while one of us was away.
@@ -281,6 +317,31 @@
         reset();
         showPrompt({ kind: "recovery-codes", server, codes: body.recovery_codes });
         break;
+      case "Providers":
+        providers = { offered: body.offered, linked: body.linked, hasPassword: body.has_password };
+        break;
+      case "ProviderBrowser":
+        if (prompt?.kind === "provider-confirm" && prompt.server === server) closePrompt(prompt);
+        reset();
+        showPrompt({ kind: "provider-page", server, url: body.url, code: body.code });
+        break;
+      case "ProviderDone": {
+        const now = get(accountPrompt);
+        if (now?.kind === "provider-page" && now.server === server) closePrompt(now);
+        reset();
+        addNotification(
+          body.link ? `${fromServer(server)}${body.kind} is linked to this account` : `${fromServer(server)}confirmed. Go on within a few minutes.`,
+          "info",
+        );
+        listProviders(server);
+        break;
+      }
+      case "ProviderUnlinked":
+        if (prompt?.kind === "provider-confirm" && prompt.server === server) closePrompt(prompt);
+        reset();
+        addNotification(`${fromServer(server)}${body.kind} is no longer linked`, "info");
+        listProviders(server);
+        break;
       case "Info": {
         const before = get(account.peek(server))?.info.needs_2fa;
         account.of(server).update((a) => (a ? { ...a, info: body as AccountInfo } : a));
@@ -326,6 +387,7 @@
           prompt.server === server &&
           (prompt.kind === "totp-setup" ||
             (prompt.kind === "password" && body.request === "PasswordChange") ||
+            (prompt.kind === "provider-confirm" && (body.request === "ProviderStart" || body.request === "ProviderUnlink")) ||
             (prompt.kind === "recovery-new" && body.request === "RecoveryKeyNew") ||
             (prompt.kind === "delete" && body.request === "DeleteAccount"))
         ) {
@@ -335,6 +397,88 @@
           addNotification(`${fromServer(server)}${body.reason}`, "warning");
         }
         break;
+    }
+  }
+
+  function listProviders(server: string) {
+    invoke("account_request", { server, request: "ProviderList" }).catch(() => {});
+  }
+
+  // What the account panel, and the steps that ask for a password, go by.
+  // An older relay never answers, and `null` then means a password.
+  let providersOf = "";
+  $effect(() => {
+    const p = $accountPrompt;
+    if (p?.kind !== "account" || p.server === providersOf) return;
+    providersOf = p.server;
+    providers = null;
+    listProviders(p.server);
+  });
+
+  /** The person's answer at a provider's sign-in. The prompt goes first: a
+   *  wrong recovery key, a refused pairing or a taken name brings it back. */
+  async function answerProvider(server: string, answer: Record<string, unknown>) {
+    try {
+      await invoke("account_provider_answer", { server, answer });
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  function chooseProvider(answer: Record<string, unknown>) {
+    const p = get(accountPrompt);
+    if (!p || p.kind !== "provider-choice") return;
+    closePrompt(p);
+    if (answer.kind === "pair") showPrompt({ kind: "pair-wait", server: p.server, code: "" });
+    void answerProvider(p.server, answer);
+  }
+
+  function submitProviderName() {
+    const p = get(accountPrompt);
+    if (!p || p.kind !== "provider-name" || !providerName.trim()) return;
+    closePrompt(p);
+    void answerProvider(p.server, { kind: "name", name: providerName.trim() });
+  }
+
+  function cancelProvider() {
+    const p = get(accountPrompt);
+    if (p) invoke("account_cancel", { server: p.server }).catch(() => {});
+    closePrompt();
+  }
+
+  async function answerPair(yes: boolean) {
+    const p = get(accountPrompt);
+    if (!p || p.kind !== "pair-ask") return;
+    closePrompt(p);
+    await invoke("account_pair_answer", { server: p.server, pair: p.pair, yes }).catch((e) =>
+      addNotification(String(e), "warning"),
+    );
+  }
+
+  /** A provider link, a proof with a provider, or an unlink. */
+  async function runProvider(server: string, provider: string, action: "link" | "unlink" | "prove") {
+    const codes = get(account.peek(server))?.info.totp_enabled ?? false;
+    const needsPassword = action !== "prove" && providers?.hasPassword;
+    error =
+      needsPassword && !oldPassword ? "Enter your password."
+      : action !== "prove" && codes && !code.trim() ? (useRecovery ? "Enter a recovery code." : "Enter the code from your authenticator app.")
+      : "";
+    if (error) return;
+    busy = true;
+    const proof = {
+      server,
+      provider,
+      password: needsPassword ? oldPassword.normalize("NFC") : "",
+      totp: codes && !useRecovery && code.trim() ? code.trim() : null,
+      recovery: codes && useRecovery && code.trim() ? code.trim() : null,
+    };
+    try {
+      // The answers come as account-reply (onReply)
+      if (action === "unlink") await invoke("account_provider_unlink", proof);
+      else await invoke("account_provider_start", { ...proof, link: action === "link" });
+    } catch (e) {
+      error = String(e);
+      busy = false;
     }
   }
 
@@ -390,7 +534,7 @@
     const codes = me?.info.totp_enabled ?? false;
     error =
       confirmName.trim().toLowerCase() !== me?.name ? "Type the account's name to confirm."
-      : !oldPassword ? "Enter your password."
+      : !oldPassword && providers?.hasPassword !== false ? "Enter your password."
       : codes && !code.trim() ? (useRecovery ? "Enter a recovery code." : "Enter the code from your authenticator app.")
       : "";
     if (error) return;
@@ -443,7 +587,7 @@
     if (!p || p.kind !== "recovery-new") return;
     const codes = get(account.peek(p.server))?.info.totp_enabled ?? false;
     error =
-      !oldPassword ? "Enter your password."
+      !oldPassword && providers?.hasPassword !== false ? "Enter your password."
       : codes && !code.trim() ? (useRecovery ? "Enter a recovery code." : "Enter the code from your authenticator app.")
       : "";
     if (error) return;
@@ -486,7 +630,8 @@
   function escapeFor(kind: string): (() => void) | undefined {
     if (busy) return undefined;
     if (kind === "totp") return cancelTotp;
-    if (["totp-setup", "safety", "account", "delete", "password", "recovery-new"].includes(kind)) return () => closePrompt();
+    if (["provider-name", "provider-choice"].includes(kind)) return cancelProvider;
+    if (["totp-setup", "safety", "account", "delete", "password", "recovery-new", "provider-confirm", "provider-page"].includes(kind)) return () => closePrompt();
     return undefined;
   }
 
@@ -528,12 +673,145 @@
           <button type="button" class="secondary" onclick={cancelTotp} disabled={busy}>Cancel</button>
           <button type="button" class="submit-btn btn btn-primary" onclick={submitTotp} disabled={busy || !code.trim()}>Sign in</button>
         </div>
+      {:else if p.kind === "provider-name"}
+        <h2>{fromServer(p.server)}Choose your name here</h2>
+        <p class="hint">This is what people here see. It cannot be changed later.</p>
+        <div class="field">
+          <label for="acct-provider-name">Account name</label>
+          <!-- svelte-ignore a11y_autofocus -->
+          <input
+            id="acct-provider-name"
+            type="text"
+            placeholder="a-z, 0-9, _ and -"
+            maxlength={32}
+            autofocus
+            bind:value={providerName}
+            onkeydown={(e) => e.key === "Enter" && submitProviderName()}
+          />
+        </div>
+        {#if p.problem}<div class="error" role="alert">{p.problem}</div>{/if}
+        <div class="buttons">
+          <button type="button" class="secondary" onclick={cancelProvider}>Cancel</button>
+          <button type="button" class="submit-btn btn btn-primary" onclick={submitProviderName} disabled={!providerName.trim()}>Go on</button>
+        </div>
+      {:else if p.kind === "provider-choice"}
+        {#if p.claim}
+          <h2>{fromServer(p.server)}Open {p.name}</h2>
+          <p class="hint">
+            This server says nobody has opened this account yet. Your provider says who you are, but your messages
+            and keys are encrypted with a key only your devices hold, so this device makes that key now.
+          </p>
+          {#if claimAsked}
+            <p class="hint">
+              <strong>Have you used this account before?</strong> Then do not go on: a server can hide an account's
+              data to get a device to start over. Cancel, and talk to whoever runs this server.
+            </p>
+          {/if}
+          <div class="buttons">
+            <button type="button" class="secondary" onclick={cancelProvider}>Cancel</button>
+            {#if claimAsked}
+              <button type="button" class="submit-btn btn btn-primary" onclick={() => chooseProvider({ kind: "claim" })}>It is my first time, go on</button>
+            {:else}
+              <button type="button" class="submit-btn btn btn-primary" onclick={() => (claimAsked = true)}>First time here</button>
+            {/if}
+          </div>
+        {:else}
+          <h2>{fromServer(p.server)}Unlock {p.name}</h2>
+          <p class="hint">
+            Your provider says who you are. Your messages and keys are encrypted with a key only your devices hold,
+            so this new device needs one of these.
+          </p>
+          {#if p.problem}<div class="error" role="alert">{p.problem}</div>{/if}
+          <div class="field">
+            <label for="acct-provider-recovery">Recovery key</label>
+            <!-- svelte-ignore a11y_autofocus -->
+            <input
+              id="acct-provider-recovery"
+              type="text"
+              placeholder="ABCD-EFGH-…"
+              autocomplete="off"
+              spellcheck="false"
+              autofocus
+              bind:value={recoveryText}
+              onkeydown={(e) => e.key === "Enter" && recoveryText.trim() && chooseProvider({ kind: "recovery", key: recoveryText.trim() })}
+            />
+          </div>
+          <div class="buttons">
+            <button type="button" class="secondary" onclick={cancelProvider}>Cancel</button>
+            <button type="button" class="secondary" onclick={() => chooseProvider({ kind: "pair" })}>Ask my other device</button>
+            {#if p.hasPassword}
+              <button type="button" class="secondary" onclick={() => chooseProvider({ kind: "password" })}>Use my password</button>
+            {/if}
+            <button type="button" class="submit-btn btn btn-primary" onclick={() => chooseProvider({ kind: "recovery", key: recoveryText.trim() })} disabled={!recoveryText.trim()}>Unlock</button>
+          </div>
+        {/if}
+      {:else if p.kind === "pair-wait"}
+        <h2>{fromServer(p.server)}Check your other device</h2>
+        {#if p.code}
+          <p class="hint">Approve this device there if it shows the same code.</p>
+          <code class="secret">{p.code}</code>
+          <p class="hint">Once approved, this device takes over and the other one signs out here.</p>
+        {:else}
+          <p class="hint">Asking your other device…</p>
+        {/if}
+      {:else if p.kind === "pair-ask"}
+        <h2>{fromServer(p.server)}Approve a new device?</h2>
+        <p class="hint">
+          Someone signed in as you through your provider and asks this device for the key to your messages. Say yes only if
+          it is you, and that device shows this code. Approving signs this device out here.
+        </p>
+        <code class="secret">{p.code}</code>
+        <p class="hint">If it is not you, say no and change your provider account's password.</p>
+        <div class="buttons">
+          <button type="button" class="secondary" onclick={() => answerPair(false)}>No</button>
+          <button type="button" class="submit-btn btn btn-primary" onclick={() => answerPair(true)}>It is me, the codes match</button>
+        </div>
+      {:else if p.kind === "provider-page"}
+        <h2>Your code: {p.code}</h2>
+        <p class="hint">Open the provider's page. When it comes back, tap this code there.</p>
+        <div class="buttons">
+          <button type="button" class="secondary" onclick={() => closePrompt()}>Cancel</button>
+          <button
+            type="button"
+            class="submit-btn btn btn-primary"
+            onclick={() => invoke("account_open_page", { url: p.url }).catch((e) => addNotification(String(e), "warning"))}
+          >Open the page</button>
+        </div>
+      {:else if p.kind === "provider-confirm"}
+        {@const codes = $account?.info.totp_enabled ?? false}
+        <h2>{p.action === "link" ? `Link ${p.provider}` : `Unlink ${p.provider}`}</h2>
+        <p class="hint">
+          {#if p.action === "link"}You can then sign in here through {p.provider}. A new device still needs your password,
+            recovery key or another device to unlock your messages.
+          {:else}You will no longer sign in here through {p.provider}.{/if}
+        </p>
+        {#if providers?.hasPassword}
+          <div class="field">
+            <label for="acct-provider-password">Password</label>
+            <!-- svelte-ignore a11y_autofocus -->
+            <input id="acct-provider-password" type="password" autocomplete="current-password" autofocus bind:value={oldPassword} disabled={busy} />
+          </div>
+        {/if}
+        {#if codes}
+          <div class="field">
+            <label for="acct-provider-code">{useRecovery ? "Recovery code" : "Code from your authenticator app"}</label>
+            <input id="acct-provider-code" type="text" autocomplete="one-time-code" bind:value={code} disabled={busy} />
+          </div>
+          <button type="button" class="link" onclick={() => (useRecovery = !useRecovery)}>
+            {useRecovery ? "Use a code from the app" : "Lost your phone? Use a recovery code"}
+          </button>
+        {/if}
+        {#if error}<div class="error" role="alert">{error}</div>{/if}
+        <div class="buttons">
+          <button type="button" class="secondary" onclick={() => closePrompt()} disabled={busy}>Cancel</button>
+          <button type="button" class="submit-btn btn btn-primary" onclick={() => runProvider(p.server, p.provider, p.action)} disabled={busy}>Go on</button>
+        </div>
       {:else if p.kind === "recovery"}
         <h2>{fromServer(p.server)}Your {p.renewed ? "new " : ""}recovery key</h2>
         <p class="hint">
-          {#if p.renewed}Your old recovery key no longer works. {/if}Write it down and keep it somewhere safe: if
-          you forget your password, it sets a new one ("Forgot your password?" when you sign in) and opens your
-          account's encrypted vault. VoIPC shows it only now, and the server cannot recover it for you.
+          {#if p.renewed}Your old recovery key no longer works. {/if}Write it down and keep it somewhere safe: it
+          opens your account's encrypted vault on a new device, and sets a new password if you forget yours ("Forgot
+          your password?" when you sign in). VoIPC shows it only now, and the server cannot recover it for you.
         </p>
         <code class="secret">{p.key}</code>
         <button type="button" class="secondary" onclick={() => copy(p.key)}>{copied ? "Copied" : "Copy"}</button>
@@ -616,10 +894,26 @@
             <span>Messages kept on this server: <strong>{$account.cloud ? "yes" : "no"}</strong></span>
             <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); askCloud(server); }}>Change</button>
           </div>
-          <div class="row">
-            <span>Password</span>
-            <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); reset(); showPrompt({ kind: "password", server }); }}>Change</button>
-          </div>
+          {#if providers?.hasPassword !== false}
+            <div class="row">
+              <span>Password</span>
+              <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); reset(); showPrompt({ kind: "password", server }); }}>Change</button>
+            </div>
+          {/if}
+          {#each providers?.offered ?? [] as provider (provider)}
+            {@const linked = providers?.linked.find((l) => l.kind === provider)}
+            <div class="row">
+              <span>{provider}{#if linked}: linked as <strong>{linked.name}</strong>{/if}</span>
+              {#if linked}
+                {#if !providers?.hasPassword && !$account.info.totp_enabled}
+                  <button type="button" class="secondary" onclick={() => runProvider(p.server, provider, "prove")}>Confirm it's you</button>
+                {/if}
+                <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); reset(); showPrompt({ kind: "provider-confirm", server, provider, action: "unlink" }); }}>Unlink</button>
+              {:else}
+                <button type="button" class="secondary" onclick={() => { const server = p.server; closePrompt(); reset(); showPrompt({ kind: "provider-confirm", server, provider, action: "link" }); }}>Link</button>
+              {/if}
+            </div>
+          {/each}
           {#if newRecoveryKey(get(olderRelay.peek(p.server))?.protocol ?? null)}
             <div class="row">
               <span>Recovery key</span>
@@ -681,10 +975,14 @@
           <!-- svelte-ignore a11y_autofocus -->
           <input id="acct-delete-name" type="text" autocomplete="off" autofocus bind:value={confirmName} disabled={busy} />
         </div>
-        <div class="field">
-          <label for="acct-delete-password">Password</label>
-          <input id="acct-delete-password" type="password" autocomplete="current-password" bind:value={oldPassword} disabled={busy} />
-        </div>
+        {#if providers?.hasPassword !== false}
+          <div class="field">
+            <label for="acct-delete-password">Password</label>
+            <input id="acct-delete-password" type="password" autocomplete="current-password" bind:value={oldPassword} disabled={busy} />
+          </div>
+        {:else if !codes}
+          <p class="hint">Confirm it's you first, from the account panel, if this says so.</p>
+        {/if}
         {#if codes}
           <div class="field">
             <label for="acct-delete-code">{useRecovery ? "Recovery code" : "Code from your authenticator app"}</label>
@@ -755,19 +1053,23 @@
           The recovery key you have now stops working, and only the new one resets your password. An account made
           before VoIPC 1.3 gets its reset key this way: until then, a device that remembers it could reset it too.
         </p>
-        <div class="field">
-          <label for="acct-recovery-password">Password</label>
-          <!-- svelte-ignore a11y_autofocus -->
-          <input
-            id="acct-recovery-password"
-            type="password"
-            autocomplete="current-password"
-            autofocus
-            bind:value={oldPassword}
-            disabled={busy}
-            onkeydown={(e) => e.key === "Enter" && !codes && submitRecoveryNew()}
-          />
-        </div>
+        {#if providers?.hasPassword !== false}
+          <div class="field">
+            <label for="acct-recovery-password">Password</label>
+            <!-- svelte-ignore a11y_autofocus -->
+            <input
+              id="acct-recovery-password"
+              type="password"
+              autocomplete="current-password"
+              autofocus
+              bind:value={oldPassword}
+              disabled={busy}
+              onkeydown={(e) => e.key === "Enter" && !codes && submitRecoveryNew()}
+            />
+          </div>
+        {:else if !codes}
+          <p class="hint">Confirm it's you first, from the account panel, if this says so.</p>
+        {/if}
         {#if codes}
           <div class="field">
             <label for="acct-recovery-code">{useRecovery ? "Recovery code" : "Code from your authenticator app"}</label>

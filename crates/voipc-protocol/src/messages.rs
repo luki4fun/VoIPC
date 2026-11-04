@@ -380,6 +380,37 @@ pub enum AuthContinue {
         totp: Option<String>,
         recovery_code: Option<String>,
     },
+    /// The answer to `AuthStep::ProviderSignup` (protocol v17): the name to take,
+    /// and the solved proof of work.
+    ProviderSignup {
+        name: String,
+        altcha: String,
+        ts: String,
+    },
+    /// The answer to `AuthStep::ProviderSigned` with `claim`: this account's
+    /// first vault (no `slot.pass`), and the identity in it.
+    Claim {
+        identity_key: Vec<u8>,
+        vault: Vec<VaultBlob>,
+    },
+    /// The answer to `AuthStep::ProviderSigned` without `claim`: the identity's
+    /// signature over the challenge (`voipc-provider/v1|<relay>|<name>|<challenge>`),
+    /// which only a device that opened the vault can make. Nothing else lets a
+    /// provider's sign-in in.
+    ProviderProof {
+        signature: Vec<u8>,
+    },
+    /// Asks a device of this account to hand over the vault's key:
+    /// `SHA-256(label | ephemeral | blind)`, so that the key is fixed before the
+    /// other device's nonce is known (`voipc_crypto::pair`).
+    PairStart {
+        commitment: Vec<u8>,
+    },
+    /// What `commitment` was over, once `AuthStep::PairNonce` came.
+    PairReveal {
+        ephemeral: Vec<u8>,
+        blind: Vec<u8>,
+    },
 }
 
 /// Account management after sign-in.
@@ -501,6 +532,41 @@ pub enum AccountRequest {
         op: AdminOp,
         code: Option<String>,
     },
+
+    // ── Providers (protocol v17) ──
+    /// What the relay offers and what this account has linked.
+    ProviderList,
+    /// Link a provider (`link`) or prove it's you with one you have. A link needs
+    /// a recent sign-in: with `secret` (and the second factor where there is
+    /// one) here, or, without a password, a provider's proof first.
+    /// `ProviderBrowser` answers, then `ProviderDone` when the browser is through.
+    ProviderStart {
+        kind: ProviderKind,
+        link: bool,
+        secret: Option<Vec<u8>>,
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    },
+    /// Refused when it is the last way in. A recent sign-in, as for a link.
+    ProviderUnlink {
+        kind: ProviderKind,
+        secret: Option<Vec<u8>>,
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    },
+    /// This device's nonce for a pairing (`AccountReply::PairAsked`).
+    PairNonce {
+        pair: u64,
+        nonce: Vec<u8>,
+    },
+    /// The person compared the codes and said yes: the vault's key, wrapped.
+    PairApprove {
+        pair: u64,
+        wrapped: Vec<u8>,
+    },
+    PairDecline {
+        pair: u64,
+    },
 }
 
 /// What an admin asks for (`AccountRequest::Admin`). A step that changes
@@ -593,6 +659,48 @@ pub enum AuthStep {
     /// The password is reset; sign in with the new one. Every other device
     /// and session of the account was signed out.
     ResetDone,
+    /// The answer to `AccountStart::Providers` (protocol v17).
+    Providers { kinds: Vec<ProviderKind> },
+    /// Open `url` in the system browser, show `code`, and come back with
+    /// `ticket` (`AccountStart::ProviderResume`).
+    OpenBrowser {
+        url: String,
+        code: String,
+        ticket: Vec<u8>,
+    },
+    /// Nothing has happened in the browser yet: try the ticket again.
+    ProviderPending,
+    /// The browser is through: `AccountStart::ProviderResume` goes on from here.
+    ProviderReady,
+    /// The provider knows this person and nobody here does, and sign-up is open:
+    /// choose a name (`suggestion` is the provider's, in the username alphabet;
+    /// `problem` what was wrong with the last one).
+    ProviderSignup {
+        relay_id: [u8; 16],
+        suggestion: String,
+        problem: String,
+        pow: PowChallenge,
+    },
+    /// The provider's sign-in holds, for the account `name`, which is not in yet.
+    /// `claim`: nobody has opened this account (`AuthContinue::Claim`). Otherwise
+    /// open `blobs`, the vault without `slot.pass`, with the recovery key or a
+    /// paired device and sign `challenge`; or, with `has_password`, sign in
+    /// again with the password. A relay can say `claim` of any account, and hide
+    /// its vault: a device that remembers the account does not believe it.
+    ProviderSigned {
+        relay_id: [u8; 16],
+        name: String,
+        claim: bool,
+        has_password: bool,
+        challenge: Vec<u8>,
+        blobs: Vec<VaultBlob>,
+    },
+    /// The other device's nonce, for `AuthContinue::PairStart`.
+    PairNonce { nonce: Vec<u8> },
+    /// The other device agreed: the vault's key, wrapped to the ephemeral key.
+    PairWrapped { wrapped: Vec<u8> },
+    /// No device could, or would. `reason` says which.
+    PairRefused { reason: String },
 }
 
 /// Answers to `AccountRequest`.
@@ -698,6 +806,41 @@ pub enum AccountReply {
     /// An answer to `AccountRequest::Admin` (protocol v16); a refusal is
     /// `Error` with `request` "Admin".
     Admin(AdminReply),
+    /// `ProviderList` (protocol v17). `has_password`: what to ask for a link.
+    Providers {
+        offered: Vec<ProviderKind>,
+        linked: Vec<LinkedProvider>,
+        has_password: bool,
+    },
+    /// `ProviderStart`: open `url`, show `code`.
+    ProviderBrowser {
+        url: String,
+        code: String,
+    },
+    /// The browser came through: linked, or proved.
+    ProviderDone {
+        kind: ProviderKind,
+        link: bool,
+    },
+    ProviderUnlinked {
+        kind: ProviderKind,
+    },
+    /// A device that signed in through a provider asks for the vault's key.
+    /// Send a nonce (`PairNonce`); `PairRevealed` follows.
+    PairAsked {
+        pair: u64,
+        commitment: Vec<u8>,
+    },
+    /// What the commitment was over: check it, show the code, ask the person.
+    PairRevealed {
+        pair: u64,
+        ephemeral: Vec<u8>,
+        blind: Vec<u8>,
+    },
+    /// The other device gave up or the time ran out.
+    PairEnded {
+        pair: u64,
+    },
 }
 
 /// Answers to `AdminOp`.

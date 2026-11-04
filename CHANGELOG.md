@@ -2,6 +2,36 @@
 
 All notable changes to VoIPC are documented here.
 
+## [Unreleased]
+
+Protocol 17. Needs l4f-accounts v0.12.0.
+
+### Added
+- **Sign in with Discord, Google or Facebook**, on a relay with a web address and a public certificate
+  (`[accounts] public_url`, each provider's application in the environment). A provider says who you are and
+  cannot unlock your messages: a new device also needs the recovery key, another of your devices, or your
+  password, and without one of them it gets in nowhere ([docs/ACCOUNTS.md](docs/ACCOUNTS.md)).
+- **Accounts without a password**: the first sign-in through a provider opens the account and shows its recovery
+  key. `voipc-server admin reclaim <name>` is the way back for someone who lost everything.
+- **Linking** a provider to an account, and unlinking it, in the account panel.
+- **Approving a new device from another one**, comparing a six-digit code.
+- `[accounts] signups_per_hour`.
+- `community_load`, which measures how big a relay goes; the results are in docs/OPERATING.md §10a.
+
+### Changed
+- An app that pinned a relay's self-signed certificate accepts a new one the public CAs accept, so moving a
+  relay to a real certificate does not trip the pin at every renewal.
+
+### Fixed
+- **People missing from member lists after many joined at once.** A connection's queue held 256 messages and
+  dropped the rest without a word, and every join is told to everyone, so a burst (everybody reconnecting after a
+  relay restart) lost members from rosters, or a whole list. Someone missing a member never hands them their keys,
+  so that member cannot read them. At 1000 people on two cores, 3858 messages went; none go now. The queue is
+  bounded by bytes instead, as much memory as before, and a client that has really stopped reading is disconnected
+  rather than left behind.
+- An app speaking a newer protocol than a 1.7 relay could not read that relay's member lists. Nothing released
+  had hit it yet: it needed this protocol bump.
+
 ## [1.7.0] - release candidate
 
 Protocol 16. A 1.7 app still talks to relays back to 1.0 (protocol 12); there the admin

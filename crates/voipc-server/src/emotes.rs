@@ -22,7 +22,6 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::sync::mpsc;
 use tracing::{debug, warn};
 use voipc_protocol::codec::encode_server_msg;
 use voipc_protocol::conv::{hex, unhex};
@@ -33,6 +32,7 @@ use voipc_protocol::types::{
 };
 
 use crate::config::EmotesConfig;
+use crate::control::ControlTx;
 use crate::files::{Bucket, Prepared, Reply};
 use crate::session::send_msg;
 use crate::state::ServerState;
@@ -575,7 +575,7 @@ impl EmoteStore {
 
 // ── Control messages ──────────────────────────────────────────────────────
 
-fn refuse(tx: &mpsc::Sender<Vec<u8>>, name: String, reason: String) {
+fn refuse(tx: &ControlTx, name: String, reason: String) {
     let _ = send_msg(tx, &ServerMessage::EmoteError { name, reason });
 }
 
@@ -583,7 +583,7 @@ fn refuse(tx: &mpsc::Sender<Vec<u8>>, name: String, reason: String) {
 fn for_admin(
     state: &ServerState,
     session: SessionId,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
     name: &str,
 ) -> Option<Arc<EmoteStore>> {
     let Some(store) = state.emotes.clone() else {
@@ -606,7 +606,7 @@ pub(crate) async fn handle_add(
     state: &Arc<ServerState>,
     session: SessionId,
     emote: Emote,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) {
     let name = emote.name.clone();
     let Some(store) = for_admin(state, session, tx, &name) else {
@@ -627,7 +627,7 @@ pub(crate) async fn handle_remove(
     state: &Arc<ServerState>,
     session: SessionId,
     names: Vec<String>,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) {
     let Some(store) = for_admin(state, session, tx, "") else {
         return;
@@ -662,7 +662,7 @@ pub(crate) async fn handle_rename(
     session: SessionId,
     from: String,
     to: String,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) {
     let Some(store) = for_admin(state, session, tx, &from) else {
         return;
@@ -680,7 +680,7 @@ pub(crate) async fn handle_move(
     names: Vec<String>,
     pack: Option<String>,
     sticker: Option<bool>,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) {
     let first = names.first().cloned().unwrap_or_default();
     let Some(store) = for_admin(state, session, tx, &first) else {
@@ -700,7 +700,7 @@ pub(crate) async fn handle_stickers(
     state: &Arc<ServerState>,
     session: SessionId,
     on: bool,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) {
     let Some(store) = for_admin(state, session, tx, "") else {
         return;

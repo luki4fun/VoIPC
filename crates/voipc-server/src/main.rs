@@ -16,6 +16,7 @@ mod accounts;
 mod bans;
 mod channels;
 mod config;
+mod control;
 mod emotes;
 mod files;
 mod fsutil;
@@ -271,6 +272,10 @@ enum AdminCommand {
     /// their phone.
     #[command(name = "reset-2fa")]
     Reset2fa { name: String },
+    /// For someone without a password who lost every device and their recovery
+    /// key: wipe the account's vault and identity, so its provider sign-in opens
+    /// it anew. What it kept is gone, and everyone who knew it is warned.
+    Reclaim { name: String },
     /// Print a single-use sign-up code (registration = "invite" or "closed").
     Invite {
         /// Only this account name can use it.
@@ -713,6 +718,14 @@ async fn run_command(config: &ServerConfig, command: Command) -> Result<()> {
                     user.username
                 );
             }
+        }
+        Command::Admin(AdminCommand::Reclaim { name }) => {
+            let user = user_named(name).await?;
+            relay.reclaim(&ctx, &user).await.map_err(|e| anyhow::anyhow!(e))?;
+            println!(
+                "{}: vault and identity wiped, signed out everywhere. The next sign-in through a provider opens it anew, and whoever knew this account is warned.",
+                user.username
+            );
         }
         Command::Admin(AdminCommand::Invite { name, days }) => {
             // Closed: only an admin makes accounts, each for a name it picked.

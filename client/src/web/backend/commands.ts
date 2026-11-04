@@ -12,7 +12,7 @@ import { getConfig, resetConfig, updateConfig } from "./config";
 import * as session from "./session";
 import { forgetDevice, listDevices } from "./devices";
 import { wasm } from "./wasm";
-import { forgetRelayId, type AccountArgs } from "./account";
+import { forgetRelayId, type AccountArgs, type ProviderAnswer } from "./account";
 import { playCue } from "./sounds";
 import type { SavedServer, SoundSettings } from "../../lib/stores/settings";
 import type { ProximityMode } from "../../lib/spatial";
@@ -151,6 +151,8 @@ function accountArgs(raw: unknown): AccountArgs | undefined {
       return { kind: "device" };
     case "reset":
       return { kind: "reset", recovery: str(a.recovery, "recovery"), password: str(a.password, "password") };
+    case "provider":
+      return { kind: "provider", ticket: a.ticket as number[] };
     default:
       fail("unknown account sign-in");
   }
@@ -175,8 +177,10 @@ const handlers: Record<string, Handler> = {
     const name = str(username, "username");
     if (addr.length === 0 || addr.length > 253) fail("address must be 1-253 characters");
     // 32 for the name and 5 for its "#0000" tag; the server checks each part
-    if (name.length === 0 || byteLength(name) > 37) fail("username must be 1-32 characters");
-    return session.connect(addr, name, accountArgs(account));
+    // A provider's sign-in has no name yet: its answer decides the account.
+    const args = accountArgs(account);
+    if ((name.length === 0 && args?.kind !== "provider") || byteLength(name) > 37) fail("username must be 1-32 characters");
+    return session.connect(addr, name, args);
   },
 
   // ── accounts (client/src-tauri/src/account.rs) ──
@@ -188,6 +192,38 @@ const handlers: Record<string, Handler> = {
   },
   account_cancel: ({ server }) => {
     session.sessionOrSigningIn(str(server, "server"))?.account?.cancel();
+  },
+  account_provider_ask: ({ address, ask }) => {
+    const a = ask as Record<string, unknown>;
+    const question =
+      a.kind === "providers" ? "providers"
+      : a.kind === "open" ? { open: a.provider }
+      : { status: a.ticket };
+    return session.askRelay(str(address, "address"), question);
+  },
+  account_open_page: ({ url }) => {
+    const page = str(url, "url");
+    if (!wasm().providerPageOk(page)) fail("This server named a page that is no provider's: not opening it.");
+    window.open(page, "_blank", "noopener");
+  },
+  account_provider_answer: ({ server, answer }) => {
+    const s = session.sessionOrSigningIn(str(server, "server"));
+    if (!s?.account) fail("No sign-in is waiting for that.");
+    s.account.answerProvider(answer as ProviderAnswer);
+  },
+  account_pair_answer: ({ server, pair, yes }) => {
+    const { s, account } = needAccount(server);
+    account.pairAnswer(s, pair as number, yes === true);
+  },
+  account_provider_start: ({ server, provider, link, password, totp, recovery }) => {
+    const { s, account } = needAccount(server);
+    const opt = (v: unknown, name: string) => (v == null ? null : str(v, name));
+    return account.providerStart(s, str(provider, "provider"), link === true, str(password, "password"), opt(totp, "totp"), opt(recovery, "recovery"));
+  },
+  account_provider_unlink: ({ server, provider, password, totp, recovery }) => {
+    const { s, account } = needAccount(server);
+    const opt = (v: unknown, name: string) => (v == null ? null : str(v, name));
+    return account.providerUnlink(s, str(provider, "provider"), str(password, "password"), opt(totp, "totp"), opt(recovery, "recovery"));
   },
   account_request: ({ server, request }) => needAccount(server).s.sendControl({ Account: request }),
   account_password_change: ({ server, old, new: next, totp, recovery }) => {

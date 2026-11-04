@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use voipc_protocol::conv::{hex, unhex16};
 use voipc_protocol::messages::{AccountReply, AccountRequest, ClientMessage};
-use voipc_protocol::types::{AccountInfo, UserInfo};
+use voipc_protocol::types::{AccountInfo, ProviderKind, UserInfo};
 use zeroize::Zeroizing;
 
 use crate::account::{
@@ -72,6 +72,17 @@ pub struct AccountSession {
     /// Conversations purged on request, whose tombstone follows the relay's
     /// `LogPurged` (sent before it, the purge would take it too).
     tombstones: std::collections::HashSet<String>,
+    /// A new device asking for the vault's key, until the person answers.
+    pairing: Option<Pairing>,
+}
+
+/// A pairing this device was asked for (`crate::pair`).
+struct Pairing {
+    pair: u64,
+    commitment: Vec<u8>,
+    nonce: Vec<u8>,
+    /// Once revealed and checked: what the DEK would be wrapped to.
+    ephemeral: Option<Vec<u8>>,
 }
 
 impl AccountSession {
@@ -106,6 +117,7 @@ impl AccountSession {
             enrol: None,
             roster: HashMap::new(),
             tombstones: Default::default(),
+            pairing: None,
         };
         (
             s,
@@ -148,9 +160,124 @@ impl AccountSession {
         a.send.push(ask);
     }
 
+    /// The person's answer to `account-pair-ask`. Only after they compared the
+    /// codes does the vault's key leave this device, and only to the key that
+    /// was committed to before this device's nonce was known.
+    pub fn pair_answer(&mut self, pair: u64, yes: bool) -> Actions {
+        let Some(p) = self.pairing.take_if(|p| p.pair == pair) else {
+            return Actions::default();
+        };
+        let wrapped = p.ephemeral.as_ref().filter(|_| yes).and_then(|ephemeral| {
+            crate::pair::wrap_dek(ephemeral, &self.dek, &self.relay_id, &self.name, &p.commitment)
+        });
+        Actions::sending(vec![ClientMessage::Account(match wrapped {
+            Some(wrapped) => AccountRequest::PairApprove { pair, wrapped },
+            None => AccountRequest::PairDecline { pair },
+        })])
+    }
+
+    /// The pairing replies. `None`: not one.
+    fn on_pair_reply(&mut self, reply: &AccountReply) -> Option<Actions> {
+        match reply {
+            AccountReply::PairAsked { pair, commitment } => {
+                // One at a time: the person is looking at the first.
+                if self.pairing.is_some() {
+                    return Some(Actions::sending(vec![ClientMessage::Account(
+                        AccountRequest::PairDecline { pair: *pair },
+                    )]));
+                }
+                let nonce = crate::aead::random::<{ crate::pair::NONCE_LEN }>().to_vec();
+                self.pairing = Some(Pairing {
+                    pair: *pair,
+                    commitment: commitment.clone(),
+                    nonce: nonce.clone(),
+                    ephemeral: None,
+                });
+                Some(Actions::sending(vec![ClientMessage::Account(
+                    AccountRequest::PairNonce { pair: *pair, nonce },
+                )]))
+            }
+            AccountReply::PairRevealed {
+                pair,
+                ephemeral,
+                blind,
+            } => {
+                let p = self.pairing.as_mut().filter(|p| p.pair == *pair)?;
+                if !crate::pair::reveal_ok(&p.commitment, ephemeral, blind) {
+                    // Not the key it committed to: somebody is in the middle.
+                    self.pairing = None;
+                    return Some(Actions::sending(vec![ClientMessage::Account(
+                        AccountRequest::PairDecline { pair: *pair },
+                    )]));
+                }
+                let code = crate::pair::code(&p.commitment, &p.nonce, ephemeral);
+                p.ephemeral = Some(ephemeral.clone());
+                Some(Actions {
+                    emit: vec![(
+                        "account-pair-ask",
+                        serde_json::json!({ "pair": pair, "code": code }),
+                    )],
+                    ..Default::default()
+                })
+            }
+            AccountReply::PairEnded { pair } => {
+                self.pairing.take_if(|p| p.pair == *pair)?;
+                Some(Actions {
+                    emit: vec![("account-pair-ended", serde_json::json!({ "pair": pair }))],
+                    ..Default::default()
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Link a provider (`link`), or prove it's you with one you have linked. A
+    /// link needs a recent sign-in: `master` is the stretched password, where
+    /// the account has one. `ProviderBrowser` answers as `account-reply`.
+    pub fn provider_start(
+        &self,
+        kind: ProviderKind,
+        link: bool,
+        master: Option<&[u8; 32]>,
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    ) -> Actions {
+        Actions::sending(vec![ClientMessage::Account(AccountRequest::ProviderStart {
+            kind,
+            link,
+            secret: secret_of(master),
+            totp,
+            recovery_code,
+        })])
+    }
+
+    /// As for a link. `ProviderUnlinked` answers as `account-reply`.
+    pub fn provider_unlink(
+        &self,
+        kind: ProviderKind,
+        master: Option<&[u8; 32]>,
+        totp: Option<String>,
+        recovery_code: Option<String>,
+    ) -> Actions {
+        Actions::sending(vec![ClientMessage::Account(AccountRequest::ProviderUnlink {
+            kind,
+            secret: secret_of(master),
+            totp,
+            recovery_code,
+        })])
+    }
+
+    /// The account's name here.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
     /// One `AccountReply`. What none of this answers goes to the front end
     /// as `account-reply`.
     pub fn on_reply(&mut self, reply: &AccountReply) -> Actions {
+        if let Some(actions) = self.on_pair_reply(reply) {
+            return actions;
+        }
         if let Some(next) = self.enrol.as_ref().and_then(|e| e.on_reply(reply)) {
             return Actions::sending(vec![next]);
         }
@@ -409,13 +536,13 @@ impl AccountSession {
     /// closes the connection.
     pub fn delete_account(
         &self,
-        master: &[u8; 32],
+        master: Option<&[u8; 32]>,
         totp: Option<String>,
         recovery_code: Option<String>,
     ) -> Actions {
         Actions::sending(vec![ClientMessage::Account(
             AccountRequest::DeleteAccount {
-                secret: derive_from_master(master).auth_secret.to_vec(),
+                secret: secret_of(master).unwrap_or_default(),
                 totp: totp
                     .map(|c| c.trim().replace(' ', ""))
                     .filter(|c| !c.is_empty()),
@@ -468,15 +595,14 @@ impl AccountSession {
     /// recovery key resets its password from then on (S-006).
     pub fn recovery_key_new(
         &self,
-        master: &[u8; 32],
+        master: Option<&[u8; 32]>,
         totp: Option<String>,
         recovery_code: Option<String>,
     ) -> (Actions, String) {
-        let secret = derive_from_master(master);
         let recovery = Zeroizing::new(crate::aead::random::<32>());
         let vault = Vault::from_dek(self.relay_id, &self.name, *self.dek);
         let msg = AccountRequest::RecoveryKeyNew {
-            secret: secret.auth_secret.to_vec(),
+            secret: secret_of(master).unwrap_or_default(),
             recovery_slot: vault.recovery_slot(&recovery).v,
             reset_key: reset_key(&recovery, &self.relay_id, &self.name).to_vec(),
             totp: totp
@@ -512,6 +638,12 @@ impl AccountSession {
     pub fn memory_key(&self) -> String {
         memory_key(&self.relay_id, &self.name)
     }
+}
+
+/// What a stretched password proves itself with. An account without a password
+/// sends none (a recent sign-in through a provider, or a code, stands in for it).
+fn secret_of(master: Option<&[u8; 32]>) -> Option<Vec<u8>> {
+    master.map(|m| derive_from_master(m).auth_secret.to_vec())
 }
 
 /// `AccountSession::memory_key` before there is one: `relay hex|name`.
@@ -554,6 +686,96 @@ mod tests {
             false,
             password_based,
         )
+    }
+
+    /// This device's side of a pairing, from the ask to the wrapped key.
+    fn asked(s: &mut AccountSession, new: &crate::pair::PairRequest) -> Vec<u8> {
+        let a = s.on_reply(&AccountReply::PairAsked {
+            pair: 5,
+            commitment: new.commitment().to_vec(),
+        });
+        let [ClientMessage::Account(AccountRequest::PairNonce { pair: 5, nonce })] = &a.send[..]
+        else {
+            panic!("no nonce: {:?}", a.send)
+        };
+        assert!(a.emit.is_empty(), "nothing to ask the person yet");
+        nonce.clone()
+    }
+
+    #[test]
+    fn the_vault_key_goes_only_to_the_committed_key_and_only_on_a_yes() {
+        let (mut s, _) = session(true, false);
+        let new = crate::pair::PairRequest::new();
+        let nonce = asked(&mut s, &new);
+        let (ephemeral, blind) = new.reveal();
+        let a = s.on_reply(&AccountReply::PairRevealed {
+            pair: 5,
+            ephemeral,
+            blind,
+        });
+        assert!(a.send.is_empty(), "nothing leaves before the person says so");
+        let (name, payload) = &a.emit[0];
+        assert_eq!(*name, "account-pair-ask");
+        assert_eq!(payload["code"], new.code(&nonce), "both devices show the same");
+
+        let a = s.pair_answer(5, true);
+        let [ClientMessage::Account(AccountRequest::PairApprove { pair: 5, wrapped })] = &a.send[..]
+        else {
+            panic!("no key: {:?}", a.send)
+        };
+        assert_eq!(new.open(wrapped, &RELAY, "me"), Some(*s.dek));
+        assert!(s.pair_answer(5, true).send.is_empty(), "answered once");
+    }
+
+    #[test]
+    fn a_no_or_a_swapped_key_hands_nothing_over() {
+        let (mut s, _) = session(true, false);
+        let new = crate::pair::PairRequest::new();
+        asked(&mut s, &new);
+        let (ephemeral, blind) = new.reveal();
+        s.on_reply(&AccountReply::PairRevealed {
+            pair: 5,
+            ephemeral,
+            blind,
+        });
+        let a = s.pair_answer(5, false);
+        assert!(matches!(
+            &a.send[..],
+            [ClientMessage::Account(AccountRequest::PairDecline { pair: 5 })]
+        ));
+
+        // A relay revealing a key of its own under the commitment it was shown
+        asked(&mut s, &new);
+        let (theirs, blind) = crate::pair::PairRequest::new().reveal();
+        let a = s.on_reply(&AccountReply::PairRevealed {
+            pair: 5,
+            ephemeral: theirs,
+            blind,
+        });
+        assert!(a.emit.is_empty(), "the person is not even asked");
+        assert!(matches!(
+            &a.send[..],
+            [ClientMessage::Account(AccountRequest::PairDecline { pair: 5 })]
+        ));
+        assert!(s.pair_answer(5, true).send.is_empty());
+    }
+
+    #[test]
+    fn a_second_ask_waits_its_turn_and_an_ended_one_goes() {
+        let (mut s, _) = session(true, false);
+        let new = crate::pair::PairRequest::new();
+        asked(&mut s, &new);
+        let a = s.on_reply(&AccountReply::PairAsked {
+            pair: 6,
+            commitment: new.commitment().to_vec(),
+        });
+        assert!(matches!(
+            &a.send[..],
+            [ClientMessage::Account(AccountRequest::PairDecline { pair: 6 })]
+        ));
+        let a = s.on_reply(&AccountReply::PairEnded { pair: 5 });
+        assert_eq!(a.emit[0].0, "account-pair-ended");
+        asked(&mut s, &new);
     }
 
     fn sends(a: &Actions, what: &str) -> usize {

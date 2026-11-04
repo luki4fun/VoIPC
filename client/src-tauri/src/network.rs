@@ -501,6 +501,10 @@ pub async fn connect_to_server(
 
     // Store the active connection
     let tcp = tcp_tx.clone();
+    // A provider's sign-in only knows now who it is
+    let username = account
+        .as_ref()
+        .map_or(username, |link| link.session().name().to_string());
     let connection = ActiveConnection {
         account: account.clone(),
         files,
@@ -993,7 +997,7 @@ pub async fn send_tcp_message(tcp_tx: &ControlTx, msg: &ClientMessage) -> Result
     tcp_tx.send(msg)
 }
 
-fn parse_address(address: &str) -> Result<(String, u16), String> {
+pub(crate) fn parse_address(address: &str) -> Result<(String, u16), String> {
     let (host, port_str) = if address.starts_with('[') {
         // IPv6: [::1]:9987
         let bracket_end = address

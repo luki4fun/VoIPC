@@ -143,6 +143,13 @@ pub struct AccountsConfig {
     /// readable by the server's user only; `VOIPC_ACCOUNTS_KEY` wins over it.
     /// Back it up: without it nobody's two-factor codes work.
     pub key_file: String,
+    /// This relay's web address (`https://voice.example.org:9987`), with a
+    /// certificate browsers accept: where a provider (Discord, Google) sends a
+    /// sign-in back. Empty: no sign-in with a provider. Each provider also needs
+    /// its application's `VOIPC_OAUTH_<PROVIDER>_ID` and `_SECRET` in the environment.
+    pub public_url: String,
+    /// New accounts an hour at most. A move from another service can want more.
+    pub signups_per_hour: u32,
 }
 
 impl Default for AccountsConfig {
@@ -155,6 +162,8 @@ impl Default for AccountsConfig {
             retention_days: 365,
             quota_mb: 50,
             key_file: "voipc-accounts.key".into(),
+            public_url: String::new(),
+            signups_per_hour: 60,
         }
     }
 }
@@ -288,6 +297,18 @@ impl ServerConfig {
             ));
         }
         if self.accounts.mode != AccountsMode::Off {
+            let url = &self.accounts.public_url;
+            if !url.is_empty() {
+                let host = url.strip_prefix("https://").unwrap_or_default();
+                if host.is_empty() || host.contains('/') {
+                    return Err(anyhow!(
+                        "[accounts] public_url must be like https://voice.example.org:9987, with no path or trailing slash: {url}"
+                    ));
+                }
+            }
+            if self.accounts.signups_per_hour == 0 {
+                return Err(anyhow!("[accounts] signups_per_hour must be at least 1"));
+            }
             if self.accounts.quota_mb == 0 {
                 return Err(anyhow!("[accounts] quota_mb must be at least 1: with 0, a new account's vault cannot be stored"));
             }

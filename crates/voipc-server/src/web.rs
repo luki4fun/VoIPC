@@ -57,6 +57,7 @@ use voipc_protocol::video::{
 
 use crate::config::ServerConfig;
 use crate::media;
+use crate::accounts::provider;
 use crate::state::ServerState;
 use crate::{session, ConnLimits};
 
@@ -155,8 +156,13 @@ async fn handle_request(
     peer_ip: std::net::IpAddr,
 ) -> Response<Full<Bytes>> {
     let head_only = req.method() == Method::HEAD;
-    let mut resp = if crate::files::is_file_path(req.uri().path()) {
+    let path = req.uri().path();
+    let mut resp = if crate::files::is_file_path(path) {
         files(req, state, peer_ip).await
+    } else if req.method() == Method::POST && path == provider::CONFIRM_PATH {
+        provider_confirm(req, state, peer_ip).await
+    } else if req.method() == Method::GET && path.starts_with(provider::CALLBACK_PREFIX) {
+        provider::callback(state, path, req.uri().query().unwrap_or_default())
     } else if req.method() == Method::GET || head_only {
         route(req.uri().path(), wt)
     } else if req.method() == Method::POST && req.uri().path() == GAME_ROUTES_PATH {
@@ -168,10 +174,10 @@ async fn handle_request(
         resp
     };
     let headers = resp.headers_mut();
-    headers.insert(
-        header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static(CSP),
-    );
+    // A provider's page sets its own: a form, where this one forbids any
+    headers
+        .entry(header::CONTENT_SECURITY_POLICY)
+        .or_insert(HeaderValue::from_static(CSP));
     headers.insert(
         header::X_CONTENT_TYPE_OPTIONS,
         HeaderValue::from_static("nosniff"),
@@ -180,6 +186,23 @@ async fn handle_request(
         *resp.body_mut() = Full::new(Bytes::new());
     }
     resp
+}
+
+/// The person tapped a code on a provider's page: a state and a three-digit pick.
+const MAX_CONFIRM_BODY: usize = 1024;
+
+async fn provider_confirm(
+    req: Request<Incoming>,
+    state: &Arc<ServerState>,
+    peer_ip: IpAddr,
+) -> Response<Full<Bytes>> {
+    match http_body_util::Limited::new(req.into_body(), MAX_CONFIRM_BODY)
+        .collect()
+        .await
+    {
+        Ok(b) => provider::confirm(state, &b.to_bytes(), peer_ip).await,
+        Err(_) => plain(StatusCode::PAYLOAD_TOO_LARGE, "body too large"),
+    }
 }
 
 // ── Files ───────────────────────────────────────────────────────────────

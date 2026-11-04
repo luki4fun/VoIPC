@@ -370,6 +370,12 @@ elif [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
     sleep 0.2
   done
   # 2>&1: a crash's stack trace goes to stderr, and it is the whole story
+  echo "--- Sign-in with a provider (test-provider.mjs)"
+  if CHROME="$CHROME" TMPDIR="$WORK" node "$SCRIPT_DIR/test-provider.mjs" "$((TCP_PORT + 7))" 2>&1 | tee "$WORK/provider.txt"; then
+    echo "PASS sign-in with a provider, in real browsers"
+  else
+    echo "FAIL the provider sign-in lane" | tee -a "$WORK/fails.txt"
+  fi
   if node "$SCRIPT_DIR/test-ui.mjs" "$TCP_PORT" "$UI_CDP" "$TCP_PORT2" "$TCP_PORT3" 2>&1 | tee "$WORK/ui.txt"; then
     echo "PASS the UI survives creating and configuring a proximity channel"
   else

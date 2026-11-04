@@ -2739,6 +2739,100 @@ async fn a_newer_client_is_told_the_server_needs_an_update() {
     );
 }
 
+/// A guest whose stream holds next to nothing, so that as soon as it stops reading
+/// the relay's writer stalls and everything queues up.
+async fn slow_reader(state: &Arc<ServerState>, name: &str) -> Client {
+    let (stream, server) = tokio::io::duplex(256);
+    let (media_tx, _media_rx) = mpsc::channel(8);
+    let (sid_tx, _sid_rx) = oneshot::channel();
+    let handler = tokio::spawn(handle_connection(
+        server,
+        name.into(),
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        media_tx,
+        sid_tx,
+        state.clone(),
+    ));
+    let mut c = Client {
+        stream,
+        handler,
+        buf: BytesMut::new(),
+    };
+    c.send(&ClientMessage::Authenticate {
+        username: name.into(),
+        protocol_version: PROTOCOL_VERSION,
+        app_version: APP_VERSION.to_string(),
+        identity_key: None,
+        prekey_bundle: None,
+        account: None,
+    })
+    .await;
+    // The whole first burst, up to the list of the channel everybody starts in
+    c.expect("General's list", |m| {
+        matches!(m, ServerMessage::UserList { channel_id: 0, .. })
+    })
+    .await;
+    c
+}
+
+/// Everybody joining at once, seen by someone whose writer is behind. At 256
+/// messages this lost members without a word, measured at 1000 people on a small
+/// server, and whoever misses a member never hands them their keys.
+#[tokio::test]
+async fn a_reader_behind_loses_nobody_in_a_burst_of_joins() {
+    let state = admin_state();
+    let mut c = slow_reader(&state, "behind").await;
+    const JOINS: u32 = 5000;
+    for i in 0..JOINS {
+        broadcast_user_joined(
+            &state,
+            UserInfo {
+                user_id: 1_000_000 + i,
+                username: format!("joiner{i}"),
+                channel_id: 0,
+                is_muted: false,
+                is_deafened: false,
+                is_screen_sharing: false,
+                is_admin: false,
+                shares_history: false,
+                account: None,
+                is_moderator: false,
+                badges: Vec::new(),
+            },
+        )
+        .await;
+    }
+    let mut next = 0;
+    while next < JOINS {
+        match c.next().await {
+            Some(ServerMessage::UserJoined { user }) => {
+                assert_eq!(user.user_id, 1_000_000 + next, "in order, none missing");
+                next += 1;
+            }
+            Some(_) => {}
+            None => panic!("the connection ended after {next} of {JOINS}"),
+        }
+    }
+}
+
+/// Past what a connection may have waiting, it ends. It is not left behind with a
+/// state that is quietly wrong, and it does not hold the relay's memory.
+#[tokio::test]
+async fn a_client_that_stopped_reading_is_ended_not_left_behind() {
+    let state = admin_state();
+    let c = slow_reader(&state, "stopped").await;
+    assert_eq!(state.sessions.len(), 1);
+    let frame = vec![0u8; 60_000];
+    for _ in 0..crate::control::MAX_QUEUED_BYTES / frame.len() + 1 {
+        state.broadcast_raw_to_all(&frame).await;
+    }
+    tokio::time::timeout(Duration::from_secs(10), c.handler)
+        .await
+        .expect("the connection ends though nothing reads it")
+        .unwrap();
+    assert_eq!(state.sessions.len(), 0, "and is cleaned up");
+}
+
 /// Runs the client's sign-in machine (voipc-crypto) against this relay.
 async fn drive(
     c: &mut Client,
@@ -2766,8 +2860,8 @@ async fn drive(
                     c.send(&m.keys(b)).await;
                 }
                 Step::NeedTotp => return Err("asked for a code".into()),
-                Step::Stretch { .. } | Step::ResetDone => return Err("not a sign-in step".into()),
                 Step::Ignore => {}
+                _ => return Err("not a sign-in step".into()),
             }
         }
     }
@@ -6517,4 +6611,1071 @@ async fn a_group_given_from_the_shell_reaches_the_connection_at_the_next_check()
     // No scope moved: only the standing tells the check something changed
     crate::accounts::revalidate(&state).await;
     assert!(groups(&state).contains(&"crew".to_string()));
+}
+
+// ── Sign-in with a provider ──────────────────────────────────────────────
+
+mod providers {
+    use super::*;
+    use crate::accounts::provider::{self, NOT_YET};
+    use l4f_accounts::oauth::{Kind, Provider};
+    use l4f_accounts::service::OAuth;
+    use std::sync::Mutex;
+    use voipc_crypto::account::{provider_ask, Method, SignIn, Step};
+    use voipc_protocol::types::{AccountStart, ProviderKind};
+
+    use hyper::StatusCode;
+
+    const LO: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
+    const IDENTITY_OTHER: [u8; 33] = [6; 33];
+
+    /// A provider on a local port: any code is good, and it says the person is
+    /// whoever `subject` holds. Answers each request and closes.
+    async fn fake_provider() -> (String, Arc<Mutex<String>>) {
+        let subject = Arc::new(Mutex::new("1001".to_string()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let who = subject.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let who = who.clone();
+                tokio::spawn(async move {
+                    let mut got = Vec::new();
+                    let mut chunk = [0u8; 2048];
+                    while !got.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match s.read(&mut chunk).await {
+                            Ok(n) if n > 0 => got.extend_from_slice(&chunk[..n]),
+                            _ => return,
+                        }
+                    }
+                    let body = if got.starts_with(b"POST") {
+                        r#"{"access_token":"at","token_type":"Bearer"}"#.to_string()
+                    } else {
+                        format!(
+                            r#"{{"id":"{}","username":"dee_d","global_name":"Dee D"}}"#,
+                            who.lock().unwrap()
+                        )
+                    };
+                    let answer = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = s.write_all(answer.as_bytes()).await;
+                });
+            }
+        });
+        (base, subject)
+    }
+
+    /// A relay with accounts and a Discord application at `fake_provider`.
+    async fn relay(
+        registration: RegistrationMode,
+    ) -> (Arc<ServerState>, TempDb, Arc<Mutex<String>>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        let (base, subject) = fake_provider().await;
+        let mut config = ServerConfig::default();
+        config.accounts.mode = AccountsMode::Optional;
+        config.accounts.registration = registration;
+        config.accounts.public_url = "https://voice.example".into();
+        let db = TempDb(std::env::temp_dir().join(format!(
+            "voipc-relay-{}.db",
+            hex::encode(rand::random::<[u8; 8]>())
+        )));
+        let store = l4f_accounts::store::Store::connect(&format!("sqlite://{}", db.0.display()))
+            .await
+            .unwrap();
+        let mut discord = Provider::new(Kind::Discord, "client".into(), "secret".into());
+        discord.authorize_url = format!("{base}/authorize");
+        discord.token_url = format!("{base}/token");
+        discord.profile_url = format!("{base}/profile");
+        let http = reqwest::Client::builder().no_proxy().build().unwrap();
+        let relay = crate::accounts::Relay::open_with(&config.accounts, store, &[9u8; 32])
+            .await
+            .unwrap()
+            .with_providers(OAuth::new(http, vec![discord]));
+        let mut state = ServerState::new(
+            &config,
+            ServerSettings::default(),
+            Vec::new(),
+            "test-admin-token".into(),
+        );
+        state.accounts = Some(Arc::new(relay));
+        (Arc::new(state), db, subject)
+    }
+
+    fn relay_of(state: &ServerState) -> &crate::accounts::Relay {
+        state.accounts.as_deref().unwrap()
+    }
+
+    /// `AccountStart::Provider`: the page, the code, the ticket.
+    async fn open_page(state: &Arc<ServerState>) -> (String, String, Vec<u8>) {
+        let first = provider_ask(
+            AccountStart::Provider {
+                kind: ProviderKind::Discord,
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        let mut c = open_raw(state, &first).await;
+        let Some(ServerMessage::AuthStep(AuthStep::OpenBrowser { url, code, ticket })) =
+            c.next().await
+        else {
+            panic!("no page to open")
+        };
+        (url, code, ticket)
+    }
+
+    /// `AccountStart::ProviderStatus`.
+    async fn status(state: &Arc<ServerState>, ticket: &[u8]) -> bool {
+        let first = provider_ask(
+            AccountStart::ProviderStatus {
+                ticket: ticket.to_vec(),
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        let mut c = open_raw(state, &first).await;
+        match c.next().await {
+            Some(ServerMessage::AuthStep(AuthStep::ProviderReady)) => true,
+            Some(ServerMessage::AuthStep(AuthStep::ProviderPending)) => false,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn state_in(url: &str) -> &str {
+        url.split(['?', '&'])
+            .find_map(|p| p.strip_prefix("state="))
+            .unwrap()
+    }
+
+    /// The browser: back from the provider, and `pick` tapped.
+    async fn browser(state: &Arc<ServerState>, url: &str, pick: &str) -> StatusCode {
+        let s = state_in(url);
+        let back = provider::callback(state, "/account/oauth/discord/cb", &format!("state={s}&code=abc"));
+        assert_eq!(back.status(), StatusCode::OK);
+        provider::confirm(state, format!("state={s}&pick={pick}").as_bytes(), LO)
+            .await
+            .status()
+    }
+
+    /// What the person chooses at `Step::ProviderChoice`.
+    enum Choice {
+        Claim,
+        Recovery([u8; 32]),
+    }
+
+    /// Runs the client's machine through a provider's sign-in.
+    async fn sign_in(
+        state: &Arc<ServerState>,
+        ticket: Vec<u8>,
+        choice: Choice,
+    ) -> Result<(Client, voipc_crypto::account::SignedIn), String> {
+        let (mut m, first) = SignIn::start(
+            "",
+            Method::Provider { ticket },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        let mut c = open_raw(state, &first).await;
+        loop {
+            let msg = c.next().await.ok_or("closed")?;
+            if matches!(msg, ServerMessage::Authenticated { account: Some(_), .. }) {
+                return Ok((c, m.finish()?));
+            }
+            let mut steps = m.on_message(&msg)?;
+            while !steps.is_empty() {
+                match steps.remove(0) {
+                    Step::Send(out) => c.send(&out).await,
+                    Step::Keys => {
+                        let ik = m.identity().unwrap().public_key().serialize().to_vec();
+                        let b = PreKeyBundleData {
+                            identity_key: ik,
+                            ..bundle()
+                        };
+                        c.send(&m.keys(b)).await;
+                    }
+                    Step::ProviderSignup { .. } => {
+                        let out = m.provider_signup("deedee")?;
+                        c.send(&out).await;
+                    }
+                    Step::ProviderChoice { .. } => {
+                        steps = match &choice {
+                            Choice::Claim => m.provider_claim()?,
+                            Choice::Recovery(key) => m.provider_recovery(key)?,
+                        };
+                    }
+                    Step::ProviderPending => return Err(NOT_YET.into()),
+                    Step::Ignore => {}
+                    _ => return Err("not a step here".into()),
+                }
+            }
+        }
+    }
+
+    /// A first sign-in on an open relay: the provider's person takes a name and
+    /// claims. Returns the connection, what it signed in with, and the recovery key.
+    async fn claimed(state: &Arc<ServerState>) -> (Client, voipc_crypto::account::SignedIn, [u8; 32]) {
+        let (url, code, ticket) = open_page(state).await;
+        assert_eq!(browser(state, &url, &code).await, StatusCode::OK);
+        let (c, signed) = sign_in(state, ticket, Choice::Claim).await.unwrap();
+        let key = voipc_crypto::account::recovery_parse(signed.recovery.as_ref().unwrap()).unwrap();
+        (c, signed, key)
+    }
+
+    fn stored_keys(blobs: &[VaultBlob]) -> Vec<&str> {
+        blobs.iter().map(|b| b.k.as_str()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_relay_without_providers_lists_none_and_offers_no_page() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let first = provider_ask(AccountStart::Providers, PROTOCOL_VERSION, APP_VERSION);
+        let mut c = open_raw(&state, &first).await;
+        assert!(
+            matches!(
+                c.next().await,
+                Some(ServerMessage::AuthStep(AuthStep::Providers { ref kinds })) if kinds.is_empty()
+            ),
+        );
+        let first = provider_ask(
+            AccountStart::Provider {
+                kind: ProviderKind::Discord,
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        let mut c = open_raw(&state, &first).await;
+        assert!(matches!(c.next().await, Some(ServerMessage::AuthError { .. })));
+    }
+
+    /// Nothing is asked of the provider before the tap, and a wrong tap ends it:
+    /// that is what a person sent somebody else's link does.
+    #[tokio::test]
+    async fn the_flow_waits_for_the_right_code_and_a_wrong_one_ends_it() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (url, code, ticket) = open_page(&state).await;
+
+        let not_yet = sign_in(&state, ticket.clone(), Choice::Claim).await;
+        assert_eq!(not_yet.err().as_deref(), Some(NOT_YET));
+        assert!(!status(&state, &ticket).await, "asking does not end the flow");
+
+        let s = state_in(&url).to_string();
+        let page = provider::callback(&state, "/account/oauth/discord/cb", &format!("state={s}&code=abc"));
+        assert_eq!(page.status(), StatusCode::OK);
+        let csp = page.headers().get(hyper::header::CONTENT_SECURITY_POLICY).unwrap();
+        assert!(csp.to_str().unwrap().contains("form-action 'self'"));
+        let not_yet = sign_in(&state, ticket.clone(), Choice::Claim).await;
+        assert_eq!(
+            not_yet.err().as_deref(),
+            Some(NOT_YET),
+            "back from the provider, not tapped"
+        );
+
+        let wrong = if code == "100" { "101" } else { "100" };
+        let tapped = provider::confirm(&state, format!("state={s}&pick={wrong}").as_bytes(), LO).await;
+        assert_eq!(tapped.status(), StatusCode::FORBIDDEN);
+        // A second tap, now with the right code, changes nothing
+        let again = provider::confirm(&state, format!("state={s}&pick={code}").as_bytes(), LO).await;
+        assert_eq!(again.status(), StatusCode::GONE);
+        assert!(status(&state, &ticket).await, "through, if not well");
+        let ended = sign_in(&state, ticket, Choice::Claim).await;
+        assert!(ended.err().unwrap().contains("not the one"));
+    }
+
+    #[tokio::test]
+    async fn a_callback_for_no_flow_or_another_provider_ends_there() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let gone = provider::callback(&state, "/account/oauth/discord/cb", "state=nothing&code=abc");
+        assert_eq!(gone.status(), StatusCode::GONE);
+        let (url, _, _) = open_page(&state).await;
+        let other = provider::callback(
+            &state,
+            "/account/oauth/google/cb",
+            &format!("state={}&code=abc", state_in(&url)),
+        );
+        assert_eq!(other.status(), StatusCode::GONE);
+    }
+
+    #[tokio::test]
+    async fn the_first_sign_in_claims_with_a_recovery_key_and_no_password_slot() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (_c, signed, _) = claimed(&state).await;
+        assert_eq!(signed.name, "deedee");
+        let relay = relay_of(&state);
+        let user = relay.store().user_by_username("deedee").await.unwrap().unwrap();
+        assert!(!user.has_password);
+        let stored = relay.vault(user.id).await.unwrap();
+        let keys = stored_keys(&stored);
+        assert!(!keys.contains(&"slot.pass"), "{keys:?}");
+        assert!(keys.contains(&"slot.recovery") && keys.contains(&"slot.reset"), "{keys:?}");
+        assert_eq!(
+            relay.identity(user.id).await.unwrap().unwrap(),
+            signed.identity.public_key().serialize().to_vec()
+        );
+    }
+
+    /// The recovery key opens the same vault on a new device, the same identity
+    /// comes out, and the live connection is taken over only then.
+    #[tokio::test]
+    async fn a_new_device_comes_in_with_the_recovery_key() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (old, signed, key) = claimed(&state).await;
+        let (url, code, ticket) = open_page(&state).await;
+        browser(&state, &url, &code).await;
+        let (_c, again) = sign_in(&state, ticket, Choice::Recovery(key)).await.unwrap();
+        assert_eq!(
+            again.identity.public_key().serialize(),
+            signed.identity.public_key().serialize()
+        );
+        assert!(again.recovery.is_none(), "shown once, at the claim");
+        let mut old = old;
+        loop {
+            match old.next().await {
+                Some(ServerMessage::Disconnected { reason }) => {
+                    assert!(reason.contains("another device"), "{reason}");
+                    break;
+                }
+                Some(_) => {}
+                None => panic!("closed without saying why"),
+            }
+        }
+    }
+
+    /// Steps to `ProviderSigned` for an account that exists, by hand.
+    async fn at_the_choice(state: &Arc<ServerState>) -> (Client, Vec<u8>, Vec<VaultBlob>, bool) {
+        let (url, code, ticket) = open_page(state).await;
+        browser(state, &url, &code).await;
+        let first = ClientMessage::Authenticate {
+            username: String::new(),
+            protocol_version: PROTOCOL_VERSION,
+            app_version: APP_VERSION.to_string(),
+            identity_key: None,
+            prekey_bundle: None,
+            account: Some(AccountStart::ProviderResume { ticket }),
+        };
+        let mut c = open_raw(state, &first).await;
+        let Some(ServerMessage::AuthStep(AuthStep::ProviderSigned {
+            challenge,
+            blobs,
+            claim,
+            ..
+        })) = c.next().await
+        else {
+            panic!("no ProviderSigned")
+        };
+        (c, challenge, blobs, claim)
+    }
+
+    /// The hole this all exists for: `Keys` only compares a public key, which a
+    /// relay's members can all see. Without the vault, nobody gets to it, and the
+    /// real person's connection is not touched.
+    #[tokio::test]
+    async fn a_hijacked_provider_account_gets_no_admission_and_takes_nothing_over() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut real, signed, _) = claimed(&state).await;
+        let public = signed.identity.public_key().serialize().to_vec();
+
+        let (mut c, _, _, claim) = at_the_choice(&state).await;
+        assert!(!claim);
+        c.send(&keys(&public, false)).await;
+        assert!(
+            matches!(c.next().await, Some(ServerMessage::AuthError { .. })),
+            "the public key alone is no way in"
+        );
+
+        let (mut c, _, _, _) = at_the_choice(&state).await;
+        c.send(&ClientMessage::AuthContinue(AuthContinue::ProviderProof {
+            signature: vec![0; 64],
+        }))
+        .await;
+        let Some(ServerMessage::AuthError { reason }) = c.next().await else {
+            panic!("a made-up signature is no way in")
+        };
+        assert!(reason.contains("does not open"), "{reason}");
+
+        // And someone else's real signature, over the right challenge
+        let (mut c, challenge, _, _) = at_the_choice(&state).await;
+        let stranger = voipc_crypto::generate_identity_key_pair();
+        let relay_id = relay_of(&state).relay_id;
+        c.send(&ClientMessage::AuthContinue(AuthContinue::ProviderProof {
+            signature: voipc_crypto::account::provider_proof(&stranger, &relay_id, "deedee", &challenge),
+        }))
+        .await;
+        assert!(matches!(c.next().await, Some(ServerMessage::AuthError { .. })));
+
+        real.send(&ClientMessage::Ping { timestamp: 7 }).await;
+        real.expect("the real connection lives on", |m| {
+            matches!(m, ServerMessage::Pong { timestamp: 7 })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn the_password_slot_never_goes_out_to_a_provider_sign_in() {
+        let (state, _db, subject) = relay(RegistrationMode::Open).await;
+        let (_c, _, _) = register_with(&state, "wendy").await;
+        let relay = relay_of(&state);
+        let wendy = relay.store().user_by_username("wendy").await.unwrap().unwrap();
+        assert!(
+            relay.vault(wendy.id).await.unwrap().iter().any(|b| b.k == "slot.pass"),
+            "the control: this vault has one"
+        );
+        *subject.lock().unwrap() = "2002".into();
+        link_directly(&state, wendy.id, "2002").await;
+
+        let (url, code, ticket) = open_page(&state).await;
+        browser(&state, &url, &code).await;
+        let first = provider_ask(
+            AccountStart::ProviderResume { ticket },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        let mut c = open_raw(&state, &first).await;
+        let Some(ServerMessage::AuthStep(AuthStep::ProviderSigned {
+            name,
+            has_password,
+            claim,
+            blobs,
+            ..
+        })) = c.next().await
+        else {
+            panic!("no ProviderSigned")
+        };
+        assert_eq!(name, "wendy");
+        assert!(has_password && !claim);
+        assert!(!stored_keys(&blobs).contains(&"slot.pass"), "{:?}", stored_keys(&blobs));
+    }
+
+    /// An identity on record for `user`'s account: what a provider's `credential`
+    /// row looks like when made by hand, with fields l4f's `Credential` keeps public.
+    async fn link_directly(state: &Arc<ServerState>, user: AccountId, subject: &str) {
+        let c = l4f_accounts::model::Credential {
+            kind: Kind::Discord.credential_kind(),
+            ext_id: subject.as_bytes().to_vec(),
+            user_id: user,
+            public_key: None,
+            alg: 0,
+            sign_count: 0,
+            flags: 0,
+            name: "dee_d".into(),
+            created_at: l4f_accounts::util::now(),
+            last_used_at: None,
+            public: false,
+        };
+        assert!(relay_of(state).store().insert_credential(&c).await.unwrap());
+    }
+
+    /// A code makes the session fresh, and fresh is what a password's reset asks.
+    /// Here it must not matter: the code says nothing about the vault.
+    #[tokio::test]
+    async fn a_provider_and_a_code_cannot_replace_an_identity() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut c, signed, key) = claimed(&state).await;
+        let secret = totp_on(&mut c).await;
+        drop(c);
+
+        let (url, code, ticket) = open_page(&state).await;
+        browser(&state, &url, &code).await;
+        let first = provider_ask(
+            AccountStart::ProviderResume { ticket },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        let mut c = open_raw(&state, &first).await;
+        assert!(matches!(
+            c.next().await,
+            Some(ServerMessage::AuthStep(AuthStep::NeedTotp))
+        ));
+        let code = format!(
+            "{:06}",
+            l4f_accounts::totp::code_at(&secret, l4f_accounts::util::now() / 30 + 1)
+        );
+        c.send(&ClientMessage::AuthContinue(AuthContinue::Totp { code })).await;
+        let msg = c.next().await.unwrap();
+        let (mut m, _) = SignIn::start(
+            "",
+            Method::Provider { ticket: vec![] },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        m.on_message(&msg).unwrap();
+        // The vault opened and proved, as the real person's device would
+        let Step::Send(proof) = m.provider_recovery(&key).unwrap().remove(0) else {
+            panic!("no proof")
+        };
+        c.send(&proof).await;
+        c.send(&keys(&IDENTITY_OTHER, true)).await;
+        let Some(ServerMessage::AuthError { reason }) = c.next().await else {
+            panic!("an identity replaced through a provider")
+        };
+        assert!(reason.contains("not your account's"), "{reason}");
+        let on_record = relay_of(&state)
+            .identity(relay_of(&state).store().user_by_username("deedee").await.unwrap().unwrap().id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(on_record, signed.identity.public_key().serialize().to_vec());
+    }
+
+    /// A claim is for an account nobody opened, and a relay's answer is not
+    /// what makes that so: the database's identity row is.
+    #[tokio::test]
+    async fn a_claim_is_refused_once_an_identity_exists() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (_real, signed, _) = claimed(&state).await;
+        let (mut c, _, _, _) = at_the_choice(&state).await;
+        c.send(&ClientMessage::AuthContinue(AuthContinue::Claim {
+            identity_key: IDENTITY_OTHER.to_vec(),
+            vault: vec![reset_slot()],
+        }))
+        .await;
+        assert!(matches!(c.next().await, Some(ServerMessage::AuthError { .. })));
+        let relay = relay_of(&state);
+        let user = relay.store().user_by_username("deedee").await.unwrap().unwrap();
+        assert_eq!(
+            relay.identity(user.id).await.unwrap().unwrap(),
+            signed.identity.public_key().serialize().to_vec()
+        );
+        assert!(
+            relay.vault(user.id).await.unwrap().iter().any(|b| b.k == "slot.recovery"),
+            "the vault is still there"
+        );
+    }
+
+    /// Two devices at the same unopened account: the database decides, not what
+    /// the relay told each of them a moment ago.
+    #[tokio::test]
+    async fn the_second_of_two_claims_changes_nothing() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (_c, signed, _) = claimed(&state).await;
+        let relay = relay_of(&state);
+        let user = relay.store().user_by_username("deedee").await.unwrap().unwrap();
+        let before = relay.vault(user.id).await.unwrap();
+        let err = provider::claim(relay, user.id, &IDENTITY_OTHER, &[reset_slot()])
+            .await
+            .unwrap_err();
+        assert!(err.contains("opened just now"), "{err}");
+        assert_eq!(
+            relay.identity(user.id).await.unwrap().unwrap(),
+            signed.identity.public_key().serialize().to_vec()
+        );
+        assert_eq!(relay.vault(user.id).await.unwrap().len(), before.len());
+    }
+
+    /// A claim that died halfway left blobs nobody can open, and no identity.
+    #[tokio::test]
+    async fn a_claim_goes_through_what_a_dead_one_left() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        let (_c, _) = register(&state, "gwen").await;
+        let relay = relay_of(&state);
+        let user = relay.store().user_by_username("gwen").await.unwrap().unwrap();
+        db_forget_identity(relay, user.id).await;
+        provider::claim(relay, user.id, &IDENTITY_OTHER, &[reset_slot()])
+            .await
+            .unwrap();
+        let keys: Vec<String> = relay.vault(user.id).await.unwrap().into_iter().map(|b| b.k).collect();
+        assert_eq!(keys, ["slot.reset"], "only what this claim wrote");
+    }
+
+    async fn db_forget_identity(relay: &crate::accounts::Relay, user: AccountId) {
+        let l4f_accounts::store::Store::Lite(b) = relay.store() else {
+            panic!("these tests run on SQLite")
+        };
+        sqlx::query("DELETE FROM voipc_identity WHERE account = $1")
+            .bind(&user.0[..])
+            .execute(&b.0)
+            .await
+            .unwrap();
+    }
+
+    /// The way back for someone who lost everything, from the shell only, and not
+    /// for an account with a password, which it would lock out.
+    #[tokio::test]
+    async fn reclaim_reopens_an_account_without_a_password_only() {
+        let (state, _db, subject) = relay(RegistrationMode::Open).await;
+        let (c, signed, _) = claimed(&state).await;
+        drop(c);
+        let relay = relay_of(&state);
+        let ctx = relay.ctx(LO, "test");
+        let user = relay.store().user_by_username("deedee").await.unwrap().unwrap();
+        relay.reclaim(&ctx, &user).await.unwrap();
+        assert!(relay.identity(user.id).await.unwrap().is_none());
+        assert!(relay.vault(user.id).await.unwrap().is_empty());
+
+        // The same provider opens it anew, under the same name, with a new identity
+        let (url, code, ticket) = open_page(&state).await;
+        browser(&state, &url, &code).await;
+        let (_c, again) = sign_in(&state, ticket, Choice::Claim).await.unwrap();
+        assert_eq!(again.name, "deedee");
+        assert_ne!(
+            again.identity.public_key().serialize(),
+            signed.identity.public_key().serialize()
+        );
+
+        *subject.lock().unwrap() = "5005".into();
+        let (_w, _, _) = register_with(&state, "wendy").await;
+        let wendy = relay.store().user_by_username("wendy").await.unwrap().unwrap();
+        let err = relay.reclaim(&ctx, &wendy).await.unwrap_err();
+        assert!(err.contains("has a password"), "{err}");
+        assert!(relay.identity(wendy.id).await.unwrap().is_some());
+    }
+
+    /// How an account without a password gets one: the recovery key, as anyone
+    /// who forgot theirs. It then signs in with it, from any device.
+    #[tokio::test]
+    async fn the_recovery_key_adds_a_password_to_an_account_without_one() {
+        use voipc_crypto::account::recovery_text;
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (c, signed, key) = claimed(&state).await;
+        drop(c);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        reset_with(&state, "deedee", &recovery_text(&key), "a brand new password", None)
+            .await
+            .unwrap();
+        let relay = relay_of(&state);
+        let user = relay.store().user_by_username("deedee").await.unwrap().unwrap();
+        assert!(user.has_password);
+
+        let (mut m, first) = SignIn::start(
+            "deedee",
+            Method::Password {
+                password: zeroize::Zeroizing::new("a brand new password".into()),
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        let mut c = open_raw(&state, &first).await;
+        drive(&mut c, &mut m).await.unwrap();
+        assert_eq!(
+            m.finish().unwrap().identity.public_key().serialize(),
+            signed.identity.public_key().serialize()
+        );
+    }
+
+    /// A claim needs what every account's reset depends on.
+    #[tokio::test]
+    async fn a_claim_without_a_reset_key_is_refused() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (url, code, ticket) = open_page(&state).await;
+        browser(&state, &url, &code).await;
+        let first = provider_ask(
+            AccountStart::ProviderResume { ticket },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        let (mut m, _) = SignIn::start("", Method::Provider { ticket: vec![] }, PROTOCOL_VERSION, APP_VERSION);
+        let mut c = open_raw(&state, &first).await;
+        let msg = c.next().await.unwrap();
+        for s in m.on_message(&msg).unwrap() {
+            assert!(matches!(s, Step::ProviderSignup { .. }));
+        }
+        c.send(&m.provider_signup("deedee").unwrap()).await;
+        assert!(matches!(
+            c.next().await,
+            Some(ServerMessage::AuthStep(AuthStep::ProviderSigned { claim: true, .. }))
+        ));
+        c.send(&ClientMessage::AuthContinue(AuthContinue::Claim {
+            identity_key: IDENTITY_OTHER.to_vec(),
+            vault: vec![],
+        }))
+        .await;
+        assert!(matches!(c.next().await, Some(ServerMessage::AuthError { .. })));
+        let relay = relay_of(&state);
+        let user = relay.store().user_by_username("deedee").await.unwrap().unwrap();
+        assert!(relay.identity(user.id).await.unwrap().is_none(), "still unclaimed");
+    }
+
+    /// On a relay that takes invites only, a provider nobody knows makes no account.
+    #[tokio::test]
+    async fn a_closed_relay_makes_no_account_for_a_stranger() {
+        let (state, _db, _) = relay(RegistrationMode::Invite).await;
+        let (url, code, ticket) = open_page(&state).await;
+        browser(&state, &url, &code).await;
+        let err = sign_in(&state, ticket, Choice::Claim).await.err().unwrap();
+        assert!(err.contains("No account here uses that sign-in"), "{err}");
+    }
+
+    /// A proven connection may remember its device; a remembered device's own
+    /// connection may not reset anything or get that for free.
+    #[tokio::test]
+    async fn only_a_proven_connection_counts_as_recent_for_remembering_a_device() {
+        use voipc_crypto::account::DeviceEnrol;
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut c, signed, _) = claimed(&state).await;
+        let (enrol, ask) = DeviceEnrol::start(signed.relay_id);
+        c.send(&ask).await;
+        let ServerMessage::Account(r) = c.expect("challenge", |m| reply(m).is_some()).await else {
+            unreachable!()
+        };
+        assert!(matches!(r, AccountReply::DeviceChallenge { .. }), "{r:?}");
+        c.send(&enrol.on_reply(&r).unwrap()).await;
+        assert!(matches!(
+            c.expect("added", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::DeviceAdded)
+        ));
+        drop(c);
+
+        // Signed in by that device key: as a stolen device would be
+        let (mut m, first) = SignIn::start(
+            "deedee",
+            Method::Device {
+                key: enrol.key,
+                relay_id: signed.relay_id,
+                dek: signed.vault.dek(),
+            },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        let mut c = open_raw(&state, &first).await;
+        drive(&mut c, &mut m).await.unwrap();
+        c.send(&ClientMessage::Account(AccountRequest::DeviceChallenge)).await;
+        let ServerMessage::Account(AccountReply::Error { request, .. }) =
+            c.expect("refused", |m| reply(m).is_some()).await
+        else {
+            panic!("a remembered device enrolled another")
+        };
+        assert_eq!(request, "DeviceChallenge");
+        c.send(&ClientMessage::Account(AccountRequest::DeleteAccount {
+            secret: vec![],
+            totp: None,
+            recovery_code: None,
+        }))
+        .await;
+        let ServerMessage::Account(AccountReply::Error { reason, .. }) =
+            c.expect("refused", |m| reply(m).is_some()).await
+        else {
+            panic!("a stolen device deleted the account")
+        };
+        assert!(reason.contains("provider"), "{reason}");
+    }
+
+    // ── Pairing ──
+
+    /// The old device hears the ask and answers with a nonce.
+    async fn pair_asked(old: &mut Client) -> (u64, Vec<u8>, Vec<u8>) {
+        let ServerMessage::Account(AccountReply::PairAsked { pair, commitment }) = old
+            .expect("asked", |m| matches!(reply(m), Some(AccountReply::PairAsked { .. })))
+            .await
+        else {
+            unreachable!()
+        };
+        let nonce = vec![3u8; voipc_crypto::pair::NONCE_LEN];
+        old.send(&ClientMessage::Account(AccountRequest::PairNonce {
+            pair,
+            nonce: nonce.clone(),
+        }))
+        .await;
+        (pair, commitment, nonce)
+    }
+
+    /// The new device answers the nonce: the reveal goes out, its code comes back.
+    async fn pair_reveal(m: &mut SignIn, c: &mut Client) -> String {
+        let msg = c.next().await.unwrap();
+        let mut steps = m.on_message(&msg).unwrap();
+        let Step::Send(reveal) = steps.remove(0) else {
+            panic!("no reveal")
+        };
+        c.send(&reveal).await;
+        let Step::PairCode { code } = steps.remove(0) else {
+            panic!("no code")
+        };
+        code
+    }
+
+    /// The old device checks the reveal and works out its own code.
+    async fn pair_revealed(old: &mut Client, commitment: &[u8], nonce: &[u8]) -> (Vec<u8>, String) {
+        let ServerMessage::Account(AccountReply::PairRevealed {
+            ephemeral, blind, ..
+        }) = old
+            .expect("revealed", |m| {
+                matches!(reply(m), Some(AccountReply::PairRevealed { .. }))
+            })
+            .await
+        else {
+            unreachable!()
+        };
+        assert!(voipc_crypto::pair::reveal_ok(commitment, &ephemeral, &blind));
+        let code = voipc_crypto::pair::code(commitment, nonce, &ephemeral);
+        (ephemeral, code)
+    }
+
+    /// Runs what the machine returned, until the relay says the device is in.
+    async fn run_to_authenticated(m: &mut SignIn, c: &mut Client, steps: Vec<Step>) {
+        for s in steps {
+            match s {
+                Step::Send(out) => c.send(&out).await,
+                Step::Keys => {
+                    let ik = m.identity().unwrap().public_key().serialize().to_vec();
+                    let b = PreKeyBundleData {
+                        identity_key: ik,
+                        ..bundle()
+                    };
+                    c.send(&m.keys(b)).await;
+                }
+                _ => panic!("unexpected step"),
+            }
+        }
+        c.expect("Authenticated", |m| {
+            matches!(m, ServerMessage::Authenticated { account: Some(_), .. })
+        })
+        .await;
+    }
+
+    /// The new device up to `ProviderChoice`.
+    async fn new_device(state: &Arc<ServerState>) -> (SignIn, Client) {
+        let (url, code, ticket) = open_page(state).await;
+        browser(state, &url, &code).await;
+        let (mut m, first) = SignIn::start(
+            "",
+            Method::Provider { ticket },
+            PROTOCOL_VERSION,
+            APP_VERSION,
+        );
+        let mut c = open_raw(state, &first).await;
+        let msg = c.next().await.unwrap();
+        let steps = m.on_message(&msg).unwrap();
+        assert!(matches!(steps[0], Step::ProviderChoice { claim: false, .. }));
+        (m, c)
+    }
+
+    #[tokio::test]
+    async fn the_other_device_hands_the_vault_key_over_when_the_codes_match() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut old, signed, _) = claimed(&state).await;
+        let (mut m, mut c) = new_device(&state).await;
+        c.send(&m.pair_start().unwrap()).await;
+        let (pair, commitment, nonce) = pair_asked(&mut old).await;
+        let code = pair_reveal(&mut m, &mut c).await;
+        let (ephemeral, old_code) = pair_revealed(&mut old, &commitment, &nonce).await;
+        assert_eq!(code, old_code, "both show the same");
+
+        let wrapped = voipc_crypto::pair::wrap_dek(
+            &ephemeral,
+            &signed.vault.dek(),
+            &signed.relay_id,
+            &signed.name,
+            &commitment,
+        )
+        .unwrap();
+        old.send(&ClientMessage::Account(AccountRequest::PairApprove { pair, wrapped }))
+            .await;
+        let msg = c.next().await.unwrap();
+        let steps = m.on_message(&msg).unwrap();
+        run_to_authenticated(&mut m, &mut c, steps).await;
+        assert_eq!(
+            m.finish().unwrap().identity.public_key().serialize(),
+            signed.identity.public_key().serialize()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_other_device_saying_no_leaves_the_choice_open() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut old, _, key) = claimed(&state).await;
+        let (mut m, mut c) = new_device(&state).await;
+        c.send(&m.pair_start().unwrap()).await;
+        let (pair, commitment, nonce) = pair_asked(&mut old).await;
+        pair_reveal(&mut m, &mut c).await;
+        pair_revealed(&mut old, &commitment, &nonce).await;
+        old.send(&ClientMessage::Account(AccountRequest::PairDecline { pair })).await;
+        let msg = c.next().await.unwrap();
+        let steps = m.on_message(&msg).unwrap();
+        assert!(matches!(steps[0], Step::PairRefused { .. }));
+        // Still waiting for an answer: the recovery key works
+        let steps = m.provider_recovery(&key).unwrap();
+        run_to_authenticated(&mut m, &mut c, steps).await;
+    }
+
+    /// A stranger with the provider account must not be able to wear the person
+    /// down with questions on their other device.
+    #[tokio::test]
+    async fn asking_the_other_device_is_rate_limited() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (_old, _, _) = claimed(&state).await;
+        let (mut m, mut c) = new_device(&state).await;
+        let relay = relay_of(&state);
+        let user = relay.store().user_by_username("deedee").await.unwrap().unwrap();
+        for _ in 0..3 {
+            assert!(relay.spend_pair_ask(user.id));
+        }
+        c.send(&m.pair_start().unwrap()).await;
+        let msg = c.next().await.unwrap();
+        let steps = m.on_message(&msg).unwrap();
+        let Step::PairRefused { reason } = &steps[0] else {
+            panic!("asked past the limit")
+        };
+        assert!(reason.contains("Too many"), "{reason}");
+    }
+
+    #[tokio::test]
+    async fn nobody_answers_a_pairing_for_another_account() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut old, _, _) = claimed(&state).await;
+        let (mut m, mut c) = new_device(&state).await;
+        let (mut mallory, _) = register(&state, "mallory").await;
+        c.send(&m.pair_start().unwrap()).await;
+        let ServerMessage::Account(AccountReply::PairAsked { pair, .. }) = old
+            .expect("asked", |m| matches!(reply(m), Some(AccountReply::PairAsked { .. })))
+            .await
+        else {
+            unreachable!()
+        };
+        for msg in [
+            AccountRequest::PairDecline { pair },
+            AccountRequest::PairApprove {
+                pair,
+                wrapped: vec![1; 93],
+            },
+            AccountRequest::PairNonce {
+                pair,
+                nonce: vec![1; voipc_crypto::pair::NONCE_LEN],
+            },
+        ] {
+            mallory.send(&ClientMessage::Account(msg)).await;
+        }
+        // The next thing the new device hears is the real device's nonce
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let nonce = vec![3u8; voipc_crypto::pair::NONCE_LEN];
+        old.send(&ClientMessage::Account(AccountRequest::PairNonce {
+            pair,
+            nonce: nonce.clone(),
+        }))
+        .await;
+        let Some(ServerMessage::AuthStep(AuthStep::PairNonce { nonce: got })) = c.next().await
+        else {
+            panic!("somebody else answered")
+        };
+        assert_eq!(got, nonce);
+    }
+
+    // ── A signed-in account's providers ──
+
+    #[tokio::test]
+    async fn a_password_account_links_with_its_password_and_unlinks_again() {
+        let (state, _db, subject) = relay(RegistrationMode::Open).await;
+        *subject.lock().unwrap() = "3003".into();
+        let (mut c, _, signed) = register_with(&state, "wendy").await;
+        let secret = voipc_crypto::account::derive("correct horse battery", &signed.relay_id, "wendy")
+            .auth_secret
+            .to_vec();
+        c.send(&ClientMessage::Account(AccountRequest::ProviderList)).await;
+        let ServerMessage::Account(AccountReply::Providers {
+            offered,
+            linked,
+            has_password,
+        }) = c.expect("list", |m| reply(m).is_some()).await
+        else {
+            panic!("no list")
+        };
+        assert_eq!(offered, [ProviderKind::Discord]);
+        assert!(linked.is_empty() && has_password);
+
+        // Without the password: no
+        c.send(&ClientMessage::Account(AccountRequest::ProviderStart {
+            kind: ProviderKind::Discord,
+            link: true,
+            secret: None,
+            totp: None,
+            recovery_code: None,
+        }))
+        .await;
+        assert!(matches!(
+            c.expect("refused", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::Error { .. })
+        ));
+
+        c.send(&ClientMessage::Account(AccountRequest::ProviderStart {
+            kind: ProviderKind::Discord,
+            link: true,
+            secret: Some(secret.clone()),
+            totp: None,
+            recovery_code: None,
+        }))
+        .await;
+        let ServerMessage::Account(AccountReply::ProviderBrowser { url, code }) =
+            c.expect("page", |m| reply(m).is_some()).await
+        else {
+            panic!("no page")
+        };
+        assert_eq!(browser(&state, &url, &code).await, StatusCode::OK);
+        assert!(matches!(
+            c.expect("done", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::ProviderDone { link: true, .. })
+        ));
+        c.send(&ClientMessage::Account(AccountRequest::ProviderList)).await;
+        let ServerMessage::Account(AccountReply::Providers { linked, .. }) =
+            c.expect("list", |m| reply(m).is_some()).await
+        else {
+            panic!("no list")
+        };
+        assert_eq!(linked.len(), 1);
+        assert_eq!(linked[0].kind, ProviderKind::Discord);
+
+        c.send(&ClientMessage::Account(AccountRequest::ProviderUnlink {
+            kind: ProviderKind::Discord,
+            secret: Some(secret),
+            totp: None,
+            recovery_code: None,
+        }))
+        .await;
+        assert!(matches!(
+            c.expect("unlinked", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::ProviderUnlinked { .. })
+        ));
+    }
+
+    /// Nothing but this provider signs this account in: it stays.
+    #[tokio::test]
+    async fn the_last_way_in_cannot_be_unlinked() {
+        let (state, _db, _) = relay(RegistrationMode::Open).await;
+        let (mut c, _, _) = claimed(&state).await;
+        // Prove it with the provider first: a password-less account's recent sign-in
+        c.send(&ClientMessage::Account(AccountRequest::ProviderStart {
+            kind: ProviderKind::Discord,
+            link: false,
+            secret: None,
+            totp: None,
+            recovery_code: None,
+        }))
+        .await;
+        let ServerMessage::Account(AccountReply::ProviderBrowser { url, code }) =
+            c.expect("page", |m| reply(m).is_some()).await
+        else {
+            panic!("no page")
+        };
+        browser(&state, &url, &code).await;
+        assert!(matches!(
+            c.expect("done", |m| reply(m).is_some()).await,
+            ServerMessage::Account(AccountReply::ProviderDone { link: false, .. })
+        ));
+        c.send(&ClientMessage::Account(AccountRequest::ProviderUnlink {
+            kind: ProviderKind::Discord,
+            secret: None,
+            totp: None,
+            recovery_code: None,
+        }))
+        .await;
+        let ServerMessage::Account(AccountReply::Error { reason, .. }) =
+            c.expect("refused", |m| reply(m).is_some()).await
+        else {
+            panic!("the last way in went")
+        };
+        assert!(reason.contains("leave no"), "{reason}");
+    }
+
+    #[test]
+    fn public_url_is_checked() {
+        let with = |url: &str| {
+            let mut c = ServerConfig::default();
+            c.accounts.mode = AccountsMode::Optional;
+            c.accounts.public_url = url.into();
+            c.validate().is_ok()
+        };
+        assert!(with("https://voice.example.org:9987"));
+        assert!(with(""));
+        assert!(!with("http://voice.example.org"));
+        assert!(!with("https://voice.example.org/"));
+        assert!(!with("https://voice.example.org/x"));
+        assert!(!with("https://"));
+    }
 }

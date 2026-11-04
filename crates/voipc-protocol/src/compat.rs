@@ -97,6 +97,102 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
     (15, Side::Server, 5, "UserList without badges"),
     (15, Side::Server, 18, "ChannelUsers without badges"),
     (15, Side::Server, 46, "AccountReply::Admin never comes"),
+    (
+        12,
+        Side::Client,
+        0,
+        "Authenticate: the provider starts are refused",
+    ),
+    (
+        12,
+        Side::Server,
+        45,
+        "AuthStep: the provider steps never come from it",
+    ),
+    (
+        13,
+        Side::Client,
+        0,
+        "Authenticate: the provider starts are refused",
+    ),
+    (
+        13,
+        Side::Client,
+        40,
+        "AuthContinue: the provider steps are refused",
+    ),
+    (
+        13,
+        Side::Server,
+        45,
+        "AuthStep: the provider steps never come from it",
+    ),
+    (
+        14,
+        Side::Client,
+        0,
+        "Authenticate: the provider starts are refused",
+    ),
+    (
+        14,
+        Side::Client,
+        40,
+        "AuthContinue: the provider steps are refused",
+    ),
+    (
+        14,
+        Side::Server,
+        45,
+        "AuthStep: the provider steps never come from it",
+    ),
+    (
+        15,
+        Side::Client,
+        0,
+        "Authenticate: the provider starts are refused",
+    ),
+    (
+        15,
+        Side::Client,
+        40,
+        "AuthContinue: the provider steps are refused",
+    ),
+    (
+        15,
+        Side::Server,
+        45,
+        "AuthStep: the provider steps never come from it",
+    ),
+    (
+        16,
+        Side::Client,
+        0,
+        "Authenticate: the provider starts are refused",
+    ),
+    (
+        16,
+        Side::Client,
+        40,
+        "AuthContinue: the provider steps are refused",
+    ),
+    (
+        16,
+        Side::Client,
+        41,
+        "AccountRequest: the provider requests are refused",
+    ),
+    (
+        16,
+        Side::Server,
+        45,
+        "AuthStep: the provider steps never come from it",
+    ),
+    (
+        16,
+        Side::Server,
+        46,
+        "AccountReply: the provider replies never come from it",
+    ),
 ];
 
 /// How many messages each side had at a protocol: an index at or past it is
@@ -106,7 +202,7 @@ fn client_messages(proto: u32) -> u32 {
         ..=12 => 42,
         13 => 45,
         14 => 49,
-        15 => 50,
+        15..=16 => 50,
         _ => u32::MAX,
     }
 }
@@ -160,6 +256,33 @@ pub fn encode_client_msg_for(
         ClientMessage::Account(AccountRequest::Admin { .. }) if proto < 16 => {
             Err(ProtocolError::NotOnThisRelay(proto))
         }
+        // New variants of enums nested in a message that is older: its index
+        // says nothing, so they are named.
+        ClientMessage::Authenticate {
+            account:
+                Some(
+                    AccountStart::Providers
+                    | AccountStart::Provider { .. }
+                    | AccountStart::ProviderResume { .. }
+                    | AccountStart::ProviderStatus { .. },
+                ),
+            ..
+        }
+        | ClientMessage::AuthContinue(
+            AuthContinue::ProviderSignup { .. }
+            | AuthContinue::Claim { .. }
+            | AuthContinue::ProviderProof { .. }
+            | AuthContinue::PairStart { .. }
+            | AuthContinue::PairReveal { .. },
+        )
+        | ClientMessage::Account(
+            AccountRequest::ProviderList
+            | AccountRequest::ProviderStart { .. }
+            | AccountRequest::ProviderUnlink { .. }
+            | AccountRequest::PairNonce { .. }
+            | AccountRequest::PairApprove { .. }
+            | AccountRequest::PairDecline { .. },
+        ) if proto < 17 => Err(ProtocolError::NotOnThisRelay(proto)),
         ClientMessage::EmoteAdd { emote } if proto == 14 => old(postcard::to_allocvec(&(
             EMOTE_ADD,
             EmoteAdd14 {
@@ -193,17 +316,17 @@ pub fn decode_server_msg_from(payload: &[u8], proto: u32) -> Result<ServerMessag
         (AUTHENTICATED, ..=12) => postcard::from_bytes::<Authenticated12>(rest)?.into(),
         (AUTHENTICATED, 13) => postcard::from_bytes::<Authenticated13>(rest)?.into(),
         (AUTHENTICATED, 14) => postcard::from_bytes::<Authenticated14>(rest)?.into(),
-        (USER_JOINED, _) => ServerMessage::UserJoined {
+        (USER_JOINED, ..=15) => ServerMessage::UserJoined {
             user: postcard::from_bytes::<UserJoined15>(rest)?.user.into(),
         },
-        (USER_LIST, _) => {
+        (USER_LIST, ..=15) => {
             let l: UserList15 = postcard::from_bytes(rest)?;
             ServerMessage::UserList {
                 channel_id: l.channel_id,
                 users: l.users.into_iter().map(UserInfo::from).collect(),
             }
         }
-        (CHANNEL_USERS, _) => {
+        (CHANNEL_USERS, ..=15) => {
             let l: ChannelUsers15 = postcard::from_bytes(rest)?;
             ServerMessage::ChannelUsers {
                 channel_id: l.channel_id,
@@ -700,6 +823,26 @@ mod tests {
                 }),
                 15,
             ),
+            (
+                ClientMessage::Authenticate {
+                    username: String::new(),
+                    protocol_version: 16,
+                    app_version: String::new(),
+                    identity_key: None,
+                    prekey_bundle: None,
+                    account: Some(AccountStart::Providers),
+                },
+                16,
+            ),
+            (
+                ClientMessage::AuthContinue(AuthContinue::ProviderProof { signature: vec![] }),
+                16,
+            ),
+            (ClientMessage::Account(AccountRequest::ProviderList), 16),
+            (
+                ClientMessage::Account(AccountRequest::PairDecline { pair: 1 }),
+                16,
+            ),
         ];
         for (msg, v) in cases {
             assert!(
@@ -754,6 +897,50 @@ mod tests {
             decode_server_msg_from(&list, 15).unwrap(),
             ServerMessage::UserList { channel_id: 2, .. }
         ));
+    }
+
+    /// The arms above are for the protocols before badges, and only those. As
+    /// `_` they turned on the first relay of the protocol before today's: all of
+    /// a 1.7 relay's rosters failed to decode once this app spoke 17.
+    #[test]
+    fn rosters_with_badges_decode_at_every_protocol_that_has_them() {
+        let user = UserInfo {
+            user_id: 7,
+            username: "ann".into(),
+            channel_id: 2,
+            is_muted: false,
+            is_deafened: false,
+            is_screen_sharing: false,
+            is_admin: false,
+            shares_history: false,
+            account: Some([5; 16]),
+            is_moderator: false,
+            badges: vec!["crew".into()],
+        };
+        let messages = [
+            ServerMessage::UserJoined { user: user.clone() },
+            ServerMessage::UserList {
+                channel_id: 2,
+                users: vec![user.clone()],
+            },
+            ServerMessage::ChannelUsers {
+                channel_id: 2,
+                users: vec![user],
+            },
+        ];
+        for v in 16..=PROTOCOL_VERSION {
+            for msg in &messages {
+                let bytes = postcard::to_allocvec(msg).unwrap();
+                let back = decode_server_msg_from(&bytes, v).unwrap();
+                let users = match back {
+                    ServerMessage::UserJoined { user } => vec![user],
+                    ServerMessage::UserList { users, .. }
+                    | ServerMessage::ChannelUsers { users, .. } => users,
+                    other => panic!("{other:?} at {v}"),
+                };
+                assert_eq!(users[0].badges, ["crew"], "at {v}");
+            }
+        }
     }
 
     #[test]

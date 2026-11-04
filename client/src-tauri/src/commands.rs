@@ -46,8 +46,10 @@ pub async fn connect(
     if address.is_empty() || address.len() > 253 {
         return Err("address must be 1-253 characters".into());
     }
-    // 32 for the name and 5 for its "#0000" tag; the server checks each part
-    if username.is_empty() || username.len() > 37 {
+    // 32 for the name and 5 for its "#0000" tag; the server checks each part. A
+    // provider's sign-in has no name yet: its answer decides the account.
+    let named = !matches!(account, Some(crate::account::AccountArgs::Provider { .. }));
+    if (named && username.is_empty()) || username.len() > 37 {
         return Err("username must be 1-32 characters".into());
     }
 

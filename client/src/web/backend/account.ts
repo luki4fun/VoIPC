@@ -8,7 +8,7 @@
 
 import { toHex } from "../../lib/hex";
 import { getConfig } from "./config";
-import { cursorStorageKey, findDevice, saveDevice } from "./devices";
+import { cursorStorageKey, findDevice, listDevices, saveDevice } from "./devices";
 import { freshPage, keepMemory, markReplay, type PageMemory } from "./log-memory";
 import { wasm, type AccountActions, type AccountMethod, type AccountSession, type AccountSignIn, type SignInStep, type SignalClient } from "./wasm";
 
@@ -17,7 +17,19 @@ export type AccountArgs =
   | { kind: "login"; password: string }
   | { kind: "register"; password: string; invite?: string | null }
   | { kind: "device" }
-  | { kind: "reset"; recovery: string; password: string };
+  | { kind: "reset"; recovery: string; password: string }
+  | { kind: "provider"; ticket: number[] };
+
+/** What a sign-in through a provider asks the person (account.rs `ProviderAnswer`). */
+export type ProviderAnswer =
+  | { kind: "name"; name: string }
+  | { kind: "claim" }
+  | { kind: "recovery"; key: string }
+  | { kind: "pair" }
+  | { kind: "password" };
+
+/** What this ends with when the person chose their password; the name follows. */
+const USE_PASSWORD = "Sign in with your password: ";
 
 /** What a reset ends with (account.rs RESET_DONE): the relay closes that
  *  connection, and the front end signs in with the new password. */
@@ -101,15 +113,21 @@ function writeCursors(key: string, json: string): void {
 const pageMemory = new Map<string, PageMemory>();
 
 type TotpAnswer = { code: string; recovery: boolean } | null;
+type ProviderChoice = { name: string; claim: boolean; has_password: boolean; problem: string };
 type Body = Record<string, unknown>;
 
 const TOTP_WAIT_MS = 115_000;
+/** The relay waits five minutes for a person; this a little less. */
+const PROVIDER_WAIT_MS = 290_000;
 /** `AccountSession.tick`. */
 const TICK_MS = 2_000;
 
 export class AccountDriver {
   private signIn: AccountSignIn | null;
   private totpWaiter: ((a: TotpAnswer) => void) | null = null;
+  private providerWaiter: ((a: ProviderAnswer | null) => void) | null = null;
+  /** What the person is asked at a provider's sign-in, kept for asking again. */
+  private choice: ProviderChoice | null = null;
   private asked = 0;
   /** What follows the sign-in (voipc_crypto::account_session, as on the desktop). */
   private session: AccountSession | null = null;
@@ -128,7 +146,8 @@ export class AccountDriver {
   /** Throws why it cannot start (a bad name, no remembered device). */
   static async create(server: string, username: string, args: AccountArgs): Promise<AccountDriver> {
     const api = wasm();
-    const name = api.normalizeAccountName(username);
+    // A provider's answer decides the account
+    const name = args.kind === "provider" ? "" : api.normalizeAccountName(username);
     let method: AccountMethod;
     if (args.kind === "device") {
       const d = await findDevice(server, name);
@@ -147,7 +166,11 @@ export class AccountDriver {
         .filter(([s]) => s !== server)
         .map(([s, id]) => [id, s]),
     );
-    return new AccountDriver(signIn, args.kind !== "device", args.kind === "device" ? null : args.password);
+    if (args.kind === "provider") {
+      const devices = await listDevices();
+      signIn.rememberedHere(devices.filter((d) => d.server === server).map((d) => d.name));
+    }
+    return new AccountDriver(signIn, args.kind !== "device", args.kind === "device" || args.kind === "provider" ? null : args.password);
   }
 
   /** The Authenticate payload. */
@@ -181,8 +204,115 @@ export class AccountDriver {
         void this.stretchThen(host, signIn, s.stretch);
       } else if (s.resetDone) {
         host.failAuth(new Error(RESET_DONE));
+      } else if (s.providerPending) {
+        host.failAuth(new Error("Not finished in the browser yet."));
+      } else if (s.providerSignup) {
+        void this.askName(host, signIn, s.providerSignup);
+      } else if (s.providerChoice) {
+        this.choice = { ...s.providerChoice, problem: "" };
+        void this.askChoice(host, signIn);
+      } else if (s.pairCode) {
+        host.emit("account-pair-code", s.pairCode);
+      } else if (s.pairRefused) {
+        if (this.choice) this.choice.problem = s.pairRefused;
+        void this.askChoice(host, signIn);
       }
     }
+  }
+
+  /** Asks the front end and waits for `answerProvider`. */
+  private askProvider(host: AccountHost, event: string, payload: unknown): Promise<ProviderAnswer | null> {
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => resolve(null), PROVIDER_WAIT_MS);
+      this.providerWaiter = (a) => {
+        clearTimeout(timer);
+        this.providerWaiter = null;
+        resolve(a);
+      };
+      host.emit(event, payload);
+    });
+  }
+
+  private async askName(host: AccountHost, signIn: AccountSignIn, ask: { suggestion: string; problem: string }): Promise<void> {
+    const answer = await this.askProvider(host, "account-provider-signup", ask);
+    if (this.signIn !== signIn) return;
+    if (answer?.kind !== "name") {
+      host.failAuth(new Error("Nothing was chosen in time."));
+      return;
+    }
+    try {
+      host.sendRaw(signIn.providerSignup(answer.name));
+    } catch (e) {
+      host.failAuth(e instanceof Error ? e : new Error(String(e)));
+    }
+  }
+
+  /** What opens the account, as the person says (account.rs `choose`). */
+  private async askChoice(host: AccountHost, signIn: AccountSignIn): Promise<void> {
+    for (;;) {
+      const answer = await this.askProvider(host, "account-provider-choice", this.choice);
+      if (this.signIn !== signIn) return;
+      try {
+        switch (answer?.kind) {
+          case "claim":
+            this.steps(host, signIn, signIn.providerClaim());
+            return;
+          case "pair":
+            host.sendRaw(signIn.pairStart());
+            return;
+          case "password":
+            host.failAuth(new Error(`${USE_PASSWORD}${this.choice?.name ?? ""}`));
+            return;
+          case "recovery":
+            break;
+          default:
+            host.failAuth(new Error("Nothing was chosen in time."));
+            return;
+        }
+      } catch (e) {
+        host.failAuth(e instanceof Error ? e : new Error(String(e)));
+        return;
+      }
+      try {
+        this.steps(host, signIn, signIn.providerRecovery(answer.key));
+        return;
+      } catch (e) {
+        // A mistyped key costs nothing: ask again
+        if (this.choice) this.choice.problem = e instanceof Error ? e.message : String(e);
+      }
+    }
+  }
+
+  /** The person's answer to `account-provider-signup` or `account-provider-choice`. */
+  answerProvider(answer: ProviderAnswer): void {
+    if (!this.providerWaiter) throw new Error("No sign-in is waiting for that.");
+    this.providerWaiter(answer);
+  }
+
+  /** The person's answer to `account-pair-ask`. */
+  pairAnswer(host: AccountHost, pair: number, yes: boolean): void {
+    if (this.session) this.run(host, this.session.pairAnswer(pair, yes));
+  }
+
+  /** A password stretched, or null for an account without one. */
+  private async master(session: AccountSession, password: string): Promise<Uint8Array | null> {
+    if (!password) return null;
+    const master = await stretch(password, session.kdfSalt());
+    if (this.session !== session) throw new Error("The connection ended.");
+    return master;
+  }
+
+  /** Link a provider, or prove it's you with one (account.rs `account_provider_start`). */
+  async providerStart(host: AccountHost, kind: string, link: boolean, password: string, totp: string | null, recovery: string | null): Promise<void> {
+    const session = this.session;
+    if (!session) throw new Error("Not signed in to an account on that server");
+    this.run(host, session.providerStart(kind, link, await this.master(session, password), totp, recovery));
+  }
+
+  async providerUnlink(host: AccountHost, kind: string, password: string, totp: string | null, recovery: string | null): Promise<void> {
+    const session = this.session;
+    if (!session) throw new Error("Not signed in to an account on that server");
+    this.run(host, session.providerUnlink(kind, await this.master(session, password), totp, recovery));
   }
 
   /** The password's stretching, off the page's thread, then the machine's next steps. */
@@ -222,6 +352,7 @@ export class AccountDriver {
 
   cancel(): void {
     this.totpWaiter?.(null);
+    this.providerWaiter?.(null);
   }
 
   /** After Authenticated, with its `account` (AccountInfo). */
@@ -256,6 +387,7 @@ export class AccountDriver {
     if (this.ticker !== null) clearInterval(this.ticker);
     this.ticker = null;
     this.totpWaiter?.(null);
+    this.providerWaiter?.(null);
     this.signIn?.free();
     this.signIn = null;
     this.session?.free();
@@ -327,9 +459,7 @@ export class AccountDriver {
   async deleteAccount(host: AccountHost, password: string, totp: string | null, recovery: string | null): Promise<void> {
     const session = this.session;
     if (!session) throw new Error("Not signed in to an account on that server");
-    const master = await stretch(password, session.kdfSalt());
-    if (this.session !== session) throw new Error("The connection ended.");
-    this.run(host, session.deleteAccount(master, totp, recovery));
+    this.run(host, session.deleteAccount(await this.master(session, password), totp, recovery));
   }
 
   /** Out of channel log `conv`; with `tell`, the relay is asked to take us out. */
@@ -371,9 +501,7 @@ export class AccountDriver {
   async recoveryKeyNew(host: AccountHost, password: string, totp: string | null, recovery: string | null): Promise<string> {
     const session = this.session;
     if (!session) throw new Error("Not signed in to an account on that server");
-    const master = await stretch(password, session.kdfSalt());
-    if (this.session !== session) throw new Error("The connection ended.");
-    const out = session.recoveryKeyNew(master, totp, recovery);
+    const out = session.recoveryKeyNew(await this.master(session, password), totp, recovery);
     this.run(host, out);
     return out.key;
   }

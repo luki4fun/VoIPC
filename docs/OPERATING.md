@@ -126,9 +126,13 @@ WantedBy=multi-user.target
 - **Commands:**
   - `admin grant|revoke <name> <group>` (`admin`, `moderator`, or one made in the app);
   - `admin reset-2fa <name>`;
+  - `admin reclaim <name>` (no password, every device and the recovery key lost);
   - `admin invite`;
   - `ban list|add|remove`.
   - [ACCOUNTS.md](ACCOUNTS.md) has the details.
+- **Sign-in with a provider** (`public_url`, `VOIPC_OAUTH_<PROVIDER>_ID` and `_SECRET`) needs a public
+  certificate on this port. Apps that pinned the old self-signed one accept it, since the public CAs do, and
+  go on doing so at each renewal. `signups_per_hour` (60) bounds new accounts: raise it for a move.
 
 ## 7. Backups
 
@@ -257,6 +261,45 @@ release speaks which protocol: [COMPATIBILITY.md](COMPATIBILITY.md) §1.
 `[update]` (§14) refuses to start in the container: its binary is part of the image. Pull a new
 tag instead, by hand or with `podman auto-update` and the `io.containers.autoupdate=registry`
 label.
+
+## 10a. How big one relay goes
+
+Measured with `community_load` (below) on one relay and one 32-thread machine with
+62 GiB, load clients on the same machine, 2026-11-04: guests, no voice, N clients arriving at
+50 a second, all joining one text channel at once, then one 200-byte chat message a second.
+
+| Clients | Relay's cores | Join all (s) | Join p95 (ms) | Rosters short | Chat p95 (ms) | Chat delivered | Relay RSS (MiB) |
+|---|---|---|---|---|---|---|---|
+| 500 | all | 0.2 | 77 | 0 | 3 | all | 107 |
+| 1000 | all | 1.0 | 239 | 0 | 5 | all | 229 |
+| 2000 | all | 3.8 | 1543 | 0 | 9 | all | 523 |
+| 500 | 2 | 0.2 | 145 | 0 | 3 | all | 97 |
+| 1000 | 2 | 0.8 | 426 | 0 | 8 | all | 198 |
+| 2000 | 2 | 3.4 | 1990 | 0 | 12 | all | 532 |
+
+So the relay itself carries 2000 connections. What a connection may have waiting is bounded at 16 MiB
+of messages. Past that its client has stopped reading, and the relay ends the connection (the log says so)
+rather than let it fall behind quietly: the app reconnects and gets the whole state again. The limits a
+real community meets first are these:
+
+- **One message holds one list.** `UserList` fits 2621 guests, 1598 accounts, or 789 accounts with
+  three badges each; `ChannelList` 1213 channels, 555 with a 64-byte description, 210 with 256 bytes.
+  Past that the list never arrives, and everybody starts in General.
+- **Joining takes time at the client.** A member joining a channel of N sends 3N control messages at
+  50 a second: 120 s at 2000. The crypto itself is small: 0.4 ms and about 4 KiB a member.
+- **Kept history is for 256 members a channel**: the next joiner gets no offline catch-up there.
+- **A person's pins fit about 650 accounts** (the vault travels in one message).
+
+Not measured: voice in a big channel (`voice_load` is for that), accounts signing in at once, real
+networks.
+
+```sh
+cargo build -p voipc-server --release --bin voipc-server --example community_load
+target/release/voipc-server -c server.toml &   # max_users above N
+target/release/examples/community_load run 500 127.0.0.1:9987 "$!"
+target/release/examples/community_load frames
+target/release/examples/community_load crypto 2000
+```
 
 ## 11. The file cache
 

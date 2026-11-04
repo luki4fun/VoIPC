@@ -18,6 +18,7 @@ use voipc_protocol::messages::{
 use voipc_protocol::types::*;
 
 use crate::accounts::Powers;
+use crate::control::{control_queue, ControlTx};
 use crate::state::ServerState;
 
 /// One-time pre-keys stored per user. A bundle request consumes one and
@@ -137,8 +138,13 @@ pub async fn handle_connection<S>(
     // --- Split into reader/writer ---
     let (read_half, mut write_half) = tokio::io::split(stream);
 
+    // Session vanished between authenticate() and here — nothing to serve
+    let Some(close) = state.sessions.get(&session_id).map(|s| s.close.clone()) else {
+        return;
+    };
+
     // Writer task: receives serialized messages from a channel and writes them to the stream
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(256);
+    let (tx, mut rx) = control_queue(close.clone());
 
     let mut writer_handle = tokio::spawn(async move {
         while let Some(data) = rx.recv().await {
@@ -149,18 +155,14 @@ pub async fn handle_connection<S>(
         }
     });
 
-    // Store the sender in the session; keep the admin close handle
-    let close = match state.sessions.get_mut(&session_id) {
-        Some(mut session) => {
-            session.control_tx = tx.clone();
-            session.close.clone()
-        }
+    // Store the sender in the session
+    match state.sessions.get_mut(&session_id) {
+        Some(mut session) => session.control_tx = tx.clone(),
         None => {
-            // Session vanished between authenticate() and here — nothing to serve
             writer_handle.abort();
             return;
         }
-    };
+    }
 
     // Sent from here (not inside authenticate) so that a failed write
     // still flows through cleanup_session below instead of leaking the
@@ -251,7 +253,7 @@ pub async fn handle_connection<S>(
                 false
             }
             _ = close.notified() => {
-                info!(user_id, "connection closed by admin");
+                info!(user_id, "connection closed by the relay");
                 break;
             }
         };
@@ -676,7 +678,7 @@ where
     }
 
     // Create a placeholder sender (will be replaced after split)
-    let (placeholder_tx, _) = mpsc::channel(1);
+    let placeholder_tx = ControlTx::placeholder();
 
     let mut session = crate::state::UserSession::new(
         user_id,
@@ -704,6 +706,7 @@ where
             device_challenge: None,
             standing: s.standing,
             step_up_at: None,
+            vault_proven: s.vault_proven,
         });
         session.set_scopes(s.user, s.scopes);
         s.account
@@ -795,7 +798,7 @@ where
 ///
 /// The sender is told rather than dropped silently: an honest client that hit
 /// this has a message it believes was sent.
-async fn relayable(ciphertext: &[u8], tx: &mpsc::Sender<Vec<u8>>) -> bool {
+async fn relayable(ciphertext: &[u8], tx: &ControlTx) -> bool {
     if ciphertext.len() <= MAX_RELAY_CIPHERTEXT {
         return true;
     }
@@ -874,7 +877,7 @@ async fn handle_message(
     state: &Arc<ServerState>,
     user_id: UserId,
     session_id: SessionId,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     match msg {
         ClientMessage::JoinChannel {
@@ -1504,7 +1507,7 @@ async fn handle_join_channel(
     session_id: SessionId,
     channel_id: ChannelId,
     password: Option<&str>,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     // Rate-limit password attempts to prevent brute force
     if password.is_some() {
@@ -1629,7 +1632,7 @@ fn tell_listen_only(
     state: &ServerState,
     session_id: SessionId,
     channel_id: ChannelId,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) {
     let listen = state
         .sessions
@@ -1694,7 +1697,7 @@ async fn handle_leave_text_channel(
     user_id: UserId,
     session_id: SessionId,
     channel_id: ChannelId,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     // Same budget as the join, and for the same reason: leaving is also a
     // broadcast to every session plus a write of the channel map, and a
@@ -1893,7 +1896,7 @@ async fn handle_create_channel(
     proximity: ProximityMode,
     anonymous: bool,
     text: bool,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     // Validate and sanitize name
     let name = name.trim().to_string();
@@ -1962,7 +1965,7 @@ async fn handle_set_channel_password(
     session_id: SessionId,
     channel_id: ChannelId,
     password: Option<String>,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     let overrides = state.can(session_id, Powers::CHANNELS);
     let locks = password.is_some();
@@ -1994,7 +1997,7 @@ async fn handle_set_channel_proximity(
     session_id: SessionId,
     channel_id: ChannelId,
     proximity: ProximityMode,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     let overrides = state.can(session_id, Powers::CHANNELS);
     match state
@@ -2020,7 +2023,7 @@ async fn handle_set_channel_options(
     session_id: SessionId,
     channel_id: ChannelId,
     request: ChannelOptions,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     // Turning anonymity off shows everyone in there by their real name: an
     // unmasking, so an admin's or the channel creator's alone.
@@ -2132,7 +2135,7 @@ async fn handle_kick_user(
     requester_session_id: SessionId,
     channel_id: ChannelId,
     target_id: UserId,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     let admin = state.is_admin(requester_session_id);
     let moderates = state.can(requester_session_id, Powers::KICK);
@@ -2274,7 +2277,7 @@ async fn handle_send_invite(
     requester_id: UserId,
     channel_id: ChannelId,
     target_user_id: UserId,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     match state
         .add_invite(channel_id, requester_id, target_user_id)
@@ -2319,7 +2322,7 @@ async fn handle_send_poke(
     target_user_id: UserId,
     ciphertext: Vec<u8>,
     message_type: u8,
-    _tx: &mpsc::Sender<Vec<u8>>,
+    _tx: &ControlTx,
 ) -> Result<()> {
     // The name the target may see: a poke from an anonymous channel must not
     // carry the real one
@@ -2415,7 +2418,7 @@ async fn end_unused_sign_in(state: &ServerState, token: Option<&str>) {
 }
 
 /// A `ChannelError` for the sender alone: what they asked for was refused.
-async fn channel_error(tx: &mpsc::Sender<Vec<u8>>, reason: impl Into<String>) {
+async fn channel_error(tx: &ControlTx, reason: impl Into<String>) {
     let _ = send_msg(
         tx,
         &ServerMessage::ChannelError {
@@ -2424,7 +2427,7 @@ async fn channel_error(tx: &mpsc::Sender<Vec<u8>>, reason: impl Into<String>) {
     );
 }
 
-async fn admin_error(tx: &mpsc::Sender<Vec<u8>>, reason: &str) {
+async fn admin_error(tx: &ControlTx, reason: &str) {
     let _ = send_msg(
         tx,
         &ServerMessage::AdminError {
@@ -2439,7 +2442,7 @@ async fn handle_admin_login(
     user_id: UserId,
     session_id: SessionId,
     token: &str,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) {
     use subtle::ConstantTimeEq;
     let (has_account, peer_ip) = state
@@ -2575,7 +2578,7 @@ async fn handle_admin_kick(
     target_id: UserId,
     reason: String,
     ban: Option<(u32, bool)>,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) {
     if target_id == admin_user_id {
         admin_error(tx, "you cannot kick yourself").await;
@@ -2668,7 +2671,7 @@ async fn handle_admin_ban_account(
     name: &str,
     reason: String,
     duration_secs: u32,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) {
     let Some(relay) = state.accounts.clone() else {
         admin_error(tx, "this server has no accounts").await;
@@ -2827,7 +2830,7 @@ async fn handle_start_screen_share(
     session_id: SessionId,
     resolution: u16,
     codec: VideoCodec,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     let channel_id = state
         .sessions
@@ -2881,7 +2884,7 @@ async fn handle_stop_screen_share(
     state: &Arc<ServerState>,
     user_id: UserId,
     session_id: SessionId,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     let channel_id = state
         .sessions
@@ -2933,7 +2936,7 @@ async fn handle_watch_screen_share(
     viewer_user_id: UserId,
     viewer_session_id: SessionId,
     sharer_user_id: UserId,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     let channel_id = state
         .sessions
@@ -3011,7 +3014,7 @@ async fn handle_stop_watching(
     state: &Arc<ServerState>,
     viewer_user_id: UserId,
     viewer_session_id: SessionId,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     let channel_id = state
         .sessions
@@ -3089,7 +3092,7 @@ pub(crate) async fn relay_keyframe_request(state: &ServerState, sharer_sid: Sess
 async fn handle_request_prekey_bundle(
     state: &Arc<ServerState>,
     target_user_id: UserId,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     let (bundle, running_low) = {
         let mut session = match state.sessions.get_mut(&target_user_id) {
@@ -3194,7 +3197,7 @@ async fn handle_encrypted_direct_message(
     target_user_id: UserId,
     ciphertext: Vec<u8>,
     message_type: u8,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     let (real, alias) = state.names_of(from_user_id).await;
 
@@ -3245,7 +3248,7 @@ async fn handle_encrypted_channel_message(
     session_id: SessionId,
     channel_id: ChannelId,
     ciphertext: Vec<u8>,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     if state.sessions.get(&session_id).is_none() {
         return Ok(());
@@ -3524,7 +3527,7 @@ async fn broadcast_to_channel(
     // leave stalls every reader behind it, and holding it across a loop that
     // serializes the message once per recipient puts that stall in the path of
     // every voice packet on the server.
-    let member_txs: Vec<mpsc::Sender<Vec<u8>>> = {
+    let member_txs: Vec<ControlTx> = {
         let channels = state.channels.read().await;
         let Some(channel) = channels.get(&channel_id) else {
             return;
@@ -3552,7 +3555,7 @@ async fn broadcast_to_channel(
 /// `sessions`), so a client that stops reading its socket must not be able
 /// to park the whole server behind its full queue. A client that cannot
 /// drain 256 control messages is dead anyway.
-pub(crate) fn send_msg(tx: &mpsc::Sender<Vec<u8>>, msg: &ServerMessage) -> Result<()> {
+pub(crate) fn send_msg(tx: &ControlTx, msg: &ServerMessage) -> Result<()> {
     let data = encode_server_msg(msg).inspect_err(|e| {
         // Every caller discards this Result, and for the ordinary reason —
         // a client that has stopped reading is not our problem. A message too
@@ -3561,13 +3564,7 @@ pub(crate) fn send_msg(tx: &mpsc::Sender<Vec<u8>>, msg: &ServerMessage) -> Resul
         // a key bundle that simply never arrives.
         warn!("refusing to send a message that cannot be framed: {e}");
     })?;
-    tx.try_send(data).map_err(|e| match e {
-        mpsc::error::TrySendError::Full(_) => {
-            anyhow::anyhow!("control send queue full (client not reading)")
-        }
-        mpsc::error::TrySendError::Closed(_) => anyhow::anyhow!("control send channel closed"),
-    })?;
-    Ok(())
+    Ok(tx.try_send(data)?)
 }
 
 #[cfg(test)]

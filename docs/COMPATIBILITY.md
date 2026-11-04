@@ -12,7 +12,7 @@ nobody checks, so a new one comes with its test.
 
 **1.x keeps:**
 - A relay admits a client exactly when their `PROTOCOL_VERSION` is equal (12 in 1.0, 13 in
-  1.3, 14 in 1.4, 15 in 1.5, 16 in 1.7). The app version is informational only.
+  1.3, 14 in 1.4, 15 in 1.5, 16 in 1.7, 17 in 1.8). The app version is informational only.
 - **Since 1.6, an app talks to relays from its own protocol down to `OLDEST_RELAY_PROTOCOL`**
   (`crates/voipc-protocol/src/compat.rs`; 12 in 1.6 and 1.7), never fewer than three protocols back.
   It asks with its own; a relay of an older protocol refuses with its own (below), and the app

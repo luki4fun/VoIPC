@@ -228,6 +228,36 @@ pub enum AccountStart {
     /// account proves itself with its identity key, which only the vault's
     /// recovery slot opens. It ends in `AuthStep::ResetDone`, not a sign-in.
     Reset,
+    /// Which providers this relay signs in with (protocol v17). Answered with
+    /// `AuthStep::Providers`; the connection ends there, no account involved.
+    Providers,
+    /// Sign in with a provider (protocol v17). Answered with
+    /// `AuthStep::OpenBrowser`; the connection ends there, so that an app the
+    /// system suspends while the browser is open loses nothing. No name yet:
+    /// the provider's answer decides the account.
+    Provider { kind: ProviderKind },
+    /// Back from the browser with `AuthStep::OpenBrowser`'s ticket.
+    ProviderResume { ticket: Vec<u8> },
+    /// Whether the browser is through (`AuthStep::ProviderReady`, or
+    /// `ProviderPending`), without spending the ticket; the connection ends there.
+    ProviderStatus { ticket: Vec<u8> },
+}
+
+/// Who can vouch for an account at sign-in. Never for its vault: the relay sees
+/// all a provider says, so nothing of that may open anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProviderKind {
+    Discord,
+    Google,
+    Facebook,
+}
+
+/// A provider linked to an account, as the account panel lists it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinkedProvider {
+    pub kind: ProviderKind,
+    /// What the provider calls the person.
+    pub name: String,
 }
 
 /// The sign-up proof of work: an ALTCHA challenge (JSON) and the relay's

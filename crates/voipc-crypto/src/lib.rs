@@ -24,6 +24,7 @@ pub mod group;
 pub mod identity;
 pub mod log;
 pub mod media_keys;
+pub mod pair;
 pub mod prekey;
 pub mod session;
 pub mod stores;

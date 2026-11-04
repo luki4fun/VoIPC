@@ -247,11 +247,70 @@ counts at once.
   While the conversation runs on another key than the one pinned, there is no
   number to compare: reconnect to them first.
 
+## Signing in with Discord, Google or Facebook
+
+Optional, and only where the relay has a web address with a certificate browsers accept, because the
+provider sends the browser back there. Without one, nothing changes and no buttons show. Instagram is not
+possible: its API serves professional accounts only. Facebook is there because the library has it, and is
+untested.
+
+**Setting it up.** Each relay registers its own application at each provider: no central service is
+involved. The redirect address is `https://<your host:port>/account/oauth/<discord|google|facebook>/cb`.
+
+```toml
+[accounts]
+public_url = "https://voice.example.org:9987"
+```
+
+```sh
+VOIPC_OAUTH_DISCORD_ID=…     VOIPC_OAUTH_DISCORD_SECRET=…
+VOIPC_OAUTH_GOOGLE_ID=…      VOIPC_OAUTH_GOOGLE_SECRET=…
+```
+
+**Signing in.** Account tab → *Continue with Discord*. The app shows a three-digit code and opens the
+provider; back on the relay's page, the person taps that code. Only then is the provider asked who it is. The
+code is against somebody sending you their link. It is not perfect (they can send the code along), which is
+why getting this far opens nothing yet:
+
+**A provider says who you are. It cannot unlock your messages.** The relay sees all a provider says, so no key
+may come from it. So a device that signs in this way needs one of these before it gets in at all:
+
+- on a device already remembered, nothing: its device key signs in, and the provider is not asked;
+- the **recovery key**, shown once when the account is opened;
+- **another of your devices**, online: it asks you to compare a six-digit code, then hands over the key.
+  Approving signs that device out here, as any sign-in on another device does;
+- **your password**, on an account that has one.
+
+Someone who has only your provider account therefore joins no channel, reads nothing, and does not take your
+connection over. They can ask your other device for the key, at most three times and then once per ten minutes:
+say no, and change that provider's password.
+
+**The first time** (an account nobody opened) the device makes the vault and shows the recovery key. Where
+sign-up is open, a provider nobody here knows gets to choose a name first; elsewhere it is told that no account
+uses that sign-in. A server can claim an account was never opened, to hide its vault and the pins in it, so a
+device that remembers the account refuses, and the dialog asks you to stop if you have used it before.
+
+**Linking** an existing account: account panel → *Link*, with your password (and code). You can then sign in
+through the provider, and your password or recovery key still unlocks a new device. *Unlink* refuses the last way in.
+
+**Without a password**, what would ask for one asks for your two-factor code, or, without codes, for the
+provider again (*Confirm it's you* in the account panel, good for a few minutes). To add a password, use *Forgot
+your password?* with the recovery key.
+
+**Lost every device and the recovery key?** `voipc-server admin reclaim <name>` wipes the vault and identity so
+that the provider's sign-in opens the account anew. What it kept is gone, and everyone who knew it is warned.
+Accounts with a password are refused: this would lock them out.
+
+**A provider sign-in never replaces an identity**, not even with a two-factor code. Signing in with the password
+is what can.
+
 ## What the server learns
 
 From accounts:
 
 - account names
+- for a linked provider, the provider's id for you and the name it gives. Never your email, and no provider
+  token is kept
 - an Argon2id hash of a secret derived from each password
 - identity public keys
 - the public keys of remembered devices

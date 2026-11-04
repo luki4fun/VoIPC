@@ -28,7 +28,7 @@ use l4f_accounts::service::{
 use l4f_accounts::store::{PutBlob, PutLimited, Store, StoreConn};
 use l4f_accounts::{pow, scope, util, IpMode};
 use tokio::io::{AsyncRead, AsyncWrite};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::Semaphore;
 use tracing::{info, warn};
 use voipc_protocol::codec::{decode_client_msg, encode_server_msg};
 use voipc_protocol::conv::dm_parties;
@@ -41,6 +41,7 @@ use voipc_protocol::types::{
 };
 
 use crate::config::{AccountsConfig, AccountsMode, RegistrationMode};
+use crate::control::ControlTx;
 use crate::state::ServerState;
 
 /// The privileges this relay checks (1.7). Each is a scope a group (an l4f
@@ -157,6 +158,9 @@ const PENDING_SIGN_INS: usize = 32;
 /// Of those, at most this many from one address (IPv6: one /64), so one
 /// address cannot hold them all.
 const PENDING_PER_ADDRESS: usize = 4;
+/// Closes a connection that only asked something (`AccountStart::Providers`,
+/// `Provider`); its `AuthStep` was the answer.
+const ANSWERED: &str = "Answered.";
 /// What a sign-in hears when no permit is free.
 pub const BUSY: &str = "the server is busy signing people in — try again in a moment";
 /// How often every signed-in connection is checked against the database: a
@@ -185,6 +189,7 @@ mod admin;
 pub mod bans;
 pub mod gates;
 pub mod log;
+pub mod provider;
 
 /// What l4f calls back into.
 pub struct RelayHost {
@@ -234,6 +239,13 @@ pub struct Relay {
     /// Recovery-key resets per address (`ConnLimits` key): each fetches a
     /// vault's recovery slot, so they are few (5, then one per 3 minutes).
     resets: DashMap<IpAddr, crate::state::RateLimiter>,
+    /// Sign-ins out at a provider's page.
+    providers: provider::Flows,
+    /// Pairings in progress, and how often each account may ask for one.
+    pairs: DashMap<u64, provider::PairLink>,
+    pair_asks: DashMap<AccountId, crate::state::RateLimiter>,
+    /// One claim of a provider's account at a time (`provider::claim`).
+    claiming: tokio::sync::Mutex<()>,
 }
 
 /// A key slot as `voipc_crypto::account::Vault` writes it: version byte,
@@ -278,7 +290,16 @@ impl Relay {
         })
         .is_some();
         let master = master_key(&cfg.key_file, made_with_key)?;
-        Self::open_with(cfg, store, &master).await
+        let mut relay = Self::open_with(cfg, store, &master).await?;
+        if !cfg.public_url.is_empty() {
+            match provider::from_env()? {
+                Some(oauth) => relay = relay.with_providers(oauth),
+                None => warn!(
+                    "[accounts] public_url is set, but no VOIPC_OAUTH_<PROVIDER>_ID and _SECRET are"
+                ),
+            }
+        }
+        Ok(relay)
     }
 
     pub async fn open_with(cfg: &AccountsConfig, store: Store, master: &[u8]) -> Result<Relay> {
@@ -320,6 +341,10 @@ impl Relay {
             pow_key,
             ban_key,
             resets: DashMap::new(),
+            providers: provider::Flows::default(),
+            pairs: DashMap::new(),
+            pair_asks: DashMap::new(),
+            claiming: tokio::sync::Mutex::new(()),
         })
     }
 
@@ -636,7 +661,7 @@ fn l4f_config(cfg: &AccountsConfig, relay_id: [u8; 16]) -> Config {
     let signup = l4f_accounts::pow::Limits {
         min_form_seconds: 0,
         max_accounts_per_ip_day: 20,
-        max_accounts_per_hour: 60,
+        max_accounts_per_hour: cfg.signups_per_hour as usize,
         ..Default::default()
     };
     Config {
@@ -664,6 +689,7 @@ fn l4f_config(cfg: &AccountsConfig, relay_id: [u8; 16]) -> Config {
         totp_issuer: "VoIPC".into(),
         // Device keys sign for this origin; it names the relay, not its address.
         base_url: format!("voipc://{}", hex::encode(relay_id)),
+        oauth_base_url: cfg.public_url.clone(),
         cookie_secure: false,
         ip_mode: IpMode::Hash,
         ..Config::default()
@@ -776,6 +802,8 @@ pub struct SignedIn {
     pub account: AccountInfo,
     pub identity_key: Vec<u8>,
     pub prekey_bundle: PreKeyBundleData,
+    /// This connection's device opened the vault (`AccountSession::vault_proven`).
+    pub vault_proven: bool,
 }
 
 async fn send<S: AsyncWrite + Unpin>(stream: &mut S, msg: &ServerMessage) -> Result<(), String> {
@@ -889,6 +917,28 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
         }
         AccountStart::Reset => {
             return reset(state, relay, stream, buf, name, &ctx, ip, &mut answers).await
+        }
+        AccountStart::Providers => {
+            let kinds = relay.provider_kinds();
+            step(stream, AuthStep::Providers { kinds }).await?;
+            return Err(ANSWERED.into());
+        }
+        AccountStart::Provider { kind } => {
+            relay.provider_open(stream, kind, ip).await?;
+            return Err(ANSWERED.into());
+        }
+        AccountStart::ProviderResume { ticket } => {
+            return provider::resume(state, relay, stream, buf, &ticket, &ctx, ip, &mut answers)
+                .await;
+        }
+        AccountStart::ProviderStatus { ticket } => {
+            let answer = if provider::ready(relay, &ticket)? {
+                AuthStep::ProviderReady
+            } else {
+                AuthStep::ProviderPending
+            };
+            step(stream, answer).await?;
+            return Err(ANSWERED.into());
         }
         AccountStart::Register { invite } => {
             let invite = invite.filter(|c| !c.trim().is_empty());
@@ -1312,6 +1362,7 @@ async fn finish<S: AsyncRead + AsyncWrite + Unpin>(
         account,
         identity_key,
         prekey_bundle,
+        vault_proven: false,
     })
 }
 
@@ -1376,18 +1427,18 @@ async fn recovery_key_new(
     (recovery_slot, reset_key): (&[u8], &[u8]),
     (totp, recovery_code): (Option<String>, Option<String>),
 ) -> Result<(), String> {
-    let password = secret_text(secret)?;
     if recovery_slot.len() != SLOT_LEN || reset_key.len() != RESET_KEY_LEN {
         return Err("malformed recovery key".into());
     }
-    let (user, _) = confirm_again(
+    let secret = (!secret.is_empty()).then_some(secret);
+    let user = prove_recent(
         state,
         relay,
         session_id,
         ctx,
         user,
         info,
-        &password,
+        secret,
         (totp, recovery_code),
     )
     .await?;
@@ -1496,9 +1547,8 @@ async fn delete_account(
     secret: &[u8],
     second: (Option<String>, Option<String>),
 ) -> Result<(), String> {
-    let password = secret_text(secret)?;
-    let (user, _) =
-        confirm_again(state, relay, session_id, ctx, user, info, &password, second).await?;
+    let secret = (!secret.is_empty()).then_some(secret);
+    let user = prove_recent(state, relay, session_id, ctx, user, info, secret, second).await?;
     let scopes = state
         .sessions
         .get(&session_id)
@@ -1520,6 +1570,74 @@ async fn delete_account(
         })?;
     info!(user = %user.id.hex(), "account deleted by its owner");
     Ok(())
+}
+
+/// A recent sign-in for what a provider link, an unlink, or (without a password)
+/// a new recovery key or deleting the account takes: the password and the second
+/// factor where there is a password; without one the second factor; without
+/// that, a provider's proof already on this connection. The sign-in that got a
+/// connection in does not count, so neither a stolen device nor a provider account
+/// alone is enough. Returns the account as the database has it now.
+#[allow(clippy::too_many_arguments)]
+async fn prove_recent(
+    state: &ServerState,
+    relay: &Relay,
+    session_id: u32,
+    ctx: &Ctx,
+    user: &User,
+    info: &SessionInfo,
+    secret: Option<&[u8]>,
+    (totp, recovery_code): (Option<String>, Option<String>),
+) -> Result<User, String> {
+    let now_user = relay
+        .store()
+        .user_by_id(user.id)
+        .await
+        .map_err(|e| e.to_string())?
+        .ok_or("This account is gone.")?;
+    if now_user.has_password {
+        let secret = secret.ok_or("Enter your password.")?;
+        let password = secret_text(secret)?;
+        let (user, _) = confirm_again(
+            state,
+            relay,
+            session_id,
+            ctx,
+            &now_user,
+            info,
+            &password,
+            (totp, recovery_code),
+        )
+        .await?;
+        return Ok(user);
+    }
+    if l4f_accounts::service::has_second_factor(&now_user) {
+        let fresh = match (&totp, &recovery_code) {
+            (Some(code), _) => relay.accounts.step_up_totp(ctx, &now_user, info, code).await,
+            (None, Some(code)) => relay.accounts.step_up_recovery(ctx, &now_user, info, code).await,
+            (None, None) => {
+                return Err(
+                    "This account needs a code from the authenticator app, or a recovery code."
+                        .into(),
+                )
+            }
+        }
+        .map_err(|e| e.message().to_string())?;
+        if let Some(a) = state
+            .sessions
+            .get_mut(&session_id)
+            .as_mut()
+            .and_then(|s| s.account.as_mut())
+        {
+            a.token = fresh.token;
+            a.info = fresh.info;
+        }
+        return Ok(now_user);
+    }
+    if !relay.accounts.fresh(info, util::now()) {
+        return Err("Confirm it's you with a provider you have linked first.".into());
+    }
+    Ok(now_user)
 }
 
 /// Ends this relay's connection of an account whose sessions l4f just ended,
@@ -1552,7 +1670,7 @@ pub async fn handle_request(
     state: &Arc<ServerState>,
     session_id: u32,
     req: AccountRequest,
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) -> Result<()> {
     let reply = |r: AccountReply| ServerMessage::Account(r);
     let Some(relay) = state.accounts.clone() else {
@@ -1561,10 +1679,10 @@ pub async fn handle_request(
             &reply(refused("Account", "This relay has no accounts.")),
         );
     };
-    let Some((user, info, peer_ip)) = state.sessions.get(&session_id).and_then(|s| {
+    let Some((user, info, peer_ip, vault_proven)) = state.sessions.get(&session_id).and_then(|s| {
         s.account
             .as_ref()
-            .map(|a| (a.user.clone(), a.info.clone(), s.peer_ip))
+            .map(|a| (a.user.clone(), a.info.clone(), s.peer_ip, a.vault_proven))
     }) else {
         return crate::session::send_msg(
             tx,
@@ -1600,7 +1718,7 @@ pub async fn handle_request(
     let now = util::now();
     let out = match req {
         AccountRequest::DeviceChallenge => {
-            if !relay.accounts.fresh(&info, now) {
+            if !relay.accounts.fresh(&info, now) && !vault_proven {
                 refused(
                     "DeviceChallenge",
                     "Sign in with your password again to remember this device.",
@@ -1655,7 +1773,7 @@ pub async fn handle_request(
             }
         }
         AccountRequest::TotpEnable { sealed, code } => {
-            if !relay.accounts.fresh(&info, now) {
+            if !relay.accounts.fresh(&info, now) && !vault_proven {
                 refused(
                     "TotpEnable",
                     "Sign in with your password again to turn codes on.",
@@ -1695,6 +1813,90 @@ pub async fn handle_request(
         }
         AccountRequest::VaultPut { k, v, expect } => {
             relay.vault_put(user.id, &k, &v, expect).await?
+        }
+        AccountRequest::ProviderList => provider::list(&relay, &user).await?,
+        AccountRequest::ProviderStart {
+            kind,
+            link,
+            secret,
+            totp,
+            recovery_code,
+        } => {
+            // A proof with a provider is the provider's page itself
+            let proved = if link {
+                prove_recent(
+                    state,
+                    &relay,
+                    session_id,
+                    &ctx,
+                    &user,
+                    &info,
+                    secret.as_deref(),
+                    (totp, recovery_code),
+                )
+                .await
+                .map(|_| ())
+            } else {
+                Ok(())
+            };
+            match proved {
+                Ok(()) => {
+                    provider::start_for_account(&relay, session_id, &user, kind, link, peer_ip)
+                }
+                Err(reason) => refused("ProviderStart", &reason),
+            }
+        }
+        AccountRequest::ProviderUnlink {
+            kind,
+            secret,
+            totp,
+            recovery_code,
+        } => {
+            match prove_recent(
+                state,
+                &relay,
+                session_id,
+                &ctx,
+                &user,
+                &info,
+                secret.as_deref(),
+                (totp, recovery_code),
+            )
+            .await
+            {
+                Ok(now_user) => {
+                    // The session the proof just made, not the one this began with
+                    let info = state
+                        .sessions
+                        .get(&session_id)
+                        .and_then(|s| s.account.as_ref().map(|a| a.info.clone()))
+                        .unwrap_or(info);
+                    provider::unlink(&relay, &ctx, &now_user, &info, kind).await?
+                }
+                Err(reason) => refused("ProviderUnlink", &reason),
+            }
+        }
+        AccountRequest::PairNonce { pair, nonce } => {
+            if nonce.len() == voipc_crypto::pair::NONCE_LEN {
+                relay
+                    .pair_event(user.id, pair, provider::PairEvent::Nonce(nonce))
+                    .await;
+            }
+            return Ok(());
+        }
+        AccountRequest::PairApprove { pair, wrapped } => {
+            if wrapped.len() <= 256 {
+                relay
+                    .pair_event(user.id, pair, provider::PairEvent::Wrapped(wrapped))
+                    .await;
+            }
+            return Ok(());
+        }
+        AccountRequest::PairDecline { pair } => {
+            relay
+                .pair_event(user.id, pair, provider::PairEvent::Declined)
+                .await;
+            return Ok(());
         }
         AccountRequest::LogPurge { conv } => log::purge(&relay, user.id, conv.as_deref()).await?,
         AccountRequest::DeleteAccount {

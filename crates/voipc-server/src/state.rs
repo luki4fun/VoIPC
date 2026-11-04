@@ -15,6 +15,7 @@ use voipc_protocol::types::*;
 
 use crate::channels::{ChannelEntry, MAX_SLOW_MODE_SECS};
 use crate::config::ServerConfig;
+use crate::control::ControlTx;
 use crate::settings::ServerSettings;
 
 /// Simple token-bucket rate limiter.
@@ -68,7 +69,7 @@ pub struct UserSession {
     pub is_muted: bool,
     pub is_deafened: bool,
     /// Sender for pushing control messages to this user's writer task.
-    pub control_tx: mpsc::Sender<Vec<u8>>,
+    pub control_tx: ControlTx,
     /// Media packets (voice, video, screen audio) queued for this user's
     /// QUIC session. A full queue drops the packet, like UDP would.
     pub media_tx: mpsc::Sender<Bytes>,
@@ -212,6 +213,11 @@ pub struct AccountSession {
     pub standing: crate::accounts::Standing,
     /// When a code last passed an admin step-up (`AdminReply::StepUp`).
     pub step_up_at: Option<std::time::Instant>,
+    /// A provider's sign-in, and this connection's device then opened the vault
+    /// (or made it): as good as a recent password for remembering this device or
+    /// turning codes on, and for nothing else. A provider alone never sets this,
+    /// nor does a remembered device, so one stolen device stays what it was.
+    pub vault_proven: bool,
 }
 
 impl UserSession {
@@ -258,7 +264,7 @@ impl UserSession {
     pub fn new(
         user_id: UserId,
         username: String,
-        control_tx: mpsc::Sender<Vec<u8>>,
+        control_tx: ControlTx,
         media_tx: mpsc::Sender<Bytes>,
         peer_ip: IpAddr,
         max_users: u32,
@@ -2272,7 +2278,7 @@ pub(crate) mod test_support {
     ) -> (UserId, SessionId, mpsc::Receiver<Bytes>) {
         let user_id = state.next_user_id();
         let session_id = user_id;
-        let (tx, _rx) = mpsc::channel(1);
+        let tx = ControlTx::placeholder();
         let (media_tx, media_rx) = mpsc::channel(16);
         let session = UserSession::new(
             user_id,

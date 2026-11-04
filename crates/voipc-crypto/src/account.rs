@@ -636,6 +636,46 @@ pub fn reset_proof_ok(
     })
 }
 
+/// What a provider's sign-in signs with the identity key, which only a device
+/// that opened the vault has: a provider vouches for the person, never for the
+/// vault, and nothing else lets such a sign-in in.
+fn provider_message(relay_id: &[u8; 16], name: &str, challenge: &[u8]) -> Vec<u8> {
+    let mut m = format!(
+        "voipc-provider/v1|{}|{}|",
+        hex(relay_id),
+        name.trim().to_ascii_lowercase()
+    )
+    .into_bytes();
+    m.extend_from_slice(challenge);
+    m
+}
+
+pub fn provider_proof(
+    identity: &IdentityKeyPair,
+    relay_id: &[u8; 16],
+    name: &str,
+    challenge: &[u8],
+) -> Vec<u8> {
+    identity
+        .private_key()
+        .calculate_signature(&provider_message(relay_id, name, challenge), &mut crate::rng())
+        .expect("sign")
+        .to_vec()
+}
+
+pub fn provider_proof_ok(
+    identity_key: &[u8],
+    relay_id: &[u8; 16],
+    name: &str,
+    challenge: &[u8],
+    signature: &[u8],
+) -> bool {
+    libsignal_protocol::IdentityKey::decode(identity_key).is_ok_and(|k| {
+        k.public_key()
+            .verify_signature(&provider_message(relay_id, name, challenge), signature)
+    })
+}
+
 // ── Recovery key ──────────────────────────────────────────────────────────
 
 const B32: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -800,6 +840,45 @@ pub enum Method {
         recovery: Zeroizing<[u8; 32]>,
         password: Zeroizing<String>,
     },
+    /// Back from a provider's page, with the relay's ticket. The account comes
+    /// from the provider's answer, and the person says what opens the vault
+    /// (`Step::ProviderChoice`).
+    Provider { ticket: Vec<u8> },
+}
+
+/// Whether `url` is a provider's own sign-in page. The relay names the page, and
+/// a hostile one would sooner name a copy of it that asks for the password:
+/// nothing else is opened.
+pub fn provider_page_ok(url: &str) -> bool {
+    const PAGES: [&str; 3] = [
+        "https://discord.com/oauth2/authorize?",
+        "https://accounts.google.com/o/oauth2/v2/auth?",
+        "https://www.facebook.com/",
+    ];
+    PAGES.iter().any(|p| url.starts_with(p))
+        && url.len() <= 2048
+        && url.bytes().all(|b| b.is_ascii_graphic())
+}
+
+/// What `Authenticate` asks for a provider's sign-in, before there is a
+/// sign-in: which ones there are (`AccountStart::Providers`), or the page to
+/// open (`AccountStart::Provider`). The relay answers, then ends the connection.
+pub fn provider_ask(start: AccountStart, protocol_version: u32, app_version: &str) -> ClientMessage {
+    ClientMessage::Authenticate {
+        username: String::new(),
+        protocol_version,
+        app_version: app_version.to_string(),
+        identity_key: None,
+        prekey_bundle: None,
+        account: Some(start),
+    }
+}
+
+/// `AuthStep::ProviderSigned`, until the person has chosen.
+struct ProviderSigned {
+    claim: bool,
+    challenge: Vec<u8>,
+    blobs: Vec<VaultBlob>,
 }
 
 /// What waits for the stretched password (`Step::Stretch`).
@@ -829,6 +908,27 @@ pub enum Step {
     /// The reset went through: sign in with the new password (the relay ends
     /// this connection).
     ResetDone,
+    /// Nothing has happened in the browser yet: try the ticket again later (the
+    /// relay ends this connection).
+    ProviderPending,
+    /// The provider knows this person and nobody here does: ask for a name
+    /// (`problem` says what was wrong with the last), then `provider_signup`.
+    ProviderSignup {
+        suggestion: String,
+        problem: String,
+    },
+    /// A provider's sign-in holds. Ask the person what opens the account:
+    /// with `claim`, `provider_claim`; otherwise `provider_recovery`,
+    /// `pair_start`, or with `has_password` a new sign-in with the password.
+    ProviderChoice {
+        name: String,
+        claim: bool,
+        has_password: bool,
+    },
+    /// Show this and ask the person to compare it on their other device.
+    PairCode { code: String },
+    /// The other device did not hand the key over: ask again.
+    PairRefused { reason: String },
     /// Nothing to do with that message.
     Ignore,
 }
@@ -867,6 +967,12 @@ pub struct SignIn {
     pending: Option<Pending>,
     /// A reset waiting for the person's code (`totp`, `recovery_code`).
     reset: Option<AuthContinue>,
+    provider: Option<ProviderSigned>,
+    /// The proof of work a provider's sign-up waits to solve.
+    signup_pow: Option<PowChallenge>,
+    pair: Option<crate::pair::PairRequest>,
+    /// Accounts this device remembers on this relay (`remembered_here`).
+    remembered: Vec<String>,
 }
 
 impl SignIn {
@@ -887,6 +993,9 @@ impl SignIn {
                 device_id: key.device_id.to_vec(),
             },
             Method::Reset { .. } => AccountStart::Reset,
+            Method::Provider { ticket } => AccountStart::ProviderResume {
+                ticket: ticket.clone(),
+            },
         };
         let relay_id = match &method {
             Method::Device { relay_id, .. } => Some(*relay_id),
@@ -915,6 +1024,10 @@ impl SignIn {
             stretch_outside: false,
             pending: None,
             reset: None,
+            provider: None,
+            signup_pow: None,
+            pair: None,
+            remembered: Vec::new(),
         };
         (m, auth)
     }
@@ -933,6 +1046,13 @@ impl SignIn {
     pub fn expect_relay(&mut self, here: Option<[u8; 16]>, elsewhere: Vec<([u8; 16], String)>) {
         self.relay_here = here;
         self.relay_elsewhere = elsewhere;
+    }
+
+    /// The accounts this device remembers on this relay. A relay saying that one
+    /// of them was never opened is hiding its vault, and with it the pins that
+    /// would catch it swapping somebody's key: not believed.
+    pub fn remembered_here(&mut self, names: Vec<String>) {
+        self.remembered = names;
     }
 
     fn relay_ok(&self, relay_id: &[u8; 16]) -> Result<(), String> {
@@ -1106,8 +1226,101 @@ impl SignIn {
             Method::Password { password }
             | Method::Register { password, .. }
             | Method::Reset { password, .. } => Some(password),
-            Method::Device { .. } => None,
+            Method::Device { .. } | Method::Provider { .. } => None,
         }
+    }
+
+    /// The name the person chose, for `Step::ProviderSignup`. Solves the proof
+    /// of work: seconds of CPU, so off the async workers.
+    pub fn provider_signup(&mut self, name: &str) -> Result<ClientMessage, String> {
+        let pow = self.signup_pow.as_ref().ok_or("unexpected sign-in step")?;
+        let altcha =
+            solve_pow(&pow.altcha).ok_or("The server's sign-up puzzle did not solve.")?;
+        Ok(ClientMessage::AuthContinue(AuthContinue::ProviderSignup {
+            name: normalize_name(name)?,
+            altcha,
+            ts: pow.ts.clone(),
+        }))
+    }
+
+    /// "First time here": this account's vault, under a new recovery key.
+    pub fn provider_claim(&mut self) -> Result<Vec<Step>, String> {
+        let relay_id = self.relay_id.ok_or("unexpected sign-in step")?;
+        if !self.provider.as_ref().is_some_and(|p| p.claim) {
+            return Err("unexpected sign-in step".into());
+        }
+        let vault = Vault::create(relay_id, &self.name);
+        let recovery = random::<32>();
+        let identity = IdentityKeyPair::generate(&mut crate::rng());
+        let blobs = vec![
+            vault.recovery_slot(&recovery),
+            VaultBlob {
+                k: SLOT_RESET.into(),
+                v: reset_key(&recovery, &relay_id, &self.name).to_vec(),
+                version: 0,
+            },
+            vault.seal_item(ITEM_IDENTITY, 1, &identity.serialize()),
+        ];
+        self.recovery = Some(recovery_text(&recovery));
+        self.vault = Some(vault);
+        let identity_key = identity.public_key().serialize().to_vec();
+        self.identity = Some(identity);
+        self.blobs = blobs.clone();
+        Ok(vec![
+            Step::Send(ClientMessage::AuthContinue(AuthContinue::Claim {
+                identity_key,
+                vault: blobs,
+            })),
+            Step::Keys,
+        ])
+    }
+
+    /// The vault is open: its identity signs the relay's challenge.
+    fn provider_opened(&mut self, vault: Vault) -> Result<Vec<Step>, String> {
+        let relay_id = self.relay_id.ok_or("unexpected sign-in step")?;
+        let signed = self.provider.as_ref().ok_or("unexpected sign-in step")?;
+        let identity = vault
+            .open_item(&signed.blobs, ITEM_IDENTITY)
+            .map_err(|e| e.to_string())?
+            .payload;
+        let identity = IdentityKeyPair::try_from(&identity[..])
+            .map_err(|_| "The vault's identity key is damaged.".to_string())?;
+        let signature = provider_proof(&identity, &relay_id, &self.name, &signed.challenge);
+        self.blobs = signed.blobs.clone();
+        self.vault = Some(vault);
+        self.identity = Some(identity);
+        Ok(vec![
+            Step::Send(ClientMessage::AuthContinue(AuthContinue::ProviderProof {
+                signature,
+            })),
+            Step::Keys,
+        ])
+    }
+
+    pub fn provider_recovery(&mut self, recovery: &[u8; 32]) -> Result<Vec<Step>, String> {
+        let relay_id = self.relay_id.ok_or("unexpected sign-in step")?;
+        let signed = self.provider.as_ref().ok_or("unexpected sign-in step")?;
+        let vault = Vault::open_with_recovery(relay_id, &self.name, &signed.blobs, recovery)
+            .map_err(|e| match e {
+                VaultError::WrongKey => {
+                    "That recovery key does not open this account.".to_string()
+                }
+                e => e.to_string(),
+            })?;
+        self.provider_opened(vault)
+    }
+
+    /// Ask another device of this account for the vault's key.
+    pub fn pair_start(&mut self) -> Result<ClientMessage, String> {
+        if !self.provider.as_ref().is_some_and(|p| !p.claim) {
+            return Err("unexpected sign-in step".into());
+        }
+        let request = crate::pair::PairRequest::new();
+        let commitment = request.commitment().to_vec();
+        self.pair = Some(request);
+        Ok(ClientMessage::AuthContinue(AuthContinue::PairStart {
+            commitment,
+        }))
     }
 
     /// Stretches here, or asks the host to (`stretch_outside`).
@@ -1213,7 +1426,7 @@ impl SignIn {
                             .map_err(|e| e.to_string())?
                     }
                     Method::Device { dek, .. } => Vault::from_dek(relay_id, &self.name, *dek),
-                    Method::Register { .. } | Method::Reset { .. } => {
+                    Method::Register { .. } | Method::Reset { .. } | Method::Provider { .. } => {
                         return Err("unexpected sign-in step".into())
                     }
                 };
@@ -1228,6 +1441,87 @@ impl SignIn {
                 self.vault = Some(vault);
                 self.blobs = blobs.clone();
                 Ok(vec![Step::Keys])
+            }
+            ServerMessage::AuthStep(AuthStep::ProviderPending)
+                if matches!(self.method, Method::Provider { .. }) =>
+            {
+                Ok(vec![Step::ProviderPending])
+            }
+            ServerMessage::AuthStep(AuthStep::ProviderSignup {
+                relay_id,
+                suggestion,
+                problem,
+                pow,
+            }) => {
+                if !matches!(self.method, Method::Provider { .. }) {
+                    return Err("unexpected sign-in step".into());
+                }
+                self.relay_ok(relay_id)?;
+                self.relay_id = Some(*relay_id);
+                self.signup_pow = Some(pow.clone());
+                Ok(vec![Step::ProviderSignup {
+                    suggestion: suggestion.clone(),
+                    problem: problem.clone(),
+                }])
+            }
+            ServerMessage::AuthStep(AuthStep::ProviderSigned {
+                relay_id,
+                name,
+                claim,
+                has_password,
+                challenge,
+                blobs,
+            }) => {
+                if !matches!(self.method, Method::Provider { .. }) || self.provider.is_some() {
+                    return Err("unexpected sign-in step".into());
+                }
+                self.relay_ok(relay_id)?;
+                let name = normalize_name(name)?;
+                if *claim && self.remembered.contains(&name) {
+                    return Err(format!(
+                        "This server says the account {name} was never used, and this device \
+                         remembers it. It may be hiding your vault: not going on."
+                    ));
+                }
+                self.relay_id = Some(*relay_id);
+                self.name = name.clone();
+                self.provider = Some(ProviderSigned {
+                    claim: *claim,
+                    challenge: challenge.clone(),
+                    blobs: blobs.clone(),
+                });
+                Ok(vec![Step::ProviderChoice {
+                    name,
+                    claim: *claim,
+                    has_password: *has_password,
+                }])
+            }
+            ServerMessage::AuthStep(AuthStep::PairNonce { nonce }) => {
+                let pair = self.pair.as_ref().ok_or("unexpected sign-in step")?;
+                let (ephemeral, blind) = pair.reveal();
+                Ok(vec![
+                    Step::Send(ClientMessage::AuthContinue(AuthContinue::PairReveal {
+                        ephemeral,
+                        blind,
+                    })),
+                    Step::PairCode {
+                        code: pair.code(nonce),
+                    },
+                ])
+            }
+            ServerMessage::AuthStep(AuthStep::PairWrapped { wrapped }) => {
+                let relay_id = self.relay_id.ok_or("unexpected sign-in step")?;
+                let pair = self.pair.take().ok_or("unexpected sign-in step")?;
+                let dek = pair
+                    .open(wrapped, &relay_id, &self.name)
+                    .ok_or("The other device's answer does not open.")?;
+                self.provider_opened(Vault::from_dek(relay_id, &self.name, dek))
+            }
+            ServerMessage::AuthStep(AuthStep::PairRefused { reason }) => {
+                self.pair = None;
+                Ok(vec![Step::PairRefused {
+                    reason: reason.clone(),
+                }])
             }
             _ => Ok(vec![Step::Ignore]),
         }
@@ -1285,6 +1579,54 @@ mod tests {
     use super::*;
 
     const RELAY: [u8; 16] = [0x11; 16];
+
+    #[test]
+    fn only_a_providers_own_page_is_opened() {
+        for good in [
+            "https://discord.com/oauth2/authorize?response_type=code&state=a",
+            "https://accounts.google.com/o/oauth2/v2/auth?client_id=x",
+            "https://www.facebook.com/v21.0/dialog/oauth?client_id=x",
+        ] {
+            assert!(provider_page_ok(good), "{good}");
+        }
+        for bad in [
+            "https://discord.com.evil.example/oauth2/authorize?x",
+            "https://evil.example/https://discord.com/oauth2/authorize?x",
+            "http://discord.com/oauth2/authorize?x",
+            "https://discord.com/login?next=x",
+            "https://www.facebook.com.evil.example/",
+            "file:///etc/passwd",
+            "https://discord.com/oauth2/authorize?a b",
+            "",
+        ] {
+            assert!(!provider_page_ok(bad), "{bad}");
+        }
+    }
+
+    /// A relay saying an account this device remembers was never opened is hiding
+    /// its vault, and with it the pins that would catch a swapped key.
+    #[test]
+    fn a_remembered_account_is_not_believed_unopened() {
+        let signed = |name: &str| {
+            ServerMessage::AuthStep(AuthStep::ProviderSigned {
+                relay_id: RELAY,
+                name: name.into(),
+                claim: true,
+                has_password: false,
+                challenge: vec![0; 32],
+                blobs: Vec::new(),
+            })
+        };
+        let machine = || {
+            let (mut m, _) = SignIn::start("", Method::Provider { ticket: vec![] }, 17, "test");
+            m.remembered_here(vec!["luki".into()]);
+            m
+        };
+        let err = machine().on_message(&signed("luki")).err().unwrap();
+        assert!(err.contains("hiding your vault"), "{err}");
+        let steps = machine().on_message(&signed("lukas")).unwrap();
+        assert!(matches!(steps[0], Step::ProviderChoice { claim: true, .. }));
+    }
 
     #[test]
     fn names_follow_the_relays_rules() {

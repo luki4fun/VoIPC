@@ -109,6 +109,7 @@ pub fn run() {
 
     let builder = tauri::Builder::default()
         .plugin(tauri_plugin_notification::init())
+        .plugin(tauri_plugin_opener::init())
         // A file dropped where the page does not take it would have the
         // WebView open it in place of the app, mid-call: since 1.3 drops go
         // to the page (`dragDropEnabled: false`). Nothing of ours is a file
@@ -352,6 +353,12 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             commands::connect,
             account::account_totp,
+            account::account_open_page,
+            account::account_provider_ask,
+            account::account_provider_answer,
+            account::account_pair_answer,
+            account::account_provider_start,
+            account::account_provider_unlink,
             account::account_password_change,
             account::account_recovery_key_new,
             account::account_leave,

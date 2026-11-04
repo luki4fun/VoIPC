@@ -21,7 +21,7 @@
   import { isWeb } from "../stores/platform.js";
   import { pendingInvite, serverAddress } from "../stores/connection.js";
   import { parseInviteLink } from "../invite.js";
-  import { DOWNLOAD_PAGE, RESET_DONE, connectTo, serverId, showConnectDialog, signInAgain, updateNeeded, type AccountSignIn } from "../connect.js";
+  import { DOWNLOAD_PAGE, RESET_DONE, USE_PASSWORD, connectTo, serverId, showConnectDialog, signInAgain, updateNeeded, type AccountSignIn } from "../connect.js";
   import { randomTag, splitName, withTag } from "../username.js";
   import { availableUpdate, checkForUpdate, checkUpdates, installUpdate, updateBusy, updatesSupported } from "../stores/updates.js";
   import { updateFits } from "../update-rules.js";
@@ -94,6 +94,89 @@
     invoke<{ server: string; name: string }[]>("account_devices")
       .then((list) => (remembered = list.some((d) => d.server === server && d.name === want)))
       .catch(() => (remembered = false));
+  });
+
+  // ── Sign-in with a provider ──
+  /** What this server offers. Only where it has a public certificate: the
+   *  provider sends the browser back there, so a pin would not do. */
+  let providers = $state<string[]>([]);
+  /** Out at the provider's page: the code to tap there, and the ticket to come
+   *  back with. */
+  let providerWait = $state<{ provider: string; url: string; code: string; ticket: number[]; server: { host: string; port: number } } | null>(null);
+
+  $effect(() => {
+    const [h, p, m] = [host, port, mode];
+    providers = [];
+    if (m !== "account" || !h.trim() || !p) return;
+    const t = setTimeout(() => {
+      invoke<{ providers: string[] }>("account_provider_ask", { address: serverId(h, p), ask: { kind: "providers" } })
+        .then((r) => (providers = r.providers))
+        .catch(() => {});
+    }, 500);
+    return () => clearTimeout(t);
+  });
+
+  async function startProvider(provider: string) {
+    error = "";
+    try {
+      const r = await invoke<{ url: string; code: string; ticket: number[] }>("account_provider_ask", {
+        address: serverId(host, port),
+        ask: { kind: "open", provider },
+      });
+      providerWait = { provider, ...r, server: { host, port } };
+    } catch (e) {
+      error = String(e);
+    }
+  }
+
+  /** Whether the browser is through; then the sign-in goes on. */
+  async function checkProvider() {
+    const wait = providerWait;
+    if (!wait || connecting) return;
+    let ready = false;
+    try {
+      const r = await invoke<{ ready: boolean }>("account_provider_ask", {
+        address: serverId(wait.server.host, wait.server.port),
+        ask: { kind: "status", ticket: wait.ticket },
+      });
+      ready = r.ready;
+    } catch (e) {
+      providerWait = null;
+      error = String(e);
+      return;
+    }
+    if (!ready || providerWait !== wait) return;
+    providerWait = null;
+    connecting = true;
+    const result = await connectTo({
+      ...wait.server,
+      username: "",
+      acceptSelfSigned: selfSigned,
+      remember,
+      account: { mode: "provider", ticket: wait.ticket },
+    });
+    connecting = false;
+    if (result.ok) {
+      showConnectDialog.set(false);
+    } else if (result.error.includes(USE_PASSWORD)) {
+      name = result.error.slice(result.error.indexOf(USE_PASSWORD) + USE_PASSWORD.length).trim();
+      accountAction = "signin";
+      error = "Enter your password to unlock this account.";
+    } else {
+      error = result.error;
+    }
+  }
+
+  // Coming back from the browser, or side by side with it
+  $effect(() => {
+    if (!providerWait) return;
+    const check = () => void checkProvider();
+    const timer = setInterval(check, 3000);
+    window.addEventListener("focus", check);
+    return () => {
+      clearInterval(timer);
+      window.removeEventListener("focus", check);
+    };
   });
 
   /** What the connect signs in with, or a reason it cannot yet. */
@@ -442,6 +525,21 @@
         <button type="button" class:active={accountAction === "signin"} onclick={() => (accountAction = "signin")} disabled={connecting}>Sign in</button>
         <button type="button" class:active={accountAction === "create"} onclick={() => (accountAction = "create")} disabled={connecting}>Create account</button>
       </div>
+      {#if providerWait}
+        <div class="provider-wait">
+          <p class="account-note">Your code is</p>
+          <code class="provider-code">{providerWait.code}</code>
+          <p class="account-note">Open {providerWait.provider} and sign in there. When it comes back, tap this code on the page, then return here.</p>
+          <button type="button" class="connect-provider" onclick={() => providerWait && invoke("account_open_page", { url: providerWait.url }).catch((e) => (error = String(e)))}>Open {providerWait.provider}</button>
+          <button type="button" class="link-btn" onclick={() => (providerWait = null)}>Cancel</button>
+        </div>
+      {:else if providers.length && accountAction === "signin"}
+        <div class="providers">
+          {#each providers as provider (provider)}
+            <button type="button" class="connect-provider" onclick={() => startProvider(provider)} disabled={connecting}>Continue with {provider}</button>
+          {/each}
+        </div>
+      {/if}
       <div class="field">
         <label for="account-name">Account name</label>
         <input
@@ -661,6 +759,30 @@
     font-size: var(--fs-sm);
   }
 
+  .providers,
+  .provider-wait {
+    display: flex;
+    flex-direction: column;
+    align-items: stretch;
+    gap: 8px;
+    margin-bottom: 12px;
+  }
+  .provider-code {
+    font-size: 2rem;
+    letter-spacing: 0.2em;
+    text-align: center;
+  }
+  .connect-provider {
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border-color);
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    cursor: pointer;
+  }
+  .connect-provider:hover:not(:disabled) {
+    background: var(--bg-hover);
+  }
   .account-note {
     font-size: var(--fs-sm);
     color: var(--text-secondary);

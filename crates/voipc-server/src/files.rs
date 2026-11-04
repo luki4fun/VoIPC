@@ -60,7 +60,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::{debug, info, warn};
 use voipc_protocol::conv::{hex, unhex};
 use voipc_protocol::messages::{
@@ -70,6 +70,7 @@ use voipc_protocol::messages::{
 use voipc_protocol::types::{ChannelId, FileConv, FileLimits, SessionId, UserId};
 
 use crate::config::FilesConfig;
+use crate::control::ControlTx;
 use crate::session::send_msg;
 use crate::state::{ServerState, UserSession};
 
@@ -1926,7 +1927,7 @@ fn conv_for(state: &ServerState, other: &Party) -> Option<FileConv> {
 
 /// `FileWanted` to `place`'s members online, except the one asking.
 async fn want(state: &ServerState, place: &Place, hash: [u8; 32], except: SessionId) {
-    let mut sends: Vec<(mpsc::Sender<Vec<u8>>, FileConv)> = Vec::new();
+    let mut sends: Vec<(ControlTx, FileConv)> = Vec::new();
     let mut add = |sid: SessionId, conv: FileConv| {
         if sid != except {
             if let Some(tx) = state.sessions.get(&sid).map(|s| s.control_tx.clone()) {
@@ -1967,7 +1968,7 @@ async fn want(state: &ServerState, place: &Place, hash: [u8; 32], except: Sessio
 
 // ── Control messages ──────────────────────────────────────────────────────
 
-async fn refuse_now(tx: &mpsc::Sender<Vec<u8>>, hash: [u8; 32], (code, reason): Why) {
+async fn refuse_now(tx: &ControlTx, hash: [u8; 32], (code, reason): Why) {
     let _ = send_msg(
         tx,
         &ServerMessage::FileRefused {
@@ -1985,7 +1986,7 @@ pub(crate) async fn handle_upload(
     conv: FileConv,
     size: u64,
     hash: [u8; 32],
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) {
     let Some(store) = state.files.clone() else {
         return refuse_now(tx, hash, NO_FILES).await;
@@ -2005,7 +2006,7 @@ pub(crate) async fn handle_fetch(
     session_id: SessionId,
     conv: FileConv,
     hash: [u8; 32],
-    tx: &mpsc::Sender<Vec<u8>>,
+    tx: &ControlTx,
 ) {
     let Some(store) = state.files.clone() else {
         return refuse_now(tx, hash, NO_FILES).await;
