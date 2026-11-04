@@ -59,7 +59,7 @@ out of servers that have not upgraded yet.
 - Any change with the same `PROTOCOL_VERSION` fails it.
 - `compat.rs`'s tests fail when a message's layout at an older protocol differs from today's
   and `RESHAPED` does not name it, and when an old shape there differs from its golden file.
-- The nightly `old-relays` job runs the released 1.0, 1.3, 1.4, 1.6 and 1.7 relays and speaks to each
+- The nightly `old-relays` job runs the released 1.0, 1.3, 1.4, 1.6, 1.7 and 1.8 relays and speaks to each
   in its own protocol (`voice_load`).
 
 ## 2. Game SDK (`docs/SDK.md`)

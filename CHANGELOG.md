@@ -2,10 +2,10 @@
 
 All notable changes to VoIPC are documented here.
 
-## [Unreleased]
+## [1.9.0] - release candidate
 
-Protocol 18. The app still talks to relays back to 1.0 (protocol 12), and on an older relay holds back what its
-other apps could not read.
+Protocol 18. A 1.9 app still talks to relays back to 1.0 (protocol 12), and on an older relay holds back what its
+other apps could not read. Needs l4f-accounts v0.13.0.
 
 ### Added
 - **Channels made in the app** that stay until someone deletes them, with **categories** and an order, by anyone
