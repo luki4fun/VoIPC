@@ -1932,4 +1932,26 @@ mod tests {
         let again = DeviceKey::from_parts(key.device_id, key.pkcs8().to_vec()).unwrap();
         assert_eq!(again.public_key(), key.public_key());
     }
+
+    /// A relay before 1.9 has no invited resume, and refuses the message outright:
+    /// there the invite stays behind, and the sign-in goes on without one.
+    #[test]
+    fn an_invite_goes_along_only_to_a_relay_that_knows_it() {
+        let start = |proto| {
+            let method = Method::Provider {
+                ticket: vec![1],
+                invite: Some("code".into()),
+            };
+            let (_, first) = SignIn::start("", method, proto, "test");
+            match first {
+                ClientMessage::Authenticate { account, .. } => account.unwrap(),
+                other => panic!("{other:?}"),
+            }
+        };
+        assert!(matches!(
+            start(18),
+            AccountStart::ProviderResumeInvited { invite, .. } if invite == "code"
+        ));
+        assert!(matches!(start(17), AccountStart::ProviderResume { .. }));
+    }
 }

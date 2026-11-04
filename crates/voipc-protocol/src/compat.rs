@@ -98,6 +98,12 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
     (15, Side::Server, 18, "ChannelUsers without badges"),
     (15, Side::Server, 46, "AccountReply::Admin never comes"),
     (
+        17,
+        Side::Client,
+        0,
+        "Authenticate: a resume with an invite is refused",
+    ),
+    (
         12,
         Side::Client,
         0,
@@ -870,6 +876,20 @@ mod tests {
                     account: Some(AccountStart::Providers),
                 },
                 16,
+            ),
+            (
+                ClientMessage::Authenticate {
+                    username: String::new(),
+                    protocol_version: 17,
+                    app_version: String::new(),
+                    identity_key: None,
+                    prekey_bundle: None,
+                    account: Some(AccountStart::ProviderResumeInvited {
+                        ticket: vec![],
+                        invite: String::new(),
+                    }),
+                },
+                17,
             ),
             (
                 ClientMessage::AuthContinue(AuthContinue::ProviderProof { signature: vec![] }),
