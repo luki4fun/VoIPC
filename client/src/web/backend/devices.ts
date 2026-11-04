@@ -8,6 +8,7 @@
 // relay serves this page, so a relay that wants them can take them; the
 // README says so.
 
+import { browserMarksKey } from "../../lib/dm-rules";
 import { toHex } from "../../lib/hex";
 
 export interface DeviceRecord {
@@ -115,6 +116,7 @@ export async function forgetDevice(server: string, name: string): Promise<void> 
   if (known) {
     try {
       localStorage.removeItem(cursorStorageKey(known.relay_id, name));
+      localStorage.removeItem(browserMarksKey(server, name));
     } catch {
       // Storage off: nothing was kept either.
     }

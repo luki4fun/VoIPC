@@ -107,6 +107,29 @@ export function requestAllRosters(server: string): void {
  * two are reconciled. `trustRosterCount` is what keeps a refused answer (also
  * an empty list) from zeroing a channel we are simply not allowed to see into.
  */
+/**
+ * The relay says nobody has `id` any more: off the lists now, not when a
+ * departure or the next roster gets here, which for a channel we cannot ask
+ * about is never. They say where writing to somebody goes (`liveIdOf`).
+ */
+export function forgetUser(server: string, id: number): void {
+  channelRosters.of(server).update((m) => {
+    const next = new Map<number, UserInfo[]>();
+    for (const [channelId, list] of m) next.set(channelId, list.filter((u) => u.user_id !== id));
+    return next;
+  });
+  users.of(server).update((list) => list.filter((u) => u.user_id !== id));
+}
+
+/** `id`'s account, on the roster of any channel. */
+export function rosterAccount(server: string, id: number): UserInfo["account"] {
+  for (const list of get(channelRosters.peek(server)).values()) {
+    const u = list.find((x) => x.user_id === id);
+    if (u?.account) return u.account;
+  }
+  return undefined;
+}
+
 export function setRoster(server: string, channelId: number, list: UserInfo[]): void {
   channelRosters.of(server).update((m) => new Map(m).set(channelId, list));
   const channel = get(channels.peek(server)).find((c) => c.channel_id === channelId);

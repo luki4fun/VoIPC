@@ -120,6 +120,9 @@
       {#if user.is_admin}
         <span class="shield" title="Server admin"><Icon name="shield" size={12} /></span>
       {/if}
+      {#each user.badges ?? [] as badge (badge)}
+        <span class="badge" title="A group badge on this server">{badge}</span>
+      {/each}
       {#if user.shares_history}
         <span class="sharing-history" title="Shares recent chat with newcomers"><Icon name="history" size={12} /></span>
       {/if}
@@ -258,6 +261,22 @@
     color: var(--accent);
     display: inline-flex;
     vertical-align: middle;
+  }
+
+  /* A group's badge (1.7): text the server's admins chose */
+  .badge {
+    display: inline-block;
+    max-width: 10ch;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    vertical-align: middle;
+    padding: 0 5px;
+    border-radius: var(--r-pill);
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: var(--fs-micro);
+    font-weight: 500;
+    line-height: 1.5;
   }
 
   /* Quieter than the shield: it says what someone offers, not what they are */

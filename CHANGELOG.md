@@ -2,6 +2,66 @@
 
 All notable changes to VoIPC are documented here.
 
+## [1.7.0] - release candidate
+
+Protocol 16. A 1.7 app still talks to relays back to 1.0 (protocol 12); there the admin
+panel shows bans and emotes only, and no badges. Needs l4f-accounts v0.11.0.
+
+### Added
+- **Users, groups and privileges in the app** (server menu → *Server admin*), on relays with
+  accounts ([docs/ACCOUNTS.md](docs/ACCOUNTS.md)):
+  - *Users*: search the accounts, see one's groups and history (what was done to its access,
+    by whom, never an address), give and take groups, reset two-factor codes, ban, and make
+    or revoke sign-up invites;
+  - *Groups*: make, change and delete groups, with a badge and the privileges they hand out,
+    and see who is in each.
+- **Fine privileges** instead of one moderator role: kick, ban, the ban list, channels, emotes,
+  see accounts, manage accounts, manage groups, and everything (admin). The moderator group
+  keeps kick, ban and channels; one made before 1.7 is moved over at the first start. Nobody
+  hands out more than they hold, and only an admin kicks or bans someone with a privilege.
+- **A fresh two-factor code** for steps that hand out power: giving or taking a group with
+  privileges, editing or deleting a group, resetting someone's codes. It holds ten minutes.
+- **Channel gates**: a channel's settings name the groups that may see and join it, and those
+  that may speak there. Outside the first the channel is not there at all; outside the second
+  you listen and read, the relay drops what you say, post or share, and the app says
+  *Listening only*. Losing the group moves you out, and out of its kept messages. A gate on a
+  channel from `channels.json` is kept in the accounts database.
+- **Group badges** next to names in the member list, where the account mark shows.
+
+### Changed
+- The server menu's shield item reads *Server admin*, and opens the tabs your privileges
+  allow.
+- Taking away a group without privileges no longer signs the account out (l4f-accounts
+  v0.11.0); a group with privileges still does.
+- Turning a channel's anonymity off, which shows everyone's real name there, is an admin's or
+  the channel creator's: holders of *Channels* (moderators) no longer can.
+
+### Fixed
+- **Reloading the browser kept nothing.** With an account and copies on the server, a reload lost
+  the conversation: the browser remembered how far it had read but keeps no messages, so it never
+  read them back. It reads the newest 500 of each conversation back now, without counting them as
+  new, and what you cleared or closed stays that way. A remembered account signs back in by itself
+  on a reload (not into voice). Messages with no server copy still go: a guest's, or those of
+  somebody with copies off.
+- **Direct messages to somebody who had just reconnected went nowhere.** A conversation kept the
+  id they had before, so you read "left the server" while they were online, until they wrote first.
+  It follows them now. A message kept on the server reaches somebody online at once, instead of at
+  their next sign-in, so one that missed them live still arrives.
+- **Direct messages that never left.** Writing to somebody in another room with no secure session
+  yet queued the message and never asked for one; it waited for good, shown as sent. Now it asks, a
+  session they open sends what waited, and the conversation says so when none comes up.
+- **Copies silently not kept** for somebody only known from another channel's member list.
+- **The same message twice**, its live copy and its stored one, when its writer stood in another room
+  or had reconnected. The copy its writer signed wins.
+- **Clear and Search were missing** in a direct message opened while in no voice channel.
+- **A sign-in with many conversations** could stop reading them for the session, and said "not kept".
+  It reads one at a time now and goes on when the relay asks it to wait; reading has its own budget
+  on the relay, so it no longer refuses what you write meanwhile.
+
+### Security
+- A direct message written from an anonymous channel keeps no server copy: the copy carries your
+  account and the live message your pseudonym, so its reader could tie the two.
+
 ## [1.6.0] - 2026-11-03
 
 No protocol change: a 1.5 app and relay connect as before. New: this app also talks to relays

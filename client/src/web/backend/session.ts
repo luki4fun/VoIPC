@@ -709,6 +709,13 @@ export class Session implements SessionContext, AccountHost {
         this.emit("user-joined", b.user);
         break;
       }
+      case "UserUpdated":
+        this.account?.noteRoster(this, [b.user]);
+        this.emit("user-updated", b.user);
+        break;
+      case "ListenOnly":
+        this.emit("listen-only", { channel_id: b.channel_id, on: b.on });
+        break;
       case "UserLeft": {
         const uid: number = b.user_id;
         // Leaving a text channel is not leaving the server: the person is
@@ -799,6 +806,9 @@ export class Session implements SessionContext, AccountHost {
         this.emit("kicked", { channel_id: b.channel_id, reason: b.reason });
         break;
       case "ChannelUsers":
+        // Who is which account, also of people in rooms we are not in: a
+        // direct message to them is kept only if we know.
+        this.account?.noteRoster(this, b.users);
         this.emit("channel-users", { channel_id: b.channel_id, users: b.users });
         break;
       case "InviteReceived":
@@ -865,10 +875,17 @@ export class Session implements SessionContext, AccountHost {
         // The relay has handed out most of our one-time pre-keys
         this.sendControl({ UploadPreKeys: { prekeys: this.signal.morePrekeys() } });
         break;
-      case "PreKeyBundleUnavailable":
+      case "PreKeyBundleUnavailable": {
         // Remove from pending so we don't loop
         this.pendingSessions.delete(b.user_id);
+        // What waited for that session is going nowhere, and looks sent. It
+        // need not mean they left: the request may be what was refused.
+        const before = this.pendingMessages.length;
+        this.pendingMessages = this.pendingMessages.filter((m) => !(m.target.kind === "direct" && m.target.targetUserId === b.user_id));
+        const expired = before - this.pendingMessages.length;
+        if (expired > 0) this.emit("dm-undelivered", { user_id: b.user_id, expired, kept: this.account?.keptFor(b.user_id) ?? false });
         break;
+      }
       case "DirectMessageUndelivered":
         // Between two accounts with cloud copies on, it went into the stored log
         // as well (sendDirectMessage): they read it when they are back.
@@ -1314,6 +1331,8 @@ export class Session implements SessionContext, AccountHost {
   private markEstablished(userId: number): void {
     this.establishedSessions.add(userId);
     this.pendingSessions.delete(userId);
+    // The session they opened is the one what we queued for them waited for
+    this.drainPendingDms(userId);
   }
 
   /**
@@ -1671,6 +1690,8 @@ export class Session implements SessionContext, AccountHost {
     } else {
       this.pendingMessages.push({ target: { kind: "direct", targetUserId }, id: messageId, content, ttlSecs, refs, queuedAt: Date.now() });
       this.emit("direct-chat-message", { ...event, pending: true });
+      // Rosters only start one with people our rooms told us of
+      this.requestPrekeyBundlesForUsers([{ user_id: targetUserId }]);
     }
   }
 }

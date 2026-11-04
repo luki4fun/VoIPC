@@ -1,10 +1,9 @@
 <script lang="ts">
   // The server name across the top of the sidebar, with its dropdown.
 
-  import { isAdmin, serverAddress } from "../../stores/connection.js";
+  import { serverAddress } from "../../stores/connection.js";
   import { copyInviteLink } from "../../stores/channel-ui.js";
-  import { openAdminPanel, showAdminLogin } from "../../stores/admin-ui.js";
-  import { emoteLimits } from "../../stores/emotes.js";
+  import { openAdminPanel, panelAllowed, showAdminLogin } from "../../stores/admin-ui.js";
   import { currentChannelId } from "../../stores/channels.js";
   import { disconnectServer, serverEntries } from "../../connect.js";
   import { playDisconnectedSound } from "../../sounds.js";
@@ -89,11 +88,11 @@
         class="menu-item"
         onclick={() => {
           open = false;
-          $isAdmin ? openAdminPanel() : showAdminLogin.set(true);
+          $panelAllowed ? openAdminPanel() : showAdminLogin.set(true);
         }}
       >
         <Icon name="shield" size={16} />
-        <span>{!$isAdmin ? "Admin login" : $emoteLimits ? "Bans and emotes" : "Active bans"}</span>
+        <span>{$panelAllowed ? "Server admin" : "Admin login"}</span>
       </button>
       <div class="menu-sep"></div>
       {#if onopensettings}

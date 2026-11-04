@@ -130,6 +130,14 @@ impl AccountSession {
         a
     }
 
+    /// Every couple of seconds while connected (`AccountSync::tick`).
+    pub fn tick(&mut self) -> Actions {
+        let (send, events) = self.sync.tick();
+        let mut a = Actions::sending(send);
+        self.events(events, &mut a);
+        a
+    }
+
     fn start_enrol(&mut self, a: &mut Actions) {
         // One at a time: a second would sign the first one's challenge.
         if self.enrol.is_some() {
@@ -256,7 +264,8 @@ impl AccountSession {
         }
     }
 
-    /// The accounts in a roster (`UserList`, `UserJoined`), for the pins. The
+    /// The accounts in a roster (`UserList`, `UserJoined`, `ChannelUsers`),
+    /// for the pins and for keeping copies of direct messages to them. The
     /// relay never sends an account behind a pseudonym. A name this account
     /// first met as an account, shown now as a guest, is a warning: an honest
     /// relay with accounts never lets a guest use an account's name.
@@ -356,7 +365,7 @@ impl AccountSession {
     }
 
     pub fn kept_for(&self, user_id: u32) -> bool {
-        self.cloud() && self.roster.contains_key(&user_id)
+        self.cloud() && self.roster.contains_key(&user_id) && !self.sync.copy_refused()
     }
 
     /// The safety number with `user_id`: our identity `own_key`, their pinned
@@ -568,6 +577,7 @@ mod tests {
             shares_history: false,
             account: Some(account),
             is_moderator: false,
+            badges: vec![],
         }
     }
 

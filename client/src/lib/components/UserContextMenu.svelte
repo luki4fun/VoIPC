@@ -16,7 +16,8 @@
   import { isAdmin, serverAddress } from "../stores/connection.js";
   import { showChatPane } from "../stores/platform.js";
   import { centreView } from "../stores/room.js";
-  import { canInvite, canKick, isCurrentChannelCreator, isModerator, isPreviewing } from "../stores/roster.js";
+  import { canInvite, canKick, isCurrentChannelCreator, isPreviewing } from "../stores/roster.js";
+  import { can } from "../stores/powers.js";
   import { selectedStrip, setUserVolume, toggleUserMute, userVolumes } from "../stores/mixer.js";
   import {
     adminAction,
@@ -56,8 +57,9 @@
 
   const menu = $derived($userMenu);
   let menuEl: HTMLDivElement | undefined = $state(undefined);
-  // A moderator acts on people, not on admins or other moderators (the server
-  // holds to that too); in their own channel they still kick as its creator.
+  // Only an admin acts on admins and on those who hold privileges (the server
+  // holds to that, for any privilege; the roster shows `voipc:channels`); in
+  // their own channel a creator still kicks.
   const spared = $derived(!!menu && !$isAdmin && !!(menu.user.is_admin || menu.user.is_moderator));
 
   // Per-user volume lives in one store, shared with the mixer: this used to be
@@ -165,12 +167,16 @@
           <span>Kick from channel</span>
         </button>
       {/if}
-      {#if $isAdmin || ($isModerator && !spared)}
+      {#if ($can("voipc:kick") || $can("voipc:ban")) && !spared}
         <div class="ctx-separator"></div>
+      {/if}
+      {#if $can("voipc:kick") && !spared}
         <button class="ctx-item danger" onclick={() => { openAdminAction(menu.user, "kick", 0, "Kick from server"); closeUserMenu(); }}>
           <Icon name="shield" size={16} />
           <span>Kick from server</span>
         </button>
+      {/if}
+      {#if $can("voipc:ban") && !spared}
         <button class="ctx-item danger" onclick={() => { openAdminAction(menu.user, "ban", 3600, "Ban for 1 hour"); closeUserMenu(); }}>
           <Icon name="ban" size={16} />
           <span>Ban 1 hour</span>

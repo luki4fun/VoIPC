@@ -432,6 +432,10 @@ function sameMessage(a: ChatMessage, b: ChatMessage): boolean {
   // Between accounts, the account is the author: a user id is new on every
   // connect, so a message from the stored log carries none worth comparing.
   if (a.id && b.id && a.account && b.account) return a.account === b.account && a.id === b.id;
+  // Only one knows its account: a stored copy, and a live or a member's one
+  // from before its writer reconnected. Same name, same id; `mergeHistory`
+  // keeps the copy that knows, so a claim here cannot replace it.
+  if (a.id && b.id && (a.account || b.account) && a.username === b.username) return a.id === b.id;
   if (a.id && b.id) return a.user_id === b.user_id && a.id === b.id;
   return (
     a.user_id === b.user_id &&
@@ -550,10 +554,14 @@ export function mergeHistory(
     if (m.timestamp <= clearedBefore) continue;
     const seen = kept.findIndex((h) => sameMessage(h, m));
     if (seen !== -1) {
+      // A member's copy of what we hold from its writer changes nothing, not
+      // even when it goes: anyone could name that writer and that id.
+      if (m.kind === "shared" && kept[seen].account) continue;
       // Hearsay gives way to the real thing, and never the other way round:
       // where all we had was a member's copy of a message and the message
-      // itself turns up, we keep the one we witnessed.
-      if (kept[seen].kind === "shared" && m.kind !== "shared") {
+      // itself turns up, we keep the one we witnessed. Likewise a stored copy,
+      // which its writer signed, over a live one nothing ties to an account.
+      if ((kept[seen].kind === "shared" && m.kind !== "shared") || (!kept[seen].account && m.account)) {
         // What this reader saw done to it stays: reactions and a pin are
         // their own record, and the row on screen is the same row
         const { reactions, pin } = kept[seen];

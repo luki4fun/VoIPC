@@ -69,16 +69,37 @@ export function archivedPeers(dms: Map<string, ChatMessage[]>, serverKey: string
  * our own room and every roster it was told. Absent means "away", which may
  * be wrong — a hidden channel's members are not told — so it never claims
  * more than that.
+ *
+ * The highest id: a list can be stale (a roster of a channel we can no longer
+ * ask about, or the moment they are on both sides of a reconnect), and ids
+ * only grow. Never a pseudonym, which only one channel keeps unique: the same
+ * name elsewhere may be somebody else, and this says where writing goes.
  */
 export function liveIdOf(name: string, users: UserInfo[], rosters: Map<number, UserInfo[]>): number | undefined {
   if (!name) return undefined;
-  const here = users.find((u) => u.username === name);
-  if (here) return here.user_id;
-  for (const list of rosters.values()) {
-    const u = list.find((x) => x.username === name);
-    if (u) return u.user_id;
+  let newest: number | undefined;
+  for (const list of [users, ...rosters.values()]) {
+    for (const u of list) {
+      if (u.username !== name || !(u.account || name.includes("#"))) continue;
+      if (newest === undefined || u.user_id > newest) newest = u.user_id;
+    }
   }
-  return undefined;
+  return newest;
+}
+
+/**
+ * The id writing to a conversation goes to: the newer of what its row has and
+ * what the lists say, since a list can be older than a row a message moved.
+ * None for a row that has only a made-up id and nobody on a list.
+ */
+export function writeToId(rowId: number, liveId: number | undefined): number | undefined {
+  const newest = Math.max(rowId, liveId ?? 0);
+  return newest > 0 ? newest : undefined;
+}
+
+/** Where this browser keeps what an account cleared on a server (chat.ts). */
+export function browserMarksKey(server: string, accountName: string): string {
+  return `voipc.marks.${server}|${accountName}`;
 }
 
 /**

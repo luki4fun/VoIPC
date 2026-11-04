@@ -392,6 +392,12 @@ pub async fn connect_to_server(
     ));
     if let Some(link) = &account {
         crate::account::after_connect(&app_handle, &address, link, &tcp_tx).await;
+        tokio::spawn(crate::account::tick_task(
+            app_handle.clone(),
+            address.clone(),
+            link.clone(),
+            tcp_tx.clone(),
+        ));
     }
     let video_decode_handle = tokio::task::spawn_blocking({
         let app_handle = app_handle.clone();
@@ -953,6 +959,11 @@ impl ControlTx {
         self.proto
     }
 
+    /// The connection's writer has gone.
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
+
     /// Queues `msg`, one entry per frame so the pacer counts what the relay
     /// does. A message the relay's protocol lacks is refused here.
     pub fn send(&self, msg: &ClientMessage) -> Result<(), String> {
@@ -1186,6 +1197,7 @@ async fn control_reader_task<R: AsyncRead + Unpin>(
                             &tcp_tx,
                         )
                         .await;
+                        drain_ready_dms(&signal, &tcp_tx, (&app_handle, &server)).await;
                     }
                     Err(e) => warn!("failed to decode server message: {}", e),
                 },
@@ -1470,11 +1482,14 @@ async fn handle_server_message(
     // Everything a game hears about comes from the voice connection only: a
     // user id here means nothing on the server the game is playing on.
     let in_voice = || is_voice.load(Ordering::Relaxed);
-    // Who is which account, for the pins. The server never sends an account
-    // behind a pseudonym, so an anonymous channel adds nothing here.
+    // Who is which account, for the pins and for keeping copies of direct
+    // messages. The server never sends an account behind a pseudonym, so an
+    // anonymous channel adds nothing here.
     let seen: &[UserInfo] = match &msg {
-        ServerMessage::UserList { users, .. } => users,
-        ServerMessage::UserJoined { user } => std::slice::from_ref(user),
+        ServerMessage::UserList { users, .. } | ServerMessage::ChannelUsers { users, .. } => users,
+        ServerMessage::UserJoined { user } | ServerMessage::UserUpdated { user } => {
+            std::slice::from_ref(user)
+        }
         _ => &[],
     };
     if let Some(link) = account {
@@ -1997,6 +2012,17 @@ async fn handle_server_message(
             upsert_channel(channels_snapshot, channel.clone());
             emit_server(app_handle, server, "channel-created", &channel);
         }
+        ServerMessage::UserUpdated { user } => {
+            emit_server(app_handle, server, "user-updated", user);
+        }
+        ServerMessage::ListenOnly { channel_id, on } => {
+            emit_server(
+                app_handle,
+                server,
+                "listen-only",
+                serde_json::json!({"channel_id": channel_id, "on": on}),
+            );
+        }
         ServerMessage::ChannelDeleted { channel_id } => {
             if let Ok(mut list) = channels_snapshot.lock() {
                 list.retain(|c| c.channel_id != channel_id);
@@ -2274,6 +2300,23 @@ async fn handle_server_message(
             // Remove from pending so we don't loop
             let mut sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
             sig.pending_sessions.remove(&user_id);
+            // What waited for that session is going nowhere, and looks sent.
+            // It need not mean they left: the request may be what was refused.
+            let before = sig.pending_messages.len();
+            sig.pending_messages.retain(|m| {
+                !matches!(m.target, PendingTarget::Direct { target_user_id } if target_user_id == user_id)
+            });
+            let expired = before - sig.pending_messages.len();
+            drop(sig);
+            if expired > 0 {
+                let kept = account.is_some_and(|l| l.session().kept_for(user_id));
+                emit_server(
+                    app_handle,
+                    server,
+                    "dm-undelivered",
+                    serde_json::json!({"user_id": user_id, "expired": expired, "kept": kept}),
+                );
+            }
         }
         ServerMessage::PreKeysLow { .. } => {
             // The relay has handed out most of our one-time pre-keys
@@ -3178,6 +3221,37 @@ async fn handle_sender_key_received(
 }
 
 /// Drain and send pending direct messages for a specific user whose session was just established.
+/// Any queued direct message whose session exists now goes out. A session comes
+/// up with our own bundle request, or with whatever the peer sends first: a
+/// sender key or a poke opens it as well as a message does.
+async fn drain_ready_dms(
+    signal: &Arc<std::sync::Mutex<SignalState>>,
+    tcp_tx: &ControlTx,
+    ui: (&tauri::AppHandle, &str),
+) {
+    let ready: Vec<u32> = {
+        let sig = signal.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut ids: Vec<u32> = sig
+            .pending_messages
+            .iter()
+            .filter_map(|m| match m.target {
+                PendingTarget::Direct { target_user_id }
+                    if sig.established_sessions.contains(&target_user_id) =>
+                {
+                    Some(target_user_id)
+                }
+                _ => None,
+            })
+            .collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    for id in ready {
+        drain_pending_dms(id, signal, tcp_tx, ui).await;
+    }
+}
+
 async fn drain_pending_dms(
     target_user_id: u32,
     signal: &Arc<std::sync::Mutex<SignalState>>,

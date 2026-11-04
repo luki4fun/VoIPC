@@ -10,6 +10,7 @@
   import { viewingVoice, voiceChannel, voiceServer } from "../../stores/channels.js";
   import { isMobile } from "../../stores/platform.js";
   import { leaveVoice } from "../../stores/voice.js";
+  import { voiceListenOnly } from "../../stores/channel-ui.js";
   import { serverEntries } from "../../connect.js";
   import ScreenShareControls from "../ScreenShareControls.svelte";
   import Icon from "../Icons.svelte";
@@ -23,6 +24,8 @@
 
   // Nothing to report while we are in no voice channel.
   const inVoice = $derived($voiceState === "connected" && $voiceServer !== null);
+  // The channel's gate names who speaks, and we are not one: nobody hears us
+  const listening = $derived(!!$voiceChannel && $voiceListenOnly.has($voiceChannel.channel_id));
 </script>
 
 {#if inVoice}
@@ -47,6 +50,11 @@
         {$voiceLatency}ms{#if $voiceTcp}&nbsp;· TCP{/if}{#if $lossPercent > 0}&nbsp;· {$lossPercent}%{/if}
       </span>
     </div>
+    {#if listening}
+      <div class="listen-only" role="status" title="This channel's groups say who speaks; nobody hears you here">
+        <Icon name="lock" size={14} /> Listening only
+      </div>
+    {/if}
     {#if !$isMobile}
       <div class="share-row"><ScreenShareControls /></div>
     {/if}
@@ -62,6 +70,14 @@
     background: var(--bg-secondary);
     border-top: 1px solid var(--border);
     flex-shrink: 0;
+  }
+
+  .listen-only {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: var(--fs-sm);
+    color: var(--warning);
   }
 
   .voice-line {

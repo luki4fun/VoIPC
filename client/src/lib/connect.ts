@@ -12,6 +12,7 @@
 
 import { hasNsfwConsent } from "./stores/channel-ui.js";
 import { dropPrompts } from "./stores/account.js";
+import { isWeb } from "./stores/platform.js";
 import { derived, get, writable, type Readable } from "svelte/store";
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -30,6 +31,7 @@ import {
   clearServerUnread,
   dmConversations,
   unreadPerChannel,
+  releaseBrowserMarks,
 } from "./stores/chat.js";
 import { pendingInvites } from "./stores/invites.js";
 import { parseHostPort } from "./invite.js";
@@ -148,6 +150,59 @@ interface OpenDetails {
   account?: boolean;
 }
 const details = new Map<string, OpenDetails>();
+
+/** This browser tab's open account servers, for its next reload. */
+const RELOAD_KEY = "voipc.reload";
+
+/**
+ * Written for a reload of this tab: a remembered account signs back in by
+ * itself, and a guest starts over. Beside `saveOpenServers`, not through it: that
+ * list is kept only if the person asked, and a server that showed us out stays
+ * on it, where signing back in would take the account from the other device
+ * that ended this session. So this goes with `removeServer`, before anything
+ * is awaited: a Disconnect followed by F5 stays disconnected.
+ */
+function saveReloadList(): void {
+  if (!isWeb) return;
+  const saved = get(savedServers);
+  const servers: SavedServer[] = get(openServers).flatMap((id) => {
+    const d = details.get(id);
+    if (!d?.account) return [];
+    return [{ name: serverName(id, saved), host: d.host, port: d.port, username: d.asked, accept_self_signed: d.acceptSelfSigned, account: true }];
+  });
+  try {
+    sessionStorage.setItem(RELOAD_KEY, JSON.stringify(servers));
+  } catch {
+    // Storage off: the connect dialog it is
+  }
+}
+
+/**
+ * The servers to open at the start: on a reload of this tab its account servers,
+ * then `list`. Only on a reload: a new visit starts at the dialog, and a duplicated
+ * or discarded tab has no business taking an account from wherever it went since.
+ */
+export function withReloadServers(list: SavedServer[]): SavedServer[] {
+  if (!isWeb) return list;
+  const nav = performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined;
+  if (nav?.type !== "reload" || (document as Document & { wasDiscarded?: boolean }).wasDiscarded) {
+    // This page starts at the dialog, so its own F5 must too
+    try {
+      sessionStorage.removeItem(RELOAD_KEY);
+    } catch {
+      // Storage off: there is nothing to remove
+    }
+    return list;
+  }
+  let reload: SavedServer[] = [];
+  try {
+    const stored: unknown = JSON.parse(sessionStorage.getItem(RELOAD_KEY) ?? "[]");
+    if (Array.isArray(stored)) reload = stored;
+  } catch {
+    return list;
+  }
+  return [...reload, ...list.filter((s) => !reload.some((r) => r.host === s.host && r.port === s.port))];
+}
 
 // ── Opening ────────────────────────────────────────────────────────────────
 
@@ -283,6 +338,7 @@ export async function connectTo(
   // Not asked to show it, but nothing else is on screen: better this one than
   // an empty window behind the connect dialog
   if (view || !get(serverAddress)) serverAddress.set(server);
+  saveReloadList();
 
   if (manual) {
     // Remembering is a separate concern from connecting, and a failure to
@@ -397,6 +453,7 @@ function removeServer(server: string): void {
   const run = reconnectRuns.get(server);
   if (run) run.cancelled = true;
   reconnectRuns.delete(server);
+  releaseBrowserMarks(server);
   resetServer(server);
   details.delete(server);
   // What it sent can no longer be answered: its connection is gone
@@ -410,6 +467,7 @@ function removeServer(server: string): void {
   if (get(serverAddress) === server) {
     serverAddress.set(after[Math.min(index, after.length - 1)] ?? "");
   }
+  saveReloadList();
 }
 
 /**

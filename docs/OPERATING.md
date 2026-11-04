@@ -124,7 +124,7 @@ WantedBy=multi-user.target
   everything the relay hashes. Without it the database is of no use: back the two up together.
 - **Postgres:** use `sslmode=verify-full` in the URL when the database is on another host.
 - **Commands:**
-  - `admin grant|revoke <name> admin|moderator`;
+  - `admin grant|revoke <name> <group>` (`admin`, `moderator`, or one made in the app);
   - `admin reset-2fa <name>`;
   - `admin invite`;
   - `ban list|add|remove`.
@@ -235,7 +235,7 @@ The simplest way is a host directory that user 65532 owns:
     install -d -o 65532 -g 65532 -m 0700 /srv/voipc
     install -o 65532 -g 65532 -m 0600 server.toml cert.pem key.pem /srv/voipc/
     docker run -d --name voipc -v /srv/voipc:/data \
-      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.6.0
+      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.7.0-rc.1
     docker exec voipc /voipc-server --config /data/server.toml admin grant <name> admin
 
 With a named volume instead, copy the files in with a throwaway container first, then run the
@@ -431,11 +431,11 @@ Runtime settings in `server_settings.json`:
 | `text` | `false` | Makes it a **text channel**: no voice, no screen share, no proximity. Joining one is a subscription rather than a move, so any number can be open at once and none of them costs the voice channel you stand in |
 | `message_ttl_secs` | `0` | A **message destruction timer**: seconds a message written here lives before every client deletes it, `0` for none. Up to 30 days. Without accounts the server stores no chat and deletes nothing — this is what the channel tells its members, and each client stamps it on what it sends, inside the encryption where the relay cannot reach it. With accounts, the server also deletes the copies members keep there when their timer runs out. It applies to what is written from then on, not to what people already have |
 | `auto_join` | `false` | Only with `text`. Clients join this channel on connect. A user who leaves it is not brought back — the client remembers that, which is why the server joins nobody by itself. There is no limit on how many a client holds: the budgets that pay for joining them are sized from how many channels this server has |
-| `announce` | `false` | Only with `text`. An **announcement channel**: only its managers — admins and moderators, and for a channel somebody created, its creator — may post, and the server refuses everybody else's messages. It reads none of them; who posts where is all it checks. A member's shared history from such a channel is still shown as second-hand, as everywhere |
+| `announce` | `false` | Only with `text`. An **announcement channel**: only its managers — admins and whoever holds the *Channels* privilege (moderators, by default), and for a channel somebody created, its creator — may post, and the server refuses everybody else's messages. It reads none of them; who posts where is all it checks. A member's shared history from such a channel is still shown as second-hand, as everywhere |
 | `slow_mode_secs` | `0` | **Slow mode**: each member may post once per this many seconds, up to 6 hours; `0` is off. The server holds them to it, the channel's managers are exempt, and the chat shows the countdown rather than letting a message be sent and refused |
 | `nsfw` | `false` | Marks the channel **18+**. Each app asks its user, once per server, to confirm being 18 or older before joining or showing such a channel, and never joins one by itself (`auto_join` waits for that answer). The server only carries the flag. It is a question, not an age check: give the channel a `password` too if it has to stay shut |
 
-The creator of a channel, or any admin or moderator, can change these at runtime through the channel's gear icon. Channels from `channels.json` have no creator, so only admins and moderators can change those.
+The creator of a channel, or any admin or holder of *Channels* (moderators, by default), can change these at runtime through the channel's gear icon. Channels from `channels.json` have no creator, so only those can change them. With accounts, the same dialog sets a channel's gate: the groups that may see and join it, and those that may speak ([ACCOUNTS.md](ACCOUNTS.md), Channel gates).
 
 **Channel presets.** Rather than writing `channels.json` by hand, start from one of the built-in layouts and edit from there:
 

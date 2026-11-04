@@ -16,10 +16,11 @@ import {
   toArchived,
   type EventIn,
 } from "../chat-rules.js";
-import { archivedPeers, closeMarkKey, listRows } from "../dm-rules.js";
+import { archivedPeers, browserMarksKey, closeMarkKey, listRows } from "../dm-rules.js";
 import { previewChannelId, previewUsers } from "./channels.js";
 import { serverAddress, serverKey, userId } from "./connection.js";
 import { scoped } from "./scoped.js";
+import { isWeb } from "./platform.js";
 import { openServers } from "./servers.js";
 import { chatHistoryDisabled, maxConversations } from "./settings.js";
 import type { ChatMessage } from "../types.js";
@@ -167,7 +168,7 @@ function noteOpened(server: string, id: number, name: string): void {
 
 /** What we call the person behind an id: what their conversation is filed
  *  under already, whom we opened it with, or the name we were given. */
-function peerName(server: string, peerId: number, fallback: string): string {
+export function peerName(server: string, peerId: number, fallback: string): string {
   return (
     get(dmConversations.peek(server)).find((c) => c.user_id === peerId)?.username ||
     openedIds.get(server)?.get(peerId) ||
@@ -263,14 +264,40 @@ export function attachDm(server: string, name: string, id: number): void {
   noteOpened(server, id, name);
   // Asked first: an update that changes nothing still wakes every list
   const row = get(dmConversations.peek(server)).find((x) => x.username === name);
-  if (!row || row.user_id === id) return;
-  const moved = row.user_id;
+  if (row && row.user_id !== id) {
+    dmConversations.of(server).update((convos) => {
+      const c = convos.find((x) => x.username === name);
+      if (c) c.user_id = id;
+      return [...convos];
+    });
+  }
+  const active = get(activeDmUserId.peek(server));
+  if (active !== null && active !== id && get(activeDmUsername.peek(server)) === name) activeDmUserId.of(server).set(id);
+}
+
+/**
+ * The relay says nobody has `id` any more. Their conversation goes back to a
+ * made-up id, as an archived one has: away until they are on a list we see,
+ * and it attaches again (ChatPanel). Keeping the old id looked "live" and sent
+ * every message after it into nothing.
+ */
+export function detachDm(server: string, id: number): void {
+  const row = get(dmConversations.peek(server)).find((c) => c.user_id === id);
+  if (!row) return;
+  const name = row.username;
+  noteOpened(server, id, name);
+  const away = archivedId--;
+  // Where writing to them goes now: the row may have seen only live messages
+  const account = row.account ?? archivedPeers(get(dmMessages), serverKey(server)).find((p) => p.name === name)?.account;
   dmConversations.of(server).update((convos) => {
     const c = convos.find((x) => x.username === name);
-    if (c) c.user_id = id;
+    if (c) {
+      c.user_id = away;
+      if (account) c.account = account;
+    }
     return [...convos];
   });
-  if (get(activeDmUserId.peek(server)) === moved) activeDmUserId.of(server).set(id);
+  if (get(activeDmUserId.peek(server)) === id) activeDmUserId.of(server).set(away);
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +349,8 @@ async function saveNow() {
   const dmMap = pruneConversations(get(dmMessages), limit);
   if (dmMap !== get(dmMessages)) dmMessages.set(dmMap);
 
+  saveBrowserMarks();
+
   // Nothing keeps it: history off, the archive still locked, or the browser.
   // The pruning above still bounds memory; the copy of every conversation
   // over IPC that the backend throws away does not happen (H5-06).
@@ -350,6 +379,62 @@ async function saveNow() {
     });
   } catch (e) {
     console.error("Failed to save chat history:", e);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// What an account cleared, in the browser
+// ---------------------------------------------------------------------------
+
+/** Whose marks each server's are, while signed in there. */
+const markOwners = new Map<string, string>();
+
+/**
+ * The browser keeps no chat, so the server's copies come back with every
+ * reload. What this account cleared, closed or saw purged must not, and the
+ * desktop's archive is where that lives otherwise. Guests keep nothing.
+ * Merged: the map holds every server's marks.
+ */
+export function loadBrowserMarks(server: string, accountName: string): void {
+  if (!isWeb) return;
+  const key = browserMarksKey(server, accountName);
+  markOwners.set(server, key);
+  let stored: unknown;
+  try {
+    stored = JSON.parse(localStorage.getItem(key) ?? "{}");
+  } catch {
+    return;
+  }
+  if (!stored || typeof stored !== "object") return;
+  clearedBefore.update((marks) => {
+    const next = new Map(marks);
+    for (const [mark, at] of Object.entries(stored)) {
+      if (typeof at === "number" && at > (next.get(mark) ?? 0)) next.set(mark, at);
+    }
+    return next;
+  });
+}
+
+/**
+ * This account's marks stop being saved: the server was closed (saved first,
+ * since the account is gone before the debounced save runs), or it was
+ * forgotten or deleted here (`keep` false: a later save must not write them
+ * back). A tab another device took over must not write over what that one saves.
+ */
+export function releaseBrowserMarks(server: string, keep = true): void {
+  if (keep) saveBrowserMarks();
+  markOwners.delete(server);
+}
+
+function saveBrowserMarks(): void {
+  for (const [server, key] of markOwners) {
+    const prefix = `${serverKey(server)}/`;
+    const own = [...get(clearedBefore)].filter(([mark]) => mark.startsWith(prefix));
+    try {
+      localStorage.setItem(key, JSON.stringify(Object.fromEntries(own)));
+    } catch {
+      // Storage off: it is asked again at the next save
+    }
   }
 }
 
@@ -481,9 +566,13 @@ function bounded(m: ChatMessage): ChatMessage {
 
 /** Already here: the same message by its sender's account and id, read from
  *  the stored log before it came live (a message queued while its writer was
- *  alone goes out live later). */
+ *  alone goes out live later). A live copy may not know the account, when its
+ *  writer is on no list we see: then by the name (`sameMessage`). */
 function held(existing: ChatMessage[] | undefined, m: ChatMessage): boolean {
-  return !!m.id && !!m.account && !!existing?.some((h) => h.id === m.id && h.account === m.account);
+  return (
+    !!m.id &&
+    !!existing?.some((h) => h.id === m.id && !!h.account && (m.account ? h.account === m.account : h.username === m.username))
+  );
 }
 
 /** Returns whether it was new. */
@@ -518,14 +607,18 @@ export function fileStoredChannelMessage(server: string, channelName: string, ms
   if (purged(key, msg)) return false;
   const watermark = get(clearedBefore).get(key) ?? 0;
   let added = false;
+  let changed = false;
   channelMessages.update((map) => {
-    const { messages, added: n } = mergeHistory(map.get(key) ?? [], [msg], "", watermark);
-    if (n === 0) return map;
-    added = true;
+    const existing = map.get(key) ?? [];
+    const { messages, added: n } = mergeHistory(existing, [msg], "", watermark);
+    // Not only when it is new: its writer's copy replaces a member's
+    if (messages === existing) return map;
+    changed = true;
+    added = n > 0;
     map.set(key, messages.filter((x) => x.kind !== "history-marker").slice(-MAX_MESSAGES));
     return new Map(map);
   });
-  if (added) scheduleSave();
+  if (changed) scheduleSave();
   return added;
 }
 
@@ -623,6 +716,9 @@ export function addDmMessage(
 ) {
   const isEcho = fromId === myId;
   const peerId = isEcho ? toId : fromId;
+  // Their id now, whatever becomes of this copy: the stored log may have
+  // brought it first, and our answer must not go to the id they had before.
+  if (!isEcho) attachDm(server, fromName, fromId);
   // That server's open conversation, not the one on screen: an echo names its
   // peer by what is open where it was sent.
   const activeName = get(activeDmUsername.peek(server));
@@ -658,7 +754,10 @@ export function addDmMessage(
     // The name it is filed under (`dmKeyOf`); for our echo, whom we opened it with
     const name = isEcho ? peerName(server, peerId, activeName || "Unknown") : fromName;
     const existing = convos.find((c) => c.user_id === peerId) ?? convos.find((c) => c.username === name);
-    if (existing && existing.user_id !== peerId) {
+    // Not for our notice: it is about an id that is gone, and the row may have
+    // moved on to the one they have now.
+    const notice = msg.kind === "notice";
+    if (existing && existing.user_id !== peerId && !notice) {
       moved = existing.user_id;
       existing.user_id = peerId;
     }
@@ -667,19 +766,19 @@ export function addDmMessage(
       if (!isEcho) {
         existing.username = fromName;
       }
-      if (!onScreen) {
+      if (!onScreen && !notice) {
         existing.unread++;
         noteUnread(dmKey(server, existing.username), msg.timestamp);
       }
       return [...convos];
     } else {
-      if (!onScreen) noteUnread(dmKey(server, name), msg.timestamp);
+      if (!onScreen && !notice) noteUnread(dmKey(server, name), msg.timestamp);
       return [
         ...convos,
         {
           user_id: peerId,
           username: name,
-          unread: onScreen ? 0 : 1,
+          unread: onScreen || notice ? 0 : 1,
         },
       ];
     }
@@ -707,6 +806,8 @@ export function fileStoredDm(
     thread?: string | null;
     file?: unknown;
     fwd?: unknown;
+    /** An earlier page read it, and this one reads it back (log-memory.ts). */
+    replay?: boolean;
   },
   own: { name: string; account: string },
   expires_at: number | undefined,
@@ -731,32 +832,44 @@ export function fileStoredDm(
   // What the user cleared stays cleared, as in a channel (1.0 audit H2-06)
   const watermark = get(clearedBefore).get(key) ?? 0;
   let added = false;
+  let changed = false;
   dmMessages.update((map) => {
     const existing = map.get(key) ?? [];
     const { messages, added: n } = mergeHistory(existing, [msg], "", watermark);
-    if (n === 0) return map;
-    added = true;
+    // Not only when it is new: its writer's copy replaces a live one that
+    // could not say whose it was
+    if (messages === existing) return map;
+    changed = true;
+    added = n > 0;
     // The marker a member's hand-off draws is not wanted here: the log is the
     // conversation itself, not somebody's copy of it.
     map.set(key, messages.filter((x) => x.kind !== "history-marker").slice(-MAX_MESSAGES));
     return new Map(map);
   });
-  if (!added) return;
-  scheduleSave();
+  // Never an older id: the roster it came from can be behind the row
+  const rowId = get(dmConversations.peek(server)).find((c) => c.username === peerName)?.user_id ?? 0;
+  if (peerUserId !== undefined && peerUserId > rowId) attachDm(server, peerName, peerUserId);
+  if (changed) scheduleSave();
+  const onScreen =
+    server === get(serverAddress) && get(activeDmUserId.peek(server)) !== null && get(activeDmUsername.peek(server)) === peerName;
+  const news = added && !m.from_me && !m.replay && !onScreen;
   dmConversations.of(server).update((convos) => {
     const existing = convos.find((c) => c.username === peerName);
     if (existing) {
+      // Even for a copy we hold: where writing to them goes once they are away
+      if (existing.account === m.peer_account && !news) return convos;
       existing.account = m.peer_account;
-      if (!m.from_me) {
+      if (news) {
         existing.unread++;
         noteUnread(key, m.timestamp);
       }
       return [...convos];
     }
+    if (!added) return convos;
     // Not here now: a negative id stands in until they are (addDmMessage).
     const id = peerUserId ?? -parseInt(m.peer_account.slice(0, 7), 16) - 1;
-    if (!m.from_me) noteUnread(key, m.timestamp);
-    return [...convos, { user_id: id, username: peerName, unread: m.from_me ? 0 : 1, account: m.peer_account }];
+    if (news) noteUnread(key, m.timestamp);
+    return [...convos, { user_id: id, username: peerName, unread: news ? 1 : 0, account: m.peer_account }];
   });
 }
 

@@ -75,6 +75,41 @@ test("between accounts the account is the author, not this connection's user id"
   assert.equal(mergeHistory(live, [msg({ timestamp: T, id: "a", user_id: 7, account: "bb" })], "").added, 1);
 });
 
+test("a copy that does not know its account is the same message under the same name", () => {
+  // Live from somebody on no list we see, then read from the log: one message
+  const live = [msg({ timestamp: T, id: "a", user_id: 7, content: "from the live copy" })];
+  const stored = msg({ timestamp: T, id: "a", user_id: 0, account: "aa", content: "signed" });
+  const { messages, added } = mergeHistory(live, [stored], "");
+  assert.equal(added, 0);
+  const kept = messages.filter((m) => m.kind !== "history-marker");
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].content, "signed", "the copy its writer signed wins, whichever came first");
+  assert.equal(kept[0].account, "aa");
+  // Another name under that id is somebody else's message
+  assert.equal(mergeHistory(live, [{ ...stored, username: "mallory" }], "").added, 1);
+});
+
+test("a member's copy of what its writer signed changes nothing", () => {
+  // After a reload a member still offers the writer's old user id, without an
+  // account: that is not a second message, and no claim on the signed one.
+  const signed = [msg({ timestamp: T, id: "a", user_id: 12, account: "aa", content: "signed", expires_at: T + 100_000 })];
+  const claim = msg({ timestamp: T, id: "a", user_id: 7, kind: "shared", content: "claimed", expires_at: T + 1 });
+  const { messages, added } = mergeHistory(signed, [claim], "bob");
+  assert.equal(added, 0);
+  const kept = messages.filter((m) => m.kind !== "history-marker");
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].content, "signed");
+  assert.equal(kept[0].expires_at, T + 100_000, "nor does it bring its deletion forward");
+  // The other way round the signed copy replaces the claim, and the corrected
+  // list is what comes back: a caller goes by that, there being nothing added
+  const claims = [claim];
+  const after = mergeHistory(claims, [signed[0]], "");
+  assert.equal(after.added, 0);
+  assert.notEqual(after.messages, claims);
+  assert.equal(mergeHistory(signed, [claim], "bob").messages, signed, "and nothing to do is the same list");
+  assert.equal(after.messages.filter((m) => m.kind !== "history-marker")[0].content, "signed");
+});
+
 test("without ids the old heuristic still catches a duplicate", () => {
   // Anything stored before this release has no id, and the first share after
   // upgrading must not double the whole conversation.

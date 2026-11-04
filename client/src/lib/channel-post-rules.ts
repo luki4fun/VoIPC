@@ -16,11 +16,12 @@ import type { ChannelInfo, UserInfo } from "./types.ts";
 export interface Me {
   userId: number | null;
   isAdmin: boolean;
+  /** Manages every channel (`voipc:channels`; the moderator role before 1.7). */
   isModerator: boolean;
 }
 
 /**
- * The channel's managers: its creator, admins and moderators. The server lets
+ * The channel's managers: its creator, admins and whoever manages channels. The server lets
  * exactly these change a channel's settings, post in an announcement channel
  * and skip slow mode. The lobby has none.
  */

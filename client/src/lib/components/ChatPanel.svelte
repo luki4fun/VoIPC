@@ -17,11 +17,12 @@
   import { tick, untrack } from "svelte";
   import { channels } from "../stores/channels.js";
   import { uiPrefs } from "../stores/ui-prefs.js";
-  import { isAdmin, serverAddress, serverKey, userId, username } from "../stores/connection.js";
+  import { serverAddress, serverKey, userId, username } from "../stores/connection.js";
   import { addNotification } from "../stores/notifications.js";
   import { confirmAction } from "../stores/confirm.js";
   import { get } from "svelte/store";
   import { account, accountHex } from "../stores/account.js";
+  import { can } from "../stores/powers.js";
   import { users } from "../stores/users.js";
   import { emoteLimits, emoteSets, noteEmotes, pendingImport } from "../stores/emotes.js";
   import { showAdminPanel } from "../stores/admin-ui.js";
@@ -34,7 +35,7 @@
   import { fetchFile, fileLimits, sendFile } from "../files.js";
   import { linkFacts, mentionNames as mentionNamesOf, plainText } from "../markdown.js";
   import { rosterOf } from "../roster-rules.js";
-  import { awayHint, liveIdOf, reach } from "../dm-rules.js";
+  import { awayHint, liveIdOf, reach, writeToId } from "../dm-rules.js";
   import { prepare } from "../image-prep.js";
   import { sealedLen } from "../file-rules.js";
   import {
@@ -73,6 +74,7 @@
     showMessage,
     nsfwConsented,
     setDmMessageTtl,
+    listenOnly,
   } from "../stores/channel-ui.js";
   import { canManage, needsNsfwConsent, postBlock, slowModeLabel } from "../channel-post-rules.js";
   import { currentChannelId } from "../stores/channels.js";
@@ -129,10 +131,12 @@
   /** Their id now, when they are on a list we see (dm-rules.ts). */
   const dmSeenId = $derived(dmName === null ? undefined : liveIdOf(dmName, $users, $channelRosters));
   const dmReach = $derived(isDmMode ? reach($activeDmUserId ?? 0, dmSeenId, dmRow?.account, !!$account?.cloud) : "live");
-  // An archived conversation's person is here: theirs from now on
+  // Their person is here, under a newer id: an archived conversation's, or one
+  // who came back after a reload. Theirs from now on. Never an older id: a
+  // roster can hold the one they had before a message moved the row.
   $effect(() => {
     const [server, name, id] = [$serverAddress, dmName, dmSeenId];
-    if (name !== null && id !== undefined && ($activeDmUserId ?? 0) < 0) untrack(() => attachDm(server, name, id));
+    if (name !== null && id !== undefined && id > ($activeDmUserId ?? 0)) untrack(() => attachDm(server, name, id));
   });
 
   // The channel whose chat is on screen: a preview, then the text channel the
@@ -172,6 +176,8 @@
   let now = $state(Date.now());
   /** Bumped on every send, so the countdown starts without waiting for a tick. */
   let sentCount = $state(0);
+  /** The channel's gate lets us only read here (`ListenOnly`). */
+  let listening = $derived(!isDmMode && !!effectiveChannel && $listenOnly.has(effectiveChannel.channel_id));
   let block = $derived.by(() => {
     void sentCount;
     if (isDmMode || !effectiveChannel) return null;
@@ -215,7 +221,9 @@
       : null,
   );
   /** Whether this conversation can be written in, answers included. */
-  let canAnswer = $derived(isDmMode ? dmReach !== "readonly" : canSendChannelMessage && block?.kind !== "announce");
+  let canAnswer = $derived(
+    isDmMode ? dmReach !== "readonly" : canSendChannelMessage && !listening && block?.kind !== "announce",
+  );
   // Raw: a $state proxy of a message is never === the message itself, and
   // these are looked up in the conversation by identity
   let replyingTo = $state.raw<ChatMessage | null>(null);
@@ -711,7 +719,7 @@
     // Its picture as the importer's first row: the file itself, which the
     // importer sanitizes and shows before anything goes up
     const makeEmote =
-      $isAdmin && $emoteLimits
+      $can("voipc:emotes") && $emoteLimits
         ? async (m: ChatMessage) => {
             const server = $serverAddress;
             try {
@@ -768,13 +776,19 @@
         key: `c${ch.channel_id}`,
         label: ch.text ? `#${ch.name}` : ch.name,
         target: { server, channelId: ch.channel_id },
-        blocked: b?.kind === "announce" ? "Only moderators post here" : b?.kind === "slow" ? `Slow mode: ${slowModeLabel(b.remainingSecs)}` : undefined,
+        blocked: $listenOnly.has(ch.channel_id)
+          ? "You can only read here"
+          : b?.kind === "announce"
+            ? "Only moderators post here"
+            : b?.kind === "slow"
+              ? `Slow mode: ${slowModeLabel(b.remainingSecs)}`
+              : undefined,
       });
     }
     for (const c of $dmConversations) {
       // Keyed by name, as the sidebar's rows (dm-rules `listRows`)
       if (out.some((d) => d.key === `d${c.username}`)) continue;
-      const seen = c.user_id > 0 ? undefined : liveIdOf(c.username, $users, $channelRosters);
+      const seen = writeToId(c.user_id, liveIdOf(c.username, $users, $channelRosters));
       const r = reach(c.user_id, seen, c.account, !!$account?.cloud);
       if (r === "readonly") continue;
       const dm = { peer: seen ?? c.user_id, name: c.username, away: r === "kept" ? c.account : undefined };
@@ -1027,7 +1041,7 @@
         </div>
       {/if}
     {/if}
-    {#if !isLobby}
+    {#if isDmMode || !isLobby}
       <button
         class="clear-chat-btn search-btn"
         onclick={() => (searching = !searching)}
@@ -1044,7 +1058,7 @@
         aria-label="Files in this conversation"
       ><Icon name="paperclip" size={16} /></button>
     {/if}
-    {#if displayMessages.length > 0 && !isLobby}
+    {#if displayMessages.length > 0 && (isDmMode || !isLobby)}
       <button
         class="clear-chat-btn"
         onclick={(e) => { if (keptConv) { e.stopPropagation(); showClearMenu = !showClearMenu; } else void confirmClearHere(); }}
@@ -1149,6 +1163,10 @@
       replying={replyingTo?.username ?? null}
       oncancelreply={() => (replyingTo = null)}
     />
+  {:else if canSendChannelMessage && listening}
+    <div class="preview-footer post-block" role="status">
+      <Icon name="lock" size={14} /> You can only read and listen in {channelLabel}: its groups say who speaks
+    </div>
   {:else if canSendChannelMessage && block?.kind === "announce"}
     <div class="preview-footer post-block">
       <Icon name="megaphone" size={14} /> Only moderators can post in #{channelName}

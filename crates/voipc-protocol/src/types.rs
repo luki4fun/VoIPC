@@ -45,10 +45,18 @@ pub struct UserInfo {
     /// the user id, which is new on every connect.
     #[serde(default)]
     pub account: Option<[u8; 16]>,
-    /// Holds the moderator role (kick, ban, any channel's settings).
+    /// Manages every channel (protocol v16: holds `voipc:channels`, as the
+    /// moderator role did before): their pins count anywhere.
     #[serde(default)]
     pub is_moderator: bool,
+    /// The badges of the groups this account counts in (protocol v16), at
+    /// most `MAX_BADGES`. Empty wherever `account` is withheld.
+    #[serde(default)]
+    pub badges: Vec<String>,
 }
+
+/// Badges a member shows at most (`UserInfo::badges`).
+pub const MAX_BADGES: usize = 3;
 
 // ── Accounts (protocol v11) ──────────────────────────────────────────────
 
@@ -245,12 +253,70 @@ pub struct VaultBlob {
 pub struct AccountInfo {
     pub id: [u8; 16],
     pub name: String,
-    /// What the account may do right now (`*`, `voipc:moderate`, …).
+    /// What the account may do right now (`*`, `voipc:kick`, …).
     pub scopes: Vec<String>,
     /// It holds a role whose rights wait for a second factor: the client
     /// asks the user to set one up.
     pub needs_2fa: bool,
     pub totp_enabled: bool,
+}
+
+// ── Server administration (protocol v16) ────────────────────────────────
+
+/// An account as the admin pages list it: no address, no e-mail.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AdminUser {
+    pub id: [u8; 16],
+    pub name: String,
+    pub totp: bool,
+    /// Unix seconds.
+    pub created_at: i64,
+}
+
+/// A group (an account role) and the privileges (scopes) it hands out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupInfo {
+    /// 2 to 32 of a-z, 0-9, `_` and `-`; never renamed.
+    pub name: String,
+    pub description: String,
+    /// Shown next to members' names; empty for none.
+    pub badge: String,
+    /// `*`, `voipc:kick`, `users:admin`, …
+    pub scopes: Vec<String>,
+    /// `admin` and `user` (every account) are built in: never deleted.
+    pub builtin: bool,
+}
+
+/// One line of an account's history, for the admin pages. Never the address.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuditRow {
+    /// `role_grant`, `totp_reset`, `register`, …
+    pub event: String,
+    /// The name of the account that did it; `None` for the account itself
+    /// or the server's shell.
+    pub actor: Option<String>,
+    pub detail: String,
+    pub at: i64,
+}
+
+/// A sign-up code that is still open or was used.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InviteInfo {
+    /// What `InviteRevoke` names (not the code, which is shown once).
+    pub id: String,
+    /// Only this name may use it.
+    pub name: Option<String>,
+    pub created_by: Option<String>,
+    pub expires_at: i64,
+    pub used_by: Option<String>,
+}
+
+/// Who may see and join a channel, and who may speak in it: group names.
+/// Empty means everyone (every account and guest); `*` passes every gate.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelGate {
+    pub groups: Vec<String>,
+    pub speakers: Vec<String>,
 }
 
 /// An active ban, as shown to admins. An address ban shows the name it was
@@ -531,6 +597,7 @@ mod tests {
             shares_history: true,
             account: None,
             is_moderator: false,
+            badges: vec![],
         };
         let bytes = postcard::to_allocvec(&info).unwrap();
         let decoded: UserInfo = postcard::from_bytes(&bytes).unwrap();
@@ -632,6 +699,7 @@ mod tests {
             shares_history: false,
             account: None,
             is_moderator: false,
+            badges: vec![],
         };
         let bytes = postcard::to_allocvec(&info).unwrap();
         let decoded: UserInfo = postcard::from_bytes(&bytes).unwrap();

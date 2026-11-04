@@ -40,7 +40,7 @@
     openDm,
     unreadPerChannel,
   } from "../../stores/chat.js";
-  import { ago, awayHint, liveIdOf, reach } from "../../dm-rules.js";
+  import { ago, awayHint, liveIdOf, reach, writeToId } from "../../dm-rules.js";
   import { notificationBody } from "../../chat-rules.js";
   import { uiPrefs } from "../../stores/ui-prefs.js";
   import {
@@ -274,7 +274,7 @@
            the focus on it) must stay the same one -->
       <div class="dm-list" role="group" aria-label="Direct messages">
         {#each $dmList as { convo, last } (convo.username)}
-          {@const seen = convo.user_id > 0 ? convo.user_id : liveIdOf(convo.username, $users, $channelRosters)}
+          {@const seen = writeToId(convo.user_id, liveIdOf(convo.username, $users, $channelRosters))}
           {@const r = reach(convo.user_id, seen, convo.account, !!$account?.cloud)}
           {@const who = shortName(convo.username)}
           {@const open = $activeDmUserId !== null && $activeDmUsername === convo.username}

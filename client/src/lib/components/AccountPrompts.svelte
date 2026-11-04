@@ -13,11 +13,23 @@
   import type { UnlistenFn } from "@tauri-apps/api/event";
   import { listenServer, fromServer } from "../connect.js";
   import { account, accountHex, accountPrompt, closePrompt, relayAccounts, showPrompt } from "../stores/account.js";
-  import { applyChannelEvent, applyStoredDmEvent, fileStoredDm, joinedTextChannelIds, purgeWritten } from "../stores/chat.js";
+  import { privilegeLabel } from "../scopes.js";
+  import {
+    applyChannelEvent,
+    applyStoredDmEvent,
+    fileStoredDm,
+    joinedTextChannelIds,
+    loadBrowserMarks,
+    purgeWritten,
+    releaseBrowserMarks,
+  } from "../stores/chat.js";
   import { channels, currentChannelId } from "../stores/channels.js";
   import { shareChannelHistory } from "../stores/settings.js";
+  import { channelRosters } from "../stores/rosters.js";
   import { users } from "../stores/users.js";
+  import { isWeb } from "../stores/platform.js";
   import { chatEvent, expiryFor } from "../chat-rules.js";
+  import { liveIdOf } from "../dm-rules.js";
   import { dmMessageTtl, managesChannel } from "../stores/channel-ui.js";
   import { userId } from "../stores/connection.js";
   import { addNotification } from "../stores/notifications.js";
@@ -139,6 +151,8 @@
         "account-signed-in",
         (server, d) => {
           account.of(server).set({ name: d.name, relayId: d.relay_id, info: d.info, cloud: d.prefs.cloud });
+          // Before the log is read: what was cleared must not come back with it
+          loadBrowserMarks(server, d.name);
           // The second factor a role needs is asked for by the backend once the
           // connection is listed (account.rs after_connect); its setup waits
           // behind the recovery key, which nothing replaces.
@@ -169,16 +183,16 @@
         thread?: string | null;
         file?: unknown;
         fwd?: unknown;
+        replay?: boolean;
       }>("stored-dm", (server, m) => {
         const me = get(account.peek(server));
         if (!me) return;
-        const online = get(users.peek(server)).find((u) => u.username === m.peer_name);
         fileStoredDm(
           server,
           m,
           { name: me.name, account: accountHex(me.info.id) },
           expiryFor(m.timestamp, m.ttl_secs ?? undefined, dmMessageTtl(server, m.peer_name)),
-          online?.user_id,
+          liveIdOf(m.peer_name, get(users.peek(server)), get(channelRosters.peek(server))),
         );
       }),
       // A tombstone: its writer deleted what they wrote there up to `before`.
@@ -225,6 +239,9 @@
       }),
       listenServer<{ reason: string }>("stored-not-kept", (server, d) =>
         addNotification(`${fromServer(server)}not kept on the server: ${d.reason}`, "warning"),
+      ),
+      listenServer<{ reason: string }>("stored-not-read", (server, d) =>
+        addNotification(`${fromServer(server)}kept messages could not be read: ${d.reason}`, "warning"),
       ),
       // A vault item this device will not use as the server holds it (and so
       // never saves over this session).
@@ -280,6 +297,7 @@
         const name = get(account.peek(server))?.name ?? "";
         // Nothing of it is any use here now: the remembered device, the
         // server's account id (a new account there is another one)
+        releaseBrowserMarks(server, false);
         invoke("forget_device", { server, name }).catch(() => {});
         invoke("forget_relay_id", { server }).catch(() => {});
         addNotification(`${fromServer(server)}account ${name} deleted`, "info");
@@ -299,6 +317,8 @@
         else if (prompt?.kind === "recovery-new" && prompt.server === server) keyChangedOn = server;
         break;
       case "Error":
+        // The admin panel's own (admin-ui.ts)
+        if (body.request === "Admin") break;
         if (body.request === "RecoveryKeyNew" && pendingKey?.server === server) pendingKey = null;
         if (body.request === "RecoveryKeyNew" && keyChangedOn === server) keyChangedOn = null;
         if (
@@ -469,6 +489,10 @@
     if (["totp-setup", "safety", "account", "delete", "password", "recovery-new"].includes(kind)) return () => closePrompt();
     return undefined;
   }
+
+  /** The privileges an account holds, by the names the group editor uses. */
+  const privilegeNames = (scopes: string[]) =>
+    scopes.map(privilegeLabel).join(", ");
 </script>
 
 {#if $accountPrompt}
@@ -557,8 +581,9 @@
         <h2>Keep your messages here too?</h2>
         <p class="hint">
           With a copy on {fromServer(p.server).replace(/: $/, "") || "this server"}, you can read your messages on
-          your other devices, and what people write while you are away waits for you. This device keeps them only in
-          its own chat history, if that is on; the browser keeps none between visits.
+          your other devices, and what people write while you are away waits for you. {isWeb
+            ? "A browser keeps no chat of its own: a reload brings back what has a copy here, and whoever writes a message decides whether it gets one."
+            : "This device keeps them only in its own chat history, if that is on."}
         </p>
         <p class="hint small">
           The copy is end-to-end encrypted: the server cannot read it. It does learn who wrote in which channel or
@@ -573,7 +598,7 @@
         {#if error}<div class="error" role="alert">{error}</div>{/if}
         <div class="buttons">
           <button type="button" class="secondary" onclick={() => submitCloud(p.server, false)} disabled={busy}>
-            Only on this device
+            {isWeb ? "No copies" : "Only on this device"}
           </button>
           <button type="button" class="submit-btn btn btn-primary" onclick={() => submitCloud(p.server, true)} disabled={busy}>
             Keep a copy here
@@ -583,7 +608,7 @@
         <!-- `p` follows the store: a handler reads p.server before closePrompt(). -->
         <h2>{$account.name}</h2>
         <p class="hint">
-          {$account.info.scopes.includes("*") ? "Admin" : $account.info.scopes.includes("voipc:moderate") ? "Moderator" : "Member"}
+          {$account.info.scopes.includes("*") ? "Admin" : $account.info.scopes.length ? privilegeNames($account.info.scopes) : "Member"}
           · two-factor codes {$account.info.totp_enabled ? "on" : "off"}
         </p>
         <div class="rows">
@@ -618,11 +643,13 @@
             <button
               type="button"
               class="secondary"
-              onclick={() =>
+              onclick={() => {
+                releaseBrowserMarks(p.server, false);
                 invoke("forget_device", { server: p.server, name: $account?.name ?? "" }).then(
                   () => addNotification(`${fromServer(p.server)}this device is forgotten: the password is needed next time`, "info"),
                   (e) => addNotification(String(e), "warning"),
-                )}
+                );
+              }}
             >Forget</button>
           </div>
         </div>

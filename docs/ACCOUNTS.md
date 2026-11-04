@@ -67,15 +67,68 @@ token.
   mode `admin invite` refuses to print a code without `--for`. Codes printed
   before the switch to `closed` stay valid until they expire.
 
-## Roles and two-factor codes
+## Groups, privileges and two-factor codes
 
-There are two roles: **admin** (everything) and **moderator** (kick, ban, and any
-channel's settings). Either role needs two-factor codes before its rights apply.
-On a new device, the account signs in with its password and a code; a device the
-server remembers signs in without either.
+A **group** is a set of accounts with a name, an optional badge shown next to their
+names in the member list, and the **privileges** it hands out. An account can be in
+several groups and holds what all of them hand out. Admins manage them in the app:
+server menu → *Server admin* → *Users* and *Groups*.
 
-A moderator kicks and bans people, not admins or other moderators. Listing and
-lifting bans stay with admins.
+| Privilege | Lets its holders |
+|---|---|
+| Everything (`*`) | do all of the below, and see the real names behind an anonymous channel |
+| Kick (`voipc:kick`) | kick people from the server and from any channel |
+| Ban (`voipc:ban`) | ban people they can see, by address and account |
+| Ban list (`voipc:bans`) | see the ban list, lift bans, ban an account by name |
+| Channels (`voipc:channels`) | change the settings and gates of the channels they can see; post in announcement channels and past slow mode; see hidden channels |
+| Emotes (`voipc:emotes`) | add, rename and remove the server's emotes and stickers |
+| See accounts (`users:read`) | see the account list, an account's groups and its history, and who is in a group |
+| Manage accounts (`users:admin`) | give and take groups, reset two-factor codes, make and revoke invites |
+| Manage groups (`roles:admin`) | make, change and delete groups |
+
+Two groups are built in: **admin** (everything) and **user** (every account, no
+privileges). The server also makes a **moderator** group (badge *mod*: kick, ban,
+channels) on its first start. A moderator group from before 1.7 keeps what it
+granted.
+
+- **Privileges need two-factor codes.** A group's privileges, and its badge, apply
+  once the account has set up codes. A group without privileges counts at once.
+  On a new device, an account with privileges signs in with its password and a
+  code; a device the server remembers signs in without either.
+- **Nobody hands out more than they hold.** Giving or taking a group, or editing
+  one, needs every privilege it hands out, and the account it is done to may hold
+  nothing the one doing it lacks. The last admin cannot lose *admin*.
+- **A fresh code for steps that hand out power.** Giving or taking a group with
+  privileges, making, changing or deleting a group, and resetting someone's codes
+  ask for a code from your authenticator app. It holds for ten minutes.
+- **Taking a group with privileges away signs the account out**, so the loss
+  counts at once; a remembered device signs it in again. Taking away a group
+  without privileges does not.
+- **Holders of a privilege are spared.** Only an admin kicks or bans an account
+  that holds any privilege; in a channel they made, a creator still kicks.
+- An account's history in the app lists what was done to its access, by whom and
+  when: groups, codes, passwords, devices, invites. It never shows an address.
+
+## Channel gates
+
+A channel can name the groups that may **see and join** it, and the groups that may
+**speak** there. Holders of *Channels* set them in the channel's settings; both
+empty means everyone, guests too.
+
+- Outside the first list the channel is not there: not in the list, not in a
+  member count, "does not exist" when joined, previewed or invited to. Losing the
+  group moves its members out, and takes them out of the channel's kept messages,
+  online or not.
+- Outside the second list a member listens and reads. The server drops their
+  voice, posts and screen shares there, and the app says *Listening only*.
+- Admins pass every gate. A holder of *Channels* changes only gates of channels
+  they can see, and cannot save one that shuts themselves out.
+- The gate of a channel from `channels.json` is kept in the accounts database and
+  outlasts a restart; one on a channel somebody made lasts as long as the channel.
+- A group a gate names cannot be deleted: change the channel first. Deleting it
+  would open what it closed.
+- Known limit: making a channel with the name of one you cannot see is refused as
+  "name taken", which tells you that a channel of that name exists.
 
 A ban covers the address someone connects from (an IPv4 address, or the IPv6
 /64), and with *Ban the account too* their account, from any address. Everyone
@@ -90,9 +143,10 @@ From the server's shell. Each command reads `[accounts]` from the server's own
 config, given before the command — `voipc-server -c server.toml admin invite` —
 and without it stops with "accounts are off":
 
-- `voipc-server admin grant <name> admin|moderator` gives a role, and
-  `admin revoke <name> admin|moderator` takes it away again and signs the account
-  out everywhere (the last admin keeps the role).
+- `voipc-server admin grant <name> <group>` gives a group (`admin`, `moderator` or
+  any other), and `admin revoke <name> <group>` takes it away again. A group with
+  privileges taken away signs the account out everywhere (the last admin keeps
+  *admin*).
 - `voipc-server admin reset-2fa <name>` removes an account's codes and recovery
   codes, forgets its devices and signs it out everywhere. This is how an admin who
   lost their phone gets back in.
@@ -101,9 +155,10 @@ and without it stops with "accounts are off":
   the copy.
 
 These commands are a second process next to the server. A running server checks
-every signed-in connection against the database every five minutes, so a role
+every signed-in connection against the database every five minutes, so a group
 given or taken away, codes reset or a session ended from the shell reaches
-connections that are already open within that time.
+connections that are already open within that time. What is done in the app
+counts at once.
 
 ## For members
 
@@ -136,15 +191,20 @@ connections that are already open within that time.
   the desktop the device is kept in the encrypted chat history: it signs in alone
   once that history is unlocked, and with chat history switched off only until
   the app closes. In the browser, the device key is kept under a key the browser
-  will not export. *Your account → Forget* drops it on this device.
+  will not export, and reloading a tab signs a remembered account back in by
+  itself, without voice; a new tab, or a tab you disconnected or that another
+  device took over, shows the connect dialog. *Your account → Forget* drops it on
+  this device.
 - **One device at a time.** Signing in somewhere else ends the older session; it
   does not reconnect by itself.
 - **Copies on the server** are asked about once, the first time you connect, and
   can be changed under *Your account*. On the desktop your messages are also kept
   in its encrypted archive, unless you switched that off; the browser keeps none
-  between visits, so there the server's copy is the only one. With it you can
+  between visits, so there the server's copy is the only one, and a reload reads
+  the newest 500 entries of each conversation back from it. With it you can
   read your channels on another device, and catch up on what people wrote while
-  you were away. It works
+  you were away; somebody online gets a direct message kept for them at once. It
+  works
   in channels from the server's `channels.json` and in direct messages. Temporary
   channels, and channels that are anonymous or hide their members, keep nothing.
 - **People who join later.** What you kept in a channel before somebody joined is
@@ -196,7 +256,7 @@ From accounts:
 - identity public keys
 - the public keys of remembered devices
 - two-factor secrets, sealed by the key file
-- roles
+- groups, what they hand out, and which groups each gated channel names
 - sign-in records with hashed IP addresses
 - each account's vault, which it cannot open without guessing the password: each
   guess costs 600,000 PBKDF2-SHA256 rounds, so a long password used nowhere else
@@ -270,9 +330,16 @@ in [THREAT-MODEL.md](THREAT-MODEL.md)):
 
 ## Not in this version
 
-- An admin dialog in the app. Roles, invites and two-factor resets are on the
-  command line for now.
 - Starting a direct conversation with an account that has not been online since
   you connected.
 - Keeping chat in the browser between visits. The browser keeps the server's copies
-  only; the desktop app keeps its own encrypted archive.
+  only; the desktop app keeps its own encrypted archive. So after a reload the
+  browser shows only what has a copy: whoever writes a message decides that, so
+  messages from a guest, or from somebody with copies off, are gone. It also
+  forgets what you had not opened yet (a read conversation and an unread one look
+  the same), and a pin by a manager who is away.
+- A kept copy of a direct message you write from an anonymous channel: the copy
+  carries your account and the message your pseudonym, so nothing is kept there,
+  edits and deletions included, and the app says so. A key for that conversation
+  may still be filed the first time, which a modified client of the other party
+  could notice; the same user id on another roster tells them as much.

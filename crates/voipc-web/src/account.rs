@@ -356,6 +356,11 @@ impl AccountSession {
         actions(self.session.after_connect())
     }
 
+    /// Every couple of seconds while connected: reads refused for now go on.
+    pub fn tick(&mut self) -> Result<JsValue, JsError> {
+        actions(self.session.tick())
+    }
+
     /// A decoded `AccountReply`.
     #[wasm_bindgen(js_name = onReply)]
     pub fn on_reply(&mut self, reply: JsValue) -> Result<JsValue, JsError> {
@@ -363,7 +368,7 @@ impl AccountSession {
         actions(self.session.on_reply(&reply))
     }
 
-    /// The `users` of a `UserList` or `UserJoined`, for the pins.
+    /// The `users` of a `UserList`, `UserJoined` or `ChannelUsers`, for the pins.
     #[wasm_bindgen(js_name = noteRoster)]
     pub fn note_roster(&mut self, users: JsValue) -> Result<JsValue, JsError> {
         let users: Vec<UserInfo> = serde_wasm_bindgen::from_value(users)?;
