@@ -50,6 +50,8 @@ async function stop(code) {
   }
   process.exit(code);
 }
+// How test-web.sh stops a lane it runs side by side: the relay and browsers go with it.
+process.on("SIGTERM", () => stop(1));
 
 // ── The relay ─────────────────────────────────────────────────────────────
 

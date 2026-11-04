@@ -48,6 +48,8 @@ async function stop(code) {
   }
   process.exit(code);
 }
+// How test-web.sh stops a lane it runs side by side: the relay and browsers go with it.
+process.on("SIGTERM", () => stop(1));
 
 // ── A picture, written here so the lane needs no file of its own ──────────
 
@@ -270,7 +272,8 @@ async function throughProvider(tab, cdpPort) {
   await page.send("Page.navigate", { url: `${ORIGIN}/account/oauth/discord/cb?state=${state}&code=abc` });
   await waitFor(page, `document.querySelector("button[name=pick]")`);
   await page.evaluate(`document.querySelector('button[name=pick][value="${code}"]').click()`);
-  await waitFor(page, `document.body.innerText.includes("go back to the app")`);
+  // body?: the submit is navigating, and a document starts with none
+  await waitFor(page, `document.body?.innerText.includes("go back to the app")`);
   await page.send("Page.close").catch(() => {});
 }
 

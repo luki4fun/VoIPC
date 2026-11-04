@@ -42,6 +42,8 @@ async function stop(code) {
   }
   process.exit(code);
 }
+// How test-web.sh stops a lane it runs side by side: the relay and browsers go with it.
+process.on("SIGTERM", () => stop(1));
 
 // ── The stand-in provider ─────────────────────────────────────────────────
 
@@ -210,7 +212,8 @@ async function throughProvider(tab, cdpPort) {
   const choices = await page.evaluate(`[...document.querySelectorAll("button[name=pick]")].map((b) => b.value)`);
   // A real submit: this is what the page's own policy has to allow
   await page.evaluate(`document.querySelector('button[name=pick][value="${code}"]').click()`);
-  await waitFor(page, `document.body.innerText.includes("go back to the app")`);
+  // body?: the submit is navigating, and a document starts with none
+  await waitFor(page, `document.body?.innerText.includes("go back to the app")`);
   await page.send("Page.close").catch(() => {});
   return { code, opened, choices };
 }
