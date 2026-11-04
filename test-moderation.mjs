@@ -842,6 +842,9 @@ async function lane() {
   await ivy.evaluate(`document.querySelector(".back-btn")?.click(); 0`);
   await openRoom(ivy, "lobby-chat");
   check("back in the channel, held again", await seen(ivy, heldFooter), await pageText(ivy));
+  // The bin is there only with something to clear, and nothing above promises her a row here
+  await say(bob, "something for the bin");
+  await waitFor(ivy, `[...document.querySelectorAll(".msg")].some((m) => m.textContent.includes("something for the bin"))`, 60_000);
   await openClearMenu(ivy);
   check("where she cannot, it does not", await ivy.evaluate(`!${purgeItem}`), await pageText(ivy));
   check("and says why", await ivy.evaluate(`document.querySelector(".clear-held")?.textContent.includes("until you can write here again")`), await pageText(ivy));
