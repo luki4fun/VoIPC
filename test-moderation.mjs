@@ -198,11 +198,19 @@ const totpAt = (b32, step) => {
   return String((h.readUInt32BE(o) & 0x7fffffff) % 1_000_000).padStart(6, "0");
 };
 
+/** The relay's page up. A browser just started on a busy runner can leave its first page blank. */
+async function reachDialog(tab) {
+  const shown = `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`;
+  await tab.send("Page.navigate", { url: `${ORIGIN}/` });
+  if (await waitFor(tab, shown).then(() => true, () => false)) return;
+  await tab.send("Page.navigate", { url: `${ORIGIN}/` });
+  await waitFor(tab, shown, 60_000);
+}
+
 /** The connect dialog on the relay's own page, its Account tab open. */
 async function openDialog(cdpPort) {
   const tab = await newTab(cdpPort);
-  await tab.send("Page.navigate", { url: `${ORIGIN}/` });
-  await waitFor(tab, `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`);
+  await reachDialog(tab);
   if (await tab.evaluate(`!!document.querySelector(".skip-link")`)) {
     await tab.evaluate(`document.querySelector(".skip-link").click()`);
     await waitFor(tab, `document.querySelector(".connect-btn")`);
@@ -216,8 +224,7 @@ async function openDialog(cdpPort) {
 
 /** The connect dialog on the relay's own page, as a guest. */
 async function connectGuest(tab, name) {
-  await tab.send("Page.navigate", { url: `${ORIGIN}/` });
-  await waitFor(tab, `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`);
+  await reachDialog(tab);
   if (await tab.evaluate(`!!document.querySelector(".skip-link")`)) {
     await tab.evaluate(`document.querySelector(".skip-link").click()`);
     await waitFor(tab, `document.querySelector(".connect-btn")`);
@@ -266,8 +273,7 @@ async function createAccount(tab, name) {
  *  longer has the server open, so a reload does not bring it back. `secret`: a code, for
  *  an account whose privileges ask for one. */
 async function signIn(tab, name, secret) {
-  await tab.send("Page.navigate", { url: `${ORIGIN}/` });
-  await waitFor(tab, `document.querySelector(".skip-link") || document.querySelector(".connect-btn")`);
+  await reachDialog(tab);
   if (await tab.evaluate(`!!document.querySelector(".skip-link")`)) {
     await tab.evaluate(`document.querySelector(".skip-link").click()`);
     await waitFor(tab, `document.querySelector(".connect-btn")`);
