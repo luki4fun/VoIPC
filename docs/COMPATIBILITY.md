@@ -14,13 +14,14 @@ nobody checks, so a new one comes with its test.
 - A relay admits a client exactly when their `PROTOCOL_VERSION` is equal (12 in 1.0, 13 in
   1.3, 14 in 1.4, 15 in 1.5, 16 in 1.7, 17 in 1.8). The app version is informational only.
 - **Since 1.6, an app talks to relays from its own protocol down to `OLDEST_RELAY_PROTOCOL`**
-  (`crates/voipc-protocol/src/compat.rs`; 12 in 1.6 and 1.7), never fewer than three protocols back.
+  (`crates/voipc-protocol/src/compat.rs`; 12 in 1.6 to 1.8), never fewer than three protocols back.
   It asks with its own; a relay of an older protocol refuses with its own (below), and the app
   connects again speaking that one. It shows a banner there, and holds back what that relay's
   other apps could not read:
 
-  | Relay | What a 1.7 app does not offer there |
+  | Relay | What a 1.8 app does not offer there |
   |---|---|
+  | 1.7 (16) | sign-in with a provider, linking one, and approving a new device from another |
   | 1.5, 1.6 (15) | users, groups, privileges and channel gates in the admin panel (and below); group badges are not shown |
   | 1.4 (14) | moving emotes between packs; its emote tokens use 1.4's 20 hex digits |
   | 1.3 (13) | emotes and stickers |
@@ -57,7 +58,7 @@ out of servers that have not upgraded yet.
 - Any change with the same `PROTOCOL_VERSION` fails it.
 - `compat.rs`'s tests fail when a message's layout at an older protocol differs from today's
   and `RESHAPED` does not name it, and when an old shape there differs from its golden file.
-- The nightly `old-relays` job runs the released 1.0, 1.3, 1.4 and 1.6 relays and speaks to each
+- The nightly `old-relays` job runs the released 1.0, 1.3, 1.4, 1.6 and 1.7 relays and speaks to each
   in its own protocol (`voice_load`).
 
 ## 2. Game SDK (`docs/SDK.md`)

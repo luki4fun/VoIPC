@@ -7719,7 +7719,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voipc-audio"
-version = "1.7.0-rc.1"
+version = "1.8.0-rc.1"
 dependencies = [
  "anyhow",
  "audiopus",
@@ -7738,7 +7738,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-client"
-version = "1.7.0-rc.1"
+version = "1.8.0-rc.1"
 dependencies = [
  "anyhow",
  "ashpd 0.9.3",
@@ -7786,7 +7786,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-crypto"
-version = "1.7.0-rc.1"
+version = "1.8.0-rc.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7810,7 +7810,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-media"
-version = "1.7.0-rc.1"
+version = "1.8.0-rc.1"
 dependencies = [
  "gif",
  "image-webp",
@@ -7822,7 +7822,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-protocol"
-version = "1.7.0-rc.1"
+version = "1.8.0-rc.1"
 dependencies = [
  "bytes",
  "postcard",
@@ -7835,7 +7835,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-server"
-version = "1.7.0-rc.1"
+version = "1.8.0-rc.1"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -7876,7 +7876,7 @@ dependencies = [
 
 [[package]]
 name = "voipc-video"
-version = "1.7.0-rc.1"
+version = "1.8.0-rc.1"
 dependencies = [
  "anyhow",
  "ffmpeg-next",

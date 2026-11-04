@@ -42,6 +42,15 @@ const SHIPPED: &[(&str, &str)] = &[
         "postgres/0004_bans.sql",
         "60ddf372ad42d9f40c2f7ea58f1294ad147c77db1a500873f08ad01b3908e473",
     ),
+    // 1.7.0
+    (
+        "sqlite/0005_gates.sql",
+        "94b7d20cbed162ccb6c1de186ca4a4feecc54d4bbb03373653ef45ad23a5b757",
+    ),
+    (
+        "postgres/0005_gates.sql",
+        "94b7d20cbed162ccb6c1de186ca4a4feecc54d4bbb03373653ef45ad23a5b757",
+    ),
 ];
 
 #[test]

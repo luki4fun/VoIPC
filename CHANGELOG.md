@@ -2,9 +2,10 @@
 
 All notable changes to VoIPC are documented here.
 
-## [Unreleased]
+## [1.8.0] - release candidate
 
-Protocol 17. Needs l4f-accounts v0.12.0.
+Protocol 17. A 1.8 app still talks to relays back to 1.0 (protocol 12); there it offers no sign-in with a
+provider. Needs l4f-accounts v0.12.0.
 
 ### Added
 - **Sign in with Discord, Google or Facebook**, on a relay with a web address and a public certificate
