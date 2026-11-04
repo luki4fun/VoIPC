@@ -152,7 +152,7 @@ function accountArgs(raw: unknown): AccountArgs | undefined {
     case "reset":
       return { kind: "reset", recovery: str(a.recovery, "recovery"), password: str(a.password, "password") };
     case "provider":
-      return { kind: "provider", ticket: a.ticket as number[] };
+      return { kind: "provider", ticket: a.ticket as number[], invite: optStr(a.invite, "invite") };
     default:
       fail("unknown account sign-in");
   }

@@ -23,16 +23,21 @@
 
   const blank = (): GroupInfo => ({ name: "", description: "", badge: "", scopes: [], builtin: false });
 
-  /** The form's colour, and what it was when opened: sent only if it changed. */
+  /** The form's colour and section, and what they were when opened: sent only if
+   *  one changed. */
   let color = $state<number | null>(null);
+  let section = $state(true);
   let colorBefore: number | null = null;
+  let sectionBefore = true;
   /** Sent once the group is saved, not with it: a code may be asked for between,
    *  and what a code is asked for is the step sent last. */
-  let colorToSend: { name: string; color: number | null } | null = null;
+  let colorToSend: { name: string; color: number | null; section: boolean } | null = null;
 
   function edit(g: GroupInfo) {
     editing = { create: false, group: { ...g, scopes: [...g.scopes] } };
-    colorBefore = color = $groupStyles.find((s) => s.badge === g.badge)?.color ?? null;
+    const style = $groupStyles.find((s) => s.badge === g.badge);
+    colorBefore = color = style?.color ?? null;
+    sectionBefore = section = style?.section ?? true;
     void adminOp({ GroupMembers: { name: g.name, offset: 0 } });
   }
 
@@ -49,7 +54,10 @@
     if (!editing) return;
     saving = true;
     // As the relay will keep the name: `Crew` is stored as `crew`
-    colorToSend = color !== colorBefore ? { name: editing.group.name.trim().toLowerCase(), color } : null;
+    colorToSend =
+      color !== colorBefore || section !== sectionBefore
+        ? { name: editing.group.name.trim().toLowerCase(), color, section }
+        : null;
     void adminOp({ GroupSave: { create: editing.create, group: editing.group } });
   }
 
@@ -63,6 +71,7 @@
 
   function startNew() {
     colorBefore = color = null;
+    sectionBefore = section = true;
     editing = { create: true, group: blank() };
   }
 
@@ -153,7 +162,7 @@
       <label class="field">
         Badge
         <input class="admin-input" aria-label="Badge" bind:value={g.badge} maxlength="32" disabled={!mayEdit} placeholder="None" />
-        <span class="admin-hint">Next to members' names, and over their section in the member list. Anyone on this server can read it, guests too.</span>
+        <span class="admin-hint">Next to members' names. Anyone on this server can read it, guests too.</span>
       </label>
       <label class="field">
         Description
@@ -180,6 +189,13 @@
           <span class="admin-hint">None: the theme's own</span>
         {/if}
       </div>
+      <label class="check-row">
+        <input type="checkbox" aria-label="Own section in the member list" disabled={!mayEdit} bind:checked={section} />
+        <span class="check-text">
+          <span>Own section in the member list</span>
+          <span class="check-hint">Off, its people stay with everybody else, and only wear the badge.</span>
+        </span>
+      </label>
     {/if}
     <div class="section">
       <div class="section-title">Privileges</div>

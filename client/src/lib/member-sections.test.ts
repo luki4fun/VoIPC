@@ -4,9 +4,9 @@ import { test } from "node:test";
 import { badgeStyle, badgesInOrder, colorOf, hexOf, sectionsOf } from "./member-sections.ts";
 
 const styles = [
-  { badge: "Lead", color: 0xff8800 },
-  { badge: "Crew", color: null },
-  { badge: "Online", color: null },
+  { badge: "Lead", color: 0xff8800, section: true },
+  { badge: "Crew", color: null, section: true },
+  { badge: "Online", color: null, section: true },
 ];
 const m = (name: string, ...badges: string[]) => ({ name, badges });
 const names = (s: { members: { name: string }[] }) => s.members.map((x) => x.name);
@@ -67,4 +67,21 @@ test("a badge with no colour keeps the theme's look, one with a colour its reada
   assert.equal(badgeStyle("Crew", styles), "");
   assert.equal(badgeStyle("Ghost", styles), "");
   assert.match(badgeStyle("Lead", styles), /^background: #ff8800; color: #[0-9a-f]{6};$/);
+});
+
+test("a group whose section is turned off keeps its badge, and its people stand with the next", () => {
+  const off = [
+    { badge: "Lead", color: 0xff8800, section: false },
+    { badge: "Crew", color: null, section: true },
+  ];
+  const out = sectionsOf([m("a", "Lead"), m("b", "Lead", "Crew"), m("c")], off, "In voice");
+  assert.deepEqual(
+    out.map((s) => [s.label, names(s)]),
+    [
+      ["Crew", ["b"]],
+      ["In voice", ["a", "c"]],
+    ],
+  );
+  assert.deepEqual(badgesInOrder(["Crew", "Lead"], off), ["Lead", "Crew"], "the order of badges stays");
+  assert.match(badgeStyle("Lead", off), /#ff8800/, "and its colour");
 });

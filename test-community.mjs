@@ -2,10 +2,11 @@
 // Community basics (1.9), in real browsers against a real relay: what a server
 // calls itself, a channel made in the app, a group's colour and section, a display
 // name beside the `@name`, a picture that only ever reaches the page sanitized,
-// `@everyone` from someone allowed and from someone not, and an invite link.
+// `@everyone` from someone allowed and from someone not, an invite link, by password
+// and through a provider (a stand-in on a local port), and a group's section turned off.
 // (session_tests.rs has the rules; what only a browser shows is here.)
 //
-//   npm run web
+//   VOIPC_SELFTEST=1 npm run web      # a release relay has no stand-in provider
 //   node test-community.mjs [port]
 //   COMMUNITY_DATABASE=postgres://... node test-community.mjs [port]   # another database
 //
@@ -14,6 +15,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { createHmac } from "node:crypto";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -36,6 +38,7 @@ function check(what, ok, detail = "") {
 }
 
 async function stop(code) {
+  provider.close();
   for (const c of children) c.kill("SIGKILL");
   await sleep(1000);
   try {
@@ -85,6 +88,22 @@ function png(side, [r, g, b]) {
 const picture = join(WORK, "me.png");
 writeFileSync(picture, png(300, [30, 200, 90]));
 
+// ── The stand-in provider ─────────────────────────────────────────────────
+
+const provider = createServer((req, res) => {
+  req.resume();
+  req.on("end", () => {
+    res.setHeader("content-type", "application/json");
+    res.end(
+      req.method === "POST"
+        ? JSON.stringify({ access_token: "at", token_type: "Bearer" })
+        : JSON.stringify({ id: "424242", username: "dee_d", global_name: "Dee D" }),
+    );
+  });
+});
+await new Promise((r) => provider.listen(0, "127.0.0.1", r));
+const providerBase = `http://127.0.0.1:${provider.address().port}`;
+
 // ── The relay ─────────────────────────────────────────────────────────────
 
 spawnSync(
@@ -104,6 +123,7 @@ key_path = "server.key"
 [accounts]
 mode = "optional"
 registration = "open"
+public_url = "${ORIGIN}"
 ${process.env.COMMUNITY_DATABASE ? `database = "${process.env.COMMUNITY_DATABASE}"` : ""}
 `,
 );
@@ -111,7 +131,16 @@ writeFileSync(join(WORK, "channels.json"), JSON.stringify([{ name: "lobby-chat",
 const relay = spawn(
   join(ROOT, "target/release/voipc-server"),
   ["-c", "server.toml", "--admin-token", TOKEN, "--channels", "channels.json"],
-  { cwd: WORK, stdio: ["ignore", "ignore", "inherit"] },
+  {
+    cwd: WORK,
+    env: {
+      ...process.env,
+      VOIPC_OAUTH_DISCORD_ID: "client",
+      VOIPC_OAUTH_DISCORD_SECRET: "secret",
+      VOIPC_OAUTH_TEST_BASE: providerBase,
+    },
+    stdio: ["ignore", "ignore", "inherit"],
+  },
 );
 children.push(relay);
 await sleep(1500);
@@ -219,11 +248,30 @@ async function openDialog(cdpPort, fragment = "") {
     await tab.evaluate(`document.querySelector(".skip-link").click()`);
     await waitFor(tab, `document.querySelector(".connect-btn")`);
   }
+  await tab.evaluate(`window.open = (url) => { window.__opened = url; return null; }; 0`);
   await tab.evaluate(setInput('input[placeholder="localhost"]', "127.0.0.1"));
   await tab.evaluate(setInput('input[placeholder="9987"]', String(PORT)));
   if (!fragment) await tab.evaluate(`document.querySelector(".mode-switch button:nth-child(2)").click()`);
   await waitFor(tab, `document.querySelector("#account-name")`);
   return tab;
+}
+
+/** A click on Continue, the code, the provider's page in a tab of its own, and the
+ *  tap on the code there. */
+async function throughProvider(tab, cdpPort) {
+  await waitFor(tab, `document.querySelector(".connect-provider")`);
+  await tab.evaluate(`${byText(".connect-provider", "Continue with Discord")}.click()`);
+  await waitFor(tab, `document.querySelector(".provider-code")`);
+  const code = await tab.evaluate(`document.querySelector(".provider-code").textContent.trim()`);
+  await tab.evaluate(`${byText(".connect-provider", "Open Discord")}.click()`);
+  await waitFor(tab, `window.__opened`);
+  const state = new URL(await tab.evaluate(`window.__opened`)).searchParams.get("state");
+  const page = await newTab(cdpPort);
+  await page.send("Page.navigate", { url: `${ORIGIN}/account/oauth/discord/cb?state=${state}&code=abc` });
+  await waitFor(page, `document.querySelector("button[name=pick]")`);
+  await page.evaluate(`document.querySelector('button[name=pick][value="${code}"]').click()`);
+  await waitFor(page, `document.body.innerText.includes("go back to the app")`);
+  await page.send("Page.close").catch(() => {});
 }
 
 /** What a first connect asks after the sign-in: answered. */
@@ -303,7 +351,12 @@ const lastMessage = (text) => `[...document.querySelectorAll(".msg")].reverse().
 // ── The lane ──────────────────────────────────────────────────────────────
 
 async function lane() {
-  const [one, two, three] = await Promise.all([browser(PORT + 100), browser(PORT + 101), browser(PORT + 102)]);
+  const [one, two, three, four] = await Promise.all([
+    browser(PORT + 100),
+    browser(PORT + 101),
+    browser(PORT + 102),
+    browser(PORT + 103),
+  ]);
 
   // An admin: an account with codes on, and the token.
   const ann = await openDialog(one);
@@ -526,7 +579,39 @@ async function lane() {
     check("on the Channels tab", await seen(cat, `document.querySelector('.admin-dialog input[aria-label="Channel name"]')`, 8_000), await cat.evaluate(`document.querySelector(".admin-dialog")?.innerText.slice(0, 300) ?? ""`));
   }
 
-  for (const [who, tab] of [["annika", ann], ["bobby", bob], ["cathy", cat]]) {
+  // The same link through a provider: the buttons are there beside its code
+  const dee = await openDialog(four, new URL(link).hash);
+  await throughProvider(dee, four);
+  await waitFor(dee, `document.querySelector('${dialogOf("provider-name")}')`);
+  await dee.evaluate(setInput("#acct-provider-name", "deedee"));
+  await dee.evaluate(`document.querySelector('${dialogOf("provider-name")} .submit-btn').click()`);
+  await waitFor(dee, `document.querySelector('${dialogOf("provider-choice")}')`, 60_000);
+  await dee.evaluate(`document.querySelector('${dialogOf("provider-choice")} .submit-btn').click()`);
+  await waitFor(dee, `document.querySelector('${dialogOf("provider-choice")}')?.innerText.includes("used this account before")`);
+  await dee.evaluate(`document.querySelector('${dialogOf("provider-choice")} .submit-btn').click()`);
+  await waitFor(dee, `document.querySelector('${dialogOf("recovery")}')`);
+  await dee.evaluate(`document.querySelector('${dialogOf("recovery")} .submit-btn').click()`);
+  await settle(dee);
+  await openChat(dee, "lobby-chat");
+  const deeRow = `[...document.querySelectorAll(".user-list.modern .user")].find((u) => u.textContent.includes("deedee"))`;
+  check("through a provider, a link starts in its group too", await seen(dee, `${deeRow}?.textContent.includes("Crew")`), await dee.evaluate(`document.querySelector(".user-list.modern")?.innerText ?? ""`));
+
+  // A group's section turned off: the badge stays, the heading goes
+  const crewHeading = `[...document.querySelectorAll(".user-list.modern .group-label")].some((l) => l.textContent.startsWith("Crew"))`;
+  check("before, its people stand under it", await seen(dee, crewHeading));
+  await tabTo("Groups");
+  const crewRow = `[...document.querySelectorAll(".admin-dialog .list-row")].find((r) => r.querySelector(".row-name")?.textContent.trim().startsWith("crew"))`;
+  await waitFor(ann, crewRow);
+  await ann.evaluate(`${crewRow}.click()`);
+  const sectionBox = `document.querySelector('.admin-dialog input[aria-label="Own section in the member list"]')`;
+  await waitFor(ann, sectionBox);
+  await ann.evaluate(`${sectionBox}.click()`);
+  await ann.evaluate(`document.querySelector('.group-form button[type="submit"]').click()`);
+  await stepUp();
+  check("turned off, the heading goes", await seen(dee, `!(${crewHeading})`), await dee.evaluate(`document.querySelector(".user-list.modern")?.innerText ?? ""`));
+  check("and the badge stays", await dee.evaluate(`!!${deeRow}?.textContent.includes("Crew")`));
+
+  for (const [who, tab] of [["annika", ann], ["bobby", bob], ["cathy", cat], ["deedee", dee]]) {
     check(`no page error on ${who}'s side`, tab.errors.length === 0, tab.errors.join(" | ").slice(0, 400));
   }
 }

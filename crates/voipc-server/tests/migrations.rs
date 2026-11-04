@@ -51,6 +51,23 @@ const SHIPPED: &[(&str, &str)] = &[
         "postgres/0005_gates.sql",
         "94b7d20cbed162ccb6c1de186ca4a4feecc54d4bbb03373653ef45ad23a5b757",
     ),
+    // 1.9.0
+    (
+        "sqlite/0006_community.sql",
+        "29e8ee4b9e7f029a632c08e93318854ffb78255807a01120257dd6d0b903ecd3",
+    ),
+    (
+        "sqlite/0007_group_sections.sql",
+        "7e5391a0b6929eb8f6251c4c0008702793d0e77dd18a8171dd80a7db2f58fdfc",
+    ),
+    (
+        "postgres/0006_community.sql",
+        "4e9424aaddbf094a19e6afdeb77d6d9566fcb1de525027e58a5df2a409feee28",
+    ),
+    (
+        "postgres/0007_group_sections.sql",
+        "bfd8bf320d9d9381bbb06ba0a794d683e6e4ebd0e618d56f200926c7f8584beb",
+    ),
 ];
 
 #[test]

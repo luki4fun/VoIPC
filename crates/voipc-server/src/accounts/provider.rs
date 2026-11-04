@@ -50,6 +50,7 @@ use super::{
     next, refused, second_factor, step, unexpected, vault_item_ok, Relay, SignedIn, BUSY,
     RESET_KEY_LEN, SLOT_RESET, STEP_WAIT, VAULT_MAX_ITEMS, VAULT_NS, VAULT_TOTAL_BYTES,
 };
+use super::links;
 use crate::state::{RateLimiter, ServerState};
 
 /// Where a provider sends the browser back (l4f's own path) and where the
@@ -67,6 +68,8 @@ const CHOICE_WAIT: Duration = Duration::from_secs(300);
 const PAIR_WAIT: Duration = Duration::from_secs(120);
 /// What the app takes for "not yet" (`AuthStep::ProviderPending` says it first).
 pub const NOT_YET: &str = "Not finished in the browser yet.";
+const NO_ACCOUNT: &str =
+    "No account here uses that sign-in. Make one with an invite, or sign in another way and link it in your account panel.";
 const ENDED: &str = "That sign-in has ended. Start again in the app.";
 
 fn kind_of(k: ProviderKind) -> Kind {
@@ -129,6 +132,8 @@ enum Purpose {
 enum Outcome {
     Signed(LoginStep),
     Signup { cookie: String },
+    /// Sign-up is closed: only with an invite (`resume`).
+    NoAccount { cookie: String },
     Failed(String),
 }
 
@@ -470,6 +475,7 @@ pub async fn confirm(state: &Arc<ServerState>, body: &[u8], ip: IpAddr) -> Respo
             let outcome = match outcome {
                 Ok((SocialOutcome::Signed(step), _)) => Outcome::Signed(step),
                 Ok((SocialOutcome::Signup { cookie }, _)) => Outcome::Signup { cookie },
+                Ok((SocialOutcome::NoAccount { cookie }, _)) => Outcome::NoAccount { cookie },
                 Ok(_) => Outcome::Failed("unexpected sign-in step".into()),
                 Err(e) => Outcome::Failed(e.message().to_string()),
             };
@@ -599,6 +605,7 @@ pub(super) async fn resume<S: AsyncRead + AsyncWrite + Unpin>(
     stream: &mut S,
     buf: &mut BytesMut,
     ticket: &[u8],
+    invite: Option<&str>,
     ctx: &l4f_accounts::service::Ctx,
     ip: IpAddr,
     answers: &mut u32,
@@ -625,7 +632,19 @@ pub(super) async fn resume<S: AsyncRead + AsyncWrite + Unpin>(
             second_factor(relay, stream, buf, ctx, pending, answers, ip).await?
         }
         Stage::Done(Outcome::Signup { cookie }) => {
-            signup(relay, stream, buf, ctx, &cookie, answers, ip).await?
+            // A link that ran out is no reason to turn someone away where anyone
+            // may sign up: they only do not get what it would have given
+            let invite = usable_invite(relay, invite).await;
+            signup(relay, stream, buf, ctx, &cookie, invite, answers, ip).await?
+        }
+        Stage::Done(Outcome::NoAccount { cookie }) => {
+            let Some(invite) = invite else {
+                return Err(NO_ACCOUNT.into());
+            };
+            if links::is_link_code(invite) && !relay.link_usable(invite).await.unwrap_or(false) {
+                return Err(links::GONE.into());
+            }
+            signup(relay, stream, buf, ctx, &cookie, Some(invite), answers, ip).await?
         }
         Stage::Done(Outcome::Failed(reason)) => return Err(reason),
         _ => return Err(ENDED.into()),
@@ -638,13 +657,24 @@ pub(super) async fn resume<S: AsyncRead + AsyncWrite + Unpin>(
     r
 }
 
-/// The provider knows this person and nobody here does, and sign-up is open.
+async fn usable_invite<'a>(relay: &Relay, invite: Option<&'a str>) -> Option<&'a str> {
+    let invite = invite?;
+    if links::is_link_code(invite) && !relay.link_usable(invite).await.unwrap_or(false) {
+        return None;
+    }
+    Some(invite)
+}
+
+/// The provider knows this person and nobody here does, and sign-up is open or they
+/// hold an invite: a link, or a code an admin made.
+#[allow(clippy::too_many_arguments)]
 async fn signup<S: AsyncRead + AsyncWrite + Unpin>(
     relay: &Relay,
     stream: &mut S,
     buf: &mut BytesMut,
     ctx: &l4f_accounts::service::Ctx,
     cookie: &str,
+    invite: Option<&str>,
     answers: &mut u32,
     ip: IpAddr,
 ) -> Result<NewSession, String> {
@@ -688,7 +718,25 @@ async fn signup<S: AsyncRead + AsyncWrite + Unpin>(
             ..Default::default()
         };
         let _work = relay.pending_slot(ip).ok_or_else(|| BUSY.to_string())?;
-        match relay.accounts.oauth_signup(ctx, cookie, &name, proof).await {
+        if let Some(code) = invite.filter(|c| links::is_link_code(c)) {
+            let how = links::How::Provider(cookie);
+            match links::register(relay, ctx, code, &name, how, &altcha, &ts).await {
+                Ok(session) => return Ok(session),
+                Err(links::Refused::Name(text)) => problem = text,
+                Err(links::Refused::End(text)) => return Err(text),
+            }
+            continue;
+        }
+        let made = match invite {
+            Some(code) => {
+                relay
+                    .accounts
+                    .oauth_signup_invite(ctx, cookie, code, &name)
+                    .await
+            }
+            None => relay.accounts.oauth_signup(ctx, cookie, &name, proof).await,
+        };
+        match made {
             Ok(session) => return Ok(session),
             Err(
                 e @ (l4f_accounts::service::Error::UsernameTaken

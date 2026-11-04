@@ -193,7 +193,11 @@ pub(super) async fn handle(
             crate::layout::send_styles_all(state).await;
             Ok(groups_reply(relay, actor).await)
         }
-        AdminOp::GroupStyle { name, color } => {
+        AdminOp::GroupStyle {
+            name,
+            color,
+            section,
+        } => {
             if !scope::covers(&scopes, &["roles:admin".to_string()]) {
                 return Ok(refused("Admin", "You may not change groups."));
             }
@@ -212,7 +216,7 @@ pub(super) async fn handle(
             if !scope::covers(&scopes, &role.scopes) {
                 return Ok(refused("Admin", "You may not change that group."));
             }
-            relay.group_color_put(role.id, color).await?;
+            relay.group_style_put(role.id, color, section).await?;
             crate::layout::send_styles_all(state).await;
             Ok(groups_reply(relay, actor).await)
         }

@@ -189,7 +189,7 @@
       username: "",
       acceptSelfSigned: selfSigned,
       remember,
-      account: { mode: "provider", ticket: wait.ticket },
+      account: { mode: "provider", ticket: wait.ticket, invite: signupInvite.trim() || null },
     });
     connecting = false;
     if (result.ok) {
@@ -569,7 +569,7 @@
           <button type="button" class="connect-provider" onclick={() => providerWait && invoke("account_open_page", { url: providerWait.url }).catch((e) => (error = String(e)))}>Open {providerWait.provider}</button>
           <button type="button" class="link-btn" onclick={() => (providerWait = null)}>Cancel</button>
         </div>
-      {:else if providers.length && accountAction === "signin"}
+      {:else if providers.length && (accountAction === "signin" || signupInvite.trim())}
         <div class="providers">
           {#each providers as provider (provider)}
             <button type="button" class="connect-provider" onclick={() => startProvider(provider)} disabled={connecting}>Continue with {provider}</button>

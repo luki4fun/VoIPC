@@ -18,7 +18,7 @@ export type AccountArgs =
   | { kind: "register"; password: string; invite?: string | null }
   | { kind: "device" }
   | { kind: "reset"; recovery: string; password: string }
-  | { kind: "provider"; ticket: number[] };
+  | { kind: "provider"; ticket: number[]; invite?: string | null };
 
 /** What a sign-in through a provider asks the person (account.rs `ProviderAnswer`). */
 export type ProviderAnswer =

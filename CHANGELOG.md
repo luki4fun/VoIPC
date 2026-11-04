@@ -12,7 +12,7 @@ other apps could not read.
   holding `voipc:channels`, on a relay with accounts. Those from `channels.json` stay the file's, and can be placed
   and ordered too. A **welcome channel** opens the first time someone comes to a server.
 - **A group's colour and place**: its badge in that colour, and the member list sections people by their top group.
-  Nobody climbs over a group they could not have made.
+  Nobody climbs over a group they could not have made. A group's section can be turned off.
 - **Display names and profile pictures**, shown beside the `@name` and never instead of it. A name cannot pass for
   another account's. Other people's pictures reach the screen only through the picture sanitizer, like any file.
   `voipc:profiles` clears those of someone holding no more than its holder.
@@ -20,8 +20,8 @@ other apps could not read.
   `server_description` in `server_settings.json`, without accounts). Always shown above the address, and never kept
   in a bookmark.
 - **Invite links**: one link for many people, with a limit, an expiry and a starting group, on a relay of any sign-up
-  mode but `closed`. Each sign-up still solves the proof of work. Password sign-up only so far: someone new signing
-  in with a provider gets no starting group, and an invite-only relay offers them no sign-up yet.
+  mode but `closed`. Each sign-up still solves the proof of work. It works with a password or through a provider, and
+  an admin's invite code now works through a provider too, also on an invite-only relay.
 - **`@everyone`, `@here` and `@&badge`**, from members holding `voipc:mention_all`. Every client decides for itself
   and only for a message arriving live: nothing rings later for what happened while away, and a stored copy or
   history handed over never has that power.

@@ -305,7 +305,7 @@ export async function connectTo(
         acceptInvalidCerts: selfSigned,
         account: account
           ? account.mode === "provider"
-            ? { kind: "provider", ticket: account.ticket ?? [] }
+            ? { kind: "provider", ticket: account.ticket ?? [], invite: account.invite ?? null }
             : { kind: account.mode, password: account.password ?? "", invite: account.invite ?? null, recovery: account.recovery ?? null }
           : null,
       });

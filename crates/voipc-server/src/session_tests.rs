@@ -6770,9 +6770,24 @@ mod providers {
         ticket: Vec<u8>,
         choice: Choice,
     ) -> Result<(Client, voipc_crypto::account::SignedIn), String> {
+        sign_in_with(state, ticket, None, choice, &["deedee"]).await
+    }
+
+    /// With an invite, and the names to try in turn when asked for one.
+    async fn sign_in_with(
+        state: &Arc<ServerState>,
+        ticket: Vec<u8>,
+        invite: Option<&str>,
+        choice: Choice,
+        names: &[&str],
+    ) -> Result<(Client, voipc_crypto::account::SignedIn), String> {
+        let mut names = names.iter();
         let (mut m, first) = SignIn::start(
             "",
-            Method::Provider { ticket },
+            Method::Provider {
+                ticket,
+                invite: invite.map(String::from),
+            },
             PROTOCOL_VERSION,
             APP_VERSION,
         );
@@ -6795,7 +6810,8 @@ mod providers {
                         c.send(&m.keys(b)).await;
                     }
                     Step::ProviderSignup { .. } => {
-                        let out = m.provider_signup("deedee")?;
+                        let name = names.next().ok_or("asked for one name too many")?;
+                        let out = m.provider_signup(name)?;
                         c.send(&out).await;
                     }
                     Step::ProviderChoice { .. } => {
@@ -7094,7 +7110,7 @@ mod providers {
         let msg = c.next().await.unwrap();
         let (mut m, _) = SignIn::start(
             "",
-            Method::Provider { ticket: vec![] },
+            Method::Provider { ticket: vec![], invite: None },
             PROTOCOL_VERSION,
             APP_VERSION,
         );
@@ -7263,7 +7279,7 @@ mod providers {
             PROTOCOL_VERSION,
             APP_VERSION,
         );
-        let (mut m, _) = SignIn::start("", Method::Provider { ticket: vec![] }, PROTOCOL_VERSION, APP_VERSION);
+        let (mut m, _) = SignIn::start("", Method::Provider { ticket: vec![], invite: None }, PROTOCOL_VERSION, APP_VERSION);
         let mut c = open_raw(&state, &first).await;
         let msg = c.next().await.unwrap();
         for s in m.on_message(&msg).unwrap() {
@@ -7283,6 +7299,135 @@ mod providers {
         let relay = relay_of(&state);
         let user = relay.store().user_by_username("deedee").await.unwrap().unwrap();
         assert!(relay.identity(user.id).await.unwrap().is_none(), "still unclaimed");
+    }
+
+    /// A link's maker, on any relay: someone with an account, made from the shell.
+    async fn link_maker(state: &Arc<ServerState>) -> AccountId {
+        let relay = state.accounts.clone().unwrap();
+        let ctx = relay.ctx(LO, "test");
+        let name = format!("maker{:04}", rand::random::<u16>());
+        let code = relay
+            .accounts
+            .invite_create_as_host(&ctx, Some(&name), 1)
+            .await
+            .unwrap();
+        let form = l4f_accounts::service::InviteForm {
+            code: &code,
+            username: &name,
+            password: "a long enough password here",
+            email: None,
+            display_name: None,
+        };
+        relay.accounts.register_invite(&ctx, form).await.unwrap().info.user_id
+    }
+
+    async fn in_group(state: &ServerState, name: &str, group: &str) -> bool {
+        let relay = state.accounts.as_ref().unwrap();
+        let user = relay.store().user_by_username(name).await.unwrap().unwrap();
+        relay
+            .store()
+            .user_roles(user.id)
+            .await
+            .unwrap()
+            .iter()
+            .any(|r| r.name == group)
+    }
+
+    /// Where sign-up is by invite: a link lets a stranger in through a provider, as
+    /// it does with a password, with its limits and its starting group.
+    #[tokio::test]
+    async fn a_link_lets_a_stranger_in_through_a_provider() {
+        let (state, _db, subject) = relay(RegistrationMode::Invite).await;
+        group(&state, "crew", Some("Crew"), &[]).await;
+        let relay = state.accounts.clone().unwrap();
+        let maker = link_maker(&state).await;
+        let (code, _) = relay.link_new(1, 7, Some("crew"), maker).await.unwrap().unwrap();
+
+        // A name that is taken asks again, and costs no use
+        let (url, shown, ticket) = open_page(&state).await;
+        browser(&state, &url, &shown).await;
+        let taken = relay.store().user_by_id(maker).await.unwrap().unwrap().username;
+        sign_in_with(&state, ticket, Some(&code), Choice::Claim, &[&taken, "deedee"])
+            .await
+            .expect("signed up under the second name");
+        assert!(in_group(&state, "deedee", "crew").await, "its starting group");
+        assert_eq!(relay.links().await.unwrap()[0].uses, 1);
+        let dee = relay.store().user_by_username("deedee").await.unwrap().unwrap();
+        let audit = relay.store().audit_of(dee.id, 50).await.unwrap();
+        let used = audit.iter().find(|e| e.event == "invite_link_used").unwrap();
+        assert_eq!(used.actor_id, Some(maker), "by whose link");
+
+        // Used up: nobody else gets in on it
+        *subject.lock().unwrap() = "someone-else".into();
+        let (url, shown, ticket) = open_page(&state).await;
+        browser(&state, &url, &shown).await;
+        let err = sign_in_with(&state, ticket, Some(&code), Choice::Claim, &["other"])
+            .await
+            .err()
+            .unwrap();
+        assert!(err.contains("not valid"), "{err}");
+    }
+
+    /// An admin's single-use code works through a provider too, and is spent.
+    #[tokio::test]
+    async fn an_invite_code_lets_a_stranger_in_through_a_provider() {
+        let (state, _db, subject) = relay(RegistrationMode::Invite).await;
+        let relay = state.accounts.clone().unwrap();
+        let ctx = relay.ctx(LO, "test");
+        let code = relay.accounts.invite_create_as_host(&ctx, None, 1).await.unwrap();
+        let (url, shown, ticket) = open_page(&state).await;
+        browser(&state, &url, &shown).await;
+        sign_in_with(&state, ticket, Some(&code), Choice::Claim, &["deedee"])
+            .await
+            .expect("signed up");
+        *subject.lock().unwrap() = "someone-else".into();
+        let (url, shown, ticket) = open_page(&state).await;
+        browser(&state, &url, &shown).await;
+        let err = sign_in_with(&state, ticket, Some(&code), Choice::Claim, &["other"])
+            .await
+            .err();
+        assert!(err.is_some(), "spent");
+    }
+
+    /// Where anyone may sign up, a link adds its group; one that ran out only does not.
+    #[tokio::test]
+    async fn on_an_open_relay_a_dead_link_turns_nobody_away() {
+        let (state, _db, subject) = relay(RegistrationMode::Open).await;
+        group(&state, "crew", Some("Crew"), &[]).await;
+        let relay = state.accounts.clone().unwrap();
+        let maker = link_maker(&state).await;
+        let (code, _) = relay.link_new(1, 7, Some("crew"), maker).await.unwrap().unwrap();
+        let (url, shown, ticket) = open_page(&state).await;
+        browser(&state, &url, &shown).await;
+        sign_in_with(&state, ticket, Some(&code), Choice::Claim, &["deedee"])
+            .await
+            .expect("signed up");
+        assert!(in_group(&state, "deedee", "crew").await);
+
+        *subject.lock().unwrap() = "someone-else".into();
+        let (url, shown, ticket) = open_page(&state).await;
+        browser(&state, &url, &shown).await;
+        sign_in_with(&state, ticket, Some(&code), Choice::Claim, &["other"])
+            .await
+            .expect("anyone may sign up here");
+        assert!(!in_group(&state, "other", "crew").await, "the link had run out");
+    }
+
+    /// Sign-up closed means closed: a link is no way round it.
+    #[tokio::test]
+    async fn a_closed_relay_takes_no_link_from_a_provider_either() {
+        let (state, _db, _) = relay(RegistrationMode::Closed).await;
+        let relay = state.accounts.clone().unwrap();
+        let maker = link_maker(&state).await;
+        let (code, _) = relay.link_new(5, 7, None, maker).await.unwrap().unwrap();
+        let (url, shown, ticket) = open_page(&state).await;
+        browser(&state, &url, &shown).await;
+        let err = sign_in_with(&state, ticket, Some(&code), Choice::Claim, &["deedee"])
+            .await
+            .err()
+            .unwrap();
+        assert!(err.contains("not valid"), "{err}");
+        assert!(!relay.is_account_name("deedee").await.unwrap());
     }
 
     /// On a relay that takes invites only, a provider nobody knows makes no account.
@@ -7427,7 +7572,7 @@ mod providers {
         browser(state, &url, &code).await;
         let (mut m, first) = SignIn::start(
             "",
-            Method::Provider { ticket },
+            Method::Provider { ticket, invite: None },
             PROTOCOL_VERSION,
             APP_VERSION,
         );
@@ -8293,6 +8438,7 @@ mod group_styles {
         GroupStyle {
             badge: badge.into(),
             color,
+            section: true,
         }
     }
 
@@ -8345,6 +8491,7 @@ mod group_styles {
             AdminOp::GroupStyle {
                 name: "lead".into(),
                 color: Some(0xff8800),
+                section: true,
             },
         )
         .await;
@@ -8386,6 +8533,7 @@ mod group_styles {
             AdminOp::GroupStyle {
                 name: "crew".into(),
                 color: Some(1),
+                section: true,
             },
         )
         .await;
@@ -8461,6 +8609,7 @@ mod group_styles {
             AdminOp::GroupStyle {
                 name: "crew".into(),
                 color: Some(1),
+                section: true,
             },
         )
         .await;
@@ -8474,6 +8623,7 @@ mod group_styles {
             AdminOp::GroupStyle {
                 name: "mods".into(),
                 color: Some(1),
+                section: true,
             },
         )
         .await;
@@ -8483,6 +8633,7 @@ mod group_styles {
             AdminOp::GroupStyle {
                 name: "crew".into(),
                 color: Some(0x100_0000),
+                section: true,
             },
         )
         .await;
@@ -8495,6 +8646,7 @@ mod group_styles {
             AdminOp::GroupStyle {
                 name: "crew".into(),
                 color: Some(1),
+                section: true,
             },
         )
         .await;
@@ -8579,6 +8731,45 @@ mod group_styles {
     }
 
     #[tokio::test]
+    async fn a_groups_section_can_be_turned_off_and_keeps_its_colour_and_place() {
+        let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
+        group(&state, "crew", Some("Crew"), &[]).await;
+        let (mut ann, _, _) = admin_account(&state, "ann").await;
+        let lo = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let mut guest = connect(&state, "guest#1234", lo).await;
+        let crew_of = |list: Vec<GroupStyle>| list.into_iter().find(|s| s.badge == "Crew").unwrap();
+        assert!(crew_of(styles(&mut guest).await).section, "on until someone turns it off");
+
+        let r = answer(
+            &mut ann,
+            AdminOp::GroupStyle {
+                name: "crew".into(),
+                color: Some(7),
+                section: false,
+            },
+        )
+        .await;
+        assert!(matches!(r, AccountReply::Admin(AdminReply::Groups { .. })), "{r:?}");
+        let crew = crew_of(styles(&mut guest).await);
+        assert_eq!((crew.color, crew.section), (Some(7), false));
+
+        // Moving it changes neither, and someone arriving later hears the same
+        let relay = state.accounts.clone().unwrap();
+        let mut names: Vec<String> = relay
+            .groups_in_order()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(r, _)| r.name)
+            .collect();
+        names.reverse();
+        answer(&mut ann, AdminOp::GroupOrder { names }).await;
+        let mut late = connect(&state, "late#1234", lo).await;
+        let crew = crew_of(styles(&mut late).await);
+        assert_eq!((crew.color, crew.section), (Some(7), false));
+    }
+
+    #[tokio::test]
     async fn a_deleted_group_takes_its_style_along() {
         let (state, _db) = relay_state(AccountsMode::Optional, RegistrationMode::Open).await;
         group(&state, "crew", Some("Crew"), &[]).await;
@@ -8589,6 +8780,7 @@ mod group_styles {
             AdminOp::GroupStyle {
                 name: "crew".into(),
                 color: Some(7),
+                section: true,
             },
         )
         .await;

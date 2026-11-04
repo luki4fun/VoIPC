@@ -303,6 +303,10 @@ pub fn encode_client_msg_for(
                 | AdminOp::InviteLinkRevoke { .. },
             ..
         })
+        | ClientMessage::Authenticate {
+            account: Some(AccountStart::ProviderResumeInvited { .. }),
+            ..
+        }
         | ClientMessage::Account(
             AccountRequest::ProfileSet { .. } | AccountRequest::ProfilePictureSet { .. },
         ) if proto < 18 => Err(ProtocolError::NotOnThisRelay(proto)),

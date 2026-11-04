@@ -54,7 +54,11 @@ pub enum AccountArgs {
     /// Ends with the error `RESET_DONE`, never signed in.
     Reset { recovery: String, password: String },
     /// Back from a provider's page, with the relay's ticket.
-    Provider { ticket: Vec<u8> },
+    Provider {
+        ticket: Vec<u8>,
+        #[serde(default)]
+        invite: Option<String>,
+    },
 }
 
 /// What a sign-in through a provider asks the person.
@@ -351,7 +355,7 @@ pub async fn sign_in<S: AsyncWrite + Unpin, R: AsyncRead + Unpin>(
         normalize_name(username)?
     };
     let method = match args {
-        AccountArgs::Provider { ticket } => Method::Provider { ticket },
+        AccountArgs::Provider { ticket, invite } => Method::Provider { ticket, invite },
         AccountArgs::Login { password } => Method::Password {
             password: Zeroizing::new(password),
         },

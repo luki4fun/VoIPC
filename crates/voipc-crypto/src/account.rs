@@ -842,8 +842,11 @@ pub enum Method {
     },
     /// Back from a provider's page, with the relay's ticket. The account comes
     /// from the provider's answer, and the person says what opens the vault
-    /// (`Step::ProviderChoice`).
-    Provider { ticket: Vec<u8> },
+    /// (`Step::ProviderChoice`). `invite`: a code or link, for someone nobody knows yet.
+    Provider {
+        ticket: Vec<u8>,
+        invite: Option<String>,
+    },
 }
 
 /// Whether `url` is a provider's own sign-in page. The relay names the page, and
@@ -993,8 +996,15 @@ impl SignIn {
                 device_id: key.device_id.to_vec(),
             },
             Method::Reset { .. } => AccountStart::Reset,
-            Method::Provider { ticket } => AccountStart::ProviderResume {
-                ticket: ticket.clone(),
+            // An older relay has no use for one
+            Method::Provider { ticket, invite } => match invite.clone().filter(|_| protocol_version >= 18) {
+                Some(invite) => AccountStart::ProviderResumeInvited {
+                    ticket: ticket.clone(),
+                    invite,
+                },
+                None => AccountStart::ProviderResume {
+                    ticket: ticket.clone(),
+                },
             },
         };
         let relay_id = match &method {
@@ -1618,7 +1628,7 @@ mod tests {
             })
         };
         let machine = || {
-            let (mut m, _) = SignIn::start("", Method::Provider { ticket: vec![] }, 17, "test");
+            let (mut m, _) = SignIn::start("", Method::Provider { ticket: vec![], invite: None }, 17, "test");
             m.remembered_here(vec!["luki".into()]);
             m
         };

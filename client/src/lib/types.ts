@@ -365,7 +365,7 @@ export type AdminOp =
   | { CategoryDelete: { id: number } }
   | { LayoutSet: { categories: number[]; channels: [number, number | null][] } }
   | { WelcomeSet: { channel_id: number | null } }
-  | { GroupStyle: { name: string; color: number | null } }
+  | { GroupStyle: { name: string; color: number | null; section: boolean } }
   | { GroupOrder: { names: string[] } }
   | { ProfileReset: { id: number[]; name: boolean; picture: boolean } }
   | { ServerProfileSet: { name: string; description: string } }

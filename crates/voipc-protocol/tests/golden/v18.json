@@ -906,6 +906,20 @@
             }
           ]
         }
+      },
+      "8": {
+        "ProviderResumeInvited": {
+          "STRUCT": [
+            {
+              "ticket": {
+                "SEQ": "U8"
+              }
+            },
+            {
+              "invite": "STR"
+            }
+          ]
+        }
       }
     }
   },
@@ -1183,6 +1197,9 @@
               "color": {
                 "OPTION": "U32"
               }
+            },
+            {
+              "section": "BOOL"
             }
           ]
         }
@@ -2861,6 +2878,9 @@
         "color": {
           "OPTION": "U32"
         }
+      },
+      {
+        "section": "BOOL"
       }
     ]
   },

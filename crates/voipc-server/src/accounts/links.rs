@@ -14,7 +14,7 @@ use anyhow::Result;
 use l4f_accounts::model::AccountId;
 use l4f_accounts::pow;
 use l4f_accounts::scope;
-use l4f_accounts::service::{Ctx, Host, InviteForm, NewSession};
+use l4f_accounts::service::{Ctx, Error, Host, InviteForm, NewSession};
 use l4f_accounts::store::Store;
 use l4f_accounts::util;
 use sha2::{Digest, Sha256};
@@ -227,6 +227,32 @@ impl Relay {
     }
 }
 
+/// What vouches for the new account.
+pub enum How<'a> {
+    Password(&'a str),
+    /// The provider's sealed identity (`SocialOutcome::Signup`, `NoAccount`).
+    Provider(&'a str),
+}
+
+/// Why a sign-up with a link did not go through.
+pub enum Refused {
+    /// The name: another may do.
+    Name(String),
+    End(String),
+}
+
+impl Refused {
+    pub fn text(self) -> String {
+        match self {
+            Refused::Name(t) | Refused::End(t) => t,
+        }
+    }
+}
+
+fn the_end(reason: impl Into<String>) -> Refused {
+    Refused::End(reason.into())
+}
+
 /// A sign-up with a link: the proof of work and caps of an open sign-up, then the
 /// account, in its starting group. In `register`'s order: a taken or invalid name
 /// costs neither the caps nor a use, or someone with the link could shut sign-up for
@@ -237,16 +263,16 @@ pub async fn register(
     ctx: &Ctx,
     code: &str,
     name: &str,
-    password: &str,
+    how: How<'_>,
     altcha: &str,
     ts: &str,
-) -> Result<NewSession, String> {
-    let hash = hash_of(code).ok_or(GONE)?;
+) -> Result<NewSession, Refused> {
+    let hash = hash_of(code).ok_or_else(|| the_end(GONE))?;
     if relay.registration == RegistrationMode::Closed {
-        return Err(GONE.into());
+        return Err(the_end(GONE));
     }
     if altcha.is_empty() {
-        return Err("The sign-up puzzle was not solved.".into());
+        return Err(the_end("The sign-up puzzle was not solved."));
     }
     let cfg = relay.accounts.host.config();
     let bucket = util::ip_key(ctx.ip);
@@ -263,20 +289,21 @@ pub async fn register(
         ..Default::default()
     };
     let turn = relay.link_lock.lock().await;
-    let no_js = gate.precheck(proof, true).map_err(|d| d.message)?;
+    let no_js = gate.precheck(proof, true).map_err(|d| the_end(d.message))?;
     let reserved: Vec<&str> = cfg.reserved_usernames.iter().map(String::as_str).collect();
-    let username = scope::normalize_username(name, &reserved).map_err(str::to_string)?;
+    let username = scope::normalize_username(name, &reserved)
+        .map_err(|e| Refused::Name(e.to_string()))?;
     let taken = relay.store().user_by_username(&username).await;
     if !matches!(taken, Ok(None)) {
-        return Err("That name is taken.".into());
+        return Err(Refused::Name("That name is taken.".into()));
     }
-    let permit = gate.caps(no_js).map_err(|d| d.message)?;
+    let permit = gate.caps(no_js).map_err(|d| the_end(d.message))?;
     let Some(link) = relay
         .link_take(&hash)
         .await
-        .map_err(|_| "Something went wrong. Please try again.")?
+        .map_err(|_| the_end("Something went wrong. Please try again."))?
     else {
-        return Err(GONE.into());
+        return Err(the_end(GONE));
     };
     // Counted unless it was refused: Argon2 being busy with someone's login makes no
     // account and must cost none. A client that hangs up drops this future, maybe
@@ -285,12 +312,16 @@ pub async fn register(
         permit: Some(permit),
         limiter: &relay.accounts.limiter,
     };
-    let session = match with_minted_code(relay, ctx, name, password).await {
+    let session = match with_minted_code(relay, ctx, name, how).await {
         Ok(s) => s,
-        Err(reason) => {
+        Err(e) => {
             count.permit = None;
             relay.link_refund(&hash).await;
-            return Err(reason);
+            let text = e.message().to_string();
+            return Err(match e {
+                Error::UsernameTaken | Error::Invalid(_) => Refused::Name(text),
+                _ => Refused::End(text),
+            });
         }
     };
     drop(count);
@@ -318,25 +349,34 @@ async fn with_minted_code(
     relay: &Relay,
     ctx: &Ctx,
     name: &str,
-    password: &str,
-) -> Result<NewSession, String> {
+    how: How<'_>,
+) -> Result<NewSession, Error> {
     let code = relay
         .accounts
         .invite_create_as_host(ctx, Some(name), 1)
-        .await
-        .map_err(|e| e.message().to_string())?;
-    let form = InviteForm {
-        code: &code,
-        username: name,
-        password,
-        email: None,
-        display_name: None,
+        .await?;
+    let r = match how {
+        How::Password(password) => {
+            let form = InviteForm {
+                code: &code,
+                username: name,
+                password,
+                email: None,
+                display_name: None,
+            };
+            relay.accounts.register_invite(ctx, form).await
+        }
+        How::Provider(cookie) => {
+            relay
+                .accounts
+                .oauth_signup_invite(ctx, cookie, &code, name)
+                .await
+        }
     };
-    let r = relay.accounts.register_invite(ctx, form).await;
     // Spent or refused, it was only ever a step of this sign-up
     if let Some(raw) = util::b64u_dec(&code) {
         let hash: [u8; 32] = Sha256::digest(raw).into();
         let _ = relay.store().delete_invite(&hash).await;
     }
-    r.map_err(|e| e.message().to_string())
+    r
 }

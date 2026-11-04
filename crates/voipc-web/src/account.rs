@@ -59,6 +59,8 @@ enum MethodJs {
     /// Back from a provider's page, with the relay's ticket.
     Provider {
         ticket: Vec<u8>,
+        #[serde(default)]
+        invite: Option<String>,
     },
 }
 
@@ -117,7 +119,7 @@ impl AccountSignIn {
             normalize_name(name).map_err(JsError::new)?
         };
         let method = match method {
-            MethodJs::Provider { ticket } => Method::Provider { ticket },
+            MethodJs::Provider { ticket, invite } => Method::Provider { ticket, invite },
             MethodJs::Login { password } => Method::Password {
                 password: Zeroizing::new(password),
             },

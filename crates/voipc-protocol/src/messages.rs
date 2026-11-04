@@ -672,10 +672,12 @@ pub enum AdminOp {
     WelcomeSet {
         channel_id: Option<ChannelId>,
     },
-    /// A group's colour, `0xRRGGBB`, or none. Hands out nothing, so no fresh code.
+    /// A group's colour, `0xRRGGBB` or none, and whether its people stand under it in
+    /// the member list. Hands out nothing, so no fresh code.
     GroupStyle {
         name: String,
         color: Option<u32>,
+        section: bool,
     },
     /// Every group, in the order they should show. A group the editor could not
     /// change stays where it is.

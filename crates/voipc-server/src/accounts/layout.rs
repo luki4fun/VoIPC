@@ -32,14 +32,23 @@ pub struct KeptRows {
 /// One frame holds this many, at the largest a badge can be (32 characters).
 const MAX_STYLED_GROUPS: usize = 400;
 
+struct StyleRow {
+    color: Option<u32>,
+    position: Option<i64>,
+    no_section: bool,
+}
+
+/// How a group looks, as `groups_in_order` tells it.
+pub struct GroupLook {
+    pub color: Option<u32>,
+    pub section: bool,
+}
+
 /// The sort key of a group: where it was put. Then, for one nobody has placed, those
 /// with privileges and the built-in ones first: a name is no way to climb, and
 /// someone who may make groups could otherwise call theirs `00-mine`.
-fn rank(
-    rows: &HashMap<Vec<u8>, (Option<u32>, Option<i64>)>,
-    role: &Role,
-) -> (i64, bool, bool, String) {
-    let position = rows.get(&role.id.0[..]).and_then(|r| r.1);
+fn rank(rows: &HashMap<Vec<u8>, StyleRow>, role: &Role) -> (i64, bool, bool, String) {
+    let position = rows.get(&role.id.0[..]).and_then(|r| r.position);
     (
         position.unwrap_or(i64::MAX),
         role.scopes.is_empty(),
@@ -49,28 +58,42 @@ fn rank(
 }
 
 impl Relay {
-    async fn style_rows(&self) -> Result<HashMap<Vec<u8>, (Option<u32>, Option<i64>)>> {
-        let rows: Vec<(Vec<u8>, Option<i64>, Option<i64>)> = db!(self.store(), pool => {
-            sqlx::query_as("SELECT role, CAST(color AS BIGINT), CAST(position AS BIGINT) FROM voipc_group_style")
+    async fn style_rows(&self) -> Result<HashMap<Vec<u8>, StyleRow>> {
+        let rows: Vec<(Vec<u8>, Option<i64>, Option<i64>, bool)> = db!(self.store(), pool => {
+            sqlx::query_as("SELECT role, CAST(color AS BIGINT), CAST(position AS BIGINT), no_section FROM voipc_group_style")
                 .fetch_all(pool)
                 .await?
         });
         Ok(rows
             .into_iter()
-            .map(|(role, color, position)| (role, (color.map(|c| c as u32 & 0xff_ffff), position)))
+            .map(|(role, color, position, no_section)| {
+                let color = color.map(|c| c as u32 & 0xff_ffff);
+                (
+                    role,
+                    StyleRow {
+                        color,
+                        position,
+                        no_section,
+                    },
+                )
+            })
             .collect())
     }
 
-    /// Every group in the server's order, with its colour.
-    pub async fn groups_in_order(&self) -> Result<Vec<(Role, Option<u32>)>> {
+    /// Every group in the server's order, with how it looks.
+    pub async fn groups_in_order(&self) -> Result<Vec<(Role, GroupLook)>> {
         let rows = self.style_rows().await?;
         let mut roles = self.store().roles().await?;
         roles.sort_by_cached_key(|r| rank(&rows, r));
         Ok(roles
             .into_iter()
             .map(|r| {
-                let color = rows.get(&r.id.0[..]).and_then(|s| s.0);
-                (r, color)
+                let row = rows.get(&r.id.0[..]);
+                let look = GroupLook {
+                    color: row.and_then(|s| s.color),
+                    section: !row.is_some_and(|s| s.no_section),
+                };
+                (r, look)
             })
             .collect())
     }
@@ -83,9 +106,13 @@ impl Relay {
             .groups_in_order()
             .await?
             .into_iter()
-            .filter_map(|(r, color)| {
+            .filter_map(|(r, look)| {
                 let badge = r.badge.filter(|b| !b.is_empty())?;
-                seen.insert(badge.clone()).then_some(GroupStyle { badge, color })
+                seen.insert(badge.clone()).then_some(GroupStyle {
+                    badge,
+                    color: look.color,
+                    section: look.section,
+                })
             })
             .take(MAX_STYLED_GROUPS)
             .collect())
@@ -106,15 +133,21 @@ impl Relay {
             .collect())
     }
 
-    pub async fn group_color_put(&self, role: AccountId, color: Option<u32>) -> Result<()> {
-        let color = color.map(|c| i64::from(c & 0xff_ffff));
+    pub async fn group_style_put(
+        &self,
+        role: AccountId,
+        color: Option<u32>,
+        section: bool,
+    ) -> Result<()> {
+        let color = color.map(|c| (c & 0xff_ffff) as i32);
         db!(self.store(), pool => {
             sqlx::query(
-                "INSERT INTO voipc_group_style (role, color) VALUES ($1, $2) \
-                 ON CONFLICT (role) DO UPDATE SET color = excluded.color",
+                "INSERT INTO voipc_group_style (role, color, no_section) VALUES ($1, $2, $3) \
+                 ON CONFLICT (role) DO UPDATE SET color = excluded.color, no_section = excluded.no_section",
             )
             .bind(&role.0[..])
-            .bind(color.map(|c| c as i32))
+            .bind(color)
+            .bind(!section)
             .execute(pool)
             .await?;
         });

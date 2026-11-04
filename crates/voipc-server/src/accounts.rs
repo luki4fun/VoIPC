@@ -951,8 +951,24 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             return Err(ANSWERED.into());
         }
         AccountStart::ProviderResume { ticket } => {
-            return provider::resume(state, relay, stream, buf, &ticket, &ctx, ip, &mut answers)
-                .await;
+            return provider::resume(
+                state, relay, stream, buf, &ticket, None, &ctx, ip, &mut answers,
+            )
+            .await;
+        }
+        AccountStart::ProviderResumeInvited { ticket, invite } => {
+            return provider::resume(
+                state,
+                relay,
+                stream,
+                buf,
+                &ticket,
+                Some(&invite),
+                &ctx,
+                ip,
+                &mut answers,
+            )
+            .await;
         }
         AccountStart::ProviderStatus { ticket } => {
             let answer = if provider::ready(relay, &ticket)? {
@@ -1026,7 +1042,9 @@ pub async fn sign_in<S: AsyncRead + AsyncWrite + Unpin>(
             let pw = secret_text(&auth_secret)?;
             let _work = work()?;
             let s = if let Some(code) = invite.as_deref().filter(|c| links::is_link_code(c)) {
-                links::register(relay, &ctx, code, name, &pw, &altcha, &ts).await?
+                links::register(relay, &ctx, code, name, links::How::Password(&pw), &altcha, &ts)
+                    .await
+                    .map_err(links::Refused::text)?
             } else {
                 match &invite {
                     Some(code) => {

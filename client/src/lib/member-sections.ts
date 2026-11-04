@@ -7,6 +7,8 @@ import { avatarInk } from "./avatar.ts";
 export interface GroupStyle {
   badge: string;
   color: number | null;
+  /** Its people stand under it in the member list. An admin can turn that off. */
+  section: boolean;
 }
 
 export interface MemberSection<T> {
@@ -42,7 +44,8 @@ export function sectionsOf<T extends { badges?: string[] }>(
   styles: readonly GroupStyle[],
   rest: string,
 ): MemberSection<T>[] {
-  const rank = ranks(styles);
+  const sectioned = styles.filter((s) => s.section);
+  const rank = ranks(sectioned);
   const held = new Map<number, T[]>();
   const others: T[] = [];
   for (const m of members) {
@@ -55,7 +58,7 @@ export function sectionsOf<T extends { badges?: string[] }>(
   }
   const out: MemberSection<T>[] = [...held.keys()]
     .sort((a, b) => a - b)
-    .map((r) => ({ key: `group-${r}`, label: styles[r].badge, members: held.get(r)! }));
+    .map((r) => ({ key: `group-${r}`, label: sectioned[r].badge, members: held.get(r)! }));
   if (others.length > 0) out.push({ key: "rest", label: rest, members: others });
   return out;
 }

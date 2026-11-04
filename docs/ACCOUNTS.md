@@ -73,9 +73,9 @@ if you want one, and optionally a group they start in. A link is public by natur
 so each sign-up still solves the proof of work and counts against the sign-up limits,
 and it is shown once and revocable. Its starting group must hold no privileges, then
 and at each use: give that group power later and the link stops handing it out. On
-`closed` there are none. A link works for sign-up with a password. Someone new signing
-in through a provider gets no starting group, and on `invite` is offered no sign-up:
-they make the account with the link, then link the provider.
+`closed` there are none. A link works for sign-up with a password or through a provider,
+and an invite code from an admin works through a provider too, also where sign-up is
+otherwise by invite only.
 
 ## Groups, privileges and two-factor codes
 
@@ -123,7 +123,9 @@ granted.
 
 **A group's colour and order** decide how its badge looks and where its people stand
 in the member list: under their top group, top groups first. A row shows its top
-three badges. Holding `roles:admin`, you can recolour only groups you could have made,
+three badges. A group's *Own section in the member list* can be turned off: its people
+then stay with everybody else and only wear the badge. Holding `roles:admin`, you can
+recolour only groups you could have made,
 and a group you could not stays exactly where it is in the order, with nothing moving
 past it. **A badge is public**: everyone on the server is told every badge, guests too,
 whoever holds it. What the group behind it is called is not.
