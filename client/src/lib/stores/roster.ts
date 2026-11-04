@@ -35,9 +35,10 @@ import {
 } from "./chat.js";
 import { isAdmin, serverAddress, userId, voiceIsAdmin } from "./connection.js";
 import { can } from "./powers.js";
+import { olderRelay } from "./relay.js";
 import { channelRosters } from "./rosters.js";
 import { speakingUsers, users, visibleMembers } from "./users.js";
-import { rosterOf } from "../roster-rules.js";
+import { rosterOf, summonOffered } from "../roster-rules.js";
 import type { ChannelInfo, ChatMessage, UserInfo } from "../types.js";
 
 /**
@@ -269,6 +270,13 @@ export const canKick: Readable<boolean> = derived(
 export const canInvite: Readable<boolean> = derived(
   [isPreviewing, isCurrentChannelCreator],
   ([$previewing, $owner]) => $previewing && $owner,
+);
+
+/** Invite on a privilege: into the room you stand in, from anywhere (`summonOffered`). */
+export const canSummon: Readable<boolean> = derived(
+  [channels, currentChannelId, can, olderRelay],
+  ([$channels, $id, $can, $older]) =>
+    summonOffered($channels.find((c) => c.channel_id === $id), $can("voipc:channels"), $older?.protocol ?? null),
 );
 
 /**

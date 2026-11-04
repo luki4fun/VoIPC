@@ -12,6 +12,8 @@
   import { avatarStyle } from "../../avatar.js";
   import { shortName } from "../../username.js";
   import { userId } from "../../stores/connection.js";
+  import { restrictions } from "../../stores/restrictions.js";
+  import { markTitle } from "../../restrict-rules.js";
   import { speakingUsers } from "../../stores/users.js";
   import { audibleIds } from "../../stores/room.js";
   import { isCulled } from "../../stores/roster.js";
@@ -40,6 +42,7 @@
       talking ? "talking" : null,
       user.is_muted ? "muted" : null,
       user.is_deafened ? "deafened" : null,
+      $restrictions.has(user.user_id) ? "held back on this server" : null,
       user.is_screen_sharing ? "sharing their screen" : null,
       culled ? "out of earshot in the game" : null,
     ]
@@ -63,6 +66,7 @@
     </span>
     <span class="marks" aria-hidden="true">
       {#if user.is_muted}<span class="mark" title="Muted"><Icon name="mic-off" size={small ? 12 : 14} /></span>{/if}
+      {#if $restrictions.has(user.user_id)}<span class="mark restricted-mark" title={markTitle($restrictions.get(user.user_id)!, Date.now())}><Icon name="hourglass" size={small ? 12 : 14} /></span>{/if}
       {#if user.is_deafened}<span class="mark" title="Deafened"><Icon name="headphones-off" size={small ? 12 : 14} /></span>{/if}
     </span>
   </div>

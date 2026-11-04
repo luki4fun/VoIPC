@@ -29,6 +29,10 @@
   import { rosterForRow } from "../../roster-rules.js";
   import { userId, isAdmin, serverAddress, serverKey } from "../../stores/connection.js";
   import { account } from "../../stores/account.js";
+  import { blocked, blockedMember } from "../../stores/blocks.js";
+  import { isBlocked } from "../../block-rules.js";
+  import { restrictions } from "../../stores/restrictions.js";
+  import { markTitle } from "../../restrict-rules.js";
   import { showChatPane } from "../../stores/platform.js";
   import {
     activeDmUserId,
@@ -237,8 +241,14 @@
                 >{member.username.charAt(0).toUpperCase()}<AvatarPicture account={member.account} /></span
               >
               <span class="nested-name" title={member.username}><MemberName username={member.username} account={member.account} /></span>
+              {#if $blockedMember(member)}
+                <span class="blocked-mark" title="You blocked this person"><Icon name="ban" size={12} /></span>
+              {/if}
               {#if member.is_muted}
                 <span class="status-icon muted" title="Muted"><Icon name="mic-off" size={12} /></span>
+              {/if}
+              {#if $restrictions.has(member.user_id)}
+                <span class="status-icon restricted-mark" title={markTitle($restrictions.get(member.user_id)!, Date.now())}><Icon name="hourglass" size={12} /></span>
               {/if}
               {#if member.is_deafened}
                 <span class="status-icon deafened" title="Deafened"><Icon name="headphones-off" size={12} /></span>
@@ -340,7 +350,7 @@
           {@const r = reach(convo.user_id, seen, convo.account, !!$account?.cloud)}
           {@const who = shortName(convo.username)}
           {@const open = $activeDmUserId !== null && $activeDmUsername === convo.username}
-          {@const preview = $uiPrefs.dm_previews && last ? notificationBody(last) : ""}
+          {@const preview = $uiPrefs.dm_previews && last && !isBlocked($blocked, convo, false) ? notificationBody(last) : ""}
           <div class="channel-row">
             <button
               class="dm-entry"
@@ -652,9 +662,19 @@
     min-width: 0;
   }
 
+  .blocked-mark {
+    display: inline-flex;
+    color: var(--text-secondary);
+    flex-shrink: 0;
+  }
+
   .status-icon {
     display: flex;
     flex-shrink: 0;
+  }
+
+  .status-icon.restricted-mark {
+    color: var(--warning);
   }
 
   .status-icon.muted {

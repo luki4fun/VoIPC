@@ -68,6 +68,15 @@ const SHIPPED: &[(&str, &str)] = &[
         "postgres/0007_group_sections.sql",
         "bfd8bf320d9d9381bbb06ba0a794d683e6e4ebd0e618d56f200926c7f8584beb",
     ),
+    // 1.10.0
+    (
+        "sqlite/0008_moderation.sql",
+        "b3dc46cf813b6c8bde418443b51952e331a6185431cb634a814c9fcbc67d7130",
+    ),
+    (
+        "postgres/0008_moderation.sql",
+        "9d315baf10d2bee5b7b32adff2f8325497747509b5cc660f8e165432235880ec",
+    ),
 ];
 
 #[test]

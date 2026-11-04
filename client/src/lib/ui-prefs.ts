@@ -138,6 +138,12 @@ export interface UiPrefs {
    * Files lists them, each with "Ask again".
    */
   emotes_mobile_ok: string[];
+  /**
+   * Who a guest blocked, per server (`"host:port"` -> key -> what to call them;
+   * block-rules.ts has the keys). Only here: it is never sent to a relay. An
+   * account keeps its own list sealed in its vault, not here.
+   */
+  blocked: Record<string, Record<string, string>>;
 }
 
 /** Bounds. A width outside these is a panel you cannot get back by dragging. */
@@ -198,6 +204,7 @@ export function defaultUiPrefs(): UiPrefs {
     show_stickers: true,
     animate_emotes: "always",
     emotes_mobile_ok: [],
+    blocked: {},
   };
 }
 
@@ -266,6 +273,24 @@ function nsfwOk(raw: unknown): string[] {
   if (!Array.isArray(raw)) return [];
   const list = raw.filter((k): k is string => typeof k === "string" && k !== "");
   return [...new Set(list)].slice(-NSFW_OK_MAX);
+}
+
+/** How many servers' lists, and how many people on each: `BLOCKS_MAX` in block-rules.ts. */
+const BLOCKED_MAX_SERVERS = 200;
+const BLOCKED_MAX_PER_SERVER = 200;
+
+/** A key this build does not know stays: a newer one may have written it. */
+function blockedLists(raw: unknown): UiPrefs["blocked"] {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
+  const out: UiPrefs["blocked"] = {};
+  for (const [server, list] of Object.entries(raw as Record<string, unknown>).slice(-BLOCKED_MAX_SERVERS)) {
+    if (!list || typeof list !== "object" || Array.isArray(list)) continue;
+    const kept = Object.entries(list as Record<string, unknown>)
+      .filter(([, label]) => typeof label === "string")
+      .slice(-BLOCKED_MAX_PER_SERVER);
+    if (kept.length > 0) out[server] = Object.fromEntries(kept) as Record<string, string>;
+  }
+  return out;
 }
 
 function clamp(value: unknown, lo: number, hi: number, fallback: number): number {
@@ -389,5 +414,6 @@ export function sanitizeUiPrefs(raw: unknown): UiPrefs {
     show_stickers: bool(r.show_stickers, d.show_stickers),
     animate_emotes: r.animate_emotes === "hover" || r.animate_emotes === "never" ? r.animate_emotes : "always",
     emotes_mobile_ok: nsfwOk(r.emotes_mobile_ok),
+    blocked: blockedLists(r.blocked),
   };
 }

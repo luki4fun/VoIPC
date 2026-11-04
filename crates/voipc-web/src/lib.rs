@@ -437,7 +437,7 @@ fn as_js<T: serde::Serialize>(v: Option<T>) -> JsValue {
 
 /// `{ id: string | null, text: string, ttl_secs: number | null,
 /// reply_to: string | null, thread: string | null, file: FileRef | null,
-/// fwd: {name, at} | null, event: {kind, target, emoji?, on?} | null }` from a
+/// fwd: {name, at, report?} | null, event: {kind, target, emoji?, on?} | null }` from a
 /// received message.
 #[wasm_bindgen(js_name = openEnvelope)]
 pub fn open_envelope(plaintext: &[u8]) -> JsValue {

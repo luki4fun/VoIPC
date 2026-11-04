@@ -448,7 +448,7 @@ pub async fn profile_picture_get(
     .await
 }
 
-/// Invite a user to your channel (creator only).
+/// Invite a user to your channel, as its creator or on `voipc:channels` (the relay decides).
 #[tauri::command]
 pub async fn send_invite(
     state: State<'_, AppState>,
@@ -3474,6 +3474,32 @@ pub async fn admin_ban(
     .await
 }
 
+/// Restrict a member (`voipc:restrict`): both false lifts, `duration_secs` 0 is
+/// until lifted.
+#[tauri::command]
+pub async fn admin_restrict(
+    state: State<'_, AppState>,
+    server: String,
+    user_id: u32,
+    voice: bool,
+    text: bool,
+    duration_secs: u32,
+    reason: String,
+) -> Result<(), String> {
+    send_admin_message(
+        &state,
+        &server,
+        ClientMessage::AdminRestrict {
+            user_id,
+            voice,
+            text,
+            duration_secs,
+            reason,
+        },
+    )
+    .await
+}
+
 /// Ban an account by name, online or not (admin only).
 #[tauri::command]
 pub async fn admin_ban_account(
@@ -3503,6 +3529,12 @@ pub async fn admin_unban(
     id: u64,
 ) -> Result<(), String> {
     send_admin_message(&state, &server, ClientMessage::AdminUnban { id }).await
+}
+
+/// Who takes a report of a message now; delivered as the `report-takers` event.
+#[tauri::command]
+pub async fn report_takers_get(state: State<'_, AppState>, server: String) -> Result<(), String> {
+    send_admin_message(&state, &server, ClientMessage::ReportTakersGet).await
 }
 
 /// Request the ban list (admin only); delivered as the `admin-bans` event.

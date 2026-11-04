@@ -98,6 +98,31 @@ export async function toggleUserMute(id: number): Promise<void> {
   }
 }
 
+/**
+ * Who a block silenced (`silenceChanges` in block-rules.ts), by id, and whether
+ * that is what muted them: somebody already muted by hand stays muted after an
+ * unblock. Nothing here stops the fader, which stays a manual override.
+ */
+const silenced = new Map<number, boolean>();
+
+export function silencedIds(): ReadonlySet<number> {
+  return new Set(silenced.keys());
+}
+
+/** Silence one person of the call for a block, or give them back. Never a blind
+ *  toggle: that would unmute whoever is muted by hand. */
+export async function silenceUser(id: number, on: boolean): Promise<void> {
+  if (on) {
+    const audible = volumeOf(id) > 0;
+    silenced.set(id, audible);
+    if (audible) await toggleUserMute(id);
+    return;
+  }
+  const muted = silenced.get(id);
+  silenced.delete(id);
+  if (muted && volumeOf(id) === 0) await toggleUserMute(id);
+}
+
 /** The only caller of `set_user_fx`. Optimistic, like the volume above. */
 export async function setUserFx(id: number, lane: Lane): Promise<void> {
   const l = cleanLane(lane);
@@ -169,4 +194,5 @@ export function clearMixer(): void {
   userFx.set(new Map());
   selectedStrip.set(null);
   premute.clear();
+  silenced.clear();
 }

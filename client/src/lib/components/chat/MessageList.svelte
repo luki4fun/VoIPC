@@ -1,6 +1,10 @@
 <script module lang="ts">
   import type { ChatMessage as Message } from "../../types.js";
 
+  /** What a moderator is told where their hide cannot be kept for those away. */
+  export const HIDE_ONLINE_ONLY =
+    "Hidden only for people online now. Those away still see it, unless this channel keeps messages and you keep copies on this server (Your account).";
+
   /** What can be done to a message here, beside answering it; each absent
    *  where it cannot (ChatPanel decides: who may, and whether posting is). */
   export interface MessageActions {
@@ -10,7 +14,12 @@
     remove?: (m: Message) => void;
     /** For the channel's managers. */
     pin?: (m: Message, on: boolean) => void;
+    /** For a holder of `voipc:hide`: on which messages it counts, and whether it
+     *  reaches only those online (`HIDE_ONLINE_ONLY`). */
+    hide?: { may: (m: Message) => boolean; onlineOnly: boolean; send: (m: Message, on: boolean) => void };
     forward?: (m: Message) => void;
+    /** To whoever takes reports; wherever it can be read, muted or not. */
+    report?: (m: Message) => void;
     /** Its picture into the server's emotes (admins). */
     makeEmote?: (m: Message) => void;
   }
@@ -36,16 +45,21 @@
   import { callsOn, powerTokens, tokensForMe } from "../../mention-rules.js";
   import { community } from "../../relay-rules.js";
   import { olderRelay } from "../../stores/relay.js";
-  import { groupStyles } from "../../stores/channels.js";
+  import { channels, groupStyles } from "../../stores/channels.js";
   import { can, myBadges } from "../../stores/powers.js";
+  import { blocked, revealedRows, revealRow } from "../../stores/blocks.js";
+  import { foldedLine } from "../../block-rules.js";
+  import { hiddenLine, isHidden } from "../../chat-rules.js";
   import { ambiguousTarget, findTarget, indexById, isOwn } from "../../thread-rules.js";
   import { reactionChips, rowKey, sameRow } from "../../chat-rules.js";
-  import { receivedNow } from "../../stores/chat.js";
+  import { channelMessages, chatKey, receivedNow } from "../../stores/chat.js";
+  import { REPORT_CHECK, reportCheck, reportLine, reportPlace } from "../../report-rules.js";
   import { confirmAction } from "../../stores/confirm.js";
   import { QUICK_REACTIONS } from "../../emoji.js";
   import { shortName } from "../../username.js";
   import Icon from "../Icons.svelte";
   import MemberName from "../MemberName.svelte";
+  import { headerAccount } from "../../profile-rules.js";
   import Markdown from "./Markdown.svelte";
   import FileCard from "./FileCard.svelte";
   import Lightbox from "./Lightbox.svelte";
@@ -77,6 +91,8 @@
     /** Who an `@` may name here, and our own names (see Markdown). */
     names?: readonly string[];
     me?: readonly string[];
+    /** A channel whose names are pseudonyms: its headers show nothing beside them. */
+    anonymous?: boolean;
     /** Where the unread part began: a "New" divider goes before the first message after it. */
     newSince?: number;
     /** The server and conversation these rows are in, for their files. */
@@ -98,6 +114,7 @@
     onjumpelsewhere,
     under,
     names = [],
+    anonymous = false,
     me = [],
     newSince,
     server = "",
@@ -133,6 +150,25 @@
   /** The messages among the rows, without our own dividers. */
   const rows = $derived(messages.filter(isRow));
 
+  /** What a row says instead of itself, until "Show": nothing of it is drawn,
+   *  quoted or fetched before that. The store keeps the message all the same. */
+  function folded(m: ChatMessage): string | null {
+    return foldedLine($blocked, m, anonymous, $revealedRows);
+  }
+
+  /** A report's label, and what our own copy says of it. Who it is from is who sent
+   *  it; the rest is their word. Not checked for one of our own, which we know. */
+  function reportShown(m: ChatMessage) {
+    const report = m.fwd!.report!;
+    const channel = report.channel ? $channels.find((c) => c.name === report.channel) : undefined;
+    const mine = isMine(m);
+    const copies = report.channel ? ($channelMessages.get(chatKey(server, report.channel)) ?? []) : [];
+    return {
+      line: reportLine(m.fwd!, m.username, mine, reportPlace(report.channel, !!channel && !channel.text), fullTime(m.fwd!.at)),
+      check: mine ? null : reportCheck(m, copies, !!channel?.anonymous),
+    };
+  }
+
   /** Whether `m` names us with an `@` (outside code). */
   function mentionsMe(m: ChatMessage): boolean {
     if (!m.content.includes("@") || isMine(m)) return false;
@@ -151,7 +187,7 @@
 
   /** The first message after `newSince` that somebody else wrote. */
   const newFrom = $derived(
-    newSince === undefined ? undefined : rows.find((m) => m.timestamp >= newSince && !isMine(m)),
+    newSince === undefined ? undefined : rows.find((m) => m.timestamp >= newSince && !isMine(m) && !folded(m)),
   );
   let newEl = $state<HTMLElement | null>(null);
   /** The divider has been on screen: no need to point at it any more. */
@@ -199,6 +235,8 @@
     // Show header if different user, after a history divider, or more than 5 minutes apart
     return (
       !isRow(prev) ||
+      // A row shown after a folded one says who wrote it
+      !!folded(prev) ||
       prev.user_id !== curr.user_id ||
       dayKey(prev.timestamp) !== dayKey(curr.timestamp) ||
       // Where a name came from is part of what the header says, so a second-hand
@@ -212,6 +250,8 @@
 
   /** The line a quote shows of the message answered. */
   function snippet(m: ChatMessage): string {
+    const line = folded(m);
+    if (line) return line;
     const text = m.kind === "undecryptable" ? m.content : plainText(m.content);
     return text.length > 120 ? `${text.slice(0, 120)}…` : text || m.file?.name || "…";
   }
@@ -303,6 +343,7 @@
 
   /** Right click, a long press on a touch screen, or the menu key. */
   function onContextMenu(e: MouseEvent, m: ChatMessage) {
+    if (folded(m)) return;
     const fromTouch = (e as PointerEvent).pointerType === "touch" || (touch && (e as PointerEvent).pointerType !== "mouse");
     // Selected text keeps the native menu, with its Copy; on a touch screen
     // the long press made that selection, and the app's menu has Copy text
@@ -468,23 +509,33 @@
     {@const target = msg.reply_to ? findTarget(index, msg.reply_to, msg.timestamp) : undefined}
     {@const tabbable = msg === current}
     {@const isEditing = !!editing && sameRow(editing, msg)}
+    {@const rowFold = folded(msg)}
     <!-- A row the keyboard can stand on, with the arrows to move: one tab stop
          for the whole list (see "Rows, focus and jumping") -->
     <!-- svelte-ignore a11y_no_noninteractive_tabindex, a11y_no_noninteractive_element_interactions -->
     <div
       class="msg"
-      class:to-me={(!!target && isMine(target) && !isMine(msg)) || mentionsMe(msg)}
+      class:to-me={!rowFold && ((!!target && isMine(target) && !isMine(msg)) || mentionsMe(msg))}
       class:flash={flashing === msg}
       class:grouped={!shouldShowHeader(i)}
       class:touch
       tabindex={tabbable ? 0 : -1}
       role="article"
-      aria-label="{shortName(msg.username)}, {formatTime(msg.timestamp)}"
+      aria-label={rowFold ?? `${shortName(msg.username)}, ${formatTime(msg.timestamp)}`}
       use:row={msg}
       onfocusin={() => (focused = msg)}
       onkeydown={(e) => onRowKeydown(e, msg)}
       oncontextmenu={(e) => onContextMenu(e, msg)}
     >
+      {#if rowFold}
+        <div class="msg-content msg-folded">
+          <span class="folded-line">{rowFold}</span>
+          <button class="folded-show" type="button" tabindex={tabbable ? 0 : -1} aria-label="Show this message" onclick={() => revealRow(msg)}>{isHidden(msg) ? "Show anyway" : "Show"}</button>
+          {#if isHidden(msg) && actions.hide?.may(msg)}
+            <button class="folded-show folded-restore" type="button" tabindex={tabbable ? 0 : -1} aria-label="Restore this message" onclick={() => actions.hide?.send(msg, false)}>Restore</button>
+          {/if}
+        </div>
+      {:else}
       {#if msg.reply_to && !(under && target === under)}
         {#if target}
           <button
@@ -495,7 +546,7 @@
             title="Go to the message this answers"
           >
             <Icon name="reply" size={12} />
-            <span class="quote-name">{shortName(target.username)}</span>
+            {#if !folded(target)}<span class="quote-name">{shortName(target.username)}</span>{/if}
             <span class="quote-text">{snippet(target)}</span>
           </button>
         {:else if ambiguousTarget(index, msg.reply_to, msg.timestamp)}
@@ -510,7 +561,7 @@
       {/if}
       {#if shouldShowHeader(i)}
         <div class="msg-header">
-          <span class="msg-username" class:self={isMine(msg)} title={msg.username}><MemberName username={msg.username} account={msg.kind === "shared" ? null : msg.account} /></span>
+          <span class="msg-username" class:self={isMine(msg)} title={msg.username}><MemberName username={msg.username} account={headerAccount(msg, anonymous)} /></span>
           <time class="msg-time" datetime={new Date(msg.timestamp).toISOString()} title={fullTime(msg.timestamp)}
             >{formatTime(msg.timestamp)}</time
           >
@@ -522,7 +573,18 @@
           {/if}
         </div>
       {/if}
-      {#if msg.fwd}
+      {#if msg.fwd?.report}
+        {@const shown = reportShown(msg)}
+        <div class="report-label">
+          <span class="report-line"><Icon name="shield" size={12} /> {shown.line}</span>
+          {#if shown.check}
+            <span class="report-check" data-check={shown.check}>{REPORT_CHECK[shown.check]}</span>
+          {/if}
+          {#if msg.fwd.report.why}
+            <span class="report-reason">{msg.fwd.report.why}</span>
+          {/if}
+        </div>
+      {:else if msg.fwd}
         <div class="fwd-label" title="Forwarded: first written {fullTime(msg.fwd.at)}">
           <Icon name="forward" size={12} /> Forwarded from {shortName(msg.fwd.name)}
         </div>
@@ -569,6 +631,9 @@
           {#if msg.pin?.on}
             <span class="pinned-tag" title="Pinned by {shortName(msg.pin.by)}"><Icon name="pin" size={11} /> Pinned</span>
           {/if}
+          {#if isHidden(msg)}
+            <span class="pinned-tag hidden-tag" title={msg.hide?.ban ? "This server says it removed this with a ban. You chose to show it." : "A moderator hid this from its readers. You chose to show it."}><Icon name="eye-off" size={11} /> {hiddenLine(msg)}</span>
+          {/if}
           {#if msg.file}
             <FileCard
               file={msg.file}
@@ -602,9 +667,10 @@
           {/each}
         </div>
       {/if}
+      {/if}
       {#if threads?.get(msg)}
         {@const answers = threads.get(msg)!}
-        {@const unread = answers.some((a) => a.timestamp > (threadSeen?.(msg) ?? 0) && !isMine(a))}
+        {@const unread = answers.some((a) => a.timestamp > (threadSeen?.(msg) ?? 0) && !isMine(a) && !folded(a))}
         <button
           class="thread-summary"
           type="button"
@@ -616,7 +682,7 @@
           {#if unread}<span class="unread-dot" title="New replies"></span>{/if}
         </button>
       {/if}
-      {#if !isEditing}
+      {#if !isEditing && !rowFold}
       <div class="msg-tools" role="toolbar" aria-label="Message actions">
         {#if actions.react && answerable(msg)}
           <button
@@ -678,8 +744,13 @@
     {/if}
     <!-- Not a copy a member handed over: forwarded, its claimed writer would
          become a "Forwarded from" label with no mark of hearsay (D-15) -->
-    {#if actions.forward && answerable(m) && m.kind !== "shared"}
+    {#if actions.forward && answerable(m) && m.kind !== "shared" && !isHidden(m)}
       <button type="button" onclick={() => act(actions.forward!)}><Icon name="forward" size={16} /> Forward</button>
+    {/if}
+    <!-- Not a member's copy, for the same reason. Not what was hidden, which a
+         moderator has seen to. Never one's own -->
+    {#if actions.report && answerable(m) && m.kind !== "shared" && !isHidden(m) && !isMine(m)}
+      <button type="button" onclick={() => act(actions.report!)}><Icon name="shield" size={16} /> Report</button>
     {/if}
     {#if actions.edit && textEditable(m)}
       <button type="button" onclick={() => act(startEdit)}><Icon name="pencil" size={16} /> Edit</button>
@@ -692,7 +763,14 @@
         ><Icon name="pin" size={16} /> {m.pin?.on ? "Unpin" : "Pin"}</button
       >
     {/if}
-    <button type="button" onclick={() => act(copyText)}><Icon name="copy" size={16} /> Copy text</button>
+    {#if actions.hide && answerable(m) && actions.hide.may(m)}
+      <button type="button" title={actions.hide.onlineOnly && !isHidden(m) ? HIDE_ONLINE_ONLY : undefined} onclick={() => act((x) => actions.hide?.send(x, !isHidden(x)))}>
+        <Icon name={isHidden(m) ? "eye" : "eye-off"} size={16} /> {isHidden(m) ? "Restore" : actions.hide.onlineOnly ? "Hide for those online" : "Hide"}
+      </button>
+    {/if}
+    {#if !isHidden(m)}
+      <button type="button" onclick={() => act(copyText)}><Icon name="copy" size={16} /> Copy text</button>
+    {/if}
     {#if actions.remove && ownEditable(m)}
       <button class="danger" type="button" onclick={() => act(askDelete)}><Icon name="trash" size={16} /> Delete</button>
     {/if}
@@ -745,6 +823,26 @@
   .attachment-placeholder {
     color: var(--text-secondary);
     font-style: italic;
+  }
+
+  .msg-folded {
+    color: var(--text-secondary);
+    font-style: italic;
+  }
+
+  .folded-show {
+    margin-left: 6px;
+    padding: 0;
+    background: none;
+    border: none;
+    color: var(--text-secondary);
+    font-style: normal;
+    text-decoration: underline;
+    cursor: pointer;
+  }
+
+  .folded-show:hover {
+    color: var(--text-primary);
   }
 
   /* Second-hand: a member's copy of what was said before we arrived. Drawn in
@@ -1061,6 +1159,36 @@
     font-size: var(--fs-sm);
     font-style: italic;
     color: var(--text-secondary);
+  }
+
+  /* A report: its label says whose word it is, in text no sender can dress up */
+  .report-label {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 2px 0 1px;
+    padding-left: 8px;
+    border-left: 2px solid var(--border);
+    font-size: var(--fs-sm);
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+  }
+
+  .report-line {
+    font-style: italic;
+  }
+
+  .report-check {
+    font-size: var(--fs-micro);
+    font-weight: 600;
+  }
+
+  .report-check[data-check="differs"] {
+    color: var(--danger);
+  }
+
+  .report-reason {
+    color: var(--text-primary);
   }
 
   .edited,

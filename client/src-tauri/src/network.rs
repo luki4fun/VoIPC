@@ -706,6 +706,21 @@ fn end_screen_share(c: &mut ActiveConnection) -> bool {
     std::mem::replace(&mut c.is_screen_sharing, false)
 }
 
+/// How we hear each person, on a connection leaving voice: a user id is somebody
+/// else next time. The mixer's stores forget them at this point too (`clearMixer`),
+/// so someone left silent here would stay so with the UI at 100%. Not on a move
+/// between this server's rooms. `audio.attach` does the same in the browser.
+fn forget_people(c: &ActiveConnection) {
+    c.user_volumes
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+    c.user_fx
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clear();
+}
+
 /// This connection's server confirmed a voice channel: voice is here now.
 ///
 /// The latest confirmation wins. If another server held voice, it is left
@@ -743,6 +758,7 @@ async fn claim_voice(app: &tauri::AppHandle, server: &str, is_voice: &Arc<Atomic
         if other.watching_user_id_shared.swap(0, Ordering::Relaxed) != 0 {
             let _ = send_tcp_message(&other.tcp_tx, &ClientMessage::StopWatchingScreenShare).await;
         }
+        forget_people(other);
         // A game driving the old room is detached now, before this claim
         // lets a `hello` waiting on this server return and subscribe afresh.
         // Left for the old server's leave to do, the Detached would land on
@@ -794,6 +810,7 @@ async fn leave_voice(
         .filter(|c| Arc::ptr_eq(&c.is_voice, is_voice))
     {
         end_screen_share(c);
+        forget_people(c);
     }
     if clear_voice(&state, server) {
         release_holds(app);
@@ -1574,6 +1591,41 @@ async fn handle_server_message(
                 server,
                 "mention-power",
                 serde_json::json!({ "user_ids": user_ids, "on": on }),
+            );
+        }
+        ServerMessage::Restrictions { list } => {
+            emit_server(
+                app_handle,
+                server,
+                "restrictions",
+                serde_json::json!({ "list": list }),
+            );
+        }
+        ServerMessage::ChatMods { mods } => {
+            emit_server(
+                app_handle,
+                server,
+                "chat-mods",
+                serde_json::json!({ "mods": mods }),
+            );
+        }
+        ServerMessage::PostsHidden { marks } => {
+            emit_server(
+                app_handle,
+                server,
+                "posts-hidden",
+                serde_json::json!({ "marks": marks }),
+            );
+        }
+        ServerMessage::ReportTakers { takers } => {
+            if let Some(link) = account {
+                link.session().note_takers(&takers);
+            }
+            emit_server(
+                app_handle,
+                server,
+                "report-takers",
+                serde_json::json!({ "takers": takers }),
             );
         }
         ServerMessage::MyBadges { badges } => {

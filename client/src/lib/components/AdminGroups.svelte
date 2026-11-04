@@ -11,7 +11,7 @@
   import { olderRelay } from "../stores/relay.js";
   import { badgeStyle, colorOf, hexOf, pillStyle } from "../member-sections.js";
   import { community } from "../relay-rules.js";
-  import { PRIVILEGES, privilegeLabel } from "../scopes.js";
+  import { privilegeLabel, privilegesOn } from "../scopes.js";
   import Icon from "./Icons.svelte";
   import type { GroupInfo } from "../types.js";
 
@@ -121,13 +121,14 @@
     }
   });
 
-  /** The privileges to tick: the known ones, then any other the group holds. */
+  const offered = $derived(privilegesOn($olderRelay?.protocol ?? null));
+  /** The privileges to tick: what this relay knows, then any other the group holds. */
   const choices = $derived(
     editing
       ? [
-          ...PRIVILEGES,
+          ...offered,
           ...editing.group.scopes
-            .filter((s) => !PRIVILEGES.some((p) => p.scope === s))
+            .filter((s) => !offered.some((p) => p.scope === s))
             .map((s) => ({ scope: s, label: s, hint: "Set from the server's shell" })),
         ]
       : [],

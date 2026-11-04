@@ -1,6 +1,7 @@
 <script lang="ts">
   import { isMuted, isDeafened, isTransmitting } from '../stores/connection';
   import { startTransmit, stopTransmit, voiceMode } from '../stores/voice';
+  import { voiceRestriction } from '../stores/restrictions';
   import Icon from './Icons.svelte';
 
   /** One row instead of two, for when the screen is short of room: the
@@ -12,7 +13,8 @@
   /** A press that came with a pointer: its click is the end of a hold, not a toggle. */
   let fromPointer = false;
 
-  const blocked = $derived($isMuted || $isDeafened);
+  const held = $derived(!!$voiceRestriction?.voice);
+  const blocked = $derived($isMuted || $isDeafened || held);
 
   // Through the shared actions rather than invoking directly, which is also
   // what gives this button the guard it never had: outside a voice channel
@@ -83,7 +85,7 @@
     class:disabled={blocked}
     aria-pressed={pressing}
     aria-disabled={blocked}
-    aria-label={blocked ? 'Talk (unmute first)' : 'Talk'}
+    aria-label={held ? 'Talk (nobody hears you on this server for now)' : blocked ? 'Talk (unmute first)' : 'Talk'}
     {onpointerdown}
     onpointerup={release}
     onpointercancel={release}
@@ -95,7 +97,7 @@
     use:letGoOnRemove
   >
     <Icon name="mic-on" size={slim ? 20 : 32} />
-    <span aria-hidden="true">{blocked ? 'Unmute to talk' : pressing ? 'Release to stop' : 'Hold to talk'}</span>
+    <span aria-hidden="true">{held ? 'Nobody hears you' : blocked ? 'Unmute to talk' : pressing ? 'Release to stop' : 'Hold to talk'}</span>
   </button>
 {/if}
 

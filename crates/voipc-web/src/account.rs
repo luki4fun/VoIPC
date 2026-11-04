@@ -16,7 +16,7 @@ use voipc_protocol::conv::unhex16;
 use voipc_protocol::messages::AccountReply;
 use voipc_protocol::messages::{ClientMessage, ServerMessage};
 use voipc_protocol::types::PreKeyBundleData;
-use voipc_protocol::types::{AccountInfo, UserInfo};
+use voipc_protocol::types::{AccountInfo, ReportTaker, UserInfo};
 use wasm_bindgen::prelude::*;
 
 fn bytes(msg: &ClientMessage) -> Vec<u8> {
@@ -507,6 +507,14 @@ impl AccountSession {
         actions(self.session.note_roster(&users))
     }
 
+    /// The `takers` of a `ReportTakers`, for the pins.
+    #[wasm_bindgen(js_name = noteTakers)]
+    pub fn note_takers(&mut self, takers: JsValue) -> Result<(), JsError> {
+        let takers: Vec<ReportTaker> = serde_wasm_bindgen::from_value(takers)?;
+        self.session.note_takers(&takers);
+        Ok(())
+    }
+
     /// An identity `user_id` showed (a pre-key bundle, or a session they
     /// opened: `SignalClient.takeSeen`), against the pins.
     #[wasm_bindgen(js_name = checkIdentity)]
@@ -536,10 +544,17 @@ impl AccountSession {
         envelope: &[u8],
         sent_at: f64,
         ttl_secs: Option<u32>,
+        once: bool,
     ) -> Result<JsValue, JsError> {
         let a = self
             .session
-            .kept_dm(account_hex, envelope.to_vec(), sent_at as u64, ttl_secs)
+            .kept_dm(
+                account_hex,
+                envelope.to_vec(),
+                sent_at as u64,
+                ttl_secs,
+                once,
+            )
             .map_err(|e| JsError::new(&e))?;
         actions(a)
     }
@@ -652,6 +667,17 @@ impl AccountSession {
     #[wasm_bindgen(js_name = setPrefs)]
     pub fn set_prefs(&mut self, cloud: bool, asked: bool) -> Result<JsValue, JsError> {
         actions(self.session.set_prefs(Prefs { cloud, asked }))
+    }
+
+    /// Block or unblock the person `key` names; throws why the list could not
+    /// be kept (`AccountSession::set_block`).
+    #[wasm_bindgen(js_name = setBlocked)]
+    pub fn set_blocked(&mut self, key: &str, label: &str, on: bool) -> Result<JsValue, JsError> {
+        actions(
+            self.session
+                .set_block(key, label, on)
+                .map_err(|e| JsError::new(&e))?,
+        )
     }
 
     #[wasm_bindgen(js_name = setShare)]

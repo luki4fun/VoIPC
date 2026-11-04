@@ -3,7 +3,7 @@ import { test } from "node:test";
 
 import { readFileSync } from "node:fs";
 
-import { centerSquare, cleanDisplayName, cleanServerName } from "./profile-rules.ts";
+import { centerSquare, cleanDisplayName, cleanServerName, headerAccount, writerTag } from "./profile-rules.ts";
 
 test("a display name a relay should have refused is not shown", () => {
   for (const bad of [
@@ -69,4 +69,18 @@ test("a display name is read without what draws nothing, and may keep what an em
   const persian = "\u0645\u06cc\u200c\u062e\u0648\u0627\u0647\u0645";
   assert.equal(cleanDisplayName(persian), persian);
   assert.equal(cleanDisplayName("a\u200bb"), null, "a zero-width space joins nothing");
+});
+
+test("an anonymous channel tags nobody else's message with an account", () => {
+  const roster = () => "theirs";
+  assert.equal(writerTag(false, true, "mine", roster), undefined, "a stale roster row names nobody");
+  assert.equal(writerTag(false, false, "mine", roster), "theirs");
+  assert.equal(writerTag(true, true, "mine", roster), "mine", "our own stays ours, for our reactions and edits");
+});
+
+test("a header shows nobody's chosen name behind a pseudonym, ours included", () => {
+  assert.equal(headerAccount({ account: "aa" }, true), null);
+  assert.equal(headerAccount({ account: "aa" }, false), "aa");
+  assert.equal(headerAccount({ kind: "shared", account: "aa" }, false), null);
+  assert.equal(headerAccount({}, false), null);
 });

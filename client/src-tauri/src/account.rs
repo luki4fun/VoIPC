@@ -822,9 +822,12 @@ pub async fn send_kept_dm(
     let id = crate::crypto::new_message_id();
     let extras = crate::commands::checked_extras(reply_to, thread, file, fwd, event)?;
     let payload = crate::crypto::envelope_with(&id, &content, ttl_secs, &extras);
+    // A report kept for this one message: the dialog asked. Anything else needs
+    // cloud copies on.
+    let once = extras.fwd.as_ref().is_some_and(|f| f.report.is_some());
     let a = link
         .session()
-        .kept_dm(&account, payload, crate::crypto::now_ms(), ttl_secs)?;
+        .kept_dm(&account, payload, crate::crypto::now_ms(), ttl_secs, once)?;
     run(&app, &server, &connection.tcp_tx, a).await;
     Ok(id)
 }
@@ -920,6 +923,24 @@ pub async fn account_set_prefs(
     let connections = state.connections.read().await;
     let (connection, link) = signed_in(&connections, &server)?;
     let a = link.session().set_prefs(prefs);
+    run(&app, &server, &connection.tcp_tx, a).await;
+    Ok(())
+}
+
+/// Block or unblock the person `key` names on `server`: a sealed vault item,
+/// and `account-blocks` tells the front end. The person is told nothing.
+#[tauri::command]
+pub async fn account_block(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    server: String,
+    key: String,
+    label: String,
+    on: bool,
+) -> Result<(), String> {
+    let connections = state.connections.read().await;
+    let (connection, link) = signed_in(&connections, &server)?;
+    let a = link.session().set_block(&key, &label, on)?;
     run(&app, &server, &connection.tcp_tx, a).await;
     Ok(())
 }

@@ -202,3 +202,47 @@ fn emote_names_and_pack_labels() {
     }
     assert_eq!(format!("{:?}", Secret("hunter2".into())), "Secret(…)");
 }
+
+/// What the desktop emits as `posts-hidden`, which the browser's backend makes the
+/// same (`posts-marks.ts`) and the store reads (`onPostsHidden`).
+#[test]
+fn a_posts_mark_in_json_is_what_the_front_end_reads() {
+    let mark = |account| PostsMark {
+        account,
+        name: "dan".into(),
+        since_ms: 1_000,
+        before_ms: 2_000,
+        by: "bobby".into(),
+    };
+    assert_eq!(
+        serde_json::to_value(mark(None)).unwrap(),
+        serde_json::json!({ "account": null, "name": "dan", "since_ms": 1000, "before_ms": 2000, "by": "bobby" })
+    );
+    assert_eq!(
+        serde_json::to_value(mark(Some([7; 16]))).unwrap()["account"],
+        serde_json::json!([7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7])
+    );
+}
+
+/// What the desktop emits as `report-takers`, which `cleanTakers` reads as it does the
+/// browser's decoder, where None is undefined.
+#[test]
+fn a_report_taker_in_json_is_what_the_front_end_reads() {
+    let taker = |user_id, account| ReportTaker {
+        user_id,
+        account,
+        name: "bobby".into(),
+    };
+    assert_eq!(
+        serde_json::to_value(taker(None, None)).unwrap(),
+        serde_json::json!({ "user_id": null, "account": null, "name": "bobby" })
+    );
+    assert_eq!(
+        serde_json::to_value(taker(Some(5), Some([7; 16]))).unwrap(),
+        serde_json::json!({
+            "user_id": 5,
+            "account": [7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7],
+            "name": "bobby",
+        })
+    );
+}

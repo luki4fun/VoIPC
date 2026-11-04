@@ -33,6 +33,7 @@ import {
   unreadPerChannel,
   releaseBrowserMarks,
 } from "./stores/chat.js";
+import { loadGuestBlocks } from "./stores/blocks.js";
 import { pendingInvites } from "./stores/invites.js";
 import { parseHostPort } from "./invite.js";
 import { addNotification } from "./stores/notifications.js";
@@ -295,6 +296,7 @@ export async function connectTo(
   // returns, and `listenServer` drops events for servers that are not open.
   openServers.update((list) => [...list, server]);
   connectionState.of(server).set("connecting");
+  loadGuestBlocks(server);
 
   let id: number;
   for (let tries = 0; ; tries++) {
@@ -632,6 +634,7 @@ async function reconnectLoop(
       // Registered before connecting: the server sends the channel list while
       // logging us in, so it can be here before `connect` has resolved.
       const listArrived = nextChannelList(server);
+      loadGuestBlocks(server);
       const id = await invoke<number>("connect", {
         address: server,
         username: d.username,

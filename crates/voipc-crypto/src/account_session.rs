@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use voipc_protocol::conv::{hex, unhex16};
 use voipc_protocol::messages::{AccountReply, AccountRequest, ClientMessage};
-use voipc_protocol::types::{AccountInfo, ProviderKind, UserInfo};
+use voipc_protocol::types::{AccountInfo, ProviderKind, ReportTaker, UserInfo};
 use zeroize::Zeroizing;
 
 use crate::account::{
@@ -103,6 +103,7 @@ impl AccountSession {
             "info": info,
             "recovery": signed.recovery,
             "prefs": sync.prefs(),
+            "blocks": sync.blocks(),
         });
         let s = AccountSession {
             sync,
@@ -457,21 +458,35 @@ impl AccountSession {
     }
 
     /// A direct message for an account that is away (`account_hex`): kept in
-    /// the stored log only, which is the one way it reaches them.
+    /// the stored log only, which is the one way it reaches them. `once`: a
+    /// report its writer chose to keep sealed for them, whatever cloud copies
+    /// say; everything else needs those on.
     pub fn kept_dm(
         &mut self,
         account_hex: &str,
         envelope: Vec<u8>,
         sent_at: u64,
         ttl_secs: Option<u32>,
+        once: bool,
     ) -> Result<Actions, String> {
-        if !self.cloud() {
+        if !self.cloud() && !once {
             return Err("They are away, and your messages are not kept on this server".into());
         }
         let peer = unhex16(account_hex).ok_or("not an account id")?;
         Ok(Actions::sending(
-            self.sync.send_dm(peer, envelope, sent_at, ttl_secs),
+            self.sync.keep_dm(peer, envelope, sent_at, ttl_secs),
         ))
+    }
+
+    /// Who the relay says takes reports. Someone in a hidden channel is on no
+    /// roster, and without this their identity would go unchecked against the
+    /// pins, and no copy be kept for them. Noted before anything is sent to them.
+    pub fn note_takers(&mut self, takers: &[ReportTaker]) {
+        for t in takers {
+            if let (Some(user_id), Some(account)) = (t.user_id, t.account) {
+                self.roster.insert(user_id, (account, t.name.clone()));
+            }
+        }
     }
 
     /// A message written in a channel with log `log` (`ChannelInfo::log`;
@@ -638,6 +653,16 @@ impl AccountSession {
 
     pub fn set_prefs(&mut self, prefs: Prefs) -> Actions {
         Actions::sending(self.sync.set_prefs(prefs))
+    }
+
+    /// Blocks or unblocks the person `key` names (`AccountSync::set_block`), and
+    /// tells the front end who is blocked now. `Err` says why the list could not
+    /// be kept. Nothing here reaches the person, and the relay gets one sealed item.
+    pub fn set_block(&mut self, key: &str, label: &str, on: bool) -> Result<Actions, String> {
+        let mut a = Actions::sending(self.sync.set_block(key, label, on)?);
+        a.emit
+            .push(("account-blocks", json!({ "blocks": self.sync.blocks() })));
+        Ok(a)
     }
 
     pub fn set_share(&mut self, share: bool) {
@@ -943,6 +968,53 @@ mod tests {
     }
 
     #[test]
+    fn identities_of_report_takers_are_checked() {
+        let (mut s, _) = session(false, false);
+        let key = || {
+            IdentityKeyPair::generate(&mut crate::rng())
+                .public_key()
+                .serialize()
+                .to_vec()
+        };
+        let (k1, k2) = (key(), key());
+        let taker = |user_id, account, name: &str| ReportTaker {
+            user_id,
+            account,
+            name: name.into(),
+        };
+        assert!(
+            s.check_identity(5, &k1).emit.is_empty() && s.check_identity(5, &k2).emit.is_empty(),
+            "on no roster and not noted: nothing checks them"
+        );
+        s.note_takers(&[
+            taker(Some(5), Some([5; 16]), "bob"),
+            // Neither of these is anyone to check, by id or by account
+            taker(None, Some([6; 16]), "away"),
+            taker(Some(7), None, "admin"),
+        ]);
+        assert!(s.check_identity(5, &k1).emit.is_empty(), "pinned");
+        let a = s.check_identity(5, &k2);
+        assert_eq!(a.emit.len(), 1);
+        assert_eq!(
+            (
+                a.emit[0].0,
+                a.emit[0].1["user_id"].as_u64(),
+                a.emit[0].1["name"].as_str()
+            ),
+            ("identity-key-changed", Some(5), Some("bob"))
+        );
+        s.set_prefs(Prefs {
+            cloud: true,
+            asked: true,
+        });
+        assert!(
+            s.kept_for(5),
+            "and a copy is kept for them, as for a roster"
+        );
+        assert!(!s.kept_for(7), "the token has no account");
+    }
+
+    #[test]
     fn identities_are_checked_for_the_accounts_the_rosters_name() {
         let (mut s, _) = session(false, false);
         let key = || {
@@ -996,7 +1068,14 @@ mod tests {
             "cloud copies are off"
         );
         assert!(!s.kept_for(5));
-        assert!(s.kept_dm(&hex(&[5; 16]), b"x".to_vec(), 1, None).is_err());
+        assert!(s
+            .kept_dm(&hex(&[5; 16]), b"x".to_vec(), 1, None, false)
+            .is_err());
+        assert!(
+            s.kept_dm(&hex(&[5; 16]), b"x".to_vec(), 1, None, true)
+                .is_ok(),
+            "a report kept for this one message"
+        );
         s.set_prefs(Prefs {
             cloud: true,
             asked: true,
@@ -1008,7 +1087,28 @@ mod tests {
                 .is_empty(),
             "no log in that channel"
         );
-        assert!(s.kept_dm("zz", b"x".to_vec(), 1, None).is_err());
+        assert!(s.kept_dm("zz", b"x".to_vec(), 1, None, false).is_err());
         assert_eq!(s.memory_key(), memory_key(&RELAY, "me"));
+    }
+
+    /// The front end starts from the list and hears each change from here, on
+    /// both backends. The relay hears one sealed item, the person nothing.
+    #[test]
+    fn a_block_is_told_to_the_front_end_and_nobody_else() {
+        let (mut s, started) = session(false, false);
+        assert_eq!(started.emit[0].1["blocks"], json!([]));
+        let key = format!("a:{}", hex(&[5; 16]));
+        let a = s.set_block(&key, "bob", true).unwrap();
+        assert_eq!(a.send.len(), 1);
+        assert_eq!(sends(&a, "VaultPut"), 1, "{:?}", a.send);
+        assert_eq!(a.emit[0].0, "account-blocks");
+        assert_eq!(a.emit[0].1["blocks"], json!([[key, "bob"]]));
+        assert!(
+            s.set_block("nobody", "x", true).is_err(),
+            "an error for the front end to show"
+        );
+        // The list goes with the next sign-in: from the vault, in `AccountSync`'s tests
+        let a = s.set_block(&key, "bob", false).unwrap();
+        assert_eq!(a.emit[0].1["blocks"], json!([]));
     }
 }

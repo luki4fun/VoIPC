@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import {
   canManage,
   canManageAs,
+  hideRight,
   needsNsfwConsent,
   postBlock,
   slowModeLabel,
@@ -73,4 +74,27 @@ test("slow-mode labels read like people talk", () => {
   assert.equal(slowModeLabel(90), "90 s");
   // The server's cap: the dialog must not offer more than it accepts
   assert.equal(Math.max(...SLOW_MODE_CHOICES), 6 * 60 * 60);
+});
+
+test("whoever may hide: a holder, on anyone but another holder, and nobody in an anonymous channel", () => {
+  const open = { anonymous: false };
+  const holder = { hide: true, admin: false };
+  const admin = { hide: true, admin: true };
+  const nobody = { hide: false, admin: false };
+  assert.equal(hideRight(open, nobody, false), false, "a plain member");
+  assert.equal(hideRight(open, holder, false), true);
+  assert.equal(hideRight({ anonymous: true }, holder, false), false, "it would unmask them as staff");
+  assert.equal(hideRight({ anonymous: true }, admin, false), false, "an admin neither");
+  assert.equal(hideRight(open, holder, true), false, "a listed writer is spared");
+  assert.equal(hideRight(open, admin, true), true, "but for an admin, as with a kick");
+  assert.equal(hideRight(open, { hide: false, admin: true }, true), true, "an admin holds it whatever the list says");
+  // Not a privilege of its own, and no holder of another one hides by it
+  assert.equal(hideRight(open, nobody, true), false);
+});
+
+test("a hide's holder is not hurried by slow mode, and stays out of an announcement channel", () => {
+  const slow = { text: true, announce: false, slow_mode_secs: 60 };
+  assert.deepEqual(postBlock(slow, false, 1000, 1000), { kind: "slow", remainingSecs: 60 }, "the control");
+  assert.equal(postBlock(slow, false, 1000, 1000, true), null);
+  assert.deepEqual(postBlock({ ...slow, announce: true }, false, 1000, 1000, true), { kind: "announce" });
 });

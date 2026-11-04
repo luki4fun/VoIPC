@@ -17,6 +17,7 @@
 
   import { connectionState, isMuted, isTransmitting, voiceUserId } from "../stores/connection.js";
   import { voice, voiceServer } from "../stores/channels.js";
+  import { voiceRestriction } from "../stores/restrictions.js";
   import { speakingUsers } from "../stores/users.js";
   import { audioSetupOpen, pttKey, pttHoldMode } from "../stores/settings.js";
   import { keyOwner } from "../keybind.js";
@@ -54,6 +55,7 @@
       $voiceState === "connected" &&
       !$isTransmitting &&
       !$isMuted &&
+      !$voiceRestriction?.voice &&
       !$audioSetupOpen
     ) {
       startTransmit();

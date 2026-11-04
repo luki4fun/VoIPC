@@ -23,6 +23,7 @@ import { share } from "./share";
 import { Files, originOf, sanitizeImage } from "./files";
 import { Emotes, emoteLimitsOf } from "./emotes";
 import { motionOf } from "./media";
+import { postsMarks } from "./posts-marks";
 
 /** Bound for the authentication response (network.rs CONNECT_TIMEOUT). */
 const AUTH_TIMEOUT_MS = 10_000;
@@ -731,6 +732,19 @@ export class Session implements SessionContext, AccountHost {
         break;
       case "MyBadges":
         this.emit("my-badges", b.badges);
+        break;
+      case "Restrictions":
+        this.emit("restrictions", { list: b.list });
+        break;
+      case "ChatMods":
+        this.emit("chat-mods", { mods: b.mods });
+        break;
+      case "PostsHidden":
+        this.emit("posts-hidden", { marks: postsMarks(b.marks) });
+        break;
+      case "ReportTakers":
+        this.account?.noteTakers(b.takers);
+        this.emit("report-takers", { takers: b.takers });
         break;
       case "GroupStyles":
         this.emit("group-styles", b.groups);
@@ -1641,7 +1655,10 @@ export class Session implements SessionContext, AccountHost {
   sendKeptDm(accountHex: string, content: string, ttlSecs?: number, refs?: MessageRefs): string {
     if (!this.account) throw new Error("Not signed in to an account on that server");
     const messageId = wasm().newMessageId();
-    this.account.keptDm(this, accountHex, wasm().envelope(messageId, content, ttlSecs, refs), ttlSecs);
+    // A report kept for this one message: the dialog asked. Anything else needs
+    // cloud copies on.
+    const once = !!refs?.fwd?.report;
+    this.account.keptDm(this, accountHex, wasm().envelope(messageId, content, ttlSecs, refs), ttlSecs, once);
     return messageId;
   }
 

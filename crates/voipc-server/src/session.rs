@@ -17,6 +17,7 @@ use voipc_protocol::messages::{
 };
 use voipc_protocol::types::*;
 
+use crate::accounts::modlog;
 use crate::accounts::Powers;
 use crate::control::{control_queue, ControlTx};
 use crate::state::ServerState;
@@ -194,6 +195,9 @@ pub async fn handle_connection<S>(
     crate::layout::send_styles(&state, &tx).await;
     crate::accounts::profile::send_server_profile(&state, &tx).await;
     crate::accounts::mention_power_at_connect(&state, session_id, user_id, &tx).await;
+    crate::accounts::chat_mods_at_connect(&state, &tx).await;
+    crate::accounts::modlog::send_marks(&state, &tx).await;
+    crate::restrict::at_connect(&state, session_id, user_id, &tx);
 
     // Auto-join General (channel 0)
     if let Err(e) = handle_join_channel(&state, user_id, session_id, 0, None, &tx).await {
@@ -655,6 +659,14 @@ where
     // packets, but its UI only knows user_ids.
     let session_id = user_id;
 
+    // A guest a moderator took off posts does not get to say it in a name instead, as an
+    // account is refused a display name. Not for the wait: that would rename any waiting
+    // guest who reloads, and stop no first visit.
+    let username = if signed_in.is_none() && crate::restrict::guest_text_held(state, peer_ip) {
+        tagged.map_or_else(|| "guest".to_string(), |(_, tag)| format!("guest#{tag}"))
+    } else {
+        username
+    };
     let username_lower = username.to_lowercase();
     let account_id = signed_in.as_ref().map(|s| s.user.id.0);
     match &signed_in {
@@ -771,6 +783,7 @@ where
     if let Some(why) = crate::bans::refusal(state, peer_ip, held) {
         force_disconnect(state, session_id, &why).await;
     }
+    crate::restrict::admit(state, session_id);
     // The bridge can start routing this session's media now
     let _ = sid_tx.send(session_id);
 
@@ -824,6 +837,15 @@ fn may_change_state(state: &Arc<ServerState>, session_id: SessionId, user_id: Us
         debug!(user_id, "state change rate limit exceeded, dropping");
     }
     allowed
+}
+
+/// A restriction or the wait holds their words: a poke rings, an invite pops up, and
+/// a channel's name is public text.
+fn text_held(state: &ServerState, session_id: SessionId) -> bool {
+    state
+        .sessions
+        .get(&session_id)
+        .is_some_and(|s| s.silence.text())
 }
 
 /// Whether both users are members of the channel a relay names.
@@ -910,6 +932,10 @@ async fn handle_message(
             anonymous,
             text,
         } => {
+            if text_held(state, session_id) {
+                channel_error(tx, crate::restrict::TEXT_HELD).await;
+                return Ok(());
+            }
             let allowed = state.spend(session_id, |s| &mut s.create_channel_rate);
             if !allowed {
                 channel_error(tx, "rate limit exceeded, try again later").await;
@@ -1084,6 +1110,14 @@ async fn handle_message(
         ClientMessage::ProfilePictureGet { hash } => {
             crate::accounts::profile::answer_picture(state, session_id, hash, tx).await;
         }
+        ClientMessage::ReportTakersGet => {
+            if !state.spend(session_id, |s| &mut s.report_rate) {
+                channel_error(tx, crate::report::ASKED_TOO_OFTEN).await;
+                return Ok(());
+            }
+            let takers = crate::report::takers_for(state, session_id, user_id).await;
+            let _ = send_msg(tx, &ServerMessage::ReportTakers { takers });
+        }
         ClientMessage::RequestChannelUsers { channel_id } => {
             let allowed = state.is_channel_public_or_member(channel_id, user_id).await
                 || state.is_admin(session_id);
@@ -1098,6 +1132,10 @@ async fn handle_message(
             channel_id,
             target_user_id,
         } => {
+            if text_held(state, session_id) {
+                channel_error(tx, crate::restrict::TEXT_HELD).await;
+                return Ok(());
+            }
             // An invite raises a popup on the target's screen, every time it
             // is sent — the invite set dedupes, the notification does not. The
             // same budget as a poke, for the same reason.
@@ -1105,35 +1143,36 @@ async fn handle_message(
             if !allowed {
                 channel_error(tx, "sending too fast, slow down").await;
             } else {
-                handle_send_invite(state, user_id, channel_id, target_user_id, tx).await?;
+                handle_send_invite(state, user_id, session_id, channel_id, target_user_id, tx)
+                    .await?;
             }
         }
         ClientMessage::AcceptInvite { channel_id } => {
-            // Whether there is anything to accept, read before the join spends
-            // the invite. The join answers Ok whether or not it went through,
-            // so without this anybody could make any creator's client say that
+            // Whether there is anything to accept, and who asked, read before the
+            // join spends the invite. The join answers Ok whether or not it went
+            // through, so without this anybody could make anyone's client say that
             // somebody of their choosing had accepted.
-            let invited = {
-                let channels = state.channels.read().await;
-                channels
-                    .get(&channel_id)
-                    .is_some_and(|ch| ch.invited_users.contains(&user_id))
-            };
-            if !invited {
+            let inviter = state
+                .channels
+                .read()
+                .await
+                .get(&channel_id)
+                .filter(|ch| ch.invited_users.contains(&user_id))
+                .map(|ch| ch.inviter_of(user_id));
+            let Some(inviter) = inviter else {
                 return Ok(());
-            }
+            };
             // Join with no password — validate_join will check invite set
             handle_join_channel(state, user_id, session_id, channel_id, None, tx).await?;
-            // Notify the channel creator, if the join really happened
-            let creator_id = {
-                let channels = state.channels.read().await;
-                channels
-                    .get(&channel_id)
-                    .filter(|ch| ch.members.contains(&user_id))
-                    .and_then(|ch| ch.info.created_by)
-            };
-            if let Some(creator_id) = creator_id {
-                if let Some(session) = state.sessions.get(&creator_id) {
+            // Notify who asked, if the join really happened
+            let joined = state
+                .channels
+                .read()
+                .await
+                .get(&channel_id)
+                .is_some_and(|ch| ch.members.contains(&user_id));
+            if joined {
+                if let Some(session) = inviter.and_then(|id| state.sessions.get(&id)) {
                     let _ = send_msg(
                         &session.control_tx,
                         &ServerMessage::InviteAccepted {
@@ -1152,6 +1191,10 @@ async fn handle_message(
             ciphertext,
             message_type,
         } => {
+            if text_held(state, session_id) {
+                channel_error(tx, crate::restrict::TEXT_HELD).await;
+                return Ok(());
+            }
             if relayable(&ciphertext, tx).await {
                 // Pokes play a sound and raise an OS notification — same budget as chat
                 let allowed = state.spend(session_id, |s| &mut s.chat_rate);
@@ -1440,17 +1483,7 @@ async fn handle_message(
             if !state.can(session_id, Powers::BANS) {
                 admin_error(tx, "not an admin").await;
             } else {
-                match crate::bans::remove(state, id).await {
-                    Ok(true) => info!(user_id, id, "admin unban"),
-                    Ok(false) => {}
-                    Err(e) => warn!("lifting a ban: {e:#}"),
-                }
-                let _ = send_msg(
-                    tx,
-                    &ServerMessage::AdminBans {
-                        bans: crate::bans::list(state),
-                    },
-                );
+                handle_admin_unban(state, session_id, id, tx).await;
             }
         }
         ClientMessage::AdminListBans => {
@@ -1458,7 +1491,7 @@ async fn handle_message(
                 let _ = send_msg(
                     tx,
                     &ServerMessage::AdminBans {
-                        bans: crate::bans::list(state),
+                        bans: crate::bans::list_for(state, state.is_admin(session_id)),
                     },
                 );
             } else {
@@ -1474,6 +1507,31 @@ async fn handle_message(
                 handle_admin_ban_account(state, session_id, &name, reason, duration_secs, tx).await;
             } else {
                 admin_error(tx, "not an admin").await;
+            }
+        }
+        // Top-level as the kick and the ban are: a token admin on a relay without
+        // accounts acts too, and an AccountRequest needs an account
+        ClientMessage::AdminRestrict {
+            user_id: target_id,
+            voice,
+            text,
+            duration_secs,
+            reason,
+        } => {
+            if !state.can(session_id, Powers::RESTRICT) {
+                admin_error(tx, "not an admin").await;
+            } else if may_change_state(state, session_id, user_id) {
+                crate::restrict::handle(
+                    state,
+                    session_id,
+                    target_id,
+                    voice,
+                    text,
+                    duration_secs,
+                    reason,
+                    tx,
+                )
+                .await;
             }
         }
 
@@ -2176,6 +2234,44 @@ async fn handle_kick_user(
             .get(&target_id)
             .is_some_and(|t| t.is_admin || t.is_moderator);
     let is_text = state.is_text_channel(channel_id).await;
+    let (creator, channel_key, channel_name) = state
+        .channels
+        .read()
+        .await
+        .get(&channel_id)
+        .map(|c| {
+            (
+                c.info.created_by == Some(requester_id),
+                c.gate_key.clone(),
+                c.info.name.clone(),
+            )
+        })
+        .unwrap_or_default();
+    // A creator's kick in their own channel takes no privilege, whatever else they
+    // hold, and leaves no row
+    if moderates && !creator {
+        if let Err(e) = state
+            .may_kick(channel_id, requester_id, target_id, moderates, spared)
+            .await
+        {
+            channel_error(tx, e.to_string()).await;
+            return Ok(());
+        }
+        let (target, target_name) = modlog::target_of(state, target_id, Some(channel_id)).await;
+        let row = modlog::Entry {
+            action: "channel_kick",
+            target,
+            target_name: &target_name,
+            channel_key: &channel_key,
+            channel_name: &channel_name,
+            ..Default::default()
+        };
+        if let Err(e) = modlog::put(state, requester_session_id, row).await {
+            warn!("keeping a kick: {e:#}");
+            channel_error(tx, "the kick could not be kept").await;
+            return Ok(());
+        }
+    }
     match state
         .kick_user(channel_id, requester_id, target_id, moderates, spared)
         .await
@@ -2299,16 +2395,60 @@ pub(crate) async fn evict(state: &Arc<ServerState>, channel_id: ChannelId, targe
     }
 }
 
-/// Handle a channel invite from the channel creator.
+/// Handle a channel invite: from the channel creator, or a summon, from a holder of
+/// `voipc:channels` standing in the room (`check_invite`). Nothing happens to whoever
+/// is asked without their yes. A summon writes its row first, as a moderator's channel
+/// kick does; a creator's invite takes no privilege and leaves no row.
 async fn handle_send_invite(
     state: &Arc<ServerState>,
     requester_id: UserId,
+    session_id: SessionId,
     channel_id: ChannelId,
     target_user_id: UserId,
     tx: &ControlTx,
 ) -> Result<()> {
+    // Nobody reaches into a channel they cannot see, by id either
+    if !state.may_reach(session_id, channel_id).await {
+        channel_error(tx, "channel does not exist").await;
+        return Ok(());
+    }
+    let manages = state.can(session_id, Powers::CHANNELS);
+    let takes_a_row = match state
+        .may_invite(channel_id, requester_id, target_user_id, manages)
+        .await
+    {
+        Ok(takes_a_row) => takes_a_row,
+        Err(e) => {
+            channel_error(tx, e.to_string()).await;
+            return Ok(());
+        }
+    };
+    if takes_a_row {
+        // By any channel: someone picked from an anonymous room's roster stays masked
+        let (target, target_name) = modlog::target_of(state, target_user_id, None).await;
+        let (channel_key, channel_name) = state
+            .channels
+            .read()
+            .await
+            .get(&channel_id)
+            .map(|c| (c.gate_key.clone(), c.info.name.clone()))
+            .unwrap_or_default();
+        let row = modlog::Entry {
+            action: "summon",
+            target,
+            target_name: &target_name,
+            channel_key: &channel_key,
+            channel_name: &channel_name,
+            ..Default::default()
+        };
+        if let Err(e) = modlog::put(state, session_id, row).await {
+            warn!("keeping a summon: {e:#}");
+            channel_error(tx, "the invite could not be kept").await;
+            return Ok(());
+        }
+    }
     match state
-        .add_invite(channel_id, requester_id, target_user_id)
+        .add_invite(channel_id, requester_id, target_user_id, manages)
         .await
     {
         Ok((channel_name, mut invited_by)) => {
@@ -2386,10 +2526,12 @@ async fn handle_decline_invite(
     user_id: UserId,
     channel_id: ChannelId,
 ) -> Result<()> {
-    // Look up the channel creator to notify them
-    let creator_id = {
+    // Look up who asked, to notify them
+    let inviter_id = {
         let channels = state.channels.read().await;
-        channels.get(&channel_id).and_then(|ch| ch.info.created_by)
+        channels
+            .get(&channel_id)
+            .and_then(|ch| ch.inviter_of(user_id))
     };
 
     // A decline for a channel nobody invited us to is a message of the
@@ -2399,9 +2541,9 @@ async fn handle_decline_invite(
         return Ok(());
     }
 
-    // Notify the creator
-    if let Some(creator_id) = creator_id {
-        if let Some(session) = state.sessions.get(&creator_id) {
+    // Notify them
+    if let Some(inviter_id) = inviter_id {
+        if let Some(session) = state.sessions.get(&inviter_id) {
             let _ = send_msg(
                 &session.control_tx,
                 &ServerMessage::InviteDeclined {
@@ -2456,7 +2598,7 @@ async fn channel_error(tx: &ControlTx, reason: impl Into<String>) {
     );
 }
 
-async fn admin_error(tx: &ControlTx, reason: &str) {
+pub(crate) async fn admin_error(tx: &ControlTx, reason: &str) {
     let _ = send_msg(
         tx,
         &ServerMessage::AdminError {
@@ -2542,6 +2684,9 @@ async fn handle_admin_login(
             None,
         )
         .await;
+        // Whatever the wait is set to: a row on this address held them as a guest
+        crate::restrict::settle(state, session_id).await;
+        crate::restrict::reasons_for(state, tx);
         return;
     }
     let failures = state
@@ -2581,7 +2726,7 @@ pub(crate) async fn force_disconnect(state: &ServerState, session_id: SessionId,
 }
 
 /// Who a ban says banned: the account's name, or the admin token's holder.
-fn banned_by(state: &ServerState, session_id: SessionId) -> String {
+pub(crate) fn banned_by(state: &ServerState, session_id: SessionId) -> String {
     state
         .sessions
         .get(&session_id)
@@ -2589,7 +2734,9 @@ fn banned_by(state: &ServerState, session_id: SessionId) -> String {
         .unwrap_or_else(|| "admin token".into())
 }
 
-fn ban_reason(reason: String) -> String {
+/// What a step keeps as its reason, its row and its ban alike: Postgres refuses a NUL.
+pub(crate) fn ban_reason(reason: String) -> String {
+    let reason: String = reason.chars().filter(|c| !c.is_control()).collect();
     let reason: String = reason.trim().chars().take(200).collect();
     if reason.is_empty() {
         "no reason given".to_string()
@@ -2632,8 +2779,21 @@ async fn handle_admin_kick(
         return;
     }
     let reason = ban_reason(reason);
+    let (row_target, row_name) = modlog::target_of(state, target_sid, None).await;
 
     let Some((duration_secs, with_account)) = ban else {
+        let row = modlog::Entry {
+            action: "kick",
+            target: row_target,
+            target_name: &row_name,
+            reason: &reason,
+            ..Default::default()
+        };
+        if let Err(e) = modlog::put(state, admin_user_id, row).await {
+            warn!("keeping a kick: {e:#}");
+            admin_error(tx, "the kick could not be kept").await;
+            return;
+        }
         info!(admin = admin_user_id, target = target_id, "admin kick");
         force_disconnect(
             state,
@@ -2644,24 +2804,46 @@ async fn handle_admin_kick(
         return;
     };
 
-    let Some((ip, label, account)) = state.sessions.get(&target_sid).map(|s| {
-        (
-            s.peer_ip,
-            s.username.clone(),
-            s.account.as_ref().map(|a| a.user.id.0),
-        )
-    }) else {
+    let Some((ip, account)) = state
+        .sessions
+        .get(&target_sid)
+        .map(|s| (s.peer_ip, s.account.as_ref().map(|a| a.user.id.0)))
+    else {
         admin_error(tx, "user not found").await;
         return;
     };
+    // The name this banner may see: the ban list must not tie a pseudonym to
+    // the person it hides for whoever reads the list next.
+    let (real, alias) = state.names_of(target_sid).await;
+    let label = crate::state::pick_name(&real, &alias, by_admin);
     let duration = (duration_secs > 0).then(|| Duration::from_secs(u64::from(duration_secs)));
     let by = banned_by(state, admin_user_id);
     let mut targets = vec![crate::bans::Target::Addr(ip)];
     if let (true, Some(a)) = (with_account, account) {
         targets.push(crate::bans::Target::Account(a));
     }
+    let covers = if targets.len() > 1 {
+        "address and account"
+    } else {
+        "address"
+    };
+    let row = modlog::Entry {
+        action: "ban",
+        target: row_target,
+        target_name: &row_name,
+        reason: &reason,
+        detail: &modlog::ban_detail(covers, u64::from(duration_secs)),
+        ..Default::default()
+    };
+    if let Err(e) = modlog::put(state, admin_user_id, row).await {
+        warn!("keeping a ban: {e:#}");
+        admin_error(tx, "the ban could not be kept").await;
+        return;
+    }
     for t in targets {
-        if let Err(e) = crate::bans::add(state, t, &label, &reason, &by, duration).await {
+        let behind = alias.as_deref().filter(|_| by_admin);
+        if let Err(e) = crate::bans::add_as(state, t, &label, behind, &reason, &by, duration).await
+        {
             warn!("keeping a ban: {e:#}");
             admin_error(tx, "the ban could not be kept").await;
             return;
@@ -2726,8 +2908,38 @@ async fn handle_admin_ban_account(
     {
         return admin_error(tx, "you cannot ban yourself").await;
     }
+    // A moderator moderates people, not the ones who moderate: by name as in a
+    // kick, and here they may not even be online.
+    if !state.is_admin(session_id) {
+        match relay.store().user_scopes(user.id).await {
+            Ok(scopes) if crate::accounts::holds_power(&scopes) => {
+                return admin_error(
+                    tx,
+                    "only an admin can kick or ban an admin or someone with privileges",
+                )
+                .await;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!("reading an account's privileges: {e}");
+                return admin_error(tx, "the ban could not be kept").await;
+            }
+        }
+    }
     let duration = (duration_secs > 0).then(|| Duration::from_secs(u64::from(duration_secs)));
     let reason = ban_reason(reason);
+    let row = modlog::Entry {
+        action: "ban",
+        target: Some(user.id.0),
+        target_name: &user.username,
+        reason: &reason,
+        detail: &modlog::ban_detail("account", u64::from(duration_secs)),
+        ..Default::default()
+    };
+    if let Err(e) = modlog::put(state, session_id, row).await {
+        warn!("keeping a ban: {e:#}");
+        return admin_error(tx, "the ban could not be kept").await;
+    }
     if let Err(e) = crate::bans::add(
         state,
         crate::bans::Target::Account(user.id.0),
@@ -2746,7 +2958,48 @@ async fn handle_admin_ban_account(
     let _ = send_msg(
         tx,
         &ServerMessage::AdminBans {
-            bans: crate::bans::list(state),
+            bans: crate::bans::list_for(state, state.is_admin(session_id)),
+        },
+    );
+}
+
+/// Lifts ban `id`. Only a ban the list shows, so that its row can say whose: one
+/// the shell made a moment ago can be lifted once it is in the list. That name may
+/// be a pseudonym, so the row never ties it to the account.
+async fn handle_admin_unban(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    id: u64,
+    tx: &ControlTx,
+) {
+    let ban = state.bans.iter().find(|e| e.value().id == id).map(|e| {
+        let covers = match e.key() {
+            crate::bans::Key::Account(_) => "account",
+            crate::bans::Key::Addr(_) => "address",
+        };
+        (e.value().log_name().to_string(), covers)
+    });
+    if let Some((name, covers)) = ban {
+        let row = modlog::Entry {
+            action: "unban",
+            target_name: &name,
+            detail: covers,
+            ..Default::default()
+        };
+        if let Err(e) = modlog::put(state, session_id, row).await {
+            warn!("keeping an unban: {e:#}");
+            return admin_error(tx, "the unban could not be kept").await;
+        }
+        match crate::bans::remove(state, id).await {
+            Ok(true) => info!(session_id, id, "admin unban"),
+            Ok(false) => {}
+            Err(e) => warn!("lifting a ban: {e:#}"),
+        }
+    }
+    let _ = send_msg(
+        tx,
+        &ServerMessage::AdminBans {
+            bans: crate::bans::list_for(state, state.is_admin(session_id)),
         },
     );
 }
@@ -2786,10 +3039,12 @@ async fn handle_request_channel_history(
     // same person at once, and each request costs them an encrypt and up to
     // ~48 KiB. A non-sharer spends no token — there is nothing to protect them
     // from beyond the question itself.
+    // Someone held would be refused the answer, so they are not asked and do not
+    // pay for the encrypt.
     let serve = state
         .sessions
         .get_mut(&target_sid)
-        .map(|mut s| s.shares_history && s.history_serve_rate.try_consume())
+        .map(|mut s| s.shares_history && !s.silence.text() && s.history_serve_rate.try_consume())
         .unwrap_or(false);
     if !serve {
         return;
@@ -2821,7 +3076,7 @@ async fn handle_send_channel_history(
     if state
         .sessions
         .get(&from_session_id)
-        .is_some_and(|s| s.listen_only.contains(&channel_id))
+        .is_some_and(|s| s.listen_only.contains(&channel_id) || s.silence.text())
     {
         return;
     }
@@ -2909,7 +3164,7 @@ async fn handle_start_screen_share(
 }
 
 /// Handle a screen share stop request.
-async fn handle_stop_screen_share(
+pub(crate) async fn handle_stop_screen_share(
     state: &Arc<ServerState>,
     user_id: UserId,
     session_id: SessionId,
@@ -3228,6 +3483,14 @@ async fn handle_encrypted_direct_message(
     message_type: u8,
     tx: &ControlTx,
 ) -> Result<()> {
+    if state
+        .sessions
+        .get(&from_session_id)
+        .is_some_and(|s| s.silence.direct())
+    {
+        channel_error(tx, crate::restrict::DIRECT_HELD).await;
+        return Ok(());
+    }
     let (real, alias) = state.names_of(from_user_id).await;
 
     let timestamp = SystemTime::now()

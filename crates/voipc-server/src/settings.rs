@@ -39,6 +39,12 @@ pub struct ServerSettings {
     pub server_name: Option<String>,
     #[serde(default)]
     pub server_description: Option<String>,
+
+    /// Minutes a new member waits before they may speak, post or write directly,
+    /// counted from the account's creation or the guest's first connection from
+    /// that address. 0 (the default): no wait. Restart to change.
+    #[serde(default)]
+    pub new_member_wait_mins: u32,
 }
 
 fn default_empty_channel_timeout() -> u64 {
@@ -54,6 +60,9 @@ fn default_proximity_enabled() -> bool {
     true
 }
 
+/// A week: past that an account is hardly new.
+pub const MAX_NEW_MEMBER_WAIT_MINS: u32 = 10_080;
+
 impl Default for ServerSettings {
     fn default() -> Self {
         Self {
@@ -64,6 +73,7 @@ impl Default for ServerSettings {
             game_token: None,
             server_name: None,
             server_description: None,
+            new_member_wait_mins: 0,
         }
     }
 }
@@ -78,6 +88,11 @@ impl ServerSettings {
         crate::channels::refuse_placeholder("game_token", settings.game_token.as_deref())?;
         if !(1..=64).contains(&settings.max_channel_name_len) {
             anyhow::bail!("max_channel_name_len must be between 1 and 64");
+        }
+        if settings.new_member_wait_mins > MAX_NEW_MEMBER_WAIT_MINS {
+            anyhow::bail!(
+                "new_member_wait_mins must be at most {MAX_NEW_MEMBER_WAIT_MINS} (a week)"
+            );
         }
         if settings
             .game_token
@@ -183,5 +198,31 @@ mod tests {
         std::fs::write(&path, r#"{"game_token": "a-real-token-of-length"}"#).unwrap();
         assert!(ServerSettings::load_from_file(&path).is_ok());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn new_member_wait_mins_over_the_limit_refuses_to_start() {
+        let dir = std::env::temp_dir().join(format!("voipc-wait-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("server_settings.json");
+        std::fs::write(&path, r#"{"new_member_wait_mins": 10081}"#).unwrap();
+        let err = ServerSettings::load_from_file(&path)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("new_member_wait_mins"), "{err}");
+        std::fs::write(&path, r#"{"new_member_wait_mins": 10080}"#).unwrap();
+        assert_eq!(
+            ServerSettings::load_from_file(&path)
+                .unwrap()
+                .new_member_wait_mins,
+            10_080
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_settings_file_defaults_to_no_wait() {
+        let old: ServerSettings = serde_json::from_str(r#"{"max_channels": 10}"#).unwrap();
+        assert_eq!(old.new_member_wait_mins, 0);
     }
 }

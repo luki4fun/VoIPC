@@ -50,9 +50,12 @@
     voice,
     voiceChannel,
     voiceServer,
+    voiceUsers,
   } from "./lib/stores/channels.js";
   import { patchUser, users, speakingUsers } from "./lib/stores/users.js";
   import { account, accountHex } from "./lib/stores/account.js";
+  import { blocked } from "./lib/stores/blocks.js";
+  import { isBlocked, silenceChanges } from "./lib/block-rules.js";
   import { addNotification, removeNotification } from "./lib/stores/notifications.js";
   import { availableUpdate, initUpdates } from "./lib/stores/updates.js";
   import { updateToast, type UpdateInfo } from "./lib/update-rules.js";
@@ -81,8 +84,10 @@
     channelMessages,
     joinedTextChannelIds,
     mergeChannelHistory,
+    onPostsHidden,
     openTextChannel,
     flushChatSave,
+    quietBlockedDms,
     receivedNow,
   } from "./lib/stores/chat.js";
   import ChatHistorySetup from "./lib/components/ChatHistorySetup.svelte";
@@ -163,6 +168,7 @@
     forgetLeft,
     isTextChannel,
     listenOnly,
+    hideCheck,
     managesChannel,
     openJoinedTextChannel,
     previewChannel,
@@ -177,21 +183,23 @@
   import type { GroupStyle } from "./lib/member-sections.js";
   import type { WireProfile } from "./lib/profile-rules.js";
   import { callsOn, hasPower, powerTokens, tokensForMe } from "./lib/mention-rules.js";
-  import { mentionPower, myBadges, onMentionPower } from "./lib/stores/powers.js";
+  import { chatMods, mentionPower, myBadges, onChatMods, onMentionPower, onReportTakers, reportTakers } from "./lib/stores/powers.js";
+  import { onRestrictions, restrictions, voiceRestriction } from "./lib/stores/restrictions.js";
+  import { heldNotice, type RestrictionRow } from "./lib/restrict-rules.js";
+  import { writerTag } from "./lib/profile-rules.js";
   import { onPicture, onProfiles, onServerProfile } from "./lib/stores/profiles.js";
   type ServerProfileEvent = Parameters<typeof onServerProfile>[1];
   import {
     chatEvent,
     expiryFor,
-    forHandOff,
-    HISTORY_MAX_MESSAGES,
+    handOffOf,
     MAX_CONVERSATIONS,
     messageRefs,
     notificationBody,
     receivedText,
   } from "./lib/chat-rules.js";
   import { LAYOUT_PICKER_VERSION } from "./lib/ui-prefs.js";
-  import { voiceMode, vadThreshold } from "./lib/stores/voice.js";
+  import { stopTransmit, voiceMode, vadThreshold } from "./lib/stores/voice.js";
   import {
     playChannelSwitchSound,
     playUserJoinedSound,
@@ -216,7 +224,7 @@
   import { shortName } from "./lib/username.js";
   import { mentionNames, mentionsName, parse } from "./lib/markdown.js";
   import { findTarget, isOwn } from "./lib/thread-rules.js";
-  import { cleanLane, micLane } from "./lib/stores/mixer.js";
+  import { cleanLane, micLane, silenceUser, silencedIds } from "./lib/stores/mixer.js";
   import {
     addScreenShare,
     removeScreenShare,
@@ -360,6 +368,24 @@
       .catch(() => {});
   }
 
+  // A block silences someone in the call, whichever server is on screen: only the
+  // voice server's roster may drive this, since `set_user_volume` has no server and
+  // an id on another one is a stranger. By volume alone, which the relay never sees.
+  const voiceBlocked = blocked.at(voiceServer);
+  $effect(() => {
+    const changes = silenceChanges($voiceUsers, $voiceBlocked, !!$voiceChannel?.anonymous, silencedIds());
+    untrack(() => {
+      for (const { id, on } of changes) void silenceUser(id, on);
+    });
+  });
+
+  // What someone newly blocked had waiting stops counting, on every open server
+  const everyBlocked = blocked.all();
+  $effect(() => {
+    const servers = [...$everyBlocked.keys()];
+    untrack(() => servers.forEach(quietBlockedDms));
+  });
+
   // A server can ask every client into a text channel; the ones this user
   // walked out of are skipped. Every open server, not just the one on screen.
   //
@@ -495,6 +521,13 @@
     const names = mentionNames([...people, own]).filter((n) => n === own || n === shortName(own));
     const tree = parse(content, { names });
     return names.some((n) => mentionsName(tree, n));
+  }
+
+  /** Whether someone here is blocked: by their account where a list we see has
+   *  it, else by the name. */
+  function blockedSender(server: string, uid: number, name: string): boolean {
+    const known = get(users.peek(server)).find((u) => u.user_id === uid)?.account ?? rosterAccount(server, uid);
+    return isBlocked(get(blocked.peek(server)), { account: known, username: name }, false);
   }
 
   /** Whether this message came with its sender's power to call on everybody. */
@@ -945,10 +978,24 @@
           return next;
         });
         const name = channelNameById(server, d.channel_id);
+        // A gate letting us speak again means nothing while we are held on the whole server
+        if (!d.on && get(restrictions.peek(server)).get(get(userId.peek(server)))?.voice) return;
         addNotification(
           `${fromServer(server)}${d.on ? `You can only listen and read in ${name}` : `You may speak in ${name} again`}`,
           "info",
         );
+      }),
+
+      listenServer<{ list: RestrictionRow[] }>("restrictions", (server, d) => {
+        const me = get(userId.peek(server));
+        const before = get(restrictions.peek(server)).get(me) ?? null;
+        onRestrictions(server, d.list);
+        const after = get(restrictions.peek(server)).get(me) ?? null;
+        const notice = heldNotice(before, after, Date.now());
+        if (notice) addNotification(`${fromServer(server)}${notice}`, after ? "warning" : "info");
+        // Not through the mute, which goes across every server, is kept and is
+        // announced: this is one server's. A lift re-arms voice activation (VoiceKeys)
+        if (after?.voice && !before?.voice && inVoice(server)) void stopTransmit();
       }),
 
       listenServer<UserInfo>("user-joined", (server, joiner) => {
@@ -1170,6 +1217,14 @@
           mediaKeyToast = null;
         }
 
+        // Its ids go with the connection: a restarted relay numbers from 1 again,
+        // and whoever gets a holder's old id must not call on everybody. The relay
+        // says who holds it again at sign-in.
+        mentionPower.of(server).set(new Set());
+        chatMods.of(server).set(new Map());
+        restrictions.of(server).set(new Map());
+        reportTakers.of(server).set(null);
+
         // A second connection-lost during a reconnect (ServerShutdown is
         // followed by the socket closing) is the loop's business, not a
         // second loop's; neither is one while the first connect is running.
@@ -1340,21 +1395,7 @@
           if (!currentRosterOf(server, channelId).some((u) => u.user_id === data.from_user_id)) {
             return;
           }
-          // Second-hand messages go on: a conversation should outlive the last
-          // person who was there for it, and it stays marked as hearsay all the
-          // way down the chain — sanitizeHistory re-stamps whatever it is handed.
-          const now = Date.now();
-          const text = ($channelMessages.get(chatKey(server, chName)) ?? []).filter(
-            (m) =>
-              (!m.kind || m.kind === "text" || m.kind === "shared") &&
-              // A message whose destruction timer has run out is not history. The
-              // sweep takes it off our own screen within seconds; handing it over
-              // in the meantime would put it back into somebody else's archive
-              // with a fresh copy of the same deadline.
-              !(m.expires_at !== undefined && m.expires_at <= now),
-          );
-          // Without what events did here (reactions, a pin): the reader's own record
-          let msgs: ChatMessage[] = text.slice(-HISTORY_MAX_MESSAGES).map(forHandOff);
+          let msgs: ChatMessage[] = handOffOf($channelMessages.get(chatKey(server, chName)) ?? []);
           // Stay well under the 64 KiB control-message cap (Signal envelope + framing)
           const bytes = (list: ChatMessage[]) =>
             new TextEncoder().encode(JSON.stringify(list)).length;
@@ -1376,6 +1417,9 @@
         messages: unknown[];
       }>("channel-history-received", (server, data) => {
         const chName = channelNameById(server, data.channel_id);
+        // Not from someone blocked. Read and dropped here: the sharer never knows
+        const anonymous = !!get(channels.peek(server)).find((c) => c.channel_id === data.channel_id)?.anonymous;
+        if (!anonymous && blockedSender(server, data.from_user_id, data.from_username)) return;
         if (chName) {
           mergeChannelHistory(
             server,
@@ -1452,6 +1496,12 @@
         onMentionPower(server, p.user_ids, p.on),
       ),
 
+      listenServer<{ mods: { account: number[]; hide: boolean; admin: boolean }[] }>("chat-mods", (server, d) =>
+        onChatMods(server, d.mods),
+      ),
+
+      listenServer<{ marks: Parameters<typeof onPostsHidden>[1] }>("posts-hidden", (server, d) => onPostsHidden(server, d.marks)),
+      listenServer<{ takers: Parameters<typeof onReportTakers>[1] }>("report-takers", (server, d) => onReportTakers(server, d.takers)),
       listenServer<string[]>("my-badges", (server, badges) => {
         myBadges.of(server).set(badges);
       }),
@@ -1493,6 +1543,9 @@
       listenServer<{ channel_id: number; channel_name: string; invited_by: string }>(
         "invite-received",
         (server, data) => {
+          // Dropped, never declined: a decline would tell them. An invite has
+          // only the name to go by.
+          if (isBlocked(get(blocked.peek(server)), { username: data.invited_by }, false)) return;
           pendingInvites.update((inv) => [
             ...inv.filter((i) => !(i.server === server && i.channel_id === data.channel_id)),
             {
@@ -1519,6 +1572,7 @@
       listenServer<{ from_user_id: number; from_username: string; message: string }>(
         "poke-received",
         (server, data) => {
+          if (blockedSender(server, data.from_user_id, data.from_username)) return;
           const poke = createPoke(server, data.from_user_id, data.from_username, data.message);
           let fresh = false;
           pendingPokes.update((p) => {
@@ -1564,18 +1618,24 @@
           const uname = uid === self ? ownDisplayName(server, username, channel_id) : username;
           // Tagged with the writer's account, so the same message read from
           // the channel's stored log is recognised (sameMessage).
-          const writer = uid === self
-            ? get(account.peek(server))?.info.id
-            : (currentRosterOf(server, channel_id).find((u) => u.user_id === uid)?.account ??
-              get(users.peek(server)).find((u) => u.user_id === uid)?.account);
-          // An edit, delete, reaction or pin: done to an earlier message here,
-          // never a message itself. A pin counts only from one of the
-          // channel's managers, as the roster has the sender now.
+          const writer = writerTag(
+            uid === self,
+            !!get(channels.peek(server)).find((c) => c.channel_id === channel_id)?.anonymous,
+            get(account.peek(server))?.info.id,
+            () =>
+              currentRosterOf(server, channel_id).find((u) => u.user_id === uid)?.account ??
+              get(users.peek(server)).find((u) => u.user_id === uid)?.account,
+          );
+          // An edit, delete, reaction, pin or hide: done to an earlier message
+          // here, never a message itself. A pin counts only from one of the
+          // channel's managers, as the roster has the sender now; a hide only from
+          // a holder of its privilege.
           if (data.event != null) {
             const event = chatEvent(data.event);
             const by = { user_id: uid, username: uname, account: writer ? accountHex(writer) : undefined };
             const mayPin = event?.kind === "pin" && managesChannel(server, channel_id, uid);
-            if (event) applyChannelEvent(server, chName, { event, by, at: timestamp, content }, mayPin);
+            const mayHide = event?.kind === "hide" ? hideCheck(server, channel_id, by) : undefined;
+            if (event) applyChannelEvent(server, chName, { event, by, at: timestamp, content }, mayPin, mayHide);
             return;
           }
           // A forward only repeats what somebody else said, as a quote does
@@ -1595,7 +1655,11 @@
             account: writer ? accountHex(writer) : undefined,
             ...messageRefs(data),
           });
-          if (added) {
+          // Kept, and nothing more: no count, no sound, no notification, whoever
+          // they call on. The channel's own anonymity decides, not the tag.
+          const anonymous = !!get(channels.peek(server)).find((c) => c.channel_id === channel_id)?.anonymous;
+          const quiet = uid !== self && isBlocked(get(blocked.peek(server)), { account: writer, username: uname }, anonymous);
+          if (added && !quiet) {
             // An answer to something we wrote, or our name after an @, reaches
             // us like a direct message does
             const mine = uid === self;
@@ -1616,7 +1680,7 @@
             if (does.os) {
               notifyUnfocused(
                 `${fromServer(server)}${shortName(uname)} ${answered ? "replied to you" : "mentioned you"}`,
-                notificationBody({ content, file: messageRefs(data).file, expires_at }),
+                notificationBody({ ...messageRefs(data), content, expires_at }),
               );
             }
           }
@@ -1652,7 +1716,8 @@
           expires_at: expiryFor(m.timestamp, m.ttl_secs, channelMessageTtl(server, ch.channel_id)),
           ...messageRefs(m),
         });
-        if (added && !m.from_me && !m.replay && !viewingChannel(server, ch.channel_id)) {
+        const quiet = isBlocked(get(blocked.peek(server)), { account: m.sender_account, username: m.sender_name }, !!ch.anonymous);
+        if (added && !quiet && !m.from_me && !m.replay && !viewingChannel(server, ch.channel_id)) {
           const forMe = mentionsUs(server, ch.channel_id, m.content);
           const does = arrival(channelNotify(server, ch.name, ch.user_count), { mine: false, onScreen: false, forMe });
           if (does.count) incrementChannelUnread(server, ch.name, m.timestamp);
@@ -1721,10 +1786,10 @@
           account: sender ? accountHex(sender) : undefined,
           ...messageRefs(data),
         });
-        if (from_user_id !== myId) {
+        if (from_user_id !== myId && !isBlocked(get(blocked.peek(server)), { account: sender, username: from_username }, false)) {
           playDirectMessageSound();
-          // Never the text of a message with a timer (R2-14)
-          const body = notificationBody({ content, file: messageRefs(data).file, expires_at });
+          // Never the text of a message with a timer (R2-14), nor of a report
+          const body = notificationBody({ ...messageRefs(data), content, expires_at });
           notifyUnfocused(`${fromServer(server)}${shortName(from_username)}`, body || "New message");
         }
       }),
@@ -1870,6 +1935,8 @@
       // Global PTT shortcut events from Rust backend
       listen("ptt-global-pressed", () => {
         isTransmitting.set(true);
+        // The hotkey opens the capture in Rust and only then says so
+        if (get(voiceRestriction)?.voice) void stopTransmit();
       }),
       listen("ptt-global-released", () => {
         isTransmitting.set(false);

@@ -7,6 +7,7 @@
 // The server is the authority on both questions; this mirrors its gate so the
 // client does not spend a round trip on an answer it already knows is "no".
 
+import { moderation } from "./relay-rules.ts";
 import type { ChannelInfo, UserInfo } from "./types.ts";
 
 /**
@@ -108,4 +109,16 @@ export function rosterForRow(
 ): UserInfo[] {
   if (channel.channel_id === currentChannelId && channel.hide_members && !admin) return [];
   return rosterOf(channel.channel_id, rosters, currentChannelId, ownUsers);
+}
+
+/**
+ * Whether to offer an invite to `room`, the one we stand in, on the strength of
+ * `voipc:channels` rather than of having made it.
+ *
+ * Mirrors `check_invite` in crates/voipc-server/src/state.rs, which decides: the
+ * lobby takes no invites, and an anonymous room is the one place we go by a
+ * pseudonym, from behind which the relay lets nobody summon.
+ */
+export function summonOffered(room: ChannelInfo | undefined, holds: boolean, protocol: number | null): boolean {
+  return holds && moderation(protocol) && !!room && room.channel_id !== 0 && !room.anonymous;
 }

@@ -369,19 +369,9 @@ elif [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
     curl -s "http://127.0.0.1:$UI_CDP/json/version" > /dev/null 2>&1 && break
     sleep 0.2
   done
+  # First: it reads what the self-test left behind, and an empty channel goes after
+  # empty_channel_timeout_secs (5 minutes), which the lanes below can outlast.
   # 2>&1: a crash's stack trace goes to stderr, and it is the whole story
-  echo "--- Sign-in with a provider (test-provider.mjs)"
-  if CHROME="$CHROME" TMPDIR="$WORK" node "$SCRIPT_DIR/test-provider.mjs" "$((TCP_PORT + 7))" 2>&1 | tee "$WORK/provider.txt"; then
-    echo "PASS sign-in with a provider, in real browsers"
-  else
-    echo "FAIL the provider sign-in lane" | tee -a "$WORK/fails.txt"
-  fi
-  echo "--- Community basics (test-community.mjs)"
-  if CHROME="$CHROME" TMPDIR="$WORK" node "$SCRIPT_DIR/test-community.mjs" "$((TCP_PORT + 8))" 2>&1 | tee "$WORK/community.txt"; then
-    echo "PASS community basics, in real browsers"
-  else
-    echo "FAIL the community lane" | tee -a "$WORK/fails.txt"
-  fi
   if node "$SCRIPT_DIR/test-ui.mjs" "$TCP_PORT" "$UI_CDP" "$TCP_PORT2" "$TCP_PORT3" 2>&1 | tee "$WORK/ui.txt"; then
     echo "PASS the UI survives creating and configuring a proximity channel"
   else
@@ -390,6 +380,27 @@ elif [ "$BROWSER_ALICE" = chromium ] || [ "$BROWSER_BOB" = chromium ]; then
     fail=1
   fi
   kill "$ui_browser" 2>/dev/null || true
+  echo "--- Sign-in with a provider (test-provider.mjs)"
+  if CHROME="$CHROME" TMPDIR="$WORK" node "$SCRIPT_DIR/test-provider.mjs" "$((TCP_PORT + 7))" 2>&1 | tee "$WORK/provider.txt"; then
+    echo "PASS sign-in with a provider, in real browsers"
+  else
+    echo "FAIL the provider sign-in lane" | tee -a "$WORK/fails.txt"
+    fail=1
+  fi
+  echo "--- Community basics (test-community.mjs)"
+  if CHROME="$CHROME" TMPDIR="$WORK" node "$SCRIPT_DIR/test-community.mjs" "$((TCP_PORT + 8))" 2>&1 | tee "$WORK/community.txt"; then
+    echo "PASS community basics, in real browsers"
+  else
+    echo "FAIL the community lane" | tee -a "$WORK/fails.txt"
+    fail=1
+  fi
+  echo "--- Moderation and safety (test-moderation.mjs)"
+  if CHROME="$CHROME" TMPDIR="$WORK" node "$SCRIPT_DIR/test-moderation.mjs" "$((TCP_PORT + 9))" 2>&1 | tee "$WORK/moderation.txt"; then
+    echo "PASS moderation and safety, in real browsers"
+  else
+    echo "FAIL the moderation lane" | tee -a "$WORK/fails.txt"
+    fail=1
+  fi
 else
   echo "--- UI regression skipped (needs Chromium for the DevTools protocol)"
 fi

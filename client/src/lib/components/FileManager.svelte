@@ -10,6 +10,7 @@
   import { openServers, serverId, serverName } from "../stores/servers.js";
   import { savedServers } from "../stores/settings.js";
   import { channels } from "../stores/channels.js";
+  import { foldedAt } from "../stores/blocks.js";
   import { uiPrefs } from "../stores/ui-prefs.js";
   import { isWeb } from "../stores/platform.js";
   import { confirmAction } from "../stores/confirm.js";
@@ -126,7 +127,7 @@
     }
     return false;
   }
-  const rows = $derived(fileRows($channelMessages, $dmMessages, cache?.entries ?? []).filter((r) => !behindGate(r)));
+  const rows = $derived(fileRows($channelMessages, $dmMessages, cache?.entries ?? []).filter((r) => !behindGate(r) && !$foldedAt(r.place, r.msg)));
   const sections = $derived(arrangeFiles(rows, { filter, sort, group, query, place }));
   const total = $derived(sections.reduce((n, s) => n + s.rows.length, 0));
   /** The sections as drawn: the first `limit` rows. */

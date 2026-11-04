@@ -2,6 +2,21 @@
 // and a client does not take its word for it: a name goes on screen beside the
 // real `@name`, so what it must not do is hide that, reorder it or pass for it.
 
+/** The account a live channel message is tagged with. Somebody else's never in an
+ *  anonymous channel, which keeps no log to match it against: a roster row left from
+ *  the room before it would tie the pseudonym to them. */
+export function writerTag<T>(mine: boolean, anonymous: boolean, own: T | undefined, known: () => T | undefined): T | undefined {
+  if (mine) return own;
+  return anonymous ? undefined : known();
+}
+
+/** The account whose chosen name a message's header may show. Not a `shared` copy's,
+ *  which only says so itself, and nobody's behind a pseudonym, our own included:
+ *  a screenshot of the channel should show what the others see. */
+export function headerAccount(m: { kind?: string; account?: string }, anonymous: boolean): string | null {
+  return m.kind === "shared" || anonymous ? null : (m.account ?? null);
+}
+
 /** Control, zero-width and bidi characters: session.rs `bad_name_char`. */
 const BAD_CHAR =
   /[\p{Cc}\u00ad\u115f\u1160\u3164\uffa0\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff]/u;

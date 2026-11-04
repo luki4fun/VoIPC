@@ -63,6 +63,10 @@
   import { serverName } from "../stores/servers.js";
   import { saveOpenServers } from "../connect.js";
   import { voice } from "../stores/channels.js";
+  import { account } from "../stores/account.js";
+  import { blocked, unblock } from "../stores/blocks.js";
+  import { serverAddress } from "../stores/connection.js";
+  import { shortName } from "../username.js";
   import Icon from "./Icons.svelte";
   import PaletteEditor from "./PaletteEditor.svelte";
   import FileManager from "./FileManager.svelte";
@@ -1133,6 +1137,30 @@
     {/if}
 
     {#if activeTab === "privacy"}
+      <div class="section">
+        <h4>Blocked people</h4>
+        {#if $blocked.size === 0}
+          <span class="toggle-hint">Nobody on this server. A person's menu blocks them.</span>
+        {:else}
+          {#each [...$blocked] as [key, label] (key)}
+            <div class="device-row blocked-row">
+              <span title={label}>{shortName(label)}</span>
+              <button class="danger-btn btn btn-danger-outline" onclick={() => void unblock($serverAddress, key, label)}>Unblock</button>
+            </div>
+          {/each}
+        {/if}
+        <span class="toggle-hint">
+          For the server on screen. Their messages fold away, their direct messages, pokes and invites stay quiet, and you
+          do not hear them in a call. Nothing changes in a channel where people go by pseudonyms. They are not told.
+          {#if $account}
+            Kept sealed in your account: the server can see that the list changed and about how long it is, never who is on it.
+          {:else}
+            Kept on this {isWeb ? "browser" : "device"} and never sent. A guest is only a name: a block falls on whoever
+            uses that name next, and a guest can get past it with another.
+          {/if}
+        </span>
+      </div>
+
       <div class="section">
         <h4>Remembered accounts</h4>
         {#if remembered.length === 0}

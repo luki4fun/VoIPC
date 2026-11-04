@@ -2034,7 +2034,7 @@ check(
   }
   await sleep(300);
   check("a right click on a message opens its menu", await ann.evaluate(
-    `[...document.querySelectorAll(".msg-menu [role=menuitem]")].map((b) => b.textContent.trim()).join(",") === "React,Reply,Reply in thread,Forward,Pin,Copy text"`),
+    `[...document.querySelectorAll(".msg-menu [role=menuitem]")].map((b) => b.textContent.trim()).join(",") === "React,Reply,Reply in thread,Forward,Report,Pin,Copy text"`),
     await ann.evaluate(`document.querySelector(".msg-menu")?.textContent ?? "no menu"`));
   // At the pointer, or ending there where there is no room below it
   check("where the pointer is", !!lineAt && (await ann.evaluate(`(() => { const r = document.querySelector(".msg-menu")?.getBoundingClientRect();
@@ -3412,7 +3412,7 @@ if (PORT3) {
       const refusedBan = await waitFor(banned, `/This account is banned/.test(document.querySelector(".error")?.textContent ?? "")`, 30_000).then(() => true, () => false);
       check("and cannot sign in", refusedBan, await banned.evaluate(`document.querySelector(".error")?.textContent ?? ""`));
       await banned.send("Page.close").catch(() => {});
-      await four.evaluate(`${banRow}?.querySelector("button")?.click()`);
+      await four.evaluate(`${banRow}?.querySelector(".admin-cancel")?.click()`);
       const lifted = await waitFor(four, `!(${banRow})`, 10_000).then(() => true, () => false);
       check("Unban lifts it", listed && lifted);
 

@@ -42,17 +42,18 @@ import { openServers } from "./servers.js";
 import { currentRosterOf } from "./rosters.js";
 import { users } from "./users.js";
 import { shortName } from "../username.js";
-import type { ChatPlace } from "../chat-rules.js";
+import type { Actor, ChatPlace } from "../chat-rules.js";
 import { addNotification } from "./notifications.js";
 import { relayAccounts } from "./account.js";
-import { can, canOn } from "./powers.js";
+import { can, canOn, chatMods } from "./powers.js";
 import { adminGate, adminOp } from "./admin-ops.js";
 import { olderRelay } from "./relay.js";
 import { showChatPane } from "./platform.js";
 import { updateActiveStreamChat, updateUiPrefs, uiPrefs } from "./ui-prefs.js";
 import { streamStage } from "./screenshare.js";
 import { buildInviteLink, splitAddress } from "../invite.js";
-import { canManage, canManageAs, needsNsfwConsent, type Me } from "../channel-post-rules.js";
+import { canManage, canManageAs, hideRight, needsNsfwConsent, type Me } from "../channel-post-rules.js";
+import { moderation } from "../relay-rules.js";
 import type { ProximityMode } from "../spatial.js";
 import type { ChannelGate, ChannelInfo, ChatMessage } from "../types.js";
 
@@ -564,6 +565,38 @@ export function managesChannel(server: string, channelId: number, uid: number): 
     get(users.peek(server)).find((u) => u.user_id === uid);
   if (uid !== get(userId.peek(server))) return canManageAs(ch, entry);
   return canManage(ch, { userId: uid, isAdmin: get(isAdmin.peek(server)), isModerator: canOn(server, "voipc:channels") });
+}
+
+/**
+ * Whether a hide from `by` counts in channel `channelId` of `server`, and on which
+ * messages; undefined where it counts on none, as with no such privilege or in an
+ * anonymous channel. Who holds it is the relay's word by account, so someone away
+ * counts; a token admin, who has no account, only while the roster shows them.
+ *
+ * A relay lying here gets a named fake moderator and one extra click: a hide
+ * destroys nothing.
+ */
+export function hideCheck(server: string, channelId: number, by: Actor): ((m: ChatMessage) => boolean) | undefined {
+  const ch = get(channels.peek(server)).find((c) => c.channel_id === channelId);
+  if (!ch || !moderation(get(olderRelay.peek(server))?.protocol ?? null)) return undefined;
+  const mods = get(chatMods.peek(server));
+  const listed = by.account ? mods.get(by.account) : undefined;
+  // Not 0, which is both someone away and us before `connect` has answered
+  const mine = by.user_id !== 0 && by.user_id === get(userId.peek(server));
+  const row =
+    currentRosterOf(server, channelId).find((u) => u.user_id === by.user_id) ??
+    get(users.peek(server)).find((u) => u.user_id === by.user_id);
+  const hider = {
+    hide: !!listed?.hide || (mine && canOn(server, "voipc:hide")),
+    admin: !!listed?.admin || (mine && get(isAdmin.peek(server))) || !!row?.is_admin,
+  };
+  if (!hideRight(ch, hider, false)) return undefined;
+  return (m) => hideRight(ch, hider, m.kind !== "shared" && !!m.account && mods.has(m.account));
+}
+
+/** Slow mode does not hold this account back on `server` (`postBlock`). */
+export function unhurriedOn(server: string): boolean {
+  return canOn(server, "voipc:hide") && moderation(get(olderRelay.peek(server))?.protocol ?? null);
 }
 
 /** When this client last posted in each channel, per server (ms). For slow

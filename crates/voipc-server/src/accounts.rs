@@ -36,8 +36,8 @@ use voipc_protocol::messages::{
     AccountReply, AccountRequest, AuthContinue, AuthStep, ClientMessage, ServerMessage,
 };
 use voipc_protocol::types::{
-    AccountInfo, AccountStart, PowChallenge, PreKeyBundleData, Registration, RelayAccounts,
-    VaultBlob,
+    AccountInfo, AccountStart, ChatMod, PowChallenge, PreKeyBundleData, Registration,
+    RelayAccounts, ReportTaker, VaultBlob,
 };
 
 use crate::config::{AccountsConfig, AccountsMode, RegistrationMode};
@@ -49,6 +49,10 @@ use crate::state::ServerState;
 pub const KICK: &str = "voipc:kick";
 pub const BAN: &str = "voipc:ban";
 pub const BANS: &str = "voipc:bans";
+pub const RESTRICT: &str = "voipc:restrict";
+pub const HIDE: &str = "voipc:hide";
+pub const REPORTS: &str = "voipc:reports";
+pub const MODLOG: &str = "voipc:modlog";
 pub const CHANNELS: &str = "voipc:channels";
 pub const PROFILES: &str = "voipc:profiles";
 pub const MENTION_ALL: &str = "voipc:mention_all";
@@ -68,28 +72,52 @@ const APP_SCOPES: &[ScopeDef] = &[
     },
     ScopeDef {
         name: BAN,
-        description: "Ban people, by address and account",
+        description: "Ban people, by address and account, and remove the posts of someone banned",
     },
     ScopeDef {
         name: BANS,
-        description: "See the ban list, lift bans, ban an account by name",
+        description:
+            "See the ban list, lift bans, ban an account by name, and remove the posts of someone banned",
+    },
+    ScopeDef {
+        name: RESTRICT,
+        description: "Mute someone's voice or stop their channel posts for a while",
+    },
+    ScopeDef {
+        name: HIDE,
+        description: "Hide a message from its readers, who can still open it",
+    },
+    ScopeDef {
+        name: REPORTS,
+        description: "Receive what people report",
+    },
+    ScopeDef {
+        name: MODLOG,
+        description: "Read the moderation log",
     },
     ScopeDef {
         name: CHANNELS,
-        description: "Change the settings and gates of the channels you can see",
+        description: "Change the settings and gates of the channels you can see, and invite people to the one you stand in",
     },
     ScopeDef {
         name: EMOTES,
         description: "Add, rename and remove the server's emotes and stickers",
     },
 ];
-/// Before 1.7, the moderator's one scope: what it became.
+/// Before 1.7, the moderator's one scope: what it became. Frozen: a group from
+/// then keeps what it granted, and never gains what it did not.
 const MODERATE_WAS: &str = "voipc:moderate";
-const MODERATOR: [&str; 3] = [BAN, CHANNELS, KICK];
+const MODERATE_BECAME: [&str; 3] = [BAN, CHANNELS, KICK];
+/// The moderator group of a database made now, sorted as a role keeps them.
+const MODERATOR: [&str; 7] = [BAN, CHANNELS, HIDE, KICK, MODLOG, REPORTS, RESTRICT];
+const MODERATOR_SAYS: &str =
+    "Kick, ban, restrict, hide messages, read the moderation log, take reports and change the channels' settings";
+/// What the group said before 1.10.
+const MODERATOR_SAID: &str = "Kick, ban and change the channels' settings";
 
 /// What a session may do, one bit per privilege (`UserSession::can`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Powers(u8);
+pub struct Powers(u16);
 
 impl Powers {
     pub const KICK: Powers = Powers(1);
@@ -100,12 +128,14 @@ impl Powers {
     pub const USERS_READ: Powers = Powers(1 << 5);
     pub const USERS_ADMIN: Powers = Powers(1 << 6);
     pub const ROLES_ADMIN: Powers = Powers(1 << 7);
+    pub const RESTRICT: Powers = Powers(1 << 8);
 
     pub fn of(scopes: &[String]) -> Powers {
         [
             (KICK, Powers::KICK),
             (BAN, Powers::BAN),
             (BANS, Powers::BANS),
+            (RESTRICT, Powers::RESTRICT),
             (CHANNELS, Powers::CHANNELS),
             (EMOTES, Powers::EMOTES),
             ("users:read", Powers::USERS_READ),
@@ -203,8 +233,10 @@ pub mod gates;
 pub mod layout;
 pub mod links;
 pub mod log;
+pub mod modlog;
 pub mod profile;
 pub mod provider;
+pub mod restrict;
 
 /// What l4f calls back into.
 pub struct RelayHost {
@@ -246,6 +278,8 @@ pub struct Relay {
     pub quota: i64,
     /// The longest a stored message is kept.
     pub retention_ms: i64,
+    /// How long the moderation log keeps a row.
+    pub modlog_days: u32,
     pending: Arc<Semaphore>,
     pending_by_address: Arc<DashMap<String, usize>>,
     pow_key: Vec<u8>,
@@ -353,6 +387,7 @@ impl Relay {
             cloud: cfg.cloud,
             quota: i64::from(cfg.quota_mb) * 1024 * 1024,
             retention_ms: i64::from(cfg.retention_days) * 86_400_000,
+            modlog_days: cfg.modlog_days,
             pending: Arc::new(Semaphore::new(PENDING_SIGN_INS)),
             pending_by_address: Arc::default(),
             pow_key,
@@ -644,7 +679,7 @@ async fn ensure_moderator(store: &Store) -> Result<()> {
                 .iter()
                 .filter(|s| *s != MODERATE_WAS)
                 .cloned()
-                .chain(MODERATOR.iter().map(|s| s.to_string()))
+                .chain(MODERATE_BECAME.iter().map(|s| s.to_string()))
                 .collect();
             scopes.sort();
             scopes.dedup();
@@ -654,19 +689,49 @@ async fn ensure_moderator(store: &Store) -> Result<()> {
                 .map_err(|e| anyhow!("moving {} off voipc:moderate: {e:?}", role.name))?;
         }
     }
-    if store.role_by_name("moderator").await?.is_some() {
+    // 1.10's tools reach a group still exactly at the old default, once. Written
+    // on every first boot, a new database's too, so a group trimmed back to the
+    // old three later is left there. A crash before the widening below errs
+    // towards less: the group keeps the old three.
+    let first_boot = db!(store, pool => {
+        sqlx::query("INSERT INTO voipc_meta (k, v) VALUES ('moderator_1_10', $1) ON CONFLICT DO NOTHING")
+            .bind(&[1u8][..])
+            .execute(pool)
+            .await?
+            .rows_affected()
+            == 1
+    });
+    let Some(role) = store.role_by_name("moderator").await? else {
+        // None: another boot made it first. The scopes come in the same
+        // transaction, so a crash never leaves a moderator role that grants nothing.
+        store
+            .create_role_with_scopes(
+                "moderator",
+                MODERATOR_SAYS,
+                Some("mod"),
+                &MODERATOR.map(String::from),
+            )
+            .await?;
         return Ok(());
+    };
+    let mut held = role.scopes.clone();
+    held.sort();
+    if first_boot && held == MODERATE_BECAME {
+        store
+            .set_role_scopes(role.id, &MODERATOR.map(String::from))
+            .await
+            .map_err(|e| anyhow!("widening the moderator group: {e:?}"))?;
+        if role.description == MODERATOR_SAID {
+            store
+                .update_role(role.id, MODERATOR_SAYS, role.badge.as_deref())
+                .await?;
+        }
+        info!(
+            "[accounts] the moderator group was untouched, so it now also hands out {RESTRICT}, \
+             {HIDE}, {REPORTS} and {MODLOG}. This happens once: take them away in the group \
+             editor and they stay away"
+        );
     }
-    // None: another boot made it first. The scopes come in the same
-    // transaction, so a crash never leaves a moderator role that grants nothing.
-    store
-        .create_role_with_scopes(
-            "moderator",
-            "Kick, ban and change the channels' settings",
-            Some("mod"),
-            &MODERATOR.map(String::from),
-        )
-        .await?;
     Ok(())
 }
 
@@ -2157,6 +2222,13 @@ async fn kept_post_ok(state: &ServerState, session_id: u32, conv: &str) -> Resul
         if state.names_of(user_id).await.1.is_some() {
             return Err("nothing is kept while you write under a pseudonym.".into());
         }
+        if state
+            .sessions
+            .get(&session_id)
+            .is_some_and(|s| s.silence.direct())
+        {
+            return Err(crate::restrict::DIRECT_HELD.into());
+        }
         return Ok(());
     }
     let channel_id = {
@@ -2405,15 +2477,20 @@ pub async fn revalidate(state: &Arc<ServerState>) {
             Err(e) => warn!("checking a signed-in connection: {e}"),
         }
     }
+    // Holders who are not here too: a stored hide is read against them
+    refresh_chat_mods(state).await;
 }
 
 /// The session's powers as `scopes` say, and the account told. A change of
 /// groups reaches what they see and where they may be (`gates`), one of
 /// badges or privileges the rosters showing them.
-/// Holds power over others, which spares it from a kick and an address ban. Calling
-/// on everybody is none.
+/// Holds power over others, which spares it from a kick and an address ban.
+/// Calling on everybody, taking reports and reading the log act on nobody: a
+/// helper holding only those can still be kicked.
 pub fn holds_power(scopes: &[String]) -> bool {
-    scopes.iter().any(|s| s != MENTION_ALL)
+    scopes
+        .iter()
+        .any(|s| ![MENTION_ALL, REPORTS, MODLOG].contains(&s.as_str()))
 }
 
 /// Whether this session's account may call on everybody.
@@ -2421,6 +2498,132 @@ pub fn holds_mention_power(s: &crate::state::UserSession) -> bool {
     s.account
         .as_ref()
         .is_some_and(|a| scope::allowed(&a.scopes, MENTION_ALL))
+}
+
+/// Whether this session's account may hide messages.
+pub fn holds_hide(s: &crate::state::UserSession) -> bool {
+    s.account
+        .as_ref()
+        .is_some_and(|a| scope::allowed(&a.scopes, HIDE))
+}
+
+/// Holders of `voipc:reports` who are away and could read a sealed copy: a role
+/// that grants it (not one still waiting for codes), a log key to wrap to, not
+/// banned. Group by group until there are `want`, so what this reads stays small.
+pub async fn takers_away(
+    state: &ServerState,
+    relay: &Relay,
+    want: usize,
+) -> Result<Vec<ReportTaker>> {
+    const PER_GROUP: u32 = 8;
+    let mut read = std::collections::BTreeSet::new();
+    let mut away = Vec::new();
+    for role in relay.store().roles().await? {
+        if away.len() >= want {
+            break;
+        }
+        if !scope::allowed(&role.scopes, REPORTS) {
+            continue;
+        }
+        let (users, _) = relay.store().role_members(role.id, PER_GROUP, 0).await?;
+        for user in users {
+            let id = user.id.0;
+            if !read.insert(id)
+                || state.account_sessions.contains_key(&id)
+                || crate::bans::account_ban(state, id).is_some()
+                || !scope::allowed(&relay.accounts.effective_scopes(&user).await?, REPORTS)
+                || !log::has_key(relay, &id).await?
+            {
+                continue;
+            }
+            away.push(ReportTaker {
+                user_id: None,
+                account: Some(id),
+                name: user.username.clone(),
+            });
+        }
+    }
+    Ok(away)
+}
+
+/// Accounts one `ChatMods` lists at most: about 54 KiB, one frame.
+pub(crate) const CHAT_MODS_MAX: usize = 3000;
+
+/// Every account holding a privilege (`holds_power`), whether or not it is here,
+/// by account id so that repeated reads compare equal.
+pub async fn read_chat_mods(relay: &Relay) -> Result<Vec<ChatMod>> {
+    const PAGE: u32 = if cfg!(test) { 2 } else { 500 };
+    let mut read = std::collections::BTreeSet::new();
+    let mut mods = std::collections::BTreeMap::new();
+    for role in relay.store().roles().await? {
+        if !holds_power(&role.scopes) {
+            continue;
+        }
+        let mut offset = 0;
+        loop {
+            let (users, total) = relay.store().role_members(role.id, PAGE, offset).await?;
+            for user in &users {
+                if !read.insert(user.id.0) {
+                    continue;
+                }
+                // Not the group's: one waiting for codes grants nothing yet
+                let scopes = relay.accounts.effective_scopes(user).await?;
+                if holds_power(&scopes) {
+                    let row = ChatMod {
+                        account: user.id.0,
+                        hide: scope::allowed(&scopes, HIDE),
+                        admin: is_star(&scopes),
+                    };
+                    mods.insert(user.id.0, row);
+                }
+            }
+            offset += users.len() as u32;
+            if users.is_empty() || i64::from(offset) >= total {
+                break;
+            }
+        }
+    }
+    if mods.len() > CHAT_MODS_MAX {
+        warn!(
+            held = mods.len(),
+            "more accounts hold privileges than clients can be told of: \
+             those past the first {CHAT_MODS_MAX} are not spared from a hide"
+        );
+    }
+    Ok(mods.into_values().take(CHAT_MODS_MAX).collect())
+}
+
+/// Reads who holds what and tells everybody, if that changed. The list stays locked
+/// throughout, so that two reads at once cannot end with the older one's answer.
+pub async fn refresh_chat_mods(state: &ServerState) {
+    let Some(relay) = state.accounts.as_ref() else {
+        return;
+    };
+    let mut held = state.chat_mods.write().await;
+    let mods = match read_chat_mods(relay).await {
+        Ok(mods) => mods,
+        Err(e) => {
+            warn!("reading who holds privileges: {e:#}");
+            return;
+        }
+    };
+    if *held == mods {
+        return;
+    }
+    *held = mods;
+    match encode_server_msg(&ServerMessage::ChatMods { mods: held.clone() }) {
+        Ok(data) => state.broadcast_raw_to_all(&data).await,
+        Err(e) => warn!("telling who holds privileges: {e:#}"),
+    }
+}
+
+/// A client that just connected: who holds what. Before it can ask for any stored
+/// log, whose hides are read against this.
+pub async fn chat_mods_at_connect(state: &ServerState, tx: &ControlTx) {
+    let mods = state.chat_mods.read().await.clone();
+    if !mods.is_empty() {
+        let _ = crate::session::send_msg(tx, &ServerMessage::ChatMods { mods });
+    }
 }
 
 /// A client that just connected: who may call on everybody, its own badges, and
@@ -2475,7 +2678,7 @@ pub(crate) async fn apply_scopes(
 ) -> Result<()> {
     let info = relay.info_of(&user, &scopes).await?;
     let standing = relay.standing(&user, &scopes).await?;
-    let (my_badges, calls, called_before, editor_changed);
+    let (my_badges, calls, called_before, editor_changed, listed_changed, reads_restrictions);
     let (tx, user_id, channel_id, is_admin, became_admin, regated, shown) = {
         let Some(mut s) = state.sessions.get_mut(&session_id) else {
             return Ok(());
@@ -2486,7 +2689,11 @@ pub(crate) async fn apply_scopes(
         s.scope_written = read;
         let (was_admin, was_editor) = (s.is_admin, s.powers.has(Powers::CHANNELS));
         let could_call = holds_mention_power(&s);
+        let was_listed = (s.is_moderator, holds_hide(&s));
+        let could_restrict = s.can(Powers::RESTRICT);
         s.set_scopes(user, scopes);
+        listed_changed = was_listed != (s.is_moderator, holds_hide(&s)) || s.is_admin != was_admin;
+        reads_restrictions = s.can(Powers::RESTRICT) && !could_restrict;
         let mut old = Standing::default();
         if let Some(a) = s.account.as_mut() {
             a.needs_2fa = info.needs_2fa;
@@ -2535,6 +2742,13 @@ pub(crate) async fn apply_scopes(
     if shown {
         let info = crate::session::user_info_for(state, user_id, session_id, channel_id);
         crate::session::broadcast_user_updated(state, info).await;
+    }
+    crate::restrict::standing_changed(state, session_id).await;
+    if reads_restrictions {
+        crate::restrict::reasons_for(state, &tx);
+    }
+    if listed_changed {
+        refresh_chat_mods(state).await;
     }
     Ok(())
 }
@@ -2658,5 +2872,622 @@ mod tests {
         assert!(p(&["*"]).has(Powers::ROLES_ADMIN));
         assert_eq!(p(&["voipc:kickx", "voipcx:kick"]), Powers::default());
         assert!(is_star(&["*".into()]) && !is_star(&["voipc:*".into()]));
+        // The ninth bit, past what a byte held
+        assert!(p(&["voipc:*"]).has(Powers::RESTRICT) && p(&["*"]).has(Powers::RESTRICT));
+        assert!(p(&["voipc:restrict"]).has(Powers::RESTRICT));
+        assert!(!p(&["voipc:restrict"]).has(Powers::KICK));
+        assert!(!p(&["voipc:kick", "roles:admin"]).has(Powers::RESTRICT));
+        // These three read the scopes themselves
+        assert_eq!(
+            p(&["voipc:hide", "voipc:reports", "voipc:modlog"]),
+            Powers::default()
+        );
+    }
+
+    /// The moderator group's rules, on every database a relay can run on.
+    mod moderator_group {
+        use super::*;
+
+        const OLD: [&str; 3] = ["voipc:ban", "voipc:channels", "voipc:kick"];
+        const NEW: [&str; 7] = [
+            "voipc:ban",
+            "voipc:channels",
+            "voipc:hide",
+            "voipc:kick",
+            "voipc:modlog",
+            "voipc:reports",
+            "voipc:restrict",
+        ];
+
+        /// New databases: a SQLite file, and with `VOIPC_TEST_POSTGRES` also one on
+        /// that server (`postgres://user@host:port/postgres`, a throwaway; no CI
+        /// job runs one, so this is the only check of that SQL).
+        struct Databases {
+            stores: Vec<Store>,
+            file: std::path::PathBuf,
+        }
+
+        impl Drop for Databases {
+            fn drop(&mut self) {
+                for suffix in ["", "-wal", "-shm", ".lock"] {
+                    let _ = std::fs::remove_file(format!("{}{suffix}", self.file.display()));
+                }
+            }
+        }
+
+        async fn databases() -> Databases {
+            let id = rand::random::<u32>();
+            let file = std::env::temp_dir().join(format!("voipc-moderator-{id:08x}.db"));
+            let url = format!("sqlite://{}?mode=rwc", file.display());
+            let mut stores = vec![Store::connect(&url).await.unwrap()];
+            if let Ok(server) = std::env::var("VOIPC_TEST_POSTGRES") {
+                let name = format!("voipc_moderator_{id:08x}");
+                let admin = Store::connect(&server).await.unwrap();
+                db!(&admin, pool => {
+                    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE {name}")))
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                });
+                let (base, _) = server.rsplit_once('/').unwrap();
+                stores.push(Store::connect(&format!("{base}/{name}")).await.unwrap());
+            }
+            Databases { stores, file }
+        }
+
+        async fn boot(store: &Store) {
+            let cfg = AccountsConfig {
+                mode: AccountsMode::Optional,
+                ..Default::default()
+            };
+            Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+                .await
+                .unwrap();
+        }
+
+        async fn group(store: &Store) -> l4f_accounts::model::Role {
+            store.role_by_name("moderator").await.unwrap().unwrap()
+        }
+
+        async fn set(store: &Store, scopes: &[&str]) {
+            let scopes: Vec<String> = scopes.iter().map(|s| s.to_string()).collect();
+            let id = group(store).await.id;
+            store.set_role_scopes(id, &scopes).await.unwrap();
+        }
+
+        /// As a relay before 1.10 left it: the group holding `scopes`, the old
+        /// words, and the question of widening it not yet decided.
+        async fn before_1_10(store: &Store, scopes: &[&str]) {
+            set(store, scopes).await;
+            let m = group(store).await;
+            store
+                .update_role(m.id, MODERATOR_SAID, m.badge.as_deref())
+                .await
+                .unwrap();
+            db!(store, pool => {
+                sqlx::query("DELETE FROM voipc_meta WHERE k = 'moderator_1_10'")
+                    .execute(pool)
+                    .await
+                    .unwrap();
+            });
+        }
+
+        #[tokio::test]
+        async fn a_new_moderator_group_has_the_new_privileges() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                boot(store).await;
+                let m = group(store).await;
+                assert_eq!(m.scopes, NEW);
+                assert_eq!(m.description, MODERATOR_SAYS);
+                assert_eq!(m.badge.as_deref(), Some("mod"));
+                assert!(Powers::of(&m.scopes).has(Powers::RESTRICT));
+                // Its very first boot decided too: trimmed before any other, it is
+                // not taken for an upgrade at the next
+                set(store, &OLD).await;
+                boot(store).await;
+                assert_eq!(group(store).await.scopes, OLD);
+            }
+        }
+
+        #[tokio::test]
+        async fn an_untouched_moderator_gains_them_once_on_upgrade() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                boot(store).await;
+                before_1_10(store, &OLD).await;
+                let before = group(store).await;
+                assert_eq!(before.scopes, OLD, "control: nothing has widened it yet");
+                boot(store).await;
+                let m = group(store).await;
+                assert_eq!(m.scopes, NEW);
+                assert_eq!(m.id, before.id, "the same group, with its members");
+                assert_eq!(m.description, MODERATOR_SAYS);
+                assert_eq!(m.badge.as_deref(), Some("mod"));
+                boot(store).await;
+                assert_eq!(group(store).await.scopes, NEW);
+            }
+        }
+
+        /// From 1.6 in one step: what the old scope became is the old default.
+        /// Any other group keeps exactly what the old scope granted.
+        #[tokio::test]
+        async fn a_moderator_from_before_1_7_gains_them_too_and_other_groups_do_not() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                boot(store).await;
+                before_1_10(store, &[MODERATE_WAS]).await;
+                store
+                    .create_role_with_scopes("helpers", "", None, &[MODERATE_WAS.to_string()])
+                    .await
+                    .unwrap();
+                boot(store).await;
+                assert_eq!(group(store).await.scopes, NEW);
+                let helpers = store.role_by_name("helpers").await.unwrap().unwrap();
+                assert_eq!(helpers.scopes, OLD);
+            }
+        }
+
+        #[tokio::test]
+        async fn an_edited_moderator_is_left_alone() {
+            let edits: [&[&str]; 4] = [
+                &[],
+                &["voipc:ban", "voipc:kick"],
+                &["voipc:ban", "voipc:bans", "voipc:channels", "voipc:kick"],
+                &["voipc:ban", "voipc:channels", "voipc:emotes"],
+            ];
+            for edited in edits {
+                let dbs = databases().await;
+                for store in &dbs.stores {
+                    boot(store).await;
+                    before_1_10(store, edited).await;
+                    boot(store).await;
+                    let m = group(store).await;
+                    assert_eq!(m.scopes, edited);
+                    assert_eq!(m.description, MODERATOR_SAID, "{edited:?}");
+                    // The one chance has passed: back at the old three is the owner's choice
+                    set(store, &OLD).await;
+                    boot(store).await;
+                    assert_eq!(group(store).await.scopes, OLD, "after {edited:?}");
+                }
+            }
+        }
+
+        /// The owner's own words are theirs; only the privileges were the default.
+        #[tokio::test]
+        async fn a_group_with_other_words_keeps_them() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                boot(store).await;
+                before_1_10(store, &OLD).await;
+                let id = group(store).await.id;
+                store
+                    .update_role(id, "Our helpers", Some("crew"))
+                    .await
+                    .unwrap();
+                boot(store).await;
+                let m = group(store).await;
+                assert_eq!(m.scopes, NEW);
+                assert_eq!(
+                    (m.description.as_str(), m.badge.as_deref()),
+                    ("Our helpers", Some("crew"))
+                );
+            }
+        }
+
+        /// The log's own SQL on each database: i64 ids and times, and the longest
+        /// names, which only Postgres holds to their VARCHAR limits.
+        #[tokio::test]
+        async fn the_restrictions_round_trip_on_both_backends() {
+            use crate::bans::Key;
+            use crate::restrict::Held;
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                let cfg = AccountsConfig {
+                    mode: AccountsMode::Optional,
+                    ..Default::default()
+                };
+                let relay = Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+                    .await
+                    .unwrap();
+                let id = AccountId([7; 16]);
+                store
+                    .create_user(
+                        &l4f_accounts::model::NewUser {
+                            id,
+                            username: "kim".into(),
+                            display_name: "kim".into(),
+                            email_pending: None,
+                            password_hash: None,
+                            created_at: 1,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                let wide = "\u{1F600}";
+                let voice = Held {
+                    voice: true,
+                    text: false,
+                    by: wide.repeat(64),
+                    reason: wide.repeat(200),
+                    expires_at: None,
+                };
+                let posts = Held {
+                    voice: false,
+                    text: true,
+                    expires_at: Some(1000),
+                    ..voice.clone()
+                };
+                let (account, address) = (Key::Account(id.0), Key::Addr([9; 32]));
+                relay.restriction_put(&account, &posts, 1).await.unwrap();
+                relay.restriction_put(&account, &voice, 2).await.unwrap();
+                relay.restriction_put(&address, &posts, 3).await.unwrap();
+
+                let rows = relay.restriction_rows(999).await.unwrap();
+                assert_eq!(rows.len(), 2, "one each: a second replaces the first");
+                let (_, of_account) = rows.iter().find(|(k, _)| *k == account).unwrap();
+                assert!(of_account.voice && !of_account.text);
+                assert_eq!(of_account.expires_at, None);
+                assert_eq!(of_account.reason.chars().count(), 200);
+                let (_, of_address) = rows.iter().find(|(k, _)| *k == address).unwrap();
+                assert!(!of_address.voice && of_address.text);
+                assert_eq!(of_address.expires_at, Some(1000));
+
+                // What ran out goes, and only that
+                let rows = relay.restriction_rows(1000).await.unwrap();
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].0, account);
+                relay.restriction_put(&address, &posts, 3).await.unwrap();
+                relay.restrictions_sweep(1000).await.unwrap();
+                assert_eq!(relay.restriction_rows(0).await.unwrap().len(), 1);
+                relay.restriction_delete(&account).await.unwrap();
+                assert!(relay.restriction_rows(0).await.unwrap().is_empty());
+            }
+        }
+
+        /// What says a sealed report can be kept for someone away.
+        #[tokio::test]
+        async fn a_log_key_is_found_on_both_backends() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                let cfg = AccountsConfig {
+                    mode: AccountsMode::Optional,
+                    ..Default::default()
+                };
+                let relay = Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+                    .await
+                    .unwrap();
+                let id = AccountId([7; 16]);
+                store
+                    .create_user(
+                        &l4f_accounts::model::NewUser {
+                            id,
+                            username: "kim".into(),
+                            display_name: "kim".into(),
+                            email_pending: None,
+                            password_hash: None,
+                            created_at: 1,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                assert!(!log::has_key(&relay, &id.0).await.unwrap());
+                log::publish(&relay, id, &[1; 33], &[2; 64]).await.unwrap();
+                assert!(log::has_key(&relay, &id.0).await.unwrap());
+                assert!(!log::has_key(&relay, &[8; 16]).await.unwrap());
+            }
+        }
+
+        #[tokio::test]
+        async fn the_modlog_round_trips_on_both_backends() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                let cfg = AccountsConfig {
+                    mode: AccountsMode::Optional,
+                    ..Default::default()
+                };
+                let relay = Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+                    .await
+                    .unwrap();
+                let wide = "\u{1F600}x\0".repeat(400);
+                let key = format!("c:{}", "k".repeat(78));
+                let entry = |action| modlog::Entry {
+                    action,
+                    actor: Some([1; 16]),
+                    actor_name: &wide,
+                    target: Some([2; 16]),
+                    target_name: &wide,
+                    channel_key: &key,
+                    channel_name: &wide,
+                    reason: &wide,
+                    detail: &wide,
+                };
+                relay.modlog_put(&entry("ban")).await.unwrap();
+                relay.modlog_put(&entry("hide")).await.unwrap();
+                relay
+                    .modlog_put(&modlog::Entry {
+                        action: "kick",
+                        actor_name: "server shell",
+                        target_name: "kim",
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                let rows = relay.modlog_rows(0, 200).await.unwrap();
+                assert_eq!(rows.len(), 3);
+                assert!(rows[0].0 > rows[1].0 && rows[1].0 > rows[2].0);
+                assert!(rows[0].1 > 1_700_000_000, "seconds: {}", rows[0].1);
+                let (_, _, action, actor, target, k, name, reason, detail) = &rows[1];
+                assert_eq!(action, "hide");
+                assert_eq!(k.as_deref(), Some(key.as_str()));
+                for (text, chars) in [
+                    (actor, 64),
+                    (target, 64),
+                    (name.as_ref().unwrap(), 64),
+                    (reason, 200),
+                    (detail, 255),
+                ] {
+                    assert_eq!(text.chars().count(), chars, "{text}");
+                    assert!(!text.contains('\0'));
+                }
+                // An empty channel is none at all
+                assert!(rows[0].5.is_none() && rows[0].6.is_none());
+                assert_eq!(relay.modlog_rows(rows[1].0, 200).await.unwrap().len(), 1);
+                assert_eq!(
+                    relay.modlog_notes_since([1; 16], 0).await.unwrap(),
+                    1,
+                    "the note, not the ban, and only this actor's"
+                );
+                assert_eq!(relay.modlog_notes_since([2; 16], 0).await.unwrap(), 0);
+                assert_eq!(modlog::sweep(&relay).await.unwrap(), 0);
+                // The bind of a cutoff in the past takes what is older, on both
+                let old = util::now() - 181 * 86_400;
+                db!(store, pool => {
+                    sqlx::query("UPDATE voipc_modlog SET at = $1 WHERE action = 'kick'")
+                        .bind(old)
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                });
+                assert_eq!(modlog::sweep(&relay).await.unwrap(), 1);
+
+                // What the log calls someone an admin banned, across a restart
+                let ban = crate::bans::Ban {
+                    id: 0,
+                    label: "tom".into(),
+                    reason: String::new(),
+                    by: "boss".into(),
+                    created_at: 1,
+                    expires_at: None,
+                    addr: None,
+                    alias: Some("Guest-0001".into()),
+                };
+                relay
+                    .ban_put(&crate::bans::Key::Addr([7; 32]), &ban)
+                    .await
+                    .unwrap();
+                let rows = relay.ban_rows(2).await.unwrap();
+                assert_eq!(rows[0].1.log_name(), "Guest-0001");
+                assert_eq!(rows[0].1.label, "tom");
+            }
+        }
+
+        /// What a shell ban takes out of the logs, on both: its statements are `ban_put`'s.
+        #[tokio::test]
+        async fn a_banned_account_leaves_the_logs_on_both_backends() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                let cfg = AccountsConfig {
+                    mode: AccountsMode::Optional,
+                    ..Default::default()
+                };
+                let relay = Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+                    .await
+                    .unwrap();
+                let (dan, cat) = ([7u8; 16], [8u8; 16]);
+                for (id, username) in [(dan, "dan"), (cat, "cat")] {
+                    store
+                        .create_user(
+                            &l4f_accounts::model::NewUser {
+                                id: AccountId(id),
+                                username: username.into(),
+                                display_name: username.into(),
+                                email_pending: None,
+                                password_hash: None,
+                                created_at: 1,
+                            },
+                            None,
+                        )
+                        .await
+                        .unwrap();
+                }
+                db!(store, pool => {
+                    for id in [dan, cat] {
+                        sqlx::query("INSERT INTO voipc_members (conv, account, joined_at) VALUES ('c:aa', $1, 1)")
+                            .bind(&id[..])
+                            .execute(pool)
+                            .await
+                            .unwrap();
+                    }
+                    for (owner, recipient) in [(dan, cat), (cat, dan), (cat, cat)] {
+                        sqlx::query("INSERT INTO voipc_pending (conv, owner, recipient, created_at) VALUES ('c:aa', $1, $2, 1)")
+                            .bind(&owner[..])
+                            .bind(&recipient[..])
+                            .execute(pool)
+                            .await
+                            .unwrap();
+                    }
+                });
+                relay.ban_out_of_logs(&dan).await.unwrap();
+                let (members, pending): (i64, i64) = db!(store, pool => {
+                    let members = sqlx::query_scalar("SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_members")
+                        .fetch_one(pool)
+                        .await
+                        .unwrap();
+                    let pending = sqlx::query_scalar("SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_pending")
+                        .fetch_one(pool)
+                        .await
+                        .unwrap();
+                    (members, pending)
+                });
+                assert_eq!((members, pending), (1, 1), "the other member's stay");
+
+                // A reason with a NUL in it, which Postgres would refuse in the bind
+                let ban = crate::bans::Ban {
+                    id: 0,
+                    label: "dan".into(),
+                    reason: crate::session::ban_reason("a\0b".into()),
+                    by: "boss".into(),
+                    created_at: 1,
+                    expires_at: None,
+                    addr: None,
+                    alias: None,
+                };
+                relay
+                    .ban_put(&crate::bans::Key::Account(dan), &ban)
+                    .await
+                    .unwrap();
+                assert_eq!(relay.ban_rows(2).await.unwrap()[0].1.reason, "ab");
+            }
+        }
+
+        #[tokio::test]
+        async fn a_removal_round_trips_on_both_backends() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                let cfg = AccountsConfig {
+                    mode: AccountsMode::Optional,
+                    ..Default::default()
+                };
+                let relay = Relay::open_with(&cfg, store.clone(), &[9u8; 32])
+                    .await
+                    .unwrap();
+                let id = AccountId([7; 16]);
+                store
+                    .create_user(
+                        &l4f_accounts::model::NewUser {
+                            id,
+                            username: "kim".into(),
+                            display_name: "kim".into(),
+                            email_pending: None,
+                            password_hash: None,
+                            created_at: 1,
+                        },
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                for (conv, server_at) in [
+                    ("c:aa", 2000_i64),
+                    ("c:bb", 3000),
+                    ("c:aa", 1),
+                    ("c:aa", 5000),
+                    ("d:aa", 2000),
+                ] {
+                    db!(store, pool => {
+                        sqlx::query(
+                            "INSERT INTO voipc_log (conv, sender, epoch, server_at, keep_until, ct) VALUES ($1, $2, 1, $3, $3, $4)",
+                        )
+                        .bind(conv)
+                        .bind(&id.0[..])
+                        .bind(server_at)
+                        .bind(&[0u8][..])
+                        .execute(pool)
+                        .await
+                        .unwrap();
+                    });
+                }
+                let wide = "\u{1F600}x\0".repeat(400);
+                let row = modlog::Entry {
+                    action: "remove_posts",
+                    actor: Some([1; 16]),
+                    actor_name: &wide,
+                    target: Some(id.0),
+                    target_name: &wide,
+                    reason: &wide,
+                    ..Default::default()
+                };
+                let window = "last hour";
+                assert_eq!(
+                    relay
+                        .posts_remove(Some(id.0), 1000, 4000, window, &row)
+                        .await
+                        .unwrap(),
+                    2,
+                    "in the window, in channels"
+                );
+                let left: i64 = db!(store, pool => {
+                    sqlx::query_scalar("SELECT CAST(COUNT(*) AS BIGINT) FROM voipc_log")
+                        .fetch_one(pool)
+                        .await
+                        .unwrap()
+                });
+                assert_eq!(left, 3);
+                // A guest's deletes nothing, and has no account to name
+                let guest = modlog::Entry {
+                    action: "remove_posts",
+                    actor_name: "boss",
+                    target_name: "gus#0001",
+                    ..Default::default()
+                };
+                assert_eq!(
+                    relay
+                        .posts_remove(None, 0, 4000, window, &guest)
+                        .await
+                        .unwrap(),
+                    0
+                );
+                let marks = relay.modlog_marks().await.unwrap();
+                assert_eq!(marks.len(), 2);
+                assert_eq!(
+                    (
+                        marks[0].account,
+                        marks[0].name.as_str(),
+                        marks[0].since_ms,
+                        marks[0].before_ms,
+                        marks[0].by.as_str()
+                    ),
+                    (None, "gus#0001", 0, 4000, "boss")
+                );
+                assert_eq!(
+                    (marks[1].account, marks[1].since_ms, marks[1].before_ms),
+                    (Some(id.0), 1000, 4000)
+                );
+                assert_eq!(marks[1].name.chars().count(), 64);
+                assert_eq!(marks[1].by.chars().count(), 64);
+                let rows = relay.modlog_rows(0, 200).await.unwrap();
+                assert_eq!(rows[1].8, "2 kept messages, last hour");
+                // Others' rows are no removals
+                relay
+                    .modlog_put(&modlog::Entry {
+                        action: "ban",
+                        target_name: "kim",
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(relay.modlog_marks().await.unwrap().len(), 2);
+            }
+        }
+
+        #[tokio::test]
+        async fn a_privilege_removed_after_the_upgrade_is_not_given_back() {
+            let dbs = databases().await;
+            for store in &dbs.stores {
+                boot(store).await;
+                before_1_10(store, &OLD).await;
+                boot(store).await;
+                assert_eq!(group(store).await.scopes, NEW, "control: it did widen");
+                set(store, &OLD).await;
+                boot(store).await;
+                assert_eq!(group(store).await.scopes, OLD);
+                let fewer = &NEW[..NEW.len() - 1];
+                set(store, fewer).await;
+                boot(store).await;
+                assert_eq!(group(store).await.scopes, fewer);
+            }
+        }
     }
 }

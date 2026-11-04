@@ -24,6 +24,8 @@ mod gates;
 mod layout;
 mod media;
 mod presets;
+mod report;
+mod restrict;
 mod routing;
 mod session;
 mod settings;
@@ -145,6 +147,8 @@ enum BanCommand {
 
 /// Where a relay without accounts keeps its bans (next to channels.json).
 const BANS_FILE: &str = "bans.json";
+/// Who a ban and a moderation log row say acted, from the command line.
+const SHELL: &str = "server shell";
 
 async fn run_ban(config: &ServerConfig, command: BanCommand) -> Result<()> {
     let mut state = ServerState::new(
@@ -191,7 +195,8 @@ async fn run_ban(config: &ServerConfig, command: BanCommand) -> Result<()> {
             reason,
             days,
         } => {
-            let duration = (days > 0).then(|| Duration::from_secs(u64::from(days) * 86_400));
+            let secs = u64::from(days) * 86_400;
+            let duration = (days > 0).then(|| Duration::from_secs(secs));
             let reason = if reason.trim().is_empty() {
                 "no reason given".to_string()
             } else {
@@ -209,23 +214,49 @@ async fn run_ban(config: &ServerConfig, command: BanCommand) -> Result<()> {
                         .user_by_username(&name)
                         .await?
                         .with_context(|| format!("no account named {name:?}"))?;
+                    relay
+                        .modlog_put(&accounts::modlog::Entry {
+                            action: "ban",
+                            actor_name: SHELL,
+                            target: Some(user.id.0),
+                            target_name: &user.username,
+                            reason: &reason,
+                            detail: &accounts::modlog::ban_detail("account", secs),
+                            ..Default::default()
+                        })
+                        .await
+                        .context("writing the moderation log")?;
                     bans::add(
                         &state,
                         bans::Target::Account(user.id.0),
                         &user.username,
                         &reason,
-                        "server shell",
+                        SHELL,
                         duration,
                     )
                     .await?
                 }
                 (None, Some(ip)) => {
+                    let label = "(from the server shell)";
+                    if let Some(relay) = &state.accounts {
+                        relay
+                            .modlog_put(&accounts::modlog::Entry {
+                                action: "ban",
+                                actor_name: SHELL,
+                                target_name: label,
+                                reason: &reason,
+                                detail: &accounts::modlog::ban_detail("address", secs),
+                                ..Default::default()
+                            })
+                            .await
+                            .context("writing the moderation log")?;
+                    }
                     bans::add(
                         &state,
                         bans::Target::Addr(ip),
-                        "(from the server shell)",
+                        label,
                         &reason,
-                        "server shell",
+                        SHELL,
                         duration,
                     )
                     .await?
@@ -239,6 +270,25 @@ async fn run_ban(config: &ServerConfig, command: BanCommand) -> Result<()> {
             );
         }
         BanCommand::Remove { id } => {
+            let ban = state.bans.iter().find(|e| e.value().id == id).map(|e| {
+                let covers = match e.key() {
+                    bans::Key::Account(_) => "account",
+                    bans::Key::Addr(_) => "address",
+                };
+                (e.value().log_name().to_string(), covers)
+            });
+            if let (Some(relay), Some((name, covers))) = (&state.accounts, ban) {
+                relay
+                    .modlog_put(&accounts::modlog::Entry {
+                        action: "unban",
+                        actor_name: SHELL,
+                        target_name: &name,
+                        detail: covers,
+                        ..Default::default()
+                    })
+                    .await
+                    .context("writing the moderation log")?;
+            }
             if bans::remove(&state, id).await? {
                 println!(
                     "ban {id} lifted; a running server lets them in again within {} minutes",
@@ -983,6 +1033,11 @@ async fn main() -> Result<()> {
                     Ok(_) => {}
                     Err(e) => warn!("stored-message sweep: {e}"),
                 }
+                match accounts::modlog::sweep(&sweeper).await {
+                    Ok(n) if n > 0 => info!(dropped = n, "moderation log rows past their time"),
+                    Ok(_) => {}
+                    Err(e) => warn!("moderation log sweep: {e}"),
+                }
             }
         });
         Some(relay)
@@ -1071,6 +1126,19 @@ async fn main() -> Result<()> {
         });
     }
     bans::load(&state).await.context("reading the bans")?;
+    restrict::load(&state)
+        .await
+        .context("reading the restrictions")?;
+    // What ran out is told to everyone. Asks for nothing while nobody is held
+    // and no wait is set.
+    let ticking = state.clone();
+    tokio::spawn(async move {
+        let mut every = tokio::time::interval(Duration::from_secs(restrict::TICK_SECS));
+        loop {
+            every.tick().await;
+            restrict::tick(&ticking, bans::now_secs()).await;
+        }
+    });
     // Every client gets the channel list in one frame. Too many channels with
     // long descriptions and it cannot be sent, and clients see no channels at
     // all: say so now instead (1.0 audit H1-06)
@@ -1090,6 +1158,7 @@ async fn main() -> Result<()> {
             .await
             .context("reading the channel gates")?;
         gates::prune_logs(&state).await;
+        accounts::refresh_chat_mods(&state).await;
     }
     // What the server's shell changes (roles, codes, bans) reaches
     // connections already open.
@@ -1102,6 +1171,7 @@ async fn main() -> Result<()> {
             every.tick().await;
             accounts::revalidate(&watched).await;
             gates::prune_logs(&watched).await;
+            restrict::prune_clocks(&watched, bans::now_secs());
             match bans::load(&watched).await {
                 Ok(()) => bans::enforce(&watched, None).await,
                 Err(e) => warn!("reading the bans: {e:#}"),

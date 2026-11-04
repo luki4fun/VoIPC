@@ -23,6 +23,7 @@
     purgeWritten,
     releaseBrowserMarks,
   } from "../stores/chat.js";
+  import { onAccountBlocks } from "../stores/blocks.js";
   import { channels, currentChannelId } from "../stores/channels.js";
   import { shareChannelHistory } from "../stores/settings.js";
   import { channelRosters, currentRosterOf } from "../stores/rosters.js";
@@ -30,7 +31,7 @@
   import { isWeb } from "../stores/platform.js";
   import { chatEvent, expiryFor } from "../chat-rules.js";
   import { liveIdOf } from "../dm-rules.js";
-  import { dmMessageTtl, managesChannel } from "../stores/channel-ui.js";
+  import { dmMessageTtl, hideCheck, managesChannel } from "../stores/channel-ui.js";
   import { userId } from "../stores/connection.js";
   import { addNotification } from "../stores/notifications.js";
   import { community, newRecoveryKey } from "../relay-rules.js";
@@ -158,10 +159,12 @@
         info: AccountInfo;
         recovery: string | null;
         prefs: { cloud: boolean; asked: boolean };
+        blocks?: [string, string][];
       }>(
         "account-signed-in",
         (server, d) => {
           account.of(server).set({ name: d.name, relayId: d.relay_id, info: d.info, cloud: d.prefs.cloud });
+          onAccountBlocks(server, d.blocks);
           const waiting = get(accountPrompt);
           if (waiting?.kind === "pair-wait" && waiting.server === server) closePrompt(waiting);
           // Before the log is read: what was cleared must not come back with it
@@ -178,6 +181,7 @@
           if (!d.prefs.asked) askCloud(server);
         },
       ),
+      listenServer<{ blocks: [string, string][] }>("account-blocks", (server, d) => onAccountBlocks(server, d.blocks)),
       listenServer<boolean>("account-need-totp", (server, retry) => {
         reset();
         showPrompt({ kind: "totp", server, retry });
@@ -245,9 +249,10 @@
         if (ch) purgeWritten(server, "channel", ch.name, writer, t.before, writerName);
         else if (t.conv.startsWith("d:")) purgeWritten(server, "dm", t.name, writer, t.before, writerName);
       }),
-      // An edit, delete, reaction or pin from a stored log, by its sender
+      // An edit, delete, reaction, pin or hide from a stored log, by its sender
       // (the other party of a direct one, or us). A pin counts only from a
-      // manager the roster lists now: one whose sender is away is let go.
+      // manager the roster lists now: one whose sender is away is let go. A hide
+      // goes by account, so it stands when its moderator has left.
       listenServer<{
         conv: string;
         name: string;
@@ -272,7 +277,8 @@
         const ev = { event, by, at: t.timestamp, content: t.content };
         if (ch) {
           const mayPin = event.kind === "pin" && (t.from_me || !!online) && managesChannel(server, ch.channel_id, by.user_id);
-          applyChannelEvent(server, ch.name, ev, mayPin);
+          const mayHide = event.kind === "hide" ? hideCheck(server, ch.channel_id, by) : undefined;
+          applyChannelEvent(server, ch.name, ev, mayPin, mayHide);
         } else if (t.conv.startsWith("d:")) {
           applyStoredDmEvent(server, t.name || `account ${t.account.slice(0, 8)}`, ev);
         }
@@ -287,7 +293,13 @@
       // never saves over this session).
       listenServer<{ item: string; problem: string }>("vault-problem", (server, d) => {
         const what =
-          d.item === "item.pins" ? "the identities you pinned" : d.item === "item.logkey" ? "your key for kept messages" : "your account settings";
+          d.item === "item.pins"
+            ? "the identities you pinned"
+            : d.item === "item.logkey"
+              ? "your key for kept messages"
+              : d.item === "item.blocks"
+                ? "the people you blocked"
+                : "your account settings";
         const why =
           d.problem === "newer"
             ? "were saved by a newer VoIPC — update to use them"

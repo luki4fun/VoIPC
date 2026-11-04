@@ -244,6 +244,16 @@ pub fn picture_ok(image: &[u8]) -> bool {
     (png || webp) && image.len() <= MAX_PROFILE_PICTURE
 }
 
+/// A name or a picture is public text. Clearing one's own stays open.
+const HELD: &str = "You cannot set a display name or picture on this server for now.";
+
+fn held(state: &ServerState, session_id: SessionId) -> bool {
+    state
+        .sessions
+        .get(&session_id)
+        .is_some_and(|s| s.silence.text())
+}
+
 /// `AccountRequest::ProfileSet`.
 pub async fn set_name(
     state: &Arc<ServerState>,
@@ -259,6 +269,9 @@ pub async fn set_name(
         Ok(name) => name,
         Err(reason) => return Ok(refused("ProfileSet", &reason)),
     };
+    if name.is_some() && held(state, session_id) {
+        return Ok(refused("ProfileSet", HELD));
+    }
     // Cheap to store and expensive to announce, like all a client says about itself
     let now = relay.profiles(&[user.id.0]).await?;
     if now[0].name == name {
@@ -285,6 +298,9 @@ pub async fn set_picture(
             "ProfilePictureSet",
             "A profile picture is a PNG or WebP of at most 32 KB.",
         ));
+    }
+    if image.is_some() && held(state, session_id) {
+        return Ok(refused("ProfilePictureSet", HELD));
     }
     let hash: Option<[u8; 32]> = image.as_deref().map(|i| Sha256::digest(i).into());
     if relay.profiles(&[user.id.0]).await?[0].picture == hash {

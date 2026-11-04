@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { adminOps, community } from "../relay-rules.js";
+  import { adminOps, community, moderation } from "../relay-rules.js";
+  import { removalHint, removalReachesAccount, removalWindows } from "../modlog-rules.js";
   import { backdrop, dialog } from "../actions/dialog.js";
   import { roving } from "../actions/roving.js";
   // Admin token login, and the server admin panel: bans, emotes, and on a
@@ -16,6 +17,7 @@
 
   import {
     adminError,
+    adminOp,
     adminToken,
     clearShown,
     banAccount,
@@ -24,11 +26,12 @@
     showAdminLogin,
     showAdminPanel,
     stepUp,
+    stepUpSays,
     submitAdminLogin,
     submitStepUp,
     unban,
   } from "../stores/admin-ui.js";
-  import { relayAccounts } from "../stores/account.js";
+  import { account, relayAccounts } from "../stores/account.js";
   import { can } from "../stores/powers.js";
   import { emoteLimits, pendingImport } from "../stores/emotes.js";
   import { olderRelay } from "../stores/relay.js";
@@ -38,10 +41,11 @@
   import AdminGroups from "./AdminGroups.svelte";
   import AdminServer from "./AdminServer.svelte";
   import AdminChannels from "./AdminChannels.svelte";
+  import AdminModLog from "./AdminModLog.svelte";
   import Icon from "./Icons.svelte";
   import type { BanInfo } from "../types.js";
 
-  type Tab = "bans" | "emotes" | "users" | "groups" | "channels" | "server";
+  type Tab = "bans" | "emotes" | "users" | "groups" | "channels" | "modlog" | "server";
   let tab = $state<Tab>("bans");
   // A chat picture's "Make an emote or sticker…": straight to the importer
   $effect(() => {
@@ -57,6 +61,7 @@
     if (groups && $can("users:read")) t.push(["users", "Users"]);
     if (groups && ($can("roles:admin") || $can("users:read"))) t.push(["groups", "Groups"]);
     if ($relayAccounts && community($olderRelay?.protocol ?? null) && $can("voipc:channels")) t.push(["channels", "Channels"]);
+    if ($relayAccounts && moderation($olderRelay?.protocol ?? null) && $can("voipc:modlog")) t.push(["modlog", "Moderation log"]);
     if ($relayAccounts && community($olderRelay?.protocol ?? null) && $can("*")) t.push(["server", "Server"]);
     return t;
   });
@@ -87,12 +92,24 @@
   let banName = $state("");
   let banReason = $state("");
   let banDays = $state(0);
+  let banRemoval = $state<number | null>(null);
+  // Asked of the account: a token admin has none to ask as
+  const mayRemove = $derived(!!$account && !!$relayAccounts && moderation($olderRelay?.protocol ?? null));
 
   async function submitBan() {
     if (!banName.trim()) return;
-    await banAccount(banName, banReason, banDays * 86_400);
+    await banAccount(banName, banReason, banDays * 86_400, mayRemove ? banRemoval : null);
     banName = "";
     banReason = "";
+    banRemoval = null;
+  }
+
+  // Removing the posts of someone on the list, who may have been banned a while ago
+  let removing = $state<BanInfo | null>(null);
+  let removingWindow = $state(86_400);
+  function submitRemoval() {
+    if (removing) void adminOp({ RemovePosts: { name: removing.label, window_secs: removingWindow } });
+    removing = null;
   }
 </script>
 
@@ -102,6 +119,9 @@
       <span class="ban-label row-name">{ban.label}</span>
       <span class="ban-reason row-meta">{ban.reason ? `${ban.reason} · ` : ""}by {ban.by} · {expiry(ban)}</span>
     </div>
+    {#if mayRemove}
+      <button type="button" class="btn btn-secondary ban-remove" onclick={() => { removing = ban; removingWindow = 86_400; }}>Remove posts</button>
+    {/if}
     <button type="button" class="btn btn-secondary admin-cancel" onclick={() => unban(ban.id)}>Unban</button>
   </li>
 {/snippet}
@@ -150,7 +170,7 @@
         {#if $stepUp}
           <form class="callout" onsubmit={(e) => { e.preventDefault(); submitStepUp(stepCode); stepCode = ""; }}>
             <div class="section-title">Confirm with a code</div>
-            <p class="admin-hint">This hands out power. Enter a code from your authenticator app; it holds for ten minutes.</p>
+            <p class="admin-hint">{stepUpSays($stepUp)} Enter a code from your authenticator app; it holds for ten minutes.</p>
             <div class="inline-form">
               <!-- svelte-ignore a11y_autofocus -->
               <input class="admin-input code-input" inputmode="numeric" autocomplete="one-time-code" placeholder="123456" aria-label="Two-factor code" bind:value={stepCode} autofocus />
@@ -170,6 +190,8 @@
           <AdminGroups />
         {:else if shown === "channels"}
           <AdminChannels />
+        {:else if shown === "modlog"}
+          <AdminModLog />
         {:else if shown === "server"}
           <AdminServer />
         {:else}
@@ -185,12 +207,38 @@
                   <option value={7}>7 days</option>
                   <option value={30}>30 days</option>
                 </select>
+                {#if mayRemove}
+                  <select class="admin-select ban-add-removal" aria-label="Also remove their posts" bind:value={banRemoval}>
+                    <option value={null}>Keep their posts</option>
+                    {#each removalWindows($can("*")) as [secs, label] (secs)}
+                      <option value={secs}>Remove posts: {label.toLowerCase()}</option>
+                    {/each}
+                  </select>
+                {/if}
                 <button type="submit" class="btn btn-danger admin-ok" disabled={!banName.trim()}>Ban account</button>
               </form>
+              {#if mayRemove && banRemoval !== null}
+                <p class="admin-hint">{removalHint(true)}</p>
+              {/if}
             </section>
           {/if}
           <section class="section">
             <div class="section-title">Active bans</div>
+            {#if removing}
+              <form class="callout ban-removal" onsubmit={(e) => { e.preventDefault(); submitRemoval(); }}>
+                <div class="section-title">Remove the posts of {removing.label}</div>
+                <p class="admin-hint">{removalHint(removalReachesAccount(removing, $bans))}</p>
+                <div class="inline-form">
+                  <select class="admin-select" aria-label="How far back" bind:value={removingWindow}>
+                    {#each removalWindows($can("*")) as [secs, label] (secs)}
+                      <option value={secs}>{label}</option>
+                    {/each}
+                  </select>
+                  <button type="button" class="btn btn-secondary admin-cancel" onclick={() => (removing = null)}>Cancel</button>
+                  <button type="submit" class="btn btn-danger admin-ok">Remove posts</button>
+                </div>
+              </form>
+            {/if}
             {#if $bans.length === 0}
               <p class="admin-hint empty">No active bans. Right-click someone in the member list to kick or ban them.</p>
             {:else}

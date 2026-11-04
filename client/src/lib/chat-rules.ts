@@ -31,9 +31,10 @@
 // stores/chat.ts, which owns the state and reaches the backend, cannot.
 
 import { isEmoteReaction } from "./emote-rules.ts";
-import type { ChatEvent, ChatMessage, FileRef, Forwarded, Reaction, Reactor } from "./types.ts";
+import type { ChatEvent, ChatMessage, FileRef, Forwarded, Reaction, Reactor, ReportMark } from "./types.ts";
 import { authorKey, findTarget } from "./thread-rules.ts";
 import { plainText } from "./markdown.ts";
+import { shortName } from "./username.ts";
 
 /** Per conversation, in the store and in the archive. */
 export const MAX_MESSAGES = 500;
@@ -200,6 +201,11 @@ export function sanitizeHistory(
     // history, and taking it would put it back on screen everywhere it is
     // shared onward from here.
     if (expires_at !== undefined && expires_at <= now) continue;
+    // A report goes by who actually sent it, which a hand-off cannot show: the
+    // mark would put the sharer's claim in the app's own words. It stays what
+    // it is under that, a forward's label.
+    const refs = messageRefs(m);
+    if (refs.fwd?.report) refs.fwd = { name: refs.fwd.name, at: refs.fwd.at };
     valid.push({
       user_id: m.user_id,
       // A name and its "#0000" tag
@@ -216,7 +222,7 @@ export function sanitizeHistory(
       // newcomer does not already hold, and points at nothing they cannot see.
       // Its file too, checked as if it had just arrived: its key is no more
       // than the message itself gives a member.
-      ...messageRefs(m),
+      ...refs,
       // That its writer changed it, which the text already shows: the
       // sharer's word, like the rest. What else events did to it (reactions,
       // a pin) is each reader's own record, and never taken from a peer.
@@ -260,9 +266,11 @@ export function receivedText(text: string): string {
  * What a system notification says of a message (R2-14). Nothing of one with
  * a destruction timer: the notification centre, or a phone's lock screen,
  * would keep its text after the message is gone. A file without a caption
- * by its name.
+ * by its name. Nothing of a report: what it quotes is what it says should not
+ * be shown, so a lock screen is the last place for it.
  */
-export function notificationBody(m: Pick<ChatMessage, "content" | "file" | "expires_at">): string {
+export function notificationBody(m: Pick<ChatMessage, "content" | "file" | "expires_at" | "fwd">): string {
+  if (m.fwd?.report) return "Reported a message";
   if (m.expires_at !== undefined) return "";
   return plainText(m.content).slice(0, 140) || (m.file ? `Sent a file: ${m.file.name}` : "");
 }
@@ -293,14 +301,32 @@ export function messageRefs(src: {
 }
 
 /** envelope.rs `MAX_FWD_NAME`. */
-const MAX_FWD_NAME = 64;
+export const MAX_FWD_NAME = 64;
+/** envelope.rs `MAX_REPORT_WHY`. */
+const MAX_REPORT_WHY = 300;
 
 /** A forwarded message's label as it may be kept (envelope.rs
- *  `Forwarded::checked`): a cleaned name, and a moment JS holds exactly. */
+ *  `Forwarded::checked`): a cleaned name, a moment JS holds exactly, and a report's
+ *  mark where a sound one came with it. */
 export function forwarded(v: unknown): Forwarded | undefined {
   const f = v as Record<string, unknown> | null;
   if (typeof f?.name !== "string" || within(f.at, 0, Number.MAX_SAFE_INTEGER) === undefined) return undefined;
-  return { name: cleanText(f.name, MAX_FWD_NAME) || "someone", at: f.at as number };
+  const report = reportMarkOf(f.report);
+  return { name: cleanText(f.name, MAX_FWD_NAME) || "someone", at: f.at as number, ...(report ? { report } : {}) };
+}
+
+/** envelope.rs `ReportMark::checked`. */
+function reportMarkOf(v: unknown): ReportMark | undefined {
+  const r = v as Record<string, unknown> | null;
+  if (typeof r?.channel !== "string" || typeof r.why !== "string") return undefined;
+  const id = keptId(r.id);
+  const by = typeof r.by === "string" ? cleanText(r.by, MAX_FWD_NAME) : "";
+  return {
+    channel: cleanText(r.channel, MAX_FWD_NAME),
+    ...(id ? { id } : {}),
+    why: cleanText(r.why, MAX_REPORT_WHY),
+    ...(by ? { by } : {}),
+  };
 }
 
 /** voipc_crypto::file::MAX_FILE_PLAIN, and envelope.rs's bounds on a file. */
@@ -321,7 +347,7 @@ export function cleanFileName(name: string): string {
 }
 
 /** `cleanFileName`, at most `max` characters (envelope.rs `clean`). */
-function cleanText(text: string, max: number): string {
+export function cleanText(text: string, max: number): string {
   return Array.from(text.replace(NAME_JUNK, "")).slice(0, max).join("").trim();
 }
 
@@ -366,7 +392,7 @@ export function fileRef(v: unknown): FileRef | undefined {
 /** The fields the archive has a place of its own for (crypto.rs `ChatMessage`). */
 const ARCHIVE_FIELDS = new Set(["user_id", "username", "content", "timestamp", "kind", "id", "expires_at", "account"]);
 /** The fields `extra` holds that this version reads back (`fromArchived`). */
-const EXTRA_FIELDS = new Set(["reply_to", "thread", "file", "fwd", "edited_at", "reactions", "pin", "power"]);
+const EXTRA_FIELDS = new Set(["reply_to", "thread", "file", "fwd", "edited_at", "reactions", "pin", "hide", "power"]);
 
 /**
  * A message as the desktop archive stores it: every field it has no place of
@@ -563,14 +589,15 @@ export function mergeHistory(
       // itself turns up, we keep the one we witnessed. Likewise a stored copy,
       // which its writer signed, over a live one nothing ties to an account.
       if ((kept[seen].kind === "shared" && m.kind !== "shared") || (!kept[seen].account && m.account)) {
-        // What this reader saw done to it stays: reactions and a pin are
+        // What this reader saw done to it stays: reactions, a pin and a hide are
         // their own record, and the row on screen is the same row
-        const { reactions, pin, power } = kept[seen];
+        const { reactions, pin, hide, power } = kept[seen];
         kept[seen] = succeed(kept[seen], {
           ...m,
           expires_at: soonerExpiry(kept[seen].expires_at, m.expires_at),
           ...(reactions ? { reactions } : {}),
           ...(pin ? { pin } : {}),
+          ...(hide ? { hide } : {}),
           // Who held what when it arrived is known only here, and only then
           ...(power ? { power } : {}),
         });
@@ -642,6 +669,11 @@ export function mergeHistory(
 //     `MAX_REACTION_EMOJI` different emoji on one message.
 //   - A pin only from one of the channel's managers by the roster's roles,
 //     which the caller asks (`canManageAs`, channel-post-rules.ts).
+//   - A hide only from a holder of `voipc:hide`, which the caller asks
+//     (`hideCheck`, channel-ui.ts). It collapses the message for its readers and
+//     destroys nothing: the worst a false holder can do is one extra click.
+//   - Not an event, but the same field: what the server says was removed with a
+//     ban (`PostsMark`). Only the server's next word changes that, not a restore.
 
 /** Different emoji on one message, at most. */
 export const MAX_REACTION_EMOJI = 20;
@@ -686,7 +718,8 @@ export function chatEvent(v: unknown): ChatEvent | undefined {
     case "react":
       return typeof e.on === "boolean" && isReaction(e.emoji) ? { kind: "react", target, emoji: e.emoji, on: e.on } : undefined;
     case "pin":
-      return typeof e.on === "boolean" ? { kind: "pin", target, on: e.on } : undefined;
+    case "hide":
+      return typeof e.on === "boolean" ? { kind: e.kind, target, on: e.on } : undefined;
   }
   return undefined;
 }
@@ -723,9 +756,95 @@ export function sameRow(a: ChatMessage, b: ChatMessage): boolean {
   return rowKey(a) === rowKey(b);
 }
 
+/** Whether a moderator's hide stands on it. Everything that reads a hide reads
+ *  it here, or through the two below. */
+export function isHidden(m: Pick<ChatMessage, "hide">): boolean {
+  return !!m.hide?.on;
+}
+
+/** What a hidden message says instead of itself. Of a ban's removal, whose word it
+ *  is: the server's, which no moderator signed. */
+export function hiddenLine(m: Pick<ChatMessage, "hide">): string {
+  const by = shortName(m.hide?.by ?? "") || "a moderator";
+  return m.hide?.ban ? `This server says ${by} removed this with a ban` : `Removed by ${by}`;
+}
+
+/** Whether a row shows `hiddenLine`: hidden, and not shown anyway (`revealed`
+ *  holds `rowKey`s). */
+export function foldedByHide(m: ChatMessage, revealed: ReadonlySet<ChatMessage>): boolean {
+  return isHidden(m) && !revealed.has(rowKey(m));
+}
+
+/** Something someone wrote, as opposed to a line of ours or what is left of it. */
+export function isWritten(m: ChatMessage): boolean {
+  return m.kind !== "history-marker" && m.kind !== "notice" && m.kind !== "deleted" && m.kind !== "undecryptable";
+}
+
 /** A message that is there to be drawn, answered or acted on. */
 function isLive(m: ChatMessage): boolean {
-  return !!m.id && m.kind !== "history-marker" && m.kind !== "notice" && m.kind !== "deleted" && m.kind !== "undecryptable";
+  return !!m.id && isWritten(m);
+}
+
+/** Whose posts a server says it removed (`PostsHidden`), `account` in hex. */
+export interface PostsMark {
+  account: string | null;
+  name: string;
+  since_ms: number;
+  before_ms: number;
+  by: string;
+}
+
+/**
+ * Whether `mark` is about `m`: in its window, and theirs. By the account where the
+ * copy knows one, else by the name, which covers a guest, a live copy whose writer
+ * was on no list, and a member's copy. So a guest's mark never takes the message of
+ * an account going by that name.
+ */
+export function markHits(m: Pick<ChatMessage, "account" | "username" | "timestamp">, mark: PostsMark): boolean {
+  if (m.timestamp < mark.since_ms || m.timestamp > mark.before_ms) return false;
+  return m.account ? m.account === mark.account : m.username === mark.name;
+}
+
+/** Marks by whom they can hit, since each message is held against them all. */
+export type MarkIndex = Map<string, PostsMark[]>;
+
+const markKey = (m: Pick<ChatMessage, "account" | "username">) => (m.account ? `a:${m.account}` : `n:${m.username}`);
+
+/** `index` with `marks` in it. */
+export function addMarks(index: MarkIndex, marks: readonly PostsMark[]): MarkIndex {
+  for (const mark of marks) {
+    const keys = [`n:${mark.name}`, ...(mark.account ? [`a:${mark.account}`] : [])];
+    for (const key of keys) {
+      const had = index.get(key);
+      if (had) had.push(mark);
+      else index.set(key, [mark]);
+    }
+  }
+  return index;
+}
+
+/**
+ * `m` as `marks` leave it: hidden, in the field a moderator's hide uses, so that all
+ * that reads one reads this. Nothing of it goes, and any reader can still show it.
+ * A hostile relay gets a false line and one extra click out of this. The same object
+ * where they say nothing of it, which a list asks to know that nothing changed.
+ */
+export function marked(m: ChatMessage, marks: MarkIndex | undefined): ChatMessage {
+  if (!marks?.size || m.hide?.ban || !isWritten(m)) return m;
+  const mark = marks.get(markKey(m))?.find((x) => markHits(m, x));
+  if (!mark) return m;
+  return succeed(m, { ...m, hide: { on: true, at: mark.before_ms, by: mark.by.slice(0, 64), ban: true } });
+}
+
+/** `list` with `marked` applied, or `list` itself when that changes nothing. */
+export function applyMarks(list: ChatMessage[], marks: MarkIndex | undefined): ChatMessage[] {
+  let changed = false;
+  const next = list.map((m) => {
+    const made = marked(m, marks);
+    if (made !== m) changed = true;
+    return made;
+  });
+  return changed ? next : list;
 }
 
 /**
@@ -741,6 +860,9 @@ export function applyEvent(
     /** Whether this connection received `m` (a guest's edit or delete takes
      *  only those); every message, where omitted. */
     current?: (m: ChatMessage) => boolean;
+    /** Whether the sender's hide counts on `m` (`hideCheck`); absent where it
+     *  counts on nothing, a direct conversation among them. */
+    mayHide?: (m: ChatMessage) => boolean;
   },
 ): ChatMessage[] {
   const { event, by, at } = ev;
@@ -780,6 +902,19 @@ export function applyEvent(
     }
     return replace(theirs, (m) =>
       m.edited_at !== undefined && at < m.edited_at ? null : { ...m, content: ev.content, edited_at: at },
+    );
+  }
+  if (event.kind === "hide") {
+    const may = opts.mayHide;
+    if (!may) return list;
+    // By id, not `findTarget`: a second account repeating the id would otherwise
+    // shield the message. Every copy, then, and what that overdoes costs a click.
+    return replace(
+      (m) => m.id === event.target && isLive(m) && may(m),
+      (m) =>
+        m.hide && (m.hide.ban || at < m.hide.at || (at === m.hide.at && event.on === m.hide.on))
+          ? null
+          : { ...m, hide: { on: event.on, at, by: by.username.slice(0, 64) } },
     );
   }
   // A reaction or a pin goes on the message the id names, as a quote finds it
@@ -844,22 +979,44 @@ export function reactionChips(m: ChatMessage, mine: (key: string) => boolean): R
 
 /** A conversation's pinned messages, the latest pin first. */
 export function pinnedOf(list: readonly ChatMessage[]): ChatMessage[] {
-  return list.filter((m) => m.pin?.on && isLive(m)).sort((a, b) => b.pin!.at - a.pin!.at);
+  return list.filter((m) => m.pin?.on && isLive(m) && !isHidden(m)).sort((a, b) => b.pin!.at - a.pin!.at);
 }
 
 /**
  * A message as a history hand-off offers it: without what events did to it
- * here (reactions, a pin), which is this reader's own record and would only
- * cost the hand-off's budget; the receiver drops them anyway (`sanitizeHistory`).
+ * here (reactions, a pin, a hide), which is this reader's own record and would
+ * only cost the hand-off's budget; the receiver drops them anyway
+ * (`sanitizeHistory`).
  * Never with what a later version kept in its archive entry (`extra_kept`).
  * Its text cut to what a receiver takes, before the budget is measured, so one
  * long message cannot push the others out (R2-07).
  */
 export function forHandOff(m: ChatMessage): ChatMessage {
   const long = m.content.length > HISTORY_MAX_CONTENT;
-  if (!m.reactions && !m.pin && m.extra_kept === undefined && !long) return m;
-  const { reactions: _r, pin: _p, extra_kept: _k, ...rest } = m;
+  if (!m.reactions && !m.pin && !m.hide && m.extra_kept === undefined && !long) return m;
+  const { reactions: _r, pin: _p, hide: _h, extra_kept: _k, ...rest } = m;
   return long ? { ...rest, content: cutText(rest.content) } : rest;
+}
+
+/**
+ * What a member who asks for a channel's past is offered of `list`. Second-hand
+ * messages go on: a conversation should outlive the last person who was there for
+ * it, and it stays marked as hearsay all the way down the chain.
+ *
+ * Not a message whose timer has run out, which the sweep is about to take off our
+ * own screen: handing it over would put it back into somebody else's archive. Not
+ * one a moderator hid either, which a newcomer would read as if nothing had happened.
+ */
+export function handOffOf(list: readonly ChatMessage[], now = Date.now()): ChatMessage[] {
+  return list
+    .filter(
+      (m) =>
+        (!m.kind || m.kind === "text" || m.kind === "shared") &&
+        !isHidden(m) &&
+        !(m.expires_at !== undefined && m.expires_at <= now),
+    )
+    .slice(-HISTORY_MAX_MESSAGES)
+    .map(forHandOff);
 }
 
 /** A text cut to `HISTORY_MAX_CONTENT`, never inside an emote's token (which
@@ -882,11 +1039,11 @@ function editedAt(v: unknown, timestamp: number, now = Date.now()): Pick<ChatMes
 /**
  * What events did to a message, as the archive's `extra` holds it, each part
  * checked as if it had just arrived: the edit's moment, the reactions within
- * their limits, the pin. A part that does not check is dropped, never the
- * message.
+ * their limits, the pin, the hide. A part that does not check is dropped, never
+ * the message.
  */
-function eventState(more: Record<string, unknown>, timestamp: number): Pick<ChatMessage, "edited_at" | "reactions" | "pin"> {
-  const out: Pick<ChatMessage, "edited_at" | "reactions" | "pin"> = { ...editedAt(more.edited_at, timestamp) };
+function eventState(more: Record<string, unknown>, timestamp: number): Pick<ChatMessage, "edited_at" | "reactions" | "pin" | "hide"> {
+  const out: Pick<ChatMessage, "edited_at" | "reactions" | "pin" | "hide"> = { ...editedAt(more.edited_at, timestamp) };
   const moment = (v: unknown) => typeof v === "number" && Number.isFinite(v) && v > 0;
   if (Array.isArray(more.reactions)) {
     const reactions: Reaction[] = [];
@@ -905,6 +1062,10 @@ function eventState(more: Record<string, unknown>, timestamp: number): Pick<Chat
   const p = more.pin as Record<string, unknown> | undefined;
   if (p && typeof p.on === "boolean" && moment(p.at) && typeof p.by === "string") {
     out.pin = { on: p.on, at: p.at as number, by: p.by.slice(0, 64) };
+  }
+  const h = more.hide as Record<string, unknown> | undefined;
+  if (h && typeof h.on === "boolean" && moment(h.at) && typeof h.by === "string") {
+    out.hide = { on: h.on, at: h.at as number, by: h.by.slice(0, 64), ...(h.ban === true ? { ban: true } : {}) };
   }
   return out;
 }

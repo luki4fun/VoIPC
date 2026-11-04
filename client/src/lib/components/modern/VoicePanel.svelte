@@ -11,6 +11,8 @@
   import { isMobile } from "../../stores/platform.js";
   import { leaveVoice } from "../../stores/voice.js";
   import { voiceListenOnly } from "../../stores/channel-ui.js";
+  import { voiceRestriction } from "../../stores/restrictions.js";
+  import { heldLine } from "../../restrict-rules.js";
   import { serverEntries } from "../../connect.js";
   import ScreenShareControls from "../ScreenShareControls.svelte";
   import Icon from "../Icons.svelte";
@@ -53,6 +55,11 @@
     {#if listening}
       <div class="listen-only" role="status" title="This channel's groups say who speaks; nobody hears you here">
         <Icon name="lock" size={14} /> Listening only
+      </div>
+    {/if}
+    {#if $voiceRestriction?.voice}
+      <div class="listen-only held-voice" role="status" title="The server drops your voice for now, whatever your microphone does">
+        <Icon name="hourglass" size={14} /> {heldLine($voiceRestriction, "voice", Date.now())}
       </div>
     {/if}
     {#if !$isMobile}

@@ -1,7 +1,7 @@
 //! Everything a signed-in account keeps up with after its sign-in, as a state
 //! machine without I/O that the desktop client and the browser both drive:
 //! the vault items it writes back (pinned identities, preferences, the log
-//! key), and the stored-message log (`log`) — publishing its log key, sealing
+//! key, who it blocked), and the stored-message log (`log`) — publishing its log key, sealing
 //! what it sends, and fetching and opening what was kept for it.
 //!
 //! A log is a conversation: a direct one (`d:`, its two parties) or a
@@ -15,7 +15,7 @@
 //! The host feeds every `AccountReply` to `on_reply` and sends whatever comes
 //! back; stored messages come out as `Event::Message` / `Event::ChannelMessage`.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 
 use libsignal_protocol::IdentityKeyPair;
 use serde::{Deserialize, Serialize};
@@ -33,6 +33,15 @@ use crate::log::{
 
 pub const ITEM_LOGKEY: &str = "item.logkey";
 pub const ITEM_PREFS: &str = "item.prefs";
+pub const ITEM_BLOCKS: &str = "item.blocks";
+
+/// The most people one account's blocked list holds.
+pub const BLOCKS_MAX: usize = 200;
+/// The characters kept of a blocked person's name: only a label, and a relay's to choose.
+const BLOCK_NAME_MAX: usize = 64;
+/// What the blocked list's payload is padded to a multiple of: the relay sees
+/// an item's size, and must not read how many people are on it from that.
+const BLOCKS_BUCKET: usize = 1024;
 
 /// Most accounts one `LogKeys` asks about (the relay's own bound).
 const KEYS_PER_ASK: usize = 64;
@@ -55,6 +64,109 @@ pub struct Prefs {
     pub cloud: bool,
     /// Whether the first-connect setup asked this already.
     pub asked: bool,
+}
+
+/// Who the person blocked here, kept sealed in the vault so every device
+/// follows it. Its own item, never a field of `Prefs`: that one is positional,
+/// and a new field makes every saved copy unreadable.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Blocks {
+    /// By account, with the name it went by.
+    accounts: BTreeMap<[u8; 16], String>,
+    /// Guests, who have only a name, as it was written.
+    guests: BTreeSet<String>,
+}
+
+impl Blocks {
+    fn len(&self) -> usize {
+        self.accounts.len() + self.guests.len()
+    }
+
+    /// As the front end keys them (`block-rules.ts`): `a:<hex>` and
+    /// `g:<lowercase name>`, each with what to call them.
+    fn entries(&self) -> Vec<(String, String)> {
+        let accounts = self
+            .accounts
+            .iter()
+            .map(|(a, name)| (format!("a:{}", voipc_protocol::conv::hex(a)), name.clone()));
+        let guests = self
+            .guests
+            .iter()
+            .map(|name| (format!("g:{}", name.to_lowercase()), name.clone()));
+        accounts.chain(guests).collect()
+    }
+
+    /// Blocks or unblocks the person `key` names: whether that changed anything.
+    fn set(&mut self, key: &str, label: &str, on: bool) -> Result<bool, String> {
+        let name: String = label.chars().take(BLOCK_NAME_MAX).collect();
+        let full = on && self.len() >= BLOCKS_MAX;
+        let refused = || format!("You can block at most {BLOCKS_MAX} people here.");
+        if let Some(hex) = key.strip_prefix("a:") {
+            let account = voipc_protocol::conv::unhex16(hex).ok_or("not an account id")?;
+            if !on {
+                return Ok(self.accounts.remove(&account).is_some());
+            }
+            if self.accounts.get(&account) == Some(&name) {
+                return Ok(false);
+            }
+            if full && !self.accounts.contains_key(&account) {
+                return Err(refused());
+            }
+            self.accounts.insert(account, name);
+            return Ok(true);
+        }
+        let guest = key.strip_prefix("g:").ok_or("not a person to block")?;
+        let same = |g: &String| g.to_lowercase() == guest;
+        if !on {
+            let had = self.guests.len();
+            self.guests.retain(|g| !same(g));
+            return Ok(self.guests.len() != had);
+        }
+        if name.to_lowercase() != guest {
+            return Err("not a person to block".into());
+        }
+        if self.guests.iter().any(same) {
+            return Ok(false);
+        }
+        if full {
+            return Err(refused());
+        }
+        self.guests.insert(name);
+        Ok(true)
+    }
+
+    /// Another device's list as well: a lost unblock stays blocked, the safe
+    /// way round. Past the cap the guests go first: an account is the surer name.
+    fn join(&mut self, theirs: Blocks) {
+        self.accounts.extend(theirs.accounts);
+        self.guests.extend(theirs.guests);
+        self.trim();
+    }
+
+    fn trim(&mut self) {
+        while self.len() > BLOCKS_MAX {
+            if self.guests.pop_last().is_none() {
+                self.accounts.pop_last();
+            }
+        }
+    }
+
+    /// Padded to a whole bucket: postcard reads what it needs and leaves the rest.
+    fn to_padded(&self) -> Vec<u8> {
+        let mut bytes = postcard::to_allocvec(self).expect("blocks encode");
+        bytes.resize(
+            bytes.len().div_ceil(BLOCKS_BUCKET).max(1) * BLOCKS_BUCKET,
+            0,
+        );
+        bytes
+    }
+
+    /// What the vault holds, or `None` for something else.
+    fn from_bytes(bytes: &[u8]) -> Option<Blocks> {
+        let mut blocks: Blocks = postcard::from_bytes(bytes).ok()?;
+        blocks.trim();
+        Some(blocks)
+    }
 }
 
 /// What a device remembers of the log between runs; the host keeps it.
@@ -126,6 +238,8 @@ pub enum Event {
         item: &'static str,
         problem: &'static str,
     },
+    /// Who is blocked now, as another device's list joined ours.
+    Blocks { entries: Vec<(String, String)> },
 }
 
 impl Event {
@@ -278,6 +392,9 @@ impl Event {
                 "vault-problem",
                 serde_json::json!({ "item": item, "problem": problem }),
             ),
+            Event::Blocks { entries } => {
+                ("account-blocks", serde_json::json!({ "blocks": entries }))
+            }
             Event::IdentityChanged { .. } => return None,
         })
     }
@@ -332,6 +449,8 @@ pub struct AccountSync {
     pins_version: i64,
     prefs: Prefs,
     prefs_version: i64,
+    blocks: Blocks,
+    blocks_version: i64,
     /// Our older keys go to whoever joins a channel's log (the same consent
     /// as handing history over in person).
     share: bool,
@@ -466,6 +585,9 @@ impl AccountSync {
         let prefs = load(ITEM_PREFS, &|b| postcard::from_bytes::<Prefs>(b).is_ok())
             .and_then(|b| postcard::from_bytes(&b).ok())
             .unwrap_or_default();
+        let blocks = load(ITEM_BLOCKS, &|b| Blocks::from_bytes(b).is_some())
+            .and_then(|b| Blocks::from_bytes(&b))
+            .unwrap_or_default();
         let (logkey, logkey_version, fresh) =
             match load(ITEM_LOGKEY, &|b| LogKey::from_bytes(b).is_some())
                 .and_then(|b| LogKey::from_bytes(&b))
@@ -482,6 +604,8 @@ impl AccountSync {
             pins_version: version(ITEM_PINS),
             prefs,
             prefs_version: version(ITEM_PREFS),
+            blocks,
+            blocks_version: version(ITEM_BLOCKS),
             share,
             saving: HashSet::new(),
             dirty: HashSet::new(),
@@ -556,6 +680,34 @@ impl AccountSync {
         self.save(ITEM_PREFS)
     }
 
+    /// Who is blocked, as the front end keys them (`Blocks::entries`).
+    pub fn blocks(&self) -> Vec<(String, String)> {
+        self.blocks.entries()
+    }
+
+    /// Blocks or unblocks the person `key` names (`a:<hex>`, `g:<lowercase
+    /// name>`), under `label`. What goes to the relay is this one sealed item
+    /// and nothing about anybody; nothing goes to the person. Refused where
+    /// the list could not be kept: at the cap, or an item this device must not
+    /// save over.
+    pub fn set_block(
+        &mut self,
+        key: &str,
+        label: &str,
+        on: bool,
+    ) -> Result<Vec<ClientMessage>, String> {
+        if self.read_only.contains(ITEM_BLOCKS) {
+            return Err(
+                "Your blocked list could not be read here, so it cannot be changed now.".into(),
+            );
+        }
+        Ok(if self.blocks.set(key, label, on)? {
+            self.save(ITEM_BLOCKS)
+        } else {
+            Vec::new()
+        })
+    }
+
     pub fn set_share(&mut self, share: bool) {
         self.share = share;
     }
@@ -602,6 +754,7 @@ impl AccountSync {
         match k {
             ITEM_PINS => self.pins.to_bytes(),
             ITEM_PREFS => postcard::to_allocvec(&self.prefs).expect("prefs encode"),
+            ITEM_BLOCKS => self.blocks.to_padded(),
             _ => self.logkey.to_bytes().to_vec(),
         }
     }
@@ -610,6 +763,7 @@ impl AccountSync {
         match k {
             ITEM_PINS => &mut self.pins_version,
             ITEM_PREFS => &mut self.prefs_version,
+            ITEM_BLOCKS => &mut self.blocks_version,
             _ => &mut self.logkey_version,
         }
     }
@@ -635,7 +789,7 @@ impl AccountSync {
     }
 
     fn which(k: &str) -> Option<&'static str> {
-        [ITEM_PINS, ITEM_PREFS, ITEM_LOGKEY]
+        [ITEM_PINS, ITEM_PREFS, ITEM_BLOCKS, ITEM_LOGKEY]
             .into_iter()
             .find(|i| *i == k)
     }
@@ -658,8 +812,8 @@ impl AccountSync {
                 }
             }
             (None, Some(b)) => {
-                // Another device wrote first: pins join, a log key or prefs of
-                // theirs win (the log key: two would leave wraps to the wrong one).
+                // Another device wrote first: pins and blocks join, a log key or
+                // prefs of theirs win (the log key: two would leave wraps to the wrong one).
                 // One we cannot use is left alone, as at start.
                 match self.vault.open_item(std::slice::from_ref(b), k) {
                     Ok(item) => {
@@ -683,6 +837,15 @@ impl AccountSync {
                             ITEM_PREFS => {
                                 if let Ok(p) = postcard::from_bytes(&plain) {
                                     self.prefs = p;
+                                }
+                            }
+                            ITEM_BLOCKS => {
+                                if let Some(theirs) = Blocks::from_bytes(&plain) {
+                                    self.blocks.join(theirs);
+                                    self.dirty.insert(k);
+                                    self.later.push(Event::Blocks {
+                                        entries: self.blocks.entries(),
+                                    });
                                 }
                             }
                             _ => {
@@ -832,7 +995,23 @@ impl AccountSync {
         sent_at: u64,
         ttl_secs: Option<u32>,
     ) -> Vec<ClientMessage> {
-        if !self.prefs.cloud || peer == self.me {
+        if !self.prefs.cloud {
+            return Vec::new();
+        }
+        self.keep_dm(peer, envelope, sent_at, ttl_secs)
+    }
+
+    /// One direct message to keep for `peer` whatever cloud copies say: a report
+    /// to someone away, which its writer chose to keep sealed for that one
+    /// message (`AccountSession::kept_dm`).
+    pub fn keep_dm(
+        &mut self,
+        peer: [u8; 16],
+        envelope: Vec<u8>,
+        sent_at: u64,
+        ttl_secs: Option<u32>,
+    ) -> Vec<ClientMessage> {
+        if peer == self.me {
             return Vec::new();
         }
         self.outbox.push(Outgoing {
@@ -1816,6 +1995,29 @@ mod tests {
             p["event"],
             serde_json::json!({ "kind": "react", "target": "m1", "emoji": "🔥", "on": true })
         );
+        // A moderator's hide likewise, never a message of the channel's
+        let hide = Event::ChannelMessage {
+            conv: "c:1".into(),
+            sender: [1; 16],
+            sender_name: "ann".into(),
+            from_me: false,
+            envelope: ev(
+                ChatEvent::Hide {
+                    target: "m1".into(),
+                    on: true,
+                },
+                "",
+            ),
+            sent_at: 30,
+            server_at: 20,
+            seq: 6,
+        };
+        let (name, p) = hide.to_wire().unwrap();
+        assert_eq!(name, "stored-event");
+        assert_eq!(
+            p["event"],
+            serde_json::json!({ "kind": "hide", "target": "m1", "on": true })
+        );
         let dm = Event::Message {
             conv: "d:1".into(),
             peer: [2; 16],
@@ -1859,6 +2061,7 @@ mod tests {
                     fwd: Some(crate::envelope::Forwarded {
                         name: "cy".into(),
                         at: 7,
+                        report: None,
                     }),
                     ..Extras::default()
                 },
@@ -2047,6 +2250,130 @@ mod tests {
             events.iter().any(
                 |e| matches!(e, Event::Message { peer, from_me: false, .. } if *peer == bob.id)
             ),
+            "{events:?}"
+        );
+    }
+
+    /// `me`'s sync with cloud copies off: what most accounts have.
+    fn sync_without_copies(me: &Account) -> AccountSync {
+        let mut s = sync_for(me);
+        s.prefs.cloud = false;
+        s
+    }
+
+    #[test]
+    fn a_plain_dm_is_still_not_kept_with_cloud_off() {
+        let (me, bob) = (account(1), account(2));
+        let mut s = sync_without_copies(&me);
+        assert!(s
+            .send_dm(bob.id, envelope("m", "hello", None), 1, None)
+            .is_empty());
+        assert!(s.outbox.is_empty(), "nothing waits to go out either");
+    }
+
+    #[test]
+    fn a_marked_report_is_kept_once_with_cloud_copies_off() {
+        let (me, bob) = (account(1), account(2));
+        let mut s = sync_without_copies(&me);
+        let out = s.keep_dm(bob.id, envelope("r1", "report", None), 1, None);
+        assert_eq!(sent(&out, "LogKeys").len(), 1);
+        let (out, _) = s
+            .on_reply(&AccountReply::LogKeysFound {
+                keys: vec![bob.info("bob")],
+            })
+            .unwrap();
+        assert_eq!(sent(&out, "WrapsFetch").len(), 1);
+        let conv = dm_conv(&me.id, &bob.id);
+        let (out, _) = s
+            .on_reply(&AccountReply::Wraps {
+                conv: conv.clone(),
+                wraps: Vec::new(),
+            })
+            .unwrap();
+        assert_eq!(sent(&out, "LogAppend").len(), 1);
+        assert_eq!(sent(&out, "EpochPut").len(), 1);
+        // That one message: cloud copies are still off for the next
+        assert!(!s.prefs.cloud);
+        assert!(s
+            .send_dm(bob.id, envelope("m", "hello", None), 2, None)
+            .is_empty());
+        // Nor to ourselves, as for any copy
+        assert!(s
+            .keep_dm(me.id, envelope("x", "me", None), 3, None)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_kept_report_reaches_a_moderator_with_cloud_off() {
+        let (carla, bob) = (account(1), account(2));
+        let conv = dm_conv(&carla.id, &bob.id);
+        let mut reporter = sync_without_copies(&carla);
+        reporter.keep_dm(bob.id, envelope("r1", "report", None), 1, None);
+        reporter
+            .on_reply(&AccountReply::LogKeysFound {
+                keys: vec![bob.info("bob")],
+            })
+            .unwrap();
+        let (out, _) = reporter
+            .on_reply(&AccountReply::Wraps {
+                conv: conv.clone(),
+                wraps: Vec::new(),
+            })
+            .unwrap();
+        let Some(AccountRequest::EpochPut { epoch, wraps, .. }) =
+            sent(&out, "EpochPut").first().copied()
+        else {
+            panic!("an epoch is minted: {out:?}");
+        };
+        let Some(AccountRequest::LogAppend { ct, .. }) = sent(&out, "LogAppend").first().copied()
+        else {
+            panic!("the report goes out: {out:?}");
+        };
+        let to_bob = wraps.iter().find(|w| w.recipient == bob.id).unwrap();
+
+        // bob signs in with copies off: the index is read all the same
+        let mut moderator = sync_without_copies(&bob);
+        let (out, _) = moderator
+            .on_reply(&AccountReply::LogConvs {
+                convs: vec![(conv.clone(), 1)],
+            })
+            .unwrap();
+        assert_eq!(sent(&out, "LogKeys").len(), 1, "{out:?}");
+        assert_eq!(sent(&out, "WrapsFetch").len(), 1, "{out:?}");
+        moderator
+            .on_reply(&AccountReply::LogKeysFound {
+                keys: vec![carla.info("carla")],
+            })
+            .unwrap();
+        moderator
+            .on_reply(&AccountReply::Wraps {
+                conv: conv.clone(),
+                wraps: vec![WrapOut {
+                    owner: carla.id,
+                    epoch: *epoch,
+                    wrapped: to_bob.wrapped.clone(),
+                }],
+            })
+            .unwrap();
+        let (_, events) = moderator
+            .on_reply(&AccountReply::LogPage {
+                conv: conv.clone(),
+                entries: vec![LogEntry {
+                    seq: 1,
+                    sender: carla.id,
+                    epoch: *epoch,
+                    server_at: 1,
+                    ct: ct.clone(),
+                }],
+                more: false,
+                owed: Vec::new(),
+            })
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::Message { peer, from_me: false, envelope, .. }
+                    if *peer == carla.id && crate::envelope::open_envelope(envelope).text == "report")),
             "{events:?}"
         );
     }
@@ -2690,6 +3017,341 @@ mod tests {
                 |e| matches!(e, Event::IdentityChanged { account, .. } if *account == peer.id)
             ),
             "{events:?}"
+        );
+    }
+
+    impl Blocks {
+        fn from_entries(entries: &[(String, String)]) -> Blocks {
+            let mut b = Blocks::default();
+            for (key, label) in entries {
+                b.set(key, label, true).unwrap();
+            }
+            b
+        }
+    }
+
+    /// `me` signed in with these vault items, sealed as an earlier save left them.
+    fn start_with_items(
+        me: &Account,
+        items: &[(&str, u64, Vec<u8>)],
+        memory: LogMemory,
+    ) -> (AccountSync, Vault) {
+        let vault = Vault::create(RELAY, "me");
+        let mut blobs = vec![VaultBlob {
+            version: 1,
+            ..vault.seal_item(ITEM_LOGKEY, 1, &me.logkey.to_bytes())
+        }];
+        for (k, gen, payload) in items {
+            blobs.push(VaultBlob {
+                version: 1,
+                ..vault.seal_item(k, *gen, payload)
+            });
+        }
+        let dek = vault.dek();
+        let signed = SignedIn {
+            relay_id: RELAY,
+            name: "me".into(),
+            vault,
+            identity: me.identity,
+            recovery: None,
+            blobs,
+        };
+        let (s, _) = AccountSync::start(&signed, me.id, memory, false);
+        (s, Vault::from_dek(RELAY, "me", dek))
+    }
+
+    /// The one `VaultPut` of `out`.
+    fn put_of(out: &[ClientMessage]) -> (&str, &[u8]) {
+        match &sent(out, "VaultPut")[..] {
+            [AccountRequest::VaultPut { k, v, .. }] => (k.as_str(), v.as_slice()),
+            other => panic!("not one VaultPut: {other:?}"),
+        }
+    }
+
+    const BOB: [u8; 16] = [0xb0; 16];
+
+    fn bob_key() -> String {
+        format!("a:{}", voipc_protocol::conv::hex(&BOB))
+    }
+
+    fn blocks_of(entries: &[(&str, &str)]) -> Vec<(String, String)> {
+        entries
+            .iter()
+            .map(|(k, l)| (k.to_string(), l.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn a_blocked_list_survives_saving_and_signing_in_again() {
+        let me = account(1);
+        let (mut s, vault) = start_with_items(&me, &[], LogMemory::default());
+        let out = s.set_block(&bob_key(), "bob", true).unwrap();
+        assert_eq!(put_of(&out).0, ITEM_BLOCKS);
+        assert!(
+            s.set_block("g:eve#0001", "Eve#0001", true)
+                .unwrap()
+                .is_empty(),
+            "one write at a time"
+        );
+        let (out, _) = s
+            .on_reply(&AccountReply::VaultStored {
+                k: ITEM_BLOCKS.into(),
+                version: 2,
+            })
+            .unwrap();
+        let (k, v) = put_of(&out);
+        let saved = VaultBlob {
+            k: k.to_string(),
+            v: v.to_vec(),
+            version: 3,
+        };
+        let item = vault.open_item(&[saved], ITEM_BLOCKS).unwrap();
+        assert_eq!(item.gen, 2, "each save counts");
+
+        // The next sign-in, on any device of the account
+        let want = blocks_of(&[(&bob_key(), "bob"), ("g:eve#0001", "Eve#0001")]);
+        let (mut s, _) = start_with_items(
+            &me,
+            &[(ITEM_BLOCKS, item.gen, item.payload)],
+            LogMemory::default(),
+        );
+        assert_eq!(s.blocks(), want, "a guest as written, keyed in lower case");
+
+        // An unblock is a save too, and no change is no write
+        let out = s.set_block(&bob_key(), "bob", false).unwrap();
+        assert_eq!(put_of(&out).0, ITEM_BLOCKS);
+        assert_eq!(s.blocks(), blocks_of(&[("g:eve#0001", "Eve#0001")]));
+        assert!(s.set_block(&bob_key(), "bob", false).unwrap().is_empty());
+    }
+
+    /// Why this is an item of its own: `Prefs` is positional, and a field added
+    /// to it would turn every account's two saved bytes "unreadable" and read-only.
+    #[test]
+    fn saved_prefs_still_open_beside_a_blocked_list() {
+        let me = account(1);
+        let list = Blocks::from_entries(&blocks_of(&[(&bob_key(), "bob")])).to_padded();
+        let (mut s, _) = start_with_items(
+            &me,
+            &[(ITEM_PREFS, 1, vec![1, 1]), (ITEM_BLOCKS, 1, list)],
+            LogMemory::default(),
+        );
+        assert_eq!(
+            s.prefs(),
+            Prefs {
+                cloud: true,
+                asked: true
+            }
+        );
+        assert_eq!(s.blocks().len(), 1);
+        assert!(problems(&mut s).is_empty(), "nothing is reported");
+        assert!(
+            !s.read_only.contains(ITEM_PREFS),
+            "and the cloud setting can still be saved"
+        );
+    }
+
+    /// Two devices at once: theirs joins ours, is written back, and the front
+    /// end hears. A lost unblock stays blocked.
+    #[test]
+    fn a_conflict_over_the_blocked_list_joins_both_and_saves_again() {
+        let me = account(1);
+        let (mut s, vault) = start_with_items(&me, &[], LogMemory::default());
+        let out = s.set_block(&bob_key(), "bob", true).unwrap();
+        assert_eq!(put_of(&out).0, ITEM_BLOCKS);
+        let theirs = VaultBlob {
+            version: 5,
+            ..vault.seal_item(
+                ITEM_BLOCKS,
+                4,
+                &Blocks::from_entries(&blocks_of(&[("g:eve#0001", "eve#0001")])).to_padded(),
+            )
+        };
+        let (out, events) = s
+            .on_reply(&AccountReply::VaultConflict {
+                k: ITEM_BLOCKS.into(),
+                blob: Some(theirs),
+            })
+            .unwrap();
+        let want = blocks_of(&[(&bob_key(), "bob"), ("g:eve#0001", "eve#0001")]);
+        assert_eq!(s.blocks(), want);
+        assert!(
+            matches!(
+                &sent(&out, "VaultPut")[..],
+                [AccountRequest::VaultPut { expect: 5, .. }]
+            ),
+            "saved over what the relay holds now: {out:?}"
+        );
+        let told = events
+            .iter()
+            .find_map(|e| match e {
+                Event::Blocks { .. } => e.to_wire(),
+                _ => None,
+            })
+            .expect("the front end is told");
+        assert_eq!(told.0, "account-blocks");
+        assert_eq!(told.1["blocks"], serde_json::json!(want));
+    }
+
+    /// One this device cannot use is left alone, and a change to it is refused
+    /// out loud: a list that only looks changed comes back at the next sign-in.
+    #[test]
+    fn a_blocked_list_it_cannot_read_is_never_saved_over() {
+        let me = account(1);
+        let vault = Vault::create(RELAY, "me");
+        let mut damaged = VaultBlob {
+            version: 4,
+            ..vault.seal_item(ITEM_BLOCKS, 3, &Blocks::default().to_padded())
+        };
+        let last = damaged.v.len() - 1;
+        damaged.v[last] ^= 1;
+        let (mut s, _) = start_with(&me, vault.dek(), Some(damaged), LogMemory::default());
+        assert_eq!(problems(&mut s), vec![(ITEM_BLOCKS, "unreadable")]);
+        assert!(s.set_block(&bob_key(), "bob", true).is_err());
+        assert!(s.blocks().is_empty());
+        // Withheld, where this device saw one
+        let seen = LogMemory {
+            vault_gens: [(ITEM_BLOCKS.to_string(), 5)].into(),
+            ..Default::default()
+        };
+        let (mut s, _) = start_with(&me, vault.dek(), None, seen);
+        assert_eq!(problems(&mut s), vec![(ITEM_BLOCKS, "missing")]);
+        assert!(s.set_block(&bob_key(), "bob", true).is_err());
+        // The control: a first device saves
+        let (mut s, _) = start_with(&me, vault.dek(), None, LogMemory::default());
+        assert_eq!(
+            sent(&s.set_block(&bob_key(), "bob", true).unwrap(), "VaultPut").len(),
+            1
+        );
+    }
+
+    #[test]
+    fn the_blocked_list_stops_at_its_cap() {
+        let me = account(1);
+        let (mut s, _) = start_with_items(&me, &[], LogMemory::default());
+        for i in 0..BLOCKS_MAX {
+            let name = format!("guest#{i:04}");
+            s.set_block(&format!("g:{name}"), &name, true).unwrap();
+        }
+        assert_eq!(s.blocks().len(), BLOCKS_MAX);
+        assert!(s.set_block(&bob_key(), "bob", true).is_err(), "one more");
+        assert!(
+            s.set_block("g:guest#0000", "guest#0000", true)
+                .unwrap()
+                .is_empty(),
+            "one already on it is no more"
+        );
+        assert_eq!(s.blocks().len(), BLOCKS_MAX);
+        // Unblocking makes room
+        s.set_block("g:guest#0000", "guest#0000", false).unwrap();
+        assert!(s.set_block(&bob_key(), "bob", true).is_ok());
+        // Nor does a list another device saved get past it, the accounts staying
+        let mut over = Blocks::default();
+        for i in 0..(BLOCKS_MAX + 20) {
+            over.guests.insert(format!("guest#{i:04}"));
+        }
+        over.accounts.insert(BOB, "bob".into());
+        let bytes = postcard::to_allocvec(&over).unwrap();
+        let read = Blocks::from_bytes(&bytes).unwrap();
+        assert_eq!(read.len(), BLOCKS_MAX);
+        assert!(read.accounts.contains_key(&BOB));
+    }
+
+    #[test]
+    fn a_label_is_clipped_and_a_key_must_name_somebody() {
+        let me = account(1);
+        let (mut s, _) = start_with_items(&me, &[], LogMemory::default());
+        s.set_block(&bob_key(), &"b".repeat(500), true).unwrap();
+        assert_eq!(s.blocks()[0].1.chars().count(), BLOCK_NAME_MAX);
+        for bad in ["", "bob", "a:zz", "x:bob", "g:other"] {
+            assert!(s.set_block(bad, "bob", true).is_err(), "{bad}");
+        }
+    }
+
+    /// The relay sees that the item changed and its bucket. How many people are
+    /// on the list it must not read from the size.
+    #[test]
+    fn lists_of_different_lengths_in_a_bucket_seal_to_one_size() {
+        let vault = Vault::create(RELAY, "me");
+        let sealed = |names: &[&str]| {
+            let mut b = Blocks::default();
+            for n in names {
+                b.guests.insert(n.to_string());
+            }
+            let padded = b.to_padded();
+            assert_eq!(padded.len() % BLOCKS_BUCKET, 0);
+            (
+                padded.len(),
+                vault.seal_item(ITEM_BLOCKS, 1, &padded).v.len(),
+            )
+        };
+        let (one, none) = (sealed(&["bob#0001"]), sealed(&[]));
+        let many = sealed(&["bob#0001", "eve#0002", "mallory#0003", "trudy#0004"]);
+        assert_eq!(none, one, "nobody blocked looks like somebody");
+        assert_eq!(one, many, "and one like four");
+        // The control: a list past the bucket is the next one, and still opens
+        let names: Vec<String> = (0..200).map(|i| format!("someone-long#{i:04}")).collect();
+        let long: Vec<&str> = names.iter().map(String::as_str).collect();
+        assert!(sealed(&long).0 > one.0);
+        let mut b = Blocks::default();
+        b.guests.extend(names);
+        assert_eq!(Blocks::from_bytes(&b.to_padded()).unwrap(), b);
+    }
+
+    /// A block tells the relay nothing but that an item changed, and the blocked
+    /// person nothing at all.
+    #[test]
+    fn a_block_sends_one_sealed_write_and_names_nobody() {
+        let me = account(1);
+        let hex = voipc_protocol::conv::hex(&BOB);
+        let holds = |hay: &[u8], needle: &[u8]| hay.windows(needle.len()).any(|w| w == needle);
+        let name = "eve-the-guest#0001";
+        for (key, label, who) in [
+            (bob_key(), "bob-the-person", &BOB[..]),
+            (format!("g:{name}"), name, name.as_bytes()),
+        ] {
+            let (mut s, _) = start_with_items(&me, &[], LogMemory::default());
+            let out = s.set_block(&key, label, true).unwrap();
+            assert_eq!(out.len(), 1, "one message: {out:?}");
+            let (k, v) = put_of(&out);
+            assert_eq!(k, ITEM_BLOCKS, "and the only thing it names");
+            for leak in [who, label.as_bytes(), hex.as_bytes()] {
+                assert!(!holds(v, leak), "the sealed bytes hold {leak:?}");
+            }
+            let shown = format!("{out:?}");
+            assert!(!shown.contains(label) && !shown.contains(&hex));
+            // The control: unsealed, the same list does say who
+            let plain = s.item_bytes(ITEM_BLOCKS);
+            assert!(holds(&plain, who) && holds(&plain, label.as_bytes()));
+        }
+    }
+
+    /// The vault is shared with the pins: a refused write reaches the person,
+    /// or the block would be lost at the next sign-in without a word.
+    #[test]
+    fn a_refused_write_of_the_blocked_list_is_told() {
+        let me = account(1);
+        let (mut s, _) = start_with_items(&me, &[], LogMemory::default());
+        s.set_block(&bob_key(), "bob", true).unwrap();
+        let (_, events) = s
+            .on_reply(&AccountReply::Error {
+                request: "VaultPut".into(),
+                reason: "The vault is full.".into(),
+            })
+            .unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, Event::NotKept { reason } if reason.contains("full"))),
+            "{events:?}"
+        );
+        // And it can be tried again
+        assert_eq!(
+            sent(
+                &s.set_block("g:eve#0001", "eve#0001", true).unwrap(),
+                "VaultPut"
+            )
+            .len(),
+            1
         );
     }
 }

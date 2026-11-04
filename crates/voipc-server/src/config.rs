@@ -137,6 +137,9 @@ pub struct AccountsConfig {
     pub cloud: bool,
     /// How long a stored message stays at most.
     pub retention_days: u32,
+    /// How long the moderation log keeps a row, whatever happened to the
+    /// accounts it names.
+    pub modlog_days: u32,
     /// Per account: the vault and stored messages together.
     pub quota_mb: u32,
     /// The master key (seals second-factor secrets). Made on first start,
@@ -160,6 +163,7 @@ impl Default for AccountsConfig {
             registration: RegistrationMode::Invite,
             cloud: true,
             retention_days: 365,
+            modlog_days: 180,
             quota_mb: 50,
             key_file: "voipc-accounts.key".into(),
             public_url: String::new(),
@@ -314,6 +318,9 @@ impl ServerConfig {
             }
             if self.accounts.retention_days == 0 {
                 return Err(anyhow!("[accounts] retention_days must be at least 1: with 0, a kept message expires as it arrives"));
+            }
+            if self.accounts.modlog_days == 0 {
+                return Err(anyhow!("[accounts] modlog_days must be at least 1: with 0, the sweep empties the moderation log"));
             }
         }
         let f = &self.files;
@@ -570,6 +577,24 @@ mod tests {
         assert!(off.validate().is_ok(), "no accounts, no quota to mind");
         assert!(parse("max_users = 0").validate().is_err());
         assert!(parse("max_connections_per_ip = 1").validate().is_err());
+    }
+
+    #[test]
+    fn modlog_days_zero_is_refused() {
+        let parse = |extra: &str| {
+            toml::from_str::<ServerConfig>(&format!("cert_path = \"c\"\nkey_path = \"k\"\n{extra}"))
+                .unwrap()
+        };
+        let zero = parse("[accounts]\nmode = \"optional\"\nmodlog_days = 0");
+        assert!(zero
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("modlog_days"));
+        // The rest of the same config is fine: it is the zero that stops the start
+        let one = parse("[accounts]\nmode = \"optional\"\nmodlog_days = 1");
+        assert!(one.validate().is_ok());
+        assert_eq!(ServerConfig::default().accounts.modlog_days, 180);
     }
 
     #[test]

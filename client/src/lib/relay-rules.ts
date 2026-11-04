@@ -36,6 +36,12 @@ export function community(p: number | null): boolean {
   return p === null || p >= 18;
 }
 
+/** What 1.10 brought (protocol 19): mute and timeouts, hiding messages, summons,
+ *  the moderation log, reports. */
+export function moderation(p: number | null): boolean {
+  return p === null || p >= 19;
+}
+
 /** What the banner names as off on a relay of protocol `p`. */
 export function missing(p: number | null): string[] {
   if (p === null) return [];
@@ -47,6 +53,7 @@ export function missing(p: number | null): string[] {
   if (p < 16) off.push("users, groups and channel gates");
   if (p < 17) off.push("sign-in with a provider");
   if (p < 18) off.push("channels made in the app, display names and pictures, invite links, @everyone");
+  if (p < 19) off.push("mute and timeouts, hiding messages, summons, the moderation log, reports");
   return off;
 }
 

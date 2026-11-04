@@ -603,9 +603,19 @@ pub async fn channel_delete(
     channel_id: ChannelId,
 ) -> Result<(), String> {
     let relay = state.accounts.clone().ok_or(GONE)?;
-    let (_, gate, kept, conv) = reachable(state, session_id, channel_id).await?;
+    let (info, gate, kept, conv) = reachable(state, session_id, channel_id).await?;
     if !kept {
         return Err(NOT_THE_APPS.into());
+    }
+    let row = crate::accounts::modlog::Entry {
+        action: "channel_delete",
+        channel_key: &conv,
+        channel_name: &info.name,
+        ..Default::default()
+    };
+    if let Err(e) = crate::accounts::modlog::put(state, session_id, row).await {
+        warn!(conv, "keeping a channel's deletion: {e:#}");
+        return Err("That could not be kept.".into());
     }
     // All of it first, in one go: a failure here leaves a channel that can be
     // deleted again, and a crash after it one that does not come back

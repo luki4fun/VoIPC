@@ -94,11 +94,11 @@ async fn handle_voice_packet(session_id: SessionId, data: Bytes, state: &ServerS
     }
 
     // One lookup for all three: this runs per voice packet per speaker.
-    let (channel_id, speaker_uid, listen_only) = match state.sessions.get(&session_id) {
+    let (channel_id, speaker_uid, not_heard) = match state.sessions.get(&session_id) {
         Some(session) => (
             session.channel_id,
             session.user_id,
-            session.listen_only.contains(&session.channel_id),
+            session.listen_only.contains(&session.channel_id) || session.silence.voice(),
         ),
         None => {
             warn!(session_id, "voice forward: session not found in state");
@@ -106,9 +106,10 @@ async fn handle_voice_packet(session_id: SessionId, data: Bytes, state: &ServerS
         }
     };
     // The gate names who speaks here, and they are told they are not one
-    // (`ListenOnly`). A position is no speech: proximity still places them.
-    if listen_only && !is_position {
-        trace!(session_id, "voice forward: dropping (listen only)");
+    // (`ListenOnly`), or they are held (`Restrictions`). A position is no speech:
+    // proximity still places them.
+    if not_heard && !is_position {
+        trace!(session_id, "voice forward: dropping (listen only or held)");
         return;
     }
 

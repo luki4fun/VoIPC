@@ -123,7 +123,8 @@ pub enum ClientMessage {
     /// Request the user list of a channel without joining it (preview).
     RequestChannelUsers { channel_id: ChannelId },
 
-    /// Invite a user to your channel (creator only).
+    /// Invite a user to your channel: its creator, or a holder of `voipc:channels`
+    /// standing in it (protocol v19).
     SendInvite {
         channel_id: ChannelId,
         target_user_id: UserId,
@@ -334,6 +335,17 @@ pub enum ClientMessage {
     ProfilesGet { accounts: Vec<[u8; 16]> },
     /// `ServerMessage::ProfilePicture` answers (protocol v18).
     ProfilePictureGet { hash: [u8; 32] },
+    /// Restrict a member (protocol v19). Both false lifts. `duration_secs` 0: until
+    /// lifted. Answered by `ServerMessage::Restrictions` to everyone, or `AdminError`.
+    AdminRestrict {
+        user_id: UserId,
+        voice: bool,
+        text: bool,
+        duration_secs: u32,
+        reason: String,
+    },
+    /// Who takes a report now (protocol v19). `ServerMessage::ReportTakers` answers.
+    ReportTakersGet,
 }
 
 /// The client's side of an account sign-in, between `Authenticate` and
@@ -710,6 +722,27 @@ pub enum AdminOp {
     InviteLinkRevoke {
         id: String,
     },
+    /// The moderation log, newest first: rows older than id `before` (0: from
+    /// the newest).
+    ModLog {
+        before: i64,
+    },
+    /// A moderator's own word that they hid a message or showed it again. Hiding
+    /// is inside E2E, where the relay cannot see it; the log marks the row as this.
+    ModNote {
+        channel_id: ChannelId,
+        target: String,
+        message: String,
+        on: bool,
+    },
+    /// What `name`, banned now, wrote to channels' stored logs in the last
+    /// `window_secs` (0: all that is kept) goes, and devices are told to hide their
+    /// copies. Takes a fresh code. Never direct messages. Sent after the ban, whose
+    /// released shape cannot take a field.
+    RemovePosts {
+        name: String,
+        window_secs: u32,
+    },
 }
 
 /// The relay's side of an account sign-in.
@@ -971,6 +1004,16 @@ pub enum AdminReply {
     InviteLinks { links: Vec<InviteLinkInfo> },
     /// Shown once: only its hash is kept.
     InviteLinkCode { code: String },
+    /// A page of the moderation log, under the `before` it answers. `keep_days`:
+    /// how long this server keeps a row.
+    ModLog {
+        before: i64,
+        rows: Vec<ModRow>,
+        more: bool,
+        keep_days: u32,
+    },
+    /// `RemovePosts` is done: `entries` stored messages went.
+    PostsRemoved { name: String, entries: u64 },
 }
 
 /// A wrapped epoch key for one member (`AccountRequest::EpochPut`).
@@ -1392,6 +1435,26 @@ pub enum ServerMessage {
     /// Every badge of our own groups (protocol v18), so `@&badge` reaches us even
     /// where our row shows only the top ones (`MAX_BADGES`). Told to us alone.
     MyBadges { badges: Vec<String> },
+
+    /// One change, or everyone held right after connect (protocol v19). `voice`,
+    /// `text` and `direct` all false: lifted.
+    Restrictions { list: Vec<Restriction> },
+
+    /// Every account holding a privilege (protocol v19), the whole list: at connect
+    /// and when it changes. By account, since a stored hide must still count when its
+    /// moderator is away. Advisory, as a pin's right is: chat is end to end, and only
+    /// clients act on it.
+    ChatMods { mods: Vec<ChatMod> },
+
+    /// This server says these posts were removed (protocol v19): at once, and
+    /// everything still in its log right after connect. Clients hide their copies in
+    /// channels, never delete them, and never touch direct messages. It names no
+    /// channel and no reason.
+    PostsHidden { marks: Vec<PostsMark> },
+
+    /// What `ReportTakersGet` asked (protocol v19): online first, at most
+    /// `MAX_REPORT_TAKERS`.
+    ReportTakers { takers: Vec<ReportTaker> },
 }
 
 /// `FileRefused.code`, final for this hash: not in a conversation of the

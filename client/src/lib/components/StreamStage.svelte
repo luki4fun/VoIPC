@@ -18,9 +18,11 @@
   } from "../ui-prefs.js";
   import { activeStreamChat, uiLayout, updateActiveStreamChat } from "../stores/ui-prefs.js";
   import { streamStage } from "../stores/screenshare.js";
-  import { displayChannelId, shownMessages } from "../stores/roster.js";
+  import { displayChannel, displayChannelId, shownMessages } from "../stores/roster.js";
   import { activeDmUserId, activeDmUsername } from "../stores/chat.js";
   import { serverAddress } from "../stores/connection.js";
+  import { blocked, revealedRows } from "../stores/blocks.js";
+  import { newestUnfolded } from "../block-rules.js";
   import ChatPanel from "./ChatPanel.svelte";
   import ScreenShareViewer from "./ScreenShareViewer.svelte";
   import SharePreview from "./SharePreview.svelte";
@@ -48,12 +50,14 @@
   // show has moved on. "Seen" is the newest message while the chat was open,
   // or when the conversation itself changed — opening another channel is not
   // news from this one. Newer, not just different: a message expiring under
-  // its timer is no news either.
+  // its timer is no news either, nor is one from someone blocked.
   // A direct one by its person's name, which outlives their id (they came back)
   const conversation = $derived(
     `${$serverAddress}/${$activeDmUserId === null ? `#${$displayChannelId}` : `@${$activeDmUsername}`}`,
   );
-  const newest = $derived($shownMessages.at(-1)?.timestamp ?? 0);
+  const newest = $derived(
+    newestUnfolded($blocked, $shownMessages, $activeDmUserId === null && !!$displayChannel?.anonymous, $revealedRows),
+  );
   let seen = $state(0);
   let seenIn = "";
   $effect(() => {

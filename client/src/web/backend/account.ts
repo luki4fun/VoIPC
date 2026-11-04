@@ -423,6 +423,16 @@ export class AccountDriver {
     }
   }
 
+  /** The people of a `ReportTakers`, for the pins. Never throws: the answer
+   *  itself must still be shown. */
+  noteTakers(takers: unknown[]): void {
+    try {
+      this.session?.noteTakers(takers);
+    } catch (e) {
+      console.warn("could not read who takes reports:", e);
+    }
+  }
+
   /** An identity `userId` showed: in a pre-key bundle, or a session they opened. */
   checkIdentity(host: AccountHost, userId: number, key: ArrayLike<number>): void {
     if (this.session) this.run(host, this.session.checkIdentity(userId, Uint8Array.from(key)));
@@ -434,9 +444,9 @@ export class AccountDriver {
   }
 
   /** A direct message for an account that is away (hex id); throws why not. */
-  keptDm(host: AccountHost, accountHex: string, envelope: Uint8Array, ttlSecs?: number | null): void {
+  keptDm(host: AccountHost, accountHex: string, envelope: Uint8Array, ttlSecs: number | null | undefined, once: boolean): void {
     if (!this.session) throw new Error("Not signed in to an account on that server");
-    this.run(host, this.session.keptDm(accountHex, envelope, Date.now(), ttlSecs ?? null));
+    this.run(host, this.session.keptDm(accountHex, envelope, Date.now(), ttlSecs ?? null, once));
   }
 
   /** A message written in a channel with log `log` ("" for none), kept for its members too. */
@@ -509,5 +519,10 @@ export class AccountDriver {
   setPrefs(host: AccountHost, cloud: boolean, asked: boolean): void {
     if (!this.session) throw new Error("Not signed in to an account on that server");
     this.run(host, this.session.setPrefs(cloud, asked));
+  }
+
+  setBlocked(host: AccountHost, key: string, label: string, on: boolean): void {
+    if (!this.session) throw new Error("Not signed in to an account on that server");
+    this.run(host, this.session.setBlocked(key, label, on));
   }
 }

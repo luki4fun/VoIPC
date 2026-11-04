@@ -285,6 +285,10 @@ const handlers: Record<string, Handler> = {
     const p = prefs as Record<string, unknown>;
     account.setPrefs(s, bool(p?.cloud, "cloud"), bool(p?.asked, "asked"));
   },
+  account_block: ({ server, key, label, on }) => {
+    const { s, account } = needAccount(server);
+    account.setBlocked(s, str(key, "key"), str(label, "label"), bool(on, "on"));
+  },
   safety_number: ({ server, userId }) => need(server).safetyNumber(u32(userId, "userId")),
   qr_svg: ({ text }) => {
     const t = str(text, "text");
@@ -371,6 +375,7 @@ const handlers: Record<string, Handler> = {
     need(server).sendControl({ KickUser: { channel_id: u32(channelId, "channelId"), user_id: u32(userId, "userId") } }),
   profiles_get: ({ server, accounts }) =>
     need(server).sendControl({ ProfilesGet: { accounts } }),
+  report_takers_get: ({ server }) => need(server).sendControl("ReportTakersGet"),
   profile_picture_get: ({ server, hash }) =>
     need(server).sendControl({ ProfilePictureGet: { hash } }),
   request_channel_users: ({ server, channelId }) =>
@@ -555,6 +560,16 @@ const handlers: Record<string, Handler> = {
         reason: str(reason, "reason"),
         duration_secs: u32(durationSecs, "durationSecs"),
         account: account === true,
+      },
+    }),
+  admin_restrict: ({ server, userId, voice, text, durationSecs, reason }) =>
+    need(server).sendControl({
+      AdminRestrict: {
+        user_id: u32(userId, "userId"),
+        voice: voice === true,
+        text: text === true,
+        duration_secs: u32(durationSecs, "durationSecs"),
+        reason: str(reason, "reason"),
       },
     }),
   admin_ban_account: ({ server, name, reason, durationSecs }) =>

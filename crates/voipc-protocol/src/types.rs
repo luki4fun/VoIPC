@@ -55,6 +55,16 @@ pub struct UserInfo {
     pub badges: Vec<String>,
 }
 
+/// An account holding a privilege (`ServerMessage::ChatMods`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatMod {
+    pub account: [u8; 16],
+    /// Holds `voipc:hide`.
+    pub hide: bool,
+    /// Holds `*`: alone acts on other holders.
+    pub admin: bool,
+}
+
 /// Badges a member shows at most (`UserInfo::badges`).
 pub const MAX_BADGES: usize = 3;
 
@@ -393,6 +403,73 @@ pub struct AuditRow {
     pub actor: Option<String>,
     pub detail: String,
     pub at: i64,
+}
+
+/// One line of the moderation log. Names are as they were then, and as anyone
+/// but an admin saw them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModRow {
+    pub id: i64,
+    /// Unix seconds.
+    pub at: i64,
+    /// `kick`, `ban`, `unban`, `channel_kick`, `remove_posts`, `hide`, ...
+    pub action: String,
+    pub actor: String,
+    pub target: String,
+    /// None: server-wide, or a channel this reader cannot see.
+    pub channel: Option<String>,
+    pub reason: String,
+    pub detail: String,
+    /// The actor's app said so; the relay could not see it.
+    pub advisory: bool,
+}
+
+/// Whose posts this server says it removed (`ServerMessage::PostsHidden`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PostsMark {
+    /// None: a guest, or someone known here only by a pseudonym.
+    pub account: Option<[u8; 16]>,
+    pub name: String,
+    /// Message timestamps in Unix ms, not seconds.
+    pub since_ms: u64,
+    pub before_ms: u64,
+    pub by: String,
+}
+
+/// People one `ServerMessage::ReportTakers` names at most.
+pub const MAX_REPORT_TAKERS: usize = 5;
+
+/// Someone who takes a report of a message (protocol v19). Never someone standing
+/// under a pseudonym: this ties a user id to a name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReportTaker {
+    /// Here now: a report goes to this id. None: away, a sealed copy waits for `account`.
+    pub user_id: Option<UserId>,
+    /// None: the admin token, with no account.
+    pub account: Option<[u8; 16]>,
+    pub name: String,
+}
+
+/// Who may not speak for now (protocol v19). No name and no channel: an id says
+/// nothing a roster did not, under a pseudonym too.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Restriction {
+    pub user_id: UserId,
+    /// No voice, no screen share.
+    pub voice: bool,
+    /// No posts (reactions, pins, edits, deletes included), pokes, invites, new
+    /// channels, display name or picture.
+    pub text: bool,
+    /// No direct messages. The new-member wait sets this; a moderator's
+    /// restriction does not.
+    pub direct: bool,
+    /// Seconds until this row next changes, by the relay's clock. None: until
+    /// someone lifts it.
+    pub expires_in_secs: Option<u32>,
+    /// An account's name or "admin token". Empty: only the new-member wait applies.
+    pub by: String,
+    /// Told to the member and to holders of `voipc:restrict`; empty for everyone else.
+    pub reason: String,
 }
 
 /// A sign-up code that is still open or was used.

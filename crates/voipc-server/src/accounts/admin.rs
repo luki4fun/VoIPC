@@ -111,6 +111,8 @@ pub(super) async fn handle(
             if let Some(sid) = online(state, &id) {
                 super::refresh(state, relay, sid, AccountId(id)).await?;
             }
+            // They may be away, where no session's scopes change
+            super::refresh_chat_mods(state).await;
             crate::gates::prune_logs(state).await;
             Ok(user_reply(relay, actor, AccountId(id)).await)
         }
@@ -135,6 +137,7 @@ pub(super) async fn handle(
                     super::refresh(state, relay, sid, AccountId(id)).await?;
                 }
             }
+            super::refresh_chat_mods(state).await;
             crate::gates::prune_logs(state).await;
             Ok(user_reply(relay, actor, AccountId(id)).await)
         }
@@ -231,6 +234,25 @@ pub(super) async fn handle(
             if !name && !picture {
                 return Ok(refused("Admin", "That clears nothing."));
             }
+            let cleared = match (name, picture) {
+                (true, true) => "name and picture",
+                (true, false) => "name",
+                _ => "picture",
+            };
+            let Some(whose) = relay.store().user_by_id(AccountId(id)).await? else {
+                return Ok(refused("Admin", "No such account."));
+            };
+            let row = super::modlog::Entry {
+                action: "profile_reset",
+                target: Some(id),
+                target_name: &whose.username,
+                detail: cleared,
+                ..Default::default()
+            };
+            if let Err(e) = super::modlog::put(state, session_id, row).await {
+                tracing::warn!("keeping a profile reset: {e:#}");
+                return Ok(refused("Admin", "That could not be kept."));
+            }
             if name {
                 relay.profile_name_put(AccountId(id), None).await?;
             }
@@ -243,11 +265,7 @@ pub(super) async fn handle(
                     Some(AccountId(id)),
                     Some(user.id),
                     "profile_reset",
-                    match (name, picture) {
-                        (true, true) => "name and picture",
-                        (true, false) => "name",
-                        _ => "picture",
-                    },
+                    cleared,
                     "",
                 )
                 .await?;
@@ -549,6 +567,47 @@ pub(super) async fn handle(
                     .await
                     .map(|()| None),
             ))
+        }
+        AdminOp::ModLog { before } => {
+            if !scope::allowed(&scopes, super::MODLOG) {
+                return Ok(refused("Admin", "You may not read the moderation log."));
+            }
+            Ok(super::modlog::page(state, relay, session_id, &scopes, before).await)
+        }
+        AdminOp::ModNote {
+            channel_id,
+            target,
+            message,
+            on,
+        } => {
+            if !scope::allowed(&scopes, super::HIDE) {
+                return Ok(refused("Admin", "You may not hide messages."));
+            }
+            Ok(
+                super::modlog::note(state, relay, session_id, channel_id, &target, &message, on)
+                    .await,
+            )
+        }
+        AdminOp::RemovePosts { name, window_secs } => {
+            if !state.can(session_id, Powers::BAN) && !state.can(session_id, Powers::BANS) {
+                return Ok(refused("Admin", "You may not remove posts."));
+            }
+            let who = match super::modlog::removal_of(
+                state,
+                relay,
+                session_id,
+                &scopes,
+                &name,
+                window_secs,
+            )
+            .await?
+            {
+                Ok(who) => who,
+                Err(reason) => return Ok(refused("Admin", reason)),
+            };
+            // Gone for good: not a step for one stolen session
+            step_up!();
+            Ok(super::modlog::remove_posts(state, relay, session_id, who).await)
         }
     }
 }

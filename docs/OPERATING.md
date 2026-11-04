@@ -133,6 +133,26 @@ WantedBy=multi-user.target
 - **Sign-in with a provider** (`public_url`, `VOIPC_OAUTH_<PROVIDER>_ID` and `_SECRET`) needs a public
   certificate on this port. Apps that pinned the old self-signed one accept it, since the public CAs do, and
   go on doing so at each renewal. `signups_per_hour` (60) bounds new accounts: raise it for a move.
+- **Mutes and timeouts** live in the database (`voipc_restrictions`), so they outlast a restart: an account's by its id, a guest's as a keyed hash of the address, never the address. A row goes when it is lifted or runs out, and with its account. On a relay without accounts they live in memory, so a reconnect keeps them and a restart does not. No shell command touches them.
+- **Hiding messages** keeps nothing new here of itself: a hide travels end to end like a message, and goes where the
+  channel's stored messages go. The moderator's app also adds a row to the moderation log, naming who hid or restored
+  whose message in which channel, with the message's id. Every client is told each account holding a privilege, from your groups, at connect and when it
+  changes. What your shell changes reaches them within five minutes.
+- **The moderation log** (*Server admin*, for holders of `voipc:modlog`) lives in the database. `modlog_days`
+  (180) is how long a row and the names in it stay, by time alone; 0 stops the start. Whoever holds the database can
+  change it, so back it up and guard it as the record it is.
+- **Removing a banned member's posts** deletes rows of `voipc_log` for good: back them up if you may want them. It
+  keeps the direct messages and every key, so someone back from a ban reads and writes as before. Everyone who connects
+  is told of each removal still in the moderation log, the newest 2,000, so `modlog_days` is also how long a device
+  coming back hears of one. Files stay until `max_age_hours` takes them. From the shell, ban first; the removal itself
+  is made in the app, from *Active bans*.
+- **Reports** keep no row of their own: a report is a direct message to each holder of `voipc:reports`, and the relay
+  only answers who they are. A report that carries the message's file, the default until it is unticked, lists that
+  file under the direct message too, as any forward does, so the relay can see which conversation it came from.
+  There is no setting beyond who holds it, and nothing to back up. Reports reach someone away
+  through the stored log, so with `cloud = false` they reach only those online. Admins hold it anyway, and on a relay
+  without accounts so does whoever logged in with the token, while connected. Give the privilege to someone who reads
+  their messages: where nobody who holds it can be reached, the dialog says nobody takes reports.
 - **In the app** (*Server admin*): channels and categories, the server's name and icon, invite links.
 
 ## 7. Backups
@@ -211,6 +231,14 @@ and the apps right after (the way back: [COMPATIBILITY.md](COMPATIBILITY.md) §4
 
 The apps go back by hand too ([COMPATIBILITY.md](COMPATIBILITY.md) §4).
 
+**From 1.9 to 1.10** (protocol 18 to 19):
+- **A migration:** `0008_moderation.sql` adds the moderation log and the restrictions, so going back takes the old binary
+  and the backup.
+- **The moderator group** gains the four new privileges once, on the first start, if it still holds exactly kick, ban and
+  channels, and the log says so. A group you edited is left alone: tick them yourself, or only `*` has the tools.
+- **New keys, with defaults that change nothing:** `modlog_days` in `[accounts]` and `new_member_wait_mins` in
+  `server_settings.json`.
+
 **A later release that migrates the database** needs the old binary **and** the backup taken
 before the upgrade for a rollback: an older relay refuses a database that a newer one has
 migrated, by design. Release candidates (`-rc.N`) are for testing on a relay you can roll back.
@@ -240,7 +268,7 @@ The simplest way is a host directory that user 65532 owns:
     install -d -o 65532 -g 65532 -m 0700 /srv/voipc
     install -o 65532 -g 65532 -m 0600 server.toml cert.pem key.pem /srv/voipc/
     docker run -d --name voipc -v /srv/voipc:/data \
-      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.9.0-rc.1
+      -p 9987:9987/tcp -p 9987:9987/udp ghcr.io/luki4fun/voipc-server:1.10.0-rc.1
     docker exec voipc /voipc-server --config /data/server.toml admin grant <name> admin
 
 With a named volume instead, copy the files in with a throwaway container first, then run the
@@ -287,6 +315,10 @@ and who may call on everybody:
 | 1000 | all | 0.6 | 269 | 0 | 5 | all | 246 |
 | 2000 | all | 3.2 | 1595 | 0 | 10 | all | 561 |
 | 2000 | 2 | 3.0 | 2022 | 0 | 24 | all | 739 |
+
+Moderation (protocol 19) adds who holds privileges, running restrictions and removal marks to each
+connection, with no measurable cost: 2000 clients joined in 2.4 s (2.6 s on 2 cores) with p95 1452 ms
+(2342 ms), no short rosters, every message delivered, at 569 MiB (668 MiB).
 
 So the relay itself carries 2000 connections. What a connection may have waiting is bounded at 16 MiB
 of messages. Past that its client has stopped reading, and the relay ends the connection (the log says so)
@@ -466,9 +498,12 @@ Runtime settings in `server_settings.json`:
   "proximity_enabled": true,
   "game_token": null,
   "server_name": null,
-  "server_description": null
+  "server_description": null,
+  "new_member_wait_mins": 0
 }
 ```
+
+`new_member_wait_mins` (0, off, by default; at most 10080, a week; read at start) holds new members back from speaking, posting and writing direct messages for that long, against raids. An account counts from when it was made; a guest from when that address first came, and a guest counts as new again once the wait and one more day have gone by since their last visit. Admins, holders of a privilege and anyone in a group other than the built-in `user` do not wait, so someone you invite into a call cannot talk until the wait ends unless you give them a group, and an invite link that hands one out skips it. A guest's clock lives in memory: a restart, a self-update included, starts it again for every guest there. An account's does not. It keeps at most 100,000 addresses: when it is full, a guest from a new address waits from when they connect and again after a reload, and the next sweep, within five minutes, keeps only the clocks still inside the wait.
 
 `server_name` and `server_description` are what the server calls itself on a relay without accounts (on one with them, an admin sets these in the app, which goes first). Shown above the address, never instead of it. A name over 32 characters or shaped like an address reads as none.
 
@@ -476,13 +511,13 @@ Runtime settings in `server_settings.json`:
 
 `game_token` (unset by default) is a bearer token a **game server** may present to `POST /game/v1/routes`, which narrows who hears whom inside a channel whose `routed` flag is on. Unset, that endpoint answers 404 and this server has no idea games exist. It is not the admin token and is deliberately much weaker: no session list, no names, no kick, no bans — only "these players may hear each other, for the next few seconds", as opaque ids it forgets.
 
-**Persistent channels** (optional): drop a `channels.json` in the directory the server runs from (or pass `--channels <path>`) to pre-create long-lived rooms that survive restarts. See [channels.example.json](../channels.example.json) — plaintext `password` fields are hashed to SHA-256 on first load and the file is rewritten atomically. Per channel:
+**Persistent channels** (optional): drop a `channels.json` in the directory the server runs from (or pass `--channels <path>`) to pre-create long-lived rooms that survive restarts. See [channels.example.json](../channels.example.json) — plaintext `password` fields are hashed to SHA-256 on first load and the file is rewritten atomically. A holder of `voipc:channels` standing in such a room can change its password, and can invite someone past it. Per channel:
 
 | Option | Default | Effect |
 |---|---|---|
 | `proximity` | `"off"` | `"2d"` or `"3d"` makes it a proximity room |
 | `hidden` | `false` | Not listed in the sidebar for non-admins. It can still be joined — by an invite link, by the game SDK, or by anyone who knows it is there — so it is out of the way, not locked. Give a channel a `password` if you need it shut, and both if it is the one your game drives |
-| `anonymous` | `false` | Members see each other as `Guest-1234`, a fresh name per visit. The server substitutes it everywhere, so no client ever learns the real one; admins see the real names, and no chat history is handed over in such a channel. Voice channels only, and it hides a name rather than a person: user ids are the same everywhere, so somebody who is also in a channel where you can see them can be matched up by id — which is why a text channel, one you are in *besides* the voice channel you stand in, may not be anonymous at all |
+| `anonymous` | `false` | Members see each other as `Guest-48213907`, a fresh name per visit. The server substitutes it everywhere, so no client ever learns the real one; admins see the real names, and no chat history is handed over in such a channel. Voice channels only, and it hides a name rather than a person: user ids are the same everywhere, so somebody who is also in a channel where you can see them can be matched up by id — which is why a text channel, one you are in *besides* the voice channel you stand in, may not be anonymous at all |
 | `screen_share` | `true` | `false` refuses screen sharing there |
 | `hide_members` | `false` | Non-admins see no member list, only whoever is speaking (and can still adjust their volume). Nobody outside is told who joins or leaves either — only that the count changed — which is the same rule a password channel follows |
 | `routed` | `false` | The server forwards each voice only to whoever should hear it, instead of to every member. For a channel a game drives, where "every member" can be a whole map. **The one option that tells this server anything about who hears whom** — members in such a channel say which of the others they want to hear, and a game server with `game_token` may narrow that further. Positions, names and audio stay as unreadable to it as ever. Everyone joining is told, and the channel is marked **R** |

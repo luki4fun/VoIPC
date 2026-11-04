@@ -211,6 +211,18 @@ pub const RESHAPED: &[(u32, Side, u32, &str)] = &[
         46,
         "AccountReply: AdminReply::ChannelDone never comes from it",
     ),
+    (
+        18,
+        Side::Client,
+        41,
+        "AdminOp: the moderation steps are refused",
+    ),
+    (
+        18,
+        Side::Server,
+        46,
+        "AccountReply: AdminReply::ModLog and PostsRemoved never come from it",
+    ),
 ];
 
 /// How many messages each side had at a protocol: an index at or past it is
@@ -221,6 +233,7 @@ fn client_messages(proto: u32) -> u32 {
         13 => 45,
         14 => 49,
         15..=17 => 50,
+        18 => 52,
         _ => u32::MAX,
     }
 }
@@ -326,6 +339,10 @@ pub fn encode_client_msg_for(
         | ClientMessage::Account(
             AccountRequest::ProfileSet { .. } | AccountRequest::ProfilePictureSet { .. },
         ) if proto < 18 => Err(ProtocolError::NotOnThisRelay(proto)),
+        ClientMessage::Account(AccountRequest::Admin {
+            op: AdminOp::ModLog { .. } | AdminOp::ModNote { .. } | AdminOp::RemovePosts { .. },
+            ..
+        }) if proto < 19 => Err(ProtocolError::NotOnThisRelay(proto)),
         ClientMessage::EmoteAdd { emote } if proto == 14 => old(postcard::to_allocvec(&(
             EMOTE_ADD,
             EmoteAdd14 {
@@ -835,6 +852,16 @@ mod tests {
         ));
     }
 
+    fn restrict() -> ClientMessage {
+        ClientMessage::AdminRestrict {
+            user_id: 1,
+            voice: true,
+            text: false,
+            duration_secs: 60,
+            reason: String::new(),
+        }
+    }
+
     #[test]
     fn what_an_older_relay_never_heard_of_is_refused() {
         let cases = [
@@ -900,6 +927,37 @@ mod tests {
                 ClientMessage::Account(AccountRequest::PairDecline { pair: 1 }),
                 16,
             ),
+            (
+                ClientMessage::Account(AccountRequest::Admin {
+                    op: AdminOp::ModLog { before: 0 },
+                    code: None,
+                }),
+                18,
+            ),
+            (
+                ClientMessage::Account(AccountRequest::Admin {
+                    op: AdminOp::ModNote {
+                        channel_id: 1,
+                        target: String::new(),
+                        message: String::new(),
+                        on: true,
+                    },
+                    code: None,
+                }),
+                18,
+            ),
+            (
+                ClientMessage::Account(AccountRequest::Admin {
+                    op: AdminOp::RemovePosts {
+                        name: "dan".into(),
+                        window_secs: 3600,
+                    },
+                    code: None,
+                }),
+                18,
+            ),
+            (restrict(), 18),
+            (ClientMessage::ReportTakersGet, 18),
         ];
         for (msg, v) in cases {
             assert!(
@@ -910,6 +968,29 @@ mod tests {
         // ... and the same messages are fine where they exist
         assert!(encode_client_msg_for(&ClientMessage::FileCancel { hash: [0; 32] }, 13).is_ok());
         assert!(encode_client_msg_for(&ClientMessage::EmoteStickers { on: true }, 14).is_ok());
+        assert!(encode_client_msg_for(
+            &ClientMessage::Account(AccountRequest::Admin {
+                op: AdminOp::ModLog { before: 0 },
+                code: None,
+            }),
+            PROTOCOL_VERSION,
+        )
+        .is_ok());
+        assert!(encode_client_msg_for(
+            &ClientMessage::Account(AccountRequest::Admin {
+                op: AdminOp::RemovePosts {
+                    name: "dan".into(),
+                    window_secs: 0,
+                },
+                code: None,
+            }),
+            PROTOCOL_VERSION,
+        )
+        .is_ok());
+        assert_eq!(
+            encode_client_msg_for(&restrict(), PROTOCOL_VERSION).unwrap(),
+            vec![encode_client_msg(&restrict()).unwrap()]
+        );
     }
 
     #[test]

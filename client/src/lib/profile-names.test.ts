@@ -24,5 +24,13 @@ test("the member rows use MemberName", () => {
 
 test("a chat header does not take a shared message's word for whose account it is", () => {
   const text = readFileSync(new URL("./components/chat/MessageList.svelte", import.meta.url), "utf8");
-  assert.match(text, /msg\.kind === "shared" \? null : msg\.account/);
+  assert.match(text, /account=\{headerAccount\(msg, anonymous\)\}/);
+});
+
+test("who may call on everybody is forgotten with the connection, even during a reconnect", () => {
+  const text = readFileSync(new URL("../App.svelte", import.meta.url), "utf8");
+  const lost = text.slice(text.indexOf('"connection-lost"'));
+  const cleared = lost.indexOf("mentionPower.of(server).set(new Set())");
+  assert.ok(cleared >= 0);
+  assert.ok(cleared < lost.indexOf('!== "connected") return'), "before the early return");
 });

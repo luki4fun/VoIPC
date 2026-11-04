@@ -263,11 +263,14 @@ export interface AccountSession {
   onReply(reply: unknown): AccountActions;
   /** The users of a UserList, UserJoined or ChannelUsers, for the pins. */
   noteRoster(users: unknown): AccountActions;
+  /** The people of a ReportTakers, for the pins. */
+  noteTakers(takers: unknown): void;
   /** An identity a user showed (a bundle, or a session they opened). */
   checkIdentity(userId: number, key: Uint8Array): AccountActions;
   outgoingDm(userId: number, envelope: Uint8Array, sentAt: number, ttlSecs?: number | null): AccountActions;
-  /** A direct message for an account that is away (its hex id); throws why not. */
-  keptDm(accountHex: string, envelope: Uint8Array, sentAt: number, ttlSecs?: number | null): AccountActions;
+  /** A direct message for an account that is away (its hex id); throws why not.
+   *  `once`: a report, kept whatever cloud copies say. */
+  keptDm(accountHex: string, envelope: Uint8Array, sentAt: number, ttlSecs: number | null | undefined, once: boolean): AccountActions;
   outgoingChannel(log: string, envelope: Uint8Array, sentAt: number, ttlSecs?: number | null): AccountActions;
   /** In a channel with log `conv`: keep it, and read what it kept. */
   enter(conv: string): AccountActions;
@@ -289,6 +292,7 @@ export interface AccountSession {
   cloud(): boolean;
   asked(): boolean;
   setPrefs(cloud: boolean, asked: boolean): AccountActions;
+  setBlocked(key: string, label: string, on: boolean): AccountActions;
   setShare(share: boolean): void;
   /** The PBKDF2 salt for this account's passwords. */
   kdfSalt(): string;

@@ -275,7 +275,15 @@ async fn speech(state: &Arc<ServerState>, uid: UserId, channel_id: ChannelId) {
         },
     );
     if listen && sharing {
-        crate::session::cleanup_and_notify_screen_shares(state, uid, uid, channel_id).await;
+        // Their share only: what they watch goes on, since they may still listen
+        let _ = crate::session::handle_stop_screen_share(state, uid, uid, &tx).await;
+        // Tell the sharer's own client to stop capturing
+        let _ = send_msg(
+            &tx,
+            &ServerMessage::ScreenShareError {
+                reason: "you can only listen in this channel now".into(),
+            },
+        );
     }
 }
 

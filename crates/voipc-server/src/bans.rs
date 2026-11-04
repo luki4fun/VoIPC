@@ -49,11 +49,30 @@ pub struct Ban {
     /// A relay without accounts: the address itself, for `bans.json`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addr: Option<IpAddr>,
+    /// The pseudonym they went by when an admin banned them, whose label is the
+    /// real name: what the moderation log, read by others, goes on calling them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
 }
 
 impl Ban {
     fn active(&self, now: i64) -> bool {
         self.expires_at.is_none_or(|t| t > now)
+    }
+
+    /// What a row in the moderation log calls whoever this ban covers.
+    pub fn log_name(&self) -> &str {
+        self.alias.as_deref().unwrap_or(&self.label)
+    }
+
+    /// The name a reader knows this ban by. Someone who is no admin has what the log
+    /// says: the real name beside a row's time would say who it was.
+    pub fn name_for(&self, admin: bool) -> &str {
+        if admin {
+            &self.label
+        } else {
+            self.log_name()
+        }
     }
 }
 
@@ -93,6 +112,25 @@ fn active(state: &ServerState, key: &Key) -> Option<Ban> {
         .get(key)
         .map(|b| b.clone())
         .filter(|b| b.active(now_secs()))
+}
+
+/// The ban `account` is under now, if any.
+pub fn account_ban(state: &ServerState, account: [u8; 16]) -> Option<Ban> {
+    active(state, &Key::Account(account))
+}
+
+/// The running ban of an address whoever went by `name` was banned from, if any, as
+/// this reader knows it (`Ban::name_for`).
+pub fn address_ban_as(state: &ServerState, name: &str, admin: bool) -> Option<Ban> {
+    let now = now_secs();
+    state
+        .bans
+        .iter()
+        .find(|e| {
+            let b = e.value();
+            matches!(e.key(), Key::Addr(_)) && b.name_for(admin) == name && b.active(now)
+        })
+        .map(|e| e.value().clone())
 }
 
 /// At accept: an address ban refuses at once on a relay without accounts.
@@ -148,6 +186,19 @@ pub async fn add(
     by: &str,
     duration: Option<Duration>,
 ) -> Result<Ban> {
+    add_as(state, target, label, None, reason, by, duration).await
+}
+
+/// `add`, with the pseudonym behind an admin's `label` (`Ban::alias`).
+pub async fn add_as(
+    state: &ServerState,
+    target: Target,
+    label: &str,
+    alias: Option<&str>,
+    reason: &str,
+    by: &str,
+    duration: Option<Duration>,
+) -> Result<Ban> {
     let now = now_secs();
     let key = key_of(state, &target);
     let mut ban = Ban {
@@ -158,6 +209,7 @@ pub async fn add(
         created_at: now,
         expires_at: duration.map(|d| now.saturating_add(d.as_secs().min(i64::MAX as u64) as i64)),
         addr: None,
+        alias: alias.map(|a| a.chars().take(64).collect()),
     };
     if let Some(relay) = &state.accounts {
         ban.id = relay.ban_put(&key, &ban).await?;
@@ -202,6 +254,11 @@ pub async fn remove(state: &ServerState, id: u64) -> Result<bool> {
 
 /// The active bans, accounts first, newest first within each.
 pub fn list(state: &ServerState) -> Vec<BanInfo> {
+    list_for(state, true)
+}
+
+/// The same for one reader (`Ban::name_for`).
+pub fn list_for(state: &ServerState, admin: bool) -> Vec<BanInfo> {
     let now = now_secs();
     let mut bans: Vec<BanInfo> = state
         .bans
@@ -212,7 +269,7 @@ pub fn list(state: &ServerState) -> Vec<BanInfo> {
             BanInfo {
                 id: b.id,
                 account: matches!(e.key(), Key::Account(_)),
-                label: b.label.clone(),
+                label: b.name_for(admin).to_string(),
                 reason: b.reason.clone(),
                 by: b.by.clone(),
                 created_at: b.created_at.max(0) as u64,
@@ -248,6 +305,15 @@ pub async fn load(state: &ServerState) -> Result<()> {
     } else {
         Vec::new()
     };
+    // A ban the shell made left the channels' logs in its own process, and this relay
+    // went on letting them join one again until it knew
+    if let Some(relay) = &state.accounts {
+        for (key, _) in fresh.iter().filter(|(k, _)| !state.bans.contains_key(k)) {
+            if let Key::Account(a) = key {
+                relay.ban_out_of_logs(a).await?;
+            }
+        }
+    }
     state.bans.retain(|k, _| fresh.iter().any(|(f, _)| f == k));
     for (k, b) in fresh {
         state.bans.insert(k, b);

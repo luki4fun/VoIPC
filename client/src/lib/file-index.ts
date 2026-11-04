@@ -7,7 +7,7 @@
 //
 // Pure, so file-index.test.ts runs it under Node's own test runner.
 
-import { hasExpired, splitChatKey, type ChatPlace } from "./chat-rules.ts";
+import { hasExpired, isHidden, splitChatKey, type ChatPlace } from "./chat-rules.ts";
 import { fold, terms } from "./search-rules.ts";
 import type { ChatMessage, FileRef } from "./types.ts";
 
@@ -39,7 +39,8 @@ export function fileKind(f: FileRef): FileKind {
   return top === "image" || top === "video" || top === "audio" ? top : "other";
 }
 
-/** Every file a live message in these conversations carries. */
+/** Every file a live message in these conversations carries, but for one a
+ *  moderator hid. */
 export function fileRows(
   channels: ReadonlyMap<string, readonly ChatMessage[]>,
   dms: ReadonlyMap<string, readonly ChatMessage[]>,
@@ -55,7 +56,7 @@ export function fileRows(
       const place: ChatPlace = { kind, key, ...at };
       for (const msg of messages) {
         const file = msg.file;
-        if (file && !hasExpired(msg, now)) {
+        if (file && !hasExpired(msg, now) && !isHidden(msg)) {
           const copy = kept.get(file.hash);
           out.push({ file, msg, place, kind: fileKind(file), local: copy?.bytes ?? null, used: copy?.last_used ?? null });
         }

@@ -20,6 +20,9 @@
   import { userId } from "../../stores/connection.js";
   import { groupStyles, viewingVoice } from "../../stores/channels.js";
   import { speakingUsers } from "../../stores/users.js";
+  import { blockedMember } from "../../stores/blocks.js";
+  import { restrictions } from "../../stores/restrictions.js";
+  import { markTitle } from "../../restrict-rules.js";
   import { audibleIds } from "../../stores/room.js";
   import {
     displayChannelCreatorId,
@@ -130,12 +133,18 @@
       {#if user.shares_history}
         <span class="sharing-history" title="Shares recent chat with newcomers"><Icon name="history" size={12} /></span>
       {/if}
+      {#if $blockedMember(user)}
+        <span class="blocked-mark" title="You blocked this person"><Icon name="ban" size={12} /></span>
+      {/if}
       {#if user.user_id === $userId}
         <span class="you">(you)</span>
       {/if}
     </span>
     {#if user.is_muted}
       <span class="status-icon muted" title="Muted"><Icon name="mic-off" size={14} /></span>
+    {/if}
+    {#if $restrictions.has(user.user_id)}
+      <span class="status-icon restricted-mark" title={markTitle($restrictions.get(user.user_id)!, Date.now())}><Icon name="hourglass" size={14} /></span>
     {/if}
     {#if user.is_deafened}
       <span class="status-icon deafened" title="Deafened"><Icon name="headphones-off" size={14} /></span>
@@ -291,6 +300,12 @@
     vertical-align: middle;
   }
 
+  .blocked-mark {
+    display: inline-flex;
+    margin-left: 4px;
+    color: var(--text-secondary);
+  }
+
   .you {
     color: var(--text-secondary);
     font-size: var(--fs-micro);
@@ -299,6 +314,10 @@
   .status-icon {
     display: flex;
     flex-shrink: 0;
+  }
+
+  .status-icon.restricted-mark {
+    color: var(--warning);
   }
 
   .status-icon.muted {

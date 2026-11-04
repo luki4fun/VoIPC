@@ -183,6 +183,9 @@ export interface ChatMessage {
   reactions?: Reaction[];
   /** Pinned in its channel by a manager (`on`), or unpinned; latest wins. */
   pin?: { on: boolean; at: number; by: string };
+  /** A moderator collapsed it for its readers (`on`), or took that back; latest
+   *  wins. Nothing of it is gone. Read through chat-rules.ts `isHidden`. */
+  hide?: { on: boolean; at: number; by: string; ban?: boolean };
   /** It arrived from a member allowed to call on everybody (mention-rules.ts). */
   power?: boolean;
   /** What a later version kept in this message's archive entry that this one
@@ -197,6 +200,19 @@ export interface Forwarded {
   name: string;
   /** When it was written there (ms). */
   at: number;
+  /** It is a report of that message to a moderator (report-rules.ts). */
+  report?: ReportMark;
+}
+
+/** What makes a forward a report (envelope.rs `ReportMark`): the reporter's word. */
+export interface ReportMark {
+  /** The channel they say it was written in; empty: a direct message. */
+  channel: string;
+  /** Its id there. */
+  id?: string;
+  why: string;
+  /** Who it came from, as told by whoever passes a report on. */
+  by?: string;
 }
 
 /**
@@ -207,7 +223,8 @@ export type ChatEvent =
   | { kind: "edit"; target: string }
   | { kind: "delete"; target: string }
   | { kind: "react"; target: string; emoji: string; on: boolean }
-  | { kind: "pin"; target: string; on: boolean };
+  | { kind: "pin"; target: string; on: boolean }
+  | { kind: "hide"; target: string; on: boolean };
 
 /** One emoji on a message, and everyone who put it there or took it off. */
 export interface Reaction {
@@ -310,6 +327,23 @@ export interface AuditRow {
   at: number;
 }
 
+/** One line of the moderation log (1.10). */
+export interface ModRow {
+  id: number;
+  /** Unix seconds. */
+  at: number;
+  /** `kick`, `ban`, `unban`, `channel_kick`, `remove_posts`, `hide`, ...: an action this app does not know shows as it is. */
+  action: string;
+  actor: string;
+  target: string;
+  /** None: server-wide, or a channel this reader cannot see. */
+  channel: string | null;
+  reason: string;
+  detail: string;
+  /** The actor's app said so; the relay could not see it. */
+  advisory: boolean;
+}
+
 export interface InviteLinkInfo {
   id: string;
   max_uses: number;
@@ -372,7 +406,10 @@ export type AdminOp =
   | { ServerIconSet: { image: number[] | null } }
   | "InviteLinks"
   | { InviteLinkNew: { max_uses: number; days: number; group: string | null } }
-  | { InviteLinkRevoke: { id: string } };
+  | { InviteLinkRevoke: { id: string } }
+  | { ModLog: { before: number } }
+  | { ModNote: { channel_id: number; target: string; message: string; on: boolean } }
+  | { RemovePosts: { name: string; window_secs: number } };
 
 /** `AdminReply` as serde writes it. */
 export type AdminReply =
@@ -386,6 +423,8 @@ export type AdminReply =
   | { InviteLinkCode: { code: string } }
   | { Gate: { channel_id: number; gate: ChannelGate; groups: string[] } }
   | { ChannelDone: { channel_id: number | null } }
+  | { ModLog: { before: number; rows: ModRow[]; more: boolean; keep_days: number } }
+  | { PostsRemoved: { name: string; entries: number } }
   | "StepUp";
 
 /** A category of channels (protocol 18). */
