@@ -362,6 +362,8 @@ async function answerFirstRun(tab, who, timeoutMs = 15_000) {
       audio: !!document.querySelector(".audio-setup .skip-link"),
       layout: !!document.querySelector(".layout-setup"),
       answered: JSON.parse(localStorage.getItem("voipc.settings") ?? "{}").ui_prefs?.layout_asked_version === 2,
+      // What the page says about it: a failure names its own reason
+      says: document.querySelector('.error[role="alert"]')?.textContent ?? "",
     })`);
     if (seen.audio) {
       await realClick(tab, ".audio-setup .skip-link");

@@ -7,6 +7,15 @@ All notable changes to VoIPC are documented here.
 Protocol 20. This app still talks to relays back to 1.0 (protocol 12), and on an older relay holds back what its
 other apps could not read.
 
+### Fixed
+- **A slow or busy device no longer loses the relay's last word.** The relay closed a connection the moment the far end's
+  network layer had its last message, which threw it away if the app had not read it yet, and a sign-in answer, a refusal or
+  a kick reason became "Connection lost". It now waits for the app to hang up, for up to 5 seconds.
+- **A busy relay no longer drops packets for want of room.** Its UDP socket sat at the system's default of 212 KiB, and what
+  did not fit was lost without a word: 340,000 packets in one soak at 2000 clients, which slowed every join and could lose
+  a connection. It now asks for 8 MiB, and warns at start if the system gives less: see *How big one relay goes* in
+  OPERATING.md for the one setting.
+
 ### Added
 - **What someone deleted, and what closed on Discord, stay that way through a move.** Every run and *Go on* read Discord's
   channels and roles again first, and the relay refuses a channel closed there while its gate here is open. A hide or a

@@ -326,6 +326,18 @@ label.
 
 ## 10a. How big one relay goes
 
+**Give the relay's UDP socket room, on any relay with more than a few dozen people.** Every client's voice, video and
+control packets wait in one socket's buffer while the relay is busy, and what does not fit is dropped without a word in any
+log. The relay asks for 8 MiB, and Linux gives at most twice `net.core.rmem_max`, which is usually only 212 KiB. It
+warns at start if it got less. On the host, a container's included:
+
+```sh
+sysctl -w net.core.rmem_max=4194304 net.core.wmem_max=4194304   # and the same in /etc/sysctl.d/ to keep it
+```
+
+At 2000 clients on this machine that took the packets dropped from 340,000 to under 11,000 a run, and all of them joining a
+channel from about 3 s to about 1 s. `nstat -az UdpRcvbufErrors` counts what the kernel has dropped this way.
+
 Measured with `community_load` (below) on one relay and one 32-thread machine with
 62 GiB, load clients on the same machine, 2026-11-04: guests, no voice, N clients arriving at
 50 a second, all joining one text channel at once, then one 200-byte chat message a second.

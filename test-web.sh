@@ -55,6 +55,10 @@ annotate() { # title detail
 die() { echo "$*" >&2; annotate "test-web" "$*"; exit 1; }
 failed_at=""
 lanes_running=()
+# UDP packets the kernel dropped for a full socket buffer, machine-wide. A relay's socket
+# overflowing is silent, and what it looks like is a connection that fails under load.
+udp_drops() { awk '/^Udp:/ { if (!c) { for (i = 1; i <= NF; i++) if ($i == "RcvbufErrors") c = i } else print $c }' /proc/net/snmp 2>/dev/null || echo 0; }
+udp_drops_before=$(udp_drops)
 # `wait` before rm: Chromium is still writing its profile when SIGTERM lands,
 # and under `set -e` a failing rm inside the trap would turn a green run red.
 # (Run by the EXIT trap; $(jobs -p) splits into pids on purpose.)
@@ -469,6 +473,9 @@ else
   echo "--- UI regression skipped (needs Chromium for the DevTools protocol)"
 fi
 
+udp_drops_after=$(udp_drops)
+udp_dropped=$(( ${udp_drops_after:-0} - ${udp_drops_before:-0} ))
+echo "--- UDP packets dropped for a full socket buffer during this run: $udp_dropped"
 echo "--- server log tail"; tail -20 "$WORK/server.log"
 
 # Everything above is in the job log; the failure goes into an annotation too
@@ -476,6 +483,7 @@ echo "--- server log tail"; tail -20 "$WORK/server.log"
 if [ "$fail" -ne 0 ]; then
   annotate "test-web $BROWSER_ALICE -> $BROWSER_BOB" "$(
     cat "$WORK/fails.txt"
+    echo "--- UDP packets dropped for a full socket buffer during this run: $udp_dropped"
     echo "--- alice"; tail -20 "$WORK/alice.txt"
     echo "--- bob";   tail -20 "$WORK/bob.txt")"
 fi
